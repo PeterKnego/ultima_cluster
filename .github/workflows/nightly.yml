@@ -270,7 +270,7 @@ jobs:
           FUZZ_GROUPS: |
             uc_protocol_datagram uc_protocol_log_frame uc_protocol_cnc uc2_remote_frame
             uc2_crypto_open uc2_crypto_handshake uc2_crypto_group_key uc2_crypto_admin
-            ultima_journal_record ultima_journal_stable_value uc2_service_session
+            ultima_journal_record ultima_journal_stable_value uc2_service_session ring_mpsc_record
             uc2_node_toml uc2_gateway_toml uc2_node_http
         run: |
           set -euo pipefail
