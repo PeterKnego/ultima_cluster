@@ -455,6 +455,12 @@ impl MpscConsumer {
         }
     }
 
+    /// Cumulative count of dead-producer holes this consumer has skipped
+    /// (spec §4.2). Mirrored to the cnc page and `/metrics` by the node.
+    pub fn holes_skipped(&self) -> u64 {
+        self.holes_skipped
+    }
+
     /// First observation of a hole at `pos` starts its timer and reports
     /// `false`; a later observation of the SAME position reports whether
     /// `hole_timeout` has elapsed. Moving on clears the timer.
@@ -788,5 +794,85 @@ mod tests {
         producer
             .try_write(1, 0, [0; 8], b"x")
             .expect("stale-claim snapshot must read as fully-free, not underflow/panic");
+    }
+
+    /// M13a regression for the convoy (spec §4.3's preemption test).
+    ///
+    /// Producer A claims a slot and STOPS there — exactly the state a
+    /// scheduler preemption (or a SIGKILL) between the CAS and the commit
+    /// leaves behind. Producers B..H must each complete their own
+    /// `try_write` while A is stopped; the consumer must return `None`
+    /// (head-of-line behind A) and burn nothing; and once A commits, the
+    /// records must come out in claim order, A first.
+    ///
+    /// Against the pre-M13a protocol this test HANGS: B's `try_write` spins
+    /// forever on `publish_position != claim_pos`. That is the discrimination
+    /// — run it against `git stash`ed old ring code and it never returns
+    /// (bound the run with `timeout 30 cargo test …` if you check that).
+    #[test]
+    fn a_stopped_producer_blocks_nobody_and_order_is_preserved() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 65536, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+
+        // A claims and stops.
+        let a = producer
+            .claim_without_commit(1, 0, [0; 8], b"A")
+            .expect("A claims");
+
+        // B..H each write a full record BEHIND A's hole, on their own
+        // threads, and every one of them must finish. The join is the
+        // assertion: with the old protocol these threads never return.
+        const OTHERS: usize = 7;
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles: Vec<_> = (0..OTHERS)
+            .map(|t| {
+                let p = producer.clone();
+                let done = Arc::clone(&done);
+                thread::spawn(move || {
+                    let payload = [b'B' + t as u8];
+                    p.try_write(1, 0, [0; 8], &payload).expect("write behind the hole");
+                    done.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            done.load(Ordering::Relaxed),
+            OTHERS,
+            "every producer behind a stopped one must complete"
+        );
+
+        // The consumer is head-of-line behind A: nothing readable yet, even
+        // though seven records are committed behind it.
+        let mut buf = Vec::new();
+        for _ in 0..1000 {
+            assert!(
+                matches!(consumer.try_read(&mut buf), Ok(None)),
+                "a claimed-but-uncommitted slot must read as None, never a record"
+            );
+        }
+        assert_eq!(consumer.holes_skipped(), 0, "a 1 s hole timeout has not elapsed");
+
+        // A commits. Now everything drains, A first.
+        producer.commit_claim(a);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        while seen.len() < OTHERS + 1 {
+            let mut buf = Vec::new();
+            match consumer.try_read(&mut buf) {
+                Ok(Some(_)) => seen.push(buf),
+                Ok(None) => thread::yield_now(),
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        assert_eq!(seen[0], b"A".to_vec(), "claim order: A was claimed first");
+        let mut rest: Vec<Vec<u8>> = seen[1..].to_vec();
+        rest.sort();
+        let mut want: Vec<Vec<u8>> =
+            (0..OTHERS).map(|t| vec![b'B' + t as u8]).collect();
+        want.sort();
+        assert_eq!(rest, want, "every record behind the hole is delivered exactly once");
     }
 }
