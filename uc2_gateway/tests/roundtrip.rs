@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use uc2_gateway::{Edge, EdgeConfig, Member};
-use uc2_remote::{RemoteClient, RemoteConfig};
+use uc2_remote::{Consistency, RemoteClient, RemoteConfig};
 use uc2_service::{ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
@@ -82,13 +82,13 @@ fn write_cas_read_round_trip_through_the_edge() {
     assert!(!r.replayed);
 
     let q = read_query();
-    let r = client.query(&q, true).unwrap().wait().unwrap();
+    let r = client.query(&q, Consistency::Linearizable).unwrap().wait().unwrap();
     let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
         .unwrap()
         .0;
     assert_eq!(v, Some(8), "the linearizable read sees the CAS");
 
-    let r = client.query(&q, false).unwrap().wait().unwrap();
+    let r = client.query(&q, Consistency::Snapshot).unwrap().wait().unwrap();
     let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
         .unwrap()
         .0;
@@ -130,7 +130,7 @@ fn raw_pass_through_round_trips_with_the_envelope_off() {
     assert_eq!(dec(&r.bytes), CmdResp::CasResult(false), "CAS against the wrong old value fails");
     assert!(!r.replayed);
 
-    let r = client.query(&read_query(), true).unwrap().wait().unwrap();
+    let r = client.query(&read_query(), Consistency::Linearizable).unwrap().wait().unwrap();
     let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
         .unwrap()
         .0;

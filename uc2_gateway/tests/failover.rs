@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use uc2_gateway::{Edge, EdgeConfig, Member};
 use uc2_remote::conn::FramedConn;
-use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
+use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 use uc_lincheck::register::{Cmd, CmdResp};
 
 mod common;
@@ -258,7 +258,7 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     // that was acknowledged. (Writes are monotone, so "last acknowledged" and
     // "highest acknowledged" are the same value.)
     let q = read_query();
-    let r = client.query(&q, true).unwrap().wait().expect("linearizable read");
+    let r = client.query(&q, Consistency::Linearizable).unwrap().wait().expect("linearizable read");
     let v: Option<u64> =
         bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard()).unwrap().0;
     let v = v.expect("the register was written");
