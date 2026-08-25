@@ -270,7 +270,7 @@ RAM-backed filesystems).
 **Wire crypto is opt-in and off by default.** With `[crypto].enabled = false`,
 node-to-node UDP is cleartext and its source is unauthenticated: the
 `uc_protocol::v2` decoders parse untrusted bytes with nothing in front of them.
-That is why they are total on `&[u8]` and fuzzed nightly — fourteen
+That is why they are total on `&[u8]` and fuzzed nightly — fifteen
 `cargo-fuzz` targets, 600 s each, with an asserted execution floor
 ([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)).
 

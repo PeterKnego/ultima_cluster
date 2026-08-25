@@ -133,15 +133,42 @@ Contrast the much larger, and safe, window: a client stalled *after*
 stamping its claim word (the ordinary case — writing a large record body,
 or paused anywhere from there to its commit) is handled by the hole timer
 instead. The consumer waits `hole_timeout` (default 1 s), skips the
-claimed range, and counts it in the aggregate
-`uc2_ingress_holes_skipped_total` counter on `/metrics` (summed across
-*both* rings — it does not tell you which one). If that client then
-resumes and tries to commit, its commit CAS fails against the skip
-marker and it gets back `Skipped`, not silence. The one residual case —
-a client so stalled it resumes and writes its body a full ring lap
-later, into a slot some later claimant now owns — is not a hole at all
-by the time it is observed; the record's CRC catches it as a `Corrupt`
-read, not a silent mix of two clients' bytes.
+claimed range, and counts it — on `uc2_ingress_holes_skipped_total` or
+`uc2_query_holes_skipped_total`, one counter per ring, so you can see
+which client path is affected. If that client then resumes and tries to
+commit, its commit CAS fails against the skip marker and it gets back
+`Skipped`, not silence.
+
+The residual case is a client so stalled it resumes and writes its body a
+full ring lap later, into a slot some later claimant now owns. This is
+**not fully caught by the CRC**, and an earlier version of this page said
+it was. Three shapes, and only the first is caught:
+
+- **A partial stomp** disagrees with the victim's own trailer, so the
+  record fails its CRC. On an MPSC ring that is not a recoverable read
+  error — the slot is immutable until the consumer passes it — so it
+  surfaces as the `IngressRingCorrupt` fail-stop below, not a retry.
+- **A complete same-length stomp** writes a fully self-consistent record
+  — the resurrected client's own payload and its own CRC — over the later
+  claimant's. The CRC *matches*, and the node delivers the resurrected
+  client's record at the later claimant's position. The later claimant's
+  submit is silently lost; its client sees no response and retries on
+  timeout, and the resurrected record may be applied twice.
+  **Exactly-once across that survives only if your service wraps its
+  state machine in `Sessioned`** — the `(client_id, seq)` envelope is
+  what turns the duplicate into a `REPLAYED` answer.
+- **A padding stomp** — a client resurrecting inside the tail-padding
+  path — is not CRC-covered at all, because the padding marker is
+  recognised before any CRC is computed. The node closes this by
+  accepting a padding marker only when its length is exactly the tail
+  remnant, which is the only length real padding can ever have; anything
+  else goes down the ordinary record path and meets the CRC. The
+  remaining residual: a real record that ends flush with the ring tail is
+  indistinguishable from padding by that test.
+
+All three need a client stalled for longer than `hole_timeout` *and* a
+full ring lap in the meantime. If you are seeing them, the thing to fix
+is the stalling client (or `hole_timeout`), not the ring.
 
 Recovery from `IngressRingWedged` is the same as any other fail-stop:
 `agent_failstopped` is logged, the daemon exits 1, and systemd restarts
@@ -150,6 +177,29 @@ because the ring file format changed in 2.7.0 too, every process
 attached to this host's instance directory (service, gateway, any shmem
 client) needs the node to be back up before it can reattach; see
 [the same-host restart rule](upgrade-a-cluster.md#ring-format-change-in-270-restart-a-hosts-processes-together).
+
+## My node just fail-stopped with `IngressRingCorrupt`
+
+```
+consensus fatal (fail-stop): IngressRingCorrupt ring=<ingress|query> (<detail>)
+— the record at the consumer position does not decode, and an MPSC slot is
+immutable until the consumer passes it, so this cannot be retried. Restart
+the node; every attached client must reattach.
+```
+
+A record at the ring's consumer position failed to decode — a bad CRC, or
+a length outside the ring's own bounds. On these rings that is *not* a
+transient read error: no producer may reclaim a slot the consumer has not
+released, so the next drain cycle would read the identical bytes, forever.
+Before 2.7.0's final review the node treated it as transient, which meant
+a permanent silent stall of every client on that ring while the node
+still reported itself able to serve. It now fail-stops.
+
+The realistic causes are the stomp shapes described above (a client
+stalled past `hole_timeout` that resurrected a lap later) and memory or
+storage corruption of the mapped ring file. Recovery is identical to
+`IngressRingWedged`: restart the node, and every attached process
+reattaches.
 
 ## Is a joiner recovering by snapshot?
 
