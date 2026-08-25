@@ -15,6 +15,7 @@ pub mod client;
 pub mod conn;
 pub mod error;
 pub mod frame;
+pub(crate) mod outgoing;
 pub(crate) mod park;
 
 pub use client::{RemoteClient, RemoteConfig, RemoteResponse, RemoteStats, Ticket};
