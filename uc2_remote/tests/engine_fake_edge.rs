@@ -771,3 +771,344 @@ fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
     assert!(conns < 200, "backed off, not spun: {conns} connections");
     send.shutdown();
 }
+
+// -------------------------------------------------- liveness and the budget
+
+/// Drive one request and return its outcome, discriminated as a small enum so
+/// assertions read like the old `Ticket::wait` ones.
+#[derive(Debug, PartialEq, Eq)]
+enum Got {
+    Response { body: Vec<u8>, replayed: bool, expired: bool },
+    Unknown,
+    PayloadTooLarge,
+    TimedOut,
+    Closed,
+    Nothing,
+}
+
+/// `_send` is taken only so a call site reads like the old `Ticket::wait`
+/// pairs; the poll half is what actually resolves.
+fn one(
+    _send: &uc2_remote::RemoteSendHalf,
+    poll: &mut uc2_remote::RemotePollHalf,
+    user_data: u64,
+    budget: Duration,
+) -> Got {
+    let deadline = Instant::now() + budget;
+    let mut got = Got::Nothing;
+    while matches!(got, Got::Nothing) && Instant::now() < deadline {
+        poll.poll(|c| {
+            if c.user_data != user_data {
+                return;
+            }
+            got = match c.outcome {
+                RemoteOutcome::Response { body, replayed, expired } => {
+                    Got::Response { body: body.to_vec(), replayed, expired }
+                }
+                RemoteOutcome::Unknown => Got::Unknown,
+                RemoteOutcome::PayloadTooLarge => Got::PayloadTooLarge,
+                RemoteOutcome::TimedOut => Got::TimedOut,
+                RemoteOutcome::Closed => Got::Closed,
+            };
+        });
+        std::thread::yield_now();
+    }
+    got
+}
+
+#[test]
+fn expired_surfaces_as_a_response_flagged_expired() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, expired: true, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    match one(&send, &mut poll, 1, WAIT) {
+        Got::Response { expired, .. } => assert!(expired, "FLAG_EXPIRED must reach the caller"),
+        other => panic!("expected an EXPIRED response, got {other:?}"),
+    }
+    assert_eq!(send.stats().expired, 1);
+    send.shutdown();
+}
+
+#[test]
+fn unknown_is_resolved_by_a_resend_or_surfaces_as_an_outcome() {
+    // Default: resend_on_unknown = true, so it resolves itself.
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    assert_eq!(
+        one(&send, &mut poll, 1, WAIT),
+        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false }
+    );
+    assert_eq!(send.stats().unknown, 1);
+    send.shutdown();
+
+    // Told not to resend, it surfaces.
+    let edge2 = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let (send2, mut poll2) = RemoteEngine::connect(RemoteConfig {
+        resend_on_unknown: false,
+        ..cfg(vec![edge2.addr.clone()])
+    })
+    .unwrap();
+    send2.try_submit(1, b"abc").unwrap();
+    assert_eq!(one(&send2, &mut poll2, 1, WAIT), Got::Unknown);
+    send2.shutdown();
+}
+
+#[test]
+fn an_edge_that_stalls_mid_frame_is_declared_dead_and_the_request_fails_over() {
+    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let stalling = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        partial_frame_then_hang: true,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(300),
+        ..cfg(vec![stalling.addr.clone(), good.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    let t = Instant::now();
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(5)),
+        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false },
+        "a peer that vanishes mid-frame must reach the same verdict as one silent between frames"
+    );
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert!(send.stats().reconnects >= 1);
+    send.shutdown();
+}
+
+#[test]
+fn a_silent_edge_is_declared_dead_and_the_request_fails_over() {
+    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let silent = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(300),
+        ..cfg(vec![silent.addr.clone(), good.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(5)),
+        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false }
+    );
+    let s = send.stats();
+    assert!(s.reconnects >= 1 && s.resends >= 1, "{s:?}");
+    send.shutdown();
+}
+
+#[test]
+fn ping_pong_keeps_an_idle_connection_alive() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(200),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(send.stats().reconnects, 0, "PING/PONG must hold an idle connection open");
+    assert_eq!(edge.observed.conns.load(AtomicOrdering::SeqCst), 1);
+    assert!(send.is_connected());
+    send.try_submit(1, b"abc").unwrap();
+    assert_eq!(
+        one(&send, &mut poll, 1, WAIT),
+        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false }
+    );
+    send.shutdown();
+}
+
+#[test]
+fn a_request_that_is_never_answered_completes_timed_out() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(200),
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_secs(30),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(3)), Got::TimedOut);
+    send.shutdown();
+}
+
+/// The carried-over Task 6 Minor: an edge that answers AFTER `request_timeout`.
+/// The sweep delivers `TimedOut` first, and when the late RESPONSE then arrives
+/// it Misses the owner CAS on the freed slot, so NO second completion follows.
+/// This pins "sweep won, then the response arrives, no double-deliver" against
+/// the wire, not just against the CAS argument.
+#[test]
+fn a_late_response_after_the_sweep_delivers_no_second_completion() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        // The answer is written well after the request_timeout budget: the
+        // sweep fires first, the response is late.
+        delay: Duration::from_millis(500),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(150),
+        // PING/PONG keeps the connection alive across the delay so the late
+        // answer really does arrive (no redial, no resend, no fresh answer).
+        ping_interval: Duration::from_millis(30),
+        dead_after: Duration::from_secs(30),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(3)), Got::TimedOut);
+    // The link stayed up: no redial, no resend — the late answer is coming on
+    // the SAME connection.
+    assert_eq!(send.stats().reconnects, 0, "the connection must stay up: {:?}", send.stats());
+    assert_eq!(send.stats().resends, 0);
+    // Now outlast the edge's delay and keep polling: the late RESPONSE arrives
+    // and must be dropped, not delivered a second time.
+    let mut extra = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        extra += poll.poll(|c| panic!("a second completion for {}: {:?}", c.user_data, c.outcome));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(extra, 0, "the late response must Miss the freed slot, not double-deliver");
+    assert_eq!(send.inflight(), 0);
+    send.shutdown();
+}
+
+#[test]
+fn shutdown_completes_outstanding_requests_with_closed() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        delay: Duration::from_secs(30),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    send.shutdown();
+    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(2)), Got::Closed);
+    assert_eq!(send.try_submit(2, b"abc"), Err(SubmitError::Closed));
+}
+
+#[test]
+fn request_timeout_is_enforced_through_an_endless_redirect_churn() {
+    // Every dial SUCCEEDS and every request is redirected to an address that
+    // is down: the reader never returns to an idle tick, so the sweep has to
+    // run inside the dial scan. (M12c Task 3b regression.)
+    let dead = "127.0.0.1:1".to_string();
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        redirect_all_to: Some(dead),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_millis(200),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    let t = Instant::now();
+    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(4)), Got::TimedOut);
+    assert!(t.elapsed() < Duration::from_secs(2), "budget overshot: {:?}", t.elapsed());
+    assert!(send.stats().reconnects >= 1);
+    send.shutdown();
+}
+
+#[test]
+fn request_timeout_and_shutdown_are_prompt_while_every_member_is_unreachable() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let addr = edge.addr.clone();
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_millis(200),
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(200),
+        ..cfg(vec![addr])
+    })
+    .unwrap();
+    drop(edge); // the cluster goes away underneath a connected client
+    send.try_submit(1, b"abc").unwrap();
+    let t = Instant::now();
+    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(4)), Got::TimedOut);
+    assert!(t.elapsed() < Duration::from_secs(2), "budget overshot: {:?}", t.elapsed());
+    send.try_submit(2, b"abc").ok();
+    let t2 = Instant::now();
+    send.shutdown();
+    assert!(t2.elapsed() < Duration::from_secs(2), "shutdown mid-dial must be prompt");
+    assert!(matches!(
+        one(&send, &mut poll, 2, Duration::from_secs(2)),
+        Got::Closed | Got::TimedOut | Got::Nothing
+    ));
+}
+
+/// A member that accepts a connection and then parks it, so a dial costs a
+/// full `connect_timeout` in the HELLO read — deterministic and portable
+/// where a SYN blackhole is not.
+struct ParkingMember {
+    addr: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    acceptor: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParkingMember {
+    fn spawn() -> ParkingMember {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        l.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s = std::sync::Arc::clone(&stop);
+        let acceptor = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !s.load(AtomicOrdering::SeqCst) {
+                if let Ok((sock, _)) = l.accept() {
+                    held.push(sock);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        ParkingMember { addr, stop, acceptor: Some(acceptor) }
+    }
+}
+
+impl Drop for ParkingMember {
+    fn drop(&mut self) {
+        self.stop.store(true, AtomicOrdering::SeqCst);
+        if let Some(h) = self.acceptor.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[test]
+fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
+    // Four members that accept and stall: ONE pass is 4 x connect_timeout, so
+    // sweeping only "between passes" would blow the 500 ms budget.
+    let parked: Vec<ParkingMember> = (0..4).map(|_| ParkingMember::spawn()).collect();
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let mut members: Vec<String> = parked.iter().map(|p| p.addr.clone()).collect();
+    members.insert(0, edge.addr.clone());
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_millis(500),
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(200),
+        ..cfg(members)
+    })
+    .unwrap();
+    drop(edge);
+    send.try_submit(1, b"abc").unwrap();
+    let t = Instant::now();
+    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(5)), Got::TimedOut);
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "the sweep must run INSIDE a pass: {:?}",
+        t.elapsed()
+    );
+    let t2 = Instant::now();
+    send.shutdown();
+    assert!(t2.elapsed() < Duration::from_secs(2), "shutdown mid-pass must be prompt");
+}
