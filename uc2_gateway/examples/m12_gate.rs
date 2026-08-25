@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! M12a gate: gateway (`Edge` + `RemoteClient`) vs direct `Engine` throughput
+//! M12a gate: gateway (`Edge` + `RemoteEngine`) vs direct `Engine` throughput
 //! (spec `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` §4.6
 //! item 5, §8 row 2).
 //!
@@ -31,9 +31,10 @@
 //! `uc2_client::Engine`.
 //!
 //! **`gateway`** boots a SEPARATE three-node cluster, one [`Edge`] per node,
-//! and connects ONE [`RemoteClient`] to the leader's edge over the framed TCP
-//! remote protocol. `--envelope on` (the default) runs the service as
-//! `Sessioned<CountSm>` and the edge's `session_envelope: true` — the edge
+//! and connects ONE `RemoteEngine` (split send/poll halves) to the leader's
+//! edge over the framed TCP remote protocol. `--envelope on` (the default)
+//! runs the service as `Sessioned<CountSm>` and the edge's
+//! `session_envelope: true` — the edge
 //! prepends the 16-byte `client_id ++ seq` header, the client sends the same
 //! raw command bytes the direct arm does. `--envelope off` runs bare
 //! [`CountSm`] with `session_envelope: false` (raw pass-through, at-least-once
@@ -57,7 +58,6 @@
 use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,7 +69,7 @@ use uc2_client::{Engine, EngineConfig, Outcome, SubmitError};
 use uc2_gateway::{Edge, EdgeConfig, Member};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
-use uc2_remote::{RemoteClient, RemoteConfig};
+use uc2_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf, SubmitError as RemoteSubmitError};
 use uc2_service::{
     RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig,
     Sessioned, StateMachine, TAG_FRESH,
@@ -80,7 +80,7 @@ use uc2_service::{
 #[derive(Parser)]
 #[command(
     name = "m12_gate",
-    about = "uc2 M12a gate: gateway (Edge + RemoteClient) vs direct Engine throughput (spec §8 row 2)"
+    about = "uc2 M12a gate: gateway (Edge + RemoteEngine) vs direct Engine throughput (spec §8 row 2)"
 )]
 struct Cli {
     /// Fleet per-role subcommand. Omitted = the in-process local smoke below
@@ -129,7 +129,7 @@ enum Envelope {
 // every role oversubscribed). The roles below are the fleet shape — one
 // process per role per host, dedicated cores — driven by
 // `bench-infra/scripts/m12_fleet_gate.py`. They deliberately reuse the SAME
-// `CountSm`/`RawCountSm` pair, the same `Edge`, the same `RemoteClient` and
+// `CountSm`/`RawCountSm` pair, the same `Edge`, the same `RemoteEngine` and
 // the same two measurement cores as the in-process arms, so the only thing
 // that changes between smoke and fleet is where the processes run.
 
@@ -303,7 +303,7 @@ fn main() -> anyhow::Result<()> {
         print_report("direct (Engine)", s);
     }
     if let Some(s) = &gateway_stats {
-        print_report("gateway (Edge + RemoteClient)", s);
+        print_report("gateway (Edge + RemoteEngine)", s);
     }
 
     if let (Some(d), Some(g)) = (&direct_stats, &gateway_stats) {
@@ -878,11 +878,11 @@ where
         edges.push(edge);
     }
 
-    // ONE RemoteClient, connected straight to the leader's edge (this
+    // ONE RemoteEngine connection, connected straight to the leader's edge (this
     // harness measures steady-state throughput, not failover — that is
     // `failover.rs` / `remote_lin.rs`'s job).
     let leader_addr = edges[leader].local_addr();
-    let remote = RemoteClient::connect(RemoteConfig {
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         app_id: APP_ID.into(),
         members: vec![leader_addr.to_string()],
         client_id: None,
@@ -892,10 +892,10 @@ where
     })
     .unwrap_or_else(|e| panic!("remote connect {leader_addr}: {e}"));
 
-    let stats = run_remote_measurement(&remote, secs, payload);
-    print_remote_stats(&remote);
+    let stats = run_remote_measurement(&send, &mut poll, secs, payload);
+    print_remote_stats(&send);
 
-    remote.shutdown();
+    send.shutdown();
     for edge in edges {
         edge.stop();
     }
@@ -908,19 +908,22 @@ where
     stats
 }
 
-/// `RemoteClient`-side measurement core: one sender thread issuing
-/// `submit()` under the client's own credit/inflight gating, and a small pool
-/// of ticket-wait threads so pipelining is not serialized behind
-/// `Ticket::wait` (mirrors [`run_client_measurement`]'s slot-array latency
-/// correlation, adapted to `RemoteClient`'s `Ticket` handle rather than the
-/// `Engine`'s `user_data` callback).
-fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) -> ClientStats {
-    const N_WAITERS: usize = 8;
-    /// Bound on one ticket's wait — generous relative to a healthy run so it
-    /// never becomes the limiter, but finite so a stuck response cannot hang
-    /// the harness forever.
-    const TICKET_WAIT: Duration = Duration::from_secs(10);
-
+/// `RemoteEngine`-side measurement core: ONE submitter loop calling
+/// `try_submit` under the halves' own credit/inflight gating, with an inline
+/// poll drain between submits — the same shape as
+/// [`run_client_measurement`]'s `Engine` arm, correlating latency through the
+/// `user_data` the completion carries. (The old shape — a `Ticket` per
+/// request and a pool of waiter threads — was the client's structure, not the
+/// cluster's, and is what M13b removed; `RemoteSendHalf` is `!Sync` by
+/// design, so there is no second thread here to hand work to — the submitter
+/// drains `poll` itself, which is legal because `poll` is nonblocking and
+/// this arm drives exactly one connection.)
+fn run_remote_measurement(
+    send: &RemoteSendHalf,
+    poll: &mut RemotePollHalf,
+    secs: u64,
+    payload_len: usize,
+) -> ClientStats {
     let raw_payload = vec![0xABu8; payload_len];
     let cmd_bytes = bincode::serde::encode_to_vec(&raw_payload, bincode::config::standard())
         .expect("encode fixed payload");
@@ -935,90 +938,45 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
     let resolved = Arc::new(AtomicU64::new(0));
     let lost = Arc::new(AtomicU64::new(0));
     let last_response_ns = Arc::new(AtomicU64::new(0));
+    let mut hist = Histogram::<u64>::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram");
 
-    // Each waiter owns its OWN histogram (no shared lock on the hot path —
-    // a `Mutex<Histogram>` shared across all N_WAITERS threads would
-    // serialize every response recording and inflate the measured latency
-    // with lock-contention time that has nothing to do with the gateway or
-    // the network). Merged into one histogram after every thread has joined.
     let t0 = Instant::now();
-    let mut senders = Vec::with_capacity(N_WAITERS);
-    let mut waiters = Vec::with_capacity(N_WAITERS);
-    for _ in 0..N_WAITERS {
-        let (tx, rx) = mpsc::channel::<(u64, uc2_remote::Ticket)>();
-        senders.push(tx);
-        let send_ns = Arc::clone(&send_ns);
-        let responses = Arc::clone(&responses);
-        let resolved = Arc::clone(&resolved);
-        let lost = Arc::clone(&lost);
-        let last_response_ns = Arc::clone(&last_response_ns);
-        waiters.push(
-            thread::Builder::new()
-                .name("m12-gw-wait".into())
-                .spawn(move || {
-                    let mut local_hist =
-                        Histogram::<u64>::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram");
-                    for (idx, ticket) in rx {
-                        let outcome = ticket.wait_timeout(TICKET_WAIT);
-                        let now = t0.elapsed().as_nanos() as u64;
-                        match outcome {
-                            Ok(_resp) => {
-                                let slot = (idx as usize) & SLOT_MASK;
-                                let lat = now
-                                    .saturating_sub(send_ns[slot].load(Ordering::Acquire))
-                                    .min(HIST_MAX_NS);
-                                let _ = local_hist.record(lat);
-                                responses.fetch_add(1, Ordering::Relaxed);
-                                last_response_ns.fetch_max(now, Ordering::Relaxed);
-                            }
-                            Err(_e) => {
-                                lost.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        resolved.fetch_add(1, Ordering::Relaxed);
-                    }
-                    local_hist
-                })
-                .expect("spawn waiter thread"),
-        );
-    }
-
     let mut sent_idx: u64 = 0;
     let deadline = t0 + Duration::from_secs(secs);
     while Instant::now() < deadline {
         let idx = sent_idx;
         let slot = (idx as usize) & SLOT_MASK;
         send_ns[slot].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
-        // `RemoteClient::submit`'s own doc (`uc2_remote/src/client.rs`) is
-        // explicit: it BLOCKS while the edge's credits (or the local
-        // `max_inflight` cap) are exhausted, pacing this loop itself —
-        // there is no transient "backpressure, retry" error to yield on
-        // here, unlike the direct arm's `SubmitError::Backpressure`
-        // (`Engine::try_submit` is non-blocking by design; `RemoteClient`
-        // is not). The only `Err` this can resolve to is `TimedOut`
-        // (credits never reopened within `request_timeout`) or `Closed`
-        // (the client shut down under us) — both are genuine harness
-        // failures for a healthy run, hence the `panic!` rather than a
-        // retry loop.
-        match remote.submit(&cmd_bytes) {
-            Ok(ticket) => {
-                let w = (idx as usize) % N_WAITERS;
-                senders[w].send((idx, ticket)).expect("waiter thread alive");
-                sent_idx += 1;
-            }
-            Err(e) => panic!("remote submit: {e}"),
+        match send.try_submit(idx, &cmd_bytes) {
+            Ok(()) => sent_idx += 1,
+            Err(RemoteSubmitError::Backpressure) => thread::yield_now(),
+            Err(e) => panic!("try_submit: {e}"),
         }
+        drain_remote(
+            poll,
+            &send_ns,
+            &mut hist,
+            t0,
+            &responses,
+            &resolved,
+            &lost,
+            &last_response_ns,
+        );
     }
     let send_window_end_ns = t0.elapsed().as_nanos() as u64;
 
-    // Closing the channels lets each waiter thread exit once it has drained
-    // (and resolved, one way or another) everything already queued.
-    drop(senders);
-    let mut hist = Histogram::<u64>::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram");
-    for w in waiters {
-        if let Ok(local_hist) = w.join() {
-            hist.add(local_hist).expect("merge waiter histogram");
-        }
+    let drain_deadline = Instant::now() + DRAIN_GRACE;
+    while resolved.load(Ordering::Relaxed) < sent_idx && Instant::now() < drain_deadline {
+        drain_remote(
+            poll,
+            &send_ns,
+            &mut hist,
+            t0,
+            &responses,
+            &resolved,
+            &lost,
+            &last_response_ns,
+        );
     }
 
     let sends = sent_idx;
@@ -1053,7 +1011,7 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
         && inflight_at_end == 0
         && lost_count == 0;
 
-    let rs = remote.stats();
+    let rs = send.stats();
 
     ClientStats {
         sends,
@@ -1079,14 +1037,50 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
     }
 }
 
+/// One nonblocking drain of `poll`, folded into the counters
+/// [`run_remote_measurement`] reports from. `expired` responses (the edge's
+/// dedup window moved past this seq before the answer arrived) carry no body
+/// and count as lost, same as `Unknown`/`TimedOut`/`Closed`/`PayloadTooLarge`.
+#[allow(clippy::too_many_arguments)]
+fn drain_remote(
+    poll: &mut RemotePollHalf,
+    send_ns: &[AtomicU64],
+    hist: &mut Histogram<u64>,
+    t0: Instant,
+    responses: &AtomicU64,
+    resolved: &AtomicU64,
+    lost: &AtomicU64,
+    last_response_ns: &AtomicU64,
+) {
+    poll.poll(|c| {
+        resolved.fetch_add(1, Ordering::Relaxed);
+        match c.outcome {
+            RemoteOutcome::Response { expired: false, .. } => {
+                let now = t0.elapsed().as_nanos() as u64;
+                let slot = (c.user_data as usize) & SLOT_MASK;
+                let lat = now
+                    .saturating_sub(send_ns[slot].load(Ordering::Acquire))
+                    .min(HIST_MAX_NS);
+                let _ = hist.record(lat);
+                responses.fetch_add(1, Ordering::Relaxed);
+                last_response_ns.fetch_max(now, Ordering::Relaxed);
+            }
+            _ => {
+                lost.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 /// The gateway arm's own stats the direct arm has no analog for — printed
 /// separately rather than shoehorned into [`ClientStats`]'s field names.
-fn print_remote_stats(remote: &RemoteClient) {
-    let s = remote.stats();
+fn print_remote_stats(send: &RemoteSendHalf) {
+    let s = send.stats();
     println!("---------------------------- gateway/remote plane -------------------------");
     println!(
         "redirects {} | leader_changes {} | reconnects {} | resends {} | retries {} | \
-         unknown {} | expired {} | refused_members {} | max_credits_seen {}",
+         unknown {} | expired {} | refused_members {} | max_credits_seen {} | \
+         socket_writes {} | frames_written {}",
         s.redirects,
         s.leader_changes,
         s.reconnects,
@@ -1095,7 +1089,9 @@ fn print_remote_stats(remote: &RemoteClient) {
         s.unknown,
         s.expired,
         s.refused_members,
-        s.max_credits_seen
+        s.max_credits_seen,
+        s.socket_writes,
+        s.frames_written
     );
     println!("============================================================================");
 }
@@ -1396,7 +1392,7 @@ fn run_client_remote_role(a: ClientRemoteArgs) -> anyhow::Result<()> {
         "m12_gate client-remote: {} s, payload {}, inflight {}, gateways {:?}",
         a.secs, a.payload, a.inflight, gateways
     );
-    let remote = RemoteClient::connect(RemoteConfig {
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         app_id: a.app_id,
         members: gateways,
         client_id: None,
@@ -1406,10 +1402,10 @@ fn run_client_remote_role(a: ClientRemoteArgs) -> anyhow::Result<()> {
     })
     .map_err(|e| anyhow::anyhow!("remote connect: {e}"))?;
 
-    let stats = run_remote_measurement(&remote, a.secs, a.payload);
-    print_remote_stats(&remote);
-    remote.shutdown();
-    print_report("gateway (Edge + RemoteClient)", &stats);
+    let stats = run_remote_measurement(&send, &mut poll, a.secs, a.payload);
+    print_remote_stats(&send);
+    send.shutdown();
+    print_report("gateway (Edge + RemoteEngine)", &stats);
     print_result_json("gateway", &stats, a.secs, a.payload, a.inflight);
     Ok(())
 }
