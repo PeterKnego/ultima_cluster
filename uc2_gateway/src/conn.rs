@@ -90,13 +90,20 @@ pub(crate) struct Conn {
     /// The connection is finished: the socket has been shut down and the
     /// reader must stop.
     closed: AtomicBool,
-    /// The handshake completed and `HELLO_OK` is on the wire.
+    /// The connection counts toward the budget and the edge may write
+    /// unsolicited frames on it. Flipped inside `Shared::join_and_grant`
+    /// (under `grant_lock`) just BEFORE the handshake writes `HELLO_OK` — it
+    /// must be set under that lock so a concurrent grant recompute counts this
+    /// connection, which is what keeps the sum of granted credits within the
+    /// budget at every instant.
     ///
-    /// Nothing the edge sends *on its own initiative* — the `STATUS` timer
-    /// above all — may go out before this is set. A client's dial requires the
-    /// first frame it reads to be `HELLO_OK`/`HELLO_REFUSED`/`REDIRECT`, so a
-    /// `STATUS` that beat the handshake (a slow WAN link plus a status
-    /// interval well under the handshake budget) would fail the dial outright.
+    /// A client's dial requires the first frame it reads to be
+    /// `HELLO_OK`/`HELLO_REFUSED`/`REDIRECT`, so nothing the edge sends on its
+    /// own initiative — the `STATUS` timer above all — may reach the socket
+    /// before `HELLO_OK`. Since `ready` is set *before* that write, the
+    /// ordering is NOT enforced by this flag: it is enforced by the handshake
+    /// holding this connection's `writer` across `join_and_grant` and the
+    /// `HELLO_OK` write, so every unsolicited-frame path blocks behind it.
     ready: AtomicBool,
     /// Readers parked on the credit gate. Lets the driver skip the gate lock
     /// entirely on the (overwhelmingly common) uncontended path.
@@ -170,7 +177,9 @@ impl Conn {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Call once, immediately after `HELLO_OK` is written. See [`Conn::ready`].
+    /// Call once, inside `Shared::join_and_grant` under `grant_lock`, just
+    /// before `HELLO_OK` is written — the handshake holds this connection's
+    /// `writer` across both, which preserves HELLO_OK-first. See [`Conn::ready`].
     pub fn set_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
