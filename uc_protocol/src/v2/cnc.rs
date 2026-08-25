@@ -27,7 +27,7 @@
 //!       free_disk_bytes (each field's own doc comment below pins its exact
 //!       offset and "next free" note — this line is deliberately not kept
 //!       byte-exact, to stop it drifting stale again as fields land)
-//! 3904..4096  reserved (zero)
+//! 4032..4096  reserved (zero)
 //! ```
 //!
 //! **crc split (deliberate):** this module is `core`-only (no_std-friendly —
@@ -174,6 +174,19 @@ const _: () = assert!(CNC_OFF_FREE_DISK_BYTES + 64 <= CNC_PAGE_LEN);
 /// after this line: 3968.
 pub const CNC_OFF_ADMIN_AUTH: usize = 3904;
 const _: () = assert!(CNC_OFF_ADMIN_AUTH + 64 <= CNC_PAGE_LEN);
+
+/// M13a: cumulative count of dead-producer holes the node has skipped on the
+/// two client-facing MPSC rings (`ingress.ring` + `query.ring`) — a client
+/// process killed between its ring claim and its commit (spec §4.2). Writer:
+/// the consensus agent, published only when the value CHANGES (it moves
+/// approximately never, and this is a shared cache line). 0 = no client has
+/// ever died mid-write, which is the expected steady state; a nonzero value
+/// means at least one client's submit was silently dropped, which is exactly
+/// the kind of thing an operator must be able to see from outside the
+/// process — same motivation as `seal_failures` and `free_disk_bytes` above.
+/// Next free reserved-band offset after this line: 4032.
+pub const CNC_OFF_INGRESS_HOLES_SKIPPED: usize = 3968;
+const _: () = assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
@@ -500,5 +513,9 @@ mod tests {
         assert_eq!(CNC_OFF_FREE_DISK_BYTES, 3840);
         // M12b: admin_auth.
         assert_eq!(CNC_OFF_ADMIN_AUTH, 3904);
+        // M13a: ingress_holes_skipped.
+        assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED, 3968);
+        assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED - CNC_OFF_ADMIN_AUTH, 64);
+        const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
     }
 }

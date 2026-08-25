@@ -68,6 +68,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_peer_advertised_limit_bytes",
     "uc2_truncations_total",
     "uc2_wipes_total",
+    "uc2_ingress_holes_skipped_total",
     "uc2_reports_unattested_total",
     "uc2_reports_implausible_total",
     "uc2_crypto_handshake_failures_total",
@@ -417,6 +418,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_ingress_holes_skipped_total",
+        "Client ring records skipped because the producing process died between its claim and its commit.",
+        s.cnc.ingress_holes_skipped(),
+    );
+    push_counter(
+        &mut out,
         "uc2_reports_unattested_total",
         "Durable reports declined for lacking a wire-0.5.0 term attestation.",
         s.reports_unattested.load(Ordering::Relaxed),
@@ -683,6 +690,14 @@ mod tests {
         text.contains(&format!("\n{name} "))
             || text.contains(&format!("\n{name}{{"))
             || text.contains(&format!("\n# TYPE {name} "))
+    }
+
+    #[test]
+    fn ingress_holes_skipped_is_exported() {
+        let s = synthetic_sources();
+        assert!(render_prometheus(&s).contains("uc2_ingress_holes_skipped_total 0"));
+        s.cnc.store_ingress_holes_skipped(2);
+        assert!(render_prometheus(&s).contains("uc2_ingress_holes_skipped_total 2"));
     }
 
     #[test]
