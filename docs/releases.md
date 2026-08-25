@@ -1,5 +1,86 @@
 # ultima_cluster releases
 
+## v2.7.0 — M13 remote path: performance and flow control
+
+**Three defects, one milestone.** Located by
+`docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`, a per-hop isolation bench
+that put a dummy sink behind each hop and a minimal driver in front of it, so
+the bottleneck was found by subtraction rather than inferred from an
+end-to-end number. Spec:
+`docs/superpowers/specs/2026-08-24-uc2-m13-remote-path-design.md`. Gate:
+`docs/benchmarks/uc2-m13-gate-2026-08-24.md`.
+
+**Nothing in this release touches consensus, the node-to-node wire protocol,
+or the cnc page layout.** `uc_protocol::version::CURRENT` stays `0.5.0`. The
+remote wire protocol stays v1, with two clarifications to its reference (a
+`credits` value MAY decrease and is honoured immediately for new seqs;
+`STATUS` MAY be sent at any time) that describe behaviour the client already
+had.
+
+### The client (`uc2_remote`)
+
+*Filled in by track B at merge: the split halves, what moved from the old
+client unchanged, and the ported `client_fake_edge` scenarios.*
+
+### The ring (`uc_protocol::ring::mpsc`)
+
+*Filled in by track A at merge: per-record commit, the lap-stamped commit
+word, the dead-producer hole and its `IngressRingWedged` residual, the loom
+model, and the ring-magic bump.*
+
+### The edge budget (`uc2_gateway`)
+
+`Shared` carries `budget = max_inflight − max_inflight / 8` and a `live`
+count of handshaken connections; a connection's grant is
+`clamp(budget / live, 1, per_conn_inflight)`, exported as
+`uc2_gateway::budget_for` / `uc2_gateway::grant_for`. `Conn` gains a dynamic
+`ceiling` that `relax` climbs towards, so a connection that relaxes after a
+backpressure episode cannot climb past the share its neighbours leave it.
+
+Two ordering decisions carry the invariant "the sum of grants never exceeds
+the budget", and they are the whole of the design:
+
+- **On connect**, a handshake counts itself into `live`, asks for a
+  republication, and **waits** (bounded, `GRANT_SETTLE_TIMEOUT` = 250 ms,
+  normally microseconds) for the driver to have pushed the smaller share to
+  every connection already attached — *then* computes its own grant and puts
+  it in `HELLO_OK`. Granting first and shrinking the others afterwards would
+  over-promise the window for as long as the republication took.
+- **On disconnect**, the connection leaves the table *before* it leaves the
+  budget. The reverse order would let the survivors grow into a share the
+  departing connection still nominally held.
+
+The reduction itself is written by the **driver** thread, never by a
+handshaking reader: the driver is the only thread allowed to write on a
+connection other than its own, and a reader that took another connection's
+writer lock could stall for the socket write timeout. A reduction is also
+pushed from the reader on its *own* connection the moment `Conn::squeeze`
+fires — the call site M12's §4.2 asked for and `edge.rs` never had.
+
+`EdgeStats` gains `grant_changes`. `EdgeConfig::validate` gains
+`PerConnExceedsBudget` (a named refusal: one connection must be grantable in
+full) and `EdgeConfig::warnings()` gains a `max_connections > budget`
+advisory, printed once by the daemon — past that point every grant floors at
+1 and the sum stops fitting the window, which is legal and miserable.
+
+### What the 2.6.0 collapse actually was
+
+`docs/notes/uc2-m12a-edge-flow-control-gap.md` blamed the missing budget. The
+bench refuted it: the collapse reproduced with the edge's window at 65536 and
+at 4096, with a raw client and with `RemoteClient`, against a sink with no
+admission window, and at 2,048 total outstanding — inside the envelope that
+note prescribed. The cause was the ingress ring's publish convoy. That note
+now carries a correction paragraph; `run-a-gateway.md`'s operating envelope
+and the `CPUQuota=` advice in the systemd unit are retired, the latter
+because CPU containment starved the preempted producer and made the convoy
+worse.
+
+### M12 gate row 2
+
+Closed by reference to M13 gate row b. Row 2 compared one TCP client to one
+shared-memory client at equal inflight, which the bench showed to be the
+wrong comparison; row b is the re-specification the bench recommended.
+
 ## v2.6.0 — M12 adoptable cluster — *prepared, not yet tagged*
 
 **Four sub-milestones, one tag.** M12a (gateway kit) merged at `185783e`,

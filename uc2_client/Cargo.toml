@@ -14,8 +14,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
-uc2_log = { path = "../uc2_log", version = "2.6.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.7.0" }
+uc2_log = { path = "../uc2_log", version = "2.7.0" }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
@@ -29,5 +29,5 @@ thiserror = { workspace = true }
 # manifest instead (standard idiom for a dev-only test-time-only dependency).
 uc2_node = { path = "../uc2_node" }
 uc2_service = { path = "../uc2_service" }
-uc2_net = { path = "../uc2_net", version = "2.6.0" }
+uc2_net = { path = "../uc2_net", version = "2.7.0" }
 tempfile = { workspace = true }

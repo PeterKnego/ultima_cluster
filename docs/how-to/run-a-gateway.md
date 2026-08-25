@@ -27,55 +27,65 @@ node-id → gateway-address table that answers `REDIRECT` and `LEADER_CHANGED`
 node B doesn't recognize gets stuck. See
 [the config reference](../reference/gateway-config.md) for every key.
 
-## Operating envelope (2.6.0)
+## Operating envelope (2.7.0)
 
-**Size total client inflight against the node's admission window, not against
-the gateway's own limits.** The edge grants credits **per connection** — each
-connection is handed `[limits] per_conn_inflight` in full at `HELLO_OK`, and
-the halve-on-backpressure / relax-back ladder runs per connection too. There
-is **no global budget across connections** tied to the co-located node's
-ingress admission window, so nothing stops N connections from collectively
-asking for far more than the node can admit.
+**The rule is connections versus cores.** Everything else the edge used to
+need sizing against is now arithmetic it does itself.
 
-Inside its envelope the edge aggregates well. The 2026-08-24 fleet ladder
-([gate record][edgesat], 4 × `c6id.2xlarge`) measured **451k resp/s aggregate
-at N = 4 connections** — 0.32× the backend's measured 1.42M/s peak — each
-connection holding ~108–113k/s, 0 lost. Past the envelope the edge does
-**not** degrade gracefully; it collapses: at N = 8 (1024 inflight each) the
-aggregate fell to **10,774 resp/s** (a ~30× drop) with p95 4.3 s, and N = 16
-**lost 9,126 responses**, while the edge process burned ~7 of the host's 8
-cores and starved the co-located node and service. That run had the edge's
-protective per-connection cap active at its row-2 value, so this is a
-[confirmed product defect][cleanrun], not a misconfiguration — the fix (a
-global, admission-aware outstanding-grant budget at the edge) is planned as
-the next milestone.
+`2.7.0` gives the edge a **global grant budget**: it holds one `Engine`
+inflight window, keeps an eighth of it back as headroom, and divides the
+rest equally across its live connections —
+`grant = clamp(budget / connections, 1, per_conn_inflight)`. A connection is
+told its grant in `HELLO_OK`; when a new connection shrinks everyone's share
+the smaller number is pushed as a `STATUS` **before** the affected clients
+can send into it, and when a connection leaves the survivors grow back into
+its share. So the sum of what this edge has promised never exceeds what its
+node can accept, and the reactive halve-on-backpressure ladder — which in
+`2.6.0` was the only cross-connection arbiter there was — is now the
+exception path. See [the grant budget](../reference/gateway-config.md#the-grant-budget-270)
+for the numbers and the two startup checks that go with it
+(`per_conn_inflight` above the budget is a refusal; `max_connections` above
+it is a warning).
 
-**Until it lands, operate inside two rules:**
+**The 2.6.0 collapse is gone.** That release's envelope warned that N
+connections past the node's admission window did not degrade but collapsed —
+~30× down, second-scale p95, lost responses, the edge burning seven of eight
+cores. The [hop bench](../benchmarks/uc2-m13-hop-bench-2026-08-24.md) located
+the cause, and it was not the credit design: it was a convoy in the
+shared-memory MPSC ingress ring, where producers published in claim order and
+spun on their predecessor, so one preempted producer stalled all of them.
+`2.7.0` replaces that with per-record commit (no producer ever waits for
+another), which is why the rule below is about **cores**, not about inflight
+arithmetic. The [correction note](../notes/uc2-m12a-edge-flow-control-gap.md)
+records what the `2.6.0` diagnosis got right and what it got wrong.
 
-1. **Total client inflight across every connection to one edge must stay
-   below the node's admission window.** That window is `[node]
-   admission_bytes` (default `262144` — 256 KiB, ≈ 4–6k in-flight frames at
-   small payloads; see [the node config
-   reference](../reference/configuration.md)). With the default
-   `per_conn_inflight = 256` that is roughly 16 fully-loaded connections per
-   edge; raise `per_conn_inflight` and divide accordingly. Count the clients,
-   multiply by the window each actually keeps open, and compare — the edge
-   will not do this arithmetic for you, and `max_connections` (default
-   `1024`) is far above it.
-2. **Bound the gateway's CPU when it is co-located with a node** — which is
-   the supported topology. The edge has no CPU limit of its own, and the
-   node's busy-spin agents have no protection from an edge that starts
-   churning. `packaging/systemd/uc2-gateway.service` carries a commented
-   `CPUQuota=` line for exactly this; uncomment and size it to leave the node
-   and service their cores.
+**What still needs your attention:**
 
-Nothing warns you before you cross the line. The leading signals are the
-gateway stats line's `backpressure` and `retries` counters climbing together
-(see [Stats line](#stats-line)) and the node's `Uc2AdmissionSaturated` alert
-([Monitor a cluster](monitor-a-cluster.md)).
+1. **Count threads against cores.** One edge costs one acceptor, one driver,
+   and **one reader thread per connection**; the co-located node runs four
+   busy-spin agents and the service one more. On an 8-vCPU host, an edge with
+   more than a handful of *busy* connections is oversubscribed, and past that
+   point more connections buy latency, not throughput. The measured shape:
+   one connection through the edge relays at the cluster's own commit
+   ceiling, the aggregate knee is around two connections (the single driver
+   thread saturates), and past the knee the curve is flat, then slowly down —
+   degradation, not a cliff. `max_connections` (default `1024`) bounds
+   threads and sockets; it is not a capacity number and never was.
+2. **Bound the gateway's CPU only if you have a reason to.** With the convoy
+   gone, `CPUQuota=` is a policy choice about who owns the host's cores, not
+   a protection against collapse — and it was never protection: throttling
+   the edge made the convoy *worse*, because it starved the preempted
+   producer harder.
+3. **Size `per_conn_inflight` as a ceiling, not an allocation.** It caps what
+   one connection may hold while few are attached; the budget takes over as
+   more arrive. A value above the budget is refused at startup by name.
 
-[edgesat]: ../benchmarks/uc2-m12-gate-2026-08-22.md#edge-saturation-ladder-2026-08-24-n-client-aggregate
-[cleanrun]: ../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact
+The signals worth watching are the stats line's `backpressure` (should be
+near zero — grants that fit the window do not hit it), `grant_changes` (moves
+when connections come and go, quiet otherwise), and the node's
+`Uc2AdmissionSaturated` alert ([Monitor a cluster](monitor-a-cluster.md)).
+
+[gate]: ../benchmarks/uc2-m13-gate-2026-08-24.md
 
 ## Start it
 
@@ -236,9 +246,11 @@ counts them, so a rising number is the signal to raise the ceiling or spread
 clients across members.
 
 **`max_connections` is not a capacity number.** It bounds threads and
-sockets, not inflight work: the edge collapses well below `1024` connections
-if their combined inflight exceeds the node's admission window. Size that
-first — see [Operating envelope (2.6.0)](#operating-envelope-260).
+sockets, not throughput: one reader thread per connection is a real cost on a
+host that is also running a node and a service. Size it against the host's
+cores — see [Operating envelope (2.7.0)](#operating-envelope-270) — and note
+that a value above the edge's grant budget is a startup warning, because
+every connection past the budget is granted the floor of one credit.
 
 ## The single-driver head-of-line caveat
 
@@ -284,7 +296,9 @@ instead of a silent maybe.
 main loop's 100 ms polling interval), exactly these fields in order:
 `conns` (connections accepted), `submits`, `queries`, `responses`,
 `redirects`, `retries`, `unknown`, `backpressure` (squeeze events),
-`leader_changes` (observed leader-watch transitions), `status`
+`grant_changes` (per-connection grant redivisions — moves as connections come
+and go, quiet otherwise), `leader_changes` (observed leader-watch
+transitions), `status`
 (standalone `STATUS` frames written), and `refused_busy` (dials turned away
 at the `max_connections` ceiling). `EdgeStats` also tracks
 `leader_changed_frames` (`LEADER_CHANGED` frames actually written, which can

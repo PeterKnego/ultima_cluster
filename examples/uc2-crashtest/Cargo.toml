@@ -44,36 +44,36 @@ survival-tests = []
 enospc-tests = []
 
 [dependencies]
-uc2_node      = { path = "../../uc2_node", version = "2.6.0" }
-uc2_service   = { path = "../../uc2_service", version = "2.6.0" }
-uc2_net       = { path = "../../uc2_net", version = "2.6.0" }
-uc2_consensus = { path = "../../uc2_consensus", version = "2.6.0" }
+uc2_node      = { path = "../../uc2_node", version = "2.7.0" }
+uc2_service   = { path = "../../uc2_service", version = "2.7.0" }
+uc2_net       = { path = "../../uc2_net", version = "2.7.0" }
+uc2_consensus = { path = "../../uc2_consensus", version = "2.7.0" }
 # M8 Task 15: crypto-material fixture (key generation) for the hard-crash
 # tests' UC2_CRYPTO=1 path, plus the node bin's --crypto-key/--crypto-allowlist
 # CLI wiring. Already a transitive dep via uc2_node; declared directly because
 # both the bin and the integration tests reference it by name.
-uc2_crypto    = { path = "../../uc2_crypto", version = "2.6.0" }
+uc2_crypto    = { path = "../../uc2_crypto", version = "2.7.0" }
 # pulls in the `RegisterSm: uc2_service::StateMachine` impl (the `v2` feature is
 # now uc-lincheck's only SDK target).
 uc-lincheck   = { path = "../../uc-lincheck", default-features = false, features = ["v2"] }
 # M12a Task 11: the `uc2-crashtest-gateway` bin's `Edge`.
-uc2_gateway   = { path = "../../uc2_gateway", version = "2.6.0" }
+uc2_gateway   = { path = "../../uc2_gateway", version = "2.7.0" }
 clap          = { version = "4", features = ["derive"] }
 anyhow        = { workspace = true }
 
 # uc-lincheck is already a [dependency] (used by the bins) and is therefore
 # available to the integration tests too — no dev-dep needed.
 [dev-dependencies]
-uc2_client = { path = "../../uc2_client", version = "2.6.0" }
+uc2_client = { path = "../../uc2_client", version = "2.7.0" }
 # M7 Task 10: `sigkill_mid_config_window` drives the leader's cnc admin slot
 # directly (the `uc2ctl`/`reconfig.rs` harness pattern), reading the cnc file
 # without going through a client.
-uc2_log      = { path = "../../uc2_log", version = "2.6.0" }
-uc_protocol  = { path = "../../uc_protocol", version = "2.6.0" } # NODE_FLAG_LEADER/CAN_SERVE constants
+uc2_log      = { path = "../../uc2_log", version = "2.7.0" }
+uc_protocol  = { path = "../../uc_protocol", version = "2.7.0" } # NODE_FLAG_LEADER/CAN_SERVE constants
 # M12a Task 11: `tests/remote_lin.rs` drives the cluster through three real
 # gateway processes over the framed TCP remote protocol, so it needs the
 # remote SDK and the codec the gateway passes through opaquely.
-uc2_remote = { path = "../../uc2_remote", version = "2.6.0" }
+uc2_remote = { path = "../../uc2_remote", version = "2.7.0" }
 bincode    = { workspace = true }
 tempfile   = { workspace = true }
 rand       = { workspace = true } # seeded op selection in hard_crash.rs

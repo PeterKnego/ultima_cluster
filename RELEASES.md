@@ -7,6 +7,76 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## v2.7.0 — the remote path at the cluster's speed (M13)
+
+The remote path — `client → TCP → gateway → shared memory → node` — now runs
+at the backend's own rate and **degrades instead of collapsing** when a host
+has more connections than cores. Three defects, located by a per-hop
+isolation bench that measured every hop alone
+([the bench](docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md)) and fixed
+together. Nothing here touches consensus, the node-to-node wire protocol, or
+the cnc page; the remote wire protocol stays v1. Proof record, row by row:
+[M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md).
+
+- **A rebuilt remote client** (`uc2_remote`): the same blocking
+  `RemoteClient::submit` / `Ticket::wait` surface, over an `Engine`-shaped
+  split — a submitter that encodes straight into a preallocated outgoing
+  ring, a writer thread that coalesces whatever is queued into one `write`,
+  a reader that resolves completions without a lock, and a poll half for
+  callers that want batches instead of tickets. The old client paid one
+  `write` and about seven futex operations **per request**; it capped at
+  ~171k responses/s against a sink that answered instantly, while a raw
+  client through the same shipped gateway into the same shipped cluster did
+  1.14M/s. That gap was the remote path's bottleneck, by 7×. →
+  [Remote protocol](docs/reference/remote-protocol.md) ·
+  [the hop bench](docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md)
+- **A shared-memory ingress ring that cannot convoy**
+  (`uc_protocol::ring::mpsc`): producers now commit their own record and no
+  producer ever waits for another; the single consumer walks records in claim
+  order and stops at the first uncommitted one. A producer that is preempted
+  mid-record costs one consumer stall, not a pile-up of every other producer
+  spinning on it. A producer that *dies* mid-record leaves a hole the
+  consumer skips after `hole_timeout`, counted and logged, instead of
+  wedging every producer forever. →
+  [The MPSC publish convoy, explained](docs/notes/uc2-m13-mpsc-publish-convoy-explained.md)
+- **A global credit budget at the gateway**: the edge holds one `Engine`
+  window, keeps an eighth back as headroom, and divides the rest equally
+  across its live connections instead of promising each one the same
+  constant. A shrinking share is pushed as a `STATUS` before the client can
+  send into it; a growing one rides the next response. Two new startup
+  checks come with it — `per_conn_inflight` above the budget is a named
+  refusal, `max_connections` above it a printed warning. The old
+  halve-on-backpressure ladder is still there and is now the exception path.
+  →
+  [The grant budget](docs/reference/gateway-config.md#the-grant-budget-270) ·
+  [Run a gateway](docs/how-to/run-a-gateway.md#operating-envelope-270)
+- **Fixed:** the `2.6.0` gateway collapse — ~30× throughput loss, second-scale
+  p95 and lost responses past eight connections on an eight-core host — is
+  gone, and its diagnosis is corrected. It was **not** the missing credit
+  budget the `2.6.0` envelope blamed: it reproduced at 2,048 outstanding
+  requests, well inside that envelope, against a sink with no admission
+  window at all. It was the ingress ring's publish convoy. The `2.6.0`
+  operating envelope and the `CPUQuota=` advice that went with it are both
+  retired — CPU containment made the convoy *worse*. →
+  [the correction](docs/notes/uc2-m12a-edge-flow-control-gap.md) ·
+  [M12 gate row 2, closed](docs/benchmarks/uc2-m12-gate-2026-08-22.md)
+- **Performance:** measured on a 4× `c6id.2xlarge` fleet, the gate's
+  adjudicated rows — one connection through the gateway against the direct
+  shared-memory arm on the same cluster generation, the N-connection
+  aggregate against the same reference, the 1→16 connection ladder for
+  monotonicity, and N shared-memory engines on an oversubscribed host. →
+  [M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md) ·
+  [per-hop bench](docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md)
+
+**Upgrade consequence.** The ingress ring's on-disk header changed, so its
+magic is bumped and a stale attach is refused by name. **Restart the node,
+the service, the gateway and every local client on a host together** — this
+is a same-host restart, not a cluster flag day: nodes on different hosts do
+not talk to each other through this ring, and the node-to-node wire protocol
+is untouched. A gateway `[limits]` section with `per_conn_inflight` above the
+grant budget (`max_inflight` less an eighth) now refuses to start, by name. →
+[Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+
 ## v2.6.0 — adoptable cluster (M12) — *prepared, not yet tagged*
 
 **Written before the tag, as every release here is.** The four M12
@@ -186,7 +256,7 @@ written down.
   total client inflight across all connections to one edge under the node's
   admission window, and bound a co-located gateway's CPU (`CPUQuota=`, shipped
   commented in the unit file). →
-  [Operating envelope](docs/how-to/run-a-gateway.md#operating-envelope-260) ·
+  [Operating envelope](docs/how-to/run-a-gateway.md#operating-envelope-270) ·
   [gate record § the confirmed defect](docs/benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact)
 - **Gates** — [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md),
   reported the way this project reports: what ran, and what did not.

@@ -13,11 +13,14 @@ TimeoutStopSec=5
 KillSignal=SIGTERM
 LimitNOFILE=65536
 
-# Bound the gateway's CPU when it shares a host with its node (the supported
-# topology): under cross-connection overload the edge can burn nearly every
-# core and starve the node's busy-spin agents. Uncomment and size it to leave
-# the node and service their cores — see
-# docs/how-to/run-a-gateway.md#operating-envelope-260
+# Optional: bound the gateway's CPU when it shares a host with its node (the
+# supported topology). This is a policy choice about who owns the host's
+# cores — it is NOT protection against overload. Before 2.7.0 this comment
+# claimed it was; that was wrong twice over, because the 2.6.0 collapse was a
+# convoy in the shared ingress ring (fixed in 2.7.0) and throttling the edge
+# made that convoy WORSE, not better, by starving the preempted producer.
+# Size it to leave the node and service their cores if you want the guarantee
+# — see docs/how-to/run-a-gateway.md#operating-envelope-270
 # CPUQuota=200%
 
 [Install]
