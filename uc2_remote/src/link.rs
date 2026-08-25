@@ -167,7 +167,6 @@ pub(crate) struct StatCells {
     pub(crate) reconnects: AtomicU64,
     pub(crate) resends: AtomicU64,
     pub(crate) retries: AtomicU64,
-    #[allow(dead_code, reason = "task 9 counts UNKNOWN frames here")]
     pub(crate) unknown: AtomicU64,
     pub(crate) expired: AtomicU64,
     pub(crate) max_credits_seen: AtomicU32,
@@ -457,11 +456,14 @@ impl Link {
     /// the queue is full, so this outcome was dropped.
     ///
     /// **While the link is open the park terminates and nothing is dropped.**
-    /// The slot side can always take one more (a request is either a live slot
-    /// or a queued record, never both, so `live_slots + queued <=
-    /// max_inflight <= CompletionQueue::entries()`), and the arena side is
-    /// floored at `MAX_FRAME_LEN`, so the poller draining even one record
-    /// frees room for any body this wire admits.
+    /// The poller drains the queue continuously while the link is up, so this
+    /// park always ends with room to push: each drained record frees a queue
+    /// entry, and the arena side is floored at `MAX_FRAME_LEN`, so draining
+    /// even one record frees room for any body this wire admits. The slot and
+    /// queue counts track `max_inflight` closely (a request is a live slot or a
+    /// queued record, rarely both — the reader frees the slot just before it
+    /// pushes the record, so `queued` can momentarily exceed it), but what
+    /// guarantees the park ends is the poller's progress, not that bound.
     ///
     /// **After `close` the loop gives up instead.** The slot bound does not
     /// cover the arena: `push` also refuses a body that does not fit the free
@@ -1626,7 +1628,6 @@ impl Reader {
                     self.link.stats.refused_members.fetch_add(1, Ordering::Relaxed);
                     return Act::Reconnect(None);
                 }
-                self.link.close_from_thread();
                 Act::Stop
             }
             _ => Act::Continue,

@@ -185,7 +185,7 @@ impl SlotTable {
         self.take(seq)
     }
 
-    #[allow(dead_code, reason = "task 9 aborts a slot the edge answered finally")]
+    #[cfg(test)]
     pub(crate) fn abort(&self, seq: u64) -> Resolve {
         self.take(seq)
     }
@@ -276,7 +276,7 @@ impl SlotTable {
     /// be **positional** — a frame is copied back out of the outgoing ring
     /// exactly as it was staged, so the re-send never has to know which of the
     /// two kinds it is carrying.
-    #[allow(dead_code, reason = "recorded at claim; read only by this module's tests")]
+    #[cfg(test)]
     pub(crate) fn kind(&self, seq: u64) -> ReqKind {
         if self.slot(seq).kind.load(Ordering::Relaxed) == ReqKind::Query as u8 {
             ReqKind::Query

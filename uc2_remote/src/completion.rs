@@ -33,11 +33,8 @@ use crate::park::WaitCell;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OutcomeTag {
-    #[allow(dead_code, reason = "task 6 tags a RESPONSE frame with this")]
     Response,
-    #[allow(dead_code, reason = "task 9 tags an UNKNOWN frame with this")]
     Unknown,
-    #[allow(dead_code, reason = "task 8 tags a RETRY{PAYLOAD_TOO_LARGE} with this")]
     PayloadTooLarge,
     TimedOut,
     Closed,
