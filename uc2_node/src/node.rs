@@ -1212,7 +1212,7 @@ impl Node {
             next_nonce: 0,
             admission_bytes: cfg.admission_bytes,
             pending_ring_ingress: None,
-            last_holes_published: 0,
+            last_holes_published: (0, 0),
             sock: cons_sock,
             id_to_addr,
             addr_to_id,
@@ -1725,9 +1725,12 @@ struct Consensus {
     /// the ring (its consumer position advanced), so it MUST be retried here
     /// rather than dropped. `(client_id, local_seq, payload)`.
     pending_ring_ingress: Option<(u32, u32, Vec<u8>)>,
-    /// M13a: the last `holes_skipped` sum published to the cnc page. The
-    /// cnc store and the log line fire only when the sum moves.
-    last_holes_published: u64,
+    /// M13a: the last `holes_skipped` values published to the cnc page, per
+    /// ring (`(ingress, query)`). The cnc store and the log line fire only
+    /// when that ring's own count moves — the two are NOT summed, so an
+    /// operator can tell a losing submit path from a losing read path
+    /// (final-review ruling on Important 2).
+    last_holes_published: (u64, u64),
     sock: FaultSocket,
     id_to_addr: HashMap<NodeId, SocketAddr>,
     addr_to_id: HashMap<SocketAddr, NodeId>,
@@ -3081,46 +3084,104 @@ impl Consensus {
         Ok(position)
     }
 
-    /// M13a: a ring error from a client-facing MPSC ring. Everything except
-    /// `Wedged` ends this drain cycle and is retried next cycle (the record
-    /// was not consumed). `Wedged` cannot be retried — the consumer is stuck
-    /// behind a claim whose length is unknowable (spec §4.2) — so the
-    /// consensus agent fail-stops the same way `Action::Fatal` does: a panic
-    /// on the agent thread, which the `AgentRunner` drop-guard turns into a
-    /// finished flag, which `uc2-node`'s main loop reports as
-    /// `agent_failstopped` before exiting 1 for systemd to restart.
+    /// M13a: a ring error from a client-facing MPSC ring. Two of them are
+    /// UNRECOVERABLE and fail-stop; everything else (`Full`, `Empty`, …) ends
+    /// this drain cycle and is genuinely retried next cycle.
+    ///
+    /// * `Wedged` — the consumer is stuck behind a claim whose length is
+    ///   unknowable (spec §4.2). Nothing can size the hole, ever.
+    /// * `Corrupt` / `BadCrc` — the record AT `consumer_position` does not
+    ///   decode. On an MPSC ring that slot is immutable until the consumer
+    ///   advances past it (no producer may claim a range the consumer has not
+    ///   released), so "retry at the same position next cycle" re-reads the
+    ///   same bytes forever: a permanent, silent stall of every client on the
+    ///   ring, with `can_serve` still set and nothing in `/metrics` moving.
+    ///   Found by the M13a final review (Important 1).
+    ///
+    /// Fail-stop is the same path `Action::Fatal` uses: a panic on the agent
+    /// thread, which the `AgentRunner` drop-guard turns into a finished flag,
+    /// which `uc2-node`'s main loop reports as `agent_failstopped` before
+    /// exiting 1 for systemd to restart. The rings are volatile, so the
+    /// restarted node starts clean.
     fn ring_error_fail_stop(&self, e: &RingError, ring: &'static str) {
-        if let RingError::Wedged { position } = e {
-            crate::obs_event!(
-                Error,
-                "ingress_ring_wedged",
-                node = self.id as u64,
-                ring = ring,
-                position = *position
-            );
-            panic!(
-                "consensus fatal (fail-stop): IngressRingWedged ring={ring} position={position} \
-                 — a producer died between its claim and its claim word; the hole's length is \
-                 unknowable. Restart the node; every attached client must reattach."
-            );
+        match e {
+            RingError::Wedged { position } => {
+                crate::obs_event!(
+                    Error,
+                    "ingress_ring_wedged",
+                    node = self.id as u64,
+                    ring = ring,
+                    position = *position
+                );
+                panic!(
+                    "consensus fatal (fail-stop): IngressRingWedged ring={ring} \
+                     position={position} — a producer died between its claim and its claim \
+                     word; the hole's length is unknowable. Restart the node; every attached \
+                     client must reattach."
+                );
+            }
+            // Final review, Important 1: a decode failure is ALSO unrecoverable
+            // on an MPSC ring, and used to be treated as transient. The slot at
+            // `consumer_position` is immutable until the consumer advances past
+            // it — no producer may claim it again — so a `Corrupt`/`BadCrc`
+            // there is not "retried next cycle", it is re-read identically
+            // forever: a permanent silent stall of every client on this ring
+            // with `can_serve` still set and no signal anywhere. Fail-stop, same
+            // chain as `Wedged`.
+            RingError::Corrupt(_) | RingError::BadCrc => {
+                let detail = e.to_string();
+                crate::obs_event!(
+                    Error,
+                    "ingress_ring_corrupt",
+                    node = self.id as u64,
+                    ring = ring,
+                    detail = detail.as_str()
+                );
+                panic!(
+                    "consensus fatal (fail-stop): IngressRingCorrupt ring={ring} ({e}) — the \
+                     record at the consumer position does not decode, and an MPSC slot is \
+                     immutable until the consumer passes it, so this cannot be retried. \
+                     Restart the node; every attached client must reattach."
+                );
+            }
+            _ => {}
         }
     }
 
     /// M13a: mirror the two client-facing rings' skipped-hole counts onto the
-    /// cnc page for `/metrics`, and log the first observation of each new
-    /// hole. Called once per duty cycle from `publish_status`; the store and
-    /// the log fire only when the sum changes.
+    /// cnc page for `/metrics`, and log each new hole. Called once per duty
+    /// cycle from `publish_status`; each ring's store and log line fire only
+    /// when THAT ring's count changes.
+    ///
+    /// Final review (Important 2): the two counts are published to two cnc
+    /// lines and exported as two `/metrics` series, not summed into one. A
+    /// single aggregate told an operator that something on this host had
+    /// abandoned a claim but not whether it was the submit path or the read
+    /// path — which are different clients, different code, different fixes.
     fn publish_ring_holes(&mut self) {
-        let holes = self.ingress_ring.holes_skipped() + self.query_ring.holes_skipped();
-        if holes != self.last_holes_published {
-            self.cnc.store_ingress_holes_skipped(holes);
+        let ingress = self.ingress_ring.holes_skipped();
+        if ingress != self.last_holes_published.0 {
+            self.cnc.store_ingress_holes_skipped(ingress);
             crate::obs_event!(
                 Warn,
                 "ingress_hole_skipped",
                 node = self.id as u64,
-                holes_skipped = holes
+                ring = "ingress",
+                holes_skipped = ingress
             );
-            self.last_holes_published = holes;
+            self.last_holes_published.0 = ingress;
+        }
+        let query = self.query_ring.holes_skipped();
+        if query != self.last_holes_published.1 {
+            self.cnc.store_query_holes_skipped(query);
+            crate::obs_event!(
+                Warn,
+                "ingress_hole_skipped",
+                node = self.id as u64,
+                ring = "query",
+                holes_skipped = query
+            );
+            self.last_holes_published.1 = query;
         }
     }
 
@@ -3173,11 +3234,12 @@ impl Consensus {
                     did = true;
                 }
                 Ok(None) => break,
-                // Corrupt record (bad crc/magic — the wire has no per-record
-                // recovery once framing is suspect): stop this cycle rather
-                // than risk misreading a subsequent slot; the next cycle
-                // re-tries at the same (unread) consumer position. A
-                // `Wedged` ring never returns from the call below.
+                // `Full`/`Empty` and friends end this cycle and are retried
+                // next cycle. `Wedged`, `Corrupt` and `BadCrc` never return
+                // from the call below: an MPSC slot is immutable until the
+                // consumer passes it, so "retry at the same position" would
+                // re-read the same undecodable bytes forever — a permanent
+                // silent stall, not a retry (final review, Important 1).
                 Err(e) => {
                     self.ring_error_fail_stop(&e, "ingress");
                     break;
@@ -3445,9 +3507,10 @@ impl Consensus {
                     self.pending_reads.push(read);
                 }
                 Ok(None) => break,
-                // Corrupt record: stop this cycle (retried at the same unread
-                // position next cycle) — same posture as the ingress drain. A
-                // `Wedged` ring never returns from the call below.
+                // Same posture as the ingress drain: only the transient
+                // errors reach the `break`. `Wedged`/`Corrupt`/`BadCrc`
+                // fail-stop inside the call below rather than stalling this
+                // ring forever (final review, Important 1).
                 Err(e) => {
                     self.ring_error_fail_stop(&e, "query");
                     break;
@@ -5725,7 +5788,7 @@ mod tests {
             next_nonce: 0,
             admission_bytes: 256 * 1024,
             pending_ring_ingress: None,
-            last_holes_published: 0,
+            last_holes_published: (0, 0),
             sock,
             id_to_addr,
             addr_to_id,
@@ -8209,6 +8272,33 @@ mod tests {
 
         h.cons.publish_ring_holes();
         assert_eq!(h.cons.cnc.ingress_holes_skipped(), 1);
+        // Final review, Important 2: the two rings are counted separately —
+        // an ingress hole must NOT show up on the query line.
+        assert_eq!(h.cons.cnc.query_holes_skipped(), 0, "the query line is independent");
+    }
+
+    /// Final review, Important 2: the query ring's holes land on the QUERY
+    /// cnc line, not the ingress one. The old code summed both into
+    /// `ingress_holes_skipped`, so an operator seeing the counter move could
+    /// not tell which client path was losing records. Mirror of the ingress
+    /// test above, driven through the real query drain.
+    #[test]
+    fn a_query_ring_hole_is_counted_on_its_own_cnc_line() {
+        let mut h = harness();
+        let (producer, _c) =
+            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
+        let dead =
+            producer.claim_without_commit(uc_protocol::v2::ipc::MSG_V2_QUERY, 0, extra_client(9, 1), b"lost").unwrap();
+        drop(dead);
+        h.cons.query_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        h.cons.drain_query_ring(); // arms the hole timer
+        h.cons.drain_query_ring(); // skips and counts it
+        assert_eq!(h.cons.query_ring.holes_skipped(), 1);
+
+        h.cons.publish_ring_holes();
+        assert_eq!(h.cons.cnc.query_holes_skipped(), 1, "counted on the query line");
+        assert_eq!(h.cons.cnc.ingress_holes_skipped(), 0, "NOT summed into ingress");
     }
 
     /// M13a: the unsized hole (`RingError::Wedged`) is not recoverable — the
@@ -8269,12 +8359,69 @@ mod tests {
         h.cons.drain_query_ring();
     }
 
-    /// Every other ring error stays what it was: a bounded, non-fatal end to
-    /// this drain cycle.
+    /// Every TRANSIENT ring error stays what it was: a bounded, non-fatal end
+    /// to this drain cycle. (`BadCrc` used to be in this list and no longer
+    /// is — see the `IngressRingCorrupt` tests below.)
     #[test]
     fn an_ordinary_ring_error_does_not_fail_stop() {
         let h = harness();
-        h.cons.ring_error_fail_stop(&RingError::BadCrc, "ingress");
-        h.cons.ring_error_fail_stop(&RingError::Full, "query");
+        h.cons.ring_error_fail_stop(&RingError::Full, "ingress");
+        h.cons.ring_error_fail_stop(&RingError::Empty, "query");
+        h.cons.ring_error_fail_stop(&RingError::Overwritten, "ingress");
+    }
+
+    /// Final review, Important 1: plant an UNDECODABLE committed record at
+    /// the consumer position of a ring file. `length` is `len_or_advance`
+    /// packed into the commit word; a committed word is `LAP | len` with the
+    /// CLAIMED bit clear.
+    ///
+    /// The `Corrupt` shape uses a length below the 6-byte floor; the
+    /// `BadCrc` shape uses a plausible length over an all-zero body, whose
+    /// crc32 cannot match. Both are permanent on an MPSC ring: the slot is
+    /// immutable until the consumer passes it, and the consumer cannot pass
+    /// a slot it cannot decode.
+    fn corrupt_ring_file(path: &std::path::Path, len: u32) {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let m = unsafe { memmap2::MmapMut::map_mut(&file) }.unwrap();
+        let region = Region::from_mmap(m);
+        // SAFETY: every ring file is `RingHeader` (256 B) then the slot
+        // region; an mmap base is page-aligned, so slot offset 0 is
+        // 4-byte-aligned as `store_commit_word` requires. `claim_position`
+        // is moved up so the slot classifies as this lap's, not an empty
+        // ring.
+        unsafe {
+            let header = &*(region.ptr_at(0) as *const RingHeader);
+            header.claim_position.store(len.max(8) as u64, Ordering::Release);
+            uc_protocol::ring::common::store_commit_word(
+                region.ptr_at(uc_protocol::ring::common::RING_HEADER_LEN),
+                0,
+                uc_protocol::ring::encode_commit_word(0, len, false),
+                Ordering::Release,
+            );
+        }
+    }
+
+    /// A `Corrupt` decode on the ingress ring is a PERMANENT stall, not a
+    /// retry: it must take the same fail-stop chain `Wedged` does, through
+    /// the real drain loop, with its own greppable name.
+    #[test]
+    #[should_panic(expected = "IngressRingCorrupt ring=ingress")]
+    fn a_corrupt_ingress_record_fail_stops_through_the_real_drain() {
+        let mut h = harness();
+        // Length 4: below the 6-byte floor the consumer validates.
+        corrupt_ring_file(&h._dir.path().join("ingress.ring"), 4);
+        h.cons.drain_ingress_ring(false);
+    }
+
+    /// The same for the query ring, and for the OTHER undecodable shape —
+    /// `BadCrc` (a plausible length over bytes whose crc32 does not match).
+    /// Pinned on `ring=query` so a copy-paste of the ingress arm's ring name
+    /// would fail here.
+    #[test]
+    #[should_panic(expected = "IngressRingCorrupt ring=query")]
+    fn a_bad_crc_query_record_fail_stops_through_the_real_drain() {
+        let mut h = harness();
+        corrupt_ring_file(&h._dir.path().join("query.ring"), 24);
+        h.cons.drain_query_ring();
     }
 }

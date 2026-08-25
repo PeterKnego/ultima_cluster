@@ -176,17 +176,38 @@ pub const CNC_OFF_ADMIN_AUTH: usize = 3904;
 const _: () = assert!(CNC_OFF_ADMIN_AUTH + 64 <= CNC_PAGE_LEN);
 
 /// M13a: cumulative count of dead-producer holes the node has skipped on the
-/// two client-facing MPSC rings (`ingress.ring` + `query.ring`) — a client
-/// process killed between its ring claim and its commit (spec §4.2). Writer:
-/// the consensus agent, published only when the value CHANGES (it moves
-/// approximately never, and this is a shared cache line). 0 = no client has
-/// ever died mid-write, which is the expected steady state; a nonzero value
-/// means at least one client's submit was silently dropped, which is exactly
-/// the kind of thing an operator must be able to see from outside the
-/// process — same motivation as `seal_failures` and `free_disk_bytes` above.
+/// client **ingress** MPSC ring (`ingress.ring`) — a client process killed or
+/// stalled between its ring claim and its commit (spec §4.2). The query ring
+/// has its own line, [`CNC_OFF_QUERY_HOLES_SKIPPED`]; the two are NOT summed
+/// (they were, before the M13a final review — an operator could not tell
+/// which ring was losing records). Writer: the consensus agent, published
+/// only when the value CHANGES (it moves approximately never, and this is a
+/// shared cache line).
+///
+/// 0 = no producer on this ring has ever abandoned a claim, which is the
+/// expected steady state. A nonzero value means **at least one producer's
+/// claim was abandoned** — note that a timed-out tail-PADDING claim also
+/// counts here and loses nothing at all. A submit may have been dropped; if
+/// that producer is still alive and resumes, its commit CAS is refused and
+/// it is told `Skipped` rather than left to guess. Exposed because it is
+/// exactly the kind of thing an operator must be able to see from outside
+/// the process — same motivation as `seal_failures` and `free_disk_bytes`
+/// above.
 /// Next free reserved-band offset after this line: 4032.
 pub const CNC_OFF_INGRESS_HOLES_SKIPPED: usize = 3968;
 const _: () = assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
+
+/// M13a (final review): the same counter for the client **query** MPSC ring
+/// (`query.ring`), kept separate from [`CNC_OFF_INGRESS_HOLES_SKIPPED`] so
+/// `/metrics` can export two series and an operator can tell a losing submit
+/// path from a losing read path. Same writer, same on-change-only
+/// discipline, same reading of a nonzero value.
+///
+/// This is the LAST 64-byte line of the 4 KiB page (4032 + 64 = 4096): the
+/// reserved band is now full, and a further field needs the page to grow
+/// (a cnc-layout flag day), not another offset.
+pub const CNC_OFF_QUERY_HOLES_SKIPPED: usize = 4032;
+const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
@@ -517,5 +538,10 @@ mod tests {
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED, 3968);
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED - CNC_OFF_ADMIN_AUTH, 64);
         const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
+        // M13a (final review): query_holes_skipped — the next free line
+        // after ingress's 64 bytes, and the LAST line of the page.
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 4032);
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 64);
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED + 64, CNC_PAGE_LEN);
     }
 }
