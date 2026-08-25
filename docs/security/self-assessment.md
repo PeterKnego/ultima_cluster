@@ -28,11 +28,12 @@ the enumeration this assessment worked from.
 **Method**, in three layers:
 
 1. **Code reading** of each seam above, against the threat model's actor list.
-2. **Coverage-guided fuzzing** — fourteen `cargo-fuzz` targets, one per parser
+2. **Coverage-guided fuzzing** — fifteen `cargo-fuzz` targets, one per parser
    family, with a deterministic committed seed corpus, run nightly for 600 s
-   each with an asserted execution floor. A single 20-second local sweep of all
-   fourteen targets executes ~118 M inputs; cumulative local execution during
-   M12d was several hundred million.
+   each with an asserted execution floor. A single 20-second local sweep of the
+   fourteen targets that existed during M12d executes ~118 M inputs; cumulative
+   local execution during M12d was several hundred million. The fifteenth,
+   `ring_mpsc_record`, arrived with the 2.7.0 MPSC ring rewrite.
    [VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
    is the record; [`fuzz/README.md`](/fuzz/README.md) is the operating manual.
 3. **The pre-existing correctness tiers**, which are older than this
@@ -194,10 +195,18 @@ Ranked by where we think the residual risk actually is:
    that reasoning weakens.
 5. **The `uc_protocol::ring` buffers' `unsafe` mmap code.** Five files —
    `spsc`, `mpsc`, `broadcast`, `common`, `futex` — whose layout is frozen by
-   offset-pin tests and whose *interleavings and UB are covered by nothing*.
-   The tree's one loom model checks the log buffer's frame-visibility protocol,
-   not these; Miri cannot map a file-backed region. The MPSC claim-then-commit
-   sequence and the broadcast seqlock are the two we would look at first.
+   offset-pin tests. As of 2.7.0 the MPSC ring is the one exception to "covered
+   by nothing": its claim-then-commit protocol has a loom model
+   (`uc_protocol/tests/loom_mpsc.rs`, P1–P5 plus mutation runs), its slot
+   decoder has a fuzz target (`ring_mpsc_record`), and its producer-preemption
+   case is a unit test. That model runs over a `Vec` of loom atomics — the
+   **mmap itself is outside both loom and Miri**, so mapping-level UB is still
+   uncovered, and the model omits the tail-padding path, the futex park/wake
+   and the crc32. **SPSC's interleavings and the broadcast seqlock remain
+   unmodelled**; for the seqlock that is deliberate (a faithful loom model of
+   it correctly fails under loom's full C++ semantics — see
+   `uc2_log/tests/loom_frame.rs`'s header), which is itself worth an outside
+   opinion. Those are the places we would look first.
 6. **The gateway's credit / backpressure ladder under a malicious client.** The
    caps (`MAX_FRAME_LEN`, `max_connections`, credits, write timeout) are
    designed against an over-eager client, not a hostile one. Behaviour under a
@@ -223,8 +232,8 @@ The short form:
 | WGL linearizability capstones | failover, purge/snapshot churn, partition/quorum loss |
 | Elle | transactional safety, plus a mutation tier that proves the harness can fail |
 | Multi-process SIGKILL | real processes, real reconstruction |
-| loom | the **log buffer's** frame-visibility protocol, exhaustively — a hand-written model (`uc2_log/tests/loom_frame.rs`); **not** the `uc_protocol::ring` rings |
-| **Fuzzing (§7)** | **fourteen decoder targets, nightly, with an execution floor** |
+| loom | two hand-written models: the **log buffer's** frame-visibility protocol (`uc2_log/tests/loom_frame.rs`) and the **MPSC ring's** claim-then-commit protocol (`uc_protocol/tests/loom_mpsc.rs`, since 2.7.0). Both model the protocol over loom atomics, **not** the mmap; SPSC and the broadcast seqlock are still unmodelled |
+| **Fuzzing (§7)** | **fifteen decoder targets, nightly, with an execution floor** |
 | **Miri (§7)** | **the pure decoders — 62 tests, isolation on, no exclusions; the mmap rings are out of reach** |
 
 ## 6. Dependency posture

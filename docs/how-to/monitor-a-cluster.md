@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 64 families — is the
+exposition. The full series contract — 65 families — is the
 `CONTRACT_SERIES` array in
 [`uc2_node/src/obs/metrics.rs`](../../uc2_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -66,15 +66,26 @@ everything else — snapshot/session counters, sender/receiver datagram and
 byte totals, resync counters — read the source array; each family carries
 its own one-line doc comment there.
 
-One family worth calling out because its shape is easy to misread:
-`uc2_ingress_holes_skipped_total` (since 2.7.0) is a **single counter that
-sums skipped holes across both client-facing rings**, `ingress.ring` and
-`query.ring` — it does not tell you which ring hit the hole, and there is
-no per-ring alert on it. It counts only the *recoverable* case, a stalled
-or dead producer skipped after `hole_timeout` (default 1 s). The
-unrecoverable case — a producer that dies in the few instructions between
-claiming a slot and stamping its claim word — is not a counter at all; it
-is the `IngressRingWedged` fail-stop. See
+Two families worth calling out because their shape is easy to misread:
+`uc2_ingress_holes_skipped_total` and `uc2_query_holes_skipped_total`
+(both since 2.7.0) are **one counter per client-facing ring** —
+`ingress.ring` (submits) and `query.ring` (reads) respectively. They are
+deliberately NOT summed: which ring is losing records tells you which
+client path to go and look at. Neither has an alert rule of its own;
+both are counters you watch for an edge.
+
+They count only the *recoverable* case: a claim abandoned past
+`hole_timeout` (default 1 s) by a producer that died or stalled. Read a
+nonzero value as **"at least one producer's claim was abandoned"**, not
+as "a submit was dropped" — a timed-out tail-padding claim also counts
+here and loses nothing at all, and a producer that is still alive is
+told `Skipped` when its commit is refused rather than losing the record
+silently.
+
+Two *unrecoverable* cases are not counters at all, but fail-stops: a
+producer that dies in the few instructions between claiming a slot and
+stamping its claim word (`IngressRingWedged`), and a record at the
+consumer position that does not decode (`IngressRingCorrupt`). See
 [Diagnose a node: my node just fail-stopped with `IngressRingWedged`](diagnose-a-node.md#my-node-just-fail-stopped-with-ingressringwedged).
 
 ## Install the alert rules

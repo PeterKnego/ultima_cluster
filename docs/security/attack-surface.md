@@ -7,7 +7,7 @@ what bounds it, and which fuzz target covers it. The
 inventory. [Self-assessment](self-assessment.md) records what was found in it.
 
 "Fuzz target" names a real target in [`fuzz/fuzz_targets/`](/fuzz) — there are
-fourteen, each run for 600 s per night with an asserted execution floor
+fifteen, each run for 600 s per night with an asserted execution floor
 ([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes),
 [`fuzz/README.md`](/fuzz/README.md)).
 
@@ -75,13 +75,22 @@ would need. The default in `packaging/node.example.toml` is 512.
   sessions belong to the simulation and the linearizability capstones
   ([VERIFICATION §2, §3](/docs/VERIFICATION.md)).
 - **The IPC ring buffers' `unsafe` code** (`uc_protocol/src/ring/{spsc,mpsc,
-  broadcast,common,futex}.rs`). Their **layout** is frozen by offset-pin tests,
-  and that is all. There is **no interleaving coverage and no UB coverage**:
-  the one loom model in the tree (`uc2_log/tests/loom_frame.rs`) exhaustively
-  checks the **log buffer's** frame-visibility protocol — a hand-written model
-  of that atomic handshake, not the shipped ring code — and Miri cannot map a
-  file-backed region. The MPSC claim-then-commit sequence and the broadcast
-  seqlock are therefore unchecked for interleavings; it is an open, stated
-  residue ([VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified))
-  and a named item in
+  broadcast,common,futex}.rs`). Their **layout** is frozen by offset-pin tests.
+  Since 2.7.0 the **MPSC claim-then-commit sequence is no longer unchecked**:
+  `uc_protocol/tests/loom_mpsc.rs` is a loom model of that protocol (properties
+  P1–P5, with mutation runs that prove the model can fail), its slot decoder
+  has a fuzz target (`ring_mpsc_record`), and the preemption case — a producer
+  stopped between claim and commit — is a unit test rather than a hope. What
+  the loom model covers is the **protocol**, over a `Vec` of loom atomics: the
+  mmap itself is still outside both loom and Miri (Miri cannot map a
+  file-backed region), so mapping-level UB remains uncovered, and the model
+  deliberately omits the tail-straddle padding path, the futex park/wake and
+  the crc32. The **broadcast seqlock is still unmodelled** — deliberately, and
+  the reason is written down: a faithful loom model of a seqlock-style
+  overwrite race correctly fails under loom's full C++ semantics
+  (`uc2_log/tests/loom_frame.rs`'s header), so its absence is a design
+  statement, not an oversight. SPSC's interleavings are likewise unmodelled.
+  All of that is an open, stated residue
+  ([VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified)) and a
+  named item in
   [the self-assessment's "focus here" list](self-assessment.md#4-what-an-external-review-should-focus-on).

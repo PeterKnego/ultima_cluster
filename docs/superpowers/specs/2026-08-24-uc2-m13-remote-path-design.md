@@ -300,8 +300,26 @@ the skip path itself: marking a timed-out hole (§4.2) is one
 skip marker `CLAIMED | LAP | 0`, so a producer that only stalled (not
 died) and commits in the same window loses that race harmlessly and is
 delivered normally, uncounted. See `uc_protocol/src/ring/mpsc.rs`'s module
-doc for the full as-built description, including the crc-caught residual
-of a resurrection a full lap late.
+doc for the full as-built description.
+
+Third — corrected by the final review, because the earlier wording here
+and in four other places was **false**: the crc32 does NOT catch every
+resurrection a full lap late. It catches a *partial* stomp. A *complete
+same-length* stomp is a self-consistent record (the resurrected
+producer's own header_extra, payload and crc), so it is delivered as that
+producer's record at the later claimant's position: the later claimant's
+submit is silently lost and retried by its client's timeout, and the
+resurrected record can be delivered twice — exactly-once across that is
+`Sessioned`'s job, not the ring's. A *padding* stomp is not crc-covered
+at all, because `decode_record_slice` short-circuits on
+`msg_type == PADDING_MSG_TYPE` before hashing anything; the consumer
+therefore accepts a padding marker only when its committed length is
+exactly `bytes_to_tail` (the only length real padding can have) and sends
+everything else down the crc'd record path, with the stated residual that
+a record ending flush with the tail is indistinguishable from padding.
+`claim` refuses `PADDING_MSG_TYPE` from callers
+(`RingError::ReservedMsgType`) so the ambiguity cannot be manufactured
+from above. Canonical statement: `RingError::Skipped`'s doc.
 
 ## 5. The edge: global outstanding-grant budget
 
