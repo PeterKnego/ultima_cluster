@@ -27,10 +27,16 @@ server host, the edge process and the client host):
   E  hop2+3      remote-load(C) → edge(S) → dummy-node(S)   N conns
   F  full        blaster(C)     → edge(leader) → REAL 3-node cluster (raw sm) N conns
   G  direct      engine-load(leader) → REAL cluster          1 point (reference)
+  gate         the M13 gate (spec §2): rows a/b/c from ONE remote-load ladder
+               through the edge into the real cluster against ONE same-generation
+               engine-load reference, row d from engine-load → dummy-node on the
+               server host. Prints GATE-JSON + PASS/FAIL per row and exits
+               non-zero if any bar was missed. Rows e/f are cargo tests, printed.
 
-Output: one `HOP-JSON {...}` line per point, a `HOP-TABLE` at the end. This
-is a MEASUREMENT driver — it has no bar; the exit code is 0 unless the
-infrastructure failed (no leader, no RESULT at all).
+Output: one `HOP-JSON {...}` line per point, a `HOP-TABLE` at the end. Every
+arm but `gate` is a MEASUREMENT with no bar and exits 0 unless the
+infrastructure failed; `--arms gate` adjudicates the pre-committed bars in
+`docs/benchmarks/uc2-m13-gate-2026-08-24.md` and exits non-zero on a miss.
 """
 
 import argparse
@@ -45,7 +51,7 @@ import m6_fleet_gate as m6  # noqa: E402
 import m12_fleet_gate as m12  # noqa: E402
 from m12_fleet_gate import (  # noqa: E402
     ssh, start_unit, kill_unit, tail_log, parse_result, echo,
-    sample_cpu_concurrently, wait_units_done, unit_log,
+    sample_cpu_concurrently, wait_units_done, unit_log, Verdict,
 )
 
 HOP_APP = "hop-bench"
@@ -331,6 +337,104 @@ def arm_full(m12hosts, hophosts, a, points):
         m12.stop_cluster(node_hosts)
 
 
+def detect_cores(host, override):
+    if override:
+        return override
+    r = ssh(host, "nproc", label="nproc")
+    try:
+        return int((r.stdout or "").strip().splitlines()[0])
+    except (ValueError, IndexError):
+        raise RuntimeError(f"could not read nproc on {host.public_ip}: {r.stdout!r}")
+
+
+def arm_gate(m12hosts, hophosts, a, points, verdicts):
+    """The M13 gate (spec §2, doc docs/benchmarks/uc2-m13-gate-2026-08-24.md).
+
+    Rows a, b and c all come from ONE `remote-load` ladder through the real
+    edge into the real 3-voter cluster, against ONE `engine-load` direct-arm
+    reference taken on the SAME cluster generation and the same leader — the
+    comparison M12's row 2 got wrong. Row d then runs on the server host
+    alone against `dummy-node`. Rows e and f are cargo tests; their commands
+    are printed, not run.
+    """
+    node_hosts = m12hosts[:3]
+    C = hophosts[3]
+    cores = detect_cores(hophosts[0], a.gate_cores)
+    direct_rps = 0.0
+    m12.wipe_dirs(node_hosts)
+    m12.start_cluster(node_hosts, a, "off", raw_sm=True)
+    try:
+        leader = m6.wait_leader(node_hosts, list(range(3)), m12.LEADER_WAIT_SECS)
+        if leader is None:
+            raise RuntimeError("no serving leader in the real cluster")
+        L, LH = node_hosts[leader], hophosts[leader]
+        print(f"INFO gate: real cluster leader = n{leader} ({L.public_ip}), "
+              f"{cores} cores on the server host", flush=True)
+
+        # G — the direct arm, same generation, same leader. Rows a and b are
+        # ratios against this and nothing else.
+        g = run_point(
+            f"GATE G direct engine→REAL cluster inflight={a.conn_inflight}", LH, LH,
+            ["engine-load", "--instance-dir", L.dir, "--app-id", m12.APP,
+             "--secs", str(a.secs), "--payload", str(a.payload),
+             "--inflight", str(a.conn_inflight), "--engines", "1"],
+            "engine", a.secs, a, edge_unit="node",
+            extra={"hop": "gate-g", "inflight": a.conn_inflight, "n": 1})
+        points.append(g)
+        direct_rps = g.get("rps") or 0.0
+
+        # Rows a/b/c — one remote-load ladder through the edge on the leader.
+        members = ",".join(f"{i}@{h.private_ip}:{EDGE_PORT}" for i, h in enumerate(node_hosts))
+        start_hop_edge(LH, L.dir, m12.APP, a.gate_edge_inflight, a.gate_edge_per_conn,
+                       members=members)
+        gw = f"{L.private_ip}:{EDGE_PORT}"
+        for n in ladder(a.gate_conns):
+            points.append(run_point(
+                f"GATE abc remote→edge→REAL cluster conns={n} inflight={a.conn_inflight}",
+                LH, C,
+                ["remote-load", "--gateways", gw, "--app-id", m12.APP,
+                 "--secs", str(a.secs), "--payload", str(a.payload),
+                 "--inflight", str(a.conn_inflight), "--conns", str(n)],
+                "remote", a.secs, a, edge_unit="hb-edge",
+                extra={"hop": "gate-c", "inflight": a.conn_inflight, "n": n,
+                       "driver": "remote-load"}))
+        kill_unit(LH, "hb-edge")
+    finally:
+        for h in hophosts[:3]:
+            kill_unit(h, "hb-edge")
+        m12.stop_cluster(node_hosts)
+
+    # Row d — N engines into one dummy node on the server host.
+    S = hophosts[0]
+    start_dummy_node(S, a)
+    try:
+        for n in ladder(a.gate_engines):
+            points.append(run_point(
+                f"GATE d engine→dummy-node engines={n} inflight={a.conn_inflight}", S, S,
+                ["engine-load", "--instance-dir", hop_dir(S), "--app-id", HOP_APP,
+                 "--secs", str(a.secs), "--payload", str(a.payload),
+                 "--inflight", str(a.conn_inflight), "--engines", str(n)],
+                "engine", a.secs, a, edge_unit="hb-dnode",
+                extra={"hop": "gate-d", "inflight": a.conn_inflight, "n": n}))
+    finally:
+        kill_unit(S, "hb-dnode")
+
+    verdicts.append(verdict_row_a(points, direct_rps))
+    verdicts.append(verdict_row_b(points, direct_rps))
+    verdicts.append(verdict_row_c(points))
+    verdicts.append(verdict_row_d(points, cores))
+    for v in verdicts:
+        print("GATE-JSON " + json.dumps(
+            {"row": v.row, "passed": v.passed, "detail": v.detail}), flush=True)
+    print("\nGATE rows e and f are local/CI — run them where the code is:", flush=True)
+    for c in ("cargo test -p uc_protocol",
+              'RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release loom_',
+              "cargo test -p uc2_remote",
+              "cargo test -p uc2_gateway",
+              "cargo test -p uc2_node --test remote_lin"):
+        print(f"  {c}", flush=True)
+
+
 def arm_diag(S, C, a, points):
     """Collapse diagnosis: blaster → edge → dummy-node at the rungs around the
     knee, with the EDGE's per-thread CPU + current syscall sampled mid-rung
@@ -408,11 +512,182 @@ def table(points):
     print("HOP-POINTS-JSON " + json.dumps(points), flush=True)
 
 
+# --------------------------------------------------------------- gate rows
+#
+# Every row is a PURE function of the points list, so `--selftest` can
+# adjudicate canned numbers without a fleet. The bars are spec §2's, copied
+# into the defaults below and NOT overridable from the command line — a bar
+# you can move from the shell is not a bar.
+
+BAR_A_RATIO = 0.5      # one connection through the edge vs the direct arm
+BAR_B_RATIO = 0.75     # best N-connection aggregate vs the direct arm
+BAR_C_P99_MS = 1000.0  # p99 bound at every rung
+BAR_C_RUNG = 0.8       # no rung more than 20% below the previous one
+BAR_D_FRAC = 0.5       # row d's "x 0.5" term
+BAR_D_FLOOR = 0.10     # …and its never-below-10%-of-single-engine floor
+
+
+def busy_threads(n):
+    """Busy threads at N engines: one submitter and one poll thread each, plus
+    the sink's single busy-poll drain thread."""
+    return 2 * n + 1
+
+
+def _ladder(points, hop):
+    """The usable rungs of one ladder, keyed by N, lowest first."""
+    by_n = {}
+    for p in points:
+        if p.get("hop") == hop and p.get("ok") and p.get("rps"):
+            by_n[p["n"]] = p
+    return [by_n[n] for n in sorted(by_n)]
+
+
+def verdict_row_a(points, direct_rps):
+    row = "a one connection through the edge vs direct Engine"
+    if not direct_rps:
+        return Verdict(row, False, "no direct-arm reference (G) was measured")
+    rungs = [p for p in _ladder(points, "gate-c") if p["n"] == 1]
+    if not rungs:
+        return Verdict(row, False, "no single-connection rung was measured")
+    rps = rungs[0]["rps"]
+    ratio = rps / direct_rps
+    return Verdict(row, ratio >= BAR_A_RATIO,
+                   f"{rps:.0f}/s vs direct {direct_rps:.0f}/s = {ratio:.3f}x "
+                   f"(bar >= {BAR_A_RATIO}x)")
+
+
+def verdict_row_b(points, direct_rps):
+    row = "b N-connection aggregate vs direct Engine"
+    if not direct_rps:
+        return Verdict(row, False, "no direct-arm reference (G) was measured")
+    rungs = _ladder(points, "gate-c")
+    if not rungs:
+        return Verdict(row, False, "no ladder rung was measured")
+    best = max(rungs, key=lambda p: p["rps"])
+    ratio = best["rps"] / direct_rps
+    return Verdict(row, ratio >= BAR_B_RATIO,
+                   f"best rung N={best['n']} {best['rps']:.0f}/s vs direct "
+                   f"{direct_rps:.0f}/s = {ratio:.3f}x (bar >= {BAR_B_RATIO}x)")
+
+
+def verdict_row_c(points):
+    row = "c ladder monotone, no collapse"
+    rungs = _ladder(points, "gate-c")
+    if not rungs:
+        return Verdict(row, False, "no ladder rung was measured")
+    bad = []
+    lost = 0
+    for p in rungs:
+        lost += p.get("lost") or 0
+        if (p.get("lost") or 0) > 0:
+            bad.append(f"N={p['n']} lost {p['lost']}")
+        p99 = p.get("p99_ms")
+        if p99 is None or p99 >= BAR_C_P99_MS:
+            bad.append(f"N={p['n']} p99 {p99} ms (bar < {BAR_C_P99_MS})")
+    for prev, cur in zip(rungs, rungs[1:]):
+        if cur["rps"] < BAR_C_RUNG * prev["rps"]:
+            bad.append(f"N={cur['n']} {cur['rps']:.0f}/s is "
+                       f"{cur['rps'] / prev['rps']:.2f}x of N={prev['n']} "
+                       f"(bar >= {BAR_C_RUNG})")
+    detail = (f"{len(rungs)} rung(s) N={[p['n'] for p in rungs]}, lost {lost}, "
+              f"p99 max {max((p.get('p99_ms') or 0) for p in rungs):.1f} ms")
+    if bad:
+        detail += " — " + "; ".join(bad)
+    return Verdict(row, not bad, detail)
+
+
+def verdict_row_d(points, cores):
+    row = "d N engines on an oversubscribed host"
+    rungs = _ladder(points, "gate-d")
+    base = next((p for p in rungs if p["n"] == 1), None)
+    if base is None:
+        return Verdict(row, False, "no single-engine reference rung was measured")
+    b = base["rps"]
+    bad = []
+    for p in rungs:
+        # Clamped at 1.0: at N=1 on 8 cores the raw factor is 8/3, which would
+        # demand one engine outrun itself. See the gate doc, "Reading row d".
+        factor = min(1.0, cores / busy_threads(p["n"]))
+        expect = factor * b * BAR_D_FRAC
+        floor = b * BAR_D_FLOOR
+        if p["rps"] < expect or p["rps"] < floor:
+            bad.append(f"N={p['n']} {p['rps']:.0f}/s < max(linear {expect:.0f}, "
+                       f"floor {floor:.0f})")
+    detail = (f"{cores} cores, single-engine {b:.0f}/s, rungs "
+              + ", ".join(f"N={p['n']}:{p['rps']:.0f}" for p in rungs))
+    if bad:
+        detail += " — " + "; ".join(bad)
+    return Verdict(row, not bad, detail)
+
+
+# ---------------------------------------------------------------- selftest
+
+def _pt(hop, n, rps, p99=1.0, lost=0, ok=True):
+    return {"label": f"{hop} n={n}", "arm": "remote", "ok": ok, "hop": hop, "n": n,
+            "rps": rps, "p50_ms": 0.1, "p95_ms": p99 / 2, "p99_ms": p99, "lost": lost,
+            "retried": 0, "sends": int(rps), "inflight": 1024,
+            "server_host_cpu_pct": None, "server_proc_cpu_pct": None,
+            "client_host_cpu_pct": None, "client_proc_cpu_pct": None}
+
+
+def selftest():
+    """Feed canned HOP-JSON points through the row arithmetic and check the
+    verdicts. Runs nowhere near a fleet; `--selftest` is the whole invocation.
+    """
+    fails = []
+
+    def check(name, got, want):
+        if got != want:
+            fails.append(f"{name}: verdict {got}, expected {want}")
+
+    direct = 2_000_000.0
+    ladder_ok = [_pt("gate-c", 1, 1_100_000.0), _pt("gate-c", 2, 1_500_000.0),
+                 _pt("gate-c", 4, 1_400_000.0), _pt("gate-c", 8, 1_200_000.0),
+                 _pt("gate-c", 16, 1_000_000.0)]
+
+    # --- row a: one connection vs the direct arm, bar 0.5x
+    check("a pass", verdict_row_a(ladder_ok, direct).passed, True)
+    check("a fail", verdict_row_a([_pt("gate-c", 1, 900_000.0)], direct).passed, False)
+    check("a missing", verdict_row_a([], direct).passed, False)
+    check("a no direct", verdict_row_a(ladder_ok, 0.0).passed, False)
+
+    # --- row b: best rung vs the direct arm, bar 0.75x
+    check("b pass", verdict_row_b(ladder_ok, direct).passed, True)      # 1.5M/2.0M = 0.75
+    check("b fail", verdict_row_b([_pt("gate-c", 2, 1_400_000.0)], direct).passed, False)
+
+    # --- row c: 0 lost, p99 < 1000 ms, no rung > 20% below the previous
+    check("c pass", verdict_row_c(ladder_ok).passed, True)
+    check("c lost", verdict_row_c(ladder_ok[:-1] + [_pt("gate-c", 16, 1_000_000.0, lost=3)]).passed,
+          False)
+    check("c p99", verdict_row_c(ladder_ok[:-1] + [_pt("gate-c", 16, 1_000_000.0, p99=1500.0)]).passed,
+          False)
+    collapse = ladder_ok[:-1] + [_pt("gate-c", 16, 900_000.0)]          # 0.75x of the 8 rung
+    check("c collapse", verdict_row_c(collapse).passed, False)
+    check("c one rung", verdict_row_c([_pt("gate-c", 1, 1_000_000.0)]).passed, True)
+    check("c empty", verdict_row_c([]).passed, False)
+
+    # --- row d: <= linear on an 8-core host, busy = 2N+1, factor clamped at 1
+    d_ok = [_pt("gate-d", 1, 2_800_000.0), _pt("gate-d", 2, 2_240_000.0),
+            _pt("gate-d", 4, 1_400_000.0), _pt("gate-d", 8, 950_000.0)]
+    check("d pass", verdict_row_d(d_ok, cores=8).passed, True)
+    d_convoy = d_ok[:-1] + [_pt("gate-d", 8, 5_000.0)]                  # the M12 collapse
+    check("d collapse", verdict_row_d(d_convoy, cores=8).passed, False)
+    d_floor = d_ok[:-1] + [_pt("gate-d", 8, 200_000.0)]                 # 7.1% of single
+    check("d floor", verdict_row_d(d_floor, cores=8).passed, False)
+    check("d no base", verdict_row_d(d_ok[1:], cores=8).passed, False)
+    check("busy", busy_threads(4), 9)
+
+    for f in fails:
+        print(f"SELFTEST FAIL {f}")
+    print(f"SELFTEST: {len(fails)} failure(s)")
+    return 1 if fails else 0
+
+
 # -------------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser(description="M13 per-hop isolation bench (fleet)")
-    ap.add_argument("--fleet", action="store_true", required=True)
+    ap.add_argument("--fleet", action="store_true")
     ap.add_argument("--hosts", default="", help="pub/priv,... (else terraform output)")
     ap.add_argument("--nodes", type=int, default=4)
     ap.add_argument("--ssh-user", default="ubuntu")
@@ -436,10 +711,27 @@ def main():
     ap.add_argument("--full-inflights", default="256,1024")
     ap.add_argument("--admission-kib", type=int, default=256)
     ap.add_argument("--cpu-window-secs", type=int, default=5)
-    ap.add_argument("--arms", default="1,3,2,full", help="subset of: 1,3,2,full,diag")
+    ap.add_argument("--arms", default="1,3,2,full", help="subset of: 1,3,2,full,diag,gate")
     ap.add_argument("--diag-rungs", default="4x1024,6x1024,8x128,8x1024",
                     help="diag arm: comma-separated <conns>x<inflight> rungs")
+    ap.add_argument("--selftest", action="store_true",
+                    help="adjudicate canned points through the row arithmetic and exit "
+                         "(no fleet, no ssh)")
+    ap.add_argument("--gate-conns", default="1,2,4,8,16", help="gate rows a/b/c: connection ladder")
+    ap.add_argument("--gate-engines", default="1,2,4,8", help="gate row d: engine ladder")
+    ap.add_argument("--gate-edge-inflight", type=int, default=65536,
+                    help="gate rows a/b/c: the edge's Engine window")
+    ap.add_argument("--gate-edge-per-conn", type=int, default=1024,
+                    help="gate rows a/b/c: the edge's per-connection credit ceiling "
+                         "(must be <= the grant budget, i.e. 7/8 of --gate-edge-inflight)")
+    ap.add_argument("--gate-cores", type=int, default=0,
+                    help="gate row d: cores on the server host (0 = detect with nproc)")
     a = ap.parse_args()
+
+    if a.selftest:
+        sys.exit(selftest())
+    if not a.fleet:
+        ap.error("one of --fleet or --selftest is required")
 
     hop_hosts = m6.build_fleet_hosts(HOP_BIN, a.ssh_user, a.ssh_key, a.hosts, count=a.nodes,
                                      unit_prefix=m12.UNIT_PREFIX, remote_root=HOP_ROOT,
@@ -461,6 +753,7 @@ def main():
           f"{[h.public_ip for h in hop_hosts[:3]]}", flush=True)
     arms = [x.strip() for x in a.arms.split(",") if x.strip()]
     points = []
+    verdicts = []
     try:
         if "1" in arms:
             arm_hop1(S, a, points)
@@ -472,6 +765,8 @@ def main():
             arm_full(m12_hosts, hop_hosts, a, points)
         if "diag" in arms:
             arm_diag(S, C, a, points)
+        if "gate" in arms:
+            arm_gate(m12_hosts, hop_hosts, a, points, verdicts)
     finally:
         table(points)
         for h in hop_hosts:
@@ -481,6 +776,18 @@ def main():
     if not points:
         print("RESULT: FAIL (infrastructure) — no points measured")
         sys.exit(1)
+    if verdicts:
+        print("\nM13 gate — FLEET")
+        for v in verdicts:
+            print(f"  [{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}")
+        failed = [v for v in verdicts if not v.passed]
+        if failed:
+            print(f"RESULT: FAIL (honest) — {len(failed)} of {len(verdicts)} adjudicated "
+                  f"row(s) missed their bar: {[v.row for v in failed]}")
+            sys.exit(1)
+        print(f"RESULT: PASS — {len(verdicts)} adjudicated row(s), "
+              f"{len(missing)} point(s) without a RESULT line")
+        sys.exit(0)
     print(f"RESULT: MEASURED {len(points)} points, {len(missing)} without a RESULT line"
           + (f": {missing}" if missing else ""))
     sys.exit(0)
