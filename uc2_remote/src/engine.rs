@@ -18,6 +18,24 @@
 //! it. Redirects, leader changes, retries and connection loss are absorbed by
 //! the link's own threads and are never completions.
 //!
+//! # The window
+//!
+//! Admission is a **count**: a request goes exactly while the number of
+//! accepted-but-unanswered requests — SUBMITs and QUERIES alike — is under
+//! both the edge's current `credits` grant and the caller's `max_inflight`.
+//! That is the edge's own rule (`Conn::reserve`, `uc2_gateway/src/conn.rs`),
+//! and it is NOT `seq <= acked_seq + credits`: `acked_seq` advances on SUBMIT
+//! only, so a seq-based window would close permanently after `credits`
+//! queries. See [`admissible`] for the full argument, and
+//! [`RemoteSendHalf::acked_seq`] for what `acked_seq` is actually good for.
+//!
+//! `credits` is an absolute grant carried by `HELLO_OK`, by every `RESPONSE`
+//! and by an unsolicited `STATUS`. It **may decrease** — the edge halves it
+//! under back-pressure — and a reduction is honoured immediately for new
+//! admissions, without invalidating anything already in flight. The reader
+//! thread applies a grant only if it belongs to the connection currently
+//! installed (`link::credit_update`).
+//!
 //! # Thread roles
 //!
 //! [`RemoteSendHalf`] is `Send` but **not** `Sync`: it is the outgoing ring's
@@ -323,6 +341,42 @@ pub enum RemoteOutcome<'a> {
     Closed,
 }
 
+/// **The admission rule, in one place.** A request may go exactly while the
+/// number of requests already accepted and not yet answered is under BOTH the
+/// edge's current grant and the caller's own `max_inflight` cap.
+///
+/// It is a **count**, not a seq range, and that is the edge's own rule rather
+/// than a simplification of it: `uc2_gateway`'s `Conn::reserve`/`Conn::claim`
+/// admit while `inflight < credits`, counting SUBMITs and QUERIES alike. The
+/// obvious-looking alternative — `seq <= acked_seq + credits` — is wrong
+/// against that edge, because `acked_seq` advances on **SUBMIT only**
+/// (`Conn::claim`, and the test pinning it in `uc2_gateway/src/conn.rs`): a
+/// client that ran queries would push its seq stream forward while the left
+/// edge of such a window stood still, and the window would close permanently
+/// after `credits` queries. `a_run_of_queries_never_closes_the_window` in
+/// `tests/engine_fake_edge.rs` is that defect, reproduced.
+///
+/// `credits` is an **absolute grant that MAY decrease** (the edge halves it
+/// under back-pressure and relaxes it back), and a reduction binds new
+/// admissions immediately: `inflight` above a freshly-lowered grant simply
+/// refuses until completions drain it. Requests already accepted are never
+/// invalidated by it — the edge reserved their slots before it squeezed.
+///
+/// `acked_seq` deliberately does not appear here. It is kept as a monotone
+/// statistic ([`RemoteSendHalf::acked_seq`]) and as a hint for the re-send
+/// path, nothing more.
+///
+/// The two loads behind this — `inflight`, then `credits` — are not one
+/// atomic snapshot, so a grant that shrinks between them can let exactly one
+/// request through over the new ceiling. That is deliberate, and it is not a
+/// protocol violation: an edge whose window is full simply stops reading the
+/// socket (`Conn::wait_for_credit`), so the cost of the race is one frame
+/// waiting in a TCP buffer, not a dropped connection. Taking a lock on the
+/// submit path to close it would cost far more than it saves.
+pub(crate) fn admissible(inflight: u64, credits: u32, max_inflight: u32) -> bool {
+    inflight < u64::from(credits) && inflight < u64::from(max_inflight)
+}
+
 /// Constructor namespace, like `uc2_client::Engine`.
 pub struct RemoteEngine;
 
@@ -380,6 +434,13 @@ impl RemoteSendHalf {
     /// [`RemoteCompletion`] carrying this `user_data`. An `Err` means the
     /// request was never accepted: no seq was consumed, nothing will complete.
     ///
+    /// **The window is a count** ([`admissible`]): this is admitted exactly
+    /// while the requests already accepted and not yet answered — queries
+    /// included — number fewer than both the edge's current grant
+    /// ([`RemoteSendHalf::credits`]) and `max_inflight`. The grant is
+    /// absolute and MAY decrease; a reduction binds the next admission
+    /// immediately.
+    ///
     /// [`SubmitError::Backpressure`] is the normal, expected refusal — the
     /// credit window, the local `max_inflight` cap or the ring is full. **The
     /// wait strategy is the caller's**, deliberately: this crate never sleeps
@@ -400,7 +461,11 @@ impl RemoteSendHalf {
     }
 
     /// Issue a read. Same contract, same nonblocking shape and same wait
-    /// strategy as [`RemoteSendHalf::try_submit`].
+    /// strategy as [`RemoteSendHalf::try_submit`] — and the same count-based
+    /// window: a query occupies one unit of the grant while it is unanswered,
+    /// exactly as a submit does, and releases it on completion. It never
+    /// advances `acked_seq`, which is why the window cannot be a seq range
+    /// (see [`admissible`]).
     ///
     /// [`Consistency::Linearizable`] goes through the node's quorum read
     /// barrier; [`Consistency::Snapshot`] is answered from the replica the
@@ -463,19 +528,14 @@ impl RemoteSendHalf {
             return Err(SubmitError::PayloadTooLarge);
         }
         let seq = self.next_seq.get();
-        // The credit rule, checked before the seq is consumed: a seq may go
-        // only while `seq <= acked_seq + credits`. Both are absolute counts
-        // the edge advertises, so a shrinking grant closes the window for new
-        // seqs at once without invalidating what is already in flight.
-        let window = link.acked_seq().saturating_add(u64::from(link.credits()));
-        if seq > window {
-            return Err(SubmitError::Backpressure);
-        }
-        // The local cap, and the slot this seq lands on. `claim` re-checks
-        // both, but checking here is what keeps a refusal free of side
+        // The admission rule (see `admissible`) and the slot this seq lands
+        // on, both checked before the seq is consumed. `claim` re-checks the
+        // slot, but checking here is what keeps a refusal free of side
         // effects: `claim` runs only after the bytes are staged.
         let slots = link.slots();
-        if slots.inflight() >= u64::from(link.cfg.max_inflight) || !slots.is_free(seq) {
+        if !admissible(slots.inflight(), link.credits(), link.cfg.max_inflight)
+            || !slots.is_free(seq)
+        {
             return Err(SubmitError::Backpressure);
         }
         let h = Header { ty, flags, version: PROTOCOL_VERSION, client_id: link.client_id, seq };
@@ -558,14 +618,26 @@ impl RemoteSendHalf {
         link.out_producer().release_to(pos);
     }
 
-    /// The last absolute grant the edge advertised.
+    /// The last absolute grant the edge advertised — the ceiling on
+    /// unanswered requests of both kinds ([`admissible`]). It MAY decrease,
+    /// and a decrease is in force for the very next admission.
     pub fn credits(&self) -> u32 {
         self.link.credits()
     }
 
-    /// Requests accepted but not yet completed.
+    /// Requests accepted but not yet completed. This — not the seq stream — is
+    /// what the edge's grant bounds; see [`RemoteSendHalf::try_submit`].
     pub fn inflight(&self) -> u64 {
         self.link.inflight()
+    }
+
+    /// The highest sequence number the edge has acknowledged. **A statistic
+    /// and a re-send hint, not part of the admission rule**: the edge advances
+    /// it on SUBMIT only (`Conn::claim` in `uc2_gateway`), so a run of queries
+    /// leaves it standing still while requests flow perfectly well. Monotone,
+    /// and carried across a redial.
+    pub fn acked_seq(&self) -> u64 {
+        self.link.acked_seq()
     }
 
     /// Counters for what the link had to do to keep its promise.
@@ -701,5 +773,64 @@ pub(crate) fn outcome_of(
         OutcomeTag::PayloadTooLarge => RemoteOutcome::PayloadTooLarge,
         OutcomeTag::TimedOut => RemoteOutcome::TimedOut,
         OutcomeTag::Closed => RemoteOutcome::Closed,
+    }
+}
+#[cfg(test)]
+mod window_tests {
+    use super::admissible;
+
+    /// The whole rule, exhaustively over the interesting corners: an
+    /// unanswered request of EITHER kind occupies one unit of the grant, and
+    /// nothing else enters into it. No seq appears anywhere — that is the
+    /// point (see the function's own doc).
+    #[test]
+    fn the_grant_bounds_the_number_of_unanswered_requests() {
+        for credits in 0..=8u32 {
+            for inflight in 0..=10u64 {
+                assert_eq!(
+                    admissible(inflight, credits, 1024),
+                    inflight < u64::from(credits),
+                    "credits {credits}, inflight {inflight}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_grant_admits_nothing() {
+        assert!(!admissible(0, 0, 1024), "an idle client with no grant still waits");
+        assert!(!admissible(5, 0, 1024));
+    }
+
+    /// The grant is an ABSOLUTE count and it MAY decrease — below what is
+    /// already in flight, even. Nothing new goes until the completions drain
+    /// under the new grant; the requests already accepted are unaffected (the
+    /// edge reserved their slots before it squeezed).
+    #[test]
+    fn a_reduced_grant_refuses_until_the_completions_drain() {
+        assert!(!admissible(4, 1, 1024), "four in flight against a grant of one");
+        assert!(!admissible(2, 1, 1024));
+        assert!(!admissible(1, 1, 1024));
+        assert!(admissible(0, 1, 1024), "the last completion re-opens the window");
+    }
+
+    /// `max_inflight` is a local cap ON TOP of the grant; the tighter of the
+    /// two binds, whichever it happens to be.
+    #[test]
+    fn the_tighter_of_the_grant_and_the_local_cap_binds() {
+        assert!(admissible(7, 1000, 8), "the local cap has room");
+        assert!(!admissible(8, 1000, 8), "max_inflight binds below a generous grant");
+        assert!(!admissible(8, 8, 1000), "the grant binds below a generous local cap");
+        for credits in 0..=6u32 {
+            for max_inflight in 0..=6u32 {
+                for inflight in 0..=8u64 {
+                    assert_eq!(
+                        admissible(inflight, credits, max_inflight),
+                        inflight < u64::from(credits.min(max_inflight)),
+                        "credits {credits}, max_inflight {max_inflight}, inflight {inflight}"
+                    );
+                }
+            }
+        }
     }
 }
