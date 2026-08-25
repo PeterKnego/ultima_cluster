@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::{FrameType, Header, PROTOCOL_VERSION};
@@ -236,6 +236,39 @@ impl Conn {
                 w.shutdown();
                 drop(w);
                 self.close();
+                false
+            }
+        }
+    }
+
+    /// Acquire this connection's writer lock for a caller that needs to hold
+    /// it across OTHER work before writing exactly one frame through it —
+    /// the handshake path, which must hold the lock from before
+    /// `Shared::join_and_grant` (which can flip [`Conn::set_ready`], making
+    /// this connection a legal target for an unsolicited `STATUS`/
+    /// `LEADER_CHANGED` write from another thread) through its own
+    /// `HELLO_OK` write, so that write can never lose the race for the
+    /// socket to one of those. Pair with [`Conn::write_locked`].
+    pub fn lock_writer(&self) -> MutexGuard<'_, FramedConn> {
+        self.writer.lock()
+    }
+
+    /// Write one frame through an already-held [`Conn::lock_writer`] guard.
+    /// Same contract as [`Conn::write`], with one difference forced by
+    /// holding the lock across the call: on failure it inlines what
+    /// [`Conn::close`] would do instead of calling it, because `close` takes
+    /// `writer` itself and the caller here already holds it — taking it
+    /// again would deadlock.
+    pub fn write_locked(&self, w: &mut FramedConn, h: Header, payload: &[u8], now_ns: u64) -> bool {
+        match w.write_frame(h, payload) {
+            Ok(()) => {
+                self.last_write_ns.store(now_ns, Ordering::Relaxed);
+                true
+            }
+            Err(_) => {
+                w.shutdown();
+                let _ = self.closed.swap(true, Ordering::AcqRel);
+                self.notify_gate();
                 false
             }
         }

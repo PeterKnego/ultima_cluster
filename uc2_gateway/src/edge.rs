@@ -1093,20 +1093,45 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         return false;
     }
 
+    // Hold THIS connection's writer lock from BEFORE `join_and_grant`
+    // through the HELLO_OK write below — not the plain `Conn::write`, which
+    // would re-lock and release it, leaving a window open.
+    //
+    // `join_and_grant` flips `Conn::set_ready` inside `grant_lock`, which is
+    // what the budget invariant needs (see its doc), but it also makes this
+    // connection a legal target for the driver's `push_grants`/leader-watch
+    // pushes the instant that lock releases — *before* HELLO_OK is
+    // physically on the wire. Without holding the writer across that gap,
+    // a thread preempted here (unbounded under load, not just a few
+    // instructions) can let a `STATUS`/`LEADER_CHANGED` win the race for
+    // this socket ahead of its own handshake reply, violating "nothing
+    // precedes HELLO_OK" (`credits_wire.rs::
+    // no_frame_precedes_hello_ok_and_status_follows_it`). Holding the
+    // writer here forces any such push to block on the SAME mutex until
+    // this write is done, so it can never land first.
+    //
+    // Lock order is `writer(conn) -> grant_lock`, and it must never be the
+    // reverse anywhere: `push_grants` releases `grant_lock` before it ever
+    // touches a `writer` (see its doc), `recompute_locked` never touches a
+    // `writer` at all, and `leave`/`join_and_grant` never take another
+    // connection's `writer`. So there is no cycle for this order to invert
+    // against.
+    let mut w = conn.lock_writer();
+
     // Join the budget and recompute every other connection's share, THIS
     // connection's own share, and its ready-transition, all as one atomic
     // step under `grant_lock` — see `Shared::join_and_grant` for why the
     // ready-transition has to be inside that same critical section. The
-    // returned grant is what HELLO_OK carries; the write itself happens
-    // after, off the lock (see the doc there for the one place lag can
-    // still reach the wire, and why the headroom absorbs it).
+    // returned grant is what HELLO_OK carries.
     let grant = shared.join_and_grant(conn);
 
     let leader = send.leader_hint();
     let leader_addr = leader.and_then(|id| shared.gateway_of(id)).unwrap_or("");
     let mut out = Vec::new();
     HelloOk { credits: grant, leader, leader_addr }.encode(&mut out);
-    conn.write(conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns())
+    let ok = conn.write_locked(&mut w, conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns());
+    drop(w);
+    ok
 }
 
 fn refuse_hello(shared: &Arc<Shared>, conn: &Arc<Conn>, reason: u8, detail: &str) {
