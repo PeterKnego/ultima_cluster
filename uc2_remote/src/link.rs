@@ -36,10 +36,17 @@
 //!   neither `Clone` nor `Sync`, so no second thread can obtain one. The
 //!   writer thread is therefore the only caller of those methods — and the
 //!   only holder of the socket's write half.
-//! - The `OutRing` **producer** role (`push_frame`, `release_to`) is reachable
-//!   only through [`Link::out_producer`], whose sole caller is
+//! - The `OutRing` **producer** role (`stage_frame`, `commit`, `release_to`)
+//!   is reachable only through [`Link::out_producer`], whose sole caller is
 //!   `RemoteSendHalf` — `Send` but not `Sync`, so exactly one submitter
 //!   thread.
+//! - The `SlotTable` ([`Link::slots`]) is the one structure that is genuinely
+//!   **multi-role by design**: the submitter claims, the reader resolves, the
+//!   writer marks sent, the sweep expires. It needs no ownership token
+//!   because it is not SPSC — every transition goes through the single-CAS
+//!   protocol `slots.rs` documents, which is correct from any thread. Its
+//!   per-method role comments (`SUBMITTER ONLY` on `claim`/`is_free`) are
+//!   about the *seq allocation* being single-threaded, not about the memory.
 //! - The `CompletionQueue` **producer** role is reachable only through
 //!   `Link::complete`/`Link::sweep_deadlines`, which are private to this
 //!   module and called from exactly two places: [`Reader`] (moved into the
@@ -107,23 +114,16 @@ pub(crate) struct StatCells {
     #[allow(dead_code, reason = "task 8 counts LEADER_CHANGED frames here")]
     pub(crate) leader_changes: AtomicU64,
     pub(crate) reconnects: AtomicU64,
-    #[allow(dead_code, reason = "task 8 counts the ordered window re-send here")]
     pub(crate) resends: AtomicU64,
     #[allow(dead_code, reason = "task 8 counts honoured RETRY frames here")]
     pub(crate) retries: AtomicU64,
     #[allow(dead_code, reason = "task 9 counts UNKNOWN frames here")]
     pub(crate) unknown: AtomicU64,
-    #[allow(dead_code, reason = "task 6 counts EXPIRED responses here")]
     pub(crate) expired: AtomicU64,
     pub(crate) max_credits_seen: AtomicU32,
     pub(crate) refused_members: AtomicU64,
     pub(crate) stale_redials: AtomicU64,
     pub(crate) socket_writes: AtomicU64,
-    #[allow(
-        dead_code,
-        reason = "task 6 counts the frames each batched write carried — the \
-                  numerator of the batching factor this milestone exists to move"
-    )]
     pub(crate) frames_written: AtomicU64,
 }
 
@@ -189,15 +189,14 @@ pub(crate) struct Link {
     /// [`credit_update`].
     generation: AtomicU64,
     /// The highest `acked_seq` any frame advertised. Monotone.
-    #[allow(
-        dead_code,
-        reason = "task 6's `try_submit` gates the credit window on this; the \
-                  reader already keeps it current"
-    )]
     acked_seq: AtomicU64,
     /// The current connection has answered something only a serving edge can
     /// answer. Until then the writer sends ONE frame (probe-before-flush).
-    #[allow(dead_code, reason = "task 8 gates the flush on this")]
+    #[allow(
+        dead_code,
+        reason = "task 6's RESPONSE handler SETS this; task 8 is what reads it \
+                  (the probe-before-flush limit)"
+    )]
     proven: AtomicBool,
     /// The single seq written while unproven; `0` = none.
     #[allow(dead_code, reason = "task 8 gates the flush on this")]
@@ -342,16 +341,28 @@ impl Link {
         }
     }
 
-    /// SUBMITTER ONLY: the outgoing ring's producer role (`push_frame`,
-    /// `release_to`). `RemoteSendHalf` is `Send` but not `Sync`, so exactly
-    /// one thread can ever be here.
-    #[allow(
-        dead_code,
-        reason = "task 6's `try_submit` is the sole caller; this task only \
-                  establishes the link, so nothing is submitted yet"
-    )]
+    /// SUBMITTER ONLY: the outgoing ring's producer role (`stage_frame`,
+    /// `commit`, `release_to`). `RemoteSendHalf` is `Send` but not `Sync`, so
+    /// exactly one thread can ever be here.
     pub(crate) fn out_producer(&self) -> &OutRing {
         &self.out
+    }
+
+    /// The correlation table. Unlike the two SPSC structures this is shared by
+    /// design (module header): the submitter claims, the reader resolves, the
+    /// writer marks sent, the sweep expires — all through the single-CAS
+    /// protocol in `slots.rs`, which is sound from any thread. The submitter
+    /// reaches it for `is_free`/`claim`/`publish_next_seq` and for the reclaim
+    /// walk.
+    pub(crate) fn slots(&self) -> &SlotTable {
+        &self.slots
+    }
+
+    /// The highest sequence number the edge has acknowledged — the left edge
+    /// of the credit window. Monotone, and carried across a redial (every live
+    /// seq is strictly greater than it).
+    pub(crate) fn acked_seq(&self) -> u64 {
+        self.acked_seq.load(Ordering::Acquire)
     }
 
     /// POLLER ONLY: park until a completion is queued. Reads the wake seq
@@ -614,6 +625,16 @@ struct Writer {
     /// thread makes names it, so a complaint about a connection the reader
     /// already replaced is ignored rather than tearing down the fresh one.
     generation: u64,
+    /// The seq of the first frame at or after `OutRing::send_pos` — the
+    /// writer's own view of "what I have not put on the wire yet".
+    ///
+    /// It is a cursor rather than a lookup because the ring is a byte stream:
+    /// one `write_all_bytes` may carry many frames, and the writer needs to
+    /// know WHICH requests it just sent in order to mark their slots and count
+    /// them (`frames_written`, the numerator of the batching factor). Seqs are
+    /// gap-free from 1 and laid into the ring in issue order, so walking it
+    /// forward past every extent that ends at or below `send_pos` is exact.
+    cursor: u64,
     scratch: Vec<u8>,
     last_write: Instant,
     _not_sync: PhantomData<Cell<()>>,
@@ -625,6 +646,7 @@ impl Writer {
             link,
             conn,
             generation: 0,
+            cursor: 1,
             scratch: Vec::with_capacity(64 * 1024),
             last_write: Instant::now(),
             _not_sync: PhantomData,
@@ -699,13 +721,14 @@ impl Writer {
         }
     }
 
-    /// Write whatever the ring holds. Returns whether anything went out.
-    /// TASK 8 extends this with the probe-before-flush limit and the
+    /// Write whatever the ring holds, one `write_all_bytes` per contiguous run
+    /// (two only when a frame straddles the wrap). Returns whether anything
+    /// went out. TASK 8 extends this with the probe-before-flush limit and the
     /// retransmit queue; at this task it drains unconditionally.
     ///
     /// CONSUMER ROLE: `peek_upto`/`consume` are reachable only from here.
     fn drain_ring(&mut self) -> bool {
-        let limit = self.link.out.write_pos();
+        let limit = flush_limit(&self.link, self.cursor);
         let mut wrote = false;
         while self.link.out.send_pos() < limit {
             let n = {
@@ -722,8 +745,51 @@ impl Writer {
             self.link.out.consume(n);
             self.link.stats.socket_writes.fetch_add(1, Ordering::Relaxed);
             wrote = true;
+            self.advance_cursor();
         }
         wrote
+    }
+
+    /// Walk the frame cursor up to `send_pos`, marking every request it passes
+    /// as sent and counting it.
+    ///
+    /// The bound is the submitter's published `next_seq`, and reading it here
+    /// is safe without any further ordering: `publish_next_seq` is a `Release`
+    /// store made BEFORE the `Release` store to the ring's `write` cursor, and
+    /// the bytes this call is accounting for were observed through an
+    /// `Acquire` load of that same `write` — so the slot for every frame in
+    /// the run is already visible, metadata and all. (That is the same
+    /// slot-before-bytes ordering `OutRing::stage_frame` documents, seen from
+    /// the consumer's end.)
+    ///
+    /// A frame whose slot is no longer live — the request was answered, swept
+    /// or aborted while its bytes were still in the ring — has **no readable
+    /// extent** ([`crate::slots::SlotTable::live_extent`] answers `None`
+    /// rather than a later occupant's offset), so it cannot be checked against
+    /// `send_pos`. It is skipped rather than waited for, and still counted:
+    /// the ring is a byte stream that goes out in order, so every committed
+    /// frame reaches the wire exactly once whatever became of its request.
+    /// Skipping it cannot run the cursor past an unsent LIVE frame — the ring
+    /// is FIFO, so the next live frame's own extent check stops the walk.
+    fn advance_cursor(&mut self) {
+        let sent_to = self.link.out.send_pos();
+        let next_seq = self.link.slots.next_seq();
+        while self.cursor < next_seq {
+            if let Some((off, len)) = self.link.slots.live_extent(self.cursor) {
+                if off + len as u64 > sent_to {
+                    break;
+                }
+                self.link.slots.mark_sent(self.cursor, true);
+                // A frame written more than once is a re-send by definition;
+                // TASK 8 is what creates them, and this is where they are
+                // counted so the counter cannot drift from what was written.
+                if self.link.slots.bump_attempts(self.cursor) > 1 {
+                    self.link.stats.resends.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.link.stats.frames_written.fetch_add(1, Ordering::Relaxed);
+            self.cursor += 1;
+        }
     }
 
     /// Dial a fresh connection, publish its read half to the reader, and reset
@@ -812,7 +878,13 @@ impl Writer {
                     link.probe_seq.store(0, Ordering::Release);
                     self.conn = fresh;
                     self.generation = generation;
-                    // TASK 8 inserts the ordered resend of the live window here.
+                    // The frame cursor is deliberately NOT reset: `send_pos`
+                    // never moves backwards, so it still names the first frame
+                    // this thread has not written, and every frame below it
+                    // has already been counted. TASK 8 inserts the ordered
+                    // resend of the live window here — it re-sends by extent
+                    // and then jumps `send_pos` forward, and it owns
+                    // re-pointing this cursor at the frame that follows.
                     g.read_half = Some((generation, read_half));
                     drop(g);
                     link.connected.store(true, Ordering::Release);
@@ -836,6 +908,16 @@ impl Writer {
             }
         }
     }
+}
+
+/// How far into the ring the writer may flush, given the frame it is at.
+///
+/// TASK 8 replaces the body with the probe-before-flush rule (while the
+/// connection is unproven, only ONE frame may go out, so a whole pipelined
+/// window is not spent on an edge that turns out to be redirecting). Here it
+/// is everything the submitter has committed.
+fn flush_limit(link: &Arc<Link>, _cursor: u64) -> u64 {
+    link.out.write_pos()
 }
 
 /// Sleep `total` in [`SWEEP_INTERVAL`] slices so `close` is noticed promptly.
@@ -982,11 +1064,55 @@ impl Reader {
         }
     }
 
-    /// TASK 6 adds RESPONSE, TASK 7 the credit plumbing, TASK 8 REDIRECT /
-    /// LEADER_CHANGED / RETRY, TASK 9 UNKNOWN and HELLO_REFUSED. At this task
-    /// the reader understands liveness and STATUS only.
+    /// TASK 8 adds REDIRECT / LEADER_CHANGED / RETRY, TASK 9 UNKNOWN and
+    /// HELLO_REFUSED. At this task the reader understands liveness, STATUS and
+    /// RESPONSE.
     fn on_frame(&mut self, h: Header, payload: bytes::Bytes) -> Act {
         match h.ty {
+            // The one frame that resolves a request. Order inside this arm is
+            // load-bearing: the slot is taken FIRST (the single CAS that makes
+            // the completion exactly-once), and the credit grant riding the
+            // same frame is applied AFTER — so a submitter woken by the wider
+            // window always finds the slot it is about to reuse already free.
+            FrameType::Response => {
+                let Ok(meta) = crate::frame::ResponseMeta::decode(&payload) else {
+                    // A malformed RESPONSE resolves nothing: the request stays
+                    // live and its own deadline is what answers it. Dropping
+                    // the frame is strictly safer than guessing a seq.
+                    return Act::Continue;
+                };
+                let body = payload.slice(crate::frame::ResponseMeta::LEN..);
+                // Anything answered with a RESPONSE proves this edge is
+                // serving us: the window may flush now (probe-before-flush is
+                // task 8, this is the flag it reads).
+                self.link.proven.store(true, Ordering::Release);
+                let expired = h.flags & crate::frame::FLAG_EXPIRED != 0;
+                if expired {
+                    self.link.stats.expired.fetch_add(1, Ordering::Relaxed);
+                }
+                if let crate::slots::Resolve::Won { user_data } = self.link.slots.resolve(h.seq) {
+                    let rec = Record {
+                        user_data,
+                        position: meta.position,
+                        has_position: true,
+                        tag: OutcomeTag::Response,
+                        replayed: h.flags & crate::frame::FLAG_REPLAYED != 0,
+                        expired,
+                        body_off: 0,
+                        body_len: 0,
+                    };
+                    // `false` = the poller abandoned the queue after a close;
+                    // see `Link::complete`, and the caveat on the exactly-once
+                    // wording in `engine.rs`.
+                    let _ = self.link.complete(rec, &body);
+                }
+                // A RESPONSE for a seq we no longer hold is not an error: a
+                // swept, aborted or already-resolved request can legitimately
+                // be answered late. The grant on it is still current, so it is
+                // applied either way.
+                credit_update(&self.link, self.generation, meta.credits, meta.acked_seq);
+                Act::Continue
+            }
             FrameType::Status => {
                 if let Ok(s) = crate::frame::Status::decode(&payload) {
                     credit_update(&self.link, self.generation, s.credits, s.acked_seq);
