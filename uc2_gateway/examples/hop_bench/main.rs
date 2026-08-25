@@ -81,7 +81,9 @@ pub struct EdgeArgs {
     #[arg(long, default_value_t = 4096)]
     pub max_inflight: u32,
     /// Credits granted to every connection at HELLO_OK (`per_conn_inflight`).
-    #[arg(long, default_value_t = 4096)]
+    /// Must be at or under the edge's grant budget — `max_inflight` less its
+    /// 1/8 headroom — or `Edge::start` refuses by name.
+    #[arg(long, default_value_t = 1024)]
     pub per_conn_inflight: u32,
     #[arg(long, default_value_t = false)]
     pub envelope: bool,
