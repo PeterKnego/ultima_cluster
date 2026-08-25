@@ -350,6 +350,9 @@ impl RemoteClient {
             expired: s.expired.load(Ordering::Relaxed),
             max_credits_seen: s.max_credits_seen.load(Ordering::Relaxed),
             refused_members: s.refused_members.load(Ordering::Relaxed),
+            // This client has no connection generation: one reader thread
+            // owns the reconnect, so a stale redial request cannot arise.
+            stale_redials: 0,
             // The batching counters belong to the split client's writer
             // thread (`uc2_remote::link`). This client writes one frame per
             // submit under its state lock — that is exactly what M13b

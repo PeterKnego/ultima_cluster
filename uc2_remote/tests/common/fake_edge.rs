@@ -72,6 +72,14 @@ pub struct Behaviour {
     /// answer nothing (not even `PING`), keeping the socket open. The client
     /// must notice via `dead_after`, not via an error.
     pub hang: bool,
+    /// Like [`Behaviour::hang`], but only on the FIRST connection — every
+    /// later one is served normally. The client must recover onto a healthy
+    /// connection, and must do it with ONE reconnect however many of its
+    /// threads noticed the silence.
+    pub hang_first: bool,
+    /// Advertise these credits in `HELLO_OK` on every connection but the
+    /// first, so which connection's grant is in effect is observable.
+    pub second_credits: Option<u32>,
     /// Like [`Behaviour::hang`], but the silence starts in the MIDDLE of a
     /// frame: right after `HELLO_OK` the edge writes a valid frame header
     /// announcing a payload and then never writes the payload. A reader that
@@ -98,6 +106,8 @@ impl Default for Behaviour {
             drop_after_first_request: false,
             expired: false,
             hang: false,
+            hang_first: false,
+            second_credits: None,
             partial_frame_then_hang: false,
             delay: Duration::from_millis(1),
         }
@@ -217,6 +227,9 @@ enum Action {
 type Queue = Arc<(Mutex<VecDeque<Action>>, Condvar)>;
 
 fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>, is_first: bool) {
+    // Per-connection resolution of the two "first connection only" knobs.
+    let hang = b.hang || (b.hang_first && is_first);
+    let credits = if is_first { b.credits } else { b.second_credits.unwrap_or(b.credits) };
     // A raw duplicate of the socket, kept so `partial_frame_then_hang` can put
     // a DELIBERATELY incomplete frame on the wire — `FramedConn` only ever
     // writes whole ones, which is the point of it.
@@ -257,7 +270,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
     }
     let self_addr = rd.local_addr().map(|a| a.to_string()).unwrap_or_default();
     let advertised = b.hello_ok_leader_addr.clone().unwrap_or_else(|| self_addr.clone());
-    HelloOk { credits: b.credits, leader: Some(1), leader_addr: &advertised }.encode(&mut out);
+    HelloOk { credits, leader: Some(1), leader_addr: &advertised }.encode(&mut out);
     if wr.write_frame(hdr(FrameType::HelloOk, 0, client_id, 0), &out).is_err() {
         return;
     }
@@ -268,7 +281,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
         let Some(mut raw) = raw else { return };
         let mut frame = Vec::new();
         let mut body = Vec::new();
-        ResponseMeta { credits: b.credits, acked_seq: 0, position: 0 }.encode(&mut body);
+        ResponseMeta { credits, acked_seq: 0, position: 0 }.encode(&mut body);
         encode_frame(&mut frame, hdr(FrameType::Response, 0, client_id, 1), &body);
         // Header plus one payload byte: enough to leave the peer's parser
         // committed to a frame it will never see the end of.
@@ -287,7 +300,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
     let q: Queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
     let done = Arc::new(AtomicBool::new(false));
     let (qq, oo, ss, bb, dd) = (q.clone(), o.clone(), stop.clone(), b.clone(), done.clone());
-    let responder = thread::spawn(move || respond(wr, qq, oo, ss, dd, bb, client_id));
+    let responder = thread::spawn(move || respond(wr, qq, oo, ss, dd, bb, client_id, credits));
 
     // --- request loop
     let mut used_once = false;
@@ -296,7 +309,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
             Ok(Some((h, payload))) => match h.ty {
                 FrameType::Submit | FrameType::Query => {
                     o.arrived(h.seq);
-                    if b.hang {
+                    if hang {
                         continue;
                     }
                     let once = is_first && !used_once;
@@ -339,7 +352,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                         break;
                     }
                 }
-                FrameType::Ping if b.hang => {}
+                FrameType::Ping if hang => {}
                 FrameType::Ping => {
                     q.0.lock().unwrap().push_back(Action::Pong);
                     q.1.notify_all();
@@ -369,6 +382,7 @@ fn respond(
     done: Arc<AtomicBool>,
     b: Behaviour,
     client_id: u64,
+    credits: u32,
 ) {
     let mut out = Vec::new();
     loop {
@@ -411,8 +425,7 @@ fn respond(
                 if b.expired {
                     flags |= FLAG_EXPIRED | FLAG_ENVELOPED;
                 }
-                ResponseMeta { credits: b.credits, acked_seq: seq, position: seq * 64 }
-                    .encode(&mut out);
+                ResponseMeta { credits, acked_seq: seq, position: seq * 64 }.encode(&mut out);
                 out.extend_from_slice(&payload);
                 o.answering();
                 wr.write_frame(hdr(FrameType::Response, flags, client_id, seq), &out)
