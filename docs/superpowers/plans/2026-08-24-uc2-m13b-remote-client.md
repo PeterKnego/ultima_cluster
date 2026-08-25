@@ -21,6 +21,30 @@
 - Every new module starts with the repo's two-line header:
   `// SPDX-License-Identifier: Apache-2.0` then `// Copyright 2026 Peter Knego`.
 
+## Execution errata (2026-08-25, found during subagent-driven execution)
+
+- **Tasks 2, 3 (and 4 if it shares a buffer between threads): never form a
+  reference over a whole shared buffer.** The code as written in Task 2
+  Step 3 and Task 3 (`UnsafeCell<Box<[u8]>>` / `UnsafeCell<Box<[Record]>>`
+  with `let buf = unsafe { &mut *self.x.get() }; buf[idx..]`) goes through
+  `Box`'s `DerefMut`, which is a Unique retag over the **entire** allocation
+  and invalidates any slice the other thread is holding — even for disjoint
+  byte ranges. Confirmed under Miri (Stacked Borrows) during the Task 2
+  review. Implement instead with a raw base pointer (`Box<[UnsafeCell<u8>]>`
+  or a cached `*mut u8`), `ptr::copy_nonoverlapping` for writes and
+  `slice::from_raw_parts` over exactly the accessed range for reads; state
+  in each SAFETY comment that no whole-buffer reference is ever formed. Add
+  a two-thread test per structure and run it under
+  `cargo +nightly miri test -p uc2_remote --lib <module>::`.
+- Cursor invariants that SAFETY comments rely on (`ack <= send <= write`
+  and the like) get `debug_assert!`s at every mutation site; a safe fn whose
+  correctness depends on a caller precondition asserts it.
+- The branch is `uc2/m13-remote-path` (one branch for tracks A/B/C), not
+  `uc2/m13b-remote-client`.
+- Task 10 also migrates the `query(&[u8], bool)` call sites so the workspace
+  compiles at its commit; Task 5 keeps the old client compiling by pointing
+  it at the moved config/stats types.
+
 ---
 
 ## Provenance: what is being replaced, and every behaviour that must survive
