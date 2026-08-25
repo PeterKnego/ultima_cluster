@@ -41,7 +41,11 @@ impl WaitCell {
         }
     }
 
-    #[allow(dead_code, reason = "first caller lands with the completion queue, task 3")]
+    #[allow(
+        dead_code,
+        reason = "task 3's completion-queue tests park against these; the first \
+                  non-test caller is the reader/poll pair, task 4"
+    )]
     pub(crate) fn seq(&self) -> u64 {
         self.seq.load(Ordering::Acquire)
     }
@@ -58,7 +62,11 @@ impl WaitCell {
     }
 
     /// Park until the seq moves past `observed`, or `timeout` elapses.
-    #[allow(dead_code, reason = "first caller lands with the completion queue, task 3")]
+    #[allow(
+        dead_code,
+        reason = "task 3's completion-queue tests park against these; the first \
+                  non-test caller is the reader/poll pair, task 4"
+    )]
     pub(crate) fn park(&self, observed: u64, timeout: Duration) {
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let g = self.lock.lock().unwrap();
