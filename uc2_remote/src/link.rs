@@ -1598,6 +1598,37 @@ impl Reader {
             }
             // A PONG carries no state: having arrived is the point.
             FrameType::Pong => Act::Continue,
+            FrameType::Unknown => {
+                // The edge timed our slot out on its side. `resend_on_unknown`
+                // decides who answers: re-send it (the default — the edge lost
+                // it, we still hold it), or surface UNKNOWN to the caller.
+                self.link.stats.unknown.fetch_add(1, Ordering::Relaxed);
+                if self.link.cfg.resend_on_unknown {
+                    if self.link.slots.is_live(h.seq) {
+                        self.link.queue_retransmit(h.seq, Duration::ZERO);
+                    }
+                } else if let crate::slots::Resolve::Won { user_data } =
+                    self.link.slots.resolve(h.seq)
+                {
+                    let _ =
+                        self.link.complete(Record::simple(user_data, OutcomeTag::Unknown), &[]);
+                }
+                Act::Continue
+            }
+            FrameType::HelloRefused => {
+                let reason = HelloRefused::decode(&payload).map(|r| r.reason).unwrap_or(0);
+                // Same split as the dial path: what the refusal is ABOUT
+                // decides who it is terminal for. FAULTED/BUSY are statements
+                // about THIS EDGE, so they cost one member; anything else
+                // (APP_ID/VERSION) is about US and no member would answer
+                // differently.
+                if reason == HELLO_REFUSED_FAULTED || reason == HELLO_REFUSED_BUSY {
+                    self.link.stats.refused_members.fetch_add(1, Ordering::Relaxed);
+                    return Act::Reconnect(None);
+                }
+                self.link.close_from_thread();
+                Act::Stop
+            }
             _ => Act::Continue,
         }
     }
@@ -1607,10 +1638,8 @@ impl Reader {
 pub(crate) enum Act {
     Continue,
     Reconnect(Option<String>),
-    #[allow(
-        dead_code,
-        reason = "task 9 stops the reader on a mid-life HELLO_REFUSED that no                   other member would answer differently"
-    )]
+    /// Stop the reader for good: a mid-life HELLO_REFUSED that no other member
+    /// would answer differently (APP_ID/VERSION — about us, not the edge).
     Stop,
 }
 
