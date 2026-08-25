@@ -193,7 +193,11 @@ const _: () = assert!(CNC_OFF_ADMIN_AUTH + 64 <= CNC_PAGE_LEN);
 /// exactly the kind of thing an operator must be able to see from outside
 /// the process — same motivation as `seal_failures` and `free_disk_bytes`
 /// above.
-/// Next free reserved-band offset after this line: 4032.
+///
+/// This field is the FIRST u64 of its 64-byte line;
+/// [`CNC_OFF_QUERY_HOLES_SKIPPED`] is the second (see its doc for why
+/// sharing the line is legitimate here). Next free reserved-band offset
+/// after this LINE: 4032.
 pub const CNC_OFF_INGRESS_HOLES_SKIPPED: usize = 3968;
 const _: () = assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 
@@ -203,11 +207,25 @@ const _: () = assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 /// path from a losing read path. Same writer, same on-change-only
 /// discipline, same reading of a nonzero value.
 ///
-/// This is the LAST 64-byte line of the 4 KiB page (4032 + 64 = 4096): the
-/// reserved band is now full, and a further field needs the page to grow
-/// (a cnc-layout flag day), not another offset.
-pub const CNC_OFF_QUERY_HOLES_SKIPPED: usize = 4032;
-const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
+/// **This is the second u64 of the SAME 64-byte line as
+/// [`CNC_OFF_INGRESS_HOLES_SKIPPED`]** (3968 + 8), not a line of its own —
+/// deliberately, so the page's last line (4032..4096) stays free for a
+/// future field instead of being spent on a diagnostics counter. Sharing a
+/// line is normally forbidden here because it false-shares between distinct
+/// writers; it is legitimate in this one case because **both counters have
+/// the same single writer** — the consensus agent's `publish_ring_holes`,
+/// which writes both from the same thread in the same duty cycle — so the
+/// one-writer-per-cache-line discipline holds with the line shared. Readers
+/// (`/metrics`, `uc2ctl status`) are off the hot path.
+///
+/// Because the line is shared, both counters are accessed as plain
+/// `AtomicU64`s at their own 8-byte-aligned offsets, NOT as
+/// `PaddedAtomicU64`: that type is `repr(align(64))` and 64 bytes wide, so a
+/// reference to one at 3976 would be misaligned, and a reference to one at
+/// 3968 would span the other counter as non-atomic `_pad` bytes.
+pub const CNC_OFF_QUERY_HOLES_SKIPPED: usize = 3976;
+const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_PAGE_LEN);
+const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED == CNC_OFF_INGRESS_HOLES_SKIPPED + 8);
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
@@ -538,10 +556,15 @@ mod tests {
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED, 3968);
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED - CNC_OFF_ADMIN_AUTH, 64);
         const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
-        // M13a (final review): query_holes_skipped — the next free line
-        // after ingress's 64 bytes, and the LAST line of the page.
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 4032);
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 64);
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED + 64, CNC_PAGE_LEN);
+        // M13a (final review): query_holes_skipped shares ingress's line as
+        // its SECOND u64 (one writer for both), so the page's last line
+        // stays free.
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 3976);
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 8);
+        // Both counters live inside the one 64-byte line starting at 3968...
+        assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED % 64, 0);
+        const { assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
+        // ...and 4032..4096 is still reserved and free (module doc line 30).
+        assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
     }
 }
