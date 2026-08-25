@@ -12,6 +12,7 @@
 //! promised; a port re-implements the format, not this API.
 
 pub mod client;
+pub(crate) mod completion;
 pub mod conn;
 pub mod error;
 pub mod frame;
