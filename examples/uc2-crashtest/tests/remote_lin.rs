@@ -106,7 +106,7 @@ use rand::{Rng, SeedableRng};
 
 use uc2_client::Client;
 use uc2_log::cnc::CncPage;
-use uc2_remote::{RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats};
+use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats};
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
@@ -626,7 +626,7 @@ fn worker(
             }
             1 => {
                 let inv = history.invoke();
-                let r = client.query(&read_query(), true).and_then(|t| t.wait());
+                let r = client.query(&read_query(), Consistency::Linearizable).and_then(|t| t.wait());
                 match resolve(r, "read") {
                     Some(resp) => {
                         let v = dec_read(&resp.bytes);
@@ -997,7 +997,7 @@ fn remote_lin_once(seed: u64, envelope: bool) {
         let deadline = Instant::now() + Duration::from_secs(60);
         let v = loop {
             lock(&rig).supervise();
-            match c.query(&read_query(), true).and_then(|t| t.wait()) {
+            match c.query(&read_query(), Consistency::Linearizable).and_then(|t| t.wait()) {
                 Ok(r) => break dec_read(&r.bytes),
                 Err(e) => {
                     assert!(Instant::now() < deadline, "final linearizable read never answered: {e:?}");

@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use counter::{Applied, Command as CounterCommand, Query, QueryResponse};
-use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
+use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 
 #[derive(Parser)]
 #[command(name = "counter-remote", about = "Drives the counter cluster through a uc2-gateway")]
@@ -180,8 +180,10 @@ fn submit(client: &RemoteClient, cmd: &CounterCommand, deadline: Instant) -> Res
 }
 
 fn query(client: &RemoteClient, linearizable: bool, deadline: Instant) -> Result<(), Fail> {
+    let consistency =
+        if linearizable { Consistency::Linearizable } else { Consistency::Snapshot };
     let ticket =
-        client.query(&enc(&Query::Value), linearizable).map_err(|e| Fail::Run(e.to_string()))?;
+        client.query(&enc(&Query::Value), consistency).map_err(|e| Fail::Run(e.to_string()))?;
     let resp = ticket.wait_timeout(remaining(deadline)).map_err(|e| Fail::Run(e.to_string()))?;
     let answer: QueryResponse = dec(&resp.bytes)?;
     println!("value={}", answer.value);

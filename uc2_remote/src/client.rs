@@ -1,1404 +1,279 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! [`RemoteClient`] — the Rust remote client: pipelined, credit-gated,
-//! redirect-following, with ordered re-send across failover.
+//! [`RemoteClient`] — the blocking convenience client, layered on the
+//! [`crate::RemoteEngine`] halves the way `uc2_client::Client` sits on its
+//! `Engine`.
 //!
-//! # The promise (design spec §4.5)
+//! # What this is for, and what it is not
 //!
-//! Every [`RemoteClient::submit`] / [`RemoteClient::query`] ends in **exactly
-//! one** resolution: `Ok(RemoteResponse)`, or `Err` of [`RemoteError::Expired`]
-//! / [`RemoteError::Unknown`] / [`RemoteError::PayloadTooLarge`] /
+//! One request, one [`Ticket`], one blocking `wait`: the shape a CLI
+//! (`counter-remote`), a crash test worker, or any caller with a handful of
+//! outstanding requests wants. It costs an `Arc` allocation and a condvar
+//! wake per request, and a mutex across `try_submit` so the handle can be
+//! `Sync`. **It is not the path M13's throughput bars measure** — that is
+//! [`crate::RemoteSendHalf::try_submit`] plus [`crate::RemotePollHalf::poll`]
+//! on the caller's own threads.
+//!
+//! # The promise (unchanged)
+//!
+//! Every `submit`/`query` ends in **exactly one** resolution: `Ok(
+//! RemoteResponse)`, or `Err` of [`RemoteError::Expired`] /
+//! [`RemoteError::Unknown`] / [`RemoteError::PayloadTooLarge`] /
 //! [`RemoteError::TimedOut`] / [`RemoteError::Closed`]. `REDIRECT`,
-//! `LEADER_CHANGED`, `RETRY` and connection loss are *not* outcomes the caller
-//! sees — the client reconnects, re-`HELLO`s, and re-sends every unanswered
-//! `seq` in order. With the edge's session envelope on, a re-send is safe by
-//! construction (the `Sessioned` adapter answers `fresh` / `replayed` /
-//! `expired`); with it off, a re-sent write may duplicate — that is the
-//! documented cost of turning the envelope off, not a client bug.
-//!
-//! # Shape
-//!
-//! One background **reader thread** owns the read half of the current
-//! connection and is the *only* thread that reconnects — so there is no
-//! reconnect race to lose. Everything else lives under a single
-//! `Mutex<State>` + `Condvar`:
-//!
-//! - the write half of the connection (so frame order == seq order, and a
-//!   half-written frame can only ever be followed by a discarded connection),
-//! - `credits` / `acked_seq` (the flow-control pair) and `pending` (the
-//!   unanswered requests, keyed by `seq`, holding their bytes for re-send).
-//!
-//! **One lock, one order.** The writer lives *inside* `State` rather than
-//! behind its own mutex: with two locks, `submit` (which must hold `State` to
-//! allocate a `seq` and wait on credits) and the reader thread (which must hold
-//! `State` to release credits) can only be made deadlock-free by an ordering
-//! that also has to admit the reconnect path. One lock removes the question.
-//! The cost — a socket write happens under the lock — is bounded by a socket
-//! *write timeout*: a write that cannot complete within `WRITE_TIMEOUT`
-//! (2 s, deliberately not `request_timeout` — see the constant) fails,
-//! the connection is discarded, and the reader re-sends on a fresh one. That is
-//! what stops the one real cycle (peer stops reading → our writer blocks under
-//! the lock → our reader cannot drain responses → peer never resumes).
-//!
-//! Credit discipline (spec §4.2): the client may have at most `credits`
-//! unanswered `seq`s beyond `acked_seq`, i.e. it only sends `seq` while
-//! `seq <= acked_seq + credits`. `HELLO_OK` sets the initial credits; every
-//! `RESPONSE` and `STATUS` updates the pair and wakes anyone waiting.
+//! `LEADER_CHANGED`, `RETRY` and connection loss are absorbed by the link.
 
-use std::collections::BTreeMap;
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::conn::FramedConn;
-use crate::engine::{RemoteConfig, RemoteResponse, RemoteStats};
-use crate::error::RemoteError;
-use crate::frame::{
-    encode_frame, FrameType, Header, Hello, HelloOk, HelloRefused, Leader, ResponseMeta, Retry,
-    Status, FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_BUSY,
-    HELLO_REFUSED_FAULTED, MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_NOT_SERVING,
-    RETRY_PAYLOAD_TOO_LARGE,
+use crate::engine::{
+    Consistency, RemoteCompletion, RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf,
+    RemoteResponse, RemoteSendHalf, RemoteStats, RemoteWaitHandle, SubmitError,
 };
+use crate::error::RemoteError;
 
-/// The reader's tick: how often it times out stale requests, re-pumps requests
-/// whose `RETRY` backoff has expired, sends `PING`, and notices `shutdown`.
-/// Also the socket read timeout, so an idle connection ticks at this rate.
-/// It is the granularity at which a `RETRY` hint is honoured.
-const SWEEP_INTERVAL: Duration = Duration::from_millis(25);
-/// Socket write timeout. Deliberately *not* `request_timeout`: a write happens
-/// under the state lock, so a stuck write freezes the whole client for this
-/// long. Short enough to fail over quickly, long enough that a briefly full
-/// socket buffer is not mistaken for a dead peer.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-/// A `RETRY` hint is honoured, but never for longer than this.
-const MAX_RETRY_SLEEP: Duration = Duration::from_secs(1);
-/// A `RETRY{retry_after_us: 0}` still backs off this much, so a retry loop can
-/// never become a spin.
-const MIN_RETRY_SLEEP: Duration = Duration::from_micros(100);
-/// Backoff applied to a request an edge redirected to *itself* — the edge is
-/// telling us it cannot serve and has no better hint, so slow down.
-const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
-/// Backoff after a full pass over `members` failed to connect. Slept in
-/// [`SWEEP_INTERVAL`] slices (see `Inner::sleep_sweeping`) so it can never
-/// outlast a pending request's budget.
-const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(5);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
-/// Hops followed during one connect scan — a `REDIRECT` at the handshake, or
-/// a `HELLO_OK` that names a leader other than the edge that sent it.
-const MAX_REDIRECT_HOPS: usize = 8;
+/// One outstanding request's resolution cell.
+struct TicketCore {
+    done: Mutex<Option<Result<RemoteResponse, RemoteError>>>,
+    cv: Condvar,
+}
+
+impl TicketCore {
+    fn new() -> TicketCore {
+        TicketCore { done: Mutex::new(None), cv: Condvar::new() }
+    }
+
+    fn set(&self, r: Result<RemoteResponse, RemoteError>) {
+        let mut g = self.done.lock().unwrap();
+        if g.is_none() {
+            *g = Some(r);
+        }
+        drop(g);
+        self.cv.notify_all();
+    }
+}
 
 /// A handle on one outstanding request.
 pub struct Ticket {
-    rx: Receiver<Result<RemoteResponse, RemoteError>>,
+    core: Arc<TicketCore>,
 }
 
 impl Ticket {
-    /// Block until the request resolves. Only the client's own `request_timeout`
-    /// or `shutdown` can end the wait without an answer.
+    /// Block until the request resolves. Only the client's own
+    /// `request_timeout` or `shutdown` can end the wait without an answer.
     pub fn wait(self) -> Result<RemoteResponse, RemoteError> {
-        self.rx.recv().unwrap_or(Err(RemoteError::Closed))
-    }
-
-    /// Like [`Ticket::wait`] with a caller-side bound. Note that giving up here
-    /// abandons the request: the client stops tracking it once it resolves.
-    pub fn wait_timeout(self, d: Duration) -> Result<RemoteResponse, RemoteError> {
-        match self.rx.recv_timeout(d) {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => Err(RemoteError::TimedOut),
-            Err(RecvTimeoutError::Disconnected) => Err(RemoteError::Closed),
-        }
-    }
-}
-
-// ---------------------------------------------------------------- internals
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Submit,
-    Query { linearizable: bool },
-}
-
-impl Kind {
-    fn ty(self) -> FrameType {
-        match self {
-            Kind::Submit => FrameType::Submit,
-            Kind::Query { .. } => FrameType::Query,
-        }
-    }
-
-    fn flags(self) -> u8 {
-        match self {
-            Kind::Query { linearizable: true } => FLAG_LINEARIZABLE,
-            _ => 0,
-        }
-    }
-}
-
-struct Pending {
-    kind: Kind,
-    /// Kept so the request can be re-sent byte-for-byte after a failover.
-    payload: Bytes,
-    tx: SyncSender<Result<RemoteResponse, RemoteError>>,
-    created: Instant,
-    /// Earliest time this request may go on the wire again. A `RETRY` hint and
-    /// the self-`REDIRECT` backoff are expressed here rather than by sleeping:
-    /// the reader thread must never block, or one request's backoff would delay
-    /// every other request's response — and a queued `REDIRECT` past its
-    /// failover budget.
-    not_before: Instant,
-    attempts: u32,
-    /// `false` = written to no live connection yet (fresh, or invalidated by a
-    /// reconnect / `RETRY` / `UNKNOWN`); the pump owns getting it onto the wire.
-    sent: bool,
-}
-
-#[derive(Default)]
-struct Stats {
-    redirects: AtomicU64,
-    leader_changes: AtomicU64,
-    reconnects: AtomicU64,
-    resends: AtomicU64,
-    retries: AtomicU64,
-    unknown: AtomicU64,
-    expired: AtomicU64,
-    max_credits_seen: AtomicU32,
-    refused_members: AtomicU64,
-}
-
-struct State {
-    /// The write half of the current connection; `None` while disconnected.
-    conn: Option<FramedConn>,
-    credits: u32,
-    acked_seq: u64,
-    next_seq: u64,
-    pending: BTreeMap<u64, Pending>,
-    leader: Option<(u32, String)>,
-    /// Lower bound on the lowest `seq` that still needs writing — `u64::MAX`
-    /// means "everything pending is on the wire". Keeps the pump from scanning
-    /// the whole in-flight window on every frame.
-    resend_from: u64,
-    /// Index into `cfg.members` that the round-robin resumes after.
-    member_idx: usize,
-    /// The address currently connected to (may be a redirect target that is not
-    /// in `members`).
-    current_addr: String,
-    /// When anything was last written to the current connection — drives `PING`.
-    /// Lives here (not in the reader thread) because submitting threads write too.
-    last_write: Instant,
-    /// The current connection has answered something that only an edge willing
-    /// to serve us can answer (a `RESPONSE`, or a `STATUS` acknowledging the
-    /// probe). Until then the pump writes ONE request, not the window — see
-    /// [`Inner::pump`].
-    proven: bool,
-    /// The single request written while `!proven`, if one is outstanding.
-    probe_seq: Option<u64>,
-    closed: bool,
-}
-
-struct Inner {
-    cfg: RemoteConfig,
-    client_id: u64,
-    state: Mutex<State>,
-    cv: Condvar,
-    stats: Stats,
-    /// xorshift64 state for retry jitter (`rand` is not a dependency here — this
-    /// crate is meant to be trivially re-implementable in another language).
-    rng: AtomicU64,
-}
-
-/// What the reader thread should do after a frame.
-enum Act {
-    Continue,
-    /// Reconnect, preferring this address if given.
-    Reconnect(Option<String>),
-    Stop,
-}
-
-// ---------------------------------------------------------------- client
-
-/// A connected remote client. `Send + Sync`; share it behind an `Arc` or a
-/// reference — every method takes `&self`.
-pub struct RemoteClient {
-    inner: Arc<Inner>,
-    reader: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl RemoteClient {
-    /// Connect to the first reachable member, following a `REDIRECT` at
-    /// `HELLO` — and, when an edge's `HELLO_OK` names a *different* member as
-    /// leader, hopping to that one before adopting the connection, so a
-    /// pipelined window is flushed at the leader rather than redirected frame
-    /// by frame.
-    ///
-    /// Fails with [`RemoteError::Config`] if [`RemoteConfig::validate`]
-    /// refuses the configuration, before any socket is opened.
-    ///
-    /// Fails with [`RemoteError::HelloRefused`] if an edge refuses the
-    /// handshake for a reason no other member would answer differently — a
-    /// wrong `app_id` or protocol version. A `HELLO_REFUSED{FAULTED}` or
-    /// `{BUSY}` is the *edge's* problem instead, so that member is counted
-    /// ([`RemoteStats::refused_members`]) and skipped. Fails with
-    /// [`RemoteError::NoMembersReachable`] only after a full pass over
-    /// `members`.
-    pub fn connect(cfg: RemoteConfig) -> Result<Self, RemoteError> {
-        cfg.validate()?;
-        let client_id = cfg.client_id.unwrap_or_else(random_u64);
-        // The stats live longer than this call, and `dial` records the members
-        // it had to skip, so they are built before the first dial rather than
-        // after it.
-        let stats = Stats::default();
-        // No `Inner` exists yet, so there is nothing to sweep and no
-        // `closed` flag to watch: this scan is bounded by the caller's own
-        // patience, exactly as before.
-        let (conn, info, idx, addr) = dial(&cfg, client_id, None, 0, &stats, None)?;
-        let read_half = conn.try_clone()?;
-        read_half.set_read_timeout(Some(SWEEP_INTERVAL))?;
-        conn.set_write_timeout(Some(WRITE_TIMEOUT))?;
-
-        stats.max_credits_seen.store(info.credits, Ordering::Relaxed);
-        let inner = Arc::new(Inner {
-            client_id,
-            state: Mutex::new(State {
-                conn: Some(conn),
-                credits: info.credits,
-                acked_seq: 0,
-                next_seq: 0,
-                pending: BTreeMap::new(),
-                resend_from: u64::MAX,
-                leader: info.leader,
-                member_idx: idx,
-                current_addr: addr,
-                last_write: Instant::now(),
-                proven: false,
-                probe_seq: None,
-                closed: false,
-            }),
-            cv: Condvar::new(),
-            stats,
-            rng: AtomicU64::new(client_id | 1),
-            cfg,
-        });
-
-        let reader_inner = Arc::clone(&inner);
-        let handle = thread::Builder::new()
-            .name("uc2-remote-rx".into())
-            .spawn(move || reader_loop(reader_inner, read_half))?;
-        Ok(RemoteClient { inner, reader: Mutex::new(Some(handle)) })
-    }
-
-    /// Submit a command. Blocks while the edge's credits are exhausted (or the
-    /// local `max_inflight` cap is reached), and gives up with
-    /// [`RemoteError::TimedOut`] if credits never reopen within
-    /// `request_timeout`.
-    ///
-    /// Note that credit wait is a **separate** `request_timeout` budget from
-    /// the one the returned [`Ticket`] then spends: a caller that blocks the
-    /// full wait here and then waits out the request's own budget can spend
-    /// ~2 x `request_timeout` in total. Size the value with that in mind, or
-    /// bound the whole thing caller-side with [`Ticket::wait_timeout`].
-    pub fn submit(&self, cmd: &[u8]) -> Result<Ticket, RemoteError> {
-        self.enqueue(Kind::Submit, cmd)
-    }
-
-    /// Ask a question. `linearizable` goes through the node's read barrier;
-    /// otherwise it is a snapshot read served by whichever replica the edge sits
-    /// on. Same credit accounting as [`RemoteClient::submit`].
-    pub fn query(&self, q: &[u8], linearizable: bool) -> Result<Ticket, RemoteError> {
-        self.enqueue(Kind::Query { linearizable }, q)
-    }
-
-    /// The identity this client asserts in every frame — the key the edge's
-    /// session dedup is per.
-    pub fn client_id(&self) -> u64 {
-        self.inner.client_id
-    }
-
-    /// Whether a connection is currently established. A `false` here is not a
-    /// failure: the reader thread is reconnecting and outstanding requests will
-    /// be re-sent.
-    pub fn is_connected(&self) -> bool {
-        self.inner.state.lock().unwrap().conn.is_some()
-    }
-
-    /// The gateway address currently connected to, if any. Note this can be a
-    /// `REDIRECT`/`LEADER_CHANGED` target that is not in `members`.
-    pub fn connected_addr(&self) -> Option<String> {
-        let st = self.inner.state.lock().unwrap();
-        st.conn.as_ref().map(|_| st.current_addr.clone())
-    }
-
-    /// The leader the current edge last told us about, if any.
-    pub fn leader(&self) -> Option<(u32, String)> {
-        self.inner.state.lock().unwrap().leader.clone()
-    }
-
-    pub fn stats(&self) -> RemoteStats {
-        let s = &self.inner.stats;
-        RemoteStats {
-            redirects: s.redirects.load(Ordering::Relaxed),
-            leader_changes: s.leader_changes.load(Ordering::Relaxed),
-            reconnects: s.reconnects.load(Ordering::Relaxed),
-            resends: s.resends.load(Ordering::Relaxed),
-            retries: s.retries.load(Ordering::Relaxed),
-            unknown: s.unknown.load(Ordering::Relaxed),
-            expired: s.expired.load(Ordering::Relaxed),
-            max_credits_seen: s.max_credits_seen.load(Ordering::Relaxed),
-            refused_members: s.refused_members.load(Ordering::Relaxed),
-            // This client has no connection generation: one reader thread
-            // owns the reconnect, so a stale redial request cannot arise.
-            stale_redials: 0,
-            // The batching counters belong to the split client's writer
-            // thread (`uc2_remote::link`). This client writes one frame per
-            // submit under its state lock — that is exactly what M13b
-            // replaces — so it has nothing to report here.
-            socket_writes: 0,
-            frames_written: 0,
-        }
-    }
-
-    /// Close the connection and fail every outstanding request with
-    /// [`RemoteError::Closed`]. Dropping the client does the same.
-    pub fn shutdown(self) {
-        self.close();
-    }
-
-    fn close(&self) {
-        {
-            let mut st = self.inner.state.lock().unwrap();
-            if !st.closed {
-                st.closed = true;
-                if let Some(c) = st.conn.take() {
-                    c.shutdown();
-                }
-                let pending = std::mem::take(&mut st.pending);
-                for (_, p) in pending {
-                    let _ = p.tx.send(Err(RemoteError::Closed));
-                }
-                self.inner.cv.notify_all();
-            }
-        }
-        let handle = self.reader.lock().unwrap().take();
-        if let Some(h) = handle {
-            let _ = h.join();
-        }
-    }
-
-    fn enqueue(&self, kind: Kind, payload: &[u8]) -> Result<Ticket, RemoteError> {
-        if HEADER_LEN + payload.len() > MAX_FRAME_LEN as usize {
-            return Err(RemoteError::PayloadTooLarge);
-        }
-        let inner = &self.inner;
-        let deadline = Instant::now() + inner.cfg.request_timeout;
-        let mut st = inner.state.lock().unwrap();
+        let mut g = self.core.done.lock().unwrap();
         loop {
-            if st.closed {
-                return Err(RemoteError::Closed);
+            if let Some(r) = g.take() {
+                return r;
             }
-            // The credit discipline, checked before a seq is even allocated:
-            // the next seq must satisfy `seq <= acked_seq + credits`.
-            let next = st.next_seq + 1;
-            let credit_ok = next <= st.acked_seq.saturating_add(st.credits as u64);
-            let inflight_ok = st.pending.len() < inner.cfg.max_inflight as usize;
-            if credit_ok && inflight_ok {
-                break;
+            g = self.core.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Like [`Ticket::wait`] with a caller-side bound. Giving up here abandons
+    /// the request: the link still resolves it, the answer is just dropped.
+    pub fn wait_timeout(self, d: Duration) -> Result<RemoteResponse, RemoteError> {
+        let deadline = Instant::now() + d;
+        let mut g = self.core.done.lock().unwrap();
+        loop {
+            if let Some(r) = g.take() {
+                return r;
             }
             let now = Instant::now();
             if now >= deadline {
                 return Err(RemoteError::TimedOut);
             }
-            let (guard, _) = inner.cv.wait_timeout(st, deadline - now).unwrap();
-            st = guard;
+            let (guard, _) = self.core.cv.wait_timeout(g, deadline - now).unwrap();
+            g = guard;
         }
-        st.next_seq += 1;
-        let seq = st.next_seq;
-        let (tx, rx) = sync_channel(1);
-        st.pending.insert(
-            seq,
-            Pending {
-                kind,
-                payload: Bytes::copy_from_slice(payload),
-                tx,
-                created: Instant::now(),
-                not_before: Instant::now(),
-                attempts: 0,
-                sent: false,
-            },
-        );
-        st.resend_from = st.resend_from.min(seq);
-        inner.pump(&mut st);
-        Ok(Ticket { rx })
     }
 }
 
-impl std::fmt::Debug for RemoteClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let st = self.inner.state.lock().unwrap();
-        f.debug_struct("RemoteClient")
-            .field("client_id", &self.inner.client_id)
-            .field("addr", &st.current_addr)
-            .field("connected", &st.conn.is_some())
-            .field("credits", &st.credits)
-            .field("acked_seq", &st.acked_seq)
-            .field("pending", &st.pending.len())
-            .field("closed", &st.closed)
-            .finish()
+/// A connected remote client. `Send + Sync`; share it behind an `Arc` or a
+/// reference — every method takes `&self`.
+pub struct RemoteClient {
+    send: Mutex<RemoteSendHalf>,
+    wait: RemoteWaitHandle,
+    stop: Arc<AtomicBool>,
+    poller: Mutex<Option<JoinHandle<()>>>,
+    request_timeout: Duration,
+}
+
+impl RemoteClient {
+    /// Connect (see [`RemoteEngine::connect`] for the error contract) and
+    /// start this client's own poller thread.
+    pub fn connect(cfg: RemoteConfig) -> Result<Self, RemoteError> {
+        let request_timeout = cfg.request_timeout;
+        let (send, poll) = RemoteEngine::connect(cfg)?;
+        let wait = poll.wait_handle();
+        let stop = Arc::new(AtomicBool::new(false));
+        let poller = {
+            let stop = Arc::clone(&stop);
+            let wait = wait.clone();
+            std::thread::Builder::new()
+                .name("uc2-remote-poll".into())
+                .spawn(move || poller_loop(poll, stop, wait))?
+        };
+        Ok(RemoteClient {
+            send: Mutex::new(send),
+            wait,
+            stop,
+            poller: Mutex::new(Some(poller)),
+            request_timeout,
+        })
+    }
+
+    /// Submit a command. Blocks while the edge's credits (or `max_inflight`)
+    /// are exhausted, and gives up with [`RemoteError::TimedOut`] if the
+    /// window never reopens within `request_timeout`.
+    ///
+    /// Note that the credit wait is a **separate** `request_timeout` budget
+    /// from the one the returned [`Ticket`] then spends, so a caller that
+    /// blocks the full wait here and then waits out the request can spend
+    /// ~2 x `request_timeout` in total.
+    pub fn submit(&self, cmd: &[u8]) -> Result<Ticket, RemoteError> {
+        self.enqueue(None, cmd)
+    }
+
+    /// Ask a question. Same admission accounting as [`RemoteClient::submit`].
+    pub fn query(&self, q: &[u8], consistency: Consistency) -> Result<Ticket, RemoteError> {
+        self.enqueue(Some(consistency), q)
+    }
+
+    fn enqueue(&self, q: Option<Consistency>, bytes: &[u8]) -> Result<Ticket, RemoteError> {
+        let core = Arc::new(TicketCore::new());
+        // The engine's `user_data` is an owned reference to the ticket; the
+        // completion path (or a refusal below) turns it back with exactly one
+        // `Arc::from_raw`.
+        let user_data = Arc::into_raw(Arc::clone(&core)) as u64;
+        let deadline = Instant::now() + self.request_timeout;
+        loop {
+            let r = {
+                let s = self.send.lock().unwrap();
+                match q {
+                    None => s.try_submit(user_data, bytes),
+                    Some(c) => s.try_query(user_data, c, bytes),
+                }
+            };
+            match r {
+                Ok(()) => return Ok(Ticket { core }),
+                Err(SubmitError::Backpressure) => {
+                    if Instant::now() >= deadline {
+                        reclaim(user_data);
+                        return Err(RemoteError::TimedOut);
+                    }
+                    // Park on the completion signal: a completion is exactly
+                    // what reopens the window.
+                    self.wait.park(Duration::from_micros(200));
+                }
+                Err(SubmitError::Closed) => {
+                    reclaim(user_data);
+                    return Err(RemoteError::Closed);
+                }
+                Err(SubmitError::PayloadTooLarge) => {
+                    reclaim(user_data);
+                    return Err(RemoteError::PayloadTooLarge);
+                }
+            }
+        }
+    }
+
+    pub fn stats(&self) -> RemoteStats {
+        self.send.lock().unwrap().stats()
+    }
+
+    pub fn leader(&self) -> Option<(u32, String)> {
+        self.send.lock().unwrap().leader()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.send.lock().unwrap().is_connected()
+    }
+
+    pub fn connected_addr(&self) -> Option<String> {
+        self.send.lock().unwrap().connected_addr()
+    }
+
+    pub fn client_id(&self) -> u64 {
+        self.send.lock().unwrap().client_id()
+    }
+
+    /// Close the connection and fail every outstanding request with
+    /// [`RemoteError::Closed`]. Idempotent; dropping the client does the same.
+    pub fn shutdown(&self) {
+        self.send.lock().unwrap().shutdown();
+        self.stop.store(true, Ordering::Release);
+        self.wait.wake();
+        let handle = self.poller.lock().unwrap().take();
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
     }
 }
 
 impl Drop for RemoteClient {
     fn drop(&mut self) {
-        self.close();
+        self.shutdown();
     }
 }
 
-// ---------------------------------------------------------------- inner
-
-impl Inner {
-    fn is_closed(&self) -> bool {
-        self.state.lock().unwrap().closed
-    }
-
-    fn note_credits(&self, credits: u32) {
-        self.stats.max_credits_seen.fetch_max(credits, Ordering::Relaxed);
-    }
-
-    /// Write every unsent pending that credits allow, in `seq` order.
-    ///
-    /// Stops at the first request the credit window does not cover — a later
-    /// `seq` can never be admissible when an earlier one is not, so this both
-    /// respects the window and preserves order. A write failure discards the
-    /// connection (leaving the request unsent); the reader thread notices the
-    /// dead socket and reconnects.
-    ///
-    /// ## Probe before flush
-    ///
-    /// On a connection that has not yet answered anything (`!proven`: freshly
-    /// connected, reconnected, or hopped) this writes exactly **one** request
-    /// and stops. Only when that probe is answered — a `RESPONSE`, or a
-    /// `STATUS` whose `acked_seq` covers it — does the window flush.
-    ///
-    /// The reason is not politeness, it is cost. An edge that cannot serve
-    /// answers **every** SUBMIT with a `REDIRECT`, so flushing a window of N
-    /// at the wrong member costs N redirect frames, of which the client uses
-    /// the first and discards the rest when it reconnects — and then does it
-    /// again at the next member. Measured across a leader failover with ~190
-    /// requests in flight, that was thousands of frames per election. Probing
-    /// costs one frame to find out, and one round-trip of latency on a
-    /// connection that is about to be replaced anyway.
-    fn pump(&self, st: &mut State) {
-        if st.conn.is_none() || st.resend_from == u64::MAX {
-            return;
-        }
-        let now = Instant::now();
-        let probe_only = !st.proven;
-        let State {
-            conn,
-            pending,
-            acked_seq,
-            credits,
-            resend_from,
-            last_write,
-            probe_seq,
-            ..
-        } = &mut *st;
-        // A probe is outstanding only while it is still ON THE WIRE. A
-        // `RETRY`/`UNKNOWN` answer marks it unsent again, and that re-send is
-        // the next probe — testing `pending.contains_key` alone would wedge
-        // the connection there until the request timed out.
-        if probe_only && probe_seq.is_some_and(|p| pending.get(&p).is_some_and(|q| q.sent)) {
-            return;
-        }
-        let window = acked_seq.saturating_add(*credits as u64);
-        let c = conn.as_mut().expect("checked above");
-        let mut next_from = u64::MAX;
-        // Drain every admissible unsent frame into ONE buffer under the lock,
-        // then flush it with a SINGLE `write_all` below — instead of a syscall
-        // per frame. Frames are length-prefixed, so the concatenation parses
-        // back to whole frames on the edge however TCP segments it. The flush
-        // happens when the drain is empty (flush-on-empty); there is no batch
-        // timer, so this never adds a latency cadence at low inflight.
-        let mut buf: Vec<u8> = Vec::new();
-        let mut min_batch_seq: Option<u64> = None;
-        for (seq, p) in pending.range_mut(*resend_from..) {
-            if p.sent {
-                continue;
-            }
-            if *seq > window {
-                next_from = *seq;
-                break;
-            }
-            if p.not_before > now {
-                // Still backing off (a RETRY hint, or a self-REDIRECT). Stop
-                // rather than skip: re-send order is part of the contract, so a
-                // later seq must not overtake an earlier one. The reader's tick
-                // pumps again once the backoff expires.
-                next_from = *seq;
-                break;
-            }
-            let h = Header {
-                ty: p.kind.ty(),
-                flags: p.kind.flags(),
-                version: PROTOCOL_VERSION,
-                client_id: self.client_id,
-                seq: *seq,
-            };
-            encode_frame(&mut buf, h, &p.payload);
-            if min_batch_seq.is_none() {
-                min_batch_seq = Some(*seq);
-            }
-            p.sent = true;
-            p.attempts += 1;
-            if p.attempts > 1 {
-                self.stats.resends.fetch_add(1, Ordering::Relaxed);
-            }
-            if probe_only {
-                *probe_seq = Some(*seq);
-                // `resend_from` is a lower bound, so naming a seq that may not
-                // exist is fine — the next pump's `range` starts at the first
-                // pending key at or above it.
-                next_from = seq.saturating_add(1);
-                break;
-            }
-        }
-        let broken = if buf.is_empty() {
-            false
-        } else {
-            match c.write_all_bytes(&buf) {
-                Ok(()) => {
-                    *last_write = now;
-                    false
-                }
-                Err(_) => {
-                    // The whole batch failed to reach the peer: `resend_from`
-                    // must not advance past it. `drop_conn` + the reader's
-                    // reconnect (which resets every `sent` flag and rewinds
-                    // `resend_from` to the first pending key) re-send it in
-                    // order — the same recovery a per-frame write failure took.
-                    next_from = min_batch_seq.unwrap_or(*resend_from);
-                    true
-                }
-            }
-        };
-        *resend_from = next_from;
-        if broken {
-            // Wake the reader thread out of its blocking read; it reconnects.
-            drop_conn(st);
-        }
-    }
-
-    /// Fail every request older than `request_timeout`.
-    fn sweep(&self) {
-        let mut st = self.state.lock().unwrap();
-        let budget = self.cfg.request_timeout;
-        let stale: Vec<u64> = st
-            .pending
-            .iter()
-            .filter(|(_, p)| p.created.elapsed() >= budget)
-            .map(|(seq, _)| *seq)
-            .collect();
-        if stale.is_empty() {
-            return;
-        }
-        for seq in stale {
-            if let Some(p) = st.pending.remove(&seq) {
-                let _ = p.tx.send(Err(RemoteError::TimedOut));
-            }
-        }
-        self.cv.notify_all();
-    }
-
-    /// Sleep `total`, in [`SWEEP_INTERVAL`] slices, sweeping between them and
-    /// giving up early on shutdown.
-    ///
-    /// The reconnect backoff is the only sleep the reader thread ever takes,
-    /// and it is taken with no connection at all — nothing is waiting behind
-    /// it. But `RECONNECT_BACKOFF_MAX` is 500 ms, twenty times the sweep
-    /// interval, so sleeping it whole would let a 200 ms request overshoot its
-    /// budget by more than twice over.
-    fn sleep_sweeping(&self, total: Duration) {
-        let end = Instant::now() + total;
-        loop {
-            self.sweep();
-            if self.is_closed() {
-                return;
-            }
-            let now = Instant::now();
-            if now >= end {
-                return;
-            }
-            thread::sleep((end - now).min(SWEEP_INTERVAL));
-        }
-    }
-
-    /// Update the flow-control pair from a frame that carries it, then push
-    /// whatever the new window admits.
-    fn credit_update(&self, st: &mut State, credits: u32, acked_seq: u64) {
-        self.note_credits(credits);
-        st.credits = credits;
-        st.acked_seq = st.acked_seq.max(acked_seq);
-        self.pump(st);
-        // The admission wake is deliberately NOT here: `credit_update` runs once
-        // per received frame, and waking every blocked submitter on each frame
-        // was a thundering herd. The reader loop issues ONE `cv.notify_all`
-        // after it finishes a whole read-batch, by which point the credit
-        // window reflects every frame in the batch. See `reader_loop`.
-    }
-
-    fn resolve(&self, st: &mut State, seq: u64, res: Result<RemoteResponse, RemoteError>) {
-        if let Some(p) = st.pending.remove(&seq) {
-            let _ = p.tx.send(res);
-            // The `Ticket`'s answer travels on `p.tx` (its own channel), so the
-            // caller is already woken. The admission `cv` — which only paces
-            // submitters waiting for credit — is notified once per read-batch by
-            // the reader loop, not per resolved request.
-        }
-    }
-
-    /// Mark a request for re-send, not before `delay` from now. Returns `false`
-    /// if it is no longer pending (already resolved, or swept), in which case
-    /// there is nothing to do.
-    fn mark_unsent(&self, st: &mut State, seq: u64, delay: Duration) -> bool {
-        match st.pending.get_mut(&seq) {
-            Some(p) => {
-                p.sent = false;
-                if !delay.is_zero() {
-                    p.not_before = Instant::now() + delay;
-                }
-                st.resend_from = st.resend_from.min(seq);
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn on_frame(&self, h: Header, payload: Bytes) -> Act {
-        match h.ty {
-            FrameType::Response => {
-                let Ok(meta) = ResponseMeta::decode(&payload) else { return Act::Continue };
-                let body = payload.slice(ResponseMeta::LEN..);
-                let mut st = self.state.lock().unwrap();
-                if h.flags & FLAG_EXPIRED != 0 {
-                    self.stats.expired.fetch_add(1, Ordering::Relaxed);
-                    self.resolve(&mut st, h.seq, Err(RemoteError::Expired));
-                } else {
-                    self.resolve(
-                        &mut st,
-                        h.seq,
-                        Ok(RemoteResponse {
-                            position: meta.position,
-                            bytes: body,
-                            replayed: h.flags & FLAG_REPLAYED != 0,
-                        }),
-                    );
-                }
-                // Anything the edge answers with a RESPONSE proves it is
-                // serving us: the window may flush now.
-                st.proven = true;
-                self.credit_update(&mut st, meta.credits, meta.acked_seq);
-                Act::Continue
-            }
-            FrameType::Status => {
-                let Ok(s) = Status::decode(&payload) else { return Act::Continue };
-                let mut st = self.state.lock().unwrap();
-                // A STATUS that acknowledges the probe says the same thing a
-                // RESPONSE would: this edge took our write. (A bare idle
-                // STATUS, whose `acked_seq` is below the probe, proves only
-                // that the edge is alive — which is not the question.)
-                if !st.proven && st.probe_seq.is_some_and(|p| s.acked_seq >= p) {
-                    st.proven = true;
-                }
-                self.credit_update(&mut st, s.credits, s.acked_seq);
-                Act::Continue
-            }
-            FrameType::Retry => {
-                let Ok(r) = Retry::decode(&payload) else { return Act::Continue };
-                if r.reason == RETRY_PAYLOAD_TOO_LARGE {
-                    // Terminal: the payload will not get smaller by being sent
-                    // again.
-                    let mut st = self.state.lock().unwrap();
-                    self.resolve(&mut st, h.seq, Err(RemoteError::PayloadTooLarge));
-                    return Act::Continue;
-                }
-                self.stats.retries.fetch_add(1, Ordering::Relaxed);
-                let delay = self.jittered(Duration::from_micros(r.retry_after_us as u64));
-                let mut st = self.state.lock().unwrap();
-                let still_pending = self.mark_unsent(&mut st, h.seq, delay);
-                if r.reason == RETRY_NOT_SERVING {
-                    // A statement about the edge's ROLE, not about a transient
-                    // resource shortage — and one that does not expire on this
-                    // connection. The edge latches a connection it has refused
-                    // a write on, so that the set of SUBMITs it accepts stays a
-                    // prefix of what was sent (`uc2_gateway`'s
-                    // `Conn::latch_not_serving`); re-sending here would be
-                    // refused for as long as the connection lived, however
-                    // quickly this member became the leader. So: go somewhere
-                    // else. The backoff set above still paces it — nothing is
-                    // written until it expires, wherever we land.
-                    let preferred = st
-                        .leader
-                        .as_ref()
-                        .map(|(_, a)| a.clone())
-                        .filter(|a| *a != st.current_addr);
-                    return Act::Reconnect(preferred);
-                }
-                if still_pending {
-                    // Nothing to write yet — the reader's tick pumps it once the
-                    // backoff expires. Never sleep here: this thread also carries
-                    // every other request's response and the failover frames.
-                    self.pump(&mut st);
-                }
-                Act::Continue
-            }
-            FrameType::Unknown => {
-                self.stats.unknown.fetch_add(1, Ordering::Relaxed);
-                let mut st = self.state.lock().unwrap();
-                if self.cfg.resend_on_unknown {
-                    if self.mark_unsent(&mut st, h.seq, Duration::ZERO) {
-                        self.pump(&mut st);
-                    }
-                } else {
-                    self.resolve(&mut st, h.seq, Err(RemoteError::Unknown));
-                }
-                Act::Continue
-            }
-            FrameType::Redirect => {
-                self.stats.redirects.fetch_add(1, Ordering::Relaxed);
-                let Ok(l) = Leader::decode(&payload) else { return Act::Continue };
-                let mut st = self.state.lock().unwrap();
-                if !l.addr.is_empty() {
-                    st.leader = Some((l.node_id, l.addr.to_string()));
-                }
-                if l.addr.is_empty() {
-                    // The request was refused, not answered: it must go out again
-                    // — the reconnect re-sends everything unanswered, in order.
-                    self.mark_unsent(&mut st, h.seq, Duration::ZERO);
-                    return Act::Reconnect(None);
-                }
-                if l.addr == st.current_addr {
-                    // An edge can name its own node as the leader hint while not
-                    // yet serving ("elected but not serving"), so it redirects us
-                    // to the address we are already on.
-                    //
-                    // Re-sending in place cannot work: the edge latches a
-                    // connection it has refused a write on (`uc2_gateway`'s
-                    // `Conn::latch_not_serving` — the prefix invariant), so this
-                    // connection will be refused for as long as it lives, even
-                    // once this member starts serving. A FRESH connection to the
-                    // same address is the thing that changes the answer. The
-                    // backoff below is what stops that becoming a spin: nothing
-                    // is written until it expires, so the loop runs at the
-                    // backoff's rate, not the frame rate.
-                    self.mark_unsent(&mut st, h.seq, SELF_REDIRECT_BACKOFF);
-                    return Act::Reconnect(Some(l.addr.to_string()));
-                }
-                self.mark_unsent(&mut st, h.seq, Duration::ZERO);
-                Act::Reconnect(Some(l.addr.to_string()))
-            }
-            FrameType::LeaderChanged => {
-                self.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
-                let Ok(l) = Leader::decode(&payload) else { return Act::Continue };
-                let mut st = self.state.lock().unwrap();
-                if l.addr.is_empty() {
-                    st.leader = None;
-                    return Act::Reconnect(None);
-                }
-                st.leader = Some((l.node_id, l.addr.to_string()));
-                if l.addr == st.current_addr {
-                    // We are already on the new leader's edge: nothing to do,
-                    // and reconnecting would only churn the in-flight window.
-                    return Act::Continue;
-                }
-                Act::Reconnect(Some(l.addr.to_string()))
-            }
-            FrameType::HelloRefused => {
-                let (reason, detail) = match HelloRefused::decode(&payload) {
-                    Ok(r) => (r.reason, r.detail.to_string()),
-                    Err(_) => (0, String::new()),
-                };
-                // Same split as the dial path, and for the same reason: what
-                // the refusal is ABOUT decides who it is terminal for.
-                // `FAULTED`/`BUSY` are statements about THIS EDGE — it has
-                // taken itself out of service, or is at its connection ceiling
-                // — so another member may well be healthy and this costs one
-                // member, not the client. Closing here instead would turn a
-                // single edge's local condition into a dead client, which is
-                // exactly what the multi-member list exists to prevent.
-                if reason == HELLO_REFUSED_FAULTED || reason == HELLO_REFUSED_BUSY {
-                    self.stats.refused_members.fetch_add(1, Ordering::Relaxed);
-                    return Act::Reconnect(None);
-                }
-                // `APP_ID`/`VERSION` are about US: no member would answer
-                // differently, so neither a re-send nor another member fixes
-                // it. Fail everything and stop.
-                self.fail_all_and_close(|| RemoteError::HelloRefused {
-                    reason,
-                    detail: detail.clone(),
-                });
-                Act::Stop
-            }
-            FrameType::Ping => {
-                let pong = Header {
-                    ty: FrameType::Pong,
-                    flags: 0,
-                    version: PROTOCOL_VERSION,
-                    client_id: self.client_id,
-                    seq: h.seq,
-                };
-                let mut st = self.state.lock().unwrap();
-                let failed = match st.conn.as_mut() {
-                    Some(c) => c.write_frame(pong, &[]).is_err(),
-                    None => false,
-                };
-                if failed {
-                    drop_conn(&mut st);
-                }
-                Act::Continue
-            }
-            // A PONG carries no state: simply having arrived is the point — the
-            // reader records every received frame against `dead_after`.
-            FrameType::Pong => Act::Continue,
-            // HELLO_OK arrives only during a handshake; the rest are client→edge
-            // types the edge must never send. Ignore rather than tear down.
-            _ => Act::Continue,
-        }
-    }
-
-    fn fail_all_and_close(&self, mk: impl Fn() -> RemoteError) {
-        let mut st = self.state.lock().unwrap();
-        st.closed = true;
-        drop_conn(&mut st);
-        let pending = std::mem::take(&mut st.pending);
-        for (_, p) in pending {
-            let _ = p.tx.send(Err(mk()));
-        }
-        self.cv.notify_all();
-    }
-
-    /// Open a fresh connection (preferring `preferred`, else round-robin over
-    /// `members` starting after the current one), re-`HELLO`, reset credits from
-    /// `HELLO_OK`, and re-send every unanswered request in `seq` order.
-    ///
-    /// Returns `false` when the client was shut down and the reader must stop.
-    /// Never gives up otherwise: a full failed pass over `members` backs off and
-    /// tries again, while `sweep` keeps failing requests that run out of budget.
-    ///
-    /// **`sweep` runs here, at the top of every iteration**, and that is not
-    /// belt-and-braces. The reader's tick — one of the other places it runs —
-    /// is only reached between reads on a live connection, and there are two
-    /// ways to never get back there: every dial *failing* (the loop sleeps its
-    /// backoff below, in sweeping slices), and every dial *succeeding* (an
-    /// edge pair that redirects each request to the other, or one edge
-    /// redirecting to an address that is down, puts the reader in a reconnect
-    /// churn that resets its tick clock every cycle). The second cost a real
-    /// cluster its `request_timeout` entirely: observed in the M12c quickstart
-    /// as a client hung >200 s on a 10 s budget while an edge logged 37 000
-    /// redirects.
-    ///
-    /// The sweep INSIDE one scan — between each `dial_one` and each redirect
-    /// hop — lives in [`dial`], which takes this `Inner` for exactly that:
-    /// a single pass can cost `(members + 1 + MAX_REDIRECT_HOPS)` attempts,
-    /// so "between passes" was never a fine enough grain.
-    fn reconnect(&self, preferred: Option<String>, rd: &mut FramedConn) -> bool {
-        if self.is_closed() {
-            return false;
-        }
-        self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
-        let mut preferred = preferred;
-        let mut backoff = RECONNECT_BACKOFF_START;
-        loop {
-            self.sweep();
-            if self.is_closed() {
-                return false;
-            }
-            let start = {
-                let mut st = self.state.lock().unwrap();
-                drop_conn(&mut st);
-                // Everything unanswered has to go out again on the new
-                // connection, in order.
-                for p in st.pending.values_mut() {
-                    p.sent = false;
-                }
-                st.resend_from = st.pending.keys().next().copied().unwrap_or(u64::MAX);
-                st.member_idx + 1
-            };
-            // `dial` sweeps and re-checks `closed` between every attempt and
-            // every redirect hop — passing `Some(self)` is what makes a scan
-            // over an unreachable member list interruptible. Each attempt
-            // still gets the FULL `connect_timeout`: timeliness comes from
-            // sweeping, never from short dials (a shortened budget pins
-            // itself under a steady stream of submits and can make a healthy
-            // but slow cluster permanently unreachable).
-            match dial(
-                &self.cfg,
-                self.client_id,
-                preferred.as_deref(),
-                start,
-                &self.stats,
-                Some(self),
-            ) {
-                Ok((conn, info, idx, addr)) => {
-                    let read_half = match conn
-                        .try_clone()
-                        .and_then(|r| r.set_read_timeout(Some(SWEEP_INTERVAL)).map(|_| r))
-                    {
-                        Ok(r) => r,
-                        Err(_) => {
-                            preferred = None;
-                            continue;
-                        }
-                    };
-                    let _ = conn.set_write_timeout(Some(WRITE_TIMEOUT));
-                    let mut st = self.state.lock().unwrap();
-                    if st.closed {
-                        conn.shutdown();
-                        return false;
-                    }
-                    st.conn = Some(conn);
-                    st.member_idx = idx;
-                    st.current_addr = addr;
-                    // Explicit, though `drop_conn` above already cleared it:
-                    // the new connection has answered nothing, so the pump
-                    // probes rather than flushing (see `pump`).
-                    st.proven = false;
-                    st.probe_seq = None;
-                    if info.leader.is_some() {
-                        st.leader = info.leader;
-                    }
-                    self.note_credits(info.credits);
-                    // `credits` resets from HELLO_OK, but `acked_seq` is carried
-                    // across: it only ever moves forward (every update is a
-                    // `max`), and every pending seq is strictly greater than it,
-                    // so the window `seq <= acked_seq + credits` stays correct
-                    // against an edge that has acknowledged nothing yet.
-                    st.credits = info.credits;
-                    st.last_write = Instant::now();
-                    self.pump(&mut st);
-                    self.cv.notify_all();
-                    *rd = read_half;
-                    return true;
-                }
-                // The scan noticed `shutdown` between attempts and abandoned
-                // itself. Nothing to retry, nothing to sleep for.
-                Err(RemoteError::Closed) => return false,
-                Err(RemoteError::HelloRefused { reason, detail }) => {
-                    self.fail_all_and_close(|| RemoteError::HelloRefused {
-                        reason,
-                        detail: detail.clone(),
-                    });
-                    return false;
-                }
-                Err(_) => {
-                    // Nothing reachable this pass. Keep the promise anyway:
-                    // requests still time out on their own budget, swept
-                    // through the backoff rather than after it.
-                    preferred = None;
-                    self.sleep_sweeping(backoff);
-                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                }
-            }
-        }
-    }
-
-    /// A backoff of `base` plus up to 25% jitter, floored at [`MIN_RETRY_SLEEP`]
-    /// and capped at [`MAX_RETRY_SLEEP`]. Applied as a `not_before` deadline,
-    /// never as a sleep.
-    fn jittered(&self, base: Duration) -> Duration {
-        let base = base.clamp(MIN_RETRY_SLEEP, MAX_RETRY_SLEEP);
-        let span = (base.as_micros() as u64 / 4).max(1);
-        base + Duration::from_micros(self.next_rand() % span)
-    }
-
-    /// xorshift64 — enough for backoff jitter, and no dependency.
-    fn next_rand(&self) -> u64 {
-        let mut x = self.rng.load(Ordering::Relaxed);
-        if x == 0 {
-            x = 0x9E37_79B9_7F4A_7C15;
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng.store(x, Ordering::Relaxed);
-        x
+impl std::fmt::Debug for RemoteClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.send.lock().unwrap();
+        f.debug_struct("RemoteClient")
+            .field("client_id", &s.client_id())
+            .field("addr", &s.connected_addr())
+            .field("credits", &s.credits())
+            .field("inflight", &s.inflight())
+            .finish()
     }
 }
 
-/// Discard the current connection, shutting the socket down so a peer thread
-/// blocked in `read_frame` wakes up.
-fn drop_conn(st: &mut State) {
-    if let Some(c) = st.conn.take() {
-        c.shutdown();
-    }
-    // Whatever the next connection is, it has proved nothing yet.
-    st.proven = false;
-    st.probe_seq = None;
+/// Give the ticket reference back without resolving it — the request was
+/// refused, so no completion will ever carry this `user_data`.
+fn reclaim(user_data: u64) {
+    // SAFETY: `user_data` came from `Arc::into_raw::<TicketCore>` in
+    // `enqueue`, and this is the ONLY path that reclaims a REFUSED request
+    // (an accepted one is reclaimed by `resolve`, exactly once).
+    drop(unsafe { Arc::from_raw(user_data as *const TicketCore) });
 }
 
-/// What the periodic tick decided.
-enum Tick {
-    Ok,
-    /// Nothing has been received for `dead_after`: fail over.
-    Reconnect,
-}
-
-impl Inner {
-    /// The periodic tick, run by the reader thread every [`SWEEP_INTERVAL`]
-    /// **regardless of whether frames are arriving**.
-    ///
-    /// This is what enforces `request_timeout` (an edge that answers every
-    /// re-send with `RETRY` or a self-`REDIRECT` keeps the reader busy forever,
-    /// so an idle-only sweep would never run), what re-pumps requests whose
-    /// backoff has expired, and what keeps the connection proven live.
-    fn tick(&self, now: Instant, dead: bool) -> Tick {
-        self.sweep();
-        let mut st = self.state.lock().unwrap();
-        if st.closed {
-            return Tick::Ok;
-        }
-        if dead {
-            return Tick::Reconnect;
-        }
-        self.pump(&mut st);
-        if st.conn.is_some() && now.duration_since(st.last_write) >= self.cfg.ping_interval {
-            let ping = Header {
-                ty: FrameType::Ping,
-                flags: 0,
-                version: PROTOCOL_VERSION,
-                client_id: self.client_id,
-                seq: 0,
-            };
-            let failed = match st.conn.as_mut() {
-                Some(c) => c.write_frame(ping, &[]).is_err(),
-                None => false,
-            };
-            if failed {
-                drop_conn(&mut st);
+fn resolve(c: RemoteCompletion<'_>) {
+    // SAFETY: as `reclaim` — one completion per accepted request, so this
+    // runs exactly once for this pointer.
+    let core = unsafe { Arc::from_raw(c.user_data as *const TicketCore) };
+    let r = match c.outcome {
+        RemoteOutcome::Response { body, replayed, expired } => {
+            if expired {
+                Err(RemoteError::Expired)
             } else {
-                st.last_write = now;
+                Ok(RemoteResponse {
+                    position: c.position.unwrap_or(0),
+                    bytes: Bytes::copy_from_slice(body),
+                    replayed,
+                })
             }
         }
-        Tick::Ok
-    }
-}
-
-fn reader_loop(inner: Arc<Inner>, mut rd: FramedConn) {
-    let mut last_tick = Instant::now();
-    // Owned by this thread alone, so `dead_after` costs no lock.
-    let mut last_recv = last_tick;
-    loop {
-        if inner.is_closed() {
-            return;
-        }
-        // `dead_after` is the mid-frame bound as well as the silence bound:
-        // a peer that vanishes half way through a frame must reach the same
-        // verdict, on the same clock, as one that vanishes between frames.
-        let frame = rd.read_frame_buffered(inner.cfg.dead_after);
-        // One clock read per iteration serves the tick, the liveness check and
-        // the receive stamp.
-        let now = Instant::now();
-        match frame {
-            Ok(Some((h, payload))) => {
-                last_recv = now;
-                let mut act = inner.on_frame(h, payload);
-                // Drain every frame this coalesced read already delivered,
-                // processing the whole burst before touching the admission
-                // condvar. `on_frame`'s credit/resolve updates all land under
-                // the state lock as they are processed; only the wake is
-                // deferred to the end of the batch.
-                while matches!(act, Act::Continue) {
-                    match rd.next_buffered() {
-                        Ok(Some((h2, payload2))) => act = inner.on_frame(h2, payload2),
-                        Ok(None) => break,
-                        // A malformed frame in the buffered bytes is the same
-                        // verdict a bad socket read would earn: reconnect.
-                        Err(_) => {
-                            act = Act::Reconnect(None);
-                            break;
-                        }
-                    }
-                }
-                // ONE admission wake for the whole read-batch. `notify_all`, not
-                // `notify_one`: a batch can free several credit slots at once
-                // with several submitters blocked in `enqueue`, and `notify_one`
-                // would leave the rest stalled until the next frame.
-                inner.cv.notify_all();
-                match act {
-                    Act::Continue => {}
-                    Act::Stop => return,
-                    Act::Reconnect(preferred) => {
-                        if !inner.reconnect(preferred, &mut rd) {
-                            return;
-                        }
-                        last_recv = Instant::now();
-                        last_tick = last_recv;
-                        continue;
-                    }
-                }
-            }
-            // Read timeout at a frame boundary: nothing to do here, the tick
-            // below does the periodic work.
-            Ok(None) => {}
-            Err(_) => {
-                if !inner.reconnect(None, &mut rd) {
-                    return;
-                }
-                last_recv = Instant::now();
-                last_tick = last_recv;
-                continue;
-            }
-        }
-        if now.duration_since(last_tick) >= SWEEP_INTERVAL {
-            last_tick = now;
-            let dead = now.duration_since(last_recv) >= inner.cfg.dead_after;
-            if let Tick::Reconnect = inner.tick(now, dead) {
-                if !inner.reconnect(None, &mut rd) {
-                    return;
-                }
-                last_recv = Instant::now();
-                last_tick = last_recv;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------- handshake
-
-struct HelloInfo {
-    credits: u32,
-    leader: Option<(u32, String)>,
-}
-
-enum Dialed {
-    Ok(FramedConn, HelloInfo),
-    Redirect(String),
-    Refused { reason: u8, detail: String },
-    Failed,
-}
-
-/// Try `preferred` (if any) and then every member in round-robin order from
-/// `start_idx`, following `REDIRECT`s at the handshake — and hopping to the
-/// leader a `HELLO_OK` names before adopting the connection that named it.
-fn dial(
-    cfg: &RemoteConfig,
-    client_id: u64,
-    preferred: Option<&str>,
-    start_idx: usize,
-    stats: &Stats,
-    between: Option<&Inner>,
-) -> Result<(FramedConn, HelloInfo, usize, String), RemoteError> {
-    let n = cfg.members.len();
-    if n == 0 {
-        return Err(RemoteError::NoMembersReachable);
-    }
-    let mut order: Vec<String> = Vec::with_capacity(n + 1);
-    if let Some(p) = preferred {
-        order.push(p.to_string());
-    }
-    for k in 0..n {
-        order.push(cfg.members[(start_idx + k) % n].clone());
-    }
-    let mut hops = 0usize;
-    let mut i = 0usize;
-    // Every address actually dialed in this scan. It is what stops the
-    // leader-hop below from ping-ponging between two edges that name each
-    // other, without the `order`-membership test the REDIRECT path uses (every
-    // member is already in `order`, so that test would never let a hop happen).
-    let mut visited: Vec<String> = Vec::with_capacity(n + 1);
-    // A connection to an edge that named a leader elsewhere, held open while
-    // that leader is tried. If the hop fails — the named leader is the one
-    // that just died, which is exactly the case a failover puts us in — this
-    // is still a working connection to a live member, and adopting it beats
-    // returning `NoMembersReachable` and sitting disconnected through an
-    // election (the edge will redirect, which is slower but never stuck).
-    let mut fallback: Option<(FramedConn, HelloInfo, usize, String)> = None;
-    while i < order.len() {
-        // BETWEEN EVERY ATTEMPT AND EVERY REDIRECT HOP (each is one iteration
-        // of this loop): fail whatever ran out of budget, and abandon the scan
-        // if the client was shut down. Without this, `request_timeout` and
-        // `shutdown` are both quantised to a whole pass —
-        // `(members + 1 + MAX_REDIRECT_HOPS)` attempts, each up to
-        // `connect_timeout`. Nothing here is held across the connect itself:
-        // `sweep`/`is_closed` take the state lock and give it back.
-        if let Some(inner) = between {
-            inner.sweep();
-            if inner.is_closed() {
-                if let Some((conn, ..)) = fallback {
-                    conn.shutdown();
-                }
-                return Err(RemoteError::Closed);
-            }
-        }
-        let addr = order[i].clone();
-        visited.push(addr.clone());
-        match dial_one(cfg, client_id, &addr) {
-            Dialed::Ok(conn, info) => {
-                let idx = cfg.members.iter().position(|m| *m == addr).unwrap_or(start_idx % n);
-                // `HELLO_OK` named a leader that is not this edge. Hop to it
-                // BEFORE committing to this connection.
-                //
-                // This is a throughput property, not a correctness one — the
-                // edge would answer every write with a `REDIRECT` anyway — but
-                // the cost is not small: the pipelined window is flushed the
-                // moment a connection is adopted, so adopting a member that
-                // cannot serve costs one redirect frame PER PENDING REQUEST,
-                // and then a reconnect. Hopping here costs one extra
-                // handshake. Measured on the gateway failover capstone, a
-                // client that dials a follower now reaches the leader with
-                // zero redirects and zero re-sends, where before it paid one
-                // redirect, one reconnect and a full re-send of its window.
-                //
-                // `leader` is `None` when the edge named nobody, and carries
-                // the dialed address itself when `HELLO_OK` advertised no
-                // address or its own (`addr_or`), so `!= addr` is exactly "a
-                // usable address elsewhere".
-                if let Some((_, leader_addr)) = info.leader.as_ref()
-                    && *leader_addr != addr
-                    && hops < MAX_REDIRECT_HOPS
-                    && !visited.contains(leader_addr)
-                {
-                    hops += 1;
-                    order.insert(i + 1, leader_addr.clone());
-                    // Nothing has been written on it, so keeping it costs
-                    // nothing and no request can be left in doubt either way.
-                    match fallback {
-                        None => fallback = Some((conn, info, idx, addr)),
-                        Some(_) => conn.shutdown(),
-                    }
-                    i += 1;
-                    continue;
-                }
-                return Ok((conn, info, idx, addr));
-            }
-            Dialed::Redirect(to) => {
-                if hops < MAX_REDIRECT_HOPS && !order.contains(&to) {
-                    hops += 1;
-                    order.insert(i + 1, to);
-                }
-                i += 1;
-            }
-            // `FAULTED` and `BUSY` are the EDGE's problem, not the client's:
-            // that gateway has taken itself out of service (its node's shmem
-            // instance restarted under it, and a supervisor has to restart it),
-            // or it is already serving `max_connections`. Every other member
-            // may be perfectly healthy, so this costs one member and the scan
-            // goes on — only a full pass of failures is `NoMembersReachable`.
-            Dialed::Refused { reason: HELLO_REFUSED_FAULTED | HELLO_REFUSED_BUSY, .. } => {
-                stats.refused_members.fetch_add(1, Ordering::Relaxed);
-                i += 1;
-            }
-            // `APP_ID` / `VERSION` are about US. No member would answer
-            // differently, so trying the rest would only turn one clear error
-            // into `NoMembersReachable` — the least useful thing to tell an
-            // operator who has mistyped a cluster name.
-            Dialed::Refused { reason, detail } => {
-                return Err(RemoteError::HelloRefused { reason, detail })
-            }
-            Dialed::Failed => i += 1,
-        }
-    }
-    // Nothing better turned up: take the edge that redirects over no edge.
-    if let Some(f) = fallback {
-        return Ok(f);
-    }
-    Err(RemoteError::NoMembersReachable)
-}
-
-/// One attempt: TCP connect, `HELLO`, and whatever the edge answers.
-///
-/// Both halves are bounded by [`RemoteConfig::connect_timeout`] — the connect
-/// by `connect_timeout` itself, the handshake by the read/write timeouts and
-/// the deadline below — deliberately as two separate budgets rather than one
-/// combined one. See the note on [`RemoteConfig::request_timeout`]: a single
-/// budget would starve the handshake on a link whose connect is slow but
-/// healthy, and the cost of two is a bounded `2 x connect_timeout` worst case
-/// for one attempt — the term that appears in the invariant documented on
-/// [`RemoteConfig::request_timeout`].
-fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
-    let Some(sa) = addr.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-        return Dialed::Failed;
+        RemoteOutcome::Unknown => Err(RemoteError::Unknown),
+        RemoteOutcome::PayloadTooLarge => Err(RemoteError::PayloadTooLarge),
+        RemoteOutcome::TimedOut => Err(RemoteError::TimedOut),
+        RemoteOutcome::Closed => Err(RemoteError::Closed),
     };
-    let Ok(sock) = TcpStream::connect_timeout(&sa, cfg.connect_timeout) else {
-        return Dialed::Failed;
-    };
-    let Ok(mut conn) = FramedConn::new(sock) else { return Dialed::Failed };
-    if conn.set_read_timeout(Some(cfg.connect_timeout)).is_err()
-        || conn.set_write_timeout(Some(cfg.connect_timeout)).is_err()
-    {
-        return Dialed::Failed;
-    }
-    let mut out = Vec::new();
-    Hello { app_id: &cfg.app_id }.encode(&mut out);
-    let hello = Header {
-        ty: FrameType::Hello,
-        flags: 0,
-        version: PROTOCOL_VERSION,
-        client_id,
-        seq: 0,
-    };
-    if conn.write_frame(hello, &out).is_err() {
-        return Dialed::Failed;
-    }
-    let deadline = Instant::now() + cfg.connect_timeout;
-    loop {
-        // The REMAINING budget, not the constant: `read_frame` grants a fresh
-        // `max_stall` once a partial frame has started, so a peer dribbling
-        // bytes could otherwise stretch the handshake to ~2 x connect_timeout
-        // and one attempt to ~3 x — contradicting the bound documented on
-        // `RemoteConfig::request_timeout`.
-        match conn.read_frame(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Some((h, payload))) => {
-                return match h.ty {
-                    FrameType::HelloOk => match HelloOk::decode(&payload) {
-                        Ok(ok) => {
-                            let leader = ok
-                                .leader
-                                .map(|id| (id, addr_or(ok.leader_addr, addr)));
-                            Dialed::Ok(conn, HelloInfo { credits: ok.credits, leader })
-                        }
-                        Err(_) => Dialed::Failed,
-                    },
-                    FrameType::HelloRefused => match HelloRefused::decode(&payload) {
-                        Ok(r) => Dialed::Refused { reason: r.reason, detail: r.detail.to_string() },
-                        Err(_) => Dialed::Failed,
-                    },
-                    FrameType::Redirect => match Leader::decode(&payload) {
-                        Ok(l) if !l.addr.is_empty() => Dialed::Redirect(l.addr.to_string()),
-                        _ => Dialed::Failed,
-                    },
-                    _ => Dialed::Failed,
-                };
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    return Dialed::Failed;
-                }
-            }
-            Err(_) => return Dialed::Failed,
+    core.set(r);
+}
+
+fn poller_loop(mut poll: RemotePollHalf, stop: Arc<AtomicBool>, wait: RemoteWaitHandle) {
+    while !stop.load(Ordering::Acquire) {
+        if poll.poll(resolve) == 0 {
+            wait.park(Duration::from_millis(1));
         }
     }
-}
-
-fn addr_or(advertised: &str, fallback: &str) -> String {
-    if advertised.is_empty() { fallback.to_string() } else { advertised.to_string() }
-}
-
-/// A random-enough `client_id`: the process-random `RandomState` seed, mixed
-/// with the wall clock and a per-process counter so two clients in one process
-/// never collide. (`rand` is deliberately not a dependency of this crate.)
-fn random_u64() -> u64 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut h = RandomState::new().build_hasher();
-    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-    h.write_u128(
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
-    );
-    let v = h.finish();
-    if v == 0 { 0x5DEE_CE66_D1CE_4B1D } else { v }
+    // Final drain: `shutdown` completes every outstanding request with
+    // `Closed`, and those completions are queued before the threads stop.
+    while poll.poll(resolve) > 0 {}
 }
