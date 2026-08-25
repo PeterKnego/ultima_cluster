@@ -5497,6 +5497,7 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 mod tests {
     use super::*;
     use uc2_log::region::Region;
+    use uc_protocol::ring::RingHeader;
     use uc_protocol::v2::ipc::MSG_V2_SUBMIT;
 
     /// Build a heap-backed cnc page for the bare-`Consensus` harness (no file,
@@ -8220,6 +8221,52 @@ mod tests {
     fn a_wedged_ingress_ring_fail_stops_the_consensus_agent() {
         let h = harness();
         h.cons.ring_error_fail_stop(&RingError::Wedged { position: 4096 }, "ingress");
+    }
+
+    /// Hand-write an UNSIZED claim into a ring file's header: advance
+    /// `claim_position` past the consumer with NO claim word behind it —
+    /// exactly the state a producer killed between its `claim_position` CAS
+    /// and its claim-word store leaves behind (spec §4.2). Same construction
+    /// as `uc_protocol::ring::mpsc`'s `an_unsized_hole_wedges_after_the_timeout`,
+    /// which can reach the header directly from inside that module; from here
+    /// the ring file is mapped and the header read off offset 0.
+    fn wedge_ring_file(path: &std::path::Path) {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let m = unsafe { memmap2::MmapMut::map_mut(&file) }.unwrap();
+        let region = Region::from_mmap(m);
+        // SAFETY: every ring file begins with a `RingHeader` at offset 0, and
+        // an mmap base is page-aligned (so the 64-byte alignment holds).
+        let header = unsafe { &*(region.ptr_at(0) as *const RingHeader) };
+        header.claim_position.store(24, Ordering::Release);
+    }
+
+    /// Review finding 1: the fail-stop must be exercised through the REAL
+    /// drain path, not just the helper — a regression restoring `Err(_) =>
+    /// break` in `drain_ingress_ring` would otherwise turn an unsized hole
+    /// back into a silent permanent stall.
+    #[test]
+    #[should_panic(expected = "IngressRingWedged ring=ingress")]
+    fn a_wedged_ingress_ring_fail_stops_through_the_real_drain() {
+        let mut h = harness();
+        wedge_ring_file(&h._dir.path().join("ingress.ring"));
+        h.cons.ingress_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+        // First drain arms the hole timer (the ring still reads `Ok(None)`);
+        // the second finds the timeout elapsed with an unknowable length and
+        // returns `RingError::Wedged` into the drain's error arm.
+        h.cons.drain_ingress_ring(false);
+        h.cons.drain_ingress_ring(false);
+    }
+
+    /// The same through the query drain — and pinned on `ring=query`, so a
+    /// copy-paste of the ingress arm's ring name would fail here.
+    #[test]
+    #[should_panic(expected = "IngressRingWedged ring=query")]
+    fn a_wedged_query_ring_fail_stops_through_the_real_drain() {
+        let mut h = harness();
+        wedge_ring_file(&h._dir.path().join("query.ring"));
+        h.cons.query_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+        h.cons.drain_query_ring();
+        h.cons.drain_query_ring();
     }
 
     /// Every other ring error stays what it was: a bounded, non-fatal end to
