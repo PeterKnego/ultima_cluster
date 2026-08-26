@@ -60,6 +60,9 @@ writer.
 | 3712 | `admission_bytes` | the node's configured admission window |
 | 3776 | `seal_failures` | crypto seal failures |
 | 3840 | `free_disk_bytes` | free bytes on the instance dir's filesystem; writer: the `uc2-node` daemon only, `0` = never published |
+| 3904 | `admin_auth` | M12b: HMAC-SHA256 auth line for the admin request slot (tag ‖ `expiry_ns` ‖ key-name hash); all-zero = no auth attached |
+| 3968 | `ingress_holes_skipped` | M13: dead-producer holes skipped on the client **ingress** MPSC ring; writer: the consensus agent, published on change only |
+| 3976 | `query_holes_skipped` | M13: same counter for the **query** ring — deliberately the second u64 of the 3968 line (same writer, on-change only), so the last line (4032) stays free |
 
 Counters are absolute byte positions in the replicated log, not indices.
 

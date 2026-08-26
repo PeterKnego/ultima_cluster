@@ -4,245 +4,111 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-`ultima_cluster` (UC) is an **Aeron-shaped, Rust-native State Machine Replication
-application server**. This is **UC v2**: milestones M1–M6 are complete and on
-`main` (log+archive, replication, static-leader commit pipeline, elections, the
-end-to-end SDK, and snapshots/learners/purge). The M5 throughput gate and M6
-fleet gate both passed on real AWS fleets.
+`ultima_cluster` (UC) is an **Aeron-shaped, Rust-native State Machine
+Replication application server**. This is **UC v2**; the v1 stack (an
+`openraft`-based design) is retired and its crates deleted — v2 owns
+consensus, elections, and transport directly. Do not reintroduce `openraft`,
+`quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client` crate names.
 
-**M7 (live single-server reconfiguration)** ships promote/demote/add/remove
-membership changes, one at a time, under load, via the `uc2ctl` admin CLI — no
-restarts, no joint consensus (branch `uc2/m7-reconfig`; design spec
-`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`). Green on the full
-local proof stack; the 5-host fleet run is a separate, user-approved step
-(`v2.1.0` tags only once it lands — see
-`docs/benchmarks/uc2-m7-gate-2026-07-13.md`). This bumps the wire protocol
-version once (`FRAME_TYPE_CONFIG=4`, admin datagram kinds 16/17).
+**Current version: `2.7.0` (M13). Milestones M1–M13 are all complete**, each
+closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
+pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
+the honest-failure protocol). The per-milestone history that used to live in
+this section is in `RELEASES.md` (user-facing), `docs/releases.md` (the
+engineering record), and the gate docs; this section keeps only the map and
+the standing facts that bind new work.
 
-**M8 (wire crypto) ships authenticated, encrypted node↔node UDP — opt-in, off
-by default** (branch `uc2/m8-wire-crypto`; design spec
-`docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md`; gate doc
-`docs/benchmarks/uc2-m8-gate-2026-07-29.md`). This **changes v2.0's stated
-security posture**: encryption/auth was an *explicit non-goal* ("trusted
-private network, same as stock Aeron"); it is now available and **flag-day
-opt-in** (a cluster runs all-encrypted or all-cleartext, no mixed mode). Noise
-`IK` handshake over an allowlist of X25519 static keys, AES-256-GCM over the
-datagram envelope with the 16-byte header authenticated as AAD, a rotating
-cluster group key for the fan-out plane, RFC-6479 anti-replay. Threat model:
-a network-path adversary (read/inject/replay/corrupt, no private key); **out
-of model**: a compromised host or a malicious cluster member (the group key is
-symmetric — any holder can forge fan-out traffic as any node, a documented
-residual). Bumped the wire protocol to **0.4.0** (`version::CURRENT`; the
-`cnc.dat` page layout and its `CNC_V2_VERSION` gate are unchanged — M8 touches
-the UDP datagram format, not the shmem page). The full local proof stack and
-all four correctness capstones pass with crypto ON (T15, anti-vacuity proven);
-the cross-host fleet A/B is a separate, user-approved step (`v2.2.0` tags only
-once it lands). Do not reintroduce `quinn`/QUIC for this — UC seals its own
-reliable-UDP transport directly.
+| milestone | release | what it shipped | gate doc (`docs/benchmarks/`) |
+|---|---|---|---|
+| M1–M6 | v2.0.0 | the v2 core: log+archive, replication, commit pipeline, elections, end-to-end SDK, snapshots/learners/purge | `uc2-m{4,5,6}-gate-*` |
+| M7 | v2.1.0 | live single-server reconfiguration (promote/demote/add/remove via `uc2ctl`, one at a time, under load) | `uc2-m7-gate-2026-07-13` |
+| M8 | v2.3.0 rollup | opt-in node↔node wire crypto (Noise IK + AES-256-GCM, flag-day) | `uc2-m8-gate-2026-07-29` |
+| wire 0.5.0 | v2.3.0 rollup | content-attested durable reports — a consensus safety fix (commit ranking becomes a CONTENT quorum) | `docs/notes/uc2-term-map-window-loss-explained.md` |
+| M9 | v2.3.0 | deployable node: `uc2-node` daemon, TOML config, named startup refusals, systemd | `uc2-m9-gate-2026-08-19` |
+| M10 | v2.4.0 | observable cluster: `/metrics` `/healthz` `/readyz`, alert rules, dashboard | `uc2-m10-gate-2026-08-20` |
+| M11 | v2.5.0 | survivable cluster: offline backup/verify/restore, quorum-loss recovery, ENOSPC fail-stop | `uc2-m11-gate-2026-08-20` |
+| M12a–d | v2.6.0 | adoptable cluster: gateway kit + remote client, admin authn/audit, packaging/publishing, security posture + fuzz tier | `uc2-m12-gate-2026-08-22` |
+| M13 | v2.7.0 | remote path at the cluster's speed: per-record MPSC ring (no publish convoy), Engine-shaped remote client, edge grant budget | `uc2-m13-gate-2026-08-24` |
 
-**Wire protocol 0.5.0 (content-attested durable reports)** — a consensus
-safety fix, not a milestone. `AppendPosition` carries an 8-byte body with the
-term the sender attributes to the byte below its reported position; the leader
-declines a report that disagrees with its own term map, which turns commit
-ranking from a POSITION quorum into a CONTENT quorum (Raft's `(index, term)`
-pair, sound by Log Matching). Header and `cnc.dat` layout unchanged; a 0.4.0
-peer's header-only report reads as unattested and is not counted, so a mixed
-cluster stalls commits rather than making unsound ones — **upgrade all nodes
-together**. Found by the 2026-08-16 nightly flake hunt; see
-`docs/superpowers/plans/2026-08-16-nightly-flake-hunt-brief.md` and
-`docs/notes/uc2-term-map-window-loss-explained.md`.
+(Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
+`v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1`, and the final `v2.6.0` and
+`v2.7.0` tags + the ordered crates.io publish are the maintainer's deliberate
+release step, `docs/how-to/cut-a-release.md` §6.)
 
-**M9 (deployable node) is complete and released (`v2.3.0`)**: the real
-`uc2-node` daemon (TOML config file, named startup refusals, SIGTERM
-drain-and-stop), the `counter-service` binary template, systemd units and
-`node.example.toml` under `packaging/`, and the restart-cost fleet gate
-(`docs/benchmarks/uc2-m9-gate-2026-08-19.md`). The production-readiness arc
-(M9–M12) is specced in
-`docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md`.
+Next up: **M14, multi-service** (one log → N FSM processes) — spec draft on
+the `worktree-uc2-multi-service` worktree, user review pending.
 
-**M10 (observable cluster) is complete and released (`v2.4.0`; fleet gate
-passed 2026-08-20 — scrape cost ~1.7% at a >=0.95 bar)**: an in-daemon `/metrics` + `/healthz` + `/readyz` endpoint
-over the cnc page (hand-rolled `std::net`, zero new dependencies — enabled by
-the `[metrics]` config section, off when absent), transition-triggered
-JSON-lines records (`[log]` section sets the level), a fail-fast daemon on
-agent death, and shipped alert rules + Grafana dashboard under `packaging/`
-with every rule proven to fire (`scripts/m10_alert_fire.sh`, needs
-`promtool`). Readiness keys on `can_serve`, never the leader flag — the
-elected-but-not-serving `0x01` state is not ready. The peer-slot band is
-leader-authoritative (followers export zeros). Gate doc:
-`docs/benchmarks/uc2-m10-gate-2026-08-20.md`; operator docs:
-`docs/how-to/monitor-a-cluster.md`.
+### Standing facts that bind new work
 
-**M11 (survivable cluster) is merged; ALL gate rows now PASS — the fleet
-flag-day row 2026-08-21 (4-host fleet, downtime 14.0 s / 14.7 s vs a 60 s
-bar, driver `bench-infra/scripts/m11_fleet_gate.py`) and true-ENOSPC against
-a real loopback fixture. Getting 3b green took a test fix (an explicit
-post-warm-up squeeze — the single serial CAS writer moves ~15 KB/s, so the
-old 8 MiB headroom needed ~550 s against a 60 s bound) and then TWO PRODUCT
-fixes it exposed: (1) the mmapped IPC files were sparse
-(`create_shared_backing_file` punched holes), so a full disk killed whichever
-process touched an unbacked page with SIGBUS instead of taking the fail-stop
-path — now `fallocate(ZERO_RANGE)` reserves blocks up front, which costs
-~78 MiB reserved per default instance dir and turns a full disk into a named
-startup refusal (same answer Aeron reaches via
-`aeron.term.buffer.sparse.file` + `aeron.perform.storage.checks`); (2)
-`ultima_journal`'s segment preallocator discarded the errno, so a full disk
-fail-stopped saying only "segment preallocation failed". Nightly
-32491691229 (all 9 jobs green, `survival` included) is the independent
-confirmation. RELEASED as `v2.5.0` 2026-08-21; upgrade consequence worth
-knowing: instance dirs now reserve ~78 MiB at boot and a node that cannot
-reserve it refuses to start**: offline
-`uc2ctl backup / verify-backup / restore` (ordered-copy artifact, verify
-asserts the purge-straddle coverage invariant, under-load-safe incl. purge
-races, refuses a live instance dir) with the backed-up-under-load →
-host-destroyed → restore → rejoin story proven as a CI crashtest;
-`uc2ctl force-single-member` for quorum loss (offline, never-persisting
-recovery wrapper, data-loss window stated, dropped peers rejoin as fresh
-ids); ENOSPC fail-stop asserted end-to-end plus a `free_disk_bytes` cnc
-field (reserved band 3840) and `Uc2DiskLow`; `scripts/uc2_flag_day.sh`
-(measured downtime, exit codes 0/1/3). The milestone's review loop also
-fixed two pre-existing journal-layer defects: a crash-torn-tail boot
-refusal (+ heal-residue wedge chain) and a masked roll-boundary
-acked-durability hole (fsync-on-seal) — see the gate doc
-`docs/benchmarks/uc2-m11-gate-2026-08-20.md`. Operator docs:
-`docs/how-to/back-up-a-cluster.md`, `recover-from-quorum-loss.md`,
-`upgrade-a-cluster.md`.
-
-**M12 ("adoptable cluster") is an umbrella of four sub-milestones — M12a
-gateway kit, M12b admin authn/audit, M12c packaging/publishing, M12d
-security posture — that tag together as `v2.6.0` once all four land** (spec
-`docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md`; gate doc
-`docs/benchmarks/uc2-m12-gate-2026-08-22.md`, filled in row by row as each
-sub-milestone lands, per the honest-failure protocol every prior milestone
-used). **M12a (gateway kit)** shipped the two-tier `RawStateMachine`/
-`StateMachine` contract, `Sessioned<S>` (exactly-once at the raw layer), and
-`uc2_gateway`/`uc2_remote` — a TCP edge (`Edge`) terminating a framed remote
-protocol on a node's host, relayed over the existing shmem `Engine`, plus a
-pipelined `RemoteClient`. None of it touches consensus, the wire protocol
-between nodes, or the cnc page.
-
-**M12b (admin authentication + audit) is merged on `uc2/m12b-admin-auth`
-(HEAD `cca681d`; gate doc row 4 PASS)**: HMAC-SHA256-signed admin requests
-(a new 64-byte cnc line, `CNC_OFF_ADMIN_AUTH = 3904`, within the existing
-reserved band — no wire-protocol bump), an append-only, `fsync`-per-record
-audit log (`<instance_dir>/audit.jsonl`, recorded before every admin
-answer), and two now-**explicit-choice** config sections: `[crypto].enabled`
-and `[admin]`. **Two new named startup refusals**: an absent `[crypto]`
-section (`ConfigError::CryptoChoiceRequired`) and an absent `[admin]`
-section (`ConfigError::AdminChoiceRequired`) — a `node.toml` from M9–M11
-refuses to start on `v2.6.0`+ until both are written (a per-host config
-edit, not a wire flag day; see `docs/how-to/upgrade-a-cluster.md`).
-`uc2ctl` gains `--admin-key/--admin-key-name/--admin-ttl-secs` on every
-mutating verb, plus `gen-admin-key PATH` (writes a fresh 0600, 32-byte key)
-and `audit --instance-dir D [--tail N] [--json]` (offline, reads
-`audit.jsonl` directly). Ruled deviation from the design sketch: **no
-`(seq, nonce)` replay ring** — the signed tag already covers `seq`, the
-consensus agent only ever acts on `seq > last_admin_seq`, and a restart
-resets that cursor but also re-randomizes `instance_id`, which the tag also
-covers, so a ring would never refuse anything those two checks do not
-already refuse (`expiry_ns` bounds the delay window instead). **The tag's
-`instance_id`/`app_id` binding is taken from the node's own boot-time state
-(`Consensus::admin_instance_id`/`admin_app_id`), never re-read from the cnc
-page** — the page is a writable file whose header is only magic-checked, so
-reading it per request would have let an actor with instance-dir write
-access (but no key) restore a captured `instance_id` after a restart and
-replay a captured request; regression test
-`uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`. **Residual,
-stated everywhere it matters** (`README.md`, `docs/reference/configuration.md`,
-`docs/how-to/change-cluster-membership.md`,
-`docs/how-to/encrypt-node-traffic.md`): a follower forwards an
-authenticated admin request to the leader as a `ConfigProposal` (wire kind
-16) over the node-to-node UDP socket, not the admin band — with
-`[crypto].enabled = false` that plane is only membership-address-filtered,
-not authenticated, so `[admin] auth = "hmac"` authenticates cluster-wide
-only paired with `[crypto].enabled = true`. See the spec's §5 "As built"
-amendment for the full reason-code table (20–24) and every other as-built
-correction.
-
-**M12c (packaging, publishing, hygiene) is merged on `uc2/m12c-packaging`
-(gate doc rows 5/6/7 + added rows 11–13)**: lockstep `2.6.0` across
-`[workspace.package]`, the tag, the tarballs, the image and **12 publishable
-crates** (`ultima-journal`, `uc_protocol`, `uc2_crypto`, `uc2_log`,
-`uc2_consensus`, `uc2_net`, `uc2_client`, `uc2_node`, `uc2_service`,
-`uc2_remote`, `uc2_gateway`, `uc2ctl`); `uc2_sim`, `uc-lincheck` and the
-example crates are `publish = false`. **MSRV `1.89`** (real floor:
-`std::fs::File::try_lock_exclusive`) with `rust-toolchain.toml` pinned to
-1.96.0 and an `msrv` CI job running clippy on the floor; `deny.toml` + two
-`cargo-deny` passes (one documented ignore: RUSTSEC-2025-0141, `bincode`
-unmaintained, no patched version exists); `publish-check` CI job
-(`check_publish_metadata.sh` + `cargo package` for all 12 in ONE invocation
-+ `cargo publish --dry-run` for the 4 dependency-free leaves only — a
-non-leaf dry run cannot resolve path deps that are not on crates.io yet).
-`.github/workflows/release.yml` builds native x86_64 + aarch64 tarballs,
-`SHA256SUMS`, a per-crate CycloneDX SBOM archive and a signed multi-arch
-`ghcr.io/peterknego/uc2` image, all cosign-keyless and all gated on
-`release-smoke` (the tarball's own `packaging/quickstart-local.sh` in a bare
-`ubuntu:24.04`, then the compose stack driven through a gateway by the new
-`counter-remote` example bin). **Docker/compose/ghcr/cosign-OIDC were never
-run locally — CI-only until the first `v2.6.0-rc.1` tag, which the user
-pushes as a deliberate step; aarch64 binaries are built but never executed
-in CI.** The publish itself is manual and ordered —
-`docs/how-to/cut-a-release.md` §6 has the sequence; the semver promise (what
-is API, what is not, why the wire protocol and cnc page are flag-day
-instead) is `docs/reference/semver-policy.md`. **`cargo fmt` is DEFERRED**
-per the spec's own condition: two long-lived worktrees are open
-(`fix/remaining-flakes`, `worktree-uc2-multi-service`) and a one-shot
-reformat measures ~2 731 hunks — re-run `cargo fmt --all` as a single
-mechanical commit and add `--check` to `ci.yml` once neither branch is
-outstanding. The `RELEASES.md`/`docs/releases.md` writeup covers all four
-sub-milestones and lands with the `v2.6.0` tag, not here.
-
-**M12d (security posture + the review-ready package) is merged on
-`uc2/m12d-security-posture` (gate doc row 9 PASS, row 8 BUILT with its first
-nightly run pending, row 10 external review still pending)**: a **fuzzing
-tier** — `fuzz/`, a `cargo-fuzz` crate deliberately **outside the workspace**
-(`exclude = ["fuzz"]` + its own empty `[workspace]`, because `libfuzzer-sys`
-needs nightly and the workspace pins stable at an MSRV floor of 1.89) with
-**14 targets** over every parser that sees bytes it did not write
-(`uc_protocol_datagram`, `uc_protocol_log_frame`, `uc_protocol_cnc`,
-`uc2_remote_frame`, `uc2_crypto_open`, `uc2_crypto_handshake`,
-`uc2_crypto_group_key`, `uc2_crypto_admin`, `ultima_journal_record`,
-`ultima_journal_stable_value`, `uc2_service_session`, `uc2_node_toml`,
-`uc2_gateway_toml`, `uc2_node_http`), a deterministic committed seed corpus
-(the generator's output, exactly — `cargo +nightly run --bin seed-corpus`),
-`scripts/fuzz_smoke.sh`, and `fuzz-groups` + `fuzz` + `miri` jobs in
-`nightly.yml`. **Three real product defects came out of it**: five
-`uc_protocol::v2::datagram` readers made total (never reachable through the
-receiver's guards — defence in depth), `Sessioned::apply` handing the inner SM
-a non-empty `out` (user-reachable apply-thread panic), and
-`Sessioned::install_snapshot` pre-allocating up to 1 GiB from an unvalidated
-length. **Plus one about the harness: a fuzz tier can be green and vacuous** —
-an `llvm-symbolizer` stall had four targets executing ~16 inputs per 60 s run
-while printing clean, so `fuzz_smoke.sh --min-runs N` asserts libFuzzer's
-execution count and CI passes `--min-runs 10000` against 600 s. **Miri runs
-over the pure decoders only** (62 tests, isolation ON, nothing excluded); the
-mmap'd IPC rings are out of reach (three reproduced blockers, ending at "Miri
-does not support file-backed memory mappings") and the `Vec`-backed ring
-fallback was deliberately NOT built. The **security package** is
-`docs/security/{threat-model,attack-surface,self-assessment}.md` + root
-`SECURITY.md` (supported = latest minor `2.6.x`, GitHub private vulnerability
-reporting, 7-day acknowledgement) + README **Security posture** and **Scope
-and limits** sections. Standing facts worth knowing: the command payload
-ceiling is **≤ 1344 B crypto off / ≤ 1312 B crypto on** (one datagram,
-`MTU_DEFAULT = 1408`, not configurable — `preflight` refuses above it), and
-`bincode::config::standard()` is `NoLimit`, so the typed tier's decode is
-bounded by the payload cap and serde's 1 MiB pre-allocation cap, not by the
-codec. No consensus, wire-protocol or cnc change.
-
-**The v1 stack (an `openraft`-based design) has been retired** and its crates
-deleted — v2 owns consensus, elections, and transport directly. Do not
-reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`
-crate names; those are gone.
+- **Wire protocol is 0.5.0** (`uc_protocol::version::CURRENT`); the node↔node
+  wire and the `cnc.dat` page layout are **flag days, never mixed-version** —
+  a 0.4.0 peer's durable report reads as unattested and is not counted, so a
+  mixed cluster stalls commits rather than making unsound ones; upgrade all
+  nodes together. The client↔gateway remote protocol is separate and stays
+  v1. What is API vs. what is flag-day: `docs/reference/semver-policy.md`.
+- **Wire crypto is opt-in and OFF by default**, all-encrypted or
+  all-cleartext per cluster (no mixed mode). Threat model: a network-path
+  adversary; out of model: a compromised host or a malicious member — the
+  fan-out group key is symmetric, so any holder can forge fan-out traffic as
+  any node (a documented residual). UC seals its own reliable-UDP transport;
+  no QUIC.
+- **`[crypto]` and `[admin]` are explicit config choices since 2.6.0** — a
+  `node.toml` without both refuses to start by name (a per-host edit, not a
+  wire flag day; see `docs/how-to/upgrade-a-cluster.md`). Admin requests are
+  HMAC-SHA256-signed, with an append-only, fsync-per-record audit log
+  (`<instance_dir>/audit.jsonl`). Residual: a follower forwards an
+  authenticated admin request to the leader over the node↔node UDP plane, so
+  `[admin] auth = "hmac"` authenticates cluster-wide only when paired with
+  `[crypto].enabled = true`.
+- **Command payload ceiling: ≤ 1344 B crypto-off / ≤ 1312 B crypto-on** (one
+  datagram, `MTU_DEFAULT = 1408`, not configurable — `preflight` refuses
+  above it). `bincode` is `NoLimit`; the typed tier's decode is bounded by
+  the payload cap and serde's 1 MiB pre-allocation cap, not by the codec.
+- **Purge is OFF by default** (`PurgePolicy::Disabled`). The
+  `/metrics`/`/healthz`/`/readyz` endpoint exists only when `[metrics]` is
+  configured; readiness keys on `can_serve`, never the leader flag; the
+  peer-slot metric band is leader-authoritative (followers export zeros).
+- **Instance dirs reserve ~78 MiB at boot** (the IPC backing files are
+  fallocated, not sparse, so a full disk is a named startup refusal instead
+  of a SIGBUS mid-run); a node that cannot reserve it refuses to start.
+- **M13 mechanics worth knowing**: the MPSC ingress ring commits per record
+  (ring magic `ULTRNG2` — a same-host restart re-initialises the ring; a
+  dead producer's hole is skipped and counted, cnc offsets 3968/3976);
+  `RemoteClient` is a thin blocking layer over `RemoteEngine`'s send/poll
+  halves; the gateway holds a global grant budget (the Engine window less
+  1/8 headroom, divided across live connections). The M12 "collapse past the
+  admission window" diagnosis was wrong — the cause was a ring publish
+  convoy; see `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md` before
+  trusting any pre-2.7.0 gateway sizing advice.
+- **12 publishable crates, versioned in lockstep** with the tag and the
+  image; `uc2_sim`, `uc-lincheck` and the example crates are
+  `publish = false`. Publishing is manual and ordered
+  (`docs/how-to/cut-a-release.md` §6); `deny.toml` + `cargo-deny` run in CI
+  (one documented ignore: RUSTSEC-2025-0141, `bincode` unmaintained, no
+  patched version exists). Docker/compose/ghcr/cosign are CI-only; aarch64
+  binaries are built but never executed in CI.
+- **Security posture**: `docs/security/{threat-model,attack-surface,self-assessment}.md`
+  + root `SECURITY.md` (supported = latest minor; GitHub private
+  vulnerability reporting). The whole proof surface is mapped in
+  `docs/VERIFICATION.md` — sim, lincheck/crashtest capstones, Elle, Lean
+  proofs + conformance, loom (log-buffer frame visibility + the MPSC ring's
+  per-record commit), 15 fuzz targets, Miri (pure decoders + `uc2_remote`'s
+  Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
+- **`cargo fmt` is DEFERRED** (a one-shot reformat measures ~2 731 hunks)
+  until the two long-lived worktrees (`fix/remaining-flakes`,
+  `worktree-uc2-multi-service`) land; then run `cargo fmt --all` as a single
+  mechanical commit and add `--check` to `ci.yml`.
 
 Canonical documents, in order:
 
 1. `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` — the
-   canonical v2 design spec. Read it end-to-end before substantial work.
-2. `docs/benchmarks/uc2-m{1..7}-gate-*.md` — the per-milestone gate docs (the
-   permanent record for v2; there is no `docs/tasks/` consolidation for v2 — the
-   `taskNN` docs under `docs/tasks/` are v1-era history). M7's design spec is
-   `docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md` (a second,
-   later spec than the M1-M6 one above).
+   canonical v2 design spec; read it end-to-end before substantial work.
+   Later milestones have their own specs beside it (M7 reconfig, M8 wire
+   crypto, M12 adoptable, M13 remote path — each amended with as-built
+   errata where execution diverged from the draft).
+2. `docs/benchmarks/uc2-m*-gate-*.md` — the per-milestone gate docs (the
+   permanent record for v2; the `taskNN` docs under `docs/tasks/` are v1-era
+   history).
 3. `docs/ops/uc2-runbook.md` — operational runbook (instance-dir layout, cnc
    decode, purge enablement, live reconfiguration ops).
 4. Storage primitives: `../ultima_db/docs/tasks/task26_journal.md`
@@ -283,6 +149,8 @@ scripts/elle_check.sh                            # elle consistency tier: 5 list
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 (cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
 cargo run -p uc2_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
+RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc  # MPSC ring loom model (log buffer: -p uc2_log --test loom_frame)
+python3 bench-infra/scripts/m13_hop_bench.py --selftest  # M13 gate row arithmetic, no fleet/ssh
 ```
 
 `fuzz/` is a `cargo-fuzz` crate **outside the workspace** (the root manifest
@@ -298,15 +166,19 @@ override `ELLE_DIR`/`ELLE_MUT_DIR` to `/tmp` (RAM tmpfs, no swap → OOM; see
 "Local box" below). Nightly CI runs the clean tier (`elle` job); the weekly
 `elle-weekly.yml` runs the mutation tier.
 
-Cross-host fleet gates run via `bench-infra/` (terraform + ansible provisioning,
-`bench-infra/scripts/m6_fleet_gate.py` as the orchestrator — pass `--m7` for
-the M7 scenarios, which drive `uc2ctl` for admin ops and run over a 5-host
-topology instead of M6's 4).
+Cross-host fleet gates run via `bench-infra/` (terraform + ansible
+provisioning); each milestone has its own driver under `bench-infra/scripts/`
+— `m6_fleet_gate.py` (`--m7` for the M7 scenarios) through
+`m9`/`m10`/`m11`/`m12_fleet_gate.py`, and `m13_hop_bench.py`, whose
+`--arms gate` adjudicated the M13 bars on the fleet and whose `--selftest`
+checks the row arithmetic locally.
 
 Workspace crates:
 
 - `uc_protocol` — wire spec; `core`-friendly data types (`version`, `magic`,
-  `error_codes`) plus the lock-free ring buffers (`ring`: SPSC/MPSC/Broadcast)
+  `error_codes`) plus the lock-free ring buffers (`ring`:
+  SPSC/MPSC/Broadcast — the MPSC ring commits per record since M13, so no
+  producer ever waits on another)
   and the v2 wire spec (`v2`): the `cnc.dat` 4 KiB page layout, the self-locating
   UDP datagram header, and per-message frame layouts. Multi-language gate.
 - `uc2_log` — the log buffer + archive. File-backed shared log buffer (readers
@@ -349,9 +221,14 @@ Workspace crates:
   credit-gated flow control, `REDIRECT`/`LEADER_CHANGED`/`RETRY`) and
   `RemoteClient`, the pipelined, redirect-following, re-sending Rust
   implementation of it — for clients that cannot attach to shmem directly.
+  **M13**: rebuilt as the `RemoteEngine` split halves
+  (`RemoteSendHalf`/`RemotePollHalf`, lock-free SPSC internals, count-based
+  admission); `RemoteClient` remains as a thin blocking layer on top.
 - `uc2_gateway` — **M12a**: `Edge`, a per-node TCP front door that terminates
   `uc2_remote` traffic and relays it over the local `uc2_client::Engine`;
   ships as the `uc2-gateway` binary + `gateway.toml` + a systemd unit.
+  **M13**: a global outstanding-grant budget — the sum of per-connection
+  credits never exceeds the node's admission window.
 - `uc-lincheck` — test/verification library: WGL linearizability `checker`, op
   `history` recorder, `model`, and the in-memory CAS-`register` SM
   (`Cmd`/`CmdResp`/`RegisterSm: uc2_service::StateMachine`). One source of truth
