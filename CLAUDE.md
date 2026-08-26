@@ -31,9 +31,9 @@ the standing facts that bind new work.
 | M13 | v2.7.0 | remote path at the cluster's speed: per-record MPSC ring (no publish convoy), Engine-shaped remote client, edge grant budget | `uc2-m13-gate-2026-08-24` |
 
 (Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
-`v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1`, and the final `v2.6.0` and
-`v2.7.0` tags + the ordered crates.io publish are the maintainer's deliberate
-release step, `docs/how-to/cut-a-release.md` §6.)
+`v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1` only and is superseded by
+`v2.7.0`, with no final `v2.6.0` tag. The ordered crates.io publish has
+never been run; `docs/how-to/cut-a-release.md` §6 is the procedure.)
 
 Next up: **M14, multi-service** (one log → N FSM processes) — spec draft on
 the `worktree-uc2-multi-service` worktree, user review pending.

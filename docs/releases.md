@@ -1,6 +1,6 @@
 # ultima_cluster releases
 
-## v2.7.0 — M13 remote path: performance and flow control
+## v2.7.0 — 2026-08-26 — M13 remote path: performance and flow control
 
 **Three defects, one milestone.** Located by
 `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`, a per-hop isolation bench
@@ -116,7 +116,7 @@ Closed by reference to M13 gate row b. Row 2 compared one TCP client to one
 shared-memory client at equal inflight, which the bench showed to be the
 wrong comparison; row b is the re-specification the bench recommended.
 
-## v2.6.0 — M12 adoptable cluster — *prepared, not yet tagged*
+## v2.6.0 — M12 adoptable cluster — *shipped as `v2.6.0-rc.1`; superseded by v2.7.0, no final tag*
 
 **Four sub-milestones, one tag.** M12a (gateway kit) merged at `185783e`,
 M12b (admin authn + audit) at `9897219`, M12c (packaging + publishing) at
