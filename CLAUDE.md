@@ -383,6 +383,41 @@ recurs; avoid it structurally:
 - Keep generated histories small (cap op targets), bound `elle-cli`'s JVM heap
   (`-Xmx`), and `rm -rf` scratch between runs to reclaim RAM.
 
+## Benchmarking discipline
+
+Perf **rate bars are fleet-only** (`bench-infra/`); a local run is **smoke**,
+never a gate — never move a bar because a dev-box run went red. The box is
+small and noisy: the same dip measured 7× spanned 0–18% against a 10% bar.
+
+The cargo target dir (`~/.cache/cargo-target`) is **shared by the main
+checkout and every worktree**, so another checkout's build can silently swap
+your binaries mid-measurement. For any measurement or proof stack run from a
+worktree, set a private `CARGO_TARGET_DIR=<path>` and verify binary
+provenance before trusting a number.
+
+## Finding a performance bottleneck
+
+UC's SMR is a chain of hops; throughput is bounded by the slowest. Don't
+micro-optimize blindly — **isolate each hop, measure it alone** (realistic
+stand-ins at the boundaries: dummy sink, dummy upstream, raw driver), and
+compare against the whole-chain number: the hop whose solo throughput ≈ the
+whole-chain throughput is the limiter, and optimizing any faster hop measures
+null end-to-end. Two refinements from M13:
+
+- A whole-system **collapse** can be an emergent pathology under a stress
+  dimension, not any hop's slow steady state — sweep the stress axes
+  (concurrency, inflight), and **reproduce the collapse in the smallest
+  isolated hop** before believing a causal story.
+- **Measurement refutes plausible-but-wrong stories.** M12 blamed the credit
+  budget because the collapse "appeared past the admission window"; the
+  isolation matrix (window large *and* small, sink with *no* window, load
+  inside the envelope) proved it was an ingress-ring publish convoy —
+  "consistent with the symptom" is not "the cause."
+
+Harness model: `uc2_gateway/examples/hop_bench`; worked example
+`docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`; the convoy mechanism
+`docs/notes/uc2-m13-mpsc-publish-convoy-explained.md`.
+
 ## Architecture overview
 
 UC is a State Machine Replication application server. Three process roles;
