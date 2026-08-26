@@ -28,7 +28,7 @@ where the two disagree, the dated record wins.
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol **and the MPSC ring's per-record commit protocol** |
 | **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fifteen decoders that see bytes the process did not write |
-| **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders (**not** the file-backed rings) |
+| **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc2_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 
 ### The headline result
@@ -437,7 +437,10 @@ because it happened: see the harness finding below.
 The same decoders are run under [Miri](https://github.com/rust-lang/miri) in
 nightly CI (`miri` job): `uc_protocol`'s `v2::` wire/cnc/ipc layer and `version`
 packing (43 tests), and `ultima_journal`'s segment and `stable_value` record
-decoders (19 tests). libFuzzer finds inputs that panic; Miri finds undefined
+decoders (19 tests), and `uc2_remote`'s `outgoing`/`completion`/`slots` SPSC
+structures (29 tests, added with the 2.7.0 client — Vec-backed, so Miri models
+them fully, and it caught a real Stacked-Borrows aliasing bug there during
+that client's development). libFuzzer finds inputs that panic; Miri finds undefined
 behaviour on inputs that do not. Every selected test passes with Miri's
 **isolation left on** — nothing needed excluding, and isolation is never
 disabled.
@@ -531,7 +534,7 @@ result are separate commits, in that order.
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones, `sim-heavy`, loom, crashtest, Elle clean tier, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders) |
+| `nightly.yml` | Full proof suite — lincheck capstones, `sim-heavy`, loom, crashtest, Elle clean tier, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc2_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---

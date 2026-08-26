@@ -7,7 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## v2.7.0 — the remote path at the cluster's speed (M13)
+## v2.7.0 — 2026-08-26 — the remote path at the cluster's speed (M13)
 
 The remote path — `client → TCP → gateway → shared memory → node` — now runs
 at the backend's own rate and **degrades instead of collapsing** when a host
@@ -77,7 +77,7 @@ is untouched. A gateway `[limits]` section with `per_conn_inflight` above the
 grant budget (`max_inflight` less an eighth) now refuses to start, by name. →
 [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
 
-## v2.6.0 — adoptable cluster (M12) — *prepared, not yet tagged*
+## v2.6.0 — adoptable cluster (M12) — *shipped as `v2.6.0-rc.1`; superseded by v2.7.0, no final tag*
 
 **Written before the tag, as every release here is.** The four M12
 sub-milestones — M12a gateway kit, M12b admin authentication and audit, M12c
