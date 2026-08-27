@@ -21,12 +21,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
-    self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP,
-    CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING,
-    CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_HEADER_CRC,
-    CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS, CNC_OFF_QUERY_HOLES_SKIPPED,
-    CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
-    CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
+    self, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ,
+    CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE,
+    CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES,
+    CNC_OFF_FSM_LAG_BYTES, CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS,
+    CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICES_DECLARED,
+    CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
+    CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
+    CNC_SVC_STATUS_INCARNATION_SHIFT, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -159,6 +161,53 @@ pub fn pack_id_and_role(peer_id: u32, role_bits: u8) -> u64 {
 #[inline]
 pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
     ((naks_served as u64) << 32) | replay_datagrams as u64
+}
+
+/// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
+/// `CNC_OFF_SERVICE_SLOTS` doc for the writer-per-line table. Same shape as
+/// [`PeerSlot`]: every field its own cache line, `#[repr(C)]`, stride pinned.
+#[repr(C)]
+pub struct ServiceSlot {
+    pub status: PaddedAtomicU64,
+    pub applied: PaddedAtomicU64,
+    pub epoch: PaddedAtomicU64,
+    pub output_completed: PaddedAtomicU64,
+    pub snapshot_pos: PaddedAtomicU64,
+    pub heartbeat_ns: PaddedAtomicU64,
+    pub lag_waits: PaddedAtomicU64,
+    pub reserved: PaddedAtomicU64,
+}
+
+const _: () = assert!(std::mem::size_of::<ServiceSlot>() == 512);
+const _: () = assert!(std::mem::size_of::<ServiceSlot>() == CNC_SERVICE_SLOT_STRIDE);
+const _: () = assert!(std::mem::offset_of!(ServiceSlot, status) == cnc::CNC_SVC_OFF_STATUS);
+const _: () = assert!(std::mem::offset_of!(ServiceSlot, applied) == cnc::CNC_SVC_OFF_APPLIED);
+const _: () = assert!(std::mem::offset_of!(ServiceSlot, epoch) == cnc::CNC_SVC_OFF_EPOCH);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceSlot, output_completed) == cnc::CNC_SVC_OFF_OUTPUT_COMPLETED
+);
+const _: () =
+    assert!(std::mem::offset_of!(ServiceSlot, snapshot_pos) == cnc::CNC_SVC_OFF_SNAPSHOT_POS);
+const _: () =
+    assert!(std::mem::offset_of!(ServiceSlot, heartbeat_ns) == cnc::CNC_SVC_OFF_HEARTBEAT_NS);
+const _: () = assert!(std::mem::offset_of!(ServiceSlot, lag_waits) == cnc::CNC_SVC_OFF_LAG_WAITS);
+const _: () = assert!(std::mem::offset_of!(ServiceSlot, reserved) == cnc::CNC_SVC_OFF_RESERVED);
+
+/// Pack a slot's `status` word: `service_id` (bits 0..8) | attached (bit 8)
+/// | `incarnation` (bits 32..64).
+pub fn pack_service_status(service_id: u8, attached: bool, incarnation: u32) -> u64 {
+    (service_id as u64)
+        | if attached { CNC_SVC_STATUS_ATTACHED } else { 0 }
+        | ((incarnation as u64) << CNC_SVC_STATUS_INCARNATION_SHIFT)
+}
+
+/// Inverse of [`pack_service_status`]: `(service_id, attached, incarnation)`.
+pub fn unpack_service_status(v: u64) -> (u8, bool, u32) {
+    (
+        (v & 0xFF) as u8,
+        v & CNC_SVC_STATUS_ATTACHED != 0,
+        (v >> CNC_SVC_STATUS_INCARNATION_SHIFT) as u32,
+    )
 }
 
 /// M7 admin request record (seqlock discipline).
@@ -408,7 +457,7 @@ impl CncPage {
         // SAFETY: region.len() == CNC_PAGE_LEN and base is 64-byte aligned
         // (both asserted in `new`); CNC_OFF_APPEND (256) is a 64-byte-aligned
         // offset and size_of::<LogCounters>() == 256 fits within the page
-        // from there (256 + 256 == 512 <= 4096). `LogCounters` is
+        // from there (256 + 256 == 512 <= 4096 (page 1)). `LogCounters` is
         // `#[repr(C)]` over `PaddedAtomicU64` fields, so the cast is
         // layout-pinned (cross-checked against `uc_protocol` in this
         // module's tests). The reference borrows `self`.
@@ -417,19 +466,19 @@ impl CncPage {
 
     /// `ServiceProgress` cast at `CNC_OFF_SERVICE_APPLIED`.
     pub fn service(&self) -> &ServiceProgress {
-        // SAFETY: as `counters()` — offset 512, size 192, 512+192=704<=4096.
+        // SAFETY: as `counters()` — offset 512, size 192, 512+192=704<=4096 (page 1).
         unsafe { &*(self.region.ptr_at(CNC_OFF_SERVICE_APPLIED) as *const ServiceProgress) }
     }
 
     /// `NodeStatusV2` cast at `CNC_OFF_TERM`.
     pub fn status(&self) -> &NodeStatusV2 {
-        // SAFETY: as `counters()` — offset 704, size 448, 704+448=1152<=4096.
+        // SAFETY: as `counters()` — offset 704, size 448, 704+448=1152<=4096 (page 1).
         unsafe { &*(self.region.ptr_at(CNC_OFF_TERM) as *const NodeStatusV2) }
     }
 
     /// `SnapshotSlots` cast at `CNC_OFF_SERVICE_SNAPSHOT_POS` (M6 Task 3).
     pub fn snapshots(&self) -> &SnapshotSlots {
-        // SAFETY: as `counters()` — offset 1152, size 192, 1152+192=1344<=4096.
+        // SAFETY: as `counters()` — offset 1152, size 192, 1152+192=1344<=4096 (page 1).
         unsafe { &*(self.region.ptr_at(CNC_OFF_SERVICE_SNAPSHOT_POS) as *const SnapshotSlots) }
     }
 
@@ -437,7 +486,7 @@ impl CncPage {
     /// consensus agent (M6 Task 9). Compare against `snapshots().node_snapshot_floor`
     /// for the "purge caught up to snapshot" health check.
     pub fn archive_first_base(&self) -> &PaddedAtomicU64 {
-        // SAFETY: offset 1344, size 64, 1344+64=1408<=4096.
+        // SAFETY: offset 1344, size 64, 1344+64=1408<=4096 (page 1).
         unsafe { &*(self.region.ptr_at(CNC_OFF_ARCHIVE_FIRST_BASE) as *const PaddedAtomicU64) }
     }
 
@@ -446,9 +495,53 @@ impl CncPage {
     pub fn peer_slot(&self, i: usize) -> &PeerSlot {
         assert!(i < CNC_MAX_PEER_SLOTS, "peer slot index {i} out of range");
         let off = CNC_OFF_PEER_SLOTS + i * CNC_PEER_SLOT_STRIDE;
-        // SAFETY: last slot ends at 1408 + 8*256 = 3456 <= 4096 (const-asserted
+        // SAFETY: last slot ends at 1408 + 8*256 = 3456 <= 4096 (page 1) (const-asserted
         // in `uc_protocol`); each is a `PeerSlot` (256 B, 4 padded atomics).
         unsafe { &*(self.region.ptr_at(off) as *const PeerSlot) }
+    }
+
+    /// M14a: the per-service slot for id `i` on page 2 (panics on `i >= 8`,
+    /// like `peer_slot`). Every attaching party reads all declared slots; a
+    /// service writes ONLY its own.
+    pub fn service_slot(&self, i: usize) -> &ServiceSlot {
+        assert!(i < CNC_MAX_SERVICES, "service slot index {i} out of range");
+        let off = CNC_OFF_SERVICE_SLOTS + i * CNC_SERVICE_SLOT_STRIDE;
+        // SAFETY: as `peer_slot` — off is 64-aligned (4096 + i*512), the slot
+        // is 512 bytes, and 4096 + 8*512 = 8192 = CNC_PAGE_LEN.
+        unsafe { &*(self.region.ptr_at(off) as *const ServiceSlot) }
+    }
+
+    /// M14a: bit `i` set ⇔ service id `i` is declared. Boot-once, node-written.
+    /// A bare `AtomicU64` (not `PaddedAtomicU64`) because it shares its line
+    /// with `fsm_lag_bytes` — see the 3968/3976 pair's doc on why.
+    pub fn services_declared(&self) -> u64 {
+        // SAFETY: 4032 is 8-aligned and 4032 + 8 <= CNC_PAGE_LEN.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_SERVICES_DECLARED) as *const AtomicU64))
+                .load(Ordering::Acquire)
+        }
+    }
+    pub fn store_services_declared(&self, v: u64) {
+        // SAFETY: as `services_declared`.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_SERVICES_DECLARED) as *const AtomicU64))
+                .store(v, Ordering::Release)
+        }
+    }
+    /// M14a: the lag bound in bytes, `0` ⇔ lockstep. Boot-once, node-written.
+    pub fn fsm_lag_bytes(&self) -> u64 {
+        // SAFETY: 4040 is 8-aligned and 4040 + 8 <= CNC_PAGE_LEN.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_FSM_LAG_BYTES) as *const AtomicU64))
+                .load(Ordering::Acquire)
+        }
+    }
+    pub fn store_fsm_lag_bytes(&self, v: u64) {
+        // SAFETY: as `fsm_lag_bytes`.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_FSM_LAG_BYTES) as *const AtomicU64))
+                .store(v, Ordering::Release)
+        }
     }
 
     /// M7: config version (adopted cluster-config).
@@ -893,6 +986,30 @@ mod tests {
         assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 8);
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
         const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
+        // M14a: the boot-once pair and page 2.
+        assert_eq!(cnc::CNC_OFF_SERVICES_DECLARED, 4032);
+        assert_eq!(cnc::CNC_OFF_FSM_LAG_BYTES, 4040);
+        assert_eq!(std::mem::size_of::<ServiceSlot>(), 512);
+        assert_eq!(std::mem::size_of::<ServiceSlot>(), cnc::CNC_SERVICE_SLOT_STRIDE);
+        for i in 0..cnc::CNC_MAX_SERVICES {
+            let slot = page.service_slot(i);
+            let expect = cnc::CNC_OFF_SERVICE_SLOTS + i * cnc::CNC_SERVICE_SLOT_STRIDE;
+            assert_eq!(slot as *const _ as usize - base, expect, "service slot {i}");
+        }
+        let s0 = page.service_slot(0);
+        let s0_base = s0 as *const _ as usize;
+        assert_eq!(&s0.status as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_STATUS);
+        assert_eq!(&s0.applied as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_APPLIED);
+        assert_eq!(&s0.epoch as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_EPOCH);
+        assert_eq!(
+            &s0.output_completed as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_OUTPUT_COMPLETED
+        );
+        assert_eq!(&s0.snapshot_pos as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_SNAPSHOT_POS);
+        assert_eq!(&s0.heartbeat_ns as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_HEARTBEAT_NS);
+        assert_eq!(&s0.lag_waits as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_LAG_WAITS);
+        assert_eq!(&s0.reserved as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_RESERVED);
+        assert_eq!(page.page().len(), 8192);
     }
 
     #[test]
@@ -987,6 +1104,15 @@ mod tests {
         std::fs::write(&p, vec![0u8; CNC_PAGE_LEN + 1]).unwrap();
         let r = CncPage::open_file(&p, "test-app").map(|_| ());
         assert!(matches!(r, Err(CncError::BadHeader)), "{r:?}");
+        // A 4 KiB (cnc 2.0) file is refused by length before the version is
+        // even read: the flag day between cnc 2.0 and 3.0 is a length gate,
+        // not a version-field decode.
+        std::fs::write(&p, vec![0u8; 4096]).unwrap();
+        let r = CncPage::open_file(&p, "test-app").map(|_| ());
+        assert!(
+            matches!(r, Err(CncError::BadHeader)),
+            "a 4 KiB (cnc 2.0) file is refused by length before the version is even read: {r:?}"
+        );
     }
 
     #[test]
@@ -1201,6 +1327,65 @@ mod tests {
             7,
             "offset pin: the value must live at 3976 exactly"
         );
+    }
+
+    #[test]
+    fn services_declared_and_fsm_lag_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.services_declared(), 0, "fresh page: nothing declared");
+        assert_eq!(page.fsm_lag_bytes(), 0);
+        page.store_services_declared(0b101);
+        page.store_fsm_lag_bytes(16 << 20);
+        assert_eq!(page.services_declared(), 0b101);
+        assert_eq!(page.fsm_lag_bytes(), 16 << 20);
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[4032..4040].try_into().unwrap()),
+            0b101,
+            "offset pin: services_declared lives at 4032"
+        );
+        assert_eq!(
+            u64::from_le_bytes(raw[4040..4048].try_into().unwrap()),
+            16 << 20,
+            "offset pin: fsm_lag_bytes lives at 4040"
+        );
+        assert_eq!(page.query_holes_skipped(), 0, "the 3968 line is untouched");
+    }
+
+    #[test]
+    fn service_slots_init_zero_and_are_independent() {
+        let page = CncPage::heap(&test_meta());
+        for i in 0..cnc::CNC_MAX_SERVICES {
+            let s = page.service_slot(i);
+            assert_eq!(s.status.load_acquire(), 0, "slot {i} dormant");
+            assert_eq!(s.applied.load_acquire(), 0);
+            assert_eq!(s.epoch.load_acquire(), 0);
+        }
+        let s3 = page.service_slot(3);
+        s3.status.store_release(pack_service_status(3, true, 1));
+        s3.applied.store_release(4096);
+        assert_eq!(s3.epoch.fetch_add(1) + 1, 1);
+        assert_eq!(unpack_service_status(s3.status.load_acquire()), (3, true, 1));
+        assert_eq!(page.service_slot(2).applied.load_acquire(), 0, "neighbour below untouched");
+        assert_eq!(page.service_slot(4).applied.load_acquire(), 0, "neighbour above untouched");
+        // Byte pin: slot 3's `applied` line is at 4096 + 3*512 + 64.
+        let raw = page.page();
+        let off = 4096 + 3 * 512 + 64;
+        assert_eq!(u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()), 4096);
+    }
+
+    #[test]
+    #[should_panic(expected = "service slot index 8 out of range")]
+    fn service_slot_index_is_bounds_checked() {
+        let page = CncPage::heap(&test_meta());
+        let _ = page.service_slot(8);
+    }
+
+    #[test]
+    fn service_status_pack_roundtrips_every_field() {
+        assert_eq!(unpack_service_status(pack_service_status(0, false, 0)), (0, false, 0));
+        assert_eq!(unpack_service_status(pack_service_status(7, true, u32::MAX)), (7, true, u32::MAX));
+        assert_eq!(pack_service_status(5, true, 2), 5 | (1 << 8) | (2u64 << 32));
     }
 
     #[test]
