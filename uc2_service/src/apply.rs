@@ -315,11 +315,24 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         let (target, one_frame) =
             match crate::lag::plan(st.lag_mode, floor, st.follower.cursor, commit, durable) {
                 crate::lag::Plan::Wait => {
-                    if !st.lag_waiting {
-                        st.lag_waiting = true;
-                        crate::attach::slot(&st.cnc, st.service_id).lag_waits.fetch_add(1);
+                    // Lockstep waits out of line (see `lockstep_wait`); a
+                    // bounded wait is `fsm_lag` bytes ahead of the slowest FSM
+                    // and goes straight to the agent's sleep.
+                    let opened = if matches!(st.lag_mode, crate::lag::LagMode::Lockstep) {
+                        lockstep_wait(st, commit, durable)
+                    } else {
+                        None
+                    };
+                    match opened {
+                        Some(plan) => plan,
+                        None => {
+                            if !st.lag_waiting {
+                                st.lag_waiting = true;
+                                crate::attach::slot(&st.cnc, st.service_id).lag_waits.fetch_add(1);
+                            }
+                            break;
+                        }
                     }
-                    break;
                 }
                 crate::lag::Plan::Apply { target, one_frame } => (target, one_frame),
             };
@@ -507,6 +520,15 @@ fn maybe_build_snapshot<S: RawStateMachine>(st: &mut ApplyState<S>) {
 /// batch cap, so a burst of queries can never starve the apply loop.
 const QUERY_DRAIN_PER_CYCLE: usize = 64;
 
+/// Lockstep wait ladder (`lockstep_wait`): spins re-planning, then yields.
+/// Measured in `uc2_node/examples/apply_bench`
+/// (docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md).
+const LAG_WAIT_SPINS: u32 = 256;
+const LAG_WAIT_YIELDS: u32 = 2048;
+/// While yielding, refresh the heartbeat this often so a long ladder is
+/// never mistaken for a dead FSM.
+const LAG_WAIT_HEARTBEAT_EVERY: u32 = 256;
+
 /// Drain `svc_query.ring` (bounded): read each request's `expected_epoch` prefix,
 /// REFUSE any stamped for a superseded incarnation with `MSG_V2_RETRY`, and
 /// answer the rest by querying the SM and publishing `MSG_V2_RESPONSE`
@@ -596,6 +618,40 @@ fn unix_ns() -> u64 {
 /// writer), and the crashtest harness / a real process supervisor, which already
 /// respawns the service on node restart, takes the process the rest of the way
 /// down. A matching id (or a torn `None` read) resets the streak.
+/// The lockstep barrier wait. Under lockstep the sibling is at most one frame
+/// away, so the barrier opens within a frame's apply time plus a cache-line
+/// round trip: spin re-planning for that, then yield. The yield budget is
+/// generous on purpose — a lockstep FSM must never SLEEP on a live sibling:
+/// one FSM in the agent's 50 µs sleep stalls every other FSM's next frame,
+/// their ladders exhaust too, and the whole set falls into sleeping in
+/// lockstep (measured ~18 k frames/s; the yield-only experiment ran 33×
+/// faster). The heartbeat is refreshed while yielding. `None` after the
+/// budget means a genuinely stalled or dead sibling: the caller counts the
+/// episode and hands the cycle back to the agent.
+///
+/// Out of line: inlining the ladder into `apply_cycle`'s loop cost 9 % at
+/// N=1 on a path N=1 never executes (codegen of the hot body).
+#[inline(never)]
+fn lockstep_wait<S: RawStateMachine>(st: &mut ApplyState<S>, commit: u64, durable: u64) -> Option<(u64, bool)> {
+    for i in 0..(LAG_WAIT_SPINS + LAG_WAIT_YIELDS) {
+        if i < LAG_WAIT_SPINS {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+            if (i - LAG_WAIT_SPINS).is_multiple_of(LAG_WAIT_HEARTBEAT_EVERY) {
+                crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
+            }
+        }
+        let floor = crate::lag::floor(&st.cnc, st.declared);
+        if let crate::lag::Plan::Apply { target, one_frame } =
+            crate::lag::plan(st.lag_mode, floor, st.follower.cursor, commit, durable)
+        {
+            return Some((target, one_frame));
+        }
+    }
+    None
+}
+
 pub(crate) fn check_node_instance(cnc: &CncPage, attached: u128, streak: &mut u8) {
     match cnc.try_instance_id() {
         Some(id) if id != attached => {

@@ -80,14 +80,36 @@ Payload 64 B, frame 96 B, 6 s after a 1 s warm-up, one run each unless noted.
    store) plus `sched_yield`; a spin-before-yield ladder or a futex on the
    sibling's slot would recover more, a busy-spin most of it.
 
+## The fix, measured (same day)
+
+Three shapes of a wait ladder were tried in `apply_cycle`'s `Wait` arm, each
+re-measured with this harness (5–6 s runs; bounded N=1 unpatched control:
+21.85 M / 21.85 M):
+
+| shape | lockstep N=2 / 4 / 8 | bounded N=1 | bounded N=8 | verdict |
+|---|---|---|---|---|
+| v1: 128 spins + 8 yields, inline in the loop, every mode | 569 k / 235 k / 31.6 k (23–55 k sleeps per FSM at N ≥ 4) | 21.5 M | **20.4 M (−6 %)**, 12× the waits | lockstep N ≥ 4 cascades into sleeps; spinning on the slowest FSM's `applied` line in bounded mode slows it |
+| v2: lockstep-only, 256 spins + 32 yields, inline | 552 k / 324 k / 374 k | **19.8 M / 19.7 M (−9 %)** | 18.4 M | bounded never executes the arm — the loss is **codegen of the hot loop body** (A/B'd against the unpatched binary back to back, box idle) |
+| **v3 (shipped): lockstep-only, out of line (`#[inline(never)] lockstep_wait`), 256 spins + 2 048 yields with a heartbeat refresh every 256, bounded untouched** | **631 k / 583 k / 458 k, 0–1 sleeps** | 21.36 M / 21.59 M (−1.5 %) | 21.16 M (= unpatched 21.14 M) | the lockstep set never sleeps on a live sibling; the hot body is the original plus one call in a cold arm |
+
+Two lessons the ladder taught on the way: (a) a lockstep FSM must **never
+sleep on a live sibling** — one 50 µs sleep stalls every other FSM's next
+frame, their ladders exhaust, and the set falls into sleeping in lockstep, so
+the yield budget must exceed any plausible handshake, not merely the common
+one; (b) code in a hot loop's body costs even on paths that never run — the
+9 % at N=1 was a layout effect, found only because the control was re-run on
+the exact binary. Cost accepted for a *dead* sibling under lockstep: each
+survivor yields for ~0.5–2 ms per 50 µs sleep (≈ a core each) while the
+cluster is stalled by contract and the alert fires.
+
 ## What this changes
 
-- **M14c must treat lockstep's idle behaviour as a defect to fix, not a cost
-  to report.** Spec §13 planned to "measure lockstep on the fleet"; the fleet
-  would have measured the 50 µs sleep. The fix is in the wait path
-  (`apply_cycle`'s `Wait` arm / the apply agent's idle ladder), not in the
-  barrier's semantics. Until then lockstep is correct but unusable past
-  ~18 k frames/s per FSM.
+- **Lockstep's idle behaviour was a defect, fixed the same day** (`v3` above,
+  `uc2_service/src/apply.rs::lockstep_wait`): 18 k → 631 k frames/s at N=2.
+  Spec §13 planned to "measure lockstep on the fleet"; the fleet would have
+  measured the 50 µs sleep. The remaining ~1.6 µs/frame is the N-way
+  cross-core handshake lockstep inherently costs — the fleet row measures
+  that, now.
 - **The spec's §12 fleet row measures a *slow* FSM's convergence** (bounded
   mode pacing the cluster to the slow FSM's rate); this document shows the
   equal-speed overhead is ~zero at N ≤ 8. A fleet row for equal-speed N=2
