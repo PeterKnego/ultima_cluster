@@ -277,8 +277,8 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     push_gauge(
         &mut out,
         "uc2_service_epoch",
-        "Service incarnation counter, bumped each service attach.",
-        service.service_epoch.load_acquire(),
+        "FSM 0's incarnation counter, bumped each attach (per-FSM families: M14c).",
+        s.cnc.service_slot(0).epoch.load_acquire(),
     );
     push_gauge(
         &mut out,

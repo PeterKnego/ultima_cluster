@@ -5,6 +5,7 @@
 //! `node.toml`, `NodeConfig::services` programmatically). See the design spec
 //! §3.3 and §5.1–§5.2.
 
+use uc2_log::cnc::CncPage;
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 
 /// The FSM pacing policy (spec §1, "FSM pacing"). There is deliberately no
@@ -123,6 +124,38 @@ impl ServicesConfig {
     }
 }
 
+/// The page-1 aggregates the node publishes each cycle (spec §3.2): the
+/// slowest FSM's numbers. Every reader that used to read "the service" now
+/// reads "the slowest service" — the purge floor, the output marker, the
+/// readiness heartbeat, `uc2ctl status`, the unlabelled `/metrics` families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServiceMins {
+    pub applied: u64,
+    pub snapshot_pos: u64,
+    pub output_completed: u64,
+    pub heartbeat_ns: u64,
+}
+
+/// N acquire loads, no stores. `None` for a `none_for_tests` node.
+pub fn service_mins(cnc: &CncPage, services: &ServicesConfig) -> Option<ServiceMins> {
+    let mut m = ServiceMins {
+        applied: u64::MAX,
+        snapshot_pos: u64::MAX,
+        output_completed: u64::MAX,
+        heartbeat_ns: u64::MAX,
+    };
+    let mut any = false;
+    for id in services.ids() {
+        let s = cnc.service_slot(id as usize);
+        m.applied = m.applied.min(s.applied.load_acquire());
+        m.snapshot_pos = m.snapshot_pos.min(s.snapshot_pos.load_acquire());
+        m.output_completed = m.output_completed.min(s.output_completed.load_acquire());
+        m.heartbeat_ns = m.heartbeat_ns.min(s.heartbeat_ns.load_acquire());
+        any = true;
+    }
+    any.then_some(m)
+}
+
 /// `"lockstep"`, or a byte count as `<digits>` with an optional `KiB`/`MiB`/
 /// `GiB` suffix (no spaces, no fractions, binary units only — the same
 /// vocabulary the spec uses). Errors name the field.
@@ -208,6 +241,31 @@ mod tests {
         assert_eq!(s.ids().count(), 0);
         assert_eq!(s.ring_ids().collect::<Vec<_>>(), vec![0]);
         s.validate(4 << 20).unwrap();
+    }
+
+    #[test]
+    fn service_mins_is_the_min_over_declared_ids_and_ignores_undeclared_slots() {
+        let page = uc2_log::cnc::CncPage::heap(&uc2_log::cnc::CncMeta {
+            node_id: 1, instance_id: 7, app_id: "t".into(), buffer_bytes: 1 << 20, max_payload: 256,
+        });
+        let s = ServicesConfig::from_ids(&[0, 2], None).unwrap();
+        page.service_slot(0).applied.store_release(500);
+        page.service_slot(0).snapshot_pos.store_release(400);
+        page.service_slot(0).output_completed.store_release(300);
+        page.service_slot(0).heartbeat_ns.store_release(1_000);
+        page.service_slot(2).applied.store_release(200);
+        page.service_slot(2).snapshot_pos.store_release(900);
+        page.service_slot(2).output_completed.store_release(50);
+        page.service_slot(2).heartbeat_ns.store_release(2_000);
+        page.service_slot(1).applied.store_release(1); // undeclared: must not count
+        let m = service_mins(&page, &s).unwrap();
+        assert_eq!(m, ServiceMins { applied: 200, snapshot_pos: 400, output_completed: 50, heartbeat_ns: 1_000 });
+        // A declared-but-dormant id (slot 2 zeroed) drags every min to 0 — spec §5.1, intentional.
+        page.service_slot(2).applied.store_release(0);
+        page.service_slot(2).snapshot_pos.store_release(0);
+        assert_eq!(service_mins(&page, &s).unwrap().applied, 0);
+        assert_eq!(service_mins(&page, &s).unwrap().snapshot_pos, 0);
+        assert!(service_mins(&page, &ServicesConfig::none_for_tests()).is_none());
     }
 
     #[test]

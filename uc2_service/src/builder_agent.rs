@@ -32,6 +32,7 @@ use std::sync::mpsc;
 
 use uc2_log::cnc::CncPage;
 
+use crate::attach::slot;
 use crate::config::SnapshotError;
 use crate::snapshots::SnapshotStore;
 
@@ -46,6 +47,8 @@ pub(crate) struct BuilderState {
     pub(crate) cnc: Arc<CncPage>,
     /// Shared with `SnapshotTrigger` on the apply side; see the module doc.
     pub(crate) busy: Arc<AtomicBool>,
+    /// M14a: which declared FSM slot this builder publishes to.
+    pub(crate) service_id: u8,
 }
 
 /// One builder duty cycle. Returns `true` iff it drained a job (drives the
@@ -61,7 +64,7 @@ pub(crate) fn builder_cycle(st: &mut BuilderState) -> bool {
                     // rename inside `publish` has already completed, so a torn
                     // build is never observed here (module doc / snapshots.rs
                     // doc).
-                    st.cnc.snapshots().service_snapshot_pos.store_release(pos);
+                    slot(&st.cnc, st.service_id).snapshot_pos.store_release(pos);
                 }
                 Err(e) => {
                     // Logged + dropped: the marker is not advanced, so the
@@ -108,6 +111,7 @@ mod tests {
             store: SnapshotStore::open(dir).unwrap(),
             cnc: page(),
             busy: Arc::clone(&busy),
+            service_id: 0,
         };
         (tx, st, busy)
     }
@@ -133,7 +137,7 @@ mod tests {
         tx.try_send((4096, job)).unwrap();
 
         assert!(builder_cycle(&mut st), "one job drained");
-        assert_eq!(cnc.snapshots().service_snapshot_pos.load_acquire(), 4096);
+        assert_eq!(cnc.service_slot(0).snapshot_pos.load_acquire(), 4096);
         assert!(!busy.load(Ordering::Acquire), "busy cleared after completion");
 
         let store = SnapshotStore::open(dir.path()).unwrap();
@@ -156,7 +160,7 @@ mod tests {
         tx.try_send((4096, job)).unwrap();
 
         assert!(builder_cycle(&mut st));
-        assert_eq!(cnc.snapshots().service_snapshot_pos.load_acquire(), 0, "marker not advanced");
+        assert_eq!(cnc.service_slot(0).snapshot_pos.load_acquire(), 0, "marker not advanced");
         assert!(!busy.load(Ordering::Acquire), "busy cleared even on failure");
     }
 

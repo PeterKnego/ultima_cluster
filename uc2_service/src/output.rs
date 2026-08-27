@@ -89,11 +89,13 @@ pub(crate) struct OutputState<S: RawStateMachine, O: RawOutputHandler<S>> {
     pub(crate) was_leader: bool,
     /// The node `instance_id` this incarnation attached to (M5 final review
     /// #2c) — a change means the node restarted; this thread must fail-stop
-    /// rather than keep writing `output_completed` onto the new generation's
-    /// page. Checked with the same two-consecutive-cycle derace as the apply
-    /// loop, via [`crate::apply::check_node_instance`].
+    /// rather than keep writing our slot's `output_completed` onto the new
+    /// generation's page. Checked with the same two-consecutive-cycle derace
+    /// as the apply loop, via [`crate::apply::check_node_instance`].
     pub(crate) instance_id: u128,
     pub(crate) instance_mismatch_streak: u8,
+    /// M14a: which declared FSM slot this incarnation writes (`cfg.service_id`).
+    pub(crate) service_id: u8,
 }
 
 impl<S: RawStateMachine, O: RawOutputHandler<S>> OutputState<S, O> {
@@ -104,6 +106,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> OutputState<S, O> {
         handler: O,
         journal_dir: std::path::PathBuf,
         instance_id: u128,
+        service_id: u8,
     ) -> std::io::Result<Self> {
         // `rt` (thread scheduling) + `time` (enabled for a future handler that
         // wants `tokio::time` inside `on_committed`; the backoff sleeps here go
@@ -120,6 +123,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> OutputState<S, O> {
             was_leader: false,
             instance_id,
             instance_mismatch_streak: 0,
+            service_id,
         })
     }
 }
@@ -155,7 +159,7 @@ pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
     }
 
     let counters = st.cnc.counters();
-    let service_applied = st.cnc.service().service_applied.load_acquire();
+    let service_applied = crate::attach::slot(&st.cnc, st.service_id).applied.load_acquire();
     // Never run ahead of apply: `state` must already reflect `cmd`'s effect.
     let target =
         counters.commit.load_acquire().min(counters.durable.load_acquire()).min(service_applied);
@@ -186,7 +190,7 @@ pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
                     // the borrows disjoint (module doc). The frame payload goes
                     // through as bytes — a typed handler decodes it inside
                     // `TypedOutput`'s `RawOutputHandler` impl.
-                    if !deliver(&st.sm, &st.cnc, &st.handler, &st.rt, pos, frame_end, payload) {
+                    if !deliver(&st.sm, &st.cnc, st.service_id, &st.handler, &st.rt, pos, frame_end, payload) {
                         // Lost leadership mid-frame: abandon it (unpersisted —
                         // the next become-leader edge redelivers it) and stop
                         // touching the log this cycle.
@@ -205,6 +209,7 @@ pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
             let outcome = output_replay_degrade(
                 &st.sm,
                 &st.cnc,
+                st.service_id,
                 &st.handler,
                 &st.rt,
                 &st.journal_dir,
@@ -248,9 +253,11 @@ pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
 /// slow handler stalls reads as well as applies. A real degradation for a
 /// slow/blocking handler, flagged in the task report as a concern for the
 /// controller rather than silently accepted.
+#[allow(clippy::too_many_arguments)]
 fn deliver<S: RawStateMachine, O: RawOutputHandler<S>>(
     sm: &Arc<Mutex<S>>,
     cnc: &CncPage,
+    service_id: u8,
     handler: &O,
     rt: &tokio::runtime::Runtime,
     pos: u64,
@@ -268,7 +275,7 @@ fn deliver<S: RawStateMachine, O: RawOutputHandler<S>>(
         };
         match result {
             Ok(()) => {
-                store_output_completed(cnc, frame_end);
+                store_output_completed(cnc, service_id, frame_end);
                 return true;
             }
             Err(OutputError::Permanent(msg)) => {
@@ -276,7 +283,7 @@ fn deliver<S: RawStateMachine, O: RawOutputHandler<S>>(
                     "uc2_service: on_committed PERMANENT failure at position {pos}: {msg} \
                      (advancing output_progress anyway per the OutputError::Permanent contract)"
                 );
-                store_output_completed(cnc, frame_end);
+                store_output_completed(cnc, service_id, frame_end);
                 return true;
             }
             Err(OutputError::Retryable(_)) => {
@@ -296,8 +303,8 @@ fn deliver<S: RawStateMachine, O: RawOutputHandler<S>>(
 /// cursor below the in-page high-water mark — module doc) — the `max` keeps
 /// this shared, cross-process-visible counter monotonic even though a
 /// redelivery pass would otherwise overwrite it backwards.
-fn store_output_completed(cnc: &CncPage, frame_end: u64) {
-    let cell = &cnc.service().output_completed;
+fn store_output_completed(cnc: &CncPage, service_id: u8, frame_end: u64) {
+    let cell = &crate::attach::slot(cnc, service_id).output_completed;
     let current = cell.load_acquire();
     if frame_end > current {
         cell.store_release(frame_end);
@@ -323,6 +330,7 @@ enum ReplayOutcome {
 fn output_replay_degrade<S: RawStateMachine, O: RawOutputHandler<S>>(
     sm: &Arc<Mutex<S>>,
     cnc: &CncPage,
+    service_id: u8,
     handler: &O,
     rt: &tokio::runtime::Runtime,
     journal_dir: &Path,
@@ -336,7 +344,7 @@ fn output_replay_degrade<S: RawStateMachine, O: RawOutputHandler<S>>(
     reader
         .scan(|_seq, base, payload| {
             let counters = cnc.counters();
-            let service_applied = cnc.service().service_applied.load_acquire();
+            let service_applied = crate::attach::slot(cnc, service_id).applied.load_acquire();
             let target = counters
                 .commit
                 .load_acquire()
@@ -362,7 +370,7 @@ fn output_replay_degrade<S: RawStateMachine, O: RawOutputHandler<S>>(
                         return false;
                     }
                     let cmd = &payload[off + HEADER_LEN..off + total];
-                    if !deliver(sm, cnc, handler, rt, pos, end, cmd) {
+                    if !deliver(sm, cnc, service_id, handler, rt, pos, end, cmd) {
                         lost_leadership = true;
                         return false;
                     }

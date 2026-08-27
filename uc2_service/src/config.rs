@@ -54,8 +54,8 @@ impl ServiceConfig {
 /// **Default is `interval_bytes: 0` = "never".** This is the purge-off-by-
 /// default starting point (spec M6): with no interval configured, the builder
 /// thread (when spawned via `start_with_snapshots`) never trips, so no
-/// snapshot file is ever written, `cnc.snapshots().service_snapshot_pos` stays
-/// `0`, and (once Task 4 lands) the purge driver never advances — a
+/// snapshot file is ever written, this FSM's slot `snapshot_pos` stays `0`,
+/// and (once Task 4 lands) the purge driver never advances — a
 /// snapshot-capable SM that is never asked to snapshot behaves exactly like one
 /// that isn't, from the log-retention perspective.
 ///

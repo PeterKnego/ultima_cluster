@@ -13,9 +13,9 @@
 //! [`SnapshotStore::newest`] scans for, so a build that dies mid-write (before
 //! the rename) leaves, at worst, an orphaned temp file that is never mistaken
 //! for a complete snapshot — the rename is the single moment a snapshot becomes
-//! "complete" and discoverable. This is also why the cnc marker
-//! (`cnc.snapshots().service_snapshot_pos`, written by the builder agent, not
-//! this module) is updated only AFTER `publish` returns `Ok`.
+//! "complete" and discoverable. This is also why the cnc marker (this FSM's
+//! slot `snapshot_pos`, written by the builder agent, not this module) is
+//! updated only AFTER `publish` returns `Ok`.
 //!
 //! **Retention.** After a successful publish, `publish` unlinks every snapshot
 //! file except the newest 2 (by position) — keep-newest-2, not keep-last-N-by-

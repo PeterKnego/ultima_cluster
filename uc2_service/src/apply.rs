@@ -208,7 +208,7 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// The node `instance_id` this incarnation attached to (M5 final review
     /// #2c). A change means the node restarted and recreated the cnc page in
     /// place — this attachment is invalidated and this thread must fail-stop
-    /// rather than keep writing `service_applied`/`service_heartbeat_ns` onto the
+    /// rather than keep writing `applied`/`heartbeat_ns` onto our slot on the
     /// NEW generation's page (a single-writer violation, and the enabler of the
     /// epoch-0 barrier collision guarded node-side in #1).
     pub(crate) instance_id: u128,
@@ -219,12 +219,14 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     pub(crate) instance_mismatch_streak: u8,
     /// This incarnation's service epoch, captured at attach (M5 final review
     /// #5). Fixed for the life of this service incarnation — a newer incarnation
-    /// would bump `service_epoch` on the shared page, but THIS thread must keep
-    /// comparing forwarded reads against ITS OWN epoch, not whatever the page now
-    /// holds (re-reading live would make an old incarnation answer reads stamped
-    /// for a newer one). #2c fail-stops on the node-restart case; this closes the
-    /// same-node service-restart case.
+    /// would bump our slot's `epoch` on the shared page, but THIS thread must
+    /// keep comparing forwarded reads against ITS OWN epoch, not whatever the
+    /// slot now holds (re-reading live would make an old incarnation answer
+    /// reads stamped for a newer one). #2c fail-stops on the node-restart
+    /// case; this closes the same-node service-restart case.
     pub(crate) my_epoch: u64,
+    /// M14a: which declared FSM slot this incarnation writes (`cfg.service_id`).
+    pub(crate) service_id: u8,
     /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
     pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
     /// M6 Task 5: below-floor reconstruction (snapshot install + tail replay).
@@ -290,7 +292,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         // dead timeline; keep the heartbeat so the node sees a live-but-
         // poisoned service rather than a hung one.
         refuse_queries(st);
-        st.cnc.status().service_heartbeat_ns.store_release(unix_ns());
+        crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
         return false;
     }
     let target = c.commit.load_acquire().min(durable);
@@ -359,7 +361,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     profile::add(pf_frames, pf_sm, pf_pub, pf_bytes);
                 }
                 // Publish the new applied frontier for barrier readers / clients.
-                st.cnc.service().service_applied.store_release(st.follower.cursor);
+                crate::attach::slot(&st.cnc, st.service_id).applied.store_release(st.follower.cursor);
                 if st.follower.cursor == cursor_before {
                     // No frame cleared the target guard (target between the
                     // cursor and the next frame's end). Nothing more to do this
@@ -393,7 +395,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 Err(e) => panic!("service journal replay fail-stop: {e}"),
             };
             st.follower.cursor = cursor;
-            st.cnc.service().service_applied.store_release(cursor);
+            crate::attach::slot(&st.cnc, st.service_id).applied.store_release(cursor);
             st.needs_replay = false;
             progressed = true;
             // Re-loop: read live from the rejoin point (may CaughtUp, apply
@@ -401,7 +403,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         }
     }
     // Liveness: a wall-clock heartbeat the node compares against its own clock.
-    st.cnc.status().service_heartbeat_ns.store_release(unix_ns());
+    crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
     drain_queries(st);
     // M6 Task 3: the freeze hook, last in the cycle (module doc / brief) —
     // strictly after the batch loop above has published this cycle's
@@ -437,7 +439,7 @@ fn maybe_build_snapshot<S: RawStateMachine>(st: &mut ApplyState<S>) {
     if trigger.busy.load(Ordering::Acquire) {
         return; // one in-flight build max
     }
-    let applied = st.cnc.service().service_applied.load_acquire();
+    let applied = crate::attach::slot(&st.cnc, st.service_id).applied.load_acquire();
     if applied.saturating_sub(trigger.last_snapshot_pos) < trigger.policy.interval_bytes {
         return;
     }
@@ -506,7 +508,7 @@ fn refuse_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
 fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
     // This incarnation's epoch, CAPTURED AT ATTACH (M5 final review #5) — fixed
     // for this incarnation's life, NOT re-read live from the page. A newer
-    // incarnation attaching to the same page bumps `service_epoch`; if we
+    // incarnation attaching to the same slot bumps its `epoch`; if we
     // re-read it live, an old (still-running) incarnation would start answering
     // reads stamped for the NEW epoch with ITS OWN (stale) state — a
     // linearizability hole. Comparing against the fixed attach-time epoch makes

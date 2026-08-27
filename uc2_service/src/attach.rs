@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use uc2_log::buffer::LogBuffer;
-use uc2_log::cnc::CncPage;
+use uc2_log::cnc::{CncPage, pack_service_status, unpack_service_status};
 use uc2_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 
@@ -35,6 +35,11 @@ pub(crate) struct Attached<S: RawStateMachine> {
     pub(crate) poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// M14a: which declared FSM slot this attach is for (`cfg.service_id`).
     pub(crate) service_id: u8,
+}
+
+/// M14a: the one path every service-side slot access takes.
+pub(crate) fn slot(cnc: &CncPage, id: u8) -> &uc2_log::cnc::ServiceSlot {
+    cnc.service_slot(id as usize)
 }
 
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
@@ -100,13 +105,15 @@ pub(crate) fn attach<S: RawStateMachine>(
     // one rejoin mechanism — try-live-then-replay — covers both a caught-up
     // reattach and a fresh SM (`None -> 0`) on a long-scrolled ring.
     let start_pos = last_applied.unwrap_or(0);
-    cnc.service().service_applied.store_release(start_pos);
-
-    // 5. Bump the service epoch — the incarnation marker — AFTER step 4, with
-    //    AcqRel (fetch_add), so a barrier reader that captures
-    //    epoch→applied→epoch sees a consistent snapshot. This is the
-    //    bump-once-at-attach point; it happens before the thread is READY.
-    let epoch = cnc.service().service_epoch.fetch_add(1) + 1;
+    let s = slot(&cnc, cfg.service_id);
+    s.applied.store_release(start_pos);
+    // Status: attached, incarnation += 1 (the prior life's value survives a
+    // crash on the same page; a node restart zeroes it with the page).
+    let (_, _, incarnation) = unpack_service_status(s.status.load_acquire());
+    s.status.store_release(pack_service_status(cfg.service_id, true, incarnation.wrapping_add(1)));
+    // 5. Bump the epoch AFTER applied, AcqRel — the discipline the node's
+    //    capture-recheck bracket relies on (unchanged, now per slot).
+    let epoch = s.epoch.fetch_add(1) + 1;
 
     let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let follower = LogFollower::new(Arc::clone(&buffer), start_pos);
@@ -123,6 +130,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         instance_id,
         instance_mismatch_streak: 0,
         my_epoch: epoch,
+        service_id: cfg.service_id,
         // M6 Task 3: only `start_with_snapshots` installs a real trigger
         // (it needs `S: SnapshotStateMachine`, a bound `attach` doesn't
         // carry) — it overwrites this field on the `Attached` this function

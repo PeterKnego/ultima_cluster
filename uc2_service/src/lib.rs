@@ -163,6 +163,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
                 output,
                 journal_dir,
                 instance_id,
+                service_id,
             )?;
             let output_agent =
                 AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || output_cycle(&mut output_state))?;
@@ -222,6 +223,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
                 output,
                 journal_dir,
                 instance_id,
+                service_id,
             )?;
             let output_agent =
                 AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || output_cycle(&mut output_state))?;
@@ -243,7 +245,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // Seed the interval basis from whatever the cnc marker already holds
         // (0 on a fresh page) — a service reattaching after a prior
         // incarnation already built snapshots doesn't immediately re-trigger.
-        let last_snapshot_pos = cnc.snapshots().service_snapshot_pos.load_acquire();
+        let last_snapshot_pos = attach::slot(&cnc, cfg.service_id).snapshot_pos.load_acquire();
         let freeze: FreezeFn<S> = Box::new(|sm: &S| {
             let (handle, pos) = sm.freeze()?;
             let job: BuildJob = Box::new(move |w: &mut dyn std::io::Write| S::stream_snapshot(handle, w));
@@ -268,7 +270,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             store: store.clone(),
             install,
         });
-        let mut builder_state = BuilderState { rx, store, cnc: Arc::clone(&cnc), busy };
+        let mut builder_state = BuilderState { rx, store, cnc: Arc::clone(&cnc), busy, service_id };
         let builder_agent =
             AgentRunner::spawn("uc2-snapshot-builder", APPLY_IDLE, move || builder_cycle(&mut builder_state))?;
 
@@ -319,8 +321,8 @@ impl<S: RawStateMachine> Service<S> {
         self.instance_id
     }
 
-    /// This service incarnation's epoch (the value it bumped `service_epoch`
-    /// to at attach).
+    /// This service incarnation's epoch (the value it bumped this FSM's slot
+    /// `epoch` to at attach).
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -369,9 +371,16 @@ impl<S: RawStateMachine> Service<S> {
             && self.agents.iter().all(|a| !a.is_finished())
     }
 
-    /// Graceful stop: signal every agent and join, propagating a work-closure
-    /// panic (fail-loud in teardown).
+    /// Graceful stop: clear this incarnation's attached bit (the incarnation
+    /// counter survives — a fresh attach on the same page bumps it, not this),
+    /// then signal every agent and join, propagating a work-closure panic
+    /// (fail-loud in teardown). `crash()` deliberately leaves the bit set — a
+    /// crash is indistinguishable from a kill; the heartbeat ages instead
+    /// (spec §8).
     pub fn stop(self) {
+        let s = attach::slot(&self._cnc, self.service_id);
+        let (_, _, inc) = uc2_log::cnc::unpack_service_status(s.status.load_acquire());
+        s.status.store_release(uc2_log::cnc::pack_service_status(self.service_id, false, inc));
         for a in self.agents {
             a.stop();
         }

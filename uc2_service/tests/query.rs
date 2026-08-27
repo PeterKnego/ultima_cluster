@@ -171,7 +171,7 @@ fn stale_epoch_svc_query_gets_retry() {
         .unwrap();
     assert_eq!(svc2.epoch(), 2, "the restarted incarnation bumps the epoch");
     let cnc = uc2_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "q-epoch").unwrap();
-    wait_until(|| cnc.service().service_epoch.load_acquire() == 2);
+    wait_until(|| cnc.service_slot(0).epoch.load_acquire() == 2);
 
     // Write an SVC_QUERY stamped with the OLD (superseded) epoch directly onto
     // svc_query.ring. Payload = expected_epoch u64 LE ++ query bytes. No client

@@ -366,6 +366,9 @@ enum ReadPhase {
 struct PendingRead {
     client_id: u32,
     local_seq: u32,
+    /// M14a: which FSM's slot certifies this read; M14a always 0, M14b takes
+    /// it from the query record.
+    service_id: u8,
     /// The raw query bytes (forwarded verbatim after `expected_epoch`).
     query: Vec<u8>,
     /// Rung A ordering gate (spec §3.2): the seq of the NEXT probe round at
@@ -1229,6 +1232,7 @@ impl Node {
             query_ring,
             svc_query,
             services: cfg.services,
+            min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
             next_round_seq: 1,
@@ -1360,9 +1364,11 @@ impl Node {
         self.cnc.counters()
     }
 
-    /// The service's applied position (cnc `service_applied`, offset 512). A
-    /// reconstructing service catches up when this reaches `commit`; the M6 gate
-    /// reads it to time below-floor reconstruction convergence.
+    /// The slowest declared FSM's applied position (page-1 aggregate, cnc
+    /// `service_applied`, offset 512 — published each cycle by
+    /// `Consensus::publish_service_mins`). A reconstructing service catches up
+    /// when this reaches `commit`; the M6 gate reads it to time below-floor
+    /// reconstruction convergence.
     pub fn service_applied(&self) -> u64 {
         self.cnc.service().service_applied.load_acquire()
     }
@@ -1729,10 +1735,14 @@ struct Consensus {
     /// (`MSG_V2_SVC_QUERY`; payload = `expected_epoch: u64 LE ++ query bytes`).
     svc_query: Vec<Option<SpscProducer>>,
     /// M14a: a copy of `NodeConfig::services` — the declared set + lag policy.
-    /// Unused by this task's consensus logic; Task 5 routes `forward_svc_query`
-    /// by `read.service_id` and Task 6 answers `MSG_V2_BAD_SERVICE` from it.
-    #[allow(dead_code)]
+    /// Read by `publish_service_mins` every cycle; Task 6 also answers
+    /// `MSG_V2_BAD_SERVICE` from it.
     services: ServicesConfig,
+    /// M14a: this cycle's `min(applied)` over the declared FSMs, refreshed by
+    /// `publish_service_mins()` at the top of every `do_work` cycle.
+    /// `u64::MAX` for a `none_for_tests` node (nothing declared: no FSM
+    /// pacing) — never read as a real position in that state.
+    min_applied: u64,
     /// In-flight linearizable reads parked between admission and forward/retry
     /// (the ReadIndex barrier state machine). Small — one entry per outstanding
     /// client read; walked every duty cycle (bounded by outstanding reads).
@@ -2055,6 +2065,8 @@ impl Consensus {
         if self.halt_removed {
             return false;
         }
+        // M14a: the FSM aggregates first — everything below reads them.
+        self.publish_service_mins();
         let mut did = false;
 
         // 0. Absorb the durable counter BEFORE anything that reads our own log
@@ -2670,6 +2682,33 @@ impl Consensus {
     #[cfg(test)]
     fn crypto_peer_ids(&self) -> Option<&PeerIds> {
         self.crypto_peer_ids.as_ref()
+    }
+
+    /// M14a (spec §3.2/§5.1): publish `min` over the declared FSMs' slots into
+    /// page 1's singular service fields, once per cycle, store-on-change.
+    /// Runs FIRST in `do_work`: `refresh_durable` (the report ceiling), the
+    /// ingress door and the two persisters all read this cycle's value.
+    fn publish_service_mins(&mut self) {
+        let Some(m) = crate::services::service_mins(&self.cnc, &self.services) else {
+            self.min_applied = u64::MAX; // nothing declared: no FSM pacing
+            return;
+        };
+        self.min_applied = m.applied;
+        let sp = self.cnc.service();
+        if sp.service_applied.load_acquire() != m.applied {
+            sp.service_applied.store_release(m.applied);
+        }
+        if sp.output_completed.load_acquire() != m.output_completed {
+            sp.output_completed.store_release(m.output_completed);
+        }
+        let sn = self.cnc.snapshots();
+        if sn.service_snapshot_pos.load_acquire() != m.snapshot_pos {
+            sn.service_snapshot_pos.store_release(m.snapshot_pos);
+        }
+        let st = self.cnc.status();
+        if st.service_heartbeat_ns.load_acquire() != m.heartbeat_ns {
+            st.service_heartbeat_ns.store_release(m.heartbeat_ns);
+        }
     }
 
     /// M6 Task 9: refresh the cnc observability band. Writes the static
@@ -3521,6 +3560,9 @@ impl Consensus {
                     let mut read = PendingRead {
                         client_id,
                         local_seq,
+                        // M14a: always 0 (the remote path's only FSM); M14b
+                        // takes this from the query record instead.
+                        service_id: 0,
                         query: buf,
                         // Rung A §3.2: record the NEXT round's seq — only a
                         // round issued at-or-after this admission may certify.
@@ -3615,19 +3657,19 @@ impl Consensus {
                 // moves the epoch and fails the recheck — so a read is never
                 // forwarded across a service incarnation boundary.
                 let ready = {
-                    let svc = self.cnc.service();
-                    let e = svc.service_epoch.load_acquire();
-                    let applied = svc.service_applied.load_acquire();
+                    let slot = self.cnc.service_slot(self.pending_reads[i].service_id as usize);
+                    let e = slot.epoch.load_acquire();
+                    let applied = slot.applied.load_acquire();
                     // Sentinel-collision guard (M5 final review IMPORTANT #1): a
                     // captured epoch of 0 is NOT ready — never forward on it.
                     // `expected_epoch == 0` is the wire sentinel for "skip the
                     // epoch check" (a snapshot read the service answers
                     // unconditionally — see `uc_protocol::v2::ipc` and
                     // `uc2_service::apply::drain_queries`). A fresh cnc page
-                    // zeroes `service_epoch` on EVERY node boot, so the bracket
+                    // zeroes the slot's epoch on EVERY node boot, so the bracket
                     // could otherwise pass while NO live service has attached
                     // this generation — and a stale service incarnation still
-                    // writing `service_applied` onto the recreated page (the
+                    // writing `applied` onto the recreated page (the
                     // crashtest's node_sigkill_recovery window) could push
                     // `applied >= commit_at` with `e == 0`. Forwarding then would
                     // (a) stamp the skip-the-check sentinel and (b) certify a
@@ -3637,7 +3679,7 @@ impl Consensus {
                     // incarnation (epoch bumped at attach) is ever forwarded —
                     // with its true epoch, so the service's own stale-epoch
                     // refusal still applies end-to-end.
-                    if e >= 1 && applied >= commit_at && svc.service_epoch.load_acquire() == e {
+                    if e >= 1 && applied >= commit_at && slot.epoch.load_acquire() == e {
                         Some(e)
                     } else {
                         None
@@ -3646,8 +3688,9 @@ impl Consensus {
                 if let Some(e) = ready {
                     let client_id = self.pending_reads[i].client_id;
                     let local_seq = self.pending_reads[i].local_seq;
+                    let service_id = self.pending_reads[i].service_id;
                     let query = std::mem::take(&mut self.pending_reads[i].query);
-                    if self.forward_svc_query(0, client_id, local_seq, e, &query) {
+                    if self.forward_svc_query(service_id, client_id, local_seq, e, &query) {
                         self.pending_reads.swap_remove(i);
                         did = true;
                         continue;
@@ -5837,6 +5880,7 @@ mod tests {
             query_ring,
             svc_query,
             services: ServicesConfig::default(),
+            min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
             next_round_seq: 1,
@@ -6421,6 +6465,7 @@ mod tests {
         PendingRead {
             client_id: 7,
             local_seq: 1,
+            service_id: 0,
             query: Vec::new(),
             round_seq,
             commit_at,
@@ -6471,14 +6516,14 @@ mod tests {
         assert!(!h.cons.advance_pending_reads());
         assert_eq!(h.cons.pending_reads.len(), 1);
 
-        // Caught up BUT service_epoch still 0: the sentinel-collision guard
+        // Caught up BUT the slot's epoch still 0: the sentinel-collision guard
         // keeps it parked (unchanged behavior).
-        h.cons.cnc.service().service_applied.store_release(6048);
+        h.cons.cnc.service_slot(0).applied.store_release(6048);
         assert!(!h.cons.advance_pending_reads());
         assert_eq!(h.cons.pending_reads.len(), 1, "epoch-0 must not forward");
 
         // A real incarnation attaches (epoch 1) → forwarded and dropped.
-        h.cons.cnc.service().service_epoch.store_release(1);
+        h.cons.cnc.service_slot(0).epoch.store_release(1);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "caught-up read must forward and drop");
     }
@@ -6641,16 +6686,16 @@ mod tests {
         read.phase = ReadPhase::AwaitApplied;
         h.cons.pending_reads.push(read);
 
-        // Service applied past the read index, but service_epoch is still 0
+        // Service applied past the read index, but the slot's epoch is still 0
         // (no service attached this generation): the guard parks the read.
-        h.cons.cnc.service().service_applied.store_release(6048);
-        assert_eq!(h.cons.cnc.service().service_epoch.load_acquire(), 0);
+        h.cons.cnc.service_slot(0).applied.store_release(6048);
+        assert_eq!(h.cons.cnc.service_slot(0).epoch.load_acquire(), 0);
         assert!(!h.cons.advance_pending_reads(), "must not forward on the epoch-0 sentinel");
         assert_eq!(h.cons.pending_reads.len(), 1);
 
         // Epoch bumps to 1 (a real incarnation attached) → forwarded with
         // expected_epoch 1 and dropped from the barrier.
-        h.cons.cnc.service().service_epoch.store_release(1);
+        h.cons.cnc.service_slot(0).epoch.store_release(1);
         assert!(h.cons.advance_pending_reads(), "must forward once epoch >= 1");
         assert!(h.cons.pending_reads.is_empty());
     }
