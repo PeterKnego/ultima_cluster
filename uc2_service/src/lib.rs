@@ -35,6 +35,7 @@ mod attach;
 mod builder_agent;
 mod config;
 mod egress;
+mod lag;
 mod output;
 mod replay;
 mod session;

@@ -69,6 +69,11 @@ pub(crate) fn attach<S: RawStateMachine>(
     if cfg.service_id as usize >= CNC_MAX_SERVICES || declared & (1u64 << cfg.service_id) == 0 {
         return Err(ServiceError::ServiceNotDeclared { id: cfg.service_id, declared });
     }
+    // M14a Task 7: the lag mode this incarnation runs under, read once at
+    // attach (the page's `services_declared`/`fsm_lag_bytes` are boot-once —
+    // see the cnc layout doc) — reuses the effective `declared` mask above
+    // (page `0` folded to `1`, the harness-node case).
+    let lag_mode = crate::lag::mode_from_page(declared, cnc.fsm_lag_bytes());
     // 1c. M14a: one process per id. Exclusive flock, held for the service's
     // life (the OS releases it on any exit), mirroring the node's
     // `instance.lock`.
@@ -157,6 +162,9 @@ pub(crate) fn attach<S: RawStateMachine>(
         instance_mismatch_streak: 0,
         my_epoch: epoch,
         service_id: cfg.service_id,
+        lag_mode,
+        declared,
+        lag_waiting: false,
         // M6 Task 3: only `start_with_snapshots` installs a real trigger
         // (it needs `S: SnapshotStateMachine`, a bound `attach` doesn't
         // carry) — it overwrites this field on the `Attached` this function

@@ -250,3 +250,109 @@ fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
     svc1.stop();
     node.stop();
 }
+
+/// FSM 1's stand-in: 1 ms per apply, so FSM 0 would run ~1000 frames ahead
+/// per second without the barrier.
+#[derive(Default)]
+pub struct SlowCountSm(CountSm);
+impl StateMachine for SlowCountSm {
+    type Command = Cmd;
+    type Response = u64;
+    type Query = ();
+    type QueryResponse = u64;
+    fn apply(&mut self, position: u64, cmd: Cmd) -> u64 {
+        std::thread::sleep(Duration::from_millis(1));
+        self.0.apply(position, cmd)
+    }
+    fn query(&self, q: ()) -> u64 { self.0.query(q) }
+    fn last_applied(&self) -> Option<u64> { self.0.last_applied() }
+}
+
+/// Drive `n` submits through the pipelined client while a sampler thread
+/// records the largest `applied_0 - applied_1` it sees (applied_0 read FIRST,
+/// so a racing sample can only under-read the gap). Returns `(max_gap, total)`.
+fn drive_and_sample_gap(dir: &Path, n: u64) -> (u64, u64) {
+    use uc2_client::{PipelinedClient, PipelinedConfig};
+    let cnc = open_cnc(dir);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let cnc = std::sync::Arc::clone(&cnc);
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut max_gap = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let a0 = cnc.service_slot(0).applied.load_acquire();
+                let a1 = cnc.service_slot(1).applied.load_acquire();
+                max_gap = max_gap.max(a0.saturating_sub(a1));
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            max_gap
+        })
+    };
+    // A long deadline: under lockstep every ticket waits behind the slow FSM.
+    let client = PipelinedClient::connect(
+        dir,
+        APP,
+        PipelinedConfig { request_timeout: Duration::from_secs(30), ..PipelinedConfig::default() },
+    )
+    .unwrap();
+    let mut tickets = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        tickets.push(client.submit::<Cmd, u64>(&Cmd::Add(1)).unwrap());
+    }
+    let mut total = 0;
+    for t in tickets {
+        total = t.wait().unwrap();
+    }
+    wait_until("FSM 1 caught up", || {
+        cnc.service_slot(1).applied.load_acquire() == cnc.service_slot(0).applied.load_acquire()
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    client.shutdown();
+    (sampler.join().unwrap(), total)
+}
+
+#[test]
+fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
+    let _g = serialize();
+    let dir = tempdir();
+    const BOUND: u64 = 64 << 10;
+    let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Bounded(BOUND))))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc0 = start_service(dir.path(), 0);
+    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(1), SlowCountSm::default())
+        .start()
+        .unwrap();
+    // 3000 frames × 128 B = 384 KiB of log — six times the bound.
+    let (max_gap, total) = drive_and_sample_gap(dir.path(), 3000);
+    assert_eq!(total, 3000);
+    assert!(max_gap <= BOUND, "applied_0 - applied_1 reached {max_gap} > bound {BOUND}");
+    assert!(max_gap > BOUND / 2, "vacuity: the fast FSM never approached the bound (max gap {max_gap})");
+    let cnc = open_cnc(dir.path());
+    assert!(cnc.service_slot(0).lag_waits.load_acquire() > 0, "FSM 0 must have waited at least once");
+    assert_eq!(cnc.service_slot(1).lag_waits.load_acquire(), 0, "the slow FSM never waits");
+    svc0.stop();
+    svc1.stop();
+    node.stop();
+}
+
+#[test]
+fn lockstep_holds_the_fsms_within_one_frame() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Lockstep)))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc0 = start_service(dir.path(), 0);
+    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(1), SlowCountSm::default())
+        .start()
+        .unwrap();
+    let (max_gap, total) = drive_and_sample_gap(dir.path(), 500);
+    assert_eq!(total, 500);
+    // One frame: header 32 + payload (≤ max_payload 256), 32-byte aligned.
+    let one_frame = uc_protocol::v2::frame::align_frame_len(32 + 256) as u64;
+    assert!(max_gap <= one_frame, "lockstep gap {max_gap} > one frame {one_frame}");
+    assert!(max_gap > 0, "vacuity: no gap ever observed");
+    svc0.stop();
+    svc1.stop();
+    node.stop();
+}

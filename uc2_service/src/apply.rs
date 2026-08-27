@@ -227,6 +227,16 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     pub(crate) my_epoch: u64,
     /// M14a: which declared FSM slot this incarnation writes (`cfg.service_id`).
     pub(crate) service_id: u8,
+    /// M14a Task 7: the lag barrier mode this incarnation runs under, fixed at
+    /// attach (the page's lag config is boot-once, like `service_id`).
+    pub(crate) lag_mode: crate::lag::LagMode,
+    /// M14a Task 7: the effective declared-set bitmask (page `0` folded to
+    /// `1`, the harness-node case) — `lag::floor`'s min ranges over this.
+    pub(crate) declared: u64,
+    /// M14a Task 7: true while this incarnation is mid wait-episode (a `Wait`
+    /// plan was returned last cycle and hasn't yet resolved to an `Apply`) —
+    /// so `lag_waits` counts EPISODES (the `false -> true` edge), not cycles.
+    pub(crate) lag_waiting: bool,
     /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
     pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
     /// M6 Task 5: below-floor reconstruction (snapshot install + tail replay).
@@ -295,9 +305,25 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
         return false;
     }
-    let target = c.commit.load_acquire().min(durable);
+    let commit = c.commit.load_acquire();
     let mut progressed = false;
     loop {
+        // M14a: the lag barrier — re-planned every iteration so a floor that
+        // moved mid-cycle is honoured (`floor` only increases; a stale sample
+        // is conservative).
+        let floor = crate::lag::floor(&st.cnc, st.declared);
+        let (target, one_frame) =
+            match crate::lag::plan(st.lag_mode, floor, st.follower.cursor, commit, durable) {
+                crate::lag::Plan::Wait => {
+                    if !st.lag_waiting {
+                        st.lag_waiting = true;
+                        crate::attach::slot(&st.cnc, st.service_id).lag_waits.fetch_add(1);
+                    }
+                    break;
+                }
+                crate::lag::Plan::Apply { target, one_frame } => (target, one_frame),
+            };
+        st.lag_waiting = false;
         // is_leader read inline (a direct field access, not a `&self` method)
         // so it does not conflict with the `follower` borrow the batch holds.
         let is_leader =
@@ -319,36 +345,36 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     (0u64, 0u64, 0u64, 0u64);
                 let mut sm = st.sm.lock().unwrap();
                 for (pos, hdr, payload) in frames {
-                    // NEW_TERM (and any future non-MESSAGE type) is not user data.
-                    if hdr.frame_type != FRAME_TYPE_MESSAGE {
-                        continue;
+                    // NEW_TERM (and any future non-MESSAGE type), and anything
+                    // already applied (idempotent re-entry: a restart replays
+                    // from `last_applied`), are skipped without counting as
+                    // this cycle's "one frame" for lockstep.
+                    if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > sm.last_applied() {
+                        #[cfg(feature = "apply-profile")]
+                        let t0 = profile::now();
+                        // Bytes straight from the frame to the state machine. Typed
+                        // SMs decode (and encode the response) inside their blanket
+                        // `RawStateMachine` impl; raw SMs see the slice. Committed
+                        // bytes are trusted; a decode failure there is
+                        // unrecoverable corruption and fail-stops.
+                        st.resp_buf.clear();
+                        sm.apply(pos, payload, &mut st.resp_buf);
+                        #[cfg(feature = "apply-profile")]
+                        let t1 = profile::now();
+                        if is_leader {
+                            st.egress.publish(hdr.session_id, hdr.correlation_id, pos, &st.resp_buf);
+                        }
+                        #[cfg(feature = "apply-profile")]
+                        {
+                            let t2 = profile::now();
+                            pf_frames += 1;
+                            pf_sm += t1 - t0; // apply incl. codec
+                            pf_pub += t2 - t1;
+                            pf_bytes += payload.len() as u64;
+                        }
                     }
-                    // Idempotent re-entry: skip anything at or below what the SM
-                    // has already applied (a restart replays from last_applied).
-                    if Some(pos) <= sm.last_applied() {
-                        continue;
-                    }
-                    #[cfg(feature = "apply-profile")]
-                    let t0 = profile::now();
-                    // Bytes straight from the frame to the state machine. Typed
-                    // SMs decode (and encode the response) inside their blanket
-                    // `RawStateMachine` impl; raw SMs see the slice. Committed
-                    // bytes are trusted; a decode failure there is
-                    // unrecoverable corruption and fail-stops.
-                    st.resp_buf.clear();
-                    sm.apply(pos, payload, &mut st.resp_buf);
-                    #[cfg(feature = "apply-profile")]
-                    let t1 = profile::now();
-                    if is_leader {
-                        st.egress.publish(hdr.session_id, hdr.correlation_id, pos, &st.resp_buf);
-                    }
-                    #[cfg(feature = "apply-profile")]
-                    {
-                        let t2 = profile::now();
-                        pf_frames += 1;
-                        pf_sm += t1 - t0; // apply incl. codec
-                        pf_pub += t2 - t1;
-                        pf_bytes += payload.len() as u64;
+                    if one_frame {
+                        break; // lockstep: exactly one frame past the floor
                     }
                 }
                 drop(sm);
