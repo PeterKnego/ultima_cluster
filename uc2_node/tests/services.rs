@@ -173,3 +173,80 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
     assert_eq!(s0.epoch.load_acquire(), 1, "detach does not bump the epoch");
     node.stop();
 }
+
+#[test]
+fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_refused() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(2), CountSm::default())
+        .start()
+        .err()
+        .expect("id 2 is not declared");
+    assert!(matches!(err, uc2_service::ServiceError::ServiceNotDeclared { id: 2, declared: 0b11 }), "{err:?}");
+    assert!(err.to_string().contains("service id 2 is not declared"), "{err}");
+
+    let svc1 = start_service(dir.path(), 1);
+    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(1), CountSm::default())
+        .start()
+        .err()
+        .expect("id 1 is held");
+    assert!(matches!(err, uc2_service::ServiceError::AlreadyAttached { id: 1 }), "{err:?}");
+    svc1.stop();
+    // The lock is released with the process's handle: a re-attach succeeds.
+    let svc1b = start_service(dir.path(), 1);
+    assert_eq!(svc1b.epoch(), 2);
+    svc1b.stop();
+    node.stop();
+}
+
+/// Review fix (fix round 1): `service_id` is a `u8` never range-checked
+/// before the declared-set gate's `1u64 << cfg.service_id`. The brief's
+/// original `||` order evaluated the shift first, so a `service_id` of 200
+/// (well past `CNC_MAX_SERVICES`) panicked with "attempt to shift left with
+/// overflow" in a debug/test build instead of returning the named
+/// `ServiceNotDeclared` refusal. This test runs in the default (debug,
+/// overflow-checked) test profile, so it would have panicked under the old
+/// `||` ordering.
+#[test]
+fn an_out_of_range_service_id_is_a_named_refusal_not_a_shift_overflow_panic() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(200), CountSm::default())
+        .start()
+        .err()
+        .expect("id 200 is out of range");
+    assert!(matches!(err, uc2_service::ServiceError::ServiceNotDeclared { id: 200, declared: 0b11 }), "{err:?}");
+    node.stop();
+}
+
+#[test]
+fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc0 = start_service(dir.path(), 0);
+    let svc1 = start_service(dir.path(), 1);
+    let client = Client::connect(dir.path(), APP).unwrap();
+    let mut last: u64 = 0;
+    for _ in 0..100 {
+        last = client.submit(&Cmd::Add(1)).unwrap();
+    }
+    assert_eq!(last, 100, "FSM 0's answers reach the client in order");
+    let cnc = open_cnc(dir.path());
+    wait_until("FSM 1 caught up", || {
+        cnc.service_slot(1).applied.load_acquire() == cnc.service_slot(0).applied.load_acquire()
+    });
+    assert_eq!(cnc.service().service_applied.load_acquire(), cnc.service_slot(0).applied.load_acquire());
+    assert_eq!(svc0.query(()), 100);
+    assert_eq!(svc1.query(()), 100, "same log, same deterministic SM ⇒ same state");
+    assert!(dir.path().join("snapshots").join("1").is_dir());
+    client.shutdown();
+    svc0.stop();
+    svc1.stop();
+    node.stop();
+}

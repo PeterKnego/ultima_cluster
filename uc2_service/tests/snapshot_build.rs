@@ -70,7 +70,7 @@ fn wait_until(mut f: impl FnMut() -> bool) {
 /// an in-progress build (there shouldn't be one in this test, since every
 /// publish either fully succeeds or is cleaned up) would NOT be counted.
 fn count_snapshots(dir: &Path) -> usize {
-    std::fs::read_dir(dir.join("snapshots"))
+    std::fs::read_dir(dir.join("snapshots").join("0"))
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".ultsnap"))
@@ -101,7 +101,7 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
     let s = cnc.snapshots().service_snapshot_pos.load_acquire();
     assert!(s <= cnc.service().service_applied.load_acquire(), "snapshot at an applied position");
 
-    let store = uc2_service::snapshots::SnapshotStore::open(dir.path()).unwrap();
+    let store = uc2_service::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
     let (pos, path) = store.newest(u64::MAX).unwrap().expect("file exists");
     assert_eq!(pos, s);
     assert!(path.ends_with(format!("snap-{s}.ultsnap")));

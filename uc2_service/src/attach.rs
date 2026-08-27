@@ -11,6 +11,7 @@ use uc2_log::buffer::LogBuffer;
 use uc2_log::cnc::{CncPage, pack_service_status, unpack_service_status};
 use uc2_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
+use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 
 use crate::apply::ApplyState;
 use crate::config::{ServiceConfig, ServiceError};
@@ -35,6 +36,9 @@ pub(crate) struct Attached<S: RawStateMachine> {
     pub(crate) poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// M14a: which declared FSM slot this attach is for (`cfg.service_id`).
     pub(crate) service_id: u8,
+    /// M14a: `service.<id>.lock`, held for the service's life (dropped last,
+    /// released by the OS on any exit) — enforces one process per id.
+    pub(crate) _lock: std::fs::File,
 }
 
 /// M14a: the one path every service-side slot access takes.
@@ -56,6 +60,28 @@ pub(crate) fn attach<S: RawStateMachine>(
     let meta = cnc.meta();
     let instance_id = meta.instance_id;
 
+    // 1b. M14a: the declared-set gate. `0` on the page is a harness node
+    // (`ServicesConfig::none_for_tests`), which rings FSM 0 only.
+    let declared = match cnc.services_declared() {
+        0 => 1,
+        d => d,
+    };
+    if cfg.service_id as usize >= CNC_MAX_SERVICES || declared & (1u64 << cfg.service_id) == 0 {
+        return Err(ServiceError::ServiceNotDeclared { id: cfg.service_id, declared });
+    }
+    // 1c. M14a: one process per id. Exclusive flock, held for the service's
+    // life (the OS releases it on any exit), mirroring the node's
+    // `instance.lock`.
+    let lock_path = dir.join(format!("service.{}.lock", cfg.service_id));
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .map_err(|_| ServiceError::AlreadyAttached { id: cfg.service_id })?;
+
     // 2. Open the log buffer file (read-only in spirit: the service only ever
     //    uses the read APIs; a v2.x hardening may map PROT_READ). Its max_claim
     //    margin must match the node's, so take max_payload from the cnc header.
@@ -64,7 +90,7 @@ pub(crate) fn attach<S: RawStateMachine>(
 
     // 3. Egress producer (service→everyone responses) + svc_query consumer
     //    (node→service queries; drained by Task 11). M14a: named for this
-    //    process's declared `service_id` (not yet enforced — Task 6).
+    //    process's declared `service_id` (enforced by the declared-set gate above).
     let egress_ring = BroadcastRing::open(&dir.join(format!("egress_service.{}.broadcast", cfg.service_id)))
         .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let egress = Egress::new(egress_ring.producer());
@@ -142,5 +168,14 @@ pub(crate) fn attach<S: RawStateMachine>(
         snapshot_restore: None,
     };
 
-    Ok(Attached { apply_state, buffer, cnc, instance_id, epoch, poisoned, service_id: cfg.service_id })
+    Ok(Attached {
+        apply_state,
+        buffer,
+        cnc,
+        instance_id,
+        epoch,
+        poisoned,
+        service_id: cfg.service_id,
+        _lock: lock,
+    })
 }

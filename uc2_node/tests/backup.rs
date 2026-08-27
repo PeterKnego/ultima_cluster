@@ -6,13 +6,16 @@
 //! Construction follows `lifecycle.rs`'s `single_node` pattern (a sole voter
 //! on a freshly bound loopback socket) and `purge_safety.rs`'s pattern of
 //! faking the service side — the node's purge driver only ever reads the
-//! `service_snapshot_pos` marker on the cnc page (`purge_safety.rs`'s own
-//! comment: "Task 4's node code never reads the snapshot FILE anyway"). Here
-//! we DO need real snapshot files on disk (the backup/verify coverage check
-//! reads them), so snapshot publish is faked with the real
+//! `service_snapshot_pos` marker on page 1 (`purge_safety.rs`'s own comment:
+//! "Task 4's node code never reads the snapshot FILE anyway"). Here we DO
+//! need real snapshot files on disk (the backup/verify coverage check reads
+//! them), so snapshot publish is faked with the real
 //! `uc2_service::snapshots::SnapshotStore` (a `uc2_node` dev-dependency)
 //! writing arbitrary bytes at the chosen position, while the purge trigger
-//! itself is still the direct cnc-marker write `purge_safety.rs` uses.
+//! itself is the fake service writing its OWN `service_slot(0).snapshot_pos`
+//! (since M14a Task 5 the consensus agent is page 1's single writer, mirroring
+//! `min(slot.snapshot_pos)` over the declared set every cycle — a direct page-1
+//! poke would just be overwritten back to slot 0's value on the next cycle).
 //!
 //! Journals use tiny segments (`SEG_BYTES`) on the ext4 `CARGO_TARGET_TMPDIR`
 //! so a purge cycle actually drops whole segment files without megabytes of
@@ -183,10 +186,15 @@ fn drive_until_durable_exceeds(node: &Node, target: u64, timeout: Duration) -> u
 }
 
 /// Publish a real (fake-content) snapshot file at `pos`, then drive the node's
-/// purge machinery exactly as `purge_safety.rs` does (write the cnc marker
-/// directly), and wait for `archive_first_base` to advance.
+/// purge machinery exactly as `purge_safety.rs` does (write the fake
+/// service's OWN slot marker — since M14a Task 5 the consensus agent is the
+/// single writer of page 1's `service_snapshot_pos`, overwriting it every
+/// cycle with `min` over the declared set's slots, so poking page 1 directly
+/// here would be clobbered right back to slot 0's value; writing
+/// `service_slot(0)` is what a real service now does, and the node mirrors it
+/// onto page 1 within a cycle), and wait for `archive_first_base` to advance.
 fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: u64) {
-    let store = SnapshotStore::open(dir).expect("open snapshot store");
+    let store = SnapshotStore::open(dir, 0).expect("open snapshot store");
     store.publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?)).expect("publish snapshot");
     let cnc = open_cnc(dir, app);
     let before = node.archive_first_base();
@@ -200,7 +208,7 @@ fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: 
         "test setup: snapshot pos {pos} is within one segment of the floor {before} — \
          nothing below it is purgeable"
     );
-    cnc.snapshots().service_snapshot_pos.store_release(pos);
+    cnc.service_slot(0).snapshot_pos.store_release(pos);
     wait_until("purge advanced the floor", || node.archive_first_base() > before || pos == 0);
 }
 
@@ -476,7 +484,7 @@ fn ordered_backup_survives_a_purge_racing_the_copy() {
     }
 
     let cnc = open_cnc(&dir, app);
-    let store = SnapshotStore::open(&dir).expect("open snapshot store");
+    let store = SnapshotStore::open(&dir, 0).expect("open snapshot store");
 
     std::thread::scope(|scope| {
         let _guard = StopOnDrop(&stop);
@@ -499,7 +507,7 @@ fn ordered_backup_survives_a_purge_racing_the_copy() {
                     if durable > SEG_BYTES {
                         let pos = durable.saturating_sub(SEG_BYTES / 2).max(1);
                         if store.publish(pos, |w| Ok(w.write_all(b"race-snapshot")?)).is_ok() {
-                            cnc.snapshots().service_snapshot_pos.store_release(pos);
+                            cnc.service_slot(0).snapshot_pos.store_release(pos);
                         }
                     }
                 }

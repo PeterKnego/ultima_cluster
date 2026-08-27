@@ -1445,6 +1445,7 @@ name = "uc2_service"
 version = "2.7.0"
 dependencies = [
  "bincode",
+ "fs2",
  "serde",
  "tempfile",
  "thiserror",

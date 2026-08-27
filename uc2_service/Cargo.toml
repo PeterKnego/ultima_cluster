@@ -33,6 +33,9 @@ ultima-db = { workspace = true, optional = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
+# M14a: `service.<id>.lock` — one process per declared FSM slot, same pattern
+# as the node's `instance.lock` (uc2_node/src/ipc.rs).
+fs2 = { workspace = true }
 # Task 12 (OutputHandler): the output agent's own `current_thread` runtime.
 # `rt` (thread scheduling / block_on) + `time` (a handler's own `tokio::time`
 # use inside `on_committed`) ONLY — no multi-thread runtime, no macros, no I/O

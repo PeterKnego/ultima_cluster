@@ -108,7 +108,7 @@ mod tests {
         let busy = Arc::new(AtomicBool::new(false));
         let st = BuilderState {
             rx,
-            store: SnapshotStore::open(dir).unwrap(),
+            store: SnapshotStore::open(dir, 0).unwrap(),
             cnc: page(),
             busy: Arc::clone(&busy),
             service_id: 0,
@@ -140,7 +140,7 @@ mod tests {
         assert_eq!(cnc.service_slot(0).snapshot_pos.load_acquire(), 4096);
         assert!(!busy.load(Ordering::Acquire), "busy cleared after completion");
 
-        let store = SnapshotStore::open(dir.path()).unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
         let (pos, path) = store.newest(u64::MAX).unwrap().unwrap();
         assert_eq!(pos, 4096);
         assert_eq!(std::fs::read(path).unwrap(), b"snapshot-bytes");

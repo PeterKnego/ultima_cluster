@@ -98,6 +98,15 @@ pub enum ServiceError {
          machine cannot install a covering snapshot"
     )]
     SnapshotRequired { needed: u64, first_available: u64 },
+    /// M14a: `service_id` is not in the node's declared set (cnc 4032).
+    #[error(
+        "service id {id} is not declared on this node (declared set 0b{declared:b}); \
+         fix [services] ids on the node or --service-id on the service"
+    )]
+    ServiceNotDeclared { id: u8, declared: u64 },
+    /// M14a: another live process holds `service.<id>.lock`.
+    #[error("another process already holds service id {id} on this instance dir (service.{id}.lock)")]
+    AlreadyAttached { id: u8 },
 }
 
 /// Why a [`SnapshotStateMachine`](crate::SnapshotStateMachine) freeze/stream/

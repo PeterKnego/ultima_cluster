@@ -45,9 +45,9 @@ pub struct SnapshotStore {
 }
 
 impl SnapshotStore {
-    /// Open (creating if absent) the snapshot directory under `instance_dir`.
-    pub fn open(instance_dir: &Path) -> io::Result<SnapshotStore> {
-        let dir = instance_dir.join(DIR_NAME);
+    /// Open (creating if absent) `snapshots/<service_id>/` under `instance_dir`.
+    pub fn open(instance_dir: &Path, service_id: u8) -> io::Result<SnapshotStore> {
+        let dir = instance_dir.join(DIR_NAME).join(service_id.to_string());
         std::fs::create_dir_all(&dir)?;
         Ok(SnapshotStore { dir })
     }
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn publish_creates_the_pinned_file_name_and_newest_finds_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(dir.path()).unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
         let path = store.publish(4096, ok_write(b"hello")).unwrap();
         assert_eq!(path, store.path_for(4096));
         assert!(path.ends_with("snap-4096.ultsnap"));
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn a_failed_write_never_becomes_newest_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(dir.path()).unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
         let result = store.publish(100, |w| {
             w.write_all(b"partial").ok();
             Err(SnapshotError::Codec("boom".into()))
@@ -191,7 +191,7 @@ mod tests {
         assert!(store.newest(u64::MAX).unwrap().is_none(), "a torn build is never `newest`");
         assert!(!store.path_for(100).exists(), "final name was never created");
         // No leftover temp file either (best-effort cleanup on failure).
-        let entries: Vec<_> = std::fs::read_dir(dir.path().join("snapshots"))
+        let entries: Vec<_> = std::fs::read_dir(dir.path().join("snapshots").join("0"))
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
@@ -205,8 +205,8 @@ mod tests {
     #[test]
     fn a_bare_temp_file_on_disk_is_never_newest() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(dir.path()).unwrap();
-        std::fs::write(dir.path().join("snapshots").join("snap-500.ultsnap.tmp"), b"torn").unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
+        std::fs::write(dir.path().join("snapshots").join("0").join("snap-500.ultsnap.tmp"), b"torn").unwrap();
         assert!(store.newest(u64::MAX).unwrap().is_none());
         assert!(store.newest(500).unwrap().is_none());
     }
@@ -214,11 +214,11 @@ mod tests {
     #[test]
     fn retention_keeps_only_the_newest_two() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(dir.path()).unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
         for pos in [100u64, 200, 300, 400] {
             store.publish(pos, ok_write(b"x")).unwrap();
         }
-        let mut remaining: Vec<u64> = std::fs::read_dir(dir.path().join("snapshots"))
+        let mut remaining: Vec<u64> = std::fs::read_dir(dir.path().join("snapshots").join("0"))
             .unwrap()
             .filter_map(|e| e.ok())
             .filter_map(|e| parse_snap_pos(&e.file_name().to_string_lossy()))
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn newest_at_most_picks_correctly_among_a_sparse_set() {
         let dir = tempfile::tempdir().unwrap();
-        let store = SnapshotStore::open(dir.path()).unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
         store.publish(100, ok_write(b"a")).unwrap();
         store.publish(900, ok_write(b"b")).unwrap();
 
@@ -246,10 +246,10 @@ mod tests {
     fn open_creates_the_directory_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!dir.path().join("snapshots").exists());
-        let _store = SnapshotStore::open(dir.path()).unwrap();
-        assert!(dir.path().join("snapshots").is_dir());
+        let _store = SnapshotStore::open(dir.path(), 3).unwrap();
+        assert!(dir.path().join("snapshots").join("3").is_dir());
         // Reopening (e.g. a fresh service incarnation attaching again) must
         // not fail on an already-existing directory.
-        let _store2 = SnapshotStore::open(dir.path()).unwrap();
+        let _store2 = SnapshotStore::open(dir.path(), 3).unwrap();
     }
 }

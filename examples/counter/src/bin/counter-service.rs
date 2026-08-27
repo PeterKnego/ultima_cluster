@@ -28,6 +28,9 @@ struct Args {
     /// How long to wait for the node's control page to appear.
     #[arg(long, default_value_t = 30)]
     wait_secs: u64,
+    /// Which declared FSM slot this process is (see [services] ids).
+    #[arg(long, default_value_t = 0)]
+    service_id: u8,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,9 +50,9 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id);
+    let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id).service_id(args.service_id);
     let service = ServiceBuilder::new(cfg, CounterSm::default()).start()?;
-    println!("service attached at {}", args.instance_dir.display());
+    println!("service {} attached at {}", args.service_id, args.instance_dir.display());
 
     // The template every service binary should copy: a signal flag, a poll
     // loop that supervises the apply agent, and an explicit stop. A service

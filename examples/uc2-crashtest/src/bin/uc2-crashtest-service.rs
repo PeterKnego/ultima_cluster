@@ -35,6 +35,9 @@ struct Args {
     /// replicated contract (see `uc2_service::session`).
     #[arg(long, default_value_t = false)]
     sessioned: bool,
+    /// Which declared FSM slot this process is (see [services] ids).
+    #[arg(long, default_value_t = 0)]
+    service_id: u8,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +50,9 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let cfg = ServiceConfig::new(args.instance_dir, args.app_id);
+    let service_id = args.service_id;
+    let instance_dir = args.instance_dir.clone();
+    let cfg = ServiceConfig::new(args.instance_dir, args.app_id).service_id(service_id);
     // Two separate `start()` calls rather than one over a boxed SM: the
     // builder is generic over the state machine and `Service<S>` carries `S`
     // in its type, so the branch has to happen here. Both arms park forever
@@ -56,9 +61,11 @@ fn main() -> anyhow::Result<()> {
         let _svc =
             ServiceBuilder::new(cfg, Sessioned::new(RegisterSm::default(), SessionConfig::default()))
                 .start()?;
+        println!("service {} attached at {}", service_id, instance_dir.display());
         park_forever();
     } else {
         let _svc = ServiceBuilder::new(cfg, RegisterSm::default()).start()?;
+        println!("service {} attached at {}", service_id, instance_dir.display());
         park_forever();
     }
 }
