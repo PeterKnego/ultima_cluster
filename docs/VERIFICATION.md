@@ -527,6 +527,14 @@ If an arm misses, the document records an honest FAIL and the real number, and
 the bar does not move. Git history is the audit trail — the decide rule and the
 result are separate commits, in that order.
 
+Below the gates sit the **hop-isolation harnesses** — `uc2_gateway/examples/hop_bench`
+(client, edge and node hops with stand-ins at their boundaries) and
+`uc2_node/examples/apply_bench` (the FSM's apply loop alone, driven by a fake
+node) — which produce ratios and ladders, never gated numbers: a dev-box
+figure is smoke. Their worked examples are `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`
+and `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the latter found and
+fixed lockstep's 50 µs-sleep throttle the day M14a merged).
+
 ---
 
 ## 10. Continuous integration

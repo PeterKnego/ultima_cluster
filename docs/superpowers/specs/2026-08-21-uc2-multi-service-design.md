@@ -266,6 +266,8 @@ leader's admission door enforces the barrier before a frame is even appended
 must therefore sample the `fsm_lag` bound on the **leader only**; sampling it
 on a follower mid-replay is expected to (harmlessly) trip.
 
+**As-built errata (M14a, lockstep wait):** under lockstep the `Wait` is served out of line by `lockstep_wait` — spin re-planning, then yield (with a heartbeat refresh), and only then the agent's 50 µs sleep — because a lockstep FSM that sleeps on a live sibling stalls every sibling's next frame and the set cascades into sleeping in lockstep (measured 18 k frames/s before, 631 k after at N=2). A bounded `Wait` still goes straight to the sleep: it is `fsm_lag` bytes ahead of the slowest FSM, and spinning on that FSM's `applied` line slows it (−6 % at N=8 when tried). `lag_waits` counts ladder exhaustions (a stalled or dead sibling), not ladder spins.
+
 Everything else in the loop is unchanged: `apply(position, cmd)` per frame,
 `slot[id].applied.store_release(...)` after the frame, `Overrun` → journal
 replay → rejoin.
@@ -638,7 +640,7 @@ FSM-kill time-to-recover ≤ 15 s (M9's bar); lockstep cost measured and
 | risk | mitigation |
 |---|---|
 | Q interacts with flow control / leader-side heuristics in a way the design missed | the sim scenario + `lin_partition_v2` with two FSMs; explicit plan check item (§5.3) before code |
-| Lockstep barrier cost across processes | measured on the fleet; lockstep is opt-in, bounded is the default |
+| Lockstep barrier cost across processes | measured in isolation the day M14a merged (`uc2_node/examples/apply_bench`, `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`): the first implementation slept 50 µs on every wait (18 k frames/s); the shipped `lockstep_wait` ladder never sleeps on a live sibling (631 k / 583 k / 458 k frames/s at N = 2 / 4 / 8 on the dev box, bounded unaffected); the remaining ~1.6 µs/frame is the N-way cross-core handshake and is what the fleet row measures; lockstep is opt-in, bounded is the default |
 | Per-service egress rings multiply client polling work | N ≤ 8; the engine already polls two rings; measured in the M5-style smoke |
 | cnc flag day surprises operators | named refusals on version mismatch (already in place); the M12 `how-to/upgrade-a-cluster.md` already has the exact same-host procedure ("Ring format change in 2.7.0: restart a host's processes together", written for `ULTRNG2`) — this release adds a cnc-3.0 section in the same shape plus the wire-0.6.0 whole-cluster step; `RELEASES.md` section per the CLAUDE.md release rule; `run-a-cluster.md` gets the declared-set-before-purge rule (§8) |
 | M11 backup silently drops per-FSM snapshot dirs if §7.5 is missed in the plan | the backup round-trip test (§12) is written **before** the `snapshots/<id>/` move lands, so it fails red on the flat copier first |

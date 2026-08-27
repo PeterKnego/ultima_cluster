@@ -291,7 +291,21 @@ null end-to-end. Two refinements from M13:
   inside the envelope) proved it was an ingress-ring publish convoy —
   "consistent with the symptom" is not "the cause."
 
-Harness model: `uc2_gateway/examples/hop_bench`; worked example
+Two more from M14a's apply-hop isolation (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`):
+
+- **Code in a hot loop's body costs even on paths that never run.** A wait
+  ladder added inline to the apply loop's `Wait` arm cost 9 % at N=1 — a path
+  N=1 never executes — through codegen alone; out of line it cost 1.5 %.
+  A/B the *exact binaries* back to back on an idle box before attributing a
+  delta to the change's semantics, and keep the hot body small.
+- **A barrier wait must never sleep on a live peer.** One lockstep FSM in a
+  50 µs sleep stalls every sibling's next frame, their ladders exhaust, and
+  the set cascades into sleeping in lockstep (18 k frames/s); the yield budget
+  has to exceed *any* plausible handshake, not the common one, and spinning
+  on a slow peer's line only slows that peer (−6 % bounded at N=8).
+
+Harness models: `uc2_gateway/examples/hop_bench` (client/edge/node hops),
+`uc2_node/examples/apply_bench` (the FSM hop alone); worked example
 `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`; the convoy mechanism
 `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md`.
 

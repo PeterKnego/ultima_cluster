@@ -276,6 +276,8 @@ A declared id with no process attached is not merely idle: once the log runs
 until that id catches up or reattaches — so a missing service process for a
 declared id is an outage, not a degraded FSM.
 
+Prefer the bounded policy (the default). `"lockstep"` is correct and supported but pays an N-way handshake on every frame — on the dev box ~600 k frames/s per FSM against ~22 M bounded — and a stalled FSM under lockstep costs each of its siblings a core while they wait (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
+
 If you are starting nodes over SSH, do not background with `ssh host 'cmd &'` —
 the busy-spin threads hold the pipe open and the SSH session hangs. Use
 `systemd-run`, or `setsid` with redirected stdio.

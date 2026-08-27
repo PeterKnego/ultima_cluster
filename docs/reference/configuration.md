@@ -87,7 +87,7 @@ for the operational picture and the M14a snapshot-transfer limitation.
 | Key | Default | Meaning |
 |---|---|---|
 | `ids` | `[0]` | The declared service ids, each `0..8`. Must include `0` (the default responder and the only FSM the remote path reaches). |
-| `fsm_lag` | `buffer_bytes / 4` | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB|MiB|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). |
+| `fsm_lag` | `buffer_bytes / 4` | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB|MiB|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). Lockstep costs an N-way cross-core handshake per frame — ~1.6 µs at N=2 on the dev box, i.e. ~600 k frames/s per FSM against ~22 M bounded (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`) — and while a sibling is stalled or dead every other FSM burns ≈ a core yielding on it. |
 
 ## Startup refusals
 
