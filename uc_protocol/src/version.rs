@@ -39,10 +39,11 @@ impl ProtocolVersion {
 // `CNC_V2_VERSION` u32 (that module is `core`-only, so it re-spells the
 // same-major / peer-minor-not-newer rule directly rather than depend on this
 // type). The two version lines are INDEPENDENT, not lockstep: `CNC_V2_VERSION`
-// gates the cnc shmem page format at local IPC attach and has its own history
-// (stuck at major=2/minor=0 since M5 while `CURRENT` moved 0.1.0 through
-// 0.4.0); `CURRENT` documents the semver of the wire *datagram* protocol but
-// does not itself enforce anything.
+// gates the cnc shmem page format at local IPC attach. `CNC_V2_VERSION` moved
+// 2.0 → 3.0 in M14a (page grew to 8 KiB); the two version lines remain
+// independent — that bump did not touch this constant. `CURRENT` documents
+// the semver of the wire *datagram* protocol but does not itself enforce
+// anything.
 // 0.5.0: content-attested durable reports — `DGRAM_KIND_APPEND_POSITION`
 // gains an 8-byte body carrying the term the sender attributes to the byte
 // below its reported position (`AppendPositionBody`, datagram.rs). The 16-byte

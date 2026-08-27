@@ -2,10 +2,10 @@
 // Copyright 2026 Peter Knego
 
 //! `cnc.dat` v2 page layout (M5 spec §7-ish; see
-//! docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md). One
-//! fixed-size 4 KiB page shared node/service/clients, replacing the M1-M4
-//! heap-side `LogCounters` with an mmap'd layout so every process sees the
-//! same atomics.
+//! docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md). Two
+//! 4 KiB pages (8 KiB) since cnc 3.0, shared node/service/clients, replacing
+//! the M1-M4 heap-side `LogCounters` with an mmap'd layout so every process
+//! sees the same atomics.
 //!
 //! Layout (byte offsets):
 //!
@@ -15,6 +15,8 @@
 //! 256   LogCounters   (append, durable, sent, commit)       4 × 64 B lines
 //! 512   ServiceProgress (service_applied, service_epoch,
 //!                        output_completed)                  3 × 64 B lines
+//!                        (node-written aggregates since 3.0: min over
+//!                        declared ids; service_epoch retired at 0)
 //! 704   NodeStatusV2  (term, flags, leader_hint,
 //!                      node_heartbeat_ns, service_heartbeat_ns,
 //!                      output_progress, next_client_id)     7 × 64 B lines
@@ -27,7 +29,9 @@
 //!       free_disk_bytes (each field's own doc comment below pins its exact
 //!       offset and "next free" note — this line is deliberately not kept
 //!       byte-exact, to stop it drifting stale again as fields land)
-//! 4032..4096  reserved (zero)
+//! 4032  services_declared / fsm_lag_bytes (node, boot-once)
+//! 4096  ServiceSlot[8] (per service: status, applied, epoch, output_completed,
+//!       snapshot_pos, heartbeat_ns, lag_waits, reserved) 8 × 512 B
 //! ```
 //!
 //! **crc split (deliberate):** this module is `core`-only (no_std-friendly —
@@ -42,11 +46,16 @@
 
 /// Magic bytes at the start of every v2 cnc page.
 pub const CNC_MAGIC: &[u8; 8] = b"UC2CNC\0\0";
-/// Fixed total page size — one page, shared node/service/clients.
-pub const CNC_PAGE_LEN: usize = 4096;
+/// Two 4 KiB pages since M14a (cnc 3.0): page 1 is the M1–M13 layout
+/// unchanged, page 2 is the per-service slot band (`CNC_OFF_SERVICE_SLOTS`).
+pub const CNC_PAGE_LEN: usize = 8192;
 /// Packed like `uc_protocol::ProtocolVersion`: `(major << 24) | (minor << 16) | patch`.
+/// 3.0 (M14a): the page grew to two 4 KiB pages, the singular service band on
+/// page 1 became node-written aggregates, and `MSG_V2_QUERY` gained a
+/// service-id prefix (M14b) — a 2.0 party would misread all three, so it is a
+/// major bump: every same-host attacher refuses the other side's page.
 #[allow(clippy::identity_op)] // (0 << 16) spells out the packing explicitly (minor = 0)
-pub const CNC_V2_VERSION: u32 = (2 << 24) | (0 << 16);
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (0 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -227,6 +236,55 @@ pub const CNC_OFF_QUERY_HOLES_SKIPPED: usize = 3976;
 const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_PAGE_LEN);
 const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED == CNC_OFF_INGRESS_HOLES_SKIPPED + 8);
 
+// M14a: the boot-once pair on page 1's last line. Both are written ONCE by
+// the node at startup (`Node::start_with`, before any agent runs) and read
+// by every attaching service and client, which take the declared set and the
+// lag policy from the PAGE, not from the config file. Two plain `AtomicU64`s
+// sharing one 64-byte line, for the same reason as 3968/3976: one writer,
+// and `PaddedAtomicU64` cannot sit at +8.
+/// Bit `i` set ⇔ service id `i` is declared in this node's `[services] ids`.
+pub const CNC_OFF_SERVICES_DECLARED: usize = 4032;
+const _: () = assert!(CNC_OFF_SERVICES_DECLARED.is_multiple_of(64));
+/// The lag bound in bytes; `0` ⇔ lockstep.
+pub const CNC_OFF_FSM_LAG_BYTES: usize = 4040;
+const _: () = assert!(CNC_OFF_FSM_LAG_BYTES == CNC_OFF_SERVICES_DECLARED + 8);
+const _: () = assert!(CNC_OFF_SERVICES_DECLARED + 64 == 4096, "page 1 is exactly full");
+
+// M14a: page 2 — `ServiceSlot[CNC_MAX_SERVICES]`. One slot per service id,
+// fixed 512 B stride (eight 64 B lines), ONE WRITER PER LINE — every line is
+// written by one agent of the service process that owns the slot, except the
+// reserved line 7. Per-slot layout (offsets relative to the slot base):
+//   +0   status          u64 = service_id (bits 0..8) | attached (bit 8)
+//                              | incarnation (bits 32..64)    writer: service (attach/detach)
+//   +64  applied         u64 position                          writer: service apply agent
+//   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
+//   +192 output_completed u64 position                         writer: service output agent
+//   +256 snapshot_pos    u64 position                          writer: service builder agent
+//   +320 heartbeat_ns    u64 unix ns                           writer: service apply agent
+//   +384 lag_waits       u64 count                             writer: service apply agent
+//   +448 reserved (zero)
+pub const CNC_OFF_SERVICE_SLOTS: usize = 4096;
+pub const CNC_SERVICE_SLOT_STRIDE: usize = 512;
+pub const CNC_MAX_SERVICES: usize = 8;
+pub const CNC_SVC_OFF_STATUS: usize = 0;
+pub const CNC_SVC_OFF_APPLIED: usize = 64;
+pub const CNC_SVC_OFF_EPOCH: usize = 128;
+pub const CNC_SVC_OFF_OUTPUT_COMPLETED: usize = 192;
+pub const CNC_SVC_OFF_SNAPSHOT_POS: usize = 256;
+pub const CNC_SVC_OFF_HEARTBEAT_NS: usize = 320;
+pub const CNC_SVC_OFF_LAG_WAITS: usize = 384;
+pub const CNC_SVC_OFF_RESERVED: usize = 448;
+/// `status` bit 8: the owning service process is attached (cleared on a clean
+/// detach; a crashed service leaves it set and its heartbeat ages instead).
+pub const CNC_SVC_STATUS_ATTACHED: u64 = 1 << 8;
+/// `status` bits 32..64: the attach count of this id on this page (bumped
+/// per attach, so a restart is visible even before the epoch is read).
+pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
+const _: () = assert!(
+    CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE <= CNC_PAGE_LEN,
+    "service-slot band overruns the cnc page"
+);
+
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
 
@@ -390,8 +448,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (2<<24)|(0<<16) = 0x0200_0000 -> LE [0,0,0,2]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x00, 0x02]);
+        // version = (3<<24)|(0<<16) = 0x0300_0000 -> LE [0,0,0,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x00, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -564,7 +622,31 @@ mod tests {
         // Both counters live inside the one 64-byte line starting at 3968...
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED % 64, 0);
         const { assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
-        // ...and 4032..4096 is still reserved and free (module doc line 30).
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
+        // M14a: the last page-1 line is the boot-once pair the node writes at
+        // startup — services_declared and fsm_lag_bytes share it exactly as the
+        // M13 holes pair shares 3968 (one writer, two plain AtomicU64s).
+        assert_eq!(CNC_OFF_SERVICES_DECLARED, 4032);
+        assert_eq!(CNC_OFF_SERVICES_DECLARED % 64, 0);
+        assert_eq!(CNC_OFF_FSM_LAG_BYTES, 4040);
+        assert_eq!(CNC_OFF_FSM_LAG_BYTES - CNC_OFF_SERVICES_DECLARED, 8);
+        const { assert!(CNC_OFF_FSM_LAG_BYTES + 8 <= CNC_OFF_SERVICES_DECLARED + 64) };
+        // Page 1 is now FULL: the pair's line ends exactly where page 2 starts.
+        assert_eq!(CNC_OFF_SERVICES_DECLARED + 64, 4096);
+        // M14a: page 2 = ServiceSlot[8], 512 B stride, eight 64 B lines each.
+        assert_eq!(CNC_OFF_SERVICE_SLOTS, 4096);
+        assert_eq!(CNC_SERVICE_SLOT_STRIDE, 512);
+        assert_eq!(CNC_MAX_SERVICES, 8);
+        assert_eq!(CNC_SVC_OFF_STATUS, 0);
+        assert_eq!(CNC_SVC_OFF_APPLIED, 64);
+        assert_eq!(CNC_SVC_OFF_EPOCH, 128);
+        assert_eq!(CNC_SVC_OFF_OUTPUT_COMPLETED, 192);
+        assert_eq!(CNC_SVC_OFF_SNAPSHOT_POS, 256);
+        assert_eq!(CNC_SVC_OFF_HEARTBEAT_NS, 320);
+        assert_eq!(CNC_SVC_OFF_LAG_WAITS, 384);
+        assert_eq!(CNC_SVC_OFF_RESERVED, 448);
+        assert_eq!(CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE, 8192);
+        assert_eq!(CNC_PAGE_LEN, 8192);
+        assert_eq!(CNC_SVC_STATUS_ATTACHED, 1 << 8);
     }
 }
