@@ -103,7 +103,9 @@ verify rather than a build:
 ## Look-up
 
 - [Instance directory](../reference/instance-directory.md) — every file, its
-  owner, and its durability class. *Was §1.*
+  owner, and its durability class, including the per-declared-FSM files since
+  M14 (`svc_query.<id>.ring`, `egress_service.<id>.broadcast`,
+  `service.<id>.lock`, `snapshots/<id>/`). *Was §1.*
 - [The cnc control page](../reference/cnc-page.md) — the pinned layout, field by
   field. *Was §3's field tables.*
 - [`uc2ctl`](../reference/uc2ctl.md) — sub-commands, arguments, response

@@ -212,6 +212,24 @@ attaches *outside* those units, most often a long-lived embedded client.
 The rings are volatile (recreated at boot), so there is nothing to migrate
 and no rollback step beyond restarting the old binaries together.
 
+## Control-page change in 2.8.0: restart a host's processes together
+
+M14 grows `cnc2.dat` from 4 KiB to 8 KiB and bumps its version to 3.0. Every
+same-host party — the node, each service, every client, `uc2ctl`, the gateway
+— refuses a page whose major version differs, by name (`VersionMismatch`),
+so a 2.7 service cannot attach to a 2.8 node or vice-versa. This is a
+**same-host** flag day, not a cluster-wide one: the node↔node wire stays 0.5.0
+in 2.8.0, so hosts can be upgraded one at a time. On each host:
+
+1. stop the clients, the gateway, then the services, then the node;
+2. swap binaries;
+3. start the node (it re-creates the page and unlinks the old singular ring
+   names), then the services with their `--service-id`, then the clients.
+
+The instance directory's journal, state and snapshots are reused as-is. If
+`[services]` is absent, the node declares FSM 0 only and behaves exactly as
+before, except that a service must now attach as id 0 (the default).
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)

@@ -10,11 +10,13 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.4.0` |
+| `version::CURRENT` | `0.5.0` |
+| cnc page version | 3.0 (M14: 8 KiB page) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
-independent of this one. Wire protocol 0.4.0 changed the UDP datagram format;
-it did not change the cnc page layout.
+independent of this one. cnc 3.0 changed the same-host shmem layout only;
+the UDP datagram format is unchanged at 0.5.0 — the two version lines are
+independent (M14c bumps the wire to 0.6.0 for `SNAP_BEGIN`).
 
 `app_id`, `instance_id`, and the protocol version are checked at every IPC
 entry point. A mismatched `app_id` means the wrong cluster; a changed

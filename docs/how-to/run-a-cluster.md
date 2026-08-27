@@ -153,6 +153,16 @@ durable config record owns membership, and a restart with an edited `members`
 list has no effect. To change membership on a running cluster, use `uc2ctl` —
 see [Change cluster membership](change-cluster-membership.md).
 
+`[services]` (M14) declares which state-machine processes this node hosts —
+absent means `ids = [0]` only. **The set is static and must be identical on
+every node** — it is not a live-reconfiguration surface the way `members` is.
+An id may only be **added** while the journal is intact from position 0
+(purge disabled, or never fired): a new FSM rebuilds from genesis, and no
+sibling's snapshot can stand in for it because it is a different state
+machine. Add an id to a cluster with a purged prefix and the new id fails its
+attach with `SnapshotRequired` — and, being declared, it holds admission
+closed cluster-wide until the set is put back the way it was (spec §8).
+
 ## Open the network path between the nodes
 
 Node-to-node replication is UDP on the `bind` port. Every node's port must be
@@ -181,9 +191,12 @@ the test-only override never silences the warning.
 
 The directory also needs free space **before** the node starts, not as it
 fills: the node reserves its memory-mapped files on disk at boot — the log
-buffer (`buffer_bytes`, 64 MiB by default) plus about 14 MiB of IPC rings, so
-roughly 78 MiB at the defaults, and the journal grows on top of that. A node
-that cannot reserve it refuses to start and says so:
+buffer (`buffer_bytes`, 64 MiB by default) plus 14 MiB of IPC rings plus 5 MiB
+per declared `[services]` id beyond the first, so roughly 78 MiB at the
+defaults with one FSM and ~113 MiB with eight, and the journal grows on top
+of that. See [Instance directory](../reference/instance-directory.md#limits)
+for the exact formula. A node that cannot reserve it refuses to start and
+says so:
 
 ```
 uc2-node: failed to start node 0: io: No space left on device (os error 28)
@@ -252,6 +265,13 @@ The service half is your own binary; supervise it with
 stop together and in the right order. See
 [Write a service binary](write-a-service-binary.md) for the signal handling it
 must implement.
+
+Since M14, run **one service process per declared `[services]` id**, each
+started with its own `--service-id`, and supervise all of them the same way.
+A declared id with no process attached is not merely idle: once the log runs
+`fsm_lag` bytes ahead of it, the leader's admission door closes cluster-wide
+until that id catches up or reattaches — so a missing service process for a
+declared id is an outage, not a degraded FSM.
 
 If you are starting nodes over SSH, do not background with `ssh host 'cmd &'` —
 the busy-spin threads hold the pipe open and the SSH session hangs. Use
