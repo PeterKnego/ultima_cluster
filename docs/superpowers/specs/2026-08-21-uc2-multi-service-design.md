@@ -252,6 +252,20 @@ FSMs *a*, *b*: `applied_a − applied_b ≤ fsm_lag` (bounded) or
 `applied_a − applied_b ≤ one frame` (lockstep). Under lockstep, `min(applied)
 ≥ frame end` is exactly "every FSM's response for this command exists".
 
+**As-built errata (M14a):** the invariant above is a target cap on *live*
+apply and does not cover journal replay. On a FOLLOWER whose FSM *k* is stuck
+(slow SM, or itself mid-replay) while the cluster's quorum keeps committing, a
+sibling FSM *j* that falls off the live ring (`Overrun`) rejoins via
+`replay_into` to the archived frontier — not to `applied_k + fsm_lag` — so
+`applied_j − applied_k` may exceed `fsm_lag` on that follower for as long as
+the replay takes. This is safe (applying more of an already-committed log is
+always sound; responses are leader-only, so a follower's over-eager FSM
+publishes nothing early) and it is bounded on the leader itself, because the
+leader's admission door enforces the barrier before a frame is even appended
+— so the leader's own FSMs never see this excursion. The M14c slow-FSM oracle
+must therefore sample the `fsm_lag` bound on the **leader only**; sampling it
+on a follower mid-replay is expected to (harmlessly) trip.
+
 Everything else in the loop is unchanged: `apply(position, cmd)` per frame,
 `slot[id].applied.store_release(...)` after the frame, `Overrun` → journal
 replay → rejoin.

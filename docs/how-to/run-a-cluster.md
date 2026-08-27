@@ -162,6 +162,9 @@ sibling's snapshot can stand in for it because it is a different state
 machine. Add an id to a cluster with a purged prefix and the new id fails its
 attach with `SnapshotRequired` — and, being declared, it holds admission
 closed cluster-wide until the set is put back the way it was (spec §8).
+With more than one declared id and purge enabled, a learner joining below the
+purge floor also has a real gap in M14a — see the note in
+[Change cluster membership](change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously).
 
 ## Open the network path between the nodes
 

@@ -23,13 +23,14 @@ Two properties are worth stating because they change how mistakes surface:
   [startup refusals](#startup-refusals) runs against the loaded config before
   the first agent is spawned.
 
-Field names match the `NodeConfig` fields below. Three differ in shape:
+Field names match the `NodeConfig` fields below. Four differ in shape:
 
 | TOML | Maps to |
 |---|---|
 | `[[members]]` / `[[learners]]` tables of `id` + `addr` | `Vec<(NodeId, SocketAddr)>` |
 | `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
 | `[crypto]` with `enabled` (required), `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` | `CryptoConfig` |
+| `[services]` with `ids`, `fsm_lag` (a string) — absent means `ids = [0]` | `ServicesConfig` |
 
 Two keys exist only in the file and have no `NodeConfig` field:
 
@@ -74,6 +75,20 @@ For the full series contract, the alert rules, the dashboard, and the
 structured-event vocabulary, see
 [Monitor a cluster](../how-to/monitor-a-cluster.md).
 
+### `[services]`
+
+M14a: which state-machine processes (FSMs) this node hosts, and how far apart
+they may drift. Optional; **absent means `ids = [0]`** with the default lag
+bound. The set is static and must be identical on every node — it is not a
+live-reconfiguration surface the way `members` is. See
+[Write one config file per host](../how-to/run-a-cluster.md#write-one-config-file-per-host)
+for the operational picture and the M14a snapshot-transfer limitation.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ids` | `[0]` | The declared service ids, each `0..8`. Must include `0` (the default responder and the only FSM the remote path reaches). |
+| `fsm_lag` | `buffer_bytes / 4` | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB|MiB|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). |
+
 ## Startup refusals
 
 `uc2-node` refuses to start, naming the field, rather than failing later in a
@@ -95,6 +110,12 @@ replaces:
 | unknown keys inside `[log]`/`[metrics]` are refused, by name, like every other section | M9 accepted anything inside these two sections unvalidated; M10 defines their schema, so a typo there is now caught the same way as everywhere else. |
 | `[crypto]` section must be present | M12b (spec §3.3): `enabled` is an **explicit choice**, not absent-means-off like `[purge]` — an absent section is `ConfigError::CryptoChoiceRequired`, so a `node.toml` cannot silently run cleartext by omission. `enabled = false` must not also carry `key_path`/`allowlist_path`; `enabled = true` requires both. |
 | `[admin]` section must be present | M12b (spec §3.3, §5.1): `auth` is likewise an explicit choice — an absent section is `ConfigError::AdminChoiceRequired`. `auth = "hmac"` requires at least one uniquely-named entry in `keys`; `auth = "none"` requires `keys` to be empty; `request_ttl_ms` (default 30000) must be `>= 1000` under either mode. |
+| `services.ids` must not be empty | M14a: an explicitly-empty list would leave no FSM (not even 0) declared; omit `[services]` entirely for the default `[0]` instead. |
+| `services.ids` must not contain a duplicate id | M14a: a repeated id would double-count (or alias) one FSM's slot. |
+| `services.ids` entries must be `< 8` | M14a: the cnc page's per-service band holds 8 slots. |
+| `services.ids` must include `0` | M14a: FSM 0 is the default responder and the only FSM the remote path reaches; a set without it can never answer a remote client. |
+| `services.fsm_lag` must parse | M14a: an unparsable string (wrong suffix, spaces, a fraction) is refused by name rather than silently falling back to the default bound. |
+| `services.fsm_lag` must be `> 0` and `< buffer_bytes / 2` | M14a: `0` is the page's lockstep sentinel (write `"lockstep"` instead), and a bound at or above half the buffer cannot provably keep every FSM on the ring (the other half is the appender's overrun margin plus the leader's admission window). |
 
 The RAM-backed-filesystem refusal has two override channels, and **neither is
 silent** — the override suppresses the refusal, never the notice, and the

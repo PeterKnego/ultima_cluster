@@ -119,6 +119,15 @@ If your deployment has meaningful sustained write load, turn on snapshots and
 purging first so each new learner converges by snapshot install plus tail
 replay: [Keep the journal from growing without bound](bound-journal-growth.md).
 
+**M14a limitation:** a snapshot session ships FSM 0's artifact only. On a node
+declaring more than one service id (`[services]` with `ids` beyond `[0]`), a
+learner joining a cluster whose journal prefix has already been purged cannot
+rebuild FSM 1..N-1 below the floor — its `min_applied` stays pinned at 0, its
+report ceiling stays pinned at `fsm_lag`, and it can neither converge nor pass
+the `promote` catch-up check. This is fixed in M14c, which ships per-FSM
+snapshot artifacts. With purge disabled (the default), a learner replays from
+genesis instead and is unaffected.
+
 ## Add a voter
 
 Two independent changes, in order.

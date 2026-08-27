@@ -63,7 +63,7 @@ directory.
 ## The ordering rule, and why it matters
 
 The three directories copy in one fixed order, one fully before the next
-starts: **`journal/` → `state/` → `snapshots/`**. This is not incidental — it
+starts: **`journal/` → `state/` → `snapshots/<id>/`**. This is not incidental — it
 is the entire correctness argument for taking a backup while purge is running
 concurrently underneath it:
 
@@ -74,7 +74,7 @@ concurrently underneath it:
 > happened BEFORE the journal copy. The reverse order can capture a snapshot
 > set from before a purge that the journal copy then reflects: a hole.
 
-Get the order backwards — copy `snapshots/` first, then let a purge run, then
+Get the order backwards — copy `snapshots/<id>/` first, then let a purge run, then
 copy `journal/` — and you can build an artifact whose journal has already lost
 the prefix that only the *old* snapshot set covered. `uc2ctl verify-backup`
 checks for exactly this (the "coverage invariant," below) on every artifact,

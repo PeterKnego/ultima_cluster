@@ -217,9 +217,14 @@ and no rollback step beyond restarting the old binaries together.
 M14 grows `cnc2.dat` from 4 KiB to 8 KiB and bumps its version to 3.0. Every
 same-host party — the node, each service, every client, `uc2ctl`, the gateway
 — refuses a page whose major version differs, by name (`VersionMismatch`),
-so a 2.7 service cannot attach to a 2.8 node or vice-versa. This is a
-**same-host** flag day, not a cluster-wide one: the node↔node wire stays 0.5.0
-in 2.8.0, so hosts can be upgraded one at a time. On each host:
+so a 2.7 service cannot attach to a 2.8 node or vice-versa. This cnc-page
+change is itself **same-host**, not cluster-wide: it needs no coordination
+across hosts by construction. Whether `2.8.0` *also* carries a node↔node wire
+flag day is a separate question, decided by that release's own notes — do not
+assume a per-host upgrade is safe until they say so. (For the record: M14c is
+the milestone that bumps the wire to `0.6.0` for `SNAP_BEGIN`, and that one
+**is** a whole-cluster restart, on the same terms as every prior wire flag
+day.) On each host:
 
 1. stop the clients, the gateway, then the services, then the node;
 2. swap binaries;
