@@ -13,7 +13,9 @@ before you decide which one you need.
 ## What gets copied
 
 `uc2ctl backup` copies exactly the node's **durable** subdirectories —
-`journal/`, `state/`, `snapshots/` — into a fresh artifact directory. It never
+`journal/`, `state/`, `snapshots/<id>/` for every FSM id present — one
+directory per declared service since M14 — filtered to complete
+`snap-<pos>.ultsnap` files — into a fresh artifact directory. It never
 touches `cnc2.dat`, `log.buf`, the ring files, or `instance.lock`: those are
 volatile, and a node's next boot recreates them unconditionally regardless of
 what a backup or restore did. **`audit.jsonl` is not part of the artifact
@@ -43,6 +45,13 @@ snapshot_floor=0
 healed_torn_tail=true
 files=3
 ```
+
+(No `newest_snapshot.<id>=` line prints for an id whose `snapshots/<id>/`
+holds no artifact yet — this example is a fresh node, before any FSM has
+published one. A node with declared FSMs that HAVE snapshotted prints one
+`newest_snapshot.<id>=<pos>` line per such id, between `journal_last_pos` and
+the aggregate `newest_snapshot=` line — see "The `MANIFEST` file" below for
+the full per-id shape.)
 
 (`healed_torn_tail=true` here is the ordinary case, not a sign of trouble —
 see the note under "Verify before you trust it" below.)
@@ -127,12 +136,16 @@ Verify:
    one taken genuinely mid-crash-equivalent append. It is not, by itself, a
    sign anything went wrong.
 2. Opens all five `state/*.state` files read-only.
-3. Lists `snapshots/snap-*.ultsnap` and finds the newest.
-4. Checks the **coverage invariant**: if the journal's `first_base` is above
-   zero, some retained snapshot must cover it (`newest_snapshot >=
-   first_base`). If not, the artifact is unsafe to restore from — an install
-   from it would have a hole below the snapshot floor with nothing to fill
-   it — and `verify-backup` fails with `Hole`.
+3. Lists `snapshots/<id>/snap-*.ultsnap` for every id present and finds the
+   newest per id.
+4. Checks the **coverage invariant** — **per FSM** since M14: for every id
+   whose `snapshots/<id>/` directory exists, if the journal's `first_base` is
+   above zero, that id's own newest retained snapshot must cover it (its
+   `newest_snapshot.<id> >= first_base`). A missing or stale snapshot for any
+   ONE id is a `hole: service <id>` refusal — that FSM alone could not be
+   rebuilt, even if every other declared FSM's snapshot is fine. A purged
+   journal with no `snapshots/` directory at all is FSM 0's hole (the one id
+   every node declares).
 5. If a `MANIFEST` file is present (every `uc2ctl backup` artifact writes
    one), cross-checks its recorded positions against what verify just
    recovered — catching tampering or bitrot at the metadata level. A
@@ -189,10 +202,10 @@ for it):
 
 | Key | Meaning |
 |---|---|
-| `format` | `uc2-backup-v1` |
+| `format` | `uc2-backup-v2` |
 | `journal_first_base` | lowest position still covered by the artifact's journal; `0` = unpurged/empty |
 | `journal_last_pos` | the artifact's recovered durable frontier |
-| `newest_snapshot` | highest `snap-<pos>.ultsnap` position found, or `none` |
+| `newest_snapshot.<id>` | one line for every id `0..8`: highest `snap-<pos>.ultsnap` position found in `snapshots/<id>/`, or `none` |
 | `snapshot_floor` | the durably-persisted snapshot floor from `state/snapshot.state` |
 | `healed_torn_tail` | whether making this artifact healed a torn active-segment tail |
 | `created_unix_ns` | wall-clock creation time |

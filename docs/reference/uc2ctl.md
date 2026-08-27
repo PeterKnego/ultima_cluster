@@ -152,23 +152,25 @@ above. Task walkthroughs: [Back up a cluster](../how-to/back-up-a-cluster.md),
 ### `backup`
 
 Ordered-copy an instance directory's durable `journal/` → `state/` →
-`snapshots/` into a fresh backup artifact, then runs `verify-backup` on the
-copy and writes a `MANIFEST`. Filesystem-only; the node may be running
-throughout.
+`snapshots/<id>/` (one directory per declared FSM id since M14) into a fresh
+backup artifact, then runs `verify-backup` on the copy and writes a
+`MANIFEST`. Filesystem-only; the node may be running throughout.
 
 - `--instance-dir <DIR>` — the node's on-disk instance directory.
 - `--out <DIR>` — destination for the new artifact. Refused if it already
   exists and is non-empty (`ArtifactExists`).
 
 Prints the resulting report as `key=value` lines: `journal_first_base`,
-`journal_last_pos`, `newest_snapshot` (or `none`), `snapshot_floor`,
-`healed_torn_tail`, `files`. Nonzero exit on error.
+`journal_last_pos`, one `newest_snapshot.<id>` (or `none`) line per FSM id
+present, the aggregate `newest_snapshot` (the min over ids present, or
+`none`), `snapshot_floor`, `healed_torn_tail`, `files`. Nonzero exit on error.
 
 ### `verify-backup`
 
 Read-only verification of a backup artifact — recovers its positions, checks
-the coverage invariant (a journal whose `first_base > 0` must be covered by a
-retained snapshot, else `Hole`), and cross-checks a `MANIFEST` if present
+the coverage invariant **per FSM id** present in `snapshots/<id>/` (a journal
+whose `first_base > 0` must be covered by that id's own retained snapshot,
+else `Hole { service: <id>, .. }`), and cross-checks a `MANIFEST` if present
 (`ManifestMismatch` on tamper/bitrot). May heal the artifact's own torn
 active-segment tail (a shrink-only truncate, reported as
 `healed_torn_tail=true`, which is the routine case under segment

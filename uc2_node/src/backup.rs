@@ -91,6 +91,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::state::{ConfigRecord, TermMap, VoteRecord};
+use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use ultima_journal::{StableValue, StableValueConfig};
 
 const STATE_FILES: [&str; 5] =
@@ -99,7 +100,7 @@ const STATE_FILES: [&str; 5] =
 const SNAP_PREFIX: &str = "snap-";
 const SNAP_SUFFIX: &str = ".ultsnap";
 
-const MANIFEST_FORMAT: &str = "uc2-backup-v1";
+const MANIFEST_FORMAT: &str = "uc2-backup-v2";
 
 /// Bounded retry count for [`copy_dir_sorted`]'s whole-directory retry on a
 /// vanished source file. See that function's doc for why bounded and why a
@@ -116,10 +117,12 @@ pub struct BackupReport {
     /// of the live instance — a backup taken under load may be short of the
     /// source's current frontier by design).
     pub journal_last_pos: u64,
-    /// The highest position of any complete (`snap-<pos>.ultsnap`) snapshot
-    /// file found in the artifact's `snapshots/`, or `None` if there are
-    /// none.
-    pub newest_snapshot: Option<u64>,
+    /// Per service id present in `snapshots/<id>/` (M14a): the highest
+    /// position of any complete (`snap-<pos>.ultsnap`) snapshot file found
+    /// in that id's subdirectory, or `None` if there is no directory (or it
+    /// is empty) for that id. Offline and config-blind: whatever
+    /// `snapshots/<id>/` directories exist on disk are the ids present.
+    pub newest_snapshots: [Option<u64>; CNC_MAX_SERVICES],
     /// The durably-persisted snapshot floor from `state/snapshot.state`
     /// (`0` if never set).
     pub snapshot_floor: u64,
@@ -128,8 +131,17 @@ pub struct BackupReport {
     /// the node was running; reported, not hidden.
     pub healed_torn_tail: bool,
     /// Total number of files copied (or, for a standalone [`verify_artifact`]
-    /// call, found) across `journal/` + `state/` + `snapshots/`.
+    /// call, found) across `journal/` + `state/` + `snapshots/*/`.
     pub files: usize,
+}
+
+impl BackupReport {
+    /// The cluster-wide coverage point: the LOWEST newest-snapshot over the
+    /// ids present (a restore is only as fresh as its slowest FSM). `None`
+    /// if no id has any snapshot at all.
+    pub fn newest_snapshot(&self) -> Option<u64> {
+        self.newest_snapshots.iter().flatten().copied().min()
+    }
 }
 
 /// Why a backup or verify failed.
@@ -147,16 +159,20 @@ pub enum BackupError {
     /// `backup_instance`'s `out` directory already exists and is non-empty.
     #[error("artifact output directory already exists and is not empty")]
     ArtifactExists,
-    /// The coverage invariant failed: the artifact's journal starts above
-    /// `first_base`, but no retained snapshot covers that position. A backup
+    /// The coverage invariant failed for one service id: the artifact's
+    /// journal starts above `first_base`, but no retained snapshot for
+    /// `service` covers that position (M14a: coverage is checked per FSM id
+    /// present in `snapshots/<id>/` — a `service: 0` hole with
+    /// `newest_snapshot: None` also covers the "no snapshot directory at
+    /// all" case, since FSM 0 is the one id every node declares). A backup
     /// built by this module's own ordering rule can never produce this; it
-    /// is the anti-vacuity signal that a hand-built (or wrong-order) artifact
-    /// is unsafe to restore from.
+    /// is the anti-vacuity signal that a hand-built (or wrong-order, or
+    /// tampered) artifact is unsafe to restore from.
     #[error(
-        "hole: journal first_base={first_base} is not covered by any retained snapshot \
-         (newest_snapshot={newest_snapshot:?})"
+        "hole: service {service}: journal first_base={first_base} is not covered by any \
+         retained snapshot (newest_snapshot={newest_snapshot:?})"
     )]
-    Hole { first_base: u64, newest_snapshot: Option<u64> },
+    Hole { service: u8, first_base: u64, newest_snapshot: Option<u64> },
     /// A `MANIFEST` is present but disagrees with the artifact's own
     /// recovered state — tampering or bitrot at the metadata level.
     #[error("manifest mismatch: {0}")]
@@ -354,6 +370,44 @@ fn copy_dir_sorted_once(
     Ok(names.len())
 }
 
+/// Per-id snapshot subdirectories present on disk, ascending. Offline and
+/// config-blind: whatever `snapshots/<id>/` directories exist under `root`
+/// are the set — this module never reads `[services]`/`node.toml`.
+fn snapshot_ids_present(root: &Path) -> io::Result<Vec<u8>> {
+    let dir = snapshots_dir(root);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(id) = entry.file_name().to_str().and_then(|n| n.parse::<u8>().ok())
+            && (id as usize) < CNC_MAX_SERVICES
+        {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// `snapshots/<id>/` for every id present, journal-then-state-then-snapshots
+/// ordering preserved by the caller; the per-directory filter is the same
+/// `snap-<pos>.ultsnap` rule [`copy_dir_sorted`] has always used.
+fn copy_snapshot_tree(src_root: &Path, dst_root: &Path) -> Result<(), BackupError> {
+    for id in snapshot_ids_present(src_root)? {
+        copy_dir_sorted(
+            &snapshots_dir(src_root).join(id.to_string()),
+            &snapshots_dir(dst_root).join(id.to_string()),
+            |n| parse_snap_pos(n).is_some(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Ordered-copy `instance_dir` into a fresh `out` directory: `journal/` fully,
 /// then `state/` fully, then `snapshots/` (see the module doc for why this
 /// order is load-bearing). Refuses an `out` that already exists and is
@@ -383,13 +437,10 @@ pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, 
         fs::create_dir_all(out)?;
     }
 
-    // The ordering rule: journal/ fully, THEN state/, THEN snapshots/.
+    // The ordering rule: journal/ fully, THEN state/, THEN snapshots/*/.
     copy_dir_sorted(&journal_dir(instance_dir), &journal_dir(out), |_| true)?;
     copy_dir_sorted(&state_dir(instance_dir), &state_dir(out), |_| true)?;
-    let src_snapshots = snapshots_dir(instance_dir);
-    if src_snapshots.is_dir() {
-        copy_dir_sorted(&src_snapshots, &snapshots_dir(out), |n| parse_snap_pos(n).is_some())?;
-    }
+    copy_snapshot_tree(instance_dir, out)?;
 
     let report = verify_artifact(out)?;
     write_manifest(out, &report)?;
@@ -479,22 +530,38 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
         open_state_readonly::<u64>(&state_dir(artifact).join("snapshot.state"))?.unwrap_or(0);
     open_state_readonly::<ConfigRecord>(&state_dir(artifact).join("config.state"))?;
 
-    // 3. Snapshots: newest complete `snap-<pos>.ultsnap`.
-    let (newest_snapshot, snapshot_files) = scan_snapshots(&snapshots_dir(artifact))?;
+    // 3. Snapshots: per id present, the newest complete `snap-<pos>.ultsnap`.
+    let (newest_snapshots, snapshot_files) = scan_snapshot_tree(artifact)?;
 
-    // 4. Coverage invariant — the whole point of this module.
-    let covered = match newest_snapshot {
-        Some(pos) => pos >= journal_first_base,
-        None => journal_first_base == 0,
-    };
-    if journal_first_base > 0 && !covered {
-        return Err(BackupError::Hole { first_base: journal_first_base, newest_snapshot });
+    // 4. Coverage invariant, PER ID (M14a): every FSM whose directory exists
+    // must be rebuildable from its own newest snapshot + the journal tail. A
+    // purged journal with no snapshot directory at all is FSM 0's hole (the
+    // one id every node declares) — the whole point of this module.
+    if journal_first_base > 0 {
+        let ids: Vec<u8> = snapshot_ids_present(artifact)?;
+        if ids.is_empty() {
+            return Err(BackupError::Hole {
+                service: 0,
+                first_base: journal_first_base,
+                newest_snapshot: None,
+            });
+        }
+        for id in ids {
+            let n = newest_snapshots[id as usize];
+            if n.is_none_or(|pos| pos < journal_first_base) {
+                return Err(BackupError::Hole {
+                    service: id,
+                    first_base: journal_first_base,
+                    newest_snapshot: n,
+                });
+            }
+        }
     }
 
     let report = BackupReport {
         journal_first_base,
         journal_last_pos,
-        newest_snapshot,
+        newest_snapshots,
         snapshot_floor,
         healed_torn_tail,
         files: journal_files + STATE_FILES.len() + snapshot_files,
@@ -591,12 +658,7 @@ pub fn restore_artifact(artifact: &Path, instance_dir: &Path) -> Result<BackupRe
 
     copy_dir_sorted(&journal_dir(artifact), &journal_dir(instance_dir), |_| true)?;
     copy_dir_sorted(&state_dir(artifact), &state_dir(instance_dir), |_| true)?;
-    let src_snapshots = snapshots_dir(artifact);
-    if src_snapshots.is_dir() {
-        copy_dir_sorted(&src_snapshots, &snapshots_dir(instance_dir), |n| {
-            parse_snap_pos(n).is_some()
-        })?;
-    }
+    copy_snapshot_tree(artifact, instance_dir)?;
 
     Ok(report)
 }
@@ -666,6 +728,20 @@ fn scan_snapshots(dir: &Path) -> io::Result<(Option<u64>, usize)> {
     Ok((newest, count))
 }
 
+/// Per id present under `root`'s `snapshots/`: the newest complete artifact
+/// (via [`scan_snapshots`] on that id's subdirectory); plus the total file
+/// count across all ids.
+fn scan_snapshot_tree(root: &Path) -> io::Result<([Option<u64>; CNC_MAX_SERVICES], usize)> {
+    let mut newest = [None; CNC_MAX_SERVICES];
+    let mut count = 0;
+    for id in snapshot_ids_present(root)? {
+        let (n, c) = scan_snapshots(&snapshots_dir(root).join(id.to_string()))?;
+        newest[id as usize] = n;
+        count += c;
+    }
+    Ok((newest, count))
+}
+
 fn manifest_value(newest_snapshot: Option<u64>) -> String {
     match newest_snapshot {
         Some(pos) => pos.to_string(),
@@ -676,17 +752,23 @@ fn manifest_value(newest_snapshot: Option<u64>) -> String {
 fn write_manifest(dir: &Path, report: &BackupReport) -> Result<(), BackupError> {
     let created_unix_ns =
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let contents = format!(
-        "format={}\njournal_first_base={}\njournal_last_pos={}\nnewest_snapshot={}\n\
-         snapshot_floor={}\nhealed_torn_tail={}\ncreated_unix_ns={}\n",
-        MANIFEST_FORMAT,
-        report.journal_first_base,
-        report.journal_last_pos,
-        manifest_value(report.newest_snapshot),
-        report.snapshot_floor,
-        report.healed_torn_tail,
-        created_unix_ns,
+    let mut contents = format!(
+        "format={}\njournal_first_base={}\njournal_last_pos={}\n",
+        MANIFEST_FORMAT, report.journal_first_base, report.journal_last_pos,
     );
+    // One `newest_snapshot.<id>=<pos|none>` line for EVERY id 0..CNC_MAX_SERVICES
+    // (deterministic, easy to parse) — not just the ids present, so a
+    // shrinking declared set is visible in the manifest too.
+    for id in 0..CNC_MAX_SERVICES {
+        contents.push_str(&format!(
+            "newest_snapshot.{id}={}\n",
+            manifest_value(report.newest_snapshots[id])
+        ));
+    }
+    contents.push_str(&format!(
+        "snapshot_floor={}\nhealed_torn_tail={}\ncreated_unix_ns={}\n",
+        report.snapshot_floor, report.healed_torn_tail, created_unix_ns,
+    ));
     fs::write(dir.join("MANIFEST"), contents)?;
     Ok(())
 }
@@ -739,18 +821,14 @@ fn check_manifest(path: &Path, report: &BackupReport) -> Result<(), BackupError>
         ));
     }
 
-    let ns_raw = get("newest_snapshot")?;
-    let ns: Option<u64> = if ns_raw == "none" {
-        None
-    } else {
-        Some(parse_u64("newest_snapshot", ns_raw)?)
-    };
-    if ns != report.newest_snapshot {
-        return Err(mismatch(
-            "newest_snapshot",
-            manifest_value(ns),
-            manifest_value(report.newest_snapshot),
-        ));
+    for id in 0..CNC_MAX_SERVICES {
+        let key = format!("newest_snapshot.{id}");
+        let raw = get(&key)?;
+        let ns: Option<u64> =
+            if raw == "none" { None } else { Some(parse_u64(&key, raw)?) };
+        if ns != report.newest_snapshots[id] {
+            return Err(mismatch(&key, manifest_value(ns), manifest_value(report.newest_snapshots[id])));
+        }
     }
 
     let sf = parse_u64("snapshot_floor", get("snapshot_floor")?)?;
@@ -801,10 +879,12 @@ mod tests {
 
     #[test]
     fn manifest_roundtrips() {
+        let mut newest_snapshots = [None; CNC_MAX_SERVICES];
+        newest_snapshots[0] = Some(200);
         let report = BackupReport {
             journal_first_base: 100,
             journal_last_pos: 5000,
-            newest_snapshot: Some(200),
+            newest_snapshots,
             snapshot_floor: 200,
             healed_torn_tail: true,
             files: 7,
@@ -820,7 +900,7 @@ mod tests {
         let report = BackupReport {
             journal_first_base: 0,
             journal_last_pos: 5000,
-            newest_snapshot: None,
+            newest_snapshots: [None; CNC_MAX_SERVICES],
             snapshot_floor: 0,
             healed_torn_tail: false,
             files: 3,
@@ -832,10 +912,12 @@ mod tests {
 
     #[test]
     fn check_manifest_catches_a_tampered_field() {
+        let mut newest_snapshots = [None; CNC_MAX_SERVICES];
+        newest_snapshots[0] = Some(200);
         let report = BackupReport {
             journal_first_base: 100,
             journal_last_pos: 5000,
-            newest_snapshot: Some(200),
+            newest_snapshots,
             snapshot_floor: 200,
             healed_torn_tail: false,
             files: 7,
@@ -859,7 +941,7 @@ mod tests {
         let healed_at_backup_time = BackupReport {
             journal_first_base: 0,
             journal_last_pos: 5000,
-            newest_snapshot: None,
+            newest_snapshots: [None; CNC_MAX_SERVICES],
             snapshot_floor: 0,
             healed_torn_tail: true,
             files: 3,
@@ -884,7 +966,7 @@ mod tests {
         let clean_at_backup_time = BackupReport {
             journal_first_base: 0,
             journal_last_pos: 5000,
-            newest_snapshot: None,
+            newest_snapshots: [None; CNC_MAX_SERVICES],
             snapshot_floor: 0,
             healed_torn_tail: false,
             files: 3,

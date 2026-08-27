@@ -35,8 +35,10 @@ use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
 use uc2_node::backup::{backup_instance, restore_artifact, verify_artifact, BackupError};
 use uc2_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
+use uc2_node::ServicesConfig;
 use uc2_service::snapshots::SnapshotStore;
-use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc2_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
+use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
 use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
 
 const SEG_BYTES: u64 = 64 * 1024;
@@ -269,7 +271,7 @@ fn backup_of_a_stopped_node_verifies_and_reports_positions() {
     assert_eq!(verify_report.journal_last_pos, report.journal_last_pos);
 
     let manifest = std::fs::read_to_string(out.join("MANIFEST")).expect("read MANIFEST");
-    assert!(manifest.contains("format=uc2-backup-v1"), "manifest: {manifest}");
+    assert!(manifest.contains("format=uc2-backup-v2"), "manifest: {manifest}");
     assert!(
         manifest.contains(&format!("journal_last_pos={}", report.journal_last_pos)),
         "manifest: {manifest}"
@@ -351,14 +353,17 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     let first_base_1 = node.archive_first_base();
     assert!(first_base_1 > 0, "first purge must have landed");
 
-    // Copy `snapshots/` EARLY — it now holds (at least) the snap at pos1.
+    // Copy `snapshots/0/` EARLY — it now holds (at least) the snap at pos1.
+    // This test's node declares only FSM 0 (the default `ServicesConfig`), so
+    // `snapshots/` has exactly one per-id subdirectory (M14a Task 6 layout).
     let out = root.path().join("backup3-out");
-    std::fs::create_dir_all(out.join("snapshots")).unwrap();
-    for entry in std::fs::read_dir(dir.join("snapshots")).unwrap() {
+    std::fs::create_dir_all(out.join("snapshots").join("0")).unwrap();
+    for entry in std::fs::read_dir(dir.join("snapshots").join("0")).unwrap() {
         let entry = entry.unwrap();
-        std::fs::copy(entry.path(), out.join("snapshots").join(entry.file_name())).unwrap();
+        std::fs::copy(entry.path(), out.join("snapshots").join("0").join(entry.file_name()))
+            .unwrap();
     }
-    let newest_copied = std::fs::read_dir(out.join("snapshots"))
+    let newest_copied = std::fs::read_dir(out.join("snapshots").join("0"))
         .unwrap()
         .filter_map(|e| e.ok())
         .filter_map(|e| {
@@ -405,7 +410,7 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     node.stop();
 
     match verify_artifact(&out) {
-        Err(BackupError::Hole { first_base, newest_snapshot }) => {
+        Err(BackupError::Hole { first_base, newest_snapshot, .. }) => {
             assert!(first_base > newest_snapshot.unwrap_or(0));
             eprintln!(
                 "observed hole: first_base={first_base} newest_snapshot={newest_snapshot:?} \
@@ -1051,4 +1056,127 @@ fn verify_artifact_proceeds_on_a_stopped_nodes_dir_with_a_stale_lock() {
     let report =
         verify_artifact(&dir).expect("a stopped node's own instance dir must verify in place");
     assert!(report.journal_last_pos > 0);
+}
+
+// ---------------------------------------------------------------- Task 9: M14a snapshots/<id>/
+
+/// Two snapshotting FSMs (`RegisterSm`, ids 0 and 1) on a purging node.
+/// Returns once the journal has purged at least one segment.
+fn two_fsm_purged_node(
+    dir: &Path,
+    app: &str,
+) -> (Node, uc2_service::Service<RegisterSm>, uc2_service::Service<RegisterSm>, u64) {
+    let mut cfg = config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
+    cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
+    let node = Node::start(cfg).expect("node");
+    wait_until("serving", || node.can_serve());
+    let svc = |id: u8| {
+        ServiceBuilder::new(
+            ServiceConfig::new(dir, app)
+                .service_id(id)
+                .snapshot_policy(SnapshotPolicy { interval_bytes: 32 * 1024 }),
+            RegisterSm::default(),
+        )
+        .start_with_snapshots()
+        .expect("snapshot service")
+    };
+    let (s0, s1) = (svc(0), svc(1));
+    let client = Client::connect(dir, app).expect("client");
+    let mut v = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while node.archive_first_base() == 0 {
+        assert!(Instant::now() < deadline, "no purge after 60 s");
+        v += 1;
+        let _: uc_lincheck::register::CmdResp = client.submit(&RegCmd::Write(v)).expect("write");
+    }
+    client.shutdown();
+    (node, s0, s1, v)
+}
+
+#[test]
+fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "restore2";
+    let (node, s0, s1, last) = two_fsm_purged_node(&dir, app);
+    for id in ["0", "1"] {
+        assert!(
+            std::fs::read_dir(dir.join("snapshots").join(id)).unwrap().next().is_some(),
+            "snapshots/{id} has an artifact"
+        );
+    }
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    s0.stop();
+    s1.stop();
+
+    let artifact = root.path().join("restore2-artifact");
+    let report = backup_instance(&dir, &artifact)
+        .expect("backup_instance — RED before Task 9: the flat copier drops snapshots/<id>/ and verify reports a Hole");
+    assert!(report.journal_first_base > 0, "vacuity: the journal must have been purged");
+    assert!(
+        report.newest_snapshots[0].is_some() && report.newest_snapshots[1].is_some(),
+        "{report:?}"
+    );
+    assert!(report.newest_snapshots[2..].iter().all(Option::is_none));
+    for id in ["0", "1"] {
+        assert!(
+            std::fs::read_dir(artifact.join("snapshots").join(id)).unwrap().next().is_some(),
+            "artifact snapshots/{id}"
+        );
+    }
+    let manifest = std::fs::read_to_string(artifact.join("MANIFEST")).unwrap();
+    assert!(manifest.contains("format=uc2-backup-v2\n"), "{manifest}");
+    assert!(manifest.contains("newest_snapshot.0="), "{manifest}");
+    assert!(manifest.contains("newest_snapshot.7=none\n"), "{manifest}");
+
+    let fresh = root.path().join("n0-restored");
+    restore_artifact(&artifact, &fresh).expect("restore");
+    let mut cfg = config(&fresh, app, PurgePolicy::Disabled);
+    cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
+    let rnode = Node::start(cfg).expect("restored node");
+    wait_until("restored serving", || rnode.can_serve());
+    let rs0 = ServiceBuilder::new(ServiceConfig::new(&fresh, app).service_id(0), RegisterSm::default())
+        .start_with_snapshots()
+        .expect("restored svc 0");
+    let rs1 = ServiceBuilder::new(ServiceConfig::new(&fresh, app).service_id(1), RegisterSm::default())
+        .start_with_snapshots()
+        .expect("restored svc 1");
+    let client = Client::connect(&fresh, app).expect("client");
+    let got: Option<u64> = client.query_linearizable(&()).expect("read");
+    assert_eq!(got, Some(last), "FSM 0 rebuilt from its own snapshot + tail");
+    wait_until("FSM 1 rebuilt", || rs1.query(()) == Some(last));
+    client.shutdown();
+    rnode.stop();
+    rs0.stop();
+    rs1.stop();
+}
+
+#[test]
+fn verify_reports_a_hole_for_the_id_whose_snapshot_is_missing() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "hole2";
+    let (node, s0, s1, _) = two_fsm_purged_node(&dir, app);
+    node.stop();
+    s0.stop();
+    s1.stop();
+    let artifact = root.path().join("hole2-artifact");
+    let report = backup_instance(&dir, &artifact).expect("backup");
+    // Delete FSM 1's snapshots from the artifact: FSM 1 can no longer be rebuilt.
+    for e in std::fs::read_dir(artifact.join("snapshots").join("1")).unwrap() {
+        std::fs::remove_file(e.unwrap().path()).unwrap();
+    }
+    match verify_artifact(&artifact) {
+        Err(BackupError::Hole { service: 1, first_base, newest_snapshot: None }) => {
+            assert_eq!(first_base, report.journal_first_base);
+        }
+        other => panic!("expected Hole{{service: 1}}, got {other:?}"),
+    }
+    // A MANIFEST that still claims FSM 1's snapshot is a mismatch too — but
+    // the Hole is reported first (coverage before cross-check, as today).
 }

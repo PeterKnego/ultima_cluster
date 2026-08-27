@@ -79,8 +79,8 @@ use clap::{Parser, Subcommand};
 use uc2_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc2_log::cnc::{AdminAuth, AdminReq, CncPage};
 use uc_protocol::v2::cnc::{
-    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
-    NODE_FLAG_LEADER,
+    CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
+    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 
 /// How long a mutating command polls the response line before giving up.
@@ -563,9 +563,14 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
 fn print_backup_report(r: &uc2_node::backup::BackupReport) {
     println!("journal_first_base={}", r.journal_first_base);
     println!("journal_last_pos={}", r.journal_last_pos);
+    for id in 0..CNC_MAX_SERVICES {
+        if let Some(pos) = r.newest_snapshots[id] {
+            println!("newest_snapshot.{id}={pos}");
+        }
+    }
     println!(
         "newest_snapshot={}",
-        r.newest_snapshot.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string())
+        r.newest_snapshot().map(|p| p.to_string()).unwrap_or_else(|| "none".to_string())
     );
     println!("snapshot_floor={}", r.snapshot_floor);
     println!("healed_torn_tail={}", r.healed_torn_tail);
