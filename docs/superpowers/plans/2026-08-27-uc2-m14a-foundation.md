@@ -2751,3 +2751,31 @@ Not covered here, by design (named in the header): §5.4/§6 (M14b), §7.3 (M14c
 **Two facts worth re-checking during execution:**
 1. `FrameIter` advances the follower's cursor **as it yields** (`uc2_log/src/reader.rs:100-125`). Lockstep's `break` after the first yielded frame relies on the cursor then sitting at the *next* frame's start — it does, because the advance happens before the yield returns. If that ever changes, lockstep silently becomes "one batch", not "one frame".
 2. `publish_service_mins` must stay the **first** statement of `do_work` after the halt check. Moving it below step 0 makes `refresh_durable` publish a report ceiling from the previous cycle's `min_applied` — still safe (stale is conservative) but one cycle later than the spec's steady state.
+
+---
+
+## Execution record (2026-08-27, subagent-driven; the SDD ledger, condensed)
+
+Branch `worktree-uc2-multi-service`, merge base `4fcad3c`, final HEAD `bbac7a8`. Task commits: T1 `f58f3c2`, T2 `86ffcd2`, T3 `242081b`, T4 `d3fc45d`, T5 `59562e6`, T6 `92bc9af` (1 fix round), T9 `580a69f` (executed before T7/T8 by ruling), T7 `23711d7` + `61573cd` (1 fix round), T8 `bf8b187`, T10 `247b72d` (1 fix round), T11 `cecba5f`; final whole-branch review (0 Critical, 7 Important — all mechanical) → fix wave `90c28dd` + `bbac7a8`. Evidence on `bbac7a8`: `cargo test --workspace --no-fail-fast` 1 346 passed / 0 failed; clippy `--workspace --all-targets -D warnings` clean. On `cecba5f`: `lin_v2` 7/7 + `lin_partition_v2` 7/7 Linearizable, hard-crash tests green, fuzz smoke `uc_protocol_cnc` 49.8 M / `uc2_node_toml` 908 k runs clean, m5 smoke 169 561 resp/s with 0 lost (smoke; same-box A/B vs `main` 168.9 k/169.8 k vs 184.1 k/158.7 k — inside the box's repeat noise).
+
+### Rulings made during execution (each with what it costs if wrong)
+
+1. T5: no `Drop` on `Service` — the attached bit is informational (spec §8); `AlreadyAttached` keys on the flock, which any exit releases. Cost if wrong: a dropped-not-stopped in-process service shows attached until its heartbeat ages.
+2. T6: the two `backup.rs` purge tests that went red at T5 were fixed in T6 (fake service writes what a real one writes), not deferred. Cost: none.
+3. T6→T9 reorder: T9 ran right after T6 because the flat copier was the only red left and T7/T8 do not depend on T9. Cost: order only.
+4. T6: shift-overflow for `service_id ≥ 64` (the brief's own snippet) fixed by range-check-first + test. Cost: none.
+5. T7: `mode_from_page` takes the RAW `services_declared()`; the folded mask stays for `floor`. Cost: none.
+6. T8: `backup.rs` is a mixed file — node-only tests take `none_for_tests()` and the fake helper writes page 1 directly (a harness node does not mirror). Cost: test-only lines.
+7. T10: stale 78 MiB figure fixed in `run-a-cluster.md`. Cost: none.
+8. T11: reused the warm private target dir `/home/claude/cargo-target-uc2-m14a`. Cost: none.
+9. Final review Important #7: the follower journal-replay path can exceed the §4.2 bound (safe; recorded as spec/plan errata; M14c's slow-FSM oracle samples on the leader only). Cost if wrong: an M14c oracle flake on followers.
+
+### Deferred to M14b/M14c (triaged by the final review as CAN WAIT)
+
+- `lag_waits` misses bounded stalls where the cap sits mid-frame and counts ≈ per frame under lockstep — fix in M14c, which exports the counter; `floor()` still loads N slots in `LagMode::Off`.
+- `try_lock_exclusive` errors map wholesale to `AlreadyAttached` (EPERM/ENOLCK read as contention); `ServiceNotDeclared { declared }` carries the folded mask on a harness node.
+- `BackupReport::newest_snapshot()` flattens `None`s (an id with no snapshot does not lower the aggregate, contrary to its doc) — revisit with per-id `uc2ctl status` in M14c.
+- `forward_svc_query` returns `false` on a `None` producer (parks the read) — M14b adds `MSG_V2_BAD_SERVICE`; add a `debug_assert!` there.
+- `ServicesConfig::none_for_tests()` is `pub` (`#[doc(hidden)]`) on a publishable crate and disables the door term + ceiling — consider a `harness` cargo feature once M14b/c settle the test surface. The `default()`-with-no-service stall is the footgun to keep in mind for every new node-only test.
+- Door test's `refused` assert message (`services.rs:406`) is stale (the refusal now comes from the client's 2 000-slot window; the proof is `append ≤ BOUND + one_frame`).
+- `reconstruction.rs` purge tests sit ~22 % under the 16 KiB harness door budget; `service_epoch_bumps_with_fetch_add` exercises a retired field; `cnc.rs:53` doc cites M14b's query prefix ahead of time; accessor/import style nits (fmt is deferred project-wide); stale `fuzz/corpus/uc2_gateway_toml/01-packaging-example` seed (own commit).
