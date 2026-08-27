@@ -123,7 +123,14 @@ fn start_single_node_with_buffer(dir: &Path, app_id: &str, buffer_bytes: usize) 
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
-        services: uc2_node::ServicesConfig::default(),
+        // M14a: node-only harness — these tests drive 2000 submits before any
+        // service ever attaches. `ServicesConfig::default()` declares FSM 0,
+        // whose `applied` (permanently 0 with no service) would close the
+        // admission door at `append - min_applied <= buffer_bytes / 4` = 16
+        // KiB, so `append > RING_BYTES` (64 KiB) could never hold.
+        // `none_for_tests()` declares nothing: no door term, no report
+        // ceiling, page 1 left untouched.
+        services: uc2_node::ServicesConfig::none_for_tests(),
     })
     .unwrap()
 }
@@ -173,6 +180,11 @@ fn write_submit_retrying(prod: &MpscProducer, retries: u32, local_seq: u32, cmd:
 /// the pipeline is drained (append == commit == durable, stable). By that point
 /// `append` has crossed the ring capacity many times over, so the live buffer
 /// has scrolled and a fresh service must reconstruct from the journal.
+///
+/// Note: `append == commit == durable, stable` cannot by itself distinguish
+/// "every submit landed" from "the admission door closed early" (a stalled
+/// FSM term would present the same stable reading) — that is what the
+/// `append > RING_BYTES` precondition assertions in the tests below are for.
 fn wait_commit_covers_all(node: &Node) {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last = 0u64;
@@ -207,12 +219,15 @@ fn query_total(svc: &Service<CountSm>) -> u64 {
     svc.query(())
 }
 
-/// The service catches up to the apply frontier = min(commit, durable).
+/// The service catches up to the apply frontier = min(commit, durable). These
+/// tests build the node `none_for_tests()`, which never mirrors slots to page
+/// 1's `ServiceProgress` — so poll the service's own FSM-0 slot on page 2
+/// (`cnc.service_slot(0).applied`) instead of page 1's `service().service_applied`.
 fn wait_service_caught_up(cnc: &CncPage) {
     wait_until(|| {
         let target =
             cnc.counters().commit.load_acquire().min(cnc.counters().durable.load_acquire());
-        target > 0 && cnc.service().service_applied.load_acquire() >= target
+        target > 0 && cnc.service_slot(0).applied.load_acquire() >= target
     });
 }
 
@@ -220,7 +235,7 @@ fn wait_service_caught_up(cnc: &CncPage) {
 
 #[test]
 fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let node = start_single_node_with_buffer(dir.path(), "rec", RING_BYTES);
     wait_until(|| node.can_serve());
 
@@ -248,7 +263,7 @@ fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
 
 #[test]
 fn restarted_service_epoch_bumps_and_state_rebuilds() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let node = start_single_node_with_buffer(dir.path(), "rst", RING_BYTES);
     wait_until(|| node.can_serve());
 
@@ -257,6 +272,10 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
         write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
     }
     wait_commit_covers_all(&node);
+    assert!(
+        node.counters().append.load_acquire() > RING_BYTES as u64,
+        "precondition: the ring must have scrolled before svc1 attaches"
+    );
 
     // First incarnation: reconstructs from the journal, converges to 2000.
     let svc1 =

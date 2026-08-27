@@ -244,6 +244,12 @@ fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: 
         "test setup: snapshot pos {pos} is within one segment of the floor {before} — \
          nothing below it is purgeable"
     );
+    debug_assert_eq!(
+        cnc.services_declared(),
+        0,
+        "this fake-service helper writes page 1 directly; only a harness node \
+         (nothing declared) leaves page 1 to the test"
+    );
     cnc.snapshots().service_snapshot_pos.store_release(pos);
     wait_until("purge advanced the floor", || node.archive_first_base() > before || pos == 0);
 }
@@ -388,8 +394,10 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     assert!(first_base_1 > 0, "first purge must have landed");
 
     // Copy `snapshots/0/` EARLY — it now holds (at least) the snap at pos1.
-    // This test's node declares only FSM 0 (the default `ServicesConfig`), so
-    // `snapshots/` has exactly one per-id subdirectory (M14a Task 6 layout).
+    // This file's `config()` builds the node `none_for_tests()` (nothing
+    // declared), but the fake-service helper above always publishes under id
+    // 0, so `snapshots/` has exactly one per-id subdirectory (M14a Task 6
+    // layout).
     let out = root.path().join("backup3-out");
     std::fs::create_dir_all(out.join("snapshots").join("0")).unwrap();
     for entry in std::fs::read_dir(dir.join("snapshots").join("0")).unwrap() {
