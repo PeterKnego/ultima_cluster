@@ -347,8 +347,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 for (pos, hdr, payload) in frames {
                     // NEW_TERM (and any future non-MESSAGE type), and anything
                     // already applied (idempotent re-entry: a restart replays
-                    // from `last_applied`), are skipped without counting as
-                    // this cycle's "one frame" for lockstep.
+                    // from `last_applied`), are simply not applied/published —
+                    // the `one_frame` break below still fires after THIS
+                    // yielded frame regardless of its type, so lockstep's
+                    // "one frame per next_batch" counts every yielded frame,
+                    // not only ones that were actually applied.
                     if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > sm.last_applied() {
                         #[cfg(feature = "apply-profile")]
                         let t0 = profile::now();

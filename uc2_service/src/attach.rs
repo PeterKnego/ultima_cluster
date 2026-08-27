@@ -46,6 +46,14 @@ pub(crate) fn slot(cnc: &CncPage, id: u8) -> &uc2_log::cnc::ServiceSlot {
     cnc.service_slot(id as usize)
 }
 
+/// M14a Task 7: the lag mode this incarnation runs under, computed from the
+/// page's RAW `services_declared` (NOT the effective/folded declared-set
+/// mask `attach()` uses for the per-id gate and `ApplyState.declared`) — see
+/// the call site's comment for why the fold must not happen here.
+pub(crate) fn lag_mode_for(cnc: &CncPage) -> crate::lag::LagMode {
+    crate::lag::mode_from_page(cnc.services_declared(), cnc.fsm_lag_bytes())
+}
+
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
 pub(crate) fn attach<S: RawStateMachine>(
@@ -71,9 +79,16 @@ pub(crate) fn attach<S: RawStateMachine>(
     }
     // M14a Task 7: the lag mode this incarnation runs under, read once at
     // attach (the page's `services_declared`/`fsm_lag_bytes` are boot-once —
-    // see the cnc layout doc) — reuses the effective `declared` mask above
-    // (page `0` folded to `1`, the harness-node case).
-    let lag_mode = crate::lag::mode_from_page(declared, cnc.fsm_lag_bytes());
+    // see the cnc layout doc). `lag_mode_for` deliberately reads the RAW page
+    // value, NOT the folded `declared` mask above: `mode_from_page`'s
+    // `(0, _) => Off` arm is what recognizes a harness node
+    // (`ServicesConfig::none_for_tests`, `services_declared == 0` on the
+    // page) — folding `0` to `1` first would make an undeclared page
+    // indistinguishable from a genuine one-FSM cluster and route it through
+    // `Bounded`/`Lockstep` instead of `Off`. `ApplyState.declared` (below, for
+    // `lag::floor`) still gets the FOLDED mask, since `floor` needs a real
+    // bit to range over either way.
+    let lag_mode = lag_mode_for(&cnc);
     // 1c. M14a: one process per id. Exclusive flock, held for the service's
     // life (the OS releases it on any exit), mirroring the node's
     // `instance.lock`.
@@ -186,4 +201,48 @@ pub(crate) fn attach<S: RawStateMachine>(
         service_id: cfg.service_id,
         _lock: lock,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lag_mode_for;
+    use crate::lag::LagMode;
+    use uc2_log::cnc::{CncMeta, CncPage};
+
+    fn page() -> std::sync::Arc<CncPage> {
+        CncPage::heap(&CncMeta {
+            node_id: 1,
+            instance_id: 1,
+            app_id: "attach-test".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
+        })
+    }
+
+    // Review fix (fix round 1): `lag_mode_for` must read the RAW
+    // `services_declared` value, not the effective/folded declared-set mask
+    // `attach()` computes for its per-id gate — a fresh/`none_for_tests` page
+    // (`services_declared == 0`) is a harness node and must attach as
+    // `LagMode::Off`, never `Lockstep`/`Bounded`, regardless of whatever
+    // `fsm_lag_bytes` happens to hold.
+    #[test]
+    fn undeclared_page_is_off_even_with_a_nonzero_lag_bound() {
+        let p = page();
+        assert_eq!(p.services_declared(), 0, "fresh page: nothing declared");
+        p.store_fsm_lag_bytes(1 << 18); // a real bound, NOT lockstep's 0
+        assert_eq!(lag_mode_for(&p), LagMode::Off);
+    }
+
+    // The lockstep-collision case named in the review: an undeclared page
+    // whose `fsm_lag_bytes` also happens to be 0 must still read as `Off`,
+    // not `Lockstep` — this is exactly the bug the fold-before-mode_from_page
+    // ordering introduced (harmless when the bound was nonzero, silent when
+    // it was 0 too).
+    #[test]
+    fn undeclared_page_is_off_not_lockstep_when_lag_bytes_is_also_zero() {
+        let p = page();
+        assert_eq!(p.services_declared(), 0);
+        assert_eq!(p.fsm_lag_bytes(), 0);
+        assert_eq!(lag_mode_for(&p), LagMode::Off);
+    }
 }
