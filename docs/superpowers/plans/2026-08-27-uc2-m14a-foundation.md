@@ -2668,7 +2668,7 @@ git commit -m "docs(m14a): cnc 3.0 page layout, per-FSM instance-dir files + res
 
 Runs things and records what it saw. Rate numbers from this box are smoke (`docs/notes/dev-box-not-a-bench.md`); nothing here adjudicates a bar.
 
-- [ ] **Step 1: A private target dir, the workspace suite**
+- [x] **Step 1: A private target dir, the workspace suite**
 
 ```bash
 export CARGO_TARGET_DIR=/home/claude/.cache/cargo-target-m14a
@@ -2679,7 +2679,7 @@ cargo test --workspace 2>&1 | tail -30
 
 Expected: clippy clean; every test binary reports `0 failed`. Paste the tail into the commit body of Step 5.
 
-- [ ] **Step 2: The capstones that exercise attach/apply under faults**
+- [x] **Step 2: The capstones that exercise attach/apply under faults**
 
 ```bash
 cargo test -p uc2_node --test lin_v2 2>&1 | tail -12
@@ -2689,7 +2689,7 @@ cargo test -p uc2-crashtest --features hard-crash-tests 2>&1 | tail -12
 
 Expected: `Linearizable` on every capstone (they run one FSM per node — the default `{0}` — and are unchanged in intent).
 
-- [ ] **Step 3: The fuzz targets this plan touched**
+- [x] **Step 3: The fuzz targets this plan touched**
 
 ```bash
 scripts/fuzz_smoke.sh 60 --min-runs 10000 uc_protocol_cnc uc2_node_toml
@@ -2697,7 +2697,7 @@ scripts/fuzz_smoke.sh 60 --min-runs 10000 uc_protocol_cnc uc2_node_toml
 
 Expected: both PASS with ≥ 10 000 runs; the `[services]` table parses under the existing `uc2_node_toml` target.
 
-- [ ] **Step 4: The M5 smoke with two FSMs** — `m5_gate all` starts one service per node; a quick two-FSM variant is the `services.rs` `two_fsms_apply…` test at scale. Run:
+- [x] **Step 4: The M5 smoke with two FSMs** — `m5_gate all` starts one service per node; a quick two-FSM variant is the `services.rs` `two_fsms_apply…` test at scale. Run:
 
 ```bash
 UC2_M5_MAX_SECS=6 cargo run -p uc2_node --release --example m5_gate -- all --secs 6 --root /home/claude/m14a-smoke
@@ -2705,7 +2705,7 @@ UC2_M5_MAX_SECS=6 cargo run -p uc2_node --release --example m5_gate -- all --sec
 
 Expected: `RESULT: PASS` (single FSM, default config) — the regression smoke that the page-2 move and the barrier's per-iteration `floor` loads did not visibly change the local number. Record the responses/s line **as smoke** in the commit body; do not compare it against any bar.
 
-- [ ] **Step 5: Commit the evidence**
+- [x] **Step 5: Commit the evidence**
 
 ```bash
 git add -A   # nothing but the plan checkboxes should change
