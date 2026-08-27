@@ -2,8 +2,10 @@
 
 **Date:** 2026-08-21 (re-baselined 2026-08-26, see §0)
 **Status:** approved design (brainstorm 2026-08-20/21); re-baselined on the
-shipped M11–M13 tree; **user review of the re-baseline pending**, then the
-implementation plan.
+shipped M11–M13 tree; re-baseline **reviewed 2026-08-27** (§0 item 2 demoted
+to a plan task — no deployments exist, so there is no compatibility question,
+only the tool's correctness against the new layout). Next: the implementation
+plan.
 **Baseline:** `origin/main` 4fcad3c (M1–M13 complete, `v2.7.0`, wire 0.5.0,
 cnc page 2.0, remote protocol v1, ingress ring `ULTRNG2`).
 
@@ -18,7 +20,7 @@ corrected in place in the body; this section is the changelog for review.
 | # | what shipped | effect on this spec | fixed in |
 |---|---|---|---|
 | 1 | M11 `free_disk_bytes` @ 3840, M12b `admin_auth` @ 3904, M13 hole counters @ 3968/3976 (`uc_protocol/src/v2/cnc.rs:152-227`) | the two page-1 fields this spec placed at 3840/3904 collide; the only free page-1 line is 4032..4096 | §3.2: both fields move to the 4032 line (u64 pair, one writer — the same pattern M13 used at 3968/3976); page 1's reserved band is thereby exhausted |
-| 2 | M11 offline backup/verify/restore (`uc2_node/src/backup.rs`, `uc2ctl backup|verify-backup|restore`) copies `snapshots/` **flat**, filtered to `snap-<pos>.ultsnap` names, and verifies one coverage invariant (newest snapshot ≥ `journal_first_base`) | `snapshots/<id>/` subdirectories would be silently skipped by backup and restore, and `verify` has no per-FSM coverage form | new §7.5 |
+| 2 | M11 offline backup/verify/restore (`uc2_node/src/backup.rs`, `uc2ctl backup|verify-backup|restore`) copies `snapshots/` **flat**, filtered to `snap-<pos>.ultsnap` names, and verifies one coverage invariant (newest snapshot ≥ `journal_first_base`) | `snapshots/<id>/` subdirectories would be silently skipped by backup and restore, and `verify` has no per-FSM coverage form. **Review 2026-08-27: not a design item** — there are no deployments, so no old artifacts to stay compatible with; it is a mechanical plan task (teach the three tools the per-id layout) | new §7.5 (plan task, not a decision) |
 | 3 | M12a remote protocol v1 (`uc2_remote/src/frame.rs`): `SUBMIT`/`QUERY` carry no service selector; the standing rule is that the remote protocol stays v1 | `submit_to`/`submit_all`/`query_*_on` have no remote form | §6.4: the remote path is FSM 0 in stage 1; a selector is a protocol-v2 item, out of scope |
 | 4 | M13 client `Engine` is a `(SendHalf, PollHalf)` split with an all-atomic `Slot` (`uc2_client/src/slots.rs:44-49`); the gateway's grant budget is `EdgeConfig::max_inflight` less 1/8 (`uc2_gateway/src/edge.rs:207-209`), not the cnc admission field, and `SubmitError::Backpressure` already squeezes a connection's credits (`edge.rs:1357-1387`) | the fan-in buffer for `submit_all` cannot live in the atomic slot; FSM back-pressure must reach remote clients | §6.2 (fan-in buffer on the `PollHalf`), §5.2 (the new door term surfaces as today's `Backpressure`; no gateway change) |
 | 5 | M11 boot reservation (`buffer_bytes` + 14 MiB of rings, fallocated; ENOSPC = named startup refusal) | every extra FSM adds 5 MiB of rings | §5.5 |
