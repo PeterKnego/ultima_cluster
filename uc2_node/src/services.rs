@@ -7,6 +7,7 @@
 
 use uc2_log::cnc::CncPage;
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
+use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
 /// The FSM pacing policy (spec §1, "FSM pacing"). There is deliberately no
 /// unbounded variant: an FSM slower than the log's sustained rate can never
@@ -186,6 +187,29 @@ pub fn parse_fsm_lag(s: &str) -> Result<FsmLag, String> {
         .ok_or_else(|| format!("services.fsm_lag: {s:?} overflows u64"))
 }
 
+/// The door/ceiling term (spec §5.2): the byte bound, or one max-size frame
+/// under lockstep ("at most one frame past the FSMs"). `None` ⇔ nothing
+/// declared ⇔ no FSM term at all.
+pub fn fsm_lag_eff(services: &ServicesConfig, buffer_bytes: u64, max_payload: usize) -> Option<u64> {
+    if services.declared() == 0 {
+        return None;
+    }
+    Some(match services.resolve_lag(buffer_bytes) {
+        FsmLag::Lockstep => align_frame_len(HEADER_LEN + max_payload) as u64,
+        FsmLag::Bounded(b) => b,
+    })
+}
+
+/// Q (spec §5.3): what this node attests toward the leader's commit ranking
+/// — never more than it has validated, never more than `fsm_lag` past its
+/// slowest FSM. Reporting less than you hold is always safe in Raft.
+pub fn report_ceiling(validated_up_to: u64, min_applied: u64, fsm_lag_eff: Option<u64>) -> u64 {
+    match fsm_lag_eff {
+        None => validated_up_to,
+        Some(lag) => validated_up_to.min(min_applied.saturating_add(lag)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +303,25 @@ mod tests {
             let e = parse_fsm_lag(bad).unwrap_err();
             assert!(e.contains("services.fsm_lag"), "{bad:?}: {e}");
         }
+    }
+
+    #[test]
+    fn fsm_lag_eff_table() {
+        let b = 4u64 << 20;
+        assert_eq!(fsm_lag_eff(&ServicesConfig::none_for_tests(), b, 256), None);
+        assert_eq!(fsm_lag_eff(&ServicesConfig::default(), b, 256), Some(1 << 20));
+        assert_eq!(fsm_lag_eff(&ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(4096))).unwrap(), b, 256), Some(4096));
+        // Lockstep: one max-size frame — header 32 + 256 payload, 32-aligned = 288.
+        assert_eq!(fsm_lag_eff(&ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(), b, 256), Some(288));
+        assert_eq!(fsm_lag_eff(&ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(), b, 1), Some(64));
+    }
+
+    #[test]
+    fn report_ceiling_never_exceeds_validated_and_is_inert_without_fsms() {
+        assert_eq!(report_ceiling(10_000, 2_000, Some(4_096)), 6_096);
+        assert_eq!(report_ceiling(10_000, 9_000, Some(4_096)), 10_000);
+        assert_eq!(report_ceiling(10_000, 0, Some(4_096)), 4_096, "absent FSMs cap the report at the bound");
+        assert_eq!(report_ceiling(10_000, u64::MAX, Some(4_096)), 10_000, "saturating add");
+        assert_eq!(report_ceiling(10_000, 0, None), 10_000);
     }
 }

@@ -424,6 +424,11 @@ pub struct Node {
     /// `NodeConfig` so `submit` (the in-process path) enforces the same
     /// door as the client ring drain.
     admission_bytes: u64,
+    /// M14a (spec §5.2): the FSM term for the admission door — `append -
+    /// min_applied <= fsm_lag_eff`, checked here the same way `submit`
+    /// checks `admission_bytes`. `None` ⇔ nothing declared (door inert),
+    /// computed once at boot from `crate::services::fsm_lag_eff`.
+    fsm_door: Option<u64>,
     buffer: Arc<LogBuffer>,
     truncations: Arc<AtomicU64>,
     /// M6 Task 8: count of wipe-and-rejoins (NoCommonPrefix → truncate-to-0). A
@@ -1210,6 +1215,10 @@ impl Node {
         let receiver_agent =
             AgentRunner::spawn("uc2-receiver", IdleStrategy::Yield, move || receiver.do_work())?;
 
+        // M14a (spec §5.2): the FSM term the door + report ceiling share —
+        // computed once at boot from the static declared set + lag policy.
+        let fsm_lag_eff = crate::services::fsm_lag_eff(&cfg.services, cfg.buffer_bytes as u64, cfg.max_payload);
+
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
             reports_unattested: Arc::clone(&reports_unattested),
@@ -1238,6 +1247,7 @@ impl Node {
             next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: cfg.admission_bytes,
+            fsm_lag_eff,
             pending_ring_ingress: None,
             last_holes_published: (0, 0),
             sock: cons_sock,
@@ -1325,6 +1335,7 @@ impl Node {
             can_serve_flag,
             ingress_tx,
             admission_bytes: cfg.admission_bytes,
+            fsm_door: fsm_lag_eff,
             buffer,
             truncations,
             wipes,
@@ -1487,6 +1498,12 @@ impl Node {
         let commit = self.cnc.counters().commit.load_acquire();
         if !admission_open(append, commit, self.admission_bytes) {
             return Err(SubmitError::Full);
+        }
+        if let Some(lag) = self.fsm_door {
+            let min_applied = self.cnc.service().service_applied.load_acquire();
+            if !admission_open(append, min_applied, lag) {
+                return Err(SubmitError::Full);
+            }
         }
         match self.ingress_tx.try_send(payload) {
             Ok(()) => Ok(()),
@@ -1759,6 +1776,11 @@ struct Consensus {
     /// Mirror of `NodeConfig::admission_bytes` (the `append - commit` door
     /// budget for the ring drain).
     admission_bytes: u64,
+    /// M14a (spec §5.2): the FSM term — `Some(fsm_lag)` when at least one
+    /// service is declared, `None` (inert) for a `none_for_tests` node.
+    /// Computed once at boot (`crate::services::fsm_lag_eff`) from the
+    /// static `NodeConfig::services` + `buffer_bytes` + `max_payload`.
+    fsm_lag_eff: Option<u64>,
     /// A ring record held back by a prior `AppendError::WouldOverrun` before
     /// taking more from `ingress_ring` — the record was already consumed off
     /// the ring (its consumer position advanced), so it MUST be retried here
@@ -3285,6 +3307,15 @@ impl Consensus {
                 let commit = self.cnc.counters().commit.load_acquire();
                 if !admission_open(append, commit, self.admission_bytes) {
                     break; // door closed; leave the rest in the ring this cycle
+                }
+                // M14a (spec §5.2): the FSM term — the slowest declared FSM
+                // may not fall more than fsm_lag behind the append head.
+                // Same client-visible outcome as the window term: the record
+                // stays in the ring and the client's try_write sees Full.
+                if let Some(lag) = self.fsm_lag_eff
+                    && !admission_open(append, self.min_applied, lag)
+                {
+                    break;
                 }
             }
             let mut buf = Vec::new();
@@ -4817,11 +4848,19 @@ impl Consensus {
     /// frontier can move: a durable advance, and the end of every event drain.
     fn publish_validated_frontier(&self) {
         self.reports_unattested.store(self.sm.reports_unattested(), Ordering::Relaxed);
-        // Term first, then position: a reader that samples between the two
-        // sees an older position with a newer term, which fails the leader's
-        // attestation check (the safe direction) rather than passing wrongly.
-        self.validated_term.store(self.sm.validated_term(), Ordering::Release);
-        self.validated_frontier.store(self.sm.validated_up_to(), Ordering::Release);
+        // M14a (Q, spec §5.3): the report ceiling — validated, and no more
+        // than fsm_lag past the slowest FSM. `term_at(ceiling)` is the term
+        // of the byte BELOW the ceiling (the same attestation as before:
+        // `validated_term()` is `term_at(validated_up_to)`).
+        let ceiling = crate::services::report_ceiling(
+            self.sm.validated_up_to(),
+            self.min_applied,
+            self.fsm_lag_eff,
+        );
+        // Term first, then position (unchanged): a torn read fails the
+        // leader's attestation check, the safe direction.
+        self.validated_term.store(self.sm.term_at(ceiling), Ordering::Release);
+        self.validated_frontier.store(ceiling, Ordering::Release);
     }
 
     /// Issue #6, leader open phase 2: the archive finished the collapse to
@@ -5886,6 +5925,7 @@ mod tests {
             next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: 256 * 1024,
+            fsm_lag_eff: crate::services::fsm_lag_eff(&ServicesConfig::default(), 1 << 16, 4096),
             pending_ring_ingress: None,
             last_holes_published: (0, 0),
             sock,

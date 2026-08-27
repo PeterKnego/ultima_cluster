@@ -12,10 +12,16 @@
 //! them), so snapshot publish is faked with the real
 //! `uc2_service::snapshots::SnapshotStore` (a `uc2_node` dev-dependency)
 //! writing arbitrary bytes at the chosen position, while the purge trigger
-//! itself is the fake service writing its OWN `service_slot(0).snapshot_pos`
-//! (since M14a Task 5 the consensus agent is page 1's single writer, mirroring
-//! `min(slot.snapshot_pos)` over the declared set every cycle — a direct page-1
-//! poke would just be overwritten back to slot 0's value on the next cycle).
+//! itself is the fake service writing the page-1 marker directly.
+//!
+//! M14a Task 8: this file's default `config`/`start_node` build the node
+//! `none_for_tests()` (nothing declared) — most tests here never attach a
+//! real FSM, and Task 8's admission-door FSM term would otherwise cap
+//! `append` at `buffer_bytes / 4` forever once an unattached FSM's `applied`
+//! (permanently 0) falls behind. `publish_service_mins` is a no-op when
+//! nothing is declared, so a direct page-1 poke sticks (no mirror clobbers
+//! it back). The few tests that attach a real FSM 0 service use
+//! `start_node_with(.., ServicesConfig::default())` instead.
 //!
 //! Journals use tiny segments (`SEG_BYTES`) on the ext4 `CARGO_TARGET_TMPDIR`
 //! so a purge cycle actually drops whole segment files without megabytes of
@@ -49,7 +55,24 @@ const PAYLOAD_BYTES: usize = 64;
 /// 32-byte frame slot (`uc_protocol::v2::frame`) — 96 bytes.
 const FRAME_BYTES: u64 = align_frame_len(HEADER_LEN + PAYLOAD_BYTES) as u64;
 
+// M14a Task 8: this file's node-construction default is `none_for_tests()`
+// (nothing declared, the FSM door + report ceiling stay inert) — most of
+// this file's tests fake the service side (write `service_slot(0)`/page 1
+// markers directly per the module doc) or drive raw `node.submit` volume
+// with no FSM ever attached, and Task 8's admission-door FSM term
+// (`append - min_applied <= fsm_lag`) would otherwise cap `append` at
+// `buffer_bytes / 4` forever once `min_applied` (an unattached FSM's
+// `applied`, permanently 0) falls behind — exactly the class of node-only
+// test Task 3's `none_for_tests()` sweep exists for, missed here because
+// this file mixes fake-service tests with a few real ones. The handful of
+// tests that DO attach a real service for FSM 0 (`restore_roundtrip_boots_and_serves`,
+// `restore_accepts_a_target_with_empty_dirs_and_a_stale_lock`) use
+// `start_node_with` + `ServicesConfig::default()` explicitly instead.
 fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
+    config_with(dir, app, purge, uc2_node::ServicesConfig::none_for_tests())
+}
+
+fn config_with(dir: &Path, app: &str, purge: PurgePolicy, services: ServicesConfig) -> NodeConfig {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     NodeConfig {
         id: 0,
@@ -68,7 +91,7 @@ fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
         learners: Vec::new(),
         journal_segment_bytes: SEG_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
-        services: uc2_node::ServicesConfig::default(),
+        services,
     }
 }
 
@@ -105,6 +128,15 @@ fn open_cnc(dir: &Path, app: &str) -> Arc<CncPage> {
 
 fn start_node(dir: &Path, app: &str, purge: PurgePolicy) -> Node {
     let node = Node::start(config(dir, app, purge)).expect("start");
+    wait_until("can_serve", || node.can_serve());
+    node
+}
+
+/// As [`start_node`], but with an explicit declared set — for the tests
+/// that attach a REAL `ServiceBuilder` for FSM 0 (which needs id 0 declared
+/// to attach at all), unlike the rest of this file's fake-service tests.
+fn start_node_with(dir: &Path, app: &str, purge: PurgePolicy, services: ServicesConfig) -> Node {
+    let node = Node::start(config_with(dir, app, purge, services)).expect("start");
     wait_until("can_serve", || node.can_serve());
     node
 }
@@ -187,14 +219,16 @@ fn drive_until_durable_exceeds(node: &Node, target: u64, timeout: Duration) -> u
     }
 }
 
-/// Publish a real (fake-content) snapshot file at `pos`, then drive the node's
-/// purge machinery exactly as `purge_safety.rs` does (write the fake
-/// service's OWN slot marker — since M14a Task 5 the consensus agent is the
-/// single writer of page 1's `service_snapshot_pos`, overwriting it every
-/// cycle with `min` over the declared set's slots, so poking page 1 directly
-/// here would be clobbered right back to slot 0's value; writing
-/// `service_slot(0)` is what a real service now does, and the node mirrors it
-/// onto page 1 within a cycle), and wait for `archive_first_base` to advance.
+/// Publish a real (fake-content) snapshot file at `pos`, then drive the
+/// node's purge machinery, and wait for `archive_first_base` to advance.
+///
+/// M14a Task 8: this file's node is now built `none_for_tests()` (nothing
+/// declared) — the consensus agent's page-1 mirror
+/// (`publish_service_mins`) is a no-op when nothing is declared, so it
+/// never clobbers a direct page-1 write; write the floor field the purge
+/// driver reads (`cnc.snapshots().service_snapshot_pos`) straight, the way
+/// `purge_safety.rs` did before M14a Task 5 introduced the slot-mirroring
+/// indirection for a declared node.
 fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: u64) {
     let store = SnapshotStore::open(dir, 0).expect("open snapshot store");
     store.publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?)).expect("publish snapshot");
@@ -210,7 +244,7 @@ fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: 
         "test setup: snapshot pos {pos} is within one segment of the floor {before} — \
          nothing below it is purgeable"
     );
-    cnc.service_slot(0).snapshot_pos.store_release(pos);
+    cnc.snapshots().service_snapshot_pos.store_release(pos);
     wait_until("purge advanced the floor", || node.archive_first_base() > before || pos == 0);
 }
 
@@ -512,7 +546,7 @@ fn ordered_backup_survives_a_purge_racing_the_copy() {
                     if durable > SEG_BYTES {
                         let pos = durable.saturating_sub(SEG_BYTES / 2).max(1);
                         if store.publish(pos, |w| Ok(w.write_all(b"race-snapshot")?)).is_ok() {
-                            cnc.service_slot(0).snapshot_pos.store_release(pos);
+                            cnc.snapshots().service_snapshot_pos.store_release(pos);
                         }
                     }
                 }
@@ -774,7 +808,7 @@ fn restore_roundtrip_boots_and_serves() {
     let dir = root.path().join("n0");
     let app = "restore1";
 
-    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    let node = start_node_with(&dir, app, PurgePolicy::Disabled, ServicesConfig::default());
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
         .start()
         .expect("start service");
@@ -807,7 +841,7 @@ fn restore_roundtrip_boots_and_serves() {
         "restore_artifact must report the artifact's own recovered positions"
     );
 
-    let restored_node = start_node(&fresh_dir, app, PurgePolicy::Disabled);
+    let restored_node = start_node_with(&fresh_dir, app, PurgePolicy::Disabled, ServicesConfig::default());
     let restored_svc = ServiceBuilder::new(
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
@@ -843,7 +877,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
     let dir = root.path().join("n0");
     let app = "restore3";
 
-    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    let node = start_node_with(&dir, app, PurgePolicy::Disabled, ServicesConfig::default());
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
         .start()
         .expect("start service");
@@ -879,7 +913,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
 
     restore_artifact(&artifact, &fresh_dir).expect("restore_artifact must accept an empty-dirs, stale-volatile-files target");
 
-    let restored_node = start_node(&fresh_dir, app, PurgePolicy::Disabled);
+    let restored_node = start_node_with(&fresh_dir, app, PurgePolicy::Disabled, ServicesConfig::default());
     let restored_svc = ServiceBuilder::new(
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),

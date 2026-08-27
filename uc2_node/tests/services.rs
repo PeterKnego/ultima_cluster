@@ -356,3 +356,157 @@ fn lockstep_holds_the_fsms_within_one_frame() {
     svc1.stop();
     node.stop();
 }
+
+#[test]
+fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
+    use uc2_client::{ClientError, PipelinedClient, PipelinedConfig};
+    let _g = serialize();
+    let dir = tempdir();
+    const BOUND: u64 = 64 << 10;
+    let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Bounded(BOUND))))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc0 = start_service(dir.path(), 0);
+    // `max_inflight` comfortably above the ~1024 records that fit under the
+    // 64 KiB door (so the client's own window isn't what stops the burst —
+    // the full door-capped backlog reaches the ring either way) yet well
+    // below the loop bound (so the window itself is what the client
+    // eventually observes), combined with `try_submit` (fail-fast, no
+    // retry): plain `submit` retries `Backpressure` for a 1 s grace, and the
+    // poll driver's deadline sweep (`request_timeout`) frees a swept
+    // ticket's window slot every sweep — with a sweep interval well under
+    // that 1 s grace, `submit` can ALWAYS eventually claim a freed slot, so
+    // it never truly observes `BackpressureFull` here (confirmed: with
+    // plain `submit` every one of 4000 submits eventually succeeds, just
+    // increasingly slowly). `try_submit` reads the window synchronously,
+    // with no grace/sweep interaction, so it reliably surfaces the shut
+    // door once `max_inflight` outstanding tickets have piled up.
+    let client = PipelinedClient::connect(
+        dir.path(),
+        APP,
+        PipelinedConfig {
+            request_timeout: Duration::from_millis(500),
+            max_inflight: 2000,
+            ..PipelinedConfig::default()
+        },
+    )
+    .unwrap();
+    // Fire until the door refuses.
+    let mut refused = false;
+    let mut tickets = Vec::new();
+    for _ in 0..4000 {
+        match client.try_submit::<Cmd, u64>(&Cmd::Add(1)) {
+            Ok(t) => tickets.push(t),
+            Err(ClientError::BackpressureFull) => {
+                refused = true;
+                break;
+            }
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+    assert!(refused, "4000 × 128 B = 512 KiB must not all get through a 64 KiB door");
+    let cnc = open_cnc(dir.path());
+    let one_frame = uc_protocol::v2::frame::align_frame_len(32 + 256) as u64;
+    let append = cnc.counters().append.load_acquire();
+    assert!(append <= BOUND + one_frame, "append {append} ran past the door ({BOUND} + one frame)");
+    let _ = tickets; // drop: whatever timed out, timed out
+    // Attaching the missing FSM re-opens the door: both catch up, writes flow.
+    let svc1 = start_service(dir.path(), 1);
+    wait_until("door reopens", || {
+        client.submit::<Cmd, u64>(&Cmd::Add(1)).and_then(|t| t.wait()).is_ok()
+    });
+    wait_until("both past the bound", || cnc.service_slot(1).applied.load_acquire() > BOUND);
+    client.shutdown();
+    svc0.stop();
+    svc1.stop();
+    node.stop();
+}
+
+/// Three in-process nodes. The LEADER declares nothing (door inert), the two
+/// FOLLOWERS declare {0,1} with a 64 KiB bound and have no FSM attached, so
+/// their reports are capped at 64 KiB and commit stalls there although the
+/// leader appends freely. Attaching both FSMs on both followers releases it.
+#[test]
+fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
+    let _g = serialize();
+    let root = tempdir();
+    const BOUND: u64 = 64 << 10;
+    let socks: Vec<std::net::UdpSocket> =
+        (0..3).map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
+    let members: Vec<(uc2_consensus::election::NodeId, std::net::SocketAddr)> =
+        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+    fn node_cfg(dir: &Path, i: usize, members: &[(u32, std::net::SocketAddr)], services: ServicesConfig) -> NodeConfig {
+        let mut cfg = config(dir, services);
+        cfg.id = i as u32;
+        cfg.bind = members[i].1;
+        cfg.members = members.to_vec();
+        cfg.seed = 1 + i as u64;
+        cfg
+    }
+    // `Node::crash(self)` consumes, so the slots are `Option`s.
+    let mut nodes: Vec<Option<Node>> = Vec::new();
+    let mut dirs = Vec::new();
+    for (i, sock) in socks.into_iter().enumerate() {
+        let dir = root.path().join(format!("n{i}"));
+        let cfg = node_cfg(&dir, i, &members, ServicesConfig::none_for_tests());
+        nodes.push(Some(Node::start_with_socket(cfg, sock).unwrap()));
+        dirs.push(dir);
+    }
+    let serving = |n: &Option<Node>| n.as_ref().is_some_and(|n| n.is_leader() && n.can_serve());
+    let mut leader = 0;
+    wait_until("single serving leader", || {
+        let ls: Vec<usize> = (0..3).filter(|&i| serving(&nodes[i])).collect();
+        if ls.len() == 1 { leader = ls[0]; }
+        ls.len() == 1
+    });
+    // Restart the two followers with the declared set (config is per node;
+    // crash-then-rebind exactly as lincheck_v2::kill_and_restart_leader).
+    for i in (0..3).filter(|&i| i != leader) {
+        nodes[i].take().unwrap().crash();
+        let sock = std::net::UdpSocket::bind(members[i].1).unwrap();
+        let cfg = node_cfg(&dirs[i], i, &members, ids(&[0, 1], Some(FsmLag::Bounded(BOUND))));
+        nodes[i] = Some(Node::start_with_socket(cfg, sock).unwrap());
+    }
+    wait_until("leader serving again", || serving(&nodes[leader]));
+    let leader_node = nodes[leader].as_ref().unwrap();
+    // 2000 × 64 B payloads ≈ 200 KiB of frames through the leader's own door
+    // (256 KiB admission window, no FSM term). A valid `bincode`-encoded
+    // `Cmd::Add(1)` padded to 64 B with trailing zeros: `decode_from_slice`
+    // only consumes what the type needs and ignores the rest, so this both
+    // decodes cleanly once the FSMs attach below AND matches the frame-size
+    // arithmetic the assertions below assume.
+    let mut payload = bincode::serde::encode_to_vec(Cmd::Add(1), bincode::config::standard()).unwrap();
+    payload.resize(64, 0);
+    let mut sent = 0;
+    while sent < 2000 {
+        match leader_node.submit(payload.clone()) {
+            Ok(()) => sent += 1,
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let one_frame = uc_protocol::v2::frame::align_frame_len(32 + 256) as u64;
+    let c = leader_node.counters();
+    let (append, commit) = (c.append.load_acquire(), c.commit.load_acquire());
+    assert!(append > 2 * BOUND, "vacuity: the leader appended only {append}");
+    assert!(commit <= BOUND + one_frame, "commit {commit} ran past the followers' capped reports ({BOUND})");
+    let lcnc = open_cnc(&dirs[leader]);
+    for i in 0..8 {
+        let s = lcnc.peer_slot(i);
+        if s.id_and_role.load_acquire() == 0 { continue; }
+        let rd = s.reported_durable.load_acquire();
+        assert!(rd <= BOUND + one_frame, "peer slot {i} reported {rd} > cap");
+    }
+    // Release: attach both FSMs on both followers; each applies to commit,
+    // min_applied rises, the ceiling rises, commit follows — to the end.
+    let mut services = Vec::new();
+    for i in (0..3).filter(|&i| i != leader) {
+        services.push(start_service(&dirs[i], 0));
+        services.push(start_service(&dirs[i], 1));
+    }
+    wait_until("commit reaches append", || {
+        let c = leader_node.counters();
+        c.commit.load_acquire() == c.append.load_acquire()
+    });
+    for s in services { s.stop(); }
+    for n in nodes.into_iter().flatten() { n.stop(); }
+}
