@@ -144,6 +144,19 @@ enabled = false
 # [metrics]
 # bind = "127.0.0.1:9600"
 
+# M14a: the state-machine processes this node hosts (one process per id, all
+# applying the same log). Absent ⇒ ids = [0] with fsm_lag = buffer_bytes / 4.
+# The set is static and must match on every node; changing it is a restart,
+# and an id may only be ADDED while the journal is intact from position 0
+# (purge disabled or never fired) — a new FSM rebuilds from genesis.
+# fsm_lag bounds how far any FSM may run ahead of the slowest ("lockstep" =
+# one frame); it must be below buffer_bytes / 2. Every id beyond 0 reserves a
+# further 5 MiB of ring files at boot (see instance-directory.md).
+#
+# [services]
+# ids = [0]
+# fsm_lag = "16MiB"
+
 # Admin authentication: who may change cluster membership (add/remove/
 # promote/demote) via uc2ctl. REQUIRED (not absent-means-off), like
 # [crypto].enabled above.

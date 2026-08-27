@@ -355,6 +355,7 @@ mod tests {
             purge: PurgePolicy::Disabled,
             journal_segment_bytes: crate::DEFAULT_JOURNAL_SEGMENT_BYTES,
             crypto: CryptoConfig::Disabled,
+            services: crate::services::ServicesConfig::default(),
         }
     }
 

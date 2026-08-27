@@ -45,6 +45,7 @@ pub mod obs;
 pub mod preflight;
 mod read_round;
 pub mod recovery;
+pub mod services;
 
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
@@ -54,6 +55,7 @@ pub use node::{
     REASON_AUTH_UNKNOWN_KEY,
     StartOpts, SubmitError,
 };
+pub use services::{FsmLag, ServicesConfig};
 /// M12b: admin-request authentication, re-exported so a deployment that only
 /// depends on `uc2_node` can build a [`StartOpts`] without naming
 /// `uc2_crypto` directly. [`AdminPolicy::Filesystem`] (the `Default`) is

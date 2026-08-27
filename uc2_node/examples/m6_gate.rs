@@ -294,6 +294,7 @@ fn make_config(
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::default(),
     }
 }
 

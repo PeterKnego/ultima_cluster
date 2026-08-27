@@ -63,6 +63,7 @@ fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
         learners: Vec::new(),
         journal_segment_bytes: SEG_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::default(),
     }
 }
 

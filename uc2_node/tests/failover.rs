@@ -214,6 +214,7 @@ fn make_config_ring(
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::none_for_tests(),
     }
 }
 

@@ -149,6 +149,7 @@ fn make_config(
         purge: uc2_node::PurgePolicy::Disabled,
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::none_for_tests(),
     }
 }
 
@@ -369,6 +370,7 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: SEG,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::none_for_tests(),
     };
 
     let v_dir = dir.path().join("v0");

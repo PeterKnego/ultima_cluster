@@ -984,6 +984,7 @@ fn make_config(
         purge: uc2_node::PurgePolicy::Disabled,
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::default(),
     }
 }
 

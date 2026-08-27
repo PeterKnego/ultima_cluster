@@ -45,6 +45,7 @@ use uc_protocol::v2::ipc::{
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
+use crate::services::ServicesConfig;
 use uc2_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
@@ -208,6 +209,11 @@ pub struct NodeConfig {
     /// never silently fall back to cleartext — that would make the whole
     /// feature opt-out per boot, by accident.
     pub crypto: CryptoConfig,
+    /// M14a: the declared service set + FSM lag policy (`[services]`). Default
+    /// `{0}` with `fsm_lag = buffer_bytes / 4`. Validated at `Node::start`
+    /// (`ServicesConfig::validate`) — a bad bound is a named startup refusal
+    /// before any file is created.
+    pub services: ServicesConfig,
 }
 
 /// What a drain achieved before the node stopped.
@@ -7417,6 +7423,7 @@ mod tests {
             purge: PurgePolicy::Disabled,
             journal_segment_bytes: DEFAULT_JOURNAL_SEGMENT_BYTES,
             crypto: CryptoConfig::Disabled,
+            services: ServicesConfig::default(),
         };
         (cfg, dir)
     }

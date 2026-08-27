@@ -181,6 +181,7 @@ fn victim_config(
             allowlist_path,
             rotation: uc2_crypto::rotation::RotationPolicy::default(),
         },
+        services: uc2_node::ServicesConfig::default(),
     }
 }
 
@@ -988,6 +989,7 @@ fn spawn_storm_cluster(faults: FaultConfig) -> (tempfile::TempDir, Vec<Node>, Ve
                 allowlist_path,
                 rotation: uc2_crypto::rotation::RotationPolicy::default(),
             },
+            services: uc2_node::ServicesConfig::default(),
         };
         nodes.push(Node::start_with_socket(cfg, sock).expect("storm node boots"));
     }

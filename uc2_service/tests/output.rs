@@ -118,6 +118,7 @@ fn start_single_node(dir: &Path, app_id: &str) -> Node {
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::default(),
     })
     .unwrap()
 }

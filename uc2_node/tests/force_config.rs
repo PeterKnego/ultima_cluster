@@ -45,6 +45,7 @@ fn config_for(id: u32, addr: SocketAddr, instance_dir: PathBuf) -> NodeConfig {
         purge: PurgePolicy::Disabled,
         journal_segment_bytes: DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::none_for_tests(),
     }
 }
 

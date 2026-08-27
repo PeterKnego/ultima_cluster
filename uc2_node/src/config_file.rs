@@ -35,6 +35,9 @@ use uc2_net::fault::FaultConfig;
 
 use crate::obs::log::LogLevel;
 use crate::preflight::{ObsOptions, StartupOptions};
+#[cfg(test)]
+use crate::services::FsmLag;
+use crate::services::ServicesConfig;
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -172,6 +175,17 @@ struct MetricsSectionFile {
     bind: Option<SocketAddr>,
 }
 
+/// M14a: `[services]` — the declared FSM set and the lag policy (spec §3.3).
+/// `fsm_lag` is a STRING (`"16MiB"`, `"lockstep"`), parsed by
+/// `services::parse_fsm_lag` so the refusal can name the field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServicesSection {
+    ids: Vec<u8>,
+    #[serde(default)]
+    fsm_lag: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NodeConfigFile {
@@ -217,6 +231,9 @@ struct NodeConfigFile {
     /// `[purge]`/`[crypto]`.
     #[serde(default)]
     metrics: Option<MetricsSectionFile>,
+    /// Absent means `[0]` with the default bound (`buffer_bytes / 4`).
+    #[serde(default)]
+    services: Option<ServicesSection>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -407,6 +424,24 @@ pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError
     };
     let metrics_bind = f.metrics.map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".parse().unwrap()));
 
+    let services = match f.services {
+        None => ServicesConfig::default(),
+        Some(s) => {
+            let fsm_lag = match s.fsm_lag.as_deref() {
+                None => None,
+                Some(raw) => Some(
+                    crate::services::parse_fsm_lag(raw)
+                        .map_err(|detail| ConfigError::Invalid { field: "services.fsm_lag", detail })?,
+                ),
+            };
+            let cfg = ServicesConfig::from_ids(&s.ids, fsm_lag)
+                .map_err(|detail| ConfigError::Invalid { field: "services.ids", detail })?;
+            cfg.validate(f.buffer_bytes as u64)
+                .map_err(|detail| ConfigError::Invalid { field: "services.fsm_lag", detail })?;
+            cfg
+        }
+    };
+
     Ok((NodeConfig {
         id: f.id,
         members: f.members.into_iter().map(|m| (m.id, m.addr)).collect(),
@@ -424,6 +459,7 @@ pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError
         purge,
         journal_segment_bytes: f.journal_segment_bytes,
         crypto,
+        services,
     },
     StartupOptions {
         allow_volatile_fs: f.allow_volatile_fs,
@@ -565,6 +601,7 @@ auth = "none"
         assert!(matches!(cfg.purge, PurgePolicy::Disabled));
         assert!(matches!(cfg.crypto, CryptoConfig::Disabled));
         assert!(cfg.learners.is_empty());
+        assert_eq!(cfg.services, ServicesConfig::default());
     }
 
     /// The defaults must produce a config the node can actually START on.
@@ -884,6 +921,56 @@ level = "info"
     /// name-hash-collision refusal in the same loop has no test: exhibiting
     /// a real 64-bit FNV-1a collision needs ~2^32 work, so the check is
     /// carried on its argument, not on a fixture.)
+    #[test]
+    fn services_section_absent_means_fsm_zero_and_the_default_bound() {
+        let (cfg, _) = load_str(MINIMAL).unwrap();
+        assert_eq!(cfg.services, ServicesConfig::default());
+    }
+
+    #[test]
+    fn services_section_parses_ids_and_a_byte_size_lag() {
+        let body = format!("{MINIMAL}\n[services]\nids = [0, 1, 2]\nfsm_lag = \"16MiB\"\n");
+        let (cfg, _) = load_str(&body).unwrap();
+        assert_eq!(cfg.services, ServicesConfig::from_ids(&[0, 1, 2], Some(FsmLag::Bounded(16 << 20))).unwrap());
+    }
+
+    #[test]
+    fn services_section_parses_lockstep() {
+        let body = format!("{MINIMAL}\n[services]\nids = [0, 3]\nfsm_lag = \"lockstep\"\n");
+        let (cfg, _) = load_str(&body).unwrap();
+        assert_eq!(cfg.services.resolve_lag(1 << 26), FsmLag::Lockstep);
+    }
+
+    #[test]
+    fn services_refusals_name_the_field() {
+        for (tail, needle, field) in [
+            ("ids = []", "services.ids must not be empty", "services.ids"),
+            ("ids = [0, 0]", "duplicate service id 0", "services.ids"),
+            ("ids = [0, 9]", "out of range", "services.ids"),
+            ("ids = [1]", "service id 0 must be declared", "services.ids"),
+            ("ids = [0]\nfsm_lag = \"16 MiB\"", "services.fsm_lag must be", "services.fsm_lag"),
+            ("ids = [0]\nfsm_lag = \"0\"", "not a bound", "services.fsm_lag"),
+            // default buffer_bytes is 64 MiB; half is 32 MiB.
+            ("ids = [0]\nfsm_lag = \"32MiB\"", "below buffer_bytes / 2", "services.fsm_lag"),
+        ] {
+            let body = format!("{MINIMAL}\n[services]\n{tail}\n");
+            let err = load_str(&body).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{tail}: expected {needle:?} in {msg:?}");
+            match err {
+                ConfigError::Invalid { field: f, .. } => assert_eq!(f, field, "{tail}"),
+                other => panic!("{tail}: expected Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_typo_inside_services_is_refused() {
+        let body = format!("{MINIMAL}\n[services]\nids = [0]\nfsm_lagg = \"1MiB\"\n");
+        let err = load_str(&body).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
+    }
+
     #[test]
     fn admin_hmac_empty_key_name_is_refused() {
         let body = format!(

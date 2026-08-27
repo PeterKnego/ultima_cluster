@@ -73,6 +73,7 @@ pub fn start_single_node_with_election(
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::default(),
     };
     let node = Node::start(cfg).expect("node start");
     (node, dir)
@@ -166,6 +167,7 @@ pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
             learners: Vec::new(),
             journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
             crypto: uc2_node::CryptoConfig::Disabled,
+            services: uc2_node::ServicesConfig::default(),
         };
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let service = ServiceBuilder::new(

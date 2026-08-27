@@ -415,6 +415,7 @@ fn node_config(
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
+        services: uc2_node::ServicesConfig::default(),
     }
 }
 

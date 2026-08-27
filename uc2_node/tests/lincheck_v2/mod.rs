@@ -255,6 +255,7 @@ fn make_config(
         learners: Vec::new(),
         journal_segment_bytes: ccfg.journal_segment_bytes,
         crypto,
+        services: uc2_node::ServicesConfig::default(),
     }
 }
 

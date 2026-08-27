@@ -20,7 +20,10 @@ use std::time::{Duration, Instant};
 
 use uc2_crypto::admin::{AdminKey, generate_key_file};
 use uc2_net::fault::FaultConfig;
-use uc2_node::{AdminPolicy, CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy};
+use uc2_node::{
+    AdminPolicy, CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy,
+    ServicesConfig,
+};
 
 const APP: &str = "ctlauth";
 
@@ -46,6 +49,7 @@ fn make_config(instance_dir: PathBuf, addr: SocketAddr) -> NodeConfig {
         purge: PurgePolicy::Disabled,
         journal_segment_bytes: DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: CryptoConfig::Disabled,
+        services: ServicesConfig::none_for_tests(),
     }
 }
 

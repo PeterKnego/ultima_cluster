@@ -105,6 +105,7 @@ fn main() -> anyhow::Result<()> {
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
+        services: uc2_node::ServicesConfig::default(),
     };
 
     let node = Node::start(cfg)?;
