@@ -46,7 +46,7 @@ fn make_instance(dir: &Path, app_id: &str, ingress_cap: u64, egress_cap: u64) {
     CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
     MpscRing::create(&dir.join("ingress.ring"), ingress_cap, 128).unwrap();
     MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
-    BroadcastRing::create(&dir.join("egress_service.broadcast"), egress_cap, 128).unwrap();
+    BroadcastRing::create(&dir.join("egress_service.0.broadcast"), egress_cap, 128).unwrap();
     BroadcastRing::create(&dir.join("egress_node.broadcast"), egress_cap, 128).unwrap();
 }
 
@@ -95,7 +95,7 @@ fn injected_retry_frame_is_delivered_as_retry_error() {
     // to the ingress ring before we inject the answer.
     std::thread::sleep(Duration::from_millis(50));
 
-    let mut producer = BroadcastRing::open(&dir.path().join("egress_service.broadcast"))
+    let mut producer = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
         .unwrap()
         .producer();
     producer.write(MSG_V2_RETRY, 0, extra_client(client_id, 0), &[]).unwrap();

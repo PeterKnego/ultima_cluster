@@ -12,9 +12,10 @@
 //!   * `query.ring` (MPSC, clients → node): [`MSG_V2_QUERY`] — payload is the
 //!     query bytes; `flags` bit 0 ([`FLAG_V2_LINEARIZABLE`]) selects
 //!     linearizable vs. snapshot routing.
-//!   * `svc_query.ring` (SPSC, node → service): [`MSG_V2_SVC_QUERY`] —
-//!     payload is `expected_epoch: u64 LE` followed by the query bytes.
-//!   * `egress_service.broadcast` (SERVICE → clients): [`MSG_V2_RESPONSE`] —
+//!   * `svc_query.<id>.ring` (SPSC, node → service): [`MSG_V2_SVC_QUERY`] —
+//!     payload is `expected_epoch: u64 LE` followed by the query bytes. M14a:
+//!     one ring per declared FSM id (`<id>` = `0`..`7`).
+//!   * `egress_service.<id>.broadcast` (SERVICE → clients): [`MSG_V2_RESPONSE`] —
 //!     written by the service apply agent (`uc2_service::egress`), NOT the node
 //!     (the node only creates the ring file; the attaching service owns the
 //!     producer). Payload is `position: u64 LE` followed by the response bytes;

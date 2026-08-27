@@ -38,7 +38,7 @@ fn make_instance(dir: &Path, app_id: &str, ingress_cap: u64, egress_cap: u64) {
     CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
     MpscRing::create(&dir.join("ingress.ring"), ingress_cap, 128).unwrap();
     MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
-    BroadcastRing::create(&dir.join("egress_service.broadcast"), egress_cap, 128).unwrap();
+    BroadcastRing::create(&dir.join("egress_service.0.broadcast"), egress_cap, 128).unwrap();
     BroadcastRing::create(&dir.join("egress_node.broadcast"), egress_cap, 128).unwrap();
 }
 
@@ -184,7 +184,7 @@ fn drain(poll: &mut uc2_client::PollHalf) -> Vec<(u64, Option<u64>, String)> {
 
 /// Egress producer for injecting answers into a synthetic dir.
 fn egress(dir: &std::path::Path) -> uc_protocol::ring::BroadcastProducer {
-    BroadcastRing::open(&dir.join("egress_service.broadcast")).unwrap().producer()
+    BroadcastRing::open(&dir.join("egress_service.0.broadcast")).unwrap().producer()
 }
 
 /// Same as `egress`, but for the NODE broadcast (`egress_node.broadcast`) —

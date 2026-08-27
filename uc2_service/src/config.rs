@@ -15,6 +15,9 @@ pub struct ServiceConfig {
     /// M6 Task 3: the snapshot-building cadence. Default `SnapshotPolicy::default()`
     /// (`interval_bytes: 0`, "never") — see that type's doc.
     pub snapshot_policy: SnapshotPolicy,
+    /// M14a: which declared FSM slot this process is; default 0. Refused at
+    /// attach if not declared on the node's page.
+    pub service_id: u8,
 }
 
 impl ServiceConfig {
@@ -23,6 +26,7 @@ impl ServiceConfig {
             instance_dir: instance_dir.into(),
             app_id: app_id.into(),
             snapshot_policy: SnapshotPolicy::default(),
+            service_id: 0,
         }
     }
 
@@ -33,6 +37,12 @@ impl ServiceConfig {
     /// thread, so a policy set here is simply unused on that path.
     pub fn snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
         self.snapshot_policy = policy;
+        self
+    }
+
+    /// M14a: declare which FSM slot this process is (default 0).
+    pub fn service_id(mut self, id: u8) -> Self {
+        self.service_id = id;
         self
     }
 }

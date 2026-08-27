@@ -165,7 +165,7 @@ fn stale_epoch_svc_query_gets_retry() {
     // Second incarnation: epoch 2. Subscribe to the service egress BEFORE
     // driving the query so the RETRY answer cannot be missed.
     let mut egress =
-        BroadcastRing::open(&dir.path().join("egress_service.broadcast")).unwrap().subscribe();
+        BroadcastRing::open(&dir.path().join("egress_service.0.broadcast")).unwrap().subscribe();
     let svc2 = ServiceBuilder::new(ServiceConfig::new(dir.path(), "q-epoch"), CountSm::default())
         .start()
         .unwrap();
@@ -178,7 +178,7 @@ fn stale_epoch_svc_query_gets_retry() {
     // query is in flight, so the node's barrier never produces onto this ring
     // concurrently — the direct write is the sole producer for this window.
     let (mut producer, _consumer) =
-        SpscRing::open(&dir.path().join("svc_query.ring")).unwrap().into_split();
+        SpscRing::open(&dir.path().join("svc_query.0.ring")).unwrap().into_split();
     let query_bytes = bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap();
     let mut payload = old_epoch.to_le_bytes().to_vec();
     payload.extend_from_slice(&query_bytes);

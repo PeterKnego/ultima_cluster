@@ -129,6 +129,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         let instance_id = attached.instance_id;
         let epoch = attached.epoch;
         let poisoned = Arc::clone(&attached.poisoned);
+        let service_id = attached.service_id;
 
         // 6. Spawn the apply thread. `AgentRunner::drop` already signals+joins,
         //    so a spawn failure below cannot leak a running thread. Keep a shared
@@ -173,7 +174,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         let apply_agent = AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
 
-        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned })
+        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned, service_id })
     }
 
     /// Like [`start`](Self::start), but ALSO spawns the M6 Task 3 snapshot
@@ -204,6 +205,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         let instance_id = attached.instance_id;
         let epoch = attached.epoch;
         let poisoned = Arc::clone(&attached.poisoned);
+        let service_id = attached.service_id;
 
         let mut state = attached.apply_state;
         let sm = Arc::clone(&state.sm);
@@ -280,7 +282,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // it new work.
         agents.push(builder_agent);
 
-        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned })
+        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned, service_id })
     }
 }
 
@@ -306,6 +308,8 @@ pub struct Service<S: RawStateMachine> {
     _cnc: Arc<CncPage>,
     instance_id: u128,
     epoch: u64,
+    /// M14a: which declared FSM slot this process is (`cfg.service_id`).
+    service_id: u8,
 }
 
 impl<S: RawStateMachine> Service<S> {
@@ -319,6 +323,11 @@ impl<S: RawStateMachine> Service<S> {
     /// to at attach).
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// M14a: which declared FSM slot this process is (`ServiceConfig::service_id`).
+    pub fn service_id(&self) -> u8 {
+        self.service_id
     }
 
     /// Direct, synchronous raw query against the live state machine on the

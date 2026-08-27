@@ -78,14 +78,24 @@ impl InstanceDir {
     pub fn query_ring(&self) -> PathBuf {
         self.root.join("query.ring")
     }
-    pub fn svc_query_ring(&self) -> PathBuf {
-        self.root.join("svc_query.ring")
-    }
-    pub fn egress_service(&self) -> PathBuf {
-        self.root.join("egress_service.broadcast")
-    }
     pub fn egress_node(&self) -> PathBuf {
         self.root.join("egress_node.broadcast")
+    }
+    /// M14a: the node→service query ring for service `id`.
+    pub fn svc_query_ring_for(&self, id: u8) -> PathBuf {
+        self.root.join(format!("svc_query.{id}.ring"))
+    }
+    /// M14a: service `id`'s response broadcast (service → clients).
+    pub fn egress_service_for(&self, id: u8) -> PathBuf {
+        self.root.join(format!("egress_service.{id}.broadcast"))
+    }
+    /// M14a: service `id`'s snapshot directory (`snapshots/<id>/`).
+    pub fn snapshot_dir_for(&self, id: u8) -> PathBuf {
+        self.root.join("snapshots").join(id.to_string())
+    }
+    /// M14a: the exclusive flock a service process takes for its id.
+    pub fn service_lock_for(&self, id: u8) -> PathBuf {
+        self.root.join(format!("service.{id}.lock"))
     }
 }
 
@@ -117,7 +127,11 @@ mod tests {
         assert_eq!(d.cnc_path(), dir.path().join("cnc2.dat"));
         assert_eq!(d.log_path(), dir.path().join("log.buf"));
         assert_eq!(d.ingress_ring(), dir.path().join("ingress.ring"));
-        assert_eq!(d.egress_service(), dir.path().join("egress_service.broadcast"));
         assert_eq!(d.egress_node(), dir.path().join("egress_node.broadcast"));
+        assert_eq!(d.svc_query_ring_for(0), dir.path().join("svc_query.0.ring"));
+        assert_eq!(d.svc_query_ring_for(7), dir.path().join("svc_query.7.ring"));
+        assert_eq!(d.egress_service_for(3), dir.path().join("egress_service.3.broadcast"));
+        assert_eq!(d.snapshot_dir_for(1), dir.path().join("snapshots").join("1"));
+        assert_eq!(d.service_lock_for(2), dir.path().join("service.2.lock"));
     }
 }

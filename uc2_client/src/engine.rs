@@ -55,7 +55,8 @@ use crate::slots::{ReqKind, Resolve, SlotTable};
 pub(crate) const CNC_FILE: &str = "cnc2.dat";
 pub(crate) const INGRESS_RING: &str = "ingress.ring";
 pub(crate) const QUERY_RING: &str = "query.ring";
-pub(crate) const EGRESS_SERVICE: &str = "egress_service.broadcast";
+/// M14a: FSM 0's ring — the default responder. M14b opens every declared id's ring.
+pub(crate) const EGRESS_SERVICE: &str = "egress_service.0.broadcast";
 pub(crate) const EGRESS_NODE: &str = "egress_node.broadcast";
 
 /// Engine attach configuration.

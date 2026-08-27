@@ -144,8 +144,8 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         "cnc2.dat",
         "ingress.ring",
         "query.ring",
-        "svc_query.ring",
-        "egress_service.broadcast",
+        "svc_query.0.ring",
+        "egress_service.0.broadcast",
         "egress_node.broadcast",
     ] {
         let _ = std::fs::remove_file(a.instance_dir.join(f));
@@ -168,7 +168,7 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("create ingress ring: {e}"))?;
     MpscRing::create(&a.instance_dir.join("query.ring"), a.ingress_bytes, MAX_MSG)
         .map_err(|e| anyhow::anyhow!("create query ring: {e}"))?;
-    BroadcastRing::create(&a.instance_dir.join("egress_service.broadcast"), a.egress_bytes, MAX_MSG)
+    BroadcastRing::create(&a.instance_dir.join("egress_service.0.broadcast"), a.egress_bytes, MAX_MSG)
         .map_err(|e| anyhow::anyhow!("create egress_service ring: {e}"))?;
     BroadcastRing::create(&a.instance_dir.join("egress_node.broadcast"), a.egress_bytes, MAX_MSG)
         .map_err(|e| anyhow::anyhow!("create egress_node ring: {e}"))?;
@@ -191,7 +191,7 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     let (_query_producer, mut query) = MpscRing::open(&a.instance_dir.join("query.ring"))
         .map_err(|e| anyhow::anyhow!("open query ring: {e}"))?
         .into_split();
-    let mut egress = BroadcastRing::open(&a.instance_dir.join("egress_service.broadcast"))
+    let mut egress = BroadcastRing::open(&a.instance_dir.join("egress_service.0.broadcast"))
         .map_err(|e| anyhow::anyhow!("open egress_service ring: {e}"))?
         .producer();
 

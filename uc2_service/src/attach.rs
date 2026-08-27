@@ -33,6 +33,8 @@ pub(crate) struct Attached<S: RawStateMachine> {
     /// Shared poison flag (see [`ApplyState::poisoned`]) — the `Service`
     /// handle keeps a clone so `is_alive` can report a poisoned incarnation.
     pub(crate) poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// M14a: which declared FSM slot this attach is for (`cfg.service_id`).
+    pub(crate) service_id: u8,
 }
 
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
@@ -56,12 +58,13 @@ pub(crate) fn attach<S: RawStateMachine>(
         Arc::new(LogBuffer::open_file(&dir.join("log.buf"), Arc::clone(&cnc), meta.max_payload as usize)?);
 
     // 3. Egress producer (service→everyone responses) + svc_query consumer
-    //    (node→service queries; drained by Task 11).
-    let egress_ring = BroadcastRing::open(&dir.join("egress_service.broadcast"))
+    //    (node→service queries; drained by Task 11). M14a: named for this
+    //    process's declared `service_id` (not yet enforced — Task 6).
+    let egress_ring = BroadcastRing::open(&dir.join(format!("egress_service.{}.broadcast", cfg.service_id)))
         .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let egress = Egress::new(egress_ring.producer());
-    let svc_query_ring =
-        SpscRing::open(&dir.join("svc_query.ring")).map_err(|e| ServiceError::Ring(e.to_string()))?;
+    let svc_query_ring = SpscRing::open(&dir.join(format!("svc_query.{}.ring", cfg.service_id)))
+        .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let (_svc_query_producer, svc_query) = svc_query_ring.into_split();
 
     // 4. Publish the applied frontier. Over-reporting above the journal
@@ -131,5 +134,5 @@ pub(crate) fn attach<S: RawStateMachine>(
         snapshot_restore: None,
     };
 
-    Ok(Attached { apply_state, buffer, cnc, instance_id, epoch, poisoned })
+    Ok(Attached { apply_state, buffer, cnc, instance_id, epoch, poisoned, service_id: cfg.service_id })
 }

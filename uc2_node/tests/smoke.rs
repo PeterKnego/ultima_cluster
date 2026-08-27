@@ -94,8 +94,9 @@ fn instance_dir_lock_and_cnc_publication() {
     // The shared-memory ring files exist (created fresh at boot).
     assert!(dir.path().join("ingress.ring").exists());
     assert!(dir.path().join("query.ring").exists());
-    assert!(dir.path().join("svc_query.ring").exists());
-    assert!(dir.path().join("egress_service.broadcast").exists());
+    assert!(dir.path().join("svc_query.0.ring").exists());
+    assert!(dir.path().join("egress_service.0.broadcast").exists());
+    assert!(!dir.path().join("svc_query.ring").exists(), "the legacy singular name is not created");
     assert!(dir.path().join("egress_node.broadcast").exists());
 
     node.stop();

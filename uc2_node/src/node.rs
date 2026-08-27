@@ -32,8 +32,8 @@ use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscProducer, SpscRing,
 };
 use uc_protocol::v2::cnc::{
-    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
-    NODE_FLAG_LEADER,
+    CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
+    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, align_frame_len};
@@ -399,11 +399,12 @@ fn admission_open(append: u64, commit: u64, budget: u64) -> bool {
 /// halves (the ingress + query CONSUMERs, the egress_node + svc_query
 /// PRODUCERs) are handed to the consensus agent, and the counterpart halves —
 /// which attaching clients/service open the files for themselves — are dropped
-/// in `create_rings`. `egress_service` is the service's producer ring; the node
-/// only creates + retains the file so the service can open it.
+/// in `create_rings`. M14a: `egress_services` is one entry per RING id
+/// (`ServicesConfig::ring_ids`) — each is the service's producer ring; the
+/// node only creates + retains the file so the service can open it.
 #[allow(dead_code)]
 struct Rings {
-    egress_service: BroadcastRing,
+    egress_services: Vec<BroadcastRing>,
 }
 
 pub struct Node {
@@ -535,6 +536,12 @@ impl Node {
             ))
         })?;
 
+        // M14a: the lag bound is validated BEFORE any file is created — a
+        // named startup refusal, like a bad crypto key.
+        cfg.services
+            .validate(cfg.buffer_bytes as u64)
+            .map_err(|d| io::Error::new(io::ErrorKind::InvalidInput, d))?;
+
         let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
 
         // M12b (spec §5.3): the admin audit file, opened for append BEFORE
@@ -625,6 +632,11 @@ impl Node {
         let cnc = CncPage::create_file(&instance.cnc_path(), &meta).map_err(to_io)?;
         cnc.counters().prime(durable);
 
+        // M14a: the declared set and the lag policy, published ONCE, before
+        // any agent runs; services and clients read them from the page.
+        cnc.store_services_declared(cfg.services.declared());
+        cnc.store_fsm_lag_bytes(cfg.services.page_lag_value(cfg.buffer_bytes as u64));
+
         // 4. Log buffer file: reuse the existing file when it already matches the
         // configured capacity (preserves ring bytes below `durable` across a
         // restart — free NAK-serving prefill), else create it fresh.
@@ -653,7 +665,8 @@ impl Node {
         // prior attachment is invalidated by the new instance_id anyway).
         // `ingress`/`egress_node` are pre-split: the consensus agent is the
         // sole owner of the consumer/producer half it drives (Task 7).
-        let (rings, ingress_ring, egress_node, query_ring, svc_query) = create_rings(&instance)?;
+        let (rings, ingress_ring, egress_node, query_ring, svc_query) =
+            create_rings(&instance, &cfg.services)?;
 
         // M7 (spec 2026-07-13): recover the durable `ConfigRecord` — genesis-seed
         // on a fresh instance dir, T5-carry revert of a record ahead of durable,
@@ -881,7 +894,10 @@ impl Node {
         // M6 Task 6: snapshot session wiring. `snap_dir` holds the position-tagged
         // artifacts (shared with the service's builder); `incoming_snapshot` is the
         // node-internal signal the receiver raises on a completed inbound transfer.
-        let snap_dir = cfg.instance_dir.join("snapshots");
+        // M14a: ships FSM 0's artifact ONLY — the snapshot transfer plane is not
+        // yet per-id (see deviation 3 in the M14a plan); M14c generalizes this to
+        // every declared id.
+        let snap_dir = instance.snapshot_dir_for(0);
         let _ = std::fs::create_dir_all(&snap_dir);
         let incoming_snapshot = Arc::new(AtomicU64::new(0));
         // M7 Task 6: companion cell for `incoming_snapshot` — the encoded config
@@ -1212,6 +1228,7 @@ impl Node {
             egress_node,
             query_ring,
             svc_query,
+            services: cfg.services,
             pending_reads: Vec::new(),
             current_round: None,
             next_round_seq: 1,
@@ -1706,10 +1723,16 @@ struct Consensus {
     /// The client query ring's consumer half (Task 11, MPSC) — the consensus
     /// thread is its sole reader (`MSG_V2_QUERY`; `flags` bit 0 = linearizable).
     query_ring: MpscConsumer,
-    /// The node→service query ring's producer half (Task 11, SPSC) — the
-    /// consensus agent is its single writer (`MSG_V2_SVC_QUERY`; payload =
-    /// `expected_epoch: u64 LE ++ query bytes`).
-    svc_query: SpscProducer,
+    /// The node→service query rings' producer halves (Task 11, SPSC), one per
+    /// ring id (M14a: `Vec` len [`CNC_MAX_SERVICES`], `Some` for every declared
+    /// ring id) — the consensus agent is each ring's single writer
+    /// (`MSG_V2_SVC_QUERY`; payload = `expected_epoch: u64 LE ++ query bytes`).
+    svc_query: Vec<Option<SpscProducer>>,
+    /// M14a: a copy of `NodeConfig::services` — the declared set + lag policy.
+    /// Unused by this task's consensus logic; Task 5 routes `forward_svc_query`
+    /// by `read.service_id` and Task 6 answers `MSG_V2_BAD_SERVICE` from it.
+    #[allow(dead_code)]
+    services: ServicesConfig,
     /// In-flight linearizable reads parked between admission and forward/retry
     /// (the ReadIndex barrier state machine). Small — one entry per outstanding
     /// client read; walked every duty cycle (bounded by outstanding reads).
@@ -3291,23 +3314,30 @@ impl Consensus {
         let _ = self.egress_node.write(MSG_V2_RETRY, 0, extra, &[]);
     }
 
-    /// Forward a barrier-passed (or snapshot) read to the service on
-    /// `svc_query.ring`: payload = `expected_epoch: u64 LE ++ query bytes`,
+    /// Forward a barrier-passed (or snapshot) read to service `service_id`'s
+    /// `svc_query.<id>.ring`: payload = `expected_epoch: u64 LE ++ query bytes`,
     /// `header_extra` echoing the client identity so the service's answer routes
     /// back. `expected_epoch == 0` means "skip the epoch check" (snapshot reads).
-    /// Returns `false` if the ring is momentarily full (the caller retries).
+    /// Returns `false` if the ring is momentarily full (the caller retries) OR
+    /// `service_id` is not a ring id (M14b answers `MSG_V2_BAD_SERVICE` before
+    /// reaching here).
     fn forward_svc_query(
         &mut self,
+        service_id: u8,
         client_id: u32,
         local_seq: u32,
         expected_epoch: u64,
         query: &[u8],
     ) -> bool {
+        let Some(producer) = self.svc_query.get_mut(service_id as usize).and_then(|p| p.as_mut())
+        else {
+            return false; // not a ring id — M14b answers MSG_V2_BAD_SERVICE before reaching here
+        };
         let mut payload = Vec::with_capacity(8 + query.len());
         payload.extend_from_slice(&expected_epoch.to_le_bytes());
         payload.extend_from_slice(query);
         let extra = extra_client(client_id, local_seq);
-        self.svc_query.try_write(MSG_V2_SVC_QUERY, 0, extra, &payload).is_ok()
+        producer.try_write(MSG_V2_SVC_QUERY, 0, extra, &payload).is_ok()
     }
 
     /// Send a nonce'd READ_PROBE to every follower over the consensus socket,
@@ -3450,7 +3480,7 @@ impl Consensus {
                     let (client_id, local_seq) = client_from_extra(rec.header_extra);
                     if rec.flags & FLAG_V2_LINEARIZABLE == 0 {
                         // Snapshot: forward immediately, epoch check skipped (0).
-                        self.forward_svc_query(client_id, local_seq, 0, &buf);
+                        self.forward_svc_query(0, client_id, local_seq, 0, &buf);
                         continue;
                     }
                     // Linearizable: only a serving leader can confirm a read.
@@ -3617,7 +3647,7 @@ impl Consensus {
                     let client_id = self.pending_reads[i].client_id;
                     let local_seq = self.pending_reads[i].local_seq;
                     let query = std::mem::take(&mut self.pending_reads[i].query);
-                    if self.forward_svc_query(client_id, local_seq, e, &query) {
+                    if self.forward_svc_query(0, client_id, local_seq, e, &query) {
                         self.pending_reads.swap_remove(i);
                         did = true;
                         continue;
@@ -4988,48 +5018,64 @@ fn open_or_create_buffer(
 /// file first — a prior instance's attachment is invalidated by the new
 /// instance_id anyway). Sizes are fixed by the spec: ingress 4 MiB, query
 /// 1 MiB, svc_query 1 MiB, both broadcasts 4 MiB; 64 KiB max message each.
+/// M14a: one `svc_query.<id>.ring` (SPSC, 1 MiB) + one
+/// `egress_service.<id>.broadcast` (broadcast, 4 MiB) + one `snapshots/<id>/`
+/// per id in `services.ring_ids()` — 5 MiB per id, part of the boot
+/// reservation (instance-directory.md).
 /// Returns the retained `Rings`, plus the four node-side ring halves the
 /// consensus agent drives: the ingress ring's CONSUMER + the node egress ring's
-/// PRODUCER (Task 7), and the query ring's CONSUMER + the svc_query ring's
-/// PRODUCER (Task 11 — the node reads client queries and forwards barrier-passed
-/// reads to the service). Every counterpart half (the ingress + query
-/// producers, the egress_node consumer, the svc_query consumer) is dropped
-/// here: the node never uses them, and attaching clients/service open the files
-/// themselves to get their own halves.
+/// PRODUCER (Task 7), the query ring's CONSUMER (Task 11 — the node reads
+/// client queries and forwards barrier-passed reads to the service), and the
+/// per-id `svc_query` PRODUCERs (`Some` for every ring id, `None` otherwise).
+/// Every counterpart half (the ingress + query producers, the egress_node
+/// consumer, the svc_query consumers) is dropped here: the node never uses
+/// them, and attaching clients/service open the files themselves to get their
+/// own halves.
+#[allow(clippy::type_complexity)]
 fn create_rings(
     dir: &InstanceDir,
-) -> io::Result<(Rings, MpscConsumer, BroadcastProducer, MpscConsumer, SpscProducer)> {
+    services: &ServicesConfig,
+) -> io::Result<(Rings, MpscConsumer, BroadcastProducer, MpscConsumer, Vec<Option<SpscProducer>>)> {
     const MIB: u64 = 1 << 20;
     const MAX_MSG: u32 = 64 << 10;
-    for p in [
+    // Unlink every ring this or a PREVIOUS layout could have left (the
+    // cnc-2.0 singular names included): a stale file's attachment is
+    // invalidated by the new instance_id anyway.
+    let mut stale = vec![
         dir.ingress_ring(),
         dir.query_ring(),
-        dir.svc_query_ring(),
-        dir.egress_service(),
         dir.egress_node(),
-    ] {
+        dir.root.join("svc_query.ring"),
+        dir.root.join("egress_service.broadcast"),
+    ];
+    for id in 0..CNC_MAX_SERVICES as u8 {
+        stale.push(dir.svc_query_ring_for(id));
+        stale.push(dir.egress_service_for(id));
+    }
+    for p in stale {
         let _ = std::fs::remove_file(&p);
     }
     let ingress = MpscRing::create(&dir.ingress_ring(), 4 * MIB, MAX_MSG).map_err(to_io)?;
     let (_ingress_producer, ingress_consumer) = ingress.into_split();
     let egress_node = BroadcastRing::create(&dir.egress_node(), 4 * MIB, MAX_MSG).map_err(to_io)?;
     let egress_node_producer = egress_node.producer();
-    // Query ring (clients → node, MPSC): keep the node's CONSUMER half.
     let query = MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?;
     let (_query_producer, query_consumer) = query.into_split();
-    // svc_query ring (node → service, SPSC): keep the node's PRODUCER half.
-    let svc_query = SpscRing::create(&dir.svc_query_ring(), MIB, MAX_MSG).map_err(to_io)?;
-    let (svc_query_producer, _svc_query_consumer) = svc_query.into_split();
-    Ok((
-        Rings {
-            egress_service: BroadcastRing::create(&dir.egress_service(), 4 * MIB, MAX_MSG)
-                .map_err(to_io)?,
-        },
-        ingress_consumer,
-        egress_node_producer,
-        query_consumer,
-        svc_query_producer,
-    ))
+    // M14a: one svc_query (SPSC, 1 MiB) + one egress_service (broadcast,
+    // 4 MiB) + one snapshots/<id>/ per ring id. 5 MiB per id, fallocated —
+    // part of the boot reservation (instance-directory.md).
+    let mut svc_query: Vec<Option<SpscProducer>> = (0..CNC_MAX_SERVICES).map(|_| None).collect();
+    let mut egress_services = Vec::new();
+    for id in services.ring_ids() {
+        let ring = SpscRing::create(&dir.svc_query_ring_for(id), MIB, MAX_MSG).map_err(to_io)?;
+        let (producer, _consumer) = ring.into_split();
+        svc_query[id as usize] = Some(producer);
+        egress_services.push(
+            BroadcastRing::create(&dir.egress_service_for(id), 4 * MIB, MAX_MSG).map_err(to_io)?,
+        );
+        std::fs::create_dir_all(dir.snapshot_dir_for(id))?;
+    }
+    Ok((Rings { egress_services }, ingress_consumer, egress_node_producer, query_consumer, svc_query))
 }
 
 // --------------------------------------------------------- M7 config helpers
@@ -5765,8 +5811,10 @@ mod tests {
                 .producer();
         let (_query_producer, query_ring) =
             MpscRing::create(&dir.path().join("query.ring"), 4096, 1024).unwrap().into_split();
-        let (svc_query, _svc_query_consumer) =
-            SpscRing::create(&dir.path().join("svc_query.ring"), 4096, 1024).unwrap().into_split();
+        let (svc_query_0, _svc_query_consumer) =
+            SpscRing::create(&dir.path().join("svc_query.0.ring"), 4096, 1024).unwrap().into_split();
+        let mut svc_query: Vec<Option<SpscProducer>> = (0..CNC_MAX_SERVICES).map(|_| None).collect();
+        svc_query[0] = Some(svc_query_0);
 
         let cons = Consensus {
             reports_unattested: Arc::new(AtomicU64::new(0)),
@@ -5788,6 +5836,7 @@ mod tests {
             egress_node,
             query_ring,
             svc_query,
+            services: ServicesConfig::default(),
             pending_reads: Vec::new(),
             current_round: None,
             next_round_seq: 1,

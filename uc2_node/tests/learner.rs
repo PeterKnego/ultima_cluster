@@ -443,7 +443,7 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     // journal-replay datagram below the adopted position and be dropped as a dup.
     let floor = (durable / 2) / 128 * 128;
     assert!(floor > SEG, "need >1 segment below the floor (durable={durable})");
-    let snap_dir = v_dir.join("snapshots");
+    let snap_dir = v_dir.join("snapshots").join("0");
     std::fs::create_dir_all(&snap_dir).unwrap();
     std::fs::write(snap_dir.join(format!("snap-{floor}.ultsnap")), vec![0x5Au8; 4096]).unwrap();
     cnc.snapshots().service_snapshot_pos.store_release(floor);

@@ -139,7 +139,7 @@ fn service_applies_committed_frames_and_publishes_responses() {
     // Subscribe to the egress BEFORE submitting: a broadcast subscriber is
     // "join-and-listen" (it skips records published before it joined), so
     // joining first guarantees we observe every response.
-    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.broadcast")).unwrap().subscribe();
+    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast")).unwrap().subscribe();
 
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "svc-test"), CountSm::default())
         .start()
@@ -185,7 +185,7 @@ fn egress_frame_layout_is_byte_pinned() {
     let node = Node::start(node_config(dir.path(), "layout")).unwrap();
     wait_until(|| node.can_serve());
 
-    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.broadcast")).unwrap().subscribe();
+    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast")).unwrap().subscribe();
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "layout"), CountSm::default())
         .start()
         .unwrap();

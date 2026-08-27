@@ -475,7 +475,7 @@ mod tests {
         uc2_log::cnc::CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
         MpscRing::create(&dir.join("ingress.ring"), MIB, 128).unwrap();
         MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
-        BroadcastRing::create(&dir.join("egress_service.broadcast"), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join("egress_service.0.broadcast"), MIB, 128).unwrap();
         BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 128).unwrap();
     }
 

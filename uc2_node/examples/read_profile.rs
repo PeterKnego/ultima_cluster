@@ -194,7 +194,7 @@ use uc_protocol::v2::ipc::{
 /// may take: this harness is an ATTACHING party, exactly like `uc2_client`.
 const CNC_FILE: &str = "cnc2.dat";
 const QUERY_RING: &str = "query.ring";
-const EGRESS_SERVICE: &str = "egress_service.broadcast";
+const EGRESS_SERVICE: &str = "egress_service.0.broadcast";
 const EGRESS_NODE: &str = "egress_node.broadcast";
 const INGRESS_RING: &str = "ingress.ring";
 
