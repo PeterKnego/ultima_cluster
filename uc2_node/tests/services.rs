@@ -531,11 +531,34 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
     assert_eq!(client.query_linearizable_on::<(), u64>(0, &()).unwrap().wait().unwrap(), 6);
     assert!(matches!(client.submit_to::<Cmd, u64>(2, &Cmd::Add(1)), Err(ClientError::ServiceNotDeclared { id: 2, declared: 0b11 })));
     assert!(matches!(client.query_snapshot_on::<(), u64>(7, &()), Err(ClientError::ServiceNotDeclared { id: 7, declared: 0b11 })));
-    // The default `submit` still means FSM 0 — and FSM 1's answer to it is
-    // dropped as a wrong-ring record, counted.
+    // `try_submit_to`/`try_submit` put an IDENTICAL wire frame on the
+    // ingress ring — `expected` is client-local, never transmitted — so
+    // every declared FSM applies and answers every frame regardless of who
+    // asked; only the reader's own `expected` mask decides whether an
+    // answer completes its request or gets dropped. `PollHalf::poll` drains
+    // each declared FSM's ring in ascending id order (ring 0 before ring
+    // 1), every cycle. That makes the earlier `submit_to(1, ..)` call above
+    // a STRUCTURALLY guaranteed wrong-ring drop: ring 0 (FSM 0's answer) is
+    // read first and is NOT the expected ring (`expected = bit(1)`), so it
+    // is rejected as `WrongRing` and counted, unconditionally, before ring
+    // 1 (FSM 1's real, expected answer) is even reached in the same cycle —
+    // `dropped_before` (below) already counts ≥ 1 because of it. The DEFAULT
+    // `submit` below is the opposite case: it targets FSM 0
+    // (`expected = bit(0)`), and ring 0 is BOTH the expected ring and the
+    // one read first, so FSM 0's answer resolves (and frees) the slot
+    // before FSM 1's late answer for the same wire seq is drained; that
+    // straggler then finds the slot already free and is counted as a
+    // `duplicates` (`Resolve::Miss`) drop, not a `wrong_ring` one — the two
+    // stats are siblings on the very same `handle_record` match (`engine.rs`),
+    // one per outcome of the SAME race, so summing them isolates "was FSM
+    // 1's answer to THIS submit dropped and counted" without depending on
+    // which specific outcome an FSM-vs-FSM apply/publish race lands on.
+    let dropped_before = client.stats().wrong_ring + client.stats().duplicates;
     let d: u64 = client.submit::<Cmd, u64>(&Cmd::Add(1)).unwrap().wait().unwrap();
     assert_eq!(d, 7);
-    wait_until("FSM 1's answer to the default submit was dropped", || client.stats().wrong_ring >= 1);
+    wait_until("FSM 1's answer to the default submit was dropped", || {
+        client.stats().wrong_ring + client.stats().duplicates > dropped_before
+    });
     client.shutdown();
     // The blocking shim mirrors all four.
     let c = Client::connect(dir.path(), APP).unwrap();
