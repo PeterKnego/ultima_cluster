@@ -313,7 +313,7 @@ impl SendHalf {
         let deadline_ns = s.t0.elapsed().as_nanos() as u64 + s.timeout_ns;
         let seq = s
             .table
-            .claim(user_data, kind, deadline_ns)
+            .claim(user_data, kind, deadline_ns, 0b1, false)
             .map_err(|_| SubmitError::Backpressure)?; // WindowFull and SlotBusy alike
         let write_result = ring.try_write(msg_type, flags, extra_client(s.client_id, seq as u32), bytes);
         finish_write(&s.table, &s.stats, seq, write_result)
@@ -517,8 +517,8 @@ fn handle_record(
             } else {
                 ReqKind::Submit
             };
-            match shared.table.resolve(wire_seq, Some(delivered)) {
-                Resolve::Won { user_data } => {
+            match shared.table.resolve(wire_seq, Some(delivered), Some(0)) {
+                Resolve::Won { user_data, .. } => {
                     let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
@@ -538,6 +538,9 @@ fn handle_record(
                     shared.stats.duplicates.fetch_add(1, Ordering::Relaxed);
                     0
                 }
+                // Task 4 gives these their real handling (partial fan-in
+                // accounting; a response from a ring the slot didn't expect).
+                Resolve::Partial | Resolve::WrongRing => 0,
             }
         }
         MSG_V2_NOT_LEADER => {
@@ -547,9 +550,9 @@ fn handle_record(
                 buf.get(..8).and_then(|s| s.try_into().ok()).unwrap_or([0xff; 8]),
             );
             let hint = if hint_raw == u64::MAX { None } else { Some(hint_raw as u32) };
-            match shared.table.resolve(wire_seq, None) {
+            match shared.table.resolve(wire_seq, None, None) {
                 // kind-agnostic: a pre-side-effect signal
-                Resolve::Won { user_data } => {
+                Resolve::Won { user_data, .. } => {
                     shared.stats.not_leader.fetch_add(1, Ordering::Relaxed);
                     cb(Completion { user_data, position: None, outcome: Outcome::NotLeader { hint } });
                     1
@@ -557,8 +560,8 @@ fn handle_record(
                 _ => 0, // stale redirect for an already-resolved slot: no side effect to guard
             }
         }
-        MSG_V2_RETRY => match shared.table.resolve(wire_seq, None) {
-            Resolve::Won { user_data } => {
+        MSG_V2_RETRY => match shared.table.resolve(wire_seq, None, None) {
+            Resolve::Won { user_data, .. } => {
                 shared.stats.retry.fetch_add(1, Ordering::Relaxed);
                 cb(Completion { user_data, position: None, outcome: Outcome::Retry });
                 1
@@ -632,7 +635,7 @@ mod tests {
     fn lost_release_after_a_concurrent_completion_reports_accepted_not_refused() {
         let table = SlotTable::new(8, 0);
         let stats = StatCells::default();
-        let seq = table.claim(0xABCD, ReqKind::Submit, u64::MAX).unwrap();
+        let seq = table.claim(0xABCD, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
 
         // Something else (instance-restart drain, or the deadline sweep)
         // wins the slot's completion before our write ever lands.
@@ -656,7 +659,7 @@ mod tests {
     fn ordinary_write_failure_with_an_uncontested_release_still_refuses() {
         let table = SlotTable::new(8, 0);
         let stats = StatCells::default();
-        let seq = table.claim(0xBEEF, ReqKind::Submit, u64::MAX).unwrap();
+        let seq = table.claim(0xBEEF, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
 
         let result = finish_write(&table, &stats, seq, Err(RingError::Full));
         assert!(matches!(result, Err(SubmitError::Backpressure)), "{result:?}");
