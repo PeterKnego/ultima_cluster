@@ -487,9 +487,6 @@ pub struct FollowerStats {
 /// under clippy's type-complexity threshold.
 pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>);
 
-/// One artifact inside an inbound session. `base` is its first byte's
-/// STREAM-GLOBAL offset — the session is one concatenated byte stream whose
-/// artifact boundaries the BEGINs announce, so the repair path is unchanged.
 /// M14c: the identity of the last INBOUND session that completed here — what
 /// [`FollowerReceiver::snap_last_done`] re-acks a straggling `SNAP_BEGIN`
 /// against. The artifact list is part of the identity on purpose: a leader that
@@ -503,6 +500,9 @@ struct SnapDone {
     artifacts: Vec<(u8, u64)>,
 }
 
+/// One artifact inside an inbound session. `base` is its first byte's
+/// STREAM-GLOBAL offset — the session is one concatenated byte stream whose
+/// artifact boundaries the BEGINs announce, so the repair path is unchanged.
 struct SnapPart {
     service_id: u8,
     snapshot_pos: u64,
@@ -716,6 +716,22 @@ fn next_declared_id(declared: u64, after: Option<u8>) -> Option<u8> {
         return None;
     }
     Some((from + rest.trailing_zeros()) as u8)
+}
+
+/// M14c: abandon an inbound intake's artifacts — close each still-open `.part`
+/// and delete it. An artifact already renamed (`done`) has none left to remove.
+/// Called whenever an intake is dropped rather than completed (a named refusal,
+/// or a new session replacing a stale one), so an abandoned session cannot
+/// leave a pre-sized `incoming-*.part` under `snapshots/<id>/` forever — those
+/// are `set_len`'d to the artifact's full size, so a leak is real disk.
+fn discard_snap_parts(parts: Vec<SnapPart>) {
+    for p in parts {
+        if p.done {
+            continue;
+        }
+        drop(p.file); // close before unlink
+        let _ = std::fs::remove_file(&p.part_path);
+    }
 }
 
 /// M14c: open the `.part` for one announced artifact under `<root>/<id>/`. Free
@@ -1560,6 +1576,19 @@ impl FollowerReceiver {
             DGRAM_KIND_SNAP_BEGIN => {
                 if let Some(b) = read_snap_begin_body(&d[DATAGRAM_HEADER_LEN..]) {
                     self.snap_begin(from, b);
+                } else if self.snap_dir.is_some() {
+                    // M14c: a body we cannot even DECODE is the other, and more
+                    // realistic, half of the `peer wire 0.5.0` refusal: a
+                    // genuine 0.5.0 `SNAP_BEGIN` body is 26 bytes plus its
+                    // config, so it fails `read_snap_begin_body`'s
+                    // `SNAP_BEGIN_FIXED_LEN` (34) check and would otherwise
+                    // vanish with BOTH refusal counters at zero — exactly the
+                    // flag-day symptom an operator needs to see. Same named
+                    // refusal, same drop as a wrong `layout` byte. Only counted
+                    // on a node that receives snapshots at all (elsewhere kinds
+                    // 12/13 are ignored wholesale).
+                    self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
+                    self.snap_drop_intake_from(from);
                 }
             }
             DGRAM_KIND_SNAP_CHUNK => {
@@ -1604,7 +1633,7 @@ impl FollowerReceiver {
         if b.layout != SNAP_BEGIN_LAYOUT_V2 {
             // "peer wire 0.5.0" — a body whose discriminator we do not speak.
             self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
-            self.snap_intake = None;
+            self.snap_drop_intake_from(from);
             return;
         }
         // The id must be inside the mask, and the mask must be OURS. A shift by
@@ -1613,7 +1642,7 @@ impl FollowerReceiver {
         let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
         if b.services_declared != self.own_declared || b.services_declared & bit == 0 {
             self.stats.snap_refused_declared_mismatch.fetch_add(1, Ordering::Relaxed);
-            self.snap_intake = None;
+            self.snap_drop_intake_from(from);
             return;
         }
         if b.total_len == 0 {
@@ -1670,6 +1699,9 @@ impl FollowerReceiver {
             self.snap_probe_missing_begin(from, b.session, 0);
             return;
         }
+        // Replace any stale intake BEFORE opening this one: its `.part` files
+        // must not leak, and the new session may re-use the very same path.
+        self.snap_discard_intake();
         let Some(part) = open_snap_part(&root, &b, 0) else {
             return;
         };
@@ -1686,6 +1718,25 @@ impl FollowerReceiver {
             config: b.config,
         });
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M14c: drop the in-flight intake, if any, deleting its `.part` files.
+    fn snap_discard_intake(&mut self) {
+        if let Some(intake) = self.snap_intake.take() {
+            discard_snap_parts(intake.parts);
+        }
+    }
+
+    /// M14c: a named `SNAP_BEGIN` refusal has just been counted — drop the
+    /// session it refuses. ONLY this peer's intake: a forged or legacy BEGIN
+    /// from any OTHER address must not tear down an unrelated live transfer
+    /// (it is counted and the datagram discarded, nothing more). A refusal from
+    /// the peer we are actually transferring with does drop the session — its
+    /// leader is speaking a wire we cannot finish the transfer on.
+    fn snap_drop_intake_from(&mut self, from: SocketAddr) {
+        if self.snap_intake.as_ref().is_some_and(|cur| cur.peer == from) {
+            self.snap_discard_intake();
+        }
     }
 
     /// M14c: a `SNAP_BEGIN` we cannot place — prompt the leader for the
@@ -4428,5 +4479,231 @@ mod tests {
         let runs = frame_runs(&[b"aaaa"], 4096);
         leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
         drive_until(&mut r, || b.counters().append.load_acquire() == runs[0].2);
+    }
+
+    // ---- M14c: the per-id intake's placement guard, probe and DONE latch ----
+
+    /// A `SNAP_BEGIN` body as the leader ships it (fixed part only, no config).
+    fn snap_begin_wire(session: u32, id: u8, pos: u64, len: u64, declared: u64) -> Vec<u8> {
+        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+        write_snap_begin_body(
+            &mut body,
+            &SnapBeginBody {
+                session,
+                layout: SNAP_BEGIN_LAYOUT_V2,
+                service_id: id,
+                snapshot_pos: pos,
+                total_len: len,
+                services_declared: declared,
+                config: vec![],
+            },
+        );
+        body
+    }
+
+    /// The ordering rule the placement guard is built on: artifacts are
+    /// announced ascending over the DECLARED mask, so with `0b101` declared the
+    /// artifact after id 0 is id **2**, and nothing follows it. (A sender that
+    /// skips one, or a lost BEGIN, is what the guard in `snap_begin` catches.)
+    #[test]
+    fn next_declared_id_walks_a_sparse_declared_mask() {
+        assert_eq!(next_declared_id(0b101, None), Some(0));
+        assert_eq!(next_declared_id(0b101, Some(0)), Some(2), "id 1 is NOT declared");
+        assert_eq!(next_declared_id(0b101, Some(2)), None);
+        assert_eq!(next_declared_id(0b110, None), Some(1), "a mask that does not start at 0");
+        assert_eq!(next_declared_id(1 << 63, None), Some(63));
+        assert_eq!(next_declared_id(1 << 63, Some(63)), None, "no shift past bit 63");
+        assert_eq!(next_declared_id(0, None), None);
+    }
+
+    /// M14c: an artifact's STREAM base is the SUM of its predecessors' lengths,
+    /// and the sender rotates to artifact k+1 once k's last chunk has been
+    /// SENT — so a BEGIN that skips a declared id means an earlier BEGIN was
+    /// lost. Placing it at `announced_len` anyway would hand two FSMs each
+    /// other's bytes. It is dropped, and a 1-byte `SNAP_NAK` at `announced_len`
+    /// prompts the leader for the artifact we are missing (its own 20 ms resend
+    /// cadence only ever covers the artifact it is currently shipping).
+    #[test]
+    fn a_begin_that_skips_a_declared_id_is_not_placed_and_prompts_for_the_missing_one() {
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b111, None);
+        // Pin the intake's own NAK timer far into the future: every SNAP_NAK
+        // this test sees is then unambiguously the missing-BEGIN probe, never
+        // an ordinary gap NAK (artifact 0's 64 bytes never arrive here).
+        r.snap_nak_cfg =
+            NakConfig { delay_min_ns: 1 << 40, delay_max_ns: 1 << 40, backoff_ns: 1 << 40 };
+        let to = r.local_addr();
+
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 0, 4096, 64, 0b111));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the first BEGIN never opened an intake");
+            r.do_work();
+        }
+
+        // id 1 is still un-announced, so id 2 cannot be placed.
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 2, 8192, 64, 0b111));
+        let (_, body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_NAK);
+        let nak = read_snap_nak_body(&body).expect("a well-formed SNAP_NAK body");
+        assert_eq!(
+            (nak.session, nak.offset, nak.length),
+            (11, 64, 1),
+            "a one-byte probe at announced_len — 'send me the BEGIN that starts here'"
+        );
+        assert!(!dir.path().join("2").exists(), "the skipped-ahead artifact is not placed");
+        assert_eq!(
+            r.snap_intake.as_ref().unwrap().parts.len(),
+            1,
+            "still exactly one announced artifact"
+        );
+
+        // The prompted BEGIN lands: id 1 is placed at base 64...
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 1, 5120, 64, 0b111));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.as_ref().unwrap().parts.len() < 2 {
+            assert!(Instant::now() < deadline, "the prompted BEGIN was never placed");
+            r.do_work();
+        }
+        assert!(dir.path().join("1").join("incoming-5120.part").exists());
+
+        // ...and the re-sent BEGIN(2) now places, at base 128.
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 2, 8192, 64, 0b111));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.as_ref().unwrap().parts.len() < 3 {
+            assert!(Instant::now() < deadline, "the re-sent BEGIN(2) was never placed");
+            r.do_work();
+        }
+        let intake = r.snap_intake.as_ref().unwrap();
+        assert_eq!(
+            intake.parts.iter().map(|p| (p.service_id, p.base)).collect::<Vec<_>>(),
+            vec![(0, 0), (1, 64), (2, 128)],
+            "each artifact sits at the SUM of its predecessors' lengths"
+        );
+        assert_eq!(intake.announced_len, 192);
+        assert!(dir.path().join("2").join("incoming-8192.part").exists());
+    }
+
+    /// M14c: the leader re-sends a `SNAP_BEGIN` every 20 ms until our
+    /// `SNAP_DONE` reaches it. A lost DONE must therefore NOT re-open (and
+    /// re-download) a set we already renamed and installed — it must be
+    /// re-acked, which is exactly what the leader is waiting for.
+    #[test]
+    fn a_begin_re_sent_after_the_session_completed_is_re_acked_not_re_downloaded() {
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        let to = r.local_addr();
+        let begin = snap_begin_wire(21, 0, 4096, 64, 0b1);
+
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 0, &[0xABu8; 64]);
+        let (_, first) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
+        assert_eq!(read_snap_begin_body(&first).unwrap().session, 21);
+        let part = dir.path().join("0").join("incoming-4096.part");
+        assert!(dir.path().join("0").join("snap-4096.ultsnap").exists(), "renamed");
+        assert!(!part.exists(), "the .part is gone once renamed");
+
+        // The DONE was lost on the wire: the leader re-sends the BEGIN.
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
+        let (_, second) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
+        assert_eq!(
+            read_snap_begin_body(&second).unwrap().session,
+            21,
+            "a SECOND ack for the same session, not a fresh download"
+        );
+        assert!(!part.exists(), "no .part reappears");
+        assert!(r.snap_intake.is_none(), "no intake was re-opened");
+    }
+
+    /// M14c: a named refusal drops the session it refuses — and ONLY that one.
+    /// A forged/legacy `SNAP_BEGIN` from any other address must not tear down
+    /// an unrelated live transfer; and a session that IS dropped must take its
+    /// pre-sized `.part` with it rather than leaking a full-size file.
+    #[test]
+    fn a_refusal_from_another_peer_spares_the_live_intake_and_a_real_one_cleans_up() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut stranger = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        let st = r.stats();
+        let to = r.local_addr();
+
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(4, 0, 4096, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the BEGIN never opened an intake");
+            r.do_work();
+        }
+        let part = dir.path().join("0").join("incoming-4096.part");
+        assert!(part.exists());
+
+        // A legacy-layout BEGIN from an unrelated address.
+        let mut legacy = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+        write_snap_begin_body(
+            &mut legacy,
+            &SnapBeginBody {
+                session: 4,
+                layout: 0, // a 0.5.0-shaped body
+                service_id: 0,
+                snapshot_pos: 4096,
+                total_len: 64,
+                services_declared: 0b1,
+                config: vec![],
+            },
+        );
+        stranger.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &legacy);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_legacy_peer.load(Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "the stranger's refusal was never counted");
+            r.do_work();
+        }
+        assert!(r.snap_intake.is_some(), "an unrelated peer may not kill a live transfer");
+        assert!(part.exists(), "nor delete its .part");
+
+        // From the peer we are actually transferring with, it does drop the
+        // session — and the abandoned .part goes with it.
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &legacy);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_legacy_peer.load(Relaxed) < 2 {
+            assert!(Instant::now() < deadline, "the leader's refusal was never counted");
+            r.do_work();
+        }
+        assert!(r.snap_intake.is_none(), "our own leader's legacy BEGIN drops the session");
+        assert!(!part.exists(), "an abandoned .part must not leak a full-size file");
+    }
+
+    /// M14c: a NEW session from the same peer replaces a stale intake — and
+    /// must not orphan the stale one's `.part`.
+    #[test]
+    fn a_replacing_session_removes_the_stale_intakes_part() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        let to = r.local_addr();
+
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(1, 0, 4096, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the first BEGIN never opened an intake");
+            r.do_work();
+        }
+        let stale = dir.path().join("0").join("incoming-4096.part");
+        assert!(stale.exists());
+
+        // A second session (the first one timed out at the leader), newer floor.
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(2, 0, 8192, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.as_ref().is_none_or(|i| i.session != 2) {
+            assert!(Instant::now() < deadline, "the replacing BEGIN never took over");
+            r.do_work();
+        }
+        assert!(dir.path().join("0").join("incoming-8192.part").exists(), "the new .part");
+        assert!(!stale.exists(), "the superseded .part must not be orphaned");
     }
 }

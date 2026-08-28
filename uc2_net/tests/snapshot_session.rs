@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use uc2_log::buffer::LogBuffer;
 use uc2_log::cnc::{CncMeta, CncPage};
 use uc2_log::region::Region;
-use uc2_net::fault::{FaultConfig, FaultSocket};
+use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::rebuild::NakConfig;
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
@@ -75,6 +75,10 @@ struct Harness {
     ctrl_tx: mpsc::SyncSender<CtrlMsg>,
     follower_addr: SocketAddr,
     follower_snap_dir: PathBuf,
+    /// The leader's SEND-side partition table — a scriptable, deterministic
+    /// link cut (unlike the seeded `drop_per_million`), used to lose one
+    /// specific datagram.
+    leader_block: PartitionHandle,
     _leader_dir: tempfile::TempDir,
     _follower_dir: tempfile::TempDir,
 }
@@ -87,6 +91,7 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
     let mut recv_sock = FaultSocket::from_socket(leader_raw).unwrap();
     send_sock.set_faults(faults);
     recv_sock.set_faults(faults);
+    let leader_block = send_sock.partition_handle();
 
     // Follower socket.
     let mut follower_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
@@ -169,6 +174,7 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
         ctrl_tx,
         follower_addr,
         follower_snap_dir,
+        leader_block,
         _leader_dir: leader_dir,
         _follower_dir: follower_dir,
     }
@@ -231,6 +237,36 @@ impl Harness {
                 config: vec![],
             },
         );
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.send_to(&d, self.follower_addr).unwrap();
+    }
+
+    /// A genuine wire-0.5.0 `SNAP_BEGIN`: its fixed body part is 26 bytes
+    /// (`session` ++ pad ++ `snapshot_pos` ++ `total_len` ++ `config_len`), so
+    /// it is too short to decode as 0.6.0 at all — the realistic flag-day
+    /// shape, which must still name the `peer wire 0.5.0` refusal rather than
+    /// vanishing as an anonymous malformed datagram.
+    fn forge_legacy_050_begin(&self) {
+        use uc_protocol::v2::datagram::{
+            DATAGRAM_HEADER_LEN, DGRAM_KIND_SNAP_BEGIN, DatagramHeader, write_datagram_header,
+        };
+        const LEGACY_FIXED_LEN: usize = 26;
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + LEGACY_FIXED_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: TERM,
+                kind: DGRAM_KIND_SNAP_BEGIN,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        let body = &mut d[DATAGRAM_HEADER_LEN..];
+        body[0..4].copy_from_slice(&98u32.to_le_bytes()); // session
+        body[8..16].copy_from_slice(&snap_pos(0).to_le_bytes()); // snapshot_pos
+        body[16..24].copy_from_slice(&64u64.to_le_bytes()); // total_len
+        body[24..26].copy_from_slice(&0u16.to_le_bytes()); // config_len
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         s.send_to(&d, self.follower_addr).unwrap();
     }
@@ -334,4 +370,53 @@ fn a_mismatched_declared_set_refuses_the_session() {
     });
     assert_eq!(st.snap_refused_legacy_peer.load(Ordering::Relaxed), 0, "not the other refusal");
     assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
+}
+
+#[test]
+fn a_too_short_0_5_0_begin_body_is_refused_as_a_legacy_peer() {
+    // The OTHER half of `peer wire 0.5.0`, and the one a real flag day
+    // produces: a 26-byte 0.5.0 body never even decodes as 0.6.0, so without
+    // the `else` arm it would be dropped with BOTH refusal counters at zero.
+    let mut h = build(FaultConfig::default(), &[0]);
+    let st = h.follower.stats();
+    h.forge_legacy_050_begin();
+    h.pump_until("the too-short legacy body is counted as a refusal", |_| {
+        st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
+    });
+    assert_eq!(st.snap_refused_declared_mismatch.load(Ordering::Relaxed), 0, "not the other refusal");
+    assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
+}
+
+#[test]
+fn a_lost_first_begin_never_mis_bases_a_later_artifact() {
+    // The sender rotates to artifact k+1 once k's last chunk has been SENT and
+    // re-sends only the BEGIN it is currently targeting — so a BEGIN lost at
+    // the START of the stream is not re-sent on its own. A receiver that placed
+    // the NEXT BEGIN at that base anyway would give FSM 0 and FSM 2 each
+    // other's bytes, complete both, and install the swap silently. Cut the link
+    // for exactly the duty cycle that carries BEGIN(0).
+    let mut h = build(FaultConfig::default(), &[0, 2]);
+    h.leader_block.block(h.follower_addr);
+    h.trigger();
+    h.leader_send.do_work(); // BEGIN(0) + its first chunks go into the void
+    h.leader_block.unblock(h.follower_addr);
+
+    h.pump_until("both artifacts transferred after a lost first BEGIN", |h| {
+        h.final_path(0).exists() && h.final_path(2).exists()
+    });
+    assert_eq!(
+        std::fs::read(h.final_path(0)).unwrap(),
+        snapshot_bytes(0),
+        "FSM 0's directory holds FSM 0's artifact, not FSM 2's"
+    );
+    assert_eq!(
+        std::fs::read(h.final_path(2)).unwrap(),
+        snapshot_bytes(2),
+        "FSM 2's directory holds FSM 2's artifact, not FSM 0's"
+    );
+    assert_eq!(
+        h.leader_send.stats().snap_sessions.load(Ordering::Relaxed),
+        1,
+        "recovered inside the SAME session — no 30 s timeout, no re-open"
+    );
 }
