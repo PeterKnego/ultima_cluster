@@ -2865,10 +2865,26 @@ impl Consensus {
     /// than [`crate::services::SERVICE_STALE_NS`]. That one predicate covers
     /// both exits: an orderly `Service::stop` clears the bit (reported next
     /// cycle), and a SIGKILLed service leaves the bit set, so only the
-    /// ageing heartbeat can report it (~3 s). Attach is keyed on the epoch,
-    /// which `uc2_service::attach` bumps once per incarnation, so a
-    /// stop/start pair emits `service_detached` then `service_attached` with
-    /// the new epoch.
+    /// ageing heartbeat can report it (~3 s).
+    ///
+    /// Attach DOMINATES, and the two arms are not symmetric — read this
+    /// before writing an alert on the pair. An epoch bump always emits
+    /// `service_attached` (`uc2_service::attach` bumps the epoch once per
+    /// incarnation, so every arrival is named exactly once). But
+    /// `service_detached` is emitted only when a NON-LIVE cycle is actually
+    /// OBSERVED — the bit cleared, or the heartbeat older than
+    /// `SERVICE_STALE_NS`. A departure the node never sees is therefore
+    /// never reported: a SIGKILLed service that a supervisor restarts inside
+    /// the 3 s heartbeat bar keeps the ATTACHED bit and a fresh-enough
+    /// heartbeat throughout, so the new incarnation's epoch bump reaches the
+    /// attach arm first and the operator sees `service_attached` twice in a
+    /// row for the same id, with no `service_detached` between them. That is
+    /// the truthful record of what this node observed; treat a repeated
+    /// `service_attached` (a rising `epoch` for a live id) as its own signal
+    /// of a restart, rather than assuming the events alternate. A slower
+    /// stop/start — anything that leaves one non-live duty cycle in between,
+    /// including every orderly `Service::stop` — does emit
+    /// `service_detached` then `service_attached` with the new epoch.
     #[inline(never)]
     fn note_service_transitions(&mut self) {
         let now_ns = self.last_wall_ns;

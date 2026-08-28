@@ -650,3 +650,65 @@ fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
     node.stop();
     uc2_node::obs::log::stderr_for_tests();
 }
+
+/// M14c (spec §14.4): the AGEING half of the detach predicate — the half the
+/// spec literally names. A SIGKILLed service leaves the ATTACHED bit set
+/// forever, so nothing but the staling heartbeat can report it gone.
+///
+/// Driven by writing FSM 1's slot BY HAND (the same trick
+/// `uc2ctl/tests/status_services.rs` uses: the slot band's writer is the
+/// service process, and this test deliberately has none). That lets the
+/// "heartbeat has aged past the bar" state be created instantly — a
+/// backdated stamp — instead of waiting out `SERVICE_STALE_NS` in real time.
+#[test]
+fn an_ageing_heartbeat_alone_emits_service_detached() {
+    let _g = serialize();
+    let buf = uc2_node::obs::log::capture_for_tests();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+
+    let now_ns = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    };
+    let cnc = open_cnc(dir.path());
+    let s1 = cnc.service_slot(1);
+    // Arrive: a fresh heartbeat and the ATTACHED bit BEFORE the epoch bump,
+    // so the cycle that sees epoch=1 also sees a live slot — no non-live
+    // window that could emit a detach for the wrong reason.
+    s1.heartbeat_ns.store_release(now_ns());
+    s1.status.store_release(uc2_log::cnc::pack_service_status(1, true, 1));
+    s1.epoch.store_release(1);
+    wait_until("service_attached record for FSM 1", || {
+        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        t.lines().any(|l| {
+            l.contains(r#""event":"service_attached""#)
+                && l.contains(r#""service":1"#)
+                && l.contains(r#""epoch":1"#)
+        })
+    });
+
+    // Now age the heartbeat past the bar with the ATTACHED bit STILL SET —
+    // exactly a `kill -9`'d service. Only the staleness arm can fire.
+    s1.status.store_release(uc2_log::cnc::pack_service_status(1, true, 1));
+    s1.heartbeat_ns
+        .store_release(now_ns() - (uc2_node::services::SERVICE_STALE_NS + 1_000_000_000));
+    wait_until("service_detached record for FSM 1 off the ageing heartbeat", || {
+        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        t.lines().any(|l| {
+            l.contains(r#""event":"service_detached""#)
+                && l.contains(r#""service":1"#)
+                && l.contains(r#""epoch":1"#)
+        })
+    });
+    // The bit was never cleared: the ONLY thing that could have reported it
+    // is the heartbeat ageing.
+    let (_, attached, _) = uc2_log::cnc::unpack_service_status(s1.status.load_acquire());
+    assert!(attached, "the ATTACHED bit must still be set — a kill -9 never clears it");
+
+    node.stop();
+    uc2_node::obs::log::stderr_for_tests();
+}
