@@ -988,7 +988,8 @@ impl Node {
         receiver.set_sender_route(ctrl_tx.clone());
         receiver.set_intake_gate(Arc::clone(&intake_gate));
         receiver.set_snapshot_intake(
-            snap_dir.clone(),
+            snap_dir.parent().expect("snapshots/<id> has a parent").to_path_buf(),
+            0b1, /* INTERIM (M14c Task 6 wires the declared set) */
             Some((Arc::clone(&incoming_snapshot), Arc::clone(&incoming_snapshot_config))),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));

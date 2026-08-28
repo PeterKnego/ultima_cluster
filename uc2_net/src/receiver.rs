@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -464,6 +464,21 @@ pub struct FollowerStats {
     /// `SNAP_DONE` costs only the leader's session slot, which times out —
     /// the local artifact is already renamed and installed by then.
     pub seal_failures: AtomicU64,
+    /// M14c (spec §14.3): a `SNAP_BEGIN` arrived whose `layout` byte is not
+    /// [`SNAP_BEGIN_LAYOUT_V2`] — the named refusal **`peer wire 0.5.0`**. The
+    /// session is dropped. NOTE this is the *defensive* half: a genuine 0.5.0
+    /// body is only 26 bytes plus its config and is usually dropped by
+    /// `read_snap_begin_body`'s length check before it ever gets here; this
+    /// fires when a 0.5.0 body happens to reach 34 bytes (an 8-byte-or-longer
+    /// carried config — i.e. every configured cluster). The follower keeps
+    /// NAKing; the operator sees the counter and finishes the flag day.
+    pub snap_refused_legacy_peer: AtomicU64,
+    /// M14c (spec §8, §14.3): a `SNAP_BEGIN` arrived whose `services_declared`
+    /// differs from this node's own declared mask (or that names a service id
+    /// outside it) — the named refusal **`declared-set mismatch`**. The session
+    /// is dropped: installing a set that does not cover this node's FSMs would
+    /// strand one below an adopted floor. Declared sets must match cluster-wide.
+    pub snap_refused_declared_mismatch: AtomicU64,
 }
 
 /// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
@@ -472,24 +487,60 @@ pub struct FollowerStats {
 /// under clippy's type-complexity threshold.
 pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>);
 
-/// M6 Task 6: one in-flight INBOUND snapshot transfer (this node is receiving a
-/// snapshot from the leader because its NAK fell below the purge floor). Chunks
-/// land at their file offset in a pre-sized `.part`; a `Rebuilt` over the file's
-/// byte space tracks contiguity + gaps (NAK'd like the main stream). On
-/// completion the `.part` is fsync'd + atomically renamed to the final artifact.
+/// One artifact inside an inbound session. `base` is its first byte's
+/// STREAM-GLOBAL offset — the session is one concatenated byte stream whose
+/// artifact boundaries the BEGINs announce, so the repair path is unchanged.
+/// M14c: the identity of the last INBOUND session that completed here — what
+/// [`FollowerReceiver::snap_last_done`] re-acks a straggling `SNAP_BEGIN`
+/// against. The artifact list is part of the identity on purpose: a leader that
+/// restarts recycles its session ids from 1, so `(peer, session)` alone would
+/// make a genuinely NEW session look like a re-send and wedge it. A BEGIN
+/// naming an artifact this session did not carry opens a fresh intake instead.
+struct SnapDone {
+    peer: SocketAddr,
+    session: u32,
+    /// `(service_id, snapshot_pos)` of every artifact the session installed.
+    artifacts: Vec<(u8, u64)>,
+}
+
+struct SnapPart {
+    service_id: u8,
+    snapshot_pos: u64,
+    base: u64,
+    len: u64,
+    /// Taken (dropped) just before the rename, mirroring the 0.5.0 discipline.
+    file: Option<std::fs::File>,
+    part_path: PathBuf,
+    final_path: PathBuf,
+    done: bool,
+}
+
+/// M6 Task 6 / M14c: one in-flight INBOUND snapshot transfer — a stream of one
+/// artifact per declared FSM. Chunks land at their stream offset in the
+/// pre-sized `.part` of whichever artifact contains that offset; one `Rebuilt`
+/// over the stream's byte space tracks contiguity + gaps (NAK'd like the main
+/// stream). Each artifact is fsync'd + atomically renamed the moment the
+/// contiguous frontier passes its end; the FLOOR is adopted only once EVERY
+/// declared id has landed, so no FSM is ever stranded below an adopted floor.
 struct SnapIntake {
     peer: SocketAddr,
     session: u32,
-    snapshot_pos: u64,
-    total_len: u64,
-    file: std::fs::File,
-    part_path: PathBuf,
-    final_path: PathBuf,
-    /// Contiguity over `[0, total_len)` file offsets.
+    /// From the session's first `SNAP_BEGIN`; equals this node's own mask (a
+    /// difference is refused before an intake ever opens).
+    services_declared: u64,
+    /// Bit `i` set ⇔ id `i`'s artifact is complete and renamed.
+    received: u64,
+    /// Announced artifacts, ascending, contiguous in `base`.
+    parts: Vec<SnapPart>,
+    /// Sum of the announced artifacts' lengths — how far the stream is known
+    /// to run (it grows as later BEGINs arrive).
+    announced_len: u64,
+    /// Contiguity over `[0, announced_len)` STREAM offsets.
     got: Rebuilt,
     nak: NakTimer,
     /// M7 Task 6: the encoded `ConfigRecord.config` carried in `SNAP_BEGIN`
-    /// (`v2::config::encode_config` bytes; empty if the leader shipped none).
+    /// (`v2::config::encode_config` bytes; empty if the leader shipped none;
+    /// identical on every BEGIN of a session — taken from the first).
     /// Forwarded to `incoming_snapshot_config` on completion, alongside
     /// `incoming_snapshot_pos`, for the consensus agent's install handler.
     config: Vec<u8>,
@@ -547,11 +598,21 @@ pub struct FollowerReceiver {
     gate: Option<Arc<AtomicBool>>,
     /// Per-duty-cycle latch: emit at most one `LeaderActivity` per `do_work`.
     activity_emitted: bool,
-    /// M6 Task 6: snapshot directory (`instance_dir/snapshots`) for inbound
-    /// transfers. `None` = this node never receives snapshots (no intake).
+    /// M6 Task 6 / M14c: the snapshots ROOT (`instance_dir/snapshots`) for
+    /// inbound transfers; each artifact lands under `<root>/<service_id>/`.
+    /// `None` = this node never receives snapshots (no intake).
     snap_dir: Option<PathBuf>,
+    /// M14c: this node's own declared FSM mask, compared against every
+    /// session's `services_declared`. Set by `set_snapshot_intake`.
+    own_declared: u64,
     /// M6 Task 6: the in-flight inbound snapshot transfer, if any.
     snap_intake: Option<SnapIntake>,
+    /// M14c: the last session that COMPLETED here. The sender keeps re-sending
+    /// a `SNAP_BEGIN` on a 20 ms cadence until our `SNAP_DONE` reaches it, so a
+    /// lost DONE would otherwise re-open (and re-download) a set we already
+    /// installed. Instead we re-ack it, which is exactly what the leader is
+    /// waiting for.
+    snap_last_done: Option<SnapDone>,
     /// M6 Task 6: node-internal signal — the position of the newest COMPLETE
     /// inbound snapshot (written on rename). The consensus agent samples it to
     /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
@@ -642,6 +703,48 @@ pub struct FollowerReceiver {
     cleartext_peer_log: HashMap<SocketAddr, u64>,
 }
 
+/// M14c: the lowest id in `declared` strictly above `after` (`None` = the
+/// lowest of all). The artifacts of a session are announced in exactly this
+/// order, which is what lets the receiver place each one's STREAM base.
+fn next_declared_id(declared: u64, after: Option<u8>) -> Option<u8> {
+    let from = after.map_or(0u32, |id| id as u32 + 1);
+    if from >= u64::BITS {
+        return None;
+    }
+    let rest = declared >> from;
+    if rest == 0 {
+        return None;
+    }
+    Some((from + rest.trailing_zeros()) as u8)
+}
+
+/// M14c: open the `.part` for one announced artifact under `<root>/<id>/`. Free
+/// function so it borrows neither the receiver nor the intake.
+fn open_snap_part(root: &Path, b: &SnapBeginBody, base: u64) -> Option<SnapPart> {
+    let dir = root.join(b.service_id.to_string());
+    std::fs::create_dir_all(&dir).ok()?;
+    let part_path = dir.join(format!("incoming-{}.part", b.snapshot_pos));
+    let final_path = dir.join(format!("snap-{}.ultsnap", b.snapshot_pos));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .read(true)
+        .open(&part_path)
+        .ok()?;
+    file.set_len(b.total_len).ok()?;
+    Some(SnapPart {
+        service_id: b.service_id,
+        snapshot_pos: b.snapshot_pos,
+        base,
+        len: b.total_len,
+        file: Some(file),
+        part_path,
+        final_path,
+        done: false,
+    })
+}
+
 impl FollowerReceiver {
     /// `route` carries consensus datagrams (kinds 5–11, spec §3.1) RAW to the
     /// consensus agent (no term filter — the SM adopts higher terms; a
@@ -716,7 +819,9 @@ impl FollowerReceiver {
             gate: None,
             activity_emitted: false,
             snap_dir: None,
+            own_declared: 0,
             snap_intake: None,
+            snap_last_done: None,
             incoming_snapshot_pos: None,
             incoming_snapshot_config: None,
             snap_nak_cfg: cfg.nak,
@@ -822,16 +927,25 @@ impl FollowerReceiver {
         self.straddle_hook = Some(hook);
     }
 
-    /// M6 Task 6: enable INBOUND snapshot transfers. `snap_dir` is where the
-    /// `.part`/final artifacts land (`instance_dir/snapshots`); `incoming` (if
-    /// set) is `(position, config)`: the position cell receives each COMPLETED
-    /// transfer's floor for the consensus agent to adopt as an archive floor,
-    /// and (M7 Task 6) the config cell receives that SAME transfer's carried
-    /// `SNAP_BEGIN.config` bytes for the agent's `adopt_snapshot_config` install
+    /// M6 Task 6 / M14c: enable INBOUND snapshot transfers. `snap_root` is the
+    /// `snapshots/` directory the per-id `.part`/final artifacts land under
+    /// (`<root>/<id>/`); `own_declared` is this node's declared FSM bitmask,
+    /// which every session's `SNAP_BEGIN` must match (`declared-set mismatch`);
+    /// `incoming` (if set) is `(position, config)`: the position cell receives
+    /// each COMPLETED session's floor — the MINIMUM over the received artifact
+    /// positions — for the consensus agent to adopt as an archive floor, and
+    /// (M7 Task 6) the config cell receives that session's carried
+    /// `SNAP_BEGIN.config` bytes for the agent's `adopt_snapshot_config`
     /// handler. Without this call kinds 12/13 are ignored (a node that never
     /// joins below a floor never receives snapshots).
-    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<IncomingSnapshotSignal>) {
-        self.snap_dir = Some(snap_dir);
+    pub fn set_snapshot_intake(
+        &mut self,
+        snap_root: PathBuf,
+        own_declared: u64,
+        incoming: Option<IncomingSnapshotSignal>,
+    ) {
+        self.snap_dir = Some(snap_root);
+        self.own_declared = own_declared;
         if let Some((pos, config)) = incoming {
             self.incoming_snapshot_pos = Some(pos);
             self.incoming_snapshot_config = Some(config);
@@ -1478,44 +1592,95 @@ impl FollowerReceiver {
         }
     }
 
-    /// Begin an inbound snapshot transfer: pre-size a `.part` and start tracking
-    /// contiguity. A duplicate BEGIN for the in-flight session is a no-op; a BEGIN
-    /// for a different session replaces a stale one.
+    /// Begin (or extend) an inbound snapshot transfer: pre-size this artifact's
+    /// `.part` and start tracking it. A duplicate BEGIN for an artifact already
+    /// announced in this session is a no-op (the sender re-sends one every
+    /// 20 ms); a BEGIN for a different session replaces a stale one. Two named
+    /// refusals drop the session outright.
     fn snap_begin(&mut self, from: SocketAddr, b: SnapBeginBody) {
-        let Some(dir) = self.snap_dir.clone() else {
+        let Some(root) = self.snap_dir.clone() else {
             return; // this node does not receive snapshots
         };
-        if let Some(cur) = &self.snap_intake
-            && cur.peer == from
-            && cur.session == b.session
-        {
-            return; // duplicate BEGIN — already in progress
+        if b.layout != SNAP_BEGIN_LAYOUT_V2 {
+            // "peer wire 0.5.0" — a body whose discriminator we do not speak.
+            self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
+            self.snap_intake = None;
+            return;
+        }
+        // The id must be inside the mask, and the mask must be OURS. A shift by
+        // an id >= 64 is not representable — `checked_shl` folds that into the
+        // same refusal rather than panicking in debug.
+        let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
+        if b.services_declared != self.own_declared || b.services_declared & bit == 0 {
+            self.stats.snap_refused_declared_mismatch.fetch_add(1, Ordering::Relaxed);
+            self.snap_intake = None;
+            return;
         }
         if b.total_len == 0 {
             return;
         }
-        let part_path = dir.join(format!("incoming-{}.part", b.snapshot_pos));
-        let final_path = dir.join(format!("snap-{}.ultsnap", b.snapshot_pos));
-        let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(&part_path)
-        else {
-            return;
-        };
-        if file.set_len(b.total_len).is_err() {
+        // A session that already completed HERE: our `SNAP_DONE` was lost and
+        // the leader is still re-sending the last artifact's BEGIN while it
+        // waits for one. Re-ack instead of re-opening (and re-downloading) a
+        // set that is already renamed, installed and signalled.
+        if self.snap_last_done.as_ref().is_some_and(|d| {
+            d.peer == from
+                && d.session == b.session
+                && d.artifacts.contains(&(b.service_id, b.snapshot_pos))
+        }) {
+            self.snap_send_done(from, &b);
             return;
         }
+        if let Some(cur) = self.snap_intake.as_mut()
+            && cur.peer == from
+            && cur.session == b.session
+        {
+            if cur
+                .parts
+                .iter()
+                .any(|p| p.service_id == b.service_id && p.snapshot_pos == b.snapshot_pos)
+            {
+                return; // duplicate BEGIN — already announced (the sender re-sends)
+            }
+            // An artifact's STREAM base is the SUM of its predecessors' lengths,
+            // so it can only be placed if it is the NEXT declared id: a BEGIN
+            // that skips one means an earlier BEGIN was lost, and placing this
+            // one at `announced_len` anyway would give two FSMs each other's
+            // bytes — a silent mis-install, not a stall. Drop it and prompt.
+            let expect = next_declared_id(cur.services_declared, cur.parts.last().map(|p| p.service_id));
+            if Some(b.service_id) != expect {
+                let (peer, session, at) = (cur.peer, cur.session, cur.announced_len);
+                self.snap_probe_missing_begin(peer, session, at);
+                return;
+            }
+            // The next artifact of the SAME session: it starts where the
+            // announced stream currently ends.
+            let Some(part) = open_snap_part(&root, &b, cur.announced_len) else {
+                return;
+            };
+            cur.announced_len += part.len;
+            cur.parts.push(part);
+            self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // A new session (or one replacing a stale one). Same placement rule: a
+        // session's FIRST artifact is the lowest declared id — anything else is
+        // a session already under way whose opening BEGIN we never saw.
+        if Some(b.service_id) != next_declared_id(b.services_declared, None) {
+            self.snap_probe_missing_begin(from, b.session, 0);
+            return;
+        }
+        let Some(part) = open_snap_part(&root, &b, 0) else {
+            return;
+        };
+        let announced_len = part.len;
         self.snap_intake = Some(SnapIntake {
             peer: from,
             session: b.session,
-            snapshot_pos: b.snapshot_pos,
-            total_len: b.total_len,
-            file,
-            part_path,
-            final_path,
+            services_declared: b.services_declared,
+            received: 0,
+            parts: vec![part],
+            announced_len,
             got: Rebuilt::new(0),
             nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
             config: b.config,
@@ -1523,7 +1688,20 @@ impl FollowerReceiver {
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Land one snapshot chunk at its file offset; on completion fsync + rename.
+    /// M14c: a `SNAP_BEGIN` we cannot place — prompt the leader for the
+    /// artifact that starts at STREAM offset `at` by NAKing one byte of it.
+    /// The sender targets the artifact its head repair NAK falls in, so this
+    /// makes the missing BEGIN the next cycle's re-send. Without it a BEGIN
+    /// lost EARLY in the stream would strand the whole session until the
+    /// leader's 30 s session timeout: its own 20 ms re-send cadence only ever
+    /// covers the artifact it is currently shipping.
+    fn snap_probe_missing_begin(&mut self, peer: SocketAddr, session: u32, at: u64) {
+        self.send_snap_nak(peer, session, at, 1);
+    }
+
+    /// Land one snapshot chunk at its STREAM offset, in whichever announced
+    /// artifact contains it; publish any artifact the contiguous frontier has
+    /// now passed.
     fn snap_chunk(&mut self, from: SocketAddr, offset: u64, payload: &[u8]) {
         let Some(intake) = self.snap_intake.as_mut() else {
             return;
@@ -1534,38 +1712,120 @@ impl FollowerReceiver {
         let Some(end) = offset.checked_add(payload.len() as u64) else {
             return;
         };
-        if end > intake.total_len {
-            return; // past EOF — corrupt/duplicate; drop
-        }
-        if intake.file.seek(SeekFrom::Start(offset)).is_err()
-            || intake.file.write_all(payload).is_err()
-        {
+        // A chunk always sits inside ONE artifact (the sender never spans a
+        // boundary). Anything else — past the announced stream, or for a BEGIN
+        // we have not seen — is dropped; the sender re-sends that BEGIN on its
+        // own cadence and the peer re-NAKs the bytes.
+        let Some(i) = intake
+            .parts
+            .iter()
+            .position(|p| offset >= p.base && end <= p.base + p.len)
+        else {
+            return;
+        };
+        let at = offset - intake.parts[i].base;
+        let Some(file) = intake.parts[i].file.as_mut() else {
+            return; // already renamed — a duplicate repair chunk
+        };
+        if file.seek(SeekFrom::Start(at)).is_err() || file.write_all(payload).is_err() {
             return;
         }
         intake.got.insert(offset, end);
-        if intake.got.contiguous() >= intake.total_len {
-            self.snap_complete();
-        }
+        self.snap_publish_complete_parts();
     }
 
-    /// The `.part` is contiguous: fsync, atomically rename to the final artifact,
-    /// signal completion, and ack with SNAP_DONE.
+    /// fsync + atomically rename every announced artifact the contiguous
+    /// frontier has now covered end to end, then — once EVERY declared id has
+    /// landed — complete the session. A torn `.part` is never renamed, so a
+    /// reader (the service's gap guard, or AdoptFloor) only ever sees a
+    /// complete artifact.
+    fn snap_publish_complete_parts(&mut self) {
+        let Some(intake) = self.snap_intake.as_mut() else {
+            return;
+        };
+        let contiguous = intake.got.contiguous();
+        for p in intake.parts.iter_mut() {
+            if p.done || contiguous < p.base + p.len {
+                continue;
+            }
+            let Some(file) = p.file.take() else {
+                continue;
+            };
+            if file.sync_all().is_err() {
+                p.file = Some(file);
+                return;
+            }
+            drop(file);
+            if std::fs::rename(&p.part_path, &p.final_path).is_err() {
+                return;
+            }
+            p.done = true;
+            intake.received |= 1u64 << p.service_id; // id < 64: checked in `snap_begin`
+        }
+        if intake.received != intake.services_declared {
+            return; // the set is incomplete — no floor is adopted yet
+        }
+        self.snap_complete();
+    }
+
+    /// Every artifact of the session is renamed: ack with SNAP_DONE, publish the
+    /// carried config, and signal the floor — the MINIMUM over the received
+    /// positions, which is exactly the node floor the leader shipped from, so
+    /// every FSM's own artifact sits at or above it.
     fn snap_complete(&mut self) {
         let Some(intake) = self.snap_intake.take() else {
             return;
         };
-        // Durability + atomic publish: a torn `.part` is never renamed, so a
-        // reader (the service gap guard, or AdoptFloor) only ever sees a complete
-        // artifact.
-        if intake.file.sync_all().is_err() {
+        let Some(last) = intake.parts.last() else {
             return;
+        };
+        let floor = intake.parts.iter().map(|p| p.snapshot_pos).min().unwrap_or(0);
+        // Ack: echo the LAST artifact's SnapBeginBody as SNAP_DONE so the leader
+        // closes its session (it keys on `(peer, session)` alone).
+        let ack = SnapBeginBody {
+            session: intake.session,
+            layout: SNAP_BEGIN_LAYOUT_V2,
+            service_id: last.service_id,
+            snapshot_pos: last.snapshot_pos,
+            total_len: last.len,
+            services_declared: intake.services_declared,
+            config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
+        };
+        // M8 (T17): sealed or dropped. A dropped DONE costs only the leader's
+        // session slot (it times out); the local artifacts are already renamed,
+        // so the install below must proceed either way. Latch the session as
+        // completed first: the leader re-sends its BEGIN until a DONE lands, and
+        // `snap_begin` re-acks from this latch instead of re-downloading.
+        self.snap_last_done = Some(SnapDone {
+            peer: intake.peer,
+            session: intake.session,
+            artifacts: intake.parts.iter().map(|p| (p.service_id, p.snapshot_pos)).collect(),
+        });
+        self.snap_send_done(intake.peer, &ack);
+        // M7 Task 6: publish the carried config BEFORE the position signal — the
+        // consensus agent's install handler samples the position (Acquire) and
+        // only then reads this cell, so publishing it first (the mutex itself is
+        // a release fence) guarantees it sees THIS transfer's bytes, never a
+        // stale or absent value from a prior/no session.
+        if let Some(cell) = &self.incoming_snapshot_config {
+            *cell.lock().unwrap() = intake.config.clone();
         }
-        drop(intake.file);
-        if std::fs::rename(&intake.part_path, &intake.final_path).is_err() {
-            return;
+        // Signal the consensus agent to adopt the floor + mirror observability.
+        if let Some(slot) = &self.incoming_snapshot_pos {
+            slot.store(floor, Ordering::Release);
         }
-        // Ack: echo the SnapBeginBody as SNAP_DONE so the leader closes its session.
-        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN]; // M7: may grow with config
+        // Arm the forward gap-tracker resync: once the consensus agent's AdoptFloor
+        // re-primes the shared `append` up to this position, rebuild our tracker
+        // forward so we NAK the retained `[floor, frontier)` tail (M6 Task 8).
+        self.snap_adopt_pending = Some(floor);
+        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Ack a session with `SNAP_DONE`. The leader keys the close on
+    /// `(peer, session)` alone, so the body simply echoes the artifact the ack
+    /// was prompted by (the session's last, or a re-sent BEGIN's own).
+    fn snap_send_done(&mut self, peer: SocketAddr, b: &SnapBeginBody) {
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN];
         write_datagram_header(
             &mut d,
             &DatagramHeader {
@@ -1579,36 +1839,38 @@ impl FollowerReceiver {
         write_snap_begin_body(
             &mut d[DATAGRAM_HEADER_LEN..],
             &SnapBeginBody {
-                session: intake.session,
+                session: b.session,
                 layout: SNAP_BEGIN_LAYOUT_V2,
-                service_id: 0,         // Task 5: the last artifact's id
-                snapshot_pos: intake.snapshot_pos,
-                total_len: intake.total_len,
-                services_declared: 1,  // Task 5: this node's own mask
+                service_id: b.service_id,
+                snapshot_pos: b.snapshot_pos,
+                total_len: b.total_len,
+                services_declared: b.services_declared,
                 config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
-        // M8 (T17): sealed or dropped. A dropped DONE costs only the leader's
-        // session slot (it times out); the local artifact is already renamed,
-        // so the install below must proceed either way.
-        self.seal_and_send(intake.peer, DGRAM_KIND_SNAP_DONE, &mut d);
-        // M7 Task 6: publish the carried config BEFORE the position signal — the
-        // consensus agent's install handler samples the position (Acquire) and
-        // only then reads this cell, so publishing it first (the mutex itself is
-        // a release fence) guarantees it sees THIS transfer's bytes, never a
-        // stale or absent value from a prior/no session.
-        if let Some(cell) = &self.incoming_snapshot_config {
-            *cell.lock().unwrap() = intake.config.clone();
-        }
-        // Signal the consensus agent to adopt the floor + mirror observability.
-        if let Some(slot) = &self.incoming_snapshot_pos {
-            slot.store(intake.snapshot_pos, Ordering::Release);
-        }
-        // Arm the forward gap-tracker resync: once the consensus agent's AdoptFloor
-        // re-primes the shared `append` up to this position, rebuild our tracker
-        // forward so we NAK the retained `[floor, frontier)` tail (M6 Task 8).
-        self.snap_adopt_pending = Some(intake.snapshot_pos);
-        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+        self.seal_and_send(peer, DGRAM_KIND_SNAP_DONE, &mut d);
+    }
+
+    /// Build, seal and send one `SNAP_NAK`. `false` = it could not be sealed and
+    /// was dropped; the snapshot NAK timer re-fires.
+    fn send_snap_nak(&mut self, peer: SocketAddr, session: u32, offset: u64, length: u32) -> bool {
+        let term = self.term.load(Ordering::Relaxed);
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_NAK_BODY_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: term,
+                kind: DGRAM_KIND_SNAP_NAK,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        write_snap_nak_body(
+            &mut d[DATAGRAM_HEADER_LEN..],
+            &SnapNakBody { session, offset, length },
+        );
+        self.seal_and_send(peer, DGRAM_KIND_SNAP_NAK, &mut d)
     }
 
     /// M6 Task 8: after a snapshot install, the consensus agent's `AdoptFloor`
@@ -1647,38 +1909,36 @@ impl FollowerReceiver {
             return false;
         };
         let contiguous = intake.got.contiguous();
-        let gap = intake.got.first_gap().or({
-            if contiguous < intake.total_len {
-                Some((contiguous, intake.total_len))
-            } else {
-                None
-            }
-        });
+        let announced_len = intake.announced_len;
+        let gap = intake
+            .got
+            .first_gap()
+            .or({
+                if contiguous < announced_len {
+                    Some((contiguous, announced_len))
+                } else {
+                    None
+                }
+            })
+            // M14c: everything ANNOUNCED has landed but the declared set is not
+            // complete — we are waiting on the next artifact's `SNAP_BEGIN`.
+            // NAK one byte past the announced end: the sender targets the
+            // artifact its head NAK falls in, so this asks for that BEGIN. (It
+            // is also the ordinary steady state a beat before the leader ships
+            // it, where the probe costs one datagram and hurries it along.)
+            .or({
+                if intake.received != intake.services_declared {
+                    Some((announced_len, announced_len + 1))
+                } else {
+                    None
+                }
+            });
         let fired = intake.nak.poll(gap, now);
         if let Some((start, end)) = fired {
             let length = (end - start).min(self.cfg.nak_max_bytes as u64) as u32;
             let session = intake.session;
             let peer = intake.peer;
-            let term = self.term.load(Ordering::Relaxed);
-            let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_NAK_BODY_LEN];
-            write_datagram_header(
-                &mut d,
-                &DatagramHeader {
-                    position: 0,
-                    leadership_term_id: term,
-                    kind: DGRAM_KIND_SNAP_NAK,
-                    flags: 0,
-                    key_epoch: 0,
-                },
-            );
-            write_snap_nak_body(
-                &mut d[DATAGRAM_HEADER_LEN..],
-                &SnapNakBody { session, offset: start, length },
-            );
-            if !self.seal_and_send(peer, DGRAM_KIND_SNAP_NAK, &mut d) {
-                return false; // dropped; the snapshot NAK timer re-fires
-            }
-            return true;
+            return self.send_snap_nak(peer, session, start, length);
         }
         false
     }
@@ -3942,6 +4202,20 @@ mod tests {
         let _ = b;
     }
 
+    /// A scratch directory on REAL DISK, never `/tmp` (RAM-backed tmpfs with no
+    /// swap on the dev box — CLAUDE.md). `CARGO_TARGET_TMPDIR` is set only for
+    /// integration-test binaries and these are inline `#[cfg(test)]` unit tests
+    /// in the lib target, so this falls back to a package-relative `target/`
+    /// directory — the same shape as `uc2_node/src/audit.rs`'s helper.
+    fn snap_scratch_dir() -> tempfile::TempDir {
+        let root = std::env::var("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_net_tests")
+        });
+        assert!(!root.starts_with("/tmp"), "test scratch must not live on tmpfs: {}", root.display());
+        std::fs::create_dir_all(&root).expect("scratch root");
+        tempfile::Builder::new().prefix("uc2-snap-").tempdir_in(&root).expect("tempdir")
+    }
+
     /// The other direction of a snapshot session — the receiving node's own
     /// replies. T11's allowance explicitly did NOT cover these, so before
     /// T17 a session stalled on its first lost chunk and never signalled
@@ -3949,8 +4223,8 @@ mod tests {
     #[test]
     fn the_snapshot_intakes_snap_nak_and_snap_done_are_sealed() {
         let (mut r, mut peer, _b) = receiver_with_crypto();
-        let dir = tempfile::tempdir().unwrap();
-        r.set_snapshot_intake(dir.path().to_path_buf(), None);
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
         let to = r.local_addr();
 
         // Open a session of 64 bytes, then deliver ONLY the second half so a
@@ -3965,7 +4239,7 @@ mod tests {
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: TOTAL,
-                services_declared: 1,
+                services_declared: 0b1,
                 config: vec![],
             },
         );
@@ -3988,13 +4262,15 @@ mod tests {
         let done = read_snap_begin_body(&done_body).expect("a well-formed SNAP_DONE body");
         assert_eq!(done.session, 7);
         assert_eq!(done.snapshot_pos, 4096);
+        assert_eq!(done.service_id, 0);
+        assert_eq!(done.services_declared, 0b1);
         assert_eq!(
             done_wire.len(),
             DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN + CRYPTO_OVERHEAD,
             "exactly the counter+tag overhead"
         );
         assert!(
-            dir.path().join("snap-4096.ultsnap").exists(),
+            dir.path().join("0").join("snap-4096.ultsnap").exists(),
             "the sealed session actually completed end to end"
         );
     }
@@ -4037,8 +4313,8 @@ mod tests {
     fn an_unsealed_snap_begin_is_refused_now_that_t17_landed() {
         use Ordering::Relaxed;
         let (mut r, mut peer, _b) = receiver_with_crypto();
-        let dir = tempfile::tempdir().unwrap();
-        r.set_snapshot_intake(dir.path().to_path_buf(), None);
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
         let to = r.local_addr();
         let st = r.stats();
         let before = st.datagrams.load(Relaxed);
@@ -4055,7 +4331,7 @@ mod tests {
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 32,
-                services_declared: 1,
+                services_declared: 0b1,
                 config: hostile.clone(),
             },
         );
@@ -4096,8 +4372,8 @@ mod tests {
     fn an_unsealed_snap_chunk_is_refused_now_that_t17_landed() {
         use Ordering::Relaxed;
         let (mut r, mut peer, _b) = receiver_with_crypto();
-        let dir = tempfile::tempdir().unwrap();
-        r.set_snapshot_intake(dir.path().to_path_buf(), None);
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
         let to = r.local_addr();
         let st = r.stats();
 
@@ -4112,7 +4388,7 @@ mod tests {
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 64,
-                services_declared: 1,
+                services_declared: 0b1,
                 config: vec![],
             },
         );

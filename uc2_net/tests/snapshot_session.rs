@@ -33,7 +33,6 @@ use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
 
 const TERM: u32 = 3;
 const CAP: u64 = 1 << 20; // 1 MiB ring
-const SNAP_POS: u64 = 64 * 1024;
 const SNAP_LEN: usize = 300 * 1024;
 
 fn heap_buffer() -> Arc<LogBuffer> {
@@ -52,14 +51,20 @@ fn unrouted() -> mpsc::SyncSender<NetEvent> {
     tx
 }
 
-/// Deterministic snapshot payload (so both ends can be byte-compared).
-fn snapshot_bytes() -> Vec<u8> {
-    (0..SNAP_LEN).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect()
+/// Deterministic snapshot payload for `id` (so both ends can be byte-compared,
+/// and the two artifacts of a stream are distinguishable).
+fn snapshot_bytes(id: u8) -> Vec<u8> {
+    (0..SNAP_LEN).map(|i| (i.wrapping_mul(31).wrapping_add(7 + id as usize)) as u8).collect()
 }
 
-fn write_snapshot_file(dir: &Path) -> PathBuf {
-    let path = dir.join(format!("snap-{SNAP_POS}.ultsnap"));
-    std::fs::write(&path, snapshot_bytes()).unwrap();
+/// The artifact position FSM `id` publishes in these tests.
+fn snap_pos(id: u8) -> u64 {
+    64 * 1024 + id as u64 * 4096
+}
+
+fn write_snapshot_file(dir: &Path, id: u8) -> PathBuf {
+    let path = dir.join(format!("snap-{id}-{}.ultsnap", snap_pos(id)));
+    std::fs::write(&path, snapshot_bytes(id)).unwrap();
     path
 }
 
@@ -74,7 +79,7 @@ struct Harness {
     _follower_dir: tempfile::TempDir,
 }
 
-fn build(faults: FaultConfig) -> Harness {
+fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
     // Leader: one socket, cloned for send + recv (as uc2_node composes it).
     let leader_raw = UdpSocket::bind("127.0.0.1:0").unwrap();
     let leader_addr = leader_raw.local_addr().unwrap();
@@ -95,18 +100,24 @@ fn build(faults: FaultConfig) -> Harness {
     // below-floor NAK. NO replay source is wired, so the NAK is unservable from
     // the journal and upgrades to a session.
     let leader_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let snap_path = write_snapshot_file(leader_dir.path());
-    let src_len = std::fs::metadata(&snap_path).unwrap().len();
+    let mut declared = 0u64;
+    let mut artifacts = Vec::new();
+    for &id in ids {
+        declared |= 1 << id;
+        let path = write_snapshot_file(leader_dir.path(), id);
+        let len = std::fs::metadata(&path).unwrap().len();
+        artifacts.push(uc2_net::sender::SnapArtifact {
+            service_id: id,
+            snapshot_pos: snap_pos(id),
+            path,
+            len,
+        });
+    }
     let snapshot_source: uc2_net::sender::SnapshotSource = Arc::new(move || {
         Some(uc2_net::sender::SnapshotSet {
-            services_declared: 0b1,
+            services_declared: declared,
             config: Vec::new(),
-            artifacts: vec![uc2_net::sender::SnapArtifact {
-                service_id: 0,
-                snapshot_pos: SNAP_POS,
-                path: snap_path.clone(),
-                len: src_len,
-            }],
+            artifacts: artifacts.clone(),
         })
     });
 
@@ -149,7 +160,7 @@ fn build(faults: FaultConfig) -> Harness {
     fcfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 1_000_000 };
     let mut follower =
         FollowerReceiver::new(follower_buf, follower_sock, fcfg, term, unrouted());
-    follower.set_snapshot_intake(follower_snap_dir.clone(), None);
+    follower.set_snapshot_intake(follower_snap_dir.clone(), declared, None);
 
     Harness {
         leader_send,
@@ -186,19 +197,53 @@ impl Harness {
         }
     }
 
-    fn final_path(&self) -> PathBuf {
-        self.follower_snap_dir.join(format!("snap-{SNAP_POS}.ultsnap"))
+    fn final_path(&self, id: u8) -> PathBuf {
+        self.follower_snap_dir.join(id.to_string()).join(format!("snap-{}.ultsnap", snap_pos(id)))
+    }
+
+    /// Send a hand-built SNAP_BEGIN straight at the follower — the only way to
+    /// exercise a refusal, since our own sender never emits one.
+    fn forge_begin(&self, layout: u8, services_declared: u64) {
+        use uc_protocol::v2::datagram::{
+            DATAGRAM_HEADER_LEN, DGRAM_KIND_SNAP_BEGIN, DatagramHeader, SNAP_BEGIN_FIXED_LEN,
+            SnapBeginBody, write_datagram_header, write_snap_begin_body,
+        };
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: TERM,
+                kind: DGRAM_KIND_SNAP_BEGIN,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        write_snap_begin_body(
+            &mut d[DATAGRAM_HEADER_LEN..],
+            &SnapBeginBody {
+                session: 99,
+                layout,
+                service_id: 0,
+                snapshot_pos: snap_pos(0),
+                total_len: 64,
+                services_declared,
+                config: vec![],
+            },
+        );
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.send_to(&d, self.follower_addr).unwrap();
     }
 }
 
 #[test]
 fn below_floor_nak_upgrades_to_snapshot_session_and_file_transfers_exactly() {
-    let mut h = build(FaultConfig::default());
+    let mut h = build(FaultConfig::default(), &[0]);
     h.trigger();
-    h.pump_until("file transferred", |h| h.final_path().exists());
+    h.pump_until("file transferred", |h| h.final_path(0).exists());
 
-    let got = std::fs::read(h.final_path()).unwrap();
-    assert_eq!(got, snapshot_bytes(), "received file is byte-identical to the source");
+    let got = std::fs::read(h.final_path(0)).unwrap();
+    assert_eq!(got, snapshot_bytes(0), "received file is byte-identical to the source");
     assert_eq!(
         h.leader_send.stats().snap_sessions.load(Ordering::Relaxed),
         1,
@@ -216,14 +261,77 @@ fn snapshot_session_survives_chunk_loss_via_snap_nak() {
     // Drop 20% of datagrams in BOTH directions: chunks are lost → the follower
     // NAKs the gaps → repair chunks fill them. Completion is still reached.
     let faults = FaultConfig { drop_per_million: 200_000, seed: 42, ..FaultConfig::default() };
-    let mut h = build(faults);
+    let mut h = build(faults, &[0]);
     h.trigger();
-    h.pump_until("file transferred under loss", |h| h.final_path().exists());
+    h.pump_until("file transferred under loss", |h| h.final_path(0).exists());
 
-    let got = std::fs::read(h.final_path()).unwrap();
-    assert_eq!(got, snapshot_bytes(), "file is byte-identical despite chunk loss");
+    let got = std::fs::read(h.final_path(0)).unwrap();
+    assert_eq!(got, snapshot_bytes(0), "file is byte-identical despite chunk loss");
     assert!(
         h.leader_send.stats().snap_chunk_naks.load(Ordering::Relaxed) > 0,
         "the SNAP_NAK repair path must have run under 20% loss"
     );
+}
+
+#[test]
+fn a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss() {
+    // Drop 20% of datagrams in BOTH directions: chunks from BOTH artifacts are
+    // lost → the follower NAKs the stream-global gaps → repair chunks fill
+    // them, wherever in the stream they fall. Both files complete.
+    let faults = FaultConfig { drop_per_million: 200_000, seed: 42, ..FaultConfig::default() };
+    let mut h = build(faults, &[0, 2]);
+    h.trigger();
+    h.pump_until("both artifacts transferred under loss", |h| {
+        h.final_path(0).exists() && h.final_path(2).exists()
+    });
+
+    assert_eq!(std::fs::read(h.final_path(0)).unwrap(), snapshot_bytes(0), "FSM 0's artifact");
+    assert_eq!(std::fs::read(h.final_path(2)).unwrap(), snapshot_bytes(2), "FSM 2's artifact");
+    assert!(
+        !h.follower_snap_dir.join("1").exists(),
+        "an undeclared id gets no directory"
+    );
+    assert_eq!(
+        h.leader_send.stats().snap_sessions.load(Ordering::Relaxed),
+        1,
+        "ONE session carries the whole set"
+    );
+    assert!(
+        h.leader_send.stats().snap_chunk_naks.load(Ordering::Relaxed) > 0,
+        "the SNAP_NAK repair path must have run under 20% loss"
+    );
+    // No `.part` survives a completed session.
+    for id in [0u8, 2] {
+        let dir = h.follower_snap_dir.join(id.to_string());
+        let parts: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(parts.is_empty(), "{dir:?} still holds a .part");
+    }
+}
+
+#[test]
+fn a_layout_zero_begin_is_refused_as_a_wire_050_peer() {
+    let mut h = build(FaultConfig::default(), &[0]);
+    let st = h.follower.stats();
+    h.forge_begin(0, 0b1); // layout 0 = a 0.5.0-shaped body
+    h.pump_until("the legacy-layout refusal is counted", |_| {
+        st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
+    });
+    assert_eq!(st.snap_refused_declared_mismatch.load(Ordering::Relaxed), 0, "not the other refusal");
+    assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
+}
+
+#[test]
+fn a_mismatched_declared_set_refuses_the_session() {
+    let mut h = build(FaultConfig::default(), &[0]); // the follower's own mask is 0b1
+    let st = h.follower.stats();
+    h.forge_begin(uc_protocol::v2::datagram::SNAP_BEGIN_LAYOUT_V2, 0b11);
+    h.pump_until("the declared-set refusal is counted", |_| {
+        st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
+    });
+    assert_eq!(st.snap_refused_legacy_peer.load(Ordering::Relaxed), 0, "not the other refusal");
+    assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
 }
