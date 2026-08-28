@@ -24,7 +24,7 @@ use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
 };
-use uc2_net::sender::{CtrlMsg, Sender, SenderConfig, SenderCrypto};
+use uc2_net::sender::{CtrlMsg, SnapArtifact, SnapshotSet, Sender, SenderConfig, SenderCrypto};
 use uc2_crypto::admin::{AdminMessage, AdminPolicy};
 use uc2_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
@@ -934,7 +934,17 @@ impl Node {
             let path = src_dir.join(format!("snap-{floor}.ultsnap"));
             let len = std::fs::metadata(&path).ok()?.len();
             let config = src_config_bytes.lock().unwrap().clone();
-            Some((floor, path, len, config))
+            Some(SnapshotSet {
+                // INTERIM (M14c Task 6 wires the declared set): FSM 0 only.
+                services_declared: 0b1,
+                config,
+                artifacts: vec![SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: floor,
+                    path,
+                    len,
+                }],
+            })
         }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters

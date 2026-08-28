@@ -67,6 +67,14 @@ const SNAP_DGRAMS_PER_CYCLE: usize = 4;
 /// floor if it still needs the snapshot, reopening a fresh session.
 const SNAP_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 
+/// A session re-sends the `SNAP_BEGIN` of the artifact it is currently working
+/// on no more often than this. A lost BEGIN would otherwise strand every chunk
+/// of that artifact (the receiver cannot place bytes for an artifact it was
+/// never told about, and cannot NAK for one either) until the 30 s session
+/// timeout. A duplicate BEGIN is a no-op at the receiver, so this costs at most
+/// one datagram per 20 ms per session.
+const SNAP_BEGIN_RESEND_NS: u64 = 20_000_000;
+
 /// Control messages routed from the leader's receiver agent (Task 8).
 /// Bounded channel; a dropped message is safe (NAK re-fires after backoff,
 /// status re-sends on its floor).
@@ -94,37 +102,85 @@ pub enum CtrlMsg {
     SetPeers { followers: Vec<SocketAddr>, learners: Vec<SocketAddr>, cluster_size: usize },
 }
 
-/// M6 Task 6: newest durable snapshot artifact the node is willing to ship —
-/// `(snapshot_pos, path, total_len, config)`. The node wires this to
-/// `SnapshotStore` filtered by its PERSISTED floor marker (never a
-/// half-written file). `None` = no shippable snapshot (the NAK stays an
-/// overrun). M7 Task 6: `config` is the `v2::config::encode_config` bytes of
-/// the CURRENT `ConfigRecord.config` at ship time — carried in every
-/// `SNAP_BEGIN` so a below-floor joiner adopts the leader's membership
-/// alongside its lineage. Over-delivery (shipping it to a peer whose config is
-/// already current) is safe: the receiver adopts by fiat only on a genuine
-/// install, and adoption itself is idempotent by version.
-pub type SnapshotSource = Arc<dyn Fn() -> Option<(u64, PathBuf, u64, Vec<u8>)> + Send + Sync>;
+/// M14c: one FSM's newest durable snapshot artifact, as offered to a session.
+#[derive(Debug, Clone)]
+pub struct SnapArtifact {
+    pub service_id: u8,
+    pub snapshot_pos: u64,
+    pub path: PathBuf,
+    pub len: u64,
+}
 
-/// One in-flight outbound snapshot transfer (M6 Task 6). At most one at a time
-/// — a second requester waits; sessions are rare by construction (only a peer
-/// whose NAK fell below the purge floor triggers one).
+/// M14c (spec §7.3/§14.3): everything one snapshot session ships — one
+/// artifact per declared FSM, **ascending by `service_id`, non-empty, every
+/// `len > 0`**, plus the declared bitmask and the config the session carries.
+/// A source that cannot honour those invariants must return `None`: the
+/// session is refused (the peer re-NAKs) rather than opened half-formed.
+#[derive(Debug, Clone)]
+pub struct SnapshotSet {
+    /// The sender's declared FSM mask; rides every `SNAP_BEGIN` and is what
+    /// the receiver compares against its own (`declared-set mismatch`).
+    pub services_declared: u64,
+    /// M7: the encoded `ConfigRecord.config` at ship time — see below.
+    pub config: Vec<u8>,
+    pub artifacts: Vec<SnapArtifact>,
+}
+
+/// M6 Task 6 / M14c: the newest durable snapshot SET the node is willing to
+/// ship. The node wires this to each declared FSM's `SnapshotStore` filtered by
+/// its PERSISTED floor marker (never a half-written file). `None` = nothing
+/// shippable (the NAK stays an overrun). M7 Task 6: `config` is the
+/// `v2::config::encode_config` bytes of the CURRENT `ConfigRecord.config` at
+/// ship time — carried in every `SNAP_BEGIN` so a below-floor joiner adopts the
+/// leader's membership alongside its lineage. Over-delivery (shipping to a peer
+/// whose config is already current) is safe: the receiver adopts by fiat only
+/// on a genuine install, and adoption is idempotent by version.
+pub type SnapshotSource = Arc<dyn Fn() -> Option<SnapshotSet> + Send + Sync>;
+
+/// One artifact inside an in-flight outbound session. `base` is its first
+/// byte's STREAM-GLOBAL offset (the session is one concatenated byte stream
+/// with artifact boundaries announced by the BEGINs), so `SNAP_NAK` repair is
+/// byte-identical to 0.5.0.
+struct SnapPart {
+    service_id: u8,
+    snapshot_pos: u64,
+    base: u64,
+    len: u64,
+    file: std::fs::File,
+    /// When this artifact's `SNAP_BEGIN` was last put on the wire; `None` =
+    /// never. Re-sent on the [`SNAP_BEGIN_RESEND_NS`] cadence — see
+    /// `drive_snap_session`.
+    begun_ns: Option<u64>,
+}
+
+/// One in-flight outbound snapshot transfer (M6 Task 6; M14c: N artifacts). At
+/// most one at a time — a second requester waits; sessions are rare by
+/// construction (only a peer whose NAK fell below the purge floor triggers one).
 struct SnapSession {
     peer: SocketAddr,
     session: u32,
-    snapshot_pos: u64,
-    file: std::fs::File,
-    total_len: u64,
-    /// Next sequential byte offset to ship (the contiguous fill cursor).
+    /// Rides every `SNAP_BEGIN`; the receiver refuses a session whose mask
+    /// differs from its own.
+    services_declared: u64,
+    /// Ascending by `service_id`, contiguous in `base`.
+    parts: Vec<SnapPart>,
+    /// Sum of the artifacts' lengths — the stream's byte space.
+    stream_len: u64,
+    /// Next sequential STREAM offset to ship (the contiguous fill cursor).
     cursor: u64,
-    /// Peer-requested missing ranges (repair), served before the cursor.
+    /// Peer-requested missing STREAM ranges (repair), served before the cursor.
     naks: VecDeque<(u64, u32)>,
-    /// SNAP_BEGIN has been sent (first cycle sends it before any chunk).
-    begun: bool,
     last_activity_ns: u64,
     /// M7 Task 6: the encoded `ConfigRecord.config` at the moment this session
-    /// opened (from the `SnapshotSource` closure) — carried in `SNAP_BEGIN`.
+    /// opened (from the `SnapshotSource` closure) — carried in every `SNAP_BEGIN`.
     config: Vec<u8>,
+}
+
+impl SnapSession {
+    /// Index of the artifact containing stream offset `at`, or `None` past EOF.
+    fn part_at(&self, at: u64) -> Option<usize> {
+        self.parts.iter().position(|p| at >= p.base && at < p.base + p.len)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -943,7 +999,8 @@ impl Sender {
     /// Try to open a snapshot session to `to` in response to a below-floor NAK.
     /// Returns `false` (caller counts an overrun) when: a session is already in
     /// flight (one at a time — the peer re-NAKs and waits), no source is wired,
-    /// no shippable snapshot exists, or the file cannot be opened.
+    /// no shippable snapshot set exists, the set breaks its invariants, or one
+    /// of the files cannot be opened.
     fn try_open_snap_session(&mut self, to: SocketAddr) -> bool {
         if self.snap.is_some() {
             return false;
@@ -951,34 +1008,59 @@ impl Sender {
         let Some(src) = self.snapshot_source.clone() else {
             return false;
         };
-        let Some((pos, path, len, config)) = src() else {
+        let Some(set) = src() else {
             return false;
         };
-        let Ok(file) = std::fs::File::open(&path) else {
+        if set.artifacts.is_empty() {
             return false;
-        };
+        }
+        // Build the parts eagerly: every file must open and every invariant
+        // must hold before a single datagram goes out, so a half-formed set
+        // stays an overrun (the peer re-NAKs) rather than a session the
+        // receiver can never complete.
+        let mut parts = Vec::with_capacity(set.artifacts.len());
+        let mut base = 0u64;
+        let mut prev_id: Option<u8> = None;
+        for a in &set.artifacts {
+            if a.len == 0 || prev_id.is_some_and(|p| p >= a.service_id) {
+                return false; // empty artifact, or not strictly ascending
+            }
+            prev_id = Some(a.service_id);
+            let Ok(file) = std::fs::File::open(&a.path) else {
+                return false;
+            };
+            parts.push(SnapPart {
+                service_id: a.service_id,
+                snapshot_pos: a.snapshot_pos,
+                base,
+                len: a.len,
+                file,
+                begun_ns: None,
+            });
+            base += a.len;
+        }
         let sid = self.snap_session_seq.wrapping_add(1);
         self.snap_session_seq = sid;
         self.snap = Some(SnapSession {
             peer: to,
             session: sid,
-            snapshot_pos: pos,
-            file,
-            total_len: len,
+            services_declared: set.services_declared,
+            parts,
+            stream_len: base,
             cursor: 0,
             naks: VecDeque::new(),
-            begun: false,
             last_activity_ns: self.base.elapsed().as_nanos() as u64,
-            config,
+            config: set.config,
         });
         self.stats.snap_sessions.fetch_add(1, Ordering::Relaxed);
         true
     }
 
     /// Advance the in-flight snapshot session by at most [`SNAP_DGRAMS_PER_CYCLE`]
-    /// chunk datagrams: send SNAP_BEGIN once, then serve peer repair NAKs, then
-    /// fill the cursor sequentially. Abandons the session after
-    /// [`SNAP_SESSION_TIMEOUT_NS`] with no progress. Returns `true` iff it did work.
+    /// chunk datagrams: make sure this cycle's target artifact has a live
+    /// `SNAP_BEGIN`, then serve peer repair NAKs, then fill the cursor
+    /// sequentially. Abandons the session after [`SNAP_SESSION_TIMEOUT_NS`] with
+    /// no progress. Returns `true` iff it did work.
     fn drive_snap_session(&mut self) -> bool {
         let Some(mut sess) = self.snap.take() else {
             return false;
@@ -990,22 +1072,48 @@ impl Sender {
             return true;
         }
 
+        // Which artifact this cycle's first datagram targets: the head repair
+        // NAK's, else the cursor's, else the last one (the stream is fully sent
+        // and we are waiting for the DONE — keep its BEGIN alive).
+        let target = sess
+            .naks
+            .front()
+            .and_then(|&(off, _)| sess.part_at(off))
+            .or_else(|| sess.part_at(sess.cursor))
+            .unwrap_or(sess.parts.len() - 1);
+
+        // `did` = this cycle put a datagram on the wire (the agent's duty
+        // signal). `progress` = it did something a *live* peer's transfer needs
+        // — a first BEGIN or a chunk. A BEGIN RE-send is deliberately NOT
+        // progress: it fires on its own 20 ms cadence, so counting it would
+        // refresh `last_activity_ns` forever and a dead peer's session would
+        // never hit [`SNAP_SESSION_TIMEOUT_NS`] — pinning the single session
+        // slot against every other requester.
         let mut did = false;
-        if !sess.begun {
-            // M8 (Task 17): `begun` latches only on a datagram that actually
+        let mut progress = false;
+        let first_ever = sess.parts[target].begun_ns.is_none();
+        let stale = sess.parts[target]
+            .begun_ns
+            .is_none_or(|at| now.saturating_sub(at) >= SNAP_BEGIN_RESEND_NS);
+        if stale {
+            let p = &sess.parts[target];
+            let (peer, session, service_id, pos, len) =
+                (sess.peer, sess.session, p.service_id, p.snapshot_pos, p.len);
+            let declared = sess.services_declared;
+            // M8 (Task 17): `begun_ns` latches only on a datagram that actually
             // reached the wire. A seal failure (no session with this peer yet)
-            // must leave the session un-begun so the NEXT cycle retries the
-            // BEGIN — latching it unconditionally would open a session whose
-            // peer never learned it existed, and every chunk after it would be
-            // dropped by a receiver with no intake.
-            if self.send_snap_begin(sess.peer, sess.session, sess.snapshot_pos, sess.total_len, &sess.config) {
-                sess.begun = true;
+            // must leave the artifact un-begun so the NEXT cycle retries the
+            // BEGIN — latching it unconditionally would ship chunks a receiver
+            // with no intake for them can only drop.
+            if self.send_snap_begin(peer, session, service_id, pos, len, declared, &sess.config) {
+                sess.parts[target].begun_ns = Some(now);
                 did = true;
-            } else {
-                // Nothing else in this session can make progress until the
-                // peer has the BEGIN; keep the slot and retry next cycle.
-                // `false` (no work done) deliberately: a session whose peer
-                // has no key yet must not keep the agent's duty loop hot, and
+                progress |= first_ever;
+            } else if first_ever {
+                // Nothing in this artifact can make progress until the peer has
+                // its BEGIN; keep the slot and retry next cycle. `false` (no
+                // work done) deliberately: a session whose peer has no key yet
+                // must not keep the agent's duty loop hot, and
                 // `last_activity_ns` is left un-refreshed so the session is
                 // abandoned on the ordinary `SNAP_SESSION_TIMEOUT_NS` path if
                 // the link never comes up.
@@ -1022,18 +1130,28 @@ impl Sender {
             };
             let n = self.send_snap_chunk(&mut sess, offset, true);
             if n == 0 {
-                break; // offset past EOF / read error — drop the request
+                break; // outside every artifact / read error — drop the request
             }
             if (n as u32) < length {
-                // Range spans multiple datagrams: re-queue the remainder.
+                // Range spans multiple datagrams (or an artifact boundary):
+                // re-queue the remainder.
                 sess.naks.push_front((offset + n as u64, length - n as u32));
             }
             emitted += 1;
             did = true;
+            progress = true;
         }
-        // Then sequential cursor fill.
-        while emitted < SNAP_DGRAMS_PER_CYCLE && sess.cursor < sess.total_len {
+        // Then sequential cursor fill, artifact by artifact.
+        while emitted < SNAP_DGRAMS_PER_CYCLE && sess.cursor < sess.stream_len {
             let at = sess.cursor;
+            let Some(i) = sess.part_at(at) else {
+                break;
+            };
+            if sess.parts[i].begun_ns.is_none() {
+                // Crossed into the next artifact: its BEGIN goes out first, at
+                // the top of the next cycle.
+                break;
+            }
             let n = self.send_snap_chunk(&mut sess, at, false);
             if n == 0 {
                 break;
@@ -1041,22 +1159,25 @@ impl Sender {
             sess.cursor += n as u64;
             emitted += 1;
             did = true;
+            progress = true;
         }
 
-        if did {
+        if progress {
             sess.last_activity_ns = now;
         }
         self.snap = Some(sess);
         did
     }
 
-    /// Read one MTU-sized chunk from the snapshot file at `offset` and ship it as
-    /// a SNAP_CHUNK (header `position` = file offset). Returns bytes sent (0 on
-    /// EOF / read error).
+    /// Read one MTU-sized chunk at STREAM offset `offset` from whichever
+    /// artifact contains it and ship it as a SNAP_CHUNK (header `position` =
+    /// the stream offset). A datagram never spans an artifact boundary — the
+    /// receiver writes one datagram into exactly one `.part`. Returns bytes
+    /// sent (0 past the stream / read error).
     fn send_snap_chunk(&mut self, sess: &mut SnapSession, offset: u64, is_nak: bool) -> usize {
-        if offset >= sess.total_len {
+        let Some(i) = sess.part_at(offset) else {
             return 0;
-        }
+        };
         // M8 (Task 17): `- crypto_overhead()`. T10 deliberately left this
         // un-subtracted while SNAP was cleartext — the ONE of the four MTU
         // budget sites in this file that did not need it then. A sealed chunk
@@ -1065,12 +1186,14 @@ impl Sender {
         // chunk (which, at the default 1408, is every chunk of a snapshot
         // bigger than one datagram — i.e. all of them).
         let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
-        let want = ((sess.total_len - offset) as usize).min(budget);
+        let part_end = sess.parts[i].base + sess.parts[i].len;
+        let want = ((part_end - offset) as usize).min(budget);
+        let in_file = offset - sess.parts[i].base;
         let mut buf = vec![0u8; want];
-        if sess.file.seek(SeekFrom::Start(offset)).is_err() {
+        if sess.parts[i].file.seek(SeekFrom::Start(in_file)).is_err() {
             return 0;
         }
-        if sess.file.read_exact(&mut buf).is_err() {
+        if sess.parts[i].file.read_exact(&mut buf).is_err() {
             return 0;
         }
         if !self.assemble_snap(sess.peer, offset, DGRAM_KIND_SNAP_CHUNK, &buf) {
@@ -1089,17 +1212,21 @@ impl Sender {
         want
     }
 
-    /// Ship SNAP_BEGIN (header `position` = 0; body carries session/pos/len/config).
-    /// M7 Task 6: `config` is the encoded `ConfigRecord.config` this session's
+    /// Ship one artifact's SNAP_BEGIN (header `position` = 0; body carries
+    /// session / layout / service_id / pos / len / declared / config). M7 Task 6:
+    /// `config` is the encoded `ConfigRecord.config` this session's
     /// `SnapshotSource` closure captured at open time — the body grows to fit it.
     /// Returns `false` if the datagram could not be sealed and was therefore
-    /// dropped (M8 Task 17) — the caller must NOT latch the session as begun.
+    /// dropped (M8 Task 17) — the caller must NOT latch the artifact as begun.
+    #[allow(clippy::too_many_arguments)]
     fn send_snap_begin(
         &mut self,
         peer: SocketAddr,
         session: u32,
+        service_id: u8,
         snapshot_pos: u64,
         total_len: u64,
+        services_declared: u64,
         config: &[u8],
     ) -> bool {
         let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
@@ -1108,10 +1235,10 @@ impl Sender {
             &SnapBeginBody {
                 session,
                 layout: SNAP_BEGIN_LAYOUT_V2,
-                service_id: 0,         // Task 4: the artifact's id
+                service_id,
                 snapshot_pos,
                 total_len,
-                services_declared: 1,  // Task 4: the source's declared mask
+                services_declared,
                 config: config.to_vec(),
             },
         );
@@ -2624,7 +2751,16 @@ mod tests {
             Some(SenderCrypto { half: leader.send_half(), peer_ids }),
         );
         s.set_snapshot_source(Arc::new(move || {
-            Some((4096, snap_path.clone(), total, t17_config_bytes()))
+            Some(SnapshotSet {
+                services_declared: 0b1,
+                config: t17_config_bytes(),
+                artifacts: vec![SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 4096,
+                    path: snap_path.clone(),
+                    len: total,
+                }],
+            })
         }));
         (s, f, peer, dir)
     }
@@ -2652,9 +2788,121 @@ mod tests {
             always_leader(),
         );
         s.set_snapshot_source(Arc::new(move || {
-            Some((4096, snap_path.clone(), total, t17_config_bytes()))
+            Some(SnapshotSet {
+                services_declared: 0b1,
+                config: t17_config_bytes(),
+                artifacts: vec![SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 4096,
+                    path: snap_path.clone(),
+                    len: total,
+                }],
+            })
         }));
         (s, f, dir)
+    }
+
+    /// M14c Task 4: two artifacts, ids 0 and 2, 2048 B and 3000 B —
+    /// deliberately not a multiple of the MTU budget, so the artifact-boundary
+    /// clamp is exercised. Same shape as
+    /// `sender_without_crypto_and_snapshot_source` (primed ring, so an injected
+    /// NAK at 0 is below the floor and upgrades to a session).
+    fn sender_with_two_artifacts() -> (Sender, Fake, tempfile::TempDir) {
+        let f = Fake::new();
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("snap-2048.ultsnap");
+        let p2 = dir.path().join("snap-4096.ultsnap");
+        std::fs::write(&p0, vec![0xA1u8; 2048]).unwrap();
+        std::fs::write(&p2, vec![0xB2u8; 3000]).unwrap();
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        s.set_snapshot_source(Arc::new(move || {
+            Some(SnapshotSet {
+                services_declared: 0b101,
+                config: t17_config_bytes(),
+                artifacts: vec![
+                    SnapArtifact { service_id: 0, snapshot_pos: 2048, path: p0.clone(), len: 2048 },
+                    SnapArtifact { service_id: 2, snapshot_pos: 4096, path: p2.clone(), len: 3000 },
+                ],
+            })
+        }));
+        (s, f, dir)
+    }
+
+    #[test]
+    fn a_session_ships_one_begin_per_artifact_and_never_spans_a_boundary() {
+        let (mut s, f, _dir) = sender_with_two_artifacts();
+        let addr = f.addr();
+        s.on_nak(addr, 0, 96); // below the ring floor → upgrades to a session
+        let mut begins: Vec<SnapBeginBody> = Vec::new();
+        let mut chunks: Vec<(u64, usize)> = Vec::new(); // (stream offset, payload len)
+        // Four cycles: the first ships BEGIN(0) + all of artifact 0, the second
+        // BEGIN(2) + all of artifact 2. `Fake::recv_raw` spins 500 ms on an
+        // empty drain, so [`SNAP_BEGIN_RESEND_NS`] DOES elapse between cycles —
+        // the trailing artifact's BEGIN is re-sent (a byte-identical no-op at
+        // the receiver), which `dedup` below folds away.
+        for _ in 0..4 {
+            s.do_work();
+            while let Some(d) = f.recv_raw() {
+                let h = read_datagram_header(&d).unwrap();
+                match h.kind {
+                    DGRAM_KIND_SNAP_BEGIN => {
+                        begins.push(read_snap_begin_body(&d[DATAGRAM_HEADER_LEN..]).unwrap())
+                    }
+                    DGRAM_KIND_SNAP_CHUNK => {
+                        chunks.push((h.position, d.len() - DATAGRAM_HEADER_LEN))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for b in &begins {
+            assert_eq!(b.layout, SNAP_BEGIN_LAYOUT_V2);
+            assert_eq!(b.services_declared, 0b101, "the declared mask rides EVERY begin");
+            assert_eq!(b.session, begins[0].session, "one session for the whole stream");
+            assert_eq!(b.config, t17_config_bytes(), "config rides every begin unchanged");
+        }
+        // A re-send is byte-identical to its original, so distinct bodies ==
+        // one per artifact, in ascending `service_id` order.
+        begins.dedup();
+        assert_eq!(begins.len(), 2, "one distinct BEGIN per artifact: {begins:?}");
+        assert_eq!(
+            (begins[0].service_id, begins[0].snapshot_pos, begins[0].total_len),
+            (0, 2048, 2048)
+        );
+        assert_eq!(
+            (begins[1].service_id, begins[1].snapshot_pos, begins[1].total_len),
+            (2, 4096, 3000)
+        );
+        // Stream-global offsets, contiguous over [0, 5048), and no datagram
+        // straddles the 2048 boundary (the receiver writes one datagram into
+        // exactly one `.part`).
+        chunks.sort_unstable();
+        chunks.dedup();
+        let mut want = 0u64;
+        for &(off, len) in &chunks {
+            assert_eq!(off, want, "chunks fill the stream contiguously: {chunks:?}");
+            assert!(
+                off >= 2048 || off + len as u64 <= 2048,
+                "chunk [{off}, {}) spans the artifact boundary at 2048",
+                off + len as u64
+            );
+            want = off + len as u64;
+        }
+        assert_eq!(want, 5048, "the whole 2048 + 3000 byte stream was sent");
     }
 
     /// Drive a snapshot session and collect the raw datagrams of `kind`.
@@ -2722,22 +2970,36 @@ mod tests {
         let (mut s, f, peer, _dir) = sender_with_crypto_and_established_session("begin-sealed");
         let addr = f.addr();
         let begins = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_BEGIN);
-        assert_eq!(begins.len(), 1, "exactly one SNAP_BEGIN opens a session");
-        let d = &begins[0];
+        assert!(!begins.is_empty(), "a session opens with a SNAP_BEGIN");
         let cfgb = t17_config_bytes();
-        assert!(
-            !d.windows(cfgb.len()).any(|w| w == cfgb.as_slice()),
-            "the cluster config must not be readable (or forgeable) on the wire"
-        );
+        // M14c: the BEGIN is re-sent on the [`SNAP_BEGIN_RESEND_NS`] cadence
+        // (`Fake::recv_raw`'s 500 ms empty-drain spin makes that elapse here),
+        // so open EVERY one: each must be sealed, and all must be the SAME
+        // body — a re-send is a byte-identical no-op at the receiver.
         let mut recv = peer.receive_half();
-        let mut open = d.clone();
-        let n = open.len();
-        let len = recv
-            .open_slice(T17_LEADER_ID, &mut open, n)
-            .expect("the peer must open the sealed SNAP_BEGIN");
-        let body = read_snap_begin_body(&open[DATAGRAM_HEADER_LEN..len]).expect("well-formed body");
+        let mut bodies = Vec::new();
+        for d in &begins {
+            assert!(
+                !d.windows(cfgb.len()).any(|w| w == cfgb.as_slice()),
+                "the cluster config must not be readable (or forgeable) on the wire"
+            );
+            let mut open = d.clone();
+            let n = open.len();
+            let len = recv
+                .open_slice(T17_LEADER_ID, &mut open, n)
+                .expect("the peer must open the sealed SNAP_BEGIN");
+            bodies.push(
+                read_snap_begin_body(&open[DATAGRAM_HEADER_LEN..len]).expect("well-formed body"),
+            );
+        }
+        bodies.dedup();
+        assert_eq!(bodies.len(), 1, "exactly one DISTINCT SNAP_BEGIN opens a session");
+        let body = &bodies[0];
         assert_eq!(body.config, cfgb, "the config survives the round trip intact");
         assert_eq!(body.total_len, T17_SNAP_LEN as u64);
+        assert_eq!(body.layout, SNAP_BEGIN_LAYOUT_V2);
+        assert_eq!(body.service_id, 0);
+        assert_eq!(body.services_declared, 0b1);
     }
 
     #[test]
@@ -2836,7 +3098,16 @@ mod tests {
             Some(SenderCrypto { half: leader.send_half(), peer_ids }),
         );
         s.set_snapshot_source(Arc::new(move || {
-            Some((4096, snap_path.clone(), total, t17_config_bytes()))
+            Some(SnapshotSet {
+                services_declared: 0b1,
+                config: t17_config_bytes(),
+                artifacts: vec![SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 4096,
+                    path: snap_path.clone(),
+                    len: total,
+                }],
+            })
         }));
         let addr = f.addr();
         s.on_nak(addr, 0, 96);

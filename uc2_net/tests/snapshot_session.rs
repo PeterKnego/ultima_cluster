@@ -94,11 +94,21 @@ fn build(faults: FaultConfig) -> Harness {
     // The leader dir holds the source snapshot; the sender ships it on a
     // below-floor NAK. NO replay source is wired, so the NAK is unservable from
     // the journal and upgrades to a session.
-    let leader_dir = tempfile::tempdir().unwrap();
+    let leader_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let snap_path = write_snapshot_file(leader_dir.path());
     let src_len = std::fs::metadata(&snap_path).unwrap().len();
-    let snapshot_source: uc2_net::sender::SnapshotSource =
-        Arc::new(move || Some((SNAP_POS, snap_path.clone(), src_len, Vec::new())));
+    let snapshot_source: uc2_net::sender::SnapshotSource = Arc::new(move || {
+        Some(uc2_net::sender::SnapshotSet {
+            services_declared: 0b1,
+            config: Vec::new(),
+            artifacts: vec![uc2_net::sender::SnapArtifact {
+                service_id: 0,
+                snapshot_pos: SNAP_POS,
+                path: snap_path.clone(),
+                len: src_len,
+            }],
+        })
+    });
 
     let leader_buf = heap_buffer();
     // Prime the ring far ahead so a NAK at position 0 is below the ring floor
@@ -131,7 +141,7 @@ fn build(faults: FaultConfig) -> Harness {
     leader_recv.set_sender_route(ctrl_tx.clone());
 
     // Follower: intake enabled.
-    let follower_dir = tempfile::tempdir().unwrap();
+    let follower_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let follower_snap_dir = follower_dir.path().join("snapshots");
     std::fs::create_dir_all(&follower_snap_dir).unwrap();
     let follower_buf = heap_buffer();
