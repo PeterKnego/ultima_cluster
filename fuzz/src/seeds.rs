@@ -116,7 +116,15 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
     write_snap_begin_body(
         &mut b,
-        &SnapBeginBody { session: 7, snapshot_pos: 8192, total_len: 1 << 20, config },
+        &SnapBeginBody {
+            session: 7,
+            layout: SNAP_BEGIN_LAYOUT_V2,
+            service_id: 0,
+            snapshot_pos: 8192,
+            total_len: 1 << 20,
+            services_declared: 0b1,
+            config,
+        },
     );
     seeds.push(Seed::fixed("10-snap-begin-config", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
@@ -144,6 +152,25 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
         &ConfigReplyBody { nonce: 0x0BAD_F00D_DEAD_BEEF, status: 0, reason: 0, version: 12 },
     );
     seeds.push(Seed::fixed("13-config-reply", datagram(DGRAM_KIND_CONFIG_REPLY, 0, 3, &b)));
+
+    // M14c / wire 0.6.0: a MULTI-service SNAP_BEGIN — a non-zero `service_id`,
+    // a multi-bit `services_declared`, and no config, so the decoder's fixed
+    // part is exercised at exactly `SNAP_BEGIN_FIXED_LEN` (the 10- seed covers
+    // the config-carrying variable-length path).
+    let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+    write_snap_begin_body(
+        &mut b,
+        &SnapBeginBody {
+            session: 9,
+            layout: SNAP_BEGIN_LAYOUT_V2,
+            service_id: 2,
+            snapshot_pos: 65536,
+            total_len: 300 * 1024,
+            services_declared: 0b101,
+            config: vec![],
+        },
+    );
+    seeds.push(Seed::fixed("14-snap-begin-v2", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
     seeds
 }

@@ -52,7 +52,17 @@ impl ProtocolVersion {
 // cluster degrades to stalled commits rather than to unsound ones. As with
 // 0.4.0 the cnc page is untouched (`CNC_V2_VERSION` unchanged): this alters
 // the UDP datagram format, not the shmem layout.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 5, 0);
+// 0.6.0 (M14c): `DGRAM_KIND_SNAP_BEGIN`'s body carries the per-FSM fields a
+// multi-service snapshot session needs — `layout`, `service_id` and
+// `services_declared` — growing its fixed part from 26 to 34 bytes
+// (`SNAP_BEGIN_FIXED_LEN`). Every other datagram, the 16-byte header included,
+// is byte-identical to 0.5.0, so a mixed 0.5.0/0.6.0 cluster replicates and
+// elects normally; only a snapshot session between mixed versions goes wrong,
+// and only the 0.6.0 side can detect it (the `layout` byte). **This constant
+// is documentary and is not itself checked on any receive path** — the flag
+// day rests on the standing operational rule (upgrade all nodes together,
+// `docs/how-to/upgrade-a-cluster.md`), not on a version gate.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 6, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]
@@ -86,5 +96,10 @@ mod tests {
         let a = ProtocolVersion::new(1, 0, 0);
         let b = ProtocolVersion::new(2, 0, 0);
         assert!(!a.compatible_with(b));
+    }
+
+    #[test]
+    fn current_is_the_m14c_snapshot_wire() {
+        assert_eq!(CURRENT, ProtocolVersion::new(0, 6, 0));
     }
 }

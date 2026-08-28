@@ -26,8 +26,8 @@ use uc2_log::cnc::CncPage;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SnapBeginBody,
-    write_datagram_header, write_snap_begin_body,
+    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN,
+    SNAP_BEGIN_LAYOUT_V2, SnapBeginBody, write_datagram_header, write_snap_begin_body,
 };
 #[cfg(test)]
 use uc_protocol::v2::datagram::read_snap_begin_body;
@@ -1105,7 +1105,15 @@ impl Sender {
         let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
         write_snap_begin_body(
             &mut body,
-            &SnapBeginBody { session, snapshot_pos, total_len, config: config.to_vec() },
+            &SnapBeginBody {
+                session,
+                layout: SNAP_BEGIN_LAYOUT_V2,
+                service_id: 0,         // Task 4: the artifact's id
+                snapshot_pos,
+                total_len,
+                services_declared: 1,  // Task 4: the source's declared mask
+                config: config.to_vec(),
+            },
         );
         if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_BEGIN, &body) {
             return false;

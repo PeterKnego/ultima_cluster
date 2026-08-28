@@ -38,7 +38,8 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
     DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    SNAP_BEGIN_FIXED_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
+    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V2, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
+    SnapNakBody, StatusBody,
     TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_config_proposal_body, read_config_reply_body,
     read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
     read_snap_begin_body, read_snap_nak_body, read_status_body, read_term_map_body, read_vote_body,
@@ -1579,8 +1580,11 @@ impl FollowerReceiver {
             &mut d[DATAGRAM_HEADER_LEN..],
             &SnapBeginBody {
                 session: intake.session,
+                layout: SNAP_BEGIN_LAYOUT_V2,
+                service_id: 0,         // Task 5: the last artifact's id
                 snapshot_pos: intake.snapshot_pos,
                 total_len: intake.total_len,
+                services_declared: 1,  // Task 5: this node's own mask
                 config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
@@ -3955,7 +3959,15 @@ mod tests {
         let mut begin = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(
             &mut begin,
-            &SnapBeginBody { session: 7, snapshot_pos: 4096, total_len: TOTAL, config: vec![] },
+            &SnapBeginBody {
+                session: 7,
+                layout: SNAP_BEGIN_LAYOUT_V2,
+                service_id: 0,
+                snapshot_pos: 4096,
+                total_len: TOTAL,
+                services_declared: 1,
+                config: vec![],
+            },
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 32, &[0xEEu8; 32]);
@@ -4039,8 +4051,11 @@ mod tests {
             &mut body,
             &SnapBeginBody {
                 session: 1,
+                layout: SNAP_BEGIN_LAYOUT_V2,
+                service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 32,
+                services_declared: 1,
                 config: hostile.clone(),
             },
         );
@@ -4091,7 +4106,15 @@ mod tests {
         let mut begin = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(
             &mut begin,
-            &SnapBeginBody { session: 3, snapshot_pos: 4096, total_len: 64, config: vec![] },
+            &SnapBeginBody {
+                session: 3,
+                layout: SNAP_BEGIN_LAYOUT_V2,
+                service_id: 0,
+                snapshot_pos: 4096,
+                total_len: 64,
+                services_declared: 1,
+                config: vec![],
+            },
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
         let deadline = Instant::now() + Duration::from_secs(3);

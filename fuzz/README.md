@@ -152,7 +152,7 @@ growth.
 
 | Target | What it parses |
 | --- | --- |
-| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header plus every body reader, i.e. the first code an unauthenticated UDP packet reaches. |
+| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header plus every body reader, i.e. the first code an unauthenticated UDP packet reaches. Since wire 0.6.0 that includes SNAP_BEGIN's layout discriminator, per-FSM id and declared-set word (`read_snap_begin_body` is total for every layout value). |
 | `uc2_remote_frame` | `uc2_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. |
 | `uc2_crypto_open` | `uc2_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic on attacker-chosen bytes. |
 | `uc2_crypto_handshake` | `uc2_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface, the first thing in the process to see bytes from anyone who can reach the UDP port. |
