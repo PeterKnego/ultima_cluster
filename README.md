@@ -175,7 +175,7 @@ including what is *not* verified and how to reproduce every layer.
 | `uc2_sim` | Deterministic simulation + invariants + fuzz |
 | `uc2_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
 | `uc2_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
-| `uc2_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries |
+| `uc2_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14) |
 | `uc2_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `RemoteSendHalf`/`RemotePollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
 | `uc2_gateway` | The `Edge`: a per-node TCP front door relaying `uc2_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
 | `uc-lincheck` | WGL linearizability checker + history recorder + register model |

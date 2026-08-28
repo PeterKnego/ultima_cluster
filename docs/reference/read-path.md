@@ -19,8 +19,12 @@ went out. This is an ordering rule; it is not a position comparison. The next
 round begins when the previous one completes, so the cadence is self-clocking
 at roughly one round per RTT. There is no tuning knob.
 
-A read is additionally gated on the service catching up to the read position,
-on a follower header-term check, on a capture-recheck, and on a service-epoch
+One probe round certifies every parked read regardless of which FSM it names
+— the round certifies a commit position, which is service-agnostic.
+
+A read is additionally gated on **the named FSM's** service catching up to
+the read position (the query's `service_id` selects the slot; M14), on a
+follower header-term check, on a capture-recheck, and on a service-epoch
 backstop that rejects an answer if the service restarted during the query.
 
 ## Constants
@@ -73,3 +77,4 @@ Batching gains appear only under concurrent reads.
 |---|---|
 | A burst of reads all resolving `RETRY` after ~1 s | the round cannot reach quorum — partition or deposition |
 | Sub-second read stalls under packet loss | not expected; the 2 ms retransmit covers loss. Suspect a cause other than loss. |
+| `MSG_V2_BAD_SERVICE` answered on `egress_node` | the client named an FSM id this node has no ring for (undeclared, ≥ 8, or a non-zero id on a harness node); the SDK refuses such ids locally, so this means a raw ring writer or a client attached to a differently-declared node |

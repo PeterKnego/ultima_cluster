@@ -454,7 +454,9 @@ it, and refuses to publish anything if it does not print `PASS`.
   protocol a remote client speaks, and `RemoteEngine`/`RemoteClient`, the Rust
   implementation of it. On-host clients use `uc2_client`'s three tiers
   instead: `Engine`, `PipelinedClient` + `Ticket`, and the blocking `Client`
-  shim.
+  shim. M14: `submit_to(id, …)`, `submit_all(…)` (every FSM's answer, in id
+  order) and `query_*_on(id, …)` pick which state machine answers; the plain
+  calls mean FSM 0.
 - **[The operations runbook](/docs/ops/uc2-runbook.md)** — instance directory
   layout, backups, membership changes, quorum-loss recovery, upgrades.
 - **[Versioning and the semver promise](/docs/reference/semver-policy.md)** —

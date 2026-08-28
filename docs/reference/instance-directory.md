@@ -16,10 +16,10 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. |
 | `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships and installs them. `<pos>` is the absolute log byte position the snapshot represents. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
-| `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Same format as `ingress.ring`. |
+| `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
 | `svc_query.<id>.ring` | node → service | Forwarded queries for FSM `id`. One per declared id since M14. |
-| `egress_service.<id>.broadcast` | node → service | Apply and output stream to FSM `id`'s service. One per declared id since M14. |
-| `egress_node.broadcast` | node → clients | Submit responses broadcast to clients. |
+| `egress_service.<id>.broadcast` | node → service | Apply and output stream to FSM `id`'s service. One per declared id since M14. A client opens every declared id's ring and accepts a response only from the FSM(s) its request named. |
+| `egress_node.broadcast` | node → clients | Node-originated answers to clients: `MSG_V2_NOT_LEADER` (with the leader hint), `MSG_V2_RETRY`, and `MSG_V2_BAD_SERVICE` (the query named an id this node has no ring for). Submit and query *responses* come from the FSMs' own rings. |
 | `service.<id>.lock` | service | Exclusive `flock`, held for FSM `id`'s service process's life — one process per declared id (M14). |
 | `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. One exception: a byte-identical re-send of an already-answered, already-recorded proposal (same nonce) is counted, not re-recorded — it repeats an answer already in the file rather than being a new admin event. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
 

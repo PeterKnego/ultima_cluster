@@ -54,6 +54,20 @@ and covered by this policy on the same terms as the rows above:
 (`uc2_client::{EngineConfig, SendHalf, PollHalf, Completion, Outcome,
 Consistency, SubmitError}`) are in the same position and are covered too.
 
+- **M14b adds per-FSM routing and fan-in to the `uc2_client` surface**:
+  `FanInTicket`; `Outcome::{Responses, BadService}`;
+  `SubmitError::ServiceNotDeclared`; `ClientError::ServiceNotDeclared`;
+  `SendHalf::{declared, try_submit_to, try_submit_all, try_query_on}`;
+  `PipelinedClient::{declared, submit_to, submit_all, query_snapshot_on,
+  query_linearizable_on}`; `Client::{declared, submit_to, submit_all,
+  query_snapshot_on, query_linearizable_on}` — all additive (minor).
+  `uc2_client` now depends on `bytes` (`Outcome::Responses` and
+  `FanInTicket` expose `bytes::Bytes`, the same type the SM contract uses).
+  One behavioural change is worth flagging even though it is not a
+  breaking change under this policy: `Outcome` and `SubmitError` gained
+  variants, so an exhaustive match on either downstream breaks at compile
+  time — a documented minor-version hazard of the three-tier promise.
+
 The normative descriptions live where the surface does:
 [the state-machine contract](state-machine-contract.md),
 [configuration](configuration.md), [`gateway.toml`](gateway-config.md),
