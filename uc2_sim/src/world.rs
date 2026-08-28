@@ -602,6 +602,8 @@ struct Node {
     /// T13: count of `Msg::Nak` gap-repair requests this node has SENT — see
     /// `World::nak_count`.
     nak_sent: u32,
+    /// M14b: the slowest local FSM's reach — outgoing reports are clamped to it.
+    apply_ceiling: Option<u64>,
 }
 
 /// T13: one node's crypto-plane state. `peers`/`group` are pure `(input,
@@ -796,6 +798,7 @@ impl World {
                 halted: false,
                 crypto: None,
                 nak_sent: 0,
+                apply_ceiling: None,
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
@@ -1335,7 +1338,6 @@ impl World {
                 if let Some(leader) = self.nodes[node].leader_hint
                     && leader != node
                 {
-                    let (id, term) = (self.nodes[node].id, self.nodes[node].sm.current_term());
                     // F1a data-plane contract switch — see `DataPlane`.
                     //   Gated     (structural clamp): clamp to `matched`, so a
                     //             divergent-but-un-truncated durable is never
@@ -1354,8 +1356,7 @@ impl World {
                         DataPlane::Mechanism { .. } => None,
                     };
                     if let Some(durable) = reportable {
-                        let durable_term = self.nodes[node].sm.term_at(durable);
-            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
+                        self.send_report(node, leader, durable, now, step)?;
                     }
                 }
             }
@@ -1377,10 +1378,8 @@ impl World {
             && let Some(leader) = self.nodes[node].leader_hint
             && leader != node
         {
-            let (id, term, durable) =
-                (self.nodes[node].id, self.nodes[node].sm.current_term(), self.nodes[node].durable);
-            let durable_term = self.nodes[node].sm.term_at(durable);
-            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
+            let durable = self.nodes[node].durable;
+            self.send_report(node, leader, durable, now, step)?;
         }
         // Mechanism C-1 CONTINUOUS LEAK: an erroneously-OPEN intake gate during a
         // truncation ships the stale (un-re-primed) AppendPosition = the raw
@@ -1398,10 +1397,8 @@ impl World {
             && let Some(leader) = self.nodes[node].leader_hint
             && leader != node
         {
-            let (id, term, durable) =
-                (self.nodes[node].id, self.nodes[node].sm.current_term(), self.nodes[node].durable);
-            let durable_term = self.nodes[node].sm.term_at(durable);
-            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
+            let durable = self.nodes[node].durable;
+            self.send_report(node, leader, durable, now, step)?;
         }
         self.push(SimEvent::ArchiveStep { node }, now + self.cfg.archive_step_ns);
         Ok(())
@@ -1532,6 +1529,10 @@ impl World {
             if let Some(t) = nd.pending_trunc_to.take() {
                 nd.durable = t;
                 nd.append = t;
+                // inv10: the deferred physical truncation lands — `durable` (the
+                // report source) drops to the consistent cut. A legitimate
+                // report discontinuity.
+                self.checker.on_report_reset(node);
             }
             self.record_committed(node);
             // Reconciliation for this term is complete (durable clamped to the
@@ -1543,7 +1544,7 @@ impl World {
             let handle_ok = !handle_keyed
                 || self.nodes[node].sm.current_term() == self.nodes[node].adopted_term;
             if handle_ok {
-                self.reopen_gate(node, now);
+                self.reopen_gate(node, now, step)?;
             }
         }
         // inv8 — revert correctness, pinned at the exact point the truncation
@@ -1620,19 +1621,41 @@ impl World {
     /// C-1 flow the gate reopens with a truncation still in flight, so the RAW
     /// divergent durable — not yet truncated — escapes into the leader's commit
     /// ranking, and the genuine-quorum oracle (inv5) catches the phantom.
-    fn reopen_gate(&mut self, node: usize, now: u64) {
+    fn reopen_gate(
+        &mut self,
+        node: usize,
+        now: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
         self.nodes[node].intake_gate = true;
         if let Some(leader) = self.nodes[node].leader_hint
             && leader != node
         {
-            let (id, term, durable) = (
-                self.nodes[node].id,
-                self.nodes[node].sm.current_term(),
-                self.nodes[node].durable,
-            );
-            let durable_term = self.nodes[node].sm.term_at(durable);
-            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
+            let durable = self.nodes[node].durable;
+            self.send_report(node, leader, durable, now, step)?;
         }
+        Ok(())
+    }
+
+    /// M14b: the ONE place a node's durable report leaves it. Clamps to the
+    /// node's apply ceiling (spec §5.3's `min(validated, min_applied + lag)`
+    /// with the ceiling standing in for `min_applied + lag`) and runs inv10.
+    /// `inject_report` deliberately bypasses this — it forges a wire value.
+    fn send_report(
+        &mut self,
+        node: usize,
+        leader: usize,
+        unclamped: u64,
+        now: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        let ceiling = self.nodes[node].apply_ceiling;
+        let durable = ceiling.map_or(unclamped, |c| unclamped.min(c));
+        self.checker.on_report(node, durable, unclamped, ceiling, step)?;
+        let (id, term) = (self.nodes[node].id, self.nodes[node].sm.current_term());
+        let durable_term = self.nodes[node].sm.term_at(durable);
+        self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
+        Ok(())
     }
 
     // ------------------------------------------------------- T13: crypto plane
@@ -1943,7 +1966,7 @@ impl World {
                         && handle_ok
                         && term >= term_before
                     {
-                        self.reopen_gate(to, now);
+                        self.reopen_gate(to, now, step)?;
                     }
                 }
                 Ok(())
@@ -2066,6 +2089,10 @@ impl World {
 
                 // Collapse the volatile tail to the durable base, then append the
                 // NewTerm no-op frame and feed it back; reset send cursors.
+                // inv10: a role change — the volatile tail collapses to `base`
+                // and a leader reports to nobody; the stream restarts if it is
+                // ever deposed.
+                self.checker.on_report_reset(node);
                 let nd = &mut self.nodes[node];
                 nd.append = base;
                 nd.durable = nd.durable.max(base);
@@ -2120,7 +2147,10 @@ impl World {
                 self.nodes[node].new_term_pos = None;
                 // A new term means a possibly-new leader: the replication match
                 // must be re-confirmed from scratch (Raft resets matchIndex).
+                // inv10: `matched` is the `Gated` report source, so a role change
+                // legitimately drops the next report to 0.
                 self.nodes[node].matched = 0;
+                self.checker.on_report_reset(node);
                 // Intake gate (Mechanism): adopting a STRICTLY new term closes the
                 // gate; it reopens only once reconciliation for this term completes
                 // (a clean term map, or a truncation ack). The shadow
@@ -2197,6 +2227,10 @@ impl World {
                 let own_before = self.nodes[node].map_before_reconcile.clone();
                 let leader = self.nodes[node].last_leader_map.clone();
                 self.checker.on_truncate(node as NodeId, to, &own_before, &leader, step)?;
+                // inv10: a truncation cuts `durable`/`append` back to `to` (or,
+                // under `Mechanism`, defers the cut to the ack) — the node's
+                // next report legitimately restarts from a lower position.
+                self.checker.on_report_reset(node);
                 self.stat_truncations += 1;
 
                 // M7 persist-revert-BEFORE-truncate (spec §5): the NODE's
@@ -2302,6 +2336,9 @@ impl World {
                 // crash, but no restart is ever scheduled and `restart()`
                 // refuses (the `halted` flag). Volatile state is torn down the
                 // same way `do_crash` does it.
+                // inv10: the same volatile teardown a crash does (`matched = 0`,
+                // `append` collapses to `durable`) — a report discontinuity.
+                self.checker.on_report_reset(node);
                 let nd = &mut self.nodes[node];
                 nd.halted = true;
                 nd.up = false;
@@ -2329,6 +2366,10 @@ impl World {
     }
 
     fn do_crash(&mut self, node: usize, now: u64) {
+        // inv10: a crash tears down the volatile state the report is built from
+        // (`matched = 0`, `append` collapses to `durable`) — a legitimate
+        // report discontinuity, ahead of the restart that also resets it.
+        self.checker.on_report_reset(node);
         {
             let nd = &mut self.nodes[node];
             nd.up = false;
@@ -2388,6 +2429,19 @@ impl World {
     /// reconnecting divergent node reconciling.
     pub fn set_quiet(&mut self, quiet: bool) {
         self.quiet = quiet;
+    }
+
+    /// M14b: cap node's outgoing durable reports at `ceiling` (`None` lifts it).
+    /// Models the slowest local FSM's applied position plus `fsm_lag`. A
+    /// change is a legitimate report discontinuity for inv10.
+    pub fn set_apply_ceiling(&mut self, node: usize, ceiling: Option<u64>) {
+        self.nodes[node].apply_ceiling = ceiling;
+        self.checker.on_report_reset(node);
+    }
+
+    /// M14b: the durable position node last reported (0 after a reset).
+    pub fn last_report(&self, node: usize) -> u64 {
+        self.checker.last_report(node)
     }
 
     // ---------------------------------------------------- T13: crypto plane

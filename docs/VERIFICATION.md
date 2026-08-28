@@ -175,7 +175,7 @@ toolchain to ≥ v4.32.0.
 
 A virtual-time cluster driving the *real* `ElectionSm` — `world.rs` wires
 `uc2_consensus` directly, so a fix in the consensus crate is automatically
-reflected rather than mirrored by hand. Seeded fault fuzz with nine whole-cluster
+reflected rather than mirrored by hand. Seeded fault fuzz with ten whole-cluster
 safety invariants swept after **every** event:
 
 | | Invariant |
@@ -189,11 +189,15 @@ safety invariants swept after **every** event:
 | inv7 | Quorum legality — no phantom commit, and the commit rides a chaining config |
 | inv8 | Revert correctness after truncation settles |
 | inv9 | Tombstone permanence |
+| inv10 | Report ceiling — a clamped report never exceeds its unclamped value or its apply ceiling, and never decreases except across a truncation, restart, role change or ceiling change (M14b) |
 
 Directed scenarios stage specific historical bugs as permanent regression pins —
 including `rebooted_unreconciled_voter_must_not_certify_phantom_commit` (Finding
 #5) and `old_term_range_must_not_commit_before_new_term_quorum` (Finding #6b),
 both verified RED before their fix and GREEN after.
+`capped_quorum_stalls_commit_and_releasing_one_follower_resumes_it` models
+M14a's report ceiling as a per-node apply cap and pins that commit stalls iff a
+commit quorum is capped.
 
 The simulator was itself blind to the durable dual-reader hazard until recently:
 `world.rs` advanced the counter and fed `DurableAdvanced` in the same handler, so
@@ -595,9 +599,9 @@ The most important section, and the one most projects omit.
 - **The published gate numbers are fleet measurements**, on the hardware and
   configuration each record names. They are reproducible, not universal.
 - **M14a's lag barrier and quorum-gated report ceiling are unit-tested and
-  integration-tested on one node and a 3-node in-process cluster; the sim
-  scenario (report never exceeds validated, commit stalls iff a quorum is
-  capped) is M14b.**
+  integration-tested on one node and a 3-node in-process cluster.** M14b's sim
+  scenario covers the ceiling's liveness property; the real node's ceiling is
+  exercised by `uc2_node/tests/services.rs` on a 3-node in-process cluster.
 - **Wire crypto is opt-in and off by default.** With it disabled the posture is a
   trusted network. With it enabled, the threat model is a network-path adversary;
   a compromised host and a malicious cluster member are explicitly **out of

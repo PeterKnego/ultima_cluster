@@ -125,6 +125,66 @@ fn minority_partition_cannot_commit_and_heals() {
     assert!(stats.truncations >= 1, "the deposed leader's tail must truncate");
 }
 
+/// M14b (spec §12): a per-node apply ceiling models "the slowest FSM's
+/// applied position + fsm_lag" — what M14a's report ceiling clamps a real
+/// node's AppendPosition to. With BOTH followers capped, the leader alone is
+/// not a quorum, so commit freezes at the cap while the leader's durable runs
+/// past it; releasing ONE follower restores a quorum and commit resumes.
+/// Every existing invariant runs throughout (`run*` returning `Ok`).
+#[test]
+fn capped_quorum_stalls_commit_and_releasing_one_follower_resumes_it() {
+    const FRAME: u64 = 96;
+    let mut w = World::new(base_cfg(11));
+    w.run_until_leader().expect("invariants");
+    let leader = w.current_leader().unwrap();
+    let followers = w.majority_excluding(leader);
+    let cap = w.max_commit() + 2 * FRAME;
+    for &f in &followers {
+        w.set_apply_ceiling(f, Some(cap));
+    }
+    w.append_and_replicate(40 * FRAME);
+    w.run_steps(8_000).expect("invariants");
+    assert!(
+        w.leader_durable() > cap + 10 * FRAME,
+        "vacuity: the leader must hold durable bytes well past the cap (durable {})",
+        w.leader_durable()
+    );
+    assert!(
+        w.max_commit() <= cap,
+        "commit {} ran past the capped quorum's ceiling {cap}",
+        w.max_commit()
+    );
+    for &f in &followers {
+        assert!(w.last_report(f) <= cap, "follower {f} reported {} > cap {cap}", w.last_report(f));
+    }
+    w.set_apply_ceiling(followers[0], None);
+    assert!(
+        w.run_until(|w| w.max_commit() > cap).expect("invariants"),
+        "commit must resume once a quorum is uncapped (timed out)"
+    );
+    assert!(w.last_report(followers[1]) <= cap, "the still-capped follower stays capped");
+}
+
+/// M14b: a capped MINORITY never stalls the cluster — the leader plus the
+/// uncapped follower are a quorum (spec §5.3: a lagging minority falls to
+/// journal replay, the cluster does not wait for it).
+#[test]
+fn a_capped_minority_does_not_stall_commit() {
+    const FRAME: u64 = 96;
+    let mut w = World::new(base_cfg(12));
+    w.run_until_leader().expect("invariants");
+    let leader = w.current_leader().unwrap();
+    let f = w.majority_excluding(leader)[0];
+    let cap = w.max_commit() + FRAME;
+    w.set_apply_ceiling(f, Some(cap));
+    w.append_and_replicate(20 * FRAME);
+    assert!(
+        w.run_until(|w| w.max_commit() > cap + 10 * FRAME).expect("invariants"),
+        "one capped follower must not stall a 3-node cluster (timed out)"
+    );
+    assert!(w.last_report(f) <= cap, "the capped follower never reports past its ceiling");
+}
+
 #[test]
 fn crash_during_truncate_recovers() {
     let mut w = World::new(base_cfg(11));
@@ -502,6 +562,29 @@ fn fuzz_default_seeds() {
         });
         if let Err(v) = w.run() {
             panic!("seed {seed} (Mechanism): {v}");
+        }
+    }
+    // M14b: the same seeds with one node's report capped from the first
+    // leader on — a capped MINORITY under drops/dups/crashes. Every invariant
+    // (inv10 included) must hold; liveness is not asserted here (the capped
+    // node may be the leader, which never reports).
+    for seed in 0..50u64 {
+        let mut w = World::new(SimConfig {
+            n_nodes: 3,
+            seed,
+            max_steps: 20_000,
+            drop_per_million: 20_000,
+            dup_per_million: 5_000,
+            crash_per_million: 500,
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run_until_leader() {
+            panic!("seed {seed} (capped): {v}");
+        }
+        let capped = (seed % 3) as usize;
+        w.set_apply_ceiling(capped, Some(w.max_commit() + 96));
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (capped node {capped}): {v}");
         }
     }
 }

@@ -21,6 +21,11 @@
 //! - **inv9 — tombstone permanence:** no adopted config re-lists a tombstoned
 //!   id (self-consistency and across the adoption edge), and tombstones never
 //!   shrink.
+//! - **inv10 — report ceiling (M14b):** a node's outgoing durable report never
+//!   exceeds the value it would have reported unclamped, never exceeds its
+//!   apply ceiling when one is set, and never decreases between reset events
+//!   (truncation, crash/restart, a role change, a changed ceiling).
+//!   `inject_report` — a forged wire value by construction — bypasses it.
 //!
 //! The checker owns the sim's *ground truth* — the values a real cluster would
 //! only know from an oracle: which node opened which term, the **genuine**
@@ -165,6 +170,9 @@ pub struct InvariantChecker {
     /// Per-node last commit within the current run (reset on restart, which is
     /// an exempt-and-expected commit regression) — invariant 3 monotonicity.
     last_commit: Vec<u64>,
+    /// inv10 (M14b): per-node last outgoing durable report, reset to 0 at every
+    /// legitimate report discontinuity (see [`InvariantChecker::on_report_reset`]).
+    last_report: Vec<u64>,
 }
 
 impl InvariantChecker {
@@ -178,6 +186,7 @@ impl InvariantChecker {
             committed_config: None,
             committed_hw: vec![0; n],
             last_commit: vec![0; n],
+            last_report: vec![0; n],
         }
     }
 
@@ -190,6 +199,63 @@ impl InvariantChecker {
     /// is durable ground truth).
     pub fn on_restart(&mut self, node: usize) {
         self.last_commit[node] = 0;
+        // inv10: a reboot re-borns the report stream from the recovered durable
+        // (and, under `Mechanism`, from a closed gate) — a legitimate decrease.
+        self.last_report[node] = 0;
+    }
+
+    /// inv10 (M14b): the report ceiling. `clamped` is what the node sends,
+    /// `unclamped` what it would have sent without a ceiling, `ceiling` the
+    /// cap in force (`None` = uncapped).
+    pub fn on_report(
+        &mut self,
+        node: usize,
+        clamped: u64,
+        unclamped: u64,
+        ceiling: Option<u64>,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if clamped > unclamped {
+            return Err(self.viol(
+                "report ceiling (inv10)",
+                step,
+                format!("node {node} reported {clamped} above its unclamped value {unclamped}"),
+            ));
+        }
+        if let Some(c) = ceiling
+            && clamped > c
+        {
+            return Err(self.viol(
+                "report ceiling (inv10)",
+                step,
+                format!("node {node} reported {clamped} above its apply ceiling {c}"),
+            ));
+        }
+        let last = self.last_report[node];
+        if clamped < last {
+            return Err(self.viol(
+                "report ceiling (inv10)",
+                step,
+                format!(
+                    "node {node} report decreased {last} -> {clamped} with no truncation, restart, \
+                     role change or ceiling change in between"
+                ),
+            ));
+        }
+        self.last_report[node] = clamped;
+        Ok(())
+    }
+
+    /// A legitimate discontinuity in a node's reports: truncation (durable
+    /// went down), crash/restart, a role change (`matched` resets), or a
+    /// changed apply ceiling. Restarts also come through `on_restart`.
+    pub fn on_report_reset(&mut self, node: usize) {
+        self.last_report[node] = 0;
+    }
+
+    /// The durable position node `node` last reported (0 after a reset).
+    pub fn last_report(&self, node: usize) -> u64 {
+        self.last_report[node]
     }
 
     /// A node advanced its commit counter to `commit` (`Action::AdvanceCommit`).
@@ -999,5 +1065,37 @@ mod tests {
         ok.version = 2;
         ok.tombstones.push(2);
         assert!(c.on_config_adopted(0, &ok, &prev, 2).is_ok());
+    }
+
+    #[test]
+    fn inv10_catches_a_report_above_its_unclamped_value() {
+        let mut c = checker(vec![(1, 0)], 0);
+        let err = c.on_report(1, 200, 100, None, 7).unwrap_err();
+        assert!(err.invariant.contains("inv10"), "{err}");
+        assert!(err.detail.contains("above its unclamped"), "{err}");
+    }
+
+    #[test]
+    fn inv10_catches_a_report_above_its_apply_ceiling() {
+        let mut c = checker(vec![(1, 0)], 0);
+        let err = c.on_report(1, 150, 200, Some(100), 7).unwrap_err();
+        assert!(err.invariant.contains("inv10"), "{err}");
+        assert!(err.detail.contains("above its apply ceiling 100"), "{err}");
+    }
+
+    #[test]
+    fn inv10_catches_a_decrease_without_a_reset_and_tolerates_one_after() {
+        let mut c = checker(vec![(1, 0)], 0);
+        c.on_report(2, 96, 96, None, 1).unwrap();
+        c.on_report(2, 96, 192, Some(96), 2).unwrap(); // equal (a floor re-send) is fine
+        c.on_report(2, 192, 192, None, 3).unwrap();
+        let err = c.on_report(2, 96, 96, None, 4).unwrap_err();
+        assert!(err.invariant.contains("inv10"), "{err}");
+        assert!(err.detail.contains("decreased"), "{err}");
+        c.on_report_reset(2); // truncation / restart / role change
+        c.on_report(2, 96, 96, None, 5).unwrap();
+        assert_eq!(c.last_report(2), 96);
+        c.on_restart(2); // restart resets it too
+        assert_eq!(c.last_report(2), 0);
     }
 }
