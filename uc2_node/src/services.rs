@@ -209,6 +209,16 @@ pub fn fsm_lag_eff(services: &ServicesConfig, buffer_bytes: u64, max_payload: us
     })
 }
 
+/// M14c (spec §9): how stale a declared FSM's heartbeat may get before the
+/// node calls it gone and emits `service_detached`. Deliberately the SAME
+/// 3 s bar `obs::http`'s `HEARTBEAT_STALE_NS` applies to `/readyz` — a
+/// service readiness already refuses to count is a service the transition
+/// log should have named — and pinned equal to it by a unit test in
+/// `obs::http`. They are separate constants because they answer different
+/// questions (serve traffic? / say so in the log); if you move one, decide
+/// about the other rather than discovering the drift later.
+pub const SERVICE_STALE_NS: u64 = 3_000_000_000;
+
 /// Q (spec §5.3): what this node attests toward the leader's commit ranking
 /// — never more than it has validated, never more than `fsm_lag` past its
 /// slowest FSM. Reporting less than you hold is always safe in Raft.

@@ -36,6 +36,9 @@ use super::metrics::{now_unix_ns, render_prometheus};
 
 /// Liveness/readiness heartbeat staleness bar. Anything older than this is
 /// treated as "the writer stopped stamping it", not "the writer is just slow".
+///
+/// Pinned equal to [`crate::services::SERVICE_STALE_NS`] (M14c) by
+/// `the_readiness_bar_and_the_detach_bar_agree` below.
 const HEARTBEAT_STALE_NS: u64 = 3_000_000_000;
 
 /// Cap on the bytes read while hunting for the end of the request headers —
@@ -299,6 +302,13 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// M14c: readiness and the `service_detached` transition record use the
+    /// same 3 s staleness bar. Two constants, one number, one test.
+    #[test]
+    fn the_readiness_bar_and_the_detach_bar_agree() {
+        assert_eq!(HEARTBEAT_STALE_NS, crate::services::SERVICE_STALE_NS);
+    }
 
     /// IMPORTANT-2 regression: `write_response`'s `write_all` had no
     /// timeout, so a client that connects and never reads its response

@@ -16,7 +16,7 @@ use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId,
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::cnc::{AdminAuth, AdminReq, AdminResp, CncMeta, CncPage};
+use uc2_log::cnc::{AdminAuth, AdminReq, AdminResp, CncMeta, CncPage, unpack_service_status};
 use uc2_log::counters::LogCounters;
 use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
@@ -1373,6 +1373,9 @@ impl Node {
             last_leader_map: Vec::new(),
             halt_removed: false,
             last_flags: 0,
+            service_last_epoch: [0; CNC_MAX_SERVICES],
+            service_was_live: [false; CNC_MAX_SERVICES],
+            last_wall_ns: 0,
             config_bytes: Arc::clone(&config_bytes),
             admin,
             // C1: the SAME values written into `CncMeta` above — the tag is
@@ -2012,6 +2015,20 @@ struct Consensus {
     /// the first publish). Compared each cycle so `serving_changed` fires
     /// only on the `NODE_FLAG_CAN_SERVE` bit's edge, not every cycle.
     last_flags: u64,
+    /// M14c (spec §9): per-declared-id edge state for the `[log]` transition
+    /// records. `service_last_epoch[i]` is the epoch the last
+    /// `service_attached` was emitted for; `service_was_live[i]` whether id
+    /// `i` was last seen attached AND stamping. Indexed BY SERVICE ID, not
+    /// densely — declared sets are sparse (`{0, 3}` is legal).
+    service_last_epoch: [u64; CNC_MAX_SERVICES],
+    service_was_live: [bool; CNC_MAX_SERVICES],
+    /// M14c: the wall-clock ns `publish_status` last stamped into
+    /// `node_heartbeat_ns`, reused by `note_service_transitions` so the
+    /// transition check costs no second clock read per duty cycle. One cycle
+    /// stale, which is immaterial against a 3 s bar; `0` until the first
+    /// `publish_status`, which reads as "everything fresh" and therefore can
+    /// never emit a spurious detach at boot.
+    last_wall_ns: u64,
     /// M7 Task 6: the snapshot-session config-carry cache — refreshed with the
     /// newly-adopted config's encoded bytes on every `Action::ConfigAdopted`;
     /// read by the sender's `SnapshotSource` closure (a separate `Arc` clone) so
@@ -2831,6 +2848,59 @@ impl Consensus {
         if st.service_heartbeat_ns.load_acquire() != m.heartbeat_ns {
             st.service_heartbeat_ns.store_release(m.heartbeat_ns);
         }
+        self.note_service_transitions();
+    }
+
+    /// M14c (spec §9): emit `service_attached` / `service_detached` on the
+    /// edges of each declared FSM's liveness.
+    ///
+    /// Out of line deliberately. M14a measured a wait ladder inlined into a
+    /// hot loop's body costing 9 % at N=1 — on a path N=1 never executes —
+    /// through codegen alone; `do_work` calls `publish_service_mins` first
+    /// thing every cycle and everything downstream (the door, the report
+    /// ceiling, both persisters) reads what it publishes, so that body stays
+    /// small.
+    ///
+    /// Live = the slot's ATTACHED bit is set AND its heartbeat is fresher
+    /// than [`crate::services::SERVICE_STALE_NS`]. That one predicate covers
+    /// both exits: an orderly `Service::stop` clears the bit (reported next
+    /// cycle), and a SIGKILLed service leaves the bit set, so only the
+    /// ageing heartbeat can report it (~3 s). Attach is keyed on the epoch,
+    /// which `uc2_service::attach` bumps once per incarnation, so a
+    /// stop/start pair emits `service_detached` then `service_attached` with
+    /// the new epoch.
+    #[inline(never)]
+    fn note_service_transitions(&mut self) {
+        let now_ns = self.last_wall_ns;
+        for id in self.services.ids() {
+            let i = id as usize;
+            let slot = self.cnc.service_slot(i);
+            let epoch = slot.epoch.load_acquire();
+            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+            let live = attached
+                && now_ns.saturating_sub(slot.heartbeat_ns.load_acquire())
+                    < crate::services::SERVICE_STALE_NS;
+            if epoch > self.service_last_epoch[i] {
+                self.service_last_epoch[i] = epoch;
+                self.service_was_live[i] = true;
+                crate::obs_event!(
+                    Info,
+                    "service_attached",
+                    node = self.id as u64,
+                    service = id as u64,
+                    epoch = epoch
+                );
+            } else if self.service_was_live[i] && !live {
+                self.service_was_live[i] = false;
+                crate::obs_event!(
+                    Info,
+                    "service_detached",
+                    node = self.id as u64,
+                    service = id as u64,
+                    epoch = epoch
+                );
+            }
+        }
     }
 
     /// M14c (spec §14.3, controller amendment 2): NAME each snapshot-session
@@ -3227,6 +3297,7 @@ impl Consensus {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         status.node_heartbeat_ns.store_release(now_ns);
+        self.last_wall_ns = now_ns;
         self.publish_ring_holes();
     }
 
@@ -6131,6 +6202,9 @@ mod tests {
             last_leader_map: Vec::new(),
             halt_removed: false,
             last_flags: 0,
+            service_last_epoch: [0; CNC_MAX_SERVICES],
+            service_was_live: [false; CNC_MAX_SERVICES],
+            last_wall_ns: 0,
             config_bytes: Arc::new(Mutex::new(Vec::new())),
             admin: AdminPolicy::Filesystem,
             // Inert under `Filesystem` (verify_admin returns before reading

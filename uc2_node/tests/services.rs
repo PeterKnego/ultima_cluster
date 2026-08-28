@@ -605,3 +605,48 @@ fn a_raw_query_for_an_id_without_a_ring_gets_bad_service_from_the_node() {
     }
     node.stop();
 }
+
+/// M14c (spec §9): the `[log]` transition records name each FSM's arrival
+/// and departure. Attach is keyed on the slot's epoch (bumped once per
+/// incarnation by `uc2_service::attach`); departure is keyed on liveness =
+/// ATTACHED bit AND a fresh heartbeat, so an orderly `stop()` is reported on
+/// the next duty cycle and a killed service is reported once its heartbeat
+/// ages past `services::SERVICE_STALE_NS`.
+#[test]
+fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
+    let _g = serialize();
+    let buf = uc2_node::obs::log::capture_for_tests();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+
+    let svc1 = start_service(dir.path(), 1);
+    wait_until("service_attached record for FSM 1", || {
+        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        t.lines().any(|l| {
+            l.contains(r#""event":"service_attached""#)
+                && l.contains(r#""service":1"#)
+                && l.contains(r#""epoch":1"#)
+        })
+    });
+
+    svc1.stop();
+    wait_until("service_detached record for FSM 1", || {
+        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        t.lines().any(|l| {
+            l.contains(r#""event":"service_detached""#) && l.contains(r#""service":1"#)
+        })
+    });
+
+    // FSM 0 was never started: it must not be reported as attaching or
+    // departing — the events are edges, not a per-cycle status dump.
+    let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+    assert!(
+        !t.lines().any(|l| l.contains(r#""event":"service_attached""#)
+            && l.contains(r#""service":0"#)),
+        "{t}"
+    );
+
+    node.stop();
+    uc2_node::obs::log::stderr_for_tests();
+}

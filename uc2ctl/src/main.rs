@@ -77,7 +77,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand};
 
 use uc2_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
-use uc2_log::cnc::{AdminAuth, AdminReq, CncPage};
+use uc2_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
     NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
@@ -519,6 +519,44 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         if leader_hint == u64::MAX { "unknown".to_string() } else { leader_hint.to_string() }
     );
     println!("log: commit={commit} durable={durable} append={append}");
+    // M14c (spec §9): the per-service table, straight off page 2 of the page
+    // this command already opened. One row per DECLARED id (the bitmask at
+    // cnc 4032), including ids nothing has attached to — a declared-but-
+    // absent FSM holds min(applied) still, which closes the admission door
+    // and caps this node's durable report, so it is exactly the row that
+    // explains a stalled cluster. A harness page (declared == 0) prints the
+    // header and no rows.
+    let declared = cnc.services_declared();
+    let fsm_lag = cnc.fsm_lag_bytes();
+    let ids: Vec<u8> =
+        (0..CNC_MAX_SERVICES as u8).filter(|i| declared & (1u64 << i) != 0).collect();
+    let lag_desc =
+        if fsm_lag == 0 { "lockstep".to_string() } else { format!("{fsm_lag} bytes") };
+    println!("services: declared={ids:?} fsm_lag={lag_desc}");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    for id in ids {
+        let s = cnc.service_slot(id as usize);
+        let (_, attached, incarnation) = unpack_service_status(s.status.load_acquire());
+        let applied = s.applied.load_acquire();
+        let hb = s.heartbeat_ns.load_acquire();
+        // A never-stamped heartbeat is `never`, not a 55-year age: the
+        // slot is zeroed at node boot and only a service ever writes it.
+        let age = if hb == 0 {
+            "never".to_string()
+        } else {
+            format!("{:.3}s", now_ns.saturating_sub(hb) as f64 / 1e9)
+        };
+        println!(
+            "  id={id} attached={attached} epoch={} incarnation={incarnation} \
+             applied={applied} lag={} snapshot_pos={} heartbeat_age={age}",
+            s.epoch.load_acquire(),
+            commit.saturating_sub(applied),
+            s.snapshot_pos.load_acquire(),
+        );
+    }
     println!("members:");
     for i in 0..CNC_MAX_PEER_SLOTS {
         let slot = cnc.peer_slot(i);
