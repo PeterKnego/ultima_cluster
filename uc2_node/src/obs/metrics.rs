@@ -82,6 +82,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_reports_unattested_total",
     "uc2_snapshot_refused_legacy_peer_total",
     "uc2_snapshot_refused_declared_set_total",
+    "uc2_snapshot_intake_io_failures_total",
     "uc2_reports_implausible_total",
     "uc2_crypto_handshake_failures_total",
     "uc2_sender_seal_failures_total",
@@ -643,6 +644,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_snapshot_intake_io_failures_total",
+        "Local I/O failures on the snapshot INTAKE path: a `.part` that could not be created/sized, or a completed artifact whose fsync/rename failed. Retried, but a persistent count means this node's snapshot dir is full, read-only, or obstructed (spec §14.3).",
+        s.receiver.snap_intake_io_failures.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
         "uc2_reports_implausible_total",
         "Durable reports declined for disagreeing with this node's term map.",
         s.reports_implausible.load(Ordering::Relaxed),
@@ -1071,6 +1078,16 @@ mod tests {
         let text = render_prometheus(&s);
         assert!(text.contains("uc2_snapshot_refused_legacy_peer_total 3\n"), "{text}");
         assert!(text.contains("uc2_snapshot_refused_declared_set_total 1\n"), "{text}");
+    }
+
+    /// M14c review round 2, finding 1: the intake-side I/O counter — the
+    /// receiver half of the same story ("the disk, not the wire").
+    #[test]
+    fn snapshot_intake_io_failures_render_from_receiver_stats() {
+        let s = synthetic_sources();
+        s.receiver.snap_intake_io_failures.fetch_add(4, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_snapshot_intake_io_failures_total 4\n"), "{text}");
     }
 
     #[test]

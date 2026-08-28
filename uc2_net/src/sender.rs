@@ -634,8 +634,20 @@ impl Sender {
                         && s.peer == from
                         && s.session == session
                     {
+                        // M14c review: `last_activity_ns` is refreshed only by a
+                        // request this session can actually SERVE. An offset at
+                        // or past the stream is unservable — `part_at` returns
+                        // `None`, `drive_snap_session` drops it without progress
+                        // — so refreshing on it would let a peer that only ever
+                        // NAKs garbage (or a stale/racing intake) pin the single
+                        // session slot forever, exactly the failure mode the
+                        // BEGIN-resend exclusion in `drive_snap_session` closes.
+                        // A servable NAK needs no refresh here either: serving it
+                        // sets `progress`, which refreshes on the real event.
+                        if offset < s.stream_len {
+                            s.last_activity_ns = self.base.elapsed().as_nanos() as u64;
+                        }
                         s.naks.push_back((offset, length));
-                        s.last_activity_ns = self.base.elapsed().as_nanos() as u64;
                     }
                 }
                 CtrlMsg::SnapDone { from, session } => {
@@ -1012,6 +1024,21 @@ impl Sender {
             return false;
         };
         if set.artifacts.is_empty() {
+            return false;
+        }
+        // M14c review: the set must COVER the declared mask exactly — one
+        // artifact per declared id and no artifact outside it. Without this a
+        // source that lost one FSM's file (or gained a stray one) opens a
+        // session whose BEGINs advertise `services_declared` the stream can
+        // never satisfy: the receiver's `received != services_declared` never
+        // closes, it probes for a BEGIN that will never come, and the transfer
+        // burns the slot until the timeout instead of staying an overrun the
+        // peer re-NAKs.
+        if set.artifacts.len() != set.services_declared.count_ones() as usize
+            || set.artifacts.iter().any(|a| {
+                a.service_id >= 64 || set.services_declared & (1u64 << a.service_id) == 0
+            })
+        {
             return false;
         }
         // Build the parts eagerly: every file must open and every invariant
@@ -2903,6 +2930,120 @@ mod tests {
             want = off + len as u64;
         }
         assert_eq!(want, 5048, "the whole 2048 + 3000 byte stream was sent");
+    }
+
+    /// M14c review round 2: the same shape as
+    /// `sender_without_crypto_and_snapshot_source`, but the ctrl `SyncSender`
+    /// is handed back (so a test can inject a real `CtrlMsg::SnapNak` through
+    /// `do_work`'s own drain) and the declared mask / artifact ids are the
+    /// caller's, so a deliberately non-covering set can be built.
+    fn sender_with_snap_source_and_ctrl(
+        services_declared: u64,
+        ids: &[u8],
+    ) -> (Sender, Fake, mpsc::SyncSender<CtrlMsg>, tempfile::TempDir) {
+        let f = Fake::new();
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts: Vec<SnapArtifact> = ids
+            .iter()
+            .map(|&id| {
+                let path = dir.path().join(format!("snap-{id}-2048.ultsnap"));
+                std::fs::write(&path, vec![0xC3u8; 2048]).unwrap();
+                SnapArtifact { service_id: id, snapshot_pos: 2048, path, len: 2048 }
+            })
+            .collect();
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        s.set_snapshot_source(Arc::new(move || Some(SnapshotSet {
+            services_declared,
+            config: t17_config_bytes(),
+            artifacts: artifacts.clone(),
+        })));
+        (s, f, tx, dir)
+    }
+
+    /// M14c review round 2, finding 1: a peer that only ever asks for bytes
+    /// PAST the end of the stream must not hold the single session slot open.
+    /// Such a `SNAP_NAK` is unservable (`part_at` is `None`, the request is
+    /// dropped without progress), so it must not refresh `last_activity_ns` —
+    /// otherwise the session never reaches `SNAP_SESSION_TIMEOUT_NS` and every
+    /// other below-floor requester is refused for as long as the dead peer
+    /// keeps NAKing.
+    #[test]
+    fn an_unservable_snap_nak_does_not_keep_a_dead_session_alive() {
+        let (mut s, f, tx, _dir) = sender_with_snap_source_and_ctrl(0b1, &[0]);
+        let addr = f.addr();
+        s.on_nak(addr, 0, 96); // below the ring floor -> upgrades to a session
+        s.do_work();
+        let (session, stream_len) = {
+            let sess = s.snap.as_ref().expect("the below-floor NAK opened a session");
+            (sess.session, sess.stream_len)
+        };
+        f.drain();
+
+        // Age the sender's own clock in 10 s steps (its only clock is
+        // `base.elapsed()`), feeding an unservable repair request each step.
+        for _ in 0..6 {
+            tx.send(CtrlMsg::SnapNak {
+                from: addr,
+                session,
+                offset: stream_len, // one past the last byte: unservable, forever
+                length: 64,
+            })
+            .unwrap();
+            s.base = s.base.checked_sub(Duration::from_secs(10)).unwrap();
+            s.do_work();
+            f.drain();
+            if s.snap.is_none() {
+                break;
+            }
+        }
+        assert!(
+            s.snap.is_none(),
+            "a session fed nothing but unservable SNAP_NAKs must still be abandoned at \
+             SNAP_SESSION_TIMEOUT_NS - only a SERVABLE request is liveness"
+        );
+    }
+
+    /// M14c review round 2, finding 2: the sender refuses a set that does not
+    /// COVER its own declared mask. Declaring `0b111` while shipping ids 0 and
+    /// 2 would advertise a third artifact that never arrives: the receiver's
+    /// `received != services_declared` never closes and it probes for a BEGIN
+    /// that will never be sent, burning the session slot until the timeout.
+    /// Staying an overrun (the peer re-NAKs) is the correct, recoverable shape.
+    #[test]
+    fn a_set_that_does_not_cover_its_declared_mask_never_opens_a_session() {
+        let (mut s, f, _tx, _dir) = sender_with_snap_source_and_ctrl(0b111, &[0, 2]);
+        let addr = f.addr();
+        let before = s.stats().overruns.load(Ordering::Relaxed);
+        s.on_nak(addr, 0, 96);
+        for _ in 0..4 {
+            s.do_work();
+        }
+        assert!(s.snap.is_none(), "a set that misses a declared id must not open a session");
+        assert!(f.recv_raw().is_none(), "not one datagram of a half-formed session goes out");
+        assert!(
+            s.stats().overruns.load(Ordering::Relaxed) > before,
+            "the refusal stays a counted overrun, not a silent drop"
+        );
+
+        // The control: the SAME artifacts with a mask they do cover DO open one.
+        let (mut ok, ok_f, _tx2, _dir2) = sender_with_snap_source_and_ctrl(0b101, &[0, 2]);
+        ok.on_nak(ok_f.addr(), 0, 96);
+        ok.do_work();
+        assert!(ok.snap.is_some(), "a covering set still opens a session");
     }
 
     /// Drive a snapshot session and collect the raw datagrams of `kind`.

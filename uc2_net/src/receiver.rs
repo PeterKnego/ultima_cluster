@@ -479,6 +479,16 @@ pub struct FollowerStats {
     /// is dropped: installing a set that does not cover this node's FSMs would
     /// strand one below an adopted floor. Declared sets must match cluster-wide.
     pub snap_refused_declared_mismatch: AtomicU64,
+    /// M14c review round 2: a local I/O failure on the snapshot INTAKE path —
+    /// a `.part` that could not be created/sized (`open_snap_part`), or a
+    /// completed artifact whose `sync_all`/`rename` failed. None of these are
+    /// the peer's fault and none are fatal (the transfer is retried: the
+    /// missing BEGIN is re-sent on its cadence, and a synced-but-unrenamed
+    /// `.part` is re-renamed on the next chunk), but a follower that can never
+    /// finish an install is otherwise SILENT — it just keeps NAKing. This is
+    /// the counter that names "the disk, not the wire" (full/read-only
+    /// snapshot dir, a stray directory sitting on the final path, EPERM).
+    pub snap_intake_io_failures: AtomicU64,
 }
 
 /// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
@@ -1685,6 +1695,9 @@ impl FollowerReceiver {
             // The next artifact of the SAME session: it starts where the
             // announced stream currently ends.
             let Some(part) = open_snap_part(&root, &b, cur.announced_len) else {
+                // Local I/O, not the peer: counted so a follower that can never
+                // open a `.part` is diagnosable rather than a silent NAK loop.
+                self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             cur.announced_len += part.len;
@@ -1703,6 +1716,7 @@ impl FollowerReceiver {
         // must not leak, and the new session may re-use the very same path.
         self.snap_discard_intake();
         let Some(part) = open_snap_part(&root, &b, 0) else {
+            self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let announced_len = part.len;
@@ -1799,15 +1813,24 @@ impl FollowerReceiver {
             if p.done || contiguous < p.base + p.len {
                 continue;
             }
-            let Some(file) = p.file.take() else {
-                continue;
-            };
-            if file.sync_all().is_err() {
-                p.file = Some(file);
-                return;
+            // M14c review round 2: BOTH steps are retried on the next call.
+            // `file` is `None` here only when a previous call already synced
+            // this artifact and the RENAME is what failed — the `.part` is
+            // complete on disk, so the retry is just the rename. Returning with
+            // `file: None, done: false` and no retry (the old shape) stranded
+            // the artifact forever: no further chunk arrives for a part the
+            // frontier has already covered, so nothing ever published it and
+            // the whole session hung on `received != services_declared`.
+            if let Some(file) = p.file.take() {
+                if file.sync_all().is_err() {
+                    p.file = Some(file);
+                    self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                drop(file);
             }
-            drop(file);
             if std::fs::rename(&p.part_path, &p.final_path).is_err() {
+                self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             p.done = true;
@@ -1956,6 +1979,19 @@ impl FollowerReceiver {
     /// Emit a SNAP_NAK for the first gap in the inbound transfer (RTT-delayed,
     /// like the main stream). Called once per duty cycle from `upkeep`.
     fn snap_upkeep(&mut self, now: u64) -> bool {
+        // M14c review round 2: re-drive a publish that failed on local I/O. A
+        // part whose bytes have ALL landed gets no further chunk, so
+        // `snap_chunk` — the only other caller — can never retry it; the duty
+        // cycle is what turns "the operator cleared the full disk / removed the
+        // stray path" into a completed install instead of a permanent stall.
+        // Cheap: one `contiguous()` read and a walk of the (single-digit) parts,
+        // and only when something is actually outstanding.
+        if self.snap_intake.as_ref().is_some_and(|i| {
+            let contiguous = i.got.contiguous();
+            i.parts.iter().any(|p| !p.done && contiguous >= p.base + p.len)
+        }) {
+            self.snap_publish_complete_parts();
+        }
         let Some(intake) = self.snap_intake.as_mut() else {
             return false;
         };

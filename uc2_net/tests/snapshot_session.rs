@@ -348,6 +348,45 @@ fn a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss() {
     }
 }
 
+/// M14c review round 2, finding 1(b): a publish that fails on LOCAL I/O must
+/// be counted and RETRIED, never stranded. A part whose bytes have all landed
+/// receives no further chunk, so before the fix a single failed `rename` left
+/// it `file: None, done: false` forever — the session hung on
+/// `received != services_declared`, the follower NAKed a byte past the stream
+/// (which the sender cannot serve), and nothing ever named the disk as the
+/// cause.
+#[test]
+fn a_failed_publish_is_counted_and_retried_not_stranded() {
+    let mut h = build(FaultConfig::default(), &[0]);
+    // Sit a DIRECTORY on the artifact's final path: renaming the completed
+    // `.part` onto it fails (EISDIR) — the stand-in for a read-only/full
+    // snapshot dir, and deterministic on every filesystem.
+    std::fs::create_dir_all(h.follower_snap_dir.join("0")).unwrap();
+    std::fs::create_dir(h.final_path(0)).unwrap();
+
+    let st = h.follower.stats();
+    h.trigger();
+    h.pump_until("the intake I/O failure is counted", |_| {
+        st.snap_intake_io_failures.load(Ordering::Relaxed) > 0
+    });
+    assert!(h.final_path(0).is_dir(), "the obstacle is still in place");
+    assert!(
+        h.follower_snap_dir.join("0").join(format!("incoming-{}.part", snap_pos(0))).exists(),
+        "the completed .part is still on disk, waiting to be published"
+    );
+
+    // Clear the obstacle: the next duty cycles must retry the publish.
+    std::fs::remove_dir(h.final_path(0)).unwrap();
+    h.pump_until("the artifact publishes once the obstacle is cleared", |h| {
+        h.final_path(0).is_file()
+    });
+    assert_eq!(
+        std::fs::read(h.final_path(0)).unwrap(),
+        snapshot_bytes(0),
+        "the retried publish installs the byte-identical artifact"
+    );
+}
+
 #[test]
 fn a_layout_zero_begin_is_refused_as_a_wire_050_peer() {
     let mut h = build(FaultConfig::default(), &[0]);
