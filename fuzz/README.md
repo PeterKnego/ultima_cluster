@@ -161,7 +161,7 @@ growth.
 | `ultima_journal_record` | `ultima_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment. |
 | `ultima_journal_stable_value` | `ultima_journal::stable_value` — the durable vote / term map / snapshot floor slots. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. |
-| `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write. |
+| `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write, and, for a query record, the M14b `service_id ++ query` split (`split_query_payload`). |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header` behind the real caller's `len >= HEADER_LEN` guard (that reader is deliberately caller-guarded — see its doc). |
 | `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope (under a fuzz-derived, deliberately tiny `SessionConfig`, so client/byte eviction and the window trim are reachable) and its snapshot install path. |
 | `uc2_node_toml` | `uc2_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |

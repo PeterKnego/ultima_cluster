@@ -704,6 +704,13 @@ pub fn ring_mpsc_record() -> Vec<Seed> {
     tiny[4..6].copy_from_slice(&PADDING_MSG_TYPE.to_le_bytes());
     seeds.push(Seed::fixed("09-min-padding", input(encode_commit_word(0, 6, false), 0, &tiny)));
 
+    // M14b: a committed QUERY record with the service-id prefix, and one with
+    // an EMPTY payload (no id byte) — the node's split must be total on both.
+    let q = record(2, 0, [9; 8], &[1u8, b'q', b'r', b'y']);
+    seeds.push(Seed::fixed("10-query-with-id", input(encode_commit_word(3, q.len() as u32, false), 3, &q)));
+    let q0 = record(2, 0, [9; 8], &[]);
+    seeds.push(Seed::fixed("11-query-empty", input(encode_commit_word(3, q0.len() as u32, false), 3, &q0)));
+
     seeds
 }
 
