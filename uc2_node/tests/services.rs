@@ -510,3 +510,75 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     for s in services { s.stop(); }
     for n in nodes.into_iter().flatten() { n.stop(); }
 }
+
+#[test]
+fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
+    use uc2_client::{Client, ClientError, PipelinedClient, PipelinedConfig};
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc0 = start_service(dir.path(), 0);
+    let svc1 = start_service(dir.path(), 1);
+    let client = PipelinedClient::connect(dir.path(), APP, PipelinedConfig::default()).unwrap();
+    assert_eq!(client.declared(), 0b11);
+    let t1: u64 = client.submit_to::<Cmd, u64>(1, &Cmd::Add(5)).unwrap().wait().unwrap();
+    assert_eq!(t1, 5, "FSM 1 answered its own total");
+    let all = client.submit_all::<Cmd, u64>(&Cmd::Add(1)).unwrap().wait().unwrap();
+    assert_eq!(all, vec![(0, 6), (1, 6)], "same log, same SM ⇒ identical totals, ordered by id");
+    assert_eq!(client.query_snapshot_on::<(), u64>(1, &()).unwrap().wait().unwrap(), 6);
+    assert_eq!(client.query_linearizable_on::<(), u64>(1, &()).unwrap().wait().unwrap(), 6);
+    assert_eq!(client.query_linearizable_on::<(), u64>(0, &()).unwrap().wait().unwrap(), 6);
+    assert!(matches!(client.submit_to::<Cmd, u64>(2, &Cmd::Add(1)), Err(ClientError::ServiceNotDeclared { id: 2, declared: 0b11 })));
+    assert!(matches!(client.query_snapshot_on::<(), u64>(7, &()), Err(ClientError::ServiceNotDeclared { id: 7, declared: 0b11 })));
+    // The default `submit` still means FSM 0 — and FSM 1's answer to it is
+    // dropped as a wrong-ring record, counted.
+    let d: u64 = client.submit::<Cmd, u64>(&Cmd::Add(1)).unwrap().wait().unwrap();
+    assert_eq!(d, 7);
+    wait_until("FSM 1's answer to the default submit was dropped", || client.stats().wrong_ring >= 1);
+    client.shutdown();
+    // The blocking shim mirrors all four.
+    let c = Client::connect(dir.path(), APP).unwrap();
+    assert_eq!(c.declared(), 0b11);
+    assert_eq!(c.submit_to::<Cmd, u64>(1, &Cmd::Add(1)).unwrap(), 8);
+    assert_eq!(c.submit_all::<Cmd, u64>(&Cmd::Add(1)).unwrap(), vec![(0, 9), (1, 9)]);
+    assert_eq!(c.query_snapshot_on::<(), u64>(1, &()).unwrap(), 9);
+    assert_eq!(c.query_linearizable_on::<(), u64>(1, &()).unwrap(), 9);
+    c.shutdown();
+    svc0.stop();
+    svc1.stop();
+    node.stop();
+}
+
+/// A raw query record naming an id the node has no ring for is answered
+/// MSG_V2_BAD_SERVICE on the node broadcast (the SDK refuses such ids
+/// locally, so this drives the ring directly).
+#[test]
+fn a_raw_query_for_an_id_without_a_ring_gets_bad_service_from_the_node() {
+    use uc_protocol::ring::{BroadcastRing, MpscRing};
+    use uc_protocol::v2::ipc::{MSG_V2_BAD_SERVICE, MSG_V2_QUERY, client_from_extra, extra_client, write_query_payload};
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let mut node_egress = BroadcastRing::open(&dir.path().join("egress_node.broadcast")).unwrap().subscribe();
+    let (producer, _c) = MpscRing::open(&dir.path().join("query.ring")).unwrap().into_split();
+    let mut payload = Vec::new();
+    write_query_payload(5, b"q", &mut payload);
+    producer.try_write(MSG_V2_QUERY, 0, extra_client(0x77, 1), &payload).unwrap();
+    let mut buf = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "no BAD_SERVICE within 10 s");
+        match node_egress.try_read(&mut buf) {
+            Ok(Some(rec)) if client_from_extra(rec.header_extra) == (0x77, 1) => {
+                assert_eq!(rec.msg_type, MSG_V2_BAD_SERVICE);
+                assert_eq!(buf, [5]);
+                break;
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(1)),
+            Err(e) => panic!("egress_node read: {e}"),
+        }
+    }
+    node.stop();
+}

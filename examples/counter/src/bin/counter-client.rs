@@ -42,15 +42,22 @@ struct Args {
     /// Wait up to this long for the node to become able to serve.
     #[arg(long, default_value_t = 30)]
     wait_secs: u64,
+    /// Ask FSM <id> instead of FSM 0.
+    #[arg(long)]
+    service_id: Option<u8>,
+    /// Submit to every declared FSM and print each answer.
+    #[arg(long)]
+    all: bool,
 }
 
 /// Writes are leader-only, and a freshly started cluster takes an election plus
 /// one committed NewTerm frame before anyone can serve. Retry the transient
-/// cases; report the rest.
-fn submit_with_retry(client: &Client, cmd: &Command, deadline: Instant) -> anyhow::Result<Applied> {
+/// cases; report the rest. Shared by every write shape below (`submit`,
+/// `submit_to`, `submit_all`) — only the call itself differs.
+fn retry_with<T>(deadline: Instant, mut call: impl FnMut() -> Result<T, ClientError>) -> anyhow::Result<T> {
     loop {
-        match client.submit::<Command, Applied>(cmd) {
-            Ok(applied) => return Ok(applied),
+        match call() {
+            Ok(v) => return Ok(v),
             Err(ClientError::NotLeader { hint }) if Instant::now() < deadline => {
                 if let Some(id) = hint {
                     anyhow::bail!(
@@ -68,38 +75,73 @@ fn submit_with_retry(client: &Client, cmd: &Command, deadline: Instant) -> anyho
     }
 }
 
+fn submit_with_retry(client: &Client, cmd: &Command, deadline: Instant) -> anyhow::Result<Applied> {
+    retry_with(deadline, || client.submit::<Command, Applied>(cmd))
+}
+
+/// `ClientError::NotLeader` on a linearizable read, worded once and shared by
+/// both the default (FSM 0) and `--service-id` read paths.
+fn not_leader_for_read(hint: Option<u32>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "linearizable reads are leader-only and this node is a follower{}. \
+         Either point --instance-dir at the leader, or pass --snapshot to \
+         read this replica's own copy of the state.",
+        hint.map(|id| format!(" (node {id} is the leader)")).unwrap_or_default()
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let client = Client::connect(&args.instance_dir, &args.app_id)?;
     let deadline = Instant::now() + Duration::from_secs(args.wait_secs);
 
     if !args.read_only {
-        if args.reset {
-            let applied = submit_with_retry(&client, &Command::Reset, deadline)?;
-            println!("Reset -> value {} @ position {}", applied.value, applied.position);
-        } else {
-            for _ in 0..args.count {
-                let applied = submit_with_retry(&client, &Command::Add(args.add), deadline)?;
-                println!(
-                    "Add({}) -> value {} @ position {}",
-                    args.add, applied.value, applied.position
-                );
+        let cmd = if args.reset { Command::Reset } else { Command::Add(args.add) };
+        let reps = if args.reset { 1 } else { args.count };
+        for _ in 0..reps {
+            if args.all {
+                let all: Vec<(u8, Applied)> =
+                    retry_with(deadline, || client.submit_all::<Command, Applied>(&cmd))?;
+                for (id, applied) in all {
+                    println!("FSM {id}: {cmd:?} -> value {} @ position {}", applied.value, applied.position);
+                }
+            } else if let Some(id) = args.service_id {
+                let applied =
+                    retry_with(deadline, || client.submit_to::<Command, Applied>(id, &cmd))?;
+                println!("FSM {id}: {cmd:?} -> value {} @ position {}", applied.value, applied.position);
+            } else {
+                // Default path: FSM 0, output byte-identical to before --service-id/--all existed.
+                let applied = submit_with_retry(&client, &cmd, deadline)?;
+                if args.reset {
+                    println!("Reset -> value {} @ position {}", applied.value, applied.position);
+                } else {
+                    println!(
+                        "Add({}) -> value {} @ position {}",
+                        args.add, applied.value, applied.position
+                    );
+                }
             }
         }
     }
 
-    if args.snapshot {
+    if let Some(id) = args.service_id {
+        if args.snapshot {
+            let r: QueryResponse = client.query_snapshot_on(id, &Query::Value)?;
+            println!("FSM {id}: snapshot read -> {}", r.value);
+        } else {
+            match client.query_linearizable_on::<Query, QueryResponse>(id, &Query::Value) {
+                Ok(r) => println!("FSM {id}: linearizable read -> {}", r.value),
+                Err(ClientError::NotLeader { hint }) => return Err(not_leader_for_read(hint)),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    } else if args.snapshot {
         let r: QueryResponse = client.query_snapshot(&Query::Value)?;
         println!("snapshot read -> {}", r.value);
     } else {
         match client.query_linearizable::<Query, QueryResponse>(&Query::Value) {
             Ok(r) => println!("linearizable read -> {}", r.value),
-            Err(ClientError::NotLeader { hint }) => anyhow::bail!(
-                "linearizable reads are leader-only and this node is a follower{}. \
-                 Either point --instance-dir at the leader, or pass --snapshot to \
-                 read this replica's own copy of the state.",
-                hint.map(|id| format!(" (node {id} is the leader)")).unwrap_or_default()
-            ),
+            Err(ClientError::NotLeader { hint }) => return Err(not_leader_for_read(hint)),
             Err(e) => return Err(e.into()),
         }
     }
