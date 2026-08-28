@@ -17,9 +17,9 @@
 //!
 //! 6. `drain_abort` is exhaustive only after claims are quiesced — a claim racing the drain publishes after the scan passes and is backstopped by the deadline sweep, so pollers must keep sweeping unless claims are provably stopped.
 //!
-//! 7. `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is mutated only by `resolve`'s `fetch_or`, and that `fetch_or` never races a concurrent re-claim of the same word: `release` is the ONLY cross-thread freer of a slot (it runs on the send thread, inside `engine.rs`'s `finish_write` — `resolve`/`sweep`/`drain_abort` are all poll-thread-only), and `release(seq)` is called only when that seq's ring write FAILED, meaning no response frame for that generation was ever transmitted and so no `resolve` call for it can be in flight to race the free. A `resolve` that is in flight therefore always targets a generation no concurrent `release` can be freeing, so the matching claim-time reset of `received` (phase 2, under RESERVED) and `resolve`'s `fetch_or` on it are always the same generation, never back-to-back generations racing across the free. This, plus invariant 4 (a stale wire_seq collision needs a 2^32-outstanding gap), also covers reading `expected`/`fan_in` from a newer generation: that read is confined to the same impossible window, and even there the completing `compare_exchange(owner, FREE)` would fail (return `Miss`), so a stale read is never acted on. `resolve` completes a slot (the single owner CAS) only when the last expected bit lands in `received` or a ring-less (`ring: None`) terminal answer arrives, whichever comes first.
+//! 7. `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is touched by MULTI-RING (fan-in) requests only: `resolve` skips the `fetch_or` when `expected == bit` (a single-ring request — the overwhelmingly common one), because a set of one is opened and closed by its only piece, so the word would only ever hold that bit and nothing reads it. Exactly-once does not rest on `received` in either case: the gate is the single owner CAS (invariant 3), and a duplicate delivery for a completed single-ring generation is caught by the FREE/stale-seq checks at the top of `resolve` or loses that CAS. For the multi-ring case the `fetch_or` never races a concurrent re-claim of the same word: `release` is the ONLY cross-thread freer of a slot (it runs on the send thread, inside `engine.rs`'s `finish_write` — `resolve`/`sweep`/`drain_abort` are all poll-thread-only), and `release(seq)` is called only when that seq's ring write FAILED, meaning no response frame for that generation was ever transmitted and so no `resolve` call for it can be in flight to race the free. A `resolve` that is in flight therefore always targets a generation no concurrent `release` can be freeing, so the matching claim-time reset of `received` (phase 2, under RESERVED) and `resolve`'s `fetch_or` on it are always the same generation, never back-to-back generations racing across the free. This, plus invariant 4 (a stale wire_seq collision needs a 2^32-outstanding gap), also covers reading `expected`/`fan_in` from a newer generation: that read is confined to the same impossible window, and even there the completing `compare_exchange(owner, FREE)` would fail (return `Miss`), so a stale read is never acted on. `resolve` completes a slot (the single owner CAS) only when the last expected bit lands in `received` or a ring-less (`ring: None`) terminal answer arrives, whichever comes first.
 //!
-//! 8. `resolve` reports `first` — whether the delivery it just recorded was the FIRST ring piece of this generation (`received` was 0 before the `fetch_or`). This exists because invariant 4's outstanding-gap argument protects the SLOT (freed and re-claimed under a fresh `expected`/`received`), not the engine-side fan-in piece buffer indexed by the same slot index: a partial fan-in ended by a ring-less terminal or the deadline sweep leaves pieces behind, and the generation 2^32 requests later at that index carries the SAME u32 wire seq — so a seq comparison cannot tell the two apart, while `first` (decided here, by the slot table) always can. The buffer resets on `first`, never on a seq change.
+//! 8. `resolve` reports `first` — whether the delivery it just recorded was the FIRST ring piece of this generation. For a multi-ring request that is `received == 0` before the `fetch_or`; for a single-ring request it is `true` by construction (a set of one has nothing preceding its only piece), decided without reading `received` at all. This exists because invariant 4's outstanding-gap argument protects the SLOT (freed and re-claimed under a fresh `expected`/`received`), not the engine-side fan-in piece buffer indexed by the same slot index: a partial fan-in ended by a ring-less terminal or the deadline sweep leaves pieces behind, and the generation 2^32 requests later at that index carries the SAME u32 wire seq — so a seq comparison cannot tell the two apart, while `first` (decided here, by the slot table) always can. The buffer resets on `first`, never on a seq change.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
@@ -186,25 +186,40 @@ impl SlotTable {
             if expected & bit == 0 {
                 return Resolve::WrongRing; // not ours to answer; slot untouched
             }
-            // `received` is only ever mutated here, and never races a
-            // concurrent re-claim of this word: `release` — the only
-            // cross-thread freer of a slot — fires only when this
-            // generation's ring write FAILED (engine.rs's `finish_write`),
-            // meaning no response frame for it was ever sent; a `resolve`
-            // call in flight for this generation is proof a frame DID
-            // arrive, so no concurrent `release`/re-claim of THIS generation
-            // can be racing it (module doc invariant 7). So a plain fetch_or
-            // is exact: a repeated bit is a duplicate delivery on that ring.
-            let prev = slot.received.fetch_or(bit, Ordering::AcqRel);
-            if prev & bit != 0 {
-                return Resolve::Miss;
-            }
-            // The slot table — not a seq comparison — decides where a
-            // generation starts: `prev == 0` means nothing has answered this
-            // claim yet, so this piece opens a fresh set.
-            first = prev == 0;
-            if (prev | bit) != expected {
-                return Resolve::Partial { first }; // more rings still to answer
+            if expected == bit {
+                // SINGLE-RING FAST PATH (the common request: `try_submit`,
+                // `try_submit_to`, every query). The set has one member, so
+                // this piece both opens and closes it: `received` would only
+                // ever hold `bit`, and nothing reads it — so skip the atomic
+                // RMW entirely. Exactly-once is unaffected: the gate is the
+                // completing `compare_exchange(owner, FREE)` below, and a
+                // duplicate delivery for this generation is caught above
+                // (slot already FREE, or re-owned by a later generation —
+                // invariant 4), or loses that CAS. Measured: p90 3 µs → 2 µs
+                // (M14b addendum), the whole tail cost of a response.
+                first = true;
+            } else {
+                // MULTI-RING (fan-in) only. `received` is mutated only here,
+                // and never races a concurrent re-claim of this word:
+                // `release` — the only cross-thread freer of a slot — fires
+                // only when this generation's ring write FAILED (engine.rs's
+                // `finish_write`), meaning no response frame for it was ever
+                // sent; a `resolve` call in flight for this generation is
+                // proof a frame DID arrive, so no concurrent
+                // `release`/re-claim of THIS generation can be racing it
+                // (module doc invariant 7). So a plain fetch_or is exact: a
+                // repeated bit is a duplicate delivery on that ring.
+                let prev = slot.received.fetch_or(bit, Ordering::AcqRel);
+                if prev & bit != 0 {
+                    return Resolve::Miss;
+                }
+                // The slot table — not a seq comparison — decides where a
+                // generation starts: `prev == 0` means nothing has answered
+                // this claim yet, so this piece opens a fresh set.
+                first = prev == 0;
+                if (prev | bit) != expected {
+                    return Resolve::Partial { first }; // more rings still to answer
+                }
             }
         }
         let user_data = slot.user_data.load(Ordering::Relaxed);
@@ -280,6 +295,15 @@ impl SlotTable {
         self.next_seq.store(v, Ordering::Relaxed);
     }
 
+    /// The raw `received` word of the slot `wire_seq` maps to. Test-only:
+    /// it is read AFTER a completion (freeing a slot does not clear the
+    /// word — only `claim` phase 2 does), which is exactly how the
+    /// single-ring fast path is observed.
+    #[cfg(test)]
+    pub(crate) fn received_for_tests(&self, wire_seq: u32) -> u8 {
+        self.slots[(wire_seq as usize) & self.mask].received.load(Ordering::Relaxed)
+    }
+
     /// The number of slots (the engine sizes its fan-in buffer off this).
     pub(crate) fn slot_count(&self) -> usize {
         self.slots.len()
@@ -308,6 +332,9 @@ mod tests {
         let seq = t.claim(1, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
         assert!(matches!(t.resolve(seq as u32, None, Some(0)), Resolve::Won { .. }));
         assert_eq!(t.resolve(seq as u32, None, Some(0)), Resolve::Miss, "duplicate must not double-complete");
+        // The single-ring fast path removes the `received`-bit duplicate
+        // check; the owner CAS is what makes this a Miss.
+        assert_eq!(t.inflight(), 0);
     }
 
     #[test]
@@ -664,5 +691,52 @@ mod tests {
             "a one-ring fan-in's only piece is also its first"
         );
         assert_eq!(t.inflight(), 0);
+    }
+
+    /// The fast path, stated as an invariant rather than as a timing claim:
+    /// a request awaiting ONE ring never writes `received` at all. (The word
+    /// survives the free — only `claim` phase 2 resets it — so reading it
+    /// after the completion is a faithful witness.)
+    #[test]
+    fn a_single_ring_resolve_never_touches_received() {
+        let t = SlotTable::new(8, 0);
+        let seq = t.claim(0x5A, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 0x5A, fan_in: false, first: true },
+            "a set of one: its only piece is also its first"
+        );
+        assert_eq!(t.received_for_tests(seq as u32), 0, "no fetch_or on the single-ring path");
+        assert_eq!(t.inflight(), 0);
+    }
+
+    /// The control: a MULTI-ring request still accumulates, because its
+    /// completion condition IS `received == expected`.
+    #[test]
+    fn a_multi_ring_resolve_still_accumulates_received() {
+        let t = SlotTable::new(8, 0);
+        let seq = t.claim(0x5B, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
+        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)), Resolve::Partial { first: true });
+        assert_eq!(t.received_for_tests(seq as u32), 0b10, "the partial piece is recorded");
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 0x5B, fan_in: true, first: false }
+        );
+        assert_eq!(t.received_for_tests(seq as u32), 0b11);
+    }
+
+    /// The exactly-once gate for a single-ring request is the owner CAS, not
+    /// the `received` bit: a duplicate delivery must still be `Miss` exactly
+    /// once, and must not resurrect or double-decrement the slot.
+    #[test]
+    fn a_single_ring_duplicate_is_a_miss_and_the_window_stays_closed() {
+        let t = SlotTable::new(8, 0);
+        let seq = t.claim(0x5C, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        assert!(matches!(t.resolve(seq as u32, None, Some(0)), Resolve::Won { .. }));
+        assert_eq!(t.inflight(), 0);
+        for _ in 0..3 {
+            assert_eq!(t.resolve(seq as u32, None, Some(0)), Resolve::Miss, "duplicate delivery");
+        }
+        assert_eq!(t.inflight(), 0, "a duplicate must not double-decrement inflight");
     }
 }
