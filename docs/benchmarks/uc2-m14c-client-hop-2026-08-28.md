@@ -141,7 +141,11 @@ unsettled numbers are tabulated above.
 6. **The three hot-body suspects were not measured, deliberately.** The plan's
    Steps 4–6 (v1: `handle_record`'s fan-in arms out of line; v2: `send`'s
    query prefix out of line; v3: `poll`'s single-ring slice pattern) are
-   gated on R0 reproducing a negative delta, and it does not. Their decision
+   gated on R0 reproducing the M14b-era loss, and it does not: R0 itself read
+   **−0.30 %** — negative, but overlapping, and its two sibling
+   configurations read **+0.31 %** (R0b) and **−0.05 %** (R0f). The stop was
+   adjudicated on that *sign inconsistency across configurations plus
+   overlapping ranges*, not on a positive or zero R0. Their decision
    rule requires a **≥ +1 %** disjoint delta over 6 reps; finding 2 indicates
    this harness does not reliably resolve 1 % on this box, so all three would
    in all likelihood have returned OVERLAP. Recording them as "refuted" would
@@ -191,8 +195,10 @@ explanation — subject to finding 3's caveat that it remains an inference.
   not be carried forward without a fleet measurement — it is within this box's
   build-to-build noise. Its source is the "Post-execution addendum" of
   `docs/superpowers/plans/2026-08-27-uc2-m14b-query-routing-and-fan-in.md`
-  (≈ lines 1822–1831), which this document contradicts; amending that file is
-  not this task's to do.
+  (≈ lines 1822–1831), which this document contradicts; that addendum now
+  carries a **"Superseded 2026-08-28 (M14c Task 2)"** note pointing here
+  (`docs/superpowers/plans/2026-08-27-uc2-m14b-query-routing-and-fan-in.md`,
+  ≈ line 1834), added in Task 10 — so the two files no longer disagree.
 - **`scripts/hop1_ab.sh` is committed** so the next attempt starts from a
   runner with the alternation, the fixed sink, the checksum echo, the
   sink-settle pauses and the disjointness verdict already in it, rather than

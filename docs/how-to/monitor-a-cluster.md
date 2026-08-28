@@ -55,15 +55,19 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 72 families — is the
+exposition. The full series contract — 73 families — is the
 `CONTRACT_SERIES` array in
 [`uc2_node/src/obs/metrics.rs`](../../uc2_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
 it cannot drift silently. This page names only the load-bearing subset: the
 lag/saturation/heartbeat-age/peer-lag gauges and the `agent_alive` gauge that
 the alert rules below key on, plus the counters they watch for edges. For
-everything else — snapshot/session counters, sender/receiver datagram and
-byte totals, resync counters — read the source array; each family carries
+everything else — snapshot/session counters (among them
+`uc2_snapshot_intake_io_failures_total`, the intake-side "the disk, not the
+wire" counter: a `.part` that could not be created or a completed artifact
+whose fsync/rename failed; retried, so a *rising* count, not a nonzero one,
+is the signal), sender/receiver datagram and byte totals, resync counters —
+read the source array; each family carries
 its own one-line doc comment there.
 
 Two families worth calling out because their shape is easy to misread:
@@ -168,7 +172,7 @@ table:
 | `Uc2FollowerSealFailures` | outgoing control frames a **follower** could not seal (check pairwise sessions/allowlist) — a leader's own climb is benign and excluded by the rule | warning |
 | `Uc2DiskLow` | `uc2_free_disk_bytes` has sat below 4 journal segments' worth of free space for 2m — the archive fail-stops at `ENOSPC`; purge or grow the disk | warning |
 | `Uc2ServiceAbsent` | a declared FSM's `uc2_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
-| `Uc2ServicePinnedAtLagBound` | a declared FSM's `uc2_service_lag_bytes` has sat at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is pacing the whole cluster | warning |
+| `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc2_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 
@@ -176,7 +180,12 @@ The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_
 (`uc2_service_heartbeat_age_seconds{service=""}`) — the same family now
 carries a labelled sample per FSM, and the rule is about the node's slowest
 one. `Uc2ServiceAbsent` and `Uc2ServicePinnedAtLagBound` are per-FSM: they
-fire once per offending `service` label, on whichever node declares it.
+fire once per offending `service` label, on whichever node declares it — and
+never both for the same FSM. An FSM that is **absent** also has its lag climb
+to the bound and sit there, so `Uc2ServicePinnedAtLagBound` is guarded with
+`and on(instance, service) uc2_service_attached == 1`: a detached FSM pages
+once, as the critical `Uc2ServiceAbsent`, and "pinned at the bound" always
+means an FSM that is actually running.
 
 ### Watching the disk before `ENOSPC` hits it
 

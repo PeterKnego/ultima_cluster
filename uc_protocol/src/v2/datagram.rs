@@ -143,8 +143,12 @@ pub fn read_read_probe_body(buf: &[u8]) -> Option<ReadProbeBody> {
 /// leader → peer: opens one artifact of a session. Body = [`SnapBeginBody`];
 /// header `position` = 0. M14c: one BEGIN per declared FSM, ascending by id.
 pub const DGRAM_KIND_SNAP_BEGIN: u8 = 12;
-/// leader → peer: one file chunk. Header `position` = the snapshot-FILE offset;
-/// payload = the raw bytes at that offset.
+/// leader → peer: one file chunk. Header `position` = the STREAM-GLOBAL
+/// offset — the session is one concatenated byte stream over its artifacts (a
+/// chunk's offset within its own file is `position - <that artifact's base>`),
+/// NOT the file offset; payload = the raw bytes at that stream offset. A
+/// datagram never spans an artifact boundary, so one chunk lands in exactly
+/// one `.part`.
 pub const DGRAM_KIND_SNAP_CHUNK: u8 = 13;
 /// peer → leader: request a missing byte range. Body = [`SnapNakBody`].
 pub const DGRAM_KIND_SNAP_NAK: u8 = 14;

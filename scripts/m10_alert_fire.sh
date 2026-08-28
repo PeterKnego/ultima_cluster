@@ -295,10 +295,16 @@ def build_Uc2ServicePinnedAtLagBound():
     rows = load_scenario("fsm_pinned")
     lag_row = select(rows, "uc2_service_lag_bytes", {"service": "1"})
     bound_row = select(rows, "uc2_fsm_lag_bytes", {})
+    # Review round 2: the rule is now gated on the FSM being ATTACHED (so an
+    # absent FSM pages once, as Uc2ServiceAbsent, not twice). The scenario
+    # already scrapes `uc2_service_attached`, so the guard series is the real
+    # captured one — it must be replayed here or the rule can never fire.
+    att_row = select(rows, "uc2_service_attached", {"service": "1"})
     # group_left keeps the LHS's `service` label; `and on(instance)` keeps it too.
     r = new_rule("warning", labels_from=lag_row)
     add_hold_last(r, lag_row, "uc2_service_lag_bytes", 30)
     add_hold_last(r, bound_row, "uc2_fsm_lag_bytes", 30)
+    add_hold_last(r, att_row, "uc2_service_attached", 30)
     r["eval_time"] = total_for(30)[0]
     return r
 

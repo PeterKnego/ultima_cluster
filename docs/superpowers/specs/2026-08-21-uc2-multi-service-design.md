@@ -660,6 +660,39 @@ M14a (`main` 6111257) and M14b (`main` 4347bc2) are in. Their execution records 
 
 M14b's exact-binary A/B (`hop_bench engine-load` → `dummy-node`, dev box, 17 pairs) put hop 1 at **−4.2 % resp/s vs M14a's tip**, reproducibly, with p90 2 → 3 µs. Skipping `received.fetch_or` for a single-ring request (`expected == bit`; the completing CAS is already the exactly-once gate) restores the tail but not the rate, so the rate loss is the grown hot body — M14a's codegen lesson. M14c: commit the fast path; then bisect M14a-style, one variant per suspect, A/B'd back to back on the same harness: (v1) the fan-in arms of `handle_record`'s `MSG_V2_RESPONSE` branch moved out of line (`#[inline(never)]`), leaving the single-ring `Won` path as the hot body; (v2) `send`'s prefix path out of line; (v3) `poll`'s ring loop shape. Keep what measures; record every number in the plan's execution record. Target: hop 1 inside the box's repeat noise of `main`. No bar — rate bars are fleet-only (M14d).
 
+**As-built errata (M14c, 2026-08-28 — the −4.2 % premise is refuted):** the
+M14b measurement this section is built on **did not reproduce**. Rebuilding
+the identical two commits and A/B-ing the exact binaries back to back
+(`scripts/hop1_ab.sh`, 6 reps, alternated order, fixed sink) read **−0.30 %**,
+**+0.31 %** and **−0.05 %** across three configurations — all with overlapping
+ranges — and a control that A/B'd **the same commit built twice** manufactured
+**+1.02 %**, larger than the effect being hunted. So this box does not resolve
+1 % on this harness, and the bisection (v1/v2/v3) was **stopped before it
+started**: recording three "refuted" variants would have been a claim the
+instrument cannot support. What *is* kept is Task 1's fast path — skipping
+`received.fetch_or` for a single-ring request — because it restores the
+**tail** exactly as designed (p90 3 → 2 µs) at a rate delta of −0.05 %,
+OVERLAP. The new standing rule, and the reason the premise fell: **a
+same-source rebuild control before any binary-to-binary perf claim** — build
+the same commit twice, A/B those two binaries, and treat anything smaller than
+that control's spread as unmeasurable on this box. Full record:
+`docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md`; runner:
+`scripts/hop1_ab.sh`. A ~1 % client-hop question belongs on the fleet (M14d),
+not on the dev box.
+
+**As-built errata (M14c, 2026-08-28 — two deliberate strictnesses in §14.3/§14.4).**
+Both are as-built on purpose; neither is a bug to "fix":
+1. **The receiver checks `services_declared` on EVERY `SNAP_BEGIN`**, not
+   "on the first" as §14.3 says. Every BEGIN carries the mask, and a session
+   whose later BEGIN disagrees with its first is exactly the mixed/forged case
+   the `declared-set mismatch` refusal exists for — checking once would admit
+   the artifacts that arrive after the check.
+2. **`service_detached` also fires when the slot's ATTACHED bit clears**, not
+   only when the heartbeat ages past the wedged threshold. An orderly service
+   stop clears the bit immediately; waiting out the heartbeat threshold to say
+   so would delay the event by the stale window and make an orderly stop look
+   like a wedge.
+
 ### 14.3 §7.3 as designed — one session per join, a stream of N artifacts
 
 What is already per-id (M14a): `snapshots/<id>/` directories, `SnapshotStore::open(dir, id)` (each FSM builds, discovers and installs its *own* artifact; the node signals nothing), `slot[id].snapshot_pos`, and the purge floor `min(snapshot_pos)` over declared ids. What is still single-artifact: the transfer plane — the sender's `SnapSession` (one at a time, `snapshot_source` closure returns FSM 0's file at the node floor), the receiver's `SnapIntake` (one `snap_dir`, one `incoming_snapshot_pos`), and the node-wide floor-adoption cell.

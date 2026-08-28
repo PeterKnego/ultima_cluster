@@ -77,7 +77,9 @@ Read it in this order:
    `[log]` records say which: `service_attached` then no `service_detached`
    means it is still holding its slot.
 3. **`lag` pinned at `fsm_lag`** (`Uc2ServicePinnedAtLagBound`) — that FSM is
-   running, just slower than the log. Nothing is broken; the cluster is being
+   running, just slower than the log. (The rule is gated on
+   `uc2_service_attached == 1`, so a *detached* FSM whose lag has drifted to
+   the bound pages as `Uc2ServiceAbsent` instead — case 1, not this one.) Nothing is broken; the cluster is being
    paced to it, which is what a bound buys you. Either make that FSM faster
    or accept the rate. Raising `fsm_lag` buys latency headroom, not
    throughput, and it is refused above `buffer_bytes / 2`.

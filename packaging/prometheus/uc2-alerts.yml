@@ -97,7 +97,14 @@ groups:
     # genuinely pinned FSM sits ON the bound and never past it. The
     # on(instance) group_left join is the same idiom Uc2PeerLagging uses to
     # compare a per-peer series against the node-scalar admission window.
-    expr: (uc2_service_lag_bytes >= on(instance) group_left uc2_fsm_lag_bytes) and on(instance) uc2_fsm_lag_bytes > 0
+    #
+    # Review round 2: gated on the FSM being ATTACHED. A detached FSM's
+    # lag climbs to the bound and sits there, so an absent FSM would fire
+    # BOTH this and Uc2ServiceAbsent — two pages for one fact, and the
+    # wrong one on top (an absent FSM is critical and is not "pacing the
+    # cluster", it is gone). `on(instance, service)`: both sides carry
+    # the service label here, unlike the node-scalar bound above.
+    expr: (uc2_service_lag_bytes >= on(instance) group_left uc2_fsm_lag_bytes) and on(instance) uc2_fsm_lag_bytes > 0 and on(instance, service) uc2_service_attached == 1
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }

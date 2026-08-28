@@ -264,7 +264,7 @@ counted (`Node::snapshot_session_refusals`) *and* named in a
 
 | refusal | meaning | fix |
 |---|---|---|
-| `peer wire 0.5.0` | a `SNAP_BEGIN` arrived whose layout byte is not the `0.6.0` value | finish the flag day: some node is still on `0.5.0` |
+| `peer wire 0.5.0` | the `SNAP_BEGIN` is too short for `0.6.0` (a `0.5.0` body) or its layout byte is not one we speak | finish the flag day: some node is still on `0.5.0` |
 | `declared-set mismatch` | the sender's `[services] ids` differ from this node's | make `[services] ids` identical on every node, then restart the odd one out |
 
 Both drop the session; the joining node keeps NAKing, so the cluster is
