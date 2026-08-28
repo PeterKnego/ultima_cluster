@@ -174,6 +174,9 @@ fn submit_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
+            // M14b: this harness only ever drives FSM 0, which every node
+            // declares — naming an undeclared id here is a wiring bug.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -213,6 +216,8 @@ fn read_leader(conn: &mut Conn, deadline: Instant) -> ReadOutcome {
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
+            // M14b: FSM 0 only, as in `submit_cmd` above.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -838,6 +843,9 @@ fn submit_cmd_multi(conn: &mut MultiConn, cmd: &Cmd, deadline: Instant) -> Submi
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
+            // M14b: this harness only ever drives FSM 0, which every node
+            // declares — naming an undeclared id here is a wiring bug.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -877,6 +885,8 @@ fn read_leader_multi(conn: &mut MultiConn, deadline: Instant) -> ReadOutcome {
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
+            // M14b: FSM 0 only, as in `submit_cmd_multi` above.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
         }
     }
