@@ -38,8 +38,8 @@ use uc_protocol::v2::cnc::{
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, align_frame_len};
 use uc_protocol::v2::ipc::{
-    FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra,
-    extra_client,
+    FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY,
+    client_from_extra, extra_client, split_query_payload,
 };
 
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
@@ -3384,6 +3384,21 @@ impl Consensus {
         let _ = self.egress_node.write(MSG_V2_RETRY, 0, extra, &[]);
     }
 
+    /// M14b: answer a query naming an id this node has no ring for with
+    /// `MSG_V2_BAD_SERVICE` on the node egress, payload = the offending id.
+    /// Pre-answer and side-effect-free (nothing was forwarded), so the client
+    /// may re-issue with a different id.
+    fn send_bad_service(&mut self, client_id: u32, local_seq: u32, service_id: u8) {
+        let extra = extra_client(client_id, local_seq);
+        let _ = self.egress_node.write(MSG_V2_BAD_SERVICE, 0, extra, &[service_id]);
+    }
+
+    /// M14b: whether `svc_query.<id>.ring` exists on this node — the declared
+    /// set for a real node, `{0}` for a harness node (plan deviation 4).
+    fn has_service_ring(&self, id: u8) -> bool {
+        self.svc_query.get(id as usize).is_some_and(|p| p.is_some())
+    }
+
     /// Forward a barrier-passed (or snapshot) read to service `service_id`'s
     /// `svc_query.<id>.ring`: payload = `expected_epoch: u64 LE ++ query bytes`,
     /// `header_extra` echoing the client identity so the service's answer routes
@@ -3401,7 +3416,8 @@ impl Consensus {
     ) -> bool {
         let Some(producer) = self.svc_query.get_mut(service_id as usize).and_then(|p| p.as_mut())
         else {
-            return false; // not a ring id — M14b answers MSG_V2_BAD_SERVICE before reaching here
+            // unreachable for queries admitted by drain_query_ring (has_service_ring); kept as the safe default
+            return false;
         };
         let mut payload = Vec::with_capacity(8 + query.len());
         payload.extend_from_slice(&expected_epoch.to_le_bytes());
@@ -3548,9 +3564,20 @@ impl Consensus {
                 Ok(Some(rec)) => {
                     did = true;
                     let (client_id, local_seq) = client_from_extra(rec.header_extra);
+                    // M14b: `service_id: u8 ++ query`. No id byte = malformed,
+                    // dropped (the service drops short svc_query records the
+                    // same way; the SDK always writes the prefix).
+                    let Some((service_id, _)) = split_query_payload(&buf) else {
+                        continue;
+                    };
+                    if !self.has_service_ring(service_id) {
+                        self.send_bad_service(client_id, local_seq, service_id);
+                        continue;
+                    }
+                    buf.remove(0); // strip the id; `buf` is now the query bytes
                     if rec.flags & FLAG_V2_LINEARIZABLE == 0 {
-                        // Snapshot: forward immediately, epoch check skipped (0).
-                        self.forward_svc_query(0, client_id, local_seq, 0, &buf);
+                        // Snapshot: forward immediately to the named id, epoch check skipped (0).
+                        self.forward_svc_query(service_id, client_id, local_seq, 0, &buf);
                         continue;
                     }
                     // Linearizable: only a serving leader can confirm a read.
@@ -3591,9 +3618,8 @@ impl Consensus {
                     let mut read = PendingRead {
                         client_id,
                         local_seq,
-                        // M14a: always 0 (the remote path's only FSM); M14b
-                        // takes this from the query record instead.
-                        service_id: 0,
+                        // M14b: from the record; the barrier certifies on this FSM's slot
+                        service_id,
                         query: buf,
                         // Rung A §3.2: record the NEXT round's seq — only a
                         // round issued at-or-after this admission may certify.
@@ -8440,6 +8466,88 @@ mod tests {
         h.cons.publish_ring_holes();
         assert_eq!(h.cons.cnc.query_holes_skipped(), 1, "counted on the query line");
         assert_eq!(h.cons.cnc.ingress_holes_skipped(), 0, "NOT summed into ingress");
+    }
+
+    /// M14b: the query payload's first byte names the FSM. A query naming an
+    /// id this node has no ring for is answered MSG_V2_BAD_SERVICE on the
+    /// node broadcast, keyed by the client pair, and never parked.
+    #[test]
+    fn a_query_for_an_id_without_a_ring_is_answered_bad_service() {
+        use uc_protocol::v2::ipc::{MSG_V2_BAD_SERVICE, MSG_V2_QUERY, write_query_payload};
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let mut node_egress =
+            BroadcastRing::open(&h._dir.path().join("egress_node.broadcast")).unwrap().subscribe();
+        let (producer, _c) =
+            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
+        let mut payload = Vec::new();
+        write_query_payload(5, b"q", &mut payload); // 5: no ring on the harness node
+        producer.try_write(MSG_V2_QUERY, 0, extra_client(9, 1), &payload).unwrap();
+        write_query_payload(200, b"q", &mut payload); // out of range: same answer
+        producer.try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 2), &payload).unwrap();
+        assert!(h.cons.drain_query_ring());
+        assert!(h.cons.pending_reads.is_empty(), "a bad id is never parked");
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        while let Ok(Some(rec)) = node_egress.try_read(&mut buf) {
+            got.push((rec.msg_type, client_from_extra(rec.header_extra), buf.clone()));
+        }
+        assert_eq!(got, vec![
+            (MSG_V2_BAD_SERVICE, (9, 1), vec![5]),
+            (MSG_V2_BAD_SERVICE, (9, 2), vec![200]),
+        ]);
+    }
+
+    /// M14b: a snapshot read is forwarded to the NAMED id's ring (the harness
+    /// gets a second ring for id 1 for this test), payload unchanged
+    /// (`expected_epoch 0 ++ query`), and a linearizable read carries the id
+    /// into its PendingRead.
+    #[test]
+    fn queries_route_to_the_named_ids_ring_and_pending_reads_carry_the_id() {
+        use uc_protocol::v2::ipc::{MSG_V2_QUERY, MSG_V2_SVC_QUERY, write_query_payload};
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let (svc1_producer, mut svc1_consumer) =
+            SpscRing::create(&h._dir.path().join("svc_query.1.ring"), 4096, 1024).unwrap().into_split();
+        h.cons.svc_query[1] = Some(svc1_producer);
+        let (producer, _c) =
+            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
+        let mut payload = Vec::new();
+        write_query_payload(1, b"snap", &mut payload);
+        producer.try_write(MSG_V2_QUERY, 0, extra_client(9, 3), &payload).unwrap();
+        write_query_payload(1, b"lin", &mut payload);
+        producer.try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 4), &payload).unwrap();
+        assert!(h.cons.drain_query_ring());
+        let mut buf = Vec::new();
+        let rec = svc1_consumer.try_read(&mut buf).unwrap().expect("forwarded to svc_query.1");
+        assert_eq!(rec.msg_type, MSG_V2_SVC_QUERY);
+        assert_eq!(client_from_extra(rec.header_extra), (9, 3));
+        assert_eq!(&buf[..8], &0u64.to_le_bytes(), "snapshot reads skip the epoch check");
+        assert_eq!(&buf[8..], b"snap", "the id byte is stripped before forwarding");
+        assert!(svc1_consumer.try_read(&mut buf).unwrap().is_none());
+        assert_eq!(h.cons.pending_reads.len(), 1);
+        assert_eq!(h.cons.pending_reads[0].service_id, 1);
+        assert_eq!(h.cons.pending_reads[0].query, b"lin");
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
+    }
+
+    /// M14b: an EMPTY query payload (no id byte) is dropped — neither parked
+    /// nor answered (plan deviation 5; the service drops short records the
+    /// same way).
+    #[test]
+    fn an_empty_query_payload_is_dropped() {
+        use uc_protocol::v2::ipc::MSG_V2_QUERY;
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let mut node_egress =
+            BroadcastRing::open(&h._dir.path().join("egress_node.broadcast")).unwrap().subscribe();
+        let (producer, _c) =
+            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
+        producer.try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 5), &[]).unwrap();
+        assert!(h.cons.drain_query_ring());
+        assert!(h.cons.pending_reads.is_empty());
+        let mut buf = Vec::new();
+        assert!(node_egress.try_read(&mut buf).unwrap().is_none(), "no answer for a malformed record");
     }
 
     /// M13a: the unsized hole (`RingError::Wedged`) is not recoverable — the

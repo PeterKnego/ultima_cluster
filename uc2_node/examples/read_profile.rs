@@ -185,7 +185,7 @@ use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
     FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
-    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client, write_query_payload,
 };
 
 /// Well-known file names under the instance dir — the shared contract with
@@ -1008,6 +1008,9 @@ fn run_read_measurement(
     // Send loop: keep `readers` reads in flight. `RingError::Full` means
     // yield+retry, exactly like the real uc2_client.
     let mut local_seq: u32 = 0;
+    // M14b: the query payload is now `service_id: u8 ++ query`; built once per
+    // send into a reused scratch buffer, keeping the send loop allocation-free.
+    let mut query_payload = Vec::new();
     'send: while Instant::now() < deadline {
         // Pause while the attached node is not a serving leader: without this a
         // leadership flip degenerates into a NOT_LEADER feedback flood that
@@ -1028,8 +1031,9 @@ fn run_read_measurement(
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
         owner[idx].store(local_seq as u64 + 1, Ordering::Release);
         let extra = extra_client(client_id, local_seq);
+        write_query_payload(0, &query_bytes, &mut query_payload);
         loop {
-            match query_producer.try_write(MSG_V2_QUERY, flags, extra, &query_bytes) {
+            match query_producer.try_write(MSG_V2_QUERY, flags, extra, &query_payload) {
                 Ok(()) => break,
                 Err(RingError::Full) => thread::yield_now(),
                 Err(e) => panic!("query.ring write error: {e}"),
