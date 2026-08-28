@@ -235,6 +235,53 @@ The instance directory's journal, state and snapshots are reused as-is. If
 `[services]` is absent, the node declares FSM 0 only and behaves exactly as
 before, except that a service must now attach as id 0 (the default).
 
+## Wire change in 2.8.0: `SNAP_BEGIN` carries every FSM's snapshot (0.6.0)
+
+M14c moves the node-to-node wire from `0.5.0` to `0.6.0`. One datagram
+changes: `SNAP_BEGIN`, which opens a snapshot session. Its body grew from 26
+to 34 fixed bytes and now names *which* FSM's artifact is being shipped
+(`service_id`), the sender's declared FSM set (`services_declared`), and a
+layout discriminator — because a session now carries **one artifact per
+declared FSM**, not one artifact. `DATA`, `NAK`, `APPEND_POSITION`,
+`TERM_MAP`, the 16-byte header and every admin datagram are byte-identical to
+`0.5.0`.
+
+**This is a whole-cluster flag day, on the same terms as every prior one.**
+A mixed `0.5.0`/`0.6.0` cluster replicates and elects normally — which is
+precisely why it is dangerous: the damage is confined to snapshot sessions,
+so it surfaces later, when a learner joins or a node falls below the purge
+floor, not at upgrade time. A `0.5.0` receiver handed a `0.6.0` `SNAP_BEGIN`
+misreads its config length and drops or mis-adopts the carried membership; a
+`0.6.0` receiver refuses the session by name. Nothing in the header enforces
+this (`version::CURRENT` is documentary and has no caller on any receive
+path) — the rule is operational: **stop every node, swap, start every node.**
+`scripts/uc2_flag_day.sh` does exactly that and needs no new flags.
+
+Two named, counted refusals on the receiving node tell you a cluster is
+mixed or mis-declared instead of leaving a joiner silently stuck. Each is
+counted (`Node::snapshot_session_refusals`) *and* named in a
+`snapshot_session_refused` log record the first time it happens:
+
+| refusal | meaning | fix |
+|---|---|---|
+| `peer wire 0.5.0` | a `SNAP_BEGIN` arrived whose layout byte is not the `0.6.0` value | finish the flag day: some node is still on `0.5.0` |
+| `declared-set mismatch` | the sender's `[services] ids` differ from this node's | make `[services] ids` identical on every node, then restart the odd one out |
+
+Both drop the session; the joining node keeps NAKing, so the cluster is
+stalled-but-safe until the mismatch is fixed — never half-installed.
+
+The sending side has its own, quieter counterpart: a leader that cannot
+assemble a complete set declines to open the session at all and says why once
+(`snapshot_session_declined`, `reason = "floor 0" | "missing artifact" | "set
+does not cover declared"`). `floor 0` is ordinary — nothing has snapshotted
+yet, so the joiner is served by journal replay. The other two mean a declared
+FSM's newest artifact is missing on the leader; the joiner re-NAKs until it
+appears.
+
+The snapshot **directory layout is unchanged from 2.8.0's own layout**:
+artifacts already live in `snapshots/<service-id>/` (M14a). No migration, no
+rollback step beyond restarting the old binaries together.
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)

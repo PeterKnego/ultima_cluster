@@ -93,6 +93,12 @@ impl InstanceDir {
     pub fn snapshot_dir_for(&self, id: u8) -> PathBuf {
         self.root.join("snapshots").join(id.to_string())
     }
+    /// M14c: the snapshots ROOT (`snapshots/`), which holds one `<id>/`
+    /// directory per declared FSM. The inbound snapshot intake is wired to this
+    /// and picks the per-id subdirectory from each `SNAP_BEGIN`.
+    pub fn snapshot_root(&self) -> PathBuf {
+        self.root.join("snapshots")
+    }
     /// M14a: the exclusive flock a service process takes for its id.
     pub fn service_lock_for(&self, id: u8) -> PathBuf {
         self.root.join(format!("service.{id}.lock"))

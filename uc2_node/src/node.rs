@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime};
 
@@ -312,6 +312,21 @@ const OUTPUT_PROGRESS_FLOOR_NS: u64 = 100_000_000;
 /// codes 1-10 and 12 are the SM's; 11 is the node's own defensive catch-all,
 /// previously a deliberate reuse of 6/NotFound).
 const REASON_MALFORMED_OP: u32 = 11;
+
+// ---- M14c: why the snapshot source DECLINED to open a session ------------
+// The source closure is called once per below-floor NAK, so a decline that
+// logged unconditionally would be a per-NAK log storm. These codes latch the
+// last reported reason in an `AtomicU8` so `snapshot_session_declined` is
+// emitted only when the reason CHANGES (spec §14.3 wants the refusal named,
+// not repeated). `uc2_net` carries no logging dependency — the node names it.
+/// The source last returned a shippable set (nothing to report).
+const SNAP_DECLINE_NONE: u8 = 0;
+/// Nothing has snapshotted yet: the joiner replays the journal from 0.
+const SNAP_DECLINE_FLOOR_ZERO: u8 = 1;
+/// A declared id's newest artifact is missing, empty, or unpublished.
+const SNAP_DECLINE_MISSING: u8 = 2;
+/// The assembled set does not cover the declared mask exactly.
+const SNAP_DECLINE_UNCOVERED: u8 = 3;
 
 // ---- M12b: admin-authentication refusal reasons (spec §5.2) --------------
 // Wire `reason` codes on an admin response whose `status` is 1 (refused).
@@ -899,14 +914,13 @@ impl Node {
             }),
         );
         sender.set_replay_source(journal);
-        // M6 Task 6: snapshot session wiring. `snap_dir` holds the position-tagged
-        // artifacts (shared with the service's builder); `incoming_snapshot` is the
-        // node-internal signal the receiver raises on a completed inbound transfer.
-        // M14a: ships FSM 0's artifact ONLY — the snapshot transfer plane is not
-        // yet per-id (see deviation 3 in the M14a plan); M14c generalizes this to
-        // every declared id.
-        let snap_dir = instance.snapshot_dir_for(0);
-        let _ = std::fs::create_dir_all(&snap_dir);
+        // M6 Task 6 / M14c: snapshot session wiring. `snap_root` holds one
+        // `snapshots/<id>/` per declared FSM (created in `create_rings`);
+        // `incoming_snapshot` is the node-internal signal the receiver raises on
+        // a COMPLETED inbound transfer — with N artifacts that is the minimum
+        // over the set, so no FSM is ever stranded below an adopted floor.
+        let snap_root = instance.snapshot_root();
+        let _ = std::fs::create_dir_all(&snap_root);
         let incoming_snapshot = Arc::new(AtomicU64::new(0));
         // M7 Task 6: companion cell for `incoming_snapshot` — the encoded config
         // carried by the SAME completed inbound transfer (`SnapBeginBody.config`),
@@ -918,32 +932,82 @@ impl Node {
         // around a DATA datagram to detect a prime that straddled its processing and
         // drop the stale frontier rather than clobber the freshly primed floor.
         let prime_generation = Arc::new(AtomicU64::new(0));
-        // Offer ONLY the file at the node's durable floor: a session ships a
-        // fully-published artifact (rename-atomic + validated as the floor marker).
+        // M14c: offer ONE artifact PER DECLARED FSM, and only files at or above
+        // the node's durable floor — a session ships fully-published artifacts
+        // (rename-atomic, and each id's marker is written only after its own
+        // rename; see `uc2_service::builder_agent`).
         let src_cnc = Arc::clone(&cnc);
-        let src_dir = snap_dir.clone();
+        let src_root = snap_root.clone();
+        let src_services = cfg.services;
+        // M14c (controller amendment 2): the last DECLINE reason this source
+        // reported, so the node names a decline in a log line ONCE per distinct
+        // reason instead of once per NAK (a below-floor peer re-NAKs on a timer).
+        // `uc2_net` has no logging dependency, so the naming lives here.
+        let src_decline_reason = AtomicU8::new(SNAP_DECLINE_NONE);
         // M7 Task 6: the same cell `Action::ConfigAdopted`'s exec arm refreshes —
         // ships whatever config is CURRENT at the moment a peer's NAK opens a
         // session, never a boot-time snapshot of it.
         let src_config_bytes = Arc::clone(&config_bytes);
+        let src_id = cfg.id;
         sender.set_snapshot_source(Arc::new(move || {
+            let decline = |code: u8, reason: &'static str| -> Option<SnapshotSet> {
+                if src_decline_reason.swap(code, Ordering::Relaxed) != code {
+                    crate::obs_event!(
+                        Info,
+                        "snapshot_session_declined",
+                        node = src_id as u64,
+                        reason = reason
+                    );
+                }
+                None
+            };
             let floor = src_cnc.snapshots().node_snapshot_floor.load_acquire();
             if floor == 0 {
-                return None;
+                // Nothing has snapshotted: the joiner is served by journal
+                // replay from 0 (spec §14.3's "moot" case).
+                return decline(SNAP_DECLINE_FLOOR_ZERO, "floor 0");
             }
-            let path = src_dir.join(format!("snap-{floor}.ultsnap"));
-            let len = std::fs::metadata(&path).ok()?.len();
-            let config = src_config_bytes.lock().unwrap().clone();
+            let mask = src_services.ring_mask();
+            let mut artifacts = Vec::new();
+            for id in src_services.ring_ids() {
+                let pos = src_cnc.service_slot(id as usize).snapshot_pos.load_acquire();
+                if pos == 0 {
+                    return decline(SNAP_DECLINE_MISSING, "missing artifact");
+                }
+                let path = src_root.join(id.to_string()).join(format!("snap-{pos}.ultsnap"));
+                // A declared id whose newest artifact is missing (a retention
+                // race, a hand-edited dir) makes the SET incomplete — and the
+                // receiver adopts the floor only on a complete set, so a partial
+                // ship would strand the joiner below a floor it can never adopt
+                // AND hold the leader's single session slot for 30 s. Refuse:
+                // the NAK stays an overrun, the peer re-NAKs, the next attempt
+                // sees the file.
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    return decline(SNAP_DECLINE_MISSING, "missing artifact");
+                };
+                let len = meta.len();
+                if len == 0 {
+                    return decline(SNAP_DECLINE_MISSING, "missing artifact");
+                }
+                artifacts.push(SnapArtifact { service_id: id, snapshot_pos: pos, path, len });
+            }
+            // Controller amendment 1: the set must cover the mask EXACTLY. A set
+            // short of a declared bit would livelock the joiner — it probes for
+            // the missing id forever, the leader's session times out at 30 s, the
+            // re-NAK re-opens the identical session — with no counter anywhere.
+            // `ring_ids()` is ascending and inside `mask` by construction, so
+            // this only ever trips on a future edit that breaks that pairing.
+            let covered = artifacts.iter().fold(0u64, |m, a| {
+                m | 1u64.checked_shl(a.service_id as u32).unwrap_or(0)
+            });
+            if artifacts.len() != mask.count_ones() as usize || covered != mask {
+                return decline(SNAP_DECLINE_UNCOVERED, "set does not cover declared");
+            }
+            src_decline_reason.store(SNAP_DECLINE_NONE, Ordering::Relaxed);
             Some(SnapshotSet {
-                // INTERIM (M14c Task 6 wires the declared set): FSM 0 only.
-                services_declared: 0b1,
-                config,
-                artifacts: vec![SnapArtifact {
-                    service_id: 0,
-                    snapshot_pos: floor,
-                    path,
-                    len,
-                }],
+                services_declared: mask,
+                config: src_config_bytes.lock().unwrap().clone(),
+                artifacts,
             })
         }));
 
@@ -988,8 +1052,8 @@ impl Node {
         receiver.set_sender_route(ctrl_tx.clone());
         receiver.set_intake_gate(Arc::clone(&intake_gate));
         receiver.set_snapshot_intake(
-            snap_dir.parent().expect("snapshots/<id> has a parent").to_path_buf(),
-            0b1, /* INTERIM (M14c Task 6 wires the declared set) */
+            snap_root.clone(),
+            cfg.services.ring_mask(),
             Some((Arc::clone(&incoming_snapshot), Arc::clone(&incoming_snapshot_config))),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
@@ -1252,6 +1316,8 @@ impl Node {
             query_ring,
             svc_query,
             services: cfg.services,
+            snap_stats: Arc::clone(&route_drops),
+            last_snap_refusals: (0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
@@ -1466,6 +1532,20 @@ impl Node {
     /// was absent (which downstream idempotency could also explain).
     pub fn crypto_stats(&self) -> &uc2_net::receiver::FollowerStats {
         &self.route_drops
+    }
+
+    /// M14c (spec §14.3, §9): the two named snapshot-session refusals this node
+    /// counted — `(peer wire 0.5.0, declared-set mismatch)`. Both drop the
+    /// session; the follower keeps NAKing, so a non-zero value means a joiner is
+    /// stuck and the fleet is mixed-version or mis-declared. The observability
+    /// workstream exports these; this accessor is the single source it reads.
+    /// The consensus agent names each one in a `snapshot_session_refused` log
+    /// record as it happens (`uc2_net` carries no logging dependency).
+    pub fn snapshot_session_refusals(&self) -> (u64, u64) {
+        (
+            self.route_drops.snap_refused_legacy_peer.load(Ordering::Relaxed),
+            self.route_drops.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+        )
     }
 
     /// M7 Task 6: the cnc-mirrored `ConfigRecord.config.version` — bumped by
@@ -1766,6 +1846,14 @@ struct Consensus {
     /// Read by `publish_service_mins` every cycle; Task 6 also answers
     /// `MSG_V2_BAD_SERVICE` from it.
     services: ServicesConfig,
+    /// M14c (spec §14.3): the receiver's stats — the SAME `Arc` the follower
+    /// receiver bumps and `Node::snapshot_session_refusals` reads. Sampled once
+    /// per duty cycle so the two named snapshot-session refusals are NAMED in a
+    /// log line (`uc2_net` has no logging dependency, so the node does it).
+    snap_stats: Arc<uc2_net::receiver::FollowerStats>,
+    /// The `(peer wire 0.5.0, declared-set mismatch)` pair as of the last cycle
+    /// — the edge detector behind `snapshot_session_refused`.
+    last_snap_refusals: (u64, u64),
     /// M14a: this cycle's `min(applied)` over the declared FSMs, refreshed by
     /// `publish_service_mins()` at the top of every `do_work` cycle.
     /// `u64::MAX` for a `none_for_tests` node (nothing declared: no FSM
@@ -2271,6 +2359,7 @@ impl Consensus {
         // cycle; `node_heartbeat_ns` is wall-clock ns (SystemTime) so a service
         // in another process can compare it against its own clock for liveness.
         self.publish_status();
+        self.report_snapshot_refusals();
 
         // 7. Sample the service-written `output_completed` counter (Task 12);
         // on change, durably persist + mirror it, subject to the 100 ms floor.
@@ -2742,6 +2831,39 @@ impl Consensus {
         if st.service_heartbeat_ns.load_acquire() != m.heartbeat_ns {
             st.service_heartbeat_ns.store_release(m.heartbeat_ns);
         }
+    }
+
+    /// M14c (spec §14.3, controller amendment 2): NAME each snapshot-session
+    /// refusal in a log line. The receiver counts them (it is in `uc2_net`,
+    /// which has no logging dependency); this samples the pair once per duty
+    /// cycle and emits only on a CHANGE, so a joiner re-NAKing against a
+    /// mixed-version or mis-declared cluster produces one record per refusal
+    /// rather than one per cycle. Two loads of an uncontended atomic on the
+    /// steady-state path, no allocation on the untaken branch.
+    fn report_snapshot_refusals(&mut self) {
+        let now = (
+            self.snap_stats.snap_refused_legacy_peer.load(Ordering::Relaxed),
+            self.snap_stats.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+        );
+        if now.0 != self.last_snap_refusals.0 {
+            crate::obs_event!(
+                Warn,
+                "snapshot_session_refused",
+                node = self.id as u64,
+                reason = "peer wire 0.5.0",
+                total = now.0
+            );
+        }
+        if now.1 != self.last_snap_refusals.1 {
+            crate::obs_event!(
+                Warn,
+                "snapshot_session_refused",
+                node = self.id as u64,
+                reason = "declared-set mismatch",
+                total = now.1
+            );
+        }
+        self.last_snap_refusals = now;
     }
 
     /// M6 Task 9: refresh the cnc observability band. Writes the static
@@ -5956,6 +6078,8 @@ mod tests {
             query_ring,
             svc_query,
             services: ServicesConfig::none_for_tests(),
+            snap_stats: Arc::new(uc2_net::receiver::FollowerStats::default()),
+            last_snap_refusals: (0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,

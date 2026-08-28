@@ -133,7 +133,7 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.5.0` — see [wire protocol](wire-protocol.md)).
+  currently `0.6.0` — see [wire protocol](wire-protocol.md)).
 - **The `cnc.dat` page layout** (`CNC_V2_VERSION` — see
   [the cnc control page](cnc-page.md)).
 

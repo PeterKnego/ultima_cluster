@@ -20,7 +20,7 @@
 //! 4 MiB no-wrap ring, 150–300 ms election timeouts, whole-box serialization).
 
 use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -446,6 +446,11 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     let snap_dir = v_dir.join("snapshots").join("0");
     std::fs::create_dir_all(&snap_dir).unwrap();
     std::fs::write(snap_dir.join(format!("snap-{floor}.ultsnap")), vec![0x5Au8; 4096]).unwrap();
+    // M14c: the source closure ships each declared id's own newest artifact, so
+    // the test must publish the SLOT the service owns as well as the page-1
+    // aggregate the node would normally derive from it (a `none_for_tests` node
+    // publishes no aggregates — `publish_service_mins` returns early).
+    cnc.service_slot(0).snapshot_pos.store_release(floor);
     cnc.snapshots().service_snapshot_pos.store_release(floor);
 
     await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
@@ -556,6 +561,325 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     assert!(
         learner_decoded.learners.iter().any(|m| m.id == extra_learner_id),
         "decoded cache must contain the extra learner from the installed config"
+    );
+
+    learner.stop();
+    voter.stop();
+}
+
+/// A snapshot-capable RAW state machine (bytes in, bytes out — no serde, so the
+/// test can submit plain byte payloads through `Node::submit` exactly as the
+/// single-FSM join test above does). `freeze` pins `(total, last_applied)`.
+#[derive(Default)]
+struct SumSm {
+    total: u64,
+    last: Option<u64>,
+}
+
+impl uc2_service::RawStateMachine for SumSm {
+    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+        if cmd.len() >= 8 {
+            self.total = self.total.wrapping_add(u64::from_le_bytes(cmd[..8].try_into().unwrap()));
+        }
+        self.last = Some(position);
+        out.extend_from_slice(&self.total.to_le_bytes());
+    }
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.total.to_le_bytes());
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.last
+    }
+}
+
+impl uc2_service::SnapshotStateMachine for SumSm {
+    type SnapshotHandle = Vec<u8>;
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc2_service::SnapshotError> {
+        let pos = self.last.unwrap_or(0);
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.total.to_le_bytes());
+        buf.extend_from_slice(&pos.to_le_bytes());
+        Ok((buf, pos))
+    }
+    fn stream_snapshot(
+        handle: Vec<u8>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        assert!(buf.len() >= 16, "a SumSm artifact is 16 bytes");
+        self.total = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        self.last = Some(position);
+        Ok(position)
+    }
+}
+
+fn start_sum_service(dir: &Path, app: &str, id: u8) -> uc2_service::Service<SumSm> {
+    let cfg = uc2_service::ServiceConfig::new(dir, app)
+        .service_id(id)
+        .snapshot_policy(uc2_service::SnapshotPolicy { interval_bytes: 256 * 1024 });
+    uc2_service::ServiceBuilder::new(cfg, SumSm::default())
+        .start_with_snapshots()
+        .expect("service start")
+}
+
+/// M14c (spec §7.3/§14.3): a fresh learner joins a PURGED **two-FSM** leader.
+/// One session carries BOTH artifacts (one `SNAP_BEGIN` per declared id, chunk
+/// offsets stream-global); the learner writes each to `snapshots/<id>/`, adopts
+/// the floor only once both landed, and each of its FSMs installs its OWN
+/// artifact and tail-replays. The first test anywhere that combines two FSMs
+/// with a below-floor join.
+#[test]
+fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
+    let _g = serialize();
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-2fsm-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    let app = "learner-join-2fsm";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        buffer_bytes: 1 << 18, // small ring: the learner's NAK from 0 falls below it
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 4096 },
+        journal_segment_bytes: SEG,
+        crypto: uc2_node::CryptoConfig::Disabled,
+        services: uc2_node::ServicesConfig::from_ids(&[0, 1], None).unwrap(),
+    };
+
+    let v_dir = dir.path().join("v0");
+    let voter = Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    let _v0 = start_sum_service(&v_dir, app, 0);
+    let _v1 = start_sum_service(&v_dir, app, 1);
+    await_until(30, "voter serves", || voter.can_serve());
+
+    // Drive well past one snapshot interval per FSM so both slots publish a
+    // position and the node floor (their min) leaves the journal's first
+    // segment behind.
+    for i in 0u64..24000 {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match voter.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+
+    let v_cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    await_until(30, "both FSMs published a snapshot", || {
+        v_cnc.service_slot(0).snapshot_pos.load_acquire() > SEG
+            && v_cnc.service_slot(1).snapshot_pos.load_acquire() > SEG
+    });
+    await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
+    let first_base = voter.archive_first_base();
+    let frontier = voter.counters().append.load_acquire();
+    let commit = voter.counters().commit.load_acquire();
+
+    // A FRESH learner joins with no prior state — and with its own two FSMs.
+    let l_dir = dir.path().join("l1");
+    let learner =
+        Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
+    let _l0 = start_sum_service(&l_dir, app, 0);
+    let _l1 = start_sum_service(&l_dir, app, 1);
+
+    await_until(60, "learner caught up across the purged prefix", || {
+        learner.counters().durable.load_acquire() >= frontier
+            && learner.counters().commit.load_acquire() >= frontier
+    });
+    assert!(
+        learner.archive_first_base() >= first_base,
+        "the learner must have adopted the shipped snapshot floor, not replayed from 0"
+    );
+
+    // Both artifacts landed, each in its OWN directory.
+    for id in [0u8, 1] {
+        let d = l_dir.join("snapshots").join(id.to_string());
+        let installed: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("snap-") && n.ends_with(".ultsnap")
+            })
+            .collect();
+        assert!(!installed.is_empty(), "learner {d:?} holds no installed artifact");
+    }
+
+    // And both learner FSMs reached the leader's commit — each installed its own
+    // artifact and tail-replayed the retained window.
+    let l_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
+    await_until(60, "both learner FSMs applied to the leader's commit", || {
+        l_cnc.service_slot(0).applied.load_acquire() >= commit
+            && l_cnc.service_slot(1).applied.load_acquire() >= commit
+    });
+    assert_eq!(
+        learner.snapshot_session_refusals(),
+        (0, 0),
+        "matching declared sets and a 0.6.0 peer: neither refusal may fire"
+    );
+    assert!(!learner.is_leader(), "a learner never leads");
+
+    learner.stop();
+    voter.stop();
+}
+
+/// Restores the process-global log sink when it goes out of scope — including
+/// on a panic, so a failing assertion below cannot leave every LATER test in
+/// this binary appending to a capture buffer nobody drains.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        uc2_node::obs::log::stderr_for_tests();
+    }
+}
+
+/// M14c (spec §8/§14.3), controller amendment 2: a joiner whose declared FSM
+/// set differs from the leader's must refuse the snapshot session **by name** —
+/// the counter increments AND the node emits `snapshot_session_refused` with
+/// `reason = "declared-set mismatch"`. Refusing keeps the joiner stalled-but-safe
+/// (it re-NAKs forever) instead of installing a set that covers only some of its
+/// FSMs; the log line plus the counter are what tell an operator which it is.
+#[test]
+fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
+    let _g = serialize();
+    let buf = uc2_node::obs::log::capture_for_tests();
+    let _restore = CaptureGuard;
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-mismatch-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    let app = "learner-mismatch";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf, services| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        buffer_bytes: 1 << 18,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+        crypto: uc2_node::CryptoConfig::Disabled,
+        services,
+    };
+
+    // The leader declares {0} (a harness node's ring mask), so every SNAP_BEGIN
+    // it sends carries `services_declared = 0b1`.
+    let v_dir = dir.path().join("v0");
+    let voter = Node::start_with_socket(
+        cfg(0, v_addr, v_dir.clone(), uc2_node::ServicesConfig::none_for_tests()),
+        v_sock,
+    )
+    .expect("start voter");
+    await_until(30, "voter serves", || voter.can_serve());
+
+    for i in 0u64..24000 {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match voter.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+
+    // Publish a floor + a real artifact for FSM 0, exactly as the single-FSM
+    // join test above does (a `none_for_tests` node publishes no aggregate).
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    let durable = voter.counters().durable.load_acquire();
+    let floor = (durable / 2) / 128 * 128;
+    assert!(floor > SEG, "need >1 segment below the floor (durable={durable})");
+    let snap_dir = v_dir.join("snapshots").join("0");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    std::fs::write(snap_dir.join(format!("snap-{floor}.ultsnap")), vec![0x5Au8; 4096]).unwrap();
+    cnc.service_slot(0).snapshot_pos.store_release(floor);
+    cnc.snapshots().service_snapshot_pos.store_release(floor);
+    await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
+
+    // The joiner declares {0, 1} — a genuine `[services] ids` mismatch.
+    let l_dir = dir.path().join("l1");
+    let learner = Node::start_with_socket(
+        cfg(1, l_addr, l_dir.clone(), uc2_node::ServicesConfig::from_ids(&[0, 1], None).unwrap()),
+        l_sock,
+    )
+    .expect("start learner");
+
+    await_until(60, "the joiner refused the mismatched session", || {
+        learner.snapshot_session_refusals().1 >= 1
+    });
+    assert_eq!(
+        learner.snapshot_session_refusals().0,
+        0,
+        "a 0.6.0 peer must never count as 'peer wire 0.5.0'"
+    );
+    await_until(30, "the refusal was named in a log line", || {
+        let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        captured.contains("snapshot_session_refused") && captured.contains("declared-set mismatch")
+    });
+    // Stalled-but-safe: nothing was half-installed under the joiner's own root.
+    assert!(
+        !l_dir.join("snapshots").join("1").join("").exists()
+            || std::fs::read_dir(l_dir.join("snapshots").join("1"))
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+        "a refused session must leave no artifact behind"
     );
 
     learner.stop();
