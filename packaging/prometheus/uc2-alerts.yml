@@ -18,7 +18,7 @@ groups:
     labels: { severity: critical }
     annotations: { summary: "{{ $labels.instance }} elected but its NewTerm frame is not quorum-committed (flags 0x01)" }
   - alert: Uc2ServiceWedged
-    expr: uc2_service_heartbeat_age_seconds > 5 and uc2_node_heartbeat_age_seconds < 3
+    expr: uc2_service_heartbeat_age_seconds{service=""} > 5 and uc2_node_heartbeat_age_seconds < 3
     for: 1m
     labels: { severity: critical }
     annotations: { summary: "apply loop wedged on {{ $labels.instance }}: node alive, service heartbeat stale" }
@@ -80,3 +80,24 @@ groups:
     for: 2m
     labels: { severity: warning }
     annotations: { summary: "{{ $labels.instance }} has less than 4 journal segments of free disk — the archive fail-stops at ENOSPC; purge or grow the disk" }
+  - alert: Uc2ServiceAbsent
+    # M14c: rendered for every DECLARED id, so an FSM that never started is a
+    # 0 sample rather than a missing series — that is what makes it
+    # alertable at all. An absent declared FSM holds min(applied) still,
+    # which closes the admission door and caps this node's durable report at
+    # the lag bound: the cluster stalls by design until it attaches.
+    expr: uc2_service_attached == 0
+    for: 30s
+    labels: { severity: critical }
+    annotations: { summary: "declared FSM {{ $labels.service }} is not attached on {{ $labels.instance }} — admission is closed and this node's report is capped at the lag bound" }
+  - alert: Uc2ServicePinnedAtLagBound
+    # Bounded mode only: uc2_fsm_lag_bytes == 0 means lockstep, where being
+    # "at the bound" is the normal steady state. `>=` not `>`: the node's own
+    # report ceiling caps commit at exactly min(applied) + fsm_lag, so a
+    # genuinely pinned FSM sits ON the bound and never past it. The
+    # on(instance) group_left join is the same idiom Uc2PeerLagging uses to
+    # compare a per-peer series against the node-scalar admission window.
+    expr: (uc2_service_lag_bytes >= on(instance) group_left uc2_fsm_lag_bytes) and on(instance) uc2_fsm_lag_bytes > 0
+    for: 30s
+    labels: { severity: warning }
+    annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }

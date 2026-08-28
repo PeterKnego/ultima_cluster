@@ -234,6 +234,8 @@ RULE_META = {
     "Uc2CleartextPeer": {"severity": "critical", "real": False, "scenario": "crypto_counters"},
     "Uc2FollowerSealFailures": {"severity": "warning", "real": False, "scenario": "crypto_counters"},
     "Uc2DiskLow": {"severity": "warning", "real": False, "scenario": "disk_low"},
+    "Uc2ServiceAbsent": {"severity": "critical", "real": True, "scenario": "service_absent"},
+    "Uc2ServicePinnedAtLagBound": {"severity": "warning", "real": True, "scenario": "fsm_pinned"},
 }
 
 
@@ -268,12 +270,36 @@ def build_Uc2LeaderNotServing():
 
 def build_Uc2ServiceWedged():
     rows = load_scenario("service_wedged")
-    svc_row = select(rows, "uc2_service_heartbeat_age_seconds", {})
+    # M14c: this family now also carries per-FSM samples. `select` compares
+    # `labels.get(k) == v`, so `None` means "this label is absent" — the
+    # aggregate row, which is what the rule's own `{service=""}` matches.
+    svc_row = select(rows, "uc2_service_heartbeat_age_seconds", {"service": None})
     node_row = select(rows, "uc2_node_heartbeat_age_seconds", {})
     r = new_rule("critical", labels_from=svc_row)  # LHS of `and`
     add_hold_last(r, svc_row, "uc2_service_heartbeat_age_seconds", 60)
     add_hold_last(r, node_row, "uc2_node_heartbeat_age_seconds", 60)
     r["eval_time"] = total_for(60)[0]
+    return r
+
+
+def build_Uc2ServiceAbsent():
+    rows = load_scenario("service_absent")
+    row = select(rows, "uc2_service_attached", {"service": "1"})
+    r = new_rule("critical", labels_from=row)  # == 0 keeps every label
+    add_hold_last(r, row, "uc2_service_attached", 30)
+    r["eval_time"] = total_for(30)[0]
+    return r
+
+
+def build_Uc2ServicePinnedAtLagBound():
+    rows = load_scenario("fsm_pinned")
+    lag_row = select(rows, "uc2_service_lag_bytes", {"service": "1"})
+    bound_row = select(rows, "uc2_fsm_lag_bytes", {})
+    # group_left keeps the LHS's `service` label; `and on(instance)` keeps it too.
+    r = new_rule("warning", labels_from=lag_row)
+    add_hold_last(r, lag_row, "uc2_service_lag_bytes", 30)
+    add_hold_last(r, bound_row, "uc2_fsm_lag_bytes", 30)
+    r["eval_time"] = total_for(30)[0]
     return r
 
 
@@ -419,6 +445,8 @@ RULE_BUILDERS = {
     "Uc2CleartextPeer": build_Uc2CleartextPeer,
     "Uc2FollowerSealFailures": build_Uc2FollowerSealFailures,
     "Uc2DiskLow": build_Uc2DiskLow,
+    "Uc2ServiceAbsent": build_Uc2ServiceAbsent,
+    "Uc2ServicePinnedAtLagBound": build_Uc2ServicePinnedAtLagBound,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

@@ -194,8 +194,8 @@
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_heartbeat_age_seconds",
-          "legendFormat": "service {{instance}}"
+          "expr": "uc2_service_heartbeat_age_seconds{service=\"\"}",
+          "legendFormat": "service (slowest) {{instance}}"
         }
       ]
     },
@@ -227,6 +227,90 @@
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "expr": "delta(uc2_receiver_dropped_total[1m])",
           "legendFormat": "receiver dropped {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Services (per FSM)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Per-FSM apply lag vs the bound",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "uc2_service_lag_bytes",
+          "legendFormat": "fsm {{service}} {{instance}}"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "uc2_fsm_lag_bytes > 0",
+          "legendFormat": "bound {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Per-FSM heartbeat age",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "uc2_service_heartbeat_age_seconds{service!=\"\"}",
+          "legendFormat": "fsm {{service}} {{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Every declared FSM attached",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 38 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "min(uc2_service_attached)",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Declared sets agreeing",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 38 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "count(count_values(\"v\", uc2_services_declared))",
+          "instant": true
         }
       ]
     }

@@ -61,6 +61,8 @@ const ALL_SCENARIOS: &[&str] = &[
     "repeated_wipes",
     "crypto_counters",
     "disk_low",
+    "service_absent",
+    "fsm_pinned",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -175,6 +177,8 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "repeated_wipes" => scenario_repeated_wipes(),
         "crypto_counters" => scenario_crypto_counters(),
         "disk_low" => scenario_disk_low(),
+        "service_absent" => scenario_service_absent(scratch_root),
+        "fsm_pinned" => scenario_fsm_pinned(scratch_root),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -618,6 +622,8 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             members[i].1,
             RING_BYTES,
             256 * 1024,
+            // Unchanged pre-M14c default declared set: `{0}`.
+            uc2_node::ServicesConfig::default(),
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
         let obs =
@@ -896,6 +902,209 @@ fn scenario_disk_low() -> (SeriesFile, Disclosure) {
     )
 }
 
+// ----------------------------------------------------------- scenario 12
+
+/// Uc2ServiceAbsent — **real**. A node declaring `{0, 1}` with only FSM 0
+/// ever attached. FSM 1's slot stays unattached for the whole capture, and
+/// the exporter renders it as `uc2_service_attached{service="1"} 0` because
+/// the per-FSM band iterates the DECLARED bitmask, not occupied slots.
+///
+/// No `wait_ready` here: `/readyz` keys on page 1's service heartbeat, which
+/// is the `min` over declared FSMs, so an absent FSM 1 holds this node at
+/// 503 forever by design. `await_stable_leader` (can_serve) is the right
+/// gate — the node is serving, it is admission that is shut.
+fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
+    let services = uc2_node::ServicesConfig::from_ids(&[0, 1], None).expect("declared set");
+    let (_dir, mut nodes) =
+        spawn_cluster_with_services(scratch_root, "svc-absent", 1, 256 * 1024, services);
+    await_stable_leader(&nodes, 20);
+
+    let instance_dir = nodes[0].instance_dir.clone();
+    let svc0 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP).service_id(0), NoopSm)
+        .start()
+        .expect("FSM 0 attaches");
+    // FSM 1 is deliberately never started.
+    let addr = nodes[0].obs_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..6 {
+        sf.record_round("n0", &scrape(addr), &["uc2_service_attached", "uc2_services_declared"]);
+        thread::sleep(Duration::from_millis(500));
+    }
+    svc0.stop();
+    nodes[0].stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "service_absent",
+            rules: &["Uc2ServiceAbsent"],
+            state: "real",
+            method: "real single-node cluster declaring services.ids = [0, 1]; FSM 0 attaches, \
+                     FSM 1 is never started. 6 real scrapes of the node's /metrics all read \
+                     uc2_service_attached{service=\"1\"} 0 (and service=\"0\" 1) — the per-FSM \
+                     band renders a row for every DECLARED id, so the absent FSM is a 0 sample, \
+                     not a missing series."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 13
+
+/// FSM 1's stand-in for `fsm_pinned`: 20 ms per apply, so it can never keep
+/// up with the load loop and the lag barrier pins the whole node to it.
+struct SlowSm;
+impl StateMachine for SlowSm {
+    type Command = ();
+    type Response = ();
+    type Query = ();
+    type QueryResponse = ();
+    fn apply(&mut self, _position: u64, _cmd: ()) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    fn query(&self, _q: ()) {}
+    fn last_applied(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// `fsm_pinned`'s payload size. 96 B + the 32 B frame header aligns to a
+/// 128 B frame, and 8192 is a whole number of those — so the door
+/// (`append - min_applied <= fsm_lag`) lands the append head exactly ON the
+/// bound or one frame past it, never straddling it. With a 64 B payload
+/// (96 B frames, 8192/96 = 85.33) the same steady state oscillates between
+/// 8160 and 8256, i.e. one frame BELOW the bound half the time, and the
+/// rule's `>=` would be adjudicating a coin flip.
+const PINNED_PAYLOAD: usize = 96;
+
+/// True when this scrape body shows the commit head level with the append
+/// head. See `scenario_fsm_pinned`'s loop for why that matters.
+fn commit_at_append_head(body: &str) -> bool {
+    let (mut append, mut commit) = (None, None);
+    for (name, _labels, v) in parse_metrics(body) {
+        match name.as_str() {
+            "uc2_append_bytes" => append = Some(v),
+            "uc2_commit_bytes" => commit = Some(v),
+            _ => {}
+        }
+    }
+    append.is_some() && append == commit
+}
+
+/// Uc2ServicePinnedAtLagBound — **real**. A node declaring `{0, 1}` with
+/// `fsm_lag = Bounded(8 KiB)` and a 256 KiB admission window, so the FSM
+/// door — not the admission window — is what stops the log. FSM 0 is a
+/// no-op, FSM 1 sleeps 20 ms per record. Under sustained load the door
+/// (`append - min_applied <= fsm_lag`) holds the backlog on the bound, and
+/// on a single-node cluster commit is that same head, so
+/// `commit - applied_1` settles at a FLAT 8320 for the whole capture:
+/// the 8192-byte bound plus one 128-byte frame, because the door is checked
+/// BEFORE a record is admitted, so the append head lands one frame past the
+/// bound and stops. (Measured 12/12 samples on 5 consecutive runs. The
+/// brief predicted exactly 8192 via `services::report_ceiling`; the
+/// ceiling is what this node REPORTS, and on a single-node cluster the
+/// commit head is its own append head, one frame past the door — hence the
+/// rule's `>=`, which holds either way.)
+///
+/// Disclosure worth reading twice: FSM 1's heartbeat also ages while it
+/// sleeps inside `apply`, so a real deployment in this state would fire
+/// `Uc2ServiceWedged` too. That is honest — an FSM this slow IS wedged from
+/// the cluster's point of view — but only `Uc2ServicePinnedAtLagBound` is
+/// adjudicated from this capture.
+fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
+    let services =
+        uc2_node::ServicesConfig::from_ids(&[0, 1], Some(uc2_node::FsmLag::Bounded(8192)))
+            .expect("declared set");
+    let (_dir, mut nodes) =
+        spawn_cluster_with_services(scratch_root, "fsm-pinned", 1, 256 * 1024, services);
+    await_stable_leader(&nodes, 20);
+
+    let instance_dir = nodes[0].instance_dir.clone();
+    let svc0 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP).service_id(0), NoopSm)
+        .start()
+        .expect("FSM 0 attaches");
+    let svc1 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP).service_id(1), SlowSm)
+        .start()
+        .expect("FSM 1 attaches");
+
+    let addr = nodes[0].obs_addr();
+    let families = ["uc2_service_lag_bytes", "uc2_fsm_lag_bytes", "uc2_service_attached"];
+    let mut sf = SeriesFile::new();
+    for _ in 0..12 {
+        // Each round: top the log up until the FSM door refuses — that
+        // refusal IS the pinned state — and scrape at that moment, so the
+        // series is a level rather than a sawtooth.
+        //
+        // Two properties of the real node make the naive form misread it,
+        // and both are worked around here rather than papered over:
+        //
+        //  - `Node::submit`'s door reads the APPEND COUNTER, which the
+        //    consensus agent advances a cycle later, while the in-process
+        //    ingress queue is 8192 records deep. An UNPACED spinner
+        //    therefore enqueues hundreds of records past the door before
+        //    the counter moves (measured: 4x the bound, then a multi-second
+        //    drain). Hence the 1 ms pace.
+        //  - `uc2_service_lag_bytes` is `commit - applied`, so it only
+        //    equals the backlog the door is holding when the commit head is
+        //    level with the append head AND the door is still shut across
+        //    the scrape. Both are checked below, and both are needed:
+        //    without the second, one sample per 12-round capture read the
+        //    drain instead of the level (measured 5 runs, dips of 3-5 KiB),
+        //    because the slow FSM applies a chunk during the HTTP round
+        //    trip and the door reopens mid-request.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let body = loop {
+            while nodes[0].n().submit(vec![0u8; PINNED_PAYLOAD]).is_ok() {
+                assert!(Instant::now() < deadline, "FSM door never shut under load");
+                thread::sleep(Duration::from_millis(1));
+            }
+            let body = scrape(addr);
+            // Was the node still pinned WHILE that scrape was taken? On this
+            // 4-core box the request's round trip is long enough (6 busy
+            // polling agents competing with the harness thread) for the slow
+            // FSM to drain part of the backlog and reopen the door mid-
+            // request; such a sample reads the drain, not the pinned state.
+            // A refused submit right after the scrape says the door was shut
+            // across it — and a `Full` probe appends nothing.
+            let still_pinned = matches!(
+                nodes[0].n().submit(vec![0u8; PINNED_PAYLOAD]),
+                Err(uc2_node::SubmitError::Full)
+            );
+            if still_pinned && commit_at_append_head(&body) {
+                break body;
+            }
+            assert!(Instant::now() < deadline, "node never held still at the lag bound");
+            thread::sleep(Duration::from_millis(10));
+        };
+        sf.record_round("n0", &body, &families);
+        // Let the slow FSM drain a few frames, so the next round genuinely
+        // refills to the bound rather than re-reading a frozen counter.
+        thread::sleep(Duration::from_millis(200));
+    }
+    svc1.stop();
+    svc0.stop();
+    nodes[0].stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "fsm_pinned",
+            rules: &["Uc2ServicePinnedAtLagBound"],
+            state: "real",
+            method: "real single-node cluster, services.ids = [0, 1], fsm_lag = 8 KiB, admission \
+                     window 256 KiB (so the FSM door binds first). FSM 1 sleeps 20 ms per apply, \
+                     and a paced load tops the log up to the door each round; each scrape is \
+                     taken while the door is verifiably still shut and the commit head is level \
+                     with the append head. 12 real scrapes read \
+                     uc2_service_lag_bytes{service=\"1\"} flat at 8320 — the 8192-byte bound \
+                     plus the one 128-byte frame the door admits before it shuts — while \
+                     uc2_fsm_lag_bytes reads 8192."
+                .into(),
+        },
+    )
+}
+
 // ============================================================ cluster kit
 //
 // Shapes copied from `uc2_node/tests/failover.rs` (spawn_cluster / NodeH /
@@ -958,6 +1167,9 @@ fn seed_for(i: usize) -> u64 {
     0xA1B2_C3D4_5566_7788 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+// One more knob than clippy likes; every one of them varies per scenario
+// and a struct here would just be `NodeConfig` again.
+#[allow(clippy::too_many_arguments)]
 fn make_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
@@ -966,6 +1178,7 @@ fn make_config(
     addr: SocketAddr,
     buffer_bytes: usize,
     admission_bytes: u64,
+    services: uc2_node::ServicesConfig,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -984,18 +1197,20 @@ fn make_config(
         purge: uc2_node::PurgePolicy::Disabled,
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc2_node::CryptoConfig::Disabled,
-        services: uc2_node::ServicesConfig::default(),
+        services,
     }
 }
 
 /// Bind every node's socket first (so the full member map is known before
 /// any agent runs), then start each on its pre-bound socket with a real obs
-/// HTTP server attached.
-fn spawn_cluster(
+/// HTTP server attached. Every declared FSM's rings and `snapshots/<id>/`
+/// are created by the node at boot, whether or not anything attaches.
+fn spawn_cluster_with_services(
     scratch_root: &Path,
     label: &str,
     n: usize,
     admission_bytes: u64,
+    services: uc2_node::ServicesConfig,
 ) -> (tempfile::TempDir, Vec<NodeH>) {
     let dir = tempfile::Builder::new()
         .prefix(&format!("m10-{label}-"))
@@ -1019,6 +1234,7 @@ fn spawn_cluster(
             addr,
             RING_BYTES,
             admission_bytes,
+            services,
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
         let obs =
@@ -1026,6 +1242,23 @@ fn spawn_cluster(
         nodes.push(NodeH { addr, instance_dir, node: Some(node), obs: Some(obs) });
     }
     (dir, nodes)
+}
+
+/// The default declared set (`{0}`, lag bound = buffer/4) — every pre-M14c
+/// scenario.
+fn spawn_cluster(
+    scratch_root: &Path,
+    label: &str,
+    n: usize,
+    admission_bytes: u64,
+) -> (tempfile::TempDir, Vec<NodeH>) {
+    spawn_cluster_with_services(
+        scratch_root,
+        label,
+        n,
+        admission_bytes,
+        uc2_node::ServicesConfig::default(),
+    )
 }
 
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
