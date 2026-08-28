@@ -87,9 +87,9 @@ wait counter climbs is the one *being* paced, i.e. a victim, not the cause.
 The cause is the id with the largest `uc2_service_lag_bytes`. Treat
 `lag_waits_total` as reliable under lockstep but an **undercount under
 bounded mode** — the apply loop only counts a wait when the cap sits on a
-frame boundary; `uc2_service_lag_bytes{service}` (what
-`Uc2ServicePinnedAtLagBound` keys on) is the trustworthy pinned-at-bound
-signal either way.
+frame boundary (the service-side fix is deferred to M14c′);
+`uc2_service_lag_bytes{service}` (what `Uc2ServicePinnedAtLagBound` keys on)
+is the trustworthy pinned-at-bound signal either way.
 
 The transition records name arrivals and departures explicitly:
 `{"event":"service_attached","node":0,"service":1,"epoch":4}` and
