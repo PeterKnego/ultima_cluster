@@ -1188,6 +1188,9 @@ pub fn submit_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
+            // M14b: this harness only ever drives FSM 0, which every node
+            // declares — naming an undeclared id here is a wiring bug.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -1235,6 +1238,8 @@ pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
             | Err(e @ ClientError::PayloadTooLarge { .. })
+            // M14b: FSM 0 only, as in `submit_cmd` above.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
         }
     }

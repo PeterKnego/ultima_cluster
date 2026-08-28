@@ -69,11 +69,11 @@ use serde::de::DeserializeOwned;
 
 use uc_protocol::ring::{RingError, RingWaitHandle};
 
-use crate::ticket::{TicketCore, ticket_pair};
+use crate::ticket::{Resolved, TicketCore, fan_in_ticket_pair, ticket_pair};
 use crate::wait::Idle;
 use crate::{
-    ClientError, Completion, Consistency, Engine, EngineConfig, EngineStats, Outcome, PollHalf,
-    SendHalf, SubmitError, Ticket, WaitStrategy,
+    ClientError, Completion, Consistency, Engine, EngineConfig, EngineStats, FanInTicket, Outcome,
+    PollHalf, SendHalf, SubmitError, Ticket, WaitStrategy,
 };
 
 /// How long `submit`/`query_*` retries `Backpressure`/`NotServing` before
@@ -118,6 +118,10 @@ impl Default for PipelinedConfig {
 /// `SendHalf` clone instead.
 pub struct PipelinedClient {
     send: Mutex<SendHalf>,
+    /// M14b: the attached node's declared-FSM bitmask, read once at connect
+    /// (it is a boot-time property of the node) — reported by
+    /// [`Self::declared`] and carried into a `ServiceNotDeclared` error.
+    declared: u64,
     stop: Arc<AtomicBool>,
     wait_handle: RingWaitHandle,
     driver: Option<std::thread::JoinHandle<()>>,
@@ -140,11 +144,24 @@ impl PipelinedClient {
             start_seq: 0,
         };
         let (send, poll) = Engine::attach(instance_dir, app_id, engine_cfg)?;
+        let declared = send.declared();
         let wait_handle = poll.wait_handle();
         let stop = Arc::new(AtomicBool::new(false));
-        let driver = spawn_driver(poll, Arc::clone(&stop), cfg.driver_wait, cfg.request_timeout)
-            .map_err(RingError::Io)?;
-        Ok(PipelinedClient { send: Mutex::new(send), stop, wait_handle, driver: Some(driver) })
+        let driver = spawn_driver(
+            poll,
+            Arc::clone(&stop),
+            cfg.driver_wait,
+            cfg.request_timeout,
+            declared,
+        )
+        .map_err(RingError::Io)?;
+        Ok(PipelinedClient {
+            send: Mutex::new(send),
+            declared,
+            stop,
+            wait_handle,
+            driver: Some(driver),
+        })
     }
 
     /// Submit a command; nonblocking apart from up to [`BACKPRESSURE_GRACE`]
@@ -184,6 +201,62 @@ impl PipelinedClient {
     ) -> Result<Ticket<QR>, ClientError> {
         let bytes = encode(q)?;
         self.dispatch(&bytes, true, |send, ud, b| send.try_query(ud, b, Consistency::Snapshot))
+    }
+
+    /// M14b: the attached node's declared-FSM set (bit i ⇔ FSM i is declared),
+    /// `0b1` on a single-service node. Naming any other id in `submit_to`/
+    /// `query_*_on` is refused at the door with
+    /// [`ClientError::ServiceNotDeclared`].
+    pub fn declared(&self) -> u64 {
+        self.declared
+    }
+
+    /// M14b: submit a command; FSM `id` answers (every declared FSM applies
+    /// it — only the named one's response is awaited). Retries transient
+    /// refusals like [`Self::submit`].
+    pub fn submit_to<C: Serialize, R: DeserializeOwned>(
+        &self,
+        id: u8,
+        cmd: &C,
+    ) -> Result<Ticket<R>, ClientError> {
+        let bytes = encode(cmd)?;
+        self.dispatch(&bytes, true, move |send, ud, b| send.try_submit_to(ud, id, b))
+    }
+
+    /// M14b: submit a command and collect EVERY declared FSM's answer in one
+    /// [`FanInTicket`], ascending by service id.
+    pub fn submit_all<C: Serialize, R: DeserializeOwned>(
+        &self,
+        cmd: &C,
+    ) -> Result<FanInTicket<R>, ClientError> {
+        let bytes = encode(cmd)?;
+        self.dispatch_with(&bytes, true, fan_in_ticket_pair::<R>, |send, ud, b| {
+            send.try_submit_all(ud, b)
+        })
+    }
+
+    /// M14b: linearizable read against FSM `id` (quorum read barrier).
+    pub fn query_linearizable_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+    ) -> Result<Ticket<QR>, ClientError> {
+        let bytes = encode(q)?;
+        self.dispatch(&bytes, true, move |send, ud, b| {
+            send.try_query_on(ud, id, b, Consistency::Linearizable)
+        })
+    }
+
+    /// M14b: snapshot (non-linearizable) read against FSM `id`.
+    pub fn query_snapshot_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+    ) -> Result<Ticket<QR>, ClientError> {
+        let bytes = encode(q)?;
+        self.dispatch(&bytes, true, move |send, ud, b| {
+            send.try_query_on(ud, id, b, Consistency::Snapshot)
+        })
     }
 
     pub fn client_id(&self) -> u32 {
@@ -249,13 +322,17 @@ impl PipelinedClient {
     /// total, `Backpressure` retried at [`RETRY_BACKPRESSURE`] and
     /// `NotServing` at [`RETRY_NOT_SERVING`]); `false` for `try_submit`
     /// (fail-fast — the first refusal maps immediately).
-    fn dispatch<R: DeserializeOwned>(
+    /// `pair`: which ticket flavour to mint — [`ticket_pair`] for a single
+    /// response, [`fan_in_ticket_pair`] for a `submit_all`. Both hand back the
+    /// same [`TicketCore`], so the reclaim accounting below is identical.
+    fn dispatch_with<T>(
         &self,
         bytes: &[u8],
         retry: bool,
+        pair: fn() -> (T, Arc<TicketCore>),
         submit_fn: impl Fn(&SendHalf, u64, &[u8]) -> Result<(), SubmitError>,
-    ) -> Result<Ticket<R>, ClientError> {
-        let (ticket, core) = ticket_pair::<R>();
+    ) -> Result<T, ClientError> {
+        let (ticket, core) = pair();
         // Key Mechanics #1: user_data = Arc::into_raw(core.clone()) as u64.
         let user_data = Arc::into_raw(core.clone()) as u64;
         let deadline = Instant::now() + BACKPRESSURE_GRACE;
@@ -294,16 +371,25 @@ impl PipelinedClient {
                     reclaim(user_data);
                     return Err(ClientError::Ring(e));
                 }
-                // M14b: `dispatch` never names a service id — `try_submit`/
-                // `try_query` both target FSM 0, which every node that runs
-                // one declares. Kept only to make the match exhaustive;
-                // Task 5 gives the id-naming tiers their own mapping.
-                Err(SubmitError::ServiceNotDeclared { .. }) => {
+                // M14b: the door refused an id that is not in the attached
+                // node's declared set — nothing reached the ring, so no
+                // completion will arrive and `user_data` is reclaimed here.
+                Err(SubmitError::ServiceNotDeclared { id, declared }) => {
                     reclaim(user_data);
-                    return Err(ClientError::Retry);
+                    return Err(ClientError::ServiceNotDeclared { id, declared });
                 }
             }
         }
+    }
+
+    /// The single-response door: [`Self::dispatch_with`] with a [`Ticket`].
+    fn dispatch<R: DeserializeOwned>(
+        &self,
+        bytes: &[u8],
+        retry: bool,
+        submit_fn: impl Fn(&SendHalf, u64, &[u8]) -> Result<(), SubmitError>,
+    ) -> Result<Ticket<R>, ClientError> {
+        self.dispatch_with(bytes, retry, ticket_pair::<R>, submit_fn)
     }
 }
 
@@ -400,6 +486,7 @@ fn spawn_driver(
     stop: Arc<AtomicBool>,
     ws: WaitStrategy,
     request_timeout: Duration,
+    declared: u64,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name("uc2-pipelined-driver".into()).spawn(move || {
         let mut guard = DriverGuard(poll);
@@ -411,17 +498,24 @@ fn spawn_driver(
             // `from_raw` for that leak.
             let core = unsafe { Arc::from_raw(c.user_data as *const TicketCore) };
             core.resolve(match c.outcome {
-                Outcome::Response(bytes) => Ok((c.position.unwrap_or(0), bytes.to_vec())),
+                Outcome::Response(bytes) => Ok(Resolved::One {
+                    position: c.position.unwrap_or(0),
+                    bytes: bytes::Bytes::copy_from_slice(bytes),
+                }),
+                // M14b: cloning the pieces out of the engine's fan-in buffer
+                // is a refcount bump each, not a payload copy.
+                Outcome::Responses(parts) => Ok(Resolved::Many {
+                    position: c.position.unwrap_or(0),
+                    parts: parts.to_vec(),
+                }),
+                // M14b: the node has no ring for the id it was handed.
+                Outcome::BadService { id } => Err(ClientError::ServiceNotDeclared { id, declared }),
                 Outcome::NotLeader { hint } => Err(ClientError::NotLeader { hint }),
                 Outcome::Retry => Err(ClientError::Retry),
                 Outcome::TimedOut => Err(ClientError::Timeout(request_timeout)),
                 Outcome::InstanceRestart { attached, current } => {
                     Err(ClientError::InstanceRestart { attached, current })
                 }
-                // M14b: unreachable on this driver today — `PipelinedClient`
-                // issues only FSM-0 requests, which never fan in and are never
-                // refused for the id. Task 5 gives them real handling.
-                Outcome::Responses(_) | Outcome::BadService { .. } => Err(ClientError::Retry),
             });
         };
         let mut idle = Idle::for_strategy(ws);
@@ -488,6 +582,22 @@ mod tests {
         MpscRing::create(&dir.join("ingress.ring"), MIB, 128).unwrap();
         MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
         BroadcastRing::create(&dir.join("egress_service.0.broadcast"), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 128).unwrap();
+    }
+
+    /// M14b: a two-FSM page (`services_declared = 0b11`) with a response ring
+    /// per declared id — mirrors `tests/engine_synthetic.rs`'s fixture of the
+    /// same name.
+    fn make_instance_two_fsms(dir: &std::path::Path, app_id: &str) {
+        use uc_protocol::ring::{BroadcastRing, MpscRing};
+        const MIB: u64 = 1 << 20;
+        let page =
+            uc2_log::cnc::CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
+        page.store_services_declared(0b11);
+        MpscRing::create(&dir.join("ingress.ring"), MIB, 128).unwrap();
+        MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
+        BroadcastRing::create(&dir.join("egress_service.0.broadcast"), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join("egress_service.1.broadcast"), MIB, 128).unwrap();
         BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 128).unwrap();
     }
 
@@ -569,5 +679,51 @@ mod tests {
         // matching disarm.
         let _arm2 = ArmGuard::new(&wh);
         drop(_arm2);
+    }
+
+    /// M14b: the fan-in tier end to end against a two-FSM page — `submit_all`
+    /// collects one piece per declared FSM in id order whatever the arrival
+    /// order, and `submit_to` an undeclared id is refused at the door with
+    /// `ServiceNotDeclared` (no ring write, no ticket left inflight).
+    #[test]
+    fn submit_all_against_a_two_fsm_page_fans_in_and_submit_to_an_undeclared_id_is_refused() {
+        use uc_protocol::ring::BroadcastRing;
+        use uc_protocol::v2::ipc::{MSG_V2_RESPONSE, extra_client};
+        // `CARGO_TARGET_TMPDIR` is not defined for a LIB unit test (cargo sets
+        // it only for integration tests/benches), so this uses `tempdir()`
+        // like the two fixtures above it — a few MiB of ring files.
+        let dir = tempfile::tempdir().unwrap();
+        make_instance_two_fsms(dir.path(), "fan");
+        let client = PipelinedClient::connect(
+            dir.path(),
+            "fan",
+            PipelinedConfig { serving_gate: false, ..PipelinedConfig::default() },
+        )
+        .unwrap();
+        assert_eq!(client.declared(), 0b11);
+        assert!(matches!(
+            client.submit_to::<u64, u64>(2, &1),
+            Err(ClientError::ServiceNotDeclared { id: 2, declared: 0b11 })
+        ));
+        let ticket = client.submit_all::<u64, u64>(&1).unwrap();
+        let cid = client.client_id();
+        let enc = |v: u64| {
+            let mut p = 4096u64.to_le_bytes().to_vec();
+            p.extend(bincode::serde::encode_to_vec(v, bincode::config::standard()).unwrap());
+            p
+        };
+        // seq 0 is this client's first request; FSM 1 answers before FSM 0.
+        BroadcastRing::open(&dir.path().join("egress_service.1.broadcast"))
+            .unwrap()
+            .producer()
+            .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &enc(11))
+            .unwrap();
+        BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
+            .unwrap()
+            .producer()
+            .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &enc(10))
+            .unwrap();
+        assert_eq!(ticket.wait().unwrap(), vec![(0, 10u64), (1, 11u64)]);
+        client.shutdown();
     }
 }

@@ -119,6 +119,48 @@ impl Client {
         self.inner.query_linearizable(q)?.wait()
     }
 
+    /// M14b: the attached node's declared-FSM set (bit i ⇔ FSM i is
+    /// declared), `0b1` on a single-service node.
+    pub fn declared(&self) -> u64 {
+        self.inner.declared()
+    }
+
+    /// M14b: submit a command; FSM `id` answers. Blocks like [`Self::submit`].
+    pub fn submit_to<C: Serialize, R: DeserializeOwned>(
+        &self,
+        id: u8,
+        cmd: &C,
+    ) -> Result<R, ClientError> {
+        self.inner.submit_to(id, cmd)?.wait()
+    }
+
+    /// M14b: submit a command and block for EVERY declared FSM's answer,
+    /// ascending by service id.
+    pub fn submit_all<C: Serialize, R: DeserializeOwned>(
+        &self,
+        cmd: &C,
+    ) -> Result<Vec<(u8, R)>, ClientError> {
+        self.inner.submit_all(cmd)?.wait()
+    }
+
+    /// M14b: snapshot (non-linearizable) read against FSM `id`.
+    pub fn query_snapshot_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+    ) -> Result<QR, ClientError> {
+        self.inner.query_snapshot_on(id, q)?.wait()
+    }
+
+    /// M14b: linearizable read against FSM `id` (quorum read barrier).
+    pub fn query_linearizable_on<Q: Serialize, QR: DeserializeOwned>(
+        &self,
+        id: u8,
+        q: &Q,
+    ) -> Result<QR, ClientError> {
+        self.inner.query_linearizable_on(id, q)?.wait()
+    }
+
     /// Stop the driver thread and fail every still-inflight request with
     /// [`ClientError::ShutDown`].
     pub fn shutdown(self) {

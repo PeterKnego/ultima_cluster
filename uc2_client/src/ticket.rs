@@ -2,18 +2,84 @@
 // Copyright 2026 Peter Knego
 
 //! Ticket<R>: a blocking handle that is also a Future (spec §7, M5 Task 5).
+//!
+//! M14b adds the fan-in twin, [`FanInTicket<R>`]: the handle a
+//! `submit_all` returns, resolving to one decoded response PER DECLARED FSM
+//! (`Vec<(u8, R)>`, ascending by id). Both wrap the same [`TicketCore`] and
+//! share its blocking/parking machinery; they differ only in the decoder they
+//! apply to the completion ([`decode_one`] vs [`decode_many`]), which is also
+//! what makes a shape mismatch (a fan-in completion on a `Ticket`, or vice
+//! versa) a [`ClientError::Decode`] rather than a silent misread.
 
 use crate::ClientError;
+use bytes::Bytes;
+use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-/// Internal state of a single-response slot.
+/// What a completion carried: one response, or a fan-in's per-FSM pieces.
+/// `Bytes` throughout (M14b deviation 1): a `Ticket`/`FanInTicket` decodes
+/// from the refcounted piece, and a caller who wants the raw bytes gets them
+/// without a copy.
+///
+/// `position` is carried for symmetry with the wire completion but discarded
+/// at this layer — a ticket resolves to the decoded value, not to a position
+/// (the pre-M14b `Result<(u64, Vec<u8>), _>` discarded it the same way).
+pub(crate) enum Resolved {
+    One {
+        #[allow(dead_code)]
+        position: u64,
+        bytes: Bytes,
+    },
+    Many {
+        #[allow(dead_code)]
+        position: u64,
+        parts: Vec<(u8, Bytes)>,
+    },
+}
+
+/// Decode a single-response completion; a fan-in completion here is a shape
+/// error, not a partial read.
+fn decode_one<R: DeserializeOwned>(r: Result<Resolved, ClientError>) -> Result<R, ClientError> {
+    match r? {
+        Resolved::One { bytes, .. } => {
+            bincode::serde::decode_from_slice::<R, _>(&bytes, bincode::config::standard())
+                .map(|(v, _)| v)
+                .map_err(|e| ClientError::Decode(e.to_string()))
+        }
+        Resolved::Many { .. } => Err(ClientError::Decode(
+            "fan-in completion on a single-response ticket".into(),
+        )),
+    }
+}
+
+/// Decode a fan-in completion piece by piece, preserving the engine's id
+/// order; the first piece that fails to decode fails the whole ticket.
+fn decode_many<R: DeserializeOwned>(
+    r: Result<Resolved, ClientError>,
+) -> Result<Vec<(u8, R)>, ClientError> {
+    match r? {
+        Resolved::Many { parts, .. } => parts
+            .into_iter()
+            .map(|(id, bytes)| {
+                bincode::serde::decode_from_slice::<R, _>(&bytes, bincode::config::standard())
+                    .map(|(v, _)| (id, v))
+                    .map_err(|e| ClientError::Decode(format!("fsm {id}: {e}")))
+            })
+            .collect(),
+        Resolved::One { .. } => Err(ClientError::Decode(
+            "single response on a fan-in ticket".into(),
+        )),
+    }
+}
+
+/// Internal state of a ticket slot.
 struct State {
-    /// None = waiting; Some(result) = resolved. Position is discarded at this layer.
-    done: Option<Result<(u64, Vec<u8>), ClientError>>,
+    /// None = waiting; Some(result) = resolved.
+    done: Option<Result<Resolved, ClientError>>,
     /// Waker to notify on resolution (Future path).
     waker: Option<Waker>,
 }
@@ -39,8 +105,9 @@ impl TicketCore {
         }
     }
 
-    /// Resolve with bytes (or an error). First resolution wins; later calls are ignored.
-    pub(crate) fn resolve(&self, r: Result<(u64, Vec<u8>), ClientError>) {
+    /// Resolve with a completion (or an error). First resolution wins; later
+    /// calls are ignored.
+    pub(crate) fn resolve(&self, r: Result<Resolved, ClientError>) {
         let mut state = self.inner.lock().unwrap();
         if state.done.is_some() {
             return; // Already resolved; ignore.
@@ -53,6 +120,51 @@ impl TicketCore {
             w.wake();
         }
     }
+
+    /// Block until resolved, then hand the (undecoded) completion over. This
+    /// call itself has no local timeout — see [`Ticket::wait`].
+    fn take_blocking(&self) -> Result<Resolved, ClientError> {
+        let mut state = self.inner.lock().unwrap();
+        loop {
+            if let Some(result) = state.done.take() {
+                return result;
+            }
+            state = self.cv.wait(state).unwrap();
+        }
+    }
+
+    /// Block until resolved or `d` elapses; on elapse, `Err(Timeout(d))`.
+    fn take_blocking_timeout(&self, d: Duration) -> Result<Resolved, ClientError> {
+        let deadline = Instant::now() + d;
+        let mut state = self.inner.lock().unwrap();
+        loop {
+            if let Some(result) = state.done.take() {
+                return result;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Timeout(d));
+            }
+            let (new_state, timed_out) = self.cv.wait_timeout(state, remaining).unwrap();
+            state = new_state;
+            if timed_out.timed_out() {
+                return Err(ClientError::Timeout(d));
+            }
+        }
+    }
+
+    /// The `Future` path: take the completion if there is one, otherwise
+    /// register `cx`'s waker and report pending.
+    fn take_polled(&self, cx: &mut Context<'_>) -> Option<Result<Resolved, ClientError>> {
+        let mut state = self.inner.lock().unwrap();
+        match state.done.take() {
+            Some(result) => Some(result),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                None
+            }
+        }
+    }
 }
 
 /// A blocking handle that is also a Future, typed for response R.
@@ -63,7 +175,7 @@ pub struct Ticket<R> {
     taken: bool,
 }
 
-impl<R: serde::de::DeserializeOwned> Ticket<R> {
+impl<R: DeserializeOwned> Ticket<R> {
     /// Block until resolved, then decode. This call itself has no local
     /// timeout — it blocks until the driver resolves the ticket. A
     /// `ClientError::Timeout` CAN still arrive, but only because the
@@ -71,57 +183,16 @@ impl<R: serde::de::DeserializeOwned> Ticket<R> {
     /// attach/connect time) resolved the underlying request as
     /// `Outcome::TimedOut`; `wait()` never imposes one on its own.
     pub fn wait(self) -> Result<R, ClientError> {
-        let mut state = self.core.inner.lock().unwrap();
-        loop {
-            if let Some(result) = state.done.take() {
-                return match result {
-                    Ok((_, bytes)) => {
-                        bincode::serde::decode_from_slice::<R, _>(
-                            &bytes,
-                            bincode::config::standard(),
-                        )
-                        .map(|(v, _)| v)
-                        .map_err(|e| ClientError::Decode(e.to_string()))
-                    }
-                    Err(e) => Err(e),
-                };
-            }
-            state = self.core.cv.wait(state).unwrap();
-        }
+        decode_one(self.core.take_blocking())
     }
 
     /// Block until resolved or timeout, then decode. Returns `Err(Timeout(d))` on timeout.
     pub fn wait_timeout(self, d: Duration) -> Result<R, ClientError> {
-        let deadline = Instant::now() + d;
-        let mut state = self.core.inner.lock().unwrap();
-        loop {
-            if let Some(result) = state.done.take() {
-                return match result {
-                    Ok((_, bytes)) => {
-                        bincode::serde::decode_from_slice::<R, _>(
-                            &bytes,
-                            bincode::config::standard(),
-                        )
-                        .map(|(v, _)| v)
-                        .map_err(|e| ClientError::Decode(e.to_string()))
-                    }
-                    Err(e) => Err(e),
-                };
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(ClientError::Timeout(d));
-            }
-            let (new_state, timed_out) = self.core.cv.wait_timeout(state, remaining).unwrap();
-            state = new_state;
-            if timed_out.timed_out() {
-                return Err(ClientError::Timeout(d));
-            }
-        }
+        decode_one(self.core.take_blocking_timeout(d))
     }
 }
 
-impl<R: serde::de::DeserializeOwned> Future for Ticket<R> {
+impl<R: DeserializeOwned> Future for Ticket<R> {
     type Output = Result<R, ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -129,24 +200,53 @@ impl<R: serde::de::DeserializeOwned> Future for Ticket<R> {
         if this.taken {
             panic!("Ticket polled after completion");
         }
-        let mut state = this.core.inner.lock().unwrap();
-        if let Some(result) = state.done.take() {
-            let output = match result {
-                Ok((_, bytes)) => {
-                    bincode::serde::decode_from_slice::<R, _>(
-                        &bytes,
-                        bincode::config::standard(),
-                    )
-                    .map(|(v, _)| v)
-                    .map_err(|e| ClientError::Decode(e.to_string()))
-                }
-                Err(e) => Err(e),
-            };
-            this.taken = true;
-            Poll::Ready(output)
-        } else {
-            state.waker = Some(cx.waker().clone());
-            Poll::Pending
+        match this.core.take_polled(cx) {
+            Some(result) => {
+                this.taken = true;
+                Poll::Ready(decode_one(result))
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// M14b: the fan-in twin of [`Ticket`] — what `submit_all` returns. Resolves
+/// to one decoded response per declared FSM, ascending by service id. Same
+/// core, same blocking/`Future` contract; only the decode differs.
+pub struct FanInTicket<R> {
+    core: Arc<TicketCore>,
+    _phantom: std::marker::PhantomData<fn() -> R>,
+    /// Tracks if poll() has already returned Ready; polling after completion panics.
+    taken: bool,
+}
+
+impl<R: DeserializeOwned> FanInTicket<R> {
+    /// Block until every declared FSM's piece has arrived, then decode them
+    /// all. Same no-local-timeout contract as [`Ticket::wait`].
+    pub fn wait(self) -> Result<Vec<(u8, R)>, ClientError> {
+        decode_many(self.core.take_blocking())
+    }
+
+    /// Block until resolved or timeout, then decode. Returns `Err(Timeout(d))` on timeout.
+    pub fn wait_timeout(self, d: Duration) -> Result<Vec<(u8, R)>, ClientError> {
+        decode_many(self.core.take_blocking_timeout(d))
+    }
+}
+
+impl<R: DeserializeOwned> Future for FanInTicket<R> {
+    type Output = Result<Vec<(u8, R)>, ClientError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.taken {
+            panic!("FanInTicket polled after completion");
+        }
+        match this.core.take_polled(cx) {
+            Some(result) => {
+                this.taken = true;
+                Poll::Ready(decode_many(result))
+            }
+            None => Poll::Pending,
         }
     }
 }
@@ -156,6 +256,17 @@ impl<R: serde::de::DeserializeOwned> Future for Ticket<R> {
 pub(crate) fn ticket_pair<R>() -> (Ticket<R>, Arc<TicketCore>) {
     let core = Arc::new(TicketCore::new());
     let ticket = Ticket {
+        core: core.clone(),
+        _phantom: std::marker::PhantomData,
+        taken: false,
+    };
+    (ticket, core)
+}
+
+/// M14b: the `fan_in_ticket_pair` twin, for `PipelinedClient::submit_all`.
+pub(crate) fn fan_in_ticket_pair<R>() -> (FanInTicket<R>, Arc<TicketCore>) {
+    let core = Arc::new(TicketCore::new());
+    let ticket = FanInTicket {
         core: core.clone(),
         _phantom: std::marker::PhantomData,
         taken: false,
@@ -206,8 +317,13 @@ mod tests {
         }
     }
 
-    fn resolved_bytes(v: u64) -> Result<(u64, Vec<u8>), crate::ClientError> {
-        Ok((7, bincode::serde::encode_to_vec(v, bincode::config::standard()).unwrap()))
+    fn resolved_bytes(v: u64) -> Result<Resolved, crate::ClientError> {
+        Ok(Resolved::One {
+            position: 7,
+            bytes: Bytes::from(
+                bincode::serde::encode_to_vec(v, bincode::config::standard()).unwrap(),
+            ),
+        })
     }
 
     #[test]
@@ -272,7 +388,7 @@ mod tests {
     #[test]
     fn decode_failure_surfaces_as_decode_error() {
         let (t, core) = ticket_pair::<String>();
-        core.resolve(Ok((0, vec![0xFF]))); // truncated bincode varint
+        core.resolve(Ok(Resolved::One { position: 0, bytes: Bytes::from_static(&[0xFF]) })); // truncated bincode varint
         assert!(matches!(t.wait(), Err(crate::ClientError::Decode(_))));
     }
 
@@ -379,5 +495,41 @@ mod tests {
             "Elapsed {:?} suspiciously low",
             elapsed
         );
+    }
+
+    #[test]
+    fn fan_in_ticket_decodes_every_piece_in_order() {
+        let (t, core) = fan_in_ticket_pair::<u64>();
+        let enc = |v: u64| {
+            Bytes::from(bincode::serde::encode_to_vec(v, bincode::config::standard()).unwrap())
+        };
+        core.resolve(Ok(Resolved::Many {
+            position: 96,
+            parts: vec![(0, enc(7)), (3, enc(9))],
+        }));
+        assert_eq!(t.wait().unwrap(), vec![(0, 7u64), (3, 9u64)]);
+    }
+
+    #[test]
+    fn a_single_response_on_a_fan_in_ticket_and_vice_versa_are_decode_errors() {
+        let (t, core) = fan_in_ticket_pair::<u64>();
+        core.resolve(Ok(Resolved::One {
+            position: 96,
+            bytes: Bytes::from_static(&[7, 0, 0, 0, 0, 0, 0, 0]),
+        }));
+        assert!(matches!(t.wait(), Err(ClientError::Decode(_))));
+        let (t1, core1) = ticket_pair::<u64>();
+        core1.resolve(Ok(Resolved::Many { position: 96, parts: vec![] }));
+        assert!(matches!(t1.wait(), Err(ClientError::Decode(_))));
+    }
+
+    #[test]
+    fn fan_in_ticket_error_resolution_surfaces_the_error() {
+        let (t, core) = fan_in_ticket_pair::<u64>();
+        core.resolve(Err(ClientError::ServiceNotDeclared { id: 4, declared: 0b11 }));
+        assert!(matches!(
+            t.wait(),
+            Err(ClientError::ServiceNotDeclared { id: 4, declared: 0b11 })
+        ));
     }
 }

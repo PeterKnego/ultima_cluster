@@ -67,5 +67,5 @@ pub use engine::{
 };
 pub use error::ClientError;
 pub use pipelined::{PipelinedClient, PipelinedConfig};
-pub use ticket::Ticket;
+pub use ticket::{FanInTicket, Ticket};
 pub use wait::WaitStrategy;

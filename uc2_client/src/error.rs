@@ -74,6 +74,11 @@ pub enum ClientError {
     /// command/query, or bincode-decoding the returned response.
     #[error("(de)serialization error: {0}")]
     Decode(String),
+    /// M14b: `id` is not a declared FSM on the attached node — refused at the
+    /// door (`SubmitError::ServiceNotDeclared`) or answered by the node
+    /// (`MSG_V2_BAD_SERVICE`, when the node has no ring for it). No side effect.
+    #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
+    ServiceNotDeclared { id: u8, declared: u64 },
     /// The client was shut down while this request was still in flight.
     #[error("client shut down")]
     ShutDown,
