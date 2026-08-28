@@ -49,6 +49,29 @@ fn make_instance_caps(dir: &Path, app_id: &str, ingress_cap: u64, egress_cap: u6
     make_instance(dir, app_id, ingress_cap, egress_cap);
 }
 
+/// A synthetic dir whose page declares FSMs {0, 1} and has both egress rings.
+fn make_instance_two_fsms(dir: &Path, app_id: &str) {
+    let page = CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
+    page.store_services_declared(0b11);
+    MpscRing::create(&dir.join("ingress.ring"), MIB, 128).unwrap();
+    MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
+    BroadcastRing::create(&dir.join("egress_service.0.broadcast"), MIB, 128).unwrap();
+    BroadcastRing::create(&dir.join("egress_service.1.broadcast"), MIB, 128).unwrap();
+    BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 128).unwrap();
+}
+
+/// Egress producer for FSM `id`'s ring.
+fn egress_for(dir: &Path, id: u8) -> uc_protocol::ring::BroadcastProducer {
+    BroadcastRing::open(&dir.join(format!("egress_service.{id}.broadcast"))).unwrap().producer()
+}
+
+/// `MSG_V2_RESPONSE` payload: `position ++ body`.
+fn response(position: u64, body: &[u8]) -> Vec<u8> {
+    let mut p = position.to_le_bytes().to_vec();
+    p.extend_from_slice(body);
+    p
+}
+
 fn cfg() -> EngineConfig {
     EngineConfig { serving_gate: false, ..EngineConfig::default() }
 }
@@ -163,7 +186,8 @@ fn try_query_is_gated_the_same_way_as_try_submit() {
 }
 
 use uc_protocol::v2::ipc::{
-    FLAG_V2_IS_QUERY, MSG_V2_NOT_LEADER, MSG_V2_RESPONSE, MSG_V2_RETRY, extra_client,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_QUERY,
+    MSG_V2_RESPONSE, MSG_V2_RETRY, extra_client,
 };
 
 /// Collect completions into owned tuples (payload copied out of the borrow).
@@ -173,7 +197,15 @@ fn drain(poll: &mut uc2_client::PollHalf) -> Vec<(u64, Option<u64>, String)> {
         let tag = match &c.outcome {
             uc2_client::Outcome::Response(b) => format!("resp:{}", b.len()),
             uc2_client::Outcome::NotLeader { hint } => format!("notleader:{hint:?}"),
+            uc2_client::Outcome::Responses(parts) => format!(
+                "responses:{:?}",
+                parts
+                    .iter()
+                    .map(|(id, b)| (*id, String::from_utf8_lossy(b).into_owned()))
+                    .collect::<Vec<_>>()
+            ),
             uc2_client::Outcome::Retry => "retry".into(),
+            uc2_client::Outcome::BadService { id } => format!("badservice:{id}"),
             uc2_client::Outcome::TimedOut => "timeout".into(),
             uc2_client::Outcome::InstanceRestart { .. } => "restart".into(),
         };
@@ -395,4 +427,182 @@ fn wire_seq_wrap_roundtrips_through_a_real_ring() {
         prod.write(MSG_V2_RESPONSE, 0, extra_client(s.client_id(), wire), &payload).unwrap();
         assert_eq!(drain(&mut p), vec![(i, Some(i), "resp:1".to_string())], "iteration {i}");
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// M14b: N egress rings, the query prefix, per-ring matching and the fan-in.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn attach_opens_every_declared_ring_and_default_submit_ignores_the_other_fsm() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "two");
+    let (send, mut poll) = Engine::attach(dir.path(), "two", cfg()).unwrap();
+    assert_eq!(send.declared(), 0b11);
+    let cid = send.client_id();
+    send.try_submit(1, b"x").unwrap(); // expects FSM 0 only
+    // FSM 1 answers first (it is faster today): not ours, dropped and counted.
+    egress_for(dir.path(), 1)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"one"))
+        .unwrap();
+    assert!(drain(&mut poll).is_empty());
+    assert_eq!(poll.stats().wrong_ring, 1);
+    egress_for(dir.path(), 0)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"zero"))
+        .unwrap();
+    assert_eq!(drain(&mut poll), vec![(1, Some(96), "resp:4".to_string())]);
+    assert_eq!(poll.stats().responses, 1);
+}
+
+#[test]
+fn submit_all_fans_in_every_declared_ring_in_id_order_whatever_the_arrival_order() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "all");
+    let (send, mut poll) = Engine::attach(dir.path(), "all", cfg()).unwrap();
+    let cid = send.client_id();
+    send.try_submit_all(2, b"x").unwrap();
+    egress_for(dir.path(), 1)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(4096, b"b"))
+        .unwrap();
+    assert!(drain(&mut poll).is_empty(), "one of two pieces: not complete");
+    assert_eq!(send.inflight(), 1);
+    egress_for(dir.path(), 0)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(4096, b"a"))
+        .unwrap();
+    assert_eq!(
+        drain(&mut poll),
+        vec![(2, Some(4096), "responses:[(0, \"a\"), (1, \"b\")]".to_string())],
+        "ordered by id, not by arrival"
+    );
+    assert_eq!(send.inflight(), 0);
+    // A late duplicate from ring 0 is a Miss (the slot is free), not a second completion.
+    egress_for(dir.path(), 0)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(4096, b"a"))
+        .unwrap();
+    assert!(drain(&mut poll).is_empty());
+    assert_eq!(poll.stats().duplicates, 1);
+}
+
+#[test]
+fn submit_to_expects_only_the_named_ring() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "to");
+    let (send, mut poll) = Engine::attach(dir.path(), "to", cfg()).unwrap();
+    let cid = send.client_id();
+    send.try_submit_to(3, 1, b"x").unwrap();
+    egress_for(dir.path(), 0)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"zero"))
+        .unwrap();
+    assert!(drain(&mut poll).is_empty());
+    assert_eq!(poll.stats().wrong_ring, 1);
+    egress_for(dir.path(), 1)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"one"))
+        .unwrap();
+    assert_eq!(drain(&mut poll), vec![(3, Some(96), "resp:3".to_string())]);
+}
+
+#[test]
+fn an_undeclared_or_out_of_range_id_is_refused_at_the_door() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "undecl");
+    let (send, _poll) = Engine::attach(dir.path(), "undecl", cfg()).unwrap();
+    assert!(matches!(
+        send.try_submit_to(4, 2, b"x"),
+        Err(SubmitError::ServiceNotDeclared { id: 2, declared: 0b11 })
+    ));
+    assert!(matches!(
+        send.try_query_on(4, 9, b"q", Consistency::Snapshot),
+        Err(SubmitError::ServiceNotDeclared { id: 9, declared: 0b11 })
+    ));
+    assert_eq!(send.inflight(), 0, "a door refusal never claims a slot");
+    // A harness page (declared 0) folds to {0}: id 1 is refused, id 0 accepted.
+    let dir0 = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir0.path(), "harness", MIB, MIB);
+    let (send0, _p0) = Engine::attach(dir0.path(), "harness", cfg()).unwrap();
+    assert_eq!(send0.declared(), 0b1);
+    assert!(matches!(
+        send0.try_submit_to(5, 1, b"x"),
+        Err(SubmitError::ServiceNotDeclared { id: 1, declared: 0b1 })
+    ));
+    send0.try_submit_to(5, 0, b"x").unwrap();
+}
+
+#[test]
+fn try_query_on_writes_the_service_id_prefix_and_counts_it_toward_the_cap() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "prefix");
+    let (send, _poll) =
+        Engine::attach(dir.path(), "prefix", EngineConfig { max_payload: Some(4), ..cfg() })
+            .unwrap();
+    let (_qp, mut qc) = MpscRing::open(&dir.path().join("query.ring")).unwrap().into_split();
+    send.try_query_on(6, 1, b"zz", Consistency::Linearizable).unwrap();
+    let mut buf = Vec::new();
+    let rec = qc.try_read(&mut buf).unwrap().expect("one query record");
+    assert_eq!(rec.msg_type, MSG_V2_QUERY);
+    assert_eq!(rec.flags, FLAG_V2_LINEARIZABLE);
+    assert_eq!(buf, [1, b'z', b'z'], "service_id ++ query");
+    // The cap counts the wire payload: 4 query bytes + 1 prefix = 5 > 4.
+    assert!(matches!(
+        send.try_query_on(7, 0, b"zzzz", Consistency::Snapshot),
+        Err(SubmitError::PayloadTooLarge { len: 5, max: 4 })
+    ));
+    // A submit has no prefix: 4 bytes fit exactly.
+    send.try_submit(8, b"zzzz").unwrap();
+}
+
+#[test]
+fn bad_service_on_the_node_ring_resolves_kind_agnostic_with_the_id() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "bad");
+    let (send, mut poll) = Engine::attach(dir.path(), "bad", cfg()).unwrap();
+    let cid = send.client_id();
+    send.try_query_on(9, 1, b"q", Consistency::Snapshot).unwrap();
+    egress_node(dir.path()).write(MSG_V2_BAD_SERVICE, 0, extra_client(cid, 0), &[1]).unwrap();
+    assert_eq!(drain(&mut poll), vec![(9, None, "badservice:1".to_string())]);
+    assert_eq!(poll.stats().bad_service, 1);
+    assert_eq!(send.inflight(), 0);
+}
+
+#[test]
+fn a_terminal_answer_ends_a_partial_fan_in_and_late_pieces_are_duplicates() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance_two_fsms(dir.path(), "term");
+    let (send, mut poll) = Engine::attach(dir.path(), "term", cfg()).unwrap();
+    let cid = send.client_id();
+    send.try_submit_all(10, b"x").unwrap();
+    egress_for(dir.path(), 1)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"b"))
+        .unwrap();
+    assert!(drain(&mut poll).is_empty());
+    egress_node(dir.path()).write(MSG_V2_RETRY, 0, extra_client(cid, 0), &[]).unwrap();
+    assert_eq!(drain(&mut poll), vec![(10, None, "retry".to_string())]);
+    egress_for(dir.path(), 0)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"a"))
+        .unwrap();
+    assert!(drain(&mut poll).is_empty());
+    assert_eq!(poll.stats().duplicates, 1);
+}
+
+/// Ruling A: `fan_in` is the CLAIM-TIME flag, not the mask width — a
+/// `try_submit_all` on a node that declares only FSM 0 still completes as
+/// `Outcome::Responses` with one piece, so a caller's match arm does not
+/// depend on how many FSMs the node happens to run.
+#[test]
+fn submit_all_on_a_single_fsm_page_completes_as_responses_with_one_piece() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "one-fsm", MIB, MIB);
+    let (send, mut poll) = Engine::attach(dir.path(), "one-fsm", cfg()).unwrap();
+    assert_eq!(send.declared(), 0b1);
+    let cid = send.client_id();
+    send.try_submit_all(11, b"x").unwrap();
+    egress_for(dir.path(), 0)
+        .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(96, b"a"))
+        .unwrap();
+    assert_eq!(
+        drain(&mut poll),
+        vec![(11, Some(96), "responses:[(0, \"a\")]".to_string())]
+    );
+    assert_eq!(send.inflight(), 0);
+    assert_eq!(poll.stats().responses, 1);
 }

@@ -294,6 +294,14 @@ impl PipelinedClient {
                     reclaim(user_data);
                     return Err(ClientError::Ring(e));
                 }
+                // M14b: `dispatch` never names a service id — `try_submit`/
+                // `try_query` both target FSM 0, which every node that runs
+                // one declares. Kept only to make the match exhaustive;
+                // Task 5 gives the id-naming tiers their own mapping.
+                Err(SubmitError::ServiceNotDeclared { .. }) => {
+                    reclaim(user_data);
+                    return Err(ClientError::Retry);
+                }
             }
         }
     }
@@ -410,6 +418,10 @@ fn spawn_driver(
                 Outcome::InstanceRestart { attached, current } => {
                     Err(ClientError::InstanceRestart { attached, current })
                 }
+                // M14b: unreachable on this driver today — `PipelinedClient`
+                // issues only FSM-0 requests, which never fan in and are never
+                // refused for the id. Task 5 gives them real handling.
+                Outcome::Responses(_) | Outcome::BadService { .. } => Err(ClientError::Retry),
             });
         };
         let mut idle = Idle::for_strategy(ws);

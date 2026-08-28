@@ -16,6 +16,7 @@ categories.workspace = true
 [dependencies]
 uc_protocol = { path = "../uc_protocol", version = "2.7.0" }
 uc2_log = { path = "../uc2_log", version = "2.7.0" }
+bytes = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }

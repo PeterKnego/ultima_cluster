@@ -705,7 +705,11 @@ fn run_client_measurement(
                             Outcome::Retry => {
                                 retried.fetch_add(1, Ordering::Relaxed);
                             }
-                            Outcome::TimedOut | Outcome::InstanceRestart { .. } => {
+                            // A bench never issues a fan-in or names an id.
+                            Outcome::TimedOut
+                            | Outcome::InstanceRestart { .. }
+                            | Outcome::Responses(_)
+                            | Outcome::BadService { .. } => {
                                 lost.fetch_add(1, Ordering::Relaxed);
                             }
                         }

@@ -3,10 +3,10 @@
 
 //! The pipelined engine (spec §4): bytes-level, io_uring-shaped attach +
 //! send/poll split. [`Engine::attach`] opens a node's shmem IPC (cnc v2
-//! page, ingress/query MPSC rings, node/service broadcast egress) under an
-//! instance directory and returns a [`SendHalf`] (cheap to `Clone`, one per
-//! submitter thread) paired with a single-owner [`PollHalf`] that drains
-//! completions.
+//! page, ingress/query MPSC rings, the node broadcast and — M14b — one
+//! service broadcast per declared FSM) under an instance directory and
+//! returns a [`SendHalf`] (cheap to `Clone`, one per submitter thread)
+//! paired with a single-owner [`PollHalf`] that drains completions.
 //!
 //! ## The central contract
 //!
@@ -30,19 +30,22 @@
 //! `bincode(Response)` against today's SDK. See spec §4:
 //! `docs/superpowers/specs/2026-08-13-uc2-pipelined-client-design.md`.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use uc2_log::cnc::CncPage;
 use uc_protocol::ring::{
     BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing, RecordHeader, RingError,
 };
-use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
+use uc_protocol::v2::cnc::{CNC_MAX_SERVICES, NODE_FLAG_CAN_SERVE};
 use uc_protocol::v2::ipc::{
-    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
-    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_QUERY,
+    MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+    write_query_payload,
 };
 
 use crate::error::ClientError;
@@ -55,9 +58,12 @@ use crate::slots::{ReqKind, Resolve, SlotTable};
 pub(crate) const CNC_FILE: &str = "cnc2.dat";
 pub(crate) const INGRESS_RING: &str = "ingress.ring";
 pub(crate) const QUERY_RING: &str = "query.ring";
-/// M14a: FSM 0's ring — the default responder. M14b opens every declared id's ring.
-pub(crate) const EGRESS_SERVICE: &str = "egress_service.0.broadcast";
 pub(crate) const EGRESS_NODE: &str = "egress_node.broadcast";
+
+/// M14b: FSM `id`'s response ring. The engine opens one per declared id.
+pub(crate) fn egress_service_ring(id: u8) -> String {
+    format!("egress_service.{id}.broadcast")
+}
 
 /// Engine attach configuration.
 pub struct EngineConfig {
@@ -127,6 +133,10 @@ pub enum SubmitError {
     InstanceRestart { attached: u128, current: u128 },
     #[error("ring error: {0}")]
     Ring(RingError),
+    /// M14b: `id` is not in the attached node's declared set (or `>= 8`).
+    /// Refused at the door — no slot claimed, nothing written.
+    #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
+    ServiceNotDeclared { id: u8, declared: u64 },
 }
 
 /// Per-field completion counters, `Relaxed`-loaded into an [`EngineStats`]
@@ -144,6 +154,8 @@ struct StatCells {
     retry: AtomicU64,
     timed_out: AtomicU64,
     restarts: AtomicU64,
+    wrong_ring: AtomicU64,
+    bad_service: AtomicU64,
 }
 
 impl StatCells {
@@ -159,6 +171,8 @@ impl StatCells {
             retry: self.retry.load(Ordering::Relaxed),
             timed_out: self.timed_out.load(Ordering::Relaxed),
             restarts: self.restarts.load(Ordering::Relaxed),
+            wrong_ring: self.wrong_ring.load(Ordering::Relaxed),
+            bad_service: self.bad_service.load(Ordering::Relaxed),
         }
     }
 }
@@ -176,6 +190,11 @@ pub struct EngineStats {
     pub retry: u64,
     pub timed_out: u64,
     pub restarts: u64,
+    /// M14b: a RESPONSE from a ring the request did not expect — a sibling
+    /// FSM's answer to a request that named another; dropped.
+    pub wrong_ring: u64,
+    /// M14b: `MSG_V2_BAD_SERVICE` answers (the node has no ring for the id).
+    pub bad_service: u64,
 }
 
 /// State shared between a [`SendHalf`] (cloned, one per submitter thread) and
@@ -192,6 +211,9 @@ struct Shared {
     timeout_ns: u64,
     max_payload: Option<usize>,
     serving_gate: bool,
+    /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
+    /// reading 0 (a harness node) folds to `0b1`.
+    declared: u64,
 }
 
 /// Namespace for [`Engine::attach`].
@@ -205,21 +227,55 @@ pub struct SendHalf {
     shared: Arc<Shared>,
     ingress: MpscProducer,
     query: MpscProducer,
+    /// M14b: assembly buffer for a query's `service_id ++ query` wire payload
+    /// (one `try_write` takes one slice). `SendHalf` is `!Sync`, so this
+    /// `RefCell` is never contended.
+    scratch: RefCell<Vec<u8>>,
 }
 
-/// The completion side: single owner, `Send`. `poll` (Task 4) drains
-/// completions in one bounded, zero-alloc duty cycle.
+/// The completion side: single owner, `Send`. `poll` drains completions in
+/// one bounded duty cycle (zero-alloc except a fan-in's buffered pieces).
 pub struct PollHalf {
     shared: Arc<Shared>,
-    egress_service: BroadcastConsumer,
+    /// One consumer per declared FSM, ascending id (FSM 0 first).
+    egress_services: Vec<(u8, BroadcastConsumer)>,
     egress_node: BroadcastConsumer,
     buf: Vec<u8>,
+    /// M14b fan-in buffer, one entry per slot index: the pieces of a
+    /// `try_submit_all` that have arrived so far. Keyed by the slot's wire
+    /// seq so a reused index never mixes generations; a swept slot's stale
+    /// pieces stay until the index is reused (bounded: ≤ 8 pieces per slot).
+    fanin: Vec<FanIn>,
     cycle: u64,
 }
 
+/// The pieces of one in-flight fan-in, buffered until the last one lands.
+#[derive(Default)]
+struct FanIn {
+    seq: u32,
+    position: u64,
+    /// `Bytes`, not `Vec<u8>`: refcounted from here to the caller (deviation 1).
+    parts: Vec<(u8, Bytes)>,
+}
+
+impl FanIn {
+    /// Record one piece; a different wire seq means the slot index was
+    /// reused — start over for the new generation.
+    fn push_piece(&mut self, seq: u32, position: u64, ring: u8, body: &[u8]) {
+        if self.seq != seq || self.parts.is_empty() {
+            self.seq = seq;
+            self.position = position;
+            self.parts.clear();
+        }
+        self.parts.push((ring, Bytes::copy_from_slice(body)));
+    }
+}
+
 /// One resolved completion, handed to the callback passed to [`PollHalf::poll`].
-/// `position` is `Some` only for [`Outcome::Response`] (the wire's `u64` LE
-/// prefix, stripped from `outcome`'s borrowed payload).
+/// `position` is `Some` only for [`Outcome::Response`] and
+/// [`Outcome::Responses`] (the wire's `u64` LE prefix, stripped from
+/// `outcome`'s borrowed payload; for a fan-in, the first piece to arrive —
+/// one submitted frame commits at one position, so every piece carries it).
 pub struct Completion<'a> {
     pub user_data: u64,
     pub position: Option<u64>,
@@ -233,11 +289,18 @@ pub enum Outcome<'a> {
     /// A `MSG_V2_RESPONSE` payload, borrowed from the engine's read buffer
     /// (the wire's `position: u64 LE` prefix already stripped).
     Response(&'a [u8]),
+    /// M14b: a completed `try_submit_all` — one `(service_id, response)` per
+    /// declared FSM, ascending by id, all for the same log position. `Bytes`
+    /// so the pieces travel refcounted to the caller (deviation 1).
+    Responses(&'a [(u8, Bytes)]),
     /// A `MSG_V2_NOT_LEADER` redirect; `hint` is `None` when the node doesn't
     /// know the current leader (wire sentinel `u64::MAX`).
     NotLeader { hint: Option<u32> },
     /// A `MSG_V2_RETRY` transient signal: no side effect happened yet.
     Retry,
+    /// M14b: the node has no ring for the requested id (`MSG_V2_BAD_SERVICE`).
+    /// Pre-side-effect, like `Retry`.
+    BadService { id: u8 },
     /// The per-request deadline elapsed with no answer (includes anything
     /// lost to a broadcast overwrite — see `drain_ring`'s `Overwritten` arm).
     TimedOut,
@@ -265,7 +328,20 @@ impl Engine {
         let max_payload = cfg.max_payload.or(Some(cnc.meta().max_payload as usize));
         let (ingress, _ic) = MpscRing::open(&instance_dir.join(INGRESS_RING))?.into_split();
         let (query, _qc) = MpscRing::open(&instance_dir.join(QUERY_RING))?.into_split();
-        let egress_service = BroadcastRing::open(&instance_dir.join(EGRESS_SERVICE))?.subscribe();
+        // M14b: which FSMs exist here. A page reading 0 is a harness node
+        // (nothing declared, FSM 0 ringed) — the same fold every attacher uses.
+        let declared = match cnc.services_declared() {
+            0 => 0b1,
+            d => d,
+        };
+        let mut egress_services = Vec::new();
+        for id in 0..CNC_MAX_SERVICES as u8 {
+            if declared & (1u64 << id) != 0 {
+                let ring =
+                    BroadcastRing::open(&instance_dir.join(egress_service_ring(id)))?.subscribe();
+                egress_services.push((id, ring));
+            }
+        }
         let egress_node = BroadcastRing::open(&instance_dir.join(EGRESS_NODE))?.subscribe();
         let shared = Arc::new(Shared {
             cnc,
@@ -279,15 +355,30 @@ impl Engine {
             timeout_ns: cfg.request_timeout.as_nanos() as u64,
             max_payload,
             serving_gate: cfg.serving_gate,
+            declared,
         });
+        let slots = shared.table.slot_count();
         Ok((
-            SendHalf { shared: Arc::clone(&shared), ingress, query },
-            PollHalf { shared, egress_service, egress_node, buf: Vec::new(), cycle: 0 },
+            SendHalf {
+                shared: Arc::clone(&shared),
+                ingress,
+                query,
+                scratch: RefCell::new(Vec::new()),
+            },
+            PollHalf {
+                shared,
+                egress_services,
+                egress_node,
+                buf: Vec::new(),
+                fanin: (0..slots).map(|_| FanIn::default()).collect(),
+                cycle: 0,
+            },
         ))
     }
 }
 
 impl SendHalf {
+    #[allow(clippy::too_many_arguments)]
     fn send(
         &self,
         ring: &MpscProducer,
@@ -296,6 +387,9 @@ impl SendHalf {
         kind: ReqKind,
         user_data: u64,
         bytes: &[u8],
+        expected: u8,
+        fan_in: bool,
+        prefix: Option<u8>,
     ) -> Result<(), SubmitError> {
         let s = &self.shared;
         if s.dead.load(Ordering::Acquire) {
@@ -305,28 +399,97 @@ impl SendHalf {
         if s.serving_gate && s.cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
             return Err(SubmitError::NotServing);
         }
+        // The cap describes the WIRE payload (deviation 6): a query carries
+        // its one-byte service id.
+        let wire_len = bytes.len() + usize::from(prefix.is_some());
         if let Some(max) = s.max_payload
-            && bytes.len() > max
+            && wire_len > max
         {
-            return Err(SubmitError::PayloadTooLarge { len: bytes.len(), max });
+            return Err(SubmitError::PayloadTooLarge { len: wire_len, max });
         }
         let deadline_ns = s.t0.elapsed().as_nanos() as u64 + s.timeout_ns;
         let seq = s
             .table
-            .claim(user_data, kind, deadline_ns, 0b1, false)
+            .claim(user_data, kind, deadline_ns, expected, fan_in)
             .map_err(|_| SubmitError::Backpressure)?; // WindowFull and SlotBusy alike
-        let write_result = ring.try_write(msg_type, flags, extra_client(s.client_id, seq as u32), bytes);
+        let extra = extra_client(s.client_id, seq as u32);
+        let write_result = match prefix {
+            None => ring.try_write(msg_type, flags, extra, bytes),
+            Some(id) => {
+                // One `try_write` takes one slice: assemble `id ++ bytes` in
+                // this half's scratch (SendHalf is !Sync; the RefCell is never
+                // contended).
+                let mut scratch = self.scratch.borrow_mut();
+                write_query_payload(id, bytes, &mut scratch);
+                ring.try_write(msg_type, flags, extra, &scratch)
+            }
+        };
         finish_write(&s.table, &s.stats, seq, write_result)
     }
 
-    /// Submit a command; nonblocking. See the module's central contract: an
-    /// `Ok(())` here obligates the engine to eventually deliver exactly one
-    /// completion for `user_data` via [`PollHalf::poll`] (Task 4).
-    pub fn try_submit(&self, user_data: u64, cmd_bytes: &[u8]) -> Result<(), SubmitError> {
-        self.send(&self.ingress, MSG_V2_SUBMIT, 0, ReqKind::Submit, user_data, cmd_bytes)
+    /// The ring bitmask for a declared id, or the door refusal.
+    fn expect_one(&self, id: u8) -> Result<u8, SubmitError> {
+        let declared = self.shared.declared;
+        if (id as usize) < CNC_MAX_SERVICES && declared & (1u64 << id) != 0 {
+            Ok(1u8 << id)
+        } else {
+            Err(SubmitError::ServiceNotDeclared { id, declared })
+        }
     }
 
-    /// Issue a read; nonblocking. `query_bytes` must decode as
+    /// The declared set this engine attached to (bit i ⇔ FSM i), `0b1` on a
+    /// harness node.
+    pub fn declared(&self) -> u64 {
+        self.shared.declared
+    }
+
+    /// Submit a command; FSM 0 answers. Nonblocking. See the module's central
+    /// contract: an `Ok(())` here obligates the engine to eventually deliver
+    /// exactly one completion for `user_data` via [`PollHalf::poll`].
+    pub fn try_submit(&self, user_data: u64, cmd_bytes: &[u8]) -> Result<(), SubmitError> {
+        self.try_submit_to(user_data, 0, cmd_bytes)
+    }
+
+    /// M14b: submit a command; FSM `id` answers (every declared FSM applies
+    /// it — only the named one's response is awaited).
+    pub fn try_submit_to(
+        &self,
+        user_data: u64,
+        id: u8,
+        cmd_bytes: &[u8],
+    ) -> Result<(), SubmitError> {
+        let expected = self.expect_one(id)?;
+        self.send(
+            &self.ingress,
+            MSG_V2_SUBMIT,
+            0,
+            ReqKind::Submit,
+            user_data,
+            cmd_bytes,
+            expected,
+            false,
+            None,
+        )
+    }
+
+    /// M14b: submit a command and collect EVERY declared FSM's answer
+    /// ([`Outcome::Responses`], ascending by id, one completion).
+    pub fn try_submit_all(&self, user_data: u64, cmd_bytes: &[u8]) -> Result<(), SubmitError> {
+        let expected = self.shared.declared as u8; // ids < 8 ⇒ the mask fits
+        self.send(
+            &self.ingress,
+            MSG_V2_SUBMIT,
+            0,
+            ReqKind::Submit,
+            user_data,
+            cmd_bytes,
+            expected,
+            true,
+            None,
+        )
+    }
+
+    /// Issue a read against FSM 0; nonblocking. `query_bytes` must decode as
     /// `bincode(Query)` against today's SDK (see the module's byte contract).
     pub fn try_query(
         &self,
@@ -334,11 +497,33 @@ impl SendHalf {
         query_bytes: &[u8],
         c: Consistency,
     ) -> Result<(), SubmitError> {
+        self.try_query_on(user_data, 0, query_bytes, c)
+    }
+
+    /// M14b: issue a read against FSM `id`. The wire payload is `id ++ query`.
+    pub fn try_query_on(
+        &self,
+        user_data: u64,
+        id: u8,
+        query_bytes: &[u8],
+        c: Consistency,
+    ) -> Result<(), SubmitError> {
+        let expected = self.expect_one(id)?;
         let flags = match c {
             Consistency::Linearizable => FLAG_V2_LINEARIZABLE,
             Consistency::Snapshot => 0,
         };
-        self.send(&self.query, MSG_V2_QUERY, flags, ReqKind::Query, user_data, query_bytes)
+        self.send(
+            &self.query,
+            MSG_V2_QUERY,
+            flags,
+            ReqKind::Query,
+            user_data,
+            query_bytes,
+            expected,
+            false,
+            Some(id),
+        )
     }
 
     pub fn client_id(&self) -> u32 {
@@ -430,23 +615,29 @@ impl Clone for SendHalf {
             shared: Arc::clone(&self.shared),
             ingress: self.ingress.clone(), // per-clone producer cache (MpscProducer contract)
             query: self.query.clone(),
+            scratch: RefCell::new(Vec::new()), // per-clone assembly buffer
         }
     }
 }
 
 impl PollHalf {
     /// Drain and dispatch completions in one bounded duty cycle: up to 128
-    /// records off each broadcast (service first, then node), plus — every
-    /// 64th call — the amortized restart check and deadline sweep. `cb` is
-    /// called once per resolved completion; returns the total emitted.
+    /// records off each broadcast (every declared FSM's ring in ascending id
+    /// order, then the node ring), plus — every 64th call — the amortized
+    /// restart check and deadline sweep. `cb` is called once per resolved
+    /// completion; returns the total emitted.
     pub fn poll(&mut self, mut cb: impl FnMut(Completion<'_>)) -> usize {
         self.cycle += 1;
+        let maint = self.cycle.is_multiple_of(64);
+        let PollHalf { shared, egress_services, egress_node, buf, fanin, .. } = self;
         let mut emitted = 0usize;
-        if self.cycle.is_multiple_of(64) {
-            emitted += maintenance(&self.shared, &mut cb);
+        if maint {
+            emitted += maintenance(shared, &mut cb);
         }
-        emitted += drain_ring(&mut self.egress_service, &self.shared, &mut self.buf, &mut cb);
-        emitted += drain_ring(&mut self.egress_node, &self.shared, &mut self.buf, &mut cb);
+        for (id, ring) in egress_services.iter_mut() {
+            emitted += drain_ring(ring, Some(*id), shared, buf, fanin, &mut cb);
+        }
+        emitted += drain_ring(egress_node, None, shared, buf, fanin, &mut cb);
         emitted
     }
 
@@ -455,10 +646,19 @@ impl PollHalf {
         self.shared.table.drain_abort(cb);
     }
 
-    /// Wait handle for the service egress broadcast — for a caller that wants
-    /// to park (rather than busy-poll) between duty cycles.
+    /// Wait handle for FSM 0's egress broadcast — the default responder's
+    /// ring — for a caller that wants to park (rather than busy-poll) between
+    /// duty cycles.
+    ///
+    /// M14b deviation 3: a `RingWaitHandle` is ONE futex, so a parked driver
+    /// is woken by FSM 0's publishes only; a completion that lands solely on
+    /// another FSM's ring resolves at the park timeout instead (≤ 1 ms in the
+    /// pipelined driver), not at the publish. The gateway only ever issues
+    /// FSM-0 requests, so its driver is unaffected. (On a node that does not
+    /// declare FSM 0, this is the lowest declared id's ring — the first entry
+    /// of the ascending list.)
     pub fn wait_handle(&self) -> uc_protocol::ring::RingWaitHandle {
-        self.egress_service.wait_handle()
+        self.egress_services[0].1.wait_handle()
     }
 
     /// A point-in-time snapshot of this engine's counters.
@@ -470,14 +670,16 @@ impl PollHalf {
 /// Drain up to 128 records off one broadcast (bounded work per call).
 fn drain_ring(
     ring: &mut BroadcastConsumer,
+    ring_id: Option<u8>,
     shared: &Shared,
     buf: &mut Vec<u8>,
+    fanin: &mut [FanIn],
     cb: &mut impl FnMut(Completion<'_>),
 ) -> usize {
     let mut emitted = 0usize;
     for _ in 0..128 {
         match ring.try_read(buf) {
-            Ok(Some(rec)) => emitted += handle_record(shared, &rec, buf, cb),
+            Ok(Some(rec)) => emitted += handle_record(shared, fanin, ring_id, &rec, buf, cb),
             Ok(None) => break,
             Err(RingError::Overwritten) => {
                 // Spec §4 item 6: a stat, NOT an eager fail-all — the engine
@@ -496,6 +698,8 @@ fn drain_ring(
 /// One record's routing. Returns 1 if a completion was emitted, else 0.
 fn handle_record(
     shared: &Shared,
+    fanin: &mut [FanIn],
+    ring_id: Option<u8>,
     rec: &RecordHeader,
     buf: &[u8],
     cb: &mut impl FnMut(Completion<'_>),
@@ -506,6 +710,9 @@ fn handle_record(
     }
     match rec.msg_type {
         MSG_V2_RESPONSE => {
+            let Some(ring) = ring_id else {
+                return 0; // a RESPONSE never travels on the node ring
+            };
             if buf.len() < 8 {
                 // Malformed (missing position prefix): count, do NOT resolve —
                 // the slot stays live and the deadline backstops the request.
@@ -517,9 +724,9 @@ fn handle_record(
             } else {
                 ReqKind::Submit
             };
-            match shared.table.resolve(wire_seq, Some(delivered), Some(0)) {
-                Resolve::Won { user_data, .. } => {
-                    let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
+            match shared.table.resolve(wire_seq, Some(delivered), Some(ring)) {
+                Resolve::Won { user_data, fan_in: false } => {
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -527,6 +734,33 @@ fn handle_record(
                         outcome: Outcome::Response(&buf[8..]),
                     });
                     1
+                }
+                Resolve::Won { user_data, fan_in: true } => {
+                    // The last piece: buffer it beside the earlier ones, emit
+                    // the whole set ordered by id, then drop the pieces (the
+                    // `Bytes` refcounts travelled to the caller by value).
+                    let f = &mut fanin[shared.table.slot_index(wire_seq)];
+                    f.push_piece(wire_seq, position, ring, &buf[8..]);
+                    f.parts.sort_by_key(|p| p.0);
+                    shared.stats.responses.fetch_add(1, Ordering::Relaxed);
+                    cb(Completion {
+                        user_data,
+                        position: Some(f.position),
+                        outcome: Outcome::Responses(&f.parts),
+                    });
+                    f.parts.clear();
+                    1
+                }
+                Resolve::Partial => {
+                    fanin[shared.table.slot_index(wire_seq)]
+                        .push_piece(wire_seq, position, ring, &buf[8..]);
+                    0
+                }
+                Resolve::WrongRing => {
+                    // A sibling FSM answering a request that named another
+                    // ring (or a fan-in generation that never expected it).
+                    shared.stats.wrong_ring.fetch_add(1, Ordering::Relaxed);
+                    0
                 }
                 Resolve::KindMismatch => {
                     // T14: stale cross-generation collision — drop, count,
@@ -538,9 +772,6 @@ fn handle_record(
                     shared.stats.duplicates.fetch_add(1, Ordering::Relaxed);
                     0
                 }
-                // Task 4 gives these their real handling (partial fan-in
-                // accounting; a response from a ring the slot didn't expect).
-                Resolve::Partial | Resolve::WrongRing => 0,
             }
         }
         MSG_V2_NOT_LEADER => {
@@ -568,6 +799,25 @@ fn handle_record(
             }
             _ => 0,
         },
+        MSG_V2_BAD_SERVICE => {
+            // M14b: ring-less and kind-agnostic, like RETRY — it ends the
+            // whole request (a partial fan-in included; the stale pieces left
+            // in `fanin[idx]` are discarded by the next generation's first
+            // `push_piece`, which sees a different wire seq).
+            let id = buf.first().copied().unwrap_or(u8::MAX);
+            match shared.table.resolve(wire_seq, None, None) {
+                Resolve::Won { user_data, .. } => {
+                    shared.stats.bad_service.fetch_add(1, Ordering::Relaxed);
+                    cb(Completion {
+                        user_data,
+                        position: None,
+                        outcome: Outcome::BadService { id },
+                    });
+                    1
+                }
+                _ => 0,
+            }
+        }
         _ => 0, // not a client-facing msg_type
     }
 }

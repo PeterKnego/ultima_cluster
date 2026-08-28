@@ -1315,6 +1315,7 @@ name = "uc2_client"
 version = "2.7.0"
 dependencies = [
  "bincode",
+ "bytes",
  "serde",
  "tempfile",
  "thiserror",

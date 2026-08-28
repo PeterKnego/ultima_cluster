@@ -1402,6 +1402,16 @@ fn dispatch(
                 }
                 return !conn.is_closed();
             }
+            Err(SubmitError::ServiceNotDeclared { .. }) => {
+                // Unreachable: the edge never names a service id (protocol v1
+                // has no selector), so every request goes to FSM 0. Handled
+                // like `PayloadTooLarge` — a permanent door refusal, not a
+                // transient the client should keep re-sending.
+                if conn.unreserve(corr) {
+                    shared.write_retry(conn, h.seq, RETRY_PAYLOAD_TOO_LARGE, 0);
+                }
+                return !conn.is_closed();
+            }
             Err(SubmitError::InstanceRestart { .. }) => {
                 conn.unreserve(corr);
                 shared.on_instance_restart();
@@ -1662,6 +1672,14 @@ fn complete(
             shared.redirect_or_retry_into(buf, &conn, seq, hint.or_else(|| send.leader_hint()));
         }
         Outcome::Retry => {
+            let (_, buf) =
+                batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+            shared.write_retry_into(buf, &conn, seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
+        }
+        Outcome::Responses(_) | Outcome::BadService { .. } => {
+            // Unreachable on the edge: it only ever issues FSM-0 requests
+            // (protocol v1 has no service selector, spec §6.4). Answer as a
+            // transient so a client that somehow sees it retries.
             let (_, buf) =
                 batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
             shared.write_retry_into(buf, &conn, seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);

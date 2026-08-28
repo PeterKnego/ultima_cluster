@@ -203,9 +203,6 @@ impl SlotTable {
     }
 
     /// The table index a wire seq maps to (the fan-in buffer is keyed by it).
-    // Task 4 wires the fan-in response buffer that indexes by this; unused
-    // outside tests until then.
-    #[allow(dead_code)]
     pub(crate) fn slot_index(&self, wire_seq: u32) -> usize {
         (wire_seq as usize) & self.mask
     }
@@ -263,9 +260,7 @@ impl SlotTable {
         self.next_seq.store(v, Ordering::Relaxed);
     }
 
-    // Task 4 sizes the fan-in response buffer off this; unused outside tests
-    // until then (see `slot_index`).
-    #[allow(dead_code)]
+    /// The number of slots (the engine sizes its fan-in buffer off this).
     pub(crate) fn slot_count(&self) -> usize {
         self.slots.len()
     }

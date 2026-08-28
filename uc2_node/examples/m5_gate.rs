@@ -629,7 +629,11 @@ fn run_client_measurement(
                         // lost response (or a node restart) into one of
                         // these — count it so the PASS bar can't be fooled
                         // by zero in-flight-at-end alone.
-                        Outcome::TimedOut | Outcome::InstanceRestart { .. } => {
+                        // A bench never issues a fan-in or names an id.
+                        Outcome::TimedOut
+                        | Outcome::InstanceRestart { .. }
+                        | Outcome::Responses(_)
+                        | Outcome::BadService { .. } => {
                             lost.fetch_add(1, Ordering::Relaxed);
                         }
                     }

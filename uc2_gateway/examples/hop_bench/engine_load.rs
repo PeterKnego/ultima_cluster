@@ -178,7 +178,11 @@ fn drive_one(
                             }
                             Outcome::NotLeader { .. } => s.redirected += 1,
                             Outcome::Retry => s.retried += 1,
-                            Outcome::TimedOut | Outcome::InstanceRestart { .. } => s.lost += 1,
+                            // A bench never issues a fan-in or names an id.
+                            Outcome::TimedOut
+                            | Outcome::InstanceRestart { .. }
+                            | Outcome::Responses(_)
+                            | Outcome::BadService { .. } => s.lost += 1,
                         }
                         resolved.fetch_add(1, Ordering::Relaxed);
                     });
