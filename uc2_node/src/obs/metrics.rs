@@ -898,6 +898,43 @@ mod tests {
         }
     }
 
+    /// Review fix round 1: `synthetic_sources()` always declares FSM 0, so
+    /// nothing else in this module exercises `services_declared == 0` — the
+    /// exact shape of a real M14a-unaware / no-`[services]` harness page.
+    /// Must not panic, and every per-FSM family still renders its header
+    /// (and, for the four aggregates, its bare unlabelled sample off slot 0,
+    /// which is always valid memory even when never declared) with zero
+    /// `service="..."` samples anywhere.
+    #[test]
+    fn a_harness_page_with_nothing_declared_renders_headers_and_no_labelled_samples() {
+        let s = synthetic_sources();
+        s.cnc.store_services_declared(0);
+        let text = render_prometheus(&s);
+        for name in [
+            "uc2_service_applied_bytes",
+            "uc2_service_epoch",
+            "uc2_service_snapshot_pos_bytes",
+            "uc2_service_heartbeat_age_seconds",
+            "uc2_service_attached",
+            "uc2_service_lag_bytes",
+            "uc2_service_lag_waits_total",
+            "uc2_services_declared",
+            "uc2_fsm_lag_bytes",
+        ] {
+            assert_eq!(
+                text.matches(&format!("# TYPE {name} ")).count(),
+                1,
+                "exactly one family header for {name}: {text}"
+            );
+        }
+        assert!(!text.contains(r#"service=""#), "no id is declared: {text}");
+        assert!(text.contains("\nuc2_service_applied_bytes 0\n"), "{text}");
+        assert!(text.contains("\nuc2_service_epoch 0\n"), "{text}");
+        assert!(text.contains("\nuc2_service_snapshot_pos_bytes 0\n"), "{text}");
+        assert!(text.contains("uc2_service_heartbeat_age_seconds "), "{text}");
+        assert!(text.contains("\nuc2_services_declared 0\n"), "{text}");
+    }
+
     /// Boundary-matched family presence: `\n{name} ` (a bare gauge/counter
     /// value line), `\n{name}{{` (a labeled sample line), or
     /// `\n# TYPE {name} ` (the family header, unconditionally emitted
