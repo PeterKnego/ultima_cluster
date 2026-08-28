@@ -18,6 +18,8 @@
 //! 6. `drain_abort` is exhaustive only after claims are quiesced — a claim racing the drain publishes after the scan passes and is backstopped by the deadline sweep, so pollers must keep sweeping unless claims are provably stopped.
 //!
 //! 7. `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is mutated only by `resolve`'s `fetch_or`, and that `fetch_or` never races a concurrent re-claim of the same word: `release` is the ONLY cross-thread freer of a slot (it runs on the send thread, inside `engine.rs`'s `finish_write` — `resolve`/`sweep`/`drain_abort` are all poll-thread-only), and `release(seq)` is called only when that seq's ring write FAILED, meaning no response frame for that generation was ever transmitted and so no `resolve` call for it can be in flight to race the free. A `resolve` that is in flight therefore always targets a generation no concurrent `release` can be freeing, so the matching claim-time reset of `received` (phase 2, under RESERVED) and `resolve`'s `fetch_or` on it are always the same generation, never back-to-back generations racing across the free. This, plus invariant 4 (a stale wire_seq collision needs a 2^32-outstanding gap), also covers reading `expected`/`fan_in` from a newer generation: that read is confined to the same impossible window, and even there the completing `compare_exchange(owner, FREE)` would fail (return `Miss`), so a stale read is never acted on. `resolve` completes a slot (the single owner CAS) only when the last expected bit lands in `received` or a ring-less (`ring: None`) terminal answer arrives, whichever comes first.
+//!
+//! 8. `resolve` reports `first` — whether the delivery it just recorded was the FIRST ring piece of this generation (`received` was 0 before the `fetch_or`). This exists because invariant 4's outstanding-gap argument protects the SLOT (freed and re-claimed under a fresh `expected`/`received`), not the engine-side fan-in piece buffer indexed by the same slot index: a partial fan-in ended by a ring-less terminal or the deadline sweep leaves pieces behind, and the generation 2^32 requests later at that index carries the SAME u32 wire seq — so a seq comparison cannot tell the two apart, while `first` (decided here, by the slot table) always can. The buffer resets on `first`, never on a seq change.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
@@ -39,10 +41,19 @@ pub(crate) enum ClaimError {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Resolve {
     /// Terminal: the slot is freed. `fan_in` is the claim-time flag (not derived
-    /// from `expected`'s width — see the module doc invariant 7).
-    Won { user_data: u64, fan_in: bool },
-    /// This ring's piece was recorded; other expected rings are still pending. Slot stays live.
-    Partial,
+    /// from `expected`'s width — see the module doc invariant 7). `first` is
+    /// true when THIS delivery was the generation's first ring piece (see
+    /// [`Resolve::Partial`]); it is always false for a ring-less terminal
+    /// (`ring: None`), which carries no piece to buffer.
+    Won { user_data: u64, fan_in: bool, first: bool },
+    /// This ring's piece was recorded; other expected rings are still pending.
+    /// Slot stays live. `first` is true when no ring had answered this
+    /// generation yet (`received` was 0 before this piece) — the fan-in
+    /// buffer keys its per-generation reset off this, NOT off the u32 wire
+    /// seq, which repeats every 2^32 requests at the same slot index
+    /// (invariant 4's outstanding-gap argument covers the SLOT, which is
+    /// re-claimed, not the engine-side piece buffer, which is not).
+    Partial { first: bool },
     KindMismatch,
     /// A response from a ring the request did not expect — dropped, slot untouched.
     WrongRing,
@@ -166,6 +177,9 @@ impl SlotTable {
             return Resolve::KindMismatch; // leave the slot for the real answer
         }
         let expected = slot.expected.load(Ordering::Relaxed);
+        // False for a ring-less terminal: no piece is pushed, so the flag is
+        // irrelevant there (see `Resolve::Won`'s doc).
+        let mut first = false;
         if let Some(r) = ring {
             debug_assert!(r < 8);
             let bit = 1u8 << r;
@@ -185,8 +199,12 @@ impl SlotTable {
             if prev & bit != 0 {
                 return Resolve::Miss;
             }
+            // The slot table — not a seq comparison — decides where a
+            // generation starts: `prev == 0` means nothing has answered this
+            // claim yet, so this piece opens a fresh set.
+            first = prev == 0;
             if (prev | bit) != expected {
-                return Resolve::Partial; // more rings still to answer
+                return Resolve::Partial { first }; // more rings still to answer
             }
         }
         let user_data = slot.user_data.load(Ordering::Relaxed);
@@ -199,10 +217,12 @@ impl SlotTable {
             return Resolve::Miss; // lost the race to sweep/another delivery
         }
         self.inflight.fetch_sub(1, Ordering::AcqRel);
-        Resolve::Won { user_data, fan_in }
+        Resolve::Won { user_data, fan_in, first }
     }
 
-    /// The table index a wire seq maps to (the fan-in buffer is keyed by it).
+    /// The table index a wire seq maps to (the engine's fan-in buffer is
+    /// indexed by it; its per-generation reset keys on `first`, not the seq —
+    /// invariant 8).
     pub(crate) fn slot_index(&self, wire_seq: u32) -> usize {
         (wire_seq as usize) & self.mask
     }
@@ -534,7 +554,10 @@ mod tests {
         let seq = t.claim(7, ReqKind::Submit, u64::MAX, 0b01, false).unwrap(); // expects ring 0 only
         assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)), Resolve::WrongRing);
         assert_eq!(t.inflight(), 1);
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Won { user_data: 7, fan_in: false });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 7, fan_in: false, first: true }
+        );
         assert_eq!(t.inflight(), 0);
     }
 
@@ -542,11 +565,14 @@ mod tests {
     fn fan_in_completes_only_when_every_expected_ring_answered_in_any_order() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(8, ReqKind::Submit, u64::MAX, 0b101, true).unwrap(); // rings 0 and 2
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)), Resolve::Partial);
+        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)), Resolve::Partial { first: true });
         assert_eq!(t.inflight(), 1, "a partial keeps the slot live");
         // A duplicate from the same ring is a Miss, not a second piece.
         assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)), Resolve::Miss);
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Won { user_data: 8, fan_in: true });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 8, fan_in: true, first: false }
+        );
         assert_eq!(t.inflight(), 0);
         assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Miss, "freed");
     }
@@ -555,9 +581,13 @@ mod tests {
     fn a_terminal_answer_completes_a_partial_fan_in() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(9, ReqKind::Query, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Query), Some(1)), Resolve::Partial);
-        // NOT_LEADER / RETRY / BAD_SERVICE are ring-less and kind-agnostic: they end the whole request.
-        assert_eq!(t.resolve(seq as u32, None, None), Resolve::Won { user_data: 9, fan_in: true });
+        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Query), Some(1)), Resolve::Partial { first: true });
+        // NOT_LEADER / RETRY / BAD_SERVICE are ring-less and kind-agnostic: they end the whole
+        // request. They carry no piece, so `first` is false (nothing to buffer).
+        assert_eq!(
+            t.resolve(seq as u32, None, None),
+            Resolve::Won { user_data: 9, fan_in: true, first: false }
+        );
         assert_eq!(t.inflight(), 0);
     }
 
@@ -565,7 +595,7 @@ mod tests {
     fn received_is_reset_when_a_slot_index_is_reused() {
         let t = SlotTable::new(1, 0); // 64 slots
         let seq = t.claim(1, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Partial);
+        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Partial { first: true });
         // Drain (shutdown) frees it with ring 1 still pending.
         let mut aborted = Vec::new();
         t.drain_abort(|ud| aborted.push(ud));
@@ -575,8 +605,15 @@ mod tests {
         let seq2 = t.claim(2, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
         assert_eq!(t.slot_index(seq2 as u32), t.slot_index(seq as u32));
         // The old ring-0 piece must not count for the new request.
-        assert_eq!(t.resolve(seq2 as u32, Some(ReqKind::Submit), Some(1)), Resolve::Partial);
-        assert_eq!(t.resolve(seq2 as u32, Some(ReqKind::Submit), Some(0)), Resolve::Won { user_data: 2, fan_in: true });
+        assert_eq!(
+            t.resolve(seq2 as u32, Some(ReqKind::Submit), Some(1)),
+            Resolve::Partial { first: true },
+            "the reused index starts a FRESH generation: this piece is its first"
+        );
+        assert_eq!(
+            t.resolve(seq2 as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 2, fan_in: true, first: false }
+        );
     }
 
     #[test]
@@ -586,11 +623,46 @@ mod tests {
         let _ = t.claim(1, ReqKind::Submit, u64::MAX, 0, false);
     }
 
+    /// Ruling E: `first` is what the engine-side fan-in buffer resets on, so
+    /// the slot table must report it exactly — true for the piece that opens
+    /// a generation (whether that generation then goes `Partial` or completes
+    /// outright), false for every later piece of the same generation, and
+    /// false for a ring-less terminal (which pushes nothing).
+    #[test]
+    fn resolve_reports_first_only_for_the_piece_that_opens_a_generation() {
+        let t = SlotTable::new(8, 0);
+        // Two-ring fan-in: piece 1 opens the generation, piece 2 does not.
+        let seq = t.claim(0x11, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
+        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)), Resolve::Partial { first: true });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 0x11, fan_in: true, first: false },
+            "the closing piece of a multi-ring fan-in is not the first"
+        );
+        // Single-ring fan-in: its one piece both opens and closes the set.
+        let solo = t.claim(0x22, ReqKind::Submit, u64::MAX, 0b1, true).unwrap();
+        assert_eq!(
+            t.resolve(solo as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 0x22, fan_in: true, first: true }
+        );
+        // Ring-less terminal on a partial: no piece, so `first` is false.
+        let term = t.claim(0x33, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
+        assert_eq!(t.resolve(term as u32, Some(ReqKind::Submit), Some(0)), Resolve::Partial { first: true });
+        assert_eq!(
+            t.resolve(term as u32, None, None),
+            Resolve::Won { user_data: 0x33, fan_in: true, first: false }
+        );
+    }
+
     #[test]
     fn a_single_ring_fan_in_completes_as_a_fan_in() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(3, ReqKind::Submit, u64::MAX, 0b1, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Won { user_data: 3, fan_in: true });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { user_data: 3, fan_in: true, first: true },
+            "a one-ring fan-in's only piece is also its first"
+        );
         assert_eq!(t.inflight(), 0);
     }
 }

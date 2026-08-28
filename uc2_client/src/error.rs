@@ -77,6 +77,12 @@ pub enum ClientError {
     /// M14b: `id` is not a declared FSM on the attached node — refused at the
     /// door (`SubmitError::ServiceNotDeclared`) or answered by the node
     /// (`MSG_V2_BAD_SERVICE`, when the node has no ring for it). No side effect.
+    ///
+    /// Also the ATTACH-time refusal for a cnc page whose `services_declared`
+    /// names only ids `>= CNC_MAX_SERVICES` (nothing this client can ring):
+    /// reported as `id: 0` with the RAW page value in `declared` — FSM 0, the
+    /// default target of `try_submit`/`try_query`, is genuinely not declared,
+    /// and no in-range id is either.
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
     /// The client was shut down while this request was still in flight.

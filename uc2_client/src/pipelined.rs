@@ -204,7 +204,8 @@ impl PipelinedClient {
     }
 
     /// M14b: the attached node's declared-FSM set (bit i ⇔ FSM i is declared),
-    /// `0b1` on a single-service node. Naming any other id in `submit_to`/
+    /// `0b1` on a single-service node, masked to ids `< 8` (see
+    /// [`crate::SendHalf::declared`]). Naming any other id in `submit_to`/
     /// `query_*_on` is refused at the door with
     /// [`ClientError::ServiceNotDeclared`].
     pub fn declared(&self) -> u64 {

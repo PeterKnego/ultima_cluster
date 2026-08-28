@@ -242,9 +242,13 @@ pub struct PollHalf {
     egress_node: BroadcastConsumer,
     buf: Vec<u8>,
     /// M14b fan-in buffer, one entry per slot index: the pieces of a
-    /// `try_submit_all` that have arrived so far. Keyed by the slot's wire
-    /// seq so a reused index never mixes generations; a swept slot's stale
-    /// pieces stay until the index is reused (bounded: ≤ 8 pieces per slot).
+    /// `try_submit_all` that have arrived so far. A generation's FIRST piece
+    /// (as reported by the slot table's `Resolve::{Partial, Won}.first`)
+    /// clears the entry, so a reused index never mixes generations — see
+    /// `FanIn::push_piece` for why the wire seq cannot be the key. Every
+    /// terminal (fan-in completion or a ring-less NOT_LEADER/RETRY/
+    /// BAD_SERVICE) also clears it, so only live fan-ins retain memory
+    /// (bounded either way: ≤ 8 pieces per slot).
     fanin: Vec<FanIn>,
     cycle: u64,
 }
@@ -252,18 +256,29 @@ pub struct PollHalf {
 /// The pieces of one in-flight fan-in, buffered until the last one lands.
 #[derive(Default)]
 struct FanIn {
-    seq: u32,
     position: u64,
     /// `Bytes`, not `Vec<u8>`: refcounted from here to the caller (deviation 1).
     parts: Vec<(u8, Bytes)>,
 }
 
 impl FanIn {
-    /// Record one piece; a different wire seq means the slot index was
-    /// reused — start over for the new generation.
-    fn push_piece(&mut self, seq: u32, position: u64, ring: u8, body: &[u8]) {
-        if self.seq != seq || self.parts.is_empty() {
-            self.seq = seq;
+    /// Record one piece. `first` — the slot table's verdict that `received`
+    /// was empty before this delivery (`Resolve::{Partial, Won}.first`, see
+    /// `slots.rs` invariant 8) — starts a new generation: clear the pieces
+    /// and adopt this one's position.
+    ///
+    /// The generation key CANNOT be the wire seq. A partial fan-in ended by a
+    /// ring-less terminal or by the deadline sweep leaves its pieces here,
+    /// and the generation exactly 2^32 requests later at this same slot index
+    /// carries the SAME `wire_seq as u32` — a seq comparison would then
+    /// append the new generation's pieces to the stale ones and deliver them
+    /// under one `user_data`. `first` is decided by the slot table's own
+    /// `received` mask, which the re-claim resets, so it is exact across a
+    /// wrap. (`slots.rs` invariant 4's outstanding-gap argument covers the
+    /// SLOT, which is freed and re-claimed; it does not transfer to this
+    /// buffer, which is not.)
+    fn push_piece(&mut self, first: bool, position: u64, ring: u8, body: &[u8]) {
+        if first {
             self.position = position;
             self.parts.clear();
         }
@@ -329,10 +344,22 @@ impl Engine {
         let (ingress, _ic) = MpscRing::open(&instance_dir.join(INGRESS_RING))?.into_split();
         let (query, _qc) = MpscRing::open(&instance_dir.join(QUERY_RING))?.into_split();
         // M14b: which FSMs exist here. A page reading 0 is a harness node
-        // (nothing declared, FSM 0 ringed) — the same fold every attacher uses.
-        let declared = match cnc.services_declared() {
-            0 => 0b1,
-            d => d,
+        // (nothing declared, FSM 0 ringed) — the same fold every attacher
+        // uses. The page word is a raw u64 written by the node, but this
+        // client can only ring ids < CNC_MAX_SERVICES, so MASK it: an
+        // unmasked value would let `try_submit_all` await rings that were
+        // never opened and `wait_handle` index an empty `egress_services`.
+        // A page whose declared set names ONLY out-of-range ids leaves
+        // nothing this client can talk to — a named refusal (the M12d
+        // posture: a shared-memory page never panics an attacher), reported
+        // as FSM 0 undeclared with the RAW page value, the same shape the
+        // per-request door refusal uses.
+        let raw = cnc.services_declared();
+        let masked = raw & ((1u64 << CNC_MAX_SERVICES) - 1);
+        let declared = match (raw, masked) {
+            (0, _) => 0b1,
+            (_, 0) => return Err(ClientError::ServiceNotDeclared { id: 0, declared: raw }),
+            (_, m) => m,
         };
         let mut egress_services = Vec::new();
         for id in 0..CNC_MAX_SERVICES as u8 {
@@ -438,7 +465,11 @@ impl SendHalf {
     }
 
     /// The declared set this engine attached to (bit i ⇔ FSM i), `0b1` on a
-    /// harness node.
+    /// harness node. Always MASKED to ids `< CNC_MAX_SERVICES` (8) — the
+    /// engine opens a response ring only for those, and a page declaring
+    /// nothing in range is refused at [`Engine::attach`]
+    /// ([`ClientError::ServiceNotDeclared`] with `id: 0`), so this value is
+    /// never 0 and never names a ring the engine did not open.
     pub fn declared(&self) -> u64 {
         self.shared.declared
     }
@@ -726,7 +757,7 @@ fn handle_record(
             };
             let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
             match shared.table.resolve(wire_seq, Some(delivered), Some(ring)) {
-                Resolve::Won { user_data, fan_in: false } => {
+                Resolve::Won { user_data, fan_in: false, .. } => {
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -735,12 +766,14 @@ fn handle_record(
                     });
                     1
                 }
-                Resolve::Won { user_data, fan_in: true } => {
+                Resolve::Won { user_data, fan_in: true, first } => {
                     // The last piece: buffer it beside the earlier ones, emit
                     // the whole set ordered by id, then drop the pieces (the
                     // `Bytes` refcounts travelled to the caller by value).
+                    // `first` is true when this piece is also the generation's
+                    // only one (a single-declared-FSM `try_submit_all`).
                     let f = &mut fanin[shared.table.slot_index(wire_seq)];
-                    f.push_piece(wire_seq, position, ring, &buf[8..]);
+                    f.push_piece(first, position, ring, &buf[8..]);
                     f.parts.sort_by_key(|p| p.0);
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
@@ -751,9 +784,9 @@ fn handle_record(
                     f.parts.clear();
                     1
                 }
-                Resolve::Partial => {
+                Resolve::Partial { first } => {
                     fanin[shared.table.slot_index(wire_seq)]
-                        .push_piece(wire_seq, position, ring, &buf[8..]);
+                        .push_piece(first, position, ring, &buf[8..]);
                     0
                 }
                 Resolve::WrongRing => {
@@ -784,6 +817,10 @@ fn handle_record(
             match shared.table.resolve(wire_seq, None, None) {
                 // kind-agnostic: a pre-side-effect signal
                 Resolve::Won { user_data, .. } => {
+                    // A partial fan-in ends here: drop its buffered pieces so
+                    // retained memory is bounded by the LIVE fan-ins (the next
+                    // generation's `first` piece would clear them anyway).
+                    fanin[shared.table.slot_index(wire_seq)].parts.clear();
                     shared.stats.not_leader.fetch_add(1, Ordering::Relaxed);
                     cb(Completion { user_data, position: None, outcome: Outcome::NotLeader { hint } });
                     1
@@ -793,6 +830,7 @@ fn handle_record(
         }
         MSG_V2_RETRY => match shared.table.resolve(wire_seq, None, None) {
             Resolve::Won { user_data, .. } => {
+                fanin[shared.table.slot_index(wire_seq)].parts.clear(); // as NOT_LEADER
                 shared.stats.retry.fetch_add(1, Ordering::Relaxed);
                 cb(Completion { user_data, position: None, outcome: Outcome::Retry });
                 1
@@ -801,12 +839,13 @@ fn handle_record(
         },
         MSG_V2_BAD_SERVICE => {
             // M14b: ring-less and kind-agnostic, like RETRY — it ends the
-            // whole request (a partial fan-in included; the stale pieces left
-            // in `fanin[idx]` are discarded by the next generation's first
-            // `push_piece`, which sees a different wire seq).
+            // whole request, a partial fan-in included: its buffered pieces
+            // are dropped here (and the next generation's `first` piece would
+            // clear them regardless — see `FanIn::push_piece`).
             let id = buf.first().copied().unwrap_or(u8::MAX);
             match shared.table.resolve(wire_seq, None, None) {
                 Resolve::Won { user_data, .. } => {
+                    fanin[shared.table.slot_index(wire_seq)].parts.clear();
                     shared.stats.bad_service.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -901,6 +940,153 @@ mod tests {
         assert!(matches!(result, Ok(())), "lost release must report accepted: {result:?}");
         assert_eq!(stats.accepted.load(Ordering::Relaxed), 1, "accepted must count this request");
         assert_eq!(table.inflight(), 0, "must not double-decrement on a lost release");
+    }
+
+    // --- synthetic instance dir: the same idiom as
+    // `tests/engine_synthetic.rs` / `pipelined.rs`'s unit tests (an
+    // integration test crate can't share a module with `src/`, so this gets
+    // its own tiny copy). This test lives HERE rather than in
+    // `tests/engine_synthetic.rs` because it must force the slot sequence
+    // onto a chosen generation, and `SlotTable::set_next_seq_for_tests` is
+    // `#[cfg(test)]`, i.e. crate-internal.
+
+    fn meta(app_id: &str) -> uc2_log::cnc::CncMeta {
+        uc2_log::cnc::CncMeta {
+            node_id: 0,
+            instance_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                ^ 0xA5A5_5A5A_A5A5_5A5A_u128,
+            app_id: app_id.into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
+        }
+    }
+
+    /// A page declaring FSMs {0, 1}, with a response ring per declared id.
+    fn make_instance_two_fsms(dir: &Path, app_id: &str) {
+        const MIB: u64 = 1 << 20;
+        let page = uc2_log::cnc::CncPage::create_file(&dir.join(CNC_FILE), &meta(app_id)).unwrap();
+        page.store_services_declared(0b11);
+        MpscRing::create(&dir.join(INGRESS_RING), MIB, 128).unwrap();
+        MpscRing::create(&dir.join(QUERY_RING), MIB, 256).unwrap();
+        BroadcastRing::create(&dir.join(egress_service_ring(0)), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join(egress_service_ring(1)), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join(EGRESS_NODE), MIB, 128).unwrap();
+    }
+
+    fn producer(dir: &Path, file: &str) -> uc_protocol::ring::BroadcastProducer {
+        BroadcastRing::open(&dir.join(file)).unwrap().producer()
+    }
+
+    /// `MSG_V2_RESPONSE` payload: `position ++ body`.
+    fn response(position: u64, body: &[u8]) -> Vec<u8> {
+        let mut p = position.to_le_bytes().to_vec();
+        p.extend_from_slice(body);
+        p
+    }
+
+    /// One `poll` duty cycle, rendered as `(user_data, position, tag)` — the
+    /// same rendering `tests/engine_synthetic.rs::drain` uses.
+    fn drain(poll: &mut PollHalf) -> Vec<(u64, Option<u64>, String)> {
+        let mut out = Vec::new();
+        poll.poll(|c| {
+            let tag = match &c.outcome {
+                Outcome::Response(b) => format!("resp:{}", b.len()),
+                Outcome::Responses(parts) => format!(
+                    "responses:{:?}",
+                    parts
+                        .iter()
+                        .map(|(id, b)| (*id, String::from_utf8_lossy(b).into_owned()))
+                        .collect::<Vec<_>>()
+                ),
+                Outcome::NotLeader { hint } => format!("notleader:{hint:?}"),
+                Outcome::Retry => "retry".into(),
+                Outcome::BadService { id } => format!("badservice:{id}"),
+                Outcome::TimedOut => "timeout".into(),
+                Outcome::InstanceRestart { .. } => "restart".into(),
+            };
+            out.push((c.user_data, c.position, tag));
+        });
+        out
+    }
+
+    /// Ruling E: the fan-in piece buffer's generation key is the slot table's
+    /// `first`, NOT the u32 wire seq.
+    ///
+    /// A fan-in aborted by a ring-less terminal (or the deadline sweep)
+    /// leaves its buffered pieces behind. `slots.rs` invariant 4 protects the
+    /// SLOT across a wrap (freed and re-claimed), but the piece buffer at
+    /// that index is not re-claimed — and the generation exactly 2^32
+    /// requests later carries the SAME `wire_seq as u32`. Under the old
+    /// seq-keyed reset, the stale piece was appended to the new generation
+    /// and delivered under its `user_data`, with a duplicate ring id and the
+    /// OLD position. Both arms run here: `+ slot_count` (a distinct wire seq,
+    /// the control — the old code reset correctly) and `+ 2^32` (the same
+    /// wire seq, the case that reproduced the defect).
+    #[test]
+    fn an_aborted_fan_ins_stale_piece_never_joins_the_next_generation_at_the_same_index() {
+        for wrap in [false, true] {
+            let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+            make_instance_two_fsms(dir.path(), "fanin-gen");
+            let (send, mut poll) = Engine::attach(
+                dir.path(),
+                "fanin-gen",
+                EngineConfig { serving_gate: false, ..EngineConfig::default() },
+            )
+            .unwrap();
+            let cid = send.client_id();
+
+            // Generation A (wire seq 0): FSM 1 answers, then a node-ring RETRY
+            // ends the request with FSM 0's piece still outstanding.
+            send.try_submit_all(1, b"x").unwrap();
+            producer(dir.path(), &egress_service_ring(1))
+                .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(4096, b"stale"))
+                .unwrap();
+            assert!(drain(&mut poll).is_empty(), "one of two pieces: not complete");
+            producer(dir.path(), EGRESS_NODE)
+                .write(MSG_V2_RETRY, 0, extra_client(cid, 0), &[])
+                .unwrap();
+            assert_eq!(drain(&mut poll), vec![(1, None, "retry".to_string())]);
+
+            // Generation B at the SAME slot index. `+ 2^32` also repeats the
+            // u32 wire seq (0) — what the old seq-keyed reset could not see.
+            let step =
+                if wrap { 1u64 << 32 } else { send.shared.table.slot_count() as u64 };
+            send.shared.table.set_next_seq_for_tests(step);
+            send.try_submit_all(2, b"y").unwrap();
+            let wire_seq = step as u32;
+            assert_eq!(
+                send.shared.table.slot_index(wire_seq),
+                send.shared.table.slot_index(0),
+                "both generations must land on the same slot index"
+            );
+            producer(dir.path(), &egress_service_ring(0))
+                .write(MSG_V2_RESPONSE, 0, extra_client(cid, wire_seq), &response(8192, b"a"))
+                .unwrap();
+            assert!(drain(&mut poll).is_empty());
+            producer(dir.path(), &egress_service_ring(1))
+                .write(MSG_V2_RESPONSE, 0, extra_client(cid, wire_seq), &response(8192, b"b"))
+                .unwrap();
+            assert_eq!(
+                drain(&mut poll),
+                vec![(2, Some(8192), "responses:[(0, \"a\"), (1, \"b\")]".to_string())],
+                "wrap={wrap}: exactly this generation's two pieces, at ITS position — \
+                 no stale piece, no duplicate id"
+            );
+            assert_eq!(send.inflight(), 0);
+        }
+    }
+
+    /// A directory on real disk for synthetic instance dirs: `/tmp` is a
+    /// RAM-backed tmpfs with no swap on the dev box (see CLAUDE.md), and the
+    /// lib target gets no `CARGO_TARGET_TMPDIR`, so derive the cargo target
+    /// dir from the test binary's own path.
+    fn scratch_base() -> std::path::PathBuf {
+        let exe = std::env::current_exe().expect("test binary path");
+        // <target>/<profile>/deps/<bin> -> <target>/<profile>
+        exe.parent().and_then(|p| p.parent()).expect("target dir").to_path_buf()
     }
 
     /// The ordinary counterpart: a write failure whose release WINS (no

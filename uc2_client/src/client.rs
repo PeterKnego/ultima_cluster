@@ -120,7 +120,8 @@ impl Client {
     }
 
     /// M14b: the attached node's declared-FSM set (bit i ⇔ FSM i is
-    /// declared), `0b1` on a single-service node.
+    /// declared), `0b1` on a single-service node. Masked to ids `< 8` — see
+    /// [`crate::SendHalf::declared`].
     pub fn declared(&self) -> u64 {
         self.inner.declared()
     }

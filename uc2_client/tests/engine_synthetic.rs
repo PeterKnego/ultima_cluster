@@ -606,3 +606,53 @@ fn submit_all_on_a_single_fsm_page_completes_as_responses_with_one_piece() {
     assert_eq!(send.inflight(), 0);
     assert_eq!(poll.stats().responses, 1);
 }
+
+/// Finding 2: `services_declared` is a raw `u64` on a shared-memory page, but
+/// this client can only ring ids `< CNC_MAX_SERVICES` (8). A page declaring
+/// ONLY out-of-range ids used to be stored unmasked: `attach` opened zero
+/// response rings and returned `Ok`, and the first use panicked — `poll
+/// .wait_handle()` indexing an empty `egress_services`, or `try_submit_all`
+/// computing `expected = 0` and tripping `claim`'s assert. The M12d posture
+/// is that a shared-memory page never panics an attacher: it must be a named
+/// refusal instead.
+#[test]
+fn a_page_declaring_only_out_of_range_ids_is_refused_at_attach() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "oor", MIB, MIB);
+    CncPage::open_file(&dir.path().join("cnc2.dat"), "oor")
+        .unwrap()
+        .store_services_declared(0x100);
+
+    match Engine::attach(dir.path(), "oor", cfg()) {
+        Err(uc2_client::ClientError::ServiceNotDeclared { id: 0, declared: 0x100 }) => {}
+        Err(other) => panic!("wrong refusal: {other:?}"),
+        Ok((send, poll)) => {
+            // Pre-fix reality, kept as the RED evidence: attach succeeds with
+            // an empty ring set and the first use panics.
+            let _ = poll.wait_handle();
+            let _ = send.try_submit_all(1, b"x");
+            panic!("attach must refuse a page whose declared set names only out-of-range ids");
+        }
+    }
+}
+
+/// The in-range bits of a mixed page still attach: `0b101 | (1 << 9)` keeps
+/// FSMs {0, 2} and drops the id this client cannot ring, so `declared()` is
+/// exactly the masked set (and never names a ring `attach` did not open).
+#[test]
+fn out_of_range_declared_bits_are_masked_off_when_something_in_range_remains() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    CncPage::create_file(&dir.path().join("cnc2.dat"), &meta("mixed")).unwrap();
+    CncPage::open_file(&dir.path().join("cnc2.dat"), "mixed")
+        .unwrap()
+        .store_services_declared(0b101 | (1 << 9));
+    MpscRing::create(&dir.path().join("ingress.ring"), MIB, 128).unwrap();
+    MpscRing::create(&dir.path().join("query.ring"), MIB, 256).unwrap();
+    BroadcastRing::create(&dir.path().join("egress_service.0.broadcast"), MIB, 128).unwrap();
+    BroadcastRing::create(&dir.path().join("egress_service.2.broadcast"), MIB, 128).unwrap();
+    BroadcastRing::create(&dir.path().join("egress_node.broadcast"), MIB, 128).unwrap();
+
+    let (send, _poll) = Engine::attach(dir.path(), "mixed", cfg()).unwrap();
+    assert_eq!(send.declared(), 0b101, "id 9 is masked off; {{0, 2}} remain");
+    send.try_submit_all(1, b"x").expect("the masked set is what the engine awaits");
+}
