@@ -15,9 +15,10 @@
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use uc2_log::cnc::unpack_service_status;
 use uc_protocol::v2::cnc::{
-    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
-    NODE_FLAG_LEADER,
+    CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
+    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 
 use super::ObsSources;
@@ -50,11 +51,20 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_durable_bytes",
     "uc2_sent_bytes",
     "uc2_commit_bytes",
+    // M14c (spec §9): the per-FSM band. The first four are the M10
+    // aggregates, which now also carry one `service="<id>"` sample per
+    // declared id in the SAME family block.
     "uc2_service_applied_bytes",
     "uc2_service_epoch",
+    "uc2_service_snapshot_pos_bytes",
+    "uc2_service_heartbeat_age_seconds",
+    "uc2_service_attached",
+    "uc2_service_lag_bytes",
+    "uc2_service_lag_waits_total",
+    "uc2_services_declared",
+    "uc2_fsm_lag_bytes",
     "uc2_output_completed_bytes",
     "uc2_output_progress_bytes",
-    "uc2_service_snapshot_pos_bytes",
     "uc2_node_snapshot_floor_bytes",
     "uc2_incoming_snapshot_pos_bytes",
     "uc2_archive_first_base_bytes",
@@ -62,7 +72,6 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_apply_lag_bytes",
     "uc2_admission_saturation",
     "uc2_node_heartbeat_age_seconds",
-    "uc2_service_heartbeat_age_seconds",
     "uc2_peer_reported_durable_bytes",
     "uc2_peer_replication_lag_bytes",
     "uc2_peer_advertised_limit_bytes",
@@ -71,6 +80,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_ingress_holes_skipped_total",
     "uc2_query_holes_skipped_total",
     "uc2_reports_unattested_total",
+    "uc2_snapshot_refused_legacy_peer_total",
+    "uc2_snapshot_refused_declared_set_total",
     "uc2_reports_implausible_total",
     "uc2_crypto_handshake_failures_total",
     "uc2_sender_seal_failures_total",
@@ -151,6 +162,209 @@ fn push_labeled(out: &mut String, name: &str, help: &str, ty: &str, samples: &[(
         out.push_str(&value.to_string());
         out.push('\n');
     }
+}
+
+/// M14c (spec §9): one row per DECLARED service id, gathered in a single
+/// pass over page 2 so every per-FSM family renders from the same snapshot.
+///
+/// Unlike the peer band (which skips unoccupied slots), a declared id gets a
+/// row even when nothing has ever attached to it: an absent FSM must show up
+/// as `uc2_service_attached{service="k"} 0`, not as a missing series —
+/// `Uc2ServiceAbsent` cannot alert on a series that is not there. A harness
+/// page (`services_declared == 0`) yields no rows, and the families then
+/// render as headers alone, exactly like a node with no occupied peer slots.
+struct ServiceRow {
+    /// Pre-formatted label body, no braces: `service="0"`.
+    labels: String,
+    attached: u64,
+    applied: u64,
+    epoch: u64,
+    snapshot_pos: u64,
+    /// `commit - applied`, saturating: the two counters are independent
+    /// atomics read microseconds apart, so `applied > commit` is a normal
+    /// racy snapshot, not an error.
+    lag_bytes: u64,
+    lag_waits: u64,
+    heartbeat_age: f64,
+}
+
+fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
+    let declared = s.cnc.services_declared();
+    let mut rows = Vec::new();
+    for id in 0..CNC_MAX_SERVICES as u8 {
+        if declared & (1u64 << id) == 0 {
+            continue;
+        }
+        let slot = s.cnc.service_slot(id as usize);
+        let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+        let applied = slot.applied.load_acquire();
+        let hb = slot.heartbeat_ns.load_acquire();
+        rows.push(ServiceRow {
+            labels: format!("service=\"{id}\""),
+            attached: attached as u64,
+            applied,
+            epoch: slot.epoch.load_acquire(),
+            snapshot_pos: slot.snapshot_pos.load_acquire(),
+            lag_bytes: commit.saturating_sub(applied),
+            lag_waits: slot.lag_waits.load_acquire(),
+            heartbeat_age: now.saturating_sub(hb) as f64 / 1e9,
+        });
+    }
+    rows
+}
+
+/// One family block carrying BOTH the unlabeled aggregate sample and one
+/// labeled sample per declared FSM. They are the same metric FAMILY, so they
+/// must share a single `# HELP`/`# TYPE` pair — a second header for a name
+/// already seen in the same scrape is a parse error on Prometheus's side.
+/// The query-side consequence, documented in `monitor-a-cluster.md`:
+/// `sum(<name>)` double counts, so "the aggregate" is `<name>{service=""}`
+/// and "per FSM" is `<name>{service!=""}`.
+fn push_gauge_with_services(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    aggregate: u64,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> u64,
+) {
+    push_family_header(out, name, help, "gauge");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&aggregate.to_string());
+    out.push('\n');
+    for r in rows {
+        out.push_str(name);
+        out.push('{');
+        out.push_str(&r.labels);
+        out.push_str("} ");
+        out.push_str(&pick(r).to_string());
+        out.push('\n');
+    }
+}
+
+/// [`push_gauge_with_services`] for an `f64` family (the heartbeat ages).
+fn push_gauge_f64_with_services(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    aggregate: f64,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> f64,
+) {
+    push_family_header(out, name, help, "gauge");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&aggregate.to_string());
+    out.push('\n');
+    for r in rows {
+        out.push_str(name);
+        out.push('{');
+        out.push_str(&r.labels);
+        out.push_str("} ");
+        out.push_str(&pick(r).to_string());
+        out.push('\n');
+    }
+}
+
+/// A per-FSM family with no aggregate twin (`attached`, `lag_bytes`,
+/// `lag_waits_total`): header plus one labeled sample per declared id.
+fn push_service_labeled(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    ty: &str,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> u64,
+) {
+    let samples: Vec<(String, u64)> =
+        rows.iter().map(|r| (r.labels.clone(), pick(r))).collect();
+    push_labeled(out, name, help, ty, &samples);
+}
+
+/// M14c (spec §9): every per-FSM family, aggregates included, as one
+/// contiguous block. `commit` and `now` are this scrape's single samples,
+/// threaded in so the block is consistent with the rest of the render.
+///
+/// The aggregates are page 1's `min` over the declared ids, published once
+/// per cycle by the node (`crate::services::service_mins` /
+/// `Consensus::publish_service_mins`) — they now mean "the slowest FSM".
+/// `uc2_service_epoch`'s aggregate is the exception: it is FSM 0's epoch
+/// (M14a retired page 1's `service_epoch`), not a min.
+fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64) {
+    let rows = service_rows(s, commit, now);
+    let service = s.cnc.service();
+    let snapshots = s.cnc.snapshots();
+    let status = s.cnc.status();
+
+    push_gauge_with_services(
+        out,
+        "uc2_service_applied_bytes",
+        "Position the service state machine has applied through (unlabeled = the SLOWEST declared FSM; one labeled sample per declared FSM).",
+        service.service_applied.load_acquire(),
+        &rows,
+        |r| r.applied,
+    );
+    push_gauge_with_services(
+        out,
+        "uc2_service_epoch",
+        "Service incarnation counter, bumped each attach (unlabeled = FSM 0's, the M10 series; one labeled sample per declared FSM).",
+        s.cnc.service_slot(0).epoch.load_acquire(),
+        &rows,
+        |r| r.epoch,
+    );
+    push_gauge_with_services(
+        out,
+        "uc2_service_snapshot_pos_bytes",
+        "Position of the newest complete service-built snapshot, 0 = none (unlabeled = the min over declared FSMs, which is the purge floor).",
+        snapshots.service_snapshot_pos.load_acquire(),
+        &rows,
+        |r| r.snapshot_pos,
+    );
+    push_gauge_f64_with_services(
+        out,
+        "uc2_service_heartbeat_age_seconds",
+        "Seconds since a service heartbeat was last stamped, unlabeled = the stalest declared FSM (a never-written heartbeat reads as a huge age, by design).",
+        now.saturating_sub(status.service_heartbeat_ns.load_acquire()) as f64 / 1e9,
+        &rows,
+        |r| r.heartbeat_age,
+    );
+    push_service_labeled(
+        out,
+        "uc2_service_attached",
+        "1 if this declared FSM's slot has the ATTACHED bit set. A declared FSM that never started reads 0 here and holds admission closed.",
+        "gauge",
+        &rows,
+        |r| r.attached,
+    );
+    push_service_labeled(
+        out,
+        "uc2_service_lag_bytes",
+        "commit - this FSM's applied position (saturating). Pinned at uc2_fsm_lag_bytes means this FSM is pacing the cluster.",
+        "gauge",
+        &rows,
+        |r| r.lag_bytes,
+    );
+    push_service_labeled(
+        out,
+        "uc2_service_lag_waits_total",
+        "Times this FSM's apply loop waited at the lag barrier for a sibling.",
+        "counter",
+        &rows,
+        |r| r.lag_waits,
+    );
+    push_gauge(
+        out,
+        "uc2_services_declared",
+        "Bitmask of declared service ids (bit k = id k). Must match cluster-wide; a mismatch refuses snapshot sessions.",
+        s.cnc.services_declared(),
+    );
+    push_gauge(
+        out,
+        "uc2_fsm_lag_bytes",
+        "The configured FSM lag bound in bytes; 0 means lockstep.",
+        s.cnc.fsm_lag_bytes(),
+    );
 }
 
 /// Render the full M10 series contract over one snapshot of `s`'s `Arc`s
@@ -268,18 +482,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
 
     let service = s.cnc.service();
     let service_applied = service.service_applied.load_acquire();
-    push_gauge(
-        &mut out,
-        "uc2_service_applied_bytes",
-        "Position the service state machine has applied through.",
-        service_applied,
-    );
-    push_gauge(
-        &mut out,
-        "uc2_service_epoch",
-        "FSM 0's incarnation counter, bumped each attach (per-FSM families: M14c).",
-        s.cnc.service_slot(0).epoch.load_acquire(),
-    );
+    // M14c (spec §9): the whole per-FSM band — the four M10 aggregates (now
+    // "slowest FSM") each with their labelled twins, plus attached/lag/
+    // lag_waits/declared/fsm_lag. `now` moves up from the heartbeat block
+    // below so one clock sample covers both.
+    let now = now_unix_ns();
+    push_service_families(&mut out, s, commit, now);
     push_gauge(
         &mut out,
         "uc2_output_completed_bytes",
@@ -295,12 +503,6 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
 
     let snapshots = s.cnc.snapshots();
-    push_gauge(
-        &mut out,
-        "uc2_service_snapshot_pos_bytes",
-        "Position of the newest complete service-built snapshot (0 = none).",
-        snapshots.service_snapshot_pos.load_acquire(),
-    );
     push_gauge(
         &mut out,
         "uc2_node_snapshot_floor_bytes",
@@ -345,20 +547,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         admission_saturation,
     );
 
-    let now = now_unix_ns();
     let node_hb = status.node_heartbeat_ns.load_acquire();
-    let service_hb = status.service_heartbeat_ns.load_acquire();
     push_gauge_f64(
         &mut out,
         "uc2_node_heartbeat_age_seconds",
         "Seconds since this node's own heartbeat was last stamped (a never-written heartbeat reads as a huge age, by design).",
         now.saturating_sub(node_hb) as f64 / 1e9,
-    );
-    push_gauge_f64(
-        &mut out,
-        "uc2_service_heartbeat_age_seconds",
-        "Seconds since the attached service's heartbeat was last stamped (a never-written heartbeat reads as a huge age, by design).",
-        now.saturating_sub(service_hb) as f64 / 1e9,
     );
 
     let mut reported_samples = Vec::new();
@@ -434,6 +628,18 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         "uc2_reports_unattested_total",
         "Durable reports declined for lacking a wire-0.5.0 term attestation.",
         s.reports_unattested.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_snapshot_refused_legacy_peer_total",
+        "Snapshot sessions refused because the sender's SNAP_BEGIN was a 0.5.0 body (too short or layout 0): the fleet is mixed-version; upgrade every node (spec §14.3).",
+        s.receiver.snap_refused_legacy_peer.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_snapshot_refused_declared_set_total",
+        "Snapshot sessions refused because the sender's declared service set differs from this node's [services] ids — a joiner is stuck until the sets match (spec §8).",
+        s.receiver.snap_refused_declared_mismatch.load(Ordering::Relaxed),
     );
     push_counter(
         &mut out,
@@ -627,7 +833,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    use uc2_log::cnc::{CncMeta, CncPage, pack_id_and_role};
+    use uc2_log::cnc::{CncMeta, CncPage, pack_id_and_role, pack_service_status};
     use uc_protocol::v2::cnc::CNC_PEER_ROLE_VOTER;
 
     use super::*;
@@ -653,6 +859,13 @@ mod tests {
         // `uc2_free_disk_bytes` — it's conditionally emitted, same as
         // `uc2_leader_hint` above.
         cnc.store_free_disk_bytes(1);
+        // M14c: declare FSM 0 and a lag bound so the per-service families
+        // render at least one LABELED sample in the base fixture —
+        // `every_contract_series_is_present` would otherwise be satisfied by
+        // the bare family header alone (see `series_present`'s own doc on
+        // why vacuous presence checks are the hazard here).
+        cnc.store_services_declared(0b1);
+        cnc.store_fsm_lag_bytes(1 << 20);
 
         ObsSources {
             node_id: 7,
@@ -738,6 +951,89 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(r#"peer="0""#), "unoccupied slots must not appear: {text}");
+    }
+
+    /// M14c (spec §9): one labelled sample per DECLARED id — including an id
+    /// nothing has ever attached to, which must read `attached 0` rather
+    /// than vanish (an absent series is not alertable).
+    #[test]
+    fn per_fsm_families_render_one_sample_per_declared_id() {
+        let s = synthetic_sources();
+        s.cnc.store_services_declared(0b101); // ids 0 and 2; id 1 NOT declared
+        s.cnc.store_fsm_lag_bytes(65_536);
+        s.cnc.counters().commit.store_release(10_000);
+        let s0 = s.cnc.service_slot(0);
+        s0.status.store_release(pack_service_status(0, true, 3));
+        s0.applied.store_release(9_000);
+        s0.epoch.store_release(7);
+        s0.snapshot_pos.store_release(4_096);
+        s0.lag_waits.store_release(12);
+        // id 2: declared, never attached — every field stays zero.
+        let text = render_prometheus(&s);
+        assert!(text.contains(r#"uc2_service_applied_bytes{service="0"} 9000"#), "{text}");
+        assert!(text.contains(r#"uc2_service_epoch{service="0"} 7"#), "{text}");
+        assert!(text.contains(r#"uc2_service_snapshot_pos_bytes{service="0"} 4096"#), "{text}");
+        assert!(text.contains(r#"uc2_service_attached{service="0"} 1"#), "{text}");
+        assert!(text.contains(r#"uc2_service_attached{service="2"} 0"#), "{text}");
+        assert!(text.contains(r#"uc2_service_lag_bytes{service="0"} 1000"#), "{text}");
+        assert!(text.contains(r#"uc2_service_lag_bytes{service="2"} 10000"#), "{text}");
+        assert!(text.contains(r#"uc2_service_lag_waits_total{service="0"} 12"#), "{text}");
+        assert!(text.contains(r#"uc2_service_heartbeat_age_seconds{service="2"}"#), "{text}");
+        assert!(text.contains("\nuc2_services_declared 5\n"), "{text}");
+        assert!(text.contains("\nuc2_fsm_lag_bytes 65536\n"), "{text}");
+        assert!(!text.contains(r#"service="1""#), "id 1 is not declared: {text}");
+    }
+
+    /// The four M10 aggregates keep their bare names (now "slowest FSM") and
+    /// share ONE family header with their labelled twins — two `# HELP`
+    /// lines for one family is a scrape Prometheus rejects.
+    #[test]
+    fn the_aggregates_keep_their_bare_names_in_one_family_block() {
+        let s = synthetic_sources();
+        s.cnc.store_services_declared(0b11);
+        s.cnc.service().service_applied.store_release(1_234);
+        let text = render_prometheus(&s);
+        assert!(text.contains("\nuc2_service_applied_bytes 1234\n"), "{text}");
+        for name in [
+            "uc2_service_applied_bytes",
+            "uc2_service_epoch",
+            "uc2_service_snapshot_pos_bytes",
+            "uc2_service_heartbeat_age_seconds",
+        ] {
+            assert_eq!(
+                text.matches(&format!("# TYPE {name} ")).count(),
+                1,
+                "exactly one family header for {name}: {text}"
+            );
+        }
+    }
+
+    /// `commit - applied` saturates: a slot that reports past this scrape's
+    /// commit sample (two independent atomics, read microseconds apart)
+    /// reads 0, never a wrapped 18-exabyte lag.
+    #[test]
+    fn service_lag_bytes_saturates_when_applied_is_past_commit() {
+        let s = synthetic_sources();
+        s.cnc.store_services_declared(0b1);
+        s.cnc.counters().commit.store_release(500);
+        s.cnc.service_slot(0).applied.store_release(900);
+        assert!(
+            render_prometheus(&s).contains(r#"uc2_service_lag_bytes{service="0"} 0"#),
+            "{}",
+            render_prometheus(&s)
+        );
+    }
+
+    /// M14c (spec §14.3): the two named snapshot-session refusals render as
+    /// counters off the receiver stats the node already shares with /metrics.
+    #[test]
+    fn snapshot_refusal_counters_render_from_receiver_stats() {
+        let s = synthetic_sources();
+        s.receiver.snap_refused_legacy_peer.fetch_add(3, Ordering::Relaxed);
+        s.receiver.snap_refused_declared_mismatch.fetch_add(1, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_snapshot_refused_legacy_peer_total 3\n"), "{text}");
+        assert!(text.contains("uc2_snapshot_refused_declared_set_total 1\n"), "{text}");
     }
 
     #[test]
