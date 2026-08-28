@@ -83,29 +83,54 @@ unsettled numbers are tabulated above.
 2. **Two independent builds of the *same commit* differ by more than the
    effect being hunted.** R6 A/B'd `hb-m14a` against `hop_bench.main` — both
    built from 3a7f9a5, in different directories, with the pinned toolchain —
-   and measured **+1.02 %**. That is the instrument's build-to-build
-   resolution, and it is larger in magnitude than every matched-provenance
-   M14a-vs-M14b delta in this document. It generalises M14a's codegen lesson
+   and measured **+1.02 %** — larger in magnitude than every
+   matched-provenance M14a-vs-M14b delta in this document, though R6's own
+   ranges OVERLAP, so by this document's rule it too is "not measured" and is
+   an indication of the build-to-build spread rather than a pinned value for
+   it. The direction of the argument survives that caveat: a control that
+   *cannot* differ by source still moves as much as the rows being compared.
+   It generalises M14a's codegen lesson
    (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`: an inline wait ladder
    cost 9 % at N=1 on a path N=1 never executes): at this hop's scale, *where
    the code lands* is worth ~1 %, so a ~1 % A/B between two commits measures
    layout luck, not the source change.
 
 3. **The prior binaries do carry a small, sign-consistent delta — and it is
-   the older build pair, not the source.** Rows R0c/R0g/R0h (−0.61 %, −0.69 %,
-   −1.28 %, all overlapping) and R0d/R0e (−2.76 %, −2.90 %) all use the prior
-   session's two binaries. Their sign never flips, so something in *those two
-   builds* is real; but freshly building the identical two commits erases it
-   (finding 1), and building the same commit twice manufactures a delta of
-   comparable size (finding 2). The residue is the build, not `uc2_client`.
+   the older build pair.** Rows R0c/R0g/R0h (−0.61 %, −0.69 %, −1.28 %, all
+   overlapping) and R0d/R0e (−2.76 %, −2.90 %) all use the prior session's
+   two binaries. Their sign never flips, so something in *those two builds* is
+   real; but freshly building the identical two commits erases it (finding 1),
+   and building the same commit twice manufactures a delta of comparable size
+   (finding 2). That the residue is the **build** rather than `uc2_client` is
+   therefore an **inference by elimination, not a measured fact** — nothing
+   here inspected the object code. The open step that would settle it is a
+   symbol-alignment / disassembly diff of the poll-loop and `handle_record`
+   symbols between `hb-m14a` and `hop_bench.main` (two builds of 3a7f9a5);
+   until that is done, "layout" is the surviving hypothesis, not a conclusion.
 
-4. **Order was refuted as the confound; the harness's pacing is a second
-   one.** The prior session's script ran a fixed `branch → main` order every
-   rep. Swapping it (R0e) *kept* the −2.9 %, so a within-pair position effect
-   is not the explanation. But the same two binaries and the same sink read
-   −2.76 %/−2.90 % under that script and −0.69 %/−1.28 % under
-   `scripts/hop1_ab.sh` (R0g/R0h) — a factor of two to four from the runner
-   alone. See "The runner's own confound" below.
+   One row deserves explicit treatment rather than silence: **R0e
+   (−2.90 %, *disjoint*) is the only row in the table that would pass this
+   document's own decision rule** (≥ 1 %, ranges disjoint). It is not treated
+   as the answer because it is the least controlled row — 5 reps, fixed run
+   order, and the prior session's script rather than the one committed here.
+   R0h is preferred over it as the estimate for that same binary pair: same
+   two binaries, same sink, the committed runner, order alternated, 6 reps —
+   and it reads −1.28 % **OVERLAP**. The honest reading is that the prior
+   pair's delta is somewhere in the −0.6 % to −2.9 % range depending on how
+   it is measured, which is itself the finding about the instrument.
+
+4. **Order was refuted as the confound, and the remaining runner gap is
+   unexplained.** The prior session's script ran a fixed `branch → main` order
+   every rep. Swapping it (R0e) *kept* the −2.9 %, so a within-pair position
+   effect is not the explanation. The same two binaries and the same sink
+   nonetheless read −2.76 %/−2.90 % under that script and −0.69 %/−1.28 %
+   under `scripts/hop1_ab.sh` (R0g/R0h) — a factor of two to four from the
+   runner alone, on a difference this document **did not identify**. It is not
+   the sink-settle pauses: the prior script already contained the identical
+   `sleep 0.5` after `READY` and `sleep 1` after the kill. The untested
+   candidate is the per-rep order **alternation** itself (the prior script
+   alternates nothing within a series; R0e swapped the order *between*
+   series). See "The runner's own confound" below.
 
 5. **Task 1's fast path did what it was built to do, and only that.** R1:
    `p90` median **3 µs → 2 µs** — the pre-M14b tail, restored — with the rate
@@ -117,39 +142,61 @@ unsettled numbers are tabulated above.
    Steps 4–6 (v1: `handle_record`'s fan-in arms out of line; v2: `send`'s
    query prefix out of line; v3: `poll`'s single-ring slice pattern) are
    gated on R0 reproducing a negative delta, and it does not. Their decision
-   rule requires a **≥ +1 %** disjoint delta over 6 reps; finding 2 shows this
-   harness cannot resolve 1 % on this box, so every one of the three would
-   have returned OVERLAP by construction. Recording them as "refuted" would
+   rule requires a **≥ +1 %** disjoint delta over 6 reps; finding 2 indicates
+   this harness does not reliably resolve 1 % on this box, so all three would
+   in all likelihood have returned OVERLAP. Recording them as "refuted" would
    have been a claim the instrument cannot support. They remain untried
    suspects, and `uc2_client/src/engine.rs` is unchanged by this work.
 
 ## The runner's own confound
 
-Two pauses in `scripts/hop1_ab.sh` are measured, not cosmetic: `sleep 0.5`
-after the sink prints `READY` (before the driver attaches) and `sleep 1` after
-the sink is killed (before the next run's sink starts). Without them, the
-driver races the sink's own start-up and every side reads ≈ 5.74 M resp/s
-regardless of which binary drives — a ceiling that masks a real driver-side
-difference. The same binaries and sink read **−0.69 %** unsettled (R0g) and
-**−1.28 %** settled (R0h). The pauses are in the committed script with this
-rationale beside them.
+`scripts/hop1_ab.sh` carries two pauses: `sleep 0.5` after the sink prints
+`READY` (before the driver attaches) and `sleep 1` after the sink is killed
+(before the next run's sink starts). The **only controlled comparison of them**
+in this session is R0g (without) against R0h (with) — same runner, same
+binaries, same sink, order alternated both times: **−0.69 % vs −1.28 %, both
+OVERLAP**. So the pauses are worth roughly 0.6 pp of an overlapping delta.
+They are kept as hygiene — a driver should not race the sink's start-up — not
+as a fix for a demonstrated confound.
 
-This is the M13 lesson in a new place: the first three explanations tried here
-— cross-session drift, the fixed run order, the choice of sink binary — were
-each "consistent with the symptom" and each refuted by a controlled cell
-(R0c/R0g, R0e, R0f respectively). Only the two-builds-of-one-commit control
-(R6) explained it.
+Two claims an earlier draft of this document made here are **withdrawn**, and
+the logs are why:
+
+- *"Without the pauses every side reads ≈ 5.74 M resp/s — a ceiling."* Not
+  what the logs show. Unsettled series means are 5.736/5.754 (R0b),
+  5.771/5.735 (R0c), 5.742/5.739 (R0f), 5.714/5.675 (R0g); settled series
+  means are 5.751/5.734 (R0), 5.751/5.677 (R0h), 5.715/5.774 (R6),
+  5.709/5.706 (R1). Same band. There is no ceiling attributable to the pauses.
+- *"The same two binaries read −2.9 % with the pauses and −0.7 % without
+  them."* False attribution: the −2.9 % is R0e, produced by the **prior
+  session's script, which already contained the identical two pauses**
+  (`run.sh`/`run2.sh`, `sleep 0.5` after `READY` and `sleep 1` after the
+  kill). The pauses cannot be what separates those two numbers.
+
+What *is* higher is the prior script itself — 5.82–5.89 M on its main side,
+above anything `hop1_ab.sh` produced. **That gap is unexplained.** Order was
+refuted (R0e), the sink was refuted (R0f), and the pauses are identical in
+both scripts. The untested candidate is the per-rep alternation.
+
+This is the M13 lesson in a new place: cross-session drift, the fixed run
+order, and the choice of sink binary were each "consistent with the symptom"
+and each refuted by a controlled cell (R0c/R0g, R0e, R0f respectively). The
+two-builds-of-one-commit control (R6) is what supplies the leading
+explanation — subject to finding 3's caveat that it remains an inference.
 
 ## What this changes
 
 - **Nothing in `uc2_client`.** No variant was applied; `engine.rs` is exactly
   the Task-1 commit `f47fe5f`. The claim that M14b cost hop 1 ≈ −4.2 % should
-  not be carried forward from the M14b addendum without a fleet measurement —
-  it is within this box's build-to-build noise.
+  not be carried forward without a fleet measurement — it is within this box's
+  build-to-build noise. Its source is the "Post-execution addendum" of
+  `docs/superpowers/plans/2026-08-27-uc2-m14b-query-routing-and-fan-in.md`
+  (≈ lines 1822–1831), which this document contradicts; amending that file is
+  not this task's to do.
 - **`scripts/hop1_ab.sh` is committed** so the next attempt starts from a
-  runner with the alternation, the fixed sink, the checksum echo, the pacing
-  pauses and the disjointness verdict already in it, rather than an ad-hoc
-  script per session.
+  runner with the alternation, the fixed sink, the checksum echo, the
+  sink-settle pauses and the disjointness verdict already in it, rather than
+  an ad-hoc script per session.
 - **A ~1 % client-hop question belongs on the fleet, not here.** M13 measured
   the fleet chain as cluster-bound (1.75 M/s into a 3-node cluster vs 2.44 M/s
   against a dummy node), so a few percent of client hop may be masked end to

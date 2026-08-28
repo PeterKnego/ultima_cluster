@@ -26,7 +26,7 @@
 #   --sink  hop_bench binary used for `dummy-node` (fixed for every run)
 #   --a     hop_bench binary used as driver A (the baseline)
 #   --b     hop_bench binary used as driver B (the candidate)
-#   --reps  A/B pairs to run (default 6). Even reps run A then B, odd reps
+#   --reps  A/B pairs to run (default 6). Odd reps run A then B, even reps
 #           run B then A, so a warm-up or thermal drift cannot favour a side.
 #   --secs  seconds per run (default 6)
 #   --root  scratch dir for the instance dir and logs (default $HOME/m14c-ab).
@@ -44,7 +44,7 @@ while [ $# -gt 0 ]; do
         --reps) REPS="$2"; shift 2 ;;
         --secs) SECS="$2"; shift 2 ;;
         --root) ROOT="$2"; shift 2 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -83,11 +83,12 @@ run_one() { # $1 = side label (A|B), $2 = driver binary, $3 = rep number
         kill -0 "$sink_pid" 2>/dev/null || { echo "sink died; see $ROOT/sink.log" >&2; exit 1; }
     done
     # Let the sink settle past READY before attaching, and let the previous
-    # run's teardown finish before the next one starts. Measured, not
-    # cosmetic: without these two pauses every side reads ~5.74 M resp/s
-    # regardless of which binary drives, because the driver races the sink's
-    # own start-up — a ceiling that MASKS a real driver-side difference. The
-    # same two binaries read -2.9 % with the pauses and -0.7 % without them
+    # run's teardown finish before the next one starts, so the driver does not
+    # race the sink's own start-up. The only controlled comparison of these
+    # two pauses is R0g (without) vs R0h (with): same runner, same binaries,
+    # same sink, -0.69 % vs -1.28 %, BOTH overlapping. So they are worth about
+    # 0.6 pp of an overlapping delta — kept as hygiene, not as a fix for a
+    # known confound, and they do not explain the larger prior-script gap
     # (docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md, "The runner's own
     # confound").
     sleep 0.5
