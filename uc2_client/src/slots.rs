@@ -17,7 +17,7 @@
 //!
 //! 6. `drain_abort` is exhaustive only after claims are quiesced — a claim racing the drain publishes after the scan passes and is backstopped by the deadline sweep, so pollers must keep sweeping unless claims are provably stopped.
 //!
-//! 7. `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is mutated only by `resolve` on the poll thread: every owner transition to FREE other than `release`'s own CAS (i.e. `resolve`, `sweep`, `drain_abort`) happens on that same poll thread, so `resolve`'s `fetch_or` on `received` — which runs after the owner/generation check and before the completing CAS — never races a concurrent mutator of that word. `resolve` completes a slot (the single owner CAS) only when the last expected bit lands in `received` or a ring-less (`ring: None`) terminal answer arrives, whichever comes first.
+//! 7. `expected` (the ring bitmask a request awaits), `received` (the bitmask of rings that have answered so far) and `fan_in` (whether this request was issued as a fan-in, stored as a separate `AtomicBool`) are written in claim phase 2, under the RESERVED word — invisible to readers until the phase-3 publish. Thereafter `received` is mutated only by `resolve`'s `fetch_or`, and that `fetch_or` never races a concurrent re-claim of the same word: `release` is the ONLY cross-thread freer of a slot (it runs on the send thread, inside `engine.rs`'s `finish_write` — `resolve`/`sweep`/`drain_abort` are all poll-thread-only), and `release(seq)` is called only when that seq's ring write FAILED, meaning no response frame for that generation was ever transmitted and so no `resolve` call for it can be in flight to race the free. A `resolve` that is in flight therefore always targets a generation no concurrent `release` can be freeing, so the matching claim-time reset of `received` (phase 2, under RESERVED) and `resolve`'s `fetch_or` on it are always the same generation, never back-to-back generations racing across the free. This, plus invariant 4 (a stale wire_seq collision needs a 2^32-outstanding gap), also covers reading `expected`/`fan_in` from a newer generation: that read is confined to the same impossible window, and even there the completing `compare_exchange(owner, FREE)` would fail (return `Miss`), so a stale read is never acted on. `resolve` completes a slot (the single owner CAS) only when the last expected bit lands in `received` or a ring-less (`ring: None`) terminal answer arrives, whichever comes first.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
@@ -172,9 +172,15 @@ impl SlotTable {
             if expected & bit == 0 {
                 return Resolve::WrongRing; // not ours to answer; slot untouched
             }
-            // `received` is only ever mutated on the poll thread (this
-            // function) after the claim-time reset, so a plain fetch_or is
-            // exact: a repeated bit is a duplicate delivery on that ring.
+            // `received` is only ever mutated here, and never races a
+            // concurrent re-claim of this word: `release` — the only
+            // cross-thread freer of a slot — fires only when this
+            // generation's ring write FAILED (engine.rs's `finish_write`),
+            // meaning no response frame for it was ever sent; a `resolve`
+            // call in flight for this generation is proof a frame DID
+            // arrive, so no concurrent `release`/re-claim of THIS generation
+            // can be racing it (module doc invariant 7). So a plain fetch_or
+            // is exact: a repeated bit is a duplicate delivery on that ring.
             let prev = slot.received.fetch_or(bit, Ordering::AcqRel);
             if prev & bit != 0 {
                 return Resolve::Miss;
