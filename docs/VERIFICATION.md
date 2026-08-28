@@ -537,7 +537,25 @@ Below the gates sit the **hop-isolation harnesses** — `uc2_gateway/examples/ho
 node) — which produce ratios and ladders, never gated numbers: a dev-box
 figure is smoke. Their worked examples are `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`
 and `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the latter found and
-fixed lockstep's 50 µs-sleep throttle the day M14a merged).
+fixed lockstep's 50 µs-sleep throttle the day M14a merged). `scripts/hop1_ab.sh`
+A/Bs exact binaries of hop 1 (the client) back to back and includes a
+same-source rebuild control; its worked example,
+`docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md`, is the one that found
+the M14b "−4.2 %" reading did not survive a fresh-build control.
+
+**Alert rules are proven to fire, not just to parse.**
+`scripts/m10_alert_fire.sh` builds or breaks a real cluster per rule
+(`uc2_node/examples/m10_alerts.rs`), scrapes each node's *real* `/metrics`
+HTTP endpoint once a second, time-dilates the captured samples onto a
+synthetic timeline sized to that rule's `for:` clause, and lets
+`promtool test rules` adjudicate — one `PASS`/`FAIL` line per shipped rule,
+with the dilation policy disclosed at runtime and every scenario labelled
+`real` or `synthetic`. A rule that ships without an adjudication entry fails
+the run before any cluster starts. All 16 rules are covered; the two M14c
+per-FSM rules (`Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`) are backed
+by `real` two-FSM scenarios — a declared FSM that never attaches, and one
+whose apply loop is slow enough that the node's own report ceiling pins
+`commit − applied` exactly at the lag bound.
 
 ---
 
@@ -627,6 +645,9 @@ cargo test --workspace
 # Transactional safety
 scripts/elle_check.sh                                       # clean tier
 scripts/elle_mutation.sh                                    # the harness's teeth
+
+# Alert rules — every shipped rule fired against a real cluster (needs promtool)
+scripts/m10_alert_fire.sh
 
 # Hard crash
 cargo test -p uc2-crashtest --features hard-crash-tests

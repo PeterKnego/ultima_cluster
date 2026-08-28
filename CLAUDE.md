@@ -303,9 +303,17 @@ Two more from M14a's apply-hop isolation (`docs/benchmarks/uc2-m14a-apply-hop-20
   the set cascades into sleeping in lockstep (18 k frames/s); the yield budget
   has to exceed *any* plausible handshake, not the common one, and spinning
   on a slow peer's line only slows that peer (−6 % bounded at N=8).
+- **Exact binaries are not enough — rebuild the same source twice first.**
+  M14b's client-hop A/B read −4.2 % on one binary pair (17 pairs, no
+  overlap); fresh builds of the same two commits read ±0.3 %, and two
+  builds of the *same* commit differed by 1 %. Before attributing a delta to
+  code, measure the harness's build-to-build resolution with a same-source
+  rebuild control, and only trust deltas outside it (`scripts/hop1_ab.sh`,
+  `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md`).
 
 Harness models: `uc2_gateway/examples/hop_bench` (client/edge/node hops),
-`uc2_node/examples/apply_bench` (the FSM hop alone); worked example
+`uc2_node/examples/apply_bench` (the FSM hop alone), `scripts/hop1_ab.sh`
+(the client hop A/B, with a same-source rebuild control); worked example
 `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`; the convoy mechanism
 `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md`.
 

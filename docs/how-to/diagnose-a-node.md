@@ -48,6 +48,56 @@ own clock. They are separate processes and fail separately: a frozen service
 heartbeat with a live node heartbeat means the apply loop is wedged, not the
 cluster.
 
+## Which FSM is holding the cluster up?
+
+Since M14 a node runs one FSM per declared id, and the slowest one paces
+everything: page 1's service band is the `min` over declared ids, the
+admission door is `append − min(applied) ≤ fsm_lag`, and this node's durable
+report is capped at `min(applied) + fsm_lag`. So a single sick FSM stalls
+commits cluster-wide — by design, and visibly.
+
+Start with `uc2ctl status`, which prints the whole band without a scrape:
+
+```text
+services: declared=[0, 1] fsm_lag=8192 bytes
+  id=0 attached=true epoch=3 incarnation=3 applied=1048576 lag=0 snapshot_pos=1040384 heartbeat_age=0.004s
+  id=1 attached=false epoch=0 incarnation=0 applied=0 lag=1048576 snapshot_pos=0 heartbeat_age=never
+```
+
+Read it in this order:
+
+1. **`attached=false`** on a declared id (`Uc2ServiceAbsent`) — that FSM's
+   process is not running, or it refused to attach. Check the service's own
+   logs for `ServiceNotDeclared` (its `--service-id` is not in this node's
+   `[services] ids`) or the `service.<id>.lock` refusal (two processes, one
+   id). `heartbeat_age=never` distinguishes "never started since this node
+   booted" from "was running, stopped".
+2. **`attached=true` with a stale `heartbeat_age`** (`Uc2ServiceWedged`) —
+   the apply loop is wedged inside `apply()`, not the cluster. The
+   `[log]` records say which: `service_attached` then no `service_detached`
+   means it is still holding its slot.
+3. **`lag` pinned at `fsm_lag`** (`Uc2ServicePinnedAtLagBound`) — that FSM is
+   running, just slower than the log. Nothing is broken; the cluster is being
+   paced to it, which is what a bound buys you. Either make that FSM faster
+   or accept the rate. Raising `fsm_lag` buys latency headroom, not
+   throughput, and it is refused above `buffer_bytes / 2`.
+
+`uc2_service_lag_waits_total{service}` tells you the converse: an FSM whose
+wait counter climbs is the one *being* paced, i.e. a victim, not the cause.
+The cause is the id with the largest `uc2_service_lag_bytes`. Treat
+`lag_waits_total` as reliable under lockstep but an **undercount under
+bounded mode** — the apply loop only counts a wait when the cap sits on a
+frame boundary; `uc2_service_lag_bytes{service}` (what
+`Uc2ServicePinnedAtLagBound` keys on) is the trustworthy pinned-at-bound
+signal either way.
+
+The transition records name arrivals and departures explicitly:
+`{"event":"service_attached","node":0,"service":1,"epoch":4}` and
+`{"event":"service_detached","node":0,"service":1,"epoch":4}`. Departure is
+edge-triggered on either the slot's ATTACHED bit clearing (an orderly stop,
+reported within a duty cycle) or the heartbeat ageing past 3 s (a killed
+process — nothing clears the bit for it).
+
 ## Is replication moving?
 
 Read the counters at 256, 320, 384, 448, 512. On a healthy leader:

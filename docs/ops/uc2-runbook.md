@@ -58,6 +58,11 @@ verify rather than a build:
   `[metrics]`, Prometheus scraping and alert rules, the Grafana dashboard,
   the `/healthz`/`/readyz` probes, and the structured JSON-lines event
   vocabulary.
+- [Diagnose a node → Which FSM is holding the cluster up?](../how-to/diagnose-a-node.md#which-fsm-is-holding-the-cluster-up)
+  — the per-FSM band (`uc2ctl status`'s services table, the
+  `service="<id>"` metric families, `Uc2ServiceAbsent` /
+  `Uc2ServicePinnedAtLagBound`, and the `service_attached`/`service_detached`
+  records).
 
 ## Changing a running cluster
 
@@ -110,6 +115,9 @@ verify rather than a build:
   field. *Was §3's field tables.*
 - [`uc2ctl`](../reference/uc2ctl.md) — sub-commands, arguments, response
   statuses, refusal reasons.
+- [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
+  — which metric families carry a `service` label, what the unlabeled
+  aggregate means now, and the declared-set drift query.
 - [Configuration](../reference/configuration.md) — `NodeConfig`, environment
   switches, crypto file formats, cluster limits.
 - [Linearizable read path](../reference/read-path.md) — how reads are certified

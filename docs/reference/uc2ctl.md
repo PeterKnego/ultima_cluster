@@ -121,8 +121,8 @@ Permanently removes a voter. The id is tombstoned. Wire op `5`.
 ### `status`
 
 Prints the node's current config version and pending state, per-member
-peer-slot observability, and the leader/serving flags. Read-only: it writes no
-admin request.
+peer-slot observability, the per-declared-FSM service table (M14), and the
+leader/serving flags. Read-only: it writes no admin request.
 
 - `--admission-bytes <U64>` — override for the staleness warning's admission
   window. Since wire protocol 0.3.0 the node publishes its configured value on
@@ -139,6 +139,8 @@ Output fields:
 | `leader_hint` | the id this node believes leads; `unknown` when the raw value is `u64::MAX` |
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
+| `services` | the declared id list (cnc 4032's bitmask) and the lag policy — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints an empty list and no rows |
+| per-FSM rows | one line per **declared** id, attached or not: `attached` (the slot's ATTACHED bit), `epoch` (incarnations since this node booted), `incarnation` (the status word's counter), `applied`, `lag` (`commit − applied`), `snapshot_pos`, `heartbeat_age` (`never` if that FSM has not stamped since boot) |
 
 ## Offline commands
 

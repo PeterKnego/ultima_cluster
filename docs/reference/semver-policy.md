@@ -67,6 +67,23 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   breaking change under this policy: `Outcome` and `SubmitError` gained
   variants, so an exhaustive match on either downstream breaks at compile
   time — a documented minor-version hazard of the three-tier promise.
+- **M14c adds the per-FSM observability surface**, all additive:
+  `uc2_service_attached`, `uc2_service_lag_bytes`,
+  `uc2_service_lag_waits_total`, `uc2_services_declared` and
+  `uc2_fsm_lag_bytes` as new metric families; a `service="<id>"` sample per
+  declared id on `uc2_service_applied_bytes`, `uc2_service_epoch`,
+  `uc2_service_snapshot_pos_bytes` and `uc2_service_heartbeat_age_seconds`;
+  the `Uc2ServiceAbsent` and `Uc2ServicePinnedAtLagBound` rules; the
+  `service_attached`/`service_detached` `[log]` records; and a `services:`
+  section in `uc2ctl status`'s output. Nothing was renamed or removed. Two
+  consequences worth flagging even though neither is breaking under this
+  policy: a query that assumed one sample per `uc2_service_*` family now
+  sees several, so `sum(...)` double counts unless it says `{service=""}`
+  (the shipped rules and dashboard were updated); and a scraper of
+  `uc2ctl status` stdout sees new lines between `log:` and `members:`.
+  The metric series contract is not itself in the promised-surface table —
+  `uc2_node::obs` is listed as not promised — but it is treated as an
+  operator interface in practice: families are added, not renamed.
 
 The normative descriptions live where the surface does:
 [the state-machine contract](state-machine-contract.md),

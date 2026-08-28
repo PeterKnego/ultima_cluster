@@ -1830,3 +1830,12 @@ Asked "did M14b measure its hops?" — it had not (T9 ran only the whole-chain `
 | branch + single-ring fast path (`expected == bit` skips the `received.fetch_or`; scratch build, not committed) — 4 runs | 5.61–5.71 M | ≈ 5.67 M (−4.5 %) | 2 µs / 3 µs |
 
 Every one of the 17 main/branch pairs, in both orders, had the branch lower; series 2 and 3 do not overlap at all. **Reading:** M14b costs the client hop ≈ 4 % on this box, reproducibly; the `fetch_or` per single-ring response is what adds 1 µs to p90 (the fast path restores the tail exactly) but it is *not* the rate loss — the rate loss survives the guard, so it is the grown hot body (`handle_record`'s wider `Resolve` match with the fan-in arms and `ring: Option<u8>`, `send`'s prefix branch + three extra claim stores, `poll`'s ring loop): M14a's codegen lesson again. `perf` is unavailable here (`perf_event_paranoid = 4`), so the split between send-thread and poll-thread cost is not measured. The whole chain on the fleet is cluster-bound (M13: direct-Engine 1.75 M/s into the 3-node cluster vs 2.44 M/s single-engine against a dummy node), so a 4 % client-hop loss may be masked end to end — it is a real per-core cost either way. **Deferred to M14c:** keep the fast-path guard (tail win, free), then bisect the hot body the way M14a did (one variant per suspect, out-of-line the fan-in arms, A/B exact binaries) before the M14d fleet gate. Logs: `ab-{1,2,3}.log` in the job scratch (not retained).
+
+**Superseded 2026-08-28 (M14c Task 2):** the −4.2 % did not reproduce on
+freshly built binaries of the same two commits (−0.30 % / +0.31 % / −0.05 %,
+ranges overlapping), and two independent builds of the SAME commit differed
+by +1.02 % — the delta above was a property of that binary pair (layout),
+not of the source; the box resolves ~1 %. Record:
+`docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md`; runner:
+`scripts/hop1_ab.sh`. The 'fetch_or fast path' tail win stands (p90 3 → 2 µs)
+and shipped in M14c Task 1.
