@@ -83,6 +83,7 @@ bound. The set is static and must be identical on every node — it is not a
 live-reconfiguration surface the way `members` is. See
 [Write one config file per host](../how-to/run-a-cluster.md#write-one-config-file-per-host)
 for the operational picture and the M14a snapshot-transfer limitation.
+Background: [how multi-service works](../notes/uc2-m14-multi-service-explained.md).
 
 | Key | Default | Meaning |
 |---|---|---|
