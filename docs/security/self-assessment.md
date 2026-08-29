@@ -14,7 +14,9 @@ boundaries, what is out of model) and [attack surface](attack-surface.md)
 ## 1. Scope and method
 
 **Who:** the maintainers. **When:** 2026-08-23 / 2026-08-24, as milestone M12d
-of the `v2.6.0` release.
+of the `v2.6.0` release. **Revised 2026-08-29 for `2.8.0` (M14, multi-service):**
+the M12d dating below is kept as history; the additions are F7, item 8 in §4,
+and the M14 line in §5.
 
 **What was looked at:** every place the system parses bytes it did not write —
 the pre-auth UDP datagram path, the crypto plane (Noise `IK` handshake, AEAD
@@ -145,6 +147,19 @@ green and vacuous, which is why `scripts/fuzz_smoke.sh` now asserts a floor on
 libFuzzer's reported execution count and CI passes `--min-runs 10000` against a
 600 s budget. **Green now means fuzzed.**
 
+### F7 — an unservable `SNAP_NAK` pinned the snapshot-session slot
+
+**Severity:** low (liveness of a joiner; no integrity effect) · **Status:**
+fixed, `a405e71` (M14c) · **Found by:** the M14c review of the per-FSM intake.
+
+With one artifact per declared FSM in a session (wire 0.6.0), a `SNAP_NAK`
+for a range the sender could not serve left the session slot occupied, so a
+joiner could wedge a sender's slot until the 30 s cycle. The sender now
+refuses a set that misses a declared id up front, an unservable NAK releases
+the slot, and intake I/O failures are retried and counted
+(`uc2_snapshot_intake_io_failures_total`). Reachability: any peer, or anyone
+spoofing one with crypto off — the same reach as every SNAP kind.
+
 ## 3. Known weaknesses, not fixed
 
 Each of these is a decision with a reason, not a backlog item we forgot. The
@@ -217,6 +232,12 @@ Ranked by where we think the residual risk actually is:
    byte budget). We believe the consequence is confined to *liveness of
    exactly-once* for the evicted clients — the tier degrades to at-least-once —
    and not to a correctness violation. That belief deserves checking.
+8. **The multi-artifact snapshot intake state machine** (`uc2_net/src/receiver.rs`,
+   M14c): adopt-on-complete across N artifacts, `.part` files, an abandoned
+   intake's unlink, the declared-set and layout refusals, and the interaction
+   with a concurrent second session from another peer. It is unit-tested and
+   exercised by one two-FSM learner test; nobody outside the project has read
+   it against interleaved or malformed sessions.
 
 ## 5. Verification inventory
 
@@ -234,6 +255,7 @@ The short form:
 | loom | two hand-written models: the **log buffer's** frame-visibility protocol (`uc2_log/tests/loom_frame.rs`) and the **MPSC ring's** claim-then-commit protocol (`uc_protocol/tests/loom_mpsc.rs`, since 2.7.0). Both model the protocol over loom atomics, **not** the mmap; SPSC and the broadcast seqlock are still unmodelled |
 | **Fuzzing (§7)** | **fifteen decoder targets, nightly, with an execution floor** |
 | **Miri (§7)** | **the pure decoders — 62 tests, isolation on, no exclusions; the mmap rings are out of reach** |
+| **M14 multi-service** | unit + in-process integration + sim inv10 + fuzz seeds; **no two-FSM lincheck/partition/crash/Elle yet** (M14c2, `2.8.1`) — [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified) |
 
 ## 6. Dependency posture
 
@@ -269,4 +291,4 @@ rows 5 and 6.
 
 ---
 
-**Status: package prepared 2026-08-24; external review pending (gate row 10).**
+**Status: package prepared 2026-08-24; revised for 2.8.0 on 2026-08-29; external review pending (gate row 10).**

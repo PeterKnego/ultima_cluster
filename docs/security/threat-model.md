@@ -141,6 +141,16 @@ Each of these is a deliberate boundary, not an oversight.
   window at the ingress ring) bound memory per connection and per request. They
   do not make the system resistant to a determined flood, and nothing here
   rate-limits by source.
+- **A stalled FSM is a cluster-scope liveness lever (2.8.0).** M14's report
+  ceiling caps a node's durable report by its own FSMs' progress, so one
+  stalled or slow FSM process on a *quorum* of hosts stalls commit
+  cluster-wide — by design, so a lagging FSM never falls unrecoverably
+  behind. In lockstep mode one stalled FSM also parks every sibling on its
+  host. Same-uid processes are inside the trust boundary, so this is not a
+  new actor; it is a new blast radius for a same-uid mistake (a wedged
+  service, a squatted `service.<id>.lock`). The `Uc2ServiceAbsent` /
+  `Uc2ServicePinnedAtLagBound` alerts are the detection; restarting the FSM
+  is the remedy.
 - **Side channels.** No constant-time claims beyond what the underlying
   primitives make; timing, cache and traffic-shape channels are not analysed.
 - **Your state machine.** `apply` is your code. Nondeterminism in it diverges

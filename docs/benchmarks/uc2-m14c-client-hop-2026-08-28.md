@@ -19,7 +19,7 @@ Binaries, all copied out of their target dirs before any run:
 | `hop_bench.branch` | prior session's build of ce85fea | `dfb8e7529b8d` |
 
 > **Smoke, not a gate.** Dev-box numbers are never compared to a bar
-> (`docs/notes/dev-box-not-a-bench.md`; CLAUDE.md "Benchmarking discipline").
+> (CLAUDE.md "Benchmarking discipline").
 > What this document records is *ratios* from one hop measured alone — the
 > divide-and-conquer method of CLAUDE.md "Finding a performance bottleneck".
 > **This document sets no bar and moves none.** M14d's fleet gate is the
