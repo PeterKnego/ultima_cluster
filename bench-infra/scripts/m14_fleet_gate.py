@@ -463,6 +463,14 @@ def arm_join(voters, learner, a, K, checks):
     rc, out = h.ctl("add-learner", new_id, addr)
     if rc != 0:
         raise RuntimeError(f"add-learner refused: {out.strip()}")
+    # Capture the target at add-learner time (fix round 1): under continuous
+    # fan-in load, `applied` keeps advancing, so reading it after the
+    # learner's node+service units boot (several ssh round trips) would
+    # inflate the target past "join start" and, with it, the 60 s bar for a
+    # reason unrelated to join speed. Spec §15.4 row f is explicit: the
+    # learner must reach both voters' `applied` AT ADD-LEARNER TIME.
+    target = {i: s["applied"] for i, s in status_slots(h)[0].items()}
+    print(f"INFO row f: leader applied at join start {target}", flush=True)
     # t0 is a driver-clock delta at both ends (here and the status poll below),
     # so no host clock is needed for joined_at (amendment 2).
     t0 = time.time()
@@ -472,8 +480,6 @@ def arm_join(voters, learner, a, K, checks):
     for sid, spin in [(0, 0), (1, K)]:
         truncate_log(learner, f"service{sid}")
         start_unit(learner, f"service{sid}", service_args(learner, sid, spin, M14_SNAPSHOT_INTERVAL_BYTES))
-    target = {i: s["applied"] for i, s in status_slots(h)[0].items()}
-    print(f"INFO row f: leader applied at join start {target}", flush=True)
     joined_at = None
     while time.time() < t0 + BAR_F_JOIN_SECS + 5:
         slots, _ = status_slots(learner)
