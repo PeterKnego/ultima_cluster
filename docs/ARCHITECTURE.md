@@ -51,8 +51,8 @@ it for you.
 The natural fit is a modest amount of state that must be *exactly* right, mutated
 by a high rate of small commands: matching engines and order books, exchange and
 trading systems, control planes, metadata and configuration stores, sequencers,
-coordination services. It is the model behind ZooKeeper, etcd, Aeron Cluster, and
-the LMAX-style trading architectures.
+coordination services. It is the model behind ZooKeeper, etcd, and the
+LMAX-style trading architectures.
 
 ### When you would not
 
@@ -76,7 +76,7 @@ consensus thread touches each entry five to seven times, and that is the ceiling
 the throughput plateau is identical on 8 and 16 vCPUs, because the bottleneck is
 one thread doing per-message work.
 
-`ultima_cluster` inverts this, following Aeron's design:
+`ultima_cluster` inverts this:
 
 > **Replication is a byte-stream fan-out of the log itself. Consensus is a control
 > plane that runs at single-digit kHz regardless of message rate.**
@@ -361,13 +361,12 @@ version number promises, and what it deliberately does not, is
 ## Design lineage
 
 The predecessor (`uc_node`, built on `openraft`) was correct and gate-green, and
-structurally capped roughly 13–14× behind Aeron Cluster on matched hardware and
-durability. The decision to rebuild rather than tune rested on measurement, not
+structurally capped roughly 13–14× below what the same hardware and durability
+settings can deliver. The decision to rebuild rather than tune rested on measurement, not
 taste; the retired v1 record is kept in [`docs/tasks/`](/docs/tasks) as a
 negative-results archive.
 
-Three moves were adopted wholesale from Aeron's design — "port the design, not the
-code":
+Three structural moves define the rebuild:
 
 1. Consensus is a control plane; replication is a byte-stream fan-out.
 2. Batching is structural, formed from backlog at every stage — never timer-based.
