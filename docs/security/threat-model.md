@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Threat model
 
 What `ultima_cluster` defends, against whom, and — the more useful half —

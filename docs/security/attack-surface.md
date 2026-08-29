@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Attack surface
 
 Every place `ultima_cluster` parses bytes it did not write, what reaches it,

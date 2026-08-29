@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 # `uc2-fuzz` — coverage-guided fuzzing for ultima_cluster
 
 Structure-unaware [libFuzzer](https://llvm.org/docs/LibFuzzer.html) targets,

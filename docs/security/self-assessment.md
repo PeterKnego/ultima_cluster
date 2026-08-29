@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Security self-assessment
 
 What the maintainers looked at, what they found, and what they know they have
