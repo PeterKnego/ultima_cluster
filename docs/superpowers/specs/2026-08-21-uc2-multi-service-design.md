@@ -746,13 +746,17 @@ any fleet run, per the honest-failure protocol (M7–M13).
 
 ### 15.2 Topology
 
-Five `c6id.2xlarge` (8 vCPU each, 40 vCPU; the account quota is 48 as of
-2026-08-29), `us-east-1`, one placement group, NVMe journals, fsync on —
-the M7 shape (`uc2-m7-gate-2026-07-13.md`). Roles: `hosts[0..3]` three
-voters, `hosts[3]` the learner (idle until row f), `hosts[4]` the client.
-Rows a–e use exactly M13's four-host shape (three voters + a client host on
-the same instance type), so row a's N=1 number is directly comparable to
-M13's full-stack arm; the fifth host is what row f needs and nothing else.
+Four `c6id.2xlarge` (8 vCPU each, 32 vCPU), `us-east-1`, one placement
+group, NVMe journals, fsync on — the M13 shape. Roles: `hosts[0..3]` three
+voters, `hosts[3]` the learner (idle until row f). **The measuring client is
+the direct `Engine`, which is shmem-attached and therefore runs on the
+leader host** — exactly as the M12 and M13 direct arms did
+(`m12_fleet_gate.py:421-437`). A separate client host was drafted on
+2026-08-29 and withdrawn the same day (errata: this paragraph); the
+account's 48-vCPU quota leaves room for a fifth host if a remote-path row
+is ever added, but no row in §15.4 needs one. Rows a–e use exactly M13's
+voter shape, so row a's N=1 number is directly comparable to M13's
+full-stack direct arm.
 
 ### 15.3 Harness: `m12_gate` extended, driven by `m14_fleet_gate.py`
 
@@ -805,7 +809,7 @@ depend on the calibration landing exactly.
 **What "rate" means, everywhere below**: client-observed completed
 operations per second over the arm's steady window (the middle 8 s of a 12 s
 arm; the leading 2 s and trailing 2 s discarded — M9's window rule), envelope
-on, one direct-client process on `hosts[4]` at `m12_gate`'s direct-client
+on, one direct-client process on the leader host at `m12_gate`'s direct-client
 defaults (`--inflight 4096`, 64-byte payload — the M13 sizing). Positions and bytes are the node's view;
 ops are the client's; the gate rates ops.
 
