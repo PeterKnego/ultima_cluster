@@ -27,9 +27,14 @@
 //! ```
 //!
 //! The two client roles each print ONE machine-readable
-//! `RESULT {"arm":…,"responses_per_sec":…,…}` line, which is all the fleet
-//! driver parses. Everything else they print is for a human reading the unit
-//! log.
+//! `RESULT {"arm":…,"responses_per_sec":…,…}` line. That is the main thing
+//! the fleet drivers parse, but not the only one: `client-direct
+//! --timeline` also prints one `TL {"sec":…,"unix_ms":…,"responses":…}` line
+//! per elapsed second (M14's row d reads its recovery clock off those), the
+//! `check-fsms` role prints `FSMS` / `FSMS-OK {"count":…}`, and the `node`
+//! role prints a `… stats: reports_unattested=N snap_refusals=(a,b)` line
+//! whenever those counters change (M14's rows f and c read it). Everything
+//! else these roles print is for a human reading the unit log.
 //!
 //! **`direct`** is `m5_gate`'s measuring client (`uc2_node/examples/m5_gate.rs`)
 //! copied verbatim: three in-process nodes + three typed [`CountSm`] services,
@@ -836,6 +841,8 @@ struct MeasureOpts {
     warmup_secs: u64,
     measure_secs: u64,
     /// Print one `TL {...}` line per elapsed second (row d's recovery clock).
+    /// Independent of `measure_secs`: the timeline is served by a fixed
+    /// per-second bucket array, not by the window's completion-timestamp Vec.
     timeline: bool,
 }
 
@@ -986,8 +993,24 @@ fn run_client_measurement(
     // buckets for `--timeline` — both are the price of a Vec/bucket-array
     // touch per completion, so an unbounded arm (`MeasureOpts::default()`)
     // must not pay for either (ruling: keep the hot loop's body small).
-    let done_ns: Option<Arc<Mutex<Vec<u64>>>> =
-        (opts.measure_secs > 0 || opts.timeline).then(|| Arc::new(Mutex::new(Vec::new())));
+    //
+    // `done_ns` is gated on `measure_secs` ALONE. `--timeline` reads the
+    // bucket array below, never this Vec (the only reader is `window_rate`,
+    // at the end of this function), and the two flags are independent: M14's
+    // row d runs a 45 s timeline arm and row f a 90 s untimed one, neither of
+    // which reads `window_rps`. At ~1 M ops/s those arms would have grown
+    // this Vec to 400-800 MB by DOUBLING inside the poll thread, and a
+    // ~200 MB memcpy can land inside the 2 s recovery window row d exists to
+    // measure. When the window IS wanted, reserve it up front instead of
+    // growing: `measure_secs` seconds at 2 M completions/s (comfortably above
+    // anything this harness has measured), capped at 64 Mi entries = 512 MiB
+    // so a long `--measure-secs` cannot ask for an unbounded reservation.
+    let done_ns: Option<Arc<Mutex<Vec<u64>>>> = (opts.measure_secs > 0).then(|| {
+        let cap = (opts.measure_secs as usize)
+            .saturating_mul(2_000_000)
+            .min(64 << 20);
+        Arc::new(Mutex::new(Vec::with_capacity(cap)))
+    });
     let buckets: Option<Arc<Box<[AtomicU64]>>> = opts.timeline.then(|| {
         Arc::new(
             (0..secs + 40)
