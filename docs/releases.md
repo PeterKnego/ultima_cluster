@@ -1,5 +1,336 @@
 # ultima_cluster releases
 
+## v2.8.0 — <tag date> — M14 multi-service: one log, N state machines
+
+**One replicated log, up to eight state-machine processes per node.** M14a
+(`main` 6111257) put the FSMs on the control page and bound them together;
+M14b (`4347bc2`) gave the client per-FSM routing and a fan-in; M14c
+(`b3f1053`) shipped the snapshot session that carries every FSM's artifact,
+the per-FSM metrics, and a client hot-path investigation that refuted its own
+premise. Spec:
+`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` — §1–§9 the
+design, §14 the M14c as-built amendments, §15 the M14d gate and release
+scope. Gate: `docs/benchmarks/uc2-m14-gate-2026-08-29.md`. Explainer:
+`docs/notes/uc2-m14-multi-service-explained.md`. The per-sub-milestone SDD
+ledgers are the execution records at the end of
+`docs/superpowers/plans/2026-08-27-uc2-m14a-foundation.md`,
+`2026-08-27-uc2-m14b-query-routing-and-fan-in.md` and
+`2026-08-28-uc2-m14c-perf-wire-observability.md`.
+
+**What this release touches at the wire and page level — two flag days.**
+`uc_protocol::version::CURRENT` moves `0.5.0` → `0.6.0`
+(`uc_protocol/src/version.rs:65`) because `SNAP_BEGIN`'s payload grows:
+`SNAP_BEGIN_FIXED_LEN` **26 → 34** fixed bytes
+(`uc_protocol/src/v2/datagram.rs:170`), reusing the 0.5.0 pad rather than
+appending — `[4] layout:u8 = 1 · [5] service_id:u8 · [6..8] zero · [8..16]
+snapshot_pos · [16..24] total_len · [24..32] services_declared:u64 · [32..34]
+config_len · config [34..]` (spec §14.3). Every other datagram — the 16-byte
+header, `DATA`, `NAK`, `AppendPosition`, `TermMap`, the admin datagrams — is
+byte-identical to `0.5.0`. The cnc page goes `2.0` → **`3.0`** and
+`CNC_PAGE_LEN` 4096 → **8192** (`uc_protocol/src/v2/cnc.rs:51`): page 1 keeps
+its byte layout exactly (every existing offset test holds, including M13's
+`offsets_do_not_overlap`), page 2 is `ServiceSlot[8]` at
+`CNC_OFF_SERVICE_SLOTS = 4096`, stride 512 B, and page 1's **last free line**
+takes the 4032 pair — `services_declared: u64` at 4032 and `fsm_lag_bytes:
+u64` at 4040, one writer, the pattern M13 set with 3968/3976. **Page 1 is
+thereby full**; a further page-1 field grows the file by another 4 KiB behind
+the next cnc major (spec §3.2). The client↔gateway remote protocol stays v1
+and the log frame header is untouched (spec §6.3).
+
+### M14a — the foundation (`main` 6111257; plan HEAD `bbac7a8`)
+
+- **Page 2, `ServiceSlot[8]`** (spec §3.1). Eight 64-byte lines per slot, one
+  writer each: `status` (`service_id | attached | incarnation`), `applied`,
+  `epoch`, `output_completed`, `snapshot_pos`, `heartbeat_ns`, `lag_waits`,
+  and line 7 reserved. Offsets pinned in **both** `uc_protocol::v2::cnc` and
+  `uc2_log::cnc` with the const-asserts and tests the `PeerSlots` band has.
+- **Page 1's singular fields become node-written aggregates** (spec §3.2):
+  `service_applied` (512), `output_completed` (640), `service_heartbeat_ns`
+  (960) and `service_snapshot_pos` (1152) are now the **min over declared
+  ids**, computed once per consensus poll; `service_epoch` (576) is retired
+  and held at 0, readers moving to the slot. `uc2ctl status`, the M10 metric
+  families, the dashboard and the purge floor keep reading one number whose
+  meaning is now "the slowest FSM", and the one-writer-per-line rule survives
+  (the writer changed from the service to the node; it did not become shared).
+- **`[services]` in `node.toml`** (spec §3.3): `ids` (absent section ⇒ `[0]`)
+  and `fsm_lag` (a byte size, or `"lockstep"`; default `buffer_bytes / 4`),
+  with M9-style named startup refusals before any file is created — empty
+  `ids`, a duplicate id, an id ≥ 8, an unparsable `fsm_lag`, and `fsm_lag >=
+  buffer_bytes / 2` (a bounded policy must provably keep the FSMs on the ring:
+  half the ring is the conservative bound that still leaves room for the
+  leader's admission window).
+- **The lag barrier** (spec §4.2), one step in `apply_cycle` before each
+  frame at `[p, p + len)`: `floor = min(slot[i].applied)` over declared ids,
+  then `lockstep: wait while floor < p` / `bounded: wait while p + len − floor
+  > fsm_lag`. It reads only shared memory, is role-agnostic, keeps the
+  heartbeat ticking while waiting, counts `lag_waits` per episode, and **does
+  not apply during journal replay** — a replaying FSM is the one holding the
+  min down. As-built errata, both in §4.2: (1) the pairwise bound is a target
+  cap on *live* apply — on a follower, a sibling that falls off the ring
+  rejoins via `replay_into` to the archived frontier, so the excursion is
+  possible there and harmless (responses are leader-only), while the leader's
+  admission door enforces the bound before a frame is even appended, so the
+  leader's own FSMs never see it; (2) a lockstep `Wait` is served out of line
+  by `lockstep_wait` — spin, then yield with a heartbeat refresh, and only
+  then the agent's 50 µs sleep — because a lockstep FSM that sleeps on a live
+  sibling stalls every sibling's next frame and the whole set cascades into
+  sleeping in lockstep. Measured on the dev box (smoke, not a bar): **18 k →
+  631 k frames/s at N=2** (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
+  A *bounded* `Wait` still goes straight to the sleep: it is `fsm_lag` bytes
+  ahead of the slowest FSM, and spinning on that FSM's `applied` line slows it
+  (−6 % at N=8 when tried).
+- **Q — the quorum-gated durable report** (spec §5.3). The node's published
+  frontier becomes `ceiling = min(sm.validated_up_to(), min_applied +
+  fsm_lag_eff)`, attested with `term_map.term_at(ceiling − 1)`, stored term
+  first then position, both `Release` — the 0.5.0 content-attestation
+  ordering, unchanged, and `ceiling ≤ validated_up_to` always, so a node never
+  attests content it has not validated. The receiver in `uc2_net` is
+  untouched. Consequence: if a **commit quorum's** FSMs fall more than
+  `fsm_lag` behind, the leader's `CommitTracker` cannot advance and its
+  admission door closes — cluster-wide back-pressure; a lagging **minority**
+  does not stall the cluster, it falls to journal replay and rejoins.
+- **Per-id everything** (spec §4.4, §5.5, §7.5): `service.<id>.lock` held for
+  the service's life (`uc2_service/src/attach.rs:95`), `snapshots/<id>/`,
+  `state/output_progress.<id>.state`, and, created by the node,
+  `svc_query.<id>.ring` + `egress_service.<id>.broadcast` per declared id. The
+  legacy singular ring names are **not** created. M11's offline
+  backup/verify/restore learned the `snapshots/<id>/` layout in the same
+  sub-milestone.
+- **The boot reservation formula** (spec §5.5). Each declared id adds a 1 MiB
+  `svc_query.<id>.ring` and a 4 MiB `egress_service.<id>.broadcast`, all
+  fallocated so ENOSPC stays a named startup refusal, so the reservation is
+  **`buffer_bytes` + 14 MiB + 5 MiB × (N − 1)** (+4 KiB for page 2) — about
+  113 MiB at N = 8 with the default buffer, against ~78 MiB at N = 1.
+
+### M14b — routing and fan-in (`main` 4347bc2; plan HEAD `efc5339`)
+
+- **The query codec splits** (spec §5.4, §6.3): `query.ring`'s `MSG_V2_QUERY`
+  payload becomes `service_id:u8 ++ query bytes`; `drain_query_ring` forwards
+  to that id's `svc_query.<id>.ring`. The `svc_query` payload
+  (`expected_epoch ++ query`) and the log frame header are unchanged, and the
+  M13 MPSC record framing is untouched — the service byte lives inside the
+  message payload.
+- **`MSG_V2_BAD_SERVICE`** (payload `service_id:u8`, on
+  `egress_node.broadcast`): a query naming an undeclared id is **answered**
+  instead of parking until the client's deadline.
+- **The slot table grows two masks and a flag**: `expected` (the rings a
+  request awaits) and `received`, plus `fan_in` as a separate `AtomicBool` —
+  execution Ruling A, because deriving fan-in from `expected.count_ones() > 1`
+  breaks on a node declaring only FSM 0, where `try_submit_all` has
+  `expected = 0b1` and would have completed as a single response. Completion
+  is `received == expected` or a ring-less terminal, whichever comes first;
+  exactly-once still rests on the single owner CAS, not on `received`
+  (`uc2_client/src/slots.rs` module invariants 7 and 8).
+- **The fan-in buffer is `PollHalf`-owned**, one entry per slot index, and
+  resets on a generation's **first** piece rather than on a sequence change —
+  execution Ruling E: a partial fan-in abandoned by a ring-less terminal or
+  the deadline sweep leaves pieces behind, and the generation 2^32 requests
+  later at that index carries the same u32 wire seq, so a seq key cannot tell
+  them apart while `first` (decided by the slot table) always can.
+- **The API**: `submit_to(id)` / `try_submit_to`, `submit_all` /
+  `try_submit_all` (`FanInTicket<R>` → `Vec<(u8, R)>` ascending by id, one
+  ticket, one completion), and `query_snapshot_on` / `query_linearizable_on`.
+  An undeclared id fails locally with `ClientError::ServiceNotDeclared`
+  before touching a ring. `Engine::attach` reads `services_declared` off the
+  page and opens one egress consumer per declared id; `poll` round-robins
+  them ascending, then the node ring.
+- **Sim invariant 10** (M14b plan Task 7): the four inline `Msg::Report` sites
+  in `uc2_sim`'s `world.rs` are funnelled through `send_report`, which clamps
+  to the node's `apply_ceiling` — the sim's model of "the slowest FSM's
+  applied position + `fsm_lag`" — and runs inv10, which catches a report above
+  its unclamped value, above its ceiling, or decreasing without a reset
+  (truncation, restart, role change). Two capped-quorum scenarios came with
+  it, and the discrimination check is recorded in the M14b execution record:
+  with the ceiling ignored, commit ran to 18 912 against a cap of 288.
+- **A ruling worth keeping** (Ruling C): a sibling FSM's answer to a
+  single-FSM request is *dropped and counted as a duplicate*, not as
+  `wrong_ring` — `poll` drains ring 0 first, FSM 0's answer frees the slot,
+  and the late piece loses the owner check before the ring check is reached.
+
+### M14c — the client hop, wire `0.6.0`, observability (`main` b3f1053; plan HEAD `74f16bc`)
+
+- **The A/B that refuted its own premise.** M14c was scoped around M14b's
+  measured −4.2 % client-hop cost. Rebuilding the identical two commits and
+  A/B-ing the exact binaries back to back (`scripts/hop1_ab.sh`, 6 reps,
+  alternated order, fixed sink) read **−0.30 %, +0.31 % and −0.05 %** across
+  three configurations, all with overlapping ranges — and a control that A/B'd
+  **the same commit built twice** manufactured **+1.02 %**, larger than the
+  effect being hunted. The planned three-variant bisection was therefore
+  **stopped before it started**: recording three "refuted" variants would have
+  been a claim the instrument cannot support. What ships from that workstream
+  is Task 1's single-ring fast path — `resolve` skips the `received.fetch_or`
+  when `expected == bit`, since a set of one is opened and closed by its only
+  piece — kept for its measured **tail** win (p90 3 → 2 µs) at a rate delta
+  of −0.05 %, OVERLAP. The standing rule this produced, now CLAUDE.md's third
+  benchmarking bullet: **build the same source twice and A/B those binaries
+  first**; treat anything smaller than that control's spread as unmeasurable
+  on the box. Record:
+  `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md` (dev box, smoke).
+- **The snapshot session becomes a stream of artifacts** (spec §14.3). One
+  `SnapSession`/`SnapIntake` as before, but for every declared id in ascending
+  order: one `SNAP_BEGIN` naming the id, that id's newest artifact position
+  and length, followed by that artifact's chunks. **Chunk offsets are
+  stream-global** — the session is one concatenated byte stream with artifact
+  boundaries announced by the BEGINs — so `SNAP_NAK` repair is byte-identical
+  to `0.5.0`. The receiver writes each artifact to
+  `snapshots/<id>/incoming-<pos>.part`, renames on completion, tracks
+  `received` against the BEGIN's `services_declared`, and adopts the floor
+  **only when `received == services_declared`**, so no FSM is ever stranded
+  below an adopted floor. Two named, counted refusals on the receiving node:
+  `layout == 0` → **`peer wire 0.5.0`**, and a mask that is not this node's
+  declared set → **`declared-set mismatch`**; both drop the session, the
+  follower keeps NAKing, and the operator sees the counter
+  (`Node::snapshot_session_refusals`).
+- **The flag day, stated honestly** (spec §14.3's "§3.4 correction"). The
+  16-byte datagram header carries **no version field**, and
+  `uc_protocol::version::CURRENT` has no caller on any receive path — it is
+  documentary. So the spec's original "a 0.5.0 peer refuses a 0.6.0 datagram
+  at the existing version check" is false. The truth: a mixed cluster
+  replicates and elects normally, and only a snapshot session between versions
+  goes wrong — detectable only on the **0.6.0** side, via the `layout` byte. A
+  0.5.0 receiver of a 0.6.0 BEGIN misreads `config_len`. The flag day is real
+  and rests on the standing operational rule (upgrade all nodes together),
+  not on a check that does not exist. Adding a real header version field is
+  out of scope — the header is full, and it would be its own flag day.
+- **Two deliberate strictnesses** (spec §14.3/§14.4 errata; neither is a bug
+  to "fix"): the receiver validates `services_declared` on **every**
+  `SNAP_BEGIN`, not only the first, because a session whose later BEGIN
+  disagrees with its first is exactly the mixed/forged case the refusal
+  exists for; and `service_detached` also fires when the slot's ATTACHED bit
+  clears, not only when the heartbeat ages past the wedged threshold, so an
+  orderly stop is not reported a stale-window late.
+- **Per-FSM observability** (spec §14.4). Labelled twins via the existing
+  `push_labeled` (`service="<id>"`) — the peer-slot band's mechanism, not a
+  new one; the unlabeled aggregates keep their names and now mean "slowest
+  FSM". New families: `uc2_service_attached`, `uc2_service_lag_bytes`,
+  `uc2_service_lag_waits_total`, `uc2_services_declared`, `uc2_fsm_lag_bytes`
+  (0 = lockstep) — all in `CONTRACT_SERIES`, so the presence test and the
+  `m10_gate` live scrape cover them. Two alert rules with `m10_alerts`
+  scenarios that prove them firing: `Uc2ServiceAbsent` and
+  `Uc2ServicePinnedAtLagBound` (`scripts/m10_alert_fire.sh` 16/16, both
+  `state=real`). `uc2ctl status` prints a per-service table off the page it
+  already opens, and `service_attached` / `service_detached` land as
+  transition records.
+- **A documented limitation, not a fix** (execution Ruling K):
+  `uc2_service_lag_waits_total` reads **0 while an FSM is parked at the
+  bounded barrier** — M14a's known undercount, surfaced now that the counter
+  is exported. The writer is in `uc2_service`, which M14c does not touch; the
+  limitation is written into `monitor-a-cluster.md` and `diagnose-a-node.md`,
+  the alert keys on `lag_bytes` instead, and the service-side fix is M14c2.
+- **Fixed on the transfer plane**: a `SNAP_BEGIN` resend no longer refreshes
+  the session's activity clock (a dead peer would have pinned the session
+  slot), and a `SNAP_NAK` that is unservable forever no longer keeps a dead
+  session alive (`uc2_net/src/sender.rs`'s
+  `an_unservable_snap_nak_does_not_keep_a_dead_session_alive`); snapshot
+  intake I/O failures are retried and counted
+  (`uc2_snapshot_intake_io_failures_total`).
+- **Evidence across the M14c finish** (`2ef480d`, then the fix wave
+  `74f16bc`): `cargo test --workspace` 1 411 passed / 0 failed (102
+  binaries); `lin_v2` 7/7 and `lin_partition_v2` 7/7 Linearizable;
+  `uc2-crashtest --features hard-crash-tests` green; sim-heavy 38/38;
+  `m10_gate coverage` 72/72; fuzz `uc_protocol_datagram` 51 019 361 runs
+  clean. All single-FSM capstones — see *Deferred* for what two FSMs still
+  lack.
+
+### The gate
+
+`docs/benchmarks/uc2-m14-gate-2026-08-29.md`, bars pre-committed verbatim
+from spec §15.4 before any run, per the honest-failure protocol M7–M13 use.
+Topology (spec §15.2): four `c6id.2xlarge` in one placement group,
+`us-east-1`, NVMe journals, fsync on — M13's shape, three voters plus a
+learner idle until row f. The measuring client is the direct `Engine`, which
+is shmem-attached and therefore runs **on the leader host**, exactly as the
+M12 and M13 direct arms did; rate is completed ops/s over the middle 8 s of a
+12 s arm at `--inflight 4096`, 64-byte payload, session envelope on, fan-in
+whenever two FSMs are declared (one completion = every declared FSM
+answered). Rows a–f are fleet-only; row g is CI.
+
+| row | what it compares | bar |
+|---|---|---|
+| a | two bounded `CountSm` FSMs (`n2eq`) vs one (`n1`), same run | ≥ 0.90 |
+| b | `CountSm` + `SpinCountSm(K)` (`pair`) vs `SpinCountSm(K)` alone (`slow1`), same K, same run | within [0.90, 1.10] |
+| c | after every arm, every FSM on every host answers the same count | any mismatch = FAIL; blocks the release |
+| d | SIGKILL FSM 1 on the leader host under fan-in load, restart at once | ≤ 15 s to a confirmed 2 s window ≥ 80 % of baseline, FSM 1 re-attached with lag ≤ bound |
+| e | lockstep arms vs their bounded twins | reported, no bar |
+| f | a learner declaring `{0,1}` joins a purged two-FSM leader under load | ≤ 60 s, `snapshot_session_refusals() == (0, 0)` on every node, both artifacts on the learner, row c on the learner |
+| g | `ci.yml` and the newest `nightly.yml` at or after the gated commit | green; the doc states the M14c2 deferral |
+
+`K` is not fixed in advance: a calibration ladder (`SpinCountSm(K)` alone at
+K ∈ {250 … 8000}) runs first and picks the K whose rate is nearest 0.5 × `n1`,
+and row b then compares `pair` against `slow1` **at that same K in the same
+run**, so the bar does not depend on where the calibration lands. Row d reuses
+M9's recovery rule verbatim (`m9_fleet_gate.py:343-379`), read off the
+client's own per-second timeline on the host being killed, so there is no
+clock skew. Row f runs the voters at `PurgePolicy::BelowSnapshot {
+slack_bytes: 0 }` with 16 KiB journal segments and a 32 KiB snapshot interval,
+so the joiner is genuinely below the floor and must converge by a snapshot
+session. Driver: `bench-infra/scripts/m14_fleet_gate.py` (`--selftest` checks
+the verdict arithmetic with no fleet).
+
+**Results: the fleet run has not been made.** It is a user-gated step, and the
+gate doc's result cells are empty by design until it is.
+
+<!-- PENDING FLEET RUN: fill from docs/benchmarks/uc2-m14-gate-2026-08-29.md Results -->
+
+The only M14 numbers that exist today are dev-box smoke and set no bar:
+`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the FSM hop alone —
+bounded mode free of N, and the 18 k → 631 k lockstep fix) and
+`docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md` (the client hop A/B and
+its same-source rebuild control).
+
+### Deferred
+
+- **M14c2 — the two-FSM proof tier, a proof-only `2.8.1`** (spec §15.1, a
+  2026-08-29 ruling that reversed §14.1's order). `2.8.0` ships multi-service
+  with the coverage VERIFICATION §11 states — unit tests, in-process
+  integration on one node and a 3-node cluster (`uc2_node/tests/services.rs`,
+  `learner.rs`'s two-FSM join, `uc2_net/tests/snapshot_session.rs`'s
+  two-artifact stream), the M14b sim scenario, and the fuzz seeds — and says
+  so. What M14c2 adds: `lin_v2 two_fsm` (lockstep, bounded, a slow-FSM
+  oracle), `lin_partition_v2` with two FSMs, the two hard-crash scenarios, and
+  the Elle clean tier with two FSMs, plus the M14c plan's own "Deferred to
+  M14c2" list — the receiver-side intake timeout, the `snap_chunk` write-failure
+  counter and the publish re-drive cadence (execution Ruling M), the sender's
+  refusal-path unit tests, and the `lag_waits` bounded-mode undercount
+  (Ruling K). **This is a disclosed gap, not a claim.**
+- **The M14a and M14b deferred minors** are listed, each with what it costs if
+  wrong, in the "Deferred to M14b/M14c" and "Deferred to M14c" sections of the
+  two plans' execution records
+  (`docs/superpowers/plans/2026-08-27-uc2-m14a-foundation.md`,
+  `2026-08-27-uc2-m14b-query-routing-and-fan-in.md`). None is on a correctness
+  path.
+- **Out of scope, unchanged since §14.5**: a datagram header version field, a
+  remote-protocol service selector (a protocol-v2 item — in stage 1 a remote
+  client always gets FSM 0's answer, spec §6.4).
+
+### Three behaviours that live only in rustdoc
+
+The M14b execution record asked for these to be carried into the release
+writeup, because they are real, user-visible, and documented nowhere but the
+API docs.
+
+1. **A query at exactly the payload cap is refused.** The cap describes the
+   **wire** payload, and a query now carries its one-byte service id, so a
+   query body of exactly `max_payload` bytes fails with
+   `PayloadTooLarge { len: n + 1, max: n }` — deviation 6, documented at
+   `uc2_client/src/engine.rs:429-436` (and the inherited-cap rationale at
+   `engine.rs:74-84`).
+2. **A parked driver is woken only by FSM 0's ring.** `PollHalf::wait_handle`
+   returns ONE futex — the lowest declared id's egress broadcast — so a
+   completion that lands solely on another FSM's ring resolves at the park
+   timeout (≤ 1 ms in the pipelined driver) rather than at the publish;
+   deviation 3, documented at `uc2_client/src/engine.rs:680-690`. The gateway
+   only ever issues FSM-0 requests, so its driver is unaffected.
+3. **`submit_all` against a declared-but-unattached FSM times out every
+   fan-in.** `try_submit_all` sets `expected` to the page's *declared* set
+   (`uc2_client/src/engine.rs:506-509`) and completion is `received ==
+   expected` (`uc2_client/src/slots.rs`, module invariant 7), so an id that is
+   declared but has no process attached never contributes its piece and every
+   fan-in resolves via the engine's deadline sweep as `Outcome::TimedOut` —
+   the only way a `Timeout` can reach a ticket at all
+   (`uc2_client/src/ticket.rs:179-184`). Wait for every declared FSM to attach
+   before fanning in.
+
 ## v2.7.0 — 2026-08-26 — M13 remote path: performance and flow control
 
 **Three defects, one milestone.** Located by

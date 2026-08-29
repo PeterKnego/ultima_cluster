@@ -7,6 +7,80 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+<!-- `<tag date>` is pre-tag scaffolding: `docs/how-to/cut-a-release.md` §1's last step ("retire the pre-tag scaffolding") dates this heading when the tag is cut. -->
+## v2.8.0 — <tag date> — several state machines behind one log (M14)
+
+A cluster can now run up to eight state-machine processes per node, all fed
+by the one replicated log: submit to any of them, fan a query across all, and
+keep them within a bounded distance of each other or in lockstep. The
+node-to-node wire moves to `0.6.0` (one datagram changed) and the control
+page to cnc `3.0` (8 KiB) — both flag days, on the same terms as every prior
+one. Proof record, row by row: [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md).
+Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained.md).
+
+- **`[services]`: declare N state machines, bounded or lockstep**
+  (`uc2_node`, `uc2_service`): ids `0..8` (id 0 is the default responder and
+  the only one the remote path reaches), each attaching with
+  `ServiceConfig::service_id`, holding `service.<id>.lock`, and publishing
+  its progress on the cnc page's per-service band. A lag policy keeps them
+  together: `fsm_lag = "<bytes>"` bounds how far any FSM may lead another;
+  `"lockstep"` makes every FSM finish frame k before any starts k+1. A
+  node's durable report is capped by its own FSMs' progress, so commit
+  stalls only when a quorum's FSMs are stuck — never on one straggler. →
+  [Configuration § `[services]`](docs/reference/configuration.md#services) ·
+  [Limits](docs/reference/limits.md)
+- **Per-FSM routing and a client fan-in** (`uc2_client`, `uc_protocol`):
+  `submit_to(id)`, `submit_all` (one ticket, every FSM's answer),
+  `query_snapshot_on` / `query_linearizable_on`; a query names its FSM on the
+  wire and an undeclared id answers `BAD_SERVICE` instead of parking. →
+  [How it works § routing and fan-in](docs/notes/uc2-m14-multi-service-explained.md#routing-and-fan-in) · [Read path](docs/reference/read-path.md)
+- **A snapshot session ships every FSM's artifact — wire `0.6.0`**
+  (`uc2_net`): `SNAP_BEGIN` now names the FSM, the sender's declared set and
+  a layout byte; a joiner adopts the floor only once the whole set has
+  landed, and refuses by name a `0.5.0` sender or a mismatched set rather
+  than installing half a cluster. → [Upgrade: the 0.6.0 flag day](docs/how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060) ·
+  [Wire protocol](docs/reference/wire-protocol.md)
+- **Per-FSM observability** (`uc2_node`, `uc2ctl`): `service="<id>"` twins of
+  the service families, `uc2_service_attached`, `uc2_service_lag_bytes`,
+  `uc2_service_lag_waits_total`, `uc2_services_declared`; two alerts
+  (`Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`) proven to fire; a
+  per-FSM table in `uc2ctl status`; `service_attached`/`service_detached`
+  transition records. → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
+  [uc2ctl](docs/reference/uc2ctl.md)
+- **Per-FSM backup and restore**: `snapshots/<id>/` per FSM in the backup
+  artifact and on restore. → [Back up a cluster](docs/how-to/back-up-a-cluster.md)
+- **Fixed:** an unservable `SNAP_NAK` no longer pins a snapshot-session slot;
+  intake I/O failures are retried and counted (`uc2_snapshot_intake_io_failures_total`).
+  The lockstep barrier no longer sleeps on a live sibling (18 k → 631 k
+  frames/s at N=2 on the dev box) — [apply-hop bench](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md).
+- **Performance:** the M14 gate's bars are pre-committed and **the fleet run
+  has not been made yet** — rows a (two bounded FSMs vs one, same run:
+  **≥ 0.90**), b (a fast + slow FSM pair vs the slow FSM alone: **within
+  [0.90, 1.10]**), c (every FSM on every host agrees on the final count: **any
+  mismatch is a FAIL and blocks the release**), d (SIGKILL an FSM on the
+  leader host under fan-in load: **≤ 15 s** back to 80 % of baseline, and that
+  FSM re-attached inside its lag bound), e (lockstep against its bounded twin:
+  reported, **no bar**), f (a two-FSM learner joins a purged leader under
+  load: **≤ 60 s**, zero snapshot-session refusals, both artifacts present).
+  <!-- PENDING FLEET RUN: fill from docs/benchmarks/uc2-m14-gate-2026-08-29.md Results -->
+  → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md). Dev-box smoke,
+  never a bar: [apply hop](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md)
+  and [client hop](docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md).
+
+**Upgrade consequence.** Wire `0.6.0` and cnc `3.0` are flag days: stop every
+node, upgrade, start them together; a mixed cluster replicates and elects but
+a snapshot session between versions is refused by name, so a joiner stalls
+until the fleet matches. Existing single-service deployments need no config
+change — no `[services]` section means `{0}` with the default bound. A
+service must attach as id 0 (the default). Details, in the imperative:
+[Upgrade a cluster](docs/how-to/upgrade-a-cluster.md).
+
+**Coverage.** Multi-service ships with unit tests, in-process integration
+(one node and a 3-node cluster), a sim scenario for the report ceiling and
+fuzz seeds for the new wire bytes. The two-FSM linearizability, partition,
+hard-crash and Elle capstones are the next, proof-only release (`2.8.1`,
+"M14c2") — stated in [VERIFICATION §11](docs/VERIFICATION.md#11-what-is-not-verified).
+
 ## v2.7.0 — 2026-08-26 — the remote path at the cluster's speed (M13)
 
 The remote path — `client → TCP → gateway → shared memory → node` — now runs
