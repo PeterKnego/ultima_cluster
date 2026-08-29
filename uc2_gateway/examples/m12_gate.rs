@@ -1913,41 +1913,88 @@ fn run_client_remote_role(a: ClientRemoteArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// M14d fix round 1: the settle loop's per-pass verdict, pulled out pure so
+/// it's unit-testable without a cluster. `counts` empty (no successful pass
+/// yet, e.g. every attempt hit a query error) is never a pass.
+fn fsms_pass_ok(counts: &[(u8, u64)], expect: Option<u64>, expect_min: Option<u64>) -> bool {
+    if counts.is_empty() {
+        return false;
+    }
+    let agree = counts.windows(2).all(|w| w[0].1 == w[1].1);
+    let n = counts[0].1;
+    let vs_expect = match (expect, expect_min) {
+        (Some(e), _) => n == e,
+        (None, Some(m)) => n >= m,
+        (None, None) => true,
+    };
+    agree && vs_expect
+}
+
 /// M14d row c: every declared FSM answers the same count, equal to (or at
 /// least) what the client completed. Any mismatch is exit 1 — the row is a
 /// consensus/apply defect, not a rate.
 fn run_check_fsms_role(a: CheckFsmsArgs) -> anyhow::Result<()> {
-    let client = uc2_client::Client::connect(&a.instance_dir, &a.app_id)?;
+    let deadline = Instant::now() + Duration::from_secs(a.settle_secs);
+    // M14d fix round 1: a node that just restarted (rows d/f, right after a
+    // kill or a join) may not have its cnc page ready yet — retry connect
+    // the same as the query loop below rather than exiting 1 on the first
+    // attempt (the blocking `Client`'s errors, including a bare `NotLeader`
+    // during a leader change, propagate immediately with no retry of their
+    // own: `uc2_client/src/error.rs`).
+    let client = loop {
+        match uc2_client::Client::connect(&a.instance_dir, &a.app_id) {
+            Ok(c) => break c,
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "connect to {:?} failed after {}s: {e}",
+                        a.instance_dir,
+                        a.settle_secs,
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
     let declared = client.declared();
     let ids: Vec<u8> = (0..8u8).filter(|i| declared & (1u64 << i) != 0).collect();
     anyhow::ensure!(!ids.is_empty(), "no FSM declared on {:?}", a.instance_dir);
-    let deadline = Instant::now() + Duration::from_secs(a.settle_secs);
     let mut last: Vec<(u8, u64)> = Vec::new();
+    let mut last_err: Option<String> = None;
     loop {
-        last.clear();
+        let mut pass: Vec<(u8, u64)> = Vec::with_capacity(ids.len());
+        let mut pass_err: Option<String> = None;
         for &id in &ids {
-            let c: u64 = match a.mode {
-                CheckMode::Linearizable => client.query_linearizable_on(id, &())?,
-                CheckMode::Snapshot => client.query_snapshot_on(id, &())?,
+            let r: Result<u64, _> = match a.mode {
+                CheckMode::Linearizable => client.query_linearizable_on(id, &()),
+                CheckMode::Snapshot => client.query_snapshot_on(id, &()),
             };
-            last.push((id, c));
+            match r {
+                Ok(c) => pass.push((id, c)),
+                Err(e) => {
+                    pass_err = Some(e.to_string());
+                    break;
+                }
+            }
         }
-        let agree = last.windows(2).all(|w| w[0].1 == w[1].1);
-        let n = last[0].1;
-        let vs_expect = match (a.expect, a.expect_min) {
-            (Some(e), _) => n == e,
-            (None, Some(m)) => n >= m,
-            (None, None) => true,
-        };
-        if agree && vs_expect {
-            break;
+        match pass_err {
+            // A query error (e.g. `NotLeader` mid-election, right after a
+            // kill or a join) is not a divergence — skip this pass's
+            // agreement check and keep the last successful pass's counts.
+            Some(e) => last_err = Some(e),
+            None => {
+                last = pass;
+                if fsms_pass_ok(&last, a.expect, a.expect_min) {
+                    break;
+                }
+            }
         }
         if Instant::now() >= deadline {
             for (id, c) in &last {
                 println!("FSMS {{\"id\":{id},\"count\":{c}}}");
             }
             anyhow::bail!(
-                "divergence after {}s: counts {last:?}, expect {:?}, expect_min {:?}",
+                "divergence after {}s: counts {last:?}, expect {:?}, expect_min {:?}, last_err {last_err:?}",
                 a.settle_secs, a.expect, a.expect_min
             );
         }
@@ -2041,5 +2088,22 @@ mod tests {
         assert_eq!(n, 3);
         assert!((rps - 3.0 / 8.0).abs() < 1e-9, "{rps}");
         assert_eq!(window_rate(&done, 0, 0), (0, 0.0));
+    }
+
+    #[test]
+    fn fsms_pass_ok_agreement_and_expect() {
+        // agree + exact match on `--expect` → pass.
+        assert!(fsms_pass_ok(&[(0, 42), (1, 42)], Some(42), None));
+        // agree but the exact `--expect` doesn't match → not a pass.
+        assert!(!fsms_pass_ok(&[(0, 42), (1, 42)], Some(43), None));
+        // `--expect-min` satisfied (agreeing counts at or above it) → pass.
+        assert!(fsms_pass_ok(&[(0, 42), (1, 42)], None, Some(40)));
+        assert!(fsms_pass_ok(&[(0, 42), (1, 42)], None, Some(42)));
+        assert!(!fsms_pass_ok(&[(0, 42), (1, 42)], None, Some(43)));
+        // disagreement is never a pass, expect/expect_min notwithstanding.
+        assert!(!fsms_pass_ok(&[(0, 42), (1, 41)], None, None));
+        assert!(!fsms_pass_ok(&[(0, 42), (1, 41)], Some(42), None));
+        // no successful pass yet (every attempt hit a query error) → not a pass.
+        assert!(!fsms_pass_ok(&[], None, None));
     }
 }
