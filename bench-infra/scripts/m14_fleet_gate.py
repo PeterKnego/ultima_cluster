@@ -340,8 +340,94 @@ def arm_rates(voters, a, rates, checks):
     return K
 
 
+def status_slots(h):
+    """`uc2ctl status` per-FSM rows (M14c) → {id: {...}}; also returns the
+    node's fsm_lag bound (bytes; 0 = lockstep) from the `services:` line."""
+    r = ssh(h, f"sudo {BUILT_CTL} status --instance-dir {h.dir} --app-id {APP}", label="uc2ctl")
+    out = (r.stdout or "") + (r.stderr or "")
+    slots = {}
+    for m in STATUS_RE.finditer(out):
+        slots[int(m.group(1))] = {
+            "attached": m.group(2) == "true", "applied": int(m.group(5)),
+            "lag": int(m.group(6)), "snapshot_pos": int(m.group(7)),
+        }
+    lm = re.search(r"fsm_lag=(\d+) bytes|fsm_lag=(lockstep)", out)
+    bound = 0 if (lm is None or lm.group(2)) else int(lm.group(1))
+    return slots, bound
+
+
+def node_stats(h):
+    """Last `stats:` line of the node unit's log → (unattested, legacy, mismatch)."""
+    out = tail_log(h, "node", lines=400)
+    hits = STATS_RE.findall(out or "")
+    if not hits:
+        return None
+    u, l, m = hits[-1]
+    return int(u), int(l), int(m)
+
+
+def parse_timeline(out):
+    return [(int(json.loads(m)["unix_ms"]), int(json.loads(m)["responses"])) for m in TL_RE.findall(out)]
+
+
+def bound_timeline(tl, end_ms):
+    """Drop trailing timeline buckets published after the client's own run
+    ended. `--timeline` prints one TL line per bucket for `secs + 40`
+    buckets, so ~40 s of zero-response buckets trail the run and would
+    otherwise read as an outage to `recovery_time`. Buckets strictly before
+    `end_ms` are kept unchanged."""
+    return [(ms, r) for ms, r in tl if ms < end_ms]
+
+
 def arm_kill(voters, a, K, checks):
-    raise NotImplementedError("Task 4c")
+    """Row d: the bounded pair under fan-in load; SIGKILL FSM 1's unit on the
+    leader host; start it again at once. Recovery is judged twice — the
+    client's own per-second timeline (M9's window rule, same host as the
+    kill so no clock skew) and `uc2ctl status` showing FSM 1 attached with
+    lag ≤ bound."""
+    leader = start_cluster_m14(voters, [(0, 0), (1, K)])
+    h = voters[leader]
+    run_rate_arm(voters, leader, a, "kill", fan_in=True, secs=KILL_ARM_SECS, timeline=True, unit=True)
+    t_start = time.time()
+    time.sleep(12.0)                       # 2 s ramp + [2,10) s baseline + slack
+    t0 = time.time()
+    ssh(h, f"sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-service1", label="SIGKILL")
+    start_unit(h, "service1", service_args(h, 1, K, 0))
+    attached_at = None
+    deadline = t0 + 30.0
+    _, bound = status_slots(h)
+    while time.time() < deadline:
+        slots, _ = status_slots(h)
+        s1 = slots.get(1)
+        if s1 and s1["attached"] and (bound == 0 or s1["lag"] <= bound):
+            attached_at = round(time.time() - t0, 2)
+            break
+        time.sleep(0.25)
+    # let the client finish, then read its timeline
+    time.sleep(max(0.0, (t_start + KILL_ARM_SECS + 8) - time.time()))
+    out = tail_log(h, "client", lines=2000) or ""
+    d = parse_result(out, "direct")
+    tl = parse_timeline(out)
+    if d:
+        # Amendment 1: bound the timeline by the client's own run so the ~40
+        # trailing zero-response buckets --timeline keeps emitting past
+        # RESULT don't read as an outage. t_start_ms is the client's own
+        # clock (the first TL line's unix_ms), not the driver's local time,
+        # so this is immune to driver/host clock skew.
+        t_start_ms = tl[0][0] if tl else int(t_start * 1000)
+        tl = bound_timeline(tl, t_start_ms + int(d["elapsed_secs"] * 1000) + 1000)
+    t0_ms = int(t0 * 1000)
+    base_lo, base_hi = int((t_start + 2) * 1000), int((t_start + 10) * 1000)
+    baseline, recovered, windows = recovery_time(tl, t0_ms, base_lo, base_hi)
+    print("INFO recovery timeline (ops/s per 2 s window, end-relative to t0): " +
+          ", ".join(f"{(e - t0_ms) / 1000:.1f}s:{r:.0f}" for e, r in windows[:25]), flush=True)
+    print(f"INFO row d: baseline {baseline:.0f}/s, rate recovered at {recovered}s, "
+          f"FSM 1 attached+lag≤{bound} at {attached_at}s; client lost={d['lost'] if d else '?'}", flush=True)
+    kill_unit(h, "client")
+    check_all(voters, leader, "kill", checks, expect_min=int(d["responses"]) if d else None)
+    stop_cluster_m14(voters)
+    return {"baseline": baseline, "recovered_at": recovered, "attached_at": attached_at,
+            "bound": bound, "client_lost": d["lost"] if d else None}
 
 
 def arm_join(voters, learner, a, K, checks):
@@ -389,6 +475,9 @@ def selftest():
     expect("row d fail late attach", not verdict_row_d({"baseline": 1000, "recovered_at": 9.5, "attached_at": 16.0}).passed)
     expect("row d fail never", not verdict_row_d({"baseline": 1000, "recovered_at": None, "attached_at": 3.0}).passed)
     expect("row e always passes", verdict_row_e({"n2eq": 100.0, "n2eq-ls": 40.0}).passed)
+    tl_in = [(ms, 100) for ms in range(0, 5000, 1000)] + [(ms, 0) for ms in range(5000, 45000, 1000)]
+    expect("bound_timeline drops trailing buckets past end_ms, keeps earlier",
+           bound_timeline(tl_in, 5000) == [(ms, 100) for ms in range(0, 5000, 1000)])
     good = {"joined_at": 30.0, "refusals": {"h0": (0, 0), "h1": (0, 0), "h2": (0, 0), "h3": (0, 0)},
             "artifacts": {0: 1, 1: 1}, "check_ok": True}
     expect("row f pass", verdict_row_f(good).passed)
