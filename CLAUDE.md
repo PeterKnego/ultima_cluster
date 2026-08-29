@@ -162,8 +162,8 @@ against 600 s per target); `fuzz/README.md` covers adding a target,
 regenerating the corpus, and `tmin`/`cmin`.
 
 The elle scripts write histories to `$HOME/.cache/uc2-elle*` (disk) — never
-override `ELLE_DIR`/`ELLE_MUT_DIR` to `/tmp` (RAM tmpfs, no swap → OOM; see
-"Local box" below). Nightly CI runs the clean tier (`elle` job); the weekly
+override `ELLE_DIR`/`ELLE_MUT_DIR` to `/tmp` (often RAM-backed tmpfs → OOM; see
+"Local scratch" below). Nightly CI runs the clean tier (`elle` job); the weekly
 `elle-weekly.yml` runs the mutation tier.
 
 Cross-host fleet gates run via `bench-infra/` (terraform + ansible
@@ -240,31 +240,36 @@ Workspace crates:
 - `ultima_journal` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved).
 
-## Local box: do NOT write heavy artifacts to `/tmp`
+## Local scratch: keep heavy artifacts off `/tmp`
 
-**`/tmp` on this box is `tmpfs` — RAM-backed — and there is NO swap.** Anything
-written under `/tmp` (including the agent scratchpad at `/tmp/claude-*/`) consumes
-resident RAM. Large test outputs there (multi-tens-of-thousands-of-event elle
-histories, journal segments, load-test dumps) race the busy-spin node clusters
-and `cargo` release builds for a ~15 GiB pool, and the kernel then `SIGKILL`s the
-biggest process (exit 137/143) — which manifests as tests dying mid-run or the
-Claude Code harness itself getting torn down ("previous process exited"). This
-recurs; avoid it structurally:
+On many Linux dev boxes `/tmp` is `tmpfs` — RAM-backed — and swap may be small
+or absent. Anything written there (including the agent scratchpad at
+`/tmp/claude-*/`) then consumes resident RAM, and large test outputs
+(multi-tens-of-thousands-of-event elle histories, journal segments, load-test
+dumps) race the busy-spin node clusters and `cargo` release builds for the
+same pool until the kernel `SIGKILL`s the biggest process (exit 137/143) —
+which manifests as tests dying mid-run or the Claude Code harness itself
+getting torn down ("previous process exited"). This has happened repeatedly
+on developer machines; avoid it structurally rather than by assuming the
+current machine is big enough (do not encode a particular box's size,
+mounts, or free space here — this file is shared):
 
-- **Write test/scratch artifacts to real disk** (`/dev/sda1`, mounted at `/`, ~66
-  GiB free), NOT `/tmp`. For the elle harness, set `ELLE_DIR` under `/home/claude`
-  (e.g. `/home/claude/elle-out`), never the default `/tmp/uc2-elle`.
-- Test **instance dirs / journals already go to ext4** via
-  `env!("CARGO_TARGET_TMPDIR")` (the `tempdir()` helper in the test suites) — keep
-  it that way; do not `tempdir()` under `/tmp`.
+- **Write test/scratch artifacts to real disk** (a path under `$HOME`), NOT
+  `/tmp`. For the elle harness, set `ELLE_DIR` under `$HOME` (e.g.
+  `$HOME/elle-out`), never the default `/tmp/uc2-elle`. Check with
+  `findmnt /tmp` if unsure what backs it.
+- Test **instance dirs / journals already go to the cargo target tree** via
+  `env!("CARGO_TARGET_TMPDIR")` (the `tempdir()` helper in the test suites) —
+  keep it that way; do not `tempdir()` under `/tmp`.
 - Keep generated histories small (cap op targets), bound `elle-cli`'s JVM heap
   (`-Xmx`), and `rm -rf` scratch between runs to reclaim RAM.
 
 ## Benchmarking discipline
 
 Perf **rate bars are fleet-only** (`bench-infra/`); a local run is **smoke**,
-never a gate — never move a bar because a dev-box run went red. The box is
-small and noisy: the same dip measured 7× spanned 0–18% against a 10% bar.
+never a gate — never move a bar because a dev-box run went red. A dev box is
+noisy whatever its size (busy-spin agents contend for the scheduler): on one,
+the same dip measured 7× spanned 0–18% against a 10% bar.
 
 The cargo target dir (`~/.cache/cargo-target`) is **shared by the main
 checkout and every worktree**, so another checkout's build can silently swap
