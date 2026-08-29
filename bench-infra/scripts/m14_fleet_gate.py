@@ -11,7 +11,9 @@ Arms (each a fresh cluster generation unless noted):
   slow1   {0} SpinCountSm(K)                         → rate(slow1)
   pair    {0,1} CountSm + SpinCountSm(K), bounded    → rate(pair)      row b
   n2eq-ls / pair-ls  the same two pairs in lockstep  → reported        row e
-  kill    pair under load; SIGKILL FSM 1 on the leader host; restart   row d
+  kill    pair with a snapshot policy on BOTH FSMs, load submitted to FSM 0
+          only; SIGKILL FSM 1 on the leader host; restart it with the same
+          snapshot policy (procedure re-specified 2026-08-29)      row d
   join    pair + purge + snapshots; add-learner on hosts[3] under load row f
   row c   check-fsms after EVERY arm above (leader: linearizable; every
           host: snapshot) — any mismatch FAILs the gate.
@@ -495,10 +497,10 @@ def bound_timeline(tl, end_ms):
 
 
 def arm_kill(voters, a, K, checks):
-    """Row d: the bounded pair under fan-in load; SIGKILL FSM 1's unit on the
-    leader host; start it again at once. Recovery is judged twice — the
-    client's own per-second timeline (M9's window rule) and `uc2ctl status`
-    showing FSM 1 attached with lag ≤ bound.
+    """Row d: the bounded pair under load submitted to FSM 0; SIGKILL FSM 1's
+    unit on the leader host; start it again at once. Recovery is judged twice
+    — the client's own per-second timeline (M9's window rule) and `uc2ctl
+    status` showing FSM 1 attached with lag ≤ bound.
 
     Single-clock discipline (fix round 1): the kill instant (`t0_ms`) and the
     baseline window are both taken on the HOST clock (the same clock that
@@ -507,9 +509,41 @@ def arm_kill(voters, a, K, checks):
     only for `attached_at` (a driver-clock delta at both ends of the
     `uc2ctl status` poll, so it stays internally consistent) and the poll
     deadline."""
-    leader = start_cluster_m14(voters, [(0, 0), (1, K)])
+    # ---------------------------------------------------------------------
+    # PROCEDURE RE-SPECIFIED 2026-08-29, after run 1 of the M14 fleet gate
+    # (docs/benchmarks/uc2-m14-gate-2026-08-29.md, "Re-specification —
+    # applied 2026-08-29 (run 2)"). THE BAR IS UNCHANGED (BAR_D_* above, M9's
+    # rule plus the attach clause); run 1's FAIL and its numbers stay in the
+    # record. Two things changed, both about what the row can measure:
+    #
+    #  (1) BOTH FSMs run with `snap=M14_SNAPSHOT_INTERVAL_BYTES` (32 MiB) —
+    #      the cluster below and the restarted FSM 1 further down. Run 1 gave
+    #      neither a snapshot policy, so the restarted FSM replayed the WHOLE
+    #      journal (~11.9 M commands, ~1.3 GB) and `attached_at` was a
+    #      replay-completion clock (21.6 s). A deployed service installs its
+    #      newest artifact and tail-replays one interval; that is what M9's
+    #      15 s budget was itemised against. Purge stays OFF here (row f owns
+    #      the purge shape).
+    #  (2) The measuring client submits to FSM 0 ONLY (`fan_in=False`). Under
+    #      fan-in a submit completes only when EVERY declared FSM answers, and
+    #      journal replay is publish-silent (uc2_service/src/replay.rs:44-46),
+    #      so in run 1 all 4 096 in-flight requests could retire only on the
+    #      client's 30 s `request_timeout` — the rate read 0 for the rest of
+    #      the arm regardless of how fast FSM 1 recovered, and `lost` came out
+    #      at exactly `--inflight`. Submitting to FSM 0 alone removes that
+    #      artifact and still measures the recovery the row wants: FSM 0 is the
+    #      default responder, and its apply is held back by the bounded lag
+    #      barrier (64 MiB) once FSM 1 is dead, so the client's completion rate
+    #      falls at the kill and rises again exactly when FSM 1 has caught up
+    #      enough to release the barrier.
+    #
+    # Row c's checks after this arm still verify BOTH FSMs (`expect_min =
+    # responses`), unchanged: FSM 1 must still agree with FSM 0 and with every
+    # remote host in both read modes.
+    # ---------------------------------------------------------------------
+    leader = start_cluster_m14(voters, [(0, 0), (1, K)], snap=M14_SNAPSHOT_INTERVAL_BYTES)
     h = voters[leader]
-    run_rate_arm(voters, leader, a, "kill", fan_in=True, secs=KILL_ARM_SECS, timeline=True, unit=True,
+    run_rate_arm(voters, leader, a, "kill", fan_in=False, secs=KILL_ARM_SECS, timeline=True, unit=True,
                  measure=False)
     t_start = time.time()
     time.sleep(12.0)                       # 2 s ramp + [2,10) s baseline + slack
@@ -524,7 +558,7 @@ def arm_kill(voters, a, K, checks):
     pre_inc = pre["incarnation"] if pre else None
     r = ssh(h, f"date +%s%3N; sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-service1", label="SIGKILL")
     t0_ms = int((r.stdout or "").strip().splitlines()[0])   # host clock: the SIGKILL instant
-    start_unit(h, "service1", service_args(h, 1, K, 0))
+    start_unit(h, "service1", service_args(h, 1, K, M14_SNAPSHOT_INTERVAL_BYTES))
     attached_at = None
     deadline = t0 + 30.0
     while time.time() < deadline:
