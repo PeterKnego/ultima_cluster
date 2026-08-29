@@ -30,12 +30,12 @@ detection-timing confirmation is still outstanding.
 
 ## Try it
 
-Download the signed `v2.7.0` tarball and run its quickstart — no toolchain
+Download the signed `v2.8.0` tarball and run its quickstart — no toolchain
 needed:
 
 ```bash
-tar xzf uc2-2.7.0-x86_64-unknown-linux-gnu.tar.gz
-uc2-2.7.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
+tar xzf uc2-2.8.0-x86_64-unknown-linux-gnu.tar.gz
+uc2-2.8.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
 ```
 
 Three nodes, three services and three gateways come up on this host, a real
