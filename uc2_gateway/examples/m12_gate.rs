@@ -68,7 +68,7 @@ use hdrhistogram::Histogram;
 use uc2_client::{Engine, EngineConfig, Outcome, SubmitError};
 use uc2_gateway::{Edge, EdgeConfig, Member};
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig};
+use uc2_node::{Node, NodeConfig, ServicesConfig};
 use uc2_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf, SubmitError as RemoteSubmitError};
 use uc2_service::{
     RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig,
@@ -165,6 +165,23 @@ struct NodeArgs {
     /// Ingress admission window in KiB (`append - commit` backpressure gate).
     #[arg(long, default_value_t = 256)]
     admission_kib: u64,
+    /// M14d: declared FSM ids, comma-separated (`0,1`). Absent = `{0}` with
+    /// the node's default lag bound — every pre-M14 arm is byte-for-byte
+    /// unchanged. Refused by name like `node.toml`'s `[services].ids`.
+    #[arg(long)]
+    services: Option<String>,
+    /// M14d: `lockstep` or a byte bound (`65536`, `16MiB`) — the string form
+    /// of `[services].fsm_lag`, parsed by the same function.
+    #[arg(long)]
+    fsm_lag: Option<String>,
+    /// M14d row f: `PurgePolicy::BelowSnapshot { slack_bytes: 0 }` (as
+    /// `m6_gate`'s node role) so a late joiner is genuinely below the floor.
+    #[arg(long, default_value_t = false)]
+    purge_below_snapshot: bool,
+    /// M14d row f: journal segment size; small (16 KiB, M7's value) so purge
+    /// actually drops prefixes inside a 60 s arm.
+    #[arg(long, default_value_t = uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES)]
+    journal_segment_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -399,6 +416,7 @@ fn seed_for(id: u32) -> u64 {
     0xA1B2_C3D4_5566_7788 ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn node_config(
     id: u32,
     members: Vec<(u32, SocketAddr)>,
@@ -407,6 +425,9 @@ fn node_config(
     app_id: &str,
     buffer_bytes: usize,
     admission_bytes: u64,
+    services: ServicesConfig,
+    purge: uc2_node::PurgePolicy,
+    journal_segment_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -421,11 +442,11 @@ fn node_config(
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),
         faults: FaultConfig::default(),
-        purge: uc2_node::PurgePolicy::Disabled,
+        purge,
         learners: Vec::new(),
-        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        journal_segment_bytes,
         crypto: uc2_node::CryptoConfig::Disabled,
-        services: uc2_node::ServicesConfig::default(),
+        services,
     }
 }
 
@@ -490,6 +511,9 @@ where
             app_id,
             NODE_BUFFER_BYTES,
             DEFAULT_ADMISSION_BYTES,
+            ServicesConfig::default(),
+            uc2_node::PurgePolicy::Disabled,
+            uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id), make_sm())
@@ -1170,6 +1194,40 @@ fn parse_id_addr_list(s: &str) -> Vec<(u32, String)> {
         .collect()
 }
 
+/// M14d: `--services` / `--fsm-lag` → the `ServicesConfig` a node boots
+/// with. Absent flags are the node default; refusals name the flag, the way
+/// `node.toml`'s loader names the field (`config_file.rs`'s `services.ids` /
+/// `services.fsm_lag`).
+fn services_from_flags(
+    services: Option<&str>,
+    fsm_lag: Option<&str>,
+) -> anyhow::Result<ServicesConfig> {
+    let lag = match fsm_lag {
+        None => None,
+        Some(raw) => Some(
+            uc2_node::services::parse_fsm_lag(raw.trim())
+                .map_err(|detail| anyhow::anyhow!("--fsm-lag {raw:?}: {detail}"))?,
+        ),
+    };
+    match services {
+        None if lag.is_none() => Ok(ServicesConfig::default()),
+        None => ServicesConfig::from_ids(&[0], lag)
+            .map_err(|detail| anyhow::anyhow!("--services (default 0): {detail}")),
+        Some(list) => {
+            let ids = list
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<u8>()
+                        .map_err(|e| anyhow::anyhow!("--services {list:?}: {s:?} is not an id ({e})"))
+                })
+                .collect::<anyhow::Result<Vec<u8>>>()?;
+            ServicesConfig::from_ids(&ids, lag)
+                .map_err(|detail| anyhow::anyhow!("--services {list:?}: {detail}"))
+        }
+    }
+}
+
 /// A per-process session identity for the direct arm. Random enough that two
 /// successive `client-direct` runs against the same long-lived service do NOT
 /// collide on `(client_id, seq)` — a collision would make the second run's
@@ -1206,6 +1264,12 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         })
         .collect();
     let id = a.id;
+    let services = services_from_flags(a.services.as_deref(), a.fsm_lag.as_deref())?;
+    let purge = if a.purge_below_snapshot {
+        uc2_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 }
+    } else {
+        uc2_node::PurgePolicy::Disabled
+    };
     let cfg = node_config(
         id,
         members,
@@ -1214,17 +1278,28 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         &a.app_id,
         FLEET_BUFFER_BYTES,
         a.admission_kib * 1024,
+        services,
+        purge,
+        a.journal_segment_bytes,
     );
     let node = Node::start(cfg)?;
-    println!("m12_gate node {id} up; parking (killed externally by the harness)");
+    println!(
+        "m12_gate node {id} up (services={:#b}); parking (killed externally by the harness)",
+        services.declared()
+    );
     // Protocol 0.5.0 observability, same as `m5_gate`'s node role: the
     // attestation counter is process-local, so it cannot come out through the
-    // cnc page. On a healthy throughput run it must stay 0.
-    let mut last = u64::MAX;
+    // cnc page. On a healthy throughput run it must stay 0. M14d adds the
+    // snapshot-session refusal counters (below-floor joins the node had to
+    // turn away).
+    let mut last = (u64::MAX, (u64::MAX, u64::MAX));
     loop {
-        let now = node.reports_unattested();
+        let now = (node.reports_unattested(), node.snapshot_session_refusals());
         if now != last {
-            println!("m12_gate node {id} stats: reports_unattested={now}");
+            println!(
+                "m12_gate node {id} stats: reports_unattested={} snap_refusals=({},{})",
+                now.0, now.1 .0, now.1 .1
+            );
             last = now;
         }
         thread::sleep(Duration::from_millis(500));
@@ -1426,4 +1501,37 @@ fn run_client_remote_role(a: ClientRemoteArgs) -> anyhow::Result<()> {
     print_report("gateway (Edge + RemoteEngine)", &stats);
     print_result_json("gateway", &stats, a.secs, a.payload, a.inflight);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uc2_node::FsmLag;
+
+    #[test]
+    fn services_from_flags_absent_is_the_node_default() {
+        let s = services_from_flags(None, None).unwrap();
+        assert_eq!(s.declared(), 0b1);
+        assert_eq!(s.resolve_lag(1 << 20), ServicesConfig::default().resolve_lag(1 << 20));
+    }
+
+    #[test]
+    fn services_from_flags_two_ids_bounded_and_lockstep() {
+        let s = services_from_flags(Some("0,1"), Some("65536")).unwrap();
+        assert_eq!(s.declared(), 0b11);
+        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Bounded(65536));
+        let s = services_from_flags(Some("0, 1"), Some("lockstep")).unwrap();
+        assert_eq!(s.declared(), 0b11);
+        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Lockstep);
+    }
+
+    #[test]
+    fn services_from_flags_refuses_by_name() {
+        let e = services_from_flags(Some("1"), None).unwrap_err().to_string();
+        assert!(e.contains("--services"), "{e}");
+        let e = services_from_flags(Some("0,x"), None).unwrap_err().to_string();
+        assert!(e.contains("--services"), "{e}");
+        let e = services_from_flags(Some("0"), Some("bogus")).unwrap_err().to_string();
+        assert!(e.contains("--fsm-lag"), "{e}");
+    }
 }
