@@ -325,7 +325,12 @@ its own honest-failure clock. →
 [M14 gate § row d](benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed).
 Result of run 2:
 
-<!-- PENDING RUN 2 -->
+Row d alone was re-run on the re-specified procedure (purge on, 32 MiB
+snapshots on both FSMs, FSM-0-only client) on **2026-08-29** at commit
+`6228365`: **PASS** — recovered at 5.5 s and attached+caught-up at 7.9 s,
+both well inside the unchanged ≤ 15 s bar; run 1's FAIL under the original
+procedure stays in the record and is not superseded. →
+[M14 gate § Run 2 (re-specified)](benchmarks/uc2-m14-gate-2026-08-29.md#run-2-re-specified).
 
 Dev-box smoke, which sets no bar and does not predict the fleet's shape:
 `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the FSM hop alone —

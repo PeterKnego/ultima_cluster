@@ -83,7 +83,11 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
     claims to. Full diagnosis, and a re-specification that is **proposed, not
     applied**: → [M14 gate § row d](docs/benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed);
     re-specified and re-run 2026-08-29 — result:
-    <!-- PENDING RUN 2 -->
+    re-run alone under the re-specified procedure (purge on, snapshots on
+    both FSMs, FSM-0-only client) on 2026-08-29 at commit `6228365`:
+    **PASS** — recovered 5.5 s, attached+caught-up 7.9 s, well inside the
+    ≤ 15 s bar; run 1's FAIL above stays in the record →
+    [M14 gate § Run 2 (re-specified)](docs/benchmarks/uc2-m14-gate-2026-08-29.md#run-2-re-specified).
   - **g — pending**: the gated commit has never been pushed, so no CI or
     nightly run exists at it.
   → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md). Dev-box smoke,
