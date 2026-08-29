@@ -570,6 +570,28 @@ fn restart_node0_and_assert_converges(cluster: &mut Cluster) {
     let _stderr = capture_stderr(&mut node0_child, "node0-restarted");
     wait_for_fresh_instance(&cluster.dirs[0], cluster.node0_old_instance_id, Duration::from_secs(15));
     cluster.node0_child = node0_child; // now guarded by the struct's own teardown at scope-end.
+
+    // The ORIGINAL service fail-stops itself on the instance_id change (its
+    // v2.0 contract), and a real supervisor only respawns a process that has
+    // EXITED. Since M14a the apply agent owns an exclusive `service.<id>.lock`
+    // for the service's life, so the respawn must come after that exit:
+    // `svc_procs[0] = Some(spawn_service(..))` evaluates the RHS before
+    // dropping the old `Reap`, so it spawned the replacement while the
+    // original's apply thread was still on its way to the panic — and the
+    // replacement died with `AlreadyAttached` (nightly 33184711408, both
+    // tests; the local box happened to win the race). Waiting for the exit
+    // (the service bin exits non-zero once an agent dies, like the
+    // `counter-service` template) also makes the fail-stop contract an
+    // assertion here instead of a side effect this harness merely relied on.
+    let mut original_svc = cluster.svc_procs[0].take().expect("node 0's service was spawned at boot");
+    let status = poll_exit(&mut original_svc.0, Duration::from_secs(15)).expect(
+        "node 0's original service never fail-stopped after the node restarted with a fresh instance_id",
+    );
+    assert!(
+        !status.success(),
+        "node 0's original service exited cleanly ({status}); expected the instance_id fail-stop"
+    );
+    drop(original_svc); // already exited; Reap's kill is a no-op, wait() reaps.
     cluster.svc_procs[0] = Some(spawn_service(&cluster.dirs[0]));
 
     let leader_idx = loop {

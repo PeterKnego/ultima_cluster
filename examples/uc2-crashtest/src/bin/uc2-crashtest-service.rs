@@ -3,8 +3,11 @@
 
 //! Service-only reference binary for the v2 multi-process hard-crash test
 //! (M5 Task 14, spec §8 L3). Waits for the node's `cnc2.dat` to appear (up
-//! to 30s), attaches, runs the non-persisting `RegisterSm`, then parks until
-//! killed (the test SIGKILLs it mid-apply).
+//! to 30s), attaches, runs the non-persisting `RegisterSm`, then supervises
+//! it the way the `counter-service` template does: poll `is_alive` and exit
+//! non-zero the moment the apply agent fail-stops (instance_id change, log
+//! rewind), so a harness acting as the supervisor can wait for the exit and
+//! respawn. A hard death is still the test's job (it SIGKILLs mid-apply).
 //!
 //! `--sessioned` (M12a Task 11) wraps the register in `Sessioned` so the
 //! service can sit behind a gateway edge running with its session envelope
@@ -16,7 +19,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use uc2_service::{ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
+use uc2_service::{RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
 use uc_lincheck::register::RegisterSm;
 
 #[derive(Parser)]
@@ -55,24 +58,33 @@ fn main() -> anyhow::Result<()> {
     let cfg = ServiceConfig::new(args.instance_dir, args.app_id).service_id(service_id);
     // Two separate `start()` calls rather than one over a boxed SM: the
     // builder is generic over the state machine and `Service<S>` carries `S`
-    // in its type, so the branch has to happen here. Both arms park forever
-    // holding their service alive — dropping it would stop the apply agent.
+    // in its type, so the branch has to happen here. Both arms hand the
+    // service to `supervise`, which holds it alive until it fail-stops.
     if args.sessioned {
-        let _svc =
-            ServiceBuilder::new(cfg, Sessioned::new(RegisterSm::default(), SessionConfig::default()))
-                .start()?;
+        let svc = ServiceBuilder::new(cfg, Sessioned::new(RegisterSm::default(), SessionConfig::default()))
+            .start()?;
         println!("service {} attached at {}", service_id, instance_dir.display());
-        park_forever();
+        supervise(svc)
     } else {
-        let _svc = ServiceBuilder::new(cfg, RegisterSm::default()).start()?;
+        let svc = ServiceBuilder::new(cfg, RegisterSm::default()).start()?;
         println!("service {} attached at {}", service_id, instance_dir.display());
-        park_forever();
+        supervise(svc)
     }
 }
 
-/// Park until the test SIGKILLs this process.
-fn park_forever() -> ! {
-    loop {
-        std::thread::park();
+/// The supervisor half of the v2.0 fail-stop contract, mirroring
+/// `counter-service`: hold the service alive, and exit non-zero as soon as an
+/// agent has died. This matters since M14a — the apply agent owns the
+/// exclusive `service.<id>.lock`, so a process that parked on after its apply
+/// thread panicked would sit there as a zombie that looks alive to the test
+/// while its lock is already released, and a harness could only "wait for the
+/// fail-stop" by racing that unwind (nightly 33184711408). Exiting makes the
+/// fail-stop observable as a process exit, which is what a real supervisor
+/// (systemd `Restart=on-failure`) keys on.
+fn supervise<S: RawStateMachine>(svc: Service<S>) -> anyhow::Result<()> {
+    while svc.is_alive() {
+        std::thread::sleep(Duration::from_millis(20));
     }
+    eprintln!("uc2-crashtest-service: an agent fail-stopped; exiting for respawn");
+    anyhow::bail!("service agent fail-stopped")
 }
