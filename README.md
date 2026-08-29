@@ -86,7 +86,7 @@ What shipped since the core, and where to read about it:
 | v2.5.0 (M11) | Offline backup / verify / restore; recovery after losing a majority; full-disk fail-stop | [Back up](/docs/how-to/back-up-a-cluster.md) · [Recover from quorum loss](/docs/how-to/recover-from-quorum-loss.md) |
 | v2.6.0 (M12) | Gateway + remote client for processes off the node host; signed admin requests with an audit log; signed release artifacts; security package | [Run a gateway](/docs/how-to/run-a-gateway.md) · [Admin authentication](/docs/notes/uc2-admin-authentication.md) · [Security](/docs/security) |
 | v2.7.0 (M13) | Remote path at the cluster's own speed: a rebuilt remote client, a convoy-free ingress ring, a global gateway credit budget | [Remote protocol](/docs/reference/remote-protocol.md) · [M13 gate](/docs/benchmarks/uc2-m13-gate-2026-08-24.md) |
-| *on `main`* (M14) | Several state machines per cluster, fed by one log; submit to any, or fan a query across all | [Design spec](/docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md) — unreleased |
+| v2.8.0 (M14) | Several state machines per cluster, fed by one log; submit to any, or fan a query across all | [How it works](/docs/notes/uc2-m14-multi-service-explained.md) · [M14 gate](/docs/benchmarks/uc2-m14-gate-2026-08-29.md) |
 
 Building from source: [Quickstart](/docs/QUICKSTART.md) (from-source section);
 developer build/test/lint commands are in [`CLAUDE.md`](/CLAUDE.md).

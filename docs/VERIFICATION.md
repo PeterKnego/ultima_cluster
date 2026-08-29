@@ -9,10 +9,11 @@ verification, and they carry very different weight. Everything below is sorted b
 the strength of the evidence, and the boundaries between tiers are stated
 explicitly rather than blurred.
 
-**Status of this document:** current as of the M12d security-posture pass
-(2026-08-23), which added §7; the proof, simulation and capstone tiers are as of
-the M8 gate (2026-07-29). Each section cites the dated record it summarizes;
-where the two disagree, the dated record wins.
+**Status of this document:** current as of the M14d release pass (2026-08-29),
+which added the M14 coverage statement to §11; §7 as of M12d; the proof,
+simulation and capstone tiers as of the M8 gate (2026-07-29). Each section
+cites the dated record it summarizes; where the two disagree, the dated
+record wins.
 
 ---
 
@@ -650,10 +651,15 @@ The most important section, and the one most projects omit.
   (`bincode`, the `ultima-db` snapshot adapter) reached through those seams.
 - **The published gate numbers are fleet measurements**, on the hardware and
   configuration each record names. They are reproducible, not universal.
-- **M14a's lag barrier and quorum-gated report ceiling are unit-tested and
-  integration-tested on one node and a 3-node in-process cluster.** M14b's sim
-  scenario covers the ceiling's liveness property; the real node's ceiling is
-  exercised by `uc2_node/tests/services.rs` on a 3-node in-process cluster.
+- **Multi-service (M14) is covered by unit tests, in-process integration on
+  one node and a 3-node cluster (`uc2_node/tests/services.rs`, `learner.rs`'s
+  two-FSM join, `uc2_net/tests/snapshot_session.rs`'s two-artifact stream),
+  the M14b sim scenario (inv10) and fuzz seeds for the 0.6.0 `SNAP_BEGIN` and
+  the query split. It is NOT yet covered by any linearizability capstone,
+  partition test, hard-crash scenario or Elle tier with two FSMs — those are
+  M14c2, a proof-only `2.8.1` (spec §15.1). The M14 fleet gate
+  (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`) measures rates, a kill and a
+  join; it is not a substitute.**
 - **Wire crypto is opt-in and off by default.** With it disabled the posture is a
   trusted network. With it enabled, the threat model is a network-path adversary;
   a compromised host and a malicious cluster member are explicitly **out of

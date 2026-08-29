@@ -6,8 +6,8 @@ it — that document is the authority; this page is the index. Numbers here
 are quoted from those pages and from the constants they name, not
 re-measured.
 
-This page describes `main`. Where a row differs between the released
-`2.7.0` and the unreleased M14 work on `main`, the row says so.
+This page describes `main`. Where a limit changed between releases, the row
+says so.
 
 ## Hard limits
 
@@ -18,7 +18,7 @@ these is a configuration knob.
 |---|---|---|
 | Members per cluster (voters + learners) | **8** | the cnc page's peer-slot band; enforced on the wire too — [Configuration § Cluster limits](configuration.md#cluster-limits), [Change cluster membership](../how-to/change-cluster-membership.md) |
 | Membership changes in flight | **1** | single-server change rule — [Configuration § Cluster limits](configuration.md#cluster-limits) |
-| State machines (FSMs) per cluster | **8**, ids `0..8`, and `0` must be declared | the cnc page's per-service band (M14, unreleased) — [Configuration § `[services]`](configuration.md#services) |
+| State machines (FSMs) per cluster | **8**, ids `0..8`, and `0` must be declared | the cnc page's per-service band (2.8.0) — [Configuration § `[services]`](configuration.md#services) |
 | FSMs the remote path can reach | **FSM 0 only** | a gateway submits to and queries the default responder (M14) — [Configuration § `[services]`](configuration.md#services) |
 | Command payload, wire crypto off | **≤ 1344 B** | `MTU_DEFAULT = 1408` minus the 32 B frame header (32-aligned) and the 16 B datagram header — [Remote protocol § payload](remote-protocol.md), [State-machine contract § Payload ceiling](state-machine-contract.md#payload-ceiling) |
 | Command payload, wire crypto on | **≤ 1312 B** | the same budget less `CRYPTO_OVERHEAD` = 24 B (8 B counter + 16 B AES-GCM tag, `uc_protocol::v2::crypto`) |
@@ -39,7 +39,7 @@ expected to change.
 | Constraint | What it means for you | Where |
 |---|---|---|
 | **Linux only**, x86-64 or aarch64 | The IPC layer is file-backed shared memory plus futex wakeups. Release tarballs are built on native runners for both architectures; the release smoke test unpacks only the x86-64 tarball (`.github/workflows/release.yml`). | [Quickstart](../QUICKSTART.md) |
-| **The node↔node wire and the cnc page are flag days, never semver** | Every node in a cluster stops and restarts on the new version together; mixed-version operation is not supported. A mixed cluster is designed to *stall* rather than commit unsoundly (a `0.4.0` peer's durable report reads as unattested and is not counted). `2.7.0` ships wire `0.5.0`; M14c on `main` moves it to `0.6.0` (`SNAP_BEGIN` grew), a whole-cluster restart on the same terms. | [Versioning and the semver promise § flag-day](semver-policy.md#the-wire-and-the-cnc-page-are-flag-day-not-semver), [Upgrade a cluster](../how-to/upgrade-a-cluster.md) |
+| **The node↔node wire and the cnc page are flag days, never semver** | Every node in a cluster stops and restarts on the new version together; mixed-version operation is not supported. A mixed cluster is designed to *stall* rather than commit unsoundly (a `0.4.0` peer's durable report reads as unattested and is not counted). `2.7.0` shipped wire `0.5.0`; `2.8.0` moves it to `0.6.0` (`SNAP_BEGIN` grew), a whole-cluster restart on the same terms. | [Versioning and the semver promise § flag-day](semver-policy.md#the-wire-and-the-cnc-page-are-flag-day-not-semver), [Upgrade a cluster](../how-to/upgrade-a-cluster.md) |
 | **One membership change at a time** | `add-learner` / `promote` / `demote` / `remove-learner` are serialized; a second proposal while one is in flight is refused by name. A fresh learner catching up by log replay alone can be outrun indefinitely under sustained writes — enable snapshots + purge first. | [Change cluster membership](../how-to/change-cluster-membership.md) |
 | **Wire crypto is opt-in, OFF by default, and all-or-nothing per cluster** | No mixed cleartext/encrypted mode. Turning it on or off is itself a flag day. `[crypto]` must be present in `node.toml` either way — an absent section refuses to start rather than silently running cleartext. | [Encrypt node traffic](../how-to/encrypt-node-traffic.md), [Configuration](configuration.md) |
 | **`[admin]` must be present**, and `auth = "hmac"` is cluster-wide only with `[crypto].enabled = true` | A follower forwards an authenticated admin request to the leader over the node↔node socket, which the leader cannot re-verify; without wire crypto that hop is unauthenticated. | [Configuration § Admin authentication](configuration.md#admin-authentication), [Threat model § 6](../security/threat-model.md#6-residuals-stated-elsewhere-and-where) |

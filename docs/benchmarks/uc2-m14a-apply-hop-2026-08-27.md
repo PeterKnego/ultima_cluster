@@ -5,7 +5,7 @@ harness `uc2_node/examples/apply_bench.rs` built on each. **Box:** the 32-core
 dev box; a private `CARGO_TARGET_DIR` per tree.
 
 > **Smoke, not a gate.** Dev-box numbers are never compared to a bar
-> (`docs/notes/dev-box-not-a-bench.md`). What this document records is
+> (CLAUDE.md "Benchmarking discipline"). What this document records is
 > *ratios and ladders* from one hop measured alone — the divide-and-conquer
 > method of CLAUDE.md "Finding a performance bottleneck" — because M14a added
 > work to this hop (the lag barrier in `apply_cycle`) and nothing before this

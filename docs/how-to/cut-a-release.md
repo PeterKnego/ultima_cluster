@@ -59,7 +59,12 @@ documentation for what it changes, because the tag is what people read.
       ```
 
       which regenerates the deterministic `NN-name` seeds; those are the only
-      corpus files that belong in git.
+      corpus files that belong in git. For `v2.8.0` the scaffolding to
+      retire is: the two `<tag date>` headings (`RELEASES.md`,
+      `docs/releases.md`) and the two `<!-- PENDING FLEET RUN … -->` HTML
+      comments in the same two files, filled from the fleet gate's Results
+      section once it has run (`grep -rn "PENDING FLEET RUN"` finds both;
+      the comments are invisible when rendered, so they are easy to miss).
 
 ## 2. Check the version the way the workflow will
 

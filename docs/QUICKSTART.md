@@ -4,8 +4,7 @@ From a download to a real three-node cluster, in two commands and about a
 minute. No Rust toolchain, no broker, no ZooKeeper, no container runtime.
 
 Every command and every output from §2 onward is real — copied from an actual
-run, not written from memory. §1 is the download procedure for the first
-release, which has not been cut yet (see its note).
+run, not written from memory.
 
 You need Linux (x86-64 or aarch64), `bash`, coreutils, and a directory on a
 real disk. That is the whole list for §2 onward — **running** the cluster
@@ -17,10 +16,9 @@ are for getting the artifact, not for using it.
 
 ## 1. Download it, and verify it
 
-> **Not published yet.** `v2.7.0` is written up but not tagged, so nothing is
-> at these URLs today — the release workflow that produces and signs the
-> artifacts is built and gated but has not run for a real tag. This section is
-> the procedure for the first release; until it lands, build from source
+> **`v2.8.0` prepared, not yet tagged.** The commands below name `v2.7.0`,
+> the latest tagged release; `v2.8.0`'s artifacts will not exist at these
+> URLs until it is cut. Until then, build `v2.8.0` from source
 > (`cargo build --workspace --release`) and use §2 onward against
 > `target/release`, or run `packaging/quickstart-local.sh --bin-dir
 > target/release`.

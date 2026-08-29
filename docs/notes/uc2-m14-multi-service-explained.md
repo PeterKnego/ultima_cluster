@@ -76,8 +76,9 @@ bound at all (`services.rs:117-134`).
 The implementation is a **target cap**, not a lock. Before each batch the
 apply loop takes `floor = min(slot.applied)` over the declared ids — N acquire
 loads, no stores (`uc2_service/src/lag.rs:35-43`) — and turns the policy into
-a position: `target = min(head, floor + lag)` for bounded, or "one frame,
-only while `cursor == floor`" for lockstep (`lag.rs:45-68`).
+a position: `target = min(head, floor + lag)` for bounded, or one frame,
+proceeding while `cursor <= floor` and waiting once `cursor > floor`, for
+lockstep (`lag.rs:45-68`).
 `LogFollower::next_batch(target)` then yields only frames whose *end* is at or
 below the target (`uc2_service/src/apply.rs:311-348`). A capped batch simply
 reads as if the log were idle; there is no barrier object, no shared lock, and
@@ -119,7 +120,7 @@ The apply agent's idle strategy is a 50 µs sleep. A lockstep FSM that finds a
 sibling not yet at its frame took `Wait`, broke out of the loop, and slept —
 and *that sleep stalled every sibling's next frame*, so their waits exhausted
 too, and the whole set fell into sleeping in lockstep at ~18 k frames/s. The
-fix (`uc2_service/src/apply.rs:635-654`, `lockstep_wait`) is a ladder: 256
+fix (`uc2_service/src/apply.rs:634-653`, `lockstep_wait`) is a ladder: 256
 spins, then 2 048 yields with a heartbeat refresh every 256, and only then the
 agent's sleep. Measured 631 k frames/s at N=2 on the same box.
 
@@ -175,7 +176,7 @@ paced out of the quorum window, and recovers by journal replay.
 The price is the mirror image, and it is real: **one stalled FSM on a quorum
 of hosts is a cluster-scope stall.** A declared FSM that never started is the
 same thing — it holds `min(applied)` at 0 and caps the report at the bound
-from boot (`Uc2ServiceAbsent`, `uc2-alerts.yml:83-91`). This is the intended
+from boot (`Uc2ServiceAbsent`, `uc2-alerts.yml:83-92`). This is the intended
 outcome, not a bug: the alternative is silently letting the log outrun a
 replica's state machine. It also means an FSM is code with cluster-wide
 liveness authority — the same class of trust as `apply` itself, which is
@@ -204,7 +205,8 @@ this node has no ring for is answered `MSG_V2_BAD_SERVICE` on the node egress,
 pre-forward and side-effect-free, so the client may simply re-issue
 (`uc2_node/src/node.rs:3779-3796,3607-3614`). An undeclared id given to the
 SDK fails locally, before any ring is touched (`engine.rs:457-465`,
-`ClientError::ServiceNotDeclared`).
+`SubmitError::ServiceNotDeclared`; wrapped as `ClientError::ServiceNotDeclared`
+at `pipelined.rs:378-380`).
 
 So what happens to a command when only one FSM answers? Every declared FSM
 applies it, and on the leader every declared FSM publishes a response onto its
@@ -277,8 +279,9 @@ node falls below the purge floor. Stop every node, swap, start every node:
 Every M10 family that described "the service" now has a labelled twin per
 declared id, rendered through `push_service_labeled`
 (`uc2_node/src/obs/metrics.rs:273`), a thin wrapper over the same
-`push_labeled` the peer-slot band already used (`metrics.rs:156`). The unlabelled names keep their names and now mean **the slowest
-FSM** — the node's consensus agent computes `min(applied)`,
+`push_labeled` the peer-slot band already used (`metrics.rs:156`). The
+unlabelled names keep their names and now mean **the slowest FSM** — the
+node's consensus agent computes `min(applied)`,
 `min(snapshot_pos)`, `min(output_completed)` and the oldest heartbeat over the
 declared ids each cycle and publishes them to page 1
 (`uc2_node/src/services.rs:150-167`, `uc2_node/src/node.rs:2830`), so the

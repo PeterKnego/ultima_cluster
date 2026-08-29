@@ -1,5 +1,6 @@
 # ultima_cluster releases
 
+<!-- `<tag date>` is pre-tag scaffolding: `docs/how-to/cut-a-release.md` §1's last step ("retire the pre-tag scaffolding") dates this heading when the tag is cut. -->
 ## v2.8.0 — <tag date> — M14 multi-service: one log, N state machines
 
 **One replicated log, up to eight state-machine processes per node.** M14a
@@ -226,7 +227,8 @@ and the log frame header is untouched (spec §6.3).
   (`uc2_snapshot_intake_io_failures_total`).
 - **Evidence across the M14c finish** (`2ef480d`, then the fix wave
   `74f16bc`): `cargo test --workspace` 1 411 passed / 0 failed (102
-  binaries); `lin_v2` 7/7 and `lin_partition_v2` 7/7 Linearizable;
+  binaries) at `74f16bc` (`2ef480d` read 1 407, before the fix wave);
+  `lin_v2` 7/7 and `lin_partition_v2` 7/7 Linearizable;
   `uc2-crashtest --features hard-crash-tests` green; sim-heavy 38/38;
   `m10_gate coverage` 72/72; fuzz `uc_protocol_datagram` 51 019 361 runs
   clean. All single-FSM capstones — see *Deferred* for what two FSMs still

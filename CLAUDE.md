@@ -10,7 +10,7 @@ application server**. This is **UC v2**; the v1 stack (an
 consensus, elections, and transport directly. Do not reintroduce `openraft`,
 `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client` crate names.
 
-**Current version: `2.7.0` (M13). Milestones M1–M13 are all complete**, each
+**Current version: `2.8.0` (M14). Milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
 the honest-failure protocol). The per-milestone history that used to live in
@@ -29,23 +29,27 @@ the standing facts that bind new work.
 | M11 | v2.5.0 | survivable cluster: offline backup/verify/restore, quorum-loss recovery, ENOSPC fail-stop | `uc2-m11-gate-2026-08-20` |
 | M12a–d | v2.6.0 | adoptable cluster: gateway kit + remote client, admin authn/audit, packaging/publishing, security posture + fuzz tier | `uc2-m12-gate-2026-08-22` |
 | M13 | v2.7.0 | remote path at the cluster's speed: per-record MPSC ring (no publish convoy), Engine-shaped remote client, edge grant budget | `uc2-m13-gate-2026-08-24` |
+| M14 | v2.8.0 | multi-service: one log → N FSMs (bounded/lockstep lag, per-FSM routing + fan-in, 0.6.0 snapshot stream, per-FSM observability) | `uc2-m14-gate-2026-08-29` |
 
 (Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
 `v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1` only and is superseded by
 `v2.7.0`, with no final `v2.6.0` tag. The ordered crates.io publish has
 never been run; `docs/how-to/cut-a-release.md` §6 is the procedure.)
 
-Next up: **M14, multi-service** (one log → N FSM processes) — spec draft on
-the `worktree-uc2-multi-service` worktree, user review pending.
+Next up: **M14c2** — the two-FSM capstones (`lin_v2 two_fsm`,
+`lin_partition_v2`, hard-crash, Elle) as a proof-only `2.8.1`; spec §15.1.
 
 ### Standing facts that bind new work
 
-- **Wire protocol is 0.5.0** (`uc_protocol::version::CURRENT`); the node↔node
-  wire and the `cnc.dat` page layout are **flag days, never mixed-version** —
-  a 0.4.0 peer's durable report reads as unattested and is not counted, so a
-  mixed cluster stalls commits rather than making unsound ones; upgrade all
-  nodes together. The client↔gateway remote protocol is separate and stays
-  v1. What is API vs. what is flag-day: `docs/reference/semver-policy.md`.
+- **Wire protocol is 0.6.0** (`uc_protocol::version::CURRENT`) (`0.6.0`
+  changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name,
+  so a mixed cluster stalls a joiner rather than installing half a set); the
+  node↔node wire and the `cnc.dat` page layout are **flag days, never
+  mixed-version** — a 0.4.0 peer's durable report reads as unattested and is
+  not counted, so a mixed cluster stalls commits rather than making unsound
+  ones; upgrade all nodes together. The client↔gateway remote protocol is
+  separate and stays v1. What is API vs. what is flag-day:
+  `docs/reference/semver-policy.md`.
 - **Wire crypto is opt-in and OFF by default**, all-encrypted or
   all-cleartext per cluster (no mixed mode). Threat model: a network-path
   adversary; out of model: a compromised host or a malicious member — the
@@ -80,6 +84,10 @@ the `worktree-uc2-multi-service` worktree, user review pending.
   admission window" diagnosis was wrong — the cause was a ring publish
   convoy; see `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md` before
   trusting any pre-2.7.0 gateway sizing advice.
+- **M14 mechanics worth knowing**: ≤ 8 FSMs, id 0 mandatory and
+  remote-reachable; lag policy per node must match cluster-wide (checked on
+  the snapshot path); one stalled FSM on a quorum of hosts stalls commit by
+  design (report ceiling); `service.<id>.lock` per FSM.
 - **12 publishable crates, versioned in lockstep** with the tag and the
   image; `uc2_sim`, `uc-lincheck` and the example crates are
   `publish = false`. Publishing is manual and ordered
@@ -95,9 +103,9 @@ the `worktree-uc2-multi-service` worktree, user review pending.
   per-record commit), 15 fuzz targets, Miri (pure decoders + `uc2_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is DEFERRED** (a one-shot reformat measures ~2 731 hunks)
-  until the two long-lived worktrees (`fix/remaining-flakes`,
-  `worktree-uc2-multi-service`) land; then run `cargo fmt --all` as a single
-  mechanical commit and add `--check` to `ci.yml`.
+  until the long-lived worktree (`fix/remaining-flakes`) lands; then run
+  `cargo fmt --all` as a single mechanical commit and add `--check` to
+  `ci.yml`.
 
 Canonical documents, in order:
 
@@ -179,7 +187,8 @@ Workspace crates:
   `error_codes`) plus the lock-free ring buffers (`ring`:
   SPSC/MPSC/Broadcast — the MPSC ring commits per record since M13, so no
   producer ever waits on another)
-  and the v2 wire spec (`v2`): the `cnc.dat` 4 KiB page layout, the self-locating
+  and the v2 wire spec (`v2`): the `cnc.dat` 8 KiB (cnc 3.0: page 2 is the
+  per-service slot band) page layout, the self-locating
   UDP datagram header, and per-message frame layouts. Multi-language gate.
 - `uc2_log` — the log buffer + archive. File-backed shared log buffer (readers
   poll positions in place, bounded by the commit counter) and the archive agent
@@ -348,7 +357,8 @@ through atomic counters in the `cnc.dat` page and monotonic byte **positions**
   and side-effecting `on_committed` (leader-only, at-least-once).
 - Client processes translate external requests into Commands and submit via shmem.
 
-The shmem layer is a fixed-layout `cnc.dat` 4 KiB control page (`uc_protocol::v2::cnc`,
+The shmem layer is a fixed-layout `cnc.dat` 8 KiB (cnc 3.0: page 2 is the
+per-service slot band) control page (`uc_protocol::v2::cnc`,
 offsets pinned in both `uc_protocol` and `uc2_log` so they never drift) plus the
 file-backed log buffer and per-stream ring buffers under an instance directory.
 Ring buffers are lock-free; SPSC for service↔node, MPSC for clients→node,

@@ -246,6 +246,11 @@ declared FSM**, not one artifact. `DATA`, `NAK`, `APPEND_POSITION`,
 `TERM_MAP`, the 16-byte header and every admin datagram are byte-identical to
 `0.5.0`.
 
+This is separate from the same-host cnc 3.0 restart above: nodes, services
+and clients on a host restart together because the page grew to 8 KiB
+([cnc page](../reference/cnc-page.md)); the wire flag day below governs
+node-to-node traffic across the whole cluster instead.
+
 **This is a whole-cluster flag day, on the same terms as every prior one.**
 A mixed `0.5.0`/`0.6.0` cluster replicates and elects normally — which is
 precisely why it is dangerous: the damage is confined to snapshot sessions,
