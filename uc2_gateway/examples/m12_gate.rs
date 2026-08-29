@@ -212,7 +212,10 @@ struct ServiceArgs {
     #[arg(long, default_value_t = 0)]
     work_spin: u64,
     /// M14d row f: `SnapshotPolicy { interval_bytes }` on the service so the
-    /// leader has artifacts to ship. `0` = no snapshots (every prior arm).
+    /// leader has artifacts to ship. `0` = no snapshots — `start()`, byte-for-
+    /// byte every prior arm. `> 0` runs `start_with_snapshots()` (typed tier
+    /// only: `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
+    /// `SnapshotStateMachine`); paired with `--raw-sm` it is refused by name.
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
 }
@@ -1431,6 +1434,19 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------- service role
 
+/// M14d T2 fix round 1: `ServiceBuilder::start()` never reads
+/// `cfg.snapshot_policy` — only `start_with_snapshots()` spawns the M6
+/// builder thread that trips it (`uc2_service/src/lib.rs:199-291`, the same
+/// method `m6_gate.rs` uses). Shared by the four typed arms below (raw arms
+/// keep plain `start()`; `--raw-sm` + `--snapshot-interval-bytes` is refused
+/// by name before this is ever reached).
+fn start_typed_svc<S: SnapshotStateMachine>(
+    b: ServiceBuilder<S>,
+    snapshots: bool,
+) -> anyhow::Result<Service<S>> {
+    if snapshots { Ok(b.start_with_snapshots()?) } else { Ok(b.start()?) }
+}
+
 fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     let cnc = a.instance_dir.join("cnc2.dat");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1445,29 +1461,38 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         !(a.raw_sm && a.work_spin > 0),
         "--raw-sm and --work-spin are exclusive: the slow FSM is the typed tier (spec §15.3)"
     );
+    anyhow::ensure!(
+        !(a.raw_sm && a.snapshot_interval_bytes > 0),
+        "--raw-sm and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
+    );
     let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id).service_id(a.service_id);
     if a.snapshot_interval_bytes > 0 {
         cfg = cfg.snapshot_policy(SnapshotPolicy { interval_bytes: a.snapshot_interval_bytes });
     }
     let envelope = a.envelope == Envelope::On;
+    let snapshots = a.snapshot_interval_bytes > 0;
     let tag = format!("id={} spin={} snap={}", a.service_id, a.work_spin, a.snapshot_interval_bytes);
     // Each arm diverges (parks forever), so the `Service<_>` types never need
     // to unify — `m5_gate`'s service role does the same.
     match (envelope, a.raw_sm, a.work_spin > 0) {
         (true, false, false) => {
-            let _svc = ServiceBuilder::new(cfg, Sessioned::new(CountSm::default(), SessionConfig::default())).start()?;
+            let svc = ServiceBuilder::new(cfg, Sessioned::new(CountSm::default(), SessionConfig::default()));
+            let _svc = start_typed_svc(svc, snapshots)?;
             park_service(&format!("Sessioned<CountSm> (typed tier, envelope on, {tag})"))
         }
         (true, false, true) => {
-            let _svc = ServiceBuilder::new(cfg, Sessioned::new(SpinCountSm::with_spin(a.work_spin), SessionConfig::default())).start()?;
+            let svc = ServiceBuilder::new(cfg, Sessioned::new(SpinCountSm::with_spin(a.work_spin), SessionConfig::default()));
+            let _svc = start_typed_svc(svc, snapshots)?;
             park_service(&format!("Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"))
         }
         (false, false, false) => {
-            let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
+            let svc = ServiceBuilder::new(cfg, CountSm::default());
+            let _svc = start_typed_svc(svc, snapshots)?;
             park_service(&format!("CountSm (typed tier, envelope off, {tag})"))
         }
         (false, false, true) => {
-            let _svc = ServiceBuilder::new(cfg, SpinCountSm::with_spin(a.work_spin)).start()?;
+            let svc = ServiceBuilder::new(cfg, SpinCountSm::with_spin(a.work_spin));
+            let _svc = start_typed_svc(svc, snapshots)?;
             park_service(&format!("SpinCountSm (typed tier, envelope off, {tag})"))
         }
         (true, true, _) => {
