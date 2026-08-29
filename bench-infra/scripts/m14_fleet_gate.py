@@ -447,7 +447,65 @@ def arm_kill(voters, a, K, checks):
 
 
 def arm_join(voters, learner, a, K, checks):
-    raise NotImplementedError("Task 4d")
+    """Row f: voters run the bounded pair with purge ON and snapshots every
+    32 KiB; fan-in load runs for the whole arm; 10 s in, a learner declared
+    {0,1} is admitted (`uc2ctl add-learner` on the leader — M7's pattern:
+    the learner boots as a plain node with the CURRENT voters as its seed
+    members) and must reach both voters' `applied` within 60 s via a
+    two-artifact snapshot session (wire 0.6.0), with zero refusals."""
+    leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES)
+    h = voters[leader]
+    run_rate_arm(voters, leader, a, "join", fan_in=True, secs=JOIN_ARM_SECS, timeline=False, unit=True)
+    t_client_start = time.time()
+    time.sleep(JOIN_AT_SECS)
+    new_id, addr = 3, f"{learner.private_ip}:{PORT}"
+    m12.wipe_dirs([learner])
+    rc, out = h.ctl("add-learner", new_id, addr)
+    if rc != 0:
+        raise RuntimeError(f"add-learner refused: {out.strip()}")
+    # t0 is a driver-clock delta at both ends (here and the status poll below),
+    # so no host clock is needed for joined_at (amendment 2).
+    t0 = time.time()
+    start_unit(learner, "node", node_args(learner, new_id, m12.members_str(voters), [(0, 0), (1, K)], None,
+                                          True, M14_SNAPSHOT_INTERVAL_BYTES), nofile=True)
+    time.sleep(2.0)
+    for sid, spin in [(0, 0), (1, K)]:
+        truncate_log(learner, f"service{sid}")
+        start_unit(learner, f"service{sid}", service_args(learner, sid, spin, M14_SNAPSHOT_INTERVAL_BYTES))
+    target = {i: s["applied"] for i, s in status_slots(h)[0].items()}
+    print(f"INFO row f: leader applied at join start {target}", flush=True)
+    joined_at = None
+    while time.time() < t0 + BAR_F_JOIN_SECS + 5:
+        slots, _ = status_slots(learner)
+        if all(i in slots and slots[i]["attached"] and slots[i]["applied"] >= target.get(i, 0) for i in (0, 1)) \
+                and all(slots[i]["snapshot_pos"] > 0 for i in (0, 1)):
+            joined_at = round(time.time() - t0, 2)
+            break
+        time.sleep(0.5)
+    # Wait for the client UNIT to exit rather than sleeping a fixed margin, so
+    # the log read never races the client's last write (amendment 1).
+    m12.wait_units_done([(h, ["client"])], t_client_start + JOIN_ARM_SECS + CLIENT_SLACK_SECS)
+    out = tail_log(h, "client", lines=200) or ""
+    d = parse_result(out, "direct")
+    if d is None:
+        print("WARN row f: client RESULT missing — log read raced or the client died", flush=True)
+    kill_unit(h, "client")
+    artifacts = {}
+    for i in (0, 1):
+        r = ssh(learner, f"sudo find {learner.dir}/snapshots/{i} -type f ! -name '*.part' 2>/dev/null | wc -l", label="ls")
+        artifacts[i] = int((r.stdout or "0").strip() or 0)
+    refusals = {}
+    for hh in voters + [learner]:
+        st = node_stats(hh)
+        refusals[hh.public_ip] = (st[1], st[2]) if st else (-1, -1)
+    hosts_all = voters + [learner]
+    before = len(checks)
+    check_all(hosts_all, leader, "join", checks, expect_min=int(d["responses"]) if d else None)
+    check_ok = all(c[3] for c in checks[before:]) and len({c[4] for c in checks[before:]}) == 1
+    print(f"INFO row f: joined_at={joined_at}s artifacts={artifacts} refusals={refusals} check_ok={check_ok}", flush=True)
+    stop_cluster_m14(hosts_all)
+    return {"joined_at": joined_at, "refusals": refusals, "artifacts": artifacts, "check_ok": check_ok,
+            "client_lost": d["lost"] if d else None}
 
 
 # ---------------------------------------------------------------- selftest
