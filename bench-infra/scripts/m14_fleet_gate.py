@@ -174,6 +174,180 @@ def verdict_row_f(join):
                    f"both artifacts={both}, divergence check={join.get('check_ok')}")
 
 
+# ------------------------------------------------------------------ fleet
+def prepare_host_m14(host):
+    """m12's build plus the uc2ctl binary (rows d/f drive real admin ops)."""
+    m12.prepare_host(host, apply_profile=False)
+    env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
+    cmd = (f"{env} {m6.SshHost.CARGO} build --release --manifest-path {m6.SshHost.UC_SRC}/Cargo.toml "
+           f"-p uc2ctl && test -x {BUILT_CTL} && echo CTL-OK")
+    r = ssh(host, cmd, label="build-ctl")
+    if "CTL-OK" not in (r.stdout or ""):
+        raise RuntimeError(f"uc2ctl build on {host.public_ip}: {r.stderr or r.stdout}")
+
+
+def setup_fleet(a):
+    hosts = m6.build_fleet_hosts(BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts, count=4,
+                                 ctl_bin=BUILT_CTL, unit_prefix=UNIT_PREFIX,
+                                 remote_root=REMOTE_ROOT, probe_bin=BUILT_PROBE)
+    if not a.no_sync:
+        sync_tree(hosts, a.local_tree)
+    for h in hosts:
+        prepare_host_m14(h)
+        stop_cluster_m14([h])
+    voters, learner = hosts[:3], hosts[3]
+    print(f"INFO topology: voters {[h.public_ip for h in voters]}, learner {learner.public_ip}; "
+          f"the direct client runs on the leader host", flush=True)
+    return hosts, voters, learner
+
+
+SERVICE_UNITS = ("service0", "service1")
+
+
+def stop_cluster_m14(hosts):
+    for h in hosts:
+        for u in ("client",) + SERVICE_UNITS + ("node",):
+            kill_unit(h, u)
+
+
+def node_args(h, node_id, members, fsms, lag, purge, snap):
+    args = ["node", "--id", str(node_id), "--bind", f"{h.private_ip}:{PORT}",
+            "--instance-dir", h.dir, "--members", members, "--app-id", APP,
+            "--admission-kib", str(ADMISSION_KIB),
+            "--services", ",".join(str(i) for i, _ in fsms)]
+    if lag is not None:
+        args += ["--fsm-lag", lag]
+    if purge:
+        args += ["--purge-below-snapshot", "--journal-segment-bytes", str(M14_SEGMENT_BYTES)]
+    return args
+
+
+def service_args(h, sid, spin, snap):
+    args = ["service", "--instance-dir", h.dir, "--app-id", APP, "--envelope", "on",
+            "--service-id", str(sid), "--work-spin", str(spin)]
+    if snap:
+        args += ["--snapshot-interval-bytes", str(snap)]
+    return args
+
+
+ADMISSION_KIB = 256
+
+
+def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0):
+    """`fsms` = [(id, spin)], e.g. [(0, 0)] or [(0, 0), (1, K)]. A FRESH
+    generation: dirs wiped, nodes then services, settle after each."""
+    m12.wipe_dirs(voters)
+    ms = m12.members_str(voters)
+    for i, h in enumerate(voters):
+        start_unit(h, "node", node_args(h, i, ms, fsms, lag, purge, snap), nofile=True)
+    time.sleep(BOOT_SETTLE_SECS)
+    for h in voters:
+        for sid, spin in fsms:
+            truncate_log(h, f"service{sid}")
+            start_unit(h, f"service{sid}", service_args(h, sid, spin, snap))
+    time.sleep(BOOT_SETTLE_SECS)
+    leader = m6.wait_leader(voters, list(range(len(voters))), LEADER_WAIT_SECS)
+    if leader is None:
+        raise RuntimeError("no single serving leader")
+    return leader
+
+
+def run_rate_arm(voters, leader, a, label, fan_in, secs=ARM_SECS, timeline=False, unit=False):
+    """The direct client on the leader host. Foreground (returns the RESULT
+    dict) unless `unit`, in which case it is started as a transient unit and
+    the caller reads the log later (row d/f keep it running across an action)."""
+    h = voters[leader]
+    args = ["client-direct", "--instance-dir", h.dir, "--app-id", APP,
+            "--secs", str(secs), "--payload", str(a.payload), "--inflight", str(a.inflight),
+            "--envelope", "on", "--warmup-secs", str(WARMUP_SECS), "--measure-secs", str(MEASURE_SECS)]
+    if fan_in:
+        args.append("--fan-in")
+    if timeline:
+        args.append("--timeline")
+    if unit:
+        truncate_log(h, "client")
+        start_unit(h, "client", args)
+        return None
+    rc, out = run_foreground(h, args, timeout=secs + CLIENT_SLACK_SECS)
+    echo(label, out)
+    d = parse_result(out, "direct")
+    if d is None:
+        raise RuntimeError(f"{label}: no RESULT line (rc={rc})")
+    return d
+
+
+def check_fsms(h, mode, expect=None, expect_min=None):
+    args = ["check-fsms", "--instance-dir", h.dir, "--app-id", APP, "--mode", mode]
+    if expect is not None:
+        args += ["--expect", str(expect)]
+    if expect_min is not None:
+        args += ["--expect-min", str(expect_min)]
+    rc, out = run_foreground(h, args, timeout=60)
+    echo(f"check-fsms {h.public_ip} {mode}", out, lines=6)
+    m = FSMS_OK_RE.search(out)
+    count = json.loads(m.group(1))["count"] if m else None
+    return rc == 0 and m is not None, count
+
+
+def check_all(hosts, leader, arm, checks, expect=None, expect_min=None):
+    """Row c after an arm: linearizable on the leader, snapshot on every host.
+    Appends (arm, host, mode, ok, count) tuples; never raises — the verdict
+    function judges."""
+    ok, c = check_fsms(hosts[leader], "linearizable", expect, expect_min)
+    checks.append((arm, hosts[leader].public_ip, "linearizable", ok, c))
+    for h in hosts:
+        ok, c = check_fsms(h, "snapshot", expect, expect_min)
+        checks.append((arm, h.public_ip, "snapshot", ok, c))
+
+
+# ------------------------------------------------------------- rate arms
+def rate_of(d):
+    return float(d["window_rps"])
+
+
+def one_arm(voters, a, label, fsms, lag, rates, checks, fan_in):
+    leader = start_cluster_m14(voters, fsms, lag=lag)
+    print(f"INFO arm {label}: leader n{leader} on {voters[leader].public_ip}", flush=True)
+    d = run_rate_arm(voters, leader, a, label, fan_in)
+    rates[label] = rate_of(d)
+    print(f"INFO arm {label}: window_rps={rates[label]:.0f} responses={d['responses']} lost={d['lost']}", flush=True)
+    check_all(voters, leader, label, checks, expect=int(d["responses"]))
+    stop_cluster_m14(voters)
+    return d
+
+
+def arm_calib(voters, a, rates, checks):
+    """FSM 0 alone as SpinCountSm over a K ladder; pick the K nearest 0.5 × n1."""
+    ladder = []
+    for k in [int(x) for x in a.calib_ks.split(",")]:
+        d = one_arm(voters, a, f"calib-{k}", [(0, k)], None, rates, checks, fan_in=False)
+        ladder.append((k, rate_of(d) / rates["n1"]))
+        print(f"INFO calib K={k}: {ladder[-1][1]:.3f} × n1", flush=True)
+    k, ratio = pick_k(ladder)
+    gate_json("calib", True, ladder=ladder, K=k, ratio=ratio)
+    return k
+
+
+def arm_rates(voters, a, rates, checks):
+    one_arm(voters, a, "n1", [(0, 0)], None, rates, checks, fan_in=False)
+    K = a.k if a.k else arm_calib(voters, a, rates, checks)
+    print(f"INFO slow FSM K = {K}", flush=True)
+    one_arm(voters, a, "n2eq", [(0, 0), (1, 0)], None, rates, checks, fan_in=True)
+    one_arm(voters, a, "slow1", [(0, K)], None, rates, checks, fan_in=False)
+    one_arm(voters, a, "pair", [(0, 0), (1, K)], None, rates, checks, fan_in=True)
+    one_arm(voters, a, "n2eq-ls", [(0, 0), (1, 0)], "lockstep", rates, checks, fan_in=True)
+    one_arm(voters, a, "pair-ls", [(0, 0), (1, K)], "lockstep", rates, checks, fan_in=True)
+    return K
+
+
+def arm_kill(voters, a, K, checks):
+    raise NotImplementedError("Task 4c")
+
+
+def arm_join(voters, learner, a, K, checks):
+    raise NotImplementedError("Task 4d")
+
+
 # ---------------------------------------------------------------- selftest
 def selftest():
     fails = 0
@@ -228,11 +402,55 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(description="UC v2 M14 fleet-gate driver (spec §15 rows a–g)")
-    ap.add_argument("--selftest", action="store_true", help="replay canned rows through the verdicts; no fleet")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--fleet", action="store_true")
+    ap.add_argument("--hosts", default="", help="pub/priv,... (else terraform output); 4 needed")
+    ap.add_argument("--ssh-user", default="ubuntu")
+    ap.add_argument("--ssh-key", default="/home/claude/.ssh/id_ed25519")
+    ap.add_argument("--local-tree", default=str(Path(__file__).resolve().parent.parent.parent))
+    ap.add_argument("--no-sync", action="store_true")
+    ap.add_argument("--payload", type=int, default=64)
+    ap.add_argument("--inflight", type=int, default=4096)
+    ap.add_argument("--calib-ks", default="250,500,1000,2000,4000,8000",
+                    help="SpinCountSm K ladder for the calibration arm")
+    ap.add_argument("--k", type=int, default=0, help="skip calibration and use this K")
+    ap.add_argument("--rows", default="abcdef", help="subset of a b c d e f (c runs with every arm)")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
-    ap.error("--fleet is added in the next task; only --selftest exists yet")
+    if not a.fleet:
+        ap.error("one of --fleet or --selftest is required")
+    hosts, voters, learner = setup_fleet(a)
+    rates, checks, verdicts = {}, [], []
+    kill = join = None
+    try:
+        if any(r in a.rows for r in "abe"):
+            K = arm_rates(voters, a, rates, checks)
+        else:
+            K = a.k
+        if "d" in a.rows:
+            kill = arm_kill(voters, a, K, checks)
+        if "f" in a.rows:
+            join = arm_join(voters, learner, a, K, checks)
+    finally:
+        stop_cluster_m14(hosts)
+    print("\nM14 gate — FLEET (rates in ops/s over the 8 s window)")
+    for k, v in rates.items():
+        print(f"  {k:10s} {v:12.0f}")
+    if "a" in a.rows: verdicts.append(verdict_row_a(rates))
+    if "b" in a.rows: verdicts.append(verdict_row_b(rates))
+    verdicts.append(verdict_row_c(checks))
+    if kill is not None: verdicts.append(verdict_row_d(kill))
+    if "e" in a.rows: verdicts.append(verdict_row_e(rates))
+    if join is not None: verdicts.append(verdict_row_f(join))
+    for v in verdicts:
+        print(f"  [{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}")
+    failed = [v for v in verdicts if not v.passed]
+    if failed:
+        print(f"RESULT: FAIL (honest) — {len(failed)} of {len(verdicts)} rows missed: {[v.row for v in failed]}")
+        sys.exit(1)
+    print(f"RESULT: PASS — {len(verdicts)} rows")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
