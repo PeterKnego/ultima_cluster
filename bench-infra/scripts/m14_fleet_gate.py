@@ -25,6 +25,7 @@ code is the verdict: a green terminal is not a PASS.
 import argparse
 import json
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -51,6 +52,12 @@ BAR_D_FRACTION = 0.80       # M9's rule: a 2 s window at ≥ 80 % of baseline �
 BAR_D_WINDOW_SECS = 2       # … confirmed by the next such window
 BAR_F_JOIN_SECS = 60.0      # M6's JOIN_BUDGET
 CALIB_TARGET = 0.5          # slow-solo ≈ 0.5 × rate(n1)
+# The ladder must actually STRADDLE the target. `pick_k` returns the nearest
+# rung whatever the ladder holds, so a ladder that never slows the FSM below
+# ~0.85 × n1 would still yield a K — and row b would then compare two
+# consensus-bound arms and pass vacuously (the slow FSM was never the
+# limiter). Outside this band the run FAILS at calibration, before row b.
+CALIB_LO, CALIB_HI = 0.35, 0.65
 
 # ------------------------------------------------------------- arm shape
 ARM_SECS = 12               # 2 s warm-up + 8 s window + 2 s tail (spec §15.3)
@@ -65,8 +72,16 @@ TL_RE = re.compile(r'^TL\s+(\{.*\})\s*$', re.M)
 FSMS_OK_RE = re.compile(r'^FSMS-OK\s+(\{.*\})\s*$', re.M)
 STATS_RE = re.compile(r"reports_unattested=(\d+) snap_refusals=\((\d+),(\d+)\)")
 
-M14_SEGMENT_BYTES = 16 * 1024          # M7's value: purge inside one arm
-M14_SNAPSHOT_INTERVAL_BYTES = 32 * 1024
+# Journal/snapshot sizing for row f. The m6/m7-era values (16 KiB / 32 KiB)
+# were written for arms whose client wrote kilobytes per second; the M13-class
+# direct client on this shape writes ~100 MB/s (≈ 1.5 M ops/s × 64 B), which
+# at 16 KiB segments is ~6 000 segment rolls AND ~3 000 snapshot builds every
+# second — an untested churn regime that would red row f for harness reasons.
+# At 16 MiB / 32 MiB the same 90 s arm still rolls the journal ~500 times and
+# builds ~250 snapshots, so the learner is still far below the purge floor and
+# must still converge by a snapshot session.
+M14_SEGMENT_BYTES = 16 << 20
+M14_SNAPSHOT_INTERVAL_BYTES = 32 << 20
 
 
 def gate_json(row, passed, **fields):
@@ -81,6 +96,43 @@ def pick_k(calib):
     if not calib:
         raise ValueError("empty calibration ladder")
     return min(calib, key=lambda kr: abs(kr[1] - CALIB_TARGET))
+
+
+def calib_ok(ratio):
+    """True when the picked rung's ratio lands inside [CALIB_LO, CALIB_HI] —
+    i.e. the ladder really produced a slow FSM. Pure, so the selftest can
+    reject a ladder that never slowed down."""
+    return ratio is not None and CALIB_LO <= ratio <= CALIB_HI
+
+
+def fsm_reattached(pre_inc, slot, bound):
+    """Row d's attach clause, as a pure predicate.
+
+    The `attached` bit alone is NOT evidence of a reattach: only the service
+    writes it (`uc2_service/src/attach.rs:159` sets it, `uc2_service/src/
+    lib.rs:388-389` clears it on an orderly stop), so a SIGKILL leaves the
+    KILLED incarnation's bit set and the first poll after the kill would read
+    `attached=true` for the corpse. `uc2_service::attach` bumps the slot's
+    incarnation exactly once per attach (same line 159,
+    `incarnation.wrapping_add(1)`), and the node is NOT restarted in row d, so
+    the counter survives the kill — a STRICTLY greater incarnation than the
+    pre-kill reading is the new life.
+
+    `bound is None` means the `services:` line was unreadable, so the lag
+    clause cannot be judged: never satisfied (keep polling)."""
+    if pre_inc is None or slot is None or bound is None:
+        return False
+    return bool(slot["attached"]) and slot["incarnation"] > pre_inc \
+        and (bound == 0 or slot["lag"] <= bound)
+
+
+def baseline_clean(t0_ms, base_hi_ms):
+    """True when row d's baseline window closed BEFORE the kill instant. If
+    the client unit took longer than the driver's pre-kill sleep to reach its
+    first completion, the baseline window is still open when the SIGKILL
+    lands, and the outage deflates the baseline — which errs toward PASS. Pure
+    so the selftest can pin the comparison."""
+    return t0_ms >= base_hi_ms
 
 
 def verdict_row_a(rates):
@@ -162,16 +214,27 @@ def verdict_row_e(rates):
 
 def verdict_row_f(join):
     """`join` = {"joined_at": s|None, "refusals": {host: (legacy, mismatch)},
-    "artifacts": {0: n, 1: n}, "check_ok": bool}."""
+    "artifacts": {0: n, 1: n}, "installs": n, "check_ok": bool}.
+
+    `installs` is the anti-vacuity clause. Everything else row f checks is
+    satisfiable by a learner that caught up by PLAIN JOURNAL REPLAY and then
+    built its own snapshots on its own interval: it would be attached, at the
+    target `applied`, with `snapshot_pos > 0` and an artifact under both ids,
+    having never opened a snapshot session at all. At least one
+    `snapshot_installed` record on the learner is the positive evidence that
+    the wire-0.6.0 two-artifact session actually ran."""
     j = join.get("joined_at")
     refusals_zero = all(tuple(v) == (0, 0) for v in join.get("refusals", {}).values()) and bool(join.get("refusals"))
     both = all(join.get("artifacts", {}).get(i, 0) > 0 for i in (0, 1))
-    ok = j is not None and j <= BAR_F_JOIN_SECS and refusals_zero and both and join.get("check_ok", False)
+    installs = int(join.get("installs") or 0)
+    ok = j is not None and j <= BAR_F_JOIN_SECS and refusals_zero and both \
+        and installs >= 1 and join.get("check_ok", False)
     gate_json("f", ok, **{k: (v if k != "refusals" else {h: list(t) for h, t in v.items()}) for k, v in join.items()},
               bar=BAR_F_JOIN_SECS)
     return Verdict("f two-FSM learner join over wire 0.6.0", ok,
                    f"joined at {j}s (bar ≤ {BAR_F_JOIN_SECS}s), refusals zero={refusals_zero}, "
-                   f"both artifacts={both}, divergence check={join.get('check_ok')}")
+                   f"both artifacts={both}, snapshot installs={installs} (need ≥ 1), "
+                   f"divergence check={join.get('check_ok')}")
 
 
 # ------------------------------------------------------------------ fleet
@@ -239,6 +302,11 @@ def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0):
     m12.wipe_dirs(voters)
     ms = m12.members_str(voters)
     for i, h in enumerate(voters):
+        # Node units append to a per-unit log that is NOT wiped by
+        # `systemd-run`, so without this every grep over the node log (row d's
+        # attach/detach transitions, row f's snapshot installs) would also see
+        # every earlier arm's records. Service units already did this.
+        truncate_log(h, "node")
         start_unit(h, "node", node_args(h, i, ms, fsms, lag, purge, snap), nofile=True)
     time.sleep(BOOT_SETTLE_SECS)
     for h in voters:
@@ -252,14 +320,25 @@ def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0):
     return leader
 
 
-def run_rate_arm(voters, leader, a, label, fan_in, secs=ARM_SECS, timeline=False, unit=False):
+def run_rate_arm(voters, leader, a, label, fan_in, secs=ARM_SECS, timeline=False, unit=False,
+                 measure=True):
     """The direct client on the leader host. Foreground (returns the RESULT
     dict) unless `unit`, in which case it is started as a transient unit and
-    the caller reads the log later (row d/f keep it running across an action)."""
+    the caller reads the log later (row d/f keep it running across an action).
+
+    `measure=False` passes `--measure-secs 0`, which switches the client's
+    per-completion `done_ns` Vec off entirely. Rows d and f never read
+    `window_rps` (row d judges recovery from the per-second TL buckets, row f
+    from `uc2ctl status`), and at ~1 M ops/s over a 45 s / 90 s arm that Vec
+    would grow to hundreds of MB by doubling INSIDE the poll thread — a
+    ~200 MB memcpy that can land inside the 2 s recovery window row d is
+    trying to measure. Rows a/b/e keep the window."""
     h = voters[leader]
     args = ["client-direct", "--instance-dir", h.dir, "--app-id", APP,
             "--secs", str(secs), "--payload", str(a.payload), "--inflight", str(a.inflight),
-            "--envelope", "on", "--warmup-secs", str(WARMUP_SECS), "--measure-secs", str(MEASURE_SECS)]
+            "--envelope", "on",
+            "--warmup-secs", str(WARMUP_SECS if measure else 0),
+            "--measure-secs", str(MEASURE_SECS if measure else 0)]
     if fan_in:
         args.append("--fan-in")
     if timeline:
@@ -324,7 +403,14 @@ def arm_calib(voters, a, rates, checks):
         ladder.append((k, rate_of(d) / rates["n1"]))
         print(f"INFO calib K={k}: {ladder[-1][1]:.3f} × n1", flush=True)
     k, ratio = pick_k(ladder)
-    gate_json("calib", True, ladder=ladder, K=k, ratio=ratio)
+    if not calib_ok(ratio):
+        gate_json("calib", False, ladder=ladder, K=k, ratio=ratio, band=[CALIB_LO, CALIB_HI])
+        print(f"FAIL calib: the nearest rung is K={k} at {ratio:.3f} × n1, outside "
+              f"[{CALIB_LO}, {CALIB_HI}] — the ladder never made FSM 0 the limiter, so row b "
+              f"would compare two consensus-bound arms and pass vacuously. Extend the ladder "
+              f"(--calib-ks) past K={max(kk for kk, _ in ladder)} and re-run.", flush=True)
+        raise RuntimeError(f"calibration ratio {ratio:.3f} outside [{CALIB_LO}, {CALIB_HI}]")
+    gate_json("calib", True, ladder=ladder, K=k, ratio=ratio, band=[CALIB_LO, CALIB_HI])
     return k
 
 
@@ -342,18 +428,47 @@ def arm_rates(voters, a, rates, checks):
 
 def status_slots(h):
     """`uc2ctl status` per-FSM rows (M14c) → {id: {...}}; also returns the
-    node's fsm_lag bound (bytes; 0 = lockstep) from the `services:` line."""
+    node's fsm_lag bound from the `services:` line.
+
+    `bound` is bytes, `0` for a genuine `fsm_lag=lockstep`, and **None when
+    the `services:` line is absent** — a status this driver could not read.
+    Mapping "unreadable" onto 0 would silently drop the lag clause from row
+    d's attach condition (0 reads as lockstep, which needs no lag check), so
+    `None` is kept distinct and every consumer treats it as not-yet-known.
+
+    `epoch` and `incarnation` are returned too: row d's attach clause needs a
+    BUMPED incarnation, not just the `attached` bit (see `fsm_reattached`)."""
     r = ssh(h, f"sudo {BUILT_CTL} status --instance-dir {h.dir} --app-id {APP}", label="uc2ctl")
     out = (r.stdout or "") + (r.stderr or "")
     slots = {}
     for m in STATUS_RE.finditer(out):
         slots[int(m.group(1))] = {
-            "attached": m.group(2) == "true", "applied": int(m.group(5)),
+            "attached": m.group(2) == "true", "epoch": int(m.group(3)),
+            "incarnation": int(m.group(4)), "applied": int(m.group(5)),
             "lag": int(m.group(6)), "snapshot_pos": int(m.group(7)),
         }
     lm = re.search(r"fsm_lag=(\d+) bytes|fsm_lag=(lockstep)", out)
-    bound = 0 if (lm is None or lm.group(2)) else int(lm.group(1))
+    if lm is None:
+        bound = None
+    elif lm.group(2):
+        bound = 0
+    else:
+        bound = int(lm.group(1))
     return slots, bound
+
+
+def log_lines(h, unit, pattern, lines=200):
+    """Lines of a unit's log matching an extended regex, newest last.
+
+    `obs_event!` renders one JSON line per record and writes it to STDERR
+    (`uc2_node/src/obs/log.rs:227-243`, sink defaults to stderr, default level
+    Info) — no subscriber is installed or needed — and every transient unit
+    appends BOTH stdout and stderr to the same file
+    (`m12_fleet_gate.unit_start_cmd`), so the node role's structured records
+    are in its unit log next to its own printlns."""
+    r = ssh(h, f"sudo grep -E {shlex.quote(pattern)} {m12.unit_log(h, unit)} 2>/dev/null | tail -n {lines}",
+            label="grep")
+    return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
 
 
 def node_stats(h):
@@ -394,20 +509,27 @@ def arm_kill(voters, a, K, checks):
     deadline."""
     leader = start_cluster_m14(voters, [(0, 0), (1, K)])
     h = voters[leader]
-    run_rate_arm(voters, leader, a, "kill", fan_in=True, secs=KILL_ARM_SECS, timeline=True, unit=True)
+    run_rate_arm(voters, leader, a, "kill", fan_in=True, secs=KILL_ARM_SECS, timeline=True, unit=True,
+                 measure=False)
     t_start = time.time()
     time.sleep(12.0)                       # 2 s ramp + [2,10) s baseline + slack
     t0 = time.time()                       # driver clock: attached_at + poll deadline only
+    # The pre-kill reading of FSM 1's slot, taken BEFORE the SIGKILL: its
+    # incarnation is what the reattach must exceed (`fsm_reattached`).
+    pre_slots, bound = status_slots(h)
+    pre = pre_slots.get(1)
+    if pre is None or bound is None:
+        print("WARN row d: FSM 1's status row (or the services: line) is unreadable before the "
+              "kill — the attach clause cannot be adjudicated and will fail closed", flush=True)
+    pre_inc = pre["incarnation"] if pre else None
     r = ssh(h, f"date +%s%3N; sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-service1", label="SIGKILL")
     t0_ms = int((r.stdout or "").strip().splitlines()[0])   # host clock: the SIGKILL instant
     start_unit(h, "service1", service_args(h, 1, K, 0))
     attached_at = None
     deadline = t0 + 30.0
-    _, bound = status_slots(h)
     while time.time() < deadline:
         slots, _ = status_slots(h)
-        s1 = slots.get(1)
-        if s1 and s1["attached"] and (bound == 0 or s1["lag"] <= bound):
+        if fsm_reattached(pre_inc, slots.get(1), bound):
             attached_at = round(time.time() - t0, 2)
             break
         time.sleep(0.25)
@@ -436,26 +558,40 @@ def arm_kill(voters, a, K, checks):
             tl = bound_timeline(tl, t_start_ms + int(d["elapsed_secs"] * 1000) + 1000)
         base_lo, base_hi = t_start_ms + 2000, t_start_ms + 10000
         baseline, recovered, windows = recovery_time(tl, t0_ms, base_lo, base_hi)
+        if not baseline_clean(t0_ms, base_hi):
+            print(f"WARN row d: baseline window overlapped the kill "
+                  f"(t0 - base_hi = {t0_ms - base_hi}ms) — recovery NOT adjudicated", flush=True)
+            recovered = None
     print("INFO recovery timeline (ops/s per 2 s window, end-relative to t0): " +
           ", ".join(f"{(e - t0_ms) / 1000:.1f}s:{r:.0f}" for e, r in windows[:25]), flush=True)
     print(f"INFO row d: baseline {baseline:.0f}/s, rate recovered at {recovered}s, "
           f"FSM 1 attached+lag≤{bound} at {attached_at}s; client lost={d['lost'] if d else '?'}", flush=True)
+    # Spec §15.5: the transitions the LEADER's node actually observed. Attach
+    # dominates and the pair is not symmetric — a restart inside the ~3 s
+    # heartbeat bar shows `service_attached` twice with no `service_detached`
+    # between (uc2_node/src/node.rs:2854-2888). Recorded, never adjudicated.
+    transitions = log_lines(h, "node", "service_(de|at)tached")
+    print(f"INFO row d: leader service transitions ({len(transitions)}):", flush=True)
+    for ln in transitions:
+        print(f"  {ln}", flush=True)
     check_all(voters, leader, "kill", checks, expect_min=int(d["responses"]) if d else None)
     stop_cluster_m14(voters)
     return {"baseline": baseline, "recovered_at": recovered, "attached_at": attached_at,
-            "bound": bound, "client_lost": d["lost"] if d else None}
+            "bound": bound, "pre_incarnation": pre_inc, "transitions": transitions,
+            "client_lost": d["lost"] if d else None}
 
 
 def arm_join(voters, learner, a, K, checks):
     """Row f: voters run the bounded pair with purge ON and snapshots every
-    32 KiB; fan-in load runs for the whole arm; 10 s in, a learner declared
+    `M14_SNAPSHOT_INTERVAL_BYTES`; fan-in load runs for the whole arm; 10 s in, a learner declared
     {0,1} is admitted (`uc2ctl add-learner` on the leader — M7's pattern:
     the learner boots as a plain node with the CURRENT voters as its seed
     members) and must reach both voters' `applied` within 60 s via a
     two-artifact snapshot session (wire 0.6.0), with zero refusals."""
     leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES)
     h = voters[leader]
-    run_rate_arm(voters, leader, a, "join", fan_in=True, secs=JOIN_ARM_SECS, timeline=False, unit=True)
+    run_rate_arm(voters, leader, a, "join", fan_in=True, secs=JOIN_ARM_SECS, timeline=False, unit=True,
+                 measure=False)
     t_client_start = time.time()
     time.sleep(JOIN_AT_SECS)
     new_id, addr = 3, f"{learner.private_ip}:{PORT}"
@@ -474,6 +610,7 @@ def arm_join(voters, learner, a, K, checks):
     # t0 is a driver-clock delta at both ends (here and the status poll below),
     # so no host clock is needed for joined_at (amendment 2).
     t0 = time.time()
+    truncate_log(learner, "node")          # the snapshot-install grep must be arm-scoped
     start_unit(learner, "node", node_args(learner, new_id, m12.members_str(voters), [(0, 0), (1, K)], None,
                                           True, M14_SNAPSHOT_INTERVAL_BYTES), nofile=True)
     time.sleep(2.0)
@@ -496,10 +633,20 @@ def arm_join(voters, learner, a, K, checks):
     if d is None:
         print("WARN row f: client RESULT missing — log read raced or the client died", flush=True)
     kill_unit(h, "client")
-    artifacts = {}
+    # Spec §15.5 wants the per-id artifact LENGTHS, not just a count: one
+    # `find` prints a size per complete artifact, the count is its length.
+    artifacts, artifact_bytes = {}, {}
     for i in (0, 1):
-        r = ssh(learner, f"sudo find {learner.dir}/snapshots/{i} -type f ! -name '*.part' 2>/dev/null | wc -l", label="ls")
-        artifacts[i] = int((r.stdout or "0").strip() or 0)
+        r = ssh(learner, f"sudo find {learner.dir}/snapshots/{i} -type f ! -name '*.part' "
+                         f"-printf '%s\\n' 2>/dev/null", label="ls")
+        sizes = [int(x) for x in (r.stdout or "").split() if x.isdigit()]
+        artifacts[i], artifact_bytes[i] = len(sizes), sizes
+    # Anti-vacuity for row f: positive evidence that a snapshot SESSION ran on
+    # the learner, rather than a plain journal catch-up plus its own snapshot
+    # builds (which would satisfy attached + applied + snapshot_pos > 0 on
+    # their own). `snapshot_installed` is emitted at Info by
+    # `uc2_node/src/node.rs:3168`.
+    installs = len(log_lines(learner, "node", '"event":"snapshot_installed"'))
     refusals = {}
     for hh in voters + [learner]:
         st = node_stats(hh)
@@ -508,9 +655,11 @@ def arm_join(voters, learner, a, K, checks):
     before = len(checks)
     check_all(hosts_all, leader, "join", checks, expect_min=int(d["responses"]) if d else None)
     check_ok = all(c[3] for c in checks[before:]) and len({c[4] for c in checks[before:]}) == 1
-    print(f"INFO row f: joined_at={joined_at}s artifacts={artifacts} refusals={refusals} check_ok={check_ok}", flush=True)
+    print(f"INFO row f: joined_at={joined_at}s artifacts={artifacts} bytes={artifact_bytes} "
+          f"snapshot_installs={installs} refusals={refusals} check_ok={check_ok}", flush=True)
     stop_cluster_m14(hosts_all)
-    return {"joined_at": joined_at, "refusals": refusals, "artifacts": artifacts, "check_ok": check_ok,
+    return {"joined_at": joined_at, "refusals": refusals, "artifacts": artifacts,
+            "artifact_bytes": artifact_bytes, "installs": installs, "check_ok": check_ok,
             "client_lost": d["lost"] if d else None}
 
 
@@ -524,6 +673,11 @@ def selftest():
         fails += 0 if cond else 1
 
     expect("pick_k nearest 0.5", pick_k([(500, 0.9), (2000, 0.52), (8000, 0.2)])[0] == 2000)
+    expect("calib band accepts a straddling ladder",
+           calib_ok(pick_k([(500, 0.9), (2000, 0.52), (8000, 0.2)])[1]))
+    expect("calib band rejects a ladder that never slowed the FSM down",
+           not calib_ok(pick_k([(250, 0.98), (8000, 0.85)])[1]))
+    expect("calib band rejects an over-slow ladder", not calib_ok(pick_k([(8000, 0.10)])[1]))
     expect("row a pass at 0.95", verdict_row_a({"n1": 1000.0, "n2eq": 950.0}).passed)
     expect("row a fail at 0.85", not verdict_row_a({"n1": 1000.0, "n2eq": 850.0}).passed)
     expect("row a fail on missing", not verdict_row_a({"n1": 1000.0}).passed)
@@ -554,17 +708,36 @@ def selftest():
     expect("row d pass", verdict_row_d({"baseline": 1000, "recovered_at": 9.5, "attached_at": 3.0}).passed)
     expect("row d fail late attach", not verdict_row_d({"baseline": 1000, "recovered_at": 9.5, "attached_at": 16.0}).passed)
     expect("row d fail never", not verdict_row_d({"baseline": 1000, "recovered_at": None, "attached_at": 3.0}).passed)
+    # The killed FSM's stale `attached` bit must not satisfy the attach clause.
+    live = {"attached": True, "incarnation": 4, "lag": 100}
+    expect("row d attach: stale incarnation is the corpse, not a reattach",
+           not fsm_reattached(4, live, 4096))
+    expect("row d attach: bumped incarnation + lag inside the bound",
+           fsm_reattached(3, live, 4096))
+    expect("row d attach: bumped incarnation but lag over the bound",
+           not fsm_reattached(3, live, 10))
+    expect("row d attach: lockstep (bound 0) skips the lag clause",
+           fsm_reattached(3, live, 0))
+    expect("row d attach: unreadable status (bound None) never satisfies",
+           not fsm_reattached(3, live, None))
+    expect("row d attach: detached never satisfies",
+           not fsm_reattached(3, {**live, "attached": False}, 4096))
+    expect("row d baseline window closed before the kill", baseline_clean(12000, 10000))
+    expect("row d baseline window still open at the kill", not baseline_clean(9000, 10000))
     expect("row e always passes", verdict_row_e({"n2eq": 100.0, "n2eq-ls": 40.0}).passed)
     tl_in = [(ms, 100) for ms in range(0, 5000, 1000)] + [(ms, 0) for ms in range(5000, 45000, 1000)]
     expect("bound_timeline drops trailing buckets past end_ms, keeps earlier",
            bound_timeline(tl_in, 5000) == [(ms, 100) for ms in range(0, 5000, 1000)])
     good = {"joined_at": 30.0, "refusals": {"h0": (0, 0), "h1": (0, 0), "h2": (0, 0), "h3": (0, 0)},
-            "artifacts": {0: 1, 1: 1}, "check_ok": True}
+            "artifacts": {0: 1, 1: 1}, "artifact_bytes": {0: [4096], 1: [4096]},
+            "installs": 2, "check_ok": True}
     expect("row f pass", verdict_row_f(good).passed)
     expect("row f fail on a refusal", not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (1, 0)}}).passed)
     expect("row f fail on one artifact", not verdict_row_f({**good, "artifacts": {0: 1, 1: 0}}).passed)
     expect("row f fail late", not verdict_row_f({**good, "joined_at": 61.0}).passed)
     expect("row f fail divergence", not verdict_row_f({**good, "check_ok": False}).passed)
+    expect("row f fail on no snapshot install (journal-replay join)",
+           not verdict_row_f({**good, "installs": 0}).passed)
     print(f"selftest: {'PASS' if fails == 0 else f'FAIL ({fails})'}")
     return 0 if fails == 0 else 1
 
