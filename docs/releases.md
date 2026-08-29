@@ -304,12 +304,10 @@ budgeted for was "a short tail" replay, and M9 read its rate from a *survivor*,
 not from a client that could be pinned by the restarted process. So the row as
 specified cannot measure what it claims to. No product defect is implicated:
 row c is green on that same arm. The gate doc carries the three-layer diagnosis
-(harness / client / spec, each labelled FACT or HYPOTHESIS) and a **proposed,
-not applied** re-specification — snapshot policy on the row-d FSMs, and a
-measuring client that does not wait on the killed FSM — following the M12 and
-M9 precedent of recording the FAIL, keeping the bar, and re-specifying as a
-separate pre-committed step. Whether `2.8.0` ships with a documented row d FAIL
-is the maintainer's call.
+(harness / client / spec, each labelled FACT or HYPOTHESIS) and the re-specification — purge on and a snapshot policy on the row-d FSMs,
+and a measuring client that does not wait on the killed FSM — applied as a
+separate pre-committed step and re-run the same day (result below), following
+the M12 and M9 precedent of recording the FAIL and keeping the bar.
 
 **Row d was re-specified and re-run on 2026-08-29.** The maintainer adopted
 the re-specification: the row-d arm now runs a 32 MiB snapshot policy on both

@@ -80,8 +80,7 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
     client's 4 096 in-flight fan-in requests could only retire on their 30 s
     timeout, pinning its window at zero. No product defect is implicated (row
     c is green on that same arm); the row as specified cannot measure what it
-    claims to. Full diagnosis, and a re-specification that is **proposed, not
-    applied**: → [M14 gate § row d](docs/benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed);
+    claims to. Full diagnosis, and the re-specification that was applied before run 2: → [M14 gate § row d](docs/benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed);
     re-specified and re-run 2026-08-29 — result:
     re-run alone under the re-specified procedure (purge on, snapshots on
     both FSMs, FSM-0-only client) on 2026-08-29 at commit `6228365`:
