@@ -716,3 +716,184 @@ Labels via the existing `push_labeled` (`service="<id>"`) — the peer-slot band
 ### 14.5 Out of scope for M14c
 
 The capstones (M14c2), the fleet gate and release writeup (M14d), a datagram header version field, a remote-protocol service selector (§11), and the M14b deferrals that are not on the hot path (listed in the M14b plan's execution record).
+
+## 15. M14d design (2026-08-29) — the fleet gate and the 2.8.0 release
+
+M14a (`main` 6111257), M14b (4347bc2) and M14c (b3f1053) are in. This section
+fixes what §12's one paragraph left open — the harness, the topology, the
+tolerance, the exact rule behind every bar — and scopes the release. Where it
+contradicts §12 or §14.1, this section wins. Bars are committed here, before
+any fleet run, per the honest-failure protocol (M7–M13).
+
+### 15.1 The cut, amended
+
+- **M14d** (this section, one plan): `bench-infra/scripts/m14_fleet_gate.py` +
+  the `m12_gate` harness extension, the gate doc
+  `docs/benchmarks/uc2-m14-gate-<date>.md`, and the `2.8.0` release writeup.
+  Tagging and the crates.io publish stay user steps
+  (`docs/how-to/cut-a-release.md` §4, §6).
+- **M14c2 moves *after* the release** (ruling 2026-08-29, reversing §14.1's
+  order): the §12 capstones (`lin_v2 two_fsm`, `lin_partition_v2` with two
+  FSMs, the two hard-crash scenarios, the elle two-FSM tier) and the M14c
+  plan's "Deferred to M14c2" list land as a proof-only `2.8.1`. `2.8.0`
+  therefore ships multi-service with the coverage VERIFICATION §11 states
+  today — unit, in-process integration on one node and a 3-node cluster, the
+  M14b sim scenario, the fuzz seeds — **and says so** in the gate doc, in
+  VERIFICATION §11 and in the release notes. This is a disclosed gap, not a
+  claim.
+- Out of scope, unchanged from §14.5: a datagram header version field, a
+  remote-protocol service selector (§11), the M14a/M14b deferred minors.
+
+### 15.2 Topology
+
+Five `c6id.2xlarge` (8 vCPU each, 40 vCPU; the account quota is 48 as of
+2026-08-29), `us-east-1`, one placement group, NVMe journals, fsync on —
+the M7 shape (`uc2-m7-gate-2026-07-13.md`). Roles: `hosts[0..3]` three
+voters, `hosts[3]` the learner (idle until row f), `hosts[4]` the client.
+Rows a–e use exactly M13's four-host shape (three voters + a client host on
+the same instance type), so row a's N=1 number is directly comparable to
+M13's full-stack arm; the fifth host is what row f needs and nothing else.
+
+### 15.3 Harness: `m12_gate` extended, driven by `m14_fleet_gate.py`
+
+**No new binary.** `uc2_gateway/examples/m12_gate.rs` already has the `node`
+/ `service` / `edge` / direct-client roles the M12 and M13 fleet drivers
+launch as `systemd-run` transient units. M14d adds:
+
+- `node --services <mask> --fsm-lag lockstep|bounded:<bytes>` → the
+  `ServicesConfig` the node boots with (today hard-coded to
+  `ServicesConfig::default()` at `m12_gate.rs:428`). Absent flags keep the
+  default (`{0}`, `Bounded(buffer_bytes / 4)`), so every existing arm is
+  byte-for-byte unchanged.
+- `node --purge` → `PurgePolicy::BelowSnapshot { slack_bytes: 0 }` (as `m6_gate`'s node
+  role), needed by row f only; and the `node` role's stats line gains
+  `Node::snapshot_session_refusals()` beside `reports_unattested`, so row f's
+  refusal counters come out of a gate node without a `[metrics]` endpoint.
+- `service --service-id <id> --work-spin <K>` → `ServiceConfig::service_id`,
+  and a `SpinCountSm`: `CountSm`'s typed twin whose `apply` runs a
+  fixed-iteration integer loop of `K` rounds before returning the count. The
+  loop's result is consumed through `std::hint::black_box` and **never
+  reaches the response**, so the response is the count and only the count;
+  `K` changes cost, not output. The typed tier is deliberate (it is the
+  quickstart's tier and the one the M12 gate rated); `--raw-sm` stays
+  available and is not part of any M14 row. Unit test: for any `K`, the
+  response stream of `SpinCountSm` equals `CountSm`'s on the same input.
+- The direct-client role submits with `submit_all` (waits for every declared
+  FSM's response) when the declared mask has more than one bit, and after
+  each arm runs the divergence check of row c through
+  `query_linearizable_on(id)` per declared id, against every voter.
+
+`m14_fleet_gate.py` reuses `m6_fleet_gate.build_fleet_hosts` (count=5),
+`m12_fleet_gate`'s `systemd-run` bring-up, sync and teardown, and M13's
+`--selftest` pattern: every verdict function is pure over recorded numbers
+and the selftest replays a canned row set through them, locally, with no
+fleet. Bars are module-level constants, printed beside each verdict as
+`GATE-JSON` lines; the exit code is the verdict.
+
+**The slow FSM, made precise.** §12 says "a deliberately ~2× slower
+variant". `counter`'s apply costs tens of nanoseconds and is nowhere near the
+limiter (M13 measured the fleet chain cluster-bound at ~1.75 M ops/s), so
+"2× slower than `counter`" would change nothing. The intended meaning, fixed
+here: **the slow FSM's solo apply rate is ≈ half the N=1 cluster rate**, so
+that it — not consensus, not the client — is the bottleneck in row b. `K` is
+calibrated by a preliminary arm (`calib`: FSM 0 alone running `SpinCountSm`
+at a ladder of `K`, 8 s each; pick the `K` whose rate is nearest 0.5× row
+a's N=1 rate) and recorded in the gate doc. Row b's bar is a ratio against
+slow-solo measured *with that same `K` in the same run*, so the bar does not
+depend on the calibration landing exactly.
+
+**What "rate" means, everywhere below**: client-observed completed
+operations per second over the arm's steady window (the middle 8 s of a 12 s
+arm; the leading 2 s and trailing 2 s discarded — M9's window rule), envelope
+on, one direct-client process on `hosts[4]` at `m12_gate`'s direct-client
+defaults (`--inflight 4096`, 64-byte payload — the M13 sizing). Positions and bytes are the node's view;
+ops are the client's; the gate rates ops.
+
+### 15.4 The rows and their bars
+
+| row | arm(s) | rule | bar |
+|---|---|---|---|
+| **a** — equal-speed pair | `n1`: `{0}` counter. `n2eq`: `{0,1}` both counter, bounded default | `rate(n2eq) / rate(n1)` | **≥ 0.90** |
+| **b** — bounded convergence | `slow1`: `{0}` `SpinCountSm(K)`. `pair`: `{0,1}` = counter + `SpinCountSm(K)`, bounded default | `rate(pair) / rate(slow1)` | **within [0.90, 1.10]** (ruling 2026-08-29: ±10 %) |
+| **c** — zero divergence | after **every** arm above and in d–f | on every voter (and the learner in f), for every declared id: `query_linearizable_on(id)` → count; all counts equal each other **and** the client's completed-op count; per-FSM `applied` bytes on `uc2ctl status` equal across ids on each host | **any mismatch = FAIL** |
+| **d** — FSM kill | `pair` under load; at t0 `SIGKILL` FSM 1's unit on the **leader** host; `systemd-run` it again immediately | M9's recovery rule (`m9_fleet_gate.py:343-379`): recovered = first 2 s window at ≥ 80 % of the pre-kill 8 s baseline whose end is within 15 s of t0, confirmed by the next window; **and** `uc2ctl status` on that host shows `service 1` attached with `lag ≤ bound` by the same deadline | **≤ 15 s** (M9's bar) |
+| **e** — lockstep cost | `n2eq-ls` and `pair-ls`: rows a/b's pairs with `--fsm-lag lockstep` | `rate(n2eq-ls) / rate(n2eq)` and `rate(pair-ls) / rate(pair)` | **reported, not barred** (§12) |
+| **f** — two-FSM learner join, wire 0.6.0 | `pair` with `PurgePolicy::BelowSnapshot` on the voters, under load; `uc2ctl add-learner` a learner on `hosts[3]` declared `{0,1}` | the learner's snapshot session carries **two** artifacts (`layout = SNAP_BEGIN_LAYOUT_V2 = 1`, `services_declared = 0b11`): after the join the learner holds a complete artifact under both `snapshots/0/` and `snapshots/1/`, and `uc2ctl status` on it shows `snapshot_pos > 0` for both ids; the learner reaches both voters' `applied` within M6's `JOIN_BUDGET = 60 s`; row c's check passes on the learner; the receiving node's `Node::snapshot_session_refusals()` pair — printed by the `node` role beside `reports_unattested` — reads **(0, 0)** (`peer wire 0.5.0`, `declared-set mismatch`) on every node | **converges inside 60 s with zero refusals**; the join time is reported |
+| **g** — correctness tiers | CI at the gated commit | `ci.yml` green (workspace tests, clippy, deny, fuzz smoke); the most recent `nightly.yml` at or after the gated commit green (capstones, sim-heavy, crashtest, loom, miri) | **green**, and the doc states the M14c2 deferral in §15.1's words |
+
+Why these and not others: the remote path is FSM-0-only in 2.8.0
+(`docs/reference/limits.md`) and unchanged by M14 at the wire, so M13's rows
+a–d stand and are **not re-run**; the per-FSM metric families and both M14c
+alerts are proven to fire by `scripts/m10_alert_fire.sh` in CI and are not a
+fleet question; the `[services]` named refusals are `daemon_refusals` tests.
+A fleet gate is for what only a fleet can measure — rates across real
+hosts, a kill on a real host, a snapshot stream over a real network.
+
+Reading a FAIL: row a or b below the bar is diagnosed before any re-run
+(harness defect vs. product property — both recorded, the bar kept); row c
+is a **consensus or apply defect** and blocks the release outright; row f's
+refusal counters non-zero is a wire-0.6.0 defect and blocks likewise.
+
+### 15.5 Facts the gate doc must state
+
+The `K` chosen and the calibration ladder; every arm's rate with its window;
+the leader's identity per arm; the row-c counts per host per id; row d's
+timeline (M9's `INFO recovery timeline` format) and the observed
+`service_detached` → `service_attached` log lines on the leader host; row f's per-id artifact
+lengths on the learner, join time and both refusal counters; the CI and nightly
+run ids for row g; the commit gated; and the M14c2 deferral, verbatim.
+
+### 15.6 The 2.8.0 release
+
+Per `docs/how-to/cut-a-release.md` §1 and CLAUDE.md "Release documentation",
+**before the tag**, in this order:
+
+1. **Version**: `Cargo.toml` `2.7.0 → 2.8.0` (+ intra-workspace pins);
+   literal-string sweep (`README.md` lines 33/37/38/89, `packaging/compose.yml`,
+   `Dockerfile` comments, `QUICKSTART.md`, `run-a-cluster.md`);
+   `SECURITY.md` supported line → `2.8.x`. Wire `0.6.0` and cnc `3.0` are
+   already in the code (126836d, f58f3c2) — nothing to bump there.
+2. **Writeup**: a `2.8.0` section atop `RELEASES.md` — feature bullets
+   (multi-service `[services]`; per-FSM routing + client fan-in; the wire
+   0.6.0 snapshot stream; per-FSM observability + the two alerts; `uc2ctl
+   status` per-FSM table; per-FSM backup), a **Fixed** bullet (the M14c
+   `SNAP_NAK` slot pinning, a405e71; the apply-loop lockstep sleep, 80a37a8),
+   a **Performance** bullet (the M14 gate, the two hop docs), the **Upgrade
+   consequence** paragraph (0.6.0 flag day + cnc 3.0 same-host restart;
+   `upgrade-a-cluster.md` §"Wire change in 2.8.0" already written). The
+   matching `docs/releases.md` entry. **A new explainer**
+   `docs/notes/uc2-m14-multi-service-explained.md` (one log → N FSMs, the
+   lag barrier and the quorum-gated report ceiling in plain language, why
+   lockstep costs what it costs) — CLAUDE.md requires every feature bullet
+   to link a detailed doc and none exists for the mechanism.
+3. **Sweep** for statements 2.8.0 invalidates: `docs/reference/limits.md`'s
+   "unreleased" qualifiers; `upgrade-a-cluster.md`'s dating; CLAUDE.md's
+   project-status block (version, the M14 table row, wire `0.6.0`, the cnc
+   page is 8 KiB in two places, "Next up"); `docs/VERIFICATION.md`'s header
+   ("current as of M12d") and §11 (the M14c2 deferral, stated); the M14b
+   plan's three "rustdoc-only behaviours to carry into the release writeup".
+4. **Security posture refresh** (the 2026-08-29 review): `attack-surface.md`
+   (cnc row 4 KiB → 8 KiB + page-2 band; a row for
+   `uc_protocol::v2::ipc::split_query_payload`, local-only, fuzzed via
+   `ring_mpsc_record`; the `SNAP_BEGIN` row's per-id on-disk consequence);
+   `threat-model.md` §5 (one stalled FSM on a quorum of hosts is a
+   cluster-scope liveness lever; `service.<id>.lock` is a same-uid squat
+   point); `self-assessment.md` (F7 = a405e71; §4 gains the multi-artifact
+   intake state machine; §5's tier table carries the M14c2 caveat; a
+   "revised for 2.8.0" line, the M12d dating kept as history).
+5. **Nightly**: the 2026-08-28 scheduled `nightly.yml` run failed; its cause
+   is diagnosed and recorded (fixed, or named as a known flake with the
+   memory's evidence) before the rc tag.
+6. **Tag path**: `v2.8.0-rc.1` → `cosign verify-blob` as a stranger
+   (cut-a-release §3, §5) → `v2.8.0`. Both user steps; the plan ends with the
+   release-smoke evidence and the two commands.
+
+### 15.7 Acceptance
+
+M14d is done when: the harness extension's unit tests are green (spin-SM
+determinism; `--services`/`--fsm-lag` parse and refuse like `node.toml`);
+`m14_fleet_gate.py --selftest` passes; the gate doc with **all bars committed
+first** is on `main`; the fleet run is recorded in that doc with every row's
+verdict and §15.5's facts, FAILs diagnosed; and the 15.6 writeup is on
+`main` with the rc tag's verification evidence — the `v2.8.0` tag itself
+being the user's step.
