@@ -119,7 +119,7 @@ Two shapes to know before writing a query:
 `uc2_service_lag_waits_total{service}` is reliable under lockstep (≈ one
 wait per frame), but an **undercount under bounded mode**: the M14a apply
 loop only counts a wait when the cap sits on a frame boundary (M14a's
-execution record lists this; the service-side fix is deferred to M14c′).
+execution record lists this; the service-side fix is deferred to M14c2).
 For the pinned-at-bound signal, use `uc2_service_lag_bytes{service}` — the
 series `Uc2ServicePinnedAtLagBound` actually keys on.
 

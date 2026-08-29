@@ -653,7 +653,7 @@ M14a (`main` 6111257) and M14b (`main` 4347bc2) are in. Their execution records 
 ### 14.1 The cut
 
 - **M14c** (this section's scope, one plan): (1) the client hot-path cost M14b measured, fixed first; (2) §7.3 — N artifacts per snapshot session, wire 0.6.0; (3) §9 — observability. In that order: the fix precedes anything that measures, the wire change is the one flag day and gets its own review cycle, the labelled metrics are what the proof plans will read.
-- **M14c′** (its own plan, after M14c): the §12 capstones — `lin_v2 two_fsm` (lockstep, bounded, slow-FSM oracle), `lin_partition_v2` with two FSMs, the two hard-crash scenarios, the elle clean tier with two FSMs. They are written against the finished node because the learner-join and purge/snapshot-churn paths they prove are exactly what §7.3 changes.
+- **M14c2** (its own plan, after M14c): the §12 capstones — `lin_v2 two_fsm` (lockstep, bounded, slow-FSM oracle), `lin_partition_v2` with two FSMs, the two hard-crash scenarios, the elle clean tier with two FSMs. They are written against the finished node because the learner-join and purge/snapshot-churn paths they prove are exactly what §7.3 changes.
 - **M14d** unchanged: fleet gate + release writeup.
 
 ### 14.2 Client hot path (new workstream; not in the original design)
@@ -715,4 +715,4 @@ Labels via the existing `push_labeled` (`service="<id>"`) — the peer-slot band
 
 ### 14.5 Out of scope for M14c
 
-The capstones (M14c′), the fleet gate and release writeup (M14d), a datagram header version field, a remote-protocol service selector (§11), and the M14b deferrals that are not on the hot path (listed in the M14b plan's execution record).
+The capstones (M14c2), the fleet gate and release writeup (M14d), a datagram header version field, a remote-protocol service selector (§11), and the M14b deferrals that are not on the hot path (listed in the M14b plan's execution record).

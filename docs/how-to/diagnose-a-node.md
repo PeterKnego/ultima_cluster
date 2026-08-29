@@ -89,7 +89,7 @@ wait counter climbs is the one *being* paced, i.e. a victim, not the cause.
 The cause is the id with the largest `uc2_service_lag_bytes`. Treat
 `lag_waits_total` as reliable under lockstep but an **undercount under
 bounded mode** — the apply loop only counts a wait when the cap sits on a
-frame boundary (the service-side fix is deferred to M14c′);
+frame boundary (the service-side fix is deferred to M14c2);
 `uc2_service_lag_bytes{service}` (what `Uc2ServicePinnedAtLagBound` keys on)
 is the trustworthy pinned-at-bound signal either way.
 
