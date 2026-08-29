@@ -8,16 +8,22 @@
 //! ```text
 //! # local smoke — both arms in-process, one after the other (NOT the gate)
 //! cargo run -p uc2_gateway --release --example m12_gate -- \
-//!     [--arm direct|gateway|both] [--secs 6] [--payload 64] [--inflight 4096] \
+//!     [--arm direct|gateway|both|fsms] [--secs 6] [--payload 64] [--inflight 4096] \
 //!     [--envelope on|off] [--root DIR]
 //!
 //! # fleet roles — one process per role per host, driven by
-//! # bench-infra/scripts/m12_fleet_gate.py (gate rows 2 and 3)
-//! m12_gate node          --id N --bind A --instance-dir D --members id@addr,… [--admission-kib K]
-//! m12_gate service       --instance-dir D [--envelope on|off] [--raw-sm]
+//! # bench-infra/scripts/m12_fleet_gate.py (gate rows 2 and 3) and M14d's driver
+//! m12_gate node          --id N --bind A --instance-dir D --members id@addr,… [--admission-kib K] \
+//!                         [--services 0,1] [--fsm-lag lockstep|BYTES] [--purge-below-snapshot] \
+//!                         [--journal-segment-bytes N]
+//! m12_gate service       --instance-dir D [--envelope on|off] [--raw-sm] \
+//!                         [--service-id ID] [--work-spin K] [--snapshot-interval-bytes N]
 //! m12_gate edge          --instance-dir D --listen A --members id@gw_addr,… [--envelope on|off] [--inflight N]
-//! m12_gate client-direct --instance-dir D --secs S [--payload P] [--inflight N] [--envelope on|off]
+//! m12_gate client-direct --instance-dir D --secs S [--payload P] [--inflight N] [--envelope on|off] \
+//!                         [--fan-in] [--warmup-secs S] [--measure-secs S] [--timeline]
 //! m12_gate client-remote --gateways A,… --secs S [--payload P] [--inflight N]
+//! m12_gate check-fsms    --instance-dir D --app-id A [--mode linearizable|snapshot] \
+//!                         [--expect N] [--expect-min N] [--settle-secs S]
 //! ```
 //!
 //! The two client roles each print ONE machine-readable
@@ -113,6 +119,9 @@ enum Arm {
     Direct,
     Gateway,
     Both,
+    /// M14d: two FSMs — `CountSm` + `SpinCountSm(2000)` — fan-in load, then
+    /// the divergence check; smoke only.
+    Fsms,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -147,6 +156,9 @@ enum Role {
     /// Measuring client over the framed remote protocol — runs on a host with
     /// no node of its own (the gateway arm of row 2).
     ClientRemote(ClientRemoteArgs),
+    /// M14d: every declared FSM's count, checked for agreement (and against
+    /// `--expect`/`--expect-min`) — exits 1 on divergence.
+    CheckFsms(CheckFsmsArgs),
 }
 
 #[derive(clap::Args)]
@@ -258,6 +270,19 @@ struct ClientDirectArgs {
     /// the two arms submit byte-identical frames to an identical service.
     #[arg(long, value_enum, default_value_t = Envelope::On)]
     envelope: Envelope,
+    /// M14d: submit to every declared FSM and count a completion only when
+    /// every FSM answered (spec §15.3).
+    #[arg(long, default_value_t = false)]
+    fan_in: bool,
+    /// M14d: steady-window start (seconds after t0). 0 = whole run.
+    #[arg(long, default_value_t = 0)]
+    warmup_secs: u64,
+    /// M14d: steady-window length. 0 = no window (`window_rps` reads 0).
+    #[arg(long, default_value_t = 0)]
+    measure_secs: u64,
+    /// M14d row d: print `TL` per-second completion buckets.
+    #[arg(long, default_value_t = false)]
+    timeline: bool,
 }
 
 #[derive(clap::Args)]
@@ -275,6 +300,37 @@ struct ClientRemoteArgs {
     inflight: u64,
 }
 
+#[derive(clap::Args)]
+struct CheckFsmsArgs {
+    #[arg(long)]
+    instance_dir: PathBuf,
+    #[arg(long, default_value = "m12-gate")]
+    app_id: String,
+    /// `linearizable` goes through the leader's quorum barrier (run on the
+    /// leader host); `snapshot` reads each FSM's local state (any host).
+    #[arg(long, value_enum, default_value_t = CheckMode::Linearizable)]
+    mode: CheckMode,
+    /// Every FSM's count must equal this exactly (rows a/b/e: the client's
+    /// completed ops on this cluster generation).
+    #[arg(long)]
+    expect: Option<u64>,
+    /// Every FSM's count must be at least this (rows d/f: ops the client saw
+    /// complete; commands still in flight at a kill may add to it).
+    #[arg(long)]
+    expect_min: Option<u64>,
+    /// Keep re-reading until the counts agree, up to this long — followers
+    /// apply asynchronously and a check right after load may catch one
+    /// mid-frame.
+    #[arg(long, default_value_t = 10)]
+    settle_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CheckMode {
+    Linearizable,
+    Snapshot,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -287,6 +343,7 @@ fn main() -> anyhow::Result<()> {
             Role::Edge(a) => run_edge_role(a),
             Role::ClientDirect(a) => run_client_direct_role(a),
             Role::ClientRemote(a) => run_client_remote_role(a),
+            Role::CheckFsms(a) => run_check_fsms_role(a),
         };
     }
 
@@ -302,6 +359,10 @@ fn main() -> anyhow::Result<()> {
     );
     let _ = std::fs::remove_dir_all(&root); // fresh root per run
     std::fs::create_dir_all(&root)?;
+
+    if cli.arm == Arm::Fsms {
+        return run_fsms_arm(&root, cli.secs, cli.payload, cli.inflight);
+    }
 
     println!("arm                   : {:?}", cli.arm);
     println!("envelope (gateway arm): {:?}", cli.envelope);
@@ -652,6 +713,63 @@ where
     (nodes, services, dirs)
 }
 
+/// M14d: `boot_cluster` for two declared FSMs per node — id 0 `CountSm`,
+/// id 1 `SpinCountSm(spin)`. Bounded lag at the node default.
+#[allow(clippy::type_complexity)]
+fn boot_cluster2(
+    root: &std::path::Path,
+    app_id: &str,
+    n: usize,
+    spin: u64,
+) -> (Vec<Node>, Vec<Service<CountSm>>, Vec<Service<SpinCountSm>>, Vec<PathBuf>) {
+    let socks: Vec<UdpSocket> = (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
+    let members: Vec<(u32, SocketAddr)> =
+        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+    let services = ServicesConfig::from_ids(&[0, 1], None).expect("ids 0,1");
+    let (mut nodes, mut s0, mut s1, mut dirs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (i, sock) in socks.into_iter().enumerate() {
+        let addr = members[i].1;
+        let instance_dir = root.join(format!("n{i}"));
+        std::fs::create_dir_all(&instance_dir).expect("instance dir");
+        let cfg = node_config(
+            i as u32, members.clone(), addr, instance_dir.clone(), app_id,
+            NODE_BUFFER_BYTES, DEFAULT_ADMISSION_BYTES, services,
+            uc2_node::PurgePolicy::Disabled, uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        );
+        let node = Node::start_with_socket(cfg, sock).expect("node start");
+        let a = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id).service_id(0), CountSm::default())
+            .start().expect("service 0");
+        let b = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id).service_id(1), SpinCountSm::with_spin(spin))
+            .start().expect("service 1");
+        nodes.push(node); s0.push(a); s1.push(b); dirs.push(instance_dir);
+    }
+    (nodes, s0, s1, dirs)
+}
+
+fn run_fsms_arm(root: &std::path::Path, secs: u64, payload: usize, inflight: u64) -> anyhow::Result<()> {
+    const APP_ID: &str = "uc2-m12-gate-fsms";
+    let (nodes, s0, s1, dirs) = boot_cluster2(root, APP_ID, 3, 2_000);
+    let leader = await_single_leader(&nodes, 30);
+    println!("[fsms] leader elected: n{leader}");
+    let opts = MeasureOpts { fan_in: true, warmup_secs: 1, measure_secs: secs.saturating_sub(2), timeline: false };
+    let stats = run_client_measurement(&dirs[leader], APP_ID, secs, payload, inflight, None, &opts);
+    print_report("fsms (fan-in, 2 FSMs)", &stats);
+    print_result_json("fsms", &stats, secs, payload, inflight);
+    anyhow::ensure!(stats.lost == 0, "{} lost", stats.lost);
+    run_check_fsms_role(CheckFsmsArgs {
+        instance_dir: dirs[leader].clone(),
+        app_id: APP_ID.into(),
+        mode: CheckMode::Linearizable,
+        expect: Some(stats.responses),
+        expect_min: None,
+        settle_secs: 10,
+    })?;
+    for n in nodes { n.stop(); }
+    for s in s0 { s.stop(); }
+    for s in s1 { s.stop(); }
+    Ok(())
+}
+
 /// A loopback TCP address nothing is listening on *right now* (bind-then-drop
 /// reservation — `uc2_gateway/tests/common/mod.rs`'s `free_tcp_addr` trick):
 /// every edge needs the whole node-id -> gateway-address map before any of
@@ -696,6 +814,41 @@ struct ClientStats {
     max_ms: f64,
     responses_per_sec: f64,
     pass: bool,
+    /// M14d: completions inside `[warmup_secs, warmup_secs + measure_secs)`.
+    window_responses: u64,
+    /// M14d: `window_responses / measure_secs`; 0.0 when `measure_secs == 0`.
+    window_rps: f64,
+    /// M14d: whether this run submitted via `try_submit_all` (fan-in).
+    fan_in: bool,
+    /// M14d: `Engine::declared()` / `Client::declared()` — the FSM bitmask
+    /// this client attached to.
+    declared: u64,
+}
+
+/// M14d: what the fleet driver varies per arm, beyond `secs/payload/inflight`.
+#[derive(Clone, Copy, Debug, Default)]
+struct MeasureOpts {
+    /// `try_submit_all` (one response per declared FSM, counted as ONE
+    /// completed op when every part arrived) instead of `try_submit`.
+    fan_in: bool,
+    /// Steady window: completions in `[warmup, warmup + measure)` seconds
+    /// after t0. `measure == 0` disables the window (`window_rps` = 0).
+    warmup_secs: u64,
+    measure_secs: u64,
+    /// Print one `TL {...}` line per elapsed second (row d's recovery clock).
+    timeline: bool,
+}
+
+/// Completions inside `[warmup, warmup + measure)` and their rate. Pure, so
+/// the arithmetic is testable; `done_ns` are completion times since t0.
+fn window_rate(done_ns: &[u64], warmup_secs: u64, measure_secs: u64) -> (u64, f64) {
+    if measure_secs == 0 {
+        return (0, 0.0);
+    }
+    let lo = warmup_secs * 1_000_000_000;
+    let hi = lo + measure_secs * 1_000_000_000;
+    let n = done_ns.iter().filter(|&&t| t >= lo && t < hi).count() as u64;
+    (n, n as f64 / measure_secs as f64)
 }
 
 fn print_report(label: &str, s: &ClientStats) {
@@ -741,7 +894,15 @@ fn run_direct_arm(root: &std::path::Path, secs: u64, payload: usize, inflight: u
     let leader = await_single_leader(&nodes, 30);
     println!("[direct] leader elected: n{leader}");
 
-    let stats = run_client_measurement(&dirs[leader], APP_ID, secs, payload, inflight, None);
+    let stats = run_client_measurement(
+        &dirs[leader],
+        APP_ID,
+        secs,
+        payload,
+        inflight,
+        None,
+        &MeasureOpts::default(),
+    );
 
     for node in nodes {
         node.stop();
@@ -764,6 +925,7 @@ fn run_client_measurement(
     payload_len: usize,
     inflight_cap: u64,
     session_client_id: Option<u64>,
+    opts: &MeasureOpts,
 ) -> ClientStats {
     let (send, mut poll) = Engine::attach(
         instance_dir,
@@ -816,6 +978,24 @@ fn run_client_measurement(
     ));
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
+    let t0_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // M14d: completion timestamps for the steady-window rate, and per-second
+    // buckets for `--timeline` — both are the price of a Vec/bucket-array
+    // touch per completion, so an unbounded arm (`MeasureOpts::default()`)
+    // must not pay for either (ruling: keep the hot loop's body small).
+    let done_ns: Option<Arc<Mutex<Vec<u64>>>> =
+        (opts.measure_secs > 0 || opts.timeline).then(|| Arc::new(Mutex::new(Vec::new())));
+    let buckets: Option<Arc<Box<[AtomicU64]>>> = opts.timeline.then(|| {
+        Arc::new(
+            (0..secs + 40)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    });
 
     let matcher = thread::Builder::new()
         .name("m12-gate-poll".into())
@@ -830,7 +1010,33 @@ fn run_client_measurement(
             let last_response_ns = Arc::clone(&last_response_ns);
             let hist = Arc::clone(&hist);
             let stop = Arc::clone(&stop);
+            let done_ns = done_ns.clone();
+            let buckets = buckets.clone();
+            let fan_in = opts.fan_in;
             move || {
+                // Common bookkeeping for one completed op (`Response`, or a
+                // fan-in `Responses` where every part arrived): latency,
+                // count, and — only when the caller asked — the window
+                // timestamp and the timeline bucket.
+                let record = |user_data: u64| {
+                    let idx = (user_data as usize) & SLOT_MASK;
+                    let now = t0.elapsed().as_nanos() as u64;
+                    let lat = now
+                        .saturating_sub(send_ns[idx].load(Ordering::Acquire))
+                        .min(HIST_MAX_NS);
+                    let _ = hist.lock().unwrap().record(lat);
+                    responses.fetch_add(1, Ordering::Relaxed);
+                    last_response_ns.fetch_max(now, Ordering::Relaxed);
+                    if let Some(d) = &done_ns {
+                        d.lock().unwrap().push(now);
+                    }
+                    if let Some(b) = &buckets {
+                        let sec = (now / 1_000_000_000) as usize;
+                        if sec < b.len() {
+                            b[sec].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                };
                 while !stop.load(Ordering::Relaxed) {
                     let n = poll.poll(|c| {
                         match c.outcome {
@@ -840,14 +1046,23 @@ fn run_client_measurement(
                                 {
                                     not_fresh.fetch_add(1, Ordering::Relaxed);
                                 }
-                                let idx = (c.user_data as usize) & SLOT_MASK;
-                                let now = t0.elapsed().as_nanos() as u64;
-                                let lat = now
-                                    .saturating_sub(send_ns[idx].load(Ordering::Acquire))
-                                    .min(HIST_MAX_NS);
-                                let _ = hist.lock().unwrap().record(lat);
-                                responses.fetch_add(1, Ordering::Relaxed);
-                                last_response_ns.fetch_max(now, Ordering::Relaxed);
+                                record(c.user_data);
+                            }
+                            Outcome::Responses(parts) => {
+                                if fan_in {
+                                    if session_client_id.is_some()
+                                        && !parts.iter().all(|(_, body)| {
+                                            body.first() == Some(&TAG_FRESH)
+                                        })
+                                    {
+                                        not_fresh.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    record(c.user_data);
+                                } else {
+                                    // A bench that did not ask for a fan-in
+                                    // must not silently receive one.
+                                    lost.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                             Outcome::NotLeader { .. } => {
                                 not_leader.fetch_add(1, Ordering::Relaxed);
@@ -855,10 +1070,8 @@ fn run_client_measurement(
                             Outcome::Retry => {
                                 retried.fetch_add(1, Ordering::Relaxed);
                             }
-                            // A bench never issues a fan-in or names an id.
                             Outcome::TimedOut
                             | Outcome::InstanceRestart { .. }
-                            | Outcome::Responses(_)
                             | Outcome::BadService { .. } => {
                                 lost.fetch_add(1, Ordering::Relaxed);
                             }
@@ -896,7 +1109,12 @@ fn run_client_measurement(
             }
             None => &cmd_bytes,
         };
-        match send.try_submit(sent_idx, submit_bytes) {
+        let r = if opts.fan_in {
+            send.try_submit_all(sent_idx, submit_bytes)
+        } else {
+            send.try_submit(sent_idx, submit_bytes)
+        };
+        match r {
             Ok(()) => sent_idx += 1,
             Err(SubmitError::Backpressure) => thread::yield_now(),
             Err(SubmitError::NotServing) => thread::sleep(Duration::from_millis(1)),
@@ -944,6 +1162,19 @@ fn run_client_measurement(
         && lost.load(Ordering::Relaxed) == 0;
 
     let engine_stats = send.stats();
+    let declared = send.declared();
+
+    if let Some(b) = &buckets {
+        for (i, c) in b.iter().enumerate() {
+            let n = c.load(Ordering::Relaxed);
+            let ms = t0_unix_ms + (i as u64) * 1000;
+            println!("TL {{\"sec\":{i},\"unix_ms\":{ms},\"responses\":{n}}}");
+        }
+    }
+    let (window_responses, window_rps) = match &done_ns {
+        Some(d) => window_rate(&d.lock().unwrap(), opts.warmup_secs, opts.measure_secs),
+        None => (0, 0.0),
+    };
 
     ClientStats {
         sends,
@@ -963,6 +1194,10 @@ fn run_client_measurement(
         max_ms,
         responses_per_sec,
         pass,
+        window_responses,
+        window_rps,
+        fan_in: opts.fan_in,
+        declared,
     }
 }
 
@@ -1200,6 +1435,13 @@ fn run_remote_measurement(
         max_ms,
         responses_per_sec,
         pass,
+        // M14d: the fan-in / steady-window / declared-mask fields are a
+        // direct-arm (`Engine`) concept — the gateway/remote arm neither
+        // fans in nor exposes a declared-FSM bitmask over the wire.
+        window_responses: 0,
+        window_rps: 0.0,
+        fan_in: false,
+        declared: 0,
     }
 }
 
@@ -1556,7 +1798,8 @@ fn print_result_json(arm: &str, s: &ClientStats, secs: u64, payload: usize, infl
         "RESULT {{\"arm\":\"{arm}\",\"responses_per_sec\":{:.1},\"payload\":{payload},\
          \"inflight\":{inflight},\"secs\":{secs},\"sends\":{},\"responses\":{},\
          \"lost\":{},\"not_fresh\":{},\"inflight_at_end\":{},\"p50_ms\":{:.3},\
-         \"p90_ms\":{:.3},\"p95_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\"elapsed_secs\":{:.3}}}",
+         \"p90_ms\":{:.3},\"p95_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\"elapsed_secs\":{:.3},\
+         \"window_rps\":{:.1},\"window_responses\":{},\"fan_in\":{},\"declared\":{}}}",
         s.responses_per_sec,
         s.sends,
         s.responses,
@@ -1569,6 +1812,10 @@ fn print_result_json(arm: &str, s: &ClientStats, secs: u64, payload: usize, infl
         s.p99_ms,
         s.max_ms,
         s.elapsed.as_secs_f64(),
+        s.window_rps,
+        s.window_responses,
+        s.fan_in,
+        s.declared,
     );
 }
 
@@ -1605,6 +1852,12 @@ fn run_client_direct_role(a: ClientDirectArgs) -> anyhow::Result<()> {
         a.inflight,
         if envelope_on { "on" } else { "off" }
     );
+    let opts = MeasureOpts {
+        fan_in: a.fan_in,
+        warmup_secs: a.warmup_secs,
+        measure_secs: a.measure_secs,
+        timeline: a.timeline,
+    };
     let stats = run_client_measurement(
         &a.instance_dir,
         &a.app_id,
@@ -1612,6 +1865,7 @@ fn run_client_direct_role(a: ClientDirectArgs) -> anyhow::Result<()> {
         a.payload,
         a.inflight,
         session_client_id,
+        &opts,
     );
     print_report("direct (Engine)", &stats);
     print_result_json("direct", &stats, a.secs, a.payload, a.inflight);
@@ -1656,6 +1910,53 @@ fn run_client_remote_role(a: ClientRemoteArgs) -> anyhow::Result<()> {
     send.shutdown();
     print_report("gateway (Edge + RemoteEngine)", &stats);
     print_result_json("gateway", &stats, a.secs, a.payload, a.inflight);
+    Ok(())
+}
+
+/// M14d row c: every declared FSM answers the same count, equal to (or at
+/// least) what the client completed. Any mismatch is exit 1 — the row is a
+/// consensus/apply defect, not a rate.
+fn run_check_fsms_role(a: CheckFsmsArgs) -> anyhow::Result<()> {
+    let client = uc2_client::Client::connect(&a.instance_dir, &a.app_id)?;
+    let declared = client.declared();
+    let ids: Vec<u8> = (0..8u8).filter(|i| declared & (1u64 << i) != 0).collect();
+    anyhow::ensure!(!ids.is_empty(), "no FSM declared on {:?}", a.instance_dir);
+    let deadline = Instant::now() + Duration::from_secs(a.settle_secs);
+    let mut last: Vec<(u8, u64)> = Vec::new();
+    loop {
+        last.clear();
+        for &id in &ids {
+            let c: u64 = match a.mode {
+                CheckMode::Linearizable => client.query_linearizable_on(id, &())?,
+                CheckMode::Snapshot => client.query_snapshot_on(id, &())?,
+            };
+            last.push((id, c));
+        }
+        let agree = last.windows(2).all(|w| w[0].1 == w[1].1);
+        let n = last[0].1;
+        let vs_expect = match (a.expect, a.expect_min) {
+            (Some(e), _) => n == e,
+            (None, Some(m)) => n >= m,
+            (None, None) => true,
+        };
+        if agree && vs_expect {
+            break;
+        }
+        if Instant::now() >= deadline {
+            for (id, c) in &last {
+                println!("FSMS {{\"id\":{id},\"count\":{c}}}");
+            }
+            anyhow::bail!(
+                "divergence after {}s: counts {last:?}, expect {:?}, expect_min {:?}",
+                a.settle_secs, a.expect, a.expect_min
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    for (id, c) in &last {
+        println!("FSMS {{\"id\":{id},\"count\":{c}}}");
+    }
+    println!("FSMS-OK {{\"declared\":{declared},\"count\":{},\"mode\":\"{:?}\"}}", last[0].1, a.mode);
     Ok(())
 }
 
@@ -1728,5 +2029,17 @@ mod tests {
         assert_eq!(StateMachine::last_applied(&b), Some(pos));
         let err = SpinCountSm::with_spin(0).install_snapshot(pos + 64, &mut &blob[..]);
         assert!(err.is_err(), "a mis-tagged artifact must be refused");
+    }
+
+    #[test]
+    fn window_rate_counts_only_completions_inside_the_window() {
+        // completions at 0.5s, 1.5s, 2.5s, 3.5s, 9.5s, 10.5s, 11.5s with a
+        // 2 s warm-up and an 8 s window → the 2.5, 3.5, 9.5 completions.
+        let ns = |s: f64| (s * 1e9) as u64;
+        let done = [ns(0.5), ns(1.5), ns(2.5), ns(3.5), ns(9.5), ns(10.5), ns(11.5)];
+        let (n, rps) = window_rate(&done, 2, 8);
+        assert_eq!(n, 3);
+        assert!((rps - 3.0 / 8.0).abs() < 1e-9, "{rps}");
+        assert_eq!(window_rate(&done, 0, 0), (0, 0.0));
     }
 }
