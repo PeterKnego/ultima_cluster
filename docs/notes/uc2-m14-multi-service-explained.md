@@ -122,7 +122,7 @@ and *that sleep stalled every sibling's next frame*, so their waits exhausted
 too, and the whole set fell into sleeping in lockstep at ~18 k frames/s. The
 fix (`uc2_service/src/apply.rs:634-653`, `lockstep_wait`) is a ladder: 256
 spins, then 2 048 yields with a heartbeat refresh every 256, and only then the
-agent's sleep. Measured 631 k frames/s at N=2 on the same box.
+agent's sleep. Measured 631 k frames/s at N=2 on the same box. Both of those numbers are the FSMs alone on a dev box, and they do **not** predict a loaded host: on the fleet (2026-08-29, `docs/benchmarks/uc2-m14-gate-2026-08-29.md` row e) lockstep ran 60× slower than its bounded twin, at a fixed ~46 µs per frame, on a leader host running the node's four agents, both FSMs and the client on eight vCPUs.
 
 Two lessons generalise past lockstep, and both are in CLAUDE.md now:
 

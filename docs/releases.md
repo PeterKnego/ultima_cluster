@@ -264,19 +264,57 @@ run**, so the bar does not depend on where the calibration lands. Row d reuses
 M9's recovery rule verbatim (`m9_fleet_gate.py:343-379`), read off the
 client's own per-second timeline on the host being killed, so there is no
 clock skew. Row f runs the voters at `PurgePolicy::BelowSnapshot {
-slack_bytes: 0 }` with 16 KiB journal segments and a 32 KiB snapshot interval,
+slack_bytes: 0 }` with 16 MiB journal segments and a 32 MiB snapshot interval,
 so the joiner is genuinely below the floor and must converge by a snapshot
 session. Driver: `bench-infra/scripts/m14_fleet_gate.py` (`--selftest` checks
 the verdict arithmetic with no fleet).
 
-**Results: the fleet run has not been made.** It is a user-gated step, and the
-gate doc's result cells are empty by design until it is.
+**Results: the fleet run happened on 2026-08-29** (4 × `c6id.2xlarge`,
+us-east-1a; voters `54.167.140.44` / `54.210.38.235` / `3.80.224.32`, learner
+`54.90.243.67`; gated commit `711bf58`; driver log retained at
+`~/.cache/uc2-m14-gate-2026-08-29.log`). **The driver's verdict was
+`RESULT: FAIL (honest) — 1 of 6 rows missed: ['d …']`.** The bar was not
+touched.
 
-<!-- PENDING FLEET RUN: fill from docs/benchmarks/uc2-m14-gate-2026-08-29.md Results -->
+| row | result |
+|---|---|
+| a | **PASS** — 0.961 (`n2eq` 1 309 702 / `n1` 1 362 555 ops/s), bar ≥ 0.90. A second bounded FSM behind the same log costs 3.9 %. |
+| b | **PASS** — 1.015 (`pair` 774 043 / `slow1` 762 272 ops/s at K = 500), bar [0.90, 1.10]. The bounded pair converges to the slow FSM's solo rate. |
+| c | **PASS** — 57 `check-fsms` invocations, zero mismatches, every arm. Includes the kill arm, where the SIGKILLed-and-rebuilt FSM's count matches the survivor's and both remote hosts' in both read modes. |
+| d | **FAIL** — the attach clause was met at **21.6 s** against a ≤ 15 s bar, and the client's rate never recovered inside the arm. Diagnosed; bar kept. |
+| e | **reported** (no bar) — lockstep at **0.0166×** its bounded twin (21 707 vs 1 309 702 ops/s), i.e. **60×** slower; `pair-ls` 0.0282× (36×). |
+| f | **PASS** — the two-FSM learner joined in **24.12 s** (bar ≤ 60 s), `snapshot_session_refusals() == (0, 0)` on all four nodes, both artifacts (45 121 B each) present under `snapshots/0/` and `snapshots/1/`, one `snapshot_installed`, and the learner passes row c. |
+| g | **pending** — the gated commit is on an unpushed branch, so no `ci.yml` or `nightly.yml` run exists at `711bf58`. The newest green nightly on `main` is run `33246873016` on `5242054` (`crashtest`, `survival`, `crashtest-crypto` and every other job green); the 2026-08-28 failure `33184711408` on `4347bc2` was closed by `a4a7a9c`. |
 
-The only M14 numbers that exist today are dev-box smoke and set no bar:
+**Row d, in one paragraph.** The driver restarts the killed FSM with **no
+snapshot policy** (`service_args(h, 1, K, 0)`), so the fresh in-memory SM
+rebuilds by replaying the *whole* journal — ~11.9 M commands, roughly 1.3 GB —
+where a service configured with a `SnapshotPolicy` would install an artifact
+and tail-replay one interval. Meanwhile `uc2_service`'s replay path
+deliberately **suppresses leader-publish** (`replay.rs:44-46`: those responses
+were already answered by the previous incarnation), so the client's up-to-4 096
+in-flight *fan-in* requests — each of which completes only when **every**
+declared FSM answers — never received FSM 1's half and could only retire on
+their 30 s `request_timeout`. With a count-based `--inflight 4096` window fully
+pinned, the client's rate read 0 for the rest of the 45 s arm no matter how
+fast FSM 1 recovered, and `lost` came out at exactly 4 096. M9's 15 s bar,
+which row d inherited verbatim, was set for a **node** restart whose services
+ran with purge and snapshots on — M9's own gate doc says the restart cost it
+budgeted for was "a short tail" replay, and M9 read its rate from a *survivor*,
+not from a client that could be pinned by the restarted process. So the row as
+specified cannot measure what it claims to. No product defect is implicated:
+row c is green on that same arm. The gate doc carries the three-layer diagnosis
+(harness / client / spec, each labelled FACT or HYPOTHESIS) and a **proposed,
+not applied** re-specification — snapshot policy on the row-d FSMs, and a
+measuring client that does not wait on the killed FSM — following the M12 and
+M9 precedent of recording the FAIL, keeping the bar, and re-specifying as a
+separate pre-committed step. Whether `2.8.0` ships with a documented row d FAIL
+is the maintainer's call.
+
+Dev-box smoke, which sets no bar and does not predict the fleet's shape:
 `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the FSM hop alone —
-bounded mode free of N, and the 18 k → 631 k lockstep fix) and
+bounded mode free of N, and the 18 k → 631 k lockstep fix, measured with the
+FSMs alone on the box) and
 `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md` (the client hop A/B and
 its same-source rebuild control).
 

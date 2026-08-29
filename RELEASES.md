@@ -53,16 +53,37 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
   intake I/O failures are retried and counted (`uc2_snapshot_intake_io_failures_total`).
   The lockstep barrier no longer sleeps on a live sibling (18 k → 631 k
   frames/s at N=2 on the dev box) — [apply-hop bench](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md).
-- **Performance:** the M14 gate's bars are pre-committed and **the fleet run
-  has not been made yet** — rows a (two bounded FSMs vs one, same run:
-  **≥ 0.90**), b (a fast + slow FSM pair vs the slow FSM alone: **within
-  [0.90, 1.10]**), c (every FSM on every host agrees on the final count: **any
-  mismatch is a FAIL and blocks the release**), d (SIGKILL an FSM on the
-  leader host under fan-in load: **≤ 15 s** back to 80 % of baseline, and that
-  FSM re-attached inside its lag bound), e (lockstep against its bounded twin:
-  reported, **no bar**), f (a two-FSM learner joins a purged leader under
-  load: **≤ 60 s**, zero snapshot-session refusals, both artifacts present).
-  <!-- PENDING FLEET RUN: fill from docs/benchmarks/uc2-m14-gate-2026-08-29.md Results -->
+- **Performance:** the M14 gate ran on the fleet on **2026-08-29**
+  (4 × `c6id.2xlarge`, commit `711bf58`) against bars pre-committed before the
+  driver existed. **The verdict was FAIL: five of six rows met their bar, row
+  d did not, and the bar stands.**
+  - **a — PASS**, 0.961: two bounded FSMs behind one log cost 3.9 % of the
+    one-FSM rate (1 309 702 vs 1 362 555 ops/s), against a ≥ 0.90 bar.
+  - **b — PASS**, 1.015: a fast + slow FSM pair runs at the slow FSM's own
+    solo rate (774 043 vs 762 272 ops/s at K = 500), inside [0.90, 1.10].
+  - **c — PASS**: 57 checks, zero divergence. Every FSM on every host answers
+    the same count in both read modes after every arm — including after the
+    SIGKILL, where the rebuilt FSM matches the survivor exactly.
+  - **f — PASS**: a learner declaring `{0,1}` joined a purged two-FSM leader
+    under load in **24.12 s** (bar ≤ 60 s), with **zero** snapshot-session
+    refusals on all four nodes and both FSMs' artifacts installed over wire
+    `0.6.0`.
+  - **e — reported, no bar**: lockstep cost **60×** its bounded twin on the
+    fleet's leader host (21 707 vs 1 309 702 ops/s), far worse than the
+    dev-box hop bench suggests; the shape is a fixed per-frame stall and the
+    likely-but-untested cause is CPU oversubscription on that host.
+  - **d — FAIL**: SIGKILL an FSM on the leader host under fan-in load. FSM 1
+    was back inside its lag bound at **21.6 s** against a ≤ 15 s bar, and the
+    client's rate never recovered inside the arm. Cause: the harness restarts
+    the FSM with **no snapshot policy**, so it replays ~11.9 M commands of
+    journal, and journal replay deliberately publishes no responses — so the
+    client's 4 096 in-flight fan-in requests could only retire on their 30 s
+    timeout, pinning its window at zero. No product defect is implicated (row
+    c is green on that same arm); the row as specified cannot measure what it
+    claims to. Full diagnosis, and a re-specification that is **proposed, not
+    applied**: → [M14 gate § row d](docs/benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed).
+  - **g — pending**: the gated commit has never been pushed, so no CI or
+    nightly run exists at it.
   → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md). Dev-box smoke,
   never a bar: [apply hop](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md)
   and [client hop](docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md).
