@@ -191,6 +191,10 @@ Seed for the randomised timeout.
 **`purge: PurgePolicy`**
 Journal purge policy. Default `PurgePolicy::Disabled`. The enabled form is
 `PurgePolicy::BelowSnapshot { slack_bytes }`.
+A `SnapshotPolicy` shortens a service restart only together with purge:
+reconstruction installs the newest artifact only when the journal no longer
+covers the start position (`uc2_service/src/replay.rs:73-78`); with purge off it
+replays the whole journal.
 To turn it on, see [Keep the journal from growing without bound](../how-to/bound-journal-growth.md).
 
 **`crypto: CryptoConfig`**

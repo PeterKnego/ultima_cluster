@@ -11,9 +11,10 @@ Arms (each a fresh cluster generation unless noted):
   slow1   {0} SpinCountSm(K)                         → rate(slow1)
   pair    {0,1} CountSm + SpinCountSm(K), bounded    → rate(pair)      row b
   n2eq-ls / pair-ls  the same two pairs in lockstep  → reported        row e
-  kill    pair with a snapshot policy on BOTH FSMs, load submitted to FSM 0
-          only; SIGKILL FSM 1 on the leader host; restart it with the same
-          snapshot policy (procedure re-specified 2026-08-29)      row d
+  kill    pair with snapshots on BOTH FSMs AND purge on (so a restart can
+          install), load submitted to FSM 0 only; SIGKILL FSM 1 on the leader
+          host; restart it with the same snapshot policy
+          (procedure re-specified 2026-08-29)                      row d
   join    pair + purge + snapshots; add-learner on hosts[3] under load row f
   row c   check-fsms after EVERY arm above (leader: linearizable; every
           host: snapshot) — any mismatch FAILs the gate.
@@ -517,13 +518,27 @@ def arm_kill(voters, a, K, checks):
     # record. Two things changed, both about what the row can measure:
     #
     #  (1) BOTH FSMs run with `snap=M14_SNAPSHOT_INTERVAL_BYTES` (32 MiB) —
-    #      the cluster below and the restarted FSM 1 further down. Run 1 gave
-    #      neither a snapshot policy, so the restarted FSM replayed the WHOLE
-    #      journal (~11.9 M commands, ~1.3 GB) and `attached_at` was a
-    #      replay-completion clock (21.6 s). A deployed service installs its
-    #      newest artifact and tail-replays one interval; that is what M9's
-    #      15 s budget was itemised against. Purge stays OFF here (row f owns
-    #      the purge shape).
+    #      the cluster below and the restarted FSM 1 further down — AND the
+    #      cluster runs with PURGE ON (`purge=True`, which also gives
+    #      `node_args` the 16 MiB `--journal-segment-bytes`), the same shape
+    #      row f uses. Both halves are required, and the second is the one
+    #      that actually does the work: reconstruction installs the newest
+    #      artifact only inside the gap guard
+    #      `if first > start_pos` (uc2_service/src/replay.rs:73-78), where
+    #      `first` is the base of the OLDEST RETAINED journal segment
+    #      (`reader.first_meta()`, 0 while nothing has been purged) and a
+    #      fresh process's `start_pos` is 0
+    #      (uc2_service/src/attach.rs:153, `last_applied().unwrap_or(0)`).
+    #      With purge off, `first` stays 0 for the whole arm, `0 > 0` is
+    #      false, and the FSM falls through to `scan_from(0)` — the full
+    #      replay run 1 diagnosed — NO MATTER what snapshot interval it was
+    #      given. Only `PurgePolicy::BelowSnapshot` dispatches
+    #      `ArchiveCmd::Purge` and lifts `first` above 0
+    #      (uc2_node/src/node.rs:3261-3270). Run 1 gave the FSMs neither, so
+    #      the restart replayed the WHOLE journal (~11.9 M commands, ~1.3 GB)
+    #      and `attached_at` was a replay-completion clock (21.6 s). A
+    #      deployed service installs its newest artifact and tail-replays one
+    #      interval; that is what M9's 15 s budget was itemised against.
     #  (2) The measuring client submits to FSM 0 ONLY (`fan_in=False`). Under
     #      fan-in a submit completes only when EVERY declared FSM answers, and
     #      journal replay is publish-silent (uc2_service/src/replay.rs:44-46),
@@ -541,7 +556,7 @@ def arm_kill(voters, a, K, checks):
     # responses`), unchanged: FSM 1 must still agree with FSM 0 and with every
     # remote host in both read modes.
     # ---------------------------------------------------------------------
-    leader = start_cluster_m14(voters, [(0, 0), (1, K)], snap=M14_SNAPSHOT_INTERVAL_BYTES)
+    leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES)
     h = voters[leader]
     run_rate_arm(voters, leader, a, "kill", fan_in=False, secs=KILL_ARM_SECS, timeline=True, unit=True,
                  measure=False)

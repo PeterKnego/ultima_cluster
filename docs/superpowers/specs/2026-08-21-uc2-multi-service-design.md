@@ -826,17 +826,20 @@ ops are the client's; the gate rates ops.
 | **a** — equal-speed pair | `n1`: `{0}` counter. `n2eq`: `{0,1}` both counter, bounded default | `rate(n2eq) / rate(n1)` | **≥ 0.90** |
 | **b** — bounded convergence | `slow1`: `{0}` `SpinCountSm(K)`. `pair`: `{0,1}` = counter + `SpinCountSm(K)`, bounded default | `rate(pair) / rate(slow1)` | **within [0.90, 1.10]** (ruling 2026-08-29: ±10 %) |
 | **c** — zero divergence | after **every** arm above and in d–f | on every voter (and the learner in f), for every declared id: `query_linearizable_on(id)` → count; all counts equal each other **and** the client's completed-op count; per-FSM `applied` bytes on `uc2ctl status` equal across ids on each host | **any mismatch = FAIL** |
-| **d** — FSM kill | `pair` under load; at t0 `SIGKILL` FSM 1's unit on the **leader** host; `systemd-run` it again immediately (procedure re-specified 2026-08-29 after run 1: both FSMs run with `--snapshot-interval-bytes 33554432`, and the measuring client submits to **FSM 0 only** instead of fan-in) | M9's recovery rule (`m9_fleet_gate.py:343-379`): recovered = first 2 s window at ≥ 80 % of the pre-kill 8 s baseline whose end is within 15 s of t0, confirmed by the next window; **and** `uc2ctl status` on that host shows `service 1` attached with `lag ≤ bound` by the same deadline | **≤ 15 s** (M9's bar) |
+| **d** — FSM kill | `pair` under load; at t0 `SIGKILL` FSM 1's unit on the **leader** host; `systemd-run` it again immediately (procedure re-specified 2026-08-29 after run 1: both FSMs run with `--snapshot-interval-bytes 33554432` **and the arm runs `PurgePolicy::BelowSnapshot`** — without purge the restart installs nothing and replays the whole journal — and the measuring client submits to **FSM 0 only** instead of fan-in) | M9's recovery rule (`m9_fleet_gate.py:343-379`): recovered = first 2 s window at ≥ 80 % of the pre-kill 8 s baseline whose end is within 15 s of t0, confirmed by the next window; **and** `uc2ctl status` on that host shows `service 1` attached with `lag ≤ bound` by the same deadline | **≤ 15 s** (M9's bar) |
 | **e** — lockstep cost | `n2eq-ls` and `pair-ls`: rows a/b's pairs with `--fsm-lag lockstep` | `rate(n2eq-ls) / rate(n2eq)` and `rate(pair-ls) / rate(pair)` | **reported, not barred** (§12) |
 | **f** — two-FSM learner join, wire 0.6.0 | `pair` with `PurgePolicy::BelowSnapshot` on the voters, under load; `uc2ctl add-learner` a learner on `hosts[3]` declared `{0,1}` | the learner's snapshot session carries **two** artifacts (`layout = SNAP_BEGIN_LAYOUT_V2 = 1`, `services_declared = 0b11`): after the join the learner holds a complete artifact under both `snapshots/0/` and `snapshots/1/`, and `uc2ctl status` on it shows `snapshot_pos > 0` for both ids; the learner reaches both voters' `applied` within M6's `JOIN_BUDGET = 60 s`; row c's check passes on the learner; the receiving node's `Node::snapshot_session_refusals()` pair — printed by the `node` role beside `reports_unattested` — reads **(0, 0)** (`peer wire 0.5.0`, `declared-set mismatch`) on every node | **converges inside 60 s with zero refusals**, and ≥ 1 snapshot install observed on the learner (`snapshot_installed` in its node log); the join time is reported |
 | **g** — correctness tiers | CI at the gated commit | `ci.yml` green (workspace tests, clippy, deny, fuzz smoke); the most recent `nightly.yml` at or after the gated commit green (capstones, sim-heavy, crashtest, loom, miri) | **green**, and the doc states the M14c2 deferral in §15.1's words |
 
 **Erratum, 2026-08-29 (after fleet run 1).** Row d's *procedure* — not its
-bar — was re-specified after run 1 FAILed: both FSMs now run with a 32 MiB
-snapshot policy and the measuring client submits to FSM 0 only, because run 1's
-snapshot-less restart made the attach clause a full-journal-replay clock and
-its fan-in client's 30 s `request_timeout` pinned the rate clause at 0
-regardless of FSM 1's recovery (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`,
+bar — was re-specified after run 1 FAILed: the arm now runs a 32 MiB snapshot
+policy on both FSMs **together with purge** (a `SnapshotPolicy` shortens a
+restart only with purge — reconstruction installs the newest artifact only when
+the journal no longer covers the start position, `uc2_service/src/replay.rs:73-78`),
+and the measuring client submits to FSM 0 only, because run 1's snapshot-less
+restart made the attach clause a full-journal-replay clock and its fan-in
+client's 30 s `request_timeout` pinned the rate clause at 0 regardless of FSM
+1's recovery (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`,
 "Re-specification — applied 2026-08-29 (run 2)"; run 1's FAIL stays recorded).
 
 Why these and not others: the remote path is FSM-0-only in 2.8.0

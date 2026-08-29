@@ -82,7 +82,8 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
     c is green on that same arm); the row as specified cannot measure what it
     claims to. Full diagnosis, and a re-specification that is **proposed, not
     applied**: → [M14 gate § row d](docs/benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed);
-    re-specified and re-run 2026-08-29 — result: <!-- PENDING RUN 2 -->.
+    re-specified and re-run 2026-08-29 — result:
+    <!-- PENDING RUN 2 -->
   - **g — pending**: the gated commit has never been pushed, so no CI or
     nightly run exists at it.
   → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md). Dev-box smoke,

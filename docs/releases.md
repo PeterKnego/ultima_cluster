@@ -281,7 +281,7 @@ touched.
 | a | **PASS** — 0.961 (`n2eq` 1 309 702 / `n1` 1 362 555 ops/s), bar ≥ 0.90. A second bounded FSM behind the same log costs 3.9 %. |
 | b | **PASS** — 1.015 (`pair` 774 043 / `slow1` 762 272 ops/s at K = 500), bar [0.90, 1.10]. The bounded pair converges to the slow FSM's solo rate. |
 | c | **PASS** — 57 `check-fsms` invocations, zero mismatches, every arm. Includes the kill arm, where the SIGKILLed-and-rebuilt FSM's count matches the survivor's and both remote hosts' in both read modes. |
-| d | **FAIL** — the attach clause was met at **21.6 s** against a ≤ 15 s bar, and the client's rate never recovered inside the arm. Diagnosed; bar kept; re-specified and re-run 2026-08-29 — result: <!-- PENDING RUN 2 --> |
+| d | **FAIL** — the attach clause was met at **21.6 s** against a ≤ 15 s bar, and the client's rate never recovered inside the arm. Diagnosed; bar kept; re-specified and re-run 2026-08-29 — result: see below |
 | e | **reported** (no bar) — lockstep at **0.0166×** its bounded twin (21 707 vs 1 309 702 ops/s), i.e. **60×** slower; `pair-ls` 0.0282× (36×). |
 | f | **PASS** — the two-FSM learner joined in **24.12 s** (bar ≤ 60 s), `snapshot_session_refusals() == (0, 0)` on all four nodes, both artifacts (45 121 B each) present under `snapshots/0/` and `snapshots/1/`, one `snapshot_installed`, and the learner passes row c. |
 | g | **pending** — the gated commit is on an unpushed branch, so no `ci.yml` or `nightly.yml` run exists at `711bf58`. The newest green nightly on `main` is run `33246873016` on `5242054` (`crashtest`, `survival`, `crashtest-crypto` and every other job green); the 2026-08-28 failure `33184711408` on `4347bc2` was closed by `a4a7a9c`. |
@@ -312,14 +312,20 @@ separate pre-committed step. Whether `2.8.0` ships with a documented row d FAIL
 is the maintainer's call.
 
 **Row d was re-specified and re-run on 2026-08-29.** The maintainer adopted
-the re-specification: both row-d FSMs now run with a 32 MiB snapshot policy
-(so the restarted FSM installs its newest artifact and tail-replays one
-interval), and the measuring client submits to **FSM 0 only** rather than
-fan-in (so the rate clause reads the bounded lag barrier releasing, not the
-client's 30 s request timeout). **The ≤ 15 s bar is unchanged and run 1's FAIL
-stays in the record**; the re-specified row starts its own honest-failure
-clock. Result of run 2: <!-- PENDING RUN 2 -->. →
+the re-specification: the row-d arm now runs a 32 MiB snapshot policy on both
+FSMs **together with purge below the snapshot floor** — a `SnapshotPolicy`
+shortens a service restart only with purge, because reconstruction installs the
+newest artifact only when the journal no longer covers the start position
+(`uc2_service/src/replay.rs:73-78`), so with purge off the restart replays the
+whole journal however often it snapshots — and the measuring client submits to
+**FSM 0 only** rather than fan-in (so the rate clause reads the bounded lag
+barrier releasing, not the client's 30 s request timeout). **The ≤ 15 s bar is
+unchanged and run 1's FAIL stays in the record**; the re-specified row starts
+its own honest-failure clock. →
 [M14 gate § row d](benchmarks/uc2-m14-gate-2026-08-29.md#row-d--the-fail-diagnosed).
+Result of run 2:
+
+<!-- PENDING RUN 2 -->
 
 Dev-box smoke, which sets no bar and does not predict the fleet's shape:
 `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the FSM hop alone —

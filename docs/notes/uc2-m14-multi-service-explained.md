@@ -240,6 +240,12 @@ inserts one word, so `SNAP_BEGIN_FIXED_LEN` goes 26 → 34
 `0.5.0 → 0.6.0` wire bump; `DATA`, `NAK`, `APPEND_POSITION`, `TERM_MAP`, the
 16-byte header and every admin datagram are byte-identical.
 
+One thing the per-id install path does *not* do on its own: a
+`SnapshotPolicy` shortens a service restart only together with purge —
+reconstruction installs the newest artifact only when the journal no longer
+covers the start position (`uc2_service/src/replay.rs:73-78`); with purge off it
+replays the whole journal.
+
 The receiver writes each artifact to its own pre-sized `.part`, fsyncs and
 renames it as the contiguous frontier passes its end, and **adopts the floor
 only once every declared id has landed** — `received == services_declared` —
