@@ -382,16 +382,24 @@ def bound_timeline(tl, end_ms):
 def arm_kill(voters, a, K, checks):
     """Row d: the bounded pair under fan-in load; SIGKILL FSM 1's unit on the
     leader host; start it again at once. Recovery is judged twice — the
-    client's own per-second timeline (M9's window rule, same host as the
-    kill so no clock skew) and `uc2ctl status` showing FSM 1 attached with
-    lag ≤ bound."""
+    client's own per-second timeline (M9's window rule) and `uc2ctl status`
+    showing FSM 1 attached with lag ≤ bound.
+
+    Single-clock discipline (fix round 1): the kill instant (`t0_ms`) and the
+    baseline window are both taken on the HOST clock (the same clock that
+    stamps every TL line's `unix_ms`), so no driver/host skew term can enter
+    the recovery judgement. The driver's own `time.time()` (`t0`) is kept
+    only for `attached_at` (a driver-clock delta at both ends of the
+    `uc2ctl status` poll, so it stays internally consistent) and the poll
+    deadline."""
     leader = start_cluster_m14(voters, [(0, 0), (1, K)])
     h = voters[leader]
     run_rate_arm(voters, leader, a, "kill", fan_in=True, secs=KILL_ARM_SECS, timeline=True, unit=True)
     t_start = time.time()
     time.sleep(12.0)                       # 2 s ramp + [2,10) s baseline + slack
-    t0 = time.time()
-    ssh(h, f"sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-service1", label="SIGKILL")
+    t0 = time.time()                       # driver clock: attached_at + poll deadline only
+    r = ssh(h, f"date +%s%3N; sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-service1", label="SIGKILL")
+    t0_ms = int((r.stdout or "").strip().splitlines()[0])   # host clock: the SIGKILL instant
     start_unit(h, "service1", service_args(h, 1, K, 0))
     attached_at = None
     deadline = t0 + 30.0
@@ -403,27 +411,35 @@ def arm_kill(voters, a, K, checks):
             attached_at = round(time.time() - t0, 2)
             break
         time.sleep(0.25)
-    # let the client finish, then read its timeline
-    time.sleep(max(0.0, (t_start + KILL_ARM_SECS + 8) - time.time()))
+    # Wait for the client UNIT to exit (the sibling drivers' full ssh+attach+drain
+    # budget) rather than sleeping a fixed margin, so the log read never races the
+    # client's last write and silently skips the timeline trim.
+    m12.wait_units_done([(h, ["client"])], t_start + KILL_ARM_SECS + CLIENT_SLACK_SECS)
     out = tail_log(h, "client", lines=2000) or ""
+    kill_unit(h, "client")
     d = parse_result(out, "direct")
     tl = parse_timeline(out)
-    if d:
-        # Amendment 1: bound the timeline by the client's own run so the ~40
-        # trailing zero-response buckets --timeline keeps emitting past
-        # RESULT don't read as an outage. t_start_ms is the client's own
-        # clock (the first TL line's unix_ms), not the driver's local time,
-        # so this is immune to driver/host clock skew.
-        t_start_ms = tl[0][0] if tl else int(t_start * 1000)
-        tl = bound_timeline(tl, t_start_ms + int(d["elapsed_secs"] * 1000) + 1000)
-    t0_ms = int(t0 * 1000)
-    base_lo, base_hi = int((t_start + 2) * 1000), int((t_start + 10) * 1000)
-    baseline, recovered, windows = recovery_time(tl, t0_ms, base_lo, base_hi)
+    if d is None:
+        print("WARN row d: client RESULT missing — log read raced or the client died; "
+              "timeline NOT trimmed", flush=True)
+    if not tl:
+        print("WARN row d: empty timeline — no baseline, no recovery window", flush=True)
+        baseline, recovered, windows = 0.0, None, []
+    else:
+        # The client's own first TL line is its own t0 (unix_ms = t0_unix_ms +
+        # sec*1000) — host clock throughout, matching t0_ms above.
+        t_start_ms = tl[0][0]
+        if d is not None:
+            # Amendment 1: bound the timeline by the client's own run so the ~40
+            # trailing zero-response buckets --timeline keeps emitting past
+            # RESULT don't read as an outage.
+            tl = bound_timeline(tl, t_start_ms + int(d["elapsed_secs"] * 1000) + 1000)
+        base_lo, base_hi = t_start_ms + 2000, t_start_ms + 10000
+        baseline, recovered, windows = recovery_time(tl, t0_ms, base_lo, base_hi)
     print("INFO recovery timeline (ops/s per 2 s window, end-relative to t0): " +
           ", ".join(f"{(e - t0_ms) / 1000:.1f}s:{r:.0f}" for e, r in windows[:25]), flush=True)
     print(f"INFO row d: baseline {baseline:.0f}/s, rate recovered at {recovered}s, "
           f"FSM 1 attached+lag≤{bound} at {attached_at}s; client lost={d['lost'] if d else '?'}", flush=True)
-    kill_unit(h, "client")
     check_all(voters, leader, "kill", checks, expect_min=int(d["responses"]) if d else None)
     stop_cluster_m14(voters)
     return {"baseline": baseline, "recovered_at": recovered, "attached_at": attached_at,
