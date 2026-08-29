@@ -51,8 +51,8 @@ it for you.
 The natural fit is a modest amount of state that must be *exactly* right, mutated
 by a high rate of small commands: matching engines and order books, exchange and
 trading systems, control planes, metadata and configuration stores, sequencers,
-coordination services. It is the model behind ZooKeeper, etcd, and the
-LMAX-style trading architectures.
+coordination services. It is the model behind ZooKeeper, etcd, Aeron Cluster, and
+the LMAX-style trading architectures.
 
 ### When you would not
 
