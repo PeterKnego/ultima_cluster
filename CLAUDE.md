@@ -10,11 +10,12 @@ application server**. This is **UC v2**; the v1 stack (an
 consensus, elections, and transport directly. Do not reintroduce `openraft`,
 `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client` crate names.
 
-**Current version: `2.8.0` (M14). Milestones M1–M14 are all complete**, each
+**Current version: `2.8.0` (M14). Milestones M1–M13 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
-the honest-failure protocol). The per-milestone history that used to live in
-this section is in `RELEASES.md` (user-facing), `docs/releases.md` (the
+the honest-failure protocol); M14's gate doc has its bars committed and its
+fleet run pending (see the gate doc). The per-milestone history that used to
+live in this section is in `RELEASES.md` (user-facing), `docs/releases.md` (the
 engineering record), and the gate docs; this section keeps only the map and
 the standing facts that bind new work.
 

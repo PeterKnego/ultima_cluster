@@ -755,8 +755,10 @@ leader host** — exactly as the M12 and M13 direct arms did
 2026-08-29 and withdrawn the same day (errata: this paragraph); the
 account's 48-vCPU quota leaves room for a fifth host if a remote-path row
 is ever added, but no row in §15.4 needs one. Rows a–e use exactly M13's
-voter shape, so row a's N=1 number is directly comparable to M13's
-full-stack direct arm.
+voter shape, so row a's N=1 number is measured on the same host shape as
+M13's full-stack direct arm; the client binary and its windowing changed
+since, so the M13 number is context, not a bar (errata 2026-08-29, per
+CLAUDE.md's same-source-rebuild lesson).
 
 ### 15.3 Harness: `m12_gate` extended, driven by `m14_fleet_gate.py`
 
@@ -787,7 +789,8 @@ launch as `systemd-run` transient units. M14d adds:
   each arm runs the divergence check of row c through
   `query_linearizable_on(id)` per declared id, against every voter.
 
-`m14_fleet_gate.py` reuses `m6_fleet_gate.build_fleet_hosts` (count=5),
+`m14_fleet_gate.py` reuses `m6_fleet_gate.build_fleet_hosts` (count=4 —
+errata 2026-08-29, following §15.2's withdrawal of the fifth host),
 `m12_fleet_gate`'s `systemd-run` bring-up, sync and teardown, and M13's
 `--selftest` pattern: every verdict function is pure over recorded numbers
 and the selftest replays a canned row set through them, locally, with no
@@ -801,8 +804,11 @@ limiter (M13 measured the fleet chain cluster-bound at ~1.75 M ops/s), so
 here: **the slow FSM's solo apply rate is ≈ half the N=1 cluster rate**, so
 that it — not consensus, not the client — is the bottleneck in row b. `K` is
 calibrated by a preliminary arm (`calib`: FSM 0 alone running `SpinCountSm`
-at a ladder of `K`, 8 s each; pick the `K` whose rate is nearest 0.5× row
-a's N=1 rate) and recorded in the gate doc. Row b's bar is a ratio against
+at a ladder of `K`, 12 s arms with an 8 s window, like every rate arm; pick
+the `K` whose rate is nearest 0.5× row a's N=1 rate) and recorded in the gate
+doc. Errata 2026-08-29: the picked rung must land inside [0.35, 0.65] × N=1,
+or the run FAILS at calibration — a ladder that never made the FSM the
+limiter would let row b pass vacuously. Row b's bar is a ratio against
 slow-solo measured *with that same `K` in the same run*, so the bar does not
 depend on the calibration landing exactly.
 
