@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-`ultima_cluster` (UC) is an **Aeron-shaped, Rust-native State Machine
-Replication application server**. This is **UC v2**; the v1 stack (an
+`ultima_cluster` (UC) is a **Rust-native State Machine Replication
+application server**. This is **UC v2**; the v1 stack (an
 `openraft`-based design) is retired and its crates deleted — v2 owns
 consensus, elections, and transport directly. Do not reintroduce `openraft`,
 `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client` crate names.
