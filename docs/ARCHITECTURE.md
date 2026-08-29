@@ -332,16 +332,31 @@ can forge fan-out traffic as any node. See runbook §11.
 
 | Crate | Role |
 |---|---|
-| `uc_protocol` | Wire spec — cnc page layout, datagram/frame formats, lock-free rings. `no_std`; the multi-language gate |
-| `uc2_log` | Log buffer runtime and archive agent — journal recording, snapshots, purge floor |
-| `uc2_net` | Reliable-UDP sender/receiver agents, NAK repair, flow control, snapshot sessions, fault injection |
-| `uc2_consensus` | Pure-sync safety core — commit tracking, elections, term maps, truncation. No I/O, no threads, no clock |
-| `uc2_sim` | Deterministic simulation, invariants, fuzz |
-| `uc2_node` | Composition — agent wiring, IPC surface, read barrier, gate harnesses |
-| `uc2_service` | Service SDK — `StateMachine` traits, apply agent, reconstruction |
-| `uc2_client` | Sync client SDK — submit, linearizable and snapshot queries, response matcher |
-| `uc-lincheck` | WGL linearizability checker, history recorder, register model |
-| `ultima_journal` | Segmented append journal and atomic `StableValue`s |
+| `uc_protocol` | Wire spec: cnc page layout, datagram/frame formats, lock-free rings (SPSC/MPSC/broadcast) |
+| `uc2_log` | Shared log buffer + archive agent (journal recording, snapshots, purge floor) |
+| `uc2_net` | Reliable-UDP sender/receiver agents, NAK repair, flow control, snapshot sessions |
+| `uc2_consensus` | Pure-sync safety core: commit tracker, elections, term maps, truncation |
+| `uc2_crypto` | Opt-in node-to-node wire crypto (M8, off by default): Noise `IK` handshake, AES-256-GCM over the datagram envelope, rotating group key, anti-replay; plus the M12b admin-request HMAC |
+| `uc2_sim` | Deterministic simulation + invariants + fuzz |
+| `uc2_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
+| `uc2_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
+| `uc2_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14) |
+| `uc2_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `RemoteSendHalf`/`RemotePollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
+| `uc2_gateway` | The `Edge`: a per-node TCP front door relaying `uc2_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
+| `uc-lincheck` | WGL linearizability checker + history recorder + register model |
+| `ultima_journal` | Segmented append journal + atomic `StableValue`s |
+
+Builds standalone — the only external storage dep,
+[`ultima-db`](https://crates.io/crates/ultima-db), comes from crates.io.
+
+**Published to crates.io:** twelve crates, prepared and gated in CI,
+published **in lockstep at one version** — which is also the git tag, the
+tarball name and the image tag. That is the thirteen crates in the table above, minus `uc2_sim` and
+`uc-lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row
+here). `uc2_sim`, `uc-lincheck` and the two example crates are
+`publish = false`: proof and teaching apparatus, not product. What that
+version number promises, and what it deliberately does not, is
+[the semver policy](reference/semver-policy.md).
 
 ## Design lineage
 
@@ -359,8 +374,14 @@ code":
 3. The node is a pipeline of single-writer polling agents coordinated exclusively
    by shared-memory position counters.
 
+The guiding principles these serve — correctness, resiliency, high
+performance — are stated in plain language in
+[Core principles](../CORE_PRINCIPLES.md).
+
 ## Where to go next
 
+- **[Core principles](../CORE_PRINCIPLES.md)** — the ranked rules this shape
+  is derived from, and what each one costs when it loses.
 - **[`VERIFICATION.md`](/docs/VERIFICATION.md)** — what is proved, what is checked, what
   is only bug-hunted, and how to reproduce each.
 - **[`docs/ops/uc2-runbook.md`](/docs/ops/uc2-runbook.md)** — instance directory layout,
