@@ -24,6 +24,10 @@ sim-heavy = []
 # self dev-dependency below (so default `cargo test` keeps working); never on for
 # `cargo build`. Post-M7 loose-end (4).
 test-support = []
+# The consensus crate's mutation teeth (elle tier), reachable from the sim so a
+# directed scenario can carry a RED twin against the shipped kernel (e.g. the
+# pre-2026-08-16 index-aligned reconcile). Never on by default.
+mutation-testing = ["uc2_consensus/mutation-testing"]
 
 [dependencies]
 uc2_consensus = { path = "../uc2_consensus", version = "2.7.0" }

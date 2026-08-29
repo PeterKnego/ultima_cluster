@@ -12,6 +12,7 @@
 //! contract) is built out. See `DataPlane` for the two-mode contract.
 
 use uc2_consensus::config::{ConfigOp, ProposeError};
+use uc2_consensus::reconcile::MAX_TERM_MAP_WIRE_ENTRIES;
 use uc2_sim::invariants::InvariantViolation;
 use uc2_sim::world::{DataPlane, SimConfig, World};
 
@@ -486,8 +487,9 @@ fn raw_m3_forged_report_phantom_commit_is_caught() {
 /// wipe-DISABLED counterfactual fail-stops.
 ///
 /// A leader whose shipped term-map tail has slid PAST a follower's first byte —
-/// its low-end entries dropped by log purge (the real M6 case, unreachable in a
-/// natural sim run capped at `MAX_TERM_MAP_WIRE_ENTRIES` terms) — leaves that
+/// its low-end entries dropped by log purge (the real M6 case; a natural sim
+/// run reaches the slid WINDOW since 2026-08-29 but never purges, see
+/// `window_slide_past_64_lifetime_terms_*`) — leaves that
 /// follower NO common prefix. We craft the exact byte-for-byte "slid-past" wire
 /// tail and inject it into a follower holding a genuine `[(1,0)]` prefix, driving
 /// `reconcile` to `NoCommonPrefix` through the full sim data plane.
@@ -2248,4 +2250,114 @@ fn issue7_drive(w: &mut World) -> Result<(), InvariantViolation> {
     w.partition(l, b); // b freezes at an already-reported, already-committed position
     w.run()?;
     Ok(())
+}
+
+/// Drive a 3-node quiet cluster past the term-map wire window, one term per
+/// round: crash the leader, let the survivors elect, stream data in the new
+/// term (a map entry is DATA-stamped, so a term without bytes leaves no
+/// entry), bring the crashed node back and let it reconcile against the new
+/// leader's window. Returns the number of rounds; `Ok(false)` if some round
+/// did not reconverge (the wipe loop the pre-fix kernel produced), `Err` on
+/// an invariant violation.
+fn slide_the_window(w: &mut World, target_len: usize) -> Result<(usize, bool), InvariantViolation> {
+    w.run_until_leader()?;
+    let longest = |w: &World| (0..3).map(|i| w.node_map(i).len()).max().unwrap();
+    let mut rounds = 0;
+    while longest(w) < target_len && rounds < 4 * target_len {
+        rounds += 1;
+        let leader = w.current_leader().expect("a leader exists at the top of every round");
+        w.crash(leader);
+        w.run_until_leader()?;
+        w.append_and_replicate(4096);
+        w.restart(leader)?;
+        let converged = w.run_until(|w| {
+            let d = w.leader_durable();
+            d > 0 && (0..3).all(|i| w.node_durable(i) == d)
+        })?;
+        if !converged {
+            return Ok((rounds, false));
+        }
+    }
+    Ok((rounds, true))
+}
+
+fn window_slide_cfg() -> SimConfig {
+    SimConfig {
+        n_nodes: 3,
+        seed: 1,
+        max_steps: 20_000_000,
+        drop_per_million: 0,
+        dup_per_million: 0,
+        crash_per_million: 0,
+        ..SimConfig::default()
+    }
+}
+
+/// The 2026-08-16 acked-write-loss regression, driven end to end through the
+/// sim's data plane rather than by an injected map. A cluster whose LIFETIME
+/// leadership count exceeds `MAX_TERM_MAP_WIRE_ENTRIES` ships only the last
+/// 64 term-map entries (`ElectionSm::term_map_wire_tail`), so every healthy
+/// follower's full map is LONGER than the window it receives and
+/// `leader[0]` is its entry `j > 0`. The pre-fix index-aligned match declared
+/// `NoCommonPrefix` against every such follower, wiping them in a loop and
+/// eventually truncating committed bytes cluster-wide; the aligned match
+/// must reconcile them CLEAN — zero wipes, zero truncations, and the whole
+/// cluster still converging. Red twin:
+/// `window_slide_with_index_aligned_reconcile_wipes_healthy_followers`.
+///
+/// Until 2026-08-29 the sim could not express this at all: every `run_*`
+/// loop stopped at `MAX_TERM_MAP_WIRE_ENTRIES - 2` entries ("cap the run
+/// rather than provoke it"), so `sim-heavy`'s thousand seeds never once
+/// executed the branch the fix added. The non-vacuity assertion below is
+/// what that cap would fail (verified RED before the cap was removed:
+/// "round 61: the cluster did not reconverge").
+#[test]
+fn window_slide_past_64_lifetime_terms_reconciles_healthy_followers_clean() {
+    let mut w = World::new(window_slide_cfg());
+    let target = MAX_TERM_MAP_WIRE_ENTRIES + 8;
+    let (rounds, converged) = slide_the_window(&mut w, target).unwrap();
+    assert!(converged, "round {rounds}: the cluster did not reconverge after the restart");
+    let longest = (0..3).map(|i| w.node_map(i).len()).max().unwrap();
+    assert!(
+        longest >= target,
+        "non-vacuity: no node's map ever exceeded the {MAX_TERM_MAP_WIRE_ENTRIES}-entry wire \
+         window (longest {longest} after {rounds} rounds) — the window never slid, so this \
+         test proves nothing about alignment"
+    );
+    assert_eq!(w.wipes(), 0, "a healthy follower was wiped (NoCommonPrefix) by a slid window");
+    assert_eq!(w.truncations(), 0, "a healthy follower was truncated by a slid window");
+    let leader = w.current_leader().unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            w.node_map(i),
+            w.node_map(leader),
+            "node {i}'s full map must match the leader's after the window slid"
+        );
+    }
+}
+
+/// RED twin of the above: the same churn with the kernel's pre-2026-08-16
+/// index-aligned match restored (`mutation-testing` tooth). The moment the
+/// window slides, the restarted node's `[(1,0), ...]` map no longer starts
+/// with the leader's window and the old match declares `NoCommonPrefix` —
+/// a wipe of a healthy follower. The sim must SEE that: wipes, or an
+/// invariant violation, or a cluster that stops reconverging — never the
+/// clean run the green twin demands.
+#[cfg(feature = "mutation-testing")]
+#[test]
+fn window_slide_with_index_aligned_reconcile_wipes_healthy_followers() {
+    let mut w = World::new(window_slide_cfg());
+    w.set_mutate_index_aligned_reconcile(true);
+    let target = MAX_TERM_MAP_WIRE_ENTRIES + 8;
+    let outcome = slide_the_window(&mut w, target);
+    let longest = (0..3).map(|i| w.node_map(i).len()).max().unwrap();
+    // The bug's signature is a WIPE of a healthy follower (NoCommonPrefix →
+    // truncate-to-0), not merely a stall: demand the wipe itself, and accept
+    // an invariant violation only as the stronger outcome.
+    assert!(
+        outcome.is_err() || w.wipes() > 0,
+        "index-aligned reconcile ran a slid window ({longest} entries, {outcome:?}) with \
+         {} wipes — the tooth is not biting",
+        w.wipes()
+    );
 }

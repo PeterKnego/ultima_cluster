@@ -80,6 +80,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Seeded heavy fuzz (1000-seed election/truncation)
         run: cargo test -p uc2_sim --features sim-heavy
+      # The window-slide red twin needs uc2_consensus's mutation tooth (the
+      # pre-2026-08-16 index-aligned reconcile); it must keep FINDING wipes.
+      - name: Window-slide red twin (mutation tooth must bite)
+        run: cargo test -p uc2_sim --features mutation-testing --test scenarios window_slide
 
   loom:
     runs-on: ubuntu-latest

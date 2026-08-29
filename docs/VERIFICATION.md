@@ -223,9 +223,26 @@ the report path and the vote-credential path could never disagree.
 the two threads do — pinned by
 `stale_vote_credential_opens_a_term_below_a_committed_position`.
 
+It was blind in a second place until 2026-08-29. Every `run_*` loop stopped a
+run the moment any node's term map reached `MAX_TERM_MAP_WIRE_ENTRIES - 2`
+entries ("a wire limitation, not a safety bug — cap the run rather than
+provoke it"), so the leader's 64-entry wire window never slid inside a
+follower's map — and the window-aligned `reconcile` branch added by the
+2026-08-16 acked-write-loss fix was executed by the simulator, including
+`sim-heavy`'s thousand seeds, exactly never. The cap is gone;
+`window_slide_past_64_lifetime_terms_reconciles_healthy_followers_clean`
+drives a cluster through 70+ leader changes and pins zero wipes and zero
+truncations of healthy followers with every map converging (verified RED
+against the cap: "round 61: the cluster did not reconverge"), and its red
+twin `window_slide_with_index_aligned_reconcile_wipes_healthy_followers`
+restores the pre-fix index-aligned match through a `mutation-testing` tooth
+(`reconcile::reconcile_index_aligned`, the old body verbatim) and pins that
+the sim then sees the wipes. Nightly runs both.
+
 ```bash
 cargo test -p uc2_sim                          # standard tier
 cargo test -p uc2_sim --features sim-heavy     # 1000-seed fuzz
+cargo test -p uc2_sim --features mutation-testing --test scenarios window_slide  # red twin
 ```
 
 ---

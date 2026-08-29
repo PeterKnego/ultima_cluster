@@ -394,6 +394,12 @@ pub struct ElectionSm {
     /// [`ElectionSm::set_mutate_skip_vote_order`].
     #[cfg(feature = "mutation-testing")]
     mutate_skip_vote_order: bool,
+    /// Mutation tooth (sim red twin): reconcile with the PRE-2026-08-16
+    /// index-aligned prefix match, which declared `NoCommonPrefix` against
+    /// every healthy follower once the leader's wire window slid. See
+    /// [`ElectionSm::set_mutate_index_aligned_reconcile`].
+    #[cfg(feature = "mutation-testing")]
+    mutate_index_aligned_reconcile: bool,
 }
 
 /// Lexicographic vote-freshness order (free-function form for the Lean
@@ -523,6 +529,8 @@ impl ElectionSm {
             mutate_quorum_minus_one: false,
             #[cfg(feature = "mutation-testing")]
             mutate_skip_vote_order: false,
+            #[cfg(feature = "mutation-testing")]
+            mutate_index_aligned_reconcile: false,
         };
         sm.arm_timeout(now_ns);
         sm
@@ -560,6 +568,15 @@ impl ElectionSm {
     #[cfg(feature = "mutation-testing")]
     pub fn set_mutate_skip_vote_order(&mut self, on: bool) {
         self.mutate_skip_vote_order = on;
+    }
+
+    /// Mutation tooth: reconcile with the pre-2026-08-16 index-aligned
+    /// prefix match (`reconcile::reconcile_index_aligned`) instead of the
+    /// window-aligned one — the shipped acked-write-loss bug, restored so
+    /// the sim's `window_slide_*` red twin can prove it would be caught.
+    #[cfg(feature = "mutation-testing")]
+    pub fn set_mutate_index_aligned_reconcile(&mut self, on: bool) {
+        self.mutate_index_aligned_reconcile = on;
     }
 
     /// M7 boot-recovery hook: restore the durable `ConfigRecord`'s PREV level.
@@ -1313,7 +1330,15 @@ impl ElectionSm {
     /// action: `Truncate` (+ latch) when a byte is invalid, `PersistTermMap`
     /// when the map merely grows, `Fatal` when there is no common prefix.
     fn reconcile_term_map(&mut self, entries: &[(u32, u64)], out: &mut Vec<Action>) {
-        match reconcile(&self.term_map, self.durable, entries) {
+        #[cfg(feature = "mutation-testing")]
+        let outcome = if self.mutate_index_aligned_reconcile {
+            crate::reconcile::reconcile_index_aligned(&self.term_map, self.durable, entries)
+        } else {
+            reconcile(&self.term_map, self.durable, entries)
+        };
+        #[cfg(not(feature = "mutation-testing"))]
+        let outcome = reconcile(&self.term_map, self.durable, entries);
+        match outcome {
             Reconcile::NoCommonPrefix if self.wipe_on_no_common_prefix => {
                 // WIPE-AND-REJOIN (M6 Task 8). The divergence predates the leader's
                 // shipped term-map window — in M6 this is the real case where the

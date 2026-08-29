@@ -48,7 +48,6 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use uc2_consensus::config::{Addr, ClusterConfig, ConfigOp, ProposeError};
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
-use uc2_consensus::reconcile::MAX_TERM_MAP_WIRE_ENTRIES;
 
 use crate::invariants::{InvariantChecker, InvariantViolation};
 
@@ -715,6 +714,11 @@ pub struct World {
     /// (`propose_config` returns `Result<_, ProposeError>`); surfaced by the
     /// next `step_once`.
     pending_violation: Option<InvariantViolation>,
+    /// Sim red-twin tooth: every node's SM (including ones rebuilt by a
+    /// restart) reconciles with the pre-2026-08-16 index-aligned match. See
+    /// [`World::set_mutate_index_aligned_reconcile`].
+    #[cfg(feature = "mutation-testing")]
+    mutate_index_aligned_reconcile: bool,
     /// When set, a serving leader stops appending NEW frames — modeling a client
     /// that has stopped submitting. The leader still heartbeats its existing tail
     /// and re-gossips commit + term map on the idle floor, so commit PLATEAUS.
@@ -819,6 +823,8 @@ impl World {
             genesis_config: genesis,
             admitted_ever,
             pending_violation: None,
+            #[cfg(feature = "mutation-testing")]
+            mutate_index_aligned_reconcile: false,
             quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
@@ -912,16 +918,13 @@ impl World {
 
     // ---------------------------------------------------------------- run loop
 
-    /// Run to the step budget (or an empty queue, or the term-map wire cap).
+    /// Run to the step budget (or an empty queue).
     /// Returns the run [`Stats`], or the first [`InvariantViolation`].
     pub fn run(&mut self) -> Result<Stats, InvariantViolation> {
         if let Some(v) = self.pending_violation.take() {
             return Err(v); // ledger minor g: don't drop a parked violation
         }
         while self.steps < self.cfg.max_steps {
-            if self.term_map_cap_reached() {
-                break;
-            }
             if !self.step_once()? {
                 break;
             }
@@ -935,7 +938,7 @@ impl World {
             return Err(v); // ledger minor g: don't drop a parked violation
         }
         while self.current_leader().is_none() && self.steps < self.cfg.max_steps {
-            if self.term_map_cap_reached() || !self.step_once()? {
+            if !self.step_once()? {
                 break;
             }
         }
@@ -943,7 +946,7 @@ impl World {
     }
 
     /// Step until `pred` holds (or the budget runs out). `Ok(true)` iff the
-    /// predicate held; `Ok(false)` = budget/queue/cap exhausted first
+    /// predicate held; `Ok(false)` = budget/queue exhausted first
     /// (ledger minor x: the old `Ok(())` let scenarios silently "pass"
     /// phases that had timed out).
     pub fn run_until(
@@ -954,7 +957,7 @@ impl World {
             return Err(v); // ledger minor g: don't drop a parked violation
         }
         while !pred(self) && self.steps < self.cfg.max_steps {
-            if self.term_map_cap_reached() || !self.step_once()? {
+            if !self.step_once()? {
                 break;
             }
         }
@@ -980,7 +983,7 @@ impl World {
         }
         let deadline = self.now.saturating_add(duration_ns);
         while !pred(self) {
-            if self.steps >= self.cfg.max_steps || self.term_map_cap_reached() {
+            if self.steps >= self.cfg.max_steps {
                 break;
             }
             let Some(Reverse(next)) = self.queue.peek() else {
@@ -1010,7 +1013,7 @@ impl World {
         }
         let deadline = self.now.saturating_add(duration_ns);
         loop {
-            if self.steps >= self.cfg.max_steps || self.term_map_cap_reached() {
+            if self.steps >= self.cfg.max_steps {
                 break;
             }
             let Some(Reverse(next)) = self.queue.peek() else {
@@ -1033,7 +1036,7 @@ impl World {
         }
         let target = self.steps.saturating_add(k);
         while self.steps < target && self.steps < self.cfg.max_steps {
-            if self.term_map_cap_reached() || !self.step_once()? {
+            if !self.step_once()? {
                 break;
             }
         }
@@ -1107,14 +1110,6 @@ impl World {
             )?;
         }
         Ok(true)
-    }
-
-    /// True once any node's persisted term map nears the wire cap. Beyond this,
-    /// a shipped map could slide its base-0 entry off the 64-entry window and
-    /// spuriously surface `NoCommonPrefix` (`Fatal`) — a wire limitation, not a
-    /// safety bug. Per the brief we cap the run rather than provoke it.
-    fn term_map_cap_reached(&self) -> bool {
-        self.nodes.iter().any(|n| n.term_map.len() >= MAX_TERM_MAP_WIRE_ENTRIES - 2)
     }
 
     fn stats(&self) -> Stats {
@@ -1458,6 +1453,8 @@ impl World {
         let term_map = self.nodes[node].term_map.clone();
         let durable = self.nodes[node].durable;
         let mut sm = ElectionSm::new(cfg, vote, &term_map, durable, now);
+        #[cfg(feature = "mutation-testing")]
+        sm.set_mutate_index_aligned_reconcile(self.mutate_index_aligned_reconcile);
         // Restore the record's PREV level (construction seeds prev == cur), so a
         // post-restart truncation below the config frame still reverts to the
         // genuine predecessor.
@@ -2434,6 +2431,18 @@ impl World {
     /// M14b: cap node's outgoing durable reports at `ceiling` (`None` lifts it).
     /// Models the slowest local FSM's applied position plus `fsm_lag`. A
     /// change is a legitimate report discontinuity for inv10.
+    /// Mutation tooth (red twin of `window_slide_past_64_lifetime_terms_*`):
+    /// restore the pre-2026-08-16 index-aligned reconcile in every node's SM,
+    /// now and across restarts. `mutation-testing` builds only — the tooth
+    /// lives in `uc2_consensus` behind the same feature.
+    #[cfg(feature = "mutation-testing")]
+    pub fn set_mutate_index_aligned_reconcile(&mut self, on: bool) {
+        self.mutate_index_aligned_reconcile = on;
+        for n in &mut self.nodes {
+            n.sm.set_mutate_index_aligned_reconcile(on);
+        }
+    }
+
     pub fn set_apply_ceiling(&mut self, node: usize, ceiling: Option<u64>) {
         self.nodes[node].apply_ceiling = ceiling;
         self.checker.on_report_reset(node);

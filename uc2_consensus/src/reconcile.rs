@@ -191,6 +191,45 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
     Reconcile::Ok(Outcome { valid_up_to, new_map })
 }
 
+/// Mutation tooth (never in a default build): the PRE-2026-08-16 kernel,
+/// verbatim from `2102584^` — an index-aligned prefix match from `k = 0` with
+/// the old `NoCommonPrefix` rule (`leader[0].base > own[0].base`). Once a
+/// cluster's lifetime term count exceeds `MAX_TERM_MAP_WIRE_ENTRIES`, the
+/// leader's shipped window no longer starts at a healthy follower's entry 0,
+/// so this declares `NoCommonPrefix` against every healthy follower — the
+/// acked-write-loss bug the aligned [`reconcile`] fixed. Kept so the sim's
+/// `window_slide_with_index_aligned_reconcile_wipes_healthy_followers` red
+/// twin can prove the sim catches it; selected through
+/// `ElectionSm::set_mutate_index_aligned_reconcile`.
+#[cfg(feature = "mutation-testing")]
+pub fn reconcile_index_aligned(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) -> Reconcile {
+    if leader.is_empty() {
+        return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: own.to_vec() });
+    }
+    let mut k = 0;
+    while k < own.len() && k < leader.len() && own[k] == leader[k] {
+        k += 1;
+    }
+    if k == 0 && !own.is_empty() && leader[0].1 > own[0].1 {
+        return Reconcile::NoCommonPrefix;
+    }
+    let mut valid_up_to = own_durable;
+    if k < own.len() {
+        valid_up_to = valid_up_to.min(own[k].1);
+    }
+    if k < leader.len() && leader[k].1 < own_durable {
+        valid_up_to = valid_up_to.min(leader[k].1);
+    }
+    let mut new_map: Vec<(u32, u64)> = Vec::with_capacity(own.len());
+    new_map.extend_from_slice(&own[..k]);
+    for &(term, base) in &own[k..] {
+        if base < valid_up_to {
+            new_map.push((term, base));
+        }
+    }
+    Reconcile::Ok(Outcome { valid_up_to, new_map })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
