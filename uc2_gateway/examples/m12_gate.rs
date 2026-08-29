@@ -72,7 +72,7 @@ use uc2_node::{Node, NodeConfig, ServicesConfig};
 use uc2_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf, SubmitError as RemoteSubmitError};
 use uc2_service::{
     RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig,
-    Sessioned, StateMachine, TAG_FRESH,
+    Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine, TAG_FRESH,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -201,6 +201,20 @@ struct ServiceArgs {
     /// `--features uc2_service/apply-profile` this is the codec-share A/B.
     #[arg(long, default_value_t = false)]
     raw_sm: bool,
+    /// M14d: attach as this FSM id (`ServiceConfig::service_id`). The node
+    /// must have declared it (`--services`), else the attach is refused by
+    /// name (`ServiceNotDeclared`).
+    #[arg(long, default_value_t = 0)]
+    service_id: u8,
+    /// M14d: `> 0` runs `SpinCountSm` with this many LCG rounds per apply —
+    /// the deliberately slow FSM. `0` = plain `CountSm`. Incompatible with
+    /// `--raw-sm`.
+    #[arg(long, default_value_t = 0)]
+    work_spin: u64,
+    /// M14d row f: `SnapshotPolicy { interval_bytes }` on the service so the
+    /// leader has artifacts to ship. `0` = no snapshots (every prior arm).
+    #[arg(long, default_value_t = 0)]
+    snapshot_interval_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -391,6 +405,115 @@ impl StateMachine for CountSm {
 
     fn last_applied(&self) -> Option<u64> {
         self.last_applied
+    }
+}
+
+/// M14d row f: the typed counter can be shipped as a snapshot — 16 bytes,
+/// `count ++ last_applied`, position-pinned on install (the `RegSm` shape in
+/// `m6_gate.rs`). `Sessioned<CountSm>` inherits it (session.rs:274).
+impl SnapshotStateMachine for CountSm {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        let pos = self.last_applied.unwrap_or(0);
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.count.to_le_bytes());
+        buf.extend_from_slice(&pos.to_le_bytes());
+        Ok((buf, pos))
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        if buf.len() < 16 {
+            return Err(SnapshotError::Codec(format!("short snapshot: {} bytes", buf.len())));
+        }
+        let count = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if pos != position {
+            return Err(SnapshotError::Codec(format!(
+                "snapshot payload position {pos} != requested {position}"
+            )));
+        }
+        self.count = count;
+        self.last_applied = Some(position);
+        Ok(position)
+    }
+}
+
+/// M14d: `CountSm` with a fixed price per apply. `spin` rounds of an integer
+/// LCG, seeded from the position, consumed through `black_box` — so the loop
+/// cannot be optimised away and its result never reaches the response.
+/// `K` changes cost, not output (spec §15.3); the test above pins that.
+#[derive(Default)]
+struct SpinCountSm {
+    inner: CountSm,
+    spin: u64,
+}
+
+impl SpinCountSm {
+    fn with_spin(spin: u64) -> Self {
+        Self { inner: CountSm::default(), spin }
+    }
+}
+
+impl StateMachine for SpinCountSm {
+    type Command = Vec<u8>;
+    type Response = u64;
+    type Query = ();
+    type QueryResponse = u64;
+
+    fn apply(&mut self, position: u64, cmd: Vec<u8>) -> u64 {
+        let mut x: u64 = position ^ 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..self.spin {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            x ^= x >> 29;
+        }
+        std::hint::black_box(x);
+        // Both `StateMachine::apply` and the blanket `RawStateMachine::apply`
+        // are in scope and CountSm implements both (the latter via the
+        // blanket impl), so a bare `self.inner.apply(..)` is ambiguous
+        // (E0034) — disambiguate with UFCS.
+        StateMachine::apply(&mut self.inner, position, cmd)
+    }
+
+    fn query(&self, q: ()) -> u64 {
+        StateMachine::query(&self.inner, q)
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        StateMachine::last_applied(&self.inner)
+    }
+}
+
+impl SnapshotStateMachine for SpinCountSm {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        self.inner.freeze()
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        CountSm::stream_snapshot(handle, dst)
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
+        self.inner.install_snapshot(position, src)
     }
 }
 
@@ -1318,34 +1441,42 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         );
         thread::sleep(Duration::from_millis(20));
     }
-    let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
+    anyhow::ensure!(
+        !(a.raw_sm && a.work_spin > 0),
+        "--raw-sm and --work-spin are exclusive: the slow FSM is the typed tier (spec §15.3)"
+    );
+    let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id).service_id(a.service_id);
+    if a.snapshot_interval_bytes > 0 {
+        cfg = cfg.snapshot_policy(SnapshotPolicy { interval_bytes: a.snapshot_interval_bytes });
+    }
     let envelope = a.envelope == Envelope::On;
-    // Each arm diverges (parks forever), so the four `Service<_>` types never
-    // need to unify — `m5_gate`'s service role does the same.
-    match (envelope, a.raw_sm) {
-        (true, false) => {
-            let _svc = ServiceBuilder::new(
-                cfg,
-                Sessioned::new(CountSm::default(), SessionConfig::default()),
-            )
-            .start()?;
-            park_service("Sessioned<CountSm> (typed tier, envelope on)")
+    let tag = format!("id={} spin={} snap={}", a.service_id, a.work_spin, a.snapshot_interval_bytes);
+    // Each arm diverges (parks forever), so the `Service<_>` types never need
+    // to unify — `m5_gate`'s service role does the same.
+    match (envelope, a.raw_sm, a.work_spin > 0) {
+        (true, false, false) => {
+            let _svc = ServiceBuilder::new(cfg, Sessioned::new(CountSm::default(), SessionConfig::default())).start()?;
+            park_service(&format!("Sessioned<CountSm> (typed tier, envelope on, {tag})"))
         }
-        (false, false) => {
+        (true, false, true) => {
+            let _svc = ServiceBuilder::new(cfg, Sessioned::new(SpinCountSm::with_spin(a.work_spin), SessionConfig::default())).start()?;
+            park_service(&format!("Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"))
+        }
+        (false, false, false) => {
             let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
-            park_service("CountSm (typed tier, envelope off)")
+            park_service(&format!("CountSm (typed tier, envelope off, {tag})"))
         }
-        (true, true) => {
-            let _svc = ServiceBuilder::new(
-                cfg,
-                Sessioned::new(RawCountSm::default(), SessionConfig::default()),
-            )
-            .start()?;
-            park_service("Sessioned<RawCountSm> (raw tier, envelope on)")
+        (false, false, true) => {
+            let _svc = ServiceBuilder::new(cfg, SpinCountSm::with_spin(a.work_spin)).start()?;
+            park_service(&format!("SpinCountSm (typed tier, envelope off, {tag})"))
         }
-        (false, true) => {
+        (true, true, _) => {
+            let _svc = ServiceBuilder::new(cfg, Sessioned::new(RawCountSm::default(), SessionConfig::default())).start()?;
+            park_service(&format!("Sessioned<RawCountSm> (raw tier, envelope on, {tag})"))
+        }
+        (false, true, _) => {
             let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
-            park_service("RawCountSm (raw tier, envelope off)")
+            park_service(&format!("RawCountSm (raw tier, envelope off, {tag})"))
         }
     }
 }
@@ -1533,5 +1664,44 @@ mod tests {
         assert!(e.contains("--services"), "{e}");
         let e = services_from_flags(Some("0"), Some("bogus")).unwrap_err().to_string();
         assert!(e.contains("--fsm-lag"), "{e}");
+    }
+
+    fn drive<S: StateMachine<Command = Vec<u8>, Response = u64, Query = (), QueryResponse = u64>>(
+        sm: &mut S,
+    ) -> Vec<u64> {
+        (1..=200u64)
+            .map(|i| sm.apply(i * 64, vec![(i & 0xff) as u8; 8]))
+            .collect()
+    }
+
+    #[test]
+    fn spin_count_sm_is_count_sm_with_a_price_not_a_different_answer() {
+        let mut plain = CountSm::default();
+        let mut spin = SpinCountSm::with_spin(5_000);
+        assert_eq!(drive(&mut plain), drive(&mut spin));
+        // `StateMachine` and the blanket `RawStateMachine` are both in scope
+        // and both implemented, so a bare `.query()`/`.last_applied()` on a
+        // concrete SM is ambiguous (E0034) — disambiguate with UFCS.
+        assert_eq!(StateMachine::query(&plain, ()), StateMachine::query(&spin, ()));
+        assert_eq!(StateMachine::last_applied(&plain), StateMachine::last_applied(&spin));
+        // Two different K's, same answers: K prices the apply, it never
+        // reaches the response (spec §15.3).
+        let mut spin2 = SpinCountSm::with_spin(50);
+        assert_eq!(drive(&mut spin2), drive(&mut SpinCountSm::with_spin(0)));
+    }
+
+    #[test]
+    fn count_sm_snapshot_round_trips_and_pins_the_position() {
+        let mut a = SpinCountSm::with_spin(10);
+        drive(&mut a);
+        let (blob, pos) = a.freeze().unwrap();
+        assert_eq!(pos, 200 * 64);
+        let mut b = SpinCountSm::with_spin(0);
+        let got = b.install_snapshot(pos, &mut &blob[..]).unwrap();
+        assert_eq!(got, pos);
+        assert_eq!(StateMachine::query(&b, ()), 200);
+        assert_eq!(StateMachine::last_applied(&b), Some(pos));
+        let err = SpinCountSm::with_spin(0).install_snapshot(pos + 64, &mut &blob[..]);
+        assert!(err.is_err(), "a mis-tagged artifact must be refused");
     }
 }
