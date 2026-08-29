@@ -119,14 +119,15 @@ If your deployment has meaningful sustained write load, turn on snapshots and
 purging first so each new learner converges by snapshot install plus tail
 replay: [Keep the journal from growing without bound](bound-journal-growth.md).
 
-**M14a limitation:** a snapshot session ships FSM 0's artifact only. On a node
-declaring more than one service id (`[services]` with `ids` beyond `[0]`), a
-learner joining a cluster whose journal prefix has already been purged cannot
-rebuild FSM 1..N-1 below the floor — its `min_applied` stays pinned at 0, its
-report ceiling stays pinned at `fsm_lag`, and it can neither converge nor pass
-the `promote` catch-up check. This is fixed in M14c, which ships per-FSM
-snapshot artifacts. With purge disabled (the default), a learner replays from
-genesis instead and is unaffected.
+**Multi-FSM nodes (M14):** a snapshot session carries one artifact per
+declared FSM, so a learner declaring `[services]` with `ids` beyond `[0]`
+rebuilds every FSM below the floor, not only FSM 0. The learner's declared set
+must match the sender's exactly — a source whose artifact set does not cover
+`services_declared` (one per declared id, none outside it) is refused before
+a session opens, and the learner keeps waiting rather than installing a partial
+set. (M14a shipped FSM 0's artifact only, which pinned a purged-cluster learner's
+`min_applied` at 0 and made `promote` refuse `NotCaughtUp` forever; M14c fixed
+it — [Upgrade a cluster § wire change in 2.8.0](upgrade-a-cluster.md).)
 
 ## Add a voter
 

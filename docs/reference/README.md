@@ -21,6 +21,8 @@ What an operator touches directly.
   process writes it, and which must survive a power cut.
 - [Configuration](configuration.md) — `NodeConfig` field by field, the
   environment switches, crypto key material, and the cluster limits.
+- [Limits](limits.md) — every hard limit, standing constraint and accepted
+  residual in one table set, each row pointing at the page that owns it.
 
 ## SDK surfaces
 

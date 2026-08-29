@@ -70,6 +70,8 @@ and crash tiers had missed. Full picture, including what is *not* verified:
   — what is proved, what is measured, on what.
 - **[How-to guides](/docs/how-to)** · **[Reference](/docs/reference)** ·
   **[Operations runbook](/docs/ops/uc2-runbook.md)** · **[API docs](https://peterknego.github.io/ultima_cluster/)**.
+- **[Limits](/docs/reference/limits.md)** — every hard limit, standing
+  constraint and accepted residual, each linked to the doc that owns it.
 - **[RELEASES.md](/RELEASES.md)** — every feature, release by release, each
   linked to its detailed doc.
 
@@ -111,7 +113,10 @@ bytes it did not write is listed, guarded, and fuzzed.
 ## Scope 
 
 What is shipped, release by release — each feature with a link to its
-detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. 
+detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. What it will not
+do, and what it does only under conditions — member and payload ceilings,
+flag-day upgrades, the crypto and admin residuals, what is not verified —
+is collected in **[Limits](/docs/reference/limits.md)**.
 
 ## License
 
