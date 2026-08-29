@@ -46,3 +46,6 @@ __pycache__/
 # scripts/release_smoke.sh's default work directory (hundreds of MB of
 # root-owned cluster state; .dockerignore keeps it out of the build context).
 .release-smoke/
+
+# superpowers SDD scratch (ledger, briefs, review packages)
+.superpowers/
