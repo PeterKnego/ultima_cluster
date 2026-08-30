@@ -174,30 +174,42 @@ def unit_log(host, unit):
     return f"/opt/bench/{UNIT_PREFIX}-{unit}.log"
 
 
-def unit_start_cmd(host, unit, args, nofile=False):
+def unit_start_cmd(host, unit, args, nofile=False, cpus=None):
     """The `systemd-run` command line for one unit (no ssh — see `start_unit`
-    for the single-unit path and `start_units_batch` for the N-at-once one)."""
+    for the single-unit path and `start_units_batch` for the N-at-once one).
+
+    `cpus` (e.g. "0,1,4,5"), when set, adds `-p CPUAffinity={cpus} ` right
+    after the `LimitNOFILE` flag position — whether or not `nofile` is set —
+    pinning the unit to those logical CPUs (see `PIN_MAP_C6ID_2XL` and
+    `--pin` in m14_fleet_gate.py / m14_ab_27_vs_28.py). `cpus=None` (the
+    default) leaves the line byte-identical to before this parameter
+    existed."""
     quoted = " ".join(shlex.quote(a) for a in args)
     limit = "-p LimitNOFILE=65536 " if nofile else ""
+    affinity = f"-p CPUAffinity={cpus} " if cpus else ""
     return (
         f"sudo systemd-run --unit={UNIT_PREFIX}-{unit} --collect -p TimeoutStopSec=1 "
         f"{limit}"
+        f"{affinity}"
         f"-p StandardOutput=append:{unit_log(host, unit)} "
         f"-p StandardError=append:{unit_log(host, unit)} "
         f"{host.gate} {quoted}"
     )
 
 
-def start_unit(host, unit, args, nofile=False):
+def start_unit(host, unit, args, nofile=False, cpus=None):
     """A transient `systemd-run --collect` unit running the m12_gate binary.
 
     `nofile` mirrors packaging/systemd/uc2-node.service's LimitNOFILE=65536 and
     is set for NODE units: the journal holds an fd per segment, and systemd's
     default soft limit of 1024 is what turned an earlier fleet run's small
     segments into EMFILE fail-stops (m10_fleet_gate's comment on the same
-    line)."""
+    line).
+
+    `cpus` is forwarded to `unit_start_cmd` (see its docstring); `None` (the
+    default) pins nothing, unchanged from before `--pin` existed."""
     kill_unit(host, unit)
-    cmd = unit_start_cmd(host, unit, args, nofile=nofile)
+    cmd = unit_start_cmd(host, unit, args, nofile=nofile, cpus=cpus)
     r = ssh(host, cmd, label="systemd-run")
     if r.returncode != 0:
         raise RuntimeError(
@@ -205,7 +217,7 @@ def start_unit(host, unit, args, nofile=False):
         )
 
 
-def start_units_batch(host, specs):
+def start_units_batch(host, specs, cpus=None):
     """Start several units on ONE host in ONE ssh round trip.
 
     The edge-saturation row starts N client units that must all be loading the
@@ -219,13 +231,16 @@ def start_units_batch(host, specs):
     `StandardOutput=append:`, and a leftover log from an earlier ladder point
     would let that point's RESULT line be re-read as this one's.
 
+    `cpus`, when set, pins every unit in this batch to the same CPUs (all
+    edgesat client units share one role); `None` (the default) pins nothing.
+
     Returns the list of units that reported STARTED."""
     parts = []
     for unit, args in specs:
         parts.append(f"sudo systemctl reset-failed {UNIT_PREFIX}-{unit} 2>/dev/null; true")
         parts.append(f"sudo rm -f {unit_log(host, unit)}")
         parts.append(
-            f"{unit_start_cmd(host, unit, args)} "
+            f"{unit_start_cmd(host, unit, args, cpus=cpus)} "
             f"&& echo STARTED:{unit} || echo FAILED:{unit}"
         )
     r = ssh(host, "; ".join(parts), label="systemd-run")
@@ -275,11 +290,17 @@ def tail_log(host, unit, lines=200):
     return r.stdout or ""
 
 
-def run_foreground(host, args, timeout):
+def run_foreground(host, args, timeout, cpus=None):
     """A BLOCKING ssh command (not systemd-run): the client roles run for
-    `--secs` and exit, and their stdout IS the measurement."""
+    `--secs` and exit, and their stdout IS the measurement.
+
+    `cpus` (e.g. "3,7"), when set, pins the process via `taskset -c` — there
+    is no systemd transient unit here to carry `-p CPUAffinity=`, since this
+    path runs the client in the foreground and blocks on its exit. `None`
+    (the default) pins nothing."""
     quoted = " ".join(shlex.quote(a) for a in args)
-    cmd = f"sudo {host.gate} {quoted}"
+    prefix = f"taskset -c {cpus} " if cpus else ""
+    cmd = f"sudo {prefix}{host.gate} {quoted}"
     print(f"INFO [ssh {host.public_ip}] {cmd}", flush=True)
     try:
         r = host._ssh(cmd, capture_output=True, timeout=timeout)
@@ -329,6 +350,104 @@ def prepare_host(host, apply_profile=False):
     m6.assert_durable_fs(fstype, f"{REMOTE_ROOT} (instance-dir parent)", host.public_ip)
 
 
+# --------------------------------------------------------------- CPU pinning
+#
+# The 2026-08-30 A/B (docs/benchmarks/uc2-m14d-ab-2.7.0-vs-2.8.0-2026-08-30.md)
+# found the SAME binary landing in per-generation rate modes 25% apart on
+# this rig's 8-vCPU `c6id.2xlarge` hosts; the leading hypothesis is thread
+# placement drifting onto a hyperthread sibling of one of the node's four
+# busy-spin polling agents (consensus/sender/receiver/archive). `--pin` (in
+# m14_fleet_gate.py and m14_ab_27_vs_28.py) is the mitigation under test: pin
+# every role to disjoint physical cores so a generation's placement can't
+# collide with itself.
+#
+# ASSUMED sibling layout for `c6id.2xlarge` (8 vCPU = 4 physical cores x 2
+# SMT threads): logical CPU `i` and `i+4` are the two threads of one
+# physical core, i.e. siblings are (0,4) (1,5) (2,6) (3,7). This has NOT
+# been verified on a real host yet — Task 9 Step 2's validation run must run
+# `lscpu -e=CPU,CORE` on a host FIRST and record the actual layout;
+# `verify_pin_layout`/`require_pin_layout` below refuse to proceed if the
+# assumption doesn't hold, so a wrong-layout host family fails closed
+# instead of pinning onto siblings silently.
+#
+# The map: the node's four busy-spin agents get cores 0 and 1, BOTH threads
+# of each (0,1,4,5) — two whole physical cores, so no agent shares a
+# physical core with another agent or with anything else. Each service gets
+# one thread of a third core (service0 on cpu 2, service1 on cpu 6 — its
+# sibling, left idle on purpose so a second FSM never shares a physical core
+# with the first); M14 allows up to 8 FSMs, and a service id >= 2 has no
+# dedicated pin here — callers share it onto service1's thread (cpu 6; see
+# m14_fleet_gate.py's `service_cpu`). client/edge share the fourth core's
+# two threads (3,7) — on the rows this rig drives they are never both live
+# at once (an edge unit only exists during a gateway arm, started after the
+# direct client's own measurement has already stopped), so sharing costs
+# nothing.
+PIN_MAP_C6ID_2XL = {
+    "node": "0,1,4,5",
+    "service0": "2",
+    "service1": "6",
+    "client": "3,7",
+    "edge": "3,7",
+}
+
+EXPECTED_SIBLING_PAIRS = {(0, 4), (1, 5), (2, 6), (3, 7)}
+
+
+def sibling_pairs(lscpu_text):
+    """Parse `lscpu -p=CPU,CORE` output into the set of hyperthread sibling
+    pairs {(lo, hi), ...} — two logical CPUs sharing one physical CORE id.
+    Pure (no ssh), so `--selftest` can pin it against canned text. Comment
+    lines (`lscpu -p` prefixes them with '#') and blank lines are skipped."""
+    by_core = {}
+    for line in lscpu_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(",")
+        if len(fields) < 2:
+            continue
+        cpu, core = int(fields[0]), int(fields[1])
+        by_core.setdefault(core, []).append(cpu)
+    pairs = set()
+    for cpus in by_core.values():
+        cpus = sorted(cpus)
+        if len(cpus) == 2:
+            pairs.add((cpus[0], cpus[1]))
+    return pairs
+
+
+def verify_pin_layout(host):
+    """ssh `lscpu -p=CPU,CORE` on `host` and return True iff its hyperthread
+    sibling pairs are EXACTLY `EXPECTED_SIBLING_PAIRS` — the assumption
+    `PIN_MAP_C6ID_2XL` is built on (see the comment above it). Prints the
+    actual layout on a mismatch so the refusal is diagnosable without a
+    second ssh."""
+    r = ssh(host, "lscpu -p=CPU,CORE", label="lscpu")
+    pairs = sibling_pairs(r.stdout or "")
+    if pairs != EXPECTED_SIBLING_PAIRS:
+        print(f"WARN [{host.public_ip}] sibling layout {sorted(pairs)} != "
+              f"expected {sorted(EXPECTED_SIBLING_PAIRS)} — PIN_MAP_C6ID_2XL's "
+              f"assumption does not hold on this host", flush=True)
+        return False
+    return True
+
+
+def require_pin_layout(hosts):
+    """`verify_pin_layout` on every host in `hosts`; SystemExit (naming the
+    offending hosts — the WARN lines above already printed the actual
+    layout) if any mismatches. This is `--pin`'s gate in both m14 drivers,
+    called on every voter before the first arm, so a wrong-layout host
+    family never runs pinned silently."""
+    bad = [h for h in hosts if not verify_pin_layout(h)]
+    if bad:
+        raise SystemExit(
+            f"--pin refused: sibling layout mismatch on "
+            f"{[h.public_ip for h in bad]} (see the WARN line(s) above for "
+            f"the actual layout); PIN_MAP_C6ID_2XL assumes "
+            f"{sorted(EXPECTED_SIBLING_PAIRS)}"
+        )
+
+
 # ------------------------------------------------------------------ cluster
 
 def members_str(node_hosts):
@@ -347,14 +466,19 @@ def wipe_dirs(node_hosts):
         ssh(h, f"sudo rm -rf {h.dir} && sudo mkdir -p {h.dir}", label="ssh")
 
 
-def start_cluster(node_hosts, a, envelope, raw_sm=False):
+def start_cluster(node_hosts, a, envelope, raw_sm=False, pins=None):
+    """`pins`, when given, is a role -> CPU-list dict (see
+    `PIN_MAP_C6ID_2XL`); this single-FSM cluster has one service unit, pinned
+    to the map's `service0` entry. `None` (the default) pins nothing —
+    byte-identical to before `pins` existed."""
+    pins = pins or {}
     ms = members_str(node_hosts)
     for i, h in enumerate(node_hosts):
         start_unit(h, "node", [
             "node", "--id", str(i), "--bind", f"{h.private_ip}:{PORT}",
             "--instance-dir", h.dir, "--members", ms, "--app-id", APP,
             "--admission-kib", str(a.admission_kib),
-        ], nofile=True)
+        ], nofile=True, cpus=pins.get("node"))
     time.sleep(BOOT_SETTLE_SECS)
     for h in node_hosts:
         args = ["service", "--instance-dir", h.dir, "--app-id", APP,
@@ -362,7 +486,7 @@ def start_cluster(node_hosts, a, envelope, raw_sm=False):
         if raw_sm:
             args.append("--raw-sm")
         truncate_log(h, "service")
-        start_unit(h, "service", args)
+        start_unit(h, "service", args, cpus=pins.get("service0"))
     time.sleep(BOOT_SETTLE_SECS)
 
 
@@ -372,20 +496,24 @@ def stop_cluster(node_hosts):
             kill_unit(h, u)
 
 
-def start_edges(node_hosts, a, envelope, inflight=None):
+def start_edges(node_hosts, a, envelope, inflight=None, pins=None):
     """`inflight` overrides `a.inflight` for the edge's `max_inflight` /
     `per_conn_inflight` pair. Rows 1-3 leave it None (the whole point of row 2
     is EQUAL inflight on both arms); the edge-saturation row overrides it, for
-    the reason spelled out on `--edgesat-edge-inflight`."""
+    the reason spelled out on `--edgesat-edge-inflight`.
+
+    `pins` (role -> CPU-list dict, e.g. `PIN_MAP_C6ID_2XL`), when given, pins
+    the edge unit to its `edge` entry; `None` (the default) pins nothing."""
     em = edge_members_str(node_hosts)
     infl = a.inflight if inflight is None else inflight
+    edge_cpus = (pins or {}).get("edge")
     for i, h in enumerate(node_hosts):
         start_unit(h, "edge", [
             "edge", "--instance-dir", h.dir, "--app-id", APP,
             "--listen", f"{h.private_ip}:{EDGE_PORT}",
             "--members", em, "--envelope", envelope,
             "--inflight", str(infl),
-        ])
+        ], cpus=edge_cpus)
     time.sleep(EDGE_SETTLE_SECS)
 
 
@@ -418,7 +546,9 @@ def echo(prefix, out, lines=40):
         print(f"  [{prefix}] {l}", flush=True)
 
 
-def run_direct_arm(node_hosts, leader, a, envelope, payload=None, secs=None):
+def run_direct_arm(node_hosts, leader, a, envelope, payload=None, secs=None, cpus=None):
+    """`cpus` pins the direct client via `run_foreground`'s `taskset`; `None`
+    (the default) pins nothing."""
     payload = a.payload if payload is None else payload
     secs = a.secs if secs is None else secs
     h = node_hosts[leader]
@@ -426,7 +556,7 @@ def run_direct_arm(node_hosts, leader, a, envelope, payload=None, secs=None):
         "client-direct", "--instance-dir", h.dir, "--app-id", APP,
         "--secs", str(secs), "--payload", str(payload),
         "--inflight", str(a.inflight), "--envelope", envelope,
-    ], timeout=secs + CLIENT_SLACK_SECS)
+    ], timeout=secs + CLIENT_SLACK_SECS, cpus=cpus)
     echo("direct", out)
     d = parse_result(out, "direct")
     if d is None:
@@ -434,13 +564,15 @@ def run_direct_arm(node_hosts, leader, a, envelope, payload=None, secs=None):
     return d
 
 
-def run_gateway_arm(node_hosts, client_host, leader, a):
+def run_gateway_arm(node_hosts, client_host, leader, a, cpus=None):
+    """`cpus` pins the remote client via `run_foreground`'s `taskset`; `None`
+    (the default) pins nothing."""
     rc, out = run_foreground(client_host, [
         "client-remote",
         "--gateways", f"{node_hosts[leader].private_ip}:{EDGE_PORT}",
         "--app-id", APP, "--secs", str(a.secs), "--payload", str(a.payload),
         "--inflight", str(a.inflight),
-    ], timeout=a.secs + CLIENT_SLACK_SECS)
+    ], timeout=a.secs + CLIENT_SLACK_SECS, cpus=cpus)
     echo("gateway", out)
     d = parse_result(out, "gateway")
     if d is None:

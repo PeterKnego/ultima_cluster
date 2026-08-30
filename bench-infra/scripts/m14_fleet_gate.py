@@ -40,7 +40,8 @@ from m12_fleet_gate import (  # noqa: E402
     ssh, start_unit, kill_unit, truncate_log, tail_log, run_foreground,
     parse_result, echo, Verdict, APP, PORT, REMOTE_ROOT, UNIT_PREFIX,
     BUILT_GATE, BUILT_PROBE, BOOT_SETTLE_SECS, CLIENT_SLACK_SECS,
-    LEADER_WAIT_SECS,
+    LEADER_WAIT_SECS, PIN_MAP_C6ID_2XL, EXPECTED_SIBLING_PAIRS,
+    sibling_pairs, require_pin_layout,
 )
 from m13_hop_bench import sync_tree  # noqa: E402
 
@@ -299,23 +300,43 @@ def service_args(h, sid, spin, snap):
 ADMISSION_KIB = 256
 
 
-def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0):
+def service_cpu(pins, sid):
+    """The CPU pin for FSM `sid`'s service unit, from a role -> CPU-list
+    `pins` dict (e.g. `PIN_MAP_C6ID_2XL`): id 0 gets `service0`'s dedicated
+    thread, id 1 gets `service1`'s. `PIN_MAP_C6ID_2XL` has no dedicated pin
+    past id 1 (M14 allows up to 8 FSMs total), so id >= 2 shares
+    `service1`'s thread — those extra FSMs are unpinned load on top of it,
+    not isolated. `None` (unpinned) if `pins` is falsy or has no entry."""
+    if not pins:
+        return None
+    unit = f"service{sid}"
+    return pins.get(unit, pins.get("service1") if sid >= 1 else None)
+
+
+def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0, pins=None):
     """`fsms` = [(id, spin)], e.g. [(0, 0)] or [(0, 0), (1, K)]. A FRESH
-    generation: dirs wiped, nodes then services, settle after each."""
+    generation: dirs wiped, nodes then services, settle after each.
+
+    `pins` (role -> CPU-list dict, e.g. `PIN_MAP_C6ID_2XL`), when given,
+    pins every node unit to its `node` entry and every service unit per
+    `service_cpu`; `None` (the default) pins nothing."""
     m12.wipe_dirs(voters)
     ms = m12.members_str(voters)
+    node_cpus = (pins or {}).get("node")
     for i, h in enumerate(voters):
         # Node units append to a per-unit log that is NOT wiped by
         # `systemd-run`, so without this every grep over the node log (row d's
         # attach/detach transitions, row f's snapshot installs) would also see
         # every earlier arm's records. Service units already did this.
         truncate_log(h, "node")
-        start_unit(h, "node", node_args(h, i, ms, fsms, lag, purge, snap), nofile=True)
+        start_unit(h, "node", node_args(h, i, ms, fsms, lag, purge, snap), nofile=True,
+                  cpus=node_cpus)
     time.sleep(BOOT_SETTLE_SECS)
     for h in voters:
         for sid, spin in fsms:
             truncate_log(h, f"service{sid}")
-            start_unit(h, f"service{sid}", service_args(h, sid, spin, snap))
+            start_unit(h, f"service{sid}", service_args(h, sid, spin, snap),
+                      cpus=service_cpu(pins, sid))
     time.sleep(BOOT_SETTLE_SECS)
     leader = m6.wait_leader(voters, list(range(len(voters))), LEADER_WAIT_SECS)
     if leader is None:
@@ -324,7 +345,7 @@ def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0):
 
 
 def run_rate_arm(voters, leader, a, label, fan_in, secs=ARM_SECS, timeline=False, unit=False,
-                 measure=True):
+                 measure=True, pins=None):
     """The direct client on the leader host. Foreground (returns the RESULT
     dict) unless `unit`, in which case it is started as a transient unit and
     the caller reads the log later (row d/f keep it running across an action).
@@ -335,8 +356,14 @@ def run_rate_arm(voters, leader, a, label, fan_in, secs=ARM_SECS, timeline=False
     from `uc2ctl status`), and at ~1 M ops/s over a 45 s / 90 s arm that Vec
     would grow to hundreds of MB by doubling INSIDE the poll thread — a
     ~200 MB memcpy that can land inside the 2 s recovery window row d is
-    trying to measure. Rows a/b/e keep the window."""
+    trying to measure. Rows a/b/e keep the window.
+
+    `pins` (role -> CPU-list dict), when given, pins the client to its
+    `client` entry — as a `-p CPUAffinity=` on the transient unit (`unit`
+    path) or a `taskset -c` prefix on the foreground ssh (the other path);
+    `None` (the default) pins nothing."""
     h = voters[leader]
+    client_cpus = (pins or {}).get("client")
     args = ["client-direct", "--instance-dir", h.dir, "--app-id", APP,
             "--secs", str(secs), "--payload", str(a.payload), "--inflight", str(a.inflight),
             "--envelope", "on",
@@ -348,9 +375,9 @@ def run_rate_arm(voters, leader, a, label, fan_in, secs=ARM_SECS, timeline=False
         args.append("--timeline")
     if unit:
         truncate_log(h, "client")
-        start_unit(h, "client", args)
+        start_unit(h, "client", args, cpus=client_cpus)
         return None
-    rc, out = run_foreground(h, args, timeout=secs + CLIENT_SLACK_SECS)
+    rc, out = run_foreground(h, args, timeout=secs + CLIENT_SLACK_SECS, cpus=client_cpus)
     echo(label, out)
     d = parse_result(out, "direct")
     if d is None:
@@ -387,10 +414,10 @@ def rate_of(d):
     return float(d["window_rps"])
 
 
-def one_arm(voters, a, label, fsms, lag, rates, checks, fan_in):
-    leader = start_cluster_m14(voters, fsms, lag=lag)
+def one_arm(voters, a, label, fsms, lag, rates, checks, fan_in, pins=None):
+    leader = start_cluster_m14(voters, fsms, lag=lag, pins=pins)
     print(f"INFO arm {label}: leader n{leader} on {voters[leader].public_ip}", flush=True)
-    d = run_rate_arm(voters, leader, a, label, fan_in)
+    d = run_rate_arm(voters, leader, a, label, fan_in, pins=pins)
     rates[label] = rate_of(d)
     print(f"INFO arm {label}: window_rps={rates[label]:.0f} responses={d['responses']} lost={d['lost']}", flush=True)
     check_all(voters, leader, label, checks, expect=int(d["responses"]))
@@ -398,11 +425,11 @@ def one_arm(voters, a, label, fsms, lag, rates, checks, fan_in):
     return d
 
 
-def arm_calib(voters, a, rates, checks):
+def arm_calib(voters, a, rates, checks, pins=None):
     """FSM 0 alone as SpinCountSm over a K ladder; pick the K nearest 0.5 × n1."""
     ladder = []
     for k in [int(x) for x in a.calib_ks.split(",")]:
-        d = one_arm(voters, a, f"calib-{k}", [(0, k)], None, rates, checks, fan_in=False)
+        d = one_arm(voters, a, f"calib-{k}", [(0, k)], None, rates, checks, fan_in=False, pins=pins)
         ladder.append((k, rate_of(d) / rates["n1"]))
         print(f"INFO calib K={k}: {ladder[-1][1]:.3f} × n1", flush=True)
     k, ratio = pick_k(ladder)
@@ -417,15 +444,15 @@ def arm_calib(voters, a, rates, checks):
     return k
 
 
-def arm_rates(voters, a, rates, checks):
-    one_arm(voters, a, "n1", [(0, 0)], None, rates, checks, fan_in=False)
-    K = a.k if a.k else arm_calib(voters, a, rates, checks)
+def arm_rates(voters, a, rates, checks, pins=None):
+    one_arm(voters, a, "n1", [(0, 0)], None, rates, checks, fan_in=False, pins=pins)
+    K = a.k if a.k else arm_calib(voters, a, rates, checks, pins=pins)
     print(f"INFO slow FSM K = {K}", flush=True)
-    one_arm(voters, a, "n2eq", [(0, 0), (1, 0)], None, rates, checks, fan_in=True)
-    one_arm(voters, a, "slow1", [(0, K)], None, rates, checks, fan_in=False)
-    one_arm(voters, a, "pair", [(0, 0), (1, K)], None, rates, checks, fan_in=True)
-    one_arm(voters, a, "n2eq-ls", [(0, 0), (1, 0)], "lockstep", rates, checks, fan_in=True)
-    one_arm(voters, a, "pair-ls", [(0, 0), (1, K)], "lockstep", rates, checks, fan_in=True)
+    one_arm(voters, a, "n2eq", [(0, 0), (1, 0)], None, rates, checks, fan_in=True, pins=pins)
+    one_arm(voters, a, "slow1", [(0, K)], None, rates, checks, fan_in=False, pins=pins)
+    one_arm(voters, a, "pair", [(0, 0), (1, K)], None, rates, checks, fan_in=True, pins=pins)
+    one_arm(voters, a, "n2eq-ls", [(0, 0), (1, 0)], "lockstep", rates, checks, fan_in=True, pins=pins)
+    one_arm(voters, a, "pair-ls", [(0, 0), (1, K)], "lockstep", rates, checks, fan_in=True, pins=pins)
     return K
 
 
@@ -497,7 +524,7 @@ def bound_timeline(tl, end_ms):
     return [(ms, r) for ms, r in tl if ms < end_ms]
 
 
-def arm_kill(voters, a, K, checks):
+def arm_kill(voters, a, K, checks, pins=None):
     """Row d: the bounded pair under load submitted to FSM 0; SIGKILL FSM 1's
     unit on the leader host; start it again at once. Recovery is judged twice
     — the client's own per-second timeline (M9's window rule) and `uc2ctl
@@ -556,10 +583,11 @@ def arm_kill(voters, a, K, checks):
     # responses`), unchanged: FSM 1 must still agree with FSM 0 and with every
     # remote host in both read modes.
     # ---------------------------------------------------------------------
-    leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES)
+    leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES,
+                               pins=pins)
     h = voters[leader]
     run_rate_arm(voters, leader, a, "kill", fan_in=False, secs=KILL_ARM_SECS, timeline=True, unit=True,
-                 measure=False)
+                 measure=False, pins=pins)
     t_start = time.time()
     time.sleep(12.0)                       # 2 s ramp + [2,10) s baseline + slack
     t0 = time.time()                       # driver clock: attached_at + poll deadline only
@@ -573,7 +601,8 @@ def arm_kill(voters, a, K, checks):
     pre_inc = pre["incarnation"] if pre else None
     r = ssh(h, f"date +%s%3N; sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-service1", label="SIGKILL")
     t0_ms = int((r.stdout or "").strip().splitlines()[0])   # host clock: the SIGKILL instant
-    start_unit(h, "service1", service_args(h, 1, K, M14_SNAPSHOT_INTERVAL_BYTES))
+    start_unit(h, "service1", service_args(h, 1, K, M14_SNAPSHOT_INTERVAL_BYTES),
+              cpus=service_cpu(pins, 1))
     attached_at = None
     deadline = t0 + 30.0
     while time.time() < deadline:
@@ -630,17 +659,18 @@ def arm_kill(voters, a, K, checks):
             "client_lost": d["lost"] if d else None}
 
 
-def arm_join(voters, learner, a, K, checks):
+def arm_join(voters, learner, a, K, checks, pins=None):
     """Row f: voters run the bounded pair with purge ON and snapshots every
     `M14_SNAPSHOT_INTERVAL_BYTES`; fan-in load runs for the whole arm; 10 s in, a learner declared
     {0,1} is admitted (`uc2ctl add-learner` on the leader — M7's pattern:
     the learner boots as a plain node with the CURRENT voters as its seed
     members) and must reach both voters' `applied` within 60 s via a
     two-artifact snapshot session (wire 0.6.0), with zero refusals."""
-    leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES)
+    leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES,
+                               pins=pins)
     h = voters[leader]
     run_rate_arm(voters, leader, a, "join", fan_in=True, secs=JOIN_ARM_SECS, timeline=False, unit=True,
-                 measure=False)
+                 measure=False, pins=pins)
     t_client_start = time.time()
     time.sleep(JOIN_AT_SECS)
     new_id, addr = 3, f"{learner.private_ip}:{PORT}"
@@ -661,11 +691,13 @@ def arm_join(voters, learner, a, K, checks):
     t0 = time.time()
     truncate_log(learner, "node")          # the snapshot-install grep must be arm-scoped
     start_unit(learner, "node", node_args(learner, new_id, m12.members_str(voters), [(0, 0), (1, K)], None,
-                                          True, M14_SNAPSHOT_INTERVAL_BYTES), nofile=True)
+                                          True, M14_SNAPSHOT_INTERVAL_BYTES), nofile=True,
+              cpus=(pins or {}).get("node"))
     time.sleep(2.0)
     for sid, spin in [(0, 0), (1, K)]:
         truncate_log(learner, f"service{sid}")
-        start_unit(learner, f"service{sid}", service_args(learner, sid, spin, M14_SNAPSHOT_INTERVAL_BYTES))
+        start_unit(learner, f"service{sid}", service_args(learner, sid, spin, M14_SNAPSHOT_INTERVAL_BYTES),
+                  cpus=service_cpu(pins, sid))
     joined_at = None
     while time.time() < t0 + BAR_F_JOIN_SECS + 5:
         slots, _ = status_slots(learner)
@@ -787,6 +819,50 @@ def selftest():
     expect("row f fail divergence", not verdict_row_f({**good, "check_ok": False}).passed)
     expect("row f fail on no snapshot install (journal-replay join)",
            not verdict_row_f({**good, "installs": 0}).passed)
+    # --pin (Task 9 step 1): unit_start_cmd's CPUAffinity threading, and the
+    # pure sibling-pairs parser verify_pin_layout is built on. No fleet, no
+    # ssh — a fake host object is enough since unit_start_cmd never touches
+    # the network.
+    class _FakeHost:
+        public_ip = "10.0.0.1"
+        private_ip = "10.0.0.1"
+        gate = "/opt/bench/uc/target/release/examples/m6_gate"
+
+    _fh = _FakeHost()
+    _cmd_unpinned = m12.unit_start_cmd(_fh, "node", ["node"], cpus=None)
+    _cmd_pinned = m12.unit_start_cmd(_fh, "node", ["node"], cpus="0,1,4,5")
+    expect("unit_start_cmd cpus=None has no CPUAffinity", "CPUAffinity" not in _cmd_unpinned)
+    expect("unit_start_cmd cpus set adds -p CPUAffinity=<list> ",
+           "-p CPUAffinity=0,1,4,5 " in _cmd_pinned)
+    expect("unit_start_cmd cpus=None is byte-identical to the pre-cpus call shape",
+           _cmd_unpinned == m12.unit_start_cmd(_fh, "node", ["node"]))
+    expect("service_cpu id 0 -> service0's dedicated pin",
+           service_cpu(PIN_MAP_C6ID_2XL, 0) == PIN_MAP_C6ID_2XL["service0"])
+    expect("service_cpu id 1 -> service1's dedicated pin",
+           service_cpu(PIN_MAP_C6ID_2XL, 1) == PIN_MAP_C6ID_2XL["service1"])
+    expect("service_cpu id >= 2 shares service1's pin (no dedicated pin past id 1)",
+           service_cpu(PIN_MAP_C6ID_2XL, 2) == PIN_MAP_C6ID_2XL["service1"])
+    expect("service_cpu with no pins is unpinned", service_cpu(None, 0) is None)
+    # sibling_pairs: canned `lscpu -p=CPU,CORE` text, both the assumed
+    # layout (siblings i,i+4) and a WRONG layout (siblings i,i+1) that must
+    # be rejected by verify_pin_layout's comparison.
+    LSCPU_EXPECTED = (
+        "# The following is the parsable format, which can be fed to other\n"
+        "# programs. Each different item in every column has an unique ID\n"
+        "# starting usually from zero.\n"
+        "# CPU,CORE\n"
+        "0,0\n1,1\n2,2\n3,3\n4,0\n5,1\n6,2\n7,3\n"
+    )
+    LSCPU_WRONG = (
+        "# CPU,CORE\n"
+        "0,0\n1,0\n2,1\n3,1\n4,2\n5,2\n6,3\n7,3\n"
+    )
+    expect("sibling_pairs on the assumed c6id.2xlarge layout matches EXPECTED_SIBLING_PAIRS",
+           sibling_pairs(LSCPU_EXPECTED) == EXPECTED_SIBLING_PAIRS)
+    expect("sibling_pairs on a (i, i+1) layout is rejected (not EXPECTED_SIBLING_PAIRS)",
+           sibling_pairs(LSCPU_WRONG) != EXPECTED_SIBLING_PAIRS)
+    expect("sibling_pairs on a (i, i+1) layout is exactly {(0,1),(2,3),(4,5),(6,7)}",
+           sibling_pairs(LSCPU_WRONG) == {(0, 1), (2, 3), (4, 5), (6, 7)})
     print(f"selftest: {'PASS' if fails == 0 else f'FAIL ({fails})'}")
     return 0 if fails == 0 else 1
 
@@ -806,23 +882,31 @@ def main():
                     help="SpinCountSm K ladder for the calibration arm")
     ap.add_argument("--k", type=int, default=0, help="skip calibration and use this K")
     ap.add_argument("--rows", default="abcdef", help="subset of a b c d e f (c runs with every arm)")
+    ap.add_argument("--pin", action="store_true",
+                    help="pin every node/service/client unit to PIN_MAP_C6ID_2XL's CPUs "
+                         "(default off); verifies the assumed hyperthread-sibling layout "
+                         "on every voter first and refuses to run (SystemExit) if it "
+                         "doesn't hold — see m12_fleet_gate.verify_pin_layout")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
     if not a.fleet:
         ap.error("one of --fleet or --selftest is required")
     hosts, voters, learner = setup_fleet(a)
+    if a.pin:
+        require_pin_layout(voters)
+    pins = PIN_MAP_C6ID_2XL if a.pin else None
     rates, checks, verdicts = {}, [], []
     kill = join = None
     try:
         if any(r in a.rows for r in "abe"):
-            K = arm_rates(voters, a, rates, checks)
+            K = arm_rates(voters, a, rates, checks, pins=pins)
         else:
             K = a.k
         if "d" in a.rows:
-            kill = arm_kill(voters, a, K, checks)
+            kill = arm_kill(voters, a, K, checks, pins=pins)
         if "f" in a.rows:
-            join = arm_join(voters, learner, a, K, checks)
+            join = arm_join(voters, learner, a, K, checks, pins=pins)
     finally:
         stop_cluster_m14(hosts)
     print("\nM14 gate — FLEET (rates in ops/s over the 8 s window)")

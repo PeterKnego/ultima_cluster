@@ -65,15 +65,20 @@ def prepare_host_27(host):
         raise RuntimeError(f"2.7.0 build on {host.public_ip}: {(r.stderr or r.stdout)[-2000:]}")
 
 
-def one_arm(label, hosts, a):
+def one_arm(label, hosts, a, pins=None):
+    """`pins` (role -> CPU-list dict, e.g. `m12.PIN_MAP_C6ID_2XL`), when
+    given, pins the node/service units (`m12.start_cluster`) and the direct
+    client (`m12.run_direct_arm`, via `taskset` since it runs in the
+    foreground, not as a systemd unit); `None` (the default) pins nothing."""
     voters = hosts[:3]
     m12.stop_cluster(voters)
     m12.wipe_dirs(voters)
-    m12.start_cluster(voters, a, "on")
+    m12.start_cluster(voters, a, "on", pins=pins)
     leader = m6.wait_leader(voters, [0, 1, 2], m12.LEADER_WAIT_SECS)
     if leader is None:
         raise RuntimeError(f"{label}: no single serving leader")
-    d = m12.run_direct_arm(voters, leader, a, "on", payload=a.payload, secs=a.secs)
+    d = m12.run_direct_arm(voters, leader, a, "on", payload=a.payload, secs=a.secs,
+                           cpus=(pins or {}).get("client"))
     m12.stop_cluster(voters)
     if d is None:
         raise RuntimeError(f"{label}: no RESULT line")
@@ -115,6 +120,11 @@ def main():
     ap.add_argument("--inflight", type=int, default=4096)
     ap.add_argument("--admission-kib", type=int, default=256)
     ap.add_argument("--order", choices=("AB", "BA"), default="AB", help="arm order inside each rep")
+    ap.add_argument("--pin", action="store_true",
+                    help="pin every node/service/client unit to m12.PIN_MAP_C6ID_2XL's CPUs "
+                         "(default off); verifies the assumed hyperthread-sibling layout on "
+                         "every voter first and refuses to run (SystemExit) if it doesn't "
+                         "hold — see m12_fleet_gate.verify_pin_layout")
     a = ap.parse_args()
 
     hosts28 = m6.build_fleet_hosts(m12.BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts, count=4,
@@ -124,6 +134,9 @@ def main():
                                    unit_prefix=m12.UNIT_PREFIX, remote_root=m12.REMOTE_ROOT,
                                    probe_bin=PROBE27)
     voters = hosts28[:3]
+    if a.pin:
+        m12.require_pin_layout(voters)
+    pins = m12.PIN_MAP_C6ID_2XL if a.pin else None
     if not a.no_sync:
         sync_tree(voters, a.local_tree)
         sync_tree_to(voters, a.tree27, SRC27)
@@ -144,7 +157,7 @@ def main():
             pairs = (("A-2.7.0", hosts27), ("B-2.8.0", hosts28))
             for ver, hs in (pairs if a.order == "AB" else pairs[::-1]):
                 label = f"{ver} rep{rep}"
-                p = one_arm(label, hs, a)
+                p = one_arm(label, hs, a, pins=pins)
                 points.append(p)
                 print(f"POINT {json.dumps(p)}", flush=True)
                 time.sleep(2.0)
