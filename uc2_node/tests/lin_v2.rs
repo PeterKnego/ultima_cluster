@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use lincheck_v2::{ClusterCfg, LinClusterV2, join_workers, serialize, spawn_workers};
+use lincheck_v2::{ClusterCfg, InstallCounting, LinClusterV2, join_workers, serialize, spawn_workers};
 use uc2_net::fault::FaultConfig;
 use uc2_node::PurgePolicy;
 use uc_lincheck::checker::{Verdict, check_register};
@@ -1072,3 +1072,96 @@ fn run_two_fsm_slow(label: &str, lag: uc2_node::FsmLag, seed: u64) {
 
 #[test] fn two_fsm_slow()          { run_two_fsm_slow("two_fsm_slow",          uc2_node::FsmLag::Bounded(64 * 1024), 0x51); }
 #[test] fn two_fsm_slow_lockstep() { run_two_fsm_slow("two_fsm_slow_lockstep", uc2_node::FsmLag::Lockstep,           0x52); }
+
+// ------------------------------------------- M14c2 T11: snapshot needs purge
+
+/// M14d run-1's lesson, pinned in-process: reconstruction after a service
+/// restart installs the newest snapshot ONLY when the journal no longer
+/// covers `start_pos` (`uc2_service/src/replay.rs:73-78`'s gap guard). With
+/// purge off, the journal always covers `start_pos`, so a `SnapshotPolicy`
+/// alone never shortens a restart — the fresh service replays the whole
+/// journal, exactly as it would with no snapshot policy at all. With purge
+/// on, the leader's journal prefix is dropped below the snapshot floor, so
+/// the fresh service's `start_pos` (0, an empty SM) is no longer covered and
+/// reconstruction installs the newest artifact once.
+///
+/// `InstallCounting` (`lincheck_v2` module) counts `install_snapshot` calls
+/// via the process-global `lincheck_v2::INSTALLS` static — see that static's
+/// doc for the single-user-in-this-binary discipline this test relies on.
+///
+/// **Adaptation found during TDD Step 3 (reported in task-11-report.md):**
+/// the gap guard is only ever CONSULTED when the apply loop's `next_batch`
+/// returns `Overrun` (`uc2_service/src/apply.rs:361-365`) — i.e. when the
+/// fresh, empty service's `start_pos == 0` read is no longer covered by the
+/// LIVE ring buffer (`append + max_claim() > pos + capacity`,
+/// `uc2_log/src/buffer.rs:415-419`), not merely by the archived journal. The
+/// brief's literal body (3000 writes against the harness's then-hardcoded
+/// 4 MiB ring, ~52 B/frame observed, ~156 KB total) never wraps that ring,
+/// so `crash_and_restart_leader_service` (node stays up, ring buffer
+/// untouched) reads position 0 straight off the still-live buffer and NEVER
+/// calls `replay_into` at all — `INSTALLS` measured 0, not 1, with purge on
+/// (confirmed empirically). First attempt at a fix (blowing `WRITE_COUNT` up
+/// to 100 000 to out-write the fixed 4 MiB ring) worked but made every run
+/// take 10+ minutes under this box's contention — a real hang risk, not just
+/// slow. The actual fix: `ClusterCfg::buffer_bytes` (added to the harness,
+/// `uc2_node/tests/lincheck_v2/mod.rs`, default `1 << 22` byte-identical to
+/// the prior hardcoded value — every other capstone unaffected) lets this
+/// test shrink the RING instead of inflating the write volume, restoring the
+/// brief's original write count and its sub-30s budget.
+fn restart_installs(purge: bool) -> u32 {
+    // ~156 KB at 3000 writes (observed ~52 B/frame) comfortably exceeds a
+    // 64 KiB ring — see the doc above for why the ring, not the write count,
+    // is what must be small.
+    const WRITE_COUNT: u64 = 3_000;
+    const RING_BYTES: u64 = 1 << 16; // 64 KiB
+    let _g = serialize();
+    eprintln!("[t11 purge={purge}] phase: start");
+    let dir = tempdir();
+    let ccfg = ClusterCfg {
+        purge: if purge {
+            PurgePolicy::BelowSnapshot { slack_bytes: 0 }
+        } else {
+            PurgePolicy::Disabled
+        },
+        journal_segment_bytes: 16 * 1024,
+        snapshot_interval_bytes: 32 * 1024,
+        buffer_bytes: RING_BYTES,
+        ..ClusterCfg::default()
+    };
+    let mut cluster: LinClusterV2<InstallCounting> =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader = cluster.await_single_serving(30);
+    eprintln!("[t11 purge={purge}] phase: leader elected ({leader})");
+    let client = cluster.client(leader);
+    for i in 0..WRITE_COUNT {
+        let _: CmdResp = client.submit(&Cmd::Write(i)).unwrap();
+    }
+    eprintln!("[t11 purge={purge}] phase: {WRITE_COUNT} submits done");
+    if purge {
+        let d = Instant::now() + Duration::from_secs(30);
+        while cluster.max_archive_first_base() == 0 && Instant::now() < d {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let first_base = cluster.max_archive_first_base();
+        eprintln!("[t11 purge={purge}] phase: purge wait done / first_base = {first_base}");
+        assert!(first_base > 0, "purge never advanced");
+    }
+    lincheck_v2::INSTALLS.store(0, Ordering::Relaxed);
+    cluster.crash_and_restart_leader_service();
+    eprintln!("[t11 purge={purge}] phase: crash_and_restart_leader_service returned");
+    let _: Option<u64> = client.query_linearizable(&()).unwrap(); // the fresh service is caught up
+    eprintln!("[t11 purge={purge}] phase: query_linearizable returned");
+    cluster.stop();
+    eprintln!("[t11 purge={purge}] phase: stop done");
+    lincheck_v2::INSTALLS.load(Ordering::Relaxed)
+}
+
+#[test]
+fn snapshot_restart_installs_only_with_purge() {
+    assert_eq!(
+        restart_installs(false),
+        0,
+        "purge off: reconstruction must replay, never install (replay.rs gap guard)"
+    );
+    assert_eq!(restart_installs(true), 1, "purge on: the newest artifact is installed exactly once");
+}

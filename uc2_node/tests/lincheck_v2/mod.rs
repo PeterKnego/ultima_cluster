@@ -220,6 +220,15 @@ pub struct ClusterCfg {
     /// (the default) is the pre-M14c2 posture — one implicit FSM 0, no second
     /// service — so every existing capstone is unaffected.
     pub services: FsmSet,
+    /// M14c2 T11: the live log-buffer ring's capacity (`NodeConfig::buffer_bytes`).
+    /// Must be a power of two. Default `1 << 22` (4 MiB) is byte-for-byte the
+    /// pre-M14c2 hardcoded value, so every existing capstone is unaffected. A
+    /// test that needs to force a fresh service's `start_pos == 0` read to
+    /// OVERRUN the live ring (so reconstruction actually consults the
+    /// archived journal / snapshot path, rather than reading position 0
+    /// straight off a still-live buffer) sets this small instead of writing
+    /// an enormous volume through the default 4 MiB ring.
+    pub buffer_bytes: u64,
 }
 
 impl Default for ClusterCfg {
@@ -231,6 +240,7 @@ impl Default for ClusterCfg {
             spare_node: false,
             crypto: false,
             services: FsmSet::Single,
+            buffer_bytes: 1 << 22,
         }
     }
 }
@@ -273,7 +283,7 @@ fn make_config(
         bind: addr,
         instance_dir,
         app_id: APP.into(),
-        buffer_bytes: 1 << 22, // 4 MiB
+        buffer_bytes: ccfg.buffer_bytes as usize,
         max_payload: 256,
         admission_bytes: 256 * 1024,
         election_timeout_min_ns: timeout_min_ns,
@@ -1264,6 +1274,62 @@ impl uc2_service::SnapshotStateMachine for Corrupt<RegisterSm> {
         position: u64,
         src: &mut dyn std::io::Read,
     ) -> Result<u64, uc2_service::SnapshotError> {
+        self.0.install_snapshot(position, src)
+    }
+}
+
+/// M14c2 T11: counts `install_snapshot` calls — the observable for "did
+/// reconstruction install the newest snapshot artifact, or replay the whole
+/// journal instead" (`uc2_service/src/replay.rs:73-78`'s gap guard: install
+/// only fires when the journal no longer covers `start_pos`; with purge off
+/// the journal always covers it, so reconstruction replays — the M14d run-1
+/// lesson `snapshot_restart_installs_only_with_purge` pins in-process).
+///
+/// Process-global static: this whole test binary is already serialized
+/// (`serialize()`), and `snapshot_restart_installs_only_with_purge`
+/// (`uc2_node/tests/lin_v2.rs`) is the ONLY test in this binary that wraps an
+/// SM in `InstallCounting`. If a second test ever does, it MUST also take
+/// `serialize()` around its use of this counter or the two will race.
+pub static INSTALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Wraps `RegisterSm`, forwarding every call unchanged except
+/// `install_snapshot`, which increments [`INSTALLS`] first.
+#[derive(Default)]
+pub struct InstallCounting(pub RegisterSm);
+
+impl uc2_service::StateMachine for InstallCounting {
+    type Command = Cmd;
+    type Response = CmdResp;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+    fn apply(&mut self, position: u64, cmd: Cmd) -> CmdResp {
+        uc2_service::StateMachine::apply(&mut self.0, position, cmd)
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        uc2_service::StateMachine::query(&self.0, q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        uc2_service::StateMachine::last_applied(&self.0)
+    }
+}
+
+impl uc2_service::SnapshotStateMachine for InstallCounting {
+    type SnapshotHandle = <RegisterSm as uc2_service::SnapshotStateMachine>::SnapshotHandle;
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc2_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        handle: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        RegisterSm::stream_snapshot(handle, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        INSTALLS.fetch_add(1, Ordering::Relaxed);
         self.0.install_snapshot(position, src)
     }
 }
