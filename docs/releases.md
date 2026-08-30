@@ -269,6 +269,14 @@ refutes the brief's premise:
 
 ### Re-parked (open, named, not done)
 
+- **Twelve-factor hygiene, postponed by the maintainer on 2026-08-30**
+  (`docs/notes/uc2-twelve-factor-assessment.md`): env-var overrides for
+  deploy-varying config keys (factor 3 — new config surface, wants its own
+  spec; key material stays file-based) and one log stream (factor 11 —
+  the `println!` lifecycle lines and the gateway stats line routed through
+  `obs::log::emit` on one descriptor). Both are behaviour changes and
+  belong to a feature release, not a proof-only patch. The release-ledger
+  suggestion (factor 5) is a `cut-a-release.md` §7 line, not code.
 - **No in-process test pins a bound-pinned FSM** — the whole two-FSM WGL
   family runs at ~425 records/s behind a synchronous client loop (the final
   fix wave's `max_lag` measurement: 192 B of a 64 KiB bound, 64 B of a 288 B

@@ -44,7 +44,11 @@ Next up: **TBD by the maintainer.** M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
 Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
 fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`; the rig's
-own validation run on a fleet is still pending (spec §15.1, §16).
+own validation run on a fleet is still pending (spec §15.1, §16). First
+candidate for the next minor: the twelve-factor hygiene items postponed
+out of M14c2 — env-var overrides for deploy-varying config keys (#3) and
+one log stream (#11); the release-ledger line (#5) is process, not code
+(`docs/notes/uc2-twelve-factor-assessment.md`).
 
 ### Standing facts that bind new work
 
