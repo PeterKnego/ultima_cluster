@@ -7,8 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## v2.8.1 — <tag date> — the multi-service proof pass (M14c2)
-<!-- tag date: fill at tag time -->
+## v2.8.1 — 2026-08-30 — the multi-service proof pass (M14c2)
 
 **A proof-only release.** No new feature, no configuration change, and no wire
 or cnc change — `2.8.1` is API-compatible with `2.8.0` by construction, and for

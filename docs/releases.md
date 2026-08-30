@@ -1,7 +1,6 @@
 # ultima_cluster releases
 
-## v2.8.1 — <tag date> — M14c2: the multi-service proof pass
-<!-- tag date: fill at tag time -->
+## v2.8.1 — 2026-08-30 — M14c2: the multi-service proof pass
 
 **Proof only. No feature, no configuration change, no wire or cnc change —
 `2.8.1` is API-compatible with `2.8.0` by construction** (spec §15.1's own
