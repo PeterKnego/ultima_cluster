@@ -7,8 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-<!-- `<tag date>` is pre-tag scaffolding: `docs/how-to/cut-a-release.md` §1's last step ("retire the pre-tag scaffolding") dates this heading when the tag is cut. -->
-## v2.8.0 — <tag date> — several state machines behind one log (M14)
+## v2.8.0 — 2026-08-30 — several state machines behind one log (M14)
 
 A cluster can now run up to eight state-machine processes per node, all fed
 by the one replicated log: submit to any of them, fan a query across all, and

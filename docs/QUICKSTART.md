@@ -16,20 +16,13 @@ are for getting the artifact, not for using it.
 
 ## 1. Download it, and verify it
 
-> **`v2.8.0` prepared, not yet tagged.** The commands below name `v2.7.0`,
-> the latest tagged release; `v2.8.0`'s artifacts will not exist at these
-> URLs until it is cut. Until then, build `v2.8.0` from source
-> (`cargo build --workspace --release`) and use §2 onward against
-> `target/release`, or run `packaging/quickstart-local.sh --bin-dir
-> target/release`.
-
 Releases live at
 [github.com/PeterKnego/ultima_cluster/releases](https://github.com/PeterKnego/ultima_cluster/releases).
 Pick your architecture and take the tarball, its checksum, `SHA256SUMS`, and
 the signature bundle:
 
 ```bash
-VER=2.7.0
+VER=2.8.0
 TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
 BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
 
@@ -97,7 +90,7 @@ packaging/quickstart-local.sh
 
 ```text
 ultima_cluster quickstart
-   binaries: /home/you/uc2-2.7.0-x86_64-unknown-linux-gnu/bin
+   binaries: /home/you/uc2-2.8.0-x86_64-unknown-linux-gnu/bin
    root:     /home/you/uc2-quickstart
 
 1. writing configuration
@@ -352,7 +345,7 @@ supervisor:
   publishes:
 
   ```bash
-  UC2_IMAGE=ghcr.io/peterknego/uc2:2.7.0 \
+  UC2_IMAGE=ghcr.io/peterknego/uc2:2.8.0 \
     docker compose -f packaging/compose.yml up -d
   ```
 

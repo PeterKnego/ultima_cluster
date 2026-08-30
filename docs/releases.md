@@ -1,7 +1,6 @@
 # ultima_cluster releases
 
-<!-- `<tag date>` is pre-tag scaffolding: `docs/how-to/cut-a-release.md` §1's last step ("retire the pre-tag scaffolding") dates this heading when the tag is cut. -->
-## v2.8.0 — <tag date> — M14 multi-service: one log, N state machines
+## v2.8.0 — 2026-08-30 — M14 multi-service: one log, N state machines
 
 **One replicated log, up to eight state-machine processes per node.** M14a
 (`main` 6111257) put the FSMs on the control page and bound them together;
