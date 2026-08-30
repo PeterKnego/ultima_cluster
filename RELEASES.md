@@ -7,6 +7,129 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## v2.8.1 — <tag date> — the multi-service proof pass (M14c2)
+<!-- tag date: fill at tag time -->
+
+**A proof-only release.** No new feature, no configuration change, and no wire
+or cnc change — `2.8.1` is API-compatible with `2.8.0` by construction, and for
+an operator coming from `2.8.0` the upgrade is the plain binary swap the
+flag-day script already performs ([Upgrade a
+cluster](docs/how-to/upgrade-a-cluster.md)).
+What it adds is the evidence `2.8.0` said it did not have: the linearizability,
+partition, hard-crash and Elle tiers now all run **with two state machines
+attached to every node**, each FSM's history checked on its own. It also
+settles the M14 gate's row-e lockstep finding by experiment, and closes the
+deferrals M14c left open. The coverage record, with what is still open:
+[VERIFICATION § 11](docs/VERIFICATION.md#11-what-is-not-verified).
+
+- **Linearizability with two FSMs, bounded and lockstep** — `two_fsm_bounded`
+  and `two_fsm_lockstep` ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs))
+  drive the M6 fault set (leader kills, service crashes, purge and snapshot
+  churn) against two attached FSMs, and check **one WGL history per FSM** with
+  the untouched checker. On top of that sits a second oracle:
+  **replication equivalence** — every `submit_all`'s per-FSM answers must be
+  byte-equal, so a divergence is caught even where both histories are
+  independently linearizable. The oracle is **shown to bite**:
+  `two_fsm_oracle_bites` runs FSM 1 as a corrupting state machine and dies on
+  the first divergent CAS. →
+  [How multi-service works](docs/notes/uc2-m14-multi-service-explained.md)
+- **A slow FSM does not break the pair, and does not get left behind** —
+  `two_fsm_slow` / `two_fsm_slow_lockstep`
+  ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs)) run a normal FSM
+  beside one that takes 200 µs per apply and assert two things every 50 ms: the
+  separation stays inside the lag policy, **and** over the run's second half
+  the two FSMs' apply rates agree within 10 %. Measured ratio: 1.000 — the fast
+  FSM is paced by the slow one rather than sitting at the bound. →
+  [Configuration § `[services]`](docs/reference/configuration.md#services)
+- **Partition and quorum loss with two FSMs** —
+  `minority_partition_and_heal_two_fsm`
+  ([`uc2_node/tests/lin_partition_v2.rs`](uc2_node/tests/lin_partition_v2.rs)):
+  a minority is isolated, the majority keeps writing, the partition heals, and
+  both FSMs' histories are checked separately with equivalence asserted before
+  either verdict is read.
+- **`SIGKILL` with two FSMs** — `two_fsm_service_sigkill` kills and respawns
+  one FSM's process under load; `two_fsm_node_sigkill` kills the node and both
+  services together and brings them all back
+  ([`examples/uc2-crashtest/tests/hard_crash.rs`](examples/uc2-crashtest/tests/hard_crash.rs)).
+  Real processes, real `kill -9`; every FSM history linearizable and the
+  equivalence oracle at zero across every restart.
+- **Elle runs with two FSMs** — a new `quiet_two_fsm` pass records **one
+  list-append history per FSM** and `scripts/elle_check.sh` adjudicates each
+  under both `serializable` and `strong-serializable`. The clean tier's default
+  is now **six** passes, and a failure names the FSM. →
+  [Investigate a failed run](docs/how-to/investigate-a-failed-run.md)
+- **A snapshot only shortens a restart together with purge** —
+  `snapshot_restart_installs_only_with_purge`
+  ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs)) pins the fact that
+  cost the M14 gate its row-d run 1: a `SnapshotPolicy` shortens a service
+  restart only when purge is on, **and** only once the live log buffer has
+  wrapped past the restart position — below the wrap a restart reads the
+  still-live ring and touches neither the journal nor a snapshot, whatever the
+  purge posture. → [Bound journal growth](docs/how-to/bound-journal-growth.md)
+- **A CPU-pinned fleet rig** — `--pin` (default off) in
+  `bench-infra/scripts/m14_fleet_gate.py` and `m14_ab_27_vs_28.py` gives every
+  node, service and client unit its own `CPUAffinity`, and refuses to start
+  unless the sibling layout it assumes is the layout every host in the run
+  actually reports. **It has not yet been run on a fleet**; its record
+  ([`uc2-m14c2-fleet-pinning-2026-08-30.md`](docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md))
+  is a stub until it has.
+- **Lockstep under CPU oversubscription: an operating-envelope fact, not a
+  defect.** The M14 gate reported lockstep at 60× its bounded twin on a busy
+  8-vCPU host and could not say why. It reproduces on the dev box, harder:
+  **624 k → 709 frames/s (880×) with 3 runnable threads on 1 CPU**, while
+  bounded mode on the identical rung is unaffected at **7.4 M frames/s**. The
+  pre-registered explanation (a sleeping FSM cascading the set) is **refuted** —
+  the barrier ladder never exhausts, so the sleep is never reached. Against a
+  decision rule fixed before the first measurement, no candidate fix cleared
+  the 50 % recovery bar (a ×4 and a ×16 ladder and an unbounded yield all
+  1.00×; a futex handoff 116× but still only 13 % of the unconstrained rate),
+  so the bar stands and **no behaviour changed** — the number is documented as
+  an envelope instead: lockstep needs a free CPU per declared FSM plus the
+  node's own agents. →
+  [The experiment](docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md) ·
+  [Configuration § `[services]`](docs/reference/configuration.md#services) ·
+  [Limits](docs/reference/limits.md)
+- **Fixed:** `uc2_service_lag_waits_total` counted **nothing** for the common
+  bounded case — a byte bound rarely divides the frame stream, so the usual
+  pinned state is a cap sitting *inside* the next frame, which the counter's
+  old edge never saw; it now counts one episode per bounded mid-frame stall
+  ([Diagnose a node](docs/how-to/diagnose-a-node.md) ·
+  [Monitor a cluster](docs/how-to/monitor-a-cluster.md)). A snapshot intake
+  that cannot publish — a directory in the way of the final rename, say — no
+  longer retries once per arriving chunk (at most one attempt per 250 ms on
+  both the chunk and the duty-cycle path) and is **abandoned after 60 s**
+  without a chunk, unlinking its unfinished `.part` files and re-downloading
+  the set on the next session: a behaviour change, so that a stalled transfer
+  cannot hold full-size partial files forever, and the window for "clear the
+  obstacle and it publishes" is now bounded at 60 s. Three new counters make
+  those visible (`uc2_snapshot_open_failed_total`,
+  `uc2_snapshot_intake_abandoned_total`,
+  `uc2_snapshot_begin_undecodable_total`), a repair `SNAP_NAK` for an artifact
+  whose `SNAP_BEGIN` has not gone out yet is skipped instead of served,
+  `snap_chunk` write failures are counted, `uc2ctl status` prints
+  `fsm_lag=n/a` when a node declares no FSMs, and the learner-join test now
+  pins the *positions* of the artifacts a joiner installed rather than just
+  their presence. **One alert threshold moved:** `Uc2ServicePinnedAtLagBound` now
+  fires at `max(bound − 1408, 0.9 × bound)` instead of `bound`, so an FSM
+  parked one frame short of its bound still pages — for a bound at or below one
+  MTU (1408 B) the old rule fired at any lag ≥ 1, the new one only at
+  ≥ 0.9 × bound, which is a **loosening** at those very small bounds.
+  Neither the exact frame size nor a per-deployment tolerance is expressible in
+  the rule today, and the alert fixture does not exercise the new clauses —
+  both stated in
+  [`packaging/prometheus/uc2-alerts.yml`](packaging/prometheus/uc2-alerts.yml)
+  and in [Monitor a cluster](docs/how-to/monitor-a-cluster.md).
+
+**`v2.8.0`'s pre-release flag stays; `v2.8.1` is Latest.** `2.8.0` was
+published as a GitHub *pre-release* precisely because these capstones were
+missing. It stays marked that way — the record of what it shipped and what it
+did not is worth keeping — and `v2.8.1` becomes the repository's *Latest
+release*. It is also the release that carries the **first crates.io publish**
+of the twelve publishable crates, on the maintainer's explicit go and in the
+order [`docs/how-to/cut-a-release.md` § 6](docs/how-to/cut-a-release.md) sets
+out. No upgrade steps: `2.8.1` changes neither the wire, the cnc page, nor any
+configuration `2.8.0` accepted.
+
 ## v2.8.0 — 2026-08-30 — several state machines behind one log (M14)
 
 A cluster can now run up to eight state-machine processes per node, all fed
@@ -105,6 +228,9 @@ two-FSM capstones are still M14c2, `v2.8.0` is marked *pre-release* on GitHub
 (Latest stays `v2.7.0`) and the crates.io publish is held until `2.8.1`
 carries those proofs. The tarballs, `SHA256SUMS`, SBOM and the
 `ghcr.io/peterknego/uc2:2.8.0` image are published and cosign-verified.
+**Those proofs landed in `v2.8.1` — the section above**, which is the release
+to take: `v2.8.0` keeps its pre-release flag, and `2.8.1` adds no feature, so
+nothing below changes.
 
 **Coverage.** Multi-service ships with unit tests, in-process integration
 (one node and a 3-node cluster), a sim scenario for the report ceiling and

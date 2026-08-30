@@ -10,11 +10,13 @@ application server**. This is **UC v2**; the v1 stack (an
 consensus, elections, and transport directly. Do not reintroduce `openraft`,
 `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client` crate names.
 
-**Current version: `2.8.0` (M14). Milestones M1–M13 are all complete**, each
+**Current version: `2.8.1` (M14c2). Milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
-the honest-failure protocol); M14's gate doc has its bars committed and its
-fleet run pending (see the gate doc). The per-milestone history that used to
+the honest-failure protocol). M14c2 is **proof-only**: no new feature, no wire
+or cnc change — its record is the two-FSM capstones (`docs/VERIFICATION.md`
+§11) and the lockstep envelope bench doc; the pinned-fleet-rig validation run
+is the one open item. The per-milestone history that used to
 live in this section is in `RELEASES.md` (user-facing), `docs/releases.md` (the
 engineering record), and the gate docs; this section keeps only the map and
 the standing facts that bind new work.
@@ -31,14 +33,18 @@ the standing facts that bind new work.
 | M12a–d | v2.6.0 | adoptable cluster: gateway kit + remote client, admin authn/audit, packaging/publishing, security posture + fuzz tier | `uc2-m12-gate-2026-08-22` |
 | M13 | v2.7.0 | remote path at the cluster's speed: per-record MPSC ring (no publish convoy), Engine-shaped remote client, edge grant budget | `uc2-m13-gate-2026-08-24` |
 | M14 | v2.8.0 | multi-service: one log → N FSMs (bounded/lockstep lag, per-FSM routing + fan-in, 0.6.0 snapshot stream, per-FSM observability) | `uc2-m14-gate-2026-08-29` |
+| M14c2 | v2.8.1 | two-FSM proof pass; lockstep envelope; fleet pinning | `uc2-m14c2-lockstep-oversubscription-2026-08-30` |
 
 (Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
 `v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1` only and is superseded by
 `v2.7.0`, with no final `v2.6.0` tag. The ordered crates.io publish has
 never been run; `docs/how-to/cut-a-release.md` §6 is the procedure.)
 
-Next up: **M14c2** — the two-FSM capstones (`lin_v2 two_fsm`,
-`lin_partition_v2`, hard-crash, Elle) as a proof-only `2.8.1`; spec §15.1.
+Next up: **TBD by the maintainer.** M14c2 is done — the two-FSM capstones
+(`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
+Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
+fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`; the rig's
+own validation run on a fleet is still pending (spec §15.1, §16).
 
 ### Standing facts that bind new work
 

@@ -8,8 +8,13 @@ opposite directions, and elle's two tiers fail for opposite reasons.
 
 ## A clean-tier elle failure
 
-`scripts/elle_check.sh` runs five passes: quiet, failover, partition, purge,
-reconfig.
+`scripts/elle_check.sh` runs six passes: quiet, failover, partition, purge,
+reconfig, and — since `2.8.1` — `quiet_two_fsm`, a two-FSM cluster that
+records **one history per FSM**. The two-FSM pass therefore writes
+`$ELLE_DIR/quiet_two_fsm/fsm0/history.edn` and `.../fsm1/history.edn` instead
+of a single `history.edn`, and each is adjudicated separately: the FAIL line
+names the FSM (`quiet_two_fsm/fsm1`), which is the first thing to read — a
+violation on one FSM only is a different bug from one on both.
 
 A FAIL here means elle found a dependency cycle, or an aborted or stale read
 that linearizability forbids. **Treat it as a real consistency bug, not flake.**

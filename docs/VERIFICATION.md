@@ -9,11 +9,11 @@ verification, and they carry very different weight. Everything below is sorted b
 the strength of the evidence, and the boundaries between tiers are stated
 explicitly rather than blurred.
 
-**Status of this document:** current as of the M14d release pass (2026-08-29),
-which added the M14 coverage statement to §11; §7 as of M12d; the proof,
-simulation and capstone tiers as of the M8 gate (2026-07-29). Each section
-cites the dated record it summarizes; where the two disagree, the dated
-record wins.
+**Status of this document:** current as of the M14c2 proof pass (`2.8.1`,
+2026-08-30), which replaced §11's M14 gap statement with the two-FSM coverage
+record and added the two-FSM capstones to §3–§5; §7 as of M12d; the proof and
+simulation tiers as of the M8 gate (2026-07-29). Each section cites the dated
+record it summarizes; where the two disagree, the dated record wins.
 
 ---
 
@@ -24,9 +24,9 @@ record wins.
 | **Lean 4 proofs** | Machine-checked | Consensus safety kernels; election safety and log matching over an N-node protocol model |
 | **Conformance rig** | Executable, exhaustive-by-sampling | That the Lean model and the real Rust agree, vector by vector |
 | **Deterministic simulation** | Checked under seeded fuzz | Nine whole-cluster safety invariants under fault injection |
-| **WGL lincheck capstones** | Checked on real processes | Linearizability of a register under leader kills, crashes, partitions, purge |
-| **Elle** | Checked on real processes | Transactional safety (serializable and strict) — plus a mutation tier proving the harness has teeth |
-| **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load |
+| **WGL lincheck capstones** | Checked on real processes | Linearizability of a register under leader kills, crashes, partitions, purge — single- and two-FSM |
+| **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
+| **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol **and the MPSC ring's per-record commit protocol** |
 | **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fifteen decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc2_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
@@ -258,6 +258,44 @@ partitions the network, and — in the M6 tier — runs snapshot-backed purge
 underneath. Real node and service agents, real reliable-UDP over loopback, real
 instance directories.
 
+**Two-FSM capstones (`2.8.1`, M14c2).** Every node runs two attached state
+machines and the same checker adjudicates **one history per FSM**, with a
+second oracle on top: **replication equivalence** — every `submit_all`'s
+per-FSM answers must be byte-equal, and a disagreement is counted and recorded
+as `Indeterminate` in both histories rather than silently taken from FSM 0.
+
+| test | file | what it drives |
+|---|---|---|
+| `two_fsm_bounded` | `uc2_node/tests/lin_v2.rs` | two FSMs at `FsmLag::Bounded(64 KiB)` under failover and purge/snapshot churn |
+| `two_fsm_lockstep` | `uc2_node/tests/lin_v2.rs` | the same faults at `FsmLag::Lockstep` |
+| `two_fsm_slow` | `uc2_node/tests/lin_v2.rs` | a fast FSM beside `Slow<RegisterSm, 200>` (200 µs/apply), bounded |
+| `two_fsm_slow_lockstep` | `uc2_node/tests/lin_v2.rs` | the same pair in lockstep |
+| `minority_partition_and_heal_two_fsm` | `uc2_node/tests/lin_partition_v2.rs` | minority partition, quorum loss and heal, per-FSM WGL before and after |
+| `two_fsm_service_sigkill` | `examples/uc2-crashtest/tests/hard_crash.rs` | §5 — FSM 1's process `SIGKILL`ed mid-load |
+| `two_fsm_node_sigkill` | `examples/uc2-crashtest/tests/hard_crash.rs` | §5 — the node and both services killed together |
+
+Two more tests keep those honest rather than adding coverage of their own:
+
+- **The equivalence oracle is shown to bite.** `two_fsm_oracle_bites`
+  (`lin_v2.rs`, `#[should_panic(expected = "replication-equivalence
+  violated")]`) runs FSM 1 as `Corrupt<RegisterSm>` and the run dies on the
+  first divergent CAS — the recorded panic is
+  `[(0, CasResult(true)), (1, CasResult(false))]`. An oracle that has never
+  been made to fail is not evidence.
+- **The slow-FSM oracle** is what `two_fsm_slow*` actually assert, beyond
+  linearizability: at every 50 ms sample the FSMs' separation stays inside the
+  policy (≤ `fsm_lag` bounded, ≤ one 288 B frame in lockstep), **and** over the
+  run's second half their apply rates agree within 10 %. Measured ratio was
+  1.000 in all four runs (~19.6–22.2 KB/s, the slow FSM the limiter) — the fast
+  FSM is throttled to the slow one's pace, it does not sit at the bound.
+
+One more pin, from the M14d row-d lesson —
+`snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a `SnapshotPolicy`
+shortens a service restart **only together with purge, and only once the live
+log buffer has wrapped past `start_pos`**; below the wrap a restart reads the
+still-live ring and touches neither the journal nor a snapshot, whatever the
+purge posture.
+
 ```bash
 cargo test --workspace          # includes the capstones
 ```
@@ -278,7 +316,7 @@ Jepsen EDN. Both models are run: `serializable` and **`strong-serializable`** (t
 strict, real-time model). A cycle-search timeout (`unknown`) is treated as a hard
 **FAIL**, never a pass.
 
-### Clean tier — five passes, all clean under both models
+### Clean tier — six passes, all clean under both models
 
 | Pass | Events | serializable | strong-serializable |
 |---|--:|---|---|
@@ -287,6 +325,17 @@ strict, real-time model). A cycle-search timeout (`unknown`) is treated as a har
 | partition | 51,770 | clean | clean |
 | purge | 54,574 | clean | clean |
 | reconfig | 96,714 | clean | clean |
+| quiet_two_fsm — FSM 0 | 16,062 | clean | clean |
+| quiet_two_fsm — FSM 1 | 16,060 | clean | clean |
+
+`quiet_two_fsm` is the M14c2 (`2.8.1`) addition: a quiet two-FSM cluster at
+`FsmLag::Bounded(64 KiB)`, recording **one history per FSM**
+(`$ELLE_DIR/quiet_two_fsm/fsm{0,1}/history.edn`), each adjudicated separately
+under both models by `scripts/elle_check.sh`, with the same replication-
+equivalence oracle §3 describes asserted at zero. The five older rows are the
+2026-07-16 gate's default sizing; the two-FSM row is the 2026-08-30 run at
+`ELLE_TARGET_OPS=8000` (the sizing nightly uses), 100 % of ops `ok` on both
+FSMs.
 
 Every invocation first self-tests the checker against two fixtures — a known
 write-skew cycle that must be rejected under `serializable`, and a real-time
@@ -335,6 +384,13 @@ build is byte-identical and the read-path mutation is `#[cfg]`-shadowed out.
 
 Real node and service processes, `SIGKILL`ed mid-load. Recovery is required to
 stay linearizable — not merely to start up.
+
+**Two FSMs (`2.8.1`, M14c2).** Two scenarios run a node with `--services 0,1`
+and check *both* FSMs' histories plus the replication-equivalence oracle across
+every restart: `two_fsm_service_sigkill` kills and respawns FSM 1's process
+under load, and `two_fsm_node_sigkill` kills the node and both services
+together, then brings the node back and reattaches both. Six kill cycles across
+the two tests, every FSM history `Linearizable`, `equiv == 0` throughout.
 
 ```bash
 cargo test -p uc2-crashtest --features hard-crash-tests
@@ -599,7 +655,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones, `sim-heavy`, loom, crashtest, Elle clean tier, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc2_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc2_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---
@@ -651,15 +707,55 @@ The most important section, and the one most projects omit.
   (`bincode`, the `ultima-db` snapshot adapter) reached through those seams.
 - **The published gate numbers are fleet measurements**, on the hardware and
   configuration each record names. They are reproducible, not universal.
-- **Multi-service (M14) is covered by unit tests, in-process integration on
-  one node and a 3-node cluster (`uc2_node/tests/services.rs`, `learner.rs`'s
-  two-FSM join, `uc2_net/tests/snapshot_session.rs`'s two-artifact stream),
-  the M14b sim scenario (inv10) and fuzz seeds for the 0.6.0 `SNAP_BEGIN` and
-  the query split. It is NOT yet covered by any linearizability capstone,
-  partition test, hard-crash scenario or Elle tier with two FSMs — those are
-  M14c2, a proof-only `2.8.1` (spec §15.1). The M14 fleet gate
-  (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`) measures rates, a kill and a
-  join; it is not a substitute.**
+- **Multi-service (M14): the two-FSM proof gap `2.8.0` disclosed here is
+  closed by `2.8.1` (M14c2, spec §15.1, §16).** The record, so it can be
+  audited rather than taken on trust:
+  - **Seven two-FSM capstones** — `two_fsm_bounded`, `two_fsm_lockstep`,
+    `two_fsm_slow`, `two_fsm_slow_lockstep` (`uc2_node/tests/lin_v2.rs`),
+    `minority_partition_and_heal_two_fsm`
+    (`uc2_node/tests/lin_partition_v2.rs`), and `two_fsm_service_sigkill` /
+    `two_fsm_node_sigkill` (`examples/uc2-crashtest/tests/hard_crash.rs`).
+    Each checks **one WGL history per FSM** with the untouched `uc-lincheck`
+    checker (§3, §5).
+  - **The replication-equivalence oracle** — every `submit_all`'s per-FSM
+    answers must be byte-equal — is asserted at zero in all seven, and is
+    **shown to bite**: `two_fsm_oracle_bites` runs FSM 1 as
+    `Corrupt<RegisterSm>` and panics on the first divergent CAS.
+  - **The slow-FSM oracle** (`two_fsm_slow`, `two_fsm_slow_lockstep`, FSM 1 =
+    `Slow<RegisterSm, 200>`): the FSMs' separation stays inside the policy at
+    every 50 ms sample **and** their second-half apply rates agree within
+    10 % — measured ratio 1.000 (§3).
+  - **The Elle clean tier runs with two FSMs** — `elle_quiet_two_fsm`
+    (`uc2_node/tests/elle_v2.rs`), one history per FSM, both clean under
+    `serializable` and `strong-serializable` (§4).
+  - **The M14c deferrals are closed** in `uc2_net` (snapshot-session refusal
+    tests, the NAK-before-BEGIN skip, three new counters, a 60 s intake
+    timeout, a paced publish re-drive) and in `uc2_service`/`uc2_node`/`uc2ctl`
+    (`lag_waits` now counts bounded mid-frame stalls, the learner join pins the
+    installed artifact positions, the pinned-at-bound alert threshold, the
+    snapshot-decline latch test).
+  - **The lockstep 60× the M14 gate reported (row e) was settled by
+    experiment, not argument**, against a decision rule fixed before any
+    measurement: it reproduces at 880× on a deliberately oversubscribed rung
+    (624 k → 709 frames/s at 3 threads on 1 CPU) while bounded mode on the same
+    rung is unaffected at 7.4 M frames/s; the pre-registered sleep-cascade
+    mechanism was **refuted** (`lag_waits = 0` on every collapsed run); no
+    candidate fix cleared the pre-committed 50 % recovery bar (yield ladder ×4
+    and ×16 and an unbounded yield all 1.00×; a futex wait on the sibling's
+    `applied` word 116× but still only 13 % of the unconstrained rate). The
+    verdict is therefore an **operating-envelope fact stated with the number,
+    not a product defect**, and no behavioural code changed →
+    [`uc2-m14c2-lockstep-oversubscription-2026-08-30.md`](/docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md),
+    [Limits](/docs/reference/limits.md).
+  - **Still open, and the reason this bullet is not simply deleted:** the M14
+    fleet gate measures rates, a kill and a join — it is not a correctness
+    substitute, and row e has **not** been re-measured. The `--pin` CPU-pinning
+    rig (`bench-infra/scripts/m14_fleet_gate.py`,
+    `m14_ab_27_vs_28.py`) that would confirm pinning recovers the fleet's 60×
+    is written and self-checking but **has never run on a fleet** — its record
+    (`docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md`) is a stub, and
+    the `c6id.2xlarge` sibling map in it is a documented, machine-verified
+    assumption, not an observation.
 - **Wire crypto is opt-in and off by default.** With it disabled the posture is a
   trusted network. With it enabled, the threat model is a network-path adversary;
   a compromised host and a malicious cluster member are explicitly **out of

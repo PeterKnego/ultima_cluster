@@ -2,7 +2,7 @@
 # UC v2 elle consistency check (design spec 2026-07-15). Generates missing pass
 # histories via the elle_v2 driver, then asserts each is valid with an EMPTY
 # anomaly set under BOTH serializable and the strict (real-time) model.
-# Usage: scripts/elle_check.sh [pass ...]     (default: all five passes)
+# Usage: scripts/elle_check.sh [pass ...]     (default: all six passes)
 set -euo pipefail
 
 JAVA="${JAVA:-java}"

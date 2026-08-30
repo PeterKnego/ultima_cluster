@@ -65,6 +65,16 @@ documentation for what it changes, because the tag is what people read.
       comments in the same two files, filled from the fleet gate's Results
       section once it has run (`grep -rn "PENDING FLEET RUN"` finds both;
       the comments are invisible when rendered, so they are easy to miss).
+      For `v2.8.1` it is the same shape: the two `<tag date>` headings, each
+      flagged by a `<!-- tag date: fill at tag time -->` comment on the line
+      below it, and one `<!-- PENDING: nightly + ci evidence … -->` comment at
+      the end of `docs/releases.md`'s `2.8.1` entry, filled with the workflow
+      run ids in the M14 gate's row-g style after the post-merge `ci.yml` and
+      `nightly.yml` runs (`grep -rn "tag date\|PENDING:" RELEASES.md
+      docs/releases.md` finds all three). `v2.8.1` also flips two things
+      `v2.8.0` deliberately left: `gh release edit v2.8.0` keeps its
+      pre-release flag, `v2.8.1` becomes **Latest**, and §6's crates.io
+      publish runs for the first time.
 
 ## 2. Check the version the way the workflow will
 

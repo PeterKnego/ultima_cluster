@@ -6,14 +6,19 @@ name: nightly
 #   * capstones  — the whole workspace test suite INCLUDING uc2_node's WGL
 #                  lincheck capstones (lin_v2: failover + purge/snapshot-churn
 #                  linearizability; lin_partition_v2: partition / quorum-loss)
-#                  plus the uc2_service ultima_db-adapter pass.
+#                  plus the uc2_service ultima_db-adapter pass. Since 2.8.1
+#                  each of those has a TWO-FSM twin (lin_v2's two_fsm_*,
+#                  lin_partition_v2's minority_partition_and_heal_two_fsm),
+#                  picked up by `cargo test --workspace` with no matrix change.
 #   * sim-heavy  — uc2_sim's 1000-seed election/truncation fuzz tier.
 #   * loom       — the uc2_log frame-visibility memory model AND the
 #                  uc_protocol MPSC ring commit protocol (M13a: claim/commit
 #                  CAS, skip-marker race, head-of-line at a hole; exhaustive
 #                  interleaving exploration; needs `--cfg loom` + release).
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
-#                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*).
+#                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*), including
+#                  the 2.8.1 two-FSM scenarios (two_fsm_service_sigkill,
+#                  two_fsm_node_sigkill) — same feature flag, no matrix change.
 #   * quickstart — packaging/quickstart-local.sh run for real: three nodes,
 #                  three services, three gateways and a remote client, driven
 #                  from a bin dir that holds nothing but the five shipped
@@ -175,11 +180,15 @@ jobs:
         if: always()
         run: scripts/enospc_fixture.sh destroy /home/runner/uc2-enospc-test
 
-  # Elle transactional-safety tier: 5 list-append passes (quiet/failover/
-  # partition/purge/reconfig), each adjudicated by the vendored elle-cli under
-  # `serializable` AND `strong-serializable` — anomaly set must be empty. The jar
-  # is vendored (nothing downloads); jq ships on ubuntu-latest. Reduced op sizing
-  # keeps elle-cli's cycle search clear of `unknown` verdicts on a 4-vCPU runner.
+  # Elle transactional-safety tier: 6 list-append passes (quiet/failover/
+  # partition/purge/reconfig/quiet_two_fsm), each adjudicated by the vendored
+  # elle-cli under `serializable` AND `strong-serializable` — anomaly set must be
+  # empty. `quiet_two_fsm` (M14c2, 2.8.1) runs a two-FSM cluster and writes ONE
+  # HISTORY PER FSM under `quiet_two_fsm/fsm{0,1}/`; elle_check.sh adjudicates
+  # each separately, so its FAIL lines name the FSM. No matrix change was needed
+  # to pick it up — it is in the script's default pass list. The jar is vendored
+  # (nothing downloads); jq ships on ubuntu-latest. Reduced op sizing keeps
+  # elle-cli's cycle search clear of `unknown` verdicts on a 4-vCPU runner.
   elle:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -193,10 +202,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - name: Elle clean tier (5 passes, both consistency models)
+      - name: Elle clean tier (6 passes, both consistency models)
         run: scripts/elle_check.sh
 
-  # M8 Task 15: the same 5-pass clean tier with wire crypto Enabled on every
+  # M8 Task 15: the same 6-pass clean tier with wire crypto Enabled on every
   # node (UC2_CRYPTO=1 — see uc2_node/tests/elle_v2.rs's crypto_from_env).
   # A dedicated ELLE_DIR: CI runners are ephemeral (no cross-job reuse), but
   # naming it explicitly keeps the crypto/cleartext histories unambiguous in
@@ -218,7 +227,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - name: Elle clean tier, crypto ON (5 passes, both consistency models)
+      - name: Elle clean tier, crypto ON (6 passes, both consistency models)
         run: scripts/elle_check.sh
 
   # Lean proofs gate (Phase 1): builds the sorry-free Uc2Model/Uc2Proofs

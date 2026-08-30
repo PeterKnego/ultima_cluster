@@ -1,5 +1,322 @@
 # ultima_cluster releases
 
+## v2.8.1 — <tag date> — M14c2: the multi-service proof pass
+<!-- tag date: fill at tag time -->
+
+**Proof only. No feature, no configuration change, no wire or cnc change —
+`2.8.1` is API-compatible with `2.8.0` by construction** (spec §15.1's own
+words). It closes the coverage gap `2.8.0` disclosed: the WGL linearizability,
+partition, hard-crash and Elle tiers now each run with **two state machines
+attached to every node**, one history per FSM; the M14 gate's row-e lockstep
+finding is settled by a pre-registered experiment; the M14c deferrals are
+closed. Commits `bb60d20..e5cc299` on `worktree-uc2-m14c2`, base `1d80136`
+(= `main` at the `v2.8.0` tag). Plan and the binding spec section:
+`docs/superpowers/plans/2026-08-30-uc2-m14c2-proof-pass.md`,
+`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` §15.1, §16.
+Coverage record: `docs/VERIFICATION.md` §11.
+
+Twelve tasks, in the order they ran: T0 a spec erratum; T1 the shared
+`--services`/`--fsm-lag` parser; T2 the harness's second FSM; T3–T5 the WGL
+capstones; T6 the two hard-crash scenarios; T7 the Elle tier; T8 the lockstep
+experiment; T9 the fleet-rig pinning; T10a/T10b/T11 the deferrals; T12 this
+writeup.
+
+### The harness (T1, T2 — `85d4cf1`, `862b9d4`)
+
+- **`ServicesConfig::from_cli(Option<&str>, Option<&str>)`** (`uc2_node/src/services.rs`)
+  is now the one parser behind `--services` / `--fsm-lag`; `m12_gate` and the
+  crashtest node bin both take it, so a test process declares FSMs exactly the
+  way `uc2-node` does.
+- **`FsmSet::{Single, Two { lag }}`** in `uc2_node/tests/lincheck_v2/mod.rs`
+  starts a second `uc2_service` per node, plus `Slow<SM, MICROS>` (a wrapper
+  that sleeps `MICROS` per apply), `Corrupt<SM>` (used only to make an oracle
+  fail), `submit_all_cmd` (one submit, both answers, recorded into two
+  histories) and `read_leader_on(id, …)`. `ClusterCfg` gained
+  `buffer_bytes` (T11) with its previous hardcoded `1 << 22` as the default, so
+  no existing capstone's geometry moved. The single-FSM paths — `worker`,
+  `spawn_workers`, `submit_cmd`, `read_leader` — are untouched: T3's diff into
+  those two files is 308 insertions, **0 deletions**.
+
+### The capstones (T3–T5 — `2ea78d2`, `24bff5b`, `02896a4`, `a71d89e`)
+
+Every two-FSM capstone asserts **per-FSM linearizability** with the untouched
+`uc-lincheck` WGL checker *plus* the **replication-equivalence oracle**: each
+`submit_all`'s per-FSM answers must be byte-equal, an unequal pair is counted
+and recorded as `Indeterminate` in *both* histories rather than resolved from
+FSM 0, and `equiv == 0` is asserted before any checker verdict is read.
+
+- `two_fsm_bounded` / `two_fsm_lockstep` (`uc2_node/tests/lin_v2.rs`) — the M6
+  fault set (leader kills, service crashes, purge/snapshot churn) at
+  `FsmLag::Bounded(64 KiB)` and `FsmLag::Lockstep`. Green at two seeds each
+  (~7 s per run); the file's whole suite ran 13/13 in 178 s
+  (task-3/task-4 reports).
+- `two_fsm_oracle_bites` — `#[should_panic(expected = "replication-equivalence
+  violated")]`, FSM 1 = `Corrupt<RegisterSm>`. Observed panic:
+  `[(0, CasResult(true)), (1, CasResult(false))]`. An oracle nobody has made
+  fail is not evidence; this is the demonstration.
+- `two_fsm_slow` / `two_fsm_slow_lockstep` — FSM 1 = `Slow<RegisterSm, 200>`.
+  Two assertions beyond linearizability: (i) at every 50 ms sample the
+  separation is inside the policy (≤ `fsm_lag`; ≤ one 288 B frame in
+  lockstep), (ii) over the run's second half the two FSMs' apply rates are
+  within 10 %. Measured `ratio=1.000` in all four runs
+  (`rate0=19681 rate1=19681`, then `rate0=22156 rate1=22156`; task-4 report) —
+  the fast FSM tracks the slow one exactly rather than sitting at the bound.
+- `minority_partition_and_heal_two_fsm` (`uc2_node/tests/lin_partition_v2.rs`)
+  — `Run` gained `h1`/`equiv` and a `start_cfg_two_fsm`/`finish_two` sibling
+  pair; `run_minority` takes a `two_fsm` flag whose `false` arm is the
+  pre-existing code moved verbatim into an `else`. Measured
+  `ops=804 ok=799` (FSM 0) and `ops=800 ok=800` (FSM 1) at seed 7; suite 8/8 in
+  59.9 s.
+
+### Hard crash (T6 — `6e14dcc`)
+
+`two_fsm_service_sigkill` (FSM 1's process killed and respawned mid-load) and
+`two_fsm_node_sigkill` (node + both services killed, node respawned, both
+services reattached), in `examples/uc2-crashtest/tests/hard_crash.rs`, over
+`spawn_service_id` / `spawn_node_with_services` in that crate's
+`tests/common/mod.rs`. Both FSM histories linearizable and `equiv == 0` across
+6 kill cycles; two seeds × two runs each plus the default seed; the whole
+`hard_crash` suite 6/6 in 9.6 s (task-6 report).
+
+### Elle (T7 — `11d4ecc`)
+
+`elle_quiet_two_fsm` (`uc2_node/tests/elle_v2.rs`) records **one list-append
+history per FSM**; `scripts/elle_check.sh` learned the per-FSM shape (its
+generation trigger and verdict loop both handle `<pass>/fsm*/history.edn`) and
+its default pass list is now **six**. Measured at `ELLE_TARGET_OPS=8000`:
+`completed0=8031 ok0=8031 completed1=8030 ok1=8030 equiv=0`, then
+`quiet_two_fsm/fsm0` 16 062 events and `fsm1` 16 060 events, **clean under both
+`serializable` and `strong-serializable`** (task-7 report). The single-history
+path was re-run afterwards to prove it is unchanged.
+
+### The lockstep experiment (T8 — `3c7122d`, `74f8109`)
+
+Record: `docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`.
+Dev-box smoke throughout — what it adjudicates is a *ratio* and a *mechanism*,
+never a rate bar.
+
+- **Reproduced, harder than the fleet.** Unconstrained lockstep N=2 runs
+  624 276 / 623 031 / 629 333 frames/s; at `--cores 0` (3 runnable threads on
+  1 CPU) it reads **709 / 709 / 710** — **880× down** — while **bounded** N=2 on
+  the identical rung is **7.4 M frames/s** and lockstep N=1 is 338 k. The
+  control was measured first: **1.0 % peak-to-peak** unconstrained, and the
+  `stress-ng` rungs vary by ~5×, which is why the bisect was read on the
+  0.1 %-stable `--cores 0` rung.
+- **The pre-registered mechanism is refuted.** `lag_waits = 0` on every
+  collapsed run: the yield ladder never exhausts, so `APPLY_IDLE`'s 50 µs sleep
+  is never reached and M14a's "one sleeper cascades the set" is *not* what row
+  e is. 1/709 = **1.41 ms per frame** — a scheduler quantum, not a handshake.
+- **The rule, applied verbatim** (plan Global Constraints, restating spec
+  §16.4): (a) ladder ×4 and ×16 → **1.00×**; (b) unbounded yield while the
+  sibling is live → **1.00×**; (c) futex wait on the sibling's `applied` word →
+  **116×** (82 639 frames/s) but only **13 %** of the unconstrained rate, where
+  the bar is 50 % (≥ 312 k). No variant clears it → **operating-envelope fact,
+  stated with the number**. Landed as one sentence with the gradient in
+  `docs/reference/configuration.md` (`[services]`, `fsm_lag`) and
+  `docs/reference/limits.md`. **No behavioural code change**: `apply.rs` gains
+  only a "do not retune" comment at `LAG_WAIT_YIELDS` and a paragraph on
+  `lockstep_wait`, both pointing at the bench doc.
+- Variant (c) was built, measured and **discarded** with its patch shape
+  written into the doc, so the next attempt does not re-derive it.
+
+### The pinned fleet rig (T9 — `e4b4fc0`, `ad4658d`) — written, not yet run
+
+`--pin` (default off) in `bench-infra/scripts/m14_fleet_gate.py` and
+`m14_ab_27_vs_28.py`, over new plumbing in `m12_fleet_gate.py`
+(`unit_start_cmd(..., cpus=)` → `systemd-run -p CPUAffinity=`, and a `taskset`
+prefix for the foreground client paths). `PIN_MAP_C6ID_2XL` assigns node
+`0,1,4,5`, service0 `2`, service1 `6`, client/edge `3,7`, and
+`require_pin_layout` refuses the run unless `lscpu -p=CPU,CORE` on **every host
+the run starts units on — the row-f learner included** — reports the assumed
+`(i, i+4)` sibling pairs. `--selftest` went 37 → 47 pure checks, all passing;
+`cpus=None` leaves every command line byte-identical.
+**Step 2, the fleet validation run, has not happened** (user-gated; the fleet
+was destroyed). `docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md` is a
+stub saying so, and the sibling map is a documented, machine-verified
+assumption until it does.
+
+### The M14c deferrals (T10a — `69856d2`, `21ab79a`)
+
+In `uc2_net`, all with red-first evidence (the report records a
+behavioural-red round in which each fix was re-disabled individually):
+
+- **Sender**: `snap_open_failed` counts the `File::open` TOCTOU refusal that
+  previously had no counter (latched log, re-armed when a session opens); three
+  refusal-path unit tests, two of them characterisation tests over guards that
+  already existed (stated as such); a repair `SNAP_NAK` inside an artifact
+  whose `SNAP_BEGIN` has not gone out is **skipped**, not served — reachable
+  only for non-head requests, which the report names.
+- **Receiver**: `SNAP_INTAKE_TIMEOUT_NS = 60 s` (deliberately 2× the sender's
+  30 s session timeout, so the leader gives up first) abandons an intake with
+  no chunk, unlinks its unfinished `.part` files and counts
+  `snap_intake_abandoned`; an undecodable `SNAP_BEGIN` is counted once per
+  session; `snap_chunk` seek/write failures are counted (tested by swapping the
+  intake's handle for a read-only `File` on the same `.part`, so a real EBADF
+  travels the shipped path); the publish re-drive is paced to one attempt per
+  250 ms **on the chunk path as well as the duty cycle** — the fix round's own
+  test measured **11 failing renames where the paced behaviour is 1** before
+  the cadence moved inside `snap_publish_complete_parts`, and only a *failed*
+  attempt arms the interval, so a normal publish is never delayed.
+- Three series added to `CONTRACT_SERIES` and exported:
+  `uc2_snapshot_open_failed_total`, `uc2_snapshot_intake_abandoned_total`,
+  `uc2_snapshot_begin_undecodable_total`;
+  `docs/how-to/monitor-a-cluster.md`'s family count 73 → 76.
+- **Behaviour change worth naming:** a locally-obstructed install (a directory
+  in the way of the final rename) now loses its completed-but-unpublished
+  `.part` after 60 s and re-downloads the set, instead of publishing the
+  instant the operator clears the obstacle. The trade is deliberate — a
+  stranded full-size `.part` is real disk — and the two counters rising
+  together is documented in three places as the signature.
+
+### The M14c deferrals (T10b — `14ffb4e`, `3c5f962`)
+
+- **Ruling K, `uc2_service_lag_waits_total` undercounted to zero.** `lag::plan`
+  returns `Wait` only when the cap is at or below the cursor; a byte bound
+  rarely divides the frame stream, so the common pinned state is a cap *inside*
+  the next frame — `Apply { target: cap }`, a zero-frame batch, no cursor
+  movement and nothing counted. Now an out-of-line `note_lag_wait` fires at the
+  "batch moved nothing" break when `target < head` (exactly "the barrier set
+  this target"), and an episode ends when the **cursor advances**, not when the
+  plan stops saying `Wait`. Red-first: `left: 0 / right: 1`, verbatim the
+  reported symptom. The edge is `#[inline(never)]` per M14a's codegen lesson;
+  **no A/B was run on `apply_bench`** and the report says so.
+- `note_service_transitions` now takes the words `service_mins_and_liveness`
+  already loaded (one pass per declared id) instead of re-reading them, so both
+  readers adjudicate the same sample; no performance claim is made.
+- The learner two-FSM join now pins the **positions** of the artifacts it
+  installed (parsed from `snap-<pos>.ultsnap`) against the voter's
+  `service_slot(id).snapshot_pos`, not merely their presence.
+- `uc2ctl status` prints `fsm_lag=n/a` when a node declares no FSMs, instead of
+  a resolved bound it paces nothing against.
+- The snapshot decline latch was lifted out of a closure into
+  `snapshot_set_for(…)` and is covered by an 11-call transition test.
+- **`Uc2ServicePinnedAtLagBound`'s threshold moved** to
+  `max(bound − 1408, 0.9 × bound)`, written as two `and`-ed clauses because
+  PromQL has no scalar-vector `max` (and `group_left()` needs its empty parens
+  or the parser reads the following expression as a label list). **Disclosure:**
+  for bounds at or below one MTU (1408 B) the previous expression fired at any
+  lag ≥ 1 and the new one only at ≥ 0.9 × bound — a loosening at very small
+  bounds; an exact frame is not expressible because `max_payload` is not an
+  exported metric. `promtool check rules` → 16 rules;
+  `scripts/m10_alert_fire.sh` → **16 PASS / 0 FAIL**.
+
+### The snapshot-restart pin (T11 — `5727a36`, `e5cc299`)
+
+`snapshot_restart_installs_only_with_purge` (`uc2_node/tests/lin_v2.rs`) pins
+the fact that cost the M14 gate its row-d run 1: a `SnapshotPolicy` shortens a
+service restart **only together with purge, and only once the live log buffer
+has wrapped past `start_pos`** — below the wrap the fresh service reads the
+still-live ring (`replay_into` is reached only via `Batch::Overrun`) and
+touches neither the journal nor a snapshot, whatever the purge posture. The
+test asserts `INSTALLS == 1` with purge on, `== 0` with purge off, **and** that
+the rebuilt SM holds the last write, so a `0` cannot pass by nothing having
+happened at all. Flip evidence recorded both ways; ~31 s.
+
+### Deviations found by execution — the reports' own corrections
+
+Each of these was reported rather than papered over, with the measurement that
+refutes the brief's premise:
+
+1. **The brief's crashtest warm-up was a real bug** (T6). Every declared FSM
+   applies a committed command, so a plain `warmup_write` recorded into FSM 0's
+   history only made FSM 1's history unexplainable — a *deterministic*
+   violation reproduced with zero SIGKILLs. Fixed by recording the warm-up into
+   both histories (`warmup_write2`).
+2. **`snap_sessions == 1` is false at cluster scale** (T10b). A fresh learner
+   re-NAKs below the floor until its floor adoption sticks, so the leader opens
+   **3** sessions, not 1 — measured, stable over 3 runs. The exact claim is
+   pinned where it belongs, at the seam:
+   `uc2_net/tests/snapshot_session.rs::a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss`.
+   *Newly measured, not previously recorded: three full re-transfers of every
+   artifact on every fresh below-floor join. Correctness-neutral, worth a look.*
+3. **"Two words `service_mins` just loaded" was one word** (T10b), and it is
+   per-id, so the intent (no slot word read twice per duty cycle) was
+   implemented instead of the letter.
+4. **A harness page does not read `fsm_lag_bytes == 0`** (T10b) — the node
+   writes a resolved bound whether or not it declares FSMs.
+5. **The receiver has no injectable clock in the integration test binary**
+   (T10a), so the timeout and cadence tests live in `receiver.rs`'s unit module
+   driving the real `snap_upkeep(now)`; `uc2_net/tests/snapshot_session.rs` is
+   unchanged.
+6. **3000 writes never wrap a 4 MiB ring** (T11), so the brief's literal test
+   body could never reach `install_snapshot` in either arm. Fixed by shrinking
+   the *ring* (`buffer_bytes: 1 << 16` in that test only), not by inflating the
+   write count — a 100 k-write variant ran 10+ minutes and was rejected.
+7. **The wrong-id mutation the review proposed does not discriminate** on the
+   learner fixture (T10b): both FSMs snapshot at the same position, so
+   `shipped + 1` was used instead. Recorded in the test.
+
+### Re-parked (open, named, not done)
+
+- **Peer-gate session replacement** — `snap_begin` still lets any address that
+  passes the term filter replace a live intake from a different peer (T10a,
+  pre-existing).
+- **`snap_last_done`'s partial `(id, pos)` match** — the DONE latch re-acks on
+  a partial match against the session's set (T10a, pre-existing).
+- **The alert fixture does not exercise the new tolerance clauses** — the
+  `fsm_pinned` scenario's 96 B payload divides its 8 KiB bound, so `16/16` says
+  nothing about either clause; the honest close is a second arm at a
+  non-dividing payload, and the scenario's own `Disclosure` string now says so.
+- **Exporting `max_payload` as a metric** would let the pinned-at-bound rule
+  subtract a real frame and retire both the MTU and the `0.9` approximations.
+- **The lockstep 50 % bar may be unreachable for any blocking design** — the
+  implementer's argument (a lockstep frame at N=2 needs 2–3 mandatory context
+  switches on 1–2 CPUs, ~12 µs, against 3.2 µs for 50 % of 624 k), and the
+  observation that the rule's regression clause is vacuous against a
+  lockstep-gated implementation. **Not acted on: the bar stands as
+  pre-committed** (honest-failure protocol); re-specifying it against a
+  scheduling-aware ceiling is the maintainer's call, and the argument is in the
+  bench doc's §3 either way.
+- The pacing test's 9-chunk block could exceed 250 ms on a loaded runner and
+  FAIL spuriously; tighten it if nightly ever shows it.
+- `elle_check.sh`'s generation trigger treats `fsm0/history.edn` alone as
+  "generated", so a kill between the two writes would adjudicate FSM 0 only —
+  a one-line hardening.
+
+### Verification evidence
+
+Every line below is quoted from the task reports of the commits above; none is
+a fleet measurement, and `2.8.1` claims no rate.
+
+- `cargo test -p uc2_node --test lin_v2` → `13 passed; 0 failed … 178.46s`
+  (task-4); `--test lin_partition_v2` → `8 passed; 0 failed … 59.42s` (task-5);
+  `snapshot_restart` alone → `1 passed … 31.61s` (task-11).
+- `cargo test -p uc2-crashtest --features hard-crash-tests --test hard_crash` →
+  `6 passed; 0 failed … 9.62s` (task-6).
+- Elle: `OK: quiet_two_fsm/fsm0 clean under serializable` /
+  `strong-serializable` and the same two lines for `fsm1`;
+  `elle consistency check passed (quiet_two_fsm, crypto=0)` (task-7).
+- `cargo test --workspace` → **1435 passed, 0 failed**, 2 ignored, across 102
+  suites (task-10b, on the final T10b tree); `cargo test -p uc2_net -p uc2_node`
+  → 29 `test result: ok` lines, 0 failed (task-10a).
+- `cargo clippy --workspace --all-targets -- -D warnings` → clean (task-10a,
+  task-10b, and again at the version bump).
+- `promtool check rules packaging/prometheus/uc2-alerts.yml` → `SUCCESS: 16
+  rules found`; `scripts/m10_alert_fire.sh` → 16 PASS / 0 FAIL (task-10b).
+- `python3 bench-infra/scripts/m14_fleet_gate.py --selftest` → 47 checks,
+  `selftest: PASS` (task-9).
+- Release-mechanics checks at the bump:
+  `cargo metadata … uc2_node … .version` → `2.8.1`; `cargo build --workspace`
+  → exit 0; `cargo package -p uc_protocol --allow-dirty --no-verify` →
+  `Packaged 25 files, 363.6KiB`.
+- `cargo fmt` was not run — the project-wide deferral is unchanged.
+
+### CI and nightly
+
+**No workflow matrix change was needed.** `capstones` runs
+`cargo test --workspace`, which picks up `lin_v2`'s `two_fsm_*` and
+`lin_partition_v2`'s two-FSM scenario; `crashtest` runs
+`cargo test -p uc2-crashtest --features hard-crash-tests`, which picks up both
+new SIGKILL scenarios; `elle` and `elle-crypto` both run
+`scripts/elle_check.sh` with no arguments, whose default pass list now includes
+`quiet_two_fsm`. Only the stale "5 passes" comments and step names in
+`.github/workflows/nightly.yml` (and `scripts/elle_check.sh`'s usage line,
+`docs/how-to/investigate-a-failed-run.md` and `docs/VERIFICATION.md` §4)
+changed, to six.
+
+<!-- PENDING: nightly + ci evidence for 2.8.1 — fill from the post-merge run
+     (plan Task 12 Step 4), in the row-g style: workflow, run id, commit. -->
+
 ## v2.8.0 — 2026-08-30 — M14 multi-service: one log, N state machines
 
 **One replicated log, up to eight state-machine processes per node.** M14a

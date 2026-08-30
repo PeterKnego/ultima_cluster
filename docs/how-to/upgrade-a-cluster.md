@@ -287,6 +287,16 @@ The snapshot **directory layout is unchanged from 2.8.0's own layout**:
 artifacts already live in `snapshots/<service-id>/` (M14a). No migration, no
 rollback step beyond restarting the old binaries together.
 
+## Nothing to do for 2.8.1
+
+`2.8.1` is a **proof-only** release (M14c2): it adds no feature, no config key
+and no default change, and it moves neither the node↔node wire (`0.6.0`) nor
+the control page (cnc `3.0`). Coming from `2.8.0`, the upgrade is the plain
+binary swap this script already performs — none of the version-specific
+sections above apply, and there is no migration or extra rollback step. Run the
+same flag day anyway: it is the procedure this system supports, and it gives
+you the same measured downtime number.
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)
