@@ -919,25 +919,42 @@ fn run_two_fsm(label: &str, lag: uc2_node::FsmLag, seed: u64) {
         N_WORKERS,
     );
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let mut faults = 0u32;
+    let mut follower_svc_faults = 0u32;
     let start = Instant::now();
-    while History::ok_count(&h0.snapshot()) < TARGET_OPS || cluster.max_archive_first_base() == 0 {
+    while History::ok_count(&h0.snapshot()) < TARGET_OPS
+        || History::ok_count(&h1.snapshot()) < TARGET_OPS
+        || cluster.max_archive_first_base() == 0
+    {
         std::thread::sleep(FAULT_PERIOD);
         cluster.supervise_services();
         match frng.random_range(0..3u8) {
             0 => cluster.kill_and_restart_leader(),
             1 => cluster.crash_and_restart_leader_service(),
-            _ => cluster.crash_and_restart_random_follower_service(&mut frng),
+            _ => {
+                cluster.crash_and_restart_random_follower_service(&mut frng);
+                follower_svc_faults += 1;
+            }
         }
+        faults += 1;
         assert!(
             start.elapsed() < budget,
-            "[{label}] budget exhausted: ok={} floor={}",
+            "[{label}] budget exhausted: ok0={} ok1={} floor={}",
             History::ok_count(&h0.snapshot()),
+            History::ok_count(&h1.snapshot()),
             cluster.max_archive_first_base()
         );
     }
+    let elapsed = start.elapsed();
+    let (ok0, ok1) = (History::ok_count(&h0.snapshot()), History::ok_count(&h1.snapshot()));
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
     cluster.stop();
+    eprintln!(
+        "[{label}] seed={seed} ok0={ok0} ok1={ok1} faults={faults} \
+         follower_svc_faults={follower_svc_faults} elapsed={:.1}s",
+        elapsed.as_secs_f64()
+    );
     assert_eq!(
         equiv_failures.load(Ordering::Relaxed),
         0,
@@ -989,3 +1006,69 @@ fn two_fsm_oracle_bites() {
     cluster.stop();
     assert_eq!(r[0].1, r[1].1, "replication-equivalence violated: {r:?}");
 }
+
+/// M14c2 T4: the slow-FSM oracle. FSM 1 is `Slow<RegisterSm, 200>` (200 µs per
+/// apply — ≥ 10× slower than FSM 0's unthrottled apply on this box, so it is
+/// comfortably "the limiter"). No faults; a background sampler reads
+/// `(applied_0, applied_1)` off the leader's cnc page every 50 ms and asserts
+/// (ruling 2026-08-30, spec §16.3):
+///   (i) the lag bound holds at EVERY sample — `Bounded(b)` -> `b`,
+///       `Lockstep` -> 288 (one frame: max_payload 256 + 32-byte header);
+///   (ii) over the second half of the run, FSM 0's applied-bytes rate is
+///        within 10% of FSM 1's — i.e. the faster FSM actually converges to
+///        the slow one's pace rather than racing arbitrarily ahead within the
+///        bound.
+fn run_two_fsm_slow(label: &str, lag: uc2_node::FsmLag, seed: u64) {
+    const SECS: u64 = 20;
+    const N_WORKERS: u32 = 4;
+    let _g = serialize();
+    let dir = tempdir();
+    let ccfg = ClusterCfg { services: lincheck_v2::FsmSet::Two { lag }, ..ClusterCfg::default() };
+    let cluster: LinClusterV2<uc_lincheck::register::RegisterSm, lincheck_v2::Slow<uc_lincheck::register::RegisterSm, 200>> =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader = cluster.await_single_serving(30);
+    let dirs = Arc::new(cluster.dirs());
+    let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
+    let equiv = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let handles = lincheck_v2::spawn_workers2(&dirs, &h0, &h1, &equiv, &stop, &last_seen, seed, Duration::ZERO, N_WORKERS);
+    // sampler: (t, applied_0, applied_1) on the leader every 50 ms; no faults in this run
+    let samples = {
+        let stop = Arc::clone(&stop);
+        let dir0 = dirs[leader].clone();
+        std::thread::spawn(move || {
+            let cnc = uc2_log::cnc::CncPage::open_file(&dir0.join("cnc2.dat"), lincheck_v2::APP).expect("cnc");
+            let mut v = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                v.push((Instant::now(), cnc.service_slot(0).applied.load_acquire(), cnc.service_slot(1).applied.load_acquire()));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            v
+        })
+    };
+    std::thread::sleep(Duration::from_secs(SECS));
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    let samples = samples.join().unwrap();
+    cluster.stop();
+    assert_eq!(equiv.load(Ordering::Relaxed), 0, "[{label}] replication-equivalence violated");
+    // (i) the bound at every sample
+    let bound = match lag { uc2_node::FsmLag::Bounded(b) => b, uc2_node::FsmLag::Lockstep => 288 };
+    for (t, a0, a1) in &samples {
+        assert!(a0.saturating_sub(*a1) <= bound, "[{label}] lag {} > bound {bound} at {:?}", a0.saturating_sub(*a1), t);
+    }
+    // (ii) convergence over the second half (ruling 2026-08-30)
+    let half = samples.len() / 2;
+    let (t0, a0_0, a1_0) = samples[half];
+    let (t1, a0_1, a1_1) = *samples.last().unwrap();
+    let dt = (t1 - t0).as_secs_f64();
+    let (r0, r1) = ((a0_1 - a0_0) as f64 / dt, (a1_1 - a1_0) as f64 / dt);
+    assert!(r1 > 0.0, "[{label}] FSM 1 made no progress in the second half");
+    let ratio = r0 / r1;
+    assert!((0.9..=1.1).contains(&ratio), "[{label}] FSM 0 rate {r0:.0} B/s vs FSM 1 {r1:.0} B/s: ratio {ratio:.3} outside [0.9, 1.1]");
+    eprintln!("[{label}] samples={} rate0={r0:.0} rate1={r1:.0} ratio={ratio:.3}", samples.len());
+}
+
+#[test] fn two_fsm_slow()          { run_two_fsm_slow("two_fsm_slow",          uc2_node::FsmLag::Bounded(64 * 1024), 0x51); }
+#[test] fn two_fsm_slow_lockstep() { run_two_fsm_slow("two_fsm_slow_lockstep", uc2_node::FsmLag::Lockstep,           0x52); }
