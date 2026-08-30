@@ -222,6 +222,46 @@ pub fn spawn_service_with(instance_dir: &Path, sessioned: bool) -> Reap {
     Reap(child)
 }
 
+/// M14c2 T6: spawn the service-only binary declaring a specific `--service-id`
+/// (unlike [`spawn_service`]/[`spawn_service_with`], which always boot the
+/// implicit FSM 0 process) — one process per FSM in a multi-service cluster.
+pub fn spawn_service_id(instance_dir: &Path, id: u8) -> Reap {
+    let mut cmd = Command::new(SERVICE_BIN);
+    cmd.arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID)
+        .arg("--service-id")
+        .arg(id.to_string());
+    let child = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {SERVICE_BIN}: {e}"));
+    Reap(child)
+}
+
+/// M14c2 T6: spawn the node-only binary declaring `--services`/`--fsm-lag`
+/// (Task 1) — a multi-FSM single-node cluster, unlike [`spawn_node`]/
+/// [`spawn_node_with`] which always boot the implicit single-FSM default.
+pub fn spawn_node_with_services(instance_dir: &Path, services: &str, fsm_lag: &str) -> Reap {
+    let mut cmd = Command::new(NODE_BIN);
+    cmd.arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID)
+        .arg("--services")
+        .arg(services)
+        .arg("--fsm-lag")
+        .arg(fsm_lag);
+    let child = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {NODE_BIN}: {e}"));
+    Reap(child)
+}
+
 /// Poll for `path` to exist, up to `timeout`. Only meaningful for the FIRST
 /// boot on a fresh instance dir (e.g. waiting for the very first
 /// `cnc2.dat`) — after a node restart on a REUSED instance dir, the old

@@ -128,6 +128,19 @@ enum ReadOutcome {
     Fatal(String),
 }
 
+/// M14c2 T6: [`SubmitOutcome`]'s fan-in twin — one submit, EVERY declared
+/// FSM's answer (ascending by service id), same classification discipline as
+/// [`submit_cmd`]/[`SubmitOutcome`] (see the module doc: only
+/// `NotLeader`/`BackpressureFull`/`Retry` are guaranteed-not-committed and
+/// safe to retry; everything else is `Indeterminate` and never retried; a
+/// harness/wiring-bug error is `Fatal`).
+#[derive(Debug)]
+enum SubmitOutcome2 {
+    Ok(Vec<(u8, CmdResp)>),
+    Indeterminate,
+    Fatal(String),
+}
+
 /// Submit `cmd`, retrying ONLY the guaranteed-not-committed errors
 /// (`NotLeader`/`BackpressureFull`/`Retry`) until `deadline`. Every other
 /// error is `Indeterminate` and NEVER retried — see the module doc. A
@@ -178,6 +191,49 @@ fn submit_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
             // declares — naming an undeclared id here is a wiring bug.
             | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
+/// M14c2 T6: [`submit_cmd`]'s fan-in twin — one submit, EVERY declared FSM's
+/// answer (ascending by service id). Same routing/retry/classification
+/// discipline as [`submit_cmd`] (see its doc and the module doc); only the
+/// client call and the `Ok` payload differ.
+fn submit_all_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome2 {
+    loop {
+        if Instant::now() > deadline {
+            return SubmitOutcome2::Indeterminate; // gave up → in-limbo
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        match client.submit_all::<Cmd, CmdResp>(cmd) {
+            Ok(r) => return SubmitOutcome2::Ok(r),
+            Err(ClientError::NotLeader { .. })
+            | Err(ClientError::BackpressureFull)
+            | Err(ClientError::Retry) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Maybe-committed → indeterminate, never retried; drop the (now
+            // stale) client so the next op reconnects — see `submit_cmd`'s
+            // doc for why this matters specifically for a node restart.
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_))
+            | Err(ClientError::Timeout(_))
+            | Err(ClientError::ResponseOverwritten) => {
+                conn.drop_client();
+                return SubmitOutcome2::Indeterminate;
+            }
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
+            // This harness only ever fans in over declared ids, so naming an
+            // undeclared one here is a wiring bug.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ShutDown) => return SubmitOutcome2::Fatal(format!("{e:?}")),
         }
     }
 }
@@ -315,6 +371,187 @@ fn spawn_workers(
         .collect()
 }
 
+/// M14c2 T6: [`worker`]'s two-FSM twin (mirrors `lincheck_v2::worker2`'s
+/// shape over this file's single-`dir` `Conn`/[`submit_all_cmd`]). Every
+/// Write/CAS goes through [`submit_all_cmd`], fanning in to both FSMs'
+/// answers. An unequal pair between FSM 0's and FSM 1's response is a
+/// **replication-equivalence violation** — both FSMs replay the identical
+/// committed command stream, so their responses must agree; count it in
+/// `equiv` and record `Indeterminate` in BOTH histories (never feed the
+/// checker a lie about what was observed). An equal pair is recorded with
+/// that response in both histories (each stamped with its own
+/// `invoke`/`ret` — `History::seq` is per-history). Reads alternate: FSM 0
+/// via the existing [`read_leader`] path into `h0`, FSM 1 via
+/// `query_linearizable_on(1, &())` into `h1`.
+#[allow(clippy::too_many_arguments)]
+fn worker2(
+    id: u32,
+    dir: Arc<PathBuf>,
+    h0: Arc<History>,
+    h1: Arc<History>,
+    equiv: Arc<AtomicU64>,
+    last_seen: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    mut rng: StdRng,
+    throttle: Duration,
+) {
+    let mut conn = Conn::new((*dir).clone());
+    let mut read_fsm1 = false;
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(throttle);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        match rng.random_range(0..3u8) {
+            0 => {
+                let v = rng.random_range(1..1000u64);
+                let op = Op::Write(v);
+                let (inv0, inv1) = (h0.invoke(), h1.invoke());
+                match submit_all_cmd(&mut conn, &Cmd::Write(v), deadline) {
+                    SubmitOutcome2::Ok(resp) => {
+                        let (a, b) = (&resp[0].1, &resp[1].1);
+                        if a != b {
+                            equiv.fetch_add(1, Ordering::Relaxed);
+                            h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                            h1.record(id, op, inv1, Outcome::Indeterminate);
+                        } else {
+                            h0.record(id, op.clone(), inv0, Outcome::Ok(RegResp::Ack));
+                            h1.record(id, op, inv1, Outcome::Ok(RegResp::Ack));
+                        }
+                    }
+                    SubmitOutcome2::Indeterminate => {
+                        h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                        h1.record(id, op, inv1, Outcome::Indeterminate);
+                    }
+                    SubmitOutcome2::Fatal(e) => panic!("fatal submit_all: {e}"),
+                }
+            }
+            1 => {
+                read_fsm1 = !read_fsm1;
+                if !read_fsm1 {
+                    let inv = h0.invoke();
+                    let outcome = match read_leader(&mut conn, deadline) {
+                        ReadOutcome::Ok(v) => {
+                            if let Some(x) = v {
+                                last_seen.store(x, Ordering::Relaxed);
+                            }
+                            Outcome::Ok(RegResp::Value(v))
+                        }
+                        ReadOutcome::Indeterminate => Outcome::Indeterminate,
+                        ReadOutcome::Fatal(e) => panic!("fatal read (fsm0): {e}"),
+                    };
+                    h0.record(id, Op::Read, inv, outcome);
+                } else {
+                    let inv = h1.invoke();
+                    // FSM 1 read: same routing/classification discipline as
+                    // `read_leader`, targeting `query_linearizable_on(1, &())`.
+                    let outcome = loop {
+                        if Instant::now() > deadline {
+                            break Outcome::Indeterminate;
+                        }
+                        let Some(client) = conn.client() else {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        };
+                        match client.query_linearizable_on::<(), Option<u64>>(1, &()) {
+                            Ok(v) => break Outcome::Ok(RegResp::Value(v)),
+                            Err(ClientError::NotLeader { .. })
+                            | Err(ClientError::Retry)
+                            | Err(ClientError::BackpressureFull) => {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(ClientError::InstanceRestart { .. })
+                            | Err(ClientError::Cnc(_))
+                            | Err(ClientError::Ring(_)) => {
+                                conn.drop_client();
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                                conn.drop_client();
+                                break Outcome::Indeterminate;
+                            }
+                            Err(e @ ClientError::Decode(_))
+                            | Err(e @ ClientError::AppIdMismatch { .. })
+                            | Err(e @ ClientError::VersionMismatch { .. })
+                            | Err(e @ ClientError::PayloadTooLarge { .. })
+                            | Err(e @ ClientError::ServiceNotDeclared { .. })
+                            | Err(e @ ClientError::ShutDown) => panic!("fatal read (fsm1): {e:?}"),
+                        }
+                    };
+                    h1.record(id, Op::Read, inv, outcome);
+                }
+            }
+            _ => {
+                let old = if rng.random_bool(0.7) {
+                    last_seen.load(Ordering::Relaxed)
+                } else {
+                    rng.random_range(1..1000u64)
+                };
+                let new = rng.random_range(1..1000u64);
+                let op = Op::Cas { old, new };
+                let (inv0, inv1) = (h0.invoke(), h1.invoke());
+                match submit_all_cmd(&mut conn, &Cmd::Cas { old, new }, deadline) {
+                    SubmitOutcome2::Ok(resp) => {
+                        let (a, b) = (&resp[0].1, &resp[1].1);
+                        if a != b {
+                            equiv.fetch_add(1, Ordering::Relaxed);
+                            h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                            h1.record(id, op, inv1, Outcome::Indeterminate);
+                        } else {
+                            match a {
+                                CmdResp::CasResult(ok) => {
+                                    if *ok {
+                                        last_seen.store(new, Ordering::Relaxed);
+                                    }
+                                    h0.record(id, op.clone(), inv0, Outcome::Ok(RegResp::CasOk(*ok)));
+                                    h1.record(id, op, inv1, Outcome::Ok(RegResp::CasOk(*ok)));
+                                }
+                                other => panic!("cas returned non-cas response: {other:?}"),
+                            }
+                        }
+                    }
+                    SubmitOutcome2::Indeterminate => {
+                        h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                        h1.record(id, op, inv1, Outcome::Indeterminate);
+                    }
+                    SubmitOutcome2::Fatal(e) => panic!("fatal cas: {e}"),
+                }
+            }
+        }
+    }
+    conn.drop_client();
+}
+
+/// Spawn `n_workers` two-FSM op-driving threads sharing `dir`/`h0`/`h1`/
+/// `equiv`/`last_seen`/`stop` (see [`worker2`]). Same per-worker seeding
+/// discipline as [`spawn_workers`]; argument order mirrors it (`dir` before
+/// the histories, `last_seen` before `stop`).
+#[allow(clippy::too_many_arguments)]
+fn spawn_workers2(
+    dir: &Arc<PathBuf>,
+    h0: &Arc<History>,
+    h1: &Arc<History>,
+    equiv: &Arc<AtomicU64>,
+    last_seen: &Arc<AtomicU64>,
+    stop: &Arc<AtomicBool>,
+    seed: u64,
+    throttle: Duration,
+    n_workers: u32,
+) -> Vec<std::thread::JoinHandle<()>> {
+    (0..n_workers)
+        .map(|w| {
+            let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let (dir, h0, h1, equiv, last_seen, stop) = (
+                Arc::clone(dir),
+                Arc::clone(h0),
+                Arc::clone(h1),
+                Arc::clone(equiv),
+                Arc::clone(last_seen),
+                Arc::clone(stop),
+            );
+            std::thread::spawn(move || worker2(w, dir, h0, h1, equiv, last_seen, stop, rng, throttle))
+        })
+        .collect()
+}
+
 fn join_workers(handles: Vec<std::thread::JoinHandle<()>>) {
     for h in handles {
         if let Err(e) = h.join() {
@@ -338,6 +575,33 @@ fn warmup_write(dir: &Path, history: &History, last_seen: &AtomicU64) {
         other => panic!("warm-up write did not commit: {other:?}"),
     }
     history.record(0, Op::Write(1), inv, Outcome::Ok(RegResp::Ack));
+    last_seen.store(1, Ordering::Relaxed);
+    conn.drop_client();
+}
+
+/// M14c2 T6: [`warmup_write`]'s two-FSM twin. `warmup_write` submits via
+/// plain [`submit_cmd`] (`client.submit`) and records the effect ONLY into
+/// its one `history` argument — correct for a single-FSM node, but on a
+/// two-FSM node the client SDK's own contract is that "every declared FSM
+/// applies it — only the named one's response is awaited"
+/// (`uc2_client::PipelinedClient::submit_to`'s doc): the log is shared, so
+/// FSM 1 silently applies `Write(1)` too even though only FSM 0's response
+/// was awaited. Recording the warm-up in `h0` alone (as [`warmup_write`]
+/// does) leaves that mutation untracked in `h1` — an unavoidable (not
+/// flaky) WGL violation the moment any later FSM-1 read observes it, since
+/// the model has no explaining Write. Route the warm-up through
+/// [`submit_all_cmd`] instead so both histories record it (a plain `Write`
+/// always succeeds identically on both FSMs regardless of prior state, so
+/// this can never itself trip the replication-equivalence oracle).
+fn warmup_write2(dir: &Path, h0: &History, h1: &History, last_seen: &AtomicU64) {
+    let mut conn = Conn::new(dir.to_path_buf());
+    let (inv0, inv1) = (h0.invoke(), h1.invoke());
+    match submit_all_cmd(&mut conn, &Cmd::Write(1), Instant::now() + Duration::from_secs(15)) {
+        SubmitOutcome2::Ok(_) => {}
+        other => panic!("warm-up write did not commit: {other:?}"),
+    }
+    h0.record(0, Op::Write(1), inv0, Outcome::Ok(RegResp::Ack));
+    h1.record(0, Op::Write(1), inv1, Outcome::Ok(RegResp::Ack));
     last_seen.store(1, Ordering::Relaxed);
     conn.drop_client();
 }
@@ -462,6 +726,159 @@ fn linearizable_under_service_sigkill() {
 
     assert_linearizable(&entries, "hard_crash", &seed.to_string());
     // _node / svc Reaps dropped here → killed + reaped.
+}
+
+// ------------------------------------------------------------- test 1b (M14c2 T6)
+
+/// M14c2: SIGKILL FSM 1 mid-load (five times), respawn it; both FSMs'
+/// histories stay linearizable and every `submit_all` pair stayed equal.
+#[test]
+fn two_fsm_service_sigkill() {
+    shorten_client_timeout();
+    let seed: u64 = std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let tmp = tempdir();
+    let inst = tmp.path().join("inst");
+    std::fs::create_dir_all(&inst).unwrap();
+    let _node = spawn_node_with_services(&inst, "0,1", "65536");
+    wait_for_ready(&inst, Duration::from_secs(10));
+    let _svc0 = spawn_service_id(&inst, 0);
+    let svc1 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 1))));
+    let dir = Arc::new(inst.clone());
+    let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
+    let equiv = Arc::new(AtomicU64::new(0));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    warmup_write2(&inst, &h0, &h1, &last_seen);
+    let handles =
+        spawn_workers2(&dir, &h0, &h1, &equiv, &last_seen, &stop, seed, Duration::from_millis(7), 3);
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(700));
+        let mut g = svc1.lock().unwrap();
+        g.take(); // SIGKILL + reap FSM 1
+        *g = Some(spawn_service_id(&inst, 1));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    assert_eq!(equiv.load(Ordering::Relaxed), 0, "replication-equivalence violated");
+    assert_linearizable(
+        &Arc::try_unwrap(h0).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        "two_fsm_service_sigkill_fsm0",
+        "fsm0",
+    );
+    assert_linearizable(
+        &Arc::try_unwrap(h1).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        "two_fsm_service_sigkill_fsm1",
+        "fsm1",
+    );
+    // _node / svc0 / svc1 Reaps dropped here → killed + reaped.
+}
+
+/// M14c2: SIGKILL the NODE with both FSMs attached; respawn node then both
+/// services (three times). Both histories linearizable across every restart.
+///
+/// Same skeleton as `node_sigkill_recovery_once` (kill via a `Mutex<Option<
+/// Reap>>` reassignment, wait for a genuinely FRESH `instance_id` — not just
+/// a stale leftover `cnc2.dat` — before reattaching), generalized to a
+/// two-FSM node (`spawn_node_with_services`/`spawn_service_id`) and to three
+/// kill/restart cycles within one run (mirroring
+/// `two_fsm_service_sigkill`'s own in-test fault loop above, rather than
+/// `node_sigkill_recovery`'s three separate whole-test repeats): each cycle
+/// kills node → service0 → service1 (in that order, all three down before
+/// any respawn — a service never self-heals across a node restart, so there
+/// is nothing to race by killing them first), then respawns node, waits for
+/// the fresh instance id, and respawns service0 then service1.
+#[test]
+fn two_fsm_node_sigkill() {
+    shorten_client_timeout();
+    let seed: u64 = std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+
+    let tmp = tempdir();
+    let inst = tmp.path().join("inst");
+    std::fs::create_dir_all(&inst).unwrap();
+
+    let node = Arc::new(Mutex::new(Some(spawn_node_with_services(&inst, "0,1", "65536"))));
+    wait_for_ready(&inst, Duration::from_secs(10));
+    let svc0 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 0))));
+    let svc1 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 1))));
+
+    let dir = Arc::new(inst.clone());
+    let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
+    let equiv = Arc::new(AtomicU64::new(0));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    warmup_write2(&inst, &h0, &h1, &last_seen);
+
+    const N_WORKERS: u32 = 3;
+    let throttle = Duration::from_millis(7);
+    let handles = spawn_workers2(&dir, &h0, &h1, &equiv, &last_seen, &stop, seed, throttle, N_WORKERS);
+
+    for run in 0..3u32 {
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Capture the pre-kill instance_id (a throwaway probe client) so the
+        // post-restart wait can positively confirm a FRESH node, not just a
+        // stale leftover cnc2.dat (same rationale as `node_sigkill_recovery_once`).
+        let old_instance_id = connect_with_retry(&inst, Duration::from_secs(10)).instance_id();
+
+        // Kill order: node → service0 → service1. All three down before any
+        // respawn — the v2.0 external-supervisor contract (a service never
+        // self-heals across a node restart) means there is nothing to race
+        // by killing the services strictly after the node.
+        {
+            let mut g = node.lock().unwrap();
+            g.take(); // SIGKILL + reap the OLD node
+        }
+        {
+            let mut g = svc0.lock().unwrap();
+            g.take(); // SIGKILL + reap the OLD service 0
+        }
+        {
+            let mut g = svc1.lock().unwrap();
+            g.take(); // SIGKILL + reap the OLD service 1
+        }
+
+        // Respawn order: node, then wait for a fresh instance id, then
+        // service0, then service1 (module doc: node-first-then-services).
+        {
+            let mut g = node.lock().unwrap();
+            *g = Some(spawn_node_with_services(&inst, "0,1", "65536"));
+        }
+        wait_for_fresh_instance(&inst, old_instance_id, Duration::from_secs(10));
+        {
+            let mut g = svc0.lock().unwrap();
+            *g = Some(spawn_service_id(&inst, 0));
+        }
+        {
+            let mut g = svc1.lock().unwrap();
+            *g = Some(spawn_service_id(&inst, 1));
+        }
+
+        // Let recovery land before the next cycle (or the tail assertions).
+        std::thread::sleep(Duration::from_secs(2));
+        eprintln!(
+            "[two_fsm_node_sigkill] run={run} ok0={} ok1={}",
+            History::ok_count(&h0.snapshot()),
+            History::ok_count(&h1.snapshot())
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+
+    assert_eq!(equiv.load(Ordering::Relaxed), 0, "replication-equivalence violated");
+    assert_linearizable(
+        &Arc::try_unwrap(h0).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        "two_fsm_node_sigkill_fsm0",
+        "fsm0",
+    );
+    assert_linearizable(
+        &Arc::try_unwrap(h1).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        "two_fsm_node_sigkill_fsm1",
+        "fsm1",
+    );
+    // node / svc0 / svc1 Reaps dropped here → killed + reaped.
 }
 
 // ------------------------------------------------------------- test 2
