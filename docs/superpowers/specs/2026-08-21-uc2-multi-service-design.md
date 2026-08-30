@@ -918,3 +918,155 @@ first** is on `main`; the fleet run is recorded in that doc with every row's
 verdict and §15.5's facts, FAILs diagnosed; and the 15.6 writeup is on
 `main` with the rc tag's verification evidence — the `v2.8.0` tag itself
 being the user's step.
+
+## 16. M14c2 design (2026-08-30) — the multi-service proof pass, release 2.8.1
+
+`2.8.0` shipped (tag `590b99f`, 2026-08-30) as a GitHub pre-release with the
+§12 capstones still owed — disclosed in the gate doc, VERIFICATION §11 and
+`RELEASES.md`, and the crates.io publish held. This section is the design of
+that owed work plus what the M14d gate added to it. Where it contradicts §12
+or §14.1, this section wins. Ruling 2026-08-30: 2.8.1 is proof-only **unless**
+§16.4's experiment confirms a lockstep defect, in which case the fix ships in
+it.
+
+### 16.1 The cut
+
+One plan, seven workstreams, in this order: (a) the in-process harness
+extension; (b) the four §12 capstones; (c) the lockstep experiment and its
+decision; (d) the fleet rig pinned; (e) the M14c "Deferred to M14c2" list;
+(f) the snapshot-needs-purge pin; (g) the 2.8.1 release. No new feature; no
+wire or cnc change (2.8.1 is API-compatible with 2.8.0 by construction).
+
+### 16.2 The harness: one extension unlocks three tiers
+
+`uc2_node/tests/lincheck_v2/mod.rs` is shared by `lin_v2`, `lin_partition_v2`
+and `elle_v2`, and today hard-codes one FSM (`make_config` sets
+`ServicesConfig::default()`; `spawn_service` starts one `Service<SM>` per node
+dir with the implicit id 0). The extension:
+
+- `ClusterCfg` gains `services: FsmSet` with `FsmSet::Single` (the default —
+  every existing test is byte-for-byte unchanged) and
+  `FsmSet::Two { lag: FsmLag, slow_apply: Option<Duration> }`.
+- `LinClusterV2<SM, SM1 = SM>` starts, for `Two`, a second `Service<SM1>` per
+  node with `ServiceConfig::service_id(1)`; the node's `ServicesConfig` is
+  `from_ids(&[0, 1], Some(lag))`. `SM1` is either `SM` or `Slow<SM>`, a
+  wrapper whose `apply` sleeps `slow_apply` then delegates — output identical,
+  so the replication-equivalence oracle applies to it unchanged.
+- `submit_all_cmd` (beside `submit_cmd`) submits with `submit_all`, receives
+  `Vec<(u8, R)>`, and records the **same** op into two `History`s — one per
+  FSM id — with each FSM's response. The WGL checker is not touched.
+- Sampling: `LinClusterV2::service_applied(id) -> u64` reads the cnc service
+  slot (`CncPage::service_slot(id).applied`) on the leader's dir.
+- `examples/uc2-crashtest`'s node bin gains `--services 0,1` and
+  `--fsm-lag lockstep|<bytes>`, parsed by a new
+  `uc2_node::ServicesConfig::from_cli(ids: &str, fsm_lag: Option<&str>)`;
+  `uc2_gateway/examples/m12_gate.rs`'s `services_from_flags` becomes a call
+  to it (one helper, two bins). The service bin already takes
+  `--service-id`.
+
+### 16.3 The capstones and their oracles
+
+Every two-FSM capstone asserts two things on top of what its single-FSM
+parent asserts: **per-FSM linearizability** (each history checked separately
+by the untouched `uc-lincheck` checker) and the **replication-equivalence
+oracle** — for every `submit_all`, the two responses are byte-equal (same
+deterministic SM, same log ⇒ identical answers). A single unequal pair is a
+FAIL and a consensus/apply defect.
+
+| capstone | shape | extra assertion |
+|---|---|---|
+| `lin_v2::two_fsm_bounded`, `::two_fsm_lockstep` | two `RegisterSm`, the existing failover + purge/snapshot-churn schedule, bounded (default bound) / lockstep | per-FSM WGL + equivalence |
+| `lin_v2::two_fsm_slow` (bounded) | FSM 1 = `Slow<RegisterSm>` with a fixed `apply` sleep sized so FSM 1 alone is ≈ half of FSM 0's rate on the box; sampled every 50 ms | (i) `applied_0 − applied_1 ≤ fsm_lag` at every sample; (ii) **convergence** (ruling 2026-08-30): over the second half of the run, FSM 0's applied rate is within 10 % of FSM 1's — bounded mode must throttle FSM 0 to the slow FSM's pace, not let it race |
+| `lin_v2::two_fsm_slow_lockstep` | same, lockstep | `applied_0 − applied_1 ≤ one frame` at every sample |
+| `lin_partition_v2::minority_partition_and_heal_two_fsm` | the existing scenario, two FSMs, bounded | per-FSM WGL + equivalence, before and after heal |
+| `uc2-crashtest::two_fsm_service_sigkill` (feature `hard-crash-tests`) | real processes; SIGKILL `--service-id 1` mid-load; respawn | both histories linearizable across the restart; equivalence holds after recovery; the restarted FSM re-attaches with a bumped incarnation |
+| `uc2-crashtest::two_fsm_node_sigkill` | SIGKILL the node with both attached; respawn node then both services | as above |
+| `elle_v2::elle_quiet_two_fsm` | the clean tier once with two FSMs | one Elle history per FSM, each under both models; equivalence on every read |
+
+Local proof stack for the plan's acceptance: the whole suite green, the
+capstones green with the failure injected (each new oracle watched to fail
+once with a deliberate divergence — e.g. FSM 1 built with a different seed
+— before the fix is reverted).
+
+### 16.4 The lockstep experiment — and the decision rule
+
+M14d's gate row e measured lockstep at 21.7 k ops/s on the leader host
+(0.017× bounded), identical with and without the slow FSM: a fixed per-frame
+stall signature, ≈ the 18 k frames/s M14a saw when the barrier slept. On the
+dev box, with the FSMs alone, the M14a fix reads 631 k frames/s at N=2.
+Hypothesis: on the fleet host the node's four busy agents, two apply threads
+and the client's two threads oversubscribe 8 vCPUs; the wait ladder
+(`LAG_WAIT_SPINS = 256`, `LAG_WAIT_YIELDS = 2048`, `apply.rs:523-530`)
+exhausts without the sibling being scheduled, `lockstep_wait` returns `None`,
+and the agent's `APPLY_IDLE` (`Sleep(50 µs)`, `uc2_service/src/lib.rs:81`)
+does exactly what M14a's rule forbids — sleeps on a live sibling — once per
+frame.
+
+**Protocol** (dev box, `uc2_node/examples/apply_bench`, recorded in
+`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-<date>.md`):
+
+1. Baseline: `--fsms 2 --mode lockstep` unconstrained (expect ~600 k/s).
+2. Oversubscribe: the same under `taskset -c` to fewer cores than busy
+   threads, with a busy-spin load generator on the same cores (a small bin or
+   `stress-ng --cpu`). Target: reproduce the ~20 k/s mode. If it does not
+   reproduce, widen the stress axes (cores, spinners) before concluding.
+3. Bisect once reproduced: (a) ladder length ×4 / ×16; (b) `APPLY_IDLE`
+   yield instead of sleep while a sibling is live; (c) a futex wait on the
+   sibling's applied word (the rings already have futex wakeups) — measure
+   each alone.
+
+**Decision rule:** the pathology is a **product defect** iff it reproduces
+only under oversubscription *and* one of (a)–(c) restores ≥ 50 % of the
+unconstrained rate under the same oversubscription without regressing the
+unconstrained N=1/N=2 bounded numbers by more than the rig's resolution
+(measured with a same-source rebuild control, CLAUDE.md's M14c lesson). Then
+2.8.1 carries the smallest such change, `apply_bench` re-measures it, and —
+user-gated — the fleet's row e arm re-measures it (`m14_fleet_gate.py
+--rows e`, reported not barred). Otherwise it is an **operating-envelope
+fact**: lockstep needs `busy threads ≤ cores`, stated with the number in
+`configuration.md`'s `[services]` section and `limits.md`.
+
+### 16.5 The fleet rig pinned
+
+The 2026-08-30 A/B showed the same binary landing in per-generation rate
+modes 25 % apart (1.07–1.49 M for 2.7.0, 1.26–1.89 M for 2.8.0), with p50 =
+inflight ÷ rate in every saturated arm — the cluster's mode, not client
+noise. `bench-infra/scripts/m14_fleet_gate.py` (and `m12_fleet_gate.py`'s
+`unit_start_cmd`) gain a `-p CPUAffinity=` per unit: node agents, services and
+the client on disjoint cores of the 8-vCPU host, hyperthread siblings kept
+apart. Validation: one binary, one fleet bring-up, ≥ 4 interleaved arms pinned
+vs unpinned; if the pinned spread is under 5 % the setting becomes the default
+for every future gate and the gate doc's "reading the rules" says so. Fleet
+spend is user-gated.
+
+### 16.6 Deferrals and the purge fact
+
+The M14c plan's "Deferred to M14c2" list becomes tasks, grouped: sender
+(refusal unit tests, skip repair NAKs inside a not-yet-begun artifact,
+`snap_open_failed`), receiver (intake timeout, undecodable-BEGIN count,
+`snap_chunk` write-failure counter, re-drive cadence — ruling M), service
+(`lag_waits` bounded undercount — ruling K), tests (`learner.rs` session
+assertion, decline latch, `uc2ctl status` `fsm_lag=n/a`), docs/metrics nits.
+Plus one new unit test in `uc2_service` pinning the fact M14d's run 1 taught:
+reconstruction installs the newest snapshot only when the journal no longer
+covers `start_pos` (`replay.rs:73-78`); with purge off it replays the whole
+journal.
+
+### 16.7 Release 2.8.1
+
+`VERIFICATION.md` §11's M14 bullet rewritten from "not yet covered" to the
+coverage record; the summary table's capstone rows name the two-FSM variants;
+`RELEASES.md` 2.8.1 section (proofs; the lockstep outcome, defect or
+envelope; fixes from §16.6) + `docs/releases.md`; the M14 gate doc's coverage
+statement updated by pointer; `v2.8.0`'s pre-release flag stays, 2.8.1
+becomes Latest; then the first crates.io publish (`cut-a-release.md` §6), on
+the maintainer's go. Tag by `git tag -a` (§4 as corrected 2026-08-30).
+
+### 16.8 Acceptance
+
+The harness extension leaves every existing test byte-identical; the seven
+capstones green locally and in the nightly (`capstones`, `crashtest`, `elle`
+jobs — the two-FSM variants added to their matrices); each new oracle
+demonstrated to fail on an injected divergence; the lockstep bench doc with
+the decision recorded either way; the pinning result recorded; the deferrals
+closed or re-parked with a reason; 2.8.1's writeup on `main` before the tag.
