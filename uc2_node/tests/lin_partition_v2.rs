@@ -148,7 +148,7 @@ impl Run {
     /// majority node) record into, same as a single-FSM run; `h1` is FSM 1's
     /// independent read/write history.
     fn start_cfg_two_fsm(seed: u64, faults: FaultConfig, ccfg: ClusterCfg) -> Run {
-        debug_assert!(
+        assert!(
             matches!(ccfg.services, lincheck_v2::FsmSet::Two { .. }),
             "start_cfg_two_fsm requires ClusterCfg::services == FsmSet::Two"
         );
@@ -243,12 +243,12 @@ fn run_minority(seed: u64, ccfg: ClusterCfg, two_fsm: bool) -> Result<(), String
     r.cluster.await_reconverged(20);
     std::thread::sleep(Duration::from_millis(1000)); // let survivors catch up + commit
 
-    if !majority_progressed {
-        return Err(format!("majority did not progress during minority partition ({before} -> {after})"));
-    }
-
     if two_fsm {
         let (entries0, entries1, equiv_n) = r.finish_two();
+
+        if !majority_progressed {
+            return Err(format!("majority did not progress during minority partition ({before} -> {after})"));
+        }
         if History::ok_count(&entries0) < MIN_OK || History::ok_count(&entries1) < MIN_OK {
             return Err("too few Ok ops; run is vacuous".into());
         }
@@ -260,6 +260,10 @@ fn run_minority(seed: u64, ccfg: ClusterCfg, two_fsm: bool) -> Result<(), String
         check_or_transient(&entries1, seed, "minority-two-fsm/1")
     } else {
         let entries = r.finish();
+
+        if !majority_progressed {
+            return Err(format!("majority did not progress during minority partition ({before} -> {after})"));
+        }
         if History::ok_count(&entries) < MIN_OK {
             return Err("too few Ok ops; run is vacuous".into());
         }
