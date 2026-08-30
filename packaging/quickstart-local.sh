@@ -284,7 +284,7 @@ instance_dir = "$ROOT/n$i"
 app_id = "$APP"
 listen = "127.0.0.1:$((GW_PORT_BASE + i))"
 
-$gw_members_toml# counter-service runs a plain CounterSm, not a uc2_service::Sessioned wrapper
+$gw_members_toml# counter-service runs a plain CounterSm, not a uc_service::Sessioned wrapper
 # around one, so there is nothing on the far end to strip a session envelope:
 # raw pass-through. A production service wraps its state machine in Sessioned
 # and turns this on, which is what makes a re-sent write answer "replayed"

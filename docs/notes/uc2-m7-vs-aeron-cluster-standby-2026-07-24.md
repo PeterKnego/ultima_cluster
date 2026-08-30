@@ -63,7 +63,7 @@ This is the whole story, and the M7 spec (§1) names it explicitly:
   + stop-and-restart-as-a-member promotion. That sidesteps the hard interaction
   surface by never letting membership live in the log.
 - **M7 takes the opposite bet.** It keeps membership *in* the log and pays for
-  the hard surface with the sim (`uc2_sim` inv6–inv9 + counterfactual-red pins),
+  the hard surface with the sim (`uc_sim` inv6–inv9 + counterfactual-red pins),
   the WGL lincheck capstones, the SIGKILL crashtest, and truncation-revert as a
   first-class design element (§5). The spec frames Aeron's retreat as "an
   engineering warning about the integration surface, not about the math" — and
@@ -111,13 +111,13 @@ role, and it got them "for free" from the M6/M7 design:
 
 - **It never back-pressures the leader.** `FlowControl` keeps voters and learners
   in two lists; `limit()` is the quorum-th order statistic over **voters only**
-  (`uc2_net/src/flow.rs:76-83`), and a learner's advert is stored as bare
+  (`uc_net/src/flow.rs:76-83`), and a learner's advert is stored as bare
   `contiguous` and never consulted (`flow.rs:50-56`). Unit-proven:
   `learner_status_never_moves_the_limit` (`flow.rs:132-149`). A lagging learner
   cannot stall the send cursor.
 - **It never gates commit.** `rebuild_membership` sets `members = voter_ids()`
   only, and `follower_slot` returns `None` for a learner, so its `Report` never
-  reaches the `CommitTracker` (`uc2_consensus/src/election.rs:1382-1401`,
+  reaches the `CommitTracker` (`uc_consensus/src/election.rs:1382-1401`,
   `1250-1262`).
 - **It self-heals when it falls behind** over the *same* reliable-UDP machinery
   as a voter: shallow NAK off the ring (`sender.rs:588-601`), deep-NAK replay
@@ -144,7 +144,7 @@ below is safe to expose over a WAN without it. No consensus-core change.
 Aeron's headline Standby win is running a query/egress service *off* the standby
 without touching the live cluster. UC's shape for this:
 
-- A cross-region learner runs its **own `uc2_service` copy** applying its local
+- A cross-region learner runs its **own `uc_service` copy** applying its local
   (lagging) committed positions — the apply agent already polls
   `min(commit, durable)` in the log buffer in place. That's a read replica for
   free, *if* the read path doesn't demand leader contact.

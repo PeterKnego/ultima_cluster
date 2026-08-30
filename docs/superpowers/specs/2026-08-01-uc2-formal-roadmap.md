@@ -167,7 +167,7 @@ like overrun risk; timebox and re-gate per the house pattern.
 
 **Exit criteria.** Sorry-free reconfig safety theorems; every one of the 11
 ported `assumption`s either proved or explicitly re-recorded as a modeling
-axiom with a Rust anchor; conformance extended if `uc2_consensus` grows a
+axiom with a Rust anchor; conformance extended if `uc_consensus` grows a
 pure reconfig kernel worth vectoring.
 
 ---
@@ -248,7 +248,7 @@ estimates under the standing gate/timebox discipline.
   invariants, TLC checks, violations reproduced at code level. Its
   code-level-reproduction step attacks this project's measured cost center
   (CE adjudication against Rust). Trial ONLY on a zero-formal-coverage
-  surface — `uc2_net`'s NAK/retransmit/flow-control plane is the designated
+  surface — `uc_net`'s NAK/retransmit/flow-control plane is the designated
   target (concurrent, complex, sim-tested only) — and ONLY under the arc's
   discipline: a calibration gate first (revert a known fix — #5 is the
   designated shallow one — confirm rediscovery), every CE treated as a

@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! Quorum commit ranking (spec §6): commit = the quorum-th highest of
+//! {leader's own durable} ∪ {reported follower durables}, bounded by the
+//! leader's own durable, monotonic. "Commit means quorum-fsync'd."
+//!
+//! Bounded-by-own is not redundant with the rank: followers can legitimately
+//! out-fsync the leader (their archives run independently), making the
+//! quorum-th highest exceed what the leader itself holds durably — and the
+//! leader must never declare committed what it could not itself serve.
+//!
+//! A member without a tracked follower slot counts as a permanently-zero
+//! report: conservative by construction — an untracked member can never help
+//! reach quorum, only a real report can.
+//!
+//! Pure and allocation-free after construction: the agent (uc_net's sender
+//! duty cycle in M3) feeds reports in and stores the result out.
+
+pub struct CommitTracker {
+    /// Latest reported durable per follower index — the follower's CURRENT
+    /// durable, not a high-water mark.
+    ///
+    /// This slot was monotonic-max until 2026-08-16, to keep a reordered UDP
+    /// report from regressing it. That defended the wrong direction. A
+    /// follower's durable genuinely REGRESSES whenever it truncates (a
+    /// reconcile cut, a wipe, a restart onto a shorter journal), and under
+    /// election churn that happens constantly. Holding the pre-truncation
+    /// high-water mark let the leader rank a quorum that no longer existed
+    /// and commit — then gossip — a position no live quorum held; a later
+    /// leader whose history genuinely diverges then truncated a follower
+    /// BELOW its own commit counter. That is the residue the 2026-08-16 hunt
+    /// chased after the term-map alignment and commit-validation fixes: every
+    /// surviving rewind carried `prov=("gossip")`.
+    ///
+    /// Taking the latest value instead is safe by construction in the
+    /// direction that matters: over-counting is a safety bug (a phantom
+    /// commit), under-counting is only ever a liveness delay, and `advance`
+    /// keeps `commit` itself monotone regardless. A reordered report can now
+    /// momentarily lower a slot, which at worst defers one advance until the
+    /// next report — the follower re-reports on its own floor cadence.
+    reported: Vec<u64>,
+    /// Reusable ranking scratch: {own} ∪ reported.
+    scratch: Vec<u64>,
+    quorum: usize,
+    commit: u64,
+}
+
+impl CommitTracker {
+    pub fn new(n_followers: usize, cluster_size: usize) -> Self {
+        // The leader is a member, so cluster_size must exceed the follower
+        // count; and the rank below indexes scratch[quorum-1], so there must
+        // be enough tracked members to ever reach quorum. n_followers MAY be
+        // smaller than cluster_size - 1: an untracked member is a
+        // permanently-zero report — conservative, it can never help commit.
+        assert!(
+            cluster_size > n_followers,
+            "cluster_size must exceed n_followers (the leader is a member)"
+        );
+        assert!(
+            n_followers + 1 > cluster_size / 2,
+            "not enough tracked followers to ever reach quorum"
+        );
+        Self {
+            reported: vec![0; n_followers],
+            scratch: Vec::with_capacity(cluster_size),
+            quorum: cluster_size / 2 + 1,
+            commit: 0,
+        }
+    }
+
+    /// Record a follower's reported durable position (AppendPosition). Takes
+    /// the report AS GIVEN — see [`CommitTracker::reported`] for why this must
+    /// not be a high-water mark.
+    pub fn on_durable(&mut self, follower_idx: usize, durable: u64) {
+        self.reported[follower_idx] = durable;
+    }
+
+    /// Diagnostic (UC2_TRUNC_TRACE): the current per-follower report slots.
+    pub fn reported_slots(&self) -> &[u64] {
+        &self.reported
+    }
+
+    #[inline]
+    pub fn commit(&self) -> u64 {
+        self.commit
+    }
+
+    /// Clear per-follower reports (term transition: stale-term reports must
+    /// not certify bytes in the new term). Commit itself stays monotonic.
+    pub fn reset_reports(&mut self) {
+        for r in &mut self.reported {
+            *r = 0;
+        }
+    }
+
+    /// Rank the quorum. Returns `Some(new_commit)` iff commit advanced.
+    pub fn advance(&mut self, own_durable: u64) -> Option<u64> {
+        self.scratch.clear();
+        self.scratch.push(own_durable);
+        self.scratch.extend_from_slice(&self.reported);
+        self.scratch.sort_unstable_by(|a, b| b.cmp(a));
+        let ranked = self.scratch[self.quorum - 1].min(own_durable);
+        if ranked > self.commit {
+            self.commit = ranked;
+            Some(ranked)
+        } else {
+            None
+        }
+    }
+
+    /// Mutation tooth (elle harness): degrade the rank to quorum-1. Applied at
+    /// construction time by ElectionSm's knob so it survives config-boundary
+    /// tracker rebuilds.
+    #[cfg(feature = "mutation-testing")]
+    pub fn force_quorum_minus_one(&mut self) {
+        self.quorum = (self.quorum - 1).max(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn three_node_commit_is_second_highest_bounded_by_own() {
+        let mut t = CommitTracker::new(2, 3);
+        assert_eq!(t.commit(), 0);
+        // no reports yet: {own=1000, 0, 0} -> 2nd highest = 0
+        assert_eq!(t.advance(1000), None);
+        assert_eq!(t.commit(), 0);
+        // one follower at 400: {1000, 400, 0} -> 2nd = 400
+        t.on_durable(0, 400);
+        assert_eq!(t.advance(1000), Some(400));
+        // second follower at 700: {1000, 400, 700} -> 2nd = 700
+        t.on_durable(1, 700);
+        assert_eq!(t.advance(1000), Some(700));
+        // followers ahead of the leader's own durable: bounded by own.
+        // (Possible in practice: the leader's archive can lag its own sends.)
+        t.on_durable(0, 5000);
+        t.on_durable(1, 5000);
+        assert_eq!(t.advance(1000), Some(1000));
+        assert_eq!(t.advance(1000), None); // no re-advance without movement
+        // own durable catches up -> commit follows
+        assert_eq!(t.advance(4000), Some(4000));
+    }
+
+    #[test]
+    fn commit_never_regresses_even_when_a_report_does() {
+        let mut t = CommitTracker::new(2, 3);
+        t.on_durable(0, 800);
+        t.on_durable(1, 900);
+        assert_eq!(t.advance(1000), Some(900));
+        // A lower report (a reordered datagram, or a follower that genuinely
+        // truncated) lowers that SLOT — per-slot values are not high-water
+        // marks since 2026-08-16 — but `commit` itself stays put.
+        t.on_durable(1, 100);
+        assert_eq!(t.advance(1000), None);
+        assert_eq!(t.commit(), 900);
+    }
+
+    /// **The 2026-08-16 phantom-commit residue.** A follower's durable
+    /// REGRESSES whenever it truncates (reconcile cut, wipe, restart onto a
+    /// shorter journal). While the slot was a high-water mark, the leader kept
+    /// ranking against bytes that follower no longer held, committing — and
+    /// gossiping — a position no live quorum backed. A later leader whose
+    /// history genuinely diverged then truncated a follower below its own
+    /// commit counter.
+    #[test]
+    fn a_follower_that_truncates_stops_backing_the_bytes_it_dropped() {
+        let mut t = CommitTracker::new(2, 3);
+        // Both followers hold 5000; the leader commits it (quorum of 3).
+        t.on_durable(0, 5000);
+        t.on_durable(1, 5000);
+        assert_eq!(t.advance(9000), Some(5000));
+        // Follower 0 truncates back to 1000 and re-reports; follower 1 is gone
+        // (silent). The leader must NOT be able to certify anything above 1000
+        // from here: {own 9000, 1000, 5000-stale} would have ranked 5000 under
+        // the old high-water slot even though only the leader still holds it.
+        t.on_durable(0, 1000);
+        t.on_durable(1, 1000);
+        // Ranked = 2nd highest of {9000, 1000, 1000} = 1000, below the existing
+        // commit, so no advance — and crucially no NEW certification above it.
+        assert_eq!(t.advance(9000), None);
+        // A fresh, genuine quorum at 6000 still commits normally.
+        t.on_durable(0, 6000);
+        t.on_durable(1, 6000);
+        assert_eq!(t.advance(9000), Some(6000));
+    }
+
+    #[test]
+    fn four_node_even_cluster_commit_is_third_highest() {
+        // even cluster: 4/2 + 1 = 3 = a real majority of 4, not 2 —
+        // regression guard on the quorum formula for the even case
+        let mut t = CommitTracker::new(3, 4);
+        t.on_durable(0, 90);
+        t.on_durable(1, 80);
+        // {own=100, 90, 80, 0} -> quorum 3 -> 3rd highest = 80
+        assert_eq!(t.advance(100), Some(80));
+        // the silent fourth member alone must never complete the quorum:
+        // with only one report, {100, 90, 0, 0} -> 3rd = 0
+        let mut t2 = CommitTracker::new(3, 4);
+        t2.on_durable(0, 90);
+        assert_eq!(t2.advance(100), None);
+    }
+
+    #[test]
+    fn five_node_commit_is_third_highest() {
+        let mut t = CommitTracker::new(4, 5);
+        // {own=100, 90, 80, 70, 0} -> quorum 3 -> 3rd highest = 80
+        t.on_durable(0, 90);
+        t.on_durable(1, 80);
+        t.on_durable(2, 70);
+        assert_eq!(t.advance(100), Some(80));
+    }
+
+    #[test]
+    fn quorum_loss_never_commits_on_own_durable_alone() {
+        // 3 nodes, both followers silent forever: {own, 0, 0} -> 2nd = 0.
+        // The no-phantom-commits property under quorum loss.
+        let mut t = CommitTracker::new(2, 3);
+        assert_eq!(t.advance(u64::MAX), None);
+        assert_eq!(t.commit(), 0);
+    }
+
+    #[test]
+    fn untracked_member_counts_as_permanent_zero() {
+        // 3-node cluster, only 1 tracked follower (the sender-test shape):
+        // quorum 2 over {own, f1, missing=0} -> commit = min(own, f1)
+        let mut t = CommitTracker::new(1, 3);
+        t.on_durable(0, 700);
+        assert_eq!(t.advance(1000), Some(700));
+        t.on_durable(0, 2000);
+        assert_eq!(t.advance(1000), Some(1000)); // still bounded by own
+    }
+
+    #[test]
+    fn reset_reports_clears_slots_but_keeps_commit() {
+        let mut t = CommitTracker::new(2, 3);
+        // both followers ahead of own; commit bounded by own = 1000
+        t.on_durable(0, 5000);
+        t.on_durable(1, 5000);
+        assert_eq!(t.advance(1000), Some(1000));
+        assert_eq!(t.commit(), 1000);
+        // term transition: stale-term reports must not certify the new term
+        t.reset_reports();
+        // own advances to 6000 but followers are silent (cleared to 0):
+        // {6000, 0, 0} -> quorum-2 = 0 -> no advance. (Without the clear, the
+        // stale 5000/5000 would wrongly certify 5000.)
+        assert_eq!(t.advance(6000), None);
+        assert_eq!(t.commit(), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "cluster_size")]
+    fn leader_must_be_a_member() {
+        let _ = CommitTracker::new(3, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "quorum")]
+    fn too_few_tracked_followers_is_rejected() {
+        let _ = CommitTracker::new(1, 5); // quorum 3 > 2 tracked members
+    }
+
+    /// Mutation tooth (elle harness): forcing quorum-1 makes a 3-node tracker
+    /// commit on the leader's own durable alone — the injected bug the failover
+    /// elle pass must catch as a lost update.
+    #[cfg(feature = "mutation-testing")]
+    #[test]
+    fn forced_quorum_minus_one_commits_without_any_report() {
+        let mut t = CommitTracker::new(2, 3);
+        t.force_quorum_minus_one();
+        // No follower reports: {own=1000, 0, 0} -> rank 1 -> own -> commits.
+        assert_eq!(t.advance(1000), Some(1000));
+    }
+}

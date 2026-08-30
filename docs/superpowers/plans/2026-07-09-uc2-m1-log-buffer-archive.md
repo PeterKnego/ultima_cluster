@@ -1,17 +1,17 @@
-# UC v2 M1 — `uc2_log` Log Buffer + Archive Implementation Plan
+# UC v2 M1 — `uc_log` Log Buffer + Archive Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build UC v2's core data structure — the mmap'd single-writer log buffer with position counters — plus the archive agent that records it to `ultima_journal` in fsync'd blocks, hitting the M1 gate: ≥1 M msgs/s (64 B payloads) append+record+fsync on one node.
+**Goal:** Build UC v2's core data structure — the mmap'd single-writer log buffer with position counters — plus the archive agent that records it to `uc_journal` in fsync'd blocks, hitting the M1 gate: ≥1 M msgs/s (64 B payloads) append+record+fsync on one node.
 
-**Architecture:** Per spec `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §4. Frame layout lives in `uc_protocol::v2` (core-only). New crate `uc2_log` provides: `Region` (heap- or mmap-backed raw memory), `LogBuffer`+`Appender` (single-writer ring addressed by absolute u64 positions, atomic-after-write length commit, padding frames at wrap, one hard overrun gate against the durable counter), `Archive` (block-records the buffer into `ultima_journal`: one journal record per ≤1 MiB frame-aligned block, `seq`=block index, `meta`=base position, one fsync per block, durable counter advances after; replay-from-position via binary search), and `agent` (IdleStrategy + AgentRunner threads).
+**Architecture:** Per spec `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §4. Frame layout lives in `uc_protocol::v2` (core-only). New crate `uc_log` provides: `Region` (heap- or mmap-backed raw memory), `LogBuffer`+`Appender` (single-writer ring addressed by absolute u64 positions, atomic-after-write length commit, padding frames at wrap, one hard overrun gate against the durable counter), `Archive` (block-records the buffer into `uc_journal`: one journal record per ≤1 MiB frame-aligned block, `seq`=block index, `meta`=base position, one fsync per block, durable counter advances after; replay-from-position via binary search), and `agent` (IdleStrategy + AgentRunner threads).
 
-**Tech Stack:** Rust edition 2024, `ultima_journal` (in-tree), `memmap2`, `thiserror`; dev: `tempfile`, `loom`.
+**Tech Stack:** Rust edition 2024, `uc_journal` (in-tree), `memmap2`, `thiserror`; dev: `tempfile`, `loom`.
 
 ## Global Constraints
 
 - `cargo clippy --workspace -- -D warnings` must pass at every commit (repo rule).
-- `uc_protocol::v2::frame` must stay `core`-only: no `std` imports, no atomics — the atomic commit-word store/load lives in `uc2_log`.
+- `uc_protocol::v2::frame` must stay `core`-only: no `std` imports, no atomics — the atomic commit-word store/load lives in `uc_log`.
 - Frame alignment 32 B; header 32 B; `length` field = total frame length (header+payload); `length == 0` means uncommitted (spec §4).
 - Positions are absolute `u64` byte offsets, monotonic forever; ring offset = `position & (capacity-1)`.
 - Buffer capacity: power of two, multiple of 32, ≤ 2^31 (length field is u32), default 512 MiB.
@@ -19,7 +19,7 @@
 - Archive: `Durability::Consistent`, `preallocate_segments: true`, block ≤ 1 MiB and frame-aligned, `meta` = block base position.
 - No timer-based batching anywhere: the archive records whatever accumulated per poll (structural batching).
 - SPDX header on every new file: `// SPDX-License-Identifier: Apache-2.0` + `// Copyright 2026 Peter Knego` (match existing files).
-- Commit after every task; commit messages `feat(uc2_log): ...` / `feat(uc_protocol): ...`.
+- Commit after every task; commit messages `feat(uc_log): ...` / `feat(uc_protocol): ...`.
 
 ---
 
@@ -135,7 +135,7 @@ Top of `uc_protocol/src/v2/frame.rs` (above the test module):
 //! (de)serialization over byte slices. The `length` field at offset 0 is the
 //! commit word: written LAST with a release store, read with an acquire load,
 //! `0` = frame not yet committed. Those atomic ops live in the runtime crate
-//! (`uc2_log`) — this module never touches atomics so it stays `core`-only.
+//! (`uc_log`) — this module never touches atomics so it stays `core`-only.
 
 /// Every frame starts on a 32-byte boundary; frame slots are padded up to it.
 pub const FRAME_ALIGNMENT: usize = 32;
@@ -218,14 +218,14 @@ git commit -m "feat(uc_protocol): v2 frame layout — 32B header, commit-word le
 
 ---
 
-### Task 2: `uc2_log` crate scaffold — counters + region
+### Task 2: `uc_log` crate scaffold — counters + region
 
 **Files:**
-- Modify: `Cargo.toml` (workspace `members`: add `"uc2_log"` after `"uc_protocol"`)
-- Create: `uc2_log/Cargo.toml`
-- Create: `uc2_log/src/lib.rs`
-- Create: `uc2_log/src/counters.rs`
-- Create: `uc2_log/src/region.rs`
+- Modify: `Cargo.toml` (workspace `members`: add `"uc_log"` after `"uc_protocol"`)
+- Create: `uc_log/Cargo.toml`
+- Create: `uc_log/src/lib.rs`
+- Create: `uc_log/src/counters.rs`
+- Create: `uc_log/src/region.rs`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -236,11 +236,11 @@ git commit -m "feat(uc_protocol): v2 frame layout — 32B header, commit-word le
 
 - [ ] **Step 1: Create the crate and workspace wiring**
 
-`uc2_log/Cargo.toml`:
+`uc_log/Cargo.toml`:
 
 ```toml
 [package]
-name = "uc2_log"
+name = "uc_log"
 description = "UC v2 log buffer + archive (spec 2026-07-09, M1)"
 edition.workspace = true
 version.workspace = true
@@ -249,7 +249,7 @@ authors.workspace = true
 
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
-ultima-journal = { workspace = true }
+uc_journal = { workspace = true }
 memmap2 = { workspace = true }
 thiserror = { workspace = true }
 
@@ -260,13 +260,13 @@ tempfile = { workspace = true }
 loom = "0.7"
 ```
 
-In the root `Cargo.toml`, change the members line to include `"uc2_log"`:
+In the root `Cargo.toml`, change the members line to include `"uc_log"`:
 
 ```toml
-members = ["uc_protocol", "uc2_log", "uc_service", "uc_node", "uc_client", "uc_autobench", "uc-lincheck", "uc-rt-busyspin", "ultima_journal", "examples/counter_loop", "examples/uc-crashtest"]
+members = ["uc_protocol", "uc_log", "uc_service", "uc_node", "uc_client", "uc_autobench", "uc_lincheck", "uc-rt-busyspin", "uc_journal", "examples/counter_loop", "examples/uc-crashtest"]
 ```
 
-`uc2_log/src/lib.rs`:
+`uc_log/src/lib.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -281,7 +281,7 @@ pub mod region;
 
 - [ ] **Step 2: Write the failing tests**
 
-Test module at the bottom of `uc2_log/src/counters.rs`:
+Test module at the bottom of `uc_log/src/counters.rs`:
 
 ```rust
 #[cfg(test)]
@@ -306,7 +306,7 @@ mod tests {
 }
 ```
 
-Test module at the bottom of `uc2_log/src/region.rs`:
+Test module at the bottom of `uc_log/src/region.rs`:
 
 ```rust
 #[cfg(test)]
@@ -329,12 +329,12 @@ mod tests {
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_log`
+Run: `cargo test -p uc_log`
 Expected: COMPILE ERROR (types not defined).
 
 - [ ] **Step 4: Write the implementations**
 
-`uc2_log/src/counters.rs` (above tests):
+`uc_log/src/counters.rs` (above tests):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -391,7 +391,7 @@ impl LogCounters {
 }
 ```
 
-`uc2_log/src/region.rs` (above tests):
+`uc_log/src/region.rs` (above tests):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -468,15 +468,15 @@ impl Drop for Region {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_log`
+Run: `cargo test -p uc_log`
 Expected: 3 passed.
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add Cargo.toml uc2_log
-git commit -m "feat(uc2_log): crate scaffold — padded position counters + raw region"
+cargo clippy -p uc_log -- -D warnings
+git add Cargo.toml uc_log
+git commit -m "feat(uc_log): crate scaffold — padded position counters + raw region"
 ```
 
 ---
@@ -484,8 +484,8 @@ git commit -m "feat(uc2_log): crate scaffold — padded position counters + raw 
 ### Task 3: `LogBuffer` + `Appender` — single-writer append, padding, overrun gate, recordable slices
 
 **Files:**
-- Create: `uc2_log/src/buffer.rs`
-- Modify: `uc2_log/src/lib.rs` (add `pub mod buffer;`)
+- Create: `uc_log/src/buffer.rs`
+- Modify: `uc_log/src/lib.rs` (add `pub mod buffer;`)
 
 **Interfaces:**
 - Consumes: `Region`, `LogCounters` (Task 2); `uc_protocol::v2::frame` (Task 1).
@@ -500,7 +500,7 @@ git commit -m "feat(uc2_log): crate scaffold — padded position counters + raw 
 
 - [ ] **Step 1: Write the failing tests**
 
-Test module at the bottom of `uc2_log/src/buffer.rs`. Tests use a small buffer (4096 B) so wrap and gate paths are cheap to hit, and drive the durable counter by hand (no archive yet):
+Test module at the bottom of `uc_log/src/buffer.rs`. Tests use a small buffer (4096 B) so wrap and gate paths are cheap to hit, and drive the durable counter by hand (no archive yet):
 
 ```rust
 #[cfg(test)]
@@ -619,12 +619,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_log buffer`
+Run: `cargo test -p uc_log buffer`
 Expected: COMPILE ERROR.
 
 - [ ] **Step 3: Write the implementation**
 
-`uc2_log/src/buffer.rs` (above tests):
+`uc_log/src/buffer.rs` (above tests):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -871,19 +871,19 @@ impl Appender {
 }
 ```
 
-Add `pub mod buffer;` to `uc2_log/src/lib.rs`.
+Add `pub mod buffer;` to `uc_log/src/lib.rs`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_log buffer`
+Run: `cargo test -p uc_log buffer`
 Expected: 5 passed. (If `wrap_emits_padding_and_slice_stops_at_wrap` fails on the gate, note the test advances `durable` before wrapping — the gate math is `end > durable + capacity`.)
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add uc2_log/src/buffer.rs uc2_log/src/lib.rs
-git commit -m "feat(uc2_log): log buffer — single-writer append, wrap padding, overrun gate, recordable slices"
+cargo clippy -p uc_log -- -D warnings
+git add uc_log/src/buffer.rs uc_log/src/lib.rs
+git commit -m "feat(uc_log): log buffer — single-writer append, wrap padding, overrun gate, recordable slices"
 ```
 
 ---
@@ -891,8 +891,8 @@ git commit -m "feat(uc2_log): log buffer — single-writer append, wrap padding,
 ### Task 4: Validated positional reads + loom model of the commit protocol
 
 **Files:**
-- Modify: `uc2_log/src/buffer.rs` (add `FrameRead`, `LogBuffer::read_frame_validated`)
-- Create: `uc2_log/tests/loom_frame.rs`
+- Modify: `uc_log/src/buffer.rs` (add `FrameRead`, `LogBuffer::read_frame_validated`)
+- Create: `uc_log/tests/loom_frame.rs`
 
 **Interfaces:**
 - Consumes: Task 3's `LogBuffer` internals (`commit_word`, `max_claim`, `offset`, region).
@@ -902,7 +902,7 @@ git commit -m "feat(uc2_log): log buffer — single-writer append, wrap padding,
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the test module in `uc2_log/src/buffer.rs`:
+Append to the test module in `uc_log/src/buffer.rs`:
 
 ```rust
     #[test]
@@ -944,7 +944,7 @@ Append to the test module in `uc2_log/src/buffer.rs`:
     }
 ```
 
-Create `uc2_log/tests/loom_frame.rs` — a loom model of the exact ordering protocol (release commit word + release append counter vs acquire reader). It models the protocol on loom atomics rather than driving the mmap code (loom requires its own atomic types); the model must mirror `buffer.rs` ordering choices — if those change, change this test:
+Create `uc_log/tests/loom_frame.rs` — a loom model of the exact ordering protocol (release commit word + release append counter vs acquire reader). It models the protocol on loom atomics rather than driving the mmap code (loom requires its own atomic types); the model must mirror `buffer.rs` ordering choices — if those change, change this test:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -953,7 +953,7 @@ Create `uc2_log/tests/loom_frame.rs` — a loom model of the exact ordering prot
 //! Loom model of the frame commit protocol (buffer.rs):
 //!   writer: plain payload writes -> Release store of length -> Release store of append
 //!   reader: Acquire load of append -> bounded read -> payload fully visible
-//! Run: RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+//! Run: RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release
 #![cfg(loom)]
 
 use loom::sync::Arc;
@@ -1000,12 +1000,12 @@ fn committed_frame_is_fully_visible_to_append_bounded_reader() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_log buffer`
+Run: `cargo test -p uc_log buffer`
 Expected: COMPILE ERROR (`FrameRead` / `read_frame_validated` not defined).
 
 - [ ] **Step 3: Write the implementation**
 
-Add to `impl LogBuffer` in `uc2_log/src/buffer.rs`:
+Add to `impl LogBuffer` in `uc_log/src/buffer.rs`:
 
 ```rust
     /// Read one frame at `pos` with overwrite validation, for lagging /
@@ -1055,18 +1055,18 @@ pub enum FrameRead {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_log buffer`
+Run: `cargo test -p uc_log buffer`
 Expected: 7 passed.
 
-Run the loom model: `RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release`
+Run the loom model: `RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release`
 Expected: 1 passed (loom explores all interleavings; takes seconds).
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add uc2_log/src/buffer.rs uc2_log/tests/loom_frame.rs
-git commit -m "feat(uc2_log): validated positional reads with overwrite margin + loom model of the commit protocol"
+cargo clippy -p uc_log -- -D warnings
+git add uc_log/src/buffer.rs uc_log/tests/loom_frame.rs
+git commit -m "feat(uc_log): validated positional reads with overwrite margin + loom model of the commit protocol"
 ```
 
 ---
@@ -1074,9 +1074,9 @@ git commit -m "feat(uc2_log): validated positional reads with overwrite margin +
 ### Task 5: mmap-backed `Region` + `LogBuffer` file create/open
 
 **Files:**
-- Modify: `uc2_log/src/region.rs` (add `Backing::Mmap`, `Region::from_mmap`)
-- Modify: `uc2_log/src/buffer.rs` (add `LogBuffer::create_file` / `LogBuffer::open_file`)
-- Create: `uc2_log/tests/buffer_file.rs`
+- Modify: `uc_log/src/region.rs` (add `Backing::Mmap`, `Region::from_mmap`)
+- Modify: `uc_log/src/buffer.rs` (add `LogBuffer::create_file` / `LogBuffer::open_file`)
+- Create: `uc_log/tests/buffer_file.rs`
 
 **Interfaces:**
 - Consumes: Tasks 2–4.
@@ -1087,7 +1087,7 @@ git commit -m "feat(uc2_log): validated positional reads with overwrite margin +
 
 - [ ] **Step 1: Write the failing test**
 
-`uc2_log/tests/buffer_file.rs`:
+`uc_log/tests/buffer_file.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1095,8 +1095,8 @@ git commit -m "feat(uc2_log): validated positional reads with overwrite margin +
 #![cfg(not(loom))]
 
 use std::sync::Arc;
-use uc2_log::buffer::{Appender, FrameRead, LogBuffer};
-use uc2_log::counters::LogCounters;
+use uc_log::buffer::{Appender, FrameRead, LogBuffer};
+use uc_log::counters::LogCounters;
 
 #[test]
 #[cfg_attr(miri, ignore)] // real mmap
@@ -1134,12 +1134,12 @@ fn file_backed_buffer_roundtrip_across_reopen_of_mapping() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p uc2_log --test buffer_file`
+Run: `cargo test -p uc_log --test buffer_file`
 Expected: COMPILE ERROR (`create_file` not defined).
 
 - [ ] **Step 3: Write the implementation**
 
-In `uc2_log/src/region.rs`, extend `Backing` and add the constructor:
+In `uc_log/src/region.rs`, extend `Backing` and add the constructor:
 
 ```rust
 enum Backing {
@@ -1166,7 +1166,7 @@ And in `Drop`, add the arm:
             Backing::Mmap(_) => {} // munmap on MmapMut drop
 ```
 
-In `uc2_log/src/buffer.rs`, add to `impl LogBuffer` (with `use std::path::Path;` at the top):
+In `uc_log/src/buffer.rs`, add to `impl LogBuffer` (with `use std::path::Path;` at the top):
 
 ```rust
     /// Create (or truncate) the buffer file at `capacity` bytes and map it.
@@ -1184,7 +1184,7 @@ In `uc2_log/src/buffer.rs`, add to `impl LogBuffer` (with `use std::path::Path;`
             .open(path)?;
         file.set_len(capacity)?;
         // SAFETY: exclusive logical ownership per the instance-dir contract
-        // (one node per instance dir; instance.lock arrives with uc2_node).
+        // (one node per instance dir; instance.lock arrives with uc_node).
         let m = unsafe { memmap2::MmapMut::map_mut(&file)? };
         Ok(Self::new(Region::from_mmap(m), counters, max_payload))
     }
@@ -1204,34 +1204,34 @@ In `uc2_log/src/buffer.rs`, add to `impl LogBuffer` (with `use std::path::Path;`
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_log`
+Run: `cargo test -p uc_log`
 Expected: all pass (unit + buffer_file).
 
 Best-effort miri over the heap-backed unit tests (mmap/journal tests are `#[cfg_attr(miri, ignore)]` or unit-level heap only):
 
 ```bash
-rustup +nightly component add miri 2>/dev/null && cargo +nightly miri test -p uc2_log --lib || echo "miri unavailable on this box — record as TODO in the task doc"
+rustup +nightly component add miri 2>/dev/null && cargo +nightly miri test -p uc_log --lib || echo "miri unavailable on this box — record as TODO in the task doc"
 ```
 Expected if available: all lib tests pass under miri (raw-pointer buffer code is the point of this run).
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add uc2_log/src/region.rs uc2_log/src/buffer.rs uc2_log/tests/buffer_file.rs
-git commit -m "feat(uc2_log): mmap-backed region + buffer file create/open"
+cargo clippy -p uc_log -- -D warnings
+git add uc_log/src/region.rs uc_log/src/buffer.rs uc_log/tests/buffer_file.rs
+git commit -m "feat(uc_log): mmap-backed region + buffer file create/open"
 ```
 
 ---
 
-### Task 6: `Archive` — block recording into ultima_journal
+### Task 6: `Archive` — block recording into uc_journal
 
 **Files:**
-- Create: `uc2_log/src/archive.rs`
-- Modify: `uc2_log/src/lib.rs` (add `pub mod archive;`)
+- Create: `uc_log/src/archive.rs`
+- Modify: `uc_log/src/lib.rs` (add `pub mod archive;`)
 
 **Interfaces:**
-- Consumes: `LogBuffer::recordable_slice` (Task 3), `LogCounters` (Task 2), `ultima_journal::{Journal, JournalConfig, Durability}`.
+- Consumes: `LogBuffer::recordable_slice` (Task 3), `LogCounters` (Task 2), `uc_journal::{Journal, JournalConfig, Durability}`.
 - Produces (used by Tasks 7–9):
   - `struct ArchiveConfig { pub dir: PathBuf, pub max_block_bytes: usize, pub segment_size_bytes: u64, pub preallocate_segments: bool }` with `ArchiveConfig::new(dir) -> Self` (defaults: 1 MiB blocks, 64 MiB segments, preallocate true)
   - `Archive::open(cfg: ArchiveConfig) -> Result<Archive, ArchiveError>`
@@ -1242,7 +1242,7 @@ git commit -m "feat(uc2_log): mmap-backed region + buffer file create/open"
 
 - [ ] **Step 1: Write the failing tests**
 
-Test module at the bottom of `uc2_log/src/archive.rs`:
+Test module at the bottom of `uc_log/src/archive.rs`:
 
 ```rust
 #[cfg(test)]
@@ -1326,12 +1326,12 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_log archive`
+Run: `cargo test -p uc_log archive`
 Expected: COMPILE ERROR.
 
 - [ ] **Step 3: Write the implementation**
 
-`uc2_log/src/archive.rs` (above tests):
+`uc_log/src/archive.rs` (above tests):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1347,7 +1347,7 @@ Expected: COMPILE ERROR.
 
 use std::path::PathBuf;
 
-use ultima_journal::{Durability, Journal, JournalConfig, JournalError};
+use uc_journal::{Durability, Journal, JournalConfig, JournalError};
 
 use crate::buffer::LogBuffer;
 
@@ -1445,21 +1445,21 @@ impl Archive {
 }
 ```
 
-Add `pub mod archive;` to `uc2_log/src/lib.rs`.
+Add `pub mod archive;` to `uc_log/src/lib.rs`.
 
 Note: `tempfile` is already a dev-dependency (Task 2); journal tests write real files, so keep them out of miri (`--lib` miri runs skip integration; these are unit tests in-module — if miri is being run, they hit real syscalls: add `#[cfg_attr(miri, ignore)]` on all three tests in this module).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_log archive`
+Run: `cargo test -p uc_log archive`
 Expected: 3 passed. (If `Journal::append` rejects seq 0 as the first record, adapt `next_block_seq` recovery to the journal's actual first-seq convention — the test failure will say which; update the test's `read(0)` accordingly and note it in the commit message.)
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add uc2_log/src/archive.rs uc2_log/src/lib.rs
-git commit -m "feat(uc2_log): archive — frame-aligned block recording, fsync per block, durable counter"
+cargo clippy -p uc_log -- -D warnings
+git add uc_log/src/archive.rs uc_log/src/lib.rs
+git commit -m "feat(uc_log): archive — frame-aligned block recording, fsync per block, durable counter"
 ```
 
 ---
@@ -1467,7 +1467,7 @@ git commit -m "feat(uc2_log): archive — frame-aligned block recording, fsync p
 ### Task 7: Archive recovery on reopen + `replay_from`
 
 **Files:**
-- Modify: `uc2_log/src/archive.rs` (add `Replay`, `ReplayFrame`, `Archive::replay_from`; recovery tests)
+- Modify: `uc_log/src/archive.rs` (add `Replay`, `ReplayFrame`, `Archive::replay_from`; recovery tests)
 
 **Interfaces:**
 - Consumes: Task 6's `Archive`.
@@ -1478,7 +1478,7 @@ git commit -m "feat(uc2_log): archive — frame-aligned block recording, fsync p
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the test module in `uc2_log/src/archive.rs`:
+Append to the test module in `uc_log/src/archive.rs`:
 
 ```rust
     #[test]
@@ -1560,12 +1560,12 @@ Append to the test module in `uc2_log/src/archive.rs`:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_log archive`
+Run: `cargo test -p uc_log archive`
 Expected: COMPILE ERROR (`replay_from` not defined).
 
 - [ ] **Step 3: Write the implementation**
 
-Add to `uc2_log/src/archive.rs` (imports: `use uc_protocol::v2::frame::{self, FrameHeader, FRAME_TYPE_PADDING, HEADER_LEN};`):
+Add to `uc_log/src/archive.rs` (imports: `use uc_protocol::v2::frame::{self, FrameHeader, FRAME_TYPE_PADDING, HEADER_LEN};`):
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1675,15 +1675,15 @@ impl Archive {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_log archive`
+Run: `cargo test -p uc_log archive`
 Expected: 5 passed.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add uc2_log/src/archive.rs
-git commit -m "feat(uc2_log): archive recovery on reopen + replay_from with block binary search"
+cargo clippy -p uc_log -- -D warnings
+git add uc_log/src/archive.rs
+git commit -m "feat(uc_log): archive recovery on reopen + replay_from with block binary search"
 ```
 
 ---
@@ -1691,19 +1691,19 @@ git commit -m "feat(uc2_log): archive recovery on reopen + replay_from with bloc
 ### Task 8: `agent` — IdleStrategy + AgentRunner
 
 **Files:**
-- Create: `uc2_log/src/agent.rs`
-- Modify: `uc2_log/src/lib.rs` (add `pub mod agent;`)
+- Create: `uc_log/src/agent.rs`
+- Modify: `uc_log/src/lib.rs` (add `pub mod agent;`)
 
 **Interfaces:**
 - Consumes: nothing crate-internal.
-- Produces (used by Task 9 and, later, `uc2_net`/`uc2_node` — may migrate to a shared crate then):
+- Produces (used by Task 9 and, later, `uc_net`/`uc_node` — may migrate to a shared crate then):
   - `enum IdleStrategy { BusySpin, Yield, Sleep(std::time::Duration) }` with `fn idle(&self)`
   - `AgentRunner::spawn(name: &str, idle: IdleStrategy, work: impl FnMut() -> bool + Send + 'static) -> std::io::Result<AgentRunner>` — loops `work()`, idling per strategy when it returns `false`
   - `AgentRunner::stop(self)` — signals stop, joins the thread (propagates a panic from `work`)
 
 - [ ] **Step 1: Write the failing test**
 
-Test module at the bottom of `uc2_log/src/agent.rs`:
+Test module at the bottom of `uc_log/src/agent.rs`:
 
 ```rust
 #[cfg(test)]
@@ -1733,12 +1733,12 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p uc2_log agent`
+Run: `cargo test -p uc_log agent`
 Expected: COMPILE ERROR.
 
 - [ ] **Step 3: Write the implementation**
 
-`uc2_log/src/agent.rs` (above tests):
+`uc_log/src/agent.rs` (above tests):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1806,19 +1806,19 @@ impl AgentRunner {
 }
 ```
 
-Add `pub mod agent;` to `uc2_log/src/lib.rs`.
+Add `pub mod agent;` to `uc_log/src/lib.rs`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p uc2_log agent`
+Run: `cargo test -p uc_log agent`
 Expected: 1 passed.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_log -- -D warnings
-git add uc2_log/src/agent.rs uc2_log/src/lib.rs
-git commit -m "feat(uc2_log): polling agent runner + idle strategies"
+cargo clippy -p uc_log -- -D warnings
+git add uc_log/src/agent.rs uc_log/src/lib.rs
+git commit -m "feat(uc_log): polling agent runner + idle strategies"
 ```
 
 ---
@@ -1826,7 +1826,7 @@ git commit -m "feat(uc2_log): polling agent runner + idle strategies"
 ### Task 9: `m1_gate` throughput example + gate run + docs
 
 **Files:**
-- Create: `uc2_log/examples/m1_gate.rs`
+- Create: `uc_log/examples/m1_gate.rs`
 - Create: `docs/benchmarks/uc2-m1-gate-2026-07-09.md` (written from the run's output)
 
 **Interfaces:**
@@ -1835,7 +1835,7 @@ git commit -m "feat(uc2_log): polling agent runner + idle strategies"
 
 - [ ] **Step 1: Write the example**
 
-`uc2_log/examples/m1_gate.rs`:
+`uc_log/examples/m1_gate.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1843,7 +1843,7 @@ git commit -m "feat(uc2_log): polling agent runner + idle strategies"
 
 //! M1 gate: solo append+record+fsync throughput (spec §9: >= 1M msgs/s @ 64B).
 //!
-//! Usage: cargo run -p uc2_log --release --example m1_gate -- <journal_dir> \
+//! Usage: cargo run -p uc_log --release --example m1_gate -- <journal_dir> \
 //!            [secs=10] [payload=64] [buffer_mib=512] [buffer_path=/dev/shm/uc2-m1-gate.buf]
 //!
 //! Layout mirrors deployment: buffer file on tmpfs (/dev/shm — no writeback
@@ -1855,10 +1855,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use uc2_log::agent::{AgentRunner, IdleStrategy};
-use uc2_log::archive::{Archive, ArchiveConfig};
-use uc2_log::buffer::{Appender, AppendError, LogBuffer};
-use uc2_log::counters::LogCounters;
+use uc_log::agent::{AgentRunner, IdleStrategy};
+use uc_log::archive::{Archive, ArchiveConfig};
+use uc_log::buffer::{Appender, AppendError, LogBuffer};
+use uc_log::counters::LogCounters;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -1955,15 +1955,15 @@ fn main() {
 - [ ] **Step 2: Build and smoke-run it (short)**
 
 ```bash
-cargo build --release -p uc2_log --example m1_gate
-rm -rf /tmp/uc2-m1-smoke && cargo run --release -p uc2_log --example m1_gate -- /tmp/uc2-m1-smoke 3
+cargo build --release -p uc_log --example m1_gate
+rm -rf /tmp/uc2-m1-smoke && cargo run --release -p uc_log --example m1_gate -- /tmp/uc2-m1-smoke 3
 ```
 Expected: runs 3 s, prints the report, no panics, `durable_lag` bounded (not growing monotonically), overrun stalls small or zero.
 
 - [ ] **Step 3: Run the gate (10 s, journal on the fastest local disk)**
 
 ```bash
-rm -rf /tmp/uc2-m1-gate && cargo run --release -p uc2_log --example m1_gate -- /tmp/uc2-m1-gate 10
+rm -rf /tmp/uc2-m1-gate && cargo run --release -p uc_log --example m1_gate -- /tmp/uc2-m1-gate 10
 ```
 Record the full output. The official gate hardware is a c6id NVMe box (fleet validation is a follow-up with the user — bench-infra has no solo-node role yet); on the local dev box, record whatever it does and compare against the journal's known standalone rates. If the local rate is far below 1 M/s, check `avg block KiB` first: healthy structural batching should show blocks growing with load and fsyncs/s in the hundreds-to-low-thousands, not per-message.
 
@@ -1976,10 +1976,10 @@ Create `docs/benchmarks/uc2-m1-gate-2026-07-09.md` with: the exact command, host
 ```bash
 cargo fmt --check
 cargo clippy --workspace -- -D warnings
-cargo test -p uc2_log
+cargo test -p uc_log
 cargo test -p uc_protocol
-git add uc2_log/examples/m1_gate.rs docs/benchmarks/uc2-m1-gate-2026-07-09.md
-git commit -m "feat(uc2_log): m1_gate throughput example + gate measurement doc"
+git add uc_log/examples/m1_gate.rs docs/benchmarks/uc2-m1-gate-2026-07-09.md
+git commit -m "feat(uc_log): m1_gate throughput example + gate measurement doc"
 ```
 
 ---

@@ -1,5 +1,109 @@
 # ultima_cluster releases
 
+## v2.9.0 — <tag date> — the `uc_*` crate rename
+<!-- tag date: fill at tag time -->
+
+**Mechanical. No behaviour change, no wire or cnc change, no binary rename.**
+Every package took a uniform `uc_` prefix, and every crate directory was
+renamed with it. The user-facing writeup, with the migration `sed` and the
+old→new table, is the `2.9.0` section of `RELEASES.md`; this entry is the
+engineering record of how it was done and what proves it.
+
+### What moved, and what deliberately did not
+
+Renamed (package **and** directory): `uc2_log`→`uc_log`, `uc2_net`→`uc_net`,
+`uc2_crypto`→`uc_crypto`, `uc2_consensus`→`uc_consensus`, `uc2_node`→`uc_node`,
+`uc2_service`→`uc_service`, `uc2_client`→`uc_client`, `uc2_remote`→`uc_remote`,
+`uc2_gateway`→`uc_gateway`, `uc2ctl`→`uc_ctl`, `ultima_journal`(package
+`ultima-journal`)→`uc_journal`, plus the unpublished `uc2_sim`→`uc_sim`,
+`uc-lincheck`→`uc_lincheck`, `uc2-crashtest`→`uc_crashtest` and the
+out-of-workspace `uc2-fuzz`→`uc_fuzz`. `uc_protocol` already conformed.
+
+Deliberately **not** renamed, because they are operator-facing contracts rather
+than package names:
+
+- the three binaries `uc2-node`, `uc2ctl`, `uc2-gateway` — and therefore the
+  systemd units, the `ghcr.io/peterknego/uc2` image, `compose.yml`'s
+  healthchecks and every runbook command. `uc_ctl/Cargo.toml` gained an
+  explicit `[[bin]] name = "uc2ctl"` block: its binary had been named
+  implicitly from the package (`src/main.rs`), so without the pin the package
+  rename would have silently renamed the CLI.
+- every `/metrics` name (`uc2_is_leader`, `uc2_fsm_lag_bytes`,
+  `uc2_free_disk_bytes`, …) — none contains a crate token, so the rename could
+  not have reached them; dashboards and `uc2-alerts.yml` are unchanged.
+- the agent thread names (`uc2-consensus`, `uc2-apply`, `uc2-sender`,
+  `uc2-receiver`, `uc2-archive`), visible in `ps`/`perf` output, and
+  `scripts/uc2_flag_day.sh`.
+- doc filenames (`docs/ops/uc2-runbook.md`, the `uc2-m*-gate-*.md` records,
+  `docs/reference/uc2ctl.md` — which documents the binary).
+
+### How it was executed
+
+1. `git mv` for all 14 directories, so history follows by rename detection.
+2. One `sed` pass over the 376 tracked files matching any old crate token,
+   applied to the 15 unambiguous identifiers.
+3. `uc2ctl` was handled separately, because the string is *both* a package name
+   and the binary name: only `-p uc2ctl`, the `uc2ctl/` path prefix, the
+   workspace `members` entry, and the package arg of the two `(pkg, bin)`
+   helper call sites (`cargo_bin`, `build_bin`) were rewritten.
+4. `fuzz/` (outside the workspace, own lockfile) followed: its 15 target names
+   contain crate tokens, so `fuzz_targets/*.rs` and the matching
+   `fuzz/corpus/<target>/` directories were `git mv`'d to keep the committed
+   seed corpora attached to their targets.
+5. `CLAUDE.md`'s standing ban on the names `uc_node`/`uc_service`/`uc_client`
+   — they were v1's — was rewritten to record that the ban is lifted and that a
+   pre-rename commit naming them means the deleted v1 crate.
+
+### Why a minor and not a major
+
+`docs/reference/semver-policy.md` says a promised item changing incompatibly
+means `3.0.0`, and every promised path moved
+(`uc2_service::traits::RawStateMachine` → `uc_service::traits::…`). The
+exception was granted on one fact: the §6 crates.io publish had **never been
+run**, so no resolver could hold the old names and no lockfile could break; the
+wire, cnc page, on-disk layout and binaries were untouched. That fact expired
+the moment `2.9.0` was published, and the policy now says so in a dedicated
+section — any later rename of a promised path is a `3.0.0`.
+
+### Verification
+
+A rename either compiles or it does not, so the evidence is the whole local
+stack at `2.9.0`, plus the checks that a `sed` can silently break — packaging,
+the fuzz corpora, and the docs' links.
+
+- `cargo build --workspace` → exit 0; `cargo clippy --workspace --all-targets
+  -- -D warnings` → exit 0.
+- `cargo test --workspace` → **exit 0, 1 436 passed / 0 failed across 102 test
+  binaries** (`~/uc-rename-verify/test-2.9.0.log`).
+- `scripts/check_publish_metadata.sh` → `ok: publish metadata (keywords,
+  categories) within crates.io limits`.
+- `cargo publish --workspace --dry-run` → exit 0, all 12 crates verified and
+  ordered by cargo itself: `uc_consensus, uc_journal, uc_protocol, uc_remote,
+  uc_crypto, uc_log, uc_net, uc_client, uc_node, uc_ctl, uc_service,
+  uc_gateway`, each at `v2.9.0`. (Run with `--allow-dirty` because the rename
+  was still uncommitted; `cargo publish` otherwise refuses a dirty tree.)
+- Fuzz: `RUSTFLAGS="--cfg fuzzing" cargo +nightly check --all-targets` in
+  `fuzz/` → exit 0 with all 15 targets resolving, and
+  `cargo +nightly fuzz run uc_crypto_open -- -max_total_time=10` → exit 0,
+  `2 595 640 runs`, `corp: 19/5680b` — the 19 seeds prove the renamed target
+  found its moved `fuzz/corpus/uc_crypto_open/`. (A plain `cargo check` in
+  `fuzz/` fails on `route_raw`/`ObsSources::for_tests`, which are
+  `cfg(any(test, fuzzing))`; that is the wrong command, not a defect.)
+- `git grep` for every pre-rename token — `uc2_log`, `uc2_net`, `uc2_crypto`,
+  `uc2_consensus`, `uc2_node`, `uc2_service`, `uc2_client`, `uc2_remote`,
+  `uc2_gateway`, `uc2_sim`, `ultima_journal`, `ultima-journal`, `uc-lincheck`,
+  `uc2-crashtest`, `uc2-fuzz` — returns nothing.
+- Links: all 173 tracked `.md` files scanned for repo-relative targets;
+  **0 broken links point into a renamed crate directory**. 44 broken links
+  exist, all inside `docs/superpowers/plans/`, and all resolve identically
+  badly at the `v2.8.1` tag — pre-existing, untouched.
+
+Not run locally, and left to CI: the MSRV job (1.89 clippy), `cargo-deny`, the
+`ultima_db`-feature and `apply-profile` clippy arms, the hard-crash suite, elle
+and the Lean tiers. Nothing in this release changes what any of them execute —
+only the `-p` names they are invoked with, which `ci.yml` and `release.yml`
+carry.
+
 ## v2.8.1 — 2026-08-30 — M14c2: the multi-service proof pass
 
 **Proof only. No feature, no configuration change, no wire or cnc change —
@@ -22,12 +126,12 @@ writeup.
 
 ### The harness (T1, T2 — `85d4cf1`, `862b9d4`)
 
-- **`ServicesConfig::from_cli(Option<&str>, Option<&str>)`** (`uc2_node/src/services.rs`)
+- **`ServicesConfig::from_cli(Option<&str>, Option<&str>)`** (`uc_node/src/services.rs`)
   is now the one parser behind `--services` / `--fsm-lag`; `m12_gate` and the
   crashtest node bin both take it, so a test process declares FSMs exactly the
   way `uc2-node` does.
-- **`FsmSet::{Single, Two { lag }}`** in `uc2_node/tests/lincheck_v2/mod.rs`
-  starts a second `uc2_service` per node, plus `Slow<SM, MICROS>` (a wrapper
+- **`FsmSet::{Single, Two { lag }}`** in `uc_node/tests/lincheck_v2/mod.rs`
+  starts a second `uc_service` per node, plus `Slow<SM, MICROS>` (a wrapper
   that sleeps `MICROS` per apply), `Corrupt<SM>` (used only to make an oracle
   fail), `submit_all_cmd` (one submit, both answers, recorded into two
   histories) and `read_leader_on(id, …)`. `ClusterCfg` gained
@@ -39,12 +143,12 @@ writeup.
 ### The capstones (T3–T5 — `2ea78d2`, `24bff5b`, `02896a4`, `a71d89e`)
 
 Every two-FSM capstone asserts **per-FSM linearizability** with the untouched
-`uc-lincheck` WGL checker *plus* the **replication-equivalence oracle**: each
+`uc_lincheck` WGL checker *plus* the **replication-equivalence oracle**: each
 `submit_all`'s per-FSM answers must be byte-equal, an unequal pair is counted
 and recorded as `Indeterminate` in *both* histories rather than resolved from
 FSM 0, and `equiv == 0` is asserted before any checker verdict is read.
 
-- `two_fsm_bounded` / `two_fsm_lockstep` (`uc2_node/tests/lin_v2.rs`) — the M6
+- `two_fsm_bounded` / `two_fsm_lockstep` (`uc_node/tests/lin_v2.rs`) — the M6
   fault set (leader kills, service crashes, purge/snapshot churn) at
   `FsmLag::Bounded(64 KiB)` and `FsmLag::Lockstep`. Green at two seeds each
   (~7 s per run); the file's whole suite ran 13/13 in 178 s
@@ -73,7 +177,7 @@ FSM 0, and `equiv == 0` is asserted before any checker verdict is read.
   progress, not of the barrier's behaviour at the bound. Earlier wording here
   ("the fast FSM tracks the slow one … rather than sitting at the bound")
   claimed a pacing mechanism the run had not measured.
-- `minority_partition_and_heal_two_fsm` (`uc2_node/tests/lin_partition_v2.rs`)
+- `minority_partition_and_heal_two_fsm` (`uc_node/tests/lin_partition_v2.rs`)
   — `Run` gained `h1`/`equiv` and a `start_cfg_two_fsm`/`finish_two` sibling
   pair; `run_minority` takes a `two_fsm` flag whose `false` arm is the
   pre-existing code moved verbatim into an `else`. Measured
@@ -84,7 +188,7 @@ FSM 0, and `equiv == 0` is asserted before any checker verdict is read.
 
 `two_fsm_service_sigkill` (FSM 1's process killed and respawned mid-load) and
 `two_fsm_node_sigkill` (node + both services killed, node respawned, both
-services reattached), in `examples/uc2-crashtest/tests/hard_crash.rs`, over
+services reattached), in `examples/uc_crashtest/tests/hard_crash.rs`, over
 `spawn_service_id` / `spawn_node_with_services` in that crate's
 `tests/common/mod.rs`. Both FSM histories linearizable and `equiv == 0` across
 6 kill cycles; two seeds × two runs each plus the default seed; the whole
@@ -92,7 +196,7 @@ services reattached), in `examples/uc2-crashtest/tests/hard_crash.rs`, over
 
 ### Elle (T7 — `11d4ecc`)
 
-`elle_quiet_two_fsm` (`uc2_node/tests/elle_v2.rs`) records **one list-append
+`elle_quiet_two_fsm` (`uc_node/tests/elle_v2.rs`) records **one list-append
 history per FSM**; `scripts/elle_check.sh` learned the per-FSM shape (its
 generation trigger and verdict loop both handle `<pass>/fsm*/history.edn`) and
 its default pass list is now **six**. Measured at `ELLE_TARGET_OPS=8000`:
@@ -157,7 +261,7 @@ assumption until it does.
 
 ### The M14c deferrals (T10a — `69856d2`, `21ab79a`)
 
-In `uc2_net`, all with red-first evidence (the report records a
+In `uc_net`, all with red-first evidence (the report records a
 behavioural-red round in which each fix was re-disabled individually):
 
 - **Sender**: `snap_open_failed` counts the `File::open` TOCTOU refusal that
@@ -190,7 +294,7 @@ behavioural-red round in which each fix was re-disabled individually):
 
 ### The M14c deferrals (T10b — `14ffb4e`, `3c5f962`)
 
-- **Ruling K, `uc2_service_lag_waits_total` undercounted to zero.** `lag::plan`
+- **Ruling K, `uc_service_lag_waits_total` undercounted to zero.** `lag::plan`
   returns `Wait` only when the cap is at or below the cursor; a byte bound
   rarely divides the frame stream, so the common pinned state is a cap *inside*
   the next frame — `Apply { target: cap }`, a zero-frame batch, no cursor
@@ -222,7 +326,7 @@ behavioural-red round in which each fix was re-disabled individually):
 
 ### The snapshot-restart pin (T11 — `5727a36`, `e5cc299`)
 
-`snapshot_restart_installs_only_with_purge` (`uc2_node/tests/lin_v2.rs`) pins
+`snapshot_restart_installs_only_with_purge` (`uc_node/tests/lin_v2.rs`) pins
 the fact that cost the M14 gate its row-d run 1: a `SnapshotPolicy` shortens a
 service restart **only together with purge, and only once the live log buffer
 has wrapped past `start_pos`** — below the wrap the fresh service reads the
@@ -246,7 +350,7 @@ refutes the brief's premise:
    re-NAKs below the floor until its floor adoption sticks, so the leader opens
    **3** sessions, not 1 — measured, stable over 3 runs. The exact claim is
    pinned where it belongs, at the seam:
-   `uc2_net/tests/snapshot_session.rs::a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss`.
+   `uc_net/tests/snapshot_session.rs::a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss`.
    *Newly measured, not previously recorded: three full re-transfers of every
    artifact on every fresh below-floor join. Correctness-neutral, worth a look.*
 3. **"Two words `service_mins` just loaded" was one word** (T10b), and it is
@@ -256,7 +360,7 @@ refutes the brief's premise:
    writes a resolved bound whether or not it declares FSMs.
 5. **The receiver has no injectable clock in the integration test binary**
    (T10a), so the timeout and cadence tests live in `receiver.rs`'s unit module
-   driving the real `snap_upkeep(now)`; `uc2_net/tests/snapshot_session.rs` is
+   driving the real `snap_upkeep(now)`; `uc_net/tests/snapshot_session.rs` is
    unchanged.
 6. **3000 writes never wrap a 4 MiB ring** (T11), so the brief's literal test
    body could never reach `install_snapshot` in either arm. Fixed by shrinking
@@ -316,19 +420,19 @@ refutes the brief's premise:
 Every line below is quoted from the task reports of the commits above; none is
 a fleet measurement, and `2.8.1` claims no rate.
 
-- `cargo test -p uc2_node --test lin_v2` → `13 passed; 0 failed … 178.46s` at
+- `cargo test -p uc_node --test lin_v2` → `13 passed; 0 failed … 178.46s` at
   the T4 tree (task-4); the 14th test
   (`snapshot_restart_installs_only_with_purge`, T11) landed later and ran
   alone → `1 passed … 31.61s` (task-11). The whole file at the final fix
   wave's HEAD, inside the workspace run: `14 passed; 0 failed … 212.84s`.
   `--test lin_partition_v2` → `8 passed; 0 failed … 59.42s` (task-5).
-- `cargo test -p uc2-crashtest --features hard-crash-tests --test hard_crash` →
+- `cargo test -p uc_crashtest --features hard-crash-tests --test hard_crash` →
   `6 passed; 0 failed … 9.62s` (task-6).
 - Elle: `OK: quiet_two_fsm/fsm0 clean under serializable` /
   `strong-serializable` and the same two lines for `fsm1`;
   `elle consistency check passed (quiet_two_fsm, crypto=0)` (task-7).
 - `cargo test --workspace` → **1435 passed, 0 failed**, 2 ignored, across 102
-  suites (task-10b, on the final T10b tree); `cargo test -p uc2_net -p uc2_node`
+  suites (task-10b, on the final T10b tree); `cargo test -p uc_net -p uc_node`
   → 29 `test result: ok` lines, 0 failed (task-10a).
 - `cargo clippy --workspace --all-targets -- -D warnings` → clean (task-10a,
   task-10b, and again at the version bump).
@@ -337,7 +441,7 @@ a fleet measurement, and `2.8.1` claims no rate.
 - `python3 bench-infra/scripts/m14_fleet_gate.py --selftest` → 47 checks,
   `selftest: PASS` (task-9).
 - Release-mechanics checks at the bump:
-  `cargo metadata … uc2_node … .version` → `2.8.1`; `cargo build --workspace`
+  `cargo metadata … uc_node … .version` → `2.8.1`; `cargo build --workspace`
   → exit 0; `cargo package -p uc_protocol --allow-dirty --no-verify` →
   `Packaged 25 files, 363.6KiB`.
 - `cargo fmt` was not run — the project-wide deferral is unchanged.
@@ -347,7 +451,7 @@ a fleet measurement, and `2.8.1` claims no rate.
 **No workflow matrix change was needed.** `capstones` runs
 `cargo test --workspace`, which picks up `lin_v2`'s `two_fsm_*` and
 `lin_partition_v2`'s two-FSM scenario; `crashtest` runs
-`cargo test -p uc2-crashtest --features hard-crash-tests`, which picks up both
+`cargo test -p uc_crashtest --features hard-crash-tests`, which picks up both
 new SIGKILL scenarios; `elle` and `elle-crypto` both run
 `scripts/elle_check.sh` with no arguments, whose default pass list now includes
 `quiet_two_fsm`. Only the stale "5 passes" comments and step names in
@@ -416,7 +520,7 @@ and the log frame header is untouched (spec §6.3).
   writer each: `status` (`service_id | attached | incarnation`), `applied`,
   `epoch`, `output_completed`, `snapshot_pos`, `heartbeat_ns`, `lag_waits`,
   and line 7 reserved. Offsets pinned in **both** `uc_protocol::v2::cnc` and
-  `uc2_log::cnc` with the const-asserts and tests the `PeerSlots` band has.
+  `uc_log::cnc` with the const-asserts and tests the `PeerSlots` band has.
 - **Page 1's singular fields become node-written aggregates** (spec §3.2):
   `service_applied` (512), `output_completed` (640), `service_heartbeat_ns`
   (960) and `service_snapshot_pos` (1152) are now the **min over declared
@@ -457,13 +561,13 @@ and the log frame header is untouched (spec §6.3).
   fsm_lag_eff)`, attested with `term_map.term_at(ceiling − 1)`, stored term
   first then position, both `Release` — the 0.5.0 content-attestation
   ordering, unchanged, and `ceiling ≤ validated_up_to` always, so a node never
-  attests content it has not validated. The receiver in `uc2_net` is
+  attests content it has not validated. The receiver in `uc_net` is
   untouched. Consequence: if a **commit quorum's** FSMs fall more than
   `fsm_lag` behind, the leader's `CommitTracker` cannot advance and its
   admission door closes — cluster-wide back-pressure; a lagging **minority**
   does not stall the cluster, it falls to journal replay and rejoins.
 - **Per-id everything** (spec §4.4, §5.5, §7.5): `service.<id>.lock` held for
-  the service's life (`uc2_service/src/attach.rs:95`), `snapshots/<id>/`,
+  the service's life (`uc_service/src/attach.rs:95`), `snapshots/<id>/`,
   `state/output_progress.<id>.state`, and, created by the node,
   `svc_query.<id>.ring` + `egress_service.<id>.broadcast` per declared id. The
   legacy singular ring names are **not** created. M11's offline
@@ -493,7 +597,7 @@ and the log frame header is untouched (spec §6.3).
   `expected = 0b1` and would have completed as a single response. Completion
   is `received == expected` or a ring-less terminal, whichever comes first;
   exactly-once still rests on the single owner CAS, not on `received`
-  (`uc2_client/src/slots.rs` module invariants 7 and 8).
+  (`uc_client/src/slots.rs` module invariants 7 and 8).
 - **The fan-in buffer is `PollHalf`-owned**, one entry per slot index, and
   resets on a generation's **first** piece rather than on a sequence change —
   execution Ruling E: a partial fan-in abandoned by a ring-less terminal or
@@ -508,7 +612,7 @@ and the log frame header is untouched (spec §6.3).
   page and opens one egress consumer per declared id; `poll` round-robins
   them ascending, then the node ring.
 - **Sim invariant 10** (M14b plan Task 7): the four inline `Msg::Report` sites
-  in `uc2_sim`'s `world.rs` are funnelled through `send_report`, which clamps
+  in `uc_sim`'s `world.rs` are funnelled through `send_report`, which clamps
   to the node's `apply_ceiling` — the sim's model of "the slowest FSM's
   applied position + `fsm_lag`" — and runs inv10, which catches a report above
   its unclamped value, above its ceiling, or decreasing without a reset
@@ -575,8 +679,8 @@ and the log frame header is untouched (spec §6.3).
 - **Per-FSM observability** (spec §14.4). Labelled twins via the existing
   `push_labeled` (`service="<id>"`) — the peer-slot band's mechanism, not a
   new one; the unlabeled aggregates keep their names and now mean "slowest
-  FSM". New families: `uc2_service_attached`, `uc2_service_lag_bytes`,
-  `uc2_service_lag_waits_total`, `uc2_services_declared`, `uc2_fsm_lag_bytes`
+  FSM". New families: `uc_service_attached`, `uc_service_lag_bytes`,
+  `uc_service_lag_waits_total`, `uc_services_declared`, `uc2_fsm_lag_bytes`
   (0 = lockstep) — all in `CONTRACT_SERIES`, so the presence test and the
   `m10_gate` live scrape cover them. Two alert rules with `m10_alerts`
   scenarios that prove them firing: `Uc2ServiceAbsent` and
@@ -585,15 +689,15 @@ and the log frame header is untouched (spec §6.3).
   already opens, and `service_attached` / `service_detached` land as
   transition records.
 - **A documented limitation, not a fix** (execution Ruling K):
-  `uc2_service_lag_waits_total` reads **0 while an FSM is parked at the
+  `uc_service_lag_waits_total` reads **0 while an FSM is parked at the
   bounded barrier** — M14a's known undercount, surfaced now that the counter
-  is exported. The writer is in `uc2_service`, which M14c does not touch; the
+  is exported. The writer is in `uc_service`, which M14c does not touch; the
   limitation is written into `monitor-a-cluster.md` and `diagnose-a-node.md`,
   the alert keys on `lag_bytes` instead, and the service-side fix is M14c2.
 - **Fixed on the transfer plane**: a `SNAP_BEGIN` resend no longer refreshes
   the session's activity clock (a dead peer would have pinned the session
   slot), and a `SNAP_NAK` that is unservable forever no longer keeps a dead
-  session alive (`uc2_net/src/sender.rs`'s
+  session alive (`uc_net/src/sender.rs`'s
   `an_unservable_snap_nak_does_not_keep_a_dead_session_alive`); snapshot
   intake I/O failures are retried and counted
   (`uc2_snapshot_intake_io_failures_total`).
@@ -601,7 +705,7 @@ and the log frame header is untouched (spec §6.3).
   `74f16bc`): `cargo test --workspace` 1 411 passed / 0 failed (102
   binaries) at `74f16bc` (`2ef480d` read 1 407, before the fix wave);
   `lin_v2` 7/7 and `lin_partition_v2` 7/7 Linearizable;
-  `uc2-crashtest --features hard-crash-tests` green; sim-heavy 38/38;
+  `uc_crashtest --features hard-crash-tests` green; sim-heavy 38/38;
   `m10_gate coverage` 72/72; fuzz `uc_protocol_datagram` 51 019 361 runs
   clean. All single-FSM capstones — see *Deferred* for what two FSMs still
   lack.
@@ -662,7 +766,7 @@ touched.
 snapshot policy** (`service_args(h, 1, K, 0)`), so the fresh in-memory SM
 rebuilds by replaying the *whole* journal — ~11.9 M commands, roughly 1.3 GB —
 where a service configured with a `SnapshotPolicy` would install an artifact
-and tail-replay one interval. Meanwhile `uc2_service`'s replay path
+and tail-replay one interval. Meanwhile `uc_service`'s replay path
 deliberately **suppresses leader-publish** (`replay.rs:44-46`: those responses
 were already answered by the previous incarnation), so the client's up-to-4 096
 in-flight *fan-in* requests — each of which completes only when **every**
@@ -686,7 +790,7 @@ the re-specification: the row-d arm now runs a 32 MiB snapshot policy on both
 FSMs **together with purge below the snapshot floor** — a `SnapshotPolicy`
 shortens a service restart only with purge, because reconstruction installs the
 newest artifact only when the journal no longer covers the start position
-(`uc2_service/src/replay.rs:73-78`), so with purge off the restart replays the
+(`uc_service/src/replay.rs:73-78`), so with purge off the restart replays the
 whole journal however often it snapshots — and the measuring client submits to
 **FSM 0 only** rather than fan-in (so the rate clause reads the bounded lag
 barrier releasing, not the client's 30 s request timeout). **The ≤ 15 s bar is
@@ -714,8 +818,8 @@ its same-source rebuild control).
 - **M14c2 — the two-FSM proof tier, a proof-only `2.8.1`** (spec §15.1, a
   2026-08-29 ruling that reversed §14.1's order). `2.8.0` ships multi-service
   with the coverage VERIFICATION §11 states — unit tests, in-process
-  integration on one node and a 3-node cluster (`uc2_node/tests/services.rs`,
-  `learner.rs`'s two-FSM join, `uc2_net/tests/snapshot_session.rs`'s
+  integration on one node and a 3-node cluster (`uc_node/tests/services.rs`,
+  `learner.rs`'s two-FSM join, `uc_net/tests/snapshot_session.rs`'s
   two-artifact stream), the M14b sim scenario, and the fuzz seeds — and says
   so. What M14c2 adds: `lin_v2 two_fsm` (lockstep, bounded, a slow-FSM
   oracle), `lin_partition_v2` with two FSMs, the two hard-crash scenarios, and
@@ -744,22 +848,22 @@ API docs.
    **wire** payload, and a query now carries its one-byte service id, so a
    query body of exactly `max_payload` bytes fails with
    `PayloadTooLarge { len: n + 1, max: n }` — deviation 6, documented at
-   `uc2_client/src/engine.rs:429-436` (and the inherited-cap rationale at
+   `uc_client/src/engine.rs:429-436` (and the inherited-cap rationale at
    `engine.rs:74-84`).
 2. **A parked driver is woken only by FSM 0's ring.** `PollHalf::wait_handle`
    returns ONE futex — the lowest declared id's egress broadcast — so a
    completion that lands solely on another FSM's ring resolves at the park
    timeout (≤ 1 ms in the pipelined driver) rather than at the publish;
-   deviation 3, documented at `uc2_client/src/engine.rs:680-690`. The gateway
+   deviation 3, documented at `uc_client/src/engine.rs:680-690`. The gateway
    only ever issues FSM-0 requests, so its driver is unaffected.
 3. **`submit_all` against a declared-but-unattached FSM times out every
    fan-in.** `try_submit_all` sets `expected` to the page's *declared* set
-   (`uc2_client/src/engine.rs:506-509`) and completion is `received ==
-   expected` (`uc2_client/src/slots.rs`, module invariant 7), so an id that is
+   (`uc_client/src/engine.rs:506-509`) and completion is `received ==
+   expected` (`uc_client/src/slots.rs`, module invariant 7), so an id that is
    declared but has no process attached never contributes its piece and every
    fan-in resolves via the engine's deadline sweep as `Outcome::TimedOut` —
    the only way a `Timeout` can reach a ticket at all
-   (`uc2_client/src/ticket.rs:179-184`). Wait for every declared FSM to attach
+   (`uc_client/src/ticket.rs:179-184`). Wait for every declared FSM to attach
    before fanning in.
 
 ## v2.7.0 — 2026-08-26 — M13 remote path: performance and flow control
@@ -779,7 +883,7 @@ remote wire protocol stays v1, with two clarifications to its reference (a
 `STATUS` MAY be sent at any time) that describe behaviour the client already
 had.
 
-### The client (`uc2_remote`)
+### The client (`uc_remote`)
 
 `RemoteEngine::connect` returns `(RemoteSendHalf, RemotePollHalf)`; the old
 single-lock `RemoteClient` is now a thin blocking layer over them. Each
@@ -819,12 +923,12 @@ reproduces the old convoy's trigger. The ring magic is bumped (`ULTRNG2`), so
 a same-host restart re-initialises the ring rather than reading an old-format
 buffer.
 
-### The edge budget (`uc2_gateway`)
+### The edge budget (`uc_gateway`)
 
 `Shared` carries `budget = max_inflight − max_inflight / 8` and a `live`
 count of handshaken connections; a connection's grant is
 `clamp(budget / live, 1, per_conn_inflight)`, exported as
-`uc2_gateway::budget_for` / `uc2_gateway::grant_for`. `Conn` gains a dynamic
+`uc_gateway::budget_for` / `uc_gateway::grant_for`. `Conn` gains a dynamic
 `ceiling` that `relax` climbs towards, so a connection that relaxes after a
 backpressure episode cannot climb past the share its neighbours leave it.
 
@@ -915,18 +1019,18 @@ one cnc change is M12b's 64-byte admin-auth line at `CNC_OFF_ADMIN_AUTH =
   hardware at a 509 B payload — typed `sm_apply` 1173 ns/frame (87.7 % of the
   apply cycle) vs raw 14 ns (8.0 %), ~84×.
   Byte-identity with `v2.5.0` is asserted, not assumed
-  (`uc2_service/tests/raw_contract.rs`). A cheaper intermediate exists and is
+  (`uc_service/tests/raw_contract.rs`). A cheaper intermediate exists and is
   documented: typing a blob field as `bytes::Bytes`/`serde_bytes` gives the
   identical wire at 1.2–1.9× raw.
 - **`Sessioned<S>`** — a 16-byte `client_id ++ seq` envelope, a one-byte
   FRESH/REPLAYED/EXPIRED tag, an LRU dedup table that rides snapshots, and a
   replicated `SessionConfig` that `install_snapshot` refuses to silently
   retune.
-- **`uc2_remote` protocol v1 and `RemoteClient`** — framed TCP, per-connection
+- **`uc_remote` protocol v1 and `RemoteClient`** — framed TCP, per-connection
   credits, `REDIRECT`/`LEADER_CHANGED`/`RETRY`/`UNKNOWN`, pipelined submit and
   query, ordered re-send after failover.
-- **`uc2_gateway::Edge` + the `uc2-gateway` binary + `gateway.toml`** — a
-  per-node TCP front door over `uc2_client::Engine`, static `node_id → address`
+- **`uc_gateway::Edge` + the `uc2-gateway` binary + `gateway.toml`** — a
+  per-node TCP front door over `uc_client::Engine`, static `node_id → address`
   member map (Aeron's `ingressEndpoints` shape), leader watch off the cnc page.
 
 **Rulings and mechanisms worth remembering.**
@@ -966,7 +1070,7 @@ one cnc change is M12b's 64-byte admin-auth line at `CNC_OFF_ADMIN_AUTH =
 - **Signed admin requests.** `HMAC-SHA256` over
   `len(app_id) ‖ app_id ‖ instance_id ‖ seq ‖ nonce ‖ op ‖ id ‖ ip ‖ port ‖
   expiry_ns`, every integer little-endian, under a named 32-byte key
-  (`uc2_crypto::admin`). New reason codes 20 `auth_missing`, 21 `auth_bad_tag`,
+  (`uc_crypto::admin`). New reason codes 20 `auth_missing`, 21 `auth_bad_tag`,
   22 `auth_expired`, 23 `auth_unknown_key`, 24 `audit_failed`. `uc2ctl` gains
   `--admin-key`/`--admin-key-name`/`--admin-ttl-secs` on every mutating verb,
   plus `gen-admin-key` and offline `audit`.
@@ -1008,7 +1112,7 @@ into `CNC_OFF_INSTANCE_LO/HI`, re-present the captured lines, and have the
 change applied a second time — which also falsified the restart half of the
 no-replay-ring argument above. The binding now comes from
 `Consensus::admin_instance_id`/`admin_app_id`, set once in `Node::start_with`.
-Pinned by `uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`,
+Pinned by `uc_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`,
 with anti-vacuity confirmed: reverting the binding makes that replay verify and
 reach `propose_config`.
 
@@ -1030,7 +1134,7 @@ flood of *fresh* nonces from a member still costs one `fsync` each.
   "1.89"` (probed to `File::try_lock_exclusive`, not guessed) with the pinned
   stable at 1.96.0, and `docs/reference/semver-policy.md`.
 - **Supply chain.** `deny.toml` plus two `cargo-deny` passes (default graph and
-  `--all-features`, so `uc2_service`'s non-default `ultima_db` adapter is
+  `--all-features`, so `uc_service`'s non-default `ultima_db` adapter is
   actually resolved), a CycloneDX SBOM, and CI `deny` / `publish-check` / `msrv`
   jobs. Dropping `snow`'s `std` feature removed `ring` and made the spec's
   "exactly one AES-GCM implementation in the graph" rule true. Dead workspace
@@ -1051,10 +1155,10 @@ flood of *fresh* nonces from a member still costs one `fsync` each.
   `cargo package --no-verify` over **all 12** crates in one invocation (which
   is what forces every path dep to carry a resolvable `version =`), but the
   per-crate `--dry-run` covers only the **4 dependency-free leaves**
-  (`ultima-journal`, `uc_protocol`, `uc2_remote`, `uc2_consensus`). A non-leaf
+  (`uc_journal`, `uc_protocol`, `uc_remote`, `uc_consensus`). A non-leaf
   crate's dry run cannot pass before the first publish — its path deps must
   resolve against the real registry — and this is not only a bootstrap gap:
-  `uc2_node`'s dev-dependency on `uc2_service` is a genuine dev-only cycle no
+  `uc_node`'s dev-dependency on `uc_service` is a genuine dev-only cycle no
   publish order avoids. Row 7 therefore claims *packaging* for 12 and
   *publishing* for 4; the full sequence is first exercised by the manual
   ordered publish in `cut-a-release.md` §6.
@@ -1081,7 +1185,7 @@ flood of *fresh* nonces from a member still costs one `fsync` each.
   byte-identity promise is defined against it, so replacing it is a wire-format
   migration, not a hygiene fix.
 
-**Fixed on the way:** `uc2_remote`'s `request_timeout` was not enforced while
+**Fixed on the way:** `uc_remote`'s `request_timeout` was not enforced while
 reconnecting — the sweep now runs between every dial attempt, the per-attempt
 connect-shortening (which pinned the dial budget under load) is gone, and the
 `HELLO` read is capped at the attempt deadline so the documented
@@ -1136,7 +1240,7 @@ architecture doc's log-buffer default was also corrected from a stale
   reviewable as code.
 - **Miri is blocked on the rings, and each blocker was reproduced, not
   assumed.** Miri runs the *pure* decoders (`uc_protocol`'s `v2::` wire/cnc/ipc
-  layer and `version` packing, 43 tests; `ultima_journal`'s segment and
+  layer and `version` packing, 43 tests; `uc_journal`'s segment and
   `stable_value` decoders, 19 tests) — 62 tests, all passing **with isolation
   left on**. The IPC rings cannot be checked: isolation on gives
   ``unsupported operation: `open` not available``; isolation off gives
@@ -1146,13 +1250,13 @@ architecture doc's log-buffer default was also corrected from a stale
   **deliberately not built**: it would check a different object than the one
   that ships. The gap is restated in `docs/VERIFICATION.md` §11.
 - **Two seams exposed for fuzzing, with their posture stated.**
-  `uc2_node::config_file::parse_str` and `uc2_gateway::config_file::parse_str`
+  `uc_node::config_file::parse_str` and `uc_gateway::config_file::parse_str`
   are ordinary public API (the loaders' pure inner half).
-  `uc2_node::obs::http::route_raw` and `ObsSources::for_tests` are
+  `uc_node::obs::http::route_raw` and `ObsSources::for_tests` are
   `#[cfg(any(test, fuzzing))]` and absent from a shipped build, with
   `check-cfg = ['cfg(fuzzing)']` declared so `clippy -D warnings` stays clean
   without promoting the seam to a Cargo feature (which would have made it API).
-  `ultima_journal::fuzz_seams` is `pub` (a separate compilation unit cannot see
+  `uc_journal::fuzz_seams` is `pub` (a separate compilation unit cannot see
   `pub(crate)`) but `#[doc(hidden)]`.
 - **`--min-runs 10000` is a stall floor, not a coverage bar.** It catches a
   symbolizer-class stall; it does not catch a target that has merely become
@@ -1170,7 +1274,7 @@ semantics is a design decision; parked as a follow-up, with the raw tier as
 the workaround. (ii) The `uc_protocol::ring` buffers have **no interleaving or
 UB coverage at all** — an earlier draft's claim that loom covered them was
 wrong and was corrected everywhere; the tree's one loom model
-(`uc2_log/tests/loom_frame.rs`) checks the *log buffer's* frame-visibility
+(`uc_log/tests/loom_frame.rs`) checks the *log buffer's* frame-visibility
 protocol, and nothing checks the MPSC claim-then-commit sequence or the
 broadcast seqlock.
 
@@ -1253,7 +1357,7 @@ aggregate. A new `m12_fleet_gate.py --row edgesat` ladder scales concurrent
   **451k** aggregate (per client ~108–113k, clean), then N = 8 = **10,774**
   (p95 4.3 s) and N = 16 = **3,840** with **9,126 lost**. **The hypothesis is
   falsified.**
-- **Confirmed defect** (`uc2_gateway/src/edge.rs:753,848,1328`): credits are
+- **Confirmed defect** (`uc_gateway/src/edge.rs:753,848,1328`): credits are
   **per-connection**. Every connection is granted `per_conn_inflight` in full
   at `HELLO_OK`, halved reactively on Engine `Backpressure` and relaxed back
   toward the cap when clear. **There is no global budget across connections**
@@ -1384,7 +1488,7 @@ that could never have passed, followed by two genuine product defects:
    **Upgrade note:** these files are no longer sparse. A default instance
    directory reserves ~78 MiB at startup (64 MiB log buffer + ~14 MiB rings),
    and a node that cannot reserve it refuses to start.
-3. **Even a correct fail-stop did not say why.** `ultima_journal`'s segment
+3. **Even a correct fail-stop did not say why.** `uc_journal`'s segment
    preallocator replaced the underlying `io::Error` with
    `Error::other("segment preallocation failed")`, so a full disk halted the
    node without ever naming `ENOSPC`. The failing error's kind and errno are
@@ -1515,7 +1619,7 @@ docs described a daemon the build did not produce. M9 ships it.
   bar (the observable figure is plumbing-dominated — an upper bound). Cluster
   switchover after a leader stop is **≈0.4 s** (derived from the ungated
   8.5 % × 5 s dip window).
-- **Deployment model, stated plainly.** `uc2_client` is a same-host SDK: the
+- **Deployment model, stated plainly.** `uc_client` is a same-host SDK: the
   intended shape is one app client per node — the leader's serves requests, a
   follower's answers its callers with a redirect to the leader
   (`NotLeader` carries a leader hint). Place `instance_dir` on a real disk;
@@ -1564,7 +1668,7 @@ serve — bytes from a dead timeline.
   durable is clamped to its term-observation frontier; and the follower's
   commit advance and its reports are both bounded by a validated frontier.
 
-Measured on the directed rig (`uc2_node/tests/stale_read_hunt.rs`, 300 s of
+Measured on the directed rig (`uc_node/tests/stale_read_hunt.rs`, 300 s of
 500 ms-cadence leader kills): log rewinds beneath the applied frontier went
 from 11 per run to **0**, with zero acked-write loss throughout.
 
@@ -1631,7 +1735,7 @@ Design: `docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md`. Gate:
   self-addressed report.
 - **Deferred / follow-up:** the lock-free `sealing_epoch` fast path (not needed
   — arm A passed); suppressing the leader self-send; a release-mode OOB-read in
-  `uc2_log`'s `read_frame_validated` (`debug_assert!`-only bounds guard,
+  `uc_log`'s `read_frame_validated` (`debug_assert!`-only bounds guard,
   pre-existing v2 code from `72f649b`, out of M8 scope, surfaced during T14).
 
 *The 0.3.0 items below shipped in the same tag (v2.3.0); 0.5.0 supersedes the
@@ -1674,7 +1778,7 @@ Safety fixes in this line:
   Lean commit-certification model (46-step kernel-checked Figure-8
   countermodel), reproduced RED-first and pinned by the sim
   (`old_term_range_must_not_commit_before_new_term_quorum`, inv2 at the
-  violating advance) plus a `uc2_consensus` unit pin
+  violating advance) plus a `uc_consensus` unit pin
   (`commit_clamped_to_new_term_base_never_certifies_old_term_only_range`).
   Remedy: upgrade; no back-port is planned.
 - **Intake-gate reopen was keyed to `current_term`, not the data-plane term

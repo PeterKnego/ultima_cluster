@@ -42,7 +42,7 @@ uc_local_path: "{{ playbook_dir }}/../.."  # repo root (ultima_cluster), for rsy
 # --- Sibling ultima_db (OFF by default) ---
 # Only needed when Cargo.toml's `[patch.crates-io] ultima-db = { path =
 # "../ultima_db" }` line is uncommented for lockstep local development. The
-# DEFAULT build resolves ultima-db from crates.io and ultima_journal from the
+# DEFAULT build resolves ultima-db from crates.io and uc_journal from the
 # in-tree workspace member, so no sibling checkout is required and this sync is
 # skipped. Enable with `-e ud_sync=true` when running in lockstep mode.
 ud_sync: false

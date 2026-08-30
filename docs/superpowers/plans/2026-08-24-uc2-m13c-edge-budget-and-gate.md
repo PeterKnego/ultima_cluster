@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build spec §5 — a **global outstanding-grant budget** in `uc2_gateway::Edge`, so the sum of credits the edge has promised across all its connections never exceeds the `Engine` window it can actually honour, and a shrinking share reaches a client *before* it sends into it. Then build the M13 gate artefacts (spec §2): the gate doc with its pre-committed bars a–f, and `m13_hop_bench.py --arms gate` that adjudicates rows a–d and prints e/f's commands. Finally, a docs-only release checklist (spec §7) that retires the `v2.6.0` operating envelope the fix removes.
+**Goal:** Build spec §5 — a **global outstanding-grant budget** in `uc_gateway::Edge`, so the sum of credits the edge has promised across all its connections never exceeds the `Engine` window it can actually honour, and a shrinking share reaches a client *before* it sends into it. Then build the M13 gate artefacts (spec §2): the gate doc with its pre-committed bars a–f, and `m13_hop_bench.py --arms gate` that adjudicates rows a–d and prints e/f's commands. Finally, a docs-only release checklist (spec §7) that retires the `v2.6.0` operating envelope the fix removes.
 
 **Architecture:** `Shared` gains a `budget` (the `Engine` window less a 1/8 headroom) and a `live` count of handshaken connections; each connection's grant is `clamp(budget / live, 1, per_conn_inflight)`, recomputed on every connect and disconnect. A reduction is published by the **single driver thread** (the only thread allowed to touch other connections' sockets) as `STATUS{acked_seq, credits}`; a handshaking reader waits for that publication before it grants its own connection anything, which is what makes "the sum never exceeds the budget" true at every instant rather than eventually. An increase rides the next `RESPONSE` or the idle `STATUS` timer, because a wider window costs a client nothing to learn late.
 
-**Tech Stack:** Rust 2024 (`uc2_gateway`, `uc_protocol` unchanged, `uc2_remote` unchanged), Python 3 for `bench-infra/scripts/m13_hop_bench.py`, Markdown for the gate doc and the release sweep.
+**Tech Stack:** Rust 2024 (`uc_gateway`, `uc_protocol` unchanged, `uc_remote` unchanged), Python 3 for `bench-infra/scripts/m13_hop_bench.py`, Markdown for the gate doc and the release sweep.
 
 **Spec:** docs/superpowers/specs/2026-08-24-uc2-m13-remote-path-design.md
 
@@ -21,7 +21,7 @@
 - **Dev-box numbers are smoke only.** Every rate bar in the gate doc is fleet-only; never move a bar because a local run went red (memory: `dev-box-not-a-bench`).
 - **Fleet runs are a user-approved step.** This plan produces the driver and the empty gate doc; the last task prints the exact command and stops.
 - **Commit after every task**, with the exact message given in that task's final step.
-- **Track boundaries:** track B owns `uc2_remote` (`RemoteClient` keeps `connect`/`submit`/`Ticket::wait`/`stats`/`shutdown` and `RemoteStats.max_credits_seen`) and `docs/reference/remote-protocol.md` §6; track A owns `uc_protocol::ring::mpsc` and the ring-format restart note. **Do not edit those files here** — reference them.
+- **Track boundaries:** track B owns `uc_remote` (`RemoteClient` keeps `connect`/`submit`/`Ticket::wait`/`stats`/`shutdown` and `RemoteStats.max_credits_seen`) and `docs/reference/remote-protocol.md` §6; track A owns `uc_protocol::ring::mpsc` and the ring-format restart note. **Do not edit those files here** — reference them.
 
 ---
 
@@ -36,7 +36,7 @@
 ## File Structure
 
 ```
-uc2_gateway/
+uc_gateway/
   src/
     config.rs          MODIFY  ConfigError::PerConnExceedsBudget, validate, defaults doc
     conn.rs            MODIFY  Conn.ceiling, set_ceiling -> CeilingChange, relax(), counted flag
@@ -73,8 +73,8 @@ docs/
 ### Task 1: `budget_for` / `grant_for` — the arithmetic, alone
 
 **Files:**
-- Modify `uc2_gateway/src/edge.rs` — new constant + two pure fns near the constants block (after `DRIVER_PERIODIC_EVERY`, ~line 138); new tests in the existing `mod tests` (~line 1408).
-- Modify `uc2_gateway/src/lib.rs` (~line 51) — re-export.
+- Modify `uc_gateway/src/edge.rs` — new constant + two pure fns near the constants block (after `DRIVER_PERIODIC_EVERY`, ~line 138); new tests in the existing `mod tests` (~line 1408).
+- Modify `uc_gateway/src/lib.rs` (~line 51) — re-export.
 
 **Interfaces:**
 - Produces: `pub fn budget_for(max_inflight: u32) -> u32`, `pub fn grant_for(live: u32, budget: u32, per_conn: u32) -> u32`, `pub const BUDGET_HEADROOM_DIV: u32 = 8`.
@@ -82,7 +82,7 @@ docs/
 
 **Steps:**
 
-- [ ] Write the failing tests first. Append to `uc2_gateway/src/edge.rs`'s `mod tests`:
+- [ ] Write the failing tests first. Append to `uc_gateway/src/edge.rs`'s `mod tests`:
 
 ```rust
     #[test]
@@ -126,9 +126,9 @@ docs/
     }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --lib` → expect failure: `cannot find function 'budget_for' in this scope` (and `grant_for`).
+- [ ] Run: `cargo test -p uc_gateway --lib` → expect failure: `cannot find function 'budget_for' in this scope` (and `grant_for`).
 
-- [ ] Implement. Insert after `const DRIVER_PERIODIC_EVERY: u64 = 64;` in `uc2_gateway/src/edge.rs`:
+- [ ] Implement. Insert after `const DRIVER_PERIODIC_EVERY: u64 = 64;` in `uc_gateway/src/edge.rs`:
 
 ```rust
 /// The fraction of the `Engine` window the edge keeps out of the grant
@@ -166,18 +166,18 @@ pub fn grant_for(live: u32, budget: u32, per_conn: u32) -> u32 {
 }
 ```
 
-- [ ] Re-export in `uc2_gateway/src/lib.rs`, replacing the `pub use edge::{Edge, EdgeError, EdgeStats};` line:
+- [ ] Re-export in `uc_gateway/src/lib.rs`, replacing the `pub use edge::{Edge, EdgeError, EdgeStats};` line:
 
 ```rust
 pub use edge::{BUDGET_HEADROOM_DIV, Edge, EdgeError, EdgeStats, budget_for, grant_for};
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --lib` → expect `test result: ok`, the three new tests passing.
-- [ ] Run: `cargo clippy -p uc2_gateway --all-targets -- -D warnings` → expect no warnings.
+- [ ] Run: `cargo test -p uc_gateway --lib` → expect `test result: ok`, the three new tests passing.
+- [ ] Run: `cargo clippy -p uc_gateway --all-targets -- -D warnings` → expect no warnings.
 - [ ] Commit:
 
 ```sh
-git add uc2_gateway/src/edge.rs uc2_gateway/src/lib.rs
+git add uc_gateway/src/edge.rs uc_gateway/src/lib.rs
 git commit -m "feat(gateway): budget_for/grant_for — the edge's global grant arithmetic
 
 Pure functions, no wiring yet: budget = Engine window - 1/8 headroom,
@@ -190,9 +190,9 @@ exception (live > budget) is documented and tested; spec §5.1."
 ### Task 2: `Shared` budget + `Conn` ceiling, recomputed on connect and disconnect
 
 **Files:**
-- Modify `uc2_gateway/src/conn.rs` — `Conn` fields (~51-95), `Conn::new` (~98-116), `squeeze`/`relax` (~324-360), new `set_ceiling`/`ceiling`/`mark_counted`/`clear_counted`, `CeilingChange` enum; unit tests (~540-560).
-- Modify `uc2_gateway/src/edge.rs` — `Shared` fields (~299-328), `Edge::start`'s `Shared` literal (~555-566), `handshake` (~843-855), `reader`'s tail (~778), `complete`'s `relax` call (~1328), `Edge::grants_for_tests`.
-- Modify `uc2_gateway/tests/credits.rs` — test (i).
+- Modify `uc_gateway/src/conn.rs` — `Conn` fields (~51-95), `Conn::new` (~98-116), `squeeze`/`relax` (~324-360), new `set_ceiling`/`ceiling`/`mark_counted`/`clear_counted`, `CeilingChange` enum; unit tests (~540-560).
+- Modify `uc_gateway/src/edge.rs` — `Shared` fields (~299-328), `Edge::start`'s `Shared` literal (~555-566), `handshake` (~843-855), `reader`'s tail (~778), `complete`'s `relax` call (~1328), `Edge::grants_for_tests`.
+- Modify `uc_gateway/tests/credits.rs` — test (i).
 
 **Interfaces:**
 - Produces: `pub(crate) enum CeilingChange { Same, Raised, Lowered }`; `Conn::set_ceiling(&self, ceiling: u32) -> CeilingChange`; `Conn::ceiling(&self) -> u32`; `Conn::relax(&self) -> bool` (no argument any more); `Shared::join(&self, conn: &Conn)`, `Shared::leave(&self, conn: &Conn)`, `Shared::current_grant(&self) -> u32`; `#[cfg(feature = "test-util")] Edge::grants_for_tests(&self) -> Vec<(u32, u32)>`.
@@ -200,7 +200,7 @@ exception (live > budget) is documented and tested; spec §5.1."
 
 **Steps:**
 
-- [ ] Failing test first — append to `uc2_gateway/tests/credits.rs`:
+- [ ] Failing test first — append to `uc_gateway/tests/credits.rs`:
 
 ```rust
 /// (spec §5.4, i) Whatever the edge has promised across every connection, the
@@ -212,11 +212,11 @@ exception (live > budget) is documented and tested; spec §5.1."
 fn the_sum_of_grants_never_exceeds_the_edges_budget() {
     let root = common::tempdir();
     let (node, dir) = common::start_single_node(root.path());
-    let svc = uc2_service::ServiceBuilder::new(
-        uc2_service::ServiceConfig::new(&dir, common::APP),
-        uc2_service::Sessioned::new(
+    let svc = uc_service::ServiceBuilder::new(
+        uc_service::ServiceConfig::new(&dir, common::APP),
+        uc_service::Sessioned::new(
             uc_lincheck::register::RegisterSm::default(),
-            uc2_service::SessionConfig::default(),
+            uc_service::SessionConfig::default(),
         ),
     )
     .start()
@@ -226,7 +226,7 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget() {
     // budget = 64 - 64/8 = 56; per-connection cap 32. Six connections is
     // well inside `live <= budget`, so the floor-at-1 exception cannot apply.
     let edge = std::sync::Arc::new(Edge::start(edge_config(&dir, 64, 32)).unwrap());
-    let budget = uc2_gateway::budget_for(64);
+    let budget = uc_gateway::budget_for(64);
     assert_eq!(budget, 56);
 
     let worst = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -245,11 +245,11 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget() {
     for i in 0..6u64 {
         let mut c = common::dial_raw(edge.local_addr());
         common::send_hello(&mut c, 0x100 + i, common::APP);
-        let ok = common::read_until(&mut c, uc2_remote::frame::FrameType::HelloOk,
+        let ok = common::read_until(&mut c, uc_remote::frame::FrameType::HelloOk,
                                     Duration::from_secs(5));
         assert!(ok.is_some(), "connection {i} never got HELLO_OK");
         let live = (i + 1) as u32;
-        let want = uc2_gateway::grant_for(live, budget, 32);
+        let want = uc_gateway::grant_for(live, budget, 32);
         // Settled state: everyone holds the same share.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -279,7 +279,7 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget() {
 }
 ```
 
-- [ ] Add the raw-client helpers the test needs to `uc2_gateway/tests/common/mod.rs` (moved from `credits_wire.rs`, which keeps working through them). Append:
+- [ ] Add the raw-client helpers the test needs to `uc_gateway/tests/common/mod.rs` (moved from `credits_wire.rs`, which keeps working through them). Append:
 
 ```rust
 // ------------------------------------------------------ raw framed client
@@ -288,8 +288,8 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget() {
 // report: what is on the wire, in what order. Shared by `credits_wire.rs`
 // (frame ordering) and `credits.rs` (the grant budget).
 
-use uc2_remote::conn::FramedConn;
-use uc2_remote::frame::{FrameType, Header, Hello, PROTOCOL_VERSION};
+use uc_remote::conn::FramedConn;
+use uc_remote::frame::{FrameType, Header, Hello, PROTOCOL_VERSION};
 
 /// Mid-frame stall budget for the raw reads below. Nothing in these tests
 /// writes a partial frame, so it only bounds a wedged test.
@@ -336,11 +336,11 @@ pub fn read_until(c: &mut FramedConn, want: FrameType, budget: Duration) -> Opti
 }
 ```
 
-  Then delete the now-duplicated `dial_raw`, `send_hello`, `read_until` and `READ_STALL` from `uc2_gateway/tests/credits_wire.rs` (lines ~47-98) and change its call sites from `dial_raw(&edge)` to `common::dial_raw(edge.local_addr())`, `read_until(...)` to `common::read_until(...)`, `READ_STALL` to `common::READ_STALL`.
+  Then delete the now-duplicated `dial_raw`, `send_hello`, `read_until` and `READ_STALL` from `uc_gateway/tests/credits_wire.rs` (lines ~47-98) and change its call sites from `dial_raw(&edge)` to `common::dial_raw(edge.local_addr())`, `read_until(...)` to `common::read_until(...)`, `READ_STALL` to `common::READ_STALL`.
 
-- [ ] Run: `cargo test -p uc2_gateway --test credits` → expect failure: `no method named 'grants_for_tests' found for struct 'Edge'`.
+- [ ] Run: `cargo test -p uc_gateway --test credits` → expect failure: `no method named 'grants_for_tests' found for struct 'Edge'`.
 
-- [ ] Implement the `Conn` half. In `uc2_gateway/src/conn.rs`, add to the `Conn` struct after the `credits` field:
+- [ ] Implement the `Conn` half. In `uc_gateway/src/conn.rs`, add to the `Conn` struct after the `credits` field:
 
 ```rust
     /// The ceiling `credits` may climb back to — the connection's current
@@ -502,7 +502,7 @@ impl Conn {
     }
 ```
 
-- [ ] Implement the `Shared` half. In `uc2_gateway/src/edge.rs`, add to `struct Shared` after `max_payload`:
+- [ ] Implement the `Shared` half. In `uc_gateway/src/edge.rs`, add to `struct Shared` after `max_payload`:
 
 ```rust
     /// The total outstanding grant this edge will hand out across every
@@ -759,12 +759,12 @@ fn regrant_tick(shared: &Arc<Shared>) {
 }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway` → expect all green, including `the_sum_of_grants_never_exceeds_the_edges_budget` and the four new `conn.rs` unit tests.
-- [ ] Run: `cargo clippy -p uc2_gateway --all-targets -- -D warnings` → expect no warnings.
+- [ ] Run: `cargo test -p uc_gateway` → expect all green, including `the_sum_of_grants_never_exceeds_the_edges_budget` and the four new `conn.rs` unit tests.
+- [ ] Run: `cargo clippy -p uc_gateway --all-targets -- -D warnings` → expect no warnings.
 - [ ] Commit:
 
 ```sh
-git add uc2_gateway/src/conn.rs uc2_gateway/src/edge.rs uc2_gateway/tests/
+git add uc_gateway/src/conn.rs uc_gateway/src/edge.rs uc_gateway/tests/
 git commit -m "feat(gateway): global outstanding-grant budget at the edge (spec §5.1)
 
 Shared gains budget (Engine window - 1/8) + live; each connection gets
@@ -781,8 +781,8 @@ reason. Test: 6 connections, sampled every 200us, sum <= 56."
 ### Task 3: publish a reduction as `STATUS`, and send one on `squeeze`
 
 **Files:**
-- Modify `uc2_gateway/src/edge.rs` — `dispatch`'s `Backpressure` arm (~1090-1096).
-- Modify `uc2_gateway/tests/credits.rs` — test (ii).
+- Modify `uc_gateway/src/edge.rs` — `dispatch`'s `Backpressure` arm (~1090-1096).
+- Modify `uc_gateway/tests/credits.rs` — test (ii).
 
 **Interfaces:**
 - Consumes: `Shared::write_status`, `Shared::push_grants` (Task 2).
@@ -790,7 +790,7 @@ reason. Test: 6 connections, sampled every 200us, sum <= 56."
 
 **Steps:**
 
-- [ ] Failing test first — append to `uc2_gateway/tests/credits.rs`:
+- [ ] Failing test first — append to `uc_gateway/tests/credits.rs`:
 
 ```rust
 /// (spec §5.4, ii) A connect shrinks everyone's grant, and the client learns
@@ -801,15 +801,15 @@ reason. Test: 6 connections, sampled every 200us, sum <= 56."
 /// without me asking anything".
 #[test]
 fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
-    use uc2_remote::frame::{FrameType, Status};
+    use uc_remote::frame::{FrameType, Status};
 
     let root = common::tempdir();
     let (node, dir) = common::start_single_node(root.path());
-    let svc = uc2_service::ServiceBuilder::new(
-        uc2_service::ServiceConfig::new(&dir, common::APP),
-        uc2_service::Sessioned::new(
+    let svc = uc_service::ServiceBuilder::new(
+        uc_service::ServiceConfig::new(&dir, common::APP),
+        uc_service::Sessioned::new(
             uc_lincheck::register::RegisterSm::default(),
-            uc2_service::SessionConfig::default(),
+            uc_service::SessionConfig::default(),
         ),
     )
     .start()
@@ -825,7 +825,7 @@ fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
     let (_, hello_ok) = common::read_until_frame(&mut first, FrameType::HelloOk,
                                                  Duration::from_secs(5))
         .expect("HELLO_OK");
-    let granted = uc2_remote::frame::HelloOk::decode(&hello_ok).unwrap().credits;
+    let granted = uc_remote::frame::HelloOk::decode(&hello_ok).unwrap().credits;
     assert_eq!(granted, 32, "the only connection gets the whole budget, capped at per_conn");
 
     // The first connection sends NOTHING from here on. Whatever it hears next
@@ -849,7 +849,7 @@ fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
 }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --test credits -- a_new_connection_shrinks` → expect PASS already if Task 2 is complete (`push_grants` writes the STATUS). **If it fails**, the cause is `write_status` not being reached — diagnose before touching the squeeze path.
+- [ ] Run: `cargo test -p uc_gateway --test credits -- a_new_connection_shrinks` → expect PASS already if Task 2 is complete (`push_grants` writes the STATUS). **If it fails**, the cause is `write_status` not being reached — diagnose before touching the squeeze path.
 
 - [ ] Now the squeeze call site (spec §5.2: "STATUS is also sent on `squeeze` — today a reduction reaches the client only on the next RESPONSE; `edge.rs` has no call site"). In `dispatch`'s `Err(SubmitError::Backpressure)` arm, extend the `if !squeezed` block:
 
@@ -872,7 +872,7 @@ fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
                 }
 ```
 
-- [ ] Add the regression that the squeeze path really writes one — append to `uc2_gateway/tests/credits.rs`, inside `a_squeezed_window_still_resolves_every_request`, replacing its `let es = edge.stats();` block tail:
+- [ ] Add the regression that the squeeze path really writes one — append to `uc_gateway/tests/credits.rs`, inside `a_squeezed_window_still_resolves_every_request`, replacing its `let es = edge.stats();` block tail:
 
 ```rust
     let es = edge.stats();
@@ -889,12 +889,12 @@ fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
     }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --test credits` → expect all green.
-- [ ] Run: `cargo clippy -p uc2_gateway --all-targets -- -D warnings` → expect no warnings.
+- [ ] Run: `cargo test -p uc_gateway --test credits` → expect all green.
+- [ ] Run: `cargo clippy -p uc_gateway --all-targets -- -D warnings` → expect no warnings.
 - [ ] Commit:
 
 ```sh
-git add uc2_gateway/src/edge.rs uc2_gateway/tests/credits.rs
+git add uc_gateway/src/edge.rs uc_gateway/tests/credits.rs
 git commit -m "feat(gateway): push a shrinking grant as STATUS, including on squeeze
 
 A reduction reaches every ready connection through the driver's regrant
@@ -909,13 +909,13 @@ unprompted when a second connection joins."
 ### Task 4: `HELLO_OK` carries the live grant; a disconnect gives the share back
 
 **Files:**
-- Modify `uc2_gateway/tests/credits.rs` — tests (iii) and (iv).
+- Modify `uc_gateway/tests/credits.rs` — tests (iii) and (iv).
 
 **Interfaces:** none new — this task is the acceptance evidence for Task 2's connect/disconnect wiring.
 
 **Steps:**
 
-- [ ] Failing test first — append to `uc2_gateway/tests/credits.rs`:
+- [ ] Failing test first — append to `uc_gateway/tests/credits.rs`:
 
 ```rust
 /// (spec §5.4, iii) A disconnect gives its share back to the survivors, and
@@ -923,15 +923,15 @@ unprompted when a second connection joins."
 /// never the config constant.
 #[test]
 fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
-    use uc2_remote::frame::{FrameType, HelloOk};
+    use uc_remote::frame::{FrameType, HelloOk};
 
     let root = common::tempdir();
     let (node, dir) = common::start_single_node(root.path());
-    let svc = uc2_service::ServiceBuilder::new(
-        uc2_service::ServiceConfig::new(&dir, common::APP),
-        uc2_service::Sessioned::new(
+    let svc = uc_service::ServiceBuilder::new(
+        uc_service::ServiceConfig::new(&dir, common::APP),
+        uc_service::Sessioned::new(
             uc_lincheck::register::RegisterSm::default(),
-            uc2_service::SessionConfig::default(),
+            uc_service::SessionConfig::default(),
         ),
     )
     .start()
@@ -940,7 +940,7 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
 
     // budget 56, cap 32: 1 -> 32, 2 -> 28, 4 -> 14.
     let edge = Edge::start(edge_config(&dir, 64, 32)).unwrap();
-    let budget = uc2_gateway::budget_for(64);
+    let budget = uc_gateway::budget_for(64);
 
     let mut held = Vec::new();
     for i in 0..3u64 {
@@ -956,7 +956,7 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
         common::read_until_frame(&mut fourth, FrameType::HelloOk, Duration::from_secs(5))
             .expect("HELLO_OK");
     let credits = HelloOk::decode(&body).unwrap().credits;
-    assert_eq!(credits, uc2_gateway::grant_for(4, budget, 32), "HELLO_OK must carry the live share");
+    assert_eq!(credits, uc_gateway::grant_for(4, budget, 32), "HELLO_OK must carry the live share");
     assert_eq!(credits, 14);
 
     // Three of them go away; the survivor must climb back to the whole cap.
@@ -976,7 +976,7 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
     let (_, body) = common::read_until_frame(&mut held[0], FrameType::Status,
                                              Duration::from_secs(5))
         .expect("no STATUS carried the widened window");
-    assert_eq!(uc2_remote::frame::Status::decode(&body).unwrap().credits, 32);
+    assert_eq!(uc_remote::frame::Status::decode(&body).unwrap().credits, 32);
 
     drop(held);
     edge.stop();
@@ -986,7 +986,7 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
 }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --test credits -- a_disconnect_gives` → expect PASS (Task 2 built the mechanism; this is its acceptance). A failure here means `leave` is not reached — check the `reader` tail order.
+- [ ] Run: `cargo test -p uc_gateway --test credits -- a_disconnect_gives` → expect PASS (Task 2 built the mechanism; this is its acceptance). A failure here means `leave` is not reached — check the `reader` tail order.
 
 - [ ] (iv) Tighten the existing two-client test. In `two_clients_stay_inside_the_credits_the_edge_grants`, replace the informational `println!` and the ceiling assertion:
 
@@ -1018,12 +1018,12 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
     );
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --test credits` → expect all five tests green.
-- [ ] Run: `cargo test -p uc2_gateway` → expect the whole gateway suite green (`credits_wire.rs` included, on the moved helpers).
+- [ ] Run: `cargo test -p uc_gateway --test credits` → expect all five tests green.
+- [ ] Run: `cargo test -p uc_gateway` → expect the whole gateway suite green (`credits_wire.rs` included, on the moved helpers).
 - [ ] Commit:
 
 ```sh
-git add uc2_gateway/tests/credits.rs
+git add uc_gateway/tests/credits.rs
 git commit -m "test(gateway): HELLO_OK grants the live share; a disconnect returns it
 
 Plus the acceptance the budget exists for: the two-client test now asserts
@@ -1036,8 +1036,8 @@ Engine window mean the reactive halve/relax ladder never runs."
 ### Task 5: config validation — `per_conn_inflight <= budget`, and a warning past it
 
 **Files:**
-- Modify `uc2_gateway/src/config.rs` — `ConfigError` (~39-64), `validate` (~136-178), tests (~233-241).
-- Modify `uc2_gateway/examples/hop_bench/main.rs` — `EdgeArgs::per_conn_inflight` default (~84).
+- Modify `uc_gateway/src/config.rs` — `ConfigError` (~39-64), `validate` (~136-178), tests (~233-241).
+- Modify `uc_gateway/examples/hop_bench/main.rs` — `EdgeArgs::per_conn_inflight` default (~84).
 - Modify `docs/reference/gateway-config.md` — `[limits]` table + sizing section.
 - Modify `packaging/gateway.example.toml` — `[limits]` comments.
 
@@ -1047,7 +1047,7 @@ Engine window mean the reactive halve/relax ladder never runs."
 
 **Steps:**
 
-- [ ] Failing test first — append to `uc2_gateway/src/config.rs`'s `mod tests`:
+- [ ] Failing test first — append to `uc_gateway/src/config.rs`'s `mod tests`:
 
 ```rust
     #[test]
@@ -1089,7 +1089,7 @@ Engine window mean the reactive halve/relax ladder never runs."
     }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --lib` → expect failure: `no variant or associated item named 'PerConnExceedsBudget'`.
+- [ ] Run: `cargo test -p uc_gateway --lib` → expect failure: `no variant or associated item named 'PerConnExceedsBudget'`.
 
 - [ ] Implement. Add to `ConfigError`:
 
@@ -1135,7 +1135,7 @@ Engine window mean the reactive halve/relax ladder never runs."
     }
 ```
 
-- [ ] Print the warnings once at startup. In `uc2_gateway/src/bin/uc2-gateway.rs`, immediately before `Edge::start(...)`:
+- [ ] Print the warnings once at startup. In `uc_gateway/src/bin/uc2-gateway.rs`, immediately before `Edge::start(...)`:
 
 ```rust
     for w in cfg.warnings() {
@@ -1143,7 +1143,7 @@ Engine window mean the reactive halve/relax ladder never runs."
     }
 ```
 
-- [ ] Unblock the bench harness, which currently defaults `per_conn_inflight` to the whole window. In `uc2_gateway/examples/hop_bench/main.rs`:
+- [ ] Unblock the bench harness, which currently defaults `per_conn_inflight` to the whole window. In `uc_gateway/examples/hop_bench/main.rs`:
 
 ```rust
     /// Credits granted to every connection at HELLO_OK (`per_conn_inflight`).
@@ -1153,11 +1153,11 @@ Engine window mean the reactive halve/relax ladder never runs."
     pub per_conn_inflight: u32,
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --lib` → expect green. Run `cargo build -p uc2_gateway --example hop_bench --release` → expect a clean build.
+- [ ] Run: `cargo test -p uc_gateway --lib` → expect green. Run `cargo build -p uc_gateway --example hop_bench --release` → expect a clean build.
 - [ ] Smoke the refusal end to end:
 
 ```sh
-cargo run -q -p uc2_gateway --example hop_bench --release -- edge \
+cargo run -q -p uc_gateway --example hop_bench --release -- edge \
   --instance-dir /home/claude/nonexistent --listen 127.0.0.1:0 \
   --max-inflight 4096 --per-conn-inflight 4096
 ```
@@ -1190,8 +1190,8 @@ for the first fourteen connections, `255` at fifteen, and so on down. A
 connection is told its grant in `HELLO_OK`, and every later change reaches
 it as an absolute `credits` value: a **reduction** is pushed as a standalone
 `STATUS` before it can send into the smaller window, an **increase** rides
-the next `RESPONSE` or the idle `STATUS` tick. `uc2_gateway::budget_for` and
-`uc2_gateway::grant_for` are public if you would rather compute than read.
+the next `RESPONSE` or the idle `STATUS` tick. `uc_gateway::budget_for` and
+`uc_gateway::grant_for` are public if you would rather compute than read.
 
 **What this replaces.** In `2.6.0` every connection was granted
 `per_conn_inflight` in full and nothing counted the sum, so N connections
@@ -1227,12 +1227,12 @@ max_inflight = 4096
 per_conn_inflight = 256
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway && cargo clippy -p uc2_gateway --all-targets -- -D warnings` → expect green, no warnings.
+- [ ] Run: `cargo test -p uc_gateway && cargo clippy -p uc_gateway --all-targets -- -D warnings` → expect green, no warnings.
 - [ ] Commit:
 
 ```sh
-git add uc2_gateway/src/config.rs uc2_gateway/src/bin/uc2-gateway.rs \
-        uc2_gateway/examples/hop_bench/main.rs \
+git add uc_gateway/src/config.rs uc_gateway/src/bin/uc2-gateway.rs \
+        uc_gateway/examples/hop_bench/main.rs \
         docs/reference/gateway-config.md packaging/gateway.example.toml
 git commit -m "feat(gateway): refuse per_conn_inflight above the budget, warn past max_connections
 
@@ -1248,16 +1248,16 @@ Docs: gateway-config.md 'The grant budget', gateway.example.toml."
 ### Task 6: `grant_changes` in the stats line and the operator docs
 
 **Files:**
-- Modify `uc2_gateway/src/bin/uc2-gateway.rs` — stats line (~93-108).
+- Modify `uc_gateway/src/bin/uc2-gateway.rs` — stats line (~93-108).
 - Modify `docs/how-to/run-a-gateway.md` — "Stats line" section (~280-296).
-- Modify `uc2_gateway/examples/hop_bench/main.rs` — the per-second `edge:` line (~123-132).
+- Modify `uc_gateway/examples/hop_bench/main.rs` — the per-second `edge:` line (~123-132).
 
 **Interfaces:**
 - Consumes: `EdgeStats::grant_changes` (added in Task 2).
 
 **Steps:**
 
-- [ ] Failing test first — append to `uc2_gateway/src/edge.rs`'s `mod tests`:
+- [ ] Failing test first — append to `uc_gateway/src/edge.rs`'s `mod tests`:
 
 ```rust
     /// `grant_changes` counts redivisions, in both directions, per connection.
@@ -1272,7 +1272,7 @@ Docs: gateway-config.md 'The grant budget', gateway.example.toml."
     }
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway --lib -- the_stats_snapshot_exposes_grant_changes` → expect PASS if Task 2 added the field; a failure means the field or the snapshot line is missing.
+- [ ] Run: `cargo test -p uc_gateway --lib -- the_stats_snapshot_exposes_grant_changes` → expect PASS if Task 2 added the field; a failure means the field or the snapshot line is missing.
 
 - [ ] Add it to the binary's stats line:
 
@@ -1331,12 +1331,12 @@ is observed but not announced) but the reference binary does not print it;
 read it via `Edge::stats()` if you embed the library yourself.
 ```
 
-- [ ] Run: `cargo test -p uc2_gateway && cargo build -p uc2_gateway --example hop_bench --release && cargo clippy -p uc2_gateway --all-targets -- -D warnings` → expect green.
+- [ ] Run: `cargo test -p uc_gateway && cargo build -p uc_gateway --example hop_bench --release && cargo clippy -p uc_gateway --all-targets -- -D warnings` → expect green.
 - [ ] Commit:
 
 ```sh
-git add uc2_gateway/src/edge.rs uc2_gateway/src/bin/uc2-gateway.rs \
-        uc2_gateway/examples/hop_bench/main.rs docs/how-to/run-a-gateway.md
+git add uc_gateway/src/edge.rs uc_gateway/src/bin/uc2-gateway.rs \
+        uc_gateway/examples/hop_bench/main.rs docs/how-to/run-a-gateway.md
 git commit -m "feat(gateway): export grant_changes in the stats line
 
 EdgeStats.grant_changes counts budget redivisions; the daemon's stats line
@@ -1382,7 +1382,7 @@ Baseline and root causes: `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`
 M13 makes the remote path — `client → TCP → Edge → shmem Engine → node` —
 run at the cluster's speed and **degrade rather than collapse** under more
 connections than the host has cores. Three fixes, measured together: a
-rebuilt `uc2_remote` client (track B), per-record commit in
+rebuilt `uc_remote` client (track B), per-record commit in
 `uc_protocol::ring::mpsc` (track A), and a global outstanding-grant budget
 at the edge (track C). No consensus change, no node↔node wire change, no
 cnc-page change; the remote wire protocol stays v1.
@@ -1405,7 +1405,7 @@ e and f are local/CI.
 | c | Ladder N = 1,2,4,8,16 at 1024 inflight on the co-located host, with the ring fix + edge budget | **monotone, no collapse**: 0 lost, p99 bounded (< 1 s at every rung), no rung > 20% below the previous rung | *not yet run* |
 | d | N local `Engine`s into one node on an oversubscribed host (`engine-load --engines 1,2,4,8` on the 8-vCPU server host, and locally on 4 vCPU) | **≤ linear degradation**: resp/s at N engines ≥ (cores / busy threads) × single-engine resp/s × 0.5, never below 10% of single-engine | *not yet run* |
 | e | Ring correctness: existing 73 `uc_protocol` tests + new preemption test + loom model | green | *not yet run* |
-| f | Correctness capstones on the new client: `remote_lin` (envelope on/off), `uc2_gateway` tests, `client_fake_edge` suite ported | green | *not yet run* |
+| f | Correctness capstones on the new client: `remote_lin` (envelope on/off), `uc_gateway` tests, `client_fake_edge` suite ported | green | *not yet run* |
 
 Reference numbers from the hop bench, for scale (they are **not** bars):
 direct arm 1.9–2.6 M/s; raw client through edge+cluster 1.14 M/s (0.6×) at
@@ -1452,12 +1452,12 @@ running them:
 ```bash
 cargo test -p uc_protocol                                   # row e: ring, incl. the preemption test
 RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release loom_   # row e: the loom model
-cargo test -p uc2_remote                                    # row f: client_fake_edge, ported
-cargo test -p uc2_gateway                                   # row f: edge incl. the grant budget
-cargo test -p uc2_node --test remote_lin                    # row f: the capstone, envelope on/off
+cargo test -p uc_remote                                    # row f: client_fake_edge, ported
+cargo test -p uc_gateway                                   # row f: edge incl. the grant budget
+cargo test -p uc_node --test remote_lin                    # row f: the capstone, envelope on/off
 ```
 
-The dev-box smoke (`cargo run -p uc2_gateway --release --example hop_bench --
+The dev-box smoke (`cargo run -p uc_gateway --release --example hop_bench --
 local --secs 3 --conns 1,4`) is unchanged and is **not** a gate row: this box
 is 4 vCPU and every arm contends for the same cores (see "Dev box is not a
 bench" below).
@@ -1813,9 +1813,9 @@ def arm_gate(m12hosts, hophosts, a, points, verdicts):
     print("\nGATE rows e and f are local/CI — run them where the code is:", flush=True)
     for c in ("cargo test -p uc_protocol",
               'RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release loom_',
-              "cargo test -p uc2_remote",
-              "cargo test -p uc2_gateway",
-              "cargo test -p uc2_node --test remote_lin"):
+              "cargo test -p uc_remote",
+              "cargo test -p uc_gateway",
+              "cargo test -p uc_node --test remote_lin"):
         print(f"  {c}", flush=True)
 ```
 
@@ -2064,7 +2064,7 @@ node↔node wire, or the cnc page.
   and replace its final "## Fix direction (next milestone)" heading with `## Fix direction — built in 2.7.0`, appending after that section:
 
 ```markdown
-**As built** (`uc2_gateway/src/edge.rs`, `conn.rs`): `Shared` carries
+**As built** (`uc_gateway/src/edge.rs`, `conn.rs`): `Shared` carries
 `budget = max_inflight − max_inflight/8` and a `live` count;
 `grant_for(live, budget, per_conn)` is the share; `Conn::ceiling` is dynamic
 and `relax` climbs to it; a handshake joins the budget and waits for the
@@ -2105,7 +2105,7 @@ together. Nothing here touches consensus, the node-to-node wire protocol, or
 the cnc page; the remote wire protocol stays v1. Proof record, row by row:
 [M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md).
 
-- **A rebuilt remote client** (`uc2_remote`): the same blocking
+- **A rebuilt remote client** (`uc_remote`): the same blocking
   `RemoteClient::submit` / `Ticket::wait` surface, over an `Engine`-shaped
   split — a submitter that encodes straight into a preallocated outgoing
   ring, a writer thread that coalesces whatever is queued into one `write`,
@@ -2187,7 +2187,7 @@ remote wire protocol stays v1, with two clarifications to its reference (a
 `STATUS` MAY be sent at any time) that describe behaviour the client already
 had.
 
-### The client (`uc2_remote`)
+### The client (`uc_remote`)
 
 *Filled in by track B at merge: the split halves, what moved from the old
 client unchanged, and the ported `client_fake_edge` scenarios.*
@@ -2198,12 +2198,12 @@ client unchanged, and the ported `client_fake_edge` scenarios.*
 word, the dead-producer hole and its `IngressRingWedged` residual, the loom
 model, and the ring-magic bump.*
 
-### The edge budget (`uc2_gateway`)
+### The edge budget (`uc_gateway`)
 
 `Shared` carries `budget = max_inflight − max_inflight / 8` and a `live`
 count of handshaken connections; a connection's grant is
 `clamp(budget / live, 1, per_conn_inflight)`, exported as
-`uc2_gateway::budget_for` / `uc2_gateway::grant_for`. `Conn` gains a dynamic
+`uc_gateway::budget_for` / `uc_gateway::grant_for`. `Conn` gains a dynamic
 `ceiling` that `relax` climbs towards, so a connection that relaxes after a
 backpressure episode cannot climb past the share its neighbours leave it.
 
@@ -2303,6 +2303,6 @@ Performed against the spec, the prompt's pinned interfaces, and the code as it s
 
 **Placeholder scan.** Every code block is real Rust or real Python against the actual line ranges and identifiers in the tree. The only intentionally-empty text is `docs/releases.md`'s two *"Filled in by track A/B at merge"* subsections — that is a track boundary, marked as such, in a task that runs after those tracks merge — and the gate doc's result cells, which the honest-failure protocol requires to be empty at this commit.
 
-**Signature consistency.** `RemoteClient::connect/submit/Ticket::wait/stats/shutdown` and `RemoteStats.max_credits_seen` are used by the existing gateway tests and by the new tests only through that surface; nothing here reaches into `uc2_remote` internals. `hop_bench remote-load`'s CLI (`--gateways --secs --payload --inflight --conns`) is what `arm_gate` invokes, and the `RESULT {arm:"remote",…}` line is what `parse_result(out, "remote")` consumes — both are track B's pinned contract. `Engine`'s API is untouched (track A's promise). `Conn::relax`'s signature changes from `relax(&self, ceiling: u32)` to `relax(&self)` — it is `pub(crate)` inside `uc2_gateway` with exactly two call sites (`edge.rs:1328` and `conn.rs`'s unit tests), both updated in Task 2. `Shared::write_status` changes from `()` to `bool`, with both call sites updated.
+**Signature consistency.** `RemoteClient::connect/submit/Ticket::wait/stats/shutdown` and `RemoteStats.max_credits_seen` are used by the existing gateway tests and by the new tests only through that surface; nothing here reaches into `uc_remote` internals. `hop_bench remote-load`'s CLI (`--gateways --secs --payload --inflight --conns`) is what `arm_gate` invokes, and the `RESULT {arm:"remote",…}` line is what `parse_result(out, "remote")` consumes — both are track B's pinned contract. `Engine`'s API is untouched (track A's promise). `Conn::relax`'s signature changes from `relax(&self, ceiling: u32)` to `relax(&self)` — it is `pub(crate)` inside `uc_gateway` with exactly two call sites (`edge.rs:1328` and `conn.rs`'s unit tests), both updated in Task 2. `Shared::write_status` changes from `()` to `bool`, with both call sites updated.
 
 **Two traps found and handled while writing this.** (1) The naive ordering — grant the new connection first, shrink the others afterwards — over-promises the budget by up to `budget/2` for as long as the driver takes to republish, which would make test (i) flaky rather than false; hence the connect-side settle wait and the remove-then-leave order on disconnect, both called out in the code comments. (2) `hop_bench`'s `edge` role defaults to `per_conn_inflight = 4096` against `max_inflight = 4096`, which Task 5's new refusal would reject — the whole bench harness would stop starting. Task 5 lowers that default to 1024 and the gate arm passes `--gate-edge-per-conn 1024` explicitly; note that at the gate's `--gate-edge-inflight 65536` the budget (57344) never binds at 16 × 1024, so the budget's own proof is rows e/f, not row c, and the gate doc says so implicitly by scoping row c to "monotone, no collapse".

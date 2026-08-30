@@ -64,7 +64,7 @@ in existence. It did not have to be, because the adapter is byte-identical:
 same `bincode::serde` call, same `bincode::config::standard()`, same 8-byte
 position prefix on the response. A typed state machine's frames on disk and on
 the wire under `v2.6.0` are the same bytes it produced under `v2.5.0` — which
-is asserted by a test (`uc2_service/tests/raw_contract.rs`), not assumed.
+is asserted by a test (`uc_service/tests/raw_contract.rs`), not assumed.
 
 So the door opened without moving anybody through it. Existing services keep
 their typed trait and change nothing. A service with a hot or large command

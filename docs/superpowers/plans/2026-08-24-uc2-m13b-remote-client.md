@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace `uc2_remote`'s single-lock `RemoteClient` with an `Engine`-shaped split client (`RemoteEngine::connect -> (RemoteSendHalf, RemotePollHalf)`) whose per-connection hot path is two threads, a handful of atomics, batched writes and buffered reads — lifting one connection from ~50 k resp/s (dev box, `dummy-edge`) towards the blaster's proven ~3.6 M/s — while preserving every failover behaviour the current client owns.
+**Goal:** Replace `uc_remote`'s single-lock `RemoteClient` with an `Engine`-shaped split client (`RemoteEngine::connect -> (RemoteSendHalf, RemotePollHalf)`) whose per-connection hot path is two threads, a handful of atomics, batched writes and buffered reads — lifting one connection from ~50 k resp/s (dev box, `dummy-edge`) towards the blaster's proven ~3.6 M/s — while preserving every failover behaviour the current client owns.
 
 **Architecture:** Per connection: the caller's **submitter** thread encodes a frame straight into a preallocated SPSC **outgoing byte ring** and records `(seq -> user_data, kind, deadline, ring extent)` in a slot table (no syscall, no lock); a **writer** thread drains the ring with one `write_all_bytes` per drain (flush-on-empty, no timer) and owns the socket for dial/redial/resend; a **reader** thread does `read_frame_buffered`/`next_buffered`, updates `credits`/`acked_seq` atomics, resolves slots and pushes completions into a bounded SPSC **completion queue** with a byte arena, waking the poller **once per read batch**. `poll` drains that queue. The only lock on any per-request path is none; a reconnect mutex is taken on socket error and on dial, and the rare RETRY/PONG paths take small cold mutexes.
 
-**Tech Stack:** Rust 2024 (workspace edition), `std` only (`TcpStream`, `Mutex`/`Condvar` for cold paths, `UnsafeCell` + atomics for the two SPSC rings), plus the crate's existing `bytes` and `thiserror`. No `tokio`, no `uc2_client` dependency, no new crates.
+**Tech Stack:** Rust 2024 (workspace edition), `std` only (`TcpStream`, `Mutex`/`Condvar` for cold paths, `UnsafeCell` + atomics for the two SPSC rings), plus the crate's existing `bytes` and `thiserror`. No `tokio`, no `uc_client` dependency, no new crates.
 
 **Spec:** docs/superpowers/specs/2026-08-24-uc2-m13-remote-path-design.md (this plan implements §3, §6, and the caller migrations; §4 ring and §5 edge budget are other tracks)
 
@@ -14,9 +14,9 @@
 
 - MSRV is **1.89** (`rust-version` in the root `Cargo.toml`); local dev and CI build on the pin in `rust-toolchain.toml` (**1.96.0**). Nothing here may need a newer stable.
 - `cargo clippy --workspace --all-targets -- -D warnings` must stay clean at every commit.
-- **No `tokio`, no async.** `uc2_remote` stays dependency-light: `bytes` + `thiserror` only, `serde`/`bincode` in dev-dependencies. It **must not** depend on `uc2_client` or `uc_protocol` — the `SlotTable` and the wait cell are *copied and adapted*, with attribution in the module doc, exactly the way `uc2_client/src/wait.rs` was ported from `ultima_rings`.
+- **No `tokio`, no async.** `uc_remote` stays dependency-light: `bytes` + `thiserror` only, `serde`/`bincode` in dev-dependencies. It **must not** depend on `uc_client` or `uc_protocol` — the `SlotTable` and the wait cell are *copied and adapted*, with attribution in the module doc, exactly the way `uc_client/src/wait.rs` was ported from `ultima_rings`.
 - **No scratch under `/tmp`** — it is RAM-backed tmpfs with no swap on this box. Test artifacts go to `CARGO_TARGET_TMPDIR` or under `/home/claude`.
-- **Remote wire protocol v1 is unchanged** (`frame::PROTOCOL_VERSION == 1`): no new frame types, no changed layouts, no changed flag bits. `uc2_remote::frame`'s public decoders keep their signatures — `fuzz/fuzz_targets/uc2_remote_frame.rs` and `fuzz/src/seeds.rs` import `uc2_remote::frame::*` and must keep compiling untouched.
+- **Remote wire protocol v1 is unchanged** (`frame::PROTOCOL_VERSION == 1`): no new frame types, no changed layouts, no changed flag bits. `uc_remote::frame`'s public decoders keep their signatures — `fuzz/fuzz_targets/uc_remote_frame.rs` and `fuzz/src/seeds.rs` import `uc_remote::frame::*` and must keep compiling untouched.
 - **Commit after every task**, with the exact `git add`/`git commit` given in the task's last step. Work on branch `uc2/m13b-remote-client` off `main`.
 - Every new module starts with the repo's two-line header:
   `// SPDX-License-Identifier: Apache-2.0` then `// Copyright 2026 Peter Knego`.
@@ -35,7 +35,7 @@
   `slice::from_raw_parts` over exactly the accessed range for reads; state
   in each SAFETY comment that no whole-buffer reference is ever formed. Add
   a two-thread test per structure and run it under
-  `cargo +nightly miri test -p uc2_remote --lib <module>::`.
+  `cargo +nightly miri test -p uc_remote --lib <module>::`.
 - Cursor invariants that SAFETY comments rely on (`ack <= send <= write`
   and the like) get `debug_assert!`s at every mutation site; a safe fn whose
   correctness depends on a caller precondition asserts it.
@@ -49,9 +49,9 @@
 
 ## Provenance: what is being replaced, and every behaviour that must survive
 
-`uc2_remote/src/client.rs` (1573 lines) is deleted at Task 11. Before that, each of its behaviours is re-implemented on the halves. This is the checklist; each row names the current code and the task that re-homes it.
+`uc_remote/src/client.rs` (1573 lines) is deleted at Task 11. Before that, each of its behaviours is re-implemented on the halves. This is the checklist; each row names the current code and the task that re-homes it.
 
-| # | Behaviour | Current location (`uc2_remote/src/client.rs`) | Re-homed in |
+| # | Behaviour | Current location (`uc_remote/src/client.rs`) | Re-homed in |
 |---|---|---|---|
 | 1 | Config validation by name (`app_id`, `members`, `max_inflight`, `dead_after > ping_interval`) | `RemoteConfig::validate`, **204–229** | Task 5 |
 | 2 | Dial scan: preferred addr, then round-robin from `member_idx + 1` | `dial`, **1355–1478** | Task 5 |
@@ -80,20 +80,20 @@
 | 25 | `shutdown` fails every outstanding request with `Closed`; `Drop` does the same | `close`, **540–560**; `Drop`, **623–627** | Task 9 / Task 10 |
 | 26 | Every accepted request ends in **exactly one** outcome | module doc, **4–47** | Tasks 6–10 |
 
-**Test-suite note (honest discrepancy):** the spec says "28 scripted scenarios"; `uc2_remote/tests/client_fake_edge.rs` actually contains **27** `#[test]` functions. The plan ports all 27 and says so; nothing is missing, the spec's count is off by one.
+**Test-suite note (honest discrepancy):** the spec says "28 scripted scenarios"; `uc_remote/tests/client_fake_edge.rs` actually contains **27** `#[test]` functions. The plan ports all 27 and says so; nothing is missing, the spec's count is off by one.
 
 ---
 
 ## File Structure
 
-**Created in `uc2_remote/src/`:**
+**Created in `uc_remote/src/`:**
 
 | File | Responsibility |
 |---|---|
 | `park.rs` | `WaitCell`: a seq-stamped park/wake pair (`Mutex<()>` + `Condvar` + `AtomicU64` seq + `AtomicU32` waiters). Used by the writer (outgoing ring non-empty), the poller (completions available) and the reader (completion queue drained). Never on a per-request path when both sides are busy. |
 | `outgoing.rs` | `OutRing`: the SPSC byte ring the submitter encodes into and the writer drains. Owns `write`/`send`/`ack` cursors, `peek_upto`/`consume`/`copy_range`, and the writer's wake cell. |
 | `completion.rs` | `CompletionQueue`: bounded SPSC queue of completion records plus a byte arena for response bodies. Reader is the producer, `poll` the consumer. Never drops; a full queue parks the reader. |
-| `slots.rs` | `SlotTable`: generation-tagged slots indexed `seq & mask`, adapted from `uc2_client/src/slots.rs` (copied, not depended on). Adds the per-slot ring extent (`off`,`len`), `sent` flag and `not_before_ns`. |
+| `slots.rs` | `SlotTable`: generation-tagged slots indexed `seq & mask`, adapted from `uc_client/src/slots.rs` (copied, not depended on). Adds the per-slot ring extent (`off`,`len`), `sent` flag and `not_before_ns`. |
 | `link.rs` | One connection's shared state and its two threads: dial/HELLO/redirect scan, writer loop (drain, probe limit, retransmits, PING, redial + ordered resend), reader loop (frame dispatch, credits, resolve, sweep, liveness). |
 | `engine.rs` | The public halves: `RemoteEngine`, `RemoteSendHalf`, `RemotePollHalf`, `RemoteWaitHandle`, `RemoteCompletion`, `RemoteOutcome`, `SubmitError`, `Consistency`, `RemoteConfig`, `RemoteStats`, `RemoteResponse`. |
 | `client.rs` | **Rewritten**: the blocking convenience `RemoteClient` + `Ticket` over the halves (its own poller thread + an `Arc<TicketCore>` per request). Not the measured path. |
@@ -104,17 +104,17 @@
 
 | File | Change |
 |---|---|
-| `uc2_remote/src/frame.rs:120-133` | add `encode_header_into(h, payload_len) -> [u8; HEADER_LEN]` beside `encode_frame`; `encode_frame` reuses it. |
-| `uc2_remote/src/lib.rs:14-21` | new modules + re-exports. |
-| `uc2_remote/tests/client_fake_edge.rs` | trimmed to the convenience-layer scenarios (Task 10). |
-| `uc2_remote/tests/engine_fake_edge.rs` | **created**: all 27 scenarios ported to the halves. |
-| `uc2_gateway/examples/hop_bench/remote_load.rs` | rebuilt on the halves in the `engine_load` shape; `--senders` dropped. |
-| `uc2_gateway/examples/m12_gate.rs:881-1101, 1384-1415` | `run_remote_measurement`/`print_remote_stats` on the halves. |
-| `examples/uc2-crashtest/tests/remote_lin.rs`, `examples/counter/src/bin/counter-remote.rs`, `uc2_gateway/tests/{credits,credits_wire,failover,roundtrip}.rs` | convenience client; only `query`'s second argument changes. |
+| `uc_remote/src/frame.rs:120-133` | add `encode_header_into(h, payload_len) -> [u8; HEADER_LEN]` beside `encode_frame`; `encode_frame` reuses it. |
+| `uc_remote/src/lib.rs:14-21` | new modules + re-exports. |
+| `uc_remote/tests/client_fake_edge.rs` | trimmed to the convenience-layer scenarios (Task 10). |
+| `uc_remote/tests/engine_fake_edge.rs` | **created**: all 27 scenarios ported to the halves. |
+| `uc_gateway/examples/hop_bench/remote_load.rs` | rebuilt on the halves in the `engine_load` shape; `--senders` dropped. |
+| `uc_gateway/examples/m12_gate.rs:881-1101, 1384-1415` | `run_remote_measurement`/`print_remote_stats` on the halves. |
+| `examples/uc_crashtest/tests/remote_lin.rs`, `examples/counter/src/bin/counter-remote.rs`, `uc_gateway/tests/{credits,credits_wire,failover,roundtrip}.rs` | convenience client; only `query`'s second argument changes. |
 | `docs/reference/remote-protocol.md` | §6 clarifications + a "client structure" note. |
 | `README.md:179`, `docs/QUICKSTART.md:454`, `docs/how-to/run-a-gateway.md:119` | one-line API-name touch-ups. |
 
-**Unaffected, verified:** `uc2_remote/src/conn.rs` and `frame.rs`'s wire types (the halves use `FramedConn::{read_frame, read_frame_buffered, next_buffered, write_all_bytes, write_frame, try_clone, shutdown, set_read_timeout, set_write_timeout}` unchanged); `fuzz/fuzz_targets/uc2_remote_frame.rs`, `fuzz/src/seeds.rs`, `fuzz/src/bin/seed_corpus.rs` (they import only `uc2_remote::frame::*`); `uc2_gateway/src/{edge,conn}.rs` (they import only `frame` + `conn`); `uc2_gateway/examples/hop_bench/{blaster,dummy_edge,stats,engine_load}.rs`; `uc2_gateway/tests/{bin_smoke,config_file}.rs` (zero `uc2_remote` references).
+**Unaffected, verified:** `uc_remote/src/conn.rs` and `frame.rs`'s wire types (the halves use `FramedConn::{read_frame, read_frame_buffered, next_buffered, write_all_bytes, write_frame, try_clone, shutdown, set_read_timeout, set_write_timeout}` unchanged); `fuzz/fuzz_targets/uc_remote_frame.rs`, `fuzz/src/seeds.rs`, `fuzz/src/bin/seed_corpus.rs` (they import only `uc_remote::frame::*`); `uc_gateway/src/{edge,conn}.rs` (they import only `frame` + `conn`); `uc_gateway/examples/hop_bench/{blaster,dummy_edge,stats,engine_load}.rs`; `uc_gateway/tests/{bin_smoke,config_file}.rs` (zero `uc_remote` references).
 
 ---
 
@@ -132,7 +132,7 @@ Five cursors and who may write each. **Every atomic in this design has exactly o
 
 **The ring safety invariant:** `ack <= send <= write`, and the submitter only ever writes bytes into `[write, ack + capacity)`. Therefore the byte range `[ack, write)` — everything the writer might still send or re-send — is never touched by the submitter. `release_to` enforces `ack <= send` by clamping to `send`; a redial's rewind enforces `send >= ack` by taking a `max`. This is why no lock is needed between the two threads.
 
-**Reclaim is keyed on slot completion, not on `acked_seq`.** The edge advances `acked_seq` with `fetch_max(seq)` on **SUBMIT only** (`uc2_gateway/src/conn.rs:309`) — a QUERY never advances it, so `acked_seq` is not a contiguous prefix and cannot drive reclaim. The submitter instead walks `reclaim_seq` forward while the slot at that seq is FREE (completed, timed out or aborted), releasing `off + len` as it goes.
+**Reclaim is keyed on slot completion, not on `acked_seq`.** The edge advances `acked_seq` with `fetch_max(seq)` on **SUBMIT only** (`uc_gateway/src/conn.rs:309`) — a QUERY never advances it, so `acked_seq` is not a contiguous prefix and cannot drive reclaim. The submitter instead walks `reclaim_seq` forward while the slot at that seq is FREE (completed, timed out or aborted), releasing `off + len` as it goes.
 
 **Seqs are never burned.** `try_submit` checks ring space *before* it assigns a seq (it is the only producer, so check-then-push is race-free) and the slot claim cannot fail once the inflight check has passed, so the on-wire seq sequence is gap-free and strictly increasing from 1.
 
@@ -141,9 +141,9 @@ Five cursors and who may write each. **Every atomic in this design has exactly o
 ### Task 1: Foundations — `WaitCell` and `encode_header_into`
 
 **Files:**
-- Create: `uc2_remote/src/park.rs`
-- Modify: `uc2_remote/src/frame.rs:120-133` (add `encode_header_into`, make `encode_frame` use it)
-- Modify: `uc2_remote/src/lib.rs:14-18` (declare `pub(crate) mod park;`)
+- Create: `uc_remote/src/park.rs`
+- Modify: `uc_remote/src/frame.rs:120-133` (add `encode_header_into`, make `encode_frame` use it)
+- Modify: `uc_remote/src/lib.rs:14-18` (declare `pub(crate) mod park;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -153,7 +153,7 @@ Five cursors and who may write each. **Every atomic in this design has exactly o
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc2_remote/src/park.rs` with the implementation stubbed out but the tests written:
+Create `uc_remote/src/park.rs` with the implementation stubbed out but the tests written:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -161,7 +161,7 @@ Create `uc2_remote/src/park.rs` with the implementation stubbed out but the test
 
 //! `WaitCell` — a seq-stamped park/wake pair.
 //!
-//! Ported in shape (not as a dependency) from `uc2_client`'s
+//! Ported in shape (not as a dependency) from `uc_client`'s
 //! `RingWaitHandle` usage: this crate's small dependency set is an advertised
 //! property, so the ~40 lines are copied rather than pulled in.
 //!
@@ -247,13 +247,13 @@ mod tests {
 }
 ```
 
-Add to `uc2_remote/src/lib.rs`, after `pub mod frame;` (line 17):
+Add to `uc_remote/src/lib.rs`, after `pub mod frame;` (line 17):
 
 ```rust
 pub(crate) mod park;
 ```
 
-Add to `uc2_remote/src/frame.rs`, in the `#[cfg(test)] mod tests` block at the end of the file (create the block if the file has none):
+Add to `uc_remote/src/frame.rs`, in the `#[cfg(test)] mod tests` block at the end of the file (create the block if the file has none):
 
 ```rust
 #[cfg(test)]
@@ -281,12 +281,12 @@ mod header_tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --lib`
+Run: `cargo test -p uc_remote --lib`
 Expected: FAIL — `cannot find function 'encode_header_into' in this scope`, and the three `park` tests panic with `not implemented`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `uc2_remote/src/park.rs`, replace the two `unimplemented!()` bodies:
+In `uc_remote/src/park.rs`, replace the two `unimplemented!()` bodies:
 
 ```rust
     /// Publish a wake. `SeqCst` on both the bump and the `waiters` load is
@@ -313,7 +313,7 @@ In `uc2_remote/src/park.rs`, replace the two `unimplemented!()` bodies:
     }
 ```
 
-In `uc2_remote/src/frame.rs`, replace the body of `encode_frame` (lines 120–133) and add the new function above it:
+In `uc_remote/src/frame.rs`, replace the body of `encode_frame` (lines 120–133) and add the new function above it:
 
 ```rust
 /// The 24 header bytes for a frame of `payload_len` bytes, as a stack array —
@@ -351,7 +351,7 @@ pub fn encode_frame(out: &mut Vec<u8>, h: Header, payload: &[u8]) {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote --lib && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote --lib && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 4 tests pass (`park` x3, `header_tests` x1), clippy silent.
 
 - [ ] **Step 5: Commit**
@@ -359,7 +359,7 @@ Expected: PASS — 4 tests pass (`park` x3, `header_tests` x1), clippy silent.
 ```bash
 cd /home/claude/ultima/ultima_cluster
 git checkout -b uc2/m13b-remote-client
-git add uc2_remote/src/park.rs uc2_remote/src/frame.rs uc2_remote/src/lib.rs
+git add uc_remote/src/park.rs uc_remote/src/frame.rs uc_remote/src/lib.rs
 git commit -m "feat(remote): WaitCell park/wake primitive + encode_header_into
 
 Foundations for the M13b split client: a seq-stamped park cell (no missed
@@ -372,8 +372,8 @@ can be written straight into a ring with no intermediate Vec."
 ### Task 2: The outgoing byte ring (`outgoing.rs`)
 
 **Files:**
-- Create: `uc2_remote/src/outgoing.rs`
-- Modify: `uc2_remote/src/lib.rs` (add `pub(crate) mod outgoing;`)
+- Create: `uc_remote/src/outgoing.rs`
+- Modify: `uc_remote/src/lib.rs` (add `pub(crate) mod outgoing;`)
 
 **Interfaces:**
 - Consumes: `crate::park::WaitCell` (Task 1); `crate::frame::{encode_header_into, Header, HEADER_LEN}` (Task 1).
@@ -399,7 +399,7 @@ can be written straight into a ring with no intermediate Vec."
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc2_remote/src/outgoing.rs`:
+Create `uc_remote/src/outgoing.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -631,7 +631,7 @@ mod tests {
 }
 ```
 
-Add to `uc2_remote/src/lib.rs`:
+Add to `uc_remote/src/lib.rs`:
 
 ```rust
 pub(crate) mod outgoing;
@@ -639,12 +639,12 @@ pub(crate) mod outgoing;
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --lib outgoing`
+Run: `cargo test -p uc_remote --lib outgoing`
 Expected: FAIL — all six tests panic with `not implemented`.
 
 - [ ] **Step 3: Write the implementation**
 
-Replace the six `unimplemented!()` bodies in `uc2_remote/src/outgoing.rs`:
+Replace the six `unimplemented!()` bodies in `uc_remote/src/outgoing.rs`:
 
 ```rust
     /// Bytes the producer may still write. Producer-only: `ack` has a single
@@ -754,14 +754,14 @@ Replace the six `unimplemented!()` bodies in `uc2_remote/src/outgoing.rs`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote --lib outgoing && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote --lib outgoing && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 6 tests, clippy silent.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/outgoing.rs uc2_remote/src/lib.rs
+git add uc_remote/src/outgoing.rs uc_remote/src/lib.rs
 git commit -m "feat(remote): SPSC outgoing byte ring
 
 The submitter encodes frames straight into preallocated bytes and the writer
@@ -776,8 +776,8 @@ copy_range and the forward-only send cursor."
 ### Task 3: The completion queue and its arena (`completion.rs`)
 
 **Files:**
-- Create: `uc2_remote/src/completion.rs`
-- Modify: `uc2_remote/src/lib.rs` (add `pub(crate) mod completion;`)
+- Create: `uc_remote/src/completion.rs`
+- Modify: `uc_remote/src/lib.rs` (add `pub(crate) mod completion;`)
 
 **Interfaces:**
 - Consumes: `crate::park::WaitCell` (Task 1).
@@ -803,7 +803,7 @@ copy_range and the forward-only send cursor."
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc2_remote/src/completion.rs`:
+Create `uc_remote/src/completion.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1006,7 +1006,7 @@ mod tests {
 }
 ```
 
-Add to `uc2_remote/src/lib.rs`:
+Add to `uc_remote/src/lib.rs`:
 
 ```rust
 pub(crate) mod completion;
@@ -1014,12 +1014,12 @@ pub(crate) mod completion;
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --lib completion`
+Run: `cargo test -p uc_remote --lib completion`
 Expected: FAIL — six tests panic with `not implemented`.
 
 - [ ] **Step 3: Write the implementation**
 
-Replace the five `unimplemented!()` bodies in `uc2_remote/src/completion.rs`:
+Replace the five `unimplemented!()` bodies in `uc_remote/src/completion.rs`:
 
 ```rust
     pub(crate) fn new(entries: usize, arena_bytes: usize) -> CompletionQueue {
@@ -1127,14 +1127,14 @@ Replace the five `unimplemented!()` bodies in `uc2_remote/src/completion.rs`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote --lib completion && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote --lib completion && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 6 tests, clippy silent.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/completion.rs uc2_remote/src/lib.rs
+git add uc_remote/src/completion.rs uc_remote/src/lib.rs
 git commit -m "feat(remote): bounded SPSC completion queue with a body arena
 
 Reader-to-poller hand-off: bodies copied once into an arena, one wake per read
@@ -1147,8 +1147,8 @@ crate's every-request-ends-once promise does not survive a dropped completion."
 ### Task 4: The slot table (`slots.rs`)
 
 **Files:**
-- Create: `uc2_remote/src/slots.rs`
-- Modify: `uc2_remote/src/lib.rs` (add `pub(crate) mod slots;`)
+- Create: `uc_remote/src/slots.rs`
+- Modify: `uc_remote/src/lib.rs` (add `pub(crate) mod slots;`)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -1178,11 +1178,11 @@ crate's every-request-ends-once promise does not survive a dropped completion."
   }
   ```
 
-**Design note (why this is a copy, not a dependency):** `uc2_client/src/slots.rs` owns the generation-tagged, single-CAS completion protocol this needs; `uc2_remote` must not depend on `uc2_client` (dependency-light is an advertised property), so the file is copied and adapted. Three adaptations: (1) `seq` is a full `u64` on this wire, so `resolve` takes `u64` and the u32-truncation argument of the shmem version is unnecessary; (2) the submitter assigns the seq (gap-free, from 1) and passes it in, so `claim` takes a seq instead of allocating one — a "slot busy" claim is impossible because the inflight cap plus the 2x table headroom keep a live occupant out of the way, and `claim` returns `false` for it so the caller can report backpressure without burning a seq; (3) each slot carries the request's **ring extent** `(off, len)`, its `sent` flag and its `not_before_ns`, which the writer thread needs for probe limits, retransmits and the ordered resend.
+**Design note (why this is a copy, not a dependency):** `uc_client/src/slots.rs` owns the generation-tagged, single-CAS completion protocol this needs; `uc_remote` must not depend on `uc_client` (dependency-light is an advertised property), so the file is copied and adapted. Three adaptations: (1) `seq` is a full `u64` on this wire, so `resolve` takes `u64` and the u32-truncation argument of the shmem version is unnecessary; (2) the submitter assigns the seq (gap-free, from 1) and passes it in, so `claim` takes a seq instead of allocating one — a "slot busy" claim is impossible because the inflight cap plus the 2x table headroom keep a live occupant out of the way, and `claim` returns `false` for it so the caller can report backpressure without burning a seq; (3) each slot carries the request's **ring extent** `(off, len)`, its `sent` flag and its `not_before_ns`, which the writer thread needs for probe limits, retransmits and the ordered resend.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc2_remote/src/slots.rs` with the module doc, the types, the `unimplemented!()` bodies and this test module:
+Create `uc_remote/src/slots.rs` with the module doc, the types, the `unimplemented!()` bodies and this test module:
 
 ```rust
 #[cfg(test)]
@@ -1283,12 +1283,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --lib slots`
+Run: `cargo test -p uc_remote --lib slots`
 Expected: FAIL — seven tests panic with `not implemented`.
 
 - [ ] **Step 3: Write the implementation**
 
-Write `uc2_remote/src/slots.rs` in full:
+Write `uc_remote/src/slots.rs` in full:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1296,8 +1296,8 @@ Write `uc2_remote/src/slots.rs` in full:
 
 //! Correlation slot table: generation-tagged, exactly-once completions.
 //!
-//! ADAPTED COPY of `uc2_client/src/slots.rs` (same invariants, same
-//! single-CAS completion protocol) rather than a dependency: `uc2_remote`'s
+//! ADAPTED COPY of `uc_client/src/slots.rs` (same invariants, same
+//! single-CAS completion protocol) rather than a dependency: `uc_remote`'s
 //! tiny dependency set is an advertised property of the crate.
 //!
 //! # The invariants this file owns
@@ -1358,7 +1358,7 @@ impl SlotTable {
     pub(crate) fn new(max_inflight: u32) -> SlotTable {
         assert!(max_inflight >= 1);
         // 2x headroom over the window, 64 floor — same sizing rule as
-        // `uc2_client`: it keeps a stuck (deadline-pending) occupant off the
+        // `uc_client`: it keeps a stuck (deadline-pending) occupant off the
         // index a fresh seq lands on.
         let n = (max_inflight.next_power_of_two() as usize * 2).max(64);
         let slots = (0..n)
@@ -1551,17 +1551,17 @@ impl SlotTable {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote --lib slots && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote --lib slots && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 7 tests, clippy silent.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/slots.rs uc2_remote/src/lib.rs
+git add uc_remote/src/slots.rs uc_remote/src/lib.rs
 git commit -m "feat(remote): generation-tagged slot table
 
-Adapted copy of uc2_client's SlotTable (no dependency: uc2_remote stays
+Adapted copy of uc_client's SlotTable (no dependency: uc_remote stays
 dependency-light) with a full-u64 seq assigned by the submitter, plus the ring
 extent, sent flag and not_before deadline the writer thread steers on."
 ```
@@ -1571,11 +1571,11 @@ extent, sent flag and not_before deadline the writer thread steers on."
 ### Task 5: `Link` — config, dial/HELLO, the two threads (no redirect yet)
 
 **Files:**
-- Create: `uc2_remote/src/engine.rs` (config, stats, the halves' skeleton)
-- Create: `uc2_remote/src/link.rs` (shared state, dial scan, writer + reader threads)
-- Create: `uc2_remote/tests/engine_fake_edge.rs` (the halves' scenario suite; grows in Tasks 6–9)
-- Modify: `uc2_remote/src/lib.rs` (modules + re-exports)
-- Modify: `uc2_remote/src/client.rs:97-333` — **delete** the `RemoteConfig`, `RemoteStats` and `RemoteResponse` definitions (they move to `engine.rs` verbatim plus new fields) and `use crate::engine::{RemoteConfig, RemoteResponse, RemoteStats};` instead, so the old client keeps compiling until Task 11.
+- Create: `uc_remote/src/engine.rs` (config, stats, the halves' skeleton)
+- Create: `uc_remote/src/link.rs` (shared state, dial scan, writer + reader threads)
+- Create: `uc_remote/tests/engine_fake_edge.rs` (the halves' scenario suite; grows in Tasks 6–9)
+- Modify: `uc_remote/src/lib.rs` (modules + re-exports)
+- Modify: `uc_remote/src/client.rs:97-333` — **delete** the `RemoteConfig`, `RemoteStats` and `RemoteResponse` definitions (they move to `engine.rs` verbatim plus new fields) and `use crate::engine::{RemoteConfig, RemoteResponse, RemoteStats};` instead, so the old client keeps compiling until Task 11.
 
 **Interfaces:**
 - Consumes: `OutRing` (Task 2), `CompletionQueue`/`Record`/`OutcomeTag` (Task 3), `SlotTable`/`ReqKind`/`Resolve` (Task 4), `WaitCell` (Task 1), `FramedConn` + `frame::*` (existing).
@@ -1609,7 +1609,7 @@ extent, sent flag and not_before deadline the writer thread steers on."
 
 - [ ] **Step 1: Write the failing test**
 
-Create `uc2_remote/tests/engine_fake_edge.rs`:
+Create `uc_remote/tests/engine_fake_edge.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1626,7 +1626,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::fake_edge::{Behaviour, FakeEdge};
-use uc2_remote::{RemoteConfig, RemoteEngine};
+use uc_remote::{RemoteConfig, RemoteEngine};
 
 const APP: &str = "fakeapp";
 const WAIT: Duration = Duration::from_secs(10);
@@ -1701,7 +1701,7 @@ fn a_dropped_connection_is_re_established_by_the_writer_thread() {
 #[test]
 fn a_config_that_cannot_work_is_refused_by_name() {
     let bad = |c: RemoteConfig, needle: &str| match RemoteEngine::connect(c) {
-        Err(uc2_remote::RemoteError::Config(m)) => {
+        Err(uc_remote::RemoteError::Config(m)) => {
             assert!(m.contains(needle), "message {m:?} must name {needle:?}")
         }
         other => panic!("expected a Config refusal naming {needle:?}, got {other:?}"),
@@ -1722,19 +1722,19 @@ fn a_config_that_cannot_work_is_refused_by_name() {
 #[test]
 fn no_reachable_member_is_reported() {
     let e = RemoteEngine::connect(cfg(vec!["127.0.0.1:1".into()])).unwrap_err();
-    assert!(matches!(e, uc2_remote::RemoteError::NoMembersReachable), "got {e:?}");
+    assert!(matches!(e, uc_remote::RemoteError::NoMembersReachable), "got {e:?}");
 }
 
 #[test]
 fn hello_refused_is_reported_by_connect() {
     let edge = FakeEdge::spawn(Behaviour {
-        refuse_hello: Some(uc2_remote::frame::HELLO_REFUSED_APP_ID),
+        refuse_hello: Some(uc_remote::frame::HELLO_REFUSED_APP_ID),
         ..Default::default()
     });
     let e = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap_err();
     match e {
-        uc2_remote::RemoteError::HelloRefused { reason, .. } => {
-            assert_eq!(reason, uc2_remote::frame::HELLO_REFUSED_APP_ID)
+        uc_remote::RemoteError::HelloRefused { reason, .. } => {
+            assert_eq!(reason, uc_remote::frame::HELLO_REFUSED_APP_ID)
         }
         other => panic!("expected HelloRefused, got {other:?}"),
     }
@@ -1744,7 +1744,7 @@ fn hello_refused_is_reported_by_connect() {
 fn a_faulted_member_is_skipped_and_the_next_one_serves() {
     let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
     let bad = FakeEdge::spawn(Behaviour {
-        refuse_hello: Some(uc2_remote::frame::HELLO_REFUSED_FAULTED),
+        refuse_hello: Some(uc_remote::frame::HELLO_REFUSED_FAULTED),
         ..Default::default()
     });
     let (send, _poll) =
@@ -1757,24 +1757,24 @@ fn a_faulted_member_is_skipped_and_the_next_one_serves() {
 #[test]
 fn a_cluster_of_faulted_edges_is_unreachable() {
     let a = FakeEdge::spawn(Behaviour {
-        refuse_hello: Some(uc2_remote::frame::HELLO_REFUSED_FAULTED),
+        refuse_hello: Some(uc_remote::frame::HELLO_REFUSED_FAULTED),
         ..Default::default()
     });
     let b = FakeEdge::spawn(Behaviour {
-        refuse_hello: Some(uc2_remote::frame::HELLO_REFUSED_BUSY),
+        refuse_hello: Some(uc_remote::frame::HELLO_REFUSED_BUSY),
         ..Default::default()
     });
     let e = RemoteEngine::connect(cfg(vec![a.addr.clone(), b.addr.clone()])).unwrap_err();
-    assert!(matches!(e, uc2_remote::RemoteError::NoMembersReachable), "got {e:?}");
+    assert!(matches!(e, uc_remote::RemoteError::NoMembersReachable), "got {e:?}");
 }
 
 #[test]
 fn halves_have_the_documented_thread_bounds() {
     fn assert_send<T: Send>() {}
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send::<uc2_remote::RemoteSendHalf>();
-    assert_send::<uc2_remote::RemotePollHalf>();
-    assert_send_sync::<uc2_remote::RemoteWaitHandle>();
+    assert_send::<uc_remote::RemoteSendHalf>();
+    assert_send::<uc_remote::RemotePollHalf>();
+    assert_send_sync::<uc_remote::RemoteWaitHandle>();
     assert_send_sync::<RemoteConfig>();
     // `RemoteSendHalf` is deliberately NOT `Sync`: one submitter thread owns
     // it. That is enforced structurally by its `PhantomData<Cell<()>>` field,
@@ -1787,12 +1787,12 @@ fn halves_have_the_documented_thread_bounds() {
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p uc2_remote --test engine_fake_edge`
-Expected: FAIL to compile — `unresolved import uc2_remote::RemoteEngine`.
+Run: `cargo test -p uc_remote --test engine_fake_edge`
+Expected: FAIL to compile — `unresolved import uc_remote::RemoteEngine`.
 
 - [ ] **Step 3: Write the implementation — `engine.rs`**
 
-Create `uc2_remote/src/engine.rs`. Move `RemoteConfig` (with its full doc comments) from `client.rs:97-229`, `RemoteStats` from `client.rs:232-260` and `RemoteResponse` from `client.rs:262-273` verbatim, then add:
+Create `uc_remote/src/engine.rs`. Move `RemoteConfig` (with its full doc comments) from `client.rs:97-229`, `RemoteStats` from `client.rs:232-260` and `RemoteResponse` from `client.rs:262-273` verbatim, then add:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1800,7 +1800,7 @@ Create `uc2_remote/src/engine.rs`. Move `RemoteConfig` (with its full doc commen
 
 //! The split client: `RemoteEngine::connect` returns a [`RemoteSendHalf`]
 //! (one submitter thread, nonblocking) and a [`RemotePollHalf`] (one poller
-//! thread), mirroring `uc2_client`'s `Engine` over a TCP connection.
+//! thread), mirroring `uc_client`'s `Engine` over a TCP connection.
 //!
 //! # The contract
 //!
@@ -1926,7 +1926,7 @@ pub enum RemoteOutcome<'a> {
     Closed,
 }
 
-/// Constructor namespace, like `uc2_client::Engine`.
+/// Constructor namespace, like `uc_client::Engine`.
 pub struct RemoteEngine;
 
 impl RemoteEngine {
@@ -2086,7 +2086,7 @@ Note `RemoteResponse` stays exactly as it is today (`position`, `bytes: Bytes`, 
 
 - [ ] **Step 4: Write the implementation — `link.rs`**
 
-Create `uc2_remote/src/link.rs`:
+Create `uc_remote/src/link.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -2793,7 +2793,7 @@ impl Link {
 
 and make `Link::close` tolerate being called after `close_from_thread` (the `swap` already does: it then only joins the threads, which is why `close` re-reads `threads` under its own lock).
 
-Update `uc2_remote/src/lib.rs`:
+Update `uc_remote/src/lib.rs`:
 
 ```rust
 pub mod client;
@@ -2820,14 +2820,14 @@ pub use error::{FrameError, RemoteError};
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — the 9 new `engine_fake_edge` tests plus the existing 27 `client_fake_edge` tests (the old client still works, it only imports its config types from `engine` now) and the unit tests from Tasks 1–4.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/engine.rs uc2_remote/src/link.rs uc2_remote/src/lib.rs uc2_remote/src/client.rs uc2_remote/tests/engine_fake_edge.rs
+git add uc_remote/src/engine.rs uc_remote/src/link.rs uc_remote/src/lib.rs uc_remote/src/client.rs uc_remote/tests/engine_fake_edge.rs
 git commit -m "feat(remote): Link — dial/HELLO, writer and reader threads, halves skeleton
 
 RemoteEngine::connect dials (redirect-at-handshake and leader-hop ported
@@ -2841,10 +2841,10 @@ move to engine.rs so the old client keeps compiling until it is deleted."
 ### Task 6: `try_submit` / `try_query` / `poll` end to end
 
 **Files:**
-- Modify: `uc2_remote/src/outgoing.rs` — split `push_frame` into `stage_frame` + `commit` (see Step 1's rationale), keep `push_frame` as their composition.
-- Modify: `uc2_remote/src/engine.rs` — `RemoteSendHalf::{try_submit, try_query, send, reclaim}`.
-- Modify: `uc2_remote/src/link.rs` — `on_frame`'s `FrameType::Response` arm; `mark_sent` accounting in `drain_ring`.
-- Modify: `uc2_remote/tests/engine_fake_edge.rs` — port scenario #1 and #7.
+- Modify: `uc_remote/src/outgoing.rs` — split `push_frame` into `stage_frame` + `commit` (see Step 1's rationale), keep `push_frame` as their composition.
+- Modify: `uc_remote/src/engine.rs` — `RemoteSendHalf::{try_submit, try_query, send, reclaim}`.
+- Modify: `uc_remote/src/link.rs` — `on_frame`'s `FrameType::Response` arm; `mark_sent` accounting in `drain_ring`.
+- Modify: `uc_remote/tests/engine_fake_edge.rs` — port scenario #1 and #7.
 
 **Interfaces:**
 - Consumes: everything from Tasks 2–5.
@@ -2862,7 +2862,7 @@ move to engine.rs so the old client keeps compiling until it is deleted."
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `uc2_remote/src/outgoing.rs`'s test module:
+Add to `uc_remote/src/outgoing.rs`'s test module:
 
 ```rust
     #[test]
@@ -2878,18 +2878,18 @@ Add to `uc2_remote/src/outgoing.rs`'s test module:
     }
 ```
 
-Add to `uc2_remote/tests/engine_fake_edge.rs` (ports of `client_fake_edge.rs`'s `submit_pipelined_under_credits`, **23–50**, and `query_round_trips_and_carries_the_linearizable_flag`, **150–160**):
+Add to `uc_remote/tests/engine_fake_edge.rs` (ports of `client_fake_edge.rs`'s `submit_pipelined_under_credits`, **23–50**, and `query_round_trips_and_carries_the_linearizable_flag`, **150–160**):
 
 ```rust
 use std::sync::atomic::Ordering as AtomicOrdering;
-use uc2_remote::{Consistency, RemoteOutcome, SubmitError};
+use uc_remote::{Consistency, RemoteOutcome, SubmitError};
 
 /// Drive `n` requests through the halves, returning `(user_data, position,
 /// body, replayed)` in completion order. Panics on any non-`Response`
 /// outcome, so a test that expects responses says so once, here.
 fn run_submits(
-    send: &uc2_remote::RemoteSendHalf,
-    poll: &mut uc2_remote::RemotePollHalf,
+    send: &uc_remote::RemoteSendHalf,
+    poll: &mut uc_remote::RemotePollHalf,
     n: u64,
     payload: impl Fn(u64) -> Vec<u8>,
 ) -> Vec<(u64, u64, Vec<u8>, bool)> {
@@ -2978,12 +2978,12 @@ fn a_payload_larger_than_the_ring_is_refused_at_the_door() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --lib outgoing && cargo test -p uc2_remote --test engine_fake_edge`
+Run: `cargo test -p uc_remote --lib outgoing && cargo test -p uc_remote --test engine_fake_edge`
 Expected: FAIL to compile — `no method named 'stage_frame'`, `no method named 'try_submit'`.
 
 - [ ] **Step 3: Split the ring's push in two**
 
-In `uc2_remote/src/outgoing.rs`, replace `push_frame`'s body and add the pair. The reason the copy and the publish must be separable: the writer thread may send a frame the instant `write` moves, so the **slot must be published before the bytes are visible** — otherwise a response can arrive for a seq whose slot does not exist yet and the completion is lost.
+In `uc_remote/src/outgoing.rs`, replace `push_frame`'s body and add the pair. The reason the copy and the publish must be separable: the writer thread may send a frame the instant `write` moves, so the **slot must be published before the bytes are visible** — otherwise a response can arrive for a seq whose slot does not exist yet and the completion is lost.
 
 ```rust
     /// Copy a frame in at the write cursor **without publishing it**. The
@@ -3031,13 +3031,13 @@ In `uc2_remote/src/outgoing.rs`, replace `push_frame`'s body and add the pair. T
 
 - [ ] **Step 4: Implement the submit path**
 
-Add to `uc2_remote/src/engine.rs`:
+Add to `uc_remote/src/engine.rs`:
 
 ```rust
 impl RemoteSendHalf {
     /// Reclaim the ring bytes of every completed request at the head of the
     /// window. Keyed on slot completion, NOT on `acked_seq`: the edge advances
-    /// `acked_seq` on SUBMIT only (`uc2_gateway/src/conn.rs:309`), so it is not
+    /// `acked_seq` on SUBMIT only (`uc_gateway/src/conn.rs:309`), so it is not
     /// a contiguous prefix and cannot drive reclaim.
     fn reclaim(&self) {
         let link = &self.link;
@@ -3143,7 +3143,7 @@ impl RemoteSendHalf {
 }
 ```
 
-Add `SlotTable::is_free` to `uc2_remote/src/slots.rs`:
+Add `SlotTable::is_free` to `uc_remote/src/slots.rs`:
 
 ```rust
     /// SUBMITTER ONLY: is the index this seq lands on unoccupied? Checked
@@ -3153,7 +3153,7 @@ Add `SlotTable::is_free` to `uc2_remote/src/slots.rs`:
     }
 ```
 
-In `uc2_remote/src/link.rs`, add the `Response` arm to `on_frame` (before the `_ =>` arm):
+In `uc_remote/src/link.rs`, add the `Response` arm to `on_frame` (before the `_ =>` arm):
 
 ```rust
         FrameType::Response => {
@@ -3260,14 +3260,14 @@ fn cursor_at_send_pos(link: &Arc<Link>) -> u64 {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — the four new tests plus everything from Tasks 1–5.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/outgoing.rs uc2_remote/src/engine.rs uc2_remote/src/slots.rs uc2_remote/src/link.rs uc2_remote/tests/engine_fake_edge.rs
+git add uc_remote/src/outgoing.rs uc_remote/src/engine.rs uc_remote/src/slots.rs uc_remote/src/link.rs uc_remote/tests/engine_fake_edge.rs
 git commit -m "feat(remote): try_submit/try_query/poll end to end
 
 The submitter stages a frame into the ring, publishes the slot, then commits
@@ -3281,9 +3281,9 @@ client_fake_edge's submit_pipelined_under_credits and the query round trip."
 ### Task 7: Credits, `STATUS`, `acked_seq` — the window
 
 **Files:**
-- Modify: `uc2_remote/tests/common/fake_edge.rs` — one additive `Behaviour` field (`shrink_credits_to`) and its `Action::Status`.
-- Modify: `uc2_remote/tests/engine_fake_edge.rs` — window scenarios.
-- Modify: `uc2_remote/src/engine.rs` — extract the window test into `pub(crate) fn admissible` so it can be unit-tested exhaustively.
+- Modify: `uc_remote/tests/common/fake_edge.rs` — one additive `Behaviour` field (`shrink_credits_to`) and its `Action::Status`.
+- Modify: `uc_remote/tests/engine_fake_edge.rs` — window scenarios.
+- Modify: `uc_remote/src/engine.rs` — extract the window test into `pub(crate) fn admissible` so it can be unit-tested exhaustively.
 
 **Interfaces:**
 - Consumes: Task 6's `send`.
@@ -3291,7 +3291,7 @@ client_fake_edge's submit_pipelined_under_credits and the query round trip."
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `uc2_remote/src/engine.rs` a unit-test module:
+Add to `uc_remote/src/engine.rs` a unit-test module:
 
 ```rust
 #[cfg(test)]
@@ -3331,7 +3331,7 @@ mod window_tests {
 }
 ```
 
-Add to `uc2_remote/tests/common/fake_edge.rs`:
+Add to `uc_remote/tests/common/fake_edge.rs`:
 
 ```rust
 // in `pub struct Behaviour`, after `delay`:
@@ -3367,9 +3367,9 @@ Add to `uc2_remote/tests/common/fake_edge.rs`:
             }
 ```
 
-(add `Status` to the file's `uc2_remote::frame::{..}` import list if it is not already there).
+(add `Status` to the file's `uc_remote::frame::{..}` import list if it is not already there).
 
-Add to `uc2_remote/tests/engine_fake_edge.rs`:
+Add to `uc_remote/tests/engine_fake_edge.rs`:
 
 ```rust
 #[test]
@@ -3428,12 +3428,12 @@ fn the_local_inflight_cap_binds_below_the_edges_grant() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --lib window_tests && cargo test -p uc2_remote --test engine_fake_edge`
+Run: `cargo test -p uc_remote --lib window_tests && cargo test -p uc_remote --test engine_fake_edge`
 Expected: FAIL — `cannot find function 'admissible'`; `no field 'shrink_credits_to'`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `uc2_remote/src/engine.rs`, extract the rule and call it from `send`:
+In `uc_remote/src/engine.rs`, extract the rule and call it from `send`:
 
 ```rust
 /// The whole admission rule, in one place so it can be tested exhaustively:
@@ -3470,14 +3470,14 @@ and in `send`, replace the two separate checks with:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 4 unit tests + 3 integration tests added.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/engine.rs uc2_remote/tests/engine_fake_edge.rs uc2_remote/tests/common/fake_edge.rs
+git add uc_remote/src/engine.rs uc_remote/tests/engine_fake_edge.rs uc_remote/tests/common/fake_edge.rs
 git commit -m "feat(remote): the admission window, tested exhaustively
 
 One `admissible` function for the edge's absolute grant and the local inflight
@@ -3491,9 +3491,9 @@ one."
 ### Task 8: Failover — REDIRECT, LEADER_CHANGED, RETRY, the not-serving latch, probe-before-flush, resend on redial
 
 **Files:**
-- Modify: `uc2_remote/src/link.rs` — `on_frame`'s failover arms; `flush_limit`/`drain_ring` probe rule; the writer's `pending` resend list; `redial`'s resend scan.
-- Modify: `uc2_remote/src/engine.rs` — publish `oldest_unreclaimed` from `reclaim`.
-- Modify: `uc2_remote/tests/engine_fake_edge.rs` — ports of scenarios #2, #3, #4, #5, #11, #12, #13, #15, #23.
+- Modify: `uc_remote/src/link.rs` — `on_frame`'s failover arms; `flush_limit`/`drain_ring` probe rule; the writer's `pending` resend list; `redial`'s resend scan.
+- Modify: `uc_remote/src/engine.rs` — publish `oldest_unreclaimed` from `reclaim`.
+- Modify: `uc_remote/tests/engine_fake_edge.rs` — ports of scenarios #2, #3, #4, #5, #11, #12, #13, #15, #23.
 
 **Interfaces:**
 - Consumes: Tasks 5–7.
@@ -3515,7 +3515,7 @@ one."
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `uc2_remote/tests/engine_fake_edge.rs`:
+Add to `uc_remote/tests/engine_fake_edge.rs`:
 
 ```rust
 #[test]
@@ -3700,12 +3700,12 @@ fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --test engine_fake_edge`
+Run: `cargo test -p uc_remote --test engine_fake_edge`
 Expected: FAIL — the redirect/retry tests hang until `WAIT` and then assert (`got.len() == 0`), because `on_frame` still ignores `REDIRECT`/`RETRY`; the probe test sees all 50 frames at the wrong edge.
 
 - [ ] **Step 3: Publish the reclaim cursor**
 
-In `uc2_remote/src/link.rs` add the field to `Link` (`pub(crate) oldest_unreclaimed: AtomicU64`, initialised to `1`), and in `engine.rs`'s `reclaim`, after `self.reclaim_seq.set(seq);` add:
+In `uc_remote/src/link.rs` add the field to `Link` (`pub(crate) oldest_unreclaimed: AtomicU64`, initialised to `1`), and in `engine.rs`'s `reclaim`, after `self.reclaim_seq.set(seq);` add:
 
 ```rust
         // The writer thread's resend scan starts here: the oldest seq whose
@@ -3715,7 +3715,7 @@ In `uc2_remote/src/link.rs` add the field to `Link` (`pub(crate) oldest_unreclai
 
 - [ ] **Step 4: Implement the failover arms**
 
-In `uc2_remote/src/link.rs`, replace `on_frame`'s tail (everything after the `Response` arm added in Task 6) with the full dispatch, ported from `client.rs:875-1038`:
+In `uc_remote/src/link.rs`, replace `on_frame`'s tail (everything after the `Response` arm added in Task 6) with the full dispatch, ported from `client.rs:875-1038`:
 
 ```rust
         FrameType::Status => {
@@ -3749,7 +3749,7 @@ In `uc2_remote/src/link.rs`, replace `on_frame`'s tail (everything after the `Re
                 // A statement about the edge's ROLE, not a transient shortage,
                 // and one that does not expire on this connection: the edge
                 // LATCHES a connection it has refused a write on
-                // (`uc2_gateway`'s `Conn::latch_not_serving`), so re-sending
+                // (`uc_gateway`'s `Conn::latch_not_serving`), so re-sending
                 // here would be refused for as long as this socket lived. Go
                 // somewhere else; the backoff above still paces it.
                 let preferred = link
@@ -3804,7 +3804,7 @@ In `uc2_remote/src/link.rs`, replace `on_frame`'s tail (everything after the `Re
 
 - [ ] **Step 5: Implement probe-before-flush and the resend list**
 
-In `uc2_remote/src/link.rs`, replace `flush_limit` and add the resend machinery:
+In `uc_remote/src/link.rs`, replace `flush_limit` and add the resend machinery:
 
 ```rust
 /// May the writer send MORE than the single probe frame?
@@ -3956,14 +3956,14 @@ and after it set the writer's frame cursor: `*cursor = cursor_at_send_pos(link);
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 9 new scenarios plus everything before them.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/link.rs uc2_remote/src/engine.rs uc2_remote/tests/engine_fake_edge.rs
+git add uc_remote/src/link.rs uc_remote/src/engine.rs uc_remote/tests/engine_fake_edge.rs
 git commit -m "feat(remote): failover on the halves — redirect, retry, probe, resend
 
 REDIRECT / LEADER_CHANGED / RETRY (incl. the not-serving latch and the
@@ -3977,8 +3977,8 @@ reader threads, with nine of client_fake_edge's scenarios ported."
 ### Task 9: Liveness and budgets — `UNKNOWN`, `EXPIRED`, `PING`/`dead_after`, the mid-frame stall, `request_timeout`, `Closed`
 
 **Files:**
-- Modify: `uc2_remote/src/link.rs` — `on_frame`'s `Unknown` and `HelloRefused` arms.
-- Modify: `uc2_remote/tests/engine_fake_edge.rs` — ports of scenarios #6, #8, #18, #19, #20, #22, #24, #25, #26, #27 (incl. the `ParkingMember` helper).
+- Modify: `uc_remote/src/link.rs` — `on_frame`'s `Unknown` and `HelloRefused` arms.
+- Modify: `uc_remote/tests/engine_fake_edge.rs` — ports of scenarios #6, #8, #18, #19, #20, #22, #24, #25, #26, #27 (incl. the `ParkingMember` helper).
 
 **Interfaces:**
 - Consumes: Tasks 5–8.
@@ -4001,7 +4001,7 @@ reader threads, with nine of client_fake_edge's scenarios ported."
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `uc2_remote/tests/engine_fake_edge.rs`:
+Add to `uc_remote/tests/engine_fake_edge.rs`:
 
 ```rust
 /// Drive one request and return its outcome, discriminated as a small enum so
@@ -4019,8 +4019,8 @@ enum Got {
 /// `_send` is taken only so a call site reads like the old `Ticket::wait`
 /// pairs; the poll half is what actually resolves.
 fn one(
-    _send: &uc2_remote::RemoteSendHalf,
-    poll: &mut uc2_remote::RemotePollHalf,
+    _send: &uc_remote::RemoteSendHalf,
+    poll: &mut uc_remote::RemotePollHalf,
     user_data: u64,
     budget: Duration,
 ) -> Got {
@@ -4300,12 +4300,12 @@ fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --test engine_fake_edge`
+Run: `cargo test -p uc_remote --test engine_fake_edge`
 Expected: FAIL — `unknown_is_resolved_...` gets `Got::Nothing` (the `Unknown` arm is missing); the rest depend on it and on the `HelloRefused` mid-life arm.
 
 - [ ] **Step 3: Write the implementation**
 
-Add the last two arms to `on_frame` in `uc2_remote/src/link.rs`:
+Add the last two arms to `on_frame` in `uc_remote/src/link.rs`:
 
 ```rust
         FrameType::Unknown => {
@@ -4341,14 +4341,14 @@ Everything else this task tests is already in place (Task 5's sweep-inside-dial,
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote && cargo clippy -p uc2_remote --all-targets -- -D warnings`
+Run: `cargo test -p uc_remote && cargo clippy -p uc_remote --all-targets -- -D warnings`
 Expected: PASS — 10 new scenarios; total `engine_fake_edge` = 27 ports + 3 extra structural tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/link.rs uc2_remote/tests/engine_fake_edge.rs
+git add uc_remote/src/link.rs uc_remote/tests/engine_fake_edge.rs
 git commit -m "feat(remote): UNKNOWN, EXPIRED, liveness and the request_timeout budget
 
 The last two frame arms plus the ten remaining client_fake_edge scenarios:
@@ -4364,9 +4364,9 @@ dial pass."
 **Note on task boundaries:** the spec's sequence lists "the convenience client" and "delete the old client" as two steps, but both are the same file (`client.rs`) and the same set of names (`RemoteClient`, `Ticket`), so they cannot be split without an intermediate commit that does not compile. They are one task.
 
 **Files:**
-- Modify (rewrite): `uc2_remote/src/client.rs` — the old 1573-line `Inner { state: Mutex<State>, cv, .. }` client is **deleted**; what remains is ~260 lines of convenience over the halves.
-- Modify: `uc2_remote/src/lib.rs` — final export list.
-- Modify (trim): `uc2_remote/tests/client_fake_edge.rs` — down to the convenience-layer scenarios; everything else now lives in `engine_fake_edge.rs`.
+- Modify (rewrite): `uc_remote/src/client.rs` — the old 1573-line `Inner { state: Mutex<State>, cv, .. }` client is **deleted**; what remains is ~260 lines of convenience over the halves.
+- Modify: `uc_remote/src/lib.rs` — final export list.
+- Modify (trim): `uc_remote/tests/client_fake_edge.rs` — down to the convenience-layer scenarios; everything else now lives in `engine_fake_edge.rs`.
 
 **Interfaces:**
 - Consumes: `RemoteEngine`, `RemoteSendHalf`, `RemotePollHalf`, `RemoteWaitHandle`, `RemoteCompletion`, `RemoteOutcome`, `SubmitError`, `Consistency` (Tasks 5–9).
@@ -4392,7 +4392,7 @@ dial pass."
 
 - [ ] **Step 1: Write the failing tests**
 
-Replace `uc2_remote/tests/client_fake_edge.rs` entirely with the convenience-layer suite (the other 19 scenarios now live in `engine_fake_edge.rs`; the header comment says so):
+Replace `uc_remote/tests/client_fake_edge.rs` entirely with the convenience-layer suite (the other 19 scenarios now live in `engine_fake_edge.rs`; the header comment says so):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -4411,7 +4411,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::fake_edge::{Behaviour, FakeEdge};
-use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
+use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 
 const APP: &str = "fakeapp";
 const WAIT: Duration = Duration::from_secs(10);
@@ -4436,7 +4436,7 @@ fn submit_and_wait_round_trips() {
 
 #[test]
 fn tickets_may_outnumber_the_credit_window() {
-    // The shape `uc2_gateway/tests/credits.rs` and `failover.rs` rely on:
+    // The shape `uc_gateway/tests/credits.rs` and `failover.rs` rely on:
     // issue first, wait second, deeper than the grant. `submit` BLOCKS while
     // the window is closed — that block is the pacing.
     let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
@@ -4533,13 +4533,13 @@ fn a_request_that_is_never_answered_times_out() {
 #[test]
 fn hello_refused_is_reported_and_does_not_connect() {
     let edge = FakeEdge::spawn(Behaviour {
-        refuse_hello: Some(uc2_remote::frame::HELLO_REFUSED_APP_ID),
+        refuse_hello: Some(uc_remote::frame::HELLO_REFUSED_APP_ID),
         ..Default::default()
     });
     let err = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap_err();
     match err {
         RemoteError::HelloRefused { reason, .. } => {
-            assert_eq!(reason, uc2_remote::frame::HELLO_REFUSED_APP_ID)
+            assert_eq!(reason, uc_remote::frame::HELLO_REFUSED_APP_ID)
         }
         other => panic!("expected HelloRefused, got {other:?}"),
     }
@@ -4551,25 +4551,25 @@ fn client_handle_is_send_and_sync() {
     fn assert_send<T: Send>() {}
     assert_send_sync::<RemoteClient>();
     assert_send_sync::<RemoteConfig>();
-    assert_send::<uc2_remote::Ticket>();
+    assert_send::<uc_remote::Ticket>();
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_remote --test client_fake_edge`
+Run: `cargo test -p uc_remote --test client_fake_edge`
 Expected: FAIL to compile — `query` takes a `bool`, `shutdown` takes `self`, `client_fake_edge`'s old helpers are gone.
 
 - [ ] **Step 3: Rewrite `client.rs`**
 
-Replace `uc2_remote/src/client.rs` in full:
+Replace `uc_remote/src/client.rs` in full:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
 //! [`RemoteClient`] — the blocking convenience client, layered on the
-//! [`crate::RemoteEngine`] halves the way `uc2_client::Client` sits on its
+//! [`crate::RemoteEngine`] halves the way `uc_client::Client` sits on its
 //! `Engine`.
 //!
 //! # What this is for, and what it is not
@@ -4846,7 +4846,7 @@ fn poller_loop(mut poll: RemotePollHalf, stop: Arc<AtomicBool>, wait: RemoteWait
 }
 ```
 
-Set the final `uc2_remote/src/lib.rs`:
+Set the final `uc_remote/src/lib.rs`:
 
 ```rust
 pub mod client;
@@ -4882,14 +4882,14 @@ and update the crate doc's semver paragraph (`lib.rs:9-12`) to name both surface
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_remote && cargo clippy -p uc2_remote --all-targets -- -D warnings`
-Expected: PASS — 10 convenience scenarios + 30 halves scenarios + the unit tests. `wc -l uc2_remote/src/client.rs` is now under 300.
+Run: `cargo test -p uc_remote && cargo clippy -p uc_remote --all-targets -- -D warnings`
+Expected: PASS — 10 convenience scenarios + 30 halves scenarios + the unit tests. `wc -l uc_remote/src/client.rs` is now under 300.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_remote/src/client.rs uc2_remote/src/lib.rs uc2_remote/tests/client_fake_edge.rs
+git add uc_remote/src/client.rs uc_remote/src/lib.rs uc_remote/tests/client_fake_edge.rs
 git commit -m "feat(remote)!: RemoteClient is now a thin blocking layer over the halves
 
 The single-Mutex<State> client (one lock across submit, write and every
@@ -4904,9 +4904,9 @@ shutdown() takes &self."
 ### Task 11: Caller migration A — `hop_bench remote-load` on the halves
 
 **Files:**
-- Modify: `uc2_gateway/examples/hop_bench/remote_load.rs` — rebuilt in `engine_load.rs`'s measurement shape (lines 21–23 imports, 35–60 args, 62–164 `run`, 166–250 `measure`).
-- Modify: `uc2_gateway/examples/hop_bench/main.rs:60-61` — doc string of the `RemoteLoad` arm.
-- Verify: `uc2_gateway/examples/hop_bench/local.rs:157-190` never passes `--senders` (it does not — it passes `--gateways/--secs/--payload/--inflight/--conns` only), so dropping the flag needs no change there. `bench-infra/scripts/m13_hop_bench.py` likewise does not use `--senders` — confirm with `grep -n senders bench-infra/scripts/m13_hop_bench.py uc2_gateway/examples/hop_bench/local.rs` (expect: no output).
+- Modify: `uc_gateway/examples/hop_bench/remote_load.rs` — rebuilt in `engine_load.rs`'s measurement shape (lines 21–23 imports, 35–60 args, 62–164 `run`, 166–250 `measure`).
+- Modify: `uc_gateway/examples/hop_bench/main.rs:60-61` — doc string of the `RemoteLoad` arm.
+- Verify: `uc_gateway/examples/hop_bench/local.rs:157-190` never passes `--senders` (it does not — it passes `--gateways/--secs/--payload/--inflight/--conns` only), so dropping the flag needs no change there. `bench-infra/scripts/m13_hop_bench.py` likewise does not use `--senders` — confirm with `grep -n senders bench-infra/scripts/m13_hop_bench.py uc_gateway/examples/hop_bench/local.rs` (expect: no output).
 
 **Interfaces:**
 - Consumes: `RemoteEngine`, `RemoteSendHalf`, `RemotePollHalf`, `RemoteOutcome`, `SubmitError` (Task 10); `crate::stats::{SendClock, StreamStats, DRAIN_GRACE, report}` (unchanged).
@@ -4916,7 +4916,7 @@ shutdown() takes &self."
 
 - [ ] **Step 1: Rewrite the driver**
 
-Replace `uc2_gateway/examples/hop_bench/remote_load.rs` in full:
+Replace `uc_gateway/examples/hop_bench/remote_load.rs` in full:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -4935,7 +4935,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uc2_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, SubmitError};
+use uc_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, SubmitError};
 
 use crate::stats::{self, StreamStats};
 
@@ -5115,7 +5115,7 @@ fn drive_one(
 
 - [ ] **Step 2: Build it**
 
-Run: `cargo build -p uc2_gateway --examples --release`
+Run: `cargo build -p uc_gateway --examples --release`
 Expected: PASS.
 
 - [ ] **Step 3: Smoke it on the dev box (relative numbers only)**
@@ -5123,7 +5123,7 @@ Expected: PASS.
 Run, from the repo root:
 
 ```bash
-cargo build -p uc2_gateway --example hop_bench --release
+cargo build -p uc_gateway --example hop_bench --release
 target/release/examples/hop_bench dummy-edge --listen 127.0.0.1:19301 --credits 1024 &
 sleep 1
 target/release/examples/hop_bench remote-load --gateways 127.0.0.1:19301 --secs 3 --payload 64 --inflight 1024 --conns 1
@@ -5136,7 +5136,7 @@ Expected: the `RESULT {...}` line reports **at least 1,000,000 resp/s** where th
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_gateway/examples/hop_bench/remote_load.rs uc2_gateway/examples/hop_bench/main.rs
+git add uc_gateway/examples/hop_bench/remote_load.rs uc_gateway/examples/hop_bench/main.rs
 git commit -m "perf(hop_bench): remote-load on the RemoteEngine halves
 
 Same shape as the engine-load arm — one submitter loop, one poll thread,
@@ -5150,7 +5150,7 @@ driven out of its bottleneck, and SendHalf is !Sync by design."
 ### Task 12: Caller migration B — `m12_gate` client-remote on the halves
 
 **Files:**
-- Modify: `uc2_gateway/examples/m12_gate.rs:72` (import), `:881-909` (in-process gateway arm), `:911-1080` (`run_remote_measurement`), `:1082-1101` (`print_remote_stats`), `:1384-1415` (`run_client_remote_role`).
+- Modify: `uc_gateway/examples/m12_gate.rs:72` (import), `:881-909` (in-process gateway arm), `:911-1080` (`run_remote_measurement`), `:1082-1101` (`print_remote_stats`), `:1384-1415` (`run_client_remote_role`).
 
 **Interfaces:**
 - Consumes: Task 10's halves.
@@ -5159,7 +5159,7 @@ driven out of its bottleneck, and SendHalf is !Sync by design."
 - [ ] **Step 1: Change the import (line 72)**
 
 ```rust
-use uc2_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf, SubmitError};
+use uc_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf, SubmitError};
 ```
 
 - [ ] **Step 2: Rewrite `run_remote_measurement` (lines 911–1080)**
@@ -5306,7 +5306,7 @@ fn print_remote_stats(send: &RemoteSendHalf) {
 
 - [ ] **Step 4: Update the two call sites**
 
-`uc2_gateway/examples/m12_gate.rs:885-898` becomes:
+`uc_gateway/examples/m12_gate.rs:885-898` becomes:
 
 ```rust
     let leader_addr = edges[leader].local_addr();
@@ -5326,7 +5326,7 @@ fn print_remote_stats(send: &RemoteSendHalf) {
     send.shutdown();
 ```
 
-and `uc2_gateway/examples/m12_gate.rs:1399-1411` becomes:
+and `uc_gateway/examples/m12_gate.rs:1399-1411` becomes:
 
 ```rust
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
@@ -5346,17 +5346,17 @@ and `uc2_gateway/examples/m12_gate.rs:1399-1411` becomes:
 
 - [ ] **Step 5: Build and smoke**
 
-Run: `cargo build -p uc2_gateway --examples --release && cargo clippy -p uc2_gateway --all-targets -- -D warnings`
+Run: `cargo build -p uc_gateway --examples --release && cargo clippy -p uc_gateway --all-targets -- -D warnings`
 Expected: PASS.
 
-Run: `cargo run -p uc2_gateway --release --example m12_gate -- --help`
+Run: `cargo run -p uc_gateway --release --example m12_gate -- --help`
 Expected: the `client-remote` role is still listed with the same flags.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_gateway/examples/m12_gate.rs
+git add uc_gateway/examples/m12_gate.rs
 git commit -m "perf(m12_gate): client-remote arm on the RemoteEngine halves
 
 One submitter loop and an inline poll drain replace the Ticket-per-request
@@ -5370,7 +5370,7 @@ waiter pool; ClientStats is filled from the same counters as before."
 Both stay on the **convenience client**; the only incompatible change is `query`'s second argument.
 
 **Files:**
-- Modify: `examples/uc2-crashtest/tests/remote_lin.rs:109` (import), `:629`, `:1000`.
+- Modify: `examples/uc_crashtest/tests/remote_lin.rs:109` (import), `:629`, `:1000`.
 - Modify: `examples/counter/src/bin/counter-remote.rs:51` (import), `:182-189` (`query`).
 
 **Interfaces:**
@@ -5383,9 +5383,9 @@ Line 109:
 
 ```rust
 // before
-use uc2_remote::{RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats};
+use uc_remote::{RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats};
 // after
-use uc2_remote::{
+use uc_remote::{
     Consistency, RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats,
 };
 ```
@@ -5417,9 +5417,9 @@ Line 51:
 
 ```rust
 // before
-use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
+use uc_remote::{RemoteClient, RemoteConfig, RemoteError};
 // after
-use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
+use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 ```
 
 Lines 182–189:
@@ -5441,17 +5441,17 @@ fn query(client: &RemoteClient, linearizable: bool, deadline: Instant) -> Result
 
 - [ ] **Step 3: Build and run**
 
-Run: `cargo build -p counter -p uc2-crashtest --all-targets && cargo clippy -p counter -p uc2-crashtest --all-targets -- -D warnings`
+Run: `cargo build -p counter -p uc_crashtest --all-targets && cargo clippy -p counter -p uc_crashtest --all-targets -- -D warnings`
 Expected: PASS.
 
-Run: `cargo test -p uc2-crashtest --test remote_lin -- --nocapture`
+Run: `cargo test -p uc_crashtest --test remote_lin -- --nocapture`
 Expected: PASS — both envelope-on and envelope-off cases, `Linearizable`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add examples/uc2-crashtest/tests/remote_lin.rs examples/counter/src/bin/counter-remote.rs
+git add examples/uc_crashtest/tests/remote_lin.rs examples/counter/src/bin/counter-remote.rs
 git commit -m "refactor(examples): query takes Consistency, not a bool
 
 The crashtest capstone and the counter-remote reference client stay on the
@@ -5460,12 +5460,12 @@ blocking convenience client; only the query signature moved."
 
 ---
 
-### Task 14: Caller migration D — the `uc2_gateway` test suite
+### Task 14: Caller migration D — the `uc_gateway` test suite
 
 **Files:**
-- Modify: `uc2_gateway/tests/roundtrip.rs:20` (import), `:85`, `:91`, `:133`.
-- Modify: `uc2_gateway/tests/failover.rs:52` (import), `:261`.
-- Verify unchanged: `uc2_gateway/tests/credits.rs` (only `submit`/`wait`/`stats`/`shutdown`), `uc2_gateway/tests/credits_wire.rs` (`submit`/`wait`/`stats`/`is_connected`/`shutdown` + raw-socket work), `uc2_gateway/tests/bin_smoke.rs` and `config_file.rs` (no `uc2_remote` at all).
+- Modify: `uc_gateway/tests/roundtrip.rs:20` (import), `:85`, `:91`, `:133`.
+- Modify: `uc_gateway/tests/failover.rs:52` (import), `:261`.
+- Verify unchanged: `uc_gateway/tests/credits.rs` (only `submit`/`wait`/`stats`/`shutdown`), `uc_gateway/tests/credits_wire.rs` (`submit`/`wait`/`stats`/`is_connected`/`shutdown` + raw-socket work), `uc_gateway/tests/bin_smoke.rs` and `config_file.rs` (no `uc_remote` at all).
 
 **Interfaces:**
 - Consumes: Task 10.
@@ -5477,9 +5477,9 @@ Line 20:
 
 ```rust
 // before
-use uc2_remote::{RemoteClient, RemoteConfig};
+use uc_remote::{RemoteClient, RemoteConfig};
 // after
-use uc2_remote::{Consistency, RemoteClient, RemoteConfig};
+use uc_remote::{Consistency, RemoteClient, RemoteConfig};
 ```
 
 Lines 85, 91, 133:
@@ -5509,9 +5509,9 @@ Line 52:
 
 ```rust
 // before
-use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
+use uc_remote::{RemoteClient, RemoteConfig, RemoteError};
 // after
-use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
+use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 ```
 
 Line 261:
@@ -5531,14 +5531,14 @@ Lines 134–146 (`connected_addr`, `stats().leader_changes`), 173–180 (`leader
 
 - [ ] **Step 3: Run the suite**
 
-Run: `cargo test -p uc2_gateway && cargo clippy -p uc2_gateway --all-targets -- -D warnings`
+Run: `cargo test -p uc_gateway && cargo clippy -p uc_gateway --all-targets -- -D warnings`
 Expected: PASS — `credits`, `credits_wire`, `failover`, `roundtrip`, `bin_smoke`, `config_file`.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-git add uc2_gateway/tests/roundtrip.rs uc2_gateway/tests/failover.rs
+git add uc_gateway/tests/roundtrip.rs uc_gateway/tests/failover.rs
 git commit -m "test(gateway): query takes Consistency, not a bool"
 ```
 
@@ -5548,7 +5548,7 @@ git commit -m "test(gateway): query takes Consistency, not a bool"
 
 **Files:**
 - Modify: `docs/reference/remote-protocol.md:213-244` (the credit section) and `:285-363` (the failover promises) — the two §6 clarifications plus a short "client structure" note.
-- Modify: `README.md:179` — the `uc2_remote` row.
+- Modify: `README.md:179` — the `uc_remote` row.
 - Modify: `docs/QUICKSTART.md:454` — the sentence naming `RemoteClient`.
 - Modify: `docs/how-to/run-a-gateway.md:119` — the "conforming client" sentence.
 
@@ -5566,7 +5566,7 @@ In `docs/reference/remote-protocol.md`, in the **Flow control — credits** sect
 now on* — it is not a delta and not a ceiling that only rises. A client that
 sees a lower value MUST NOT send `seq > acked_seq + credits` afterwards; the
 requests already on the wire under the older, wider grant are not recalled
-(that is what the edge's headroom is for). `uc2_remote`'s client has always
+(that is what the edge's headroom is for). `uc_remote`'s client has always
 behaved this way — it stores whatever the last frame said and gates the next
 `seq` on it — and this paragraph makes the requirement explicit for a port.
 
@@ -5585,7 +5585,7 @@ In `docs/reference/remote-protocol.md`, at the end of the **Failover promises** 
 ```markdown
 ### How the reference client is built (informative)
 
-`uc2_remote` implements the promises above with **two threads per connection
+`uc_remote` implements the promises above with **two threads per connection
 and no lock on the request path**, which a port may but need not copy:
 
 - the **submitter** (the caller's own thread) checks the window from two
@@ -5610,7 +5610,7 @@ rule, the ordered re-send, the probe before flush, and the liveness clocks.
 `README.md:179`:
 
 ```markdown
-| `uc2_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `SendHalf`/`PollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
+| `uc_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `SendHalf`/`PollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
 ```
 
 `docs/QUICKSTART.md:454` — replace the clause naming `RemoteClient` so it reads:
@@ -5622,7 +5622,7 @@ rule, the ordered re-send, the probe before flush, and the liveness clocks.
 `docs/how-to/run-a-gateway.md:119`:
 
 ```markdown
-A conforming client (`uc2_remote`'s `RemoteEngine` halves or the `RemoteClient`
+A conforming client (`uc_remote`'s `RemoteEngine` halves or the `RemoteClient`
 convenience over them, or a port that implements
 ```
 
@@ -5654,17 +5654,17 @@ note on how the reference client is now built and three API-name touch-ups."
 
 - [ ] **Step 1: The crate's own suite**
 
-Run: `cargo test -p uc2_remote`
+Run: `cargo test -p uc_remote`
 Expected: PASS — the unit tests from Tasks 1–4 and 7, `codec.rs`, the 10 `client_fake_edge` convenience scenarios and the 30 `engine_fake_edge` scenarios (27 ports + `connect_completes_the_handshake…`, `an_idle_status_updates…`, `a_dropped_connection_is_re_established…`).
 
 - [ ] **Step 2: The gateway suite (the wire's other side)**
 
-Run: `cargo test -p uc2_gateway`
+Run: `cargo test -p uc_gateway`
 Expected: PASS — `credits`, `credits_wire`, `failover`, `roundtrip`, `bin_smoke`, `config_file`.
 
 - [ ] **Step 3: The correctness capstone**
 
-Run: `cargo test -p uc2-crashtest --test remote_lin`
+Run: `cargo test -p uc_crashtest --test remote_lin`
 Expected: PASS — linearizable with the session envelope on and off.
 
 - [ ] **Step 4: Workspace build + lint**
@@ -5679,14 +5679,14 @@ Expected: PASS (no regression outside the crates touched).
 
 - [ ] **Step 6: Confirm the fuzz tier is untouched**
 
-Run: `grep -rn "uc2_remote::" fuzz/fuzz_targets/uc2_remote_frame.rs fuzz/src/seeds.rs fuzz/src/bin/seed_corpus.rs`
-Expected: only `uc2_remote::frame::*` — no client, config or ticket import, so the 14 targets need no change. If a nightly toolchain and `cargo-fuzz` are installed, also run `(cd fuzz && cargo +nightly check)` and expect PASS; if they are not, say so rather than claiming it passed.
+Run: `grep -rn "uc_remote::" fuzz/fuzz_targets/uc_remote_frame.rs fuzz/src/seeds.rs fuzz/src/bin/seed_corpus.rs`
+Expected: only `uc_remote::frame::*` — no client, config or ticket import, so the 14 targets need no change. If a nightly toolchain and `cargo-fuzz` are installed, also run `(cd fuzz && cargo +nightly check)` and expect PASS; if they are not, say so rather than claiming it passed.
 
 - [ ] **Step 7: The dev-box throughput smoke — the point of the whole track**
 
 ```bash
 cd /home/claude/ultima/ultima_cluster
-cargo build -p uc2_gateway --example hop_bench --release
+cargo build -p uc_gateway --example hop_bench --release
 target/release/examples/hop_bench dummy-edge --listen 127.0.0.1:19301 --credits 1024 &
 sleep 1
 target/release/examples/hop_bench remote-load --gateways 127.0.0.1:19301 --secs 3 --payload 64 --inflight 1024 --conns 1
@@ -5710,7 +5710,7 @@ Expected: every arm completes with `lost = 0`; arms C and E (`remote-load`) are 
 cd /home/claude/ultima/ultima_cluster
 git commit --allow-empty -m "chore(m13b): local proof stack green
 
-cargo test -p uc2_remote / -p uc2_gateway / -p uc2-crashtest --test remote_lin,
+cargo test -p uc_remote / -p uc_gateway / -p uc_crashtest --test remote_lin,
 cargo test, clippy --workspace -D warnings: all green.
 Dev-box smoke (RELATIVE, 4 vCPU, not a bar): remote-load -> dummy-edge, 1 conn,
 inflight 1024 = <FILL IN measured resp/s> vs 50,480 for the old client on the

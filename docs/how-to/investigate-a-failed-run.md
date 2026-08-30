@@ -110,7 +110,7 @@ them one-to-one and the nightly job replays 100,000 conformance vectors.
 3. Re-run conformance locally, on disk:
 
 ```bash
-cargo run -p uc2_consensus --release --example conform_gen -- \
+cargo run -p uc_consensus --release --example conform_gen -- \
     --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1
 cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl
 ```

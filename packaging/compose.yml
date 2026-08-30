@@ -12,10 +12,10 @@
 # that must survive a machine, put one node per machine and follow
 # docs/how-to/run-a-cluster.md.
 #
-#     UC2_IMAGE=ghcr.io/peterknego/uc2:2.8.1 docker compose -f compose.yml up -d
+#     UC2_IMAGE=ghcr.io/peterknego/uc2:2.9.0 docker compose -f compose.yml up -d
 #     docker compose -f compose.yml logs -f n0
 #     docker run --rm --network uc2-demo_uc2 \
-#         --entrypoint /usr/local/bin/counter-remote ghcr.io/peterknego/uc2:2.8.1 \
+#         --entrypoint /usr/local/bin/counter-remote ghcr.io/peterknego/uc2:2.9.0 \
 #         --gateways gw0:9200,gw1:9201,gw2:9202 --app-id quickstart add 5
 #     docker compose -f compose.yml down -v
 #
@@ -37,7 +37,7 @@
 
 name: uc2-demo
 
-x-uc2-image: &uc2_image ${UC2_IMAGE:-ghcr.io/peterknego/uc2:2.8.1}
+x-uc2-image: &uc2_image ${UC2_IMAGE:-ghcr.io/peterknego/uc2:2.9.0}
 
 networks:
   uc2:
@@ -145,7 +145,7 @@ services:
         node_id = 2
         gateway = "gw2:9202"
 
-        # counter-service runs a plain CounterSm, not a uc2_service::Sessioned
+        # counter-service runs a plain CounterSm, not a uc_service::Sessioned
         # wrapper around one, so there is nothing on the far end to strip a
         # session envelope: raw pass-through. A production service wraps its
         # state machine in Sessioned and leaves this true (the default),

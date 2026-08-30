@@ -1,20 +1,20 @@
 # The gateway's shape, and why it flow-controls the way it does
 
-*Design note, M12a. Records the shape comparison behind `uc2_gateway::Edge`
-and `uc2_remote`'s protocol, so the reasoning survives the design
+*Design note, M12a. Records the shape comparison behind `uc_gateway::Edge`
+and `uc_remote`'s protocol, so the reasoning survives the design
 conversation that produced it.*
 
 ## Four shapes for "a client that can't attach to shmem"
 
 Before M12a, reaching a UC cluster meant running in the same process (or at
 least the same host) as a node, attached to its shared memory directly
-(`uc2_client::Engine`) — fast, but it rules out a client on a different
+(`uc_client::Engine`) — fast, but it rules out a client on a different
 host, in a different language, or behind a network boundary shmem can't
 cross. UC's rule that clients are co-located exists only because shmem is
 the node's *only* ingress today — not because remote ingress is impossible
 in general (see D). Four shapes were on the table for closing the gap.
 
-**A — the user wraps `uc2_client` themselves.** Status quo: nothing ships,
+**A — the user wraps `uc_client` themselves.** Status quo: nothing ships,
 and a user who needs a remote-reachable front door writes their own
 co-located edge process around `Engine`. Rejected as the *whole* answer:
 every single user ends up re-deriving the same hard parts from scratch —
@@ -38,7 +38,7 @@ fixed daemon standing in front of it on the ingress side breaks that same
 philosophy applied to the front door.
 
 **C — chosen. A gateway *kit*: the reusable hard part as a library, a thin
-reference binary on top.** `uc2_gateway::Edge` packages exactly the pieces
+reference binary on top.** `uc_gateway::Edge` packages exactly the pieces
 every remote-ingress user would otherwise re-derive under A — leader
 discovery, redirect (not forward), receiver-driven credits, and the
 exactly-once envelope (`Sessioned<S>`) — as a library written over the
@@ -65,7 +65,7 @@ separate edge tier at all — "the gateway" is just the user's own code
 wrapping `AeronCluster` directly (Artio/FIX-over-Aeron-Cluster is the
 canonical example of exactly this). D removes the tier C still has, but it
 is consensus-agent work, not gateway-kit work: a second ingress path *into*
-`uc2_node` itself, a client-session/admission/auth story at that layer, and
+`uc_node` itself, a client-session/admission/auth story at that layer, and
 per-language client libraries if it's going to be genuinely polyglot — each
 its own later spec. C is what gets a working, template-shaped front door
 in front of the existing shmem `Engine` without first doing all of that.
@@ -120,7 +120,7 @@ not enough on its own, for three reasons:
   your fair share." The `credits`/`acked_seq` pair in every `RESPONSE` and
   `STATUS` frame says exactly which is true.
 - **The adjustment itself lives entirely on the edge, not the client.**
-  `Conn::squeeze`/`Conn::relax` (`uc2_gateway/src/conn.rs`) halve a
+  `Conn::squeeze`/`Conn::relax` (`uc_gateway/src/conn.rs`) halve a
   connection's credits (floor `1`) the first time a request hits
   `SubmitError::Backpressure` and double them back (capped at
   `per_conn_inflight`) on every completion while squeezed — multiplicative
@@ -151,7 +151,7 @@ own design, moved up one layer to the client-facing edge:
   idle client learns the cluster changed without having to try a write first
   and fail.
 - **Credits/`STATUS`** parallel Aeron's own **Status Messages** — the
-  receiver-driven flow-control primitive `uc2_net` already uses between
+  receiver-driven flow-control primitive `uc_net` already uses between
   nodes (a receiver periodically states how much more a sender may send).
   The gateway's credit scheme is the identical pattern at the client-facing
   edge instead of the node-to-node plane: the edge states how many more

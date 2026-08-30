@@ -28,7 +28,7 @@ Take the tarball for the host's architecture from
 **verify it**, then install:
 
 ```bash
-VER=2.8.1
+VER=2.9.0
 TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
 BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
 
@@ -62,15 +62,15 @@ The identity pin on `cosign verify-blob` is not optional dressing; see
 ### Or from the container image
 
 ```bash
-docker pull ghcr.io/peterknego/uc2:2.8.1
+docker pull ghcr.io/peterknego/uc2:2.9.0
 
 cosign verify \
   --certificate-identity-regexp \
     'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/peterknego/uc2:2.8.1
+  ghcr.io/peterknego/uc2:2.9.0
 
-docker run --rm ghcr.io/peterknego/uc2:2.8.1 --version   # ENTRYPOINT is uc2-node
+docker run --rm ghcr.io/peterknego/uc2:2.9.0 --version   # ENTRYPOINT is uc2-node
 ```
 
 Multi-architecture (amd64 + arm64), built from the same tarballs the release
@@ -82,7 +82,7 @@ a worked single-host example.
 ### Or from source
 
 ```bash
-cargo build --release --locked -p uc2_node -p uc2ctl --bins
+cargo build --release --locked -p uc_node -p uc_ctl --bins
 ```
 
 Requires Rust 1.89 or newer (the workspace's `rust-version` floor;
@@ -284,7 +284,7 @@ the busy-spin threads hold the pipe open and the SSH session hangs. Use
 
 ## Put a client next to every node
 
-There is no network client. `uc2_client` attaches to a node over shared
+There is no network client. `uc_client` attaches to a node over shared
 memory, so anything that submits commands or reads state must run **on a host
 that runs a node** — typically your gateway process (REST, gRPC, whatever faces
 your callers), holding one client attached to its local node.

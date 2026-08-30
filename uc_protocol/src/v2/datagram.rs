@@ -178,7 +178,7 @@ pub const CONFIG_PROPOSAL_BODY_LEN: usize = 22;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigProposalBody {
     pub nonce: u64,
-    /// `uc2_consensus::config::ConfigOp` discriminant (1..=5).
+    /// `uc_consensus::config::ConfigOp` discriminant (1..=5).
     pub op: u32,
     pub id: u32,
     pub ip: u32,
@@ -213,7 +213,7 @@ pub struct ConfigReplyBody {
     pub nonce: u64,
     /// 0 = accepted; 1 = refused (see `reason`); 2 = retry (leader unknown/changed).
     pub status: u32,
-    /// `uc2_consensus::config::ProposeError` discriminant when refused.
+    /// `uc_consensus::config::ProposeError` discriminant when refused.
     pub reason: u32,
     /// New config version when accepted; current version otherwise.
     pub version: u64,
@@ -747,7 +747,7 @@ mod tests {
 
     /// A wire-0.5.0 sender's SNAP_BEGIN is dropped by the LENGTH check, before
     /// `layout` is even looked at: its fixed part is 26 bytes. The `layout`
-    /// refusal on the receiving node (M14c, `uc2_net`) is therefore defensive —
+    /// refusal on the receiving node (M14c, `uc_net`) is therefore defensive —
     /// it catches a body that is 0.6.0-SHAPED (>= 34 B, which a 0.5.0 body with
     /// an 8-byte-or-longer config reaches) yet carries layout 0.
     #[test]

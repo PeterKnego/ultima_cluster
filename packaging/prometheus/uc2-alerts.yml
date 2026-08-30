@@ -18,7 +18,7 @@ groups:
     labels: { severity: critical }
     annotations: { summary: "{{ $labels.instance }} elected but its NewTerm frame is not quorum-committed (flags 0x01)" }
   - alert: Uc2ServiceWedged
-    expr: uc2_service_heartbeat_age_seconds{service=""} > 5 and uc2_node_heartbeat_age_seconds < 3
+    expr: uc_service_heartbeat_age_seconds{service=""} > 5 and uc_node_heartbeat_age_seconds < 3
     for: 1m
     labels: { severity: critical }
     annotations: { summary: "apply loop wedged on {{ $labels.instance }}: node alive, service heartbeat stale" }
@@ -51,7 +51,7 @@ groups:
     labels: { severity: warning }
     annotations: { summary: "ingress admission window ≥90% consumed on {{ $labels.instance }} — commit is not keeping up with append" }
   - alert: Uc2PurgeStalled
-    expr: uc2_purge_enabled == 1 and (uc2_node_snapshot_floor_bytes - uc2_archive_first_base_bytes) > 2 * uc2_journal_segment_bytes
+    expr: uc2_purge_enabled == 1 and (uc_node_snapshot_floor_bytes - uc2_archive_first_base_bytes) > 2 * uc2_journal_segment_bytes
     for: 10m
     labels: { severity: warning }
     annotations: { summary: "purge enabled but the journal head lags the snapshot floor by >2 segments on {{ $labels.instance }}" }
@@ -86,7 +86,7 @@ groups:
     # alertable at all. An absent declared FSM holds min(applied) still,
     # which closes the admission door and caps this node's durable report at
     # the lag bound: the cluster stalls by design until it attaches.
-    expr: uc2_service_attached == 0
+    expr: uc_service_attached == 0
     for: 30s
     labels: { severity: critical }
     annotations: { summary: "declared FSM {{ $labels.service }} is not attached on {{ $labels.instance }} — admission is closed and this node's report is capped at the lag bound" }
@@ -135,7 +135,7 @@ groups:
     # `group_left()` — with the empty parens — is required: a bare
     # `group_left (expr)` makes the parser read `(expr)` as the grouping
     # LABEL LIST and fail. Do not drop them.
-    expr: (uc2_service_lag_bytes >= on(instance) group_left() (uc2_fsm_lag_bytes - 1408)) and (uc2_service_lag_bytes >= on(instance) group_left() (uc2_fsm_lag_bytes * 0.9)) and on(instance) uc2_fsm_lag_bytes > 0 and on(instance, service) uc2_service_attached == 1
+    expr: (uc_service_lag_bytes >= on(instance) group_left() (uc2_fsm_lag_bytes - 1408)) and (uc_service_lag_bytes >= on(instance) group_left() (uc2_fsm_lag_bytes * 0.9)) and on(instance) uc2_fsm_lag_bytes > 0 and on(instance, service) uc_service_attached == 1
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }

@@ -57,7 +57,7 @@ scrape_configs:
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
 exposition. The full series contract — 76 families — is the
 `CONTRACT_SERIES` array in
-[`uc2_node/src/obs/metrics.rs`](../../uc2_node/src/obs/metrics.rs); a test
+[`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
 it cannot drift silently. This page names only the load-bearing subset: the
 lag/saturation/heartbeat-age/peer-lag gauges and the `agent_alive` gauge that
@@ -103,11 +103,11 @@ consumer position that does not decode (`IngressRingCorrupt`). See
 
 A node runs one FSM per declared service id (`[services] ids`), and every
 service family carries a `service="<id>"` label per declared id:
-`uc2_service_applied_bytes`, `uc2_service_epoch`,
-`uc2_service_snapshot_pos_bytes`, `uc2_service_heartbeat_age_seconds`,
-`uc2_service_attached`, `uc2_service_lag_bytes` (= `commit − applied`),
-`uc2_service_lag_waits_total`. Two node-scalar gauges describe the set
-itself: `uc2_services_declared` (the bitmask — bit *k* = id *k*) and
+`uc_service_applied_bytes`, `uc_service_epoch`,
+`uc_service_snapshot_pos_bytes`, `uc_service_heartbeat_age_seconds`,
+`uc_service_attached`, `uc_service_lag_bytes` (= `commit − applied`),
+`uc_service_lag_waits_total`. Two node-scalar gauges describe the set
+itself: `uc_services_declared` (the bitmask — bit *k* = id *k*) and
 `uc2_fsm_lag_bytes` (the lag bound; **0 means lockstep**).
 
 Two shapes to know before writing a query:
@@ -116,14 +116,14 @@ Two shapes to know before writing a query:
   M10 series and now means **the slowest declared FSM** (page 1's `min` over
   the declared ids — the number the purge floor, the admission door and
   `/readyz` all key on). Aggregate and per-FSM samples live in the same
-  family, so `sum(uc2_service_applied_bytes)` double counts. Say
+  family, so `sum(uc_service_applied_bytes)` double counts. Say
   `{service=""}` for the aggregate and `{service!=""}` for the per-FSM rows.
 - **A declared FSM that has never attached still renders a row**, reading
-  `uc2_service_attached{service="k"} 0` with zeros beside it. That is
+  `uc_service_attached{service="k"} 0` with zeros beside it. That is
   deliberate: you cannot alert on a series that is absent, and "declared but
   never started" is the state that silently closes admission cluster-wide.
 
-`uc2_service_lag_waits_total{service}` counts wait EPISODES at the lag
+`uc_service_lag_waits_total{service}` counts wait EPISODES at the lag
 barrier — one increment per park, however long the park lasts, so read its
 rate as "how often this FSM is held", never as a duration. Under lockstep
 that is ≈ one per frame. Under bounded mode it was an **undercount before
@@ -131,12 +131,12 @@ that is ≈ one per frame. Under bounded mode it was an **undercount before
 frame boundary, so an FSM parked at a cap that sits mid-frame — the common
 case, since a byte bound rarely divides the frame stream — reported 0. Since
 2.8.1 that park counts too. For the pinned-at-bound signal, use
-`uc2_service_lag_bytes{service}` — the series `Uc2ServicePinnedAtLagBound`
+`uc_service_lag_bytes{service}` — the series `Uc2ServicePinnedAtLagBound`
 actually keys on.
 
 Declared sets must match across nodes (spec §8). There is no alert rule for
 drift, because it is a query over the fleet rather than a per-node
-condition — `count(count_values("v", uc2_services_declared))` is `1` on a
+condition — `count(count_values("v", uc_services_declared))` is `1` on a
 healthy cluster and `> 1` the moment two nodes disagree. The dashboard ships
 it as the "Declared sets agreeing" stat.
 
@@ -182,19 +182,19 @@ table:
 | `Uc2CleartextPeer` | cleartext datagrams arrived from a peer while crypto is on — a node missed the wire-crypto flag day | critical |
 | `Uc2FollowerSealFailures` | outgoing control frames a **follower** could not seal (check pairwise sessions/allowlist) — a leader's own climb is benign and excluded by the rule | warning |
 | `Uc2DiskLow` | `uc2_free_disk_bytes` has sat below 4 journal segments' worth of free space for 2m — the archive fail-stops at `ENOSPC`; purge or grow the disk | warning |
-| `Uc2ServiceAbsent` | a declared FSM's `uc2_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
-| `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc2_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
+| `Uc2ServiceAbsent` | a declared FSM's `uc_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
+| `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 
 `Uc2ServiceWedged` selects the aggregate explicitly
-(`uc2_service_heartbeat_age_seconds{service=""}`) — the same family now
+(`uc_service_heartbeat_age_seconds{service=""}`) — the same family now
 carries a labelled sample per FSM, and the rule is about the node's slowest
 one. `Uc2ServiceAbsent` and `Uc2ServicePinnedAtLagBound` are per-FSM: they
 fire once per offending `service` label, on whichever node declares it — and
 never both for the same FSM. An FSM that is **absent** also has its lag climb
 to the bound and sit there, so `Uc2ServicePinnedAtLagBound` is guarded with
-`and on(instance, service) uc2_service_attached == 1`: a detached FSM pages
+`and on(instance, service) uc_service_attached == 1`: a detached FSM pages
 once, as the critical `Uc2ServiceAbsent`, and "pinned at the bound" always
 means an FSM that is actually running.
 
@@ -213,7 +213,7 @@ journal segments' worth — chosen because that is the fail-stop the archive
 actually hits: any write or fsync error on the journal, `ENOSPC` included,
 halts the writer, the archive agent panics, and the daemon exits 1 for
 systemd to restart. This is *asserted*, not merely documented — see
-`examples/uc2-crashtest/tests/enospc.rs`. Purging (or growing the disk) before
+`examples/uc_crashtest/tests/enospc.rs`. Purging (or growing the disk) before
 this alert escalates is the whole point of watching it; see
 [Keep the journal from growing without bound](bound-journal-growth.md).
 

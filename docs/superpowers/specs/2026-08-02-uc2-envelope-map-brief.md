@@ -25,7 +25,7 @@ this one maps the envelope. Neither blocks the other.
 **The replication plane requires a frame to fit in one datagram.**
 `Sender::new` hard-asserts `HEADER_LEN + max_payload` (plus crypto overhead
 when on) fits `cfg.mtu` — the assert message itself names the escape hatch:
-*"raise mtu — the jumbo-frame knob"* (`uc2_net/src/sender.rs:419-427`). There
+*"raise mtu — the jumbo-frame knob"* (`uc_net/src/sender.rs:419-427`). There
 is no frame fragmentation across datagrams. Consequently the reachable
 envelope has three regimes:
 
@@ -41,9 +41,9 @@ envelope has three regimes:
    sweep. Out of scope (§9), pre-scoped there as the follow-on this map's
    numbers would justify or kill.
 
-The IPC rings cap messages at 64 KiB (`uc2_node/src/node.rs:4005`), so the
+The IPC rings cap messages at 64 KiB (`uc_node/src/node.rs:4005`), so the
 shmem plane is not the binder anywhere in regimes 1–2; the log buffer's
-capacity ≥ 4× max-claim assert (`uc2_log/src/buffer.rs:104-107`) is trivially
+capacity ≥ 4× max-claim assert (`uc_log/src/buffer.rs:104-107`) is trivially
 satisfied at 256 MiB harness buffers.
 
 And the arithmetic says the interesting physics is early: at M5's 1.64 M
@@ -75,7 +75,7 @@ shared ceiling) and mixing the two instruments would blur both.
 
 ## 3. Harness shape
 
-New instrument example `uc2_node/examples/envelope_map.rs`, following the
+New instrument example `uc_node/examples/envelope_map.rs`, following the
 `read_profile`/net-decomp precedent (gate-role split `node`/`service`/
 `client`/`all`/`decide-free report`; per-rung JSON lines; local runs verify
 wiring and produce no numbers) rather than growing `m5_gate` — `m5_gate` is a
@@ -229,15 +229,15 @@ Next step per house workflow: review this brief, then
 
 | Concern | Location |
 | --- | --- |
-| One-frame-one-datagram assert ("raise mtu") | `uc2_net/src/sender.rs:419-427` |
-| Harness payload cap (512, MTU-driven) | `uc2_node/examples/m5_gate.rs:275-279` |
-| Existing `--payload` / `--inflight` knobs | `uc2_node/examples/m5_gate.rs:10` |
+| One-frame-one-datagram assert ("raise mtu") | `uc_net/src/sender.rs:419-427` |
+| Harness payload cap (512, MTU-driven) | `uc_node/examples/m5_gate.rs:275-279` |
+| Existing `--payload` / `--inflight` knobs | `uc_node/examples/m5_gate.rs:10` |
 | `MTU_DEFAULT = 1408` | `uc_protocol/src/v2/datagram.rs:18` |
-| Log-buffer max-claim capacity assert | `uc2_log/src/buffer.rs:104-107` |
-| Harness buffer size (256 MiB) | `uc2_node/examples/m5_gate.rs:274` |
-| IPC rings: 64 KiB max message | `uc2_node/src/node.rs:4005` |
-| Admission window (`admission_bytes`) | `uc2_node/src/node.rs:183`, cnc @3712 |
-| Archive: ≤1 MiB blocks, fdatasync per block | `uc2_log/src/archive.rs` (module header) |
+| Log-buffer max-claim capacity assert | `uc_log/src/buffer.rs:104-107` |
+| Harness buffer size (256 MiB) | `uc_node/examples/m5_gate.rs:274` |
+| IPC rings: 64 KiB max message | `uc_node/src/node.rs:4005` |
+| Admission window (`admission_bytes`) | `uc_node/src/node.rs:183`, cnc @3712 |
+| Archive: ≤1 MiB blocks, fdatasync per block | `uc_log/src/archive.rs` (module header) |
 | M2 bytes-regime numbers (replication layer only) | `docs/benchmarks/uc2-m2-gate-2026-07-10.md` |
-| Instrument-example precedent | `uc2_node/examples/read_profile.rs`; net-decomp brief |
+| Instrument-example precedent | `uc_node/examples/read_profile.rs`; net-decomp brief |
 | ENA counters / fleet orchestration | `bench-infra/scripts/m6_fleet_gate.py` |

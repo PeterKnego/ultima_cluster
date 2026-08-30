@@ -2,7 +2,7 @@ import Uc2Model
 import Lean.Data.Json
 
 /-! Conformance replay: reads JSONL vectors emitted by
-`uc2_consensus/examples/conform_gen.rs`, replays each through `Uc2Model`,
+`uc_consensus/examples/conform_gen.rs`, replays each through `Uc2Model`,
 exits 1 on the first divergence (printing the offending line). Uses core
 `Lean.Data.Json` only — no mathlib. -/
 

@@ -132,15 +132,15 @@ broke ties in; there is no ranking left for it to apply to.
 
 ## 3. Harness shape
 
-New example: `uc2_node/examples/read_profile.rs`, following the established
+New example: `uc_node/examples/read_profile.rs`, following the established
 `m5_gate` role split so the same binary serves both the local box and a fleet.
 
 ```text
-cargo run -p uc2_node --release --example read_profile -- node    --id N --bind A --members … --instance-dir D
-cargo run -p uc2_node --release --example read_profile -- service --instance-dir D
-cargo run -p uc2_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W] [--node-pid P] [--service-pid Q]
-cargo run -p uc2_node --release --example read_profile -- all     --secs S   # local smoke, NOT a fleet number
-cargo run -p uc2_node --release --example read_profile -- decide  --rungs FILE [--write-rate W]
+cargo run -p uc_node --release --example read_profile -- node    --id N --bind A --members … --instance-dir D
+cargo run -p uc_node --release --example read_profile -- service --instance-dir D
+cargo run -p uc_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W] [--node-pid P] [--service-pid Q]
+cargo run -p uc_node --release --example read_profile -- all     --secs S   # local smoke, NOT a fleet number
+cargo run -p uc_node --release --example read_profile -- decide  --rungs FILE [--write-rate W]
 ```
 
 - `node` / `service` are thin fleet-role wrappers over the real SDK stack
@@ -184,10 +184,10 @@ Consequences, binding on the implementation:
 - The 3-host AWS fleet run is where the ladder is swept for real. It costs money
   and requires explicit user approval before `terraform apply`.
 
-### 3.2 The client role must bypass `uc2_client`
+### 3.2 The client role must bypass `uc_client`
 
-`uc2_client::query_linearizable` routes through `send_and_await`
-(`uc2_client/src/client.rs:154-184`), which **blocks on a channel per call**.
+`uc_client::query_linearizable` routes through `send_and_await`
+(`uc_client/src/client.rs:154-184`), which **blocks on a channel per call**.
 Read concurrency is the independent variable of this entire experiment, so a
 one-read-per-thread API would cap the very axis being swept.
 
@@ -228,7 +228,7 @@ and why no external proxy can succeed — kept rather than deleted so the failur
 is not re-attempted.
 
 Every agent thread is already named by `AgentRunner::spawn` via
-`thread::Builder::name` (`uc2_log/src/agent.rs:53`): `uc2-consensus`,
+`thread::Builder::name` (`uc_log/src/agent.rs:53`): `uc2-consensus`,
 `uc2-sender`, `uc2-receiver`, `uc2-archive`, `uc2-apply`. All are ≤15 chars, so
 they survive intact in `/proc/<pid>/task/<tid>/comm`. Attribution is free — the
 *attribution* was never the problem.
@@ -265,7 +265,7 @@ duty cycle. There is no third field that separates them.
 **The only true occupancy metric would be internal.** Feature-gated duty-cycle
 counters in `AgentRunner` — work-done vs. empty-poll counts per duty cycle,
 dumped by the node role at exit — would measure occupancy directly and correctly.
-That means changing `uc2_node`, which this instrument deliberately does not do
+That means changing `uc_node`, which this instrument deliberately does not do
 (the whole design is "attach, never participate"), so it remains available if
 occupancy is ever wanted for its own sake. It is **not** needed for the decision:
 clause (b) was reformulated (§2.1) to be answerable from data the harness already
@@ -415,15 +415,15 @@ The harness is test scaffolding, so the bar is that it does not lie:
 
 | Concern | Location |
 | --- | --- |
-| Query-ring drain + linearizable fork | `uc2_node/src/node.rs:1948-1956` |
+| Query-ring drain + linearizable fork | `uc_node/src/node.rs:1948-1956` |
 | Snapshot read forwarded immediately | `node.rs:1958` (`forward_svc_query`) |
 | Per-cycle query admission cap (64) | `node.rs:186` |
 | Capture read index `commit_at` | `node.rs:1983` |
 | Send probe / follower ack / count acks | `node.rs:1895-1903`, `1910-1918`, `1924-1943` |
 | `PendingRead` / `ReadPhase` | `node.rs:204-235` |
-| Service publishes `service_applied` | `uc2_service/src/apply.rs:186` |
-| Agent thread naming | `uc2_log/src/agent.rs:53` |
-| Idle strategy (`Yield` → `sched_yield`) | `uc2_log/src/agent.rs:28` |
-| Blocking client query API | `uc2_client/src/client.rs:154-184` |
-| Role-split + smoke-mode precedent | `uc2_node/examples/m5_gate.rs` |
-| Monotonic-read divergence guard precedent | `uc2_node/examples/m6_gate.rs:418-426` |
+| Service publishes `service_applied` | `uc_service/src/apply.rs:186` |
+| Agent thread naming | `uc_log/src/agent.rs:53` |
+| Idle strategy (`Yield` → `sched_yield`) | `uc_log/src/agent.rs:28` |
+| Blocking client query API | `uc_client/src/client.rs:154-184` |
+| Role-split + smoke-mode precedent | `uc_node/examples/m5_gate.rs` |
+| Monotonic-read divergence guard precedent | `uc_node/examples/m6_gate.rs:418-426` |

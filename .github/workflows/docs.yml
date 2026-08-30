@@ -4,7 +4,7 @@ name: docs
 # push to main. docs.rs renders each PUBLISHED crate separately, at whatever
 # version was last published; this renders the whole workspace together, at
 # `main`, behind one landing page — which is what you want when the question
-# spans crates ("how does uc2_service reach uc2_log?") or when main is ahead
+# spans crates ("how does uc_service reach uc_log?") or when main is ahead
 # of the last release.
 #
 # Deliberately NOT gated on rustdoc warnings: the tree carries pre-existing
@@ -41,14 +41,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # --lib drops the bins (uc2ctl is an operator CLI, not an API), and the
-      # two example crates are excluded outright. `-F uc2_service/ultima_db`
+      # two example crates are excluded outright. `-F uc_service/ultima_db`
       # documents the StoreStateMachine adapter, which the default build never
       # compiles — same reasoning as ci.yml's second clippy pass.
       - name: Build rustdoc
         run: >
           cargo doc --workspace --no-deps --lib
-          --exclude counter --exclude uc2-crashtest
-          -F uc2_service/ultima_db
+          --exclude counter --exclude uc_crashtest
+          -F uc_service/ultima_db
 
       - name: Install the landing page
         run: cp .github/pages/index.html target/doc/index.html

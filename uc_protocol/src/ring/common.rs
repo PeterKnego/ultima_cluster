@@ -394,7 +394,7 @@ pub enum RingError {
     ///    resurrected record may be delivered twice (once at its original
     ///    position if it was ever read there, once here). Exactly-once
     ///    therefore holds only for callers that ride
-    ///    `uc2_service::session::Sessioned` — the `(client_id, seq)` envelope
+    ///    `uc_service::session::Sessioned` — the `(client_id, seq)` envelope
     ///    is what turns the duplicate into a REPLAYED tag and the loss into
     ///    a client-side retry.
     /// 3. **Padding stomp (NOT crc-covered at all).** A producer preempted

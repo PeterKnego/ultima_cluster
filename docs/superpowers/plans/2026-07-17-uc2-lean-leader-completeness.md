@@ -47,7 +47,7 @@ theorem leader_completeness {n : Nat} (w : World n) (hw : Reachable w)
 - Create: `proofs/Uc2Proofs/ProtocolCommit.lean` (layered over ProtocolData; or extend ProtocolData.lean under the LA1 rules — document the call)
 - Modify: `proofs/Uc2Proofs.lean` (import)
 
-- [ ] **Step 1**: Read the Rust ground truth: `uc2_consensus/src/commit.rs` (whole file — the kernel you consume), `election.rs`'s report arm + tracker wiring (`on_durable` feed sites, `become_leader`'s `reset_reports` + `last_reports.clear`), node.rs's AppendPosition flow (module-doc level). Re-read `proofs/Uc2Model/Commit.lean` (the kernel's Lean port + its C-theorems in `Uc2Proofs/Commit.lean`).
+- [ ] **Step 1**: Read the Rust ground truth: `uc_consensus/src/commit.rs` (whole file — the kernel you consume), `election.rs`'s report arm + tracker wiring (`on_durable` feed sites, `become_leader`'s `reset_reports` + `last_reports.clear`), node.rs's AppendPosition flow (module-doc level). Re-read `proofs/Uc2Model/Commit.lean` (the kernel's Lean port + its C-theorems in `Uc2Proofs/Commit.lean`).
 - [ ] **Step 2**: Design + write the extension per decisions 1–4. Projection to the Tier B(a) world must be proved FIRST (LA1's pattern): commit steps are stutters on the data+election planes ⇒ `election_safety` and `log_matching` lift for free.
 - [ ] **Step 3**: Non-vacuity theorem per Global Constraints (commit event + later-term election + winner holds the entry), `decide`-discharged where possible.
 - [ ] **Step 4**: Gate + commit (`proof(proofs): tier-B(b) — commit certification machinery + non-vacuity (lean LB1)`).

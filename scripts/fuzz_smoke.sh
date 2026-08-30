@@ -42,7 +42,7 @@ for t in "${TARGETS[@]}"; do
   # [profile.release] does not apply here — fuzz/ is an excluded, separate
   # workspace), so the larger targets are ~27 MB of debug info. llvm-symbolizer
   # needs ~90 s to index one of those for a SINGLE address — more than the whole
-  # fuzz budget. Measured on uc2_node_toml: 400 runs took 90,180 ms with
+  # fuzz budget. Measured on uc_node_toml: 400 runs took 90,180 ms with
   # symbolization and 57 ms without. Four of the fourteen targets were getting
   # ~20 executions per run instead of tens of millions before this was added.
   # A crash still writes its artifact, which can be symbolized deliberately.

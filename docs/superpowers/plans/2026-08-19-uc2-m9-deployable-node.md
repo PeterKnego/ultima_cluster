@@ -6,7 +6,7 @@
 
 **Architecture:** three additive layers over an unchanged core. A `config_file` module deserialises a `deny_unknown_fields` TOML document into the existing `NodeConfig`, so the wire, consensus, and cnc surfaces are untouched. A `preflight` module turns every rule that today produces a confusing downstream failure — non-power-of-two buffer, learner/member id overlap, `bind` disagreeing with this node's own `members` entry, an instance directory on a RAM-backed filesystem — into a named startup refusal, mirroring the boot-refusal posture M8 already established for crypto. A `uc2-node` binary wires those to `Node::start`, installs a `SIGTERM`/`SIGINT` handler, and on signal drains the archive to a bounded deadline before calling the already-existing `Node::stop()`.
 
-**Tech Stack:** Rust workspace (edition 2024), `uc2_node` (config, preflight, drain, binaries), `serde` + `toml` (config), `signal-hook` (sync signal handling — the node has no tokio and must not gain one), `libc` (filesystem-type probe), `clap` (CLI).
+**Tech Stack:** Rust workspace (edition 2024), `uc_node` (config, preflight, drain, binaries), `serde` + `toml` (config), `signal-hook` (sync signal handling — the node has no tokio and must not gain one), `libc` (filesystem-type probe), `clap` (CLI).
 
 **Spec:** `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md` §4 (M9), §1 (locked decisions), §11 (risks).
 
@@ -16,7 +16,7 @@ Copied from the spec and CLAUDE.md house rules. Every task's requirements implic
 
 - **No consensus, wire-protocol, or cnc-layout changes.** M9 is additive: new modules and binaries plus one new method on `Node`. If a task appears to need a protocol change, stop — it is out of scope (spec §3).
 - **No leadership transfer.** A planned leader stop costs one election timeout (150–300 ms). Do not add a `TimeoutNow`-style handoff; it is a consensus change and is explicitly deferred (spec §1).
-- **No tokio in `uc2_node`.** The node is four sync single-writer polling agents. Signal handling uses `signal-hook`, not an async runtime.
+- **No tokio in `uc_node`.** The node is four sync single-writer polling agents. Signal handling uses `signal-hook`, not an async runtime.
 - **`deny_unknown_fields` on every config struct.** A typo is a startup refusal, never a silently-ignored setting — same posture as the M8 crypto boot refusal.
 - **A shutdown that hangs is worse than one that costs a replay.** The drain is deadline-bounded; on expiry, log what was left and stop anyway.
 - **Apply stays sync, deterministic, no I/O.** Untouched by this milestone; do not route config through the apply path.
@@ -29,12 +29,12 @@ Copied from the spec and CLAUDE.md house rules. Every task's requirements implic
 
 | File | Responsibility |
 |---|---|
-| `uc2_node/src/config_file.rs` (new) | TOML mirror of `NodeConfig` + `load_from_path`. Deserialisation only — no validation, no I/O beyond reading the file. |
-| `uc2_node/src/preflight.rs` (new) | Pure validation rules over a built `NodeConfig`, plus the filesystem-type probe. One named error per rule. |
-| `uc2_node/src/bin/uc2-node.rs` (new) | The daemon: CLI, load, preflight, start, signal wait, drain, stop. |
-| `uc2_node/src/node.rs` (modify) | Add `Node::stop_draining`. Nothing else. |
-| `uc2_node/tests/lifecycle.rs` (new) | Integration: drain-on-stop, restart-without-snapshot-install. |
-| `uc2_node/examples/m9_gate.rs` (new) | The pre-committed restart-cost gate. |
+| `uc_node/src/config_file.rs` (new) | TOML mirror of `NodeConfig` + `load_from_path`. Deserialisation only — no validation, no I/O beyond reading the file. |
+| `uc_node/src/preflight.rs` (new) | Pure validation rules over a built `NodeConfig`, plus the filesystem-type probe. One named error per rule. |
+| `uc_node/src/bin/uc2-node.rs` (new) | The daemon: CLI, load, preflight, start, signal wait, drain, stop. |
+| `uc_node/src/node.rs` (modify) | Add `Node::stop_draining`. Nothing else. |
+| `uc_node/tests/lifecycle.rs` (new) | Integration: drain-on-stop, restart-without-snapshot-install. |
+| `uc_node/examples/m9_gate.rs` (new) | The pre-committed restart-cost gate. |
 | `examples/counter/src/bin/counter-service.rs` (modify) | Becomes the documented service template: config file + `SIGTERM` → `Service::stop()`. |
 | `packaging/systemd/*.service` (new) | Unit files referencing the real binaries. |
 
@@ -42,34 +42,34 @@ Copied from the spec and CLAUDE.md house rules. Every task's requirements implic
 
 | Seam | Where |
 |---|---|
-| `NodeConfig` fields | `uc2_node/src/node.rs:149` — `id`, `members`, `learners`, `bind`, `instance_dir`, `app_id`, `buffer_bytes`, `max_payload`, `admission_bytes`, `election_timeout_min_ns`, `election_timeout_max_ns`, `seed`, `faults`, `purge`, `journal_segment_bytes`, `crypto` |
-| Node start / stop | `uc2_node/src/node.rs:404` `Node::start(cfg) -> io::Result<Node>`; `:1402` `stop(self)` (signals + joins all four agents); `:1408` `crash(self)` (no flush) |
-| Agent lifecycle | `uc2_log/src/agent.rs` — `AgentRunner::spawn/stop/is_finished`, `IdleStrategy`. `stop()` sets an `AtomicBool` and joins; the loop exits at the TOP of a duty cycle, which is why an explicit drain is needed |
+| `NodeConfig` fields | `uc_node/src/node.rs:149` — `id`, `members`, `learners`, `bind`, `instance_dir`, `app_id`, `buffer_bytes`, `max_payload`, `admission_bytes`, `election_timeout_min_ns`, `election_timeout_max_ns`, `seed`, `faults`, `purge`, `journal_segment_bytes`, `crypto` |
+| Node start / stop | `uc_node/src/node.rs:404` `Node::start(cfg) -> io::Result<Node>`; `:1402` `stop(self)` (signals + joins all four agents); `:1408` `crash(self)` (no flush) |
+| Agent lifecycle | `uc_log/src/agent.rs` — `AgentRunner::spawn/stop/is_finished`, `IdleStrategy`. `stop()` sets an `AtomicBool` and joins; the loop exits at the TOP of a duty cycle, which is why an explicit drain is needed |
 | Log counters (drain reads these) | `Node::counters() -> &LogCounters` (`node.rs:1211`); cnc offsets `append` 256, `durable` 320, `commit` 448, `service_applied` 512 (`docs/reference/cnc-page.md`) |
 | Snapshot-install evidence | cnc `incoming_snapshot_pos` at offset 1280 — the gate asserts this does NOT move across a clean restart |
-| `PurgePolicy` | `uc2_node/src/node.rs:139` — `Disabled` \| `BelowSnapshot { slack_bytes: u64 }` |
-| `CryptoConfig` | `uc2_crypto/src/transport.rs:166` — `Disabled` \| `Enabled { key_path: PathBuf, allowlist_path: PathBuf, rotation: RotationPolicy }` |
-| `RotationPolicy` | `uc2_crypto/src/rotation.rs:78` — `{ interval_ns: u64, bytes: u64 }`; `Default` = 1 h / 1 TiB |
-| `NodeId` | `uc2_consensus/src/election.rs:34` — `pub type NodeId = u32` |
-| Journal segment default | `uc2_node/src/node.rs:211` — `DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024` |
+| `PurgePolicy` | `uc_node/src/node.rs:139` — `Disabled` \| `BelowSnapshot { slack_bytes: u64 }` |
+| `CryptoConfig` | `uc_crypto/src/transport.rs:166` — `Disabled` \| `Enabled { key_path: PathBuf, allowlist_path: PathBuf, rotation: RotationPolicy }` |
+| `RotationPolicy` | `uc_crypto/src/rotation.rs:78` — `{ interval_ns: u64, bytes: u64 }`; `Default` = 1 h / 1 TiB |
+| `NodeId` | `uc_consensus/src/election.rs:34` — `pub type NodeId = u32` |
+| Journal segment default | `uc_node/src/node.rs:211` — `DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024` |
 | Daemon template to replace | `examples/counter/src/bin/counter-node.rs` — clap args, `seed_for()` (vote-split avoidance), then `loop { sleep(100ms) }` with NO signal handler. Lift `seed_for` into the daemon |
 | Volatile-fs rule to mirror | `bench-infra/scripts/m6_fleet_gate.py:119` `assert_durable_fs` — refuses empty/unknown fstype and anything in `VOLATILE_FS` |
 | Durable vs volatile paths | `docs/reference/instance-directory.md:31` — durable: `journal/`, `state/`, `snapshots/`; volatile-safe: `cnc2.dat`, `log.buf`, `*.ring`, `*.broadcast` |
-| Service lifecycle | `uc2_service/src/lib.rs:100` `start`, `:307` `is_alive`, `:314` `stop` |
-| Integration test helpers | `uc2_node/tests/failover.rs` — `spawn_cluster_ring`, `NodeH`, `make_config_ring`, `DEFAULT_RING`; `tempdir_in(env!("CARGO_TARGET_TMPDIR"))` |
+| Service lifecycle | `uc_service/src/lib.rs:100` `start`, `:307` `is_alive`, `:314` `stop` |
+| Integration test helpers | `uc_node/tests/failover.rs` — `spawn_cluster_ring`, `NodeH`, `make_config_ring`, `DEFAULT_RING`; `tempdir_in(env!("CARGO_TARGET_TMPDIR"))` |
 
 ---
 
 ### Task 1: Config file schema and loader
 
 **Files:**
-- Create: `uc2_node/src/config_file.rs`
-- Modify: `uc2_node/src/lib.rs` (add `pub mod config_file;` and re-export `load_from_path`)
-- Modify: `Cargo.toml` (workspace deps), `uc2_node/Cargo.toml`
+- Create: `uc_node/src/config_file.rs`
+- Modify: `uc_node/src/lib.rs` (add `pub mod config_file;` and re-export `load_from_path`)
+- Modify: `Cargo.toml` (workspace deps), `uc_node/Cargo.toml`
 - Test: inline `#[cfg(test)] mod tests` in `config_file.rs`
 
 **Interfaces:**
-- Consumes: `NodeConfig`, `PurgePolicy` (`uc2_node::node`), `CryptoConfig`/`RotationPolicy` (`uc2_crypto`), `FaultConfig` (`uc2_net::fault`).
+- Consumes: `NodeConfig`, `PurgePolicy` (`uc_node::node`), `CryptoConfig`/`RotationPolicy` (`uc_crypto`), `FaultConfig` (`uc_net::fault`).
 - Produces: `pub fn load_from_path(path: &Path) -> Result<NodeConfig, ConfigError>` and `pub enum ConfigError { Read { path: PathBuf, source: std::io::Error }, Parse { path: PathBuf, source: toml::de::Error } }`. Task 3 and Task 5 both call `load_from_path`.
 
 - [ ] **Step 1: Add the dependencies**
@@ -83,7 +83,7 @@ signal-hook = "0.3"
 libc = "0.2"
 ```
 
-Add to `uc2_node/Cargo.toml` under `[dependencies]`:
+Add to `uc_node/Cargo.toml` under `[dependencies]`:
 
 ```toml
 serde = { workspace = true }
@@ -95,12 +95,12 @@ clap = { workspace = true }
 
 - [ ] **Step 2: Verify the versions resolve**
 
-Run: `cargo build -p uc2_node`
+Run: `cargo build -p uc_node`
 Expected: builds. If the resolver rejects a version, take the current major from `cargo search toml` and update the pin — do not leave a version that does not resolve.
 
 - [ ] **Step 3: Write the failing test**
 
-Create `uc2_node/src/config_file.rs` with only this test module for now:
+Create `uc_node/src/config_file.rs` with only this test module for now:
 
 ```rust
 #[cfg(test)]
@@ -217,12 +217,12 @@ allowlist_path = "/etc/uc2/allowlist.toml"
 
 - [ ] **Step 4: Run the test to verify it fails**
 
-Run: `cargo test -p uc2_node --lib config_file`
+Run: `cargo test -p uc_node --lib config_file`
 Expected: FAIL — `load_from_path` and `default_seed_for` are not defined.
 
 - [ ] **Step 5: Write the implementation**
 
-Prepend to `uc2_node/src/config_file.rs`:
+Prepend to `uc_node/src/config_file.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -240,9 +240,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use uc2_consensus::election::NodeId;
-use uc2_crypto::rotation::RotationPolicy;
-use uc2_net::fault::FaultConfig;
+use uc_consensus::election::NodeId;
+use uc_crypto::rotation::RotationPolicy;
+use uc_net::fault::FaultConfig;
 
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
@@ -386,23 +386,23 @@ pub fn load_from_path(path: &Path) -> Result<NodeConfig, ConfigError> {
 }
 ```
 
-Add `pub mod config_file;` to `uc2_node/src/lib.rs`.
+Add `pub mod config_file;` to `uc_node/src/lib.rs`.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --lib config_file`
+Run: `cargo test -p uc_node --lib config_file`
 Expected: 4 tests PASS.
 
 - [ ] **Step 7: Lint**
 
-Run: `cargo clippy -p uc2_node --all-targets -- -D warnings`
+Run: `cargo clippy -p uc_node --all-targets -- -D warnings`
 Expected: clean.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add uc2_node/src/config_file.rs uc2_node/src/lib.rs uc2_node/Cargo.toml Cargo.toml Cargo.lock
-git commit -m "feat(uc2_node): TOML config file for the daemon (deny_unknown_fields, per-node seed default)"
+git add uc_node/src/config_file.rs uc_node/src/lib.rs uc_node/Cargo.toml Cargo.toml Cargo.lock
+git commit -m "feat(uc_node): TOML config file for the daemon (deny_unknown_fields, per-node seed default)"
 ```
 
 ---
@@ -410,8 +410,8 @@ git commit -m "feat(uc2_node): TOML config file for the daemon (deny_unknown_fie
 ### Task 2: Preflight validation rules
 
 **Files:**
-- Create: `uc2_node/src/preflight.rs`
-- Modify: `uc2_node/src/lib.rs` (add `pub mod preflight;`)
+- Create: `uc_node/src/preflight.rs`
+- Modify: `uc_node/src/lib.rs` (add `pub mod preflight;`)
 - Test: inline `#[cfg(test)] mod tests` in `preflight.rs`
 
 **Interfaces:**
@@ -422,7 +422,7 @@ Each rule below exists because it currently produces a failure that looks like s
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc2_node/src/preflight.rs` with only this test module:
+Create `uc_node/src/preflight.rs` with only this test module:
 
 ```rust
 #[cfg(test)]
@@ -533,12 +533,12 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_node --lib preflight`
+Run: `cargo test -p uc_node --lib preflight`
 Expected: FAIL — `check_semantics` is not defined.
 
 - [ ] **Step 3: Write the implementation**
 
-Prepend to `uc2_node/src/preflight.rs`:
+Prepend to `uc_node/src/preflight.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -551,7 +551,7 @@ Prepend to `uc2_node/src/preflight.rs`:
 //! with a message naming the offending field is strictly better than a
 //! cluster that elects a leader and never commits.
 
-use uc2_consensus::election::NodeId;
+use uc_consensus::election::NodeId;
 
 use crate::{CryptoConfig, NodeConfig, PurgePolicy};
 
@@ -635,14 +635,14 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --lib preflight`
+Run: `cargo test -p uc_node --lib preflight`
 Expected: 9 tests PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_node/src/preflight.rs uc2_node/src/lib.rs
-git commit -m "feat(uc2_node): preflight semantic validation with named startup refusals"
+git add uc_node/src/preflight.rs uc_node/src/lib.rs
+git commit -m "feat(uc_node): preflight semantic validation with named startup refusals"
 ```
 
 ---
@@ -650,8 +650,8 @@ git commit -m "feat(uc2_node): preflight semantic validation with named startup 
 ### Task 3: Refuse to start on a RAM-backed filesystem
 
 **Files:**
-- Modify: `uc2_node/src/preflight.rs`
-- Modify: `uc2_node/src/config_file.rs` (add the override field; change `load_from_path`'s return type)
+- Modify: `uc_node/src/preflight.rs`
+- Modify: `uc_node/src/config_file.rs` (add the override field; change `load_from_path`'s return type)
 - Test: inline tests in `preflight.rs` and `config_file.rs`
 
 **Interfaces:**
@@ -770,7 +770,7 @@ You must also update Task 1's existing `config_file.rs` tests for the new tuple 
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_node --lib preflight config_file`
+Run: `cargo test -p uc_node --lib preflight config_file`
 Expected: FAIL — `StartupOptions`, `FsVerdict`, and `check_durable_fs` are not defined; the Task 1 tests fail to compile against the new tuple return.
 
 - [ ] **Step 3: Write the implementation**
@@ -954,20 +954,20 @@ returning `Ok((NodeConfig { .. }, StartupOptions { allow_volatile_fs: f.allow_vo
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --lib`
+Run: `cargo test -p uc_node --lib`
 Expected: PASS, including Task 1's updated tests.
 
 - [ ] **Step 5: Confirm the existing suites still pass**
 
-Run: `cargo test -p uc2_node`
+Run: `cargo test -p uc_node`
 Expected: PASS. If a suite now fails on the fs probe, set `UC2_ALLOW_VOLATILE_FS=1` for that suite rather than weakening the check — the rule is correct, the test is the exception.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo clippy -p uc2_node --all-targets -- -D warnings
-git add uc2_node/src/preflight.rs uc2_node/src/config_file.rs
-git commit -m "feat(uc2_node): refuse an instance_dir on a RAM-backed fs, with a loud two-channel override"
+cargo clippy -p uc_node --all-targets -- -D warnings
+git add uc_node/src/preflight.rs uc_node/src/config_file.rs
+git commit -m "feat(uc_node): refuse an instance_dir on a RAM-backed fs, with a loud two-channel override"
 ```
 
 ---
@@ -975,8 +975,8 @@ git commit -m "feat(uc2_node): refuse an instance_dir on a RAM-backed fs, with a
 ### Task 4: Drain the archive before stopping
 
 **Files:**
-- Modify: `uc2_node/src/node.rs` (add `stop_draining` next to `stop` at :1402)
-- Test: `uc2_node/tests/lifecycle.rs` (create)
+- Modify: `uc_node/src/node.rs` (add `stop_draining` next to `stop` at :1402)
+- Test: `uc_node/tests/lifecycle.rs` (create)
 
 **Interfaces:**
 - Consumes: `Node::counters()` (`node.rs:1211`), `Node::stop()` (`:1402`).
@@ -986,7 +986,7 @@ git commit -m "feat(uc2_node): refuse an instance_dir on a RAM-backed fs, with a
 
 - [ ] **Step 1: Write the failing test**
 
-Create `uc2_node/tests/lifecycle.rs`:
+Create `uc_node/tests/lifecycle.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1011,7 +1011,7 @@ fn stop_draining_leaves_durable_caught_up_with_append() {
     assert!(c.append() > 0, "test must actually append something");
 
     match node.stop_draining(Duration::from_secs(5)) {
-        uc2_node::DrainOutcome::Drained => {}
+        uc_node::DrainOutcome::Drained => {}
         other => panic!("expected Drained, got {other:?}"),
     }
 }
@@ -1029,16 +1029,16 @@ fn stop_draining_honours_its_deadline() {
 }
 ```
 
-Write `single_node` and `append_some_load` as helpers in the same file, modelled on `uc2_node/tests/failover.rs`'s `make_config_ring`/`spawn_cluster_ring`. Read that file first and follow its construction pattern exactly, including `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`.
+Write `single_node` and `append_some_load` as helpers in the same file, modelled on `uc_node/tests/failover.rs`'s `make_config_ring`/`spawn_cluster_ring`. Read that file first and follow its construction pattern exactly, including `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cargo test -p uc2_node --test lifecycle`
+Run: `cargo test -p uc_node --test lifecycle`
 Expected: FAIL — `stop_draining` and `DrainOutcome` are not defined.
 
 - [ ] **Step 3: Write the implementation**
 
-In `uc2_node/src/node.rs`, immediately after `stop` (:1402):
+In `uc_node/src/node.rs`, immediately after `stop` (:1402):
 
 ```rust
 /// What a drain achieved before the node stopped.
@@ -1082,19 +1082,19 @@ impl Node {
 }
 ```
 
-Re-export `DrainOutcome` from `uc2_node/src/lib.rs` alongside `Node`.
+Re-export `DrainOutcome` from `uc_node/src/lib.rs` alongside `Node`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --test lifecycle`
+Run: `cargo test -p uc_node --test lifecycle`
 Expected: 2 tests PASS.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_node --all-targets -- -D warnings
-git add uc2_node/src/node.rs uc2_node/src/lib.rs uc2_node/tests/lifecycle.rs
-git commit -m "feat(uc2_node): Node::stop_draining — bounded archive drain before a clean stop"
+cargo clippy -p uc_node --all-targets -- -D warnings
+git add uc_node/src/node.rs uc_node/src/lib.rs uc_node/tests/lifecycle.rs
+git commit -m "feat(uc_node): Node::stop_draining — bounded archive drain before a clean stop"
 ```
 
 ---
@@ -1102,9 +1102,9 @@ git commit -m "feat(uc2_node): Node::stop_draining — bounded archive drain bef
 ### Task 5: The `uc2-node` daemon
 
 **Files:**
-- Create: `uc2_node/src/bin/uc2-node.rs`
-- Modify: `uc2_node/Cargo.toml` (add the `[[bin]]` target)
-- Test: `uc2_node/tests/lifecycle.rs` (add a spawn-and-signal test)
+- Create: `uc_node/src/bin/uc2-node.rs`
+- Modify: `uc_node/Cargo.toml` (add the `[[bin]]` target)
+- Test: `uc_node/tests/lifecycle.rs` (add a spawn-and-signal test)
 
 **Interfaces:**
 - Consumes: `config_file::load_from_path` (Task 1), `preflight::check` (Task 3), `Node::stop_draining` (Task 4).
@@ -1112,7 +1112,7 @@ git commit -m "feat(uc2_node): Node::stop_draining — bounded archive drain bef
 
 - [ ] **Step 1: Declare the binary target**
 
-In `uc2_node/Cargo.toml`:
+In `uc_node/Cargo.toml`:
 
 ```toml
 [[bin]]
@@ -1122,7 +1122,7 @@ path = "src/bin/uc2-node.rs"
 
 - [ ] **Step 2: Write the failing test**
 
-Add to `uc2_node/tests/lifecycle.rs`:
+Add to `uc_node/tests/lifecycle.rs`:
 
 ```rust
 #[test]
@@ -1206,16 +1206,16 @@ addr = "127.0.0.1:19702"
 }
 ```
 
-Add `libc = { workspace = true }` to `uc2_node`'s `[dev-dependencies]` if it is not already a normal dependency.
+Add `libc = { workspace = true }` to `uc_node`'s `[dev-dependencies]` if it is not already a normal dependency.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_node --test lifecycle`
+Run: `cargo test -p uc_node --test lifecycle`
 Expected: FAIL — no `uc2-node` binary.
 
 - [ ] **Step 4: Write the daemon**
 
-Create `uc2_node/src/bin/uc2-node.rs`:
+Create `uc_node/src/bin/uc2-node.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1235,7 +1235,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
-use uc2_node::{DrainOutcome, Node, config_file, preflight};
+use uc_node::{DrainOutcome, Node, config_file, preflight};
 
 #[derive(Parser)]
 #[command(name = "uc2-node", about = "An ultima_cluster node")]
@@ -1313,15 +1313,15 @@ fn main() -> ExitCode {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --test lifecycle`
+Run: `cargo test -p uc_node --test lifecycle`
 Expected: 4 tests PASS. If the SIGTERM test exceeds 1 s, the loop's 100 ms sleep is the floor — that is within budget; investigate the drain, not the poll interval.
 
 - [ ] **Step 6: Lint and commit**
 
 ```bash
-cargo clippy -p uc2_node --all-targets -- -D warnings
-git add uc2_node/src/bin/uc2-node.rs uc2_node/Cargo.toml uc2_node/tests/lifecycle.rs Cargo.lock
-git commit -m "feat(uc2_node): the uc2-node daemon — config file, preflight, SIGTERM drain-and-stop"
+cargo clippy -p uc_node --all-targets -- -D warnings
+git add uc_node/src/bin/uc2-node.rs uc_node/Cargo.toml uc_node/tests/lifecycle.rs Cargo.lock
+git commit -m "feat(uc_node): the uc2-node daemon — config file, preflight, SIGTERM drain-and-stop"
 ```
 
 ---
@@ -1331,17 +1331,17 @@ git commit -m "feat(uc2_node): the uc2-node daemon — config file, preflight, S
 **Files:**
 - Modify: `examples/counter/src/bin/counter-service.rs`
 - Create: `docs/how-to/write-a-service-binary.md`
-- Test: `uc2_node/tests/lifecycle.rs` (extend)
+- Test: `uc_node/tests/lifecycle.rs` (extend)
 
 **Interfaces:**
-- Consumes: `Service::stop()` (`uc2_service/src/lib.rs:314`), `Service::is_alive()` (`:307`).
+- Consumes: `Service::stop()` (`uc_service/src/lib.rs:314`), `Service::is_alive()` (`:307`).
 - Produces: the documented service-binary template. No new library API.
 
 The service half is user code, so the deliverable is a template plus the same signal discipline, not a second daemon. Read `examples/counter/src/bin/counter-service.rs` before editing.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `uc2_node/tests/lifecycle.rs`:
+Add to `uc_node/tests/lifecycle.rs`:
 
 ```rust
 #[test]
@@ -1393,7 +1393,7 @@ addr = "127.0.0.1:19703"
 }
 ```
 
-This test needs `counter-service` on the `CARGO_BIN_EXE_` path, so add `counter` as a dev-dependency of `uc2_node`, or move the test into `examples/counter/tests/`. Prefer the latter — it keeps `uc2_node` free of an example dependency.
+This test needs `counter-service` on the `CARGO_BIN_EXE_` path, so add `counter` as a dev-dependency of `uc_node`, or move the test into `examples/counter/tests/`. Prefer the latter — it keeps `uc_node` free of an example dependency.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1514,7 +1514,7 @@ git commit -m "docs,packaging: cut over to the uc2-node daemon (systemd units, e
 ### Task 8: The M9 restart-cost gate
 
 **Files:**
-- Create: `uc2_node/examples/m9_gate.rs`
+- Create: `uc_node/examples/m9_gate.rs`
 - Create: `docs/benchmarks/uc2-m9-gate-2026-08-19.md` (the decide rule, committed BEFORE the run)
 
 **Interfaces:**
@@ -1541,17 +1541,17 @@ git commit -m "docs(bench): pre-commit the M9 restart-cost gate decide rule"
 
 - [ ] **Step 2: Write the gate harness**
 
-Create `uc2_node/examples/m9_gate.rs` with `node` / `service` / `client` roles, following `uc2_node/examples/m7_gate.rs`'s structure so `bench-infra/scripts/m6_fleet_gate.py` can drive it. The scenario: 3-node cluster under steady load, stop the leader with `SIGTERM`, restart it, measure the four rows above. Print the bar and `exit(1)` on FAIL.
+Create `uc_node/examples/m9_gate.rs` with `node` / `service` / `client` roles, following `uc_node/examples/m7_gate.rs`'s structure so `bench-infra/scripts/m6_fleet_gate.py` can drive it. The scenario: 3-node cluster under steady load, stop the leader with `SIGTERM`, restart it, measure the four rows above. Print the bar and `exit(1)` on FAIL.
 
 - [ ] **Step 3: Run it locally as a smoke check**
 
-Run: `cargo run -p uc2_node --release --example m9_gate -- all --secs 6`
+Run: `cargo run -p uc_node --release --example m9_gate -- all --secs 6`
 Expected: PASS. A local run is smoke, never the gate.
 
 - [ ] **Step 4: Commit the harness**
 
 ```bash
-git add uc2_node/examples/m9_gate.rs
+git add uc_node/examples/m9_gate.rs
 git commit -m "test(m9): restart-cost gate harness (stop <1s, no snapshot install, dip <10%)"
 ```
 
@@ -1611,7 +1611,7 @@ produced on a locally-patched tree and is **not trustworthy as recorded**.
 package** and spawns its node half via `CARGO_BIN_EXE_counter-node`, not
 `CARGO_BIN_EXE_uc2-node`. Cargo sets `CARGO_BIN_EXE_<name>` only for the package
 that *defines* the binary, so a test in `counter` can never see `uc2-node`; the
-plan's own preference (keep `uc2_node` free of an example dependency) is only
+plan's own preference (keep `uc_node` free of an example dependency) is only
 satisfiable this way. Task 6 asserts the *service* half's signal handling; the
 daemon's is covered by Tasks 5 and 8. *Cost if wrong:* a daemon-only startup
 regression is not caught by this particular test.
@@ -1648,7 +1648,7 @@ that macOS is not a target. No code was committed for it.
 ### Rulings (continued)
 
 **Ruling 6 (Task 1) — re-verified and reviewed on Linux; APPROVED as-is.** The
-macOS evidence is superseded: `cargo test -p uc2_node --lib` is 71/71 (the
+macOS evidence is superseded: `cargo test -p uc_node --lib` is 71/71 (the
 patched-tree record said 69/71), the 4 `config_file` tests pass, and clippy is
 clean. Review verdict on the two flagged items: (a) `#[derive(Debug)]` on
 `NodeConfig` is safe to keep — `CryptoConfig::Enabled` holds key *paths*, never
@@ -1714,7 +1714,7 @@ pulls the tail back out of the buffer regardless.
 **Ruling 10 (Task 5) — the shipped default config panicked the daemon on its
 first boot, and the fix is in two places because there were two faults.**
 Running the daemon for the first time produced
-`uc2_net/src/sender.rs:421: a max-size frame (+ crypto overhead, if enabled)
+`uc_net/src/sender.rs:421: a max-size frame (+ crypto overhead, if enabled)
 must fit one datagram`. Task 1's `default_max_payload` was **1 MiB against a
 1408 B MTU** — about 700x the budget. UC does not fragment frames, so
 `Sender::new` asserts the fit at construction: every field deserialised
@@ -1839,7 +1839,7 @@ three nodes) and 4 (6/6), and FAILED row 3 at 62.0 % against the 10 % bar —
 recorded as an honest FAIL in the gate doc. The run's log shows leadership
 moved to n1; the harness ran ONE load client pinned to the leader and respawned
 it on the new leader, paying a process spawn plus its CAN_SERVE wait inside the
-5 s measurement window. That model was wrong about the SDK: `uc2_client` is
+5 s measurement window. That model was wrong about the SDK: `uc_client` is
 written for a per-node app client (every node runs one; the leader's serves,
 a follower's redirects its callers to the leader).
 Two-part fix (`10d3d9d`): the orchestrator starts a client on EVERY node and

@@ -2,7 +2,7 @@ import Uc2Model.TermMap
 
 /-! Logs as term-stamped byte sequences — the semantic ground the deep
 Reconcile theorems (R2–R4) stand on. Mirrors the sim's content-identity
-oracle (`uc2_sim/src/invariants.rs`: `term_at` equality ⇔ content identity,
+oracle (`uc_sim/src/invariants.rs`: `term_at` equality ⇔ content identity,
 `first_content_divergence`). -/
 
 namespace Uc2
@@ -19,7 +19,7 @@ def encodes (m : TermMap) (h : ByteHistory) (durable : Nat) : Prop :=
 
 end TermMap
 
-/-- `uc2_sim/src/invariants.rs::first_content_divergence`: the least position
+/-- `uc_sim/src/invariants.rs::first_content_divergence`: the least position
 `< bound` where the two histories' stamps differ, or `bound` if none. -/
 def firstDivergence (a b : ByteHistory) (bound : Nat) : Nat :=
   match (List.range bound).find? (fun p => a p ≠ b p) with

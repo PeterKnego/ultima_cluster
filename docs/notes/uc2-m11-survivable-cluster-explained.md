@@ -206,6 +206,6 @@ visible.
   `docs/how-to/upgrade-a-cluster.md`
 - CI: the nightly `survival` job (survival + quorum-loss + ENOSPC
   crashtests; the genuine-ENOSPC fixture runs where sudo exists)
-- The library surface: `uc2_node::backup`, `uc2_node::recovery`, and the
+- The library surface: `uc_node::backup`, `uc_node::recovery`, and the
   four offline `uc2ctl` subcommands (offline = no cnc admin band; the
   reference page draws the distinction).

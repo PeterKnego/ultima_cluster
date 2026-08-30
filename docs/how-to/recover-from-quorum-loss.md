@@ -121,7 +121,7 @@ tombstone does — but reusing it is **untested and not the recommended
 practice**, and this page does not walk through it. Every recovery path this
 project actually exercises (the `survival.rs` e2e behind
 `--features survival-tests`, and the module doc for
-`uc2_node::recovery::force_single_member`) rejoins a dropped peer under a
+`uc_node::recovery::force_single_member`) rejoins a dropped peer under a
 fresh id, exactly like step 2 above, and explicitly never reuses the old one.
 Follow that idiom rather than the old id: it is what is actually proven,
 not merely assumed safe.

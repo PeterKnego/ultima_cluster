@@ -9,7 +9,7 @@
 //! Usage: `cd fuzz && cargo +nightly run --bin seed-corpus`
 
 use std::path::Path;
-use uc2_fuzz::seeds;
+use uc_fuzz::seeds;
 
 fn write_target(root: &Path, target: &str, entries: Vec<seeds::Seed>) -> std::io::Result<()> {
     let dir = root.join("corpus").join(target);
@@ -58,19 +58,19 @@ fn write_target(root: &Path, target: &str, entries: Vec<seeds::Seed>) -> std::io
 fn main() -> std::io::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     write_target(root, "uc_protocol_datagram", seeds::uc_protocol_datagram())?;
-    write_target(root, "uc2_remote_frame", seeds::uc2_remote_frame())?;
-    write_target(root, "uc2_crypto_open", seeds::uc2_crypto_open())?;
-    write_target(root, "uc2_crypto_handshake", seeds::uc2_crypto_handshake())?;
-    write_target(root, "uc2_crypto_group_key", seeds::uc2_crypto_group_key())?;
-    write_target(root, "uc2_crypto_admin", seeds::uc2_crypto_admin())?;
-    write_target(root, "ultima_journal_record", seeds::ultima_journal_record())?;
-    write_target(root, "ultima_journal_stable_value", seeds::ultima_journal_stable_value())?;
+    write_target(root, "uc_remote_frame", seeds::uc_remote_frame())?;
+    write_target(root, "uc_crypto_open", seeds::uc_crypto_open())?;
+    write_target(root, "uc_crypto_handshake", seeds::uc_crypto_handshake())?;
+    write_target(root, "uc_crypto_group_key", seeds::uc_crypto_group_key())?;
+    write_target(root, "uc_crypto_admin", seeds::uc_crypto_admin())?;
+    write_target(root, "uc_journal_record", seeds::uc_journal_record())?;
+    write_target(root, "uc_journal_stable_value", seeds::uc_journal_stable_value())?;
     write_target(root, "uc_protocol_cnc", seeds::uc_protocol_cnc())?;
     write_target(root, "ring_mpsc_record", seeds::ring_mpsc_record())?;
     write_target(root, "uc_protocol_log_frame", seeds::uc_protocol_log_frame())?;
-    write_target(root, "uc2_service_session", seeds::uc2_service_session())?;
-    write_target(root, "uc2_node_toml", seeds::uc2_node_toml())?;
-    write_target(root, "uc2_gateway_toml", seeds::uc2_gateway_toml())?;
-    write_target(root, "uc2_node_http", seeds::uc2_node_http())?;
+    write_target(root, "uc_service_session", seeds::uc_service_session())?;
+    write_target(root, "uc_node_toml", seeds::uc_node_toml())?;
+    write_target(root, "uc_gateway_toml", seeds::uc_gateway_toml())?;
+    write_target(root, "uc_node_http", seeds::uc_node_http())?;
     Ok(())
 }

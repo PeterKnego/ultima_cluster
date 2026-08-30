@@ -130,10 +130,10 @@ class M9Node:
     timing a SIGTERM-to-exit ON THE HOST.
     """
 
-    def __init__(self, host, node_id, uc2_node_bin, local):
+    def __init__(self, host, node_id, uc_node_bin, local):
         self.host = host
         self.id = node_id
-        self.uc2_node_bin = uc2_node_bin
+        self.uc_node_bin = uc_node_bin
         self.local = local
         self.cfg_path = f"{Path(host.dir).parent}/n{node_id}.toml"
         self.daemon = None          # local: Popen
@@ -161,7 +161,7 @@ class M9Node:
             log.write(f"\n=== start {self.unit} ===\n")
             log.flush()
             self.daemon = subprocess.Popen(
-                [self.uc2_node_bin, "--config", self.cfg_path,
+                [self.uc_node_bin, "--config", self.cfg_path,
                  "--drain-timeout-secs", str(DRAIN_TIMEOUT_SECS)],
                 stdout=log, stderr=subprocess.STDOUT,
             )
@@ -180,7 +180,7 @@ class M9Node:
             f"-p TimeoutStopSec={UNIT_STOP_TIMEOUT} -p KillSignal=SIGTERM "
             f"-p StandardOutput=append:/opt/bench/{self.unit}.log "
             f"-p StandardError=append:/opt/bench/{self.unit}.log "
-            f"{self.uc2_node_bin} --config {self.cfg_path} "
+            f"{self.uc_node_bin} --config {self.cfg_path} "
             f"--drain-timeout-secs {DRAIN_TIMEOUT_SECS}"
         )
         r = self.host._ssh(cmd, capture_output=True)
@@ -302,13 +302,13 @@ def _run_refusal(node, base_dir, path, body):
         Path(base_dir).mkdir(parents=True, exist_ok=True)
         (Path(base_dir) / "inst").mkdir(parents=True, exist_ok=True)
         Path(path).write_text(body)
-        p = subprocess.run([node.uc2_node_bin, "--config", path],
+        p = subprocess.run([node.uc_node_bin, "--config", path],
                            capture_output=True, text=True, timeout=30)
         return p.returncode, (p.stderr or "")
     r = node.host._ssh(
         f"sudo mkdir -p {base_dir}/inst && "
         f"sudo tee {path} >/dev/null <<'M9CFG'\n{body}\nM9CFG\n"
-        f"sudo {node.uc2_node_bin} --config {path}; echo M9_RC=$?",
+        f"sudo {node.uc_node_bin} --config {path}; echo M9_RC=$?",
         capture_output=True,
     )
     out = (r.stdout or "") + (r.stderr or "")
@@ -536,7 +536,7 @@ def setup_local(a):
     subprocess.run(["rm", "-rf", str(root)], check=False)
     (root / "logs").mkdir(parents=True, exist_ok=True)
     gate = a.bin or str(Path.home() / ".cache/cargo-target/release/examples/m9_gate")
-    ucnode = a.uc2_node_bin or str(Path.home() / ".cache/cargo-target/release/uc2-node")
+    ucnode = a.uc_node_bin or str(Path.home() / ".cache/cargo-target/release/uc2-node")
     for p in (gate, ucnode):
         if not Path(p).is_file():
             sys.exit(f"binary not found: {p} — build it first")
@@ -567,13 +567,13 @@ def setup_local(a):
 def setup_fleet(a):
     specs = m6.fleet_hosts(a.hosts) if hasattr(m6, "fleet_hosts") else _hosts_from_arg(a.hosts)
     gate = a.bin or "/opt/bench/uc/target/release/examples/m9_gate"
-    ucnode = a.uc2_node_bin or "/opt/bench/uc/target/release/uc2-node"
+    ucnode = a.uc_node_bin or "/opt/bench/uc/target/release/uc2-node"
     nodes = []
     for i, (pub, priv) in enumerate(specs[:3]):
         h = SshHost(gate, f"/opt/bench/m9/n{i}", pub, priv, a.ssh_user, a.ssh_key,
                     unit_prefix="m9", remote_root="/opt/bench/m9")
         h.bind_addr_fixed = f"{priv}:{PORT}"
-        h.prepare(examples=("m9_gate",), bins=("uc2_node",))
+        h.prepare(examples=("m9_gate",), bins=("uc_node",))
         h._ssh(f"sudo rm -rf {h.dir} && sudo mkdir -p {h.dir}", capture_output=True)
         nodes.append(M9Node(h, i, ucnode, local=False))
 

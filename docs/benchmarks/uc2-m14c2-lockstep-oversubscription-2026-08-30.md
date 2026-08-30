@@ -18,17 +18,17 @@ The M14 fleet gate's **row e** measured lockstep (`fsm_lag = "lockstep"`) on a
 3-voter cluster whose 8-vCPU leader host also ran the client at **~21.7 k
 ops/s** — 60× under its bounded twin
 (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`). The dev-box apply-hop harness
-(`uc2_node/examples/apply_bench`) had measured the same mode at **631 k/s at
+(`uc_node/examples/apply_bench`) had measured the same mode at **631 k/s at
 N=2** with the FSMs alone on the box
 (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`). Two numbers 30× apart for
 the same code path.
 
 **Pre-registered hypothesis** (spec §16.4, M14a's doc comment at
-`uc2_service/src/apply.rs`): under CPU oversubscription a descheduled sibling
+`uc_service/src/apply.rs`): under CPU oversubscription a descheduled sibling
 makes the barrier ladder (`LAG_WAIT_SPINS = 256` spins, then
 `LAG_WAIT_YIELDS = 2048` yields) *exhaust*, the waiter falls through to the
 apply agent's idle strategy — `APPLY_IDLE = Sleep(50 µs)`,
-`uc2_service/src/lib.rs` — and the set cascades into sleeping in lockstep.
+`uc_service/src/lib.rs` — and the set cascades into sleeping in lockstep.
 
 ## Method
 
@@ -41,7 +41,7 @@ takes the same shape with `--fsms`/`--mode` free; the repo script stays exactly
 the shape the brief specified.
 
 The harness's three busy threads are the driver (append + fake
-archive/consensus) and the two `uc2_service` apply agents, so `--cores 0` is
+archive/consensus) and the two `uc_service` apply agents, so `--cores 0` is
 already 3 runnable threads on 1 CPU before any spinner is added.
 
 Box: **16C/32T x86_64 dev box, HT siblings `N, N+16`** (so `--cores 0-1` is two
@@ -272,7 +272,7 @@ exceeds the CPUs it collapses by up to ~880× (624 k → 709 frames/s at N=2 wit
 Landed: the envelope sentence with the number, in
 `docs/reference/configuration.md` (`[services]`, the `fsm_lag` row) and
 `docs/reference/limits.md`. **No behavioural code change**:
-`uc2_service/src/apply.rs` gains only comments — a one-line "do not retune"
+`uc_service/src/apply.rs` gains only comments — a one-line "do not retune"
 pointer at `LAG_WAIT_YIELDS` and a paragraph on `lockstep_wait` recording that
 the ladder never exhausts here — so that nobody rediscovers the 1.00× the hard
 way.

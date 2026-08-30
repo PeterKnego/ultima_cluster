@@ -2,22 +2,22 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let N state-machine processes (ids 0..7) attach to one `uc2_node` over one replicated log, each with its own cnc progress slot, its own query/egress rings and its own snapshot directory, paced by a bounded lag barrier and a quorum-gated durable report — with FSM 0 answering clients exactly as the single service does today.
+**Goal:** Let N state-machine processes (ids 0..7) attach to one `uc_node` over one replicated log, each with its own cnc progress slot, its own query/egress rings and its own snapshot directory, paced by a bounded lag barrier and a quorum-gated durable report — with FSM 0 answering clients exactly as the single service does today.
 
 **Architecture:** The cnc page grows to 8 KiB (version 3.0, a same-host flag day): page 2 is `ServiceSlot[8]` (512 B stride, one writer per line), page 1's singular service fields become node-written `min` aggregates over the declared set, and two boot-once fields at 4032/4040 publish the declared set and the lag policy. The node creates `svc_query.<id>.ring` / `egress_service.<id>.broadcast` / `snapshots/<id>/` per declared id and computes the aggregates once per consensus cycle; the service writes only its slot and, before each batch, caps its apply target at `min(slot.applied) + fsm_lag` (or one frame, in lockstep); the leader's admission door and every node's published validated frontier take `min_applied + fsm_lag` as a second ceiling so a lagging quorum stalls commit instead of running the FSMs off the ring. M11 backup/verify/restore learn the per-id snapshot layout.
 
-**Tech Stack:** Rust 2024 (workspace edition), stable 1.96.0 pinned / MSRV 1.89, `memmap2` shared memory, `fs2` flock (workspace dep, new to `uc2_service`), `serde`/`toml` config, `cargo-fuzz` on nightly for the corpus regen.
+**Tech Stack:** Rust 2024 (workspace edition), stable 1.96.0 pinned / MSRV 1.89, `memmap2` shared memory, `fs2` flock (workspace dep, new to `uc_service`), `serde`/`toml` config, `cargo-fuzz` on nightly for the corpus regen.
 
-**Spec:** `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` — this plan implements §3 (control page + config), §4.1–§4.2, §4.4 (the service side minus queries/responses fan-out), §5.1–§5.3, §5.5, §7.1–§7.2, §7.4–§7.5. **Not in this plan:** §5.4 + §6 (per-id query routing, client `submit_to`/`submit_all`, `MSG_V2_BAD_SERVICE`) and the `uc2_sim` scenario → plan **M14b**; §7.3 (N artifacts per snapshot session, wire 0.6.0), §9 (labelled metrics, alerts, `uc2ctl status` table), the capstones (§12: `lin_v2 two_fsm`, crashtest, elle), the fleet gate and the release writeup → plans **M14c/M14d**. Those plans are written after this one lands, against the tree it produces.
+**Spec:** `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` — this plan implements §3 (control page + config), §4.1–§4.2, §4.4 (the service side minus queries/responses fan-out), §5.1–§5.3, §5.5, §7.1–§7.2, §7.4–§7.5. **Not in this plan:** §5.4 + §6 (per-id query routing, client `submit_to`/`submit_all`, `MSG_V2_BAD_SERVICE`) and the `uc_sim` scenario → plan **M14b**; §7.3 (N artifacts per snapshot session, wire 0.6.0), §9 (labelled metrics, alerts, `uc2ctl status` table), the capstones (§12: `lin_v2 two_fsm`, crashtest, elle), the fleet gate and the release writeup → plans **M14c/M14d**. Those plans are written after this one lands, against the tree it produces.
 
 ## Deviations from the spec, for the reviewer
 
 Each is a plan-level decision found while mapping the spec onto the tree; the spec is not amended here. Veto any of them before execution.
 
-1. **The lag barrier is a target cap, not a spin.** Spec §4.2 says the wait "is the same spin/yield the follower already uses for `Batch::NotCommitted`". No such variant exists: `uc2_log::reader::Batch` is `Frames | CaughtUp | Overrun` (`uc2_log/src/reader.rs:49-58`), the apply loop `break`s on `CaughtUp` and the agent's `IdleStrategy::Sleep(50 µs)` idles it. But `LogFollower::next_batch(target)` yields **only frames whose end ≤ `target`** (`reader.rs:64-84`, `FrameIter::next`'s target guard), so the bounded predicate `p + len − floor ≤ fsm_lag` is exactly `target = min(commit, durable, floor + fsm_lag)`, and lockstep ("floor ≥ p") is "if `cursor == floor` apply exactly one frame, else `CaughtUp`". A capped batch simply returns `CaughtUp` and the existing idle strategy waits. Zero new wait machinery; the invariant in §4.2 holds verbatim because `floor` is sampled once per cycle and only ever increases (a stale sample is conservative). **As-built errata (spec §4.2, added at final review):** the target cap governs live apply only, not journal replay — a follower whose FSM *k* is stuck while the cluster keeps committing can have a sibling FSM *j* rejoin via `replay_into` straight to the archived frontier, so `applied_j − applied_k` may exceed `fsm_lag` there (safe; bounded on the leader; the M14c slow-FSM oracle must sample leader-only). **As-built errata 2 (post-merge, same day):** "the existing idle strategy waits" was the defect — under lockstep it capped throughput at one frame per 50 µs sleep (18 k frames/s); `lockstep_wait` (`80a37a8`) spins then yields out of line before sleeping, bounded untouched: 631 k / 583 k / 458 k frames/s at N = 2 / 4 / 8 (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
+1. **The lag barrier is a target cap, not a spin.** Spec §4.2 says the wait "is the same spin/yield the follower already uses for `Batch::NotCommitted`". No such variant exists: `uc_log::reader::Batch` is `Frames | CaughtUp | Overrun` (`uc_log/src/reader.rs:49-58`), the apply loop `break`s on `CaughtUp` and the agent's `IdleStrategy::Sleep(50 µs)` idles it. But `LogFollower::next_batch(target)` yields **only frames whose end ≤ `target`** (`reader.rs:64-84`, `FrameIter::next`'s target guard), so the bounded predicate `p + len − floor ≤ fsm_lag` is exactly `target = min(commit, durable, floor + fsm_lag)`, and lockstep ("floor ≥ p") is "if `cursor == floor` apply exactly one frame, else `CaughtUp`". A capped batch simply returns `CaughtUp` and the existing idle strategy waits. Zero new wait machinery; the invariant in §4.2 holds verbatim because `floor` is sampled once per cycle and only ever increases (a stale sample is conservative). **As-built errata (spec §4.2, added at final review):** the target cap governs live apply only, not journal replay — a follower whose FSM *k* is stuck while the cluster keeps committing can have a sibling FSM *j* rejoin via `replay_into` straight to the archived frontier, so `applied_j − applied_k` may exceed `fsm_lag` there (safe; bounded on the leader; the M14c slow-FSM oracle must sample leader-only). **As-built errata 2 (post-merge, same day):** "the existing idle strategy waits" was the defect — under lockstep it capped throughput at one frame per 50 µs sleep (18 k frames/s); `lockstep_wait` (`80a37a8`) spins then yields out of line before sleeping, bounded untouched: 631 k / 583 k / 458 k frames/s at N = 2 / 4 / 8 (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
 2. **`output_progress.state` stays one file, = `min(slot.output_completed)` over declared ids**, not `state/output_progress.<id>.state` (spec §4.4, §7.2, §7.5). The marker is a *resume hint* under an at-least-once contract: a faster FSM resuming from the min re-delivers a window it already delivered, which the contract permits, and it keeps the M11 `STATE_FILES` set, the MANIFEST and `BackupReport` untouched. Per-FSM `output_completed` on the slot (line 3) is kept, so `/metrics` and `uc2ctl` can still show each FSM's own progress in M14c. If the reviewer wants the per-id file anyway, it is a M14c item (N `StableValue`s in `NodeState` + a per-slot node-written mirror on the reserved line 7).
 3. **This plan ships snapshot transfer for FSM 0 only.** The sender's `SnapshotSource` and the receiver's intake dir move from `snapshots/` to `snapshots/0/`; a learner joining a cluster with N > 1 declared ids gets FSM 0's artifact and FSM 1..N-1 stay below the floor until M14c lands §7.3. Stated in the docs task as a M14a limitation, not hidden.
-4. **`fsm_lag_eff` under lockstep is `align_frame_len(HEADER_LEN + max_payload)`.** Spec §5.2 names `max_claim`, which does not exist in the tree (`uc2_node/src` has no such identifier); `FrameHeader.length` is the *total* frame length (`uc_protocol/src/v2/frame.rs:15`), so the largest frame the appender can produce is that expression, and "at most one frame past the FSMs" is one such frame.
+4. **`fsm_lag_eff` under lockstep is `align_frame_len(HEADER_LEN + max_payload)`.** Spec §5.2 names `max_claim`, which does not exist in the tree (`uc_node/src` has no such identifier); `FrameHeader.length` is the *total* frame length (`uc_protocol/src/v2/frame.rs:15`), so the largest frame the appender can produce is that expression, and "at most one frame past the FSMs" is one such frame.
 5. **`min` over declared ids includes unattached ids reading 0** (spec §5.1 says so, and §7.1 says a never-snapshotted declared id holds the purge floor at 0). Kept exactly as specified — with one consequence pinned by a test: the purge floor's increase-only guard (`maybe_persist_snapshot_floor`, `node.rs:2901-2967`) means a *newly declared* id can never regress the floor, only freeze it, which is the §8 "declared set grew after purge ran" row.
 
 ## Global Constraints
@@ -26,11 +26,11 @@ Each is a plan-level decision found while mapping the spec onto the tree; the sp
 - `cargo clippy --workspace --all-targets -- -D warnings` must be clean after **every** task.
 - **Never write scratch or test artifacts to `/tmp`** — RAM-backed tmpfs, no swap. Tests use `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`; the local smoke's instance dirs go under `/home/claude/`.
 - **Use a private `CARGO_TARGET_DIR`** for any measurement or the final proof-stack run from this worktree (`~/.cache/cargo-target` is shared with the main checkout and other worktrees).
-- cnc page offsets are pinned in **both** `uc_protocol::v2::cnc` and `uc2_log::cnc`, each with its own offset-assertion test; every new offset lands in both, with both tests grown.
-- **`version::CURRENT` stays 0.5.0 in this plan.** The UDP wire is untouched; the only wire change (SNAP_BEGIN) is M14c. `CNC_V2_VERSION` goes 2.0 → 3.0 here (same-host flag day; every attaching party already refuses a page whose major differs, via `CncPage::validate`, `uc2_log/src/cnc.rs:321`).
-- `uc2_consensus`, `uc2_net`'s receiver, `uc2_crypto`, the log frame, the datagram header and the M13 ring formats (`ULTRNG2`) are not touched. `publish_validated_frontier` changes the *value* the receiver already reads, not the receiver.
+- cnc page offsets are pinned in **both** `uc_protocol::v2::cnc` and `uc_log::cnc`, each with its own offset-assertion test; every new offset lands in both, with both tests grown.
+- **`version::CURRENT` stays 0.5.0 in this plan.** The UDP wire is untouched; the only wire change (SNAP_BEGIN) is M14c. `CNC_V2_VERSION` goes 2.0 → 3.0 here (same-host flag day; every attaching party already refuses a page whose major differs, via `CncPage::validate`, `uc_log/src/cnc.rs:321`).
+- `uc_consensus`, `uc_net`'s receiver, `uc_crypto`, the log frame, the datagram header and the M13 ring formats (`ULTRNG2`) are not touched. `publish_validated_frontier` changes the *value* the receiver already reads, not the receiver.
 - Command payload ceiling, `PurgePolicy::Disabled` default, `[crypto]`/`[admin]` explicit-choice refusals: unchanged.
-- The public `uc2_service` API changes shape in exactly three places, all additive except one: `ServiceConfig` gains `service_id` (+ builder `.service_id(u8)`), `ServiceError` gains two variants, and `SnapshotStore::open(instance_dir)` becomes `open(instance_dir, service_id: u8)` (the one breaking change; no external users exist — the standing "design freely" rule).
+- The public `uc_service` API changes shape in exactly three places, all additive except one: `ServiceConfig` gains `service_id` (+ builder `.service_id(u8)`), `ServiceError` gains two variants, and `SnapshotStore::open(instance_dir)` becomes `open(instance_dir, service_id: u8)` (the one breaking change; no external users exist — the standing "design freely" rule).
 - Commit after every task with a conventional message. One task, one commit.
 
 ## File Structure
@@ -40,34 +40,34 @@ Each is a plan-level decision found while mapping the spec onto the tree; the sp
 | `uc_protocol/src/v2/cnc.rs` | Modify | `CNC_PAGE_LEN` 8192, `CNC_V2_VERSION` 3.0, the page-2 `ServiceSlot` band constants (`CNC_OFF_SERVICE_SLOTS`, `CNC_SERVICE_SLOT_STRIDE`, `CNC_MAX_SERVICES`, `CNC_SVC_OFF_*`), the 4032/4040 pair (`CNC_OFF_SERVICES_DECLARED`, `CNC_OFF_FSM_LAG_BYTES`), module-doc layout map, `offsets_do_not_overlap` growth, the literal-byte version pin. |
 | `uc_protocol/src/version.rs` | Modify | The NB paragraph that says the cnc page is "stuck at major=2" — corrected. |
 | `fuzz/corpus/uc_protocol_cnc/*` | Regenerate | Seeds are built from `CNC_PAGE_LEN`; regenerated, not hand-edited. |
-| `uc2_log/src/cnc.rs` | Modify | `ServiceSlot` (`#[repr(C)]`, 8 × `PaddedAtomicU64`), `CncPage::service_slot(i)`, `services_declared`/`store_services_declared`, `fsm_lag_bytes`/`store_fsm_lag_bytes`, the length gates (`new`, `create_file`, `open_file`, `heap`, `page`/`page_mut`), SAFETY comments, `cnc_offsets_match_protocol_constants` growth, new round-trip tests. |
-| `uc2_node/src/services.rs` | Create | `ServicesConfig`/`FsmLag`/`parse_fsm_lag` (Task 3), `service_mins` (Task 5), `fsm_lag_eff`/`report_ceiling` (Task 8) — the pure, unit-tested half of the node's multi-service logic. |
-| `uc2_node/src/config_file.rs` | Modify | `[services]` section (`ServicesSection`), `parse_byte_size`, `FsmLag`, the named refusals, tests. |
-| `uc2_node/src/node.rs` | Modify | `ServicesConfig` on `NodeConfig`; per-id ring/dir creation; boot-once cnc fields; `Consensus::publish_service_mins` (top of `do_work`); `admission_open` second predicate; `publish_validated_frontier` ceiling; `PendingRead.service_id` + the per-slot ready bracket; `svc_query` producer table; `SnapshotSource`/intake at `snapshots/0/`. |
-| `uc2_node/src/ipc.rs` | Modify | `svc_query_ring_for(id)`, `egress_service_for(id)`, `snapshot_dir_for(id)`, `service_lock_for(id)` accessors + test. |
-| `uc2_node/src/obs/metrics.rs` | Modify | `uc2_service_epoch` reads slot 0 (page-1 `service_epoch` is retired). |
-| `uc2_node/src/backup.rs` | Modify | Recursive `snapshots/<id>/` copy, per-id coverage (`BackupError::Hole { service }`), `BackupReport.newest_snapshots: [Option<u64>; 8]`, MANIFEST v2. |
-| `uc2ctl/src/main.rs` | Modify | `print_backup_report` prints the per-id list. |
-| `uc2_service/Cargo.toml` | Modify | `fs2 = { workspace = true }`. |
-| `uc2_service/src/config.rs` | Modify | `ServiceConfig.service_id` + `.service_id()`, `ServiceError::{ServiceNotDeclared, AlreadyAttached}`. |
-| `uc2_service/src/attach.rs` | Modify | Declared-set check, `service.<id>.lock`, per-id ring names, slot writes. |
-| `uc2_service/src/lag.rs` | Create | The lag barrier as a pure plan: `LagMode`, `Plan`, `plan()`, `mode_from_page`, `floor` (Task 7). |
-| `uc2_service/src/apply.rs` | Modify | Slot-based `applied`/`heartbeat_ns`, the lag barrier (`apply_target`), `lag_waits`. |
-| `uc2_service/src/lib.rs` | Modify | `Service::service_id()`, the lock handle kept alive, `SnapshotStore::open(dir, id)`, slot-based snapshot/output reads. |
-| `uc2_service/src/output.rs`, `builder_agent.rs`, `snapshots.rs` | Modify | Slot-based `output_completed` / `snapshot_pos`; `snapshots/<id>/`. |
-| `uc2_client/src/engine.rs` + 6 test fixtures | Modify | `EGRESS_SERVICE` → `egress_service.0.broadcast` (FSM 0 only in M14a). |
-| `examples/counter/src/bin/counter-service.rs`, `examples/uc2-crashtest/src/bin/uc2-crashtest-service.rs` | Modify | `--service-id`. |
-| `uc2_gateway/examples/hop_bench/dummy_node.rs`, `uc2_node/examples/read_profile.rs` | Modify | Ring names. |
+| `uc_log/src/cnc.rs` | Modify | `ServiceSlot` (`#[repr(C)]`, 8 × `PaddedAtomicU64`), `CncPage::service_slot(i)`, `services_declared`/`store_services_declared`, `fsm_lag_bytes`/`store_fsm_lag_bytes`, the length gates (`new`, `create_file`, `open_file`, `heap`, `page`/`page_mut`), SAFETY comments, `cnc_offsets_match_protocol_constants` growth, new round-trip tests. |
+| `uc_node/src/services.rs` | Create | `ServicesConfig`/`FsmLag`/`parse_fsm_lag` (Task 3), `service_mins` (Task 5), `fsm_lag_eff`/`report_ceiling` (Task 8) — the pure, unit-tested half of the node's multi-service logic. |
+| `uc_node/src/config_file.rs` | Modify | `[services]` section (`ServicesSection`), `parse_byte_size`, `FsmLag`, the named refusals, tests. |
+| `uc_node/src/node.rs` | Modify | `ServicesConfig` on `NodeConfig`; per-id ring/dir creation; boot-once cnc fields; `Consensus::publish_service_mins` (top of `do_work`); `admission_open` second predicate; `publish_validated_frontier` ceiling; `PendingRead.service_id` + the per-slot ready bracket; `svc_query` producer table; `SnapshotSource`/intake at `snapshots/0/`. |
+| `uc_node/src/ipc.rs` | Modify | `svc_query_ring_for(id)`, `egress_service_for(id)`, `snapshot_dir_for(id)`, `service_lock_for(id)` accessors + test. |
+| `uc_node/src/obs/metrics.rs` | Modify | `uc_service_epoch` reads slot 0 (page-1 `service_epoch` is retired). |
+| `uc_node/src/backup.rs` | Modify | Recursive `snapshots/<id>/` copy, per-id coverage (`BackupError::Hole { service }`), `BackupReport.newest_snapshots: [Option<u64>; 8]`, MANIFEST v2. |
+| `uc_ctl/src/main.rs` | Modify | `print_backup_report` prints the per-id list. |
+| `uc_service/Cargo.toml` | Modify | `fs2 = { workspace = true }`. |
+| `uc_service/src/config.rs` | Modify | `ServiceConfig.service_id` + `.service_id()`, `ServiceError::{ServiceNotDeclared, AlreadyAttached}`. |
+| `uc_service/src/attach.rs` | Modify | Declared-set check, `service.<id>.lock`, per-id ring names, slot writes. |
+| `uc_service/src/lag.rs` | Create | The lag barrier as a pure plan: `LagMode`, `Plan`, `plan()`, `mode_from_page`, `floor` (Task 7). |
+| `uc_service/src/apply.rs` | Modify | Slot-based `applied`/`heartbeat_ns`, the lag barrier (`apply_target`), `lag_waits`. |
+| `uc_service/src/lib.rs` | Modify | `Service::service_id()`, the lock handle kept alive, `SnapshotStore::open(dir, id)`, slot-based snapshot/output reads. |
+| `uc_service/src/output.rs`, `builder_agent.rs`, `snapshots.rs` | Modify | Slot-based `output_completed` / `snapshot_pos`; `snapshots/<id>/`. |
+| `uc_client/src/engine.rs` + 6 test fixtures | Modify | `EGRESS_SERVICE` → `egress_service.0.broadcast` (FSM 0 only in M14a). |
+| `examples/counter/src/bin/counter-service.rs`, `examples/uc_crashtest/src/bin/uc_crashtest-service.rs` | Modify | `--service-id`. |
+| `uc_gateway/examples/hop_bench/dummy_node.rs`, `uc_node/examples/read_profile.rs` | Modify | Ring names. |
 | 42 `NodeConfig` literal sites (listed in Task 3) | Modify | `services: ServicesConfig::default()`. |
-| `uc2_node/tests/services.rs` | Create | The M14a integration tests: refusals, two FSMs apply, the lag bound, the door, the report ceiling. |
-| `uc2_node/tests/backup.rs` | Modify | The two-id round trip + per-id hole test. |
+| `uc_node/tests/services.rs` | Create | The M14a integration tests: refusals, two FSMs apply, the lag bound, the door, the report ceiling. |
+| `uc_node/tests/backup.rs` | Modify | The two-id round trip + per-id hole test. |
 | `packaging/node.example.toml`, `docs/reference/{cnc-page,instance-directory,wire-protocol}.md`, `docs/how-to/{upgrade-a-cluster,run-a-cluster,back-up-a-cluster}.md`, `docs/ops/uc2-runbook.md`, `docs/VERIFICATION.md` | Modify | Task 10. |
 
 ---
 
 ### Task 1: `uc_protocol` — page 2, the 4032 line, cnc version 3.0
 
-Constants only (`uc_protocol::v2::cnc` is `core`-only and holds no accessors). After this task `uc2_log` fails to compile its tests? No — `uc2_log` imports constants by name and asserts `CNC_OFF_INGRESS_HOLES_SKIPPED + 64 == 4032` etc., all still true; but `CncPage::new` asserts `region.len() == CNC_PAGE_LEN` and `create_file` allocates `CNC_PAGE_LEN`, so `uc2_log` and everything above it simply start using 8 KiB pages. `CNC_V2_VERSION` 3.0 makes every party refuse a 2.0 page — the intended flag day.
+Constants only (`uc_protocol::v2::cnc` is `core`-only and holds no accessors). After this task `uc_log` fails to compile its tests? No — `uc_log` imports constants by name and asserts `CNC_OFF_INGRESS_HOLES_SKIPPED + 64 == 4032` etc., all still true; but `CncPage::new` asserts `region.len() == CNC_PAGE_LEN` and `create_file` allocates `CNC_PAGE_LEN`, so `uc_log` and everything above it simply start using 8 KiB pages. `CNC_V2_VERSION` 3.0 makes every party refuse a 2.0 page — the intended flag day.
 
 **Files:**
 - Modify `uc_protocol/src/v2/cnc.rs` (module doc lines 4–31; constants at 44–49 and after 227; `offsets_do_not_overlap` at 493–569; `header_write_pins_literal_bytes_0_16` at 383)
@@ -217,16 +217,16 @@ git commit -m "feat(protocol): cnc 3.0 — 8 KiB page, ServiceSlot[8] band on pa
 
 ---
 
-### Task 2: `uc2_log` — `ServiceSlot`, `service_slot(i)`, the boot-once accessors, the length gates
+### Task 2: `uc_log` — `ServiceSlot`, `service_slot(i)`, the boot-once accessors, the length gates
 
-`uc2_log::cnc::CncPage` is the only typed view of the page; every attacher goes through `open_file` → `validate`. This task mirrors Task 1's constants with `#[repr(C)]` structs + `offset_of!` pins and grows the length gates from 4096 to `CNC_PAGE_LEN`. The `create_shared_backing_file` path (`uc_protocol/src/ring/common.rs:474-514`) grows a leftover 4 KiB `cnc2.dat` to 8 KiB and zero-fills it; a leftover 8 KiB file under an old binary fails the old `open_file`'s length gate with `BadHeader` — both directions refuse rather than misread.
+`uc_log::cnc::CncPage` is the only typed view of the page; every attacher goes through `open_file` → `validate`. This task mirrors Task 1's constants with `#[repr(C)]` structs + `offset_of!` pins and grows the length gates from 4096 to `CNC_PAGE_LEN`. The `create_shared_backing_file` path (`uc_protocol/src/ring/common.rs:474-514`) grows a leftover 4 KiB `cnc2.dat` to 8 KiB and zero-fills it; a leftover 8 KiB file under an old binary fails the old `open_file`'s length gate with `BadHeader` — both directions refuse rather than misread.
 
 **Files:**
-- Modify `uc2_log/src/cnc.rs` (imports 23–30; structs after `PeerSlot` at 126–150; `CncPage` accessors after `peer_slot` at 446; SAFETY comments at 255, 411, 420, 426, 432, 440, 449; test `cnc_offsets_match_protocol_constants` at 834; new tests after `query_holes_skipped_roundtrip_and_offset_pin` at 1190)
+- Modify `uc_log/src/cnc.rs` (imports 23–30; structs after `PeerSlot` at 126–150; `CncPage` accessors after `peer_slot` at 446; SAFETY comments at 255, 411, 420, 426, 432, 440, 449; test `cnc_offsets_match_protocol_constants` at 834; new tests after `query_holes_skipped_roundtrip_and_offset_pin` at 1190)
 
 **Interfaces:**
 - Consumes: Task 1's constants.
-- Produces (`uc2_log::cnc`):
+- Produces (`uc_log::cnc`):
   ```rust
   #[repr(C)]
   pub struct ServiceSlot {
@@ -348,7 +348,7 @@ Also change `open_file_rejects_wrong_length_file_without_panicking` (line 975) s
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_log --lib cnc`
+Run: `cargo test -p uc_log --lib cnc`
 Expected: compile error — `ServiceSlot`, `service_slot`, `pack_service_status` not found.
 
 - [ ] **Step 3: Implement**
@@ -446,23 +446,23 @@ Length gates: nothing to change in code — `new` (257), `page`/`page_mut` (267/
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_log`
+Run: `cargo test -p uc_log`
 Expected: PASS; `cnc` module goes 25 → 29 tests (the four added above). `open_file_rejects_wrong_length_file_without_panicking` passes with its new 4096-byte case.
 
 - [ ] **Step 5: Build the workspace — the flag day shows up as nothing**
 
 ```bash
 cargo build --workspace --all-targets
-cargo test -p uc2_client -p uc2_service -p uc2_node --test smoke 2>&1 | tail -5
+cargo test -p uc_client -p uc_service -p uc_node --test smoke 2>&1 | tail -5
 ```
 
-Expected: builds clean; `uc2_node --test smoke` passes (every process in a test is the same binary, so every party writes and reads 8 KiB pages). The `uc2_client` `torn_header.rs` comment mentioning `set_len(4096)` is a comment; leave it.
+Expected: builds clean; `uc_node --test smoke` passes (every process in a test is the same binary, so every party writes and reads 8 KiB pages). The `uc_client` `torn_header.rs` comment mentioning `set_len(4096)` is a comment; leave it.
 
 - [ ] **Step 6: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_log --all-targets -- -D warnings
-git add uc2_log/src/cnc.rs
+cargo clippy -p uc_log --all-targets -- -D warnings
+git add uc_log/src/cnc.rs
 git commit -m "feat(log): cnc 3.0 view — ServiceSlot band accessors, services_declared/fsm_lag_bytes, 8 KiB length gates"
 ```
 
@@ -470,20 +470,20 @@ git commit -m "feat(log): cnc 3.0 view — ServiceSlot band accessors, services_
 
 ### Task 3: `[services]` config — `ServicesConfig`, `FsmLag`, the named refusals, and the `NodeConfig` sweep
 
-A new module `uc2_node/src/services.rs` owns the typed value (it will also own the aggregate/`fsm_lag_eff` helpers in Tasks 5 and 8, keeping `node.rs` from growing). `config_file.rs` deserialises the raw section and calls `ServicesConfig::from_ids`, following the `[admin]` precedent (typed value + cross-field rules in `parse_str`, `ConfigError::Invalid { field, detail }` with `detail` naming the field). There is no byte-size string parser in the workspace today (grepped `MiB|parse_bytes|byte_size` — comments and `1 << 26` literals only), so `parse_fsm_lag` is new.
+A new module `uc_node/src/services.rs` owns the typed value (it will also own the aggregate/`fsm_lag_eff` helpers in Tasks 5 and 8, keeping `node.rs` from growing). `config_file.rs` deserialises the raw section and calls `ServicesConfig::from_ids`, following the `[admin]` precedent (typed value + cross-field rules in `parse_str`, `ConfigError::Invalid { field, detail }` with `detail` naming the field). There is no byte-size string parser in the workspace today (grepped `MiB|parse_bytes|byte_size` — comments and `1 << 26` literals only), so `parse_fsm_lag` is new.
 
 One refusal beyond spec §3.3, stated as **deviation 6**: **id 0 must be declared.** FSM 0 is the default responder (`submit`, spec §6.2) and the only FSM the remote path reaches (§6.4); a declared set without it makes every default client call unanswerable. Cheap to refuse by name at boot, expensive to diagnose at runtime.
 
 **Files:**
-- Create `uc2_node/src/services.rs`
-- Modify `uc2_node/src/lib.rs` (add `pub mod services;` after `pub mod recovery;` at line 47; extend the `pub use node::{…}` list at 51–56 with `ServicesConfig, FsmLag` re-exported from `services`)
-- Modify `uc2_node/src/config_file.rs` (struct at 175–220, `parse_str` construction at 410–432, tests)
-- Modify `uc2_node/src/node.rs` (`NodeConfig` at 152–211)
+- Create `uc_node/src/services.rs`
+- Modify `uc_node/src/lib.rs` (add `pub mod services;` after `pub mod recovery;` at line 47; extend the `pub use node::{…}` list at 51–56 with `ServicesConfig, FsmLag` re-exported from `services`)
+- Modify `uc_node/src/config_file.rs` (struct at 175–220, `parse_str` construction at 410–432, tests)
+- Modify `uc_node/src/node.rs` (`NodeConfig` at 152–211)
 - Modify `packaging/node.example.toml`
 - Modify the 42 `NodeConfig` literal sites (list in Step 6)
 
 **Interfaces:**
-- Produces (`uc2_node::services`, re-exported at the crate root):
+- Produces (`uc_node::services`, re-exported at the crate root):
   ```rust
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub enum FsmLag { Lockstep, Bounded(u64) }
@@ -507,7 +507,7 @@ One refusal beyond spec §3.3, stated as **deviation 6**: **id 0 must be declare
 
 - [ ] **Step 1: Write the failing unit tests for the typed value**
 
-Create `uc2_node/src/services.rs` with only the test module first:
+Create `uc_node/src/services.rs` with only the test module first:
 
 ```rust
 //! M14a: the declared service set and the FSM lag policy (`[services]` in
@@ -588,12 +588,12 @@ mod tests {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Add `pub mod services;` to `uc2_node/src/lib.rs` (after line 47). Run: `cargo test -p uc2_node --lib services`
+Add `pub mod services;` to `uc_node/src/lib.rs` (after line 47). Run: `cargo test -p uc_node --lib services`
 Expected: compile errors — `ServicesConfig`, `FsmLag`, `parse_fsm_lag` not found.
 
 - [ ] **Step 3: Implement the module**
 
-Above the test module in `uc2_node/src/services.rs`:
+Above the test module in `uc_node/src/services.rs`:
 
 ```rust
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
@@ -745,16 +745,16 @@ pub fn parse_fsm_lag(s: &str) -> Result<FsmLag, String> {
 }
 ```
 
-Re-export in `uc2_node/src/lib.rs`: `pub use services::{FsmLag, ServicesConfig};` next to the `node::{…}` re-export.
+Re-export in `uc_node/src/lib.rs`: `pub use services::{FsmLag, ServicesConfig};` next to the `node::{…}` re-export.
 
 - [ ] **Step 4: Run to verify they pass**
 
-Run: `cargo test -p uc2_node --lib services`
+Run: `cargo test -p uc_node --lib services`
 Expected: 6 passed.
 
 - [ ] **Step 5: Write the failing config-file tests**
 
-In `uc2_node/src/config_file.rs`'s test module, after `admin_hmac_duplicate_key_names_are_refused`:
+In `uc_node/src/config_file.rs`'s test module, after `admin_hmac_duplicate_key_names_are_refused`:
 
 ```rust
     #[test]
@@ -812,7 +812,7 @@ Also extend `minimal_config_maps_to_node_config_with_defaults` (line 531) with `
 
 - [ ] **Step 6: Run to verify they fail, then implement the section and the `NodeConfig` field**
 
-Run: `cargo test -p uc2_node --lib config_file` — expected: compile error (`cfg.services` has no such field).
+Run: `cargo test -p uc_node --lib config_file` — expected: compile error (`cfg.services` has no such field).
 
 In `config_file.rs`:
 
@@ -867,10 +867,10 @@ In `node.rs`, add to `NodeConfig` after `crypto`:
 
 Now the sweep — every `NodeConfig { … }` literal needs the field. Run `cargo build --workspace --all-targets 2>&1 | grep -c E0063` to count, then add one line per site. The files (from `grep -rln "journal_segment_bytes:" --include=*.rs .`, 42 files; several have more than one literal):
 
-- Use **`services: ServicesConfig::none_for_tests(),`** in the node-only harnesses — files that call `Node::start*` and never build a `ServiceBuilder`: `uc2_node/tests/{smoke,force_config,failover,reconfig,lifecycle,purge_safety,admin_auth,obs_log,learner}.rs`, `uc2_node/examples/m4_gate.rs`, `uc2ctl/tests/admin_auth_bin.rs`, `uc2_client/tests/timeout_and_restart.rs`. (These drive `Node::submit` with no FSM ever attaching; with `{0}` declared the Task 8 door would close at `fsm_lag` bytes.)
-- Use **`services: ServicesConfig::default(),`** everywhere else (the tests and examples that attach a real service, `config_file.rs`'s own construction, `obs/mod.rs::for_tests`, `preflight.rs`, `metrics.rs` tests, `node.rs`'s two test literals at ~5789/7412, the counter and crashtest node bins, `lincheck_v2/mod.rs::make_config`, `m5/m6/m7/m10_gate`, `m10_alerts`, `read_profile`, `m12_gate`, `uc2_gateway/tests/common`, `uc2_client/tests/{roundtrip,pipelined}.rs`, `uc2_service/tests/*`, `elle_v2.rs`, `lin_v2.rs`, `backup.rs`, `crypto_*.rs`, `obs_http.rs`, `query_barrier.rs`).
+- Use **`services: ServicesConfig::none_for_tests(),`** in the node-only harnesses — files that call `Node::start*` and never build a `ServiceBuilder`: `uc_node/tests/{smoke,force_config,failover,reconfig,lifecycle,purge_safety,admin_auth,obs_log,learner}.rs`, `uc_node/examples/m4_gate.rs`, `uc_ctl/tests/admin_auth_bin.rs`, `uc_client/tests/timeout_and_restart.rs`. (These drive `Node::submit` with no FSM ever attaching; with `{0}` declared the Task 8 door would close at `fsm_lag` bytes.)
+- Use **`services: ServicesConfig::default(),`** everywhere else (the tests and examples that attach a real service, `config_file.rs`'s own construction, `obs/mod.rs::for_tests`, `preflight.rs`, `metrics.rs` tests, `node.rs`'s two test literals at ~5789/7412, the counter and crashtest node bins, `lincheck_v2/mod.rs::make_config`, `m5/m6/m7/m10_gate`, `m10_alerts`, `read_profile`, `m12_gate`, `uc_gateway/tests/common`, `uc_client/tests/{roundtrip,pipelined}.rs`, `uc_service/tests/*`, `elle_v2.rs`, `lin_v2.rs`, `backup.rs`, `crypto_*.rs`, `obs_http.rs`, `query_barrier.rs`).
 
-`crate::services::ServicesConfig` inside `uc2_node`; `uc2_node::ServicesConfig` outside.
+`crate::services::ServicesConfig` inside `uc_node`; `uc_node::ServicesConfig` outside.
 
 Add to `packaging/node.example.toml`, after the `[metrics]` block:
 
@@ -893,7 +893,7 @@ Add to `packaging/node.example.toml`, after the `[metrics]` block:
 
 ```bash
 cargo build --workspace --all-targets
-cargo test -p uc2_node --lib
+cargo test -p uc_node --lib
 cargo clippy --workspace --all-targets -- -D warnings
 git add -A
 git commit -m "feat(node): [services] config — ServicesConfig/FsmLag, named refusals, NodeConfig.services"
@@ -908,21 +908,21 @@ Expected: `config_file` tests pass including `the_packaged_example_config_is_val
 The node creates `svc_query.<id>.ring`, `egress_service.<id>.broadcast` and `snapshots/<id>/` for every `ring_ids()` entry (5 MiB per id: 1 MiB SPSC + 4 MiB broadcast, the sizes at `node.rs:5015,5019`) and publishes the two boot-once fields; the service opens the `<id>` names for its `service_id` (plumbed through `ServiceConfig` here, **not enforced** until Task 6); the client opens `egress_service.0.broadcast`. Renaming is atomic across node/service/client/fixtures in this one task because a half-renamed tree cannot attach.
 
 **Files:**
-- Modify `uc2_node/src/ipc.rs` (accessors at 63–88; test `path_accessors_are_rooted` at 116)
-- Modify `uc2_node/src/node.rs` (`Rings` at 389–401; `create_rings` at 4981–5027; the call at 650; `Consensus.svc_query` field + `forward_svc_query` at 3288–3305; step 3 of `start_with` after `cnc.counters().prime(durable)` at 620; `snap_dir` at 878)
-- Modify `uc2_service/src/config.rs`, `uc2_service/src/attach.rs` (lines 60–65), `uc2_service/src/lib.rs` (`Service` gains `service_id`)
-- Modify `uc2_client/src/engine.rs:58`
-- Modify fixtures: `uc2_client/src/pipelined.rs:478`, `uc2_client/tests/{engine_synthetic.rs:41,187, pipelined.rs:112, synthetic.rs:49,98, timeout_and_restart.rs:28, torn_header.rs:31}`, `uc2_service/tests/{apply.rs:141,187, query.rs:167,180}`, `uc2_node/tests/smoke.rs:96-97`, `uc2_node/tests/learner.rs:444-446`, `uc2_gateway/examples/hop_bench/dummy_node.rs:147-148,171,194`, `uc2_node/examples/read_profile.rs:197`, `uc_protocol/src/v2/ipc.rs` module doc (ring names)
+- Modify `uc_node/src/ipc.rs` (accessors at 63–88; test `path_accessors_are_rooted` at 116)
+- Modify `uc_node/src/node.rs` (`Rings` at 389–401; `create_rings` at 4981–5027; the call at 650; `Consensus.svc_query` field + `forward_svc_query` at 3288–3305; step 3 of `start_with` after `cnc.counters().prime(durable)` at 620; `snap_dir` at 878)
+- Modify `uc_service/src/config.rs`, `uc_service/src/attach.rs` (lines 60–65), `uc_service/src/lib.rs` (`Service` gains `service_id`)
+- Modify `uc_client/src/engine.rs:58`
+- Modify fixtures: `uc_client/src/pipelined.rs:478`, `uc_client/tests/{engine_synthetic.rs:41,187, pipelined.rs:112, synthetic.rs:49,98, timeout_and_restart.rs:28, torn_header.rs:31}`, `uc_service/tests/{apply.rs:141,187, query.rs:167,180}`, `uc_node/tests/smoke.rs:96-97`, `uc_node/tests/learner.rs:444-446`, `uc_gateway/examples/hop_bench/dummy_node.rs:147-148,171,194`, `uc_node/examples/read_profile.rs:197`, `uc_protocol/src/v2/ipc.rs` module doc (ring names)
 
 **Interfaces:**
-- Produces (`uc2_node::ipc::InstanceDir`): `pub fn svc_query_ring_for(&self, id: u8) -> PathBuf` (`svc_query.<id>.ring`), `pub fn egress_service_for(&self, id: u8) -> PathBuf` (`egress_service.<id>.broadcast`), `pub fn snapshot_dir_for(&self, id: u8) -> PathBuf` (`snapshots/<id>`), `pub fn service_lock_for(&self, id: u8) -> PathBuf` (`service.<id>.lock`). The singular `svc_query_ring()` / `egress_service()` accessors are **deleted**.
-- Produces (`uc2_service`): `ServiceConfig.service_id: u8` (default 0), `ServiceConfig::service_id(self, id: u8) -> Self`, `Service::service_id(&self) -> u8`.
-- Produces (`uc2_node::Consensus`, crate-private): `svc_query: Vec<Option<SpscProducer>>` (len 8, `Some` for every ring id); `fn forward_svc_query(&mut self, service_id: u8, client_id: u32, local_seq: u32, expected_epoch: u64, query: &[u8]) -> bool`.
+- Produces (`uc_node::ipc::InstanceDir`): `pub fn svc_query_ring_for(&self, id: u8) -> PathBuf` (`svc_query.<id>.ring`), `pub fn egress_service_for(&self, id: u8) -> PathBuf` (`egress_service.<id>.broadcast`), `pub fn snapshot_dir_for(&self, id: u8) -> PathBuf` (`snapshots/<id>`), `pub fn service_lock_for(&self, id: u8) -> PathBuf` (`service.<id>.lock`). The singular `svc_query_ring()` / `egress_service()` accessors are **deleted**.
+- Produces (`uc_service`): `ServiceConfig.service_id: u8` (default 0), `ServiceConfig::service_id(self, id: u8) -> Self`, `Service::service_id(&self) -> u8`.
+- Produces (`uc_node::Consensus`, crate-private): `svc_query: Vec<Option<SpscProducer>>` (len 8, `Some` for every ring id); `fn forward_svc_query(&mut self, service_id: u8, client_id: u32, local_seq: u32, expected_epoch: u64, query: &[u8]) -> bool`.
 - Produces (cnc): `services_declared` and `fsm_lag_bytes` stored at boot.
 
 - [ ] **Step 1: Write the failing tests**
 
-`uc2_node/src/ipc.rs`, extend `path_accessors_are_rooted`:
+`uc_node/src/ipc.rs`, extend `path_accessors_are_rooted`:
 
 ```rust
         assert_eq!(d.svc_query_ring_for(0), dir.path().join("svc_query.0.ring"));
@@ -934,9 +934,9 @@ The node creates `svc_query.<id>.ring`, `egress_service.<id>.broadcast` and `sna
 
 (and delete the two assertions on the singular names).
 
-`uc2_node/tests/smoke.rs:96-97` → assert `svc_query.0.ring` and `egress_service.0.broadcast` exist, plus `!dir.path().join("svc_query.ring").exists()` ("the legacy singular name is not created").
+`uc_node/tests/smoke.rs:96-97` → assert `svc_query.0.ring` and `egress_service.0.broadcast` exist, plus `!dir.path().join("svc_query.ring").exists()` ("the legacy singular name is not created").
 
-Create `uc2_node/tests/services.rs` — the M14a integration file; this task adds its harness and first test:
+Create `uc_node/tests/services.rs` — the M14a integration file; this task adds its harness and first test:
 
 ```rust
 //! M14a multi-service integration tests: per-id rings, the declared set on
@@ -948,8 +948,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use uc2_log::cnc::CncPage;
-use uc2_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
+use uc_log::cnc::CncPage;
+use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
 
 pub const APP: &str = "m14-services";
 
@@ -980,7 +980,7 @@ pub fn config(dir: &Path, services: ServicesConfig) -> NodeConfig {
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: 1,
-        faults: uc2_net::fault::FaultConfig::default(),
+        faults: uc_net::fault::FaultConfig::default(),
         purge: PurgePolicy::Disabled,
         journal_segment_bytes: 64 * 1024,
         crypto: CryptoConfig::Disabled,
@@ -1054,7 +1054,7 @@ fn a_bad_lag_bound_is_a_named_startup_refusal_before_any_file_exists() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_node --test services` — expected: compile error (`svc_query_ring_for` etc. missing; `fsm_lag_bytes` exists but the `services_declared` assertion would read 0).
+Run: `cargo test -p uc_node --test services` — expected: compile error (`svc_query_ring_for` etc. missing; `fsm_lag_bytes` exists but the `services_declared` assertion would read 0).
 
 - [ ] **Step 3: Implement — node side**
 
@@ -1169,7 +1169,7 @@ Both callers (`drain_query_ring` snapshot path at 3447, `advance_pending_reads` 
 
 - [ ] **Step 4: Implement — service, client, fixtures**
 
-`uc2_service/src/config.rs`: add `pub service_id: u8` to `ServiceConfig` (doc: "M14a: which declared FSM slot this process is; default 0. Refused at attach if not declared on the node's page."), initialise `service_id: 0` in `new`, add:
+`uc_service/src/config.rs`: add `pub service_id: u8` to `ServiceConfig` (doc: "M14a: which declared FSM slot this process is; default 0. Refused at attach if not declared on the node's page."), initialise `service_id: 0` in `new`, add:
 
 ```rust
     pub fn service_id(mut self, id: u8) -> Self {
@@ -1180,17 +1180,17 @@ Both callers (`drain_query_ring` snapshot path at 3447, `advance_pending_reads` 
 
 `attach.rs:60-65`: open `dir.join(format!("egress_service.{}.broadcast", cfg.service_id))` and `dir.join(format!("svc_query.{}.ring", cfg.service_id))`. `Attached` gains `service_id: u8`; `Service` gains `service_id: u8` + `pub fn service_id(&self) -> u8`; `start`/`start_with_snapshots` copy it through.
 
-`uc2_client/src/engine.rs:58`: `pub(crate) const EGRESS_SERVICE: &str = "egress_service.0.broadcast";` with the comment "M14a: FSM 0's ring — the default responder. M14b opens every declared id's ring."
+`uc_client/src/engine.rs:58`: `pub(crate) const EGRESS_SERVICE: &str = "egress_service.0.broadcast";` with the comment "M14a: FSM 0's ring — the default responder. M14b opens every declared id's ring."
 
 Every fixture listed in **Files** above: `"egress_service.broadcast"` → `"egress_service.0.broadcast"`, `"svc_query.ring"` → `"svc_query.0.ring"`. `learner.rs:444-446`: `let snap_dir = v_dir.join("snapshots").join("0");`. `uc_protocol/src/v2/ipc.rs` module doc lines 15–17: name the rings `svc_query.<id>.ring` / `egress_service.<id>.broadcast`.
 
 - [ ] **Step 5: Run everything that attaches**
 
 ```bash
-cargo test -p uc2_node --test services --test smoke --test learner
-cargo test -p uc2_service -p uc2_client
-cargo test -p uc2_gateway
-cargo build --release -p uc2_gateway --example hop_bench
+cargo test -p uc_node --test services --test smoke --test learner
+cargo test -p uc_service -p uc_client
+cargo test -p uc_gateway
+cargo build --release -p uc_gateway --example hop_bench
 ```
 
 Expected: all PASS. `learner.rs::fresh_learner_joins_a_purged_leader_via_snapshot_session` passes with the fake artifact under `snapshots/0/`.
@@ -1212,14 +1212,14 @@ After this task no service process writes page 1. The service writes `slot[servi
 **Ordering constraint inside `do_work`** (`node.rs:2020-2249`): the mins must be published **before** step 0's `refresh_durable` (which calls `publish_validated_frontier`, `node.rs:4732`), before step 3b's `drain_ingress_ring` (the door, Task 8) and before steps 7/8 (the persisters) — i.e. as the first statement after the `halt_removed` check.
 
 **Files:**
-- Modify `uc2_node/src/services.rs` (add `ServiceMins` + `service_mins`)
-- Modify `uc2_node/src/node.rs` (`Consensus` fields; `do_work` top; `PendingRead` + `drain_query_ring` + `advance_pending_reads` bracket at 3581–3609; `Node::service_applied` doc at 1340)
-- Modify `uc2_node/src/obs/metrics.rs:277-282`
-- Modify `uc2_service/src/attach.rs:94-106`, `apply.rs:293,362,396,404,440`, `output.rs:158,299-305,339`, `builder_agent.rs:43-49,64`, `lib.rs:214,244,269,311-378`
-- Modify `uc2_node/tests/services.rs`
+- Modify `uc_node/src/services.rs` (add `ServiceMins` + `service_mins`)
+- Modify `uc_node/src/node.rs` (`Consensus` fields; `do_work` top; `PendingRead` + `drain_query_ring` + `advance_pending_reads` bracket at 3581–3609; `Node::service_applied` doc at 1340)
+- Modify `uc_node/src/obs/metrics.rs:277-282`
+- Modify `uc_service/src/attach.rs:94-106`, `apply.rs:293,362,396,404,440`, `output.rs:158,299-305,339`, `builder_agent.rs:43-49,64`, `lib.rs:214,244,269,311-378`
+- Modify `uc_node/tests/services.rs`
 
 **Interfaces:**
-- Produces (`uc2_node::services`):
+- Produces (`uc_node::services`):
   ```rust
   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
   pub struct ServiceMins { pub applied: u64, pub snapshot_pos: u64, pub output_completed: u64, pub heartbeat_ns: u64 }
@@ -1231,12 +1231,12 @@ After this task no service process writes page 1. The service writes `slot[servi
 
 - [ ] **Step 1: Write the failing tests**
 
-`uc2_node/src/services.rs` tests:
+`uc_node/src/services.rs` tests:
 
 ```rust
     #[test]
     fn service_mins_is_the_min_over_declared_ids_and_ignores_undeclared_slots() {
-        let page = uc2_log::cnc::CncPage::heap(&uc2_log::cnc::CncMeta {
+        let page = uc_log::cnc::CncPage::heap(&uc_log::cnc::CncMeta {
             node_id: 1, instance_id: 7, app_id: "t".into(), buffer_bytes: 1 << 20, max_payload: 256,
         });
         let s = ServicesConfig::from_ids(&[0, 2], None).unwrap();
@@ -1260,12 +1260,12 @@ After this task no service process writes page 1. The service writes `slot[servi
     }
 ```
 
-`uc2_node/tests/services.rs` — add a state machine and the first end-to-end test:
+`uc_node/tests/services.rs` — add a state machine and the first end-to-end test:
 
 ```rust
 use serde::{Deserialize, Serialize};
-use uc2_client::Client;
-use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_client::Client;
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 #[derive(Serialize, Deserialize)]
 pub enum Cmd { Add(u64) }
@@ -1287,7 +1287,7 @@ impl StateMachine for CountSm {
     fn last_applied(&self) -> Option<u64> { self.last }
 }
 
-pub fn start_service(dir: &Path, id: u8) -> uc2_service::Service<CountSm> {
+pub fn start_service(dir: &Path, id: u8) -> uc_service::Service<CountSm> {
     ServiceBuilder::new(ServiceConfig::new(dir, APP).service_id(id), CountSm::default())
         .start()
         .expect("service start")
@@ -1303,7 +1303,7 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
     let cnc = open_cnc(dir.path());
     let s0 = cnc.service_slot(0);
     wait_until("slot 0 attached", || {
-        uc2_log::cnc::unpack_service_status(s0.status.load_acquire()) == (0, true, 1)
+        uc_log::cnc::unpack_service_status(s0.status.load_acquire()) == (0, true, 1)
     });
     assert_eq!(s0.epoch.load_acquire(), 1);
     assert_eq!(cnc.service().service_epoch.load_acquire(), 0, "page-1 epoch is retired");
@@ -1323,24 +1323,24 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
 
     client.shutdown();
     svc0.stop();
-    wait_until("slot 0 detached", || !uc2_log::cnc::unpack_service_status(s0.status.load_acquire()).1);
+    wait_until("slot 0 detached", || !uc_log::cnc::unpack_service_status(s0.status.load_acquire()).1);
     assert_eq!(s0.epoch.load_acquire(), 1, "detach does not bump the epoch");
     node.stop();
 }
 ```
 
-(`serde`, `uc2_client`, `uc2_service` are already dev-dependencies of `uc2_node` — `lin_v2` uses all three.)
+(`serde`, `uc_client`, `uc_service` are already dev-dependencies of `uc_node` — `lin_v2` uses all three.)
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_node --lib services::tests::service_mins` — compile error. `cargo test -p uc2_node --test services page_one` — fails at `slot 0 attached` (the service still writes page 1).
+Run: `cargo test -p uc_node --lib services::tests::service_mins` — compile error. `cargo test -p uc_node --test services page_one` — fails at `slot 0 attached` (the service still writes page 1).
 
 - [ ] **Step 3: Implement — node side**
 
 `services.rs`:
 
 ```rust
-use uc2_log::cnc::CncPage;
+use uc_log::cnc::CncPage;
 
 /// The page-1 aggregates the node publishes each cycle (spec §3.2): the
 /// slowest FSM's numbers. Every reader that used to read "the service" now
@@ -1437,7 +1437,7 @@ In `do_work`, immediately after the `halt_removed` early return:
 
 - [ ] **Step 4: Implement — service side**
 
-`attach.rs`: add `pub(crate) fn slot(cnc: &CncPage, id: u8) -> &uc2_log::cnc::ServiceSlot { cnc.service_slot(id as usize) }`. Replace steps 4–5 (lines 94–106):
+`attach.rs`: add `pub(crate) fn slot(cnc: &CncPage, id: u8) -> &uc_log::cnc::ServiceSlot { cnc.service_slot(id as usize) }`. Replace steps 4–5 (lines 94–106):
 
 ```rust
     let start_pos = last_applied.unwrap_or(0);
@@ -1462,21 +1462,21 @@ In `do_work`, immediately after the `halt_removed` early return:
 
 ```rust
         let s = attach::slot(&self._cnc, self.service_id);
-        let (_, _, inc) = uc2_log::cnc::unpack_service_status(s.status.load_acquire());
-        s.status.store_release(uc2_log::cnc::pack_service_status(self.service_id, false, inc));
+        let (_, _, inc) = uc_log::cnc::unpack_service_status(s.status.load_acquire());
+        s.status.store_release(uc_log::cnc::pack_service_status(self.service_id, false, inc));
 ```
 
 `crash()` leaves it set (a crash is indistinguishable from a kill; the heartbeat ages instead — spec §8).
 
-Verify no page-1 service write survives: `grep -n "cnc.service()\|service_heartbeat_ns\|service_snapshot_pos" uc2_service/src/` must return **zero** hits.
+Verify no page-1 service write survives: `grep -n "cnc.service()\|service_heartbeat_ns\|service_snapshot_pos" uc_service/src/` must return **zero** hits.
 
 - [ ] **Step 5: Run**
 
 ```bash
-cargo test -p uc2_node --lib services
-cargo test -p uc2_node --test services
-cargo test -p uc2_service
-cargo test -p uc2_node --test query_barrier --test smoke --test learner --test purge_safety
+cargo test -p uc_node --lib services
+cargo test -p uc_node --test services
+cargo test -p uc_service
+cargo test -p uc_node --test query_barrier --test smoke --test learner --test purge_safety
 ```
 
 Expected: PASS. `purge_safety`/`learner` are `none_for_tests` nodes: the node does not touch page 1, so their direct pokes at `service_snapshot_pos` still drive the purge floor.
@@ -1494,21 +1494,21 @@ git commit -m "feat(cnc): service progress on page-2 slots; node publishes min a
 ### Task 6: Attach refusals, the per-id lock, per-id snapshot store, example flags — two FSMs apply one log
 
 **Files:**
-- Modify `uc2_service/Cargo.toml` (add `fs2 = { workspace = true }` under `[dependencies]`)
-- Modify `uc2_service/src/config.rs` (`ServiceError` variants)
-- Modify `uc2_service/src/attach.rs` (steps 1–3), `uc2_service/src/lib.rs` (`Service._lock`, `SnapshotStore::open` call at 238)
-- Modify `uc2_service/src/snapshots.rs` (`open`, its tests at 168–253), `uc2_service/tests/snapshot_build.rs:84`
-- Modify `examples/counter/src/bin/counter-service.rs`, `examples/uc2-crashtest/src/bin/uc2-crashtest-service.rs`
-- Modify `uc2_node/tests/services.rs`
+- Modify `uc_service/Cargo.toml` (add `fs2 = { workspace = true }` under `[dependencies]`)
+- Modify `uc_service/src/config.rs` (`ServiceError` variants)
+- Modify `uc_service/src/attach.rs` (steps 1–3), `uc_service/src/lib.rs` (`Service._lock`, `SnapshotStore::open` call at 238)
+- Modify `uc_service/src/snapshots.rs` (`open`, its tests at 168–253), `uc_service/tests/snapshot_build.rs:84`
+- Modify `examples/counter/src/bin/counter-service.rs`, `examples/uc_crashtest/src/bin/uc_crashtest-service.rs`
+- Modify `uc_node/tests/services.rs`
 
 **Interfaces:**
 - `ServiceError::ServiceNotDeclared { id: u8, declared: u64 }` (Display: `service id {id} is not declared on this node (declared set 0b{declared:b}); fix [services] ids or --service-id`), `ServiceError::AlreadyAttached { id: u8 }` (Display: `another process already holds service id {id} on this instance dir (service.{id}.lock)`).
 - `SnapshotStore::open(instance_dir: &Path, service_id: u8) -> io::Result<SnapshotStore>` → `snapshots/<id>/`.
-- `counter-service --service-id <u8>` (default 0); `uc2-crashtest-service --service-id <u8>` (default 0).
+- `counter-service --service-id <u8>` (default 0); `uc_crashtest-service --service-id <u8>` (default 0).
 
 - [ ] **Step 1: Write the failing tests**
 
-`uc2_node/tests/services.rs`:
+`uc_node/tests/services.rs`:
 
 ```rust
 #[test]
@@ -1521,7 +1521,7 @@ fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_ref
         .start()
         .err()
         .expect("id 2 is not declared");
-    assert!(matches!(err, uc2_service::ServiceError::ServiceNotDeclared { id: 2, declared: 0b11 }), "{err:?}");
+    assert!(matches!(err, uc_service::ServiceError::ServiceNotDeclared { id: 2, declared: 0b11 }), "{err:?}");
     assert!(err.to_string().contains("service id 2 is not declared"), "{err}");
 
     let svc1 = start_service(dir.path(), 1);
@@ -1529,7 +1529,7 @@ fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_ref
         .start()
         .err()
         .expect("id 1 is held");
-    assert!(matches!(err, uc2_service::ServiceError::AlreadyAttached { id: 1 }), "{err:?}");
+    assert!(matches!(err, uc_service::ServiceError::AlreadyAttached { id: 1 }), "{err:?}");
     svc1.stop();
     // The lock is released with the process's handle: a re-attach succeeds.
     let svc1b = start_service(dir.path(), 1);
@@ -1567,11 +1567,11 @@ fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
 }
 ```
 
-`uc2_service/src/snapshots.rs` `open_creates_the_directory_and_is_idempotent`: assert `dir.path().join("snapshots").join("3").is_dir()` after `SnapshotStore::open(dir.path(), 3)`.
+`uc_service/src/snapshots.rs` `open_creates_the_directory_and_is_idempotent`: assert `dir.path().join("snapshots").join("3").is_dir()` after `SnapshotStore::open(dir.path(), 3)`.
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_node --test services an_undeclared` — fails: the attach succeeds (no check yet). `cargo test -p uc2_service --lib snapshots` — compile error (arity).
+Run: `cargo test -p uc_node --test services an_undeclared` — fails: the attach succeeds (no check yet). `cargo test -p uc_service --lib snapshots` — compile error (arity).
 
 - [ ] **Step 3: Implement**
 
@@ -1628,14 +1628,14 @@ Run: `cargo test -p uc2_node --test services an_undeclared` — fails: the attac
 
 Fix the unit-test call sites (168, 185, 208, 217, 235, 249, 253 — pass `0`), `lib.rs:238` (`SnapshotStore::open(&cfg.instance_dir, cfg.service_id)?`), `tests/snapshot_build.rs:84` (`open(dir.path(), 0)`).
 
-`counter-service.rs` `Args`: `/// Which declared FSM slot this process is (see [services] ids). #[arg(long, default_value_t = 0)] service_id: u8,` and `ServiceConfig::new(...).service_id(args.service_id)`; print `service {} attached at {}`. Same in `uc2-crashtest-service.rs`.
+`counter-service.rs` `Args`: `/// Which declared FSM slot this process is (see [services] ids). #[arg(long, default_value_t = 0)] service_id: u8,` and `ServiceConfig::new(...).service_id(args.service_id)`; print `service {} attached at {}`. Same in `uc_crashtest-service.rs`.
 
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_service
-cargo test -p uc2_node --test services
-cargo test -p uc2-crashtest --test smoke
+cargo test -p uc_service
+cargo test -p uc_node --test services
+cargo test -p uc_crashtest --test smoke
 cargo test -p counter
 ```
 
@@ -1653,16 +1653,16 @@ git commit -m "feat(service): service_id attach — declared-set refusal, servic
 
 ### Task 7: The lag barrier — a target cap on `next_batch`
 
-Deviation 1 in full. `uc2_service/src/lag.rs` holds the pure plan; `apply_cycle` computes it at the top of every `loop` iteration (N acquire loads — `floor` may advance mid-cycle). Lockstep applies **one** frame per `next_batch` when `cursor == floor`; bounded caps the target at `floor + fsm_lag`. Journal replay (`replay_into`) is untouched — a replaying FSM is by definition the one holding the floor down. The heartbeat store at the end of the cycle runs on a waiting cycle too, so a waiting FSM is never mistaken for a dead one.
+Deviation 1 in full. `uc_service/src/lag.rs` holds the pure plan; `apply_cycle` computes it at the top of every `loop` iteration (N acquire loads — `floor` may advance mid-cycle). Lockstep applies **one** frame per `next_batch` when `cursor == floor`; bounded caps the target at `floor + fsm_lag`. Journal replay (`replay_into`) is untouched — a replaying FSM is by definition the one holding the floor down. The heartbeat store at the end of the cycle runs on a waiting cycle too, so a waiting FSM is never mistaken for a dead one.
 
 **Files:**
-- Create `uc2_service/src/lag.rs`; `mod lag;` in `lib.rs`
-- Modify `uc2_service/src/attach.rs` (read `fsm_lag_bytes` + declared set at attach), `apply.rs` (`ApplyState.{lag_mode, declared, lag_waiting}`; the loop at 296–372)
-- Modify `uc2_node/tests/services.rs`
+- Create `uc_service/src/lag.rs`; `mod lag;` in `lib.rs`
+- Modify `uc_service/src/attach.rs` (read `fsm_lag_bytes` + declared set at attach), `apply.rs` (`ApplyState.{lag_mode, declared, lag_waiting}`; the loop at 296–372)
+- Modify `uc_node/tests/services.rs`
 
 **Interfaces:**
 ```rust
-// uc2_service::lag (crate-private)
+// uc_service::lag (crate-private)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LagMode { Off, Lockstep, Bounded(u64) }   // Off ⇔ declared set empty on the page (harness node)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1674,7 +1674,7 @@ pub(crate) fn floor(cnc: &CncPage, declared: u64) -> u64;   // min slot.applied 
 
 - [ ] **Step 1: Write the failing tests**
 
-`uc2_service/src/lag.rs` (tests only, first):
+`uc_service/src/lag.rs` (tests only, first):
 
 ```rust
 #[cfg(test)]
@@ -1726,7 +1726,7 @@ mod tests {
 
     #[test]
     fn floor_is_the_min_over_declared_slots() {
-        let page = uc2_log::cnc::CncPage::heap(&uc2_log::cnc::CncMeta {
+        let page = uc_log::cnc::CncPage::heap(&uc_log::cnc::CncMeta {
             node_id: 1, instance_id: 7, app_id: "t".into(), buffer_bytes: 1 << 20, max_payload: 256,
         });
         page.service_slot(0).applied.store_release(900);
@@ -1738,7 +1738,7 @@ mod tests {
 }
 ```
 
-`uc2_node/tests/services.rs` — a slow SM and the two bound tests:
+`uc_node/tests/services.rs` — a slow SM and the two bound tests:
 
 ```rust
 /// FSM 1's stand-in: 1 ms per apply, so FSM 0 would run ~1000 frames ahead
@@ -1762,7 +1762,7 @@ impl StateMachine for SlowCountSm {
 /// records the largest `applied_0 - applied_1` it sees (applied_0 read FIRST,
 /// so a racing sample can only under-read the gap). Returns `(max_gap, total)`.
 fn drive_and_sample_gap(dir: &Path, n: u64) -> (u64, u64) {
-    use uc2_client::{PipelinedClient, PipelinedConfig};
+    use uc_client::{PipelinedClient, PipelinedConfig};
     let cnc = open_cnc(dir);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
@@ -1850,11 +1850,11 @@ fn lockstep_holds_the_fsms_within_one_frame() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-`cargo test -p uc2_service --lib lag` — compile error. `cargo test -p uc2_node --test services bounded_lag` — fails on `max_gap <= BOUND` (no barrier: FSM 0 runs the whole 384 KiB ahead).
+`cargo test -p uc_service --lib lag` — compile error. `cargo test -p uc_node --test services bounded_lag` — fails on `max_gap <= BOUND` (no barrier: FSM 0 runs the whole 384 KiB ahead).
 
 - [ ] **Step 3: Implement**
 
-`uc2_service/src/lag.rs`:
+`uc_service/src/lag.rs`:
 
 ```rust
 //! M14a: the FSM lag barrier as a TARGET CAP (spec §4.2, plan deviation 1).
@@ -1864,7 +1864,7 @@ fn lockstep_holds_the_fsms_within_one_frame() {
 //! is "apply one frame, only while cursor == floor". A capped batch simply
 //! reads as `CaughtUp`; the agent's idle strategy is the wait.
 
-use uc2_log::cnc::CncPage;
+use uc_log::cnc::CncPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LagMode {
@@ -1979,16 +1979,16 @@ and inside the `Batch::Frames(frames)` arm restructure the per-frame body so `on
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_service
-cargo test -p uc2_node --test services
-cargo test -p uc2_node --test lin_v2 smoke_3node_write_then_read
+cargo test -p uc_service
+cargo test -p uc_node --test services
+cargo test -p uc_node --test lin_v2 smoke_3node_write_then_read
 ```
 
-Expected: PASS. Note the `apply.rs` egress-layout test (`uc2_service/tests/apply.rs:182`) still passes — the barrier does not touch the record format.
+Expected: PASS. Note the `apply.rs` egress-layout test (`uc_service/tests/apply.rs:182`) still passes — the barrier does not touch the record format.
 
 - [ ] **Step 5: Verify the test discriminates**
 
-Temporarily change `plan`'s `LagMode::Bounded` arm to `Plan::Apply { target: head, one_frame: false }` and run `cargo test -p uc2_node --test services bounded_lag` — expected: FAIL on `max_gap <= BOUND`. Revert. Record the observed `max_gap` in the commit message.
+Temporarily change `plan`'s `LagMode::Bounded` arm to `Plan::Apply { target: head, one_frame: false }` and run `cargo test -p uc_node --test services bounded_lag` — expected: FAIL on `max_gap <= BOUND`. Revert. Record the observed `max_gap` in the commit message.
 
 - [ ] **Step 6: Clippy + commit**
 
@@ -2002,16 +2002,16 @@ git commit -m "feat(service): FSM lag barrier as a next_batch target cap — bou
 
 ### Task 8: The admission door's FSM term and the quorum-gated report ceiling (Q)
 
-Both are one extra `min` on values the node already computes. The door reuses `admission_open` unchanged — `append − min_applied ≤ fsm_lag_eff` has the same shape as `append − commit ≤ admission_bytes` — so its signature and its existing unit test stay. Q clamps what `publish_validated_frontier` stores; the receiver (`uc2_net/src/receiver.rs:1730-1772`) reads the same two atomics and is untouched. `ElectionSm::term_at(pos)` returns the term of the byte **below** `pos` (`uc2_consensus/src/election.rs:983-1000`) — `validated_term()` is literally `term_at(validated_up_to)` — so `term_at(ceiling)` is the spec's "attest the byte below the report".
+Both are one extra `min` on values the node already computes. The door reuses `admission_open` unchanged — `append − min_applied ≤ fsm_lag_eff` has the same shape as `append − commit ≤ admission_bytes` — so its signature and its existing unit test stay. Q clamps what `publish_validated_frontier` stores; the receiver (`uc_net/src/receiver.rs:1730-1772`) reads the same two atomics and is untouched. `ElectionSm::term_at(pos)` returns the term of the byte **below** `pos` (`uc_consensus/src/election.rs:983-1000`) — `validated_term()` is literally `term_at(validated_up_to)` — so `term_at(ceiling)` is the spec's "attest the byte below the report".
 
 **Files:**
-- Modify `uc2_node/src/services.rs` (`fsm_lag_eff`, `report_ceiling`)
-- Modify `uc2_node/src/node.rs` (`Node.fsm_door: Option<u64>`, `Consensus.fsm_lag_eff: u64`; `Node::submit` at 1453–1467; `drain_ingress_ring` at 3214–3221; `publish_validated_frontier` at 4736–4746)
-- Modify `uc2_node/tests/services.rs`
+- Modify `uc_node/src/services.rs` (`fsm_lag_eff`, `report_ceiling`)
+- Modify `uc_node/src/node.rs` (`Node.fsm_door: Option<u64>`, `Consensus.fsm_lag_eff: u64`; `Node::submit` at 1453–1467; `drain_ingress_ring` at 3214–3221; `publish_validated_frontier` at 4736–4746)
+- Modify `uc_node/tests/services.rs`
 
 **Interfaces:**
 ```rust
-// uc2_node::services
+// uc_node::services
 pub fn fsm_lag_eff(services: &ServicesConfig, buffer_bytes: u64, max_payload: usize) -> Option<u64>;
 //   None ⇔ nothing declared (no FSM term); Lockstep ⇒ align_frame_len(HEADER_LEN + max_payload); Bounded(b) ⇒ b
 pub fn report_ceiling(validated_up_to: u64, min_applied: u64, fsm_lag_eff: Option<u64>) -> u64;
@@ -2041,12 +2041,12 @@ pub fn report_ceiling(validated_up_to: u64, min_applied: u64, fsm_lag_eff: Optio
     }
 ```
 
-And the two integration tests in `uc2_node/tests/services.rs`:
+And the two integration tests in `uc_node/tests/services.rs`:
 
 ```rust
 #[test]
 fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
-    use uc2_client::{ClientError, PipelinedClient, PipelinedConfig};
+    use uc_client::{ClientError, PipelinedClient, PipelinedConfig};
     let _g = serialize();
     let dir = tempdir();
     const BOUND: u64 = 64 << 10;
@@ -2103,7 +2103,7 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     const BOUND: u64 = 64 << 10;
     let socks: Vec<std::net::UdpSocket> =
         (0..3).map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
-    let members: Vec<(uc2_consensus::election::NodeId, std::net::SocketAddr)> =
+    let members: Vec<(uc_consensus::election::NodeId, std::net::SocketAddr)> =
         socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
     fn node_cfg(dir: &Path, i: usize, members: &[(u32, std::net::SocketAddr)], services: ServicesConfig) -> NodeConfig {
         let mut cfg = config(dir, services);
@@ -2182,7 +2182,7 @@ The leader keeps `none_for_tests` for the whole test; only the two followers are
 
 - [ ] **Step 2: Run to verify they fail**
 
-`cargo test -p uc2_node --lib services` — compile error. `cargo test -p uc2_node --test services the_leader_door` — fails: `refused` is false (all 4000 get through). `q_a_follower_quorum` — fails on `commit <= BOUND + one_frame`.
+`cargo test -p uc_node --lib services` — compile error. `cargo test -p uc_node --test services the_leader_door` — fails: `refused` is false (all 4000 get through). `q_a_follower_quorum` — fails on `commit <= BOUND + one_frame`.
 
 - [ ] **Step 3: Implement**
 
@@ -2270,22 +2270,22 @@ pub fn report_ceiling(validated_up_to: u64, min_applied: u64, fsm_lag_eff: Optio
     }
 ```
 
-Check `term_at` is `pub` on `ElectionSm` (it is used by `validated_term` inside `uc2_consensus`; the report above quotes it as `pub fn term_at`). No `uc2_consensus` change.
+Check `term_at` is `pub` on `ElectionSm` (it is used by `validated_term` inside `uc_consensus`; the report above quotes it as `pub fn term_at`). No `uc_consensus` change.
 
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_node --lib services
-cargo test -p uc2_node --test services
-cargo test -p uc2_node --test lin_v2 --test lin_partition_v2 --test failover --test learner --test reconfig
-cargo test -p uc2_node
+cargo test -p uc_node --lib services
+cargo test -p uc_node --test services
+cargo test -p uc_node --test lin_v2 --test lin_partition_v2 --test failover --test learner --test reconfig
+cargo test -p uc_node
 ```
 
-Expected: PASS. The last line is the whole `uc2_node` suite — the `none_for_tests` sweep from Task 3 is what keeps the node-only suites green here; if any test in that list stalls on liveness, it is a node-only test that was missed in Task 3's list and gets `none_for_tests()`.
+Expected: PASS. The last line is the whole `uc_node` suite — the `none_for_tests` sweep from Task 3 is what keeps the node-only suites green here; if any test in that list stalls on liveness, it is a node-only test that was missed in Task 3's list and gets `none_for_tests()`.
 
 - [ ] **Step 5: Verify discrimination of the Q test**
 
-Temporarily make `report_ceiling` return `validated_up_to` unconditionally; run `cargo test -p uc2_node --test services q_a_follower` — expected FAIL on `commit <= BOUND + one_frame`. Revert.
+Temporarily make `report_ceiling` return `validated_up_to` unconditionally; run `cargo test -p uc_node --test services q_a_follower` — expected FAIL on `commit <= BOUND + one_frame`. Revert.
 
 - [ ] **Step 6: Clippy + commit**
 
@@ -2304,9 +2304,9 @@ Written **test-first against the flat copier**, as spec §13's mitigation prescr
 `BackupReport` keeps `Copy` by carrying `newest_snapshots: [Option<u64>; CNC_MAX_SERVICES]` (per id present on disk; backup is offline and config-blind). Coverage is per id; `MANIFEST` is `uc2-backup-v2` with one `newest_snapshot.<id>=` line per id.
 
 **Files:**
-- Modify `uc2_node/src/backup.rs` (`BackupReport` 109–133, `BackupError::Hole` 150–159, `MANIFEST_FORMAT` 102, `backup_instance` 373–397, `verify_artifact` 472–509, `restore_artifact` 570–602, `scan_snapshots` 645–667, `write_manifest`/`check_manifest` 669–788, unit tests `manifest_roundtrips` ~802–840)
-- Modify `uc2ctl/src/main.rs:561-573`
-- Modify `uc2_node/tests/backup.rs` (the `Hole` pattern match at 399; two new tests)
+- Modify `uc_node/src/backup.rs` (`BackupReport` 109–133, `BackupError::Hole` 150–159, `MANIFEST_FORMAT` 102, `backup_instance` 373–397, `verify_artifact` 472–509, `restore_artifact` 570–602, `scan_snapshots` 645–667, `write_manifest`/`check_manifest` 669–788, unit tests `manifest_roundtrips` ~802–840)
+- Modify `uc_ctl/src/main.rs:561-573`
+- Modify `uc_node/tests/backup.rs` (the `Hole` pattern match at 399; two new tests)
 - Modify `docs/how-to/back-up-a-cluster.md` (§ "What gets copied", § "The `MANIFEST` file")
 
 **Interfaces:**
@@ -2324,16 +2324,16 @@ impl BackupReport { pub fn newest_snapshot(&self) -> Option<u64> }  // min over 
 BackupError::Hole { service: u8, first_base: u64, newest_snapshot: Option<u64> }
 ```
 
-- [ ] **Step 1: Write the failing tests** (`uc2_node/tests/backup.rs`)
+- [ ] **Step 1: Write the failing tests** (`uc_node/tests/backup.rs`)
 
 ```rust
 use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
-use uc2_node::ServicesConfig;
-use uc2_service::SnapshotPolicy;
+use uc_node::ServicesConfig;
+use uc_service::SnapshotPolicy;
 
 /// Two snapshotting FSMs (`RegisterSm`, ids 0 and 1) on a purging node.
 /// Returns once the journal has purged at least one segment.
-fn two_fsm_purged_node(dir: &Path, app: &str) -> (Node, uc2_service::Service<RegisterSm>, uc2_service::Service<RegisterSm>, u64) {
+fn two_fsm_purged_node(dir: &Path, app: &str) -> (Node, uc_service::Service<RegisterSm>, uc_service::Service<RegisterSm>, u64) {
     let mut cfg = config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
     cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
     let node = Node::start(cfg).expect("node");
@@ -2370,7 +2370,7 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
         assert!(std::fs::read_dir(dir.join("snapshots").join(id)).unwrap().next().is_some(), "snapshots/{id} has an artifact");
     }
     match node.stop_draining(Duration::from_secs(10)) {
-        uc2_node::DrainOutcome::Drained => {}
+        uc_node::DrainOutcome::Drained => {}
         other => panic!("expected Drained, got {other:?}"),
     }
     s0.stop();
@@ -2440,7 +2440,7 @@ Update the existing match at `tests/backup.rs:399` to `Err(BackupError::Hole { f
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_node --test backup restore_roundtrip_with_two_fsms` — expected: compile error on `newest_snapshots` (field missing). Temporarily comment the three `newest_snapshots` assertions and re-run: expected FAIL at `backup_instance(...).expect("… RED before Task 9 …")` with `Hole`. Restore the assertions. This is the "fails red on the flat copier" evidence — record the panic line in the commit message.
+Run: `cargo test -p uc_node --test backup restore_roundtrip_with_two_fsms` — expected: compile error on `newest_snapshots` (field missing). Temporarily comment the three `newest_snapshots` assertions and re-run: expected FAIL at `backup_instance(...).expect("… RED before Task 9 …")` with `Hole`. Restore the assertions. This is the "fails red on the flat copier" evidence — record the panic line in the commit message.
 
 - [ ] **Step 3: Implement**
 
@@ -2539,17 +2539,17 @@ impl BackupReport {
 
 `BackupError::Hole` gains `service: u8` (message: `hole: service {service}: journal first_base={first_base} is not covered by any retained snapshot (newest_snapshot={newest_snapshot:?})`). `write_manifest` writes `newest_snapshot.<id>=<pos|none>` for **every** id 0..8 (deterministic, easy to parse), and `check_manifest` compares each; an artifact whose `format=` is `uc2-backup-v1` is refused by the existing unknown-format branch (there are no v1 artifacts anywhere — no deployments). Update `manifest_roundtrips` and its siblings (`newest_snapshots: [None; 8]` with `[0] = Some(200)`).
 
-`uc2ctl/src/main.rs::print_backup_report`: replace the `newest_snapshot=` line with one `newest_snapshot.<id>=<pos|none>` line per id whose value is `Some`, followed by `newest_snapshot=<min|none>` (the coverage point).
+`uc_ctl/src/main.rs::print_backup_report`: replace the `newest_snapshot=` line with one `newest_snapshot.<id>=<pos|none>` line per id whose value is `Some`, followed by `newest_snapshot=<min|none>` (the coverage point).
 
 `docs/how-to/back-up-a-cluster.md` "What gets copied": the `snapshots/` bullet becomes "`snapshots/<id>/` for every FSM id present — one directory per declared service since M14 — filtered to complete `snap-<pos>.ultsnap` files"; "The `MANIFEST` file": the format line is `uc2-backup-v2` and the per-id `newest_snapshot.<id>` lines are listed; add the sentence "`verify` checks coverage **per FSM**: a missing or stale snapshot for any one id is a `hole: service <id>` refusal, because that FSM alone could not be rebuilt."
 
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_node --lib backup
-cargo test -p uc2_node --test backup
-cargo test -p uc2ctl
-cargo test -p uc2-crashtest --features survival-tests   # the M11 survival capstone still round-trips
+cargo test -p uc_node --lib backup
+cargo test -p uc_node --test backup
+cargo test -p uc_ctl
+cargo test -p uc_crashtest --features survival-tests   # the M11 survival capstone still round-trips
 ```
 
 Expected: PASS, all 19 `tests/backup.rs` tests (17 + 2).
@@ -2682,9 +2682,9 @@ Expected: clippy clean; every test binary reports `0 failed`. Paste the tail int
 - [x] **Step 2: The capstones that exercise attach/apply under faults**
 
 ```bash
-cargo test -p uc2_node --test lin_v2 2>&1 | tail -12
-cargo test -p uc2_node --test lin_partition_v2 2>&1 | tail -12
-cargo test -p uc2-crashtest --features hard-crash-tests 2>&1 | tail -12
+cargo test -p uc_node --test lin_v2 2>&1 | tail -12
+cargo test -p uc_node --test lin_partition_v2 2>&1 | tail -12
+cargo test -p uc_crashtest --features hard-crash-tests 2>&1 | tail -12
 ```
 
 Expected: `Linearizable` on every capstone (they run one FSM per node — the default `{0}` — and are unchanged in intent).
@@ -2692,15 +2692,15 @@ Expected: `Linearizable` on every capstone (they run one FSM per node — the de
 - [x] **Step 3: The fuzz targets this plan touched**
 
 ```bash
-scripts/fuzz_smoke.sh 60 --min-runs 10000 uc_protocol_cnc uc2_node_toml
+scripts/fuzz_smoke.sh 60 --min-runs 10000 uc_protocol_cnc uc_node_toml
 ```
 
-Expected: both PASS with ≥ 10 000 runs; the `[services]` table parses under the existing `uc2_node_toml` target.
+Expected: both PASS with ≥ 10 000 runs; the `[services]` table parses under the existing `uc_node_toml` target.
 
 - [x] **Step 4: The M5 smoke with two FSMs** — `m5_gate all` starts one service per node; a quick two-FSM variant is the `services.rs` `two_fsms_apply…` test at scale. Run:
 
 ```bash
-UC2_M5_MAX_SECS=6 cargo run -p uc2_node --release --example m5_gate -- all --secs 6 --root /home/claude/m14a-smoke
+UC2_M5_MAX_SECS=6 cargo run -p uc_node --release --example m5_gate -- all --secs 6 --root /home/claude/m14a-smoke
 ```
 
 Expected: `RESULT: PASS` (single FSM, default config) — the regression smoke that the page-2 move and the barrier's per-iteration `floor` loads did not visibly change the local number. Record the responses/s line **as smoke** in the commit body; do not compare it against any bar.
@@ -2740,7 +2740,7 @@ Performed against the spec sections this plan claims (§3, §4.1–4.2, §4.4, �
 | §7.5 backup/verify/restore per id, `Hole { service }`, MANIFEST per id, test red-first | Task 9 |
 | §8 rows: crash/absent FSM back-pressure; undeclared refused; two processes same id refused; `fsm_lag` too large refused; declared set grew after purge | Task 8 tests (absent FSM closes the door; capped reports stall commit), Task 6 tests, Task 4 test, Task 10 (`run-a-cluster.md` rule) |
 | §12 unit: page-2 offsets both crates; barrier table; door with FSM term; Q pair; config refusals | Tasks 1, 2, 7, 8, 3 respectively |
-| §12 fuzz: `uc_protocol_cnc` covers the 8 KiB page; `uc2_node_toml` covers `[services]` | Task 1 (corpus regen), Task 11 |
+| §12 fuzz: `uc_protocol_cnc` covers the 8 KiB page; `uc_node_toml` covers `[services]` | Task 1 (corpus regen), Task 11 |
 
 Not covered here, by design (named in the header): §5.4/§6 (M14b), §7.3 (M14c, deviation 3), §9, the §12 capstones/sim/elle/fleet gate, the release writeup.
 
@@ -2749,14 +2749,14 @@ Not covered here, by design (named in the header): §5.4/§6 (M14b), §7.3 (M14c
 **Type consistency**: `ServicesConfig` is `Copy` (Task 3) so `Consensus.services` and `Node` can both hold it by value; `fsm_lag_eff` is `Option<u64>` in `services.rs`, on `Consensus.fsm_lag_eff` and `Node.fsm_door`, and `report_ceiling` takes `Option<u64>`; `min_applied: u64` with `u64::MAX` as the "no FSMs" value matches `report_ceiling`'s `saturating_add`. `service_id` is `u8` everywhere (`ServiceConfig`, `ServiceError`, `PendingRead`, `forward_svc_query`, `InstanceDir::*_for`, `SnapshotStore::open`, `--service-id`); slot indexing casts to `usize` at the `service_slot(i)` boundary only. `pack_service_status(u8, bool, u32) -> u64` / `unpack_service_status(u64) -> (u8, bool, u32)` match on both sides of the Task 5 tests. `BackupReport.newest_snapshots: [Option<u64>; CNC_MAX_SERVICES]` keeps `Copy` — `print_backup_report` and every test that passes a report by value are unaffected. `plan()`'s `Plan::Apply { target, one_frame }` is destructured with exactly those names in `apply_cycle`.
 
 **Two facts worth re-checking during execution:**
-1. `FrameIter` advances the follower's cursor **as it yields** (`uc2_log/src/reader.rs:100-125`). Lockstep's `break` after the first yielded frame relies on the cursor then sitting at the *next* frame's start — it does, because the advance happens before the yield returns. If that ever changes, lockstep silently becomes "one batch", not "one frame".
+1. `FrameIter` advances the follower's cursor **as it yields** (`uc_log/src/reader.rs:100-125`). Lockstep's `break` after the first yielded frame relies on the cursor then sitting at the *next* frame's start — it does, because the advance happens before the yield returns. If that ever changes, lockstep silently becomes "one batch", not "one frame".
 2. `publish_service_mins` must stay the **first** statement of `do_work` after the halt check. Moving it below step 0 makes `refresh_durable` publish a report ceiling from the previous cycle's `min_applied` — still safe (stale is conservative) but one cycle later than the spec's steady state.
 
 ---
 
 ## Execution record (2026-08-27, subagent-driven; the SDD ledger, condensed)
 
-Branch `worktree-uc2-multi-service`, merge base `4fcad3c`, final HEAD `bbac7a8`. Task commits: T1 `f58f3c2`, T2 `86ffcd2`, T3 `242081b`, T4 `d3fc45d`, T5 `59562e6`, T6 `92bc9af` (1 fix round), T9 `580a69f` (executed before T7/T8 by ruling), T7 `23711d7` + `61573cd` (1 fix round), T8 `bf8b187`, T10 `247b72d` (1 fix round), T11 `cecba5f`; final whole-branch review (0 Critical, 7 Important — all mechanical) → fix wave `90c28dd` + `bbac7a8`. Evidence on `bbac7a8`: `cargo test --workspace --no-fail-fast` 1 346 passed / 0 failed; clippy `--workspace --all-targets -D warnings` clean. On `cecba5f`: `lin_v2` 7/7 + `lin_partition_v2` 7/7 Linearizable, hard-crash tests green, fuzz smoke `uc_protocol_cnc` 49.8 M / `uc2_node_toml` 908 k runs clean, m5 smoke 169 561 resp/s with 0 lost (smoke; same-box A/B vs `main` 168.9 k/169.8 k vs 184.1 k/158.7 k — inside the box's repeat noise).
+Branch `worktree-uc2-multi-service`, merge base `4fcad3c`, final HEAD `bbac7a8`. Task commits: T1 `f58f3c2`, T2 `86ffcd2`, T3 `242081b`, T4 `d3fc45d`, T5 `59562e6`, T6 `92bc9af` (1 fix round), T9 `580a69f` (executed before T7/T8 by ruling), T7 `23711d7` + `61573cd` (1 fix round), T8 `bf8b187`, T10 `247b72d` (1 fix round), T11 `cecba5f`; final whole-branch review (0 Critical, 7 Important — all mechanical) → fix wave `90c28dd` + `bbac7a8`. Evidence on `bbac7a8`: `cargo test --workspace --no-fail-fast` 1 346 passed / 0 failed; clippy `--workspace --all-targets -D warnings` clean. On `cecba5f`: `lin_v2` 7/7 + `lin_partition_v2` 7/7 Linearizable, hard-crash tests green, fuzz smoke `uc_protocol_cnc` 49.8 M / `uc_node_toml` 908 k runs clean, m5 smoke 169 561 resp/s with 0 lost (smoke; same-box A/B vs `main` 168.9 k/169.8 k vs 184.1 k/158.7 k — inside the box's repeat noise).
 
 ### Rulings made during execution (each with what it costs if wrong)
 
@@ -2778,16 +2778,16 @@ Branch `worktree-uc2-multi-service`, merge base `4fcad3c`, final HEAD `bbac7a8`.
 - `forward_svc_query` returns `false` on a `None` producer (parks the read) — M14b adds `MSG_V2_BAD_SERVICE`; add a `debug_assert!` there.
 - `ServicesConfig::none_for_tests()` is `pub` (`#[doc(hidden)]`) on a publishable crate and disables the door term + ceiling — consider a `harness` cargo feature once M14b/c settle the test surface. The `default()`-with-no-service stall is the footgun to keep in mind for every new node-only test.
 - Door test's `refused` assert message (`services.rs:406`) is stale (the refusal now comes from the client's 2 000-slot window; the proof is `append ≤ BOUND + one_frame`).
-- `reconstruction.rs` purge tests sit ~22 % under the 16 KiB harness door budget; `service_epoch_bumps_with_fetch_add` exercises a retired field; `cnc.rs:53` doc cites M14b's query prefix ahead of time; accessor/import style nits (fmt is deferred project-wide); stale `fuzz/corpus/uc2_gateway_toml/01-packaging-example` seed (own commit).
+- `reconstruction.rs` purge tests sit ~22 % under the 16 KiB harness door budget; `service_epoch_bumps_with_fetch_add` exercises a retired field; `cnc.rs:53` doc cites M14b's query prefix ahead of time; accessor/import style nits (fmt is deferred project-wide); stale `fuzz/corpus/uc_gateway_toml/01-packaging-example` seed (own commit).
 
 ### Post-merge addendum (2026-08-27, same day)
 
-The FSM hop was then measured alone (`uc2_node/examples/apply_bench`, commit
+The FSM hop was then measured alone (`uc_node/examples/apply_bench`, commit
 `a3f1a54`; note `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`): bounded mode
 free of N (−1.2 % at N=8), −5 % vs `main` at N=1, and **lockstep throttled to
 18 k frames/s by the apply agent's 50 µs idle sleep** — fixed by the
 out-of-line `lockstep_wait` ladder (`80a37a8`; 631 k at N=2). Two dead ends
 recorded in the note: an every-mode inline ladder (bounded −6 % at N=8, lockstep
 cascading into sleeps) and a lockstep-only inline ladder (−9 % at N=1 by codegen
-alone). Suites green on `80a37a8`: `uc2_service` 21/21 + integration, `services.rs`
+alone). Suites green on `80a37a8`: `uc_service` 21/21 + integration, `services.rs`
 11/11, `lin_v2` 7/7, clippy clean.

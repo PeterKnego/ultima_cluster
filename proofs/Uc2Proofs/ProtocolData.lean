@@ -66,7 +66,7 @@ documented inline):
 8. **Sent-set data wire**: data frames live in `dsent`, append-only, delivered
    any number of times in any order — same fault model as the election wire.
    The receiver-side contiguity guard (`pos = durable`, decision 4) turns
-   reorder/duplication into no-ops, mirroring `uc2_log`'s writer rule
+   reorder/duplication into no-ops, mirroring `uc_log`'s writer rule
    ("the RECEIVER advances only to the contiguous frontier"; accept at exactly
    the frontier). Keeping `dsent` separate from `sent` is what makes the
    projection to the election model a strict field-erasure. -/
@@ -118,7 +118,7 @@ structure Node (n : Nat) where
 /-- The data wire frames (decision 8; the election wire keeps `Uc2.Msg`).
 
 - `replicate` mirrors one stamped record of the leader's replication stream
-  (`uc2_net` sender off the log buffer; NAK repair re-serves the same bytes,
+  (`uc_net` sender off the log buffer; NAK repair re-serves the same bytes,
   which the sent-set semantics covers as re-delivery). **LC1 amendment
   (Finding #7 fix)**: the frame carries BOTH terms Rust keeps separate —
   `hdr` is the datagram's wire header (`leadership_term_id`, checked for
@@ -316,7 +316,7 @@ inductive Step {n : Nat} : World n → World n → Prop
           dsent := w.dsent }
   /-- Issue #7: the consensus agent's duty cycle absorbing the durable counter
   into `ElectionSm` (`Consensus::do_work` step 2 / `refresh_durable` in
-  `uc2_node`). The ONLY way `smDurable` catches up with `durable`, and the
+  `uc_node`). The ONLY way `smDurable` catches up with `durable`, and the
   reason it can lag at all: in the real node the counter is advanced by the
   archive agent, READ AND REPORTED by the receiver agent, and absorbed here by
   a third thread on its own schedule. Collapsing those into one value is what
@@ -364,7 +364,7 @@ inductive Step {n : Nat} : World n → World n → Prop
             [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm
               (w.nodes i).pn.currentTerm v] }
   /-- Replication delivery (decision 4): accept a stamped record only at
-  exactly the receiver's frontier (`uc2_log` writer rule — reordered and
+  exactly the receiver's frontier (`uc_log` writer rule — reordered and
   duplicated deliveries become no-ops, never corruption) and only when the
   wire HEADER term EXACTLY matches the receiver's data-plane term handle
   `dataTerm` (LC1 amendment, Finding #7 fix; LC1b, Finding #8 fix — keyed
@@ -392,7 +392,7 @@ inductive Step {n : Nat} : World n → World n → Prop
   wire header, keeping the record's original stamp. This is the
   NAK-repair / deep-NAK / journal-replay path by which OLD-stamped bytes
   legitimately reach a reconciled follower inside the CURRENT leader's
-  stream (`uc2_net` sender serving retransmits off the log buffer /
+  stream (`uc_net` sender serving retransmits off the log buffer /
   journal under its own `leadership_term_id`) — what keeps
   inherited-prefix catch-up (the #6a/Fig-8 case) alive now that delivery
   requires an exact header match. -/

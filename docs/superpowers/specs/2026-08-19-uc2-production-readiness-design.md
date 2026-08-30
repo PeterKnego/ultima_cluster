@@ -26,7 +26,7 @@ Decisions locked at scope-setting:
 | Leadership transfer | **Deferred, and not to M9.** A pre-shutdown handoff needs a new protocol message (Raft's `TimeoutNow` analog) and touches `ElectionSm`. It is a consensus change wearing an operations hat; it gets its own spec or none at all. A planned leader stop costs one election timeout (150–300 ms) until then, which is acceptable and measurable. |
 | Upgrade path | **Script the flag day now; defer version negotiation.** M11 delivers a tested procedure with a published downtime number. A one-version-skew negotiation window is real design work — the negotiated floor becomes consensus-relevant state — and is explicitly out of scope here. |
 | Metrics transport | **In-daemon HTTP endpoint over a read-only cnc attach.** Not a sidecar: the daemon already holds the page, and a second process attaching read-only is a new failure mode for no gain. |
-| Gateway placement | **A client of the cluster, never a member.** It holds no consensus state, so it stays stateless and horizontally scalable. Correctness obligations stay behind `uc2_client::Engine`'s existing slot-correlation boundary. |
+| Gateway placement | **A client of the cluster, never a member.** It holds no consensus state, so it stays stateless and horizontally scalable. Correctness obligations stay behind `uc_client::Engine`'s existing slot-correlation boundary. |
 | Crypto default | **Revisit at M12, not before.** Flipping the default is a posture change that needs the M8 fleet ratio (still open) and the packaging story to land first. |
 | Verification posture | **Unchanged.** No milestone here weakens a gate, and none is blocked on the open Lean obligations. |
 
@@ -44,27 +44,27 @@ because several are sharper than expected in both directions.
 
 | Finding | Evidence |
 |---|---|
-| **No node binary exists.** The only `main.rs` in the workspace is `uc2ctl/src/main.rs`. | `docs/QUICKSTART.md:106` starts a cluster with `cargo run -p counter --bin counter-node` — an example. Fleet gates run roles built from `uc2_node/examples/m{4..7}_gate.rs`. |
+| **No node binary exists.** The only `main.rs` in the workspace is `uc_ctl/src/main.rs`. | `docs/QUICKSTART.md:106` starts a cluster with `cargo run -p counter --bin counter-node` — an example. Fleet gates run roles built from `uc_node/examples/m{4..7}_gate.rs`. |
 | **The docs already describe a binary the build does not produce.** | `docs/how-to/run-a-cluster.md` writes `/path/to/uc2-node` in its systemd example. |
-| **Graceful stop is implemented; nothing calls it.** This is smaller than it first appears. | `Node::stop()` (`uc2_node/src/node.rs:1402`) signals and joins all four agents; `Node::crash()` is the deliberate no-flush counterpart; `Service::stop()` (`uc2_service/src/lib.rs:314`) mirrors it. `examples/counter/src/bin/counter-node.rs` ends in `loop { sleep(100ms) }` and installs no signal handler, so `SIGTERM` kills agents mid-cycle and restart pays reconstruction. |
-| **`stop()` does not drain the archive.** Not a safety issue — un-recorded bytes were never durable, so never acked — but it is a restart-cost issue. | No flush API on `uc2_log::archive` or the journal; agents exit at the top of a duty cycle. |
-| **Configuration is a Rust struct.** Changing `buffer_bytes` means recompiling. | `NodeConfig` at `uc2_node/src/node.rs`; `docs/reference/configuration.md` documents fields, not a file. |
+| **Graceful stop is implemented; nothing calls it.** This is smaller than it first appears. | `Node::stop()` (`uc_node/src/node.rs:1402`) signals and joins all four agents; `Node::crash()` is the deliberate no-flush counterpart; `Service::stop()` (`uc_service/src/lib.rs:314`) mirrors it. `examples/counter/src/bin/counter-node.rs` ends in `loop { sleep(100ms) }` and installs no signal handler, so `SIGTERM` kills agents mid-cycle and restart pays reconstruction. |
+| **`stop()` does not drain the archive.** Not a safety issue — un-recorded bytes were never durable, so never acked — but it is a restart-cost issue. | No flush API on `uc_log::archive` or the journal; agents exit at the top of a duty cycle. |
+| **Configuration is a Rust struct.** Changing `buffer_bytes` means recompiling. | `NodeConfig` at `uc_node/src/node.rs`; `docs/reference/configuration.md` documents fields, not a file. |
 | **A documented silent-data-loss trap is not asserted in code.** | `run-a-cluster.md`: an instance dir on `tmpfs` makes every `fsync` a no-op and the cluster "will appear to work and will lose committed data on power loss." `bench-infra/scripts/m6_fleet_gate.py:119` (`assert_durable_fs`) already refuses this for gates; the node does not. |
 | **Zero telemetry.** No Prometheus, OTel, statsd, or `/metrics` anywhere. Library code contains **zero** `tracing::` calls; total logging is 27 `eprintln!` + 8 `println!`; no subscriber is initialised. | Workspace-wide grep. |
 | **The scrape source is already built and pinned.** | `docs/reference/cnc-page.md`: counters at 256/320/384/448/512, `term` 704, `node_flags` 768, `leader_hint` 832, heartbeats 896/960, `config_version` 3456, `admission_bytes` 3712, `seal_failures` 3776, per-peer band at 1408. Accessors: `Node::reports_unattested`, `crypto_handshake_failures`, `crypto_stats`, sender/receiver `stats()`. |
 | **No backup, restore, or quorum-loss procedure exists.** | `grep -ri 'backup\|restore\|disaster' docs/` returns nothing operational. The inputs are ready: `docs/reference/instance-directory.md` already classifies `journal/`, `state/`, `snapshots/` as must-survive-power-loss and everything else as rebuilt on boot. |
-| **`ENOSPC` is unhandled anywhere in the tree.** Purge is `Disabled` by default, so journals grow unbounded unless enabled. | Workspace-wide grep. Likely lands in one of the `.expect(...fail-stop)` paths in `uc2_log/src/archive.rs` — arguably correct, but untested, undocumented, and with no low-disk warning ahead of it. |
+| **`ENOSPC` is unhandled anywhere in the tree.** Purge is `Disabled` by default, so journals grow unbounded unless enabled. | Workspace-wide grep. Likely lands in one of the `.expect(...fail-stop)` paths in `uc_log/src/archive.rs` — arguably correct, but untested, undocumented, and with no low-disk warning ahead of it. |
 | **Every protocol change costs a full-cluster outage.** Correct in isolation; unstated as a product property. | `docs/releases.md`: 0.5.0 is a flag day, a mixed cluster *stalls commits*; crypto is a flag day with no mixed mode. The 0.5.0 fleet gate explicitly does not test mixed-version operation. |
-| **Clients must be co-located with a node.** | `uc2_client` has no sockets. Writes are leader-only; a follower returns `Outcome::NotLeader { hint }` that the *caller* must act on, and cannot reroute because it cannot reach another host. |
+| **Clients must be co-located with a node.** | `uc_client` has no sockets. Writes are leader-only; a follower returns `Outcome::NotLeader { hint }` that the *caller* must act on, and cannot reroute because it cannot reach another host. |
 | **The admin plane has no access control.** Membership change is *safe* (one at a time, documented refusal table) but not *authorised*. | `uc2ctl` writes the cnc admin band (3584/3648); node forwards as kinds 16/17. Anyone with write access to the instance directory can remove voters. No audit record. |
-| **No supply-chain or toolchain gating.** | No `cargo-deny`, `cargo-audit`, SBOM, or fuzz targets. `rust-toolchain.toml` pins `channel = "stable"` — floating — over ~130 `unsafe` blocks concentrated in `uc2_log/src/cnc.rs` (38), the three rings, and `uc2_log/src/buffer.rs`. |
-| **Version identity is inconsistent.** | Workspace version `0.1.0`; tags `v2.0.0`/`v2.1.0`. Only `uc-lincheck` and `uc2ctl` are `publish = false`, so every other crate is *intended* to publish and none has. |
+| **No supply-chain or toolchain gating.** | No `cargo-deny`, `cargo-audit`, SBOM, or fuzz targets. `rust-toolchain.toml` pins `channel = "stable"` — floating — over ~130 `unsafe` blocks concentrated in `uc_log/src/cnc.rs` (38), the three rings, and `uc_log/src/buffer.rs`. |
+| **Version identity is inconsistent.** | Workspace version `0.1.0`; tags `v2.0.0`/`v2.1.0`. Only `uc_lincheck` and `uc2ctl` are `publish = false`, so every other crate is *intended* to publish and none has. |
 
 ## 3. Non-goals
 
 Named so they are not re-litigated per milestone:
 
-- **No consensus changes.** No milestone alters `uc2_consensus`, the wire
+- **No consensus changes.** No milestone alters `uc_consensus`, the wire
   protocol, or the cnc layout outside the reserved band.
 - **No leadership-transfer protocol** (see §1).
 - **No mixed-version operation** (see §1). Flag days stay flag days; M11 makes
@@ -191,7 +191,7 @@ publishing, security posture.
 
 - **The gateway is the adoption unlock and the largest item here.** It serves a
   remote protocol, discovers and follows the leader across failover, and holds
-  no consensus state. `uc2_client::Engine` already carries the exactly-once slot
+  no consensus state. `uc_client::Engine` already carries the exactly-once slot
   correlation; the gateway must not accumulate correctness obligations of its
   own. Note the crate docs already describe `Engine` as what "a max-throughput
   RPC gateway or the `m5_gate` measurement harness runs on directly" — the

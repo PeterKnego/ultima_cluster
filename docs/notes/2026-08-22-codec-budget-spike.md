@@ -8,7 +8,7 @@ CLAUDE.md / the M5 gate doc for where real numbers come from).*
 ## Question
 
 Every command crosses the apply boundary as bytes (`payload: &[u8]` off the
-log-buffer frame, `uc2_service/src/apply.rs`), and every response leaves it as
+log-buffer frame, `uc_service/src/apply.rs`), and every response leaves it as
 bytes, but the `StateMachine` trait is typed: the framework bincode-decodes
 `S::Command` before `apply` and bincode-encodes `S::Response` after it. How
 much of the apply thread's budget is that, as the payload grows from 64 B to
@@ -46,7 +46,7 @@ payload element-wise, and `encode_to_vec` allocates per frame. `bytes::Bytes`
 
 ## Part 2 — budget share inside UC (`m5_gate all`, local smoke)
 
-Feature `uc2_service/apply-profile` (this commit; zero-cost when off): rdtsc
+Feature `uc_service/apply-profile` (this commit; zero-cost when off): rdtsc
 probes around decode / `apply` / response publish on the apply thread,
 summary to stderr. `m5_gate all --secs 6 --payload N` on the 4-vCPU dev box
 (3 nodes + 3 services + client in one process — oversubscribed, so absolute
@@ -122,8 +122,8 @@ this is a gate number.
 ## Post-fix smoke (Task 4)
 
 M12a Task 4 added `m5_gate`'s raw `CountSm` twin (`RawCountSm`, `--raw-sm`) —
-the typed/raw A/B this note called for. `cargo run -p uc2_node --release
---example m5_gate --features uc2_service/apply-profile -- all --secs 6
+the typed/raw A/B this note called for. `cargo run -p uc_node --release
+--example m5_gate --features uc_service/apply-profile -- all --secs 6
 --payload 509`, with and without `--raw-sm` (`--payload 509` rather than the
 task's nominal 512: `NODE_MAX_PAYLOAD` in `m5_gate.rs` is a hard 512 B door
 enforced at `try_submit` and a 509 B raw command bincode-encodes to exactly

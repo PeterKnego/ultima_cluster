@@ -155,7 +155,7 @@ not repeat cluster-wide the way `apply`'s does.
 
 ## `Sessioned<S>` wraps either tier
 
-`uc2_service::session` (M12a spec §4.4) ships `Sessioned<S>`, the exactly-once
+`uc_service::session` (M12a spec §4.4) ships `Sessioned<S>`, the exactly-once
 wrapper the gateway's session envelope needs. It implements `RawStateMachine`
 for any `S: RawStateMachine`, and `SnapshotStateMachine` for any
 `S: SnapshotStateMachine` — because `StateMachine` blankets onto

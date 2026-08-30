@@ -69,7 +69,7 @@ the hot path.
 - **receiver agent**: receives datagrams; log frames → position-addressed writes into
   the local log buffer (follower role); control frames → SPSC ring to consensus.
 - **archive agent**: polls the buffer from `durable_position`, block-writes ≤1 MiB to
-  `ultima_journal`, one `fdatasync` per block, then advances the durable counter.
+  `uc_journal`, one `fdatasync` per block, then advances the durable counter.
   **The only fsync site.**
 
 Service process: apply agent (polls committed log in place, calls user `apply`) + the
@@ -85,13 +85,13 @@ process is the same code with a different mmap.
 | crate | contents |
 |---|---|
 | `uc_protocol` (extended) | v2 layouts as a new module family: cnc v2, log-buffer frame format, position counters, ingress/egress rings, control-frame formats. Stays `no_std`, stays the multi-language gate. |
-| `uc2_log` | log-buffer runtime (appender, position-addressed writer, validated readers) + archive agent (journal recording, durable position, replay-from-position). |
-| `uc2_net` | UDP transport: sender/receiver agents, fan-out, NAK/retransmit, status/flow control, replay + bulk (snapshot) sessions, built-in fault-injection layer. |
-| `uc2_consensus` | **pure, sync, deterministic** consensus SM (commit ranking, elections, truncation, learner admission) — no I/O, no threads, no clock (time injected) — plus the thin agent driving it. |
-| `uc2_sim` | deterministic simulation harness for `uc2_consensus` (may live as `uc2_consensus` dev-deps/tests if small). |
-| `uc2_node` | composition: agent wiring, discovery dir, instance lock, service/client attach, snapshot/reconstruction orchestration, admission window. |
+| `uc_log` | log-buffer runtime (appender, position-addressed writer, validated readers) + archive agent (journal recording, durable position, replay-from-position). |
+| `uc_net` | UDP transport: sender/receiver agents, fan-out, NAK/retransmit, status/flow control, replay + bulk (snapshot) sessions, built-in fault-injection layer. |
+| `uc_consensus` | **pure, sync, deterministic** consensus SM (commit ranking, elections, truncation, learner admission) — no I/O, no threads, no clock (time injected) — plus the thin agent driving it. |
+| `uc_sim` | deterministic simulation harness for `uc_consensus` (may live as `uc_consensus` dev-deps/tests if small). |
+| `uc_node` | composition: agent wiring, discovery dir, instance lock, service/client attach, snapshot/reconstruction orchestration, admission window. |
 | `uc_service` / `uc_client` | v2 backends behind the unchanged trait contracts. |
-| reused as-is | `ultima_journal` (archive medium + StableValues), `uc-lincheck`, `uc-crashtest` (v2 bins), bench infra + Aeron reference arm. |
+| reused as-is | `uc_journal` (archive medium + StableValues), `uc_lincheck`, `uc-crashtest` (v2 bins), bench infra + Aeron reference arm. |
 
 ## 4. The log buffer, positions, and the archive
 
@@ -114,7 +114,7 @@ it. cnc v2 counters (cache-line separated, multi-language readable): append, dur
 sent, commit, service_applied, service epoch/seqlock, output_completed, per-follower
 observability stats.
 
-**Archive = ultima_journal recording blocks, not messages.** One journal record per
+**Archive = uc_journal recording blocks, not messages.** One journal record per
 block (≤1 MiB, frame-aligned): `seq` = block index, `meta` = block base position, CRC
 per block (amortized — removes v1's per-record CRC cost at the root), one `fdatasync`
 per block, durable counter advances after. fsync frequency scales with block rate; the
@@ -185,7 +185,7 @@ the cnc commit counter (that *is* the apply notification) and gossip `CommitPosi
 **Commit means quorum-fsync'd** — v1 consistent mode semantics. Control traffic is
 single-digit kHz regardless of message rate.
 
-**Elections — Raft's safety core over positions, entirely inside `uc2_consensus`.**
+**Elections — Raft's safety core over positions, entirely inside `uc_consensus`.**
 Inputs: control messages, injected time ticks, local counter snapshots. Outputs:
 messages + actions (persist vote, truncate to X, open term). The agent performs I/O;
 the SM never does.
@@ -263,7 +263,7 @@ replay. `build_snapshot`/`install_snapshot` still return the position `u64`.
 
 ## 8. Testing strategy
 
-**L1 — deterministic simulation** (`uc2_sim`, exists before the first networked
+**L1 — deterministic simulation** (`uc_sim`, exists before the first networked
 election): N SM instances, one thread, virtual time; seeded-random delay/drop/dup/
 reorder; injected crashes/restarts (StableValue state survives); archive progress as
 events. Invariants after every step: election safety (≤1 leader/term), term-map prefix
@@ -271,13 +271,13 @@ consistency, commit monotonicity, committed-never-truncated, leader completeness
 seeded fuzz (thousands of seeds in CI), pinned regression seeds, scripted nasties (split
 votes, asymmetric partitions, crash-during-truncate, stale-leader reads).
 
-**L2 — component:** `uc2_log` wrap/padding, overrun gate, block boundaries, truncate +
-partial re-append, replay seek, torn-tail recovery; `uc2_net` localhost harness with the
+**L2 — component:** `uc_log` wrap/padding, overrun gate, block boundaries, truncate +
+partial re-append, replay seek, torn-tail recovery; `uc_net` localhost harness with the
 fault layer built in from day one (native to own-UDP), NAK under sustained loss, window
 pacing, replay→live handoff. **loom** on the frame-commit word + counter visibility;
 **miri** over unsafe mmap code (v1's cnc-align UB is the precedent).
 
-**L3 — v1 correctness harness, ported not rebuilt:** uc-lincheck WGL capstone under
+**L3 — v1 correctness harness, ported not rebuilt:** uc_lincheck WGL capstone under
 churn + leader kills; `lin_partition`'s four scenarios re-driven through the UDP fault
 layer; uc-crashtest SIGKILL (service and node) mid-load on v2 bins. Same theorems v1
 proved; the harness carrying over is the biggest de-risker in the plan.
@@ -290,8 +290,8 @@ crashtest/fault behind features; clippy `-D warnings`.
 
 | # | deliverable | gate |
 |---|---|---|
-| M1 | `uc2_log`: buffer + archive, single node | ≥1 M/s 64 B append+record+fsync solo |
-| M2 | `uc2_net`: replication stream, 3 hosts | ≥100 MB/s per follower, durable positions keeping pace, resilient to 0.1–1 % injected loss |
+| M1 | `uc_log`: buffer + archive, single node | ≥1 M/s 64 B append+record+fsync solo |
+| M2 | `uc_net`: replication stream, 3 hosts | ≥100 MB/s per follower, durable positions keeping pace, resilient to 0.1–1 % injected loss |
 | M3 | static-leader commit pipeline, 3 nodes | **go/no-go: ≥400 k committed/s, p50 ≤1 ms, fsync on** — before elections or SDK exist |
 | M4 | elections + term map + truncation | sim + partition lincheck green; sub-second LAN failover |
 | M5 | SDK/apply/protocol v2 e2e | full lincheck + crashtest green; client→apply→response ≥400 k @ p50 ≤1 ms (headline bar) |

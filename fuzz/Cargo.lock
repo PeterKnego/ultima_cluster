@@ -922,39 +922,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
-name = "uc2-fuzz"
-version = "0.0.0"
-dependencies = [
- "base64",
- "libfuzzer-sys",
- "uc2_crypto",
- "uc2_gateway",
- "uc2_node",
- "uc2_remote",
- "uc2_service",
- "uc_protocol",
- "ultima-journal",
- "x25519-dalek",
-]
-
-[[package]]
-name = "uc2_client"
-version = "2.6.0"
+name = "uc_client"
+version = "2.9.0"
 dependencies = [
  "bincode",
+ "bytes",
  "serde",
  "thiserror",
- "uc2_log",
+ "uc_log",
  "uc_protocol",
 ]
 
 [[package]]
-name = "uc2_consensus"
-version = "2.6.0"
+name = "uc_consensus"
+version = "2.9.0"
 
 [[package]]
-name = "uc2_crypto"
-version = "2.6.0"
+name = "uc_crypto"
+version = "2.9.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -971,8 +956,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "uc2_gateway"
-version = "2.6.0"
+name = "uc_fuzz"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "libfuzzer-sys",
+ "uc_crypto",
+ "uc_gateway",
+ "uc_journal",
+ "uc_node",
+ "uc_protocol",
+ "uc_remote",
+ "uc_service",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "uc_gateway"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -982,38 +983,49 @@ dependencies = [
  "signal-hook",
  "thiserror",
  "toml",
- "uc2_client",
- "uc2_log",
- "uc2_remote",
+ "uc_client",
+ "uc_log",
  "uc_protocol",
+ "uc_remote",
 ]
 
 [[package]]
-name = "uc2_log"
-version = "2.6.0"
+name = "uc_journal"
+version = "2.9.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "rustix",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "uc_log"
+version = "2.9.0"
 dependencies = [
  "crc32fast",
  "memmap2",
  "rand",
  "serde",
  "thiserror",
+ "uc_journal",
  "uc_protocol",
- "ultima-journal",
 ]
 
 [[package]]
-name = "uc2_net"
-version = "2.6.0"
+name = "uc_net"
+version = "2.9.0"
 dependencies = [
- "uc2_crypto",
- "uc2_log",
+ "uc_crypto",
+ "uc_journal",
+ "uc_log",
  "uc_protocol",
- "ultima-journal",
 ]
 
 [[package]]
-name = "uc2_node"
-version = "2.6.0"
+name = "uc_node"
+version = "2.9.0"
 dependencies = [
  "clap",
  "fs2",
@@ -1023,38 +1035,17 @@ dependencies = [
  "signal-hook",
  "thiserror",
  "toml",
- "uc2_consensus",
- "uc2_crypto",
- "uc2_log",
- "uc2_net",
+ "uc_consensus",
+ "uc_crypto",
+ "uc_journal",
+ "uc_log",
+ "uc_net",
  "uc_protocol",
- "ultima-journal",
-]
-
-[[package]]
-name = "uc2_remote"
-version = "2.6.0"
-dependencies = [
- "bytes",
- "thiserror",
-]
-
-[[package]]
-name = "uc2_service"
-version = "2.6.0"
-dependencies = [
- "bincode",
- "serde",
- "thiserror",
- "tokio",
- "uc2_log",
- "uc_protocol",
- "ultima-journal",
 ]
 
 [[package]]
 name = "uc_protocol"
-version = "2.6.0"
+version = "2.9.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1067,14 +1058,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "ultima-journal"
-version = "2.6.0"
+name = "uc_remote"
+version = "2.9.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
+name = "uc_service"
+version = "2.9.0"
 dependencies = [
  "bincode",
- "crc32fast",
- "rustix",
+ "fs2",
  "serde",
  "thiserror",
+ "tokio",
+ "uc_journal",
+ "uc_log",
+ "uc_protocol",
 ]
 
 [[package]]

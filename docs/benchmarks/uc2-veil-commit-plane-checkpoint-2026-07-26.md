@@ -386,7 +386,7 @@ the add case against carrier `d` (|d| ≤ |c|+1) and the remove case against car
 ## S2.4 The two gaps put to the gate (full text: ledger items 14/15)
 
 1. **MODEL-EDIT-1 — `commitEntry` counts reports that are not the leader's.**
-   Rust: `uc2_consensus/src/election.rs:545-552` (stale report dropped; higher-term
+   Rust: `uc_consensus/src/election.rs:545-552` (stale report dropped; higher-term
    report becomes `adopt_term`) so only own-term reports reach
    `tracker.on_durable` (`:566-570`); companion clamp `new_term_pos` (`:1451-1456`,
    Finding #6b). Proposed edit: `commitEntry` also requires

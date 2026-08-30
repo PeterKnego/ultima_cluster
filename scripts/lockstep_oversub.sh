@@ -20,7 +20,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
 if [ -z "$BIN" ]; then
-  cargo build --release -p uc2_node --example apply_bench >/dev/null
+  cargo build --release -p uc_node --example apply_bench >/dev/null
   BIN="${CARGO_TARGET_DIR:-$HOME/.cache/cargo-target}/release/examples/apply_bench"
 fi
 echo "bin: $(sha256sum "$BIN")"

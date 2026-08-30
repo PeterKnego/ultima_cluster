@@ -29,7 +29,7 @@ stack + syscalls) actually is.
 What the repo already knows, and why the prior is "small":
 
 - **The transport is one blocking-free `send_to`/`recv_from` syscall per
-  datagram** (`uc2_net/src/sender.rs:703`, `receiver.rs:874`) — no
+  datagram** (`uc_net/src/sender.rs:703`, `receiver.rs:874`) — no
   `sendmmsg`/`recvmmsg`, no UDP GSO/GRO, no `SO_BUSY_POLL`. But datagrams are
   packed MTU-full (`MTU_DEFAULT = 1408`, `uc_protocol/src/v2/datagram.rs:18`),
   so at M5's 64 B payloads a datagram carries ~14 frames and the sender pushes
@@ -128,20 +128,20 @@ compiled out of every normal build, never enabled by any default test or gate.
 What it adds, sampled 1-in-N positions (N an env knob, default in the
 implementation plan; sampling bounds observer cost):
 
-- **Leader** (`uc2_net::Sender` + the consensus agent in `uc2_node`):
+- **Leader** (`uc_net::Sender` + the consensus agent in `uc_node`):
   `t_append` (frame published to the log buffer), `t_send` (entry to the
   `send_to` carrying the covering datagram, per follower), `t_report`
   (`recv_from` return of the commit-triggering `APPEND_POSITION`), `t_commit`
   (commit counter advance past `P` — the `rank_leader` crossing).
-- **Follower** (`uc2_net::Receiver` + archive agent): durations only —
+- **Follower** (`uc_net::Receiver` + archive agent): durations only —
   `d_recv→d_durable` (datagram in → covering fdatasync returned; the archive
-  records one fdatasync per block, `uc2_log/src/archive.rs` header) and
+  records one fdatasync per block, `uc_log/src/archive.rs` header) and
   `d_durable→d_report` (durable → `APPEND_POSITION` `send_to` entry; the
   report cadence and its `ap_reported` cursor live in
-  `uc2_net/src/receiver.rs:850`, re-send discipline at `:611`).
+  `uc_net/src/receiver.rs:850`, re-send discipline at `:611`).
 - **Syscall timing:** `Instant` pairs around `send_to`/`recv_from` at the
   sampled sites (µs/datagram distribution).
-- **Duty-cycle counters in `AgentRunner`** (`uc2_log/src/agent.rs`): per-agent
+- **Duty-cycle counters in `AgentRunner`** (`uc_log/src/agent.rs`): per-agent
   work-vs-empty poll counts and time-in-socket vs time-in-pack/seal buckets,
   dumped at exit. This is the §4.3 internal-counter escalation, verbatim.
 
@@ -153,7 +153,7 @@ read-profile precedent: a rule re-implemented outside its tests is no longer a
 pre-commitment).
 
 **Harness placement** is an implementation-plan decision, with a default: a
-thin `uc2_node/examples/net_decomp.rs` reusing the `m5_gate` role split
+thin `uc_node/examples/net_decomp.rs` reusing the `m5_gate` role split
 (`node`/`service`/`client`/`all`/`decide`), because the load whose 600 µs is
 being decomposed *is* the M5 load shape and the fleet orchestration already
 knows how to drive that shape. Extending `m5_gate` itself with a `--decompose`
@@ -241,7 +241,7 @@ To be answered in the report, not discovered after it:
    here is a batching-policy finding, not a network finding.
 3. **Report cadence inflating the apparent round trip.** Excluded from WIRE by
    the subtraction (§4.1). If `d_durable→d_report` turns out large, the cheap
-   fix is a cadence knob in `uc2_net`, and the report must say so rather than
+   fix is a cadence knob in `uc_net`, and the report must say so rather than
    let the raw leader-observed RTT be quoted as "network".
 4. **NAK/retransmit contamination.** A sampled position swept into loss
    recovery measures the repair path, not the steady state. Excluded per the
@@ -280,7 +280,7 @@ Index entry added to `docs/BENCHMARKS.md` per house convention.
 
 Three dispositions, one measurement:
 
-1. **`uc2_net` cheap ladder** (mmsg/GSO/busy-poll/jumbo): build iff clause
+1. **`uc_net` cheap ladder** (mmsg/GSO/busy-poll/jumbo): build iff clause
    (L); otherwise declined with the number.
 2. **`hi-perf-cmp` `network-rtt` ladder cells** (`udp_mmsg`, `udp_gso`,
    `udp_busypoll`, `io_uring`, `af_xdp`, `efa_srd`): funded *as UC work* iff
@@ -299,7 +299,7 @@ Three dispositions, one measurement:
 ## 8. Out of scope
 
 - Any change to transport behavior. This brief produces numbers and a
-  disposition, not a faster `uc2_net`.
+  disposition, not a faster `uc_net`.
 - Implementing any `hi-perf-cmp` cell (separate repo, separate brief, its own
   methodology decisions).
 - The bytes-bound / large-payload regime (a separate workload-envelope
@@ -341,16 +341,16 @@ Next step per house workflow: review this brief, then
 
 | Concern | Location |
 | --- | --- |
-| One `send_to` per datagram, MTU-full packing | `uc2_net/src/sender.rs:5`, `:703`, `:833` |
-| Sender duty cycle | `uc2_net/src/sender.rs:516` (`do_work`) |
-| Receiver recv loop | `uc2_net/src/receiver.rs:874` |
-| `APPEND_POSITION` handler (leader side) | `uc2_net/src/receiver.rs:231` |
-| Report re-send cadence / `ap_reported` cursor | `uc2_net/src/receiver.rs:611`, `:850` |
-| Leader self-addressed report (M8 `seal_failures`) | `uc2_net/src/receiver.rs:1087` region; M8 gate doc |
+| One `send_to` per datagram, MTU-full packing | `uc_net/src/sender.rs:5`, `:703`, `:833` |
+| Sender duty cycle | `uc_net/src/sender.rs:516` (`do_work`) |
+| Receiver recv loop | `uc_net/src/receiver.rs:874` |
+| `APPEND_POSITION` handler (leader side) | `uc_net/src/receiver.rs:231` |
+| Report re-send cadence / `ap_reported` cursor | `uc_net/src/receiver.rs:611`, `:850` |
+| Leader self-addressed report (M8 `seal_failures`) | `uc_net/src/receiver.rs:1087` region; M8 gate doc |
 | MTU constant (jumbo knob) | `uc_protocol/src/v2/datagram.rs:18` |
-| fdatasync per archive block | `uc2_log/src/archive.rs` (module header) |
-| Commit ranking on the leader | `uc2_consensus/src/election.rs:277` (`rank_leader`) |
-| Agent runner (duty-cycle counter site) | `uc2_log/src/agent.rs` |
+| fdatasync per archive block | `uc_log/src/archive.rs` (module header) |
+| Commit ranking on the leader | `uc_consensus/src/election.rs:277` (`rank_leader`) |
+| Agent runner (duty-cycle counter site) | `uc_log/src/agent.rs` |
 | External-proxy impossibility (do not re-attempt) | read-profile spec §4.3 (`2026-07-25-uc2-read-profile-design.md`) |
-| Role-split harness precedent | `uc2_node/examples/m5_gate.rs`, `read_profile.rs` |
+| Role-split harness precedent | `uc_node/examples/m5_gate.rs`, `read_profile.rs` |
 | Fleet orchestration | `bench-infra/scripts/m6_fleet_gate.py` |

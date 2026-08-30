@@ -6,7 +6,7 @@
 > half-landed.
 >
 > **Nothing in this brief is on a correctness critical path.** The acked-write
-> loss that motivated it (issue #7) is fixed in Rust, caught by `uc2_sim`, and
+> loss that motivated it (issue #7) is fixed in Rust, caught by `uc_sim`, and
 > refuted at world level in Lean. This is model fidelity.
 >
 > **If you pick it up, start at "Scoping the FCA weakening" (last section) —

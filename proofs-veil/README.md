@@ -9,7 +9,7 @@ checker for bug-finding and design assurance** — never as a proof of record.
 
 1. **Veil is never the record.** Permanent proofs live in `proofs/` (Lean
    v4.32.0, standard axiom trio, no SMT in the trusted base). Veil's only
-   deliverables are **countermodel traces** (→ directed `uc2_sim` regressions +
+   deliverables are **countermodel traces** (→ directed `uc_sim` regressions +
    Rust fixes) and, secondarily, candidate invariant text. A Veil model has **no
    conformance rig**; it is scratchpad-only. A bug it finds is reconfirmed
    independently in Rust before any fix.

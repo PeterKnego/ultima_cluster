@@ -1,4 +1,4 @@
-# `uc2-fuzz` — coverage-guided fuzzing for ultima_cluster
+# `uc_fuzz` — coverage-guided fuzzing for ultima_cluster
 
 Structure-unaware [libFuzzer](https://llvm.org/docs/LibFuzzer.html) targets,
 driven by [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html),
@@ -51,7 +51,7 @@ somewhere and attach it to the issue.
 ```bash
 scripts/fuzz_smoke.sh                                  # 30 s per target, every target
 scripts/fuzz_smoke.sh 60 uc_protocol_datagram
-scripts/fuzz_smoke.sh --min-runs 10000 600 uc2_node_toml
+scripts/fuzz_smoke.sh --min-runs 10000 600 uc_node_toml
 ```
 
 Runs each target for `SECS` seconds against the committed corpus and exits 1
@@ -152,24 +152,24 @@ growth.
 | Target | What it parses |
 | --- | --- |
 | `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header plus every body reader, i.e. the first code an unauthenticated UDP packet reaches. Since wire 0.6.0 that includes SNAP_BEGIN's layout discriminator, per-FSM id and declared-set word (`read_snap_begin_body` is total for every layout value). |
-| `uc2_remote_frame` | `uc2_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. |
-| `uc2_crypto_open` | `uc2_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic on attacker-chosen bytes. |
-| `uc2_crypto_handshake` | `uc2_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface, the first thing in the process to see bytes from anyone who can reach the UDP port. |
-| `uc2_crypto_group_key` | `uc2_crypto::group::GroupPlane::on_key_message` — the two message shapes that share datagram kind 20. |
-| `uc2_crypto_admin` | `uc2_crypto::admin` — a PROPERTY target over the M12b signed-tag layout (canonical length, sign/verify, tag bit-flip, foreign key). |
-| `ultima_journal_record` | `ultima_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment. |
-| `ultima_journal_stable_value` | `ultima_journal::stable_value` — the durable vote / term map / snapshot floor slots. |
+| `uc_remote_frame` | `uc_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. |
+| `uc_crypto_open` | `uc_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic on attacker-chosen bytes. |
+| `uc_crypto_handshake` | `uc_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface, the first thing in the process to see bytes from anyone who can reach the UDP port. |
+| `uc_crypto_group_key` | `uc_crypto::group::GroupPlane::on_key_message` — the two message shapes that share datagram kind 20. |
+| `uc_crypto_admin` | `uc_crypto::admin` — a PROPERTY target over the M12b signed-tag layout (canonical length, sign/verify, tag bit-flip, foreign key). |
+| `uc_journal_record` | `uc_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment. |
+| `uc_journal_stable_value` | `uc_journal::stable_value` — the durable vote / term map / snapshot floor slots. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. |
 | `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write, and, for a query record, the M14b `service_id ++ query` split (`split_query_payload`). |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header` behind the real caller's `len >= HEADER_LEN` guard (that reader is deliberately caller-guarded — see its doc). |
-| `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope (under a fuzz-derived, deliberately tiny `SessionConfig`, so client/byte eviction and the window trim are reachable) and its snapshot install path. |
-| `uc2_node_toml` | `uc2_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
-| `uc2_gateway_toml` | `uc2_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |
-| `uc2_node_http` | `uc2_node::obs::http::route_raw` — the unauthenticated `/metrics` + `/healthz` + `/readyz` request parser. |
+| `uc_service_session` | `Sessioned<S>` — the exactly-once envelope (under a fuzz-derived, deliberately tiny `SessionConfig`, so client/byte eviction and the window trim are reachable) and its snapshot install path. |
+| `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
+| `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |
+| `uc_node_http` | `uc_node::obs::http::route_raw` — the unauthenticated `/metrics` + `/healthz` + `/readyz` request parser. |
 
 ## `cfg(fuzzing)` seams
 
-`uc2_node_http` drives `obs::http::route_raw` and `ObsSources::for_tests`,
+`uc_node_http` drives `obs::http::route_raw` and `ObsSources::for_tests`,
 which exist only under `#[cfg(any(test, fuzzing))]` — they are a test seam,
 not API, and are absent from a shipped build. `cargo fuzz` sets `--cfg
 fuzzing` across the whole dependency graph, so the target builds under `cargo
@@ -178,7 +178,7 @@ this directory, which will fail to resolve `route_raw`. That is expected;
 `cargo fuzz` is the entry point. `cargo +nightly run --bin seed-corpus` is
 unaffected (it builds only the generator).
 
-`uc2_node/Cargo.toml` declares `unexpected_cfgs = { check-cfg =
+`uc_node/Cargo.toml` declares `unexpected_cfgs = { check-cfg =
 ['cfg(fuzzing)'] }` so the workspace's `clippy -D warnings` stays clean
 without promoting the seam to a Cargo feature (which would make it API).
 
@@ -192,4 +192,4 @@ without promoting the seam to a Cargo feature (which would make it API).
    workflow fails until you do — deliberately.
 5. Add a row to the target table above and a line to `docs/VERIFICATION.md`'s
    fuzzing section.
-6. Shared helpers (`uc2_fuzz::split`, `uc2_fuzz::NoopSm`) live in `src/lib.rs`.
+6. Shared helpers (`uc_fuzz::split`, `uc_fuzz::NoopSm`) live in `src/lib.rs`.

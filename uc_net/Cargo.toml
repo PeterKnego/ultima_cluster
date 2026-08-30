@@ -1,0 +1,21 @@
+[package]
+name = "uc_net"
+description = "UC v2 UDP replication data plane: sender/receiver agents, NAK, flow control (spec 2026-07-09, M2)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+uc_log = { path = "../uc_log", version = "2.8.1" }
+uc_crypto = { path = "../uc_crypto", version = "2.8.1" }
+uc_journal = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

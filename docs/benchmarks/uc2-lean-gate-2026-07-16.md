@@ -9,7 +9,7 @@ lands as Task 14's commit on top.
 **Build:** `lake build` — 3021 jobs, zero warnings, zero `sorry`.
 
 This is the permanent record for Phase 1 of the Lean proofs arc: a
-mathlib-free `Uc2Model/` mirroring `uc2_consensus`'s three pure-sync safety
+mathlib-free `Uc2Model/` mirroring `uc_consensus`'s three pure-sync safety
 kernels (`CommitTracker`, `reconcile`, vote-freshness/`log_ok`), 14 sorry-free
 theorems over that model in `Uc2Proofs/`, and an executable conformance rig
 (`Conform/`) that replays real Rust output through the model and diffs it bit
@@ -49,7 +49,7 @@ assumption.
 
 ## Conformance
 
-`uc2_consensus/examples/conform_gen.rs` (zero-dep — the crate's
+`uc_consensus/examples/conform_gen.rs` (zero-dep — the crate's
 `[dependencies]` stayed empty) drives real `CommitTracker::advance`/
 `on_durable`/`reset_reports`, `reconcile::reconcile`, and
 `election::log_ok_order` under a seeded splitmix64 PRNG, emitting
@@ -142,9 +142,9 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    FINDING"): a crashed ex-leader that re-wins an election ships its own
    shadowed phantom pair `(t, D), (t+1, D)` in its term map. Nothing prunes it:
    `become_leader` pushes the new term entry unconditionally
-   (`uc2_consensus/src/election.rs:1014`), leaders never reconcile their own map
+   (`uc_consensus/src/election.rs:1014`), leaders never reconcile their own map
    (reconciliation is a follower-side operation), and recovery's
-   **`rederive_term_map`** (`uc2_node/src/node.rs:3020-3045`) is append-only —
+   **`rederive_term_map`** (`uc_node/src/node.rs:3020-3045`) is append-only —
    it does not detect or drop an equal-base shadowed entry either (the
    reviewer independently re-verified this during task-11's review, closing a
    hole the implementer's own writeup had left open). Consequence: followers
@@ -167,13 +167,13 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    Safety argument, each half verified against the code: (1)
    **termAt-invariance** — a pruned `(t', D)` is immediately shadowed by the
    pushed `(t, D)`; `term_at` (the content-identity oracle,
-   `uc2_sim/src/invariants.rs`) returns the *last* entry with base ≤ pos, so
+   `uc_sim/src/invariants.rs`) returns the *last* entry with base ≤ pos, so
    the prune changes `term_at` at no position; (2) **C2 bounded-by-own** —
    commit is clamped to the leader's own durable (`CommitTracker::advance`'s
    `.min(own_durable)`; the Lean `advance_le_own`), so with our durable == D
    nothing at/above D was ever committed under t', and a follower holding
    *un*committed t'-bytes above D is truncated by its own-side clamp with or
-   without the prune. Pinned by new tests in `uc2_consensus/src/election.rs`:
+   without the prune. Pinned by new tests in `uc_consensus/src/election.rs`:
    `crash_rewin_prunes_same_base_phantom_at_become_leader` (the Finding #3
    crash-rewin sequence), `crash_rewin_collapses_multi_phantom_chain`,
    `become_leader_keeps_predecessor_when_durable_advanced` (normal-path
@@ -206,7 +206,7 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    layer (Finding #4, the data-plane one, lives in the Phase-2 spike memo):
    the reconciliation intake gate — THE load-bearing guard tying a term-T
    AppendPosition report to a tail reconciled against the T-leader — did
-   not survive a reboot. `uc2_node` booted the gate OPEN (`node.rs`
+   not survive a reboot. `uc_node` booted the gate OPEN (`node.rs`
    intake-gate init: `AtomicBool::new(true)`) with `awaiting_reconcile:
    false`, while `ElectionSm::new` recovers `current_term =
    vote_term.max(map_term)` — so a voter that GRANTED term T (vote
@@ -223,9 +223,9 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    Rust-as-shipped), then adversarially line-verified against every cited
    Rust site.
 
-   **Disposition: FIXED (TDD, RED-first).** (a) A directed `uc2_sim`
+   **Disposition: FIXED (TDD, RED-first).** (a) A directed `uc_sim`
    scenario, `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
-   (`uc2_sim/tests/scenarios.rs`), stages the exact trace — divergent
+   (`uc_sim/tests/scenarios.rs`), stages the exact trace — divergent
    term-1 ex-leader grants term T, crashes at the grant, reboots, its
    report floor races the map — and the **inv7 phantom oracle flagged it
    RED pre-fix** (`quorum legality (inv7): phantom commit — no genuine
@@ -250,12 +250,12 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    `DataTermObserved` / `become_leader`; a gossip-only adoption reboots at
    the old term and its stale reports are dropped). The sim's
    `on_restart` mirrors the same predicate so the sim keeps modeling
-   `uc2_node` boot. (c) Model amendment (`Uc2Proofs/ProtocolCommit.lean`):
+   `uc_node` boot. (c) Model amendment (`Uc2Proofs/ProtocolCommit.lean`):
    `crashRestart` now sets `reconciled := decide (currentTerm ≤ lastTermOf
    termMap)`; the finding theorem became unprovable and was deleted in the
    same commit (`lake build` green, 3026 jobs, sorry gate clean, axioms
-   unchanged). Gates re-run green: uc2_sim (23 scenarios incl. the pin +
-   both storm arms), uc2_consensus both configs, uc2_node lib, workspace
+   unchanged). Gates re-run green: uc_sim (23 scenarios incl. the pin +
+   both storm arms), uc_consensus both configs, uc_node lib, workspace
    clippy, `lin_v2` release capstone.
 
 5. **Finding #6b — CONFIRMED REAL v2.x DATA-LOSS BUG (Raft §5.4.2 /
@@ -285,7 +285,7 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    with the fix).
 
    **Disposition: FIXED (TDD, RED-first), no new state.** (a) Directed
-   `uc2_sim` scenario `old_term_range_must_not_commit_before_new_term_quorum`
+   `uc_sim` scenario `old_term_range_must_not_commit_before_new_term_quorum`
    (5 nodes, `Mechanism` data plane, seed 3): term-1 leader + one caught-up
    follower grow an uncommitted tail; a rival wins term t2 on the other
    trio and is isolated holding only its divergent `(t2, base)` NewTerm
@@ -303,7 +303,7 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    (inv5) or truncation (inv4) event can occur; inv2 is the EARLIEST
    existing oracle for the class (no oracle was added or weakened), and the
    t4 loss continuation is pinned by the Lean countermodel instead.
-   (b) The Rust fix (`uc2_consensus/src/election.rs::rank_leader`): the
+   (b) The Rust fix (`uc_consensus/src/election.rs::rank_leader`): the
    advance/store/gossip block is clamped to `ranked ≥ new_term_pos`;
    `new_term_pos == None` (between `become_leader` and `NewTermAppended`)
    means NO advance; a suppressed advance does not update `commit_seen`
@@ -327,8 +327,8 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    inherited-tail commit — the same round the read path already paid via
    `serving`; verified by the scenario's resumed-commit assert and the
    full suites (incl. both release lincheck capstones).
-   (e) Sim mirror: none needed — `uc2_sim` drives the REAL
-   `ElectionSm::rank_leader` (`world.rs` wires `uc2_consensus` directly),
+   (e) Sim mirror: none needed — `uc_sim` drives the REAL
+   `ElectionSm::rank_leader` (`world.rs` wires `uc_consensus` directly),
    so the clamp is automatically reflected; the only sim-side artifact is
    the scenario itself.
 
@@ -386,7 +386,7 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    `lc_core_commit_term_keyed_is_false`, kept in
    `Uc2Proofs/LeaderCompleteness.lean` — they refute the unconditional
    `leader_completeness` statement, which stays refuted regardless of any
-   conditional route). Rust evidence: `uc2_net/src/receiver.rs:636-639`
+   conditional route). Rust evidence: `uc_net/src/receiver.rs:636-639`
    (`if h.leadership_term_id != term { dropped_stale_term; return; }`) —
    exact header-match, not `≤`; real replication re-serves old-stamped
    bytes during catch-up/NAK-repair strictly inside the CURRENT leader's
@@ -419,7 +419,7 @@ because it invalidates a load-bearing lemma.** In the Rust node the shared
 
 - the **receiver** agent reads it directly and reports it to the leader, which
   ranks those reports into `commit`
-  (`uc2_net/src/receiver.rs`, the `DGRAM_KIND_APPEND_POSITION` send);
+  (`uc_net/src/receiver.rs`, the `DGRAM_KIND_APPEND_POSITION` send);
 - the **consensus** agent polls it a duty cycle later into `ElectionSm::durable`
   (`node.rs`, `Consensus::do_work`), which is what `log_ok` compares, what
   `start_election` advertises, and what `become_leader` uses as `base`.
@@ -458,7 +458,7 @@ gossip-driven reconcile truncation, which `Era`-conditioning repairs — the Rus
 hazard needs no truncation, no gossip and no term change on the voter, so
 `Era`-conditioning does not exclude it.
 
-**`uc2_sim` was blind to it too** (mirror-image reason), and **that half is now
+**`uc_sim` was blind to it too** (mirror-image reason), and **that half is now
 CLOSED.** `world.rs` used to advance the node's durable and feed
 `Event::DurableAdvanced` as consecutive statements in one `ArchiveStep` handler,
 with the commit report derived from the same value — and `SimEvent` had no
@@ -652,7 +652,7 @@ restore-from-`main`.
 fallback to conformance-only linkage per the spec §6 exit clause.** Outcome
 of the time-boxed attempt (full record: the T15 task report):
 
-- **The hard half is proven feasible.** Charon processed `uc2_consensus`
+- **The hard half is proven feasible.** Charon processed `uc_consensus`
   cleanly (`--start-from crate::reconcile::reconcile`; the 3.2k-line
   `election.rs` was no obstacle) and produced LLBC for `reconcile` — the
   translation path the spec worried about (iterator chains, crate size)

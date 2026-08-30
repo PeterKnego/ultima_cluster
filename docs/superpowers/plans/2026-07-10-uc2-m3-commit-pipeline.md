@@ -4,9 +4,9 @@
 
 **Goal:** The static-leader commit pipeline (spec §6 steady state): followers report durable positions, the leader ranks the quorum and advances a commit counter, gossips it back — **the project's go/no-go gate: ≥400k committed/s, p50 ≤1ms, fsync on, 3 nodes (spec §9 M3 row)** — before elections or SDK exist.
 
-**Architecture:** Control rides the existing M2 socket as two new header-only datagram kinds (AppendPosition, CommitPosition). Commit ranking is a pure, allocation-free `CommitTracker` in a new `uc2_consensus` crate (the M4 election SM grows around it); the leader's sender agent drives it each duty cycle (single writer of the leader's `commit` counter), the follower's receiver stores gossiped commit (single writer of the follower's). Admission control becomes a position window against `commit` (spec §7), closing M2's fleet-pacing wedge. Plus the M2 final review's hardening wave.
+**Architecture:** Control rides the existing M2 socket as two new header-only datagram kinds (AppendPosition, CommitPosition). Commit ranking is a pure, allocation-free `CommitTracker` in a new `uc_consensus` crate (the M4 election SM grows around it); the leader's sender agent drives it each duty cycle (single writer of the leader's `commit` counter), the follower's receiver stores gossiped commit (single writer of the follower's). Admission control becomes a position window against `commit` (spec §7), closing M2's fleet-pacing wedge. Plus the M2 final review's hardening wave.
 
-**Tech Stack:** Rust 2024, existing `uc2_net`/`uc2_log`/`uc_protocol::v2` (M2, all committed and green), new dep-free `uc2_consensus` crate.
+**Tech Stack:** Rust 2024, existing `uc_net`/`uc_log`/`uc_protocol::v2` (M2, all committed and green), new dep-free `uc_consensus` crate.
 
 ## Global Constraints
 
@@ -21,7 +21,7 @@ Every task's requirements implicitly include all of these (M1/M2 plan constraint
 - **Frame/datagram layouts are frozen** (M1/M2): kinds 5–8 were reserved in `uc_protocol::v2::datagram`; M3 promotes 5 and 6 with pinned tests. Kinds 7–8 (RequestVote/Vote) stay reserved for M4.
 - **The TSO adjudication (carried from M1, resolved here as documentation):** the seqlock overwrite-race in `read_frame_validated`/`read_run_validated` (plain copy, acquire fence, re-check) is sound on TSO (x86) and formally racy under the C++ model — like every mmap-ring design including Aeron (M1 review record). A faithful loom model of it would *correctly fail* under loom's full C++ semantics, so the M2-final-review carry "loom model for read_run_validated" is delivered as a pinned doc note in `loom_frame.rs`, NOT as a test.
 - `Durability::Consistent` everywhere; test journals 4 MiB segments (`test_cfg`); test data small (quota'd tmpfs tempdirs). Gate/example runs put journal dirs on ext4 under `/home/claude`, NEVER `/tmp`; `UC2_M3_MAX_BYTES` caps bounded runs. Drain-inclusive gate accounting (ONE wall clock around load + drain — the M1 accounting lesson).
-- SPDX headers (`Apache-2.0`, `Copyright 2026 Peter Knego`) on new files. `cargo clippy --workspace -- -D warnings` after every task; additionally `cargo clippy -p uc2_net --all-targets -- -D warnings` must be clean from Task 1 on. `cargo fmt --check` fails workspace-wide pre-existing — do NOT reformat out-of-scope files.
+- SPDX headers (`Apache-2.0`, `Copyright 2026 Peter Knego`) on new files. `cargo clippy --workspace -- -D warnings` after every task; additionally `cargo clippy -p uc_net --all-targets -- -D warnings` must be clean from Task 1 on. `cargo fmt --check` fails workspace-wide pre-existing — do NOT reformat out-of-scope files.
 - Implementers stage ONLY their own task's files (never `git add -A`).
 
 **Non-goals (M3):** elections/votes/term changes (M4 — kinds 7–8 stay reserved); replay sessions (M4 — the `overruns` seam stands; a live follower >1 ring behind remains NAK-unrecoverable, documented M2 envelope); apply path/SDK/cnc mmap (M5 — counters stay heap-side); persisting commit (M4/M5); learner/membership anything (M6).
@@ -33,12 +33,12 @@ Every task's requirements implicitly include all of these (M1/M2 plan constraint
 Everything the M2 final review triaged carry-to-M3, in one mechanical task: corrupt-header arithmetic guards, wire-position alignment, `NakConfig` invariant, sender NAK-queue cap, two doc fixes, the `--all-targets` clippy tidy, and the TSO/loom adjudication note.
 
 **Files:**
-- Modify: `uc2_net/src/receiver.rs` (guards in `on_datagram`; let-chain tidy in its test module)
-- Modify: `uc2_net/src/rebuild.rs` (`NakTimer::new` assert)
-- Modify: `uc2_net/src/sender.rs` (NAK queue cap + `naks_dropped` stat)
-- Modify: `uc2_log/src/buffer.rs` (RunRead doc wording)
-- Modify: `uc2_log/src/writer.rs` (FRAME_ALIGNMENT constant in the debug_assert)
-- Modify: `uc2_log/tests/loom_frame.rs` (header doc: the TSO adjudication)
+- Modify: `uc_net/src/receiver.rs` (guards in `on_datagram`; let-chain tidy in its test module)
+- Modify: `uc_net/src/rebuild.rs` (`NakTimer::new` assert)
+- Modify: `uc_net/src/sender.rs` (NAK queue cap + `naks_dropped` stat)
+- Modify: `uc_log/src/buffer.rs` (RunRead doc wording)
+- Modify: `uc_log/src/writer.rs` (FRAME_ALIGNMENT constant in the debug_assert)
+- Modify: `uc_log/tests/loom_frame.rs` (header doc: the TSO adjudication)
 
 **Interfaces:**
 - Consumes: everything as committed at M2 merge (aa53d27).
@@ -46,7 +46,7 @@ Everything the M2 final review triaged carry-to-M3, in one mechanical task: corr
 
 - [ ] **Step 1: Write the failing tests (receiver guards)**
 
-Append to the `tests` module in `uc2_net/src/receiver.rs` (the module already has `FakeLeader`, `follower`, `frame_runs`, `drive_until` helpers — reuse them):
+Append to the `tests` module in `uc_net/src/receiver.rs` (the module already has `FakeLeader`, `follower`, `frame_runs`, `drive_until` helpers — reuse them):
 
 ```rust
     #[test]
@@ -91,12 +91,12 @@ Append to the `tests` module in `uc2_net/src/receiver.rs` (the module already ha
 
 - [ ] **Step 2: Run — expect failure**
 
-Run: `cargo test -p uc2_net misaligned_wire position_overflow`
+Run: `cargo test -p uc_net misaligned_wire position_overflow`
 Expected: FAIL — the misaligned test trips `write_run`'s `debug_assert_eq!(position % 32, 0)` (a panic, not a drop) in debug builds; the overflow test wraps `h.position + advance` and the tiny sum passes the guard, so `dropped_malformed` never reaches 1 (deadline panic).
 
 - [ ] **Step 3: Implement the receiver guards**
 
-In `uc2_net/src/receiver.rs`, `on_datagram`'s `DGRAM_KIND_DATA` arm, immediately after the `h.position < contiguous` dup check and before `walk_advance`:
+In `uc_net/src/receiver.rs`, `on_datagram`'s `DGRAM_KIND_DATA` arm, immediately after the `h.position < contiguous` dup check and before `walk_advance`:
 
 ```rust
                 // Corrupt-header hardening (M2 final review): the wire has no
@@ -128,7 +128,7 @@ and replace the overrun-guard block's arithmetic (keep its existing comment):
 
 - [ ] **Step 4: NakConfig invariant + failing test**
 
-In `uc2_net/src/rebuild.rs`, add to the tests module:
+In `uc_net/src/rebuild.rs`, add to the tests module:
 
 ```rust
     #[test]
@@ -139,7 +139,7 @@ In `uc2_net/src/rebuild.rs`, add to the tests module:
     }
 ```
 
-Run `cargo test -p uc2_net nak_config_min` — FAIL (no panic; the underflow only bites later in `delay()`). Then implement in `NakTimer::new`:
+Run `cargo test -p uc_net nak_config_min` — FAIL (no panic; the underflow only bites later in `delay()`). Then implement in `NakTimer::new`:
 
 ```rust
     pub fn new(cfg: NakConfig, seed: u64) -> Self {
@@ -153,7 +153,7 @@ Run `cargo test -p uc2_net nak_config_min` — FAIL (no panic; the underflow onl
 
 - [ ] **Step 5: Sender NAK-queue cap + failing test**
 
-Append to `uc2_net/src/sender.rs` tests:
+Append to `uc_net/src/sender.rs` tests:
 
 ```rust
     #[test]
@@ -184,7 +184,7 @@ Append to `uc2_net/src/sender.rs` tests:
     }
 ```
 
-Run `cargo test -p uc2_net nak_queue_is_capped` — FAIL (`NAK_QUEUE_MAX`/`naks_dropped` undefined). Implement in `sender.rs`:
+Run `cargo test -p uc_net nak_queue_is_capped` — FAIL (`NAK_QUEUE_MAX`/`naks_dropped` undefined). Implement in `sender.rs`:
 
 ```rust
 /// Bound on queued NAK requests (M2 final review: a flooding/hostile
@@ -209,10 +209,10 @@ add `pub naks_dropped: AtomicU64,` to `SenderStats`, and replace the NAK push in
 
 - [ ] **Step 6: Doc fixes + clippy tidy + TSO note (no behavior)**
 
-1. `uc2_log/src/buffer.rs` — `RunRead.advance` doc: replace "(> `bytes` iff the run ends in a padding frame, which is copied header-only)" with "(≥ `bytes`; strictly greater when the run ends in a padding frame whose span exceeds its 32-byte header — a 32-byte padding span gives advance == bytes)".
-2. `uc2_log/src/writer.rs` — replace `debug_assert_eq!(position % 32, 0, "runs start at frame boundaries");` with `debug_assert_eq!(position % uc_protocol::v2::frame::FRAME_ALIGNMENT as u64, 0, "runs start at frame boundaries");`.
-3. `uc2_net/src/receiver.rs` test module — fix the four `clippy::collapsible_if` lints flagged under `--all-targets` (collapse to let-chains, matching `rebuild.rs`'s existing pattern). Verify with `cargo clippy -p uc2_net --all-targets -- -D warnings` (must be exit 0; do NOT chase pre-existing `--all-targets` lints in OTHER crates, e.g. ultima_journal's test-code `identity_op`s).
-4. `uc2_log/tests/loom_frame.rs` — append to the header doc comment (after the "Run:" line):
+1. `uc_log/src/buffer.rs` — `RunRead.advance` doc: replace "(> `bytes` iff the run ends in a padding frame, which is copied header-only)" with "(≥ `bytes`; strictly greater when the run ends in a padding frame whose span exceeds its 32-byte header — a 32-byte padding span gives advance == bytes)".
+2. `uc_log/src/writer.rs` — replace `debug_assert_eq!(position % 32, 0, "runs start at frame boundaries");` with `debug_assert_eq!(position % uc_protocol::v2::frame::FRAME_ALIGNMENT as u64, 0, "runs start at frame boundaries");`.
+3. `uc_net/src/receiver.rs` test module — fix the four `clippy::collapsible_if` lints flagged under `--all-targets` (collapse to let-chains, matching `rebuild.rs`'s existing pattern). Verify with `cargo clippy -p uc_net --all-targets -- -D warnings` (must be exit 0; do NOT chase pre-existing `--all-targets` lints in OTHER crates, e.g. uc_journal's test-code `identity_op`s).
+4. `uc_log/tests/loom_frame.rs` — append to the header doc comment (after the "Run:" line):
 
 ```rust
 //!
@@ -230,14 +230,14 @@ add `pub naks_dropped: AtomicU64,` to `SenderStats`, and replace the NAK push in
 
 - [ ] **Step 7: Run everything**
 
-Run: `cargo test -p uc2_net && cargo test -p uc2_log && cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_net --all-targets -- -D warnings && RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release`
-Expected: all green (uc2_net lib 32 = 28 + 4 new; replication 5; loom 2).
+Run: `cargo test -p uc_net && cargo test -p uc_log && cargo clippy --workspace -- -D warnings && cargo clippy -p uc_net --all-targets -- -D warnings && RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release`
+Expected: all green (uc_net lib 32 = 28 + 4 new; replication 5; loom 2).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add uc2_net/src/receiver.rs uc2_net/src/rebuild.rs uc2_net/src/sender.rs uc2_log/src/buffer.rs uc2_log/src/writer.rs uc2_log/tests/loom_frame.rs
-git commit -m "fix(uc2_net): M2 final-review hardening — corrupt-header guards, NakConfig assert, NAK-queue cap (review carry)"
+git add uc_net/src/receiver.rs uc_net/src/rebuild.rs uc_net/src/sender.rs uc_log/src/buffer.rs uc_log/src/writer.rs uc_log/tests/loom_frame.rs
+git commit -m "fix(uc_net): M2 final-review hardening — corrupt-header guards, NakConfig assert, NAK-queue cap (review carry)"
 ```
 
 ---
@@ -301,10 +301,10 @@ git commit -m "feat(uc_protocol): v2 AppendPosition/CommitPosition header-only c
 
 ---
 
-### Task 3: `uc2_log` — the `commit` counter
+### Task 3: `uc_log` — the `commit` counter
 
 **Files:**
-- Modify: `uc2_log/src/counters.rs`
+- Modify: `uc_log/src/counters.rs`
 
 **Interfaces:**
 - Consumes: M2's `LogCounters { append, durable, sent }`.
@@ -312,7 +312,7 @@ git commit -m "feat(uc_protocol): v2 AppendPosition/CommitPosition header-only c
 
 - [ ] **Step 1: Write the failing test**
 
-Update the existing `counters_start_at_zero_and_prime` test in `uc2_log/src/counters.rs` (it currently asserts `append`/`durable`/`sent`):
+Update the existing `counters_start_at_zero_and_prime` test in `uc_log/src/counters.rs` (it currently asserts `append`/`durable`/`sent`):
 
 ```rust
     #[test]
@@ -335,12 +335,12 @@ Update the existing `counters_start_at_zero_and_prime` test in `uc2_log/src/coun
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_log counters_start`
+Run: `cargo test -p uc_log counters_start`
 Expected: FAIL — no field `commit`.
 
 - [ ] **Step 3: Implement**
 
-In `uc2_log/src/counters.rs`, extend the struct (append the field LAST — the `#[repr(C)]` layout becomes the mmap'd cnc page in M5) and its doc:
+In `uc_log/src/counters.rs`, extend the struct (append the field LAST — the `#[repr(C)]` layout becomes the mmap'd cnc page in M5) and its doc:
 
 ```rust
 /// The M1+M2+M3 counter set. append: written only by the appender (leader) /
@@ -367,27 +367,27 @@ Update `new()` to initialize it. `prime()` is UNCHANGED (does not touch `commit`
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p uc2_log && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_log && cargo clippy --workspace -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_log/src/counters.rs
-git commit -m "feat(uc2_log): commit counter — quorum-fsync'd position, deliberately not primed"
+git add uc_log/src/counters.rs
+git commit -m "feat(uc_log): commit counter — quorum-fsync'd position, deliberately not primed"
 ```
 
 ---
 
-### Task 4: `uc2_consensus` crate — `CommitTracker`
+### Task 4: `uc_consensus` crate — `CommitTracker`
 
 The seed of the pure-sync consensus SM (spec §3.2): quorum commit ranking, no I/O, no clock, no allocation on the hot path. M4's election SM grows around it.
 
 **Files:**
-- Create: `uc2_consensus/Cargo.toml`
-- Create: `uc2_consensus/src/lib.rs`
-- Create: `uc2_consensus/src/commit.rs`
-- Modify: `Cargo.toml` (workspace `members`: add `"uc2_consensus"` after `"uc2_net"`)
+- Create: `uc_consensus/Cargo.toml`
+- Create: `uc_consensus/src/lib.rs`
+- Create: `uc_consensus/src/commit.rs`
+- Modify: `Cargo.toml` (workspace `members`: add `"uc_consensus"` after `"uc_net"`)
 
 **Interfaces:**
 - Consumes: nothing (dep-free).
@@ -399,11 +399,11 @@ The seed of the pure-sync consensus SM (spec §3.2): quorum commit ranking, no I
 
 - [ ] **Step 1: Create the crate**
 
-`uc2_consensus/Cargo.toml`:
+`uc_consensus/Cargo.toml`:
 
 ```toml
 [package]
-name = "uc2_consensus"
+name = "uc_consensus"
 description = "UC v2 pure-sync consensus state machine: quorum commit ranking (spec 2026-07-09 §6, M3); elections/truncation land in M4"
 edition.workspace = true
 version.workspace = true
@@ -413,7 +413,7 @@ authors.workspace = true
 [dependencies]
 ```
 
-`uc2_consensus/src/lib.rs`:
+`uc_consensus/src/lib.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -424,16 +424,16 @@ authors.workspace = true
 //! Pure and sync by construction: no I/O, no threads, no clock, no
 //! allocation on the hot path — the agent driving it does all I/O. The M4
 //! election SM (votes, terms, truncation) grows in this crate around this
-//! module, gated by the deterministic simulation (uc2_sim).
+//! module, gated by the deterministic simulation (uc_sim).
 
 pub mod commit;
 ```
 
-Add `"uc2_consensus"` to the workspace `members` array in the root `Cargo.toml` (after `"uc2_net"`).
+Add `"uc_consensus"` to the workspace `members` array in the root `Cargo.toml` (after `"uc_net"`).
 
 - [ ] **Step 2: Write the failing tests**
 
-Tests at the bottom of `uc2_consensus/src/commit.rs`:
+Tests at the bottom of `uc_consensus/src/commit.rs`:
 
 ```rust
 #[cfg(test)]
@@ -521,12 +521,12 @@ mod tests {
 
 - [ ] **Step 3: Run — expect compile failure**
 
-Run: `cargo test -p uc2_consensus`
+Run: `cargo test -p uc_consensus`
 Expected: FAIL — module/type not defined.
 
 - [ ] **Step 4: Implement**
 
-`uc2_consensus/src/commit.rs` above the tests:
+`uc_consensus/src/commit.rs` above the tests:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -545,7 +545,7 @@ Expected: FAIL — module/type not defined.
 //! report: conservative by construction — an untracked member can never help
 //! reach quorum, only a real report can.
 //!
-//! Pure and allocation-free after construction: the agent (uc2_net's sender
+//! Pure and allocation-free after construction: the agent (uc_net's sender
 //! duty cycle in M3) feeds reports in and stores the result out.
 
 pub struct CommitTracker {
@@ -611,14 +611,14 @@ impl CommitTracker {
 
 - [ ] **Step 5: Run**
 
-Run: `cargo test -p uc2_consensus && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_consensus && cargo clippy --workspace -- -D warnings`
 Expected: PASS (7 tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock uc2_consensus/Cargo.toml uc2_consensus/src/lib.rs uc2_consensus/src/commit.rs
-git commit -m "feat(uc2_consensus): crate seed — pure quorum CommitTracker (rank, bound-by-own, monotonic)"
+git add Cargo.toml Cargo.lock uc_consensus/Cargo.toml uc_consensus/src/lib.rs uc_consensus/src/commit.rs
+git commit -m "feat(uc_consensus): crate seed — pure quorum CommitTracker (rank, bound-by-own, monotonic)"
 ```
 
 ---
@@ -626,14 +626,14 @@ git commit -m "feat(uc2_consensus): crate seed — pure quorum CommitTracker (ra
 ### Task 5: leader side — AppendPosition demux, commit advance, CommitPosition gossip
 
 **Files:**
-- Modify: `uc2_net/src/sender.rs` (CtrlMsg variant; CommitTracker wiring; gossip; stats)
-- Modify: `uc2_net/src/receiver.rs` (LeaderReceiver: term check + kind-5 demux; signature change)
-- Modify: `uc2_net/Cargo.toml` (dep: `uc2_consensus = { path = "../uc2_consensus" }`)
-- Modify: `uc2_net/tests/replication.rs` (LeaderReceiver::new call site — one line)
-- Modify: `uc2_net/examples/m2_gate.rs` (LeaderReceiver::new call site — one line)
+- Modify: `uc_net/src/sender.rs` (CtrlMsg variant; CommitTracker wiring; gossip; stats)
+- Modify: `uc_net/src/receiver.rs` (LeaderReceiver: term check + kind-5 demux; signature change)
+- Modify: `uc_net/Cargo.toml` (dep: `uc_consensus = { path = "../uc_consensus" }`)
+- Modify: `uc_net/tests/replication.rs` (LeaderReceiver::new call site — one line)
+- Modify: `uc_net/examples/m2_gate.rs` (LeaderReceiver::new call site — one line)
 
 **Interfaces:**
-- Consumes: `uc2_consensus::commit::CommitTracker` (Task 4), `DGRAM_KIND_APPEND_POSITION`/`DGRAM_KIND_COMMIT_POSITION` (Task 2), `LogCounters.commit` (Task 3).
+- Consumes: `uc_consensus::commit::CommitTracker` (Task 4), `DGRAM_KIND_APPEND_POSITION`/`DGRAM_KIND_COMMIT_POSITION` (Task 2), `LogCounters.commit` (Task 3).
 - Produces (used by Tasks 6–8):
   - `CtrlMsg::AppendPos { from: SocketAddr, durable: u64 }` (new variant).
   - `LeaderReceiver::new(sock: UdpSocket, to_sender: mpsc::SyncSender<CtrlMsg>, term_id: u32) -> io::Result<Self>` (**signature change**: term added; all inbound control with a mismatched term is dropped and counted in the new `pub dropped_stale_term: u64`).
@@ -642,7 +642,7 @@ git commit -m "feat(uc2_consensus): crate seed — pure quorum CommitTracker (ra
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `uc2_net/src/sender.rs` tests (the `Fake` helper and `sender_to` already exist; `sender_to` disables heartbeats):
+Append to `uc_net/src/sender.rs` tests (the `Fake` helper and `sender_to` already exist; `sender_to` disables heartbeats):
 
 ```rust
     fn ctrl_ap(from: SocketAddr, durable: u64) -> CtrlMsg {
@@ -737,7 +737,7 @@ Append to `uc2_net/src/sender.rs` tests (the `Fake` helper and `sender_to` alrea
     }
 ```
 
-And append to `uc2_net/src/receiver.rs` tests (LeaderReceiver section — note the constructor gains `TERM`):
+And append to `uc_net/src/receiver.rs` tests (LeaderReceiver section — note the constructor gains `TERM`):
 
 ```rust
     #[test]
@@ -771,16 +771,16 @@ And append to `uc2_net/src/receiver.rs` tests (LeaderReceiver section — note t
 
 - [ ] **Step 2: Run — expect compile failures**
 
-Run: `cargo test -p uc2_net commit_advances unknown_source heartbeat_block leader_receiver_demuxes_append`
+Run: `cargo test -p uc_net commit_advances unknown_source heartbeat_block leader_receiver_demuxes_append`
 Expected: FAIL — variant/constant/field not defined; `LeaderReceiver::new` arity.
 
 - [ ] **Step 3: Implement the sender side**
 
-In `uc2_net/Cargo.toml` add `uc2_consensus = { path = "../uc2_consensus" }` to `[dependencies]`.
+In `uc_net/Cargo.toml` add `uc_consensus = { path = "../uc_consensus" }` to `[dependencies]`.
 
-In `uc2_net/src/sender.rs`:
+In `uc_net/src/sender.rs`:
 
-1. Extend the imports: add `DGRAM_KIND_COMMIT_POSITION` to the `uc_protocol::v2::datagram` list; add `use std::collections::HashMap;` and `use uc2_consensus::commit::CommitTracker;`.
+1. Extend the imports: add `DGRAM_KIND_COMMIT_POSITION` to the `uc_protocol::v2::datagram` list; add `use std::collections::HashMap;` and `use uc_consensus::commit::CommitTracker;`.
 2. Extend `CtrlMsg`:
 
 ```rust
@@ -859,7 +859,7 @@ initialized in `new()` (before the `Sender { .. }` literal):
 
 - [ ] **Step 4: Implement the leader-receiver side**
 
-In `uc2_net/src/receiver.rs`, change `LeaderReceiver`:
+In `uc_net/src/receiver.rs`, change `LeaderReceiver`:
 
 ```rust
 /// The leader-side inbound demux: NAK/status/AppendPosition → the sender's
@@ -914,21 +914,21 @@ and extend the kind match with the header-only demux (before the `_ => None` arm
 - [ ] **Step 5: Ripple the signature change**
 
 Exactly two call sites outside this file:
-- `uc2_net/tests/replication.rs` (`spawn_leader`): `LeaderReceiver::new(recv, tx, TERM).unwrap()`
-- `uc2_net/examples/m2_gate.rs` (`leader_node`): `LeaderReceiver::new(recv, tx, TERM).unwrap()`
+- `uc_net/tests/replication.rs` (`spawn_leader`): `LeaderReceiver::new(recv, tx, TERM).unwrap()`
+- `uc_net/examples/m2_gate.rs` (`leader_node`): `LeaderReceiver::new(recv, tx, TERM).unwrap()`
 
 Plus the pre-existing `leader_receiver_demuxes_control_to_sender_channel` test in receiver.rs itself.
 
 - [ ] **Step 6: Run everything**
 
-Run: `cargo test -p uc2_net && cargo test -p uc2_net --test replication && cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_net --all-targets -- -D warnings && cargo build -p uc2_net --release --example m2_gate`
+Run: `cargo test -p uc_net && cargo test -p uc_net --test replication && cargo clippy --workspace -- -D warnings && cargo clippy -p uc_net --all-targets -- -D warnings && cargo build -p uc_net --release --example m2_gate`
 Expected: all green (lib 36 = 32 + 4 new; replication 5 unchanged).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add uc2_net/Cargo.toml Cargo.lock uc2_net/src/sender.rs uc2_net/src/receiver.rs uc2_net/tests/replication.rs uc2_net/examples/m2_gate.rs
-git commit -m "feat(uc2_net): leader commit pipeline — AppendPosition demux, quorum ranking, CommitPosition gossip"
+git add uc_net/Cargo.toml Cargo.lock uc_net/src/sender.rs uc_net/src/receiver.rs uc_net/tests/replication.rs uc_net/examples/m2_gate.rs
+git commit -m "feat(uc_net): leader commit pipeline — AppendPosition demux, quorum ranking, CommitPosition gossip"
 ```
 
 ---
@@ -936,7 +936,7 @@ git commit -m "feat(uc2_net): leader commit pipeline — AppendPosition demux, q
 ### Task 6: follower side — AppendPosition emission + CommitPosition handling
 
 **Files:**
-- Modify: `uc2_net/src/receiver.rs` (`FollowerConfig`, `FollowerReceiver`, `FollowerStats`)
+- Modify: `uc_net/src/receiver.rs` (`FollowerConfig`, `FollowerReceiver`, `FollowerStats`)
 
 **Interfaces:**
 - Consumes: Task 2 kinds, Task 3 `commit` counter.
@@ -947,7 +947,7 @@ git commit -m "feat(uc2_net): leader commit pipeline — AppendPosition demux, q
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `uc2_net/src/receiver.rs` tests:
+Append to `uc_net/src/receiver.rs` tests:
 
 ```rust
     #[test]
@@ -1015,12 +1015,12 @@ Append to `uc2_net/src/receiver.rs` tests:
 
 - [ ] **Step 2: Run — expect compile failures**
 
-Run: `cargo test -p uc2_net durable_advance_emits commit_position_gossip`
+Run: `cargo test -p uc_net durable_advance_emits commit_position_gossip`
 Expected: FAIL — stats fields not defined.
 
 - [ ] **Step 3: Implement**
 
-In `uc2_net/src/receiver.rs`:
+In `uc_net/src/receiver.rs`:
 
 1. `FollowerConfig`: add `pub append_pos_floor_ns: u64,` and set `append_pos_floor_ns: 100_000_000,` in `new()`. In the test helper `follower()`, add `cfg.append_pos_floor_ns = u64::MAX;` next to the existing `status_floor_ns` line (tests assert advance-driven emission, not the floor).
 2. `FollowerStats`: add `pub append_positions_sent: AtomicU64,` and `pub commits_received: AtomicU64,`.
@@ -1085,14 +1085,14 @@ and change the status block to reuse this `durable` local instead of re-loading.
 
 - [ ] **Step 4: Run everything**
 
-Run: `cargo test -p uc2_net && cargo test -p uc2_net --test replication && cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_net --all-targets -- -D warnings`
+Run: `cargo test -p uc_net && cargo test -p uc_net --test replication && cargo clippy --workspace -- -D warnings && cargo clippy -p uc_net --all-targets -- -D warnings`
 Expected: all green (lib 38 = 36 + 2 new; replication 5 unchanged — the new AppendPosition traffic is inert there: M2's `spawn_leader` senders now rank/gossip too, which is harmless).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/src/receiver.rs
-git commit -m "feat(uc2_net): follower commit pipeline — AppendPosition emission + CommitPosition gossip intake"
+git add uc_net/src/receiver.rs
+git commit -m "feat(uc_net): follower commit pipeline — AppendPosition emission + CommitPosition gossip intake"
 ```
 
 ---
@@ -1100,9 +1100,9 @@ git commit -m "feat(uc2_net): follower commit pipeline — AppendPosition emissi
 ### Task 7: the 3-node commit harness — quorum semantics end to end
 
 **Files:**
-- Create: `uc2_net/tests/common/mod.rs` (harness helpers extracted verbatim from replication.rs)
-- Modify: `uc2_net/tests/replication.rs` (use the common module; five tests unchanged)
-- Create: `uc2_net/tests/commit.rs`
+- Create: `uc_net/tests/common/mod.rs` (harness helpers extracted verbatim from replication.rs)
+- Modify: `uc_net/tests/replication.rs` (use the common module; five tests unchanged)
+- Create: `uc_net/tests/commit.rs`
 
 **Interfaces:**
 - Consumes: everything above.
@@ -1110,23 +1110,23 @@ git commit -m "feat(uc2_net): follower commit pipeline — AppendPosition emissi
 
 - [ ] **Step 1: Extract the common harness (mechanical, no behavior change)**
 
-Create `uc2_net/tests/common/mod.rs` and MOVE these items verbatim from `uc2_net/tests/replication.rs`, making each `pub`: `TERM`, `CAP`, `MAX_PAYLOAD`, `test_cfg`, `buffer`, `Node` (+ its `stop`), `spawn_archive`, `Follower`, `spawn_follower`, `Leader`, `spawn_leader`, `load`, `await_pos`, `replayed`, `converge_and_compare`, plus the `use` lines they need. Top of the file:
+Create `uc_net/tests/common/mod.rs` and MOVE these items verbatim from `uc_net/tests/replication.rs`, making each `pub`: `TERM`, `CAP`, `MAX_PAYLOAD`, `test_cfg`, `buffer`, `Node` (+ its `stop`), `spawn_archive`, `Follower`, `spawn_follower`, `Leader`, `spawn_leader`, `load`, `await_pos`, `replayed`, `converge_and_compare`, plus the `use` lines they need. Top of the file:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Shared 3-node harness for uc2_net integration tests. Each test binary
+//! Shared 3-node harness for uc_net integration tests. Each test binary
 //! compiles this module separately, so items unused by one binary are
 //! expected — hence the file-level allow.
 #![allow(dead_code)]
 ```
 
-In `replication.rs`: add `mod common;` + `use common::*;` and delete the moved items; the five tests stay byte-identical. Run `cargo test -p uc2_net --test replication` — 5/5 green before proceeding.
+In `replication.rs`: add `mod common;` + `use common::*;` and delete the moved items; the five tests stay byte-identical. Run `cargo test -p uc_net --test replication` — 5/5 green before proceeding.
 
 - [ ] **Step 2: Write the commit tests**
 
-Full file `uc2_net/tests/commit.rs`:
+Full file `uc_net/tests/commit.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1145,7 +1145,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
-use uc2_net::fault::{FaultConfig, FaultSocket};
+use uc_net::fault::{FaultConfig, FaultSocket};
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DatagramHeader, write_datagram_header,
 };
@@ -1263,19 +1263,19 @@ Note the harness gives ghost reports their strongest shot: `end + (1 << 30)` exc
 
 - [ ] **Step 3: Run**
 
-Run: `cargo test -p uc2_net --test commit && cargo test -p uc2_net --test replication && cargo test -p uc2_net`
+Run: `cargo test -p uc_net --test commit && cargo test -p uc_net --test replication && cargo test -p uc_net`
 Expected: commit 4/4, replication 5/5, lib 38 — all green. Run the two integration binaries twice each (timing-sensitive; deadlines make regressions red, not hung).
 
 - [ ] **Step 4: Run workspace gates**
 
-Run: `cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_net --all-targets -- -D warnings`
+Run: `cargo clippy --workspace -- -D warnings && cargo clippy -p uc_net --all-targets -- -D warnings`
 Expected: clean.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/tests/common/mod.rs uc2_net/tests/replication.rs uc2_net/tests/commit.rs
-git commit -m "test(uc2_net): 3-node quorum commit harness — advance/minority/quorum-loss/forged-report"
+git add uc_net/tests/common/mod.rs uc_net/tests/replication.rs uc_net/tests/commit.rs
+git commit -m "test(uc_net): 3-node quorum commit harness — advance/minority/quorum-loss/forged-report"
 ```
 
 ---
@@ -1283,7 +1283,7 @@ git commit -m "test(uc2_net): 3-node quorum commit harness — advance/minority/
 ### Task 8: `m3_gate` — the go/no-go measurement + benchmark doc
 
 **Files:**
-- Create: `uc2_net/examples/m3_gate.rs`
+- Create: `uc_net/examples/m3_gate.rs`
 - Create: `docs/benchmarks/uc2-m3-gate-2026-07-10.md` (written from the runs' output)
 
 **Interfaces:**
@@ -1292,7 +1292,7 @@ git commit -m "test(uc2_net): 3-node quorum commit harness — advance/minority/
 
 - [ ] **Step 1: Write the example**
 
-`uc2_net/examples/m3_gate.rs`:
+`uc_net/examples/m3_gate.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1302,7 +1302,7 @@ git commit -m "test(uc2_net): 3-node quorum commit harness — advance/minority/
 //! committed/s, p50 <= 1 ms, fsync on, 3 nodes).
 //!
 //! Local (single host, loopback, all three nodes in-process):
-//!   cargo run -p uc2_net --release --example m3_gate -- local <journal_root> \
+//!   cargo run -p uc_net --release --example m3_gate -- local <journal_root> \
 //!       [secs=10] [payload=64] [admission_mib=4] [buffer_mib=256]
 //!
 //! Fleet (one process per host; start followers first):
@@ -1328,14 +1328,14 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use uc2_log::agent::{AgentRunner, IdleStrategy};
-use uc2_log::archive::{Archive, ArchiveConfig};
-use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::counters::LogCounters;
-use uc2_log::region::Region;
-use uc2_net::fault::FaultSocket;
-use uc2_net::receiver::{FollowerConfig, FollowerReceiver, FollowerStats, LeaderReceiver};
-use uc2_net::sender::{Sender, SenderConfig, SenderStats};
+use uc_log::agent::{AgentRunner, IdleStrategy};
+use uc_log::archive::{Archive, ArchiveConfig};
+use uc_log::buffer::{AppendError, Appender, LogBuffer};
+use uc_log::counters::LogCounters;
+use uc_log::region::Region;
+use uc_net::fault::FaultSocket;
+use uc_net::receiver::{FollowerConfig, FollowerReceiver, FollowerStats, LeaderReceiver};
+use uc_net::sender::{Sender, SenderConfig, SenderStats};
 
 const TERM: u32 = 1;
 const MAX_PAYLOAD: usize = 1024;
@@ -1639,9 +1639,9 @@ fn leader_role(args: &[String]) {
 
 Run:
 ```bash
-cargo build -p uc2_net --release --example m3_gate
+cargo build -p uc_net --release --example m3_gate
 df -h /home/claude   # before
-UC2_M3_MAX_BYTES=2000000000 cargo run -p uc2_net --release --example m3_gate -- \
+UC2_M3_MAX_BYTES=2000000000 cargo run -p uc_net --release --example m3_gate -- \
     local /home/claude/uc2-m3-gate 10 64 4 256
 ```
 Expected: per-second progress, final report with committed/s + p50/p99. On this 4-core sandbox a FAIL on either bar is the likely honest outcome (M2 precedent: 8 hot threads on 4 cores; and local ext4 fsync is ~ms-scale, which alone can sink p50) — report the numbers exactly as printed; do NOT tune the verdict. The correctness signals that MUST hold: `overruns 0`, commit drain completes, commit ≤ durable throughout.
@@ -1665,18 +1665,18 @@ Verify `df -h /home/claude` is back to baseline. NEVER leave gate journals behin
 
 Run:
 ```bash
-cargo test -p uc2_net && cargo test -p uc2_net --test replication && cargo test -p uc2_net --test commit
-cargo test -p uc2_log && cargo test -p uc_protocol && cargo test -p uc2_consensus
-cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_net --all-targets -- -D warnings
-cargo build -p uc2_net --release --example m3_gate
+cargo test -p uc_net && cargo test -p uc_net --test replication && cargo test -p uc_net --test commit
+cargo test -p uc_log && cargo test -p uc_protocol && cargo test -p uc_consensus
+cargo clippy --workspace -- -D warnings && cargo clippy -p uc_net --all-targets -- -D warnings
+cargo build -p uc_net --release --example m3_gate
 ```
 Expected: all green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_net/examples/m3_gate.rs docs/benchmarks/uc2-m3-gate-2026-07-10.md
-git commit -m "feat(uc2_net): m3_gate commit-pipeline example + sandbox loopback smoke run"
+git add uc_net/examples/m3_gate.rs docs/benchmarks/uc2-m3-gate-2026-07-10.md
+git commit -m "feat(uc_net): m3_gate commit-pipeline example + sandbox loopback smoke run"
 ```
 
 ---

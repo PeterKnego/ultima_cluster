@@ -59,7 +59,7 @@ read path.
 
 | Page | Need | Source |
 |---|---|---|
-| `uc2ctl.md` | look up a sub-command or a refusal code | `uc2ctl/src/main.rs` |
+| `uc2ctl.md` | look up a sub-command or a refusal code | `uc_ctl/src/main.rs` |
 | `instance-directory.md` | know what each file is and what must be durable | runbook §1 |
 | `cnc-page.md` | decode the control page | `uc_protocol::v2::cnc` |
 | `configuration.md` | look up a knob, default, or limit | `NodeConfig`; env switches |

@@ -3,12 +3,12 @@ name: ci
 # Fast correctness gate for PRs and pushes to main (~minutes, not the full
 # proof suite — that's nightly.yml):
 #   * clippy — the workspace lint gate (--all-targets, -D warnings), plus a
-#     second pass with uc2_service's non-default `ultima_db` feature so the
+#     second pass with uc_service's non-default `ultima_db` feature so the
 #     StoreStateMachine adapter (crates.io ultima-db) stays green — the
 #     default workspace build never compiles it.
-#   * tests — the whole workspace EXCEPT uc2_node's slow WGL capstones
+#   * tests — the whole workspace EXCEPT uc_node's slow WGL capstones
 #     (lin_v2 / lin_partition_v2 spin multi-node clusters of busy-polling
-#     agents for minutes; nightly runs them). uc2_node's fast integration
+#     agents for minutes; nightly runs them). uc_node's fast integration
 #     suites (smoke, failover, learner, purge_safety, query_barrier) DO run
 #     here — they're the election/truncation/reconstruction regression net,
 #     and (M12b) admin_auth / daemon_refusals, the admin authn+audit net.
@@ -46,19 +46,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (workspace, all targets)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy (uc2_service + ultima_db adapter)
-        run: cargo clippy -p uc2_service --features ultima_db --all-targets -- -D warnings
-      - name: Clippy (uc2_service + apply-profile)
-        run: cargo clippy -p uc2_service --features apply-profile --all-targets -- -D warnings
-      - name: Clippy (uc2_gateway + test-util)
-        run: cargo clippy -p uc2_gateway --features test-util --all-targets -- -D warnings
+      - name: Clippy (uc_service + ultima_db adapter)
+        run: cargo clippy -p uc_service --features ultima_db --all-targets -- -D warnings
+      - name: Clippy (uc_service + apply-profile)
+        run: cargo clippy -p uc_service --features apply-profile --all-targets -- -D warnings
+      - name: Clippy (uc_gateway + test-util)
+        run: cargo clippy -p uc_gateway --features test-util --all-targets -- -D warnings
       - name: Tests (workspace, minus slow capstones)
-        run: cargo test --workspace --exclude uc2_node
-      - name: Tests (uc2_service + ultima_db adapter)
-        run: cargo test -p uc2_service --features ultima_db
-      - name: Tests (uc2_node fast integration)
+        run: cargo test --workspace --exclude uc_node
+      - name: Tests (uc_service + ultima_db adapter)
+        run: cargo test -p uc_service --features ultima_db
+      - name: Tests (uc_node fast integration)
         run: >
-          cargo test -p uc2_node --lib
+          cargo test -p uc_node --lib
           --test smoke --test failover --test learner
           --test purge_safety --test query_barrier
           --test admin_auth --test daemon_refusals
@@ -71,7 +71,7 @@ jobs:
   # compile-clean and lint-clean, matching the pinned-stable `test` job's
   # bar. Clippy lints can differ across toolchain versions — where 1.89's
   # clippy flags something the pinned 1.96's doesn't (clippy::ptr_arg on
-  # uc2_node's deliberately-`Vec`-typed re-entrant queue param;
+  # uc_node's deliberately-`Vec`-typed re-entrant queue param;
   # clippy::unnecessary_cast on a cross-platform `libc::statvfs` field-width
   # normalization in uc2-node.rs), the code carries a targeted
   # `#[allow(..., reason = "...")]` rather than a portability-losing rewrite
@@ -89,7 +89,7 @@ jobs:
         id: msrv
         run: |
           MSRV=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name=="uc2_node") | .rust_version')
+            | jq -r '.packages[] | select(.name=="uc_node") | .rust_version')
           echo "MSRV resolved to $MSRV"
           echo "version=$MSRV" >> "$GITHUB_OUTPUT"
       - name: Install MSRV toolchain (${{ steps.msrv.outputs.version }})
@@ -122,7 +122,7 @@ jobs:
         with:
           command: check advisories licenses bans sources
           arguments: ""
-      # Second pass with every feature on, so e.g. uc2_service's non-default
+      # Second pass with every feature on, so e.g. uc_service's non-default
       # `ultima_db` adapter (crossbeam-utils, hashbrown, dashmap, ultima-db
       # itself) is actually in the resolved graph. Verified locally
       # (`cargo deny --all-features check`, M12c Task 1 fix round): those
@@ -159,7 +159,7 @@ jobs:
       # check). Pre-first-publish, NOTHING in this DAG is on crates.io yet,
       # so packaging each of the 12 crates in its OWN `cargo package`
       # invocation would fail forever for every non-leaf crate (this is not
-      # a temporary bootstrap gap: uc2_node's dev-dependency on uc2_service,
+      # a temporary bootstrap gap: uc_node's dev-dependency on uc_service,
       # for one example, is a genuine dev-only cycle no publish order can
       # fully avoid — see the `allow-wildcard-paths` note in deny.toml and
       # the per-crate "deliberately unversioned" Cargo.toml comments). Cargo
@@ -172,11 +172,11 @@ jobs:
       - name: cargo package (all 12 publishable crates)
         run: >
           cargo package --no-verify
-          -p ultima-journal -p uc_protocol -p uc2_crypto -p uc2_log
-          -p uc2_consensus -p uc2_net -p uc2_client -p uc2_node
-          -p uc2_service -p uc2_remote -p uc2_gateway -p uc2ctl
-      # The 4 leaves (no path dependencies of their own: ultima-journal,
-      # uc_protocol, uc2_remote, uc2_consensus) are the only crates that can
+          -p uc_journal -p uc_protocol -p uc_crypto -p uc_log
+          -p uc_consensus -p uc_net -p uc_client -p uc_node
+          -p uc_service -p uc_remote -p uc_gateway -p uc_ctl
+      # The 4 leaves (no path dependencies of their own: uc_journal,
+      # uc_protocol, uc_remote, uc_consensus) are the only crates that can
       # be `cargo publish --dry-run`'d before anything is actually on
       # crates.io — every other crate's path deps can't resolve from the
       # real registry yet. The real, sequential, manual publish order for a
@@ -184,7 +184,7 @@ jobs:
       # only smoke-tests that packaging itself still works.
       - name: cargo publish --dry-run (the 4 dependency-free leaves)
         run: |
-          cargo publish --dry-run -p ultima-journal
+          cargo publish --dry-run -p uc_journal
           cargo publish --dry-run -p uc_protocol
-          cargo publish --dry-run -p uc2_remote
-          cargo publish --dry-run -p uc2_consensus
+          cargo publish --dry-run -p uc_remote
+          cargo publish --dry-run -p uc_consensus

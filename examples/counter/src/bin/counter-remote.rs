@@ -7,7 +7,7 @@
 //! `counter-client` attaches to one node's instance directory over shared
 //! memory: it must run on a cluster host, and it must be pointed at the
 //! leader. This binary does the same three things (add, reset, read) from
-//! anywhere on the network, over `uc2_remote`'s framed TCP protocol, against
+//! anywhere on the network, over `uc_remote`'s framed TCP protocol, against
 //! whichever `uc2-gateway` answers first. The differences worth copying into
 //! your own remote client are all in `run` below:
 //!
@@ -21,7 +21,7 @@
 //!    encoding is the application's contract with *itself*: `counter-service`
 //!    decodes `counter::Command` with bincode-standard, so this encodes with
 //!    bincode-standard. `counter-client` does exactly the same thing — it just
-//!    has `uc2_client` do the calls for it.
+//!    has `uc_client` do the calls for it.
 //! 3. **One request, one resolution.** A ticket ends in the response or in a
 //!    named error; `RETRY`, `REDIRECT` and connection loss never reach the
 //!    caller. This binary waits with `Ticket::wait_timeout` rather than
@@ -37,7 +37,7 @@
 //! Note that the gateway used by the quickstart runs with
 //! `[session] envelope = false`, because `counter-service` runs a plain
 //! `CounterSm`. A service that wraps its state machine in
-//! `uc2_service::Sessioned` turns the envelope on and gets exactly-once
+//! `uc_service::Sessioned` turns the envelope on and gets exactly-once
 //! writes across a re-send — then `replayed=true` in this binary's output
 //! means "your write had already been applied; it was not applied twice".
 //!
@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use counter::{Applied, Command as CounterCommand, Query, QueryResponse};
-use uc2_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
+use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 
 #[derive(Parser)]
 #[command(name = "counter-remote", about = "Drives the counter cluster through a uc2-gateway")]
@@ -64,7 +64,7 @@ struct Args {
     /// Budget for the request, across re-sends and reconnects. Approximate:
     /// it is applied twice — once to the connect retry loop, once to the wait
     /// — so the worst case is ~2x this plus the one-second floor the wait
-    /// keeps, and `uc2_remote` itself enforces `request_timeout` only within
+    /// keeps, and `uc_remote` itself enforces `request_timeout` only within
     /// about a sweep interval plus a connect attempt.
     #[arg(long, default_value_t = 10)]
     timeout_secs: u64,
@@ -116,7 +116,7 @@ fn connect(args: &Args, deadline: Instant) -> Result<RemoteClient, Fail> {
         app_id: args.app_id.clone(),
         members: args.gateways.clone(),
         request_timeout: Duration::from_secs(args.timeout_secs),
-        // `CounterSm` is not wrapped in `uc2_service::Sessioned`, so nothing
+        // `CounterSm` is not wrapped in `uc_service::Sessioned`, so nothing
         // downstream can tell a re-send from a second command: re-sending an
         // `Add(5)` whose outcome is UNKNOWN would risk applying it twice. Say
         // "unknown" out loud instead — the honest answer for a state machine

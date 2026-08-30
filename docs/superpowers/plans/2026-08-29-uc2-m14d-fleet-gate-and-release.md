@@ -4,9 +4,9 @@
 
 **Goal:** Adjudicate M14 (multi-service) on a real fleet against the bars pre-committed in spec §15, and ship `2.8.0` with the writeup, the doc sweep and the security-posture refresh the release requires.
 
-**Architecture:** No new binary. `uc2_gateway/examples/m12_gate.rs` — the gate harness the M12 and M13 fleet drivers already launch as `systemd-run` units — grows a multi-FSM node config, a `SpinCountSm` slow FSM, fan-in submission, a windowed rate, a per-second timeline and a `check-fsms` divergence role. A new driver `bench-infra/scripts/m14_fleet_gate.py` reuses `m12_fleet_gate.py`'s ssh/unit/host helpers and `m13_hop_bench.py`'s pure-verdict + `--selftest` pattern. Rows are adjudicated by pure functions over recorded numbers; the exit code is the verdict. The release half is documentation and version work in the order `docs/how-to/cut-a-release.md` §1 prescribes.
+**Architecture:** No new binary. `uc_gateway/examples/m12_gate.rs` — the gate harness the M12 and M13 fleet drivers already launch as `systemd-run` units — grows a multi-FSM node config, a `SpinCountSm` slow FSM, fan-in submission, a windowed rate, a per-second timeline and a `check-fsms` divergence role. A new driver `bench-infra/scripts/m14_fleet_gate.py` reuses `m12_fleet_gate.py`'s ssh/unit/host helpers and `m13_hop_bench.py`'s pure-verdict + `--selftest` pattern. Rows are adjudicated by pure functions over recorded numbers; the exit code is the verdict. The release half is documentation and version work in the order `docs/how-to/cut-a-release.md` §1 prescribes.
 
-**Tech Stack:** Rust 1.96 (workspace), `clap`, `uc2_client::Engine`/`Client`, `uc2_service::{StateMachine, SnapshotStateMachine, Sessioned}`, Python 3 (stdlib only — the other drivers use nothing else), ssh + `systemd-run` on Ubuntu hosts, terraform + ansible (`bench-infra/`), `uc2ctl`.
+**Tech Stack:** Rust 1.96 (workspace), `clap`, `uc_client::Engine`/`Client`, `uc_service::{StateMachine, SnapshotStateMachine, Sessioned}`, Python 3 (stdlib only — the other drivers use nothing else), ssh + `systemd-run` on Ubuntu hosts, terraform + ansible (`bench-infra/`), `uc2ctl`.
 
 **Spec:** `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` **§15** (binding; §12's fleet-gate paragraph and §14.1's cut are amended by it). Read §15 in full before Task 1.
 
@@ -32,7 +32,7 @@
 | file | responsibility | task |
 |---|---|---|
 | `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` §15.2 | errata: the client runs on the leader host; 4 hosts | 0 |
-| `uc2_gateway/examples/m12_gate.rs` — `NodeArgs`, `node_config`, `services_from_flags` | node role: `--services`, `--fsm-lag`, `--purge-below-snapshot`, `--journal-segment-bytes`; stats line gains `snap_refusals` | 1 |
+| `uc_gateway/examples/m12_gate.rs` — `NodeArgs`, `node_config`, `services_from_flags` | node role: `--services`, `--fsm-lag`, `--purge-below-snapshot`, `--journal-segment-bytes`; stats line gains `snap_refusals` | 1 |
 | same file — `CountSm` snapshot impl, `SpinCountSm`, `ServiceArgs`, `run_service_role` | slow FSM + per-id attach + snapshot policy | 2 |
 | same file — `run_client_measurement`, `ClientDirectArgs`, `print_result_json`, `Role::CheckFsms`, `Arm::Fsms`, `boot_cluster2` | fan-in submit, windowed rate, timeline, divergence role, in-process two-FSM smoke | 3 |
 | `bench-infra/scripts/m14_fleet_gate.py` | the driver: bars, arms, verdicts, selftest, main | 4a–4d |
@@ -92,22 +92,22 @@ git commit -m "spec(m14): §15.2 errata — the direct Engine client is shmem-at
 ### Task 1: `m12_gate` node role — multi-FSM config, purge, refusal counters
 
 **Files:**
-- Modify: `uc2_gateway/examples/m12_gate.rs:152-168` (`NodeArgs`), `:402-432` (`node_config`), `:459-507` (`boot_cluster` call site), `:1196-1234` (`run_node_role`)
-- Test: `#[cfg(test)] mod tests` at the bottom of the same file, run with `cargo test -p uc2_gateway --example m12_gate`
+- Modify: `uc_gateway/examples/m12_gate.rs:152-168` (`NodeArgs`), `:402-432` (`node_config`), `:459-507` (`boot_cluster` call site), `:1196-1234` (`run_node_role`)
+- Test: `#[cfg(test)] mod tests` at the bottom of the same file, run with `cargo test -p uc_gateway --example m12_gate`
 
 **Interfaces:**
-- Consumes: `uc2_node::{ServicesConfig, FsmLag, PurgePolicy, DEFAULT_JOURNAL_SEGMENT_BYTES}`, `uc2_node::services::parse_fsm_lag(&str) -> Result<FsmLag, String>` (`uc2_node/src/services.rs:172`, module is `pub` at `lib.rs:48`), `ServicesConfig::from_ids(&[u8], Option<FsmLag>) -> Result<ServicesConfig, String>` (`services.rs`), `ServicesConfig::declared() -> u64`, `ServicesConfig::resolve_lag(u64) -> FsmLag`, `Node::snapshot_session_refusals() -> (u64, u64)` (`uc2_node/src/node.rs:1547`).
+- Consumes: `uc_node::{ServicesConfig, FsmLag, PurgePolicy, DEFAULT_JOURNAL_SEGMENT_BYTES}`, `uc_node::services::parse_fsm_lag(&str) -> Result<FsmLag, String>` (`uc_node/src/services.rs:172`, module is `pub` at `lib.rs:48`), `ServicesConfig::from_ids(&[u8], Option<FsmLag>) -> Result<ServicesConfig, String>` (`services.rs`), `ServicesConfig::declared() -> u64`, `ServicesConfig::resolve_lag(u64) -> FsmLag`, `Node::snapshot_session_refusals() -> (u64, u64)` (`uc_node/src/node.rs:1547`).
 - Produces: `fn services_from_flags(services: Option<&str>, fsm_lag: Option<&str>) -> anyhow::Result<ServicesConfig>`; `node_config(..)` gains three trailing parameters `services: ServicesConfig, purge: PurgePolicy, journal_segment_bytes: u64`; the node role's stats line becomes `m12_gate node {id} stats: reports_unattested={n} snap_refusals=({a},{b})`. Node CLI flags: `--services 0,1`, `--fsm-lag lockstep|<bytes-string>`, `--purge-below-snapshot`, `--journal-segment-bytes N`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the bottom of `uc2_gateway/examples/m12_gate.rs`:
+Append to the bottom of `uc_gateway/examples/m12_gate.rs`:
 
 ```rust
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uc2_node::FsmLag;
+    use uc_node::FsmLag;
 
     #[test]
     fn services_from_flags_absent_is_the_node_default() {
@@ -140,7 +140,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_gateway --example m12_gate -- services_from_flags 2>&1 | tail -5`
+Run: `cargo test -p uc_gateway --example m12_gate -- services_from_flags 2>&1 | tail -5`
 Expected: compile error `cannot find function services_from_flags`.
 
 - [ ] **Step 3: Add the flags, the helper, and thread them through**
@@ -163,7 +163,7 @@ In `NodeArgs` (after `admission_kib`):
     purge_below_snapshot: bool,
     /// M14d row f: journal segment size; small (16 KiB, M7's value) so purge
     /// actually drops prefixes inside a 60 s arm.
-    #[arg(long, default_value_t = uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES)]
+    #[arg(long, default_value_t = uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES)]
     journal_segment_bytes: u64,
 ```
 
@@ -181,7 +181,7 @@ fn services_from_flags(
     let lag = match fsm_lag {
         None => None,
         Some(raw) => Some(
-            uc2_node::services::parse_fsm_lag(raw.trim())
+            uc_node::services::parse_fsm_lag(raw.trim())
                 .map_err(|detail| anyhow::anyhow!("--fsm-lag {raw:?}: {detail}"))?,
         ),
     };
@@ -217,7 +217,7 @@ fn node_config(
     buffer_bytes: usize,
     admission_bytes: u64,
     services: ServicesConfig,
-    purge: uc2_node::PurgePolicy,
+    purge: uc_node::PurgePolicy,
     journal_segment_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
@@ -230,16 +230,16 @@ fn node_config(
 }
 ```
 
-Update the in-process call site in `boot_cluster` to pass `ServicesConfig::default(), uc2_node::PurgePolicy::Disabled, uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES`.
+Update the in-process call site in `boot_cluster` to pass `ServicesConfig::default(), uc_node::PurgePolicy::Disabled, uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES`.
 
 In `run_node_role`, build the config from the flags and extend the stats line:
 
 ```rust
     let services = services_from_flags(a.services.as_deref(), a.fsm_lag.as_deref())?;
     let purge = if a.purge_below_snapshot {
-        uc2_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 }
+        uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 }
     } else {
-        uc2_node::PurgePolicy::Disabled
+        uc_node::PurgePolicy::Disabled
     };
     let cfg = node_config(
         id, members, a.bind, a.instance_dir, &a.app_id, FLEET_BUFFER_BYTES,
@@ -264,25 +264,25 @@ In `run_node_role`, build the config from the flags and extend the stats line:
     }
 ```
 
-Add `use uc2_node::ServicesConfig;` to the imports (it is referenced unqualified above and in the tests).
+Add `use uc_node::ServicesConfig;` to the imports (it is referenced unqualified above and in the tests).
 
 - [ ] **Step 4: Run the tests and clippy**
 
-Run: `cargo test -p uc2_gateway --example m12_gate -- services_from_flags 2>&1 | tail -6`
+Run: `cargo test -p uc_gateway --example m12_gate -- services_from_flags 2>&1 | tail -6`
 Expected: `test result: ok. 3 passed`.
 
-Run: `cargo clippy -p uc2_gateway --all-targets -- -D warnings 2>&1 | tail -3`
+Run: `cargo clippy -p uc_gateway --all-targets -- -D warnings 2>&1 | tail -3`
 Expected: no warnings.
 
 - [ ] **Step 5: Smoke the in-process arm is unchanged**
 
-Run: `cargo run -p uc2_gateway --release --example m12_gate -- --arm direct --secs 3 2>&1 | grep -E 'RESULT|leader'`
+Run: `cargo run -p uc_gateway --release --example m12_gate -- --arm direct --secs 3 2>&1 | grep -E 'RESULT|leader'`
 Expected: a `leader elected` line and one `RESULT {"arm":"direct"...}` line (smoke, not a gate).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_gateway/examples/m12_gate.rs
+git add uc_gateway/examples/m12_gate.rs
 git commit -m "bench(m12_gate): node role takes --services/--fsm-lag/--purge-below-snapshot/--journal-segment-bytes; stats line prints snapshot_session_refusals (M14d T1)"
 ```
 
@@ -291,11 +291,11 @@ git commit -m "bench(m12_gate): node role takes --services/--fsm-lag/--purge-bel
 ### Task 2: `SpinCountSm`, snapshots for `CountSm`, per-id service attach
 
 **Files:**
-- Modify: `uc2_gateway/examples/m12_gate.rs:353-380` (`CountSm`), `:170-187` (`ServiceArgs`), `:1236-1277` (`run_service_role`), imports `:71-76`
+- Modify: `uc_gateway/examples/m12_gate.rs:353-380` (`CountSm`), `:170-187` (`ServiceArgs`), `:1236-1277` (`run_service_role`), imports `:71-76`
 - Test: the `#[cfg(test)] mod tests` from Task 1
 
 **Interfaces:**
-- Consumes: `uc2_service::{SnapshotStateMachine, SnapshotError, SnapshotPolicy}` (`uc2_service/src/config.rs:64` — `SnapshotPolicy { interval_bytes: u64 }`), `ServiceConfig::service_id(u8) -> Self` (`config.rs:44`), `ServiceConfig::snapshot_policy(SnapshotPolicy) -> Self` (`config.rs:38`), `Sessioned<S: SnapshotStateMachine>: SnapshotStateMachine` (`session.rs:274`). The trait shape is `m6_gate.rs:202-240`'s `RegSm` impl: `type SnapshotHandle = Vec<u8>; fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError>; fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError>; fn install_snapshot(&mut self, position: u64, src: &mut dyn Read) -> Result<u64, SnapshotError>` returning `Ok(position)`.
+- Consumes: `uc_service::{SnapshotStateMachine, SnapshotError, SnapshotPolicy}` (`uc_service/src/config.rs:64` — `SnapshotPolicy { interval_bytes: u64 }`), `ServiceConfig::service_id(u8) -> Self` (`config.rs:44`), `ServiceConfig::snapshot_policy(SnapshotPolicy) -> Self` (`config.rs:38`), `Sessioned<S: SnapshotStateMachine>: SnapshotStateMachine` (`session.rs:274`). The trait shape is `m6_gate.rs:202-240`'s `RegSm` impl: `type SnapshotHandle = Vec<u8>; fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError>; fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError>; fn install_snapshot(&mut self, position: u64, src: &mut dyn Read) -> Result<u64, SnapshotError>` returning `Ok(position)`.
 - Produces: `struct SpinCountSm { inner: CountSm, spin: u64 }` implementing `StateMachine` (same associated types as `CountSm`) and `SnapshotStateMachine`; `CountSm: SnapshotStateMachine`. Service CLI flags: `--service-id <u8>` (default 0), `--work-spin <u64>` (default 0 = plain `CountSm`), `--snapshot-interval-bytes <u64>` (default 0 = no snapshots).
 
 - [ ] **Step 1: Write the failing tests**
@@ -342,12 +342,12 @@ Add to `mod tests`:
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_gateway --example m12_gate -- spin_count count_sm_snapshot 2>&1 | tail -5`
+Run: `cargo test -p uc_gateway --example m12_gate -- spin_count count_sm_snapshot 2>&1 | tail -5`
 Expected: compile errors (`SpinCountSm` not found; `freeze` not found for `CountSm`).
 
 - [ ] **Step 3: Implement**
 
-Extend the `uc2_service` import to `{RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine, TAG_FRESH}`.
+Extend the `uc_service` import to `{RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine, TAG_FRESH}`.
 
 Below `impl StateMachine for CountSm`:
 
@@ -532,16 +532,16 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
 
 - [ ] **Step 4: Run the tests, clippy**
 
-Run: `cargo test -p uc2_gateway --example m12_gate 2>&1 | tail -6`
+Run: `cargo test -p uc_gateway --example m12_gate 2>&1 | tail -6`
 Expected: `test result: ok. 5 passed`.
 
-Run: `cargo clippy -p uc2_gateway --all-targets -- -D warnings 2>&1 | tail -3`
+Run: `cargo clippy -p uc_gateway --all-targets -- -D warnings 2>&1 | tail -3`
 Expected: clean. (If clippy flags `RawCountSm`'s snapshot-less path as unreachable, it is not — leave the match as written.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_gateway/examples/m12_gate.rs
+git add uc_gateway/examples/m12_gate.rs
 git commit -m "bench(m12_gate): SpinCountSm (the slow FSM, K prices apply and never reaches the response), CountSm snapshots, service --service-id/--work-spin/--snapshot-interval-bytes (M14d T2)"
 ```
 
@@ -550,11 +550,11 @@ git commit -m "bench(m12_gate): SpinCountSm (the slow FSM, K prices apply and ne
 ### Task 3: Client — fan-in, windowed rate, timeline, `check-fsms`, in-process two-FSM smoke
 
 **Files:**
-- Modify: `uc2_gateway/examples/m12_gate.rs:85-135` (`Cli`, `Arm`), `:136-150` (`Role`), `:210-228` (`ClientDirectArgs`), `:528-550` (`ClientStats`), `:588-609` (`run_direct_arm`), `:610-820` (`run_client_measurement`), `:1323-1397` (`print_result_json`, `run_client_direct_role`), `main`'s dispatch `:244-300`
+- Modify: `uc_gateway/examples/m12_gate.rs:85-135` (`Cli`, `Arm`), `:136-150` (`Role`), `:210-228` (`ClientDirectArgs`), `:528-550` (`ClientStats`), `:588-609` (`run_direct_arm`), `:610-820` (`run_client_measurement`), `:1323-1397` (`print_result_json`, `run_client_direct_role`), `main`'s dispatch `:244-300`
 - Test: `mod tests` + the in-process smoke arm
 
 **Interfaces:**
-- Consumes: `Engine` send half `try_submit_all(user_data, &[u8])` (`uc2_client/src/engine.rs:508`), `declared() -> u64` (`:473`), `Outcome::Responses(&[(u8, Bytes)])` (`:310`), `uc2_client::Client::connect(&Path, &str) -> Result<Client, ClientError>` (`client.rs:58`), `Client::declared() -> u64`, `Client::query_linearizable_on(id, &Q) -> Result<QR, _>` (`client.rs:157`), `Client::query_snapshot_on(id, &Q)` (`:148`).
+- Consumes: `Engine` send half `try_submit_all(user_data, &[u8])` (`uc_client/src/engine.rs:508`), `declared() -> u64` (`:473`), `Outcome::Responses(&[(u8, Bytes)])` (`:310`), `uc_client::Client::connect(&Path, &str) -> Result<Client, ClientError>` (`client.rs:58`), `Client::declared() -> u64`, `Client::query_linearizable_on(id, &Q) -> Result<QR, _>` (`client.rs:157`), `Client::query_snapshot_on(id, &Q)` (`:148`).
 - Produces: `run_client_measurement(instance_dir, app_id, secs, payload_len, inflight_cap, session_client_id, opts: &MeasureOpts) -> ClientStats` with `struct MeasureOpts { fan_in: bool, warmup_secs: u64, measure_secs: u64, timeline: bool }`; `ClientStats` gains `window_rps: f64, window_responses: u64, fan_in: bool`; the `RESULT` JSON gains `"window_rps"`, `"window_responses"`, `"fan_in"`, `"declared"`; per-second `TL {"sec":N,"unix_ms":M,"responses":R}` lines when `--timeline`; a new role `check-fsms --instance-dir D --app-id A --mode linearizable|snapshot [--expect N] [--expect-min N] [--settle-secs S]` printing `FSMS {"id":..,"count":..}` per id and one `FSMS-OK {"declared":mask,"count":N}` (exit 1 on divergence); a new in-process arm `--arm fsms`.
 
 - [ ] **Step 1: Write the failing test for the pure window arithmetic**
@@ -577,7 +577,7 @@ The windowed rate is computed by a small pure function so it can be unit-tested 
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_gateway --example m12_gate -- window_rate 2>&1 | tail -3`
+Run: `cargo test -p uc_gateway --example m12_gate -- window_rate 2>&1 | tail -3`
 Expected: `cannot find function window_rate`.
 
 - [ ] **Step 3: Implement the measurement changes**
@@ -689,7 +689,7 @@ enum CheckMode {
 /// least) what the client completed. Any mismatch is exit 1 — the row is a
 /// consensus/apply defect, not a rate.
 fn run_check_fsms_role(a: CheckFsmsArgs) -> anyhow::Result<()> {
-    let client = uc2_client::Client::connect(&a.instance_dir, &a.app_id)?;
+    let client = uc_client::Client::connect(&a.instance_dir, &a.app_id)?;
     let declared = client.declared();
     let ids: Vec<u8> = (0..8u8).filter(|i| declared & (1u64 << i) != 0).collect();
     anyhow::ensure!(!ids.is_empty(), "no FSM declared on {:?}", a.instance_dir);
@@ -760,7 +760,7 @@ fn boot_cluster2(
         let cfg = node_config(
             i as u32, members.clone(), addr, instance_dir.clone(), app_id,
             NODE_BUFFER_BYTES, DEFAULT_ADMISSION_BYTES, services,
-            uc2_node::PurgePolicy::Disabled, uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            uc_node::PurgePolicy::Disabled, uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let a = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id).service_id(0), CountSm::default())
@@ -801,22 +801,22 @@ In `main`, before the existing direct/gateway arms: `if cli.arm == Arm::Fsms { r
 
 - [ ] **Step 6: Run the tests, the smoke, clippy**
 
-Run: `cargo test -p uc2_gateway --example m12_gate 2>&1 | tail -4`
+Run: `cargo test -p uc_gateway --example m12_gate 2>&1 | tail -4`
 Expected: `test result: ok. 6 passed`.
 
-Run: `cargo run -p uc2_gateway --release --example m12_gate -- --arm fsms --secs 4 2>&1 | grep -E 'leader|RESULT|FSMS'`
+Run: `cargo run -p uc_gateway --release --example m12_gate -- --arm fsms --secs 4 2>&1 | grep -E 'leader|RESULT|FSMS'`
 Expected: one `RESULT {"arm":"fsms",...,"fan_in":true,"declared":3...}` line, two `FSMS {"id":..}` lines with equal counts, and `FSMS-OK`. Smoke, not a gate.
 
-Run: `cargo run -p uc2_gateway --release --example m12_gate -- --arm direct --secs 3 2>&1 | grep RESULT`
+Run: `cargo run -p uc_gateway --release --example m12_gate -- --arm direct --secs 3 2>&1 | grep RESULT`
 Expected: the pre-existing arm still prints its RESULT (with `"fan_in":false,"window_rps":0.0`).
 
-Run: `cargo clippy -p uc2_gateway --all-targets -- -D warnings 2>&1 | tail -3`
+Run: `cargo clippy -p uc_gateway --all-targets -- -D warnings 2>&1 | tail -3`
 Expected: clean.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add uc2_gateway/examples/m12_gate.rs
+git add uc_gateway/examples/m12_gate.rs
 git commit -m "bench(m12_gate): fan-in submit, steady-window rate, per-second timeline, check-fsms divergence role, in-process two-FSM smoke arm (M14d T3)"
 ```
 
@@ -1110,7 +1110,7 @@ def prepare_host_m14(host):
     m12.prepare_host(host, apply_profile=False)
     env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
     cmd = (f"{env} {m6.SshHost.CARGO} build --release --manifest-path {m6.SshHost.UC_SRC}/Cargo.toml "
-           f"-p uc2ctl && test -x {BUILT_CTL} && echo CTL-OK")
+           f"-p uc_ctl && test -x {BUILT_CTL} && echo CTL-OK")
     r = ssh(host, cmd, label="build-ctl")
     if "CTL-OK" not in (r.stdout or ""):
         raise RuntimeError(f"uc2ctl build on {host.public_ip}: {r.stderr or r.stdout}")
@@ -1620,7 +1620,7 @@ python3 bench-infra/scripts/m14_fleet_gate.py --fleet             # rows a–f; 
 python3 bench-infra/scripts/m14_fleet_gate.py --fleet --rows d --k <K>   # one row, with the recorded K
 ```
 
-Local smoke (never a gate): `cargo run -p uc2_gateway --release --example
+Local smoke (never a gate): `cargo run -p uc_gateway --release --example
 m12_gate -- --arm fsms --secs 4`.
 
 ## Dev box is not a bench
@@ -1714,13 +1714,13 @@ If any row FAILed, the subject says so and the Results section carries the diagn
 **Files:**
 - Create: `docs/notes/uc2-m14-multi-service-explained.md`
 
-**Interfaces:** none. Sources to read first: spec §1–§5, §7.3, §9, §14; `docs/reference/configuration.md` § `[services]`; `docs/how-to/upgrade-a-cluster.md` § "Wire change in 2.8.0"; `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the lockstep lesson); `uc2_node/src/services.rs` (the `FsmLag` doc comments); `uc2_service/src/apply.rs` (the lag barrier). Style: `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md` — a dated italic status line, then sections that explain the mechanism in plain language with the file:line that implements it.
+**Interfaces:** none. Sources to read first: spec §1–§5, §7.3, §9, §14; `docs/reference/configuration.md` § `[services]`; `docs/how-to/upgrade-a-cluster.md` § "Wire change in 2.8.0"; `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the lockstep lesson); `uc_node/src/services.rs` (the `FsmLag` doc comments); `uc_service/src/apply.rs` (the lag barrier). Style: `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md` — a dated italic status line, then sections that explain the mechanism in plain language with the file:line that implements it.
 
 - [ ] **Step 1: Write the explainer** with exactly these sections:
 
 1. `# One log, N state machines — how M14 multi-service works` + status line (`*Written 2026-08-29 for the 2.8.0 release. Coverage: see the gate doc's coverage statement; the two-FSM capstones are M14c2.*`).
 2. **Why N FSMs behind one log** — the problem (two applications wanting one consensus plane; the alternative of one log per app), what stays identical (one leader, one commit position, one journal), and what is new (per-service rings/dirs/slots, ids `0..8`, id 0 the default responder and the only one the remote path reaches — `docs/reference/limits.md`).
-3. **The lag barrier** — why "unbounded" is a silent death spiral (a lagging FSM's replay cost grows without bound — quote `services.rs`'s doc comment), `Bounded(bytes)` (`applied_a − applied_b ≤ bytes` for any pair) as a `next_batch` target cap in the apply loop, the default `buffer_bytes / 4`, what an operator sees (`uc2_service_lag_bytes{service}`, `lag_waits_total`, the `Uc2ServicePinnedAtLagBound` alert).
+3. **The lag barrier** — why "unbounded" is a silent death spiral (a lagging FSM's replay cost grows without bound — quote `services.rs`'s doc comment), `Bounded(bytes)` (`applied_a − applied_b ≤ bytes` for any pair) as a `next_batch` target cap in the apply loop, the default `buffer_bytes / 4`, what an operator sees (`uc_service_lag_bytes{service}`, `lag_waits_total`, the `Uc2ServicePinnedAtLagBound` alert).
 4. **Lockstep and what it costs** — no FSM starts frame k+1 until every FSM finished k; the N-way cross-core handshake (~1.6 µs/frame on the dev box, M14a); the 2026-08-27 lesson: a barrier wait must never sleep on a live sibling (18 k → 631 k frames/s) and why that generalises.
 5. **The quorum-gated report ceiling** — a node's durable report is capped by its own FSMs' progress plus the bound, so commit stalls iff a quorum's FSMs are stuck (M14a; sim inv10) — the liveness coupling this buys and its cost (one stalled FSM on a quorum of hosts is a cluster-scope stall — link the threat-model §5 line Task 11 adds).
 6. **Routing and fan-in** — `submit_to(id)`, `submit_all`, `query_*_on(id)`, `MSG_V2_BAD_SERVICE`, the client's fan-in buffer; what happens to a command when only one FSM answers.
@@ -1746,7 +1746,7 @@ git commit -m "docs(notes): uc2-m14-multi-service-explained — one log, N FSMs:
 ### Task 8: Version bump and the literal-string sweep
 
 **Files:**
-- Modify: `Cargo.toml:8` (`version = "2.7.0"` → `"2.8.0"`), `Cargo.toml:44`, `uc2_net/Cargo.toml:15-17`, `uc-lincheck/Cargo.toml:25`, `uc2_crypto/Cargo.toml:15`, `examples/uc2-crashtest/Cargo.toml:47-76`, `uc2_log/Cargo.toml:18`, `uc2_client/Cargo.toml:17-18` (every `version = "2.7.0"` pin — the list above is `grep -rn '2\.7\.0' --include=Cargo.toml .` on 2026-08-29; re-run it), `README.md:33,37,38`, `packaging/Dockerfile:22-38`, `packaging/compose.yml:15,18,40`, `docs/how-to/run-a-cluster.md:31,65,71,73`, `SECURITY.md` (supported line `2.7.x` → `2.8.x`, table rows).
+- Modify: `Cargo.toml:8` (`version = "2.7.0"` → `"2.8.0"`), `Cargo.toml:44`, `uc_net/Cargo.toml:15-17`, `uc_lincheck/Cargo.toml:25`, `uc_crypto/Cargo.toml:15`, `examples/uc_crashtest/Cargo.toml:47-76`, `uc_log/Cargo.toml:18`, `uc_client/Cargo.toml:17-18` (every `version = "2.7.0"` pin — the list above is `grep -rn '2\.7\.0' --include=Cargo.toml .` on 2026-08-29; re-run it), `README.md:33,37,38`, `packaging/Dockerfile:22-38`, `packaging/compose.yml:15,18,40`, `docs/how-to/run-a-cluster.md:31,65,71,73`, `SECURITY.md` (supported line `2.7.x` → `2.8.x`, table rows).
 
 **Interfaces:** none.
 
@@ -1755,7 +1755,7 @@ git commit -m "docs(notes): uc2-m14-multi-service-explained — one log, N FSMs:
 ```sh
 grep -rln '2\.7\.0' --include=Cargo.toml . | grep -v target | xargs sed -i 's/version = "2\.7\.0"/version = "2.8.0"/g'
 grep -rn '2\.7\.0' --include=Cargo.toml . | grep -v target      # → no output
-cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="uc2_node") | .version'   # → 2.8.0
+cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="uc_node") | .version'   # → 2.8.0
 cargo build --workspace 2>&1 | tail -2
 ```
 
@@ -1785,7 +1785,7 @@ Expected: package OK; clippy clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add -A Cargo.toml '*/Cargo.toml' examples/uc2-crashtest/Cargo.toml Cargo.lock README.md packaging/ docs/how-to/run-a-cluster.md SECURITY.md
+git add -A Cargo.toml '*/Cargo.toml' examples/uc_crashtest/Cargo.toml Cargo.lock README.md packaging/ docs/how-to/run-a-cluster.md SECURITY.md
 git commit -m "chore(release): 2.7.0 → 2.8.0 — workspace version, intra-workspace pins, packaging/docs literals, SECURITY.md supported line (M14d T8)"
 ```
 
@@ -1812,7 +1812,7 @@ one. Proof record, row by row: [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-2
 Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained.md).
 
 - **`[services]`: declare N state machines, bounded or lockstep**
-  (`uc2_node`, `uc2_service`): ids `0..8` (id 0 is the default responder and
+  (`uc_node`, `uc_service`): ids `0..8` (id 0 is the default responder and
   the only one the remote path reaches), each attaching with
   `ServiceConfig::service_id`, holding `service.<id>.lock`, and publishing
   its progress on the cnc page's per-service band. A lag policy keeps them
@@ -1822,20 +1822,20 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
   stalls only when a quorum's FSMs are stuck — never on one straggler. →
   [Configuration § `[services]`](docs/reference/configuration.md#services) ·
   [Limits](docs/reference/limits.md)
-- **Per-FSM routing and a client fan-in** (`uc2_client`, `uc_protocol`):
+- **Per-FSM routing and a client fan-in** (`uc_client`, `uc_protocol`):
   `submit_to(id)`, `submit_all` (one ticket, every FSM's answer),
   `query_snapshot_on` / `query_linearizable_on`; a query names its FSM on the
   wire and an undeclared id answers `BAD_SERVICE` instead of parking. →
   [How it works § routing and fan-in](docs/notes/uc2-m14-multi-service-explained.md#routing-and-fan-in) · [Read path](docs/reference/read-path.md)
 - **A snapshot session ships every FSM's artifact — wire `0.6.0`**
-  (`uc2_net`): `SNAP_BEGIN` now names the FSM, the sender's declared set and
+  (`uc_net`): `SNAP_BEGIN` now names the FSM, the sender's declared set and
   a layout byte; a joiner adopts the floor only once the whole set has
   landed, and refuses by name a `0.5.0` sender or a mismatched set rather
   than installing half a cluster. → [Upgrade: the 0.6.0 flag day](docs/how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060) ·
   [Wire protocol](docs/reference/wire-protocol.md)
-- **Per-FSM observability** (`uc2_node`, `uc2ctl`): `service="<id>"` twins of
-  the service families, `uc2_service_attached`, `uc2_service_lag_bytes`,
-  `uc2_service_lag_waits_total`, `uc2_services_declared`; two alerts
+- **Per-FSM observability** (`uc_node`, `uc2ctl`): `service="<id>"` twins of
+  the service families, `uc_service_attached`, `uc_service_lag_bytes`,
+  `uc_service_lag_waits_total`, `uc_services_declared`; two alerts
   (`Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`) proven to fire; a
   per-FSM table in `uc2ctl status`; `service_attached`/`service_detached`
   transition records. → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
@@ -1893,7 +1893,7 @@ git commit -m "docs(release): v2.8.0 writeup — RELEASES.md section + docs/rele
 
 - [ ] **Step 4: `CLAUDE.md`** — line 13: `2.7.0` (M13) → `2.8.0` (M14), "M1–M13" → "M1–M14"; add the table row `| M14 | v2.8.0 | multi-service: one log → N FSMs (bounded/lockstep lag, per-FSM routing + fan-in, 0.6.0 snapshot stream, per-FSM observability) | `uc2-m14-gate-2026-08-29` |`; replace lines 38–39 ("Next up: M14 … worktree") with "Next up: **M14c2** — the two-FSM capstones (`lin_v2 two_fsm`, `lin_partition_v2`, hard-crash, Elle) as a proof-only `2.8.1`; spec §15.1."; line 43: "Wire protocol is 0.5.0" → "Wire protocol is 0.6.0" and add "(`0.6.0` changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name, so a mixed cluster stalls a joiner rather than installing half a set)"; lines 182 and 351: "4 KiB" → "8 KiB (cnc 3.0: page 2 is the per-service slot band)"; the M13-mechanics bullet gains one M14 sibling: "**M14 mechanics worth knowing**: ≤ 8 FSMs, id 0 mandatory and remote-reachable; lag policy per node must match cluster-wide (checked on the snapshot path); one stalled FSM on a quorum of hosts stalls commit by design (report ceiling); `service.<id>.lock` per FSM." Also line 99's worktree mention: it names `worktree-uc2-multi-service` as long-lived — that worktree is gone (`git worktree list`); change the fmt-deferral sentence to name only `fix/remaining-flakes`.
 
-- [ ] **Step 5: `docs/VERIFICATION.md`** — header (lines 13–16): "current as of the M14d release pass (2026-08-29), which added the M14 coverage statement to §11; §7 as of M12d; the proof, simulation and capstone tiers as of the M8 gate (2026-07-29)". §11: replace the M14a bullet (653–656) with: "**Multi-service (M14) is covered by unit tests, in-process integration on one node and a 3-node cluster (`uc2_node/tests/services.rs`, `learner.rs`'s two-FSM join, `uc2_net/tests/snapshot_session.rs`'s two-artifact stream), the M14b sim scenario (inv10) and fuzz seeds for the 0.6.0 `SNAP_BEGIN` and the query split. It is NOT yet covered by any linearizability capstone, partition test, hard-crash scenario or Elle tier with two FSMs — those are M14c2, a proof-only `2.8.1` (spec §15.1). The M14 fleet gate (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`) measures rates, a kill and a join; it is not a substitute.**"
+- [ ] **Step 5: `docs/VERIFICATION.md`** — header (lines 13–16): "current as of the M14d release pass (2026-08-29), which added the M14 coverage statement to §11; §7 as of M12d; the proof, simulation and capstone tiers as of the M8 gate (2026-07-29)". §11: replace the M14a bullet (653–656) with: "**Multi-service (M14) is covered by unit tests, in-process integration on one node and a 3-node cluster (`uc_node/tests/services.rs`, `learner.rs`'s two-FSM join, `uc_net/tests/snapshot_session.rs`'s two-artifact stream), the M14b sim scenario (inv10) and fuzz seeds for the 0.6.0 `SNAP_BEGIN` and the query split. It is NOT yet covered by any linearizability capstone, partition test, hard-crash scenario or Elle tier with two FSMs — those are M14c2, a proof-only `2.8.1` (spec §15.1). The M14 fleet gate (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`) measures rates, a kill and a join; it is not a substitute.**"
 
 - [ ] **Step 6: Verify nothing stale remains**
 
@@ -1917,13 +1917,13 @@ git commit -m "docs: 2.8.0 sweep — limits/upgrade/README/CLAUDE.md project sta
 **Files:**
 - Modify: `docs/security/attack-surface.md` (the cnc row; a new row; the `SNAP_BEGIN` row), `docs/security/threat-model.md` §5, `docs/security/self-assessment.md` (§1 scope note, §2 F7, §4 item, §5 table, status line)
 
-**Interfaces:** facts verified 2026-08-29: `uc_protocol/src/v2/cnc.rs:266-284` (`CNC_OFF_SERVICE_SLOTS = 4096`, `CNC_MAX_SERVICES = 8`, page 8 KiB); `uc_protocol/src/v2/ipc.rs:89-95` (`split_query_payload`, `write_query_payload`), fuzzed via `fuzz/fuzz_targets/ring_mpsc_record.rs` since `5feae7c`; `uc2_gateway/src` has no `service_id` reference (remote path = FSM 0); `uc2_net/src/receiver.rs:1711` (declared-set check), `:1837` (`id < 64`), `sender.rs:1039`; `uc2_service/src/attach.rs:95` (`service.<id>.lock`); `a405e71` (the `SNAP_NAK` slot-pinning fix).
+**Interfaces:** facts verified 2026-08-29: `uc_protocol/src/v2/cnc.rs:266-284` (`CNC_OFF_SERVICE_SLOTS = 4096`, `CNC_MAX_SERVICES = 8`, page 8 KiB); `uc_protocol/src/v2/ipc.rs:89-95` (`split_query_payload`, `write_query_payload`), fuzzed via `fuzz/fuzz_targets/ring_mpsc_record.rs` since `5feae7c`; `uc_gateway/src` has no `service_id` reference (remote path = FSM 0); `uc_net/src/receiver.rs:1711` (declared-set check), `:1837` (`id < 64`), `sender.rs:1039`; `uc_service/src/attach.rs:95` (`service.<id>.lock`); `a405e71` (the `SNAP_NAK` slot-pinning fix).
 
 - [ ] **Step 1: `attack-surface.md`**
 
 cnc row: "4 KiB fixed layout, magic + version gate" → "8 KiB fixed layout since cnc `3.0` (2.8.0): page 1 as before, page 2 the `ServiceSlot[8]` band (`CNC_OFF_SERVICE_SLOTS = 4096`); magic + version gate; offsets pinned in two crates with assertion tests". New row after it:
 
-`| **Query payload split** (`service_id ++ query`, M14b) | `uc_protocol/src/v2/ipc.rs: split_query_payload` (reached from the node's query ring; `MSG_V2_BAD_SERVICE` answers an undeclared id) | a same-uid local client through the shmem query ring — **not** the gateway (`uc2_gateway` never sets an id; the remote path reaches FSM 0 only) | no (boundary D) | one leading byte; an empty payload is `None`, never a panic; an id ≥ 8 or undeclared is refused by name | `ring_mpsc_record` (seeds `10-query-with-id`, `11-query-empty`) | Boundary D is not a security boundary; the check catches mistakes. |`
+`| **Query payload split** (`service_id ++ query`, M14b) | `uc_protocol/src/v2/ipc.rs: split_query_payload` (reached from the node's query ring; `MSG_V2_BAD_SERVICE` answers an undeclared id) | a same-uid local client through the shmem query ring — **not** the gateway (`uc_gateway` never sets an id; the remote path reaches FSM 0 only) | no (boundary D) | one leading byte; an empty payload is `None`, never a panic; an id ≥ 8 or undeclared is refused by name | `ring_mpsc_record` (seeds `10-query-with-id`, `11-query-empty`) | Boundary D is not a security boundary; the check catches mistakes. |`
 
 `SNAP_BEGIN` row, Notes column: append "Since 0.6.0 a session carries one artifact per declared id, so a forged `SNAP_BEGIN` (crypto off) can populate **N** `snapshots/<id>/` directories on the joiner, not one; the id is bounded (`< 64`, and must be in the receiver's own declared set — `receiver.rs:1711`, `:1837`) so it selects among ≤ 8 fixed directories and never a path."
 
@@ -1952,7 +1952,7 @@ the slot, and intake I/O failures are retried and counted
 spoofing one with crypto off — the same reach as every SNAP kind.
 ```
 
-§4, new item 8: "**The multi-artifact snapshot intake state machine** (`uc2_net/src/receiver.rs`, M14c): adopt-on-complete across N artifacts, `.part` files, an abandoned intake's unlink, the declared-set and layout refusals, and the interaction with a concurrent second session from another peer. It is unit-tested and exercised by one two-FSM learner test; nobody outside the project has read it against interleaved or malformed sessions."
+§4, new item 8: "**The multi-artifact snapshot intake state machine** (`uc_net/src/receiver.rs`, M14c): adopt-on-complete across N artifacts, `.part` files, an abandoned intake's unlink, the declared-set and layout refusals, and the interaction with a concurrent second session from another peer. It is unit-tested and exercised by one two-FSM learner test; nobody outside the project has read it against interleaved or malformed sessions."
 
 §5 table, new row: `| **M14 multi-service** | unit + in-process integration + sim inv10 + fuzz seeds; **no two-FSM lincheck/partition/crash/Elle yet** (M14c2, `2.8.1`) — [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified) |`.
 
@@ -1977,7 +1977,7 @@ git commit -m "docs(security): 2.8.0 refresh — cnc 3.0 row, query-split row, N
 
 ```sh
 git status --short | wc -l                                   # → 0
-cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="uc2_node") | .version'   # → 2.8.0
+cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="uc_node") | .version'   # → 2.8.0
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -1
 cargo test --workspace 2>&1 | grep -E '^test result' | grep -v ' 0 failed' ; echo "(no line above = all suites 0 failed)"
 gh run list --workflow ci.yml --limit 1                       # green on HEAD
@@ -2017,4 +2017,4 @@ The crates.io publish is §6 of the same how-to and remains manual.
 
 **Placeholder scan:** none of the forbidden phrases; every code step carries code. T7's explainer lists section contents rather than prose — that is the deliverable's outline, and each section names its sources.
 
-**Type consistency:** `services_from_flags(Option<&str>, Option<&str>)` (T1) used with `.as_deref()` (T1); `node_config`'s new trailing triple used identically in T1's `run_node_role` and T3's `boot_cluster2`; `SpinCountSm::with_spin(u64)` (T2) used in T3; `MeasureOpts` fields match `ClientDirectArgs` flags (T3) and the driver's flags `--warmup-secs/--measure-secs/--fan-in/--timeline` (T4b); `check-fsms` flags `--mode/--expect/--expect-min` (T3) match `check_fsms` (T4b); the node stats regex `snap_refusals=(a,b)` (T4c `STATS_RE`) matches T1's `println!`; `STATUS_RE` (T4a) matches `uc2ctl/src/main.rs:551-557`'s `id=… attached=… epoch=… incarnation=… applied=… lag=… snapshot_pos=…` order ✓; `Verdict(row, passed, detail)` positional as in `m12_fleet_gate.py:453`.
+**Type consistency:** `services_from_flags(Option<&str>, Option<&str>)` (T1) used with `.as_deref()` (T1); `node_config`'s new trailing triple used identically in T1's `run_node_role` and T3's `boot_cluster2`; `SpinCountSm::with_spin(u64)` (T2) used in T3; `MeasureOpts` fields match `ClientDirectArgs` flags (T3) and the driver's flags `--warmup-secs/--measure-secs/--fan-in/--timeline` (T4b); `check-fsms` flags `--mode/--expect/--expect-min` (T3) match `check_fsms` (T4b); the node stats regex `snap_refusals=(a,b)` (T4c `STATS_RE`) matches T1's `println!`; `STATUS_RE` (T4a) matches `uc_ctl/src/main.rs:551-557`'s `id=… attached=… epoch=… incarnation=… applied=… lag=… snapshot_pos=…` order ✓; `Verdict(row, passed, detail)` positional as in `m12_fleet_gate.py:453`.

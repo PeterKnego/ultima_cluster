@@ -1,0 +1,32 @@
+[package]
+name = "uc_crypto"
+description = "UC v2 wire crypto: Noise IK handshake, group-key schedule, AEAD seal/open (spec 2026-07-28, M8)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+snow = { workspace = true }
+aes-gcm = { workspace = true }
+# Declared only to force `zeroize` on the `aes` copy `aes-gcm` already links,
+# so the AES round keys are scrubbed on drop (T5 review remedy). Not used
+# directly.
+aes = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

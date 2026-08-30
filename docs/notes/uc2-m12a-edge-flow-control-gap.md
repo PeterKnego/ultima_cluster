@@ -57,10 +57,10 @@ behind me, not this socket, is the scarce resource."
 
 ## What shipped
 
-- **Grant**: `uc2_gateway/src/edge.rs:848` —
+- **Grant**: `uc_gateway/src/edge.rs:848` —
   `HelloOk { credits: shared.cfg.per_conn_inflight, … }`. A config constant
   (default 256, `config.rs:123`), not a value computed from the window.
-- **Per-connection state only**: `uc2_gateway/src/conn.rs:51-95` holds
+- **Per-connection state only**: `uc_gateway/src/conn.rs:51-95` holds
   `credits`, `inflight`, `squeezed`, and a gate condvar — all per-`Conn`.
   `Shared` (`edge.rs:299-328`) has the connection table and stats and **no
   aggregate counter** of submits outstanding across connections.
@@ -69,7 +69,7 @@ behind me, not this socket, is the scarce resource."
   and doubles them back on every completion (`Conn::relax`, `conn.rs:337-360`,
   called at `edge.rs:1328`). Multiplicative both ways, per connection,
   uncoordinated.
-- **The shared arbiter**: `uc2_client::Engine`'s `SlotTable`
+- **The shared arbiter**: `uc_client::Engine`'s `SlotTable`
   (`engine.rs:273`, capacity `max_inflight`, default 4096). `SendHalf::send`
   (`engine.rs:290-319`) maps a full table **and** a full ingress ring to the
   same `Backpressure` variant (`engine.rs:313-316`, `:416`).
@@ -147,7 +147,7 @@ path, not the mechanism, and the churn has nothing to churn on. Wire
 protocol v1 already carries everything needed (`HELLO_OK{credits}`,
 `STATUS`, credits on `RESPONSE`) — the change is edge-internal.
 
-**As built** (`uc2_gateway/src/edge.rs`, `conn.rs`): `Shared` carries
+**As built** (`uc_gateway/src/edge.rs`, `conn.rs`): `Shared` carries
 `budget = max_inflight − max_inflight/8` and a `live` count;
 `grant_for(live, budget, per_conn)` is the share; `Conn::ceiling` is dynamic
 and `relax` climbs to it; under a `grant_lock`, a handshake counts itself in and

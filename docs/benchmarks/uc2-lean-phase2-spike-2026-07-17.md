@@ -22,7 +22,7 @@ Tier B (spec §7's remainder, and the pre-existing "1–3 months" placeholder in
 ## 1. Result
 
 **Election safety is proved**, sorry-free, over a nondeterministic N-node
-model of `uc2_consensus/src/election.rs`'s vote path:
+model of `uc_consensus/src/election.rs`'s vote path:
 
 ```lean
 theorem election_safety {n : Nat} (w : World n) (hw : Reachable w)
@@ -347,7 +347,7 @@ amortized. There is no version of (b) or (c) that skips (a).
   weeks of session time is needed elsewhere (memory records "leader leases,
   wire-crypto" as the standing next-priority alternatives) — that is a
   resourcing call for the user, not a technical one this memo can settle.
-- What the user should weigh either way: the sim (`uc2_sim` invariants,
+- What the user should weigh either way: the sim (`uc_sim` invariants,
   including inv4/inv5 directly), the elle consistency harness, and the WGL
   lincheck capstones **already cover** log-matching/leader-completeness/
   state-machine-safety *empirically*, under real fault injection, today.
@@ -449,7 +449,7 @@ re-appends a different payload under a `(position, term)` pair already
 shipped — `log_matching`'s conclusion (`vi = vj`) would be false at that
 position/term. The fix — `stamp ≤ currentTerm` on `deliverReplicate` — is a
 faithful, conservative model of two jointly-operating Rust mechanisms:
-`uc2_net/src/receiver.rs`'s intake drops a DATA datagram whose header term
+`uc_net/src/receiver.rs`'s intake drops a DATA datagram whose header term
 doesn't match the node's currently-adopted term (adoption itself happens only
 via consensus datagrams — vote grants, term-map gossip — never via DATA), and
 the `awaiting_reconcile` intake gate additionally forces reconcile-before-data
@@ -570,7 +570,7 @@ theorem's reach:
 `ProtocolData.lean`'s `deliverReplicate` docstring previously glossed the
 guard as "the header-term-adopt + reconcile-before-data intake gate," which
 reads as if a DATA datagram's header term itself triggers adoption. It does
-not — `uc2_net`'s receiver *drops* a DATA datagram whose header term doesn't
+not — `uc_net`'s receiver *drops* a DATA datagram whose header term doesn't
 match the adopted term; adoption comes only from consensus datagrams
 (vote grants, term-map gossip). The docstring now states the guard as the
 model's `≤` consequence of that drop-not-adopt behavior plus the
@@ -813,7 +813,7 @@ lands.
 
 **Finding #5 (FIXED — real shipped bug, safety-class, commit path).**
 `task-LB1-report.md`'s commit-certification layer surfaced this before any
-preservation proof was attempted: `uc2_node` booted the receiver intake gate
+preservation proof was attempted: `uc_node` booted the receiver intake gate
 OPEN (`node.rs`, `AtomicBool::new(true)`, was line 516) with
 `awaiting_reconcile: false` (`node.rs`, was line 801), while
 `ElectionSm::new` recovers `current_term = vote_term.max(map_term)`
@@ -826,7 +826,7 @@ term-map re-ship, and the same-term report fed the T-leader's
 actually hold. Machine-checked first as a 27-step kernel-decided
 countermodel (`finding_boot_gate_stale_report_lc_violation`, now deleted
 post-fix); `finding5-fix-report.md` records the RED-first directed
-`uc2_sim` scenario
+`uc_sim` scenario
 (`rebooted_unreconciled_voter_must_not_certify_phantom_commit`) that
 reproduced the same shape and turned GREEN post-fix. **Fix:** the boot gate
 now closes iff `vote_term > map_term` (`node.rs`, both the gate-init and
@@ -835,7 +835,7 @@ clean-reconcile / truncate-ack / `BecomeLeader` arms — no new machinery.
 
 **Finding #6b (FIXED — real shipped data-loss bug, Raft §5.4.2 / Figure-8
 class).** `task-LB2-report.md`'s first `leader_completeness` attempt
-surfaced this: `uc2_consensus/src/election.rs::rank_leader` pushed
+surfaced this: `uc_consensus/src/election.rs::rank_leader` pushed
 `Action::AdvanceCommit` off the positions-only `CommitTracker`
 UNCONDITIONALLY; `new_term_pos` gated reads/ingress/M7-propose via
 `serving`/`can_serve` but never the commit store itself. At any failover
@@ -848,7 +848,7 @@ countermodel `finding_fig8_old_term_commit_data_loss`, now deleted
 post-fix): a divergent higher-`lastTerm` rival wins the next term with a
 commit-quorum member's honest grant and truncates the committed byte
 cluster-wide — the committed entry ends with zero copies anywhere in the
-cluster. `finding6-fix-report.md`'s RED-first `uc2_sim` scenario
+cluster. `finding6-fix-report.md`'s RED-first `uc_sim` scenario
 (`old_term_range_must_not_commit_before_new_term_quorum`, 5 nodes) caught
 the same shape via the existing inv2 oracle (term-map prefix consistency —
 the review's inv4/inv5 prediction was structurally preempted by inv2 firing
@@ -896,13 +896,13 @@ construction rather than by hypothesis.
 
 **The meta-point, stated as this memo's own reading of the four reports
 together:** Findings #5 and #6b were invisible to the entire empirical
-stack (`uc2_sim`'s seeded fuzz, the elle consistency harness, the WGL
+stack (`uc_sim`'s seeded fuzz, the elle consistency harness, the WGL
 lincheck capstones) not because those oracles were poorly designed, but
 because of an **interleaving coverage gap** — both fix reports say this
 explicitly (`finding5-fix-report.md`'s "why nothing caught it before,"
 `finding6-fix-report.md`'s oracle-determination section): the existing sim
 oracles (inv7 for #5, inv2 for #6b) fire correctly and immediately the
-moment a directed scenario reaches the violating interleaving — `uc2_sim`
+moment a directed scenario reaches the violating interleaving — `uc_sim`
 just never reached it. `task-LB2-report.md` names the precise reason for
 #6b: same-disk kill-restart crashtests and 3-node elle scenarios cannot
 produce the divergent-rival, two-term-choreography shape the bug needs;
@@ -937,13 +937,13 @@ time alone** — before folding in the two Rust fix cycles at all.
 `finding6-fix-report.md` do not report a wall-clock total the way the four
 Lean-task reports do (grepped for "wall-clock"/"hour"/"minutes" — none
 present). Both cycles were real, substantial engineering effort by their
-own deliverable lists — RED-first directed `uc2_sim` scenario construction
+own deliverable lists — RED-first directed `uc_sim` scenario construction
 (one new sim fidelity mechanism for #5's 20ms report-floor mirror; a 5-node
 scripted-partition scenario for #6b), a Rust source fix, a `Uc2Proofs/
 ProtocolCommit.lean` model amendment plus finding-theorem deletion, a storm
 crash-rate re-tune with a multi-point ppm probe sweep for each, and a full
-cross-crate gate re-run (`uc2_sim`, `uc2_consensus` both feature configs,
-`uc2_node --lib`, workspace clippy, `lin_v2`, and for #6b also
+cross-crate gate re-run (`uc_sim`, `uc_consensus` both feature configs,
+`uc_node --lib`, workspace clippy, `lin_v2`, and for #6b also
 `lin_partition_v2`) — but this memo will not fabricate a number where the
 source record has none. The true total is **the measured ~18h05m of
 Lean-task time PLUS an unrecorded, additive amount for the two fix
@@ -1116,7 +1116,7 @@ hybrid-vs-full-refinement decision after Finding #7 itself):
    result of this sub-spike's proof pressure — permanent value, already
    banked, independent of whether the theorem itself is ever finished. Per
    §2 above, neither bug was an oracle-design gap the empirical stack
-   (`uc2_sim`/elle/lincheck) could have been tuned to catch without the
+   (`uc_sim`/elle/lincheck) could have been tuned to catch without the
    adversarial invariant-design process that found them; pausing does not
    retroactively lose that value. Cost: (c) stays permanently blocked and
    the arc's own `(a) → (b) → (c)` phased plan (original memo's §4 above)
@@ -1143,7 +1143,7 @@ and the user banked rather than spend the disproportionate remainder. Branch
 
 - **The Finding #7 model refinement** (LC1/LC1b): replicate frames carry a wire
   header term (provenance) distinct from the record stamp; delivery is exact-match
-  on a **lagging `dataTerm` handle** mirroring `uc2_net/src/receiver.rs`; the
+  on a **lagging `dataTerm` handle** mirroring `uc_net/src/receiver.rs`; the
   `serveTail` re-serve step models NAK-repair/journal-replay. `log_matching` and
   `election_safety` re-green under the amended model.
 - **`frames_current_authored` DISCHARGED** hypothesis-free (LC3) — the theorem

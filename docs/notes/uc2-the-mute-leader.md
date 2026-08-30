@@ -6,7 +6,7 @@ progress — and what the honest options are for fixing it. Companion to
 is about who may write log bytes, this one is about who may hold a key.*
 
 Status: mechanism **proven** by
-`uc2_crypto::group::tests::a_never_acking_peer_mutes_a_fresh_leader_for_the_activation_timeout`.
+`uc_crypto::group::tests::a_never_acking_peer_mutes_a_fresh_leader_for_the_activation_timeout`.
 Whether it fully explains the ~25 %/run failure of `sigkill_mid_config_window`
 is **not** established. No fix has been taken.
 
@@ -143,7 +143,7 @@ front of you.
 ## Reproducing
 
 ```bash
-UC2_CRYPTO=1 cargo test -p uc2-crashtest --features hard-crash-tests \
+UC2_CRYPTO=1 cargo test -p uc_crashtest --features hard-crash-tests \
     sigkill_mid_config_window
 ```
 

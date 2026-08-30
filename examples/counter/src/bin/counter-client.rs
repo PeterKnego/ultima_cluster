@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use counter::{Applied, Command, Query, QueryResponse};
-use uc2_client::{Client, ClientError};
+use uc_client::{Client, ClientError};
 
 #[derive(Parser)]
 #[command(about = "Submits commands and reads the counter")]

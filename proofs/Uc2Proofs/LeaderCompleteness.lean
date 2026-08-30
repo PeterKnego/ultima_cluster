@@ -566,7 +566,7 @@ Under the fix the countermodel's penultimate step (the candidate's clean
 reconcile setting `reconciled := true`) no longer holds — the subsequent
 `deliverReplicate`'s `hgate` is unprovable — so both finding theorems were
 DELETED (this section) in the same commit as the fix. Sim regression pin:
-`uc2_sim` `finding9_lagged_handle_candidate_reopen_needs_handle_keyed`
+`uc_sim` `finding9_lagged_handle_candidate_reopen_needs_handle_keyed`
 (RED under the `handle_keyed:false` counterfactual → GREEN under the fix).
 
 `frames_current_authored` itself is PROVEN on the repaired (handle-keyed

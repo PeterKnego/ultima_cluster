@@ -7,10 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `ultima_cluster` (UC) is a **Rust-native State Machine Replication
 application server**. This is **UC v2**; the v1 stack (an
 `openraft`-based design) is retired and its crates deleted — v2 owns
-consensus, elections, and transport directly. Do not reintroduce `openraft`,
-`quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client` crate names.
+consensus, elections, and transport directly. Do not reintroduce `openraft`
+or `quinn`/QUIC. The crate names `uc_node`/`uc_service`/`uc_client` were
+v1's and were banned for that reason; **that ban is lifted** — the v2 crates
+took those names in the `uc2_*` → `uc_*` rename (see `RELEASES.md`), so a
+pre-rename commit or doc naming them means the deleted v1 crate, not this
+code.
 
-**Current version: `2.8.1` (M14c2). Milestones M1–M14 are all complete**, each
+**Current version: `2.9.0` (the `uc_*` crate rename; M14c2 is the last
+feature milestone). Milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
 the honest-failure protocol). M14c2 is **proof-only**: no new feature, no wire
@@ -100,7 +105,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   the snapshot path); one stalled FSM on a quorum of hosts stalls commit by
   design (report ceiling); `service.<id>.lock` per FSM.
 - **12 publishable crates, versioned in lockstep** with the tag and the
-  image; `uc2_sim`, `uc-lincheck` and the example crates are
+  image; `uc_sim`, `uc_lincheck` and the example crates are
   `publish = false`. Publishing is manual and ordered
   (`docs/how-to/cut-a-release.md` §6); `deny.toml` + `cargo-deny` run in CI
   (one documented ignore: RUSTSEC-2025-0141, `bincode` unmaintained, no
@@ -111,7 +116,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   vulnerability reporting). The whole proof surface is mapped in
   `docs/VERIFICATION.md` — sim, lincheck/crashtest capstones, Elle, Lean
   proofs + conformance, loom (log-buffer frame visibility + the MPSC ring's
-  per-record commit), 15 fuzz targets, Miri (pure decoders + `uc2_remote`'s
+  per-record commit), 15 fuzz targets, Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is DEFERRED** (a one-shot reformat measures ~2 731 hunks)
   until the long-lived worktree (`fix/remaining-flakes`) lands; then run
@@ -131,7 +136,7 @@ Canonical documents, in order:
 3. `docs/ops/uc2-runbook.md` — operational runbook (instance-dir layout, cnc
    decode, purge enablement, live reconfiguration ops).
 4. Storage primitives: `../ultima_db/docs/tasks/task26_journal.md`
-   (`ultima_journal` log primitives) and `task27_snapshot_stream.md` (the
+   (`uc_journal` log primitives) and `task27_snapshot_stream.md` (the
    `ultima_db` snapshot wire format). The `ultima-db` *code* dependency comes
    from crates.io (the workspace builds standalone); the sibling checkout is
    only needed for its docs or lockstep local development
@@ -153,22 +158,22 @@ this.
 ```bash
 cargo build --workspace                          # build all workspace crates
 cargo test                                       # in-process integration + sim tests (default)
-cargo test -p uc2_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
-cargo test -p uc2_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
-cargo test -p uc2-crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable
-cargo test -p uc2_service --features ultima_db   # the (non-default) ultima-db store adapter — the default build never compiles it
+cargo test -p uc_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
+cargo test -p uc_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
+cargo test -p uc_crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable
+cargo test -p uc_service --features ultima_db   # the (non-default) ultima-db store adapter — the default build never compiles it
 cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with zero warnings)
-cargo run -p uc2_node --release --example m5_gate # throughput gate harness (see the gate doc)
-cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
-cargo run -p uc2_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
-cargo run -p uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
+cargo run -p uc_node --release --example m5_gate # throughput gate harness (see the gate doc)
+cargo run -p uc_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
+cargo run -p uc_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
+cargo run -p uc_ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
 scripts/fuzz_smoke.sh 60 --min-runs 10000         # fuzz regression gate: every target, 60s each (needs nightly + cargo-fuzz)
 (cd fuzz && cargo +nightly fuzz run uc_protocol_datagram -- -max_total_time=600)  # hunt one target
 scripts/elle_check.sh                            # elle consistency tier: 5 list-append passes, both models (needs java+jq)
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 (cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
-cargo run -p uc2_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
-RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc  # MPSC ring loom model (log buffer: -p uc2_log --test loom_frame)
+cargo run -p uc_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
+RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc  # MPSC ring loom model (log buffer: -p uc_log --test loom_frame)
 python3 bench-infra/scripts/m13_hop_bench.py --selftest  # M13 gate row arithmetic, no fleet/ssh
 ```
 
@@ -201,63 +206,63 @@ Workspace crates:
   and the v2 wire spec (`v2`): the `cnc.dat` 8 KiB (cnc 3.0: page 2 is the
   per-service slot band) page layout, the self-locating
   UDP datagram header, and per-message frame layouts. Multi-language gate.
-- `uc2_log` — the log buffer + archive. File-backed shared log buffer (readers
+- `uc_log` — the log buffer + archive. File-backed shared log buffer (readers
   poll positions in place, bounded by the commit counter) and the archive agent
-  that records ≤1 MiB blocks into `ultima_journal` (the retransmit + recovery
+  that records ≤1 MiB blocks into `uc_journal` (the retransmit + recovery
   store). Owns snapshot builder + below-floor reconstruction primitives.
-- `uc2_net` — own reliable-UDP transport (no QUIC): sender/receiver polling
+- `uc_net` — own reliable-UDP transport (no QUIC): sender/receiver polling
   agents, NAK-based retransmit off the log buffer, quorum-paced flow control,
   snapshot sessions. A seeded fault layer drives the sim.
-- `uc2_crypto` — **M8 wire crypto (opt-in, off by default)**: pure-sync,
+- `uc_crypto` — **M8 wire crypto (opt-in, off by default)**: pure-sync,
   socket-free crypto plane for node↔node UDP. Noise `IK` handshake (`snow`,
   X25519), per-peer pairwise keys + a rotating cluster group key, AES-256-GCM
   seal/open over the datagram envelope (16-byte header authenticated as AAD),
   RFC-6479 anti-replay, and the `SharedTransport`/`SendHalf`/`ReceiveHalf`
-  split that keeps the per-datagram hot path off a lock. `uc2_net` calls it at
-  two seams; `uc2_node` owns config, handshake routing, and key rotation.
-- `uc2_consensus` — pure-sync Raft-safety core over **byte positions**:
+  split that keeps the per-datagram hot path off a lock. `uc_net` calls it at
+  two seams; `uc_node` owns config, handshake routing, and key rotation.
+- `uc_consensus` — pure-sync Raft-safety core over **byte positions**:
   `CommitTracker` (quorum-th highest committed position), `ElectionSm`
   (lexicographic `(last_term, last_durable)` vote, data-stamped term map,
   truncation). No async, no I/O — driven deterministically by the sim.
-- `uc2_sim` — virtual-time deterministic world + safety invariants + seeded
+- `uc_sim` — virtual-time deterministic world + safety invariants + seeded
   fuzz. The gate that proves consensus safety without hardware.
-- `uc2_node` — the node binary + library. Wires the **four single-writer polling
+- `uc_node` — the node binary + library. Wires the **four single-writer polling
   agents** (consensus / sender / receiver / archive), the `cnc.dat` page, the
   ingress ring, and the linearizable-read barrier. Owns elections and truncation.
-- `uc2_service` — service-side SDK. **M12a: two tiers.** `RawStateMachine`
+- `uc_service` — service-side SDK. **M12a: two tiers.** `RawStateMachine`
   (bytes-in/bytes-out, the core contract) or the typed `StateMachine` (sync
   `apply`/`query`), which gets `RawStateMachine` for free via a blanket impl —
   a type implements exactly one of the two. Optionally `SnapshotStateMachine`
   (M6 purge) + `RawOutputHandler`/`OutputHandler` (async, leader-only,
-  `TypedOutput` adapts the latter onto the former). `uc2_service::session::
+  `TypedOutput` adapts the latter onto the former). `uc_service::session::
   Sessioned<S>` wraps either tier for exactly-once-over-a-remote-hop: a
   16-byte `client_id ++ seq` envelope, a 1-byte FRESH/REPLAYED/EXPIRED tag,
   replicated `SessionConfig` enforced at snapshot install. The apply agent
   polls committed positions in the log buffer; reconstruction replays the
   journal or installs a snapshot + tail-replays.
-- `uc2_client` — sync local-shmem input-client SDK. Small dep set (no transport,
+- `uc_client` — sync local-shmem input-client SDK. Small dep set (no transport,
   no consensus); matcher over the broadcast response ring.
-- `uc2_remote` — **M12a**: the remote wire protocol (protocol v1: framed TCP,
+- `uc_remote` — **M12a**: the remote wire protocol (protocol v1: framed TCP,
   credit-gated flow control, `REDIRECT`/`LEADER_CHANGED`/`RETRY`) and
   `RemoteClient`, the pipelined, redirect-following, re-sending Rust
   implementation of it — for clients that cannot attach to shmem directly.
   **M13**: rebuilt as the `RemoteEngine` split halves
   (`RemoteSendHalf`/`RemotePollHalf`, lock-free SPSC internals, count-based
   admission); `RemoteClient` remains as a thin blocking layer on top.
-- `uc2_gateway` — **M12a**: `Edge`, a per-node TCP front door that terminates
-  `uc2_remote` traffic and relays it over the local `uc2_client::Engine`;
+- `uc_gateway` — **M12a**: `Edge`, a per-node TCP front door that terminates
+  `uc_remote` traffic and relays it over the local `uc_client::Engine`;
   ships as the `uc2-gateway` binary + `gateway.toml` + a systemd unit.
   **M13**: a global outstanding-grant budget — the sum of per-connection
   credits never exceeds the node's admission window.
-- `uc-lincheck` — test/verification library: WGL linearizability `checker`, op
+- `uc_lincheck` — test/verification library: WGL linearizability `checker`, op
   `history` recorder, `model`, and the in-memory CAS-`register` SM
-  (`Cmd`/`CmdResp`/`RegisterSm: uc2_service::StateMachine`). One source of truth
-  shared by the in-process lincheck capstone (`uc2_node/tests/lin_v2.rs`) and the
+  (`Cmd`/`CmdResp`/`RegisterSm: uc_service::StateMachine`). One source of truth
+  shared by the in-process lincheck capstone (`uc_node/tests/lin_v2.rs`) and the
   multi-process hard-crash test.
-- `examples/uc2-crashtest` — multi-process test harness: reference bins (node +
+- `examples/uc_crashtest` — multi-process test harness: reference bins (node +
   service halves over a shared instance_dir) + the hard-crash tests behind the
   `hard-crash-tests` feature. The real `kill -9` path for reconstruction validation.
-- `ultima_journal` — segmented append journal + `StableValue`. In-tree workspace
+- `uc_journal` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved).
 
 ## Local scratch: keep heavy artifacts off `/tmp`
@@ -336,8 +341,8 @@ Two more from M14a's apply-hop isolation (`docs/benchmarks/uc2-m14a-apply-hop-20
   rebuild control, and only trust deltas outside it (`scripts/hop1_ab.sh`,
   `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md`).
 
-Harness models: `uc2_gateway/examples/hop_bench` (client/edge/node hops),
-`uc2_node/examples/apply_bench` (the FSM hop alone), `scripts/hop1_ab.sh`
+Harness models: `uc_gateway/examples/hop_bench` (client/edge/node hops),
+`uc_node/examples/apply_bench` (the FSM hop alone), `scripts/hop1_ab.sh`
 (the client hop A/B, with a same-source rebuild control); worked example
 `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`; the convoy mechanism
 `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md`.
@@ -349,39 +354,39 @@ same-host inter-process traffic via shared memory, cross-host traffic via UC's
 own reliable-UDP transport between nodes:
 
 ```
-[client process]      ──shmem──▶  [uc2_node]  ◀──reliable-UDP──▶  [uc2_node on peer host]
+[client process]      ──shmem──▶  [uc_node]  ◀──reliable-UDP──▶  [uc_node on peer host]
                                       ▲
                                       │ shmem (file-backed log buffer + cnc page)
                                       ▼
-                                 [uc2_service]
+                                 [uc_service]
 ```
 
 Each node is **four single-writer polling agents**, counter-coordinated (no
 locks on the hot path): **consensus** (commit tracking + elections), **sender**
 and **receiver** (reliable-UDP replication + NAK repair), and **archive** (record
-the log buffer into `ultima_journal` in ≤1 MiB blocks). All coordination is
+the log buffer into `uc_journal` in ≤1 MiB blocks). All coordination is
 through atomic counters in the `cnc.dat` page and monotonic byte **positions**
 (the absolute-offset analog of a Raft log index); `apply` is keyed on position.
 
-- `uc2_node` owns consensus, log durability, snapshot transport, leader election.
-- `uc2_service` owns the user's deterministic business logic (`apply`, `query`)
+- `uc_node` owns consensus, log durability, snapshot transport, leader election.
+- `uc_service` owns the user's deterministic business logic (`apply`, `query`)
   and side-effecting `on_committed` (leader-only, at-least-once).
 - Client processes translate external requests into Commands and submit via shmem.
 
 The shmem layer is a fixed-layout `cnc.dat` 8 KiB (cnc 3.0: page 2 is the
 per-service slot band) control page (`uc_protocol::v2::cnc`,
-offsets pinned in both `uc_protocol` and `uc2_log` so they never drift) plus the
+offsets pinned in both `uc_protocol` and `uc_log` so they never drift) plus the
 file-backed log buffer and per-stream ring buffers under an instance directory.
 Ring buffers are lock-free; SPSC for service↔node, MPSC for clients→node,
 Broadcast for node→clients (position-keyed responses bypass the node via an
 egress broadcast).
 
 Storage primitives:
-- Log buffer: `uc2_log` file-backed ring; the appender never overwrites bytes not
+- Log buffer: `uc_log` file-backed ring; the appender never overwrites bytes not
   yet recorded (one hard overrun gate); all other readers degrade to journal replay.
-- Archive / recovery: `ultima_journal::Journal` (segmented append, group commit,
+- Archive / recovery: `uc_journal::Journal` (segmented append, group commit,
   CRC per block; block seq = block index, meta = base position).
-- Durable state: `ultima_journal::StableValue<T>` (rotating two-slot atomic value)
+- Durable state: `uc_journal::StableValue<T>` (rotating two-slot atomic value)
   for vote, term map, snapshot floor, output progress, cluster-config record (config.state).
 - App state + snapshots: the user's `StateMachine`; M6 snapshots use the
   `SnapshotStateMachine` capability and (for the default store) `ultima_db`'s
@@ -414,11 +419,11 @@ service to catch up to the read position, and use a follower header-term check +
 capture-recheck + a service-epoch backstop (accept the answer only if the service
 didn't restart during the query) to close the TOCTOU against a crashing service.
 
-Correctness is proven at three levels: the deterministic sim (`uc2_sim`, safety
-invariants + seeded fuzz), the WGL lincheck capstones (`uc2_node/tests/lin_v2.rs`
+Correctness is proven at three levels: the deterministic sim (`uc_sim`, safety
+invariants + seeded fuzz), the WGL lincheck capstones (`uc_node/tests/lin_v2.rs`
 under failover AND purge/snapshot churn; `lin_partition_v2.rs` under
-partition/quorum-loss — all driving the untouched `uc-lincheck` checker), and the
-multi-process SIGKILL crashtest (`examples/uc2-crashtest`).
+partition/quorum-loss — all driving the untouched `uc_lincheck` checker), and the
+multi-process SIGKILL crashtest (`examples/uc_crashtest`).
 
 ## Code conventions
 
@@ -429,7 +434,7 @@ multi-process SIGKILL crashtest (`examples/uc2-crashtest`).
   `fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response`. No
   `async`, no clock, no randomness. Non-negotiable for SMR correctness. `position`
   (the absolute byte offset) is the idempotency key.
-- **Consensus is pure-sync.** `uc2_consensus` (CommitTracker, ElectionSm) has no
+- **Consensus is pure-sync.** `uc_consensus` (CommitTracker, ElectionSm) has no
   async and no I/O — it is driven by the node's polling agents and the sim. Safety
   logic lands there so the sim can adjudicate it deterministically.
 - **`output_handler` is async, leader-only, retryable.** Returns
@@ -441,7 +446,7 @@ multi-process SIGKILL crashtest (`examples/uc2-crashtest`).
   buffer through apply without intermediate copies.
 - **Per-record framing uses an atomic-after-write length prefix.** Reader sees
   length=0 → record not yet committed → spin/yield. Standard torn-record protection.
-- **cnc page offsets are pinned in BOTH `uc_protocol` and `uc2_log`** with
+- **cnc page offsets are pinned in BOTH `uc_protocol` and `uc_log`** with
   offset-assertion tests, and must never drift. Add fields in the reserved band.
 - **Snapshot `freeze`/`install_snapshot` are keyed on `position`.** `install_snapshot`
   takes the target position and rejects a mis-tagged artifact.
@@ -486,11 +491,11 @@ a parallel prose copy of the release history.
 
 ## Pointers to dependent crates
 
-- `ultima_journal/` — segmented append journal + `StableValue`. In-tree workspace
+- `uc_journal/` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved). Design notes:
   `../ultima_db/docs/tasks/task26_journal.md`.
 - `ultima-db` — MVCC copy-on-write B-tree store with `snapshot_stream` wire
-  format (the default app-state store + snapshot format, behind `uc2_service`'s
+  format (the default app-state store + snapshot format, behind `uc_service`'s
   non-default `ultima_db` feature). **Dependency comes from crates.io** — no
   sibling checkout required to build. Docs live in the `../ultima_db/` repo
   (`CLAUDE.md`, `docs/tasks/task27_snapshot_stream.md`) when checked out.

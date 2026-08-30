@@ -311,9 +311,9 @@ failure (the single `process::exit(1)`), `2` for a command-line usage error
 ## Refusal reasons
 
 The `reason` field of a status-`1` response. Codes 1–10 and 12 are the
-discriminants of `uc2_consensus::config::ProposeError`; 11 is the node's own
+discriminants of `uc_consensus::config::ProposeError`; 11 is the node's own
 defensive catch-all; 20–24 (M12b, `v2.6.0`) are admin-authentication
-refusals (`uc2_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — produced only
+refusals (`uc_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — produced only
 under `[admin] auth = "hmac"`, and disjoint from the `ProposeError` band so a
 caller can tell "the cluster refused this change" from "the cluster refused
 to believe this was you" without consulting the policy.

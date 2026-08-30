@@ -15,7 +15,7 @@
 - MSRV is **1.89** (`cargo clippy --workspace --all-targets --locked -- -D warnings` must pass on 1.89 in CI's `msrv` job); local dev builds on the **1.96.0** pinned in `rust-toolchain.toml`. Nothing in this plan may use an API newer than 1.89 — `AtomicU32::from_ptr` (1.75) and `std::time::Instant` are the newest things touched.
 - `cargo clippy --workspace --all-targets -- -D warnings` must be clean after **every** task; a warning is a failure.
 - **Never write scratch, test or bench artifacts to `/tmp`** — it is RAM-backed tmpfs with no swap on this box. Ring test files go through `tempfile::NamedTempFile`/`tempdir()` seeded from `env!("CARGO_TARGET_TMPDIR")` exactly as the existing tests do; the hop-bench smoke writes under `/home/claude/`.
-- cnc page offsets are pinned in **both** `uc_protocol::v2::cnc` and `uc2_log::cnc`, each with its own offset-assertion test; the one new field goes in the reserved band at **3968** and both tests grow a line.
+- cnc page offsets are pinned in **both** `uc_protocol::v2::cnc` and `uc_log::cnc`, each with its own offset-assertion test; the one new field goes in the reserved band at **3968** and both tests grow a line.
 - **No consensus, node↔node wire-protocol or cnc-layout change** beyond that one reserved-band field. `version::CURRENT` and `CNC_V2_VERSION` are untouched. The *ring file* format changes (new magic), which is a same-host restart, not a wire flag day.
 - The pinned public API — `MpscRing::{create, open, into_split, file_len}`, `MpscProducer::try_write`, `MpscConsumer::{try_read, wait_handle}`, `RingHeader`'s field names and `RING_HEADER_LEN` — does not change shape. Everything else in this plan is additive.
 - Commit after every task with a conventional message (`feat(ring):`, `test(ring):`, `docs(ring):`, …). One task, one commit.
@@ -29,7 +29,7 @@
 | `uc_protocol/src/ring/common.rs` | Modify | Commit-word encode/decode/classify, atomic word load/store helpers, the safe `decode_record_slice`, `RingError::Wedged`, `BadMagic` → `MagicMismatch`, magic-parameterised header init/validate, and the `write_record_at`/`write_padding_marker_at` body split. |
 | `uc_protocol/src/ring/mpsc.rs` | Modify | The producer claim/commit split (no cross-producer wait, `PUBLISH_SPINS_BEFORE_YIELD` deleted), the lap-checking consumer, the hole timer, `holes_skipped`, `set_hole_timeout`/`hole_timeout`, the `RING_MPSC_MAGIC` create/open, and the new tests. |
 | `uc_protocol/src/ring/mod.rs` | Modify | Re-exports the new public items. |
-| `uc_protocol/Cargo.toml` | Modify | `[lints.rust] unexpected_cfgs` for `cfg(loom)` + the `cfg(loom)` dev-dependency on `loom = "0.7"`, mirroring `uc2_log`. |
+| `uc_protocol/Cargo.toml` | Modify | `[lints.rust] unexpected_cfgs` for `cfg(loom)` + the `cfg(loom)` dev-dependency on `loom = "0.7"`, mirroring `uc_log`. |
 | `uc_protocol/tests/loom_mpsc.rs` | Create | The loom model of claim/commit/consume with two producers (the loom-on-rings item the M12d security package named). |
 | `fuzz/fuzz_targets/ring_mpsc_record.rs` | Create | Fuzz target over the consumer's decision + decode path on arbitrary commit words and slot bytes. |
 | `fuzz/src/seeds.rs` | Modify | `seeds::ring_mpsc_record()` — deterministic seeds built with the real record writer. |
@@ -39,9 +39,9 @@
 | `fuzz/README.md` | Modify | Target table row. |
 | `.github/workflows/nightly.yml` | Modify | `FUZZ_GROUPS` gains the 15th target; the `loom` job gains the `uc_protocol` model. |
 | `uc_protocol/src/v2/cnc.rs` | Modify | `CNC_OFF_INGRESS_HOLES_SKIPPED = 3968` + its offset assertion. |
-| `uc2_log/src/cnc.rs` | Modify | `ingress_holes_skipped()`/`store_ingress_holes_skipped()` accessors + offset assertion + round-trip test. |
-| `uc2_node/src/node.rs` | Modify | `Wedged` → named consensus fail-stop; publish `holes_skipped` to the cnc field each drain cycle; the log line. |
-| `uc2_node/src/obs/metrics.rs` | Modify | `uc2_ingress_holes_skipped_total` in `CONTRACT_SERIES` and the renderer, plus its test. |
+| `uc_log/src/cnc.rs` | Modify | `ingress_holes_skipped()`/`store_ingress_holes_skipped()` accessors + offset assertion + round-trip test. |
+| `uc_node/src/node.rs` | Modify | `Wedged` → named consensus fail-stop; publish `holes_skipped` to the cnc field each drain cycle; the log line. |
+| `uc_node/src/obs/metrics.rs` | Modify | `uc2_ingress_holes_skipped_total` in `CONTRACT_SERIES` and the renderer, plus its test. |
 | `docs/reference/instance-directory.md` | Modify | The ring-file format note (magic, restart-together rule). |
 | `docs/ops/uc2-runbook.md` | Modify | One bullet under "Running a cluster" pointing at the restart-together rule. |
 | `docs/how-to/upgrade-a-cluster.md` | Modify | "Ring format change in 2.7.0" section. |
@@ -1026,7 +1026,7 @@ The rest of the test is unchanged and still discriminates the `saturating_sub` f
 
 - [ ] Run the **release** build of the wrap test, which is where the torn-read race is visible: `cargo test -p uc_protocol --release wrap_under_many_producers_no_torn_read -- --exact --nocapture` → `test result: ok. 1 passed`.
 
-- [ ] Run the crates that attach to these rings: `cargo test -p uc2_client -p uc2_service -p uc2_node 2>&1 | tail -30`. Expected: all green. (`uc2_client`'s and `uc2_service`'s tests create their own ring files, so they get the new magic automatically; nothing in-tree opens a ring file written by an older binary.)
+- [ ] Run the crates that attach to these rings: `cargo test -p uc_client -p uc_service -p uc_node 2>&1 | tail -30`. Expected: all green. (`uc_client`'s and `uc_service`'s tests create their own ring files, so they get the new magic automatically; nothing in-tree opens a ring file written by an older binary.)
 
 - [ ] Lint: `cargo clippy --workspace --all-targets -- -D warnings`.
 
@@ -1349,10 +1349,10 @@ M13a spec §4.2."
 
 ### Task 5: The loom model
 
-The loom-on-rings item the M12d security package named, cashed in here. The model is of the **protocol**, not the mapping: loom cannot see an mmap, so the model is a `Vec` of loom atomics with the same claim/commit/consume discipline — the same relationship `uc2_log/tests/loom_frame.rs` has to `buffer.rs`.
+The loom-on-rings item the M12d security package named, cashed in here. The model is of the **protocol**, not the mapping: loom cannot see an mmap, so the model is a `Vec` of loom atomics with the same claim/commit/consume discipline — the same relationship `uc_log/tests/loom_frame.rs` has to `buffer.rs`.
 
 **Files:**
-- Modify `uc_protocol/Cargo.toml` (add `[lints.rust]` and the `cfg(loom)` dev-dependency, mirroring `uc2_log/Cargo.toml` lines 14–15 and 29–30)
+- Modify `uc_protocol/Cargo.toml` (add `[lints.rust]` and the `cfg(loom)` dev-dependency, mirroring `uc_log/Cargo.toml` lines 14–15 and 29–30)
 - Create `uc_protocol/tests/loom_mpsc.rs`
 - Modify `.github/workflows/nightly.yml` (the `loom` job, lines 82–91)
 
@@ -1585,7 +1585,7 @@ fn a_claimed_slot_is_never_read_as_committed() {
 
 ```yaml
       - name: Frame-visibility loom model
-        run: cargo test -p uc2_log --test loom_frame --release
+        run: cargo test -p uc_log --test loom_frame --release
         env:
           RUSTFLAGS: --cfg loom
       - name: MPSC ring commit-protocol loom model
@@ -1594,7 +1594,7 @@ fn a_claimed_slot_is_never_read_as_committed() {
           RUSTFLAGS: --cfg loom
 ```
 ```yaml
-#   * loom       — the uc2_log frame-visibility memory model AND the
+#   * loom       — the uc_log frame-visibility memory model AND the
 #                  uc_protocol MPSC ring commit protocol (exhaustive
 #                  interleaving exploration; needs `--cfg loom` + release).
 ```
@@ -1784,7 +1784,7 @@ Expected: `== fuzz ring_mpsc_record (60s) ==`, then `-- ring_mpsc_record: <N> ru
 
 - [ ] **Wire CI.** In `.github/workflows/nightly.yml`, add the target to the third `FUZZ_GROUPS` leg (which has three, keeping the documented four-per-leg ceiling):
 ```yaml
-            ultima_journal_record ultima_journal_stable_value uc2_service_session ring_mpsc_record
+            uc_journal_record uc_journal_stable_value uc_service_session ring_mpsc_record
 ```
 Then add the README row (in `fuzz/README.md`'s target table):
 ```markdown
@@ -1808,9 +1808,9 @@ built with the real writer; assigned to nightly's third fuzz leg. M13a spec §4.
 
 **Files:**
 - Modify `uc_protocol/src/v2/cnc.rs` (after `CNC_OFF_ADMIN_AUTH`, line 175–176; the module-doc reserved-band line 30; the offset test at line 502)
-- Modify `uc2_log/src/cnc.rs` (the import list lines 22–28; accessors next to `free_disk_bytes` at lines 500–514; the offset test at line 832; a new round-trip test after `free_disk_bytes_roundtrip_and_offset_pin` at line 1107)
-- Modify `uc2_node/src/node.rs` (the `Consensus` struct near line 1726; both constructors — the production one near line 1214 and the test harness near line 5669; `drain_ingress_ring`'s error arm line 3128–3133; `drain_query_ring`'s error arm; `publish_status` line 2969; a new `ring_error_fail_stop` + `publish_ring_holes`; a new test)
-- Modify `uc2_node/src/obs/metrics.rs` (`CONTRACT_SERIES` after `"uc2_wipes_total"` line 70; the renderer after the `uc2_wipes_total` `push_counter` at line 412; a new test)
+- Modify `uc_log/src/cnc.rs` (the import list lines 22–28; accessors next to `free_disk_bytes` at lines 500–514; the offset test at line 832; a new round-trip test after `free_disk_bytes_roundtrip_and_offset_pin` at line 1107)
+- Modify `uc_node/src/node.rs` (the `Consensus` struct near line 1726; both constructors — the production one near line 1214 and the test harness near line 5669; `drain_ingress_ring`'s error arm line 3128–3133; `drain_query_ring`'s error arm; `publish_status` line 2969; a new `ring_error_fail_stop` + `publish_ring_holes`; a new test)
+- Modify `uc_node/src/obs/metrics.rs` (`CONTRACT_SERIES` after `"uc2_wipes_total"` line 70; the renderer after the `uc2_wipes_total` `push_counter` at line 412; a new test)
 
 **Interfaces:**
 
@@ -1818,10 +1818,10 @@ Produces:
 ```rust
 // uc_protocol::v2::cnc
 pub const CNC_OFF_INGRESS_HOLES_SKIPPED: usize = 3968;
-// uc2_log::cnc::CncPage
+// uc_log::cnc::CncPage
 pub fn ingress_holes_skipped(&self) -> u64;
 pub fn store_ingress_holes_skipped(&self, v: u64);
-// uc2_node::node::Consensus (private)
+// uc_node::node::Consensus (private)
 fn ring_error_fail_stop(&self, e: &RingError, ring: &'static str);
 fn publish_ring_holes(&mut self);
 // /metrics
@@ -1840,7 +1840,7 @@ In `uc_protocol/src/v2/cnc.rs`'s offset test (after line 502's `assert_eq!(CNC_O
         assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 ```
 
-In `uc2_log/src/cnc.rs`'s `layout_offsets_are_pinned` test (after line 832):
+In `uc_log/src/cnc.rs`'s `layout_offsets_are_pinned` test (after line 832):
 ```rust
         // M13a: ingress_holes_skipped.
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED, 3968);
@@ -1862,7 +1862,7 @@ and a new test after `free_disk_bytes_roundtrip_and_offset_pin`:
     }
 ```
 
-In `uc2_node/src/obs/metrics.rs`, add `"uc2_ingress_holes_skipped_total",` to `CONTRACT_SERIES` after `"uc2_wipes_total"` (`every_contract_series_is_present` now fails until the renderer emits it), plus:
+In `uc_node/src/obs/metrics.rs`, add `"uc2_ingress_holes_skipped_total",` to `CONTRACT_SERIES` after `"uc2_wipes_total"` (`every_contract_series_is_present` now fails until the renderer emits it), plus:
 ```rust
     #[test]
     fn ingress_holes_skipped_is_exported() {
@@ -1873,7 +1873,7 @@ In `uc2_node/src/obs/metrics.rs`, add `"uc2_ingress_holes_skipped_total",` to `C
     }
 ```
 
-In `uc2_node/src/node.rs`'s test module:
+In `uc_node/src/node.rs`'s test module:
 ```rust
     /// M13a: a client killed between its ring claim and its commit leaves a
     /// sized hole. The consensus agent must skip it (never wedge on it),
@@ -1930,9 +1930,9 @@ In `uc2_node/src/node.rs`'s test module:
 
 - [ ] Run all four and confirm the expected failures:
   - `cargo test -p uc_protocol v2::cnc 2>&1 | tail -10` → `cannot find value `CNC_OFF_INGRESS_HOLES_SKIPPED` in this scope`
-  - `cargo test -p uc2_log cnc 2>&1 | tail -10` → the same, plus `no method named `ingress_holes_skipped``
-  - `cargo test -p uc2_node --lib obs::metrics 2>&1 | tail -10` → `missing series uc2_ingress_holes_skipped_total`
-  - `cargo test -p uc2_node --lib node::tests 2>&1 | tail -10` → `no method named `ring_error_fail_stop``
+  - `cargo test -p uc_log cnc 2>&1 | tail -10` → the same, plus `no method named `ingress_holes_skipped``
+  - `cargo test -p uc_node --lib obs::metrics 2>&1 | tail -10` → `missing series uc2_ingress_holes_skipped_total`
+  - `cargo test -p uc_node --lib node::tests 2>&1 | tail -10` → `no method named `ring_error_fail_stop``
 
 - [ ] **Add the cnc offset.** In `uc_protocol/src/v2/cnc.rs`, after `CNC_OFF_ADMIN_AUTH`:
 
@@ -1952,7 +1952,7 @@ const _: () = assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN);
 ```
 and update the module-doc reserved line (line 30) from `//! 3904..4096  reserved (zero)` to `//! 4032..4096  reserved (zero)`.
 
-- [ ] **Add the `uc2_log` accessors.** Add `CNC_OFF_INGRESS_HOLES_SKIPPED` to the import list, and after `store_free_disk_bytes`:
+- [ ] **Add the `uc_log` accessors.** Add `CNC_OFF_INGRESS_HOLES_SKIPPED` to the import list, and after `store_free_disk_bytes`:
 
 ```rust
     /// M13a: cumulative dead-producer ring holes skipped — see
@@ -2040,7 +2040,7 @@ Call `self.publish_ring_holes();` as the last statement of `publish_status`, and
                 }
 ```
 
-- [ ] **Render the metric.** In `uc2_node/src/obs/metrics.rs`, after the `uc2_wipes_total` `push_counter`:
+- [ ] **Render the metric.** In `uc_node/src/obs/metrics.rs`, after the `uc2_wipes_total` `push_counter`:
 
 ```rust
     push_counter(
@@ -2054,9 +2054,9 @@ Call `self.publish_ring_holes();` as the last statement of `publish_status`, and
 - [ ] Run everything this task touched:
 ```bash
 cargo test -p uc_protocol v2::cnc
-cargo test -p uc2_log cnc
-cargo test -p uc2_node --lib obs::metrics
-cargo test -p uc2_node --lib node::tests
+cargo test -p uc_log cnc
+cargo test -p uc_node --lib obs::metrics
+cargo test -p uc_node --lib node::tests
 ```
 Expected: all `ok`, including `a_dead_clients_ring_hole_is_skipped_counted_and_published`, `a_wedged_ingress_ring_fail_stops_the_consensus_agent` (a passing `should_panic`), `an_ordinary_ring_error_does_not_fail_stop`, `ingress_holes_skipped_roundtrip_and_offset_pin`, `every_contract_series_is_present`, `ingress_holes_skipped_is_exported`.
 
@@ -2064,10 +2064,10 @@ Expected: all `ok`, including `a_dead_clients_ring_hole_is_skipped_counted_and_p
 
 - [ ] Commit:
 ```bash
-git add uc_protocol/src/v2/cnc.rs uc2_log/src/cnc.rs uc2_node/src/node.rs uc2_node/src/obs/metrics.rs
+git add uc_protocol/src/v2/cnc.rs uc_log/src/cnc.rs uc_node/src/node.rs uc_node/src/obs/metrics.rs
 git commit -m "feat(node): IngressRingWedged fail-stop + ingress_holes_skipped on cnc/metrics
 
-cnc reserved-band field at 3968 (pinned in both uc_protocol and uc2_log with
+cnc reserved-band field at 3968 (pinned in both uc_protocol and uc_log with
 offset tests), published by the consensus agent on change only, exported as
 uc2_ingress_holes_skipped_total. RingError::Wedged fail-stops the consensus
 agent with a named error through the existing panic -> agent_failstopped ->
@@ -2155,7 +2155,7 @@ and no rollback step beyond restarting the old binaries together.
   - §6: add the second command and a sentence:
     ```markdown
     ```bash
-    RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+    RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release
     RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
     ```
 
@@ -2201,14 +2201,14 @@ The dev-box convoy reproduction is the gate for this milestone's row d (the flee
 
 **Files:** none modified. This task runs things and records what it saw.
 
-**Interfaces:** Consumes `uc2_gateway`'s `hop_bench` example (`dummy-node` + `engine-load` roles).
+**Interfaces:** Consumes `uc_gateway`'s `hop_bench` example (`dummy-node` + `engine-load` roles).
 
 ### Steps
 
 - [ ] Build the bench:
 ```bash
 cd /home/claude/ultima/ultima_cluster
-cargo build --release -p uc2_gateway --example hop_bench
+cargo build --release -p uc_gateway --example hop_bench
 ```
 
 - [ ] Run the convoy reproduction. **The instance dir goes on real disk, never `/tmp`** (`/tmp` is RAM-backed with no swap on this box):
@@ -2238,21 +2238,21 @@ cargo build --workspace
 cargo test --workspace 2>&1 | tail -40
 cargo test -p uc_protocol --release 2>&1 | tail -5
 cargo clippy --workspace --all-targets -- -D warnings
-RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release
 RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
 ```
-Expected: every suite `ok`, clippy silent. `cargo test --workspace` covers `uc2_client`'s synthetic/pipelined/torn-header suites and `uc2_service`'s apply/reconstruction suites — all of which drive real ring files, and all of which are the cross-crate evidence that the format change did not break an attacher.
+Expected: every suite `ok`, clippy silent. `cargo test --workspace` covers `uc_client`'s synthetic/pipelined/torn-header suites and `uc_service`'s apply/reconstruction suites — all of which drive real ring files, and all of which are the cross-crate evidence that the format change did not break an attacher.
 
 - [ ] Run the two lincheck capstones, which exercise the ring under failover and churn:
 ```bash
-cargo test -p uc2_node --test lin_v2
-cargo test -p uc2_node --test lin_partition_v2
+cargo test -p uc_node --test lin_v2
+cargo test -p uc_node --test lin_partition_v2
 ```
 Expected: `ok` on both.
 
 - [ ] Run the multi-process crashtest — the one tier that actually `SIGKILL`s a process holding ring state, i.e. the real dead-producer path this milestone made survivable:
 ```bash
-cargo test -p uc2-crashtest --features hard-crash-tests 2>&1 | tail -20
+cargo test -p uc_crashtest --features hard-crash-tests 2>&1 | tail -20
 ```
 Expected: `ok`. If a run reports a skipped hole in the node's log (`ingress_hole_skipped`), that is the new behaviour working as designed — record it in the commit message rather than treating it as a failure.
 

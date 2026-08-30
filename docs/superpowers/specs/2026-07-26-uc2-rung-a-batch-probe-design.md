@@ -25,7 +25,7 @@ clock into read safety.
 Every linearizable read today runs its own quorum probe round.
 `drain_query_ring` allocates a nonce, captures `commit_at`, and calls
 `send_read_probe(nonce)` **per read, inside the drain loop**
-(`uc2_node/src/node.rs:1979-2022`). At `QUERY_DRAIN_PER_CYCLE = 64` that is up
+(`uc_node/src/node.rs:1979-2022`). At `QUERY_DRAIN_PER_CYCLE = 64` that is up
 to 64 independent probe fan-outs per duty cycle, each asking every voting peer
 the same question — "am I still the leader?" — and each ack processed
 individually by `on_read_probe_ack`'s per-read nonce scan
@@ -47,7 +47,7 @@ Everything except step 1 (prove current-term leadership) of the barrier:
 - The **apply-frontier wait** (`AwaitApplied`, `service_applied >= commit_at`),
   the **capture-recheck bracket**, and the **service-epoch backstop** —
   unchanged (`advance_pending_reads`, `node.rs:2038-2117`;
-  `uc2_service/src/apply.rs:316-344`).
+  `uc_service/src/apply.rs:316-344`).
 - The **follower side**: `on_read_probe`'s ack-iff-term-matches test
   (`node.rs:1910-1918`) is the teeth of the no-stale-read guarantee and is not
   touched. Probes still go to voters only; `on_read_probe_ack` still counts
@@ -259,12 +259,12 @@ invariant would require building one — disproportionate here):
 
 | Concern | Location |
 | --- | --- |
-| Per-read probe today (to be replaced) | `uc2_node/src/node.rs:1979-2022` |
+| Per-read probe today (to be replaced) | `uc_node/src/node.rs:1979-2022` |
 | `PendingRead` / `ReadPhase` | `node.rs:207-235` |
 | Probe send / follower ack / ack counting | `node.rs:1895-1943` |
 | Advance + deadline + `can_serve` drop | `node.rs:2038-2117` |
 | Single-node fast path | `node.rs:1987-1992` |
 | Read-barrier timeout (1 s) | `node.rs:191` |
 | Mutation tooth (`skip-read-barrier`) | `node.rs:2005-2015` |
-| Integration-test precedent | `uc2_node/tests/query_barrier.rs` |
-| Measurement harness | `uc2_node/examples/read_profile.rs` |
+| Integration-test precedent | `uc_node/tests/query_barrier.rs` |
+| Measurement harness | `uc_node/examples/read_profile.rs` |

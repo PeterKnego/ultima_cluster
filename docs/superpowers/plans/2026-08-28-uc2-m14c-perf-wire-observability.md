@@ -6,7 +6,7 @@
 
 **Architecture:** Three workstreams in a fixed order. (1) The client hot path: commit the single-ring fast path in `SlotTable::resolve`, then bisect the rate loss M14a-style with a committed dev-box A/B runner — one variant per suspect, exact binaries back to back, keep what measures. (2) The snapshot transfer plane: a session stays one `SnapSession`/`SnapIntake` but becomes a stream of artifacts — one `SNAP_BEGIN` per declared id (ascending, naming the id, its newest artifact position and length, and the sender's declared set) followed by that artifact's chunks; chunk offsets are stream-global so `SNAP_NAK` repair is unchanged; the receiver writes each artifact under `snapshots/<id>/`, refuses a `layout = 0` (0.5.0) or mismatched-declared-set BEGIN by name, and adopts the floor only when every declared id's artifact has landed; each FSM installs its own artifact and tail-replays as today. (3) Observability: labelled twins of the service families via the existing `push_labeled` (`service="<id>"`), five new families, two alert rules each proven by `m10_alert_fire.sh`, a `uc2ctl status` per-service table read off the cnc page, and `service_attached`/`service_detached` events from the node's per-cycle service scan.
 
-**Tech Stack:** Rust 2024 (workspace edition), stable 1.96.0 pinned / MSRV 1.89; `uc_protocol` datagram codec; `uc2_net` reliable-UDP snapshot session with the seeded fault layer for tests; `uc2_node` cnc page-2 service slots; Prometheus exposition + `promtool` rule tests; `hop_bench` for the client A/B; `cargo-fuzz` on nightly for the new `SNAP_BEGIN` seed.
+**Tech Stack:** Rust 2024 (workspace edition), stable 1.96.0 pinned / MSRV 1.89; `uc_protocol` datagram codec; `uc_net` reliable-UDP snapshot session with the seeded fault layer for tests; `uc_node` cnc page-2 service slots; Prometheus exposition + `promtool` rule tests; `hop_bench` for the client A/B; `cargo-fuzz` on nightly for the new `SNAP_BEGIN` seed.
 
 **Spec:** `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` — **§14 (2026-08-28 amendments) is binding and wins over earlier sections**; this plan implements §14.2 (client hot path), §14.3 (= §7.3 as designed, incl. the §3.4 correction), §14.4 (= §9). **Landed before this plan:** M14a (`main` 6111257) and M14b (`main` 4347bc2 — the M14b plan's execution record lists the deferred minors; the ones on the client hot path are Task 1/2's business, the rest stay deferred). **Not in this plan:** the §12 capstones (M14c2), the fleet gate and release writeup (M14d), a datagram header version field, a remote-protocol service selector.
 
@@ -15,46 +15,46 @@
 1. **`SNAP_BEGIN_FIXED_LEN` is 34, not §7.3's 35** — §14.3 reuses the zero pad `[4..8]` for `layout`/`service_id` and inserts only `services_declared: u64`. §14 already records this.
 2. **A 0.5.0 sender's `SNAP_BEGIN` is dropped by the length check, not by the `layout` byte.** A 0.5.0 body is 26 + config bytes; `read_snap_begin_body` returns `None` below 34, and a 0.5.0 body with ≥ 8 bytes of config parses as a 0.6.0 body whose `layout` byte is the pad's zero — so the `layout == 0` refusal is the defensive second line, and the spec's "peer wire 0.5.0" refusal counter counts both paths (the receiver counts a too-short BEGIN there too). Stated so nobody expects a version handshake that does not exist (§14.3's §3.4 correction).
 3. **The snapshot source returns `None` if any declared id's newest artifact file is missing on disk**, not only at floor 0. The floor is `min(snapshot_pos)`, so every declared id has *reported* an artifact at or above it, but a file can be gone (retention keeps newest-2; a crash between the slot write and the publish) — shipping a partial set would strand the joiner's other FSMs below an adopted floor, so the sender declines the session and the follower keeps NAKing until the next snapshot round. Logged once per decline.
-4. **`uc2_service_attached{service}` is derived from the slot's `status` word, `uc2_service_lag_bytes{service}` is `commit − applied` saturating at 0** (a service can report `applied` past the sampled `commit` within one cycle).
+4. **`uc_service_attached{service}` is derived from the slot's `status` word, `uc_service_lag_bytes{service}` is `commit − applied` saturating at 0** (a service can report `applied` past the sampled `commit` within one cycle).
 5. **`service_detached` is inferred from heartbeat age crossing the same threshold the `Uc2ServiceWedged` alert uses**, not from a service-side goodbye — a `kill -9` sends none; the event says what the node can know.
 6. **The client A/B numbers are dev-box smoke and set no bar.** Task 2's decision rule is relative (variant vs the previous kept tree, non-overlapping `--reps 6` ranges); the fleet gate (M14d) measures the shipped code.
 7. **The receiver keeps every announced artifact in flight (`parts: Vec<SnapPart>`), not one `current`.** The sender rotates to artifact k+1 when artifact k's last chunk has been *sent* (§14.3), so under loss artifact k still has gaps when BEGIN(k+1) lands; one `Rebuilt` over the whole stream and per-artifact rename when the contiguous frontier passes its range keeps repair artifact-agnostic. (Task 5.)
 8. **The sender re-sends the current artifact's BEGIN on a 20 ms cadence** until that artifact's first chunk is acknowledged by the stream advancing — a lost BEGIN would otherwise stall the session to the 30 s timeout (the receiver cannot NAK for an artifact it was never told about). A duplicate BEGIN is a no-op at the receiver. This also closes the same hole for artifact 0 on 0.5.0. (Task 4.)
 9. **The snapshot source and the receiver's mask use `ring_ids()`/`ring_mask()`, not `ids()`/`declared()`**, so a `ServicesConfig::none_for_tests()` harness node offers and expects `{0}` (M14a's harness rule) — otherwise every node-only test, including the existing single-FSM learner join, would never open a session. Identical to `declared` for any real node. (Task 6.)
-10. **The four M10 service aggregates and their labelled twins share one family block** (one `# HELP`/`# TYPE` per name — a second header is a Prometheus parse error), so "the aggregate" in PromQL is `{service=""}` and `sum()` over the family double counts; `Uc2ServiceWedged`, the dashboard and `m10_alert_fire.sh`'s selector are pinned to the aggregate. `uc2_service_epoch`'s aggregate stays FSM 0's epoch (M14a). (Task 7/8.)
+10. **The four M10 service aggregates and their labelled twins share one family block** (one `# HELP`/`# TYPE` per name — a second header is a Prometheus parse error), so "the aggregate" in PromQL is `{service=""}` and `sum()` over the family double counts; `Uc2ServiceWedged`, the dashboard and `m10_alert_fire.sh`'s selector are pinned to the aggregate. `uc_service_epoch`'s aggregate stays FSM 0's epoch (M14a). (Task 7/8.)
 11. **The `m10_alerts` scenarios for the two new rules skip `wait_ready`** — `/readyz` keys on the page-1 min-over-declared heartbeat, which an absent or sleeping FSM holds stale by construction; they use `await_stable_leader` instead. (Task 8.)
 
 ## Global Constraints
 
-- MSRV **1.89**; `cargo clippy --workspace --all-targets -- -D warnings` clean after **every** task; `x.is_multiple_of(n)` rather than `x % n == 0`. **`--all-targets` does not compile feature-gated tests**: any task that adds an enum variant or changes a public signature must also build `cargo test -p uc2-crashtest --features hard-crash-tests --no-run` and fix the matches there (M14b's lesson).
+- MSRV **1.89**; `cargo clippy --workspace --all-targets -- -D warnings` clean after **every** task; `x.is_multiple_of(n)` rather than `x % n == 0`. **`--all-targets` does not compile feature-gated tests**: any task that adds an enum variant or changes a public signature must also build `cargo test -p uc_crashtest --features hard-crash-tests --no-run` and fix the matches there (M14b's lesson).
 - **Never write scratch or test artifacts to `/tmp`** (RAM-backed, no swap). Integration tests use `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`; the A/B runner's instance dirs and every bench artifact live under `/home/claude/` (real disk).
 - **Private `CARGO_TARGET_DIR`** for every measurement and for the proof stack (`~/.cache/cargo-target` is shared across worktrees); `/home/claude/cargo-target-uc2-m14a` (warm, this worktree) and `/home/claude/cargo-target-uc2-m14-main` (warm, the `main` checkout) exist. Bench binaries are copied out of the target dir and checksummed before a run.
 - **Rate bars are fleet-only.** Every number this plan records is dev-box smoke; no task moves or sets a bar.
 - **Wire (spec §14.3):** `SNAP_BEGIN` 0.6.0 body = `[0..4] session:u32 · [4] layout:u8 = 1 · [5] service_id:u8 · [6..8] zero · [8..16] snapshot_pos:u64 · [16..24] total_len:u64 · [24..32] services_declared:u64 · [32..34] config_len:u16 · [34..] config`; `SNAP_BEGIN_FIXED_LEN = 34`; `version::CURRENT = 0.6.0` (documentary — no receive path checks it); the 16-byte datagram header, `DATA`/`NAK`/`SNAP_CHUNK`/`SNAP_NAK`/`AppendPosition`/`TermMap`/admin bodies, the log frame, the ring framing (`ULTRNG2`) and `CNC_V2_VERSION` (3.0) are untouched. Chunk offsets are stream-global; `SNAP_NAK` semantics unchanged.
 - **Session rule (spec §14.3):** one session per join; artifacts ascending by id, one per declared id; the receiver adopts the floor (`min` over received positions into the existing `incoming_snapshot_pos` cell) only when `received == services_declared`; refusals `peer wire 0.5.0` and `declared-set mismatch` are named and counted.
-- **`uc2_service` is not modified** (each FSM already discovers and installs its own artifact from `snapshots/<id>/`). `uc2_consensus`, `uc2_crypto`, `uc2_remote` untouched; the remote protocol stays v1; `uc2_gateway` only if a match must grow.
+- **`uc_service` is not modified** (each FSM already discovers and installs its own artifact from `snapshots/<id>/`). `uc_consensus`, `uc_crypto`, `uc_remote` untouched; the remote protocol stays v1; `uc_gateway` only if a match must grow.
 - **Metrics (spec §14.4):** labels via the existing `push_labeled` with `service="<id>"`; unlabeled aggregate names keep their names and mean "slowest FSM"; every new family is in `CONTRACT_SERIES`; alert names `Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`, both with a `for: 30s` window and an `m10_alerts` scenario.
-- Public API additions (`uc2_net` `SnapshotSet`/`SnapArtifact`, `uc2_node` counters) land in `docs/reference/semver-policy.md` in Task 10.
+- Public API additions (`uc_net` `SnapshotSet`/`SnapArtifact`, `uc_node` counters) land in `docs/reference/semver-policy.md` in Task 10.
 - Commit after every task with a conventional message; one task, one commit (a fix round may add one).
 
 ## File Structure
 
 | File | Create/Modify | Responsibility |
 |---|---|---|
-| `uc2_client/src/slots.rs` | Modify | T1: single-ring fast path in `resolve` (no `received` RMW when `expected == bit`); invariants 7/8; tests. |
-| `uc2_client/src/engine.rs` | Modify | T2: only the bisection variants that measure (v1 `handle_fan_in_piece` out of line, v2 `send_with_prefix`, v3 `poll` loop shape). |
+| `uc_client/src/slots.rs` | Modify | T1: single-ring fast path in `resolve` (no `received` RMW when `expected == bit`); invariants 7/8; tests. |
+| `uc_client/src/engine.rs` | Modify | T2: only the bisection variants that measure (v1 `handle_fan_in_piece` out of line, v2 `send_with_prefix`, v3 `poll` loop shape). |
 | `scripts/hop1_ab.sh`, `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md` | Create | T2: the committed dev-box A/B runner and its record (smoke, never a gate). |
 | `uc_protocol/src/v2/datagram.rs`, `uc_protocol/src/version.rs`, `docs/reference/wire-protocol.md` | Modify | T3: `SNAP_BEGIN` 0.6.0 body (34 B, `layout`/`service_id`/`services_declared`), `CURRENT` 0.6.0 (documentary). |
 | `fuzz/src/seeds.rs`, `fuzz/README.md`, `fuzz/corpus/uc_protocol_datagram/` | Modify | T3: the `14-snap-begin-v2` seed. |
-| `uc2_net/src/sender.rs` | Modify | T3 (interim literal), T4: `SnapshotSet`/`SnapArtifact`/`SnapshotSource`, the artifact stream with stream-global offsets, BEGIN resend. |
-| `uc2_net/src/receiver.rs` | Modify | T3 (interim literals), T5: per-id `SnapIntake` (`parts: Vec<SnapPart>`), adopt-on-complete, the two refusal counters on `FollowerStats`, `set_snapshot_intake(root, own_declared, incoming)`. |
-| `uc2_net/tests/snapshot_session.rs` | Modify | T4/T5: multi-artifact transport tests (loss on both artifacts, refusals). |
-| `uc2_node/src/services.rs`, `uc2_node/src/ipc.rs`, `uc2_node/src/node.rs` | Modify | T6: `ring_mask()`, `snapshot_root()`, the per-id source closure + intake wiring, `snapshot_session_refusals()`; T9: `SERVICE_STALE_NS`, `note_service_transitions`, attach/detach events. |
-| `uc2_node/tests/learner.rs` | Modify | T6: the two-FSM below-floor join. |
+| `uc_net/src/sender.rs` | Modify | T3 (interim literal), T4: `SnapshotSet`/`SnapArtifact`/`SnapshotSource`, the artifact stream with stream-global offsets, BEGIN resend. |
+| `uc_net/src/receiver.rs` | Modify | T3 (interim literals), T5: per-id `SnapIntake` (`parts: Vec<SnapPart>`), adopt-on-complete, the two refusal counters on `FollowerStats`, `set_snapshot_intake(root, own_declared, incoming)`. |
+| `uc_net/tests/snapshot_session.rs` | Modify | T4/T5: multi-artifact transport tests (loss on both artifacts, refusals). |
+| `uc_node/src/services.rs`, `uc_node/src/ipc.rs`, `uc_node/src/node.rs` | Modify | T6: `ring_mask()`, `snapshot_root()`, the per-id source closure + intake wiring, `snapshot_session_refusals()`; T9: `SERVICE_STALE_NS`, `note_service_transitions`, attach/detach events. |
+| `uc_node/tests/learner.rs` | Modify | T6: the two-FSM below-floor join. |
 | `docs/how-to/upgrade-a-cluster.md`, `docs/reference/semver-policy.md` | Modify | T6: the 0.6.0 flag-day step; T10: API rows. |
-| `uc2_node/src/obs/metrics.rs` | Modify | T7: labelled service families (`push_gauge_with_services`), five new families, the two refusal counters; `CONTRACT_SERIES` 65 → 72. |
-| `packaging/prometheus/uc2-alerts.yml`, `uc2_node/examples/m10_alerts.rs`, `scripts/m10_alert_fire.sh`, `packaging/grafana/uc2-dashboard.json` | Modify | T8: `Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`, their scenarios, the adjudicator hookup, `Uc2ServiceWedged` pinned to the aggregate, dashboard rows. |
-| `uc2ctl/src/main.rs`, `uc2ctl/tests/status_services.rs`, `uc2_node/src/obs/http.rs`, `uc2_node/tests/services.rs` | Modify/Create | T9: the per-service `status` table; the stale-threshold pin; the attach/detach event test. |
+| `uc_node/src/obs/metrics.rs` | Modify | T7: labelled service families (`push_gauge_with_services`), five new families, the two refusal counters; `CONTRACT_SERIES` 65 → 72. |
+| `packaging/prometheus/uc2-alerts.yml`, `uc_node/examples/m10_alerts.rs`, `scripts/m10_alert_fire.sh`, `packaging/grafana/uc2-dashboard.json` | Modify | T8: `Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`, their scenarios, the adjudicator hookup, `Uc2ServiceWedged` pinned to the aggregate, dashboard rows. |
+| `uc_ctl/src/main.rs`, `uc_ctl/tests/status_services.rs`, `uc_node/src/obs/http.rs`, `uc_node/tests/services.rs` | Modify/Create | T9: the per-service `status` table; the stale-threshold pin; the attach/detach event test. |
 | `docs/how-to/monitor-a-cluster.md`, `docs/how-to/diagnose-a-node.md`, `docs/ops/uc2-runbook.md`, `docs/reference/uc2ctl.md`, `docs/VERIFICATION.md` | Modify | T10. |
 
 ---
@@ -63,17 +63,17 @@
 
 M14b's exact-binary A/B put hop 1 at **−4.2 % resp/s** against M14a's tip with p90 2 → 3 µs (the M14b plan's post-execution addendum, `main` 4347bc2). A scratch build that skipped `received.fetch_or` for a single-ring request restored p90 to 2 µs but not the rate. This task commits the tail win, which is free and provable in unit tests; Task 2 chases the rate.
 
-**Why it is sound.** For a request whose `expected` names exactly one ring, that one piece both opens and closes the set: nothing accumulates in `received`, and nothing reads it (`received` is written in `claim` phase 2 at `slots.rs:135` and read only inside `resolve` — verified by `grep -n received uc2_client/src/slots.rs`). The exactly-once gate is the completing owner CAS at `slots.rs:212-218`, not the `fetch_or`: a duplicate delivery for the same generation finds the slot already `FREE` (early `Miss` at `slots.rs:168-170`) or re-owned by a later generation (`seq as u32 != wire_seq`, `slots.rs:172-174`), and even a concurrent second `resolve` loses the CAS and returns `Miss`. So the `fetch_or`'s duplicate check at `slots.rs:199-201` is redundant for a single-ring request — it is a per-response atomic RMW on a shared cache line bought for nothing.
+**Why it is sound.** For a request whose `expected` names exactly one ring, that one piece both opens and closes the set: nothing accumulates in `received`, and nothing reads it (`received` is written in `claim` phase 2 at `slots.rs:135` and read only inside `resolve` — verified by `grep -n received uc_client/src/slots.rs`). The exactly-once gate is the completing owner CAS at `slots.rs:212-218`, not the `fetch_or`: a duplicate delivery for the same generation finds the slot already `FREE` (early `Miss` at `slots.rs:168-170`) or re-owned by a later generation (`seq as u32 != wire_seq`, `slots.rs:172-174`), and even a concurrent second `resolve` loses the CAS and returns `Miss`. So the `fetch_or`'s duplicate check at `slots.rs:199-201` is redundant for a single-ring request — it is a per-response atomic RMW on a shared cache line bought for nothing.
 
 **Files:**
-- Modify `uc2_client/src/slots.rs` — module-doc invariant 7 (line 20) and invariant 8 (line 22); `resolve` body (lines 164–221, specifically the `if let Some(r) = ring` block at 183–209); a new `#[cfg(test)]` accessor beside `set_next_seq_for_tests` (lines 278–281); tests (`mod tests` 289–668 — extend `second_resolve_is_a_miss_exactly_once` at 305–311, add three).
-- No other file changes. `uc2_client`'s public API is untouched; `uc2_service` and `uc2_node` are not in this workstream.
+- Modify `uc_client/src/slots.rs` — module-doc invariant 7 (line 20) and invariant 8 (line 22); `resolve` body (lines 164–221, specifically the `if let Some(r) = ring` block at 183–209); a new `#[cfg(test)]` accessor beside `set_next_seq_for_tests` (lines 278–281); tests (`mod tests` 289–668 — extend `second_resolve_is_a_miss_exactly_once` at 305–311, add three).
+- No other file changes. `uc_client`'s public API is untouched; `uc_service` and `uc_node` are not in this workstream.
 
 **Interfaces:**
 
 Consumes (all exist today):
 ```rust
-// uc2_client/src/slots.rs:41-61
+// uc_client/src/slots.rs:41-61
 pub(crate) enum Resolve {
     Won { user_data: u64, fan_in: bool, first: bool },
     Partial { first: bool },
@@ -81,13 +81,13 @@ pub(crate) enum Resolve {
     WrongRing,
     Miss,
 }
-// uc2_client/src/slots.rs:109-116
+// uc_client/src/slots.rs:109-116
 pub(crate) fn claim(&self, user_data: u64, kind: ReqKind, deadline_ns: u64, expected: u8, fan_in: bool) -> Result<u64, ClaimError>;
-// uc2_client/src/slots.rs:164
+// uc_client/src/slots.rs:164
 pub(crate) fn resolve(&self, wire_seq: u32, expect_kind: Option<ReqKind>, ring: Option<u8>) -> Resolve;
-// uc2_client/src/slots.rs:226
+// uc_client/src/slots.rs:226
 pub(crate) fn slot_index(&self, wire_seq: u32) -> usize;
-// uc2_client/src/slots.rs:279
+// uc_client/src/slots.rs:279
 #[cfg(test)] pub(crate) fn set_next_seq_for_tests(&self, v: u64);
 ```
 
@@ -181,7 +181,7 @@ Also extend the existing `second_resolve_is_a_miss_exactly_once` (`slots.rs:305-
 - [ ] **Step 2: Run the new tests and state the failure.**
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_client --lib slots::
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_client --lib slots::
 ```
 
 Expect `a_single_ring_resolve_never_touches_received` to FAIL with
@@ -266,13 +266,13 @@ Expect `a_single_ring_resolve_never_touches_received` to FAIL with
     }
 ```
 
-- [ ] **Step 4: Run the whole `uc2_client` suite and state the pass.**
+- [ ] **Step 4: Run the whole `uc_client` suite and state the pass.**
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_client
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_client
 ```
 
-Expect all green, including the four tests above, the 40 000-claim `concurrent_exactly_once_stress` (`slots.rs:406-563` — it resolves single-ring claims from four threads while a sweeper races, so it exercises exactly the case where the CAS, not the bit, has to be the gate), and `uc2_client/tests/engine_synthetic.rs`. Three assertions there are the ones worth naming because they read the counters the fast path could have moved, and must not change:
+Expect all green, including the four tests above, the 40 000-claim `concurrent_exactly_once_stress` (`slots.rs:406-563` — it resolves single-ring claims from four threads while a sweeper races, so it exercises exactly the case where the CAS, not the bit, has to be the gate), and `uc_client/tests/engine_synthetic.rs`. Three assertions there are the ones worth naming because they read the counters the fast path could have moved, and must not change:
 `engine_synthetic.rs:246` (`duplicates == 1` after a single-ring duplicate — now reached via `Resolve::Miss` from the freed-slot check instead of the repeated bit, same arm at `engine.rs:804-806`), `engine_synthetic.rs:484` (`duplicates == 1` after a late fan-in piece) and `engine_synthetic.rs:498` (`wrong_ring == 1` — the `expected & bit == 0` check still runs BEFORE the fast path).
 
 - [ ] **Step 5: Rewrite module-doc invariants 7 and 8.** Replace `slots.rs:20` (invariant 7) with:
@@ -291,11 +291,11 @@ Replace `slots.rs:22` (invariant 8) with:
 
 ```bash
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_client/src/slots.rs
+git add uc_client/src/slots.rs
 git commit -m "perf(client): single-ring fast path in resolve — the owner CAS is the exactly-once gate, so skip received.fetch_or when expected == bit (p90 3 -> 2 us; rate unchanged, see M14c task 2)"
 ```
 
-Expect clippy clean. No new enum variant, no match site anywhere else, so the `--all-targets` blind spot for feature-gated tests (`examples/uc2-crashtest/tests/*.rs` under `hard-crash-tests`) does not apply here. **No bench in this task** — Task 2 measures the fast path together with the hot-body variants, on one harness, in one sitting.
+Expect clippy clean. No new enum variant, no match site anywhere else, so the `--all-targets` blind spot for feature-gated tests (`examples/uc_crashtest/tests/*.rs` under `hard-crash-tests`) does not apply here. **No bench in this task** — Task 2 measures the fast path together with the hot-body variants, on one harness, in one sitting.
 
 ---
 
@@ -308,24 +308,24 @@ The rate loss survives the fast path, so it is the grown hot body — M14a's cod
 **Files:**
 - Create `scripts/hop1_ab.sh` (new, executable) — the committed A/B runner.
 - Create `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md` (new) — the record, shaped like the M14a apply-hop doc.
-- Modify `uc2_client/src/engine.rs` — v1: the `MSG_V2_RESPONSE` arm of `handle_record` (lines 743–809) plus a new out-of-line function after `handle_record` (which ends at line 862); v2: `SendHalf::send`'s prefix arm (lines 443–453) plus a new method in `impl SendHalf` (starts line 407); v3: `PollHalf::poll`'s ring loop (lines 668–670). **Only the variants that measure survive to the commit.**
-- Not modified: `uc2_service`, `uc2_node`, `uc_protocol`, `uc2_gateway` (the harness itself is untouched — see the note in Step 2 on why `hop_bench` differs by four lines between the two trees and why that is not a confound).
+- Modify `uc_client/src/engine.rs` — v1: the `MSG_V2_RESPONSE` arm of `handle_record` (lines 743–809) plus a new out-of-line function after `handle_record` (which ends at line 862); v2: `SendHalf::send`'s prefix arm (lines 443–453) plus a new method in `impl SendHalf` (starts line 407); v3: `PollHalf::poll`'s ring loop (lines 668–670). **Only the variants that measure survive to the commit.**
+- Not modified: `uc_service`, `uc_node`, `uc_protocol`, `uc_gateway` (the harness itself is untouched — see the note in Step 2 on why `hop_bench` differs by four lines between the two trees and why that is not a confound).
 
 **Interfaces:**
 
 Consumes (verified, all exist):
 ```rust
-// uc2_client/src/engine.rs:730-736
+// uc_client/src/engine.rs:730-736
 fn handle_record(shared: &Shared, fanin: &mut [FanIn], ring_id: Option<u8>, rec: &RecordHeader, buf: &[u8], cb: &mut impl FnMut(Completion<'_>)) -> usize;
-// uc2_client/src/engine.rs:409-419  (already carries #[allow(clippy::too_many_arguments)] at :408)
+// uc_client/src/engine.rs:409-419  (already carries #[allow(clippy::too_many_arguments)] at :408)
 fn send(&self, ring: &MpscProducer, msg_type: u16, flags: u16, kind: ReqKind, user_data: u64, bytes: &[u8], expected: u8, fan_in: bool, prefix: Option<u8>) -> Result<(), SubmitError>;
-// uc2_client/src/engine.rs:660
+// uc_client/src/engine.rs:660
 pub fn poll(&mut self, mut cb: impl FnMut(Completion<'_>)) -> usize;
-// uc2_client/src/engine.rs:280
+// uc_client/src/engine.rs:280
 fn push_piece(&mut self, first: bool, position: u64, ring: u8, body: &[u8]);
-// uc2_client/src/engine.rs:702-709
+// uc_client/src/engine.rs:702-709
 fn drain_ring(ring: &mut BroadcastConsumer, ring_id: Option<u8>, shared: &Shared, buf: &mut Vec<u8>, fanin: &mut [FanIn], cb: &mut impl FnMut(Completion<'_>)) -> usize;
-// uc2_client/src/engine.rs:241  — the field v3 reshapes access to
+// uc_client/src/engine.rs:241  — the field v3 reshapes access to
 egress_services: Vec<(u8, BroadcastConsumer)>,
 // uc_protocol/src/ring/mpsc.rs:234
 pub fn try_write(&self, msg_type: u16, flags: u16, header_extra: [u8; 8], payload: &[u8]) -> Result<(), RingError>;
@@ -488,7 +488,7 @@ mkdir -p /home/claude/m14c-ab/bin
 cd /home/claude/ultima/ultima_cluster
 git rev-parse --short HEAD                     # expect 4347bc2
 CARGO_TARGET_DIR=/home/claude/cargo-target-m14c-main \
-  cargo build --release -p uc2_gateway --example hop_bench
+  cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-m14c-main/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-main
 
 # (2) main 3a7f9a5 — M14a's tip, the recovery target. Extracted read-only with
@@ -497,19 +497,19 @@ mkdir -p /home/claude/m14c-a0-tree
 git -C /home/claude/ultima/ultima_cluster archive 3a7f9a5 | tar -x -C /home/claude/m14c-a0-tree
 cd /home/claude/m14c-a0-tree
 CARGO_TARGET_DIR=/home/claude/cargo-target-m14c-a0 \
-  cargo build --release -p uc2_gateway --example hop_bench
+  cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-m14c-a0/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-m14a
 
 # (3) the branch tree AFTER Task 1 — driver B for the first pair.
 cd /home/claude/ultima/ultima_cluster/.claude/worktrees/uc2-multi-service
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a \
-  cargo build --release -p uc2_gateway --example hop_bench
+  cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-uc2-m14a/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-t1
 
 sha256sum /home/claude/m14c-ab/bin/*            # paste into the bench doc
 ```
 
-Two facts to state in the doc rather than discover later. (a) `uc2_gateway/examples/hop_bench/engine_load.rs` differs by exactly four lines between 3a7f9a5 and 4347bc2 (`git diff 3a7f9a5 HEAD -- uc2_gateway/examples/hop_bench/engine_load.rs`): the mandatory `Outcome::Responses(_)` and `Outcome::BadService { .. }` arms added to an exhaustive match on a path a bench never takes. The harness is otherwise byte-identical, so `hb-m14a` vs `hb-main` is a `uc2_client` comparison. (b) `hb-main` is the sink for **every** run in this task, including runs of `hb-m14a` — that is what makes the sides comparable.
+Two facts to state in the doc rather than discover later. (a) `uc_gateway/examples/hop_bench/engine_load.rs` differs by exactly four lines between 3a7f9a5 and 4347bc2 (`git diff 3a7f9a5 HEAD -- uc_gateway/examples/hop_bench/engine_load.rs`): the mandatory `Outcome::Responses(_)` and `Outcome::BadService { .. }` arms added to an exhaustive match on a path a bench never takes. The harness is otherwise byte-identical, so `hb-m14a` vs `hb-main` is a `uc_client` comparison. (b) `hb-main` is the sink for **every** run in this task, including runs of `hb-m14a` — that is what makes the sides comparable.
 
 - [ ] **Step 3: The two reference pairs.** Establish where Task 1 landed and re-measure M14a's tip in this session, so the residual in Step 7 is an in-session number rather than a cross-session quote.
 
@@ -639,7 +639,7 @@ fn handle_fan_in_piece(
 Build, copy, measure both axes:
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo build --release -p uc2_gateway --example hop_bench
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-uc2-m14a/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-v1
 scripts/hop1_ab.sh --sink /home/claude/m14c-ab/bin/hb-main \
   --a /home/claude/m14c-ab/bin/hb-t1 --b /home/claude/m14c-ab/bin/hb-v1 \
@@ -649,7 +649,7 @@ scripts/hop1_ab.sh --sink /home/claude/m14c-ab/bin/hb-main \
   --reps 6 --root /home/claude/m14c-ab | tee /home/claude/m14c-ab/r2b-main-vs-v1.log # the doc row
 ```
 
-Apply the decision rule (Step 7) now: if v1 is not kept, `git checkout -- uc2_client/src/engine.rs` before Step 5, and the "previous kept tree" binary for Step 5 stays `hb-t1`.
+Apply the decision rule (Step 7) now: if v1 is not kept, `git checkout -- uc_client/src/engine.rs` before Step 5, and the "previous kept tree" binary for Step 5 stays `hb-t1`.
 
 - [ ] **Step 5: Variant v2 — `send`'s prefix path out of line.** The suspect: `send` is one function for submits and queries, and the query arm (`engine.rs:445-452`) carries a `RefCell` borrow, `write_query_payload` and a second `try_write` call site inside the body a submit runs. Replace `engine.rs:443-453` with:
 
@@ -689,7 +689,7 @@ and add this method to `impl SendHalf`, immediately after `send` (which ends at 
 
 Build, copy to `hb-v2`, and run the same two A/Bs — `--a` for the decision run is the previous **kept** binary (`hb-v1` if v1 was kept, else `hb-t1`), `--a` for the doc run is always `hb-main`. Logs `r3-prev-vs-v2.log` / `r3b-main-vs-v2.log`.
 
-**Revert discipline for Steps 4–6.** `git checkout -- uc2_client/src/engine.rs` would also undo a kept earlier variant, so do not use it. Instead, keep the accepted state in a file outside the repo and restore from that: after each adjudication that KEEPS a variant, run `cp uc2_client/src/engine.rs /home/claude/m14c-ab/engine-kept.rs`; to reject a variant, run `cp /home/claude/m14c-ab/engine-kept.rs uc2_client/src/engine.rs` (seed it once from the Task-1 tree before Step 4: `cp uc2_client/src/engine.rs /home/claude/m14c-ab/engine-kept.rs`). Confirm each revert with `git diff --stat uc2_client/src/engine.rs`.
+**Revert discipline for Steps 4–6.** `git checkout -- uc_client/src/engine.rs` would also undo a kept earlier variant, so do not use it. Instead, keep the accepted state in a file outside the repo and restore from that: after each adjudication that KEEPS a variant, run `cp uc_client/src/engine.rs /home/claude/m14c-ab/engine-kept.rs`; to reject a variant, run `cp /home/claude/m14c-ab/engine-kept.rs uc_client/src/engine.rs` (seed it once from the Task-1 tree before Step 4: `cp uc_client/src/engine.rs /home/claude/m14c-ab/engine-kept.rs`). Confirm each revert with `git diff --stat uc_client/src/engine.rs`.
 
 - [ ] **Step 6: Variant v3 — `poll`'s ring loop.** The suspect: `poll` walks a heap `Vec<(u8, BroadcastConsumer)>` (`engine.rs:241`, loop at `:668-670`) on every duty cycle, and the overwhelmingly common attach — every pre-M14b client, the gateway, and this bench — has exactly one entry. Chosen shape: **keep the `Vec`, hoist the one-element case with a slice pattern** (not a fixed `[Option<…>; 8]` array, which would enlarge `PollHalf` by seven idle `BroadcastConsumer`s and change `wait_handle`'s indexing at `:692`). Replace `engine.rs:668-670` with:
 
@@ -715,12 +715,12 @@ Build, copy to `hb-v3`, run the same two A/Bs (`--a` = previous kept binary; `--
 Then, with only the kept variants in the tree:
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_client
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_node --test services --test query_barrier
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_client
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_node --test services --test query_barrier
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Expect all green. `uc2_client` covers the slot table and `engine_synthetic.rs`'s per-ring matching, fan-in ordering and counter assertions (the only tests that can see v1's re-routing); `services` and `query_barrier` are the `uc2_node` end-to-end tests that drive the query prefix v2 moves and the multi-ring poll loop v3 reshapes. If v1 changed no behaviour it must change no test — a red here is a real defect in the refactor, not a flake, and is the reason these runs come after the measurements rather than instead of them.
+Expect all green. `uc_client` covers the slot table and `engine_synthetic.rs`'s per-ring matching, fan-in ordering and counter assertions (the only tests that can see v1's re-routing); `services` and `query_barrier` are the `uc_node` end-to-end tests that drive the query prefix v2 moves and the multi-ring poll loop v3 reshapes. If v1 changed no behaviour it must change no test — a red here is a real defect in the refactor, not a flake, and is the reason these runs come after the measurements rather than instead of them.
 
 **The residual.** Compute the kept tree's position against `hb-m14a` from R0 and the kept deltas, and re-measure it directly if any variant was kept:
 
@@ -747,12 +747,12 @@ If the kept tree still sits **more than 1.5 % below** `hb-m14a`, record that as 
 
 ```bash
 git add scripts/hop1_ab.sh docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md
-git add uc2_client/src/engine.rs            # ONLY if at least one variant was kept
+git add uc_client/src/engine.rs            # ONLY if at least one variant was kept
 git status --porcelain                       # expect exactly the files above, nothing else
 git commit -m "perf(client): hop-1 hot-body bisection — <kept variants, one clause each>; committed A/B runner + dev-box smoke record"
 ```
 
-Write the kept variants into the message (e.g. `out-of-line fan-in arms in handle_record`), and if none measured, say so plainly (`no variant measured; suspects recorded`) and drop `uc2_client/src/engine.rs` from the `git add` list — the runner and the doc still ship, because the null result is the finding. Expect `git status --porcelain` to list only those files: the three build trees, the copied binaries and every log live under `/home/claude/` (real disk, never `/tmp`) and are outside the repo by construction. `/home/claude/m14c-a0-tree` is an extracted archive, not a worktree — `git worktree list` must still show exactly the three entries it showed before this task.
+Write the kept variants into the message (e.g. `out-of-line fan-in arms in handle_record`), and if none measured, say so plainly (`no variant measured; suspects recorded`) and drop `uc_client/src/engine.rs` from the `git add` list — the runner and the doc still ship, because the null result is the finding. Expect `git status --porcelain` to list only those files: the three build trees, the copied binaries and every log live under `/home/claude/` (real disk, never `/tmp`) and are outside the repo by construction. `/home/claude/m14c-a0-tree` is an extracted archive, not a worktree — `git worktree list` must still show exactly the three entries it showed before this task.
 
 ---
 
@@ -761,7 +761,7 @@ Write the kept variants into the message (e.g. `out-of-line fan-in arms in handl
 **Files:**
 - Modify `uc_protocol/src/v2/datagram.rs` — `SNAP_BEGIN_FIXED_LEN` (line 159), the `SnapBeginBody` doc block (226–232), the struct (233–238), `write_snap_begin_body` (240–251), `read_snap_begin_body` (252–268), the `DGRAM_KIND_SNAP_BEGIN`/`DGRAM_KIND_SNAP_DONE` kind docs (143, 150), unit test `snap_begin_body_roundtrips_and_pins_layout` (673–692)
 - Modify `uc_protocol/src/version.rs` — the `CURRENT` doc comment block (ending line 54) and `pub const CURRENT` (line 55)
-- Modify `uc2_net/src/sender.rs` (the one `SnapBeginBody { .. }` literal, line 1105–1109) and `uc2_net/src/receiver.rs` (the SNAP_DONE echo literal, 1578–1586; the three in-module test literals at 3956–3959, 4038–4046, 4092–4095) — **interim field values only**, replaced properly in Tasks 4 and 5
+- Modify `uc_net/src/sender.rs` (the one `SnapBeginBody { .. }` literal, line 1105–1109) and `uc_net/src/receiver.rs` (the SNAP_DONE echo literal, 1578–1586; the three in-module test literals at 3956–3959, 4038–4046, 4092–4095) — **interim field values only**, replaced properly in Tasks 4 and 5
 - Modify `fuzz/src/seeds.rs` — the `10-snap-begin-config` seed (112–121) and a new seed after `13-config-reply` (145); `fuzz/README.md` — the `uc_protocol_datagram` row (line 155); regenerate `fuzz/corpus/uc_protocol_datagram/`
 - Modify `docs/reference/wire-protocol.md` — the version table (line 13) and the cnc-vs-wire note (lines 16–19)
 
@@ -839,7 +839,7 @@ Replace `snap_begin_body_roundtrips_and_pins_layout` (`uc_protocol/src/v2/datagr
 
     /// A wire-0.5.0 sender's SNAP_BEGIN is dropped by the LENGTH check, before
     /// `layout` is even looked at: its fixed part is 26 bytes. The `layout`
-    /// refusal on the receiving node (M14c, `uc2_net`) is therefore defensive —
+    /// refusal on the receiving node (M14c, `uc_net`) is therefore defensive —
     /// it catches a body that is 0.6.0-SHAPED (>= 34 B, which a 0.5.0 body with
     /// an 8-byte-or-longer config reaches) yet carries layout 0.
     #[test]
@@ -1032,7 +1032,7 @@ pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 6, 0);
 
 Now fix the five `SnapBeginBody { .. }` literals outside `uc_protocol` with **interim** values so the workspace builds; Tasks 4 and 5 replace them with real ones.
 
-`uc2_net/src/sender.rs:1106-1109` →
+`uc_net/src/sender.rs:1106-1109` →
 ```rust
         write_snap_begin_body(
             &mut body,
@@ -1047,9 +1047,9 @@ Now fix the five `SnapBeginBody { .. }` literals outside `uc_protocol` with **in
             },
         );
 ```
-(add `SNAP_BEGIN_LAYOUT_V2` to the `uc_protocol::v2::datagram` import list at `uc2_net/src/sender.rs:28-30`.)
+(add `SNAP_BEGIN_LAYOUT_V2` to the `uc_protocol::v2::datagram` import list at `uc_net/src/sender.rs:28-30`.)
 
-`uc2_net/src/receiver.rs:1578-1586` (the SNAP_DONE echo) →
+`uc_net/src/receiver.rs:1578-1586` (the SNAP_DONE echo) →
 ```rust
         write_snap_begin_body(
             &mut d[DATAGRAM_HEADER_LEN..],
@@ -1064,14 +1064,14 @@ Now fix the five `SnapBeginBody { .. }` literals outside `uc_protocol` with **in
             },
         );
 ```
-(add `SNAP_BEGIN_LAYOUT_V2` to the import list at `uc2_net/src/receiver.rs:38-45`.)
+(add `SNAP_BEGIN_LAYOUT_V2` to the import list at `uc_net/src/receiver.rs:38-45`.)
 
 The three in-module receiver tests (3956, 4038, 4092) each gain `layout: SNAP_BEGIN_LAYOUT_V2, service_id: 0, services_declared: 1,` in their literal — same shape; Task 5 rewrites them.
 
 - [ ] **Step 5: Run the tests**
 
-Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_protocol --lib && CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_net`
-Expected: all pass. `uc2_net`'s snapshot tests still pass because the receiver ignores the new fields at this point and the body simply grew by 8 bytes on both sides.
+Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_protocol --lib && CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_net`
+Expected: all pass. `uc_net`'s snapshot tests still pass because the receiver ignores the new fields at this point and the body simply grew by 8 bytes on both sides.
 
 - [ ] **Step 6: Fuzz seed + corpus + README**
 
@@ -1141,7 +1141,7 @@ Expected: no output — the Lean model and the conformance vectors cover electio
 ```bash
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo clippy --workspace --all-targets -- -D warnings
 git add uc_protocol/src/v2/datagram.rs uc_protocol/src/version.rs \
-        uc2_net/src/sender.rs uc2_net/src/receiver.rs \
+        uc_net/src/sender.rs uc_net/src/receiver.rs \
         fuzz/src/seeds.rs fuzz/README.md fuzz/corpus/uc_protocol_datagram \
         docs/reference/wire-protocol.md
 git commit -m "feat(protocol)!: wire 0.6.0 — SNAP_BEGIN carries layout/service_id/services_declared (fixed part 26 → 34)"
@@ -1152,16 +1152,16 @@ git commit -m "feat(protocol)!: wire 0.6.0 — SNAP_BEGIN carries layout/service
 ### Task 4: sender — one session, a stream of N artifacts
 
 **Files:**
-- Modify `uc2_net/src/sender.rs` — `SnapshotSource` (line 97–107), `SnapSession` (109–128), the session fields on `Sender` (270–277), `try_open_snap_session` (947–976), `drive_snap_session` (978–1051), `send_snap_chunk` (1053–1090), `send_snap_begin` (1092–1115), the `SNAP_DGRAMS_PER_CYCLE`/timeout constants (57–68), the T17 test fixtures (2572–2651, 2800–2835)
-- Modify `uc2_net/tests/snapshot_session.rs` — the `snapshot_source` in `build()` (lines 96–101) and `tempfile::tempdir()` → `tempdir_in` (93, 133)
+- Modify `uc_net/src/sender.rs` — `SnapshotSource` (line 97–107), `SnapSession` (109–128), the session fields on `Sender` (270–277), `try_open_snap_session` (947–976), `drive_snap_session` (978–1051), `send_snap_chunk` (1053–1090), `send_snap_begin` (1092–1115), the `SNAP_DGRAMS_PER_CYCLE`/timeout constants (57–68), the T17 test fixtures (2572–2651, 2800–2835)
+- Modify `uc_net/tests/snapshot_session.rs` — the `snapshot_source` in `build()` (lines 96–101) and `tempfile::tempdir()` → `tempdir_in` (93, 133)
 
 **Interfaces:**
 
-Consumes (verified): `uc_protocol::v2::datagram::{SNAP_BEGIN_FIXED_LEN = 34, SNAP_BEGIN_LAYOUT_V2, SnapBeginBody { session, layout, service_id, snapshot_pos, total_len, services_declared, config }, write_snap_begin_body}` (Task 3); `Sender::assemble_snap(&mut self, peer: SocketAddr, position: u64, kind: u8, payload: &[u8]) -> bool` (`uc2_net/src/sender.rs:1152`); `CtrlMsg::SnapNak { from, session, offset, length }` / `CtrlMsg::SnapDone { from, session }` (`:83-86`, handlers `:573-595` — **unchanged**, they key on `(peer, session)` only).
+Consumes (verified): `uc_protocol::v2::datagram::{SNAP_BEGIN_FIXED_LEN = 34, SNAP_BEGIN_LAYOUT_V2, SnapBeginBody { session, layout, service_id, snapshot_pos, total_len, services_declared, config }, write_snap_begin_body}` (Task 3); `Sender::assemble_snap(&mut self, peer: SocketAddr, position: u64, kind: u8, payload: &[u8]) -> bool` (`uc_net/src/sender.rs:1152`); `CtrlMsg::SnapNak { from, session, offset, length }` / `CtrlMsg::SnapDone { from, session }` (`:83-86`, handlers `:573-595` — **unchanged**, they key on `(peer, session)` only).
 
 Produces:
 ```rust
-// uc2_net::sender
+// uc_net::sender
 /// One FSM's newest durable artifact, as offered to a snapshot session.
 pub struct SnapArtifact { pub service_id: u8, pub snapshot_pos: u64, pub path: PathBuf, pub len: u64 }
 /// The whole set a session ships: one artifact per declared FSM, ASCENDING by
@@ -1171,13 +1171,13 @@ pub type SnapshotSource = Arc<dyn Fn() -> Option<SnapshotSet> + Send + Sync>;
 pub fn Sender::set_snapshot_source(&mut self, src: SnapshotSource);  // signature unchanged, type changed
 ```
 
-**Ordering decision (state it in the commit):** the two-artifact **transport** tests live in **Task 5**, not here, because they assert receiver-side facts (`snapshots/<id>/` paths, per-artifact rename, the declared-set refusals) that only exist once the intake is per-id. Task 4's own proof is a **sender-side** unit test on the datagram stream (two BEGINs, correct ids/bases, no chunk spanning an artifact boundary), and Task 4 keeps `uc2_net/tests/snapshot_session.rs` green with a one-artifact set.
+**Ordering decision (state it in the commit):** the two-artifact **transport** tests live in **Task 5**, not here, because they assert receiver-side facts (`snapshots/<id>/` paths, per-artifact rename, the declared-set refusals) that only exist once the intake is per-id. Task 4's own proof is a **sender-side** unit test on the datagram stream (two BEGINs, correct ids/bases, no chunk spanning an artifact boundary), and Task 4 keeps `uc_net/tests/snapshot_session.rs` green with a one-artifact set.
 
 **Design note for the implementer — why a BEGIN is re-sent.** The sender advances to artifact *k+1* when artifact *k*'s last chunk has been *sent*, not acked (spec §14.3), so a lost BEGIN has to be self-healing: without a resend, a dropped BEGIN(*k*) makes the receiver drop every chunk of artifact *k* (it cannot place them), the receiver cannot NAK for an artifact it was never told about, and the session stalls until `SNAP_SESSION_TIMEOUT_NS` (30 s) — which under the 20 % loss the tests inject is not a corner case. A duplicate BEGIN is a no-op at the receiver (same session + id + pos), so re-sending it is free of side effects, exactly like a re-sent chunk. This also fixes the same hole for artifact 0 on 0.5.0.
 
 - [ ] **Step 1: Write the failing test**
 
-In `uc2_net/src/sender.rs`'s test module, beside `sender_without_crypto_and_snapshot_source` (line 2625), add a two-artifact fixture and its test:
+In `uc_net/src/sender.rs`'s test module, beside `sender_without_crypto_and_snapshot_source` (line 2625), add a two-artifact fixture and its test:
 
 ```rust
     /// Two artifacts, ids 0 and 2, 2048 B and 3000 B — deliberately not a
@@ -1255,12 +1255,12 @@ In `uc2_net/src/sender.rs`'s test module, beside `sender_without_crypto_and_snap
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_net --lib sender::`
+Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_net --lib sender::`
 Expected: compile error — `cannot find struct SnapshotSet` / `SnapArtifact` in this scope; the existing fixtures at 2618/2646/2830 also fail to compile once the type changes (fixed in Step 3).
 
 - [ ] **Step 3: Implement the source types and the session**
 
-Replace `SnapshotSource` (`uc2_net/src/sender.rs:97-107`) with:
+Replace `SnapshotSource` (`uc_net/src/sender.rs:97-107`) with:
 
 ```rust
 /// M14c: one FSM's newest durable snapshot artifact, as offered to a session.
@@ -1639,14 +1639,14 @@ Replace `send_snap_begin` (1097–1115):
 
 - [ ] **Step 6: Keep the integration harness compiling and green**
 
-`uc2_net/tests/snapshot_session.rs:96-101` →
+`uc_net/tests/snapshot_session.rs:96-101` →
 
 ```rust
-    let snapshot_source: uc2_net::sender::SnapshotSource = Arc::new(move || {
-        Some(uc2_net::sender::SnapshotSet {
+    let snapshot_source: uc_net::sender::SnapshotSource = Arc::new(move || {
+        Some(uc_net::sender::SnapshotSet {
             services_declared: 0b1,
             config: Vec::new(),
-            artifacts: vec![uc2_net::sender::SnapArtifact {
+            artifacts: vec![uc_net::sender::SnapArtifact {
                 service_id: 0,
                 snapshot_pos: SNAP_POS,
                 path: snap_path.clone(),
@@ -1662,7 +1662,7 @@ Also change both `tempfile::tempdir().unwrap()` calls (lines 93 and 133) to
 - [ ] **Step 7: Run**
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_net
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_net
 ```
 Expected: `a_session_ships_one_begin_per_artifact_and_never_spans_a_boundary` passes; the two `snapshot_session.rs` tests still pass (one artifact, receiver still writing flat paths — Task 5 moves them); every T17 crypto test passes.
 
@@ -1670,7 +1670,7 @@ Expected: `a_session_ships_one_begin_per_artifact_and_never_spans_a_boundary` pa
 
 ```bash
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_net/src/sender.rs uc2_net/tests/snapshot_session.rs
+git add uc_net/src/sender.rs uc_net/tests/snapshot_session.rs
 git commit -m "feat(net): snapshot sender ships a stream of N artifacts (SnapshotSet, stream-global offsets, self-healing BEGIN)"
 ```
 
@@ -1679,17 +1679,17 @@ git commit -m "feat(net): snapshot sender ships a stream of N artifacts (Snapsho
 ### Task 5: receiver — per-id intake, floor on the complete set, two named refusals
 
 **Files:**
-- Modify `uc2_net/src/receiver.rs` — `FollowerStats` (366–465, two new counters), `SnapIntake` (474–495), the `FollowerReceiver` snapshot fields (549–564), the constructor defaults (717–723), `set_snapshot_intake` (824–838), `snap_begin` (1480–1523), `snap_chunk` (1525–1547), `snap_complete` (1549–1600), `snap_upkeep` (1640–1679), and the three in-module tests (3944–4008, 4021–4076, 4079–4118)
-- Modify `uc2_net/tests/snapshot_session.rs` — `build()` (76–155), `final_path` (177–179), the two existing tests (182–219), plus three new tests
+- Modify `uc_net/src/receiver.rs` — `FollowerStats` (366–465, two new counters), `SnapIntake` (474–495), the `FollowerReceiver` snapshot fields (549–564), the constructor defaults (717–723), `set_snapshot_intake` (824–838), `snap_begin` (1480–1523), `snap_chunk` (1525–1547), `snap_complete` (1549–1600), `snap_upkeep` (1640–1679), and the three in-module tests (3944–4008, 4021–4076, 4079–4118)
+- Modify `uc_net/tests/snapshot_session.rs` — `build()` (76–155), `final_path` (177–179), the two existing tests (182–219), plus three new tests
 
 **Interfaces:**
 
-Consumes: `SnapBeginBody` + `SNAP_BEGIN_LAYOUT_V2` + `SNAP_BEGIN_FIXED_LEN = 34` (Task 3); `Rebuilt::{new(start), insert(start, end) -> bool, contiguous() -> u64, first_gap() -> Option<(u64,u64)>}` (`uc2_net/src/rebuild.rs:23,33,28,74`); `NakTimer::{new(cfg, seed), poll(Option<(u64,u64)>, now_ns) -> Option<(u64,u64)>}` (`:111,126`); `IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>)` (`:472`); `FollowerReceiver::stats() -> Arc<FollowerStats>` (used at `uc2_node/src/node.rs:996`).
+Consumes: `SnapBeginBody` + `SNAP_BEGIN_LAYOUT_V2` + `SNAP_BEGIN_FIXED_LEN = 34` (Task 3); `Rebuilt::{new(start), insert(start, end) -> bool, contiguous() -> u64, first_gap() -> Option<(u64,u64)>}` (`uc_net/src/rebuild.rs:23,33,28,74`); `NakTimer::{new(cfg, seed), poll(Option<(u64,u64)>, now_ns) -> Option<(u64,u64)>}` (`:111,126`); `IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>)` (`:472`); `FollowerReceiver::stats() -> Arc<FollowerStats>` (used at `uc_node/src/node.rs:996`).
 
 Produces:
 ```rust
-// uc2_net::receiver::FollowerStats — the two named refusals (spec §14.3),
-// read by uc2_node (Task 6) and exported as metrics in the observability workstream.
+// uc_net::receiver::FollowerStats — the two named refusals (spec §14.3),
+// read by uc_node (Task 6) and exported as metrics in the observability workstream.
 pub snap_refused_legacy_peer: AtomicU64,        // "peer wire 0.5.0"
 pub snap_refused_declared_mismatch: AtomicU64,  // "declared-set mismatch"
 // signature change: the intake takes the snapshots/ ROOT and this node's own mask
@@ -1705,7 +1705,7 @@ pub fn FollowerReceiver::set_snapshot_intake(
 
 - [ ] **Step 1: Write the failing tests**
 
-Rewrite `uc2_net/tests/snapshot_session.rs`'s harness to take an artifact list. Replace the `SNAP_POS`/`SNAP_LEN` constants (35–36) and `write_snapshot_file` (56–64) with:
+Rewrite `uc_net/tests/snapshot_session.rs`'s harness to take an artifact list. Replace the `SNAP_POS`/`SNAP_LEN` constants (35–36) and `write_snapshot_file` (56–64) with:
 
 ```rust
 const SNAP_LEN: usize = 300 * 1024;
@@ -1740,15 +1740,15 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
         declared |= 1 << id;
         let path = write_snapshot_file(leader_dir.path(), id);
         let len = std::fs::metadata(&path).unwrap().len();
-        artifacts.push(uc2_net::sender::SnapArtifact {
+        artifacts.push(uc_net::sender::SnapArtifact {
             service_id: id,
             snapshot_pos: snap_pos(id),
             path,
             len,
         });
     }
-    let snapshot_source: uc2_net::sender::SnapshotSource = Arc::new(move || {
-        Some(uc2_net::sender::SnapshotSet {
+    let snapshot_source: uc_net::sender::SnapshotSource = Arc::new(move || {
+        Some(uc_net::sender::SnapshotSet {
             services_declared: declared,
             config: Vec::new(),
             artifacts: artifacts.clone(),
@@ -1881,7 +1881,7 @@ with this helper on `Harness` (the follower is cleartext here, so a plain socket
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_net --test snapshot_session`
+Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_net --test snapshot_session`
 Expected: compile errors — `set_snapshot_intake` takes 2 arguments but 3 were supplied; `no field snap_refused_legacy_peer on type FollowerStats`.
 
 - [ ] **Step 3: Implement the counters and the intake state**
@@ -2256,7 +2256,7 @@ Each of `the_snapshot_intakes_snap_nak_and_snap_done_are_sealed` (3944), `an_uns
 - [ ] **Step 6: Run**
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_net
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_net
 ```
 Expected: all five `snapshot_session` tests pass (the two single-artifact ones now reading `snapshots/0/`), the two refusal tests count exactly their own counter, and every in-module crypto/T17 test passes.
 
@@ -2266,7 +2266,7 @@ If `a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss` times out, the 
 
 ```bash
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_net/src/receiver.rs uc2_net/tests/snapshot_session.rs
+git add uc_net/src/receiver.rs uc_net/tests/snapshot_session.rs
 git commit -m "feat(net): per-FSM snapshot intake — snapshots/<id>/, floor adopted only on the complete set, two named refusals"
 ```
 
@@ -2275,23 +2275,23 @@ git commit -m "feat(net): per-FSM snapshot intake — snapshots/<id>/, floor ado
 ### Task 6: node wiring + the two-FSM learner join + flag-day docs
 
 **Files:**
-- Modify `uc2_node/src/services.rs` — add `ring_mask()` beside `ring_ids()` (lines 87–93)
-- Modify `uc2_node/src/ipc.rs` — add `snapshot_root()` beside `snapshot_dir_for` (lines 92–95)
-- Modify `uc2_node/src/node.rs` — the snapshot wiring block (906–938), `set_snapshot_intake` (980–983), a public accessor beside `crypto_stats` (1450–1458)
-- Modify `uc2_node/tests/learner.rs` — the existing `fresh_learner_joins_a_purged_leader_via_snapshot_session` (338–455, one added store) and a new test after it
+- Modify `uc_node/src/services.rs` — add `ring_mask()` beside `ring_ids()` (lines 87–93)
+- Modify `uc_node/src/ipc.rs` — add `snapshot_root()` beside `snapshot_dir_for` (lines 92–95)
+- Modify `uc_node/src/node.rs` — the snapshot wiring block (906–938), `set_snapshot_intake` (980–983), a public accessor beside `crypto_stats` (1450–1458)
+- Modify `uc_node/tests/learner.rs` — the existing `fresh_learner_joins_a_purged_leader_via_snapshot_session` (338–455, one added store) and a new test after it
 - Modify `docs/how-to/upgrade-a-cluster.md` (new section after line 214's `## Control-page change in 2.8.0` block, i.e. before `## Where to go next` at 238) and `docs/reference/semver-policy.md` (line 136)
 
 **Interfaces:**
 
-Consumes (verified): `uc2_net::sender::{SnapshotSet, SnapArtifact, SnapshotSource}` and `FollowerReceiver::set_snapshot_intake(PathBuf, u64, Option<IncomingSnapshotSignal>)` (Tasks 4, 5); `FollowerStats::{snap_refused_legacy_peer, snap_refused_declared_mismatch}` (Task 5); `ServicesConfig::{declared() -> u64, ids(), ring_ids(), is_declared(u8)}` (`uc2_node/src/services.rs:74-93`); `CncPage::service_slot(usize).snapshot_pos.load_acquire()` (used at `services.rs:146`); `InstanceDir::snapshot_dir_for(u8)` (`uc2_node/src/ipc.rs:93`); `Node::route_drops: Arc<FollowerStats>` — the SAME `Arc` the receiver bumps (`node.rs:996, 451`), already surfaced by `crypto_stats()` (`:1456`).
+Consumes (verified): `uc_net::sender::{SnapshotSet, SnapArtifact, SnapshotSource}` and `FollowerReceiver::set_snapshot_intake(PathBuf, u64, Option<IncomingSnapshotSignal>)` (Tasks 4, 5); `FollowerStats::{snap_refused_legacy_peer, snap_refused_declared_mismatch}` (Task 5); `ServicesConfig::{declared() -> u64, ids(), ring_ids(), is_declared(u8)}` (`uc_node/src/services.rs:74-93`); `CncPage::service_slot(usize).snapshot_pos.load_acquire()` (used at `services.rs:146`); `InstanceDir::snapshot_dir_for(u8)` (`uc_node/src/ipc.rs:93`); `Node::route_drops: Arc<FollowerStats>` — the SAME `Arc` the receiver bumps (`node.rs:996, 451`), already surfaced by `crypto_stats()` (`:1456`).
 
 Produces:
 ```rust
-// uc2_node::services
+// uc_node::services
 impl ServicesConfig { pub fn ring_mask(&self) -> u64; }   // {0} for a none_for_tests node
-// uc2_node::ipc
+// uc_node::ipc
 impl InstanceDir { pub fn snapshot_root(&self) -> PathBuf; }
-// uc2_node
+// uc_node
 impl Node {
     /// (peer wire 0.5.0, declared-set mismatch) — the observability workstream's metric source.
     pub fn snapshot_session_refusals(&self) -> (u64, u64);
@@ -2305,7 +2305,7 @@ impl Node {
 
 - [ ] **Step 1: Write the failing test**
 
-In `uc2_node/tests/learner.rs`, add after the existing join test (line 455) — read that test end to end first; this one mirrors its shape and adds two real FSMs on both sides:
+In `uc_node/tests/learner.rs`, add after the existing join test (line 455) — read that test end to end first; this one mirrors its shape and adds two real FSMs on both sides:
 
 ```rust
 /// A snapshot-capable RAW state machine (bytes in, bytes out — no serde, so the
@@ -2317,7 +2317,7 @@ struct SumSm {
     last: Option<u64>,
 }
 
-impl uc2_service::RawStateMachine for SumSm {
+impl uc_service::RawStateMachine for SumSm {
     fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
         if cmd.len() >= 8 {
             self.total = self.total.wrapping_add(u64::from_le_bytes(cmd[..8].try_into().unwrap()));
@@ -2333,9 +2333,9 @@ impl uc2_service::RawStateMachine for SumSm {
     }
 }
 
-impl uc2_service::SnapshotStateMachine for SumSm {
+impl uc_service::SnapshotStateMachine for SumSm {
     type SnapshotHandle = Vec<u8>;
-    fn freeze(&self) -> Result<(Vec<u8>, u64), uc2_service::SnapshotError> {
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc_service::SnapshotError> {
         let pos = self.last.unwrap_or(0);
         let mut buf = Vec::with_capacity(16);
         buf.extend_from_slice(&self.total.to_le_bytes());
@@ -2345,7 +2345,7 @@ impl uc2_service::SnapshotStateMachine for SumSm {
     fn stream_snapshot(
         handle: Vec<u8>,
         dst: &mut dyn std::io::Write,
-    ) -> Result<(), uc2_service::SnapshotError> {
+    ) -> Result<(), uc_service::SnapshotError> {
         dst.write_all(&handle)?;
         Ok(())
     }
@@ -2353,7 +2353,7 @@ impl uc2_service::SnapshotStateMachine for SumSm {
         &mut self,
         position: u64,
         src: &mut dyn std::io::Read,
-    ) -> Result<u64, uc2_service::SnapshotError> {
+    ) -> Result<u64, uc_service::SnapshotError> {
         let mut buf = Vec::new();
         src.read_to_end(&mut buf)?;
         assert!(buf.len() >= 16, "a SumSm artifact is 16 bytes");
@@ -2363,11 +2363,11 @@ impl uc2_service::SnapshotStateMachine for SumSm {
     }
 }
 
-fn start_sum_service(dir: &Path, app: &str, id: u8) -> uc2_service::Service<SumSm> {
-    let cfg = uc2_service::ServiceConfig::new(dir, app)
+fn start_sum_service(dir: &Path, app: &str, id: u8) -> uc_service::Service<SumSm> {
+    let cfg = uc_service::ServiceConfig::new(dir, app)
         .service_id(id)
-        .snapshot_policy(uc2_service::SnapshotPolicy { interval_bytes: 256 * 1024 });
-    uc2_service::ServiceBuilder::new(cfg, SumSm::default())
+        .snapshot_policy(uc_service::SnapshotPolicy { interval_bytes: 256 * 1024 });
+    uc_service::ServiceBuilder::new(cfg, SumSm::default())
         .start_with_snapshots()
         .expect("service start")
 }
@@ -2411,8 +2411,8 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         faults: FaultConfig::default(),
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 4096 },
         journal_segment_bytes: SEG,
-        crypto: uc2_node::CryptoConfig::Disabled,
-        services: uc2_node::ServicesConfig::from_ids(&[0, 1], None).unwrap(),
+        crypto: uc_node::CryptoConfig::Disabled,
+        services: uc_node::ServicesConfig::from_ids(&[0, 1], None).unwrap(),
     };
 
     let v_dir = dir.path().join("v0");
@@ -2497,16 +2497,16 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
 }
 ```
 
-Add the imports this needs at the top of `learner.rs`: `use std::path::Path;` (the file already imports `PathBuf`) and nothing else — `uc2_service` items are named through their full paths above. `uc2_service` is already a dev-dependency of `uc2_node` (`uc2_node/tests/services.rs:14` imports it).
+Add the imports this needs at the top of `learner.rs`: `use std::path::Path;` (the file already imports `PathBuf`) and nothing else — `uc_service` items are named through their full paths above. `uc_service` is already a dev-dependency of `uc_node` (`uc_node/tests/services.rs:14` imports it).
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_node --test learner`
+Run: `CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_node --test learner`
 Expected: compile error — `no method named snapshot_session_refusals found for struct Node`. (After Step 4 it will then fail at runtime on the two-artifact assertions until the wiring lands, because the node's source closure still offers one artifact.)
 
 - [ ] **Step 3: Add the two small accessors**
 
-`uc2_node/src/services.rs`, beside `ring_ids` (after line 93):
+`uc_node/src/services.rs`, beside `ring_ids` (after line 93):
 
 ```rust
     /// [`ring_ids`](Self::ring_ids) as a bitmask — what the snapshot session
@@ -2519,7 +2519,7 @@ Expected: compile error — `no method named snapshot_session_refusals found for
     }
 ```
 
-`uc2_node/src/ipc.rs`, beside `snapshot_dir_for` (after line 95):
+`uc_node/src/ipc.rs`, beside `snapshot_dir_for` (after line 95):
 
 ```rust
     /// M14c: the snapshots ROOT (`snapshots/`), which holds one `<id>/`
@@ -2532,7 +2532,7 @@ Expected: compile error — `no method named snapshot_session_refusals found for
 
 - [ ] **Step 4: Wire the node**
 
-`uc2_node/src/node.rs:906-938` — replace the `snap_dir` block and the source closure:
+`uc_node/src/node.rs:906-938` — replace the `snap_dir` block and the source closure:
 
 ```rust
         // M6 Task 6 / M14c: snapshot session wiring. `snap_root` holds one
@@ -2548,7 +2548,7 @@ Expected: compile error — `no method named snapshot_session_refusals found for
 ```rust
         // Offer ONLY files at or above the node's durable floor: a session ships
         // fully-published artifacts (rename-atomic, and each id's marker is
-        // written only after its own rename — `uc2_service::builder_agent`).
+        // written only after its own rename — `uc_service::builder_agent`).
         let src_cnc = Arc::clone(&cnc);
         let src_root = snap_root.clone();
         let src_services = cfg.services;
@@ -2589,7 +2589,7 @@ Expected: compile error — `no method named snapshot_session_refusals found for
         }));
 ```
 
-`uc2_node/src/node.rs:980-983` →
+`uc_node/src/node.rs:980-983` →
 
 ```rust
         receiver.set_snapshot_intake(
@@ -2599,7 +2599,7 @@ Expected: compile error — `no method named snapshot_session_refusals found for
         );
 ```
 
-Import `use uc2_net::sender::{SnapArtifact, SnapshotSet};` alongside the existing `uc2_net::sender` imports at the top of `node.rs`.
+Import `use uc_net::sender::{SnapArtifact, SnapshotSet};` alongside the existing `uc_net::sender` imports at the top of `node.rs`.
 
 Add the accessor beside `crypto_stats` (after line 1458):
 
@@ -2619,7 +2619,7 @@ Add the accessor beside `crypto_stats` (after line 1458):
 
 - [ ] **Step 5: Fix the existing single-FSM join test**
 
-`uc2_node/tests/learner.rs:452` currently publishes the floor by storing only the page-1 aggregate:
+`uc_node/tests/learner.rs:452` currently publishes the floor by storing only the page-1 aggregate:
 
 ```rust
     cnc.snapshots().service_snapshot_pos.store_release(floor);
@@ -2641,14 +2641,14 @@ That test already writes its artifact to `v_dir/snapshots/0/` (line 449) and the
 - [ ] **Step 6: Run**
 
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_node --test learner
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_node --test learner
 ```
-Expected: both join tests pass. If the two-FSM one fails, the discriminating checks, in order: (a) `learner.snapshot_session_refusals()` non-zero → the masks disagree (`ring_mask` vs what the sender put on the wire); (b) `l_dir/snapshots/1/` empty while `0/` is populated → the second BEGIN never landed (Task 4's resend); (c) both directories populated but a learner FSM's `applied` stuck → the service-side install, i.e. `replay_into`'s gap guard (`uc2_service/src/replay.rs:87-100`) not finding a covering artifact — check that the artifact position is `>= ` the learner's `archive_first_base` (it must be: the floor is the min over the set, and each id's own position is `>= ` that min).
+Expected: both join tests pass. If the two-FSM one fails, the discriminating checks, in order: (a) `learner.snapshot_session_refusals()` non-zero → the masks disagree (`ring_mask` vs what the sender put on the wire); (b) `l_dir/snapshots/1/` empty while `0/` is populated → the second BEGIN never landed (Task 4's resend); (c) both directories populated but a learner FSM's `applied` stuck → the service-side install, i.e. `replay_into`'s gap guard (`uc_service/src/replay.rs:87-100`) not finding a covering artifact — check that the artifact position is `>= ` the learner's `archive_first_base` (it must be: the floor is the min over the set, and each id's own position is `>= ` that min).
 
 Then the fuller sweep this task touches:
 ```bash
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_node --test services --test purge_safety --test lifecycle
-CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc2_net
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_node --test services --test purge_safety --test lifecycle
+CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo test -p uc_net
 ```
 
 - [ ] **Step 7: Flag-day docs**
@@ -2700,8 +2700,8 @@ rollback step beyond restarting the old binaries together.
 
 ```bash
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_node/src/services.rs uc2_node/src/ipc.rs uc2_node/src/node.rs \
-        uc2_node/tests/learner.rs \
+git add uc_node/src/services.rs uc_node/src/ipc.rs uc_node/src/node.rs \
+        uc_node/tests/learner.rs \
         docs/how-to/upgrade-a-cluster.md docs/reference/semver-policy.md
 git commit -m "feat(node): ship one artifact per declared FSM in a snapshot session; two-FSM learner join; 0.6.0 flag-day docs"
 ```
@@ -2711,39 +2711,39 @@ git commit -m "feat(node): ship one artifact per declared FSM in a snapshot sess
 ### Task 7: The labelled per-FSM metric families
 
 **Files:**
-- Modify `uc2_node/src/obs/metrics.rs`:
-  - imports (15–23): add `uc2_log::cnc::unpack_service_status`, add `CNC_MAX_SERVICES` to the `uc_protocol::v2::cnc` list
-  - `CONTRACT_SERIES` (34–100): remove the four scattered `uc2_service_*` entries (53, 54, 57, 65), insert a nine-entry service block after `"uc2_commit_bytes"` (52)
+- Modify `uc_node/src/obs/metrics.rs`:
+  - imports (15–23): add `uc_log::cnc::unpack_service_status`, add `CNC_MAX_SERVICES` to the `uc_protocol::v2::cnc` list
+  - `CONTRACT_SERIES` (34–100): remove the four scattered `uc_service_*` entries (53, 54, 57, 65), insert a nine-entry service block after `"uc2_commit_bytes"` (52)
   - new helpers after `push_labeled` (144–152)
-  - `render_prometheus` (161): call the new block where the service band is today (269–311), move `let now = now_unix_ns();` (348) up above it, delete the old `uc2_service_heartbeat_age_seconds` push (357–362)
+  - `render_prometheus` (161): call the new block where the service band is today (269–311), move `let now = now_unix_ns();` (348) up above it, delete the old `uc_service_heartbeat_age_seconds` push (357–362)
   - test module (626–774): fixture `synthetic_sources` (637–676) declares FSM 0; three new tests after `peer_slots_export_only_occupied_with_labels` (731–739)
-- Test: `uc2_node/src/obs/metrics.rs`'s own `mod tests` (626) — `every_contract_series_is_present` (680–686) and `series_present` (696–700) are reused unchanged.
-- **Not modified:** `uc2_node/examples/m10_gate.rs:294–320` iterates `CONTRACT_SERIES` and prints `CONTRACT_SERIES.len()`, so the coverage gate row picks the five new families up for free — verify by reading, change nothing.
+- Test: `uc_node/src/obs/metrics.rs`'s own `mod tests` (626) — `every_contract_series_is_present` (680–686) and `series_present` (696–700) are reused unchanged.
+- **Not modified:** `uc_node/examples/m10_gate.rs:294–320` iterates `CONTRACT_SERIES` and prints `CONTRACT_SERIES.len()`, so the coverage gate row picks the five new families up for free — verify by reading, change nothing.
 
 **Interfaces:**
 
 Consumes (all verified in the tree):
-- `uc2_log::cnc::CncPage::services_declared(&self) -> u64` (`uc2_log/src/cnc.rs:517`), `fsm_lag_bytes(&self) -> u64` (532), `service_slot(&self, i: usize) -> &ServiceSlot` (506, panics on `i >= 8`).
-- `uc2_log::cnc::ServiceSlot` (`uc2_log/src/cnc.rs:170–179`): `status, applied, epoch, output_completed, snapshot_pos, heartbeat_ns, lag_waits, reserved`, each a `PaddedAtomicU64` with `load_acquire()`.
-- `uc2_log::cnc::unpack_service_status(v: u64) -> (u8, bool, u32)` (`uc2_log/src/cnc.rs:205`) — `(service_id, attached, incarnation)`.
+- `uc_log::cnc::CncPage::services_declared(&self) -> u64` (`uc_log/src/cnc.rs:517`), `fsm_lag_bytes(&self) -> u64` (532), `service_slot(&self, i: usize) -> &ServiceSlot` (506, panics on `i >= 8`).
+- `uc_log::cnc::ServiceSlot` (`uc_log/src/cnc.rs:170–179`): `status, applied, epoch, output_completed, snapshot_pos, heartbeat_ns, lag_waits, reserved`, each a `PaddedAtomicU64` with `load_acquire()`.
+- `uc_log::cnc::unpack_service_status(v: u64) -> (u8, bool, u32)` (`uc_log/src/cnc.rs:205`) — `(service_id, attached, incarnation)`.
 - `uc_protocol::v2::cnc::CNC_MAX_SERVICES: usize = 8` (`uc_protocol/src/v2/cnc.rs:268`).
 - `push_family_header(out, name, help, ty)` (`metrics.rs:102`), `push_gauge` (115), `push_gauge_f64` (123), `push_counter` (131), `push_labeled(out, name, help, ty, &[(String, u64)])` (144 — five params, the peer band's mechanism at 364–406).
 - `now_unix_ns() -> u64` (`metrics.rs:26`).
 
 Produces (later tasks depend on these exact names):
-- Nine metric families, rendered in this order: `uc2_service_applied_bytes`, `uc2_service_epoch`, `uc2_service_snapshot_pos_bytes`, `uc2_service_heartbeat_age_seconds` (each = the existing unlabeled aggregate **plus** one `service="<id>"` sample per declared id, in ONE family block), then `uc2_service_attached`, `uc2_service_lag_bytes`, `uc2_service_lag_waits_total` (labelled only), then `uc2_services_declared` and `uc2_fsm_lag_bytes` (plain gauges).
+- Nine metric families, rendered in this order: `uc_service_applied_bytes`, `uc_service_epoch`, `uc_service_snapshot_pos_bytes`, `uc_service_heartbeat_age_seconds` (each = the existing unlabeled aggregate **plus** one `service="<id>"` sample per declared id, in ONE family block), then `uc_service_attached`, `uc_service_lag_bytes`, `uc_service_lag_waits_total` (labelled only), then `uc_services_declared` and `uc2_fsm_lag_bytes` (plain gauges).
 - `struct ServiceRow` + `fn service_rows(&ObsSources, commit: u64, now: u64) -> Vec<ServiceRow>` and `fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64)`, private to `metrics.rs`.
 - `CONTRACT_SERIES.len() == 70` (was 65).
 
 **Design notes the implementer must not re-decide:**
 
-1. **One family block, aggregate and labels together.** `uc2_service_applied_bytes` and `uc2_service_applied_bytes{service="0"}` are samples of the *same* Prometheus family; a scrape that emits two `# HELP` lines for one name is rejected by the Prometheus text parser. So the aggregate and its labelled twins share a single header, emitted by `push_gauge_with_services`. Consequence for queries (Task 8/Task 10 both depend on it): `sum(uc2_service_applied_bytes)` double counts, so "the aggregate" is `{service=""}` and "per FSM" is `{service!=""}`.
-2. **Rows come from the declared bitmask on the page, not from occupied slots.** Unlike the peer band (which skips `id_and_role == 0`), a declared id renders even when nothing ever attached: `uc2_service_attached{service="1"} 0` is the whole point — you cannot alert on a series that is absent. A harness page (`services_declared == 0`, `ServicesConfig::none_for_tests`) renders the headers with no labelled samples, which is exactly what `push_labeled` already does for zero peers.
-3. `uc2_service_epoch`'s **aggregate stays FSM 0's epoch** (what M14a made it, `metrics.rs:277–282`); only its labelled twins are per-id. It is not a `min`.
+1. **One family block, aggregate and labels together.** `uc_service_applied_bytes` and `uc_service_applied_bytes{service="0"}` are samples of the *same* Prometheus family; a scrape that emits two `# HELP` lines for one name is rejected by the Prometheus text parser. So the aggregate and its labelled twins share a single header, emitted by `push_gauge_with_services`. Consequence for queries (Task 8/Task 10 both depend on it): `sum(uc_service_applied_bytes)` double counts, so "the aggregate" is `{service=""}` and "per FSM" is `{service!=""}`.
+2. **Rows come from the declared bitmask on the page, not from occupied slots.** Unlike the peer band (which skips `id_and_role == 0`), a declared id renders even when nothing ever attached: `uc_service_attached{service="1"} 0` is the whole point — you cannot alert on a series that is absent. A harness page (`services_declared == 0`, `ServicesConfig::none_for_tests`) renders the headers with no labelled samples, which is exactly what `push_labeled` already does for zero peers.
+3. `uc_service_epoch`'s **aggregate stays FSM 0's epoch** (what M14a made it, `metrics.rs:277–282`); only its labelled twins are per-id. It is not a `min`.
 
 - [ ] **Step 1: RED — the per-FSM sample test**
 
-Add to `uc2_node/src/obs/metrics.rs`'s `mod tests`, after `peer_slots_export_only_occupied_with_labels` (ends 739). Extend the test-module import at 630 to `use uc2_log::cnc::{CncMeta, CncPage, pack_id_and_role, pack_service_status};`.
+Add to `uc_node/src/obs/metrics.rs`'s `mod tests`, after `peer_slots_export_only_occupied_with_labels` (ends 739). Extend the test-module import at 630 to `use uc_log::cnc::{CncMeta, CncPage, pack_id_and_role, pack_service_status};`.
 
 ```rust
     /// M14c (spec §9): one labelled sample per DECLARED id — including an id
@@ -2763,16 +2763,16 @@ Add to `uc2_node/src/obs/metrics.rs`'s `mod tests`, after `peer_slots_export_onl
         s0.lag_waits.store_release(12);
         // id 2: declared, never attached — every field stays zero.
         let text = render_prometheus(&s);
-        assert!(text.contains(r#"uc2_service_applied_bytes{service="0"} 9000"#), "{text}");
-        assert!(text.contains(r#"uc2_service_epoch{service="0"} 7"#), "{text}");
-        assert!(text.contains(r#"uc2_service_snapshot_pos_bytes{service="0"} 4096"#), "{text}");
-        assert!(text.contains(r#"uc2_service_attached{service="0"} 1"#), "{text}");
-        assert!(text.contains(r#"uc2_service_attached{service="2"} 0"#), "{text}");
-        assert!(text.contains(r#"uc2_service_lag_bytes{service="0"} 1000"#), "{text}");
-        assert!(text.contains(r#"uc2_service_lag_bytes{service="2"} 10000"#), "{text}");
-        assert!(text.contains(r#"uc2_service_lag_waits_total{service="0"} 12"#), "{text}");
-        assert!(text.contains(r#"uc2_service_heartbeat_age_seconds{service="2"}"#), "{text}");
-        assert!(text.contains("\nuc2_services_declared 5\n"), "{text}");
+        assert!(text.contains(r#"uc_service_applied_bytes{service="0"} 9000"#), "{text}");
+        assert!(text.contains(r#"uc_service_epoch{service="0"} 7"#), "{text}");
+        assert!(text.contains(r#"uc_service_snapshot_pos_bytes{service="0"} 4096"#), "{text}");
+        assert!(text.contains(r#"uc_service_attached{service="0"} 1"#), "{text}");
+        assert!(text.contains(r#"uc_service_attached{service="2"} 0"#), "{text}");
+        assert!(text.contains(r#"uc_service_lag_bytes{service="0"} 1000"#), "{text}");
+        assert!(text.contains(r#"uc_service_lag_bytes{service="2"} 10000"#), "{text}");
+        assert!(text.contains(r#"uc_service_lag_waits_total{service="0"} 12"#), "{text}");
+        assert!(text.contains(r#"uc_service_heartbeat_age_seconds{service="2"}"#), "{text}");
+        assert!(text.contains("\nuc_services_declared 5\n"), "{text}");
         assert!(text.contains("\nuc2_fsm_lag_bytes 65536\n"), "{text}");
         assert!(!text.contains(r#"service="1""#), "id 1 is not declared: {text}");
     }
@@ -2786,12 +2786,12 @@ Add to `uc2_node/src/obs/metrics.rs`'s `mod tests`, after `peer_slots_export_onl
         s.cnc.store_services_declared(0b11);
         s.cnc.service().service_applied.store_release(1_234);
         let text = render_prometheus(&s);
-        assert!(text.contains("\nuc2_service_applied_bytes 1234\n"), "{text}");
+        assert!(text.contains("\nuc_service_applied_bytes 1234\n"), "{text}");
         for name in [
-            "uc2_service_applied_bytes",
-            "uc2_service_epoch",
-            "uc2_service_snapshot_pos_bytes",
-            "uc2_service_heartbeat_age_seconds",
+            "uc_service_applied_bytes",
+            "uc_service_epoch",
+            "uc_service_snapshot_pos_bytes",
+            "uc_service_heartbeat_age_seconds",
         ] {
             assert_eq!(
                 text.matches(&format!("# TYPE {name} ")).count(),
@@ -2811,7 +2811,7 @@ Add to `uc2_node/src/obs/metrics.rs`'s `mod tests`, after `peer_slots_export_onl
         s.cnc.counters().commit.store_release(500);
         s.cnc.service_slot(0).applied.store_release(900);
         assert!(
-            render_prometheus(&s).contains(r#"uc2_service_lag_bytes{service="0"} 0"#),
+            render_prometheus(&s).contains(r#"uc_service_lag_bytes{service="0"} 0"#),
             "{}",
             render_prometheus(&s)
         );
@@ -2820,9 +2820,9 @@ Add to `uc2_node/src/obs/metrics.rs`'s `mod tests`, after `peer_slots_export_onl
 
 ```bash
 export CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a
-cargo test -p uc2_node --lib obs::metrics 2>&1 | tail -20
+cargo test -p uc_node --lib obs::metrics 2>&1 | tail -20
 ```
-Expected: three failures, each `assertion failed: text.contains(...)` — the strings `uc2_service_applied_bytes{service="0"} 9000`, `uc2_services_declared`, `uc2_service_lag_bytes{service="0"} 0` are nowhere in the render (only `uc2_service_applied_bytes 0` is). `the_aggregates_keep_their_bare_names_in_one_family_block` passes already (one header each, no twins yet) — that is fine, it is the regression guard for step 3.
+Expected: three failures, each `assertion failed: text.contains(...)` — the strings `uc_service_applied_bytes{service="0"} 9000`, `uc_services_declared`, `uc_service_lag_bytes{service="0"} 0` are nowhere in the render (only `uc_service_applied_bytes 0` is). `the_aggregates_keep_their_bare_names_in_one_family_block` passes already (one header each, no twins yet) — that is fine, it is the regression guard for step 3.
 
 - [ ] **Step 2: the row gatherer and the three push helpers**
 
@@ -2834,7 +2834,7 @@ In `metrics.rs`, after `push_labeled` (ends 152), add:
 ///
 /// Unlike the peer band (which skips unoccupied slots), a declared id gets a
 /// row even when nothing has ever attached to it: an absent FSM must show up
-/// as `uc2_service_attached{service="k"} 0`, not as a missing series —
+/// as `uc_service_attached{service="k"} 0`, not as a missing series —
 /// `Uc2ServiceAbsent` cannot alert on a series that is not there. A harness
 /// page (`services_declared == 0`) yields no rows, and the families then
 /// render as headers alone, exactly like a node with no occupied peer slots.
@@ -2951,7 +2951,7 @@ fn push_service_labeled(
 Add the imports (15–23):
 
 ```rust
-use uc2_log::cnc::unpack_service_status;
+use uc_log::cnc::unpack_service_status;
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
     NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
@@ -2970,7 +2970,7 @@ Still in `metrics.rs`, after `push_service_labeled`:
 /// The aggregates are page 1's `min` over the declared ids, published once
 /// per cycle by the node (`crate::services::service_mins` /
 /// `Consensus::publish_service_mins`) — they now mean "the slowest FSM".
-/// `uc2_service_epoch`'s aggregate is the exception: it is FSM 0's epoch
+/// `uc_service_epoch`'s aggregate is the exception: it is FSM 0's epoch
 /// (M14a retired page 1's `service_epoch`), not a min.
 fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64) {
     let rows = service_rows(s, commit, now);
@@ -2980,7 +2980,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
 
     push_gauge_with_services(
         out,
-        "uc2_service_applied_bytes",
+        "uc_service_applied_bytes",
         "Position the service state machine has applied through (unlabeled = the SLOWEST declared FSM; one labeled sample per declared FSM).",
         service.service_applied.load_acquire(),
         &rows,
@@ -2988,7 +2988,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_gauge_with_services(
         out,
-        "uc2_service_epoch",
+        "uc_service_epoch",
         "Service incarnation counter, bumped each attach (unlabeled = FSM 0's, the M10 series; one labeled sample per declared FSM).",
         s.cnc.service_slot(0).epoch.load_acquire(),
         &rows,
@@ -2996,7 +2996,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_gauge_with_services(
         out,
-        "uc2_service_snapshot_pos_bytes",
+        "uc_service_snapshot_pos_bytes",
         "Position of the newest complete service-built snapshot, 0 = none (unlabeled = the min over declared FSMs, which is the purge floor).",
         snapshots.service_snapshot_pos.load_acquire(),
         &rows,
@@ -3004,7 +3004,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_gauge_f64_with_services(
         out,
-        "uc2_service_heartbeat_age_seconds",
+        "uc_service_heartbeat_age_seconds",
         "Seconds since a service heartbeat was last stamped, unlabeled = the stalest declared FSM (a never-written heartbeat reads as a huge age, by design).",
         now.saturating_sub(status.service_heartbeat_ns.load_acquire()) as f64 / 1e9,
         &rows,
@@ -3012,7 +3012,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_service_labeled(
         out,
-        "uc2_service_attached",
+        "uc_service_attached",
         "1 if this declared FSM's slot has the ATTACHED bit set. A declared FSM that never started reads 0 here and holds admission closed.",
         "gauge",
         &rows,
@@ -3020,7 +3020,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_service_labeled(
         out,
-        "uc2_service_lag_bytes",
+        "uc_service_lag_bytes",
         "commit - this FSM's applied position (saturating). Pinned at uc2_fsm_lag_bytes means this FSM is pacing the cluster.",
         "gauge",
         &rows,
@@ -3028,7 +3028,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_service_labeled(
         out,
-        "uc2_service_lag_waits_total",
+        "uc_service_lag_waits_total",
         "Times this FSM's apply loop waited at the lag barrier for a sibling.",
         "counter",
         &rows,
@@ -3036,7 +3036,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     );
     push_gauge(
         out,
-        "uc2_services_declared",
+        "uc_services_declared",
         "Bitmask of declared service ids (bit k = id k). Must match cluster-wide; a mismatch refuses snapshot sessions.",
         s.cnc.services_declared(),
     );
@@ -3049,7 +3049,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
 }
 ```
 
-In `render_prometheus`: keep `let service = s.cnc.service();` and `let service_applied = service.service_applied.load_acquire();` (269–270, `service_applied` still feeds `uc2_apply_lag_bytes` at 331), then **replace** the `uc2_service_applied_bytes` push (271–276) and the `uc2_service_epoch` push (277–282) with:
+In `render_prometheus`: keep `let service = s.cnc.service();` and `let service_applied = service.service_applied.load_acquire();` (269–270, `service_applied` still feeds `uc2_apply_lag_bytes` at 331), then **replace** the `uc_service_applied_bytes` push (271–276) and the `uc_service_epoch` push (277–282) with:
 
 ```rust
     // M14c (spec §9): the whole per-FSM band — the four M10 aggregates (now
@@ -3060,22 +3060,22 @@ In `render_prometheus`: keep `let service = s.cnc.service();` and `let service_a
     push_service_families(&mut out, s, commit, now);
 ```
 
-Then delete the `uc2_service_snapshot_pos_bytes` push (297–305, keeping `let snapshots = s.cnc.snapshots();` at 297 and the two pushes that follow it), delete `let now = now_unix_ns();` (348) and `let service_hb = status.service_heartbeat_ns.load_acquire();` (350, now read inside `push_service_families`), and delete the `uc2_service_heartbeat_age_seconds` push (357–362). `uc2_node_heartbeat_age_seconds` (351–356) stays exactly as it is, now reading the moved-up `now`.
+Then delete the `uc_service_snapshot_pos_bytes` push (297–305, keeping `let snapshots = s.cnc.snapshots();` at 297 and the two pushes that follow it), delete `let now = now_unix_ns();` (348) and `let service_hb = status.service_heartbeat_ns.load_acquire();` (350, now read inside `push_service_families`), and delete the `uc_service_heartbeat_age_seconds` push (357–362). `uc_node_heartbeat_age_seconds` (351–356) stays exactly as it is, now reading the moved-up `now`.
 
-Finally, `CONTRACT_SERIES` (34–100): delete `"uc2_service_applied_bytes"` (53), `"uc2_service_epoch"` (54), `"uc2_service_snapshot_pos_bytes"` (57) and `"uc2_service_heartbeat_age_seconds"` (65), and insert after `"uc2_commit_bytes"` (52):
+Finally, `CONTRACT_SERIES` (34–100): delete `"uc_service_applied_bytes"` (53), `"uc_service_epoch"` (54), `"uc_service_snapshot_pos_bytes"` (57) and `"uc_service_heartbeat_age_seconds"` (65), and insert after `"uc2_commit_bytes"` (52):
 
 ```rust
     // M14c (spec §9): the per-FSM band. The first four are the M10
     // aggregates, which now also carry one `service="<id>"` sample per
     // declared id in the SAME family block.
-    "uc2_service_applied_bytes",
-    "uc2_service_epoch",
-    "uc2_service_snapshot_pos_bytes",
-    "uc2_service_heartbeat_age_seconds",
-    "uc2_service_attached",
-    "uc2_service_lag_bytes",
-    "uc2_service_lag_waits_total",
-    "uc2_services_declared",
+    "uc_service_applied_bytes",
+    "uc_service_epoch",
+    "uc_service_snapshot_pos_bytes",
+    "uc_service_heartbeat_age_seconds",
+    "uc_service_attached",
+    "uc_service_lag_bytes",
+    "uc_service_lag_waits_total",
+    "uc_services_declared",
     "uc2_fsm_lag_bytes",
 ```
 
@@ -3094,16 +3094,16 @@ In `synthetic_sources` (637), after `cnc.store_free_disk_bytes(1);` (655):
 ```
 
 ```bash
-cargo test -p uc2_node --lib obs:: 2>&1 | tail -20
+cargo test -p uc_node --lib obs:: 2>&1 | tail -20
 ```
 Expected: `test result: ok.` — the three new tests pass, and `every_contract_series_is_present` now covers 70 names (it reads `CONTRACT_SERIES` directly, so nothing to update). `derived_lags_saturate_and_saturation_divides` (718–730) still passes: it drives page 1's `service_applied`, which the aggregate still reads.
 
 - [ ] **Step 5: prove the exporter's own contract test and the gate harness agree**
 
 ```bash
-cargo test -p uc2_node --lib 2>&1 | tail -5
-cargo test -p uc2_node --test obs_http 2>&1 | tail -5
-cargo build -p uc2_node --release --example m10_gate 2>&1 | tail -3
+cargo test -p uc_node --lib 2>&1 | tail -5
+cargo test -p uc_node --test obs_http 2>&1 | tail -5
+cargo build -p uc_node --release --example m10_gate 2>&1 | tail -3
 ```
 Expected: all green; the example builds (it uses `CONTRACT_SERIES` and `CONTRACT_SERIES.len()`, both still in scope, so its coverage row now demands 70/70 with no source change).
 
@@ -3111,7 +3111,7 @@ Expected: all green; the example builds (it uses `CONTRACT_SERIES` and `CONTRACT
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_node/src/obs/metrics.rs
+git add uc_node/src/obs/metrics.rs
 git commit -m "feat(m14c): per-FSM metric families — service={id} twins for applied/epoch/snapshot_pos/heartbeat_age, plus attached/lag_bytes/lag_waits_total/services_declared/fsm_lag_bytes (CONTRACT_SERIES 65 -> 70)"
 ```
 
@@ -3120,7 +3120,7 @@ git commit -m "feat(m14c): per-FSM metric families — service={id} twins for ap
 
 - [ ] **Step 12 (addendum, from the wire workstream's seam): the two snapshot-refusal counters**
 
-Task 5 adds `snap_refused_legacy_peer` and `snap_refused_declared_mismatch` to `uc2_net::receiver::FollowerStats`, and `ObsSources.receiver: Arc<FollowerStats>` already exists (`uc2_node/src/obs/mod.rs:41`). Render them exactly the way `uc2_reports_unattested_total` is rendered (`metrics.rs:434-436`, `push_counter` on a relaxed load), directly after it:
+Task 5 adds `snap_refused_legacy_peer` and `snap_refused_declared_mismatch` to `uc_net::receiver::FollowerStats`, and `ObsSources.receiver: Arc<FollowerStats>` already exists (`uc_node/src/obs/mod.rs:41`). Render them exactly the way `uc2_reports_unattested_total` is rendered (`metrics.rs:434-436`, `push_counter` on a relaxed load), directly after it:
 
 ```rust
     push_counter(
@@ -3153,24 +3153,24 @@ Add both names to `CONTRACT_SERIES` beside `"uc2_reports_unattested_total"` (lin
     }
 ```
 
-Run `cargo test -p uc2_node --lib obs::metrics` — expected PASS (fold this into the task's single commit; the `git add` list is unchanged).
+Run `cargo test -p uc_node --lib obs::metrics` — expected PASS (fold this into the task's single commit; the `git add` list is unchanged).
 
 
 ### Task 8: The two alert rules, their `m10_alerts` scenarios, the adjudicator hookup, and the dashboard
 
 **Files:**
 - Modify `packaging/prometheus/uc2-alerts.yml` (82 lines, `groups: [{name: uc2, interval: 15s}]`): `Uc2ServiceWedged`'s expr (20–24) gains `{service=""}`; two new rules appended after `Uc2DiskLow` (78–82)
-- Modify `uc2_node/examples/m10_alerts.rs` (1079 lines): `ALL_SCENARIOS` (52–64), `run_scenario`'s match (162–181), `make_config` (961–989) + a `spawn_cluster_with_services` beside `spawn_cluster` (994–1029), two new scenario functions after `scenario_service_wedged` (ends ~528)
+- Modify `uc_node/examples/m10_alerts.rs` (1079 lines): `ALL_SCENARIOS` (52–64), `run_scenario`'s match (162–181), `make_config` (961–989) + a `spawn_cluster_with_services` beside `spawn_cluster` (994–1029), two new scenario functions after `scenario_service_wedged` (ends ~528)
 - Modify `scripts/m10_alert_fire.sh` (540 lines): `RULE_META` (222–237), `build_Uc2ServiceWedged` (269–279), two new builders, `RULE_BUILDERS` (407–424)
-- Modify `packaging/grafana/uc2-dashboard.json`: panel 9's target B (`"expr": "uc2_service_heartbeat_age_seconds"`, line 197) and four new panels appended after panel 10
+- Modify `packaging/grafana/uc2-dashboard.json`: panel 9's target B (`"expr": "uc_service_heartbeat_age_seconds"`, line 197) and four new panels appended after panel 10
 - Test: `scripts/m10_alert_fire.sh` itself is the test (it shells `promtool test rules` per rule and exits nonzero on any FAIL); `promtool check rules` is the cheap pre-check. The repo keeps **no** checked-in promtool unit-test file — the per-rule YAML is generated into `$OUT/_promtool_tests/<Alert>.yml` by the script's Python step (`write_test_yaml`, 477–500). Do not add one.
 
 **Interfaces:**
 
 Consumes:
-- Task 7's families: `uc2_service_attached{service}`, `uc2_service_lag_bytes{service}`, `uc2_fsm_lag_bytes` (plain).
-- `uc2_node::{FsmLag, ServicesConfig}` — `ServicesConfig::from_ids(&[u8], Option<FsmLag>) -> Result<Self, String>` (`uc2_node/src/services.rs:44`), `FsmLag::Bounded(u64)` (19). Both are re-exported from the crate root (`uc2_node/tests/services.rs:13` imports them that way).
-- `uc2_service::{ServiceBuilder, ServiceConfig, StateMachine}` — already imported by `m10_alerts.rs:45`; `ServiceConfig::new(dir, APP).service_id(id)` is the per-FSM form (`uc2_node/tests/services.rs:139`).
+- Task 7's families: `uc_service_attached{service}`, `uc_service_lag_bytes{service}`, `uc2_fsm_lag_bytes` (plain).
+- `uc_node::{FsmLag, ServicesConfig}` — `ServicesConfig::from_ids(&[u8], Option<FsmLag>) -> Result<Self, String>` (`uc_node/src/services.rs:44`), `FsmLag::Bounded(u64)` (19). Both are re-exported from the crate root (`uc_node/tests/services.rs:13` imports them that way).
+- `uc_service::{ServiceBuilder, ServiceConfig, StateMachine}` — already imported by `m10_alerts.rs:45`; `ServiceConfig::new(dir, APP).service_id(id)` is the per-FSM form (`uc_node/tests/services.rs:139`).
 - `SeriesFile::record_round(&mut self, instance: &str, body: &str, families: &[&str])` (`m10_alerts.rs:207`), `scrape(SocketAddr) -> String` (277), `await_stable_leader(&[NodeH], u64) -> usize` (1059), `NodeH::{n, obs_addr, stop, instance_dir}` (906–945), `Disclosure` (184–190), `NoopSm` (470–481), `seed_for(usize) -> u64` (957).
 - The script's `select(rows, name, filt)` (115–121) compares `r["labels"].get(k) == v`, so **`{"service": None}` selects the sample that has no `service` label** — no code change needed for that idiom.
 - `add_hold_last(r, row, metric, for_secs)` (173–186), `total_for(for_secs, range_secs=0, margin=60)` (168), `new_rule(severity, labels_from)` (210).
@@ -3181,10 +3181,10 @@ Produces:
 - `spawn_cluster_with_services(scratch_root, label, n, admission_bytes, services) -> (TempDir, Vec<NodeH>)`.
 
 **Why these two scenarios are constructible as REAL clusters (both `state: "real"`), and why they hold still:**
-- *service_absent*: a node declaring `{0, 1}` with only FSM 0 attached publishes `services_declared = 0b11`, so `uc2_service_attached{service="1"}` renders `0` for the whole capture. It never changes — nothing can attach it.
-- *fsm_pinned*: with `fsm_lag = Bounded(8 KiB)` and `admission_bytes = 256 KiB`, the FSM door (`append - min_applied <= fsm_lag`, `uc2_node/src/node.rs:394` + 3313–3320) is the binding one, and this node's own durable report is capped at `min_applied + fsm_lag` (`crate::services::report_ceiling`, `uc2_node/src/services.rs:206`). On a **single-node** cluster commit *is* that report, so under sustained load `commit - applied_1` settles at **exactly 8192** — the alert's `>=` (not `>`) is required by that arithmetic, and the captured series is a flat 8192 rather than a jittery value that `hold_last` might sample below the bound.
-- *fsm_pinned* drives load with `Node::submit(vec![0u8; 64])` (the raw in-process path `scenario_leader_isolated` already uses) while typed state machines are attached. That is sound: the typed blanket impl decodes with `bincode::serde::decode_from_slice::<S::Command, _>` (`uc2_service/src/traits.rs:72`), which for `Command = ()` consumes zero bytes and ignores the remainder — no fail-stop, and the response encodes back to zero bytes.
-- **Neither scenario may call `wait_ready`** (`m10_alerts.rs:315`): `/readyz` returns 503 while page 1's service heartbeat is stale (`uc2_node/src/obs/http.rs:256–259`), and page 1's heartbeat is the `min` over declared FSMs — an absent or sleeping FSM 1 holds it at 0/stale forever. Use `await_stable_leader` (which keys on `can_serve`) instead. `scenario_service_wedged` calls `wait_ready` *before* stopping its service, which is why it can.
+- *service_absent*: a node declaring `{0, 1}` with only FSM 0 attached publishes `services_declared = 0b11`, so `uc_service_attached{service="1"}` renders `0` for the whole capture. It never changes — nothing can attach it.
+- *fsm_pinned*: with `fsm_lag = Bounded(8 KiB)` and `admission_bytes = 256 KiB`, the FSM door (`append - min_applied <= fsm_lag`, `uc_node/src/node.rs:394` + 3313–3320) is the binding one, and this node's own durable report is capped at `min_applied + fsm_lag` (`crate::services::report_ceiling`, `uc_node/src/services.rs:206`). On a **single-node** cluster commit *is* that report, so under sustained load `commit - applied_1` settles at **exactly 8192** — the alert's `>=` (not `>`) is required by that arithmetic, and the captured series is a flat 8192 rather than a jittery value that `hold_last` might sample below the bound.
+- *fsm_pinned* drives load with `Node::submit(vec![0u8; 64])` (the raw in-process path `scenario_leader_isolated` already uses) while typed state machines are attached. That is sound: the typed blanket impl decodes with `bincode::serde::decode_from_slice::<S::Command, _>` (`uc_service/src/traits.rs:72`), which for `Command = ()` consumes zero bytes and ignores the remainder — no fail-stop, and the response encodes back to zero bytes.
+- **Neither scenario may call `wait_ready`** (`m10_alerts.rs:315`): `/readyz` returns 503 while page 1's service heartbeat is stale (`uc_node/src/obs/http.rs:256–259`), and page 1's heartbeat is the `min` over declared FSMs — an absent or sleeping FSM 1 holds it at 0/stale forever. Use `await_stable_leader` (which keys on `can_serve`) instead. `scenario_service_wedged` calls `wait_ready` *before* stopping its service, which is why it can.
 
 - [ ] **Step 1: the rules (RED at the script level)**
 
@@ -3197,7 +3197,7 @@ Append to `packaging/prometheus/uc2-alerts.yml`, after `Uc2DiskLow` (ends 82):
     # alertable at all. An absent declared FSM holds min(applied) still,
     # which closes the admission door and caps this node's durable report at
     # the lag bound: the cluster stalls by design until it attaches.
-    expr: uc2_service_attached == 0
+    expr: uc_service_attached == 0
     for: 30s
     labels: { severity: critical }
     annotations: { summary: "declared FSM {{ $labels.service }} is not attached on {{ $labels.instance }} — admission is closed and this node's report is capped at the lag bound" }
@@ -3208,7 +3208,7 @@ Append to `packaging/prometheus/uc2-alerts.yml`, after `Uc2DiskLow` (ends 82):
     # genuinely pinned FSM sits ON the bound and never past it. The
     # on(instance) group_left join is the same idiom Uc2PeerLagging uses to
     # compare a per-peer series against the node-scalar admission window.
-    expr: (uc2_service_lag_bytes >= on(instance) group_left uc2_fsm_lag_bytes) and on(instance) uc2_fsm_lag_bytes > 0
+    expr: (uc_service_lag_bytes >= on(instance) group_left uc2_fsm_lag_bytes) and on(instance) uc2_fsm_lag_bytes > 0
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }
@@ -3217,10 +3217,10 @@ Append to `packaging/prometheus/uc2-alerts.yml`, after `Uc2DiskLow` (ends 82):
 And change `Uc2ServiceWedged`'s expr (21) to select the aggregate explicitly:
 
 ```yaml
-    expr: uc2_service_heartbeat_age_seconds{service=""} > 5 and uc2_node_heartbeat_age_seconds < 3
+    expr: uc_service_heartbeat_age_seconds{service=""} > 5 and uc_node_heartbeat_age_seconds < 3
 ```
 
-(M14c added labelled samples to that family. The `and` would already have dropped them — the label sets differ, so nothing matches `uc2_node_heartbeat_age_seconds` — but relying on that is a trap for the next edit. `{service=""}` matches series where the label is absent, i.e. the aggregate.)
+(M14c added labelled samples to that family. The `and` would already have dropped them — the label sets differ, so nothing matches `uc_node_heartbeat_age_seconds` — but relying on that is a trap for the next edit. `{service=""}` matches series where the label is absent, i.e. the aggregate.)
 
 ```bash
 promtool check rules packaging/prometheus/uc2-alerts.yml
@@ -3230,7 +3230,7 @@ Expected: `check rules` prints `SUCCESS: 16 rules found`. The script then aborts
 
 - [ ] **Step 2: the harness gains a services-aware cluster builder**
 
-In `uc2_node/examples/m10_alerts.rs`, give `make_config` (961) a `services` parameter — it has exactly one caller, `spawn_cluster` (1014). **The `#[allow]` is required, not cosmetic:** `clippy::too_many_arguments` fires above seven, `make_config` is at seven today, and CI runs `-D warnings`.
+In `uc_node/examples/m10_alerts.rs`, give `make_config` (961) a `services` parameter — it has exactly one caller, `spawn_cluster` (1014). **The `#[allow]` is required, not cosmetic:** `clippy::too_many_arguments` fires above seven, `make_config` is at seven today, and CI runs `-D warnings`.
 
 ```rust
 // One more knob than clippy likes; every one of them varies per scenario
@@ -3244,7 +3244,7 @@ fn make_config(
     addr: SocketAddr,
     buffer_bytes: usize,
     admission_bytes: u64,
-    services: uc2_node::ServicesConfig,
+    services: uc_node::ServicesConfig,
 ) -> NodeConfig {
 ```
 and replace the last field with `services,`.
@@ -3261,7 +3261,7 @@ fn spawn_cluster_with_services(
     label: &str,
     n: usize,
     admission_bytes: u64,
-    services: uc2_node::ServicesConfig,
+    services: uc_node::ServicesConfig,
 ) -> (tempfile::TempDir, Vec<NodeH>) {
     let dir = tempfile::Builder::new()
         .prefix(&format!("m10-{label}-"))
@@ -3308,7 +3308,7 @@ fn spawn_cluster(
         label,
         n,
         admission_bytes,
-        uc2_node::ServicesConfig::default(),
+        uc_node::ServicesConfig::default(),
     )
 }
 ```
@@ -3322,7 +3322,7 @@ Add in `m10_alerts.rs` between `scenario_service_wedged` (which ends just above 
 
 /// Uc2ServiceAbsent — **real**. A node declaring `{0, 1}` with only FSM 0
 /// ever attached. FSM 1's slot stays unattached for the whole capture, and
-/// the exporter renders it as `uc2_service_attached{service="1"} 0` because
+/// the exporter renders it as `uc_service_attached{service="1"} 0` because
 /// the per-FSM band iterates the DECLARED bitmask, not occupied slots.
 ///
 /// No `wait_ready` here: `/readyz` keys on page 1's service heartbeat, which
@@ -3330,7 +3330,7 @@ Add in `m10_alerts.rs` between `scenario_service_wedged` (which ends just above 
 /// 503 forever by design. `await_stable_leader` (can_serve) is the right
 /// gate — the node is serving, it is admission that is shut.
 fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
-    let services = uc2_node::ServicesConfig::from_ids(&[0, 1], None).expect("declared set");
+    let services = uc_node::ServicesConfig::from_ids(&[0, 1], None).expect("declared set");
     let (_dir, mut nodes) =
         spawn_cluster_with_services(scratch_root, "svc-absent", 1, 256 * 1024, services);
     await_stable_leader(&nodes, 20);
@@ -3347,7 +3347,7 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         sf.record_round(
             "n0",
             &scrape(addr),
-            &["uc2_service_attached", "uc2_services_declared"],
+            &["uc_service_attached", "uc_services_declared"],
         );
         thread::sleep(Duration::from_millis(500));
     }
@@ -3362,7 +3362,7 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             state: "real",
             method: "real single-node cluster declaring services.ids = [0, 1]; FSM 0 attaches, \
                      FSM 1 is never started. 6 real scrapes of the node's /metrics all read \
-                     uc2_service_attached{service=\"1\"} 0 (and service=\"0\" 1) — the per-FSM \
+                     uc_service_attached{service=\"1\"} 0 (and service=\"0\" 1) — the per-FSM \
                      band renders a row for every DECLARED id, so the absent FSM is a 0 sample, \
                      not a missing series."
                 .into(),
@@ -3405,7 +3405,7 @@ impl StateMachine for SlowSm {
 /// the cluster's point of view — but only `Uc2ServicePinnedAtLagBound` is
 /// adjudicated from this capture.
 fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
-    let services = uc2_node::ServicesConfig::from_ids(&[0, 1], Some(uc2_node::FsmLag::Bounded(8192)))
+    let services = uc_node::ServicesConfig::from_ids(&[0, 1], Some(uc_node::FsmLag::Bounded(8192)))
         .expect("declared set");
     let (_dir, mut nodes) =
         spawn_cluster_with_services(scratch_root, "fsm-pinned", 1, 256 * 1024, services);
@@ -3420,7 +3420,7 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         .expect("FSM 1 attaches");
 
     let addr = nodes[0].obs_addr();
-    let families = ["uc2_service_lag_bytes", "uc2_fsm_lag_bytes", "uc2_service_attached"];
+    let families = ["uc_service_lag_bytes", "uc2_fsm_lag_bytes", "uc_service_attached"];
     let mut sf = SeriesFile::new();
     for _ in 0..12 {
         // Keep the backlog past the bound: submits are refused (`Full`) the
@@ -3445,7 +3445,7 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             method: "real single-node cluster, services.ids = [0, 1], fsm_lag = 8 KiB, admission \
                      window 256 KiB (so the FSM door binds first). FSM 1 sleeps 20 ms per apply; \
                      the node's report ceiling caps commit at min(applied) + fsm_lag, so 12 real \
-                     scrapes read uc2_service_lag_bytes{service=\"1\"} flat at the 8192-byte \
+                     scrapes read uc_service_lag_bytes{service=\"1\"} flat at the 8192-byte \
                      bound while uc2_fsm_lag_bytes reads 8192."
                 .into(),
         },
@@ -3462,11 +3462,11 @@ Register both: `ALL_SCENARIOS` (52–64) gains `"service_absent"` and `"fsm_pinn
 
 ```bash
 export CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a
-cargo run -p uc2_node --release --example m10_alerts -- --scenario service_absent --out /home/claude/m14c-alerts 2>&1 | tail -5
-cargo run -p uc2_node --release --example m10_alerts -- --scenario fsm_pinned --out /home/claude/m14c-alerts 2>&1 | tail -5
-grep -E 'uc2_service_attached|uc2_service_lag_bytes|uc2_fsm_lag_bytes' /home/claude/m14c-alerts/*.series
+cargo run -p uc_node --release --example m10_alerts -- --scenario service_absent --out /home/claude/m14c-alerts 2>&1 | tail -5
+cargo run -p uc_node --release --example m10_alerts -- --scenario fsm_pinned --out /home/claude/m14c-alerts 2>&1 | tail -5
+grep -E 'uc_service_attached|uc_service_lag_bytes|uc2_fsm_lag_bytes' /home/claude/m14c-alerts/*.series
 ```
-Expected: two `scenario=… state=real` lines and two `.series` files; `uc2_service_attached{service="1",instance="n0"}` all zeros, `uc2_service_lag_bytes{service="1",instance="n0"}` flat `8192`, `uc2_fsm_lag_bytes{instance="n0"}` `8192`. If the lag row reads *less* than 8192 in the last sample, the load loop is not keeping the backlog past the bound — raise the per-round busy window, do not weaken the rule.
+Expected: two `scenario=… state=real` lines and two `.series` files; `uc_service_attached{service="1",instance="n0"}` all zeros, `uc_service_lag_bytes{service="1",instance="n0"}` flat `8192`, `uc2_fsm_lag_bytes{instance="n0"}` `8192`. If the lag row reads *less* than 8192 in the last sample, the load loop is not keeping the backlog past the bound — raise the per-round busy window, do not weaken the rule.
 
 - [ ] **Step 4: the adjudicator hookup**
 
@@ -3480,7 +3480,7 @@ In `scripts/m10_alert_fire.sh`, add to `RULE_META` (222–237):
 Change `build_Uc2ServiceWedged`'s LHS selection (271) to pin the aggregate now that the family also carries labelled samples:
 
 ```python
-    svc_row = select(rows, "uc2_service_heartbeat_age_seconds", {"service": None})
+    svc_row = select(rows, "uc_service_heartbeat_age_seconds", {"service": None})
 ```
 
 (`select` compares `r["labels"].get(k) == v`, so `None` means "this label is absent" — the aggregate row. The rule's own `{service=""}` selector matches the same series.)
@@ -3490,20 +3490,20 @@ Add the two builders next to it:
 ```python
 def build_Uc2ServiceAbsent():
     rows = load_scenario("service_absent")
-    row = select(rows, "uc2_service_attached", {"service": "1"})
+    row = select(rows, "uc_service_attached", {"service": "1"})
     r = new_rule("critical", labels_from=row)  # == 0 keeps every label
-    add_hold_last(r, row, "uc2_service_attached", 30)
+    add_hold_last(r, row, "uc_service_attached", 30)
     r["eval_time"] = total_for(30)[0]
     return r
 
 
 def build_Uc2ServicePinnedAtLagBound():
     rows = load_scenario("fsm_pinned")
-    lag_row = select(rows, "uc2_service_lag_bytes", {"service": "1"})
+    lag_row = select(rows, "uc_service_lag_bytes", {"service": "1"})
     bound_row = select(rows, "uc2_fsm_lag_bytes", {})
     # group_left keeps the LHS's `service` label; `and on(instance)` keeps it too.
     r = new_rule("warning", labels_from=lag_row)
-    add_hold_last(r, lag_row, "uc2_service_lag_bytes", 30)
+    add_hold_last(r, lag_row, "uc_service_lag_bytes", 30)
     add_hold_last(r, bound_row, "uc2_fsm_lag_bytes", 30)
     r["eval_time"] = total_for(30)[0]
     return r
@@ -3532,7 +3532,7 @@ In `packaging/grafana/uc2-dashboard.json`, panel 9's target B (line 197) becomes
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_heartbeat_age_seconds{service=\"\"}",
+          "expr": "uc_service_heartbeat_age_seconds{service=\"\"}",
           "legendFormat": "service (slowest) {{instance}}"
         }
 ```
@@ -3562,7 +3562,7 @@ Append after panel 10 (the last element of `panels`):
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_lag_bytes",
+          "expr": "uc_service_lag_bytes",
           "legendFormat": "fsm {{service}} {{instance}}"
         },
         {
@@ -3587,7 +3587,7 @@ Append after panel 10 (the last element of `panels`):
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_heartbeat_age_seconds{service!=\"\"}",
+          "expr": "uc_service_heartbeat_age_seconds{service!=\"\"}",
           "legendFormat": "fsm {{service}} {{instance}}"
         }
       ]
@@ -3603,7 +3603,7 @@ Append after panel 10 (the last element of `panels`):
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "min(uc2_service_attached)",
+          "expr": "min(uc_service_attached)",
           "instant": true
         }
       ]
@@ -3619,7 +3619,7 @@ Append after panel 10 (the last element of `panels`):
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "count(count_values(\"v\", uc2_services_declared))",
+          "expr": "count(count_values(\"v\", uc_services_declared))",
           "instant": true
         }
       ]
@@ -3637,7 +3637,7 @@ Expected: `15 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]` — valid JSO
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add packaging/prometheus/uc2-alerts.yml packaging/grafana/uc2-dashboard.json uc2_node/examples/m10_alerts.rs scripts/m10_alert_fire.sh
+git add packaging/prometheus/uc2-alerts.yml packaging/grafana/uc2-dashboard.json uc_node/examples/m10_alerts.rs scripts/m10_alert_fire.sh
 git commit -m "feat(m14c): Uc2ServiceAbsent + Uc2ServicePinnedAtLagBound, both proven to fire from real two-FSM scenarios; dashboard per-FSM rows; ServiceWedged pinned to the aggregate sample"
 ```
 
@@ -3646,25 +3646,25 @@ git commit -m "feat(m14c): Uc2ServiceAbsent + Uc2ServicePinnedAtLagBound, both p
 ### Task 9: `uc2ctl status`'s per-service table, and the attach/detach transition records
 
 **Files:**
-- Modify `uc2ctl/src/main.rs`: `use uc2_log::cnc::{AdminAuth, AdminReq, CncPage}` (80) gains `unpack_service_status`; `run_status` (495–553) gains the services block between the `log:` line (523) and `members:` (524)
-- Create `uc2ctl/tests/status_services.rs`
-- Modify `uc2_node/src/services.rs`: add `SERVICE_STALE_NS` next to `fsm_lag_eff` (193–201)
-- Modify `uc2_node/src/obs/http.rs`: `HEARTBEAT_STALE_NS` (39) gets a cross-reference + a pinning test in `mod tests` (299)
-- Modify `uc2_node/src/node.rs`: import (19); `struct Consensus` fields near `last_flags` (1915); both constructors (`last_flags: 0,` at 1298 and 5998); `publish_service_mins` (2713–2734); `publish_status` (3092–3096); new `note_service_transitions`
-- Test: `uc2_node/tests/services.rs` (607 lines) — one new test using the file's existing `serialize()`/`tempdir()`/`config()`/`ids()`/`start_service()` helpers (18–67, 139–141)
+- Modify `uc_ctl/src/main.rs`: `use uc_log::cnc::{AdminAuth, AdminReq, CncPage}` (80) gains `unpack_service_status`; `run_status` (495–553) gains the services block between the `log:` line (523) and `members:` (524)
+- Create `uc_ctl/tests/status_services.rs`
+- Modify `uc_node/src/services.rs`: add `SERVICE_STALE_NS` next to `fsm_lag_eff` (193–201)
+- Modify `uc_node/src/obs/http.rs`: `HEARTBEAT_STALE_NS` (39) gets a cross-reference + a pinning test in `mod tests` (299)
+- Modify `uc_node/src/node.rs`: import (19); `struct Consensus` fields near `last_flags` (1915); both constructors (`last_flags: 0,` at 1298 and 5998); `publish_service_mins` (2713–2734); `publish_status` (3092–3096); new `note_service_transitions`
+- Test: `uc_node/tests/services.rs` (607 lines) — one new test using the file's existing `serialize()`/`tempdir()`/`config()`/`ids()`/`start_service()` helpers (18–67, 139–141)
 
 **Interfaces:**
 
 Consumes:
-- `uc2_log::cnc::unpack_service_status(u64) -> (u8, bool, u32)` (`uc2_log/src/cnc.rs:205`), `pack_service_status(u8, bool, u32) -> u64` (198).
-- `CncPage::{services_declared, fsm_lag_bytes, service_slot}` (`uc2_log/src/cnc.rs:517/532/506`); `uc_protocol::v2::cnc::CNC_MAX_SERVICES` — already imported by `uc2ctl/src/main.rs:82` and `uc2_node/src/node.rs:35`.
-- `ServicesConfig::ids(&self) -> impl Iterator<Item = u8>` (`uc2_node/src/services.rs:84`), ascending, declared only.
-- `uc2_node::obs::log::{capture_for_tests, stderr_for_tests}` (`uc2_node/src/obs/log.rs:152/159`) and `crate::obs_event!` (247) — `key = value` pairs where keys are identifiers and values are `u64`/`i64`/`bool`/`&str`.
-- `uc2_service::attach` bumps the slot epoch once per incarnation (`uc2_service/src/attach.rs:160–162`: status stored with `incarnation + 1`, then `epoch.fetch_add(1) + 1`); `Service::stop()` clears the ATTACHED bit (asserted by `uc2_node/tests/services.rs:172–174`).
-- `Node::start_with_socket(NodeConfig, UdpSocket)` (`uc2_node/src/node.rs:508`).
+- `uc_log::cnc::unpack_service_status(u64) -> (u8, bool, u32)` (`uc_log/src/cnc.rs:205`), `pack_service_status(u8, bool, u32) -> u64` (198).
+- `CncPage::{services_declared, fsm_lag_bytes, service_slot}` (`uc_log/src/cnc.rs:517/532/506`); `uc_protocol::v2::cnc::CNC_MAX_SERVICES` — already imported by `uc_ctl/src/main.rs:82` and `uc_node/src/node.rs:35`.
+- `ServicesConfig::ids(&self) -> impl Iterator<Item = u8>` (`uc_node/src/services.rs:84`), ascending, declared only.
+- `uc_node::obs::log::{capture_for_tests, stderr_for_tests}` (`uc_node/src/obs/log.rs:152/159`) and `crate::obs_event!` (247) — `key = value` pairs where keys are identifiers and values are `u64`/`i64`/`bool`/`&str`.
+- `uc_service::attach` bumps the slot epoch once per incarnation (`uc_service/src/attach.rs:160–162`: status stored with `incarnation + 1`, then `epoch.fetch_add(1) + 1`); `Service::stop()` clears the ATTACHED bit (asserted by `uc_node/tests/services.rs:172–174`).
+- `Node::start_with_socket(NodeConfig, UdpSocket)` (`uc_node/src/node.rs:508`).
 
 Produces:
-- `uc2_node::services::SERVICE_STALE_NS: u64 = 3_000_000_000`.
+- `uc_node::services::SERVICE_STALE_NS: u64 = 3_000_000_000`.
 - `Consensus::note_service_transitions(&mut self)` and the fields `service_last_epoch: [u64; CNC_MAX_SERVICES]`, `service_was_live: [bool; CNC_MAX_SERVICES]`, `last_wall_ns: u64`.
 - `[log]` events `service_attached` / `service_detached`, both with fields `node`, `service`, `epoch`.
 - `uc2ctl status` stdout gains a `services:` header line plus one `  id=… ` line per declared id.
@@ -3673,7 +3673,7 @@ Produces:
 
 - [ ] **Step 1: RED — the `uc2ctl status` table test**
 
-Create `uc2ctl/tests/status_services.rs`:
+Create `uc_ctl/tests/status_services.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -3692,9 +3692,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use uc2_log::cnc::{CncPage, pack_service_status};
-use uc2_net::fault::FaultConfig;
-use uc2_node::{
+use uc_log::cnc::{CncPage, pack_service_status};
+use uc_net::fault::FaultConfig;
+use uc_node::{
     CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, FsmLag, Node, NodeConfig, PurgePolicy,
     ServicesConfig,
 };
@@ -3790,16 +3790,16 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
 
 ```bash
 export CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a
-cargo test -p uc2ctl --test status_services 2>&1 | tail -20
+cargo test -p uc_ctl --test status_services 2>&1 | tail -20
 ```
 Expected: FAIL — `assertion failed: stdout.contains("services: declared=[0, 1] fsm_lag=8192 bytes")`, with the printed stdout showing only `config:`/`role:`/`log:`/`members:`.
 
 - [ ] **Step 2: GREEN — the `run_status` block**
 
-In `uc2ctl/src/main.rs`, extend the import at 80:
+In `uc_ctl/src/main.rs`, extend the import at 80:
 
 ```rust
-use uc2_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
+use uc_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
 ```
 
 and insert into `run_status` immediately after `println!("log: commit={commit} durable={durable} append={append}");` (523):
@@ -3848,26 +3848,26 @@ and insert into `run_status` immediately after `println!("log: commit={commit} d
 (`CNC_MAX_SERVICES` is already in the `uc_protocol::v2::cnc` import at 82; `SystemTime`/`UNIX_EPOCH` at 75.)
 
 ```bash
-cargo test -p uc2ctl --test status_services 2>&1 | tail -10
-cargo test -p uc2ctl 2>&1 | tail -10
+cargo test -p uc_ctl --test status_services 2>&1 | tail -10
+cargo test -p uc_ctl 2>&1 | tail -10
 ```
 Expected: both green — `admin_auth_bin.rs`'s status assertions (`config: version=1`, `id=102 role=learner`) are unaffected; its nodes use `ServicesConfig::none_for_tests()`, so they print `services: declared=[] fsm_lag=lockstep` and no rows.
 
 - [ ] **Step 3: RED — the transition-record test**
 
-Add to `uc2_node/tests/services.rs` (end of file):
+Add to `uc_node/tests/services.rs` (end of file):
 
 ```rust
 /// M14c (spec §9): the `[log]` transition records name each FSM's arrival
 /// and departure. Attach is keyed on the slot's epoch (bumped once per
-/// incarnation by `uc2_service::attach`); departure is keyed on liveness =
+/// incarnation by `uc_service::attach`); departure is keyed on liveness =
 /// ATTACHED bit AND a fresh heartbeat, so an orderly `stop()` is reported on
 /// the next duty cycle and a killed service is reported once its heartbeat
 /// ages past `services::SERVICE_STALE_NS`.
 #[test]
 fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
     let _g = serialize();
-    let buf = uc2_node::obs::log::capture_for_tests();
+    let buf = uc_node::obs::log::capture_for_tests();
     let dir = tempdir();
     let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
     wait_until("serving", || node.can_serve());
@@ -3900,18 +3900,18 @@ fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
     );
 
     node.stop();
-    uc2_node::obs::log::stderr_for_tests();
+    uc_node::obs::log::stderr_for_tests();
 }
 ```
 
 ```bash
-cargo test -p uc2_node --test services attaching_and_stopping 2>&1 | tail -20
+cargo test -p uc_node --test services attaching_and_stopping 2>&1 | tail -20
 ```
 Expected: FAIL — `timeout waiting for service_attached record for FSM 1` (the `wait_until` helper's panic, 30 s deadline). No such event exists yet.
 
 - [ ] **Step 4: GREEN — the staleness bar**
 
-In `uc2_node/src/services.rs`, after `fsm_lag_eff` (ends 201):
+In `uc_node/src/services.rs`, after `fsm_lag_eff` (ends 201):
 
 ```rust
 /// M14c (spec §9): how stale a declared FSM's heartbeat may get before the
@@ -3925,7 +3925,7 @@ In `uc2_node/src/services.rs`, after `fsm_lag_eff` (ends 201):
 pub const SERVICE_STALE_NS: u64 = 3_000_000_000;
 ```
 
-In `uc2_node/src/obs/http.rs`, amend the doc on `HEARTBEAT_STALE_NS` (37–39) with `/// Pinned equal to [`crate::services::SERVICE_STALE_NS`] (M14c) by
+In `uc_node/src/obs/http.rs`, amend the doc on `HEARTBEAT_STALE_NS` (37–39) with `/// Pinned equal to [`crate::services::SERVICE_STALE_NS`] (M14c) by
 /// `the_readiness_bar_and_the_detach_bar_agree` below.` and add to `mod tests` (299):
 
 ```rust
@@ -3939,10 +3939,10 @@ In `uc2_node/src/obs/http.rs`, amend the doc on `HEARTBEAT_STALE_NS` (37–39) w
 
 - [ ] **Step 5: GREEN — the node-side edge detector**
 
-In `uc2_node/src/node.rs`, extend the import at 19:
+In `uc_node/src/node.rs`, extend the import at 19:
 
 ```rust
-use uc2_log::cnc::{AdminAuth, AdminReq, AdminResp, CncMeta, CncPage, unpack_service_status};
+use uc_log::cnc::{AdminAuth, AdminReq, AdminResp, CncMeta, CncPage, unpack_service_status};
 ```
 
 Add to `struct Consensus`, immediately after `last_flags: u64,` (1915):
@@ -4002,7 +4002,7 @@ and add the method immediately after `publish_service_mins`:
     /// both exits: an orderly `Service::stop` clears the bit (reported next
     /// cycle), and a SIGKILLed service leaves the bit set, so only the
     /// ageing heartbeat can report it (~3 s). Attach is keyed on the epoch,
-    /// which `uc2_service::attach` bumps once per incarnation, so a
+    /// which `uc_service::attach` bumps once per incarnation, so a
     /// stop/start pair emits `service_detached` then `service_attached` with
     /// the new epoch.
     #[inline(never)]
@@ -4041,18 +4041,18 @@ and add the method immediately after `publish_service_mins`:
 ```
 
 ```bash
-cargo test -p uc2_node --test services 2>&1 | tail -12
-cargo test -p uc2_node --lib obs::http 2>&1 | tail -5
+cargo test -p uc_node --test services 2>&1 | tail -12
+cargo test -p uc_node --lib obs::http 2>&1 | tail -5
 ```
 Expected: every test in `services.rs` passes (13 + the new one), and the http pin test passes.
 
 - [ ] **Step 6: full suite for the two touched crates, clippy, commit**
 
 ```bash
-cargo test -p uc2_node --test obs_log 2>&1 | tail -6
-cargo test -p uc2_node --lib 2>&1 | tail -4
+cargo test -p uc_node --test obs_log 2>&1 | tail -6
+cargo test -p uc_node --lib 2>&1 | tail -4
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2ctl/src/main.rs uc2ctl/tests/status_services.rs uc2_node/src/services.rs uc2_node/src/obs/http.rs uc2_node/src/node.rs uc2_node/tests/services.rs
+git add uc_ctl/src/main.rs uc_ctl/tests/status_services.rs uc_node/src/services.rs uc_node/src/obs/http.rs uc_node/src/node.rs uc_node/tests/services.rs
 git commit -m "feat(m14c): uc2ctl status per-FSM table (id/attached/epoch/applied/lag/snapshot_pos/heartbeat age) + service_attached/service_detached transition records on the liveness edge"
 ```
 
@@ -4082,11 +4082,11 @@ After the `IngressRingWedged` paragraph (ends ~89) and before `## Install the al
 
 A node runs one FSM per declared service id (`[services] ids`), and every
 service family carries a `service="<id>"` label per declared id:
-`uc2_service_applied_bytes`, `uc2_service_epoch`,
-`uc2_service_snapshot_pos_bytes`, `uc2_service_heartbeat_age_seconds`,
-`uc2_service_attached`, `uc2_service_lag_bytes` (= `commit − applied`),
-`uc2_service_lag_waits_total`. Two node-scalar gauges describe the set
-itself: `uc2_services_declared` (the bitmask — bit *k* = id *k*) and
+`uc_service_applied_bytes`, `uc_service_epoch`,
+`uc_service_snapshot_pos_bytes`, `uc_service_heartbeat_age_seconds`,
+`uc_service_attached`, `uc_service_lag_bytes` (= `commit − applied`),
+`uc_service_lag_waits_total`. Two node-scalar gauges describe the set
+itself: `uc_services_declared` (the bitmask — bit *k* = id *k*) and
 `uc2_fsm_lag_bytes` (the lag bound; **0 means lockstep**).
 
 Two shapes to know before writing a query:
@@ -4095,16 +4095,16 @@ Two shapes to know before writing a query:
   M10 series and now means **the slowest declared FSM** (page 1's `min` over
   the declared ids — the number the purge floor, the admission door and
   `/readyz` all key on). Aggregate and per-FSM samples live in the same
-  family, so `sum(uc2_service_applied_bytes)` double counts. Say
+  family, so `sum(uc_service_applied_bytes)` double counts. Say
   `{service=""}` for the aggregate and `{service!=""}` for the per-FSM rows.
 - **A declared FSM that has never attached still renders a row**, reading
-  `uc2_service_attached{service="k"} 0` with zeros beside it. That is
+  `uc_service_attached{service="k"} 0` with zeros beside it. That is
   deliberate: you cannot alert on a series that is absent, and "declared but
   never started" is the state that silently closes admission cluster-wide.
 
 Declared sets must match across nodes (spec §8). There is no alert rule for
 drift, because it is a query over the fleet rather than a per-node
-condition — `count(count_values("v", uc2_services_declared))` is `1` on a
+condition — `count(count_values("v", uc_services_declared))` is `1` on a
 healthy cluster and `> 1` the moment two nodes disagree. The dashboard ships
 it as the "Declared sets agreeing" stat.
 ```
@@ -4112,15 +4112,15 @@ it as the "Declared sets agreeing" stat.
 In the alert table (after the `Uc2DiskLow` row, 133), add:
 
 ```markdown
-| `Uc2ServiceAbsent` | a declared FSM's `uc2_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
-| `Uc2ServicePinnedAtLagBound` | a declared FSM's `uc2_service_lag_bytes` has sat at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is pacing the whole cluster | warning |
+| `Uc2ServiceAbsent` | a declared FSM's `uc_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
+| `Uc2ServicePinnedAtLagBound` | a declared FSM's `uc_service_lag_bytes` has sat at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is pacing the whole cluster | warning |
 ```
 
 After the leader-authoritative paragraph (135), append:
 
 ```markdown
 `Uc2ServiceWedged` selects the aggregate explicitly
-(`uc2_service_heartbeat_age_seconds{service=""}`) — the same family now
+(`uc_service_heartbeat_age_seconds{service=""}`) — the same family now
 carries a labelled sample per FSM, and the rule is about the node's slowest
 one. `Uc2ServiceAbsent` and `Uc2ServicePinnedAtLagBound` are per-FSM: they
 fire once per offending `service` label, on whichever node declares it.
@@ -4165,9 +4165,9 @@ Read it in this order:
    or accept the rate. Raising `fsm_lag` buys latency headroom, not
    throughput, and it is refused above `buffer_bytes / 2`.
 
-`uc2_service_lag_waits_total{service}` tells you the converse: an FSM whose
+`uc_service_lag_waits_total{service}` tells you the converse: an FSM whose
 wait counter climbs is the one *being* paced, i.e. a victim, not the cause.
-The cause is the id with the largest `uc2_service_lag_bytes`.
+The cause is the id with the largest `uc_service_lag_bytes`.
 
 The transition records name arrivals and departures explicitly:
 `{"event":"service_attached","node":0,"service":1,"epoch":4}` and
@@ -4214,21 +4214,21 @@ After the M14b bullet (ends 75):
 
 ```markdown
 - **M14c adds the per-FSM observability surface**, all additive:
-  `uc2_service_attached`, `uc2_service_lag_bytes`,
-  `uc2_service_lag_waits_total`, `uc2_services_declared` and
+  `uc_service_attached`, `uc_service_lag_bytes`,
+  `uc_service_lag_waits_total`, `uc_services_declared` and
   `uc2_fsm_lag_bytes` as new metric families; a `service="<id>"` sample per
-  declared id on `uc2_service_applied_bytes`, `uc2_service_epoch`,
-  `uc2_service_snapshot_pos_bytes` and `uc2_service_heartbeat_age_seconds`;
+  declared id on `uc_service_applied_bytes`, `uc_service_epoch`,
+  `uc_service_snapshot_pos_bytes` and `uc_service_heartbeat_age_seconds`;
   the `Uc2ServiceAbsent` and `Uc2ServicePinnedAtLagBound` rules; the
   `service_attached`/`service_detached` `[log]` records; and a `services:`
   section in `uc2ctl status`'s output. Nothing was renamed or removed. Two
   consequences worth flagging even though neither is breaking under this
-  policy: a query that assumed one sample per `uc2_service_*` family now
+  policy: a query that assumed one sample per `uc_service_*` family now
   sees several, so `sum(...)` double counts unless it says `{service=""}`
   (the shipped rules and dashboard were updated); and a scraper of
   `uc2ctl status` stdout sees new lines between `log:` and `members:`.
   The metric series contract is not itself in the promised-surface table —
-  `uc2_node::obs` is listed as not promised — but it is treated as an
+  `uc_node::obs` is listed as not promised — but it is treated as an
   operator interface in practice: families are added, not renamed.
 ```
 
@@ -4239,7 +4239,7 @@ At the end of §9 (after the hop-isolation paragraph, ends 541), add:
 ```markdown
 **Alert rules are proven to fire, not just to parse.**
 `scripts/m10_alert_fire.sh` builds or breaks a real cluster per rule
-(`uc2_node/examples/m10_alerts.rs`), scrapes each node's *real* `/metrics`
+(`uc_node/examples/m10_alerts.rs`), scrapes each node's *real* `/metrics`
 HTTP endpoint once a second, time-dilates the captured samples onto a
 synthetic timeline sized to that rule's `for:` clause, and lets
 `promtool test rules` adjudicate — one `PASS`/`FAIL` line per shipped rule,
@@ -4292,19 +4292,19 @@ export CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a
 cargo clippy --workspace --all-targets -- -D warnings
 timeout 2400 cargo test --workspace --no-fail-fast 2>&1 | tail -40
 ```
-Expected: clippy clean; every binary `0 failed`. `uc2ctl`'s new `status_services` and `uc2_node`'s new `services::attaching_and_stopping_an_fsm_emits_the_transition_records` are in this run.
+Expected: clippy clean; every binary `0 failed`. `uc2ctl`'s new `status_services` and `uc_node`'s new `services::attaching_and_stopping_an_fsm_emits_the_transition_records` are in this run.
 
 - [ ] **Step 2: the capstones, the hard-crash tier, the heavy sim**
 
 ```bash
-timeout 900 cargo test -p uc2_node --test lin_v2 2>&1 | tail -12
-timeout 900 cargo test -p uc2_node --test lin_partition_v2 2>&1 | tail -12
-timeout 900 cargo test -p uc2-crashtest --features hard-crash-tests 2>&1 | tail -12
-timeout 1800 cargo test -p uc2_sim --release --features sim-heavy 2>&1 | tail -8
+timeout 900 cargo test -p uc_node --test lin_v2 2>&1 | tail -12
+timeout 900 cargo test -p uc_node --test lin_partition_v2 2>&1 | tail -12
+timeout 900 cargo test -p uc_crashtest --features hard-crash-tests 2>&1 | tail -12
+timeout 1800 cargo test -p uc_sim --release --features sim-heavy 2>&1 | tail -8
 ```
 Expected: every capstone `Linearizable`; the heavy sim tier green. The
 hard-crash tier is called out explicitly because `--all-targets` does **not**
-compile feature-gated tests: `examples/uc2-crashtest/tests/*.rs` under
+compile feature-gated tests: `examples/uc_crashtest/tests/*.rs` under
 `hard-crash-tests` never sees a `cargo clippy --workspace --all-targets` run,
 so this is the only place a break there surfaces.
 
@@ -4335,7 +4335,7 @@ Expected: `PASS` with ≥ 10 000 runs; tree clean afterwards. (Needs nightly +
 - [ ] **Step 5: the live-scrape coverage row**
 
 ```bash
-timeout 900 cargo run -p uc2_node --release --example m10_gate -- --root /home/claude/m14c-smoke 2>&1 | tail -20
+timeout 900 cargo run -p uc_node --release --example m10_gate -- --root /home/claude/m14c-smoke 2>&1 | tail -20
 rm -rf /home/claude/m14c-smoke
 ```
 Expected: the `1 /metrics coverage` verdict reads `all 70 CONTRACT_SERIES
@@ -4382,7 +4382,7 @@ git commit --allow-empty -m "test(m14c-obs): local proof stack — workspace sui
 
 ## Execution record (2026-08-28, subagent-driven; the SDD ledger, condensed)
 
-Branch `worktree-uc2-multi-service`, merge base `25cfc45` (= `main` 4347bc2 + spec §14 + this plan), final HEAD `74f16bc`. Task commits: T1 `f47fe5f`; T2 `d7ae445` + `c917c1b` (1 fix round); T3 `126836d` + `07d15c9` (1 fix round); T4 `fe35eb5`; T5 `d2ac478` + `79c3bd7` (1 fix round); T6 `edeefea`; T7 `d99f835` + `8cec0e3` (1 fix round); T8 `040a950`; T9 `d933952` + `35c1c7a` (1 fix round); T10 `b4e497f` + `2ef480d` (1 fix round); T11 `24255a1` (empty); final whole-branch review (0 Critical, 4 Important) → fix wave `a405e71` + `74f16bc`. Evidence on `2ef480d` (T11): `cargo test --workspace --no-fail-fast` 1 407 passed / 0 failed (102 binaries, neither known flake appeared); `lin_v2` 7/7, `lin_partition_v2` 7/7; `uc2-crashtest --features hard-crash-tests` green; sim-heavy 38/38; `scripts/m10_alert_fire.sh` 16/16 (both new rules `state=real`); fuzz `uc_protocol_datagram` 51 019 361 runs clean; `m10_gate coverage` 72/72. On `74f16bc`: `uc2_net` 111 passed, `m10_alert_fire.sh` 16/16 again with the guarded rule, workspace suite 1 411 passed / 0 failed (102 binaries, exit 0).
+Branch `worktree-uc2-multi-service`, merge base `25cfc45` (= `main` 4347bc2 + spec §14 + this plan), final HEAD `74f16bc`. Task commits: T1 `f47fe5f`; T2 `d7ae445` + `c917c1b` (1 fix round); T3 `126836d` + `07d15c9` (1 fix round); T4 `fe35eb5`; T5 `d2ac478` + `79c3bd7` (1 fix round); T6 `edeefea`; T7 `d99f835` + `8cec0e3` (1 fix round); T8 `040a950`; T9 `d933952` + `35c1c7a` (1 fix round); T10 `b4e497f` + `2ef480d` (1 fix round); T11 `24255a1` (empty); final whole-branch review (0 Critical, 4 Important) → fix wave `a405e71` + `74f16bc`. Evidence on `2ef480d` (T11): `cargo test --workspace --no-fail-fast` 1 407 passed / 0 failed (102 binaries, neither known flake appeared); `lin_v2` 7/7, `lin_partition_v2` 7/7; `uc_crashtest --features hard-crash-tests` green; sim-heavy 38/38; `scripts/m10_alert_fire.sh` 16/16 (both new rules `state=real`); fuzz `uc_protocol_datagram` 51 019 361 runs clean; `m10_gate coverage` 72/72. On `74f16bc`: `uc_net` 111 passed, `m10_alert_fire.sh` 16/16 again with the guarded rule, workspace suite 1 411 passed / 0 failed (102 binaries, exit 0).
 
 ### What execution taught (the headline)
 
@@ -4390,8 +4390,8 @@ Branch `worktree-uc2-multi-service`, merge base `25cfc45` (= `main` 4347bc2 + sp
 
 ### Rulings made during execution (each with what it costs if wrong)
 
-- **J (pre-flight, T4/T5):** the plan's T4 (`SnapshotSource` type) and T5 (`set_snapshot_intake` signature) left `uc2_node` uncompilable until T6; each carried a minimal INTERIM call-site update (one-artifact set, mask `0b1`) so the workspace compiled at every commit; T6 replaced both (no `INTERIM` marker survives). Cost: two interim hunks.
-- **K (T8):** `uc2_service_lag_waits_total` reads 0 while an FSM is parked at the bounded barrier — M14a's deferred "lag_waits misses bounded stalls where the cap sits mid-frame", surfaced now that T7 exports the slot counter. The writer is in `uc2_service`, which this plan does not touch; parked with the limitation documented (`monitor-a-cluster.md`, `diagnose-a-node.md`); the alert keys on `lag_bytes`. Cost if wrong: an operator reads 0 waits on a paced FSM; the alert still fires. Service-side fix → M14c2.
+- **J (pre-flight, T4/T5):** the plan's T4 (`SnapshotSource` type) and T5 (`set_snapshot_intake` signature) left `uc_node` uncompilable until T6; each carried a minimal INTERIM call-site update (one-artifact set, mask `0b1`) so the workspace compiled at every commit; T6 replaced both (no `INTERIM` marker survives). Cost: two interim hunks.
+- **K (T8):** `uc_service_lag_waits_total` reads 0 while an FSM is parked at the bounded barrier — M14a's deferred "lag_waits misses bounded stalls where the cap sits mid-frame", surfaced now that T7 exports the slot counter. The writer is in `uc_service`, which this plan does not touch; parked with the limitation documented (`monitor-a-cluster.md`, `diagnose-a-node.md`); the alert keys on `lag_bytes`. Cost if wrong: an operator reads 0 waits on a paced FSM; the alert still fires. Service-side fix → M14c2.
 - **M (residuals after the fix wave's re-review — parked, no second wave):** (1) the receiver's publish re-drive runs up to twice per poll iteration (`snap_upkeep` is called twice in `upkeep`) with no backoff, so a *persistent* rename/sync obstacle costs 1–2 failing syscalls per spin and the counter climbs at the poll rate — correctness-preserving, self-clearing, the docs say a RISING count is the signal; add a `last_publish_try_ns` cadence in M14c2. (2) `snap_chunk`'s `seek`/`write_all` failure is still silent — the likeliest ENOSPC site on a joiner (the `.part` is sparse) — so that one stall is named only by the sender's 30 s timeout and re-cycle, not by `uc2_snapshot_intake_io_failures_total`; count it in M14c2. Cost if wrong: an operator sees a silent re-transfer loop on a full snapshot disk until (2) lands.
 - **L (final fix wave):** the four trivial doc one-liners the final review listed rode along with the fix wave. Cost: none.
 
@@ -4404,7 +4404,7 @@ Branch `worktree-uc2-multi-service`, merge base `25cfc45` (= `main` 4347bc2 + sp
 - Sender: unit tests for `try_open_snap_session`'s refusal paths; skip serving a repair NAK inside a not-yet-begun artifact; a `snap_open_failed` counter for the `File::open` TOCTOU.
 - Receiver: a receiver-side intake timeout (a dead leader leaves a full `.part` until the next session); count an undecodable BEGIN from the live peer once per session; peer-gate session REPLACEMENT (pre-existing); `snap_last_done`'s partial `(id,pos)` match.
 - Node/tests: `learner.rs` two-FSM join should pin that the *session* delivered both artifacts (voter `snap_sessions == 1`) and drop the dead disjunct; a test for the decline latch; `note_service_transitions` re-loads two words `service_mins` just loaded (pass them in); `uc2ctl status` should print `fsm_lag=n/a` for a `declared=[]` harness page.
-- Metrics/docs: the harness-page test's heartbeat assertion is satisfiable by the header; T1's invariant-7 clause (fixed in the wave); `semver-policy.md` should note the changed-anyway `uc2_net` signatures.
+- Metrics/docs: the harness-page test's heartbeat assertion is satisfiable by the header; T1's invariant-7 clause (fixed in the wave); `semver-policy.md` should note the changed-anyway `uc_net` signatures.
 - `lag_waits` bounded-mode undercount (Ruling K) — the service-side fix.
 - Receiver (Ruling M): re-drive cadence; count `snap_chunk` write failures; wrap the over-long line in `diagnose-a-node.md`.
 - Alerts: a one-frame tolerance on the pinned rule for non-dividing frame sizes; the payload choice in the scenario's `Disclosure`.

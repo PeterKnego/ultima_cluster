@@ -67,7 +67,7 @@ gen() {
     local ec=0
     ( cd "$ROOT" && env "$@" UC2_MUTATION="$mut" ELLE_DIR="$MUT_DIR/$sub" \
         ELLE_BUDGET_SECS="$BUDGET" \
-        cargo test -p uc2_node --release --features mutation-testing \
+        cargo test -p uc_node --release --features mutation-testing \
         --test elle_v2 -- --ignored --exact "$passfn" --nocapture ) >"$MUT_DIR/$sub.log" 2>&1 || ec=$?
     echo "$ec"
 }

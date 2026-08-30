@@ -22,7 +22,7 @@
 //! It starts eleven processes and waits on two elections' worth of wall clock.
 //! `cargo test` has to stay fast, so this lives behind `quickstart-tests` and
 //! runs in `nightly.yml`'s `quickstart` job — the same posture as
-//! `uc2-crashtest`'s `hard-crash-tests`.
+//! `uc_crashtest`'s `hard-crash-tests`.
 //!
 //! # Binary discovery
 //!
@@ -31,7 +31,7 @@
 //! daemons are built on demand via `cargo build -p <pkg> --bin <bin>
 //! --message-format=json`, whose emitted artifact path is parsed out by hand
 //! (the technique `escargot` automates; copied from
-//! `examples/uc2-crashtest/tests/enospc.rs` so this crate needs no new
+//! `examples/uc_crashtest/tests/enospc.rs` so this crate needs no new
 //! dev-dependency).
 #![cfg(feature = "quickstart-tests")]
 
@@ -69,9 +69,9 @@ fn tarball_bin_dir(at: &Path) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create bin dir");
     let bins: [(PathBuf, &str); 5] = [
-        (cargo_bin("uc2_node", "uc2-node"), "uc2-node"),
-        (cargo_bin("uc2ctl", "uc2ctl"), "uc2ctl"),
-        (cargo_bin("uc2_gateway", "uc2-gateway"), "uc2-gateway"),
+        (cargo_bin("uc_node", "uc2-node"), "uc2-node"),
+        (cargo_bin("uc_ctl", "uc2ctl"), "uc2ctl"),
+        (cargo_bin("uc_gateway", "uc2-gateway"), "uc2-gateway"),
         (PathBuf::from(env!("CARGO_BIN_EXE_counter-service")), "counter-service"),
         (PathBuf::from(env!("CARGO_BIN_EXE_counter-remote")), "counter-remote"),
     ];

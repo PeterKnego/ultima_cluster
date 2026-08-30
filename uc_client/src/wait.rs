@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+#![allow(unexpected_cfgs)]
+
+//! Wait strategies, PORTED from `ultima_rings` (`ultima_rings/src/wait.rs`)
+//! with attribution rather than taken as a dependency — `uc_client`'s small
+//! dep set is an advertised property (spec 2026-08-13, §5).
+//!
+//! The measured findings that picked these defaults (all from ultima_rings'
+//! bench docs, 2026-08-12 topology sweep):
+//! - `BusySpin` collapses once threads outnumber schedulable CPUs, and an RPC
+//!   gateway machine is oversubscribed by construction.
+//! - On a BUSY machine `Park` is the FASTEST strategy (5-24x), not the
+//!   slowest, while keeping 70-95% of external throughput.
+//! - `thread::park_timeout` cannot deliver sub-~60µs sleeps: `PARK_MIN` is
+//!   64µs so the ladder's documented doubling is real, not fiction.
+//!
+//! In this crate: the engine (`engine.rs`) is WAITLESS by design — these
+//! strategies belong to the layer that owns a thread (`pipelined.rs`'s
+//! driver, which now drives `Idle::for_strategy`/`Idle::idle` for real) and
+//! to `Ticket::wait` (always park/unpark; a REST worker spinning through a
+//! ~1ms consensus round trip is exactly the oversubscription failure the
+//! tables document).
+
+use std::time::Duration;
+
+/// How a blocked side (consumer-on-empty, producer-on-full) waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitStrategy {
+    /// `spin_loop()` until progress: lowest latency, one core per blocked side
+    /// — measured at 99.9% of a core while idle (`examples/cpu_cost.rs`).
+    BusySpin,
+    /// Aeron-style idle ladder: spins, then yields, then timed parks doubling
+    /// 64 µs → 1 ms. Self-waking — the other side never needs to notify.
+    /// Lowest CPU of the self-waking strategies at 10.2% of a core when idle
+    /// (`examples/cpu_cost.rs`), at the cost of a wake latency
+    /// floored by the OS timer: the 64 µs floor is deliberate, because
+    /// `thread::park_timeout` cannot deliver sub-floor sleeps (a 1 µs request
+    /// measured ~60 µs on a 4-core Linux VM).
+    Backoff,
+    /// Spins, then yields **indefinitely** — never parks. Sits between
+    /// [`WaitStrategy::BusySpin`] and [`WaitStrategy::Backoff`]: wake
+    /// granularity stays at the cost of one `yield_now` (~0.7 µs measured)
+    /// rather than the OS timer floor (~60 µs), while still surrendering the
+    /// core whenever another thread is runnable.
+    ///
+    /// **This does not reduce CPU use on an idle machine.** Measured at 100.0%
+    /// of a core while idle, against `BusySpin`'s 99.9% (`examples/cpu_cost.rs`)
+    /// — with nothing else runnable, `yield_now` returns immediately and this
+    /// burns a core just like [`WaitStrategy::BusySpin`] — only less efficiently per iteration
+    /// (~0.7 µs vs ~27 ns). It buys *politeness under contention*, not idle
+    /// CPU. Callers wanting low CPU want [`WaitStrategy::Backoff`] or
+    /// [`WaitStrategy::Park`].
+    BackoffYield,
+    /// Fully blocking park/wake via the notify layer: 1.8% of a core when
+    /// idle, ~10 µs median wake latency. Unlike the self-waking strategies, this
+    /// makes the *productive* side pay a `SeqCst` fence plus a wake on every
+    /// operation.
+    ///
+    /// The 10 µs figure is measured publish-to-delivery on a 4-core Linux VM
+    /// (`examples/wake_latency.rs`; 10.19–10.40 µs p50 across three runs).
+    /// Earlier revisions of this doc claimed ~1–5 µs, which was never measured
+    /// and is roughly 2x optimistic. Tail latency is deliberately not quoted:
+    /// it was not reproducible on that machine.
+    Park,
+}
+
+pub(crate) const SPINS: u32 = 10;
+pub(crate) const YIELDS: u32 = 20;
+
+/// Floor for the [`WaitStrategy::Backoff`] ladder's timed parks.
+///
+/// Deliberately **not** 1 µs. `thread::park_timeout` cannot deliver sub-floor
+/// sleeps: measured on a 4-core Linux VM, `park_timeout(1µs)` actually sleeps
+/// ~60 µs, and requests of 1/2/4/8 µs are indistinguishable from one another.
+/// A `PARK_MIN` below that floor makes the first four rungs identical, so the
+/// documented doubling would be fiction — the ladder would jump straight from
+/// ~14 µs of yielding to ~60 µs of parking.
+///
+/// The exact floor is OS- and machine-dependent (kernel timer resolution); 64 µs
+/// is chosen to be at or above it on typical Linux. On a tuned low-latency box
+/// the real floor may be lower, making this slightly conservative — the
+/// trade-off taken is an honest ladder over an optimal one.
+const PARK_MIN: Duration = Duration::from_micros(64);
+const PARK_MAX: Duration = Duration::from_millis(1);
+
+/// Per-blocking-operation ladder state, shared by [`WaitStrategy::Backoff`]
+/// and [`WaitStrategy::BackoffYield`].
+#[derive(Debug)]
+pub(crate) struct Idle {
+    step: u32,
+    park: Duration,
+    /// `true` for [`WaitStrategy::BackoffYield`]: yield forever after the spin
+    /// rungs instead of escalating to timed parks.
+    yield_only: bool,
+}
+
+impl Idle {
+    /// The parking ladder ([`WaitStrategy::Backoff`]).
+    pub(crate) fn new() -> Self {
+        Idle {
+            step: 0,
+            park: PARK_MIN,
+            yield_only: false,
+        }
+    }
+
+    /// The ladder appropriate to `strategy`. `BusySpin` and `Park` never call
+    /// [`Idle::idle`], so they get the parking ladder and simply ignore it.
+    pub(crate) fn for_strategy(strategy: WaitStrategy) -> Self {
+        Idle {
+            yield_only: strategy == WaitStrategy::BackoffYield,
+            ..Idle::new()
+        }
+    }
+
+    /// One rung of the ladder. Timed parks self-wake, so callers re-check
+    /// their condition after every call.
+    pub(crate) fn idle(&mut self) {
+        if self.step < SPINS {
+            std::hint::spin_loop();
+        } else if self.yield_only || self.step < SPINS + YIELDS {
+            std::thread::yield_now();
+        } else {
+            std::thread::park_timeout(self.park);
+            self.park = (self.park * 2).min(PARK_MAX);
+        }
+        self.step = self.step.saturating_add(1);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn idle_ladder_spins_then_yields_then_parks_bounded() {
+        let mut idle = Idle::new();
+        // The first SPINS + YIELDS steps must not sleep (fast).
+        let t = Instant::now();
+        for _ in 0..(SPINS + YIELDS) {
+            idle.idle();
+        }
+        assert!(t.elapsed().as_millis() < 100, "spin/yield rungs slept");
+        // Subsequent steps park with doubling, capped at PARK_MAX.
+        let t = Instant::now();
+        idle.idle(); // first park
+        assert!(
+            t.elapsed() >= PARK_MIN,
+            "first park returned under PARK_MIN"
+        );
+        for _ in 0..30 {
+            idle.idle(); // doubling must cap, not overflow
+        }
+    }
+
+    #[test]
+    fn park_min_is_at_or_above_the_os_timer_floor() {
+        // `park_timeout` cannot deliver sub-floor sleeps. Measured on a 4-core
+        // Linux VM: park_timeout(1us) actually sleeps ~60us, and 1/2/4/8us are
+        // indistinguishable. A PARK_MIN below that floor makes the ladder's
+        // first rungs identical, so the documented doubling is fiction.
+        assert!(
+            PARK_MIN >= Duration::from_micros(64),
+            "PARK_MIN {PARK_MIN:?} is below the OS timer floor; \
+             the first ladder rungs would collapse into one another"
+        );
+        assert!(
+            PARK_MAX > PARK_MIN,
+            "PARK_MAX must leave room for at least one doubling"
+        );
+    }
+
+    /// Deterministic (no wall-clock): `Idle::park` only ever advances on the
+    /// parking branch, so an untouched interval proves that branch was never
+    /// taken. Asserting elapsed time here instead would be both flaky and
+    /// wrong under miri, whose interpreted execution does not track real time.
+    #[test]
+    fn yielding_ladder_never_escalates_to_parks() {
+        let mut yielding = Idle::for_strategy(WaitStrategy::BackoffYield);
+        let mut parking = Idle::for_strategy(WaitStrategy::Backoff);
+        // Well past the rung where `Backoff` starts parking.
+        for _ in 0..(SPINS + YIELDS + 5) {
+            yielding.idle();
+            parking.idle();
+        }
+        assert!(
+            parking.park > PARK_MIN,
+            "Backoff never reached a park rung, so this proves nothing"
+        );
+        assert_eq!(
+            yielding.park, PARK_MIN,
+            "yielding ladder escalated to parking"
+        );
+    }
+
+    /// The wall-clock counterpart to the above. Skipped under miri, which runs
+    /// orders of magnitude slower than real time and cannot honour the bound.
+    #[test]
+    #[cfg_attr(miri, ignore = "wall-clock bound is meaningless under miri")]
+    fn yielding_ladder_does_not_sleep() {
+        let mut idle = Idle::for_strategy(WaitStrategy::BackoffYield);
+        let t = Instant::now();
+        // 50 rungs past where `Backoff` would have started parking — which
+        // would cost 64 µs + 128 µs + ... capped at PARK_MAX, tens of ms.
+        for _ in 0..(SPINS + YIELDS + 50) {
+            idle.idle();
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(10),
+            "yielding ladder slept (took {:?})",
+            t.elapsed()
+        );
+    }
+}

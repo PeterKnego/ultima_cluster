@@ -57,7 +57,7 @@ rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"]
 rustls-pemfile = "2"
 ```
 
-Plus `crc32fast = "1"` direct dep on `uc_node` (already in the lockfile via `ultima_journal`; consistent codec choice).
+Plus `crc32fast = "1"` direct dep on `uc_node` (already in the lockfile via `uc_journal`; consistent codec choice).
 
 ### Per-node disk layout (M2 additions)
 

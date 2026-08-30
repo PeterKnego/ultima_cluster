@@ -75,6 +75,13 @@ documentation for what it changes, because the tag is what people read.
       `v2.8.0` deliberately left: `gh release edit v2.8.0` keeps its
       pre-release flag, `v2.8.1` becomes **Latest**, and §6's crates.io
       publish runs for the first time.
+      For `v2.9.0` the shape is the same again — two `<tag date>` headings and
+      one `<!-- PENDING: … -->` verification block at the end of
+      `docs/releases.md`'s `2.9.0` entry — and the same
+      `grep -rn "tag date\|PENDING:" RELEASES.md docs/releases.md` finds all
+      three. `v2.9.0` is also the release that **renamed every crate** to the
+      `uc_` prefix, so §6's publish list below is the post-rename one: it is
+      the first crates.io publish, and the names it burns are permanent.
 
 ## 2. Check the version the way the workflow will
 
@@ -83,7 +90,7 @@ manifest, so find out before you tag:
 
 ```sh
 cargo metadata --no-deps --format-version 1 \
-  | jq -r '.packages[] | select(.name=="uc2_node") | .version'
+  | jq -r '.packages[] | select(.name=="uc_node") | .version'
 ```
 
 The tag is that string with a `v` in front: `2.6.0` → `v2.6.0`. A release
@@ -211,18 +218,18 @@ operation is a bad trade; a person watching each one is not.
 Order is dependency order — it is the only order that resolves:
 
 ```sh
-cargo publish -p ultima-journal
+cargo publish -p uc_journal
 cargo publish -p uc_protocol
-cargo publish -p uc2_crypto
-cargo publish -p uc2_log
-cargo publish -p uc2_consensus
-cargo publish -p uc2_net
-cargo publish -p uc2_client
-cargo publish -p uc2_node
-cargo publish -p uc2_service
-cargo publish -p uc2_remote
-cargo publish -p uc2_gateway
-cargo publish -p uc2ctl
+cargo publish -p uc_crypto
+cargo publish -p uc_log
+cargo publish -p uc_consensus
+cargo publish -p uc_net
+cargo publish -p uc_client
+cargo publish -p uc_node
+cargo publish -p uc_service
+cargo publish -p uc_remote
+cargo publish -p uc_gateway
+cargo publish -p uc_ctl
 ```
 
 Wait for each to appear on crates.io before starting the next — `cargo
@@ -231,7 +238,7 @@ dependency resolution reads the index. Modern cargo blocks on this for you;
 if a publish fails with "no matching package named …", the previous one has
 not indexed yet, so wait and re-run just that one.
 
-`uc2_sim`, `uc-lincheck`, `counter` and `uc2-crashtest` are `publish = false`:
+`uc_sim`, `uc_lincheck`, `counter` and `uc_crashtest` are `publish = false`:
 they are the proof and teaching apparatus, not the product.
 
 If a crate fails partway through the list, the ones before it are already

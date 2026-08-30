@@ -449,7 +449,7 @@ def setup_fleet(a):
     nodes = []
     for i, h in enumerate(hosts):
         h.bind_addr_fixed = f"{h.private_ip}:{PORT}"
-        h.prepare(examples=("m9_gate",), bins=("uc2_node", "uc2ctl"))
+        h.prepare(examples=("m9_gate",), bins=("uc_node", "uc2ctl"))
         nodes.append(M11Node(h, i))
 
     members = [(n.id, n.host.bind_addr_fixed) for n in nodes]

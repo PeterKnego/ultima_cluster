@@ -4,7 +4,7 @@
 3.0 / M14) in every instance directory. It carries the counters and status
 fields the node, service, and client processes coordinate through.
 
-Offsets are pinned in both `uc_protocol::v2::cnc` and `uc2_log`, with
+Offsets are pinned in both `uc_protocol::v2::cnc` and `uc_log`, with
 offset-assertion tests cross-checking them. They do not change within a wire
 protocol major version. New fields are added in the reserved band.
 
@@ -24,7 +24,7 @@ To read a live page while diagnosing a node, see
 | 96 | u64 LE | created, ns | |
 | 104 | u64 LE | buffer bytes | log-buffer capacity; geometry for attaching processes |
 | 112 | u32 LE | max payload | |
-| 124 | u32 LE | header CRC | crc32 over bytes `[0, 124)`; written and checked by `uc2_log` |
+| 124 | u32 LE | header CRC | crc32 over bytes `[0, 124)`; written and checked by `uc_log` |
 
 Page length is 8192 bytes: page 1 (`0..4096`) is the M1–M13 layout
 byte-for-byte; page 2 (`4096..8192`) is the service-slot band.

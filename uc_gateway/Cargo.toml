@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
+[package]
+name = "uc_gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "ultima_cluster gateway edge: remote protocol v1 over a local node's shmem Engine"
+
+[features]
+# Exposes `Edge::fault_for_tests`, which forces the edge into its faulted
+# state. NOT default, and deliberately a feature rather than `#[doc(hidden)]`:
+# hiding a method from rustdoc does not stop a downstream crate calling it, and
+# nothing outside a test has any business faulting a live edge.
+test-util = []
+
+[[bin]]
+name = "uc2-gateway"
+path = "src/bin/uc2-gateway.rs"
+
+[dependencies]
+uc_client = { path = "../uc_client", version = "2.8.1" }
+uc_log = { path = "../uc_log", version = "2.8.1" }
+uc_remote = { path = "../uc_remote", version = "2.8.1" }
+uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+# Bin-side only (the library itself stays dependency-light like uc_remote's
+# hot path expects; uc_gateway is not dependency-minimal-by-contract, so
+# these are fine as ordinary crate deps): the uc2-gateway daemon's config
+# loading, CLI parsing, and signal handling. Same versions uc_node's bin uses.
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+signal-hook = { workspace = true }
+
+[dev-dependencies]
+# Self dev-dependency: the supported way to build this crate's own test targets
+# with a non-default feature enabled. `cargo test -p uc_gateway` gets
+# `test-util`; `cargo build -p uc_gateway` does not.
+# Deliberately unversioned: a crate publishing itself can never resolve a
+# versioned dependency on itself (it isn't on the registry yet mid-publish),
+# so `cargo package`/`cargo publish` would fail forever otherwise. Cargo
+# silently strips the unversioned self dev-dep from the published manifest.
+uc_gateway = { path = ".", features = ["test-util"] }
+uc_net = { path = "../uc_net", version = "2.8.1" }
+uc_node = { path = "../uc_node", version = "2.8.1" }
+uc_service = { path = "../uc_service", version = "2.8.1" }
+# NOTE: deliberately no `version =` — see uc_node/Cargo.toml's comment on
+# this same dev-dep (uc_lincheck is publish = false, never on crates.io).
+uc_lincheck = { path = "../uc_lincheck", default-features = false, features = ["v2"] }
+bincode = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+# m12_gate example only: latency histogram for the gateway-vs-direct A/B.
+hdrhistogram = { workspace = true }
+# hop_bench example only: the `--hole-stats` observer maps a ring file
+# read-only and reads `RingHeader`'s claim/consumer positions directly, so the
+# sink can tell "ring empty" from "head-of-line behind a claimed slot" without
+# any accessor being added to `uc_protocol`'s production ring code.
+memmap2 = { workspace = true }

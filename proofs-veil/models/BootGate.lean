@@ -6,7 +6,7 @@ import Veil
    TARGET: Finding #5, the SHALLOWEST of the four known election-time coherence-window
    bugs, and therefore the brief's true tool-fitness gate (Bar 2). The shipped bug:
 
-     `uc2_node` booted the receiver intake gate OPEN (`AtomicBool::new(true)`) with
+     `uc_node` booted the receiver intake gate OPEN (`AtomicBool::new(true)`) with
      `awaiting_reconcile: false`, while `ElectionSm::new` recovers
      `current_term = vote_term.max(map_term)` (election.rs:400-402) and votes persist
      before send. A voter that GRANTED term T, held a divergent tail, and crashed
@@ -92,7 +92,7 @@ relation holdsEntry (N : node)   -- those bytes are the CURRENT leader's entry E
 
 -- ---------- receiver intake gate ----------
 -- Gate closed => DATA dropped AND AppendPosition emission suppressed entirely
--- (uc2_net/src/receiver.rs::set_intake_gate).
+-- (uc_net/src/receiver.rs::set_intake_gate).
 -- `awaiting_reconcile` is NOT modeled as separate state: in UC it only gates the
 -- reopen path (node.rs ~2766), and `gateOpen` already carries every behaviour that
 -- path produces here. Dropping it is a pure state-space saving, not a fidelity loss.

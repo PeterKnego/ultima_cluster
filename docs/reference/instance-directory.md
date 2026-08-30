@@ -12,7 +12,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `instance.lock` | node | Exclusive `flock`. A second node on the same directory is refused with `AlreadyRunning`. Service and clients take a shared lock as a liveness probe. |
 | `cnc2.dat` | node | The 8 KiB control page (page 1: the M1–M13 layout; page 2: the per-FSM service-slot band since M14). See [The cnc control page](cnc-page.md). |
 | `log.buf` | node | The log ring buffer, `buffer_bytes` long. Recreated on each boot. |
-| `journal/` | node | Segmented durable log (`ultima_journal`). Survives restarts; the source for replay and purge. |
+| `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
 | `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. |
 | `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships and installs them. `<pos>` is the absolute log byte position the snapshot represents. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |

@@ -36,7 +36,7 @@ Design decisions worth disclosing up front (also repeated in the report):
      the leader kill, not after — see `sampler_start`'s docstring for why an
      after-the-kill launch would read the row non-vacuously FAIL on every
      fleet run).
-  2. `CONTRACT_SERIES` SOURCE: parsed from `uc2_node/src/obs/metrics.rs` at
+  2. `CONTRACT_SERIES` SOURCE: parsed from `uc_node/src/obs/metrics.rs` at
      orchestrator start (regex over the `pub const CONTRACT_SERIES: &[&str] =
      &[...]` literal) rather than scraped-and-boundary-matched from a live
      node. This is the ground truth the encoder itself is compiled from, it
@@ -368,10 +368,10 @@ class M10Node:
     through the embedded `CNC_TOOL_SRC` rather than a Rust `probe` role.
     """
 
-    def __init__(self, host, node_id, uc2_node_bin, metrics_addr, local):
+    def __init__(self, host, node_id, uc_node_bin, metrics_addr, local):
         self.host = host
         self.id = node_id
-        self.uc2_node_bin = uc2_node_bin
+        self.uc_node_bin = uc_node_bin
         self.metrics_addr = metrics_addr
         self.local = local
         self.cfg_path = f"{Path(host.dir).parent}/n{node_id}.toml"
@@ -416,7 +416,7 @@ class M10Node:
             log.write(f"\n=== start {self.unit} ===\n")
             log.flush()
             self.daemon = subprocess.Popen(
-                [self.uc2_node_bin, "--config", self.cfg_path,
+                [self.uc_node_bin, "--config", self.cfg_path,
                  "--drain-timeout-secs", str(DRAIN_TIMEOUT_SECS)],
                 stdout=log, stderr=subprocess.STDOUT,
             )
@@ -431,7 +431,7 @@ class M10Node:
             f"-p LimitNOFILE=65536 "
             f"-p StandardOutput=append:/opt/bench/{self.unit}.log "
             f"-p StandardError=append:/opt/bench/{self.unit}.log "
-            f"{self.uc2_node_bin} --config {self.cfg_path} "
+            f"{self.uc_node_bin} --config {self.cfg_path} "
             f"--drain-timeout-secs {DRAIN_TIMEOUT_SECS}"
         )
         r = self.host._ssh(cmd, capture_output=True)
@@ -626,7 +626,7 @@ def read_reports_unattested(node):
 
 def load_contract_series(repo_root):
     """See design decision #2: parsed from the Rust source, not scraped."""
-    path = repo_root / "uc2_node" / "src" / "obs" / "metrics.rs"
+    path = repo_root / "uc_node" / "src" / "obs" / "metrics.rs"
     text = path.read_text()
     m = re.search(r"pub const CONTRACT_SERIES:\s*&\[&str\]\s*=\s*&\[(.*?)\];", text, re.S)
     if not m:
@@ -774,7 +774,7 @@ def check_series_presence(node0, a, nodes, series_names):
     # `uc2_leader_hint` is the one CONTRACT_SERIES family that's genuinely
     # conditionally emitted on propagation timing alone (omitted entirely
     # while `leader_hint == u64::MAX`, i.e. before a node has heard of any
-    # leader — uc2_node/src/obs/metrics.rs:182-184) rather than on load —
+    # leader — uc_node/src/obs/metrics.rs:182-184) rather than on load —
     # the 10-minute soak is what makes this a non-issue (every node hears a
     # leader hint within seconds of cluster start, long before the check).
     expected = {n.metrics_addr for n in nodes}
@@ -1049,10 +1049,10 @@ def setup_fleet(a):
     )
     for h in hosts:
         h.bind_addr_fixed = f"{h.private_ip}:{PORT}"
-        h.prepare(examples=("m10_gate", "m5_gate"), bins=("uc2_node",))
+        h.prepare(examples=("m10_gate", "m5_gate"), bins=("uc_node",))
         h._ssh(f"sudo rm -rf {h.dir} && sudo mkdir -p {h.dir}", capture_output=True)
 
-    ucnode = a.uc2_node_bin or UC2_NODE_REMOTE
+    ucnode = a.uc_node_bin or UC2_NODE_REMOTE
     nodes = [
         M10Node(h, i, ucnode, f"{h.private_ip}:{METRICS_PORT}", local=False)
         for i, h in enumerate(hosts)
@@ -1069,11 +1069,11 @@ def setup_local(a):
     subprocess.run(["rm", "-rf", str(root)], check=False)
     (root / "logs").mkdir(parents=True, exist_ok=True)
     gate = a.m5_gate_bin or M5_GATE_LOCAL
-    ucnode = a.uc2_node_bin or UC2_NODE_LOCAL
+    ucnode = a.uc_node_bin or UC2_NODE_LOCAL
     for p in (gate, ucnode):
         if not Path(p).is_file():
             sys.exit(f"binary not found: {p} — build it first (cargo build --release "
-                     f"--example m5_gate -p uc2_node && cargo build --release -p uc2_node)")
+                     f"--example m5_gate -p uc_node && cargo build --release -p uc_node)")
 
     nodes = []
     for i in range(3):

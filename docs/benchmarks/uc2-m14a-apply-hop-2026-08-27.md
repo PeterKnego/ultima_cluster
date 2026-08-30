@@ -1,7 +1,7 @@
 # uc2 M14a — the FSM-side hop in isolation (`apply_bench`, dev-box smoke)
 
 **Date:** 2026-08-27. **Tree:** `main` 6111257 (M14a) vs `main` 4fcad3c (pre-M14a) —
-harness `uc2_node/examples/apply_bench.rs` built on each. **Box:** the 32-core
+harness `uc_node/examples/apply_bench.rs` built on each. **Box:** the 32-core
 dev box; a private `CARGO_TARGET_DIR` per tree.
 
 > **Smoke, not a gate.** Dev-box numbers are never compared to a bar
@@ -18,7 +18,7 @@ The service's apply loop, with everything M14a put in it: the per-iteration
 publish. Around it, stand-ins:
 
 - **upstream:** a driver thread appending 64 B frames through
-  `uc2_log::Appender` and playing archive + consensus (`durable = commit =
+  `uc_log::Appender` and playing archive + consensus (`durable = commit =
   append`, published every 64 frames), paced so `append − min(applied) ≤
   buffer/2` — the driver can never be the limiter (it spins ≥ 300 M times per
   run waiting on the FSMs);
@@ -105,7 +105,7 @@ cluster is stalled by contract and the alert fires.
 ## What this changes
 
 - **Lockstep's idle behaviour was a defect, fixed the same day** (`v3` above,
-  `uc2_service/src/apply.rs::lockstep_wait`): 18 k → 631 k frames/s at N=2.
+  `uc_service/src/apply.rs::lockstep_wait`): 18 k → 631 k frames/s at N=2.
   Spec §13 planned to "measure lockstep on the fleet"; the fleet would have
   measured the 50 µs sleep. The remaining ~1.6 µs/frame is the N-way
   cross-core handshake lockstep inherently costs — the fleet row measures
@@ -121,7 +121,7 @@ cluster is stalled by contract and the alert fires.
 
 ```bash
 export CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a          # private, never the shared dir
-cargo build -p uc2_node --release --example apply_bench
+cargo build -p uc_node --release --example apply_bench
 B=$CARGO_TARGET_DIR/release/examples/apply_bench
 for spec in "1 bounded" "2 bounded" "4 bounded" "8 bounded" "2 lockstep" "4 lockstep"; do set -- $spec
   $B --root /home/claude/apply-bench --fsms $1 --mode $2 --secs 6; done
@@ -130,4 +130,4 @@ for spec in "1 bounded" "2 bounded" "4 bounded" "8 bounded" "2 lockstep" "4 lock
 The pre-M14a control was the same file with six mechanical edits (singular
 ring names, page-1 `service_applied`, no `service_id`) built in a temporary
 worktree at 4fcad3c; the `Yield` experiment changed only
-`uc2_service/src/lib.rs`'s `APPLY_IDLE` and was reverted before commit.
+`uc_service/src/lib.rs`'s `APPLY_IDLE` and was reverted before commit.

@@ -230,7 +230,7 @@ impl MpscProducer {
     /// advanced past the claimed range before the CAS could fail, so nothing
     /// of this record was ever handed to the caller's peer. Callers that need
     /// exactly-once across such a retry ride
-    /// `uc2_service::session::Sessioned` like any other retry.
+    /// `uc_service::session::Sessioned` like any other retry.
     pub fn try_write(
         &self,
         msg_type: u16,

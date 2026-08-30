@@ -6,7 +6,7 @@ import Uc2Proofs.LogMatching
 
 Layered extension of the Tier B(a) data-plane model
 (`Uc2Proofs/ProtocolData.lean`): each node gains the commit-certification
-state of `uc2_consensus` — the REAL `Uc2Model.CommitTracker` kernel
+state of `uc_consensus` — the REAL `Uc2Model.CommitTracker` kernel
 (consumed, not re-modeled; its C1–C5 theorems in `Uc2Proofs/Commit.lean` are
 LB2's quorum extractor), a commit watermark, and the reconciliation intake
 gate — plus the commit transitions: durable reports as messages, the leader's
@@ -39,7 +39,7 @@ designer calls documented inline):
    never truncated, later leaders have it) are theorems.
 2. **Reports are messages on their own wire** (decision 2): `CMsg.report
    (src) (term) (durable)` mirrors the AppendPosition datagram
-   (`uc2_net/src/receiver.rs` 1052–1078; header carries
+   (`uc_net/src/receiver.rs` 1052–1078; header carries
    `leadership_term_id`). A third sent-set `csent` keeps the projection onto
    the data model a strict field erasure, exactly like LA1's `dsent`.
 3. **Reports are truthful at send, adversarially stale in flight**
@@ -84,7 +84,7 @@ designer calls documented inline):
    termMap)` — the recovered term is `max(vote, map)`, so the gate boots
    open exactly when the map's last term reaches the vote term (a tail
    the T-leader validated). Sim regression pin:
-   `uc2_sim` `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
+   `uc_sim` `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
    (inv7 phantom oracle, RED pre-fix → GREEN post-fix).
 6. **Tracker state lives on every node, meaningful while leader** (mirrors
    Rust: `ElectionSm.tracker` exists in every role; only the leader feeds
@@ -128,8 +128,8 @@ designer calls documented inline):
    `(currentTerm, base)` (pushed by `becomeLeader`'s `prunePush`; the
    model's analog of `new_term_pos = base + |NewTerm frame|`), and
    `ranked ≥ new_term_pos > base ⟺ k > base`. Sim regression pins:
-   `uc2_sim` `old_term_range_must_not_commit_before_new_term_quorum`
-   (inv2, RED pre-fix → GREEN post-fix) and the `uc2_consensus` unit pin
+   `uc_sim` `old_term_range_must_not_commit_before_new_term_quorum`
+   (inv2, RED pre-fix → GREEN post-fix) and the `uc_consensus` unit pin
    `commit_clamped_to_new_term_base_never_certifies_old_term_only_range`.
 10. **Omissions, documented**: (a) commit gossip / follower `commit_seen`
    (decision 4 — YAGNI: leader completeness is about the leader's hist);
@@ -182,7 +182,7 @@ theorem slotOf_lt {n : Nat} (i j : Fin n) (hj : j ≠ i) :
 the commit-certification state:
 
 - `tracker` — the REAL `Uc2Model.CommitTracker` kernel
-  (`uc2_consensus/src/commit.rs`, `ElectionSm.tracker`).
+  (`uc_consensus/src/commit.rs`, `ElectionSm.tracker`).
 - `commitIdx` — the leader's commit watermark / ghost-append cursor (the
   cnc commit counter stored on `Action::AdvanceCommit`; module doc, item 8).
 - `reconciled` — the reconciliation intake gate, `true` = open (the node's

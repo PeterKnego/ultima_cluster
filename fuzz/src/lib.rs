@@ -32,7 +32,7 @@ pub fn split(data: &[u8], n: usize) -> Vec<&[u8]> {
 /// one (`Sessioned<S>`) without caring what `S` does.
 pub struct NoopSm;
 
-impl uc2_service::RawStateMachine for NoopSm {
+impl uc_service::RawStateMachine for NoopSm {
     fn apply(&mut self, _position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
         out.clear();
     }
@@ -47,17 +47,17 @@ impl uc2_service::RawStateMachine for NoopSm {
 /// No-op snapshot capability, so `Sessioned<NoopSm>` (which forwards
 /// `SnapshotStateMachine` from its inner SM) can itself be fuzzed through the
 /// snapshot seam.
-impl uc2_service::SnapshotStateMachine for NoopSm {
+impl uc_service::SnapshotStateMachine for NoopSm {
     type SnapshotHandle = ();
 
-    fn freeze(&self) -> Result<((), u64), uc2_service::SnapshotError> {
+    fn freeze(&self) -> Result<((), u64), uc_service::SnapshotError> {
         Ok(((), 0))
     }
 
     fn stream_snapshot(
         _handle: (),
         _dst: &mut dyn std::io::Write,
-    ) -> Result<(), uc2_service::SnapshotError> {
+    ) -> Result<(), uc_service::SnapshotError> {
         Ok(())
     }
 
@@ -65,7 +65,7 @@ impl uc2_service::SnapshotStateMachine for NoopSm {
         &mut self,
         position: u64,
         src: &mut dyn std::io::Read,
-    ) -> Result<u64, uc2_service::SnapshotError> {
+    ) -> Result<u64, uc_service::SnapshotError> {
         let mut sink = std::io::sink();
         let _ = std::io::copy(src, &mut sink);
         Ok(position)
@@ -84,14 +84,14 @@ impl uc2_service::SnapshotStateMachine for NoopSm {
 ///
 /// Deliberately APPENDS rather than clearing `out` — the opposite discipline
 /// to `NoopSm`, so the two together cover both readings of
-/// [`uc2_service::RawStateMachine::apply`]'s "cleared by the caller" contract
+/// [`uc_service::RawStateMachine::apply`]'s "cleared by the caller" contract
 /// (the reading that clears is what found M12d finding #1).
 #[derive(Default)]
 pub struct EchoSm {
     applied: Option<u64>,
 }
 
-impl uc2_service::RawStateMachine for EchoSm {
+impl uc_service::RawStateMachine for EchoSm {
     fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
         self.applied = Some(position);
         out.extend_from_slice(cmd);
@@ -107,17 +107,17 @@ impl uc2_service::RawStateMachine for EchoSm {
 /// Snapshot capability for [`EchoSm`], so `Sessioned<EchoSm>` can be driven
 /// through the snapshot seam like `Sessioned<NoopSm>`. The state is a single
 /// `Option<u64>`, encoded as 8 bytes plus a presence byte.
-impl uc2_service::SnapshotStateMachine for EchoSm {
+impl uc_service::SnapshotStateMachine for EchoSm {
     type SnapshotHandle = Option<u64>;
 
-    fn freeze(&self) -> Result<(Option<u64>, u64), uc2_service::SnapshotError> {
+    fn freeze(&self) -> Result<(Option<u64>, u64), uc_service::SnapshotError> {
         Ok((self.applied, self.applied.unwrap_or(0)))
     }
 
     fn stream_snapshot(
         handle: Option<u64>,
         dst: &mut dyn std::io::Write,
-    ) -> Result<(), uc2_service::SnapshotError> {
+    ) -> Result<(), uc_service::SnapshotError> {
         dst.write_all(&[u8::from(handle.is_some())])?;
         dst.write_all(&handle.unwrap_or(0).to_le_bytes())?;
         Ok(())
@@ -127,7 +127,7 @@ impl uc2_service::SnapshotStateMachine for EchoSm {
         &mut self,
         position: u64,
         src: &mut dyn std::io::Read,
-    ) -> Result<u64, uc2_service::SnapshotError> {
+    ) -> Result<u64, uc_service::SnapshotError> {
         let mut buf = [0u8; 9];
         src.read_exact(&mut buf)?;
         self.applied = if buf[0] == 0 {
@@ -142,9 +142,9 @@ impl uc2_service::SnapshotStateMachine for EchoSm {
 // ---------------------------------------------------------------------------
 // Crypto-plane constructors
 //
-// `uc2_crypto`'s `Identity` and `Allowlist` have NO from-bytes constructor by
+// `uc_crypto`'s `Identity` and `Allowlist` have NO from-bytes constructor by
 // design (identity.rs) — both go through the real on-disk loaders, including
-// the 0600 permission check. These helpers are copied from `uc2_crypto`'s own
+// the 0600 permission check. These helpers are copied from `uc_crypto`'s own
 // `handshake.rs` test module (`node`, `authorized_pair`, `public_of`,
 // `scratch`) because those are `#[cfg(test)]` and invisible from here. They
 // are the same construction, with fixed key material so everything derived
@@ -153,12 +153,12 @@ impl uc2_service::SnapshotStateMachine for EchoSm {
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use uc2_crypto::NodeId;
-use uc2_crypto::handshake::Peers;
-use uc2_crypto::identity::{Allowlist, Identity};
-use uc2_crypto::schedule::BootSalt;
+use uc_crypto::NodeId;
+use uc_crypto::handshake::Peers;
+use uc_crypto::identity::{Allowlist, Identity};
+use uc_crypto::schedule::BootSalt;
 
-/// Fixed X25519 private scalars — the same values `uc2_crypto`'s tests use.
+/// Fixed X25519 private scalars — the same values `uc_crypto`'s tests use.
 pub const PRIV_A: [u8; 32] = [0x11; 32];
 pub const PRIV_B: [u8; 32] = [0x22; 32];
 pub const A_ID: NodeId = 1;
@@ -175,7 +175,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
     let root = std::env::var("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".scratch"));
-    let d = root.join("uc2-fuzz-scratch").join(name);
+    let d = root.join("uc_fuzz-scratch").join(name);
     assert!(!d.starts_with("/tmp"), "fuzz scratch must not live on tmpfs: {d:?}");
     std::fs::create_dir_all(&d).expect("create fuzz scratch dir");
     d
@@ -183,7 +183,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 
 /// Builds a `Peers` from a private key, the id it claims, and the peers it
 /// authorizes — key and allowlist through the real on-disk loaders, exactly as
-/// `uc2_crypto`'s `handshake.rs::node` does.
+/// `uc_crypto`'s `handshake.rs::node` does.
 pub fn build_peers(
     tag: &str,
     private: [u8; 32],
@@ -237,8 +237,8 @@ pub fn initiator_peers() -> Peers {
 /// an ack into. With a virgin plane every ack is a no-op and that branch is
 /// vacuous. `mint` draws its key from the OS RNG, which is fine here: this
 /// builds fuzz-time state, not a committed seed.
-pub fn group_plane_with_pending() -> uc2_crypto::group::GroupPlane {
-    let mut plane = uc2_crypto::group::GroupPlane::new(A_ID);
+pub fn group_plane_with_pending() -> uc_crypto::group::GroupPlane {
+    let mut plane = uc_crypto::group::GroupPlane::new(A_ID);
     let _ = plane.mint(&[B_ID, 3, 4], 1_000_000);
     plane
 }
@@ -246,7 +246,7 @@ pub fn group_plane_with_pending() -> uc2_crypto::group::GroupPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uc2_service::{RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine};
+    use uc_service::{RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine};
 
     fn envelope(client_id: u64, seq: u64, body: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();

@@ -285,4 +285,4 @@ All green at M3 close (commit `bd4ca23`).
 - Canonical design: `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` (Sections 4-10).
 - M1 record: `docs/tasks/task01_m1_embedded_single_node.md`.
 - M2 record: `docs/tasks/task02_m2_multi_node_quic.md`.
-- Dependency primitives: `../ultima_journal/` (segmented append log + `StableValue`), `../ultima_db/` (MVCC store + `snapshot_stream`), `openraft 0.9.24` (Raft consensus), `quinn 0.11` (QUIC), `memmap2 0.9`, `crc32fast 1`, `parking_lot 0.12`.
+- Dependency primitives: `../uc_journal/` (segmented append log + `StableValue`), `../ultima_db/` (MVCC store + `snapshot_stream`), `openraft 0.9.24` (Raft consensus), `quinn 0.11` (QUIC), `memmap2 0.9`, `crc32fast 1`, `parking_lot 0.12`.

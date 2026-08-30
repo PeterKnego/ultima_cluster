@@ -75,7 +75,7 @@ The fix is one word long: the identity the tag is verified against comes from
 the node's own boot-time state (`Consensus::admin_instance_id` /
 `admin_app_id`, set once in `Node::start_with`), never re-read from the page.
 It is pinned by a regression test that performs exactly that forgery
-(`uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`)
+(`uc_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`)
 and, for anti-vacuity, was confirmed to *pass* the replay with the binding
 reverted. Found in review, fixed before merge, never shipped.
 

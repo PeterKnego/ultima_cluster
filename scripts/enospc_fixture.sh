@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # M11 Task 6: a tiny loopback ext4 filesystem for the ENOSPC crashtest
-# (examples/uc2-crashtest/tests/enospc.rs, feature `enospc-tests`, env-gated
+# (examples/uc_crashtest/tests/enospc.rs, feature `enospc-tests`, env-gated
 # on UC2_ENOSPC_DIR). Needs sudo for mkfs/mount/chown (loop-device mounts are
 # root-only); probed up front so a caller without passwordless sudo gets a
 # clear exit-2 refusal instead of an interactive password prompt hanging the

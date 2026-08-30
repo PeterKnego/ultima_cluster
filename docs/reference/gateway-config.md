@@ -3,7 +3,7 @@
 Every key `uc2-gateway --config gateway.toml` reads, its default, and what
 makes it a startup refusal. Unknown keys are refused (`deny_unknown_fields`
 on every section, top level included) — a typo can never be silently
-ignored, the same posture `uc2_node`'s `node.toml` loader takes.
+ignored, the same posture `uc_node`'s `node.toml` loader takes.
 
 Loading is two steps: `config_file::load_from_path` deserialises the TOML
 (defaulting anything absent) into an `EdgeConfig`, then
@@ -65,8 +65,8 @@ for the first fourteen connections, `255` at fifteen, and so on down. A
 connection is told its grant in `HELLO_OK`, and every later change reaches
 it as an absolute `credits` value: a **reduction** is pushed as a standalone
 `STATUS` before it can send into the smaller window, an **increase** rides
-the next `RESPONSE` or the idle `STATUS` tick. `uc2_gateway::budget_for` and
-`uc2_gateway::grant_for` are public if you would rather compute than read.
+the next `RESPONSE` or the idle `STATUS` tick. `uc_gateway::budget_for` and
+`uc_gateway::grant_for` are public if you would rather compute than read.
 
 **What this replaces.** In `2.6.0` every connection was granted
 `per_conn_inflight` in full and nothing counted the sum, so N connections

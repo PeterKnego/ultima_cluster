@@ -59,33 +59,33 @@
 
 <h2>Start here</h2>
 <ul>
-  <li><a href="uc2_service/index.html">uc2_service</a> —
+  <li><a href="uc_service/index.html">uc_service</a> —
     <span class="desc">the crate you write against. Implement <code>StateMachine</code> and attach it to a node.</span></li>
-  <li><a href="uc2_client/index.html">uc2_client</a> —
+  <li><a href="uc_client/index.html">uc_client</a> —
     <span class="desc">submit commands, run linearizable and snapshot reads.</span></li>
 </ul>
 
 <h2>Remote access</h2>
 <ul>
-  <li><a href="uc2_remote/index.html">uc2_remote</a> —
+  <li><a href="uc_remote/index.html">uc_remote</a> —
     <span class="desc">the framed TCP wire protocol and <code>RemoteClient</code>, for clients that can't attach to shmem directly.</span></li>
-  <li><a href="uc2_gateway/index.html">uc2_gateway</a> —
+  <li><a href="uc_gateway/index.html">uc_gateway</a> —
     <span class="desc">the <code>Edge</code>: a per-node TCP front door relaying remote-protocol traffic over the local <code>Engine</code>.</span></li>
 </ul>
 
 <h2>The node</h2>
 <ul>
-  <li><a href="uc2_node/index.html">uc2_node</a> —
+  <li><a href="uc_node/index.html">uc_node</a> —
     <span class="desc">the process that participates in consensus, replicates the log, and makes it durable.</span></li>
 </ul>
 
 <h2>Core</h2>
 <ul>
-  <li><a href="uc2_consensus/index.html">uc2_consensus</a> —
+  <li><a href="uc_consensus/index.html">uc_consensus</a> —
     <span class="desc">the pure-sync safety core: commit ranking, elections, term maps, truncation. The kernels carrying machine-checked proofs.</span></li>
-  <li><a href="uc2_log/index.html">uc2_log</a> —
+  <li><a href="uc_log/index.html">uc_log</a> —
     <span class="desc">the shared-memory log ring, and the archive agent that makes it durable.</span></li>
-  <li><a href="uc2_net/index.html">uc2_net</a> —
+  <li><a href="uc_net/index.html">uc_net</a> —
     <span class="desc">reliable UDP with NAK repair, quorum-paced flow control, journal replay sessions.</span></li>
   <li><a href="uc_protocol/index.html">uc_protocol</a> —
     <span class="desc">the canonical wire spec: cnc page layout, frame formats, lock-free rings.</span></li>
@@ -93,11 +93,11 @@
 
 <h2>Supporting</h2>
 <ul>
-  <li><a href="uc2_crypto/index.html">uc2_crypto</a> —
+  <li><a href="uc_crypto/index.html">uc_crypto</a> —
     <span class="desc">optional authenticated and encrypted node-to-node transport. Off by default.</span></li>
-  <li><a href="ultima_journal/index.html">ultima_journal</a> —
+  <li><a href="uc_journal/index.html">uc_journal</a> —
     <span class="desc">segmented append journal and atomic <code>StableValue</code>s.</span></li>
-  <li><a href="uc2_sim/index.html">uc2_sim</a> —
+  <li><a href="uc_sim/index.html">uc_sim</a> —
     <span class="desc">the deterministic simulator: virtual time, seeded fault fuzz, nine whole-cluster invariants.</span></li>
   <li><a href="uc_lincheck/index.html">uc_lincheck</a> —
     <span class="desc">the WGL linearizability checker, history recorder, and register model.</span></li>

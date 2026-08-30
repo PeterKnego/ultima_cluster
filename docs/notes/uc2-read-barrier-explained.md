@@ -3,7 +3,7 @@
 **Audience:** developers new to UC's read path, or anyone reviewing a change to
 it. No prior Raft knowledge assumed.
 **Status:** explanatory. The normative descriptions live in the v2 design spec
-(§7) and the code (`uc2_node/src/node.rs`); if this note and those disagree,
+(§7) and the code (`uc_node/src/node.rs`); if this note and those disagree,
 they win and this note is stale.
 
 ---

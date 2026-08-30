@@ -1,10 +1,10 @@
-/-! `uc2_consensus/src/election.rs`: the vote-safety kernel —
+/-! `uc_consensus/src/election.rs`: the vote-safety kernel —
 `log_ok_order` (lexicographic freshness) + the `voted_for`
 single-vote-per-term discipline of `handle_request_vote`. Modeled at the
 post-term-adoption point (the Rust comment: "At this point current_term ==
 new_term"). Persist-before-send (`PersistAndSendVote`) is modeled as an
 atomic step — recorded as a runtime assumption (V3), discharged by
-inspection of uc2_node, not by proof. -/
+inspection of uc_node, not by proof. -/
 
 namespace Uc2
 

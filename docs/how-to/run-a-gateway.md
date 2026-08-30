@@ -5,7 +5,7 @@ the [remote protocol](../reference/remote-protocol.md) from ordinary TCP
 clients and relays their commands over shared memory into the co-located
 node, so a client that cannot attach to shmem directly (a different host, a
 non-Rust process) still gets the same replicated, linearizable-read-capable
-service a local `uc2_client::Engine` would.
+service a local `uc_client::Engine` would.
 
 ## Topology: one edge per node host
 
@@ -102,7 +102,7 @@ uc2-gateway --config /etc/uc2/gateway.toml
 uc2-gateway: listening on 0.0.0.0:9200
 ```
 
-It attaches to the node's instance directory the way `uc2_client::Engine`
+It attaches to the node's instance directory the way `uc_client::Engine`
 would — start the node first. Under systemd,
 `packaging/systemd/uc2-gateway.service` already encodes this ordering
 (`After=uc2-node.service`, `BindsTo=uc2-node.service` — the gateway stops
@@ -126,7 +126,7 @@ another edge the same way a mid-request node crash would.
 
 ## What a client sees on failover
 
-A conforming client (`uc2_remote`'s `RemoteEngine` halves or the `RemoteClient`
+A conforming client (`uc_remote`'s `RemoteEngine` halves or the `RemoteClient`
 convenience over them, or a port that implements
 [the protocol reference](../reference/remote-protocol.md)) never surfaces
 `REDIRECT`, `LEADER_CHANGED`, `RETRY`, or a dropped connection to its
@@ -214,7 +214,7 @@ dead node hears `UNKNOWN` sooner and re-sends somewhere useful sooner;
 comes back `replayed` or applies exactly once. Longer means a genuinely slow
 but *live* request is less likely to be called `UNKNOWN` prematurely. Since
 the resend is safe and the alternative is a stalled client, err short. (The
-same reasoning is why `examples/uc2-crashtest`'s gateway binary runs with a
+same reasoning is why `examples/uc_crashtest`'s gateway binary runs with a
 2 s deadline against a test that kills a node every few seconds.)
 
 A client sees this as: the request resolves `UNKNOWN` after
@@ -227,7 +227,7 @@ socket closes) or the node restarts (the faulted path above). That is why
 ### The stronger fix, not implemented
 
 The edge could probe the node's liveness directly rather than trusting the
-frozen page: `uc2_service` already takes a **shared flock on the instance
+frozen page: `uc_service` already takes a **shared flock on the instance
 directory** as a liveness probe against the node's exclusive lock, and an
 edge doing the same could refuse writes the instant the node's lock became
 acquirable — no supervisor in the loop, and no residual window at all. That
@@ -263,7 +263,7 @@ client either. A response computed for another client during that stall can
 be overwritten in the ring before the driver gets back to it, and that
 client sees `UNKNOWN` instead of its real answer. This is a real, accepted
 cost of the current single-driver design (documented in
-`uc2_gateway/src/edge.rs`'s module doc), not a bug: it resolves the same way
+`uc_gateway/src/edge.rs`'s module doc), not a bug: it resolves the same way
 any `UNKNOWN` does — the client resends, and with the session envelope on
 that resend comes back `replayed` rather than double-applying anything. If
 one misbehaving client stalling every other client on the same edge is a

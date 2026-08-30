@@ -23,7 +23,7 @@ JAVA_XMX="${ELLE_JAVA_XMX:-2g}"
 # scripts/elle_mutation.sh; this stays empty for the normal clean tier.
 CARGO_FEATURES="${ELLE_CARGO_FEATURES:-}"
 # M8 Task 15: UC2_CRYPTO=1 re-runs every pass below with wire crypto Enabled
-# on every node (see uc2_node/tests/elle_v2.rs's crypto_from_env / lincheck_v2's
+# on every node (see uc_node/tests/elle_v2.rs's crypto_from_env / lincheck_v2's
 # ClusterCfg::crypto). Inherited by the `cargo test` subshell below like any
 # other exported var — named here only so it shows up in the run's own log line
 # and so a history cached under a DIFFERENT ELLE_DIR is never silently reused
@@ -109,7 +109,7 @@ for pass in "${PASSES[@]}"; do
     else
         echo "== generating $pass history (elle_v2 driver, crypto=$UC2_CRYPTO) =="
         # shellcheck disable=SC2086
-        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc2_node --release $CARGO_FEATURES \
+        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc_node --release $CARGO_FEATURES \
             --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     fi
     # Count what we actually adjudicate. Without this the script is FAIL-OPEN:

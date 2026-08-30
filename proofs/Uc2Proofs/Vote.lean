@@ -6,7 +6,7 @@ namespace Uc2
 /-! **V3 (runtime assumption, not a theorem).** The model treats
 grant-and-record as one atomic step. The Rust discharges this via
 `Action::PersistAndSendVote` — the vote record is fsynced via `StableValue`
-BEFORE the grant datagram is sent (uc2_node's action executor), so a
+BEFORE the grant datagram is sent (uc_node's action executor), so a
 crash-restart can never un-vote. Discharged by code inspection; Tier B's
 crash-restart step preserves `votedFor` accordingly. -/
 

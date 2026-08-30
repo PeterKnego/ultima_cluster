@@ -3,7 +3,7 @@
 
 //! M8 wire-crypto layouts (spec: docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md §4).
 //! Core-only: offsets, constants, and pure codecs. No crypto code lives here —
-//! that is `uc2_crypto`'s job. A sealed datagram is:
+//! that is `uc_crypto`'s job. A sealed datagram is:
 //!
 //! ```text
 //! [ 16B header (cleartext, used as AAD; carries key_epoch) ]
@@ -23,7 +23,7 @@
 //! silently fails to interoperate (every datagram it seals or opens
 //! disagrees with a peer using the canonical order), so this sentence is
 //! the only thing pinning it: this crate is core-only and carries no crypto
-//! code to enforce it by type. See `uc2_crypto::seal` for the actual
+//! code to enforce it by type. See `uc_crypto::seal` for the actual
 //! AEAD implementation and its known-answer test.
 
 /// Per-sender monotonic counter; the low 64 bits of the 96-bit GCM nonce.

@@ -113,10 +113,10 @@ def fsm_reattached(pre_inc, slot, bound):
     """Row d's attach clause, as a pure predicate.
 
     The `attached` bit alone is NOT evidence of a reattach: only the service
-    writes it (`uc2_service/src/attach.rs:159` sets it, `uc2_service/src/
+    writes it (`uc_service/src/attach.rs:159` sets it, `uc_service/src/
     lib.rs:388-389` clears it on an orderly stop), so a SIGKILL leaves the
     KILLED incarnation's bit set and the first poll after the kill would read
-    `attached=true` for the corpse. `uc2_service::attach` bumps the slot's
+    `attached=true` for the corpse. `uc_service::attach` bumps the slot's
     incarnation exactly once per attach (same line 159,
     `incarnation.wrapping_add(1)`), and the node is NOT restarted in row d, so
     the counter survives the kill — a STRICTLY greater incarnation than the
@@ -247,7 +247,7 @@ def prepare_host_m14(host):
     m12.prepare_host(host, apply_profile=False)
     env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
     cmd = (f"{env} {m6.SshHost.CARGO} build --release --manifest-path {m6.SshHost.UC_SRC}/Cargo.toml "
-           f"-p uc2ctl && test -x {BUILT_CTL} && echo CTL-OK")
+           f"-p uc_ctl && test -x {BUILT_CTL} && echo CTL-OK")
     r = ssh(host, cmd, label="build-ctl")
     if "CTL-OK" not in (r.stdout or ""):
         raise RuntimeError(f"uc2ctl build on {host.public_ip}: {r.stderr or r.stdout}")
@@ -496,7 +496,7 @@ def log_lines(h, unit, pattern, lines=200):
     """Lines of a unit's log matching an extended regex, newest last.
 
     `obs_event!` renders one JSON line per record and writes it to STDERR
-    (`uc2_node/src/obs/log.rs:227-243`, sink defaults to stderr, default level
+    (`uc_node/src/obs/log.rs:227-243`, sink defaults to stderr, default level
     Info) — no subscriber is installed or needed — and every transient unit
     appends BOTH stdout and stderr to the same file
     (`m12_fleet_gate.unit_start_cmd`), so the node role's structured records
@@ -556,24 +556,24 @@ def arm_kill(voters, a, K, checks, pins=None):
     #      row f uses. Both halves are required, and the second is the one
     #      that actually does the work: reconstruction installs the newest
     #      artifact only inside the gap guard
-    #      `if first > start_pos` (uc2_service/src/replay.rs:73-78), where
+    #      `if first > start_pos` (uc_service/src/replay.rs:73-78), where
     #      `first` is the base of the OLDEST RETAINED journal segment
     #      (`reader.first_meta()`, 0 while nothing has been purged) and a
     #      fresh process's `start_pos` is 0
-    #      (uc2_service/src/attach.rs:153, `last_applied().unwrap_or(0)`).
+    #      (uc_service/src/attach.rs:153, `last_applied().unwrap_or(0)`).
     #      With purge off, `first` stays 0 for the whole arm, `0 > 0` is
     #      false, and the FSM falls through to `scan_from(0)` — the full
     #      replay run 1 diagnosed — NO MATTER what snapshot interval it was
     #      given. Only `PurgePolicy::BelowSnapshot` dispatches
     #      `ArchiveCmd::Purge` and lifts `first` above 0
-    #      (uc2_node/src/node.rs:3261-3270). Run 1 gave the FSMs neither, so
+    #      (uc_node/src/node.rs:3261-3270). Run 1 gave the FSMs neither, so
     #      the restart replayed the WHOLE journal (~11.9 M commands, ~1.3 GB)
     #      and `attached_at` was a replay-completion clock (21.6 s). A
     #      deployed service installs its newest artifact and tail-replays one
     #      interval; that is what M9's 15 s budget was itemised against.
     #  (2) The measuring client submits to FSM 0 ONLY (`fan_in=False`). Under
     #      fan-in a submit completes only when EVERY declared FSM answers, and
-    #      journal replay is publish-silent (uc2_service/src/replay.rs:44-46),
+    #      journal replay is publish-silent (uc_service/src/replay.rs:44-46),
     #      so in run 1 all 4 096 in-flight requests could retire only on the
     #      client's 30 s `request_timeout` — the rate read 0 for the rest of
     #      the arm regardless of how fast FSM 1 recovered, and `lost` came out
@@ -652,7 +652,7 @@ def arm_kill(voters, a, K, checks, pins=None):
     # Spec §15.5: the transitions the LEADER's node actually observed. Attach
     # dominates and the pair is not symmetric — a restart inside the ~3 s
     # heartbeat bar shows `service_attached` twice with no `service_detached`
-    # between (uc2_node/src/node.rs:2854-2888). Recorded, never adjudicated.
+    # between (uc_node/src/node.rs:2854-2888). Recorded, never adjudicated.
     transitions = log_lines(h, "node", "service_(de|at)tached")
     print(f"INFO row d: leader service transitions ({len(transitions)}):", flush=True)
     for ln in transitions:
@@ -731,7 +731,7 @@ def arm_join(voters, learner, a, K, checks, pins=None):
     # the learner, rather than a plain journal catch-up plus its own snapshot
     # builds (which would satisfy attached + applied + snapshot_pos > 0 on
     # their own). `snapshot_installed` is emitted at Info by
-    # `uc2_node/src/node.rs:3168`.
+    # `uc_node/src/node.rs:3168`.
     installs = len(log_lines(learner, "node", '"event":"snapshot_installed"'))
     refusals = {}
     for hh in voters + [learner]:

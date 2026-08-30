@@ -44,12 +44,12 @@ path = "src/bin/counter-remote.rs"
 quickstart-tests = []
 
 [dependencies]
-uc2_node      = { path = "../../uc2_node", version = "2.8.1" }
-uc2_service   = { path = "../../uc2_service", version = "2.8.1" }
-uc2_client    = { path = "../../uc2_client", version = "2.8.1" }
-uc2_net       = { path = "../../uc2_net", version = "2.8.1" }
-uc2_consensus = { path = "../../uc2_consensus", version = "2.8.1" }
-uc2_remote    = { path = "../../uc2_remote", version = "2.8.1" }
+uc_node      = { path = "../../uc_node", version = "2.9.0" }
+uc_service   = { path = "../../uc_service", version = "2.9.0" }
+uc_client    = { path = "../../uc_client", version = "2.9.0" }
+uc_net       = { path = "../../uc_net", version = "2.9.0" }
+uc_consensus = { path = "../../uc_consensus", version = "2.9.0" }
+uc_remote    = { path = "../../uc_remote", version = "2.9.0" }
 serde         = { workspace = true }
 bincode       = { workspace = true }
 clap          = { version = "4", features = ["derive"] }

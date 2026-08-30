@@ -112,10 +112,10 @@ bench-infra/scripts/m6_fleet_gate.py --fleet --read-profile   # read profile
 
 # Local, in-process smoke — 3 nodes + 3 services + 1 client in one process.
 # The harness itself calls this "NOT the gate".
-cargo run --release -p uc2_node --example m5_gate -- all
+cargo run --release -p uc_node --example m5_gate -- all
 ```
 
-The gate harnesses are `uc2_node/examples/{m4,m5,m6,m7}_gate.rs` and
+The gate harnesses are `uc_node/examples/{m4,m5,m6,m7}_gate.rs` and
 `read_profile.rs`; each carries its own `node` / `service` / `client` roles so
 the fleet orchestrator can start one process per host.
 

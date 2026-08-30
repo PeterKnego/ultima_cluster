@@ -3,7 +3,7 @@
 **Date:** 2026-07-26
 **Spec:** `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`
 **Plan:** `docs/superpowers/plans/2026-07-25-uc2-read-profile.md` (Task 7)
-**Harness:** `uc2_node/examples/read_profile.rs` (merged to main @ `bb93cec`)
+**Harness:** `uc_node/examples/read_profile.rs` (merged to main @ `bb93cec`)
 **Orchestrator:** `bench-infra/scripts/m6_fleet_gate.py --fleet --read-profile`
 
 **Fleet:** 3 × `c6id.2xlarge` (8 vCPU, local NVMe), `us-east-1`, single placement

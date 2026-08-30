@@ -20,7 +20,7 @@ version = 2
 # Apache-2.0/MIT below without adding BSD-1-Clause, LGPL-2.1-or-later, or
 # "Apache-2.0 WITH LLVM-exception" to the allowlist.
 allow = [
-  "Apache-2.0",   # the great majority of the graph, incl. every uc2_*/ultima-journal workspace crate
+  "Apache-2.0",   # the great majority of the graph, incl. every uc_* workspace crate
   "MIT",          # the other majority share (serde, tokio, bincode, rand, clap, thiserror, snow, aes-gcm family, ...)
   "BSD-2-Clause", # zerocopy
   "BSD-3-Clause", # curve25519-dalek, subtle, x25519-dalek
@@ -32,7 +32,7 @@ confidence-threshold = 0.8
 multiple-versions = "warn"
 wildcards = "deny"
 # Several dev-dependencies within this workspace are deliberately
-# unversioned path deps (uc-lincheck, and a few self-referential /
+# unversioned path deps (uc_lincheck, and a few self-referential /
 # forward-in-the-publish-DAG dev-deps — see the per-crate Cargo.toml
 # comments added in M12c Task 1): cargo silently strips an unversioned path
 # dev-dependency from a published manifest instead of erroring, which is the

@@ -45,7 +45,7 @@ explicitly so a future reader knows exactly which real-world property the proofs
 now rest on.
 
 **Scope.** A few sentences. No proof, no model, no conformance-rig change (the
-rig is over `uc2_consensus`, which crypto never touches).
+rig is over `uc_consensus`, which crypto never touches).
 
 ---
 
@@ -89,7 +89,7 @@ argument for modeling the plane where the sim is blind.
 
 **Scope.** A Veil spike session or two, following the existing guardrails
 (Lean 4.28 `veil-2.0-preview` in a separate checkout; countermodels →
-directed `uc2_sim` regressions + Rust fixes; never on `proofs/`'s build path).
+directed `uc_sim` regressions + Rust fixes; never on `proofs/`'s build path).
 The rotation bugs are already fixed in shipped code, so the immediate value is
 (a) a regression oracle and (b) hunting the *next* rotation-plane bug of the same
 class before it ships.

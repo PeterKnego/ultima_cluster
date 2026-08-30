@@ -39,11 +39,11 @@ fixed binary used for every single run, so a sink-side codegen difference can
 never leak into the delta. Reps alternate order (odd reps A→B, even reps
 B→A) so warm-up or thermal drift cannot favour a side.
 
-`uc2_gateway/examples/hop_bench/engine_load.rs` differs by exactly four net
+`uc_gateway/examples/hop_bench/engine_load.rs` differs by exactly four net
 lines between 3a7f9a5 and 4347bc2 (`git diff 3a7f9a5 HEAD -- …/engine_load.rs`):
 the mandatory `Outcome::Responses(_)` and `Outcome::BadService { .. }` arms
 added to an exhaustive match on a path a bench never takes. The harness is
-otherwise byte-identical, so `hb-m14a` vs `hb-main` is a `uc2_client`
+otherwise byte-identical, so `hb-m14a` vs `hb-main` is a `uc_client`
 comparison.
 
 ## Results
@@ -101,7 +101,7 @@ unsettled numbers are tabulated above.
    two binaries. Their sign never flips, so something in *those two builds* is
    real; but freshly building the identical two commits erases it (finding 1),
    and building the same commit twice manufactures a delta of comparable size
-   (finding 2). That the residue is the **build** rather than `uc2_client` is
+   (finding 2). That the residue is the **build** rather than `uc_client` is
    therefore an **inference by elimination, not a measured fact** — nothing
    here inspected the object code. The open step that would settle it is a
    symbol-alignment / disassembly diff of the poll-loop and `handle_record`
@@ -150,7 +150,7 @@ unsettled numbers are tabulated above.
    this harness does not reliably resolve 1 % on this box, so all three would
    in all likelihood have returned OVERLAP. Recording them as "refuted" would
    have been a claim the instrument cannot support. They remain untried
-   suspects, and `uc2_client/src/engine.rs` is unchanged by this work.
+   suspects, and `uc_client/src/engine.rs` is unchanged by this work.
 
 ## The runner's own confound
 
@@ -190,7 +190,7 @@ explanation — subject to finding 3's caveat that it remains an inference.
 
 ## What this changes
 
-- **Nothing in `uc2_client`.** No variant was applied; `engine.rs` is exactly
+- **Nothing in `uc_client`.** No variant was applied; `engine.rs` is exactly
   the Task-1 commit `f47fe5f`. The claim that M14b cost hop 1 ≈ −4.2 % should
   not be carried forward without a fleet measurement — it is within this box's
   build-to-build noise. Its source is the "Post-execution addendum" of
@@ -220,7 +220,7 @@ mkdir -p /home/claude/m14c-ab/bin
 # (1) main 4347bc2 — the M14b tip. Supplies BOTH the fixed sink and driver A.
 cd /home/claude/ultima/ultima_cluster
 CARGO_TARGET_DIR=/home/claude/cargo-target-m14c-main \
-  cargo build --release -p uc2_gateway --example hop_bench
+  cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-m14c-main/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-main
 
 # (2) main 3a7f9a5 — M14a's tip, extracted read-only (no worktree, no HEAD move).
@@ -228,13 +228,13 @@ mkdir -p /home/claude/m14c-a0-tree
 git -C /home/claude/ultima/ultima_cluster archive 3a7f9a5 | tar -x -C /home/claude/m14c-a0-tree
 cd /home/claude/m14c-a0-tree
 CARGO_TARGET_DIR=/home/claude/cargo-target-m14c-a0 \
-  cargo build --release -p uc2_gateway --example hop_bench
+  cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-m14c-a0/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-m14a
 
 # (3) the branch after Task 1.
 cd /home/claude/ultima/ultima_cluster/.claude/worktrees/uc2-multi-service
 CARGO_TARGET_DIR=/home/claude/cargo-target-uc2-m14a \
-  cargo build --release -p uc2_gateway --example hop_bench
+  cargo build --release -p uc_gateway --example hop_bench
 cp /home/claude/cargo-target-uc2-m14a/release/examples/hop_bench /home/claude/m14c-ab/bin/hb-t1
 
 sha256sum /home/claude/m14c-ab/bin/*

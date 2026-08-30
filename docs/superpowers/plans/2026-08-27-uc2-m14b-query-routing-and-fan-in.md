@@ -6,16 +6,16 @@
 
 **Architecture:** The `MSG_V2_QUERY` payload gains a leading `service_id: u8`; the node strips it, answers `MSG_V2_BAD_SERVICE` on `egress_node.broadcast` for an id with no ring, forwards snapshot reads to `svc_query.<id>.ring`, and carries the id through the existing per-slot read barrier (which M14a already keyed on `slot[service_id]`). The client `Engine` opens every declared FSM's `egress_service.<id>.broadcast`, tags each slot with an `expected` ring bitmask and a `received` bitmask, accepts a `MSG_V2_RESPONSE` only from an expected ring, and completes when `received == expected` — buffering the partial responses of a fan-in on the `PollHalf` and handing them to the callback as one ordered `Outcome::Responses`. The blocking tiers add `submit_to`/`submit_all`/`query_*_on`, a `FanInTicket<R>` for the fan-in, and a local `ServiceNotDeclared` refusal. The sim gains one report choke point, a per-node apply ceiling, invariant inv10 (a clamped report never exceeds its unclamped value or its ceiling, and never decreases between reset events) and the "commit stalls iff a quorum is capped" scenario.
 
-**Tech Stack:** Rust 2024 (workspace edition), stable 1.96.0 pinned / MSRV 1.89, `bytes::Bytes` for every fan-in payload (the workspace dep `uc2_service`/`uc2_remote` already use; `uc2_client` gains it), `uc2_sim` driving the real `ElectionSm`, `cargo-fuzz` on nightly for the `ring_mpsc_record` seed extension.
+**Tech Stack:** Rust 2024 (workspace edition), stable 1.96.0 pinned / MSRV 1.89, `bytes::Bytes` for every fan-in payload (the workspace dep `uc_service`/`uc_remote` already use; `uc_client` gains it), `uc_sim` driving the real `ElectionSm`, `cargo-fuzz` on nightly for the `ring_mpsc_record` seed extension.
 
-**Spec:** `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` — this plan implements §5.4, §6.1–§6.4, and §12's "unit: client slot-table mask completion" + "`uc2_sim`" rows. **Landed before this plan:** M14a (`main` 6111257) — cnc 3.0, `[services]`, per-id rings, the slot band, the lag barrier, the door term and the report ceiling. **Not in this plan:** §7.3 (N artifacts per snapshot session, wire 0.6.0), §9 (labelled metrics/alerts/`uc2ctl status`), the §12 capstones/elle/crashtest (M14c), the fleet gate and release writeup (M14d).
+**Spec:** `docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md` — this plan implements §5.4, §6.1–§6.4, and §12's "unit: client slot-table mask completion" + "`uc_sim`" rows. **Landed before this plan:** M14a (`main` 6111257) — cnc 3.0, `[services]`, per-id rings, the slot band, the lag barrier, the door term and the report ceiling. **Not in this plan:** §7.3 (N artifacts per snapshot session, wire 0.6.0), §9 (labelled metrics/alerts/`uc2ctl status`), the §12 capstones/elle/crashtest (M14c), the fleet gate and release writeup (M14d).
 
 ## Deviations from the spec, for the reviewer
 
-1. **Fan-in payloads are `bytes::Bytes` — the spec's type, not `Vec<u8>`.** The 2026-08-22 codec spike measured `Vec<u8>` payloads making the apply thread decode-bound (56–85 %) where `Bytes` on the same wire sat at 15–21 %, and `AppCommand = Bytes` is the SM contract end to end; the client's fan-in follows the same standard. `uc2_client` gains the workspace `bytes` dependency (already used by `uc2_service` and the published `uc2_remote`). The spec's `Vec<Option<Bytes>>` becomes a `PollHalf`-owned per-slot `FanIn { seq, position, parts: Vec<(u8, Bytes)> }`, handed to the callback as `Outcome::Responses(&[(u8, Bytes)])` (ordered by id) and carried to a `FanInTicket` as `Resolved::Many { parts: Vec<(u8, Bytes)> }` — one `Bytes::copy_from_slice` per piece at the ring-read boundary (the reused read buffer forces that one copy), refcounted from there through the ticket to the caller with no further copies.
+1. **Fan-in payloads are `bytes::Bytes` — the spec's type, not `Vec<u8>`.** The 2026-08-22 codec spike measured `Vec<u8>` payloads making the apply thread decode-bound (56–85 %) where `Bytes` on the same wire sat at 15–21 %, and `AppCommand = Bytes` is the SM contract end to end; the client's fan-in follows the same standard. `uc_client` gains the workspace `bytes` dependency (already used by `uc_service` and the published `uc_remote`). The spec's `Vec<Option<Bytes>>` becomes a `PollHalf`-owned per-slot `FanIn { seq, position, parts: Vec<(u8, Bytes)> }`, handed to the callback as `Outcome::Responses(&[(u8, Bytes)])` (ordered by id) and carried to a `FanInTicket` as `Resolved::Many { parts: Vec<(u8, Bytes)> }` — one `Bytes::copy_from_slice` per piece at the ring-read boundary (the reused read buffer forces that one copy), refcounted from there through the ticket to the caller with no further copies.
 2. **`submit_all` returns a `FanInTicket<R>`, not `Ticket<Vec<(u8, R)>>`.** `TicketCore` resolves to one `(position, bytes)` blob that `Ticket::wait` bincode-decodes as `R`; a fan-in carries N per-id blobs that each decode as `R`, which is not the same as one blob decoding as `Vec<(u8, R)>`. `TicketCore` gains a `Resolved::{One, Many}` payload and a second ticket type decodes `Many`. Same blocking/`Future` shape, honest type.
 3. **The driver still parks on FSM 0's ring handle.** `RingWaitHandle::park` is a single futex; there is no wait-on-N primitive, and `wait_handle()` has five callers (the pipelined driver, the gateway twice, `hop_bench`). A response that lands only on ring k ≠ 0 wakes nobody and resolves at the driver's existing 1 ms park ceiling (`spawn_driver`'s `park(seq, 1 ms)`). Accepted for M14b: ≤ 1 ms added latency on non-default FSMs under `WaitStrategy::Park`; `BusySpin`/`Backoff` unaffected; the gateway only ever uses FSM 0. Documented on `wait_handle`.
-4. **`MSG_V2_BAD_SERVICE` is gated on "does this node have a ring for the id", not on the declared bitmask.** A `ServicesConfig::none_for_tests()` node (declared `0`) rings FSM 0 and every unit-test harness in `uc2_node` is one; `is_declared(0)` is false there while `svc_query[0]` exists. For a real node the two predicates are identical (`ring_ids() == declared`). The gate is `svc_query[id].is_some()` — exactly what `forward_svc_query` already checks.
+4. **`MSG_V2_BAD_SERVICE` is gated on "does this node have a ring for the id", not on the declared bitmask.** A `ServicesConfig::none_for_tests()` node (declared `0`) rings FSM 0 and every unit-test harness in `uc_node` is one; `is_declared(0)` is false there while `svc_query[0]` exists. For a real node the two predicates are identical (`ring_ids() == declared`). The gate is `svc_query[id].is_some()` — exactly what `forward_svc_query` already checks.
 5. **An empty `MSG_V2_QUERY` payload (no id byte) is dropped**, matching the service's own precedent for a `svc_query` record shorter than its prefix (`apply.rs::drain_queries`: "a query has no recovery contract; the client times out/retries"). The SDK always writes the prefix, so only a raw ring writer can reach this.
 6. **Client payload cap counts the wire payload** — for a query, `query.len() + 1` is compared against `max_payload`, so the cap describes what is written, not what the caller passed.
 7. **inv10 is scoped to the sim's report choke point, not stated against `sm.validated_up_to()`.** The sim's `RawM3` and `Mechanism`-leak modes deliberately report raw durables above any validated frontier, and several red pins assert *those* traces trip a *specific* invariant (`phantom`, `inv5`). inv10 therefore states what the ceiling mechanism guarantees: clamped ≤ unclamped, clamped ≤ ceiling when set, and clamped non-decreasing between reset events (truncate, crash/restart, role change, a lowered ceiling). `inject_report` (a forged-wire model) is exempt.
@@ -27,7 +27,7 @@
 - **Private `CARGO_TARGET_DIR`** for the proof-stack run (`~/.cache/cargo-target` is shared across worktrees); the M14a-era warm dir `/home/claude/cargo-target-uc2-m14a` is fine.
 - **Record formats (spec §6.3):** `ingress.ring` `MSG_V2_SUBMIT` unchanged; `query.ring` `MSG_V2_QUERY` payload = `service_id: u8 ++ query bytes`; `svc_query.<id>.ring` `MSG_V2_SVC_QUERY` payload unchanged (`expected_epoch: u64 LE ++ query`); `egress_service.<id>.broadcast` unchanged; `egress_node.broadcast` gains `MSG_V2_BAD_SERVICE = 7` (payload `service_id: u8`). The ring framing (`ULTRNG2`), the log frame, the datagram header, `version::CURRENT` (0.5.0) and `CNC_V2_VERSION` (3.0) are untouched.
 - **The read barrier's quorum round (`read_round.rs`) is untouched** — one round certifies reads for any FSM (spec §5.4).
-- **`uc2_service`, `uc2_consensus`, `uc2_net`, `uc2_crypto` are not modified.** The remote protocol stays v1: `uc2_remote` untouched; `uc2_gateway` only gains the new `Outcome`/`SubmitError` match arms (spec §6.4: remote clients get FSM 0).
+- **`uc_service`, `uc_consensus`, `uc_net`, `uc_crypto` are not modified.** The remote protocol stays v1: `uc_remote` untouched; `uc_gateway` only gains the new `Outcome`/`SubmitError` match arms (spec §6.4: remote clients get FSM 0).
 - **Harness rule:** a page whose `services_declared` reads `0` is a harness node — every attacher treats it as `{0}` (M14a's rule, kept by the client).
 - Public API additions land in `docs/reference/semver-policy.md` (the promised surface tables) in Task 8.
 - Commit after every task with a conventional message. One task, one commit (a fix round may add one).
@@ -38,19 +38,19 @@
 |---|---|---|
 | `uc_protocol/src/v2/ipc.rs` | Modify | `MSG_V2_BAD_SERVICE = 7`; `split_query_payload`/`write_query_payload` (the `service_id ++ query` codec, core-friendly); routing-table doc; pins. |
 | `fuzz/fuzz_targets/ring_mpsc_record.rs`, `fuzz/src/seeds.rs`, `fuzz/corpus/ring_mpsc_record/*`, `fuzz/README.md` | Modify | The decoded record's payload goes through `split_query_payload` when `msg_type == MSG_V2_QUERY`; two query seeds. |
-| `uc2_node/src/node.rs` | Modify | `send_bad_service`; `has_service_ring`; `drain_query_ring` parses/strips the id, gates, routes; `forward_svc_query`'s "M14b answers first" comment realised; unit tests. |
-| `uc2_node/examples/read_profile.rs` | Modify | Its raw `MSG_V2_QUERY` writes carry the `0u8` prefix. |
-| `uc2_client/Cargo.toml` | Modify | `bytes = { workspace = true }`. |
-| `uc2_client/src/slots.rs` | Modify | `Slot.{expected, received}`, `claim(.., expected)`, `resolve(.., ring)` with `Partial`/`WrongRing`, `slot_index`, `slot_count`; tests. |
-| `uc2_client/src/engine.rs` | Modify | N egress rings, `Shared.declared`, the query prefix scratch, `try_submit_to`/`try_submit_all`/`try_query_on`, per-ring `handle_record` + `FanIn` buffer, `Outcome::{Responses, BadService}`, `SubmitError::ServiceNotDeclared`, stats `wrong_ring`/`bad_service`. |
-| `uc2_client/src/ticket.rs` | Modify | `Resolved::{One, Many}`; `FanInTicket<R>`; `fan_in_ticket_pair`. |
-| `uc2_client/src/pipelined.rs` | Modify | `submit_to`, `submit_all`, `query_snapshot_on`, `query_linearizable_on`, `declared()`; `dispatch` generalised over the ticket pair; driver maps the two new outcomes. |
-| `uc2_client/src/client.rs`, `error.rs`, `lib.rs` | Modify | Shim mirrors; `ClientError::ServiceNotDeclared`; re-export `FanInTicket`. |
-| `uc2_client/tests/engine_synthetic.rs`, `uc2_client/tests/pipelined.rs` | Modify | Mask/fan-in/bad-service tests on a synthetic dir; two-FSM tests against a real node. |
-| `uc2_gateway/src/edge.rs`, `uc2_gateway/examples/hop_bench/engine_load.rs`, `uc2_gateway/examples/m12_gate.rs`, `uc2_node/examples/m5_gate.rs` | Modify | The exhaustive `Outcome`/`SubmitError` matches gain the new arms. |
-| `uc2_node/tests/services.rs` | Modify | End-to-end: `submit_to`/`submit_all`/`query_*_on`, the local refusal, `BAD_SERVICE` on a raw record, the default `submit` ignoring the other FSM's ring. |
+| `uc_node/src/node.rs` | Modify | `send_bad_service`; `has_service_ring`; `drain_query_ring` parses/strips the id, gates, routes; `forward_svc_query`'s "M14b answers first" comment realised; unit tests. |
+| `uc_node/examples/read_profile.rs` | Modify | Its raw `MSG_V2_QUERY` writes carry the `0u8` prefix. |
+| `uc_client/Cargo.toml` | Modify | `bytes = { workspace = true }`. |
+| `uc_client/src/slots.rs` | Modify | `Slot.{expected, received}`, `claim(.., expected)`, `resolve(.., ring)` with `Partial`/`WrongRing`, `slot_index`, `slot_count`; tests. |
+| `uc_client/src/engine.rs` | Modify | N egress rings, `Shared.declared`, the query prefix scratch, `try_submit_to`/`try_submit_all`/`try_query_on`, per-ring `handle_record` + `FanIn` buffer, `Outcome::{Responses, BadService}`, `SubmitError::ServiceNotDeclared`, stats `wrong_ring`/`bad_service`. |
+| `uc_client/src/ticket.rs` | Modify | `Resolved::{One, Many}`; `FanInTicket<R>`; `fan_in_ticket_pair`. |
+| `uc_client/src/pipelined.rs` | Modify | `submit_to`, `submit_all`, `query_snapshot_on`, `query_linearizable_on`, `declared()`; `dispatch` generalised over the ticket pair; driver maps the two new outcomes. |
+| `uc_client/src/client.rs`, `error.rs`, `lib.rs` | Modify | Shim mirrors; `ClientError::ServiceNotDeclared`; re-export `FanInTicket`. |
+| `uc_client/tests/engine_synthetic.rs`, `uc_client/tests/pipelined.rs` | Modify | Mask/fan-in/bad-service tests on a synthetic dir; two-FSM tests against a real node. |
+| `uc_gateway/src/edge.rs`, `uc_gateway/examples/hop_bench/engine_load.rs`, `uc_gateway/examples/m12_gate.rs`, `uc_node/examples/m5_gate.rs` | Modify | The exhaustive `Outcome`/`SubmitError` matches gain the new arms. |
+| `uc_node/tests/services.rs` | Modify | End-to-end: `submit_to`/`submit_all`/`query_*_on`, the local refusal, `BAD_SERVICE` on a raw record, the default `submit` ignoring the other FSM's ring. |
 | `examples/counter/src/bin/counter-client.rs` | Modify | `--service-id` / `--all` so the feature is demonstrable. |
-| `uc2_sim/src/world.rs`, `uc2_sim/src/invariants.rs`, `uc2_sim/tests/scenarios.rs` | Modify | `send_report` choke point; `Node.apply_ceiling` + `World::set_apply_ceiling`; inv10; the capped-quorum scenarios; a third fuzz loop. |
+| `uc_sim/src/world.rs`, `uc_sim/src/invariants.rs`, `uc_sim/tests/scenarios.rs` | Modify | `send_report` choke point; `Node.apply_ceiling` + `World::set_apply_ceiling`; inv10; the capped-quorum scenarios; a third fuzz loop. |
 | `docs/reference/{instance-directory,read-path,semver-policy}.md`, `docs/VERIFICATION.md`, `docs/QUICKSTART.md`, `README.md` | Modify | Task 8. |
 
 ---
@@ -188,11 +188,11 @@ git commit -m "feat(protocol): MSG_V2_BAD_SERVICE + the service_id ++ query payl
 
 ### Task 2: The node routes queries by id and answers `BAD_SERVICE`
 
-After this task the node *requires* the prefix; the client (Task 4) does not yet write it — so between Tasks 2 and 4 every SDK query is misparsed (its first payload byte read as the id). The `uc2_node` suites that issue queries through the client (`query_barrier.rs`, `services.rs`, `lin_v2`'s reads, `backup.rs`'s restore read) are therefore expected red until Task 4 lands; Task 2's own verification is the unit tests plus the suites that do not query. **Run Tasks 2–4 back to back.**
+After this task the node *requires* the prefix; the client (Task 4) does not yet write it — so between Tasks 2 and 4 every SDK query is misparsed (its first payload byte read as the id). The `uc_node` suites that issue queries through the client (`query_barrier.rs`, `services.rs`, `lin_v2`'s reads, `backup.rs`'s restore read) are therefore expected red until Task 4 lands; Task 2's own verification is the unit tests plus the suites that do not query. **Run Tasks 2–4 back to back.**
 
 **Files:**
-- Modify `uc2_node/src/node.rs` (imports 40–43; `send_retry` ~3378; `forward_svc_query` ~3388–3411; `drain_query_ring` ~3540–3634; the test module's `harness` rings ~5886–5899 are used as-is)
-- Modify `uc2_node/examples/read_profile.rs:1032` (and its imports at 187)
+- Modify `uc_node/src/node.rs` (imports 40–43; `send_retry` ~3378; `forward_svc_query` ~3388–3411; `drain_query_ring` ~3540–3634; the test module's `harness` rings ~5886–5899 are used as-is)
+- Modify `uc_node/examples/read_profile.rs:1032` (and its imports at 187)
 
 **Interfaces:**
 - `Consensus::send_bad_service(&mut self, client_id: u32, local_seq: u32, service_id: u8)`; `Consensus::has_service_ring(&self, id: u8) -> bool`.
@@ -288,7 +288,7 @@ After this task the node *requires* the prefix; the client (Task 4) does not yet
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_node --lib a_query_for_an_id_without_a_ring` — expected: compile error (`MSG_V2_BAD_SERVICE` import exists after Task 1, but the assertion on `got` fails: today the record is forwarded to ring 0 with the whole payload) — at minimum the `got == vec![…]` assertion fails with an empty `got`.
+Run: `cargo test -p uc_node --lib a_query_for_an_id_without_a_ring` — expected: compile error (`MSG_V2_BAD_SERVICE` import exists after Task 1, but the assertion on `got` fails: today the record is forwarded to ring 0 with the whole payload) — at minimum the `got == vec![…]` assertion fails with an empty `got`.
 
 - [ ] **Step 3: Implement**
 
@@ -337,14 +337,14 @@ Next to `send_retry`:
 
 and in the `PendingRead { … }` literal replace `service_id: 0,` (with its M14a comment) by `service_id,` with the comment "M14b: from the record; the barrier certifies on this FSM's slot". In `forward_svc_query`, the `else { return false; // not a ring id — M14b answers … }` comment becomes `// unreachable for queries admitted by drain_query_ring (has_service_ring); kept as the safe default`.
 
-`uc2_node/examples/read_profile.rs:1032`: build the payload with `write_query_payload(0, &query_bytes, &mut scratch)` (a `Vec<u8>` scratch declared once outside the loop) and write `&scratch`; import `write_query_payload`.
+`uc_node/examples/read_profile.rs:1032`: build the payload with `write_query_payload(0, &query_bytes, &mut scratch)` (a `Vec<u8>` scratch declared once outside the loop) and write `&scratch`; import `write_query_payload`.
 
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_node --lib                       # incl. the 3 new tests and the 11 barrier tests
-cargo build -p uc2_node --examples
-cargo test -p uc2_node --test smoke --test learner --test failover   # suites that never query
+cargo test -p uc_node --lib                       # incl. the 3 new tests and the 11 barrier tests
+cargo build -p uc_node --examples
+cargo test -p uc_node --test smoke --test learner --test failover   # suites that never query
 ```
 
 Expected: PASS. (`query_barrier`, `services`, `lin_v2`, `backup` are expected red until Task 4 — do not "fix" them here.)
@@ -352,8 +352,8 @@ Expected: PASS. (`query_barrier`, `services`, `lin_v2`, `backup` are expected re
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_node --all-targets -- -D warnings
-git add uc2_node/src/node.rs uc2_node/examples/read_profile.rs
+cargo clippy -p uc_node --all-targets -- -D warnings
+git add uc_node/src/node.rs uc_node/examples/read_profile.rs
 git commit -m "feat(node): route MSG_V2_QUERY by its service_id prefix; MSG_V2_BAD_SERVICE for an id without a ring"
 ```
 
@@ -361,11 +361,11 @@ git commit -m "feat(node): route MSG_V2_QUERY by its service_id prefix; MSG_V2_B
 
 ### Task 3: Slot masks — `expected`/`received`, `Partial`, `WrongRing`
 
-Pure `uc2_client::slots` change with its own unit tests; nothing calls the new arguments until Task 4 (the two `engine.rs` call sites are updated to pass `expected = 0b1`/`ring = None` so the crate keeps compiling).
+Pure `uc_client::slots` change with its own unit tests; nothing calls the new arguments until Task 4 (the two `engine.rs` call sites are updated to pass `expected = 0b1`/`ring = None` so the crate keeps compiling).
 
 **Files:**
-- Modify `uc2_client/src/slots.rs` (module doc 4–18; `Slot` 44–49; `Resolve` 38–42; `claim` 84–113; `resolve` 133–158; tests 219–479)
-- Modify `uc2_client/src/engine.rs` (`send`'s `claim` call ~314; `handle_record`'s three `resolve` calls; the two unit tests' `claim` calls at ~635/659)
+- Modify `uc_client/src/slots.rs` (module doc 4–18; `Slot` 44–49; `Resolve` 38–42; `claim` 84–113; `resolve` 133–158; tests 219–479)
+- Modify `uc_client/src/engine.rs` (`send`'s `claim` call ~314; `handle_record`'s three `resolve` calls; the two unit tests' `claim` calls at ~635/659)
 
 **Interfaces:**
 ```rust
@@ -454,7 +454,7 @@ Also update the existing `kind_mismatch_leaves_the_slot_for_the_real_answer` to 
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_client --lib slots` — compile errors (arity, missing variants).
+Run: `cargo test -p uc_client --lib slots` — compile errors (arity, missing variants).
 
 - [ ] **Step 3: Implement**
 
@@ -526,13 +526,13 @@ Run: `cargo test -p uc2_client --lib slots` — compile errors (arity, missing v
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p uc2_client` — expected PASS (`slots` 10 → 15 tests; every synthetic test unchanged in behaviour).
+Run: `cargo test -p uc_client` — expected PASS (`slots` 10 → 15 tests; every synthetic test unchanged in behaviour).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/slots.rs uc2_client/src/engine.rs
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/slots.rs uc_client/src/engine.rs
 git commit -m "feat(client): slot expected/received ring masks — Partial, WrongRing, fan-in completion on the last piece"
 ```
 
@@ -543,13 +543,13 @@ git commit -m "feat(client): slot expected/received ring masks — Partial, Wron
 This is the task that makes the SDK's queries parse again on the node (Task 2). Everything the blocking tiers need lands here on `SendHalf`/`PollHalf`; `PipelinedClient`/`Client` follow in Task 5.
 
 **Files:**
-- Modify `uc2_client/src/engine.rs` (consts 51–60; imports 33–49; `SubmitError` 111–130; `StatCells`/`EngineStats` 132–179; `Shared` 181–195; `SendHalf`/`PollHalf`/`Outcome` 197–246; `attach` 248–288; `send`/`try_submit`/`try_query` 290–342; `Clone for SendHalf` 427–435; `poll`/`wait_handle` 437–468; `drain_ring` 470–494; `handle_record` 496–570; `maintenance` 572–602)
-- Modify `uc2_client/Cargo.toml` (add `bytes = { workspace = true }` under `[dependencies]`)
-- Modify `uc2_client/tests/engine_synthetic.rs` (fixtures 17–61 and 169–196; new tests)
+- Modify `uc_client/src/engine.rs` (consts 51–60; imports 33–49; `SubmitError` 111–130; `StatCells`/`EngineStats` 132–179; `Shared` 181–195; `SendHalf`/`PollHalf`/`Outcome` 197–246; `attach` 248–288; `send`/`try_submit`/`try_query` 290–342; `Clone for SendHalf` 427–435; `poll`/`wait_handle` 437–468; `drain_ring` 470–494; `handle_record` 496–570; `maintenance` 572–602)
+- Modify `uc_client/Cargo.toml` (add `bytes = { workspace = true }` under `[dependencies]`)
+- Modify `uc_client/tests/engine_synthetic.rs` (fixtures 17–61 and 169–196; new tests)
 
 **Interfaces:**
 ```rust
-// uc2_client (engine.rs), all pub unless noted
+// uc_client (engine.rs), all pub unless noted
 pub enum Outcome<'a> { Response(&'a [u8]), Responses(&'a [(u8, Bytes)]), NotLeader { hint: Option<u32> }, Retry, BadService { id: u8 }, TimedOut, InstanceRestart { attached: u128, current: u128 } }
 pub enum SubmitError { …existing…, ServiceNotDeclared { id: u8, declared: u64 } }
 pub struct EngineStats { …existing…, pub wrong_ring: u64, pub bad_service: u64 }
@@ -565,7 +565,7 @@ pub(crate) fn egress_service_ring(id: u8) -> String;   // "egress_service.<id>.b
 ```
 `Completion.position` is `Some` for both `Response` and `Responses` (one frame ⇒ one position; the first piece's).
 
-- [ ] **Step 1: Write the failing tests** (`uc2_client/tests/engine_synthetic.rs`)
+- [ ] **Step 1: Write the failing tests** (`uc_client/tests/engine_synthetic.rs`)
 
 Add fixtures next to `make_instance`:
 
@@ -597,14 +597,14 @@ fn response(position: u64, body: &[u8]) -> Vec<u8> {
 Extend `drain`'s match with:
 
 ```rust
-            uc2_client::Outcome::Responses(parts) => format!(
+            uc_client::Outcome::Responses(parts) => format!(
                 "responses:{:?}",
                 parts.iter().map(|(id, b)| (*id, String::from_utf8_lossy(b).into_owned())).collect::<Vec<_>>()
             ),
-            uc2_client::Outcome::BadService { id } => format!("badservice:{id}"),
+            uc_client::Outcome::BadService { id } => format!("badservice:{id}"),
 ```
 
-Add the tests (imports: `MSG_V2_BAD_SERVICE, MSG_V2_QUERY, FLAG_V2_LINEARIZABLE` from `uc_protocol::v2::ipc`, `SubmitError`, `Consistency` from `uc2_client`):
+Add the tests (imports: `MSG_V2_BAD_SERVICE, MSG_V2_QUERY, FLAG_V2_LINEARIZABLE` from `uc_protocol::v2::ipc`, `SubmitError`, `Consistency` from `uc_client`):
 
 ```rust
 #[test]
@@ -728,7 +728,7 @@ fn a_terminal_answer_ends_a_partial_fan_in_and_late_pieces_are_duplicates() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_client --test engine_synthetic` — compile errors (`declared`, `try_submit_to`, `Outcome::Responses`, …).
+Run: `cargo test -p uc_client --test engine_synthetic` — compile errors (`declared`, `try_submit_to`, `Outcome::Responses`, …).
 
 - [ ] **Step 3: Implement**
 
@@ -1035,17 +1035,17 @@ impl FanIn {
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_client
-cargo test -p uc2_node --test query_barrier --test services   # green again: the SDK writes the prefix
+cargo test -p uc_client
+cargo test -p uc_node --test query_barrier --test services   # green again: the SDK writes the prefix
 ```
 
-Expected: PASS — `engine_synthetic` 14 → 21 tests; `services.rs` and `query_barrier.rs` back to green. `uc2_gateway` does not compile yet (exhaustive matches) — Task 5.
+Expected: PASS — `engine_synthetic` 14 → 21 tests; `services.rs` and `query_barrier.rs` back to green. `uc_gateway` does not compile yet (exhaustive matches) — Task 5.
 
 - [ ] **Step 5: Clippy on the crate + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/engine.rs uc2_client/tests/engine_synthetic.rs
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/engine.rs uc_client/tests/engine_synthetic.rs
 git commit -m "feat(client): Engine opens every declared FSM ring; try_submit_to/try_submit_all/try_query_on; per-ring matching, fan-in, BadService"
 ```
 
@@ -1054,14 +1054,14 @@ git commit -m "feat(client): Engine opens every declared FSM ring; try_submit_to
 ### Task 5: The blocking tiers, the fan-in ticket, and every exhaustive match
 
 **Files:**
-- Modify `uc2_client/src/ticket.rs` (`State`/`TicketCore` 10–48; the three decode sites 73–164; `ticket_pair` 156–164; tests)
-- Modify `uc2_client/src/pipelined.rs` (`PipelinedClient` 113–148; the four methods 150–187; `dispatch` 236–299; `spawn_driver`'s `resolve` closure 398–414; unit tests 439–561)
-- Modify `uc2_client/src/client.rs` (49–127), `uc2_client/src/error.rs` (`ClientError`), `uc2_client/src/lib.rs` (re-exports 55–71)
-- Modify `uc2_gateway/src/edge.rs` (`submit_or_query`'s `SubmitError` match ~1351–1400; `complete`'s `Outcome` match 1636–1677), `uc2_gateway/examples/hop_bench/engine_load.rs:171-182`, `uc2_gateway/examples/m12_gate.rs:686-712`, `uc2_node/examples/m5_gate.rs:614-636`
+- Modify `uc_client/src/ticket.rs` (`State`/`TicketCore` 10–48; the three decode sites 73–164; `ticket_pair` 156–164; tests)
+- Modify `uc_client/src/pipelined.rs` (`PipelinedClient` 113–148; the four methods 150–187; `dispatch` 236–299; `spawn_driver`'s `resolve` closure 398–414; unit tests 439–561)
+- Modify `uc_client/src/client.rs` (49–127), `uc_client/src/error.rs` (`ClientError`), `uc_client/src/lib.rs` (re-exports 55–71)
+- Modify `uc_gateway/src/edge.rs` (`submit_or_query`'s `SubmitError` match ~1351–1400; `complete`'s `Outcome` match 1636–1677), `uc_gateway/examples/hop_bench/engine_load.rs:171-182`, `uc_gateway/examples/m12_gate.rs:686-712`, `uc_node/examples/m5_gate.rs:614-636`
 
 **Interfaces:**
 ```rust
-// uc2_client
+// uc_client
 pub struct FanInTicket<R> { … }                      // wait()/wait_timeout()/Future → Result<Vec<(u8, R)>, ClientError>
 impl PipelinedClient {
     pub fn declared(&self) -> u64;
@@ -1148,7 +1148,7 @@ pub(crate) fn fan_in_ticket_pair<R>() -> (FanInTicket<R>, Arc<TicketCore>);
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_client --lib ticket` / `--lib pipelined` — compile errors.
+Run: `cargo test -p uc_client --lib ticket` / `--lib pipelined` — compile errors.
 
 - [ ] **Step 3: Implement**
 
@@ -1277,8 +1277,8 @@ Exhaustive-match sites: `edge.rs` `complete()` gains
 
 ```bash
 cargo build --workspace --all-targets
-cargo test -p uc2_client
-cargo test -p uc2_gateway
+cargo test -p uc_client
+cargo test -p uc_gateway
 ```
 
 Expected: PASS (gateway suites unchanged in behaviour).
@@ -1296,7 +1296,7 @@ git commit -m "feat(client): submit_to/submit_all/query_*_on on PipelinedClient 
 ### Task 6: End to end — two FSMs, four calls, one bad id (+ the counter example)
 
 **Files:**
-- Modify `uc2_node/tests/services.rs` (helpers exist: `APP`, `serialize`, `tempdir`, `config`, `wait_until`, `open_cnc`, `ids`, `Cmd`, `CountSm`, `start_service`)
+- Modify `uc_node/tests/services.rs` (helpers exist: `APP`, `serialize`, `tempdir`, `config`, `wait_until`, `open_cnc`, `ids`, `Cmd`, `CountSm`, `start_service`)
 - Modify `examples/counter/src/bin/counter-client.rs`
 
 - [ ] **Step 1: Write the failing tests** (append to `services.rs`)
@@ -1304,7 +1304,7 @@ git commit -m "feat(client): submit_to/submit_all/query_*_on on PipelinedClient 
 ```rust
 #[test]
 fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
-    use uc2_client::{Client, ClientError, PipelinedClient, PipelinedConfig};
+    use uc_client::{Client, ClientError, PipelinedClient, PipelinedConfig};
     let _g = serialize();
     let dir = tempdir();
     let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
@@ -1377,7 +1377,7 @@ fn a_raw_query_for_an_id_without_a_ring_gets_bad_service_from_the_node() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_node --test services submit_to_submit_all` — before Task 5 it would not compile; on the Task 5 tree it should pass — so this test's RED is "does not compile on `main` before this plan" (record that); the raw-`BAD_SERVICE` test fails on the pre-Task-2 tree with a 10 s timeout. Run both on the current tree: expected PASS. If either fails here, that is a real integration defect — fix it in this task (the earlier tasks' unit tests passed; the seam is what this task proves).
+Run: `cargo test -p uc_node --test services submit_to_submit_all` — before Task 5 it would not compile; on the Task 5 tree it should pass — so this test's RED is "does not compile on `main` before this plan" (record that); the raw-`BAD_SERVICE` test fails on the pre-Task-2 tree with a 10 s timeout. Run both on the current tree: expected PASS. If either fails here, that is a real integration defect — fix it in this task (the earlier tasks' unit tests passed; the seam is what this task proves).
 
 - [ ] **Step 3: The example**
 
@@ -1386,9 +1386,9 @@ Run: `cargo test -p uc2_node --test services submit_to_submit_all` — before Ta
 - [ ] **Step 4: Run**
 
 ```bash
-cargo test -p uc2_node --test services
+cargo test -p uc_node --test services
 cargo test -p counter
-cargo test -p uc2_node --test query_barrier --test lin_v2 --test backup
+cargo test -p uc_node --test query_barrier --test lin_v2 --test backup
 ```
 
 Expected: PASS (`services.rs` 11 → 13 tests).
@@ -1408,19 +1408,19 @@ git commit -m "test(m14b): two-FSM end-to-end routing (submit_to/submit_all/quer
 Deviation 7 in full. Today `world.rs` builds `Msg::Report` inline at four sites (`on_archive`'s `reportable` match, the Mechanism floor re-send, the C-1 leak arm, `reopen_gate`); a fifth, `inject_report`, forges a wire value and stays untouched. This task funnels the four through `send_report`, which clamps to the node's `apply_ceiling` and runs inv10.
 
 **Files:**
-- Modify `uc2_sim/src/world.rs` (`Node` 524–605 + its literal in `World::new` ~772–799; the four send sites 1358, 1383, 1404, 1616–1636; `reopen_gate`'s two callers ~1546 and ~1946; the reset points: `Action::Truncate` ~2196, `on_truncated_feedback`'s cut ~1532, `do_crash` ~2331, `on_restart` ~1437, `Action::BecomeFollower` ~2123, `Action::BecomeLeader` ~2069, `HaltRemoved` ~2313; new hooks in the scripting block ~2352+)
-- Modify `uc2_sim/src/invariants.rs` (module doc 1–61; struct 136–168; `new`/`on_restart` 170–193; new methods; unit tests)
-- Modify `uc2_sim/tests/scenarios.rs` (`fuzz_default_seeds` 473–507; two new scenarios)
+- Modify `uc_sim/src/world.rs` (`Node` 524–605 + its literal in `World::new` ~772–799; the four send sites 1358, 1383, 1404, 1616–1636; `reopen_gate`'s two callers ~1546 and ~1946; the reset points: `Action::Truncate` ~2196, `on_truncated_feedback`'s cut ~1532, `do_crash` ~2331, `on_restart` ~1437, `Action::BecomeFollower` ~2123, `Action::BecomeLeader` ~2069, `HaltRemoved` ~2313; new hooks in the scripting block ~2352+)
+- Modify `uc_sim/src/invariants.rs` (module doc 1–61; struct 136–168; `new`/`on_restart` 170–193; new methods; unit tests)
+- Modify `uc_sim/tests/scenarios.rs` (`fuzz_default_seeds` 473–507; two new scenarios)
 - Modify `docs/VERIFICATION.md` (§2 at 172–210: "nine" → "ten", the table; §11: drop "the sim scenario … is M14b")
 
 **Interfaces:**
 ```rust
-// uc2_sim::world::World
+// uc_sim::world::World
 pub fn set_apply_ceiling(&mut self, node: usize, ceiling: Option<u64>);   // scripting hook; a change resets inv10's monotonicity baseline
 pub fn last_report(&self, node: usize) -> u64;                             // what the node last sent (0 after a reset)
 // crate-private
 fn send_report(&mut self, node: usize, leader: usize, unclamped: u64, now: u64, step: u64) -> Result<(), InvariantViolation>;
-// uc2_sim::invariants::InvariantChecker
+// uc_sim::invariants::InvariantChecker
 pub fn on_report(&mut self, node: usize, clamped: u64, unclamped: u64, ceiling: Option<u64>, step: u64) -> Result<(), InvariantViolation>;
 pub fn on_report_reset(&mut self, node: usize);
 pub fn last_report(&self, node: usize) -> u64;
@@ -1548,7 +1548,7 @@ Add a third loop to `fuzz_default_seeds`:
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_sim` — compile errors (`on_report`, `set_apply_ceiling`, `last_report`).
+Run: `cargo test -p uc_sim` — compile errors (`on_report`, `set_apply_ceiling`, `last_report`).
 
 - [ ] **Step 3: Implement — the checker**
 
@@ -1662,25 +1662,25 @@ Scripting hooks, in the block with `partition_node`:
 - [ ] **Step 5: Run**
 
 ```bash
-cargo test -p uc2_sim
-cargo test -p uc2_sim --release --features sim-heavy fuzz_heavy   # the 1000-seed tiers, ~minutes
+cargo test -p uc_sim
+cargo test -p uc_sim --release --features sim-heavy fuzz_heavy   # the 1000-seed tiers, ~minutes
 ```
 
 Expected: PASS — every existing scenario and pin unchanged (the red pins still name `phantom`/`inv5`, not inv10), 3 new unit tests, 2 new scenarios, the third fuzz loop. **If inv10 fires on an existing seed with a "decreased" detail, that is a legitimate decrease path this plan's reset list missed — find the state change that lowered the Gated/raw report (a `matched` or `durable` write), add `on_report_reset` at that exact site with a comment naming the event, and record it in the report. Never widen inv10 to allow decreases in general.**
 
 - [ ] **Step 6: Discrimination check**
 
-Temporarily make `send_report` ignore the ceiling (`let durable = unclamped;`); run `cargo test -p uc2_sim capped_quorum` — expected FAIL on `commit … ran past the capped quorum's ceiling`; revert. Record the observed commit value.
+Temporarily make `send_report` ignore the ceiling (`let durable = unclamped;`); run `cargo test -p uc_sim capped_quorum` — expected FAIL on `commit … ran past the capped quorum's ceiling`; revert. Record the observed commit value.
 
 - [ ] **Step 7: `VERIFICATION.md`**
 
-§2: "nine whole-cluster safety invariants" → "ten"; add the row `| inv10 | Report ceiling — a clamped report never exceeds its unclamped value or its apply ceiling, and never decreases except across a truncation, restart, role change or ceiling change (M14b) |`; add one sentence after the directed-scenarios paragraph: "`capped_quorum_stalls_commit_and_releasing_one_follower_resumes_it` models M14a's report ceiling as a per-node apply cap and pins that commit stalls iff a commit quorum is capped." §11: delete the sentence ending "…is M14b" and replace with "M14b's sim scenario covers the ceiling's liveness property; the real node's ceiling is exercised by `uc2_node/tests/services.rs` on a 3-node in-process cluster."
+§2: "nine whole-cluster safety invariants" → "ten"; add the row `| inv10 | Report ceiling — a clamped report never exceeds its unclamped value or its apply ceiling, and never decreases except across a truncation, restart, role change or ceiling change (M14b) |`; add one sentence after the directed-scenarios paragraph: "`capped_quorum_stalls_commit_and_releasing_one_follower_resumes_it` models M14a's report ceiling as a per-node apply cap and pins that commit stalls iff a commit quorum is capped." §11: delete the sentence ending "…is M14b" and replace with "M14b's sim scenario covers the ceiling's liveness property; the real node's ceiling is exercised by `uc_node/tests/services.rs` on a 3-node in-process cluster."
 
 - [ ] **Step 8: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_sim --all-targets -- -D warnings
-git add uc2_sim docs/VERIFICATION.md
+cargo clippy -p uc_sim --all-targets -- -D warnings
+git add uc_sim docs/VERIFICATION.md
 git commit -m "feat(sim): report choke point + per-node apply ceiling; inv10 (report ceiling); capped-quorum stall/release scenarios (discrimination: commit reached <N> uncapped vs cap <C>)"
 ```
 
@@ -1691,8 +1691,8 @@ git commit -m "feat(sim): report choke point + per-node apply ceiling; inv10 (re
 **Files:**
 - Modify `docs/reference/instance-directory.md` (rows 19 and 22 of the Files table)
 - Modify `docs/reference/read-path.md` (the sentence at 22–24; a `MSG_V2_BAD_SERVICE` row in "Diagnostic signatures")
-- Modify `docs/reference/semver-policy.md` (the promised-surface bullets naming `uc2_client` items, ~46–62)
-- Modify `docs/QUICKSTART.md` (the "Client SDKs" bullet, ~453–457), `README.md` (the `uc2_client` row, line 178)
+- Modify `docs/reference/semver-policy.md` (the promised-surface bullets naming `uc_client` items, ~46–62)
+- Modify `docs/QUICKSTART.md` (the "Client SDKs" bullet, ~453–457), `README.md` (the `uc_client` row, line 178)
 - Check `docs/reference/cnc-page.md` "Counters and status" for the 4032/4040 rows (M14a's Task 10 added them; if absent, add them as that plan specified)
 
 - [ ] **Step 1: `instance-directory.md`**
@@ -1705,11 +1705,11 @@ Lines 22–24: "…gated on **the named FSM's** service catching up to the read 
 
 - [ ] **Step 3: `semver-policy.md`**
 
-Add to the `uc2_client` promised-surface bullets: `FanInTicket`; `Outcome::{Responses, BadService}`; `SubmitError::ServiceNotDeclared`; `ClientError::ServiceNotDeclared`; `SendHalf::{declared, try_submit_to, try_submit_all, try_query_on}`; `PipelinedClient::{declared, submit_to, submit_all, query_snapshot_on, query_linearizable_on}`; `Client::{declared, submit_to, submit_all, query_snapshot_on, query_linearizable_on}` — all additive (minor); `uc2_client` now depends on `bytes` (`Outcome::Responses` and `FanInTicket` expose `bytes::Bytes`, the same type the SM contract uses). Note the one behavioural change: `Outcome` and `SubmitError` gained variants, so exhaustive matches downstream break at compile time (a documented minor-version hazard of the three-tier promise — state it).
+Add to the `uc_client` promised-surface bullets: `FanInTicket`; `Outcome::{Responses, BadService}`; `SubmitError::ServiceNotDeclared`; `ClientError::ServiceNotDeclared`; `SendHalf::{declared, try_submit_to, try_submit_all, try_query_on}`; `PipelinedClient::{declared, submit_to, submit_all, query_snapshot_on, query_linearizable_on}`; `Client::{declared, submit_to, submit_all, query_snapshot_on, query_linearizable_on}` — all additive (minor); `uc_client` now depends on `bytes` (`Outcome::Responses` and `FanInTicket` expose `bytes::Bytes`, the same type the SM contract uses). Note the one behavioural change: `Outcome` and `SubmitError` gained variants, so exhaustive matches downstream break at compile time (a documented minor-version hazard of the three-tier promise — state it).
 
 - [ ] **Step 4: `QUICKSTART.md` + `README.md`**
 
-QUICKSTART's Client-SDKs bullet: add "M14: `submit_to(id, …)`, `submit_all(…)` (every FSM's answer, in id order) and `query_*_on(id, …)` pick which state machine answers; the plain calls mean FSM 0." README's `uc2_client` row: "Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14)."
+QUICKSTART's Client-SDKs bullet: add "M14: `submit_to(id, …)`, `submit_all(…)` (every FSM's answer, in id order) and `query_*_on(id, …)` pick which state machine answers; the plain calls mean FSM 0." README's `uc_client` row: "Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14)."
 
 - [ ] **Step 5: Commit**
 
@@ -1734,10 +1734,10 @@ Expected: clippy clean; every binary `0 failed`.
 
 - [ ] **Step 2**
 ```bash
-timeout 900 cargo test -p uc2_node --test lin_v2 2>&1 | tail -12
-timeout 900 cargo test -p uc2_node --test lin_partition_v2 2>&1 | tail -12
-timeout 900 cargo test -p uc2-crashtest --features hard-crash-tests 2>&1 | tail -12
-timeout 1800 cargo test -p uc2_sim --release --features sim-heavy 2>&1 | tail -8
+timeout 900 cargo test -p uc_node --test lin_v2 2>&1 | tail -12
+timeout 900 cargo test -p uc_node --test lin_partition_v2 2>&1 | tail -12
+timeout 900 cargo test -p uc_crashtest --features hard-crash-tests 2>&1 | tail -12
+timeout 1800 cargo test -p uc_sim --release --features sim-heavy 2>&1 | tail -8
 ```
 Expected: every capstone `Linearizable`; the heavy sim tier green.
 
@@ -1750,7 +1750,7 @@ Expected: PASS with ≥ 10 000 runs; tree clean afterwards.
 
 - [ ] **Step 4**
 ```bash
-UC2_M5_MAX_SECS=6 cargo run -p uc2_node --release --example m5_gate -- all --secs 6 --root /home/claude/m14b-smoke; rm -rf /home/claude/m14b-smoke
+UC2_M5_MAX_SECS=6 cargo run -p uc_node --release --example m5_gate -- all --secs 6 --root /home/claude/m14b-smoke; rm -rf /home/claude/m14b-smoke
 ```
 Record responses/s and p50 **as smoke** (the M14a same-box figure was 158–184 k resp/s; a same-box spread of ±18 % is documented noise — never compare to a bar).
 
@@ -1776,7 +1776,7 @@ git commit --allow-empty -m "test(m14b): local proof stack — workspace suite, 
 | §6.3 record formats | Task 1 (`MSG_V2_QUERY`, `MSG_V2_BAD_SERVICE`), unchanged elsewhere |
 | §6.4 remote path = FSM 0; edge unchanged beyond attaching | Task 5 (only the exhaustive-match arms; no selector) |
 | §12 unit: client slot-table mask completion (drop-outside-mask, fan-in ordering) | Task 3 (slots) + Task 4 (engine_synthetic: id order vs arrival order) |
-| §12 `uc2_sim`: new invariant (report ≤ validated, monotone except truncation) + apply-ceiling scenario (stalls iff a quorum is capped) | Task 7 (deviation 7 scopes the invariant to the ceiling path; both scenarios + a fuzz loop) |
+| §12 `uc_sim`: new invariant (report ≤ validated, monotone except truncation) + apply-ceiling scenario (stalls iff a quorum is capped) | Task 7 (deviation 7 scopes the invariant to the ceiling path; both scenarios + a fuzz loop) |
 | §12 fuzz: `ring_mpsc_record`'s new decode step | Task 1 |
 | §8 "Client attached before all FSMs": requests to an unattached FSM wait (client timeout) | unchanged behaviour; the id's ring exists, the slot's epoch is 0 ⇒ the read parks until the deadline, submits wait for the response — no plan change needed |
 
@@ -1793,7 +1793,7 @@ Not covered here, by design: §7.3, §9, the §12 capstones/elle/crashtest, the 
 
 ## Execution record (2026-08-28, subagent-driven; the SDD ledger, condensed)
 
-Branch `worktree-uc2-multi-service`, merge base `3a7f9a5`, final HEAD `efc5339`. Task commits: T1 `5feae7c`, T2 `d900791`, T3 `5d74ba2` + `e11aaae` (1 fix round, doc-only), T4 `40a6d54` (Ruling B folded in), T5 `0f87c1f`, T6 `4823bd0` + `52b5102` (1 fix round), T7 `cbbe7bd`, T8 `eef2b91`, T9 `ad670cf` (empty) + `b9674bb` (crashtest fix); final whole-branch review (0 Critical, 2 Important) → fix wave `efc5339`. Evidence on `efc5339`: `cargo test --workspace --no-fail-fast` 1 378 passed / 1 failed — the one failure is `failover::contested_first_election_first_block_truncation_recovers` ("no clean base-0 construction in 24 tries", a ~50/50 construction race starved by the parallel full run; 7/7 on an isolated re-run — Ruling I below); clippy `--workspace --all-targets -D warnings` clean. On `ad670cf`/`b9674bb` (T9): workspace suite 0 failed, `lin_v2` 7/7 + `lin_partition_v2` 7/7, `uc2-crashtest --features hard-crash-tests` 4/4 (after `b9674bb`), sim-heavy 38 passed, fuzz smoke `ring_mpsc_record` 40.8 M runs clean, m5 smoke 165 498 resp/s p50 23.9 ms (smoke, dev box; M14a same-box 158–184 k). T7's discrimination: with the ceiling ignored, commit reached 18 912 against cap 288.
+Branch `worktree-uc2-multi-service`, merge base `3a7f9a5`, final HEAD `efc5339`. Task commits: T1 `5feae7c`, T2 `d900791`, T3 `5d74ba2` + `e11aaae` (1 fix round, doc-only), T4 `40a6d54` (Ruling B folded in), T5 `0f87c1f`, T6 `4823bd0` + `52b5102` (1 fix round), T7 `cbbe7bd`, T8 `eef2b91`, T9 `ad670cf` (empty) + `b9674bb` (crashtest fix); final whole-branch review (0 Critical, 2 Important) → fix wave `efc5339`. Evidence on `efc5339`: `cargo test --workspace --no-fail-fast` 1 378 passed / 1 failed — the one failure is `failover::contested_first_election_first_block_truncation_recovers` ("no clean base-0 construction in 24 tries", a ~50/50 construction race starved by the parallel full run; 7/7 on an isolated re-run — Ruling I below); clippy `--workspace --all-targets -D warnings` clean. On `ad670cf`/`b9674bb` (T9): workspace suite 0 failed, `lin_v2` 7/7 + `lin_partition_v2` 7/7, `uc_crashtest --features hard-crash-tests` 4/4 (after `b9674bb`), sim-heavy 38 passed, fuzz smoke `ring_mpsc_record` 40.8 M runs clean, m5 smoke 165 498 resp/s p50 23.9 ms (smoke, dev box; M14a same-box 158–184 k). T7's discrimination: with the ceiling ignored, commit reached 18 912 against cap 288.
 
 ### Rulings made during execution (each with what it costs if wrong)
 
@@ -1802,14 +1802,14 @@ Branch `worktree-uc2-multi-service`, merge base `3a7f9a5`, final HEAD `efc5339`.
 - **C (T6):** the plan's `wait_until(.., || stats().wrong_ring >= 1)` after the default `submit` was already true from the first `submit_to(1, ..)` (every FSM answers every frame; the `expected` mask is client-local), and the literal delta `wrong_ring > before` deterministically times out — `poll` drains ring 0 first, FSM 0's answer frees the slot, and FSM 1's late piece is `Resolve::Miss` (`duplicates`), not `WrongRing` (the ring check sits after the owner check). The test asserts the delta of `wrong_ring + duplicates`. Consequence for the docs: a sibling's answer to a single-FSM request is "dropped and counted", not "counted as `wrong_ring`". Cost: none.
 - **D (T9):** the crashtest fix's scoped re-review was folded into the final whole-branch review. Cost if wrong: a mis-grouped harness arm.
 - **E (final review Important 1):** the fan-in buffer resets on a generation's FIRST piece (`resolve` reports `first = received-before == 0`), and the three ring-less terminal arms clear the parts — this plan's seq-keyed `push_piece` could deliver a stale sibling piece after a u32 wire-seq wrap. Cost: one bool through `Resolve`.
-- **F (parked):** the attach-level refusal for a page whose declared set has no id < 8 reuses `ClientError::ServiceNotDeclared { id: 0, declared: <raw page word> }` (mirrors `uc2_service`'s page gate; avoids a public-API variant). Cost if wrong: an attach refusal indistinguishable from a door refusal by pattern match — revisit when `ClientError` next changes.
+- **F (parked):** the attach-level refusal for a page whose declared set has no id < 8 reuses `ClientError::ServiceNotDeclared { id: 0, declared: <raw page word> }` (mirrors `uc_service`'s page gate; avoids a public-API variant). Cost if wrong: an attach refusal indistinguishable from a door refusal by pattern match — revisit when `ClientError` next changes.
 - **G (parked):** no engine-level test for a fan-in abandoned by the deadline sweep (the case only `first` protects; the RETRY-aborted test is also covered by the terminal-arm clear); `slots.rs` pins `first`'s semantics. M14c with the Partial-then-sweep slots test.
 - **H (parked):** `scratch_base()` in the engine unit tests assumes the `<target>/<profile>/deps` layout. Harmless here.
-- **I (finish):** the one full-suite failure is an environment-sensitive construction flake (see above), not a regression — the test is election/first-block truncation, untouched by M14b (`uc2_consensus`/`uc2_net`/the replication path are not in the diff), green in T9's full run. Cost if wrong: a masked election regression.
+- **I (finish):** the one full-suite failure is an environment-sensitive construction flake (see above), not a regression — the test is election/first-block truncation, untouched by M14b (`uc_consensus`/`uc_net`/the replication path are not in the diff), green in T9's full run. Cost if wrong: a masked election regression.
 
 ### Plan defects found by execution
 
-- Deviation 7's `Vec<u8>` note is stale (the header says `Bytes`); Ruling A above; T4/T5's compile break between commits (Ruling B); T6's `wrong_ring` assertion (Ruling C); T4's seq-keyed fan-in buffer (Ruling E); the claim that `examples/counter/tests/quickstart_local.rs` greps `counter-client` (it drives `counter-remote` — no test guards `counter-client`'s default output; verified byte-identical by diff); T5's `env!("CARGO_TARGET_TMPDIR")` in a lib unit test (cargo defines it for integration tests/benches only); `cargo build --workspace --all-targets` does not compile feature-gated tests — `uc2-crashtest --features hard-crash-tests` broke on the new `ClientError` variant and only T9 caught it.
+- Deviation 7's `Vec<u8>` note is stale (the header says `Bytes`); Ruling A above; T4/T5's compile break between commits (Ruling B); T6's `wrong_ring` assertion (Ruling C); T4's seq-keyed fan-in buffer (Ruling E); the claim that `examples/counter/tests/quickstart_local.rs` greps `counter-client` (it drives `counter-remote` — no test guards `counter-client`'s default output; verified byte-identical by diff); T5's `env!("CARGO_TARGET_TMPDIR")` in a lib unit test (cargo defines it for integration tests/benches only); `cargo build --workspace --all-targets` does not compile feature-gated tests — `uc_crashtest --features hard-crash-tests` broke on the new `ClientError` variant and only T9 caught it.
 
 ### Deferred to M14c (triaged by the final review as CAN WAIT)
 
@@ -1821,7 +1821,7 @@ Branch `worktree-uc2-multi-service`, merge base `3a7f9a5`, final HEAD `efc5339`.
 
 ### Post-execution addendum: the client hop in isolation (2026-08-28, dev box, smoke)
 
-Asked "did M14b measure its hops?" — it had not (T9 ran only the whole-chain `m5_gate` smoke, whose ±18 % same-box spread cannot see a few percent). Exact-binary A/B of **hop 1 alone** (`hop_bench engine-load` → `dummy-node`, 1 engine, inflight 4096, 64 B, 6 s, fresh sink per run, box otherwise idle, private target dirs, checksums recorded): the sink was `main`'s binary for every run, so only the driver — the `uc2_client` engine — differed.
+Asked "did M14b measure its hops?" — it had not (T9 ran only the whole-chain `m5_gate` smoke, whose ±18 % same-box spread cannot see a few percent). Exact-binary A/B of **hop 1 alone** (`hop_bench engine-load` → `dummy-node`, 1 engine, inflight 4096, 64 B, 6 s, fresh sink per run, box otherwise idle, private target dirs, checksums recorded): the sink was `main`'s binary for every run, so only the driver — the `uc_client` engine — differed.
 
 | driver binary | resp/s (per run) | mean | p90 / p99 |
 |---|---|---:|---|

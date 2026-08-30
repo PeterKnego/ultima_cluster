@@ -160,4 +160,4 @@ m5_output_ring_backpressure_skip      ~ 4.2 s
 - Canonical project design: `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` (§"OutputHandler" line 253, §"Output pipeline" line ~680).
 - Predecessor record: `docs/tasks/task05_m4_clients_and_ring_fix.md`.
 - M4 follow-up #1 (metrics publisher, foundation for `leader_rx`): `uc_node/src/ipc/metrics_publisher.rs` (commit `010522c` from M4).
-- `ultima_journal::StableValue<u64>` usage example: `last_purged.state` in `uc_node/src/raft/log_storage.rs`.
+- `uc_journal::StableValue<u64>` usage example: `last_purged.state` in `uc_node/src/raft/log_storage.rs`.

@@ -8,7 +8,7 @@ is located by subtraction rather than inferred from the end-to-end number:
     [RemoteClient] ─TCP─▶ [Edge] ─shmem Engine─▶ [node] ─▶ consensus ─▶ [service]
          hop 3             hop 2         hop 1
 
-Roles come from `uc2_gateway/examples/hop_bench` (dummy-node, dummy-edge,
+Roles come from `uc_gateway/examples/hop_bench` (dummy-node, dummy-edge,
 blaster, engine-load, remote-load, edge); the real-cluster arms reuse
 `m12_gate`'s node/service roles through `m12_fleet_gate`'s helpers.
 
@@ -88,9 +88,9 @@ def prepare_host(host):
     src = m6.SshHost.UC_SRC
     cmd = (
         f"{env} {cargo} build --release --manifest-path {src}/Cargo.toml "
-        f"-p uc2_node --example m6_gate "
+        f"-p uc_node --example m6_gate "
         f"&& {env} {cargo} build --release --manifest-path {src}/Cargo.toml "
-        f"-p uc2_gateway --example m12_gate --example hop_bench "
+        f"-p uc_gateway --example m12_gate --example hop_bench "
         f"&& sudo mkdir -p {HOP_ROOT} {m12.REMOTE_ROOT} "
         f"&& echo FSTYPE=$(stat -f -c %T {HOP_ROOT}) && echo PREPARED"
     )
@@ -430,9 +430,9 @@ def arm_gate(m12hosts, hophosts, a, points, verdicts):
     print("\nGATE rows e and f are local/CI — run them where the code is:", flush=True)
     for c in ("cargo test -p uc_protocol",
               'RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc',
-              "cargo test -p uc2_remote",
-              "cargo test -p uc2_gateway",
-              "cargo test -p uc2-crashtest --features hard-crash-tests --test remote_lin"):
+              "cargo test -p uc_remote",
+              "cargo test -p uc_gateway",
+              "cargo test -p uc_crashtest --features hard-crash-tests --test remote_lin"):
         print(f"  {c}", flush=True)
 
 

@@ -2,16 +2,16 @@
 
 Date: 2026-08-13
 Status: approved design, pre-implementation
-Scope: `uc2_client` only. No wire-protocol change, no node/service change, no
+Scope: `uc_client` only. No wire-protocol change, no node/service change, no
 version bump.
 
 ## 1. Motivation
 
-`uc2_client` today exposes exactly one submit path: a blocking, one-command-
+`uc_client` today exposes exactly one submit path: a blocking, one-command-
 per-call `Client::submit` whose internals (a `Mutex<HashMap>` registration
 table plus a per-request `sync_channel`) cannot approach the throughput the
 server is built and benchmarked for. The only code that *can* — the m5_gate
-client pump (`uc2_node/examples/m5_gate.rs`, client role) — lives in an example
+client pump (`uc_node/examples/m5_gate.rs`, client role) — lives in an example
 binary, is measurement-shaped (histograms, pass bars, panic-on-error, payload
 discarded), and re-derives a pile of hard-won session-correctness knowledge
 (exactly-once correlation, duplicate-response tolerance, the serving gate)
@@ -44,7 +44,7 @@ Goals:
 - Correctness obligations (dedup, wrap safety, slot liveness, restart/
   overwrite classification) live inside the engine, invisible to callers.
 - Wait-strategy discipline informed by `ultima_rings`' measured findings,
-  ported (~60 lines) rather than depended on — `uc2_client` keeps its small
+  ported (~60 lines) rather than depended on — `uc_client` keeps its small
   advertised dep set.
 
 Non-goals:
@@ -69,7 +69,7 @@ async: t.await ──┤                                                        
 ```
 
 **B is passive; A owns the thread.** The engine is a pure-sync, waitless
-object in the house style of `uc2_consensus`/`uc2_crypto`: it never sleeps,
+object in the house style of `uc_consensus`/`uc_crypto`: it never sleeps,
 spins, parks or spawns. Its `poll()` is one bounded duty cycle. The caller —
 the gates on a dedicated busy-spin core, or A's driver thread — owns cadence
 entirely. This inverts today's structure (the thread currently lives at the
@@ -77,7 +77,7 @@ bottom, inside `Client`'s matcher); the inversion is what makes the
 zero-handoff completion path possible: the polling thread and the consuming
 code are the same thread, no intermediate queue.
 
-Following `uc2_crypto`'s `SharedTransport` precedent, the engine splits:
+Following `uc_crypto`'s `SharedTransport` precedent, the engine splits:
 
 - **`SendHalf`** — `Clone + Send` (not `Sync`; clone per submitting thread,
   the `MpscProducer`-supported pattern). Carries per-clone ring producers and
@@ -151,10 +151,10 @@ The engine itself is format-free: it never inspects submitted or returned
 payload bytes, and the node/log treat `AppCommand` as opaque `Bytes`
 end-to-end. The only format constraint is the one imposed by the OTHER
 endpoint — the target service's apply boundary — and it belongs to
-`uc2_service`, not to the engine:
+`uc_service`, not to the engine:
 
 - Today's typed `StateMachine` trait makes the service framework run the
-  codec (the ONE decode at the apply boundary, `uc2_service/src/apply.rs`),
+  codec (the ONE decode at the apply boundary, `uc_service/src/apply.rs`),
   and the framework's chosen codec is bincode (standard config). So against
   today's SDK, submitted bytes must decode as `bincode(Command)`, query
   bytes as `bincode(Query)` — a property of the service SDK the engine's
@@ -162,7 +162,7 @@ endpoint — the target service's apply boundary — and it belongs to
   (§10) would remove entirely.
 - `Outcome::Response` bytes are the egress payload with its prefix stripped:
   the layout is `position: u64 LE ++ response bytes`
-  (`uc2_service/src/egress.rs`; today's SDK makes the body
+  (`uc_service/src/egress.rs`; today's SDK makes the body
   `bincode(Response)`), and the engine strips the prefix, exposing it as
   `Completion.position`.
 - Encode-once reuse (the m5_gate trick) falls out for any service whose
@@ -277,7 +277,7 @@ client.query_linearizable(&q)? / client.query_snapshot(&q)?  -> Ticket<QResp>
 The `WaitStrategy` closed enum (`BusySpin | BackoffYield | Backoff | Park`)
 and the ~60-line `Idle` ladder are PORTED with attribution (source:
 `ultima_rings/src/wait.rs`, incl. the 64 µs `park_timeout` floor finding) —
-NOT a dependency, preserving `uc2_client`'s small advertised dep set.
+NOT a dependency, preserving `uc_client`'s small advertised dep set.
 
 Placement of waits, informed by `ultima_rings`' measurements (`BusySpin`
 collapses under oversubscription; on a busy machine `Park` is fastest and
@@ -339,7 +339,7 @@ they were load-bearing for diagnosing every historical incident.
 ## 8. Module layout
 
 ```
-uc2_client/src/
+uc_client/src/
   engine.rs      // B: SendHalf/PollHalf, slot table, session correctness (§4)
   pipelined.rs   // A: PipelinedClient + driver thread
   ticket.rs      // Ticket<R>: park/unpark + Waker state cell
@@ -386,14 +386,14 @@ Acceptance (the release criterion):
 
 ## 10. Out of scope / deferred
 
-- Publishing `uc2_client` docs positioning the engine as the "advanced" tier
+- Publishing `uc_client` docs positioning the engine as the "advanced" tier
   and tickets as the default (rustdoc lands with the code; QUICKSTART touch-
   up can ride the same branch).
 - Per-slot response-buffer reuse in A (amortizing the one copy/alloc per
   response) — measure first; only if the gate re-run shows it matters.
 - Any future `ultima_rings` hard dependency (revisit if/when that crate
   becomes the stack's shared substrate).
-- **Service-side raw passthrough** (`uc2_service` change, separate arc): a
+- **Service-side raw passthrough** (`uc_service` change, separate arc): a
   way for an SM to declare "my `Command`/`Response` are bytes — hand me the
   committed payload directly, skip the framework codec." Removes the
   bincode wrapper for apps bringing their own format (proto, flatbuffers):
@@ -412,7 +412,7 @@ Recorded after the final whole-branch review; the spec body above is left
 unmodified — these are the deltas between what shipped and what's written
 above.
 
-- **The driver is a hand-spawned `std::thread`, not `uc2_log::agent::AgentRunner`.**
+- **The driver is a hand-spawned `std::thread`, not `uc_log::agent::AgentRunner`.**
   `AgentRunner`'s duty-cycle contract forbids blocking, and its `Park` wait
   strategy blocks for up to 1ms — incompatible with that contract. See
   `pipelined.rs`'s module docs ("Threading (Key Mechanics #2)").

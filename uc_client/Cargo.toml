@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
+[package]
+name = "uc_client"
+description = "UC v2 sync shmem client SDK — cnc attach, MPSC submit/query, broadcast matcher"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+uc_log = { path = "../uc_log", version = "2.8.1" }
+bytes = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# uc_node and uc_service are deliberately unversioned: uc_client is
+# published EARLIER than both in the publish DAG order
+# (docs/how-to/cut-a-release.md), so a version here would make
+# `cargo package`/`cargo publish` require an unresolvable forward reference.
+# Cargo silently strips an unversioned path dev-dependency from the published
+# manifest instead (standard idiom for a dev-only test-time-only dependency).
+uc_node = { path = "../uc_node" }
+uc_service = { path = "../uc_service" }
+uc_net = { path = "../uc_net", version = "2.8.1" }
+tempfile = { workspace = true }

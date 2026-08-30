@@ -5,7 +5,7 @@
 # the workspace pins stable 1.96.0 with an MSRV floor of 1.89 — nothing here
 # may ever leak into a workspace build, a `cargo test`, or the lockfile.
 [package]
-name = "uc2-fuzz"
+name = "uc_fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -17,13 +17,13 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 uc_protocol = { path = "../uc_protocol" }
-uc2_remote = { path = "../uc2_remote" }
-uc2_crypto = { path = "../uc2_crypto" }
-uc2_service = { path = "../uc2_service" }
-uc2_node = { path = "../uc2_node" }
-uc2_gateway = { path = "../uc2_gateway" }
-ultima_journal = { path = "../ultima_journal", package = "ultima-journal" }
-# Only for the fuzz helpers that rebuild uc2_crypto's on-disk test fixtures
+uc_remote = { path = "../uc_remote" }
+uc_crypto = { path = "../uc_crypto" }
+uc_service = { path = "../uc_service" }
+uc_node = { path = "../uc_node" }
+uc_gateway = { path = "../uc_gateway" }
+uc_journal = { path = "../uc_journal" }
+# Only for the fuzz helpers that rebuild uc_crypto's on-disk test fixtures
 # (an allowlist file is base64 public keys; Identity/Allowlist have no
 # from-bytes constructor by design). Same versions the workspace pins.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -44,50 +44,50 @@ doc = false
 bench = false
 
 [[bin]]
-name = "uc2_remote_frame"
-path = "fuzz_targets/uc2_remote_frame.rs"
+name = "uc_remote_frame"
+path = "fuzz_targets/uc_remote_frame.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_crypto_open"
-path = "fuzz_targets/uc2_crypto_open.rs"
+name = "uc_crypto_open"
+path = "fuzz_targets/uc_crypto_open.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_crypto_handshake"
-path = "fuzz_targets/uc2_crypto_handshake.rs"
+name = "uc_crypto_handshake"
+path = "fuzz_targets/uc_crypto_handshake.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_crypto_group_key"
-path = "fuzz_targets/uc2_crypto_group_key.rs"
+name = "uc_crypto_group_key"
+path = "fuzz_targets/uc_crypto_group_key.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_crypto_admin"
-path = "fuzz_targets/uc2_crypto_admin.rs"
+name = "uc_crypto_admin"
+path = "fuzz_targets/uc_crypto_admin.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "ultima_journal_record"
-path = "fuzz_targets/ultima_journal_record.rs"
+name = "uc_journal_record"
+path = "fuzz_targets/uc_journal_record.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "ultima_journal_stable_value"
-path = "fuzz_targets/ultima_journal_stable_value.rs"
+name = "uc_journal_stable_value"
+path = "fuzz_targets/uc_journal_stable_value.rs"
 test = false
 doc = false
 bench = false
@@ -107,29 +107,29 @@ doc = false
 bench = false
 
 [[bin]]
-name = "uc2_service_session"
-path = "fuzz_targets/uc2_service_session.rs"
+name = "uc_service_session"
+path = "fuzz_targets/uc_service_session.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_node_toml"
-path = "fuzz_targets/uc2_node_toml.rs"
+name = "uc_node_toml"
+path = "fuzz_targets/uc_node_toml.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_gateway_toml"
-path = "fuzz_targets/uc2_gateway_toml.rs"
+name = "uc_gateway_toml"
+path = "fuzz_targets/uc_gateway_toml.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "uc2_node_http"
-path = "fuzz_targets/uc2_node_http.rs"
+name = "uc_node_http"
+path = "fuzz_targets/uc_node_http.rs"
 test = false
 doc = false
 bench = false

@@ -6,7 +6,7 @@
 
 ## Goal
 
-Establish the workspace foundation and prove the openraft + `ultima_journal` seam end-to-end via a single-node SMR cluster that survives a restart with state preserved.
+Establish the workspace foundation and prove the openraft + `uc_journal` seam end-to-end via a single-node SMR cluster that survives a restart with state preserved.
 
 This is the first milestone of the broader ultima_cluster build sequence (M1-M5; canonical design at `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md`). M2 adds QUIC inter-node + multi-node bootstrap; M3 adds the shmem ring buffers + service-process split; M4 adds the local-shmem client; M5 adds output handler + production polish.
 
@@ -17,7 +17,7 @@ This is the first milestone of the broader ultima_cluster build sequence (M1-M5;
 - `uc_protocol` minimal stub (versions, error codes, magic constants; `no_std`-friendly).
 - `uc_service::StateMachine` + `OutputHandler<S>` traits with full snapshot contract.
 - `uc_node::NodeBuilder<S>` + `NodeHandle<S>` — embedded mode (in-process `StateMachine`; no shmem).
-- `RaftLogStorage` impl over `ultima_journal::Journal` + three `StableValue`s (vote, committed, last_purged).
+- `RaftLogStorage` impl over `uc_journal::Journal` + three `StableValue`s (vote, committed, last_purged).
 - `RaftStateMachine` impl that calls user's trait directly under a tokio Mutex.
 - `BootstrapConfig::SingleNode` (initialize-or-resume idempotent) and `BootstrapConfig::Resume`.
 - `NodeHandle::query_snapshot(closure)` for embedded reads.
@@ -72,7 +72,7 @@ ultima_cluster/
 
 ## Storage adapter mapping (`RaftLogStorage`)
 
-`JournalLogStorage` wraps `ultima_journal::Journal` (raft log entries) plus three `StableValue`s. All fields are `Arc`-wrapped so `get_log_reader()` can return a clone. Mapping:
+`JournalLogStorage` wraps `uc_journal::Journal` (raft log entries) plus three `StableValue`s. All fields are `Arc`-wrapped so `get_log_reader()` can return a clone. Mapping:
 
 | openraft API | implementation |
 |---|---|
@@ -208,5 +208,5 @@ cargo doc --workspace --no-deps                              # builds; 5 rustdoc
 ## Pointers
 
 - Canonical design: `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` (covers M1-M5).
-- Upstream contracts: `../ultima_db/docs/tasks/task26_journal.md` (`ultima_journal`), `../ultima_db/docs/tasks/task27_snapshot_stream.md` (`ultima_db` snapshot wire format — used in M3+).
+- Upstream contracts: `../ultima_db/docs/tasks/task26_journal.md` (`uc_journal`), `../ultima_db/docs/tasks/task27_snapshot_stream.md` (`ultima_db` snapshot wire format — used in M3+).
 - openraft 0.9.24 source (cargo registry cache) for storage trait shapes.

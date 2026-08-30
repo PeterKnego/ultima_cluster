@@ -75,7 +75,7 @@ jobs:
             VERSION="0.0.0-dry"
           fi
           CRATE=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name=="uc2_node") | .version')
+            | jq -r '.packages[] | select(.name=="uc_node") | .version')
           echo "tag version:   $VERSION"
           echo "crate version: $CRATE"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -129,9 +129,9 @@ jobs:
       - name: Build the five shipped binaries
         run: >
           cargo build --release --locked --target ${{ matrix.target }}
-          -p uc2_node --bin uc2-node
-          -p uc2ctl --bin uc2ctl
-          -p uc2_gateway --bin uc2-gateway
+          -p uc_node --bin uc2-node
+          -p uc_ctl --bin uc2ctl
+          -p uc_gateway --bin uc2-gateway
           -p counter --bin counter-service --bin counter-remote
 
       - name: Assemble the tarball

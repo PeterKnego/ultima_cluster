@@ -1,6 +1,6 @@
 import Uc2Model.TermMap
 
-/-! `uc2_consensus/src/reconcile.rs::reconcile` — the pure core of log
+/-! `uc_consensus/src/reconcile.rs::reconcile` — the pure core of log
 truncation. 1:1 port; the Rust module docs are the specification and the
 Rust unit tests are re-pinned below as #guards. -/
 

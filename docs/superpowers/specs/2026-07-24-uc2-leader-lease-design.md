@@ -51,7 +51,7 @@ rates is **the probe traffic itself and the load it places on the single-writer
 polling agents**:
 
 - Each linearizable read allocates a nonce and fans a `DGRAM_KIND_READ_PROBE` out
-  to every voting peer (`uc2_node/src/node.rs:1983`, `send_read_probe` at
+  to every voting peer (`uc_node/src/node.rs:1983`, `send_read_probe` at
   `node.rs:1895-1903`).
 - Each follower's ack is processed on the leader's consensus agent
   (`on_read_probe_ack`, `node.rs:1924-1943`), and each follower spends receiver-agent
@@ -73,7 +73,7 @@ weakening. Those are explicitly out of scope (§7).
 ### Baseline recap: what the barrier proves today
 
 The read path is a ReadIndex design in three steps (traced in the codebase; see
-`uc2_node/tests/query_barrier.rs` for the capstone):
+`uc_node/tests/query_barrier.rs` for the capstone):
 
 1. **Prove current-term leadership** — capture `commit_at = commit.load_acquire()`
    at admission (`node.rs:1983`), then confirm a quorum of *voters* are still in
@@ -82,7 +82,7 @@ The read path is a ReadIndex design in three steps (traced in the codebase; see
    counts distinct voter acks to quorum (`on_read_probe_ack`, `node.rs:1929-1939`).
 2. **Wait for the service frontier** — block until the apply agent publishes
    `service_applied >= commit_at` (`advance_pending_reads`, `node.rs:2038-2117`;
-   publish at `uc2_service/src/apply.rs:186`).
+   publish at `uc_service/src/apply.rs:186`).
 3. **Epoch/term guards** — the capture-recheck bracket + `e >= 1` guard
    (`node.rs:2071-2099`) and the service-epoch backstop (`apply.rs:316-344`),
    which defend the crashing-service TOCTOU.
@@ -311,16 +311,16 @@ read already does the `service_applied >= commit_at` wait and the epoch bracket.
 
 | Concern | Location |
 | --- | --- |
-| Admission fork (linearizable vs snapshot) | `uc2_node/src/node.rs:1956` |
+| Admission fork (linearizable vs snapshot) | `uc_node/src/node.rs:1956` |
 | Capture read index `commit_at` | `node.rs:1983` |
 | Send probe (stamped with current term) | `node.rs:1895-1903` |
 | Follower ack teeth (term match) | `node.rs:1910-1913` |
 | Count distinct voter acks to quorum | `node.rs:1924-1943` |
 | `PendingRead` / `ReadPhase` state | `node.rs:204-235` |
 | Wait-for-frontier + epoch bracket | `node.rs:2038-2117` |
-| Service publishes `service_applied` | `uc2_service/src/apply.rs:186` |
-| Service-epoch backstop | `uc2_service/src/apply.rs:316-344` |
+| Service publishes `service_applied` | `uc_service/src/apply.rs:186` |
+| Service-epoch backstop | `uc_service/src/apply.rs:316-344` |
 | Monotonic clock / duty-cycle tick | `node.rs:1693`, `node.rs:1305-1306` |
 | Election timeout config | `node.rs:147-148` |
 | Read-barrier timeout (1 s) | `node.rs:191` |
-| Capstone test | `uc2_node/tests/query_barrier.rs` |
+| Capstone test | `uc_node/tests/query_barrier.rs` |

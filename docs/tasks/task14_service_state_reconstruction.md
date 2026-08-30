@@ -128,10 +128,10 @@ plus a harness that hard-kills the service. This is what proves the
 reconstruction + read barrier above against an uncatchable crash (a SPSC
 in-flight entry abandoned mid-apply), not just a cooperative shutdown.
 
-- **`uc-lincheck` library crate.** The WGL checker (`checker`/`history`/`model`)
+- **`uc_lincheck` library crate.** The WGL checker (`checker`/`history`/`model`)
   and the CAS-register SM (`register`: `Cmd`/`CmdResp`/`RegisterSm`) were test
   modules under `uc_node/tests/lincheck/` — unreachable from another crate. They
-  are extracted verbatim (logic-preserving) into `uc-lincheck` (depends on
+  are extracted verbatim (logic-preserving) into `uc_lincheck` (depends on
   `uc_service` for the `StateMachine` trait `RegisterSm` impls) so the in-process
   capstone and the multi-process test share **one** checker/SM source of truth.
 - **Reference bins** (`examples/uc-crashtest/src/bin/`): `uc-crashtest-node`
@@ -184,7 +184,7 @@ in-flight entry abandoned mid-apply), not just a cooperative shutdown.
   uncatchable hard crash, not just graceful shutdown. Gated behind the
   `hard-crash-tests` feature (spawns real processes); Linearizable across seeds
   1/7/42/88888/4359. The checker and `RegisterSm` are shared with the in-process
-  capstone via the `uc-lincheck` library crate (one source of truth).
+  capstone via the `uc_lincheck` library crate (one source of truth).
 
 ## Known limitations
 

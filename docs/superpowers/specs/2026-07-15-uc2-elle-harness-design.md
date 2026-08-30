@@ -54,7 +54,7 @@ version.
 
 - Fleet/Jepsen-style runs over real hosts + nemesis (`bench-infra`) — the
   separate, later step already earmarked in ultima_db's elle doc.
-- Multi-process driver in `examples/uc2-crashtest` — named follow-up: point the
+- Multi-process driver in `examples/uc_crashtest` — named follow-up: point the
   same EDN writer at the crashtest harness.
 - Multi-op transactions / predicate workloads — UC's SDK surface is single
   commands + queries; singleton-txn list-append is the faithful encoding.
@@ -65,7 +65,7 @@ version.
 
 ## 4. Components
 
-### 4.1 `ListAppendSm` (`uc-lincheck/src/list_append.rs`)
+### 4.1 `ListAppendSm` (`uc_lincheck/src/list_append.rs`)
 
 Beside `RegisterSm`, same posture (plain in-memory, persists nothing — it is a
 reconstruction proof object):
@@ -78,14 +78,14 @@ pub struct LaRead { pub key: u32 }                      // Query
 ```
 
 - State: `BTreeMap<u32, Vec<u64>>` + `last_applied: Option<u64>`.
-- Implements `uc2_service::StateMachine` (behind the existing `v2` feature)
+- Implements `uc_service::StateMachine` (behind the existing `v2` feature)
   and `SnapshotStateMachine` (bincode of `(map, last_applied)`, install
   rejects a mis-tagged position — mirrors `RegisterSm`) so the purge pass
   drives the real snapshot/purge path.
 - Unit tests mirror `register.rs`: apply/query roundtrip via the v2 trait,
   snapshot roundtrip + mis-tag refusal.
 
-### 4.2 EDN history writer (`uc-lincheck/src/edn.rs`)
+### 4.2 EDN history writer (`uc_lincheck/src/edn.rs`)
 
 Pure module, zero new deps, hand-formatted EDN (straight port of ultima_db's
 `elle-history` encoding): one map per line,
@@ -101,7 +101,7 @@ Pure module, zero new deps, hand-formatted EDN (straight port of ultima_db's
 - Unit tests: EDN escaping/format golden tests, invoke/complete index
   ordering, uniqueness of append values across retries, process retirement.
 
-### 4.3 Driver (`uc2_node/tests/elle_v2.rs`)
+### 4.3 Driver (`uc_node/tests/elle_v2.rs`)
 
 An integration-test target (not an example bin: it shares
 `tests/lincheck_v2/mod.rs` via `#[path]`, exactly like the four capstones).
@@ -109,7 +109,7 @@ All tests `#[ignore]`d — never in default `cargo test`; invoked explicitly by
 the scripts:
 
 ```bash
-cargo test -p uc2_node --release --test elle_v2 -- --ignored elle_quiet
+cargo test -p uc_node --release --test elle_v2 -- --ignored elle_quiet
 ```
 
 One `#[ignore]`d test per pass (`elle_quiet`, `elle_failover`, `elle_purge`,
@@ -139,7 +139,7 @@ fails liveness/vacuity exits nonzero **before** any elle verdict is trusted.
 
 Elle's `:fail` means **definitely did not commit**; getting this wrong turns
 the checker into a false-alarm (or false-pass) machine. Mapping from
-`uc2_client::ClientError`, informed by the existing `lincheck_v2` worker's
+`uc_client::ClientError`, informed by the existing `lincheck_v2` worker's
 outcome routing:
 
 | Outcome | EDN | Rationale |
@@ -199,14 +199,14 @@ each surface (write/commit, election, read) has a proven tooth.
 
 **Injection mechanism.** A `mutation-testing` cargo feature, **off in every
 normal build** (default `cargo build`/`test`/sim/gates never compile it).
-`UC2_MUTATION` is read exactly once via `OnceLock` in **`uc2_node`** (a
+`UC2_MUTATION` is read exactly once via `OnceLock` in **`uc_node`** (a
 `mutation` module mirroring ultima_db's `src/mutation.rs`: known values map to
-the enum, unset/empty = `None`, unknown value = `panic!`). `uc2_consensus`
+the enum, unset/empty = `None`, unknown value = `panic!`). `uc_consensus`
 stays env-free to preserve its pure-sync/no-I/O posture: the consensus-side
 sites are `#[cfg(feature = "mutation-testing")]` knob fields on the affected
-components (default `false`), set by `uc2_node` at wiring time from
-`mutation::active()`. The feature forwards `uc2_node/mutation-testing →
-uc2_consensus/mutation-testing`.
+components (default `false`), set by `uc_node` at wiring time from
+`mutation::active()`. The feature forwards `uc_node/mutation-testing →
+uc_consensus/mutation-testing`.
 
 **Safety invariant: feature-on + env-unset = byte-for-byte normal behavior**,
 verified two ways: the full test suite passes with the feature compiled in and
@@ -217,9 +217,9 @@ elle checks to pass on a feature-on build before attempting any mutation.
 
 | `UC2_MUTATION` value | Site | Bug injected | Caught by |
 |---|---|---|---|
-| `commit-quorum-minus-one` | `uc2_consensus::CommitTracker` | commit advances at the (quorum−1)-th highest durable position | `failover` pass: an acked append durable on the leader alone dies with the kill → lost update / aborted read |
-| `skip-vote-order-check` | `uc2_consensus::ElectionSm` | vote granted ignoring the lexicographic `(last_term, last_durable)` comparison | `failover` pass: a stale leader elected over a longer log → divergence / lost updates |
-| `skip-read-barrier` | `uc2_node` linearizable-read path | `query_linearizable` skips the READ_PROBE/ACK quorum barrier | **`strong-serializable` only**: stale reads are pure real-time anomalies, invisible to plain serializability — this tooth proves both the read path and the strict model |
+| `commit-quorum-minus-one` | `uc_consensus::CommitTracker` | commit advances at the (quorum−1)-th highest durable position | `failover` pass: an acked append durable on the leader alone dies with the kill → lost update / aborted read |
+| `skip-vote-order-check` | `uc_consensus::ElectionSm` | vote granted ignoring the lexicographic `(last_term, last_durable)` comparison | `failover` pass: a stale leader elected over a longer log → divergence / lost updates |
+| `skip-read-barrier` | `uc_node` linearizable-read path | `query_linearizable` skips the READ_PROBE/ACK quorum barrier | **`strong-serializable` only**: stale reads are pure real-time anomalies, invisible to plain serializability — this tooth proves both the read path and the strict model |
 
 **`scripts/elle_mutation.sh`** — port of ultima_db's: builds the driver once
 with `--features mutation-testing`, then (1) **control**: env unset, failover
@@ -258,7 +258,7 @@ Extends the existing nightly-proofs split (precedent: ultima_db's
 - Fixture self-tests run at the top of every `elle_check.sh` invocation
   (checker distrust is permanent, not a one-time validation).
 - Mutation control run (inertness) + three catch assertions.
-- `uc2_node::mutation` parse unit tests (known values, panic-on-unknown),
+- `uc_node::mutation` parse unit tests (known values, panic-on-unknown),
   compiled only under the feature.
 - Determinism: op generation and nemesis scheduling are seeded; cluster
   interleaving is not (same posture as the capstones — the *history* is the
@@ -289,7 +289,7 @@ Histories persist under `$ELLE_DIR/<pass>/` with the seed in a sidecar file.
 ## 8. Follow-ups (out of v1, named)
 
 1. `skip-tombstone-check` mutation (reconfig tooth).
-2. Multi-process pass: EDN writer over the `uc2-crashtest` harness (`kill -9`
+2. Multi-process pass: EDN writer over the `uc_crashtest` harness (`kill -9`
    process isolation).
 3. Fleet/Jepsen-style run over `bench-infra` hosts with a real nemesis
    (iptables partitions, `uc2ctl` reconfig under load) — the "full Jepsen for

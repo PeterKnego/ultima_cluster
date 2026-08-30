@@ -1,10 +1,10 @@
 /-! Ascending `(term, base)` maps — the wire/consensus term maps of
-`uc2_consensus/src/reconcile.rs` (module docs) and the `term_at` oracle of
-`uc2_sim/src/invariants.rs::term_at`. -/
+`uc_consensus/src/reconcile.rs` (module docs) and the `term_at` oracle of
+`uc_sim/src/invariants.rs::term_at`. -/
 
 namespace Uc2
 
-/-- `uc2_consensus`: an ascending `(term, base)` map — term `t`'s bytes begin
+/-- `uc_consensus`: an ascending `(term, base)` map — term `t`'s bytes begin
 at byte position `base`. `Nat` abstracts `u32`/`u64` faithfully: the kernels
 only compare (no wrapping arithmetic). -/
 abbrev TermMap := List (Nat × Nat)
@@ -19,7 +19,7 @@ def Ascending : TermMap → Prop
   | [_] => True
   | a :: b :: rest => a.1 < b.1 ∧ a.2 ≤ b.2 ∧ Ascending (b :: rest)
 
-/-- `uc2_sim/src/invariants.rs::term_at`: the term covering byte `pos` —
+/-- `uc_sim/src/invariants.rs::term_at`: the term covering byte `pos` —
 the term of the greatest entry whose base is `<= pos`, or 0 below the first
 entry. Within a term, bytes are cluster-identical (spec §6), so the term at a
 position IS its content identity. -/

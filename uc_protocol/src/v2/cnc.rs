@@ -38,7 +38,7 @@
 //! part of the multi-language protocol gate) and carries no crc dependency,
 //! so [`write_cnc_header`]/[`read_cnc_header`] are crc-agnostic: they read
 //! and write every fixed header field EXCEPT the crc32 word at
-//! [`CNC_OFF_HEADER_CRC`], which they leave untouched. `uc2_log::cnc`
+//! [`CNC_OFF_HEADER_CRC`], which they leave untouched. `uc_log::cnc`
 //! computes/writes the crc32 (workspace `crc32fast`) after
 //! `write_cnc_header`, and validates it before trusting a page written by
 //! another process. This mirrors the v1 `cnc.rs` split, just made explicit
@@ -67,7 +67,7 @@ pub const CNC_OFF_APP_ID: usize = 32; // [u8; 64] utf-8, NUL-padded
 pub const CNC_OFF_CREATED_NS: usize = 96; // u64 LE
 pub const CNC_OFF_BUFFER_BYTES: usize = 104; // u64 LE (log-buffer capacity — geometry for attachers)
 pub const CNC_OFF_MAX_PAYLOAD: usize = 112; // u32 LE
-pub const CNC_OFF_HEADER_CRC: usize = 124; // u32 LE, crc32 over [0..124) — written/checked by uc2_log
+pub const CNC_OFF_HEADER_CRC: usize = 124; // u32 LE, crc32 over [0..124) — written/checked by uc_log
 
 // ---- counter lines (each one 64-byte cache line, single writer noted) -----
 pub const CNC_OFF_APPEND: usize = 256; // writer: leader appender / follower receiver
@@ -301,7 +301,7 @@ pub struct CncHeader {
 
 /// Write every fixed header field (magic, version, node_id, instance_id,
 /// app_id, created_ns, buffer_bytes, max_payload) EXCEPT the crc32 word at
-/// [`CNC_OFF_HEADER_CRC`] — that byte range is left untouched; `uc2_log`
+/// [`CNC_OFF_HEADER_CRC`] — that byte range is left untouched; `uc_log`
 /// computes and writes it immediately after calling this.
 ///
 /// `page` must be at least [`CNC_PAGE_LEN`] bytes. Panics if `app_id` is
@@ -333,7 +333,7 @@ pub fn write_cnc_header(page: &mut [u8], h: &CncHeader, app_id: &str) {
 /// Decode the fixed header fields. Returns `None` for a short page or a
 /// magic mismatch. Does NOT check the crc32 word (see module doc) — callers
 /// that need attach-time integrity (an mmap shared with another process)
-/// must validate the crc themselves (`uc2_log::cnc` does this).
+/// must validate the crc themselves (`uc_log::cnc` does this).
 pub fn read_cnc_header(page: &[u8]) -> Option<CncHeader> {
     if page.len() < CNC_PAGE_LEN {
         return None;
@@ -506,7 +506,7 @@ mod tests {
     fn read_is_crc_agnostic_by_design() {
         // Documents the crc split (module doc): flipping the crc byte at
         // CNC_OFF_HEADER_CRC does NOT affect read_cnc_header — this module
-        // never looks at it. `uc2_log::cnc::CncPage::open_file` is where a
+        // never looks at it. `uc_log::cnc::CncPage::open_file` is where a
         // flipped crc byte is actually rejected (its own test covers that).
         let h = header(7);
         let mut page = vec![0u8; CNC_PAGE_LEN];

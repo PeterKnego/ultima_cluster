@@ -6,14 +6,14 @@
 
 **Architecture:** All changes are local hardening/refusals at already-identified sites — no protocol-shape changes (one additive cnc field + two new reason-code values ⇒ a single wire **minor** version bump, Task 9). The archive work adds structured error surfaces first (Tasks 1–2) so the investigation (Task 3) observes failures as diagnosable errors, not panics.
 
-**Tech Stack:** Rust workspace (uc_protocol / uc2_log / uc2_consensus / uc2_node / uc2_sim / examples), spec `docs/superpowers/specs/2026-07-14-uc2-post-m7-followups-design.md`.
+**Tech Stack:** Rust workspace (uc_protocol / uc_log / uc_consensus / uc_node / uc_sim / examples), spec `docs/superpowers/specs/2026-07-14-uc2-post-m7-followups-design.md`.
 
 ## Global Constraints
 
 - Branch: `uc2/post-m7-followups` off `main` @ 2665baa. Ledger: `.superpowers/sdd/progress-followups.md` (append one entry per completed task).
 - `cargo clippy --workspace --all-targets -- -D warnings` must stay clean after every task.
-- `uc2_consensus` stays pure-sync, no I/O (belts that log live in `uc2_node`, never in `ElectionSm`).
-- cnc page offsets pinned in BOTH `uc_protocol` and `uc2_log` with offset-assertion tests; new fields go in the reserved band (next free line: 3712).
+- `uc_consensus` stays pure-sync, no I/O (belts that log live in `uc_node`, never in `ElectionSm`).
+- cnc page offsets pinned in BOTH `uc_protocol` and `uc_log` with offset-assertion tests; new fields go in the reserved band (next free line: 3712).
 - Wire reason codes: **11 = malformed/unknown op**, **12 = self-demote refused** (pinned in the spec — do not renumber).
 - One protocol version bump for the whole wave: `CURRENT` 0.2.0 → 0.3.0, in Task 9 only.
 - Implementers stage ONLY their own files; never `git add -A`.
@@ -61,7 +61,7 @@ git commit -m "chore(followups): open post-M7 follow-up wave (branch + ledger)"
 ### Task 1: `Replay::next` corrupt-block guard
 
 **Files:**
-- Modify: `uc2_log/src/archive.rs:30-41` (ArchiveError), `uc2_log/src/archive.rs:477-515` (`Replay::next`)
+- Modify: `uc_log/src/archive.rs:30-41` (ArchiveError), `uc_log/src/archive.rs:477-515` (`Replay::next`)
 - Test: same file, `#[cfg(test)] mod tests` (existing module, tests near lines 753/904 show the journal/replay helpers in use)
 
 **Interfaces:**
@@ -99,7 +99,7 @@ Also add a second case: a block whose tail has fewer than `HEADER_LEN` bytes lef
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_log replay_surfaces_corrupt_block -- --nocapture
+cargo test -p uc_log replay_surfaces_corrupt_block -- --nocapture
 ```
 Expected: FAIL — today the first case panics with an out-of-bounds slice (`index out of range`), which the test harness reports as test failure, not the expected `Err`.
 
@@ -154,15 +154,15 @@ In `Replay::next`, guard BOTH hazards before touching header/payload bytes. Repl
 - [ ] **Step 4: Run tests**
 
 ```bash
-cargo test -p uc2_log
+cargo test -p uc_log
 ```
-Expected: new tests PASS, all existing uc2_log tests PASS.
+Expected: new tests PASS, all existing uc_log tests PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_log/src/archive.rs
-git commit -m "fix(uc2_log): Replay::next surfaces CorruptBlock instead of OOB-panicking on a malformed block"
+git add uc_log/src/archive.rs
+git commit -m "fix(uc_log): Replay::next surfaces CorruptBlock instead of OOB-panicking on a malformed block"
 ```
 
 ---
@@ -170,8 +170,8 @@ git commit -m "fix(uc2_log): Replay::next surfaces CorruptBlock instead of OOB-p
 ### Task 2: `recordable_slice` checked consistency
 
 **Files:**
-- Modify: `uc2_log/src/buffer.rs:185-221` (`recordable_slice`), `uc2_log/src/archive.rs:30-41` (new error variant), `uc2_log/src/archive.rs:238-244` (`Archive::do_work` caller)
-- Test: `uc2_log/src/buffer.rs` test module
+- Modify: `uc_log/src/buffer.rs:185-221` (`recordable_slice`), `uc_log/src/archive.rs:30-41` (new error variant), `uc_log/src/archive.rs:238-244` (`Archive::do_work` caller)
+- Test: `uc_log/src/buffer.rs` test module
 
 **Interfaces:**
 - Produces: `recordable_slice(&self, from: u64, max_bytes: usize) -> Result<&[u8], RecordableCorrupt>`; `pub struct RecordableCorrupt { pub from: u64, pub append: u64, pub end: u64, pub claimed_len: u32 }` (buffer.rs); `ArchiveError::RecorderCorrupt(RecordableCorrupt)`.
@@ -203,7 +203,7 @@ fn recordable_slice_surfaces_torn_length_word() {
 - [ ] **Step 3: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_log recordable_slice_surfaces_torn -- --nocapture
+cargo test -p uc_log recordable_slice_surfaces_torn -- --nocapture
 ```
 Expected: FAIL — compile error (`recordable_slice` returns `&[u8]`, no `unwrap_err`). That is the red state for a signature-change task.
 
@@ -270,15 +270,15 @@ Update any test callers found in Step 1 (`.unwrap()` on the new `Result`).
 - [ ] **Step 5: Run tests**
 
 ```bash
-cargo test -p uc2_log && cargo clippy -p uc2_log --all-targets -- -D warnings
+cargo test -p uc_log && cargo clippy -p uc_log --all-targets -- -D warnings
 ```
 Expected: PASS, clippy clean.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_log/src/buffer.rs uc2_log/src/archive.rs
-git commit -m "fix(uc2_log): recordable_slice promotes its torn-walk debug_assert to a checked RecorderCorrupt error"
+git add uc_log/src/buffer.rs uc_log/src/archive.rs
+git commit -m "fix(uc_log): recordable_slice promotes its torn-walk debug_assert to a checked RecorderCorrupt error"
 ```
 
 ---
@@ -286,7 +286,7 @@ git commit -m "fix(uc2_log): recordable_slice promotes its torn-walk debug_asser
 ### Task 3: Archive-panic investigation — stress harness + verdict
 
 **Files:**
-- Create: `uc2_log/tests/archive_stress.rs`
+- Create: `uc_log/tests/archive_stress.rs`
 - Modify (only if root cause confirmed): site named by the verdict
 - Modify: `.superpowers/sdd/progress-followups.md` (verdict entry), `docs/benchmarks/uc2-m7-gate-2026-07-13.md` (known-issues update)
 
@@ -297,12 +297,12 @@ This is an investigation task (systematic-debugging shape): the deliverable is a
 
 1. **H1 — torn `recordable_slice` walk** (now surfaces as `RecorderCorrupt`): the one live-buffer reader without the seqlock post-copy re-check. Its safety argument holds ONLY if `[durable, append)` is truly immutable and `from` is truly a frame boundary.
 2. **H2 — truncation seam**: `truncate_to` (archive) + election truncation reset `durable_pos`/counters; a window where `recordable_slice(from)` walks bytes whose buffer offsets hold PRE-truncation frames (stale lengths at re-used offsets) would record a malformed block. The capstone does exactly this churn.
-3. **H3 — journal pending-tail read**: `Replay` reading a block appended-but-not-fsynced (`ultima_journal` 1de711a append-readability contract) — verify `Journal::read` CRC-checks and what a torn tail returns.
+3. **H3 — journal pending-tail read**: `Replay` reading a block appended-but-not-fsynced (`uc_journal` 1de711a append-readability contract) — verify `Journal::read` CRC-checks and what a torn tail returns.
 4. **H4 — restart counter priming**: `LogCounters::prime` after crash-restart leaving `durable_pos` mid-frame relative to buffer content.
 
 - [ ] **Step 1: Build the stress harness**
 
-`uc2_log/tests/archive_stress.rs`, three arms sharing one driver (small buffer 64 KiB so wrap is constant; frames 100-4000 B mixed):
+`uc_log/tests/archive_stress.rs`, three arms sharing one driver (small buffer 64 KiB so wrap is constant; frames 100-4000 B mixed):
 
 ```rust
 //! Post-M7 archive stress: concurrent appender + archiver + replayer,
@@ -314,20 +314,20 @@ This is an investigation task (systematic-debugging shape): the deliverable is a
 ```
 
 - Arm A `stress_append_archive_replay`: appender thread appends frames; archiver thread loops `do_work`; replayer thread loops `replay_from(random archived pos)` draining `next()` to the end. Any `Err` → panic with seed + error.
-- Arm B `stress_with_truncation`: same + periodically `truncate_to(pos)` at a frame boundary below the frontier (mimic election reconciliation), then resume appending from there — mirror how `uc2_node` drives it (crib the call pattern from `grep -n "truncate_to" uc2_node/src/node.rs uc2_log/src/archive.rs`).
+- Arm B `stress_with_truncation`: same + periodically `truncate_to(pos)` at a frame boundary below the frontier (mimic election reconciliation), then resume appending from there — mirror how `uc_node` drives it (crib the call pattern from `grep -n "truncate_to" uc_node/src/node.rs uc_log/src/archive.rs`).
 - Arm C `stress_reopen`: periodically drop + reopen `Archive`/`Journal` mid-load (crash-restart shape, prime counters as node boot does).
 
 - [ ] **Step 2: Run short (CI budget) and long (repro attempt)**
 
 ```bash
-cargo test -p uc2_log --test archive_stress --release
-UC2_ARCHIVE_STRESS_MS=60000 cargo test -p uc2_log --test archive_stress --release -- --nocapture
+cargo test -p uc_log --test archive_stress --release
+UC2_ARCHIVE_STRESS_MS=60000 cargo test -p uc_log --test archive_stress --release -- --nocapture
 ```
 Run the 60 s form at least 5 times. Record every outcome.
 
 - [ ] **Step 3: Code-audit the four hypotheses**
 
-Regardless of repro: read each seam and write one paragraph per hypothesis (holds / broken / can't-tell + why) into the ledger entry. For H2 specifically: trace `truncate_to`'s handling of `durable_pos` vs the buffer's `append` counter reset and answer "can `recordable_slice(from)` ever walk offsets holding stale pre-truncation lengths?". For H3: read `ultima_journal`'s `read()` CRC path and the pending-tail contract.
+Regardless of repro: read each seam and write one paragraph per hypothesis (holds / broken / can't-tell + why) into the ledger entry. For H2 specifically: trace `truncate_to`'s handling of `durable_pos` vs the buffer's `append` counter reset and answer "can `recordable_slice(from)` ever walk offsets holding stale pre-truncation lengths?". For H3: read `uc_journal`'s `read()` CRC path and the pending-tail contract.
 
 - [ ] **Step 4: Fix if confirmed**
 
@@ -336,15 +336,15 @@ If a mechanism is confirmed (by repro or by an airtight code argument): fix at t
 - [ ] **Step 5: Run the capstone that saw the original panic**
 
 ```bash
-cargo test -p uc2_node --test lin_v2 --release
+cargo test -p uc_node --test lin_v2 --release
 ```
 Expected: PASS (Linearizable).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_log/tests/archive_stress.rs .superpowers/sdd/progress-followups.md docs/benchmarks/uc2-m7-gate-2026-07-13.md
-git commit -m "test(uc2_log): archive stress harness (append/truncate/reopen arms) + Replay-panic verdict"
+git add uc_log/tests/archive_stress.rs .superpowers/sdd/progress-followups.md docs/benchmarks/uc2-m7-gate-2026-07-13.md
+git commit -m "test(uc_log): archive stress harness (append/truncate/reopen arms) + Replay-panic verdict"
 ```
 (plus the fix commit if Step 4 confirmed something — separate commit, own red-verified test)
 
@@ -353,8 +353,8 @@ git commit -m "test(uc2_log): archive stress harness (append/truncate/reopen arm
 ### Task 4: Refuse `DemoteVoter{self}` + reason codes 11/12
 
 **Files:**
-- Modify: `uc2_consensus/src/config.rs:47-59,163-176,224-241`, `uc2_consensus/src/election.rs:821-839`, `uc2_node/src/node.rs:2130-2163`, `uc2_node/examples/uc2ctl.rs:135-153`
-- Test: `uc2_consensus/src/election.rs` test module, `uc2_node/tests/reconfig.rs:1271` (`every_refusal_surfaces`)
+- Modify: `uc_consensus/src/config.rs:47-59,163-176,224-241`, `uc_consensus/src/election.rs:821-839`, `uc_node/src/node.rs:2130-2163`, `uc_node/examples/uc2ctl.rs:135-153`
+- Test: `uc_consensus/src/election.rs` test module, `uc_node/tests/reconfig.rs:1271` (`every_refusal_surfaces`)
 - Docs: `docs/ops/uc2-runbook.md` §6 (self-demote refusal + recourse)
 
 **Interfaces:**
@@ -379,7 +379,7 @@ fn self_demote_is_refused_other_demote_still_works() {
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_consensus self_demote -- --nocapture
+cargo test -p uc_consensus self_demote -- --nocapture
 ```
 Expected: FAIL — `SelfDemote` variant does not exist (compile error).
 
@@ -391,7 +391,7 @@ config.rs — add to `ProposeError` (after `NotCaughtUp`):
     SelfDemote,               // 12 (a leader may not demote itself — see propose_config)
 ```
 
-Note in the enum's comment block: `// 11 is NOT a ProposeError: it is the node-level malformed/unknown-op reply (uc2_node::REASON_MALFORMED_OP).`
+Note in the enum's comment block: `// 11 is NOT a ProposeError: it is the node-level malformed/unknown-op reply (uc_node::REASON_MALFORMED_OP).`
 Add `ProposeError::SelfDemote => 12,` to `reason_code`, and a row to `op_code_and_reason_code_match_the_wire_table`:
 
 ```rust
@@ -436,7 +436,7 @@ uc2ctl.rs `reason_str` — add before the `_` arm:
 - [ ] **Step 5: Check for exhaustive `ProposeError` matches elsewhere**
 
 ```bash
-grep -rn "ProposeError::" --include=*.rs uc2_sim uc2_node | grep -v "Err(ProposeError"
+grep -rn "ProposeError::" --include=*.rs uc_sim uc_node | grep -v "Err(ProposeError"
 cargo build --workspace
 ```
 Fix any non-wildcard match arms the compiler flags (world.rs:1746-1756 pattern-matches specific variants with passthrough — expected no change, verify).
@@ -460,7 +460,7 @@ In `every_refusal_surfaces` (reconfig.rs, after the WrongRole block at line 1291
 - [ ] **Step 7: Run tests**
 
 ```bash
-cargo test -p uc2_consensus && cargo test -p uc2_node --test reconfig every_refusal_surfaces
+cargo test -p uc_consensus && cargo test -p uc_node --test reconfig every_refusal_surfaces
 ```
 Expected: PASS.
 
@@ -469,7 +469,7 @@ Expected: PASS.
 Add to runbook §6 (live reconfiguration ops), after the demote recipe: "**Demoting the leader itself is refused (reason 12).** To turn a leader into a learner: `remove-voter` its id (self-removal is supported — the leader replicates its own removal, steps down when it commits), then `add-learner` a FRESH id on that host (tombstoned ids never rejoin)."
 
 ```bash
-git add uc2_consensus/src/config.rs uc2_consensus/src/election.rs uc2_node/src/node.rs uc2_node/examples/uc2ctl.rs uc2_node/tests/reconfig.rs docs/ops/uc2-runbook.md
+git add uc_consensus/src/config.rs uc_consensus/src/election.rs uc_node/src/node.rs uc_node/examples/uc2ctl.rs uc_node/tests/reconfig.rs docs/ops/uc2-runbook.md
 git commit -m "feat(uc2): refuse DemoteVoter{self} (reason 12); dedicated malformed-op reason 11"
 ```
 
@@ -478,8 +478,8 @@ git commit -m "feat(uc2): refuse DemoteVoter{self} (reason 12); dedicated malfor
 ### Task 5: Refuse to start on recovered self-tombstone
 
 **Files:**
-- Modify: `uc2_node/src/node.rs:423-425` (after `config`/`prev_config` are derived)
-- Test: `uc2_node/tests/reconfig.rs` (new integration test)
+- Modify: `uc_node/src/node.rs:423-425` (after `config`/`prev_config` are derived)
+- Test: `uc_node/tests/reconfig.rs` (new integration test)
 - Docs: `docs/ops/uc2-runbook.md` (decommission section)
 
 **Interfaces:**
@@ -488,7 +488,7 @@ git commit -m "feat(uc2): refuse DemoteVoter{self} (reason 12); dedicated malfor
 - [ ] **Step 1: Audit existing restart-of-removed-node coverage**
 
 ```bash
-grep -n "restart\|Node::start\|spawn_node" uc2_node/tests/reconfig.rs examples/uc2-crashtest/src/*.rs | head -40
+grep -n "restart\|Node::start\|spawn_node" uc_node/tests/reconfig.rs examples/uc_crashtest/src/*.rs | head -40
 ```
 Identify any test that restarts a node whose id is tombstoned in its own recovered config (T9's `crash_mid_pending` restarts a node with a missed config; the T8 zombie test rebinds a port without restarting). Any such test's expectation flips to the new construction error — update it deliberately, noting it in the ledger.
 
@@ -518,7 +518,7 @@ fn restart_of_removed_node_refuses_to_start() {
 - [ ] **Step 3: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_node --test reconfig restart_of_removed_node -- --nocapture
+cargo test -p uc_node --test reconfig restart_of_removed_node -- --nocapture
 ```
 Expected: FAIL — `Node::start` currently succeeds (zombie boots).
 
@@ -550,8 +550,8 @@ node.rs, immediately after line 424 (`let prev_config = ...`):
 - [ ] **Step 5: Run tests**
 
 ```bash
-cargo test -p uc2_node --test reconfig
-cargo test -p uc2-crashtest --features hard-crash-tests
+cargo test -p uc_node --test reconfig
+cargo test -p uc_crashtest --features hard-crash-tests
 ```
 Expected: PASS (including any expectation updated in Step 1; the crashtest run guards the phantom-learner design against the new refusal).
 
@@ -560,8 +560,8 @@ Expected: PASS (including any expectation updated in Step 1; the crashtest run g
 Runbook decommission subsection: add "a removed node's binary refuses to restart on its old instance dir (`tombstoned in the recovered cluster config`) — this is the intended decommission backstop, not an error to work around. If a node was removed while its removal was still uncommitted and the cluster later truncated it (rare; requires losing the removal's quorum), the wrongly-halted node's recourse is the same wipe-and-rejoin."
 
 ```bash
-git add uc2_node/src/node.rs uc2_node/tests/reconfig.rs docs/ops/uc2-runbook.md
-git commit -m "feat(uc2_node): refuse to start when the recovered config tombstones our own id (zombie boot closed)"
+git add uc_node/src/node.rs uc_node/tests/reconfig.rs docs/ops/uc2-runbook.md
+git commit -m "feat(uc_node): refuse to start when the recovered config tombstones our own id (zombie boot closed)"
 ```
 
 ---
@@ -569,7 +569,7 @@ git commit -m "feat(uc2_node): refuse to start when the recovered config tombsto
 ### Task 6: `ConfigObserved` position≤durable belt
 
 **Files:**
-- Modify: `uc2_node/src/node.rs:1160-1165` (do_work step 1c drain)
+- Modify: `uc_node/src/node.rs:1160-1165` (do_work step 1c drain)
 - Test: node.rs's in-file test module — the harness at node.rs:3035/3610 already owns a `cfg_obs` sender (`_cfg_obs_tx`) and a driveable `Consensus`.
 
 **Interfaces:**
@@ -599,7 +599,7 @@ fn implausible_config_observation_is_ignored() {
 - [ ] **Step 3: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_node implausible_config_observation -- --nocapture
+cargo test -p uc_node implausible_config_observation -- --nocapture
 ```
 Expected: FAIL — today the implausible observation is adopted (first assert fires).
 
@@ -637,13 +637,13 @@ Replace the 1c drain body (node.rs:1160-1165):
 - [ ] **Step 5: Run tests + commit**
 
 ```bash
-cargo test -p uc2_node --lib && cargo test -p uc2_node --test reconfig
+cargo test -p uc_node --lib && cargo test -p uc_node --test reconfig
 ```
 Expected: PASS.
 
 ```bash
-git add uc2_node/src/node.rs
-git commit -m "fix(uc2_node): belt on follower ConfigObserved — skip observations above durable instead of adopting them"
+git add uc_node/src/node.rs
+git commit -m "fix(uc_node): belt on follower ConfigObserved — skip observations above durable instead of adopting them"
 ```
 
 ---
@@ -651,7 +651,7 @@ git commit -m "fix(uc2_node): belt on follower ConfigObserved — skip observati
 ### Task 7: Equal-version content-divergence check
 
 **Files:**
-- Modify: `uc2_node/src/node.rs:1160-1180` (same 1c drain, after Task 6's shape)
+- Modify: `uc_node/src/node.rs:1160-1180` (same 1c drain, after Task 6's shape)
 - Test: node.rs test module (same harness as Task 6) + a pure-function unit test
 
 **Interfaces:**
@@ -678,7 +678,7 @@ Plus a harness test mirroring Task 6's: adopt v1, then send a same-version-diffe
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_node config_content_divergence -- --nocapture
+cargo test -p uc_node config_content_divergence -- --nocapture
 ```
 Expected: FAIL — function does not exist (compile error).
 
@@ -711,9 +711,9 @@ pub(crate) fn config_content_diverges(current: &ClusterConfig, incoming: &Cluste
 - [ ] **Step 4: Run tests + commit**
 
 ```bash
-cargo test -p uc2_node --lib
-git add uc2_node/src/node.rs
-git commit -m "feat(uc2_node): surface equal-version config content divergence instead of silently ignoring it"
+cargo test -p uc_node --lib
+git add uc_node/src/node.rs
+git commit -m "feat(uc_node): surface equal-version config content divergence instead of silently ignoring it"
 ```
 
 ---
@@ -721,7 +721,7 @@ git commit -m "feat(uc2_node): surface equal-version config content divergence i
 ### Task 8: Admin-band single-writer audit
 
 **Files:**
-- Modify: `uc2_log/src/cnc.rs:476,514` (contract comments), `uc2_node/examples/uc2ctl.rs:155-169` (doc), `docs/ops/uc2-runbook.md` §6
+- Modify: `uc_log/src/cnc.rs:476,514` (contract comments), `uc_node/examples/uc2ctl.rs:155-169` (doc), `docs/ops/uc2-runbook.md` §6
 
 No behavior change expected; the audit decides. Writers found up front: `write_admin_req` ← uc2ctl only (external process, line 169); `write_admin_resp` ← consensus agent only (node.rs:2211).
 
@@ -752,7 +752,7 @@ Mirror one-line versions on `write_admin_resp` (single writer = the consensus ag
 
 ```bash
 cargo build --workspace
-git add uc2_log/src/cnc.rs uc2_node/examples/uc2ctl.rs docs/ops/uc2-runbook.md
+git add uc_log/src/cnc.rs uc_node/examples/uc2ctl.rs docs/ops/uc2-runbook.md
 git commit -m "docs(uc2): admin-band single-writer contract pinned at both accessors + runbook (audit: no in-tree second writer)"
 ```
 
@@ -761,15 +761,15 @@ git commit -m "docs(uc2): admin-band single-writer contract pinned at both acces
 ### Task 9: cnc publishes `admission_bytes` + version bump
 
 **Files:**
-- Modify: `uc_protocol/src/v2/cnc.rs:110-124,410-420` (new offset + asserts + offset test), `uc_protocol/src/version.rs:25`, `uc2_log/src/cnc.rs` (accessors + tests, model on `config_version` at 422-435), `uc2_node/src/node.rs:430` (boot write), `uc2_node/examples/uc2ctl.rs:82-91,252-258`
-- Test: offset-pin tests in BOTH uc_protocol and uc2_log; a boot assertion in an existing reconfig.rs test
+- Modify: `uc_protocol/src/v2/cnc.rs:110-124,410-420` (new offset + asserts + offset test), `uc_protocol/src/version.rs:25`, `uc_log/src/cnc.rs` (accessors + tests, model on `config_version` at 422-435), `uc_node/src/node.rs:430` (boot write), `uc_node/examples/uc2ctl.rs:82-91,252-258`
+- Test: offset-pin tests in BOTH uc_protocol and uc_log; a boot assertion in an existing reconfig.rs test
 
 **Interfaces:**
-- Produces: `CNC_OFF_ADMISSION_BYTES: usize = 3712` (uc_protocol); `CncPage::admission_bytes() -> u64` / `store_admission_bytes(u64)` (uc2_log). Zero ⇒ written by a pre-0.3.0 node (reader falls back).
+- Produces: `CNC_OFF_ADMISSION_BYTES: usize = 3712` (uc_protocol); `CncPage::admission_bytes() -> u64` / `store_admission_bytes(u64)` (uc_log). Zero ⇒ written by a pre-0.3.0 node (reader falls back).
 
 - [ ] **Step 1: Write the failing offset tests**
 
-uc_protocol cnc.rs offset test (extend the existing `assert_eq!` block at 414-417): `assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);`. uc2_log cnc.rs: a roundtrip + offset-pin test modeled on the existing config_version test:
+uc_protocol cnc.rs offset test (extend the existing `assert_eq!` block at 414-417): `assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);`. uc_log cnc.rs: a roundtrip + offset-pin test modeled on the existing config_version test:
 
 ```rust
 #[test]
@@ -790,7 +790,7 @@ fn admission_bytes_roundtrip_and_offset_pin() {
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cargo test -p uc_protocol && cargo test -p uc2_log admission_bytes
+cargo test -p uc_protocol && cargo test -p uc_log admission_bytes
 ```
 Expected: FAIL — constant/accessors don't exist.
 
@@ -807,7 +807,7 @@ pub const CNC_OFF_ADMISSION_BYTES: usize = 3712;
 const _: () = assert!(CNC_OFF_ADMISSION_BYTES + 64 <= CNC_PAGE_LEN);
 ```
 
-uc2_log cnc.rs — accessors verbatim on the `config_version` pattern (lines 422-435), named `admission_bytes` / `store_admission_bytes`, offset `CNC_OFF_ADMISSION_BYTES`, same SAFETY comments with `3712`.
+uc_log cnc.rs — accessors verbatim on the `config_version` pattern (lines 422-435), named `admission_bytes` / `store_admission_bytes`, offset `CNC_OFF_ADMISSION_BYTES`, same SAFETY comments with `3712`.
 
 node.rs line 430 area (with the other boot mirrors):
 
@@ -840,7 +840,7 @@ and in `run_status`, before the loop (replacing direct uses of `a.admission_byte
 version.rs line 25: `pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 3, 0);` with a one-line comment: `// 0.3.0: post-M7 follow-ups — cnc admission_bytes @3712, admin reason codes 11/12 (additive).` Then check nothing pins 0.2.0:
 
 ```bash
-grep -rn "0, 2, 0\|0\.2\.0" --include=*.rs uc_protocol uc2_log uc2_node uc2_net | grep -v target
+grep -rn "0, 2, 0\|0\.2\.0" --include=*.rs uc_protocol uc_log uc_node uc_net | grep -v target
 ```
 
 - [ ] **Step 4: Boot assertion in an existing test**
@@ -850,12 +850,12 @@ In reconfig.rs's cluster-spawn settle helper area, extend one existing status-pa
 - [ ] **Step 5: Run tests + commit**
 
 ```bash
-cargo test -p uc_protocol && cargo test -p uc2_log && cargo test -p uc2_node --test reconfig && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p uc_protocol && cargo test -p uc_log && cargo test -p uc_node --test reconfig && cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: PASS.
 
 ```bash
-git add uc_protocol/src/v2/cnc.rs uc_protocol/src/version.rs uc2_log/src/cnc.rs uc2_node/src/node.rs uc2_node/examples/uc2ctl.rs uc2_node/tests/reconfig.rs
+git add uc_protocol/src/v2/cnc.rs uc_protocol/src/version.rs uc_log/src/cnc.rs uc_node/src/node.rs uc_node/examples/uc2ctl.rs uc_node/tests/reconfig.rs
 git commit -m "feat(uc2): node publishes admission_bytes on cnc @3712; uc2ctl reads it; protocol 0.3.0"
 ```
 
@@ -864,8 +864,8 @@ git commit -m "feat(uc2): node publishes admission_bytes on cnc @3712; uc2ctl re
 ### Task 10: Fiat install clears cnc `config_pending`
 
 **Files:**
-- Modify: `uc2_node/src/node.rs:1444` (fiat adopt block in `maybe_adopt_incoming_snapshot`)
-- Test: extend the fiat-routing test in `uc2_node/tests/learner.rs` (the T9 `rebuild_net_for_config` peer-band test — locate: `grep -n "fiat\|adopt_snapshot" uc2_node/tests/learner.rs`)
+- Modify: `uc_node/src/node.rs:1444` (fiat adopt block in `maybe_adopt_incoming_snapshot`)
+- Test: extend the fiat-routing test in `uc_node/tests/learner.rs` (the T9 `rebuild_net_for_config` peer-band test — locate: `grep -n "fiat\|adopt_snapshot" uc_node/tests/learner.rs`)
 
 - [ ] **Step 1: Write the failing assertion**
 
@@ -883,7 +883,7 @@ To make it discriminating, the test must first put the mirror in the pending sta
 - [ ] **Step 2: Run to verify it fails**
 
 ```bash
-cargo test -p uc2_node --test learner -- --nocapture
+cargo test -p uc_node --test learner -- --nocapture
 ```
 Expected: FAIL on the new assertion (fiat path never touches the mirror today).
 
@@ -902,9 +902,9 @@ node.rs, in the fiat block after `self.cnc.store_config_version(cfg.version);` (
 - [ ] **Step 4: Run tests + commit**
 
 ```bash
-cargo test -p uc2_node --test learner
-git add uc2_node/src/node.rs uc2_node/tests/learner.rs
-git commit -m "fix(uc2_node): fiat snapshot install clears the cnc config_pending mirror"
+cargo test -p uc_node --test learner
+git add uc_node/src/node.rs uc_node/tests/learner.rs
+git commit -m "fix(uc_node): fiat snapshot install clears the cnc config_pending mirror"
 ```
 
 ---
@@ -912,7 +912,7 @@ git commit -m "fix(uc2_node): fiat snapshot install clears the cnc config_pendin
 ### Task 11: Codec/cnc/comment minors — ledger (b), (c), (f)
 
 **Files:**
-- Modify: `uc_protocol/src/v2/config.rs` (test module), `uc2_log/src/cnc.rs` (test module), `uc2_consensus/src/election.rs` (`ElectionSm::new` — locate the tracker-sizing line: `grep -n "fn new" uc2_consensus/src/election.rs`)
+- Modify: `uc_protocol/src/v2/config.rs` (test module), `uc_log/src/cnc.rs` (test module), `uc_consensus/src/election.rs` (`ElectionSm::new` — locate the tracker-sizing line: `grep -n "fn new" uc_consensus/src/election.rs`)
 
 - [ ] **Step 1: (b) decode_config minimal-boundary test**
 
@@ -940,7 +940,7 @@ In uc_protocol config.rs tests:
 
 - [ ] **Step 2: (c) admin-band port raw-byte pin**
 
-In uc2_log cnc.rs tests (same page construction as `admin_req_roundtrip_and_seq_discipline`, line 829):
+In uc_log cnc.rs tests (same page construction as `admin_req_roundtrip_and_seq_discipline`, line 829):
 
 ```rust
     #[test]
@@ -974,8 +974,8 @@ At the tracker-construction line inside `ElectionSm::new`, add:
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cargo test -p uc_protocol && cargo test -p uc2_log && cargo test -p uc2_consensus
-git add uc_protocol/src/v2/config.rs uc2_log/src/cnc.rs uc2_consensus/src/election.rs
+cargo test -p uc_protocol && cargo test -p uc_log && cargo test -p uc_consensus
+git add uc_protocol/src/v2/config.rs uc_log/src/cnc.rs uc_consensus/src/election.rs
 git commit -m "test(uc2): ledger minors (b) decode boundary, (c) admin port raw-byte pin, (f) sizing footgun comment"
 ```
 
@@ -984,15 +984,15 @@ git commit -m "test(uc2): ledger minors (b) decode boundary, (c) admin port raw-
 ### Task 12: Sim minors — ledger (g) parked violation, (x) run_until timeout signal
 
 **Files:**
-- Modify: `uc2_sim/src/world.rs:596-640` (`run`, `run_until_leader`, `run_until`, `run_steps`)
-- Modify: `uc2_sim/tests/scenarios.rs` (all `run_until` callers — 25 sites across the two files)
+- Modify: `uc_sim/src/world.rs:596-640` (`run`, `run_until_leader`, `run_until`, `run_steps`)
+- Modify: `uc_sim/tests/scenarios.rs` (all `run_until` callers — 25 sites across the two files)
 
 **Interfaces:**
 - Produces: `run_until(&mut self, pred) -> Result<bool, InvariantViolation>` — `Ok(true)` iff the predicate held. `run`/`run_until_leader`/`run_steps` keep their signatures but gain the entry violation check.
 
 - [ ] **Step 1: Write the failing tests**
 
-In world.rs's test module (or scenarios.rs if world.rs has none — check `grep -n "mod tests" uc2_sim/src/world.rs`):
+In world.rs's test module (or scenarios.rs if world.rs has none — check `grep -n "mod tests" uc_sim/src/world.rs`):
 
 ```rust
 #[test]
@@ -1017,7 +1017,7 @@ fn parked_violation_surfaces_without_a_step() {
 - [ ] **Step 2: Run to verify they fail**
 
 ```bash
-cargo test -p uc2_sim run_until_reports -- --nocapture
+cargo test -p uc_sim run_until_reports -- --nocapture
 ```
 Expected: FAIL — compile error (`Ok(())` is not `bool`) for the first; the second would silently pass today (violation dropped).
 
@@ -1049,22 +1049,22 @@ Add the identical 3-line `pending_violation` entry check to `run` (line 596), `r
 - [ ] **Step 4: Update all callers**
 
 ```bash
-grep -rn "run_until(" uc2_sim | grep -v "fn run_until"
+grep -rn "run_until(" uc_sim | grep -v "fn run_until"
 ```
 For each of the ~25 sites, choose deliberately: where the scenario REQUIRES convergence, `assert!(w.run_until(p)?, "<phase> timed out");` (or `.unwrap()` + assert in non-Result tests); where timeout is genuinely tolerated (e.g. bounded-wait probes followed by their own assertion), `let _ = w.run_until(p)?;` with a one-line comment saying why timeout is acceptable. Do NOT blanket-`let _` — the point of (x) is to force each site to state its intent.
 
 - [ ] **Step 5: Run the full sim suite**
 
 ```bash
-cargo test -p uc2_sim
+cargo test -p uc_sim
 ```
 Expected: PASS. If a scenario NOW fails its new timeout assert, that is (x) doing its job — investigate whether the phase was silently timing out before (fix the scenario's budget or its predicate, and note it in the ledger).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_sim/src/world.rs uc2_sim/tests/scenarios.rs
-git commit -m "fix(uc2_sim): run_until returns timeout signal; run helpers surface parked violations at entry"
+git add uc_sim/src/world.rs uc_sim/tests/scenarios.rs
+git commit -m "fix(uc_sim): run_until returns timeout signal; run helpers surface parked violations at entry"
 ```
 
 ---
@@ -1072,7 +1072,7 @@ git commit -m "fix(uc2_sim): run_until returns timeout signal; run helpers surfa
 ### Task 13: Test minors — ledger (k), (q), (r)
 
 **Files:**
-- Modify: `uc2_node/src/node.rs` test module (k — near the `recover_config_record` unit tests: `grep -n "recover_config_record" uc2_node/src/node.rs`), `uc2_node/tests/reconfig.rs` (q — the self-removal handoff test: `grep -n "monoton" uc2_node/tests/reconfig.rs`), `uc2_consensus/src/election.rs` test module (r)
+- Modify: `uc_node/src/node.rs` test module (k — near the `recover_config_record` unit tests: `grep -n "recover_config_record" uc_node/src/node.rs`), `uc_node/tests/reconfig.rs` (q — the self-removal handoff test: `grep -n "monoton" uc_node/tests/reconfig.rs`), `uc_consensus/src/election.rs` test module (r)
 
 - [ ] **Step 1: (k) T5-revert-then-rederive composition test**
 
@@ -1118,8 +1118,8 @@ fn self_removed_latch_is_tombstone_based_not_absence_based() {
 - [ ] **Step 4: Run + commit**
 
 ```bash
-cargo test -p uc2_node --lib && cargo test -p uc2_node --test reconfig && cargo test -p uc2_consensus
-git add uc2_node/src/node.rs uc2_node/tests/reconfig.rs uc2_consensus/src/election.rs
+cargo test -p uc_node --lib && cargo test -p uc_node --test reconfig && cargo test -p uc_consensus
+git add uc_node/src/node.rs uc_node/tests/reconfig.rs uc_consensus/src/election.rs
 git commit -m "test(uc2): ledger minors (k) revert+rederive composition, (q) strict commit monotonicity, (r) SM-level tombstone-latch pin"
 ```
 
@@ -1128,7 +1128,7 @@ git commit -m "test(uc2): ledger minors (k) revert+rederive composition, (q) str
 ### Task 14: Rename (y) + docs wave (releases.md, CLAUDE.md, runbook, crash-window note)
 
 **Files:**
-- Modify: `uc2_node/tests/lincheck_v2/mod.rs` + `uc2_node/tests/lin_v2.rs` (y), `CLAUDE.md`, `docs/ops/uc2-runbook.md`
+- Modify: `uc_node/tests/lincheck_v2/mod.rs` + `uc_node/tests/lin_v2.rs` (y), `CLAUDE.md`, `docs/ops/uc2-runbook.md`
 - Create: `docs/releases.md`
 
 - [ ] **Step 1: (y) rename `config_ops_committed`**
@@ -1170,8 +1170,8 @@ Wire protocol 0.2.0 (FRAME_TYPE_CONFIG=4, admin datagram kinds 16/17).
 - [ ] **Step 5: Run + commit**
 
 ```bash
-cargo test -p uc2_node --test lin_v2 --release
-git add uc2_node/tests/lincheck_v2/mod.rs uc2_node/tests/lin_v2.rs CLAUDE.md docs/ops/uc2-runbook.md docs/releases.md
+cargo test -p uc_node --test lin_v2 --release
+git add uc_node/tests/lincheck_v2/mod.rs uc_node/tests/lin_v2.rs CLAUDE.md docs/ops/uc2-runbook.md docs/releases.md
 git commit -m "docs(uc2): releases.md w/ v2.0.0 MPSC known-issue; config record in durable lists; crash-window ops note; rename config_ops_accepted (y)"
 ```
 
@@ -1187,13 +1187,13 @@ git commit -m "docs(uc2): releases.md w/ v2.0.0 MPSC known-issue; config record 
 ```bash
 cargo build --workspace
 cargo test
-cargo test -p uc2_node --test lin_v2 --release
-cargo test -p uc2_node --test lin_partition_v2 --release
-cargo test -p uc2-crashtest --features hard-crash-tests
-cargo test -p uc2_service --features ultima_db
+cargo test -p uc_node --test lin_v2 --release
+cargo test -p uc_node --test lin_partition_v2 --release
+cargo test -p uc_crashtest --features hard-crash-tests
+cargo test -p uc_service --features ultima_db
 cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p uc2_node --release --example m7_gate -- all --secs 6
-cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 3
+cargo run -p uc_node --release --example m7_gate -- all --secs 6
+cargo run -p uc_node --release --example m6_gate -- all --secs 6 --cycles 3
 ```
 Expected: ALL PASS / exit 0. Any failure: fix before proceeding (no gate skips).
 

@@ -2,7 +2,7 @@
 
 ## Summary
 
-`uc_node` now stores the Raft log in an `ultima_journal::Journal` opened (by default)
+`uc_node` now stores the Raft log in an `uc_journal::Journal` opened (by default)
 with `Durability::Eventual`: an append is acknowledged to openraft at the **page-cache
 write**, with fsync running asynchronously in the journal's background writer — off the
 commit critical path. Cluster durability is provided by **quorum replication** (an entry
@@ -62,6 +62,6 @@ needs the `aeron-vs-uc` harness (single-node tmpfs vs real-disk, in-flight concu
 sweep); if the ~38 ms window only partly collapses, `committed` / `output_progress` are the
 next candidates.
 
-Note: `ultima_journal::JournalConfig::new` still defaults to `Consistent`; the Eventual
+Note: `uc_journal::JournalConfig::new` still defaults to `Consistent`; the Eventual
 default is applied at the `JournalLogStorage::open` layer (uc_node), so the two layers have
 intentionally different defaults.

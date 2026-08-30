@@ -3,15 +3,15 @@
 
 //! M9: the service half's signal discipline.
 //!
-//! Lives in the `counter` package, not `uc2_node`, because cargo sets
+//! Lives in the `counter` package, not `uc_node`, because cargo sets
 //! `CARGO_BIN_EXE_<name>` only for the package that DEFINES the binary — a test
-//! in `uc2_node` can never see `counter-service`. Ruling 1 in the M9 plan. The
-//! node half's own signal handling is covered by `uc2_node/tests/lifecycle.rs`.
+//! in `uc_node` can never see `counter-service`. Ruling 1 in the M9 plan. The
+//! node half's own signal handling is covered by `uc_node/tests/lifecycle.rs`.
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-/// Distinct from every port used by `uc2_node/tests/lifecycle.rs` — these
+/// Distinct from every port used by `uc_node/tests/lifecycle.rs` — these
 /// suites can run concurrently.
 const PORT: u16 = 19711;
 

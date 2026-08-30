@@ -20,9 +20,9 @@ The `m*_gate` example binaries run the milestone scenarios and exit 1 on an
 honest failure, so a zero exit is the pass signal.
 
 ```bash
-cargo run -p uc2_node --release --example m5_gate -- all
-cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5
-cargo run -p uc2_node --release --example m7_gate -- all --secs 6
+cargo run -p uc_node --release --example m5_gate -- all
+cargo run -p uc_node --release --example m6_gate -- all --secs 6 --cycles 5
+cargo run -p uc_node --release --example m7_gate -- all --secs 6
 ```
 
 Put journals on a real disk. The gates guard against `/tmp` because a journal on
@@ -54,9 +54,9 @@ directory is the authority, not the console.
 
 ```bash
 cargo test                                        # in-process integration + sim
-cargo test -p uc2_node --test lin_v2              # linearizability under failover + purge churn
-cargo test -p uc2_node --test lin_partition_v2    # partition and quorum loss
-cargo test -p uc2-crashtest --features hard-crash-tests   # multi-process SIGKILL
+cargo test -p uc_node --test lin_v2              # linearizability under failover + purge churn
+cargo test -p uc_node --test lin_partition_v2    # partition and quorum loss
+cargo test -p uc_crashtest --features hard-crash-tests   # multi-process SIGKILL
 scripts/elle_check.sh                             # transactional safety (needs java + jq)
 (cd proofs && lake exe cache get && lake build)   # Lean proofs
 ```

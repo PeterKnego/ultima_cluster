@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use counter::CounterSm;
-use uc2_service::{ServiceBuilder, ServiceConfig};
+use uc_service::{ServiceBuilder, ServiceConfig};
 
 #[derive(Parser)]
 #[command(about = "Runs the counter state machine against a local node")]

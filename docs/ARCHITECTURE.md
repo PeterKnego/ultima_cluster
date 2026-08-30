@@ -123,11 +123,11 @@ The Raft concepts survive, re-expressed:
 ## Process shape
 
 ```
-[client process]  ──shmem──▶  [uc2_node]  ◀──reliable UDP──▶  [uc2_node on peer host]
+[client process]  ──shmem──▶  [uc_node]  ◀──reliable UDP──▶  [uc_node on peer host]
                                   ▲
                                   │ shmem (file-backed log buffer + cnc page)
                                   ▼
-                             [uc2_service]   ← your StateMachine lives here
+                             [uc_service]   ← your StateMachine lives here
 ```
 
 Three process roles share an instance directory. The separation costs nothing,
@@ -150,7 +150,7 @@ locks, no wakeups on the hot path.
 | **consensus** | The only "brain." Polls the client ingress ring, validates the session, performs **one append** per message. Drains control messages. Once per duty cycle, ranks reported durable positions and advances commit. Runs the election state machine |
 | **sender** | Scans the log buffer from `sent_position`, packs complete frames MTU-full, fans the identical datagram out to every follower (one scan, N sends, `sendmmsg`). Serves NAK retransmits by re-reading the buffer |
 | **receiver** | Receives datagrams. Log frames are written at their position offset; control frames go to consensus over an SPSC ring |
-| **archive** | Polls the buffer from `durable_position`, block-writes ≤1 MiB to `ultima_journal`, one `fdatasync` per block, then advances the durable counter. **The only fsync site in the system** |
+| **archive** | Polls the buffer from `durable_position`, block-writes ≤1 MiB to `uc_journal`, one `fdatasync` per block, then advances the durable counter. **The only fsync site in the system** |
 
 Each counter has exactly one writer, which is what lets the fast path use plain
 stores plus a single release-store commit word. Each also sits on its own
@@ -234,7 +234,7 @@ and gossips `CommitPosition`. Followers apply up to `min(commit, local contiguou
 durable)`.
 
 **Elections are Raft's safety core, expressed over positions**, and live entirely
-inside `uc2_consensus` as a pure, synchronous, deterministic state machine: no I/O,
+inside `uc_consensus` as a pure, synchronous, deterministic state machine: no I/O,
 no threads, no clock. Time is injected. The agent performs the I/O; the state
 machine only emits actions.
 
@@ -297,7 +297,7 @@ oneshots — the client matcher correlates off the ring.
   `(marker, commit]`. Monotonic persistence can only widen the replay, so
   at-least-once holds.
 
-`uc2_service` ships an optional adapter for
+`uc_service` ships an optional adapter for
 [`ultima-db`](https://crates.io/crates/ultima-db) behind the `ultima_db` feature,
 if you want a transactional store as your state machine rather than hand-rolling
 one.
@@ -333,27 +333,27 @@ can forge fan-out traffic as any node. See runbook §11.
 | Crate | Role |
 |---|---|
 | `uc_protocol` | Wire spec: cnc page layout, datagram/frame formats, lock-free rings (SPSC/MPSC/broadcast) |
-| `uc2_log` | Shared log buffer + archive agent (journal recording, snapshots, purge floor) |
-| `uc2_net` | Reliable-UDP sender/receiver agents, NAK repair, flow control, snapshot sessions |
-| `uc2_consensus` | Pure-sync safety core: commit tracker, elections, term maps, truncation |
-| `uc2_crypto` | Opt-in node-to-node wire crypto (M8, off by default): Noise `IK` handshake, AES-256-GCM over the datagram envelope, rotating group key, anti-replay; plus the M12b admin-request HMAC |
-| `uc2_sim` | Deterministic simulation + invariants + fuzz |
-| `uc2_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
-| `uc2_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
-| `uc2_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14) |
-| `uc2_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `RemoteSendHalf`/`RemotePollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
-| `uc2_gateway` | The `Edge`: a per-node TCP front door relaying `uc2_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
-| `uc-lincheck` | WGL linearizability checker + history recorder + register model |
-| `ultima_journal` | Segmented append journal + atomic `StableValue`s |
+| `uc_log` | Shared log buffer + archive agent (journal recording, snapshots, purge floor) |
+| `uc_net` | Reliable-UDP sender/receiver agents, NAK repair, flow control, snapshot sessions |
+| `uc_consensus` | Pure-sync safety core: commit tracker, elections, term maps, truncation |
+| `uc_crypto` | Opt-in node-to-node wire crypto (M8, off by default): Noise `IK` handshake, AES-256-GCM over the datagram envelope, rotating group key, anti-replay; plus the M12b admin-request HMAC |
+| `uc_sim` | Deterministic simulation + invariants + fuzz |
+| `uc_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
+| `uc_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
+| `uc_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14) |
+| `uc_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `RemoteSendHalf`/`RemotePollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
+| `uc_gateway` | The `Edge`: a per-node TCP front door relaying `uc_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
+| `uc_lincheck` | WGL linearizability checker + history recorder + register model |
+| `uc_journal` | Segmented append journal + atomic `StableValue`s |
 
 Builds standalone — the only external storage dep,
 [`ultima-db`](https://crates.io/crates/ultima-db), comes from crates.io.
 
 **Published to crates.io:** twelve crates, prepared and gated in CI,
 published **in lockstep at one version** — which is also the git tag, the
-tarball name and the image tag. That is the thirteen crates in the table above, minus `uc2_sim` and
-`uc-lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row
-here). `uc2_sim`, `uc-lincheck` and the two example crates are
+tarball name and the image tag. That is the thirteen crates in the table above, minus `uc_sim` and
+`uc_lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row
+here). `uc_sim`, `uc_lincheck` and the two example crates are
 `publish = false`: proof and teaching apparatus, not product. What that
 version number promises, and what it deliberately does not, is
 [the semver policy](reference/semver-policy.md).

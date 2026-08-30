@@ -35,7 +35,7 @@ the two gate binaries — spec §9.6's M7 fleet-gate row explicitly reuses them)
                  `Host.probe()` already reads a remote node's cnc.
 
   --read-profile : NOT a gate — an INSTRUMENT. A 3-host read_profile ladder
-                 (`uc2_node/examples/read_profile.rs`; design spec
+                 (`uc_node/examples/read_profile.rs`; design spec
                  `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`,
                  plan Task 7): one `node` + one `service` per host, the
                  measuring `client` on the leader's host (the query ring is
@@ -108,7 +108,7 @@ M7_JOURNAL_SEGMENT_BYTES = 16 * 1024
 M7_SNAPSHOT_INTERVAL_BYTES = 32 * 1024
 
 # Journal durability guard. Each node's instance dir CONTAINS its journal
-# (uc2_node InstanceDir::journal_dir() lives under it), so an instance dir on a
+# (uc_node InstanceDir::journal_dir() lives under it), so an instance dir on a
 # RAM-backed filesystem makes fsync a no-op and every durability number this
 # gate produces fiction. Deny-list volatile fs types rather than allow-listing
 # ext4 (xfs & friends must still pass). `stat -f -c %T` reports e.g.
@@ -345,7 +345,7 @@ class SshHost:
         Idempotent; ~9 s on a warm target per example."""
         example_flags = " ".join(f"--example {e}" for e in examples)
         env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
-        # `uc2ctl` is its own workspace crate (a real bin, not a uc2_node
+        # `uc2ctl` is its own workspace crate (a real bin, not a uc_node
         # example), so it needs a second `-p` build; its artifact lands in
         # target/release/ rather than target/release/examples/.
         bin_build = (
@@ -356,7 +356,7 @@ class SshHost:
         r = self._ssh(
             f"{env} "
             f"{self.CARGO} build --release {example_flags} "
-            f"--manifest-path {self.UC_SRC}/Cargo.toml -p uc2_node "
+            f"--manifest-path {self.UC_SRC}/Cargo.toml -p uc_node "
             f"{bin_build} "
             f"&& sudo mkdir -p {self.remote_root} "
             f"&& echo FSTYPE=$(stat -f -c %T {self.remote_root}) && echo PREPARED",
@@ -1231,7 +1231,7 @@ def run_gate_m7(hosts, members_seed, stop_file):
 # --------------------------------------------------------- read-profile mode
 #
 # `--read-profile` runs the linearizable-read profile ladder of
-# `uc2_node/examples/read_profile.rs` across 3 hosts (one `node` + one
+# `uc_node/examples/read_profile.rs` across 3 hosts (one `node` + one
 # `service` per host, the measuring `client` on the leader's host because the
 # query ring is same-host shared memory). Design:
 # `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`; plan Task 7.

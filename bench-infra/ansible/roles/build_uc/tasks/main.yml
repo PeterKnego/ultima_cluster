@@ -11,7 +11,7 @@
   when: uc_src_mode == "rsync"
 
 # OPT-IN (ud_sync, default false). NOT needed for a normal build: ultima-db
-# resolves from crates.io and ultima_journal is an in-tree workspace member, so
+# resolves from crates.io and uc_journal is an in-tree workspace member, so
 # the workspace builds standalone — verified on the 2026-07-26 read-profile
 # fleet run, where this task failed on all three hosts and every cargo build
 # still succeeded.
@@ -41,7 +41,7 @@
     version: "{{ uc_git_ref }}"
   when: uc_src_mode == "git"
 
-# UC v2 gate binaries are cargo examples under uc2_node (release builds no examples
+# UC v2 gate binaries are cargo examples under uc_node (release builds no examples
 # by default, so name them explicitly). m6_gate carries node/service/learner/probe/
 # loadclient roles; m5_gate is the throughput gate. The python gate orchestrators
 # (scripts/m6_fleet_gate.py) also self-build the example on each host, so this both
@@ -49,7 +49,7 @@
 - name: Build UC v2 gate example binaries
   ansible.builtin.command: >
     {{ remote_home }}/.cargo/bin/cargo build --release
-    -p uc2_node --example m5_gate --example m6_gate
+    -p uc_node --example m5_gate --example m6_gate
   args:
     chdir: "{{ uc_src_dir }}"
   environment:

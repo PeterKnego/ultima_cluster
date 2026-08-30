@@ -4,9 +4,9 @@
 
 **Goal:** make a running cluster observable without touching its hot path — an in-daemon `/metrics` endpoint over the cnc page the daemon already holds, transition-triggered structured log records, role-aware liveness/readiness probes that never route traffic to an elected-but-not-serving leader, and shipped Prometheus alert rules + a Grafana dashboard, each rule proven to fire.
 
-**Architecture:** one new module tree, `uc2_node/src/obs/`, and nothing else structural. `obs::log` is a zero-dependency JSON-lines emitter with a global level filter; transition records are emitted at the consensus `exec` sites (all of which already live in `uc2_node`) and derived edge-triggered from counters in the daemon's existing 100 ms poll loop for events owned by other crates (NAK storms, seal failures) — no other crate is touched for logging. `obs::metrics` renders Prometheus text from an `ObsSources` bundle of `Arc` clones the `Node` already holds (cnc page, sender/receiver stats, truncation/wipe counters, agent-health flags). `obs::http` is a hand-rolled `std::net` GET-only responder on its own thread serving `/metrics`, `/healthz`, `/readyz` — no tokio, no HTTP crate (none exists in the tree, and the M9 daemon is fully synchronous). The M9-reserved `[log]`/`[metrics]` config sections gain their schema, replacing the presence-only `ReservedSections` plumbing.
+**Architecture:** one new module tree, `uc_node/src/obs/`, and nothing else structural. `obs::log` is a zero-dependency JSON-lines emitter with a global level filter; transition records are emitted at the consensus `exec` sites (all of which already live in `uc_node`) and derived edge-triggered from counters in the daemon's existing 100 ms poll loop for events owned by other crates (NAK storms, seal failures) — no other crate is touched for logging. `obs::metrics` renders Prometheus text from an `ObsSources` bundle of `Arc` clones the `Node` already holds (cnc page, sender/receiver stats, truncation/wipe counters, agent-health flags). `obs::http` is a hand-rolled `std::net` GET-only responder on its own thread serving `/metrics`, `/healthz`, `/readyz` — no tokio, no HTTP crate (none exists in the tree, and the M9 daemon is fully synchronous). The M9-reserved `[log]`/`[metrics]` config sections gain their schema, replacing the presence-only `ReservedSections` plumbing.
 
-**Tech Stack:** Rust workspace (edition 2024), `uc2_node` only (obs modules, config schema, daemon wiring, gate), `uc2_log` (one small `AgentRunner` addition: a shared finished-flag), `serde`+`toml` (config), `std::net::TcpListener` (exporter), hand-formatted JSON (no `serde_json` — it is not in the workspace and the records are flat scalars). Alert-rule verification uses `promtool` (external, like elle needs `java`+`jq`).
+**Tech Stack:** Rust workspace (edition 2024), `uc_node` only (obs modules, config schema, daemon wiring, gate), `uc_log` (one small `AgentRunner` addition: a shared finished-flag), `serde`+`toml` (config), `std::net::TcpListener` (exporter), hand-formatted JSON (no `serde_json` — it is not in the workspace and the records are flat scalars). Alert-rule verification uses `promtool` (external, like elle needs `java`+`jq`).
 
 **Spec:** `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md` §5 (M10), §1 (locked decisions: in-daemon endpoint over cnc attach, no sidecar), §3 (non-goals).
 
@@ -17,7 +17,7 @@ Copied from the spec and CLAUDE.md house rules. Every task's requirements implic
 - **No consensus, wire-protocol, or cnc-layout changes.** M10 reads the page; it adds no field and moves no offset. If a task appears to need a new cnc field, stop — derive the series from what is there or from an existing accessor (spec §3).
 - **The four polling agents must not take an allocation per record.** Transition-triggered logging only: elections, truncations, snapshot installs, config transitions, NAK storms, seal failures, fail-stops. One structured record per transition, never one per operation. A counter increment is not a log site.
 - **The scrape must not perturb the hot path.** The exporter thread reads atomics with `load_acquire` and never takes a lock the agents hold (there is none to take — every cnc field is a padded atomic with one writer). The gate proves this with a fleet A/B rather than assuming it (spec §5).
-- **No tokio in `uc2_node`.** The exporter is a plain blocking thread over `std::net`. No async runtime, no HTTP dependency.
+- **No tokio in `uc_node`.** The exporter is a plain blocking thread over `std::net`. No async runtime, no HTTP dependency.
 - **`deny_unknown_fields` on every config struct** — including the new `[log]` and `[metrics]` sections. M10 defines their schema; from now on a typo inside them is a startup refusal naming the key (M9 explicitly documented their contents as unvalidated-until-M10).
 - **Readiness keys on `can_serve`, not the leader flag.** `flags == 0x01` (elected, NewTerm not yet quorum-committed) must read NOT ready (spec §5).
 - **Existing daemon output stays character-compatible.** The quickstart pins `uc2-node: node 0 is now LEADER (term 1)` — those lines stay. Structured records are additional lines on stderr.
@@ -30,24 +30,24 @@ Copied from the spec and CLAUDE.md house rules. Every task's requirements implic
 
 | File | Responsibility |
 |---|---|
-| `uc2_node/src/obs/mod.rs` (new) | Module root; re-exports `log`, `metrics`, `http`, `ObsSources`. |
-| `uc2_node/src/obs/log.rs` (new) | Level filter, sink, JSON-line formatting, `emit` + `obs_event!` macro. Zero deps. |
-| `uc2_node/src/obs/metrics.rs` (new) | `render_prometheus(&ObsSources) -> String`. Pure function, no I/O. |
-| `uc2_node/src/obs/http.rs` (new) | `ObsServer::serve(sources, bind)` — the blocking GET responder thread; `/metrics`, `/healthz`, `/readyz`. |
-| `uc2_node/src/node.rs` (modify) | `ObsSources` struct + `Node::observability()`; transition-record emission at the `exec` sites; a `last_flags` edge in `publish_status`. Nothing else. |
-| `uc2_log/src/agent.rs` (modify) | `AgentRunner` gains a shared `finished: Arc<AtomicBool>` set by a drop-guard in the worker thread (panic included) + `finished_flag()` accessor. |
-| `uc2_node/src/config_file.rs` (modify) | Typed `[log]`/`[metrics]` sections replacing the raw `toml::Table` capture. |
-| `uc2_node/src/preflight.rs` (modify) | `ObsOptions` on `StartupOptions`; `ReservedSections` retired. |
-| `uc2_node/src/bin/uc2-node.rs` (modify) | Set log level, start/stop `ObsServer`, agent fail-stop detection, counter-derived NAK-storm/seal-failure/snapshot-published records in the poll loop. |
-| `uc2_node/tests/obs_log.rs` (new) | Integration: election + truncation records from a real in-process cluster. |
-| `uc2_node/tests/obs_http.rs` (new) | Integration: endpoint routing, probe semantics (incl. the 0x01 case via `CncPage::heap`), coverage of the series contract. |
-| `uc2_node/tests/lifecycle.rs` (modify) | RESERVED-notice test replaced by acts-on-`[log]`/`[metrics]` tests. |
+| `uc_node/src/obs/mod.rs` (new) | Module root; re-exports `log`, `metrics`, `http`, `ObsSources`. |
+| `uc_node/src/obs/log.rs` (new) | Level filter, sink, JSON-line formatting, `emit` + `obs_event!` macro. Zero deps. |
+| `uc_node/src/obs/metrics.rs` (new) | `render_prometheus(&ObsSources) -> String`. Pure function, no I/O. |
+| `uc_node/src/obs/http.rs` (new) | `ObsServer::serve(sources, bind)` — the blocking GET responder thread; `/metrics`, `/healthz`, `/readyz`. |
+| `uc_node/src/node.rs` (modify) | `ObsSources` struct + `Node::observability()`; transition-record emission at the `exec` sites; a `last_flags` edge in `publish_status`. Nothing else. |
+| `uc_log/src/agent.rs` (modify) | `AgentRunner` gains a shared `finished: Arc<AtomicBool>` set by a drop-guard in the worker thread (panic included) + `finished_flag()` accessor. |
+| `uc_node/src/config_file.rs` (modify) | Typed `[log]`/`[metrics]` sections replacing the raw `toml::Table` capture. |
+| `uc_node/src/preflight.rs` (modify) | `ObsOptions` on `StartupOptions`; `ReservedSections` retired. |
+| `uc_node/src/bin/uc2-node.rs` (modify) | Set log level, start/stop `ObsServer`, agent fail-stop detection, counter-derived NAK-storm/seal-failure/snapshot-published records in the poll loop. |
+| `uc_node/tests/obs_log.rs` (new) | Integration: election + truncation records from a real in-process cluster. |
+| `uc_node/tests/obs_http.rs` (new) | Integration: endpoint routing, probe semantics (incl. the 0x01 case via `CncPage::heap`), coverage of the series contract. |
+| `uc_node/tests/lifecycle.rs` (modify) | RESERVED-notice test replaced by acts-on-`[log]`/`[metrics]` tests. |
 | `packaging/node.example.toml` (modify) | Real, annotated `[log]`/`[metrics]` sections replace the RESERVED block. |
 | `packaging/prometheus/uc2-alerts.yml` (new) | The shipped alert rules. |
 | `packaging/grafana/uc2-dashboard.json` (new) | The shipped dashboard. |
-| `uc2_node/examples/m10_alerts.rs` (new) | Scenario driver: breaks real clusters, scrapes real `/metrics`, writes `promtool test rules` inputs. |
+| `uc_node/examples/m10_alerts.rs` (new) | Scenario driver: breaks real clusters, scrapes real `/metrics`, writes `promtool test rules` inputs. |
 | `scripts/m10_alert_fire.sh` (new) | Orchestrates: run the driver, run `promtool`, one PASS/FAIL per rule. |
-| `uc2_node/examples/m10_gate.rs` (new) | The pre-committed gate: coverage row + probe-regime row + local perturbation smoke. |
+| `uc_node/examples/m10_gate.rs` (new) | The pre-committed gate: coverage row + probe-regime row + local perturbation smoke. |
 | `docs/benchmarks/uc2-m10-gate-2026-08-19.md` (new) | Gate doc — decide rule pre-committed before any run. |
 | `docs/reference/configuration.md`, `docs/how-to/monitor-a-cluster.md` (new), `docs/how-to/README.md`, `docs/ops/uc2-runbook.md`, `docs/how-to/diagnose-a-node.md` (modify) | Documentation cutover. |
 
@@ -55,20 +55,20 @@ Copied from the spec and CLAUDE.md house rules. Every task's requirements implic
 
 | Seam | Where |
 |---|---|
-| Cnc attach, read-only, cross-process proven | `uc2_log/src/cnc.rs:357` `CncPage::open_file(path, expected_app_id) -> Result<Arc<CncPage>, CncError>`; validates magic/CRC/version/app_id. `uc2ctl/src/main.rs:222-225` uses exactly this while the node writes — the concurrent-reader pattern. |
+| Cnc attach, read-only, cross-process proven | `uc_log/src/cnc.rs:357` `CncPage::open_file(path, expected_app_id) -> Result<Arc<CncPage>, CncError>`; validates magic/CRC/version/app_id. `uc_ctl/src/main.rs:222-225` uses exactly this while the node writes — the concurrent-reader pattern. |
 | Cnc getters | `cnc.rs:385` `counters() -> &LogCounters` (append/durable/sent/commit); `:397` `service() -> &ServiceProgress` (service_applied/service_epoch/output_completed); `:403` `status() -> &NodeStatusV2` (term/flags/leader_hint/node_heartbeat_ns/service_heartbeat_ns/output_progress); `:409` `snapshots() -> &SnapshotSlots` (service_snapshot_pos/node_snapshot_floor/incoming_snapshot_pos); `:417` `archive_first_base()`; `:424` `peer_slot(i)` (8 slots; `id_and_role` = id<<8\|role, 0 = unoccupied; `reported_durable`, `advertised_limit`, `naks_plus_replay` — the last is dormant since M6, do not export it, use sender/receiver stats instead); `:433` `config_version()`; `:480` `config_pending()`; `:450` `admission_bytes()`; `:466` `seal_failures()`; `:378` `CncPage::heap(meta)` (synthetic page for tests). All fields are `PaddedAtomicU64` read with `load_acquire()`. |
-| Node flags | `uc_protocol/src/v2/cnc.rs:147-148` `NODE_FLAG_LEADER = 1`, `NODE_FLAG_CAN_SERVE = 2`. `flags == 1` IS the elected-not-serving state (no separate constant). Written by `Node::publish_status`, `uc2_node/src/node.rs:2706-2731`. |
+| Node flags | `uc_protocol/src/v2/cnc.rs:147-148` `NODE_FLAG_LEADER = 1`, `NODE_FLAG_CAN_SERVE = 2`. `flags == 1` IS the elected-not-serving state (no separate constant). Written by `Node::publish_status`, `uc_node/src/node.rs:2706-2731`. |
 | Node observability accessors (existing) | `node.rs:1211` `is_leader`, `:1215` `can_serve`, `:1219` `current_term`, `:1223` `counters`, `:1230` `service_applied`, `:1238` `archive_first_base`, `:1286` `crypto_handshake_failures`, `:1292` `reports_unattested`, `:1303` `crypto_stats() -> &FollowerStats`, `:1311` `config_version`, `:1364` `truncations`, `:1370` `wipes`, `:1379` `replay_datagrams`, `:1388` `reports_implausible`. |
-| Stats structs | `uc2_net/src/sender.rs:171-222` `SenderStats` (all `AtomicU64`): `datagrams, bytes, naks_served, heartbeats, flow_stalls, overruns, replay_datagrams, naks_dropped, naks_rejected, snap_sessions, snap_chunks, snap_chunk_naks, seal_failures`. `uc2_net/src/receiver.rs:365-466` `FollowerStats`: `datagrams, bytes, dropped_stale_term, dropped_dup, dropped_overrun, dropped_malformed, dropped_gated, net_drops[], naks_sent, statuses_sent, append_positions_sent, truncation_resyncs, term_change_discards, counter_ahead_resyncs, dropped_straddle, dropped_auth_failed, dropped_replay, dropped_unknown_epoch, peer_appears_cleartext, dropped_unknown_peer, dropped_handshake, seal_failures`. Node holds them as `Arc`: `node.rs:373` `route_drops`, `:377` `sender_stats`. **The spec's `append_pos_unknown_source` does not exist by that name — it is `FollowerStats::dropped_unknown_peer`.** |
+| Stats structs | `uc_net/src/sender.rs:171-222` `SenderStats` (all `AtomicU64`): `datagrams, bytes, naks_served, heartbeats, flow_stalls, overruns, replay_datagrams, naks_dropped, naks_rejected, snap_sessions, snap_chunks, snap_chunk_naks, seal_failures`. `uc_net/src/receiver.rs:365-466` `FollowerStats`: `datagrams, bytes, dropped_stale_term, dropped_dup, dropped_overrun, dropped_malformed, dropped_gated, net_drops[], naks_sent, statuses_sent, append_positions_sent, truncation_resyncs, term_change_discards, counter_ahead_resyncs, dropped_straddle, dropped_auth_failed, dropped_replay, dropped_unknown_epoch, peer_appears_cleartext, dropped_unknown_peer, dropped_handshake, seal_failures`. Node holds them as `Arc`: `node.rs:373` `route_drops`, `:377` `sender_stats`. **The spec's `append_pos_unknown_source` does not exist by that name — it is `FollowerStats::dropped_unknown_peer`.** |
 | Node Arc counters | `node.rs:355` `truncations: Arc<AtomicU64>`, `:359` `wipes: Arc<AtomicU64>` — cloneable into `ObsSources`. The crypto counters (`reports_unattested` etc.) are likewise `Arc<AtomicU64>` fields; verify at the field definitions when building the bundle. |
-| Transition sites (all in `uc2_node/src/node.rs`, `fn exec` at `:3587`) | `Action::BecomeLeader` arm `:3621-3671` (`term`, `base` in scope); `Action::BecomeFollower` arm `:3672-3696` (`term`, `leader: Option<NodeId>`); `Action::Truncate` arm `:3731-3801` (`epoch`, `to`); `Action::CountWipe` `:3810-3815`; `Action::ConfigAdopted` arm `:3816-3877` (`position`, `config.version`, `prev_position`); `Action::HaltRemoved` `:3878-3884` and `Action::StepDownRemoved` `:3885-3895` (already `eprintln!` — convert); incoming snapshot adoption `fn maybe_adopt_incoming_snapshot` `:2527-2598` (`pos` in scope; currently fully silent). |
-| Agent lifecycle | `uc2_log/src/agent.rs:47` `AgentRunner::spawn(name, idle, work)`; `:69` `is_finished()` (true mid-run == the closure panicked); `:75` `stop()` joins and **re-raises** a panic; `Drop` (`:84-90`) swallows it. `Node.agents: Vec<AgentRunner>` (`node.rs:408`) is private — the daemon cannot currently see a mid-run agent death; M10 closes this. Agent names at spawn sites: `"uc2-archive"` `:896`, sender `:1085`, receiver `:1087`, `"uc2-consensus"` `:1181` (read the sites for the exact sender/receiver names). |
-| Config file seam | `uc2_node/src/config_file.rs:98,:101` `log: Option<toml::Table>`, `metrics: Option<toml::Table>` (presence-only today); `:141` `pub fn load_from_path(path) -> Result<(NodeConfig, StartupOptions), ConfigError>`; `:186` builds `ReservedSections`. `uc2_node/src/preflight.rs:150-163` `StartupOptions`, `:182-208` `ReservedSections` (to be retired). |
-| Daemon loop | `uc2_node/src/bin/uc2-node.rs:90-102` — 100 ms poll, `was_leader` edge-detection, then `stop_draining`. The obs server starts before this loop and stops after it. |
-| Reserved-notice tests to replace | `uc2_node/tests/lifecycle.rs:313` `daemon_starts_and_announces_the_m10_reserved_sections` (asserts `RESERVED`/`NO effect`/`[log]`/`[metrics]` substrings). Daemon-spawn pattern: `env!("CARGO_BIN_EXE_uc2-node")`, `daemon_config` helper `:153`, SIGTERM via `libc::kill`, assert on piped stderr. |
-| In-process cluster pattern | `uc2_node/tests/failover.rs` — `spawn_cluster_ring(n, buffer_bytes)`, `NodeH`, `await_single_leader`, `await_serving_among`, `submit_n`, `partition(a, b)` (`:405`). Test files are separate crates: copy the minimal helpers you need, do not import across test files. |
-| Example config pin | `the_packaged_example_config_is_valid` (in `uc2_node`'s tests) asserts `packaging/node.example.toml` loads and passes preflight — keep it green when editing the example. |
-| Heartbeat clocks | Both heartbeats are unix nanoseconds: node side `publish_status` (`node.rs:2730`), service side `uc2_service/src/apply.rs:184,:271`. Age = `SystemTime::now()` unix ns minus the field. |
+| Transition sites (all in `uc_node/src/node.rs`, `fn exec` at `:3587`) | `Action::BecomeLeader` arm `:3621-3671` (`term`, `base` in scope); `Action::BecomeFollower` arm `:3672-3696` (`term`, `leader: Option<NodeId>`); `Action::Truncate` arm `:3731-3801` (`epoch`, `to`); `Action::CountWipe` `:3810-3815`; `Action::ConfigAdopted` arm `:3816-3877` (`position`, `config.version`, `prev_position`); `Action::HaltRemoved` `:3878-3884` and `Action::StepDownRemoved` `:3885-3895` (already `eprintln!` — convert); incoming snapshot adoption `fn maybe_adopt_incoming_snapshot` `:2527-2598` (`pos` in scope; currently fully silent). |
+| Agent lifecycle | `uc_log/src/agent.rs:47` `AgentRunner::spawn(name, idle, work)`; `:69` `is_finished()` (true mid-run == the closure panicked); `:75` `stop()` joins and **re-raises** a panic; `Drop` (`:84-90`) swallows it. `Node.agents: Vec<AgentRunner>` (`node.rs:408`) is private — the daemon cannot currently see a mid-run agent death; M10 closes this. Agent names at spawn sites: `"uc2-archive"` `:896`, sender `:1085`, receiver `:1087`, `"uc2-consensus"` `:1181` (read the sites for the exact sender/receiver names). |
+| Config file seam | `uc_node/src/config_file.rs:98,:101` `log: Option<toml::Table>`, `metrics: Option<toml::Table>` (presence-only today); `:141` `pub fn load_from_path(path) -> Result<(NodeConfig, StartupOptions), ConfigError>`; `:186` builds `ReservedSections`. `uc_node/src/preflight.rs:150-163` `StartupOptions`, `:182-208` `ReservedSections` (to be retired). |
+| Daemon loop | `uc_node/src/bin/uc2-node.rs:90-102` — 100 ms poll, `was_leader` edge-detection, then `stop_draining`. The obs server starts before this loop and stops after it. |
+| Reserved-notice tests to replace | `uc_node/tests/lifecycle.rs:313` `daemon_starts_and_announces_the_m10_reserved_sections` (asserts `RESERVED`/`NO effect`/`[log]`/`[metrics]` substrings). Daemon-spawn pattern: `env!("CARGO_BIN_EXE_uc2-node")`, `daemon_config` helper `:153`, SIGTERM via `libc::kill`, assert on piped stderr. |
+| In-process cluster pattern | `uc_node/tests/failover.rs` — `spawn_cluster_ring(n, buffer_bytes)`, `NodeH`, `await_single_leader`, `await_serving_among`, `submit_n`, `partition(a, b)` (`:405`). Test files are separate crates: copy the minimal helpers you need, do not import across test files. |
+| Example config pin | `the_packaged_example_config_is_valid` (in `uc_node`'s tests) asserts `packaging/node.example.toml` loads and passes preflight — keep it green when editing the example. |
+| Heartbeat clocks | Both heartbeats are unix nanoseconds: node side `publish_status` (`node.rs:2730`), service side `uc_service/src/apply.rs:184,:271`. Age = `SystemTime::now()` unix ns minus the field. |
 
 ## The series contract
 
@@ -77,31 +77,31 @@ The single source of truth for `/metrics`. Task 5 implements it, Task 6 serves i
 | Series | Type | Source |
 |---|---|---|
 | `uc2_build_info{version}` | gauge (const 1) | `env!("CARGO_PKG_VERSION")` |
-| `uc2_node_id` | gauge | `ObsSources::node_id` |
+| `uc_node_id` | gauge | `ObsSources::node_id` |
 | `uc2_is_leader` | gauge 0/1 | `status().flags & NODE_FLAG_LEADER` |
 | `uc2_can_serve` | gauge 0/1 | `status().flags & NODE_FLAG_CAN_SERVE` |
 | `uc2_term` | gauge | `status().term` |
 | `uc2_leader_hint` | gauge | `status().leader_hint`; **omit the series when it reads `u64::MAX`** (unknown) |
 | `uc2_config_version` | gauge | `config_version()` |
 | `uc2_config_pending` | gauge 0/1 | `config_pending()` |
-| `uc2_crypto_enabled` / `uc2_purge_enabled` | gauge 0/1 | `ObsSources` bools (from `NodeConfig`) |
+| `uc_crypto_enabled` / `uc2_purge_enabled` | gauge 0/1 | `ObsSources` bools (from `NodeConfig`) |
 | `uc2_admission_bytes` / `uc2_journal_segment_bytes` | gauge | cnc `admission_bytes()` / `ObsSources` (from config) |
 | `uc2_agent_alive{agent="consensus"\|"sender"\|"receiver"\|"archive"}` | gauge 0/1 | finished-flags, inverted |
 | `uc2_append_bytes`, `uc2_durable_bytes`, `uc2_sent_bytes`, `uc2_commit_bytes` | gauge | `counters()` |
-| `uc2_service_applied_bytes`, `uc2_service_epoch`, `uc2_output_completed_bytes` | gauge | `service()` |
+| `uc_service_applied_bytes`, `uc_service_epoch`, `uc2_output_completed_bytes` | gauge | `service()` |
 | `uc2_output_progress_bytes` | gauge | `status().output_progress` |
-| `uc2_service_snapshot_pos_bytes`, `uc2_node_snapshot_floor_bytes`, `uc2_incoming_snapshot_pos_bytes` | gauge | `snapshots()` |
+| `uc_service_snapshot_pos_bytes`, `uc_node_snapshot_floor_bytes`, `uc2_incoming_snapshot_pos_bytes` | gauge | `snapshots()` |
 | `uc2_archive_first_base_bytes` | gauge | `archive_first_base()` |
 | `uc2_commit_lag_bytes` | gauge | `append.saturating_sub(commit)` |
 | `uc2_apply_lag_bytes` | gauge | `commit.saturating_sub(service_applied)` |
 | `uc2_admission_saturation` | gauge | `commit_lag as f64 / admission_bytes as f64` (0 when admission is 0) |
-| `uc2_node_heartbeat_age_seconds`, `uc2_service_heartbeat_age_seconds` | gauge | `(now_unix_ns - hb) / 1e9`; a never-written heartbeat (0) yields a huge age, which is the correct alert-side signal |
+| `uc_node_heartbeat_age_seconds`, `uc_service_heartbeat_age_seconds` | gauge | `(now_unix_ns - hb) / 1e9`; a never-written heartbeat (0) yields a huge age, which is the correct alert-side signal |
 | `uc2_peer_reported_durable_bytes{peer,role}` | gauge | occupied `peer_slot(i)`; `role` ∈ `voter`\|`learner` |
 | `uc2_peer_replication_lag_bytes{peer,role}` | gauge | `commit.saturating_sub(reported_durable)` |
 | `uc2_peer_advertised_limit_bytes{peer,role}` | gauge | slot `advertised_limit` |
 | `uc2_truncations_total`, `uc2_wipes_total` | counter | Node Arc counters |
 | `uc2_reports_unattested_total`, `uc2_reports_implausible_total` | counter | Node Arc counters (wire-0.5.0 attestation) |
-| `uc2_crypto_handshake_failures_total` | counter | Node Arc counter |
+| `uc_crypto_handshake_failures_total` | counter | Node Arc counter |
 | `uc2_sender_seal_failures_total`, `uc2_receiver_seal_failures_total` | counter | `SenderStats.seal_failures`, `FollowerStats.seal_failures` |
 | `uc2_unknown_source_datagrams_total` | counter | `FollowerStats.dropped_unknown_peer` (the spec's `append_pos_unknown_source`) |
 | `uc2_cleartext_peer_datagrams_total` | counter | `FollowerStats.peer_appears_cleartext` |
@@ -111,7 +111,7 @@ The single source of truth for `/metrics`. Task 5 implements it, Task 6 serves i
 | `uc2_snapshot_sessions_total`, `uc2_snapshot_chunks_total`, `uc2_snapshot_chunk_naks_total` | counter | `SenderStats.snap_*` |
 | `uc2_receiver_dropped_total{reason}` | counter | `FollowerStats.dropped_*`; `reason` ∈ `stale_term, dup, overrun, malformed, gated, straddle, auth_failed, replay, unknown_epoch, unknown_peer, handshake` |
 | `uc2_truncation_resyncs_total`, `uc2_term_change_discards_total`, `uc2_counter_ahead_resyncs_total` | counter | `FollowerStats` |
-| `uc2_net_event_drops_total` | counter | sum of `FollowerStats.net_drops[]` |
+| `uc_net_event_drops_total` | counter | sum of `FollowerStats.net_drops[]` |
 
 Spec coverage check against §5's list: commit lag ✓, apply lag ✓, per-peer replication lag ✓, admission-window saturation ✓, heartbeat staleness both processes ✓, rates for `reports_unattested` ✓ / `append_pos_unknown_source` (→ `uc2_unknown_source_datagrams_total`) ✓ / `naks_plus_replay` (→ the four NAK counters + `uc2_replay_datagrams_total`; the cnc per-peer `naks_plus_replay` slot has been dormant since M6 and is not exported) ✓ / `seal_failures` ✓.
 
@@ -124,17 +124,17 @@ Spec coverage check against §5's list: commit lag ✓, apply lag ✓, per-peer 
 ### Task 1: Structured log core (`obs::log`)
 
 **Files:**
-- Create: `uc2_node/src/obs/mod.rs`, `uc2_node/src/obs/log.rs`
-- Modify: `uc2_node/src/lib.rs` (add `pub mod obs;`)
+- Create: `uc_node/src/obs/mod.rs`, `uc_node/src/obs/log.rs`
+- Modify: `uc_node/src/lib.rs` (add `pub mod obs;`)
 
 **Interfaces:**
 - Consumes: nothing (std only).
 - Produces (later tasks rely on these exact names):
-  - `uc2_node::obs::log::LogLevel` — `enum LogLevel { Error, Warn, Info }`, `impl FromStr` accepting `"error" | "warn" | "info"` (case-sensitive, lowercase), `Default = Info`.
-  - `uc2_node::obs::log::{set_level, level}` — global filter (`AtomicU8`).
-  - `uc2_node::obs::log::{Field, FieldValue, emit}` — `pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>])`.
-  - `uc2_node::obs_event!` macro (exported at crate root via `#[macro_export]`): `obs_event!(Info, "became_leader", node = id as u64, term = term as u64)` — values are `u64`, `i64`, `bool`, or `&str`, dispatched by a `From` impl on `FieldValue`.
-  - `uc2_node::obs::log::capture_for_tests() -> Arc<Mutex<Vec<u8>>>` — swaps the sink to an in-memory buffer and returns it; `stderr_for_tests()` swaps back.
+  - `uc_node::obs::log::LogLevel` — `enum LogLevel { Error, Warn, Info }`, `impl FromStr` accepting `"error" | "warn" | "info"` (case-sensitive, lowercase), `Default = Info`.
+  - `uc_node::obs::log::{set_level, level}` — global filter (`AtomicU8`).
+  - `uc_node::obs::log::{Field, FieldValue, emit}` — `pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>])`.
+  - `uc_node::obs_event!` macro (exported at crate root via `#[macro_export]`): `obs_event!(Info, "became_leader", node = id as u64, term = term as u64)` — values are `u64`, `i64`, `bool`, or `&str`, dispatched by a `From` impl on `FieldValue`.
+  - `uc_node::obs::log::capture_for_tests() -> Arc<Mutex<Vec<u8>>>` — swaps the sink to an in-memory buffer and returns it; `stderr_for_tests()` swaps back.
 
 **Record shape** (one line, `\n`-terminated, valid JSON):
 
@@ -199,7 +199,7 @@ fn the_macro_expands_to_emit() {
 
 The tests share the process-global sink; guard each with a file-local `static TEST_LOCK: Mutex<()>`.
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p uc2_node --lib obs::log` — expected: compile error (module absent).
+- [ ] **Step 2: Run to verify failure** — `cargo test -p uc_node --lib obs::log` — expected: compile error (module absent).
 
 - [ ] **Step 3: Implement.** Core shape:
 
@@ -255,14 +255,14 @@ macro_rules! obs_event {
 
 with `From<u64> / From<i64> / From<bool> / From<&'a str>` impls on `FieldValue<'a>`.
 
-- [ ] **Step 4: Run tests** — `cargo test -p uc2_node --lib obs::log` — expected: 4 PASS.
-- [ ] **Step 5: Clippy** — `cargo clippy -p uc2_node --all-targets -- -D warnings`.
-- [ ] **Step 6: Commit** — `git add uc2_node/src/obs uc2_node/src/lib.rs && git commit -m "feat(obs): structured JSON-lines log core — level filter, sink, obs_event! macro"`.
+- [ ] **Step 4: Run tests** — `cargo test -p uc_node --lib obs::log` — expected: 4 PASS.
+- [ ] **Step 5: Clippy** — `cargo clippy -p uc_node --all-targets -- -D warnings`.
+- [ ] **Step 6: Commit** — `git add uc_node/src/obs uc_node/src/lib.rs && git commit -m "feat(obs): structured JSON-lines log core — level filter, sink, obs_event! macro"`.
 
 ### Task 2: `[log]` / `[metrics]` config schema
 
 **Files:**
-- Modify: `uc2_node/src/config_file.rs`, `uc2_node/src/preflight.rs`, `uc2_node/src/bin/uc2-node.rs` (drop the RESERVED notice only — the rest of the daemon changes come in Task 7), `uc2_node/tests/lifecycle.rs`, `packaging/node.example.toml`
+- Modify: `uc_node/src/config_file.rs`, `uc_node/src/preflight.rs`, `uc_node/src/bin/uc2-node.rs` (drop the RESERVED notice only — the rest of the daemon changes come in Task 7), `uc_node/tests/lifecycle.rs`, `packaging/node.example.toml`
 
 **Interfaces:**
 - Consumes: `obs::log::LogLevel` (Task 1).
@@ -311,7 +311,7 @@ fn a_typo_inside_log_or_metrics_is_now_refused() {
 
 (`load_str`/`MINIMAL` — reuse the module's existing helpers; if the helper is named differently, follow the file's own fixture names.)
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p uc2_node --lib config_file` — expected: compile errors (`opts.obs` absent).
+- [ ] **Step 2: Run to verify failure** — `cargo test -p uc_node --lib config_file` — expected: compile errors (`opts.obs` absent).
 
 - [ ] **Step 3: Implement.** In `config_file.rs`:
 
@@ -351,15 +351,15 @@ let metrics_bind = f.metrics.map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".p
 # bind = "127.0.0.1:9600"
 ```
 
-- [ ] **Step 4: Run** — `cargo test -p uc2_node` (the whole crate: config tests, lifecycle, the example-config pin) — expected: PASS.
+- [ ] **Step 4: Run** — `cargo test -p uc_node` (the whole crate: config tests, lifecycle, the example-config pin) — expected: PASS.
 - [ ] **Step 5: Clippy** — workspace clean.
 - [ ] **Step 6: Commit** — `feat(config): [log]/[metrics] gain their M10 schema; ReservedSections retired`.
 
 ### Task 3: Transition records at the consensus sites
 
 **Files:**
-- Modify: `uc2_node/src/node.rs`
-- Create: `uc2_node/tests/obs_log.rs`
+- Modify: `uc_node/src/node.rs`
+- Create: `uc_node/tests/obs_log.rs`
 
 **Interfaces:**
 - Consumes: `obs_event!` (Task 1).
@@ -375,20 +375,20 @@ let metrics_bind = f.metrics.map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".p
 
 **Emission sites** (anchor map has the line ranges): the seven `exec`-side sites plus one `publish_status` edge. `publish_status` gains a `last_flags: u64` field on the agent struct (initialised to the boot value) and emits `serving_changed` only when `flags & NODE_FLAG_CAN_SERVE` differs from the previous cycle — one branch and no allocation on the untaken path. The existing `eprintln!` at `HaltRemoved`/`StepDownRemoved` are replaced by the structured record (keep the human sentence as a `msg` field if it carries content the fields don't).
 
-- [ ] **Step 1: Write the failing integration test** (`uc2_node/tests/obs_log.rs`). Copy the minimal ring helpers from `failover.rs` (`spawn_cluster_ring`-equivalent, `await_single_leader`, `partition`) — test files are separate crates, so they cannot be imported. Two tests, sharing a file-local `TEST_LOCK` (the capture sink is process-global):
+- [ ] **Step 1: Write the failing integration test** (`uc_node/tests/obs_log.rs`). Copy the minimal ring helpers from `failover.rs` (`spawn_cluster_ring`-equivalent, `await_single_leader`, `partition`) — test files are separate crates, so they cannot be imported. Two tests, sharing a file-local `TEST_LOCK` (the capture sink is process-global):
 
 ```rust
 #[test]
 fn an_election_emits_became_leader_and_followers_note_it() {
     let _g = TEST_LOCK.lock().unwrap();
-    let buf = uc2_node::obs::log::capture_for_tests();
+    let buf = uc_node::obs::log::capture_for_tests();
     let mut cluster = spawn_ring(3);
     let leader = await_single_leader(&cluster, 10);
     await_serving(&cluster, leader, 10);
     let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(text.lines().any(|l| l.contains(r#""event":"became_leader""#)), "{text}");
     assert!(text.lines().any(|l| l.contains(r#""event":"serving_changed""#) && l.contains(r#""can_serve":true"#)), "{text}");
-    uc2_node::obs::log::stderr_for_tests();
+    uc_node::obs::log::stderr_for_tests();
 }
 
 #[test]
@@ -404,33 +404,33 @@ fn a_healed_deposed_leader_emits_log_truncated() {
 
 Every line in the capture must parse as JSON — add a small `fn assert_json_lines(text: &str)` (hand-rolled brace/quote sanity or exact-prefix checks; no serde_json) applied to the whole buffer in both tests.
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p uc2_node --test obs_log` — expected: FAIL (no records).
+- [ ] **Step 2: Run to verify failure** — `cargo test -p uc_node --test obs_log` — expected: FAIL (no records).
 - [ ] **Step 3: Implement the emissions** at the eight sites, e.g. in the `BecomeLeader` arm:
 
 ```rust
 crate::obs_event!(Info, "became_leader", node = self.id as u64, term = term as u64, base = base);
 ```
 
-- [ ] **Step 4: Run** — `cargo test -p uc2_node --test obs_log` PASS, then the neighbouring suites that exercise these paths: `cargo test -p uc2_node --test failover --test lifecycle`. The known-flaky reconfig suite is not in this task's gate; do not chase pre-existing intermittents (see `docs/superpowers/plans/2026-08-16-nightly-flake-hunt-brief.md` for which those are).
+- [ ] **Step 4: Run** — `cargo test -p uc_node --test obs_log` PASS, then the neighbouring suites that exercise these paths: `cargo test -p uc_node --test failover --test lifecycle`. The known-flaky reconfig suite is not in this task's gate; do not chase pre-existing intermittents (see `docs/superpowers/plans/2026-08-16-nightly-flake-hunt-brief.md` for which those are).
 - [ ] **Step 5: Clippy; commit** — `feat(obs): transition records at the consensus sites — elections, truncation, snapshot, config, removal`.
 
 ### Task 4: Agent-health flags and the `ObsSources` bundle
 
 **Files:**
-- Modify: `uc2_log/src/agent.rs`, `uc2_node/src/node.rs`
+- Modify: `uc_log/src/agent.rs`, `uc_node/src/node.rs`
 
 **Interfaces:**
 - Consumes: existing `Node` Arc fields (anchor map).
 - Produces:
   - `AgentRunner::finished_flag(&self) -> Arc<AtomicBool>` — false while the worker loop runs; set true when the closure returns **or panics** (drop-guard in the worker thread). `is_finished()` keeps its meaning.
-  - `uc2_node::obs::ObsSources` (defined in `obs/mod.rs`, constructed by `node.rs`):
+  - `uc_node::obs::ObsSources` (defined in `obs/mod.rs`, constructed by `node.rs`):
 
 ```rust
 pub struct ObsSources {
     pub node_id: u32,
     pub cnc: Arc<CncPage>,
-    pub sender: Arc<uc2_net::sender::SenderStats>,
-    pub receiver: Arc<uc2_net::receiver::FollowerStats>,
+    pub sender: Arc<uc_net::sender::SenderStats>,
+    pub receiver: Arc<uc_net::receiver::FollowerStats>,
     pub truncations: Arc<AtomicU64>,
     pub wipes: Arc<AtomicU64>,
     pub reports_unattested: Arc<AtomicU64>,
@@ -446,7 +446,7 @@ pub struct ObsSources {
 
   - `Node::observability(&self) -> ObsSources` — clones the Arcs; agent names as spawned (`consensus`, `sender`, `receiver`, `archive` — strip any `uc2-` prefix to match the metric label values in the series contract).
 
-- [ ] **Step 1: Failing test in `uc2_log/src/agent.rs`'s test module:**
+- [ ] **Step 1: Failing test in `uc_log/src/agent.rs`'s test module:**
 
 ```rust
 #[test]
@@ -466,16 +466,16 @@ fn the_finished_flag_survives_a_panicking_agent() {
 
 (Adjust the `spawn` signature/idle variant to the file's actual API — the anchor map has it at `agent.rs:47`.)
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p uc2_log finished_flag` — compile error.
+- [ ] **Step 2: Run to verify failure** — `cargo test -p uc_log finished_flag` — compile error.
 - [ ] **Step 3: Implement:** add the field, set via a drop-guard inside the spawned thread (fires on both return and unwind); `finished_flag()` clones the Arc. Then `ObsSources` + `Node::observability()` — a straight clone-and-collect over existing fields; the only judgement call is verifying each crypto counter field is `Arc<AtomicU64>` at its definition before cloning (the getters at `node.rs:1286-1394` point at them).
-- [ ] **Step 4: A second failing-then-passing test** in `uc2_node/tests/obs_http.rs`-to-be is deferred to Task 6; here add a smoke assertion to `uc2_node/tests/lifecycle.rs`'s in-process section: start a `single_node`, call `node.observability()`, assert `agents.len() == 4` and every flag reads false, stop, assert all true.
-- [ ] **Step 5: Run** — `cargo test -p uc2_log && cargo test -p uc2_node --test lifecycle`; clippy.
+- [ ] **Step 4: A second failing-then-passing test** in `uc_node/tests/obs_http.rs`-to-be is deferred to Task 6; here add a smoke assertion to `uc_node/tests/lifecycle.rs`'s in-process section: start a `single_node`, call `node.observability()`, assert `agents.len() == 4` and every flag reads false, stop, assert all true.
+- [ ] **Step 5: Run** — `cargo test -p uc_log && cargo test -p uc_node --test lifecycle`; clippy.
 - [ ] **Step 6: Commit** — `feat(obs): agent finished-flags (panic-proof) + Node::observability() source bundle`.
 
 ### Task 5: The Prometheus encoder (`obs::metrics`)
 
 **Files:**
-- Create: `uc2_node/src/obs/metrics.rs`
+- Create: `uc_node/src/obs/metrics.rs`
 
 **Interfaces:**
 - Consumes: `ObsSources` (Task 4).
@@ -546,7 +546,7 @@ fn a_dead_agent_reads_zero() {
 ### Task 6: The endpoint and the probes (`obs::http`)
 
 **Files:**
-- Create: `uc2_node/src/obs/http.rs`, `uc2_node/tests/obs_http.rs`
+- Create: `uc_node/src/obs/http.rs`, `uc_node/tests/obs_http.rs`
 
 **Interfaces:**
 - Consumes: `ObsSources`, `render_prometheus`, `now_unix_ns`.
@@ -619,7 +619,7 @@ fn a_real_single_node_cluster_serves_and_becomes_ready() {
 ### Task 7: Daemon wiring and counter-derived records
 
 **Files:**
-- Modify: `uc2_node/src/bin/uc2-node.rs`, `uc2_node/tests/lifecycle.rs`
+- Modify: `uc_node/src/bin/uc2-node.rs`, `uc_node/tests/lifecycle.rs`
 
 **Behaviour added to the daemon:**
 1. After preflight: `obs::log::set_level(opts.obs.log_level)`.
@@ -627,7 +627,7 @@ fn a_real_single_node_cluster_serves_and_becomes_ready() {
 3. In the 100 ms poll loop, every 10th tick (~1 s), a derived-events pass over cheap counter reads, each edge-triggered and rate-limited to one record per 10 s per event:
    - `nak_storm` (Warn): `naks_dropped` delta > 0 since last pass — fields `node`, `naks_dropped`, `naks_served`.
    - `seal_failures` (Warn): sender+receiver `seal_failures` delta > 0 — fields `node`, `count`, `is_leader` (the diagnose doc: a leader's climb is benign, a follower's is not — the field lets the reader apply that).
-   - `snapshot_published` (Info): cnc `service_snapshot_pos` advanced — fields `node`, `pos`. (The service builds snapshots in its own process; the daemon observes the page — no `uc2_service` change.)
+   - `snapshot_published` (Info): cnc `service_snapshot_pos` advanced — fields `node`, `pos`. (The service builds snapshots in its own process; the daemon observes the page — no `uc_service` change.)
    - `agent_failstopped` (Error): any finished-flag true → emit with `agent` name, print one human line, **skip the drain and `return ExitCode::FAILURE`** so systemd's `Restart=on-failure` takes over. (Today a mid-run agent panic leaves a zombie daemon that looks healthy; `stop_draining` would re-raise the panic at exit. Fail fast instead — the restarted node replays its journal.)
 4. On SIGTERM: `srv.stop()` before `stop_draining` (scrapes must not race teardown), then the existing drain path unchanged.
 
@@ -648,7 +648,7 @@ fn the_daemon_serves_metrics_when_configured_and_stops_cleanly() {
 fn the_daemon_without_a_metrics_section_opens_no_port() { /* no banner, connect refused */ }
 ```
 
-- [ ] **Step 2: verify failure; Step 3: implement; Step 4: PASS** (`cargo test -p uc2_node --test lifecycle`); **Step 5: clippy.**
+- [ ] **Step 2: verify failure; Step 3: implement; Step 4: PASS** (`cargo test -p uc_node --test lifecycle`); **Step 5: clippy.**
 - [ ] **Step 6: Commit** — `feat(daemon): wire obs — endpoint lifecycle, log level, derived NAK/seal/snapshot records, fail-fast on agent death`.
 
 ### Task 8: Alert rules, dashboard, documentation
@@ -680,7 +680,7 @@ groups:
     labels: { severity: critical }
     annotations: { summary: "{{ $labels.instance }} elected but its NewTerm frame is not quorum-committed (flags 0x01)" }
   - alert: Uc2ServiceWedged
-    expr: uc2_service_heartbeat_age_seconds > 5 and uc2_node_heartbeat_age_seconds < 3
+    expr: uc_service_heartbeat_age_seconds > 5 and uc_node_heartbeat_age_seconds < 3
     for: 1m
     labels: { severity: critical }
     annotations: { summary: "apply loop wedged on {{ $labels.instance }}: node alive, service heartbeat stale" }
@@ -705,7 +705,7 @@ groups:
     labels: { severity: warning }
     annotations: { summary: "ingress admission window ≥90% consumed on {{ $labels.instance }} — commit is not keeping up with append" }
   - alert: Uc2PurgeStalled
-    expr: uc2_purge_enabled == 1 and (uc2_node_snapshot_floor_bytes - uc2_archive_first_base_bytes) > 2 * uc2_journal_segment_bytes
+    expr: uc2_purge_enabled == 1 and (uc_node_snapshot_floor_bytes - uc2_archive_first_base_bytes) > 2 * uc2_journal_segment_bytes
     for: 10m
     labels: { severity: warning }
     annotations: { summary: "purge enabled but the journal head lags the snapshot floor by >2 segments on {{ $labels.instance }}" }
@@ -737,13 +737,13 @@ groups:
 
 - [ ] **Step 1:** Write `uc2-alerts.yml` exactly as above; write the dashboard JSON; verify both mechanically: `promtool check rules packaging/prometheus/uc2-alerts.yml` (promtool required on PATH — same class of external dependency as elle's `java`; note it in the how-to) and `python3 -m json.tool packaging/grafana/uc2-dashboard.json > /dev/null`.
 - [ ] **Step 2:** Write the how-to and the four doc edits. Keep `configuration.md`'s "reserved sections" paragraph as a one-line historical note ("reserved in M9, defined since M10").
-- [ ] **Step 3:** Run the doc-adjacent tests: `cargo test -p uc2_node the_packaged_example_config_is_valid`.
+- [ ] **Step 3:** Run the doc-adjacent tests: `cargo test -p uc_node the_packaged_example_config_is_valid`.
 - [ ] **Step 4: Commit** — `feat(packaging),docs: alert rules + dashboard + monitor-a-cluster how-to; [log]/[metrics] documented`.
 
 ### Task 9: Fire every alert rule against a deliberately broken cluster
 
 **Files:**
-- Create: `uc2_node/examples/m10_alerts.rs`, `scripts/m10_alert_fire.sh`
+- Create: `uc_node/examples/m10_alerts.rs`, `scripts/m10_alert_fire.sh`
 
 **Method.** For each rule, a scenario constructs the failure in a real in-process cluster (fault-injection partitions, killed processes/threads, `Node::crash()`), an in-process `ObsServer` per node is scraped over real HTTP once per second into per-scenario sample sets, and the samples become `promtool test rules` input series (`values: "v1 v2 v3 ..."` at `interval: 1s` — promtool accepts explicit space-separated values), with an `alert_rule_test` asserting the rule fires. The rules file under test is the shipped `packaging/prometheus/uc2-alerts.yml`, unmodified — the artifact is what is proven.
 
@@ -773,7 +773,7 @@ The split is stated, not hidden: **every rule fires from real scraped series thr
 ### Task 10: The M10 gate
 
 **Files:**
-- Create: `docs/benchmarks/uc2-m10-gate-2026-08-19.md` (FIRST, its own commit, before the harness), `uc2_node/examples/m10_gate.rs`
+- Create: `docs/benchmarks/uc2-m10-gate-2026-08-19.md` (FIRST, its own commit, before the harness), `uc_node/examples/m10_gate.rs`
 
 **The pre-committed bar** (write into the gate doc verbatim, then implement):
 
@@ -788,8 +788,8 @@ Honest-failure protocol verbatim from M9: bar and result in separate commits, ba
 
 - [ ] **Step 1:** Write the gate doc: the bar table above, why each row is the right bar (row 1: the contract is the product; row 2: the spec's named naive-probe failure; row 3: "reads cannot perturb the hot path" is a claim about cache traffic under load, only falsifiable on real cross-host hardware; row 4: a rule that has never fired is documentation, not alerting), the scenario table from Task 9, the honest-failure protocol. Commit it alone: `docs(bench): pre-commit the M10 observability gate decide rule`.
 - [ ] **Step 2:** Write `m10_gate.rs` with subcommands `coverage`, `probes`, `perturb-smoke`, `all` (clap, the `m9_gate.rs` role pattern): `coverage` boots a 3-node in-process cluster with obs servers, scrapes, iterates `CONTRACT_SERIES`; `probes` runs the row-2 choreography with `Node::crash()` on the leader and the dual-read sampler; `perturb-smoke` runs a short local load with and without a 1 s scraper and prints both numbers **ungated, labelled SMOKE**. Print the bar, print each row's PASS/FAIL, `exit(1)` on any gated FAIL.
-- [ ] **Step 3:** Run `cargo run -p uc2_node --release --example m10_gate -- all` locally. Rows 1, 2, 4 must PASS; row 3 prints smoke numbers.
-- [ ] **Step 4:** Full local proof stack: `cargo test -p uc2_node && cargo test && cargo clippy --workspace --all-targets -- -D warnings`.
+- [ ] **Step 3:** Run `cargo run -p uc_node --release --example m10_gate -- all` locally. Rows 1, 2, 4 must PASS; row 3 prints smoke numbers.
+- [ ] **Step 4:** Full local proof stack: `cargo test -p uc_node && cargo test && cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] **Step 5: Commit** — `feat(bench): m10_gate — coverage + probe-regime rows, perturbation smoke`.
 - [ ] **Step 6:** **STOP.** The fleet rows (2-repeat and 3) are a separate, user-approved step: a `bench-infra/scripts/m10_fleet_gate.py` in the m9 orchestrator's mould, an M5 A/B, real Prometheus scraping all nodes. Do not book hardware, do not write the orchestrator into this branch without the user's go — M7/M9 precedent, and the fleet costs money.
 
@@ -800,7 +800,7 @@ Honest-failure protocol verbatim from M9: bar and result in separate commits, ba
 - **The fleet orchestrator and the fleet run** — user-approved follow-up (Task 10 Step 6).
 - **`tracing` adoption.** Declared in the workspace root but consumed nowhere; M10's records are flat scalars and the hand-rolled emitter is ~100 lines with zero deps. Revisit only if a milestone needs spans or an ecosystem subscriber.
 - **Auth/TLS on the endpoint** — M10 ships read-only + bind-guidance; the admin-plane authorisation question is spec §2's open finding and not this milestone.
-- **A `uc2_service`-side endpoint.** The service's observable state (applied, epoch, heartbeat, snapshot pos) is already on the cnc page the node exports.
+- **A `uc_service`-side endpoint.** The service's observable state (applied, epoch, heartbeat, snapshot pos) is already on the cnc page the node exports.
 - **Exporting the dormant per-peer `naks_plus_replay` cnc slot** — dormant since M6; the sender/receiver aggregates carry the signal.
 
 ## Self-review (executed at plan-writing time)

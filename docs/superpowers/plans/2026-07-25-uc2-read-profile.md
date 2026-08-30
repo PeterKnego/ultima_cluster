@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `uc2_node/examples/read_profile.rs` — a read-throughput measurement harness that decides, by measurement, whether UC's ReadIndex barrier costs read *capacity*.
+**Goal:** Build `uc_node/examples/read_profile.rs` — a read-throughput measurement harness that decides, by measurement, whether UC's ReadIndex barrier costs read *capacity*.
 
 **Architecture:** An m5_gate-shaped example binary with `node` / `service` / `client` / `all` / `ladder` roles. The measurement is an A/B: the identical pipelined read workload run with and without `FLAG_V2_LINEARIZABLE`, since a snapshot read is the same path minus the barrier. Agent occupancy is read from `/proc/<pid>/task/*/status` (`voluntary_ctxt_switches`, a yield-rate proxy) because the agents' `IdleStrategy::Yield` saturates CPU% by construction. No production code is modified.
 
-**Tech Stack:** Rust 2024 workspace; `clap` (CLI), `hdrhistogram` (latency), `bincode` (payloads), `anyhow`. All dev-dependencies of `uc2_node` already.
+**Tech Stack:** Rust 2024 workspace; `clap` (CLI), `hdrhistogram` (latency), `bincode` (payloads), `anyhow`. All dev-dependencies of `uc_node` already.
 
 **Spec:** `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`
 
 ## Global Constraints
 
-- **Production code is untouched.** Only `uc2_node/examples/read_profile.rs` (new) and `uc2_node/Cargo.toml` (one `[[example]]` stanza). No edits under any `src/`.
+- **Production code is untouched.** Only `uc_node/examples/read_profile.rs` (new) and `uc_node/Cargo.toml` (one `[[example]]` stanza). No edits under any `src/`.
 - **Never write test/scratch artifacts to `/tmp`** — it is RAM-backed tmpfs with no swap on this box; an OOM SIGKILLs the largest process. Instance dirs go under `target/`. Every role that takes a directory asserts `!starts_with("/tmp")`.
 - **SPDX header on every new file:** `// SPDX-License-Identifier: Apache-2.0` then `// Copyright 2026 Peter Knego`.
 - **`cargo clippy --workspace --all-targets -- -D warnings` must pass with zero warnings.**
@@ -28,9 +28,9 @@
 The one piece of pure, fallible logic in the harness: parsing `/proc` thread stats. Written first, TDD, against a synthetic `/proc` tree so it needs no live cluster.
 
 **Files:**
-- Create: `uc2_node/examples/read_profile.rs`
-- Modify: `uc2_node/Cargo.toml` (add `[[example]]` stanza so the example's unit tests run)
-- Test: inline `#[cfg(test)] mod tests` in `uc2_node/examples/read_profile.rs`
+- Create: `uc_node/examples/read_profile.rs`
+- Modify: `uc_node/Cargo.toml` (add `[[example]]` stanza so the example's unit tests run)
+- Test: inline `#[cfg(test)] mod tests` in `uc_node/examples/read_profile.rs`
 
 **Interfaces:**
 - Consumes: nothing (first task).
@@ -41,7 +41,7 @@ The one piece of pure, fallible logic in the harness: parsing `/proc` thread sta
 
 - [ ] **Step 1: Add the Cargo.toml stanza**
 
-Append to `uc2_node/Cargo.toml`:
+Append to `uc_node/Cargo.toml`:
 
 ```toml
 # read_profile (leader-lease profile harness) carries unit tests for its
@@ -53,7 +53,7 @@ test = true
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `uc2_node/examples/read_profile.rs`:
+Create `uc_node/examples/read_profile.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -139,7 +139,7 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_node --example read_profile`
+Run: `cargo test -p uc_node --example read_profile`
 Expected: FAIL — `cannot find function 'sample_yields' in this scope` (and `occupancy_delta`, `Occupancy`).
 
 - [ ] **Step 4: Implement the sampler**
@@ -150,7 +150,7 @@ Insert above `fn main()`:
 /// One agent thread's yield rate over a measurement window.
 ///
 /// **Why yields and not CPU time:** the node's agents idle on
-/// `IdleStrategy::Yield` (`uc2_log/src/agent.rs:28` → `std::thread::yield_now()`),
+/// `IdleStrategy::Yield` (`uc_log/src/agent.rs:28` → `std::thread::yield_now()`),
 /// so an IDLE agent still burns a core in a yield loop and CPU% is saturated by
 /// construction. Each empty duty cycle costs one `sched_yield`, which the kernel
 /// counts in `voluntary_ctxt_switches` — so a LOW yield rate means a BUSY agent.
@@ -206,13 +206,13 @@ fn occupancy_delta(
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --example read_profile`
+Run: `cargo test -p uc_node --example read_profile`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs uc2_node/Cargo.toml
+git add uc_node/examples/read_profile.rs uc_node/Cargo.toml
 git commit -m "test(read-profile): /proc agent-occupancy sampler
 
 Yield-rate proxy (voluntary_ctxt_switches), not CPU time: the agents idle
@@ -227,12 +227,12 @@ signal. Ordinal only — it ranks agents, which is all the decision rule needs."
 Everything needed to stand a cluster up and elect a leader, with no measurement yet. Verified by running it.
 
 **Files:**
-- Modify: `uc2_node/examples/read_profile.rs`
+- Modify: `uc_node/examples/read_profile.rs`
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (the sampler is used in Task 5).
 - Produces:
-  - `struct ProfileSm` implementing `uc2_service::StateMachine` with `Command = Vec<u8>`, `Response = u64`, `Query = ()`, `QueryResponse = u64`.
+  - `struct ProfileSm` implementing `uc_service::StateMachine` with `Command = Vec<u8>`, `Response = u64`, `Query = ()`, `QueryResponse = u64`.
   - `fn node_config(id, members, bind, instance_dir, app_id, admission_bytes) -> NodeConfig`
   - `fn env_cap(var: &str, requested: u64) -> u64`
   - `fn await_single_leader(nodes: &[Node], secs: u64) -> usize`
@@ -242,7 +242,7 @@ Everything needed to stand a cluster up and elect a leader, with no measurement 
 
 - [ ] **Step 1: Write the imports, CLI, and constants**
 
-Replace the `use std::path::Path;` line and `fn main() {}` in `uc2_node/examples/read_profile.rs` with:
+Replace the `use std::path::Path;` line and `fn main() {}` in `uc_node/examples/read_profile.rs` with:
 
 ```rust
 use std::net::{SocketAddr, UdpSocket};
@@ -251,15 +251,15 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
-use uc2_consensus::election::NodeId;
-use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig};
-use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_consensus::election::NodeId;
+use uc_net::fault::FaultConfig;
+use uc_node::{Node, NodeConfig};
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 /// Well-known file names under the instance dir — the shared contract with
-/// `uc2_node::InstanceDir` (`uc2_node/src/ipc.rs`). Hardcoded here rather than
+/// `uc_node::InstanceDir` (`uc_node/src/ipc.rs`). Hardcoded here rather than
 /// via `InstanceDir`, which requires the exclusive flock only the owning node
-/// may take: this harness is an ATTACHING party, exactly like `uc2_client`.
+/// may take: this harness is an ATTACHING party, exactly like `uc_client`.
 const CNC_FILE: &str = "cnc2.dat";
 const QUERY_RING: &str = "query.ring";
 const EGRESS_SERVICE: &str = "egress_service.broadcast";
@@ -294,7 +294,7 @@ enum Role {
     Node(NodeArgs),
     /// State-machine service, attached to a running node.
     Service(ServiceArgs),
-    /// The measuring read client (bypasses uc2_client — see `run_read_measurement`).
+    /// The measuring read client (bypasses uc_client — see `run_read_measurement`).
     Client(ClientArgs),
     /// Local smoke: 3 nodes + 3 services + 1 read client, in-process. NOT a fleet number.
     All(AllArgs),
@@ -488,9 +488,9 @@ fn node_config(
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),
         faults: FaultConfig::default(),
-        purge: uc2_node::PurgePolicy::Disabled,
+        purge: uc_node::PurgePolicy::Disabled,
         learners: Vec::new(),
-        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     }
 }
 
@@ -560,7 +560,7 @@ fn await_single_leader(nodes: &[Node], secs: u64) -> usize {
 fn boot_cluster(
     root: &Path,
     app_id: &str,
-) -> anyhow::Result<(Vec<Node>, Vec<uc2_service::Service<ProfileSm>>, Vec<PathBuf>, usize)> {
+) -> anyhow::Result<(Vec<Node>, Vec<uc_service::Service<ProfileSm>>, Vec<PathBuf>, usize)> {
     assert!(
         !root.starts_with("/tmp"),
         "root must be on a real filesystem (never /tmp — RAM tmpfs, no swap); got {root:?}"
@@ -604,7 +604,7 @@ fn boot_cluster(
 
 /// Node-first-then-service teardown, per the v1/lincheck_v2 precedent: a node's
 /// shutdown must not wait on a service that tore down first.
-fn stop_cluster(nodes: Vec<Node>, services: Vec<uc2_service::Service<ProfileSm>>) {
+fn stop_cluster(nodes: Vec<Node>, services: Vec<uc_service::Service<ProfileSm>>) {
     for node in nodes {
         node.stop();
     }
@@ -631,25 +631,25 @@ fn run_ladder(_a: LadderArgs) -> anyhow::Result<()> {
 }
 ```
 
-(`ServiceBuilder::start()` returns `Result<Service<S>, ServiceError>` — `uc2_service/src/lib.rs:89,250` — so `uc2_service::Service<ProfileSm>` is the correct type in both signatures.)
+(`ServiceBuilder::start()` returns `Result<Service<S>, ServiceError>` — `uc_service/src/lib.rs:89,250` — so `uc_service::Service<ProfileSm>` is the correct type in both signatures.)
 
 - [ ] **Step 4: Verify it builds and boots a leader**
 
-Run: `cargo build -p uc2_node --example read_profile`
+Run: `cargo build -p uc_node --example read_profile`
 Expected: builds clean.
 
-Run: `cargo run -p uc2_node --release --example read_profile -- all --secs 1`
+Run: `cargo run -p uc_node --release --example read_profile -- all --secs 1`
 Expected: prints `leader elected: n<i> at "target/read_profile_smoke/n<i>"` and exits 0 within ~30 s.
 
 - [ ] **Step 5: Verify the Task 1 tests still pass**
 
-Run: `cargo test -p uc2_node --example read_profile`
+Run: `cargo test -p uc_node --example read_profile`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs
+git add uc_node/examples/read_profile.rs
 git commit -m "feat(read-profile): roles, ProfileSm, and the in-process smoke cluster
 
 node/service/all roles over the real SDK stack, m5_gate-shaped. The node role
@@ -661,10 +661,10 @@ sampling. No measurement yet."
 
 ### Task 3: The pipelined read client (the A/B core)
 
-The measurement itself. Reads are issued straight into `query.ring` with the harness's own `local_seq`, because `uc2_client::query_linearizable` blocks per call (`uc2_client/src/client.rs:154-184`) and read concurrency is the ladder axis.
+The measurement itself. Reads are issued straight into `query.ring` with the harness's own `local_seq`, because `uc_client::query_linearizable` blocks per call (`uc_client/src/client.rs:154-184`) and read concurrency is the ladder axis.
 
 **Files:**
-- Modify: `uc2_node/examples/read_profile.rs`
+- Modify: `uc_node/examples/read_profile.rs`
 
 **Interfaces:**
 - Consumes: `ProfileSm`, `Mode`, `env_cap`, `boot_cluster`, `stop_cluster`, the file-name constants (Task 2).
@@ -682,7 +682,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use hdrhistogram::Histogram;
-use uc2_log::cnc::CncPage;
+use uc_log::cnc::CncPage;
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
@@ -741,7 +741,7 @@ struct MatcherCtx {
 }
 
 /// Decode a query answer's payload: `0u64 LE placeholder ++ bincode(u64)`
-/// (`uc2_service/src/egress.rs:62-66`). Returns None for a write response,
+/// (`uc_service/src/egress.rs:62-66`). Returns None for a write response,
 /// whose payload is the applied position + the write's own response.
 fn decode_query_answer(payload: &[u8]) -> Option<u64> {
     let rest = payload.get(8..)?;
@@ -919,7 +919,7 @@ fn run_read_measurement(
     let occ_t0 = Instant::now();
 
     // Send loop: keep `readers` reads in flight. `RingError::Full` means
-    // yield+retry, exactly like the real uc2_client.
+    // yield+retry, exactly like the real uc_client.
     let mut local_seq: u32 = 0;
     let deadline = t0 + Duration::from_secs(secs);
     'send: while Instant::now() < deadline {
@@ -1120,20 +1120,20 @@ And replace `run_all`'s placeholder line with:
 
 - [ ] **Step 6: Run both arms and verify they measure**
 
-Run: `cargo run -p uc2_node --release --example read_profile -- all --secs 5 --readers 64 --mode snap`
+Run: `cargo run -p uc_node --release --example read_profile -- all --secs 5 --readers 64 --mode snap`
 Expected: nonzero `reads/s`, `in-flight at end : 0`, an occupancy list naming `uc2-consensus` / `uc2-apply` / etc., exit 0.
 
-Run: `cargo run -p uc2_node --release --example read_profile -- all --secs 5 --readers 64 --mode lin`
+Run: `cargo run -p uc_node --release --example read_profile -- all --secs 5 --readers 64 --mode lin`
 Expected: same shape, exit 0. The two `reads/s` numbers are the first A/B data point.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs
+git add uc_node/examples/read_profile.rs
 git commit -m "feat(read-profile): pipelined read client and the lin/snap A/B
 
 Reads go straight into query.ring with the harness's own local_seq —
-uc2_client::query_linearizable blocks per call and read concurrency is the
+uc_client::query_linearizable blocks per call and read concurrency is the
 ladder axis. Mode sets exactly one bit (FLAG_V2_LINEARIZABLE), so the delta
 between arms is the barrier's end-to-end cost and nothing else."
 ```
@@ -1145,7 +1145,7 @@ between arms is the barrier's end-to-end cost and nothing else."
 The mixed arm, plus the correctness tooth that stops a mis-wired harness from reporting a flattering number.
 
 **Files:**
-- Modify: `uc2_node/examples/read_profile.rs`
+- Modify: `uc_node/examples/read_profile.rs`
 
 **Interfaces:**
 - Consumes: `spawn_writer` (stub from Task 3), `ReadStats`, `run_read_measurement`.
@@ -1274,10 +1274,10 @@ Add `println!("read regression      : {}", s.regression);` to `print_read_report
 
 - [ ] **Step 4: Verify the mixed arm runs clean**
 
-Run: `cargo run -p uc2_node --release --example read_profile -- all --secs 5 --readers 64 --mode lin --write-rate 20000`
+Run: `cargo run -p uc_node --release --example read_profile -- all --secs 5 --readers 64 --mode lin --write-rate 20000`
 Expected: nonzero reads/s, `read regression : 0`, `in-flight at end : 0`, exit 0. `max_read_value` should be well above zero (writes are landing).
 
-Run: `cargo run -p uc2_node --release --example read_profile -- all --secs 5 --readers 64 --mode snap --write-rate 20000`
+Run: `cargo run -p uc_node --release --example read_profile -- all --secs 5 --readers 64 --mode snap --write-rate 20000`
 Expected: same, exit 0.
 
 - [ ] **Step 5: Verify the guard actually has teeth**
@@ -1289,7 +1289,7 @@ Revert the temporary change before continuing. Expected end state: the guard fir
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs
+git add uc_node/examples/read_profile.rs
 git commit -m "feat(read-profile): background write load and monotonic-read guard
 
 The writer runs on its own client_id so its responses cannot inflate the read
@@ -1305,7 +1305,7 @@ harness now fails loudly instead of reporting a flattering number."
 Sweeps concurrency across both arms and both mixes, then evaluates the pre-committed rule.
 
 **Files:**
-- Modify: `uc2_node/examples/read_profile.rs`
+- Modify: `uc_node/examples/read_profile.rs`
 
 **Interfaces:**
 - Consumes: `run_read_measurement`, `ReadStats`, `Occupancy`, `boot_cluster`, `stop_cluster`.
@@ -1390,7 +1390,7 @@ Add to the `#[cfg(test)] mod tests` block:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_node --example read_profile`
+Run: `cargo test -p uc_node --example read_profile`
 Expected: FAIL — `cannot find function 'evaluate_decision_rule'`, `cannot find struct 'Rung'`.
 
 - [ ] **Step 3: Implement `Rung` and the rule**
@@ -1481,7 +1481,7 @@ fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node --example read_profile`
+Run: `cargo test -p uc_node --example read_profile`
 Expected: PASS, 9 tests (4 from Task 1 + 5 here).
 
 - [ ] **Step 5: Implement the ladder driver**
@@ -1573,13 +1573,13 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
 
 - [ ] **Step 6: Run the ladder end to end**
 
-Run: `cargo run -p uc2_node --release --example read_profile -- ladder --secs 4 --readers 1,16,128 --write-rate 20000`
+Run: `cargo run -p uc_node --release --example read_profile -- ladder --secs 4 --readers 1,16,128 --write-rate 20000`
 Expected: 12 rung lines (2 mixes × 2 arms × 3 concurrencies), then two verdict blocks, exit 0. Every rung shows `reads/s > 0`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs
+git add uc_node/examples/read_profile.rs
 git commit -m "feat(read-profile): concurrency ladder and pre-committed decision rule
 
 The rule from spec §2 is evaluated in code, including the 65-75% borderline
@@ -1593,7 +1593,7 @@ outcome shapes so the verdict cannot be quietly re-tuned after seeing data."
 ### Task 6: Clippy, docs, and the smoke result record
 
 **Files:**
-- Modify: `uc2_node/examples/read_profile.rs` (module doc)
+- Modify: `uc_node/examples/read_profile.rs` (module doc)
 - Create: `docs/benchmarks/uc2-read-profile-2026-07-25.md`
 
 **Interfaces:**
@@ -1618,7 +1618,7 @@ Expected: passes — no existing test's behavior changed (production code is unt
 
 **This is a wiring check, not a measurement** (Global Constraints): the box carries a concurrent model-check session, so the numbers printed here are noise and must not be recorded anywhere.
 
-Run: `cargo run -p uc2_node --release --example read_profile -- ladder --secs 3 --readers 1,16 --write-rate 5000`
+Run: `cargo run -p uc_node --release --example read_profile -- ladder --secs 3 --readers 1,16 --write-rate 5000`
 Expected: 8 rung lines (2 mixes × 2 arms × 2 concurrencies), both verdict blocks print without panicking, every rung shows `reads/s > 0` and no regression, exit 0.
 
 Before running, check the box is not already saturated: `uptime && free -g`. If available memory is under ~3 GB, wait — do not risk an OOM that could kill the neighbouring session.
@@ -1626,7 +1626,7 @@ Before running, check the box is not already saturated: `uptime && free -g`. If 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs
+git add uc_node/examples/read_profile.rs
 git commit -m "docs(read-profile): module doc; harness verified end to end
 
 Wiring verified locally (reads resolve, monotonic guard holds, clean

@@ -4,13 +4,13 @@
 
 **Goal:** Replace the per-read READ_PROBE quorum round with a single shared in-flight round that certifies every read already waiting when it was issued.
 
-**Architecture:** A new pure module `uc2_node/src/read_round.rs` owns the round state machine (`ProbeRound`: distinct-acker counting, the ordering-rule certification predicate, retransmit timing) with exhaustive unit tests. `uc2_node/src/node.rs` wires it into the existing barrier: admission records a round sequence instead of sending a probe; `on_read_probe_ack` targets the one live round; `advance_pending_reads` owns the round lifecycle (abandon, retransmit, next-round issue). Wire protocol, follower side, frontier wait, epoch backstop, and the 1 s deadline are untouched.
+**Architecture:** A new pure module `uc_node/src/read_round.rs` owns the round state machine (`ProbeRound`: distinct-acker counting, the ordering-rule certification predicate, retransmit timing) with exhaustive unit tests. `uc_node/src/node.rs` wires it into the existing barrier: admission records a round sequence instead of sending a probe; `on_read_probe_ack` targets the one live round; `advance_pending_reads` owns the round lifecycle (abandon, retransmit, next-round issue). Wire protocol, follower side, frontier wait, epoch backstop, and the 1 s deadline are untouched.
 
 **Tech Stack:** Rust workspace, no new dependencies. Spec: `docs/superpowers/specs/2026-07-26-uc2-rung-a-batch-probe-design.md`. Companion explainer: `docs/notes/uc2-read-barrier-explained.md`.
 
 ## Global Constraints
 
-- **Only `uc2_node` changes** (`src/lib.rs` one line, `src/node.rs`, new `src/read_round.rs`, `tests/query_barrier.rs`). No other crate, no Cargo.toml edits, no new dependencies, no wire-protocol change (`DGRAM_KIND_READ_PROBE`/`ACK` and `ReadProbeBody { nonce, from }` reused verbatim).
+- **Only `uc_node` changes** (`src/lib.rs` one line, `src/node.rs`, new `src/read_round.rs`, `tests/query_barrier.rs`). No other crate, no Cargo.toml edits, no new dependencies, no wire-protocol change (`DGRAM_KIND_READ_PROBE`/`ACK` and `ReadProbeBody { nonce, from }` reused verbatim).
 - **The certification gate is the ordering rule** (spec §3.2): a round releases exactly the `AwaitQuorum` reads with `round_seq <= round.seq`. The position comparison (`commit_at <= P_confirmed`) MUST NOT be the gate — spec §3.1 rejects it as unsafe. A `debug_assert!` of the position redundancy is required where the plan places it, and nowhere else.
 - `PROBE_RETRANSMIT_NS = 2_000_000` (2 ms), verbatim from spec §4. Retransmits reuse the round's `seq` and `nonce` unchanged — a retransmit can never widen a certification set.
 - A round is voided (never certifying anyone) on: `can_serve` false, term change, or **any voter-set change** (`rebuild_peer_maps`). Pending reads survive a voter-set void and wait for the next round; the existing RETRY path handles the other two.
@@ -25,12 +25,12 @@
 ### Task 1: The pure round module (`read_round.rs`)
 
 **Files:**
-- Create: `uc2_node/src/read_round.rs`
-- Modify: `uc2_node/src/lib.rs:30` (one `mod` line)
+- Create: `uc_node/src/read_round.rs`
+- Modify: `uc_node/src/lib.rs:30` (one `mod` line)
 - Test: inline `#[cfg(test)] mod tests` in `read_round.rs`
 
 **Interfaces:**
-- Consumes: `uc2_consensus::election::NodeId` (a `u32`).
+- Consumes: `uc_consensus::election::NodeId` (a `u32`).
 - Produces (all `pub(crate)`, used by Tasks 2–3):
   - `const PROBE_RETRANSMIT_NS: u64 = 2_000_000`
   - `struct ProbeRound { pub(crate) seq: u64, pub(crate) nonce: u64, pub(crate) term: u32, pub(crate) commit_at_issue: u64, /* private: */ ackers, quorum, last_send_ns }`
@@ -43,7 +43,7 @@
 
 - [ ] **Step 1: Declare the module**
 
-In `uc2_node/src/lib.rs`, after `mod node;` (line 30), add:
+In `uc_node/src/lib.rs`, after `mod node;` (line 30), add:
 
 ```rust
 mod read_round;
@@ -51,7 +51,7 @@ mod read_round;
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `uc2_node/src/read_round.rs`:
+Create `uc_node/src/read_round.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -64,7 +64,7 @@ Create `uc2_node/src/read_round.rs`:
 //! Spec: `docs/superpowers/specs/2026-07-26-uc2-rung-a-batch-probe-design.md`.
 //! Plain-language account: `docs/notes/uc2-read-barrier-explained.md`.
 
-use uc2_consensus::election::NodeId;
+use uc_consensus::election::NodeId;
 
 #[cfg(test)]
 mod tests {
@@ -134,7 +134,7 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test -p uc2_node read_round`
+Run: `cargo test -p uc_node read_round`
 Expected: FAIL — `cannot find struct ProbeRound` / `PROBE_RETRANSMIT_NS` not found.
 
 - [ ] **Step 4: Implement**
@@ -238,13 +238,13 @@ impl ProbeRound {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p uc2_node read_round`
+Run: `cargo test -p uc_node read_round`
 Expected: PASS, 6 tests. (`node.rs` is untouched, so the build emits no new warnings; `ProbeRound` being unused outside tests is fine because the test module uses it — if a `dead_code` warning appears anyway, do NOT suppress it; Task 2 consumes the type and clears it. Note it in the commit message instead.)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_node/src/lib.rs uc2_node/src/read_round.rs
+git add uc_node/src/lib.rs uc_node/src/read_round.rs
 git commit -m "feat(read-round): pure probe-round state machine for Rung A
 
 Distinct-acker counting (self-seeded), the ordering-rule certification
@@ -279,7 +279,7 @@ Pure and exhaustively unit-tested; the node wires it in next."
 Replaces the per-read probe with the shared round on the happy path.
 
 **Files:**
-- Modify: `uc2_node/src/node.rs` — `PendingRead` (~line 218), `Consensus` fields (~1053), construction (~790), `drain_query_ring` (~1979-2022), `on_read_probe_ack` (~1924-1943), in-file tests (`mk_read` ~3675, `barrier_counts_distinct_ackers_then_forwards_on_service_catchup` ~3690, and the epoch-sentinel test that also uses `mk_read`)
+- Modify: `uc_node/src/node.rs` — `PendingRead` (~line 218), `Consensus` fields (~1053), construction (~790), `drain_query_ring` (~1979-2022), `on_read_probe_ack` (~1924-1943), in-file tests (`mk_read` ~3675, `barrier_counts_distinct_ackers_then_forwards_on_service_catchup` ~3690, and the epoch-sentinel test that also uses `mk_read`)
 
 **Interfaces:**
 - Consumes: `crate::read_round::ProbeRound` (Task 1's exact signatures).
@@ -591,19 +591,19 @@ Immediately after the rewritten test:
 
 - [ ] **Step 8: Build, run the crate's tests, verify**
 
-Run: `cargo test -p uc2_node` (unit + integration; the existing `query_barrier` test drives a real 3-node cluster through the new round path — its healthy read exercises issue→ack→certify live, and its partitioned read exercises the deadline fallback, since abandon/retransmit don't exist yet).
+Run: `cargo test -p uc_node` (unit + integration; the existing `query_barrier` test drives a real 3-node cluster through the new round path — its healthy read exercises issue→ack→certify live, and its partitioned read exercises the deadline fallback, since abandon/retransmit don't exist yet).
 Expected: PASS, no new warnings.
 
-Run: `cargo clippy -p uc2_node --all-targets -- -D warnings`
+Run: `cargo clippy -p uc_node --all-targets -- -D warnings`
 Expected: clean.
 
-Run: `cargo clippy -p uc2_node --features mutation-testing --all-targets -- -D warnings`
+Run: `cargo clippy -p uc_node --features mutation-testing --all-targets -- -D warnings`
 Expected: clean. (This task edits code adjacent to the `#[cfg(feature = "mutation-testing")]` blocks, and the default build never compiles them — a broken cfg block would otherwise hide until weekly CI.)
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add uc2_node/src/node.rs uc2_node/src/lib.rs
+git add uc_node/src/node.rs uc_node/src/lib.rs
 git commit -m "feat(node): batch READ_PROBE rounds — one shared round certifies waiting reads
 
 Admission records the next round seq instead of sending a per-read probe;
@@ -622,7 +622,7 @@ a stuck round falls through to the unchanged 1 s deadline → RETRY path."
 ### Task 3: Round lifecycle — abandon triggers, retransmit, chaining
 
 **Files:**
-- Modify: `uc2_node/src/node.rs` — `advance_pending_reads` (~2038), `rebuild_peer_maps` (~1412), in-file tests
+- Modify: `uc_node/src/node.rs` — `advance_pending_reads` (~2038), `rebuild_peer_maps` (~1412), in-file tests
 
 **Interfaces:**
 - Consumes: `current_round`, `maybe_issue_round`, `ProbeRound::{term, should_retransmit, mark_sent, nonce, new}` from Tasks 1–2.
@@ -785,16 +785,16 @@ Add after `round_certifies_only_reads_admitted_before_issue`:
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cargo test -p uc2_node`
+Run: `cargo test -p uc_node`
 Expected: PASS (all in-file tests + `query_barrier` + the other integration tests).
 
-Run: `cargo clippy -p uc2_node --all-targets -- -D warnings`
+Run: `cargo clippy -p uc_node --all-targets -- -D warnings`
 Expected: clean.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_node/src/node.rs
+git add uc_node/src/node.rs
 git commit -m "feat(node): probe-round lifecycle — abandon, 2 ms retransmit, chaining
 
 A round is voided on lost serving, a term change, or ANY voter-set change
@@ -812,14 +812,14 @@ previous completes, and drops a round nobody waits on."
 Proves the wiring end to end on a real 3-node loopback cluster: a burst of concurrent linearizable reads (batched through shared rounds) all return correct values, and after partitioning the leader a concurrent burst is answered RETRY/NOT_LEADER — never a stale value.
 
 **Files:**
-- Modify: `uc2_node/tests/query_barrier.rs` (reuses `spawn_cluster`, `await_single_leader`, `cut`, `drive_submits`, `CountSm`)
+- Modify: `uc_node/tests/query_barrier.rs` (reuses `spawn_cluster`, `await_single_leader`, `cut`, `drive_submits`, `CountSm`)
 
 **Interfaces:**
 - Consumes: the public API only (`Client::query_linearizable`, `ClientError::{Retry, NotLeader}`) — this test observes behavior, not internals.
 
 - [ ] **Step 1: Write the test**
 
-Append to `uc2_node/tests/query_barrier.rs`:
+Append to `uc_node/tests/query_barrier.rs`:
 
 ```rust
 /// Rung A capstone: a burst of CONCURRENT linearizable reads — batched through
@@ -900,13 +900,13 @@ fn concurrent_batched_reads_stay_linearizable_across_partition() {
 
 - [ ] **Step 2: Run it**
 
-Run: `cargo test -p uc2_node --test query_barrier`
+Run: `cargo test -p uc_node --test query_barrier`
 Expected: PASS, both tests. (This test verifies existing behavior of the completed feature — if the healthy burst hangs or the partitioned burst returns `Ok`, that is a Rung A bug: report it, do not weaken the assertions.)
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add uc2_node/tests/query_barrier.rs
+git add uc_node/tests/query_barrier.rs
 git commit -m "test(query-barrier): concurrent batched reads across a partition
 
 8 concurrent readers against a healthy leader all observe the committed
@@ -933,7 +933,7 @@ Expected: green. Pay attention to `lin_v2` and `lin_partition_v2` — they drive
 Run: `cargo clippy --workspace --all-targets -- -D warnings`
 Expected: clean.
 
-Run: `cargo clippy -p uc2_node --features mutation-testing --all-targets -- -D warnings`
+Run: `cargo clippy -p uc_node --features mutation-testing --all-targets -- -D warnings`
 Expected: clean (the tooth's cfg blocks compile only under this feature).
 
 - [ ] **Step 3: Elle clean tier**

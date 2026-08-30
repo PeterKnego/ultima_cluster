@@ -4,8 +4,8 @@ The knobs a node and a service are constructed with, plus the environment
 switches the workspace reads.
 
 Field-level API documentation for these types is generated:
-[`NodeConfig`](https://peterknego.github.io/ultima_cluster/uc2_node/struct.NodeConfig.html)
-and the `uc2_service` config types. This page states the surface, its defaults,
+[`NodeConfig`](https://peterknego.github.io/ultima_cluster/uc_node/struct.NodeConfig.html)
+and the `uc_service` config types. This page states the surface, its defaults,
 and its limits.
 
 ## The config file
@@ -193,7 +193,7 @@ Journal purge policy. Default `PurgePolicy::Disabled`. The enabled form is
 `PurgePolicy::BelowSnapshot { slack_bytes }`.
 A `SnapshotPolicy` shortens a service restart only together with purge:
 reconstruction installs the newest artifact only when the journal no longer
-covers the start position (`uc2_service/src/replay.rs:73-78`); with purge off it
+covers the start position (`uc_service/src/replay.rs:73-78`); with purge off it
 replays the whole journal.
 To turn it on, see [Keep the journal from growing without bound](../how-to/bound-journal-growth.md).
 
@@ -214,11 +214,11 @@ Fault-injection configuration, used by the simulation and test harnesses.
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `UC2_CLIENT_TIMEOUT_MS` | `uc2_client` | Client request timeout, in milliseconds. |
+| `UC2_CLIENT_TIMEOUT_MS` | `uc_client` | Client request timeout, in milliseconds. |
 | `UC2_CRYPTO` | test and gate harnesses | `1` boots harness clusters with crypto enabled. Not read by `Node::start`; production nodes are configured through `NodeConfig::crypto`. |
-| `UC2_MUTATION` | `uc2_node`, `mutation-testing` feature only | Selects an injected consensus bug. Compiled out of the default build. |
+| `UC2_MUTATION` | `uc_node`, `mutation-testing` feature only | Selects an injected consensus bug. Compiled out of the default build. |
 | `CARGO_TARGET_TMPDIR` | test harnesses | Root for test instance directories. |
-| `UC2_ALLOW_VOLATILE_FS` | `uc2_node::preflight` | Any value permits an `instance_dir` on a RAM-backed filesystem. Test and development only, and never silent — the node warns on every boot. |
+| `UC2_ALLOW_VOLATILE_FS` | `uc_node::preflight` | Any value permits an `instance_dir` on a RAM-backed filesystem. Test and development only, and never silent — the node warns on every boot. |
 
 Harness-only variables that select workload shape — `ELLE_DIR`,
 `ELLE_TARGET_OPS`, `ELLE_WORKERS`, `ELLE_MIN_FAULTS`, `ELLE_HOLD_MS`,
@@ -248,7 +248,7 @@ Wire layout and reason-code table: `docs/superpowers/specs/2026-08-22-uc2-m12-ad
 §5's "As built" amendment.
 
 `[admin]` is required, like `[crypto]` — an absent section refuses to start.
-It has no `NodeConfig` field: `uc2-node`'s `main` (`uc2_node/src/bin/uc2-node.rs`)
+It has no `NodeConfig` field: `uc2-node`'s `main` (`uc_node/src/bin/uc2-node.rs`)
 is the one place that turns `[admin]` into a live `AdminPolicy` and hands it
 to `Node::start_with(cfg, StartOpts { socket: None, admin })`. `StartOpts`
 carries `admin: AdminPolicy` and (separately) an optional pre-bound `socket`
@@ -265,7 +265,7 @@ posture, byte-for-byte, so in-process tests and harnesses that never touch
 | `request_ttl_ms` | `30000` | How long a signed request's `expiry_ns` window may extend from the moment `uc2ctl` signs it. Must be `>= 1000` under either mode. This is a **node-side ceiling on the client**: a request's expiry must be `<= now + 2 × ttl` (the doubling absorbs ordinary clock skew), so a `uc2ctl --admin-ttl-secs` wider than that is refused `auth_expired` (22) on arrival, not honoured. |
 
 **Key file rule** (shared with `[crypto]`'s key material,
-`uc2_crypto::admin::check_key_file_perms`): exactly 32 bytes, mode `0600` —
+`uc_crypto::admin::check_key_file_perms`): exactly 32 bytes, mode `0600` —
 any group or world permission bit is a startup refusal (`uc2-node`) or a
 command refusal (`uc2ctl`) naming the path. Generate one with:
 
@@ -293,9 +293,9 @@ is operator-chosen and variable-length; every other field is fixed-width.
 `key_name_hash` — the field that names which key signed the request — is
 **not** part of the signed bytes; it is the standard 64-bit FNV-1a hash of
 the key's name, computed separately. Source of truth:
-`uc2_crypto::admin::AdminMessage::canonical_bytes` (fields), `sign`/`verify`
+`uc_crypto::admin::AdminMessage::canonical_bytes` (fields), `sign`/`verify`
 (the HMAC), `fnv1a64` (the name hash) — pinned against a fixed test vector
-in `uc2_crypto/src/admin.rs`.
+in `uc_crypto/src/admin.rs`.
 
 **`app_id` is a wrong-cluster guard, not a credential.** `uc2ctl` (and every
 IPC attach) checks it against the running node's `app_id` so a request aimed
@@ -318,7 +318,7 @@ against that datagram (the canonical message is bound to the *requesting*
 node's cnc page), so what it records is which peer vouched for the change
 (`peer:<id>`). The leader drops a kind-16 datagram whose source address
 resolves to no current member (`on_config_proposal`'s membership guard,
-`uc2_node::node`) before any work runs, but with `[crypto].enabled = false`
+`uc_node::node`) before any work runs, but with `[crypto].enabled = false`
 a network-path adversary who can spoof a member's UDP source address can
 still inject a proposal onto that plane. **`[admin] auth = "hmac"` only
 authenticates cluster-wide when paired with `[crypto].enabled = true`.**

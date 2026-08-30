@@ -19,7 +19,7 @@ Workspace: /home/claude/veil-spike (REAL DISK — box /tmp is RAM tmpfs, no heav
 - Veil preview builds here: mathlib via `lake exe cache get` (8010 files); lean-smt/auto + Veil = 1418 jobs green. NO version wall.
 - Only failure = npm infoview widget (browser trace viz, not core). Fixed offline: stubbed .lake/build/js/{RefreshComponent,traceDisplay,verificationResults}.js + commented `needs := #[widgetJsAll]` in lakefile (scratch checkout). Core + ModelChecker unaffected.
 - FFI: cvc5/z3 .so present under .lake/packages/{cvc5,z3}/. #model_check runs at ELABORATION → execute via `lake build <ExampleModule>` (links extern libs), NOT `lake env lean` (interpreter misses FFI → cvc5.TermManager.new symbol error).
-- ** CHECKER EXECUTES: Examples/Puzzles/DieHard built → `❌ Violation: safety_failure` + 7-state concrete trace with per-state action (init→FillBigJug→BigToSmall→...). 354ms. This trace shape = exactly what maps to a directed uc2_sim regression. **
+- ** CHECKER EXECUTES: Examples/Puzzles/DieHard built → `❌ Violation: safety_failure` + 7-state concrete trace with per-state action (init→FillBigJug→BigToSmall→...). 354ms. This trace shape = exactly what maps to a directed uc_sim regression. **
 - Caveat (documented): infoview HTML widget unavailable offline → no pretty in-editor trace rendering, but text trace (the artifact that matters) prints fine.
 => V0 GATE PASSED. Proceed to V1 (proofs-veil/ pkg + election-plane port + Bar-1 #check_invariants).
 
@@ -765,7 +765,7 @@ nothing in run 3 is built on an unaudited model change.
 
 14. **PROPOSED `MODEL-EDIT-1` — `commitEntry` counts reports that are not the leader's.**
     The model's `commitEntry` requires only `holdsE V` for quorum members. Real UC
-    counts a follower only via a **term-stamped Report**: `uc2_consensus/src/election.rs:545-552`
+    counts a follower only via a **term-stamped Report**: `uc_consensus/src/election.rs:545-552`
     drops `term < current_term` ("stale report: dropped") and turns `term > current_term`
     into `adopt_term` + return, so only a report whose sender was at the LEADER'S OWN
     term ever reaches `self.tracker.on_durable(slot, durable)` (election.rs:566-570);
@@ -800,13 +800,13 @@ nothing in run 3 is built on an unaudited model change.
     from 1. Both wins are legal in the model ⇒ no invariant can exclude it ⇒ (b).
     *Rust adjudication — NOT a real bug:* real UC's grant is gated on
     `log_ok` — `(cand_last_term, cand_last_durable) >= (our_term, our_durable)`
-    (`uc2_consensus/src/election.rs:342-350` free-function form, `:1240-1247` method,
+    (`uc_consensus/src/election.rs:342-350` free-function form, `:1240-1247` method,
     call site `:1222`) — and **config frames ARE log entries inside `durable`**, the
     contiguous fsynced frontier (gate doc §5 Q2 link 1, CONFIRMED-SAFE). Node 3, holding
     the C_1 config entry, has a strictly longer log than candidate node 0 at equal
     `last_term`, so it REFUSES. UC additionally carries Ongaro's single-server-change
     errata precondition: `propose_config` returns `NotServing` unless the leader has
-    committed an entry of its own term (`uc2_consensus/src/election.rs:876-878`, comment
+    committed an entry of its own term (`uc_consensus/src/election.rs:876-878`, comment
     "the single-server-change precondition") — a second guard the model also lacks.
     *Proposed edit:* extend the grant guard with config currency — an immutable strict
     chain order `cfgLt` (⊇ `succCfg`, transitive, irreflexive) plus
@@ -862,7 +862,7 @@ with **`ReconfigLC.lean:108`** (session 3), half-noted in the inline comment abo
 ("sound for the single-entry model (no divergent logs)") and never ledgered. Fixed.
 
 **ITEM 14 anchor emphasis (gate-required):** the PRIMARY Rust anchor for MODEL-EDIT-1
-is the **report term gate** — `uc2_consensus/src/election.rs:545-552` (stale dropped /
+is the **report term gate** — `uc_consensus/src/election.rs:545-552` (stale dropped /
 higher adopts) gating `tracker.on_durable` at `:566-570`. The `new_term_pos` clamp
 (`:1451-1456`) is a COMPANION only: its own class is excluded from this plane by the
 E-guard narrowing, not by the clamp.
@@ -952,7 +952,7 @@ sits outside its own node's config history — exactly the class the gate predic
     `C0`-quorum {3,4,+1} and B takes a disjoint `C2`-quorum from the other two `C0`
     nodes (who do not refuse: the candidate is AHEAD, not behind). **Two leaders at T.**
     *Rust adjudication — NOT a real bug:* `propose_config` returns `NotServing` unless
-    the leader has committed an entry of its OWN term (`uc2_consensus/src/election.rs:876-878`,
+    the leader has committed an entry of its OWN term (`uc_consensus/src/election.rs:876-878`,
     comment "the single-server-change precondition" — Ongaro's single-server-change
     errata). Commit is prefix-closed, so committing an own-term entry that postdates
     `C1`'s frame COMMITS `C1`. Hence in real UC B cannot propose `C2` while `C1` is
@@ -1244,7 +1244,7 @@ Two design notes worth carrying:
 
     *Rust adjudication — the real gate is strictly tighter (so this is (b)-class
     infidelity, an OVER-approximation, not a UC bug).* `propose_config` refuses unless
-    BOTH `self.serving` (`uc2_consensus/src/election.rs:876-877`, `NotServing`, the
+    BOTH `self.serving` (`uc_consensus/src/election.rs:876-877`, `NotServing`, the
     single-server-change precondition) and `!self.config_pending()`
     (`:879-880`, `ChangePending`), where `config_pending()` is
     `config_position > commit_seen` (`:854-858`). And a **LEADER's `commit_seen` has
@@ -1381,7 +1381,7 @@ line INSIDE the model definition, which none of these are).
 
 #### GATE 1c RULING — **MODEL-EDIT-4 APPROVED**, with binding amendments
 All Rust links independently verified by the gate: `config_pending()` at
-`uc2_consensus/src/election.rs:856-858` enforced at `:879-880`; `commit_seen` has
+`uc_consensus/src/election.rs:856-858` enforced at `:879-880`; `commit_seen` has
 **exactly two writers** — the gossip intake at `:594-595`, which is literally
 leader-excluded (`if !matches!(self.role, Role::Leader)`), and `rank_leader` at `:1457`,
 behind the Finding-#6b clamp at `:1451-1456`; initialisation at `:431`. No stop-the-arc

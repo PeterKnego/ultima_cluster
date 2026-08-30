@@ -34,7 +34,7 @@ with offline procedures, and their production answer (premium Cluster Standby)
 moves replacement *out* of the consensus protocol. Their retreat is an
 engineering warning about the integration surface — membership × snapshots ×
 truncation × recovery — not about the math. UC's bet: that surface is exactly
-what `uc2_sim` + the WGL capstones + the crashtest were built to hold. M7 is
+what `uc_sim` + the WGL capstones + the crashtest were built to hold. M7 is
 the first place v2 deliberately exceeds the reference.
 
 > **See also:** `docs/notes/uc2-m7-vs-aeron-cluster-standby-2026-07-24.md` — a
@@ -227,7 +227,7 @@ refused) — under crash/partition/truncation churn; 1000-seed heavy tier.
 1. **Unit:** CONFIG frame LE-byte pin; `ConfigRecord` roundtrip;
    precondition/tombstone logic; tracker rebuild-with-carried-reports remap.
 2. **Sim:** §8.
-3. **Integration** (`uc2_node/tests/reconfig.rs`): add→promote e2e; demote;
+3. **Integration** (`uc_node/tests/reconfig.rs`): add→promote e2e; demote;
    remove-voter incl. leader self-removal (step-down + re-election); crafted
    truncation-revert (divergent-leader shape); every refusal; joining-node
    bootstrap-from-seed.

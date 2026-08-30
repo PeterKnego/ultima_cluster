@@ -17,7 +17,7 @@ same order at (nearly) the same position, and that ordering is free — it is
 the log's, not something the applications have to arrange.
 
 What stays exactly as it was: one leader, one commit position, one journal,
-one archive, one election. `uc2_consensus`, the log frame, the UDP datagram
+one archive, one election. `uc_consensus`, the log frame, the UDP datagram
 header, the crypto plane and the ingress ring are untouched. An FSM is not a
 consensus participant; it is a reader of the committed byte stream, and M14
 adds readers.
@@ -33,7 +33,7 @@ with a const-assert that page 1 is now exactly full). The node creates
 `svc_query.<id>.ring`, `egress_service.<id>.broadcast` and `snapshots/<id>/`
 for every declared id; each FSM takes `service.<id>.lock` at attach and is
 refused with `ServiceNotDeclared` if its bit is clear
-(`uc2_service/src/attach.rs:78,95-103`).
+(`uc_service/src/attach.rs:78,95-103`).
 
 The declared set is `[services] ids` in `node.toml`, static, and must be
 identical on every node — it is not a live-reconfiguration surface
@@ -41,7 +41,7 @@ identical on every node — it is not a live-reconfiguration surface
 run `0..8`, and **id 0 must be declared**: it is the default responder and the
 only FSM a remote client can reach, because the remote protocol stays v1 and
 its `SUBMIT`/`QUERY` frames carry no service selector
-(`uc2_remote/src/frame.rs:19`, spec §6.4). Both facts are pinned as hard
+(`uc_remote/src/frame.rs:19`, spec §6.4). Both facts are pinned as hard
 limits ([Limits § Hard limits](../reference/limits.md#hard-limits)).
 
 ## The lag barrier
@@ -49,7 +49,7 @@ limits ([Limits § Hard limits](../reference/limits.md#hard-limits)).
 If two FSMs read the same log at their own pace, one of them will be slower.
 The question M14 had to answer is what happens then, and the answer that looks
 kindest — let it drift, it will catch up — is the one that kills the node.
-`uc2_node/src/services.rs:12-14`:
+`uc_node/src/services.rs:12-14`:
 
 > The FSM pacing policy (spec §1, "FSM pacing"). There is deliberately no
 > unbounded variant: an FSM slower than the log's sustained rate can never
@@ -75,21 +75,21 @@ bound at all (`services.rs:117-134`).
 
 The implementation is a **target cap**, not a lock. Before each batch the
 apply loop takes `floor = min(slot.applied)` over the declared ids — N acquire
-loads, no stores (`uc2_service/src/lag.rs:35-43`) — and turns the policy into
+loads, no stores (`uc_service/src/lag.rs:35-43`) — and turns the policy into
 a position: `target = min(head, floor + lag)` for bounded, or one frame,
 proceeding while `cursor <= floor` and waiting once `cursor > floor`, for
 lockstep (`lag.rs:45-68`).
 `LogFollower::next_batch(target)` then yields only frames whose *end* is at or
-below the target (`uc2_service/src/apply.rs:311-348`). A capped batch simply
+below the target (`uc_service/src/apply.rs:311-348`). A capped batch simply
 reads as if the log were idle; there is no barrier object, no shared lock, and
 the whole thing is shmem-local — it runs identically on the leader and on
 every follower, and never involves the node.
 
 What an operator sees when a bound is doing work:
-`uc2_service_lag_bytes{service}` (= `commit − applied`) sitting at
-`uc2_fsm_lag_bytes`, `uc2_service_lag_waits_total{service}` climbing on its
+`uc_service_lag_bytes{service}` (= `commit − applied`) sitting at
+`uc2_fsm_lag_bytes`, `uc_service_lag_waits_total{service}` climbing on its
 siblings, and `Uc2ServicePinnedAtLagBound` firing after 30 s
-(`uc2_node/src/obs/metrics.rs:341-356`,
+(`uc_node/src/obs/metrics.rs:341-356`,
 `packaging/prometheus/uc2-alerts.yml:93-110`). `lag_waits` counts wait
 *episodes* — the `false → true` edge — not cycles, so it reads as "how often
 did this FSM have to stop", not "how long did it spin"
@@ -120,7 +120,7 @@ The apply agent's idle strategy is a 50 µs sleep. A lockstep FSM that finds a
 sibling not yet at its frame took `Wait`, broke out of the loop, and slept —
 and *that sleep stalled every sibling's next frame*, so their waits exhausted
 too, and the whole set fell into sleeping in lockstep at ~18 k frames/s. The
-fix (`uc2_service/src/apply.rs:634-653`, `lockstep_wait`) is a ladder: 256
+fix (`uc_service/src/apply.rs:634-653`, `lockstep_wait`) is a ladder: 256
 spins, then 2 048 yields with a heartbeat refresh every 256, and only then the
 agent's sleep. Measured 631 k frames/s at N=2 on the same box. Both of those numbers are the FSMs alone on a dev box, and they do **not** predict a loaded host: on the fleet (2026-08-29, `docs/benchmarks/uc2-m14-gate-2026-08-29.md` row e) lockstep ran 60× slower than its bounded twin, at a fixed ~46 µs per frame, on a leader host running the node's four agents, both FSMs and the client on eight vCPUs.
 
@@ -151,10 +151,10 @@ the "bound" would be local decoration. M14 closes that by capping what a node
 *reports*.
 
 `report_ceiling(validated_up_to, min_applied, fsm_lag_eff)` returns
-`min(validated_up_to, min_applied + lag)` (`uc2_node/src/services.rs:225-230`),
+`min(validated_up_to, min_applied + lag)` (`uc_node/src/services.rs:225-230`),
 and that is the value the node publishes for the receiver to clamp every
 outgoing `AppendPosition` to
-(`uc2_node/src/node.rs:5095-5110`, `publish_validated_frontier`). Two
+(`uc_node/src/node.rs:5095-5110`, `publish_validated_frontier`). Two
 properties make this safe rather than clever: the ceiling is never above the
 validated frontier, so a node never attests content it has not validated (the
 wire-0.5.0 content-attestation argument is unchanged); and reporting *less*
@@ -162,7 +162,7 @@ than you hold is always sound in Raft — it only delays commit. Elections are
 untouched, because `RequestVote` carries the node's own
 `(last_term, last_durable)` from `ElectionSm`, never a report (spec §5.3).
 The sim carries it as invariant **inv10**: a node's outgoing durable report
-never exceeds its own apply ceiling (`uc2_sim/src/invariants.rs:24,207-237`).
+never exceeds its own apply ceiling (`uc_sim/src/invariants.rs:24,207-237`).
 
 The consequence is the liveness coupling M14 deliberately bought. If a
 **quorum's** FSMs lag past the bound, the leader's `CommitTracker` cannot
@@ -185,17 +185,17 @@ already out of model ([threat model §5](../security/threat-model.md#5-out-of-mo
 ## Routing and fan-in
 
 Every FSM applies every command; only the *response* is selective, and only on
-the leader (`uc2_service/src/apply.rs:380` — followers apply and publish
+the leader (`uc_service/src/apply.rs:380` — followers apply and publish
 nothing).
 
 - `try_submit(user_data, cmd)` is `try_submit_to(.., 0, ..)`: FSM 0 answers
-  (`uc2_client/src/engine.rs:480-482`).
+  (`uc_client/src/engine.rs:480-482`).
 - `try_submit_to(user_data, id, cmd)` awaits FSM `id`'s response
   (`engine.rs:486`).
 - `try_submit_all(user_data, cmd)` awaits the whole declared set and completes
   once, with every answer ordered by id (`engine.rs:508`).
 - `query_snapshot_on(id, q)` / `query_linearizable_on(id, q)` are the read
-  forms (`uc2_client/src/client.rs:147-164`).
+  forms (`uc_client/src/client.rs:147-164`).
 
 The selector rides in one place only: the `query.ring` payload became
 `service_id: u8 ++ query` (`uc_protocol/src/v2/ipc.rs:89-95`). The submit
@@ -203,7 +203,7 @@ path needs no selector at all — the log is broadcast, so the id lives entirely
 in the client's expectations. `drain_query_ring` splits the prefix, and an id
 this node has no ring for is answered `MSG_V2_BAD_SERVICE` on the node egress,
 pre-forward and side-effect-free, so the client may simply re-issue
-(`uc2_node/src/node.rs:3779-3796,3607-3614`). An undeclared id given to the
+(`uc_node/src/node.rs:3779-3796,3607-3614`). An undeclared id given to the
 SDK fails locally, before any ring is touched (`engine.rs:457-465`,
 `SubmitError::ServiceNotDeclared`; wrapped as `ClientError::ServiceNotDeclared`
 at `pipelined.rs:378-380`).
@@ -243,19 +243,19 @@ inserts one word, so `SNAP_BEGIN_FIXED_LEN` goes 26 → 34
 One thing the per-id install path does *not* do on its own: a
 `SnapshotPolicy` shortens a service restart only together with purge —
 reconstruction installs the newest artifact only when the journal no longer
-covers the start position (`uc2_service/src/replay.rs:73-78`); with purge off it
+covers the start position (`uc_service/src/replay.rs:73-78`); with purge off it
 replays the whole journal.
 
 The receiver writes each artifact to its own pre-sized `.part`, fsyncs and
 renames it as the contiguous frontier passes its end, and **adopts the floor
 only once every declared id has landed** — `received == services_declared` —
 so no FSM is ever stranded below an adopted floor
-(`uc2_net/src/receiver.rs:528-545`). Each FSM then installs its own artifact
+(`uc_net/src/receiver.rs:528-545`). Each FSM then installs its own artifact
 and tail-replays: the existing per-id path, untouched.
 
 Two named, counted refusals drop a session outright
-(`uc2_net/src/receiver.rs:1643-1657`, counters at `:467-481`, exposed as
-`Node::snapshot_session_refusals()`, `uc2_node/src/node.rs:1547`):
+(`uc_net/src/receiver.rs:1643-1657`, counters at `:467-481`, exposed as
+`Node::snapshot_session_refusals()`, `uc_node/src/node.rs:1547`):
 
 | refusal | trigger |
 |---|---|
@@ -269,7 +269,7 @@ below an adopted floor with no way back; a stalled joiner is a counter and an
 alert. The sending side has the quieter counterpart — a leader that cannot
 assemble a set covering its declared mask declines to open the session and
 says why once, `floor 0` / `missing artifact` / `set does not cover declared`
-(`uc2_net/src/sender.rs:1016-1046`, `uc2_node/src/node.rs:957-1004`).
+(`uc_net/src/sender.rs:1016-1046`, `uc_node/src/node.rs:957-1004`).
 
 The flag-day terms are the ones every prior wire bump used, with one twist
 worth knowing: **nothing on the receive path enforces the version.** The
@@ -284,45 +284,45 @@ node falls below the purge floor. Stop every node, swap, start every node:
 
 Every M10 family that described "the service" now has a labelled twin per
 declared id, rendered through `push_service_labeled`
-(`uc2_node/src/obs/metrics.rs:273`), a thin wrapper over the same
+(`uc_node/src/obs/metrics.rs:273`), a thin wrapper over the same
 `push_labeled` the peer-slot band already used (`metrics.rs:156`). The
 unlabelled names keep their names and now mean **the slowest FSM** — the
 node's consensus agent computes `min(applied)`,
 `min(snapshot_pos)`, `min(output_completed)` and the oldest heartbeat over the
 declared ids each cycle and publishes them to page 1
-(`uc2_node/src/services.rs:150-167`, `uc2_node/src/node.rs:2830`), so the
+(`uc_node/src/services.rs:150-167`, `uc_node/src/node.rs:2830`), so the
 purge floor, the readiness heartbeat, `uc2ctl status` and the dashboard all
 keep reading one number whose meaning widened.
 
-The new families are `uc2_service_attached{service}`,
-`uc2_service_lag_bytes{service}`, `uc2_service_lag_waits_total{service}`,
-`uc2_services_declared` (the bitmask) and `uc2_fsm_lag_bytes` (0 = lockstep),
-all in `CONTRACT_SERIES` (`uc2_node/src/obs/metrics.rs:61-65,333-371`), and
+The new families are `uc_service_attached{service}`,
+`uc_service_lag_bytes{service}`, `uc_service_lag_waits_total{service}`,
+`uc_services_declared` (the bitmask) and `uc2_fsm_lag_bytes` (0 = lockstep),
+all in `CONTRACT_SERIES` (`uc_node/src/obs/metrics.rs:61-65,333-371`), and
 each is rendered for every *declared* id — an FSM that never started is a `0`
 sample rather than a missing series, which is what makes it alertable at all
 ([Monitor a cluster § the per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)).
 
 The two alerts (`packaging/prometheus/uc2-alerts.yml:83-110`):
-`Uc2ServiceAbsent` (`uc2_service_attached == 0 for 30s`, critical) and
+`Uc2ServiceAbsent` (`uc_service_attached == 0 for 30s`, critical) and
 `Uc2ServicePinnedAtLagBound` (`lag_bytes >= fsm_lag_bytes for 30s`, bounded
 mode only, and gated on the FSM being attached so an absent FSM does not page
 twice with the wrong one on top).
 
 `uc2ctl status` prints the declared set, the effective policy, and one row per
 declared id — attached, epoch, incarnation, applied, lag, `snapshot_pos`,
-heartbeat age — straight off page 2 (`uc2ctl/src/main.rs:522-558`). Including
+heartbeat age — straight off page 2 (`uc_ctl/src/main.rs:522-558`). Including
 ids nothing has attached to, because that is exactly the row that explains a
 stalled cluster. And the `[log]` transition stream gained
 `service_attached` / `service_detached` records, emitted from the node's
 per-cycle aggregate pass on an epoch bump and on a heartbeat aging past the
 wedged threshold — or on the ATTACHED bit clearing, so an orderly stop is
 reported at once instead of after the stale window
-(`uc2_node/src/node.rs:2889-2910`).
+(`uc_node/src/node.rs:2889-2910`).
 
 ## What is not there yet
 
 **Remote-path FSM selection.** The remote protocol stays v1 and its request
-frames carry no selector (`uc2_remote/src/frame.rs:19`), so the gateway relays
+frames carry no selector (`uc_remote/src/frame.rs:19`), so the gateway relays
 every `SUBMIT`/`QUERY` through the local `Engine`'s default calls: a remote
 client always gets FSM 0's answer. `submit_to`, `submit_all` and `query_*_on`
 are shmem-only. A selector is a protocol-v2 item (spec §6.4, §11).

@@ -57,9 +57,9 @@ def prepare_host_27(host):
     cargo = m6.SshHost.CARGO
     cmd = (f"sudo mkdir -p {SRC27} && "
            f"{env} {cargo} build --release --manifest-path {SRC27}/Cargo.toml "
-           f"-p uc2_node --example m6_gate && "
+           f"-p uc_node --example m6_gate && "
            f"{env} {cargo} build --release --manifest-path {SRC27}/Cargo.toml "
-           f"-p uc2_gateway --example m12_gate && test -x {GATE27} && echo PREPARED27")
+           f"-p uc_gateway --example m12_gate && test -x {GATE27} && echo PREPARED27")
     r = ssh(host, cmd, label="build-2.7.0")
     if "PREPARED27" not in (r.stdout or ""):
         raise RuntimeError(f"2.7.0 build on {host.public_ip}: {(r.stderr or r.stdout)[-2000:]}")

@@ -5,7 +5,7 @@
 //! (de)serialization over byte slices. The `length` field at offset 0 is the
 //! commit word: written LAST with a release store, read with an acquire load,
 //! `0` = frame not yet committed. Those atomic ops live in the runtime crate
-//! (`uc2_log`) — this module never touches atomics so it stays `core`-only.
+//! (`uc_log`) — this module never touches atomics so it stays `core`-only.
 
 /// Every frame starts on a 32-byte boundary; frame slots are padded up to it.
 pub const FRAME_ALIGNMENT: usize = 32;

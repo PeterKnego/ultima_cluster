@@ -78,22 +78,22 @@ Read it in this order:
    means it is still holding its slot.
 3. **`lag` pinned at `fsm_lag`** (`Uc2ServicePinnedAtLagBound`) — that FSM is
    running, just slower than the log. (The rule is gated on
-   `uc2_service_attached == 1`, so a *detached* FSM whose lag has drifted to
+   `uc_service_attached == 1`, so a *detached* FSM whose lag has drifted to
    the bound pages as `Uc2ServiceAbsent` instead — case 1, not this one.)
    Nothing is broken; the cluster is being paced to it, which is what a bound
    buys you. Either make that FSM faster or accept the rate. Raising
    `fsm_lag` buys latency headroom, not throughput, and it is refused above
    `buffer_bytes / 2`.
 
-`uc2_service_lag_waits_total{service}` tells you the converse: an FSM whose
+`uc_service_lag_waits_total{service}` tells you the converse: an FSM whose
 wait counter climbs is the one *being* paced, i.e. a victim, not the cause.
-The cause is the id with the largest `uc2_service_lag_bytes`. Since **2.8.1**
+The cause is the id with the largest `uc_service_lag_bytes`. Since **2.8.1**
 the counter is reliable in both modes: a bounded FSM parked at a cap that
 sits mid-frame counts its wait episode too (before that it read 0 on exactly
 the FSM an operator was looking at). It counts EPISODES, not cycles or
 frames — one increment per park, however long the park lasts — so read its
 RATE as "how often this FSM is being held", not as a duration.
-`uc2_service_lag_bytes{service}` (what `Uc2ServicePinnedAtLagBound` keys on)
+`uc_service_lag_bytes{service}` (what `Uc2ServicePinnedAtLagBound` keys on)
 is the pinned-at-bound signal.
 
 The transition records name arrivals and departures explicitly:
@@ -153,7 +153,7 @@ it reaches zero. The journal writer **fail-stops** on any write or fsync `io`
 error — `ENOSPC` included — which halts the archive agent, logs
 `agent_failstopped`, and exits the daemon with code 1 for systemd to restart.
 This is loud and asserted by design, not a silent degradation: see
-`examples/uc2-crashtest/tests/enospc.rs`. Recovery is exactly "free the space,
+`examples/uc_crashtest/tests/enospc.rs`. Recovery is exactly "free the space,
 then let systemd restart it" — no special procedure; the node rejoins by
 replaying its journal, the same as any other clean restart.
 

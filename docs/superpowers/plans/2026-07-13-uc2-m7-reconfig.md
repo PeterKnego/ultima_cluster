@@ -6,7 +6,7 @@
 
 **Architecture:** a membership change is a `FRAME_TYPE_CONFIG = 4` frame appended in-stream by the leader (adopt-at-append) and adopted by followers when durably recorded (the archive frame-scan that data-stamps term maps also yields config observations); at adoption every slot-indexed structure is REBUILT (fresh `CommitTracker`, `follower_slot` remap, sender fan-out + flow control via a `CtrlMsg::SetPeers`), with the last durable report per surviving member carried over; one change in flight (a new proposal is refused until the previous config frame commits) makes exactly one level of durable config history (`ConfigRecord { cur, prev }`) sufficient, and truncation strictly below the config's frame-end position reverts to `prev` (persist-revert-before-truncate, inside the existing truncation-epoch latch); removed ids are tombstoned forever, and v2's known-source guards drop a removed node's traffic at the door (the job Raft needs pre-vote for); operators drive the five ops through a same-host cnc admin slot (`uc2ctl`), with follower→leader forwarding as datagram kinds 16/17.
 
-**Tech Stack:** Rust workspace (edition 2024), `uc_protocol` v2 (core-only wire codecs), `uc2_log` (StableValue `ConfigRecord`, archive config-scan), `uc2_consensus` (dep-free `ClusterConfig` + `ElectionSm` dynamic membership), `uc2_net` (SetPeers rebuild, kinds 16/17), `uc2_node` (adoption wiring, admin poll, uc2ctl), `uc2_sim` (inv6–9 + config fuzz), `uc-lincheck` (checker unchanged — again).
+**Tech Stack:** Rust workspace (edition 2024), `uc_protocol` v2 (core-only wire codecs), `uc_log` (StableValue `ConfigRecord`, archive config-scan), `uc_consensus` (dep-free `ClusterConfig` + `ElectionSm` dynamic membership), `uc_net` (SetPeers rebuild, kinds 16/17), `uc_node` (adoption wiring, admin poll, uc2ctl), `uc_sim` (inv6–9 + config fuzz), `uc_lincheck` (checker unchanged — again).
 
 ## Global Constraints
 
@@ -22,7 +22,7 @@ Copied from the spec (`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`
 - **Hard cap 8 total members** (voters + learners, incl. transitional), enforced at proposal — the cnc PeerSlots band is the limit.
 - **Protocol version bumps once** (minor +1) with FRAME_TYPE_CONFIG=4 + kinds 16/17 + the SNAP_BEGIN extension + new cnc offsets. v2.0 nodes refuse at entry (existing rule). Upgrade order documented: all binaries first, then reconfigure.
 - **Removed-node behavior:** on adopting a config excluding itself a node halts fail-stop; a leader removing itself keeps leading until the config entry COMMITS, then halts (step-down = existing election takes over).
-- **Every cnc counter has exactly one writer;** new slots land in 3456..4096 with the writer named at the offset constant. `uc_protocol` codecs stay core-only (no `SocketAddr` — addrs are `(u32 ipv4, u16 port)` LE on the wire and in `uc2_consensus`; only `uc2_node` converts).
+- **Every cnc counter has exactly one writer;** new slots land in 3456..4096 with the writer named at the offset constant. `uc_protocol` codecs stay core-only (no `SocketAddr` — addrs are `(u32 ipv4, u16 port)` LE on the wire and in `uc_consensus`; only `uc_node` converts).
 - **Apply stays sync/deterministic/no-I/O**; CONFIG frames are consensus-plane — the apply layer skips every non-MESSAGE frame type already (no service change).
 - **clippy `--workspace --all-targets -- -D warnings` stays clean** (CI enforces it now). Denied-lints history: `manual_is_multiple_of`, `int_plus_one`, `collapsible_if` (let-chains).
 - **Journals/instance dirs never on `/tmp` for load runs** (RAM tmpfs; the orchestrator enforces fs-type). Unit tests with tiny buffers may use `tempfile::tempdir()`; journal-bearing integration tests use `tempdir_in(env!("CARGO_TARGET_TMPDIR"))` (failover.rs pattern).
@@ -36,19 +36,19 @@ Copied from the spec (`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`
 |---|---|
 | Frame types + header | `uc_protocol/src/v2/frame.rs` (MESSAGE=1, PADDING=2, NEW_TERM=3; 32 B header; `write_header_except_length`/`read_header`) |
 | Datagram kinds | `uc_protocol/src/v2/datagram.rs` (1–15 used; body codec pattern = `SnapBeginBody` + `write_/read_snap_begin_body`) |
-| cnc offsets | `uc_protocol/src/v2/cnc.rs` (PeerSlots end at 3456; page 4096) + accessors in `uc2_log/src/cnc.rs` |
-| Durables | `uc2_log/src/state.rs` `NodeState` (vote/term_map/output_progress/snapshot StableValues + one cache Mutex) |
-| Election SM | `uc2_consensus/src/election.rs` (`ElectionSm`, `Event`, `Action`, `follower_slot` at :810, `become_leader` :658, `adopt_term` :677, truncating latch in `step` :337, `adopt_snapshot_lineage` :556) |
-| Commit ranking | `uc2_consensus/src/commit.rs` (`CommitTracker::new(n_followers, cluster_size)`, `on_durable(slot, durable)`, `advance(own)`, `reset_reports()`) |
-| Node wiring | `uc2_node/src/node.rs` (`NodeConfig` :106, construction :391–546, `do_work` steps 1–10 :972, `feed_net` :1613, `exec` :1758, `send(to, kind, position, term, body)` :1941) |
-| Leader append | `uc2_log/src/buffer.rs` `append_new_term` :427 (mirror for `append_config`) |
-| Archive scan | `uc2_log/src/archive.rs` term stamping :270–290, `take_term_observations` :289, `truncate_to` :293+ |
-| Sender control | `uc2_net/src/sender.rs` `CtrlMsg` :75, `with_learners` :245, `set_peer_slots` :298 |
-| Flow control | `uc2_net/src/flow.rs` (`new`, `on_status`, `limit`) |
-| Net events | `uc2_net/src/receiver.rs` `NetEvent` :55 (+ `kind_idx` — extend BOTH) |
-| Sim | `uc2_sim/src/world.rs` (`World`, `SimConfig`, `Msg`, `inject_*`, `crash/restart`), `uc2_sim/src/invariants.rs` (`InvariantChecker`) |
-| Integration helpers | `uc2_node/tests/failover.rs` (`spawn_cluster_ring`, `NodeH`, `make_config_ring`, `DEFAULT_RING`) |
-| L3 harness | `uc2_node/tests/lincheck_v2/mod.rs` (`ClusterCfg`, `start_cfg`, fault arms in `lin_v2.rs`) |
+| cnc offsets | `uc_protocol/src/v2/cnc.rs` (PeerSlots end at 3456; page 4096) + accessors in `uc_log/src/cnc.rs` |
+| Durables | `uc_log/src/state.rs` `NodeState` (vote/term_map/output_progress/snapshot StableValues + one cache Mutex) |
+| Election SM | `uc_consensus/src/election.rs` (`ElectionSm`, `Event`, `Action`, `follower_slot` at :810, `become_leader` :658, `adopt_term` :677, truncating latch in `step` :337, `adopt_snapshot_lineage` :556) |
+| Commit ranking | `uc_consensus/src/commit.rs` (`CommitTracker::new(n_followers, cluster_size)`, `on_durable(slot, durable)`, `advance(own)`, `reset_reports()`) |
+| Node wiring | `uc_node/src/node.rs` (`NodeConfig` :106, construction :391–546, `do_work` steps 1–10 :972, `feed_net` :1613, `exec` :1758, `send(to, kind, position, term, body)` :1941) |
+| Leader append | `uc_log/src/buffer.rs` `append_new_term` :427 (mirror for `append_config`) |
+| Archive scan | `uc_log/src/archive.rs` term stamping :270–290, `take_term_observations` :289, `truncate_to` :293+ |
+| Sender control | `uc_net/src/sender.rs` `CtrlMsg` :75, `with_learners` :245, `set_peer_slots` :298 |
+| Flow control | `uc_net/src/flow.rs` (`new`, `on_status`, `limit`) |
+| Net events | `uc_net/src/receiver.rs` `NetEvent` :55 (+ `kind_idx` — extend BOTH) |
+| Sim | `uc_sim/src/world.rs` (`World`, `SimConfig`, `Msg`, `inject_*`, `crash/restart`), `uc_sim/src/invariants.rs` (`InvariantChecker`) |
+| Integration helpers | `uc_node/tests/failover.rs` (`spawn_cluster_ring`, `NodeH`, `make_config_ring`, `DEFAULT_RING`) |
+| L3 harness | `uc_node/tests/lincheck_v2/mod.rs` (`ClusterCfg`, `start_cfg`, fault arms in `lin_v2.rs`) |
 | Fleet orchestrator | `bench-infra/scripts/m6_fleet_gate.py` (LocalHost/SshHost, probe/loadclient pattern, `assert_durable_fs`) |
 
 ---
@@ -62,7 +62,7 @@ Copied from the spec (`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`
 - Modify: `uc_protocol/src/v2/cnc.rs` (offsets 3456..3776)
 - Modify: `uc_protocol/src/v2/mod.rs` (export `config`)
 - Modify: `uc_protocol/src/version.rs` (minor +1)
-- Modify: `uc2_log/src/cnc.rs` (accessors + offset-pin test extension)
+- Modify: `uc_log/src/cnc.rs` (accessors + offset-pin test extension)
 
 **Interfaces:**
 - Produces: `uc_protocol::v2::frame::FRAME_TYPE_CONFIG: u8 = 4`
@@ -70,7 +70,7 @@ Copied from the spec (`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`
 - Produces: `DGRAM_KIND_CONFIG_PROPOSAL: u8 = 16`, `DGRAM_KIND_CONFIG_REPLY: u8 = 17`, `ConfigProposalBody { nonce: u64, op: u32, id: u32, ip: u32, port: u16 }`, `ConfigReplyBody { nonce: u64, status: u32, reason: u32, version: u64 }` + `write_/read_` fns (SnapBegin pattern)
 - Produces: `SnapBeginBody` gains `config: Vec<u8>` (the encoded `WireConfig` at the floor; length-prefixed u16 after `total_len` — old field offsets unchanged)
 - Produces cnc constants (all u64 lines, 64-B stride): `CNC_OFF_CONFIG_VERSION = 3456` (writer: consensus agent), `CNC_OFF_CONFIG_PENDING = 3520` (writer: consensus agent), `CNC_OFF_ADMIN_REQ = 3584` (writer: uc2ctl; layout within the line: seq u64 @+0 — written LAST/release, nonce u64 @+8, op u32 @+16, id u32 @+20, ip u32 @+24, port u32 @+28), `CNC_OFF_ADMIN_RESP = 3648` (writer: consensus agent; seq u64 @+0 echoes the request seq — written LAST/release, status u32 @+8, reason u32 @+12, version u64 @+16). Const-assert `3648 + 64 <= 4096`.
-- Produces `uc2_log::cnc::CncPage` accessors: `config_version()`, `config_pending()`, `admin_req_*()` / `write_admin_req(..)`, `admin_resp_*()` / `write_admin_resp(..)` (seqlock discipline: readers check seq; writers write fields then seq with release — mirror the existing PeerSlot accessor style).
+- Produces `uc_log::cnc::CncPage` accessors: `config_version()`, `config_pending()`, `admin_req_*()` / `write_admin_req(..)`, `admin_resp_*()` / `write_admin_resp(..)` (seqlock discipline: readers check seq; writers write fields then seq with release — mirror the existing PeerSlot accessor style).
 
 - [ ] **Step 1: failing tests for the config codec + frame type + kinds**
 
@@ -198,7 +198,7 @@ Expected: compile errors — `FRAME_TYPE_CONFIG`, `config` module, kinds not def
 //! Cluster-config wire codec (M7, spec 2026-07-13): the payload of a
 //! `FRAME_TYPE_CONFIG` frame, the snapshot-session config carry, and the
 //! durable record's canonical byte form. Core-only: addresses are
-//! `(ipv4 u32, port u16)` — `SocketAddr` conversion happens in `uc2_node`.
+//! `(ipv4 u32, port u16)` — `SocketAddr` conversion happens in `uc_node`.
 //!
 //! Layout (all LE):
 //!   version u64 | prev_position u64 | n_voters u16 | n_learners u16 |
@@ -306,7 +306,7 @@ pub const CONFIG_PROPOSAL_BODY_LEN: usize = 22;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigProposalBody {
     pub nonce: u64,
-    /// `uc2_consensus::config::ConfigOp` discriminant (1..=5).
+    /// `uc_consensus::config::ConfigOp` discriminant (1..=5).
     pub op: u32,
     pub id: u32,
     pub ip: u32,
@@ -341,7 +341,7 @@ pub struct ConfigReplyBody {
     pub nonce: u64,
     /// 0 = accepted; 1 = refused (see `reason`); 2 = retry (leader unknown/changed).
     pub status: u32,
-    /// `uc2_consensus::config::ProposeError` discriminant when refused.
+    /// `uc_consensus::config::ProposeError` discriminant when refused.
     pub reason: u32,
     /// New config version when accepted; current version otherwise.
     pub version: u64,
@@ -392,21 +392,21 @@ const _: () = assert!(CNC_OFF_ADMIN_RESP + 64 <= CNC_PAGE_LEN);
 
 `version.rs`: bump the CURRENT protocol version's **minor** by 1 (same major). Keep `MIN_COMPATIBLE` unchanged unless it equals CURRENT — the compat rule (`same major, other.minor <= ours`) already makes v2.0 nodes refuse a v2.1 peer.
 
-`uc2_log/src/cnc.rs`: add accessors following the existing PeerSlot style — `config_version()/store_config_version(v)`, `config_pending()/store_config_pending(bool)`, `read_admin_req() -> Option<AdminReq>` (returns `None` unless seq > the caller-supplied last-seen; struct `AdminReq { seq: u64, nonce: u64, op: u32, id: u32, ip: u32, port: u16 }`), `write_admin_req(&AdminReq)` (fields then seq, release), `read_admin_resp(seq) -> Option<AdminResp>`, `write_admin_resp(&AdminResp)`. Extend the `cnc.rs` layout-pin test with the four new offsets.
+`uc_log/src/cnc.rs`: add accessors following the existing PeerSlot style — `config_version()/store_config_version(v)`, `config_pending()/store_config_pending(bool)`, `read_admin_req() -> Option<AdminReq>` (returns `None` unless seq > the caller-supplied last-seen; struct `AdminReq { seq: u64, nonce: u64, op: u32, id: u32, ip: u32, port: u16 }`), `write_admin_req(&AdminReq)` (fields then seq, release), `read_admin_resp(seq) -> Option<AdminResp>`, `write_admin_resp(&AdminResp)`. Extend the `cnc.rs` layout-pin test with the four new offsets.
 
 - [ ] **Step 4: run tests**
 
-Run: `cargo test -p uc_protocol && cargo test -p uc2_log cnc`
+Run: `cargo test -p uc_protocol && cargo test -p uc_log cnc`
 Expected: PASS (incl. the extended pin tests).
 
 - [ ] **Step 5: clippy + commit**
 
-Run: `cargo clippy -p uc_protocol -p uc2_log --all-targets -- -D warnings`
+Run: `cargo clippy -p uc_protocol -p uc_log --all-targets -- -D warnings`
 
 ```bash
 git add uc_protocol/src/v2/config.rs uc_protocol/src/v2/frame.rs uc_protocol/src/v2/datagram.rs \
-        uc_protocol/src/v2/cnc.rs uc_protocol/src/v2/mod.rs uc_protocol/src/version.rs uc2_log/src/cnc.rs
-git commit -m "feat(uc_protocol,uc2_log): M7 wire layer — CONFIG frame type, config codec, kinds 16/17, admin cnc band, version minor bump"
+        uc_protocol/src/v2/cnc.rs uc_protocol/src/v2/mod.rs uc_protocol/src/version.rs uc_log/src/cnc.rs
+git commit -m "feat(uc_protocol,uc_log): M7 wire layer — CONFIG frame type, config codec, kinds 16/17, admin cnc band, version minor bump"
 ```
 
 ---
@@ -414,7 +414,7 @@ git commit -m "feat(uc_protocol,uc2_log): M7 wire layer — CONFIG frame type, c
 ### Task 2: Durable `ConfigRecord` in `NodeState`
 
 **Files:**
-- Modify: `uc2_log/src/state.rs`
+- Modify: `uc_log/src/state.rs`
 
 **Interfaces:**
 - Produces (serde structs for `StableValue`):
@@ -473,33 +473,33 @@ pub struct ConfigRecord {
     }
 ```
 
-- [ ] **Step 2: run to verify failure** — `cargo test -p uc2_log config_record` → compile error.
+- [ ] **Step 2: run to verify failure** — `cargo test -p uc_log config_record` → compile error.
 
 - [ ] **Step 3: implement** — add the structs above; add the `config` StableValue to `NodeState::open` (`dir.join("config.state")`); widen the cache tuple to include `Option<ConfigRecord>` (the module's single-lock pattern — extend, don't add a second Mutex); accessors mirror `store_snapshot_floor` (durable-on-return via `.wait().map_err(durability_error)`).
 
-- [ ] **Step 4: run** — `cargo test -p uc2_log state` → PASS (old tests untouched).
+- [ ] **Step 4: run** — `cargo test -p uc_log state` → PASS (old tests untouched).
 
 - [ ] **Step 5: commit**
 
 ```bash
-git add uc2_log/src/state.rs
-git commit -m "feat(uc2_log): durable ConfigRecord StableValue — cur+prev, one level (one-in-flight makes it sufficient)"
+git add uc_log/src/state.rs
+git commit -m "feat(uc_log): durable ConfigRecord StableValue — cur+prev, one level (one-in-flight makes it sufficient)"
 ```
 
 ---
 
-### Task 3: `uc2_consensus` — `ClusterConfig`, `ConfigOp`, and dynamic membership in `ElectionSm`
+### Task 3: `uc_consensus` — `ClusterConfig`, `ConfigOp`, and dynamic membership in `ElectionSm`
 
 **Files:**
-- Create: `uc2_consensus/src/config.rs`
-- Modify: `uc2_consensus/src/election.rs`
-- Modify: `uc2_consensus/src/lib.rs` (export `config`)
+- Create: `uc_consensus/src/config.rs`
+- Modify: `uc_consensus/src/election.rs`
+- Modify: `uc_consensus/src/lib.rs` (export `config`)
 
 **Interfaces:**
-- Produces `uc2_consensus::config`:
+- Produces `uc_consensus::config`:
 
 ```rust
-pub type Addr = (u32, u16); // (ipv4, port) — SocketAddr conversion is uc2_node's job
+pub type Addr = (u32, u16); // (ipv4, port) — SocketAddr conversion is uc_node's job
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterConfig {
@@ -643,7 +643,7 @@ impl ClusterConfig {
 
 Write these as REAL tests following the existing `election.rs` test-module helpers (there are extensive tests below line 900 — reuse their construction pattern; the promote-slack test drives `propose_config(ConfigOp::PromoteLearner{..})` with an explicit `slack` argument — see Step 3 signature note).
 
-- [ ] **Step 2: run to verify failures** — `cargo test -p uc2_consensus` → compile errors.
+- [ ] **Step 2: run to verify failures** — `cargo test -p uc_consensus` → compile errors.
 
 - [ ] **Step 3: implement**
 
@@ -746,36 +746,36 @@ Write these as REAL tests following the existing `election.rs` test-module helpe
 
 7. `become_leader`: after `tracker.reset_reports()`, ALSO clear `last_reports` (stale-term reports must not certify promote preconditions either).
 
-- [ ] **Step 4: run** — `cargo test -p uc2_consensus` → all PASS (old + new).
+- [ ] **Step 4: run** — `cargo test -p uc_consensus` → all PASS (old + new).
 
 - [ ] **Step 5: clippy + commit**
 
 ```bash
-cargo clippy -p uc2_consensus --all-targets -- -D warnings
-git add uc2_consensus/src/config.rs uc2_consensus/src/election.rs uc2_consensus/src/lib.rs
-git commit -m "feat(uc2_consensus): ClusterConfig + ConfigOp + dynamic membership — ConfigObserved adoption, rebuild-at-boundary w/ carried reports, propose_config behind the serving gate"
+cargo clippy -p uc_consensus --all-targets -- -D warnings
+git add uc_consensus/src/config.rs uc_consensus/src/election.rs uc_consensus/src/lib.rs
+git commit -m "feat(uc_consensus): ClusterConfig + ConfigOp + dynamic membership — ConfigObserved adoption, rebuild-at-boundary w/ carried reports, propose_config behind the serving gate"
 ```
 
-Note: `uc2_node` and `uc2_sim` will NOT compile until Tasks 4–5 migrate them off `ElectionConfig.members`. That is expected mid-branch; each task's own crate tests gate it. Do NOT run `--workspace` gates between Tasks 3 and 5.
+Note: `uc_node` and `uc_sim` will NOT compile until Tasks 4–5 migrate them off `ElectionConfig.members`. That is expected mid-branch; each task's own crate tests gate it. Do NOT run `--workspace` gates between Tasks 3 and 5.
 
 ---
 
 ### Task 4: Sim — config frames, inv6–9, counterfactual-red pins, fuzz arm
 
 **Files:**
-- Modify: `uc2_sim/src/world.rs`
-- Modify: `uc2_sim/src/invariants.rs`
-- Modify: `uc2_sim/tests/scenarios.rs`
+- Modify: `uc_sim/src/world.rs`
+- Modify: `uc_sim/src/invariants.rs`
+- Modify: `uc_sim/tests/scenarios.rs`
 
 **Interfaces:**
 - Consumes: Task 3's `Event::ConfigObserved`, `Action::{ConfigAdopted, HaltRemoved}`, `propose_config(op, slack)`, `ClusterConfig`, `ConfigOp`, `ProposeError`.
 - Produces (for scenario tests): `World::propose_config(node: usize, op: ConfigOp) -> Result<u64, ProposeError>` (returns the new version; models the leader append: enqueues the config frame into the leader's stream so followers observe it at durable), `World::node_config_version(node: usize) -> u64`, `World::halted_removed(node: usize) -> bool`, `SimConfig` gains `initial_learners: Vec<usize>` and `serving_gate_disabled: bool` (counterfactual, default false), `revert_on_truncate_disabled: bool` (counterfactual, default false).
 
-- [ ] **Step 1: migrate the sim's SM construction** to `ElectionConfig { config: ClusterConfig::genesis(...), config_position: 0, .. }` (all nodes get synthetic addrs `(node_idx as u32, 1)` — the sim never opens sockets). Run `cargo test -p uc2_sim` → existing scenarios must stay green BEFORE any new modeling (pure migration commit).
+- [ ] **Step 1: migrate the sim's SM construction** to `ElectionConfig { config: ClusterConfig::genesis(...), config_position: 0, .. }` (all nodes get synthetic addrs `(node_idx as u32, 1)` — the sim never opens sockets). Run `cargo test -p uc_sim` → existing scenarios must stay green BEFORE any new modeling (pure migration commit).
 
 ```bash
-git add uc2_sim/src/world.rs
-git commit -m "refactor(uc2_sim): migrate to ClusterConfig-based ElectionConfig (pure migration, scenarios green)"
+git add uc_sim/src/world.rs
+git commit -m "refactor(uc_sim): migrate to ClusterConfig-based ElectionConfig (pure migration, scenarios green)"
 ```
 
 - [ ] **Step 2: model config frames mechanically.** In `world.rs`: a config frame is data occupying positions in the modeled stream (like the NewTerm modeling); a follower node feeds `Event::ConfigObserved{position: frame_end, config}` when its durable crosses the frame end; the leader feeds it at append. `Action::ConfigAdopted` in the sim's action handler: record the node's `(version, position, prev)` in per-node sim state (the sim's mirror of the durable record); on `Action::Truncate` exec, if `to < config_position` and `!revert_on_truncate_disabled` → revert the mirror to prev (the sim models the NODE's obligation). `Action::HaltRemoved` → mark node halted (it stops being scheduled, like `crash` but permanent).
@@ -836,14 +836,14 @@ Each invariant gets a unit test in `invariants.rs` proving it CATCHES a violatio
         truncation churn; all invariants green on every seed */ }
 ```
 
-- [ ] **Step 5: run** — `cargo test -p uc2_sim && cargo test -p uc2_sim --features sim-heavy` → PASS.
+- [ ] **Step 5: run** — `cargo test -p uc_sim && cargo test -p uc_sim --features sim-heavy` → PASS.
 
 - [ ] **Step 6: clippy + commit**
 
 ```bash
-cargo clippy -p uc2_sim --all-targets -- -D warnings
-git add uc2_sim/src/world.rs uc2_sim/src/invariants.rs uc2_sim/tests/scenarios.rs
-git commit -m "feat(uc2_sim): config-change modeling — inv6-9, counterfactual-red serving-gate + revert pins, config-churn fuzz arm"
+cargo clippy -p uc_sim --all-targets -- -D warnings
+git add uc_sim/src/world.rs uc_sim/src/invariants.rs uc_sim/tests/scenarios.rs
+git commit -m "feat(uc_sim): config-change modeling — inv6-9, counterfactual-red serving-gate + revert pins, config-churn fuzz arm"
 ```
 
 ---
@@ -851,17 +851,17 @@ git commit -m "feat(uc2_sim): config-change modeling — inv6-9, counterfactual-
 ### Task 5: Node wiring — leader append, follower scan adoption, rebuild, cnc publish
 
 **Files:**
-- Modify: `uc2_log/src/buffer.rs` (add `append_config`)
-- Modify: `uc2_log/src/archive.rs` (config observations in the frame scan)
-- Modify: `uc2_net/src/sender.rs` (`CtrlMsg::SetPeers` + fan-out/flow rebuild)
-- Modify: `uc2_node/src/node.rs` (genesis seed, `ConfigObserved` feed, `exec` arms, conversions)
+- Modify: `uc_log/src/buffer.rs` (add `append_config`)
+- Modify: `uc_log/src/archive.rs` (config observations in the frame scan)
+- Modify: `uc_net/src/sender.rs` (`CtrlMsg::SetPeers` + fan-out/flow rebuild)
+- Modify: `uc_node/src/node.rs` (genesis seed, `ConfigObserved` feed, `exec` arms, conversions)
 
 **Interfaces:**
 - Consumes: Task 1 codecs, Task 2 `ConfigRecord`, Task 3 events/actions.
 - Produces: `Appender::append_config(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError>` (mirror `append_new_term` :427 with a payload; frame type CONFIG, returns frame-END position).
 - Produces: `Archive::take_config_observations(&mut self) -> Vec<(u64, Vec<u8>)>` — `(frame_end_position, payload_bytes)` for every CONFIG frame durably recorded since last call (detected in the same scan loop as term stamping :270–290; store the payload slice copy).
 - Produces: `CtrlMsg::SetPeers { followers: Vec<SocketAddr>, learners: Vec<SocketAddr>, cluster_size: usize }` — sender swaps fan-out lists, rebuilds `FlowControl::new(...)` re-feeding the last `Status` per surviving addr (keep a `last_status: HashMap<SocketAddr,(u64,u32)>` in the sender loop), and calls the existing `set_peer_slots` refresh.
-- Produces in `uc2_node`: `fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig`, `fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig`, `fn addr_of((ip, port): Addr) -> SocketAddr` (Ipv4).
+- Produces in `uc_node`: `fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig`, `fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig`, `fn addr_of((ip, port): Addr) -> SocketAddr` (Ipv4).
 
 - [ ] **Step 1: `append_config` + failing buffer test** (mirror the `append_new_term` test in `buffer.rs`: append a config frame, read it back via the reader, assert type/term/payload).
 
@@ -882,7 +882,7 @@ git commit -m "feat(uc2_sim): config-change modeling — inv6-9, counterfactual-
 
 - [ ] **Step 3: `CtrlMsg::SetPeers` + sender test** — existing sender unit-test style: build a sender with 2 followers, send `SetPeers` adding a third, assert the fan-out list length + flow limit re-derives from re-fed Status.
 
-- [ ] **Step 4: node wiring.** In `uc2_node/src/node.rs`:
+- [ ] **Step 4: node wiring.** In `uc_node/src/node.rs`:
   1. **Genesis seed** (construction, after `NodeState::open`): if `state.config_record()` is `None`, build genesis from `cfg.members`/`cfg.learners` (version 0, position 0) and `store_config_record`. Then construct `ElectionSm` from the RECORD (not the raw NodeConfig): `ElectionConfig { config: record_to_cluster(&rec.config), config_position: rec.position, .. }`. `NodeConfig.members`/`learners` keep their meaning as the SEED (doc update on the fields: "seed config — authoritative only for a fresh instance dir; the durable ConfigRecord + stream own it afterwards").
   2. **do_work step 1c** (after the existing 1b term-observation drain): drain `archive.take_config_observations()` → decode → `self.feed(Event::ConfigObserved { position, config })`; a decode failure is fail-stop (`panic!("corrupt CONFIG frame at {position}")` — CRC-covered bytes, so this is a bug, not line noise).
   3. **Leader append path**: a new `fn append_config_frame(&mut self, new_cfg: &ClusterConfig) -> u64` — encode via `cluster_to_wire(new_cfg, self.sm.config_position())`, `appender.append_config(term, &bytes)`, then feed `Event::ConfigObserved { position, config: new_cfg.clone() }` (adopt-at-append; the archive will re-observe it durably — idempotent by version).
@@ -926,15 +926,15 @@ git commit -m "feat(uc2_sim): config-change modeling — inv6-9, counterfactual-
   5. **Pending flag maintenance** (do_work, with the commit poll): when `commit >= sm.config_position()` and pending flag set → `store_config_pending(false)`.
   6. `rebuild_peer_maps` — extract the construction block at :431–446 into a method used by both construction and adoption.
 
-- [ ] **Step 5: migrate remaining `ElectionConfig` construction sites** (node.rs tests, `m4_gate`/`m5_gate`/`m6_gate` examples construct nodes via `NodeConfig` only — verify with `cargo build -p uc2_node --all-targets`).
+- [ ] **Step 5: migrate remaining `ElectionConfig` construction sites** (node.rs tests, `m4_gate`/`m5_gate`/`m6_gate` examples construct nodes via `NodeConfig` only — verify with `cargo build -p uc_node --all-targets`).
 
-- [ ] **Step 6: run** — `cargo test -p uc2_log -p uc2_net -p uc2_node --lib` then `cargo test -p uc2_node --test smoke --test failover --test learner --test purge_safety --test query_barrier` → all green (no behavior change for static clusters: genesis record == old static wiring).
+- [ ] **Step 6: run** — `cargo test -p uc_log -p uc_net -p uc_node --lib` then `cargo test -p uc_node --test smoke --test failover --test learner --test purge_safety --test query_barrier` → all green (no behavior change for static clusters: genesis record == old static wiring).
 
 - [ ] **Step 7: clippy + commit**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_log/src/buffer.rs uc2_log/src/archive.rs uc2_net/src/sender.rs uc2_node/src/node.rs
+git add uc_log/src/buffer.rs uc_log/src/archive.rs uc_net/src/sender.rs uc_node/src/node.rs
 git commit -m "feat(uc2): config adoption wiring — append_config, archive config-scan, CtrlMsg::SetPeers rebuild, persist-then-rebuild exec, cnc publish"
 ```
 
@@ -943,9 +943,9 @@ git commit -m "feat(uc2): config adoption wiring — append_config, archive conf
 ### Task 6: Truncation revert + boot re-adoption + snapshot config carry
 
 **Files:**
-- Modify: `uc2_node/src/node.rs` (`exec` `Action::Truncate` arm :1867, boot recovery, snapshot install path)
-- Modify: `uc2_net/src/sender.rs` + `uc2_net/src/receiver.rs` (SNAP_BEGIN config carry)
-- Modify: `uc2_consensus/src/election.rs` (`adopt_snapshot_config`)
+- Modify: `uc_node/src/node.rs` (`exec` `Action::Truncate` arm :1867, boot recovery, snapshot install path)
+- Modify: `uc_net/src/sender.rs` + `uc_net/src/receiver.rs` (SNAP_BEGIN config carry)
+- Modify: `uc_consensus/src/election.rs` (`adopt_snapshot_config`)
 
 **Interfaces:**
 - Consumes: `ConfigRecord` (Task 2), `SnapBeginBody.config` (Task 1).
@@ -957,15 +957,15 @@ git commit -m "feat(uc2): config adoption wiring — append_config, archive conf
 
 - [ ] **Step 3: boot re-adoption test + implementation.** Recovery already replays archive scans for term observations; ensure the SAME boot path drains `take_config_observations` from the recovery scan so a config frame above `record.position` re-adopts (idempotent by version). Test: write config frame → crash before persist (simulate: build node A, append+adopt, copy the instance dir BEFORE the record persist by constructing the record-less state manually) — simpler deterministic form: delete `config.state` from a stopped instance dir, reboot, assert the record is rebuilt from the journal scan to the same version.
 
-- [ ] **Step 4: snapshot carry.** Sender: populate `SnapBeginBody.config` from the node-provided snapshot source (extend `SnapshotSource` to `Option<(u64, PathBuf, u64, Vec<u8>)>` — the encoded config at/below the floor, produced from the CURRENT record; the leader's committed config is ≥ any config the floor could imply, and adopt-by-version idempotence makes over-delivery safe). Receiver: on `SNAP_BEGIN`, stash the config bytes with the session; on install completion the node decodes + calls `adopt_snapshot_config(floor, cfg)` + persists the fiat record. Extend the existing M6 learner below-floor test (`uc2_node/tests/learner.rs` snapshot-session case) to assert the joiner's `config_version` equals the leader's after install.
+- [ ] **Step 4: snapshot carry.** Sender: populate `SnapBeginBody.config` from the node-provided snapshot source (extend `SnapshotSource` to `Option<(u64, PathBuf, u64, Vec<u8>)>` — the encoded config at/below the floor, produced from the CURRENT record; the leader's committed config is ≥ any config the floor could imply, and adopt-by-version idempotence makes over-delivery safe). Receiver: on `SNAP_BEGIN`, stash the config bytes with the session; on install completion the node decodes + calls `adopt_snapshot_config(floor, cfg)` + persists the fiat record. Extend the existing M6 learner below-floor test (`uc_node/tests/learner.rs` snapshot-session case) to assert the joiner's `config_version` equals the leader's after install.
 
-- [ ] **Step 5: run** — `cargo test -p uc2_consensus -p uc2_net && cargo test -p uc2_node --test learner --test failover` → green.
+- [ ] **Step 5: run** — `cargo test -p uc_consensus -p uc_net && cargo test -p uc_node --test learner --test failover` → green.
 
 - [ ] **Step 6: clippy + commit**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_consensus/src/election.rs uc2_node/src/node.rs uc2_net/src/sender.rs uc2_net/src/receiver.rs
+git add uc_consensus/src/election.rs uc_node/src/node.rs uc_net/src/sender.rs uc_net/src/receiver.rs
 git commit -m "feat(uc2): config truncation-revert (persist-revert-before-truncate), boot re-adoption from journal scan, snapshot-session config carry"
 ```
 
@@ -974,9 +974,9 @@ git commit -m "feat(uc2): config truncation-revert (persist-revert-before-trunca
 ### Task 7: Admin path — cnc slots, node poll, kinds 16/17 forwarding, `uc2ctl`
 
 **Files:**
-- Create: `uc2_node/examples/uc2ctl.rs`
-- Modify: `uc2_node/src/node.rs` (do_work step 11: admin poll; `feed_net` arms for kinds 16/17)
-- Modify: `uc2_net/src/receiver.rs` (`NetEvent::{ConfigProposal, ConfigReply}` + `kind_idx` + demux)
+- Create: `uc_node/examples/uc2ctl.rs`
+- Modify: `uc_node/src/node.rs` (do_work step 11: admin poll; `feed_net` arms for kinds 16/17)
+- Modify: `uc_net/src/receiver.rs` (`NetEvent::{ConfigProposal, ConfigReply}` + `kind_idx` + demux)
 
 **Interfaces:**
 - Consumes: Task 1 admin cnc accessors + body codecs; Task 3 `propose_config`.
@@ -999,17 +999,17 @@ git commit -m "feat(uc2): config truncation-revert (persist-revert-before-trunca
 
 `handle_admin`: decode op → if leader: `sm.propose_config(op, self.admission_bytes)`; on Ok: `append_config_frame` + reply `{status: 0, version}` to the response line; on Err: reply `{status: 1, reason}`. If follower with a leader hint: remember `(seq, nonce)` in a 1-slot pending map and `send(leader_addr, DGRAM_KIND_CONFIG_PROPOSAL, ..)`; on `NetEvent::ConfigReply` matching the pending nonce → write the response line. No hint → reply `{status: 2 /*retry*/}`. Leader side `NetEvent::ConfigProposal`: same propose path, reply via kind 17 to `from`. **Nonce dedup:** leader keeps the last `(nonce, reply)` and re-sends the stored reply on a repeat nonce (retry-idempotent while the change is pending).
 
-- [ ] **Step 3: `uc2ctl`** — clap bin in `uc2_node/examples/uc2ctl.rs` (house style: `m6_gate probe` — `CncPage::open_file`, app_id check). Mutating flow: read current req seq, write fields+seq (the Task 1 accessor enforces field-then-seq/release), poll response ≤10 s.
+- [ ] **Step 3: `uc2ctl`** — clap bin in `uc_node/examples/uc2ctl.rs` (house style: `m6_gate probe` — `CncPage::open_file`, app_id check). Mutating flow: read current req seq, write fields+seq (the Task 1 accessor enforces field-then-seq/release), poll response ≤10 s.
 
-- [ ] **Step 4: integration test** (in `uc2_node/tests/reconfig.rs`, started here, extended in Task 9): 3-voter loopback cluster via `spawn_cluster_ring`; write an `add-learner` request into the LEADER's cnc via `CncPage` directly (the uc2ctl codepath minus the bin), assert: response accepted, config_version becomes 1 on all three nodes within a deadline, PeerSlots show the learner id with role=learner. Repeat via a FOLLOWER's cnc → forwarded, same outcome.
+- [ ] **Step 4: integration test** (in `uc_node/tests/reconfig.rs`, started here, extended in Task 9): 3-voter loopback cluster via `spawn_cluster_ring`; write an `add-learner` request into the LEADER's cnc via `CncPage` directly (the uc2ctl codepath minus the bin), assert: response accepted, config_version becomes 1 on all three nodes within a deadline, PeerSlots show the learner id with role=learner. Repeat via a FOLLOWER's cnc → forwarded, same outcome.
 
-- [ ] **Step 5: run** — `cargo test -p uc2_net && cargo test -p uc2_node --test reconfig` → green. Build the bin: `cargo build -p uc2_node --example uc2ctl`.
+- [ ] **Step 5: run** — `cargo test -p uc_net && cargo test -p uc_node --test reconfig` → green. Build the bin: `cargo build -p uc_node --example uc2ctl`.
 
 - [ ] **Step 6: clippy + commit**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_net/src/receiver.rs uc2_node/src/node.rs uc2_node/examples/uc2ctl.rs uc2_node/tests/reconfig.rs
+git add uc_net/src/receiver.rs uc_node/src/node.rs uc_node/examples/uc2ctl.rs uc_node/tests/reconfig.rs
 git commit -m "feat(uc2): admin path — cnc request/response slots, leader propose+append, follower forwarding (kinds 16/17), uc2ctl CLI"
 ```
 
@@ -1018,9 +1018,9 @@ git commit -m "feat(uc2): admin path — cnc request/response slots, leader prop
 ### Task 8: Leader self-removal, removed halt, joining-node bootstrap
 
 **Files:**
-- Modify: `uc2_consensus/src/election.rs` (self-removal completion)
-- Modify: `uc2_node/src/node.rs` (halt semantics; join docs)
-- Modify: `uc2_node/tests/reconfig.rs`
+- Modify: `uc_consensus/src/election.rs` (self-removal completion)
+- Modify: `uc_node/src/node.rs` (halt semantics; join docs)
+- Modify: `uc_node/tests/reconfig.rs`
 
 **Interfaces:**
 - Produces: `Action::StepDownRemoved` — emitted by the SM when (a) it is leader, (b) its adopted config excludes it, and (c) commit has crossed `config_position` (the entry is committed). Node exec: log, stop leading (feed nothing — just halt the process the same way `HaltRemoved` does; the remaining voters elect normally).
@@ -1036,13 +1036,13 @@ git commit -m "feat(uc2): admin path — cnc request/response slots, leader prop
   - `removed_follower_halts_and_zombie_cannot_disrupt`: remove a live follower; assert it halts; keep its socket sending forged Votes/Reports at the cluster (reuse the forged-report test technique from node.rs tests) → terms don't inflate (`current_term` stable across 2 s).
   - `joining_node_boots_from_stale_seed`: start a 3-voter cluster, run add-learner for id 5, THEN boot node 5 with a seed listing only the ORIGINAL 3 voters (stale seed) → it must adopt v1 from the stream and appear in peer bands; then promote it and assert quorum works with 4 voters (kill one other voter; cluster still commits).
 
-- [ ] **Step 5: run** — `cargo test -p uc2_consensus && cargo test -p uc2_node --test reconfig` → green.
+- [ ] **Step 5: run** — `cargo test -p uc_consensus && cargo test -p uc_node --test reconfig` → green.
 
 - [ ] **Step 6: clippy + commit**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_consensus/src/election.rs uc2_node/src/node.rs uc2_node/tests/reconfig.rs
+git add uc_consensus/src/election.rs uc_node/src/node.rs uc_node/tests/reconfig.rs
 git commit -m "feat(uc2): leader self-removal (step-down after commit), removed-node fail-stop halt, stale-seed join bootstrap"
 ```
 
@@ -1051,7 +1051,7 @@ git commit -m "feat(uc2): leader self-removal (step-down after commit), removed-
 ### Task 9: Integration suite — the remaining spec §9.3 scenarios
 
 **Files:**
-- Modify: `uc2_node/tests/reconfig.rs`
+- Modify: `uc_node/tests/reconfig.rs`
 
 **Interfaces:** consumes everything above; uses `failover.rs` helpers (`spawn_cluster_ring`, `NodeH::crash/restart`, `make_config_ring`).
 
@@ -1062,12 +1062,12 @@ git commit -m "feat(uc2): leader self-removal (step-down after commit), removed-
   - `truncation_revert_e2e`: craft the divergent-leader shape from `failover.rs`'s heal-with-truncation test, with the divergent tail CONTAINING a config frame (partition leader appends config to a minority, majority elects, heals) → the minority node truncates, reverts, then re-adopts the majority's config; assert `config_version` + journal record consistency.
   - `crash_mid_pending_recovers`: SIGKILL-free in-process variant — `NodeH::crash()` a follower after the leader appends a config but before it commits; restart it; it re-adopts from journal/stream; version converges.
 
-- [ ] **Step 2: run** — `cargo test -p uc2_node --test reconfig -- --test-threads=1` (cluster tests serialize by convention) → all green.
+- [ ] **Step 2: run** — `cargo test -p uc_node --test reconfig -- --test-threads=1` (cluster tests serialize by convention) → all green.
 
 - [ ] **Step 3: commit**
 
 ```bash
-git add uc2_node/tests/reconfig.rs
+git add uc_node/tests/reconfig.rs
 git commit -m "test(uc2): reconfig integration suite — replace recipe, resize 3-5-3, refusal matrix, truncation-revert e2e, crash-mid-pending"
 ```
 
@@ -1076,11 +1076,11 @@ git commit -m "test(uc2): reconfig integration suite — replace recipe, resize 
 ### Task 10: L3 lincheck fault arm + crashtest scenario
 
 **Files:**
-- Modify: `uc2_node/tests/lincheck_v2/mod.rs` (config-op driver + spare-node pool)
-- Modify: `uc2_node/tests/lin_v2.rs` (4th capstone)
-- Modify: `examples/uc2-crashtest/tests/hard_crash.rs` (mid-config-window SIGKILL)
+- Modify: `uc_node/tests/lincheck_v2/mod.rs` (config-op driver + spare-node pool)
+- Modify: `uc_node/tests/lin_v2.rs` (4th capstone)
+- Modify: `examples/uc_crashtest/tests/hard_crash.rs` (mid-config-window SIGKILL)
 
-**Interfaces:** consumes the admin path (drive ops via the leader's cnc like Task 7's test); `uc-lincheck` checker/history/model UNCHANGED (the invariant of every milestone).
+**Interfaces:** consumes the admin path (drive ops via the leader's cnc like Task 7's test); `uc_lincheck` checker/history/model UNCHANGED (the invariant of every milestone).
 
 - [ ] **Step 1: harness support** — `ClusterCfg` gains `spare_node: bool`; `LinClusterV2` gains `fn random_config_op(&mut self, rng: &mut StdRng) -> bool` cycling a spare id through add-learner → promote → demote → remove-learner (each step only when the previous committed — poll `config_pending`), returning whether an op was submitted; counter `config_ops_committed`.
 
@@ -1099,12 +1099,12 @@ fn linearizable_under_reconfig_churn() {
 
 - [ ] **Step 3: crashtest** — extend `hard_crash.rs` with `sigkill_mid_config_window`: drive an add-learner via the leader's cnc, SIGKILL the leader NODE process between append and commit (tight timing loop — accept whichever side the race lands on, both are valid histories), restart, assert: cluster converges to ONE of {v0, v1} on all nodes (never a mix after convergence), history stays Linearizable.
 
-- [ ] **Step 4: run** — `cargo test -p uc2_node --test lin_v2 linearizable_under_reconfig_churn` (then the full lin_v2), `cargo test -p uc2-crashtest --features hard-crash-tests` → green.
+- [ ] **Step 4: run** — `cargo test -p uc_node --test lin_v2 linearizable_under_reconfig_churn` (then the full lin_v2), `cargo test -p uc_crashtest --features hard-crash-tests` → green.
 
 - [ ] **Step 5: commit**
 
 ```bash
-git add uc2_node/tests/lincheck_v2/mod.rs uc2_node/tests/lin_v2.rs examples/uc2-crashtest/tests/hard_crash.rs
+git add uc_node/tests/lincheck_v2/mod.rs uc_node/tests/lin_v2.rs examples/uc_crashtest/tests/hard_crash.rs
 git commit -m "test(uc2): L3 reconfig-churn capstone (non-vacuity >=3 committed ops) + SIGKILL-mid-config-window crashtest"
 ```
 
@@ -1113,7 +1113,7 @@ git commit -m "test(uc2): L3 reconfig-churn capstone (non-vacuity >=3 committed 
 ### Task 11: Gate harness, fleet orchestrator, docs
 
 **Files:**
-- Create: `uc2_node/examples/m7_gate.rs` (m6_gate pattern: `node|service|learner|probe|loadclient` roles + in-process `all` smoke; probe JSON gains `config_version`/`config_pending`)
+- Create: `uc_node/examples/m7_gate.rs` (m6_gate pattern: `node|service|learner|probe|loadclient` roles + in-process `all` smoke; probe JSON gains `config_version`/`config_pending`)
 - Modify: `bench-infra/scripts/m6_fleet_gate.py` → add `--m7` scenarios (or `m7_fleet_gate.py` importing its host classes — prefer extending: the host classes, fs-guard, and loadclient logic are shared)
 - Create: `docs/benchmarks/uc2-m7-gate-2026-07-XX.md` (correctness proofs + smoke verdict + fleet placeholder, M6 doc structure)
 - Modify: `docs/ops/uc2-runbook.md` §6 (full ops table: the five ops, recipes, staleness warning, upgrade order, halt/decommission)
@@ -1132,7 +1132,7 @@ git commit -m "test(uc2): L3 reconfig-churn capstone (non-vacuity >=3 committed 
 - [ ] **Step 5: commit**
 
 ```bash
-git add uc2_node/examples/m7_gate.rs bench-infra/scripts/m6_fleet_gate.py \
+git add uc_node/examples/m7_gate.rs bench-infra/scripts/m6_fleet_gate.py \
         docs/benchmarks/uc2-m7-gate-*.md docs/ops/uc2-runbook.md README.md CLAUDE.md
 git commit -m "gate(uc2): m7_gate harness + fleet orchestrator scenarios (replace/resize/self-removal) + M7 gate doc (fleet PENDING) + runbook/README/CLAUDE.md"
 ```
@@ -1145,4 +1145,4 @@ git commit -m "gate(uc2): m7_gate harness + fleet orchestrator scenarios (replac
 
 - **Spec coverage:** §3 config model → T1/T2; §4 quorum/election (adoption, rebuild, one-in-flight, serving gate, removed voters, self-removal) → T3/T5/T8; §5 truncation revert (incl. `to == position` boundary + wipe fiat + snapshot carry) → T6; §6 ops + admin + recipes + staleness warning → T7 (+T9 refusal matrix); §7 net/cnc/versioning → T1/T5 (version bump in T1); §8 sim inv6–9 + counterfactual pins + fuzz → T4; §9 test plan → T9/T10/T11; §10 milestone shape → T11 + the post-T11 note. No spec requirement without a task.
 - **Type consistency:** `ConfigOp`/`ProposeError` discriminants match the wire `op`/`reason` codes (T1 ↔ T3 tables); `ConfigRecord` fields match T2 ↔ T5 exec; `propose_config(op, slack)` arity consistent in T3/T7; frame-END position semantics stated identically in T1 (scan), T3 (`ConfigObserved`), T6 (revert boundary).
-- **Known mid-branch break:** Tasks 3–5 intentionally break `uc2_sim`/`uc2_node` compilation until migration lands — called out in T3's note; workspace-wide gates resume at T5 step 7.
+- **Known mid-branch break:** Tasks 3–5 intentionally break `uc_sim`/`uc_node` compilation until migration lands — called out in T3's note; workspace-wide gates resume at T5 step 7.

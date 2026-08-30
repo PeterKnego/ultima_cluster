@@ -14,7 +14,7 @@ Read the tooling gap below before scheduling this for production.
 
 Generating a private key is one command. Deriving the **public** half for the
 allowlist currently requires code — the derivation lives in
-`uc2_crypto::identity::Identity::public_bytes()` and is exercised by the gate
+`uc_crypto::identity::Identity::public_bytes()` and is exercised by the gate
 harness, but is not exposed as an operator command.
 
 Until a keygen command exists, generate keys and allowlists programmatically,

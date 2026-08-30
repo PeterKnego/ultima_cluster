@@ -29,7 +29,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol **and the MPSC ring's per-record commit protocol** |
 | **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fifteen decoders that see bytes the process did not write |
-| **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc2_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
+| **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 
 ### The headline result
@@ -71,7 +71,7 @@ with zero warnings and zero `sorry`.
 ### What is proved
 
 **Kernel layer** (Phase 1) — 14 theorems over `Uc2Model`, a mathlib-free mirror of
-`uc2_consensus`'s three pure-sync safety kernels:
+`uc_consensus`'s three pure-sync safety kernels:
 
 - **Commit tracker** — commit is monotone; never certifies past the caller's own
   durable position; every commit value was backed by quorum-many reports at or
@@ -117,7 +117,7 @@ So: **`leader_completeness`, if completed over the current model, would be
 completed over a model that assumes that bug away.** Splitting the counter
 invalidates `ReportEraFloor`'s reflexivity proof and everything composed from
 it, so it is scoped as its own piece of work rather than a patch. The Rust is
-fixed and the `uc2_sim` half is closed (§2); the Lean half is open.
+fixed and the `uc_sim` half is closed (§2); the Lean half is open.
 
 State-machine safety is not attempted and is gated on finishing the above.
 
@@ -136,7 +136,7 @@ Every theorem passes `#print axioms` with only the standard Lean/mathlib trio �
 The honest objection to any protocol proof is: *your theorems are about a model,
 and you ship Rust.* Two mechanisms address it.
 
-**The conformance rig.** `uc2_consensus/examples/conform_gen.rs` drives the
+**The conformance rig.** `uc_consensus/examples/conform_gen.rs` drives the
 *real* `CommitTracker::advance`/`on_durable`/`reset_reports`,
 `reconcile::reconcile`, and `election::log_ok_order` under a seeded PRNG, emitting
 JSONL vectors whose expected values are the implementation's own output.
@@ -180,7 +180,7 @@ all, so no amount of vector replay against it would have surfaced the bug. Extra
 in [`ultima_db`](https://github.com/PeterKnego/ultima_db), where proofs run
 against mechanically translated code — was attempted here and **exited at a
 toolchain wall**: Aeneas's Lean support library pins v4.31.0 and does not build
-under this repo's v4.32.0. Charon processed `uc2_consensus` cleanly, so the
+under this repo's v4.32.0. Charon processed `uc_consensus` cleanly, so the
 approach is feasible; only the version timing blocks it. Downgrading the repo's
 Lean pin to chase a research tool was rejected. Retry condition: Aeneas bumps its
 toolchain to ≥ v4.32.0.
@@ -189,10 +189,10 @@ toolchain to ≥ v4.32.0.
 
 ## 2. Deterministic simulation
 
-**Location:** [`uc2_sim/`](/uc2_sim)
+**Location:** [`uc_sim/`](/uc_sim)
 
 A virtual-time cluster driving the *real* `ElectionSm` — `world.rs` wires
-`uc2_consensus` directly, so a fix in the consensus crate is automatically
+`uc_consensus` directly, so a fix in the consensus crate is automatically
 reflected rather than mirrored by hand. Seeded fault fuzz with ten whole-cluster
 safety invariants swept after **every** event:
 
@@ -241,16 +241,16 @@ restores the pre-fix index-aligned match through a `mutation-testing` tooth
 the sim then sees the wipes. Nightly runs both.
 
 ```bash
-cargo test -p uc2_sim                          # standard tier
-cargo test -p uc2_sim --features sim-heavy     # 1000-seed fuzz
-cargo test -p uc2_sim --features mutation-testing --test scenarios window_slide  # red twin
+cargo test -p uc_sim                          # standard tier
+cargo test -p uc_sim --features sim-heavy     # 1000-seed fuzz
+cargo test -p uc_sim --features mutation-testing --test scenarios window_slide  # red twin
 ```
 
 ---
 
 ## 3. Linearizability — WGL capstones
 
-**Location:** [`uc-lincheck/`](/uc-lincheck) + `uc2_node/tests`
+**Location:** [`uc_lincheck/`](/uc_lincheck) + `uc_node/tests`
 
 A concurrent CAS-register history checked for linearizability by a
 Wing-Gong-Lowe search, while the harness kills leaders, crashes services,
@@ -266,13 +266,13 @@ as `Indeterminate` in both histories rather than silently taken from FSM 0.
 
 | test | file | what it drives |
 |---|---|---|
-| `two_fsm_bounded` | `uc2_node/tests/lin_v2.rs` | two FSMs at `FsmLag::Bounded(64 KiB)` under failover and purge/snapshot churn |
-| `two_fsm_lockstep` | `uc2_node/tests/lin_v2.rs` | the same faults at `FsmLag::Lockstep` |
-| `two_fsm_slow` | `uc2_node/tests/lin_v2.rs` | a fast FSM beside `Slow<RegisterSm, 200>` (200 µs/apply), bounded |
-| `two_fsm_slow_lockstep` | `uc2_node/tests/lin_v2.rs` | the same pair in lockstep |
-| `minority_partition_and_heal_two_fsm` | `uc2_node/tests/lin_partition_v2.rs` | minority partition, quorum loss and heal, per-FSM WGL before and after |
-| `two_fsm_service_sigkill` | `examples/uc2-crashtest/tests/hard_crash.rs` | §5 — FSM 1's process `SIGKILL`ed mid-load |
-| `two_fsm_node_sigkill` | `examples/uc2-crashtest/tests/hard_crash.rs` | §5 — the node and both services killed together |
+| `two_fsm_bounded` | `uc_node/tests/lin_v2.rs` | two FSMs at `FsmLag::Bounded(64 KiB)` under failover and purge/snapshot churn |
+| `two_fsm_lockstep` | `uc_node/tests/lin_v2.rs` | the same faults at `FsmLag::Lockstep` |
+| `two_fsm_slow` | `uc_node/tests/lin_v2.rs` | a fast FSM beside `Slow<RegisterSm, 200>` (200 µs/apply), bounded |
+| `two_fsm_slow_lockstep` | `uc_node/tests/lin_v2.rs` | the same pair in lockstep |
+| `minority_partition_and_heal_two_fsm` | `uc_node/tests/lin_partition_v2.rs` | minority partition, quorum loss and heal, per-FSM WGL before and after |
+| `two_fsm_service_sigkill` | `examples/uc_crashtest/tests/hard_crash.rs` | §5 — FSM 1's process `SIGKILL`ed mid-load |
+| `two_fsm_node_sigkill` | `examples/uc_crashtest/tests/hard_crash.rs` | §5 — the node and both services killed together |
 
 Two more tests keep those honest rather than adding coverage of their own:
 
@@ -303,7 +303,7 @@ Two more tests keep those honest rather than adding coverage of their own:
   therefore do not exercise a bound-pinned state; the slow-FSM oracle is
   evidence of **equal progress** across a heterogeneous pair, not of the
   barrier's behaviour at the bound. The barrier at the bound is covered by
-  `uc2_service`'s `lag` unit tests and the apply-hop bench, not here.
+  `uc_service`'s `lag` unit tests and the apply-hop bench, not here.
 
 One more pin, from the M14d row-d lesson —
 `snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a `SnapshotPolicy`
@@ -402,7 +402,7 @@ build is byte-identical and the read-path mutation is `#[cfg]`-shadowed out.
 
 ## 5. Multi-process hard crash
 
-**Location:** [`examples/uc2-crashtest/`](/examples/uc2-crashtest)
+**Location:** [`examples/uc_crashtest/`](/examples/uc_crashtest)
 
 Real node and service processes, `SIGKILL`ed mid-load. Recovery is required to
 stay linearizable — not merely to start up.
@@ -415,7 +415,7 @@ together, then brings the node back and reattaches both. Six kill cycles across
 the two tests, every FSM history `Linearizable`, `equiv == 0` throughout.
 
 ```bash
-cargo test -p uc2-crashtest --features hard-crash-tests
+cargo test -p uc_crashtest --features hard-crash-tests
 ```
 
 ---
@@ -426,7 +426,7 @@ An exhaustive interleaving check of the frame-visibility protocol: the atomic
 handshake by which a reader observes a fully-written frame and never a torn one.
 
 ```bash
-RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release
 RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
 ```
 
@@ -463,17 +463,17 @@ takes the process down. Availability is the thing being defended here.
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 8 KiB control page (page-2 service-slot band and the 4032 pair since M14a) every attaching process maps and parses. A file on disk any local process with write access can corrupt. |
 | `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write. |
-| `uc2_remote_frame` | `uc2_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. Input from any client that can open a socket to the gateway. |
-| `uc2_crypto_open` | `uc2_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic, which runs on attacker-chosen bytes *before* the tag has been verified. |
-| `uc2_crypto_handshake` | `uc2_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface. With crypto enabled this is the first thing in the process to see bytes from anyone who can reach the UDP port. |
-| `uc2_crypto_group_key` | `uc2_crypto::group::GroupPlane::on_key_message` — the two distinct message shapes that share datagram kind 20, i.e. a decoder that must disambiguate hostile input. |
-| `uc2_crypto_admin` | `uc2_crypto::admin` — a **property** target over the M12b signed-tag layout: canonical-length agreement, sign/verify round-trip, tag bit-flips rejected, foreign key rejected. |
-| `ultima_journal_record` | `ultima_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment after a power loss or a full disk. |
-| `ultima_journal_stable_value` | `ultima_journal::stable_value` — the durable vote / term map / snapshot floor slots. Corruption here is a consensus-safety input, not merely a data-loss one. |
-| `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope under a fuzz-derived, deliberately tiny `SessionConfig` so client eviction, byte eviction and window trim are all reachable, plus its snapshot install path. |
-| `uc2_node_toml` | `uc2_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
-| `uc2_gateway_toml` | `uc2_gateway::config_file::parse_str` — the gateway's whole named-refusal path, including its own `EdgeConfig::validate`. |
-| `uc2_node_http` | `uc2_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
+| `uc_remote_frame` | `uc_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. Input from any client that can open a socket to the gateway. |
+| `uc_crypto_open` | `uc_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic, which runs on attacker-chosen bytes *before* the tag has been verified. |
+| `uc_crypto_handshake` | `uc_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface. With crypto enabled this is the first thing in the process to see bytes from anyone who can reach the UDP port. |
+| `uc_crypto_group_key` | `uc_crypto::group::GroupPlane::on_key_message` — the two distinct message shapes that share datagram kind 20, i.e. a decoder that must disambiguate hostile input. |
+| `uc_crypto_admin` | `uc_crypto::admin` — a **property** target over the M12b signed-tag layout: canonical-length agreement, sign/verify round-trip, tag bit-flips rejected, foreign key rejected. |
+| `uc_journal_record` | `uc_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment after a power loss or a full disk. |
+| `uc_journal_stable_value` | `uc_journal::stable_value` — the durable vote / term map / snapshot floor slots. Corruption here is a consensus-safety input, not merely a data-loss one. |
+| `uc_service_session` | `Sessioned<S>` — the exactly-once envelope under a fuzz-derived, deliberately tiny `SessionConfig` so client eviction, byte eviction and window trim are all reachable, plus its snapshot install path. |
+| `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
+| `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path, including its own `EdgeConfig::validate`. |
+| `uc_node_http` | `uc_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
 
 ### Method
 
@@ -553,8 +553,8 @@ because it happened: see the harness finding below.
 
 The same decoders are run under [Miri](https://github.com/rust-lang/miri) in
 nightly CI (`miri` job): `uc_protocol`'s `v2::` wire/cnc/ipc layer and `version`
-packing (43 tests), and `ultima_journal`'s segment and `stable_value` record
-decoders (19 tests), and `uc2_remote`'s `outgoing`/`completion`/`slots` SPSC
+packing (43 tests), and `uc_journal`'s segment and `stable_value` record
+decoders (19 tests), and `uc_remote`'s `outgoing`/`completion`/`slots` SPSC
 structures (29 tests, added with the 2.7.0 client — Vec-backed, so Miri models
 them fully, and it caught a real Stacked-Borrows aliasing bug there during
 that client's development). libFuzzer finds inputs that panic; Miri finds undefined
@@ -608,7 +608,7 @@ deliberately excluded from the trust story, under hard guardrails:
 
 1. **Veil is never the record.** Permanent proofs live in `proofs/` — Lean
    v4.32.0, standard axiom trio, no SMT in the trusted base. Veil's deliverables
-   are *countermodel traces* (which become directed `uc2_sim` regressions and
+   are *countermodel traces* (which become directed `uc_sim` regressions and
    Rust fixes) and, secondarily, candidate invariant text. A Veil model has no
    conformance rig; it is scratchpad-only. Any bug it finds is independently
    reconfirmed in Rust before a fix is made.
@@ -644,9 +644,9 @@ If an arm misses, the document records an honest FAIL and the real number, and
 the bar does not move. Git history is the audit trail — the decide rule and the
 result are separate commits, in that order.
 
-Below the gates sit the **hop-isolation harnesses** — `uc2_gateway/examples/hop_bench`
+Below the gates sit the **hop-isolation harnesses** — `uc_gateway/examples/hop_bench`
 (client, edge and node hops with stand-ins at their boundaries) and
-`uc2_node/examples/apply_bench` (the FSM's apply loop alone, driven by a fake
+`uc_node/examples/apply_bench` (the FSM's apply loop alone, driven by a fake
 node) — which produce ratios and ladders, never gated numbers: a dev-box
 figure is smoke. Their worked examples are `docs/benchmarks/uc2-m13-hop-bench-2026-08-24.md`
 and `docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md` (the latter found and
@@ -658,7 +658,7 @@ the M14b "−4.2 %" reading did not survive a fresh-build control.
 
 **Alert rules are proven to fire, not just to parse.**
 `scripts/m10_alert_fire.sh` builds or breaks a real cluster per rule
-(`uc2_node/examples/m10_alerts.rs`), scrapes each node's *real* `/metrics`
+(`uc_node/examples/m10_alerts.rs`), scrapes each node's *real* `/metrics`
 HTTP endpoint once a second, time-dilates the captured samples onto a
 synthetic timeline sized to that rule's `for:` clause, and lets
 `promtool test rules` adjudicate — one `PASS`/`FAIL` line per shipped rule,
@@ -677,7 +677,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc2_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---
@@ -692,7 +692,7 @@ The most important section, and the one most projects omit.
   value** (§1), which makes a load-bearing lemma trivially true in the model and
   false in the real system. A real acked-write-loss bug lived in exactly that gap
   (Finding #12) — found from the Rust side, not by the proofs. Rust fixed,
-  `uc2_sim` closed, Lean split still open. Until it is done, proofs composed over
+  `uc_sim` closed, Lean split still open. Until it is done, proofs composed over
   that lemma are weaker than they look.
 - **State-machine safety is not attempted**, and is gated on the above.
 - **The proofs cover the consensus kernels and protocol model, not the whole
@@ -733,11 +733,11 @@ The most important section, and the one most projects omit.
   closed by `2.8.1` (M14c2, spec §15.1, §16).** The record, so it can be
   audited rather than taken on trust:
   - **Seven two-FSM capstones** — `two_fsm_bounded`, `two_fsm_lockstep`,
-    `two_fsm_slow`, `two_fsm_slow_lockstep` (`uc2_node/tests/lin_v2.rs`),
+    `two_fsm_slow`, `two_fsm_slow_lockstep` (`uc_node/tests/lin_v2.rs`),
     `minority_partition_and_heal_two_fsm`
-    (`uc2_node/tests/lin_partition_v2.rs`), and `two_fsm_service_sigkill` /
-    `two_fsm_node_sigkill` (`examples/uc2-crashtest/tests/hard_crash.rs`).
-    Each checks **one WGL history per FSM** with the untouched `uc-lincheck`
+    (`uc_node/tests/lin_partition_v2.rs`), and `two_fsm_service_sigkill` /
+    `two_fsm_node_sigkill` (`examples/uc_crashtest/tests/hard_crash.rs`).
+    Each checks **one WGL history per FSM** with the untouched `uc_lincheck`
     checker (§3, §5).
   - **The replication-equivalence oracle** — every `submit_all`'s per-FSM
     answers must be byte-equal — is asserted at zero in all seven, and is
@@ -751,13 +751,13 @@ The most important section, and the one most projects omit.
     approached the bound (`max_lag` 192 B of 65536, and 64 B of 288), so this
     is evidence of equal progress, not of the barrier at the bound (§3).
   - **The Elle clean tier runs with two FSMs** — `elle_quiet_two_fsm`
-    (`uc2_node/tests/elle_v2.rs`), one history per FSM, both clean under
+    (`uc_node/tests/elle_v2.rs`), one history per FSM, both clean under
     `serializable` and `strong-serializable`. Its equivalence check can only
     fail on a malformed fan-in (`LaResp` has one variant); the equivalence
     evidence is the WGL capstones' (§4).
-  - **The M14c deferrals are closed** in `uc2_net` (snapshot-session refusal
+  - **The M14c deferrals are closed** in `uc_net` (snapshot-session refusal
     tests, the NAK-before-BEGIN skip, three new counters, a 60 s intake
-    timeout, a paced publish re-drive) and in `uc2_service`/`uc2_node`/`uc2ctl`
+    timeout, a paced publish re-drive) and in `uc_service`/`uc_node`/`uc2ctl`
     (`lag_waits` now counts bounded mid-frame stalls, the learner join pins the
     installed artifact positions, the pinned-at-bound alert threshold, the
     snapshot-decline latch test).
@@ -800,7 +800,7 @@ lake build                                                  # 3027 jobs, zero so
 lake exe conform --seed 20260716 --count 100000             # model vs. real Rust
 
 # Simulation
-cargo test -p uc2_sim --features sim-heavy                  # 1000-seed fuzz
+cargo test -p uc_sim --features sim-heavy                  # 1000-seed fuzz
 
 # Linearizability + the rest of the suite
 cargo test --workspace
@@ -813,19 +813,19 @@ scripts/elle_mutation.sh                                    # the harness's teet
 scripts/m10_alert_fire.sh
 
 # Hard crash
-cargo test -p uc2-crashtest --features hard-crash-tests
+cargo test -p uc_crashtest --features hard-crash-tests
 
 # Memory model
-RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+RUSTFLAGS="--cfg loom" cargo test -p uc_log --test loom_frame --release
 RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
 
 # Fuzzing — needs nightly + cargo-fuzz; CI uses 600 with --min-runs 10000
 scripts/fuzz_smoke.sh 30                                    # every target
-scripts/fuzz_smoke.sh --min-runs 10000 600 uc2_node_toml    # one, at CI budget
+scripts/fuzz_smoke.sh --min-runs 10000 600 uc_node_toml    # one, at CI budget
 
 # Miri — the pure decoders (needs the miri component on nightly)
 cargo +nightly miri test -p uc_protocol --lib -- v2:: version::
-cargo +nightly miri test -p ultima-journal --lib -- \
+cargo +nightly miri test -p uc_journal --lib -- \
   stable_value::tests:: error::tests:: journal::segment::tests::header_ \
   journal::segment::tests::record_ journal::segment::tests::decode_
 ```

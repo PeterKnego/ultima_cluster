@@ -73,7 +73,7 @@ Verified directly against the checkout at merge `aceb01e`, not recalled:
   - **The Finding #7 model refinement** (LC1/LC1b): replicate frames now
     carry a wire **header term** (provenance) distinct from the record
     stamp; delivery is exact-match on a **lagging `dataTerm` handle**
-    mirroring `uc2_net/src/receiver.rs`; a `serveTail` re-serve step models
+    mirroring `uc_net/src/receiver.rs`; a `serveTail` re-serve step models
     NAK-repair/journal-replay. `log_matching`/`election_safety` re-green.
     → **Option 1 is DONE.** (The prior draft's "prototype Option 1 in
     Veil" task is obsolete.)
@@ -115,7 +115,7 @@ Verified directly against the checkout at merge `aceb01e`, not recalled:
     the `dataTerm` model, no Rust bug) — it *forced the faithful model that
     exposed*:
   - **Finding #9 — CONFIRMED REAL Rust bug** (`4ce6eb3`, fix at
-    `uc2_node/src/node.rs:~2421` keying BOTH intake-gate reopen arms to
+    `uc_node/src/node.rs:~2421` keying BOTH intake-gate reopen arms to
     `current_term == adopted_term`): a candidate whose term handle lags
     could reopen DATA intake for the stale handle-term stream against a map
     never reconciled with it — handle-stamped reports then certify a
@@ -182,7 +182,7 @@ what's left is a proof-power gap, not a discovery gap.)
 
 1. **Veil is never the record.** Permanent proofs stay in `proofs/`
    (v4.32.0, standard axiom trio, no SMT in the trusted base). Veil's only
-   deliverables are **countermodel traces** (→ directed `uc2_sim`
+   deliverables are **countermodel traces** (→ directed `uc_sim`
    regressions + Rust fixes, the #6b/#9 pattern) and, secondarily,
    candidate invariant *text*. A Veil model has **no conformance rig**;
    it is scratchpad-only. Under this rule Veil soundness is not
@@ -329,12 +329,12 @@ in the same election-time coherence window the four bugs came from and has
   `ProtocolData.lean` (the LC1 frame plane — header term + `dataTerm` +
   `serveTail`); election/log-matching: `Protocol.lean`,
   `ElectionSafety.lean`, `LogMatching.lean`.
-- Rust anchors for the coherence window: `uc2_net/src/receiver.rs`
-  (exact header-term match, lagging handle), `uc2_node/src/node.rs:~2421`
+- Rust anchors for the coherence window: `uc_net/src/receiver.rs`
+  (exact header-term match, lagging handle), `uc_node/src/node.rs:~2421`
   (Finding #9 gate-reopen fix), `52c11d5` (commit clamp), `6ca2c95` (boot
   intake gate).
 - Conformance rig (the pattern Veil must NOT be mistaken for):
-  `proofs/Conform/Main.lean` + `uc2_consensus/examples/conform_gen.rs`.
+  `proofs/Conform/Main.lean` + `uc_consensus/examples/conform_gen.rs`.
 - Veil: `github.com/verse-lab/veil` (CAV 2025; re-check `lean-toolchain`
   and `veil-2.0-preview` at spike time — v4.24.0 pin verified 2026-07-19).
 - M7: `docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`,

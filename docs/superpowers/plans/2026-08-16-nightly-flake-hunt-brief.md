@@ -18,8 +18,8 @@ diagnosed (run ids for log retrieval):
 
 | night | run id | failing test | class |
 |---|---|---|---|
-| Aug 16 | 31925505297 | `resize_3_to_5_to_3` (uc2_node/tests/reconfig.rs:1192, "node never adopted its own removal", 20 s deadline) | reconfig adoption-timeout; documented "pre-existing 2/4 on loaded baseline" (memory `pre-existing-test-flakes`) |
-| Aug 15 | 31862981617 | `node_sigkill_recovery` (examples/uc2-crashtest/tests/hard_crash.rs:582) | crashtest recovery timeout. The two `apply.rs:385` panics in its log are the DESIGNED fail-stop (instance_id changed → service fail-stop) — expected SIGKILL noise, do NOT chase them |
+| Aug 16 | 31925505297 | `resize_3_to_5_to_3` (uc_node/tests/reconfig.rs:1192, "node never adopted its own removal", 20 s deadline) | reconfig adoption-timeout; documented "pre-existing 2/4 on loaded baseline" (memory `pre-existing-test-flakes`) |
+| Aug 15 | 31862981617 | `node_sigkill_recovery` (examples/uc_crashtest/tests/hard_crash.rs:582) | crashtest recovery timeout. The two `apply.rs:385` panics in its log are the DESIGNED fail-stop (instance_id changed → service fail-stop) — expected SIGKILL noise, do NOT chase them |
 | Aug 14 | 31771653976 | `sigkill_mid_config_window` (hard_crash.rs:746) | documented ~5%/run = the crypto-OFF floor (memory `m8-crypto-reconfig-open`) |
 
 Aug 9/10/12 failures NOT yet diagnosed — Phase 0 classifies them.
@@ -297,7 +297,7 @@ prevLogIndex/prevLogTerm match gating `commitIndex`; UC's equivalent
 evidence is the term-map reconcile, so the commit advance now waits for
 it.
 
-**Fix** (`uc2_consensus::ElectionSm`, the safety core, so the sim
+**Fix** (`uc_consensus::ElectionSm`, the safety core, so the sim
 adjudicates it): an `awaiting_reconcile` commit-validation latch, armed on
 adopting a strictly higher term (mirroring the node's existing data-plane
 latch + intake-gate close, derived at boot from the same recovered state:
@@ -495,7 +495,7 @@ lists, smaller reads), `ELLE_WORKERS=2` (halves op rate),
 `ELLE_JAVA_XMX=6g`. Decide rule still 3/3 PASS both models.
 
 **Directed-rig pre-commitment (stale-read root cause, 2026-08-16):**
-`uc2_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
+`uc_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
 cluster, 1 writer acking monotone register writes, 2 linearizable readers
 asserting every read ≥ the acked frontier snapshot taken BEFORE invoke,
 nemesis = elle's failover mix (alternating leader kill+restart /

@@ -4,7 +4,7 @@
 tempted by "we already batch fsync, so isn't it eventual anyway?" — and the
 mirror temptation, "eventual must be faster, fsync is expensive."
 **Status:** explanatory. The normative descriptions live in the code
-(`uc2_log/src/archive.rs`, `ultima_journal/src/journal/writer.rs`,
+(`uc_log/src/archive.rs`, `uc_journal/src/journal/writer.rs`,
 `ArchiveConfig::durability`) and the benchmark record
 (`docs/benchmarks/uc2-aeron-parity-2026-08-15.md`, eventual-durability arm);
 if this note and those disagree, they win and this note is stale.

@@ -33,11 +33,11 @@ the way are, in the order they bite an adopter:
 | Decision | Choice |
 |---|---|
 | Structure | **Umbrella spec, four sub-milestones, gateway first**: M12a gateway kit + state-machine contract → M12b admin authn/audit + explicit-choice config → M12c packaging/publishing/hygiene → M12d posture + review-ready package. Each merges to `main` as it lands; **one tag, `v2.6.0`, when all four are done.** |
-| Gateway shape | **C — a gateway kit**: a library over `uc2_client::Engine` (leader discovery, redirect, remote flow control, exactly-once envelope) plus a thin reference binary. Not a fixed daemon with a UC-owned protocol (B), not "every user rebuilds it" (A). **D — remote ingress in the node itself (what Aeron Cluster does)** is the better end-state but is consensus-agent work with its own client-auth story; it gets its own spec later, and C's library is written transport-agnostic so it becomes D's client SDK. |
+| Gateway shape | **C — a gateway kit**: a library over `uc_client::Engine` (leader discovery, redirect, remote flow control, exactly-once envelope) plus a thin reference binary. Not a fixed daemon with a UC-owned protocol (B), not "every user rebuilds it" (A). **D — remote ingress in the node itself (what Aeron Cluster does)** is the better end-state but is consensus-agent work with its own client-auth story; it gets its own spec later, and C's library is written transport-agnostic so it becomes D's client SDK. |
 | Non-leader write | **Redirect**, never forward. Edge stays stateless; clients reconnect. A forwarding mode is a documented seam, not a deliverable. |
 | Exactly-once across the remote hop | **Session-ordered protocol + FSM-side dedup adapter** (`Sessioned<S>`, the Raft-paper client-session model): the only scheme sound across edge crashes and failover. Raw pass-through (Aeron parity) stays available. |
 | Remote flow control | **Receiver-driven explicit credits** (Aeron Status-Message model): `HELLO_OK{credits}`, credit piggybacked on every `RESPONSE`, standalone `STATUS` when idle or when credits reopen. TCP push-back is the backstop only. `RETRY` is a state signal with a `retry_after` hint, never a load signal. |
-| Reference protocol | **Framed TCP, pipelined, opaque payload**, in `uc2_remote`. No HTTP shim, no gRPC. Plain TCP; posture stated (operator's TLS terminator if needed). |
+| Reference protocol | **Framed TCP, pipelined, opaque payload**, in `uc_remote`. No HTTP shim, no gRPC. Plain TCP; posture stated (operator's TLS terminator if needed). |
 | State-machine contract | **Two tiers, user's choice**: a new raw bytes-in/bytes-out `RawStateMachine` core and today's typed serde/bincode `StateMachine` as a blanket adapter on top. Decided by the 2026-08-22 codec spike (`docs/notes/2026-08-22-codec-budget-spike.md`): with `Vec<u8>`-typed commands the apply thread is decode-bound (56–85 % of its cycles); the format is not the cost (SBE == raw); the typing and the per-frame allocation are. No SBE dependency in UC. |
 | Admin credential | **Named HMAC-SHA256 keys in `[admin]`**; request tag in a new 64-byte cnc line inside the reserved band; `audit.jsonl` under the instance dir. `auth = "none"` is the deliberate legacy opt-out. |
 | Explicit-choice config | `[crypto]` and `[admin]` go from absent-means-off to **absent-means-refuse-to-start**. Stated upgrade consequence. |
@@ -67,7 +67,7 @@ on the remote client link** in this release.
 > **Amendment (Task 13, as-built).** The plan below sketches a `Typed<S>`
 > wrapper (`impl<S: StateMachine> RawStateMachine for Typed<S>`). What
 > shipped is a **blanket impl directly on `S`** —
-> `impl<S: StateMachine> RawStateMachine for S`, `uc2_service/src/traits.rs`
+> `impl<S: StateMachine> RawStateMachine for S`, `uc_service/src/traits.rs`
 > — with no `Typed<S>` newtype at all: a typed `StateMachine` simply *is* a
 > `RawStateMachine`, not something wrapped into one. `ServiceBuilder::new`
 > therefore accepts either tier directly (no separate `::raw` constructor);
@@ -77,10 +77,10 @@ on the remote client link** in this release.
 > byte-identity promise, the measured cost split) shipped as written. See
 > `docs/reference/state-machine-contract.md` for the as-built reference.
 
-Today `uc2_service::StateMachine` is typed (`Command/Response/Query/
+Today `uc_service::StateMachine` is typed (`Command/Response/Query/
 QueryResponse: Serialize + DeserializeOwned`) and the framework does one
 bincode-standard decode per command at the apply boundary
-(`uc2_service/src/apply.rs`, also `replay.rs`, `output.rs`) and one encode
+(`uc_service/src/apply.rs`, also `replay.rs`, `output.rs`) and one encode
 per response (`egress.rs`). The transport is bytes end-to-end; only the
 trait forces the codec. The spike measured that cost at 56–85 % of the apply
 thread's cycles for `Vec<u8>`-typed commands (~1.5 ns/payload byte), dropping
@@ -118,7 +118,7 @@ impl<S: StateMachine> RawStateMachine for S { /* bincode standard */ }
   use SBE/flatbuffers/hand-laid frames directly — UC takes no such dependency.
 - The client tiers mirror this already (`Engine::try_submit(&[u8])` is raw;
   `PipelinedClient`/`Client` are typed).
-- The `apply-profile` feature (uc2_service, off by default, zero-cost when
+- The `apply-profile` feature (uc_service, off by default, zero-cost when
   off) stays as the measuring tool; the M12a fleet gate re-runs the M5 ladder
   with it on, for a raw `CountSm` and the typed one, and publishes the codec
   share.
@@ -126,9 +126,9 @@ impl<S: StateMachine> RawStateMachine for S { /* bincode standard */ }
 ### 3.2 Version identity and the semver promise
 
 `workspace.package.version = "2.6.0"`; every internal path dependency gains
-`version = "2.6.0"` (publish requires it); `ultima_journal` joins the
+`version = "2.6.0"` (publish requires it); `uc_journal` joins the
 workspace version; `uc2ctl` drops `publish = false`; `examples/*` and
-`uc-lincheck` stay unpublished. All eleven names are free on crates.io
+`uc_lincheck` stay unpublished. All eleven names are free on crates.io
 (checked 2026-08-22). `rust-version` = the lowest stable that passes (≥ 1.88,
 `ultima-db 0.1.1`'s floor; edition 2024 needs ≥ 1.85); `rust-toolchain.toml`
 pins that stable; CI gains an `msrv` job.
@@ -136,7 +136,7 @@ pins that stable; CI gains an `msrv` job.
 `docs/reference/semver-policy.md` names the promised surface:
 `RawStateMachine`, `StateMachine`, `SnapshotStateMachine`, `OutputHandler`,
 `Sessioned`, `NodeConfig` + `node.toml`, `gateway.toml`, the three client
-tiers, the `uc2_remote` protocol (its own `version` field, v1), `uc2ctl`
+tiers, the `uc_remote` protocol (its own `version` field, v1), `uc2ctl`
 verbs and exit codes. Everything else is `#[doc(hidden)]` or documented as
 internal. Wire protocol (`version::CURRENT`) and the cnc page version stay
 flag-day (policy unchanged, restated in the same doc). A breaking change to
@@ -162,17 +162,17 @@ choices are written down. Test fixtures and gates choose explicitly.
 
 ### 4.1 Crates
 
-- **`uc2_remote`** — the remote wire protocol (codec, frame types, constants)
+- **`uc_remote`** — the remote wire protocol (codec, frame types, constants)
   and the Rust remote client (`RemoteClient`: connect, pipelined submit/query,
   credit accounting, redirect following, re-send after failover). Deps:
   `bytes`, `serde` (for typed convenience only), std TCP. No shmem stack —
   this is what a polyglot port re-implements.
-- **`uc2_gateway`** — the edge library (`Edge`) over `uc2_client::Engine`,
+- **`uc_gateway`** — the edge library (`Edge`) over `uc_client::Engine`,
   plus `src/bin/uc2-gateway.rs`, the reference binary driven by
   `gateway.toml`.
-- **`uc2_service::session`** — `Sessioned<S>` (no new dependencies).
+- **`uc_service::session`** — `Sessioned<S>` (no new dependencies).
 
-### 4.2 Remote protocol (`uc2_remote`, protocol v1)
+### 4.2 Remote protocol (`uc_remote`, protocol v1)
 
 Frame: `u32 len | u8 type | u8 flags | u16 version | u64 client_id | u64 seq
 | payload`. Payload is **opaque command/query/response bytes** — the gateway
@@ -209,7 +209,7 @@ before frames leave the client. A client that ignores credits is stopped by
 the edge ceasing to read its socket (TCP window closes): the backstop, not
 the mechanism. No frame is ever accepted and then bounced for capacity.
 
-### 4.3 The edge (`uc2_gateway::Edge`)
+### 4.3 The edge (`uc_gateway::Edge`)
 
 - One `Engine` per edge process: a `SendHalf` per acceptor thread, one
   `PollHalf` driver thread. Connection table keyed by `user_data =
@@ -308,8 +308,8 @@ durably anywhere.
 ### 4.6 Tests and gate
 
 1. **Remote lincheck capstone** (CI, hard-crash style): 3 nodes + 3 edges,
-   `RemoteClient`s pipelining through `uc2_remote`, leader SIGKILLed
-   repeatedly; `uc-lincheck` asserts linearizable and **zero acked writes
+   `RemoteClient`s pipelining through `uc_remote`, leader SIGKILLed
+   repeatedly; `uc_lincheck` asserts linearizable and **zero acked writes
    lost**; run with the envelope on (default) and off.
 2. `Sessioned` unit/property tests: replay, expiry, gap, LRU eviction,
    snapshot round-trip of the dedup table, position tag.
@@ -331,19 +331,19 @@ durably anywhere.
 > below correct this section's sketch against what actually shipped;
 > §5.1/§5.3/§5.4's prose is otherwise as written. Names below match code
 > exactly: `AdminAuth`, `AdminKey`, `AdminPolicy`, `AdminMessage`, `sign`/
-> `verify` (`uc2_crypto::admin`); `StartOpts`, `Node::start_with`,
+> `verify` (`uc_crypto::admin`); `StartOpts`, `Node::start_with`,
 > `REASON_AUTH_*`/`REASON_AUDIT_FAILED`, `verify_admin`, `handle_admin`
-> (`uc2_node::node`); `AuditLog`/`AuditRecord`/`AuditOutcome`/`AuditOrigin`
-> (`uc2_node::audit`); `AdminSection`/`AdminKeyEntry`/`AdminAuthMode`,
+> (`uc_node::node`); `AuditLog`/`AuditRecord`/`AuditOutcome`/`AuditOrigin`
+> (`uc_node::audit`); `AdminSection`/`AdminKeyEntry`/`AdminAuthMode`,
 > `ConfigError::{CryptoChoiceRequired, AdminChoiceRequired}`
-> (`uc2_node::config_file`).
+> (`uc_node::config_file`).
 >
 > **§5.2 canonical message, corrected.** The line below in §5.2's own text
 > is the un-amended sketch and is missing two things the shipped code does:
 > a length prefix on `app_id`, and an explicit byte order. The actual bytes
 > `sign`/`verify` compute the tag over
-> (`uc2_crypto::admin::AdminMessage::canonical_bytes`, the one source of
-> truth both `uc2ctl` and `uc2_node` build independently from the same wire
+> (`uc_crypto::admin::AdminMessage::canonical_bytes`, the one source of
+> truth both `uc2ctl` and `uc_node` build independently from the same wire
 > fields) are, **all integers little-endian**:
 >
 > `u16 LE len(app_id) ‖ app_id bytes ‖ instance_id u128 LE ‖ seq u64 LE ‖
@@ -351,11 +351,11 @@ durably anywhere.
 > expiry_ns u64 LE`
 >
 > — 61 bytes for a 5-byte `app_id` (`2 + 5 + 16 + 8 + 8 + 4 + 4 + 4 + 2 + 8`,
-> pinned by `uc2_crypto/src/admin.rs`'s
+> pinned by `uc_crypto/src/admin.rs`'s
 > `sign_matches_hmac_over_canonical_bytes_and_layout_length` test). The tag
 > itself is `HMAC-SHA256(key, canonical_bytes)`. `key_name_hash` (the 64-bit
 > field alongside the tag on the cnc auth line) is the standard 64-bit
-> FNV-1a hash of the key's name (`uc2_crypto::admin::fnv1a64`), not part of
+> FNV-1a hash of the key's name (`uc_crypto::admin::fnv1a64`), not part of
 > the signed bytes.
 >
 > **§5.2 deviation, ruled: no `(seq, nonce)` replay ring.** The sketch below
@@ -381,7 +381,7 @@ durably anywhere.
 > access and no admin key write a captured `instance_id` back onto the page
 > after a restart and replay the capture against it. Found by the M12b
 > final review (C1) and fixed; regression test
-> `uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`.
+> `uc_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`.
 > A ring
 > would therefore never refuse anything these two checks (the seqlock
 > cursor, plus `instance_id` in the signed bytes) do not already refuse;
@@ -389,13 +389,13 @@ durably anywhere.
 > a live, correctly-sequenced, never-yet-applied request, and `expiry_ns`
 > (checked against `now` with a `2 * ttl` upper bound too, so a
 > forward-dated expiry cannot extend the window either) is what bounds
-> that. Test: `uc2_node/tests/admin_auth.rs::a_replayed_request_cannot_be_re_presented`
+> that. Test: `uc_node/tests/admin_auth.rs::a_replayed_request_cannot_be_re_presented`
 > captures a signed request's exact bytes, replays them verbatim after a
 > subsequent request has advanced `seq`, and asserts no second effect and
 > no second audit record.
 >
-> **§5.2 reason codes, as shipped** (`uc2_node::node`, disjoint from
-> `uc2_consensus::config::ProposeError`'s 1–10/12 and the node's own
+> **§5.2 reason codes, as shipped** (`uc_node::node`, disjoint from
+> `uc_consensus::config::ProposeError`'s 1–10/12 and the node's own
 > `REASON_MALFORMED_OP = 11`): `REASON_AUTH_MISSING = 20` (the auth line was
 > all-zero — an unsigned request against an `Hmac` policy), `REASON_AUTH_BAD_TAG
 > = 21` (a known key, but the HMAC does not verify — wrong key, tampering,
@@ -409,7 +409,7 @@ durably anywhere.
 > One further code the sketch did not anticipate: `REASON_AUDIT_FAILED = 24`
 > — the audit record could not be written (a full or failing disk), so the
 > request is refused rather than answered unrecorded, even on the accepted
-> path where the config change may already be appended (`uc2_node::audit`'s
+> path where the config change may already be appended (`uc_node::audit`'s
 > module doc: "accepted" means proposed and appended, not committed;
 > "recorded" means "the record reached disk before the answer did," and 24
 > is what happens when it cannot).
@@ -433,7 +433,7 @@ durably anywhere.
 > `docs/how-to/encrypt-node-traffic.md`.
 >
 > **§5.3, the shipped record shape** differs from the sketch's `args{id,
-> addr}` — the actual fields are flat, matching `uc2_node::audit::AuditRecord`:
+> addr}` — the actual fields are flat, matching `uc_node::audit::AuditRecord`:
 > `{ts_ns, event:"admin_op", actor, origin, op, op_name, id, addr, seq,
 > nonce, outcome, reason, config_version}`. `addr` is `null` for ops that
 > carry no address (`promote`/`demote`/`remove-*`); `actor` is the signing
@@ -455,7 +455,7 @@ durably anywhere.
 > `StartOpts::default()`, whose `admin` is `AdminPolicy::Filesystem` — the
 > pre-M12b posture, unchanged for every library caller (in-process tests,
 > gates, harnesses). Only the `uc2-node` daemon binary
-> (`uc2_node/src/bin/uc2-node.rs`) builds a live `AdminPolicy` from
+> (`uc_node/src/bin/uc2-node.rs`) builds a live `AdminPolicy` from
 > `[admin]` and calls `Node::start_with` directly.
 
 ### 5.1 Credential
@@ -530,12 +530,12 @@ explicitly. Upgrade note with the two new startup refusals.
 > ruled deviations.
 >
 > **Twelve crates, not eleven.** §3.2 counted eleven names; the shipped set
-> is twelve — `ultima-journal`, `uc_protocol`, `uc2_crypto`, `uc2_log`,
-> `uc2_consensus`, `uc2_net`, `uc2_client`, `uc2_node`, `uc2_service`,
-> `uc2_remote`, `uc2_gateway`, `uc2ctl`. **`uc2_sim` is `publish = false`**,
+> is twelve — `uc_journal`, `uc_protocol`, `uc_crypto`, `uc_log`,
+> `uc_consensus`, `uc_net`, `uc_client`, `uc_node`, `uc_service`,
+> `uc_remote`, `uc_gateway`, `uc2ctl`. **`uc_sim` is `publish = false`**,
 > a plan addition ruled during Task 1 and consistent with §3.2's own
 > reasoning: it is the deterministic-simulation proof apparatus, not
-> product, and it sits beside `uc-lincheck` and the example crates rather
+> product, and it sits beside `uc_lincheck` and the example crates rather
 > than beside the shipped libraries.
 >
 > **`publish-check` packages all twelve but dry-runs only the four leaves.**
@@ -545,12 +545,12 @@ explicitly. Upgrade note with the two new startup refusals.
 > registry dependency and then requires it to resolve, and a per-crate
 > invocation for a non-leaf crate therefore needs its dependencies to
 > already be on crates.io. It is also not merely a bootstrap gap —
-> `uc2_node`'s dev-dependency on `uc2_service` is a genuine dev-only cycle
+> `uc_node`'s dev-dependency on `uc_service` is a genuine dev-only cycle
 > no publish order avoids. What shipped instead: `cargo package --no-verify`
 > over all twelve **in one invocation** (cargo topo-sorts the selected set
 > and resolves cross-references locally), plus `cargo publish --dry-run` for
-> the four dependency-free leaves (`ultima-journal`, `uc_protocol`,
-> `uc2_remote`, `uc2_consensus`), plus a third step the bullet did not
+> the four dependency-free leaves (`uc_journal`, `uc_protocol`,
+> `uc_remote`, `uc_consensus`), plus a third step the bullet did not
 > anticipate: `scripts/check_publish_metadata.sh`, which checks the
 > crates.io-side metadata rules (keyword count and ≤ 20-char length,
 > category slugs) that neither `cargo package` nor `--dry-run` ever reaches.
@@ -558,7 +558,7 @@ explicitly. Upgrade note with the two new startup refusals.
 >
 > **`rust-version = "1.89"`, and the `msrv` job runs clippy.** §3.2 guessed
 > "≥ 1.88". The probed floor is 1.89.0
-> (`std::fs::File::try_lock_exclusive`/`unlock`, `uc2_node/src/backup.rs`).
+> (`std::fs::File::try_lock_exclusive`/`unlock`, `uc_node/src/backup.rs`).
 > The job runs `cargo +1.89.0 clippy --workspace --all-targets --locked --
 > -D warnings`, not `check`, with an explicit `+<version>` so
 > `rust-toolchain.toml`'s directory override cannot redirect it.
@@ -588,7 +588,7 @@ explicitly. Upgrade note with the two new startup refusals.
 > There is no second, separate "release quickstart".
 >
 > **A product fix rode along (Task 3b).** Driving the quickstart from
-> outside surfaced that `uc2_remote`'s `request_timeout` was not enforced
+> outside surfaced that `uc_remote`'s `request_timeout` was not enforced
 > while the reader was reconnecting. Fixed — the client sweeps for expired
 > requests between every dial attempt and hop — with the resulting bound
 > (`request_timeout + 2 × connect_timeout + SWEEP_INTERVAL`) documented in
@@ -613,9 +613,9 @@ explicitly. Upgrade note with the two new startup refusals.
   releases; dead `quinn`/`rustls`/`rcgen`/`rustls-pemfile` workspace deps
   removed; `rust-version` + pinned toolchain + `msrv` CI job (§3.2).
 - **Publishing**: `cargo publish --dry-run` of the whole DAG
-  (`ultima_journal`, `uc_protocol` → `uc2_log`/`uc2_crypto` → `uc2_net`/
-  `uc2_consensus` → `uc2_node`/`uc2_client` → `uc2_service`/`uc2_remote`/
-  `uc2_gateway` → `uc2ctl`) as a CI job; the real publish is a manual step at
+  (`uc_journal`, `uc_protocol` → `uc_log`/`uc_crypto` → `uc_net`/
+  `uc_consensus` → `uc_node`/`uc_client` → `uc_service`/`uc_remote`/
+  `uc_gateway` → `uc2ctl`) as a CI job; the real publish is a manual step at
   tag time with the maintainer's token.
 - **`release.yml`** on tag `v*`: matrix `x86_64-unknown-linux-gnu` +
   `aarch64-unknown-linux-gnu`; `cargo build --release --locked` of `uc2-node`,
@@ -649,11 +649,11 @@ explicitly. Upgrade note with the two new startup refusals.
 > snapshot-session framing, the cnc admin slot and auth line, the gateway
 > frame decoder, TOML config and the `/metrics` HTTP surface. What shipped
 > covers those and more, as fourteen targets: `uc_protocol_datagram`,
-> `uc_protocol_log_frame`, `uc_protocol_cnc`, `uc2_remote_frame`,
-> `uc2_crypto_open`, `uc2_crypto_handshake`, `uc2_crypto_group_key`,
-> `uc2_crypto_admin`, `ultima_journal_record`,
-> `ultima_journal_stable_value`, `uc2_service_session`, `uc2_node_toml`,
-> `uc2_gateway_toml`, `uc2_node_http`. The additions the bullet did not
+> `uc_protocol_log_frame`, `uc_protocol_cnc`, `uc_remote_frame`,
+> `uc_crypto_open`, `uc_crypto_handshake`, `uc_crypto_group_key`,
+> `uc_crypto_admin`, `uc_journal_record`,
+> `uc_journal_stable_value`, `uc_service_session`, `uc_node_toml`,
+> `uc_gateway_toml`, `uc_node_http`. The additions the bullet did not
 > anticipate are the crypto plane (the pre-auth Noise `IK` handshake is the
 > single most valuable target in the set), the on-disk journal and
 > `StableValue` records, and the `Sessioned` envelope.
@@ -676,7 +676,7 @@ explicitly. Upgrade note with the two new startup refusals.
 > the 1 GiB pre-allocation from an unvalidated snapshot length. Gate doc
 > "M12d facts" (a)–(d) is the list.
 >
-> **`uc2_service_session` fuzzes an `EchoSm`, not a no-op.** A no-op inner
+> **`uc_service_session` fuzzes an `EchoSm`, not a no-op.** A no-op inner
 > state machine emits zero response bytes, so the byte-budget eviction path
 > is unreachable and a target that claimed to cover it would be vacuous. The
 > target drives a response-producing inner SM under a fuzz-derived,
@@ -686,13 +686,13 @@ explicitly. Upgrade note with the two new startup refusals.
 > as the only variable.
 >
 > **Three seams were exposed, with deliberately different postures.**
-> `uc2_node::config_file::parse_str` and `uc2_gateway::config_file::parse_str`
+> `uc_node::config_file::parse_str` and `uc_gateway::config_file::parse_str`
 > are ordinary public API — the file loaders' pure inner half.
-> `uc2_node::obs::http::route_raw` (with `ObsSources::for_tests`) is
+> `uc_node::obs::http::route_raw` (with `ObsSources::for_tests`) is
 > `#[cfg(any(test, fuzzing))]` and absent from a shipped build;
-> `uc2_node/Cargo.toml` declares `check-cfg = ['cfg(fuzzing)']` so
+> `uc_node/Cargo.toml` declares `check-cfg = ['cfg(fuzzing)']` so
 > `clippy -D warnings` stays clean without promoting the seam to a Cargo
-> feature, which would have made it API. `ultima_journal::fuzz_seams` stays
+> feature, which would have made it API. `uc_journal::fuzz_seams` stays
 > `pub` (a separate compilation unit cannot see `pub(crate)`) but is
 > `#[doc(hidden)]`.
 >
@@ -707,7 +707,7 @@ explicitly. Upgrade note with the two new startup refusals.
 >
 > **Miri: attempted, partially delivered, exactly as the bullet allowed.** It
 > runs over the pure decoders — `uc_protocol`'s `v2::` layer and `version`
-> packing (43 tests) and `ultima_journal`'s segment and `stable_value`
+> packing (43 tests) and `uc_journal`'s segment and `stable_value`
 > decoders (19 tests) — all 62 passing with isolation ON, nothing excluded.
 > It does **not** run over the rings, and cannot: `open` is unsupported under
 > isolation; with isolation disabled it stops on `fallocate` mode 16

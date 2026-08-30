@@ -15,7 +15,7 @@ than the host has cores. Three defects found by the hop bench, three fixes:
 
 | # | defect (measured) | fix |
 |---|---|---|
-| 1 | `uc2_remote::RemoteClient` caps at ~170 k resp/s per connection against a sink that answers instantly (1 `write` per `submit`, ~7 futex per request: one state lock across submit/write/every received frame, a channel per ticket). A raw client through the *real* edge and cluster does 1.14 M/s on one connection. | **Engine-shaped split client** (§3) |
+| 1 | `uc_remote::RemoteClient` caps at ~170 k resp/s per connection against a sink that answers instantly (1 `write` per `submit`, ~7 futex per request: one state lock across submit/write/every received frame, a channel per ticket). A raw client through the *real* edge and cluster does 1.14 M/s on one connection. | **Engine-shaped split client** (§3) |
 | 2 | `uc_protocol::ring::mpsc` producers publish in claim order and spin on their predecessor; once producer threads outnumber free cores a preempted producer convoys all of them — 1.9 M/s → ~5 k/s at 8 gateway connections on 8 vCPU, every core busy. The M12 "collapse". | **Per-record commit, no cross-producer wait** (§4) |
 | 3 | The edge grants each connection a flat `per_conn_inflight`; no budget across connections (spec M12 §4.2 promised one). Not the collapse cause, but it is why overload past the `Engine` window is the reactive halve/relax ladder instead of bounded queueing. | **Global outstanding-grant budget at the edge** (§5) |
 
@@ -41,16 +41,16 @@ Adjudicated the way every prior milestone was — honestly, in the gate doc
 | c | Ladder N = 1,2,4,8,16 at 1024 inflight on the co-located host, with the ring fix + edge budget | **monotone, no collapse**: 0 lost, p99 bounded (< 1 s at every rung), no rung > 20% below the previous rung |
 | d | N local `Engine`s into one node on an oversubscribed host (`engine-load --engines 1,2,4,8` on the 8-vCPU server host, and locally on 4 vCPU) | **≤ linear degradation**: resp/s at N engines ≥ (cores / busy threads) × single-engine resp/s × 0.5, never below 10% of single-engine |
 | e | Ring correctness: existing 73 `uc_protocol` tests + new preemption test + loom model | green |
-| f | Correctness capstones on the new client: `remote_lin` (envelope on/off), `uc2_gateway` tests, `client_fake_edge` suite ported | green |
+| f | Correctness capstones on the new client: `remote_lin` (envelope on/off), `uc_gateway` tests, `client_fake_edge` suite ported | green |
 
 Reference numbers from the bench: direct arm 1.9–2.6 M/s; raw client
 through edge+cluster 1.14 M/s (0.6×) at N=1 and 1.43 M/s (0.75×) at N=2.
 
-## 3. The client: `uc2_remote` split halves
+## 3. The client: `uc_remote` split halves
 
 ### 3.1 Shape
 
-Mirror `uc2_client::Engine` exactly — the shmem client that moves 2.8 M/s —
+Mirror `uc_client::Engine` exactly — the shmem client that moves 2.8 M/s —
 over a TCP connection:
 
 ```rust
@@ -79,7 +79,7 @@ again"; the submitter decides whether to spin, yield, or park on the wait
 handle (exactly `Engine`'s contract). A blocking convenience,
 `RemoteClient` (rebuilt: `submit(&[u8]) -> Ticket`, `Ticket::wait`), is
 layered on top for the crashtest, `counter-remote` and small callers, the
-way `uc2_client::Client` sits on `Engine`; its cost is its own and it is not
+way `uc_client::Client` sits on `Engine`; its cost is its own and it is not
 the path the bars measure.
 
 ### 3.2 Hot path (per connection: two threads, no lock, no per-request allocation)
@@ -378,9 +378,9 @@ grows it; the two-client backpressure test keeps passing with
 
 ## 7. Deliverables and docs
 
-- Code: `uc2_remote` (halves + convenience client; old `RemoteClient`
+- Code: `uc_remote` (halves + convenience client; old `RemoteClient`
   removed), `uc_protocol::ring::mpsc` (+ loom model under `cfg(loom)`,
-  fuzz target), `uc2_gateway::edge` (budget), `hop_bench remote-load` +
+  fuzz target), `uc_gateway::edge` (budget), `hop_bench remote-load` +
   `m12_gate client-remote` on the halves, `counter-remote` example on the
   convenience client.
 - Gate: `docs/benchmarks/uc2-m13-gate-<date>.md` rows a–f above, run with

@@ -3,20 +3,20 @@ name: nightly
 # The full proof suite — everything ci.yml deliberately skips. One job per
 # proof family so a slow capstone doesn't hide a loom/crashtest failure and
 # each gets its own timeout:
-#   * capstones  — the whole workspace test suite INCLUDING uc2_node's WGL
+#   * capstones  — the whole workspace test suite INCLUDING uc_node's WGL
 #                  lincheck capstones (lin_v2: failover + purge/snapshot-churn
 #                  linearizability; lin_partition_v2: partition / quorum-loss)
-#                  plus the uc2_service ultima_db-adapter pass. Since 2.8.1
+#                  plus the uc_service ultima_db-adapter pass. Since 2.8.1
 #                  each of those has a TWO-FSM twin (lin_v2's two_fsm_*,
 #                  lin_partition_v2's minority_partition_and_heal_two_fsm),
 #                  picked up by `cargo test --workspace` with no matrix change.
-#   * sim-heavy  — uc2_sim's 1000-seed election/truncation fuzz tier.
-#   * loom       — the uc2_log frame-visibility memory model AND the
+#   * sim-heavy  — uc_sim's 1000-seed election/truncation fuzz tier.
+#   * loom       — the uc_log frame-visibility memory model AND the
 #                  uc_protocol MPSC ring commit protocol (M13a: claim/commit
 #                  CAS, skip-marker race, head-of-line at a hole; exhaustive
 #                  interleaving exploration; needs `--cfg loom` + release).
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
-#                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*), including
+#                  (uc_crashtest bins spawned via CARGO_BIN_EXE_*), including
 #                  the 2.8.1 two-FSM scenarios (two_fsm_service_sigkill,
 #                  two_fsm_node_sigkill) — same feature flag, no matrix change.
 #   * quickstart — packaging/quickstart-local.sh run for real: three nodes,
@@ -31,7 +31,7 @@ name: nightly
 #                  target can never be silently left unfuzzed. Nightly
 #                  toolchain; the fuzz crate is outside the workspace.
 #   * miri       — M12d: UB detection over the PURE decoders only
-#                  (uc_protocol's v2 wire/cnc/ipc layer, ultima_journal's
+#                  (uc_protocol's v2 wire/cnc/ipc layer, uc_journal's
 #                  record/stable_value decoders). The IPC rings are excluded
 #                  and cannot be included — Miri does not support file-backed
 #                  memory mappings; see the job comment and VERIFICATION.md.
@@ -74,8 +74,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Full workspace tests (incl. lin_v2 + lin_partition_v2)
         run: cargo test --workspace
-      - name: Tests (uc2_service + ultima_db adapter)
-        run: cargo test -p uc2_service --features ultima_db
+      - name: Tests (uc_service + ultima_db adapter)
+        run: cargo test -p uc_service --features ultima_db
 
   sim-heavy:
     runs-on: ubuntu-latest
@@ -84,11 +84,11 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Seeded heavy fuzz (1000-seed election/truncation)
-        run: cargo test -p uc2_sim --features sim-heavy
-      # The window-slide red twin needs uc2_consensus's mutation tooth (the
+        run: cargo test -p uc_sim --features sim-heavy
+      # The window-slide red twin needs uc_consensus's mutation tooth (the
       # pre-2026-08-16 index-aligned reconcile); it must keep FINDING wipes.
       - name: Window-slide red twin (mutation tooth must bite)
-        run: cargo test -p uc2_sim --features mutation-testing --test scenarios window_slide
+        run: cargo test -p uc_sim --features mutation-testing --test scenarios window_slide
 
   loom:
     runs-on: ubuntu-latest
@@ -97,7 +97,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Frame-visibility loom model
-        run: cargo test -p uc2_log --test loom_frame --release
+        run: cargo test -p uc_log --test loom_frame --release
         env:
           RUSTFLAGS: --cfg loom
       - name: MPSC ring commit-protocol loom model
@@ -112,7 +112,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Multi-process SIGKILL linearizability
-        run: cargo test -p uc2-crashtest --features hard-crash-tests
+        run: cargo test -p uc_crashtest --features hard-crash-tests
 
   # M12c: the binary quickstart. Feature-gated out of the default `cargo test`
   # because it starts eleven processes and waits on an election; fixed ports
@@ -128,7 +128,7 @@ jobs:
         run: cargo test -p counter --features quickstart-tests --test quickstart_local -- --nocapture
 
   # M8 Task 15: the same suite with wire crypto Enabled on every node the
-  # crashtest bins spawn (UC2_CRYPTO=1 — see examples/uc2-crashtest/tests/
+  # crashtest bins spawn (UC2_CRYPTO=1 — see examples/uc_crashtest/tests/
   # common/mod.rs). A separate job (not a matrix leg on `crashtest`) so a
   # crypto-specific regression is never conflated with a cleartext one, same
   # rationale as every other split in this file.
@@ -141,7 +141,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: Multi-process SIGKILL linearizability (crypto ON)
-        run: cargo test -p uc2-crashtest --features hard-crash-tests
+        run: cargo test -p uc_crashtest --features hard-crash-tests
 
   # M11 Task 3: the spec's acceptance sentence as a CI test — a node is
   # backed up under load, its host destroyed, a new host restored from the
@@ -158,22 +158,22 @@ jobs:
       # real 3-node cluster (node + service pairs); the default runner
       # parallelism would run several of those concurrently on a 4-vCPU
       # runner, competing for the same cores the busy-spin polling agents
-      # need (see `uc2_node/tests/backup.rs`'s `serialize()` for the same
+      # need (see `uc_node/tests/backup.rs`'s `serialize()` for the same
       # oversubscription failure mode observed there).
       - name: Backup under load -> host destroyed -> restore -> rejoin
-        run: cargo test -p uc2-crashtest --features survival-tests -- --test-threads=1
+        run: cargo test -p uc_crashtest --features survival-tests -- --test-threads=1
       # M11 Task 6: ENOSPC asserted end-to-end. A 64 MiB loopback ext4
       # filesystem (scripts/enospc_fixture.sh) needs sudo for mkfs/mount/
       # chown, which ubuntu-latest has (unlike the dev box this was
       # authored on -- see the fixture script's `sudo -n true` probe and
-      # examples/uc2-crashtest/tests/enospc.rs's module doc). The sudo-free
+      # examples/uc_crashtest/tests/enospc.rs's module doc). The sudo-free
       # `write_denied_drives_the_same_failstop_chain` sibling in the same
       # test file runs unconditionally once the feature is on, with or
       # without the fixture step below.
       - name: Create the ENOSPC loopback fixture
         run: scripts/enospc_fixture.sh create /home/runner/uc2-enospc-test 64
       - name: ENOSPC fail-stop asserted; cluster survives; recovers on space return
-        run: cargo test -p uc2-crashtest --features enospc-tests -- --test-threads=1
+        run: cargo test -p uc_crashtest --features enospc-tests -- --test-threads=1
         env:
           UC2_ENOSPC_DIR: /home/runner/uc2-enospc-test
       - name: Destroy the ENOSPC loopback fixture
@@ -206,7 +206,7 @@ jobs:
         run: scripts/elle_check.sh
 
   # M8 Task 15: the same 6-pass clean tier with wire crypto Enabled on every
-  # node (UC2_CRYPTO=1 — see uc2_node/tests/elle_v2.rs's crypto_from_env).
+  # node (UC2_CRYPTO=1 — see uc_node/tests/elle_v2.rs's crypto_from_env).
   # A dedicated ELLE_DIR: CI runners are ephemeral (no cross-job reuse), but
   # naming it explicitly keeps the crypto/cleartext histories unambiguous in
   # any artifact upload and matches `scripts/elle_check.sh`'s own posture
@@ -233,7 +233,7 @@ jobs:
   # Lean proofs gate (Phase 1): builds the sorry-free Uc2Model/Uc2Proofs
   # kernels (commit tracker, reconcile, vote-freshness), then cross-checks
   # the model against real Rust output via a 100k-vector conformance replay
-  # (uc2_consensus's conform_gen -> `lake exe conform`). See
+  # (uc_consensus's conform_gen -> `lake exe conform`). See
   # docs/benchmarks/uc2-lean-gate-2026-07-16.md and docs/ops/uc2-runbook.md
   # §9 for the "changing a proved kernel" procedure.
   lean-proofs:
@@ -257,7 +257,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Conformance replay (100k vectors)
         run: |
-          cargo run -p uc2_consensus --release --example conform_gen -- \
+          cargo run -p uc_consensus --release --example conform_gen -- \
             --out "$HOME/.cache/uc2-conform/vectors.jsonl" --count 100000 --seed "$(date +%Y%m%d)"
           cd proofs && lake exe conform "$HOME/.cache/uc2-conform/vectors.jsonl"
 
@@ -281,10 +281,10 @@ jobs:
           # One line per matrix leg. Budget: 600 s per target, so keep legs
           # at four targets or fewer to stay inside the 60-minute job timeout.
           FUZZ_GROUPS: |
-            uc_protocol_datagram uc_protocol_log_frame uc_protocol_cnc uc2_remote_frame
-            uc2_crypto_open uc2_crypto_handshake uc2_crypto_group_key uc2_crypto_admin
-            ultima_journal_record ultima_journal_stable_value uc2_service_session ring_mpsc_record
-            uc2_node_toml uc2_gateway_toml uc2_node_http
+            uc_protocol_datagram uc_protocol_log_frame uc_protocol_cnc uc_remote_frame
+            uc_crypto_open uc_crypto_handshake uc_crypto_group_key uc_crypto_admin
+            uc_journal_record uc_journal_stable_value uc_service_session ring_mpsc_record
+            uc_node_toml uc_gateway_toml uc_node_http
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -297,7 +297,7 @@ jobs:
           # (scripts/fuzz_smoke.sh skips it too).
           manifest = open("fuzz/Cargo.toml").read()
           targets = [n for n in re.findall(r'^name = "(.+)"$', manifest, re.M)
-                     if n not in ("uc2-fuzz", "seed-corpus")]
+                     if n not in ("uc_fuzz", "seed-corpus")]
 
           dupes = sorted({t for t in flat if flat.count(t) > 1})
           if dupes:
@@ -387,7 +387,7 @@ jobs:
 
   # M12d: Miri (UB detection under a symbolic interpreter) over the PURE
   # decoders only — uc_protocol's v2 wire/cnc/ipc layer and version packing,
-  # and ultima_journal's segment/stable_value record decoders. These are the
+  # and uc_journal's segment/stable_value record decoders. These are the
   # surfaces the fuzz targets drive, so Miri and libFuzzer cover the same
   # code from two directions: libFuzzer finds inputs that panic, Miri finds
   # UB on inputs that do not.
@@ -408,7 +408,7 @@ jobs:
   # `loom` job) and their layout by offset-pin tests. docs/VERIFICATION.md
   # says this out loud rather than implying the rings are Miri-clean.
   #
-  # uc2_remote's outgoing/completion/slots ARE here: those SPSC structures
+  # uc_remote's outgoing/completion/slots ARE here: those SPSC structures
   # are raw pointers over a heap Vec (not file-backed), so Miri models them
   # fully — and it found a real Stacked-Borrows aliasing bug in them during
   # M13b (a whole-buffer &mut retagging the allocation). This is the
@@ -439,14 +439,14 @@ jobs:
       - name: Miri — uc_protocol wire/cnc/ipc decoders (43 tests)
         run: |
           cargo +nightly miri test -p uc_protocol --lib -- v2:: version::
-      - name: Miri — ultima_journal record/stable_value decoders (19 tests)
+      - name: Miri — uc_journal record/stable_value decoders (19 tests)
         run: |
-          cargo +nightly miri test -p ultima-journal --lib -- \
+          cargo +nightly miri test -p uc_journal --lib -- \
             stable_value::tests:: error::tests:: \
             journal::segment::tests::header_ \
             journal::segment::tests::record_ \
             journal::segment::tests::decode_
-      - name: Miri — uc2_remote SPSC structures (outgoing/completion/slots, 29 tests)
+      - name: Miri — uc_remote SPSC structures (outgoing/completion/slots, 29 tests)
         run: |
-          cargo +nightly miri test -p uc2_remote --lib -- \
+          cargo +nightly miri test -p uc_remote --lib -- \
             outgoing:: completion:: slots::

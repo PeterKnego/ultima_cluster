@@ -4,9 +4,9 @@
 
 **Goal:** Remote clients can reach a UC cluster through a stateless gateway that follows the leader across failover with zero acked-write loss, and a state machine may take its commands as raw bytes (zero decode, zero allocation) or as typed serde values — the user's choice.
 
-**Architecture:** (1) `uc2_service` gains `RawStateMachine` (`apply(&mut self, pos, cmd: &[u8], out: &mut Vec<u8>)`) as the core contract; today's typed `StateMachine` is blanket-implemented onto it (`impl<S: StateMachine> RawStateMachine for S`) doing exactly today's bincode-standard codec, so every existing state machine compiles and produces byte-identical wire. `Sessioned<S>` wraps any `RawStateMachine` with Raft-paper client-session dedup (16-byte envelope, bounded per-client response window, snapshot-composed). (2) `uc2_remote` is the framed-TCP protocol (v1) + the Rust `RemoteClient` (pipelined, receiver-driven credits, redirect-following, ordered re-send). (3) `uc2_gateway` is the edge library over `uc2_client::Engine` — one `Engine` per edge, per-connection reader threads, one poll driver, a leader watch off the cnc page, a static member map — plus the `uc2-gateway` reference binary. Proof: a hard-crash lincheck capstone with three edges in the loop; measurement: `m12_gate` (gateway vs direct `Engine`) and `m5_gate` with `apply-profile` (codec share).
+**Architecture:** (1) `uc_service` gains `RawStateMachine` (`apply(&mut self, pos, cmd: &[u8], out: &mut Vec<u8>)`) as the core contract; today's typed `StateMachine` is blanket-implemented onto it (`impl<S: StateMachine> RawStateMachine for S`) doing exactly today's bincode-standard codec, so every existing state machine compiles and produces byte-identical wire. `Sessioned<S>` wraps any `RawStateMachine` with Raft-paper client-session dedup (16-byte envelope, bounded per-client response window, snapshot-composed). (2) `uc_remote` is the framed-TCP protocol (v1) + the Rust `RemoteClient` (pipelined, receiver-driven credits, redirect-following, ordered re-send). (3) `uc_gateway` is the edge library over `uc_client::Engine` — one `Engine` per edge, per-connection reader threads, one poll driver, a leader watch off the cnc page, a static member map — plus the `uc2-gateway` reference binary. Proof: a hard-crash lincheck capstone with three edges in the loop; measurement: `m12_gate` (gateway vs direct `Engine`) and `m5_gate` with `apply-profile` (codec share).
 
-**Tech Stack:** Rust edition 2024 workspace; `std::net` TCP + threads (no tokio on the edge hot path); `bincode` v2 standard config for the typed tier; `serde`; `clap`/`toml` for the binary (same as `uc2-node`); `uc-lincheck` for the capstone; `uc2-crashtest` harness for SIGKILL.
+**Tech Stack:** Rust edition 2024 workspace; `std::net` TCP + threads (no tokio on the edge hot path); `bincode` v2 standard config for the typed tier; `serde`; `clap`/`toml` for the binary (same as `uc2-node`); `uc_lincheck` for the capstone; `uc_crashtest` harness for SIGKILL.
 
 **Spec:** `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` (§3.1, §4) — read it first. Production-readiness umbrella: `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md` §7.
 
@@ -16,8 +16,8 @@
 - The typed trait's signature is unchanged: `fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response`; wire bytes for typed state machines are **byte-identical** to `v2.5.0` (test in Task 1 guards it).
 - Apply stays sync, deterministic, no I/O. `Sessioned` eviction and snapshot encoding must be deterministic (`BTreeMap`, position-based LRU — never time).
 - `cargo clippy --workspace --all-targets -- -D warnings` must stay clean after every task; `cargo test` (default) must stay green after every task.
-- No new heavy deps: `uc2_remote` depends on `bytes`, `thiserror` only (+ `serde`/`bincode` as dev-deps for tests); `uc2_gateway` on `uc2_client`, `uc2_remote`, `uc_protocol`, `uc2_log`, `serde`/`toml`/`clap`/`anyhow` for the bin. No tokio on the edge.
-- Never write heavy artifacts to `/tmp`: tests use `tempdir()` under `CARGO_TARGET_TMPDIR` exactly like `uc2_node/tests/lin_v2.rs`.
+- No new heavy deps: `uc_remote` depends on `bytes`, `thiserror` only (+ `serde`/`bincode` as dev-deps for tests); `uc_gateway` on `uc_client`, `uc_remote`, `uc_protocol`, `uc_log`, `serde`/`toml`/`clap`/`anyhow` for the bin. No tokio on the edge.
+- Never write heavy artifacts to `/tmp`: tests use `tempdir()` under `CARGO_TARGET_TMPDIR` exactly like `uc_node/tests/lin_v2.rs`.
 - Bars are fleet-only; local `m5_gate`/`m12_gate` runs are smoke and are labelled so in any doc.
 - Commit after every task; plan commits on branch `uc2/m12-adoptable`.
 
@@ -25,14 +25,14 @@
 
 | Path | Responsibility |
 |---|---|
-| `uc2_service/src/traits.rs` | `RawStateMachine`, blanket impl for `StateMachine`, `RawOutputHandler`, `TypedOutput<O>`, `SnapshotStateMachine: RawStateMachine` |
-| `uc2_service/src/apply.rs`, `replay.rs`, `output.rs`, `egress.rs`, `lib.rs` | pass frame bytes through; reusable response buffer; builder generics |
-| `uc2_service/src/session.rs` | `Sessioned<S>`, `SessionConfig`, envelope constants, response tag |
-| `uc2_remote/src/{lib,frame,client,error}.rs` | protocol v1 codec; `RemoteClient`; errors |
-| `uc2_gateway/src/{lib,config,edge,conn,watch}.rs` | `EdgeConfig`; `Edge` (attach/accept/driver); per-connection state; leader watch |
-| `uc2_gateway/src/bin/uc2-gateway.rs` | reference binary: args, TOML, named refusals, SIGTERM |
-| `uc2_gateway/examples/m12_gate.rs` | gateway-vs-direct measurement harness |
-| `examples/uc2-crashtest/src/bin/uc2-crashtest-gateway.rs`, `tests/remote_lin.rs` | capstone |
+| `uc_service/src/traits.rs` | `RawStateMachine`, blanket impl for `StateMachine`, `RawOutputHandler`, `TypedOutput<O>`, `SnapshotStateMachine: RawStateMachine` |
+| `uc_service/src/apply.rs`, `replay.rs`, `output.rs`, `egress.rs`, `lib.rs` | pass frame bytes through; reusable response buffer; builder generics |
+| `uc_service/src/session.rs` | `Sessioned<S>`, `SessionConfig`, envelope constants, response tag |
+| `uc_remote/src/{lib,frame,client,error}.rs` | protocol v1 codec; `RemoteClient`; errors |
+| `uc_gateway/src/{lib,config,edge,conn,watch}.rs` | `EdgeConfig`; `Edge` (attach/accept/driver); per-connection state; leader watch |
+| `uc_gateway/src/bin/uc2-gateway.rs` | reference binary: args, TOML, named refusals, SIGTERM |
+| `uc_gateway/examples/m12_gate.rs` | gateway-vs-direct measurement harness |
+| `examples/uc_crashtest/src/bin/uc_crashtest-gateway.rs`, `tests/remote_lin.rs` | capstone |
 | `packaging/systemd/uc2-gateway.service`, `packaging/gateway.example.toml` | packaging |
 | `docs/how-to/run-a-gateway.md`, `docs/reference/gateway-config.md`, `docs/reference/remote-protocol.md`, `docs/reference/state-machine-contract.md`, `docs/notes/uc2-gateway-shapes-and-flow-control.md` | docs |
 
@@ -41,9 +41,9 @@
 ### Task 1: `RawStateMachine` + blanket typed adapter (traits only, byte-identity test)
 
 **Files:**
-- Modify: `uc2_service/src/traits.rs`
-- Modify: `uc2_service/src/lib.rs:62-65` (exports)
-- Test: `uc2_service/tests/raw_contract.rs` (new)
+- Modify: `uc_service/src/traits.rs`
+- Modify: `uc_service/src/lib.rs:62-65` (exports)
+- Test: `uc_service/tests/raw_contract.rs` (new)
 
 **Interfaces:**
 - Produces (used by every later task):
@@ -62,13 +62,13 @@
   impl<S: RawStateMachine> RawOutputHandler<S> for NoopOutput
   ```
 
-- [ ] **Step 1: Write the failing test** — `uc2_service/tests/raw_contract.rs`:
+- [ ] **Step 1: Write the failing test** — `uc_service/tests/raw_contract.rs`:
 
 ```rust
 //! The raw contract and its blanket typed adapter produce the same bytes the
 //! v2.5.0 framework produced (position prefix ++ bincode(resp)) — clients
 //! built against 2.5.0 keep decoding responses unchanged.
-use uc2_service::{RawStateMachine, StateMachine};
+use uc_service::{RawStateMachine, StateMachine};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum Cmd { Add(i64) }
@@ -125,8 +125,8 @@ fn raw_sm_sees_the_bytes_untouched() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_service --test raw_contract`
-Expected: FAIL — `unresolved import uc2_service::RawStateMachine`.
+Run: `cargo test -p uc_service --test raw_contract`
+Expected: FAIL — `unresolved import uc_service::RawStateMachine`.
 
 - [ ] **Step 3: Implement in `traits.rs`** — add after the `StateMachine` trait (keep `StateMachine` verbatim):
 
@@ -200,7 +200,7 @@ impl<S: StateMachine, O: OutputHandler<S>> RawOutputHandler<S> for TypedOutput<O
 ```
 Remove the old `impl<S: StateMachine> OutputHandler<S> for NoopOutput` ONLY IF it conflicts (it does not — keep it; both impls coexist). Export in `lib.rs`: `pub use crate::traits::{NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine, SnapshotStateMachine, StateMachine, TypedOutput};`.
 
-- [ ] **Step 4: Run the test + the whole crate** — `cargo test -p uc2_service --test raw_contract` → PASS; `cargo build --workspace` → compiles (nothing else uses the new items yet; `SnapshotStateMachine: RawStateMachine` is satisfied by existing typed impls through the blanket).
+- [ ] **Step 4: Run the test + the whole crate** — `cargo test -p uc_service --test raw_contract` → PASS; `cargo build --workspace` → compiles (nothing else uses the new items yet; `SnapshotStateMachine: RawStateMachine` is satisfied by existing typed impls through the blanket).
 - [ ] **Step 5: Commit** — `git commit -am "feat(service): RawStateMachine core contract + blanket typed adapter (byte-identical wire)"`.
 
 ---
@@ -208,16 +208,16 @@ Remove the old `impl<S: StateMachine> OutputHandler<S> for NoopOutput` ONLY IF i
 ### Task 2: Apply, replay, and query paths pass bytes through; reusable response buffer
 
 **Files:**
-- Modify: `uc2_service/src/apply.rs` (apply loop ~311-343; `drain_queries` ~520-548; generics `S: StateMachine` → `S: RawStateMachine` throughout the file)
-- Modify: `uc2_service/src/replay.rs` (~140-175 and its generics)
-- Modify: `uc2_service/src/egress.rs` (`publish`, `publish_query_answer`)
-- Modify: `uc2_service/src/attach.rs` (generics), `uc2_service/src/lib.rs` (generics on `ServiceBuilder`, `Service`; `start`, `start_with_snapshots`; `Service::query`)
+- Modify: `uc_service/src/apply.rs` (apply loop ~311-343; `drain_queries` ~520-548; generics `S: StateMachine` → `S: RawStateMachine` throughout the file)
+- Modify: `uc_service/src/replay.rs` (~140-175 and its generics)
+- Modify: `uc_service/src/egress.rs` (`publish`, `publish_query_answer`)
+- Modify: `uc_service/src/attach.rs` (generics), `uc_service/src/lib.rs` (generics on `ServiceBuilder`, `Service`; `start`, `start_with_snapshots`; `Service::query`)
 
 **Interfaces:**
 - Consumes: Task 1 traits.
 - Produces: `Egress::publish(&mut self, session_id: u64, correlation_id: u64, position: u64, resp: &[u8])`, `Egress::publish_query_answer(&mut self, header_extra: [u8; 8], resp: &[u8])`; `ApplyState<S: RawStateMachine>` gains `resp_buf: Vec<u8>`; `ServiceBuilder<S: RawStateMachine, O: RawOutputHandler<S> = NoopOutput>`; `Service<S: RawStateMachine>`; `Service::query_raw(&self, q: &[u8], out: &mut Vec<u8>)` plus the existing `#[doc(hidden)] query` kept under `where S: StateMachine`.
 
-- [ ] **Step 1: The existing suites are the failing tests** — no new test file; the change is a refactor guarded by `cargo test -p uc2_service` (apply/query/reconstruction/snapshot suites) and Task 1's byte-identity test. Run `cargo test -p uc2_service` once now and note it is green (baseline).
+- [ ] **Step 1: The existing suites are the failing tests** — no new test file; the change is a refactor guarded by `cargo test -p uc_service` (apply/query/reconstruction/snapshot suites) and Task 1's byte-identity test. Run `cargo test -p uc_service` once now and note it is green (baseline).
 
 - [ ] **Step 2: `egress.rs`** — replace the two generic methods:
 
@@ -269,7 +269,7 @@ if is_leader {
     pf_bytes += payload.len() as u64;
 }
 ```
-(`pf_app` and the `APPLY` static go away; adjust `profile::add`/`report` accordingly — keep the feature compiling: `cargo clippy -p uc2_service --features apply-profile --all-targets -- -D warnings`.) Add `pub(crate) resp_buf: Vec<u8>` to `ApplyState` and initialise it in `attach.rs` with `Vec::with_capacity(256)`. Change every `S: StateMachine` bound in `apply.rs` to `S: RawStateMachine` (import it). In `drain_queries` replace the decode/query/answer lines with:
+(`pf_app` and the `APPLY` static go away; adjust `profile::add`/`report` accordingly — keep the feature compiling: `cargo clippy -p uc_service --features apply-profile --all-targets -- -D warnings`.) Add `pub(crate) resp_buf: Vec<u8>` to `ApplyState` and initialise it in `attach.rs` with `Vec::with_capacity(256)`. Change every `S: StateMachine` bound in `apply.rs` to `S: RawStateMachine` (import it). In `drain_queries` replace the decode/query/answer lines with:
 
 ```rust
 st.resp_buf.clear();
@@ -307,7 +307,7 @@ pub fn query(&self, q: S::Query) -> S::QueryResponse where S: StateMachine {
 ```
 `output_handler<O2>` will change in Task 3 — for now leave `output.rs` compiling by bounding the builder's `start`/`start_with_snapshots` output wiring on the old trait through a temporary `where S: StateMachine, O: OutputHandler<S>` on those two methods ONLY if the compiler forces it; Task 3 removes it. Prefer doing Tasks 2 and 3 in one sitting if that temporary bound is awkward.
 
-- [ ] **Step 6: Run** — `cargo test -p uc2_service` (all six suites + `raw_contract`) → PASS; `cargo test -p uc2_node --test lin_v2` → PASS (typed `RegisterSm` through the blanket); `cargo clippy --workspace --all-targets -- -D warnings` → clean.
+- [ ] **Step 6: Run** — `cargo test -p uc_service` (all six suites + `raw_contract`) → PASS; `cargo test -p uc_node --test lin_v2` → PASS (typed `RegisterSm` through the blanket); `cargo clippy --workspace --all-targets -- -D warnings` → clean.
 - [ ] **Step 7: Commit** — `git commit -am "refactor(service): apply/replay/query pass frame bytes through; reusable response buffer"`.
 
 ---
@@ -315,14 +315,14 @@ pub fn query(&self, q: S::Query) -> S::QueryResponse where S: StateMachine {
 ### Task 3: Output agent on the raw tier; `ServiceBuilder::output_handler` adapts typed handlers
 
 **Files:**
-- Modify: `uc2_service/src/output.rs` (decode sites ~170-200 and ~350-375; `deliver` signature; generics)
-- Modify: `uc2_service/src/lib.rs:91-99` (`output_handler`)
-- Test: existing `uc2_service/tests/output.rs` (unchanged — it is the guard)
+- Modify: `uc_service/src/output.rs` (decode sites ~170-200 and ~350-375; `deliver` signature; generics)
+- Modify: `uc_service/src/lib.rs:91-99` (`output_handler`)
+- Test: existing `uc_service/tests/output.rs` (unchanged — it is the guard)
 
 **Interfaces:**
 - Produces: `ServiceBuilder::output_handler<O2: OutputHandler<S>>(self, h: O2) -> ServiceBuilder<S, TypedOutput<O2>> where S: StateMachine` (API unchanged for users) and `ServiceBuilder::raw_output_handler<O2: RawOutputHandler<S>>(self, h: O2) -> ServiceBuilder<S, O2>`.
 
-- [ ] **Step 1: Baseline** — `cargo test -p uc2_service --test output` green before touching anything.
+- [ ] **Step 1: Baseline** — `cargo test -p uc_service --test output` green before touching anything.
 - [ ] **Step 2: `output.rs`** — make `OutputState<S, O>` generic over `S: RawStateMachine, O: RawOutputHandler<S>`; change `deliver(sm, cnc, handler, rt, pos, frame_end, cmd: &[u8]) -> bool` to take the payload slice; at the live path replace the decode with passing `payload` straight: `if !deliver(&st.sm, &st.cnc, &st.handler, &st.rt, pos, frame_end, payload) { ... }`; at the replay-degrade path pass `&payload[off + HEADER_LEN..off + total]`. Inside `deliver`, the handler call becomes `handler.on_committed(pos, cmd, &*sm_guard).await` with `cmd: &[u8]`.
 - [ ] **Step 3: `lib.rs`** —
 
@@ -339,7 +339,7 @@ pub fn raw_output_handler<O2: RawOutputHandler<S>>(self, h: O2) -> ServiceBuilde
 }
 ```
 Remove any temporary `where` bounds left from Task 2.
-- [ ] **Step 4: Run** — `cargo test -p uc2_service` → PASS; `cargo test --workspace` → PASS (counter example, crashtest bins compile); `cargo test -p uc2_service --features ultima_db` → PASS; clippy clean (both feature sets).
+- [ ] **Step 4: Run** — `cargo test -p uc_service` → PASS; `cargo test --workspace` → PASS (counter example, crashtest bins compile); `cargo test -p uc_service --features ultima_db` → PASS; clippy clean (both feature sets).
 - [ ] **Step 5: Commit** — `git commit -am "refactor(service): output agent on the raw tier; typed handlers adapted via TypedOutput"`.
 
 ---
@@ -347,7 +347,7 @@ Remove any temporary `where` bounds left from Task 2.
 ### Task 4: `m5_gate` raw `CountSm` arm (apply-profile smoke) + docs for the two-tier contract
 
 **Files:**
-- Modify: `uc2_node/examples/m5_gate.rs` (`CountSm` ~210-235; a `--raw-sm` flag on `node`/`all`)
+- Modify: `uc_node/examples/m5_gate.rs` (`CountSm` ~210-235; a `--raw-sm` flag on `node`/`all`)
 - Create: `docs/reference/state-machine-contract.md`
 - Modify: `docs/reference/configuration.md` or wherever `StateMachine` is documented (grep `StateMachine` under `docs/` and add a pointer)
 
@@ -357,7 +357,7 @@ Remove any temporary `where` bounds left from Task 2.
 /// Raw-tier twin of `CountSm`: sees the frame bytes, decodes nothing.
 #[derive(Default)]
 struct RawCountSm { count: u64, last_applied: Option<u64> }
-impl uc2_service::RawStateMachine for RawCountSm {
+impl uc_service::RawStateMachine for RawCountSm {
     fn apply(&mut self, position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
         self.count += 1;
         self.last_applied = Some(position);
@@ -368,7 +368,7 @@ impl uc2_service::RawStateMachine for RawCountSm {
 }
 ```
 Add `#[arg(long)] raw_sm: bool` to the node-role and all-role arg structs; where the service is built (`ServiceBuilder::new(cfg, CountSm::default()).start()`), branch: `if raw_sm { ServiceBuilder::new(cfg, RawCountSm::default()).start()? } else { ... }` (two `Service<_>` types — hold them in an enum or `Box<dyn Any>`-free way: simplest is two `Option<Service<..>>` locals kept alive until the end). The client side is unchanged (it sends bincode(`Vec<u8>`) = varint len + bytes; the raw SM ignores them; the response is 8 bytes either way — the client's matcher only counts completions).
-- [ ] **Step 2: Smoke** — `cargo run -p uc2_node --release --example m5_gate --features uc2_service/apply-profile -- all --secs 6 --payload 512` and again with `--raw-sm`; record the two `apply-profile[final]` lines in the gate-doc skeleton created in Task 12 as **smoke** (dev box). Expected shape: raw arm `sm_apply` ≈ a few ns, typed arm ≈ 800 ns at 512 B (see `docs/notes/2026-08-22-codec-budget-spike.md`).
+- [ ] **Step 2: Smoke** — `cargo run -p uc_node --release --example m5_gate --features uc_service/apply-profile -- all --secs 6 --payload 512` and again with `--raw-sm`; record the two `apply-profile[final]` lines in the gate-doc skeleton created in Task 12 as **smoke** (dev box). Expected shape: raw arm `sm_apply` ≈ a few ns, typed arm ≈ 800 ns at 512 B (see `docs/notes/2026-08-22-codec-budget-spike.md`).
 - [ ] **Step 3: Write `docs/reference/state-machine-contract.md`** — sections: the two tiers (when to pick which), the exact trait signatures (copy from Task 1), "a type implements one of the two", byte-identity promise for typed, `bytes::Bytes`/`serde_bytes` advice for blobs (cite the spike note), the `out` buffer discipline (cleared by the caller; write only your response), `RawOutputHandler` vs `OutputHandler`, how `Sessioned` wraps either (forward pointer to Task 5's section), payload ceiling (~1.3 KB, one datagram). Link from the existing docs page that documents `StateMachine`.
 - [ ] **Step 4: Commit** — `git commit -am "docs+gate: raw CountSm arm for m5_gate; state-machine contract reference"`.
 
@@ -377,9 +377,9 @@ Add `#[arg(long)] raw_sm: bool` to the node-role and all-role arg structs; where
 ### Task 5: `Sessioned<S>` — exactly-once at the raw layer
 
 **Files:**
-- Create: `uc2_service/src/session.rs`
-- Modify: `uc2_service/src/lib.rs` (`mod session; pub use session::{Sessioned, SessionConfig, SESSION_HEADER_LEN, TAG_FRESH, TAG_REPLAYED, TAG_EXPIRED};`)
-- Test: `uc2_service/tests/session.rs` (new)
+- Create: `uc_service/src/session.rs`
+- Modify: `uc_service/src/lib.rs` (`mod session; pub use session::{Sessioned, SessionConfig, SESSION_HEADER_LEN, TAG_FRESH, TAG_REPLAYED, TAG_EXPIRED};`)
+- Test: `uc_service/tests/session.rs` (new)
 
 **Interfaces:**
 - Produces:
@@ -394,10 +394,10 @@ Add `#[arg(long)] raw_sm: bool` to the node-role and all-role arg structs; where
   ```
   Response bytes = `tag u8 ++ inner response` (`TAG_EXPIRED` carries no inner bytes). A command shorter than 16 bytes → `TAG_EXPIRED` (malformed envelope is treated as unanswerable, never panics the apply thread).
 
-- [ ] **Step 1: Write the failing tests** — `uc2_service/tests/session.rs`:
+- [ ] **Step 1: Write the failing tests** — `uc_service/tests/session.rs`:
 
 ```rust
-use uc2_service::{RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine, SESSION_HEADER_LEN, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED};
+use uc_service::{RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine, SESSION_HEADER_LEN, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED};
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
 fn env(client: u64, seq: u64, cmd: &Cmd) -> Vec<u8> {
@@ -485,9 +485,9 @@ fn snapshot_round_trip_carries_the_dedup_table() {
     out.clear(); fresh.query(&bincode::serde::encode_to_vec(&uc_lincheck::register::Query::Read, bincode::config::standard()).unwrap(), &mut out);
 }
 ```
-(If `RegisterSm`'s query type is not `Query::Read`, read `uc-lincheck/src/register.rs` and use its real query enum; drop the last two lines if it has none.)
+(If `RegisterSm`'s query type is not `Query::Read`, read `uc_lincheck/src/register.rs` and use its real query enum; drop the last two lines if it has none.)
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc2_service --test session` → FAIL (unresolved imports).
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc_service --test session` → FAIL (unresolved imports).
 - [ ] **Step 3: Implement `session.rs`:**
 
 ```rust
@@ -621,19 +621,19 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
     }
 }
 ```
-Use the real `SnapshotError` variant names from `uc2_service/src/config.rs` (read it; if the variants are e.g. `Io`/`Corrupt`, map accordingly). Add `serde` derive on `ClientState` (crate already depends on `serde` with `derive`).
+Use the real `SnapshotError` variant names from `uc_service/src/config.rs` (read it; if the variants are e.g. `Io`/`Corrupt`, map accordingly). Add `serde` derive on `ClientState` (crate already depends on `serde` with `derive`).
 
-- [ ] **Step 4: Run** — `cargo test -p uc2_service --test session` → PASS; `cargo test -p uc2_service` → PASS; clippy clean.
+- [ ] **Step 4: Run** — `cargo test -p uc_service --test session` → PASS; `cargo test -p uc_service` → PASS; clippy clean.
 - [ ] **Step 5: Commit** — `git commit -am "feat(service): Sessioned<S> exactly-once adapter (envelope, window, deterministic eviction, snapshot-composed)"`.
 
 ---
 
-### Task 6: `uc2_remote` crate — protocol v1 frame codec
+### Task 6: `uc_remote` crate — protocol v1 frame codec
 
 **Files:**
-- Create: `uc2_remote/Cargo.toml`, `uc2_remote/src/lib.rs`, `uc2_remote/src/frame.rs`, `uc2_remote/src/error.rs`
-- Modify: `Cargo.toml` (workspace members: add `"uc2_remote"`, `"uc2_gateway"` now so Task 8 needs no workspace edit)
-- Test: `uc2_remote/src/frame.rs` unit tests + `uc2_remote/tests/codec.rs`
+- Create: `uc_remote/Cargo.toml`, `uc_remote/src/lib.rs`, `uc_remote/src/frame.rs`, `uc_remote/src/error.rs`
+- Modify: `Cargo.toml` (workspace members: add `"uc_remote"`, `"uc_gateway"` now so Task 8 needs no workspace edit)
+- Test: `uc_remote/src/frame.rs` unit tests + `uc_remote/tests/codec.rs`
 
 **Interfaces:**
 - Produces (used by Tasks 7–11):
@@ -668,11 +668,11 @@ Use the real `SnapshotError` variant names from `uc2_service/src/config.rs` (rea
   pub enum FrameError { Short { need: usize, have: usize }, TooLong(u32), BadType(u8), BadVersion(u16), BadPayload(&'static str) }
   ```
 
-- [ ] **Step 1: Crate skeleton** — `uc2_remote/Cargo.toml`:
+- [ ] **Step 1: Crate skeleton** — `uc_remote/Cargo.toml`:
 
 ```toml
 [package]
-name = "uc2_remote"
+name = "uc_remote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -687,12 +687,12 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 ```
-Add `"uc2_remote", "uc2_gateway"` to the workspace `members` (create `uc2_gateway/Cargo.toml` + empty `src/lib.rs` now with `[package] name = "uc2_gateway" … [dependencies] uc2_remote = { path = "../uc2_remote" }` so the workspace resolves; Task 8 fills it).
+Add `"uc_remote", "uc_gateway"` to the workspace `members` (create `uc_gateway/Cargo.toml` + empty `src/lib.rs` now with `[package] name = "uc_gateway" … [dependencies] uc_remote = { path = "../uc_remote" }` so the workspace resolves; Task 8 fills it).
 
-- [ ] **Step 2: Write the failing tests** — `uc2_remote/tests/codec.rs`:
+- [ ] **Step 2: Write the failing tests** — `uc_remote/tests/codec.rs`:
 
 ```rust
-use uc2_remote::frame::*;
+use uc_remote::frame::*;
 
 #[test]
 fn header_round_trip_and_length_prefix() {
@@ -742,19 +742,19 @@ fn typed_payloads_round_trip() {
 }
 ```
 
-- [ ] **Step 3: Run to verify it fails** — `cargo test -p uc2_remote` → compile error (no `frame` module).
+- [ ] **Step 3: Run to verify it fails** — `cargo test -p uc_remote` → compile error (no `frame` module).
 - [ ] **Step 4: Implement `frame.rs`** — fixed LE layouts; `decode_header` checks `have >= HEADER_LEN`, reads `len`, refuses `len > MAX_FRAME_LEN` and `len < HEADER_LEN`, maps `ty` via a `match` (any other byte → `BadType`), returns `(Header, len as usize - HEADER_LEN)`; `encode_frame` reserves, writes the header with `len = HEADER_LEN + payload.len()`, appends payload. String fields: `u16` length prefix, refuse non-UTF-8 with `BadPayload("utf8")`. Each typed helper is a plain struct with `encode`/`decode`. `lib.rs`: `pub mod frame; pub mod error; pub use error::RemoteError;` (`error.rs` holds `FrameError` + the client's `RemoteError`, defined fully in Task 7 — for now `RemoteError` has `Frame(#[from] FrameError)` and `Io(#[from] std::io::Error)`).
-- [ ] **Step 5: Run** — `cargo test -p uc2_remote` → PASS; clippy clean.
-- [ ] **Step 6: Commit** — `git commit -am "feat(remote): uc2_remote crate — protocol v1 frame codec"`.
+- [ ] **Step 5: Run** — `cargo test -p uc_remote` → PASS; clippy clean.
+- [ ] **Step 6: Commit** — `git commit -am "feat(remote): uc_remote crate — protocol v1 frame codec"`.
 
 ---
 
-### Task 7: `uc2_remote::RemoteClient` — pipelined, credit-gated, redirect-following
+### Task 7: `uc_remote::RemoteClient` — pipelined, credit-gated, redirect-following
 
 **Files:**
-- Create: `uc2_remote/src/client.rs`, `uc2_remote/src/conn.rs` (framed reader/writer over `TcpStream`)
-- Modify: `uc2_remote/src/lib.rs`, `uc2_remote/src/error.rs`
-- Test: `uc2_remote/tests/client_fake_edge.rs` (an in-process fake edge speaking the protocol — no cluster needed)
+- Create: `uc_remote/src/client.rs`, `uc_remote/src/conn.rs` (framed reader/writer over `TcpStream`)
+- Modify: `uc_remote/src/lib.rs`, `uc_remote/src/error.rs`
+- Test: `uc_remote/tests/client_fake_edge.rs` (an in-process fake edge speaking the protocol — no cluster needed)
 
 **Interfaces:**
 - Produces:
@@ -780,7 +780,7 @@ fn typed_payloads_round_trip() {
   ```
   Behaviour contract (spec §4.5): every submit ends in exactly one of `Ok(RemoteResponse)` / `Err(Expired|Unknown|TimedOut|Closed)`; REDIRECT / LEADER_CHANGED / connection loss are handled internally (reconnect, re-HELLO, re-send every unanswered `seq` in order); RETRY honoured with `retry_after` + jitter; credits: never more than `credits` unanswered seqs beyond `acked_seq`.
 
-- [ ] **Step 1: Write the failing test** — `uc2_remote/tests/client_fake_edge.rs` builds a minimal fake edge thread (accept, read frames with `decode_header`, answer HELLO with `HelloOk{credits: 2, leader: Some(1), ..}`, answer SUBMIT seq N with `RESPONSE{meta{credits: 2, acked_seq: N, position: N*64}, payload = cmd reversed}`; on a flag, answer the first SUBMIT with `REDIRECT{node 2, addr of a second fake edge}`; on another flag answer with `RETRY{NOT_SERVING, 1000}` once; on another, drop the connection after HELLO once):
+- [ ] **Step 1: Write the failing test** — `uc_remote/tests/client_fake_edge.rs` builds a minimal fake edge thread (accept, read frames with `decode_header`, answer HELLO with `HelloOk{credits: 2, leader: Some(1), ..}`, answer SUBMIT seq N with `RESPONSE{meta{credits: 2, acked_seq: N, position: N*64}, payload = cmd reversed}`; on a flag, answer the first SUBMIT with `REDIRECT{node 2, addr of a second fake edge}`; on another flag answer with `RETRY{NOT_SERVING, 1000}` once; on another, drop the connection after HELLO once):
 
 ```rust
 // Key assertions:
@@ -792,7 +792,7 @@ fn typed_payloads_round_trip() {
 ```
 Write the fake edge as a reusable `tests/common/fake_edge.rs` (`FakeEdge::spawn(behaviour) -> (addr, JoinHandle, Arc<Observed>)`).
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc2_remote --test client_fake_edge` → compile error.
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc_remote --test client_fake_edge` → compile error.
 - [ ] **Step 3: Implement** — `conn.rs`: `FramedConn { stream: TcpStream, rd: Vec<u8>, rd_len: usize }` with `read_frame(&mut self) -> io::Result<(Header, Bytes)>` (reads until `HEADER_LEN`, decodes, reads payload) and `write_frame(&mut self, h: Header, payload: &[u8]) -> io::Result<()>` (`encode_frame` into a scratch `Vec` then `write_all`); `set_nodelay(true)`. `client.rs`: shared state under `Arc<Inner>`:
 
 ```rust
@@ -808,17 +808,17 @@ struct Pending { kind: Kind /*Submit|Query{lin}*/, payload: Bytes, tx: mpsc::Syn
 ```
 `connect`: for each member in order: TCP connect (timeout) → send HELLO → expect `HELLO_OK` (record credits/leader) or `HELLO_REFUSED` (return error) or `REDIRECT` (go to that addr next); spawn the **reader thread** (owns the read half via `try_clone`) which loops on `read_frame` and dispatches: `RESPONSE` → pop `pending[seq]`, send `Ok(RemoteResponse)` (or `Err(Expired)`), update `credits/acked_seq`, `cv.notify_all()`; `STATUS` → update + notify; `RETRY` → sleep `retry_after + jitter`, re-send that seq; `UNKNOWN` → if `resend_on_unknown` re-send else resolve `Err(Unknown)`; `REDIRECT`/`LEADER_CHANGED` → `reconnect_to(addr)`; read error → `reconnect_round_robin()`. `reconnect_*`: under the state lock, open a new conn, HELLO, replace writer, reset `credits` from `HELLO_OK`, then re-send every `pending` in `seq` order (credit-gated). `submit`: `seq = next_seq.fetch_add(1)+1`; wait on `cv` while `pending.len() >= min(cfg.max_inflight, credits)`; insert `Pending`; write frame; return `Ticket{rx}`. `Ticket::wait` = `rx.recv()`; `wait_timeout` maps to `TimedOut`. A **sweeper** in the reader thread's idle path (or `wait_timeout`) fails pendings older than `request_timeout` with `TimedOut` and removes them. `shutdown` sets `closed`, drops the writer, fails all pendings with `Closed`, joins the reader.
 
-- [ ] **Step 4: Run** — `cargo test -p uc2_remote` → PASS; clippy clean.
+- [ ] **Step 4: Run** — `cargo test -p uc_remote` → PASS; clippy clean.
 - [ ] **Step 5: Commit** — `git commit -am "feat(remote): RemoteClient — pipelined, credit-gated, redirect-following, ordered resend"`.
 
 ---
 
-### Task 8: `uc2_gateway::Edge` core — attach, accept, submit/query round-trip
+### Task 8: `uc_gateway::Edge` core — attach, accept, submit/query round-trip
 
 **Files:**
-- Create: `uc2_gateway/src/lib.rs`, `uc2_gateway/src/config.rs`, `uc2_gateway/src/edge.rs`, `uc2_gateway/src/conn.rs`
-- Modify: `uc2_gateway/Cargo.toml`
-- Test: `uc2_gateway/tests/roundtrip.rs` (in-process 1-node cluster + `RegisterSm` service + `Edge` + `RemoteClient`)
+- Create: `uc_gateway/src/lib.rs`, `uc_gateway/src/config.rs`, `uc_gateway/src/edge.rs`, `uc_gateway/src/conn.rs`
+- Modify: `uc_gateway/Cargo.toml`
+- Test: `uc_gateway/tests/roundtrip.rs` (in-process 1-node cluster + `RegisterSm` service + `Edge` + `RemoteClient`)
 
 **Interfaces:**
 - Produces:
@@ -834,24 +834,24 @@ struct Pending { kind: Kind /*Submit|Query{lin}*/, payload: Bytes, tx: mpsc::Syn
   pub struct Edge { .. }
   impl Edge { pub fn start(cfg: EdgeConfig) -> Result<Edge, EdgeError>; pub fn local_addr(&self) -> SocketAddr;
               pub fn stats(&self) -> EdgeStats; pub fn stop(self); }
-  pub enum EdgeError { Config(ConfigError), Attach(uc2_client::ClientError), Bind(std::io::Error) }
+  pub enum EdgeError { Config(ConfigError), Attach(uc_client::ClientError), Bind(std::io::Error) }
   pub struct EdgeStats { pub connections: u64, pub submits: u64, pub queries: u64, pub responses: u64, pub redirects: u64,
                          pub retries: u64, pub unknown: u64, pub backpressure_events: u64, pub leader_changes: u64 }
   ```
 
-- [ ] **Step 1: Write the failing test** — `uc2_gateway/tests/roundtrip.rs`:
+- [ ] **Step 1: Write the failing test** — `uc_gateway/tests/roundtrip.rs`:
 
 ```rust
 //! One node, one typed RegisterSm service wrapped in Sessioned, one Edge,
 //! one RemoteClient: writes, CAS, a linearizable read and a snapshot read
 //! all round-trip through the framed protocol with the envelope on.
 use std::time::Duration;
-use uc2_gateway::{Edge, EdgeConfig, Member};
-use uc2_remote::{RemoteClient, RemoteConfig};
-use uc2_service::{ServiceBuilder, ServiceConfig, Sessioned, SessionConfig};
+use uc_gateway::{Edge, EdgeConfig, Member};
+use uc_remote::{RemoteClient, RemoteConfig};
+use uc_service::{ServiceBuilder, ServiceConfig, Sessioned, SessionConfig};
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
-mod common; // tempdir() + start_single_node(root) -> (uc2_node::Node, PathBuf) using the lin_v2 NodeConfig shape with n=1
+mod common; // tempdir() + start_single_node(root) -> (uc_node::Node, PathBuf) using the lin_v2 NodeConfig shape with n=1
 
 #[test]
 fn write_cas_read_round_trip_through_the_edge() {
@@ -879,28 +879,28 @@ fn write_cas_read_round_trip_through_the_edge() {
     client.shutdown(); edge.stop(); svc.stop(); node.stop();
 }
 ```
-(`common/mod.rs`: copy the `tempdir()` helper and a one-node `NodeConfig` builder from `uc2_node/tests/lincheck_v2/mod.rs:221-260`; `await_serving` polls `node.is_serving_leader()`.) Add to `uc2_gateway/Cargo.toml`: `[dependencies] uc2_client, uc2_remote, uc_protocol, uc2_log (paths), bytes, thiserror, parking_lot (workspace); [dev-dependencies] uc2_node, uc2_service, uc2_net, uc-lincheck (default-features=false, features=["v2"]), serde, bincode, tempfile, rand (workspace)`.
+(`common/mod.rs`: copy the `tempdir()` helper and a one-node `NodeConfig` builder from `uc_node/tests/lincheck_v2/mod.rs:221-260`; `await_serving` polls `node.is_serving_leader()`.) Add to `uc_gateway/Cargo.toml`: `[dependencies] uc_client, uc_remote, uc_protocol, uc_log (paths), bytes, thiserror, parking_lot (workspace); [dev-dependencies] uc_node, uc_service, uc_net, uc_lincheck (default-features=false, features=["v2"]), serde, bincode, tempfile, rand (workspace)`.
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc2_gateway --test roundtrip` → compile error.
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc_gateway --test roundtrip` → compile error.
 - [ ] **Step 3: Implement** —
   - `config.rs` as in Interfaces (+ `EdgeConfig::defaults()` returning the documented defaults with empty `instance_dir`/`members` — only for tests/builders; `validate` refuses empties).
   - `conn.rs`: `pub(crate) struct Conn { idx: u32, writer: Mutex<TcpStream>, client_id: AtomicU64, credits: AtomicU32, inflight: AtomicU32, acked_seq: AtomicU64, corr_to_seq: Mutex<HashMap<u32, (u64, bool /*is_query*/)>>, next_corr: AtomicU32, gate: (Mutex<()>, Condvar) }` and `ConnTable { slots: RwLock<Vec<Option<Arc<Conn>>>> }` with `insert -> idx`, `get(idx)`, `remove(idx)`, `for_each`.
   - `edge.rs`: `Edge::start`: `cfg.validate()`; `Engine::attach(&cfg.instance_dir, &cfg.app_id, EngineConfig { max_inflight: cfg.max_inflight, request_timeout: cfg.request_timeout, serving_gate: false, ..Default::default() })` → `(send, poll)` (`serving_gate: false` — the edge decides itself via `can_serve()` so it can send REDIRECT, not `NotServing`); `TcpListener::bind(cfg.listen)`; spawn `acceptor` thread: for each stream → `ConnTable::insert` → spawn `reader(conn, send.clone(), ..)`; spawn `driver(poll, table, ..)`.
   - `reader`: `FramedConn::read_frame` loop. First frame must be `HELLO` with matching `app_id` and `version == PROTOCOL_VERSION`, else `HELLO_REFUSED{reason}` and close. Reply `HELLO_OK{credits: per_conn_inflight, leader, leader_addr}` (leader from `send.leader_hint()` + member map). Then per frame: `SUBMIT` → (credit gate: `while inflight >= credits { wait on gate }`) → if `!send.can_serve()`: write `REDIRECT{members[leader_hint]}` or `RETRY{NOT_SERVING, election_timeout_hint=300_000}` and continue; else build payload (`session_envelope` → `16-byte header ++ cmd`), `corr = next_corr++`, record `corr_to_seq[corr] = (seq, false)`, `user_data = (idx as u64) << 32 | corr`, loop `send.try_submit(user_data, &payload)`: `Ok` → `inflight += 1`; `Err(Backpressure)` → `stats.backpressure += 1`, halve `credits` (min 1), `thread::yield_now()` and retry (the socket is not read meanwhile — TCP backstop); `Err(NotServing)` → REDIRECT/RETRY as above; `Err(PayloadTooLarge)` → `RETRY{SERVICE_UNAVAILABLE}`? No — refuse loudly: write `RESPONSE` with `FLAG_EXPIRED`? Use `HELLO_REFUSED`-style close: write `RETRY{reason: RETRY_SERVICE_UNAVAILABLE}` and log; document "payload > max_payload is a client bug". `Err(InstanceRestart)` → write `LEADER_CHANGED{leader: None}` to all conns (via table) and close them. `QUERY` → same but `send.try_query(user_data, q, if flags & FLAG_LINEARIZABLE { Linearizable } else { Snapshot })` (no envelope on queries). `PING` → `PONG`. Connection EOF/error → `table.remove(idx)` (in-flight completions for a removed conn are dropped on arrival).
-  - `driver`: loop `poll.poll(|c| …)`: `idx = (c.user_data >> 32) as u32; corr = c.user_data as u32;` look up conn + `(seq, is_query)` (remove the map entry, `inflight -= 1`, `acked_seq = max(acked_seq, seq)` for submits, `credits = min(credits * 2, per_conn_inflight)` on a successful completion after a squeeze, notify gate). Map `Outcome`: `Response(bytes)` → if `session_envelope && !is_query`: `tag = bytes[0]`, rest = `bytes[1..]`, flags `FLAG_ENVELOPED | (REPLAYED|EXPIRED per tag)`; write `RESPONSE{meta{credits, acked_seq, position: c.position.unwrap_or(0)}} ++ rest`; `NotLeader{hint}` → `REDIRECT{members[hint]}` (or `RETRY{NOT_SERVING}`); `Retry` → `RETRY{SERVICE_UNAVAILABLE, 1000}`; `TimedOut` → `UNKNOWN`; `InstanceRestart` → `LEADER_CHANGED{None}` to all + close all. Between polls (every 64 iterations or when `poll` returned 0): the **status timer** — for each conn with no write in `status_interval`, write `STATUS{acked_seq, credits}`; and the leader watch (Task 9). Idle strategy: `poll.wait_handle()` park with a 1 ms cap (copy `PipelinedClient`'s driver ladder in `uc2_client/src/pipelined.rs`).
+  - `driver`: loop `poll.poll(|c| …)`: `idx = (c.user_data >> 32) as u32; corr = c.user_data as u32;` look up conn + `(seq, is_query)` (remove the map entry, `inflight -= 1`, `acked_seq = max(acked_seq, seq)` for submits, `credits = min(credits * 2, per_conn_inflight)` on a successful completion after a squeeze, notify gate). Map `Outcome`: `Response(bytes)` → if `session_envelope && !is_query`: `tag = bytes[0]`, rest = `bytes[1..]`, flags `FLAG_ENVELOPED | (REPLAYED|EXPIRED per tag)`; write `RESPONSE{meta{credits, acked_seq, position: c.position.unwrap_or(0)}} ++ rest`; `NotLeader{hint}` → `REDIRECT{members[hint]}` (or `RETRY{NOT_SERVING}`); `Retry` → `RETRY{SERVICE_UNAVAILABLE, 1000}`; `TimedOut` → `UNKNOWN`; `InstanceRestart` → `LEADER_CHANGED{None}` to all + close all. Between polls (every 64 iterations or when `poll` returned 0): the **status timer** — for each conn with no write in `status_interval`, write `STATUS{acked_seq, credits}`; and the leader watch (Task 9). Idle strategy: `poll.wait_handle()` park with a 1 ms cap (copy `PipelinedClient`'s driver ladder in `uc_client/src/pipelined.rs`).
   - `Edge::stop`: set `stop` flag, shutdown listener (connect-to-self trick or `set_nonblocking` + poll), join threads, close conns.
 
-- [ ] **Step 4: Run** — `cargo test -p uc2_gateway --test roundtrip` → PASS (both envelope on; add a second test fn with `session_envelope: false` and a plain `RegisterSm` service asserting `replayed == false` and the bytes decode). Clippy clean.
-- [ ] **Step 5: Commit** — `git commit -am "feat(gateway): uc2_gateway Edge — attach, accept, credit-gated submit/query round-trip over uc2_remote"`.
+- [ ] **Step 4: Run** — `cargo test -p uc_gateway --test roundtrip` → PASS (both envelope on; add a second test fn with `session_envelope: false` and a plain `RegisterSm` service asserting `replayed == false` and the bytes decode). Clippy clean.
+- [ ] **Step 5: Commit** — `git commit -am "feat(gateway): uc_gateway Edge — attach, accept, credit-gated submit/query round-trip over uc_remote"`.
 
 ---
 
 ### Task 9: Leader watch, redirect across failover, credits under backpressure
 
 **Files:**
-- Create: `uc2_gateway/src/watch.rs`
-- Modify: `uc2_gateway/src/edge.rs` (driver hook), `uc2_gateway/src/conn.rs`
-- Test: `uc2_gateway/tests/failover.rs` (3 in-process nodes, 3 edges, leader crash → `LEADER_CHANGED` → client resubmits with `replayed`/`fresh` accounting), `uc2_gateway/tests/credits.rs`
+- Create: `uc_gateway/src/watch.rs`
+- Modify: `uc_gateway/src/edge.rs` (driver hook), `uc_gateway/src/conn.rs`
+- Test: `uc_gateway/tests/failover.rs` (3 in-process nodes, 3 edges, leader crash → `LEADER_CHANGED` → client resubmits with `replayed`/`fresh` accounting), `uc_gateway/tests/credits.rs`
 
 **Interfaces:**
 - Produces: `pub(crate) struct LeaderWatch { last: (bool, Option<u32>) }` with `fn poll(&mut self, send: &SendHalf) -> Option<(bool /*can_serve*/, Option<u32>)>` returning `Some` on transition; `EdgeStats.leader_changes`.
@@ -923,7 +923,7 @@ fn leader_crash_redirects_and_resend_is_deduped() {
 
 - [ ] **Step 2: Run to verify it fails** — compile errors / assertion on missing `leader_changes`.
 - [ ] **Step 3: Implement** — `watch.rs` as above; the driver calls `watch.poll(&send)` every 64 poll iterations (≈ sub-millisecond at load, ≤ 1 ms idle): on transition, `stats.leader_changes += 1`, compute `(leader_id, addr)` from the member map, write `LEADER_CHANGED` to every conn (a conn whose write fails is removed). Credits: `Conn::squeeze()` halves (min 1) and `Conn::relax()` doubles (max `per_conn_inflight`) — relax runs in the driver on each successful completion after a squeeze; both trigger an immediate `STATUS` write when credits *increase* (so a throttled client learns it may send again without waiting for a response).
-- [ ] **Step 4: Run** — `cargo test -p uc2_gateway` → PASS; `cargo clippy -p uc2_gateway --all-targets -- -D warnings` → clean.
+- [ ] **Step 4: Run** — `cargo test -p uc_gateway` → PASS; `cargo clippy -p uc_gateway --all-targets -- -D warnings` → clean.
 - [ ] **Step 5: Commit** — `git commit -am "feat(gateway): leader watch + LEADER_CHANGED, redirect across failover, AIMD credits under backpressure"`.
 
 ---
@@ -931,10 +931,10 @@ fn leader_crash_redirects_and_resend_is_deduped() {
 ### Task 10: `uc2-gateway` binary, `gateway.toml`, packaging
 
 **Files:**
-- Create: `uc2_gateway/src/bin/uc2-gateway.rs`, `uc2_gateway/src/config_file.rs`
+- Create: `uc_gateway/src/bin/uc2-gateway.rs`, `uc_gateway/src/config_file.rs`
 - Create: `packaging/gateway.example.toml`, `packaging/systemd/uc2-gateway.service`
-- Modify: `uc2_gateway/Cargo.toml` (`[[bin]] name = "uc2-gateway"`; deps `clap`, `toml`, `serde`, `anyhow`, `signal-hook` — the same versions `uc2_node`'s bin uses; keep them out of the library's hot path: they are fine as crate deps since the lib is not dependency-minimal-by-contract — `uc2_remote` is)
-- Test: `uc2_gateway/tests/config_file.rs`
+- Modify: `uc_gateway/Cargo.toml` (`[[bin]] name = "uc2-gateway"`; deps `clap`, `toml`, `serde`, `anyhow`, `signal-hook` — the same versions `uc_node`'s bin uses; keep them out of the library's hot path: they are fine as crate deps since the lib is not dependency-minimal-by-contract — `uc_remote` is)
+- Test: `uc_gateway/tests/config_file.rs`
 
 **Interfaces:**
 - Produces: `pub fn load_from_path(path: &Path) -> Result<EdgeConfig, ConfigFileError>` with `ConfigFileError { Read{path, source}, Parse{path, source: toml::de::Error}, Invalid(ConfigError) }`; binary exit codes: `2` = config refusal (systemd `RestartPreventExitStatus=2`), `1` = runtime start failure, `0` = clean stop on SIGTERM/SIGINT.
@@ -972,7 +972,7 @@ status_interval_ms = 200
 envelope = true                # prepend client_id/seq for Sessioned<S> services; false = raw pass-through
 ```
 
-- [ ] **Step 2: Run to verify it fails**, **Step 3: Implement** `config_file.rs` (serde structs mirroring the TOML with `#[serde(deny_unknown_fields)]` per section, then `EdgeConfig::validate`) and the binary (copy `uc2_node/src/bin/uc2-node.rs:33-93`'s shape: `Args { --config }`, load → exit 2 on error; `Edge::start` → exit 1 on error; `signal_hook::flag::register` for SIGTERM/SIGINT; loop sleeping 100 ms printing a one-line stats summary every 10 s to stderr; on stop `edge.stop()`; exit 0). `uc2-gateway.service`:
+- [ ] **Step 2: Run to verify it fails**, **Step 3: Implement** `config_file.rs` (serde structs mirroring the TOML with `#[serde(deny_unknown_fields)]` per section, then `EdgeConfig::validate`) and the binary (copy `uc_node/src/bin/uc2-node.rs:33-93`'s shape: `Args { --config }`, load → exit 2 on error; `Edge::start` → exit 1 on error; `signal_hook::flag::register` for SIGTERM/SIGINT; loop sleeping 100 ms printing a one-line stats summary every 10 s to stderr; on stop `edge.stop()`; exit 0). `uc2-gateway.service`:
 
 ```
 [Unit]
@@ -993,7 +993,7 @@ LimitNOFILE=65536
 [Install]
 WantedBy=multi-user.target
 ```
-- [ ] **Step 4: Run** — `cargo test -p uc2_gateway` → PASS; `cargo run -p uc2_gateway --bin uc2-gateway -- --config /nonexistent` → exits 2 with a named error; clippy clean.
+- [ ] **Step 4: Run** — `cargo test -p uc_gateway` → PASS; `cargo run -p uc_gateway --bin uc2-gateway -- --config /nonexistent` → exits 2 with a named error; clippy clean.
 - [ ] **Step 5: Commit** — `git commit -am "feat(gateway): uc2-gateway binary, gateway.toml, systemd unit"`.
 
 ---
@@ -1001,11 +1001,11 @@ WantedBy=multi-user.target
 ### Task 11: Remote lincheck capstone (hard-crash, three edges in the loop)
 
 **Files:**
-- Modify: `examples/uc2-crashtest/Cargo.toml` (deps `uc2_gateway`, `uc2_remote`; new bin `uc2-crashtest-gateway`)
-- Modify: `examples/uc2-crashtest/src/bin/uc2-crashtest-service.rs` (`--sessioned` flag → `Sessioned<RegisterSm>`)
-- Create: `examples/uc2-crashtest/src/bin/uc2-crashtest-gateway.rs` (thin: `--instance-dir --app-id --listen --members id@addr,… [--no-envelope]` → `Edge::start`, run until SIGTERM/SIGKILL)
-- Create: `examples/uc2-crashtest/tests/remote_lin.rs` (feature `hard-crash-tests`)
-- Modify: `.github/workflows/nightly.yml` (`crashtest` job already runs `cargo test -p uc2-crashtest --features hard-crash-tests` — the new test is picked up; add `timeout-minutes` headroom if needed)
+- Modify: `examples/uc_crashtest/Cargo.toml` (deps `uc_gateway`, `uc_remote`; new bin `uc_crashtest-gateway`)
+- Modify: `examples/uc_crashtest/src/bin/uc_crashtest-service.rs` (`--sessioned` flag → `Sessioned<RegisterSm>`)
+- Create: `examples/uc_crashtest/src/bin/uc_crashtest-gateway.rs` (thin: `--instance-dir --app-id --listen --members id@addr,… [--no-envelope]` → `Edge::start`, run until SIGTERM/SIGKILL)
+- Create: `examples/uc_crashtest/tests/remote_lin.rs` (feature `hard-crash-tests`)
+- Modify: `.github/workflows/nightly.yml` (`crashtest` job already runs `cargo test -p uc_crashtest --features hard-crash-tests` — the new test is picked up; add `timeout-minutes` headroom if needed)
 
 **Interfaces:**
 - Consumes: `common/mod.rs` helpers (`NODE_BIN`, `SERVICE_BIN`, `Reap`, `spawn_node`, `spawn_service`, `wait_for_ready`, `wait_for_fresh_instance`, `tempdir`); `uc_lincheck::history::{History, Outcome}`, `checker::check_register`, `register::{Cmd, CmdResp, RegisterSm}`.
@@ -1015,16 +1015,16 @@ WantedBy=multi-user.target
 ```rust
 #![cfg(feature = "hard-crash-tests")]
 //! Three node procs, three Sessioned services, three gateway procs; remote
-//! clients pipeline Write/Cas/Read through uc2_remote; the leader NODE is
+//! clients pipeline Write/Cas/Read through uc_remote; the leader NODE is
 //! SIGKILLed and respawned repeatedly. Assert: linearizable, and no acked
 //! write lost (every Ok(WriteAck) is visible to the checker as Ok).
 mod common;
 use common::*;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use uc_lincheck::{checker::{check_register, Verdict}, history::{History, Outcome}, register::{Cmd, CmdResp}};
-use uc2_remote::{RemoteClient, RemoteConfig};
+use uc_remote::{RemoteClient, RemoteConfig};
 
-const GATEWAY_BIN: &str = env!("CARGO_BIN_EXE_uc2-crashtest-gateway");
+const GATEWAY_BIN: &str = env!("CARGO_BIN_EXE_uc_crashtest-gateway");
 
 fn remote_lin_once(seed: u64, envelope: bool) {
     let root = tempdir();
@@ -1034,7 +1034,7 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     // 3. workers: 4 threads, each a RemoteClient over ALL THREE gateway addrs (members), client_id fixed per worker,
     //    loop for 20 s: pick Write(rand)/Cas{old,new}/Read(linearizable); inv = history.invoke();
     //    submit → ticket.wait(): Ok(resp) → Outcome::Ok(decode), Err(Expired|Unknown|TimedOut|Closed) → Outcome::Indeterminate
-    // 4. chaos thread: every 3 s pick the CURRENT leader (read each instance dir's cnc via uc2_log::cnc::CncPage::open + NODE_FLAG_LEADER),
+    // 4. chaos thread: every 3 s pick the CURRENT leader (read each instance dir's cnc via uc_log::cnc::CncPage::open + NODE_FLAG_LEADER),
     //    SIGKILL that node proc (Reap drop) and its service proc, respawn both (node first; wait_for_fresh_instance); gateway procs
     //    are NOT restarted — they must survive the InstanceRestart and keep serving after reconnects.
     // 5. stop, join, entries = history.into_entries(); assert ok*100 >= len*70 (remote path is slower: lower liveness bar than lin_v2's 80);
@@ -1046,9 +1046,9 @@ fn remote_lin_once(seed: u64, envelope: bool) {
 ```
 Write the body fully (the shape above is the contract; copy the spawn/kill/readiness helpers from `hard_crash.rs` and the worker op selection from `lincheck_v2/mod.rs:1247`). With the envelope **on**, additionally assert the "no acked write lost" property directly: maintain a per-worker set of `(value, position)` for every `Ok(WriteAck)`; at the end read the register and assert it equals the `value` of the highest `position` across all workers' Ok writes (positions are total-order, so the last acked write must be the visible one unless a later Ok write/CAS superseded it — compute the expected value by replaying Ok outcomes in position order: `Write(v)` sets v, `Cas{old,new}` with `CasResult(true)` sets new).
 
-- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc2-crashtest --features hard-crash-tests --test remote_lin` → compile error (bins missing).
+- [ ] **Step 2: Run to verify it fails** — `cargo test -p uc_crashtest --features hard-crash-tests --test remote_lin` → compile error (bins missing).
 - [ ] **Step 3: Implement** the two bins (service: `if args.sessioned { ServiceBuilder::new(cfg, Sessioned::new(RegisterSm::default(), SessionConfig::default())).start() } else { ServiceBuilder::new(cfg, RegisterSm::default()).start() }` held in an enum/`Box<dyn Any>`-free pair of `Option`s; gateway bin as described) and fill the test body.
-- [ ] **Step 4: Run** — `cargo test -p uc2-crashtest --features hard-crash-tests --test remote_lin -- --nocapture` → PASS (both variants; each ≤ 90 s locally). Then the full `cargo test -p uc2-crashtest --features hard-crash-tests` → PASS. Check `nightly.yml` `crashtest` `timeout-minutes` (60) still has headroom; bump to 75 if the run is > 40 min.
+- [ ] **Step 4: Run** — `cargo test -p uc_crashtest --features hard-crash-tests --test remote_lin -- --nocapture` → PASS (both variants; each ≤ 90 s locally). Then the full `cargo test -p uc_crashtest --features hard-crash-tests` → PASS. Check `nightly.yml` `crashtest` `timeout-minutes` (60) still has headroom; bump to 75 if the run is > 40 min.
 - [ ] **Step 5: Commit** — `git commit -am "test(crashtest): remote lincheck capstone — three gateways in the loop, leader SIGKILL, zero acked-write loss"`.
 
 ---
@@ -1056,11 +1056,11 @@ Write the body fully (the shape above is the contract; copy the spawn/kill/readi
 ### Task 12: `m12_gate` (gateway vs direct `Engine`) + gate-doc skeleton
 
 **Files:**
-- Create: `uc2_gateway/examples/m12_gate.rs`
+- Create: `uc_gateway/examples/m12_gate.rs`
 - Create: `docs/benchmarks/uc2-m12-gate-2026-08-22.md` (skeleton with every row from spec §8, local smoke numbers labelled as such, fleet cells empty)
 
 - [ ] **Step 1: Write the harness** — reuse `m5_gate`'s `all` shape (3 in-process nodes, `CountSm` services — the typed one, so the two arms share the service) with two arms selected by `--arm direct|gateway`: `direct` = `m5_gate`'s `run_client_measurement` copied verbatim (Engine on the leader's instance dir); `gateway` = one `Edge` per node + `RemoteClient` connected to the leader's edge, same payload/inflight/secs, one sender thread + ticket-wait threads, the same `ClientStats`/`print_report`. Print both arms' `responses/s`, `p50`, `p99` and the ratio `gateway/direct`. Args: `--secs 6 --payload 64 --inflight 4096 --envelope {on,off}`.
-- [ ] **Step 2: Smoke** — `cargo run -p uc2_gateway --release --example m12_gate -- --secs 6 --payload 64` on the dev box; record in the gate doc as **smoke (dev box, 4 vCPU, not a gate number)**.
+- [ ] **Step 2: Smoke** — `cargo run -p uc_gateway --release --example m12_gate -- --secs 6 --payload 64` on the dev box; record in the gate doc as **smoke (dev box, 4 vCPU, not a gate number)**.
 - [ ] **Step 3: Gate doc skeleton** — table with spec §8's rows; fill: remote capstone (CI, PASS once Task 11 is green in nightly — leave "pending nightly" until then), codec share (Task 4's smoke lines), gateway cost (Task 12 smoke), remaining rows "M12b/c/d". State the proposed bar (≥ 0.8× direct-Engine at equal inflight) and that it is fleet-only.
 - [ ] **Step 4: Commit** — `git commit -am "gate(m12a): m12_gate harness + gate doc skeleton (smoke numbers labelled)"`.
 
@@ -1070,14 +1070,14 @@ Write the body fully (the shape above is the contract; copy the spawn/kill/readi
 
 **Files:**
 - Create: `docs/how-to/run-a-gateway.md`, `docs/reference/gateway-config.md`, `docs/reference/remote-protocol.md`, `docs/notes/uc2-gateway-shapes-and-flow-control.md`
-- Modify: `docs/reference/state-machine-contract.md` (Task 4; add the `Sessioned` section), `docs/QUICKSTART.md` (one "remote clients" pointer), `docs/ops/uc2-runbook.md` (gateway ops: start/stop, what `REDIRECT`/`LEADER_CHANGED` look like, stats line), `README.md` crate table (+`uc2_remote`, `uc2_gateway`), `CLAUDE.md` workspace crate list (+ the two crates and the `Sessioned`/`RawStateMachine` one-liners), `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` §3.1 (blanket impl instead of `Typed<S>`, 1-byte tag, `FLAG_*` names — amend, do not rewrite)
-- Modify: `.github/workflows/ci.yml` — nothing required (`cargo test --workspace --exclude uc2_node` picks up `uc2_remote`/`uc2_gateway`); add `cargo clippy -p uc2_service --features apply-profile --all-targets -- -D warnings` next to the `ultima_db` clippy line so the probe never rots.
+- Modify: `docs/reference/state-machine-contract.md` (Task 4; add the `Sessioned` section), `docs/QUICKSTART.md` (one "remote clients" pointer), `docs/ops/uc2-runbook.md` (gateway ops: start/stop, what `REDIRECT`/`LEADER_CHANGED` look like, stats line), `README.md` crate table (+`uc_remote`, `uc_gateway`), `CLAUDE.md` workspace crate list (+ the two crates and the `Sessioned`/`RawStateMachine` one-liners), `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` §3.1 (blanket impl instead of `Typed<S>`, 1-byte tag, `FLAG_*` names — amend, do not rewrite)
+- Modify: `.github/workflows/ci.yml` — nothing required (`cargo test --workspace --exclude uc_node` picks up `uc_remote`/`uc_gateway`); add `cargo clippy -p uc_service --features apply-profile --all-targets -- -D warnings` next to the `ultima_db` clippy line so the probe never rots.
 
 - [ ] **Step 1: `docs/reference/remote-protocol.md`** — the frame layout byte-for-byte, every type's payload layout (copy Task 6's Interfaces block as tables), flags, the credit rule ("at most `credits` unanswered seqs beyond `acked_seq`"), the `RETRY` reasons and that it is a state signal, the failover promises (spec §4.5) — this is the page a non-Rust port implements from.
 - [ ] **Step 2: `docs/reference/gateway-config.md`** — every `gateway.toml` key, default, refusal; `docs/how-to/run-a-gateway.md` — one edge per node host, the member map must be identical everywhere, systemd unit, what a client sees on failover, when to use `envelope = false`.
 - [ ] **Step 3: `docs/notes/uc2-gateway-shapes-and-flow-control.md`** — the A/B/C/D comparison (from the design conversation; C chosen, D the end-state), why redirect not forward, why credits not TCP, Aeron parallels (`REDIRECT`, `NewLeaderEvent`, Status Messages).
 - [ ] **Step 4: Spec amendment + README/CLAUDE.md/QUICKSTART/runbook edits** as listed.
-- [ ] **Step 5: Run everything** — `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`; `cargo test -p uc2_service --features ultima_db`; `cargo test -p uc2_node --test lin_v2`; `cargo doc --workspace --no-deps --lib` (the `docs.yml` link-drift guard must still pass).
+- [ ] **Step 5: Run everything** — `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`; `cargo test -p uc_service --features ultima_db`; `cargo test -p uc_node --test lin_v2`; `cargo doc --workspace --no-deps --lib` (the `docs.yml` link-drift guard must still pass).
 - [ ] **Step 6: Commit** — `git commit -am "docs(m12a): gateway how-to/reference, remote protocol spec page, explainer note, spec §3.1 amendment"`.
 
 ---
@@ -1085,7 +1085,7 @@ Write the body fully (the shape above is the contract; copy the spawn/kill/readi
 ## Self-review against spec §3.1 / §4
 
 - §3.1 two tiers → Tasks 1–4 (blanket impl instead of `Typed<S>` — amended in Task 13; `egress` no longer allocates — Task 2; `apply-profile` kept — Task 2/4). ✔
-- §4.1 crates → Tasks 6–8 (`uc2_remote`, `uc2_gateway`, `uc2_service::session`). ✔
+- §4.1 crates → Tasks 6–8 (`uc_remote`, `uc_gateway`, `uc_service::session`). ✔
 - §4.2 protocol incl. credits/`STATUS`/`RETRY{reason, hint}`/`UNKNOWN`/`LEADER_CHANGED` → Tasks 6–9. ✔
 - §4.3 edge (Engine per edge, conn table, leader watch, static member map, redirect, envelope, errors, `gateway.toml`, packaging) → Tasks 8–10. ✔
 - §4.4 `Sessioned` (window, LRU by position, gap-as-fresh, snapshot composition, works over typed) → Task 5. ✔

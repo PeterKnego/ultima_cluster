@@ -8,7 +8,7 @@
 //! three methods below.
 
 use serde::{Deserialize, Serialize};
-use uc2_service::StateMachine;
+use uc_service::StateMachine;
 
 /// What clients send. Commands go through consensus and are applied on every
 /// replica, in the same order.

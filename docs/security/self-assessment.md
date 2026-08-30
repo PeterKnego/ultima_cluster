@@ -116,7 +116,7 @@ restart and replay a captured, still-unexpired request. The binding is now
 taken from the node's own boot-time state
 (`Consensus::admin_instance_id`/`admin_app_id`) and never re-read from the
 page. Regression test:
-`uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`
+`uc_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`
 (forges the cnc header back to the captured `instance_id`, asserts
 `auth_bad_tag`/reason 21 and the config version unmoved).
 
@@ -172,9 +172,9 @@ the ones a reviewer should weigh.
 | **A malicious cluster member can forge fan-out traffic as any node.** | The group key is symmetric; this is inherent to seal-once-send-to-many. The alternative is N seals per fan-out, which the M8 design rejected on cost. Verbatim residual 3 in [threat model §6](threat-model.md#6-residuals-stated-elsewhere-and-where). |
 | **No client authentication or TLS on the remote link.** | An explicit M12 non-goal ("no TLS on the remote client link in this release"). Reachability is authorization; the guidance is to keep the port private or front it with a proxy. |
 | **`[admin] auth = "hmac"` is only cluster-wide when paired with `[crypto].enabled = true`.** | A follower forwards an authenticated request to the leader over the node-to-node socket as wire kind 16, which the leader cannot re-verify. Stated in four places, including the README. Fixing it properly means an admin credential the *leader* can check, i.e. a wire change — deliberately not smuggled into M12b. |
-| **The IPC rings' `unsafe` code is checked for layout and nothing else.** | `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` has **no interleaving coverage and no UB coverage**. Miri does not support file-backed memory mappings (three distinct blockers, each reproduced — VERIFICATION §7), and a `Vec`-backed variant would check a different object than the one that ships. The tree's only loom model (`uc2_log/tests/loom_frame.rs`) covers the **log buffer's** frame-visibility protocol — a hand-written model of that handshake — not the rings. Offset-pin tests freeze the layout. This is the least-covered `unsafe` code in the system and it is stated as such, here and in VERIFICATION §11. |
+| **The IPC rings' `unsafe` code is checked for layout and nothing else.** | `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` has **no interleaving coverage and no UB coverage**. Miri does not support file-backed memory mappings (three distinct blockers, each reproduced — VERIFICATION §7), and a `Vec`-backed variant would check a different object than the one that ships. The tree's only loom model (`uc_log/tests/loom_frame.rs`) covers the **log buffer's** frame-visibility protocol — a hand-written model of that handshake — not the rings. Offset-pin tests freeze the layout. This is the least-covered `unsafe` code in the system and it is stated as such, here and in VERIFICATION §11. |
 | **`leader_completeness` is not proved**, and the Lean model collapses the durable counter's two readers into one. | Open, and stated: [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified). A real acked-write-loss bug once lived in exactly that model gap and was found from the Rust side. |
-| **A malformed query frame fail-stops a typed state machine, pre-commit, from an unauthenticated client.** | `uc2_service/src/traits.rs`'s blanket `RawStateMachine` impl decodes a query with `.expect("corrupt query frame (fail-stop)")`, and `uc2_service/src/apply.rs`'s query branch calls it **while holding the state machine's `Mutex`** — so a single malformed `QUERY` body arriving through a gateway (`SendHalf::try_query`) panics the apply thread and poisons the lock, with no quorum, no leadership and no commit involved. It is a one-frame remote kill switch for any deployment that pairs the typed tier with untrusted clients. **Documented rather than fixed in M12d on purpose:** turning a decode error into a refusal changes the tier's error semantics (today, undecodable bytes are treated as corruption, and corruption is a fail-stop by design — the same `.expect` guards the post-commit apply path, where fail-stop *is* the right answer because every replica sees the same committed bytes). Choosing the new contract is a design decision, parked as a follow-up. **The workaround today is the raw tier**, which hands you the bytes and lets you reject them; the other mitigation is not exposing a gateway to untrusted clients. |
+| **A malformed query frame fail-stops a typed state machine, pre-commit, from an unauthenticated client.** | `uc_service/src/traits.rs`'s blanket `RawStateMachine` impl decodes a query with `.expect("corrupt query frame (fail-stop)")`, and `uc_service/src/apply.rs`'s query branch calls it **while holding the state machine's `Mutex`** — so a single malformed `QUERY` body arriving through a gateway (`SendHalf::try_query`) panics the apply thread and poisons the lock, with no quorum, no leadership and no commit involved. It is a one-frame remote kill switch for any deployment that pairs the typed tier with untrusted clients. **Documented rather than fixed in M12d on purpose:** turning a decode error into a refusal changes the tier's error semantics (today, undecodable bytes are treated as corruption, and corruption is a fail-stop by design — the same `.expect` guards the post-commit apply path, where fail-stop *is* the right answer because every replica sees the same committed bytes). Choosing the new contract is a design decision, parked as a follow-up. **The workaround today is the raw tier**, which hands you the bytes and lets you reject them; the other mitigation is not exposing a gateway to untrusted clients. |
 | **`bincode` is unmaintained (RUSTSEC-2025-0141).** | A maintenance-status advisory with no patched version ("No safe upgrade is available!"). It is the wire codec for the cnc page, log records and the remote protocol, and the typed tier's byte-identity promise is defined against it, so replacing it is a wire-format migration. Ignored on purpose in `deny.toml`, with the reasoning, the date, and an instruction to re-check when a maintained successor appears. |
 | **The typed state-machine tier decodes with no configured byte limit.** | `bincode::config::standard()` is `NoLimit`. The bounds that exist are the ≤ 1344-byte payload cap, serde's 1 MiB pre-allocation cap, and fail-stop on a decode error. The documented stance is "committed bytes are trusted"; the answer for untrusted input is the raw tier. Stated rather than papered over — see [attack surface §1](attack-surface.md#1-the-inventory). |
 
@@ -185,7 +185,7 @@ Ranked by where we think the residual risk actually is:
 1. **The pre-auth UDP path with crypto OFF.** This is the default posture, and
    the decoders are the only thing in front of the node's state. Fuzzing is a
    regression gate, not a proof of totality. Worth a fresh pair of eyes on
-   `uc2_net::receiver`'s dispatch — in particular the consensus plane (kinds
+   `uc_net::receiver`'s dispatch — in particular the consensus plane (kinds
    5–11 plus the admin-forward kinds 16 and 17), which is forwarded **raw** to
    the consensus agent with no term filter, because a higher-term
    `RequestVote` must reach the state machine.
@@ -219,7 +219,7 @@ Ranked by where we think the residual risk actually is:
    and the crc32. **SPSC's interleavings and the broadcast seqlock remain
    unmodelled**; for the seqlock that is deliberate (a faithful loom model of
    it correctly fails under loom's full C++ semantics — see
-   `uc2_log/tests/loom_frame.rs`'s header), which is itself worth an outside
+   `uc_log/tests/loom_frame.rs`'s header), which is itself worth an outside
    opinion. Those are the places we would look first.
 6. **The gateway's credit / backpressure ladder under a malicious client.** The
    caps (`MAX_FRAME_LEN`, `max_connections`, credits, write timeout) are
@@ -232,7 +232,7 @@ Ranked by where we think the residual risk actually is:
    byte budget). We believe the consequence is confined to *liveness of
    exactly-once* for the evicted clients — the tier degrades to at-least-once —
    and not to a correctness violation. That belief deserves checking.
-8. **The multi-artifact snapshot intake state machine** (`uc2_net/src/receiver.rs`,
+8. **The multi-artifact snapshot intake state machine** (`uc_net/src/receiver.rs`,
    M14c): adopt-on-complete across N artifacts, `.part` files, an abandoned
    intake's unlink, the declared-set and layout refusals, and the interaction
    with a concurrent second session from another peer. It is unit-tested and
@@ -248,11 +248,11 @@ The short form:
 | Tier | What it covers |
 |---|---|
 | Lean 4 proofs | election safety, log matching over the consensus kernels; `leader_completeness` open |
-| Deterministic simulation (`uc2_sim`) | safety invariants + seeded fuzz over the whole protocol, virtual time |
+| Deterministic simulation (`uc_sim`) | safety invariants + seeded fuzz over the whole protocol, virtual time |
 | WGL linearizability capstones | failover, purge/snapshot churn, partition/quorum loss |
 | Elle | transactional safety, plus a mutation tier that proves the harness can fail |
 | Multi-process SIGKILL | real processes, real reconstruction |
-| loom | two hand-written models: the **log buffer's** frame-visibility protocol (`uc2_log/tests/loom_frame.rs`) and the **MPSC ring's** claim-then-commit protocol (`uc_protocol/tests/loom_mpsc.rs`, since 2.7.0). Both model the protocol over loom atomics, **not** the mmap; SPSC and the broadcast seqlock are still unmodelled |
+| loom | two hand-written models: the **log buffer's** frame-visibility protocol (`uc_log/tests/loom_frame.rs`) and the **MPSC ring's** claim-then-commit protocol (`uc_protocol/tests/loom_mpsc.rs`, since 2.7.0). Both model the protocol over loom atomics, **not** the mmap; SPSC and the broadcast seqlock are still unmodelled |
 | **Fuzzing (§7)** | **fifteen decoder targets, nightly, with an execution floor** |
 | **Miri (§7)** | **the pure decoders — 62 tests, isolation on, no exclusions; the mmap rings are out of reach** |
 | **M14 multi-service** | unit + in-process integration + sim inv10 + fuzz seeds; **no two-FSM lincheck/partition/crash/Elle yet** (M14c2, `2.8.1`) — [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified) |

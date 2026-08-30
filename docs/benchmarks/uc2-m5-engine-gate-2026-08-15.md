@@ -11,7 +11,7 @@ touched after data exists.)
 The pipelined-client arc (spec
 `docs/superpowers/specs/2026-08-13-uc2-pipelined-client-design.md`, merged
 main `c3011e2`) rewrote `m5_gate`'s client role onto the PUBLIC
-`uc2_client::Engine` (`SendHalf`/`PollHalf`) — the raw ring pump the original
+`uc_client::Engine` (`SendHalf`/`PollHalf`) — the raw ring pump the original
 gate used is gone. The plan's acceptance criterion: **the measured path is
 now the shipped path, and the M5 fleet gate must reproduce its numbers
 through the public API.** Sandbox smoke showed parity (~407k median vs 435k
@@ -84,7 +84,7 @@ private IPs 10.10.1.10/11/12:19100, node+service per host under
 the bar — now the strictly TIGHTER bar including `lost == 0` — with
 `RESULT: PASS` printed by the client binary. Best PASS point this run:
 **1,470,985 responses/s @ p50 0.655 ms (128 KiB / W=1024), 3.7× the 400k
-bar**, through the public `uc2_client::Engine`. The stretch goal (800k)
+bar**, through the public `uc_client::Engine`. The stretch goal (800k)
 remains exceeded, 1.8×.
 
 **Rule 2 (parity @ 256 KiB/1024): REGRESSION by the pre-committed floor.**
@@ -167,9 +167,9 @@ variance?
 **Design** (one fresh fleet, same 3 × c6id.2xlarge protocol):
 - Server side IDENTICAL for both arms and all runs: node + service processes
   from main `c3011e2`'s `m5_gate` on every host. (Verified: `git diff
-  35daaae c3011e2` touches NO server-side crate — `uc2_node/src`,
-  `uc2_service`, `uc2_log`, `uc2_net`, `uc2_consensus`, `uc_protocol` are
-  byte-identical; the two trees differ only in `uc2_client`, the m5_gate
+  35daaae c3011e2` touches NO server-side crate — `uc_node/src`,
+  `uc_service`, `uc_log`, `uc_net`, `uc_consensus`, `uc_protocol` are
+  byte-identical; the two trees differ only in `uc_client`, the m5_gate
   CLIENT role, and docs.)
 - Arm A: the PRE-extraction client (raw ring pump) — `m5_gate` built from
   `35daaae` (the last commit before the Task-8 client rewrite), on host0 at

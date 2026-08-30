@@ -10,7 +10,7 @@ is **poll-sleep IPC latency, not fsync** — was acted on and shipped as **task1
 landed here is the **reusable harness** (`commit-path-load` driver,
 `uc-node-launch` launcher, run/plot scripts) plus this writeup. The Phase-0
 `commit-profile` instrumentation was **dropped on integration**: its journal-side
-half (`ultima_journal::commit_profile`) was never committed and is unrecoverable,
+half (`uc_journal::commit_profile`) was never committed and is unrecoverable,
 and its verdict is already harvested — the fsync-vs-poll-sleep numbers it produced
 are kept below as historical record, not as something re-runnable from this tree.
 Design scaffolding: `docs/superpowers/specs/2026-05-30-aeron-vs-uc-commit-path-benchmark-design.md`
@@ -300,7 +300,7 @@ framings are:
 
 ## 9. Follow-up (2026-06-13) — journal group-commit lever: implemented, measured, doesn't move the UC floor
 
-`ultima_journal` landed the §6 lever #1 work (autoresearch run, merged as
+`uc_journal` landed the §6 lever #1 work (autoresearch run, merged as
 `ultima_db` `eabe345`). The champion commit `4fcb939` *"fsync dup'd fd, release
 `state.lock` across `sync_all`"* (preceded by `fec3094`, fsync re-drain
 coalescing, +21%) drops the journal's state lock while a writer thread is blocked
@@ -639,7 +639,7 @@ residual costs are physical, not loop-bound:
 - **Dominant latency = `api_batch_linger=5ms`** (proposed→received ~6.5ms), a
   throughput-for-latency trade we chose (§13); reduce it only to trade throughput back.
 - **Leader journal fsync P99 tail = 171ms** (submitted→persisted) — the one clearly
-  *actionable, in-our-code* lever: tighten the `ultima_journal` group-commit / fsync
+  *actionable, in-our-code* lever: tighten the `uc_journal` group-commit / fsync
   tail (the P50 is ~1ms, so it's a tail problem, not steady-state).
 - **Quorum replication round-trip ~2.7ms** (persisted→committed) — network /
   openraft-replication territory (alpha.21 has no in-flight pipelining knob).
@@ -654,7 +654,7 @@ apply (fixed) — it's the **leader fsync tail** (ours) and the **replication ro
 
 Acted on §15's "leader fsync tail" lever: changed the journal's hot per-commit fsync
 from `sync_all` (full fsync) to **`sync_data` (fdatasync)** in
-`ultima_journal/src/journal/writer.rs::fsync_active_segment` (full `sync_all` retained
+`uc_journal/src/journal/writer.rs::fsync_active_segment` (full `sync_all` retained
 on segment-create, where the new directory entry must be durable). fdatasync flushes
 data + the `i_size` growth and skips only inode timestamps — the standard WAL commit
 primitive; `Durability::Consistent`'s power-loss guarantee is preserved. One line, no
@@ -711,7 +711,7 @@ does to it internally.
 
 Pursued the §16 "leader fsync tail" lever further: **segment preallocation** (etcd
 `filePipeline` — preallocate each journal segment so the per-commit `fdatasync` skips the
-ext4 jbd2 metadata commit a size-extending append forces). Shipped to `ultima_journal`
+ext4 jbd2 metadata commit a size-extending append forces). Shipped to `uc_journal`
 (task36); cluster reads `UC_JOURNAL_PREALLOC`. Note §13/this doc earlier called §5
 preallocation "NOT pursued (YAGNI)" — that was reversed once a microbench showed the jbd2
 commit is a real fraction of a *local-NVMe* fsync.

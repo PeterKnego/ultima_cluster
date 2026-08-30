@@ -188,13 +188,13 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_node_heartbeat_age_seconds",
+          "expr": "uc_node_heartbeat_age_seconds",
           "legendFormat": "node {{instance}}"
         },
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_heartbeat_age_seconds{service=\"\"}",
+          "expr": "uc_service_heartbeat_age_seconds{service=\"\"}",
           "legendFormat": "service (slowest) {{instance}}"
         }
       ]
@@ -252,7 +252,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_lag_bytes",
+          "expr": "uc_service_lag_bytes",
           "legendFormat": "fsm {{service}} {{instance}}"
         },
         {
@@ -277,7 +277,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_service_heartbeat_age_seconds{service!=\"\"}",
+          "expr": "uc_service_heartbeat_age_seconds{service!=\"\"}",
           "legendFormat": "fsm {{service}} {{instance}}"
         }
       ]
@@ -293,7 +293,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "min(uc2_service_attached)",
+          "expr": "min(uc_service_attached)",
           "instant": true
         }
       ]
@@ -309,7 +309,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "count(count_values(\"v\", uc2_services_declared))",
+          "expr": "count(count_values(\"v\", uc_services_declared))",
           "instant": true
         }
       ]

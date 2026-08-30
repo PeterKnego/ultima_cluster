@@ -1,9 +1,9 @@
 # The remote protocol (v1)
 
-The wire format `uc2_gateway`'s `Edge` speaks with remote clients, and that
-`uc2_remote`'s `RemoteClient` implements. This is the page a non-Rust port
+The wire format `uc_gateway`'s `Edge` speaks with remote clients, and that
+`uc_remote`'s `RemoteClient` implements. This is the page a non-Rust port
 implements from — every layout below is byte-for-byte, taken from
-`uc2_remote/src/frame.rs`.
+`uc_remote/src/frame.rs`.
 
 Transport is a plain TCP stream, one frame after another, no length-prefixed
 stream framing beyond each frame's own `len`. All multi-byte integers are
@@ -176,7 +176,7 @@ leader watch itself never announces an unresolvable transition (see
 **`RETRY` is a state signal, never a load signal.** It answers "the world
 changed, do something different" (reconnect, wait, give up) — it is not a
 generic "try again" a client can treat as a load-shedding hint tied to
-volume. The reference edge (`uc2_gateway::Edge`) emits reasons 1, 3, and 4
+volume. The reference edge (`uc_gateway::Edge`) emits reasons 1, 3, and 4
 today; it never emits `RETRY_INSTANCE_RESTART` — its own instance-restart
 path (below) uses `LEADER_CHANGED{unknown}` plus a closed connection
 instead. `RETRY_INSTANCE_RESTART` exists in the protocol for a different
@@ -229,7 +229,7 @@ hint, not an admission input.
 now on* — it is not a delta and not a ceiling that only rises. A client that
 sees a lower value honours it immediately for its next admission decision;
 the requests already on the wire under the older, wider grant are not
-recalled (that is what the edge's headroom is for). `uc2_remote`'s client has
+recalled (that is what the edge's headroom is for). `uc_remote`'s client has
 always behaved this way — it stores whatever the last frame said and gates
 the next admission on the unanswered-request count against it, not on
 `seq` — and this paragraph makes the requirement explicit for a port.
@@ -245,7 +245,7 @@ The edge sizes credits from its local `Engine`'s inflight window
 (`per_conn_inflight`, the ceiling every connection relaxes back towards) and
 runs a **halve/double** scheme entirely on its own side — `RemoteClient`
 never adjusts its own window, it only obeys whatever `credits` the edge last
-sent. `Conn::squeeze` (`uc2_gateway/src/conn.rs`) **halves** the connection's
+sent. `Conn::squeeze` (`uc_gateway/src/conn.rs`) **halves** the connection's
 credits (floor `1`) the first time one request's retry loop hits
 `SubmitError::Backpressure`; `Conn::relax` **doubles** them back on every
 completion that arrives while squeezed, capped at `per_conn_inflight` — this
@@ -269,7 +269,7 @@ the [gate record](../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-r
 ## Payload ceiling
 
 A command's serialized bytes must fit in one UDP datagram on the node side.
-The node's own startup preflight (`uc2_node::preflight`,
+The node's own startup preflight (`uc_node::preflight`,
 `PreflightError::PayloadExceedsMtu`) refuses a configured `max_payload` that
 doesn't fit, with the arithmetic spelled out:
 
@@ -391,7 +391,7 @@ client absorbs them:
 
 ### How the reference client is built (informative)
 
-`uc2_remote` implements the promises above with **two threads per connection
+`uc_remote` implements the promises above with **two threads per connection
 and no lock on the request path**, which a port may but need not copy:
 
 - the **submitter** (the caller's own thread) checks the window from two
@@ -412,7 +412,7 @@ rule, the ordered re-send, the probe before flush, and the liveness clocks.
 
 ## What this page does not cover
 
-`uc2_gateway::Edge`'s side of failover (the not-serving latch, the leader
+`uc_gateway::Edge`'s side of failover (the not-serving latch, the leader
 watch, head-of-line behaviour) is [the how-to](../how-to/run-a-gateway.md)
 and [the flow-control note](../notes/uc2-gateway-shapes-and-flow-control.md).
 The exactly-once `Sessioned<S>` wrapper's full semantics are

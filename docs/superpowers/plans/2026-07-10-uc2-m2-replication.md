@@ -1,16 +1,16 @@
-# UC v2 M2 — `uc2_net` Replication Data Plane Implementation Plan
+# UC v2 M2 — `uc_net` Replication Data Plane Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** The UDP replication stream (spec §5): a leader's sender agent fans the log buffer out to followers MTU-datagram by MTU-datagram; follower receivers rebuild the stream position-addressed into their own buffers, archive it durably, recover loss via NAK, and pace the sender with quorum-order-statistic flow control — gate: ≥100 MB/s per follower with durable positions keeping pace, resilient to 0.1–1 % injected loss.
 
-**Architecture:** New crate `uc2_net` (sender/receiver agents, fault-injecting UDP socket, flow/gap/NAK state) + small additions to `uc2_log` (the `sent` counter, a batch validated read for the sender, a position-addressed writer for the receiver) + new core-only wire layouts in `uc_protocol::v2::datagram`. Everything is polling agents over position counters — no channels, locks, or timers on the data path. The log buffer is the retransmit buffer: NAKs are served by re-reading it.
+**Architecture:** New crate `uc_net` (sender/receiver agents, fault-injecting UDP socket, flow/gap/NAK state) + small additions to `uc_log` (the `sent` counter, a batch validated read for the sender, a position-addressed writer for the receiver) + new core-only wire layouts in `uc_protocol::v2::datagram`. Everything is polling agents over position counters — no channels, locks, or timers on the data path. The log buffer is the retransmit buffer: NAKs are served by re-reading it.
 
-**Tech Stack:** Rust 2024, std `UdpSocket` (nonblocking; no libc/quinn/tokio), existing `uc2_log` (M1) + `uc_protocol::v2::frame`, `tempfile` (dev).
+**Tech Stack:** Rust 2024, std `UdpSocket` (nonblocking; no libc/quinn/tokio), existing `uc_log` (M1) + `uc_protocol::v2::frame`, `tempfile` (dev).
 
 ## Global Constraints
 
-Every task's requirements implicitly include all of these (they extend the M1 plan's constraints, which remain in force for any `uc2_log`/`uc_protocol` change):
+Every task's requirements implicitly include all of these (they extend the M1 plan's constraints, which remain in force for any `uc_log`/`uc_protocol` change):
 
 - **Wire layouts live in `uc_protocol::v2`, core-only.** No `std`, no `serde`, no atomics in `uc_protocol` (spec §3.2: the multi-language gate). Fixed-size little-endian fields, exact offsets, verbatim from this plan.
 - **Frame layout is frozen (M1):** `FRAME_ALIGNMENT = 32`, `HEADER_LEN = 32`, commit word = u32 `length` at offset 0, `FRAME_TYPE_MESSAGE = 1`, `FRAME_TYPE_PADDING = 2`. Positions are absolute u64 byte offsets, monotonic forever; ring offset = `position & (capacity − 1)`.
@@ -31,12 +31,12 @@ Every task's requirements implicitly include all of these (they extend the M1 pl
 
 ### Task 1: M1 carry-fixes — restart read guard + `AgentRunner` Drop
 
-The final M1 whole-branch review flagged these as **required first commits** for M2. Both are in `uc2_log`.
+The final M1 whole-branch review flagged these as **required first commits** for M2. Both are in `uc_log`.
 
 **Files:**
-- Modify: `uc2_log/src/buffer.rs` (read guard in `read_frame_validated`, ~line 200)
-- Modify: `uc2_log/src/counters.rs` (`prime()` doc contract)
-- Modify: `uc2_log/src/agent.rs` (`Drop` impl, duty-cycle rustdoc)
+- Modify: `uc_log/src/buffer.rs` (read guard in `read_frame_validated`, ~line 200)
+- Modify: `uc_log/src/counters.rs` (`prime()` doc contract)
+- Modify: `uc_log/src/agent.rs` (`Drop` impl, duty-cycle rustdoc)
 
 **Interfaces:**
 - Consumes: M1's `LogBuffer::read_frame_validated`, `LogCounters::prime`, `AgentRunner`.
@@ -44,7 +44,7 @@ The final M1 whole-branch review flagged these as **required first commits** for
 
 - [ ] **Step 1: Write the failing test (read guard)**
 
-Append to the `tests` module in `uc2_log/src/buffer.rs`:
+Append to the `tests` module in `uc_log/src/buffer.rs`:
 
 ```rust
     #[test]
@@ -70,7 +70,7 @@ Append to the `tests` module in `uc2_log/src/buffer.rs`:
 
 - [ ] **Step 2: Run it — expect failure**
 
-Run: `cargo test -p uc2_log primed_fresh_buffer -- --nocapture`
+Run: `cargo test -p uc_log primed_fresh_buffer -- --nocapture`
 Expected: FAIL — in debug the `debug_assert!(len >= 4 …)` at `buffer.rs:201` panics on the zero commit word.
 
 - [ ] **Step 3: Implement the guard**
@@ -89,7 +89,7 @@ In `read_frame_validated`, immediately after `let len = self.commit_word(off).lo
 
 - [ ] **Step 4: Document the `prime()` contract**
 
-Replace the doc comment on `LogCounters::prime` in `uc2_log/src/counters.rs` with:
+Replace the doc comment on `LogCounters::prime` in `uc_log/src/counters.rs` with:
 
 ```rust
     /// Prime the counters after archive recovery (append resumes at durable —
@@ -103,7 +103,7 @@ Replace the doc comment on `LogCounters::prime` in `uc2_log/src/counters.rs` wit
 
 - [ ] **Step 5: Write the failing test (Drop)**
 
-Append to the `tests` module in `uc2_log/src/agent.rs`:
+Append to the `tests` module in `uc_log/src/agent.rs`:
 
 ```rust
     #[test]
@@ -130,12 +130,12 @@ Append to the `tests` module in `uc2_log/src/agent.rs`:
 
 - [ ] **Step 6: Run it — expect failure**
 
-Run: `cargo test -p uc2_log drop_without_stop -- --nocapture`
+Run: `cargo test -p uc_log drop_without_stop -- --nocapture`
 Expected: FAIL (compile error is acceptable here only if you already started Step 7; otherwise the count keeps rising after `drop` because nothing stops the thread — the final `assert_eq!` fires).
 
 - [ ] **Step 7: Implement Drop**
 
-Rework `AgentRunner` in `uc2_log/src/agent.rs` (the `JoinHandle` must become an `Option` so both `stop(self)` and `Drop` can take it):
+Rework `AgentRunner` in `uc_log/src/agent.rs` (the `JoinHandle` must become an `Option` so both `stop(self)` and `Drop` can take it):
 
 ```rust
 pub struct AgentRunner {
@@ -190,14 +190,14 @@ impl Drop for AgentRunner {
 
 - [ ] **Step 8: Run the full crate suite**
 
-Run: `cargo test -p uc2_log && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_log && cargo clippy --workspace -- -D warnings`
 Expected: all green (19 lib tests now), clippy clean.
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add uc2_log/src/buffer.rs uc2_log/src/counters.rs uc2_log/src/agent.rs
-git commit -m "fix(uc2_log): restart-primed read guard + AgentRunner Drop joins (M1 final-review carry)"
+git add uc_log/src/buffer.rs uc_log/src/counters.rs uc_log/src/agent.rs
+git commit -m "fix(uc_log): restart-primed read guard + AgentRunner Drop joins (M1 final-review carry)"
 ```
 
 ---
@@ -416,13 +416,13 @@ git commit -m "feat(uc_protocol): v2 datagram header + NAK/status control bodies
 
 ---
 
-### Task 3: `uc2_log` — `sent` counter + `read_run_validated` (the sender's batch read)
+### Task 3: `uc_log` — `sent` counter + `read_run_validated` (the sender's batch read)
 
 The M1 final review sized this as "a small `read_slice_validated`-style addition, not a refactor": a validated **copying** read of a run of whole frames, padding-aware, for MTU packing and NAK service.
 
 **Files:**
-- Modify: `uc2_log/src/counters.rs` (add `sent`)
-- Modify: `uc2_log/src/buffer.rs` (add `RunRead`, `SliceRead`, `read_run_validated`; tests)
+- Modify: `uc_log/src/counters.rs` (add `sent`)
+- Modify: `uc_log/src/buffer.rs` (add `RunRead`, `SliceRead`, `read_run_validated`; tests)
 
 **Interfaces:**
 - Consumes: M1 `LogBuffer` internals (`commit_word`, `max_claim`, `region`, `offset`).
@@ -434,7 +434,7 @@ The M1 final review sized this as "a small `read_slice_validated`-style addition
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to the `tests` module in `uc2_log/src/buffer.rs`:
+Append to the `tests` module in `uc_log/src/buffer.rs`:
 
 ```rust
     #[test]
@@ -523,12 +523,12 @@ Append to the `tests` module in `uc2_log/src/buffer.rs`:
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_log run_read`
+Run: `cargo test -p uc_log run_read`
 Expected: FAIL — `read_run_validated`, `SliceRead`, `RunRead` not defined.
 
 - [ ] **Step 3: Add the `sent` counter**
 
-In `uc2_log/src/counters.rs`, extend `LogCounters` (repr(C) — append the field LAST, layout is future cnc):
+In `uc_log/src/counters.rs`, extend `LogCounters` (repr(C) — append the field LAST, layout is future cnc):
 
 ```rust
 /// The M1+M2 counter set. append: written only by the appender (leader) /
@@ -548,7 +548,7 @@ Update `new()` to initialize it and `prime()` to set it (`self.sent.store_releas
 
 - [ ] **Step 4: Implement `read_run_validated`**
 
-In `uc2_log/src/buffer.rs`, next to `FrameRead`:
+In `uc_log/src/buffer.rs`, next to `FrameRead`:
 
 ```rust
 /// Result payload of a successful `read_run_validated`.
@@ -642,26 +642,26 @@ Note `frame::OFF_TYPE` is already exported by `uc_protocol::v2::frame`; extend t
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p uc2_log && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_log && cargo clippy --workspace -- -D warnings`
 Expected: PASS (3 new tests + updated counters test).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_log/src/counters.rs uc2_log/src/buffer.rs
-git commit -m "feat(uc2_log): sent counter + read_run_validated batch read (padding-aware, seqlock-validated)"
+git add uc_log/src/counters.rs uc_log/src/buffer.rs
+git commit -m "feat(uc_log): sent counter + read_run_validated batch read (padding-aware, seqlock-validated)"
 ```
 
 ---
 
-### Task 4: `uc2_log::writer::PositionedWriter` — the follower's write path
+### Task 4: `uc_log::writer::PositionedWriter` — the follower's write path
 
-Spec §4: "receiver agent (follower) writes frames at their position offset — duplicates and reordering are idempotent by construction"; spec §3.2 places the position-addressed writer in `uc2_log`.
+Spec §4: "receiver agent (follower) writes frames at their position offset — duplicates and reordering are idempotent by construction"; spec §3.2 places the position-addressed writer in `uc_log`.
 
 **Files:**
-- Create: `uc2_log/src/writer.rs`
-- Modify: `uc2_log/src/lib.rs` (add `pub mod writer;`)
-- Modify: `uc2_log/src/buffer.rs` (two `pub(crate)` accessors)
+- Create: `uc_log/src/writer.rs`
+- Modify: `uc_log/src/lib.rs` (add `pub mod writer;`)
+- Modify: `uc_log/src/buffer.rs` (two `pub(crate)` accessors)
 
 **Interfaces:**
 - Consumes: `LogBuffer` internals via new `pub(crate)` accessors: `pub(crate) fn region(&self) -> &Region` and change `fn offset` to `pub(crate) fn offset`.
@@ -671,7 +671,7 @@ Spec §4: "receiver agent (follower) writes frames at their position offset — 
 
 - [ ] **Step 1: Write the failing test**
 
-Create `uc2_log/src/writer.rs` with tests first (full file with implementation is in Step 3):
+Create `uc_log/src/writer.rs` with tests first (full file with implementation is in Step 3):
 
 ```rust
 #[cfg(test)]
@@ -746,12 +746,12 @@ mod tests {
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_log writer`
+Run: `cargo test -p uc_log writer`
 Expected: FAIL — `PositionedWriter` not defined (add `pub mod writer;` to `lib.rs` now so the failure is about the type, not the module).
 
 - [ ] **Step 3: Implement**
 
-Top of `uc2_log/src/writer.rs` (above the tests):
+Top of `uc_log/src/writer.rs` (above the tests):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -807,7 +807,7 @@ impl PositionedWriter {
 }
 ```
 
-In `uc2_log/src/buffer.rs`: change `fn offset` to `pub(crate) fn offset`, and add next to `max_claim`:
+In `uc_log/src/buffer.rs`: change `fn offset` to `pub(crate) fn offset`, and add next to `max_claim`:
 
 ```rust
     #[inline]
@@ -816,31 +816,31 @@ In `uc2_log/src/buffer.rs`: change `fn offset` to `pub(crate) fn offset`, and ad
     }
 ```
 
-In `uc2_log/src/lib.rs` add `pub mod writer;` (alphabetical order with the others).
+In `uc_log/src/lib.rs` add `pub mod writer;` (alphabetical order with the others).
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p uc2_log && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_log && cargo clippy --workspace -- -D warnings`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_log/src/writer.rs uc2_log/src/lib.rs uc2_log/src/buffer.rs
-git commit -m "feat(uc2_log): PositionedWriter — follower position-addressed frame-run writes"
+git add uc_log/src/writer.rs uc_log/src/lib.rs uc_log/src/buffer.rs
+git commit -m "feat(uc_log): PositionedWriter — follower position-addressed frame-run writes"
 ```
 
 ---
 
-### Task 5: `uc2_net` scaffold — crate + seeded fault-injecting UDP socket
+### Task 5: `uc_net` scaffold — crate + seeded fault-injecting UDP socket
 
-Spec §8 L2: "`uc2_net` … with the fault layer built in from day one (native to own-UDP)".
+Spec §8 L2: "`uc_net` … with the fault layer built in from day one (native to own-UDP)".
 
 **Files:**
-- Create: `uc2_net/Cargo.toml`
-- Create: `uc2_net/src/lib.rs`
-- Create: `uc2_net/src/fault.rs`
-- Modify: `Cargo.toml` (workspace `members`: add `"uc2_net"` after `"uc2_log"`)
+- Create: `uc_net/Cargo.toml`
+- Create: `uc_net/src/lib.rs`
+- Create: `uc_net/src/fault.rs`
+- Modify: `Cargo.toml` (workspace `members`: add `"uc_net"` after `"uc_log"`)
 
 **Interfaces:**
 - Consumes: nothing from other tasks (std only).
@@ -851,11 +851,11 @@ Spec §8 L2: "`uc2_net` … with the fault layer built in from day one (native t
 
 - [ ] **Step 1: Create the crate**
 
-`uc2_net/Cargo.toml`:
+`uc_net/Cargo.toml`:
 
 ```toml
 [package]
-name = "uc2_net"
+name = "uc_net"
 description = "UC v2 UDP replication data plane: sender/receiver agents, NAK, flow control (spec 2026-07-09, M2)"
 edition.workspace = true
 version.workspace = true
@@ -864,13 +864,13 @@ authors.workspace = true
 
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
-uc2_log = { path = "../uc2_log" }
+uc_log = { path = "../uc_log" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 ```
 
-`uc2_net/src/lib.rs`:
+`uc_net/src/lib.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -882,11 +882,11 @@ tempfile = { workspace = true }
 pub mod fault;
 ```
 
-Add `"uc2_net"` to the workspace `members` array in the root `Cargo.toml` (after `"uc2_log"`).
+Add `"uc_net"` to the workspace `members` array in the root `Cargo.toml` (after `"uc_log"`).
 
 - [ ] **Step 2: Write the failing tests**
 
-Tests module at the bottom of `uc2_net/src/fault.rs`:
+Tests module at the bottom of `uc_net/src/fault.rs`:
 
 ```rust
 #[cfg(test)]
@@ -970,12 +970,12 @@ mod tests {
 
 - [ ] **Step 3: Run — expect compile failure**
 
-Run: `cargo test -p uc2_net`
+Run: `cargo test -p uc_net`
 Expected: FAIL — types not defined.
 
 - [ ] **Step 4: Implement**
 
-`uc2_net/src/fault.rs` above the tests:
+`uc_net/src/fault.rs` above the tests:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1111,14 +1111,14 @@ Note the drop-determinism test relies on `chance` being called exactly once per 
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p uc2_net && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_net && cargo clippy --workspace -- -D warnings`
 Expected: PASS (4 tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock uc2_net/Cargo.toml uc2_net/src/lib.rs uc2_net/src/fault.rs
-git commit -m "feat(uc2_net): crate scaffold + seeded fault-injecting nonblocking UDP socket"
+git add Cargo.toml Cargo.lock uc_net/Cargo.toml uc_net/src/lib.rs uc_net/src/fault.rs
+git commit -m "feat(uc_net): crate scaffold + seeded fault-injecting nonblocking UDP socket"
 ```
 
 ---
@@ -1128,9 +1128,9 @@ git commit -m "feat(uc2_net): crate scaffold + seeded fault-injecting nonblockin
 All deterministic (injected time, seeded randomness), no I/O — the testable core of loss recovery and pacing.
 
 **Files:**
-- Create: `uc2_net/src/rebuild.rs` (`Rebuilt`, `NakConfig`, `NakTimer`)
-- Create: `uc2_net/src/flow.rs` (`FlowControl`)
-- Modify: `uc2_net/src/lib.rs` (add `pub mod flow;` and `pub mod rebuild;`)
+- Create: `uc_net/src/rebuild.rs` (`Rebuilt`, `NakConfig`, `NakTimer`)
+- Create: `uc_net/src/flow.rs` (`FlowControl`)
+- Modify: `uc_net/src/lib.rs` (add `pub mod flow;` and `pub mod rebuild;`)
 
 **Interfaces:**
 - Consumes: `crate::fault::XorShift64` (make it `pub(crate)` — it already is).
@@ -1142,7 +1142,7 @@ All deterministic (injected time, seeded randomness), no I/O — the testable co
 
 - [ ] **Step 1: Write the failing tests**
 
-`uc2_net/src/rebuild.rs` tests:
+`uc_net/src/rebuild.rs` tests:
 
 ```rust
 #[cfg(test)]
@@ -1218,7 +1218,7 @@ mod tests {
 }
 ```
 
-`uc2_net/src/flow.rs` tests:
+`uc_net/src/flow.rs` tests:
 
 ```rust
 #[cfg(test)]
@@ -1271,7 +1271,7 @@ mod tests {
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_net rebuild flow` (two invocations or just `cargo test -p uc2_net`)
+Run: `cargo test -p uc_net rebuild flow` (two invocations or just `cargo test -p uc_net`)
 Expected: FAIL — modules/types not defined.
 
 - [ ] **Step 3: Implement `rebuild.rs`**
@@ -1470,18 +1470,18 @@ impl FlowControl {
 }
 ```
 
-Add both modules to `uc2_net/src/lib.rs` (alphabetical: `fault`, `flow`, `rebuild`).
+Add both modules to `uc_net/src/lib.rs` (alphabetical: `fault`, `flow`, `rebuild`).
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p uc2_net && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_net && cargo clippy --workspace -- -D warnings`
 Expected: PASS (8 new tests).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_net/src/rebuild.rs uc2_net/src/flow.rs uc2_net/src/lib.rs
-git commit -m "feat(uc2_net): gap tracking + randomized NAK timer + quorum-order-statistic flow control"
+git add uc_net/src/rebuild.rs uc_net/src/flow.rs uc_net/src/lib.rs
+git commit -m "feat(uc_net): gap tracking + randomized NAK timer + quorum-order-statistic flow control"
 ```
 
 ---
@@ -1489,11 +1489,11 @@ git commit -m "feat(uc2_net): gap tracking + randomized NAK timer + quorum-order
 ### Task 7: the sender agent
 
 **Files:**
-- Create: `uc2_net/src/sender.rs`
-- Modify: `uc2_net/src/lib.rs` (add `pub mod sender;`)
+- Create: `uc_net/src/sender.rs`
+- Modify: `uc_net/src/lib.rs` (add `pub mod sender;`)
 
 **Interfaces:**
-- Consumes: `uc2_log::buffer::{LogBuffer, SliceRead}`, `uc2_log::counters` (via buffer), `uc_protocol::v2::datagram::*`, `crate::fault::FaultSocket`, `crate::flow::FlowControl`.
+- Consumes: `uc_log::buffer::{LogBuffer, SliceRead}`, `uc_log::counters` (via buffer), `uc_protocol::v2::datagram::*`, `crate::fault::FaultSocket`, `crate::flow::FlowControl`.
 - Produces (used by Tasks 8–10):
   - `pub enum CtrlMsg { Nak { from: SocketAddr, position: u64, length: u32 }, Status { from: SocketAddr, contiguous: u64, window: u32 } }` (`Copy`) — the leader-receiver→sender channel item.
   - `pub struct SenderConfig { pub mtu: usize, pub term_id: u32, pub heartbeat_ns: u64, pub initial_window: u64, pub dgrams_per_cycle: usize }` with `SenderConfig::new(term_id) -> Self` defaults `{ mtu: MTU_DEFAULT, heartbeat_ns: 100_000_000, initial_window: 65_536, dgrams_per_cycle: 8 }`.
@@ -1503,7 +1503,7 @@ git commit -m "feat(uc2_net): gap tracking + randomized NAK timer + quorum-order
 
 - [ ] **Step 1: Write the failing test**
 
-Tests at the bottom of `uc2_net/src/sender.rs`:
+Tests at the bottom of `uc_net/src/sender.rs`:
 
 ```rust
 #[cfg(test)]
@@ -1511,9 +1511,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
-    use uc2_log::buffer::Appender;
-    use uc2_log::counters::LogCounters;
-    use uc2_log::region::Region;
+    use uc_log::buffer::Appender;
+    use uc_log::counters::LogCounters;
+    use uc_log::region::Region;
     use uc_protocol::v2::frame::{read_header, HEADER_LEN};
 
     fn buffer() -> Arc<LogBuffer> {
@@ -1678,12 +1678,12 @@ Note for the implementer: `Fake::recv` returns `None` only after a 5 s deadline,
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_net sender`
+Run: `cargo test -p uc_net sender`
 Expected: FAIL — types not defined.
 
 - [ ] **Step 3: Implement**
 
-`uc2_net/src/sender.rs` above the tests:
+`uc_net/src/sender.rs` above the tests:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1705,7 +1705,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use uc2_log::buffer::{LogBuffer, SliceRead};
+use uc_log::buffer::{LogBuffer, SliceRead};
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DatagramHeader, MTU_DEFAULT,
     write_datagram_header,
@@ -1949,14 +1949,14 @@ self.run)` splits fields the same way.
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p uc2_net && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_net && cargo clippy --workspace -- -D warnings`
 Expected: PASS (4 new tests; the NAK one takes ~5 s for its negative assertion).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/src/sender.rs uc2_net/src/lib.rs
-git commit -m "feat(uc2_net): sender agent — MTU packing, MDC fan-out, NAK service, flow pacing, heartbeats"
+git add uc_net/src/sender.rs uc_net/src/lib.rs
+git commit -m "feat(uc_net): sender agent — MTU packing, MDC fan-out, NAK service, flow pacing, heartbeats"
 ```
 
 ---
@@ -1964,11 +1964,11 @@ git commit -m "feat(uc2_net): sender agent — MTU packing, MDC fan-out, NAK ser
 ### Task 8: the receiver agents — follower data path + leader control demux
 
 **Files:**
-- Create: `uc2_net/src/receiver.rs`
-- Modify: `uc2_net/src/lib.rs` (add `pub mod receiver;`)
+- Create: `uc_net/src/receiver.rs`
+- Modify: `uc_net/src/lib.rs` (add `pub mod receiver;`)
 
 **Interfaces:**
-- Consumes: `uc2_log::{buffer::LogBuffer, writer::PositionedWriter}`, `uc_protocol::v2::{datagram::*, frame}`, `crate::{fault::FaultSocket, flow (none), rebuild::{Rebuilt, NakConfig, NakTimer}, sender::CtrlMsg}`.
+- Consumes: `uc_log::{buffer::LogBuffer, writer::PositionedWriter}`, `uc_protocol::v2::{datagram::*, frame}`, `crate::{fault::FaultSocket, flow (none), rebuild::{Rebuilt, NakConfig, NakTimer}, sender::CtrlMsg}`.
 - Produces (used by Tasks 9–10):
   - `pub struct FollowerConfig { pub term_id: u32, pub leader: SocketAddr, pub seed: u64, pub nak: NakConfig, pub nak_max_bytes: u32, pub status_floor_ns: u64, pub status_bytes: u64 }` with `FollowerConfig::new(term_id, leader) -> Self` defaults `{ seed: 1, nak: NakConfig::default(), nak_max_bytes: 65_536, status_floor_ns: 100_000_000, status_bytes: 0 }` (0 ⇒ `capacity/4` resolved at receiver construction).
   - `pub struct FollowerStats` — `AtomicU64` fields `{ datagrams, bytes, dropped_stale_term, dropped_dup, dropped_overrun, dropped_malformed, naks_sent, statuses_sent }`, Arc-shared.
@@ -1980,7 +1980,7 @@ git commit -m "feat(uc2_net): sender agent — MTU packing, MDC fan-out, NAK ser
 
 - [ ] **Step 1: Write the failing tests**
 
-Tests at the bottom of `uc2_net/src/receiver.rs`:
+Tests at the bottom of `uc_net/src/receiver.rs`:
 
 ```rust
 #[cfg(test)]
@@ -1988,9 +1988,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
-    use uc2_log::buffer::{Appender, LogBuffer, SliceRead};
-    use uc2_log::counters::LogCounters;
-    use uc2_log::region::Region;
+    use uc_log::buffer::{Appender, LogBuffer, SliceRead};
+    use uc_log::counters::LogCounters;
+    use uc_log::region::Region;
     use uc_protocol::v2::datagram::{
         read_nak_body, read_status_body, write_datagram_header, write_nak_body,
         write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA,
@@ -2266,12 +2266,12 @@ mod tests {
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_net receiver`
+Run: `cargo test -p uc_net receiver`
 Expected: FAIL — types not defined.
 
 - [ ] **Step 3: Implement**
 
-`uc2_net/src/receiver.rs` above the tests:
+`uc_net/src/receiver.rs` above the tests:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -2298,8 +2298,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use uc2_log::buffer::LogBuffer;
-use uc2_log::writer::PositionedWriter;
+use uc_log::buffer::LogBuffer;
+use uc_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK,
     DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody, STATUS_BODY_LEN, StatusBody,
@@ -2625,14 +2625,14 @@ impl LeaderReceiver {
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p uc2_net && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_net && cargo clippy --workspace -- -D warnings`
 Expected: PASS (8 new tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/src/receiver.rs uc2_net/src/lib.rs
-git commit -m "feat(uc2_net): follower receiver (rebuild/NAK/status) + leader control demux"
+git add uc_net/src/receiver.rs uc_net/src/lib.rs
+git commit -m "feat(uc_net): follower receiver (rebuild/NAK/status) + leader control demux"
 ```
 
 ---
@@ -2640,15 +2640,15 @@ git commit -m "feat(uc2_net): follower receiver (rebuild/NAK/status) + leader co
 ### Task 9: the 3-node localhost harness — end-to-end replication under faults
 
 **Files:**
-- Create: `uc2_net/tests/replication.rs`
+- Create: `uc_net/tests/replication.rs`
 
 **Interfaces:**
-- Consumes: everything above; `uc2_log::{agent::AgentRunner, archive::{Archive, ArchiveConfig}}`.
+- Consumes: everything above; `uc_log::{agent::AgentRunner, archive::{Archive, ArchiveConfig}}`.
 - Produces: the L2 proof (spec §8) that the M2 pipeline converges: clean, under 1 % loss, under dup+reorder; stale terms rejected; quorum pacing (a dead follower doesn't stall the stream).
 
 - [ ] **Step 1: Write the harness + tests**
 
-Full file `uc2_net/tests/replication.rs`:
+Full file `uc_net/tests/replication.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -2670,15 +2670,15 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use uc2_log::agent::{AgentRunner, IdleStrategy};
-use uc2_log::archive::{Archive, ArchiveConfig, ReplayFrame};
-use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::counters::{LogCounters, PaddedAtomicU64};
-use uc2_log::region::Region;
-use uc2_net::fault::{FaultConfig, FaultSocket};
-use uc2_net::rebuild::NakConfig;
-use uc2_net::receiver::{FollowerConfig, FollowerReceiver, LeaderReceiver};
-use uc2_net::sender::{Sender, SenderConfig};
+use uc_log::agent::{AgentRunner, IdleStrategy};
+use uc_log::archive::{Archive, ArchiveConfig, ReplayFrame};
+use uc_log::buffer::{AppendError, Appender, LogBuffer};
+use uc_log::counters::{LogCounters, PaddedAtomicU64};
+use uc_log::region::Region;
+use uc_net::fault::{FaultConfig, FaultSocket};
+use uc_net::rebuild::NakConfig;
+use uc_net::receiver::{FollowerConfig, FollowerReceiver, LeaderReceiver};
+use uc_net::sender::{Sender, SenderConfig};
 
 const TERM: u32 = 3;
 const CAP: u64 = 1 << 20; // 1 MiB buffers, identical on every node
@@ -2722,7 +2722,7 @@ fn spawn_archive(name: &str, buffer: &Arc<LogBuffer>, dir: &std::path::Path) -> 
 
 struct Follower {
     node: Node,
-    stats: Arc<uc2_net::receiver::FollowerStats>,
+    stats: Arc<uc_net::receiver::FollowerStats>,
     addr: SocketAddr,
 }
 
@@ -2746,7 +2746,7 @@ fn spawn_follower(name: &str, leader: SocketAddr, faults: FaultConfig) -> Follow
 
 struct Leader {
     node: Node,
-    stats: Arc<uc2_net::sender::SenderStats>,
+    stats: Arc<uc_net::sender::SenderStats>,
 }
 
 /// The leader socket binds FIRST (followers need its address) — pass it in.
@@ -2950,19 +2950,19 @@ Harness invariants (bake these in, they are load-bearing):
 
 - [ ] **Step 2: Run the harness**
 
-Run: `cargo test -p uc2_net --test replication`
+Run: `cargo test -p uc_net --test replication`
 Expected: all five tests pass. They are timing-sensitive by nature (real UDP + real threads): deadlines are generous (60 s) and assertions are eventual-convergence only. If a test flakes under default parallelism, do NOT serialize the whole binary — find the resource contention (usually tmpfs quota in the tempdirs: shrink the loads) and fix it.
 
 - [ ] **Step 3: Run everything**
 
-Run: `cargo test -p uc2_net && cargo test -p uc2_log && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_net && cargo test -p uc_log && cargo clippy --workspace -- -D warnings`
 Expected: all green.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add uc2_net/tests/replication.rs
-git commit -m "test(uc2_net): 3-node loopback replication harness — loss/dup/reorder/stale-term/quorum-pacing"
+git add uc_net/tests/replication.rs
+git commit -m "test(uc_net): 3-node loopback replication harness — loss/dup/reorder/stale-term/quorum-pacing"
 ```
 
 ---
@@ -2970,7 +2970,7 @@ git commit -m "test(uc2_net): 3-node loopback replication harness — loss/dup/r
 ### Task 10: `m2_gate` example + gate run + benchmark doc
 
 **Files:**
-- Create: `uc2_net/examples/m2_gate.rs`
+- Create: `uc_net/examples/m2_gate.rs`
 - Create: `docs/benchmarks/uc2-m2-gate-2026-07-10.md` (written from the run's output)
 
 **Interfaces:**
@@ -2979,7 +2979,7 @@ git commit -m "test(uc2_net): 3-node loopback replication harness — loss/dup/r
 
 - [ ] **Step 1: Write the example**
 
-`uc2_net/examples/m2_gate.rs`:
+`uc_net/examples/m2_gate.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -2989,7 +2989,7 @@ git commit -m "test(uc2_net): 3-node loopback replication harness — loss/dup/r
 //! follower, durable positions keeping pace, resilient to 0.1-1% loss).
 //!
 //! Local (single host, loopback, all three nodes in-process):
-//!   cargo run -p uc2_net --release --example m2_gate -- local <journal_root> \
+//!   cargo run -p uc_net --release --example m2_gate -- local <journal_root> \
 //!       [secs=10] [payload=64] [loss_ppm=0] [buffer_mib=256]
 //!
 //! Fleet (one process per host; start followers first):
@@ -3010,14 +3010,14 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use uc2_log::agent::{AgentRunner, IdleStrategy};
-use uc2_log::archive::{Archive, ArchiveConfig};
-use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::counters::LogCounters;
-use uc2_log::region::Region;
-use uc2_net::fault::{FaultConfig, FaultSocket};
-use uc2_net::receiver::{FollowerConfig, FollowerReceiver, FollowerStats, LeaderReceiver};
-use uc2_net::sender::{Sender, SenderConfig, SenderStats};
+use uc_log::agent::{AgentRunner, IdleStrategy};
+use uc_log::archive::{Archive, ArchiveConfig};
+use uc_log::buffer::{AppendError, Appender, LogBuffer};
+use uc_log::counters::LogCounters;
+use uc_log::region::Region;
+use uc_net::fault::{FaultConfig, FaultSocket};
+use uc_net::receiver::{FollowerConfig, FollowerReceiver, FollowerStats, LeaderReceiver};
+use uc_net::sender::{Sender, SenderConfig, SenderStats};
 
 const TERM: u32 = 1;
 const MAX_PAYLOAD: usize = 1024;
@@ -3281,9 +3281,9 @@ fn leader_role(args: &[String]) {
 
 Run:
 ```bash
-cargo build -p uc2_net --release --example m2_gate
+cargo build -p uc_net --release --example m2_gate
 df -h /home/claude   # before
-UC2_M2_MAX_BYTES=2000000000 cargo run -p uc2_net --release --example m2_gate -- \
+UC2_M2_MAX_BYTES=2000000000 cargo run -p uc_net --release --example m2_gate -- \
     local /home/claude/uc2-m2-gate 10 64 0 256
 ```
 Expected: per-second progress lines, final report, `GATE ... PASS` (loopback should be far above 100 MB/s per follower). Watch `df` — 3 journals × up to ~2 GB; abort and shrink `UC2_M2_MAX_BYTES` if free space drops below ~10 GB.
@@ -3292,7 +3292,7 @@ Expected: per-second progress lines, final report, `GATE ... PASS` (loopback sho
 
 Run:
 ```bash
-UC2_M2_MAX_BYTES=500000000 cargo run -p uc2_net --release --example m2_gate -- \
+UC2_M2_MAX_BYTES=500000000 cargo run -p uc_net --release --example m2_gate -- \
     local /home/claude/uc2-m2-gate-loss 10 64 5000 256
 ```
 Expected: converges; report shows `naks_sent`/`naks_served` > 0, overruns 0, verdict PASS. (5 000 ppm = 0.5 %, mid-band of the gate's 0.1–1 %.)
@@ -3316,17 +3316,17 @@ Verify `df -h /home/claude` is back to baseline. NEVER leave gate journals behin
 
 Run:
 ```bash
-cargo test -p uc2_net && cargo test -p uc2_log && cargo test -p uc_protocol
+cargo test -p uc_net && cargo test -p uc_log && cargo test -p uc_protocol
 cargo clippy --workspace -- -D warnings
-cargo build -p uc2_net --release --example m2_gate
+cargo build -p uc_net --release --example m2_gate
 ```
 Expected: all green. (`cargo fmt --check` fails workspace-wide pre-existing — ignore, but keep your files style-consistent with neighbors.)
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add uc2_net/examples/m2_gate.rs docs/benchmarks/uc2-m2-gate-2026-07-10.md
-git commit -m "feat(uc2_net): m2_gate replication example + sandbox loopback smoke run"
+git add uc_net/examples/m2_gate.rs docs/benchmarks/uc2-m2-gate-2026-07-10.md
+git commit -m "feat(uc_net): m2_gate replication example + sandbox loopback smoke run"
 ```
 
 ---

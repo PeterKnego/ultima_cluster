@@ -41,7 +41,7 @@ whether the extra client pushes the box's NIC over.
 
 WHY A FLEET RUN AT ALL (i.e. what the local smoke could not do):
 
-  `uc2_gateway/examples/m12_gate.rs`'s in-process arms build BOTH three-node
+  `uc_gateway/examples/m12_gate.rs`'s in-process arms build BOTH three-node
   clusters inside ONE process on loopback, one arm after the other. On the
   4-vCPU dev box each arm already oversubscribes the box on its own, and the
   gateway arm adds three edges, a reader thread and a waiter pool on top of
@@ -88,7 +88,7 @@ GATEWAY arm if anything — the direct arm is the one sharing cores — so it
 cannot manufacture a passing ratio.
 
 ROW 3 is a different measurement and gets its own cluster: the whole tree is
-rebuilt with `--features uc2_service/apply-profile`, the M5-ladder payload
+rebuilt with `--features uc_service/apply-profile`, the M5-ladder payload
 (509 B — the largest raw payload whose bincode encoding lands exactly on the
 node's 512 B `max_payload` door) is driven by `client-direct`, and the
 service's own `apply-profile[...]` line is read back off its unit log for the
@@ -319,24 +319,24 @@ def prepare_host(host, apply_profile=False):
     """Build BOTH gate binaries on the host and assert the instance-dir parent
     is on a durable filesystem.
 
-    m6's own `SshHost.prepare` cannot serve here: it hardcodes `-p uc2_node`,
-    and `m12_gate` is an example of `uc2_gateway`. The rest (root cargo env,
+    m6's own `SshHost.prepare` cannot serve here: it hardcodes `-p uc_node`,
+    and `m12_gate` is an example of `uc_gateway`. The rest (root cargo env,
     the FSTYPE assertion) is the same shape, deliberately.
 
     Order matters. `m6_gate` is built FIRST and `m12_gate` last, because the
-    two builds resolve `uc2_service`'s features differently when
+    two builds resolve `uc_service`'s features differently when
     `apply_profile` is set — building m6_gate afterwards would rebuild
-    uc2_service without the feature. Only m12_gate's linked binary needs the
+    uc_service without the feature. Only m12_gate's linked binary needs the
     feature, and it is the one written last."""
     env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
     cargo = m6.SshHost.CARGO
     src = m6.SshHost.UC_SRC
-    feat = " --features uc2_service/apply-profile" if apply_profile else ""
+    feat = " --features uc_service/apply-profile" if apply_profile else ""
     cmd = (
         f"{env} {cargo} build --release --manifest-path {src}/Cargo.toml "
-        f"-p uc2_node --example m6_gate "
+        f"-p uc_node --example m6_gate "
         f"&& {env} {cargo} build --release --manifest-path {src}/Cargo.toml "
-        f"-p uc2_gateway --example m12_gate{feat} "
+        f"-p uc_gateway --example m12_gate{feat} "
         f"&& sudo mkdir -p {REMOTE_ROOT} "
         f"&& echo FSTYPE=$(stat -f -c %T {REMOTE_ROOT}) && echo PREPARED"
     )
@@ -702,7 +702,7 @@ def row3_phase(node_hosts, a, raw_sm):
                 "error": "no apply-profile line in the leader's service log — the "
                          "counters print every 1,000,000 applied frames, so either "
                          "the run never reached a million frames or the binary was "
-                         "not built with --features uc2_service/apply-profile",
+                         "not built with --features uc_service/apply-profile",
             }
         return {
             "tier": tier,
@@ -716,7 +716,7 @@ def row3_phase(node_hosts, a, raw_sm):
 
 
 def row3(node_hosts, client_host, a):
-    print("\nINFO ROW 3: rebuilding with --features uc2_service/apply-profile",
+    print("\nINFO ROW 3: rebuilding with --features uc_service/apply-profile",
           flush=True)
     for h in list(node_hosts) + [client_host]:
         prepare_host(h, apply_profile=True)

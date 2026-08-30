@@ -34,7 +34,7 @@ crypto — user's pick) starts from a clean slate.
 
 The one item with an unresolved correctness question. Seen exactly once, in the
 failover capstone: an out-of-bounds slice in `Replay::next`
-(`uc2_log/src/archive.rs:511`, `payload_range` past block end), i.e. a recorded
+(`uc_log/src/archive.rs:511`, `payload_range` past block end), i.e. a recorded
 block whose frame header disagreed with the block length. Pre-existing (predates
 M7 — that journal had no config frames).
 
@@ -64,7 +64,7 @@ Work, in order:
 2. **Root-cause verdict.** Either confirm the `recordable_slice` seam (and fix
    it with the same validated-read discipline as the other readers), or identify
    the real mechanism. Other candidates to check: the journal
-   read-before-fsync seam (the `ultima_journal` append-readability contract,
+   read-before-fsync seam (the `uc_journal` append-readability contract,
    fix 1de711a), block-chaining edges at `meta`/`block_base`, and torn state
    *around* buffer wrap where `durable` semantics could momentarily disagree
    with the frame walk.
@@ -85,7 +85,7 @@ panic path left from a malformed block to an unlabeled abort.
 ### 2.1 Refuse `DemoteVoter{self}` (+ dedicated malformed-op reason code)
 
 Today a leader demoting its own id is a legal, accepted op
-(`ClusterConfig::apply`, `uc2_consensus/src/config.rs:103-111`) and the leader
+(`ClusterConfig::apply`, `uc_consensus/src/config.rs:103-111`) and the leader
 then leads-as-learner indefinitely — `StepDownRemoved` only covers
 `RemoveNode{self}` (`election.rs:1350-1356`).
 
@@ -95,10 +95,10 @@ then leads-as-learner indefinitely — `StepDownRemoved` only covers
 - Two new wire reason codes (both currently unused; `uc2ctl` maps >10 to
   "unknown/malformed"): **11 = malformed/unknown wire op** (re-targets the
   fallback that today deliberately reuses 6/NotFound at
-  `uc2_node/src/node.rs:2148`; ledger minor (m)), **12 = self-demote refused**.
+  `uc_node/src/node.rs:2148`; ledger minor (m)), **12 = self-demote refused**.
 - `uc2ctl` `reason_str` arms (`examples/uc2ctl.rs:139-152`); new rows in the
   refusal-matrix test `every_refusal_surfaces`
-  (`uc2_node/tests/reconfig.rs:1271`); pure-mapping unit test updated
+  (`uc_node/tests/reconfig.rs:1271`); pure-mapping unit test updated
   (`config.rs:224`).
 - Runbook: document the refusal and the recourse (remove self, rejoin as
   learner with a fresh id).
@@ -153,7 +153,7 @@ fiat, or a bug elsewhere) is divergence that today goes undetected.
 
 Ledger item: "admin-band single-writer note or seqlock re-check". Audit all cnc
 admin-band writers (the kind-16/17 request/reply band, offsets 3456-3648,
-accessors in `uc2_log/src/cnc.rs`). If the single-writer discipline holds,
+accessors in `uc_log/src/cnc.rs`). If the single-writer discipline holds,
 document it at the accessor sites (load-bearing comment). If the audit finds a
 real second writer, add the seqlock re-check instead. Evidence-first: the audit
 decides which lands.
@@ -163,7 +163,7 @@ decides which lands.
 ### Observability
 
 - **cnc publishes `admission_bytes`.** New field in the cnc reserved band,
-  offsets pinned in BOTH `uc_protocol` and `uc2_log` with offset-assertion
+  offsets pinned in BOTH `uc_protocol` and `uc_log` with offset-assertion
   tests (standing convention), written once at boot from `cfg.admission_bytes`.
   `uc2ctl status` reads it when nonzero and demotes `--admission-bytes` to an
   override (ledger minor (n)). One wire **minor** version bump for the whole
@@ -186,7 +186,7 @@ decides which lands.
 - (r) SM-level pin test discriminating latch-vs-raw `contains()` (today only
   the 40s integration test discriminates).
 - (x) `World::run_until` returns a timeout signal instead of silent `Ok(())`
-  (`uc2_sim/src/world.rs:619-629`; same pattern in `run_steps`). All callers
+  (`uc_sim/src/world.rs:619-629`; same pattern in `run_steps`). All callers
   updated; scenario tests that relied on silent timeout get explicit intent.
 - (y) `config_ops_committed` counts local accepts, not durable commits:
   rename/re-doc to match reality.

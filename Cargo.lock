@@ -277,7 +277,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "counter"
-version = "2.8.1"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -286,12 +286,12 @@ dependencies = [
  "serde",
  "signal-hook",
  "tempfile",
- "uc2_client",
- "uc2_consensus",
- "uc2_net",
- "uc2_node",
- "uc2_remote",
- "uc2_service",
+ "uc_client",
+ "uc_consensus",
+ "uc_net",
+ "uc_node",
+ "uc_remote",
+ "uc_service",
 ]
 
 [[package]]
@@ -1280,59 +1280,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
-name = "uc-lincheck"
-version = "2.8.1"
-dependencies = [
- "bincode",
- "serde",
- "uc2_service",
-]
-
-[[package]]
-name = "uc2-crashtest"
-version = "2.8.1"
-dependencies = [
- "anyhow",
- "bincode",
- "clap",
- "rand",
- "tempfile",
- "uc-lincheck",
- "uc2_client",
- "uc2_consensus",
- "uc2_crypto",
- "uc2_gateway",
- "uc2_log",
- "uc2_net",
- "uc2_node",
- "uc2_remote",
- "uc2_service",
- "uc_protocol",
-]
-
-[[package]]
-name = "uc2_client"
-version = "2.8.1"
+name = "uc_client"
+version = "2.9.0"
 dependencies = [
  "bincode",
  "bytes",
  "serde",
  "tempfile",
  "thiserror",
- "uc2_log",
- "uc2_net",
- "uc2_node",
- "uc2_service",
+ "uc_log",
+ "uc_net",
+ "uc_node",
  "uc_protocol",
+ "uc_service",
 ]
 
 [[package]]
-name = "uc2_consensus"
-version = "2.8.1"
+name = "uc_consensus"
+version = "2.9.0"
 
 [[package]]
-name = "uc2_crypto"
-version = "2.8.1"
+name = "uc_crashtest"
+version = "2.9.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "rand",
+ "tempfile",
+ "uc_client",
+ "uc_consensus",
+ "uc_crypto",
+ "uc_gateway",
+ "uc_lincheck",
+ "uc_log",
+ "uc_net",
+ "uc_node",
+ "uc_protocol",
+ "uc_remote",
+ "uc_service",
+]
+
+[[package]]
+name = "uc_crypto"
+version = "2.9.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1350,8 +1341,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "uc2_gateway"
-version = "2.8.1"
+name = "uc_ctl"
+version = "2.9.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rand",
+ "tempfile",
+ "uc_crypto",
+ "uc_log",
+ "uc_net",
+ "uc_node",
+ "uc_protocol",
+]
+
+[[package]]
+name = "uc_gateway"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1366,20 +1372,41 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "uc-lincheck",
- "uc2_client",
- "uc2_gateway",
- "uc2_log",
- "uc2_net",
- "uc2_node",
- "uc2_remote",
- "uc2_service",
+ "uc_client",
+ "uc_gateway",
+ "uc_lincheck",
+ "uc_log",
+ "uc_net",
+ "uc_node",
  "uc_protocol",
+ "uc_remote",
+ "uc_service",
 ]
 
 [[package]]
-name = "uc2_log"
-version = "2.8.1"
+name = "uc_journal"
+version = "2.9.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "rustix",
+ "serde",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "uc_lincheck"
+version = "2.9.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "uc_service",
+]
+
+[[package]]
+name = "uc_log"
+version = "2.9.0"
 dependencies = [
  "crc32fast",
  "loom",
@@ -1388,24 +1415,24 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+ "uc_journal",
  "uc_protocol",
- "ultima-journal",
 ]
 
 [[package]]
-name = "uc2_net"
-version = "2.8.1"
+name = "uc_net"
+version = "2.9.0"
 dependencies = [
  "tempfile",
- "uc2_crypto",
- "uc2_log",
+ "uc_crypto",
+ "uc_journal",
+ "uc_log",
  "uc_protocol",
- "ultima-journal",
 ]
 
 [[package]]
-name = "uc2_node"
-version = "2.8.1"
+name = "uc_node"
+version = "2.9.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1420,76 +1447,20 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "uc-lincheck",
- "uc2_client",
- "uc2_consensus",
- "uc2_crypto",
- "uc2_log",
- "uc2_net",
- "uc2_service",
+ "uc_client",
+ "uc_consensus",
+ "uc_crypto",
+ "uc_journal",
+ "uc_lincheck",
+ "uc_log",
+ "uc_net",
  "uc_protocol",
- "ultima-journal",
-]
-
-[[package]]
-name = "uc2_remote"
-version = "2.8.1"
-dependencies = [
- "bincode",
- "bytes",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "uc2_service"
-version = "2.8.1"
-dependencies = [
- "bincode",
- "fs2",
- "serde",
- "tempfile",
- "thiserror",
- "tokio",
- "uc-lincheck",
- "uc2_client",
- "uc2_log",
- "uc2_net",
- "uc2_node",
- "uc_protocol",
- "ultima-db",
- "ultima-journal",
-]
-
-[[package]]
-name = "uc2_sim"
-version = "2.8.1"
-dependencies = [
- "base64 0.22.1",
- "uc2_consensus",
- "uc2_crypto",
- "uc2_sim",
- "uc_protocol",
-]
-
-[[package]]
-name = "uc2ctl"
-version = "2.8.1"
-dependencies = [
- "anyhow",
- "clap",
- "rand",
- "tempfile",
- "uc2_crypto",
- "uc2_log",
- "uc2_net",
- "uc2_node",
- "uc_protocol",
+ "uc_service",
 ]
 
 [[package]]
 name = "uc_protocol"
-version = "2.8.1"
+version = "2.9.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1504,6 +1475,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc_remote"
+version = "2.9.0"
+dependencies = [
+ "bincode",
+ "bytes",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "uc_service"
+version = "2.9.0"
+dependencies = [
+ "bincode",
+ "fs2",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uc_client",
+ "uc_journal",
+ "uc_lincheck",
+ "uc_log",
+ "uc_net",
+ "uc_node",
+ "uc_protocol",
+ "ultima-db",
+]
+
+[[package]]
+name = "uc_sim"
+version = "2.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "uc_consensus",
+ "uc_crypto",
+ "uc_protocol",
+ "uc_sim",
+]
+
+[[package]]
 name = "ultima-db"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1514,18 +1526,6 @@ dependencies = [
  "dashmap",
  "parking_lot",
  "serde",
- "thiserror",
-]
-
-[[package]]
-name = "ultima-journal"
-version = "2.8.1"
-dependencies = [
- "bincode",
- "crc32fast",
- "rustix",
- "serde",
- "tempfile",
  "thiserror",
 ]
 

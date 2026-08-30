@@ -4,7 +4,7 @@
 
 **Goal:** Give UC v2 opt-in authenticated, encrypted node-to-node UDP transport so a cluster can replicate across a network path the operator does not control.
 
-**Architecture:** A new pure-sync `uc2_crypto` crate owns identity keys, a Noise `IK` handshake driver, the group-key schedule, seal/open, and the anti-replay window. `uc_protocol::v2::crypto` holds wire layouts only. `uc2_net` gains exactly two call seams — seal after `assemble()`, open before dispatch. Two key scopes split by datagram kind: pairwise keys for unicast/low-rate kinds, one cluster group key for the identical-to-N fan-out kinds so `fan_out`'s one-seal-N-sends batching survives.
+**Architecture:** A new pure-sync `uc_crypto` crate owns identity keys, a Noise `IK` handshake driver, the group-key schedule, seal/open, and the anti-replay window. `uc_protocol::v2::crypto` holds wire layouts only. `uc_net` gains exactly two call seams — seal after `assemble()`, open before dispatch. Two key scopes split by datagram kind: pairwise keys for unicast/low-rate kinds, one cluster group key for the identical-to-N fan-out kinds so `fan_out`'s one-seal-N-sends batching survives.
 
 **Tech Stack:** Rust 2024 edition, `snow` (Noise `IK`), `aes-gcm`, `hkdf`, `sha2`, `rand`, `zeroize`.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **`uc2_crypto` is pure-sync**: no `async`, no `tokio`, no sockets, no clock reads. Time enters as an explicit `now_ns: u64` parameter, exactly like `uc2_consensus::ElectionSm`. I/O is limited to reading key files in constructors.
+- **`uc_crypto` is pure-sync**: no `async`, no `tokio`, no sockets, no clock reads. Time enters as an explicit `now_ns: u64` parameter, exactly like `uc_consensus::ElectionSm`. I/O is limited to reading key files in constructors.
 - **`uc_protocol` stays `core`-friendly**: `v2::crypto` contains byte offsets, constants, and pure codec functions only. No crypto code, no `std` beyond what `v2::datagram` already uses.
 - **Never panic on untrusted input.** Every failure on the receive path (bad tag, replay, unknown epoch, malformed handshake) returns an error that the caller turns into a drop + counter bump. A node must not be killable by a datagram.
 - **No wall-clock dependency in the handshake.** Freshness comes from random nonces, never timestamps.
@@ -25,23 +25,23 @@
 ## File Structure
 
 **Created:**
-- `uc2_crypto/Cargo.toml`, `uc2_crypto/src/lib.rs` — crate root, error type, public surface.
-- `uc2_crypto/src/identity.rs` — static keypair loading, allowlist parse/lookup/reload.
-- `uc2_crypto/src/schedule.rs` — epoch store, per-sender-per-boot derivation, overlap retention.
-- `uc2_crypto/src/seal.rs` — `seal_in_place` / `open_in_place`, AAD construction.
-- `uc2_crypto/src/replay.rs` — sliding-window anti-replay.
-- `uc2_crypto/src/handshake.rs` — Noise `IK` driver as a driven transition function.
-- `uc2_crypto/src/rotation.rs` — rotation trigger policy (pure).
+- `uc_crypto/Cargo.toml`, `uc_crypto/src/lib.rs` — crate root, error type, public surface.
+- `uc_crypto/src/identity.rs` — static keypair loading, allowlist parse/lookup/reload.
+- `uc_crypto/src/schedule.rs` — epoch store, per-sender-per-boot derivation, overlap retention.
+- `uc_crypto/src/seal.rs` — `seal_in_place` / `open_in_place`, AAD construction.
+- `uc_crypto/src/replay.rs` — sliding-window anti-replay.
+- `uc_crypto/src/handshake.rs` — Noise `IK` driver as a driven transition function.
+- `uc_crypto/src/rotation.rs` — rotation trigger policy (pure).
 - `uc_protocol/src/v2/crypto.rs` — envelope + handshake body layouts, new kind constants.
 
 **Modified:**
 - `uc_protocol/src/v2/mod.rs` — add `pub mod crypto;`.
 - `uc_protocol/src/v2/datagram.rs` — `DatagramHeader` gains `key_epoch`; reserved slot repurposed.
 - `uc_protocol/src/v2/cnc.rs`, `uc_protocol/src/version.rs` — version 0.4.0.
-- `uc2_net/src/sender.rs` — seal seam in `assemble`, MTU budget.
-- `uc2_net/src/receiver.rs` — open seam in `do_work`, counters.
-- `uc2_net/src/fault.rs` — replay/corrupt injection.
-- `uc2_node/src/node.rs` — `CryptoConfig`, boot refusal, handshake routing, rotation hook.
+- `uc_net/src/sender.rs` — seal seam in `assemble`, MTU budget.
+- `uc_net/src/receiver.rs` — open seam in `do_work`, counters.
+- `uc_net/src/fault.rs` — replay/corrupt injection.
+- `uc_node/src/node.rs` — `CryptoConfig`, boot refusal, handshake routing, rotation hook.
 - `Cargo.toml` — workspace member + deps.
 
 ---
@@ -103,7 +103,7 @@ Expected: FAIL — `unresolved module or unlinked crate 'crypto'`.
 
 //! M8 wire-crypto layouts (spec: docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md §4).
 //! Core-only: offsets, constants, and pure codecs. No crypto code lives here —
-//! that is `uc2_crypto`'s job. A sealed datagram is:
+//! that is `uc_crypto`'s job. A sealed datagram is:
 //!
 //! ```text
 //! [ 16B header (cleartext, used as AAD; carries key_epoch) ]
@@ -228,14 +228,14 @@ pub fn read_datagram_header(buf: &[u8]) -> DatagramHeader {
 
 - [ ] **Step 8: Fix every `DatagramHeader` construction site**
 
-Run: `cargo build --workspace 2>&1 | grep -c "missing field"` to get the count, then add `key_epoch: 0` to each. Sites are in `uc2_net/src/sender.rs` (`assemble`, `assemble_snap`, `send_replay_dgram`), `uc2_net/src/receiver.rs`, and their test modules.
+Run: `cargo build --workspace 2>&1 | grep -c "missing field"` to get the count, then add `key_epoch: 0` to each. Sites are in `uc_net/src/sender.rs` (`assemble`, `assemble_snap`, `send_replay_dgram`), `uc_net/src/receiver.rs`, and their test modules.
 
 - [ ] **Step 9: Bump the wire version**
 
 In `uc_protocol/src/version.rs` set `CURRENT` to 0.4.0. **Leave `CNC_V2_VERSION` and `MIN_COMPATIBLE` alone** (ruling 2026-07-28, correcting this plan's original text, which wrongly assumed the two schemes track each other):
 
 - `CNC_V2_VERSION` is `(2 << 24) | (0 << 16)` — packed major=2, minor=0 — and has never tracked `version::CURRENT`'s semver; it stayed put across both the 0.2.0 and 0.3.0 bumps. Packing "0.4.0" into it would set **major 2 → 0**, which `cnc::version_compatible`'s `local_major == peer_major` test reads as a total incompatibility, not a bump.
-- It gates the **shmem cnc page at local IPC attach** (`uc2_log/src/cnc.rs:298`), and M8 does not change that page's layout — only the UDP datagram format. Bumping it would refuse old service/client binaries for a change that cannot affect them.
+- It gates the **shmem cnc page at local IPC attach** (`uc_log/src/cnc.rs:298`), and M8 does not change that page's layout — only the UDP datagram format. Bumping it would refuse old service/client binaries for a change that cannot affect them.
 - `MIN_COMPATIBLE` is `0.1.0` (not 0.3.0) and has never been bumped. The T6 note that these constants have no enforcement call sites stays accurate.
 
 - [ ] **Step 10: Run the full protocol suite**
@@ -246,16 +246,16 @@ Expected: PASS, all offset assertions green.
 - [ ] **Step 11: Commit**
 
 ```bash
-git add uc_protocol/src/v2/crypto.rs uc_protocol/src/v2/mod.rs uc_protocol/src/v2/datagram.rs uc_protocol/src/v2/cnc.rs uc_protocol/src/version.rs uc2_net/src
+git add uc_protocol/src/v2/crypto.rs uc_protocol/src/v2/mod.rs uc_protocol/src/v2/datagram.rs uc_protocol/src/v2/cnc.rs uc_protocol/src/version.rs uc_net/src
 git commit -m "feat(uc_protocol): M8 crypto wire layouts, key_epoch header field, wire 0.4.0"
 ```
 
 ---
 
-### Task 2: `uc2_crypto` crate skeleton, identity keys, peer allowlist
+### Task 2: `uc_crypto` crate skeleton, identity keys, peer allowlist
 
 **Files:**
-- Create: `uc2_crypto/Cargo.toml`, `uc2_crypto/src/lib.rs`, `uc2_crypto/src/identity.rs`
+- Create: `uc_crypto/Cargo.toml`, `uc_crypto/src/lib.rs`, `uc_crypto/src/identity.rs`
 - Modify: `Cargo.toml` (workspace members + `[workspace.dependencies]`)
 - Test: inline `#[cfg(test)]` in `identity.rs`
 
@@ -338,16 +338,16 @@ Define the fixtures at the top of the test module: `PRIV_KEY_A` as a 32-byte arr
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto identity::`
+Run: `cargo test -p uc_crypto identity::`
 Expected: FAIL — crate does not exist.
 
 - [ ] **Step 3: Create the crate**
 
-`uc2_crypto/Cargo.toml`:
+`uc_crypto/Cargo.toml`:
 
 ```toml
 [package]
-name = "uc2_crypto"
+name = "uc_crypto"
 description = "UC v2 wire crypto: Noise IK handshake, group-key schedule, AEAD seal/open (spec 2026-07-28, M8)"
 edition.workspace = true
 version.workspace = true
@@ -367,7 +367,7 @@ thiserror = { workspace = true }
 base64 = { workspace = true }
 ```
 
-Add to the root `Cargo.toml`: `"uc2_crypto"` in `members`, and under `[workspace.dependencies]`:
+Add to the root `Cargo.toml`: `"uc_crypto"` in `members`, and under `[workspace.dependencies]`:
 
 ```toml
 # M8 wire crypto. Versions verified against crates.io 2026-07-28. The AEAD/hash
@@ -426,14 +426,14 @@ pub enum CryptoError {
 
 - [ ] **Step 5: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto identity::`
+Run: `cargo test -p uc_crypto identity::`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock uc2_crypto
-git commit -m "feat(uc2_crypto): crate skeleton, X25519 identity keys, peer allowlist"
+git add Cargo.toml Cargo.lock uc_crypto
+git commit -m "feat(uc_crypto): crate skeleton, X25519 identity keys, peer allowlist"
 ```
 
 ---
@@ -441,8 +441,8 @@ git commit -m "feat(uc2_crypto): crate skeleton, X25519 identity keys, peer allo
 ### Task 3: Key schedule — per-sender-per-boot derivation and the epoch store
 
 **Files:**
-- Create: `uc2_crypto/src/schedule.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/schedule.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -502,7 +502,7 @@ mod tests {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto schedule::`
+Run: `cargo test -p uc_crypto schedule::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -511,14 +511,14 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto schedule::`
+Run: `cargo test -p uc_crypto schedule::`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/schedule.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): key schedule — per-sender-per-boot derivation, two-epoch overlap"
+git add uc_crypto/src/schedule.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): key schedule — per-sender-per-boot derivation, two-epoch overlap"
 ```
 
 ---
@@ -526,8 +526,8 @@ git commit -m "feat(uc2_crypto): key schedule — per-sender-per-boot derivation
 ### Task 4: Anti-replay sliding window
 
 **Files:**
-- Create: `uc2_crypto/src/replay.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/replay.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -579,21 +579,21 @@ mod tests {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto replay::`
+Run: `cargo test -p uc_crypto replay::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement** the standard IPsec/RFC 6479 bitmap: a `highest: u64` and a `[u64; 16]` bitmap (1024 bits). Counter 0 is never valid (counters start at 1), so a fresh window rejects it.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto replay::`
+Run: `cargo test -p uc_crypto replay::`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/replay.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): RFC 6479 anti-replay window (reorder-tolerant)"
+git add uc_crypto/src/replay.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): RFC 6479 anti-replay window (reorder-tolerant)"
 ```
 
 ---
@@ -601,8 +601,8 @@ git commit -m "feat(uc2_crypto): RFC 6479 anti-replay window (reorder-tolerant)"
 ### Task 5: `seal_in_place` / `open_in_place`
 
 **Files:**
-- Create: `uc2_crypto/src/seal.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/seal.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -694,7 +694,7 @@ mod tests {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto seal::`
+Run: `cargo test -p uc_crypto seal::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -703,14 +703,14 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto seal::`
+Run: `cargo test -p uc_crypto seal::`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/seal.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): AES-256-GCM seal/open in place, header as AAD"
+git add uc_crypto/src/seal.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): AES-256-GCM seal/open in place, header as AAD"
 ```
 
 ---
@@ -718,8 +718,8 @@ git commit -m "feat(uc2_crypto): AES-256-GCM seal/open in place, header as AAD"
 ### Task 6: Noise `IK` handshake driver
 
 **Files:**
-- Create: `uc2_crypto/src/handshake.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/handshake.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -742,7 +742,7 @@ mod tests {
     use super::*;
 
     /// Drive two `Peers` against each other with no sockets — this is the
-    /// property that lets uc2_sim adjudicate the handshake deterministically.
+    /// property that lets uc_sim adjudicate the handshake deterministically.
     fn pump(a: &mut Peers, b: &mut Peers, mut acts: Vec<HandshakeAction>) -> (bool, bool) {
         let (mut a_up, mut b_up) = (false, false);
         for _ in 0..8 {
@@ -849,7 +849,7 @@ Write the fixtures `authorized_pair()`, `pair_with_stranger_not_in_a_allowlist()
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto handshake::`
+Run: `cargo test -p uc_crypto handshake::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement**
@@ -858,14 +858,14 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto handshake::`
+Run: `cargo test -p uc_crypto handshake::`
 Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/handshake.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): Noise IK handshake driver over snow, sim-drivable"
+git add uc_crypto/src/handshake.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): Noise IK handshake driver over snow, sim-drivable"
 ```
 
 ---
@@ -873,8 +873,8 @@ git commit -m "feat(uc2_crypto): Noise IK handshake driver over snow, sim-drivab
 ### Task 7: Group-key distribution and activation
 
 **Files:**
-- Create: `uc2_crypto/src/group.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/group.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -944,21 +944,21 @@ mod tests {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto group::`
+Run: `cargo test -p uc_crypto group::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement.** `mint` generates 32 random bytes via `rand::rngs::OsRng`, bumps the epoch, installs into the `KeySchedule`, and emits one `HS_KEY` action per peer carrying `(epoch, key)` — the caller seals that body over the peer's pairwise channel before sending. `sealing_epoch` returns the pending epoch once all peers acked, or once `now_ns` exceeds `minted_at + ACTIVATION_TIMEOUT_NS`; otherwise the previously active epoch, or `None`.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto group::`
+Run: `cargo test -p uc_crypto group::`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/group.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): group-key mint, per-peer delivery, activation with a liveness timeout"
+git add uc_crypto/src/group.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): group-key mint, per-peer delivery, activation with a liveness timeout"
 ```
 
 ---
@@ -966,8 +966,8 @@ git commit -m "feat(uc2_crypto): group-key mint, per-peer delivery, activation w
 ### Task 8: Rotation policy
 
 **Files:**
-- Create: `uc2_crypto/src/rotation.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/rotation.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -1029,21 +1029,21 @@ mod tests {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto rotation::`
+Run: `cargo test -p uc_crypto rotation::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement.** Latched booleans for `BecameLeader`/`Removal` plus `last_rotate_ns` and `bytes_since`. `take_due` checks in priority order `BecameLeader`, `Removal`, `Periodic`, clearing all counters when it returns `Some`. `on_committed_config` stores the first observation as a baseline and only latches when the count strictly grows.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto rotation::`
+Run: `cargo test -p uc_crypto rotation::`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/rotation.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): rotation policy — leader/periodic/removal triggers"
+git add uc_crypto/src/rotation.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): rotation policy — leader/periodic/removal triggers"
 ```
 
 ---
@@ -1051,8 +1051,8 @@ git commit -m "feat(uc2_crypto): rotation policy — leader/periodic/removal tri
 ### Task 9: `CryptoConfig` and the transport facade
 
 **Files:**
-- Create: `uc2_crypto/src/transport.rs`
-- Modify: `uc2_crypto/src/lib.rs`
+- Create: `uc_crypto/src/transport.rs`
+- Modify: `uc_crypto/src/lib.rs`
 - Test: inline
 
 **Interfaces:**
@@ -1125,33 +1125,33 @@ mod tests {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_crypto transport::`
+Run: `cargo test -p uc_crypto transport::`
 Expected: FAIL — module not found.
 
 - [ ] **Step 3: Implement.** `Transport` composes `Peers`, `GroupPlane`, `RotationState`, and the counter. `scope_of` is an exhaustive `match` on the kind constants — no `_ =>` arm defaulting to `Group`; unknown kinds map to `Pairwise` explicitly with a comment saying why (a new kind is unicast until proven otherwise). `seal` picks the scope, derives the send key via `derive_send_key`, allocates the next counter, and calls `seal_in_place`. Group sealing with no active epoch returns `CryptoError::NoGroupKey`.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_crypto transport::`
+Run: `cargo test -p uc_crypto transport::`
 Expected: PASS, 5 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_crypto/src/transport.rs uc2_crypto/src/lib.rs
-git commit -m "feat(uc2_crypto): transport facade — scope-by-kind, config, boot refusal"
+git add uc_crypto/src/transport.rs uc_crypto/src/lib.rs
+git commit -m "feat(uc_crypto): transport facade — scope-by-kind, config, boot refusal"
 ```
 
 ---
 
-### Task 10: `uc2_net` send seam
+### Task 10: `uc_net` send seam
 
 **Files:**
-- Modify: `uc2_net/src/sender.rs:560-600` (`assemble`, `fan_out`, `serve_nak`), `uc2_net/src/sender.rs:126-140` (`SenderConfig`), `uc2_net/Cargo.toml`
+- Modify: `uc_net/src/sender.rs:560-600` (`assemble`, `fan_out`, `serve_nak`), `uc_net/src/sender.rs:126-140` (`SenderConfig`), `uc_net/Cargo.toml`
 - Test: inline in `sender.rs`
 
 **Interfaces:**
-- Consumes: `uc2_crypto::{Transport, CryptoError}`.
+- Consumes: `uc_crypto::{Transport, CryptoError}`.
 - Produces: `Sender::with_crypto(...)` builder arm; `SenderConfig::crypto_overhead(&self) -> usize`.
 
 > **OWNERSHIP CORRECTION (ruling 2026-07-29, supersedes this task's original "move `Transport` into `Sender`" shape).**
@@ -1227,36 +1227,36 @@ fn cleartext_mode_is_byte_identical_to_pre_m8_output() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_net sender::tests::sealed`
+Run: `cargo test -p uc_net sender::tests::sealed`
 Expected: FAIL — no `crypto_enabled` field, no `with_crypto`.
 
-- [ ] **Step 3: Implement.** Add `uc2_crypto` to `uc2_net/Cargo.toml`. `Sender` gains `crypto: Option<Transport>`. In `assemble`, after `extend_from_slice`, call `self.crypto.as_mut()` and seal, stamping the epoch into the header before sealing (the header is AAD, so the epoch must be final first). `fan_out` is unchanged — it seals once inside `assemble` and the loop still sends `&self.scratch` N times. Subtract `crypto_overhead()` in the two places the MTU budget is computed (`serve_nak`'s `budget`, and the run-read budget in `do_work`).
+- [ ] **Step 3: Implement.** Add `uc_crypto` to `uc_net/Cargo.toml`. `Sender` gains `crypto: Option<Transport>`. In `assemble`, after `extend_from_slice`, call `self.crypto.as_mut()` and seal, stamping the epoch into the header before sealing (the header is AAD, so the epoch must be final first). `fan_out` is unchanged — it seals once inside `assemble` and the loop still sends `&self.scratch` N times. Subtract `crypto_overhead()` in the two places the MTU budget is computed (`serve_nak`'s `budget`, and the run-read budget in `do_work`).
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_net`
+Run: `cargo test -p uc_net`
 Expected: PASS, all existing sender tests plus 4 new.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/Cargo.toml uc2_net/src/sender.rs
-git commit -m "feat(uc2_net): seal seam in assemble; fan-out still seals once for N sends"
+git add uc_net/Cargo.toml uc_net/src/sender.rs
+git commit -m "feat(uc_net): seal seam in assemble; fan-out still seals once for N sends"
 ```
 
 ---
 
-### Task 11: `uc2_net` receive seam
+### Task 11: `uc_net` receive seam
 
 > **Read this before you start: cleartext SNAP datagrams arrive ON PURPOSE.**
 > Task 10 left `SNAP_BEGIN`/`SNAP_CHUNK` unsealed because pairwise sealing needs an established handshake session, which nothing drives until Task 12. Task 17 closes this. **Do not let the receive path drop them**, or snapshot transfer wedges with crypto ON and learners, cold nodes, and below-floor recovery can never converge — while equally, do not build a permanent exemption that silently accepts unauthenticated snapshot traffic forever. Route them through a **single, named, temporary allowance** that Task 17 deletes in one edit, and make its name say so.
 
 **Files:**
-- Modify: `uc2_net/src/receiver.rs:582-615` (`do_work`, `on_datagram`), receiver stats struct
+- Modify: `uc_net/src/receiver.rs:582-615` (`do_work`, `on_datagram`), receiver stats struct
 - Test: inline in `receiver.rs`
 
 **Interfaces:**
-- Consumes: `uc2_crypto::Transport`.
+- Consumes: `uc_crypto::Transport`.
 - Produces: stats counters `dropped_auth_failed`, `dropped_replay`, `dropped_unknown_epoch`, `peer_appears_cleartext`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1320,21 +1320,21 @@ fn truncated_and_random_datagrams_never_panic() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_net receiver::tests::a_sealed`
+Run: `cargo test -p uc_net receiver::tests::a_sealed`
 Expected: FAIL — no crypto on `Receiver`.
 
 - [ ] **Step 3: Implement.** In `do_work`, between `recv_from` and `on_datagram`, if crypto is enabled: read the header, resolve the peer id from `from`, and open in place. `key_epoch == 0` while crypto is enabled → bump `peer_appears_cleartext` and log rate-limited (once per 30s per peer) with the specific diagnostic. Handshake kinds (18/19/20) bypass the open and route to the handshake driver. Every error path drops and counts; none returns `Err` upward.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_net`
+Run: `cargo test -p uc_net`
 Expected: PASS, all existing plus 6 new.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/src/receiver.rs
-git commit -m "feat(uc2_net): open seam, drop-and-count failure paths, cleartext-peer diagnostic"
+git add uc_net/src/receiver.rs
+git commit -m "feat(uc_net): open seam, drop-and-count failure paths, cleartext-peer diagnostic"
 ```
 
 ---
@@ -1342,11 +1342,11 @@ git commit -m "feat(uc2_net): open seam, drop-and-count failure paths, cleartext
 ### Task 12: Node wiring — config, boot refusal, handshake routing, rotation hook
 
 **Files:**
-- Modify: `uc2_node/src/node.rs:113-155` (`NodeConfig`), the node construction path, the `Action::ConfigAdopted`/commit-crossing handler, `uc2_node/Cargo.toml`
+- Modify: `uc_node/src/node.rs:113-155` (`NodeConfig`), the node construction path, the `Action::ConfigAdopted`/commit-crossing handler, `uc_node/Cargo.toml`
 - Test: inline in `node.rs`
 
 **Interfaces:**
-- Consumes: `uc2_crypto::{CryptoConfig, Transport, RotationReason}`.
+- Consumes: `uc_crypto::{CryptoConfig, Transport, RotationReason}`.
 - Produces: `NodeConfig.crypto: CryptoConfig`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1394,7 +1394,7 @@ fn a_committed_remove_rotates_but_a_committed_demote_does_not() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_node node::tests::a_node_configured`
+Run: `cargo test -p uc_node node::tests::a_node_configured`
 Expected: FAIL — no `crypto` field.
 
 - [ ] **Step 3: Implement.** Add the field with `#[derive(Default)]` giving `Disabled`. Construct the `Transport` in the node's constructor **before** agent spawn (so a failure is a clean early return, as the M7 tombstone refusal does) and hand clones to sender and receiver. Route handshake kinds from the receiver to the handshake driver over the existing `NetEvent` channel. Call `on_became_leader` where `Action::BecomeLeader` is handled and `on_committed_config(config.tombstones.len())` at the same commit-crossing point `rank_leader` already uses for `StepDownRemoved`. Drain `rotation_due` once per duty cycle and mint when it returns `Some`.
@@ -1407,14 +1407,14 @@ Three wiring details that have no other home, so they must land here:
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_node`
+Run: `cargo test -p uc_node`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_node/Cargo.toml uc2_node/src/node.rs
-git commit -m "feat(uc2_node): CryptoConfig, boot refusal, handshake routing, rotation hook"
+git add uc_node/Cargo.toml uc_node/src/node.rs
+git commit -m "feat(uc_node): CryptoConfig, boot refusal, handshake routing, rotation hook"
 ```
 
 ---
@@ -1422,11 +1422,11 @@ git commit -m "feat(uc2_node): CryptoConfig, boot refusal, handshake routing, ro
 ### Task 13: Deterministic sim coverage
 
 **Files:**
-- Modify: `uc2_sim/src/world.rs`, `uc2_sim/tests/scenarios.rs`, `uc2_sim/Cargo.toml`
-- Test: `uc2_sim/tests/scenarios.rs`
+- Modify: `uc_sim/src/world.rs`, `uc_sim/tests/scenarios.rs`, `uc_sim/Cargo.toml`
+- Test: `uc_sim/tests/scenarios.rs`
 
 **Interfaces:**
-- Consumes: `uc2_crypto::{Peers, GroupPlane, HandshakeAction}`.
+- Consumes: `uc_crypto::{Peers, GroupPlane, HandshakeAction}`.
 - Produces: sim scenarios only.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1475,21 +1475,21 @@ fn every_existing_safety_invariant_still_holds_with_the_crypto_plane_on() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_sim handshakes_complete`
+Run: `cargo test -p uc_sim handshakes_complete`
 Expected: FAIL — no `enable_crypto_plane`.
 
 - [ ] **Step 3: Implement** the sim hooks. The handshake driver is already a pure transition function, so the world feeds it messages on its virtual clock with no sockets. `enable_crypto_plane(n)` gives each simulated node a `Peers` + `GroupPlane` and routes kinds 18/19/20 through the existing lossy link model.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_sim`
+Run: `cargo test -p uc_sim`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_sim
-git commit -m "test(uc2_sim): crypto plane — handshake under loss, rotation across partition, NAK recovery"
+git add uc_sim
+git commit -m "test(uc_sim): crypto plane — handshake under loss, rotation across partition, NAK recovery"
 ```
 
 ---
@@ -1497,8 +1497,8 @@ git commit -m "test(uc2_sim): crypto plane — handshake under loss, rotation ac
 ### Task 14: Adversarial and fault-injection coverage
 
 **Files:**
-- Modify: `uc2_net/src/fault.rs`
-- Create: `uc2_net/tests/crypto_adversarial.rs`
+- Modify: `uc_net/src/fault.rs`
+- Create: `uc_net/tests/crypto_adversarial.rs`
 - Test: the new integration test file
 
 **Interfaces:**
@@ -1550,21 +1550,21 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_net --test crypto_adversarial`
+Run: `cargo test -p uc_net --test crypto_adversarial`
 Expected: FAIL — no such test file / no `replay_per_million`.
 
 - [ ] **Step 3: Implement** the two fault knobs in `FaultSocket::send_to` (corrupt flips one random byte; replay stashes and re-delivers a previous datagram) and the `SealedCluster` harness.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p uc2_net --test crypto_adversarial`
+Run: `cargo test -p uc_net --test crypto_adversarial`
 Expected: PASS, 4 tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_net/src/fault.rs uc2_net/tests/crypto_adversarial.rs
-git commit -m "test(uc2_net): adversarial tier — replayed vote, revoked peer, downgrade, corruption storm"
+git add uc_net/src/fault.rs uc_net/tests/crypto_adversarial.rs
+git commit -m "test(uc_net): adversarial tier — replayed vote, revoked peer, downgrade, corruption storm"
 ```
 
 ---
@@ -1572,7 +1572,7 @@ git commit -m "test(uc2_net): adversarial tier — replayed vote, revoked peer, 
 ### Task 15: Capstones with crypto ON
 
 **Files:**
-- Modify: `uc2_node/tests/lin_v2.rs`, `uc2_node/tests/lin_partition_v2.rs`, `examples/uc2-crashtest/`, `scripts/elle_check.sh`
+- Modify: `uc_node/tests/lin_v2.rs`, `uc_node/tests/lin_partition_v2.rs`, `examples/uc_crashtest/`, `scripts/elle_check.sh`
 - Test: the existing capstones, parameterized
 
 **Interfaces:**
@@ -1596,20 +1596,20 @@ Add the same `crypto: true` arm to `linearizable_under_purge_and_snapshot_churn`
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p uc2_node --test lin_v2 linearizable_under_failover_with_crypto --release`
+Run: `cargo test -p uc_node --test lin_v2 linearizable_under_failover_with_crypto --release`
 Expected: FAIL — `LinConfig` has no `crypto` field.
 
 - [ ] **Step 3: Implement.** Add `crypto: bool` to `LinConfig`; when set, generate a keypair + allowlist per node into the test's `CARGO_TARGET_TMPDIR` instance dir and set `CryptoConfig::Enabled`. Do the same in the crashtest reference bins, gated on `UC2_CRYPTO=1`.
 
 - [ ] **Step 4: Run the full capstone set both ways**
 
-Run: `cargo test -p uc2_node --test lin_v2 --release && cargo test -p uc2_node --test lin_partition_v2 --release && cargo test -p uc2-crashtest --features hard-crash-tests && UC2_CRYPTO=1 ELLE_DIR=/home/claude/elle-out scripts/elle_check.sh`
+Run: `cargo test -p uc_node --test lin_v2 --release && cargo test -p uc_node --test lin_partition_v2 --release && cargo test -p uc_crashtest --features hard-crash-tests && UC2_CRYPTO=1 ELLE_DIR=/home/claude/elle-out scripts/elle_check.sh`
 Expected: PASS. Budget ~6 minutes for the lincheck capstones.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_node/tests examples/uc2-crashtest scripts/elle_check.sh
+git add uc_node/tests examples/uc_crashtest scripts/elle_check.sh
 git commit -m "test: run the full capstone set with crypto ON"
 ```
 
@@ -1619,7 +1619,7 @@ git commit -m "test: run the full capstone set with crypto ON"
 
 **Files:**
 - Create: `docs/benchmarks/uc2-m8-gate-2026-07-28.md`
-- Modify: `uc2_node/examples/m5_gate.rs`, `docs/ops/uc2-runbook.md`, `docs/releases.md`, `CLAUDE.md`
+- Modify: `uc_node/examples/m5_gate.rs`, `docs/ops/uc2-runbook.md`, `docs/releases.md`, `CLAUDE.md`
 - Test: the gate harness itself
 
 **Interfaces:**
@@ -1636,7 +1636,7 @@ Generate per-node key material into the harness's instance dirs and set `CryptoC
 
 - [ ] **Step 3: Run both arms**
 
-Run: `cargo run -p uc2_node --release --example m5_gate && cargo run -p uc2_node --release --example m5_gate -- --crypto`
+Run: `cargo run -p uc_node --release --example m5_gate && cargo run -p uc_node --release --example m5_gate -- --crypto`
 Expected: two result blocks. Record both verbatim.
 
 - [ ] **Step 4: Adjudicate against the pre-committed rule and write it up**
@@ -1645,36 +1645,36 @@ If the encrypted arm is within 10%, PASS. If not, the gate doc records the hones
 
 - [ ] **Step 5: Write the operator documentation**
 
-Add a runbook section covering key generation, allowlist format and distribution, the flag-day rollout procedure, what the four new drop counters mean, and rotation policy tuning. Add the `releases.md` 0.4.0 entry. Update `CLAUDE.md`'s crate list with `uc2_crypto` and the security-posture line (v2.0's "explicit non-goal" is now "opt-in, off by default").
+Add a runbook section covering key generation, allowlist format and distribution, the flag-day rollout procedure, what the four new drop counters mean, and rotation policy tuning. Add the `releases.md` 0.4.0 entry. Update `CLAUDE.md`'s crate list with `uc_crypto` and the security-posture line (v2.0's "explicit non-goal" is now "opt-in, off by default").
 
 - [ ] **Step 6: Full local proof stack**
 
-Run: `cargo build --workspace && cargo test && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p uc2_node --test lin_v2 --release && cargo test -p uc2_node --test lin_partition_v2 --release && cargo test -p uc2-crashtest --features hard-crash-tests && cargo test -p uc2_service --features ultima_db && cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 3 && cargo run -p uc2_node --release --example m7_gate -- all --secs 6`
+Run: `cargo build --workspace && cargo test && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p uc_node --test lin_v2 --release && cargo test -p uc_node --test lin_partition_v2 --release && cargo test -p uc_crashtest --features hard-crash-tests && cargo test -p uc_service --features ultima_db && cargo run -p uc_node --release --example m6_gate -- all --secs 6 --cycles 3 && cargo run -p uc_node --release --example m7_gate -- all --secs 6`
 Expected: all green. Budget ~10 minutes.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add docs uc2_node/examples/m5_gate.rs CLAUDE.md
+git add docs uc_node/examples/m5_gate.rs CLAUDE.md
 git commit -m "docs(m8): gate doc with pre-committed bar, runbook ops section, releases 0.4.0"
 ```
 
 ---
 
-### Task 17: Seal the remaining pairwise sends in `uc2_net`
+### Task 17: Seal the remaining pairwise sends in `uc_net`
 
 **EXECUTION ORDER: runs immediately after Task 12 and BEFORE Task 13.** It is numbered 17 only because it was added after the plan was written (ruling 2026-07-29); the capstones (T15) and the throughput gate (T16) must measure a build in which this is done, or they measure the wrong system.
 
-**Why this task exists.** Task 10 sealed the group-scope fan-out but left every pairwise-scope send in `uc2_net` cleartext, because pairwise sealing needs an established handshake session and nothing drives `Peers` until Task 12. That is a defensible task boundary and an indefensible end state:
+**Why this task exists.** Task 10 sealed the group-scope fan-out but left every pairwise-scope send in `uc_net` cleartext, because pairwise sealing needs an established handshake session and nothing drives `Peers` until Task 12. That is a defensible task boundary and an indefensible end state:
 
 - **Confidentiality:** `send_snap_chunk` streams raw bytes out of the service-built snapshot artifact — the complete serialized state machine. The header carries the file offset, so a passive observer reassembles the entire database from a capture with no work.
 - **Integrity, which is worse:** `send_snap_begin` ships `SnapBeginBody.config`, the encoded cluster `ConfigRecord`, and the receive path feeds it to `maybe_adopt_incoming_snapshot`. Unsealed means unauthenticated, so an on-path attacker can forge a snapshot session to a joining or below-floor node and install **attacker-chosen application state and attacker-chosen membership**. That is a consensus-integrity primitive, not a privacy footnote.
 
 **Files:**
-- Modify: `uc2_net/src/sender.rs` (`assemble_snap`, `send_snap_begin`, `send_snap_chunk`, and the `send_snap_chunk` MTU budget at ~:908 which Task 10 deliberately left un-subtracted while SNAP was cleartext)
-- Modify: `uc2_net/src/receiver.rs` (the sends at ~:906, :993, :1041, :1072, :1098 — `SNAP_NAK`, `SNAP_DONE`, `NAK`, `STATUS`, `APPEND_POSITION`)
-- Modify: `uc2_net/src/receiver.rs` — delete the temporary cleartext-SNAP allowance Task 11 added
-- **Modify: `uc2_node/src/node.rs` — the node's OWN direct sends** (~:1918 `READ_PROBE`, :2371 `CONFIG_PROPOSAL`, :2551 `VOTE`, :2558 `REQUEST_VOTE`, :2569 `COMMIT_POSITION`, :2641/:2651 `TERM_MAP`). **Scope extension ruled 2026-07-29 after the Task 11 review.** Task 10 sealed only what flows through `Sender::seal_scratch`; the node emits consensus datagrams on its own socket path, and Task 11's receive rule drops anything unsealed once crypto is on. Without this, a crypto-enabled cluster has **no elections, no commit gossip and no linearizable reads** — it does not run at all. This is not optional polish; it is the difference between a working cluster and a dead one.
+- Modify: `uc_net/src/sender.rs` (`assemble_snap`, `send_snap_begin`, `send_snap_chunk`, and the `send_snap_chunk` MTU budget at ~:908 which Task 10 deliberately left un-subtracted while SNAP was cleartext)
+- Modify: `uc_net/src/receiver.rs` (the sends at ~:906, :993, :1041, :1072, :1098 — `SNAP_NAK`, `SNAP_DONE`, `NAK`, `STATUS`, `APPEND_POSITION`)
+- Modify: `uc_net/src/receiver.rs` — delete the temporary cleartext-SNAP allowance Task 11 added
+- **Modify: `uc_node/src/node.rs` — the node's OWN direct sends** (~:1918 `READ_PROBE`, :2371 `CONFIG_PROPOSAL`, :2551 `VOTE`, :2558 `REQUEST_VOTE`, :2569 `COMMIT_POSITION`, :2641/:2651 `TERM_MAP`). **Scope extension ruled 2026-07-29 after the Task 11 review.** Task 10 sealed only what flows through `Sender::seal_scratch`; the node emits consensus datagrams on its own socket path, and Task 11's receive rule drops anything unsealed once crypto is on. Without this, a crypto-enabled cluster has **no elections, no commit gossip and no linearizable reads** — it does not run at all. This is not optional polish; it is the difference between a working cluster and a dead one.
 - Test: inline in all three files
 
 **Interfaces:**
@@ -1713,7 +1713,7 @@ fn a_forged_snapshot_begin_cannot_install_a_config() {
 
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `cargo test -p uc2_net snap`
+Run: `cargo test -p uc_net snap`
 Expected: FAIL — chunks are cleartext, forged begin is accepted.
 
 - [ ] **Step 3: Seal the sender's snapshot path**
@@ -1734,11 +1734,11 @@ At minimum: drop the MTU subtraction at the new site; seal with the wrong peer i
 
 - [ ] **Step 7: Run and commit**
 
-Run: `cargo test -p uc2_net && cargo test -p uc2_crypto && cargo clippy --workspace --all-targets -- -D warnings`
+Run: `cargo test -p uc_net && cargo test -p uc_crypto && cargo clippy --workspace --all-targets -- -D warnings`
 
 ```bash
-git add uc2_net/src
-git commit -m "feat(uc2_net): seal the remaining pairwise sends — snapshot sessions and control datagrams"
+git add uc_net/src
+git commit -m "feat(uc_net): seal the remaining pairwise sends — snapshot sessions and control datagrams"
 ```
 
 ---

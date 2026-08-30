@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
+[package]
+name = "uc_ctl"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Admin CLI for live ultima_cluster reconfiguration"
+
+# The package is `uc_ctl` (uniform `uc_` prefix on crates.io); the BINARY stays
+# `uc2ctl` — it is the operator-facing name baked into systemd units, the
+# container image, compose healthchecks and every runbook, so it is not a
+# package-naming decision to make. Declared explicitly because a `src/main.rs`
+# would otherwise take the package's name.
+[[bin]]
+name = "uc2ctl"
+path = "src/main.rs"
+
+# Deliberately its own crate rather than a bin inside `uc_node`: uc2ctl talks
+# to a running node purely through the cnc page's admin slots, so the live
+# reconfiguration verbs need only `uc_log` and `uc_protocol`, not `uc_node`
+# itself — that split is what keeps `clap` off the node library's dependency
+# graph for every consumer. M11 Task 2's `backup`/`verify-backup`/`restore`
+# verbs are the one exception: they are OFFLINE (filesystem-only, no cnc
+# admin-band interaction at all — see `uc_node::backup`'s module doc) and
+# reuse that module's `backup_instance`/`verify_artifact`/`restore_artifact`
+# rather than reimplementing them here, so `uc_node` becomes a dependency
+# for THOSE three verbs specifically.
+[dependencies]
+uc_log = { path = "../uc_log", version = "2.8.1" }
+uc_node = { path = "../uc_node", version = "2.8.1" }
+uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+# M12b Task 6: `--admin-key` signing + `gen-admin-key` — the canonical
+# `AdminMessage`/`sign`/`AdminKey`/`generate_key_file` live here so this CLI
+# builds the exact same byte layout the node verifies, rather than
+# reimplementing it.
+uc_crypto = { path = "../uc_crypto", version = "2.8.1" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+# A per-request nonce, so a response can never be mistaken for a stale one.
+rand = { workspace = true }
+
+[dev-dependencies]
+# admin_auth_bin.rs starts a real node IN-PROCESS (uc_node is already a
+# regular dependency above) and needs `FaultConfig` for `NodeConfig`.
+uc_net = { path = "../uc_net", version = "2.8.1" }
+tempfile = { workspace = true }

@@ -2,17 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Raft's safety core over positions (spec §6): leader elections with persisted votes, the fsync'd term map (RecordingLog analog), log truncation for reconciliation, replay sessions off the M2 Overrun seam, and the deterministic simulation (`uc2_sim`) that gates all of it — gate: sim invariants green across seeded fuzz + scripted nasties, and sub-second failover on the 3-node harness (spec §9 M4 row).
+**Goal:** Raft's safety core over positions (spec §6): leader elections with persisted votes, the fsync'd term map (RecordingLog analog), log truncation for reconciliation, replay sessions off the M2 Overrun seam, and the deterministic simulation (`uc_sim`) that gates all of it — gate: sim invariants green across seeded fuzz + scripted nasties, and sub-second failover on the 3-node harness (spec §9 M4 row).
 
-**Architecture:** The election SM lives entirely in `uc2_consensus` — pure, sync, message-in/action-out, time injected; the agent (in a new minimal `uc2_node` crate) performs all I/O including StableValue persistence with a persist-BEFORE-answer contract. Commit ranking MOVES from the sender thread into the consensus agent (the spec §3.1 shape), making the consensus thread the commit counter's single writer in both roles forever — this dissolves the M3 "commit-writer handoff" carry. `uc2_sim` exists and is green BEFORE the first networked election (spec §8 L1).
+**Architecture:** The election SM lives entirely in `uc_consensus` — pure, sync, message-in/action-out, time injected; the agent (in a new minimal `uc_node` crate) performs all I/O including StableValue persistence with a persist-BEFORE-answer contract. Commit ranking MOVES from the sender thread into the consensus agent (the spec §3.1 shape), making the consensus thread the commit counter's single writer in both roles forever — this dissolves the M3 "commit-writer handoff" carry. `uc_sim` exists and is green BEFORE the first networked election (spec §8 L1).
 
-**Tech Stack:** Rust 2024; existing `uc2_consensus`/`uc2_net`/`uc2_log`/`uc_protocol` (M3, committed); `ultima_journal::{StableValue, Journal::truncate_after}` (verified present: `truncate_after(&self, keep_seq) -> Notifier` synchronous with pending-fence; `StableValue<T: Serialize + DeserializeOwned + Clone + Send + Sync>` with `open/load/store→Notifier/clear`); serde (workspace, for the persisted records only — the SM stays dep-free).
+**Tech Stack:** Rust 2024; existing `uc_consensus`/`uc_net`/`uc_log`/`uc_protocol` (M3, committed); `uc_journal::{StableValue, Journal::truncate_after}` (verified present: `truncate_after(&self, keep_seq) -> Notifier` synchronous with pending-fence; `StableValue<T: Serialize + DeserializeOwned + Clone + Send + Sync>` with `open/load/store→Notifier/clear`); serde (workspace, for the persisted records only — the SM stays dep-free).
 
 ## Global Constraints
 
 Every task's requirements implicitly include all of these (M1–M3 plan constraints remain in force for the files they cover):
 
-- **Election safety invariants (spec §8 L1) are the acceptance bar, checked by `uc2_sim` after EVERY step:** ≤1 leader per term; term-map prefix consistency across nodes; commit monotonicity (within a run); committed-never-truncated; leader completeness (every committed `(term, position)` range is in every later leader's history).
+- **Election safety invariants (spec §8 L1) are the acceptance bar, checked by `uc_sim` after EVERY step:** ≤1 leader per term; term-map prefix consistency across nodes; commit monotonicity (within a run); committed-never-truncated; leader completeness (every committed `(term, position)` range is in every later leader's history).
 - **Vote rule (spec §6, verbatim):** grant `RequestVote(new_term_id, last_leadership_term_id, last_durable_position)` iff the term is new, no conflicting vote this term, and the candidate's `(last_term, durable_pos)` ≥ ours lexicographically. **Only durable positions count** — a crash discards the non-durable tail anyway. **The vote is persisted to StableValue BEFORE it is answered** — in the SM this is encoded as a single `GrantVote` action whose contract (documented on the action) is persist-then-send; the agent must `Notifier::wait()` the StableValue store before the datagram goes out.
 - **New leader protocol (spec §6):** `term_id += 1`; `base_position` = own **durable** (bytes beyond durable are discarded when opening the term — `append` collapses to `durable`); term map appended + persisted BEFORE anything else in the new term; a **NewTerm no-op frame** is appended immediately and the leader **does not serve until it commits** (Raft §5.4.2 leader completeness). The SM exposes `can_serve()` for the gate.
 - **Reconciliation (spec §6):** the leader ships its term map (suffix, capped — see wire task); a diverged follower truncates to the end of the last common `(term, base)` prefix — only ever uncommitted bytes, by vote/commit safety — then catches up via NAK/replay.
@@ -21,12 +21,12 @@ Every task's requirements implicitly include all of these (M1–M3 plan constrai
 - **Commit is NOT persisted** (decision, resolving the M3 carry): Raft-standard — commit re-derives after restart from quorum reports/gossip; persisting it buys nothing for safety and risks staleness lies. The within-run-monotonic / cross-run-re-derived contract is documented on the counter (already, M3) and in the M5 sketch.
 - **Terms become mutable:** `current_term` is an `Arc<AtomicU32>` written ONLY by the consensus agent (on transitions), read by data-path agents for stamping and checking. Data path accepts ONLY the exact current term; datagrams racing ahead of a local term transition are dropped and recovered via NAK (documented, bounded by election settle time). The M3 implausibility guard becomes term-scoped exactly this way: within the current term, `> own append ⇒ corrupt` still holds for the leader.
 - **Buffer prefill on restart is explicitly CUT from M4** (spec §10 sizes it M4/M6 — we take M6): after restart or truncation, counters prime to the recovery point and positions below it read as `Overrun` → journal replay (the M2 Task-1 guard makes this safe). Documented, not silent.
-- **`uc2_sim` is deterministic**: virtual time, seeded xorshift faults (delay/drop/dup/reorder), injected crashes/restarts (persisted state survives: vote, term map, journal-durable; volatile resets: append collapses to durable, commit to 0). No `Instant`, no threads, no I/O anywhere in `uc2_sim` or `uc2_consensus`.
+- **`uc_sim` is deterministic**: virtual time, seeded xorshift faults (delay/drop/dup/reorder), injected crashes/restarts (persisted state survives: vote, term map, journal-durable; volatile resets: append collapses to durable, commit to 0). No `Instant`, no threads, no I/O anywhere in `uc_sim` or `uc_consensus`.
 - Wire layouts in `uc_protocol::v2` stay core-only; kinds 7/8 promoted (RequestVote/Vote), kind 9 added (TermMap); `FRAME_TYPE_NEW_TERM = 3` added to the frame layer. All pinned with literal-byte tests (the M2 Task-2 standard).
-- `Durability::Consistent`; 4 MiB test segments; test data small; gate runs journal on ext4 `/home/claude`, never `/tmp`; deadline-bounded waits everywhere; SPDX headers; `cargo clippy --workspace -- -D warnings` AND `cargo clippy -p uc2_net -p uc2_consensus -p uc2_sim -p uc2_node --all-targets -- -D warnings` clean after every task. Toolchain gotcha: clippy denies `manual_is_multiple_of` and `int_plus_one` — rewrite equivalently and report the deviation.
+- `Durability::Consistent`; 4 MiB test segments; test data small; gate runs journal on ext4 `/home/claude`, never `/tmp`; deadline-bounded waits everywhere; SPDX headers; `cargo clippy --workspace -- -D warnings` AND `cargo clippy -p uc_net -p uc_consensus -p uc_sim -p uc_node --all-targets -- -D warnings` clean after every task. Toolchain gotcha: clippy denies `manual_is_multiple_of` and `int_plus_one` — rewrite equivalently and report the deviation.
 - Implementers stage ONLY their own task's files.
 
-**Non-goals (M4):** membership changes/learners (M6 — static voting set); snapshots/purge (M6); the SDK/apply path and cnc mmap (M5 — `uc2_node` here is the minimal agent-composition seed only: no discovery dir, no instance.lock, no client attach); leader leases / linearizable reads (M5/v2.x); wire auth (v2.0 posture); full WGL lincheck (M5 — it needs apply; M4's partition/failover assertions are commit-safety-level).
+**Non-goals (M4):** membership changes/learners (M6 — static voting set); snapshots/purge (M6); the SDK/apply path and cnc mmap (M5 — `uc_node` here is the minimal agent-composition seed only: no discovery dir, no instance.lock, no client attach); leader leases / linearizable reads (M5/v2.x); wire auth (v2.0 posture); full WGL lincheck (M5 — it needs apply; M4's partition/failover assertions are commit-safety-level).
 
 ---
 
@@ -258,16 +258,16 @@ git commit -m "feat(uc_protocol): v2 RequestVote/Vote/TermMap frames + NewTerm f
 
 ---
 
-### Task 2: `uc2_log` — persisted node state (vote + term map) and `Archive::truncate_to`
+### Task 2: `uc_log` — persisted node state (vote + term map) and `Archive::truncate_to`
 
 **Files:**
-- Create: `uc2_log/src/state.rs`
-- Modify: `uc2_log/src/lib.rs` (add `pub mod state;`)
-- Modify: `uc2_log/Cargo.toml` (add `serde = { workspace = true, features = ["derive"] }` — check the workspace dep name/features in the root Cargo.toml and mirror how ultima_journal declares it)
-- Modify: `uc2_log/src/archive.rs` (`truncate_to`)
+- Create: `uc_log/src/state.rs`
+- Modify: `uc_log/src/lib.rs` (add `pub mod state;`)
+- Modify: `uc_log/Cargo.toml` (add `serde = { workspace = true, features = ["derive"] }` — check the workspace dep name/features in the root Cargo.toml and mirror how uc_journal declares it)
+- Modify: `uc_log/src/archive.rs` (`truncate_to`)
 
 **Interfaces:**
-- Consumes: `ultima_journal::{StableValue, StableValueConfig, Journal::truncate_after, Notifier}`.
+- Consumes: `uc_journal::{StableValue, StableValueConfig, Journal::truncate_after, Notifier}`.
 - Produces (used by Tasks 3–9):
   - `state::VoteRecord { pub term: u32, pub voted_for: u32 }` (serde derive; `voted_for` = NodeId raw).
   - `state::TermMapEntry { pub term: u32, pub base: u64 }` and `state::TermMap = Vec<TermMapEntry>` (type alias).
@@ -276,7 +276,7 @@ git commit -m "feat(uc_protocol): v2 RequestVote/Vote/TermMap frames + NewTerm f
 
 - [ ] **Step 1: Write the failing tests (state)**
 
-`uc2_log/src/state.rs` tests:
+`uc_log/src/state.rs` tests:
 
 ```rust
 #[cfg(test)]
@@ -334,7 +334,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use ultima_journal::{StableValue, StableValueConfig, StableValueError};
+use uc_journal::{StableValue, StableValueConfig, StableValueError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteRecord {
@@ -393,11 +393,11 @@ impl NodeState {
 }
 ```
 
-NOTE for the implementer: check what error type `Notifier::wait()` returns and how it converts into `StableValueError` — if there is no `From` impl, wrap it in the closest existing `StableValueError` variant (read the enum in `ultima_journal/src/error.rs`) and report what you chose. The durable-on-return property is the requirement; the exact error plumbing is yours.
+NOTE for the implementer: check what error type `Notifier::wait()` returns and how it converts into `StableValueError` — if there is no `From` impl, wrap it in the closest existing `StableValueError` variant (read the enum in `uc_journal/src/error.rs`) and report what you chose. The durable-on-return property is the requirement; the exact error plumbing is yours.
 
 - [ ] **Step 3: Write the failing tests (truncate_to)**
 
-Append to `uc2_log/src/archive.rs` tests (the `setup`/`test_cfg` helpers exist):
+Append to `uc_log/src/archive.rs` tests (the `setup`/`test_cfg` helpers exist):
 
 ```rust
     #[test]
@@ -462,7 +462,7 @@ Append to `uc2_log/src/archive.rs` tests (the `setup`/`test_cfg` helpers exist):
 
 - [ ] **Step 4: Implement `truncate_to`**
 
-In `uc2_log/src/archive.rs`, a new method on `Archive` (below `do_work`) plus one error variant:
+In `uc_log/src/archive.rs`, a new method on `Archive` (below `do_work`) plus one error variant:
 
 ```rust
     /// Truncate the archived stream to end exactly at `pos` (spec §4,
@@ -509,7 +509,7 @@ In `uc2_log/src/archive.rs`, a new method on `Archive` (below `do_work`) plus on
             if lo == 0 {
                 // truncate_after keeps >= one block; drop-and-reappend via
                 // the truncation fence at seq 0 is expressed as keep_seq = 0
-                // AFTER rewriting: read ultima_journal's truncate_after
+                // AFTER rewriting: read uc_journal's truncate_after
                 // contract — it keeps seq 0. So: truncate to keep block 0,
                 // then we cannot shrink it in place; instead truncate to
                 // keep nothing before it is impossible — handle by
@@ -534,7 +534,7 @@ In `uc2_log/src/archive.rs`, a new method on `Archive` (below `do_work`) plus on
     }
 ```
 
-**IMPLEMENTER NOTE — resolve before writing code (the plan flags this honestly rather than guessing):** the `lo == 0` partial-block branch above is written defensively because `truncate_after(keep_seq)` cannot express "remove every block". Read `ultima_journal/src/journal/mod.rs::truncate_after` and determine the real contract: (a) if `truncate_after(0)` keeps seq 0 and a subsequent `append(0, ...)` at an existing seq is rejected (NonMonotonicSeq), the partial-`lo==0` case needs `truncate_after` semantics that support re-appending at `keep_seq`… check whether appending at `keep_seq + 1`-style is the only legal continuation. If partial truncation of block 0 is genuinely inexpressible, make `truncate_to` return a clear error for that case and document it: in practice it is unreachable in M4 — reconciliation truncation points are term-map bases or beyond, and term 1's base is position 0 = block 0's start, which takes the `base == pos` (whole-block) path or is a no-op; a PARTIAL cut inside block 0 requires a divergence within the very first block of the whole cluster history while a competing committed prefix exists, which the sim can be used to confirm never happens. Whatever you determine, encode it as a test (either the working path or the documented error) and state the resolution in your report. Add the error variant if needed:
+**IMPLEMENTER NOTE — resolve before writing code (the plan flags this honestly rather than guessing):** the `lo == 0` partial-block branch above is written defensively because `truncate_after(keep_seq)` cannot express "remove every block". Read `uc_journal/src/journal/mod.rs::truncate_after` and determine the real contract: (a) if `truncate_after(0)` keeps seq 0 and a subsequent `append(0, ...)` at an existing seq is rejected (NonMonotonicSeq), the partial-`lo==0` case needs `truncate_after` semantics that support re-appending at `keep_seq`… check whether appending at `keep_seq + 1`-style is the only legal continuation. If partial truncation of block 0 is genuinely inexpressible, make `truncate_to` return a clear error for that case and document it: in practice it is unreachable in M4 — reconciliation truncation points are term-map bases or beyond, and term 1's base is position 0 = block 0's start, which takes the `base == pos` (whole-block) path or is a no-op; a PARTIAL cut inside block 0 requires a divergence within the very first block of the whole cluster history while a competing committed prefix exists, which the sim can be used to confirm never happens. Whatever you determine, encode it as a test (either the working path or the documented error) and state the resolution in your report. Add the error variant if needed:
 
 ```rust
     #[error("cannot truncate to {pos}: partial cut inside the first archived block")]
@@ -543,26 +543,26 @@ In `uc2_log/src/archive.rs`, a new method on `Archive` (below `do_work`) plus on
 
 - [ ] **Step 5: Run everything**
 
-Run: `cargo test -p uc2_log && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_log && cargo clippy --workspace -- -D warnings`
 Expected: all green (2 state + 2 truncate tests new).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add uc2_log/src/state.rs uc2_log/src/lib.rs uc2_log/Cargo.toml Cargo.lock uc2_log/src/archive.rs
-git commit -m "feat(uc2_log): persisted vote/term-map NodeState + Archive::truncate_to"
+git add uc_log/src/state.rs uc_log/src/lib.rs uc_log/Cargo.toml Cargo.lock uc_log/src/archive.rs
+git commit -m "feat(uc_log): persisted vote/term-map NodeState + Archive::truncate_to"
 ```
 
 ---
 
-### Task 3: `uc2_consensus` — the election SM core (roles, votes, timeouts)
+### Task 3: `uc_consensus` — the election SM core (roles, votes, timeouts)
 
 The heart of M4. Pure, sync, deterministic: events in, actions out, time injected. The SM never does I/O — the persist-before-answer contract is encoded in action semantics the agent must honor.
 
 **Files:**
-- Create: `uc2_consensus/src/election.rs`
-- Modify: `uc2_consensus/src/lib.rs` (add `pub mod election;`)
-- Modify: `uc2_consensus/src/commit.rs` (add `CommitTracker::reset_reports(&mut self)` — clears per-follower reports on term transitions; commit itself stays monotonic)
+- Create: `uc_consensus/src/election.rs`
+- Modify: `uc_consensus/src/lib.rs` (add `pub mod election;`)
+- Modify: `uc_consensus/src/commit.rs` (add `CommitTracker::reset_reports(&mut self)` — clears per-follower reports on term transitions; commit itself stays monotonic)
 
 **Interfaces:**
 - Consumes: `crate::commit::CommitTracker`.
@@ -658,7 +658,7 @@ Semantics (the tests below pin each):
 
 - [ ] **Step 1: Write the failing tests**
 
-Tests at the bottom of `uc2_consensus/src/election.rs` (a driver helper keeps them readable):
+Tests at the bottom of `uc_consensus/src/election.rs` (a driver helper keeps them readable):
 
 ```rust
 #[cfg(test)]
@@ -824,14 +824,14 @@ mod tests {
 
 - [ ] **Step 2: Run — expect compile failure**
 
-Run: `cargo test -p uc2_consensus election`
+Run: `cargo test -p uc_consensus election`
 Expected: FAIL — module/types not defined.
 
 - [ ] **Step 3: Implement the SM**
 
-Write `uc2_consensus/src/election.rs` implementing exactly the interface + semantics above. Structure guidance (the implementer owns the internals; these invariants are binding):
+Write `uc_consensus/src/election.rs` implementing exactly the interface + semantics above. Structure guidance (the implementer owns the internals; these invariants are binding):
 
-- State: `cfg`, `role`, `current_term`, `voted_for: Option<(u32 term, NodeId)>`, `term_map: Vec<(u32, u64)>`, `durable`, `commit_seen`, `last_leader_activity_ns`, `timeout_deadline_ns` (re-randomized on every arming via the crate-local xorshift — copy the 10-line XorShift64 from `uc2_net/src/fault.rs` into this crate as a private helper; `uc2_consensus` stays dep-free), `votes_received: Vec<NodeId>` (candidate), `tracker: CommitTracker` (leader), `new_term_pos: Option<u64>`, `serving: bool`.
+- State: `cfg`, `role`, `current_term`, `voted_for: Option<(u32 term, NodeId)>`, `term_map: Vec<(u32, u64)>`, `durable`, `commit_seen`, `last_leader_activity_ns`, `timeout_deadline_ns` (re-randomized on every arming via the crate-local xorshift — copy the 10-line XorShift64 from `uc_net/src/fault.rs` into this crate as a private helper; `uc_consensus` stays dep-free), `votes_received: Vec<NodeId>` (candidate), `tracker: CommitTracker` (leader), `new_term_pos: Option<u64>`, `serving: bool`.
 - EVERY event first passes the term filter: `event_term > current_term` → adopt (update term, clear candidate state, `BecomeFollower`) then process; `event_term < current_term` → drop (RequestVote → rejection). `Tick`/`DurableAdvanced`/`NewTermAppended` carry no term.
 - `reset_reports` on `BecomeLeader` (fresh tracker slots; commit stays monotonic across the transition — a new leader's commit starts at its recovered `commit_seen`, never regresses within the run).
 - Leader ranking on `Tick` AND on `Report` (cheap); `AdvanceCommit` + `GossipCommit` only on advance. `can_serve` flips when `commit ≥ new_term_pos`.
@@ -854,24 +854,24 @@ with a test asserting reports clear but `commit()` is unchanged.
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p uc2_consensus && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_consensus && cargo clippy --workspace -- -D warnings`
 Expected: all green (8 election tests + 9 commit tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_consensus/src/election.rs uc2_consensus/src/lib.rs uc2_consensus/src/commit.rs
-git commit -m "feat(uc2_consensus): election SM — roles, persisted-vote rule, NewTerm serving gate"
+git add uc_consensus/src/election.rs uc_consensus/src/lib.rs uc_consensus/src/commit.rs
+git commit -m "feat(uc_consensus): election SM — roles, persisted-vote rule, NewTerm serving gate"
 ```
 
 ---
 
-### Task 4: `uc2_consensus` — reconciliation (term-map compare → truncation)
+### Task 4: `uc_consensus` — reconciliation (term-map compare → truncation)
 
 **Files:**
-- Create: `uc2_consensus/src/reconcile.rs`
-- Modify: `uc2_consensus/src/election.rs` (wire the events/actions)
-- Modify: `uc2_consensus/src/lib.rs` (add `pub mod reconcile;`)
+- Create: `uc_consensus/src/reconcile.rs`
+- Modify: `uc_consensus/src/election.rs` (wire the events/actions)
+- Modify: `uc_consensus/src/lib.rs` (add `pub mod reconcile;`)
 
 **Interfaces:**
 - Consumes: Task 3's `ElectionSm`.
@@ -914,7 +914,7 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
 
 - [ ] **Step 1: Write the failing tests (pure function first)**
 
-`uc2_consensus/src/reconcile.rs` tests:
+`uc_consensus/src/reconcile.rs` tests:
 
 ```rust
 #[cfg(test)]
@@ -1060,29 +1060,29 @@ Append to `election.rs` tests:
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p uc2_consensus && cargo clippy --workspace -- -D warnings`
+Run: `cargo test -p uc_consensus && cargo clippy --workspace -- -D warnings`
 Expected: all green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_consensus/src/reconcile.rs uc2_consensus/src/election.rs uc2_consensus/src/lib.rs
-git commit -m "feat(uc2_consensus): reconciliation — term-map compare, truncation actions, adoption"
+git add uc_consensus/src/reconcile.rs uc_consensus/src/election.rs uc_consensus/src/lib.rs
+git commit -m "feat(uc_consensus): reconciliation — term-map compare, truncation actions, adoption"
 ```
 
 ---
 
-### Task 5: `uc2_sim` — the deterministic simulation (spec §8 L1)
+### Task 5: `uc_sim` — the deterministic simulation (spec §8 L1)
 
 Exists and is green BEFORE any networked election. One thread, virtual time, seeded faults, injected crashes; invariants after every step.
 
 **Files:**
-- Create: `uc2_sim/Cargo.toml` (dep: `uc2_consensus = { path = "../uc2_consensus" }` only)
-- Create: `uc2_sim/src/lib.rs`
-- Create: `uc2_sim/src/world.rs` (the simulator)
-- Create: `uc2_sim/src/invariants.rs`
-- Create: `uc2_sim/tests/scenarios.rs`
-- Modify: root `Cargo.toml` (members += `"uc2_sim"`)
+- Create: `uc_sim/Cargo.toml` (dep: `uc_consensus = { path = "../uc_consensus" }` only)
+- Create: `uc_sim/src/lib.rs`
+- Create: `uc_sim/src/world.rs` (the simulator)
+- Create: `uc_sim/src/invariants.rs`
+- Create: `uc_sim/tests/scenarios.rs`
+- Modify: root `Cargo.toml` (members += `"uc_sim"`)
 
 **Interfaces:**
 - Consumes: `ElectionSm`/`Event`/`Action`/`reconcile` (Tasks 3–4).
@@ -1109,7 +1109,7 @@ Exists and is green BEFORE any networked election. One thread, virtual time, see
 
 - [ ] **Step 1: Scaffold + write the scripted-scenario tests first**
 
-`uc2_sim/tests/scenarios.rs`:
+`uc_sim/tests/scenarios.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1118,7 +1118,7 @@ Exists and is green BEFORE any networked election. One thread, virtual time, see
 //! Scripted nasties (spec §8): each drives the world to a specific dangerous
 //! configuration and asserts the invariants held + the expected outcome.
 
-use uc2_sim::world::{SimConfig, World};
+use uc_sim::world::{SimConfig, World};
 
 fn base_cfg(seed: u64) -> SimConfig {
     SimConfig { n_nodes: 3, seed, max_steps: 30_000, ..SimConfig::default() }
@@ -1224,24 +1224,24 @@ The `Stats` struct: `{ leaders_elected: u32, max_commit: u64, truncations: u32, 
 
 - [ ] **Step 3: Run**
 
-Run: `cargo test -p uc2_sim && cargo clippy --workspace -- -D warnings`
-Expected: all 6 tests green in seconds (virtual time — if fuzz_default takes >60s something is accidentally quadratic; fix before committing). Then run the heavy tier once locally: `cargo test -p uc2_sim --features sim-heavy --release` — must be green; report its wall time.
+Run: `cargo test -p uc_sim && cargo clippy --workspace -- -D warnings`
+Expected: all 6 tests green in seconds (virtual time — if fuzz_default takes >60s something is accidentally quadratic; fix before committing). Then run the heavy tier once locally: `cargo test -p uc_sim --features sim-heavy --release` — must be green; report its wall time.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock uc2_sim/
-git commit -m "feat(uc2_sim): deterministic election simulation — invariants, scripted nasties, seeded fuzz"
+git add Cargo.toml Cargo.lock uc_sim/
+git commit -m "feat(uc_sim): deterministic election simulation — invariants, scripted nasties, seeded fuzz"
 ```
 
 ---
 
-### Task 6: `uc2_net` — replay sessions off the Overrun seam (the M2 envelope closes)
+### Task 6: `uc_net` — replay sessions off the Overrun seam (the M2 envelope closes)
 
 **Files:**
-- Modify: `uc2_log/src/archive.rs` (journal handle exposure + `find_block` extraction)
-- Modify: `uc2_net/src/sender.rs` (journal-replay fallback in `serve_nak`)
-- Modify: `uc2_net/tests/replication.rs` + `uc2_net/tests/common/mod.rs` (the companion test)
+- Modify: `uc_log/src/archive.rs` (journal handle exposure + `find_block` extraction)
+- Modify: `uc_net/src/sender.rs` (journal-replay fallback in `serve_nak`)
+- Modify: `uc_net/tests/replication.rs` + `uc_net/tests/common/mod.rs` (the companion test)
 
 **Interfaces:**
 - Consumes: `Journal` (`Arc`-shared; verify `Journal: Send + Sync` with a compile-time assert — it is `&self` throughout with internal locking), `read_run_validated`'s wire discipline (padding header-only, run never crosses block boundary needs).
@@ -1254,31 +1254,31 @@ git commit -m "feat(uc2_sim): deterministic election simulation — invariants, 
 
 - [ ] **Step 1: Unit test the chunker + the fallback**
 
-Append to `uc2_net/src/sender.rs` tests:
+Append to `uc_net/src/sender.rs` tests:
 
 ```rust
     #[test]
     fn journal_replay_serves_deep_nak_with_identical_wire_format() {
         // leader with a TINY buffer (4096) laps it 3x while archiving; a NAK
         // for lap-0 positions must be served from the journal
-        let counters = Arc::new(uc2_log::counters::LogCounters::new());
+        let counters = Arc::new(uc_log::counters::LogCounters::new());
         let b = Arc::new(LogBuffer::new(
-            uc2_log::region::Region::heap_zeroed(4096),
+            uc_log::region::Region::heap_zeroed(4096),
             counters,
             256,
         ));
         let dir = tempfile::tempdir().unwrap();
-        let cfg = uc2_log::archive::ArchiveConfig {
+        let cfg = uc_log::archive::ArchiveConfig {
             segment_size_bytes: 4 * 1024 * 1024,
-            ..uc2_log::archive::ArchiveConfig::new(dir.path())
+            ..uc_log::archive::ArchiveConfig::new(dir.path())
         };
-        let mut arch = uc2_log::archive::Archive::open(cfg).unwrap();
+        let mut arch = uc_log::archive::Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 9);
         let mut n = 0u64;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {
                 Ok(_) => n += 1,
-                Err(uc2_log::buffer::AppendError::WouldOverrun) => {
+                Err(uc_log::buffer::AppendError::WouldOverrun) => {
                     arch.do_work(&b).unwrap();
                 }
                 Err(e) => panic!("{e}"),
@@ -1318,7 +1318,7 @@ Append to `uc2_net/src/sender.rs` tests:
     }
 ```
 
-- [ ] **Step 2: The M2-envelope companion test** (extend `uc2_net/tests/replication.rs`; `spawn_leader` in common/mod.rs gains the `set_replay_source` call — one line, using the archive it already constructs; NOTE: `spawn_archive` currently constructs the Archive inside the closure — restructure it minimally so the `Arc<Journal>` is extracted before the agent spawn):
+- [ ] **Step 2: The M2-envelope companion test** (extend `uc_net/tests/replication.rs`; `spawn_leader` in common/mod.rs gains the `set_replay_source` call — one line, using the archive it already constructs; NOTE: `spawn_archive` currently constructs the Archive inside the closure — restructure it minimally so the `Arc<Journal>` is extracted before the agent spawn):
 
 ```rust
 #[test]
@@ -1356,32 +1356,32 @@ fn paused_follower_recovers_via_replay_sessions() {
 
 (`spawn_follower_on` = the existing `spawn_follower` body taking a pre-bound socket — extract it in common/mod.rs; `spawn_follower` becomes a two-line wrapper.)
 
-- [ ] **Step 3: Implement** (archive handle + find_block extraction + chunker + the serve_nak fallback + the stat). Run `cargo test -p uc2_log` FIRST after the archive refactor — the replay tests pin `find_block`'s extraction is behavior-identical.
+- [ ] **Step 3: Implement** (archive handle + find_block extraction + chunker + the serve_nak fallback + the stat). Run `cargo test -p uc_log` FIRST after the archive refactor — the replay tests pin `find_block`'s extraction is behavior-identical.
 
 - [ ] **Step 4: Run everything**
 
-Run: `cargo test -p uc2_log && cargo test -p uc2_net && cargo test -p uc2_net --test replication && cargo test -p uc2_net --test commit && cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_net --all-targets -- -D warnings`
+Run: `cargo test -p uc_log && cargo test -p uc_net && cargo test -p uc_net --test replication && cargo test -p uc_net --test commit && cargo clippy --workspace -- -D warnings && cargo clippy -p uc_net --all-targets -- -D warnings`
 Expected: all green; the new integration test runs in seconds (replay of ~3 MiB at 8-datagrams-per-NAK with 2ms backoff ≈ ~40 NAK rounds — if it takes >60s, raise REPLAY_DGRAMS_PER_NAK's per-call bound or shrink the stream; deadline-bounded either way).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_log/src/archive.rs uc2_net/src/sender.rs uc2_net/tests/replication.rs uc2_net/tests/common/mod.rs
-git commit -m "feat(uc2_net): replay sessions — deep NAKs served from the journal (M2 envelope closed)"
+git add uc_log/src/archive.rs uc_net/src/sender.rs uc_net/tests/replication.rs uc_net/tests/common/mod.rs
+git commit -m "feat(uc_net): replay sessions — deep NAKs served from the journal (M2 envelope closed)"
 ```
 
 ---
 
-### Task 7: `uc2_net` — mutable terms, consensus routing, partitionable faults
+### Task 7: `uc_net` — mutable terms, consensus routing, partitionable faults
 
 **Files:**
-- Modify: `uc2_net/src/sender.rs`, `uc2_net/src/receiver.rs`, `uc2_net/src/fault.rs`
-- Modify: `uc2_net/tests/common/mod.rs`, `uc2_net/tests/replication.rs`, `uc2_net/tests/commit.rs`, `uc2_net/examples/m2_gate.rs`, `uc2_net/examples/m3_gate.rs` (term-handle ripple)
+- Modify: `uc_net/src/sender.rs`, `uc_net/src/receiver.rs`, `uc_net/src/fault.rs`
+- Modify: `uc_net/tests/common/mod.rs`, `uc_net/tests/replication.rs`, `uc_net/tests/commit.rs`, `uc_net/examples/m2_gate.rs`, `uc_net/examples/m3_gate.rs` (term-handle ripple)
 
 **Interfaces:**
 - Consumes: Task 1 wire frames.
 - Produces (used by Tasks 8–9):
-  - `pub type TermHandle = Arc<AtomicU32>;` (in `uc2_net/src/lib.rs`). `SenderConfig.term_id: u32` → `Sender::new` takes an extra `term: TermHandle` parameter (config stays Copy; the handle is a constructor arg). `FollowerConfig` likewise: `term_id` field REMOVED, `FollowerReceiver::new` gains `term: TermHandle`. `LeaderReceiver::new`'s `term_id: u32` → `TermHandle`. The consensus agent (Task 8) is the only WRITER of the handle; data-path agents load Relaxed per datagram/duty-cycle. Ripple: every call site constructs `Arc::new(AtomicU32::new(TERM))` — mechanical, ~12 sites.
+  - `pub type TermHandle = Arc<AtomicU32>;` (in `uc_net/src/lib.rs`). `SenderConfig.term_id: u32` → `Sender::new` takes an extra `term: TermHandle` parameter (config stays Copy; the handle is a constructor arg). `FollowerConfig` likewise: `term_id` field REMOVED, `FollowerReceiver::new` gains `term: TermHandle`. `LeaderReceiver::new`'s `term_id: u32` → `TermHandle`. The consensus agent (Task 8) is the only WRITER of the handle; data-path agents load Relaxed per datagram/duty-cycle. Ripple: every call site constructs `Arc::new(AtomicU32::new(TERM))` — mechanical, ~12 sites.
   - **Consensus routing** on `FollowerReceiver`: new optional channel `set_consensus_route(&mut self, tx: mpsc::SyncSender<NetEvent>)` where
 
 ```rust
@@ -1405,28 +1405,28 @@ pub enum NetEvent {
 
 - [ ] **Step 2: Implement + ripple the ~12 call sites.** The M3 stale-term semantics in node mode move into the SM; the receiver's `dropped_stale_term` stat in node mode counts only DATA/HEARTBEAT drops.
 
-- [ ] **Step 3: Run everything** (all uc2_net suites + both example builds + both clippy gates). Expected: green with only constructor-line changes in the pre-existing tests.
+- [ ] **Step 3: Run everything** (all uc_net suites + both example builds + both clippy gates). Expected: green with only constructor-line changes in the pre-existing tests.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add uc2_net/src/ uc2_net/tests/ uc2_net/examples/
-git commit -m "feat(uc2_net): mutable term handles, consensus routing, partitionable fault layer"
+git add uc_net/src/ uc_net/tests/ uc_net/examples/
+git commit -m "feat(uc_net): mutable term handles, consensus routing, partitionable fault layer"
 ```
 
 ---
 
-### Task 8: `uc2_node` — minimal node composition + the consensus agent
+### Task 8: `uc_node` — minimal node composition + the consensus agent
 
 The seed of spec §3.2's composition crate: agent wiring and role switching ONLY (no discovery dir, no instance.lock, no cnc, no client IPC — M5). The consensus agent is the single writer of the term handle AND the commit counter, executes every SM action honoring the persistence contracts, and owns the appender when leader.
 
 **Files:**
-- Create: `uc2_node/Cargo.toml` (deps: uc2_log, uc2_net, uc2_consensus, uc_protocol, ultima-journal workspace)
-- Create: `uc2_node/src/lib.rs`
-- Create: `uc2_node/src/node.rs`
-- Modify: root `Cargo.toml` (members += `"uc2_node"`)
-- Modify: `uc2_net/src/sender.rs` (`set_role_flag(Arc<AtomicBool>)` — heartbeats + streaming gated on leader role; `set_node_mode()` from Task 7)
-- Modify: `uc2_net/src/receiver.rs` (`set_intake_pause(Arc<AtomicBool>)` — DATA dropped while paused, for the truncation window)
+- Create: `uc_node/Cargo.toml` (deps: uc_log, uc_net, uc_consensus, uc_protocol, uc_journal workspace)
+- Create: `uc_node/src/lib.rs`
+- Create: `uc_node/src/node.rs`
+- Modify: root `Cargo.toml` (members += `"uc_node"`)
+- Modify: `uc_net/src/sender.rs` (`set_role_flag(Arc<AtomicBool>)` — heartbeats + streaming gated on leader role; `set_node_mode()` from Task 7)
+- Modify: `uc_net/src/receiver.rs` (`set_intake_pause(Arc<AtomicBool>)` — DATA dropped while paused, for the truncation window)
 
 **Interfaces:**
 - Consumes: everything above.
@@ -1487,14 +1487,14 @@ impl Node {
 
 **Wiring notes (binding):** one `UdpSocket` per node: receiver gets the raw recv clone; sender and consensus each wrap a clone in `FaultSocket` (same `FaultConfig`). Receiver: consensus route + sender route + term handle + intake-pause set. Sender: node mode + role flag + replay source (`archive.journal_arc()` — grab it before the archive moves into its agent). Archive agent: `do_work` + drain the command channel each cycle. Agent idles: `Yield` in tests/harness (`BusySpin` is m4_gate's knob).
 
-- [ ] **Step 1: Sender/receiver gates first (small, test in uc2_net)** — `set_role_flag`: a sender with the flag false streams nothing and sends no heartbeats even with appended data + elapsed interval (unit test); flag flipped true → streams. `set_intake_pause`: paused receiver drops DATA (stat `dropped_paused`), control still routes (unit test). Commit.
+- [ ] **Step 1: Sender/receiver gates first (small, test in uc_net)** — `set_role_flag`: a sender with the flag false streams nothing and sends no heartbeats even with appended data + elapsed interval (unit test); flag flipped true → streams. `set_intake_pause`: paused receiver drops DATA (stat `dropped_paused`), control still routes (unit test). Commit.
 
 ```bash
-git add uc2_net/src/sender.rs uc2_net/src/receiver.rs
-git commit -m "feat(uc2_net): role-flag gating + intake pause for node composition"
+git add uc_net/src/sender.rs uc_net/src/receiver.rs
+git commit -m "feat(uc_net): role-flag gating + intake pause for node composition"
 ```
 
-- [ ] **Step 2: Write `uc2_node` with a smoke test** — `uc2_node/tests/smoke.rs`: start ONE node with `members = [(0, self)]` (cluster of 1: quorum 1 — CommitTracker::new(0, 1), needed=0 → commit = own durable): it must elect itself (timeout → candidate → instant majority-of-1), open the term, commit the NewTerm frame, `can_serve` within a deadline; `submit` then drives commit forward. This pins the whole action-execution loop without any networking peers.
+- [ ] **Step 2: Write `uc_node` with a smoke test** — `uc_node/tests/smoke.rs`: start ONE node with `members = [(0, self)]` (cluster of 1: quorum 1 — CommitTracker::new(0, 1), needed=0 → commit = own durable): it must elect itself (timeout → candidate → instant majority-of-1), open the term, commit the NewTerm frame, `can_serve` within a deadline; `submit` then drives commit forward. This pins the whole action-execution loop without any networking peers.
 
 ```rust
 #[test]
@@ -1551,14 +1551,14 @@ fn single_node_cluster_elects_itself_and_serves() {
 
 - [ ] **Step 4: Run**
 
-Run: `cargo test -p uc2_node && cargo test -p uc2_net && cargo clippy --workspace -- -D warnings && cargo clippy -p uc2_node --all-targets -- -D warnings`
+Run: `cargo test -p uc_node && cargo test -p uc_net && cargo clippy --workspace -- -D warnings && cargo clippy -p uc_node --all-targets -- -D warnings`
 Expected: smoke green in <15 s; everything else untouched-green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock uc2_node/
-git commit -m "feat(uc2_node): minimal composition — consensus agent, role switching, action contracts"
+git add Cargo.toml Cargo.lock uc_node/
+git commit -m "feat(uc_node): minimal composition — consensus agent, role switching, action contracts"
 ```
 
 ---
@@ -1566,10 +1566,10 @@ git commit -m "feat(uc2_node): minimal composition — consensus agent, role swi
 ### Task 9: the failover/partition harness — networked elections proven
 
 **Files:**
-- Create: `uc2_node/tests/failover.rs`
+- Create: `uc_node/tests/failover.rs`
 
 **Interfaces:**
-- Consumes: `Node` (Task 8), `PartitionHandle` (Task 7), journal replay comparison (reuse the pattern from uc2_net's harness — a local `replayed(dir)` helper reading `Archive::open` + `replay_from(0)`; NewTerm frames are included in replay output and MUST match across nodes like any frame).
+- Consumes: `Node` (Task 8), `PartitionHandle` (Task 7), journal replay comparison (reuse the pattern from uc_net's harness — a local `replayed(dir)` helper reading `Archive::open` + `replay_from(0)`; NewTerm frames are included in replay output and MUST match across nodes like any frame).
 - Produces: the M4 networked gate evidence: single-leader boot, sub-second failover, minority-partition safety, heal-with-truncation, restart-rejoin.
 
 - [ ] **Step 1: Write the harness + five tests** (full file; helpers: `spawn_cluster(n, dir) -> Vec<NodeHandleWrapper>` binding all sockets first, per-node tempdir subdirs, seeds derived from index; `await_single_leader(&nodes) -> usize` deadline-bounded asserting EXACTLY one `can_serve` leader and returning it; `submit_n(leader, n)`; `await_commit_all(&nodes, target)`; `replay_equal(dirs)` — replayed frame streams identical INCLUDING NewTerm frames):
@@ -1624,15 +1624,15 @@ fn restarted_follower_recovers_state_and_rejoins() {
 
 Write each body fully in the implementation (the comments above are the specification of each; every wait deadline-bounded 30–60 s; journal data small — 1000 × 96 B per phase; election timeouts 150–300 ms as configured; the failover assert budget is <1 s MEASURED, spec §9).
 
-- [ ] **Step 2: Run** — `cargo test -p uc2_node --test failover` TWICE, plus once with `--test-threads=1` (the five tests each run a 3-node cluster: ~12 busy threads under default parallelism on 4 cores — if parallel runs flake on timing, keep tests parallel-safe but document that the harness is core-hungry; do NOT weaken deadlines below the 1 s failover budget).
+- [ ] **Step 2: Run** — `cargo test -p uc_node --test failover` TWICE, plus once with `--test-threads=1` (the five tests each run a 3-node cluster: ~12 busy threads under default parallelism on 4 cores — if parallel runs flake on timing, keep tests parallel-safe but document that the harness is core-hungry; do NOT weaken deadlines below the 1 s failover budget).
 
-- [ ] **Step 3: Full workspace gates** (every crate's tests + both clippy invocations + `cargo test -p uc2_sim`).
+- [ ] **Step 3: Full workspace gates** (every crate's tests + both clippy invocations + `cargo test -p uc_sim`).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add uc2_node/tests/failover.rs
-git commit -m "test(uc2_node): networked election harness — boot/failover/partition/heal/restart"
+git add uc_node/tests/failover.rs
+git commit -m "test(uc_node): networked election harness — boot/failover/partition/heal/restart"
 ```
 
 ---
@@ -1640,7 +1640,7 @@ git commit -m "test(uc2_node): networked election harness — boot/failover/part
 ### Task 10: `m4_gate` — failover measurement + benchmark doc
 
 **Files:**
-- Create: `uc2_node/examples/m4_gate.rs`
+- Create: `uc_node/examples/m4_gate.rs`
 - Create: `docs/benchmarks/uc2-m4-gate-2026-07-11.md`
 
 **Interfaces:**
@@ -1649,15 +1649,15 @@ git commit -m "test(uc2_node): networked election harness — boot/failover/part
 
 - [ ] **Step 1: Write the example** — `m4_gate <journal_root> [iterations=10]`: boots a 3-node local cluster (journals under `<journal_root>/n{0,1,2}`, ext4 — `/home/claude`, never `/tmp`), then loops `iterations` times: await leader + serving → drive load for 2 s (submit batches, admission-paced vs commit at 1 MiB) → record commit position → `crash()` the leader → measure (a) time-to-new-`can_serve`, (b) time-to-first-commit-advance past the pre-kill position → assert nothing committed was lost (survivor commit ≥ recorded) → restart the killed node from its dirs (it rejoins) → next iteration. Prints per-iteration lines + a summary: failover p50/p90/max for both metrics, truncations observed, terms consumed. Verdict line: `GATE (sub-second failover, no committed loss): PASS/FAIL` (PASS = every iteration's time-to-serve < 1 s and zero loss). Full code in the plan-executor's hands — mirror m3_gate's structure (arg parsing, deadline asserts, cleanup note); ~250 lines.
 
-- [ ] **Step 2: Run the gate** — `cargo run -p uc2_node --release --example m4_gate -- /home/claude/uc2-m4-gate 10`; capture verbatim; `rm -rf /home/claude/uc2-m4-gate` after; df baseline check. Also run `cargo test -p uc2_sim --features sim-heavy --release` and capture its summary + wall time. Loopback failover at 150–300 ms timeouts should land ~200–400 ms p50 — a PASS is plausible on this box (unlike M2/M3's throughput bars); report honestly either way. Correctness signals that must hold: zero committed loss across all iterations, exactly-one-leader throughout, truncations only on deposed leaders.
+- [ ] **Step 2: Run the gate** — `cargo run -p uc_node --release --example m4_gate -- /home/claude/uc2-m4-gate 10`; capture verbatim; `rm -rf /home/claude/uc2-m4-gate` after; df baseline check. Also run `cargo test -p uc_sim --features sim-heavy --release` and capture its summary + wall time. Loopback failover at 150–300 ms timeouts should land ~200–400 ms p50 — a PASS is plausible on this box (unlike M2/M3's throughput bars); report honestly either way. Correctness signals that must hold: zero committed loss across all iterations, exactly-one-leader throughout, truncations only on deposed leaders.
 
 - [ ] **Step 3: Write the doc** — `docs/benchmarks/uc2-m4-gate-2026-07-11.md`: banner (loopback measurement; the spec's "sub-second LAN failover" gets its fleet confirmation on 3×c6id later — loopback is REPRESENTATIVE here because failover time is timeout-dominated, not wire-dominated — state this reasoning); what the gate measures (kill → re-election → NewTerm commit → serving); the sim evidence (default + heavy seed counts, wall time); verbatim outputs; the M4-carry items that remain open (buffer prefill cut to M6; NoCommonPrefix fallback = M6 snapshot install; commit-not-persisted contract for M5); fleet placeholder.
 
 - [ ] **Step 4: Full gates + commit**
 
 ```bash
-git add uc2_node/examples/m4_gate.rs docs/benchmarks/uc2-m4-gate-2026-07-11.md
-git commit -m "feat(uc2_node): m4_gate failover measurement + sim evidence doc"
+git add uc_node/examples/m4_gate.rs docs/benchmarks/uc2-m4-gate-2026-07-11.md
+git commit -m "feat(uc_node): m4_gate failover measurement + sim evidence doc"
 ```
 
 ---
@@ -1668,5 +1668,5 @@ git commit -m "feat(uc2_node): m4_gate failover measurement + sim evidence doc"
 2. **Every M3-carry dispatched:** term mutability (T7 TermHandle), commit-writer handoff DISSOLVED (consensus thread owns the counter both roles — T7/T8), replay sessions + the overruns-expected companion test — note the framing improved: the counter stays 0 because the seam is SERVED; `replay_datagrams > 0` is the proof (T6), CommitTracker→SM with stable NodeIds (T3; the addr→id map lives at the demux edge in T8), vote kinds 7–8 (T1/T7), implausibility-guard term-scoping (T7 note: within-term the M3 guard stands; cross-term reports reach the SM which term-filters), commit persistence DECIDED (not persisted; Global Constraints) with the M5 restart contract restated, NakBody/StatusBody DRY re-adjudicated (still moot — three body shapes now).
 3. **Known honest gaps, stated not hidden:** `truncate_to`'s partial-block-0 case is flagged as an implementer-resolved contract (Task 2 note) — unreachable in M4 per the reconciliation analysis, must be encoded as either working code or a tested error; `NoCommonPrefix` → `Fatal` until M6's snapshot install; buffer prefill cut to M6; legacy (M3-mode) paths in sender/receiver retained for the old gates and deleted in M5.
 4. **Type consistency pass:** `NodeId = u32` everywhere (`VoteRecord.voted_for: u32` matches); `TermMapEntry {term: u32, base: u64}` (state) vs `TermMapEntryWire` (wire) vs `(u32, u64)` tuples (SM) — three shapes by design (serde / core-only / dep-free), converted at the T8 edges; `Reconcile::Ok(Outcome)` shape is the Task-4 Step-1 CONTRACT (the Interfaces sketch is explicitly superseded by the test — called out inline); `Event`/`Action` names consistent across T3/T4/T5/T8.
-5. **Sequencing honesty:** T5 (sim) lands BEFORE T8/T9 (networked elections) — the spec's ordering requirement is the task order. T6/T7 are independent of T3–T5 (could interleave) but the plan orders them after so the sim exists before any uc2_net election plumbing is written.
+5. **Sequencing honesty:** T5 (sim) lands BEFORE T8/T9 (networked elections) — the spec's ordering requirement is the task order. T6/T7 are independent of T3–T5 (could interleave) but the plan orders them after so the sim exists before any uc_net election plumbing is written.
 6. **Placeholder scan:** Task 9's test bodies are specified by binding comments with a full-code requirement on the implementer, and Task 10's example is spec'd to m3_gate's established structure — these are deliberate implementer-latitude points at the integration edge (same posture as M2's harness task), each with explicit acceptance criteria; everything algorithmic (SM, reconcile, sim, chunker, truncate) has complete code or a complete contract-by-test in the plan.

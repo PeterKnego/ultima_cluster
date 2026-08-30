@@ -20,8 +20,8 @@ absorbed copy. A voter could therefore grant while judging the candidate against
 a self-view LOWER than the value it had already reported for commit ranking,
 letting a candidate behind a committed position win and collapse below it. That
 is an acked-write loss, and it is real: reproduced deterministically in
-`uc2_node`'s `a_vote_is_refused_against_a_fresh_read_of_our_own_log` and in
-`uc2_sim`'s `stale_vote_credential_opens_a_term_below_a_committed_position`.
+`uc_node`'s `a_vote_is_refused_against_a_fresh_read_of_our_own_log` and in
+`uc_sim`'s `stale_vote_credential_opens_a_term_below_a_committed_position`.
 
 This file pins both halves of that, so the corpus records the distinction
 whether or not the full `PNode` split (issue #7's Lean half) has landed:
@@ -111,7 +111,7 @@ example :
   refine ⟨by decide, by decide, by decide, by decide⟩
 
 /-- What the fix bought, stated directly: re-reading the counter before the grant
-decision (`refresh_durable` in `uc2_node`, called from `feed_net`'s
+decision (`refresh_durable` in `uc_node`, called from `feed_net`'s
 `NetEvent::RequestVote` arm) makes the SAME scenario refuse the vote. -/
 example : logOk 2 1000 2 900 = false := by decide
 

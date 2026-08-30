@@ -4,7 +4,7 @@
 
 **Goal:** An in-process elle consistency tier for UC v2: five list-append passes (quiet/failover/partition/purge/reconfig) over `LinClusterV2` adjudicated by the vendored elle-cli under `serializable` + strict real-time models, plus mutation testing proving three injected consensus bugs are caught.
 
-**Architecture:** A new `ListAppendSm` + pure EDN recorder live in `uc-lincheck`; the driver is an `#[ignore]`d test target `uc2_node/tests/elle_v2.rs` sharing the existing `lincheck_v2` harness (genericized over the SM); shell scripts port ultima_db's checker/mutation machinery (`../ultima_db/scripts/elle_check.sh`, `elle_mutation.sh`, `tools/elle-cli/`); mutation knobs are `#[cfg(feature = "mutation-testing")]` fields in `uc2_consensus`/`uc2_node` driven by a `UC2_MUTATION` env read once in `uc2_node`.
+**Architecture:** A new `ListAppendSm` + pure EDN recorder live in `uc_lincheck`; the driver is an `#[ignore]`d test target `uc_node/tests/elle_v2.rs` sharing the existing `lincheck_v2` harness (genericized over the SM); shell scripts port ultima_db's checker/mutation machinery (`../ultima_db/scripts/elle_check.sh`, `elle_mutation.sh`, `tools/elle-cli/`); mutation knobs are `#[cfg(feature = "mutation-testing")]` fields in `uc_consensus`/`uc_node` driven by a `UC2_MUTATION` env read once in `uc_node`.
 
 **Tech Stack:** Rust (workspace conventions), elle-cli 0.1.9 standalone jar (Java/Temurin 21 + `jq` at check time only), bash scripts, GitHub Actions.
 
@@ -16,8 +16,8 @@
 
 - `cargo clippy --workspace --all-targets -- -D warnings` must stay clean after every task.
 - `cargo test` (default suite) must stay green after every task; the four lincheck capstones (`lin_v2`, `lin_partition_v2`) are the regression oracle for any `lincheck_v2/mod.rs` change.
-- The WGL checker/history/model in `uc-lincheck` (`checker.rs`, `history.rs`, `model.rs`) are **untouched**.
-- No new dependencies in `uc-lincheck` (it has `uc2_service` + `serde` + `bincode` only); the EDN module is std-only.
+- The WGL checker/history/model in `uc_lincheck` (`checker.rs`, `history.rs`, `model.rs`) are **untouched**.
+- No new dependencies in `uc_lincheck` (it has `uc_service` + `serde` + `bincode` only); the EDN module is std-only.
 - `mutation-testing` features are **off in every default build**; feature-on + `UC2_MUTATION` unset must be byte-for-byte normal behavior.
 - elle-cli's exit code is untrusted — always parse the stdout verdict; `unknown` is always a hard FAIL.
 - Instance-dir tempdirs go under `CARGO_TARGET_TMPDIR` (ext4), never `/tmp` (tmpfs quota); EDN histories go under `ELLE_DIR` (default `/tmp/uc2-elle` — small text files, tmpfs is fine).
@@ -26,19 +26,19 @@
 
 ---
 
-### Task 1: `ListAppendSm` in `uc-lincheck`
+### Task 1: `ListAppendSm` in `uc_lincheck`
 
 **Files:**
-- Create: `uc-lincheck/src/list_append.rs`
-- Modify: `uc-lincheck/src/lib.rs` (add `pub mod list_append;`)
+- Create: `uc_lincheck/src/list_append.rs`
+- Modify: `uc_lincheck/src/lib.rs` (add `pub mod list_append;`)
 
 **Interfaces:**
-- Consumes: `uc2_service::{StateMachine, SnapshotStateMachine, SnapshotError}` (existing traits; see `uc-lincheck/src/register.rs` for the shape to mirror).
+- Consumes: `uc_service::{StateMachine, SnapshotStateMachine, SnapshotError}` (existing traits; see `uc_lincheck/src/register.rs` for the shape to mirror).
 - Produces: `uc_lincheck::list_append::{LaCmd, LaResp, LaRead, ListAppendSm}` with `ListAppendSm: StateMachine<Command = LaCmd, Response = LaResp, Query = LaRead, QueryResponse = Vec<u64>> + SnapshotStateMachine + Default`. Task 5's driver and Task 4's generic harness rely on exactly these bounds.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc-lincheck/src/list_append.rs` with the tests first (module body only — the types come in Step 3):
+Create `uc_lincheck/src/list_append.rs` with the tests first (module body only — the types come in Step 3):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -55,7 +55,7 @@ Create `uc-lincheck/src/list_append.rs` with the tests first (module body only �
 #[cfg(all(test, feature = "v2"))]
 mod v2_tests {
     use super::{LaCmd, LaRead, LaResp, ListAppendSm};
-    use uc2_service::StateMachine;
+    use uc_service::StateMachine;
 
     #[test]
     fn apply_query_roundtrip_via_v2_trait() {
@@ -74,7 +74,7 @@ mod v2_tests {
 
     #[test]
     fn snapshot_roundtrip_via_v2_capability() {
-        use uc2_service::SnapshotStateMachine;
+        use uc_service::SnapshotStateMachine;
 
         let mut sm = ListAppendSm::default();
         sm.apply(4096, LaCmd::Append { key: 1, val: 42 });
@@ -94,11 +94,11 @@ mod v2_tests {
 }
 ```
 
-Add `pub mod list_append;` to `uc-lincheck/src/lib.rs` (below `pub mod register;`).
+Add `pub mod list_append;` to `uc_lincheck/src/lib.rs` (below `pub mod register;`).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc-lincheck 2>&1 | tail -5`
+Run: `cargo test -p uc_lincheck 2>&1 | tail -5`
 Expected: compile error — `LaCmd`/`ListAppendSm` not defined.
 
 - [ ] **Step 3: Write the implementation**
@@ -132,7 +132,7 @@ pub struct ListAppendSm {
 }
 
 #[cfg(feature = "v2")]
-impl uc2_service::StateMachine for ListAppendSm {
+impl uc_service::StateMachine for ListAppendSm {
     type Command = LaCmd;
     type Response = LaResp;
     type Query = LaRead;
@@ -157,22 +157,22 @@ impl uc2_service::StateMachine for ListAppendSm {
 // asserts the payload's recorded position matches the artifact tag — same
 // belt-and-suspenders as `RegisterSm`.
 #[cfg(feature = "v2")]
-impl uc2_service::SnapshotStateMachine for ListAppendSm {
+impl uc_service::SnapshotStateMachine for ListAppendSm {
     type SnapshotHandle = Vec<u8>;
 
-    fn freeze(&self) -> Result<(Vec<u8>, u64), uc2_service::SnapshotError> {
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc_service::SnapshotError> {
         let buf = bincode::serde::encode_to_vec(
             (&self.lists, self.last_applied),
             bincode::config::standard(),
         )
-        .map_err(|e| uc2_service::SnapshotError::Codec(e.to_string()))?;
+        .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
         Ok((buf, self.last_applied.unwrap_or(0)))
     }
 
     fn stream_snapshot(
         handle: Vec<u8>,
         dst: &mut dyn std::io::Write,
-    ) -> Result<(), uc2_service::SnapshotError> {
+    ) -> Result<(), uc_service::SnapshotError> {
         std::io::Write::write_all(dst, &handle)?;
         Ok(())
     }
@@ -181,16 +181,16 @@ impl uc2_service::SnapshotStateMachine for ListAppendSm {
         &mut self,
         position: u64,
         src: &mut dyn std::io::Read,
-    ) -> Result<u64, uc2_service::SnapshotError> {
+    ) -> Result<u64, uc_service::SnapshotError> {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(src, &mut buf)?;
         let ((lists, la), _) = bincode::serde::decode_from_slice::<
             (BTreeMap<u32, Vec<u64>>, Option<u64>),
             _,
         >(&buf, bincode::config::standard())
-        .map_err(|e| uc2_service::SnapshotError::Codec(e.to_string()))?;
+        .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
         if la.unwrap_or(0) != position {
-            return Err(uc2_service::SnapshotError::Codec(format!(
+            return Err(uc_service::SnapshotError::Codec(format!(
                 "snapshot payload position {} != requested {position}",
                 la.unwrap_or(0)
             )));
@@ -206,24 +206,24 @@ If `RegisterSm`'s `freeze` uses a different bincode call shape than shown, copy 
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc-lincheck 2>&1 | tail -5`
+Run: `cargo test -p uc_lincheck 2>&1 | tail -5`
 Expected: PASS (including the two new `list_append::v2_tests`).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc-lincheck --all-targets -- -D warnings
-git add uc-lincheck/src/list_append.rs uc-lincheck/src/lib.rs
-git commit -m "feat(uc-lincheck): ListAppendSm for the elle harness (elle T1)"
+cargo clippy -p uc_lincheck --all-targets -- -D warnings
+git add uc_lincheck/src/list_append.rs uc_lincheck/src/lib.rs
+git commit -m "feat(uc_lincheck): ListAppendSm for the elle harness (elle T1)"
 ```
 
 ---
 
-### Task 2: EDN history recorder in `uc-lincheck`
+### Task 2: EDN history recorder in `uc_lincheck`
 
 **Files:**
-- Create: `uc-lincheck/src/edn.rs`
-- Modify: `uc-lincheck/src/lib.rs` (add `pub mod edn;`)
+- Create: `uc_lincheck/src/edn.rs`
+- Modify: `uc_lincheck/src/lib.rs` (add `pub mod edn;`)
 
 **Interfaces:**
 - Consumes: std only.
@@ -235,7 +235,7 @@ git commit -m "feat(uc-lincheck): ListAppendSm for the elle harness (elle T1)"
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `uc-lincheck/src/edn.rs` with tests first. The line format is byte-for-byte the ultima_db `elle-history` encoding (fixture-compatible with the vendored elle-cli):
+Create `uc_lincheck/src/edn.rs` with tests first. The line format is byte-for-byte the ultima_db `elle-history` encoding (fixture-compatible with the vendored elle-cli):
 
 ```rust
 #[cfg(test)]
@@ -296,11 +296,11 @@ mod tests {
 }
 ```
 
-Add `pub mod edn;` to `uc-lincheck/src/lib.rs`.
+Add `pub mod edn;` to `uc_lincheck/src/lib.rs`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc-lincheck 2>&1 | tail -5`
+Run: `cargo test -p uc_lincheck 2>&1 | tail -5`
 Expected: compile error — `EdnOp` not defined.
 
 - [ ] **Step 3: Write the implementation**
@@ -432,15 +432,15 @@ impl EdnRecorder {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc-lincheck 2>&1 | tail -5`
+Run: `cargo test -p uc_lincheck 2>&1 | tail -5`
 Expected: PASS (three new `edn::tests`).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc-lincheck --all-targets -- -D warnings
-git add uc-lincheck/src/edn.rs uc-lincheck/src/lib.rs
-git commit -m "feat(uc-lincheck): elle EDN history recorder (elle T2)"
+cargo clippy -p uc_lincheck --all-targets -- -D warnings
+git add uc_lincheck/src/edn.rs uc_lincheck/src/lib.rs
+git commit -m "feat(uc_lincheck): elle EDN history recorder (elle T2)"
 ```
 
 ---
@@ -518,7 +518,7 @@ git commit -m "chore(tools): vendor elle-cli + fixtures for the elle harness (el
 ### Task 4: Genericize the `lincheck_v2` harness over the SM
 
 **Files:**
-- Modify: `uc2_node/tests/lincheck_v2/mod.rs`
+- Modify: `uc_node/tests/lincheck_v2/mod.rs`
 
 **Interfaces:**
 - Consumes: `uc_lincheck::list_append::ListAppendSm` bounds from Task 1 (only via the trait bound — this file never names `ListAppendSm`).
@@ -533,16 +533,16 @@ Behavior must be byte-for-byte identical for the existing capstones — this tas
 
 - [ ] **Step 1: Genericize the service spawn and slot/cluster structs**
 
-In `uc2_node/tests/lincheck_v2/mod.rs`:
+In `uc_node/tests/lincheck_v2/mod.rs`:
 
-1. Extend the `uc2_service` import with `SnapshotStateMachine` (it already imports `ServiceBuilder, ServiceConfig, SnapshotPolicy`).
+1. Extend the `uc_service` import with `SnapshotStateMachine` (it already imports `ServiceBuilder, ServiceConfig, SnapshotPolicy`).
 2. `spawn_service` (line ~175) becomes generic — replace `RegisterSm` with the type parameter:
 
 ```rust
 fn spawn_service<SM: SnapshotStateMachine + Default>(
     dir: &Path,
     snapshot_interval_bytes: u64,
-) -> uc2_service::Service<SM> {
+) -> uc_service::Service<SM> {
     if snapshot_interval_bytes == 0 {
         ServiceBuilder::new(ServiceConfig::new(dir, APP), SM::default())
             .start()
@@ -557,7 +557,7 @@ fn spawn_service<SM: SnapshotStateMachine + Default>(
 }
 ```
 
-3. `NodeSlot` (line ~196) → `pub struct NodeSlot<SM: SnapshotStateMachine + Default>` with `service: Option<uc2_service::Service<SM>>`; its `impl` block becomes `impl<SM: SnapshotStateMachine + Default> NodeSlot<SM>`.
+3. `NodeSlot` (line ~196) → `pub struct NodeSlot<SM: SnapshotStateMachine + Default>` with `service: Option<uc_service::Service<SM>>`; its `impl` block becomes `impl<SM: SnapshotStateMachine + Default> NodeSlot<SM>`.
 4. `LinClusterV2` (line ~235) → `pub struct LinClusterV2<SM: SnapshotStateMachine + Default = RegisterSm>` with `nodes: Vec<NodeSlot<SM>>` and `spare: Option<NodeSlot<SM>>`.
 5. The main `impl LinClusterV2` block → `impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM>`; every internal `spawn_service(...)` call now infers `SM`. Where `Self`/`LinClusterV2` appears in return types (`start`, `start_cfg`) it stays `Self`.
 6. **Move `read_from` (line ~593) into its own non-generic impl block** — it is register-typed (`query_linearizable::<(), Option<u64>>`, `RegResp`):
@@ -618,14 +618,14 @@ pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
 
 - [ ] **Step 3: Compile everything that uses the harness**
 
-Run: `cargo test -p uc2_node --no-run 2>&1 | tail -5`
+Run: `cargo test -p uc_node --no-run 2>&1 | tail -5`
 Expected: clean compile of `lin_v2`, `lin_partition_v2`, and every other test target. Chase any remaining `RegisterSm`-hardcoding the compiler flags (e.g. `lin_partition_v2.rs` naming `LinClusterV2` bare — the default type param keeps it compiling unchanged).
 
 - [ ] **Step 4: Regression — smoke + one full capstone**
 
 ```bash
-cargo test -p uc2_node --release --test lin_v2 smoke_3node_write_then_read -- --nocapture
-cargo test -p uc2_node --release --test lin_v2 linearizable_under_failover_v2 -- --nocapture
+cargo test -p uc_node --release --test lin_v2 smoke_3node_write_then_read -- --nocapture
+cargo test -p uc_node --release --test lin_v2 linearizable_under_failover_v2 -- --nocapture
 ```
 Expected: both PASS (`Linearizable`, liveness ≥ 80%). This is the proof the refactor changed nothing behaviorally.
 
@@ -633,8 +633,8 @@ Expected: both PASS (`Linearizable`, liveness ≥ 80%). This is the proof the re
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_node/tests/lincheck_v2/mod.rs
-git commit -m "refactor(uc2_node): genericize lincheck_v2 harness over the SM (elle T4)"
+git add uc_node/tests/lincheck_v2/mod.rs
+git commit -m "refactor(uc_node): genericize lincheck_v2 harness over the SM (elle T4)"
 ```
 
 ---
@@ -642,7 +642,7 @@ git commit -m "refactor(uc2_node): genericize lincheck_v2 harness over the SM (e
 ### Task 5: elle driver — env knobs, worker, `run_pass`, quiet pass
 
 **Files:**
-- Create: `uc2_node/tests/elle_v2.rs`
+- Create: `uc_node/tests/elle_v2.rs`
 
 **Interfaces:**
 - Consumes: Task 1 (`ListAppendSm` types), Task 2 (`EdnRecorder`), Task 4 (generic harness + routing helpers).
@@ -650,7 +650,7 @@ git commit -m "refactor(uc2_node): genericize lincheck_v2 harness over the SM (e
 
 - [ ] **Step 1: Write the driver**
 
-Create `uc2_node/tests/elle_v2.rs`:
+Create `uc_node/tests/elle_v2.rs`:
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -664,7 +664,7 @@ Create `uc2_node/tests/elle_v2.rs`:
 //! anomaly set must be empty). Never in the default `cargo test`:
 //!
 //! ```bash
-//! cargo test -p uc2_node --release --test elle_v2 -- --ignored --exact elle_quiet
+//! cargo test -p uc_node --release --test elle_v2 -- --ignored --exact elle_quiet
 //! ```
 //!
 //! Elle semantics (vs the WGL harness): `:fail` = guaranteed-not-committed
@@ -688,7 +688,7 @@ use lincheck_v2::{
     ClusterCfg, LinClusterV2, ReadOutcome, SubmitOutcome, WorkerConn, read_leader, serialize,
     submit_cmd,
 };
-use uc2_net::fault::FaultConfig;
+use uc_net::fault::FaultConfig;
 use uc_lincheck::edn::{EdnOp, EdnRecorder, EdnType};
 use uc_lincheck::list_append::{LaCmd, LaRead, LaResp, ListAppendSm};
 
@@ -866,12 +866,12 @@ fn elle_quiet() {
 
 - [ ] **Step 2: Compile**
 
-Run: `cargo test -p uc2_node --release --test elle_v2 --no-run 2>&1 | tail -3`
+Run: `cargo test -p uc_node --release --test elle_v2 --no-run 2>&1 | tail -3`
 Expected: clean compile. (Nothing runs in default `cargo test` — the test is ignored.)
 
 - [ ] **Step 3: Run the quiet pass**
 
-Run: `cargo test -p uc2_node --release --test elle_v2 -- --ignored --exact elle_quiet --nocapture`
+Run: `cargo test -p uc_node --release --test elle_v2 -- --ignored --exact elle_quiet --nocapture`
 Expected: PASS in well under the budget; the `[elle quiet]` line reports ≥ 50k ok ops; `/tmp/uc2-elle/quiet/history.edn` exists with ~2× that many lines.
 
 - [ ] **Step 4: Hand-check the history with elle-cli**
@@ -888,8 +888,8 @@ Expected: `... true` for both. If `unknown`: halve `ELLE_TARGET_OPS`, rerun, and
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_node/tests/elle_v2.rs
-git commit -m "feat(uc2_node): elle driver + quiet pass (elle T5)"
+git add uc_node/tests/elle_v2.rs
+git commit -m "feat(uc_node): elle driver + quiet pass (elle T5)"
 ```
 
 ---
@@ -973,7 +973,7 @@ for pass in "${PASSES[@]}"; do
     if [ ! -f "$hist" ]; then
         echo "== generating $pass history (elle_v2 driver) =="
         # shellcheck disable=SC2086
-        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" cargo test -p uc2_node --release $CARGO_FEATURES \
+        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" cargo test -p uc_node --release $CARGO_FEATURES \
             --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     fi
     echo "== $pass: $(wc -l < "$hist") events =="
@@ -1006,7 +1006,7 @@ git commit -m "feat(scripts): elle_check.sh — fixtures self-test + pass adjudi
 ### Task 7: Faulted passes — `failover` and `partition`
 
 **Files:**
-- Modify: `uc2_node/tests/elle_v2.rs` (append two tests)
+- Modify: `uc_node/tests/elle_v2.rs` (append two tests)
 
 **Interfaces:**
 - Consumes: Task 5's `run_pass`; `LinClusterV2` nemesis methods `kill_and_restart_leader`, `crash_and_restart_leader_service`, `partition_leader`, `partition_minority`, `heal`, `await_reconverged` (all existing, all pub).
@@ -1086,8 +1086,8 @@ Expected: both generated and `OK: ... clean` under both models. If a pass trips 
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_node/tests/elle_v2.rs
-git commit -m "feat(uc2_node): elle failover + partition passes (elle T7)"
+git add uc_node/tests/elle_v2.rs
+git commit -m "feat(uc_node): elle failover + partition passes (elle T7)"
 ```
 
 ---
@@ -1095,7 +1095,7 @@ git commit -m "feat(uc2_node): elle failover + partition passes (elle T7)"
 ### Task 8: Faulted passes — `purge` and `reconfig`
 
 **Files:**
-- Modify: `uc2_node/tests/elle_v2.rs` (append two tests)
+- Modify: `uc_node/tests/elle_v2.rs` (append two tests)
 
 **Interfaces:**
 - Consumes: `run_pass`; `ClusterCfg { purge, journal_segment_bytes, snapshot_interval_bytes, spare_node }`; nemesis methods `crash_and_restart_random_follower_service(rng)`, `random_config_op(rng)`, `spare_is_voting()`, `max_archive_first_base()`, field `config_ops_accepted`.
@@ -1114,7 +1114,7 @@ Append to `elle_v2.rs` (fault mixes copied from the corresponding `lin_v2.rs` ca
 #[ignore]
 fn elle_purge() {
     let ccfg = ClusterCfg {
-        purge: uc2_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        purge: uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
         snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
@@ -1186,38 +1186,38 @@ Expected: `elle consistency check passed (quiet failover partition purge reconfi
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add uc2_node/tests/elle_v2.rs
-git commit -m "feat(uc2_node): elle purge + reconfig passes — clean tier complete (elle T8)"
+git add uc_node/tests/elle_v2.rs
+git commit -m "feat(uc_node): elle purge + reconfig passes — clean tier complete (elle T8)"
 ```
 
 ---
 
-### Task 9: Mutation knobs in `uc2_consensus`
+### Task 9: Mutation knobs in `uc_consensus`
 
 **Files:**
-- Modify: `uc2_consensus/Cargo.toml` (add feature)
-- Modify: `uc2_consensus/src/commit.rs`
-- Modify: `uc2_consensus/src/election.rs`
+- Modify: `uc_consensus/Cargo.toml` (add feature)
+- Modify: `uc_consensus/src/commit.rs`
+- Modify: `uc_consensus/src/election.rs`
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces (Task 10 wiring relies on): feature `mutation-testing`; `CommitTracker::force_quorum_minus_one(&mut self)`; `ElectionSm::set_mutate_quorum_minus_one(&mut self, on: bool)`; `ElectionSm::set_mutate_skip_vote_order(&mut self, on: bool)` — all `#[cfg(feature = "mutation-testing")]`. `uc2_consensus` stays env-free (pure-sync posture): knobs are plain fields, set by the caller.
+- Produces (Task 10 wiring relies on): feature `mutation-testing`; `CommitTracker::force_quorum_minus_one(&mut self)`; `ElectionSm::set_mutate_quorum_minus_one(&mut self, on: bool)`; `ElectionSm::set_mutate_skip_vote_order(&mut self, on: bool)` — all `#[cfg(feature = "mutation-testing")]`. `uc_consensus` stays env-free (pure-sync posture): knobs are plain fields, set by the caller.
 
 - [ ] **Step 1: Add the feature**
 
-In `uc2_consensus/Cargo.toml`:
+In `uc_consensus/Cargo.toml`:
 
 ```toml
 [features]
 # Fault injection for the elle mutation-testing tier (scripts/elle_mutation.sh).
-# NEVER on by default; knob fields are plain bools set by uc2_node's wiring —
+# NEVER on by default; knob fields are plain bools set by uc_node's wiring —
 # this crate stays env-free (pure-sync, no I/O).
 mutation-testing = []
 ```
 
 - [ ] **Step 2: Write the failing knob tests**
 
-In `uc2_consensus/src/commit.rs` tests module, add:
+In `uc_consensus/src/commit.rs` tests module, add:
 
 ```rust
 /// Mutation tooth (elle harness): forcing quorum-1 makes a 3-node tracker
@@ -1233,7 +1233,7 @@ fn forced_quorum_minus_one_commits_without_any_report() {
 }
 ```
 
-In `uc2_consensus/src/election.rs` tests module, locate the existing test that asserts a vote is REFUSED for a candidate with a lexicographically smaller `(last_term, last_durable)` (search the tests for `log_ok` / a `RequestVote` with a lower `last_durable` asserting no grant — the constructors at lines ~1503/1967 show the arrange shape: `ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0)` is a node with durable 6000). Mirror its arrange exactly and add:
+In `uc_consensus/src/election.rs` tests module, locate the existing test that asserts a vote is REFUSED for a candidate with a lexicographically smaller `(last_term, last_durable)` (search the tests for `log_ok` / a `RequestVote` with a lower `last_durable` asserting no grant — the constructors at lines ~1503/1967 show the arrange shape: `ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0)` is a node with durable 6000). Mirror its arrange exactly and add:
 
 ```rust
 /// Mutation tooth (elle harness): with the vote-order check skipped, a
@@ -1265,7 +1265,7 @@ fn skip_vote_order_grants_stale_candidate() {
 
 - [ ] **Step 3: Run to verify they fail**
 
-Run: `cargo test -p uc2_consensus --features mutation-testing 2>&1 | tail -5`
+Run: `cargo test -p uc_consensus --features mutation-testing 2>&1 | tail -5`
 Expected: compile error — `force_quorum_minus_one` / `set_mutate_skip_vote_order` not defined.
 
 - [ ] **Step 4: Implement the knobs**
@@ -1341,8 +1341,8 @@ fn log_ok(&self, last_term: u32, last_durable: u64) -> bool {
 - [ ] **Step 5: Run tests both ways**
 
 ```bash
-cargo test -p uc2_consensus --features mutation-testing 2>&1 | tail -3
-cargo test -p uc2_consensus 2>&1 | tail -3
+cargo test -p uc_consensus --features mutation-testing 2>&1 | tail -3
+cargo test -p uc_consensus 2>&1 | tail -3
 ```
 Expected: PASS both. The feature-off run proves the default build is untouched (knob code compiles out); the feature-on run proves inertness of unset knobs (all pre-existing tests still pass) plus the two new teeth.
 
@@ -1350,20 +1350,20 @@ Expected: PASS both. The feature-off run proves the default build is untouched (
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p uc2_consensus --all-targets --features mutation-testing -- -D warnings
-git add uc2_consensus
-git commit -m "feat(uc2_consensus): mutation-testing knobs — commit quorum-1 + vote-order skip (elle T9)"
+cargo clippy -p uc_consensus --all-targets --features mutation-testing -- -D warnings
+git add uc_consensus
+git commit -m "feat(uc_consensus): mutation-testing knobs — commit quorum-1 + vote-order skip (elle T9)"
 ```
 
 ---
 
-### Task 10: `uc2_node` mutation module, wiring, and the read-barrier skip
+### Task 10: `uc_node` mutation module, wiring, and the read-barrier skip
 
 **Files:**
-- Create: `uc2_node/src/mutation.rs`
-- Modify: `uc2_node/Cargo.toml` (forwarding feature)
-- Modify: `uc2_node/src/lib.rs` (cfg-gated `mod mutation;`)
-- Modify: `uc2_node/src/node.rs` (wiring at the two `ElectionSm::new` sites + the PendingRead phase skip)
+- Create: `uc_node/src/mutation.rs`
+- Modify: `uc_node/Cargo.toml` (forwarding feature)
+- Modify: `uc_node/src/lib.rs` (cfg-gated `mod mutation;`)
+- Modify: `uc_node/src/node.rs` (wiring at the two `ElectionSm::new` sites + the PendingRead phase skip)
 
 **Interfaces:**
 - Consumes: Task 9's setters.
@@ -1371,18 +1371,18 @@ git commit -m "feat(uc2_consensus): mutation-testing knobs — commit quorum-1 +
 
 - [ ] **Step 1: Feature forwarding**
 
-`uc2_node/Cargo.toml`:
+`uc_node/Cargo.toml`:
 
 ```toml
 [features]
 # Fault injection for the elle mutation-testing tier. Off in every normal
 # build; even when compiled in, inert unless UC2_MUTATION is set.
-mutation-testing = ["uc2_consensus/mutation-testing"]
+mutation-testing = ["uc_consensus/mutation-testing"]
 ```
 
 - [ ] **Step 2: Write the module with failing parse tests**
 
-Create `uc2_node/src/mutation.rs` (port of ultima_db's `src/mutation.rs` pattern):
+Create `uc_node/src/mutation.rs` (port of ultima_db's `src/mutation.rs` pattern):
 
 ```rust
 // SPDX-License-Identifier: Apache-2.0
@@ -1444,19 +1444,19 @@ mod tests {
 }
 ```
 
-In `uc2_node/src/lib.rs`, next to the other module declarations:
+In `uc_node/src/lib.rs`, next to the other module declarations:
 
 ```rust
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 ```
 
-Run: `cargo test -p uc2_node --features mutation-testing --lib mutation 2>&1 | tail -3`
+Run: `cargo test -p uc_node --features mutation-testing --lib mutation 2>&1 | tail -3`
 Expected: the two parse tests PASS (they're self-contained; "failing first" here is the compile step).
 
 - [ ] **Step 3: Wire the consensus knobs**
 
-In `uc2_node/src/node.rs`, immediately after **each** of the two `ElectionSm::new(...)` call sites (lines ~477 and ~3219 — boot and whatever the second construction context is; read the surrounding code first), insert (adjusting the binding name to the site's, e.g. `sm`):
+In `uc_node/src/node.rs`, immediately after **each** of the two `ElectionSm::new(...)` call sites (lines ~477 and ~3219 — boot and whatever the second construction context is; read the surrounding code first), insert (adjusting the binding name to the site's, e.g. `sm`):
 
 ```rust
 #[cfg(feature = "mutation-testing")]
@@ -1471,7 +1471,7 @@ match crate::mutation::active() {
 
 - [ ] **Step 4: Wire the read-barrier skip**
 
-In `uc2_node/src/node.rs`, find the production `PendingRead` construction (search `phase: ReadPhase::AwaitQuorum` — take the non-`#[cfg(test)]` site, in the linearizable-read admission path near the "ReadIndex barrier" comment at line ~1263). Immediately after the `PendingRead` value is built (before it is pushed to `pending_reads`), insert:
+In `uc_node/src/node.rs`, find the production `PendingRead` construction (search `phase: ReadPhase::AwaitQuorum` — take the non-`#[cfg(test)]` site, in the linearizable-read admission path near the "ReadIndex barrier" comment at line ~1263). Immediately after the `PendingRead` value is built (before it is pushed to `pending_reads`), insert:
 
 ```rust
 // Mutation tooth: skip the READ_PROBE quorum barrier entirely — the read is
@@ -1489,8 +1489,8 @@ if matches!(crate::mutation::active(), Some(crate::mutation::Mutation::SkipReadB
 - [ ] **Step 5: Verify inertness two ways**
 
 ```bash
-cargo test -p uc2_node 2>&1 | tail -3                                  # feature off: untouched
-cargo test -p uc2_node --features mutation-testing 2>&1 | tail -3      # feature on, env unset: inert
+cargo test -p uc_node 2>&1 | tail -3                                  # feature off: untouched
+cargo test -p uc_node --features mutation-testing 2>&1 | tail -3      # feature on, env unset: inert
 ```
 Expected: both PASS with the same test outcomes (the second run adds only the two `mutation::tests`). `UC2_MUTATION` must not be set in the environment for the second run.
 
@@ -1498,9 +1498,9 @@ Expected: both PASS with the same test outcomes (the second run adds only the tw
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p uc2_node --all-targets --features mutation-testing -- -D warnings
-git add uc2_node
-git commit -m "feat(uc2_node): UC2_MUTATION module + consensus/read-barrier wiring (elle T10)"
+cargo clippy -p uc_node --all-targets --features mutation-testing -- -D warnings
+git add uc_node
+git commit -m "feat(uc_node): UC2_MUTATION module + consensus/read-barrier wiring (elle T10)"
 ```
 
 ---
@@ -1544,7 +1544,7 @@ gen() {
     rm -rf "$MUT_DIR/$sub"
     (cd "$ROOT" && UC2_MUTATION="$mut" ELLE_DIR="$MUT_DIR/$sub" \
         ELLE_TARGET_OPS="$OPS" ELLE_BUDGET_SECS="$BUDGET" \
-        cargo test -p uc2_node --release --features mutation-testing \
+        cargo test -p uc_node --release --features mutation-testing \
         --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     echo "$MUT_DIR/$sub/$pass/history.edn"
 }

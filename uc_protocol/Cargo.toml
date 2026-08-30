@@ -14,7 +14,7 @@ description = "ultima_cluster wire protocol — shared-memory layouts, frames, v
 [lints.rust]
 # `cfg(loom)` is set by hand (RUSTFLAGS="--cfg loom") for tests/loom_mpsc.rs,
 # never by a feature, so check-cfg has to be told about it. Mirrors
-# uc2_log/Cargo.toml.
+# uc_log/Cargo.toml.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]

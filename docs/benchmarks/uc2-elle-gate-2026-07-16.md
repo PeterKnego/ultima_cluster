@@ -19,7 +19,7 @@ real-time/linearizable model). It catches a class of anomaly the register
 capstone cannot phrase: real-time (stale-read) violations that plain
 serializability would legally reorder into the past.
 
-- Workload: singleton list-append transactions (`ListAppendSm` in `uc-lincheck`),
+- Workload: singleton list-append transactions (`ListAppendSm` in `uc_lincheck`),
   append values globally unique from one `AtomicU64`.
 - Checker: vendored `elle-cli-0.1.9-standalone.jar` (EPL-2.0, sha256
   `c9ba9b9fd32640e73d632cb5f15069c162ba6528a67f27a878767187c59f539a`), pinned in
@@ -27,7 +27,7 @@ serializability would legally reorder into the past.
   verdict and treat `unknown` (cycle-search timeout) as a hard FAIL.
 - **Strict model = `strong-serializable`** (the 0.1.9 jar supports it — this
   retired the plan's main open risk at T3).
-- History recorder: `uc-lincheck::edn` (Jepsen EDN; `:info`+process-retire for
+- History recorder: `uc_lincheck::edn` (Jepsen EDN; `:info`+process-retire for
   maybe-committed appends, `:fail` for failed reads).
 - Harness: `LinClusterV2` — real node/service agents, real reliable-UDP on
   loopback, real instance dirs — genericized over the SM.
@@ -58,7 +58,7 @@ at 8000 to keep the 4-vCPU runner clear of `unknown`.
 Three injected consensus bugs behind a `mutation-testing` cargo feature (OFF in
 every default build, inert when the feature is on but `UC2_MUTATION` is unset —
 verified by the CONTROL run). `UC2_MUTATION` is read once via a `OnceLock` in
-`uc2_node`; `uc2_consensus` stays env-free (feature-gated boolean setters only).
+`uc_node`; `uc_consensus` stays env-free (feature-gated boolean setters only).
 
 ### The finding that shaped the design
 
@@ -81,7 +81,7 @@ matched to how UC actually catches each bug**:
 | Mutation | Site | Adversary pass | Oracle | Result |
 | --- | --- | --- | --- | --- |
 | `commit-quorum-minus-one` | `CommitTracker` | `elle_mut_commit_quorum` (leader-isolation split-brain) | elle verdict **INVALID** (serializable AND strict) | `incompatible-order`, `strong-PL-1-cycle-exists` |
-| `skip-read-barrier` | `uc2_node` read path | `elle_mut_read_barrier` (directed 2-process probe) | elle **INVALID under the STRICT model ONLY** (valid under plain serializable) | `G-single-item-realtime` |
+| `skip-read-barrier` | `uc_node` read path | `elle_mut_read_barrier` (directed 2-process probe) | elle **INVALID under the STRICT model ONLY** (valid under plain serializable) | `G-single-item-realtime` |
 | `skip-vote-order-check` | `ElectionSm::log_ok` | `elle_mut_vote_order` (minority-isolate → term climb → heal) | driver run **HARD-FAILS** (exit ≠ 0) | *originally* an `uc2-archive` truncation-below-commit panic (`node.rs:716`); **re-based 2026-08-02 onto an explicit `CommittedTruncationWitness`** — see below |
 
 `skip-read-barrier` is the tooth that **proves the strict model earns its keep**:
@@ -155,8 +155,8 @@ vote-order caught on retry. Exit 0.
 
 ## Feature-off inertness (verified)
 
-- feature-OFF + feature-ON `cargo clippy -p uc2_node --all-targets -- -D warnings`: clean.
-- feature-OFF `uc2_node` lib unit tests: 24/24 (the read-path mutation is
+- feature-OFF + feature-ON `cargo clippy -p uc_node --all-targets -- -D warnings`: clean.
+- feature-OFF `uc_node` lib unit tests: 24/24 (the read-path mutation is
   `#[cfg]`-shadowed → default build byte-identical).
 - workspace `clippy --all-targets` + `cargo test --workspace --no-run`: clean.
 - clean-tier `elle_check.sh` green from a clean build → no feature cross-contamination.

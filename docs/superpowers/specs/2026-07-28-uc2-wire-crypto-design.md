@@ -89,13 +89,13 @@ We differ in four places:
 
 ## 2. Component boundaries
 
-**`uc2_crypto`** — new workspace crate. Pure-sync, no sockets, no async, no I/O
+**`uc_crypto`** — new workspace crate. Pure-sync, no sockets, no async, no I/O
 beyond reading key files at construction. Owns:
 
 - identity keypair + peer allowlist (load, reload, lookup);
 - the handshake driver wrapping `snow` — a driven transition function (feed a
   message + a monotonic tick, get actions out), the `ElectionSm` shape, so
-  `uc2_sim` can adjudicate it deterministically;
+  `uc_sim` can adjudicate it deterministically;
 - the key schedule: epoch store, per-sender-per-boot derivation, rotation
   policy, overlap retention;
 - `seal_in_place` / `open_in_place`;
@@ -106,11 +106,11 @@ datagram bodies, new `DGRAM_KIND_*` constants. Offsets pinned with
 offset-assertion tests, as every other v2 layout is. No crypto code here; the
 crate's `core`-friendly posture stands.
 
-**`uc2_net`** — exactly two call seams: seal after `assemble()` before
+**`uc_net`** — exactly two call seams: seal after `assemble()` before
 `send_to`, open after `recv_from` before header dispatch. Nothing else in the
 sender/receiver changes shape.
 
-**`uc2_node`** — `NodeConfig.crypto: CryptoConfig`, defaulting to `Disabled`,
+**`uc_node`** — `NodeConfig.crypto: CryptoConfig`, defaulting to `Disabled`,
 mirroring `PurgePolicy::Disabled`'s opt-in precedent; plus the rotation hook
 (§5).
 
@@ -363,13 +363,13 @@ Stated, not hidden:
 
 ## 8. Testing and gates
 
-- **Unit** (`uc2_crypto`): seal/open round-trip; tamper detection across each
+- **Unit** (`uc_crypto`): seal/open round-trip; tamper detection across each
   byte class (header, counter, ciphertext, tag); replay-window edges; epoch
   overlap; KATs for derivation; a property test asserting nonce uniqueness
   across restart and rotation.
-- **Sim** (`uc2_sim`): the handshake driver under loss/reorder/partition;
+- **Sim** (`uc_sim`): the handshake driver under loss/reorder/partition;
   rotation during a partition; a peer that misses an epoch recovering via NAK.
-- **Fault injection**: extend `uc2_net::fault` to corrupt, replay, and reorder
+- **Fault injection**: extend `uc_net::fault` to corrupt, replay, and reorder
   sealed datagrams — assert no panic, no divergence, counters move.
 - **Adversarial**: forged datagram under an unknown key rejected; replayed
   `VOTE` rejected; a peer dropped from the allowlist unable to re-establish;

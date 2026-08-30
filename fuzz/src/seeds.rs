@@ -179,10 +179,10 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
 // Task 2 targets
 // ===========================================================================
 
-/// `uc2_remote_frame` — one frame per type with a real encoded body, plus the
+/// `uc_remote_frame` — one frame per type with a real encoded body, plus the
 /// two header-length edges around `MAX_FRAME_LEN`.
-pub fn uc2_remote_frame() -> Vec<Seed> {
-    use uc2_remote::frame::*;
+pub fn uc_remote_frame() -> Vec<Seed> {
+    use uc_remote::frame::*;
 
     fn frame(ty: FrameType, flags: u8, client_id: u64, seq: u64, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -309,10 +309,10 @@ pub fn uc2_remote_frame() -> Vec<Seed> {
     seeds
 }
 
-/// `uc2_crypto_open` — genuine sealed datagrams under the target's fixed key,
+/// `uc_crypto_open` — genuine sealed datagrams under the target's fixed key,
 /// plus truncated and bit-flipped variants (the shapes an on-path attacker
 /// actually produces).
-pub fn uc2_crypto_open() -> Vec<Seed> {
+pub fn uc_crypto_open() -> Vec<Seed> {
     use uc_protocol::v2::datagram::*;
     const KEY: [u8; 32] = [7u8; 32];
 
@@ -339,7 +339,7 @@ pub fn uc2_crypto_open() -> Vec<Seed> {
             .enumerate()
     {
         let mut v = staged(b"a replication payload");
-        uc2_crypto::seal::seal_in_place(&mut v, &KEY, counter).expect("seal seed");
+        uc_crypto::seal::seal_in_place(&mut v, &KEY, counter).expect("seal seed");
         if i == 0 {
             // 1-byte-truncated: the tag no longer covers the ciphertext.
             let mut t = v.clone();
@@ -362,11 +362,11 @@ pub fn uc2_crypto_open() -> Vec<Seed> {
     seeds
 }
 
-/// `uc2_crypto_handshake` — a genuine Noise `IK` message 1 from the initiator
+/// `uc_crypto_handshake` — a genuine Noise `IK` message 1 from the initiator
 /// side, prefixed with the kind byte the target consumes, plus fixed
 /// non-handshake and malformed kinds.
-pub fn uc2_crypto_handshake() -> Vec<Seed> {
-    use uc2_crypto::HandshakeAction;
+pub fn uc_crypto_handshake() -> Vec<Seed> {
+    use uc_crypto::HandshakeAction;
     use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
 
     let mut seeds = Vec::new();
@@ -439,9 +439,9 @@ pub fn uc2_crypto_handshake() -> Vec<Seed> {
     seeds
 }
 
-/// `uc2_crypto_group_key` — the two message shapes that ride kind 20, at the
+/// `uc_crypto_group_key` — the two message shapes that ride kind 20, at the
 /// exact lengths the reader accepts and one either side.
-pub fn uc2_crypto_group_key() -> Vec<Seed> {
+pub fn uc_crypto_group_key() -> Vec<Seed> {
     // Wire layout, from `group.rs`'s module docs: a leading tag byte (0 = key
     // delivery, 1 = ack), then a u16 LE epoch, then — for a delivery — 32 key
     // bytes. Hand-encoded from those literals rather than by calling
@@ -460,14 +460,14 @@ pub fn uc2_crypto_group_key() -> Vec<Seed> {
 
     let mut seeds = Vec::new();
 
-    // The epoch `uc2_fuzz::group_plane_with_pending` actually mints. Taken
+    // The epoch `uc_fuzz::group_plane_with_pending` actually mints. Taken
     // from the real `GroupPlane` rather than pasted as a literal: an ack for
     // any OTHER epoch folds into a no-op, which is how the first version of
     // `02-ack-*` (hard-coded epoch 7 against a plane that mints 1) silently
     // stopped testing `on_ack` at all. The KEY is random, the epoch NUMBER is
     // a deterministic counter, so reading it here keeps the seeds fixed.
     let pending_epoch = {
-        let mut probe = uc2_crypto::group::GroupPlane::new(crate::A_ID);
+        let mut probe = uc_crypto::group::GroupPlane::new(crate::A_ID);
         let (epoch, _acts) = probe.mint(&[crate::B_ID], 1_000_000);
         epoch
     };
@@ -498,10 +498,10 @@ pub fn uc2_crypto_group_key() -> Vec<Seed> {
     seeds.push(Seed::fixed("07-empty", Vec::new()));
 
     // A genuine kind-20 delivery straight off the real rotation path.
-    let mut plane = uc2_crypto::group::GroupPlane::new(crate::A_ID);
+    let mut plane = uc_crypto::group::GroupPlane::new(crate::A_ID);
     let (_epoch, acts) = plane.mint(&[crate::B_ID], 1_000_000);
     for act in acts {
-        if let uc2_crypto::HandshakeAction::Send { body, .. } = act {
+        if let uc_crypto::HandshakeAction::Send { body, .. } = act {
             seeds.push(Seed::captured("08-real-minted-key", framed(crate::B_ID as u8, &body)));
             break;
         }
@@ -510,9 +510,9 @@ pub fn uc2_crypto_group_key() -> Vec<Seed> {
     seeds
 }
 
-/// `uc2_crypto_admin` — the target splits its input into nine fields, so the
+/// `uc_crypto_admin` — the target splits its input into nine fields, so the
 /// seeds are simply field layouts worth starting from.
-pub fn uc2_crypto_admin() -> Vec<Seed> {
+pub fn uc_crypto_admin() -> Vec<Seed> {
     let mut seeds = Vec::new();
     // Eight leading length bytes drive `split(data, 9)`; the rest is field
     // content. These give the fuzzer a shaped starting point rather than a
@@ -532,10 +532,10 @@ pub fn uc2_crypto_admin() -> Vec<Seed> {
     seeds
 }
 
-/// `ultima_journal_record` — a segment header, records at three payload sizes,
+/// `uc_journal_record` — a segment header, records at three payload sizes,
 /// and the torn tails recovery actually meets.
-pub fn ultima_journal_record() -> Vec<Seed> {
-    use ultima_journal::fuzz_seams::{SegmentHeader, encode_header, encode_record};
+pub fn uc_journal_record() -> Vec<Seed> {
+    use uc_journal::fuzz_seams::{SegmentHeader, encode_header, encode_record};
 
     let mut seeds = Vec::new();
     seeds.push(Seed::fixed(
@@ -579,9 +579,9 @@ pub fn ultima_journal_record() -> Vec<Seed> {
     seeds
 }
 
-/// `ultima_journal_stable_value` — the rotating two-slot durable value.
-pub fn ultima_journal_stable_value() -> Vec<Seed> {
-    use ultima_journal::stable_value::{SvHeader, SvSlot, encode_header, encode_slot};
+/// `uc_journal_stable_value` — the rotating two-slot durable value.
+pub fn uc_journal_stable_value() -> Vec<Seed> {
+    use uc_journal::stable_value::{SvHeader, SvSlot, encode_header, encode_slot};
 
     let mut seeds = Vec::new();
     seeds.push(Seed::fixed(
@@ -775,12 +775,12 @@ pub fn uc_protocol_log_frame() -> Vec<Seed> {
     ]
 }
 
-/// `uc2_service_session` — the exactly-once envelope, including a genuine
+/// `uc_service_session` — the exactly-once envelope, including a genuine
 /// frozen snapshot of a two-client table.
-pub fn uc2_service_session() -> Vec<Seed> {
-    use uc2_service::RawStateMachine;
-    use uc2_service::SnapshotStateMachine;
-    use uc2_service::{SESSION_HEADER_LEN, SessionConfig, Sessioned};
+pub fn uc_service_session() -> Vec<Seed> {
+    use uc_service::RawStateMachine;
+    use uc_service::SnapshotStateMachine;
+    use uc_service::{SESSION_HEADER_LEN, SessionConfig, Sessioned};
 
     fn envelope(client_id: u64, seq: u64, body: &[u8]) -> Vec<u8> {
         let mut v = Vec::with_capacity(SESSION_HEADER_LEN + body.len());
@@ -947,9 +947,9 @@ fn packaging(name: &str) -> String {
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
-/// `uc2_node_toml` — the shipped example, the quickstart's rendered file, and
+/// `uc_node_toml` — the shipped example, the quickstart's rendered file, and
 /// the shapes that must be REFUSED by name rather than accepted or panicked.
-pub fn uc2_node_toml() -> Vec<Seed> {
+pub fn uc_node_toml() -> Vec<Seed> {
     let example = packaging("node.example.toml");
 
     // Every section present EXCEPT `[admin]` — the M12b
@@ -1000,8 +1000,8 @@ pub fn uc2_node_toml() -> Vec<Seed> {
     ]
 }
 
-/// `uc2_gateway_toml` — same shape for the edge's config.
-pub fn uc2_gateway_toml() -> Vec<Seed> {
+/// `uc_gateway_toml` — same shape for the edge's config.
+pub fn uc_gateway_toml() -> Vec<Seed> {
     let example = packaging("gateway.example.toml");
     vec![
         Seed::fixed("01-packaging-example", example.into_bytes()),
@@ -1037,8 +1037,8 @@ pub fn uc2_gateway_toml() -> Vec<Seed> {
     ]
 }
 
-/// `uc2_node_http` — the request shapes an unauthenticated scraper can send.
-pub fn uc2_node_http() -> Vec<Seed> {
+/// `uc_node_http` — the request shapes an unauthenticated scraper can send.
+pub fn uc_node_http() -> Vec<Seed> {
     let mut seeds = vec![
         Seed::fixed("01-get-metrics", b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
         Seed::fixed("02-get-healthz", b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),

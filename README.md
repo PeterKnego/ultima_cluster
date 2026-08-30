@@ -17,7 +17,7 @@ SMR is used when you need ultimate performance, correctness and resiliency at th
 End to end through the SDK — client submit, consensus, apply, response — with
 **every operation quorum-fsync'd before it is acked** and reads linearizable.
 p50 0.653 ms, p90 0.757 ms. Measured on 3 × `c6id.2xlarge`, 64 B payloads,
-through the **pipelined client** (`uc2_client`'s public `Engine`) that ships
+through the **pipelined client** (`uc_client`'s public `Engine`) that ships
 today.
 
 ### Leader failover p50 202 ms, zero committed loss in 10 of 10 kills
@@ -30,12 +30,12 @@ detection-timing confirmation is still outstanding.
 
 ## Try it
 
-Download the signed `v2.8.1` tarball and run its quickstart — no toolchain
+Download the signed `v2.9.0` tarball and run its quickstart — no toolchain
 needed:
 
 ```bash
-tar xzf uc2-2.8.1-x86_64-unknown-linux-gnu.tar.gz
-uc2-2.8.1-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
+tar xzf uc2-2.9.0-x86_64-unknown-linux-gnu.tar.gz
+uc2-2.9.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
 ```
 
 Three nodes, three services and three gateways come up on this host, a real
@@ -88,6 +88,7 @@ What shipped since the core, and where to read about it:
 | v2.7.0 (M13) | Remote path at the cluster's own speed: a rebuilt remote client, a convoy-free ingress ring, a global gateway credit budget | [Remote protocol](/docs/reference/remote-protocol.md) · [M13 gate](/docs/benchmarks/uc2-m13-gate-2026-08-24.md) |
 | v2.8.0 (M14) | Several state machines per cluster, fed by one log; submit to any, or fan a query across all | [How it works](/docs/notes/uc2-m14-multi-service-explained.md) · [M14 gate](/docs/benchmarks/uc2-m14-gate-2026-08-29.md) |
 | v2.8.1 (M14c2) | The multi-service proof pass: linearizability, partition, hard-crash and Elle capstones run with two state machines | [What is verified § 11](/docs/VERIFICATION.md#11-what-is-not-verified) · [Lockstep envelope](/docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md) |
+| v2.9.0 | Every crate renamed to a uniform `uc_` prefix — packages and directories only; no binary, wire, cnc or metric name changed | [What changed](/RELEASES.md) · [Semver policy](/docs/reference/semver-policy.md) |
 
 Building from source: [Quickstart](/docs/QUICKSTART.md) (from-source section);
 developer build/test/lint commands are in [`CLAUDE.md`](/CLAUDE.md).

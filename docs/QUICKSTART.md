@@ -22,7 +22,7 @@ Pick your architecture and take the tarball, its checksum, `SHA256SUMS`, and
 the signature bundle:
 
 ```bash
-VER=2.8.1
+VER=2.9.0
 TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
 BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
 
@@ -90,7 +90,7 @@ packaging/quickstart-local.sh
 
 ```text
 ultima_cluster quickstart
-   binaries: /home/you/uc2-2.8.1-x86_64-unknown-linux-gnu/bin
+   binaries: /home/you/uc2-2.9.0-x86_64-unknown-linux-gnu/bin
    root:     /home/you/uc2-quickstart
 
 1. writing configuration
@@ -270,7 +270,7 @@ envelope = false     # raw pass-through: see below
 
 `[session] envelope = false` is the honest setting for this demo.
 `counter-service` runs a plain `CounterSm`, not a
-`uc2_service::Sessioned<CounterSm>`, so there is nothing on the far end to
+`uc_service::Sessioned<CounterSm>`, so there is nothing on the far end to
 strip a session envelope. A production service wraps its state machine in
 `Sessioned` and turns the envelope on — that is what makes a re-sent write
 answer `replayed=true` ("already applied; not applied twice") instead of
@@ -345,7 +345,7 @@ supervisor:
   publishes:
 
   ```bash
-  UC2_IMAGE=ghcr.io/peterknego/uc2:2.8.1 \
+  UC2_IMAGE=ghcr.io/peterknego/uc2:2.9.0 \
     docker compose -f packaging/compose.yml up -d
   ```
 
@@ -417,9 +417,9 @@ To build the shipped binaries and run the same quickstart from a source tree:
 
 ```bash
 cargo build --release --locked \
-  -p uc2_node --bin uc2-node \
-  -p uc2ctl --bin uc2ctl \
-  -p uc2_gateway --bin uc2-gateway \
+  -p uc_node --bin uc2-node \
+  -p uc_ctl --bin uc2ctl \
+  -p uc_gateway --bin uc2-gateway \
   -p counter --bin counter-service --bin counter-remote
 
 packaging/quickstart-local.sh --bin-dir target/release
@@ -443,7 +443,7 @@ it, and refuses to publish anything if it does not print `PASS`.
   both tiers, `SnapshotStateMachine`, `OutputHandler`, and `Sessioned<S>`.
 - **[Client SDKs](/docs/reference/remote-protocol.md)** — the framed TCP
   protocol a remote client speaks, and `RemoteEngine`/`RemoteClient`, the Rust
-  implementation of it. On-host clients use `uc2_client`'s three tiers
+  implementation of it. On-host clients use `uc_client`'s three tiers
   instead: `Engine`, `PipelinedClient` + `Ticket`, and the blocking `Client`
   shim. M14: `submit_to(id, …)`, `submit_all(…)` (every FSM's answer, in id
   order) and `query_*_on(id, …)` pick which state machine answers; the plain

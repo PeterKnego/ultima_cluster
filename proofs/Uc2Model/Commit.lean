@@ -1,6 +1,6 @@
 import Uc2Model.TermMap
 
-/-! `uc2_consensus/src/commit.rs::CommitTracker` — quorum commit ranking
+/-! `uc_consensus/src/commit.rs::CommitTracker` — quorum commit ranking
 (spec §6): commit = the quorum-th highest of {own durable} ∪ {reports},
 bounded by own, monotonic. -/
 

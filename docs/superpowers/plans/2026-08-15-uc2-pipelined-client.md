@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extract the m5_gate client pump into `uc2_client` as a public two-layer API — a bytes-level completion `Engine` (SendHalf/PollHalf) plus a `Ticket`-based `PipelinedClient` — with the existing blocking `Client` becoming a shim, per spec `docs/superpowers/specs/2026-08-13-uc2-pipelined-client-design.md`.
+**Goal:** Extract the m5_gate client pump into `uc_client` as a public two-layer API — a bytes-level completion `Engine` (SendHalf/PollHalf) plus a `Ticket`-based `PipelinedClient` — with the existing blocking `Client` becoming a shim, per spec `docs/superpowers/specs/2026-08-13-uc2-pipelined-client-design.md`.
 
 **Architecture:** Engine (B) is a passive, waitless, pure-sync correlation core: a generation-tagged slot table claimed by cloneable `SendHalf`s and drained by a single `PollHalf::poll(cb)` duty cycle. The Ticket layer (A) owns the one driver thread, resolving completions into per-ticket park/`Waker` cells. `Client` keeps its exact public API as a shim over A; `matcher.rs` is deleted; m5_gate's client role is rewritten on the public engine (acceptance = smoke parity now, fleet gate later, user-approved).
 
-**Tech Stack:** Rust, std only. Existing deps: `uc_protocol` (rings, ipc consts), `uc2_log` (CncPage, AgentRunner precedent), `serde`, `bincode`, `thiserror`. NO new dependencies (no tokio, not even dev — async is tested with a hand-rolled `block_on`).
+**Tech Stack:** Rust, std only. Existing deps: `uc_protocol` (rings, ipc consts), `uc_log` (CncPage, AgentRunner precedent), `serde`, `bincode`, `thiserror`. NO new dependencies (no tokio, not even dev — async is tested with a hand-rolled `block_on`).
 
 ## Global Constraints
 
 - Branch: all work on `uc2/pipelined-client` off current `main`.
-- **No new crate dependencies** in `uc2_client` (its small dep set is an advertised property; spec §2).
+- **No new crate dependencies** in `uc_client` (its small dep set is an advertised property; spec §2).
 - **No wire/protocol change**: same ring files, msg types, `header_extra` codec (`(client_id: u32, local_seq: u32)` LE), cnc layout. A new client talks to an old node.
 - **Compat pin:** `Client`'s public API and observable behavior are pinned by the four existing test files (`roundtrip.rs`, `synthetic.rs`, `timeout_and_restart.rs`, `torn_header.rs`) — they must pass UNCHANGED (they are the compat oracle).
 - `cargo clippy --workspace --all-targets -- -D warnings` must stay clean after every task.
@@ -32,7 +32,7 @@
 ## File Structure
 
 ```
-uc2_client/src/
+uc_client/src/
   lib.rs         # modify: module decls + public exports
   wait.rs        # NEW (Task 1): WaitStrategy + Idle ladder (ported)
   slots.rs       # NEW (Task 2): SlotTable — correlation core, no I/O
@@ -43,11 +43,11 @@ uc2_client/src/
   client.rs      # REWRITE (Task 7): compat shim over PipelinedClient
   matcher.rs     # DELETE (Task 7)
   error.rs       # modify (Task 7): + PayloadTooLarge variant, doc notes
-uc2_client/tests/
+uc_client/tests/
   engine_synthetic.rs  # NEW (Tasks 3-4): engine vs hand-rolled instance dirs
   pipelined.rs         # NEW (Task 6): real node+service round trips
   (roundtrip.rs / synthetic.rs / timeout_and_restart.rs / torn_header.rs UNCHANGED)
-uc2_node/examples/m5_gate.rs  # REWRITE client role on public Engine (Task 8)
+uc_node/examples/m5_gate.rs  # REWRITE client role on public Engine (Task 8)
 ```
 
 ---
@@ -55,8 +55,8 @@ uc2_node/examples/m5_gate.rs  # REWRITE client role on public Engine (Task 8)
 ### Task 1: `wait.rs` — ported `WaitStrategy` + `Idle` ladder
 
 **Files:**
-- Create: `uc2_client/src/wait.rs`
-- Modify: `uc2_client/src/lib.rs` (add `mod wait; pub use wait::WaitStrategy;`)
+- Create: `uc_client/src/wait.rs`
+- Modify: `uc_client/src/lib.rs` (add `mod wait; pub use wait::WaitStrategy;`)
 
 **Interfaces:**
 - Consumes: nothing (std only).
@@ -70,11 +70,11 @@ cd /home/claude/ultima/ultima_cluster && git checkout -b uc2/pipelined-client
 
 - [ ] **Step 2: Write wait.rs (port, then adapt doc comments)**
 
-Port from `/home/claude/ultima/ultima_rings/src/wait.rs` (read it first — it is ~277 lines including tests). Keep: the four-variant enum, `SPINS = 10`, `YIELDS = 20`, `PARK_MIN = 64µs`, `PARK_MAX = 1ms`, the `Idle` struct and its three tests verbatim (they are deterministic/wall-clock-bounded; keep the `#[cfg_attr(miri, ignore = ...)]` attribute as-is — harmless here). Drop: the `crate::notify` reference in the doc header (uc2_client's Park parks on the ring futex or a ticket condvar instead — say so). Add this attribution header under the SPDX lines:
+Port from `/home/claude/ultima/ultima_rings/src/wait.rs` (read it first — it is ~277 lines including tests). Keep: the four-variant enum, `SPINS = 10`, `YIELDS = 20`, `PARK_MIN = 64µs`, `PARK_MAX = 1ms`, the `Idle` struct and its three tests verbatim (they are deterministic/wall-clock-bounded; keep the `#[cfg_attr(miri, ignore = ...)]` attribute as-is — harmless here). Drop: the `crate::notify` reference in the doc header (uc_client's Park parks on the ring futex or a ticket condvar instead — say so). Add this attribution header under the SPDX lines:
 
 ```rust
 //! Wait strategies, PORTED from `ultima_rings` (`ultima_rings/src/wait.rs`)
-//! with attribution rather than taken as a dependency — `uc2_client`'s small
+//! with attribution rather than taken as a dependency — `uc_client`'s small
 //! dep set is an advertised property (spec 2026-08-13, §5).
 //!
 //! The measured findings that picked these defaults (all from ultima_rings'
@@ -104,15 +104,15 @@ pub use wait::WaitStrategy;
 
 - [ ] **Step 4: Run the ported tests**
 
-Run: `cargo test -p uc2_client wait`
+Run: `cargo test -p uc_client wait`
 Expected: PASS (3 tests: ladder ordering, PARK_MIN floor, yield-never-parks; plus the wall-clock one).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/wait.rs uc2_client/src/lib.rs
-git commit -m "feat(uc2_client): port WaitStrategy + Idle ladder from ultima_rings (attributed, no dep)"
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/wait.rs uc_client/src/lib.rs
+git commit -m "feat(uc_client): port WaitStrategy + Idle ladder from ultima_rings (attributed, no dep)"
 ```
 
 ---
@@ -120,8 +120,8 @@ git commit -m "feat(uc2_client): port WaitStrategy + Idle ladder from ultima_rin
 ### Task 2: `slots.rs` — the correlation slot table
 
 **Files:**
-- Create: `uc2_client/src/slots.rs`
-- Modify: `uc2_client/src/lib.rs` (add `mod slots;`)
+- Create: `uc_client/src/slots.rs`
+- Modify: `uc_client/src/lib.rs` (add `mod slots;`)
 
 **Interfaces:**
 - Consumes: nothing (std atomics only).
@@ -263,7 +263,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_client slots`
+Run: `cargo test -p uc_client slots`
 Expected: FAIL to compile ("cannot find `SlotTable`").
 
 - [ ] **Step 3: Implement SlotTable**
@@ -447,15 +447,15 @@ impl SlotTable {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_client slots`
+Run: `cargo test -p uc_client slots`
 Expected: PASS (8 tests).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/slots.rs uc2_client/src/lib.rs
-git commit -m "feat(uc2_client): generation-tagged correlation slot table (exactly-once, wrap-safe)"
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/slots.rs uc_client/src/lib.rs
+git commit -m "feat(uc_client): generation-tagged correlation slot table (exactly-once, wrap-safe)"
 ```
 
 ---
@@ -463,12 +463,12 @@ git commit -m "feat(uc2_client): generation-tagged correlation slot table (exact
 ### Task 3: `engine.rs` — types, attach, SendHalf
 
 **Files:**
-- Create: `uc2_client/src/engine.rs`
-- Modify: `uc2_client/src/lib.rs` (add `mod engine;` + exports)
-- Test: `uc2_client/tests/engine_synthetic.rs` (new)
+- Create: `uc_client/src/engine.rs`
+- Modify: `uc_client/src/lib.rs` (add `mod engine;` + exports)
+- Test: `uc_client/tests/engine_synthetic.rs` (new)
 
 **Interfaces:**
-- Consumes: `SlotTable` / `ReqKind` / `ClaimError` / `Resolve` (Task 2, exact signatures above); `CncPage::open_file`, `cnc.status().next_client_id` / `.flags.load_acquire()`, `cnc.meta().instance_id`, `cnc.try_instance_id()` (uc2_log); `MpscRing::open(..)?.into_split()`, `MpscProducer::try_write`, `BroadcastRing::open(..)?.subscribe()` (uc_protocol); ipc consts `MSG_V2_SUBMIT` / `MSG_V2_QUERY` / `FLAG_V2_LINEARIZABLE` / `extra_client`; `NODE_FLAG_CAN_SERVE` (uc_protocol::v2::cnc); `ClientError` (attach errors reuse it).
+- Consumes: `SlotTable` / `ReqKind` / `ClaimError` / `Resolve` (Task 2, exact signatures above); `CncPage::open_file`, `cnc.status().next_client_id` / `.flags.load_acquire()`, `cnc.meta().instance_id`, `cnc.try_instance_id()` (uc_log); `MpscRing::open(..)?.into_split()`, `MpscProducer::try_write`, `BroadcastRing::open(..)?.subscribe()` (uc_protocol); ipc consts `MSG_V2_SUBMIT` / `MSG_V2_QUERY` / `FLAG_V2_LINEARIZABLE` / `extra_client`; `NODE_FLAG_CAN_SERVE` (uc_protocol::v2::cnc); `ClientError` (attach errors reuse it).
 - Produces (public API, consumed by Tasks 4/6/8):
 
 ```rust
@@ -526,11 +526,11 @@ The shared core (private): `struct Shared { cnc: Arc<CncPage>, client_id: u32, i
 
 - [ ] **Step 1: Write the failing tests (tests/engine_synthetic.rs)**
 
-Copy `make_instance`/`meta` helpers from `uc2_client/tests/synthetic.rs` (hand-rolled instance dirs: cnc + 4 ring files; no real node). Then:
+Copy `make_instance`/`meta` helpers from `uc_client/tests/synthetic.rs` (hand-rolled instance dirs: cnc + 4 ring files; no real node). Then:
 
 ```rust
 use std::time::Duration;
-use uc2_client::{Consistency, Engine, EngineConfig, SubmitError};
+use uc_client::{Consistency, Engine, EngineConfig, SubmitError};
 
 fn cfg() -> EngineConfig {
     EngineConfig { serving_gate: false, ..EngineConfig::default() }
@@ -610,7 +610,7 @@ fn payload_too_large_fails_loud_at_the_door() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_client --test engine_synthetic`
+Run: `cargo test -p uc_client --test engine_synthetic`
 Expected: FAIL to compile ("cannot find `Engine`").
 
 - [ ] **Step 3: Implement engine.rs (attach + SendHalf + types)**
@@ -732,19 +732,19 @@ impl Clone for SendHalf {
 }
 ```
 
-`PollHalf` gets only its struct definition + a `poll` stub returning 0 in this task (Task 4 fills it); mark `#[allow(dead_code)]` on stub fields if clippy complains, removed in Task 4. Module doc for `engine.rs`: state the central contract verbatim from the spec — "every accepted try_submit/try_query produces exactly one completion for its user_data, in bounded time" — and the byte contract paragraph (engine is format-free; against today's uc2_service the payload must be `bincode(Command)`; cite spec §4).
+`PollHalf` gets only its struct definition + a `poll` stub returning 0 in this task (Task 4 fills it); mark `#[allow(dead_code)]` on stub fields if clippy complains, removed in Task 4. Module doc for `engine.rs`: state the central contract verbatim from the spec — "every accepted try_submit/try_query produces exactly one completion for its user_data, in bounded time" — and the byte contract paragraph (engine is format-free; against today's uc_service the payload must be `bincode(Command)`; cite spec §4).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_client --test engine_synthetic`
+Run: `cargo test -p uc_client --test engine_synthetic`
 Expected: PASS (4 tests).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/engine.rs uc2_client/src/lib.rs uc2_client/tests/engine_synthetic.rs
-git commit -m "feat(uc2_client): Engine attach + SendHalf (serving gate, window, fail-loud payload bound)"
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/engine.rs uc_client/src/lib.rs uc_client/tests/engine_synthetic.rs
+git commit -m "feat(uc_client): Engine attach + SendHalf (serving gate, window, fail-loud payload bound)"
 ```
 
 ---
@@ -752,8 +752,8 @@ git commit -m "feat(uc2_client): Engine attach + SendHalf (serving gate, window,
 ### Task 4: `engine.rs` — PollHalf: poll, sweep, restart, drain_abort, stats
 
 **Files:**
-- Modify: `uc2_client/src/engine.rs`
-- Test: `uc2_client/tests/engine_synthetic.rs` (extend)
+- Modify: `uc_client/src/engine.rs`
+- Test: `uc_client/tests/engine_synthetic.rs` (extend)
 
 **Interfaces:**
 - Consumes: Task 2/3 items; `BroadcastConsumer::{try_read, wait_handle}`, `RingWaitHandle` (uc_protocol); ipc consts `MSG_V2_RESPONSE` / `MSG_V2_NOT_LEADER` / `MSG_V2_RETRY` / `FLAG_V2_IS_QUERY` / `client_from_extra`.
@@ -799,15 +799,15 @@ use uc_protocol::v2::ipc::{
 };
 
 /// Collect completions into owned tuples (payload copied out of the borrow).
-fn drain(poll: &mut uc2_client::PollHalf) -> Vec<(u64, Option<u64>, String)> {
+fn drain(poll: &mut uc_client::PollHalf) -> Vec<(u64, Option<u64>, String)> {
     let mut out = Vec::new();
     poll.poll(|c| {
         let tag = match &c.outcome {
-            uc2_client::Outcome::Response(b) => format!("resp:{}", b.len()),
-            uc2_client::Outcome::NotLeader { hint } => format!("notleader:{hint:?}"),
-            uc2_client::Outcome::Retry => "retry".into(),
-            uc2_client::Outcome::TimedOut => "timeout".into(),
-            uc2_client::Outcome::InstanceRestart { .. } => "restart".into(),
+            uc_client::Outcome::Response(b) => format!("resp:{}", b.len()),
+            uc_client::Outcome::NotLeader { hint } => format!("notleader:{hint:?}"),
+            uc_client::Outcome::Retry => "retry".into(),
+            uc_client::Outcome::TimedOut => "timeout".into(),
+            uc_client::Outcome::InstanceRestart { .. } => "restart".into(),
         };
         out.push((c.user_data, c.position, tag));
     });
@@ -1000,7 +1000,7 @@ fn wire_seq_wrap_roundtrips_through_a_real_ring() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_client --test engine_synthetic`
+Run: `cargo test -p uc_client --test engine_synthetic`
 Expected: new tests FAIL (poll stub returns 0 → drains empty / compile errors for `Outcome`).
 
 - [ ] **Step 3: Implement PollHalf**
@@ -1158,15 +1158,15 @@ fn maintenance(shared: &Shared, cb: &mut impl FnMut(Completion<'_>)) -> usize {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_client --test engine_synthetic`
+Run: `cargo test -p uc_client --test engine_synthetic`
 Expected: PASS (11 tests total).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/engine.rs uc2_client/tests/engine_synthetic.rs
-git commit -m "feat(uc2_client): PollHalf — completion drain, deadline sweep, restart detection, stats"
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/engine.rs uc_client/tests/engine_synthetic.rs
+git commit -m "feat(uc_client): PollHalf — completion drain, deadline sweep, restart detection, stats"
 ```
 
 ---
@@ -1174,8 +1174,8 @@ git commit -m "feat(uc2_client): PollHalf — completion drain, deadline sweep, 
 ### Task 5: `ticket.rs` — `Ticket<R>`: blocking handle + Future
 
 **Files:**
-- Create: `uc2_client/src/ticket.rs`
-- Modify: `uc2_client/src/lib.rs` (add `mod ticket; pub use ticket::Ticket;`)
+- Create: `uc_client/src/ticket.rs`
+- Modify: `uc_client/src/lib.rs` (add `mod ticket; pub use ticket::Ticket;`)
 
 **Interfaces:**
 - Consumes: `ClientError` only.
@@ -1306,7 +1306,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_client ticket`
+Run: `cargo test -p uc_client ticket`
 Expected: FAIL to compile ("cannot find `ticket_pair`").
 
 - [ ] **Step 3: Implement per the Interfaces block**
@@ -1315,15 +1315,15 @@ Note on `ClientError::Timeout` comparison: the enum derives no `PartialEq` — t
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_client ticket`
+Run: `cargo test -p uc_client ticket`
 Expected: PASS (7 tests).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/ticket.rs uc2_client/src/lib.rs
-git commit -m "feat(uc2_client): Ticket<R> — one slot-backed cell serving wait() and .await"
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/ticket.rs uc_client/src/lib.rs
+git commit -m "feat(uc_client): Ticket<R> — one slot-backed cell serving wait() and .await"
 ```
 
 ---
@@ -1331,9 +1331,9 @@ git commit -m "feat(uc2_client): Ticket<R> — one slot-backed cell serving wait
 ### Task 6: `pipelined.rs` — `PipelinedClient` + driver thread
 
 **Files:**
-- Create: `uc2_client/src/pipelined.rs`
-- Modify: `uc2_client/src/lib.rs` (add `mod pipelined; pub use pipelined::{PipelinedClient, PipelinedConfig};`)
-- Test: `uc2_client/tests/pipelined.rs` (new)
+- Create: `uc_client/src/pipelined.rs`
+- Modify: `uc_client/src/lib.rs` (add `mod pipelined; pub use pipelined::{PipelinedClient, PipelinedConfig};`)
+- Test: `uc_client/tests/pipelined.rs` (new)
 
 **Interfaces:**
 - Consumes: `Engine::attach`, `SendHalf` (try_submit/try_query/leader_hint/stats/client_id/instance_id), `PollHalf` (poll/drain_abort/wait_handle), `SubmitError`, `Completion`, `Outcome`, `Consistency` (Tasks 3-4); `Ticket`, `TicketCore`, `ticket_pair` (Task 5); `WaitStrategy`, `Idle` (Task 1); `ClientError`.
@@ -1384,9 +1384,9 @@ impl PipelinedClient {
 Reuse `roundtrip.rs`'s harness verbatim: the `Cmd` / `CountSm` state machine, `node_config`, `wait_until` (copy them in — integration tests don't share modules). Node+service boot per test, `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`.
 
 ```rust
-fn connect(dir: &std::path::Path) -> uc2_client::PipelinedClient {
-    uc2_client::PipelinedClient::connect(
-        dir, "pipe-test", uc2_client::PipelinedConfig::default(),
+fn connect(dir: &std::path::Path) -> uc_client::PipelinedClient {
+    uc_client::PipelinedClient::connect(
+        dir, "pipe-test", uc_client::PipelinedConfig::default(),
     ).unwrap()
 }
 
@@ -1401,7 +1401,7 @@ fn pipelined_submits_all_resolve_and_totals_are_a_permutation_free_prefix() {
 
     let client = connect(dir.path());
     // WINDOW of outstanding tickets — the whole point of the layer.
-    let tickets: Vec<uc2_client::Ticket<u64>> =
+    let tickets: Vec<uc_client::Ticket<u64>> =
         (0..100).map(|_| client.submit(&Cmd::Add(1)).unwrap()).collect();
     let mut totals: Vec<u64> = tickets.into_iter().map(|t| t.wait().unwrap()).collect();
     // A single client's submits are applied in submission order (one MPSC
@@ -1463,13 +1463,13 @@ fn shutdown_fails_inflight_tickets_with_shutdown() {
     // is accepted and then never resolved — until shutdown drains it.
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     make_instance(dir.path(), "pipe-shut", 1 << 20, 1 << 20); // synthetic.rs helper, copied in
-    let client = uc2_client::PipelinedClient::connect(
+    let client = uc_client::PipelinedClient::connect(
         dir.path(), "pipe-shut",
-        uc2_client::PipelinedConfig { serving_gate: false, ..Default::default() },
+        uc_client::PipelinedConfig { serving_gate: false, ..Default::default() },
     ).unwrap();
     let t = client.submit::<_, u64>(&1u8).unwrap();
     client.shutdown();
-    assert!(matches!(t.wait(), Err(uc2_client::ClientError::ShutDown)));
+    assert!(matches!(t.wait(), Err(uc_client::ClientError::ShutDown)));
 }
 
 #[test]
@@ -1482,14 +1482,14 @@ fn every_wait_strategy_round_trips() {
     ).start().unwrap();
 
     for ws in [
-        uc2_client::WaitStrategy::BusySpin,
-        uc2_client::WaitStrategy::BackoffYield,
-        uc2_client::WaitStrategy::Backoff,
-        uc2_client::WaitStrategy::Park,
+        uc_client::WaitStrategy::BusySpin,
+        uc_client::WaitStrategy::BackoffYield,
+        uc_client::WaitStrategy::Backoff,
+        uc_client::WaitStrategy::Park,
     ] {
-        let client = uc2_client::PipelinedClient::connect(
+        let client = uc_client::PipelinedClient::connect(
             dir.path(), "pipe-test",
-            uc2_client::PipelinedConfig { driver_wait: ws, ..Default::default() },
+            uc_client::PipelinedConfig { driver_wait: ws, ..Default::default() },
         ).unwrap();
         let _: u64 = client.submit(&Cmd::Add(1)).unwrap().wait().unwrap();
         client.shutdown();
@@ -1501,7 +1501,7 @@ fn every_wait_strategy_round_trips() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p uc2_client --test pipelined`
+Run: `cargo test -p uc_client --test pipelined`
 Expected: FAIL to compile ("cannot find `PipelinedClient`").
 
 - [ ] **Step 3: Implement pipelined.rs**
@@ -1565,15 +1565,15 @@ fn spawn_driver(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p uc2_client --test pipelined`
+Run: `cargo test -p uc_client --test pipelined`
 Expected: PASS (6 tests). These boot real nodes — allow ~a minute.
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
-cargo clippy -p uc2_client --all-targets -- -D warnings
-git add uc2_client/src/pipelined.rs uc2_client/src/error.rs uc2_client/src/lib.rs uc2_client/tests/pipelined.rs
-git commit -m "feat(uc2_client): PipelinedClient — driver thread, wait strategies, sync+async tickets"
+cargo clippy -p uc_client --all-targets -- -D warnings
+git add uc_client/src/pipelined.rs uc_client/src/error.rs uc_client/src/lib.rs uc_client/tests/pipelined.rs
+git commit -m "feat(uc_client): PipelinedClient — driver thread, wait strategies, sync+async tickets"
 ```
 
 ---
@@ -1581,9 +1581,9 @@ git commit -m "feat(uc2_client): PipelinedClient — driver thread, wait strateg
 ### Task 7: `client.rs` becomes a shim; `matcher.rs` deleted; existing tests are the oracle
 
 **Files:**
-- Modify: `uc2_client/src/client.rs` (rewrite as shim), `uc2_client/src/error.rs` (doc notes), `uc2_client/src/lib.rs` (exports)
-- Delete: `uc2_client/src/matcher.rs`
-- Test: existing `uc2_client/tests/{roundtrip,synthetic,timeout_and_restart,torn_header}.rs` — UNCHANGED
+- Modify: `uc_client/src/client.rs` (rewrite as shim), `uc_client/src/error.rs` (doc notes), `uc_client/src/lib.rs` (exports)
+- Delete: `uc_client/src/matcher.rs`
+- Test: existing `uc_client/tests/{roundtrip,synthetic,timeout_and_restart,torn_header}.rs` — UNCHANGED
 
 **Interfaces:**
 - Consumes: `PipelinedClient` / `PipelinedConfig` (Task 6, exact signatures above).
@@ -1639,7 +1639,7 @@ Keep the module-level rustdoc (updated: matcher description replaced by "a shim 
 - [ ] **Step 2: Delete matcher.rs, update lib.rs**
 
 ```bash
-git rm uc2_client/src/matcher.rs
+git rm uc_client/src/matcher.rs
 ```
 
 `lib.rs` final export surface:
@@ -1669,20 +1669,20 @@ fn decode_failure_surfaces_as_decode_error() {
 
 - [ ] **Step 3: Run the compat oracle — all four existing test files, UNCHANGED**
 
-Run: `cargo test -p uc2_client`
+Run: `cargo test -p uc_client`
 Expected: PASS — especially `roundtrip.rs` (real cluster, ids, monotone totals), `synthetic.rs` (BackpressureFull after ≥900ms grace; injected RETRY), `timeout_and_restart.rs` (`Timeout(200ms)` exactly, then `InstanceRestart{attached, current}` with both ids), `torn_header.rs` (`current: 0` on a torn/zeroed header). If any fails, the SHIM (or engine) is wrong — do not edit the test.
 
 - [ ] **Step 4: Run the wider blast radius**
 
-Run: `cargo test -p uc2_service && cargo test -p uc2_node --test query_barrier`
+Run: `cargo test -p uc_service && cargo test -p uc_node --test query_barrier`
 Expected: PASS (both use `Client` against real clusters).
 
 - [ ] **Step 5: Clippy + commit**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
-git add -A uc2_client
-git commit -m "refactor(uc2_client): Client is a shim over PipelinedClient; matcher.rs deleted — one code path"
+git add -A uc_client
+git commit -m "refactor(uc_client): Client is a shim over PipelinedClient; matcher.rs deleted — one code path"
 ```
 
 ---
@@ -1690,8 +1690,8 @@ git commit -m "refactor(uc2_client): Client is a shim over PipelinedClient; matc
 ### Task 8: m5_gate client role on the public Engine + full verification
 
 **Files:**
-- Modify: `uc2_node/examples/m5_gate.rs` (client role only: `run_client_measurement`, its consts and `MatcherCtx`; node/service/all roles and the PASS bars untouched)
-- NOT touched: `uc2_node/examples/read_profile.rs` (historical harness — its recorded numbers' provenance depends on its code staying as-run; leave the raw pump there)
+- Modify: `uc_node/examples/m5_gate.rs` (client role only: `run_client_measurement`, its consts and `MatcherCtx`; node/service/all roles and the PASS bars untouched)
+- NOT touched: `uc_node/examples/read_profile.rs` (historical harness — its recorded numbers' provenance depends on its code staying as-run; leave the raw pump there)
 
 **Interfaces:**
 - Consumes: `Engine`, `EngineConfig`, `SendHalf`, `PollHalf`, `Completion`, `Outcome`, `SubmitError` (public API only — that is the point).
@@ -1701,7 +1701,7 @@ git commit -m "refactor(uc2_client): Client is a shim over PipelinedClient; matc
 - [ ] **Step 1: Record the pre-change smoke baseline**
 
 ```bash
-cargo run -p uc2_node --release --example m5_gate -- all --secs 2 2>&1 | tee /home/claude/.claude/jobs/eae46461/tmp/m5-smoke-before.txt
+cargo run -p uc_node --release --example m5_gate -- all --secs 2 2>&1 | tee /home/claude/.claude/jobs/eae46461/tmp/m5-smoke-before.txt
 ```
 
 Note `responses/s` and `p50`. (Sandbox smoke, noisy core-starved box — this is a parity sanity check, NOT the gate.)
@@ -1809,7 +1809,7 @@ fn run_client_measurement(
     // consensus/apply agents being measured, and on the oversubscribed
     // in-process `all` smoke box (3 nodes' agents + 3 services + this thread
     // sharing a handful of cores) that starved the system under test. See
-    // `uc2_node/examples/m5_gate.rs`'s poll-thread comment for the shipped
+    // `uc_node/examples/m5_gate.rs`'s poll-thread comment for the shipped
     // rationale.
 
     // Sender loop (this thread): user_data = send index; stamp send_ns
@@ -1862,8 +1862,8 @@ Delete: `MatcherCtx`, `poll_egress`, the `owner` array, the raw ring-open code a
 - [ ] **Step 3: Compile + smoke after**
 
 ```bash
-cargo clippy -p uc2_node --all-targets --release -- -D warnings
-cargo run -p uc2_node --release --example m5_gate -- all --secs 2 2>&1 | tee /home/claude/.claude/jobs/eae46461/tmp/m5-smoke-after.txt
+cargo clippy -p uc_node --all-targets --release -- -D warnings
+cargo run -p uc_node --release --example m5_gate -- all --secs 2 2>&1 | tee /home/claude/.claude/jobs/eae46461/tmp/m5-smoke-after.txt
 ```
 
 Expected: completes, `in-flight at end == 0`, responses/s within the same order as the before-file (this box is noisy; a real regression shows as a collapse, not a few percent). If it collapses, suspect: poll budget too small for the response rate (raise the 128/ring budget), or the maintenance sweep running too often.
@@ -1873,19 +1873,19 @@ Expected: completes, `in-flight at end == 0`, responses/s within the same order 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p uc2_node --test lin_v2   # the linearizability capstone drives Client under failover
+cargo test -p uc_node --test lin_v2   # the linearizability capstone drives Client under failover
 ```
 
 Expected: all PASS. (`lin_v2` is minutes-long; it is the real proof the shim preserved semantics under fire. Known-flaky setup waits are documented in memory — a setup-timeout failure reruns once before investigating.)
 
 - [ ] **Step 5: Docs touch + final commit**
 
-- `uc2_client/src/lib.rs` module doc: rewrite to describe the three tiers (Engine / PipelinedClient / Client shim) + the byte contract pointer to spec §4.
+- `uc_client/src/lib.rs` module doc: rewrite to describe the three tiers (Engine / PipelinedClient / Client shim) + the byte contract pointer to spec §4.
 - `docs/QUICKSTART.md`: where it introduces the client, add one paragraph + example fragment for `PipelinedClient` (submit → ticket → wait/await), and a one-line pointer to the engine for max-throughput gateways.
 
 ```bash
-git add uc2_node/examples/m5_gate.rs uc2_client/src/lib.rs docs/QUICKSTART.md
-git commit -m "feat(uc2_client): m5_gate client role runs on the public Engine — measured path == shipped path"
+git add uc_node/examples/m5_gate.rs uc_client/src/lib.rs docs/QUICKSTART.md
+git commit -m "feat(uc_client): m5_gate client role runs on the public Engine — measured path == shipped path"
 ```
 
 - [ ] **Step 6: Buffer note for the fleet gate**

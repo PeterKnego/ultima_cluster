@@ -1,4 +1,4 @@
-# UC v2 Lean formal-verification design — the `uc2_consensus` safety core
+# UC v2 Lean formal-verification design — the `uc_consensus` safety core
 
 **Date:** 2026-07-16
 **Status:** approved design (brainstormed; supersedes nothing — first formal-verification effort in this repo)
@@ -7,7 +7,7 @@
 ## 1. Purpose and stance
 
 Add machine-checked proofs, in Lean 4, of the safety arguments at the heart of
-`uc2_consensus` — phased so the effort earns its keep twice:
+`uc_consensus` — phased so the effort earns its keep twice:
 
 1. **Bug-hunting first.** UC is not textbook Raft: byte positions instead of
    indices, `(term, base)` boundary maps instead of per-entry terms, commit as
@@ -27,7 +27,7 @@ experiment (§6) lands.
 
 ### In scope (Phase 1 — committed)
 
-The three pure kernels of `uc2_consensus`, modeled as executable Lean 4
+The three pure kernels of `uc_consensus`, modeled as executable Lean 4
 definitions, plus the semantic ground they stand on:
 
 - **`Commit`** — `CommitTracker` (`src/commit.rs`) as a fold over
@@ -53,8 +53,8 @@ An N-node protocol model and the distributed safety theorems (§7).
 
 - The full `ElectionSm::step()` wiring (in-flight event gating, action
   emission order, cnc counters) — covered by the sim, not the prover.
-- Everything outside `uc2_consensus`: persistence, transport, log buffer,
-  read barrier, snapshots (`uc2_node` / `uc2_net` / `uc2_log`).
+- Everything outside `uc_consensus`: persistence, transport, log buffer,
+  read barrier, snapshots (`uc_node` / `uc_net` / `uc_log`).
 - M7 reconfig (single-server change, tombstones, config chaining — the sim's
   inv6–9): **Tier C, deferred**; listed as future work, unscoped.
 - Liveness (elections terminate, commits advance) — safety only.
@@ -88,9 +88,9 @@ proofs/                      # lake package `uc2-proofs` (NOT a cargo crate)
 - `Uc2Proofs` imports mathlib (wanted for `Finset` pigeonhole — quorum
   intersection; hand-rolling it is wasted effort). Pinned rev, bumped
   deliberately, `lake exe cache get` in CI.
-- Rust side gains one dev-only piece: `uc2_consensus/examples/conform_gen.rs`
+- Rust side gains one dev-only piece: `uc_consensus/examples/conform_gen.rs`
   (vector generator). **No production code changes beyond the §6
-  verifiability refactors; `uc2_consensus` stays env-free and
+  verifiability refactors; `uc_consensus` stays env-free and
   dependency-free.**
 
 ### Model fidelity rules (drift prevention)
@@ -98,7 +98,7 @@ proofs/                      # lake package `uc2-proofs` (NOT a cargo crate)
 Mirrors the cnc offset-pinning convention:
 
 - Every `Uc2Model` definition carries a doc comment naming its Rust source
-  (`uc2_consensus/src/commit.rs::advance`).
+  (`uc_consensus/src/commit.rs::advance`).
 - The nightly conformance job (§5) re-derives agreement mechanically.
 - `Aeneas/SOURCES.sha256` records the kernel sources' hash; nightly fails if
   the Rust changed without regeneration + equivalence repair.
@@ -140,13 +140,13 @@ finding about the spec, not a failure of the effort.
 |---|---------|----------------------|
 | V1 | single-vote-per-term | at most one grant per `(node, term)`; re-grant only idempotently to the same candidate |
 | V2 | grant order | a grant implies candidate `(last_term, last_durable) ≥` voter's at grant time; with C5, a winner's frontier ≥ a full quorum's frontiers — the leader-completeness seed |
-| V3 | persist-before-send | modeled as an atomic persist+send step; recorded as an **assumption on the runtime** (uc2_node's `PersistAndSendVote` contract), discharged by code inspection, not proof |
+| V3 | persist-before-send | modeled as an atomic persist+send step; recorded as an **assumption on the runtime** (uc_node's `PersistAndSendVote` contract), discharged by code inspection, not proof |
 
 ## 5. Conformance rig (model ↔ Rust, mechanical)
 
 One-directional, no FFI:
 
-1. `uc2_consensus/examples/conform_gen.rs` emits JSONL
+1. `uc_consensus/examples/conform_gen.rs` emits JSONL
    `{fn, input, rust_output}`:
    - random vectors from the same seeded-generator distribution the sim fuzz
      uses (deterministic seeds), **plus** every hand-written edge vector from
@@ -164,14 +164,14 @@ Any drift between model and Rust fails the nightly loudly.
 ## 6. Phase 1.5 — Aeneas equivalence (time-boxed, gated)
 
 **Goal:** upgrade the `reconcile` linkage from statistical (fuzz) to
-definitional: Charon translates `uc2_consensus`'s MIR to pure Lean; prove
+definitional: Charon translates `uc_consensus`'s MIR to pure Lean; prove
 `Uc2Model.reconcile = translated_reconcile` (extensional equivalence). The
 remaining trust gap is the Charon/Aeneas translation semantics — peer-reviewed
 and in production use (Microsoft SymCrypt port).
 
 **Why feasible here:** the published Aeneas-friendliness guidance (standalone,
 non-generic, dependency-free, monomorphic, safe, simple loops) describes
-`uc2_consensus` as it already is: zero deps, no generics, no unsafe.
+`uc_consensus` as it already is: zero deps, no generics, no unsafe.
 
 **Verifiability refactors** (1–2 land in Phase 1 regardless — small,
 harmless, unit tests binding; 3 is conditional):
@@ -230,7 +230,7 @@ single-server change safety, tombstone permanence (sim inv6–9).
   1. elan bootstrap (pinned `lean-toolchain`), mathlib cache
      (`lake exe cache get`);
   2. `lake build` — model, proofs, vendored Aeneas output, conform checker;
-  3. `cargo run -p uc2_consensus --example conform_gen` → run the Lean
+  3. `cargo run -p uc_consensus --example conform_gen` → run the Lean
      checker over the vectors;
   4. `SOURCES.sha256` drift check.
 - Build artifacts and vectors go to disk (`$HOME/.cache`), never `/tmp`;

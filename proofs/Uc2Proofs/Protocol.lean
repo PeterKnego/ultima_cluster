@@ -6,7 +6,7 @@ import Uc2Proofs.Quorum
 
 /-! S1 — the N-node election protocol model.
 
-A whole-cluster transition system over `uc2_consensus/src/election.rs`'s vote
+A whole-cluster transition system over `uc_consensus/src/election.rs`'s vote
 path, built for the Tier-B election-safety proof (S2). Modeling decisions
 (settled at plan time):
 
@@ -49,7 +49,7 @@ inductive Role where
 deriving Repr, DecidableEq
 
 /-- The vote-relevant slice of one node's `ElectionSm`
-(`uc2_consensus/src/election.rs`). `votedFor = some (term, id)` mirrors the
+(`uc_consensus/src/election.rs`). `votedFor = some (term, id)` mirrors the
 Rust `voted_for: Option<(u32, NodeId)>`; `votesReceived` mirrors
 `votes_received` (a dedup'd `Vec<NodeId>` in Rust, a `Finset` here);
 `lastTerm`/`durable` are the `log_ok` inputs (`term_map.last`, `durable`) —

@@ -1,0 +1,96 @@
+# ultima_cluster gateway edge configuration.
+#
+# Install as /etc/uc2/gateway.toml and start with:
+#     uc2-gateway --config /etc/uc2/gateway.toml
+#
+# Unknown keys are a startup REFUSAL, not a warning — a typo can never be
+# silently ignored. Every optional field below shows its default, so a file
+# stating only the required fields behaves exactly as this one does.
+#
+# The gateway is meant to run co-located with a uc2-node on the same host
+# (packaging/systemd/uc2-gateway.service BindsTo=uc2-node.service) and
+# attaches to that node's instance directory over shmem — it holds no durable
+# state of its own. If the node's shmem instance restarts underneath a running
+# gateway (a crash-and-restart, an upgrade), the gateway notices, refuses new
+# connections, and exits 1 so the supervisor (systemd Restart=on-failure)
+# brings a fresh gateway up against the new node instance.
+
+# ---------------------------------------------------------------- required
+
+[local]
+# The co-located node's instance directory — the same instance_dir the
+# uc2-node.toml on this host points at.
+instance_dir = "/srv/uc2/n0"
+
+# Application identity. Must match the node's app_id exactly.
+app_id = "myapp"
+
+# Where remote clients connect. 0.0.0.0 accepts on every interface.
+#
+# EXPOSURE: this is the most exposed surface in the system and it is
+# UNAUTHENTICATED. The remote protocol is plain TCP — no client credential, no
+# TLS in this release — so reachability IS authorization: anyone who can open a
+# socket here can submit commands and run queries. Bind it to a private or
+# loopback interface your application tier can reach, or front it with your own
+# TLS/authentication proxy. Do not put 0.0.0.0 on a host with a public
+# interface. See docs/security/attack-surface.md.
+listen = "0.0.0.0:9200"
+
+# Every cluster member's *gateway* address, keyed by its node id — how
+# REDIRECT and LEADER_CHANGED tell a client where the current leader is. The
+# cnc page carries node ids and roles but no addresses, so this map has to be
+# stated out of band, the same way Aeron states ingressEndpoints. Keep this
+# table IDENTICAL on every host's gateway.toml.
+[[members]]
+node_id = 0
+gateway = "10.0.0.10:9200"
+[[members]]
+node_id = 1
+gateway = "10.0.0.11:9200"
+[[members]]
+node_id = 2
+gateway = "10.0.0.12:9200"
+
+# ---------------------------------------------------------------- optional
+
+[limits]
+# The local Engine's inflight window, shared across every connection. The edge
+# holds back 1/8 of it as headroom and divides the rest — the "grant budget" —
+# equally across its live connections.
+max_inflight = 4096
+# CEILING on one connection's credits. The actual grant is
+# clamp(budget / live_connections, 1, per_conn_inflight), where budget is
+# max_inflight less its 1/8 headroom (3584 at the default above), so this
+# value binds only while few connections are attached. A value above the
+# budget is a startup REFUSAL (PerConnExceedsBudget); max_connections above
+# the budget is a startup WARNING (every connection past it floors at 1
+# credit). See docs/reference/gateway-config.md, "The grant budget".
+per_conn_inflight = 256
+# The Engine's per-request deadline, in milliseconds. A request that blows it
+# completes as TimedOut and the client is told UNKNOWN.
+#
+# It is ALSO a client's exposure window when this host's node has died but
+# systemd has not stopped the gateway yet: the cnc page stays frozen with
+# CAN_SERVE set, so the edge keeps accepting SUBMITs into a ring nobody drains
+# and can only answer them UNKNOWN this long later. 2000 is a better number
+# than the 10000 default for most gateways — it bounds how long a client is
+# pinned to a dead node before it can re-send somewhere useful, at the cost of
+# calling a genuinely slow (but live) request UNKNOWN sooner. See
+# docs/how-to/run-a-gateway.md, "When the node underneath dies".
+request_timeout_ms = 10000
+# A connection with no write for this long (ms) gets a standalone STATUS —
+# also the edge->client liveness tick, so keep it well under a client's
+# dead_after.
+status_interval_ms = 200
+# Hard ceiling on simultaneously-open client connections. Each one costs a
+# reader thread and a socket, so this is a real resource bound; over it, the
+# edge answers HELLO_REFUSED{BUSY} (reason 4) and the client tries the next
+# member rather than being silently starved here.
+max_connections = 1024
+
+[session]
+# true = prepend a 16-byte client_id/seq envelope to SUBMIT payloads and lift
+# the Sessioned tag off the response into RESPONSE flags, so a re-sent write
+# is answered "replayed" instead of applied twice. false = raw pass-through
+# (Aeron parity; dedup becomes the application's problem).
+envelope = true

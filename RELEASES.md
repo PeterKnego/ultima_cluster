@@ -7,6 +7,66 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## v2.9.0 — <tag date> — one prefix: every crate is now `uc_*`
+<!-- tag date: fill at tag time -->
+
+**A rename, and nothing else.** No behaviour changed, no wire or cnc change, no
+configuration change, and **no binary was renamed** — an operator upgrading from
+`2.8.1` swaps binaries as usual and touches nothing else. What moved is the
+*package* names, which had accumulated three inconsistent conventions (`uc2_*`,
+the un-underscored `uc2ctl`, and `ultima-journal`) and carried an internal
+version number — `2` — into names that were about to become permanent on
+crates.io. Since the [ordered crates.io publish](docs/how-to/cut-a-release.md)
+had never been run, this was the last moment it was free.
+
+| was | is |
+|---|---|
+| `uc_protocol` | `uc_protocol` (unchanged) |
+| `uc2_log`, `uc2_net`, `uc2_crypto`, `uc2_consensus` | `uc_log`, `uc_net`, `uc_crypto`, `uc_consensus` |
+| `uc2_node`, `uc2_service`, `uc2_client` | `uc_node`, `uc_service`, `uc_client` |
+| `uc2_remote`, `uc2_gateway` | `uc_remote`, `uc_gateway` |
+| `uc2ctl` (package) | `uc_ctl` (the **binary** is still `uc2ctl`) |
+| `ultima-journal` | `uc_journal` |
+| `uc2_sim`, `uc-lincheck`, `uc2-crashtest`, `uc2-fuzz` (unpublished) | `uc_sim`, `uc_lincheck`, `uc_crashtest`, `uc_fuzz` |
+
+Each crate's **directory** was renamed with it, so `uc_node/src/node.rs` is
+where `uc_node` lives.
+
+- **Nothing an operator touches was renamed.** The binaries are still
+  `uc2-node`, `uc2ctl` and `uc2-gateway`; the systemd units, the
+  `ghcr.io/peterknego/uc2` image, `compose.yml`'s healthchecks, the instance-dir
+  layout and every `/metrics` name (`uc2_is_leader`, `uc2_fsm_lag_bytes`, …) are
+  byte-for-byte what `2.8.1` shipped. Dashboards and alert rules need no edit.
+  `uc_ctl` declares `[[bin]] name = "uc2ctl"` explicitly so the package rename
+  cannot leak into the CLI. → [Run a cluster](docs/how-to/run-a-cluster.md)
+- **What does break: source that names the old crates.** If you build against
+  the workspace, `use uc2_service::…` and `cargo build -p uc2_node` stop
+  resolving. The fix is mechanical, and the names do not collide with anything
+  else:
+
+  ```sh
+  sed -i 's/uc2_log/uc_log/g; s/uc2_net/uc_net/g; s/uc2_crypto/uc_crypto/g;
+          s/uc2_consensus/uc_consensus/g; s/uc2_node/uc_node/g;
+          s/uc2_service/uc_service/g; s/uc2_client/uc_client/g;
+          s/uc2_remote/uc_remote/g; s/uc2_gateway/uc_gateway/g;
+          s/ultima_journal/uc_journal/g; s/ultima-journal/uc_journal/g' \
+      $(grep -rl 'uc2_\|ultima_journal' .)
+  # and `-p uc2ctl` → `-p uc_ctl` (the *binary* name `uc2ctl` stays)
+  ```
+
+- **Why this is `2.9.0` and not `3.0.0`.** Renaming a promised item's path is a
+  major change under [the semver policy](docs/reference/semver-policy.md), and
+  every promised path moved. It shipped as a minor on one fact that can never
+  recur: **nothing had ever been published to crates.io**, so no resolver and no
+  lockfile anywhere could have referred to the old names. The policy now records
+  this as a single, spent exception — any later rename of a promised path is a
+  `3.0.0`. →
+  [Versioning and the semver promise](docs/reference/semver-policy.md#the-one-carve-out-the-290-crate-rename)
+- **Reading older docs and commits.** Release entries below this one, the gate
+  docs and the superpowers plans were rewritten to the new names so their
+  commands still run; the git history before the rename was not. A pre-rename
+  commit naming `uc_node` means v1's deleted crate, not this one.
+
 ## v2.8.1 — 2026-08-30 — the multi-service proof pass (M14c2)
 
 **A proof-only release.** No new feature, no configuration change, and no wire
@@ -22,7 +82,7 @@ deferrals M14c left open. The coverage record, with what is still open:
 [VERIFICATION § 11](docs/VERIFICATION.md#11-what-is-not-verified).
 
 - **Linearizability with two FSMs, bounded and lockstep** — `two_fsm_bounded`
-  and `two_fsm_lockstep` ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs))
+  and `two_fsm_lockstep` ([`uc_node/tests/lin_v2.rs`](uc_node/tests/lin_v2.rs))
   drive the M6 fault set (leader kills, service crashes, purge and snapshot
   churn) against two attached FSMs, and check **one WGL history per FSM** with
   the untouched checker. On top of that sits a second oracle:
@@ -34,7 +94,7 @@ deferrals M14c left open. The coverage record, with what is still open:
   [How multi-service works](docs/notes/uc2-m14-multi-service-explained.md)
 - **A slow FSM does not break the pair, and does not get left behind** —
   `two_fsm_slow` / `two_fsm_slow_lockstep`
-  ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs)) run a normal FSM
+  ([`uc_node/tests/lin_v2.rs`](uc_node/tests/lin_v2.rs)) run a normal FSM
   beside one that takes 200 µs per apply and assert two things every 50 ms: the
   separation stays inside the lag policy, **and** over the run's second half
   the two FSMs' apply rates agree within 10 %. Measured ratio: 1.000 — both
@@ -47,14 +107,14 @@ deferrals M14c left open. The coverage record, with what is still open:
   [Configuration § `[services]`](docs/reference/configuration.md#services)
 - **Partition and quorum loss with two FSMs** —
   `minority_partition_and_heal_two_fsm`
-  ([`uc2_node/tests/lin_partition_v2.rs`](uc2_node/tests/lin_partition_v2.rs)):
+  ([`uc_node/tests/lin_partition_v2.rs`](uc_node/tests/lin_partition_v2.rs)):
   a minority is isolated, the majority keeps writing, the partition heals, and
   both FSMs' histories are checked separately with equivalence asserted before
   either verdict is read.
 - **`SIGKILL` with two FSMs** — `two_fsm_service_sigkill` kills and respawns
   one FSM's process under load; `two_fsm_node_sigkill` kills the node and both
   services together and brings them all back
-  ([`examples/uc2-crashtest/tests/hard_crash.rs`](examples/uc2-crashtest/tests/hard_crash.rs)).
+  ([`examples/uc_crashtest/tests/hard_crash.rs`](examples/uc_crashtest/tests/hard_crash.rs)).
   Real processes, real `kill -9`; every FSM history linearizable and the
   equivalence oracle at zero across every restart.
 - **Elle runs with two FSMs** — a new `quiet_two_fsm` pass records **one
@@ -68,7 +128,7 @@ deferrals M14c left open. The coverage record, with what is still open:
   [Investigate a failed run](docs/how-to/investigate-a-failed-run.md)
 - **A snapshot only shortens a restart together with purge** —
   `snapshot_restart_installs_only_with_purge`
-  ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs)) pins the fact that
+  ([`uc_node/tests/lin_v2.rs`](uc_node/tests/lin_v2.rs)) pins the fact that
   cost the M14 gate its row-d run 1: a `SnapshotPolicy` shortens a service
   restart only when purge is on, **and** only once the live log buffer has
   wrapped past the restart position — below the wrap a restart reads the
@@ -97,7 +157,7 @@ deferrals M14c left open. The coverage record, with what is still open:
   [The experiment](docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md) ·
   [Configuration § `[services]`](docs/reference/configuration.md#services) ·
   [Limits](docs/reference/limits.md)
-- **Fixed:** `uc2_service_lag_waits_total` counted **nothing** for the common
+- **Fixed:** `uc_service_lag_waits_total` counted **nothing** for the common
   bounded case — a byte bound rarely divides the frame stream, so the usual
   pinned state is a cap sitting *inside* the next frame, which the counter's
   old edge never saw; it now counts one episode per bounded mid-frame stall
@@ -149,7 +209,7 @@ one. Proof record, row by row: [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-2
 Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained.md).
 
 - **`[services]`: declare N state machines, bounded or lockstep**
-  (`uc2_node`, `uc2_service`): ids `0..8` (id 0 is the default responder and
+  (`uc_node`, `uc_service`): ids `0..8` (id 0 is the default responder and
   the only one the remote path reaches), each attaching with
   `ServiceConfig::service_id`, holding `service.<id>.lock`, and publishing
   its progress on the cnc page's per-service band. A lag policy keeps them
@@ -159,20 +219,20 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
   stalls only when a quorum's FSMs are stuck — never on one straggler. →
   [Configuration § `[services]`](docs/reference/configuration.md#services) ·
   [Limits](docs/reference/limits.md)
-- **Per-FSM routing and a client fan-in** (`uc2_client`, `uc_protocol`):
+- **Per-FSM routing and a client fan-in** (`uc_client`, `uc_protocol`):
   `submit_to(id)`, `submit_all` (one ticket, every FSM's answer),
   `query_snapshot_on` / `query_linearizable_on`; a query names its FSM on the
   wire and an undeclared id answers `BAD_SERVICE` instead of parking. →
   [How it works § routing and fan-in](docs/notes/uc2-m14-multi-service-explained.md#routing-and-fan-in) · [Read path](docs/reference/read-path.md)
 - **A snapshot session ships every FSM's artifact — wire `0.6.0`**
-  (`uc2_net`): `SNAP_BEGIN` now names the FSM, the sender's declared set and
+  (`uc_net`): `SNAP_BEGIN` now names the FSM, the sender's declared set and
   a layout byte; a joiner adopts the floor only once the whole set has
   landed, and refuses by name a `0.5.0` sender or a mismatched set rather
   than installing half a cluster. → [Upgrade: the 0.6.0 flag day](docs/how-to/upgrade-a-cluster.md#wire-change-in-280-snap_begin-carries-every-fsms-snapshot-060) ·
   [Wire protocol](docs/reference/wire-protocol.md)
-- **Per-FSM observability** (`uc2_node`, `uc2ctl`): `service="<id>"` twins of
-  the service families, `uc2_service_attached`, `uc2_service_lag_bytes`,
-  `uc2_service_lag_waits_total`, `uc2_services_declared`; two alerts
+- **Per-FSM observability** (`uc_node`, `uc2ctl`): `service="<id>"` twins of
+  the service families, `uc_service_attached`, `uc_service_lag_bytes`,
+  `uc_service_lag_waits_total`, `uc_services_declared`; two alerts
   (`Uc2ServiceAbsent`, `Uc2ServicePinnedAtLagBound`) proven to fire; a
   per-FSM table in `uc2ctl status`; `service_attached`/`service_detached`
   transition records. → [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
@@ -257,7 +317,7 @@ together. Nothing here touches consensus, the node-to-node wire protocol, or
 the cnc page; the remote wire protocol stays v1. Proof record, row by row:
 [M13 gate](docs/benchmarks/uc2-m13-gate-2026-08-24.md).
 
-- **A rebuilt remote client** (`uc2_remote`): the same blocking
+- **A rebuilt remote client** (`uc_remote`): the same blocking
   `RemoteClient::submit` / `Ticket::wait` surface, over an `Engine`-shaped
   split — a submitter that encodes straight into a preallocated outgoing
   ring, a writer thread that coalesces whatever is queued into one `write`,
@@ -350,14 +410,14 @@ written down.
   [State-machine contract](docs/reference/state-machine-contract.md) ·
   [Two tiers, one contract](docs/notes/uc2-two-tier-state-machine-contract.md) ·
   [the codec budget spike](docs/notes/2026-08-22-codec-budget-spike.md)
-- **Exactly-once over a remote hop** (`uc2_service::session::Sessioned<S>`):
+- **Exactly-once over a remote hop** (`uc_service::session::Sessioned<S>`):
   wrap either tier and a re-sent request after a failover is classified
   `FRESH` / `REPLAYED` / `EXPIRED` instead of silently applied twice. The
   dedup table is replicated state — it rides snapshots, and
   `install_snapshot` refuses one whose embedded `SessionConfig` disagrees with
   the live node rather than silently retuning it. →
   [State-machine contract](docs/reference/state-machine-contract.md)
-- **A remote protocol and client** (`uc2_remote`, protocol v1): framed TCP,
+- **A remote protocol and client** (`uc_remote`, protocol v1): framed TCP,
   credit-gated flow control, pipelined submit/query, and a `RemoteClient` that
   follows `REDIRECT`/`LEADER_CHANGED` across an election and re-sends
   unanswered requests in order. Written to be re-implemented in another
@@ -453,7 +513,7 @@ written down.
     remembering. All five now return `Option`, the pre-guards are kept, and
     the hot path is byte-identical (F1, `112b81f`). →
     [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
-  - Also: `uc2_remote`'s `request_timeout` is now enforced *while
+  - Also: `uc_remote`'s `request_timeout` is now enforced *while
     reconnecting* (it could be outlived by a reconnect loop — F5,
     `ae0f245`/`fc27536`/`b4b3b0c`), and the architecture doc's log-buffer
     default is corrected to `buffer_bytes`' real 64 MiB.
@@ -666,7 +726,7 @@ and the batched read barrier.
   commits rather than committing unsoundly. →
   [the plain-language explainer](docs/notes/uc2-term-map-window-loss-explained.md) ·
   [wire protocol reference](docs/reference/wire-protocol.md)
-- **Pipelined client SDK**: `uc2_client`'s public `Engine` (split send/poll
+- **Pipelined client SDK**: `uc_client`'s public `Engine` (split send/poll
   halves, exactly-once correlation) and `PipelinedClient` with an
   `await`-able `Ticket` per request. →
   [QUICKSTART — beyond one-shot CLI calls](docs/QUICKSTART.md) ·

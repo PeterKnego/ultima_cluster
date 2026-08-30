@@ -89,7 +89,7 @@ downstream signature.
 
 ## The fixes
 
-1. **Alignment** (`uc2_consensus::reconcile`): locate the leader's first
+1. **Alignment** (`uc_consensus::reconcile`): locate the leader's first
    shipped entry *inside* the follower's full map (terms are strictly
    ascending, so the position is unique) and compare from there. Entries
    below the window are the follower's honest record of history the leader
@@ -97,13 +97,13 @@ downstream signature.
    fires only for the genuine purged-prefix case. A window that starts
    inside our bytes at a term we never observed is proven divergence and
    truncates *at that point* instead of wiping everything.
-2. **Rewind tripwire** (`uc2_service`): if local durability ever drops
+2. **Rewind tripwire** (`uc_service`): if local durability ever drops
    below the service's applied cursor, the incarnation is poisoned — it
    stops applying and answers every read with RETRY — instead of serving
    dead-timeline answers or merging timelines. (In a healthy cluster this
    is unreachable: truncation never cuts below commit and apply never
    passes commit.)
-3. **Persist clamp** (`uc2_log`): the durable copy of the term map keeps
+3. **Persist clamp** (`uc_log`): the durable copy of the term map keeps
    only its newest entries, clamped by asking the encoder rather than
    counting. Boot re-derives the full map from journal frame headers
    anyway; the durable copy's only job is recent coverage.

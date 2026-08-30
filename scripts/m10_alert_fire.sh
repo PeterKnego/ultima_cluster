@@ -2,7 +2,7 @@
 # UC v2 M10 Task 9: fire every shipped alert rule (packaging/prometheus/uc2-alerts.yml)
 # against a deliberately broken cluster, and let promtool adjudicate.
 #
-# Method: `uc2_node/examples/m10_alerts.rs` builds/breaks a real or (where
+# Method: `uc_node/examples/m10_alerts.rs` builds/breaks a real or (where
 # disclosed) synthetic cluster, scrapes every node's REAL /metrics HTTP
 # endpoint once per second over a short bounded real window, and writes
 # `<scenario>.series` files (raw scraped values, unmodified). This script
@@ -52,7 +52,7 @@ echo "== running m10_alerts (builds/breaks clusters, scrapes real /metrics) =="
 # `.series` file into its own `FAIL rule=... (scenario did not produce
 # series)` line.
 m10_status=0
-cargo run --manifest-path "$ROOT/Cargo.toml" -p uc2_node --release --example m10_alerts -- --all --out "$OUT" || m10_status=$?
+cargo run --manifest-path "$ROOT/Cargo.toml" -p uc_node --release --example m10_alerts -- --all --out "$OUT" || m10_status=$?
 if [ "$m10_status" -ne 0 ]; then
     echo "warning: m10_alerts exited $m10_status (at least one scenario panicked — see above)." >&2
     echo "         continuing to per-rule adjudication; affected rules will show as FAIL." >&2
@@ -273,38 +273,38 @@ def build_Uc2ServiceWedged():
     # M14c: this family now also carries per-FSM samples. `select` compares
     # `labels.get(k) == v`, so `None` means "this label is absent" — the
     # aggregate row, which is what the rule's own `{service=""}` matches.
-    svc_row = select(rows, "uc2_service_heartbeat_age_seconds", {"service": None})
-    node_row = select(rows, "uc2_node_heartbeat_age_seconds", {})
+    svc_row = select(rows, "uc_service_heartbeat_age_seconds", {"service": None})
+    node_row = select(rows, "uc_node_heartbeat_age_seconds", {})
     r = new_rule("critical", labels_from=svc_row)  # LHS of `and`
-    add_hold_last(r, svc_row, "uc2_service_heartbeat_age_seconds", 60)
-    add_hold_last(r, node_row, "uc2_node_heartbeat_age_seconds", 60)
+    add_hold_last(r, svc_row, "uc_service_heartbeat_age_seconds", 60)
+    add_hold_last(r, node_row, "uc_node_heartbeat_age_seconds", 60)
     r["eval_time"] = total_for(60)[0]
     return r
 
 
 def build_Uc2ServiceAbsent():
     rows = load_scenario("service_absent")
-    row = select(rows, "uc2_service_attached", {"service": "1"})
+    row = select(rows, "uc_service_attached", {"service": "1"})
     r = new_rule("critical", labels_from=row)  # == 0 keeps every label
-    add_hold_last(r, row, "uc2_service_attached", 30)
+    add_hold_last(r, row, "uc_service_attached", 30)
     r["eval_time"] = total_for(30)[0]
     return r
 
 
 def build_Uc2ServicePinnedAtLagBound():
     rows = load_scenario("fsm_pinned")
-    lag_row = select(rows, "uc2_service_lag_bytes", {"service": "1"})
+    lag_row = select(rows, "uc_service_lag_bytes", {"service": "1"})
     bound_row = select(rows, "uc2_fsm_lag_bytes", {})
     # Review round 2: the rule is now gated on the FSM being ATTACHED (so an
     # absent FSM pages once, as Uc2ServiceAbsent, not twice). The scenario
-    # already scrapes `uc2_service_attached`, so the guard series is the real
+    # already scrapes `uc_service_attached`, so the guard series is the real
     # captured one — it must be replayed here or the rule can never fire.
-    att_row = select(rows, "uc2_service_attached", {"service": "1"})
+    att_row = select(rows, "uc_service_attached", {"service": "1"})
     # group_left keeps the LHS's `service` label; `and on(instance)` keeps it too.
     r = new_rule("warning", labels_from=lag_row)
-    add_hold_last(r, lag_row, "uc2_service_lag_bytes", 30)
+    add_hold_last(r, lag_row, "uc_service_lag_bytes", 30)
     add_hold_last(r, bound_row, "uc2_fsm_lag_bytes", 30)
-    add_hold_last(r, att_row, "uc2_service_attached", 30)
+    add_hold_last(r, att_row, "uc_service_attached", 30)
     r["eval_time"] = total_for(30)[0]
     return r
 
@@ -375,12 +375,12 @@ def build_Uc2PeerLagging():
 def build_Uc2PurgeStalled():
     rows = load_scenario("purge_stalled")
     pe_row = select(rows, "uc2_purge_enabled", {})
-    floor_row = select(rows, "uc2_node_snapshot_floor_bytes", {})
+    floor_row = select(rows, "uc_node_snapshot_floor_bytes", {})
     base_row = select(rows, "uc2_archive_first_base_bytes", {})
     seg_row = select(rows, "uc2_journal_segment_bytes", {})
     r = new_rule("warning", labels_from=pe_row)  # LHS of `and`
     add_hold_last(r, pe_row, "uc2_purge_enabled", 600)
-    add_hold_last(r, floor_row, "uc2_node_snapshot_floor_bytes", 600)
+    add_hold_last(r, floor_row, "uc_node_snapshot_floor_bytes", 600)
     add_hold_last(r, base_row, "uc2_archive_first_base_bytes", 600)
     add_hold_last(r, seg_row, "uc2_journal_segment_bytes", 600)
     r["eval_time"] = total_for(600)[0]

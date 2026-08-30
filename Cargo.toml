@@ -1,27 +1,27 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2ctl", "uc2_service", "uc2_client", "uc2_crypto", "uc-lincheck", "ultima_journal", "examples/uc2-crashtest", "examples/counter", "uc2_remote", "uc2_gateway"]
+members = ["uc_protocol", "uc_log", "uc_net", "uc_consensus", "uc_sim", "uc_node", "uc_ctl", "uc_service", "uc_client", "uc_crypto", "uc_lincheck", "uc_journal", "examples/uc_crashtest", "examples/counter", "uc_remote", "uc_gateway"]
 exclude = ["fuzz"] # cargo-fuzz crate: nightly-only, its own [workspace]; see fuzz/README.md
 
 [workspace.package]
 edition = "2024"
-version = "2.8.1"
+version = "2.9.0"
 license = "Apache-2.0"
 authors = ["Peter Knego"]
 repository = "https://github.com/PeterKnego/ultima_cluster"
 homepage = "https://github.com/PeterKnego/ultima_cluster"
 # FINAL (M12c Task 2, probed 2026-08-23; clippy fix round same day): floor =
-# std::fs::File::try_lock_exclusive/unlock (uc2_node/src/backup.rs), stable
+# std::fs::File::try_lock_exclusive/unlock (uc_node/src/backup.rs), stable
 # since 1.89.0. Probed with the already-installed 1.89.0 toolchain: `cargo
 # +1.89.0 check --workspace --all-targets --locked` (green), `cargo +1.89.0
-# test -p uc2_crypto -p uc_protocol --locked` (green, 132 + 71 passed).
+# test -p uc_crypto -p uc_protocol --locked` (green, 132 + 71 passed).
 # `cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings`
 # was RED on two 1.89-only lints, both now silenced with a targeted
 # `#[allow(..., reason = "...")]` rather than a portability-losing rewrite:
-# clippy::ptr_arg on uc2_node/src/node.rs's `exec(&mut self, act: Action,
+# clippy::ptr_arg on uc_node/src/node.rs's `exec(&mut self, act: Action,
 # _work: &mut Vec<Event>)` (`_work` is deliberately `Vec`, not `[Event]`, as
 # a reserved re-entrant push queue — see the doc comment above `exec`), and
-# clippy::unnecessary_cast on uc2_node/src/bin/uc2-node.rs's
+# clippy::unnecessary_cast on uc_node/src/bin/uc2-node.rs's
 # `free_disk_bytes` (`buf.f_bavail as u64 * buf.f_frsize as u64` normalizes
 # `libc::statvfs` field widths that vary by target — a no-op cast only on
 # this specific build target). Neither lint fires on the pinned 1.96's
@@ -41,7 +41,7 @@ thiserror = "2"
 tracing = "0.1"
 
 # storage
-ultima-journal = { path = "ultima_journal", version = "2.8.1" }
+uc_journal = { path = "uc_journal", version = "2.8.1" }
 # crates.io dep (published 0.1.1) — the workspace builds standalone, no sibling
 # checkout needed. `persistence` is required for snapshot_stream /
 # install_snapshot_stream. For lockstep local development against a checkout,
@@ -83,7 +83,7 @@ hdrhistogram = "7"
 # data (cipherstate.rs:170) and would leave the 16-byte header unauthenticated
 # on the pairwise path. The "risky" in the name is snow warning that the
 # caller then owns nonce management — which this design does deliberately and
-# structurally, per-sender-per-boot, in `uc2_crypto::schedule::derive_send_key`.
+# structurally, per-sender-per-boot, in `uc_crypto::schedule::derive_send_key`.
 # Pure feature flag: no new crates, no version movement.
 #
 # M12c Task 1 (dead-dep sweep, 2026-08-23): deliberately NOT requesting snow's
@@ -95,7 +95,7 @@ hdrhistogram = "7"
 # claim two paragraphs up — `cargo tree -i ring` showed `ring` pulled in
 # solely through this feature, not through the since-removed quinn/rustls
 # deps as originally assumed. Verified: dropping `std` still builds the full
-# workspace and `cargo test -p uc2_crypto` (132/132) is unaffected; `ring`
+# workspace and `cargo test -p uc_crypto` (132/132) is unaffected; `ring`
 # disappears from `cargo tree -i ring` entirely.
 snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "risky-raw-split"] }
 # `zeroize` scrubs the GHASH subkey; the paired `aes` feature below scrubs the

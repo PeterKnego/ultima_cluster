@@ -19,10 +19,10 @@
 use std::time::{Duration, Instant};
 
 use counter::{Applied, Command, CounterSm, Query, QueryResponse};
-use uc2_client::Client;
-use uc2_net::fault::FaultConfig;
-use uc2_node::{CryptoConfig, Node, NodeConfig, PurgePolicy};
-use uc2_service::{ServiceBuilder, ServiceConfig};
+use uc_client::Client;
+use uc_net::fault::FaultConfig;
+use uc_node::{CryptoConfig, Node, NodeConfig, PurgePolicy};
+use uc_service::{ServiceBuilder, ServiceConfig};
 
 const APP_ID: &str = "counter";
 
@@ -51,9 +51,9 @@ fn main() -> anyhow::Result<()> {
         faults: FaultConfig::default(),
         purge: PurgePolicy::Disabled,
         learners: Vec::new(),
-        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: CryptoConfig::Disabled,
-        services: uc2_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::default(),
     })?;
 
     // 2. Wait until this node has won its election and appended (and committed)
