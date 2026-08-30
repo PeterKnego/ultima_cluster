@@ -363,6 +363,38 @@ impl FollowerConfig {
 /// every occurrence; only the log line is throttled.
 const CLEARTEXT_LOG_INTERVAL_NS: u64 = 30_000_000_000; // 30s
 
+/// M14c2 (T10a): an inbound snapshot intake that has seen no chunk for this
+/// long is abandoned — its pre-sized `.part` files unlinked and the
+/// abandonment counted ([`FollowerStats::snap_intake_abandoned`]).
+///
+/// Closes the M14c deferral *"a receiver-side intake timeout (a dead leader
+/// leaves a full `.part` until the next session)"*: `open_snap_part` `set_len`s
+/// each artifact to its FULL announced size, so a leader that dies mid-transfer
+/// (or whose session is refused at its own end) leaves real disk consumed under
+/// `snapshots/<id>/` with nothing that ever reclaims it — the only pre-existing
+/// cleanup is a LATER session replacing the intake, which a joiner that never
+/// gets one never sees.
+///
+/// Deliberately twice the sender's own `SNAP_SESSION_TIMEOUT_NS` (30 s): the
+/// leader gives up first and re-cycles the slot, so this fires only when the
+/// leader is gone rather than racing its normal recovery. Measured from the
+/// last chunk, or from the newest artifact's `SNAP_BEGIN` — a slow but LIVE
+/// transfer keeps refreshing it, however large the artifact or lossy the link.
+pub const SNAP_INTAKE_TIMEOUT_NS: u64 = 60_000_000_000; // 60s
+
+/// M14c2 (T10a): the minimum spacing between two attempts to publish an
+/// intake's completed-but-unrenamed artifacts, per intake.
+///
+/// Closes M14c ruling M(1): `upkeep` calls [`FollowerReceiver::snap_upkeep`]
+/// TWICE per poll iteration and the re-drive had no backoff, so a PERSISTENT
+/// obstacle (a full or read-only snapshot dir, a stray directory on the final
+/// path) cost one to two failing `fsync`/`rename` syscalls per busy-spin
+/// iteration and made `snap_intake_io_failures` climb at the poll rate — while
+/// the operator docs say to read a RISING count as the signal. Paced, the
+/// counter reads as "one per quarter second the obstacle has been in place",
+/// and clearing the obstacle still publishes within a quarter second.
+pub const SNAP_REDRIVE_INTERVAL_NS: u64 = 250_000_000; // 250ms
+
 #[derive(Default)]
 pub struct FollowerStats {
     pub datagrams: AtomicU64,
@@ -489,6 +521,28 @@ pub struct FollowerStats {
     /// the counter that names "the disk, not the wire" (full/read-only
     /// snapshot dir, a stray directory sitting on the final path, EPERM).
     pub snap_intake_io_failures: AtomicU64,
+    /// M14c2 (T10a): inbound snapshot intakes abandoned after
+    /// [`SNAP_INTAKE_TIMEOUT_NS`] with no chunk — the leader died mid-transfer,
+    /// or its session was refused at its own end. The `.part` files are
+    /// unlinked (they are `set_len`'d to the artifact's full size, so leaking
+    /// them is real disk). Not an error on its own: the joiner is still below
+    /// the floor, keeps NAKing, and the next session starts a clean intake. A
+    /// count that keeps rising means transfers are never finishing — look at
+    /// the LEADER (or the link), not at this node's disk.
+    pub snap_intake_abandoned: AtomicU64,
+    /// M14c2 (T10a): `SNAP_BEGIN` bodies from a peer speaking a wire we cannot
+    /// decode at all, counted ONCE PER SESSION (latched until a decodable
+    /// BEGIN arrives).
+    ///
+    /// The companion of `snap_refused_legacy_peer`, which counts every such
+    /// datagram: the leader re-sends its `SNAP_BEGIN` every 20 ms until a
+    /// `SNAP_DONE` comes back, so on a flag day that counter climbs at the
+    /// resend rate and says nothing about how many distinct sessions were
+    /// refused. This one does — and it also separates the two halves of the
+    /// `peer wire 0.5.0` refusal (a body too short to decode vs. a decodable
+    /// body carrying `layout != SNAP_BEGIN_LAYOUT_V2`), which
+    /// `snap_refused_legacy_peer` deliberately folds together.
+    pub snap_begin_undecodable: AtomicU64,
 }
 
 /// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
@@ -554,6 +608,23 @@ struct SnapIntake {
     /// Forwarded to `incoming_snapshot_config` on completion, alongside
     /// `incoming_snapshot_pos`, for the consensus agent's install handler.
     config: Vec<u8>,
+    /// M14c2 (T10a): when this intake last saw evidence the transfer is LIVE —
+    /// a chunk that landed, or a new artifact's `SNAP_BEGIN`. The
+    /// [`SNAP_INTAKE_TIMEOUT_NS`] deadline is measured from here, so an
+    /// artifact of any size on a link of any quality stays alive as long as
+    /// bytes keep arriving.
+    last_chunk_ns: u64,
+    /// M14c2 (T10a): when `snap_upkeep` last ATTEMPTED to publish this intake's
+    /// completed artifacts. `None` = never, so the first attempt is immediate
+    /// (the process clock starts near zero, and a fixed `0` would otherwise
+    /// gate the re-drive for the first [`SNAP_REDRIVE_INTERVAL_NS`] of the
+    /// node's life). Only a real attempt updates it — a call the cadence
+    /// refuses does not push the next one out.
+    last_publish_try_ns: Option<u64>,
+    /// M14c2 (T10a): this intake's `snap_chunk` write failure has been logged.
+    /// The counter increments on every failure; the operator line is latched
+    /// per intake so a full disk cannot write one per datagram.
+    write_failure_logged: bool,
 }
 
 pub struct FollowerReceiver {
@@ -617,6 +688,11 @@ pub struct FollowerReceiver {
     own_declared: u64,
     /// M6 Task 6: the in-flight inbound snapshot transfer, if any.
     snap_intake: Option<SnapIntake>,
+    /// M14c2 (T10a): an undecodable `SNAP_BEGIN` has already been counted (and
+    /// logged) for the session in progress. Cleared by the next DECODABLE
+    /// `SNAP_BEGIN` — the wire is speakable again, so a later refusal is a
+    /// genuinely new one. See [`FollowerStats::snap_begin_undecodable`].
+    snap_begin_undecodable_latched: bool,
     /// M14c: the last session that COMPLETED here. The sender keeps re-sending
     /// a `SNAP_BEGIN` on a 20 ms cadence until our `SNAP_DONE` reaches it, so a
     /// lost DONE would otherwise re-open (and re-download) a set we already
@@ -847,6 +923,7 @@ impl FollowerReceiver {
             snap_dir: None,
             own_declared: 0,
             snap_intake: None,
+            snap_begin_undecodable_latched: false,
             snap_last_done: None,
             incoming_snapshot_pos: None,
             incoming_snapshot_config: None,
@@ -1598,6 +1675,22 @@ impl FollowerReceiver {
                     // on a node that receives snapshots at all (elsewhere kinds
                     // 12/13 are ignored wholesale).
                     self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
+                    // M14c2 (T10a): ...and once per SESSION, because the
+                    // leader re-sends its BEGIN every 20 ms — so the counter
+                    // above measures the resend cadence, not the number of
+                    // refused sessions, and cannot be read as "how bad is this
+                    // flag day". The latch clears on the next decodable BEGIN.
+                    if !self.snap_begin_undecodable_latched {
+                        self.snap_begin_undecodable_latched = true;
+                        self.stats.snap_begin_undecodable.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "uc2_net: SNAP_BEGIN from {from} could not be decoded ({} body \
+                             bytes) -- almost certainly a wire-0.5.0 peer; this node cannot \
+                             install its snapshot set. Upgrade every node together (the \
+                             node<->node wire is a flag day)",
+                            d.len().saturating_sub(DATAGRAM_HEADER_LEN)
+                        );
+                    }
                     self.snap_drop_intake_from(from);
                 }
             }
@@ -1640,6 +1733,15 @@ impl FollowerReceiver {
         let Some(root) = self.snap_dir.clone() else {
             return; // this node does not receive snapshots
         };
+        // M14c2 (T10a): a body we CAN decode re-arms the undecodable latch —
+        // the peer is speaking a wire we understand, so the next undecodable
+        // BEGIN is a genuinely new refused session, worth its own count and
+        // its own log line. (Same gate as the count itself: only on a node
+        // that receives snapshots at all.)
+        self.snap_begin_undecodable_latched = false;
+        // Read once, up front: every liveness stamp below is taken under a
+        // `&mut self.snap_intake` borrow that excludes `self.now_ns()`.
+        let now = self.now_ns();
         if b.layout != SNAP_BEGIN_LAYOUT_V2 {
             // "peer wire 0.5.0" — a body whose discriminator we do not speak.
             self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
@@ -1702,6 +1804,10 @@ impl FollowerReceiver {
             };
             cur.announced_len += part.len;
             cur.parts.push(part);
+            // A newly announced artifact is progress: the leader is alive and
+            // shipping, so it refreshes the intake's timeout the same way a
+            // chunk does (M14c2 T10a).
+            cur.last_chunk_ns = now;
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1730,6 +1836,9 @@ impl FollowerReceiver {
             got: Rebuilt::new(0),
             nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
             config: b.config,
+            last_chunk_ns: now,
+            last_publish_try_ns: None,
+            write_failure_logged: false,
         });
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
     }
@@ -1768,6 +1877,7 @@ impl FollowerReceiver {
     /// artifact contains it; publish any artifact the contiguous frontier has
     /// now passed.
     fn snap_chunk(&mut self, from: SocketAddr, offset: u64, payload: &[u8]) {
+        let now = self.now_ns(); // read before the `&mut` borrow below
         let Some(intake) = self.snap_intake.as_mut() else {
             return;
         };
@@ -1792,9 +1902,33 @@ impl FollowerReceiver {
         let Some(file) = intake.parts[i].file.as_mut() else {
             return; // already renamed — a duplicate repair chunk
         };
+        // M14c ruling M(2) / M14c2 (T10a): this is the likeliest ENOSPC site on
+        // a joiner — `open_snap_part` `set_len`s the `.part` to its full size
+        // but the file is SPARSE, so the blocks are only allocated here, as
+        // chunks land. Before this the failure was silent: the bytes were never
+        // recorded as landed (correct), the receiver re-NAKed them forever, and
+        // the only thing that ever named the stall was the LEADER's 30 s
+        // session timeout. Counted with the rest of the intake's local I/O; the
+        // operator line is latched per intake so a full disk cannot write one
+        // per datagram.
+        // Nothing here allocates or clones on the SUCCESS path: the diagnostic
+        // strings are built only inside the failure arm.
         if file.seek(SeekFrom::Start(at)).is_err() || file.write_all(payload).is_err() {
+            let first = !intake.write_failure_logged;
+            intake.write_failure_logged = true;
+            if first {
+                eprintln!(
+                    "uc2_net: cannot write snapshot chunk for service {} into {} -- the \
+                     transfer cannot finish; check this node's snapshot directory (full, \
+                     read-only, or obstructed)",
+                    intake.parts[i].service_id,
+                    intake.parts[i].part_path.display()
+                );
+            }
+            self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        intake.last_chunk_ns = now;
         intake.got.insert(offset, end);
         self.snap_publish_complete_parts();
     }
@@ -1986,11 +2120,49 @@ impl FollowerReceiver {
         // stray path" into a completed install instead of a permanent stall.
         // Cheap: one `contiguous()` read and a walk of the (single-digit) parts,
         // and only when something is actually outstanding.
+        //
+        // M14c2 (T10a): paced by [`SNAP_REDRIVE_INTERVAL_NS`] per intake
+        // (ruling M(1)). `upkeep` calls this twice per poll iteration, so
+        // unpaced a PERSISTENT obstacle cost one to two failing syscalls per
+        // busy-spin iteration and made `snap_intake_io_failures` climb at the
+        // poll rate — unreadable as the "rising count" signal the docs name.
         if self.snap_intake.as_ref().is_some_and(|i| {
-            let contiguous = i.got.contiguous();
-            i.parts.iter().any(|p| !p.done && contiguous >= p.base + p.len)
+            i.last_publish_try_ns.is_none_or(|t| now.saturating_sub(t) >= SNAP_REDRIVE_INTERVAL_NS)
+                && {
+                    let contiguous = i.got.contiguous();
+                    i.parts.iter().any(|p| !p.done && contiguous >= p.base + p.len)
+                }
         }) {
+            if let Some(i) = self.snap_intake.as_mut() {
+                i.last_publish_try_ns = Some(now);
+            }
             self.snap_publish_complete_parts();
+        }
+        // M14c2 (T10a): a transfer with no sign of life for
+        // [`SNAP_INTAKE_TIMEOUT_NS`] is abandoned — the leader died
+        // mid-transfer, or its session was refused at its own end. Dropping the
+        // intake unlinks its pre-sized `.part` files, which are `set_len`'d to
+        // the artifacts' FULL size and would otherwise sit under
+        // `snapshots/<id>/` until some later session happened to replace them.
+        // The node is still below the floor: it keeps NAKing, and the next
+        // session opens a clean intake. Placed AFTER the re-drive so a
+        // publish that would have succeeded on this very call is never thrown
+        // away.
+        if let Some(peer) = self
+            .snap_intake
+            .as_ref()
+            .filter(|i| now.saturating_sub(i.last_chunk_ns) >= SNAP_INTAKE_TIMEOUT_NS)
+            .map(|i| i.peer)
+        {
+            self.snap_discard_intake();
+            self.stats.snap_intake_abandoned.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "uc2_net: abandoning the inbound snapshot transfer from {peer} -- no chunk for \
+                 {} s; the partial artifacts have been removed and this node will keep NAKing \
+                 for a fresh session",
+                SNAP_INTAKE_TIMEOUT_NS / 1_000_000_000
+            );
+            return false;
         }
         let Some(intake) = self.snap_intake.as_mut() else {
             return false;
@@ -4742,4 +4914,253 @@ mod tests {
         assert!(dir.path().join("0").join("incoming-8192.part").exists(), "the new .part");
         assert!(!stale.exists(), "the superseded .part must not be orphaned");
     }
+
+    // ---- M14c2 (T10a): the intake's timeout, latches and re-drive cadence ----
+
+    /// Open a live intake for one 64-byte artifact of FSM 0 and hand back the
+    /// receiver, its fake leader, the scratch dir and the `.part`'s path. The
+    /// shared prologue of the tests below.
+    fn intake_open(
+        b: &Arc<LogBuffer>,
+        session: u32,
+    ) -> (FollowerReceiver, FakeLeader, tempfile::TempDir, PathBuf) {
+        let mut leader = FakeLeader::new();
+        let mut r = follower(b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        let to = r.local_addr();
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(session, 0, 4096, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the BEGIN never opened an intake");
+            r.do_work();
+        }
+        let part = dir.path().join("0").join("incoming-4096.part");
+        assert!(part.exists(), "the pre-sized .part is on disk");
+        (r, leader, dir, part)
+    }
+
+    /// M14c2 (T10a): an intake that has seen no chunk for
+    /// [`SNAP_INTAKE_TIMEOUT_NS`] is abandoned — its pre-sized `.part`
+    /// unlinked, the abandonment counted once. Before this a leader that died
+    /// mid-transfer (or a session refused at the far end) left a FULL-SIZE
+    /// `.part` under `snapshots/<id>/` until some later session happened to
+    /// replace it; on a joiner that never gets another one, forever.
+    #[test]
+    fn an_intake_with_no_chunk_for_the_timeout_is_abandoned_unlinked_and_counted() {
+        let b = buffer();
+        let (mut r, mut leader, dir, part) = intake_open(&b, 5);
+        let st = r.stats();
+        let to = r.local_addr();
+        let opened = r.snap_intake.as_ref().unwrap().last_chunk_ns;
+
+        // One nanosecond short of the bar: still live.
+        r.snap_upkeep(opened + SNAP_INTAKE_TIMEOUT_NS - 1);
+        assert!(r.snap_intake.is_some(), "not abandoned before the timeout");
+        assert_eq!(st.snap_intake_abandoned.load(Ordering::Relaxed), 0);
+        assert!(part.exists());
+
+        // At the bar: dropped, unlinked, counted ONCE — `upkeep` calls
+        // `snap_upkeep` twice per duty cycle, and the second call must find
+        // nothing left to abandon.
+        r.snap_upkeep(opened + SNAP_INTAKE_TIMEOUT_NS);
+        r.snap_upkeep(opened + SNAP_INTAKE_TIMEOUT_NS);
+        assert!(r.snap_intake.is_none(), "the dead intake is dropped");
+        assert!(!part.exists(), "its pre-sized .part must not leak");
+        assert_eq!(st.snap_intake_abandoned.load(Ordering::Relaxed), 1, "counted exactly once");
+
+        // A later session opens a fresh intake, exactly as if none had existed.
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(6, 0, 8192, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "a later BEGIN must open a fresh intake");
+            r.do_work();
+        }
+        assert_eq!(r.snap_intake.as_ref().unwrap().session, 6);
+        assert!(dir.path().join("0").join("incoming-8192.part").exists());
+    }
+
+    /// M14c2 (T10a): a chunk RESETS the timeout — a slow-but-live transfer must
+    /// never be abandoned. (The control for the test above: without this the
+    /// bar would be "60 s since the session opened", which a big artifact on a
+    /// lossy link legitimately exceeds.)
+    #[test]
+    fn a_chunk_resets_the_intake_timeout() {
+        let b = buffer();
+        let (mut r, mut leader, _dir, _part) = intake_open(&b, 8);
+        let to = r.local_addr();
+        let opened = r.snap_intake.as_ref().unwrap().last_chunk_ns;
+
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 32]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.as_ref().is_none_or(|i| i.got.contiguous() == 0) {
+            assert!(Instant::now() < deadline, "the chunk never landed");
+            r.do_work();
+        }
+        assert!(
+            r.snap_intake.as_ref().unwrap().last_chunk_ns >= opened,
+            "the chunk refreshed the deadline"
+        );
+        // Past the bar measured from the OPEN, but not from the chunk.
+        let last = r.snap_intake.as_ref().unwrap().last_chunk_ns;
+        r.snap_upkeep(last + SNAP_INTAKE_TIMEOUT_NS - 1);
+        assert!(r.snap_intake.is_some(), "a live transfer is not abandoned");
+    }
+
+    /// M14c2 (T10a): a `SNAP_BEGIN` body we cannot even DECODE is the shape a
+    /// real 0.5.0 flag day produces, and the leader re-sends its BEGIN every
+    /// 20 ms — so `snap_refused_legacy_peer` climbs at the resend rate and says
+    /// nothing about how many SESSIONS were refused. `snap_begin_undecodable`
+    /// is latched: one per session, cleared the moment a decodable BEGIN
+    /// arrives.
+    #[test]
+    fn an_undecodable_begin_is_counted_once_per_session() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        let st = r.stats();
+        let to = r.local_addr();
+
+        // A genuine 0.5.0 fixed body is 26 bytes — too short to decode as
+        // 0.6.0 at all. The leader re-sends it; three arrive.
+        let short = vec![0u8; 26];
+        for _ in 0..3 {
+            leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &short);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_legacy_peer.load(Relaxed) < 3 {
+            assert!(Instant::now() < deadline, "the three legacy bodies were never counted");
+            r.do_work();
+        }
+        assert_eq!(
+            st.snap_begin_undecodable.load(Relaxed),
+            1,
+            "one per SESSION, however often the leader re-sends it"
+        );
+
+        // A decodable BEGIN clears the latch: the wire is speakable again.
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(9, 0, 4096, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the decodable BEGIN never opened an intake");
+            r.do_work();
+        }
+        assert_eq!(st.snap_begin_undecodable.load(Relaxed), 1, "a decodable BEGIN counts nothing");
+
+        for _ in 0..2 {
+            leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &short);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_legacy_peer.load(Relaxed) < 5 {
+            assert!(Instant::now() < deadline, "the second legacy burst was never counted");
+            r.do_work();
+        }
+        assert_eq!(
+            st.snap_begin_undecodable.load(Relaxed),
+            2,
+            "the cleared latch re-arms: a SECOND refused session is a second count"
+        );
+    }
+
+    /// M14c ruling M(2) / M14c2 (T10a): a `seek`/`write_all` failure landing a
+    /// chunk in the `.part` was SILENT — and it is the likeliest ENOSPC site on
+    /// a joiner, because the `.part` is pre-sized sparse and its blocks are
+    /// only allocated as chunks arrive. The stall was named only by the
+    /// sender's 30 s session timeout, never by
+    /// `uc2_snapshot_intake_io_failures_total`.
+    ///
+    /// Injection: the intake's write handle is swapped for a READ-ONLY handle
+    /// on the very same `.part`. `write(2)` then really fails (EBADF) inside
+    /// the real `snap_chunk` — a genuine I/O error through the shipped code
+    /// path, not a stub.
+    #[test]
+    fn a_chunk_write_failure_is_counted_and_never_panics() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let (mut r, mut leader, _dir, part) = intake_open(&b, 12);
+        let st = r.stats();
+        let to = r.local_addr();
+        r.snap_intake.as_mut().unwrap().parts[0].file =
+            Some(std::fs::File::open(&part).expect("a read-only handle on the same .part"));
+
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 32]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_intake_io_failures.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "the failed chunk write was never counted");
+            r.do_work();
+        }
+        assert_eq!(
+            r.snap_intake.as_ref().unwrap().got.contiguous(),
+            0,
+            "bytes that were never written must not be recorded as landed"
+        );
+
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 32, TERM, &[0xCDu8; 32]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_intake_io_failures.load(Relaxed) < 2 {
+            assert!(Instant::now() < deadline, "the second failure was never counted");
+            r.do_work();
+        }
+        assert!(r.snap_intake.is_some(), "a write failure is not fatal to the intake");
+    }
+
+    /// M14c ruling M(1) / M14c2 (T10a): `upkeep` calls `snap_upkeep` TWICE per
+    /// poll iteration, so a PERSISTENT rename obstacle burned one to two
+    /// failing syscalls per spin and `snap_intake_io_failures` climbed at the
+    /// poll rate. The docs tell an operator to read a RISING count as the
+    /// signal, which a poll-rate climb makes unreadable.
+    /// [`SNAP_REDRIVE_INTERVAL_NS`] paces the re-drive to one attempt per
+    /// interval per intake.
+    #[test]
+    fn the_publish_re_drive_is_paced_to_one_attempt_per_interval() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        let st = r.stats();
+        let to = r.local_addr();
+        // A DIRECTORY on the artifact's final path: the rename of the completed
+        // `.part` fails (EISDIR) on every attempt, deterministically, on every
+        // filesystem — the stand-in for a read-only or obstructed snapshot dir.
+        std::fs::create_dir_all(dir.path().join("0")).unwrap();
+        std::fs::create_dir(dir.path().join("0").join("snap-4096.ultsnap")).unwrap();
+
+        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(14, 0, 4096, 64, 0b1));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the BEGIN never opened an intake");
+            r.do_work();
+        }
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 64]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_intake_io_failures.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "the blocked publish was never counted");
+            r.do_work();
+        }
+
+        // A virtual clock well past every real reading taken so far, so the
+        // cadence this test measures is entirely its own.
+        let t0 = r.now_ns() + 10_000_000_000;
+        let base = st.snap_intake_io_failures.load(Relaxed);
+        r.snap_upkeep(t0);
+        r.snap_upkeep(t0 + 1_000_000); // 1 ms later
+        assert_eq!(
+            st.snap_intake_io_failures.load(Relaxed) - base,
+            1,
+            "two calls 1 ms apart attempt the publish ONCE"
+        );
+        r.snap_upkeep(t0 + 1_000_000 + SNAP_REDRIVE_INTERVAL_NS);
+        assert_eq!(
+            st.snap_intake_io_failures.load(Relaxed) - base,
+            2,
+            "past the interval, the re-drive attempts again"
+        );
+        assert!(r.snap_intake.is_some(), "the intake is still waiting on the obstacle");
+    }
+
 }

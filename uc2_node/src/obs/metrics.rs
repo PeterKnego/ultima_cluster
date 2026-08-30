@@ -83,6 +83,12 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_refused_legacy_peer_total",
     "uc2_snapshot_refused_declared_set_total",
     "uc2_snapshot_intake_io_failures_total",
+    // M14c2 (T10a): the three counters that close M14c's snapshot-session
+    // deferrals — the leader's `File::open` TOCTOU, the joiner's abandoned
+    // intake, and the once-per-session undecodable `SNAP_BEGIN`.
+    "uc2_snapshot_open_failed_total",
+    "uc2_snapshot_intake_abandoned_total",
+    "uc2_snapshot_begin_undecodable_total",
     "uc2_reports_implausible_total",
     "uc2_crypto_handshake_failures_total",
     "uc2_sender_seal_failures_total",
@@ -650,6 +656,18 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_snapshot_intake_abandoned_total",
+        "Inbound snapshot transfers abandoned after 60 s with no chunk (the leader died mid-transfer): the partial artifacts are removed and this node keeps NAKing for a fresh session. A rising count means transfers never finish — look at the leader or the link, not this node's disk (M14c2).",
+        s.receiver.snap_intake_abandoned.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_snapshot_begin_undecodable_total",
+        "Snapshot SESSIONS refused because their SNAP_BEGIN body could not be decoded at all — the realistic wire-0.5.0 flag-day shape. Counted once per session (uc2_snapshot_refused_legacy_peer_total counts every datagram, and the leader re-sends one every 20 ms). Nonzero means the fleet is mixed-version; upgrade every node (M14c2).",
+        s.receiver.snap_begin_undecodable.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
         "uc2_reports_implausible_total",
         "Durable reports declined for disagreeing with this node's term map.",
         s.reports_implausible.load(Ordering::Relaxed),
@@ -779,6 +797,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         "uc2_snapshot_chunk_naks_total",
         "SNAP_CHUNK datagrams sent to repair a peer NAK.",
         s.sender.snap_chunk_naks.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_snapshot_open_failed_total",
+        "Snapshot sessions this node refused to open because an artifact file could not be opened (the store listed it, then it was purged, made unreadable, or replaced). The peer's below-floor NAK stays a counted overrun and is re-sent, so a transient race self-heals; a persistent count means this node's OWN snapshot directory is bad while a peer is trying to join (M14c2).",
+        s.sender.snap_open_failed.load(Ordering::Relaxed),
     );
 
     let dropped_samples: Vec<(String, u64)> = [
@@ -1088,6 +1112,22 @@ mod tests {
         s.receiver.snap_intake_io_failures.fetch_add(4, Ordering::Relaxed);
         let text = render_prometheus(&s);
         assert!(text.contains("uc2_snapshot_intake_io_failures_total 4\n"), "{text}");
+    }
+
+    /// M14c2 (T10a): the three counters that close M14c's snapshot-session
+    /// deferrals. `every_contract_series_is_present` proves the families are
+    /// EXPORTED; this proves each one is wired to the right stats cell —
+    /// distinct values, so a copy-paste of the wrong field is caught.
+    #[test]
+    fn the_m14c2_snapshot_counters_render_from_their_own_stats_cells() {
+        let s = synthetic_sources();
+        s.sender.snap_open_failed.fetch_add(2, Ordering::Relaxed);
+        s.receiver.snap_intake_abandoned.fetch_add(5, Ordering::Relaxed);
+        s.receiver.snap_begin_undecodable.fetch_add(7, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_snapshot_open_failed_total 2\n"), "{text}");
+        assert!(text.contains("uc2_snapshot_intake_abandoned_total 5\n"), "{text}");
+        assert!(text.contains("uc2_snapshot_begin_undecodable_total 7\n"), "{text}");
     }
 
     #[test]

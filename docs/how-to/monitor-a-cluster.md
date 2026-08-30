@@ -55,20 +55,27 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 73 families — is the
+exposition. The full series contract — 76 families — is the
 `CONTRACT_SERIES` array in
 [`uc2_node/src/obs/metrics.rs`](../../uc2_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
 it cannot drift silently. This page names only the load-bearing subset: the
 lag/saturation/heartbeat-age/peer-lag gauges and the `agent_alive` gauge that
 the alert rules below key on, plus the counters they watch for edges. For
-everything else — snapshot/session counters (among them
-`uc2_snapshot_intake_io_failures_total`, the intake-side "the disk, not the
-wire" counter: a `.part` that could not be created or a completed artifact
-whose fsync/rename failed; retried, so a *rising* count, not a nonzero one,
-is the signal), sender/receiver datagram and byte totals, resync counters —
-read the source array; each family carries
+everything else — snapshot/session counters, sender/receiver datagram and
+byte totals, resync counters — read the source array; each family carries
 its own one-line doc comment there.
+
+Five of the snapshot-session counters answer the question "why is this
+joiner not converging?", and they split it cleanly between the two ends:
+
+| series | end | means |
+|---|---|---|
+| `uc2_snapshot_intake_io_failures_total` | joiner | this node's disk: a `.part` that could not be created or written, or a completed artifact whose fsync/rename failed. Retried, so a *rising* count — not a nonzero one — is the signal; since 2.8.1 the retry is paced to one attempt per 250 ms per transfer, so it climbs at four per second while the obstacle stands, not at the poll rate. |
+| `uc2_snapshot_intake_abandoned_total` | joiner | a transfer saw no chunk for 60 s and was dropped, its partial artifacts removed. The leader (or the link) went away mid-transfer; this node keeps NAKing for a fresh session. |
+| `uc2_snapshot_open_failed_total` | leader | this node could not open an artifact its own snapshot store had just listed, so it refused to ship the set. A one-off is a purge racing a session; a persistent count means look at *this* node's snapshot directory while a peer is trying to join. |
+| `uc2_snapshot_begin_undecodable_total` | joiner | one refused session per count, because the sender's `SNAP_BEGIN` could not be decoded at all — the realistic wire-0.5.0 flag-day shape. Nonzero means the fleet is mixed-version; upgrade every node together. |
+| `uc2_snapshot_refused_legacy_peer_total` | joiner | every such datagram, not every session — the leader re-sends a `SNAP_BEGIN` every 20 ms, so this one measures the resend cadence. Read the row above it for "how many sessions". |
 
 Two families worth calling out because their shape is easy to misread:
 `uc2_ingress_holes_skipped_total` and `uc2_query_holes_skipped_total`

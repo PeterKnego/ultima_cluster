@@ -261,6 +261,23 @@ pub struct SenderStats {
     pub snap_chunks: AtomicU64,
     /// M6 Task 6: SNAP_CHUNK datagrams sent specifically to repair a peer NAK.
     pub snap_chunk_naks: AtomicU64,
+    /// M14c2 (T10a): a snapshot set was refused because one of its artifact
+    /// FILES could not be opened — the `File::open` TOCTOU. The
+    /// `SnapshotSource` closure lists what each FSM's store says is durable
+    /// below its persisted floor marker; between that listing and this open the
+    /// file can be gone (a purge racing the session), unreadable (a permission
+    /// or ownership change), or replaced by a directory (a hand-edited snapshot
+    /// dir).
+    ///
+    /// Not fatal and not the peer's fault: the NAK stays a counted overrun and
+    /// the peer re-NAKs, so a transient race self-heals. But it was the ONE
+    /// refusal in `try_open_snap_session` with no counter at all —
+    /// indistinguishable from the two ordinary ones (no source wired, a session
+    /// already in flight), so a leader whose snapshot dir had gone bad looked
+    /// exactly like a leader that simply never ships snapshots, while the
+    /// joiner NAKed forever. A PERSISTENT count is "go and look at the
+    /// LEADER's snapshot directory".
+    pub snap_open_failed: AtomicU64,
     /// M8: an outgoing datagram this sender could not seal — dropped rather
     /// than sent. Covers both scopes (T17 widened it from T10's DATA/HEARTBEAT
     /// only):
@@ -328,6 +345,14 @@ pub struct Sender {
     snapshot_source: Option<SnapshotSource>,
     /// M6 Task 6: the single in-flight outbound snapshot session, if any.
     snap: Option<SnapSession>,
+    /// M14c2 (T10a): `snap_open_failed`'s operator `eprintln!` has fired. The
+    /// counter increments on every occurrence (undercounting would hide the
+    /// problem); the log line is latched for the life of the process, because
+    /// a below-floor peer re-NAKs on its own backoff and a genuinely bad
+    /// snapshot dir would otherwise write a line per NAK, forever. Cleared
+    /// when a session DOES open — a set that opens proves the dir is readable
+    /// again, so the next failure is worth naming.
+    snap_open_failed_logged: bool,
     /// M6 Task 6: monotonic session-id generator — distinguishes a fresh session
     /// from a just-closed one so a stale SNAP_NAK/SNAP_DONE can't cross-talk.
     snap_session_seq: u32,
@@ -509,6 +534,7 @@ impl Sender {
             was_leader: false,
             snapshot_source: None,
             snap: None,
+            snap_open_failed_logged: false,
             snap_session_seq: 0,
             peer_obs: None,
             crypto,
@@ -1053,8 +1079,27 @@ impl Sender {
                 return false; // empty artifact, or not strictly ascending
             }
             prev_id = Some(a.service_id);
-            let Ok(file) = std::fs::File::open(&a.path) else {
-                return false;
+            let file = match std::fs::File::open(&a.path) {
+                Ok(f) => f,
+                Err(e) => {
+                    // M14c2 (T10a): the TOCTOU between the store's listing and
+                    // this open. Counted so a leader whose snapshot dir has
+                    // gone bad is diagnosable instead of looking like a leader
+                    // that simply never ships snapshots; see
+                    // [`SenderStats::snap_open_failed`].
+                    self.stats.snap_open_failed.fetch_add(1, Ordering::Relaxed);
+                    if !self.snap_open_failed_logged {
+                        self.snap_open_failed_logged = true;
+                        eprintln!(
+                            "uc2_net: snapshot session refused -- cannot open artifact {} for \
+                             service {}: {e} (the peer's below-floor NAK stays an overrun and \
+                             will be re-sent; check this node's snapshot directory)",
+                            a.path.display(),
+                            a.service_id
+                        );
+                    }
+                    return false;
+                }
             };
             parts.push(SnapPart {
                 service_id: a.service_id,
@@ -1080,6 +1125,9 @@ impl Sender {
             config: set.config,
         });
         self.stats.snap_sessions.fetch_add(1, Ordering::Relaxed);
+        // A set that opened proves the snapshot dir is readable again: re-arm
+        // the open-failure log so the NEXT bad set is named once more.
+        self.snap_open_failed_logged = false;
         true
     }
 
@@ -1155,6 +1203,19 @@ impl Sender {
             let Some((offset, length)) = sess.naks.pop_front() else {
                 break;
             };
+            // M14c2 (T10a): a request inside an artifact whose `SNAP_BEGIN` has
+            // not gone out in this session is SKIPPED — not served, not an
+            // error. The receiver can only place a chunk inside an artifact it
+            // has already announced (`snap_chunk` drops everything else), so
+            // serving one spends this cycle's chunk budget on datagrams that
+            // are guaranteed to be discarded, while the peer stays blocked.
+            // The BEGIN goes out on its own cadence (this cycle's `target` is
+            // the HEAD request's artifact, so the head case fixes itself here);
+            // dropping the request is the same shape a lost datagram already
+            // takes — the peer's snapshot NAK timer re-fires.
+            if sess.part_at(offset).is_some_and(|i| sess.parts[i].begun_ns.is_none()) {
+                continue;
+            }
             let n = self.send_snap_chunk(&mut sess, offset, true);
             if n == 0 {
                 break; // outside every artifact / read error — drop the request
@@ -3044,6 +3105,253 @@ mod tests {
         ok.on_nak(ok_f.addr(), 0, 96);
         ok.do_work();
         assert!(ok.snap.is_some(), "a covering set still opens a session");
+    }
+
+    // ==== M14c2 (T10a): `try_open_snap_session`'s refusal paths ==============
+    //
+    // M14c deferred the unit tests for these. Each refusal must (a) leave
+    // `self.snap` empty, (b) put NOT ONE datagram of a half-formed session on
+    // the wire, and (c) stay a counted `overruns` — the recoverable shape, the
+    // peer re-NAKs. Only the covering-mask leg was pinned before (by
+    // `a_set_that_does_not_cover_its_declared_mask_never_opens_a_session`).
+
+    /// A scratch directory on REAL DISK, never `/tmp` (RAM-backed tmpfs on the
+    /// dev box — CLAUDE.md). Mirrors `receiver.rs`'s helper of the same name:
+    /// `CARGO_TARGET_TMPDIR` is set only for integration-test binaries and
+    /// these are inline `#[cfg(test)]` unit tests in the lib target, so this
+    /// falls back to a package-relative `target/` directory.
+    fn snap_scratch_dir() -> tempfile::TempDir {
+        let root = std::env::var("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_net_tests")
+        });
+        assert!(
+            !root.starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {}",
+            root.display()
+        );
+        std::fs::create_dir_all(&root).expect("scratch root");
+        tempfile::Builder::new().prefix("uc2-snap-send-").tempdir_in(&root).expect("tempdir")
+    }
+
+    /// A `Sender` whose `SnapshotSource` hands back exactly `set` — so a test
+    /// can offer a deliberately broken one — with the ring primed so an
+    /// injected NAK at 0 is below the floor and reaches the upgrade path.
+    fn sender_with_explicit_snapshot_set(set: SnapshotSet) -> (Sender, Fake) {
+        let f = Fake::new();
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        s.set_snapshot_source(Arc::new(move || Some(set.clone())));
+        (s, f)
+    }
+
+    /// Inject the below-floor NAK, pump a few cycles, and assert the three
+    /// properties every refusal owes: no session, no datagram, one overrun.
+    fn assert_snap_session_refused(s: &mut Sender, f: &Fake, why: &str) {
+        let before = s.stats().overruns.load(Ordering::Relaxed);
+        s.on_nak(f.addr(), 0, 96); // below the ring floor → the upgrade path
+        for _ in 0..4 {
+            s.do_work();
+        }
+        assert!(s.snap.is_none(), "{why}: no session may open");
+        assert!(f.recv_raw().is_none(), "{why}: not one datagram of a half-formed session");
+        assert!(
+            s.stats().overruns.load(Ordering::Relaxed) > before,
+            "{why}: the refusal stays a counted overrun, not a silent drop"
+        );
+    }
+
+    /// Refusal 1: the set does not COVER the declared mask. Both legs of the
+    /// one guard — a declared id with no artifact, and an artifact for an id
+    /// outside the mask (the count matches, the ids do not). Either way a
+    /// `SNAP_BEGIN` would advertise a `services_declared` the stream can never
+    /// satisfy: the receiver's `received != services_declared` never closes and
+    /// it probes for a BEGIN that will never come.
+    #[test]
+    fn a_set_that_does_not_match_the_declared_ids_never_opens_a_session() {
+        let dir = snap_scratch_dir();
+        let make = |id: u8| {
+            let path = dir.path().join(format!("snap-{id}.ultsnap"));
+            std::fs::write(&path, vec![0xD4u8; 2048]).unwrap();
+            SnapArtifact { service_id: id, snapshot_pos: 2048, path, len: 2048 }
+        };
+
+        // (a) ids 0 and 2 declared, only id 0 shipped.
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b101,
+            config: t17_config_bytes(),
+            artifacts: vec![make(0)],
+        });
+        assert_snap_session_refused(&mut s, &f, "a declared id with no artifact");
+        assert_eq!(
+            s.stats().snap_open_failed.load(Ordering::Relaxed),
+            0,
+            "refused before any file is opened"
+        );
+
+        // (b) the right NUMBER of artifacts, one of them for an undeclared id.
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b101,
+            config: t17_config_bytes(),
+            artifacts: vec![make(0), make(1)],
+        });
+        assert_snap_session_refused(&mut s, &f, "an artifact for an undeclared id");
+        assert_eq!(s.stats().snap_open_failed.load(Ordering::Relaxed), 0);
+    }
+
+    /// Refusal 2: an artifact the store has not finished writing — the `.part`
+    /// case. It is offered with a length of 0 (nothing durable in it yet), and
+    /// a `SNAP_BEGIN` announcing `total_len == 0` is dropped outright by the
+    /// receiver, so such a session could never complete. The same guard also
+    /// rejects a set whose ids do not strictly ascend, since an artifact's
+    /// STREAM base is the sum of its predecessors' lengths.
+    #[test]
+    fn a_zero_length_part_or_a_misordered_set_never_opens_a_session() {
+        let dir = snap_scratch_dir();
+        let part = dir.path().join("incoming-2048.part");
+        std::fs::write(&part, b"").unwrap();
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b1,
+            config: t17_config_bytes(),
+            artifacts: vec![SnapArtifact {
+                service_id: 0,
+                snapshot_pos: 2048,
+                path: part,
+                len: 0,
+            }],
+        });
+        assert_snap_session_refused(&mut s, &f, "a half-written .part offered with len 0");
+        assert_eq!(
+            s.stats().snap_open_failed.load(Ordering::Relaxed),
+            0,
+            "the file opens fine — this is the length guard, not the open guard"
+        );
+
+        // The ordering leg: ids 0 and 2 declared, shipped descending.
+        let make = |id: u8| {
+            let path = dir.path().join(format!("snap-{id}.ultsnap"));
+            std::fs::write(&path, vec![0xD4u8; 2048]).unwrap();
+            SnapArtifact { service_id: id, snapshot_pos: 2048, path, len: 2048 }
+        };
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b101,
+            config: t17_config_bytes(),
+            artifacts: vec![make(2), make(0)],
+        });
+        assert_snap_session_refused(&mut s, &f, "a set whose ids do not strictly ascend");
+    }
+
+    /// Refusal 3: the `File::open` TOCTOU. The store listed an artifact its
+    /// persisted floor marker says is durable and it is gone (or unreadable) by
+    /// the time the session opens — a purge racing a session, a hand-edited
+    /// snapshot dir, a permission change. Before M14c2 this was the ONE refusal
+    /// with no counter at all, indistinguishable from the two ordinary ones
+    /// ("no source wired", "a session is already in flight"): the operator saw
+    /// a joiner NAKing forever and nothing naming the leader's disk.
+    /// `snap_open_failed` names it.
+    #[test]
+    fn an_unopenable_artifact_counts_snap_open_failed_and_stays_an_overrun() {
+        let dir = snap_scratch_dir();
+        let gone = dir.path().join("snap-2048.ultsnap"); // deliberately never created
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b1,
+            config: t17_config_bytes(),
+            artifacts: vec![SnapArtifact {
+                service_id: 0,
+                snapshot_pos: 2048,
+                path: gone,
+                len: 2048,
+            }],
+        });
+        assert_snap_session_refused(&mut s, &f, "an artifact whose file cannot be opened");
+        assert_eq!(
+            s.stats().snap_open_failed.load(Ordering::Relaxed),
+            1,
+            "one open failure per refused attempt — the counter that names the leader's disk"
+        );
+    }
+
+    /// M14c2 (T10a): a repair `SNAP_NAK` whose range falls inside an artifact
+    /// whose `SNAP_BEGIN` has NOT gone out in this session is SKIPPED — not
+    /// served, not an error. The receiver can only place a chunk inside an
+    /// artifact it has already announced (`snap_chunk` drops anything else), so
+    /// serving one spends the cycle's chunk budget on datagrams guaranteed to
+    /// be discarded — and does it while the peer is blocked. The BEGIN goes out
+    /// on its own cadence; the same request is served the moment it has.
+    ///
+    /// The head repair NAK must sit in an artifact that IS begun:
+    /// `drive_snap_session` targets the head NAK's artifact, so a head NAK in
+    /// an un-begun one ships its BEGIN first, in the same cycle.
+    #[test]
+    fn a_repair_nak_inside_a_not_yet_begun_artifact_is_skipped_until_its_begin_goes_out() {
+        let (mut s, f, _tx, _dir) = sender_with_snap_source_and_ctrl(0b101, &[0, 2]);
+        s.on_nak(f.addr(), 0, 96); // below the ring floor → opens the session
+        s.do_work(); // ...on the cycle that drains the NAK queue
+        assert!(s.snap.is_some(), "the below-floor NAK opened a session");
+        f.drain();
+
+        {
+            let sess = s.snap.as_mut().expect("the session is open");
+            // `begun_ns` in the far future ⇒ `now - at` saturates to 0, so the
+            // artifact reads as begun AND never stale: this cycle emits no
+            // BEGIN at all, and every SNAP_CHUNK it does emit is attributable.
+            sess.parts[0].begun_ns = Some(u64::MAX);
+            sess.parts[1].begun_ns = None;
+            sess.naks.push_back((0, 64)); // inside artifact 0, [0, 2048)
+            sess.naks.push_back((2048 + 16, 64)); // inside artifact 2, un-begun
+        }
+        s.do_work();
+
+        let mut begins = 0usize;
+        let mut chunks: Vec<u64> = Vec::new();
+        while let Some(d) = f.recv_raw() {
+            let h = read_datagram_header(&d).unwrap();
+            match h.kind {
+                DGRAM_KIND_SNAP_BEGIN => begins += 1,
+                DGRAM_KIND_SNAP_CHUNK => chunks.push(h.position),
+                _ => {}
+            }
+        }
+        assert_eq!(begins, 0, "neither artifact's BEGIN is due this cycle");
+        assert!(
+            chunks.iter().all(|&off| off < 2048),
+            "no SNAP_CHUNK may go out for an artifact whose BEGIN has not been sent: {chunks:?}"
+        );
+        assert!(
+            s.snap.as_ref().unwrap().naks.is_empty(),
+            "the skipped request is dropped (the peer re-NAKs), never re-queued into a spin"
+        );
+
+        // The control: with artifact 2's BEGIN sent, the SAME request IS served.
+        {
+            let sess = s.snap.as_mut().unwrap();
+            sess.parts[1].begun_ns = Some(u64::MAX);
+            sess.naks.push_back((2048 + 16, 64));
+        }
+        s.do_work();
+        let mut served: Vec<u64> = Vec::new();
+        while let Some(d) = f.recv_raw() {
+            let h = read_datagram_header(&d).unwrap();
+            if h.kind == DGRAM_KIND_SNAP_CHUNK {
+                served.push(h.position);
+            }
+        }
+        assert!(
+            served.contains(&(2048 + 16)),
+            "once its BEGIN is out, the same NAK is served: {served:?}"
+        );
     }
 
     /// Drive a snapshot session and collect the raw datagrams of `kind`.
