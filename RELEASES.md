@@ -91,7 +91,7 @@ Background: [how multi-service works](docs/notes/uc2-m14-multi-service-explained
     nightly run exists at it.
   → [M14 gate](docs/benchmarks/uc2-m14-gate-2026-08-29.md). Dev-box smoke,
   never a bar: [apply hop](docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md)
-  and [client hop](docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md).
+  and [client hop](docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md). A fleet A/B of this arm against 2.7.0 (14 interleaved arms, 2026-08-30) found no detectable regression — point estimate +8 % for 2.8.0, inside a ±25 % per-generation variance that the rig itself exhibits → [A/B 2.7.0 vs 2.8.0](docs/benchmarks/uc2-m14d-ab-2.7.0-vs-2.8.0-2026-08-30.md).
 
 **Upgrade consequence.** Wire `0.6.0` and cnc `3.0` are flag days: stop every
 node, upgrade, start them together; a mixed cluster replicates and elects but
