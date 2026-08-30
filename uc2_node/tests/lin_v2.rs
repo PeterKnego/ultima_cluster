@@ -876,6 +876,7 @@ fn two_fsm_smoke() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(cluster.service_applied(leader, 0) > 0 && cluster.service_applied(leader, 1) > 0);
+    client.shutdown();
     cluster.stop();
 }
 
@@ -986,11 +987,16 @@ fn two_fsm_lockstep() {
     );
 }
 
-/// The oracle must bite: FSM 1 = `Corrupt<RegisterSm>` flips every CAS, so the
-/// first CAS `submit_all` disagrees and `equiv_failures` is non-zero.
+/// The oracle must bite, and it must be the SAME oracle the capstones run:
+/// FSM 1 = `Corrupt<RegisterSm>` flips every CAS, and this test drives
+/// [`lincheck_v2::spawn_workers2`] — the capstones' own worker loop, whose
+/// `a != b` arm feeds `equiv_failures` — then makes the identical
+/// `equiv_failures == 0` assertion `run_two_fsm` makes. If the workers' fan-in
+/// comparison were ever weakened, this test stops panicking.
 #[test]
 #[should_panic(expected = "replication-equivalence violated")]
 fn two_fsm_oracle_bites() {
+    const SECS: u64 = 3;
     let _g = serialize();
     let dir = tempdir();
     let ccfg = ClusterCfg {
@@ -999,25 +1005,43 @@ fn two_fsm_oracle_bites() {
     };
     let cluster: LinClusterV2<uc_lincheck::register::RegisterSm, lincheck_v2::Corrupt<uc_lincheck::register::RegisterSm>> =
         LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
-    let leader = cluster.await_single_serving(30);
-    let client = cluster.client(leader);
-    let _: Vec<(u8, CmdResp)> = client.submit_all(&Cmd::Write(1)).unwrap();
-    let r: Vec<(u8, CmdResp)> = client.submit_all(&Cmd::Cas { old: 1, new: 2 }).unwrap();
+    let _leader = cluster.await_single_serving(30);
+    let dirs = Arc::new(cluster.dirs());
+    let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
+    let equiv = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let handles =
+        lincheck_v2::spawn_workers2(&dirs, &h0, &h1, &equiv, &stop, &last_seen, 0x14c4, Duration::ZERO, 2);
+    std::thread::sleep(Duration::from_secs(SECS));
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
     cluster.stop();
-    assert_eq!(r[0].1, r[1].1, "replication-equivalence violated: {r:?}");
+    assert_eq!(equiv.load(Ordering::Relaxed), 0, "[two_fsm_oracle_bites] replication-equivalence violated");
 }
 
 /// M14c2 T4: the slow-FSM oracle. FSM 1 is `Slow<RegisterSm, 200>` (200 µs per
-/// apply — ≥ 10× slower than FSM 0's unthrottled apply on this box, so it is
-/// comfortably "the limiter"). No faults; a background sampler reads
-/// `(applied_0, applied_1)` off the leader's cnc page every 50 ms and asserts
-/// (ruling 2026-08-30, spec §16.3):
+/// apply). No faults; a background sampler reads `(applied_0, applied_1)` off
+/// the leader's cnc page every 50 ms and asserts (ruling 2026-08-30, spec
+/// §16.3):
 ///   (i) the lag bound holds at EVERY sample — `Bounded(b)` -> `b`,
 ///       `Lockstep` -> 288 (one frame: max_payload 256 + 32-byte header);
 ///   (ii) over the second half of the run, FSM 0's applied-bytes rate is
-///        within 10% of FSM 1's — i.e. the faster FSM actually converges to
-///        the slow one's pace rather than racing arbitrarily ahead within the
-///        bound.
+///        within 10% of FSM 1's — the pair progresses together rather than one
+///        half racing arbitrarily ahead within the bound.
+///
+/// **What this does NOT exercise** (measured 2026-08-30, dev-box smoke; the
+/// summary line below now prints `max_lag` so the claim stays honest): the
+/// separation never approaches the bound. `two_fsm_slow` sampled
+/// `max_lag=192 bound=65536` (~3.7 frames at ~52 B/frame, 0.3 % of the bound)
+/// and `two_fsm_slow_lockstep` `max_lag=64 bound=288` (~1.2 frames), both at
+/// `rate0 == rate1 == ~22 KB/s`. That is ~425 records/s — an order of
+/// magnitude under `Slow<RegisterSm, 200>`'s own ~5 000 applies/s ceiling — so
+/// the LIMITER is the client loop, not FSM 1, and the lag policy never binds.
+/// Assertion (ii) is therefore evidence of equal progress across a
+/// heterogeneous pair; it is NOT evidence of the barrier's behaviour at the
+/// bound (that lives in `uc2_service`'s `lag` unit tests and the apply-hop
+/// bench). Do not cite this test for bound-pinned pacing.
 fn run_two_fsm_slow(label: &str, lag: uc2_node::FsmLag, seed: u64) {
     const SECS: u64 = 20;
     const N_WORKERS: u32 = 4;
@@ -1067,7 +1091,13 @@ fn run_two_fsm_slow(label: &str, lag: uc2_node::FsmLag, seed: u64) {
     assert!(r1 > 0.0, "[{label}] FSM 1 made no progress in the second half");
     let ratio = r0 / r1;
     assert!((0.9..=1.1).contains(&ratio), "[{label}] FSM 0 rate {r0:.0} B/s vs FSM 1 {r1:.0} B/s: ratio {ratio:.3} outside [0.9, 1.1]");
-    eprintln!("[{label}] samples={} rate0={r0:.0} rate1={r1:.0} ratio={ratio:.3}", samples.len());
+    // What the run actually exercised: the largest separation ever sampled, against the bound.
+    let max_lag = samples.iter().map(|(_, a0, a1)| a0.saturating_sub(*a1)).max().unwrap_or(0);
+    eprintln!(
+        "[{label}] samples={} rate0={r0:.0} rate1={r1:.0} ratio={ratio:.3} max_lag={max_lag} bound={bound} (~{:.1} frames at 52 B)",
+        samples.len(),
+        max_lag as f64 / 52.0
+    );
 }
 
 #[test] fn two_fsm_slow()          { run_two_fsm_slow("two_fsm_slow",          uc2_node::FsmLag::Bounded(64 * 1024), 0x51); }

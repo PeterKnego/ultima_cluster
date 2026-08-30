@@ -455,7 +455,7 @@ fn run_pass2() {
         .collect();
 
     let start = Instant::now();
-    while rec0.ok_count() < target {
+    while rec0.ok_count() < target || rec1.ok_count() < target {
         std::thread::sleep(fault_period);
         if start.elapsed() > budget {
             break;

@@ -1774,7 +1774,9 @@ fn worker2(
                 let (inv0, inv1) = (h0.invoke(), h1.invoke());
                 match submit_all_cmd::<_, CmdResp>(&mut conn, &Cmd::Write(v), deadline) {
                     SubmitOutcome::Ok(resp) => {
-                        let (a, b) = (&resp[0].1, &resp[1].1);
+                        let [(_, a), (_, b)] = &resp[..] else {
+                            panic!("submit_all returned {resp:?}, not one answer per declared FSM")
+                        };
                         if a != b {
                             equiv_failures.fetch_add(1, Ordering::Relaxed);
                             h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
@@ -1827,7 +1829,9 @@ fn worker2(
                 let (inv0, inv1) = (h0.invoke(), h1.invoke());
                 match submit_all_cmd::<_, CmdResp>(&mut conn, &Cmd::Cas { old, new }, deadline) {
                     SubmitOutcome::Ok(resp) => {
-                        let (a, b) = (&resp[0].1, &resp[1].1);
+                        let [(_, a), (_, b)] = &resp[..] else {
+                            panic!("submit_all returned {resp:?}, not one answer per declared FSM")
+                        };
                         if a != b {
                             equiv_failures.fetch_add(1, Ordering::Relaxed);
                             h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
