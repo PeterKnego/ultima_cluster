@@ -54,8 +54,12 @@ Step 2's validation run must, before trusting any pinned number:
 1. Run `lscpu -e=CPU,CORE` (or `-p=CPU,CORE`) on a live `c6id.2xlarge` host
    and record the raw output in this document, replacing this stub.
 2. Confirm `m12_fleet_gate.verify_pin_layout` (called automatically by
-   `--pin` on every voter before the first arm, via `require_pin_layout`)
-   accepted it. If the real layout doesn't match
+   `--pin`, via `require_pin_layout`, on every host the run starts units on
+   — in `m14_fleet_gate.py` that's all 4 hosts: the 3 voters plus the row-f
+   learner, since row f pins the learner's node/service units too; in
+   `m14_ab_27_vs_28.py` it's the 3 voters only, because that driver never
+   starts units on the 4th host — before the first arm) accepted it on
+   every one of them. If the real layout doesn't match
    `EXPECTED_SIBLING_PAIRS = {(0,4),(1,5),(2,6),(3,7)}`, `--pin` refuses to
    run (`SystemExit`, printing the actual layout) rather than pinning onto
    siblings silently — that refusal, if it fires, is itself the Step 2

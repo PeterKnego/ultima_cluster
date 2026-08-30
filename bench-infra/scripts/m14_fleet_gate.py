@@ -309,8 +309,9 @@ def service_cpu(pins, sid):
     not isolated. `None` (unpinned) if `pins` is falsy or has no entry."""
     if not pins:
         return None
-    unit = f"service{sid}"
-    return pins.get(unit, pins.get("service1") if sid >= 1 else None)
+    if sid == 0:
+        return pins.get("service0")
+    return pins.get(f"service{sid}", pins.get("service1"))
 
 
 def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0, pins=None):
@@ -885,8 +886,9 @@ def main():
     ap.add_argument("--pin", action="store_true",
                     help="pin every node/service/client unit to PIN_MAP_C6ID_2XL's CPUs "
                          "(default off); verifies the assumed hyperthread-sibling layout "
-                         "on every voter first and refuses to run (SystemExit) if it "
-                         "doesn't hold — see m12_fleet_gate.verify_pin_layout")
+                         "on every host the run starts units on (voters + the row-f "
+                         "learner) first and refuses to run (SystemExit) if it doesn't "
+                         "hold — see m12_fleet_gate.verify_pin_layout")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
@@ -894,7 +896,12 @@ def main():
         ap.error("one of --fleet or --selftest is required")
     hosts, voters, learner = setup_fleet(a)
     if a.pin:
-        require_pin_layout(voters)
+        # `hosts` = voters + the learner (`setup_fleet` returns all 4); row f
+        # starts node/service units on the learner too (arm_join), so the
+        # sibling layout must be verified there as well, not just on the
+        # voters — a wrong-layout learner would otherwise pin onto siblings
+        # silently the one time this run touches a 4th host.
+        require_pin_layout(hosts)
     pins = PIN_MAP_C6ID_2XL if a.pin else None
     rates, checks, verdicts = {}, [], []
     kill = join = None
