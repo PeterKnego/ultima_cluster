@@ -43,6 +43,12 @@ struct Args {
     /// key. See `--crypto-key`.
     #[arg(long)]
     crypto_allowlist: Option<PathBuf>,
+    /// M14c2: declared FSM ids (`0,1`). Absent = `{0}`.
+    #[arg(long)]
+    services: Option<String>,
+    /// M14c2: `lockstep` or a byte bound.
+    #[arg(long)]
+    fsm_lag: Option<String>,
 }
 
 fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
@@ -105,7 +111,11 @@ fn main() -> anyhow::Result<()> {
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
-        services: uc2_node::ServicesConfig::default(),
+        services: uc2_node::ServicesConfig::from_cli(args.services.as_deref(), args.fsm_lag.as_deref())
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2)
+            }),
     };
 
     let node = Node::start(cfg)?;

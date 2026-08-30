@@ -61,6 +61,28 @@ impl ServicesConfig {
         Ok(Self { declared, fsm_lag })
     }
 
+    /// The CLI form every gate/harness binary shares: `--services 0,1`
+    /// (absent ⇒ the default set `{0}`) and `--fsm-lag lockstep|<bytes>`
+    /// (absent ⇒ the default bound), refused by flag name the way
+    /// `node.toml`'s loader refuses by field name.
+    pub fn from_cli(ids: Option<&str>, fsm_lag: Option<&str>) -> Result<Self, String> {
+        let lag = match fsm_lag {
+            None => None,
+            Some(raw) => Some(parse_fsm_lag(raw.trim()).map_err(|d| format!("--fsm-lag {raw:?}: {d}"))?),
+        };
+        match ids {
+            None if lag.is_none() => Ok(Self::default()),
+            None => Self::from_ids(&[0], lag).map_err(|d| format!("--services (default 0): {d}")),
+            Some(list) => {
+                let ids = list
+                    .split(',')
+                    .map(|s| s.trim().parse::<u8>().map_err(|e| format!("--services {list:?}: {s:?} is not an id ({e})")))
+                    .collect::<Result<Vec<u8>, String>>()?;
+                Self::from_ids(&ids, lag).map_err(|d| format!("--services {list:?}: {d}"))
+            }
+        }
+    }
+
     /// HARNESS ONLY: a node with no FSMs declared. The aggregates are not
     /// published, the admission door's FSM term and the report ceiling are
     /// inert, and page 1's service band behaves as it did on cnc 2.0 (a test
@@ -263,6 +285,27 @@ mod tests {
         assert!(e.contains("service id 8 is out of range (0..8)"), "{e}");
         let e = ServicesConfig::from_ids(&[1, 2], None).unwrap_err();
         assert!(e.contains("service id 0 must be declared"), "{e}");
+    }
+
+    #[test]
+    fn from_cli_absent_is_default_and_both_flags_parse() {
+        assert_eq!(ServicesConfig::from_cli(None, None).unwrap().declared(), 0b1);
+        let s = ServicesConfig::from_cli(Some("0, 1"), Some("65536")).unwrap();
+        assert_eq!(s.declared(), 0b11);
+        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Bounded(65536));
+        let s = ServicesConfig::from_cli(Some("0,1"), Some("lockstep")).unwrap();
+        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Lockstep);
+        // lag without ids applies to the default set
+        let s = ServicesConfig::from_cli(None, Some("lockstep")).unwrap();
+        assert_eq!(s.declared(), 0b1);
+        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Lockstep);
+    }
+
+    #[test]
+    fn from_cli_refuses_by_flag_name() {
+        assert!(ServicesConfig::from_cli(Some("1"), None).unwrap_err().starts_with("--services"));
+        assert!(ServicesConfig::from_cli(Some("0,x"), None).unwrap_err().starts_with("--services"));
+        assert!(ServicesConfig::from_cli(Some("0"), Some("bogus")).unwrap_err().starts_with("--fsm-lag"));
     }
 
     #[test]

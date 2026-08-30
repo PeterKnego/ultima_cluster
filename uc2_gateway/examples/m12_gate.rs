@@ -1593,30 +1593,7 @@ fn services_from_flags(
     services: Option<&str>,
     fsm_lag: Option<&str>,
 ) -> anyhow::Result<ServicesConfig> {
-    let lag = match fsm_lag {
-        None => None,
-        Some(raw) => Some(
-            uc2_node::services::parse_fsm_lag(raw.trim())
-                .map_err(|detail| anyhow::anyhow!("--fsm-lag {raw:?}: {detail}"))?,
-        ),
-    };
-    match services {
-        None if lag.is_none() => Ok(ServicesConfig::default()),
-        None => ServicesConfig::from_ids(&[0], lag)
-            .map_err(|detail| anyhow::anyhow!("--services (default 0): {detail}")),
-        Some(list) => {
-            let ids = list
-                .split(',')
-                .map(|s| {
-                    s.trim()
-                        .parse::<u8>()
-                        .map_err(|e| anyhow::anyhow!("--services {list:?}: {s:?} is not an id ({e})"))
-                })
-                .collect::<anyhow::Result<Vec<u8>>>()?;
-            ServicesConfig::from_ids(&ids, lag)
-                .map_err(|detail| anyhow::anyhow!("--services {list:?}: {detail}"))
-        }
-    }
+    ServicesConfig::from_cli(services, fsm_lag).map_err(anyhow::Error::msg)
 }
 
 /// A per-process session identity for the direct arm. Random enough that two
