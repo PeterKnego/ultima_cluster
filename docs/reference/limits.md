@@ -67,6 +67,7 @@ rest by the page named.
 | `bincode` is unmaintained (RUSTSEC-2025-0141); replacing it is a wire-format migration | [Self-assessment § 3](../security/self-assessment.md#3-known-weaknesses-not-fixed), `deny.toml` |
 | One gateway's single driver thread means a wedged client can stall every other client on that edge for up to the 1 s write timeout; others may then see `UNKNOWN` and must resend (safe with the session envelope on) | [Run a gateway § head-of-line caveat](../how-to/run-a-gateway.md#the-single-driver-head-of-line-caveat) |
 | Lockstep multi-FSM mode (`fsm_lag = "lockstep"`, M14) costs an N-way cross-core handshake per frame, and a stalled sibling makes every other FSM burn a core yielding on it | [Configuration § `[services]`](configuration.md#services) |
+| Lockstep needs a free CPU per declared FSM plus the node's own agents: once the runnable set exceeds the available CPUs it collapses by up to **~880×** (624 k → **709** frames/s per FSM at N=2 with 3 busy threads on 1 CPU), while bounded mode on the identical rung is unaffected at 7.4 M frames/s. An envelope fact, not a defect — lengthening the yield ladder ×4/×16, and making it unbounded, both measured 1.00× | [M14c2 lockstep-under-oversubscription record](../benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md) |
 
 ## What is not verified
 
