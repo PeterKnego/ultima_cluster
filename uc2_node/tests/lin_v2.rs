@@ -878,3 +878,114 @@ fn two_fsm_smoke() {
     assert!(cluster.service_applied(leader, 0) > 0 && cluster.service_applied(leader, 1) > 0);
     cluster.stop();
 }
+
+/// M14c2 T3: two-FSM WGL capstone. Every write/CAS goes through `submit_all`
+/// (fanning in to both FSMs), and any unequal pair between FSM 0 and FSM 1
+/// increments `equiv_failures` — the replication-equivalence oracle. Each
+/// FSM's own history must ALSO be WGL-linearizable on its own.
+fn run_two_fsm(label: &str, lag: uc2_node::FsmLag, seed: u64) {
+    const TARGET_OPS: usize = 600;
+    const N_WORKERS: u32 = 3;
+    const THROTTLE: Duration = Duration::from_millis(20);
+    const FAULT_PERIOD: Duration = Duration::from_millis(1200);
+    let budget = Duration::from_secs(
+        std::env::var("UC2_LIN_BUDGET_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(115),
+    );
+    let ccfg = ClusterCfg {
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: 16 * 1024,
+        snapshot_interval_bytes: 32 * 1024,
+        services: lincheck_v2::FsmSet::Two { lag },
+        ..ClusterCfg::default()
+    };
+    let _g = serialize();
+    let dir = tempdir();
+    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    cluster.await_single_serving(30);
+    let dirs = Arc::new(cluster.dirs());
+    let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
+    let equiv_failures = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let handles = lincheck_v2::spawn_workers2(
+        &dirs,
+        &h0,
+        &h1,
+        &equiv_failures,
+        &stop,
+        &last_seen,
+        seed,
+        THROTTLE,
+        N_WORKERS,
+    );
+    let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let start = Instant::now();
+    while History::ok_count(&h0.snapshot()) < TARGET_OPS || cluster.max_archive_first_base() == 0 {
+        std::thread::sleep(FAULT_PERIOD);
+        cluster.supervise_services();
+        match frng.random_range(0..3u8) {
+            0 => cluster.kill_and_restart_leader(),
+            1 => cluster.crash_and_restart_leader_service(),
+            _ => cluster.crash_and_restart_random_follower_service(&mut frng),
+        }
+        assert!(
+            start.elapsed() < budget,
+            "[{label}] budget exhausted: ok={} floor={}",
+            History::ok_count(&h0.snapshot()),
+            cluster.max_archive_first_base()
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    cluster.stop();
+    assert_eq!(
+        equiv_failures.load(Ordering::Relaxed),
+        0,
+        "[{label}] replication-equivalence violated"
+    );
+    for (id, h) in [(0u8, h0), (1u8, h1)] {
+        let entries = Arc::try_unwrap(h).map(History::into_entries).unwrap_or_else(|a| a.snapshot());
+        match check_register(&entries) {
+            Verdict::Linearizable => {}
+            v => panic!("[{label}] FSM {id}: {v:?} (seed={seed})"),
+        }
+    }
+}
+
+#[test]
+fn two_fsm_bounded() {
+    run_two_fsm(
+        "two_fsm_bounded",
+        uc2_node::FsmLag::Bounded(64 * 1024),
+        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x14c2),
+    );
+}
+#[test]
+fn two_fsm_lockstep() {
+    run_two_fsm(
+        "two_fsm_lockstep",
+        uc2_node::FsmLag::Lockstep,
+        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x14c3),
+    );
+}
+
+/// The oracle must bite: FSM 1 = `Corrupt<RegisterSm>` flips every CAS, so the
+/// first CAS `submit_all` disagrees and `equiv_failures` is non-zero.
+#[test]
+#[should_panic(expected = "replication-equivalence violated")]
+fn two_fsm_oracle_bites() {
+    let _g = serialize();
+    let dir = tempdir();
+    let ccfg = ClusterCfg {
+        services: lincheck_v2::FsmSet::Two { lag: uc2_node::FsmLag::Bounded(64 * 1024) },
+        ..ClusterCfg::default()
+    };
+    let cluster: LinClusterV2<uc_lincheck::register::RegisterSm, lincheck_v2::Corrupt<uc_lincheck::register::RegisterSm>> =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader = cluster.await_single_serving(30);
+    let client = cluster.client(leader);
+    let _: Vec<(u8, CmdResp)> = client.submit_all(&Cmd::Write(1)).unwrap();
+    let r: Vec<(u8, CmdResp)> = client.submit_all(&Cmd::Cas { old: 1, new: 2 }).unwrap();
+    cluster.stop();
+    assert_eq!(r[0].1, r[1].1, "replication-equivalence violated: {r:?}");
+}

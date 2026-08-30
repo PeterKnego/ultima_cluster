@@ -1524,6 +1524,52 @@ pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
     }
 }
 
+/// M14c2: [`read_leader`]'s FSM-`id` twin — same routing/retry discipline,
+/// `client.query_linearizable_on::<Q, QR>(id, q)` instead of `query_linearizable`.
+pub fn read_leader_on<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
+    conn: &mut WorkerConn,
+    id: u8,
+    q: &Q,
+    deadline: Instant,
+) -> ReadOutcome<QR> {
+    loop {
+        if Instant::now() > deadline {
+            return ReadOutcome::Indeterminate;
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.rotate();
+            continue;
+        };
+        match client.query_linearizable_on::<Q, QR>(id, q) {
+            Ok(v) => return ReadOutcome::Ok(v),
+            Err(ClientError::NotLeader { hint }) => match hint {
+                Some(h) => conn.reconnect_to(h as usize),
+                None => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    conn.rotate();
+                }
+            },
+            Err(ClientError::Retry) => std::thread::sleep(Duration::from_millis(15)),
+            Err(ClientError::InstanceRestart { .. }) | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_)) => {
+                conn.drop_client();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(ClientError::BackpressureFull) => std::thread::sleep(Duration::from_millis(10)),
+            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                return ReadOutcome::Indeterminate;
+            }
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
 /// One worker: until `stop`, pick a seeded op (Write/Read/CAS), route it to the
 /// leader, classify the outcome per the WGL contract, and record it. `last_seen`
 /// is shared so CAS picks a recently-observed value often enough that some
@@ -1612,6 +1658,157 @@ pub fn spawn_workers(
             let (dirs, history, stop, last_seen) =
                 (Arc::clone(dirs), Arc::clone(history), Arc::clone(stop), Arc::clone(last_seen));
             std::thread::spawn(move || worker(w, dirs, history, stop, rng, last_seen, throttle))
+        })
+        .collect()
+}
+
+/// M14c2: [`worker`]'s two-FSM twin. Every Write/CAS goes through
+/// [`submit_all_cmd`] (fanning in to both FSMs' answers). An unequal pair
+/// between FSM 0's and FSM 1's response is a **replication-equivalence
+/// violation** — both FSMs replay the identical committed command stream, so
+/// their responses must agree; count it in `equiv_failures` and record
+/// `Indeterminate` in BOTH histories (never feed the checker a lie about what
+/// was observed). An equal pair is recorded with that response in both
+/// histories (each stamped with its own `invoke`/`ret` — `History::seq` is
+/// per-history). Reads alternate: FSM 0 via [`read_leader`] into `h0`, FSM 1
+/// via [`read_leader_on`] into `h1`.
+#[allow(clippy::too_many_arguments)]
+fn worker2(
+    id: u32,
+    dirs: Arc<Vec<PathBuf>>,
+    h0: Arc<History>,
+    h1: Arc<History>,
+    equiv_failures: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    mut rng: StdRng,
+    last_seen: Arc<AtomicU64>,
+    throttle: Duration,
+) {
+    let mut conn = WorkerConn::new(dirs, id as usize);
+    let mut read_fsm1 = false;
+    while !stop.load(Ordering::Relaxed) {
+        if !throttle.is_zero() {
+            std::thread::sleep(throttle);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        match rng.random_range(0..3u8) {
+            0 => {
+                let v = rng.random_range(1..1000u64);
+                let op = Op::Write(v);
+                let (inv0, inv1) = (h0.invoke(), h1.invoke());
+                match submit_all_cmd::<_, CmdResp>(&mut conn, &Cmd::Write(v), deadline) {
+                    SubmitOutcome::Ok(resp) => {
+                        let (a, b) = (&resp[0].1, &resp[1].1);
+                        if a != b {
+                            equiv_failures.fetch_add(1, Ordering::Relaxed);
+                            h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                            h1.record(id, op, inv1, Outcome::Indeterminate);
+                        } else {
+                            h0.record(id, op.clone(), inv0, Outcome::Ok(RegResp::Ack));
+                            h1.record(id, op, inv1, Outcome::Ok(RegResp::Ack));
+                        }
+                    }
+                    SubmitOutcome::Indeterminate => {
+                        h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                        h1.record(id, op, inv1, Outcome::Indeterminate);
+                    }
+                    SubmitOutcome::Fatal(e) => panic!("fatal submit_all: {e}"),
+                }
+            }
+            1 => {
+                read_fsm1 = !read_fsm1;
+                if !read_fsm1 {
+                    let inv = h0.invoke();
+                    let outcome = match read_leader::<(), Option<u64>>(&mut conn, &(), deadline) {
+                        ReadOutcome::Ok(v) => {
+                            if let Some(x) = v {
+                                last_seen.store(x, Ordering::Relaxed);
+                            }
+                            Outcome::Ok(RegResp::Value(v))
+                        }
+                        ReadOutcome::Indeterminate => Outcome::Indeterminate,
+                        ReadOutcome::Fatal(e) => panic!("fatal read (fsm0): {e}"),
+                    };
+                    h0.record(id, Op::Read, inv, outcome);
+                } else {
+                    let inv = h1.invoke();
+                    let outcome = match read_leader_on::<(), Option<u64>>(&mut conn, 1, &(), deadline) {
+                        ReadOutcome::Ok(v) => Outcome::Ok(RegResp::Value(v)),
+                        ReadOutcome::Indeterminate => Outcome::Indeterminate,
+                        ReadOutcome::Fatal(e) => panic!("fatal read (fsm1): {e}"),
+                    };
+                    h1.record(id, Op::Read, inv, outcome);
+                }
+            }
+            _ => {
+                let old = if rng.random_bool(0.7) {
+                    last_seen.load(Ordering::Relaxed)
+                } else {
+                    rng.random_range(1..1000u64)
+                };
+                let new = rng.random_range(1..1000u64);
+                let op = Op::Cas { old, new };
+                let (inv0, inv1) = (h0.invoke(), h1.invoke());
+                match submit_all_cmd::<_, CmdResp>(&mut conn, &Cmd::Cas { old, new }, deadline) {
+                    SubmitOutcome::Ok(resp) => {
+                        let (a, b) = (&resp[0].1, &resp[1].1);
+                        if a != b {
+                            equiv_failures.fetch_add(1, Ordering::Relaxed);
+                            h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                            h1.record(id, op, inv1, Outcome::Indeterminate);
+                        } else {
+                            match a {
+                                CmdResp::CasResult(ok) => {
+                                    if *ok {
+                                        last_seen.store(new, Ordering::Relaxed);
+                                    }
+                                    h0.record(id, op.clone(), inv0, Outcome::Ok(RegResp::CasOk(*ok)));
+                                    h1.record(id, op, inv1, Outcome::Ok(RegResp::CasOk(*ok)));
+                                }
+                                other => panic!("cas returned non-cas response: {other:?}"),
+                            }
+                        }
+                    }
+                    SubmitOutcome::Indeterminate => {
+                        h0.record(id, op.clone(), inv0, Outcome::Indeterminate);
+                        h1.record(id, op, inv1, Outcome::Indeterminate);
+                    }
+                    SubmitOutcome::Fatal(e) => panic!("fatal cas: {e}"),
+                }
+            }
+        }
+    }
+    conn.drop_client();
+}
+
+/// Spawn `n_workers` two-FSM op-driving threads (see [`worker2`]). Same
+/// per-worker seeding/starting-node discipline as [`spawn_workers`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_workers2(
+    dirs: &Arc<Vec<PathBuf>>,
+    h0: &Arc<History>,
+    h1: &Arc<History>,
+    equiv_failures: &Arc<AtomicU64>,
+    stop: &Arc<AtomicBool>,
+    last_seen: &Arc<AtomicU64>,
+    seed: u64,
+    throttle: Duration,
+    n_workers: u32,
+) -> Vec<JoinHandle<()>> {
+    (0..n_workers)
+        .map(|w| {
+            let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let (dirs, h0, h1, equiv_failures, stop, last_seen) = (
+                Arc::clone(dirs),
+                Arc::clone(h0),
+                Arc::clone(h1),
+                Arc::clone(equiv_failures),
+                Arc::clone(stop),
+                Arc::clone(last_seen),
+            );
+            std::thread::spawn(move || {
+                worker2(w, dirs, h0, h1, equiv_failures, stop, rng, last_seen, throttle)
+            })
         })
         .collect()
 }
