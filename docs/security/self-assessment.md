@@ -284,10 +284,17 @@ with issuer `https://token.actions.githubusercontent.com` — and written out in
 `packaging/README-release.md`. Nothing is published unless the `release-smoke`
 job passes first.
 
-**Honest caveat:** signing has never executed, because keyless signing needs a
-GitHub OIDC identity and the `release`/`image` jobs run only on a real tag. The
-`v2.6.0-rc.1` tag exists to close that gate before the real one is spent — gate
-rows 5 and 6.
+**Record (revised 2026-08-30):** keyless signing has now executed on three real
+tags — `v2.6.0-rc.1` (2026-08-20, the rehearsal), `v2.7.0` (2026-08-26) and
+`v2.8.0` (2026-08-30). For `v2.8.0` the §5 verification was run as a stranger:
+anonymous download, `sha256sum -c`, `cosign verify-blob` **Verified OK** on
+`SHA256SUMS`, the x86_64 tarball and the SBOM with the identity regexp above,
+`cosign verify` OK on `ghcr.io/peterknego/uc2:2.8.0`, and the published
+tarball's quickstart → `PASS`. **The git tags themselves are annotated but not
+GPG-signed** (`git tag -v` reports no signature on all three): the release's
+authenticity claim is cosign's — *this workflow on a `v*` tag of this
+repository produced these bytes* — not a personal signature on the tag. That
+is stated in `cut-a-release.md` §4 rather than left implied.
 
 ---
 

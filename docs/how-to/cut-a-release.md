@@ -100,7 +100,7 @@ run. Those three are only ever exercised by a real tag. An `-rc` tag is a real
 tag:
 
 ```sh
-git tag -s v2.6.0-rc.1 -m "ultima_cluster 2.6.0-rc.1"
+git tag -a v2.6.0-rc.1 -m "ultima_cluster 2.6.0-rc.1"
 git push origin v2.6.0-rc.1
 ```
 
@@ -114,13 +114,22 @@ someone who is not you.
 ## 4. Tag it
 
 ```sh
-git tag -s v2.6.0 -m "ultima_cluster 2.6.0"
+git tag -a v2.6.0 -m "ultima_cluster 2.6.0"
 git push origin v2.6.0
 ```
 
-`-s` signs the tag with your GPG key — a different signature from cosign's,
-covering a different thing (that *you* made this commit a release, rather than
-that *this workflow* made those files).
+`-a` makes an annotated tag (a tag object with a tagger and a message — the
+workflow's `version` job reads the tag name, and the history reads the
+message). **The tag is not GPG-signed, and never has been:** `git tag -v` on
+`v2.6.0-rc.1`, `v2.7.0` and `v2.8.0` reports "no signature found" (this file
+said `-s` until 2026-08-30, but no release box has ever held a signing key,
+and the GPG signature you may see on the tagged *commit* is GitHub's web-flow
+key on the PR merge, not the tag). Artifact authenticity rests on cosign's
+keyless signature in the `release` and `image` jobs — which proves that *this
+workflow, on a `v*` tag of this repository* made those files — and that is
+what §5 verifies. If you want the tag itself to also prove *who* cut the
+release, set up a key (`git config user.signingkey …`) and use `-s`; nothing
+in the workflow checks it either way.
 
 Then watch the run. Jobs, in order:
 
