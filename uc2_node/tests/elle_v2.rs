@@ -351,6 +351,7 @@ fn elle_purge() {
         snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
         crypto: false,
+        ..ClusterCfg::default()
     };
     run_pass(
         "purge",

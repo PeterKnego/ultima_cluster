@@ -66,7 +66,10 @@ use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
-const APP: &str = "lincheck-v2";
+/// `pub` since M14c2: the per-FSM cnc samplers/oracles in the capstone test
+/// binaries open the same cnc pages this harness does, and must name the same
+/// `app_id`.
+pub const APP: &str = "lincheck-v2";
 
 /// The full-box mutex: one lincheck-v2 test runs at a time (see module docs).
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -177,6 +180,15 @@ fn write_crypto_material(dir: &Path, ids: &[NodeId]) -> CryptoMaterial {
     CryptoMaterial { key_paths, allowlist_path }
 }
 
+/// M14c2: which FSM set every node declares. `Single` is byte-for-byte the
+/// pre-M14c2 harness (one implicit FSM 0). `Two` declares ids {0, 1} with the
+/// given lag policy and starts a second service (`SM1`) per node.
+#[derive(Clone, Copy)]
+pub enum FsmSet {
+    Single,
+    Two { lag: uc2_node::FsmLag },
+}
+
 /// Per-node config with the shared harness knobs (election 150–300 ms for
 /// sub-second failover, 4 MiB ring, small payloads). `faults` is applied to
 /// every one of the node's sockets (drop/dup/reorder), used by the lossy-links
@@ -204,6 +216,10 @@ pub struct ClusterCfg {
     /// struct. `false` (the default) is byte-for-byte the pre-M8 posture:
     /// every existing capstone is unaffected.
     pub crypto: bool,
+    /// M14c2: the declared FSM set every node boots with. [`FsmSet::Single`]
+    /// (the default) is the pre-M14c2 posture — one implicit FSM 0, no second
+    /// service — so every existing capstone is unaffected.
+    pub services: FsmSet,
 }
 
 impl Default for ClusterCfg {
@@ -214,6 +230,19 @@ impl Default for ClusterCfg {
             snapshot_interval_bytes: 0,
             spare_node: false,
             crypto: false,
+            services: FsmSet::Single,
+        }
+    }
+}
+
+/// The `NodeConfig::services` a [`ClusterCfg`] declares. `Single` is
+/// `ServicesConfig::default()` — the exact value every pre-M14c2 node booted
+/// with, so the `Single` path is byte-identical.
+fn services_config(ccfg: ClusterCfg) -> uc2_node::ServicesConfig {
+    match ccfg.services {
+        FsmSet::Single => uc2_node::ServicesConfig::default(),
+        FsmSet::Two { lag } => {
+            uc2_node::ServicesConfig::from_ids(&[0, 1], Some(lag)).expect("ids 0,1")
         }
     }
 }
@@ -255,7 +284,7 @@ fn make_config(
         learners: Vec::new(),
         journal_segment_bytes: ccfg.journal_segment_bytes,
         crypto,
-        services: uc2_node::ServicesConfig::default(),
+        services: services_config(ccfg),
     }
 }
 
@@ -277,39 +306,58 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 /// nothing, so this is always a clean in-memory state; the node reconstructs it
 /// from the replicated log (journal replay, Task 9) — that reconstruction is
 /// exactly what the capstone's service-crash fault proves.
+///
+/// M14c2: `id` is the FSM the service attaches as — `0` everywhere the
+/// pre-M14c2 harness spawned a service (`ServiceConfig::service_id(0)` is the
+/// default, so the `Single` path is unchanged), `1` for the second FSM under
+/// [`FsmSet::Two`].
 fn spawn_service<SM: SnapshotStateMachine + Default>(
     dir: &Path,
     snapshot_interval_bytes: u64,
+    id: u8,
 ) -> uc2_service::Service<SM> {
+    let cfg = ServiceConfig::new(dir, APP).service_id(id);
     if snapshot_interval_bytes == 0 {
-        ServiceBuilder::new(ServiceConfig::new(dir, APP), SM::default())
-            .start()
-            .expect("service start")
+        ServiceBuilder::new(cfg, SM::default()).start().expect("service start")
     } else {
         // M6 Task 10: snapshot-capable service — builds on-disk snapshots on the
         // policy cadence so the node can advance its purge floor. Below-floor
         // reconstruction after a service crash then goes via snapshot install.
-        let cfg = ServiceConfig::new(dir, APP)
-            .snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
+        let cfg = cfg.snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
         ServiceBuilder::new(cfg, SM::default())
             .start_with_snapshots()
             .expect("snapshot service start")
     }
 }
 
+/// The second FSM (id 1) under [`FsmSet::Two`], else `None`. Every path that
+/// spawns a node's service pairs it with this one, so a node under `Two` always
+/// has BOTH declared FSMs attached (a node missing one stalls commit by design
+/// — the report ceiling).
+fn spawn_service1<SM1: SnapshotStateMachine + Default>(
+    dir: &Path,
+    ccfg: ClusterCfg,
+) -> Option<uc2_service::Service<SM1>> {
+    matches!(ccfg.services, FsmSet::Two { .. })
+        .then(|| spawn_service::<SM1>(dir, ccfg.snapshot_interval_bytes, 1))
+}
+
 // ------------------------------------------------------------------ one slot
 
 /// One cluster member: its fixed identity/address/dir plus the live node +
 /// service (taken out of their `Option`s across a crash/restart).
-pub struct NodeSlot<SM: SnapshotStateMachine + Default> {
+pub struct NodeSlot<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> {
     id: NodeId,
     addr: SocketAddr,
     instance_dir: PathBuf,
     node: Option<Node>,
     service: Option<uc2_service::Service<SM>>,
+    /// M14c2: the node's FSM-1 service under [`FsmSet::Two`]; `None` under
+    /// `Single`. Taken/respawned in lockstep with `service` on every crash path.
+    service1: Option<uc2_service::Service<SM1>>,
 }
 
-impl<SM: SnapshotStateMachine + Default> NodeSlot<SM> {
+impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> NodeSlot<SM, SM1> {
     fn is_live(&self) -> bool {
         self.node.is_some()
     }
@@ -340,8 +388,15 @@ enum SparePhase {
     Demoted,
 }
 
-pub struct LinClusterV2<SM: SnapshotStateMachine + Default = RegisterSm> {
-    nodes: Vec<NodeSlot<SM>>,
+/// `SM1` is the second FSM's state machine, used ONLY when
+/// `ClusterCfg::services` is [`FsmSet::Two`]; it defaults to `SM`, so every
+/// pre-M14c2 spelling (`LinClusterV2`, `LinClusterV2<ListAppendSm>`) keeps
+/// meaning exactly what it did.
+pub struct LinClusterV2<
+    SM: SnapshotStateMachine + Default = RegisterSm,
+    SM1: SnapshotStateMachine + Default = SM,
+> {
+    nodes: Vec<NodeSlot<SM, SM1>>,
     members: Vec<(NodeId, SocketAddr)>,
     faults: FaultConfig,
     ccfg: ClusterCfg,
@@ -353,7 +408,7 @@ pub struct LinClusterV2<SM: SnapshotStateMachine + Default = RegisterSm> {
     /// The spare's CURRENTLY live node+service, if a cycle is in flight
     /// (`spare_phase != Idle`). `NodeSlot::id` here is whatever fresh id the
     /// current cycle allocated — never the same id twice (tombstone rule).
-    spare: Option<NodeSlot<SM>>,
+    spare: Option<NodeSlot<SM, SM1>>,
     spare_phase: SparePhase,
     /// Monotonic fresh-id allocator for the spare (starts at 100, per the
     /// brief's tombstone rule — an id, once removed, can NEVER be re-added).
@@ -368,7 +423,7 @@ pub struct LinClusterV2<SM: SnapshotStateMachine + Default = RegisterSm> {
     crypto: Option<CryptoMaterial>,
 }
 
-impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
+impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> LinClusterV2<SM, SM1> {
     /// Bring up an `n`-node cluster under `root` (a caller-owned tempdir): bind
     /// every socket first (so the full member map is known before any agent
     /// runs), start each node on its pre-bound socket, then attach one service
@@ -421,8 +476,16 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
             // A follower's service follows the committed log too, so every node
             // carries a service from boot — the new leader after a failover
             // already has one attached.
-            let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes);
-            nodes.push(NodeSlot { id: i as NodeId, addr, instance_dir, node: Some(node), service: Some(service) });
+            let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes, 0);
+            let service1 = spawn_service1::<SM1>(&instance_dir, ccfg);
+            nodes.push(NodeSlot {
+                id: i as NodeId,
+                addr,
+                instance_dir,
+                node: Some(node),
+                service: Some(service),
+                service1,
+            });
         }
         // M7 Task 10: reserve (bind-then-drop, same tolerance as `rebind`
         // elsewhere in this file) an extra address for the spare, outside the
@@ -641,6 +704,9 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         if let Some(service) = self.nodes[li].service.take() {
             service.crash();
         }
+        if let Some(s1) = self.nodes[li].service1.take() {
+            s1.crash();
+        }
         // Survivors re-elect (quorum 2/3 holds).
         self.await_serving_excluding(li, 20);
         // Restart on the persisted dir + same port (static membership): recovers
@@ -649,9 +715,11 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         let crypto = self.crypto_config_for(id);
         let cfg = make_config(id, self.members.clone(), dir.clone(), addr, self.faults, self.ccfg, crypto);
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+        let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         self.nodes[li].node = Some(node);
         self.nodes[li].service = Some(service);
+        self.nodes[li].service1 = service1;
         // Full cluster settles back to a single serving leader.
         self.await_single_serving(20);
     }
@@ -676,15 +744,31 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         let mut respawned = 0;
         for i in 0..self.nodes.len() {
             let dead = self.nodes[i].service.as_ref().is_some_and(|s| !s.is_alive());
-            if !dead {
+            // M14c2: FSM 1 is supervised the same way, INDEPENDENTLY — a
+            // healthy sibling is never torn down for the other's death.
+            // Always `false` under `FsmSet::Single` (`service1` is `None`), so
+            // this loop's behaviour there is unchanged.
+            let dead1 = self.nodes[i].service1.as_ref().is_some_and(|s| !s.is_alive());
+            if !dead && !dead1 {
                 continue;
             }
             let dir = self.nodes[i].instance_dir.clone();
-            if let Some(service) = self.nodes[i].service.take() {
-                service.crash(); // drop-joins; swallows the fail-stop panic
+            if dead {
+                if let Some(service) = self.nodes[i].service.take() {
+                    service.crash(); // drop-joins; swallows the fail-stop panic
+                }
+                self.nodes[i].service =
+                    Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0));
+                respawned += 1;
             }
-            self.nodes[i].service = Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes));
-            respawned += 1;
+            if dead1 {
+                if let Some(s1) = self.nodes[i].service1.take() {
+                    s1.crash();
+                }
+                self.nodes[i].service1 =
+                    Some(spawn_service::<SM1>(&dir, self.ccfg.snapshot_interval_bytes, 1));
+                respawned += 1;
+            }
         }
         respawned
     }
@@ -695,8 +779,13 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         if let Some(service) = self.nodes[li].service.take() {
             service.crash();
         }
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        if let Some(s1) = self.nodes[li].service1.take() {
+            s1.crash();
+        }
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+        let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         self.nodes[li].service = Some(service);
+        self.nodes[li].service1 = service1;
         // The node never lost quorum, so a serving leader still exists.
         self.await_single_serving(20);
     }
@@ -721,8 +810,13 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         if let Some(service) = self.nodes[fi].service.take() {
             service.crash();
         }
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        if let Some(s1) = self.nodes[fi].service1.take() {
+            s1.crash();
+        }
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+        let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         self.nodes[fi].service = Some(service);
+        self.nodes[fi].service1 = service1;
         // The leader never lost quorum; a serving leader still exists.
         self.await_single_serving(20);
     }
@@ -795,6 +889,9 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
             if let Some(service) = spare.service.take() {
                 service.stop();
             }
+            if let Some(s1) = spare.service1.take() {
+                s1.stop();
+            }
         }
         for s in &mut self.nodes {
             if let Some(node) = s.node.take() {
@@ -803,7 +900,19 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
             if let Some(service) = s.service.take() {
                 service.stop();
             }
+            if let Some(s1) = s.service1.take() {
+                s1.stop();
+            }
         }
+    }
+
+    /// M14c2: FSM `id`'s `applied` byte position as published on `node`'s cnc
+    /// page — the per-FSM progress every two-FSM capstone samples (an FSM that
+    /// never advances is a stalled FSM, whatever the client saw).
+    pub fn service_applied(&self, node: usize, id: u8) -> u64 {
+        let cnc = CncPage::open_file(&self.nodes[node].instance_dir.join("cnc2.dat"), APP)
+            .expect("open cnc");
+        cnc.service_slot(id as usize).applied.load_acquire()
     }
 
     // -------------------------------------------------- M7 Task 10: reconfig
@@ -906,9 +1015,19 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
                 );
                 let sock = rebind(spare_addr);
                 let node = Node::start_with_socket(cfg, sock).expect("spare node start");
-                let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
-                self.spare =
-                    Some(NodeSlot { id, addr: spare_addr, instance_dir: dir, node: Some(node), service: Some(service) });
+                // M14c2: the spare is a FULL node — under `FsmSet::Two` it must
+                // boot BOTH declared FSMs or the leader's declared-set check
+                // refuses its join.
+                let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+                let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+                self.spare = Some(NodeSlot {
+                    id,
+                    addr: spare_addr,
+                    instance_dir: dir,
+                    node: Some(node),
+                    service: Some(service),
+                    service1,
+                });
                 let (ip, port) = Self::addr_to_wire(spare_addr);
                 let resp = Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
                 if resp.status == 0 {
@@ -926,6 +1045,9 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
                         }
                         if let Some(s) = slot.service.take() {
                             s.stop();
+                        }
+                        if let Some(s1) = slot.service1.take() {
+                            s1.stop();
                         }
                     }
                     false
@@ -1005,6 +1127,9 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
             if let Some(s) = slot.service.take() {
                 s.stop();
             }
+            if let Some(s1) = slot.service1.take() {
+                s1.stop();
+            }
         }
     }
 
@@ -1019,8 +1144,10 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
     }
 }
 
-// Register-typed probe used by the WGL partition scenarios only.
-impl LinClusterV2<RegisterSm> {
+// Register-typed probe used by the WGL partition scenarios only. Generic in
+// `SM1` (M14c2) so a two-FSM cluster whose FSM 1 is a `Slow`/`Corrupt` wrapper
+// still gets the FSM-0 probe.
+impl<SM1: SnapshotStateMachine + Default> LinClusterV2<RegisterSm, SM1> {
     /// Linearizable read addressed to a SPECIFIC node via a fresh client on its
     /// dir (not leader-routed) — used to probe a partitioned-away node, which
     /// must NEVER answer with a stale `Ok`. `Ok(v)` → `Outcome::Ok`; any client
@@ -1041,6 +1168,103 @@ impl LinClusterV2<RegisterSm> {
         };
         client.shutdown();
         out
+    }
+}
+
+// ----------------------------------------------- M14c2: FSM-1 stand-in SMs
+//
+// Both wrappers delegate to an inner `SM` and are written UFCS
+// (`uc2_service::StateMachine::apply(&mut self.0, ..)`), never `self.0.apply(..)`:
+// `RawStateMachine` has a blanket impl over every `StateMachine`, so a bare
+// method call on a generic inner SM is ambiguous (E0034 — the M14d lesson).
+
+/// FSM 1's stand-in for the slow-FSM oracle: `apply` sleeps `MICROS` then
+/// delegates; output identical to `SM`'s, so the equivalence oracle holds.
+#[derive(Default)]
+pub struct Slow<SM, const MICROS: u64>(pub SM);
+
+impl<SM: uc2_service::StateMachine, const MICROS: u64> uc2_service::StateMachine
+    for Slow<SM, MICROS>
+{
+    type Command = SM::Command;
+    type Response = SM::Response;
+    type Query = SM::Query;
+    type QueryResponse = SM::QueryResponse;
+    fn apply(&mut self, position: u64, cmd: SM::Command) -> SM::Response {
+        std::thread::sleep(Duration::from_micros(MICROS));
+        uc2_service::StateMachine::apply(&mut self.0, position, cmd)
+    }
+    fn query(&self, q: SM::Query) -> SM::QueryResponse {
+        uc2_service::StateMachine::query(&self.0, q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        uc2_service::StateMachine::last_applied(&self.0)
+    }
+}
+
+impl<SM: uc2_service::SnapshotStateMachine + uc2_service::StateMachine, const MICROS: u64>
+    uc2_service::SnapshotStateMachine for Slow<SM, MICROS>
+{
+    type SnapshotHandle = SM::SnapshotHandle;
+    fn freeze(&self) -> Result<(SM::SnapshotHandle, u64), uc2_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        handle: SM::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        SM::stream_snapshot(handle, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        self.0.install_snapshot(position, src)
+    }
+}
+
+/// An FSM that answers every CAS with the OPPOSITE result — exists only to
+/// prove the replication-equivalence oracle bites (`two_fsm_oracle_bites`).
+#[derive(Default)]
+pub struct Corrupt<SM>(pub SM);
+
+impl uc2_service::StateMachine for Corrupt<RegisterSm> {
+    type Command = Cmd;
+    type Response = CmdResp;
+    type Query = ();
+    type QueryResponse = Option<u64>;
+    fn apply(&mut self, position: u64, cmd: Cmd) -> CmdResp {
+        match uc2_service::StateMachine::apply(&mut self.0, position, cmd) {
+            CmdResp::CasResult(b) => CmdResp::CasResult(!b),
+            other => other,
+        }
+    }
+    fn query(&self, q: ()) -> Option<u64> {
+        uc2_service::StateMachine::query(&self.0, q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        uc2_service::StateMachine::last_applied(&self.0)
+    }
+}
+
+impl uc2_service::SnapshotStateMachine for Corrupt<RegisterSm> {
+    type SnapshotHandle = <RegisterSm as uc2_service::SnapshotStateMachine>::SnapshotHandle;
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), uc2_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        handle: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        RegisterSm::stream_snapshot(handle, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        self.0.install_snapshot(position, src)
     }
 }
 
@@ -1190,6 +1414,61 @@ pub fn submit_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             | Err(e @ ClientError::PayloadTooLarge { .. })
             // M14b: this harness only ever drives FSM 0, which every node
             // declares — naming an undeclared id here is a wiring bug.
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
+/// M14c2: [`submit_cmd`]'s fan-in twin — one submit, EVERY declared FSM's
+/// answer (ascending by service id). The routing/retry discipline is identical
+/// (see [`submit_cmd`]'s doc for why only `NotLeader`/`BackpressureFull`/`Retry`
+/// may be retried); only the client call and the `Ok` payload differ. The
+/// caller splits the returned vector into one per-FSM history.
+pub fn submit_all_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
+    conn: &mut WorkerConn,
+    cmd: &C,
+    deadline: Instant,
+) -> SubmitOutcome<Vec<(u8, R)>> {
+    loop {
+        if Instant::now() > deadline {
+            return SubmitOutcome::Indeterminate; // gave up routing → in-limbo
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.rotate();
+            continue;
+        };
+        match client.submit_all::<C, R>(cmd) {
+            Ok(r) => return SubmitOutcome::Ok(r),
+            // Guaranteed-not-committed → safe to route + retry.
+            Err(ClientError::NotLeader { hint }) => match hint {
+                Some(h) => conn.reconnect_to(h as usize),
+                None => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    conn.rotate();
+                }
+            },
+            Err(ClientError::BackpressureFull) | Err(ClientError::Retry) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Maybe-committed → indeterminate, NEVER retried.
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_)) => {
+                conn.drop_client();
+                return SubmitOutcome::Indeterminate;
+            }
+            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                return SubmitOutcome::Indeterminate;
+            }
+            // Harness/wiring bugs.
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
+            // This harness only ever fans in over declared ids, so naming an
+            // undeclared one here is a wiring bug.
             | Err(e @ ClientError::ServiceNotDeclared { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }

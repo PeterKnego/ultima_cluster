@@ -221,6 +221,7 @@ fn linearizable_under_purge_and_snapshot_churn() {
         snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
         crypto: false,
+        ..ClusterCfg::default()
     };
 
     let seed: u64 =
@@ -637,6 +638,7 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
         snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
         crypto: true,
+        ..ClusterCfg::default()
     };
 
     let seed: u64 =
@@ -844,4 +846,35 @@ fn linearizable_under_reconfig_churn_with_crypto() {
             panic!("checker Inconclusive under crypto+reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS")
         }
     }
+}
+
+// ------------------------------------------------------------ M14c2 two FSMs
+
+/// M14c2 T2 smoke: two FSMs boot, one `submit_all` answers from both with
+/// equal responses, and the cnc slots show both attached and applied.
+#[test]
+fn two_fsm_smoke() {
+    let _g = serialize();
+    let dir = tempdir();
+    let ccfg = ClusterCfg {
+        services: lincheck_v2::FsmSet::Two { lag: uc2_node::FsmLag::Bounded(64 * 1024) },
+        ..ClusterCfg::default()
+    };
+    let cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader = cluster.await_single_serving(30);
+    let client = cluster.client(leader);
+    let resps: Vec<(u8, CmdResp)> = client.submit_all(&Cmd::Write(7)).expect("submit_all");
+    assert_eq!(resps.len(), 2, "{resps:?}");
+    assert_eq!(resps[0].1, resps[1].1, "replication-equivalence: {resps:?}");
+    let r2: Vec<(u8, CmdResp)> =
+        client.submit_all(&Cmd::Cas { old: 7, new: 8 }).expect("submit_all cas");
+    assert!(r2.iter().all(|(_, r)| *r == CmdResp::CasResult(true)), "{r2:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline
+        && (cluster.service_applied(leader, 0) == 0 || cluster.service_applied(leader, 1) == 0)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(cluster.service_applied(leader, 0) > 0 && cluster.service_applied(leader, 1) > 0);
+    cluster.stop();
 }
