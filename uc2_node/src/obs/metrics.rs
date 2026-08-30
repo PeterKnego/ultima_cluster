@@ -651,13 +651,13 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     push_counter(
         &mut out,
         "uc2_snapshot_intake_io_failures_total",
-        "Local I/O failures on the snapshot INTAKE path: a `.part` that could not be created/sized, or a completed artifact whose fsync/rename failed. Retried, but a persistent count means this node's snapshot dir is full, read-only, or obstructed (spec §14.3).",
+        "Local I/O failures on the snapshot INTAKE path: a `.part` that could not be created/sized or written to, or a completed artifact whose fsync/rename failed. Retried, but a persistent count means this node's snapshot dir is full, read-only, or obstructed (spec §14.3). Since 2.8.1 a failed publish is retried at most once per 250 ms per transfer — on the duty cycle AND on the chunk path — so a standing obstacle makes this climb at about four per second, not at the poll or chunk rate.",
         s.receiver.snap_intake_io_failures.load(Ordering::Relaxed),
     );
     push_counter(
         &mut out,
         "uc2_snapshot_intake_abandoned_total",
-        "Inbound snapshot transfers abandoned after 60 s with no chunk (the leader died mid-transfer): the partial artifacts are removed and this node keeps NAKing for a fresh session. A rising count means transfers never finish — look at the leader or the link, not this node's disk (M14c2).",
+        "Inbound snapshot transfers abandoned after 60 s with no chunk: the transfer's unfinished .part files are removed (an artifact it had already published stays, to be adopted or superseded by the next session) and this node keeps NAKing for a fresh session. A rising count means transfers never finish — on its own, look at the leader or the link. But if uc2_snapshot_intake_io_failures_total is rising at the same time the cause is local — this node's snapshot directory — and the set is being re-downloaded on a ~60 s loop until it is cleared (M14c2).",
         s.receiver.snap_intake_abandoned.load(Ordering::Relaxed),
     );
     push_counter(
