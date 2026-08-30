@@ -1077,13 +1077,17 @@ fn run_two_fsm_slow(label: &str, lag: uc2_node::FsmLag, seed: u64) {
 
 /// M14d run-1's lesson, pinned in-process: reconstruction after a service
 /// restart installs the newest snapshot ONLY when the journal no longer
-/// covers `start_pos` (`uc2_service/src/replay.rs:73-78`'s gap guard). With
-/// purge off, the journal always covers `start_pos`, so a `SnapshotPolicy`
-/// alone never shortens a restart — the fresh service replays the whole
-/// journal, exactly as it would with no snapshot policy at all. With purge
-/// on, the leader's journal prefix is dropped below the snapshot floor, so
-/// the fresh service's `start_pos` (0, an empty SM) is no longer covered and
-/// reconstruction installs the newest artifact once.
+/// covers `start_pos` (`uc2_service/src/replay.rs:73-78`'s gap guard) —
+/// AND ONLY once the live log buffer has WRAPPED PAST `start_pos`: below the
+/// wrap, a restart reads the still-live ring directly and touches neither
+/// the journal nor a snapshot, whatever the purge posture. With purge off,
+/// the journal always covers `start_pos` even past the wrap, so a
+/// `SnapshotPolicy` alone never shortens a restart — the fresh service
+/// replays the whole journal, exactly as it would with no snapshot policy at
+/// all. With purge on AND past the wrap, the leader's journal prefix is
+/// dropped below the snapshot floor, so the fresh service's `start_pos` (0,
+/// an empty SM) is no longer covered and reconstruction installs the newest
+/// artifact once.
 ///
 /// `InstallCounting` (`lincheck_v2` module) counts `install_snapshot` calls
 /// via the process-global `lincheck_v2::INSTALLS` static — see that static's
@@ -1113,6 +1117,7 @@ fn restart_installs(purge: bool) -> u32 {
     // 64 KiB ring — see the doc above for why the ring, not the write count,
     // is what must be small.
     const WRITE_COUNT: u64 = 3_000;
+    const LAST_VALUE: u64 = WRITE_COUNT - 1;
     const RING_BYTES: u64 = 1 << 16; // 64 KiB
     let _g = serialize();
     eprintln!("[t11 purge={purge}] phase: start");
@@ -1147,9 +1152,18 @@ fn restart_installs(purge: bool) -> u32 {
         assert!(first_base > 0, "purge never advanced");
     }
     lincheck_v2::INSTALLS.store(0, Ordering::Relaxed);
+    // A leader must exist right before the crash — `crash_and_restart_leader_service`
+    // returns SILENTLY when `leader()` is momentarily `None` (fix round 1: without
+    // this, a transient no-leader window would make the purge-off `== 0` branch
+    // pass VACUOUSLY, no crash/restart/reconstruction ever attempted).
+    cluster.leader().expect("a leader before the crash");
     cluster.crash_and_restart_leader_service();
     eprintln!("[t11 purge={purge}] phase: crash_and_restart_leader_service returned");
-    let _: Option<u64> = client.query_linearizable(&()).unwrap(); // the fresh service is caught up
+    // Positive evidence the reconstructed SM is actually correct, not just that
+    // SOME path ran (fix round 1: `INSTALLS == 0` alone is also consistent with
+    // "no reconstruction happened at all" — this is the gap guard's actual point).
+    let got: Option<u64> = client.query_linearizable(&()).unwrap();
+    assert_eq!(got, Some(LAST_VALUE), "[purge={purge}] rebuilt SM must hold the last write");
     eprintln!("[t11 purge={purge}] phase: query_linearizable returned");
     cluster.stop();
     eprintln!("[t11 purge={purge}] phase: stop done");

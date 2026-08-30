@@ -1290,6 +1290,16 @@ impl uc2_service::SnapshotStateMachine for Corrupt<RegisterSm> {
 /// (`uc2_node/tests/lin_v2.rs`) is the ONLY test in this binary that wraps an
 /// SM in `InstallCounting`. If a second test ever does, it MUST also take
 /// `serialize()` around its use of this counter or the two will race.
+///
+/// **Cluster-global, not leader-only (fix round 1).** All three in-process
+/// nodes run `InstallCounting`, so this counts installs across the WHOLE
+/// cluster, not just the crashed leader's fresh service. The test asserts
+/// `== 1` under purge — if it ever reads `2`, that is NOT test noise: it
+/// means a SIBLING service also fell more than one 64 KiB ring behind (under
+/// this test's serial, one-command-in-flight load) and independently took
+/// the snapshot-install path. Treat a `2` as a genuine finding to
+/// investigate (why did a healthy follower's service lag past a full ring
+/// under such light load?), not as a flake to retry past.
 pub static INSTALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Wraps `RegisterSm`, forwarding every call unchanged except
