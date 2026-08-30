@@ -1,7 +1,7 @@
 # M14c2 T8 — lockstep under CPU oversubscription
 
 **SMOKE, never a gate.** Every number here is a dev-box measurement
-(`docs/notes/dev-box-not-a-bench.md`, CLAUDE.md "Benchmarking discipline").
+(CLAUDE.md "Benchmarking discipline").
 Rate bars are fleet-only; nothing below moves a bar, and nothing below is a
 bar. What this record adjudicates is a *ratio* and a *mechanism*, both of which
 a dev box can carry.
@@ -45,7 +45,10 @@ distinct *physical* cores and `--cores 0,16` is the two logical CPUs of one
 physical core). Linux, stock scheduler, otherwise idle (load average ≈ 2.3 of
 32 during the run). rustc 1.96.0, `--release`.
 
-Every rung ran **3×** and all three numbers are reported.
+Every ladder and bisect rung ran **3×** and all three numbers are reported;
+two isolation arms (bounded N=2 at `--cores 0-1 --spinners 2`, lockstep N=1 at
+`--cores 0`) are **n=1** — they are order-of-magnitude checks, not deltas, and
+are marked as such in their table.
 
 ### Provenance
 
@@ -76,8 +79,9 @@ builds of HEAD into two separate target dirs, 3 runs each:
 | ctrl A — pinned `0-1`, 2 spinners | 741 | 1 323 | 2 008 |
 | ctrl B — pinned `0-1`, 2 spinners | 392 | 1 011 | 465 |
 
-**Resolution, unconstrained: ±1.0 %** (623 031 – 629 333 across six runs of two
-separately-built binaries). A delta smaller than that is not readable.
+**Resolution, unconstrained: 1.0 % peak-to-peak** (623 031 – 629 333 across six
+runs of two separately-built binaries — i.e. ±0.5 % about the mean; "±1.0 %"
+would overstate it). A delta smaller than that is not readable.
 
 **Resolution at a spinner rung: a factor of ~5** (392 – 2 008). The
 `stress-ng` rungs are *not* usable for reading a bisect delta; only an
@@ -91,6 +95,14 @@ bypassed. So this control measures **run-to-run noise only**; the codegen
 component M14b saw between two builds of one commit cannot appear here. It is
 the weaker of the two controls, and it is the honest description of what was
 measured.
+
+**And note where the control pair was run:** at the unconstrained rung and at
+the `0-1 --spinners 2` rung, *not* at the `--cores 0` rung the bisect is read
+on. That rung's quoted resolution (709 / 709 / 710, 0.1 %) is **n=3 of one
+binary**. Since the separately-built binaries here are bit-identical, a rebuild
+control at that rung would be identical by construction, so nothing is lost —
+but the 0.1 % figure is a run-to-run repeatability number, not a rebuild
+control.
 
 ## The ladder
 
@@ -107,8 +119,10 @@ Reproduction target was ≤ 30 k frames/s.
 | `--cores 0` (widened) | 3 / 1 | **709** | **709** | **710** | 0.0011× | **YES** |
 | `--cores 0,16` (HT pair, widened) | 3 / 2 logical, 1 physical | 86 729 | 87 518 | 88 862 | 0.14× | no |
 
-**Reproduced, hugely.** The worst rung is 880× down from unconstrained — worse
-than the fleet's row e, which is the same phenomenon with more CPUs. The
+**Reproduced, hugely.** The worst rung is 880× down from unconstrained, deeper
+than the fleet's row e (60×) on a harsher rung — consistent with row e, pending
+Task 9's pinned re-measure, which is what would establish that they are the
+same phenomenon. The
 `--cores 0` rung is the cleanest: 709 / 709 / 710 frames/s, a 0.1 % spread,
 i.e. **1.41 ms per frame**.
 
@@ -125,6 +139,10 @@ give-ups.
 | **bounded**, N=2 | `--cores 0` (same 3 threads / 1 CPU) | 7 410 565 | 7 043 294 | 7 441 768 |
 | **bounded**, N=2 | `--cores 0-1 --spinners 2` | 7 215 190 | — | — |
 | **lockstep**, N=1 (no sibling) | `--cores 0` | 338 512 | — | — |
+
+The last two rows are **n=1** (marked `—`): they are three-order-of-magnitude
+sanity checks against the 709 f/s on the same rung, not deltas, and nothing in
+the verdict rests on their exact value.
 
 Bounded mode on a *single* CPU with the same three threads runs at **7.4 M
 frames/s** — 10 000× the lockstep number on the identical rung, and a third of
@@ -148,6 +166,16 @@ runnable-but-not-running. The barrier opens when the *scheduler* eventually
 preempts the waiter — one timeslice-scale event per frame. 1.41 ms/frame is a
 scheduler quantum, not a handshake.
 
+**What is instrumented and what is inferred.** The ladder's yields were *not*
+counted, so "burns whole scheduling slices" is an inference. The bound that
+does follow from the data: `lag_waits = 0` means every barrier returned inside
+the budget, so **≤ 2 047 yield iterations per barrier**; at 1.41 ms per frame
+that is a **mean of ≥ 0.69 µs per yield iteration** — several times the cost of
+a bare `sched_yield` that does not switch (tens of ns), so the iterations are
+not free spins and the waiter is being descheduled or is re-picked after real
+work elsewhere. Pinning that down properly needs a yields-consumed counter
+alongside `lag_waits`; that is the instrument to add if this is revisited.
+
 That also predicts, correctly, that (a) and (b) below are no-ops: both change
 what happens *after* the ladder, on a path that never executes.
 
@@ -164,6 +192,14 @@ reproducing rung `--cores 0 --spinners 0` (the 0.1 %-stable one), 3 runs.
 | (b) | ladder ends only when a sibling's `heartbeat_ns` is > 1 s stale (never sleep on a live sibling) | 708 | 710 | 709 | **1.00×** |
 | (c) | after `LAG_WAIT_SPINS`, `futex_wait` on the blocking sibling's `applied` word (500 µs timeout backstop, 64 waits) + `futex_wake` after each `applied` store while in lockstep | **82 639** | **82 231** | **82 309** | **116×** |
 
+**(a1), (a2) and (b) were measured only at the reproducing rung**, not
+unconstrained as the brief's Step 3 asks; only (c) got the full unconstrained
+set below. That is immaterial to the verdict: the rule's clauses are
+conjunctive, and a variant that reads 1.00× at the reproducing rung fails the
+"≥ 50 % of the unconstrained rate" clause whatever its unconstrained numbers
+are, so no unconstrained measurement could have changed its outcome. It would
+have mattered only if one of them had cleared the rate bar.
+
 (a) and (b) are null to within one frame per second — exactly as the mechanism
 predicts. (c) is a 116× improvement, and it is the only variant that touches
 the path that actually runs.
@@ -179,19 +215,29 @@ the path that actually runs.
 | (c) N=2 **bounded**, unconstrained | — | 21 984 040 | 22 038 232 | 21 904 080 | 21 563 026 / 21 552 018 / 21 568 752 |
 | (c) N=2 lockstep, unconstrained | — | 584 195 | 569 337 | 601 831 | 624 276 / 623 031 / 629 333 |
 
-- No regression on either bounded arm (medians +1.7 % at N=1, +2.0 % at N=2 —
-  both above the +1.0 % control resolution in the *favourable* direction, so
-  read as "no regression", not as a win).
-- **Unconstrained N=2 lockstep regresses ~6 %** (median 584 k vs 624 k), which
-  is outside the 1.0 % control. The syscall pair per frame is not free at
-  full speed. (The rule's regression clause names only N=1/N=2 *bounded*, so
-  this is recorded as a finding rather than as the disqualifier.)
+- No regression on either bounded arm: **medians +2.5 % at N=1**
+  (21 825 839 vs 21 294 198) and **+2.0 % at N=2** (21 984 040 vs 21 563 026).
+  By means the N=1 figure is +1.5 % and by maxima +1.8 %; the statistic is
+  named because they differ. Both are in the *favourable* direction, so read as
+  "no regression", not as a win.
+- **But the bounded arms cannot bind this variant.** (c)'s `futex_wake` is
+  gated on `LagMode::Lockstep`, so a bounded run never executes the added
+  syscall — the bounded N=1/N=2 arms exercise none of (c)'s cost, and the
+  rule's regression clause is therefore vacuous against this particular
+  implementation. Its real cost shows only where the syscall runs:
+- **Unconstrained N=2 lockstep regresses 6.4 %** (medians 584 195 vs 624 276),
+  outside the 1.0 % peak-to-peak control. The syscall pair per frame is not
+  free at full speed. (The rule's regression clause names only N=1/N=2
+  *bounded*, so this is recorded as a finding, not as the disqualifier — the
+  verdict below turns on the 50 % clause, which (c) fails outright.)
 - **(c) restores 13 % of the unconstrained rate** (82.6 k of 624 k) at the best
   rung, 13 % at `0-1/2`, and 11 % at `0-3/4`.
 
 ## The rule
 
-Quoted verbatim from spec §16.4 (pre-committed before the run):
+Quoted verbatim from the plan's Global Constraints
+(`docs/superpowers/plans/2026-08-30-uc2-m14c2-proof-pass.md`), restating
+spec §16.4 (pre-committed before the run):
 
 > product defect iff it reproduces only under oversubscription *and* one of
 > (a) ladder ×4/×16, (b) yield-not-sleep while a sibling is live, (c) futex
@@ -208,7 +254,7 @@ Applied:
 - (a) ×4 and ×16: **null** (1.00×). Does not clear 50 %.
 - (b): **null** (1.00×). Does not clear 50 %.
 - (c): **116×**, but **13 %** of the unconstrained rate — below the 50 % bar
-  (which would need ≥ 312 k). It also costs ~6 % of unconstrained N=2
+  (which would need ≥ 312 k). It also costs 6.4 % of unconstrained N=2
   lockstep.
 
 No variant clears the bar, so the second clause fires.
@@ -221,8 +267,11 @@ exceeds the CPUs it collapses by up to ~880× (624 k → 709 frames/s at N=2 wit
 
 Landed: the envelope sentence with the number, in
 `docs/reference/configuration.md` (`[services]`, the `fsm_lag` row) and
-`docs/reference/limits.md`. **No code change.** `uc2_service/src/apply.rs` is
-untouched by this task.
+`docs/reference/limits.md`. **No behavioural code change**:
+`uc2_service/src/apply.rs` gains only comments — a one-line "do not retune"
+pointer at `LAG_WAIT_YIELDS` and a paragraph on `lockstep_wait` recording that
+the ladder never exhausts here — so that nobody rediscovers the 1.00× the hard
+way.
 
 ## What a future attempt should know
 

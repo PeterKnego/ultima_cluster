@@ -27,7 +27,13 @@ echo "bin: $(sha256sum "$BIN")"
 run() { "$BIN" --root "$ROOT" --fsms 2 --mode lockstep --secs "$SECS" --warmup-secs 1 2>&1 | grep -E 'hop: min|lag_waits'; }
 echo "== unconstrained"; run
 echo "== pinned to $CORES with $SPINNERS spinner(s)"
+# Guard the pinned arm's tools BEFORE running it. stress-ng is launched as a
+# background job, whose failure `set -e` does not catch: without this check a
+# missing stress-ng would silently produce a NON-oversubscribed rung that reads
+# like a clean result.
+command -v taskset >/dev/null || { echo "taskset required" >&2; exit 2; }
 if [ "$SPINNERS" -gt 0 ]; then
+  command -v stress-ng >/dev/null || { echo "stress-ng required" >&2; exit 2; }
   taskset -c "$CORES" stress-ng --cpu "$SPINNERS" --timeout $((SECS + 3)) --quiet & SP=$!
   sleep 0.5
   taskset -c "$CORES" "$BIN" --root "$ROOT" --fsms 2 --mode lockstep --secs "$SECS" --warmup-secs 1 2>&1 | grep -E 'hop: min|lag_waits'

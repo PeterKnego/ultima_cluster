@@ -524,6 +524,8 @@ const QUERY_DRAIN_PER_CYCLE: usize = 64;
 /// Measured in `uc2_node/examples/apply_bench`
 /// (docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md).
 const LAG_WAIT_SPINS: u32 = 256;
+// M14c2 T8: do NOT retune this expecting a win under CPU oversubscription —
+// ×4 and ×16 both measured 1.00× (docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md).
 const LAG_WAIT_YIELDS: u32 = 2048;
 /// While yielding, refresh the heartbeat this often so a long ladder is
 /// never mistaken for a dead FSM.
@@ -631,6 +633,16 @@ fn unix_ns() -> u64 {
 ///
 /// Out of line: inlining the ladder into `apply_cycle`'s loop cost 9 % at
 /// N=1 on a path N=1 never executes (codegen of the hot body).
+///
+/// M14c2 T8 — what this ladder does NOT fix: under CPU oversubscription (the
+/// runnable set exceeding the CPUs) the ladder **never exhausts**
+/// (`lag_waits = 0` on every collapsed run), so the sleep path above is never
+/// reached and the M14a cascade is not what is happening; the yields
+/// themselves are the collapse, at ~1.41 ms per frame. Lengthening the budget
+/// ×4 and ×16 both measured **1.00×**, as did an unbounded yield-until-the-
+/// sibling-looks-dead ladder. That collapse is a recorded operating-envelope
+/// fact (lockstep needs a free CPU per declared FSM), not a defect:
+/// `docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`.
 #[inline(never)]
 fn lockstep_wait<S: RawStateMachine>(st: &mut ApplyState<S>, commit: u64, durable: u64) -> Option<(u64, bool)> {
     for i in 0..(LAG_WAIT_SPINS + LAG_WAIT_YIELDS) {
