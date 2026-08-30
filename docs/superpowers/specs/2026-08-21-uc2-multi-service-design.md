@@ -970,7 +970,7 @@ Every two-FSM capstone asserts two things on top of what its single-FSM
 parent asserts: **per-FSM linearizability** (each history checked separately
 by the untouched `uc-lincheck` checker) and the **replication-equivalence
 oracle** — for every `submit_all`, the two responses are byte-equal (same
-deterministic SM, same log ⇒ identical answers). A single unequal pair is a
+deterministic SM, same log ⇒ identical answers). Reads are evidence for their own FSM's history only; two linearizable reads of two FSMs are two operations at two instants and are never compared. A single unequal pair is a
 FAIL and a consensus/apply defect.
 
 | capstone | shape | extra assertion |
@@ -981,7 +981,7 @@ FAIL and a consensus/apply defect.
 | `lin_partition_v2::minority_partition_and_heal_two_fsm` | the existing scenario, two FSMs, bounded | per-FSM WGL + equivalence, before and after heal |
 | `uc2-crashtest::two_fsm_service_sigkill` (feature `hard-crash-tests`) | real processes; SIGKILL `--service-id 1` mid-load; respawn | both histories linearizable across the restart; equivalence holds after recovery; the restarted FSM re-attaches with a bumped incarnation |
 | `uc2-crashtest::two_fsm_node_sigkill` | SIGKILL the node with both attached; respawn node then both services | as above |
-| `elle_v2::elle_quiet_two_fsm` | the clean tier once with two FSMs | one Elle history per FSM, each under both models; equivalence on every read |
+| `elle_v2::elle_quiet_two_fsm` | the clean tier once with two FSMs | one Elle history per FSM, each under both models; equivalence on every submit_all's two responses (reads at different instants may legitimately differ) |
 
 Local proof stack for the plan's acceptance: the whole suite green, the
 capstones green with the failure injected (each new oracle watched to fail
