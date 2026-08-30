@@ -22,7 +22,7 @@ Pick your architecture and take the tarball, its checksum, `SHA256SUMS`, and
 the signature bundle:
 
 ```bash
-VER=2.8.0
+VER=2.8.1
 TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
 BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
 
@@ -90,7 +90,7 @@ packaging/quickstart-local.sh
 
 ```text
 ultima_cluster quickstart
-   binaries: /home/you/uc2-2.8.0-x86_64-unknown-linux-gnu/bin
+   binaries: /home/you/uc2-2.8.1-x86_64-unknown-linux-gnu/bin
    root:     /home/you/uc2-quickstart
 
 1. writing configuration
@@ -345,7 +345,7 @@ supervisor:
   publishes:
 
   ```bash
-  UC2_IMAGE=ghcr.io/peterknego/uc2:2.8.0 \
+  UC2_IMAGE=ghcr.io/peterknego/uc2:2.8.1 \
     docker compose -f packaging/compose.yml up -d
   ```
 

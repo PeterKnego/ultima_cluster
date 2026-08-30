@@ -19,23 +19,23 @@
 #   Single architecture, tarball named explicitly (what release_smoke.sh and
 #   the CI compose smoke do):
 #       docker build -f packaging/Dockerfile \
-#           --build-arg TARBALL=uc2-2.8.0-x86_64-unknown-linux-gnu.tar.gz \
+#           --build-arg TARBALL=uc2-2.8.1-x86_64-unknown-linux-gnu.tar.gz \
 #           -t uc2:smoke .
 #
 #   Multi-architecture, tarball derived from VERSION + the platform being
 #   built (what release.yml's `image` job does):
 #       docker buildx build -f packaging/Dockerfile \
 #           --platform linux/amd64,linux/arm64 \
-#           --build-arg VERSION=2.8.0 -t ghcr.io/peterknego/uc2:2.8.0 .
+#           --build-arg VERSION=2.8.1 -t ghcr.io/peterknego/uc2:2.8.1 .
 #
 # The image's ENTRYPOINT is `uc2-node`. The other four binaries live in the
 # same image and are reached with --entrypoint:
 #
-#   docker run --rm -v uc2-n0:/srv/uc2/n0 uc2:2.8.0 --config /etc/uc2/node.toml
-#   docker run --rm --entrypoint /usr/local/bin/uc2ctl          uc2:2.8.0 status --instance-dir /srv/uc2/n0 --app-id myapp
-#   docker run --rm --entrypoint /usr/local/bin/uc2-gateway     uc2:2.8.0 --config /etc/uc2/gateway.toml
-#   docker run --rm --entrypoint /usr/local/bin/counter-service uc2:2.8.0 --instance-dir /srv/uc2/n0 --app-id myapp
-#   docker run --rm --entrypoint /usr/local/bin/counter-remote  uc2:2.8.0 --gateways gw0:9200 --app-id myapp get
+#   docker run --rm -v uc2-n0:/srv/uc2/n0 uc2:2.8.1 --config /etc/uc2/node.toml
+#   docker run --rm --entrypoint /usr/local/bin/uc2ctl          uc2:2.8.1 status --instance-dir /srv/uc2/n0 --app-id myapp
+#   docker run --rm --entrypoint /usr/local/bin/uc2-gateway     uc2:2.8.1 --config /etc/uc2/gateway.toml
+#   docker run --rm --entrypoint /usr/local/bin/counter-service uc2:2.8.1 --instance-dir /srv/uc2/n0 --app-id myapp
+#   docker run --rm --entrypoint /usr/local/bin/counter-remote  uc2:2.8.1 --gateways gw0:9200 --app-id myapp get
 #
 # There is no shell in the image (distroless), so `docker exec ... sh` does
 # not work and every `command:` must be an exec-form argv. See

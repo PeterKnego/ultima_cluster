@@ -5,7 +5,7 @@ exclude = ["fuzz"] # cargo-fuzz crate: nightly-only, its own [workspace]; see fu
 
 [workspace.package]
 edition = "2024"
-version = "2.8.0"
+version = "2.8.1"
 license = "Apache-2.0"
 authors = ["Peter Knego"]
 repository = "https://github.com/PeterKnego/ultima_cluster"
@@ -41,7 +41,7 @@ thiserror = "2"
 tracing = "0.1"
 
 # storage
-ultima-journal = { path = "ultima_journal", version = "2.8.0" }
+ultima-journal = { path = "ultima_journal", version = "2.8.1" }
 # crates.io dep (published 0.1.1) — the workspace builds standalone, no sibling
 # checkout needed. `persistence` is required for snapshot_stream /
 # install_snapshot_stream. For lockstep local development against a checkout,
