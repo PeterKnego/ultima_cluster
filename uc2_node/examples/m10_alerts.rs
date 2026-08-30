@@ -1105,9 +1105,11 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
                      than a value that straddles it. A non-dividing size — a 64-byte payload, \
                      96-byte frames, 8192/96 = 85.33 — oscillates between 8160 and 8256, i.e. \
                      one frame BELOW the bound half the time. This scenario therefore \
-                     adjudicates the rule on its EASY input; the rule itself carries a \
-                     one-frame (MTU_DEFAULT = 1408 B) tolerance for the general case, and that \
-                     tolerance is NOT what this run exercises."
+                     adjudicates the rule on its EASY input. The rule carries a tolerance for \
+                     the general case — the TIGHTER of (bound - MTU_DEFAULT 1408) and \
+                     0.9 * bound, so at this 8192-byte bound the threshold is 7372.8, not 8192 \
+                     — and 8320 clears the un-toleranced bound anyway, so this run does NOT \
+                     exercise the tolerance. A second arm at a non-dividing payload would."
                 .into(),
         },
     )

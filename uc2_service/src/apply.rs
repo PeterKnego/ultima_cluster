@@ -243,6 +243,14 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// missed (it never counted) and would have re-armed every cycle (it would
     /// have counted one episode per cycle). Set by [`note_lag_wait`], cleared
     /// only where the cursor advances.
+    ///
+    /// Two corners of that rule, both deliberate. A torn/`NotCommitted`
+    /// interlude (`Batch::CaughtUp` under a capped target) is the LOG's doing,
+    /// not the barrier's, and is never counted — the flag simply stays as it
+    /// was. And in lockstep, a ladder that opens without a frame actually
+    /// applying (the plan resolves, `next_batch` yields nothing) leaves the
+    /// flag set, so the next park folds into the SAME episode rather than
+    /// opening a new one.
     pub(crate) lag_waiting: bool,
     /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
     pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
@@ -696,6 +704,12 @@ fn lockstep_wait<S: RawStateMachine>(st: &mut ApplyState<S>, commit: u64, durabl
 /// Out of line, like [`lockstep_wait`], and for the same measured reason: code
 /// in the apply loop's body costs even on paths that never run (M14a, −9 % at
 /// N=1 for an inlined ladder).
+///
+/// **Not A/B'd.** This edit was NOT measured on `uc2_node/examples/apply_bench`
+/// at N=1. It is out of line and its only new hot-body cost is one predictable
+/// compare on an already-cold exit branch, but that is an argument, not a
+/// measurement — the only evidence behind it is that the workspace suite is
+/// green. If the apply hop is ever re-benched, this is a place to look.
 #[inline(never)]
 fn note_lag_wait(cnc: &CncPage, service_id: u8, lag_waiting: &mut bool) {
     if !*lag_waiting {

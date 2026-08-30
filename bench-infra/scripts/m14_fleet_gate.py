@@ -463,6 +463,10 @@ def status_slots(h):
 
     `bound` is bytes, `0` for a genuine `fsm_lag=lockstep`, and **None when
     the `services:` line is absent** — a status this driver could not read.
+    It is also None for a PRESENT `fsm_lag=n/a`, which `uc2ctl` prints since
+    2.8.1 for a node that declares nothing (a harness page): there is no lag
+    policy to report, so "not known" is the right reading. Fleet arms always
+    declare FSMs, so that case should not arise here.
     Mapping "unreadable" onto 0 would silently drop the lag clause from row
     d's attach condition (0 reads as lockstep, which needs no lag check), so
     `None` is kept distinct and every consumer treats it as not-yet-known.

@@ -725,19 +725,46 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         "the learner must have adopted the shipped snapshot floor, not replayed from 0"
     );
 
-    // Both artifacts landed, each in its OWN directory.
+    // Both artifacts landed, each in its OWN directory — and each AT THE
+    // VOTER'S OWN SNAPSHOT POSITION for that id (M14c2 T10b fix 1). Checking
+    // non-emptiness alone was not an oracle: a file of any provenance, at any
+    // position, passed it. The position is read from the artifact's NAME
+    // (`snap-<pos>.ultsnap` — the tag the harness exposes; the learner's slot
+    // `snapshot_pos` cannot stand in, because that word is written by the
+    // learner's OWN builder, not by an install).
+    //
+    // `contains`, not `==`: the learner runs its own snapshot-capable
+    // services, which publish LOCALLY-built artifacts into the same directory
+    // once they have applied enough, so extra positions there are legitimate.
+    // The shipped one being ABSENT is not. (Measured on this fixture: each
+    // directory holds exactly one artifact, the shipped one — the learner's own
+    // builders have not tripped by then.)
+    //
+    // Measured caveat on how to mutation-test this: BOTH declared FSMs
+    // snapshot at the SAME position here (2 883 456 — they apply the same log
+    // with the same interval, so their builders trip on the same applied byte),
+    // so comparing against the OTHER id's position is a no-op mutation. Perturb
+    // the position itself to check this assertion still bites.
     for id in [0u8, 1] {
         let d = l_dir.join("snapshots").join(id.to_string());
-        let installed: Vec<_> = std::fs::read_dir(&d)
+        let installed: Vec<u64> = std::fs::read_dir(&d)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
+            .filter_map(|e| {
                 let n = e.file_name();
                 let n = n.to_string_lossy();
-                n.starts_with("snap-") && n.ends_with(".ultsnap")
+                n.strip_prefix("snap-")
+                    .and_then(|rest| rest.strip_suffix(".ultsnap"))
+                    .and_then(|pos| pos.parse::<u64>().ok())
             })
             .collect();
         assert!(!installed.is_empty(), "learner {d:?} holds no installed artifact");
+        let shipped = v_cnc.service_slot(id as usize).snapshot_pos.load_acquire();
+        assert!(
+            installed.contains(&shipped),
+            "learner {d:?} holds artifacts at {installed:?}, but NOT the voter's FSM {id} \
+             artifact at position {shipped} — the session did not deliver this id's artifact"
+        );
     }
 
     // And both learner FSMs reached the leader's commit — each installed its own
@@ -759,17 +786,23 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     // The deferral asked for `snap_sessions == 1` here; that is NOT true at
     // cluster scale and never was. A fresh learner re-NAKs below the floor until
     // its adoption sticks, so the leader opens the session more than once —
-    // measured 3, stably, across repeated runs of this test. What must hold is
-    // that every session that ran carried the WHOLE declared set and completed:
-    // the learner abandoned no intake and hit no intake I/O failure, and both
-    // per-id artifacts are on disk (asserted above). "One session carries the
-    // whole set" — one `SNAP_BEGIN` per declared id, stream-global chunk offsets,
-    // even under 20 % loss — is pinned exactly, at the seam that owns it, by
-    // `uc2_net/tests/snapshot_session.rs::a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss`.
+    // measured 3, stably, across repeated runs of this test. "One session
+    // carries the whole set" — one `SNAP_BEGIN` per declared id, stream-global
+    // chunk offsets, even under 20 % loss — is pinned exactly, at the seam that
+    // owns it, by `uc2_net/tests/snapshot_session.rs::
+    // a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss`.
+    //
+    // The DISCRIMINATING oracle here is the per-id position check above: both
+    // artifacts on disk at the VOTER's positions is what says the session
+    // delivered this id's artifact rather than something else producing a file.
     assert!(
         voter.observability().sender.snap_sessions.load(std::sync::atomic::Ordering::Relaxed) >= 1,
         "the artifacts must have come from a snapshot session, not a log replay"
     );
+    // A cheap guard, NOT a proof of anything: on a converging run neither of
+    // these can plausibly fire (the intake timeout is 60 s against a
+    // convergence measured in seconds), so treat a non-zero here as "the
+    // transfer plane hit an I/O error or a timeout", nothing more.
     assert_eq!(
         (
             learner.crypto_stats().snap_intake_abandoned.load(std::sync::atomic::Ordering::Relaxed),
@@ -779,7 +812,7 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
         (0, 0),
-        "every session that ran must have completed whole: no abandoned intake, no intake I/O failure"
+        "guard: no intake I/O error and no intake timeout fired during the join"
     );
     assert!(!learner.is_leader(), "a learner never leads");
 

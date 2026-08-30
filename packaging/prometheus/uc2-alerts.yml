@@ -105,16 +105,37 @@ groups:
     # cluster", it is gone). `on(instance, service)`: both sides carry
     # the service label here, unlike the node-scalar bound above.
     #
-    # M14c2: ONE FRAME of tolerance. `fsm_lag` is a byte bound and frames are
-    # whole, so unless the frame size divides the bound the pinned steady
-    # state does not land ON it — the last frame that fits leaves the FSM up
-    # to one frame short, and `commit - applied` then oscillates just BELOW
-    # `fsm_lag`, silencing this rule on exactly the FSM an operator is
-    # looking for. 1408 is `MTU_DEFAULT` (uc_protocol::v2::datagram): a UC
-    # frame is one datagram and can never exceed it, so subtracting it is a
-    # sound floor for any payload size. clamp_min keeps the threshold at 1
-    # so a bound smaller than one frame cannot make an idle FSM (lag 0) fire.
-    expr: (uc2_service_lag_bytes >= on(instance) group_left clamp_min(uc2_fsm_lag_bytes - 1408, 1)) and on(instance) uc2_fsm_lag_bytes > 0 and on(instance, service) uc2_service_attached == 1
+    # M14c2: TOLERANCE for a bound the frame size does not divide. `fsm_lag`
+    # is a byte bound and frames are whole, so unless the frame size divides
+    # the bound the pinned steady state does not land ON it — the last frame
+    # that fits leaves the FSM up to one frame short, `commit - applied`
+    # oscillates just BELOW `fsm_lag`, and a `>= fsm_lag` rule goes silent on
+    # exactly the FSM an operator is hunting.
+    #
+    # One EXACT frame is not expressible here: the frame size is
+    # `align(32 + max_payload)` and `max_payload` is not exported as a
+    # metric, so the rule cannot know it. Two bounds are, and the threshold
+    # is the TIGHTER of them — `max(fsm_lag - 1408, 0.9 * fsm_lag)`, written
+    # as two `and`-ed clauses because PromQL has no scalar-vector `max`:
+    #
+    #   - `fsm_lag - 1408`: 1408 is MTU_DEFAULT (uc_protocol::v2::datagram).
+    #     A UC frame is one datagram and can never exceed it, so this is an
+    #     absolute upper bound on "one frame" for ANY payload size. It is
+    #     generous at small bounds (at fsm_lag = 8192 with 128 B frames it
+    #     would be 6784 — eleven frames of slack, i.e. an FSM 17 % short of
+    #     the bound would page) and can even go negative below 1408.
+    #   - `0.9 * fsm_lag`: caps the slack at a tenth of the bound, which is
+    #     what actually carries small bounds, and cannot go non-positive.
+    #
+    # So the slack is at most one MTU OR 10 % of the bound, whichever is
+    # tighter. At the gate fixture's 8192-byte bound the relative clause
+    # binds: threshold 7372.8 (not 6784), and the fixture's pinned FSM reads
+    # 8320. For a bound above ~14 KiB the MTU clause binds instead.
+    #
+    # `group_left()` — with the empty parens — is required: a bare
+    # `group_left (expr)` makes the parser read `(expr)` as the grouping
+    # LABEL LIST and fail. Do not drop them.
+    expr: (uc2_service_lag_bytes >= on(instance) group_left() (uc2_fsm_lag_bytes - 1408)) and (uc2_service_lag_bytes >= on(instance) group_left() (uc2_fsm_lag_bytes * 0.9)) and on(instance) uc2_fsm_lag_bytes > 0 and on(instance, service) uc2_service_attached == 1
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }

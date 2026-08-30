@@ -174,9 +174,10 @@ pub struct ServiceMins {
 /// M14c2 T10b: the edge check used to re-load `heartbeat_ns` a second time in
 /// the same duty cycle (`note_service_transitions` ran its own loop over the
 /// same slots right after [`service_mins`]). Reading each slot once and handing
-/// the words on keeps one acquire load per declared FSM per cycle instead of
-/// two, and pins that both readers see the SAME sample. Indexed BY SERVICE ID
-/// — declared sets are sparse, so undeclared entries stay at the `Default`.
+/// the words on pins that both readers adjudicate the SAME sample rather than
+/// two reads taken a few instructions apart — that is the point of this type;
+/// no performance claim is made or measured. Indexed BY SERVICE ID — declared
+/// sets are sparse, so undeclared entries stay at the `Default`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServiceLiveness {
     pub epoch: u64,
@@ -186,6 +187,10 @@ pub struct ServiceLiveness {
 }
 
 /// N acquire loads, no stores. `None` for a `none_for_tests` node.
+///
+/// Retained for tests; production reads
+/// [`service_mins_and_liveness`] (M14c2 T10b), which is the same pass plus the
+/// per-id words the attach/detach edges need.
 pub fn service_mins(cnc: &CncPage, services: &ServicesConfig) -> Option<ServiceMins> {
     let mut live = [ServiceLiveness::default(); CNC_MAX_SERVICES];
     service_mins_and_liveness(cnc, services, &mut live)
