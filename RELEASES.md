@@ -7,8 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## v2.9.0 — <tag date> — one prefix: every crate is now `uc_*`
-<!-- tag date: fill at tag time -->
+## v2.9.0 — 2026-08-30 — one prefix: every crate is now `uc_*`
 
 **A rename, and nothing else.** No behaviour changed, no wire or cnc change, no
 configuration change, and **no binary was renamed** — an operator upgrading from

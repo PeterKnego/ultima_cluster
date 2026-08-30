@@ -1,7 +1,6 @@
 # ultima_cluster releases
 
-## v2.9.0 — <tag date> — the `uc_*` crate rename
-<!-- tag date: fill at tag time -->
+## v2.9.0 — 2026-08-30 — the `uc_*` crate rename
 
 **Mechanical. No behaviour change, no wire or cnc change, no binary rename.**
 Every package took a uniform `uc_` prefix, and every crate directory was
