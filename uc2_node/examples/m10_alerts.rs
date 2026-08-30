@@ -1099,7 +1099,15 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
                      with the append head. 12 real scrapes read \
                      uc2_service_lag_bytes{service=\"1\"} flat at 8320 — the 8192-byte bound \
                      plus the one 128-byte frame the door admits before it shuts — while \
-                     uc2_fsm_lag_bytes reads 8192."
+                     uc2_fsm_lag_bytes reads 8192. PAYLOAD CHOICE (disclosed because it is \
+                     load-bearing, not incidental): the 96-byte payload makes a 128-byte frame, \
+                     which DIVIDES the 8 KiB bound, so the pinned level is a flat 8320 rather \
+                     than a value that straddles it. A non-dividing size — a 64-byte payload, \
+                     96-byte frames, 8192/96 = 85.33 — oscillates between 8160 and 8256, i.e. \
+                     one frame BELOW the bound half the time. This scenario therefore \
+                     adjudicates the rule on its EASY input; the rule itself carries a \
+                     one-frame (MTU_DEFAULT = 1408 B) tolerance for the general case, and that \
+                     tolerance is NOT what this run exercises."
                 .into(),
         },
     )

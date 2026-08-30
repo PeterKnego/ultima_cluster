@@ -139,7 +139,7 @@ Output fields:
 | `leader_hint` | the id this node believes leads; `unknown` when the raw value is `u64::MAX` |
 | `log: commit / durable / append` | the three log counters, in bytes |
 | `members` | one line per occupied peer slot: `id`, `role`, `reported_durable`, and a staleness marker when `commit - reported_durable` exceeds the admission window |
-| `services` | the declared id list (cnc 4032's bitmask) and the lag policy — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints an empty list and no rows |
+| `services` | the declared id list (cnc 4032's bitmask) and the lag policy — `fsm_lag=lockstep` or `fsm_lag=<N> bytes` (cnc 4040). A node started for a harness (`ServicesConfig::none_for_tests`) prints `declared=[] fsm_lag=n/a` and no rows: with nothing declared there is no lag policy to report, even though cnc 4040 still holds a resolved bound (since **2.8.1**; earlier releases printed that bound, or `lockstep` when it happened to read 0) |
 | per-FSM rows | one line per **declared** id, attached or not: `attached` (the slot's ATTACHED bit), `epoch` (incarnations since this node booted), `incarnation` (the status word's counter), `applied`, `lag` (`commit − applied`), `snapshot_pos`, `heartbeat_age` (`never` if that FSM has not stamped since boot) |
 
 ## Offline commands

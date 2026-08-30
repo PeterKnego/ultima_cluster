@@ -950,65 +950,14 @@ impl Node {
         let src_config_bytes = Arc::clone(&config_bytes);
         let src_id = cfg.id;
         sender.set_snapshot_source(Arc::new(move || {
-            let decline = |code: u8, reason: &'static str| -> Option<SnapshotSet> {
-                if src_decline_reason.swap(code, Ordering::Relaxed) != code {
-                    crate::obs_event!(
-                        Info,
-                        "snapshot_session_declined",
-                        node = src_id as u64,
-                        reason = reason
-                    );
-                }
-                None
-            };
-            let floor = src_cnc.snapshots().node_snapshot_floor.load_acquire();
-            if floor == 0 {
-                // Nothing has snapshotted: the joiner is served by journal
-                // replay from 0 (spec §14.3's "moot" case).
-                return decline(SNAP_DECLINE_FLOOR_ZERO, "floor 0");
-            }
-            let mask = src_services.ring_mask();
-            let mut artifacts = Vec::new();
-            for id in src_services.ring_ids() {
-                let pos = src_cnc.service_slot(id as usize).snapshot_pos.load_acquire();
-                if pos == 0 {
-                    return decline(SNAP_DECLINE_MISSING, "missing artifact");
-                }
-                let path = src_root.join(id.to_string()).join(format!("snap-{pos}.ultsnap"));
-                // A declared id whose newest artifact is missing (a retention
-                // race, a hand-edited dir) makes the SET incomplete — and the
-                // receiver adopts the floor only on a complete set, so a partial
-                // ship would strand the joiner below a floor it can never adopt
-                // AND hold the leader's single session slot for 30 s. Refuse:
-                // the NAK stays an overrun, the peer re-NAKs, the next attempt
-                // sees the file.
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    return decline(SNAP_DECLINE_MISSING, "missing artifact");
-                };
-                let len = meta.len();
-                if len == 0 {
-                    return decline(SNAP_DECLINE_MISSING, "missing artifact");
-                }
-                artifacts.push(SnapArtifact { service_id: id, snapshot_pos: pos, path, len });
-            }
-            // Controller amendment 1: the set must cover the mask EXACTLY. A set
-            // short of a declared bit would livelock the joiner — it probes for
-            // the missing id forever, the leader's session times out at 30 s, the
-            // re-NAK re-opens the identical session — with no counter anywhere.
-            // `ring_ids()` is ascending and inside `mask` by construction, so
-            // this only ever trips on a future edit that breaks that pairing.
-            let covered = artifacts.iter().fold(0u64, |m, a| {
-                m | 1u64.checked_shl(a.service_id as u32).unwrap_or(0)
-            });
-            if artifacts.len() != mask.count_ones() as usize || covered != mask {
-                return decline(SNAP_DECLINE_UNCOVERED, "set does not cover declared");
-            }
-            src_decline_reason.store(SNAP_DECLINE_NONE, Ordering::Relaxed);
-            Some(SnapshotSet {
-                services_declared: mask,
-                config: src_config_bytes.lock().unwrap().clone(),
-                artifacts,
-            })
+            snapshot_set_for(
+                &src_cnc,
+                &src_root,
+                &src_services,
+                &src_config_bytes,
+                src_id,
+                &src_decline_reason,
+            )
         }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters
@@ -2828,7 +2777,13 @@ impl Consensus {
     /// Runs FIRST in `do_work`: `refresh_durable` (the report ceiling), the
     /// ingress door and the two persisters all read this cycle's value.
     fn publish_service_mins(&mut self) {
-        let Some(m) = crate::services::service_mins(&self.cnc, &self.services) else {
+        // ONE pass over the declared slots (M14c2 T10b): the mins AND the
+        // per-id words the attach/detach edges key on, so `heartbeat_ns` is
+        // acquire-loaded once per FSM per cycle rather than twice, and both
+        // readers adjudicate the SAME sample.
+        let mut live = [crate::services::ServiceLiveness::default(); CNC_MAX_SERVICES];
+        let Some(m) = crate::services::service_mins_and_liveness(&self.cnc, &self.services, &mut live)
+        else {
             self.min_applied = u64::MAX; // nothing declared: no FSM pacing
             return;
         };
@@ -2848,7 +2803,7 @@ impl Consensus {
         if st.service_heartbeat_ns.load_acquire() != m.heartbeat_ns {
             st.service_heartbeat_ns.store_release(m.heartbeat_ns);
         }
-        self.note_service_transitions();
+        self.note_service_transitions(&live);
     }
 
     /// M14c (spec §9): emit `service_attached` / `service_detached` on the
@@ -2885,17 +2840,23 @@ impl Consensus {
     /// stop/start — anything that leaves one non-live duty cycle in between,
     /// including every orderly `Service::stop` — does emit
     /// `service_detached` then `service_attached` with the new epoch.
+    ///
+    /// M14c2 T10b: the slot words arrive from the caller's single pass
+    /// ([`crate::services::service_mins_and_liveness`]) instead of being
+    /// acquire-loaded a second time here.
     #[inline(never)]
-    fn note_service_transitions(&mut self) {
+    fn note_service_transitions(
+        &mut self,
+        words: &[crate::services::ServiceLiveness; CNC_MAX_SERVICES],
+    ) {
         let now_ns = self.last_wall_ns;
         for id in self.services.ids() {
             let i = id as usize;
-            let slot = self.cnc.service_slot(i);
-            let epoch = slot.epoch.load_acquire();
-            let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
+            let w = words[i];
+            let epoch = w.epoch;
+            let (_, attached, _) = unpack_service_status(w.status);
             let live = attached
-                && now_ns.saturating_sub(slot.heartbeat_ns.load_acquire())
-                    < crate::services::SERVICE_STALE_NS;
+                && now_ns.saturating_sub(w.heartbeat_ns) < crate::services::SERVICE_STALE_NS;
             if epoch > self.service_last_epoch[i] {
                 self.service_last_epoch[i] = epoch;
                 self.service_was_live[i] = true;
@@ -5932,6 +5893,85 @@ fn journal_durability_from_env() -> Result<uc2_log::Durability, String> {
     }
 }
 
+/// The snapshot-session SOURCE decision (M14c, spec §14.3 + controller
+/// amendments 1–2), lifted out of `Node::start`'s closure so the DECLINE LATCH
+/// is testable on its own (M14c2 T10b — the closure captured six `Node::start`
+/// locals and could only be reached by standing up a whole cluster).
+///
+/// Returns the complete set to ship, or `None` after naming the reason. The
+/// latch (`decline_reason`) is what makes the naming survivable: a below-floor
+/// peer re-NAKs on a timer, so without it every NAK would log. A line is
+/// emitted exactly when the reason CHANGES — first decline of a kind, or a
+/// switch to a different kind — and a successful set clears the latch, so the
+/// next decline of the same kind is named again.
+fn snapshot_set_for(
+    cnc: &CncPage,
+    root: &std::path::Path,
+    services: &crate::services::ServicesConfig,
+    config_bytes: &Mutex<Vec<u8>>,
+    node_id: NodeId,
+    decline_reason: &AtomicU8,
+) -> Option<SnapshotSet> {
+    let decline = |code: u8, reason: &'static str| -> Option<SnapshotSet> {
+        if decline_reason.swap(code, Ordering::Relaxed) != code {
+            crate::obs_event!(
+                Info,
+                "snapshot_session_declined",
+                node = node_id as u64,
+                reason = reason
+            );
+        }
+        None
+    };
+    let floor = cnc.snapshots().node_snapshot_floor.load_acquire();
+    if floor == 0 {
+        // Nothing has snapshotted: the joiner is served by journal
+        // replay from 0 (spec §14.3's "moot" case).
+        return decline(SNAP_DECLINE_FLOOR_ZERO, "floor 0");
+    }
+    let mask = services.ring_mask();
+    let mut artifacts = Vec::new();
+    for id in services.ring_ids() {
+        let pos = cnc.service_slot(id as usize).snapshot_pos.load_acquire();
+        if pos == 0 {
+            return decline(SNAP_DECLINE_MISSING, "missing artifact");
+        }
+        let path = root.join(id.to_string()).join(format!("snap-{pos}.ultsnap"));
+        // A declared id whose newest artifact is missing (a retention
+        // race, a hand-edited dir) makes the SET incomplete — and the
+        // receiver adopts the floor only on a complete set, so a partial
+        // ship would strand the joiner below a floor it can never adopt
+        // AND hold the leader's single session slot for 30 s. Refuse:
+        // the NAK stays an overrun, the peer re-NAKs, the next attempt
+        // sees the file.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return decline(SNAP_DECLINE_MISSING, "missing artifact");
+        };
+        let len = meta.len();
+        if len == 0 {
+            return decline(SNAP_DECLINE_MISSING, "missing artifact");
+        }
+        artifacts.push(SnapArtifact { service_id: id, snapshot_pos: pos, path, len });
+    }
+    // Controller amendment 1: the set must cover the mask EXACTLY. A set
+    // short of a declared bit would livelock the joiner — it probes for
+    // the missing id forever, the leader's session times out at 30 s, the
+    // re-NAK re-opens the identical session — with no counter anywhere.
+    // `ring_ids()` is ascending and inside `mask` by construction, so
+    // this only ever trips on a future edit that breaks that pairing.
+    let covered =
+        artifacts.iter().fold(0u64, |m, a| m | 1u64.checked_shl(a.service_id as u32).unwrap_or(0));
+    if artifacts.len() != mask.count_ones() as usize || covered != mask {
+        return decline(SNAP_DECLINE_UNCOVERED, "set does not cover declared");
+    }
+    decline_reason.store(SNAP_DECLINE_NONE, Ordering::Relaxed);
+    Some(SnapshotSet {
+        services_declared: mask,
+        config: config_bytes.lock().unwrap().clone(),
+        artifacts,
+    })
+}
+
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -8897,5 +8937,101 @@ mod tests {
         let mut h = harness();
         corrupt_ring_file(&h._dir.path().join("query.ring"), 24);
         h.cons.drain_query_ring();
+    }
+
+    // ------------------------------------- M14c2 T10b: the decline latch
+
+    /// Scratch on REAL DISK under the cargo target tree (never `/tmp` —
+    /// CLAUDE.md's scratch rule); removed with the returned `TempDir`.
+    fn decline_scratch() -> tempfile::TempDir {
+        let base = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        tempfile::Builder::new().prefix("uc2-decline-").tempdir_in(base).unwrap()
+    }
+
+    fn write_artifact(root: &std::path::Path, id: u8, pos: u64, bytes: &[u8]) {
+        let d = root.join(id.to_string());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("snap-{pos}.ultsnap")), bytes).unwrap();
+    }
+
+    /// M14c controller amendment 2 (M14c2 T10b): the snapshot source names a
+    /// DECLINE once per distinct reason, not once per NAK. A below-floor peer
+    /// re-NAKs on a timer, so the un-latched version would log at the NAK rate.
+    ///
+    /// The latch IS the gate — `snapshot_set_for` emits exactly when
+    /// `decline_reason.swap(code) != code` — so the latch's transitions are the
+    /// log lines one-for-one, and this test adjudicates the transitions.
+    /// (Counting captured lines instead would mean swapping the PROCESS-GLOBAL
+    /// log sink, which `obs::log`'s own unit tests also swap, in the same test
+    /// binary, in parallel — a racy oracle for a deterministic property.)
+    #[test]
+    fn the_snapshot_decline_latch_names_each_distinct_reason_once() {
+        let dir = decline_scratch();
+        let root = dir.path().join("snapshots");
+        let cnc = test_cnc();
+        let services = crate::services::ServicesConfig::from_ids(&[0, 1], None).unwrap();
+        let config_bytes = Mutex::new(vec![0xC0, 0xFF, 0xEE]);
+        let latch = AtomicU8::new(SNAP_DECLINE_NONE);
+        let call = || snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
+
+        // 1. Nothing has snapshotted: decline "floor 0" — the first of its kind,
+        //    so the latch TRANSITIONS (that is the log line).
+        assert!(call().is_none());
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_FLOOR_ZERO);
+        // 2. The peer re-NAKs. Same reason: no transition, so no second line.
+        assert!(call().is_none());
+        assert!(call().is_none());
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            SNAP_DECLINE_FLOOR_ZERO,
+            "a repeated reason must not re-arm the latch"
+        );
+
+        // 3. A DIFFERENT reason: the floor is up but no artifact is published.
+        cnc.snapshots().node_snapshot_floor.store_release(4096);
+        assert!(call().is_none());
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            SNAP_DECLINE_MISSING,
+            "a different reason names itself (a second log line)"
+        );
+        assert!(call().is_none());
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING, "and only once");
+
+        // 4. A published position whose FILE is absent is the same "missing"
+        //    reason — still no new line.
+        cnc.service_slot(0).snapshot_pos.store_release(1024);
+        cnc.service_slot(1).snapshot_pos.store_release(2048);
+        assert!(call().is_none());
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
+        // A zero-length file is "missing" too (a rename that lost its content).
+        write_artifact(&root, 0, 1024, b"");
+        assert!(call().is_none());
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
+
+        // 5. The complete set ships — and CLEARS the latch.
+        write_artifact(&root, 0, 1024, b"fsm-0 artifact");
+        write_artifact(&root, 1, 2048, b"fsm-1 artifact bytes");
+        let set = call().expect("a complete set ships");
+        assert_eq!(set.services_declared, 0b11, "the set covers the declared mask exactly");
+        assert_eq!(set.config, vec![0xC0, 0xFF, 0xEE], "the CURRENT config rides along");
+        assert_eq!(
+            set.artifacts.iter().map(|a| (a.service_id, a.snapshot_pos, a.len)).collect::<Vec<_>>(),
+            vec![(0u8, 1024u64, 14u64), (1, 2048, 20)],
+        );
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            SNAP_DECLINE_NONE,
+            "a successful set resets the latch"
+        );
+
+        // 6. ... so the NEXT decline of the same kind is named again.
+        std::fs::remove_file(root.join("1").join("snap-2048.ultsnap")).unwrap();
+        assert!(call().is_none());
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            SNAP_DECLINE_MISSING,
+            "after a success, the same reason names itself once more"
+        );
     }
 }

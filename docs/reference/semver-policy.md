@@ -122,13 +122,29 @@ API for downstream code. They may change in any release:
 | `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`. It is the wire spec, governed by the flag-day rule below, not by semver. |
 | `uc2_log` | `agent`, `archive`, `buffer`, `cnc`, `counters`, `reader`, `region`, `state`, `writer` |
 | `uc2_consensus` | `commit`, `config`, `election`, `reconcile` |
-| `uc2_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender` |
+| `uc2_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender`. **`2.8.0` changed these signatures, in a minor release** — see the note below. |
 | `uc2_crypto` | `admin`, `group`, `handshake`, `identity`, `replay`, `rotation`, `schedule`, `seal`, `transport` |
 | `uc2_node` | `audit`, `backup`, `ipc`, `obs`, `preflight`, `recovery`, and everything in `node` except `NodeConfig`/`Node::start*` |
 | `uc2_service` | `snapshots`, `ultima_db` |
 | `uc2_gateway` | `config_file`; `Edge`/`EdgeStats` beyond what `gateway.toml` implies |
 | `uc2_remote` | `conn`, `frame` as *Rust items* — the wire format they encode is promised (protocol v1), the Rust names are not |
 | `ultima_journal` | `bench_support` (already `#[doc(hidden)]`), and the crate generally: it is the node's storage primitive, published so the workspace can be, not offered as a general-purpose journal |
+
+`uc2_net`'s snapshot-session seam is the worked example of what "not
+promised" means in practice: **`2.8.0` (M14c) changed those public signatures
+in a minor release**, deliberately, because one log now feeds N FSMs and a
+session ships one artifact per declared id rather than one per session.
+
+| item | ≤ `2.7.0` | `2.8.0` |
+|---|---|---|
+| `sender::SnapshotSource` | `Arc<dyn Fn() -> Option<(u64, PathBuf, u64, Vec<u8>)>>` | `Arc<dyn Fn() -> Option<SnapshotSet>>` |
+| `sender::SnapshotSet` / `sender::SnapArtifact` | did not exist | the set (`services_declared`, `config`, one `SnapArtifact` per declared id) |
+| `receiver::Receiver::set_snapshot_intake` | `(snap_dir, incoming)` | `(snap_root, own_declared, incoming)` |
+
+Nothing downstream broke, because nothing downstream is supposed to be
+calling them — `uc2_node` is the only caller, and it ships in lockstep. The
+wire change that rode along (`SNAP_BEGIN`) is a **flag day**, governed by the
+rule below, not by this table: wire `0.6.0`.
 
 Also outside the promise:
 

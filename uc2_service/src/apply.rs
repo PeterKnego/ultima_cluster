@@ -233,9 +233,16 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// M14a Task 7: the effective declared-set bitmask (page `0` folded to
     /// `1`, the harness-node case) — `lag::floor`'s min ranges over this.
     pub(crate) declared: u64,
-    /// M14a Task 7: true while this incarnation is mid wait-episode (a `Wait`
-    /// plan was returned last cycle and hasn't yet resolved to an `Apply`) —
-    /// so `lag_waits` counts EPISODES (the `false -> true` edge), not cycles.
+    /// M14a Task 7: true while this incarnation is mid wait-episode — so
+    /// `lag_waits` counts EPISODES (the `false -> true` edge), not cycles.
+    ///
+    /// M14c2 ruling K: the episode ends when a FRAME MOVES, not when the plan
+    /// stops saying `Wait`. A bounded cap that sits MID-FRAME is above the
+    /// cursor, so `lag::plan` reports `Apply` with a target no frame can
+    /// clear — a barrier stall the old "reset on any `Apply`" reset both
+    /// missed (it never counted) and would have re-armed every cycle (it would
+    /// have counted one episode per cycle). Set by [`note_lag_wait`], cleared
+    /// only where the cursor advances.
     pub(crate) lag_waiting: bool,
     /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
     pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
@@ -306,6 +313,8 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         return false;
     }
     let commit = c.commit.load_acquire();
+    // The log's own frontier, for ruling K's "who set this target?" test below.
+    let head = commit.min(durable);
     let mut progressed = false;
     loop {
         // M14a: the lag barrier — re-planned every iteration so a floor that
@@ -326,17 +335,13 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     match opened {
                         Some(plan) => plan,
                         None => {
-                            if !st.lag_waiting {
-                                st.lag_waiting = true;
-                                crate::attach::slot(&st.cnc, st.service_id).lag_waits.fetch_add(1);
-                            }
+                            note_lag_wait(&st.cnc, st.service_id, &mut st.lag_waiting);
                             break;
                         }
                     }
                 }
                 crate::lag::Plan::Apply { target, one_frame } => (target, one_frame),
             };
-        st.lag_waiting = false;
         // is_leader read inline (a direct field access, not a `&self` method)
         // so it does not conflict with the `follower` borrow the batch holds.
         let is_leader =
@@ -408,9 +413,22 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     // No frame cleared the target guard (target between the
                     // cursor and the next frame's end). Nothing more to do this
                     // cycle; avoids spinning on a partially-committed frame.
+                    //
+                    // M14c2 ruling K: `target < head` means the BARRIER set
+                    // this target, not the log — a bounded cap that sits
+                    // mid-frame. `plan` never said `Wait` (the cap is above the
+                    // cursor), yet this FSM is parked at the barrier exactly
+                    // the same, so count the episode on the same edge. A
+                    // target the LOG set (`== head`) is plain idleness and is
+                    // never a wait.
+                    if target < head {
+                        note_lag_wait(&st.cnc, st.service_id, &mut st.lag_waiting);
+                    }
                     break;
                 }
                 progressed = true;
+                // A frame moved: the wait episode (if any) is over.
+                st.lag_waiting = false;
                 false
             }
         };
@@ -440,6 +458,8 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             crate::attach::slot(&st.cnc, st.service_id).applied.store_release(cursor);
             st.needs_replay = false;
             progressed = true;
+            // Replay jumped the cursor: any wait episode is over.
+            st.lag_waiting = false;
             // Re-loop: read live from the rejoin point (may CaughtUp, apply
             // more, or Overrun again if the ring lapped us during replay).
         }
@@ -664,6 +684,26 @@ fn lockstep_wait<S: RawStateMachine>(st: &mut ApplyState<S>, commit: u64, durabl
     None
 }
 
+/// The barrier's wait-episode edge (`lag_waits`, M14a Task 7; M14c2 ruling K).
+/// Counts EPISODES, not cycles: the `false -> true` edge of `lag_waiting`,
+/// which the apply loop clears again only where the cursor advances.
+///
+/// Two callers, both "this cycle is parked at the barrier": the `Wait` plan
+/// (the cap is at or below the cursor), and a batch that moved nothing under a
+/// barrier-capped target (the mid-frame cap `plan` reports as `Apply` —
+/// ruling K, the case that used to read 0 waits on a paced FSM).
+///
+/// Out of line, like [`lockstep_wait`], and for the same measured reason: code
+/// in the apply loop's body costs even on paths that never run (M14a, −9 % at
+/// N=1 for an inlined ladder).
+#[inline(never)]
+fn note_lag_wait(cnc: &CncPage, service_id: u8, lag_waiting: &mut bool) {
+    if !*lag_waiting {
+        *lag_waiting = true;
+        crate::attach::slot(cnc, service_id).lag_waits.fetch_add(1);
+    }
+}
+
 pub(crate) fn check_node_instance(cnc: &CncPage, attached: u128, streak: &mut u8) {
     match cnc.try_instance_id() {
         Some(id) if id != attached => {
@@ -727,5 +767,122 @@ mod tests {
         let mut streak = 0;
         check_node_instance(&p, 0xAAAA, &mut streak); // streak -> 1
         check_node_instance(&p, 0xAAAA, &mut streak); // streak -> 2 -> panic
+    }
+
+    // ------------------------------------------------- M14c2 ruling K: lag_waits
+
+    /// 32 B header + 64 B payload, 32-B aligned: every appended frame is 96 B,
+    /// so a 128 B bound cannot divide the frame stream — the case ruling K is
+    /// about.
+    const FRAME: u64 = 96;
+    const CAP: u64 = 1 << 16;
+    const BOUND: u64 = 128;
+
+    #[derive(Default)]
+    struct CountSm {
+        applies: u64,
+        last: Option<u64>,
+    }
+
+    impl crate::traits::RawStateMachine for CountSm {
+        fn apply(&mut self, position: u64, _cmd: &[u8], _out: &mut Vec<u8>) {
+            self.applies += 1;
+            self.last = Some(position);
+        }
+        fn query(&self, _q: &[u8], _out: &mut Vec<u8>) {}
+        fn last_applied(&self) -> Option<u64> {
+            self.last
+        }
+    }
+
+    /// The two ring files `ApplyState` needs, on REAL DISK under the cargo
+    /// target tree (never `/tmp` — CLAUDE.md's scratch rule); removed with the
+    /// returned `TempDir`.
+    fn scratch() -> tempfile::TempDir {
+        let base = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        tempfile::Builder::new().prefix("uc2-apply-lagk").tempdir_in(base).unwrap()
+    }
+
+    /// M14c2 ruling K (`docs/benchmarks/uc2-m14c-*`): `uc2_service_lag_waits_total`
+    /// read 0 while a BOUNDED FSM sat parked at the barrier, because the cap
+    /// landed MID-FRAME. `lag::plan` only says `Wait` when the cap is at or
+    /// below the cursor; a cap 32 B into a 96 B frame is above it, so the plan
+    /// is `Apply` with a target no frame can clear and the batch moves nothing
+    /// — a barrier stall the counter never saw. It must count, once per
+    /// EPISODE (the same `false -> true` edge the `Wait` arm uses), not once
+    /// per cycle.
+    #[test]
+    fn a_bounded_cap_mid_frame_counts_one_lag_wait_per_episode() {
+        let dir = scratch();
+        let cnc = page(0x1234);
+        // Two declared FSMs and a 128 B bound over a 96 B frame stream.
+        cnc.store_services_declared(0b11);
+        cnc.store_fsm_lag_bytes(BOUND);
+        let buffer = std::sync::Arc::new(uc2_log::buffer::LogBuffer::new(
+            uc2_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let mut appender = uc2_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1);
+        for i in 0..5u64 {
+            appender.append(1, i, &[i as u8; 64]).unwrap();
+        }
+        let head = 5 * FRAME;
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+        // We are FSM 0, one frame ahead of the floor: FSM 1 is still at 0, so
+        // floor = 0, cap = 128 — 32 bytes into the frame at 96.
+        cnc.service_slot(0).applied.store_release(FRAME);
+        cnc.service_slot(1).applied.store_release(0);
+
+        let egress_ring =
+            uc_protocol::ring::BroadcastRing::create(&dir.path().join("egress.bc"), 1 << 16, 1024)
+                .unwrap();
+        let (_qp, svc_query) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_query.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let mut st = super::ApplyState {
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            follower: uc2_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), FRAME),
+            sm: Arc::new(std::sync::Mutex::new(CountSm::default())),
+            cnc: Arc::clone(&cnc),
+            egress: crate::egress::Egress::new(egress_ring.producer()),
+            resp_buf: Vec::new(),
+            journal_dir: dir.path().join("journal"),
+            svc_query,
+            needs_replay: false,
+            instance_id: 0x1234,
+            instance_mismatch_streak: 0,
+            my_epoch: 1,
+            service_id: 0,
+            lag_mode: crate::lag::LagMode::Bounded(BOUND),
+            declared: 0b11,
+            lag_waiting: false,
+            snapshot_trigger: None,
+            snapshot_restore: None,
+        };
+        let waits = |c: &CncPage| c.service_slot(0).lag_waits.load_acquire();
+
+        assert_eq!(waits(&cnc), 0, "nothing counted before the first cycle");
+        // Cycle 1: parked at a cap that sits mid-frame — one episode.
+        assert!(!super::apply_cycle(&mut st), "no progress: the cap blocks the frame");
+        assert_eq!(st.follower.cursor, FRAME, "no frame moved");
+        assert_eq!(waits(&cnc), 1, "ruling K: the mid-frame cap counts a wait episode");
+        // Cycle 2: still the SAME episode — episodes, not cycles.
+        assert!(!super::apply_cycle(&mut st));
+        assert_eq!(waits(&cnc), 1, "one episode, not one per cycle");
+
+        // The sibling catches up: floor = 96, cap = 224, so the frame at 96
+        // (ending 192) clears — the episode resolves and a new one opens at
+        // the new cap, 32 bytes into the frame at 192.
+        cnc.service_slot(1).applied.store_release(FRAME);
+        assert!(super::apply_cycle(&mut st), "the floor moved: a frame applies");
+        assert_eq!(st.follower.cursor, 2 * FRAME, "exactly one frame cleared the new cap");
+        assert_eq!(st.sm.lock().unwrap().applies, 1);
+        assert_eq!(waits(&cnc), 2, "the resolve opened a SECOND episode at the new cap");
+        // ... and that second episode, too, counts once however long it lasts.
+        assert!(!super::apply_cycle(&mut st));
+        assert_eq!(waits(&cnc), 2, "still one episode");
     }
 }

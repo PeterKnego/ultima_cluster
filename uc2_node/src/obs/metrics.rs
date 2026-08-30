@@ -962,7 +962,25 @@ mod tests {
         assert!(text.contains("\nuc2_service_applied_bytes 0\n"), "{text}");
         assert!(text.contains("\nuc2_service_epoch 0\n"), "{text}");
         assert!(text.contains("\nuc2_service_snapshot_pos_bytes 0\n"), "{text}");
-        assert!(text.contains("uc2_service_heartbeat_age_seconds "), "{text}");
+        // M14c2 T10b: this used to be
+        // `contains("uc2_service_heartbeat_age_seconds ")`, which the family's
+        // OWN `# HELP` and `# TYPE` lines satisfy — a header-only render passed
+        // it, i.e. the assertion could not fail for the thing it was checking.
+        // Match the bare unlabelled SAMPLE line at a line boundary and read its
+        // VALUE, so headers alone are a failure. (The value is an age in
+        // seconds against the wall clock, so it is asserted as a well-formed
+        // non-negative number, not as a constant.)
+        let hb = text
+            .lines()
+            .find(|l| l.starts_with("uc2_service_heartbeat_age_seconds "))
+            .unwrap_or_else(|| {
+                panic!("no bare heartbeat-age SAMPLE line — headers are not a sample: {text}")
+            });
+        let age: f64 = hb["uc2_service_heartbeat_age_seconds ".len()..]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("heartbeat age must render as a number ({hb:?}): {e}"));
+        assert!(age.is_finite() && age >= 0.0, "heartbeat age must be a real age: {hb:?}");
         assert!(text.contains("\nuc2_services_declared 0\n"), "{text}");
     }
 

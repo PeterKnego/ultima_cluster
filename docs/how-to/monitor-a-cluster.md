@@ -123,12 +123,16 @@ Two shapes to know before writing a query:
   deliberate: you cannot alert on a series that is absent, and "declared but
   never started" is the state that silently closes admission cluster-wide.
 
-`uc2_service_lag_waits_total{service}` is reliable under lockstep (≈ one
-wait per frame), but an **undercount under bounded mode**: the M14a apply
-loop only counts a wait when the cap sits on a frame boundary (M14a's
-execution record lists this; the service-side fix is deferred to M14c2).
-For the pinned-at-bound signal, use `uc2_service_lag_bytes{service}` — the
-series `Uc2ServicePinnedAtLagBound` actually keys on.
+`uc2_service_lag_waits_total{service}` counts wait EPISODES at the lag
+barrier — one increment per park, however long the park lasts, so read its
+rate as "how often this FSM is held", never as a duration. Under lockstep
+that is ≈ one per frame. Under bounded mode it was an **undercount before
+2.8.1**: the apply loop counted a wait only when the barrier cap fell on a
+frame boundary, so an FSM parked at a cap that sits mid-frame — the common
+case, since a byte bound rarely divides the frame stream — reported 0. Since
+2.8.1 that park counts too. For the pinned-at-bound signal, use
+`uc2_service_lag_bytes{service}` — the series `Uc2ServicePinnedAtLagBound`
+actually keys on.
 
 Declared sets must match across nodes (spec §8). There is no alert rule for
 drift, because it is a query over the fleet rather than a per-node

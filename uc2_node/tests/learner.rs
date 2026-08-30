@@ -752,6 +752,35 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         (0, 0),
         "matching declared sets and a 0.6.0 peer: neither refusal may fire"
     );
+    // M14c2 T10b: the two artifacts landing is not by itself the M14c claim —
+    // they must have arrived through the snapshot SESSION path, whole. Only the
+    // SENDER counts sessions, so this reads the voter's counter.
+    //
+    // The deferral asked for `snap_sessions == 1` here; that is NOT true at
+    // cluster scale and never was. A fresh learner re-NAKs below the floor until
+    // its adoption sticks, so the leader opens the session more than once —
+    // measured 3, stably, across repeated runs of this test. What must hold is
+    // that every session that ran carried the WHOLE declared set and completed:
+    // the learner abandoned no intake and hit no intake I/O failure, and both
+    // per-id artifacts are on disk (asserted above). "One session carries the
+    // whole set" — one `SNAP_BEGIN` per declared id, stream-global chunk offsets,
+    // even under 20 % loss — is pinned exactly, at the seam that owns it, by
+    // `uc2_net/tests/snapshot_session.rs::a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss`.
+    assert!(
+        voter.observability().sender.snap_sessions.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "the artifacts must have come from a snapshot session, not a log replay"
+    );
+    assert_eq!(
+        (
+            learner.crypto_stats().snap_intake_abandoned.load(std::sync::atomic::Ordering::Relaxed),
+            learner
+                .crypto_stats()
+                .snap_intake_io_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        (0, 0),
+        "every session that ran must have completed whole: no abandoned intake, no intake I/O failure"
+    );
     assert!(!learner.is_leader(), "a learner never leads");
 
     learner.stop();
@@ -874,11 +903,15 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         captured.contains("snapshot_session_refused") && captured.contains("declared-set mismatch")
     });
     // Stalled-but-safe: nothing was half-installed under the joiner's own root.
-    assert!(
-        !l_dir.join("snapshots").join("1").join("").exists()
-            || std::fs::read_dir(l_dir.join("snapshots").join("1"))
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(true),
+    // The directory itself always exists — `Node::start` creates `snapshots/<id>/`
+    // for every DECLARED id — so the old `!exists() || empty` disjunct's first
+    // half was dead and could only have weakened the check (M14c2 T10b). What
+    // has to hold is that the directory is EMPTY.
+    let refused_dir = l_dir.join("snapshots").join("1");
+    assert!(refused_dir.is_dir(), "the joiner declares id 1, so its snapshot dir exists");
+    assert_eq!(
+        std::fs::read_dir(&refused_dir).expect("read the joiner's snapshot dir").count(),
+        0,
         "a refused session must leave no artifact behind"
     );
 

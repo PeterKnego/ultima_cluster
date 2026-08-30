@@ -168,8 +168,37 @@ pub struct ServiceMins {
     pub heartbeat_ns: u64,
 }
 
+/// One declared FSM's slot words that the attach/detach EDGES key on, read in
+/// the same pass as the mins above.
+///
+/// M14c2 T10b: the edge check used to re-load `heartbeat_ns` a second time in
+/// the same duty cycle (`note_service_transitions` ran its own loop over the
+/// same slots right after [`service_mins`]). Reading each slot once and handing
+/// the words on keeps one acquire load per declared FSM per cycle instead of
+/// two, and pins that both readers see the SAME sample. Indexed BY SERVICE ID
+/// — declared sets are sparse, so undeclared entries stay at the `Default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServiceLiveness {
+    pub epoch: u64,
+    /// Raw slot status word — unpack with [`uc2_log::cnc::unpack_service_status`].
+    pub status: u64,
+    pub heartbeat_ns: u64,
+}
+
 /// N acquire loads, no stores. `None` for a `none_for_tests` node.
 pub fn service_mins(cnc: &CncPage, services: &ServicesConfig) -> Option<ServiceMins> {
+    let mut live = [ServiceLiveness::default(); CNC_MAX_SERVICES];
+    service_mins_and_liveness(cnc, services, &mut live)
+}
+
+/// [`service_mins`] plus the per-id edge words, in ONE pass over the declared
+/// slots (M14c2 T10b — see [`ServiceLiveness`]). `live` is filled in BY SERVICE
+/// ID for each declared id; entries for undeclared ids are left untouched.
+pub fn service_mins_and_liveness(
+    cnc: &CncPage,
+    services: &ServicesConfig,
+    live: &mut [ServiceLiveness; CNC_MAX_SERVICES],
+) -> Option<ServiceMins> {
     let mut m = ServiceMins {
         applied: u64::MAX,
         snapshot_pos: u64::MAX,
@@ -179,10 +208,16 @@ pub fn service_mins(cnc: &CncPage, services: &ServicesConfig) -> Option<ServiceM
     let mut any = false;
     for id in services.ids() {
         let s = cnc.service_slot(id as usize);
+        let heartbeat_ns = s.heartbeat_ns.load_acquire();
         m.applied = m.applied.min(s.applied.load_acquire());
         m.snapshot_pos = m.snapshot_pos.min(s.snapshot_pos.load_acquire());
         m.output_completed = m.output_completed.min(s.output_completed.load_acquire());
-        m.heartbeat_ns = m.heartbeat_ns.min(s.heartbeat_ns.load_acquire());
+        m.heartbeat_ns = m.heartbeat_ns.min(heartbeat_ns);
+        live[id as usize] = ServiceLiveness {
+            epoch: s.epoch.load_acquire(),
+            status: s.status.load_acquire(),
+            heartbeat_ns,
+        };
         any = true;
     }
     any.then_some(m)

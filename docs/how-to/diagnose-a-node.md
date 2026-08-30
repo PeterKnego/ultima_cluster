@@ -79,19 +79,22 @@ Read it in this order:
 3. **`lag` pinned at `fsm_lag`** (`Uc2ServicePinnedAtLagBound`) — that FSM is
    running, just slower than the log. (The rule is gated on
    `uc2_service_attached == 1`, so a *detached* FSM whose lag has drifted to
-   the bound pages as `Uc2ServiceAbsent` instead — case 1, not this one.) Nothing is broken; the cluster is being
-   paced to it, which is what a bound buys you. Either make that FSM faster
-   or accept the rate. Raising `fsm_lag` buys latency headroom, not
-   throughput, and it is refused above `buffer_bytes / 2`.
+   the bound pages as `Uc2ServiceAbsent` instead — case 1, not this one.)
+   Nothing is broken; the cluster is being paced to it, which is what a bound
+   buys you. Either make that FSM faster or accept the rate. Raising
+   `fsm_lag` buys latency headroom, not throughput, and it is refused above
+   `buffer_bytes / 2`.
 
 `uc2_service_lag_waits_total{service}` tells you the converse: an FSM whose
 wait counter climbs is the one *being* paced, i.e. a victim, not the cause.
-The cause is the id with the largest `uc2_service_lag_bytes`. Treat
-`lag_waits_total` as reliable under lockstep but an **undercount under
-bounded mode** — the apply loop only counts a wait when the cap sits on a
-frame boundary (the service-side fix is deferred to M14c2);
+The cause is the id with the largest `uc2_service_lag_bytes`. Since **2.8.1**
+the counter is reliable in both modes: a bounded FSM parked at a cap that
+sits mid-frame counts its wait episode too (before that it read 0 on exactly
+the FSM an operator was looking at). It counts EPISODES, not cycles or
+frames — one increment per park, however long the park lasts — so read its
+RATE as "how often this FSM is being held", not as a duration.
 `uc2_service_lag_bytes{service}` (what `Uc2ServicePinnedAtLagBound` keys on)
-is the trustworthy pinned-at-bound signal either way.
+is the pinned-at-bound signal.
 
 The transition records name arrivals and departures explicitly:
 `{"event":"service_attached","node":0,"service":1,"epoch":4}` and

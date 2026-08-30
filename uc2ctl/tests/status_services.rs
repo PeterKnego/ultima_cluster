@@ -108,3 +108,48 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
 
     node.stop();
 }
+
+/// M14c2 T10b: a HARNESS page (`ServicesConfig::none_for_tests` — nothing
+/// declared) still carries a RESOLVED `fsm_lag_bytes` (the node writes the
+/// default bound, `buffer_bytes / 4`, whether or not it declares FSMs), so
+/// `status` reported `fsm_lag=1048576 bytes` for a node that paces no FSM at
+/// all — and a page that happened to hold 0 would have read as `lockstep`, a
+/// policy it does not have either. With nothing declared there is no policy to
+/// report: print `n/a`.
+#[test]
+fn status_prints_fsm_lag_n_a_for_a_harness_page_with_nothing_declared() {
+    let root = tempfile::Builder::new()
+        .prefix("uc2ctl-svc-none-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let dir = root.path().join("n0");
+    let services = ServicesConfig::none_for_tests();
+    let node = Node::start_with_socket(make_config(dir.clone(), addr, services), sock).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !node.can_serve() {
+        assert!(Instant::now() < deadline, "node never became leader/serving");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let out = Command::new(bin())
+        .args(["status", "--instance-dir", dir.to_str().unwrap(), "--app-id", APP])
+        .output()
+        .expect("spawn uc2ctl");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
+
+    assert!(stdout.contains("services: declared=[] fsm_lag=n/a"), "{stdout}");
+    assert!(!stdout.contains("fsm_lag=lockstep"), "a harness page has no lag policy: {stdout}");
+    // The header stands alone: nothing declared means no rows.
+    assert!(!stdout.contains("  id="), "no declared ids, so no service rows: {stdout}");
+    // Every other section is byte-for-byte what it always was.
+    assert!(stdout.contains("config: version="), "{stdout}");
+    assert!(stdout.contains("role: leader="), "{stdout}");
+    assert!(stdout.contains("log: commit="), "{stdout}");
+    assert!(stdout.contains("members:"), "{stdout}");
+
+    node.stop();
+}

@@ -530,8 +530,18 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     let fsm_lag = cnc.fsm_lag_bytes();
     let ids: Vec<u8> =
         (0..CNC_MAX_SERVICES as u8).filter(|i| declared & (1u64 << i) != 0).collect();
-    let lag_desc =
-        if fsm_lag == 0 { "lockstep".to_string() } else { format!("{fsm_lag} bytes") };
+    // M14c2 T10b: with NOTHING declared there is no lag policy to report. The
+    // page still carries a resolved `fsm_lag_bytes` (the node writes it whether
+    // or not it declares FSMs), so printing it would name a bound this node
+    // paces nothing against — and a page that happened to hold 0 would read as
+    // `lockstep`, a policy it does not have. Say `n/a`.
+    let lag_desc = if declared == 0 {
+        "n/a".to_string()
+    } else if fsm_lag == 0 {
+        "lockstep".to_string()
+    } else {
+        format!("{fsm_lag} bytes")
+    };
     println!("services: declared={ids:?} fsm_lag={lag_desc}");
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
