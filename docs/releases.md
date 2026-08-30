@@ -269,6 +269,13 @@ refutes the brief's premise:
 
 ### Re-parked (open, named, not done)
 
+- **`remote_lin_envelope_off` can return Inconclusive** — the WGL search's
+  5 000 000-visited-state budget exhausts intermittently on the 4-vCPU
+  nightly runner (~2 of the last 9 crashtest legs, either crypto posture,
+  first seen 2026-08-28 — predates this branch). Inconclusive is not a
+  violation and the test rightly refuses to count it as a pass; the fix is
+  a larger-budget retry in `assert_linearizable` or a lower op target
+  (`THROTTLE`/`LOAD`), per the panic message's own hint.
 - **Twelve-factor hygiene, postponed by the maintainer on 2026-08-30**
   (`docs/notes/uc2-twelve-factor-assessment.md`): env-var overrides for
   deploy-varying config keys (factor 3 — new config surface, wants its own
@@ -349,8 +356,23 @@ new SIGKILL scenarios; `elle` and `elle-crypto` both run
 `docs/how-to/investigate-a-failed-run.md` and `docs/VERIFICATION.md` §4)
 changed, to six.
 
-<!-- PENDING: nightly + ci evidence for 2.8.1 — fill from the post-merge run
-     (plan Task 12 Step 4), in the row-g style: workflow, run id, commit. -->
+**CI + nightly evidence (post-merge, 2026-08-30, `main` = `b2035c7`).**
+`ci.yml` run `33328724115` on the merge push: `test` / `deny` /
+`publish-check` / `msrv` all success. `nightly.yml` run `33329230537`
+(workflow_dispatch at `b2035c7`): every job success — capstones (the whole
+workspace suite including the seven two-FSM capstones, on the 4-vCPU
+runner), crashtest, crashtest-crypto, survival, sim-heavy, loom, miri,
+lean-proofs, elle and elle-crypto (six passes each, `quiet_two_fsm`
+included), quickstart, fuzz-groups and the four fuzz legs. One disclosure:
+attempt 1's `crashtest-crypto` failed on `remote_lin_envelope_off` —
+the WGL checker's visited-state budget (5 000 000) exhausted, verdict
+Inconclusive, no violation. That is a pre-existing intermittent (the
+2026-08-28 nightly `33184711408` failed identically, crypto **off**, at
+`4347bc2`, before this branch existed; the test and the remote path are
+untouched here; the two new two-FSM crashtests passed in the same job;
+two local runs pass in ~20 s). The leg was re-run and passed; the flake
+stays open in the tracked list above (a budget retry or a lower op
+target is the fix the test's own panic message names).
 
 ## v2.8.0 — 2026-08-30 — M14 multi-service: one log, N state machines
 
