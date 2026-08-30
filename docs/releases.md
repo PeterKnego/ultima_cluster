@@ -269,6 +269,14 @@ refutes the brief's premise:
 
 ### Re-parked (open, named, not done)
 
+- **No in-process test pins a bound-pinned FSM** — the whole two-FSM WGL
+  family runs at ~425 records/s behind a synchronous client loop (the final
+  fix wave's `max_lag` measurement: 192 B of a 64 KiB bound, 64 B of a 288 B
+  lockstep slack), so the lag policy never binds; the capstones prove
+  per-FSM linearizability and replication equivalence, not the barrier's
+  behaviour at the bound. That state is exercised only by the M14 fleet
+  gate's rows b and e; a paced in-process arm (a `Slow` FSM plus a
+  pipelined driver) is the follow-up.
 - **Peer-gate session replacement** — `snap_begin` still lets any address that
   passes the term filter replace a live intake from a different peer (T10a,
   pre-existing).
