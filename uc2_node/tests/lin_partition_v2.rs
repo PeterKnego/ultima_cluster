@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lincheck_v2::{ClusterCfg, LinClusterV2, join_workers, serialize, spawn_workers};
+use lincheck_v2::{ClusterCfg, LinClusterV2, join_workers, serialize, spawn_workers, spawn_workers2};
 use uc2_net::fault::FaultConfig;
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History, Outcome};
@@ -95,6 +95,12 @@ struct Run {
     _dir: tempfile::TempDir,
     cluster: LinClusterV2,
     history: Arc<History>,
+    /// M14c2 T5: FSM 1's independent history under a [`Run::start_cfg_two_fsm`]
+    /// run; `None` for every single-FSM scenario (unchanged behavior).
+    h1: Option<Arc<History>>,
+    /// M14c2 T5: replication-equivalence failure count from `spawn_workers2`'s
+    /// `submit_all` fan-in — always 0 (never incremented) for single-FSM runs.
+    equiv: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handles: Vec<std::thread::JoinHandle<()>>,
 }
@@ -129,7 +135,43 @@ impl Run {
         let stop = Arc::new(AtomicBool::new(false));
         let last_seen = Arc::new(AtomicU64::new(0));
         let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, 3);
-        Run { _dir: dir, cluster, history, stop, handles }
+        Run { _dir: dir, cluster, history, h1: None, equiv: Arc::new(AtomicU64::new(0)), stop, handles }
+    }
+
+    /// As [`start_cfg`](Self::start_cfg) but for a two-FSM cluster (M14c2
+    /// T5): `ccfg.services` must already be `FsmSet::Two`. Workers are spawned
+    /// via `spawn_workers2` (every write/CAS fans in to both FSMs via
+    /// `submit_all`; a disagreeing pair is a replication-equivalence failure,
+    /// counted in `equiv` and recorded `Indeterminate` in BOTH histories —
+    /// never fed to the checker as a lie). `history` (h0) is what the
+    /// scenario's own probes (`r.history.record(...)` against the isolated /
+    /// majority node) record into, same as a single-FSM run; `h1` is FSM 1's
+    /// independent read/write history.
+    fn start_cfg_two_fsm(seed: u64, faults: FaultConfig, ccfg: ClusterCfg) -> Run {
+        debug_assert!(
+            matches!(ccfg.services, lincheck_v2::FsmSet::Two { .. }),
+            "start_cfg_two_fsm requires ClusterCfg::services == FsmSet::Two"
+        );
+        set_fast_client_timeout();
+        let dir = tempdir();
+        let cluster = LinClusterV2::start_cfg(dir.path(), 3, faults, ccfg);
+        let leader0 = cluster.await_single_serving(30);
+        if ccfg.crypto {
+            assert!(
+                cluster.crypto_epoch_of(leader0).is_some(),
+                "crypto was configured but the elected leader never minted a group epoch — \
+                 wire crypto did not actually engage"
+            );
+        }
+        let dirs = Arc::new(cluster.dirs());
+        let history = Arc::new(History::default());
+        let h1 = Arc::new(History::default());
+        let equiv = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let last_seen = Arc::new(AtomicU64::new(0));
+        let handles =
+            spawn_workers2(&dirs, &history, &h1, &equiv, &stop, &last_seen, seed, THROTTLE, 3);
+        Run { _dir: dir, cluster, history, h1: Some(h1), equiv, stop, handles }
     }
 
     fn ok_now(&self) -> usize {
@@ -145,12 +187,33 @@ impl Run {
         self.cluster.stop();
         Arc::try_unwrap(self.history).ok().expect("sole history owner").into_entries()
     }
+
+    /// [`finish`](Self::finish)'s two-FSM twin: stops workers + cluster, then
+    /// returns FSM 0's entries, FSM 1's entries, and the final
+    /// replication-equivalence failure count. Panics if this `Run` was not
+    /// started via [`start_cfg_two_fsm`](Self::start_cfg_two_fsm) (`h1` unset).
+    fn finish_two(self) -> (Vec<Entry>, Vec<Entry>, u64) {
+        self.stop.store(true, Ordering::Relaxed);
+        join_workers(self.handles);
+        self.cluster.stop();
+        let equiv_n = self.equiv.load(Ordering::Relaxed);
+        let h0 = Arc::try_unwrap(self.history).ok().expect("sole h0 owner").into_entries();
+        let h1 = Arc::try_unwrap(self.h1.expect("finish_two requires a two-FSM Run"))
+            .ok()
+            .expect("sole h1 owner")
+            .into_entries();
+        (h0, h1, equiv_n)
+    }
 }
 
 // ============================================================ 1. minority
 
-fn run_minority(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
-    let r = Run::start_cfg(seed, FaultConfig::default(), ccfg);
+fn run_minority(seed: u64, ccfg: ClusterCfg, two_fsm: bool) -> Result<(), String> {
+    let r = if two_fsm {
+        Run::start_cfg_two_fsm(seed, FaultConfig::default(), ccfg)
+    } else {
+        Run::start_cfg(seed, FaultConfig::default(), ccfg)
+    };
 
     std::thread::sleep(Duration::from_millis(1000)); // warm up
     let before = r.ok_now();
@@ -180,22 +243,35 @@ fn run_minority(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
     r.cluster.await_reconverged(20);
     std::thread::sleep(Duration::from_millis(1000)); // let survivors catch up + commit
 
-    let entries = r.finish();
-
     if !majority_progressed {
         return Err(format!("majority did not progress during minority partition ({before} -> {after})"));
     }
-    if History::ok_count(&entries) < MIN_OK {
-        return Err("too few Ok ops; run is vacuous".into());
+
+    if two_fsm {
+        let (entries0, entries1, equiv_n) = r.finish_two();
+        if History::ok_count(&entries0) < MIN_OK || History::ok_count(&entries1) < MIN_OK {
+            return Err("too few Ok ops; run is vacuous".into());
+        }
+        // SAFETY (never retried): both FSMs replay the identical committed
+        // command stream, so a `submit_all` disagreement is a real bug, not a
+        // transient — assert before spending checker budget on either history.
+        assert_eq!(equiv_n, 0, "replication-equivalence violated (seed={seed})");
+        check_or_transient(&entries0, seed, "minority-two-fsm/0")?;
+        check_or_transient(&entries1, seed, "minority-two-fsm/1")
+    } else {
+        let entries = r.finish();
+        if History::ok_count(&entries) < MIN_OK {
+            return Err("too few Ok ops; run is vacuous".into());
+        }
+        check_or_transient(&entries, seed, "minority")
     }
-    check_or_transient(&entries, seed, "minority")
 }
 
 #[test]
 fn minority_partition_and_heal() {
     let _g = serialize();
     for attempt in 1..=3 {
-        match run_minority(7, ClusterCfg::default()) {
+        match run_minority(7, ClusterCfg::default(), false) {
             Ok(()) => return,
             Err(e) => eprintln!("[lin_partition_v2::minority] attempt {attempt}/3 transient: {e}"),
         }
@@ -209,12 +285,33 @@ fn minority_partition_and_heal_with_crypto() {
     let _g = serialize();
     let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
     for attempt in 1..=3 {
-        match run_minority(7, ccfg) {
+        match run_minority(7, ccfg, false) {
             Ok(()) => return,
             Err(e) => eprintln!("[lin_partition_v2::minority-crypto] attempt {attempt}/3 transient: {e}"),
         }
     }
     panic!("minority-with-crypto: failed after 3 transient attempts");
+}
+
+/// M14c2 T5: same scenario driven over a two-FSM cluster — every write/CAS
+/// fans in to both FSMs (`spawn_workers2`/`submit_all`), and BOTH FSMs' own
+/// histories must independently check `Linearizable` under the minority
+/// partition + heal. `equiv == 0` asserts replication-equivalence held
+/// throughout (both FSMs replay the identical committed stream).
+#[test]
+fn minority_partition_and_heal_two_fsm() {
+    let _g = serialize();
+    let ccfg = ClusterCfg {
+        services: lincheck_v2::FsmSet::Two { lag: uc2_node::FsmLag::Bounded(64 * 1024) },
+        ..ClusterCfg::default()
+    };
+    for attempt in 1..=3 {
+        match run_minority(7, ccfg, true) {
+            Ok(()) => return,
+            Err(e) => eprintln!("[lin_partition_v2::minority-two-fsm] attempt {attempt}/3 transient: {e}"),
+        }
+    }
+    panic!("minority-two-fsm: failed after 3 transient attempts");
 }
 
 // ====================================================== 2. leader isolation
