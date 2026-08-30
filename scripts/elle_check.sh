@@ -33,7 +33,7 @@ CARGO_FEATURES="${ELLE_CARGO_FEATURES:-}"
 UC2_CRYPTO="${UC2_CRYPTO:-0}"
 
 PASSES=("$@")
-[ ${#PASSES[@]} -eq 0 ] && PASSES=(quiet failover partition purge reconfig)
+[ ${#PASSES[@]} -eq 0 ] && PASSES=(quiet failover partition purge reconfig quiet_two_fsm)
 
 command -v "$JAVA" >/dev/null 2>&1 || { echo "error: java not found (set JAVA=)" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq not found" >&2; exit 1; }
@@ -78,9 +78,12 @@ require true  "$(verdict serializable "$FIX_RT")"    "realtime fixture accepted 
 require false "$(verdict "$STRICT_MODEL" "$FIX_RT")" "realtime fixture rejected under $STRICT_MODEL"
 
 for pass in "${PASSES[@]}"; do
-    hist="$ELLE_DIR/$pass/history.edn"
+    # M14c2 Task 7: a pass's history is either one file
+    # ($ELLE_DIR/$pass/history.edn, every pre-M14c2 pass) or one per FSM
+    # ($ELLE_DIR/$pass/fsm{0,1}/history.edn, quiet_two_fsm) — the generation
+    # trigger below fires only when NEITHER shape is present on disk.
     crypto_sidecar="$ELLE_DIR/$pass/crypto"
-    if [ -f "$hist" ]; then
+    if [ -f "$ELLE_DIR/$pass/history.edn" ] || [ -f "$ELLE_DIR/$pass/fsm0/history.edn" ]; then
         # M8 Task 15 review fix: a cached history under a reused ELLE_DIR can
         # predate this posture check entirely (pre-Task-15 dir) or have been
         # generated under the OTHER crypto posture — either way, adjudicating
@@ -89,12 +92,15 @@ for pass in "${PASSES[@]}"; do
         # task exists to close, one layer up: a UC2_CRYPTO=1 run against a
         # directory of cleartext histories would otherwise print "crypto=1"
         # having sealed nothing. Refuse rather than silently trust the ask.
+        # The sidecar lives at the PASS level even for the per-FSM shape
+        # (elle_v2.rs's run_pass2 writes it beside fsm0/ and fsm1/, not
+        # inside either) — one posture per pass, both FSMs generated together.
         cached_crypto="0"
         if [ -f "$crypto_sidecar" ]; then
             cached_crypto="$(cat "$crypto_sidecar")"
         fi
         if [ "$cached_crypto" != "$UC2_CRYPTO" ]; then
-            echo "error: $hist was generated under crypto=$cached_crypto but UC2_CRYPTO=$UC2_CRYPTO was requested." >&2
+            echo "error: $ELLE_DIR/$pass was generated under crypto=$cached_crypto but UC2_CRYPTO=$UC2_CRYPTO was requested." >&2
             echo "hint: point ELLE_DIR at a fresh directory, or delete $ELLE_DIR/$pass to regenerate under the requested posture." >&2
             exit 1
         fi
@@ -104,9 +110,16 @@ for pass in "${PASSES[@]}"; do
         (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc2_node --release $CARGO_FEATURES \
             --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     fi
-    echo "== $pass: $(wc -l < "$hist") events =="
-    require "true|" "$(classify serializable "$hist")"    "$pass clean under serializable"
-    require "true|" "$(classify "$STRICT_MODEL" "$hist")" "$pass clean under $STRICT_MODEL"
+    for hist in "$ELLE_DIR/$pass"/history.edn "$ELLE_DIR/$pass"/fsm*/history.edn; do
+        [ -f "$hist" ] || continue
+        label="$pass"
+        case "$hist" in
+            */fsm*/history.edn) label="$pass/$(basename "$(dirname "$hist")")" ;;
+        esac
+        echo "== $label: $(wc -l < "$hist") events =="
+        require "true|" "$(classify serializable "$hist")"    "$label clean under serializable"
+        require "true|" "$(classify "$STRICT_MODEL" "$hist")" "$label clean under $STRICT_MODEL"
+    done
 done
 
 echo "elle consistency check passed (${PASSES[*]}, crypto=$UC2_CRYPTO)"

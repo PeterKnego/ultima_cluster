@@ -30,8 +30,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use lincheck_v2::{
-    ClusterCfg, LinClusterV2, ReadOutcome, SubmitOutcome, WorkerConn, read_leader, serialize,
-    submit_cmd,
+    ClusterCfg, FsmSet, LinClusterV2, ReadOutcome, SubmitOutcome, WorkerConn, read_leader,
+    read_leader_on, serialize, submit_all_cmd, submit_cmd,
 };
 #[cfg(feature = "mutation-testing")]
 use lincheck_v2::CommittedTruncationWitness;
@@ -140,6 +140,103 @@ fn elle_worker(
                 }
                 ReadOutcome::Fatal(e) => panic!("fatal read: {e}"),
             }
+        }
+    }
+    conn.drop_client();
+}
+
+/// M14c2: [`elle_worker`]'s two-FSM twin. Appends fan in via `submit_all_cmd`
+/// and are recorded into BOTH per-FSM recorders from the ids/values `Ok`
+/// actually returned: `LaResp` has one variant, so "equal" collapses to "both
+/// present, ids exactly {0, 1}, ascending" — but a missing id or a non-ascending
+/// pair is exactly the shape a future multi-variant response would also need
+/// caught, so the general vector check stays even though this SM can't
+/// currently produce an unequal pair. An unequal (or malformed) `Ok` — or an
+/// `Indeterminate` — is `:info` in both and retires BOTH recorders (each keeps
+/// its own process id; they retire independently). Reads alternate FSM: even
+/// iterations go through [`read_leader`] (FSM 0, `rec0`), odd through
+/// [`read_leader_on`] (FSM 1, `rec1`). `Fatal` panics — the quiet pass is not
+/// fatal-tolerant.
+#[allow(clippy::too_many_arguments)]
+fn elle_worker2(
+    id: u32,
+    dirs: Arc<Vec<PathBuf>>,
+    rec0: Arc<EdnRecorder>,
+    rec1: Arc<EdnRecorder>,
+    equiv: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    mut rng: StdRng,
+    keys: u32,
+    values: Arc<AtomicU64>,
+    read_frac: f64,
+    op_deadline: Duration,
+) {
+    let mut conn = WorkerConn::new(dirs, id as usize);
+    // Initial process ids 0..n_workers are pre-allocated by EdnRecorder::new,
+    // identically on both recorders; they retire independently afterwards.
+    let mut process0 = id as u64;
+    let mut process1 = id as u64;
+    let mut iter: u64 = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let deadline = Instant::now() + op_deadline;
+        let key = rng.random_range(0..keys);
+        if !rng.random_bool(read_frac) {
+            let val = values.fetch_add(1, Ordering::Relaxed);
+            let op = EdnOp::Append { key, val };
+            rec0.record(EdnType::Invoke, process0, &op);
+            rec1.record(EdnType::Invoke, process1, &op);
+            match submit_all_cmd::<_, LaResp>(&mut conn, &LaCmd::Append { key, val }, deadline) {
+                SubmitOutcome::Ok(answers) => {
+                    let equal = answers.len() == 2
+                        && answers[0].0 == 0
+                        && answers[1].0 == 1
+                        && answers[0].1 == answers[1].1;
+                    if equal {
+                        rec0.record(EdnType::Ok, process0, &op);
+                        rec1.record(EdnType::Ok, process1, &op);
+                    } else {
+                        rec0.record(EdnType::Info, process0, &op);
+                        rec1.record(EdnType::Info, process1, &op);
+                        equiv.fetch_add(1, Ordering::Relaxed);
+                        process0 = rec0.retire();
+                        process1 = rec1.retire();
+                    }
+                }
+                // Maybe-committed on one or both FSMs: :info on both, retire both.
+                SubmitOutcome::Indeterminate => {
+                    rec0.record(EdnType::Info, process0, &op);
+                    rec1.record(EdnType::Info, process1, &op);
+                    process0 = rec0.retire();
+                    process1 = rec1.retire();
+                }
+                SubmitOutcome::Fatal(e) => panic!("fatal submit_all: {e}"),
+            }
+        } else {
+            let op = EdnOp::Read { key, result: None };
+            if iter.is_multiple_of(2) {
+                rec0.record(EdnType::Invoke, process0, &op);
+                match read_leader::<LaRead, Vec<u64>>(&mut conn, &LaRead { key }, deadline) {
+                    ReadOutcome::Ok(list) => rec0.record(
+                        EdnType::Ok,
+                        process0,
+                        &EdnOp::Read { key, result: Some(list) },
+                    ),
+                    ReadOutcome::Indeterminate => rec0.record(EdnType::Fail, process0, &op),
+                    ReadOutcome::Fatal(e) => panic!("fatal read fsm0: {e}"),
+                }
+            } else {
+                rec1.record(EdnType::Invoke, process1, &op);
+                match read_leader_on::<LaRead, Vec<u64>>(&mut conn, 1, &LaRead { key }, deadline) {
+                    ReadOutcome::Ok(list) => rec1.record(
+                        EdnType::Ok,
+                        process1,
+                        &EdnOp::Read { key, result: Some(list) },
+                    ),
+                    ReadOutcome::Indeterminate => rec1.record(EdnType::Fail, process1, &op),
+                    ReadOutcome::Fatal(e) => panic!("fatal read fsm1: {e}"),
+                }
+            }
+            iter = iter.wrapping_add(1);
         }
     }
     conn.drop_client();
@@ -280,6 +377,144 @@ fn elle_quiet() {
         |_cluster, _faults| true,
         "unreachable",
     );
+}
+
+/// M14c2: [`run_pass`]'s twin for the two-FSM quiet pass — deliberately NOT
+/// folded back into `run_pass` (that would need a generic
+/// one-or-two-recorder shape for every other pass too, for no present
+/// benefit). No nemesis, no crash-vacuity gate — same posture as
+/// [`elle_quiet`], just fanned out over `FsmSet::Two`. Writes ONE
+/// `history.edn` per FSM under `$ELLE_DIR/quiet_two_fsm/fsm{0,1}/`, with the
+/// `seed`/`crypto` sidecars at the PASS level (`$ELLE_DIR/quiet_two_fsm/`) —
+/// that is where `scripts/elle_check.sh` looks for them.
+fn run_pass2() {
+    let name = "quiet_two_fsm";
+    let default_target_ops = 50_000u64;
+    let default_workers = 4u64;
+    let min_ok_pct = 90u64;
+    let fault_period = Duration::from_millis(100);
+
+    let seed = env_u64("ELLE_SEED", 0x1107);
+    let n_workers = env_u64("ELLE_WORKERS", default_workers) as u32;
+    let keys = env_u64("ELLE_KEYS", 8) as u32;
+    let target = env_u64("ELLE_TARGET_OPS", default_target_ops);
+    let budget = Duration::from_secs(env_u64("ELLE_BUDGET_SECS", 120));
+    let ccfg = ClusterCfg {
+        services: FsmSet::Two { lag: uc2_node::FsmLag::Bounded(64 * 1024) },
+        crypto: crypto_from_env(),
+        ..ClusterCfg::default()
+    };
+
+    let _g = serialize();
+    let dir = tempdir();
+    let cluster =
+        LinClusterV2::<ListAppendSm>::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader0 = cluster.await_single_serving(30);
+    if ccfg.crypto {
+        assert!(
+            cluster.crypto_epoch_of(leader0).is_some(),
+            "[elle {name}] UC2_CRYPTO=1 but the elected leader never minted a crypto group \
+             epoch — wire crypto did not actually engage"
+        );
+    }
+
+    let dirs = Arc::new(cluster.dirs());
+    let rec0 = Arc::new(EdnRecorder::new(n_workers as u64));
+    let rec1 = Arc::new(EdnRecorder::new(n_workers as u64));
+    let equiv = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let values = Arc::new(AtomicU64::new(1));
+
+    let handles: Vec<_> = (0..n_workers)
+        .map(|w| {
+            let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let (dirs, rec0, rec1, equiv, stop, values) = (
+                Arc::clone(&dirs),
+                Arc::clone(&rec0),
+                Arc::clone(&rec1),
+                Arc::clone(&equiv),
+                Arc::clone(&stop),
+                Arc::clone(&values),
+            );
+            std::thread::spawn(move || {
+                elle_worker2(
+                    w,
+                    dirs,
+                    rec0,
+                    rec1,
+                    equiv,
+                    stop,
+                    rng,
+                    keys,
+                    values,
+                    0.5,
+                    Duration::from_secs(15),
+                )
+            })
+        })
+        .collect();
+
+    let start = Instant::now();
+    while rec0.ok_count() < target {
+        std::thread::sleep(fault_period);
+        if start.elapsed() > budget {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        if let Err(e) = h.join() {
+            std::panic::resume_unwind(e);
+        }
+    }
+    cluster.stop();
+
+    let out = elle_dir().join(name);
+    let out0 = out.join("fsm0");
+    let out1 = out.join("fsm1");
+    std::fs::create_dir_all(&out0).expect("mkdir fsm0");
+    std::fs::create_dir_all(&out1).expect("mkdir fsm1");
+    rec0.write_to(&out0.join("history.edn")).expect("write history fsm0");
+    rec1.write_to(&out1.join("history.edn")).expect("write history fsm1");
+    std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
+    // Same crypto-posture sidecar convention as `run_pass` (see its comment).
+    std::fs::write(out.join("crypto"), if ccfg.crypto { "1\n" } else { "0\n" })
+        .expect("write crypto sidecar");
+
+    let (ok0, completed0) = (rec0.ok_count(), rec0.completed_count());
+    let (ok1, completed1) = (rec1.ok_count(), rec1.completed_count());
+    let equiv_count = equiv.load(Ordering::Relaxed);
+    eprintln!(
+        "[elle {name}] seed={seed} completed0={completed0} ok0={ok0} completed1={completed1} \
+         ok1={ok1} equiv={equiv_count} elapsed={:.1}s -> {} , {}",
+        elapsed.as_secs_f64(),
+        out0.join("history.edn").display(),
+        out1.join("history.edn").display()
+    );
+    assert_eq!(
+        equiv_count, 0,
+        "{name}: {equiv_count} submit_all_cmd answers disagreed across FSMs"
+    );
+    assert!(
+        ok0 * 100 >= completed0 * min_ok_pct,
+        "liveness: only {ok0}/{completed0} ops Ok (<{min_ok_pct}%) on fsm0 in the {name} pass"
+    );
+    assert!(
+        ok1 * 100 >= completed1 * min_ok_pct,
+        "liveness: only {ok1}/{completed1} ops Ok (<{min_ok_pct}%) on fsm1 in the {name} pass"
+    );
+}
+
+/// Two-FSM quiet pass (M14c2): identical posture to [`elle_quiet`] — no
+/// faults — but every op fans in across BOTH declared FSMs (`FsmSet::Two`,
+/// bounded 64 KiB lag), writing one history per FSM for `elle_check.sh` to
+/// adjudicate independently.
+#[test]
+#[ignore]
+fn elle_quiet_two_fsm() {
+    run_pass2();
 }
 
 /// Failover pass: the lin_v2 failover capstone's fault mix — leader node
