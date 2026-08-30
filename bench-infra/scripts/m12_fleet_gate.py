@@ -365,7 +365,7 @@ def prepare_host(host, apply_profile=False):
 # SMT threads): logical CPU `i` and `i+4` are the two threads of one
 # physical core, i.e. siblings are (0,4) (1,5) (2,6) (3,7). This has NOT
 # been verified on a real host yet — Task 9 Step 2's validation run must run
-# `lscpu -e=CPU,CORE` on a host FIRST and record the actual layout;
+# `lscpu -p=CPU,CORE` on a host FIRST and record the actual layout;
 # `verify_pin_layout`/`require_pin_layout` below refuse to proceed if the
 # assumption doesn't hold, so a wrong-layout host family fails closed
 # instead of pinning onto siblings silently.

@@ -29,7 +29,9 @@ CARGO_FEATURES="${ELLE_CARGO_FEATURES:-}"
 # and so a history cached under a DIFFERENT ELLE_DIR is never silently reused
 # across the crypto/no-crypto boundary (the caller must point ELLE_DIR at a
 # fresh directory to force regeneration either way — see the pass-generation
-# loop's `[ ! -f "$hist" ]` check below).
+# loop's cached-history check below, which keys on
+# `$ELLE_DIR/$pass/history.edn` / `$ELLE_DIR/$pass/fsm0/history.edn` plus the
+# `crypto` sidecar beside them).
 UC2_CRYPTO="${UC2_CRYPTO:-0}"
 
 PASSES=("$@")
@@ -110,6 +112,12 @@ for pass in "${PASSES[@]}"; do
         (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc2_node --release $CARGO_FEATURES \
             --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     fi
+    # Count what we actually adjudicate. Without this the script is FAIL-OPEN:
+    # a generation step that exits 0 without writing a history (a renamed or
+    # mistyped `#[ignore]` test name makes `--exact` run 0 tests and exit 0; a
+    # partial write that produced only fsm0/) leaves the loop body unentered
+    # and the script goes on to print PASS having checked nothing.
+    n=0
     for hist in "$ELLE_DIR/$pass"/history.edn "$ELLE_DIR/$pass"/fsm*/history.edn; do
         [ -f "$hist" ] || continue
         label="$pass"
@@ -119,7 +127,14 @@ for pass in "${PASSES[@]}"; do
         echo "== $label: $(wc -l < "$hist") events =="
         require "true|" "$(classify serializable "$hist")"    "$label clean under serializable"
         require "true|" "$(classify "$STRICT_MODEL" "$hist")" "$label clean under $STRICT_MODEL"
+        n=$((n + 1))
     done
+    [ "$n" -ge 1 ] || { echo "FAIL: $pass adjudicated no history" >&2; exit 1; }
+    # The two-FSM shape must produce BOTH halves: a fan-in that wrote only
+    # fsm0/ is precisely the partial write this tier exists to catch.
+    case "$pass" in
+        *two_fsm) [ "$n" -eq 2 ] || { echo "FAIL: $pass needs both FSM histories (got $n)" >&2; exit 1; } ;;
+    esac
 done
 
 echo "elle consistency check passed (${PASSES[*]}, crypto=$UC2_CRYPTO)"

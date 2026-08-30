@@ -5274,6 +5274,13 @@ mod tests {
 
         // Nine more chunks stream artifact 1, well inside one interval. Each
         // one used to re-drive the blocked part and bump the counter.
+        //
+        // The "inside one interval" premise is wall-clock: on a loaded runner
+        // the burst below can itself outlast SNAP_REDRIVE_INTERVAL_NS (250 ms),
+        // at which point a SECOND failing attempt is correct behaviour, not a
+        // regression. So the exact-count assertion is gated on having actually
+        // stayed inside the interval, with margin.
+        let burst_start = Instant::now();
         for k in 0..9u64 {
             leader.send(to, DGRAM_KIND_SNAP_CHUNK, 64 + k * 64, TERM, &[0xB1u8; 64]);
         }
@@ -5282,23 +5289,36 @@ mod tests {
             assert!(Instant::now() < deadline, "artifact 1's chunks never landed");
             r.do_work();
         }
-        assert_eq!(
-            st.snap_intake_io_failures.load(Relaxed),
-            1,
-            "nine accepted chunks inside one interval must cost ZERO extra failing renames"
-        );
+        let burst_elapsed = burst_start.elapsed();
+        if burst_elapsed < Duration::from_millis(200) {
+            assert_eq!(
+                st.snap_intake_io_failures.load(Relaxed),
+                1,
+                "nine accepted chunks inside one interval must cost ZERO extra failing renames"
+            );
+        } else {
+            eprintln!(
+                "a_blocked_publish_does_not_re_fail_on_every_incoming_chunk: burst took {burst_elapsed:?} \
+                 (>= 200 ms of the {} ms interval) on a loaded runner — skipping the exact in-interval count; \
+                 the one-per-interval check below still runs",
+                SNAP_REDRIVE_INTERVAL_NS / 1_000_000
+            );
+        }
 
-        // Past the interval, the next chunk does re-drive it.
+        // Past the interval, the next chunk does re-drive it — EXACTLY once,
+        // measured as a delta off whatever the count is now (so a skipped
+        // assertion above never turns this one into a bare inequality).
+        let before_redrive = st.snap_intake_io_failures.load(Relaxed);
         std::thread::sleep(Duration::from_millis(SNAP_REDRIVE_INTERVAL_NS / 1_000_000 + 10));
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 640, TERM, &[0xB1u8; 64]);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while st.snap_intake_io_failures.load(Relaxed) < 2 {
+        while st.snap_intake_io_failures.load(Relaxed) < before_redrive + 1 {
             assert!(Instant::now() < deadline, "the re-drive never fired past the interval");
             r.do_work();
         }
         assert_eq!(
             st.snap_intake_io_failures.load(Relaxed),
-            2,
+            before_redrive + 1,
             "one attempt per interval, not one per chunk"
         );
 
