@@ -100,6 +100,12 @@ change — no `[services]` section means `{0}` with the default bound. A
 service must attach as id 0 (the default). Details, in the imperative:
 [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md).
 
+**Published as a GitHub pre-release, not on crates.io (2026-08-30).** Because the
+two-FSM capstones are still M14c2, `v2.8.0` is marked *pre-release* on GitHub
+(Latest stays `v2.7.0`) and the crates.io publish is held until `2.8.1`
+carries those proofs. The tarballs, `SHA256SUMS`, SBOM and the
+`ghcr.io/peterknego/uc2:2.8.0` image are published and cosign-verified.
+
 **Coverage.** Multi-service ships with unit tests, in-process integration
 (one node and a 3-node cluster), a sim scenario for the report ceiling and
 fuzz seeds for the new wire bytes. The two-FSM linearizability, partition,
