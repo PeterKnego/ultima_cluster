@@ -97,6 +97,31 @@ the fuzz corpora, and the docs' links.
   exist, all inside `docs/superpowers/plans/`, and all resolve identically
   badly at the `v2.8.1` tag — pre-existing, untouched.
 
+### The release itself
+
+- `ci.yml` run `33337780002` at `214ac2a` — **all four jobs green**
+  (`msrv`, `test`, `deny`, `publish-check`); `docs` run `33337780032` green.
+- `release.yml` run `33339079316` on the `v2.9.0` tag — **all seven jobs
+  green** (`version`, both `build`s, `sbom`, `release-smoke`, `image`,
+  `release`).
+- §5 verified as a stranger, from a clean directory against the release page:
+  `sha256sum -c` OK on all three artifacts; `cosign verify-blob` `Verified OK`
+  on all four signed blobs (both tarballs, the SBOM, and `SHA256SUMS` itself);
+  `cosign verify ghcr.io/peterknego/uc2:2.9.0` claims validated; the tarball's
+  own `packaging/quickstart-local.sh` → **PASS**. The shipped `bin/` holds
+  `uc2-node`, `uc2ctl`, `uc2-gateway` — the rename's central promise, checked
+  in the artifact a user actually downloads. `v2.9.0` took the **Latest**
+  pointer automatically (`v2.8.1` was not a prerelease).
+- **crates.io: the first publish this project has ever done.** All 12 crates
+  are live at `2.9.0` under their `uc_*` names, confirmed by API and not by
+  the publish logs. It took 62 minutes: crates.io rate-limits *new crate
+  names* at roughly one per 2.5 minutes after a burst of ~5, so seven of the
+  twelve needed 2–5 attempts with a 150 s backoff. Nothing was bumped and
+  nothing was skipped; the mechanism and its one-time nature are now written
+  into [Cut a release](how-to/cut-a-release.md) §6. **The semver carve-out
+  above is spent from this moment** — "nothing had ever been published"
+  stopped being true at 23:32 UTC on 2026-08-30.
+
 Not run locally, and left to CI: the MSRV job (1.89 clippy), `cargo-deny`, the
 `ultima_db`-feature and `apply-profile` clippy arms, the hard-crash suite, elle
 and the Lean tiers. Nothing in this release changes what any of them execute —

@@ -42,8 +42,10 @@ the standing facts that bind new work.
 
 (Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
 `v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1` only and is superseded by
-`v2.7.0`, with no final `v2.6.0` tag. The ordered crates.io publish has
-never been run; `docs/how-to/cut-a-release.md` §6 is the procedure.)
+`v2.7.0`, with no final `v2.6.0` tag. The ordered crates.io publish ran for
+the first time on 2026-08-30 with `2.9.0` — all 12 crates are live under
+their `uc_*` names; `docs/how-to/cut-a-release.md` §6 is the procedure, and
+its rate-limit note explains why that first run took an hour.)
 
 Next up: **TBD by the maintainer.** M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the

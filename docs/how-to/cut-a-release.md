@@ -241,6 +241,30 @@ not indexed yet, so wait and re-run just that one.
 `uc_sim`, `uc_lincheck`, `counter` and `uc_crashtest` are `publish = false`:
 they are the proof and teaching apparatus, not the product.
 
+**Expect 429s on a name's FIRST publish.** crates.io rate-limits *new crate
+names* much harder than new versions of an existing one — measured on the
+`2.9.0` run (the first this project ever did), roughly **one new name per
+2.5 minutes** after a burst of about five. Seven of the twelve needed 2–5
+attempts:
+
+```
+error: failed to publish uc_net v2.9.0 to registry at https://crates.io
+Caused by:
+  the remote server responded with an error (status 429 Too Many Requests):
+  You have published too many new crates in a short period of time.
+  Please try again after ...
+```
+
+That is not a packaging failure and needs no fix — wait past the time in the
+message and re-run **that crate**, bumping nothing. A crate *after* the
+blocked one will fail differently and confusingly, with `failed to prepare
+local package for uploading`: its path dependency on the blocked crate cannot
+resolve from the registry yet. Same cause, same remedy.
+
+The whole hour-long dance is one-time. Every later release publishes new
+*versions* of names that already exist, which is not subject to this limit —
+`2.9.0` took 62 minutes end to end; the next release will take minutes.
+
 If a crate fails partway through the list, the ones before it are already
 public. Fix the failure, bump nothing, and re-run from the crate that failed —
 a half-published version is recoverable; a wrong published version is not.
