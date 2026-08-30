@@ -276,18 +276,34 @@ as `Indeterminate` in both histories rather than silently taken from FSM 0.
 
 Two more tests keep those honest rather than adding coverage of their own:
 
-- **The equivalence oracle is shown to bite.** `two_fsm_oracle_bites`
-  (`lin_v2.rs`, `#[should_panic(expected = "replication-equivalence
-  violated")]`) runs FSM 1 as `Corrupt<RegisterSm>` and the run dies on the
-  first divergent CAS — the recorded panic is
-  `[(0, CasResult(true)), (1, CasResult(false))]`. An oracle that has never
-  been made to fail is not evidence.
+- **The equivalence oracle is shown to bite — the same oracle the capstones
+  run.** `two_fsm_oracle_bites` (`lin_v2.rs`, `#[should_panic(expected =
+  "replication-equivalence violated")]`) puts FSM 1 behind `Corrupt<RegisterSm>`
+  and then drives `lincheck_v2::spawn_workers2` — the capstones' own worker
+  loop, whose `a != b` arm is what feeds `equiv_failures` — before making the
+  identical `equiv_failures == 0` assertion `run_two_fsm` makes. It is
+  deliberately not an inline hand-rolled comparison: weakening the workers'
+  fan-in check has to stop this test panicking. An oracle that has never been
+  made to fail is not evidence.
 - **The slow-FSM oracle** is what `two_fsm_slow*` actually assert, beyond
   linearizability: at every 50 ms sample the FSMs' separation stays inside the
   policy (≤ `fsm_lag` bounded, ≤ one 288 B frame in lockstep), **and** over the
-  run's second half their apply rates agree within 10 %. Measured ratio was
-  1.000 in all four runs (~19.6–22.2 KB/s, the slow FSM the limiter) — the fast
-  FSM is throttled to the slow one's pace, it does not sit at the bound.
+  run's second half their apply rates agree within 10 %. Measured ratio 1.000
+  in both runs.
+
+  What that does **not** show, measured 2026-08-30 (dev-box smoke, never a
+  gate): both FSMs progressed at the same rate, and the separation never
+  approached the bound. `two_fsm_slow` (`Bounded(64 KiB)`) sampled
+  `max_lag = 192 B of 65536` — 0.3 % of the bound, ~3.7 frames at ~52 B/frame —
+  at `rate0 = rate1 = 22 111 B/s`; `two_fsm_slow_lockstep` sampled
+  `max_lag = 64 B of 288` (~1.2 frames) at `rate0 = rate1 = 22 227 B/s`. At
+  ~52 B/frame that is ~425 records/s, an order of magnitude under
+  `Slow<RegisterSm, 200>`'s own ~5 000 applies/s ceiling: the **client loop**,
+  not FSM 1, is the limiter here, and the lag policy never binds. These runs
+  therefore do not exercise a bound-pinned state; the slow-FSM oracle is
+  evidence of **equal progress** across a heterogeneous pair, not of the
+  barrier's behaviour at the bound. The barrier at the bound is covered by
+  `uc2_service`'s `lag` unit tests and the apply-hop bench, not here.
 
 One more pin, from the M14d row-d lesson —
 `snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a `SnapshotPolicy`
@@ -332,7 +348,13 @@ strict, real-time model). A cycle-search timeout (`unknown`) is treated as a har
 `FsmLag::Bounded(64 KiB)`, recording **one history per FSM**
 (`$ELLE_DIR/quiet_two_fsm/fsm{0,1}/history.edn`), each adjudicated separately
 under both models by `scripts/elle_check.sh`, with the same replication-
-equivalence oracle §3 describes asserted at zero. The five older rows are the
+equivalence oracle §3 describes asserted at zero. **That oracle is structurally
+weak in this tier and carries no equivalence evidence of its own**: the Elle
+workload's `LaResp` has a single variant, so the two FSMs' answers can only
+differ by being malformed — a missing id, a non-ascending pair — and the check
+can therefore only fail on a malformed fan-in, never on a genuine state
+divergence. The equivalence evidence is the WGL capstones' (§3, §5). The five
+older rows are the
 2026-07-16 gate's default sizing; the two-FSM row is the 2026-08-30 run at
 `ELLE_TARGET_OPS=8000` (the sizing nightly uses), 100 % of ops `ok` on both
 FSMs.
@@ -719,15 +741,20 @@ The most important section, and the one most projects omit.
     checker (§3, §5).
   - **The replication-equivalence oracle** — every `submit_all`'s per-FSM
     answers must be byte-equal — is asserted at zero in all seven, and is
-    **shown to bite**: `two_fsm_oracle_bites` runs FSM 1 as
-    `Corrupt<RegisterSm>` and panics on the first divergent CAS.
+    **shown to bite**: `two_fsm_oracle_bites` runs FSM 1 as `Corrupt<RegisterSm>`
+    through the capstones' own worker loop and dies on the same
+    `equiv_failures == 0` assertion the capstones make.
   - **The slow-FSM oracle** (`two_fsm_slow`, `two_fsm_slow_lockstep`, FSM 1 =
     `Slow<RegisterSm, 200>`): the FSMs' separation stays inside the policy at
     every 50 ms sample **and** their second-half apply rates agree within
-    10 % — measured ratio 1.000 (§3).
+    10 % — measured ratio 1.000. Scoped by measurement: the separation never
+    approached the bound (`max_lag` 192 B of 65536, and 64 B of 288), so this
+    is evidence of equal progress, not of the barrier at the bound (§3).
   - **The Elle clean tier runs with two FSMs** — `elle_quiet_two_fsm`
     (`uc2_node/tests/elle_v2.rs`), one history per FSM, both clean under
-    `serializable` and `strong-serializable` (§4).
+    `serializable` and `strong-serializable`. Its equivalence check can only
+    fail on a malformed fan-in (`LaResp` has one variant); the equivalence
+    evidence is the WGL capstones' (§4).
   - **The M14c deferrals are closed** in `uc2_net` (snapshot-session refusal
     tests, the NAK-before-BEGIN skip, three new counters, a 60 s intake
     timeout, a paced publish re-drive) and in `uc2_service`/`uc2_node`/`uc2ctl`

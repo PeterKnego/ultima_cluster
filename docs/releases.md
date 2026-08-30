@@ -58,9 +58,22 @@ FSM 0, and `equiv == 0` is asserted before any checker verdict is read.
   Two assertions beyond linearizability: (i) at every 50 ms sample the
   separation is inside the policy (≤ `fsm_lag`; ≤ one 288 B frame in
   lockstep), (ii) over the run's second half the two FSMs' apply rates are
-  within 10 %. Measured `ratio=1.000` in all four runs
-  (`rate0=19681 rate1=19681`, then `rate0=22156 rate1=22156`; task-4 report) —
-  the fast FSM tracks the slow one exactly rather than sitting at the bound.
+  within 10 %. Measured `ratio=1.000` in all runs (`rate0=19681 rate1=19681`,
+  then `rate0=22156 rate1=22156`; task-4 report) — both FSMs progressed at the
+  same rate.
+
+  Scoped by measurement (final fix wave, 2026-08-30, dev-box smoke — never a
+  gate): the runs also report `max_lag`, and the separation never approached
+  the bound. `two_fsm_slow` = `max_lag=192 bound=65536` (~3.7 frames at
+  ~52 B/frame, 0.3 % of the bound) at `rate0=rate1=22111`;
+  `two_fsm_slow_lockstep` = `max_lag=64 bound=288` (~1.2 frames) at
+  `rate0=rate1=22227`. ~22 KB/s at ~52 B/frame is ~425 records/s, well under
+  `Slow<RegisterSm, 200>`'s ~5 000 applies/s ceiling — so the **client loop**,
+  not FSM 1, is the limiter, and the lag policy never binds. The run does not
+  exercise a bound-pinned state; the slow-FSM oracle is evidence of equal
+  progress, not of the barrier's behaviour at the bound. Earlier wording here
+  ("the fast FSM tracks the slow one … rather than sitting at the bound")
+  claimed a pacing mechanism the run had not measured.
 - `minority_partition_and_heal_two_fsm` (`uc2_node/tests/lin_partition_v2.rs`)
   — `Run` gained `h1`/`equiv` and a `start_cfg_two_fsm`/`finish_two` sibling
   pair; `run_minority` takes a `two_fsm` flag whose `false` arm is the
@@ -88,6 +101,14 @@ its default pass list is now **six**. Measured at `ELLE_TARGET_OPS=8000`:
 `quiet_two_fsm/fsm0` 16 062 events and `fsm1` 16 060 events, **clean under both
 `serializable` and `strong-serializable`** (task-7 report). The single-history
 path was re-run afterwards to prove it is unchanged.
+
+`equiv=0` here is weaker than it looks and must not be cited as equivalence
+evidence: `LaResp` has one variant, so `elle_worker2`'s vector comparison can
+only fail on a **malformed** fan-in (a missing id, a non-ascending pair), never
+on a genuine state divergence. The general check is kept for the day the
+response type grows variants; the equivalence evidence for `2.8.1` is the WGL
+capstones' `equiv_failures == 0` (T3–T6), whose `RegisterSm` responses do carry
+state.
 
 ### The lockstep experiment (T8 — `3c7122d`, `74f8109`)
 
@@ -267,20 +288,18 @@ refutes the brief's premise:
   pre-committed** (honest-failure protocol); re-specifying it against a
   scheduling-aware ceiling is the maintainer's call, and the argument is in the
   bench doc's §3 either way.
-- The pacing test's 9-chunk block could exceed 250 ms on a loaded runner and
-  FAIL spuriously; tighten it if nightly ever shows it.
-- `elle_check.sh`'s generation trigger treats `fsm0/history.edn` alone as
-  "generated", so a kill between the two writes would adjudicate FSM 0 only —
-  a one-line hardening.
 
 ### Verification evidence
 
 Every line below is quoted from the task reports of the commits above; none is
 a fleet measurement, and `2.8.1` claims no rate.
 
-- `cargo test -p uc2_node --test lin_v2` → `13 passed; 0 failed … 178.46s`
-  (task-4); `--test lin_partition_v2` → `8 passed; 0 failed … 59.42s` (task-5);
-  `snapshot_restart` alone → `1 passed … 31.61s` (task-11).
+- `cargo test -p uc2_node --test lin_v2` → `13 passed; 0 failed … 178.46s` at
+  the T4 tree (task-4); the 14th test
+  (`snapshot_restart_installs_only_with_purge`, T11) landed later and ran
+  alone → `1 passed … 31.61s` (task-11). The whole file at the final fix
+  wave's HEAD, inside the workspace run: `14 passed; 0 failed … 212.84s`.
+  `--test lin_partition_v2` → `8 passed; 0 failed … 59.42s` (task-5).
 - `cargo test -p uc2-crashtest --features hard-crash-tests --test hard_crash` →
   `6 passed; 0 failed … 9.62s` (task-6).
 - Elle: `OK: quiet_two_fsm/fsm0 clean under serializable` /

@@ -33,7 +33,7 @@ the standing facts that bind new work.
 | M12a–d | v2.6.0 | adoptable cluster: gateway kit + remote client, admin authn/audit, packaging/publishing, security posture + fuzz tier | `uc2-m12-gate-2026-08-22` |
 | M13 | v2.7.0 | remote path at the cluster's speed: per-record MPSC ring (no publish convoy), Engine-shaped remote client, edge grant budget | `uc2-m13-gate-2026-08-24` |
 | M14 | v2.8.0 | multi-service: one log → N FSMs (bounded/lockstep lag, per-FSM routing + fan-in, 0.6.0 snapshot stream, per-FSM observability) | `uc2-m14-gate-2026-08-29` |
-| M14c2 | v2.8.1 | two-FSM proof pass; lockstep envelope; fleet pinning | `uc2-m14c2-lockstep-oversubscription-2026-08-30` |
+| M14c2 | v2.8.1 | two-FSM proof pass; lockstep envelope; fleet pinning | proof-only, no fleet gate — `docs/VERIFICATION.md` §11 (`uc2-m14c2-lockstep-oversubscription-2026-08-30` is dev-box smoke, not a gate doc) |
 
 (Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
 `v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1` only and is superseded by

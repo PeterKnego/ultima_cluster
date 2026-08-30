@@ -7,6 +7,10 @@ bar. What this record adjudicates is a *ratio* and a *mechanism*, both of which
 a dev box can carry.
 
 Date: 2026-08-30. Branch `worktree-uc2-m14c2`, HEAD `11d4ecc`.
+Still current at the branch tip: the later `lag_waits` change (ruling K,
+`14ffb4e`) counts mid-frame waits in **bounded mode only** — `lag::plan`
+returns `target == head` in Lockstep — so the `lag_waits = 0` reading below is
+unchanged by it.
 
 ## The question
 

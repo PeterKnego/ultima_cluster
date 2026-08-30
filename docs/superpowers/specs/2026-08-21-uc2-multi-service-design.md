@@ -981,7 +981,7 @@ FAIL and a consensus/apply defect.
 | `lin_partition_v2::minority_partition_and_heal_two_fsm` | the existing scenario, two FSMs, bounded | per-FSM WGL + equivalence, before and after heal |
 | `uc2-crashtest::two_fsm_service_sigkill` (feature `hard-crash-tests`) | real processes; SIGKILL `--service-id 1` mid-load; respawn | both histories linearizable across the restart; equivalence holds after recovery; the restarted FSM re-attaches with a bumped incarnation |
 | `uc2-crashtest::two_fsm_node_sigkill` | SIGKILL the node with both attached; respawn node then both services | as above |
-| `elle_v2::elle_quiet_two_fsm` | the clean tier once with two FSMs | one Elle history per FSM, each under both models; equivalence on every submit_all's two responses (reads at different instants may legitimately differ) |
+| `elle_v2::elle_quiet_two_fsm` | the clean tier once with two FSMs | one Elle history per FSM, each under both models; equivalence on every submit_all's two responses (reads at different instants may legitimately differ). **As-built erratum (T0):** this equivalence check is structurally unfalsifiable for a genuine divergence — `LaResp` has a single variant, so it can only fail on a malformed fan-in (missing id, non-ascending pair). The equivalence evidence is the WGL capstone rows above, not this one. |
 
 Local proof stack for the plan's acceptance: the whole suite green, the
 capstones green with the failure injected (each new oracle watched to fail

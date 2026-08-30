@@ -38,8 +38,13 @@ deferrals M14c left open. The coverage record, with what is still open:
   ([`uc2_node/tests/lin_v2.rs`](uc2_node/tests/lin_v2.rs)) run a normal FSM
   beside one that takes 200 µs per apply and assert two things every 50 ms: the
   separation stays inside the lag policy, **and** over the run's second half
-  the two FSMs' apply rates agree within 10 %. Measured ratio: 1.000 — the fast
-  FSM is paced by the slow one rather than sitting at the bound. →
+  the two FSMs' apply rates agree within 10 %. Measured ratio: 1.000 — both
+  FSMs progressed at the same rate. Read it for what it is: the separation
+  never approached the bound (`max_lag = 192 B of 65536` bounded,
+  `64 B of 288` lockstep, at ~22 KB/s on both FSMs — dev-box smoke,
+  2026-08-30), so these runs do not exercise a bound-pinned state. The evidence
+  is of **equal progress** across a heterogeneous pair, not of the barrier's
+  behaviour at the bound. →
   [Configuration § `[services]`](docs/reference/configuration.md#services)
 - **Partition and quorum loss with two FSMs** —
   `minority_partition_and_heal_two_fsm`
@@ -56,7 +61,11 @@ deferrals M14c left open. The coverage record, with what is still open:
 - **Elle runs with two FSMs** — a new `quiet_two_fsm` pass records **one
   list-append history per FSM** and `scripts/elle_check.sh` adjudicates each
   under both `serializable` and `strong-serializable`. The clean tier's default
-  is now **six** passes, and a failure names the FSM. →
+  is now **six** passes, and a failure names the FSM. Note the scope: this
+  tier's own equivalence check can only fail on a **malformed fan-in** (the
+  list-append response type has a single variant, so two FSMs cannot return
+  answers that differ meaningfully) — the equivalence evidence is the WGL
+  capstones'. →
   [Investigate a failed run](docs/how-to/investigate-a-failed-run.md)
 - **A snapshot only shortens a restart together with purge** —
   `snapshot_restart_installs_only_with_purge`
