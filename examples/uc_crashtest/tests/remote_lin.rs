@@ -105,7 +105,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use uc_client::Client;
-use uc_lincheck::checker::{Verdict, check_register};
+use uc_lincheck::checker::{DEFAULT_BUDGET, Verdict};
 use uc_lincheck::history::{Entry, History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp};
@@ -188,6 +188,11 @@ const MAX_PHANTOM_DUPLICATES: u64 = 8;
 /// fix; the checker itself is the shared, untouched adjudicator and is not
 /// something this test gets to change.
 const CHECKER_STACK: usize = 256 << 20;
+
+/// The retry budget when the default goes `Inconclusive` — see
+/// `assert_linearizable`. 10x the default, which at ~2 000 entries is still
+/// seconds, not minutes.
+const ESCALATED_BUDGET: u64 = DEFAULT_BUDGET * 10;
 
 /// A tempdir on the ext4 target volume, never `/tmp` (RAM-backed tmpfs with
 /// no swap on the dev box — see CLAUDE.md "Local box").
@@ -792,11 +797,13 @@ struct ChaosReport {
 
 /// Run the checker on a thread with [`CHECKER_STACK`] instead of the test
 /// harness's default 8 MiB.
-fn check_deep(entries: &[Entry]) -> Verdict {
+fn check_deep(entries: &[Entry], budget: u64) -> (Verdict, u64) {
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(CHECKER_STACK)
-            .spawn_scoped(s, || check_register(entries))
+            .spawn_scoped(s, || {
+                uc_lincheck::checker::check_register_reporting(entries, budget)
+            })
             .expect("spawn checker thread")
             .join()
             .expect("checker thread")
@@ -804,16 +811,79 @@ fn check_deep(entries: &[Entry]) -> Verdict {
 }
 
 fn assert_linearizable(entries: &[Entry], tag: &str) {
-    match check_deep(entries) {
-        Verdict::Linearizable => eprintln!("[remote_lin] {tag}: Linearizable"),
+    // MEASURED locally, 2026-08-31, five runs (three envelope_off, two of
+    // each variant):
+    //
+    //   envelope_on : 1 684 / 1 643 entries, **0 indeterminate**, 1 687 /
+    //                 1 644 visited states
+    //   envelope_off: 1 728-1 802 entries, **117-142 indeterminate**, 1 762 /
+    //                 1 803 / 1 849 visited states, and once 3 850
+    //
+    // Two things follow, and they matter for how this is fixed.
+    //
+    // 1. A healthy search costs ~`entries + 1` states — it finds a
+    //    linearization on the first path with essentially no backtracking,
+    //    spending 0.035 % of the 5 M budget. So an `Inconclusive` is NOT a
+    //    budget that was marginally too small; it is a history costing
+    //    ~2 900x the normal one. The retry below is therefore a MITIGATION
+    //    for the near-miss band, not a proven fix, and it is labelled that
+    //    way deliberately.
+    //
+    // 2. Only `envelope_off` can ever be affected, because only it produces
+    //    indeterminate entries at all. With the session envelope ON a re-sent
+    //    write comes back FRESH/REPLAYED, so every outcome is known (measured
+    //    0). With it OFF, a write whose ticket expired during a leader
+    //    SIGKILL is genuinely unknown — which is the property this variant
+    //    exists to exercise. Lowering WORKERS or raising THROTTLE to dodge it
+    //    would weaken the capstone rather than fix it.
+    //
+    // What the count alone does NOT explain: 142 indeterminate cost only
+    // 3 850 states in one run. Cost is driven by how many indeterminate
+    // writes are mutually OVERLAPPING in the real-time frontier at once (the
+    // search must try each both ways, ~2^k in that k), which the total
+    // bounds but does not determine. The count is still the right first
+    // number to print, because it is the one a human can compare against the
+    // 117-142 baseline above.
+    //
+    // So: retry once at 10x — free for the near-miss band — and if it still
+    // cannot adjudicate, FAIL loudly with both numbers. Never accept an
+    // unadjudicated history.
+    let indeterminate = entries
+        .iter()
+        .filter(|e| matches!(e.outcome, Outcome::Indeterminate))
+        .count();
+    let (verdict, spent) = check_deep(entries, DEFAULT_BUDGET);
+    let (verdict, spent, budget) = if verdict == Verdict::Inconclusive {
+        eprintln!(
+            "[remote_lin] {tag}: Inconclusive at {spent} visited states ({} entries, \
+             {indeterminate} indeterminate); retrying once at {ESCALATED_BUDGET}",
+            entries.len()
+        );
+        let (v, s2) = check_deep(entries, ESCALATED_BUDGET);
+        (v, s2, ESCALATED_BUDGET)
+    } else {
+        (verdict, spent, DEFAULT_BUDGET)
+    };
+
+    match verdict {
+        Verdict::Linearizable => eprintln!(
+            "[remote_lin] {tag}: Linearizable ({} entries, {indeterminate} indeterminate, \
+             {spent} visited states of {budget})",
+            entries.len()
+        ),
         Verdict::Inconclusive => {
             // A budget-exhausted search is not an answer: accepting it would
             // let this capstone pass while proving nothing. Same call as
             // `lin_v2.rs` makes at every one of its six check sites.
             panic!(
-                "remote_lin {tag}: checker Inconclusive — the WGL search hit its visited-state \
-                 budget and adjudicated nothing; raise the budget / lower the op target (raise \
-                 THROTTLE, shorten LOAD)"
+                "remote_lin {tag}: checker Inconclusive after {spent} visited states at the \
+                 ESCALATED budget of {budget} — {} entries of which {indeterminate} are \
+                 INDETERMINATE. A healthy run costs entries+1 states (no backtracking); this \
+                 one backtracked, and the indeterminate count is the driver (~2^k). Decide from \
+                 that number: if it is far above the usual, the chaos schedule stranded an \
+                 unusual burst of in-flight writes and the workload should change; if it is \
+                 normal, the checker needs to be smarter, not richer.",
+                entries.len()
             )
         }
         Verdict::Violation => {

@@ -41,6 +41,20 @@ pub fn check_register(entries: &[Entry]) -> Verdict {
 }
 
 pub fn check_register_with_budget(entries: &[Entry], budget: u64) -> Verdict {
+    check_register_reporting(entries, budget).0
+}
+
+/// [`check_register_with_budget`], plus **how much of the budget the search
+/// actually spent**.
+///
+/// The point is calibration, not curiosity. `Inconclusive` says only "the
+/// search did not finish"; it does not say whether the budget was marginal (a
+/// slightly harder history would have been fine at 2x) or hopeless (the
+/// history is exponential and no realistic budget helps). Without the number
+/// there is no way to choose between raising the budget and reducing what the
+/// workload generates, so a capstone that goes Inconclusive gets fixed by
+/// guessing. Callers print this beside the verdict.
+pub fn check_register_reporting(entries: &[Entry], budget: u64) -> (Verdict, u64) {
     // Normalize: drop indeterminate reads (no information); map outcomes.
     let mut ops: Vec<NOp> = Vec::new();
     for e in entries {
@@ -71,11 +85,13 @@ pub fn check_register_with_budget(entries: &[Entry], budget: u64) -> Verdict {
         &mut visited,
         &mut budget_left,
     );
-    match res {
+    let spent = budget - budget_left;
+    let verdict = match res {
         SearchResult::Ok => Verdict::Linearizable,
         SearchResult::NoLinearization => Verdict::Violation,
         SearchResult::BudgetExceeded => Verdict::Inconclusive,
-    }
+    };
+    (verdict, spent)
 }
 
 enum SearchResult {
