@@ -293,7 +293,11 @@ a half-published version is recoverable; a wrong published version is not.
 
 - [ ] The release page renders, and its links into `RELEASES.md` resolve at
       the tag (not at `main` — that is why the body pins `v<version>`).
-- [ ] `docker run --rm ghcr.io/peterknego/uc2:2.6.0 --help` works.
+- [ ] `docker run --rm ghcr.io/peterknego/uc2:<version> --help` works
+      (use the version you just tagged, not a hardcoded one). Without a
+      Docker daemon you can at least confirm the tag was pushed:
+      `gh api /users/peterknego/packages/container/uc2/versions
+      --jq '.[].metadata.container.tags'`.
 - [ ] The gate doc for the milestone records the release, per the honest-failure
       protocol every milestone has used.
 
