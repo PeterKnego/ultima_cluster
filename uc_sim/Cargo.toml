@@ -30,14 +30,14 @@ test-support = []
 mutation-testing = ["uc_consensus/mutation-testing"]
 
 [dependencies]
-uc_consensus = { path = "../uc_consensus", version = "2.8.1" }
+uc_consensus = { path = "../uc_consensus", version = "2.10.0" }
 # T13: crypto-plane sim coverage (Peers/GroupPlane are pure (input, now_ns) ->
 # Vec<Action> transition functions with no sockets/clock reads, so the world
 # can drive them exactly like ElectionSm). uc_protocol/base64 are only needed
 # to name the handshake datagram kinds and format the sim's own on-disk
 # allowlist fixture.
-uc_crypto = { path = "../uc_crypto", version = "2.8.1" }
-uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+uc_crypto = { path = "../uc_crypto", version = "2.10.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.10.0" }
 base64 = { workspace = true }
 
 [dev-dependencies]

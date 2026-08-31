@@ -141,6 +141,44 @@ A number from a dev box or a small local run is a smoke test, not a bar — see
 The fleet-measured downtime bar for this script is a separate, pre-committed,
 user-approved step; this page states no number.
 
+## Stdout is now empty (2.10.0)
+
+`uc2-node` and `uc2-gateway` write **nothing** to stdout as of 2.10.0. Every
+record they emit — startup, role changes, drain, stop, the gateway's 10 s
+stats — is a JSON line on **stderr**.
+
+Before upgrading, check whether anything you run parses daemon stdout:
+
+```sh
+grep -rn "uc2-node\|uc2-gateway" /etc/systemd/system /opt/*/bin 2>/dev/null | grep -i "stdout\|| *grep\|awk\|tee"
+```
+
+Then fix each one:
+
+- **A supervisor or log shipper reading stdout** — point it at stderr, or at
+  the merged stream. Under systemd nothing changes: journald captures both.
+- **Anything matching the old prose lines** (`uc2-node: node 0 listening on
+  …`, `uc2-node: node 0 is now LEADER (term 1)`, `uc2-gateway: conns=… `) —
+  match the JSON records instead: `"event":"node_listening"`,
+  `"event":"became_leader"`, `"event":"gateway_stats"`. The full catalogue is
+  in [Monitor a cluster](monitor-a-cluster.md#structured-records).
+- **Nothing at all** — if you only read journald or the systemd units as
+  shipped, this needs no action.
+
+The pre-start refusal lines (`uc2-node: refusing to start: …`, the
+volatile-filesystem `WARNING`) stay human prose on stderr, deliberately: they
+are emitted before `[log] level` is read, and their machine-readable half is
+the exit code — **2** for a refused config, **1** for a runtime failure.
+
+## The `ultima_db` feature is gone (2.10.0)
+
+If you build a service against `uc_service` with `features = ["ultima_db"]`,
+that feature no longer exists and the build will fail by name. It provided a
+`StoreStateMachine` adapter over the `ultima-db` crate. Supply your own
+`StateMachine` instead — UC ships no store and prescribes no snapshot
+encoding. `uc_lincheck`'s `RegisterSm` and `ListAppendSm` are worked examples
+of the `StateMachine` + `SnapshotStateMachine` pair.
+
 ## Config choices added in v2.6.0: `[crypto].enabled` and `[admin]`
 
 `v2.6.0` (M12b) made two sections of `node.toml` **explicit choices**

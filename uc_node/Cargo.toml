@@ -18,16 +18,16 @@ name = "uc2-node"
 path = "src/bin/uc2-node.rs"
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
-uc_obs = { path = "../uc_obs", version = "2.8.1" }
+uc_protocol = { path = "../uc_protocol", version = "2.10.0" }
+uc_obs = { path = "../uc_obs", version = "2.10.0" }
 # Already a workspace dependency (uc_crypto uses it) — no new crate enters the
 # lockfile. Used only to digest the config FILE at load, for the (build,
 # config) release identity of twelve-factor #5.
 sha2 = { workspace = true }
-uc_log = { path = "../uc_log", version = "2.8.1" }
-uc_net = { path = "../uc_net", version = "2.8.1" }
-uc_consensus = { path = "../uc_consensus", version = "2.8.1" }
-uc_crypto = { path = "../uc_crypto", version = "2.8.1" }
+uc_log = { path = "../uc_log", version = "2.10.0" }
+uc_net = { path = "../uc_net", version = "2.10.0" }
+uc_consensus = { path = "../uc_consensus", version = "2.10.0" }
+uc_crypto = { path = "../uc_crypto", version = "2.10.0" }
 uc_journal = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
@@ -47,7 +47,7 @@ clap = { workspace = true }
 # reference. Cargo silently strips an unversioned path dev-dependency from
 # the published manifest instead (standard idiom for a dev-only test cycle).
 uc_service = { path = "../uc_service" }
-uc_client = { path = "../uc_client", version = "2.8.1" }
+uc_client = { path = "../uc_client", version = "2.10.0" }
 # L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,
 # built for the v2 SDK trait only (v1 `uc_service` is not pulled in here).
 # NOTE: deliberately no `version =` — uc_lincheck is `publish = false` (never

@@ -62,12 +62,12 @@ detection-timing confirmation is still outstanding.
 
 ## Try it
 
-Download the signed `v2.9.0` tarball and run its quickstart — no toolchain
+Download the signed `v2.10.0` tarball and run its quickstart — no toolchain
 needed:
 
 ```bash
-tar xzf uc2-2.9.0-x86_64-unknown-linux-gnu.tar.gz
-uc2-2.9.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
+tar xzf uc2-2.10.0-x86_64-unknown-linux-gnu.tar.gz
+uc2-2.10.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
 ```
 
 Three nodes, three services and three gateways come up on this host, a real
@@ -121,6 +121,7 @@ What shipped since the core, and where to read about it:
 | v2.8.0 (M14) | Several state machines per cluster, fed by one log; submit to any, or fan a query across all | [How it works](/docs/notes/uc2-m14-multi-service-explained.md) · [M14 gate](/docs/benchmarks/uc2-m14-gate-2026-08-29.md) |
 | v2.8.1 (M14c2) | The multi-service proof pass: linearizability, partition, hard-crash and Elle capstones run with two state machines | [What is verified § 11](/docs/VERIFICATION.md#11-what-is-not-verified) · [Lockstep envelope](/docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md) |
 | v2.9.0 | Every crate renamed to a uniform `uc_` prefix — packages and directories only; no binary, wire, cnc or metric name changed | [What changed](/RELEASES.md) · [Semver policy](/docs/reference/semver-policy.md) |
+| v2.10.0 | One JSON log stream per daemon (**stdout is now empty**); config keys overridable from the environment; a weak-memory fix in the node→client ring | [Structured records](/docs/how-to/monitor-a-cluster.md#structured-records) · [Environment overrides](/docs/reference/configuration.md#environment-overrides) · [Upgrading](/docs/how-to/upgrade-a-cluster.md#stdout-is-now-empty-2100) |
 
 Building from source: [Quickstart](/docs/QUICKSTART.md) (from-source section);
 developer build/test/lint commands are in [`CLAUDE.md`](/CLAUDE.md).

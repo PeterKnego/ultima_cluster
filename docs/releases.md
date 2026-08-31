@@ -1,5 +1,176 @@
 # ultima_cluster releases
 
+## v2.10.0 — <tag date> — one log stream, config from the environment, and a weak-memory fix
+<!-- tag date: fill at tag time -->
+
+Thirteen crates, still lockstep. No wire change (protocol stays 0.6.0), no cnc
+change, no `node.toml` schema change — a `2.9.0` config starts unmodified on
+`2.10.0`. Two breaking changes for people *around* the daemons rather than
+inside them, and one correctness fix.
+
+### The Broadcast seqlock was unsound on weak memory
+
+The node→client egress ring is the only ring with **no backpressure**: the
+single producer may lap a reader mid-copy, so a read's validity rests entirely
+on re-reading `publish_position` after the copy. That argument needs
+
+> if lap N+1's bytes are visible, then `publish_position >= N+1` is visible
+
+and the producer's `Release` store does **not** provide it. Release orders
+accesses *before* the store; it says nothing about accesses after, so the next
+call's `write_record_at` may be observed ahead of it. A consumer could then
+copy half of lap N and half of lap N+1 while still reading a stale
+`publish_position`, and the re-check would pass a **torn record** into the crc
+— which `try_read`'s own comment claims cannot happen.
+
+Fix: one `fence(Release)` at the top of `BroadcastProducer::write`, between the
+previous record's publish store and this record's body writes. Cost measured
+with `rustc --emit asm` on both targets: **no instruction on x86_64** (the
+fence emits only `#MEMBARRIER`; identical machine code) and one `dmb ish` on
+aarch64 — paid exactly where the bug is reachable.
+
+**No test could have found this.** x86-TSO forbids the store-store reordering
+it needs; aarch64 permits it; CI builds aarch64 binaries and never executes
+them. `broadcast::tests::{wrap_no_torn_read, overwrite_during_read_never_tears}`
+hammer this exact path and pass. It was found by
+`uc_protocol/tests/loom_broadcast.rs`, a new loom model written to close the
+gap `docs/VERIFICATION.md` had disclosed ("the broadcast seqlock has never been
+model-checked"), which failed on its first run. Two `#[should_panic]` mutations
+keep the model honest. Impact where reachable: a torn read surfaces as a
+spurious `BadCrc` instead of the defined `Overwritten`, with a ~2^-32 tail
+where the crc passes and a client sees a corrupt response. No consensus, log or
+journal exposure. Full writeup:
+[`docs/notes/uc2-broadcast-seqlock-explained.md`](notes/uc2-broadcast-seqlock-explained.md).
+
+### One output stream per daemon (twelve-factor #11)
+
+Both daemons wrote to stdout *and* stderr, so a consumer merged two streams and
+two formats. Now: every record from startup onward is a JSON line on stderr;
+**stdout is byte-empty**, enforced by
+`the_daemon_writes_nothing_to_stdout_and_everything_to_stderr`, which pipes
+both streams over a full start/SIGTERM/exit-0 lifecycle.
+
+Two lines were **deleted rather than converted**, because both duplicated
+records the library already emitted:
+
+  * `node {id} is now LEADER/follower (term N)` — `node.rs` emits
+    `became_leader`/`became_follower` **on the transition**, while the daemon
+    polled `is_leader()` every 100 ms and so could miss a flap shorter than
+    its interval. Strictly worse, and redundant.
+  * `agent {name} fail-stopped; exiting` — printed beside the
+    `agent_failstopped` record on the line above it.
+
+The gateway could not reach `uc_node::obs::log` (and must not depend on
+`uc_node` — that would pull consensus, transport and crypto into a front-door
+process), so the 361-line log core moved to a new dependency-free crate,
+**`uc_obs`**. Named for its purpose rather than `common`/`util` deliberately:
+the workspace was searched for what a general utility crate would hold and the
+answer was "this and nothing else" (`now_ns` appears at 8 sites but is
+`self.base.elapsed()` on 8 different structs; the rest are test fixtures), and
+`semver-policy.md` records the 2.9.0 rename as a **spent** carve-out, so the
+name is effectively permanent.
+
+Stated exception, documented rather than hidden: the pre-start refusal lines
+stay human prose on stderr. They are emitted before `[log] level` has been
+read and are addressed to whoever runs `systemctl status`; their
+machine-readable half is the exit code.
+
+### Environment overrides (twelve-factor #3)
+
+Eleven `UC2_*` keys, environment winning over file. Three boundaries were
+deliberate:
+
+  * **No key material, ever.** `crypto.key_path` and the `[admin]` key paths
+    stay file-based — an env var is readable in `/proc/<pid>/environ`, in
+    `docker inspect`, and by every child process. `no_env_override_carries_key_material`
+    fails if anyone adds one.
+  * **No tuning knobs.** `buffer_bytes`, `election_timeout_*` and
+    `admission_bytes` are part of the build's behaviour, which is what the
+    twelve-factor page itself recommends.
+  * **`parse_str` stays a pure function of its text.** The env layer lives in
+    a new `parse_str_with_env(text, env)`. Two load-bearing reasons:
+    `parse_str` is the `uc_node_toml`/`uc_gateway_toml` fuzz targets' entry
+    point and a target depending on ambient state is not reproducible; and
+    `std::env::set_var` is `unsafe` in edition 2024, so tests take an explicit
+    lookup rather than mutating the process environment under a threaded test
+    binary.
+
+Overrides apply **before** validation, so a bad value is refused by the same
+path a bad file value is — but the message names the **variable**, because the
+file is valid and naming the TOML key would send the operator to edit the
+wrong thing. `UC2_MEMBERS` **replaces** the table rather than merging: a
+membership list must agree cluster-wide, so a half-overridden one is never what
+anyone means.
+
+Payoff: `packaging/compose.yml` rendered six near-identical config files
+through a busybox shell; it now renders **two**.
+
+### Release identity (twelve-factor #5)
+
+`config_loaded` {path, sha256} at startup — plain SHA-256 over the file's
+bytes, pinned in a test against the published vectors for `"abc"` and `""`
+rather than against itself, so a change of algorithm fails loudly instead of
+silently renumbering every operator's ledger. It digests the file **as read,
+before overrides**: that is the artifact under version control, and hashing a
+post-override "effective config" would need a canonical serialisation this
+crate does not have. `sha2` was already a workspace dependency, so no crate
+enters the lockfile.
+
+### `ultima-db` removed
+
+An optional dep behind `uc_service`'s non-default `ultima_db` feature, carrying
+a `StoreStateMachine` adapter that **nothing in the tree used except its own
+test** — `StoreStateMachine` appeared in exactly two files, and
+`snapshot_stream` nowhere outside the adapter. Dropped three crates from
+`Cargo.lock` (`ultima-db`, `dashmap`, `hashbrown`) and four CI/nightly/docs
+steps. Not a major version: `semver-policy.md` already excluded it by name
+under the non-default-features carve-out. This also corrected a stale claim —
+CLAUDE.md had called it "the default app-state store + snapshot format", which
+was never true of the shipped code.
+
+### Toolchain and CI
+
+`cargo fmt --all` finally ran (3 393 hunks, 189 files, one mechanical commit)
+once the last long-lived worktree landed, and `cargo fmt --all -- --check` is
+now the first step of `ci.yml`. History before that commit is unformatted, so
+`git blame` across it needs `-w`.
+
+New: `scripts/check_doc_links.py`, run first in `docs.yml`. It checks internal
+links against **both** renderers in use — GitHub's slug rules and md-tui's,
+which differ in two ways (md-tui drops `_` and collapses repeated `-`). Dead
+files, dead GitHub anchors and links nested inside `*...*` emphasis (inert in
+md-tui) are errors; md-tui-only divergences are warnings, because making them
+fatal would hold 239 em-dashed headings — including gate docs, which are
+permanent records — hostage to a third-party TUI. It found one genuine
+pre-existing dead link on its first run.
+
+### Fleet work, all methodological
+
+No performance change ships in `2.10.0`; nothing on the commit path was
+touched. Three fleet runs were made and all three are recorded:
+
+  * **CPU pinning: NOT adopted.** Pre-committed bar was "adopt iff the pinned
+    spread is < 5 %"; measured 14.3 %, plus a −9.4 % throughput cost. The
+    `c6id.2xlarge` sibling map's assumption was verified on real hardware for
+    the first time (`lscpu -e=CPU,CORE` → `CORE 0..3 0..3`).
+  * **Core count: 4 physical cores**, one per polling agent, flat past 5 —
+    measured by a pin-width sweep on `c8id.4xlarge`, direct shmem path only.
+  * **A "two operating regimes" finding was published and refuted the same
+    day.** A 16-arm probe with per-second timelines showed the gap fills in
+    with more samples: one broad distribution with a long low tail, no arm
+    ever transitioning. Pinning's real value is variance reduction — **31×
+    tighter p50 spread**. The superseded claim is marked as such rather than
+    deleted.
+
+Two standing lessons came out of that and are recorded in CLAUDE.md: size a
+spread bar's rep count from observed arm-to-arm variance (n=4 cannot
+distinguish a distribution's width from its tail), and **no fleet driver uses
+`m12_gate`'s `--warmup-secs`/`--measure-secs` steady window**, so every
+published rate includes a 3–5 % warm-up climb.
+
+<!-- PENDING: ci + nightly evidence — fill with the post-merge workflow run
+     ids in the M14 gate's row-g style once both have run on the tag commit -->
+
 ## v2.9.0 — 2026-08-30 — the `uc_*` crate rename
 
 **Mechanical. No behaviour change, no wire or cnc change, no binary rename.**

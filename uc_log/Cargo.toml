@@ -15,7 +15,7 @@ categories.workspace = true
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+uc_protocol = { path = "../uc_protocol", version = "2.10.0" }
 uc_journal = { workspace = true }
 memmap2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

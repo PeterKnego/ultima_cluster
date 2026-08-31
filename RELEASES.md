@@ -7,6 +7,91 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## v2.10.0 — <tag date>
+<!-- tag date: fill at tag time -->
+
+**One log stream, config from the environment, and a memory-ordering fix a
+model found.** Two changes an operator must read before upgrading — the
+daemons no longer write to stdout at all, and `uc_service`'s `ultima_db`
+feature is gone — plus a correctness fix in the node→client response ring that
+only manifests on aarch64.
+
+- **Every daemon now has ONE output stream and ONE format.** `uc2-node` and
+  `uc2-gateway` previously wrote to *both* stdout and stderr, so a log
+  consumer had to merge two streams and two formats. Now every record from
+  startup onward is a JSON line on **stderr**, and **stdout is byte-empty**.
+  The gateway's 12-field prose stats line became a `gateway_stats` record, and
+  five node lifecycle lines became `node_listening`, `metrics_listening`,
+  `draining`, `stopped` and `statvfs_failed`. Two lines were deleted rather
+  than converted, because they duplicated records the library already emitted.
+  → [Monitor a cluster § Structured records](docs/how-to/monitor-a-cluster.md#structured-records)
+- **Config keys that vary per deploy can now come from the environment.**
+  Eleven `UC2_*` overrides (`UC2_NODE_ID`, `UC2_BIND`, `UC2_INSTANCE_DIR`,
+  `UC2_APP_ID`, `UC2_MEMBERS`, `UC2_LOG_LEVEL`, `UC2_METRICS_BIND` and four
+  `UC2_GATEWAY_*`), environment winning over file, each announced by a
+  `config_env_override` record. One immutable image can now run every node of
+  a cluster: `packaging/compose.yml` renders **two** config files instead of
+  six. Key material stays file-based deliberately, and a test enforces it.
+  → [Configuration § Environment overrides](docs/reference/configuration.md#environment-overrides)
+- **A node reports the config it loaded, so a release can be pinned.** Every
+  node emits `config_loaded` {path, sha256} at startup — plain SHA-256 over
+  the file's bytes, so it checks against `sha256sum` on the copy in version
+  control with no UC tooling. With `uc2_build_info{version}` and the override
+  records, what a node is running is fully identifiable from a live process.
+  → [Record a release](docs/how-to/record-a-release.md)
+- **New crate `uc_obs`** — the structured log record format, extracted so
+  `uc2-gateway` can emit it without depending on `uc_node`. **13 publishable
+  crates now**, still versioned in lockstep.
+  → [Architecture § Crates](docs/ARCHITECTURE.md)
+- **A plain-language explanation of state machine replication**, with a
+  diagram — now the single source for the concept, which `README.md` and
+  `docs/ARCHITECTURE.md` point at rather than restating.
+  → [State machine replication, explained](docs/notes/state-machine-replication-explained.md)
+
+**Fixed**
+
+- **The Broadcast ring's seqlock was unsound on weak memory** — a torn
+  node→client response could escape its read barrier and reach the crc. The
+  producer's `Release` store orders accesses *before* it, not after, so the
+  next record's body writes could be observed ahead of the publish that warns
+  a lapped reader. Fixed with one publish-before-body fence: **no instruction
+  on x86_64**, one `dmb ish` on aarch64. Found by a new loom model, not by a
+  test — x86-TSO forbids the reordering and CI never executes aarch64.
+  → [The broadcast seqlock, explained](docs/notes/uc2-broadcast-seqlock-explained.md)
+- Two test-suite races that produced nightly intermittents: the reconfig
+  removal fixtures now retry when a best-effort adoption race is lost, and
+  `sigkill_mid_config_window` gained a 90 s liveness budget plus a straggler
+  diagnostic that distinguishes a starved process from a live-but-not-adopting
+  one.
+
+**Removed (breaking)**
+
+- **`uc_service`'s `ultima_db` feature and the `ultima-db` dependency.** The
+  `StoreStateMachine` adapter it provided was used by nothing in the tree
+  except its own test — no binary, example, gate harness or capstone built it.
+  Removing it drops three crates from `Cargo.lock`. Not a major version: the
+  [semver policy](docs/reference/semver-policy.md) already excluded non-default
+  features by name. A service supplies its own `StateMachine`; UC prescribes
+  no store.
+
+**Performance**
+
+- **No performance change.** UC's throughput on the published `c6id.2xlarge`
+  configuration is unmeasured this release; nothing on the commit path
+  changed. Three fleet runs were made, all methodological:
+  CPU pinning was evaluated against a pre-committed bar and **not adopted**
+  (14.3 % spread against a < 5 % bar, and a −9.4 % throughput cost), a
+  core-count sweep answered **4 physical cores, one per polling agent**, and
+  a per-second timeline probe established that the fleet's run-to-run variance
+  is one distribution with a long low tail rather than two operating regimes.
+  → [Pinning](docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md) ·
+  [Core-count sweep](docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md) ·
+  [Regime probe](docs/benchmarks/uc2-regime-probe-2026-08-31.md)
+
+**Upgrading** — the binary swap is unchanged, but read
+[Upgrade a cluster § 2.10.0](docs/how-to/upgrade-a-cluster.md#stdout-is-now-empty-2100)
+first if anything you run parses daemon stdout.
+
 ## v2.9.0 — 2026-08-30 — one prefix: every crate is now `uc_*`
 
 **A rename, and nothing else.** No behaviour changed, no wire or cnc change, no
