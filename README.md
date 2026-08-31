@@ -6,11 +6,43 @@ Built on the state-of-the-art State Machine Replication architecture, with a ful
 
 ## What it is
 
-Ultima_cluster is a State Machine Replication application server. You write a deterministic state machine; it runs your state machine on every node in a cluster, applying the same commands in the same order, and survives node failure without losing acknowledged writes. A replicated command log is what drives every change in the user-supplied state machine. Read more in [Architecture](/docs/ARCHITECTURE.md).
+`ultima_cluster` is a **State Machine Replication** application server.
+
+State machine replication makes several machines behave as one reliable
+machine. You write a **deterministic** program — the same input sequence
+always gives the same output and the same internal state — and a copy of it
+runs on every node. The nodes first agree on **one single ordered list of
+commands**, using a consensus protocol; each node then applies that list, in
+that order, to its own copy. Because the program is deterministic, all copies
+stay identical.
+
+![Clients submit commands; the nodes run a consensus protocol to agree one
+ordered log; each replica then applies that log independently and they all
+reach the same state](/docs/images/smr-overview.png)
+
+So a node can answer a query from its own copy, and if some nodes fail the
+rest continue with the correct state. **The only thing the nodes must agree on
+is the order of the inputs** — not the state itself, and not the output. That
+is what makes the expensive, general-purpose part (consensus) independent of
+your application, and it is where all the leverage comes from.
+
+→ [State machine replication, explained](/docs/notes/state-machine-replication-explained.md)
+— the full version: why order is the only thing worth agreeing on, what
+determinism costs you, and when *not* to use this model.
+
+You supply the state machine. `ultima_cluster` supplies everything else: the
+replicated command log that drives every change, consensus and elections,
+durability, failover without losing acknowledged writes, snapshots,
+membership changes, and the client SDKs. Read more in
+[Architecture](/docs/ARCHITECTURE.md).
 
 ## Why?
 
-SMR is used when you need ultimate performance, correctness and resiliency at the same time. All state is held and manipulated in memory (only occasional snapshots are persisted) and correctness is guaranteed via guaranteed order of commands across all state machines in the cluster.
+SMR is what you reach for when you need performance, correctness and
+resiliency at the same time. All state is held and manipulated in memory (only
+occasional snapshots are persisted), and correctness comes from the guaranteed
+order of commands across every state machine in the cluster — not from locks,
+transactions or conflict resolution.
 
 ### High-perf: 1.5 M responses/s at p99 0.905 ms
 

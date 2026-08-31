@@ -131,6 +131,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 Canonical documents, in order:
 
+0. `docs/notes/state-machine-replication-explained.md` — what SMR *is*, and
+   the single source for the concept (`README.md` and `docs/ARCHITECTURE.md`
+   both point here rather than restating it; keep it that way). Read it if
+   you are explaining the model to anyone, or writing prose that describes it.
 1. `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` — the
    canonical v2 design spec; read it end-to-end before substantial work.
    Later milestones have their own specs beside it (M7 reconfig, M8 wire

@@ -22,50 +22,22 @@ That is the same job Raft does. What differs is the shape.
 
 *Skip to [The one idea](#the-one-idea) if you already know SMR.*
 
-The model ([Wikipedia](https://en.wikipedia.org/wiki/State_machine_replication))
-is simple to state: instead of replicating *data*, replicate *the sequence of
-commands*. Every replica starts in the same state and applies the same commands
-in the same order, so every replica ends in the same state — no diffing, no
-merging, no conflict resolution.
-
-That reduces fault tolerance to a single problem: **agreeing on the order.** That
-is what consensus protocols like Raft and Paxos do, and it is all they do.
+The model: instead of replicating *data*, replicate *the sequence of commands*.
+Every replica starts in the same state and applies the same commands in the
+same order, so every replica ends in the same state — no diffing, no merging,
+no conflict resolution. Fault tolerance reduces to a single problem,
+**agreeing on the order**, which is what Raft and Paxos do and all they do.
 Determinism does the rest.
 
-What you get from it:
+The price is a hard constraint: **`apply` must be deterministic.** No clocks,
+no random numbers, no map-iteration order, no I/O, no ambient state. Two
+replicas that disagree by one bit have silently forked, and no consensus layer
+can detect it for you.
 
-- **Strong consistency without a distributed transaction protocol.** Ordering is
-  the only agreement needed.
-- **Trivial failover.** Every replica already holds the complete state, so a new
-  leader takes over immediately — there is no state transfer on the failure path.
-- **A replayable history.** The command log *is* the system of record, which makes
-  audit, recovery, and rebuild-from-scratch fall out for free.
-
-The price is a hard constraint: **`apply` must be deterministic.** No clocks, no
-random numbers, no map-iteration order, no I/O, no ambient state. Two replicas
-that disagree by one bit have silently forked, and no consensus layer can detect
-it for you.
-
-### When you'd reach for it
-
-The natural fit is a modest amount of state that must be *exactly* right, mutated
-by a high rate of small commands: matching engines and order books, exchange and
-trading systems, control planes, metadata and configuration stores, sequencers,
-coordination services. It is the model behind ZooKeeper, etcd, Aeron Cluster, and
-the LMAX-style trading architectures.
-
-### When you would not
-
-- **Large state.** The whole state lives in memory on every node and must be
-  snapshottable. Bulk storage wants a replicated database, not SMR.
-- **Nondeterministic work.** If `apply` needs to call a service, read a clock, or
-  consult anything ambient, the model does not hold. Push that work to an
-  `OutputHandler` (leader-only, at-least-once) or out of the system entirely.
-- **Write scaling.** Every node applies every command, and ordering runs through
-  one leader. SMR buys consistency and failover, never write throughput that
-  scales with node count — adding nodes makes it *more* durable, not faster.
-- **Eventual consistency is sufficient.** Then this is a great deal of machinery
-  for a guarantee you are not using.
+→ **[State machine replication, explained](notes/state-machine-replication-explained.md)**
+is the full version, with a diagram, what you get for that constraint, and
+when to reach for the model and when not to. It is the single source for the
+concept; this section is the recap, and the rest of this document assumes it.
 
 ## The one idea
 
