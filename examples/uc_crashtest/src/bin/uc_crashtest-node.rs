@@ -57,9 +57,12 @@ fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
             let (id, addr) = part
                 .split_once('@')
                 .unwrap_or_else(|| panic!("bad --members entry {part:?}, expected id@addr"));
-            let id: NodeId = id.parse().unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
-            let addr: SocketAddr =
-                addr.parse().unwrap_or_else(|e| panic!("bad member addr {addr:?}: {e}"));
+            let id: NodeId = id
+                .parse()
+                .unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
+            let addr: SocketAddr = addr
+                .parse()
+                .unwrap_or_else(|e| panic!("bad member addr {addr:?}: {e}"));
             (id, addr)
         })
         .collect()
@@ -111,11 +114,14 @@ fn main() -> anyhow::Result<()> {
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
-        services: uc_node::ServicesConfig::from_cli(args.services.as_deref(), args.fsm_lag.as_deref())
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(2)
-            }),
+        services: uc_node::ServicesConfig::from_cli(
+            args.services.as_deref(),
+            args.fsm_lag.as_deref(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2)
+        }),
     };
 
     let node = Node::start(cfg)?;

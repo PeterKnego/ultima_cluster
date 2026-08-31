@@ -54,7 +54,10 @@ struct Args {
 /// one committed NewTerm frame before anyone can serve. Retry the transient
 /// cases; report the rest. Shared by every write shape below (`submit`,
 /// `submit_to`, `submit_all`) — only the call itself differs.
-fn retry_with<T>(deadline: Instant, mut call: impl FnMut() -> Result<T, ClientError>) -> anyhow::Result<T> {
+fn retry_with<T>(
+    deadline: Instant,
+    mut call: impl FnMut() -> Result<T, ClientError>,
+) -> anyhow::Result<T> {
     loop {
         match call() {
             Ok(v) => return Ok(v),
@@ -86,7 +89,8 @@ fn not_leader_for_read(hint: Option<u32>) -> anyhow::Error {
         "linearizable reads are leader-only and this node is a follower{}. \
          Either point --instance-dir at the leader, or pass --snapshot to \
          read this replica's own copy of the state.",
-        hint.map(|id| format!(" (node {id} is the leader)")).unwrap_or_default()
+        hint.map(|id| format!(" (node {id} is the leader)"))
+            .unwrap_or_default()
     )
 }
 
@@ -96,24 +100,37 @@ fn main() -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(args.wait_secs);
 
     if !args.read_only {
-        let cmd = if args.reset { Command::Reset } else { Command::Add(args.add) };
+        let cmd = if args.reset {
+            Command::Reset
+        } else {
+            Command::Add(args.add)
+        };
         let reps = if args.reset { 1 } else { args.count };
         for _ in 0..reps {
             if args.all {
                 let all: Vec<(u8, Applied)> =
                     retry_with(deadline, || client.submit_all::<Command, Applied>(&cmd))?;
                 for (id, applied) in all {
-                    println!("FSM {id}: {cmd:?} -> value {} @ position {}", applied.value, applied.position);
+                    println!(
+                        "FSM {id}: {cmd:?} -> value {} @ position {}",
+                        applied.value, applied.position
+                    );
                 }
             } else if let Some(id) = args.service_id {
                 let applied =
                     retry_with(deadline, || client.submit_to::<Command, Applied>(id, &cmd))?;
-                println!("FSM {id}: {cmd:?} -> value {} @ position {}", applied.value, applied.position);
+                println!(
+                    "FSM {id}: {cmd:?} -> value {} @ position {}",
+                    applied.value, applied.position
+                );
             } else {
                 // Default path: FSM 0, output byte-identical to before --service-id/--all existed.
                 let applied = submit_with_retry(&client, &cmd, deadline)?;
                 if args.reset {
-                    println!("Reset -> value {} @ position {}", applied.value, applied.position);
+                    println!(
+                        "Reset -> value {} @ position {}",
+                        applied.value, applied.position
+                    );
                 } else {
                     println!(
                         "Add({}) -> value {} @ position {}",

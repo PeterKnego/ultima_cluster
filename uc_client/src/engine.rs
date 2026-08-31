@@ -358,7 +358,12 @@ impl Engine {
         let masked = raw & ((1u64 << CNC_MAX_SERVICES) - 1);
         let declared = match (raw, masked) {
             (0, _) => 0b1,
-            (_, 0) => return Err(ClientError::ServiceNotDeclared { id: 0, declared: raw }),
+            (_, 0) => {
+                return Err(ClientError::ServiceNotDeclared {
+                    id: 0,
+                    declared: raw,
+                });
+            }
             (_, m) => m,
         };
         let mut egress_services = Vec::new();
@@ -568,7 +573,11 @@ impl SendHalf {
     /// The cnc page's current `leader_hint` (`u64::MAX` sentinel → `None`).
     pub fn leader_hint(&self) -> Option<u32> {
         let hint = self.shared.cnc.status().leader_hint.load_acquire();
-        if hint == u64::MAX { None } else { Some(hint as u32) }
+        if hint == u64::MAX {
+            None
+        } else {
+            Some(hint as u32)
+        }
     }
 
     /// Whether the node's `NODE_FLAG_CAN_SERVE` is currently set.
@@ -631,9 +640,7 @@ fn finish_write(
             }
             match e {
                 RingError::Full => Err(SubmitError::Backpressure),
-                RingError::TooLarge { len, max } => {
-                    Err(SubmitError::PayloadTooLarge { len, max })
-                }
+                RingError::TooLarge { len, max } => Err(SubmitError::PayloadTooLarge { len, max }),
                 other => Err(SubmitError::Ring(other)),
             }
         }
@@ -660,7 +667,14 @@ impl PollHalf {
     pub fn poll(&mut self, mut cb: impl FnMut(Completion<'_>)) -> usize {
         self.cycle += 1;
         let maint = self.cycle.is_multiple_of(64);
-        let PollHalf { shared, egress_services, egress_node, buf, fanin, .. } = self;
+        let PollHalf {
+            shared,
+            egress_services,
+            egress_node,
+            buf,
+            fanin,
+            ..
+        } = self;
         let mut emitted = 0usize;
         if maint {
             emitted += maintenance(shared, &mut cb);
@@ -757,7 +771,11 @@ fn handle_record(
             };
             let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
             match shared.table.resolve(wire_seq, Some(delivered), Some(ring)) {
-                Resolve::Won { user_data, fan_in: false, .. } => {
+                Resolve::Won {
+                    user_data,
+                    fan_in: false,
+                    ..
+                } => {
                     shared.stats.responses.fetch_add(1, Ordering::Relaxed);
                     cb(Completion {
                         user_data,
@@ -766,7 +784,11 @@ fn handle_record(
                     });
                     1
                 }
-                Resolve::Won { user_data, fan_in: true, first } => {
+                Resolve::Won {
+                    user_data,
+                    fan_in: true,
+                    first,
+                } => {
                     // The last piece: buffer it beside the earlier ones, emit
                     // the whole set ordered by id, then drop the pieces (the
                     // `Bytes` refcounts travelled to the caller by value).
@@ -785,8 +807,12 @@ fn handle_record(
                     1
                 }
                 Resolve::Partial { first } => {
-                    fanin[shared.table.slot_index(wire_seq)]
-                        .push_piece(first, position, ring, &buf[8..]);
+                    fanin[shared.table.slot_index(wire_seq)].push_piece(
+                        first,
+                        position,
+                        ring,
+                        &buf[8..],
+                    );
                     0
                 }
                 Resolve::WrongRing => {
@@ -811,9 +837,15 @@ fn handle_record(
             // Defensive hint decode (malformed payload -> unknown, never panic)
             // — copied from the old matcher.rs.
             let hint_raw = u64::from_le_bytes(
-                buf.get(..8).and_then(|s| s.try_into().ok()).unwrap_or([0xff; 8]),
+                buf.get(..8)
+                    .and_then(|s| s.try_into().ok())
+                    .unwrap_or([0xff; 8]),
             );
-            let hint = if hint_raw == u64::MAX { None } else { Some(hint_raw as u32) };
+            let hint = if hint_raw == u64::MAX {
+                None
+            } else {
+                Some(hint_raw as u32)
+            };
             match shared.table.resolve(wire_seq, None, None) {
                 // kind-agnostic: a pre-side-effect signal
                 Resolve::Won { user_data, .. } => {
@@ -822,7 +854,11 @@ fn handle_record(
                     // generation's `first` piece would clear them anyway).
                     fanin[shared.table.slot_index(wire_seq)].parts.clear();
                     shared.stats.not_leader.fetch_add(1, Ordering::Relaxed);
-                    cb(Completion { user_data, position: None, outcome: Outcome::NotLeader { hint } });
+                    cb(Completion {
+                        user_data,
+                        position: None,
+                        outcome: Outcome::NotLeader { hint },
+                    });
                     1
                 }
                 _ => 0, // stale redirect for an already-resolved slot: no side effect to guard
@@ -832,7 +868,11 @@ fn handle_record(
             Resolve::Won { user_data, .. } => {
                 fanin[shared.table.slot_index(wire_seq)].parts.clear(); // as NOT_LEADER
                 shared.stats.retry.fetch_add(1, Ordering::Relaxed);
-                cb(Completion { user_data, position: None, outcome: Outcome::Retry });
+                cb(Completion {
+                    user_data,
+                    position: None,
+                    outcome: Outcome::Retry,
+                });
                 1
             }
             _ => 0,
@@ -878,7 +918,10 @@ fn maintenance(shared: &Shared, cb: &mut impl FnMut(Completion<'_>)) -> usize {
                 cb(Completion {
                     user_data,
                     position: None,
-                    outcome: Outcome::InstanceRestart { attached: shared.instance_id, current },
+                    outcome: Outcome::InstanceRestart {
+                        attached: shared.instance_id,
+                        current,
+                    },
                 });
                 emitted += 1;
             });
@@ -887,7 +930,11 @@ fn maintenance(shared: &Shared, cb: &mut impl FnMut(Completion<'_>)) -> usize {
     let now_ns = shared.t0.elapsed().as_nanos() as u64;
     shared.table.sweep(now_ns, |user_data| {
         shared.stats.timed_out.fetch_add(1, Ordering::Relaxed);
-        cb(Completion { user_data, position: None, outcome: Outcome::TimedOut });
+        cb(Completion {
+            user_data,
+            position: None,
+            outcome: Outcome::TimedOut,
+        });
         emitted += 1;
     });
     emitted
@@ -924,7 +971,9 @@ mod tests {
     fn lost_release_after_a_concurrent_completion_reports_accepted_not_refused() {
         let table = SlotTable::new(8, 0);
         let stats = StatCells::default();
-        let seq = table.claim(0xABCD, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        let seq = table
+            .claim(0xABCD, ReqKind::Submit, u64::MAX, 0b1, false)
+            .unwrap();
 
         // Something else (instance-restart drain, or the deadline sweep)
         // wins the slot's completion before our write ever lands.
@@ -937,9 +986,20 @@ mod tests {
         // genuinely full ingress ring) — finish_write must NOT report this
         // as a refusal: the completion already happened.
         let result = finish_write(&table, &stats, seq, Err(RingError::Full));
-        assert!(matches!(result, Ok(())), "lost release must report accepted: {result:?}");
-        assert_eq!(stats.accepted.load(Ordering::Relaxed), 1, "accepted must count this request");
-        assert_eq!(table.inflight(), 0, "must not double-decrement on a lost release");
+        assert!(
+            matches!(result, Ok(())),
+            "lost release must report accepted: {result:?}"
+        );
+        assert_eq!(
+            stats.accepted.load(Ordering::Relaxed),
+            1,
+            "accepted must count this request"
+        );
+        assert_eq!(
+            table.inflight(),
+            0,
+            "must not double-decrement on a lost release"
+        );
     }
 
     // --- synthetic instance dir: the same idiom as
@@ -1033,7 +1093,10 @@ mod tests {
             let (send, mut poll) = Engine::attach(
                 dir.path(),
                 "fanin-gen",
-                EngineConfig { serving_gate: false, ..EngineConfig::default() },
+                EngineConfig {
+                    serving_gate: false,
+                    ..EngineConfig::default()
+                },
             )
             .unwrap();
             let cid = send.client_id();
@@ -1042,9 +1105,17 @@ mod tests {
             // ends the request with FSM 0's piece still outstanding.
             send.try_submit_all(1, b"x").unwrap();
             producer(dir.path(), &egress_service_ring(1))
-                .write(MSG_V2_RESPONSE, 0, extra_client(cid, 0), &response(4096, b"stale"))
+                .write(
+                    MSG_V2_RESPONSE,
+                    0,
+                    extra_client(cid, 0),
+                    &response(4096, b"stale"),
+                )
                 .unwrap();
-            assert!(drain(&mut poll).is_empty(), "one of two pieces: not complete");
+            assert!(
+                drain(&mut poll).is_empty(),
+                "one of two pieces: not complete"
+            );
             producer(dir.path(), EGRESS_NODE)
                 .write(MSG_V2_RETRY, 0, extra_client(cid, 0), &[])
                 .unwrap();
@@ -1052,8 +1123,11 @@ mod tests {
 
             // Generation B at the SAME slot index. `+ 2^32` also repeats the
             // u32 wire seq (0) — what the old seq-keyed reset could not see.
-            let step =
-                if wrap { 1u64 << 32 } else { send.shared.table.slot_count() as u64 };
+            let step = if wrap {
+                1u64 << 32
+            } else {
+                send.shared.table.slot_count() as u64
+            };
             send.shared.table.set_next_seq_for_tests(step);
             send.try_submit_all(2, b"y").unwrap();
             let wire_seq = step as u32;
@@ -1063,15 +1137,29 @@ mod tests {
                 "both generations must land on the same slot index"
             );
             producer(dir.path(), &egress_service_ring(0))
-                .write(MSG_V2_RESPONSE, 0, extra_client(cid, wire_seq), &response(8192, b"a"))
+                .write(
+                    MSG_V2_RESPONSE,
+                    0,
+                    extra_client(cid, wire_seq),
+                    &response(8192, b"a"),
+                )
                 .unwrap();
             assert!(drain(&mut poll).is_empty());
             producer(dir.path(), &egress_service_ring(1))
-                .write(MSG_V2_RESPONSE, 0, extra_client(cid, wire_seq), &response(8192, b"b"))
+                .write(
+                    MSG_V2_RESPONSE,
+                    0,
+                    extra_client(cid, wire_seq),
+                    &response(8192, b"b"),
+                )
                 .unwrap();
             assert_eq!(
                 drain(&mut poll),
-                vec![(2, Some(8192), "responses:[(0, \"a\"), (1, \"b\")]".to_string())],
+                vec![(
+                    2,
+                    Some(8192),
+                    "responses:[(0, \"a\"), (1, \"b\")]".to_string()
+                )],
                 "wrap={wrap}: exactly this generation's two pieces, at ITS position — \
                  no stale piece, no duplicate id"
             );
@@ -1086,7 +1174,10 @@ mod tests {
     fn scratch_base() -> std::path::PathBuf {
         let exe = std::env::current_exe().expect("test binary path");
         // <target>/<profile>/deps/<bin> -> <target>/<profile>
-        exe.parent().and_then(|p| p.parent()).expect("target dir").to_path_buf()
+        exe.parent()
+            .and_then(|p| p.parent())
+            .expect("target dir")
+            .to_path_buf()
     }
 
     /// The ordinary counterpart: a write failure whose release WINS (no
@@ -1095,11 +1186,20 @@ mod tests {
     fn ordinary_write_failure_with_an_uncontested_release_still_refuses() {
         let table = SlotTable::new(8, 0);
         let stats = StatCells::default();
-        let seq = table.claim(0xBEEF, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        let seq = table
+            .claim(0xBEEF, ReqKind::Submit, u64::MAX, 0b1, false)
+            .unwrap();
 
         let result = finish_write(&table, &stats, seq, Err(RingError::Full));
-        assert!(matches!(result, Err(SubmitError::Backpressure)), "{result:?}");
+        assert!(
+            matches!(result, Err(SubmitError::Backpressure)),
+            "{result:?}"
+        );
         assert_eq!(stats.accepted.load(Ordering::Relaxed), 0);
-        assert_eq!(table.inflight(), 0, "an uncontested release still frees the slot");
+        assert_eq!(
+            table.inflight(),
+            0,
+            "an uncontested release still frees the slot"
+        );
     }
 }

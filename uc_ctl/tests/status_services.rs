@@ -63,7 +63,10 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while !node.can_serve() {
-        assert!(Instant::now() < deadline, "node never became leader/serving");
+        assert!(
+            Instant::now() < deadline,
+            "node never became leader/serving"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -83,13 +86,22 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
     s0.status.store_release(pack_service_status(0, true, 1));
 
     let out = Command::new(bin())
-        .args(["status", "--instance-dir", dir.to_str().unwrap(), "--app-id", APP])
+        .args([
+            "status",
+            "--instance-dir",
+            dir.to_str().unwrap(),
+            "--app-id",
+            APP,
+        ])
         .output()
         .expect("spawn uc2ctl");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
 
-    assert!(stdout.contains("services: declared=[0, 1] fsm_lag=8192 bytes"), "{stdout}");
+    assert!(
+        stdout.contains("services: declared=[0, 1] fsm_lag=8192 bytes"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("id=0 attached=true epoch=1 incarnation=1 applied=4096"),
         "{stdout}"
@@ -130,21 +142,39 @@ fn status_prints_fsm_lag_n_a_for_a_harness_page_with_nothing_declared() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while !node.can_serve() {
-        assert!(Instant::now() < deadline, "node never became leader/serving");
+        assert!(
+            Instant::now() < deadline,
+            "node never became leader/serving"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 
     let out = Command::new(bin())
-        .args(["status", "--instance-dir", dir.to_str().unwrap(), "--app-id", APP])
+        .args([
+            "status",
+            "--instance-dir",
+            dir.to_str().unwrap(),
+            "--app-id",
+            APP,
+        ])
         .output()
         .expect("spawn uc2ctl");
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert_eq!(out.status.code(), Some(0), "status must succeed: {stdout}");
 
-    assert!(stdout.contains("services: declared=[] fsm_lag=n/a"), "{stdout}");
-    assert!(!stdout.contains("fsm_lag=lockstep"), "a harness page has no lag policy: {stdout}");
+    assert!(
+        stdout.contains("services: declared=[] fsm_lag=n/a"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("fsm_lag=lockstep"),
+        "a harness page has no lag policy: {stdout}"
+    );
     // The header stands alone: nothing declared means no rows.
-    assert!(!stdout.contains("  id="), "no declared ids, so no service rows: {stdout}");
+    assert!(
+        !stdout.contains("  id="),
+        "no declared ids, so no service rows: {stdout}"
+    );
     // Every other section is byte-for-byte what it always was.
     assert!(stdout.contains("config: version="), "{stdout}");
     assert!(stdout.contains("role: leader="), "{stdout}");

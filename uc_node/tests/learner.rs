@@ -173,10 +173,14 @@ fn spawn_cluster_with_learner(n_voters: usize, n_learners: usize) -> Cluster {
         .expect("tempdir");
 
     let total = n_voters + n_learners;
-    let socks: Vec<UdpSocket> =
-        (0..total).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let all: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..total)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let all: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
     let members: Vec<(NodeId, SocketAddr)> = all[..n_voters].to_vec();
     let learners: Vec<(NodeId, SocketAddr)> = all[n_voters..].to_vec();
 
@@ -186,12 +190,30 @@ fn spawn_cluster_with_learner(n_voters: usize, n_learners: usize) -> Cluster {
         let instance_dir = dir.path().join(format!("n{i}"));
         let seed = seed_for(i);
         let is_learner = i >= n_voters;
-        let cfg =
-            make_config(i as NodeId, members.clone(), learners.clone(), instance_dir.clone(), seed, addr);
+        let cfg = make_config(
+            i as NodeId,
+            members.clone(),
+            learners.clone(),
+            instance_dir.clone(),
+            seed,
+            addr,
+        );
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, instance_dir, seed, is_learner, node: Some(node) });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            addr,
+            instance_dir,
+            seed,
+            is_learner,
+            node: Some(node),
+        });
     }
-    Cluster { _dir: dir, members, learners, nodes }
+    Cluster {
+        _dir: dir,
+        members,
+        learners,
+        nodes,
+    }
 }
 
 fn deadline_secs(secs: u64) -> Instant {
@@ -211,10 +233,15 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
         for h in nodes.iter().filter(|h| h.is_learner) {
-            assert!(!h.can_serve() && !h.is_leader(), "learner {} became a leader", h.id);
+            assert!(
+                !h.can_serve() && !h.is_leader(),
+                "learner {} became a leader",
+                h.id
+            );
         }
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].node.is_some() && nodes[i].can_serve()).collect();
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node.is_some() && nodes[i].can_serve())
+            .collect();
         assert!(serving.len() <= 1, "split-brain: {serving:?} all serve");
         if serving.len() == 1 {
             let i = serving[0];
@@ -230,8 +257,15 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
 fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = idxs.iter().copied().filter(|&i| nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain among {idxs:?}: {serving:?}");
+        let serving: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain among {idxs:?}: {serving:?}"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -279,9 +313,11 @@ fn learner_replicates_live_and_never_disturbs_quorum() {
     let commit0 = c.nodes[leader].commit();
     c.nodes[learner_idx].crash();
     submit_n(&c.nodes[leader], 2000, 1000);
-    await_until(20, "commit stalled after learner died (phantom quorum coupling)", || {
-        c.nodes[leader].commit() > commit0
-    });
+    await_until(
+        20,
+        "commit stalled after learner died (phantom quorum coupling)",
+        || c.nodes[leader].commit() > commit0,
+    );
 
     // Learner restarts and rejoins via ordinary replay — NO leader config change.
     let (members, learners) = (c.members.clone(), c.learners.clone());
@@ -297,8 +333,14 @@ fn learner_replicates_live_and_never_disturbs_quorum() {
     let learner_term_before = c.nodes[learner_idx].term();
     c.nodes[leader].crash();
     let new_leader = await_serving_among(&c.nodes, &voters, 30);
-    assert!(new_leader < 3, "the new leader must be a voter, got {new_leader}");
-    assert!(!c.nodes[learner_idx].is_leader(), "the learner must never lead");
+    assert!(
+        new_leader < 3,
+        "the new leader must be a voter, got {new_leader}"
+    );
+    assert!(
+        !c.nodes[learner_idx].is_leader(),
+        "the learner must never lead"
+    );
     // The learner adopts the new term for liveness but never self-incremented one
     // via candidacy: its term equals the new leader's, not beyond it.
     await_until(20, "learner never adopted the new leader's term", || {
@@ -403,21 +445,40 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     {
         let cfg_v1 = StoredConfig {
             version: 1,
-            voters: members.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            voters: members
+                .iter()
+                .map(|(id, a)| stored_member(*id, *a))
+                .collect(),
             learners: learners
                 .iter()
                 .map(|(id, a)| stored_member(*id, *a))
-                .chain(std::iter::once(stored_member(extra_learner_id, extra_learner_addr)))
+                .chain(std::iter::once(stored_member(
+                    extra_learner_id,
+                    extra_learner_addr,
+                )))
                 .collect(),
             tombstones: Vec::new(),
         };
-        let rec = ConfigRecord { position: 0, config: cfg_v1.clone(), prev_position: 0, prev: cfg_v1 };
-        NodeState::open(&v_dir.join("state")).unwrap().store_config_record(&rec).unwrap();
+        let rec = ConfigRecord {
+            position: 0,
+            config: cfg_v1.clone(),
+            prev_position: 0,
+            prev: cfg_v1,
+        };
+        NodeState::open(&v_dir.join("state"))
+            .unwrap()
+            .store_config_record(&rec)
+            .unwrap();
     }
 
-    let voter = Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    let voter =
+        Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
     await_until(30, "voter serves", || voter.can_serve());
-    assert_eq!(voter.config_version(), 1, "voter booted from the pre-seeded v1 record");
+    assert_eq!(
+        voter.config_version(),
+        1,
+        "voter booted from the pre-seeded v1 record"
+    );
 
     for i in 0u64..24000 {
         let mut p = vec![0u8; PAYLOAD];
@@ -442,10 +503,17 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     // a 128 B frame end for these 96 B payloads); a mid-frame floor would land the
     // journal-replay datagram below the adopted position and be dropped as a dup.
     let floor = (durable / 2) / 128 * 128;
-    assert!(floor > SEG, "need >1 segment below the floor (durable={durable})");
+    assert!(
+        floor > SEG,
+        "need >1 segment below the floor (durable={durable})"
+    );
     let snap_dir = v_dir.join("snapshots").join("0");
     std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::write(snap_dir.join(format!("snap-{floor}.ultsnap")), vec![0x5Au8; 4096]).unwrap();
+    std::fs::write(
+        snap_dir.join(format!("snap-{floor}.ultsnap")),
+        vec![0x5Au8; 4096],
+    )
+    .unwrap();
     // M14c: the source closure ships each declared id's own newest artifact, so
     // the test must publish the SLOT the service owns as well as the page-1
     // aggregate the node would normally derive from it (a `none_for_tests` node
@@ -453,9 +521,14 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     cnc.service_slot(0).snapshot_pos.store_release(floor);
     cnc.snapshots().service_snapshot_pos.store_release(floor);
 
-    await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
     let first_base = voter.archive_first_base();
-    assert!(first_base > 0, "the prefix must be gone so replay-from-0 is impossible");
+    assert!(
+        first_base > 0,
+        "the prefix must be gone so replay-from-0 is impossible"
+    );
     let frontier = voter.counters().append.load_acquire();
 
     // A FRESH learner joins with no prior state.
@@ -485,7 +558,8 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     // `fiat_snapshot_install_clears_config_pending_mirror`.
     let joiner_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
     assert_eq!(
-        joiner_cnc.config_pending(), 0,
+        joiner_cnc.config_pending(),
+        0,
         "a fiat install is never pending — the cnc mirror must read clear"
     );
 
@@ -494,7 +568,11 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     // (`adopt_snapshot_config`) on install completion, so its `config_version`
     // converges with the leader's PRE-SEEDED v1 (not the learner's own genesis
     // v0) — a real cross-node version bump, not a trivial 0 == 0 coincidence.
-    assert_eq!(voter.config_version(), 1, "sanity: voter still reports the pre-seeded version");
+    assert_eq!(
+        voter.config_version(),
+        1,
+        "sanity: voter still reports the pre-seeded version"
+    );
     assert_eq!(
         learner.config_version(),
         voter.config_version(),
@@ -548,18 +626,33 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     // fiat-install call site's comment); the two are not supposed to match.
     let voter_decoded =
         decode_config(&voter.snapshot_config_bytes()).expect("voter's cached config must decode");
-    let learner_decoded =
-        decode_config(&learner.snapshot_config_bytes()).expect("joiner's cached config must decode");
-    assert_eq!(learner_decoded.version, voter_decoded.version, "cache version must converge");
-    assert_eq!(learner_decoded.voters, voter_decoded.voters, "cache voters must converge");
-    assert_eq!(learner_decoded.learners, voter_decoded.learners, "cache learners must converge");
+    let learner_decoded = decode_config(&learner.snapshot_config_bytes())
+        .expect("joiner's cached config must decode");
+    assert_eq!(
+        learner_decoded.version, voter_decoded.version,
+        "cache version must converge"
+    );
+    assert_eq!(
+        learner_decoded.voters, voter_decoded.voters,
+        "cache voters must converge"
+    );
+    assert_eq!(
+        learner_decoded.learners, voter_decoded.learners,
+        "cache learners must converge"
+    );
     assert_eq!(
         learner_decoded.tombstones, voter_decoded.tombstones,
         "cache tombstones must converge"
     );
-    assert_eq!(learner_decoded.version, 1, "decoded cache must carry the installed v1 config");
+    assert_eq!(
+        learner_decoded.version, 1,
+        "decoded cache must carry the installed v1 config"
+    );
     assert!(
-        learner_decoded.learners.iter().any(|m| m.id == extra_learner_id),
+        learner_decoded
+            .learners
+            .iter()
+            .any(|m| m.id == extra_learner_id),
         "decoded cache must contain the extra learner from the installed config"
     );
 
@@ -579,7 +672,9 @@ struct SumSm {
 impl uc_service::RawStateMachine for SumSm {
     fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
         if cmd.len() >= 8 {
-            self.total = self.total.wrapping_add(u64::from_le_bytes(cmd[..8].try_into().unwrap()));
+            self.total = self
+                .total
+                .wrapping_add(u64::from_le_bytes(cmd[..8].try_into().unwrap()));
         }
         self.last = Some(position);
         out.extend_from_slice(&self.total.to_le_bytes());
@@ -625,7 +720,9 @@ impl uc_service::SnapshotStateMachine for SumSm {
 fn start_sum_service(dir: &Path, app: &str, id: u8) -> uc_service::Service<SumSm> {
     let cfg = uc_service::ServiceConfig::new(dir, app)
         .service_id(id)
-        .snapshot_policy(uc_service::SnapshotPolicy { interval_bytes: 256 * 1024 });
+        .snapshot_policy(uc_service::SnapshotPolicy {
+            interval_bytes: 256 * 1024,
+        });
     uc_service::ServiceBuilder::new(cfg, SumSm::default())
         .start_with_snapshots()
         .expect("service start")
@@ -675,7 +772,8 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     };
 
     let v_dir = dir.path().join("v0");
-    let voter = Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    let voter =
+        Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
     let _v0 = start_sum_service(&v_dir, app, 0);
     let _v1 = start_sum_service(&v_dir, app, 1);
     await_until(30, "voter serves", || voter.can_serve());
@@ -704,7 +802,9 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         v_cnc.service_slot(0).snapshot_pos.load_acquire() > SEG
             && v_cnc.service_slot(1).snapshot_pos.load_acquire() > SEG
     });
-    await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
     let first_base = voter.archive_first_base();
     let frontier = voter.counters().append.load_acquire();
     let commit = voter.counters().commit.load_acquire();
@@ -758,7 +858,10 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
                     .and_then(|pos| pos.parse::<u64>().ok())
             })
             .collect();
-        assert!(!installed.is_empty(), "learner {d:?} holds no installed artifact");
+        assert!(
+            !installed.is_empty(),
+            "learner {d:?} holds no installed artifact"
+        );
         let shipped = v_cnc.service_slot(id as usize).snapshot_pos.load_acquire();
         assert!(
             installed.contains(&shipped),
@@ -770,10 +873,14 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     // And both learner FSMs reached the leader's commit — each installed its own
     // artifact and tail-replayed the retained window.
     let l_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
-    await_until(60, "both learner FSMs applied to the leader's commit", || {
-        l_cnc.service_slot(0).applied.load_acquire() >= commit
-            && l_cnc.service_slot(1).applied.load_acquire() >= commit
-    });
+    await_until(
+        60,
+        "both learner FSMs applied to the leader's commit",
+        || {
+            l_cnc.service_slot(0).applied.load_acquire() >= commit
+                && l_cnc.service_slot(1).applied.load_acquire() >= commit
+        },
+    );
     assert_eq!(
         learner.snapshot_session_refusals(),
         (0, 0),
@@ -796,7 +903,12 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     // artifacts on disk at the VOTER's positions is what says the session
     // delivered this id's artifact rather than something else producing a file.
     assert!(
-        voter.observability().sender.snap_sessions.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        voter
+            .observability()
+            .sender
+            .snap_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 1,
         "the artifacts must have come from a snapshot session, not a log replay"
     );
     // A cheap guard, NOT a proof of anything: on a converging run neither of
@@ -805,7 +917,10 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     // transfer plane hit an I/O error or a timeout", nothing more.
     assert_eq!(
         (
-            learner.crypto_stats().snap_intake_abandoned.load(std::sync::atomic::Ordering::Relaxed),
+            learner
+                .crypto_stats()
+                .snap_intake_abandoned
+                .load(std::sync::atomic::Ordering::Relaxed),
             learner
                 .crypto_stats()
                 .snap_intake_io_failures
@@ -880,7 +995,12 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     // it sends carries `services_declared = 0b1`.
     let v_dir = dir.path().join("v0");
     let voter = Node::start_with_socket(
-        cfg(0, v_addr, v_dir.clone(), uc_node::ServicesConfig::none_for_tests()),
+        cfg(
+            0,
+            v_addr,
+            v_dir.clone(),
+            uc_node::ServicesConfig::none_for_tests(),
+        ),
         v_sock,
     )
     .expect("start voter");
@@ -907,18 +1027,32 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
     let durable = voter.counters().durable.load_acquire();
     let floor = (durable / 2) / 128 * 128;
-    assert!(floor > SEG, "need >1 segment below the floor (durable={durable})");
+    assert!(
+        floor > SEG,
+        "need >1 segment below the floor (durable={durable})"
+    );
     let snap_dir = v_dir.join("snapshots").join("0");
     std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::write(snap_dir.join(format!("snap-{floor}.ultsnap")), vec![0x5Au8; 4096]).unwrap();
+    std::fs::write(
+        snap_dir.join(format!("snap-{floor}.ultsnap")),
+        vec![0x5Au8; 4096],
+    )
+    .unwrap();
     cnc.service_slot(0).snapshot_pos.store_release(floor);
     cnc.snapshots().service_snapshot_pos.store_release(floor);
-    await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
 
     // The joiner declares {0, 1} — a genuine `[services] ids` mismatch.
     let l_dir = dir.path().join("l1");
     let learner = Node::start_with_socket(
-        cfg(1, l_addr, l_dir.clone(), uc_node::ServicesConfig::from_ids(&[0, 1], None).unwrap()),
+        cfg(
+            1,
+            l_addr,
+            l_dir.clone(),
+            uc_node::ServicesConfig::from_ids(&[0, 1], None).unwrap(),
+        ),
         l_sock,
     )
     .expect("start learner");
@@ -941,9 +1075,14 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     // half was dead and could only have weakened the check (M14c2 T10b). What
     // has to hold is that the directory is EMPTY.
     let refused_dir = l_dir.join("snapshots").join("1");
-    assert!(refused_dir.is_dir(), "the joiner declares id 1, so its snapshot dir exists");
+    assert!(
+        refused_dir.is_dir(),
+        "the joiner declares id 1, so its snapshot dir exists"
+    );
     assert_eq!(
-        std::fs::read_dir(&refused_dir).expect("read the joiner's snapshot dir").count(),
+        std::fs::read_dir(&refused_dir)
+            .expect("read the joiner's snapshot dir")
+            .count(),
         0,
         "a refused session must leave no artifact behind"
     );
@@ -1006,7 +1145,13 @@ fn learner_alone_cannot_supply_a_voter_quorum() {
         std::thread::yield_now();
     }
     assert!(
-        c.nodes[learner_idx].node.as_ref().unwrap().counters().durable.load_acquire()
+        c.nodes[learner_idx]
+            .node
+            .as_ref()
+            .unwrap()
+            .counters()
+            .durable
+            .load_acquire()
             >= c.nodes[leader].commit(),
         "the learner should still be replicating bytes it just cannot vote on"
     );

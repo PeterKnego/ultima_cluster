@@ -152,9 +152,15 @@ mod v2_tests {
         assert_eq!(sm.query(()), None);
         // Write, then a matching CAS, keyed on ascending byte positions.
         assert_eq!(sm.apply(128, Cmd::Write(7)), CmdResp::WriteAck);
-        assert_eq!(sm.apply(256, Cmd::Cas { old: 7, new: 9 }), CmdResp::CasResult(true));
+        assert_eq!(
+            sm.apply(256, Cmd::Cas { old: 7, new: 9 }),
+            CmdResp::CasResult(true)
+        );
         // A non-matching CAS is a no-op with a `false` result.
-        assert_eq!(sm.apply(384, Cmd::Cas { old: 7, new: 1 }), CmdResp::CasResult(false));
+        assert_eq!(
+            sm.apply(384, Cmd::Cas { old: 7, new: 1 }),
+            CmdResp::CasResult(false)
+        );
         assert_eq!(sm.query(()), Some(9));
         assert_eq!(sm.last_applied(), Some(384));
     }
@@ -174,13 +180,19 @@ mod v2_tests {
 
         let mut restored = RegisterSm::default();
         assert_eq!(
-            restored.install_snapshot(4096, &mut bytes.as_slice()).unwrap(),
+            restored
+                .install_snapshot(4096, &mut bytes.as_slice())
+                .unwrap(),
             4096
         );
         assert_eq!(restored.query(()), Some(42));
         assert_eq!(restored.last_applied(), Some(4096));
 
         // A mis-tagged install (wrong artifact position) is refused.
-        assert!(restored.install_snapshot(99, &mut bytes.as_slice()).is_err());
+        assert!(
+            restored
+                .install_snapshot(99, &mut bytes.as_slice())
+                .is_err()
+        );
     }
 }

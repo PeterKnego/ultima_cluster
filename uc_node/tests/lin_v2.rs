@@ -27,12 +27,14 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use lincheck_v2::{ClusterCfg, InstallCounting, LinClusterV2, join_workers, serialize, spawn_workers};
-use uc_net::fault::FaultConfig;
-use uc_node::PurgePolicy;
+use lincheck_v2::{
+    ClusterCfg, InstallCounting, LinClusterV2, join_workers, serialize, spawn_workers,
+};
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History};
 use uc_lincheck::register::{Cmd, CmdResp};
+use uc_net::fault::FaultConfig;
+use uc_node::PurgePolicy;
 
 /// A tempdir on the ext4 target volume (64 MiB journal segments would blow the
 /// tmpfs `/tmp` quota — see the harness module docs).
@@ -76,9 +78,14 @@ fn smoke_3node_write_then_read() {
         assert_eq!(got, Some(v), "read after write {v}");
     }
     // A CAS round-trips through the same path.
-    let cas: CmdResp = client.submit(&Cmd::Cas { old: 5, new: 9 }).expect("submit cas");
+    let cas: CmdResp = client
+        .submit(&Cmd::Cas { old: 5, new: 9 })
+        .expect("submit cas");
     assert_eq!(cas, CmdResp::CasResult(true));
-    assert_eq!(client.query_linearizable::<(), Option<u64>>(&()).unwrap(), Some(9));
+    assert_eq!(
+        client.query_linearizable::<(), Option<u64>>(&()).unwrap(),
+        Some(9)
+    );
 
     client.shutdown();
     cluster.stop(); // node-first-then-service per slot — must return, not hang.
@@ -106,8 +113,10 @@ fn linearizable_under_failover_v2() {
     // than hanging the suite.
     const BUDGET: Duration = Duration::from_secs(115);
 
-    let seed: u64 =
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
 
     let _g = serialize();
     let dir = tempdir();
@@ -119,7 +128,9 @@ fn linearizable_under_failover_v2() {
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
 
-    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+    let handles = spawn_workers(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
 
     // Fault scheduler (this thread owns `&mut cluster`): one quorum-preserving
     // fault at a time, waiting for recovery between faults, until enough ops
@@ -145,7 +156,10 @@ fn linearizable_under_failover_v2() {
     join_workers(handles);
     cluster.stop();
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2] seed={seed} faults={faults} ops={} ok={ok} elapsed={:.1}s — checking",
@@ -207,7 +221,10 @@ fn linearizable_under_purge_and_snapshot_churn() {
     // falls below the snapshot floor — the non-vacuity assert then fires as
     // "vacuous" even though nothing is wrong. Same correctness bar, more room.
     let budget = Duration::from_secs(
-        std::env::var("UC2_LIN_BUDGET_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(115),
+        std::env::var("UC2_LIN_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(115),
     );
 
     // Purge posture: 16 KiB journal segments (smaller than the snapshot interval,
@@ -224,12 +241,15 @@ fn linearizable_under_purge_and_snapshot_churn() {
         ..ClusterCfg::default()
     };
 
-    let seed: u64 =
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     cluster.await_single_serving(30);
 
     let dirs = Arc::new(cluster.dirs());
@@ -237,7 +257,9 @@ fn linearizable_under_purge_and_snapshot_churn() {
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
 
-    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+    let handles = spawn_workers(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
 
     // Fault scheduler: one quorum-preserving fault at a time, 1-in-3 —
     //   0: leader node kill+restart (fresh empty service, log-replay reconstruct),
@@ -282,7 +304,10 @@ fn linearizable_under_purge_and_snapshot_churn() {
     join_workers(handles);
     cluster.stop();
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2 purge] seed={seed} faults={faults} (follower-svc={follower_svc_faults}) \
@@ -314,7 +339,9 @@ fn linearizable_under_purge_and_snapshot_churn() {
             panic!("LINEARIZABILITY VIOLATION under purge (seed={seed}); history dumped");
         }
         Verdict::Inconclusive => {
-            panic!("checker Inconclusive under purge (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+            panic!(
+                "checker Inconclusive under purge (seed={seed}); raise THROTTLE / lower TARGET_OPS"
+            )
         }
     }
 }
@@ -392,14 +419,20 @@ fn linearizable_under_reconfig_churn() {
     // join + cluster stop) has room before the hard assert fires.
     let budget = Duration::from_secs(budget_secs.saturating_sub(5));
 
-    let ccfg = ClusterCfg { spare_node: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        spare_node: true,
+        ..ClusterCfg::default()
+    };
 
-    let seed: u64 =
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     cluster.await_single_serving(30);
 
     let dirs = Arc::new(cluster.dirs());
@@ -407,7 +440,9 @@ fn linearizable_under_reconfig_churn() {
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
 
-    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+    let handles = spawn_workers(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
 
     // Fault scheduler: one quorum-preserving fault at a time, 1-in-4 —
     //   0: leader node kill+restart,
@@ -488,7 +523,10 @@ fn linearizable_under_reconfig_churn() {
     join_workers(handles);
     cluster.stop();
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2 reconfig] seed={seed} faults={faults} (config-arm picks={config_arm_picks}) \
@@ -520,7 +558,9 @@ fn linearizable_under_reconfig_churn() {
             panic!("LINEARIZABILITY VIOLATION under reconfig churn (seed={seed}); history dumped");
         }
         Verdict::Inconclusive => {
-            panic!("checker Inconclusive under reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+            panic!(
+                "checker Inconclusive under reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS"
+            )
         }
     }
 }
@@ -546,10 +586,15 @@ fn linearizable_under_failover_with_crypto() {
     const FAULT_PERIOD: Duration = Duration::from_secs(1);
     const BUDGET: Duration = Duration::from_secs(115);
 
-    let seed: u64 =
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
 
-    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        crypto: true,
+        ..ClusterCfg::default()
+    };
 
     let _g = serialize();
     let dir = tempdir();
@@ -567,7 +612,9 @@ fn linearizable_under_failover_with_crypto() {
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
 
-    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+    let handles = spawn_workers(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
 
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
     let mut faults = 0u32;
@@ -590,7 +637,10 @@ fn linearizable_under_failover_with_crypto() {
     join_workers(handles);
     cluster.stop();
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2 crypto] seed={seed} faults={faults} ops={} ok={ok} elapsed={:.1}s — checking",
@@ -615,7 +665,9 @@ fn linearizable_under_failover_with_crypto() {
             panic!("LINEARIZABILITY VIOLATION under crypto+failover (seed={seed}); history dumped");
         }
         Verdict::Inconclusive => {
-            panic!("checker Inconclusive under crypto+failover (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+            panic!(
+                "checker Inconclusive under crypto+failover (seed={seed}); raise THROTTLE / lower TARGET_OPS"
+            )
         }
     }
 }
@@ -629,7 +681,10 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
     const THROTTLE: Duration = Duration::from_millis(20);
     const FAULT_PERIOD: Duration = Duration::from_millis(1200);
     let budget = Duration::from_secs(
-        std::env::var("UC2_LIN_BUDGET_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(115),
+        std::env::var("UC2_LIN_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(115),
     );
 
     let ccfg = ClusterCfg {
@@ -641,12 +696,15 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
         ..ClusterCfg::default()
     };
 
-    let seed: u64 =
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     let leader0 = cluster.await_single_serving(30);
     assert!(
         cluster.crypto_epoch_of(leader0).is_some(),
@@ -659,7 +717,9 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
 
-    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+    let handles = spawn_workers(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
 
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
     let mut faults = 0u32;
@@ -690,7 +750,10 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
     join_workers(handles);
     cluster.stop();
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2 crypto+purge] seed={seed} faults={faults} (follower-svc={follower_svc_faults}) \
@@ -722,7 +785,9 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
             panic!("LINEARIZABILITY VIOLATION under crypto+purge (seed={seed}); history dumped");
         }
         Verdict::Inconclusive => {
-            panic!("checker Inconclusive under crypto+purge (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+            panic!(
+                "checker Inconclusive under crypto+purge (seed={seed}); raise THROTTLE / lower TARGET_OPS"
+            )
         }
     }
 }
@@ -745,14 +810,21 @@ fn linearizable_under_reconfig_churn_with_crypto() {
         .unwrap_or(120);
     let budget = Duration::from_secs(budget_secs.saturating_sub(5));
 
-    let ccfg = ClusterCfg { spare_node: true, crypto: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        spare_node: true,
+        crypto: true,
+        ..ClusterCfg::default()
+    };
 
-    let seed: u64 =
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     let leader0 = cluster.await_single_serving(30);
     assert!(
         cluster.crypto_epoch_of(leader0).is_some(),
@@ -765,7 +837,9 @@ fn linearizable_under_reconfig_churn_with_crypto() {
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
 
-    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+    let handles = spawn_workers(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
 
     const MIN_CONFIG_OPS: u32 = 4;
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
@@ -811,7 +885,10 @@ fn linearizable_under_reconfig_churn_with_crypto() {
     join_workers(handles);
     cluster.stop();
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2 crypto+reconfig] seed={seed} faults={faults} (config-arm picks={config_arm_picks}) \
@@ -840,10 +917,14 @@ fn linearizable_under_reconfig_churn_with_crypto() {
         Verdict::Linearizable => {}
         Verdict::Violation => {
             dump_history(&entries, seed);
-            panic!("LINEARIZABILITY VIOLATION under crypto+reconfig churn (seed={seed}); history dumped");
+            panic!(
+                "LINEARIZABILITY VIOLATION under crypto+reconfig churn (seed={seed}); history dumped"
+            );
         }
         Verdict::Inconclusive => {
-            panic!("checker Inconclusive under crypto+reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+            panic!(
+                "checker Inconclusive under crypto+reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS"
+            )
         }
     }
 }
@@ -857,18 +938,25 @@ fn two_fsm_smoke() {
     let _g = serialize();
     let dir = tempdir();
     let ccfg = ClusterCfg {
-        services: lincheck_v2::FsmSet::Two { lag: uc_node::FsmLag::Bounded(64 * 1024) },
+        services: lincheck_v2::FsmSet::Two {
+            lag: uc_node::FsmLag::Bounded(64 * 1024),
+        },
         ..ClusterCfg::default()
     };
-    let cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     let leader = cluster.await_single_serving(30);
     let client = cluster.client(leader);
     let resps: Vec<(u8, CmdResp)> = client.submit_all(&Cmd::Write(7)).expect("submit_all");
     assert_eq!(resps.len(), 2, "{resps:?}");
     assert_eq!(resps[0].1, resps[1].1, "replication-equivalence: {resps:?}");
-    let r2: Vec<(u8, CmdResp)> =
-        client.submit_all(&Cmd::Cas { old: 7, new: 8 }).expect("submit_all cas");
-    assert!(r2.iter().all(|(_, r)| *r == CmdResp::CasResult(true)), "{r2:?}");
+    let r2: Vec<(u8, CmdResp)> = client
+        .submit_all(&Cmd::Cas { old: 7, new: 8 })
+        .expect("submit_all cas");
+    assert!(
+        r2.iter().all(|(_, r)| *r == CmdResp::CasResult(true)),
+        "{r2:?}"
+    );
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline
         && (cluster.service_applied(leader, 0) == 0 || cluster.service_applied(leader, 1) == 0)
@@ -890,7 +978,10 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
     const THROTTLE: Duration = Duration::from_millis(20);
     const FAULT_PERIOD: Duration = Duration::from_millis(1200);
     let budget = Duration::from_secs(
-        std::env::var("UC2_LIN_BUDGET_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(115),
+        std::env::var("UC2_LIN_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(115),
     );
     let ccfg = ClusterCfg {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
@@ -901,7 +992,8 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
     };
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     cluster.await_single_serving(30);
     let dirs = Arc::new(cluster.dirs());
     let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
@@ -947,7 +1039,10 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
         );
     }
     let elapsed = start.elapsed();
-    let (ok0, ok1) = (History::ok_count(&h0.snapshot()), History::ok_count(&h1.snapshot()));
+    let (ok0, ok1) = (
+        History::ok_count(&h0.snapshot()),
+        History::ok_count(&h1.snapshot()),
+    );
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
     cluster.stop();
@@ -962,7 +1057,9 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
         "[{label}] replication-equivalence violated"
     );
     for (id, h) in [(0u8, h0), (1u8, h1)] {
-        let entries = Arc::try_unwrap(h).map(History::into_entries).unwrap_or_else(|a| a.snapshot());
+        let entries = Arc::try_unwrap(h)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot());
         match check_register(&entries) {
             Verdict::Linearizable => {}
             v => panic!("[{label}] FSM {id}: {v:?} (seed={seed})"),
@@ -975,7 +1072,10 @@ fn two_fsm_bounded() {
     run_two_fsm(
         "two_fsm_bounded",
         uc_node::FsmLag::Bounded(64 * 1024),
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x14c2),
+        std::env::var("LIN_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x14c2),
     );
 }
 #[test]
@@ -983,7 +1083,10 @@ fn two_fsm_lockstep() {
     run_two_fsm(
         "two_fsm_lockstep",
         uc_node::FsmLag::Lockstep,
-        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x14c3),
+        std::env::var("LIN_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x14c3),
     );
 }
 
@@ -1000,24 +1103,41 @@ fn two_fsm_oracle_bites() {
     let _g = serialize();
     let dir = tempdir();
     let ccfg = ClusterCfg {
-        services: lincheck_v2::FsmSet::Two { lag: uc_node::FsmLag::Bounded(64 * 1024) },
+        services: lincheck_v2::FsmSet::Two {
+            lag: uc_node::FsmLag::Bounded(64 * 1024),
+        },
         ..ClusterCfg::default()
     };
-    let cluster: LinClusterV2<uc_lincheck::register::RegisterSm, lincheck_v2::Corrupt<uc_lincheck::register::RegisterSm>> =
-        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let cluster: LinClusterV2<
+        uc_lincheck::register::RegisterSm,
+        lincheck_v2::Corrupt<uc_lincheck::register::RegisterSm>,
+    > = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     let _leader = cluster.await_single_serving(30);
     let dirs = Arc::new(cluster.dirs());
     let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
     let equiv = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
-    let handles =
-        lincheck_v2::spawn_workers2(&dirs, &h0, &h1, &equiv, &stop, &last_seen, 0x14c4, Duration::ZERO, 2);
+    let handles = lincheck_v2::spawn_workers2(
+        &dirs,
+        &h0,
+        &h1,
+        &equiv,
+        &stop,
+        &last_seen,
+        0x14c4,
+        Duration::ZERO,
+        2,
+    );
     std::thread::sleep(Duration::from_secs(SECS));
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
     cluster.stop();
-    assert_eq!(equiv.load(Ordering::Relaxed), 0, "[two_fsm_oracle_bites] replication-equivalence violated");
+    assert_eq!(
+        equiv.load(Ordering::Relaxed),
+        0,
+        "[two_fsm_oracle_bites] replication-equivalence violated"
+    );
 }
 
 /// M14c2 T4: the slow-FSM oracle. FSM 1 is `Slow<RegisterSm, 200>` (200 µs per
@@ -1047,25 +1167,45 @@ fn run_two_fsm_slow(label: &str, lag: uc_node::FsmLag, seed: u64) {
     const N_WORKERS: u32 = 4;
     let _g = serialize();
     let dir = tempdir();
-    let ccfg = ClusterCfg { services: lincheck_v2::FsmSet::Two { lag }, ..ClusterCfg::default() };
-    let cluster: LinClusterV2<uc_lincheck::register::RegisterSm, lincheck_v2::Slow<uc_lincheck::register::RegisterSm, 200>> =
-        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let ccfg = ClusterCfg {
+        services: lincheck_v2::FsmSet::Two { lag },
+        ..ClusterCfg::default()
+    };
+    let cluster: LinClusterV2<
+        uc_lincheck::register::RegisterSm,
+        lincheck_v2::Slow<uc_lincheck::register::RegisterSm, 200>,
+    > = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     let leader = cluster.await_single_serving(30);
     let dirs = Arc::new(cluster.dirs());
     let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
     let equiv = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let last_seen = Arc::new(AtomicU64::new(0));
-    let handles = lincheck_v2::spawn_workers2(&dirs, &h0, &h1, &equiv, &stop, &last_seen, seed, Duration::ZERO, N_WORKERS);
+    let handles = lincheck_v2::spawn_workers2(
+        &dirs,
+        &h0,
+        &h1,
+        &equiv,
+        &stop,
+        &last_seen,
+        seed,
+        Duration::ZERO,
+        N_WORKERS,
+    );
     // sampler: (t, applied_0, applied_1) on the leader every 50 ms; no faults in this run
     let samples = {
         let stop = Arc::clone(&stop);
         let dir0 = dirs[leader].clone();
         std::thread::spawn(move || {
-            let cnc = uc_log::cnc::CncPage::open_file(&dir0.join("cnc2.dat"), lincheck_v2::APP).expect("cnc");
+            let cnc = uc_log::cnc::CncPage::open_file(&dir0.join("cnc2.dat"), lincheck_v2::APP)
+                .expect("cnc");
             let mut v = Vec::new();
             while !stop.load(Ordering::Relaxed) {
-                v.push((Instant::now(), cnc.service_slot(0).applied.load_acquire(), cnc.service_slot(1).applied.load_acquire()));
+                v.push((
+                    Instant::now(),
+                    cnc.service_slot(0).applied.load_acquire(),
+                    cnc.service_slot(1).applied.load_acquire(),
+                ));
                 std::thread::sleep(Duration::from_millis(50));
             }
             v
@@ -1076,11 +1216,23 @@ fn run_two_fsm_slow(label: &str, lag: uc_node::FsmLag, seed: u64) {
     join_workers(handles);
     let samples = samples.join().unwrap();
     cluster.stop();
-    assert_eq!(equiv.load(Ordering::Relaxed), 0, "[{label}] replication-equivalence violated");
+    assert_eq!(
+        equiv.load(Ordering::Relaxed),
+        0,
+        "[{label}] replication-equivalence violated"
+    );
     // (i) the bound at every sample
-    let bound = match lag { uc_node::FsmLag::Bounded(b) => b, uc_node::FsmLag::Lockstep => 288 };
+    let bound = match lag {
+        uc_node::FsmLag::Bounded(b) => b,
+        uc_node::FsmLag::Lockstep => 288,
+    };
     for (t, a0, a1) in &samples {
-        assert!(a0.saturating_sub(*a1) <= bound, "[{label}] lag {} > bound {bound} at {:?}", a0.saturating_sub(*a1), t);
+        assert!(
+            a0.saturating_sub(*a1) <= bound,
+            "[{label}] lag {} > bound {bound} at {:?}",
+            a0.saturating_sub(*a1),
+            t
+        );
     }
     // (ii) convergence over the second half (ruling 2026-08-30)
     let half = samples.len() / 2;
@@ -1088,11 +1240,21 @@ fn run_two_fsm_slow(label: &str, lag: uc_node::FsmLag, seed: u64) {
     let (t1, a0_1, a1_1) = *samples.last().unwrap();
     let dt = (t1 - t0).as_secs_f64();
     let (r0, r1) = ((a0_1 - a0_0) as f64 / dt, (a1_1 - a1_0) as f64 / dt);
-    assert!(r1 > 0.0, "[{label}] FSM 1 made no progress in the second half");
+    assert!(
+        r1 > 0.0,
+        "[{label}] FSM 1 made no progress in the second half"
+    );
     let ratio = r0 / r1;
-    assert!((0.9..=1.1).contains(&ratio), "[{label}] FSM 0 rate {r0:.0} B/s vs FSM 1 {r1:.0} B/s: ratio {ratio:.3} outside [0.9, 1.1]");
+    assert!(
+        (0.9..=1.1).contains(&ratio),
+        "[{label}] FSM 0 rate {r0:.0} B/s vs FSM 1 {r1:.0} B/s: ratio {ratio:.3} outside [0.9, 1.1]"
+    );
     // What the run actually exercised: the largest separation ever sampled, against the bound.
-    let max_lag = samples.iter().map(|(_, a0, a1)| a0.saturating_sub(*a1)).max().unwrap_or(0);
+    let max_lag = samples
+        .iter()
+        .map(|(_, a0, a1)| a0.saturating_sub(*a1))
+        .max()
+        .unwrap_or(0);
     eprintln!(
         "[{label}] samples={} rate0={r0:.0} rate1={r1:.0} ratio={ratio:.3} max_lag={max_lag} bound={bound} (~{:.1} frames at 52 B)",
         samples.len(),
@@ -1100,8 +1262,14 @@ fn run_two_fsm_slow(label: &str, lag: uc_node::FsmLag, seed: u64) {
     );
 }
 
-#[test] fn two_fsm_slow()          { run_two_fsm_slow("two_fsm_slow",          uc_node::FsmLag::Bounded(64 * 1024), 0x51); }
-#[test] fn two_fsm_slow_lockstep() { run_two_fsm_slow("two_fsm_slow_lockstep", uc_node::FsmLag::Lockstep,           0x52); }
+#[test]
+fn two_fsm_slow() {
+    run_two_fsm_slow("two_fsm_slow", uc_node::FsmLag::Bounded(64 * 1024), 0x51);
+}
+#[test]
+fn two_fsm_slow_lockstep() {
+    run_two_fsm_slow("two_fsm_slow_lockstep", uc_node::FsmLag::Lockstep, 0x52);
+}
 
 // ------------------------------------------- M14c2 T11: snapshot needs purge
 
@@ -1193,7 +1361,11 @@ fn restart_installs(purge: bool) -> u32 {
     // SOME path ran (fix round 1: `INSTALLS == 0` alone is also consistent with
     // "no reconstruction happened at all" — this is the gap guard's actual point).
     let got: Option<u64> = client.query_linearizable(&()).unwrap();
-    assert_eq!(got, Some(LAST_VALUE), "[purge={purge}] rebuilt SM must hold the last write");
+    assert_eq!(
+        got,
+        Some(LAST_VALUE),
+        "[purge={purge}] rebuilt SM must hold the last write"
+    );
     eprintln!("[t11 purge={purge}] phase: query_linearizable returned");
     cluster.stop();
     eprintln!("[t11 purge={purge}] phase: stop done");
@@ -1207,5 +1379,9 @@ fn snapshot_restart_installs_only_with_purge() {
         0,
         "purge off: reconstruction must replay, never install (replay.rs gap guard)"
     );
-    assert_eq!(restart_installs(true), 1, "purge on: the newest artifact is installed exactly once");
+    assert_eq!(
+        restart_installs(true),
+        1,
+        "purge on: the newest artifact is installed exactly once"
+    );
 }

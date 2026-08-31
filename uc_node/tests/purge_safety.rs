@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
-use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
+use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
 /// Tiny journal segments so a handful of KiB of frames rolls many segment files
 /// and `purge_below` has non-active segments to drop.
@@ -105,8 +105,11 @@ fn drive_and_quiesce(node: &Node, n: usize) {
     let mut last = u64::MAX;
     wait_until("log quiescent", || {
         let c = node.counters();
-        let (a, cm, d) =
-            (c.append.load_acquire(), c.commit.load_acquire(), c.durable.load_acquire());
+        let (a, cm, d) = (
+            c.append.load_acquire(),
+            c.commit.load_acquire(),
+            c.durable.load_acquire(),
+        );
         let quiescent = a >= expected_append && a == cm && cm == d && a == last;
         last = a;
         quiescent
@@ -122,7 +125,12 @@ fn marker_persists_and_purge_advances_only_below_it() {
     let dir = root.path();
     let app = "purge1";
 
-    let node = Node::start(config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 })).unwrap();
+    let node = Node::start(config(
+        dir,
+        app,
+        PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+    ))
+    .unwrap();
     wait_until("can_serve", || node.can_serve());
     drive_and_quiesce(&node, 6000);
 
@@ -131,7 +139,11 @@ fn marker_persists_and_purge_advances_only_below_it() {
     // No service snapshot published yet -> the floor is 0 and purge never fires,
     // no matter how much log exists (purge is gated on the marker).
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(node.archive_first_base(), 0, "purge must stay gated on the marker");
+    assert_eq!(
+        node.archive_first_base(),
+        0,
+        "purge must stay gated on the marker"
+    );
     assert_eq!(
         cnc.snapshots().node_snapshot_floor.load_acquire(),
         0,
@@ -143,13 +155,19 @@ fn marker_persists_and_purge_advances_only_below_it() {
     // it drops whole segment files. `s <= durable` by construction.
     let durable = cnc.counters().durable.load_acquire();
     let s = durable / 2;
-    assert!(s > SEG_BYTES, "test setup: need >1 segment below the marker");
+    assert!(
+        s > SEG_BYTES,
+        "test setup: need >1 segment below the marker"
+    );
     cnc.snapshots().service_snapshot_pos.store_release(s);
 
     // The node validates (`<= durable`), durably persists the floor, mirrors it,
     // and commands the purge.
     wait_until("purge advanced the floor", || node.archive_first_base() > 0);
-    assert!(node.archive_first_base() <= s, "never purged at/above the snapshot floor");
+    assert!(
+        node.archive_first_base() <= s,
+        "never purged at/above the snapshot floor"
+    );
     assert_eq!(
         cnc.snapshots().node_snapshot_floor.load_acquire(),
         s,
@@ -160,7 +178,12 @@ fn marker_persists_and_purge_advances_only_below_it() {
     // 0, but boot re-seeds the mirror + the persister's shadow from the durable
     // value, so the floor never regresses (the marker-clobber lesson).
     node.stop();
-    let node = Node::start(config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 })).unwrap();
+    let node = Node::start(config(
+        dir,
+        app,
+        PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+    ))
+    .unwrap();
     wait_until("can_serve after restart", || node.can_serve());
     let cnc2 = open_cnc(dir, app);
     assert_eq!(
@@ -181,14 +204,21 @@ fn snapshot_pos_above_durable_is_never_persisted() {
     let dir = root.path();
     let app = "purge2";
 
-    let node = Node::start(config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 })).unwrap();
+    let node = Node::start(config(
+        dir,
+        app,
+        PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+    ))
+    .unwrap();
     wait_until("can_serve", || node.can_serve());
     drive_and_quiesce(&node, 2000);
 
     let cnc = open_cnc(dir, app);
     let durable = cnc.counters().durable.load_acquire();
     // Publish a position far beyond durable — an insane/torn value.
-    cnc.snapshots().service_snapshot_pos.store_release(durable + 1_000_000);
+    cnc.snapshots()
+        .service_snapshot_pos
+        .store_release(durable + 1_000_000);
 
     // Give the consensus loop many duty cycles to (not) act on it.
     std::thread::sleep(Duration::from_millis(300));

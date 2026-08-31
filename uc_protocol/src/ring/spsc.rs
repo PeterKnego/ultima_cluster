@@ -620,7 +620,10 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(rec.is_none());
         // Busy mode must NOT have parked up to PARK_CEIL (2ms); a chunk is sub-ms.
-        assert!(elapsed < PARK_CEIL, "busy mode appears to have parked: {elapsed:?}");
+        assert!(
+            elapsed < PARK_CEIL,
+            "busy mode appears to have parked: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -631,7 +634,10 @@ mod tests {
         consumer.set_spin_budget(u32::MAX);
         producer.try_write(7, 0, [0; 8], b"hi").expect("write");
         let mut buf = Vec::new();
-        let rec = consumer.read_or_park(&mut buf).expect("read").expect("some");
+        let rec = consumer
+            .read_or_park(&mut buf)
+            .expect("read")
+            .expect("some");
         assert_eq!(rec.msg_type, 7);
         assert_eq!(&buf[..], b"hi");
     }
@@ -652,7 +658,10 @@ mod tests {
         );
         // published -> read returns it
         producer.try_write(9, 0, [0; 8], b"x").expect("write");
-        let rec = consumer.read_or_park(&mut buf).expect("read").expect("some");
+        let rec = consumer
+            .read_or_park(&mut buf)
+            .expect("read")
+            .expect("some");
         assert_eq!(rec.msg_type, 9);
     }
 }

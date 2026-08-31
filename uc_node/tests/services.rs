@@ -70,15 +70,36 @@ pub fn ids(ids: &[u8], lag: Option<FsmLag>) -> ServicesConfig {
 fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 2], Some(FsmLag::Bounded(64 << 10))))).unwrap();
+    let node = Node::start(config(
+        dir.path(),
+        ids(&[0, 2], Some(FsmLag::Bounded(64 << 10))),
+    ))
+    .unwrap();
     wait_until("serving", || node.can_serve());
     for id in [0u8, 2] {
-        assert!(dir.path().join(format!("svc_query.{id}.ring")).is_file(), "svc_query.{id}.ring");
-        assert!(dir.path().join(format!("egress_service.{id}.broadcast")).is_file(), "egress {id}");
-        assert!(dir.path().join("snapshots").join(id.to_string()).is_dir(), "snapshots/{id}");
+        assert!(
+            dir.path().join(format!("svc_query.{id}.ring")).is_file(),
+            "svc_query.{id}.ring"
+        );
+        assert!(
+            dir.path()
+                .join(format!("egress_service.{id}.broadcast"))
+                .is_file(),
+            "egress {id}"
+        );
+        assert!(
+            dir.path().join("snapshots").join(id.to_string()).is_dir(),
+            "snapshots/{id}"
+        );
     }
-    assert!(!dir.path().join("svc_query.1.ring").exists(), "undeclared id gets no ring");
-    assert!(!dir.path().join("svc_query.ring").exists(), "legacy singular name is not created");
+    assert!(
+        !dir.path().join("svc_query.1.ring").exists(),
+        "undeclared id gets no ring"
+    );
+    assert!(
+        !dir.path().join("svc_query.ring").exists(),
+        "legacy singular name is not created"
+    );
     let cnc = open_cnc(dir.path());
     assert_eq!(cnc.services_declared(), 0b101);
     assert_eq!(cnc.fsm_lag_bytes(), 64 << 10);
@@ -108,16 +129,31 @@ fn a_bad_lag_bound_is_a_named_startup_refusal_before_any_file_exists() {
     let dir = tempdir();
     let cfg = config(dir.path(), ids(&[0], Some(FsmLag::Bounded(2 << 20)))); // == buffer/2
     let err = Node::start(cfg).err().expect("must refuse");
-    assert!(err.to_string().contains("services.fsm_lag must be below buffer_bytes / 2"), "{err}");
-    assert!(!dir.path().join("cnc2.dat").exists(), "refused before creating the page");
-    assert!(!dir.path().join("instance.lock").exists(), "refused before taking the lock");
+    assert!(
+        err.to_string()
+            .contains("services.fsm_lag must be below buffer_bytes / 2"),
+        "{err}"
+    );
+    assert!(
+        !dir.path().join("cnc2.dat").exists(),
+        "refused before creating the page"
+    );
+    assert!(
+        !dir.path().join("instance.lock").exists(),
+        "refused before taking the lock"
+    );
 }
 
 #[derive(Serialize, Deserialize)]
-pub enum Cmd { Add(u64) }
+pub enum Cmd {
+    Add(u64),
+}
 
 #[derive(Default)]
-pub struct CountSm { total: u64, last: Option<u64> }
+pub struct CountSm {
+    total: u64,
+    last: Option<u64>,
+}
 impl StateMachine for CountSm {
     type Command = Cmd;
     type Response = u64;
@@ -129,14 +165,21 @@ impl StateMachine for CountSm {
         self.last = Some(position);
         self.total
     }
-    fn query(&self, _q: ()) -> u64 { self.total }
-    fn last_applied(&self) -> Option<u64> { self.last }
+    fn query(&self, _q: ()) -> u64 {
+        self.total
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.last
+    }
 }
 
 pub fn start_service(dir: &Path, id: u8) -> uc_service::Service<CountSm> {
-    ServiceBuilder::new(ServiceConfig::new(dir, APP).service_id(id), CountSm::default())
-        .start()
-        .expect("service start")
+    ServiceBuilder::new(
+        ServiceConfig::new(dir, APP).service_id(id),
+        CountSm::default(),
+    )
+    .start()
+    .expect("service start")
 }
 
 #[test]
@@ -152,7 +195,11 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
         uc_log::cnc::unpack_service_status(s0.status.load_acquire()) == (0, true, 1)
     });
     assert_eq!(s0.epoch.load_acquire(), 1);
-    assert_eq!(cnc.service().service_epoch.load_acquire(), 0, "page-1 epoch is retired");
+    assert_eq!(
+        cnc.service().service_epoch.load_acquire(),
+        0,
+        "page-1 epoch is retired"
+    );
 
     let client = Client::connect(dir.path(), APP).unwrap();
     for _ in 0..20 {
@@ -165,11 +212,16 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
     assert_eq!(cnc.service().service_applied.load_acquire(), 0);
     assert_eq!(cnc.status().service_heartbeat_ns.load_acquire(), 0);
     assert_eq!(cnc.snapshots().service_snapshot_pos.load_acquire(), 0);
-    assert!(s0.heartbeat_ns.load_acquire() > 0, "the slot's own heartbeat ticks");
+    assert!(
+        s0.heartbeat_ns.load_acquire() > 0,
+        "the slot's own heartbeat ticks"
+    );
 
     client.shutdown();
     svc0.stop();
-    wait_until("slot 0 detached", || !uc_log::cnc::unpack_service_status(s0.status.load_acquire()).1);
+    wait_until("slot 0 detached", || {
+        !uc_log::cnc::unpack_service_status(s0.status.load_acquire()).1
+    });
     assert_eq!(s0.epoch.load_acquire(), 1, "detach does not bump the epoch");
     node.stop();
 }
@@ -180,19 +232,40 @@ fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_ref
     let dir = tempdir();
     let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(2), CountSm::default())
-        .start()
-        .err()
-        .expect("id 2 is not declared");
-    assert!(matches!(err, uc_service::ServiceError::ServiceNotDeclared { id: 2, declared: 0b11 }), "{err:?}");
-    assert!(err.to_string().contains("service id 2 is not declared"), "{err}");
+    let err = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), APP).service_id(2),
+        CountSm::default(),
+    )
+    .start()
+    .err()
+    .expect("id 2 is not declared");
+    assert!(
+        matches!(
+            err,
+            uc_service::ServiceError::ServiceNotDeclared {
+                id: 2,
+                declared: 0b11
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("service id 2 is not declared"),
+        "{err}"
+    );
 
     let svc1 = start_service(dir.path(), 1);
-    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(1), CountSm::default())
-        .start()
-        .err()
-        .expect("id 1 is held");
-    assert!(matches!(err, uc_service::ServiceError::AlreadyAttached { id: 1 }), "{err:?}");
+    let err = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), APP).service_id(1),
+        CountSm::default(),
+    )
+    .start()
+    .err()
+    .expect("id 1 is held");
+    assert!(
+        matches!(err, uc_service::ServiceError::AlreadyAttached { id: 1 }),
+        "{err:?}"
+    );
     svc1.stop();
     // The lock is released with the process's handle: a re-attach succeeds.
     let svc1b = start_service(dir.path(), 1);
@@ -215,11 +288,23 @@ fn an_out_of_range_service_id_is_a_named_refusal_not_a_shift_overflow_panic() {
     let dir = tempdir();
     let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(200), CountSm::default())
-        .start()
-        .err()
-        .expect("id 200 is out of range");
-    assert!(matches!(err, uc_service::ServiceError::ServiceNotDeclared { id: 200, declared: 0b11 }), "{err:?}");
+    let err = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), APP).service_id(200),
+        CountSm::default(),
+    )
+    .start()
+    .err()
+    .expect("id 200 is out of range");
+    assert!(
+        matches!(
+            err,
+            uc_service::ServiceError::ServiceNotDeclared {
+                id: 200,
+                declared: 0b11
+            }
+        ),
+        "{err:?}"
+    );
     node.stop();
 }
 
@@ -241,9 +326,16 @@ fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
     wait_until("FSM 1 caught up", || {
         cnc.service_slot(1).applied.load_acquire() == cnc.service_slot(0).applied.load_acquire()
     });
-    assert_eq!(cnc.service().service_applied.load_acquire(), cnc.service_slot(0).applied.load_acquire());
+    assert_eq!(
+        cnc.service().service_applied.load_acquire(),
+        cnc.service_slot(0).applied.load_acquire()
+    );
     assert_eq!(svc0.query(()), 100);
-    assert_eq!(svc1.query(()), 100, "same log, same deterministic SM ⇒ same state");
+    assert_eq!(
+        svc1.query(()),
+        100,
+        "same log, same deterministic SM ⇒ same state"
+    );
     assert!(dir.path().join("snapshots").join("1").is_dir());
     client.shutdown();
     svc0.stop();
@@ -264,8 +356,12 @@ impl StateMachine for SlowCountSm {
         std::thread::sleep(Duration::from_millis(1));
         self.0.apply(position, cmd)
     }
-    fn query(&self, q: ()) -> u64 { self.0.query(q) }
-    fn last_applied(&self) -> Option<u64> { self.0.last_applied() }
+    fn query(&self, q: ()) -> u64 {
+        self.0.query(q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.0.last_applied()
+    }
 }
 
 /// Drive `n` submits through the pipelined client while a sampler thread
@@ -293,7 +389,10 @@ fn drive_and_sample_gap(dir: &Path, n: u64) -> (u64, u64) {
     let client = PipelinedClient::connect(
         dir,
         APP,
-        PipelinedConfig { request_timeout: Duration::from_secs(30), ..PipelinedConfig::default() },
+        PipelinedConfig {
+            request_timeout: Duration::from_secs(30),
+            ..PipelinedConfig::default()
+        },
     )
     .unwrap();
     let mut tickets = Vec::with_capacity(n as usize);
@@ -317,20 +416,40 @@ fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
     let _g = serialize();
     let dir = tempdir();
     const BOUND: u64 = 64 << 10;
-    let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Bounded(BOUND))))).unwrap();
+    let node = Node::start(config(
+        dir.path(),
+        ids(&[0, 1], Some(FsmLag::Bounded(BOUND))),
+    ))
+    .unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
-    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(1), SlowCountSm::default())
-        .start()
-        .unwrap();
+    let svc1 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), APP).service_id(1),
+        SlowCountSm::default(),
+    )
+    .start()
+    .unwrap();
     // 3000 frames × 128 B = 384 KiB of log — six times the bound.
     let (max_gap, total) = drive_and_sample_gap(dir.path(), 3000);
     assert_eq!(total, 3000);
-    assert!(max_gap <= BOUND, "applied_0 - applied_1 reached {max_gap} > bound {BOUND}");
-    assert!(max_gap > BOUND / 2, "vacuity: the fast FSM never approached the bound (max gap {max_gap})");
+    assert!(
+        max_gap <= BOUND,
+        "applied_0 - applied_1 reached {max_gap} > bound {BOUND}"
+    );
+    assert!(
+        max_gap > BOUND / 2,
+        "vacuity: the fast FSM never approached the bound (max gap {max_gap})"
+    );
     let cnc = open_cnc(dir.path());
-    assert!(cnc.service_slot(0).lag_waits.load_acquire() > 0, "FSM 0 must have waited at least once");
-    assert_eq!(cnc.service_slot(1).lag_waits.load_acquire(), 0, "the slow FSM never waits");
+    assert!(
+        cnc.service_slot(0).lag_waits.load_acquire() > 0,
+        "FSM 0 must have waited at least once"
+    );
+    assert_eq!(
+        cnc.service_slot(1).lag_waits.load_acquire(),
+        0,
+        "the slow FSM never waits"
+    );
     svc0.stop();
     svc1.stop();
     node.stop();
@@ -343,14 +462,20 @@ fn lockstep_holds_the_fsms_within_one_frame() {
     let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Lockstep)))).unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
-    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP).service_id(1), SlowCountSm::default())
-        .start()
-        .unwrap();
+    let svc1 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), APP).service_id(1),
+        SlowCountSm::default(),
+    )
+    .start()
+    .unwrap();
     let (max_gap, total) = drive_and_sample_gap(dir.path(), 500);
     assert_eq!(total, 500);
     // One frame: header 32 + payload (≤ max_payload 256), 32-byte aligned.
     let one_frame = uc_protocol::v2::frame::align_frame_len(32 + 256) as u64;
-    assert!(max_gap <= one_frame, "lockstep gap {max_gap} > one frame {one_frame}");
+    assert!(
+        max_gap <= one_frame,
+        "lockstep gap {max_gap} > one frame {one_frame}"
+    );
     assert!(max_gap > 0, "vacuity: no gap ever observed");
     svc0.stop();
     svc1.stop();
@@ -363,7 +488,11 @@ fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
     let _g = serialize();
     let dir = tempdir();
     const BOUND: u64 = 64 << 10;
-    let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Bounded(BOUND))))).unwrap();
+    let node = Node::start(config(
+        dir.path(),
+        ids(&[0, 1], Some(FsmLag::Bounded(BOUND))),
+    ))
+    .unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
     // `max_inflight` comfortably above the ~1024 records that fit under the
@@ -403,18 +532,29 @@ fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
             Err(e) => panic!("unexpected {e:?}"),
         }
     }
-    assert!(refused, "4000 × 128 B = 512 KiB must not all get through a 64 KiB door");
+    assert!(
+        refused,
+        "4000 × 128 B = 512 KiB must not all get through a 64 KiB door"
+    );
     let cnc = open_cnc(dir.path());
     let one_frame = uc_protocol::v2::frame::align_frame_len(32 + 256) as u64;
     let append = cnc.counters().append.load_acquire();
-    assert!(append <= BOUND + one_frame, "append {append} ran past the door ({BOUND} + one frame)");
+    assert!(
+        append <= BOUND + one_frame,
+        "append {append} ran past the door ({BOUND} + one frame)"
+    );
     let _ = tickets; // drop: whatever timed out, timed out
     // Attaching the missing FSM re-opens the door: both catch up, writes flow.
     let svc1 = start_service(dir.path(), 1);
     wait_until("door reopens", || {
-        client.submit::<Cmd, u64>(&Cmd::Add(1)).and_then(|t| t.wait()).is_ok()
+        client
+            .submit::<Cmd, u64>(&Cmd::Add(1))
+            .and_then(|t| t.wait())
+            .is_ok()
     });
-    wait_until("both past the bound", || cnc.service_slot(1).applied.load_acquire() > BOUND);
+    wait_until("both past the bound", || {
+        cnc.service_slot(1).applied.load_acquire() > BOUND
+    });
     client.shutdown();
     svc0.stop();
     svc1.stop();
@@ -430,11 +570,20 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     let _g = serialize();
     let root = tempdir();
     const BOUND: u64 = 64 << 10;
-    let socks: Vec<std::net::UdpSocket> =
-        (0..3).map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
-    let members: Vec<(uc_consensus::election::NodeId, std::net::SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
-    fn node_cfg(dir: &Path, i: usize, members: &[(u32, std::net::SocketAddr)], services: ServicesConfig) -> NodeConfig {
+    let socks: Vec<std::net::UdpSocket> = (0..3)
+        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let members: Vec<(uc_consensus::election::NodeId, std::net::SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
+    fn node_cfg(
+        dir: &Path,
+        i: usize,
+        members: &[(u32, std::net::SocketAddr)],
+        services: ServicesConfig,
+    ) -> NodeConfig {
         let mut cfg = config(dir, services);
         cfg.id = i as u32;
         cfg.bind = members[i].1;
@@ -455,7 +604,9 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     let mut leader = 0;
     wait_until("single serving leader", || {
         let ls: Vec<usize> = (0..3).filter(|&i| serving(&nodes[i])).collect();
-        if ls.len() == 1 { leader = ls[0]; }
+        if ls.len() == 1 {
+            leader = ls[0];
+        }
         ls.len() == 1
     });
     // Restart the two followers with the declared set (config is per node;
@@ -463,7 +614,12 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     for i in (0..3).filter(|&i| i != leader) {
         nodes[i].take().unwrap().crash();
         let sock = std::net::UdpSocket::bind(members[i].1).unwrap();
-        let cfg = node_cfg(&dirs[i], i, &members, ids(&[0, 1], Some(FsmLag::Bounded(BOUND))));
+        let cfg = node_cfg(
+            &dirs[i],
+            i,
+            &members,
+            ids(&[0, 1], Some(FsmLag::Bounded(BOUND))),
+        );
         nodes[i] = Some(Node::start_with_socket(cfg, sock).unwrap());
     }
     wait_until("leader serving again", || serving(&nodes[leader]));
@@ -474,7 +630,8 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     // only consumes what the type needs and ignores the rest, so this both
     // decodes cleanly once the FSMs attach below AND matches the frame-size
     // arithmetic the assertions below assume.
-    let mut payload = bincode::serde::encode_to_vec(Cmd::Add(1), bincode::config::standard()).unwrap();
+    let mut payload =
+        bincode::serde::encode_to_vec(Cmd::Add(1), bincode::config::standard()).unwrap();
     payload.resize(64, 0);
     let mut sent = 0;
     while sent < 2000 {
@@ -487,12 +644,20 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     let one_frame = uc_protocol::v2::frame::align_frame_len(32 + 256) as u64;
     let c = leader_node.counters();
     let (append, commit) = (c.append.load_acquire(), c.commit.load_acquire());
-    assert!(append > 2 * BOUND, "vacuity: the leader appended only {append}");
-    assert!(commit <= BOUND + one_frame, "commit {commit} ran past the followers' capped reports ({BOUND})");
+    assert!(
+        append > 2 * BOUND,
+        "vacuity: the leader appended only {append}"
+    );
+    assert!(
+        commit <= BOUND + one_frame,
+        "commit {commit} ran past the followers' capped reports ({BOUND})"
+    );
     let lcnc = open_cnc(&dirs[leader]);
     for i in 0..8 {
         let s = lcnc.peer_slot(i);
-        if s.id_and_role.load_acquire() == 0 { continue; }
+        if s.id_and_role.load_acquire() == 0 {
+            continue;
+        }
         let rd = s.reported_durable.load_acquire();
         assert!(rd <= BOUND + one_frame, "peer slot {i} reported {rd} > cap");
     }
@@ -507,8 +672,12 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
         let c = leader_node.counters();
         c.commit.load_acquire() == c.append.load_acquire()
     });
-    for s in services { s.stop(); }
-    for n in nodes.into_iter().flatten() { n.stop(); }
+    for s in services {
+        s.stop();
+    }
+    for n in nodes.into_iter().flatten() {
+        n.stop();
+    }
 }
 
 #[test]
@@ -522,15 +691,60 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
     let svc1 = start_service(dir.path(), 1);
     let client = PipelinedClient::connect(dir.path(), APP, PipelinedConfig::default()).unwrap();
     assert_eq!(client.declared(), 0b11);
-    let t1: u64 = client.submit_to::<Cmd, u64>(1, &Cmd::Add(5)).unwrap().wait().unwrap();
+    let t1: u64 = client
+        .submit_to::<Cmd, u64>(1, &Cmd::Add(5))
+        .unwrap()
+        .wait()
+        .unwrap();
     assert_eq!(t1, 5, "FSM 1 answered its own total");
-    let all = client.submit_all::<Cmd, u64>(&Cmd::Add(1)).unwrap().wait().unwrap();
-    assert_eq!(all, vec![(0, 6), (1, 6)], "same log, same SM ⇒ identical totals, ordered by id");
-    assert_eq!(client.query_snapshot_on::<(), u64>(1, &()).unwrap().wait().unwrap(), 6);
-    assert_eq!(client.query_linearizable_on::<(), u64>(1, &()).unwrap().wait().unwrap(), 6);
-    assert_eq!(client.query_linearizable_on::<(), u64>(0, &()).unwrap().wait().unwrap(), 6);
-    assert!(matches!(client.submit_to::<Cmd, u64>(2, &Cmd::Add(1)), Err(ClientError::ServiceNotDeclared { id: 2, declared: 0b11 })));
-    assert!(matches!(client.query_snapshot_on::<(), u64>(7, &()), Err(ClientError::ServiceNotDeclared { id: 7, declared: 0b11 })));
+    let all = client
+        .submit_all::<Cmd, u64>(&Cmd::Add(1))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(
+        all,
+        vec![(0, 6), (1, 6)],
+        "same log, same SM ⇒ identical totals, ordered by id"
+    );
+    assert_eq!(
+        client
+            .query_snapshot_on::<(), u64>(1, &())
+            .unwrap()
+            .wait()
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        client
+            .query_linearizable_on::<(), u64>(1, &())
+            .unwrap()
+            .wait()
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        client
+            .query_linearizable_on::<(), u64>(0, &())
+            .unwrap()
+            .wait()
+            .unwrap(),
+        6
+    );
+    assert!(matches!(
+        client.submit_to::<Cmd, u64>(2, &Cmd::Add(1)),
+        Err(ClientError::ServiceNotDeclared {
+            id: 2,
+            declared: 0b11
+        })
+    ));
+    assert!(matches!(
+        client.query_snapshot_on::<(), u64>(7, &()),
+        Err(ClientError::ServiceNotDeclared {
+            id: 7,
+            declared: 0b11
+        })
+    ));
     // `try_submit_to`/`try_submit` put an IDENTICAL wire frame on the
     // ingress ring — `expected` is client-local, never transmitted — so
     // every declared FSM applies and answers every frame regardless of who
@@ -554,7 +768,11 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
     // 1's answer to THIS submit dropped and counted" without depending on
     // which specific outcome an FSM-vs-FSM apply/publish race lands on.
     let dropped_before = client.stats().wrong_ring + client.stats().duplicates;
-    let d: u64 = client.submit::<Cmd, u64>(&Cmd::Add(1)).unwrap().wait().unwrap();
+    let d: u64 = client
+        .submit::<Cmd, u64>(&Cmd::Add(1))
+        .unwrap()
+        .wait()
+        .unwrap();
     assert_eq!(d, 7);
     wait_until("FSM 1's answer to the default submit was dropped", || {
         client.stats().wrong_ring + client.stats().duplicates > dropped_before
@@ -564,7 +782,10 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
     let c = Client::connect(dir.path(), APP).unwrap();
     assert_eq!(c.declared(), 0b11);
     assert_eq!(c.submit_to::<Cmd, u64>(1, &Cmd::Add(1)).unwrap(), 8);
-    assert_eq!(c.submit_all::<Cmd, u64>(&Cmd::Add(1)).unwrap(), vec![(0, 9), (1, 9)]);
+    assert_eq!(
+        c.submit_all::<Cmd, u64>(&Cmd::Add(1)).unwrap(),
+        vec![(0, 9), (1, 9)]
+    );
     assert_eq!(c.query_snapshot_on::<(), u64>(1, &()).unwrap(), 9);
     assert_eq!(c.query_linearizable_on::<(), u64>(1, &()).unwrap(), 9);
     c.shutdown();
@@ -579,16 +800,24 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
 #[test]
 fn a_raw_query_for_an_id_without_a_ring_gets_bad_service_from_the_node() {
     use uc_protocol::ring::{BroadcastRing, MpscRing};
-    use uc_protocol::v2::ipc::{MSG_V2_BAD_SERVICE, MSG_V2_QUERY, client_from_extra, extra_client, write_query_payload};
+    use uc_protocol::v2::ipc::{
+        MSG_V2_BAD_SERVICE, MSG_V2_QUERY, client_from_extra, extra_client, write_query_payload,
+    };
     let _g = serialize();
     let dir = tempdir();
     let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let mut node_egress = BroadcastRing::open(&dir.path().join("egress_node.broadcast")).unwrap().subscribe();
-    let (producer, _c) = MpscRing::open(&dir.path().join("query.ring")).unwrap().into_split();
+    let mut node_egress = BroadcastRing::open(&dir.path().join("egress_node.broadcast"))
+        .unwrap()
+        .subscribe();
+    let (producer, _c) = MpscRing::open(&dir.path().join("query.ring"))
+        .unwrap()
+        .into_split();
     let mut payload = Vec::new();
     write_query_payload(5, b"q", &mut payload);
-    producer.try_write(MSG_V2_QUERY, 0, extra_client(0x77, 1), &payload).unwrap();
+    producer
+        .try_write(MSG_V2_QUERY, 0, extra_client(0x77, 1), &payload)
+        .unwrap();
     let mut buf = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -633,17 +862,16 @@ fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
     svc1.stop();
     wait_until("service_detached record for FSM 1", || {
         let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-        t.lines().any(|l| {
-            l.contains(r#""event":"service_detached""#) && l.contains(r#""service":1"#)
-        })
+        t.lines()
+            .any(|l| l.contains(r#""event":"service_detached""#) && l.contains(r#""service":1"#))
     });
 
     // FSM 0 was never started: it must not be reported as attaching or
     // departing — the events are edges, not a per-cycle status dump.
     let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     assert!(
-        !t.lines().any(|l| l.contains(r#""event":"service_attached""#)
-            && l.contains(r#""service":0"#)),
+        !t.lines()
+            .any(|l| l.contains(r#""event":"service_attached""#) && l.contains(r#""service":0"#)),
         "{t}"
     );
 
@@ -680,7 +908,8 @@ fn an_ageing_heartbeat_alone_emits_service_detached() {
     // so the cycle that sees epoch=1 also sees a live slot — no non-live
     // window that could emit a detach for the wrong reason.
     s1.heartbeat_ns.store_release(now_ns());
-    s1.status.store_release(uc_log::cnc::pack_service_status(1, true, 1));
+    s1.status
+        .store_release(uc_log::cnc::pack_service_status(1, true, 1));
     s1.epoch.store_release(1);
     wait_until("service_attached record for FSM 1", || {
         let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
@@ -693,21 +922,28 @@ fn an_ageing_heartbeat_alone_emits_service_detached() {
 
     // Now age the heartbeat past the bar with the ATTACHED bit STILL SET —
     // exactly a `kill -9`'d service. Only the staleness arm can fire.
-    s1.status.store_release(uc_log::cnc::pack_service_status(1, true, 1));
+    s1.status
+        .store_release(uc_log::cnc::pack_service_status(1, true, 1));
     s1.heartbeat_ns
         .store_release(now_ns() - (uc_node::services::SERVICE_STALE_NS + 1_000_000_000));
-    wait_until("service_detached record for FSM 1 off the ageing heartbeat", || {
-        let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-        t.lines().any(|l| {
-            l.contains(r#""event":"service_detached""#)
-                && l.contains(r#""service":1"#)
-                && l.contains(r#""epoch":1"#)
-        })
-    });
+    wait_until(
+        "service_detached record for FSM 1 off the ageing heartbeat",
+        || {
+            let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+            t.lines().any(|l| {
+                l.contains(r#""event":"service_detached""#)
+                    && l.contains(r#""service":1"#)
+                    && l.contains(r#""epoch":1"#)
+            })
+        },
+    );
     // The bit was never cleared: the ONLY thing that could have reported it
     // is the heartbeat ageing.
     let (_, attached, _) = uc_log::cnc::unpack_service_status(s1.status.load_acquire());
-    assert!(attached, "the ATTACHED bit must still be set — a kill -9 never clears it");
+    assert!(
+        attached,
+        "the ATTACHED bit must still be set — a kill -9 never clears it"
+    );
 
     node.stop();
     uc_node::obs::log::stderr_for_tests();

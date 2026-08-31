@@ -20,21 +20,21 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use uc_crypto::{NodeId, Scope, SendHalf, Transport};
+use uc_journal::Journal;
 use uc_log::archive::find_block;
 use uc_log::buffer::{LogBuffer, SliceRead};
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
-use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN,
-    SNAP_BEGIN_LAYOUT_V2, SnapBeginBody, write_datagram_header, write_snap_begin_body,
-};
 #[cfg(test)]
 use uc_protocol::v2::datagram::read_snap_begin_body;
+use uc_protocol::v2::datagram::{
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
+    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V2,
+    SnapBeginBody, write_datagram_header, write_snap_begin_body,
+};
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
 };
-use uc_journal::Journal;
 
 use crate::TermHandle;
 use crate::fault::FaultSocket;
@@ -86,10 +86,23 @@ const SNAP_BEGIN_RESEND_NS: u64 = 20_000_000;
 /// commit at all).
 #[derive(Debug, Clone)]
 pub enum CtrlMsg {
-    Nak { from: SocketAddr, position: u64, length: u32 },
-    Status { from: SocketAddr, contiguous: u64, window: u32 },
+    Nak {
+        from: SocketAddr,
+        position: u64,
+        length: u32,
+    },
+    Status {
+        from: SocketAddr,
+        contiguous: u64,
+        window: u32,
+    },
     /// M6 Task 6: the snapshot-session peer requests a missing file range.
-    SnapNak { from: SocketAddr, session: u32, offset: u64, length: u32 },
+    SnapNak {
+        from: SocketAddr,
+        session: u32,
+        offset: u64,
+        length: u32,
+    },
     /// M6 Task 6: the snapshot-session peer signals the file is complete.
     SnapDone { from: SocketAddr, session: u32 },
     /// M7 (spec 2026-07-13): the consensus agent adopted a new `ClusterConfig`
@@ -99,7 +112,11 @@ pub enum CtrlMsg {
     /// elsewhere), not the combined fan-out `Sender::with_learners` takes at
     /// construction; the handler recombines them for streaming. `cluster_size`
     /// is the VOTING cluster size (`ClusterConfig::voters.len()`).
-    SetPeers { followers: Vec<SocketAddr>, learners: Vec<SocketAddr>, cluster_size: usize },
+    SetPeers {
+        followers: Vec<SocketAddr>,
+        learners: Vec<SocketAddr>,
+        cluster_size: usize,
+    },
 }
 
 /// M14c: one FSM's newest durable snapshot artifact, as offered to a session.
@@ -179,7 +196,9 @@ struct SnapSession {
 impl SnapSession {
     /// Index of the artifact containing stream offset `at`, or `None` past EOF.
     fn part_at(&self, at: u64) -> Option<usize> {
-        self.parts.iter().position(|p| at >= p.base && at < p.base + p.len)
+        self.parts
+            .iter()
+            .position(|p| at >= p.base && at < p.base + p.len)
     }
 }
 
@@ -222,7 +241,11 @@ impl SenderConfig {
     /// site that sizes a run/replay/journal-chunk read against the MTU must
     /// subtract this, or a sealed datagram silently exceeds `mtu`.
     pub fn crypto_overhead(&self) -> usize {
-        if self.crypto_enabled { CRYPTO_OVERHEAD } else { 0 }
+        if self.crypto_enabled {
+            CRYPTO_OVERHEAD
+        } else {
+            0
+        }
     }
 }
 
@@ -435,7 +458,17 @@ impl Sender {
         term: TermHandle,
         role: Arc<AtomicBool>,
     ) -> Sender {
-        Self::with_learners(buffer, sock, followers, &[], cluster_size, ctrl, cfg, term, role)
+        Self::with_learners(
+            buffer,
+            sock,
+            followers,
+            &[],
+            cluster_size,
+            ctrl,
+            cfg,
+            term,
+            role,
+        )
     }
 
     /// M6 Task 7: leader-side voter/learner split. `followers` is the full fan-out
@@ -455,7 +488,16 @@ impl Sender {
         role: Arc<AtomicBool>,
     ) -> Sender {
         Self::with_crypto(
-            buffer, sock, followers, learners, cluster_size, ctrl, cfg, term, role, None,
+            buffer,
+            sock,
+            followers,
+            learners,
+            cluster_size,
+            ctrl,
+            cfg,
+            term,
+            role,
+            None,
         )
     }
 
@@ -509,8 +551,11 @@ impl Sender {
         );
         // Voting followers pace commit; learners are fanned-out to but never enter
         // `limit()`.
-        let voting: Vec<SocketAddr> =
-            followers.iter().copied().filter(|a| !learners.contains(a)).collect();
+        let voting: Vec<SocketAddr> = followers
+            .iter()
+            .copied()
+            .filter(|a| !learners.contains(a))
+            .collect();
         let flow = FlowControl::new(&voting, cluster_size, cfg.initial_window, learners);
         let sent = buffer.counters().sent.load_acquire();
         Sender {
@@ -538,7 +583,10 @@ impl Sender {
             snap_session_seq: 0,
             peer_obs: None,
             crypto,
-            peer_ids: peer_ids_src.as_ref().map(PeerIds::snapshot).unwrap_or_default(),
+            peer_ids: peer_ids_src
+                .as_ref()
+                .map(PeerIds::snapshot)
+                .unwrap_or_default(),
             peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
             peer_ids_src,
         }
@@ -605,11 +653,19 @@ impl Sender {
 
         while let Ok(m) = self.ctrl.try_recv() {
             match m {
-                CtrlMsg::Status { from, contiguous, window } => {
+                CtrlMsg::Status {
+                    from,
+                    contiguous,
+                    window,
+                } => {
                     self.last_status.insert(from, (contiguous, window));
                     self.flow.on_status(from, contiguous, window)
                 }
-                CtrlMsg::Nak { from, position, length } => {
+                CtrlMsg::Nak {
+                    from,
+                    position,
+                    length,
+                } => {
                     // Fail closed against a corrupt/hostile position. A NAK
                     // position is a stream byte offset, and every frame boundary
                     // is 32-byte aligned; a position that is NOT frame-aligned
@@ -652,7 +708,12 @@ impl Sender {
                         self.naks.push_back((from, position, length));
                     }
                 }
-                CtrlMsg::SnapNak { from, session, offset, length } => {
+                CtrlMsg::SnapNak {
+                    from,
+                    session,
+                    offset,
+                    length,
+                } => {
                     // A repair request for the active session only (a stale
                     // session id — the peer NAKing a transfer we already closed —
                     // is dropped). Bounded implicitly by the file size / peer.
@@ -686,13 +747,21 @@ impl Sender {
                         self.snap = None;
                     }
                 }
-                CtrlMsg::SetPeers { followers, learners, cluster_size } => {
+                CtrlMsg::SetPeers {
+                    followers,
+                    learners,
+                    cluster_size,
+                } => {
                     // Rebuild flow control from the new voting/learner split,
                     // re-feeding every surviving address's last raw advert so
                     // ranking does not restart from the bootstrap window (mirrors
                     // `ElectionSm::rebuild_membership`'s carried-reports rationale).
-                    self.flow =
-                        FlowControl::new(&followers, cluster_size, self.cfg.initial_window, &learners);
+                    self.flow = FlowControl::new(
+                        &followers,
+                        cluster_size,
+                        self.cfg.initial_window,
+                        &learners,
+                    );
                     for (&addr, &(contiguous, window)) in self.last_status.iter() {
                         self.flow.on_status(addr, contiguous, window);
                     }
@@ -738,7 +807,10 @@ impl Sender {
         while dgrams < self.cfg.dgrams_per_cycle && self.sent < append && self.sent < limit {
             // don't read more than the flow limit allows in one datagram
             let flow_budget = (limit - self.sent).min(budget as u64) as usize;
-            match self.buffer.read_run_validated(self.sent, flow_budget, &mut self.run) {
+            match self
+                .buffer
+                .read_run_validated(self.sent, flow_budget, &mut self.run)
+            {
                 SliceRead::Run(r) => {
                     if self.sent + r.advance > limit {
                         // a single frame overshoots the remaining window
@@ -926,7 +998,9 @@ impl Sender {
         for &to in &self.followers {
             let _ = self.sock.send_to(&self.scratch, to);
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
-            self.stats.bytes.fetch_add(body_bytes as u64, Ordering::Relaxed);
+            self.stats
+                .bytes
+                .fetch_add(body_bytes as u64, Ordering::Relaxed);
         }
     }
 
@@ -947,7 +1021,9 @@ impl Sender {
                     if self.assemble(p, DGRAM_KIND_DATA, r.bytes) {
                         let _ = self.sock.send_to(&self.scratch, to);
                         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
-                        self.stats.bytes.fetch_add(r.bytes as u64, Ordering::Relaxed);
+                        self.stats
+                            .bytes
+                            .fetch_add(r.bytes as u64, Ordering::Relaxed);
                     }
                     p += r.advance;
                 }
@@ -1061,9 +1137,10 @@ impl Sender {
         // burns the slot until the timeout instead of staying an overrun the
         // peer re-NAKs.
         if set.artifacts.len() != set.services_declared.count_ones() as usize
-            || set.artifacts.iter().any(|a| {
-                a.service_id >= 64 || set.services_declared & (1u64 << a.service_id) == 0
-            })
+            || set
+                .artifacts
+                .iter()
+                .any(|a| a.service_id >= 64 || set.services_declared & (1u64 << a.service_id) == 0)
         {
             return false;
         }
@@ -1213,7 +1290,10 @@ impl Sender {
             // the HEAD request's artifact, so the head case fixes itself here);
             // dropping the request is the same shape a lost datagram already
             // takes — the peer's snapshot NAK timer re-fires.
-            if sess.part_at(offset).is_some_and(|i| sess.parts[i].begun_ns.is_none()) {
+            if sess
+                .part_at(offset)
+                .is_some_and(|i| sess.parts[i].begun_ns.is_none())
+            {
                 continue;
             }
             let n = self.send_snap_chunk(&mut sess, offset, true);
@@ -1449,7 +1529,9 @@ impl Sender {
         }
         let _ = self.sock.send_to(&self.scratch, to);
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
-        self.stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+        self.stats
+            .bytes
+            .fetch_add(body.len() as u64, Ordering::Relaxed);
         self.stats.replay_datagrams.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -1547,8 +1629,8 @@ mod tests {
     use uc_protocol::v2::crypto::{COUNTER_LEN, TAG_LEN, read_counter};
     use uc_protocol::v2::datagram::read_datagram_header;
     use uc_protocol::v2::frame::{
-        read_header, write_header_except_length, FrameHeader, FRAME_TYPE_MESSAGE, HEADER_LEN,
-        OFF_TYPE,
+        FRAME_TYPE_MESSAGE, FrameHeader, HEADER_LEN, OFF_TYPE, read_header,
+        write_header_except_length,
     };
 
     fn test_cnc(cap: u64) -> Arc<CncPage> {
@@ -1562,7 +1644,11 @@ mod tests {
     }
 
     fn buffer() -> Arc<LogBuffer> {
-        Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), test_cnc(1 << 16), 256))
+        Arc::new(LogBuffer::new(
+            Region::heap_zeroed(1 << 16),
+            test_cnc(1 << 16),
+            256,
+        ))
     }
 
     fn term_handle(t: u32) -> TermHandle {
@@ -1581,7 +1667,9 @@ mod tests {
     }
     impl Fake {
         fn new() -> Self {
-            Self { sock: FaultSocket::bind("127.0.0.1:0").unwrap() }
+            Self {
+                sock: FaultSocket::bind("127.0.0.1:0").unwrap(),
+            }
         }
         fn addr(&self) -> SocketAddr {
             self.sock.local_addr().unwrap()
@@ -1657,10 +1745,18 @@ mod tests {
             assert_eq!(h.position, 0);
             assert_eq!(body.len(), 3 * 96); // all three frames packed in one datagram
             assert_eq!(read_header(&body[96..]).correlation_id, 1);
-            assert_eq!(&body[2 * 96 + HEADER_LEN..2 * 96 + HEADER_LEN + 64], &[2u8; 64]);
+            assert_eq!(
+                &body[2 * 96 + HEADER_LEN..2 * 96 + HEADER_LEN + 64],
+                &[2u8; 64]
+            );
         }
         assert_eq!(b.counters().sent.load_acquire(), 3 * 96);
-        assert_eq!(s.stats().datagrams.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            s.stats()
+                .datagrams
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     /// M7: `SetPeers` swaps the fan-out + rebuilds `FlowControl` from the new
@@ -1673,10 +1769,18 @@ mod tests {
         let (mut s, tx) = sender_to(&[&f1, &f2], &b); // cluster_size 3: leader + f1 + f2
 
         // Seed both followers' adverts before the reconfig.
-        tx.send(CtrlMsg::Status { from: f1.addr(), contiguous: 1_000_000, window: 100_000 })
-            .unwrap();
-        tx.send(CtrlMsg::Status { from: f2.addr(), contiguous: 2_000_000, window: 50_000 })
-            .unwrap();
+        tx.send(CtrlMsg::Status {
+            from: f1.addr(),
+            contiguous: 1_000_000,
+            window: 100_000,
+        })
+        .unwrap();
+        tx.send(CtrlMsg::Status {
+            from: f2.addr(),
+            contiguous: 2_000_000,
+            window: 50_000,
+        })
+        .unwrap();
         s.do_work();
         // cluster_size 3 -> needed = 1: the higher of the two followers.
         assert_eq!(s.flow.limit(), 2_050_000);
@@ -1695,7 +1799,11 @@ mod tests {
         // needed = 2 now: f1's and f2's re-fed adverts must have survived the
         // rebuild (f3 has no status yet, so it sits at the bootstrap window
         // and cannot be the 2nd-highest).
-        assert_eq!(s.flow.limit(), 1_100_000, "f1's re-fed advert, not the bootstrap window");
+        assert_eq!(
+            s.flow.limit(),
+            1_100_000,
+            "f1's re-fed advert, not the bootstrap window"
+        );
     }
 
     #[test]
@@ -1704,7 +1812,12 @@ mod tests {
         let f1 = Fake::new();
         let (mut s, tx) = sender_to(&[&f1], &b);
         // shrink the follower's advertised limit to one datagram's worth
-        tx.send(CtrlMsg::Status { from: f1.addr(), contiguous: 0, window: 96 }).unwrap();
+        tx.send(CtrlMsg::Status {
+            from: f1.addr(),
+            contiguous: 0,
+            window: 96,
+        })
+        .unwrap();
         let mut a = Appender::new(Arc::clone(&b), 9);
         for i in 0..4 {
             a.append(4, i, &[0u8; 64]).unwrap();
@@ -1712,10 +1825,20 @@ mod tests {
         s.do_work();
         let (h, body) = f1.recv().expect("first frame");
         assert_eq!((h.position, body.len()), (0, 96)); // only up to the limit
-        assert!(s.stats().flow_stalls.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            s.stats()
+                .flow_stalls
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
         f1.drain();
         // status advances -> the rest flows
-        tx.send(CtrlMsg::Status { from: f1.addr(), contiguous: 96, window: 1 << 20 }).unwrap();
+        tx.send(CtrlMsg::Status {
+            from: f1.addr(),
+            contiguous: 96,
+            window: 1 << 20,
+        })
+        .unwrap();
         s.do_work();
         let (h, body) = f1.recv().expect("remaining frames");
         assert_eq!((h.position, body.len()), (96, 3 * 96));
@@ -1733,14 +1856,24 @@ mod tests {
         s.do_work(); // steady stream to both
         f1.drain();
         f2.drain();
-        tx.send(CtrlMsg::Nak { from: f2.addr(), position: 96, length: 192 }).unwrap();
+        tx.send(CtrlMsg::Nak {
+            from: f2.addr(),
+            position: 96,
+            length: 192,
+        })
+        .unwrap();
         s.do_work();
         let (h, body) = f2.recv().expect("retransmission");
         assert_eq!(h.kind, DGRAM_KIND_DATA);
         assert_eq!(h.position, 96);
         assert!(body.len() >= 192);
         assert!(f1.recv().is_none(), "NAK service must not fan out");
-        assert_eq!(s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            s.stats()
+                .naks_served
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -1774,16 +1907,25 @@ mod tests {
         f1.drain();
         // flood 1100 NAKs at ASCENDING positions; only the newest is live
         for i in 0..1100u64 {
-            tx.send(CtrlMsg::Nak { from: f1.addr(), position: i * 96, length: 96 }).unwrap();
+            tx.send(CtrlMsg::Nak {
+                from: f1.addr(),
+                position: i * 96,
+                length: 96,
+            })
+            .unwrap();
         }
         s.do_work(); // drains all 1100 into ONE coalesced slot, serves that slot
         assert_eq!(
-            s.stats().naks_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "same-follower NAKs coalesce to one slot — the cap never trips"
         );
         assert_eq!(
-            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_served
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the 1100 re-NAKs collapse to a single served request"
         );
@@ -1791,7 +1933,10 @@ mod tests {
         // beyond `append` (96*2): NotCommitted, so nothing is sent — proving the
         // slot held the newest position, not the oldest (which would have sent
         // frame 0).
-        assert!(f1.recv().is_none(), "coalesced NAK kept the latest position, not the oldest");
+        assert!(
+            f1.recv().is_none(),
+            "coalesced NAK kept the latest position, not the oldest"
+        );
     }
 
     #[test]
@@ -1809,13 +1954,25 @@ mod tests {
         s.do_work();
         f1.drain();
         f2.drain();
-        tx.send(CtrlMsg::Nak { from: f1.addr(), position: 0, length: 96 }).unwrap();
-        tx.send(CtrlMsg::Nak { from: f2.addr(), position: 96, length: 96 }).unwrap();
+        tx.send(CtrlMsg::Nak {
+            from: f1.addr(),
+            position: 0,
+            length: 96,
+        })
+        .unwrap();
+        tx.send(CtrlMsg::Nak {
+            from: f2.addr(),
+            position: 96,
+            length: 96,
+        })
+        .unwrap();
         // two distinct slots -> two do_work cycles serve one NAK each
         s.do_work();
         s.do_work();
         assert_eq!(
-            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_served
+                .load(std::sync::atomic::Ordering::Relaxed),
             2,
             "each follower's NAK is served on its own"
         );
@@ -1832,19 +1989,31 @@ mod tests {
         let b = buffer();
         let f1 = Fake::new();
         let (mut s, tx) = sender_to(&[&f1], &b);
-        tx.send(CtrlMsg::Nak { from: f1.addr(), position: 100, length: 96 }).unwrap();
+        tx.send(CtrlMsg::Nak {
+            from: f1.addr(),
+            position: 100,
+            length: 96,
+        })
+        .unwrap();
         s.do_work();
         assert_eq!(
-            s.stats().naks_rejected.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_rejected
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "misaligned NAK position must be rejected at ingestion"
         );
         assert_eq!(
-            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_served
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "a rejected NAK is never queued or served"
         );
-        assert!(f1.recv().is_none(), "nothing is sent to the requester for a corrupt NAK");
+        assert!(
+            f1.recv().is_none(),
+            "nothing is sent to the requester for a corrupt NAK"
+        );
     }
 
     /// Hand-build a valid message frame of `total` bytes (header + payload,
@@ -1898,7 +2067,10 @@ mod tests {
             assert!(body.len() <= blen);
             count += 1;
         });
-        assert_eq!(count, 0, "starting on a corrupt frame emits nothing and does not panic");
+        assert_eq!(
+            count, 0,
+            "starting on a corrupt frame emits nothing and does not panic"
+        );
 
         // A ZERO length word (the re-review's livelock case): align_frame_len(0)
         // == 0 advances nothing, so without the below-HEADER_LEN bail the gather
@@ -1954,24 +2126,39 @@ mod tests {
         for i in 0..(NAK_QUEUE_MAX + K) as u16 {
             // distinct sources; position 0 is frame-aligned (never rejected)
             let from = SocketAddr::from(([127, 0, 0, 1], 20_000 + i));
-            tx.send(CtrlMsg::Nak { from, position: 0, length: 96 }).unwrap();
+            tx.send(CtrlMsg::Nak {
+                from,
+                position: 0,
+                length: 96,
+            })
+            .unwrap();
         }
         s.do_work(); // drains all NAK_QUEUE_MAX+K into the queue, serves one
         assert_eq!(
-            s.stats().naks_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_dropped
+                .load(std::sync::atomic::Ordering::Relaxed),
             K as u64,
             "exactly the K over-cap distinct-source NAKs drop"
         );
         assert_eq!(
-            s.stats().naks_rejected.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .naks_rejected
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "aligned positions are not rejected"
         );
-        let served = s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed);
+        let served = s
+            .stats()
+            .naks_served
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(served, 1, "the drain cycle served one queued NAK");
         s.do_work();
         assert!(
-            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed) > served,
+            s.stats()
+                .naks_served
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > served,
             "the capped queue keeps serving on later cycles"
         );
     }
@@ -2062,7 +2249,12 @@ mod tests {
         );
         s.set_replay_source(arch.journal_arc());
         // NAK for position 0 (lapped long ago)
-        tx.send(CtrlMsg::Nak { from: f1.addr(), position: 0, length: 4096 }).unwrap();
+        tx.send(CtrlMsg::Nak {
+            from: f1.addr(),
+            position: 0,
+            length: 4096,
+        })
+        .unwrap();
         s.do_work();
         // served from the journal: DATA datagrams, self-locating from 0,
         // frames byte-identical to the original appends
@@ -2071,9 +2263,16 @@ mod tests {
         assert_eq!(h.position, 0);
         assert_eq!(read_header(&body).correlation_id, 0);
         assert_eq!(&body[HEADER_LEN..HEADER_LEN + 64], &[0u8; 64]);
-        assert!(s.stats().replay_datagrams.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        assert!(
+            s.stats()
+                .replay_datagrams
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
         assert_eq!(
-            s.stats().overruns.load(std::sync::atomic::Ordering::Relaxed),
+            s.stats()
+                .overruns
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "the seam is now served, not counted"
         );
@@ -2115,7 +2314,10 @@ mod tests {
         s.do_work();
         let (h, body) = f1.recv().expect("data datagram");
         assert_eq!(h.kind, DGRAM_KIND_DATA);
-        assert_eq!(h.leadership_term_id, 8, "datagram term must come from the sender handle");
+        assert_eq!(
+            h.leadership_term_id, 8,
+            "datagram term must come from the sender handle"
+        );
         assert_eq!(
             read_header(&body).leadership_term_id,
             7,
@@ -2154,10 +2356,17 @@ mod tests {
         for _ in 0..8 {
             s.do_work();
         }
-        assert!(f1.recv().is_none(), "a follower-role sender must emit nothing");
+        assert!(
+            f1.recv().is_none(),
+            "a follower-role sender must emit nothing"
+        );
         assert_eq!(s.stats().datagrams.load(Relaxed), 0);
         assert_eq!(s.stats().heartbeats.load(Relaxed), 0);
-        assert_eq!(b.counters().sent.load_acquire(), 0, "follower role advanced sent");
+        assert_eq!(
+            b.counters().sent.load_acquire(),
+            0,
+            "follower role advanced sent"
+        );
         // promote to leader: the pending frames now stream out
         flag.store(true, Relaxed);
         s.do_work();
@@ -2222,7 +2431,10 @@ mod tests {
             .join("uc2-net-sender-crypto")
             .join(format!("t{seq}"));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        assert!(
+            !dir.starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {dir:?}"
+        );
 
         let key_path = dir.join("node.key");
         std::fs::write(&key_path, [0x77u8; 32]).unwrap();
@@ -2239,7 +2451,9 @@ mod tests {
             allowlist_path: allow_path,
             rotation: uc_crypto::rotation::RotationPolicy::default(),
         };
-        let shared = uc_crypto::SharedTransport::new(&cfg, self_id).unwrap().unwrap();
+        let shared = uc_crypto::SharedTransport::new(&cfg, self_id)
+            .unwrap()
+            .unwrap();
         shared.mint_group_key(&[], 0); // epoch 0 — indistinguishable from the unsealed default
         shared.mint_group_key(&[], 0); // epoch 1 — provably not zero-init
         shared.send_half()
@@ -2288,7 +2502,10 @@ mod tests {
     /// resolution happens on those paths at all). T17's pairwise tests build
     /// a real map instead.
     fn group_only_crypto(half: SendHalf) -> SenderCrypto {
-        SenderCrypto { half, peer_ids: PeerIds::new() }
+        SenderCrypto {
+            half,
+            peer_ids: PeerIds::new(),
+        }
     }
 
     fn sender_without_crypto() -> (Sender, Fake) {
@@ -2366,7 +2583,11 @@ mod tests {
             &plain_d[DATAGRAM_HEADER_LEN..],
             "payload is not cleartext"
         );
-        assert_ne!(read_datagram_header(&d1).unwrap().key_epoch, 0, "stamped with the epoch");
+        assert_ne!(
+            read_datagram_header(&d1).unwrap().key_epoch,
+            0,
+            "stamped with the epoch"
+        );
     }
 
     #[test]
@@ -2401,9 +2622,15 @@ mod tests {
         let mut saw_any = false;
         while let Some(d) = f.recv_raw() {
             saw_any = true;
-            assert!(d.len() <= cfg_sealed.mtu, "a sealed datagram must not exceed the MTU");
+            assert!(
+                d.len() <= cfg_sealed.mtu,
+                "a sealed datagram must not exceed the MTU"
+            );
         }
-        assert!(saw_any, "fixture must actually produce datagrams for this to mean anything");
+        assert!(
+            saw_any,
+            "fixture must actually produce datagrams for this to mean anything"
+        );
     }
 
     #[test]
@@ -2426,9 +2653,15 @@ mod tests {
         let mut saw_any = false;
         while let Some(d) = f.recv_raw() {
             saw_any = true;
-            assert!(d.len() <= s.cfg.mtu, "a NAK-served sealed datagram must not exceed the MTU");
+            assert!(
+                d.len() <= s.cfg.mtu,
+                "a NAK-served sealed datagram must not exceed the MTU"
+            );
         }
-        assert!(saw_any, "fixture must actually produce datagrams for this to mean anything");
+        assert!(
+            saw_any,
+            "fixture must actually produce datagrams for this to mean anything"
+        );
     }
 
     #[test]
@@ -2440,7 +2673,10 @@ mod tests {
         s.on_nak(f.addr(), read_datagram_header(&first).unwrap().position, 7);
         s.do_work();
         let retx = f.recv_raw().unwrap();
-        assert_eq!(read_datagram_header(&retx).unwrap().position, read_datagram_header(&first).unwrap().position);
+        assert_eq!(
+            read_datagram_header(&retx).unwrap().position,
+            read_datagram_header(&first).unwrap().position
+        );
         assert_ne!(
             read_counter(&retx[DATAGRAM_HEADER_LEN..]),
             read_counter(&first[DATAGRAM_HEADER_LEN..]),
@@ -2487,7 +2723,11 @@ mod tests {
         s.do_work();
         let d = f.recv_raw().expect("heartbeat datagram");
         assert_eq!(read_datagram_header(&d).unwrap().kind, DGRAM_KIND_HEARTBEAT);
-        assert_ne!(read_datagram_header(&d).unwrap().key_epoch, 0, "heartbeat must be sealed too");
+        assert_ne!(
+            read_datagram_header(&d).unwrap().key_epoch,
+            0,
+            "heartbeat must be sealed too"
+        );
         assert_eq!(
             d.len(),
             DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
@@ -2506,7 +2746,11 @@ mod tests {
         // crypto on everywhere else — worse, the receiver (T11) would then
         // see a cleartext DATA where it expects a sealed one and reject it
         // as `peer_appears_cleartext`, silently wedging deep recovery.
-        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(4096), test_cnc(4096), 256));
+        let b = Arc::new(LogBuffer::new(
+            Region::heap_zeroed(4096),
+            test_cnc(4096),
+            256,
+        ));
         // tempfile::tempdir() (not a fixed path): matches
         // journal_replay_serves_deep_nak_with_identical_wire_format above —
         // a fresh, auto-cleaned, guaranteed-unique dir per run, unlike the
@@ -2581,7 +2825,11 @@ mod tests {
         // (sealed 16+14*96+24=1384 > 1360) — reverting only this site's
         // `- self.cfg.crypto_overhead()` panics here with exactly that
         // "1384 > mtu" overrun.
-        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(4096), test_cnc(4096), 256));
+        let b = Arc::new(LogBuffer::new(
+            Region::heap_zeroed(4096),
+            test_cnc(4096),
+            256,
+        ));
         let dir = tempfile::tempdir().unwrap();
         let acfg = uc_log::archive::ArchiveConfig {
             segment_size_bytes: 4 * 1024 * 1024,
@@ -2630,7 +2878,10 @@ mod tests {
                 "a journal-replayed sealed datagram must not exceed the MTU"
             );
         }
-        assert!(saw_any, "fixture must actually produce datagrams for this to mean anything");
+        assert!(
+            saw_any,
+            "fixture must actually produce datagrams for this to mean anything"
+        );
         assert!(
             s.stats().replay_datagrams.load(Ordering::Relaxed) >= 1,
             "fixture must actually exercise the journal-replay path"
@@ -2665,7 +2916,10 @@ mod tests {
             Some(group_only_crypto(unminted_crypto_send_half(1))),
         );
         append_and_flush(&mut s, b"hello");
-        assert!(f.recv_raw().is_none(), "an unsealable datagram must never reach the wire");
+        assert!(
+            f.recv_raw().is_none(),
+            "an unsealable datagram must never reach the wire"
+        );
         assert!(
             s.stats().seal_failures.load(Ordering::Relaxed) > 0,
             "the failure must be counted, not silently swallowed"
@@ -2711,7 +2965,9 @@ mod tests {
             allowlist_path: allow_path,
             rotation: uc_crypto::rotation::RotationPolicy::default(),
         };
-        let shared = uc_crypto::SharedTransport::new(&ccfg, self_id).unwrap().unwrap(); // NOT minted
+        let shared = uc_crypto::SharedTransport::new(&ccfg, self_id)
+            .unwrap()
+            .unwrap(); // NOT minted
         shared.send_half()
     }
 
@@ -2782,7 +3038,9 @@ mod tests {
     /// The snapshot artifact's bytes — a recognizable, non-repeating pattern
     /// so "is this on the wire in the clear?" is a real question.
     fn t17_snapshot_bytes() -> Vec<u8> {
-        (0..T17_SNAP_LEN).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect()
+        (0..T17_SNAP_LEN)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+            .collect()
     }
 
     /// The `ConfigRecord` bytes `SnapBeginBody.config` carries — the
@@ -2804,8 +3062,20 @@ mod tests {
         let peer_pub = tk::identity_public(&format!("{tag}-ppub"), T17_PRIV_PEER);
         let allow = [(T17_LEADER_ID, leader_pub), (T17_PEER_ID, peer_pub)];
         let area = "uc2-net-sender-t17";
-        let leader = tk::shared_transport(area, &format!("{tag}-leader"), T17_LEADER_ID, T17_PRIV_LEADER, &allow);
-        let peer = tk::shared_transport(area, &format!("{tag}-peer"), T17_PEER_ID, T17_PRIV_PEER, &allow);
+        let leader = tk::shared_transport(
+            area,
+            &format!("{tag}-leader"),
+            T17_LEADER_ID,
+            T17_PRIV_LEADER,
+            &allow,
+        );
+        let peer = tk::shared_transport(
+            area,
+            &format!("{tag}-peer"),
+            T17_PEER_ID,
+            T17_PRIV_PEER,
+            &allow,
+        );
         tk::establish(&leader, T17_LEADER_ID, &peer, T17_PEER_ID);
         tk::deliver_group_key(&leader, T17_LEADER_ID, &peer, T17_PEER_ID);
 
@@ -2836,7 +3106,10 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(SenderCrypto { half: leader.send_half(), peer_ids }),
+            Some(SenderCrypto {
+                half: leader.send_half(),
+                peer_ids,
+            }),
         );
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
@@ -2922,8 +3195,18 @@ mod tests {
                 services_declared: 0b101,
                 config: t17_config_bytes(),
                 artifacts: vec![
-                    SnapArtifact { service_id: 0, snapshot_pos: 2048, path: p0.clone(), len: 2048 },
-                    SnapArtifact { service_id: 2, snapshot_pos: 4096, path: p2.clone(), len: 3000 },
+                    SnapArtifact {
+                        service_id: 0,
+                        snapshot_pos: 2048,
+                        path: p0.clone(),
+                        len: 2048,
+                    },
+                    SnapArtifact {
+                        service_id: 2,
+                        snapshot_pos: 4096,
+                        path: p2.clone(),
+                        len: 3000,
+                    },
                 ],
             })
         }));
@@ -2959,20 +3242,42 @@ mod tests {
         }
         for b in &begins {
             assert_eq!(b.layout, SNAP_BEGIN_LAYOUT_V2);
-            assert_eq!(b.services_declared, 0b101, "the declared mask rides EVERY begin");
-            assert_eq!(b.session, begins[0].session, "one session for the whole stream");
-            assert_eq!(b.config, t17_config_bytes(), "config rides every begin unchanged");
+            assert_eq!(
+                b.services_declared, 0b101,
+                "the declared mask rides EVERY begin"
+            );
+            assert_eq!(
+                b.session, begins[0].session,
+                "one session for the whole stream"
+            );
+            assert_eq!(
+                b.config,
+                t17_config_bytes(),
+                "config rides every begin unchanged"
+            );
         }
         // A re-send is byte-identical to its original, so distinct bodies ==
         // one per artifact, in ascending `service_id` order.
         begins.dedup();
-        assert_eq!(begins.len(), 2, "one distinct BEGIN per artifact: {begins:?}");
         assert_eq!(
-            (begins[0].service_id, begins[0].snapshot_pos, begins[0].total_len),
+            begins.len(),
+            2,
+            "one distinct BEGIN per artifact: {begins:?}"
+        );
+        assert_eq!(
+            (
+                begins[0].service_id,
+                begins[0].snapshot_pos,
+                begins[0].total_len
+            ),
             (0, 2048, 2048)
         );
         assert_eq!(
-            (begins[1].service_id, begins[1].snapshot_pos, begins[1].total_len),
+            (
+                begins[1].service_id,
+                begins[1].snapshot_pos,
+                begins[1].total_len
+            ),
             (2, 4096, 3000)
         );
         // Stream-global offsets, contiguous over [0, 5048), and no datagram
@@ -3009,7 +3314,12 @@ mod tests {
             .map(|&id| {
                 let path = dir.path().join(format!("snap-{id}-2048.ultsnap"));
                 std::fs::write(&path, vec![0xC3u8; 2048]).unwrap();
-                SnapArtifact { service_id: id, snapshot_pos: 2048, path, len: 2048 }
+                SnapArtifact {
+                    service_id: id,
+                    snapshot_pos: 2048,
+                    path,
+                    len: 2048,
+                }
             })
             .collect();
         let b = buffer();
@@ -3027,11 +3337,13 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        s.set_snapshot_source(Arc::new(move || Some(SnapshotSet {
-            services_declared,
-            config: t17_config_bytes(),
-            artifacts: artifacts.clone(),
-        })));
+        s.set_snapshot_source(Arc::new(move || {
+            Some(SnapshotSet {
+                services_declared,
+                config: t17_config_bytes(),
+                artifacts: artifacts.clone(),
+            })
+        }));
         (s, f, tx, dir)
     }
 
@@ -3049,7 +3361,10 @@ mod tests {
         s.on_nak(addr, 0, 96); // below the ring floor -> upgrades to a session
         s.do_work();
         let (session, stream_len) = {
-            let sess = s.snap.as_ref().expect("the below-floor NAK opened a session");
+            let sess = s
+                .snap
+                .as_ref()
+                .expect("the below-floor NAK opened a session");
             (sess.session, sess.stream_len)
         };
         f.drain();
@@ -3093,8 +3408,14 @@ mod tests {
         for _ in 0..4 {
             s.do_work();
         }
-        assert!(s.snap.is_none(), "a set that misses a declared id must not open a session");
-        assert!(f.recv_raw().is_none(), "not one datagram of a half-formed session goes out");
+        assert!(
+            s.snap.is_none(),
+            "a set that misses a declared id must not open a session"
+        );
+        assert!(
+            f.recv_raw().is_none(),
+            "not one datagram of a half-formed session goes out"
+        );
         assert!(
             s.stats().overruns.load(Ordering::Relaxed) > before,
             "the refusal stays a counted overrun, not a silent drop"
@@ -3121,16 +3442,21 @@ mod tests {
     /// these are inline `#[cfg(test)]` unit tests in the lib target, so this
     /// falls back to a package-relative `target/` directory.
     fn snap_scratch_dir() -> tempfile::TempDir {
-        let root = std::env::var("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_net_tests")
-        });
+        let root = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_net_tests")
+            });
         assert!(
             !root.starts_with("/tmp"),
             "test scratch must not live on tmpfs: {}",
             root.display()
         );
         std::fs::create_dir_all(&root).expect("scratch root");
-        tempfile::Builder::new().prefix("uc2-snap-send-").tempdir_in(&root).expect("tempdir")
+        tempfile::Builder::new()
+            .prefix("uc2-snap-send-")
+            .tempdir_in(&root)
+            .expect("tempdir")
     }
 
     /// A `Sender` whose `SnapshotSource` hands back exactly `set` — so a test
@@ -3166,7 +3492,10 @@ mod tests {
             s.do_work();
         }
         assert!(s.snap.is_none(), "{why}: no session may open");
-        assert!(f.recv_raw().is_none(), "{why}: not one datagram of a half-formed session");
+        assert!(
+            f.recv_raw().is_none(),
+            "{why}: not one datagram of a half-formed session"
+        );
         assert!(
             s.stats().overruns.load(Ordering::Relaxed) > before,
             "{why}: the refusal stays a counted overrun, not a silent drop"
@@ -3185,7 +3514,12 @@ mod tests {
         let make = |id: u8| {
             let path = dir.path().join(format!("snap-{id}.ultsnap"));
             std::fs::write(&path, vec![0xD4u8; 2048]).unwrap();
-            SnapArtifact { service_id: id, snapshot_pos: 2048, path, len: 2048 }
+            SnapArtifact {
+                service_id: id,
+                snapshot_pos: 2048,
+                path,
+                len: 2048,
+            }
         };
 
         // (a) ids 0 and 2 declared, only id 0 shipped.
@@ -3243,7 +3577,12 @@ mod tests {
         let make = |id: u8| {
             let path = dir.path().join(format!("snap-{id}.ultsnap"));
             std::fs::write(&path, vec![0xD4u8; 2048]).unwrap();
-            SnapArtifact { service_id: id, snapshot_pos: 2048, path, len: 2048 }
+            SnapArtifact {
+                service_id: id,
+                snapshot_pos: 2048,
+                path,
+                len: 2048,
+            }
         };
         let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
             services_declared: 0b101,
@@ -3361,7 +3700,8 @@ mod tests {
         for _ in 0..4 {
             s.do_work();
             while let Some(d) = f.recv_raw() {
-                if d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(&d).unwrap().kind == kind {
+                if d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(&d).unwrap().kind == kind
+                {
                     out.push(d);
                 }
             }
@@ -3375,7 +3715,10 @@ mod tests {
         let mtu = s.cfg.mtu;
         let addr = f.addr();
         let chunks = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_CHUNK);
-        assert!(!chunks.is_empty(), "fixture must actually produce snapshot chunks");
+        assert!(
+            !chunks.is_empty(),
+            "fixture must actually produce snapshot chunks"
+        );
 
         let raw = t17_snapshot_bytes();
         for d in &chunks {
@@ -3442,9 +3785,16 @@ mod tests {
             );
         }
         bodies.dedup();
-        assert_eq!(bodies.len(), 1, "exactly one DISTINCT SNAP_BEGIN opens a session");
+        assert_eq!(
+            bodies.len(),
+            1,
+            "exactly one DISTINCT SNAP_BEGIN opens a session"
+        );
         let body = &bodies[0];
-        assert_eq!(body.config, cfgb, "the config survives the round trip intact");
+        assert_eq!(
+            body.config, cfgb,
+            "the config survives the round trip intact"
+        );
         assert_eq!(body.total_len, T17_SNAP_LEN as u64);
         assert_eq!(body.layout, SNAP_BEGIN_LAYOUT_V2);
         assert_eq!(body.service_id, 0);
@@ -3498,9 +3848,15 @@ mod tests {
         let addr = f.addr();
         let before = s.stats().seal_failures.load(Ordering::Relaxed);
         let all = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_CHUNK);
-        assert!(all.is_empty(), "an unsealed snapshot chunk must never reach the wire");
+        assert!(
+            all.is_empty(),
+            "an unsealed snapshot chunk must never reach the wire"
+        );
         let begins = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_BEGIN);
-        assert!(begins.is_empty(), "an unsealed SNAP_BEGIN must never reach the wire");
+        assert!(
+            begins.is_empty(),
+            "an unsealed SNAP_BEGIN must never reach the wire"
+        );
         assert!(
             s.stats().seal_failures.load(Ordering::Relaxed) > before,
             "the drop must be counted, not silent"
@@ -3544,7 +3900,10 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(SenderCrypto { half: leader.send_half(), peer_ids }),
+            Some(SenderCrypto {
+                half: leader.send_half(),
+                peer_ids,
+            }),
         );
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
@@ -3567,6 +3926,9 @@ mod tests {
             f.recv_raw().is_none(),
             "with no established session NOTHING goes out — never a cleartext fallback"
         );
-        assert!(s.stats().seal_failures.load(Ordering::Relaxed) > 0, "counted, not silent");
+        assert!(
+            s.stats().seal_failures.load(Ordering::Relaxed) > 0,
+            "counted, not silent"
+        );
     }
 }

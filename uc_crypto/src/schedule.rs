@@ -211,7 +211,10 @@ mod tests {
         ks.install(1, GroupKey([1u8; 32]));
         ks.install(2, GroupKey([2u8; 32]));
         assert_eq!(ks.current().unwrap().0, 2, "newest install is current");
-        assert!(ks.get(1).is_some(), "previous epoch retained for the overlap");
+        assert!(
+            ks.get(1).is_some(),
+            "previous epoch retained for the overlap"
+        );
         ks.retire_below(2);
         assert!(ks.get(1).is_none(), "retired");
         assert!(ks.get(2).is_some());

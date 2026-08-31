@@ -186,7 +186,11 @@ where
     /// Start a fluent builder. The `store` must already be opened (with its
     /// tables registered) by the caller; the adapter does not own `StoreConfig`.
     pub fn builder(store: Store) -> StoreStateMachineBuilder<C, R, Q, QR> {
-        StoreStateMachineBuilder { store, apply_fn: None, query_fn: None }
+        StoreStateMachineBuilder {
+            store,
+            apply_fn: None,
+            query_fn: None,
+        }
     }
 }
 

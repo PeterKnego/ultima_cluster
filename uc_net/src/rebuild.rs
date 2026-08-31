@@ -21,7 +21,10 @@ pub struct Rebuilt {
 
 impl Rebuilt {
     pub fn new(start: u64) -> Self {
-        Self { contiguous: start, ooo: BTreeMap::new() }
+        Self {
+            contiguous: start,
+            ooo: BTreeMap::new(),
+        }
     }
 
     #[inline]
@@ -72,12 +75,17 @@ impl Rebuilt {
     /// (Tail loss — nothing waiting — is detected against the leader's
     /// heartbeat position by the receiver, not here.)
     pub fn first_gap(&self) -> Option<(u64, u64)> {
-        self.ooo.first_key_value().map(|(&s, _)| (self.contiguous, s))
+        self.ooo
+            .first_key_value()
+            .map(|(&s, _)| (self.contiguous, s))
     }
 
     /// Highest position received (contiguous or not).
     pub fn highest(&self) -> u64 {
-        self.ooo.last_key_value().map(|(_, &e)| e).unwrap_or(self.contiguous)
+        self.ooo
+            .last_key_value()
+            .map(|(_, &e)| e)
+            .unwrap_or(self.contiguous)
     }
 }
 
@@ -92,7 +100,11 @@ pub struct NakConfig {
 
 impl Default for NakConfig {
     fn default() -> Self {
-        Self { delay_min_ns: 200_000, delay_max_ns: 1_000_000, backoff_ns: 5_000_000 }
+        Self {
+            delay_min_ns: 200_000,
+            delay_max_ns: 1_000_000,
+            backoff_ns: 5_000_000,
+        }
     }
 }
 
@@ -113,12 +125,21 @@ impl NakTimer {
             cfg.delay_min_ns <= cfg.delay_max_ns,
             "delay_min_ns must be <= delay_max_ns"
         );
-        Self { cfg, rng: XorShift64::new(seed), armed: None }
+        Self {
+            cfg,
+            rng: XorShift64::new(seed),
+            armed: None,
+        }
     }
 
     fn delay(&mut self) -> u64 {
         let span = self.cfg.delay_max_ns - self.cfg.delay_min_ns;
-        self.cfg.delay_min_ns + if span == 0 { 0 } else { self.rng.next_u64() % span }
+        self.cfg.delay_min_ns
+            + if span == 0 {
+                0
+            } else {
+                self.rng.next_u64() % span
+            }
     }
 
     /// Drive with the current first gap and the current time. Returns the
@@ -139,7 +160,10 @@ impl NakTimer {
             }
             _ => {
                 let d = self.delay();
-                self.armed = Some(Armed { start, deadline_ns: now_ns + d });
+                self.armed = Some(Armed {
+                    start,
+                    deadline_ns: now_ns + d,
+                });
                 None
             }
         }
@@ -240,13 +264,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "delay_min_ns must be <= delay_max_ns")]
     fn nak_config_min_above_max_is_rejected() {
-        let cfg = NakConfig { delay_min_ns: 2, delay_max_ns: 1, backoff_ns: 5 };
+        let cfg = NakConfig {
+            delay_min_ns: 2,
+            delay_max_ns: 1,
+            backoff_ns: 5,
+        };
         let _ = NakTimer::new(cfg, 1);
     }
 
     #[test]
     fn nak_timer_arms_randomized_fires_and_backs_off() {
-        let cfg = NakConfig { delay_min_ns: 200_000, delay_max_ns: 1_000_000, backoff_ns: 5_000_000 };
+        let cfg = NakConfig {
+            delay_min_ns: 200_000,
+            delay_max_ns: 1_000_000,
+            backoff_ns: 5_000_000,
+        };
         let mut t = NakTimer::new(cfg, 42);
         // new gap arms; nothing fires before the deadline
         assert_eq!(t.poll(Some((0, 96)), 0), None);

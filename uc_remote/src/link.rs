@@ -71,11 +71,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::completion::{CompletionQueue, OutcomeTag, Record};
 use crate::conn::FramedConn;
-use crate::engine::{outcome_of, RemoteCompletion, RemoteConfig, RemoteStats};
+use crate::engine::{RemoteCompletion, RemoteConfig, RemoteStats, outcome_of};
 use crate::error::RemoteError;
 use crate::frame::{
-    decode_header, encode_frame, FrameType, Header, Hello, HelloOk, HelloRefused, Leader,
-    HEADER_LEN, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, PROTOCOL_VERSION,
+    FrameType, HEADER_LEN, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, Header, Hello, HelloOk,
+    HelloRefused, Leader, PROTOCOL_VERSION, decode_header, encode_frame,
 };
 use crate::outgoing::OutRing;
 use crate::slots::SlotTable;
@@ -140,7 +140,8 @@ impl FlowWord {
     /// Unconditional — installing a connection supersedes whatever the
     /// previous one had to say.
     fn install(&self, generation: u64, credits: u32) {
-        self.0.store(Self::pack(generation, credits), Ordering::Release);
+        self.0
+            .store(Self::pack(generation, credits), Ordering::Release);
     }
 
     /// Apply a grant read off connection `generation`. `false` = that
@@ -152,7 +153,10 @@ impl FlowWord {
             if (cur >> 32) != (want >> 32) {
                 return false;
             }
-            match self.0.compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Acquire) {
+            match self
+                .0
+                .compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return true,
                 Err(now) => cur = now,
             }
@@ -284,7 +288,9 @@ impl Link {
         conn.set_read_timeout(Some(SWEEP_INTERVAL))?;
         conn.set_write_timeout(Some(WRITE_TIMEOUT))?;
         let watch = conn.try_clone()?;
-        stats.max_credits_seen.store(info.credits, Ordering::Relaxed);
+        stats
+            .max_credits_seen
+            .store(info.credits, Ordering::Relaxed);
 
         let link = Arc::new(Link {
             slots: SlotTable::new(cfg.max_inflight),
@@ -494,7 +500,9 @@ impl Link {
             if self.closed() {
                 return false;
             }
-            self.completions.drained().park(observed, Duration::from_millis(1));
+            self.completions
+                .drained()
+                .park(observed, Duration::from_millis(1));
         }
     }
 
@@ -599,7 +607,8 @@ impl Link {
         if !self.slots.mark_sent_if(seq, false) {
             return;
         }
-        self.slots.set_not_before_if(seq, self.now_ns() + delay.as_nanos() as u64);
+        self.slots
+            .set_not_before_if(seq, self.now_ns() + delay.as_nanos() as u64);
         let mut g = self.retransmit.lock().unwrap();
         if !g.contains(&seq) {
             g.push(seq);
@@ -623,7 +632,8 @@ impl Link {
     /// once there is a fresh connection to put it on; only the backoff is
     /// recorded here, and it survives that scan because it lives in the slot.
     fn hold_off(&self, seq: u64, delay: Duration) {
-        self.slots.set_not_before_if(seq, self.now_ns() + delay.as_nanos() as u64);
+        self.slots
+            .set_not_before_if(seq, self.now_ns() + delay.as_nanos() as u64);
     }
 
     /// The leader the edge last named. `None` clears it (a `LEADER_CHANGED`
@@ -708,7 +718,11 @@ pub(crate) fn drain_completions(
     link.completions.drain(POLL_BATCH, |rec, body| {
         cb(RemoteCompletion {
             user_data: rec.user_data,
-            position: if rec.has_position { Some(rec.position) } else { None },
+            position: if rec.has_position {
+                Some(rec.position)
+            } else {
+                None
+            },
             outcome: outcome_of(rec.tag, body, rec.replayed, rec.expired),
         })
     })
@@ -778,7 +792,10 @@ impl Writer {
                         self.link.request_redial(self.generation, None);
                         continue;
                     }
-                    self.link.stats.socket_writes.fetch_add(1, Ordering::Relaxed);
+                    self.link
+                        .stats
+                        .socket_writes
+                        .fetch_add(1, Ordering::Relaxed);
                     did_work = true;
                     self.last_write = Instant::now();
                 }
@@ -893,7 +910,9 @@ impl Writer {
                 break;
             }
             i += 1;
-            let Some((off, len)) = link.slots.live_extent(seq) else { continue };
+            let Some((off, len)) = link.slots.live_extent(seq) else {
+                continue;
+            };
             link.out.copy_range(off, len, &mut one);
             if !link.slots.is_live(seq) || !link.slots.mark_sent_if(seq, true) {
                 // Resolved under us between the extent read and here: the
@@ -966,7 +985,10 @@ impl Writer {
                 chunk.len()
             };
             self.link.out.consume(n);
-            self.link.stats.socket_writes.fetch_add(1, Ordering::Relaxed);
+            self.link
+                .stats
+                .socket_writes
+                .fetch_add(1, Ordering::Relaxed);
             wrote = true;
             self.advance_cursor();
         }
@@ -1013,11 +1035,19 @@ impl Writer {
                 // A frame written more than once is a re-send by definition;
                 // TASK 8 is what creates them, and this is where they are
                 // counted so the counter cannot drift from what was written.
-                if self.link.slots.bump_attempts_if(self.cursor).is_some_and(|n| n > 1) {
+                if self
+                    .link
+                    .slots
+                    .bump_attempts_if(self.cursor)
+                    .is_some_and(|n| n > 1)
+                {
                     self.link.stats.resends.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            self.link.stats.frames_written.fetch_add(1, Ordering::Relaxed);
+            self.link
+                .stats
+                .frames_written
+                .fetch_add(1, Ordering::Relaxed);
             self.cursor += 1;
         }
     }
@@ -1048,14 +1078,18 @@ impl Writer {
                 Some(&link),
             ) {
                 Ok((fresh, info, idx, addr)) => {
-                    let Ok(read_half) = fresh.try_clone() else { continue };
+                    let Ok(read_half) = fresh.try_clone() else {
+                        continue;
+                    };
                     if read_half.set_read_timeout(Some(SWEEP_INTERVAL)).is_err()
                         || fresh.set_read_timeout(Some(SWEEP_INTERVAL)).is_err()
                         || fresh.set_write_timeout(Some(WRITE_TIMEOUT)).is_err()
                     {
                         continue;
                     }
-                    let Ok(watch) = fresh.try_clone() else { continue };
+                    let Ok(watch) = fresh.try_clone() else {
+                        continue;
+                    };
                     if link.closed() {
                         fresh.shutdown();
                         return false;
@@ -1065,7 +1099,9 @@ impl Writer {
                     if info.leader.is_some() {
                         *link.leader.lock().unwrap() = info.leader;
                     }
-                    link.stats.max_credits_seen.fetch_max(info.credits, Ordering::Relaxed);
+                    link.stats
+                        .max_credits_seen
+                        .fetch_max(info.credits, Ordering::Relaxed);
                     // ONE critical section installs the connection: bump the
                     // generation, publish the socket, reset the
                     // per-connection flow-control state, hand the read half
@@ -1253,7 +1289,10 @@ fn flush_limit(link: &Arc<Link>, cursor: u64) -> u64 {
         // Unreachable: these are the bytes this client encoded itself. If it
         // ever happens, the frame stream is corrupt and holding the drain
         // back is the safest answer.
-        debug_assert!(false, "the outgoing ring holds a frame this client cannot decode");
+        debug_assert!(
+            false,
+            "the outgoing ring holds a frame this client cannot decode"
+        );
         return send;
     };
     if link.slots.is_live(cursor) {
@@ -1335,7 +1374,14 @@ struct Reader {
 impl Reader {
     fn new(link: Arc<Link>, rd: FramedConn) -> Reader {
         let now = Instant::now();
-        Reader { link, rd, generation: 0, last_recv: now, last_sweep: now, _not_sync: PhantomData }
+        Reader {
+            link,
+            rd,
+            generation: 0,
+            last_recv: now,
+            last_sweep: now,
+            _not_sync: PhantomData,
+        }
     }
 
     fn run(mut self) {
@@ -1492,7 +1538,9 @@ impl Reader {
                 Act::Continue
             }
             FrameType::Status => {
-                let Ok(s) = crate::frame::Status::decode(&payload) else { return Act::Continue };
+                let Ok(s) = crate::frame::Status::decode(&payload) else {
+                    return Act::Continue;
+                };
                 // A STATUS that acknowledges the probe says what a RESPONSE
                 // would: this edge took our write. A bare idle STATUS, whose
                 // `acked_seq` is still below the probe, proves only that the
@@ -1505,7 +1553,9 @@ impl Reader {
                 Act::Continue
             }
             FrameType::Retry => {
-                let Ok(r) = crate::frame::Retry::decode(&payload) else { return Act::Continue };
+                let Ok(r) = crate::frame::Retry::decode(&payload) else {
+                    return Act::Continue;
+                };
                 if r.reason == crate::frame::RETRY_PAYLOAD_TOO_LARGE {
                     // Terminal: the payload will not get smaller by being sent
                     // again, and no other member would take it either.
@@ -1518,7 +1568,9 @@ impl Reader {
                     return Act::Continue;
                 }
                 self.link.stats.retries.fetch_add(1, Ordering::Relaxed);
-                let delay = self.link.jittered(Duration::from_micros(r.retry_after_us as u64));
+                let delay = self
+                    .link
+                    .jittered(Duration::from_micros(r.retry_after_us as u64));
                 if r.reason == crate::frame::RETRY_NOT_SERVING {
                     // A statement about the edge's ROLE, not a transient
                     // shortage — and one that does not expire on this
@@ -1545,7 +1597,9 @@ impl Reader {
             }
             FrameType::Redirect => {
                 self.link.stats.redirects.fetch_add(1, Ordering::Relaxed);
-                let Ok(l) = Leader::decode(&payload) else { return Act::Continue };
+                let Ok(l) = Leader::decode(&payload) else {
+                    return Act::Continue;
+                };
                 if l.addr.is_empty() {
                     // Refused, not answered, and no hint where to go. The
                     // redial's own scan is what puts it back on the wire.
@@ -1568,8 +1622,13 @@ impl Reader {
                 Act::Reconnect(Some(l.addr.to_string()))
             }
             FrameType::LeaderChanged => {
-                self.link.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
-                let Ok(l) = Leader::decode(&payload) else { return Act::Continue };
+                self.link
+                    .stats
+                    .leader_changes
+                    .fetch_add(1, Ordering::Relaxed);
+                let Ok(l) = Leader::decode(&payload) else {
+                    return Act::Continue;
+                };
                 if l.addr.is_empty() {
                     // Mid-election: nobody is claiming it. Move, and let the
                     // dial scan find whoever answers.
@@ -1612,20 +1671,26 @@ impl Reader {
                 } else if let crate::slots::Resolve::Won { user_data } =
                     self.link.slots.resolve(h.seq)
                 {
-                    let _ =
-                        self.link.complete(Record::simple(user_data, OutcomeTag::Unknown), &[]);
+                    let _ = self
+                        .link
+                        .complete(Record::simple(user_data, OutcomeTag::Unknown), &[]);
                 }
                 Act::Continue
             }
             FrameType::HelloRefused => {
-                let reason = HelloRefused::decode(&payload).map(|r| r.reason).unwrap_or(0);
+                let reason = HelloRefused::decode(&payload)
+                    .map(|r| r.reason)
+                    .unwrap_or(0);
                 // Same split as the dial path: what the refusal is ABOUT
                 // decides who it is terminal for. FAULTED/BUSY are statements
                 // about THIS EDGE, so they cost one member; anything else
                 // (APP_ID/VERSION) is about US and no member would answer
                 // differently.
                 if reason == HELLO_REFUSED_FAULTED || reason == HELLO_REFUSED_BUSY {
-                    self.link.stats.refused_members.fetch_add(1, Ordering::Relaxed);
+                    self.link
+                        .stats
+                        .refused_members
+                        .fetch_add(1, Ordering::Relaxed);
                     return Act::Reconnect(None);
                 }
                 Act::Stop
@@ -1663,7 +1728,9 @@ pub(crate) fn credit_update(link: &Arc<Link>, generation: u64, credits: u32, ack
     if !link.flow.try_update(generation, credits) {
         return;
     }
-    link.stats.max_credits_seen.fetch_max(credits, Ordering::Relaxed);
+    link.stats
+        .max_credits_seen
+        .fetch_max(credits, Ordering::Relaxed);
     link.acked_seq.fetch_max(acked_seq, Ordering::AcqRel);
     // A wider window may have unblocked the writer.
     link.out.wake().signal();
@@ -1743,7 +1810,11 @@ fn dial(
         visited.push(addr.clone());
         match dial_one(cfg, client_id, &addr) {
             Dialed::Ok(conn, info) => {
-                let idx = cfg.members.iter().position(|m| *m == addr).unwrap_or(start_idx % n);
+                let idx = cfg
+                    .members
+                    .iter()
+                    .position(|m| *m == addr)
+                    .unwrap_or(start_idx % n);
                 // `HELLO_OK` named a leader that is not this edge. Hop to it
                 // BEFORE committing to this connection.
                 //
@@ -1790,7 +1861,10 @@ fn dial(
             // or it is already serving `max_connections`. Every other member
             // may be perfectly healthy, so this costs one member and the scan
             // goes on — only a full pass of failures is `NoMembersReachable`.
-            Dialed::Refused { reason: HELLO_REFUSED_FAULTED | HELLO_REFUSED_BUSY, .. } => {
+            Dialed::Refused {
+                reason: HELLO_REFUSED_FAULTED | HELLO_REFUSED_BUSY,
+                ..
+            } => {
                 stats.refused_members.fetch_add(1, Ordering::Relaxed);
                 i += 1;
             }
@@ -1799,7 +1873,7 @@ fn dial(
             // into `NoMembersReachable` — the least useful thing to tell an
             // operator who has mistyped a cluster name.
             Dialed::Refused { reason, detail } => {
-                return Err(RemoteError::HelloRefused { reason, detail })
+                return Err(RemoteError::HelloRefused { reason, detail });
             }
             Dialed::Failed => i += 1,
         }
@@ -1828,14 +1902,19 @@ fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
     let Ok(sock) = TcpStream::connect_timeout(&sa, cfg.connect_timeout) else {
         return Dialed::Failed;
     };
-    let Ok(mut conn) = FramedConn::new(sock) else { return Dialed::Failed };
+    let Ok(mut conn) = FramedConn::new(sock) else {
+        return Dialed::Failed;
+    };
     if conn.set_read_timeout(Some(cfg.connect_timeout)).is_err()
         || conn.set_write_timeout(Some(cfg.connect_timeout)).is_err()
     {
         return Dialed::Failed;
     }
     let mut out = Vec::new();
-    Hello { app_id: &cfg.app_id }.encode(&mut out);
+    Hello {
+        app_id: &cfg.app_id,
+    }
+    .encode(&mut out);
     let hello = Header {
         ty: FrameType::Hello,
         flags: 0,
@@ -1859,12 +1938,21 @@ fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
                     FrameType::HelloOk => match HelloOk::decode(&payload) {
                         Ok(ok) => {
                             let leader = ok.leader.map(|id| (id, addr_or(ok.leader_addr, addr)));
-                            Dialed::Ok(conn, HelloInfo { credits: ok.credits, leader })
+                            Dialed::Ok(
+                                conn,
+                                HelloInfo {
+                                    credits: ok.credits,
+                                    leader,
+                                },
+                            )
                         }
                         Err(_) => Dialed::Failed,
                     },
                     FrameType::HelloRefused => match HelloRefused::decode(&payload) {
-                        Ok(r) => Dialed::Refused { reason: r.reason, detail: r.detail.to_string() },
+                        Ok(r) => Dialed::Refused {
+                            reason: r.reason,
+                            detail: r.detail.to_string(),
+                        },
                         Err(_) => Dialed::Failed,
                     },
                     FrameType::Redirect => match Leader::decode(&payload) {
@@ -1885,7 +1973,11 @@ fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
 }
 
 fn addr_or(advertised: &str, fallback: &str) -> String {
-    if advertised.is_empty() { fallback.to_string() } else { advertised.to_string() }
+    if advertised.is_empty() {
+        fallback.to_string()
+    } else {
+        advertised.to_string()
+    }
 }
 
 /// A random-enough `client_id`: the process-random `RandomState` seed, mixed
@@ -1897,7 +1989,12 @@ fn random_u64() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut h = RandomState::new().build_hasher();
     h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-    h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
     let v = h.finish();
     if v == 0 { 0x5DEE_CE66_D1CE_4B1D } else { v }
 }
@@ -1946,7 +2043,11 @@ mod tests {
                     let _ = c.join();
                 }
             });
-            StubEdge { addr, stop, acceptor: Some(acceptor) }
+            StubEdge {
+                addr,
+                stop,
+                acceptor: Some(acceptor),
+            }
         }
     }
 
@@ -1960,7 +2061,9 @@ mod tests {
     }
 
     fn serve_stub(sock: TcpStream, credits: u32, stop: Arc<AtomicBool>) {
-        let Ok(mut c) = FramedConn::new(sock) else { return };
+        let Ok(mut c) = FramedConn::new(sock) else {
+            return;
+        };
         if c.set_read_timeout(Some(Duration::from_millis(20))).is_err() {
             return;
         }
@@ -1972,7 +2075,12 @@ mod tests {
                             let mut out = Vec::new();
                             // An empty `leader_addr` resolves to the dialed
                             // address (`addr_or`), so the dial never hops.
-                            HelloOk { credits, leader: Some(1), leader_addr: "" }.encode(&mut out);
+                            HelloOk {
+                                credits,
+                                leader: Some(1),
+                                leader_addr: "",
+                            }
+                            .encode(&mut out);
                             c.write_frame(stub_hdr(FrameType::HelloOk, h.client_id, 0), &out)
                         }
                         FrameType::Ping => {
@@ -1995,7 +2103,13 @@ mod tests {
     }
 
     fn stub_hdr(ty: FrameType, client_id: u64, seq: u64) -> Header {
-        Header { ty, flags: 0, version: PROTOCOL_VERSION, client_id, seq }
+        Header {
+            ty,
+            flags: 0,
+            version: PROTOCOL_VERSION,
+            client_id,
+            seq,
+        }
     }
 
     fn stub_cfg(addr: &str, max_inflight: u32) -> RemoteConfig {
@@ -2025,10 +2139,21 @@ mod tests {
         link.request_redial(generation.wrapping_add(1), None);
         std::thread::sleep(Duration::from_millis(150));
 
-        assert!(link.is_connected(), "a stale redial tore down a healthy connection");
-        assert_eq!(link.stats().reconnects, 0, "a stale redial cost a reconnect");
+        assert!(
+            link.is_connected(),
+            "a stale redial tore down a healthy connection"
+        );
+        assert_eq!(
+            link.stats().reconnects,
+            0,
+            "a stale redial cost a reconnect"
+        );
         assert_eq!(link.stats().stale_redials, 1);
-        assert_eq!(link.credits(), 5, "the live connection's grant must survive");
+        assert_eq!(
+            link.credits(),
+            5,
+            "the live connection's grant must survive"
+        );
 
         // The gate is a filter, not a mute: a complaint that DOES name the
         // current connection still works.
@@ -2037,7 +2162,11 @@ mod tests {
         while link.stats().reconnects == 0 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(link.stats().reconnects, 1, "a current-generation redial must be honoured");
+        assert_eq!(
+            link.stats().reconnects,
+            1,
+            "a current-generation redial must be honoured"
+        );
         link.close();
     }
 
@@ -2054,8 +2183,16 @@ mod tests {
         assert_eq!(link.credits(), 9, "a current-generation grant applies");
         assert_eq!(link.acked_seq(), 3, "and so does the acked_seq riding it");
         credit_update(&link, generation.wrapping_sub(1), 4096, 99);
-        assert_eq!(link.credits(), 9, "a superseded grant must not overwrite the live window");
-        assert_eq!(link.acked_seq(), 3, "nor may its acked_seq be applied on its own");
+        assert_eq!(
+            link.credits(),
+            9,
+            "a superseded grant must not overwrite the live window"
+        );
+        assert_eq!(
+            link.acked_seq(),
+            3,
+            "nor may its acked_seq be applied on its own"
+        );
         link.close();
     }
 
@@ -2080,7 +2217,10 @@ mod tests {
         assert_eq!(f.credits(), 2);
         assert!(!f.try_update(7, 4096));
         assert_eq!(f.credits(), 2, "the fresh HELLO_OK window must survive");
-        assert!(f.try_update(8, 3), "the new connection's own grant still applies");
+        assert!(
+            f.try_update(8, 3),
+            "the new connection's own grant still applies"
+        );
         assert_eq!(f.credits(), 3);
 
         // A grant MAY decrease, and zero is a legal grant (the edge is asking
@@ -2091,7 +2231,10 @@ mod tests {
         // Only the low 32 bits identify a connection. Asserted rather than
         // hidden: a grant would have to outlive 2^32 redials to alias, which
         // no buffered frame does.
-        assert!(f.try_update(8 + (1u64 << 32), 5), "the generation tag is the low 32 bits");
+        assert!(
+            f.try_update(8 + (1u64 << 32), 5),
+            "the generation tag is the low 32 bits"
+        );
         assert_eq!(f.credits(), 5);
     }
 
@@ -2114,13 +2257,22 @@ mod tests {
             n += 1;
             assert!(n < 10_000, "the queue never filled");
         }
-        assert!(n >= 16, "the queue should have taken at least its slot floor, took {n}");
-        assert!(t.elapsed() < Duration::from_secs(5), "complete parked on a full queue after close");
+        assert!(
+            n >= 16,
+            "the queue should have taken at least its slot floor, took {n}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "complete parked on a full queue after close"
+        );
 
         // And the close path itself: a second `close` runs `abort_outstanding`
         // against that same full queue and must still return.
         let t = Instant::now();
         link.close();
-        assert!(t.elapsed() < Duration::from_secs(5), "close wedged on a full completion queue");
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "close wedged on a full completion queue"
+        );
     }
 }

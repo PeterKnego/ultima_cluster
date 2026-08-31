@@ -21,7 +21,7 @@
 //!
 //! 8. `resolve` reports `first` — whether the delivery it just recorded was the FIRST ring piece of this generation. For a multi-ring request that is `received == 0` before the `fetch_or`; for a single-ring request it is `true` by construction (a set of one has nothing preceding its only piece), decided without reading `received` at all. This exists because invariant 4's outstanding-gap argument protects the SLOT (freed and re-claimed under a fresh `expected`/`received`), not the engine-side fan-in piece buffer indexed by the same slot index: a partial fan-in ended by a ring-less terminal or the deadline sweep leaves pieces behind, and the generation 2^32 requests later at that index carries the SAME u32 wire seq — so a seq comparison cannot tell the two apart, while `first` (decided here, by the slot table) always can. The buffer resets on `first`, never on a seq change.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 const FREE: u64 = 0;
 const RESERVED: u64 = u64::MAX;
@@ -45,7 +45,11 @@ pub(crate) enum Resolve {
     /// true when THIS delivery was the generation's first ring piece (see
     /// [`Resolve::Partial`]); it is always false for a ring-less terminal
     /// (`ring: None`), which carries no piece to buffer.
-    Won { user_data: u64, fan_in: bool, first: bool },
+    Won {
+        user_data: u64,
+        fan_in: bool,
+        first: bool,
+    },
     /// This ring's piece was recorded; other expected rings are still pending.
     /// Slot stays live. `first` is true when no ring had answered this
     /// generation yet (`received` was 0 before this piece) — the fan-in
@@ -53,7 +57,9 @@ pub(crate) enum Resolve {
     /// seq, which repeats every 2^32 requests at the same slot index
     /// (invariant 4's outstanding-gap argument covers the SLOT, which is
     /// re-claimed, not the engine-side piece buffer, which is not).
-    Partial { first: bool },
+    Partial {
+        first: bool,
+    },
     KindMismatch,
     /// A response from a ring the request did not expect — dropped, slot untouched.
     WrongRing,
@@ -61,7 +67,7 @@ pub(crate) enum Resolve {
 }
 
 struct Slot {
-    owner: AtomicU64,       // FREE / RESERVED / seq+1
+    owner: AtomicU64, // FREE / RESERVED / seq+1
     user_data: AtomicU64,
     deadline_ns: AtomicU64, // nanos since the engine's t0
     kind: AtomicU8,         // ReqKind as u8
@@ -161,7 +167,12 @@ impl SlotTable {
         }
     }
 
-    pub(crate) fn resolve(&self, wire_seq: u32, expect_kind: Option<ReqKind>, ring: Option<u8>) -> Resolve {
+    pub(crate) fn resolve(
+        &self,
+        wire_seq: u32,
+        expect_kind: Option<ReqKind>,
+        ring: Option<u8>,
+    ) -> Resolve {
         let slot = &self.slots[(wire_seq as usize) & self.mask];
         let owner = slot.owner.load(Ordering::Acquire);
         if owner == FREE || owner == RESERVED {
@@ -232,7 +243,11 @@ impl SlotTable {
             return Resolve::Miss; // lost the race to sweep/another delivery
         }
         self.inflight.fetch_sub(1, Ordering::AcqRel);
-        Resolve::Won { user_data, fan_in, first }
+        Resolve::Won {
+            user_data,
+            fan_in,
+            first,
+        }
     }
 
     /// The table index a wire seq maps to (the engine's fan-in buffer is
@@ -301,7 +316,9 @@ impl SlotTable {
     /// single-ring fast path is observed.
     #[cfg(test)]
     pub(crate) fn received_for_tests(&self, wire_seq: u32) -> u8 {
-        self.slots[(wire_seq as usize) & self.mask].received.load(Ordering::Relaxed)
+        self.slots[(wire_seq as usize) & self.mask]
+            .received
+            .load(Ordering::Relaxed)
     }
 
     /// The number of slots (the engine sizes its fan-in buffer off this).
@@ -317,7 +334,9 @@ mod tests {
     #[test]
     fn claim_resolve_roundtrip_returns_user_data_and_decrements_inflight() {
         let t = SlotTable::new(8, 0);
-        let seq = t.claim(0xAB, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        let seq = t
+            .claim(0xAB, ReqKind::Submit, u64::MAX, 0b1, false)
+            .unwrap();
         assert_eq!(t.inflight(), 1);
         match t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)) {
             Resolve::Won { user_data, .. } => assert_eq!(user_data, 0xAB),
@@ -330,8 +349,15 @@ mod tests {
     fn second_resolve_is_a_miss_exactly_once() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(1, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
-        assert!(matches!(t.resolve(seq as u32, None, Some(0)), Resolve::Won { .. }));
-        assert_eq!(t.resolve(seq as u32, None, Some(0)), Resolve::Miss, "duplicate must not double-complete");
+        assert!(matches!(
+            t.resolve(seq as u32, None, Some(0)),
+            Resolve::Won { .. }
+        ));
+        assert_eq!(
+            t.resolve(seq as u32, None, Some(0)),
+            Resolve::Miss,
+            "duplicate must not double-complete"
+        );
         // The single-ring fast path removes the `received`-bit duplicate
         // check; the owner CAS is what makes this a Miss.
         assert_eq!(t.inflight(), 0);
@@ -343,9 +369,15 @@ mod tests {
         // must not satisfy a Submit claim; the slot survives for the real one.
         let t = SlotTable::new(8, 0);
         let seq = t.claim(2, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Query), Some(0)), Resolve::KindMismatch);
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Query), Some(0)),
+            Resolve::KindMismatch
+        );
         assert_eq!(t.inflight(), 1, "slot must survive a kind mismatch");
-        assert!(matches!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Won { .. }));
+        assert!(matches!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Won { .. }
+        ));
     }
 
     #[test]
@@ -353,10 +385,17 @@ mod tests {
         let t = SlotTable::new(2, 0);
         let a = t.claim(1, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
         let _b = t.claim(2, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
-        assert_eq!(t.claim(3, ReqKind::Submit, u64::MAX, 0b1, false), Err(ClaimError::WindowFull));
-        assert!(t.release(a), "failed ring write path: release must win uncontested"); // failed ring write path
+        assert_eq!(
+            t.claim(3, ReqKind::Submit, u64::MAX, 0b1, false),
+            Err(ClaimError::WindowFull)
+        );
+        assert!(
+            t.release(a),
+            "failed ring write path: release must win uncontested"
+        ); // failed ring write path
         assert_eq!(t.inflight(), 1);
-        t.claim(4, ReqKind::Submit, u64::MAX, 0b1, false).expect("window reopened by release");
+        t.claim(4, ReqKind::Submit, u64::MAX, 0b1, false)
+            .expect("window reopened by release");
     }
 
     #[test]
@@ -365,9 +404,15 @@ mod tests {
         let stuck = t.claim(7, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
         // Force the sequence to wrap the table back onto `stuck`'s slot.
         t.set_next_seq_for_tests(stuck + t.slot_count() as u64);
-        assert_eq!(t.claim(8, ReqKind::Submit, u64::MAX, 0b1, false), Err(ClaimError::SlotBusy));
+        assert_eq!(
+            t.claim(8, ReqKind::Submit, u64::MAX, 0b1, false),
+            Err(ClaimError::SlotBusy)
+        );
         // The stuck occupant is untouched and still resolvable.
-        assert!(matches!(t.resolve(stuck as u32, None, Some(0)), Resolve::Won { user_data: 7, .. }));
+        assert!(matches!(
+            t.resolve(stuck as u32, None, Some(0)),
+            Resolve::Won { user_data: 7, .. }
+        ));
     }
 
     #[test]
@@ -379,7 +424,10 @@ mod tests {
         t.sweep(5_000, |ud| expired.push(ud));
         assert_eq!(expired, vec![1]);
         assert_eq!(t.inflight(), 1);
-        assert!(matches!(t.resolve(late as u32, None, Some(0)), Resolve::Won { user_data: 2, .. }));
+        assert!(matches!(
+            t.resolve(late as u32, None, Some(0)),
+            Resolve::Won { user_data: 2, .. }
+        ));
     }
 
     /// The lost-release side of the exactly-once protocol (invariant 3):
@@ -393,14 +441,27 @@ mod tests {
     #[test]
     fn release_after_the_slot_was_already_completed_elsewhere_loses_cleanly() {
         let t = SlotTable::new(8, 0);
-        let seq = t.claim(0xABCD, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        let seq = t
+            .claim(0xABCD, ReqKind::Submit, u64::MAX, 0b1, false)
+            .unwrap();
         let mut drained = Vec::new();
         t.drain_abort(|ud| drained.push(ud));
-        assert_eq!(drained, vec![0xABCD], "drain_abort must win the completion first");
+        assert_eq!(
+            drained,
+            vec![0xABCD],
+            "drain_abort must win the completion first"
+        );
         assert_eq!(t.inflight(), 0, "drain_abort already decremented inflight");
 
-        assert!(!t.release(seq), "a completed slot's release must lose its CAS");
-        assert_eq!(t.inflight(), 0, "a lost release must not double-decrement inflight");
+        assert!(
+            !t.release(seq),
+            "a completed slot's release must lose its CAS"
+        );
+        assert_eq!(
+            t.inflight(),
+            0,
+            "a lost release must not double-decrement inflight"
+        );
     }
 
     #[test]
@@ -431,8 +492,10 @@ mod tests {
 
     #[test]
     fn concurrent_exactly_once_stress() {
-        use std::sync::atomic::{AtomicU32, AtomicU64 as StdAtomicU64, AtomicBool, Ordering as AtomicOrdering};
         use std::sync::Arc;
+        use std::sync::atomic::{
+            AtomicBool, AtomicU32, AtomicU64 as StdAtomicU64, Ordering as AtomicOrdering,
+        };
 
         const THREADS: u64 = 4;
         const ITERATIONS: u64 = 10_000;
@@ -443,13 +506,22 @@ mod tests {
 
         // Track completions AND releases per user_data (one AtomicU32 per possible user_data).
         // Encoding: completions[ud] = resolve/sweep count, released[ud] = release success count.
-        let completions: Arc<Vec<AtomicU32>> =
-            Arc::new((0..TOTAL_CLAIMS as usize).map(|_| AtomicU32::new(0)).collect());
-        let released: Arc<Vec<AtomicU32>> =
-            Arc::new((0..TOTAL_CLAIMS as usize).map(|_| AtomicU32::new(0)).collect());
+        let completions: Arc<Vec<AtomicU32>> = Arc::new(
+            (0..TOTAL_CLAIMS as usize)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+        );
+        let released: Arc<Vec<AtomicU32>> = Arc::new(
+            (0..TOTAL_CLAIMS as usize)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+        );
         // Track which user_data values were successfully claimed.
-        let claimed: Arc<Vec<AtomicU32>> =
-            Arc::new((0..TOTAL_CLAIMS as usize).map(|_| AtomicU32::new(0)).collect());
+        let claimed: Arc<Vec<AtomicU32>> = Arc::new(
+            (0..TOTAL_CLAIMS as usize)
+                .map(|_| AtomicU32::new(0))
+                .collect(),
+        );
 
         // Count total claims accepted.
         let claims_accepted = Arc::new(StdAtomicU64::new(0));
@@ -485,14 +557,18 @@ mod tests {
                                 // Randomly resolve or release.
                                 if lcg(&mut seed) {
                                     // Try to resolve it ourselves.
-                                    if let Resolve::Won { user_data: ud, .. } = table.resolve(seq as u32, None, Some(0)) {
-                                        completions[ud as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                                    if let Resolve::Won { user_data: ud, .. } =
+                                        table.resolve(seq as u32, None, Some(0))
+                                    {
+                                        completions[ud as usize]
+                                            .fetch_add(1, AtomicOrdering::Relaxed);
                                     }
                                     // If resolve lost to sweep, sweep will count the completion.
                                 } else {
                                     // Try to release. Track whether we won the CAS.
                                     if table.release(seq) {
-                                        released[user_data as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                                        released[user_data as usize]
+                                            .fetch_add(1, AtomicOrdering::Relaxed);
                                     }
                                     // If release lost to sweep, sweep already counted the completion.
                                 }
@@ -529,7 +605,10 @@ mod tests {
                             panic!("sweeper failed to quiesce — inflight accounting bug?");
                         }
 
-                        if !had_live && table.inflight() == 0 && claimers_done.load(AtomicOrdering::Acquire) {
+                        if !had_live
+                            && table.inflight() == 0
+                            && claimers_done.load(AtomicOrdering::Acquire)
+                        {
                             break;
                         }
                         // Yield to let other threads progress.
@@ -558,9 +637,12 @@ mod tests {
                 // For each claimed request, exactly one of the three paths won:
                 // resolve (by claimer), sweep (by sweeper), or release (by claimer).
                 assert_eq!(
-                    comp_count + rel_count, 1,
+                    comp_count + rel_count,
+                    1,
                     "claimed user_data {}: completions={} + released={} must == 1 (exactly once)",
-                    ud, comp_count, rel_count
+                    ud,
+                    comp_count,
+                    rel_count
                 );
             }
         }
@@ -570,7 +652,9 @@ mod tests {
             claims,
             total_completions + total_released,
             "total accepted claims {} must equal total completions {} + releases {}",
-            claims, total_completions, total_released
+            claims,
+            total_completions,
+            total_released
         );
         assert_eq!(table.inflight(), 0, "inflight must be 0 at end");
     }
@@ -579,11 +663,18 @@ mod tests {
     fn a_response_from_an_unexpected_ring_is_dropped_and_the_slot_survives() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(7, ReqKind::Submit, u64::MAX, 0b01, false).unwrap(); // expects ring 0 only
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)), Resolve::WrongRing);
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)),
+            Resolve::WrongRing
+        );
         assert_eq!(t.inflight(), 1);
         assert_eq!(
             t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 7, fan_in: false, first: true }
+            Resolve::Won {
+                user_data: 7,
+                fan_in: false,
+                first: true
+            }
         );
         assert_eq!(t.inflight(), 0);
     }
@@ -592,28 +683,49 @@ mod tests {
     fn fan_in_completes_only_when_every_expected_ring_answered_in_any_order() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(8, ReqKind::Submit, u64::MAX, 0b101, true).unwrap(); // rings 0 and 2
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)), Resolve::Partial { first: true });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)),
+            Resolve::Partial { first: true }
+        );
         assert_eq!(t.inflight(), 1, "a partial keeps the slot live");
         // A duplicate from the same ring is a Miss, not a second piece.
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)), Resolve::Miss);
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(2)),
+            Resolve::Miss
+        );
         assert_eq!(
             t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 8, fan_in: true, first: false }
+            Resolve::Won {
+                user_data: 8,
+                fan_in: true,
+                first: false
+            }
         );
         assert_eq!(t.inflight(), 0);
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Miss, "freed");
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Miss,
+            "freed"
+        );
     }
 
     #[test]
     fn a_terminal_answer_completes_a_partial_fan_in() {
         let t = SlotTable::new(8, 0);
         let seq = t.claim(9, ReqKind::Query, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Query), Some(1)), Resolve::Partial { first: true });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Query), Some(1)),
+            Resolve::Partial { first: true }
+        );
         // NOT_LEADER / RETRY / BAD_SERVICE are ring-less and kind-agnostic: they end the whole
         // request. They carry no piece, so `first` is false (nothing to buffer).
         assert_eq!(
             t.resolve(seq as u32, None, None),
-            Resolve::Won { user_data: 9, fan_in: true, first: false }
+            Resolve::Won {
+                user_data: 9,
+                fan_in: true,
+                first: false
+            }
         );
         assert_eq!(t.inflight(), 0);
     }
@@ -622,7 +734,10 @@ mod tests {
     fn received_is_reset_when_a_slot_index_is_reused() {
         let t = SlotTable::new(1, 0); // 64 slots
         let seq = t.claim(1, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)), Resolve::Partial { first: true });
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Partial { first: true }
+        );
         // Drain (shutdown) frees it with ring 1 still pending.
         let mut aborted = Vec::new();
         t.drain_abort(|ud| aborted.push(ud));
@@ -639,7 +754,11 @@ mod tests {
         );
         assert_eq!(
             t.resolve(seq2 as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 2, fan_in: true, first: false }
+            Resolve::Won {
+                user_data: 2,
+                fan_in: true,
+                first: false
+            }
         );
     }
 
@@ -659,25 +778,47 @@ mod tests {
     fn resolve_reports_first_only_for_the_piece_that_opens_a_generation() {
         let t = SlotTable::new(8, 0);
         // Two-ring fan-in: piece 1 opens the generation, piece 2 does not.
-        let seq = t.claim(0x11, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)), Resolve::Partial { first: true });
+        let seq = t
+            .claim(0x11, ReqKind::Submit, u64::MAX, 0b11, true)
+            .unwrap();
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)),
+            Resolve::Partial { first: true }
+        );
         assert_eq!(
             t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 0x11, fan_in: true, first: false },
+            Resolve::Won {
+                user_data: 0x11,
+                fan_in: true,
+                first: false
+            },
             "the closing piece of a multi-ring fan-in is not the first"
         );
         // Single-ring fan-in: its one piece both opens and closes the set.
         let solo = t.claim(0x22, ReqKind::Submit, u64::MAX, 0b1, true).unwrap();
         assert_eq!(
             t.resolve(solo as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 0x22, fan_in: true, first: true }
+            Resolve::Won {
+                user_data: 0x22,
+                fan_in: true,
+                first: true
+            }
         );
         // Ring-less terminal on a partial: no piece, so `first` is false.
-        let term = t.claim(0x33, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(term as u32, Some(ReqKind::Submit), Some(0)), Resolve::Partial { first: true });
+        let term = t
+            .claim(0x33, ReqKind::Submit, u64::MAX, 0b11, true)
+            .unwrap();
+        assert_eq!(
+            t.resolve(term as u32, Some(ReqKind::Submit), Some(0)),
+            Resolve::Partial { first: true }
+        );
         assert_eq!(
             t.resolve(term as u32, None, None),
-            Resolve::Won { user_data: 0x33, fan_in: true, first: false }
+            Resolve::Won {
+                user_data: 0x33,
+                fan_in: true,
+                first: false
+            }
         );
     }
 
@@ -687,7 +828,11 @@ mod tests {
         let seq = t.claim(3, ReqKind::Submit, u64::MAX, 0b1, true).unwrap();
         assert_eq!(
             t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 3, fan_in: true, first: true },
+            Resolve::Won {
+                user_data: 3,
+                fan_in: true,
+                first: true
+            },
             "a one-ring fan-in's only piece is also its first"
         );
         assert_eq!(t.inflight(), 0);
@@ -700,13 +845,23 @@ mod tests {
     #[test]
     fn a_single_ring_resolve_never_touches_received() {
         let t = SlotTable::new(8, 0);
-        let seq = t.claim(0x5A, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
+        let seq = t
+            .claim(0x5A, ReqKind::Submit, u64::MAX, 0b1, false)
+            .unwrap();
         assert_eq!(
             t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 0x5A, fan_in: false, first: true },
+            Resolve::Won {
+                user_data: 0x5A,
+                fan_in: false,
+                first: true
+            },
             "a set of one: its only piece is also its first"
         );
-        assert_eq!(t.received_for_tests(seq as u32), 0, "no fetch_or on the single-ring path");
+        assert_eq!(
+            t.received_for_tests(seq as u32),
+            0,
+            "no fetch_or on the single-ring path"
+        );
         assert_eq!(t.inflight(), 0);
     }
 
@@ -715,12 +870,25 @@ mod tests {
     #[test]
     fn a_multi_ring_resolve_still_accumulates_received() {
         let t = SlotTable::new(8, 0);
-        let seq = t.claim(0x5B, ReqKind::Submit, u64::MAX, 0b11, true).unwrap();
-        assert_eq!(t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)), Resolve::Partial { first: true });
-        assert_eq!(t.received_for_tests(seq as u32), 0b10, "the partial piece is recorded");
+        let seq = t
+            .claim(0x5B, ReqKind::Submit, u64::MAX, 0b11, true)
+            .unwrap();
+        assert_eq!(
+            t.resolve(seq as u32, Some(ReqKind::Submit), Some(1)),
+            Resolve::Partial { first: true }
+        );
+        assert_eq!(
+            t.received_for_tests(seq as u32),
+            0b10,
+            "the partial piece is recorded"
+        );
         assert_eq!(
             t.resolve(seq as u32, Some(ReqKind::Submit), Some(0)),
-            Resolve::Won { user_data: 0x5B, fan_in: true, first: false }
+            Resolve::Won {
+                user_data: 0x5B,
+                fan_in: true,
+                first: false
+            }
         );
         assert_eq!(t.received_for_tests(seq as u32), 0b11);
     }
@@ -731,12 +899,25 @@ mod tests {
     #[test]
     fn a_single_ring_duplicate_is_a_miss_and_the_window_stays_closed() {
         let t = SlotTable::new(8, 0);
-        let seq = t.claim(0x5C, ReqKind::Submit, u64::MAX, 0b1, false).unwrap();
-        assert!(matches!(t.resolve(seq as u32, None, Some(0)), Resolve::Won { .. }));
+        let seq = t
+            .claim(0x5C, ReqKind::Submit, u64::MAX, 0b1, false)
+            .unwrap();
+        assert!(matches!(
+            t.resolve(seq as u32, None, Some(0)),
+            Resolve::Won { .. }
+        ));
         assert_eq!(t.inflight(), 0);
         for _ in 0..3 {
-            assert_eq!(t.resolve(seq as u32, None, Some(0)), Resolve::Miss, "duplicate delivery");
+            assert_eq!(
+                t.resolve(seq as u32, None, Some(0)),
+                Resolve::Miss,
+                "duplicate delivery"
+            );
         }
-        assert_eq!(t.inflight(), 0, "a duplicate must not double-decrement inflight");
+        assert_eq!(
+            t.inflight(),
+            0,
+            "a duplicate must not double-decrement inflight"
+        );
     }
 }

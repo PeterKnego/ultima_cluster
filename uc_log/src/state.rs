@@ -49,7 +49,7 @@ pub struct StoredConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigRecord {
-    pub position: u64,      // frame-END effect point; 0 = genesis
+    pub position: u64, // frame-END effect point; 0 = genesis
     pub config: StoredConfig,
     pub prev_position: u64,
     pub prev: StoredConfig,
@@ -176,7 +176,10 @@ impl NodeState {
             // consensus thread and the map only ever needs its newest tail.
             start = (start + 16).min(m.len());
         };
-        self.term_map.store(&clamped)?.wait().map_err(durability_error)?;
+        self.term_map
+            .store(&clamped)?
+            .wait()
+            .map_err(durability_error)?;
         self.cache.lock().unwrap().1 = clamped;
         Ok(())
     }
@@ -186,7 +189,10 @@ impl NodeState {
     /// next incarnation's at-least-once replay window; never a correctness
     /// issue (see the module doc).
     pub fn store_output_progress(&self, v: u64) -> Result<(), StableValueError> {
-        self.output_progress.store(&v)?.wait().map_err(durability_error)?;
+        self.output_progress
+            .store(&v)?
+            .wait()
+            .map_err(durability_error)?;
         self.cache.lock().unwrap().2 = v;
         Ok(())
     }
@@ -255,19 +261,38 @@ mod tests {
             let s = NodeState::open(dir.path()).unwrap();
             assert_eq!(s.vote(), None);
             assert!(s.term_map().is_empty());
-            s.store_vote(VoteRecord { term: 3, voted_for: 2 }).unwrap();
+            s.store_vote(VoteRecord {
+                term: 3,
+                voted_for: 2,
+            })
+            .unwrap();
             s.store_term_map(&vec![
                 TermMapEntry { term: 1, base: 0 },
-                TermMapEntry { term: 3, base: 4096 },
+                TermMapEntry {
+                    term: 3,
+                    base: 4096,
+                },
             ])
             .unwrap();
         }
         // "restart": reopen from the same dir
         let s = NodeState::open(dir.path()).unwrap();
-        assert_eq!(s.vote(), Some(VoteRecord { term: 3, voted_for: 2 }));
+        assert_eq!(
+            s.vote(),
+            Some(VoteRecord {
+                term: 3,
+                voted_for: 2
+            })
+        );
         assert_eq!(
             s.term_map(),
-            vec![TermMapEntry { term: 1, base: 0 }, TermMapEntry { term: 3, base: 4096 }]
+            vec![
+                TermMapEntry { term: 1, base: 0 },
+                TermMapEntry {
+                    term: 3,
+                    base: 4096
+                }
+            ]
         );
     }
 
@@ -279,7 +304,10 @@ mod tests {
         // PERSISTED_TERM_MAP_MAX_ENTRIES and survive a reopen.
         let dir = tempfile::tempdir().unwrap();
         let full: TermMap = (0..400u32)
-            .map(|i| TermMapEntry { term: i + 1, base: i as u64 * 1000 })
+            .map(|i| TermMapEntry {
+                term: i + 1,
+                base: i as u64 * 1000,
+            })
             .collect();
         {
             let s = NodeState::open(dir.path()).unwrap();
@@ -311,7 +339,8 @@ mod tests {
                 base: 8_000_000_000 + (i as u64) * 1_000_003,
             })
             .collect();
-        s.store_term_map(&full).expect("must clamp to fit, never PayloadTooLarge");
+        s.store_term_map(&full)
+            .expect("must clamp to fit, never PayloadTooLarge");
         let kept = s.term_map();
         assert!(!kept.is_empty(), "the newest entries must survive");
         assert!(kept.len() <= PERSISTED_TERM_MAP_MAX_ENTRIES);
@@ -326,9 +355,23 @@ mod tests {
     fn store_vote_overwrites_previous_term() {
         let dir = tempfile::tempdir().unwrap();
         let s = NodeState::open(dir.path()).unwrap();
-        s.store_vote(VoteRecord { term: 1, voted_for: 0 }).unwrap();
-        s.store_vote(VoteRecord { term: 2, voted_for: 1 }).unwrap();
-        assert_eq!(s.vote(), Some(VoteRecord { term: 2, voted_for: 1 }));
+        s.store_vote(VoteRecord {
+            term: 1,
+            voted_for: 0,
+        })
+        .unwrap();
+        s.store_vote(VoteRecord {
+            term: 2,
+            voted_for: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            s.vote(),
+            Some(VoteRecord {
+                term: 2,
+                voted_for: 1
+            })
+        );
     }
 
     #[test]
@@ -336,7 +379,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let s = NodeState::open(dir.path()).unwrap();
-            assert_eq!(s.output_progress(), 0, "fresh instance dir marker defaults to 0");
+            assert_eq!(
+                s.output_progress(),
+                0,
+                "fresh instance dir marker defaults to 0"
+            );
             s.store_output_progress(4096).unwrap();
             assert_eq!(s.output_progress(), 4096);
         }
@@ -350,13 +397,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let s = NodeState::open(dir.path()).unwrap();
-            assert_eq!(s.snapshot_floor(), 0, "fresh instance dir floor defaults to 0");
+            assert_eq!(
+                s.snapshot_floor(),
+                0,
+                "fresh instance dir floor defaults to 0"
+            );
             s.store_snapshot_floor(8192).unwrap();
             assert_eq!(s.snapshot_floor(), 8192);
         }
         // "restart": reopen from the same dir — the floor is a durable value.
         let s = NodeState::open(dir.path()).unwrap();
-        assert_eq!(s.snapshot_floor(), 8192, "durable snapshot floor survives reopen");
+        assert_eq!(
+            s.snapshot_floor(),
+            8192,
+            "durable snapshot floor survives reopen"
+        );
     }
 
     #[test]
@@ -366,7 +421,11 @@ mod tests {
         s.store_output_progress(4096).unwrap();
         s.store_snapshot_floor(8192).unwrap();
         assert_eq!(s.output_progress(), 4096);
-        assert_eq!(s.snapshot_floor(), 8192, "separate StableValues, separate cache slots");
+        assert_eq!(
+            s.snapshot_floor(),
+            8192,
+            "separate StableValues, separate cache slots"
+        );
     }
 
     #[test]
@@ -374,13 +433,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let genesis = StoredConfig {
             version: 0,
-            voters: vec![StoredMember { id: 1, ip: 0x0a000001, port: 19100 }],
+            voters: vec![StoredMember {
+                id: 1,
+                ip: 0x0a000001,
+                port: 19100,
+            }],
             learners: vec![],
             tombstones: vec![],
         };
         {
             let s = NodeState::open(dir.path()).unwrap();
-            assert_eq!(s.config_record(), None, "fresh dir: no record until the node seeds genesis");
+            assert_eq!(
+                s.config_record(),
+                None,
+                "fresh dir: no record until the node seeds genesis"
+            );
             let r = ConfigRecord {
                 position: 0,
                 config: genesis.clone(),

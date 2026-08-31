@@ -43,15 +43,15 @@ use std::net::{SocketAddr, UdpSocket};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use uc_client::Client;
+use uc_lincheck::register::{Cmd, CmdResp};
 use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_node::backup::{backup_instance, restore_artifact};
 use uc_node::recovery::force_single_member;
-use uc_lincheck::register::{Cmd, CmdResp};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 
 mod common;
@@ -82,7 +82,11 @@ fn free_addr() -> SocketAddr {
 }
 
 fn members_arg(members: &[(u32, SocketAddr)]) -> String {
-    members.iter().map(|(id, a)| format!("{id}@{a}")).collect::<Vec<_>>().join(",")
+    members
+        .iter()
+        .map(|(id, a)| format!("{id}@{a}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn spawn_node_multi(instance_dir: &Path, id: u32, bind: SocketAddr, members: &str) -> Reap {
@@ -118,11 +122,18 @@ fn await_single_leader(dirs: &[PathBuf], secs: u64) -> usize {
                 open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want)
             })
             .collect();
-        assert!(serving.len() <= 1, "split-brain: dirs {serving:?} all serve");
+        assert!(
+            serving.len() <= 1,
+            "split-brain: dirs {serving:?} all serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
-        assert!(Instant::now() < deadline, "no single leader among {} dirs within {secs}s", dirs.len());
+        assert!(
+            Instant::now() < deadline,
+            "no single leader among {} dirs within {secs}s",
+            dirs.len()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -140,7 +151,10 @@ fn find_follower(dirs: &[PathBuf], leader_idx: usize) -> usize {
             return i;
         }
     }
-    panic!("no follower found among {} dirs (leader={leader_idx})", dirs.len());
+    panic!(
+        "no follower found among {} dirs (leader={leader_idx})",
+        dirs.len()
+    );
 }
 
 // --------------------------------------------------- serial CAS-chain load
@@ -195,11 +209,22 @@ fn start_cas_load(client: Client) -> CasLoad {
     let acked = Arc::new(AtomicU64::new(0));
     let (stop2, acked2) = (Arc::clone(&stop), Arc::clone(&acked));
     let handle = std::thread::spawn(move || {
-        submit_until_ok(&client, &Cmd::Write(0), Instant::now() + Duration::from_secs(15));
+        submit_until_ok(
+            &client,
+            &Cmd::Write(0),
+            Instant::now() + Duration::from_secs(15),
+        );
         while !stop2.load(Ordering::Relaxed) {
             let cur = acked2.load(Ordering::Relaxed);
             let deadline = Instant::now() + Duration::from_secs(10);
-            match submit_until_ok(&client, &Cmd::Cas { old: cur, new: cur + 1 }, deadline) {
+            match submit_until_ok(
+                &client,
+                &Cmd::Cas {
+                    old: cur,
+                    new: cur + 1,
+                },
+                deadline,
+            ) {
                 CmdResp::CasResult(true) => acked2.store(cur + 1, Ordering::Relaxed),
                 CmdResp::CasResult(false) => panic!(
                     "CAS(old={cur}, new={}) unexpectedly failed under a single serial writer — \
@@ -212,7 +237,11 @@ fn start_cas_load(client: Client) -> CasLoad {
         }
         client.shutdown();
     });
-    CasLoad { stop, acked, handle: Some(handle) }
+    CasLoad {
+        stop,
+        acked,
+        handle: Some(handle),
+    }
 }
 
 /// Fix round 1, Finding 1: `backup_instance` genuinely overlapping live load
@@ -275,7 +304,12 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     for i in 0..N as u32 {
         let d = tmp.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
-        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str)));
+        node_procs.push(Some(spawn_node_multi(
+            &d,
+            i,
+            addrs[i as usize],
+            &members_str,
+        )));
         wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
     }
@@ -294,11 +328,8 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     // 1. Identify a FOLLOWER via the cnc flags; back it up LIVE, under load.
     let follower_idx = find_follower(&dirs, leader_idx);
     let artifact_dir = tmp.path().join("follower-backup-artifact");
-    let backup_report = backup_under_load_with_overlap_proof(
-        &dirs[follower_idx],
-        &artifact_dir,
-        &cas_load.acked,
-    );
+    let backup_report =
+        backup_under_load_with_overlap_proof(&dirs[follower_idx], &artifact_dir, &cas_load.acked);
     assert!(
         backup_report.journal_last_pos > 0,
         "backup of a loaded follower recovered no journal position"
@@ -343,8 +374,11 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     // leader keeps advancing under the live CAS load, but the restored
     // node's replication catch-up is expected to outrun it comfortably
     // within the bound).
-    let leader_commit_target =
-        open_cnc(&dirs[leader_idx]).expect("leader cnc").counters().commit.load_acquire();
+    let leader_commit_target = open_cnc(&dirs[leader_idx])
+        .expect("leader cnc")
+        .counters()
+        .commit
+        .load_acquire();
     let converge_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(c) = open_cnc(&restored_dir)
@@ -363,8 +397,9 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     // Every response the client received BEFORE the kill reads back via a
     // linearizable read on the leader.
     let leader_read_client = connect_with_retry(&dirs[leader_idx], Duration::from_secs(10));
-    let leader_val: Option<u64> =
-        leader_read_client.query_linearizable(&()).expect("leader linearizable read");
+    let leader_val: Option<u64> = leader_read_client
+        .query_linearizable(&())
+        .expect("leader linearizable read");
     assert!(
         leader_val.unwrap_or(0) >= pre_kill_value,
         "leader's linearizable read ({leader_val:?}) is behind the pre-kill acked value \
@@ -378,8 +413,9 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     let restored_client = connect_with_retry(&restored_dir, Duration::from_secs(10));
     let snapshot_deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let v: Option<u64> =
-            restored_client.query_snapshot(&()).expect("restored node snapshot read");
+        let v: Option<u64> = restored_client
+            .query_snapshot(&())
+            .expect("restored node snapshot read");
         if v.unwrap_or(0) >= pre_kill_value {
             break;
         }
@@ -404,8 +440,9 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     std::thread::sleep(Duration::from_millis(300));
     let acked_final = acked_handle.load(Ordering::Relaxed);
 
-    let final_val: Option<u64> =
-        leader_read_client.query_linearizable(&()).expect("final leader linearizable read");
+    let final_val: Option<u64> = leader_read_client
+        .query_linearizable(&())
+        .expect("final leader linearizable read");
     assert_eq!(
         final_val,
         Some(acked_final),
@@ -467,13 +504,23 @@ fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u64)
     let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
     let seq = old_seq + 1;
     let nonce = rand::random::<u64>();
-    cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+    cnc.write_admin_req(&AdminReq {
+        seq,
+        nonce,
+        op,
+        id,
+        ip,
+        port,
+    });
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         if let Some(resp) = cnc.read_admin_resp(seq) {
             return resp;
         }
-        assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+        assert!(
+            Instant::now() < deadline,
+            "admin response timed out for seq {seq}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -507,7 +554,12 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     for i in 0..N as u32 {
         let d = tmp.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
-        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str)));
+        node_procs.push(Some(spawn_node_multi(
+            &d,
+            i,
+            addrs[i as usize],
+            &members_str,
+        )));
         wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
     }
@@ -525,7 +577,14 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     submit_until_ok(&leader_client, &Cmd::Write(0), deadline);
     let mut acked: u64 = 0;
     for _ in 0..50u64 {
-        match submit_until_ok(&leader_client, &Cmd::Cas { old: acked, new: acked + 1 }, deadline) {
+        match submit_until_ok(
+            &leader_client,
+            &Cmd::Cas {
+                old: acked,
+                new: acked + 1,
+            },
+            deadline,
+        ) {
             CmdResp::CasResult(true) => acked += 1,
             other => panic!("unexpected response to warm-up Cas: {other:?}"),
         }
@@ -535,7 +594,9 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     // Pick the survivor (a follower) and the OTHER, permanently-dead peer
     // BEFORE killing anything.
     let survivor_idx = find_follower(&dirs, leader_idx);
-    let dead2_idx = (0..N).find(|&i| i != leader_idx && i != survivor_idx).unwrap();
+    let dead2_idx = (0..N)
+        .find(|&i| i != leader_idx && i != survivor_idx)
+        .unwrap();
     let survivor_id = survivor_idx as u32;
 
     let old_instance_id =
@@ -566,14 +627,18 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     // appended is durable, committed and applied at the survivor. The leader
     // appends nothing further here (its client is shut down, no config change
     // in flight), so once this holds nothing can move after the kill.
-    let survivor_cnc_pre_kill = open_cnc(&dirs[survivor_idx]).expect("survivor cnc before the kill");
+    let survivor_cnc_pre_kill =
+        open_cnc(&dirs[survivor_idx]).expect("survivor cnc before the kill");
     let leader_cnc_pre_kill = open_cnc(&dirs[leader_idx]).expect("leader cnc before the kill");
     let pin_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let leader_append = leader_cnc_pre_kill.counters().append.load_acquire();
         let commit = survivor_cnc_pre_kill.counters().commit.load_acquire();
         let durable = survivor_cnc_pre_kill.counters().durable.load_acquire();
-        let applied = survivor_cnc_pre_kill.service().service_applied.load_acquire();
+        let applied = survivor_cnc_pre_kill
+            .service()
+            .service_applied
+            .load_acquire();
         if durable == leader_append && commit >= durable && applied == durable {
             break;
         }
@@ -599,8 +664,10 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     let stall_deadline = Instant::now() + Duration::from_secs(2);
     let mut committed_during_stall = false;
     while Instant::now() < stall_deadline {
-        if let Ok(resp) = stall_client.submit::<Cmd, CmdResp>(&Cmd::Cas { old: acked, new: acked + 1 })
-        {
+        if let Ok(resp) = stall_client.submit::<Cmd, CmdResp>(&Cmd::Cas {
+            old: acked,
+            new: acked + 1,
+        }) {
             committed_during_stall = true;
             eprintln!("[survival] unexpected commit during the stall window: {resp:?}");
             break;
@@ -620,8 +687,9 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     // exactly. Reusing `stall_client` (rather than opening a fresh one) keeps
     // this read immediately adjacent to the stall assertion above, with no
     // window in which anything could still change.
-    let survivor_value_before_force: Option<u64> =
-        stall_client.query_snapshot(&()).expect("survivor's own snapshot read, state now frozen");
+    let survivor_value_before_force: Option<u64> = stall_client
+        .query_snapshot(&())
+        .expect("survivor's own snapshot read, state now frozen");
     stall_client.shutdown();
 
     // 2. Stop the survivor's own processes — `force_single_member` takes the
@@ -637,15 +705,26 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     dropped.sort_unstable();
     let mut expect_dropped: Vec<u32> = (0..N as u32).filter(|&i| i != survivor_id).collect();
     expect_dropped.sort_unstable();
-    assert_eq!(dropped, expect_dropped, "force must drop exactly the two dead peers");
+    assert_eq!(
+        dropped, expect_dropped,
+        "force must drop exactly the two dead peers"
+    );
 
     // 4. Restart the survivor on the SAME instance dir/id/addr — the forced
     // durable config (not `--members`, seed-only once a durable record
     // exists) now owns membership, so it boots as a sole voter and should
     // self-elect immediately.
-    node_procs[survivor_idx] =
-        Some(spawn_node_multi(&dirs[survivor_idx], survivor_id, addrs[survivor_idx], &members_str));
-    wait_for_fresh_instance(&dirs[survivor_idx], old_instance_id, Duration::from_secs(10));
+    node_procs[survivor_idx] = Some(spawn_node_multi(
+        &dirs[survivor_idx],
+        survivor_id,
+        addrs[survivor_idx],
+        &members_str,
+    ));
+    wait_for_fresh_instance(
+        &dirs[survivor_idx],
+        old_instance_id,
+        Duration::from_secs(10),
+    );
     svc_procs[survivor_idx] = Some(spawn_service(&dirs[survivor_idx]));
 
     let elect_deadline = Instant::now() + Duration::from_secs(10);
@@ -656,7 +735,10 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
         {
             break;
         }
-        assert!(Instant::now() < elect_deadline, "forced sole voter never elected/served itself");
+        assert!(
+            Instant::now() < elect_deadline,
+            "forced sole voter never elected/served itself"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -683,7 +765,14 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     // read-only: one more CAS must commit immediately (quorum of 1).
     let base = survivor_value_after_force.unwrap_or(0);
     let live_deadline = Instant::now() + Duration::from_secs(10);
-    match submit_until_ok(&survivor_post_client, &Cmd::Cas { old: base, new: base + 1 }, live_deadline) {
+    match submit_until_ok(
+        &survivor_post_client,
+        &Cmd::Cas {
+            old: base,
+            new: base + 1,
+        },
+        live_deadline,
+    ) {
         CmdResp::CasResult(true) => {}
         other => panic!("forced sole-voter cluster refused a live write: {other:?}"),
     }
@@ -700,8 +789,19 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
 
     let survivor_cnc = open_cnc(&dirs[survivor_idx]).expect("survivor cnc for admin ops");
     let (ip, port) = addr_to_wire(fresh_addr);
-    let resp = admin_request(&survivor_cnc, 1 /* AddLearner */, fresh_id, ip, port, 20);
-    assert_eq!(resp.status, 0, "add-learner refused: reason={}", resp.reason);
+    let resp = admin_request(
+        &survivor_cnc,
+        1, /* AddLearner */
+        fresh_id,
+        ip,
+        port,
+        20,
+    );
+    assert_eq!(
+        resp.status, 0,
+        "add-learner refused: reason={}",
+        resp.reason
+    );
 
     // Fix round 1, Minor 9 (fix round 2: named precisely, not just
     // "fixture-honesty"): the crashtest node bin has no `--learners` flag —
@@ -730,7 +830,12 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     // real `preflight`-checked node would refuse outright via
     // `SelfNotAMember` rather than boot with a genesis that omits itself).
     let fresh_members_str = format!("{members_str},{fresh_id}@{fresh_addr}");
-    node_procs.push(Some(spawn_node_multi(&fresh_dir, fresh_id, fresh_addr, &fresh_members_str)));
+    node_procs.push(Some(spawn_node_multi(
+        &fresh_dir,
+        fresh_id,
+        fresh_addr,
+        &fresh_members_str,
+    )));
     wait_for_ready(&fresh_dir, Duration::from_secs(10));
     svc_procs.push(Some(spawn_service(&fresh_dir)));
     dirs.push(fresh_dir.clone());
@@ -742,19 +847,35 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
         {
             break;
         }
-        assert!(Instant::now() < converge_deadline, "fresh learner never converged its config version");
+        assert!(
+            Instant::now() < converge_deadline,
+            "fresh learner never converged its config version"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
     let promote_resp = promote_until_ok(&survivor_cnc, fresh_id, 20);
-    assert_eq!(promote_resp.status, 0, "promote refused: reason={}", promote_resp.reason);
+    assert_eq!(
+        promote_resp.status, 0,
+        "promote refused: reason={}",
+        promote_resp.reason
+    );
 
     // A 2-voter cluster is genuinely operational: one more CAS must commit.
     let final_client = connect_with_retry(&dirs[survivor_idx], Duration::from_secs(10));
-    let cur: Option<u64> = final_client.query_linearizable(&()).expect("final linearizable read");
+    let cur: Option<u64> = final_client
+        .query_linearizable(&())
+        .expect("final linearizable read");
     let cur = cur.unwrap_or(0);
     let final_deadline = Instant::now() + Duration::from_secs(10);
-    match submit_until_ok(&final_client, &Cmd::Cas { old: cur, new: cur + 1 }, final_deadline) {
+    match submit_until_ok(
+        &final_client,
+        &Cmd::Cas {
+            old: cur,
+            new: cur + 1,
+        },
+        final_deadline,
+    ) {
         CmdResp::CasResult(true) => {}
         other => panic!("repaired 2-voter cluster refused a write: {other:?}"),
     }

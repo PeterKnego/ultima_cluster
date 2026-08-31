@@ -33,11 +33,20 @@ impl FlowControl {
         initial_window: u64,
         learners: &[SocketAddr],
     ) -> Self {
-        assert!(cluster_size > voting_followers.len(), "leader + voters exceed cluster");
+        assert!(
+            cluster_size > voting_followers.len(),
+            "leader + voters exceed cluster"
+        );
         let needed = (cluster_size / 2 + 1).saturating_sub(1);
-        assert!(needed <= voting_followers.len(), "not enough voters for a quorum");
+        assert!(
+            needed <= voting_followers.len(),
+            "not enough voters for a quorum"
+        );
         Self {
-            followers: voting_followers.iter().map(|a| (*a, initial_window)).collect(),
+            followers: voting_followers
+                .iter()
+                .map(|a| (*a, initial_window))
+                .collect(),
             learners: learners.iter().map(|a| (*a, 0)).collect(),
             needed,
         }
@@ -58,7 +67,10 @@ impl FlowControl {
     /// M6 Task 7/9: the latest contiguous position advertised by a learner, for
     /// the per-learner cnc observability band. `None` if not a configured learner.
     pub fn learner_position(&self, addr: SocketAddr) -> Option<u64> {
-        self.learners.iter().find(|(a, _)| *a == addr).map(|(_, p)| *p)
+        self.learners
+            .iter()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, p)| *p)
     }
 
     /// M6 Task 9: the per-peer flow value for the cnc observability band — a
@@ -141,8 +153,16 @@ mod tests {
         assert_eq!(f.limit(), 5_000); // faster of the two voters
         // Learner screams the maximum: limit is unmoved, but it is recorded.
         f.on_status(l, 1 << 40, 1 << 20);
-        assert_eq!(f.limit(), 5_000, "a learner advert must never enter the quorum statistic");
-        assert_eq!(f.learner_position(l), Some(1 << 40), "learner position tracked for observability");
+        assert_eq!(
+            f.limit(),
+            5_000,
+            "a learner advert must never enter the quorum statistic"
+        );
+        assert_eq!(
+            f.learner_position(l),
+            Some(1 << 40),
+            "learner position tracked for observability"
+        );
         // A voter slowing does move the limit; the learner still does not.
         f.on_status(a, 2_000, 0);
         assert_eq!(f.limit(), 4_000);

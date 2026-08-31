@@ -80,7 +80,10 @@ mod tests {
         c.signal(); // the wake the waiter must not sleep through
         let t = Instant::now();
         c.park(observed, Duration::from_secs(5));
-        assert!(t.elapsed() < Duration::from_secs(1), "park slept through a signal");
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "park slept through a signal"
+        );
     }
 
     #[test]
@@ -89,7 +92,10 @@ mod tests {
         let observed = c.seq();
         let t = Instant::now();
         c.park(observed, Duration::from_millis(50));
-        assert!(t.elapsed() >= Duration::from_millis(40), "park returned far too early");
+        assert!(
+            t.elapsed() >= Duration::from_millis(40),
+            "park returned far too early"
+        );
     }
 
     #[test]
@@ -103,7 +109,10 @@ mod tests {
         });
         let t = Instant::now();
         c.park(observed, Duration::from_secs(10));
-        assert!(t.elapsed() < Duration::from_secs(5), "waiter was not woken by the signal");
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "waiter was not woken by the signal"
+        );
         h.join().unwrap();
     }
 }

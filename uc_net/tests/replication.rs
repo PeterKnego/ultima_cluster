@@ -30,7 +30,11 @@ fn clean_stream_converges_and_journals_match() {
     let f1 = spawn_follower("c-f1", leader_addr, clean);
     let f2 = spawn_follower("c-f2", leader_addr, clean);
     let leader = spawn_leader(raw, vec![f1.addr, f2.addr], clean);
-    let end = load(&leader.node.buffer, &[&f1.node.buffer, &f2.node.buffer], 5_000);
+    let end = load(
+        &leader.node.buffer,
+        &[&f1.node.buffer, &f2.node.buffer],
+        5_000,
+    );
     converge_and_compare(leader, vec![f1, f2], end);
 }
 
@@ -43,15 +47,27 @@ fn one_percent_loss_recovers_via_nak() {
     let (s1, s2) = (Arc::clone(&f1.stats), Arc::clone(&f2.stats));
     // 1% loss on the leader's send side (data AND heartbeats drop; the NAK
     // delay + backoff recover both mid-stream gaps and tail loss)
-    let faults = FaultConfig { seed: 20_260_710, drop_per_million: 10_000, ..Default::default() };
+    let faults = FaultConfig {
+        seed: 20_260_710,
+        drop_per_million: 10_000,
+        ..Default::default()
+    };
     let leader = spawn_leader(raw, vec![f1.addr, f2.addr], faults);
     let sstats = Arc::clone(&leader.stats);
-    let end = load(&leader.node.buffer, &[&f1.node.buffer, &f2.node.buffer], 5_000);
+    let end = load(
+        &leader.node.buffer,
+        &[&f1.node.buffer, &f2.node.buffer],
+        5_000,
+    );
     converge_and_compare(leader, vec![f1, f2], end);
     let naks = s1.naks_sent.load(Ordering::Relaxed) + s2.naks_sent.load(Ordering::Relaxed);
     assert!(naks > 0, "1% loss must exercise the NAK path");
     assert!(sstats.naks_served.load(Ordering::Relaxed) > 0);
-    assert_eq!(sstats.overruns.load(Ordering::Relaxed), 0, "no replay-needed under 1% loss");
+    assert_eq!(
+        sstats.overruns.load(Ordering::Relaxed),
+        0,
+        "no replay-needed under 1% loss"
+    );
 }
 
 #[test]
@@ -67,7 +83,11 @@ fn dup_and_reorder_converge() {
         ..Default::default()
     };
     let leader = spawn_leader(raw, vec![f1.addr, f2.addr], faults);
-    let end = load(&leader.node.buffer, &[&f1.node.buffer, &f2.node.buffer], 5_000);
+    let end = load(
+        &leader.node.buffer,
+        &[&f1.node.buffer, &f2.node.buffer],
+        5_000,
+    );
     // dups are dropped by position, reordering is absorbed by Rebuilt —
     // convergence + identical replay IS the assertion
     converge_and_compare(leader, vec![f1, f2], end);
@@ -109,7 +129,11 @@ fn stale_term_stream_is_ignored() {
         assert!(Instant::now() < deadline, "stale datagrams never observed");
         std::thread::yield_now();
     }
-    assert_eq!(fbuf.counters().append.load_acquire(), end, "stale term advanced the log");
+    assert_eq!(
+        fbuf.counters().append.load_acquire(),
+        end,
+        "stale term advanced the log"
+    );
     converge_and_compare(leader, vec![f1], end);
 }
 
@@ -122,8 +146,11 @@ fn dead_follower_does_not_stall_the_quorum() {
     // NAKs. Its flow limit stays at initial_window (64 KiB) forever. Keep the
     // socket alive so sends don't turn into ICMP noise.
     let dead = FaultSocket::bind("127.0.0.1:0").unwrap();
-    let leader =
-        spawn_leader(raw, vec![f1.addr, dead.local_addr().unwrap()], FaultConfig::default());
+    let leader = spawn_leader(
+        raw,
+        vec![f1.addr, dead.local_addr().unwrap()],
+        FaultConfig::default(),
+    );
     // ~3 MiB stream: several times BOTH the dead follower's window and CAP —
     // only quorum pacing (3 nodes -> the faster follower) lets this finish.
     let end = load(&leader.node.buffer, &[&f1.node.buffer], 32_768);
@@ -132,7 +159,11 @@ fn dead_follower_does_not_stall_the_quorum() {
     // follower — quorum pacing (leader + f1) never waits on the dead node.
     // Eventual (the sender is an async agent and `load` paces to within
     // CAP/2 of `end`), with a deadline like every other wait here.
-    await_pos(&leader.node.buffer.counters().sent, end, "leader sent (dead follower stalled quorum)");
+    await_pos(
+        &leader.node.buffer.counters().sent,
+        end,
+        "leader sent (dead follower stalled quorum)",
+    );
     converge_and_compare(leader, vec![f1], end);
     drop(dead);
 }

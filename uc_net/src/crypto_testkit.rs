@@ -31,11 +31,16 @@ pub fn scratch_dir(area: &str, tag: &str) -> PathBuf {
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::var("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_net_tests"))
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_net_tests")
+        })
         .join(area)
         .join(format!("{tag}-{seq}"));
     std::fs::create_dir_all(&dir).unwrap();
-    assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+    assert!(
+        !dir.starts_with("/tmp"),
+        "test scratch must not live on tmpfs: {dir:?}"
+    );
     dir
 }
 
@@ -58,7 +63,9 @@ pub fn identity_public(tag: &str, private: [u8; 32]) -> [u8; 32] {
     let dir = scratch_dir("uc2-net-crypto-pub", tag);
     let key_path = dir.join("node.key");
     write_key_file(&key_path, private);
-    uc_crypto::identity::Identity::load(&key_path).unwrap().public_bytes()
+    uc_crypto::identity::Identity::load(&key_path)
+        .unwrap()
+        .public_bytes()
 }
 
 /// Minimal standard-alphabet base64 WITH padding, matching
@@ -75,8 +82,16 @@ pub fn b64_32(bytes: &[u8; 32]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -127,8 +142,14 @@ pub fn establish(a: &SharedTransport, a_id: NodeId, b: &SharedTransport, b_id: N
         }
         acts = next;
     }
-    assert!(a.is_established(b_id), "{a_id} failed to establish with {b_id}");
-    assert!(b.is_established(a_id), "{b_id} failed to establish with {a_id}");
+    assert!(
+        a.is_established(b_id),
+        "{a_id} failed to establish with {b_id}"
+    );
+    assert!(
+        b.is_established(a_id),
+        "{b_id} failed to establish with {a_id}"
+    );
 }
 
 /// Mints a group epoch on `leader` and delivers+acks it to `follower` over

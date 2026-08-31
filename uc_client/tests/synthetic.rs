@@ -36,7 +36,10 @@ fn meta(app_id: &str) -> CncMeta {
 
 fn rand_u128() -> u128 {
     // Cheap, dependency-free "random enough for a test instance_id" source.
-    let a = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let a = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     a ^ 0xA5A5_5A5A_A5A5_5A5A_u128
 }
 
@@ -59,7 +62,9 @@ fn ingress_ring_stays_full_returns_backpressure_full() {
 
     // Fill the tiny ingress ring completely via a raw producer — nobody ever
     // reads it (no node/service running), so it stays full forever.
-    let (filler, _consumer) = MpscRing::open(&dir.path().join("ingress.ring")).unwrap().into_split();
+    let (filler, _consumer) = MpscRing::open(&dir.path().join("ingress.ring"))
+        .unwrap()
+        .into_split();
     loop {
         if filler.try_write(1, 0, [0; 8], &[0u8; 8]).is_err() {
             break; // Full (or TooLarge for the last partial slot) — either way, full enough.
@@ -71,9 +76,18 @@ fn ingress_ring_stays_full_returns_backpressure_full() {
     let result: Result<u8, ClientError> = client.submit(&7u8);
     let elapsed = t0.elapsed();
 
-    assert!(matches!(result, Err(ClientError::BackpressureFull)), "{result:?}");
-    assert!(elapsed >= Duration::from_millis(900), "must honor the ~1s retry window: {elapsed:?}");
-    assert!(elapsed < Duration::from_secs(5), "must not hang well past the retry window: {elapsed:?}");
+    assert!(
+        matches!(result, Err(ClientError::BackpressureFull)),
+        "{result:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(900),
+        "must honor the ~1s retry window: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "must not hang well past the retry window: {elapsed:?}"
+    );
 }
 
 /// `MSG_V2_RETRY` isn't emitted by any real node/service component yet (M5
@@ -98,7 +112,9 @@ fn injected_retry_frame_is_delivered_as_retry_error() {
     let mut producer = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
         .unwrap()
         .producer();
-    producer.write(MSG_V2_RETRY, 0, extra_client(client_id, 0), &[]).unwrap();
+    producer
+        .write(MSG_V2_RETRY, 0, extra_client(client_id, 0), &[])
+        .unwrap();
 
     let result = handle.join().unwrap();
     assert!(matches!(result, Err(ClientError::Retry)), "{result:?}");

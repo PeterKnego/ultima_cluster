@@ -91,8 +91,7 @@ use crate::ring::common::{
     RING_HEADER_LEN, RecordHeader, RingError, RingHeader, RingWaitHandle, SlotState,
     align_record_size, cas_commit_word, classify_commit_word, decode_record_slice,
     decode_record_slice_no_padding, encode_commit_word, init_ring_header_with_magic, lap_of,
-    load_commit_word,
-    store_commit_word, validate_ring_header_with_magic, write_padding_body_at,
+    load_commit_word, store_commit_word, validate_ring_header_with_magic, write_padding_body_at,
     write_record_body_at,
 };
 
@@ -279,8 +278,7 @@ impl MpscProducer {
             let bytes_to_tail = capacity - slot_offset;
             if bytes_to_tail == capacity {
                 return Err(RingError::Corrupt(
-                    "claim_position is at the start of the slot region: no tail to pad"
-                        .to_string(),
+                    "claim_position is at the start of the slot region: no tail to pad".to_string(),
                 ));
             }
             let consumer_pos = header.consumer_position.load(Ordering::Acquire);
@@ -404,7 +402,10 @@ impl MpscProducer {
         }
         let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
         if total > self.inner.max_msg_size() {
-            return Err(RingError::TooLarge { len: total, max: self.inner.max_msg_size() });
+            return Err(RingError::TooLarge {
+                len: total,
+                max: self.inner.max_msg_size(),
+            });
         }
         // Positions advance in RECORD_ALIGN-sized steps; the length field still
         // stores the unaligned `total` so the consumer can decode payload_len.
@@ -423,7 +424,11 @@ impl MpscProducer {
             // Total contiguous bytes this iteration must reserve: `advance`, or
             // — if the record straddles the tail — a padding marker filling
             // `bytes_to_tail` plus `advance` after the wrap.
-            let needed = if bytes_to_tail < advance { bytes_to_tail + advance } else { advance };
+            let needed = if bytes_to_tail < advance {
+                bytes_to_tail + advance
+            } else {
+                advance
+            };
 
             // Free space from the cached consumer position (a lower bound, so
             // `free` is under-estimated — safe). Only when the cache reports
@@ -464,7 +469,11 @@ impl MpscProducer {
 
             // If straddling tail, claim only the tail-bytes for a padding
             // marker this iteration, then retry the real record claim.
-            let claim_size = if bytes_to_tail < advance { bytes_to_tail } else { advance };
+            let claim_size = if bytes_to_tail < advance {
+                bytes_to_tail
+            } else {
+                advance
+            };
             let target_pos = claim_pos + claim_size as u64;
             if header
                 .claim_position
@@ -483,7 +492,11 @@ impl MpscProducer {
                 // commit_count bump and no `signal` either way: padding
                 // carries nothing a parked consumer needs to wake for, and
                 // the real record's commit (one iteration later) does both.
-                let pad = PendingPadding { pos: claim_pos, claim_size, lap };
+                let pad = PendingPadding {
+                    pos: claim_pos,
+                    claim_size,
+                    lap,
+                };
                 // SAFETY: exclusive ownership of the claimed range;
                 // claim_size == bytes_to_tail >= RECORD_ALIGN >= 6.
                 unsafe { self.stamp_padding(slot_offset, &pad) };
@@ -529,7 +542,11 @@ impl MpscProducer {
                     payload,
                 );
             }
-            return Ok(PendingClaim { pos: claim_pos, total, lap });
+            return Ok(PendingClaim {
+                pos: claim_pos,
+                total,
+                lap,
+            });
         }
     }
 
@@ -610,7 +627,9 @@ impl MpscProducer {
             )
         };
         if result.is_err() {
-            return Err(RingError::Skipped { position: claim.pos });
+            return Err(RingError::Skipped {
+                position: claim.pos,
+            });
         }
         // `publish_position` reinterpreted as `commit_count` (module doc):
         // the wake word must change on every commit.
@@ -661,7 +680,9 @@ impl MpscConsumer {
                     // per record — the price of being able to time a hole
                     // at all.
                     if self.hole_elapsed(consumer_pos) {
-                        return Err(RingError::Wedged { position: consumer_pos });
+                        return Err(RingError::Wedged {
+                            position: consumer_pos,
+                        });
                     }
                     return Ok(None);
                 }
@@ -793,8 +814,8 @@ impl MpscConsumer {
                     self.hole = None;
                     let len = length as usize;
                     let bytes_to_tail = capacity - slot_offset;
-                    let max_record = align_record_size(self.inner.max_msg_size())
-                        .min(MPSC_MAX_RECORD_BYTES);
+                    let max_record =
+                        align_record_size(self.inner.max_msg_size()).min(MPSC_MAX_RECORD_BYTES);
                     if len < 6 || len > bytes_to_tail || len > max_record {
                         return Err(RingError::Corrupt(format!(
                             "commit word length {len} out of range at position {consumer_pos} \
@@ -809,10 +830,7 @@ impl MpscConsumer {
                     // no producer can reclaim this range until we advance
                     // `consumer_position` below.
                     let slot = unsafe {
-                        std::slice::from_raw_parts(
-                            self.inner.slot_region().add(slot_offset),
-                            len,
-                        )
+                        std::slice::from_raw_parts(self.inner.slot_region().add(slot_offset), len)
                     };
                     // Critical 1 (final review): `decode_record_slice`
                     // short-circuits on `msg_type == PADDING_MSG_TYPE`
@@ -840,8 +858,7 @@ impl MpscConsumer {
                     // swallowed silently. `claim` refusing
                     // `PADDING_MSG_TYPE` from callers shuts the reverse
                     // direction.
-                    let claims_padding =
-                        u16::from_le_bytes([slot[4], slot[5]]) == PADDING_MSG_TYPE;
+                    let claims_padding = u16::from_le_bytes([slot[4], slot[5]]) == PADDING_MSG_TYPE;
                     if claims_padding && len == bytes_to_tail {
                         let (_pad, advance) = decode_record_slice(slot, payload_buf)?;
                         header
@@ -970,8 +987,8 @@ impl MpscRing {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::common::MPSC_MAX_RECORD_BYTES;
+    use super::*;
     use memmap2::MmapMut;
     use std::collections::HashSet;
     use std::thread;
@@ -1005,7 +1022,10 @@ mod tests {
         .unwrap();
         drop(mmap);
 
-        assert!(matches!(MpscRing::open(tmp.path()), Err(RingError::MagicMismatch)));
+        assert!(matches!(
+            MpscRing::open(tmp.path()),
+            Err(RingError::MagicMismatch)
+        ));
 
         // And the reverse direction is covered too: a file this binary
         // creates carries the new magic.
@@ -1241,9 +1261,13 @@ mod tests {
 
         // The dead producer: claimed, written, never committed. Dropping the
         // `PendingClaim` IS the death — nothing in the ring changes.
-        let dead = producer.claim_without_commit(1, 0, [0; 8], b"lost").expect("claim");
+        let dead = producer
+            .claim_without_commit(1, 0, [0; 8], b"lost")
+            .expect("claim");
         drop(dead);
-        producer.try_write(1, 0, [0; 8], b"kept").expect("write behind the hole");
+        producer
+            .try_write(1, 0, [0; 8], b"kept")
+            .expect("write behind the hole");
 
         // First poll starts the timer and reports nothing.
         let mut buf = Vec::new();
@@ -1251,10 +1275,17 @@ mod tests {
         assert_eq!(consumer.holes_skipped(), 0);
 
         // Second poll finds the (zero) timeout elapsed: skip, count, deliver.
-        let rec = consumer.try_read(&mut buf).expect("read").expect("the record behind the hole");
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("read")
+            .expect("the record behind the hole");
         assert_eq!(rec.msg_type, 1);
         assert_eq!(&buf[..], b"kept");
-        assert_eq!(consumer.holes_skipped(), 1, "the hole is counted exactly once");
+        assert_eq!(
+            consumer.holes_skipped(),
+            1,
+            "the hole is counted exactly once"
+        );
 
         // Nothing else is left, and the counter does not drift.
         assert!(matches!(consumer.try_read(&mut buf), Ok(None)));
@@ -1268,9 +1299,15 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let ring = MpscRing::create(tmp.path(), 4096, 1024).expect("create");
         let (producer, mut consumer) = ring.into_split();
-        assert_eq!(consumer.hole_timeout(), DEFAULT_HOLE_TIMEOUT, "1 s by default");
+        assert_eq!(
+            consumer.hole_timeout(),
+            DEFAULT_HOLE_TIMEOUT,
+            "1 s by default"
+        );
 
-        let slow = producer.claim_without_commit(1, 0, [0; 8], b"slow").expect("claim");
+        let slow = producer
+            .claim_without_commit(1, 0, [0; 8], b"slow")
+            .expect("claim");
         let mut buf = Vec::new();
         for _ in 0..100 {
             assert!(matches!(consumer.try_read(&mut buf), Ok(None)));
@@ -1300,7 +1337,11 @@ mod tests {
         consumer.set_hole_timeout(std::time::Duration::from_millis(0));
 
         // A claim that never stamped its word.
-        producer.inner.header().claim_position.store(24, Ordering::Release);
+        producer
+            .inner
+            .header()
+            .claim_position
+            .store(24, Ordering::Release);
 
         let mut buf = Vec::new();
         // First poll: the timer starts, nothing is decided yet.
@@ -1363,7 +1404,9 @@ mod tests {
 
         // A claims at offset 0 (lap 0) and stalls — indistinguishable, from
         // the consumer's side, from dead.
-        let a = producer.claim_without_commit(1, 0, [0; 8], b"A").expect("A claims");
+        let a = producer
+            .claim_without_commit(1, 0, [0; 8], b"A")
+            .expect("A claims");
 
         // First poll starts the hole timer.
         let mut buf = Vec::new();
@@ -1379,7 +1422,9 @@ mod tests {
         // 24/48/72/96, the fifth straddles the tail (padding at 120..128)
         // and wraps to claim offset 0 again at lap 1 — A's exact slot.
         for i in 0u8..5 {
-            producer.try_write(2, 0, [0; 8], &[b'0' + i]).expect("write");
+            producer
+                .try_write(2, 0, [0; 8], &[b'0' + i])
+                .expect("write");
         }
 
         // A resumes now and tries to commit into a slot a later claimant
@@ -1388,7 +1433,11 @@ mod tests {
             producer.commit_claim(a),
             Err(RingError::Skipped { position: 0 })
         ));
-        assert_eq!(consumer.holes_skipped(), 1, "a CAS-refused resurrection is not a new hole");
+        assert_eq!(
+            consumer.holes_skipped(),
+            1,
+            "a CAS-refused resurrection is not a new hole"
+        );
 
         // The ring still round-trips correctly: every one of the 5 records
         // (padding auto-skipped) comes out, none corrupted or duplicated.
@@ -1406,7 +1455,9 @@ mod tests {
         assert_eq!(seen, want);
 
         // And the ring keeps working after all this.
-        producer.try_write(3, 0, [0; 8], b"still fine").expect("write");
+        producer
+            .try_write(3, 0, [0; 8], b"still fine")
+            .expect("write");
         let rec = consumer.try_read(&mut buf).expect("read").expect("record");
         assert_eq!(rec.msg_type, 3);
         assert_eq!(&buf[..], b"still fine");
@@ -1441,14 +1492,25 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "first poll starts the timer");
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "first poll starts the timer"
+        );
         assert!(
             matches!(consumer.try_read(&mut buf), Err(RingError::Corrupt(_))),
             "an oversized advance is refused, not trusted"
         );
-        assert_eq!(consumer.holes_skipped(), 0, "a refused corrupt word is not counted as skipped");
         assert_eq!(
-            producer.inner.header().consumer_position.load(Ordering::Acquire),
+            consumer.holes_skipped(),
+            0,
+            "a refused corrupt word is not counted as skipped"
+        );
+        assert_eq!(
+            producer
+                .inner
+                .header()
+                .consumer_position
+                .load(Ordering::Acquire),
             0,
             "consumer_position must not have moved past an unvalidated advance"
         );
@@ -1476,7 +1538,10 @@ mod tests {
 
         let mut buf = Vec::new();
         assert!(matches!(consumer.try_read(&mut buf), Ok(None)));
-        assert!(matches!(consumer.try_read(&mut buf), Err(RingError::Corrupt(_))));
+        assert!(matches!(
+            consumer.try_read(&mut buf),
+            Err(RingError::Corrupt(_))
+        ));
         assert_eq!(consumer.holes_skipped(), 0);
     }
 
@@ -1495,11 +1560,19 @@ mod tests {
         let (producer, mut consumer) = ring.into_split();
         consumer.set_hole_timeout(std::time::Duration::from_millis(0));
 
-        let a = producer.claim_without_commit(1, 0, [0; 8], b"A").expect("A claims");
+        let a = producer
+            .claim_without_commit(1, 0, [0; 8], b"A")
+            .expect("A claims");
 
         let mut buf = Vec::new();
-        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "starts the timer");
-        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "skips + marks the hole");
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "starts the timer"
+        );
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "skips + marks the hole"
+        );
         assert_eq!(consumer.holes_skipped(), 1);
 
         // A resumes and tries to commit into a slot the consumer has already
@@ -1509,7 +1582,11 @@ mod tests {
             producer.commit_claim(a),
             Err(RingError::Skipped { position: 0 })
         ));
-        assert_eq!(consumer.holes_skipped(), 1, "a refused resurrection is not a new hole");
+        assert_eq!(
+            consumer.holes_skipped(),
+            1,
+            "a refused resurrection is not a new hole"
+        );
 
         // The ring keeps working: a fresh write lands past A's old slot and
         // round-trips normally.
@@ -1550,7 +1627,9 @@ mod tests {
         // — the next real record would straddle, so the next claim is padding.
         let mut buf = Vec::new();
         for i in 0u8..5 {
-            producer.try_write(1, 0, [0; 8], &[b'0' + i]).expect("write");
+            producer
+                .try_write(1, 0, [0; 8], &[b'0' + i])
+                .expect("write");
             assert!(consumer.try_read(&mut buf).expect("read").is_some());
         }
         let header = producer.inner.header();
@@ -1559,13 +1638,25 @@ mod tests {
 
         // A producer enters the straddle branch and is preempted between the
         // padding stamp and the padding publication.
-        let pad = producer.claim_padding_without_commit().expect("padding claim");
-        assert_eq!(header.claim_position.load(Ordering::Acquire), 128, "the tail is claimed");
+        let pad = producer
+            .claim_padding_without_commit()
+            .expect("padding claim");
+        assert_eq!(
+            header.claim_position.load(Ordering::Acquire),
+            128,
+            "the tail is claimed"
+        );
 
         // The consumer cannot tell this from a record hole: first poll starts
         // the timer, second poll skips and MARKS it, advancing over the tail.
-        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "starts the timer");
-        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "skips + marks the padding");
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "starts the timer"
+        );
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "skips + marks the padding"
+        );
         assert_eq!(consumer.holes_skipped(), 1, "a padding hole is a hole");
         assert_eq!(
             header.consumer_position.load(Ordering::Acquire),
@@ -1574,7 +1665,9 @@ mod tests {
         );
 
         // A later claimant takes the wrap, at offset 0 of lap 1.
-        producer.try_write(2, 0, [0; 8], b"y").expect("write after the wrap");
+        producer
+            .try_write(2, 0, [0; 8], b"y")
+            .expect("write after the wrap");
 
         // The preempted padding producer resumes. Its CAS finds the skip
         // marker, not its own claim word: refused, nothing touched.
@@ -1582,14 +1675,23 @@ mod tests {
             producer.commit_padding_claim(pad),
             Err(RingError::Skipped { position: 120 })
         ));
-        assert_eq!(consumer.holes_skipped(), 1, "a refused padding commit is not a new hole");
+        assert_eq!(
+            consumer.holes_skipped(),
+            1,
+            "a refused padding commit is not a new hole"
+        );
 
         // The ring is intact: the later claimant's record round-trips, and
         // the ring keeps working afterwards.
-        let rec = consumer.try_read(&mut buf).expect("read").expect("the record after the wrap");
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("read")
+            .expect("the record after the wrap");
         assert_eq!(rec.msg_type, 2);
         assert_eq!(&buf[..], b"y");
-        producer.try_write(3, 0, [0; 8], b"still fine").expect("write");
+        producer
+            .try_write(3, 0, [0; 8], b"still fine")
+            .expect("write");
         let rec = consumer.try_read(&mut buf).expect("read").expect("record");
         assert_eq!(rec.msg_type, 3);
         assert_eq!(&buf[..], b"still fine");
@@ -1615,7 +1717,9 @@ mod tests {
         let (producer, mut consumer) = ring.into_split();
         consumer.set_hole_timeout(std::time::Duration::from_millis(0));
 
-        let a = producer.claim_without_commit(1, 0, [0; 8], b"A").expect("A claims");
+        let a = producer
+            .claim_without_commit(1, 0, [0; 8], b"A")
+            .expect("A claims");
 
         let mut buf = Vec::new();
         // First poll starts (and, with a zero timeout, immediately elapses)
@@ -1625,10 +1729,17 @@ mod tests {
         // A wins the race: it commits before the consumer polls again.
         producer.commit_claim(a).expect("A's commit is not refused");
 
-        let rec = consumer.try_read(&mut buf).expect("read").expect("A's record, delivered normally");
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("read")
+            .expect("A's record, delivered normally");
         assert_eq!(rec.msg_type, 1);
         assert_eq!(&buf[..], b"A");
-        assert_eq!(consumer.holes_skipped(), 0, "A was not skipped — it won the race");
+        assert_eq!(
+            consumer.holes_skipped(),
+            0,
+            "A was not skipped — it won the race"
+        );
     }
 
     /// Final review, Critical 1(2): the padding stomp. `decode_record_slice`
@@ -1658,7 +1769,12 @@ mod tests {
                 region.add(4),
                 2,
             );
-            store_commit_word(region, 0, encode_commit_word(0, 24, false), Ordering::Release);
+            store_commit_word(
+                region,
+                0,
+                encode_commit_word(0, 24, false),
+                Ordering::Release,
+            );
         }
 
         let mut buf = Vec::new();
@@ -1668,7 +1784,11 @@ mod tests {
             "a padding-shaped word that is not the tail remnant must meet the crc, got {got:?}"
         );
         assert_eq!(
-            producer.inner.header().consumer_position.load(Ordering::Acquire),
+            producer
+                .inner
+                .header()
+                .consumer_position
+                .load(Ordering::Acquire),
             0,
             "nothing was consumed"
         );
@@ -1688,12 +1808,16 @@ mod tests {
         // Walk both positions to 120 (5 × 24), leaving an 8-byte tail.
         let mut buf = Vec::new();
         for i in 0u8..5 {
-            producer.try_write(1, 0, [0; 8], &[b'0' + i]).expect("write");
+            producer
+                .try_write(1, 0, [0; 8], &[b'0' + i])
+                .expect("write");
             assert!(consumer.try_read(&mut buf).expect("read").is_some());
         }
         // The next record straddles: `claim` writes real padding at 120..128
         // and the record at offset 0 of lap 1.
-        producer.try_write(2, 0, [0; 8], b"z").expect("write across the tail");
+        producer
+            .try_write(2, 0, [0; 8], b"z")
+            .expect("write across the tail");
         let rec = consumer
             .try_read(&mut buf)
             .expect("the padding is skipped, not refused")
@@ -1714,10 +1838,19 @@ mod tests {
 
         assert!(matches!(
             producer.try_write(PADDING_MSG_TYPE, 0, [0; 8], b"nope"),
-            Err(RingError::ReservedMsgType { msg_type: PADDING_MSG_TYPE })
+            Err(RingError::ReservedMsgType {
+                msg_type: PADDING_MSG_TYPE
+            })
         ));
         // Nothing was claimed: the ring is untouched and still works.
-        assert_eq!(producer.inner.header().claim_position.load(Ordering::Acquire), 0);
+        assert_eq!(
+            producer
+                .inner
+                .header()
+                .claim_position
+                .load(Ordering::Acquire),
+            0
+        );
         producer.try_write(1, 0, [0; 8], b"ok").expect("write");
         let mut buf = Vec::new();
         let rec = consumer.try_read(&mut buf).expect("read").expect("record");
@@ -1746,17 +1879,28 @@ mod tests {
             );
         }
         // ...but the ring's own frontier says only 8 bytes were ever claimed.
-        producer.inner.header().claim_position.store(8, Ordering::Release);
+        producer
+            .inner
+            .header()
+            .claim_position
+            .store(8, Ordering::Release);
 
         let mut buf = Vec::new();
-        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "first poll starts the timer");
+        assert!(
+            matches!(consumer.try_read(&mut buf), Ok(None)),
+            "first poll starts the timer"
+        );
         assert!(
             matches!(consumer.try_read(&mut buf), Err(RingError::Corrupt(_))),
             "an advance past claim_position is refused, not acted on"
         );
         assert_eq!(consumer.holes_skipped(), 0);
         assert_eq!(
-            producer.inner.header().consumer_position.load(Ordering::Acquire),
+            producer
+                .inner
+                .header()
+                .consumer_position
+                .load(Ordering::Acquire),
             0,
             "consumer_position must not have moved past the frontier"
         );
@@ -1784,7 +1928,8 @@ mod tests {
                 let done = Arc::clone(&done);
                 thread::spawn(move || {
                     let payload = [b'B' + t as u8];
-                    p.try_write(1, 0, [0; 8], &payload).expect("write behind the hole");
+                    p.try_write(1, 0, [0; 8], &payload)
+                        .expect("write behind the hole");
                     done.fetch_add(1, Ordering::Relaxed);
                 })
             })
@@ -1807,7 +1952,11 @@ mod tests {
                 "a claimed-but-uncommitted slot must read as None, never a record"
             );
         }
-        assert_eq!(consumer.holes_skipped(), 0, "a 1 s hole timeout has not elapsed");
+        assert_eq!(
+            consumer.holes_skipped(),
+            0,
+            "a 1 s hole timeout has not elapsed"
+        );
 
         // A commits. Now everything drains, A first.
         producer.commit_claim(a).unwrap();
@@ -1823,9 +1972,11 @@ mod tests {
         assert_eq!(seen[0], b"A".to_vec(), "claim order: A was claimed first");
         let mut rest: Vec<Vec<u8>> = seen[1..].to_vec();
         rest.sort();
-        let mut want: Vec<Vec<u8>> =
-            (0..OTHERS).map(|t| vec![b'B' + t as u8]).collect();
+        let mut want: Vec<Vec<u8>> = (0..OTHERS).map(|t| vec![b'B' + t as u8]).collect();
         want.sort();
-        assert_eq!(rest, want, "every record behind the hole is delivered exactly once");
+        assert_eq!(
+            rest, want,
+            "every record behind the hole is delivered exactly once"
+        );
     }
 }

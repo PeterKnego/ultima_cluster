@@ -158,7 +158,10 @@ pub enum CryptoError {
     /// operator mistake (wrong file, partial write) and silently coercing
     /// it to length would sign/verify under a key the operator didn't
     /// intend.
-    #[error("admin key file {path} is {len} bytes, must be exactly {} bytes", admin::ADMIN_KEY_LEN)]
+    #[error(
+        "admin key file {path} is {len} bytes, must be exactly {} bytes",
+        admin::ADMIN_KEY_LEN
+    )]
     AdminKeyLength { path: String, len: usize },
     /// `admin::generate_key_file` was asked to write to a path that already
     /// exists. Never overwrites a key file — an operator regenerating by

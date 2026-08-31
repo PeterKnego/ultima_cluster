@@ -102,13 +102,13 @@
 //! it needed to. Follow the pattern at an existing call site rather than
 //! writing a fresh one from scratch.
 
+use crate::NodeId;
 use crate::handshake::HandshakeAction;
 #[cfg(test)]
 use crate::schedule::epoch_is_newer;
 use crate::schedule::{GroupKey, KeySchedule};
-use crate::NodeId;
-use rand::rngs::OsRng;
 use rand::TryRngCore;
+use rand::rngs::OsRng;
 use std::collections::HashSet;
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 
@@ -367,7 +367,12 @@ impl GroupPlane {
     /// The node layer polls this on its maintenance tick and re-delivers.
     pub fn unacked_peers(&self) -> Vec<NodeId> {
         match &self.pending {
-            Some(p) => p.peers.iter().copied().filter(|id| !p.acked.contains(id)).collect(),
+            Some(p) => p
+                .peers
+                .iter()
+                .copied()
+                .filter(|id| !p.acked.contains(id))
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -393,7 +398,11 @@ impl GroupPlane {
     /// With nothing minted every target is missing: there is no epoch to hold.
     pub fn peers_missing_key(&self, targets: &[NodeId]) -> Vec<NodeId> {
         match &self.pending {
-            Some(p) => targets.iter().copied().filter(|id| !p.acked.contains(id)).collect(),
+            Some(p) => targets
+                .iter()
+                .copied()
+                .filter(|id| !p.acked.contains(id))
+                .collect(),
             None => targets.to_vec(),
         }
     }
@@ -600,7 +609,10 @@ mod tests {
         let (epoch, _acts) = g.mint(&[0], 1_000);
         // Node 0 was delivered to and acks; node 2 joined the peer set later.
         g.on_ack(0, epoch);
-        assert!(g.unacked_peers().is_empty(), "0 acked, and 2 was never in the mint");
+        assert!(
+            g.unacked_peers().is_empty(),
+            "0 acked, and 2 was never in the mint"
+        );
         assert_eq!(
             g.peers_missing_key(&[0, 2]),
             vec![2],
@@ -617,7 +629,11 @@ mod tests {
         let mut g = GroupPlane::new(1);
         let (epoch, actions) = g.mint(&[2, 3], 0);
         assert_eq!(actions.len(), 2, "one HS_KEY per peer");
-        assert_eq!(g.sealing_epoch(0), None, "must not seal under an unacked epoch");
+        assert_eq!(
+            g.sealing_epoch(0),
+            None,
+            "must not seal under an unacked epoch"
+        );
         g.on_ack(2, epoch);
         assert_eq!(g.sealing_epoch(0), None, "one ack is not enough");
         g.on_ack(3, epoch);
@@ -643,7 +659,10 @@ mod tests {
         g.on_ack(2, e1);
         let (e2, _) = g.mint(&[2], 1_000);
         g.on_ack(2, e2);
-        assert!(g.schedule().get(e1).is_some(), "in-flight e1 datagrams still open");
+        assert!(
+            g.schedule().get(e1).is_some(),
+            "in-flight e1 datagrams still open"
+        );
         assert!(g.schedule().get(e2).is_some());
     }
 
@@ -661,7 +680,10 @@ mod tests {
         for body in [vec![], vec![0u8; 3], vec![0xFF; 200]] {
             let _ = g.on_key_message(1, &body);
         }
-        assert!(g.schedule().current().is_none(), "nothing was installed from garbage");
+        assert!(
+            g.schedule().current().is_none(),
+            "nothing was installed from garbage"
+        );
     }
 
     // -- Beyond the mandated five. Every prior task in this plan shipped
@@ -827,8 +849,8 @@ mod tests {
     }
 
     #[test]
-    fn a_second_mint_before_the_first_activates_still_advances_and_the_dropped_one_never_activates_later(
-    ) {
+    fn a_second_mint_before_the_first_activates_still_advances_and_the_dropped_one_never_activates_later()
+     {
         // If `fold_pending_if_activated` mistakenly evaluated the
         // OUTGOING pending epoch's timeout against a stale `minted_at`
         // read after replacement (or leaked the old PendingEpoch into the
@@ -861,13 +883,19 @@ mod tests {
     #[test]
     fn unacked_peers_names_exactly_who_still_owes_an_ack() {
         let mut g = GroupPlane::new(1);
-        assert!(g.unacked_peers().is_empty(), "nothing minted, nobody owes anything");
+        assert!(
+            g.unacked_peers().is_empty(),
+            "nothing minted, nobody owes anything"
+        );
         let (epoch, _) = g.mint(&[2, 3], 0);
         assert_eq!(g.unacked_peers(), vec![2, 3]);
         g.on_ack(2, epoch);
         assert_eq!(g.unacked_peers(), vec![3]);
         g.on_ack(3, epoch);
-        assert!(g.unacked_peers().is_empty(), "fully acked: the sweep goes quiet");
+        assert!(
+            g.unacked_peers().is_empty(),
+            "fully acked: the sweep goes quiet"
+        );
     }
 
     /// The liveness gap this pair closes: `mint` emits each delivery ONCE,
@@ -882,13 +910,27 @@ mod tests {
         let again = g.redeliver_to(&g.unacked_peers());
         assert_eq!(again.len(), 2);
         for (a, b) in first.iter().zip(again.iter()) {
-            let (HandshakeAction::Send { to: t1, kind: k1, body: b1 }, HandshakeAction::Send { to: t2, kind: k2, body: b2 }) = (a, b) else {
+            let (
+                HandshakeAction::Send {
+                    to: t1,
+                    kind: k1,
+                    body: b1,
+                },
+                HandshakeAction::Send {
+                    to: t2,
+                    kind: k2,
+                    body: b2,
+                },
+            ) = (a, b)
+            else {
                 panic!("mint and redeliver must both emit Send actions");
             };
             assert_eq!((t1, k1, b1), (t2, k2, b2), "the SAME epoch's key, verbatim");
         }
         // And it really is the minted epoch, not a fresh one.
-        let HandshakeAction::Send { body, .. } = &again[0] else { unreachable!() };
+        let HandshakeAction::Send { body, .. } = &again[0] else {
+            unreachable!()
+        };
         assert_eq!(u16::from_le_bytes([body[1], body[2]]), epoch);
     }
 
@@ -904,7 +946,9 @@ mod tests {
         assert!(g.unacked_peers().is_empty());
         let acts = g.redeliver_to(&[2]);
         assert_eq!(acts.len(), 1, "a restarted peer is re-keyed on demand");
-        let HandshakeAction::Send { to, kind, body } = &acts[0] else { unreachable!() };
+        let HandshakeAction::Send { to, kind, body } = &acts[0] else {
+            unreachable!()
+        };
         assert_eq!((*to, *kind), (2, DGRAM_KIND_HS_KEY));
         assert_eq!(u16::from_le_bytes([body[1], body[2]]), epoch);
     }
@@ -955,7 +999,11 @@ mod tests {
         let mut t = 0u64;
         for _ in 0..20 {
             t += 300_000_000; // one election timeout apart
-            assert_eq!(g.mint(&[2, 3], t).1.len(), 2, "each mint re-delivers to both peers");
+            assert_eq!(
+                g.mint(&[2, 3], t).1.len(),
+                2,
+                "each mint re-delivers to both peers"
+            );
             g.on_ack(2, g.sealing_epoch(t).unwrap_or(0)); // peer 2 keeps acking
         }
         assert!(
@@ -976,12 +1024,18 @@ mod tests {
     fn inheriting_the_clock_does_not_activate_an_epoch_before_the_grace_elapses() {
         let mut g = GroupPlane::new(1);
         g.mint(&[2, 3], 1_000_000_000);
-        assert!(g.sealing_epoch(1_500_000_000).is_none(), "half a grace in: not yet");
+        assert!(
+            g.sealing_epoch(1_500_000_000).is_none(),
+            "half a grace in: not yet"
+        );
         g.mint(&[2, 3], 1_500_000_000);
         assert!(
             g.sealing_epoch(2_000_000_000).is_none(),
             "the inherited clock starts at the FIRST mint (1.0s), so 2.0s is still inside it"
         );
-        assert!(g.sealing_epoch(3_100_000_000).is_some(), "past the grace from the first mint");
+        assert!(
+            g.sealing_epoch(3_100_000_000).is_some(),
+            "past the grace from the first mint"
+        );
     }
 }

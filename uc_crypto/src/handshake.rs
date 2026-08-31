@@ -691,7 +691,8 @@ impl Peers {
         }
 
         let mut out = [0u8; HS_BUF_LEN];
-        let Ok(out_len) = state.write_message(&encode_payload(*self_id, boot_salt), &mut out) else {
+        let Ok(out_len) = state.write_message(&encode_payload(*self_id, boot_salt), &mut out)
+        else {
             return vec![fail(from, "could not write handshake message 2")];
         };
         if !state.is_handshake_finished() {
@@ -1066,7 +1067,9 @@ mod tests {
                             b_up = true
                         }
                     }
-                    HandshakeAction::Failed { reason, .. } => panic!("unexpected failure: {reason}"),
+                    HandshakeAction::Failed { reason, .. } => {
+                        panic!("unexpected failure: {reason}")
+                    }
                 }
             }
             if next.is_empty() {
@@ -1579,7 +1582,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(announced, vec![(a2.boot_salt(), true)], "promotion announced");
+        assert_eq!(
+            announced,
+            vec![(a2.boot_salt(), true)],
+            "promotion announced"
+        );
         assert_eq!(b.peer_boot_salt(A_ID), Some(a2.boot_salt()));
         // Announced exactly once, not on every subsequent tick.
         assert!(b.tick(2_000_000_000).is_empty());
@@ -1664,8 +1671,13 @@ mod tests {
         );
         // HS_KEY is T7's; unknown kinds are not ours.
         assert!(
-            a.on_message(B_ID, uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY, &[1, 2, 3], 0)
-                .is_empty()
+            a.on_message(
+                B_ID,
+                uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY,
+                &[1, 2, 3],
+                0
+            )
+            .is_empty()
         );
         assert!(a.on_message(B_ID, 250, &[1, 2, 3], 0).is_empty());
         // A datagram claiming to be from us is refused, not processed.
@@ -1774,7 +1786,10 @@ mod tests {
             1,
             "exactly one retry at the deadline"
         );
-        assert!(a.tick(HS_RETRY_BASE_NS + 1).is_empty(), "and then quiet again");
+        assert!(
+            a.tick(HS_RETRY_BASE_NS + 1).is_empty(),
+            "and then quiet again"
+        );
     }
 
     #[test]

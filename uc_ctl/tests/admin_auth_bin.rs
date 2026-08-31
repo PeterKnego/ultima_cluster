@@ -61,7 +61,10 @@ fn start_node(root: &Path, name: &str, policy: AdminPolicy) -> (Node, PathBuf) {
     let addr = sock.local_addr().unwrap();
     let instance_dir = root.join(name);
     let cfg = make_config(instance_dir.clone(), addr);
-    let opts = uc_node::StartOpts { socket: Some(sock), admin: policy };
+    let opts = uc_node::StartOpts {
+        socket: Some(sock),
+        admin: policy,
+    };
     let node = Node::start_with(cfg, opts).expect("start");
     (node, instance_dir)
 }
@@ -69,7 +72,10 @@ fn start_node(root: &Path, name: &str, policy: AdminPolicy) -> (Node, PathBuf) {
 fn await_leader(node: &Node, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !node.can_serve() {
-        assert!(Instant::now() < deadline, "node never became leader/serving");
+        assert!(
+            Instant::now() < deadline,
+            "node never became leader/serving"
+        );
         std::thread::yield_now();
     }
 }
@@ -82,7 +88,10 @@ struct Run {
 }
 
 fn run_ctl(args: &[&str]) -> Run {
-    let out = Command::new(bin()).args(args).output().expect("spawn uc2ctl");
+    let out = Command::new(bin())
+        .args(args)
+        .output()
+        .expect("spawn uc2ctl");
     Run {
         status: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
@@ -109,7 +118,10 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
     generate_key_file(&ops_other_path).expect("gen ops-other key");
     let ops_test_key = AdminKey::load("ops-test", &ops_test_path).expect("load ops-test");
 
-    let policy = AdminPolicy::Hmac { keys: Arc::new(vec![ops_test_key]), ttl: Duration::from_secs(30) };
+    let policy = AdminPolicy::Hmac {
+        keys: Arc::new(vec![ops_test_key]),
+        ttl: Duration::from_secs(30),
+    };
     let (node, instance_dir) = start_node(root.path(), "n0", policy);
     await_leader(&node, 20);
     let dir_s = instance_dir.to_str().unwrap();
@@ -126,7 +138,10 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
         "--addr",
         "127.0.0.1:59101",
     ]);
-    assert_ne!(r.status, 0, "an unsigned add-learner must fail under Hmac: {r:?}");
+    assert_ne!(
+        r.status, 0,
+        "an unsigned add-learner must fail under Hmac: {r:?}"
+    );
     assert!(
         r.stdout.contains("auth_missing") || r.stderr.contains("auth_missing"),
         "expected auth_missing: {r:?}"
@@ -146,7 +161,10 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
         "--admin-key",
         ops_test_path.to_str().unwrap(),
     ]);
-    assert_eq!(r.status, 0, "a validly signed add-learner must succeed: {r:?}");
+    assert_eq!(
+        r.status, 0,
+        "a validly signed add-learner must succeed: {r:?}"
+    );
     assert!(r.stdout.contains("accepted"), "stdout={}", r.stdout);
 
     // Fix round 1, minor 1: "accepted" alone doesn't prove the change
@@ -182,7 +200,10 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
         "--admin-key",
         ops_other_path.to_str().unwrap(),
     ]);
-    assert_ne!(r.status, 0, "an unregistered key name must be refused: {r:?}");
+    assert_ne!(
+        r.status, 0,
+        "an unregistered key name must be refused: {r:?}"
+    );
     assert!(
         r.stdout.contains("auth_unknown_key") || r.stderr.contains("auth_unknown_key"),
         "expected auth_unknown_key: {r:?}"
@@ -200,18 +221,29 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
 
     let r_json = run_ctl(&["audit", "--instance-dir", dir_s, "--json"]);
     assert_eq!(r_json.status, 0, "audit --json must succeed: {r_json:?}");
-    let json_lines: Vec<&str> = r_json.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let json_lines: Vec<&str> = r_json
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert_eq!(json_lines.len(), 3);
     for l in &json_lines {
         let t = l.trim();
-        assert!(t.starts_with('{') && t.ends_with('}'), "not a JSON object: {l}");
+        assert!(
+            t.starts_with('{') && t.ends_with('}'),
+            "not a JSON object: {l}"
+        );
         assert!(t.contains("\"event\":\"admin_op\""), "{l}");
     }
 
     // `--tail 1` shows only the most recent record.
     let r_tail = run_ctl(&["audit", "--instance-dir", dir_s, "--tail", "1"]);
     assert_eq!(r_tail.status, 0);
-    let tail_lines: Vec<&str> = r_tail.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail_lines: Vec<&str> = r_tail
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert_eq!(tail_lines.len(), 1, "stdout={}", r_tail.stdout);
     assert!(tail_lines[0].contains("refused"));
 
@@ -229,8 +261,15 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
         writeln!(f, "not even remotely json").expect("append garbage line");
     }
     let r_garbage = run_ctl(&["audit", "--instance-dir", dir_s]);
-    assert_eq!(r_garbage.status, 0, "a garbage audit line must not crash uc2ctl: {r_garbage:?}");
-    let garbage_lines: Vec<&str> = r_garbage.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        r_garbage.status, 0,
+        "a garbage audit line must not crash uc2ctl: {r_garbage:?}"
+    );
+    let garbage_lines: Vec<&str> = r_garbage
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert_eq!(
         garbage_lines.len(),
         4,
@@ -242,7 +281,11 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
         "the garbage line should carry the ? marker: {}",
         garbage_lines[3]
     );
-    assert!(garbage_lines[3].contains("not even remotely json"), "{}", garbage_lines[3]);
+    assert!(
+        garbage_lines[3].contains("not even remotely json"),
+        "{}",
+        garbage_lines[3]
+    );
 
     // Step 5: gen-admin-key -> 32 bytes, 0600; second run refuses to
     // overwrite with a named error.
@@ -254,7 +297,11 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        assert_eq!(meta.mode() & 0o777, 0o600, "generated key must be mode 0600");
+        assert_eq!(
+            meta.mode() & 0o777,
+            0o600,
+            "generated key must be mode 0600"
+        );
     }
     // Fix round 1, minor 2: the printed snippet must name the key file's
     // stem ("generated") and the file's own absolute path — not just SOME
@@ -272,9 +319,13 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
     );
 
     let r2 = run_ctl(&["gen-admin-key", gen_path.to_str().unwrap()]);
-    assert_ne!(r2.status, 0, "gen-admin-key must refuse to overwrite an existing file");
+    assert_ne!(
+        r2.status, 0,
+        "gen-admin-key must refuse to overwrite an existing file"
+    );
     assert!(
-        r2.stderr.contains(gen_path.to_str().unwrap()) || r2.stdout.contains(gen_path.to_str().unwrap()),
+        r2.stderr.contains(gen_path.to_str().unwrap())
+            || r2.stdout.contains(gen_path.to_str().unwrap()),
         "the overwrite refusal should name the path: {r2:?}"
     );
 
@@ -305,7 +356,10 @@ fn filesystem_policy_accepts_add_learner_with_no_key() {
         "--addr",
         "127.0.0.1:59201",
     ]);
-    assert_eq!(r.status, 0, "Filesystem policy must accept an unsigned add-learner: {r:?}");
+    assert_eq!(
+        r.status, 0,
+        "Filesystem policy must accept an unsigned add-learner: {r:?}"
+    );
     assert!(r.stdout.contains("accepted"), "stdout={}", r.stdout);
 
     node.stop();

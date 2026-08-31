@@ -94,20 +94,40 @@ fn spawn_cluster(n: usize) -> Cluster {
         .expect("tempdir");
     let dir_path = dir.path().to_path_buf();
 
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
         let instance_dir = dir.path().join(format!("n{i}"));
-        let cfg = make_config(i as NodeId, members.clone(), addr, instance_dir.clone(), seed_for(i));
+        let cfg = make_config(
+            i as NodeId,
+            members.clone(),
+            addr,
+            instance_dir.clone(),
+            seed_for(i),
+        );
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, instance_dir, node });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            addr,
+            instance_dir,
+            node,
+        });
     }
-    Cluster { _dir: dir, dir_path, members, nodes }
+    Cluster {
+        _dir: dir,
+        dir_path,
+        members,
+        nodes,
+    }
 }
 
 fn deadline_secs(secs: u64) -> Instant {
@@ -117,11 +137,16 @@ fn deadline_secs(secs: u64) -> Instant {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node.can_serve()).collect();
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node.can_serve())
+            .collect();
         assert!(serving.len() <= 1, "split-brain: {serving:?} all serve");
         if serving.len() == 1 {
             let i = serving[0];
-            assert!(nodes[i].node.is_leader(), "serving node {i} not flagged leader");
+            assert!(
+                nodes[i].node.is_leader(),
+                "serving node {i} not flagged leader"
+            );
             return i;
         }
         assert!(Instant::now() < deadline, "no single leader elected");
@@ -143,13 +168,23 @@ fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16) -> AdminRe
     let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
     let seq = old_seq + 1;
     let nonce = rand::random::<u64>();
-    cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+    cnc.write_admin_req(&AdminReq {
+        seq,
+        nonce,
+        op,
+        id,
+        ip,
+        port,
+    });
     let deadline = deadline_secs(15);
     loop {
         if let Some(resp) = cnc.read_admin_resp(seq) {
             return resp;
         }
-        assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+        assert!(
+            Instant::now() < deadline,
+            "admin response timed out for seq {seq}"
+        );
         std::thread::yield_now();
     }
 }
@@ -165,7 +200,13 @@ fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
 /// `secs`, and that `member_id`'s peer slot shows up with role `want_role` on
 /// every OTHER node (voters carry every OTHER member's slot, never their own —
 /// so `member_id` itself is skipped when it is present in `nodes`).
-fn await_config_converged(nodes: &[NodeH], version: u64, member_id: NodeId, want_role: u8, secs: u64) {
+fn await_config_converged(
+    nodes: &[NodeH],
+    version: u64,
+    member_id: NodeId,
+    want_role: u8,
+    secs: u64,
+) {
     let deadline = deadline_secs(secs);
     loop {
         if nodes.iter().all(|h| h.node.config_version() >= version) {
@@ -211,7 +252,11 @@ fn await_config_converged(nodes: &[NodeH], version: u64, member_id: NodeId, want
                 found = true;
             }
         }
-        assert!(found, "node {}: no peer slot published for member {member_id}", h.id);
+        assert!(
+            found,
+            "node {}: no peer slot published for member {member_id}",
+            h.id
+        );
     }
 }
 
@@ -257,7 +302,11 @@ fn add_learner_via_leader_cnc_is_accepted_and_converges() {
 
     let cnc = open_cnc(&c.nodes[leader].instance_dir);
     let resp = admin_request(&cnc, 1 /* AddLearner */, learner_id, ip, port);
-    assert_eq!(resp.status, 0, "add-learner via the leader's own cnc was refused: reason {}", resp.reason);
+    assert_eq!(
+        resp.status, 0,
+        "add-learner via the leader's own cnc was refused: reason {}",
+        resp.reason
+    );
     assert_eq!(resp.version, 1);
 
     await_config_converged(&c.nodes, 1, learner_id, CNC_PEER_ROLE_LEARNER, 20);
@@ -272,7 +321,9 @@ fn add_learner_via_follower_cnc_is_forwarded_and_converges() {
     let _g = serialize();
     let c = spawn_cluster(3);
     let leader = await_single_leader(&c.nodes, 20);
-    let follower = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
+    let follower = (0..c.nodes.len())
+        .find(|&i| i != leader)
+        .expect("a follower exists");
 
     let learner_id: NodeId = 11;
     let learner_addr: SocketAddr = "127.0.0.1:59011".parse().unwrap();
@@ -349,8 +400,12 @@ fn leader_self_removal_hands_off() {
                     let _ = h.node.submit(p);
                     i += 1;
                 }
-                let cur =
-                    c.nodes.iter().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0);
+                let cur = c
+                    .nodes
+                    .iter()
+                    .map(|h| h.node.counters().commit.load_acquire())
+                    .max()
+                    .unwrap_or(0);
                 let prev = high_water.fetch_max(cur, Ordering::Relaxed);
                 if cur < prev {
                     regressed.store(true, Ordering::Relaxed);
@@ -372,7 +427,11 @@ fn leader_self_removal_hands_off() {
         // Remove the leader via ITS OWN admin cnc slot.
         let cnc = open_cnc(&c.nodes[leader].instance_dir);
         let resp = admin_request(&cnc, 5 /* RemoveVoter */, leader_id, 0, 0);
-        assert_eq!(resp.status, 0, "leader self-removal refused: reason {}", resp.reason);
+        assert_eq!(
+            resp.status, 0,
+            "leader self-removal refused: reason {}",
+            resp.reason
+        );
         assert_eq!(resp.version, 1);
 
         // The old leader's cnc drops LEADER + CAN_SERVE once its own removal
@@ -384,7 +443,10 @@ fn leader_self_removal_hands_off() {
             if flags & (NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE) == 0 {
                 break;
             }
-            assert!(Instant::now() < deadline, "old leader never dropped LEADER/CAN_SERVE");
+            assert!(
+                Instant::now() < deadline,
+                "old leader never dropped LEADER/CAN_SERVE"
+            );
             std::thread::yield_now();
         }
         assert!(!c.nodes[leader].node.is_leader());
@@ -395,13 +457,22 @@ fn leader_self_removal_hands_off() {
         let new_leader = {
             let deadline = deadline_secs(5);
             loop {
-                let serving: Vec<usize> =
-                    survivors.iter().copied().filter(|&i| c.nodes[i].node.can_serve()).collect();
-                assert!(serving.len() <= 1, "split-brain among survivors: {serving:?}");
+                let serving: Vec<usize> = survivors
+                    .iter()
+                    .copied()
+                    .filter(|&i| c.nodes[i].node.can_serve())
+                    .collect();
+                assert!(
+                    serving.len() <= 1,
+                    "split-brain among survivors: {serving:?}"
+                );
                 if serving.len() == 1 {
                     break serving[0];
                 }
-                assert!(Instant::now() < deadline, "no new leader emerged among the survivors");
+                assert!(
+                    Instant::now() < deadline,
+                    "no new leader emerged among the survivors"
+                );
                 std::thread::yield_now();
             }
         };
@@ -419,7 +490,10 @@ fn leader_self_removal_hands_off() {
             if c.nodes[new_leader].node.counters().commit.load_acquire() > before {
                 break;
             }
-            assert!(Instant::now() < deadline, "the new leader never advanced commit");
+            assert!(
+                Instant::now() < deadline,
+                "the new leader never advanced commit"
+            );
             std::thread::yield_now();
         }
 
@@ -441,7 +515,10 @@ fn leader_self_removal_hands_off() {
         stop.store(true, Ordering::Relaxed);
     });
 
-    assert!(!regressed.load(Ordering::Relaxed), "committed high-water regressed across the handoff");
+    assert!(
+        !regressed.load(Ordering::Relaxed),
+        "committed high-water regressed across the handoff"
+    );
 
     for h in c.nodes {
         h.node.stop();
@@ -489,13 +566,19 @@ fn removed_follower_halts_and_zombie_cannot_disrupt() {
 fn removed_follower_halts_and_zombie_once() -> bool {
     let mut c = spawn_cluster(3);
     let leader = await_single_leader(&c.nodes, 20);
-    let target = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
+    let target = (0..c.nodes.len())
+        .find(|&i| i != leader)
+        .expect("a follower exists");
     let target_id = c.nodes[target].id;
     let target_addr = c.nodes[target].addr;
 
     let leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
     let resp = admin_request(&leader_cnc, 5 /* RemoveVoter */, target_id, 0, 0);
-    assert_eq!(resp.status, 0, "follower removal refused: reason {}", resp.reason);
+    assert_eq!(
+        resp.status, 0,
+        "follower removal refused: reason {}",
+        resp.reason
+    );
     assert_eq!(resp.version, 1);
 
     // It adopts its own removal (config_version reaches 1) — the same event
@@ -519,7 +602,9 @@ fn removed_follower_halts_and_zombie_once() -> bool {
     // advancing every duty cycle. Contrast against a SURVIVING follower's
     // heartbeat, which must keep moving, to rule out a stalled test process.
     let target_cnc = open_cnc(&c.nodes[target].instance_dir);
-    let survivor = (0..c.nodes.len()).find(|&i| i != leader && i != target).unwrap();
+    let survivor = (0..c.nodes.len())
+        .find(|&i| i != leader && i != target)
+        .unwrap();
     let survivor_cnc = open_cnc(&c.nodes[survivor].instance_dir);
     let hb0 = target_cnc.status().node_heartbeat_ns.load_acquire();
     let sv0 = survivor_cnc.status().node_heartbeat_ns.load_acquire();
@@ -573,7 +658,14 @@ fn removed_follower_halts_and_zombie_once() -> bool {
     let survivor_ids: Vec<NodeId> = c.nodes.iter().map(|h| h.id).collect();
     let terms_before: Vec<u32> = survivor_ids
         .iter()
-        .map(|&id| c.nodes.iter().find(|h| h.id == id).unwrap().node.current_term())
+        .map(|&id| {
+            c.nodes
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap()
+                .node
+                .current_term()
+        })
         .collect();
     let survivor_addrs: Vec<SocketAddr> = c.nodes.iter().map(|h| h.addr).collect();
 
@@ -591,7 +683,11 @@ fn removed_follower_halts_and_zombie_once() -> bool {
     );
     write_request_vote_body(
         &mut rvb[DATAGRAM_HEADER_LEN..],
-        &RequestVoteBody { new_term: huge_term, last_term: huge_term, last_durable: u64::MAX },
+        &RequestVoteBody {
+            new_term: huge_term,
+            last_term: huge_term,
+            last_durable: u64::MAX,
+        },
     );
     let mut report = vec![0u8; DATAGRAM_HEADER_LEN];
     write_datagram_header(
@@ -616,7 +712,12 @@ fn removed_follower_halts_and_zombie_once() -> bool {
 
     for (i, &id) in survivor_ids.iter().enumerate() {
         assert_eq!(
-            c.nodes.iter().find(|h| h.id == id).unwrap().node.current_term(),
+            c.nodes
+                .iter()
+                .find(|h| h.id == id)
+                .unwrap()
+                .node
+                .current_term(),
             terms_before[i],
             "survivor id {id}'s term must stay stable under the zombie's forged datagrams"
         );
@@ -657,20 +758,38 @@ fn joining_node_boots_from_stale_seed() {
     // knowledge whatsoever of its own learner-hood (a fresh instance dir, so
     // this seed is authoritative at boot per `NodeConfig::members`' doc).
     let instance_dir5 = c.dir_path.join("n5");
-    let cfg5 = make_config(5, c.members.clone(), addr5, instance_dir5.clone(), seed_for(5));
+    let cfg5 = make_config(
+        5,
+        c.members.clone(),
+        addr5,
+        instance_dir5.clone(),
+        seed_for(5),
+    );
     let node5 = Node::start_with_socket(cfg5, sock5).expect("start joining node from a stale seed");
 
     // It adopts v1 from the replicated stream, not from its own (stale) seed.
     let deadline = deadline_secs(40);
     while node5.config_version() < 1 {
-        assert!(Instant::now() < deadline, "node 5 never adopted v1 from the stream");
+        assert!(
+            Instant::now() < deadline,
+            "node 5 never adopted v1 from the stream"
+        );
         std::thread::yield_now();
     }
 
     // It appears in every (other) node's peer band as a LEARNER.
-    let node5_h = NodeH { id: 5, addr: addr5, instance_dir: instance_dir5.clone(), node: node5 };
+    let node5_h = NodeH {
+        id: 5,
+        addr: addr5,
+        instance_dir: instance_dir5.clone(),
+        node: node5,
+    };
     for h in c.nodes.iter().chain(std::iter::once(&node5_h)) {
-        assert!(h.node.config_version() >= 1, "node {} lagging on config version", h.id);
+        assert!(
+            h.node.config_version() >= 1,
+            "node {} lagging on config version",
+            h.id
+        );
         if h.id == 5 {
             continue; // a node never lists its own slot
         }
@@ -684,7 +803,11 @@ fn joining_node_boots_from_stale_seed() {
             let id = (raw >> 8) as u32;
             let role = (raw & 0xff) as u8;
             if id == 5 {
-                assert_eq!(role, CNC_PEER_ROLE_LEARNER, "node {}: id 5's peer slot role", h.id);
+                assert_eq!(
+                    role, CNC_PEER_ROLE_LEARNER,
+                    "node {}: id 5's peer slot role",
+                    h.id
+                );
                 found = true;
             }
         }
@@ -712,7 +835,10 @@ fn joining_node_boots_from_stale_seed() {
 
     let deadline = deadline_secs(20);
     while node5_h.node.config_version() < 2 {
-        assert!(Instant::now() < deadline, "node 5 never converged on its own promotion");
+        assert!(
+            Instant::now() < deadline,
+            "node 5 never converged on its own promotion"
+        );
         std::thread::yield_now();
     }
 
@@ -730,7 +856,10 @@ fn joining_node_boots_from_stale_seed() {
             if let Some(h) = all_live().find(|h| h.node.can_serve()) {
                 break h.node.counters().commit.load_acquire();
             }
-            assert!(Instant::now() < deadline, "no leader among the remaining 3 live voters");
+            assert!(
+                Instant::now() < deadline,
+                "no leader among the remaining 3 live voters"
+            );
             std::thread::yield_now();
         }
     };
@@ -743,11 +872,17 @@ fn joining_node_boots_from_stale_seed() {
     }
     let deadline = deadline_secs(20);
     loop {
-        let cur = all_live().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0);
+        let cur = all_live()
+            .map(|h| h.node.counters().commit.load_acquire())
+            .max()
+            .unwrap_or(0);
         if cur > before {
             break;
         }
-        assert!(Instant::now() < deadline, "the 4-voter (minus 1 crashed) cluster never committed more");
+        assert!(
+            Instant::now() < deadline,
+            "the 4-voter (minus 1 crashed) cluster never committed more"
+        );
         std::thread::yield_now();
     }
 
@@ -801,8 +936,15 @@ fn partition(a: &NodeH, b: &NodeH) {
 fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = idxs.iter().copied().filter(|&i| nodes[i].node.can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain among {idxs:?}: {serving:?} serve");
+        let serving: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| nodes[i].node.can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain among {idxs:?}: {serving:?} serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -826,11 +968,15 @@ fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
 fn find_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node.can_serve()).collect();
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node.can_serve())
+            .collect();
         if serving.len() == 1 {
             let i = serving[0];
             std::thread::sleep(Duration::from_millis(20));
-            let still: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node.can_serve()).collect();
+            let still: Vec<usize> = (0..nodes.len())
+                .filter(|&i| nodes[i].node.can_serve())
+                .collect();
             if still == vec![i] {
                 return i;
             }
@@ -851,22 +997,41 @@ fn spawn_cluster_admission(n: usize, admission_bytes: u64) -> Cluster {
         .expect("tempdir");
     let dir_path = dir.path().to_path_buf();
 
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
         let instance_dir = dir.path().join(format!("n{i}"));
-        let mut cfg =
-            make_config(i as NodeId, members.clone(), addr, instance_dir.clone(), seed_for(i));
+        let mut cfg = make_config(
+            i as NodeId,
+            members.clone(),
+            addr,
+            instance_dir.clone(),
+            seed_for(i),
+        );
         cfg.admission_bytes = admission_bytes;
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, instance_dir, node });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            addr,
+            instance_dir,
+            node,
+        });
     }
-    Cluster { _dir: dir, dir_path, members, nodes }
+    Cluster {
+        _dir: dir,
+        dir_path,
+        members,
+        nodes,
+    }
 }
 
 /// Wait until `cnc`'s mirrored `config_pending` reads stable (0). Used
@@ -879,7 +1044,10 @@ fn spawn_cluster_admission(n: usize, admission_bytes: u64) -> Cluster {
 fn await_config_settled(cnc: &CncPage, secs: u64) {
     let deadline = deadline_secs(secs);
     while cnc.config_pending() != 0 {
-        assert!(Instant::now() < deadline, "config change never settled (stayed pending)");
+        assert!(
+            Instant::now() < deadline,
+            "config change never settled (stayed pending)"
+        );
         std::thread::yield_now();
     }
 }
@@ -906,7 +1074,11 @@ fn submit_batch(node: &Node, n: u64) {
 /// Max over every live node's own commit counter (each individually
 /// monotonic) — a cluster-wide high-water mark for "commit advanced".
 fn commit_high_water(nodes: &[NodeH]) -> u64 {
-    nodes.iter().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0)
+    nodes
+        .iter()
+        .map(|h| h.node.counters().commit.load_acquire())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Wait (bounded) for the cluster-wide commit high-water to advance past
@@ -932,11 +1104,25 @@ fn add_learner_and_boot(c: &mut Cluster, leader_cnc: &CncPage, id: NodeId, expec
     let addr = sock.local_addr().unwrap();
     let (ip, port) = addr_to_wire(addr);
     let resp = admin_request_ok(leader_cnc, 1 /* AddLearner */, id, ip, port, 20);
-    assert_eq!(resp.version, expect_version, "add-learner {id} landed at an unexpected version");
+    assert_eq!(
+        resp.version, expect_version,
+        "add-learner {id} landed at an unexpected version"
+    );
     let instance_dir = c.dir_path.join(format!("n{id}"));
-    let cfg = make_config(id, c.members.clone(), addr, instance_dir.clone(), seed_for(id as usize));
+    let cfg = make_config(
+        id,
+        c.members.clone(),
+        addr,
+        instance_dir.clone(),
+        seed_for(id as usize),
+    );
     let node = Node::start_with_socket(cfg, sock).expect("start extra node");
-    c.nodes.push(NodeH { id, addr, instance_dir, node });
+    c.nodes.push(NodeH {
+        id,
+        addr,
+        instance_dir,
+        node,
+    });
 }
 
 /// The set of ids `cnc`'s own peer band currently publishes with VOTER role
@@ -1071,7 +1257,10 @@ fn full_replace_a_box_recipe() {
         if caught_up {
             break;
         }
-        assert!(Instant::now() < deadline, "new node's PeerSlot never reported catch-up");
+        assert!(
+            Instant::now() < deadline,
+            "new node's PeerSlot never reported catch-up"
+        );
         std::thread::yield_now();
     }
 
@@ -1094,7 +1283,10 @@ fn full_replace_a_box_recipe() {
 
     let deadline = deadline_secs(20);
     while c.nodes.iter().any(|h| h.node.config_version() < 3) {
-        assert!(Instant::now() < deadline, "config version 3 never converged after the replace");
+        assert!(
+            Instant::now() < deadline,
+            "config version 3 never converged after the replace"
+        );
         std::thread::yield_now();
     }
     // The crashed/removed original voter must never surface in a survivor's
@@ -1107,7 +1299,11 @@ fn full_replace_a_box_recipe() {
                 continue;
             }
             let id = (raw >> 8) as u32;
-            assert_ne!(id, crash_id, "node {}: removed voter {crash_id} still published", h.id);
+            assert_ne!(
+                id, crash_id,
+                "node {}: removed voter {crash_id} still published",
+                h.id
+            );
         }
     }
     // The new node is now a fully-fledged voter cluster-wide, at v3.
@@ -1118,11 +1314,18 @@ fn full_replace_a_box_recipe() {
     // scan ALL 8 slots, not just the ones `voter_ids_via_cnc`-style checks
     // look at. Final voter set: the original 3 minus the crashed one, plus
     // the new node; every survivor's own band excludes itself.
-    let final_voters: Vec<NodeId> =
-        [0u32, 1, 2].into_iter().filter(|&id| id != crash_id).chain(std::iter::once(new_id)).collect();
+    let final_voters: Vec<NodeId> = [0u32, 1, 2]
+        .into_iter()
+        .filter(|&id| id != crash_id)
+        .chain(std::iter::once(new_id))
+        .collect();
     for h in &c.nodes {
         let cnc = open_cnc(&h.instance_dir);
-        let expected: Vec<NodeId> = final_voters.iter().copied().filter(|&id| id != h.id).collect();
+        let expected: Vec<NodeId> = final_voters
+            .iter()
+            .copied()
+            .filter(|&id| id != h.id)
+            .collect();
         assert_peer_band_clean(&cnc, &expected);
     }
 
@@ -1168,7 +1371,11 @@ fn resize_3_to_5_to_3() {
     add_learner_and_boot(&mut c, &leader_cnc, 60, 1);
     let before = commit_high_water(&c.nodes);
     submit_batch(&c.nodes[leader].node, 300);
-    await_commit_advanced(&c.nodes, before, "commit must advance across add-learner 60");
+    await_commit_advanced(
+        &c.nodes,
+        before,
+        "commit must advance across add-learner 60",
+    );
     await_config_converged(&c.nodes, 1, 60, CNC_PEER_ROLE_LEARNER, 20);
 
     let resp = admin_request_ok(&leader_cnc, 2 /* PromoteLearner */, 60, 0, 0, 30);
@@ -1181,7 +1388,11 @@ fn resize_3_to_5_to_3() {
     add_learner_and_boot(&mut c, &leader_cnc, 61, 3);
     let before = commit_high_water(&c.nodes);
     submit_batch(&c.nodes[leader].node, 300);
-    await_commit_advanced(&c.nodes, before, "commit must advance across add-learner 61");
+    await_commit_advanced(
+        &c.nodes,
+        before,
+        "commit must advance across add-learner 61",
+    );
     await_config_converged(&c.nodes, 3, 61, CNC_PEER_ROLE_LEARNER, 90);
 
     let resp = admin_request_ok(&leader_cnc, 2, 61, 0, 0, 30);
@@ -1202,7 +1413,11 @@ fn resize_3_to_5_to_3() {
     assert_eq!(resp.version, 6);
     let before = commit_high_water(&c.nodes);
     submit_batch(&c.nodes[leader].node, 200);
-    await_commit_advanced(&c.nodes, before, "commit must advance across remove-learner 60");
+    await_commit_advanced(
+        &c.nodes,
+        before,
+        "commit must advance across remove-learner 60",
+    );
 
     let resp = admin_request_ok(&leader_cnc, 3 /* DemoteVoter */, 61, 0, 0, 20);
     assert_eq!(resp.version, 7);
@@ -1214,7 +1429,11 @@ fn resize_3_to_5_to_3() {
     assert_eq!(resp.version, 8);
     let before = commit_high_water(&c.nodes);
     submit_batch(&c.nodes[leader].node, 200);
-    await_commit_advanced(&c.nodes, before, "commit must advance across remove-learner 61");
+    await_commit_advanced(
+        &c.nodes,
+        before,
+        "commit must advance across remove-learner 61",
+    );
 
     // ---- final: the original 3 converge on v8; the two added-then-removed
     // nodes (60, 61) have permanently fail-stopped on adopting their own
@@ -1266,7 +1485,11 @@ fn resize_3_to_5_to_3() {
     // suite uses: `publish_peer_band` runs inline with config adoption, so a
     // reader can catch a beat mid-transition. Asserting the instant the last
     // admin op returns reads an in-flight band and fails ~45% of the time.
-    let survivors: Vec<&NodeH> = c.nodes.iter().filter(|h| h.id != 60 && h.id != 61).collect();
+    let survivors: Vec<&NodeH> = c
+        .nodes
+        .iter()
+        .filter(|h| h.id != 60 && h.id != 61)
+        .collect();
     let expected: Vec<NodeId> = survivors.iter().map(|h| h.id).collect();
     let deadline = deadline_secs(20);
     loop {
@@ -1289,7 +1512,10 @@ fn resize_3_to_5_to_3() {
     let survivors: Vec<&NodeH> = c.nodes.iter().filter(|h| h.id < 3).collect();
     let deadline = deadline_secs(30);
     while survivors.iter().any(|h| h.node.config_version() < 8) {
-        assert!(Instant::now() < deadline, "config version 8 never converged among the original 3");
+        assert!(
+            Instant::now() < deadline,
+            "config version 8 never converged among the original 3"
+        );
         std::thread::yield_now();
     }
 
@@ -1322,7 +1548,11 @@ fn resize_3_to_5_to_3() {
         got.sort();
         let mut want: Vec<NodeId> = [0u32, 1, 2].into_iter().filter(|&id| id != h.id).collect();
         want.sort();
-        assert_eq!(got, want, "node {}: final voter set must be exactly the original 3", h.id);
+        assert_eq!(
+            got, want,
+            "node {}: final voter set must be exactly the original 3",
+            h.id
+        );
     }
 
     // T11 review (peer-band ghost-slot regression): the shrink 5 -> 3 above
@@ -1339,7 +1569,10 @@ fn resize_3_to_5_to_3() {
         if clean {
             break;
         }
-        assert!(Instant::now() < deadline, "final peer band never settled clean (ghost/duplicate slot)");
+        assert!(
+            Instant::now() < deadline,
+            "final peer band never settled clean (ghost/duplicate slot)"
+        );
         std::thread::yield_now();
     }
     for h in &survivors {
@@ -1351,10 +1584,21 @@ fn resize_3_to_5_to_3() {
     // Both removed nodes genuinely fail-stopped: over a settle window during
     // which the survivors keep committing, neither advances any further
     // (frozen, not merely lagging).
-    let (v60, v61) = (removed_60.node.config_version(), removed_61.node.config_version());
+    let (v60, v61) = (
+        removed_60.node.config_version(),
+        removed_61.node.config_version(),
+    );
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(removed_60.node.config_version(), v60, "node 60 must stay frozen (fail-stopped)");
-    assert_eq!(removed_61.node.config_version(), v61, "node 61 must stay frozen (fail-stopped)");
+    assert_eq!(
+        removed_60.node.config_version(),
+        v60,
+        "node 60 must stay frozen (fail-stopped)"
+    );
+    assert_eq!(
+        removed_61.node.config_version(),
+        v61,
+        "node 61 must stay frozen (fail-stopped)"
+    );
 
     for h in c.nodes {
         h.node.stop();
@@ -1414,7 +1658,10 @@ fn every_refusal_surfaces() {
     // ---- Malformed op (11): an op code the node doesn't know ----
     let resp = admin_request(&leader_cnc, 99, 5, 0, 0);
     assert_eq!(resp.status, 1);
-    assert_eq!(resp.reason, 11, "malformed-op reason expected, got {resp:?}");
+    assert_eq!(
+        resp.reason, 11,
+        "malformed-op reason expected, got {resp:?}"
+    );
 
     // ---- ChangePending (see doc comment above) ----
     let followers: Vec<usize> = (0..c.nodes.len()).filter(|&i| i != leader).collect();
@@ -1422,7 +1669,10 @@ fn every_refusal_surfaces() {
         partition(&c.nodes[leader], &c.nodes[f]);
     }
     let resp1 = admin_request(&leader_cnc, 1 /* AddLearner */, 300, 0, 0);
-    assert_eq!(resp1.status, 0, "op1's local append must be accepted even while isolated");
+    assert_eq!(
+        resp1.status, 0,
+        "op1's local append must be accepted even while isolated"
+    );
     let resp2 = admin_request(&leader_cnc, 1 /* AddLearner */, 301, 0, 0);
     assert_eq!(resp2.status, 1);
     assert_eq!(resp2.reason, 3, "ChangePending expected, got {resp2:?}");
@@ -1446,7 +1696,10 @@ fn every_refusal_surfaces() {
         submit_batch(&c2.nodes[leader2].node, 100);
         let deadline = deadline_secs(20);
         while c2.nodes[leader2].node.counters().commit.load_acquire() <= 4096 {
-            assert!(Instant::now() < deadline, "commit never exceeded the tiny admission slack");
+            assert!(
+                Instant::now() < deadline,
+                "commit never exceeded the tiny admission slack"
+            );
             std::thread::yield_now();
         }
         let never_addr: SocketAddr = "127.0.0.1:59500".parse().unwrap(); // never bound/started
@@ -1476,7 +1729,13 @@ fn every_refusal_surfaces() {
     assert_eq!(resp.reason, 4, "Tombstoned expected, got {resp:?}");
 
     // ---- TooManyMembers: add learners until the 8-member cap refuses ----
-    fn add_learner_until_capped(cnc: &CncPage, id: u32, ip: u32, port: u16, secs: u64) -> AdminResp {
+    fn add_learner_until_capped(
+        cnc: &CncPage,
+        id: u32,
+        ip: u32,
+        port: u16,
+        secs: u64,
+    ) -> AdminResp {
         let deadline = deadline_secs(secs);
         loop {
             let resp = admin_request(cnc, 1 /* AddLearner */, id, ip, port);
@@ -1487,7 +1746,10 @@ fn every_refusal_surfaces() {
                 2 => {}
                 _ => panic!("add-learner {id} refused unexpectedly: {resp:?}"),
             }
-            assert!(Instant::now() < deadline, "add-learner {id} never resolved (last {resp:?})");
+            assert!(
+                Instant::now() < deadline,
+                "add-learner {id} never resolved (last {resp:?})"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1502,16 +1764,33 @@ fn every_refusal_surfaces() {
             break;
         }
     }
-    assert!(hit_cap, "never observed TooManyMembers filling to the 8-member cap");
+    assert!(
+        hit_cap,
+        "never observed TooManyMembers filling to the 8-member cap"
+    );
 
     // ---- ZeroVoters: remove voters down to 1; the third refuses ----
     let leader_id = c.nodes[leader].id;
     let followers_ids: Vec<NodeId> = (0..3u32).filter(|&id| id != leader_id).collect();
     assert_eq!(followers_ids.len(), 2);
-    let resp = admin_request_ok(&leader_cnc, 5 /* RemoveVoter */, followers_ids[0], 0, 0, 20);
+    let resp = admin_request_ok(
+        &leader_cnc,
+        5, /* RemoveVoter */
+        followers_ids[0],
+        0,
+        0,
+        20,
+    );
     assert_eq!(resp.status, 0);
     await_config_settled(&leader_cnc, 20);
-    let resp = admin_request_ok(&leader_cnc, 5 /* RemoveVoter */, followers_ids[1], 0, 0, 20);
+    let resp = admin_request_ok(
+        &leader_cnc,
+        5, /* RemoveVoter */
+        followers_ids[1],
+        0,
+        0,
+        20,
+    );
     assert_eq!(resp.status, 0);
     await_config_settled(&leader_cnc, 20);
     let resp = admin_request(&leader_cnc, 5 /* RemoveVoter */, leader_id, 0, 0);
@@ -1552,7 +1831,10 @@ fn truncation_revert_e2e() {
     let phantom_addr: SocketAddr = "127.0.0.1:59900".parse().unwrap();
     let (ip, port) = addr_to_wire(phantom_addr);
     let resp = admin_request(&leader_cnc, 1 /* AddLearner */, phantom_id, ip, port);
-    assert_eq!(resp.status, 0, "isolated leader refused its own local append: {resp:?}");
+    assert_eq!(
+        resp.status, 0,
+        "isolated leader refused its own local append: {resp:?}"
+    );
     assert_eq!(resp.version, 1);
     assert_eq!(
         c.nodes[leader].node.config_version(),
@@ -1579,25 +1861,39 @@ fn truncation_revert_e2e() {
     }
     let deadline = deadline_secs(30);
     while c.nodes[leader].node.truncations() == 0 {
-        assert!(Instant::now() < deadline, "ex-leader never truncated its divergent config tail");
+        assert!(
+            Instant::now() < deadline,
+            "ex-leader never truncated its divergent config tail"
+        );
         std::thread::yield_now();
     }
     let deadline = deadline_secs(20);
     while c.nodes[leader].node.config_version() != 0 {
-        assert!(Instant::now() < deadline, "ex-leader's config never reverted to genesis (v0)");
+        assert!(
+            Instant::now() < deadline,
+            "ex-leader's config never reverted to genesis (v0)"
+        );
         std::thread::yield_now();
     }
     // Deterministic settle window: with no competing majority config change
     // to converge to yet, the reverted version must STAY at 0.
     let settle = Instant::now() + Duration::from_millis(500);
     while Instant::now() < settle {
-        assert_eq!(c.nodes[leader].node.config_version(), 0, "reverted config regressed off v0");
+        assert_eq!(
+            c.nodes[leader].node.config_version(),
+            0,
+            "reverted config regressed off v0"
+        );
         std::thread::yield_now();
     }
     // Journal-record consistency: the reverted record is no longer pending
     // — it is backed by committed (and thus durable) bytes, not a dangling
     // local-only append.
-    assert_eq!(leader_cnc.config_pending(), 0, "reverted config must not read back as pending");
+    assert_eq!(
+        leader_cnc.config_pending(),
+        0,
+        "reverted config must not read back as pending"
+    );
 
     // Full data-plane reconvergence to a single, stable frontier (the new
     // leader is idle — no submissions since heal).
@@ -1617,7 +1913,11 @@ fn truncation_revert_e2e() {
     for h in &c.nodes {
         let deadline = deadline_secs(30);
         while h.node.counters().durable.load_acquire() < final_target {
-            assert!(Instant::now() < deadline, "node {} never reconverged durable", h.id);
+            assert!(
+                Instant::now() < deadline,
+                "node {} never reconverged durable",
+                h.id
+            );
             std::thread::yield_now();
         }
     }
@@ -1628,14 +1928,29 @@ fn truncation_revert_e2e() {
     let real_id: NodeId = 901;
     let real_addr: SocketAddr = "127.0.0.1:59901".parse().unwrap();
     let (ip2, port2) = addr_to_wire(real_addr);
-    let resp = admin_request_ok(&new_leader_cnc, 1 /* AddLearner */, real_id, ip2, port2, 20);
-    assert_eq!(resp.version, 1, "the fresh post-revert config is v1 — the phantom v1 never counted");
+    let resp = admin_request_ok(
+        &new_leader_cnc,
+        1, /* AddLearner */
+        real_id,
+        ip2,
+        port2,
+        20,
+    );
+    assert_eq!(
+        resp.version, 1,
+        "the fresh post-revert config is v1 — the phantom v1 never counted"
+    );
     await_config_converged(&c.nodes, 1, real_id, CNC_PEER_ROLE_LEARNER, 20);
 
     // Final: every node agrees on the SAME version; the phantom id never
     // surfaces anywhere.
     for h in &c.nodes {
-        assert_eq!(h.node.config_version(), 1, "node {} did not converge to the final version", h.id);
+        assert_eq!(
+            h.node.config_version(),
+            1,
+            "node {} did not converge to the final version",
+            h.id
+        );
         let cnc = open_cnc(&h.instance_dir);
         for i in 0..CNC_MAX_PEER_SLOTS {
             let raw = cnc.peer_slot(i).id_and_role.load_acquire();
@@ -1643,7 +1958,11 @@ fn truncation_revert_e2e() {
                 continue;
             }
             let id = (raw >> 8) as u32;
-            assert_ne!(id, phantom_id, "node {}: the truncated phantom learner must never surface", h.id);
+            assert_ne!(
+                id, phantom_id,
+                "node {}: the truncated phantom learner must never surface",
+                h.id
+            );
         }
     }
 
@@ -1665,7 +1984,9 @@ fn crash_mid_pending_recovers() {
     let members = c.members.clone();
     let leader = await_single_leader(&c.nodes, 20);
     let leader_id = c.nodes[leader].id;
-    let follower = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
+    let follower = (0..c.nodes.len())
+        .find(|&i| i != leader)
+        .expect("a follower exists");
     let follower_id = c.nodes[follower].id;
     let follower_addr = c.nodes[follower].addr;
     let follower_dir = c.nodes[follower].instance_dir.clone();
@@ -1688,20 +2009,36 @@ fn crash_mid_pending_recovers() {
 
     // Restart the crashed follower from the SAME dirs on the SAME port.
     let sock = rebind(follower_addr);
-    let cfg =
-        make_config(follower_id, members, follower_addr, follower_dir.clone(), seed_for(follower_id as usize));
+    let cfg = make_config(
+        follower_id,
+        members,
+        follower_addr,
+        follower_dir.clone(),
+        seed_for(follower_id as usize),
+    );
     let node = Node::start_with_socket(cfg, sock).expect("restart follower");
-    c.nodes.push(NodeH { id: follower_id, addr: follower_addr, instance_dir: follower_dir, node });
+    c.nodes.push(NodeH {
+        id: follower_id,
+        addr: follower_addr,
+        instance_dir: follower_dir,
+        node,
+    });
 
     // It re-adopts the config it missed from the journal/replicated stream,
     // rejoining as an ordinary follower — no spurious election / leader claim.
     let restarted_idx = c.nodes.iter().position(|h| h.id == follower_id).unwrap();
     let deadline = deadline_secs(30);
     while c.nodes[restarted_idx].node.config_version() < 1 {
-        assert!(Instant::now() < deadline, "restarted follower never re-adopted the missed config");
+        assert!(
+            Instant::now() < deadline,
+            "restarted follower never re-adopted the missed config"
+        );
         std::thread::yield_now();
     }
-    assert!(!c.nodes[restarted_idx].node.is_leader(), "restarted follower unexpectedly became leader");
+    assert!(
+        !c.nodes[restarted_idx].node.is_leader(),
+        "restarted follower unexpectedly became leader"
+    );
 
     await_config_converged(&c.nodes, 1, new_id, CNC_PEER_ROLE_LEARNER, 20);
 
@@ -1754,9 +2091,20 @@ fn restart_of_removed_node_once() -> bool {
     // file's other add/promote/demote/remove sequences.
     let before = commit_high_water(&c.nodes);
     submit_batch(&c.nodes[leader].node, 100);
-    await_commit_advanced(&c.nodes, before, "commit must advance after adding learner 100");
+    await_commit_advanced(
+        &c.nodes,
+        before,
+        "commit must advance after adding learner 100",
+    );
 
-    let resp = admin_request_ok(&leader_cnc, 4 /* RemoveLearner */, removed_id, 0, 0, 20);
+    let resp = admin_request_ok(
+        &leader_cnc,
+        4, /* RemoveLearner */
+        removed_id,
+        0,
+        0,
+        20,
+    );
     assert_eq!(resp.version, 2);
 
     // Wait for the REMOVED node itself to adopt its own removal
@@ -1808,8 +2156,14 @@ fn restart_of_removed_node_once() -> bool {
         Err(e) => e,
     };
     let msg = err.to_string();
-    assert!(msg.contains("tombstoned"), "error must name the cause: {msg}");
-    assert!(msg.contains("fresh id"), "error must name the recourse: {msg}");
+    assert!(
+        msg.contains("tombstoned"),
+        "error must name the cause: {msg}"
+    );
+    assert!(
+        msg.contains("fresh id"),
+        "error must name the recourse: {msg}"
+    );
 
     for h in c.nodes {
         h.node.stop();

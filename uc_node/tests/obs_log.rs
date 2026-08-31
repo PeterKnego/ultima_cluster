@@ -137,8 +137,9 @@ fn spawn_cluster(n: usize) -> Cluster {
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir");
 
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
     let members: Vec<(NodeId, SocketAddr)> = socks
         .iter()
         .enumerate()
@@ -152,7 +153,10 @@ fn spawn_cluster(n: usize) -> Cluster {
         let seed = seed_for(i);
         let cfg = make_config_ring(i as NodeId, members.clone(), instance_dir, seed, addr);
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { addr, node: Some(node) });
+        nodes.push(NodeH {
+            addr,
+            node: Some(node),
+        });
     }
     Cluster { _dir: dir, nodes }
 }
@@ -183,12 +187,19 @@ fn await_until(secs: u64, msg: &str, mut f: impl FnMut() -> bool) {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].node.is_some() && nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node.is_some() && nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
             let i = serving[0];
-            assert!(nodes[i].is_leader(), "serving node {i} is not flagged leader");
+            assert!(
+                nodes[i].is_leader(),
+                "serving node {i} is not flagged leader"
+            );
             return i;
         }
         assert!(Instant::now() < deadline, "no single leader elected");
@@ -199,8 +210,15 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
 fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = idxs.iter().copied().filter(|&i| nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain among {idxs:?}: {serving:?} serve");
+        let serving: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain among {idxs:?}: {serving:?} serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -232,7 +250,9 @@ fn drive_minority_partition(c: &mut Cluster, phantom: u64, fresh: u64) -> (usize
     submit_n(&c.nodes[old], 1000);
     await_until(60, "pre-partition commit", || c.nodes[old].commit() >= pre);
     for i in (0..c.nodes.len()).filter(|&i| i != old) {
-        await_until(60, "pre-partition commit (follower)", || c.nodes[i].commit() >= pre);
+        await_until(60, "pre-partition commit (follower)", || {
+            c.nodes[i].commit() >= pre
+        });
     }
 
     let followers: Vec<usize> = (0..c.nodes.len()).filter(|&i| i != old).collect();
@@ -264,7 +284,10 @@ fn drive_minority_partition(c: &mut Cluster, phantom: u64, fresh: u64) -> (usize
 /// half-written record. Hand-rolled brace/quote sanity — no serde_json dep.
 fn assert_json_lines(text: &str) {
     for line in text.lines() {
-        assert!(line.starts_with('{') && line.ends_with('}'), "not a JSON object line: {line}");
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "not a JSON object line: {line}"
+        );
         // Every `"` must be part of a balanced, non-escaped pair count.
         let mut in_str = false;
         let mut escaped = false;
@@ -332,7 +355,9 @@ fn an_election_emits_became_leader_and_followers_note_it() {
     let buf = uc_node::obs::log::capture_for_tests();
     let mut cluster = spawn_cluster(3);
     let leader = await_single_leader(&cluster.nodes, 10);
-    await_until(10, "leader never reported can_serve", || cluster.nodes[leader].can_serve());
+    await_until(10, "leader never reported can_serve", || {
+        cluster.nodes[leader].can_serve()
+    });
 
     let text = await_capture(
         &buf,
@@ -361,7 +386,11 @@ fn a_healed_deposed_leader_emits_log_truncated() {
     let mut cluster = spawn_cluster(3);
 
     let (old, _new) = drive_minority_partition(&mut cluster, 64, 200);
-    assert_eq!(cluster.nodes[old].truncations(), 0, "premature truncation before heal");
+    assert_eq!(
+        cluster.nodes[old].truncations(),
+        0,
+        "premature truncation before heal"
+    );
 
     for node in &cluster.nodes {
         node.heal();
@@ -370,9 +399,12 @@ fn a_healed_deposed_leader_emits_log_truncated() {
         cluster.nodes[old].truncations() >= 1
     });
 
-    let text = await_capture(&buf, 5, "log_truncated record never landed in the capture buffer", |t| {
-        t.lines().any(|l| l.contains(r#""event":"log_truncated""#))
-    });
+    let text = await_capture(
+        &buf,
+        5,
+        "log_truncated record never landed in the capture buffer",
+        |t| t.lines().any(|l| l.contains(r#""event":"log_truncated""#)),
+    );
     assert_json_lines(&text);
 
     cluster.stop_all();

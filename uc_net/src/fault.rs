@@ -18,7 +18,11 @@ pub(crate) struct XorShift64(u64);
 
 impl XorShift64 {
     pub(crate) fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
     pub(crate) fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -327,15 +331,21 @@ mod tests {
         let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 99,
+            drop_per_million: 500_000,
+            ..Default::default()
+        });
         for i in 0..100u8 {
             tx.send_to(&[i], to).unwrap();
         }
         // loopback is lossless: received = exactly the non-dropped set.
         // Re-derive it from the same seed.
         let mut rng = XorShift64::new(99);
-        let expected: Vec<Vec<u8>> =
-            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
+        let expected: Vec<Vec<u8>> = (0..100u8)
+            .filter(|_| !rng.chance(500_000))
+            .map(|i| vec![i])
+            .collect();
         assert!(!expected.is_empty() && expected.len() < 100);
         let got = recv_all(&rx, expected.len());
         assert_eq!(got, expected);
@@ -346,15 +356,26 @@ mod tests {
         let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        tx.set_faults(FaultConfig { seed: 1, dup_per_million: 1_000_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 1,
+            dup_per_million: 1_000_000,
+            ..Default::default()
+        });
         tx.send_to(b"a", to).unwrap();
         assert_eq!(recv_all(&rx, 2), vec![b"a".to_vec(), b"a".to_vec()]);
 
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        tx.set_faults(FaultConfig { seed: 1, reorder_per_million: 1_000_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 1,
+            reorder_per_million: 1_000_000,
+            ..Default::default()
+        });
         tx.send_to(b"first", to).unwrap(); // held back
         tx.send_to(b"second", to).unwrap(); // goes out, then flushes "first"
-        assert_eq!(recv_all(&rx, 2), vec![b"second".to_vec(), b"first".to_vec()]);
+        assert_eq!(
+            recv_all(&rx, 2),
+            vec![b"second".to_vec(), b"first".to_vec()]
+        );
     }
 
     #[test]
@@ -376,7 +397,10 @@ mod tests {
         // nothing arrives within a short settle
         let mut buf = [0u8; 16];
         std::thread::sleep(Duration::from_millis(50));
-        assert!(rx.recv_from(&mut buf).unwrap().is_none(), "partitioned peer still received");
+        assert!(
+            rx.recv_from(&mut buf).unwrap().is_none(),
+            "partitioned peer still received"
+        );
 
         // unblock: delivery resumes
         part.unblock(to);
@@ -398,16 +422,25 @@ mod tests {
         let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 99,
+            drop_per_million: 500_000,
+            ..Default::default()
+        });
         let _part = tx.partition_handle(); // exists but empty — must be inert
         for i in 0..100u8 {
             tx.send_to(&[i], to).unwrap();
         }
         let mut rng = XorShift64::new(99);
-        let expected: Vec<Vec<u8>> =
-            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
+        let expected: Vec<Vec<u8>> = (0..100u8)
+            .filter(|_| !rng.chance(500_000))
+            .map(|i| vec![i])
+            .collect();
         let got = recv_all(&rx, expected.len());
-        assert_eq!(got, expected, "empty partition set perturbed the seeded drop sequence");
+        assert_eq!(
+            got, expected,
+            "empty partition set perturbed the seeded drop sequence"
+        );
     }
 
     // ================================================================
@@ -420,16 +453,30 @@ mod tests {
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
         // Certainty (1_000_000/million): every send is corrupted.
-        tx.set_faults(FaultConfig { seed: 3, corrupt_per_million: 1_000_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 3,
+            corrupt_per_million: 1_000_000,
+            ..Default::default()
+        });
         let original = vec![0xAAu8; 32];
         tx.send_to(&original, to).unwrap();
         let got = recv_all(&rx, 1);
         assert_eq!(got.len(), 1);
         let corrupted = &got[0];
-        assert_eq!(corrupted.len(), original.len(), "corruption must not change the length");
-        let diff_bits: u32 =
-            corrupted.iter().zip(&original).map(|(a, b)| (a ^ b).count_ones()).sum();
-        assert_eq!(diff_bits, 1, "corruption must flip EXACTLY one bit, got {diff_bits}");
+        assert_eq!(
+            corrupted.len(),
+            original.len(),
+            "corruption must not change the length"
+        );
+        let diff_bits: u32 = corrupted
+            .iter()
+            .zip(&original)
+            .map(|(a, b)| (a ^ b).count_ones())
+            .sum();
+        assert_eq!(
+            diff_bits, 1,
+            "corruption must flip EXACTLY one bit, got {diff_bits}"
+        );
     }
 
     #[test]
@@ -438,7 +485,11 @@ mod tests {
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
         // Certainty: every send after the first also re-delivers a past one.
-        tx.set_faults(FaultConfig { seed: 5, replay_per_million: 1_000_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 5,
+            replay_per_million: 1_000_000,
+            ..Default::default()
+        });
         tx.send_to(b"one", to).unwrap();
         tx.send_to(b"two", to).unwrap();
         // "one" once (its own send), "two" once (its own send) plus at least
@@ -463,15 +514,27 @@ mod tests {
         let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
+        tx.set_faults(FaultConfig {
+            seed: 99,
+            drop_per_million: 500_000,
+            ..Default::default()
+        });
         for i in 0..100u8 {
             tx.send_to(&[i], to).unwrap();
         }
         let mut rng = XorShift64::new(99);
-        let expected: Vec<Vec<u8>> =
-            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
+        let expected: Vec<Vec<u8>> = (0..100u8)
+            .filter(|_| !rng.chance(500_000))
+            .map(|i| vec![i])
+            .collect();
         let got = recv_all(&rx, expected.len());
-        assert_eq!(got, expected, "corrupt/replay at 0 must be byte-for-byte inert");
-        assert!(tx.history.is_empty(), "replay_per_million=0 must never record history");
+        assert_eq!(
+            got, expected,
+            "corrupt/replay at 0 must be byte-for-byte inert"
+        );
+        assert!(
+            tx.history.is_empty(),
+            "replay_per_million=0 must never record history"
+        );
     }
 }

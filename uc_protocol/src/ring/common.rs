@@ -351,7 +351,9 @@ pub enum RingError {
     /// The hole's length is unknowable, so the ring refuses to guess: the
     /// caller fail-stops. Strictly better than the pre-M13a behaviour, where
     /// the same death wedged every producer and the consumer silently.
-    #[error("ingress ring wedged at position {position}: an unsized claim hole outlived the hole timeout")]
+    #[error(
+        "ingress ring wedged at position {position}: an unsized claim hole outlived the hole timeout"
+    )]
     Wedged { position: u64 },
     /// Task 4's controller ruling on spec §4.2's residual, tightened by fix
     /// round 1's finding 2: a producer that merely STALLED past
@@ -489,7 +491,12 @@ pub fn create_shared_backing_file(
     let zero_len = cur.max(len);
     // SAFETY: plain fallocate syscall on our own fd; no memory contract.
     let rc = unsafe {
-        libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, 0, zero_len as libc::off_t)
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_ZERO_RANGE,
+            0,
+            zero_len as libc::off_t,
+        )
     };
     if rc != 0 {
         // Two different reasons to land here, and both want the same answer.
@@ -594,7 +601,10 @@ pub fn validate_ring_header(buf: &[u8]) -> Result<&RingHeader, RingError> {
 }
 
 /// As [`validate_ring_header`], with the expected magic chosen by the caller.
-pub fn validate_ring_header_with_magic(buf: &[u8], magic: [u8; 8]) -> Result<&RingHeader, RingError> {
+pub fn validate_ring_header_with_magic(
+    buf: &[u8],
+    magic: [u8; 8],
+) -> Result<&RingHeader, RingError> {
     if buf.len() < RING_HEADER_LEN {
         return Err(RingError::Corrupt(format!(
             "buffer too small: {} < {RING_HEADER_LEN}",
@@ -671,7 +681,14 @@ pub unsafe fn write_record_at(
     total_record_size: usize,
 ) {
     unsafe {
-        write_record_body_at(slot_region, slot_offset, msg_type, flags, header_extra, payload);
+        write_record_body_at(
+            slot_region,
+            slot_offset,
+            msg_type,
+            flags,
+            header_extra,
+            payload,
+        );
         // Write length last (legacy "length != 0 means committed" guard). No
         // Release fence is needed here: the caller advances `publish_position`
         // with a Release store after this function returns, which orders ALL of
@@ -1005,7 +1022,10 @@ fn decode_record_slice_inner(
     allow_padding: bool,
 ) -> Result<(RecordHeader, usize), RingError> {
     if slot.len() < 6 {
-        return Err(RingError::Corrupt(format!("record slice too short: {}", slot.len())));
+        return Err(RingError::Corrupt(format!(
+            "record slice too short: {}",
+            slot.len()
+        )));
     }
     let msg_type = u16::from_le_bytes([slot[4], slot[5]]);
     if allow_padding && msg_type == PADDING_MSG_TYPE {
@@ -1022,19 +1042,28 @@ fn decode_record_slice_inner(
             )));
         }
         return Ok((
-            RecordHeader { msg_type, flags: 0, header_extra: [0; 8] },
+            RecordHeader {
+                msg_type,
+                flags: 0,
+                header_extra: [0; 8],
+            },
             slot.len(),
         ));
     }
     if slot.len() < FRAME_HEADER_LEN + FRAME_TRAILER_LEN {
-        return Err(RingError::Corrupt(format!("record length {} too small", slot.len())));
+        return Err(RingError::Corrupt(format!(
+            "record length {} too small",
+            slot.len()
+        )));
     }
     let flags = u16::from_le_bytes([slot[6], slot[7]]);
     let mut header_extra = [0u8; 8];
     header_extra.copy_from_slice(&slot[8..FRAME_HEADER_LEN]);
     let payload_end = slot.len() - FRAME_TRAILER_LEN;
     let crc_actual = u32::from_le_bytes(
-        slot[payload_end..].try_into().expect("FRAME_TRAILER_LEN bytes remain"),
+        slot[payload_end..]
+            .try_into()
+            .expect("FRAME_TRAILER_LEN bytes remain"),
     );
     if crc32fast::hash(&slot[4..payload_end]) != crc_actual {
         return Err(RingError::BadCrc);
@@ -1042,7 +1071,11 @@ fn decode_record_slice_inner(
     payload_buf.clear();
     payload_buf.extend_from_slice(&slot[FRAME_HEADER_LEN..payload_end]);
     Ok((
-        RecordHeader { msg_type, flags, header_extra },
+        RecordHeader {
+            msg_type,
+            flags,
+            header_extra,
+        },
         align_record_size(slot.len()),
     ))
 }
@@ -1111,19 +1144,26 @@ mod tests {
     fn commit_word_round_trips_every_field() {
         // Max legal values in each field, so a shift/mask error cannot hide.
         let w = encode_commit_word(COMMIT_LAP_MASK, COMMIT_LEN_MASK, false);
-        assert_eq!(classify_commit_word(w, COMMIT_LAP_MASK), SlotState::Committed {
-            length: COMMIT_LEN_MASK
-        });
+        assert_eq!(
+            classify_commit_word(w, COMMIT_LAP_MASK),
+            SlotState::Committed {
+                length: COMMIT_LEN_MASK
+            }
+        );
         let c = encode_commit_word(COMMIT_LAP_MASK, COMMIT_LEN_MASK, true);
-        assert_eq!(classify_commit_word(c, COMMIT_LAP_MASK), SlotState::Claimed {
-            advance: COMMIT_LEN_MASK
-        });
+        assert_eq!(
+            classify_commit_word(c, COMMIT_LAP_MASK),
+            SlotState::Claimed {
+                advance: COMMIT_LEN_MASK
+            }
+        );
         // The claimed bit is bit 31 and nothing else.
         assert_eq!(c ^ w, COMMIT_CLAIMED);
         // A 64 KiB record — the real `max_msg_size` — fits the length field.
-        assert_eq!(classify_commit_word(encode_commit_word(3, 65536, false), 3), SlotState::Committed {
-            length: 65536
-        });
+        assert_eq!(
+            classify_commit_word(encode_commit_word(3, 65536, false), 3),
+            SlotState::Committed { length: 65536 }
+        );
     }
 
     #[test]
@@ -1139,7 +1179,10 @@ mod tests {
         // Lap matches but length is zero and nothing is claimed: impossible
         // from any producer, so the total classifier reads it as Empty
         // (the consumer then waits, and §4.2's wedge timer adjudicates).
-        assert_eq!(classify_commit_word(encode_commit_word(5, 0, false), 5), SlotState::Empty);
+        assert_eq!(
+            classify_commit_word(encode_commit_word(5, 0, false), 5),
+            SlotState::Empty
+        );
     }
 
     #[test]
@@ -1174,13 +1217,19 @@ mod tests {
         let mut buf = Vec::new();
         // Too short for even a msg_type.
         for n in 0..6usize {
-            assert!(decode_record_slice(&vec![0xABu8; n], &mut buf).is_err(), "len {n}");
+            assert!(
+                decode_record_slice(&vec![0xABu8; n], &mut buf).is_err(),
+                "len {n}"
+            );
         }
         // Long enough for a padding marker but not a record: a non-padding
         // msg_type in a 6..20-byte slice is Corrupt, never a panic.
         let mut short = vec![0u8; 8];
         short[4..6].copy_from_slice(&9u16.to_le_bytes());
-        assert!(matches!(decode_record_slice(&short, &mut buf), Err(RingError::Corrupt(_))));
+        assert!(matches!(
+            decode_record_slice(&short, &mut buf),
+            Err(RingError::Corrupt(_))
+        ));
         // A corrupt crc is BadCrc, not a panic.
         let payload = b"x";
         let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
@@ -1188,7 +1237,10 @@ mod tests {
         // SAFETY: `slot` is exactly `total` bytes, exclusively owned here.
         unsafe { write_record_body_at(slot.as_mut_ptr(), 0, 1, 0, [0; 8], payload) };
         slot[total - 1] ^= 0xFF;
-        assert!(matches!(decode_record_slice(&slot, &mut buf), Err(RingError::BadCrc)));
+        assert!(matches!(
+            decode_record_slice(&slot, &mut buf),
+            Err(RingError::BadCrc)
+        ));
     }
 
     #[test]
@@ -1212,8 +1264,6 @@ mod tests {
             validate_ring_header_with_magic(&mmap[..], crate::magic::RING_MAGIC),
             Err(RingError::MagicMismatch)
         ));
-        assert!(
-            validate_ring_header_with_magic(&mmap[..], crate::magic::RING_MPSC_MAGIC).is_ok()
-        );
+        assert!(validate_ring_header_with_magic(&mmap[..], crate::magic::RING_MPSC_MAGIC).is_ok());
     }
 }

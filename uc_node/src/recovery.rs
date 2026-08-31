@@ -139,7 +139,10 @@ fn addr_from_pair(ip: u32, port: u16) -> SocketAddr {
 }
 
 fn members_from_stored(members: &[StoredMember]) -> Vec<(u32, SocketAddr)> {
-    members.iter().map(|m| (m.id, addr_from_pair(m.ip, m.port))).collect()
+    members
+        .iter()
+        .map(|m| (m.id, addr_from_pair(m.ip, m.port)))
+        .collect()
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
@@ -210,8 +213,10 @@ fn recover_locked(instance_dir: &Path) -> io::Result<(InstanceDir, NodeState, Co
     // torn active-segment tail still heals (a physical shrink-only
     // truncate, same as `verify_artifact`) — all this tool needs; it never
     // appends.
-    let archive_cfg =
-        ArchiveConfig { preallocate_segments: false, ..ArchiveConfig::new(instance.journal_dir()) };
+    let archive_cfg = ArchiveConfig {
+        preallocate_segments: false,
+        ..ArchiveConfig::new(instance.journal_dir())
+    };
     let archive = Archive::open(archive_cfg).map_err(to_io)?;
     let durable = archive.recovered_position();
     let state = NodeState::open(&instance.state_dir()).map_err(to_io)?;
@@ -297,7 +302,9 @@ impl PlannedForce {
     /// Write the forced record — the ONLY step that mutates anything. Still
     /// under the same flock `plan_force_single_member` acquired.
     pub fn commit(self) -> io::Result<ForceReport> {
-        self.state.store_config_record(&self.new_rec).map_err(to_io)?;
+        self.state
+            .store_config_record(&self.new_rec)
+            .map_err(to_io)?;
         Ok(ForceReport {
             old_version: self.old_version,
             new_version: self.new_version,
@@ -413,7 +420,11 @@ mod tests {
 
     fn stored_member(id: u32, a: SocketAddr) -> StoredMember {
         match a.ip() {
-            std::net::IpAddr::V4(v4) => StoredMember { id, ip: u32::from(v4), port: a.port() },
+            std::net::IpAddr::V4(v4) => StoredMember {
+                id,
+                ip: u32::from(v4),
+                port: a.port(),
+            },
             std::net::IpAddr::V6(_) => panic!("ipv4 only"),
         }
     }
@@ -422,12 +433,23 @@ mod tests {
         std::fs::create_dir_all(dir.join("state")).unwrap();
         let cfg = StoredConfig {
             version,
-            voters: voters.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            voters: voters
+                .iter()
+                .map(|(id, a)| stored_member(*id, *a))
+                .collect(),
             learners: Vec::new(),
             tombstones,
         };
-        let rec = ConfigRecord { position: 0, config: cfg.clone(), prev_position: 0, prev: cfg };
-        NodeState::open(&dir.join("state")).unwrap().store_config_record(&rec).unwrap();
+        let rec = ConfigRecord {
+            position: 0,
+            config: cfg.clone(),
+            prev_position: 0,
+            prev: cfg,
+        };
+        NodeState::open(&dir.join("state"))
+            .unwrap()
+            .store_config_record(&rec)
+            .unwrap();
     }
 
     #[test]
@@ -467,14 +489,22 @@ mod tests {
 
         let err = recovered_config(&dir).expect_err("a fresh dir has no config record yet");
         assert!(
-            err.to_string().to_lowercase().contains("no durable config record"),
+            err.to_string()
+                .to_lowercase()
+                .contains("no durable config record"),
             "unexpected message: {err}"
         );
 
         let after = std::fs::read(dir.join("state").join("config.state")).unwrap();
-        assert_eq!(before, after, "recovered_config must not write anything when it refuses");
+        assert_eq!(
+            before, after,
+            "recovered_config must not write anything when it refuses"
+        );
         assert!(
-            NodeState::open(&dir.join("state")).unwrap().config_record().is_none(),
+            NodeState::open(&dir.join("state"))
+                .unwrap()
+                .config_record()
+                .is_none(),
             "no record must have been persisted"
         );
     }
@@ -491,13 +521,23 @@ mod tests {
 
         let err = force_single_member(&dir, 5).expect_err("a fresh dir has no config record yet");
         assert!(
-            err.to_string().to_lowercase().contains("no durable config record"),
+            err.to_string()
+                .to_lowercase()
+                .contains("no durable config record"),
             "unexpected message: {err}"
         );
 
         let after = std::fs::read(dir.join("state").join("config.state")).unwrap();
-        assert_eq!(before, after, "force_single_member must not write anything when it refuses");
-        assert!(NodeState::open(&dir.join("state")).unwrap().config_record().is_none());
+        assert_eq!(
+            before, after,
+            "force_single_member must not write anything when it refuses"
+        );
+        assert!(
+            NodeState::open(&dir.join("state"))
+                .unwrap()
+                .config_record()
+                .is_none()
+        );
     }
 
     /// Fix round 1, Critical 1 regression: the doubly-ahead compounding-crash
@@ -518,17 +558,34 @@ mod tests {
             learners: Vec::new(),
             tombstones: Vec::new(),
         };
-        let prev_cfg = StoredConfig { version: 4, ..cfg.clone() };
-        let rec = ConfigRecord { position: 200, config: cfg, prev_position: 100, prev: prev_cfg };
-        NodeState::open(&dir.join("state")).unwrap().store_config_record(&rec).unwrap();
+        let prev_cfg = StoredConfig {
+            version: 4,
+            ..cfg.clone()
+        };
+        let rec = ConfigRecord {
+            position: 200,
+            config: cfg,
+            prev_position: 100,
+            prev: prev_cfg,
+        };
+        NodeState::open(&dir.join("state"))
+            .unwrap()
+            .store_config_record(&rec)
+            .unwrap();
         let before = std::fs::read(dir.join("state").join("config.state")).unwrap();
 
         let err = force_single_member(&dir, 1)
             .expect_err("must refuse the doubly-ahead crash window, not fall back to a seed");
-        assert!(err.to_string().to_lowercase().contains("doubly-ahead"), "unexpected message: {err}");
+        assert!(
+            err.to_string().to_lowercase().contains("doubly-ahead"),
+            "unexpected message: {err}"
+        );
 
         let after = std::fs::read(dir.join("state").join("config.state")).unwrap();
-        assert_eq!(before, after, "force_single_member must not write anything when it refuses");
+        assert_eq!(
+            before, after,
+            "force_single_member must not write anything when it refuses"
+        );
     }
 
     /// Fix round 1, Important 3: the CLI's data-loss statement must be
@@ -552,8 +609,9 @@ mod tests {
     #[test]
     fn plan_then_commit_matches_the_one_shot_force() {
         let dir = scratch_dir("plan-then-commit");
-        let addrs: Vec<SocketAddr> =
-            (0..3).map(|_| "127.0.0.1:0".parse().unwrap()).collect::<Vec<_>>();
+        let addrs: Vec<SocketAddr> = (0..3)
+            .map(|_| "127.0.0.1:0".parse().unwrap())
+            .collect::<Vec<_>>();
         let voters: Vec<(u32, SocketAddr)> = (0..3u32).map(|i| (i, addrs[i as usize])).collect();
         seed_config(&dir, 7, &voters, Vec::new());
 

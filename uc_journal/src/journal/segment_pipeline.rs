@@ -55,7 +55,11 @@ struct PreallocErr {
 
 impl PreallocErr {
     fn capture(e: &std::io::Error) -> Self {
-        Self { kind: e.kind(), raw_os: e.raw_os_error(), display: e.to_string() }
+        Self {
+            kind: e.kind(),
+            raw_os: e.raw_os_error(),
+            display: e.to_string(),
+        }
     }
 
     /// Rebuild. An OS errno round-trips exactly (`from_raw_os_error` restores
@@ -219,10 +223,7 @@ fn preallocator_loop(shared: Arc<Shared>) {
         }
         // Slot full (or failed): wait until it's consumed or we're told to stop.
         let mut slot = shared.slot.lock().unwrap();
-        while slot.ready.is_some()
-            && !shared.shutdown.load(Ordering::Acquire)
-            && !slot.failed
-        {
+        while slot.ready.is_some() && !shared.shutdown.load(Ordering::Acquire) && !slot.failed {
             slot = shared.cv.wait(slot).unwrap();
         }
     }
@@ -235,7 +236,13 @@ mod tests {
     #[test]
     fn pipeline_hands_off_then_prepares_next() {
         let dir = tempfile::tempdir().unwrap();
-        let pipe = SegmentPipeline::spawn(dir.path().to_path_buf(), 256 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
+        let pipe = SegmentPipeline::spawn(
+            dir.path().to_path_buf(),
+            256 * 1024,
+            crate::PreallocFill::ZeroWriteFull,
+            0,
+        )
+        .unwrap();
 
         let first = pipe.take_ready().unwrap();
         assert!(first.exists(), "first temp ready after spawn");
@@ -253,7 +260,13 @@ mod tests {
     #[test]
     fn shutdown_removes_unconsumed_temp() {
         let dir = tempfile::tempdir().unwrap();
-        let pipe = SegmentPipeline::spawn(dir.path().to_path_buf(), 256 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
+        let pipe = SegmentPipeline::spawn(
+            dir.path().to_path_buf(),
+            256 * 1024,
+            crate::PreallocFill::ZeroWriteFull,
+            0,
+        )
+        .unwrap();
         pipe.shutdown();
         // After shutdown no ready temp should linger on disk.
         let leftover: Vec<_> = std::fs::read_dir(dir.path())

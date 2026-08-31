@@ -101,7 +101,10 @@ use uc_service::{
 // ------------------------------------------------------------------ CLI
 
 #[derive(Parser)]
-#[command(name = "m7_gate", about = "UC v2 M7 gate: live reconfig under load (spec §9)")]
+#[command(
+    name = "m7_gate",
+    about = "UC v2 M7 gate: live reconfig under load (spec §9)"
+)]
 struct Cli {
     #[command(subcommand)]
     role: Role,
@@ -316,7 +319,10 @@ impl SnapshotStateMachine for RegSm {
         let mut buf = Vec::new();
         src.read_to_end(&mut buf)?;
         if buf.len() < 16 {
-            return Err(SnapshotError::Codec(format!("short snapshot: {} bytes", buf.len())));
+            return Err(SnapshotError::Codec(format!(
+                "short snapshot: {} bytes",
+                buf.len()
+            )));
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -357,11 +363,13 @@ fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
     }
     s.split(',')
         .map(|part| {
-            let (id, addr) =
-                part.split_once('@').unwrap_or_else(|| panic!("bad member {part:?}, want id@addr"));
+            let (id, addr) = part
+                .split_once('@')
+                .unwrap_or_else(|| panic!("bad member {part:?}, want id@addr"));
             (
                 id.parse().unwrap_or_else(|e| panic!("bad id {id:?}: {e}")),
-                addr.parse().unwrap_or_else(|e| panic!("bad addr {addr:?}: {e}")),
+                addr.parse()
+                    .unwrap_or_else(|e| panic!("bad addr {addr:?}: {e}")),
             )
         })
         .collect()
@@ -404,10 +412,13 @@ fn make_config(
 fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> Service<RegSm> {
     if snapshot_interval_bytes == 0 {
         let cfg = ServiceConfig::new(dir, APP);
-        ServiceBuilder::new(cfg, RegSm::default()).start().expect("service start")
+        ServiceBuilder::new(cfg, RegSm::default())
+            .start()
+            .expect("service start")
     } else {
-        let cfg = ServiceConfig::new(dir, APP)
-            .snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
+        let cfg = ServiceConfig::new(dir, APP).snapshot_policy(SnapshotPolicy {
+            interval_bytes: snapshot_interval_bytes,
+        });
         ServiceBuilder::new(cfg, RegSm::default())
             .start_with_snapshots()
             .expect("snapshot service start")
@@ -633,13 +644,23 @@ fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16) -> AdminRe
     let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
     let seq = old_seq + 1;
     let nonce = rand::random::<u64>();
-    cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+    cnc.write_admin_req(&AdminReq {
+        seq,
+        nonce,
+        op,
+        id,
+        ip,
+        port,
+    });
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(resp) = cnc.read_admin_resp(seq) {
             return resp;
         }
-        assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+        assert!(
+            Instant::now() < deadline,
+            "admin response timed out for seq {seq}"
+        );
         thread::yield_now();
     }
 }
@@ -656,7 +677,10 @@ fn admin_request_ok(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u
             0 => return resp,
             2 => {}
             1 if matches!(resp.reason, 2 | 3 | 10) => {}
-            _ => panic!("admin op {op} on id {id} refused: status={} reason={}", resp.status, resp.reason),
+            _ => panic!(
+                "admin op {op} on id {id} refused: status={} reason={}",
+                resp.status, resp.reason
+            ),
         }
         assert!(
             Instant::now() < deadline,
@@ -732,7 +756,10 @@ impl Load {
         let stop = Arc::new(AtomicBool::new(false));
         let s = Arc::clone(&stop);
         let handle = thread::spawn(move || load_loop(s, registry));
-        Load { stop, handle: Some(handle) }
+        Load {
+            stop,
+            handle: Some(handle),
+        }
     }
     fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -857,19 +884,27 @@ struct NodeH {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].node.can_serve() && nodes[i].node.is_leader()).collect();
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node.can_serve() && nodes[i].node.is_leader())
+            .collect();
         assert!(serving.len() <= 1, "split-brain: {serving:?}");
         if serving.len() == 1 {
             return serving[0];
         }
-        assert!(Instant::now() < deadline, "no single serving leader within {secs}s");
+        assert!(
+            Instant::now() < deadline,
+            "no single serving leader within {secs}s"
+        );
         thread::yield_now();
     }
 }
 
 fn leader_commit(nodes: &[NodeH], id: NodeId) -> u64 {
-    nodes.iter().find(|h| h.id == id).map(|h| h.node.counters().commit.load_acquire()).unwrap_or(0)
+    nodes
+        .iter()
+        .find(|h| h.id == id)
+        .map(|h| h.node.counters().commit.load_acquire())
+        .unwrap_or(0)
 }
 
 fn wait_bool(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
@@ -889,8 +924,18 @@ fn wait_bool(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
 /// `version`. `halted` excludes ids that have already fail-stopped on their
 /// own removal in an earlier step of the SAME scenario (they will never
 /// converge on a LATER version).
-fn wait_config_converged(nodes: &[NodeH], halted: &HashSet<NodeId>, version: u64, secs: u64) -> bool {
-    wait_bool(secs, || nodes.iter().filter(|h| !halted.contains(&h.id)).all(|h| h.node.config_version() >= version))
+fn wait_config_converged(
+    nodes: &[NodeH],
+    halted: &HashSet<NodeId>,
+    version: u64,
+    secs: u64,
+) -> bool {
+    wait_bool(secs, || {
+        nodes
+            .iter()
+            .filter(|h| !halted.contains(&h.id))
+            .all(|h| h.node.config_version() >= version)
+    })
 }
 
 // --------------------------------------------------------------- the gate
@@ -903,7 +948,11 @@ struct Verdict {
 
 impl Verdict {
     fn fail(scenario: &'static str, detail: String) -> Verdict {
-        Verdict { scenario, pass: false, detail }
+        Verdict {
+            scenario,
+            pass: false,
+            detail,
+        }
     }
 }
 
@@ -920,7 +969,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         std::env::set_var("UC2_CLIENT_TIMEOUT_MS", "500");
     }
 
-    let root = a.root.unwrap_or_else(|| PathBuf::from("target/m7_gate_smoke"));
+    let root = a
+        .root
+        .unwrap_or_else(|| PathBuf::from("target/m7_gate_smoke"));
     anyhow::ensure!(
         !root.starts_with("/tmp"),
         "m7_gate all: root must be on a real filesystem (never /tmp — RAM tmpfs); got {root:?}"
@@ -936,7 +987,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     );
 
     const NV: usize = 3;
-    let socks: Vec<UdpSocket> = (0..NV).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
+    let socks: Vec<UdpSocket> = (0..NV)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
     let addrs: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().unwrap()).collect();
     let members: Vec<(NodeId, SocketAddr)> = (0..NV).map(|i| (i as NodeId, addrs[i])).collect();
 
@@ -957,7 +1010,12 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
-        nodes.push(NodeH { id: i as NodeId, dir, node, svc: Some(svc) });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            dir,
+            node,
+            svc: Some(svc),
+        });
     }
 
     let leader = await_single_leader(&nodes, 30);
@@ -993,7 +1051,12 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     println!("\n== M7 gate smoke results ==");
     let mut all_pass = true;
     for v in &verdicts {
-        println!("  [{}] {} — {}", if v.pass { "PASS" } else { "FAIL" }, v.scenario, v.detail);
+        println!(
+            "  [{}] {} — {}",
+            if v.pass { "PASS" } else { "FAIL" },
+            v.scenario,
+            v.detail
+        );
         all_pass &= v.pass;
     }
     if all_pass {
@@ -1010,13 +1073,20 @@ fn check_monotonic_read(registry: &Registry, last_read: &mut u64, after: &'stati
         Some(v) if v >= *last_read => {
             let detail = format!("read {v} after {after} (>= previous {})", *last_read);
             *last_read = v;
-            Verdict { scenario: "monotonic-read", pass: true, detail }
+            Verdict {
+                scenario: "monotonic-read",
+                pass: true,
+                detail,
+            }
         }
         Some(v) => Verdict::fail(
             "monotonic-read",
             format!("REGRESSED after {after}: {v} < previous {}", *last_read),
         ),
-        None => Verdict::fail("monotonic-read", format!("no read resolved within 10s after {after}")),
+        None => Verdict::fail(
+            "monotonic-read",
+            format!("no read resolved within 10s after {after}"),
+        ),
     }
 }
 
@@ -1058,21 +1128,35 @@ fn scenario_replace_a_box(
     );
     let node = Node::start_with_socket(cfg, sock).expect("start spare");
     let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
-    nodes.push(NodeH { id: new_id, dir, node, svc: Some(svc) });
+    nodes.push(NodeH {
+        id: new_id,
+        dir,
+        node,
+        svc: Some(svc),
+    });
     sync_registry(registry, nodes);
 
     let target_commit = leader_commit(nodes, leader_id);
-    if !wait_bool(60, || peer_reported_durable(&leader_cnc, new_id).is_some_and(|d| d >= target_commit)) {
+    if !wait_bool(60, || {
+        peer_reported_durable(&leader_cnc, new_id).is_some_and(|d| d >= target_commit)
+    }) {
         return Verdict::fail(SC, "spare never caught up within 60s".into());
     }
 
     let resp = admin_request_ok(&leader_cnc, 2 /* PromoteLearner */, new_id, 0, 0, 20);
     let promote_version = resp.version;
     if !wait_config_converged(nodes, &HashSet::new(), promote_version, 20) {
-        return Verdict::fail(SC, format!("config v{promote_version} never converged after promote"));
+        return Verdict::fail(
+            SC,
+            format!("config v{promote_version} never converged after promote"),
+        );
     }
 
-    let victim_id = match seed_members.iter().map(|(id, _)| *id).find(|&id| id != leader_id) {
+    let victim_id = match seed_members
+        .iter()
+        .map(|(id, _)| *id)
+        .find(|&id| id != leader_id)
+    {
         Some(id) => id,
         None => return Verdict::fail(SC, "no non-leader original voter to remove".into()),
     };
@@ -1087,10 +1171,17 @@ fn scenario_replace_a_box(
     let resp = admin_request_ok(&leader_cnc, 5 /* RemoveVoter */, victim_id, 0, 0, 20);
     let remove_version = resp.version;
     if !wait_config_converged(nodes, &HashSet::new(), remove_version, 20) {
-        return Verdict::fail(SC, format!("config v{remove_version} never converged after remove"));
+        return Verdict::fail(
+            SC,
+            format!("config v{remove_version} never converged after remove"),
+        );
     }
 
-    let c1 = nodes.iter().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0);
+    let c1 = nodes
+        .iter()
+        .map(|h| h.node.counters().commit.load_acquire())
+        .max()
+        .unwrap_or(0);
     let elapsed = t0.elapsed().as_secs_f64();
     let rate = c1.saturating_sub(c0) as f64 / elapsed.max(1e-6);
 
@@ -1151,27 +1242,52 @@ fn scenario_resize_3_5_3(
         );
         let node = Node::start_with_socket(cfg, sock).expect("start spare");
         let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
-        nodes.push(NodeH { id: spare_id, dir, node, svc: Some(svc) });
+        nodes.push(NodeH {
+            id: spare_id,
+            dir,
+            node,
+            svc: Some(svc),
+        });
         sync_registry(registry, nodes);
         if !wait_config_converged(nodes, &halted, resp.version, 30) {
-            return Verdict::fail(SC, format!("config v{} never converged after add {spare_id}", resp.version));
+            return Verdict::fail(
+                SC,
+                format!(
+                    "config v{} never converged after add {spare_id}",
+                    resp.version
+                ),
+            );
         }
 
         let target_commit = leader_commit(nodes, leader_id);
-        if !wait_bool(60, || peer_reported_durable(&leader_cnc, spare_id).is_some_and(|d| d >= target_commit)) {
+        if !wait_bool(60, || {
+            peer_reported_durable(&leader_cnc, spare_id).is_some_and(|d| d >= target_commit)
+        }) {
             return Verdict::fail(SC, format!("spare {spare_id} never caught up within 60s"));
         }
 
         let resp = admin_request_ok(&leader_cnc, 2 /* PromoteLearner */, spare_id, 0, 0, 30);
         if !wait_config_converged(nodes, &halted, resp.version, 30) {
-            return Verdict::fail(SC, format!("config v{} never converged after promote {spare_id}", resp.version));
+            return Verdict::fail(
+                SC,
+                format!(
+                    "config v{} never converged after promote {spare_id}",
+                    resp.version
+                ),
+            );
         }
     }
 
     for &spare_id in &[60u32, 61u32] {
         let resp = admin_request_ok(&leader_cnc, 3 /* DemoteVoter */, spare_id, 0, 0, 20);
         if !wait_config_converged(nodes, &halted, resp.version, 20) {
-            return Verdict::fail(SC, format!("config v{} never converged after demote {spare_id}", resp.version));
+            return Verdict::fail(
+                SC,
+                format!(
+                    "config v{} never converged after demote {spare_id}",
+                    resp.version
+                ),
+            );
         }
 
         let resp = admin_request_ok(&leader_cnc, 4 /* RemoveLearner */, spare_id, 0, 0, 20);
@@ -1179,7 +1295,10 @@ fn scenario_resize_3_5_3(
         if !wait_config_converged(nodes, &halted, resp.version, 20) {
             return Verdict::fail(
                 SC,
-                format!("config v{} never converged after remove-learner {spare_id}", resp.version),
+                format!(
+                    "config v{} never converged after remove-learner {spare_id}",
+                    resp.version
+                ),
             );
         }
     }
@@ -1196,8 +1315,11 @@ fn scenario_resize_3_5_3(
             let cnc = open_cnc(&h.dir);
             let mut got = voter_ids_via_cnc(&cnc);
             got.sort_unstable();
-            let mut want_others: Vec<NodeId> =
-                base_voters.iter().copied().filter(|&id| id != h.id).collect();
+            let mut want_others: Vec<NodeId> = base_voters
+                .iter()
+                .copied()
+                .filter(|&id| id != h.id)
+                .collect();
             want_others.sort_unstable();
             got == want_others
         })
@@ -1207,19 +1329,30 @@ fn scenario_resize_3_5_3(
             let cnc = open_cnc(&h.dir);
             let mut got = voter_ids_via_cnc(&cnc);
             got.sort_unstable();
-            let mut want_others: Vec<NodeId> =
-                base_voters.iter().copied().filter(|&id| id != h.id).collect();
+            let mut want_others: Vec<NodeId> = base_voters
+                .iter()
+                .copied()
+                .filter(|&id| id != h.id)
+                .collect();
             want_others.sort_unstable();
             if got != want_others {
                 return Verdict::fail(
                     SC,
-                    format!("node {}: final voter set {got:?} != expected {want_others:?}", h.id),
+                    format!(
+                        "node {}: final voter set {got:?} != expected {want_others:?}",
+                        h.id
+                    ),
                 );
             }
         }
     }
 
-    let c1 = nodes.iter().filter(|h| !halted.contains(&h.id)).map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0);
+    let c1 = nodes
+        .iter()
+        .filter(|h| !halted.contains(&h.id))
+        .map(|h| h.node.counters().commit.load_acquire())
+        .max()
+        .unwrap_or(0);
     let elapsed = t0.elapsed().as_secs_f64();
     let rate = c1.saturating_sub(c0) as f64 / elapsed.max(1e-6);
 
@@ -1248,27 +1381,40 @@ fn scenario_leader_self_removal(nodes: &mut [NodeH], registry: &Registry) -> Ver
     let leader_id = nodes[leader_idx].id;
     let leader_cnc = open_cnc(&nodes[leader_idx].dir);
 
-    let mut high_water = nodes.iter().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0);
+    let mut high_water = nodes
+        .iter()
+        .map(|h| h.node.counters().commit.load_acquire())
+        .max()
+        .unwrap_or(0);
     let t0 = Instant::now();
     let resp = admin_request(&leader_cnc, 5 /* RemoveVoter */, leader_id, 0, 0);
     if resp.status != 0 {
-        return Verdict::fail(SC, format!("leader self-removal refused: reason {}", resp.reason));
+        return Verdict::fail(
+            SC,
+            format!("leader self-removal refused: reason {}", resp.reason),
+        );
     }
 
     let budget = Duration::from_secs(30);
     let deadline = Instant::now() + budget;
     let mut regressed = false;
     let new_leader_idx = loop {
-        let cur = nodes.iter().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0);
+        let cur = nodes
+            .iter()
+            .map(|h| h.node.counters().commit.load_acquire())
+            .max()
+            .unwrap_or(0);
         if cur < high_water {
             regressed = true;
         }
         high_water = high_water.max(cur);
 
-        let old_stepped_down =
-            leader_cnc.status().flags.load_acquire() & (NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE) == 0;
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].id != leader_id && nodes[i].node.can_serve()).collect();
+        let old_stepped_down = leader_cnc.status().flags.load_acquire()
+            & (NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE)
+            == 0;
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].id != leader_id && nodes[i].node.can_serve())
+            .collect();
         if serving.len() > 1 {
             return Verdict::fail(SC, format!("split-brain among survivors: {serving:?}"));
         }
@@ -1283,15 +1429,27 @@ fn scenario_leader_self_removal(nodes: &mut [NodeH], registry: &Registry) -> Ver
     let gap = t0.elapsed();
 
     if regressed {
-        return Verdict::fail(SC, "committed high-water regressed across the handoff".into());
+        return Verdict::fail(
+            SC,
+            "committed high-water regressed across the handoff".into(),
+        );
     }
     let Some(new_leader_idx) = new_leader_idx else {
-        return Verdict::fail(SC, format!("no new leader within {:.1}s budget (gap {:.2}s)", budget.as_secs_f64(), gap.as_secs_f64()));
+        return Verdict::fail(
+            SC,
+            format!(
+                "no new leader within {:.1}s budget (gap {:.2}s)",
+                budget.as_secs_f64(),
+                gap.as_secs_f64()
+            ),
+        );
     };
     sync_registry(registry, nodes);
 
     let before = nodes[new_leader_idx].node.counters().commit.load_acquire();
-    if !wait_bool(10, || nodes[new_leader_idx].node.counters().commit.load_acquire() > before) {
+    if !wait_bool(10, || {
+        nodes[new_leader_idx].node.counters().commit.load_acquire() > before
+    }) {
         return Verdict::fail(SC, "the new leader never advanced commit".into());
     }
 

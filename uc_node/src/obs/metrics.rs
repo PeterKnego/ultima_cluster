@@ -25,7 +25,10 @@ use super::ObsSources;
 
 /// Unix nanoseconds "now" — shared with Task 6's `/healthz`/`/readyz` probes.
 pub fn now_unix_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Every metric family name the encoder emits, in the order it renders
@@ -284,8 +287,7 @@ fn push_service_labeled(
     rows: &[ServiceRow],
     pick: impl Fn(&ServiceRow) -> u64,
 ) {
-    let samples: Vec<(String, u64)> =
-        rows.iter().map(|r| (r.labels.clone(), pick(r))).collect();
+    let samples: Vec<(String, u64)> = rows.iter().map(|r| (r.labels.clone(), pick(r))).collect();
     push_labeled(out, name, help, ty, &samples);
 }
 
@@ -382,10 +384,23 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
 pub fn render_prometheus(s: &ObsSources) -> String {
     let mut out = String::with_capacity(8 * 1024);
 
-    push_family_header(&mut out, "uc2_build_info", "Static build version info.", "gauge");
-    out.push_str(&format!("uc2_build_info{{version=\"{}\"}} 1\n", env!("CARGO_PKG_VERSION")));
+    push_family_header(
+        &mut out,
+        "uc2_build_info",
+        "Static build version info.",
+        "gauge",
+    );
+    out.push_str(&format!(
+        "uc2_build_info{{version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
+    ));
 
-    push_gauge(&mut out, "uc_node_id", "This node's configured id.", s.node_id as u64);
+    push_gauge(
+        &mut out,
+        "uc_node_id",
+        "This node's configured id.",
+        s.node_id as u64,
+    );
 
     let status = s.cnc.status();
     let flags = status.flags.load_acquire();
@@ -401,11 +416,21 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         "1 if this node currently holds NODE_FLAG_CAN_SERVE.",
         (flags & NODE_FLAG_CAN_SERVE != 0) as u64,
     );
-    push_gauge(&mut out, "uc2_term", "Current consensus term.", status.term.load_acquire());
+    push_gauge(
+        &mut out,
+        "uc2_term",
+        "Current consensus term.",
+        status.term.load_acquire(),
+    );
 
     let leader_hint = status.leader_hint.load_acquire();
     if leader_hint != u64::MAX {
-        push_gauge(&mut out, "uc2_leader_hint", "Last known leader node id.", leader_hint);
+        push_gauge(
+            &mut out,
+            "uc2_leader_hint",
+            "Last known leader node id.",
+            leader_hint,
+        );
     }
 
     push_gauge(
@@ -482,10 +507,30 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     let durable = counters.durable.load_acquire();
     let sent = counters.sent.load_acquire();
     let commit = counters.commit.load_acquire();
-    push_gauge(&mut out, "uc2_append_bytes", "Local append counter.", append);
-    push_gauge(&mut out, "uc2_durable_bytes", "Local archive-durable counter.", durable);
-    push_gauge(&mut out, "uc2_sent_bytes", "Local replication-sent counter.", sent);
-    push_gauge(&mut out, "uc2_commit_bytes", "Cluster commit counter.", commit);
+    push_gauge(
+        &mut out,
+        "uc2_append_bytes",
+        "Local append counter.",
+        append,
+    );
+    push_gauge(
+        &mut out,
+        "uc2_durable_bytes",
+        "Local archive-durable counter.",
+        durable,
+    );
+    push_gauge(
+        &mut out,
+        "uc2_sent_bytes",
+        "Local replication-sent counter.",
+        sent,
+    );
+    push_gauge(
+        &mut out,
+        "uc2_commit_bytes",
+        "Cluster commit counter.",
+        commit,
+    );
 
     let service = s.cnc.service();
     let service_applied = service.service_applied.load_acquire();
@@ -545,8 +590,11 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         apply_lag,
     );
 
-    let admission_saturation =
-        if admission_bytes == 0 { 0.0 } else { commit_lag as f64 / admission_bytes as f64 };
+    let admission_saturation = if admission_bytes == 0 {
+        0.0
+    } else {
+        commit_lag as f64 / admission_bytes as f64
+    };
     push_gauge_f64(
         &mut out,
         "uc2_admission_saturation",
@@ -646,7 +694,9 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         &mut out,
         "uc2_snapshot_refused_declared_set_total",
         "Snapshot sessions refused because the sender's declared service set differs from this node's [services] ids — a joiner is stuck until the sets match (spec §8).",
-        s.receiver.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+        s.receiver
+            .snap_refused_declared_mismatch
+            .load(Ordering::Relaxed),
     );
     push_counter(
         &mut out,
@@ -806,17 +856,41 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
 
     let dropped_samples: Vec<(String, u64)> = [
-        ("stale_term", s.receiver.dropped_stale_term.load(Ordering::Relaxed)),
+        (
+            "stale_term",
+            s.receiver.dropped_stale_term.load(Ordering::Relaxed),
+        ),
         ("dup", s.receiver.dropped_dup.load(Ordering::Relaxed)),
-        ("overrun", s.receiver.dropped_overrun.load(Ordering::Relaxed)),
-        ("malformed", s.receiver.dropped_malformed.load(Ordering::Relaxed)),
+        (
+            "overrun",
+            s.receiver.dropped_overrun.load(Ordering::Relaxed),
+        ),
+        (
+            "malformed",
+            s.receiver.dropped_malformed.load(Ordering::Relaxed),
+        ),
         ("gated", s.receiver.dropped_gated.load(Ordering::Relaxed)),
-        ("straddle", s.receiver.dropped_straddle.load(Ordering::Relaxed)),
-        ("auth_failed", s.receiver.dropped_auth_failed.load(Ordering::Relaxed)),
+        (
+            "straddle",
+            s.receiver.dropped_straddle.load(Ordering::Relaxed),
+        ),
+        (
+            "auth_failed",
+            s.receiver.dropped_auth_failed.load(Ordering::Relaxed),
+        ),
         ("replay", s.receiver.dropped_replay.load(Ordering::Relaxed)),
-        ("unknown_epoch", s.receiver.dropped_unknown_epoch.load(Ordering::Relaxed)),
-        ("unknown_peer", s.receiver.dropped_unknown_peer.load(Ordering::Relaxed)),
-        ("handshake", s.receiver.dropped_handshake.load(Ordering::Relaxed)),
+        (
+            "unknown_epoch",
+            s.receiver.dropped_unknown_epoch.load(Ordering::Relaxed),
+        ),
+        (
+            "unknown_peer",
+            s.receiver.dropped_unknown_peer.load(Ordering::Relaxed),
+        ),
+        (
+            "handshake",
+            s.receiver.dropped_handshake.load(Ordering::Relaxed),
+        ),
     ]
     .into_iter()
     .map(|(reason, v)| (format!("reason=\"{reason}\""), v))
@@ -848,7 +922,12 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         s.receiver.counter_ahead_resyncs.load(Ordering::Relaxed),
     );
 
-    let net_event_drops: u64 = s.receiver.net_drops.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    let net_event_drops: u64 = s
+        .receiver
+        .net_drops
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum();
     push_counter(
         &mut out,
         "uc_net_event_drops_total",
@@ -885,7 +964,9 @@ mod tests {
         // family (both `uc2_leader_hint` and the three `uc2_peer_*`
         // families are conditionally emitted).
         cnc.status().leader_hint.store_release(0);
-        cnc.peer_slot(0).id_and_role.store_release(pack_id_and_role(9, CNC_PEER_ROLE_VOTER));
+        cnc.peer_slot(0)
+            .id_and_role
+            .store_release(pack_id_and_role(9, CNC_PEER_ROLE_VOTER));
         // M11 (Task 5): non-zero so `every_contract_series_is_present` sees
         // `uc2_free_disk_bytes` — it's conditionally emitted, same as
         // `uc2_leader_hint` above.
@@ -961,7 +1042,10 @@ mod tests {
         assert!(!text.contains(r#"service=""#), "no id is declared: {text}");
         assert!(text.contains("\nuc_service_applied_bytes 0\n"), "{text}");
         assert!(text.contains("\nuc_service_epoch 0\n"), "{text}");
-        assert!(text.contains("\nuc_service_snapshot_pos_bytes 0\n"), "{text}");
+        assert!(
+            text.contains("\nuc_service_snapshot_pos_bytes 0\n"),
+            "{text}"
+        );
         // M14c2 T10b: this used to be
         // `contains("uc_service_heartbeat_age_seconds ")`, which the family's
         // OWN `# HELP` and `# TYPE` lines satisfy — a header-only render passed
@@ -980,7 +1064,10 @@ mod tests {
             .trim()
             .parse()
             .unwrap_or_else(|e| panic!("heartbeat age must render as a number ({hb:?}): {e}"));
-        assert!(age.is_finite() && age >= 0.0, "heartbeat age must be a real age: {hb:?}");
+        assert!(
+            age.is_finite() && age >= 0.0,
+            "heartbeat age must be a real age: {hb:?}"
+        );
         assert!(text.contains("\nuc_services_declared 0\n"), "{text}");
     }
 
@@ -1023,20 +1110,29 @@ mod tests {
         let text = render_prometheus(&s);
         assert!(text.contains("uc2_commit_lag_bytes 600000"), "{text}");
         assert!(text.contains("uc2_apply_lag_bytes 250000"), "{text}");
-        assert!(text.contains("uc2_admission_saturation 2.288818359375"), "{text}");
+        assert!(
+            text.contains("uc2_admission_saturation 2.288818359375"),
+            "{text}"
+        );
     }
 
     #[test]
     fn peer_slots_export_only_occupied_with_labels() {
         let s = synthetic_sources();
-        s.cnc.peer_slot(0).id_and_role.store_release(pack_id_and_role(2, CNC_PEER_ROLE_VOTER));
+        s.cnc
+            .peer_slot(0)
+            .id_and_role
+            .store_release(pack_id_and_role(2, CNC_PEER_ROLE_VOTER));
         s.cnc.peer_slot(0).reported_durable.store_release(1234);
         let text = render_prometheus(&s);
         assert!(
             text.contains(r#"uc2_peer_reported_durable_bytes{peer="2",role="voter"} 1234"#),
             "{text}"
         );
-        assert!(!text.contains(r#"peer="0""#), "unoccupied slots must not appear: {text}");
+        assert!(
+            !text.contains(r#"peer="0""#),
+            "unoccupied slots must not appear: {text}"
+        );
     }
 
     /// M14c (spec §9): one labelled sample per DECLARED id — including an id
@@ -1056,18 +1152,48 @@ mod tests {
         s0.lag_waits.store_release(12);
         // id 2: declared, never attached — every field stays zero.
         let text = render_prometheus(&s);
-        assert!(text.contains(r#"uc_service_applied_bytes{service="0"} 9000"#), "{text}");
-        assert!(text.contains(r#"uc_service_epoch{service="0"} 7"#), "{text}");
-        assert!(text.contains(r#"uc_service_snapshot_pos_bytes{service="0"} 4096"#), "{text}");
-        assert!(text.contains(r#"uc_service_attached{service="0"} 1"#), "{text}");
-        assert!(text.contains(r#"uc_service_attached{service="2"} 0"#), "{text}");
-        assert!(text.contains(r#"uc_service_lag_bytes{service="0"} 1000"#), "{text}");
-        assert!(text.contains(r#"uc_service_lag_bytes{service="2"} 10000"#), "{text}");
-        assert!(text.contains(r#"uc_service_lag_waits_total{service="0"} 12"#), "{text}");
-        assert!(text.contains(r#"uc_service_heartbeat_age_seconds{service="2"}"#), "{text}");
+        assert!(
+            text.contains(r#"uc_service_applied_bytes{service="0"} 9000"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_epoch{service="0"} 7"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_snapshot_pos_bytes{service="0"} 4096"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_attached{service="0"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_attached{service="2"} 0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_lag_bytes{service="0"} 1000"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_lag_bytes{service="2"} 10000"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_lag_waits_total{service="0"} 12"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc_service_heartbeat_age_seconds{service="2"}"#),
+            "{text}"
+        );
         assert!(text.contains("\nuc_services_declared 5\n"), "{text}");
         assert!(text.contains("\nuc2_fsm_lag_bytes 65536\n"), "{text}");
-        assert!(!text.contains(r#"service="1""#), "id 1 is not declared: {text}");
+        assert!(
+            !text.contains(r#"service="1""#),
+            "id 1 is not declared: {text}"
+        );
     }
 
     /// The four M10 aggregates keep their bare names (now "slowest FSM") and
@@ -1115,11 +1241,21 @@ mod tests {
     #[test]
     fn snapshot_refusal_counters_render_from_receiver_stats() {
         let s = synthetic_sources();
-        s.receiver.snap_refused_legacy_peer.fetch_add(3, Ordering::Relaxed);
-        s.receiver.snap_refused_declared_mismatch.fetch_add(1, Ordering::Relaxed);
+        s.receiver
+            .snap_refused_legacy_peer
+            .fetch_add(3, Ordering::Relaxed);
+        s.receiver
+            .snap_refused_declared_mismatch
+            .fetch_add(1, Ordering::Relaxed);
         let text = render_prometheus(&s);
-        assert!(text.contains("uc2_snapshot_refused_legacy_peer_total 3\n"), "{text}");
-        assert!(text.contains("uc2_snapshot_refused_declared_set_total 1\n"), "{text}");
+        assert!(
+            text.contains("uc2_snapshot_refused_legacy_peer_total 3\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_refused_declared_set_total 1\n"),
+            "{text}"
+        );
     }
 
     /// M14c review round 2, finding 1: the intake-side I/O counter — the
@@ -1127,9 +1263,14 @@ mod tests {
     #[test]
     fn snapshot_intake_io_failures_render_from_receiver_stats() {
         let s = synthetic_sources();
-        s.receiver.snap_intake_io_failures.fetch_add(4, Ordering::Relaxed);
+        s.receiver
+            .snap_intake_io_failures
+            .fetch_add(4, Ordering::Relaxed);
         let text = render_prometheus(&s);
-        assert!(text.contains("uc2_snapshot_intake_io_failures_total 4\n"), "{text}");
+        assert!(
+            text.contains("uc2_snapshot_intake_io_failures_total 4\n"),
+            "{text}"
+        );
     }
 
     /// M14c2 (T10a): the three counters that close M14c's snapshot-session
@@ -1140,12 +1281,25 @@ mod tests {
     fn the_m14c2_snapshot_counters_render_from_their_own_stats_cells() {
         let s = synthetic_sources();
         s.sender.snap_open_failed.fetch_add(2, Ordering::Relaxed);
-        s.receiver.snap_intake_abandoned.fetch_add(5, Ordering::Relaxed);
-        s.receiver.snap_begin_undecodable.fetch_add(7, Ordering::Relaxed);
+        s.receiver
+            .snap_intake_abandoned
+            .fetch_add(5, Ordering::Relaxed);
+        s.receiver
+            .snap_begin_undecodable
+            .fetch_add(7, Ordering::Relaxed);
         let text = render_prometheus(&s);
-        assert!(text.contains("uc2_snapshot_open_failed_total 2\n"), "{text}");
-        assert!(text.contains("uc2_snapshot_intake_abandoned_total 5\n"), "{text}");
-        assert!(text.contains("uc2_snapshot_begin_undecodable_total 7\n"), "{text}");
+        assert!(
+            text.contains("uc2_snapshot_open_failed_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_intake_abandoned_total 5\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_begin_undecodable_total 7\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1176,7 +1330,13 @@ mod tests {
         let s = synthetic_sources();
         s.agents[1].1.store(true, Ordering::Release);
         let text = render_prometheus(&s);
-        assert!(text.contains(r#"uc2_agent_alive{agent="sender"} 0"#), "{text}");
-        assert!(text.contains(r#"uc2_agent_alive{agent="consensus"} 1"#), "{text}");
+        assert!(
+            text.contains(r#"uc2_agent_alive{agent="sender"} 0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"uc2_agent_alive{agent="consensus"} 1"#),
+            "{text}"
+        );
     }
 }

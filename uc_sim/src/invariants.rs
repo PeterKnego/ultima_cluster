@@ -191,7 +191,12 @@ impl InvariantChecker {
     }
 
     fn viol(&self, invariant: &'static str, step: u64, detail: String) -> InvariantViolation {
-        InvariantViolation { invariant, step, seed: self.seed, detail }
+        InvariantViolation {
+            invariant,
+            step,
+            seed: self.seed,
+            detail,
+        }
     }
 
     /// Restart re-borns the SM: its run-local commit resets to 0, so invariant-3
@@ -320,7 +325,10 @@ impl InvariantChecker {
             return Err(self.viol(
                 "commit monotonicity (inv3)",
                 step,
-                format!("node {node} commit regressed {} -> {commit}", self.last_commit[i]),
+                format!(
+                    "node {node} commit regressed {} -> {commit}",
+                    self.last_commit[i]
+                ),
             ));
         }
         self.last_commit[i] = commit;
@@ -347,7 +355,12 @@ impl InvariantChecker {
         // phantom-checked below. Elections check the chain UNCONDITIONALLY
         // (`on_become_leader`): a legal winner always holds the committed
         // config (term-lexicographic vote freshness + inv5 completeness).
-        let max_term = self.leaders_by_term.keys().next_back().copied().unwrap_or(0);
+        let max_term = self
+            .leaders_by_term
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0);
         let advancing = term == max_term && max_term > 0 && commit >= self.global_max_commit;
         if advancing
             && let Some(cc) = &self.committed_config
@@ -426,7 +439,11 @@ impl InvariantChecker {
             // truth): the leader's adopted config if this commit covers its
             // config frame's END, else the frame is still uncommitted and prev
             // governs. Cloned for the same aliasing reason as the lineage.
-            let gov = if commit >= config_position { adopted } else { prev };
+            let gov = if commit >= config_position {
+                adopted
+            } else {
+                prev
+            };
             self.committed_config = Some(gov.clone());
         }
         Ok(())
@@ -668,7 +685,11 @@ impl InvariantChecker {
                 ),
             ));
         }
-        if let Some(id) = prev.tombstones.iter().find(|id| !config.tombstones.contains(id)) {
+        if let Some(id) = prev
+            .tombstones
+            .iter()
+            .find(|id| !config.tombstones.contains(id))
+        {
             return Err(self.viol(
                 "tombstone permanence (inv9)",
                 step,
@@ -718,15 +739,22 @@ impl InvariantChecker {
         let gmc = self.global_max_commit;
         // The ground-truth committed prefix: lineage boundaries below gmc (the
         // lineage is sorted by base, so `take_while` yields the committed prefix).
-        let lineage_prefix: Vec<(u32, u64)> =
-            self.committed_lineage.iter().copied().take_while(|&(_, b)| b < gmc).collect();
+        let lineage_prefix: Vec<(u32, u64)> = self
+            .committed_lineage
+            .iter()
+            .copied()
+            .take_while(|&(_, b)| b < gmc)
+            .collect();
         for (node, m) in maps.iter().enumerate() {
             // This node's recorded boundaries below the committed high-water.
             let node_prefix: Vec<(u32, u64)> =
                 m.iter().copied().take_while(|&(_, b)| b < gmc).collect();
             // Must be a LEADING SLICE of the lineage's committed boundaries.
             let is_prefix = node_prefix.len() <= lineage_prefix.len()
-                && node_prefix.iter().zip(lineage_prefix.iter()).all(|(a, b)| a == b);
+                && node_prefix
+                    .iter()
+                    .zip(lineage_prefix.iter())
+                    .all(|(a, b)| a == b);
             if !is_prefix {
                 return Err(self.viol(
                     "term-map prefix consistency (inv2)",
@@ -823,7 +851,9 @@ mod tests {
         let mut c = checker(vec![(1, 0), (2, 960)], 2000);
         let leader_map = vec![(1, 0), (5, 2000)];
         let g = gcfg(&[0, 1, 2]);
-        let err = c.on_become_leader(0, 5, 2000, &leader_map, &g, &g, 1).unwrap_err();
+        let err = c
+            .on_become_leader(0, 5, 2000, &leader_map, &g, &g, 1)
+            .unwrap_err();
         assert!(err.invariant.contains("inv5"), "{err}");
     }
 
@@ -832,7 +862,10 @@ mod tests {
         let mut c = checker(vec![(1, 0), (2, 960)], 2000);
         let leader_map = vec![(1, 0), (2, 960), (5, 2000)];
         let g = gcfg(&[0, 1, 2]);
-        assert!(c.on_become_leader(0, 5, 2000, &leader_map, &g, &g, 1).is_ok());
+        assert!(
+            c.on_become_leader(0, 5, 2000, &leader_map, &g, &g, 1)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -840,7 +873,10 @@ mod tests {
         let mut c = checker(vec![(1, 0)], 2000);
         // Opening a term at base 1500 < gmc 2000 is a completeness breach.
         let g = gcfg(&[0, 1, 2]);
-        assert!(c.on_become_leader(0, 3, 1500, &[(1, 0), (3, 1500)], &g, &g, 1).is_err());
+        assert!(
+            c.on_become_leader(0, 3, 1500, &[(1, 0), (3, 1500)], &g, &g, 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -875,7 +911,10 @@ mod tests {
             .on_advance_commit(0, 3000, 2, true, &durables, &maps, &[0, 1, 2], &g, &g, 0, 5)
             .unwrap_err();
         assert!(err.invariant.contains("phantom"), "{err}");
-        assert_eq!(c.global_max_commit, 0, "a stale leader's phantom must not advance gmc");
+        assert_eq!(
+            c.global_max_commit, 0,
+            "a stale leader's phantom must not advance gmc"
+        );
     }
 
     #[test]
@@ -894,7 +933,10 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(c.global_max_commit, 0, "stale leader must not advance gmc");
-        assert!(c.committed_lineage.is_empty(), "stale leader must not set the lineage");
+        assert!(
+            c.committed_lineage.is_empty(),
+            "stale leader must not set the lineage"
+        );
     }
 
     #[test]
@@ -907,10 +949,25 @@ mod tests {
         let durables = vec![3000, 0, 0];
         let maps = vec![vec![(2, 0)], vec![], vec![]];
         assert!(
-            c.on_advance_commit(1, 3000, 2, false, &durables, &maps, &[0, 1, 2], &g, &g, 0, 2)
-                .is_ok()
+            c.on_advance_commit(
+                1,
+                3000,
+                2,
+                false,
+                &durables,
+                &maps,
+                &[0, 1, 2],
+                &g,
+                &g,
+                0,
+                2
+            )
+            .is_ok()
         );
-        assert_eq!(c.global_max_commit, 0, "a raw echo must not advance the genuine commit");
+        assert_eq!(
+            c.global_max_commit, 0,
+            "a raw echo must not advance the genuine commit"
+        );
     }
 
     // ---- M7 config invariants (inv6-9), the `inv2_catches_*` pattern ----
@@ -942,9 +999,15 @@ mod tests {
         // A leader adopts its own config frame at APPEND, before its durable
         // crosses it: implied-by-durable is still v0, implied-by-append is v1.
         let c = checker(vec![(1, 0)], 0);
-        assert!(c.check_config_determinism(0, &vcfg(1), &vcfg(0), &vcfg(1), 1).is_ok());
+        assert!(
+            c.check_config_determinism(0, &vcfg(1), &vcfg(0), &vcfg(1), 1)
+                .is_ok()
+        );
         // And plain agreement at the durable frontier is of course fine.
-        assert!(c.check_config_determinism(0, &vcfg(1), &vcfg(1), &vcfg(1), 2).is_ok());
+        assert!(
+            c.check_config_determinism(0, &vcfg(1), &vcfg(1), &vcfg(1), 2)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -984,10 +1047,25 @@ mod tests {
         let durables = vec![3000, 3000, 3000];
         let maps = vec![vec![(3, 0)], vec![(3, 0)], vec![(3, 0)]];
         let err = c
-            .on_advance_commit(1, 3000, 3, true, &durables, &maps, &[0, 1, 2], &vcfg(1), &vcfg(0), 0, 5)
+            .on_advance_commit(
+                1,
+                3000,
+                3,
+                true,
+                &durables,
+                &maps,
+                &[0, 1, 2],
+                &vcfg(1),
+                &vcfg(0),
+                0,
+                5,
+            )
             .unwrap_err();
         assert!(err.invariant.contains("inv7"), "{err}");
-        assert!(err.detail.contains("chain") || err.invariant.contains("chain"), "{err}");
+        assert!(
+            err.detail.contains("chain") || err.invariant.contains("chain"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1000,8 +1078,20 @@ mod tests {
         let durables = vec![3000, 3000, 3000];
         let maps = vec![vec![(3, 0)], vec![(3, 0)], vec![(3, 0)]];
         assert!(
-            c.on_advance_commit(1, 3000, 3, true, &durables, &maps, &[0, 1, 2], &vcfg(3), &vcfg(2), 100, 5)
-                .is_ok()
+            c.on_advance_commit(
+                1,
+                3000,
+                3,
+                true,
+                &durables,
+                &maps,
+                &[0, 1, 2],
+                &vcfg(3),
+                &vcfg(2),
+                100,
+                5
+            )
+            .is_ok()
         );
         // The commit covered the frame end (100 <= 3000): v3 is now committed.
         assert_eq!(c.committed_config.as_ref().map(|g| g.version), Some(3));
@@ -1027,7 +1117,9 @@ mod tests {
         // durable frontier implies v0 — revert-on-truncate failed (the
         // counterfactual's bug class).
         let c = checker(vec![(1, 0)], 0);
-        let err = c.check_revert_correctness(1, &vcfg(1), &vcfg(0), 1).unwrap_err();
+        let err = c
+            .check_revert_correctness(1, &vcfg(1), &vcfg(0), 1)
+            .unwrap_err();
         assert!(err.invariant.contains("inv8"), "{err}");
         // The settled, reverted state passes.
         assert!(c.check_revert_correctness(1, &vcfg(0), &vcfg(0), 2).is_ok());
@@ -1040,7 +1132,9 @@ mod tests {
         let mut bad = gcfg(&[0, 1, 2]);
         bad.version = 1;
         bad.tombstones.push(2);
-        let err = c.on_config_adopted(0, &bad, &gcfg(&[0, 1, 2]), 1).unwrap_err();
+        let err = c
+            .on_config_adopted(0, &bad, &gcfg(&[0, 1, 2]), 1)
+            .unwrap_err();
         assert!(err.invariant.contains("inv9"), "{err}");
         // (b) across the edge: prev tombstoned 2, the new config re-lists it.
         let mut prev = gcfg(&[0, 1]);

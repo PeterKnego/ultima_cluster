@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing};
 use uc_protocol::v2::ipc::{MSG_V2_RESPONSE, MSG_V2_SUBMIT, client_from_extra, extra_client};
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 // ------------------------------------------------------------- the state machine
 
@@ -97,7 +97,13 @@ fn open_ingress(dir: &Path) -> MpscProducer {
 
 fn write_submit(prod: &MpscProducer, client_id: u32, local_seq: u32, cmd: &Cmd) {
     let payload = bincode::serde::encode_to_vec(cmd, bincode::config::standard()).unwrap();
-    prod.try_write(MSG_V2_SUBMIT, 0, extra_client(client_id, local_seq), &payload).unwrap();
+    prod.try_write(
+        MSG_V2_SUBMIT,
+        0,
+        extra_client(client_id, local_seq),
+        &payload,
+    )
+    .unwrap();
 }
 
 /// Drain every currently-available egress record; count the ones addressed to
@@ -109,11 +115,15 @@ fn drain_responses(sub: &mut BroadcastConsumer, client_id: u32, max_total: &mut 
     loop {
         match sub.try_read(&mut buf) {
             Ok(Some(rec)) => {
-                if rec.msg_type == MSG_V2_RESPONSE && client_from_extra(rec.header_extra).0 == client_id
+                if rec.msg_type == MSG_V2_RESPONSE
+                    && client_from_extra(rec.header_extra).0 == client_id
                 {
                     // Pinned layout: position u64 LE ++ bincode(response).
                     let pos = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                    assert!(pos >= 32, "responses are for data frames, past the NewTerm frame");
+                    assert!(
+                        pos >= 32,
+                        "responses are for data frames, past the NewTerm frame"
+                    );
                     let (total, _): (u64, usize) =
                         bincode::serde::decode_from_slice(&buf[8..], bincode::config::standard())
                             .unwrap();
@@ -139,11 +149,16 @@ fn service_applies_committed_frames_and_publishes_responses() {
     // Subscribe to the egress BEFORE submitting: a broadcast subscriber is
     // "join-and-listen" (it skips records published before it joined), so
     // joining first guarantees we observe every response.
-    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast")).unwrap().subscribe();
+    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
+        .unwrap()
+        .subscribe();
 
-    let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "svc-test"), CountSm::default())
-        .start()
-        .unwrap();
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), "svc-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     // 100 submits through the real ingress ring, client identity (13, 1..=100).
     let prod = open_ingress(dir.path());
@@ -158,18 +173,28 @@ fn service_applies_committed_frames_and_publishes_responses() {
         got += drain_responses(&mut sub, 13, &mut max_total);
         got == 100
     });
-    assert_eq!(max_total, 100, "apply order: the 100th Add(1) response is the running total 100");
+    assert_eq!(
+        max_total, 100,
+        "apply order: the 100th Add(1) response is the running total 100"
+    );
 
     // service_applied catches up to the apply frontier = min(commit, durable).
     let cnc = uc_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "svc-test").unwrap();
     wait_until(|| {
-        let target =
-            cnc.counters().commit.load_acquire().min(cnc.counters().durable.load_acquire());
+        let target = cnc
+            .counters()
+            .commit
+            .load_acquire()
+            .min(cnc.counters().durable.load_acquire());
         cnc.service().service_applied.load_acquire() >= target && target > 32
     });
 
     // The service bumped its incarnation epoch at attach.
-    assert_eq!(svc.epoch(), 1, "first incarnation bumps service_epoch 0 -> 1");
+    assert_eq!(
+        svc.epoch(),
+        1,
+        "first incarnation bumps service_epoch 0 -> 1"
+    );
     assert_eq!(svc.instance_id(), cnc.meta().instance_id);
 
     svc.stop();
@@ -185,7 +210,9 @@ fn egress_frame_layout_is_byte_pinned() {
     let node = Node::start(node_config(dir.path(), "layout")).unwrap();
     wait_until(|| node.can_serve());
 
-    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast")).unwrap().subscribe();
+    let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
+        .unwrap()
+        .subscribe();
     let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "layout"), CountSm::default())
         .start()
         .unwrap();
@@ -209,14 +236,21 @@ fn egress_frame_layout_is_byte_pinned() {
 
     // header_extra = extra_client(session_id, correlation_id), same LE pair the
     // client stamped on submit.
-    assert_eq!(rec.header_extra, [0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05]);
+    assert_eq!(
+        rec.header_extra,
+        [0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05]
+    );
     // payload[..8] = position (a data frame, so >= 32); payload[8..] = bincode(7u64).
     let pos = u64::from_le_bytes(buf[..8].try_into().unwrap());
     assert!(pos >= 32);
     let (total, consumed): (u64, usize) =
         bincode::serde::decode_from_slice(&buf[8..], bincode::config::standard()).unwrap();
     assert_eq!(total, 7);
-    assert_eq!(8 + consumed, buf.len(), "no trailing bytes beyond position ++ bincode(resp)");
+    assert_eq!(
+        8 + consumed,
+        buf.len(),
+        "no trailing bytes beyond position ++ bincode(resp)"
+    );
 
     svc.stop();
     node.stop();

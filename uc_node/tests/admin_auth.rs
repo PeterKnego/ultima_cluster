@@ -56,7 +56,10 @@ fn serialize() -> MutexGuard<'static, ()> {
 }
 
 fn unix_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 fn test_key() -> AdminKey {
@@ -64,7 +67,10 @@ fn test_key() -> AdminKey {
 }
 
 fn hmac_policy() -> AdminPolicy {
-    AdminPolicy::Hmac { keys: Arc::new(vec![test_key()]), ttl: TTL }
+    AdminPolicy::Hmac {
+        keys: Arc::new(vec![test_key()]),
+        ttl: TTL,
+    }
 }
 
 struct NodeH {
@@ -105,7 +111,11 @@ impl NodeH {
             match UdpSocket::bind(self.addr) {
                 Ok(s) => break s,
                 Err(e) => {
-                    assert!(Instant::now() < deadline, "rebind {} failed: {e}", self.addr);
+                    assert!(
+                        Instant::now() < deadline,
+                        "rebind {} failed: {e}",
+                        self.addr
+                    );
                     std::thread::yield_now();
                 }
             }
@@ -117,7 +127,10 @@ impl NodeH {
             self.instance_dir.clone(),
             self.seed,
         );
-        let opts = StartOpts { socket: Some(sock), admin: policy };
+        let opts = StartOpts {
+            socket: Some(sock),
+            admin: policy,
+        };
         self.node = Some(Node::start_with(cfg, opts).expect("restart"));
     }
 }
@@ -172,17 +185,30 @@ fn spawn_cluster(n: usize, policy: AdminPolicy) -> Cluster {
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir");
 
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
         let instance_dir = dir.path().join(format!("n{i}"));
-        let cfg = make_config(i as NodeId, members.clone(), addr, instance_dir.clone(), seed_for(i));
-        let opts = StartOpts { socket: Some(sock), admin: policy.clone() };
+        let cfg = make_config(
+            i as NodeId,
+            members.clone(),
+            addr,
+            instance_dir.clone(),
+            seed_for(i),
+        );
+        let opts = StartOpts {
+            socket: Some(sock),
+            admin: policy.clone(),
+        };
         let node = Node::start_with(cfg, opts).expect("start");
         nodes.push(NodeH {
             id: i as NodeId,
@@ -203,7 +229,9 @@ fn deadline_secs(secs: u64) -> Instant {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node().can_serve()).collect();
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node().can_serve())
+            .collect();
         assert!(serving.len() <= 1, "split-brain: {serving:?} all serve");
         if serving.len() == 1 {
             return serving[0];
@@ -238,7 +266,10 @@ fn audit_lines(instance_dir: &std::path::Path) -> Vec<String> {
 /// pinned key order and a flat object, so this needs no JSON dependency.
 fn field(line: &str, key: &str) -> String {
     let needle = format!("\"{key}\":");
-    let start = line.find(&needle).unwrap_or_else(|| panic!("no {key} in {line}")) + needle.len();
+    let start = line
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + needle.len();
     let rest = &line[start..];
     if let Some(stripped) = rest.strip_prefix('"') {
         let end = stripped.find('"').expect("unterminated string value");
@@ -254,7 +285,9 @@ fn field(line: &str, key: &str) -> String {
 /// `nonce` instead.
 fn audit_for_seq(instance_dir: &std::path::Path, seq: u64) -> Option<String> {
     let want = format!("\"seq\":{seq},");
-    audit_lines(instance_dir).into_iter().find(|l| l.contains(&want))
+    audit_lines(instance_dir)
+        .into_iter()
+        .find(|l| l.contains(&want))
 }
 
 /// The record for a given nonce and origin — used on the leader for a
@@ -271,7 +304,11 @@ fn audit_for_nonce(instance_dir: &std::path::Path, nonce: u64, origin: &str) -> 
 fn assert_record(line: &str, actor: &str, outcome: &str, reason: u32) {
     assert_eq!(field(line, "actor"), actor, "actor in {line}");
     assert_eq!(field(line, "outcome"), outcome, "outcome in {line}");
-    assert_eq!(field(line, "reason"), reason.to_string(), "reason in {line}");
+    assert_eq!(
+        field(line, "reason"),
+        reason.to_string(),
+        "reason in {line}"
+    );
     assert_eq!(field(line, "event"), "admin_op", "event in {line}");
 }
 
@@ -329,7 +366,12 @@ fn admin_request(
             expiry_ns: unix_ns() + 60_000_000_000,
             key_name_hash: 0xdead_beef_dead_beef,
         }),
-        Auth::Signed { key, ttl, corrupt_tag, expiry_override } => {
+        Auth::Signed {
+            key,
+            ttl,
+            corrupt_tag,
+            expiry_override,
+        } => {
             let meta = cnc.meta();
             let expiry_ns = expiry_override.unwrap_or_else(|| unix_ns() + ttl.as_nanos() as u64);
             let m = AdminMessage {
@@ -347,11 +389,22 @@ fn admin_request(
             if corrupt_tag {
                 tag[0] ^= 0x01;
             }
-            cnc.write_admin_auth(&AdminAuth { tag, expiry_ns, key_name_hash: key.name_hash });
+            cnc.write_admin_auth(&AdminAuth {
+                tag,
+                expiry_ns,
+                key_name_hash: key.name_hash,
+            });
         }
     }
 
-    let req = AdminReq { seq, nonce, op, id, ip, port };
+    let req = AdminReq {
+        seq,
+        nonce,
+        op,
+        id,
+        ip,
+        port,
+    };
     cnc.write_admin_req(&req);
 
     let deadline = deadline_secs(10);
@@ -368,7 +421,10 @@ fn admin_request(
             });
             return (req, resp, line);
         }
-        assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+        assert!(
+            Instant::now() < deadline,
+            "admin response timed out for seq {seq}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -376,7 +432,10 @@ fn admin_request(
 /// A fresh learner id/address per call, so no test's op collides with
 /// another's inside the same cluster.
 fn fresh_learner(n: u32) -> (u32, (u32, u16)) {
-    (100 + n, (u32::from_be_bytes([127, 0, 0, 1]), 59_100 + n as u16))
+    (
+        100 + n,
+        (u32::from_be_bytes([127, 0, 0, 1]), 59_100 + n as u16),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +453,11 @@ fn filesystem_policy_ignores_the_auth_line() {
     // (a) no auth line at all — today's behaviour, unchanged.
     let (id, addr) = fresh_learner(1);
     let (_, resp, line) = admin_request(&cnc, &dir, OP_ADD_LEARNER, id, addr, Auth::None);
-    assert_eq!(resp.status, 0, "unsigned request refused under Filesystem: reason {}", resp.reason);
+    assert_eq!(
+        resp.status, 0,
+        "unsigned request refused under Filesystem: reason {}",
+        resp.reason
+    );
     // Nothing authenticated the operator — the directory's permissions were
     // the whole boundary, and the record says exactly that.
     assert_record(&line, "filesystem", "accepted", 0);
@@ -415,7 +478,11 @@ fn filesystem_policy_ignores_the_auth_line() {
     );
     assert_eq!(field(&line, "actor"), "filesystem", "{line}");
 
-    assert_eq!(audit_lines(&dir).len(), 2, "one record per request, no more");
+    assert_eq!(
+        audit_lines(&dir).len(),
+        2,
+        "one record per request, no more"
+    );
     c.stop();
 }
 
@@ -473,8 +540,15 @@ fn hmac_policy_accepts_a_valid_signature() {
             expiry_override: None,
         },
     );
-    assert_eq!(resp.status, 0, "a validly signed add-learner was refused: reason {}", resp.reason);
-    assert_eq!(resp.version, 1, "the accepted change bumped the config version");
+    assert_eq!(
+        resp.status, 0,
+        "a validly signed add-learner was refused: reason {}",
+        resp.reason
+    );
+    assert_eq!(
+        resp.version, 1,
+        "the accepted change bumped the config version"
+    );
     // The audit names the KEY that signed it — this is the row that makes the
     // log worth keeping: "ops-test added learner N at 15:04".
     assert_record(&line, "ops-test", "accepted", 0);
@@ -511,7 +585,11 @@ fn bad_tag_is_refused() {
     assert_eq!(resp.status, 1);
     assert_eq!(resp.reason, REASON_AUTH_BAD_TAG);
     assert_record(&line, "unverified", "refused", REASON_AUTH_BAD_TAG);
-    assert_eq!(c.nodes[leader].node().config_version(), 0, "nothing was proposed");
+    assert_eq!(
+        c.nodes[leader].node().config_version(),
+        0,
+        "nothing was proposed"
+    );
 
     c.stop();
 }
@@ -542,7 +620,10 @@ fn expired_is_refused() {
         },
     );
     assert_eq!(resp.status, 1);
-    assert_eq!(resp.reason, REASON_AUTH_EXPIRED, "an already-expired request must be refused");
+    assert_eq!(
+        resp.reason, REASON_AUTH_EXPIRED,
+        "an already-expired request must be refused"
+    );
     assert_record(&line, "unverified", "refused", REASON_AUTH_EXPIRED);
 
     // (b) the other side of the window: a far-future expiry (a clock game)
@@ -566,11 +647,18 @@ fn expired_is_refused() {
         },
     );
     assert_eq!(resp.status, 1);
-    assert_eq!(resp.reason, REASON_AUTH_EXPIRED, "a far-future expiry must be refused");
+    assert_eq!(
+        resp.reason, REASON_AUTH_EXPIRED,
+        "a far-future expiry must be refused"
+    );
     assert_record(&line, "unverified", "refused", REASON_AUTH_EXPIRED);
 
     assert_eq!(audit_lines(&dir).len(), 2, "both refusals are on disk");
-    assert_eq!(c.nodes[leader].node().config_version(), 0, "nothing was proposed");
+    assert_eq!(
+        c.nodes[leader].node().config_version(),
+        0,
+        "nothing was proposed"
+    );
     c.stop();
 }
 
@@ -604,7 +692,11 @@ fn unknown_key_is_refused() {
     // not verify, or an audit reader could be steered by an attacker's own
     // choice of key name.
     assert_record(&line, "unverified", "refused", REASON_AUTH_UNKNOWN_KEY);
-    assert_eq!(c.nodes[leader].node().config_version(), 0, "nothing was proposed");
+    assert_eq!(
+        c.nodes[leader].node().config_version(),
+        0,
+        "nothing was proposed"
+    );
 
     c.stop();
 }
@@ -639,7 +731,11 @@ fn a_replayed_request_cannot_be_re_presented() {
             expiry_override: None,
         },
     );
-    assert_eq!(resp.status, 0, "setup: the first presentation is accepted (reason {})", resp.reason);
+    assert_eq!(
+        resp.status, 0,
+        "setup: the first presentation is accepted (reason {})",
+        resp.reason
+    );
     assert_record(&line, "ops-test", "accepted", 0);
     let version_after = c.nodes[leader].node().config_version();
     let audit_before = audit_lines(&dir);
@@ -660,11 +756,20 @@ fn a_replayed_request_cannot_be_re_presented() {
         version_after,
         "the replayed request must not have been applied a second time"
     );
-    let now = cnc.read_admin_resp(req.seq).expect("the original answer is still there");
-    assert_eq!(now, resp, "the replay produced no second answer — the request was never re-read");
+    let now = cnc
+        .read_admin_resp(req.seq)
+        .expect("the original answer is still there");
+    assert_eq!(
+        now, resp,
+        "the replay produced no second answer — the request was never re-read"
+    );
     // And nothing new was recorded: a request that is never read is never
     // answered, so there is nothing to account for.
-    assert_eq!(audit_lines(&dir), audit_before, "the replay produced a second audit record");
+    assert_eq!(
+        audit_lines(&dir),
+        audit_before,
+        "the replay produced a second audit record"
+    );
 
     c.stop();
 }
@@ -717,11 +822,22 @@ fn a_capture_replayed_after_a_restart_is_refused() {
         OP_ADD_LEARNER,
         id,
         addr,
-        Auth::Signed { key: &key, ttl: TTL, corrupt_tag: false, expiry_override: None },
+        Auth::Signed {
+            key: &key,
+            ttl: TTL,
+            corrupt_tag: false,
+            expiry_override: None,
+        },
     );
-    assert_eq!(resp.status, 0, "setup: the capture must be of an ACCEPTED request");
+    assert_eq!(
+        resp.status, 0,
+        "setup: the capture must be of an ACCEPTED request"
+    );
     let captured_auth = cnc.read_admin_auth();
-    assert!(!captured_auth.is_zero(), "setup: a signed auth line was captured");
+    assert!(
+        !captured_auth.is_zero(),
+        "setup: a signed auth line was captured"
+    );
     drop(cnc);
 
     // 2. The restart. `last_admin_seq` goes back to 0 and the page is
@@ -753,10 +869,16 @@ fn a_capture_replayed_after_a_restart_is_refused() {
         if let Some(r) = cnc.read_admin_resp(req.seq) {
             break r;
         }
-        assert!(Instant::now() < deadline, "the replayed request was never answered");
+        assert!(
+            Instant::now() < deadline,
+            "the replayed request was never answered"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(replayed.status, 1, "the replay must be refused, not applied");
+    assert_eq!(
+        replayed.status, 1,
+        "the replay must be refused, not applied"
+    );
     assert_eq!(
         replayed.reason, REASON_AUTH_BAD_TAG,
         "the tag is bound to the node's boot-time instance_id, so it cannot verify"
@@ -794,10 +916,16 @@ fn forge_instance_id(instance_dir: &std::path::Path, instance_id: u128) {
         .write(true)
         .open(instance_dir.join("cnc2.dat"))
         .expect("open cnc2.dat for the forgery");
-    f.write_all_at(&(instance_id as u64).to_le_bytes(), CNC_OFF_INSTANCE_LO as u64)
-        .expect("write instance_id lo");
-    f.write_all_at(&((instance_id >> 64) as u64).to_le_bytes(), CNC_OFF_INSTANCE_HI as u64)
-        .expect("write instance_id hi");
+    f.write_all_at(
+        &(instance_id as u64).to_le_bytes(),
+        CNC_OFF_INSTANCE_LO as u64,
+    )
+    .expect("write instance_id lo");
+    f.write_all_at(
+        &((instance_id >> 64) as u64).to_le_bytes(),
+        CNC_OFF_INSTANCE_HI as u64,
+    )
+    .expect("write instance_id hi");
 }
 
 /// The point of verifying FIRST: a follower must refuse an unauthenticated
@@ -809,7 +937,9 @@ fn follower_verifies_before_forwarding() {
     let _g = serialize();
     let c = spawn_cluster(3, hmac_policy());
     let leader = await_single_leader(&c.nodes, 20);
-    let follower = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
+    let follower = (0..c.nodes.len())
+        .find(|&i| i != leader)
+        .expect("a follower exists");
 
     let leader_version_before = c.nodes[leader].node().config_version();
     let dir = c.nodes[follower].instance_dir.clone();
@@ -817,7 +947,10 @@ fn follower_verifies_before_forwarding() {
     let (id, addr) = fresh_learner(1);
     let (_, resp, line) = admin_request(&cnc, &dir, OP_ADD_LEARNER, id, addr, Auth::None);
 
-    assert_eq!(resp.status, 1, "the follower must refuse, not forward and not retry");
+    assert_eq!(
+        resp.status, 1,
+        "the follower must refuse, not forward and not retry"
+    );
     assert_eq!(resp.reason, REASON_AUTH_MISSING);
     assert_eq!(
         c.nodes[leader].node().config_version(),
@@ -849,7 +982,9 @@ fn a_forwarded_request_is_recorded_on_both_nodes() {
     let _g = serialize();
     let c = spawn_cluster(3, hmac_policy());
     let leader = await_single_leader(&c.nodes, 20);
-    let follower = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
+    let follower = (0..c.nodes.len())
+        .find(|&i| i != leader)
+        .expect("a follower exists");
     let key = test_key();
 
     let fdir = c.nodes[follower].instance_dir.clone();
@@ -868,16 +1003,28 @@ fn a_forwarded_request_is_recorded_on_both_nodes() {
             OP_ADD_LEARNER,
             id,
             addr,
-            Auth::Signed { key: &key, ttl: TTL, corrupt_tag: false, expiry_override: None },
+            Auth::Signed {
+                key: &key,
+                ttl: TTL,
+                corrupt_tag: false,
+                expiry_override: None,
+            },
         );
         if got.1.status != 2 {
             break got;
         }
         assert_record(&got.2, "ops-test", "retry", 0);
-        assert!(Instant::now() < deadline, "the follower never learned a leader hint");
+        assert!(
+            Instant::now() < deadline,
+            "the follower never learned a leader hint"
+        );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert_eq!(resp.status, 0, "the forwarded add-learner was refused: reason {}", resp.reason);
+    assert_eq!(
+        resp.status, 0,
+        "the forwarded add-learner was refused: reason {}",
+        resp.reason
+    );
 
     // The follower's record: the operator, locally submitted.
     assert_record(&line, "ops-test", "accepted", 0);
@@ -901,7 +1048,12 @@ fn a_forwarded_request_is_recorded_on_both_nodes() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_record(&lline, &format!("peer:{}", c.nodes[follower].id), "accepted", 0);
+    assert_record(
+        &lline,
+        &format!("peer:{}", c.nodes[follower].id),
+        "accepted",
+        0,
+    );
     assert_eq!(field(&lline, "seq"), "0", "{lline}");
     assert_eq!(field(&lline, "op_name"), "add_learner");
     assert_eq!(field(&lline, "config_version"), resp.version.to_string());

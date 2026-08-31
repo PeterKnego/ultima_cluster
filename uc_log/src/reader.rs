@@ -24,9 +24,7 @@
 
 use std::sync::Arc;
 
-use uc_protocol::v2::frame::{
-    self, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN, align_frame_len,
-};
+use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN, align_frame_len};
 
 use crate::buffer::{LogBuffer, SliceRead};
 
@@ -59,7 +57,11 @@ pub enum Batch<'a> {
 
 impl LogFollower {
     pub fn new(buffer: Arc<LogBuffer>, cursor: u64) -> Self {
-        Self { buffer, cursor, buf: Vec::new() }
+        Self {
+            buffer,
+            cursor,
+            buf: Vec::new(),
+        }
     }
 
     /// Read the next run of committed frames whose END position is `<= target`.
@@ -70,7 +72,10 @@ impl LogFollower {
         }
         let remaining = target - self.cursor;
         let max_bytes = (remaining as usize).min(MAX_RUN_BYTES);
-        let run = match self.buffer.read_run_validated(self.cursor, max_bytes, &mut self.buf) {
+        let run = match self
+            .buffer
+            .read_run_validated(self.cursor, max_bytes, &mut self.buf)
+        {
             SliceRead::Run(r) => r,
             SliceRead::NotCommitted => return Batch::CaughtUp,
             SliceRead::Overrun => return Batch::Overrun,
@@ -160,7 +165,11 @@ mod tests {
             buffer_bytes: CAP,
             max_payload: 256,
         });
-        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), Arc::clone(&cnc), 256));
+        let b = Arc::new(LogBuffer::new(
+            Region::heap_zeroed(CAP as usize),
+            Arc::clone(&cnc),
+            256,
+        ));
         (b, cnc)
     }
 
@@ -184,7 +193,10 @@ mod tests {
             }
             _ => panic!("expected Frames"),
         }
-        assert_eq!(f.cursor, 96, "cursor stopped exactly at the guarding frame's start");
+        assert_eq!(
+            f.cursor, 96,
+            "cursor stopped exactly at the guarding frame's start"
+        );
 
         // Raising the target to the full frontier yields the remaining two.
         match f.next_batch(288) {
@@ -238,7 +250,10 @@ mod tests {
             Batch::Frames(it) => assert_eq!(it.count(), 0, "padding is never yielded"),
             _ => panic!("expected Frames"),
         }
-        assert_eq!(f.cursor, 4096, "cursor advanced over the full padding span, not just 32 B");
+        assert_eq!(
+            f.cursor, 4096,
+            "cursor advanced over the full padding span, not just 32 B"
+        );
 
         // The post-wrap frame comes as its own run.
         match f.next_batch(4192) {
@@ -268,7 +283,13 @@ mod tests {
         let mut a = Appender::new(Arc::clone(&b), 1);
         a.append(1, 0, &[0u8; 64]).unwrap();
         let mut f = LogFollower::new(Arc::clone(&b), 96);
-        assert!(matches!(f.next_batch(96), Batch::CaughtUp), "cursor == target");
-        assert!(matches!(f.next_batch(32), Batch::CaughtUp), "cursor > target");
+        assert!(
+            matches!(f.next_batch(96), Batch::CaughtUp),
+            "cursor == target"
+        );
+        assert!(
+            matches!(f.next_batch(32), Batch::CaughtUp),
+            "cursor > target"
+        );
     }
 }

@@ -55,7 +55,9 @@ pub enum ClientError {
     /// [`ClientError::Timeout`] instead). Retained for API compatibility —
     /// external matchers (`lincheck_v2/mod.rs`, `hard_crash.rs`, the m6/m7
     /// gates) still match on it and treat it identically to `Timeout`.
-    #[error("response overwritten: consumer fell behind the broadcast ring (lapped, unknown losses)")]
+    #[error(
+        "response overwritten: consumer fell behind the broadcast ring (lapped, unknown losses)"
+    )]
     ResponseOverwritten,
     #[error("ingress backpressure: ring stayed full past the retry window")]
     BackpressureFull,
@@ -101,7 +103,9 @@ impl From<CncError> for ClientError {
             CncError::AppIdMismatch { expected, actual } => {
                 ClientError::AppIdMismatch { expected, actual }
             }
-            CncError::VersionMismatch { local, peer } => ClientError::VersionMismatch { local, peer },
+            CncError::VersionMismatch { local, peer } => {
+                ClientError::VersionMismatch { local, peer }
+            }
             other => ClientError::Cnc(other),
         }
     }
@@ -120,7 +124,10 @@ mod tests {
         assert!(matches!(e, ClientError::AppIdMismatch { .. }));
 
         let e = ClientError::from(CncError::VersionMismatch { local: 1, peer: 2 });
-        assert!(matches!(e, ClientError::VersionMismatch { local: 1, peer: 2 }));
+        assert!(matches!(
+            e,
+            ClientError::VersionMismatch { local: 1, peer: 2 }
+        ));
     }
 
     #[test]

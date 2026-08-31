@@ -824,12 +824,17 @@ impl SharedTransport {
     /// Same contract as [`Transport::new`]: `Disabled` yields `Ok(None)`;
     /// `Enabled` loads identity/allowlist from disk (boot refusal on
     /// failure) and mints a fresh per-process `boot_salt` from the OS RNG.
-    pub fn new(cfg: &CryptoConfig, self_id: NodeId) -> Result<Option<SharedTransport>, CryptoError> {
+    pub fn new(
+        cfg: &CryptoConfig,
+        self_id: NodeId,
+    ) -> Result<Option<SharedTransport>, CryptoError> {
         let (key_path, allowlist_path, rotation) = match cfg {
             CryptoConfig::Disabled => return Ok(None),
-            CryptoConfig::Enabled { key_path, allowlist_path, rotation } => {
-                (key_path, allowlist_path, *rotation)
-            }
+            CryptoConfig::Enabled {
+                key_path,
+                allowlist_path,
+                rotation,
+            } => (key_path, allowlist_path, *rotation),
         };
 
         let identity = Identity::load(key_path)?;
@@ -974,8 +979,11 @@ impl SharedTransport {
         // an excluded peer is picked up by `peers_missing_key` once its session
         // exists. Computed under the SAME lock as the mint, so the gate cannot
         // be decided against a session set that changes underneath it.
-        let gate_on: Vec<NodeId> =
-            peers.iter().copied().filter(|&p| ks.peers.is_established(p)).collect();
+        let gate_on: Vec<NodeId> = peers
+            .iter()
+            .copied()
+            .filter(|&p| ks.peers.is_established(p))
+            .collect();
         ks.group.mint_gated(peers, &gate_on, now_ns)
     }
 
@@ -988,7 +996,11 @@ impl SharedTransport {
     /// Forwards to [`RotationState::on_committed_config`] — see
     /// [`Transport::on_committed_config`]'s doc.
     pub fn on_committed_config(&self, tombstone_count: usize) {
-        self.key.lock().unwrap().rotation.on_committed_config(tombstone_count);
+        self.key
+            .lock()
+            .unwrap()
+            .rotation
+            .on_committed_config(tombstone_count);
     }
 
     /// Forwards to [`RotationState::take_due`] — see
@@ -1000,7 +1012,11 @@ impl SharedTransport {
     /// Forwards to [`Peers::allowlist_reload_if_stale`] — see
     /// [`Transport::allowlist_reload_if_stale`]'s doc.
     pub fn allowlist_reload_if_stale(&self, now_ns: u64) -> Result<bool, CryptoError> {
-        self.key.lock().unwrap().peers.allowlist_reload_if_stale(now_ns)
+        self.key
+            .lock()
+            .unwrap()
+            .peers
+            .allowlist_reload_if_stale(now_ns)
     }
 
     // ---- T11 plan gap: handshake driving was unreachable from outside this
@@ -1046,7 +1062,11 @@ impl SharedTransport {
         body: &[u8],
         now_ns: u64,
     ) -> Vec<HandshakeAction> {
-        self.key.lock().unwrap().peers.on_message(from, kind, body, now_ns)
+        self.key
+            .lock()
+            .unwrap()
+            .peers
+            .on_message(from, kind, body, now_ns)
     }
 
     /// Forwards to [`Peers::tick`] — the monotonic maintenance tick that
@@ -1155,7 +1175,11 @@ impl SharedTransport {
                     return Err(CryptoError::MissingPeer(kind));
                 };
                 let counter = next_counter(&self.counter);
-                self.key.lock().unwrap().peers.seal_pairwise(peer, buf, counter)
+                self.key
+                    .lock()
+                    .unwrap()
+                    .peers
+                    .seal_pairwise(peer, buf, counter)
             }
             Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
         }
@@ -1185,10 +1209,17 @@ impl SharedTransport {
             return Err(CryptoError::TooShort);
         }
         let mut key = self.key.lock().unwrap();
-        let epoch = key.group.sealing_epoch(now_ns).ok_or(CryptoError::NoGroupKey)?;
+        let epoch = key
+            .group
+            .sealing_epoch(now_ns)
+            .ok_or(CryptoError::NoGroupKey)?;
         // `sealing_epoch` and `schedule().get(epoch)` CAN disagree (T9 review
         // F3): resolve the key BEFORE touching `buf`.
-        let group_key = key.group.schedule().get(epoch).ok_or(CryptoError::NoGroupKey)?;
+        let group_key = key
+            .group
+            .schedule()
+            .get(epoch)
+            .ok_or(CryptoError::NoGroupKey)?;
         let send_key: Zeroizing<[u8; 32]> =
             Zeroizing::new(derive_send_key(group_key, self.self_id, &self.boot_salt));
         let cipher = Aes256Gcm::new(GenericArray::from_slice(&*send_key));
@@ -1278,7 +1309,11 @@ impl SendHalf {
                     return Err(CryptoError::MissingPeer(kind));
                 };
                 let counter = next_counter(&self.counter);
-                self.key.lock().unwrap().peers.seal_pairwise(peer, buf, counter)
+                self.key
+                    .lock()
+                    .unwrap()
+                    .peers
+                    .seal_pairwise(peer, buf, counter)
             }
             Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
         }
@@ -1289,7 +1324,10 @@ impl SendHalf {
             return Err(CryptoError::TooShort);
         }
         let mut key = self.key.lock().unwrap();
-        let epoch = key.group.sealing_epoch(now_ns).ok_or(CryptoError::NoGroupKey)?;
+        let epoch = key
+            .group
+            .sealing_epoch(now_ns)
+            .ok_or(CryptoError::NoGroupKey)?;
 
         // Same ordering discipline as Transport::seal_group (T9 review F3):
         // the fallible cipher/key lookup MUST resolve before `buf` is
@@ -1401,14 +1439,25 @@ impl ReceiveHalf {
         };
         match Transport::scope_of(header.kind) {
             Scope::Group => self.open_group(from, header.key_epoch, buf),
-            Scope::Pairwise => self.key.lock().unwrap().peers.open_pairwise(from, buf).map(|_counter| ()),
+            Scope::Pairwise => self
+                .key
+                .lock()
+                .unwrap()
+                .peers
+                .open_pairwise(from, buf)
+                .map(|_counter| ()),
             Scope::Unsealed => Err(CryptoError::UnsealedKind(header.kind)),
         }
     }
 
     /// Same contract and salt-trial behavior as [`Transport::open_group`] —
     /// see that method's doc for the full F1/F2 (T9 review round 1) account.
-    fn open_group(&mut self, from: NodeId, epoch: u16, buf: &mut Vec<u8>) -> Result<(), CryptoError> {
+    fn open_group(
+        &mut self,
+        from: NodeId,
+        epoch: u16,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
         let mut key = self.key.lock().unwrap();
         if key.group.schedule().get(epoch).is_none() {
             return Err(CryptoError::NoGroupKey);
@@ -1420,7 +1469,13 @@ impl ReceiveHalf {
             match Self::open_group_under_salt(&key.group, from, epoch, &salt, buf) {
                 Ok(counter) => {
                     drop(key);
-                    return Self::finish_group_open(&mut self.group_replay, from, epoch, salt, counter);
+                    return Self::finish_group_open(
+                        &mut self.group_replay,
+                        from,
+                        epoch,
+                        salt,
+                        counter,
+                    );
                 }
                 Err(e) => last_err = e,
             }
@@ -1431,7 +1486,13 @@ impl ReceiveHalf {
                 Ok(counter) => {
                     key.peers.promote_pending(from);
                     drop(key);
-                    return Self::finish_group_open(&mut self.group_replay, from, epoch, salt, counter);
+                    return Self::finish_group_open(
+                        &mut self.group_replay,
+                        from,
+                        epoch,
+                        salt,
+                        counter,
+                    );
                 }
                 Err(e) => last_err = e,
             }
@@ -1517,7 +1578,12 @@ impl ReceiveHalf {
     /// [`CryptoError::UnsealedKind`] — same contract as [`open`]; the caller
     /// must route these to the handshake driver without calling this at
     /// all (see [`SharedTransport::on_handshake_message`]).
-    pub fn open_slice(&mut self, from: NodeId, buf: &mut [u8], n: usize) -> Result<usize, CryptoError> {
+    pub fn open_slice(
+        &mut self,
+        from: NodeId,
+        buf: &mut [u8],
+        n: usize,
+    ) -> Result<usize, CryptoError> {
         if n < DATAGRAM_HEADER_LEN {
             return Err(CryptoError::TooShort);
         }
@@ -1602,7 +1668,11 @@ impl ReceiveHalf {
     /// `Scope::Pairwise` branch of [`ReceiveHalf::open_slice`] — see that
     /// method's doc and [`ReceiveHalf::pairwise_scratch`]'s field doc for
     /// why this copies rather than decrypting truly in place.
-    fn open_pairwise_via_scratch(&mut self, from: NodeId, buf: &mut [u8]) -> Result<usize, CryptoError> {
+    fn open_pairwise_via_scratch(
+        &mut self,
+        from: NodeId,
+        buf: &mut [u8],
+    ) -> Result<usize, CryptoError> {
         self.pairwise_scratch.clear();
         self.pairwise_scratch.extend_from_slice(buf);
         {
@@ -2576,15 +2646,25 @@ mod tests {
             }
             acts = next;
         }
-        assert!(a.key.lock().unwrap().peers.is_established(b_id), "a failed to establish with b");
-        assert!(b.key.lock().unwrap().peers.is_established(a_id), "b failed to establish with a");
+        assert!(
+            a.key.lock().unwrap().peers.is_established(b_id),
+            "a failed to establish with b"
+        );
+        assert!(
+            b.key.lock().unwrap().peers.is_established(a_id),
+            "b failed to establish with a"
+        );
     }
 
     /// Mints a group key on `leader` and delivers it to `follower` — same
     /// shape as [`deliver_group_key`] above, bypassing the pairwise AEAD
     /// layer (this only needs to key-synchronize `GroupPlane`, not re-prove
     /// the handshake layer).
-    fn shared_deliver_group_key(leader: &SharedTransport, follower: &SharedTransport, peers: &[NodeId]) -> u16 {
+    fn shared_deliver_group_key(
+        leader: &SharedTransport,
+        follower: &SharedTransport,
+        peers: &[NodeId],
+    ) -> u16 {
         let (leader_id, follower_id) = (leader.self_id(), follower.self_id());
         let (epoch, actions) = leader.mint_group_key(peers, 0);
         for act in actions {
@@ -2592,12 +2672,22 @@ mod tests {
                 panic!("mint must emit a Send action")
             };
             assert_eq!(to, follower_id);
-            let reply = follower.key.lock().unwrap().group.on_key_message(leader_id, &body);
+            let reply = follower
+                .key
+                .lock()
+                .unwrap()
+                .group
+                .on_key_message(leader_id, &body);
             for r in reply {
                 let HandshakeAction::Send { body: rbody, .. } = r else {
                     panic!("a well-formed delivery must ack back")
                 };
-                leader.key.lock().unwrap().group.on_key_message(follower_id, &rbody);
+                leader
+                    .key
+                    .lock()
+                    .unwrap()
+                    .group
+                    .on_key_message(follower_id, &rbody);
             }
         }
         epoch
@@ -2631,7 +2721,10 @@ mod tests {
         // names on Transport directly; hit for real here on first run).
         let _ = leader.mint_group_key(&[], 0);
         let epoch = shared_deliver_group_key(&leader, &follower, &[2]);
-        assert_ne!(epoch, 0, "fixture should not accidentally observe the zero-init epoch");
+        assert_ne!(
+            epoch, 0,
+            "fixture should not accidentally observe the zero-init epoch"
+        );
 
         let mut send = leader.send_half();
         let mut recv = follower.receive_half();
@@ -2640,7 +2733,8 @@ mod tests {
         let plain = d.clone();
         send.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
         assert_ne!(d, plain, "sealing must actually change the buffer");
-        recv.open(1, &mut d).expect("follower's ReceiveHalf must open what leader's SendHalf sealed");
+        recv.open(1, &mut d)
+            .expect("follower's ReceiveHalf must open what leader's SendHalf sealed");
         // `open` does NOT restore the header's `key_epoch` to whatever the
         // caller staged before sealing -- `seal_group` permanently stamps
         // the REAL epoch it sealed under (by design: the receiver needs to
@@ -2691,7 +2785,8 @@ mod tests {
         let plain = d.clone();
         send.seal(DGRAM_KIND_VOTE, Some(2), &mut d, 0).unwrap();
         assert_ne!(d, plain);
-        recv.open(1, &mut d).expect("b's ReceiveHalf must open what a's SendHalf sealed");
+        recv.open(1, &mut d)
+            .expect("b's ReceiveHalf must open what a's SendHalf sealed");
         assert_eq!(d, plain);
     }
 
@@ -2716,8 +2811,14 @@ mod tests {
         // assertion vacuously true either way; the discriminating check is
         // that `t.now_ns()` (the canonical source) also agrees, monotonically.
         let t_ns = t.now_ns();
-        assert!(n2 >= n1, "receive half's clock must not run behind the send half's");
-        assert!(t_ns >= n2, "SharedTransport's own now_ns must not run behind either half's");
+        assert!(
+            n2 >= n1,
+            "receive half's clock must not run behind the send half's"
+        );
+        assert!(
+            t_ns >= n2,
+            "SharedTransport's own now_ns must not run behind either half's"
+        );
         assert!(
             t_ns - n1 < 50_000_000,
             "all three readings must be close together (same origin), not independently-started clocks: {n1} vs {t_ns}"
@@ -2823,9 +2924,21 @@ mod tests {
         let len = recv
             .open_slice(1, &mut oversized, n)
             .expect("slice-based open_slice must succeed identically");
-        assert_eq!(&oversized[..len], &want[..], "open_slice output matches open's Vec output exactly");
-        assert_eq!(oversized[n..], sentinel_tail[..], "nothing past n was ever touched");
-        assert_eq!(oversized.len(), 256, "the buffer's own length is never resized -- it is a slice call");
+        assert_eq!(
+            &oversized[..len],
+            &want[..],
+            "open_slice output matches open's Vec output exactly"
+        );
+        assert_eq!(
+            oversized[n..],
+            sentinel_tail[..],
+            "nothing past n was ever touched"
+        );
+        assert_eq!(
+            oversized.len(),
+            256,
+            "the buffer's own length is never resized -- it is a slice call"
+        );
     }
 
     #[test]
@@ -2854,8 +2967,14 @@ mod tests {
 
         let mut buf = vec![0x33u8; 128];
         buf[..n].copy_from_slice(&d);
-        let len = recv.open_slice(1, &mut buf, n).expect("pairwise open_slice must succeed");
-        assert_eq!(&buf[..len], &plain[..], "pairwise open_slice round-trips byte-exact, like open");
+        let len = recv
+            .open_slice(1, &mut buf, n)
+            .expect("pairwise open_slice must succeed");
+        assert_eq!(
+            &buf[..len],
+            &plain[..],
+            "pairwise open_slice round-trips byte-exact, like open"
+        );
     }
 
     #[test]
@@ -2955,7 +3074,8 @@ mod tests {
         let plain = d.clone();
         send.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
         assert_ne!(d, plain);
-        recv.open(1, &mut d).expect("a session + group key built ENTIRELY through the pub forwarders must open");
+        recv.open(1, &mut d)
+            .expect("a session + group key built ENTIRELY through the pub forwarders must open");
         assert_eq!(&d[DATAGRAM_HEADER_LEN..], &plain[DATAGRAM_HEADER_LEN..]);
     }
 
@@ -2966,12 +3086,17 @@ mod tests {
         let mut v = vec![0u8; DATAGRAM_HEADER_LEN];
         write_datagram_header(
             &mut v,
-            &DatagramHeader { position: 4096, leadership_term_id: 3, kind, flags: 0, key_epoch: 0 },
+            &DatagramHeader {
+                position: 4096,
+                leadership_term_id: 3,
+                kind,
+                flags: 0,
+                key_epoch: 0,
+            },
         );
         v.extend_from_slice(payload);
         v
     }
-
 
     /// The counter is per-PROCESS, not per-`SendHalf`. Before T12 it lived by
     /// value inside `SendHalf`, which was sound only while that half was the
@@ -3004,14 +3129,23 @@ mod tests {
             seen.push(read_counter(&d[DATAGRAM_HEADER_LEN..]));
             // Node layer's path (pairwise scope, control traffic).
             let mut c = staged(DGRAM_KIND_HS_KEY, b"yy");
-            a.seal_pairwise_control(DGRAM_KIND_HS_KEY, 2, &mut c).unwrap();
+            a.seal_pairwise_control(DGRAM_KIND_HS_KEY, 2, &mut c)
+                .unwrap();
             seen.push(read_counter(&c[DATAGRAM_HEADER_LEN..]));
         }
         let mut sorted = seen.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), seen.len(), "a counter repeated across the two paths: {seen:?}");
-        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7, 8], "one interleaved sequence, no gaps");
+        assert_eq!(
+            sorted.len(),
+            seen.len(),
+            "a counter repeated across the two paths: {seen:?}"
+        );
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "one interleaved sequence, no gaps"
+        );
     }
 
     /// A control-path seal is a REAL seal: the peer's `ReceiveHalf` opens it,
@@ -3025,13 +3159,15 @@ mod tests {
         shared_establish(&a, &b);
 
         let mut d = staged(DGRAM_KIND_HS_KEY, b"group-key-body");
-        a.seal_pairwise_control(DGRAM_KIND_HS_KEY, 2, &mut d).unwrap();
+        a.seal_pairwise_control(DGRAM_KIND_HS_KEY, 2, &mut d)
+            .unwrap();
         assert!(
             !d.windows(14).any(|w| w == b"group-key-body"),
             "the body must not be readable on the wire"
         );
         let mut recv = b.receive_half();
-        recv.open(1, &mut d).expect("the peer opens it under the same session");
+        recv.open(1, &mut d)
+            .expect("the peer opens it under the same session");
         assert_eq!(&d[DATAGRAM_HEADER_LEN..], b"group-key-body");
     }
 
@@ -3089,7 +3225,8 @@ mod tests {
             "the group branch must stamp the sealing epoch into the header"
         );
         let mut recv = b.receive_half();
-        recv.open(1, &mut d).expect("the peer opens it on the group path");
+        recv.open(1, &mut d)
+            .expect("the peer opens it on the group path");
         assert_eq!(&d[DATAGRAM_HEADER_LEN..], b"read-probe-body");
     }
 
@@ -3115,7 +3252,8 @@ mod tests {
             seen.push(read_counter(&d[DATAGRAM_HEADER_LEN..]));
 
             let mut g = staged(DGRAM_KIND_COMMIT_POSITION, b"");
-            a.seal_control(DGRAM_KIND_COMMIT_POSITION, None, &mut g, a.now_ns()).unwrap();
+            a.seal_control(DGRAM_KIND_COMMIT_POSITION, None, &mut g, a.now_ns())
+                .unwrap();
             seen.push(read_counter(&g[DATAGRAM_HEADER_LEN..]));
 
             let mut c = staged(DGRAM_KIND_VOTE, b"yy");
@@ -3158,8 +3296,10 @@ mod tests {
         // same bytes any other destination would get.
         let mut with_peer = staged(DGRAM_KIND_READ_PROBE, b"probe");
         let mut without = staged(DGRAM_KIND_READ_PROBE, b"probe");
-        a.seal_control(DGRAM_KIND_READ_PROBE, Some(2), &mut with_peer, a.now_ns()).unwrap();
-        a.seal_control(DGRAM_KIND_READ_PROBE, Some(9), &mut without, a.now_ns()).unwrap();
+        a.seal_control(DGRAM_KIND_READ_PROBE, Some(2), &mut with_peer, a.now_ns())
+            .unwrap();
+        a.seal_control(DGRAM_KIND_READ_PROBE, Some(9), &mut without, a.now_ns())
+            .unwrap();
         assert_eq!(
             read_datagram_header(&with_peer).unwrap().key_epoch,
             read_datagram_header(&without).unwrap().key_epoch,
@@ -3181,6 +3321,9 @@ mod tests {
             a.seal_control(DGRAM_KIND_COMMIT_POSITION, None, &mut d, a.now_ns()),
             Err(CryptoError::NoGroupKey)
         ));
-        assert_eq!(d, before, "a failed seal must not mutate the staged datagram");
+        assert_eq!(
+            d, before,
+            "a failed seal must not mutate the staged datagram"
+        );
     }
 }

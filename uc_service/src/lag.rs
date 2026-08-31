@@ -46,23 +46,35 @@ pub(crate) fn plan(mode: LagMode, floor: u64, cursor: u64, commit: u64, durable:
     let head = commit.min(durable);
     if cursor >= head {
         // Nothing new anyway — never report a wait for the log's own idleness.
-        return Plan::Apply { target: head, one_frame: false };
+        return Plan::Apply {
+            target: head,
+            one_frame: false,
+        };
     }
     match mode {
-        LagMode::Off => Plan::Apply { target: head, one_frame: false },
+        LagMode::Off => Plan::Apply {
+            target: head,
+            one_frame: false,
+        },
         LagMode::Bounded(lag) => {
             let cap = floor.saturating_add(lag);
             if cap <= cursor {
                 Plan::Wait
             } else {
-                Plan::Apply { target: head.min(cap), one_frame: false }
+                Plan::Apply {
+                    target: head.min(cap),
+                    one_frame: false,
+                }
             }
         }
         LagMode::Lockstep => {
             if cursor > floor {
                 Plan::Wait
             } else {
-                Plan::Apply { target: head, one_frame: true }
+                Plan::Apply {
+                    target: head,
+                    one_frame: true,
+                }
             }
         }
     }
@@ -76,35 +88,101 @@ mod tests {
 
     #[test]
     fn off_is_todays_behaviour() {
-        assert_eq!(plan(LagMode::Off, 0, 1_000, HEAD, HEAD), Plan::Apply { target: HEAD, one_frame: false });
-        assert_eq!(plan(LagMode::Off, 0, HEAD, HEAD, HEAD), Plan::Apply { target: HEAD, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Off, 0, 1_000, HEAD, HEAD),
+            Plan::Apply {
+                target: HEAD,
+                one_frame: false
+            }
+        );
+        assert_eq!(
+            plan(LagMode::Off, 0, HEAD, HEAD, HEAD),
+            Plan::Apply {
+                target: HEAD,
+                one_frame: false
+            }
+        );
     }
 
     #[test]
     fn head_is_min_commit_durable_in_every_mode() {
-        assert_eq!(plan(LagMode::Off, 0, 0, 5_000, 7_000), Plan::Apply { target: 5_000, one_frame: false });
-        assert_eq!(plan(LagMode::Bounded(1 << 20), 0, 0, 7_000, 5_000), Plan::Apply { target: 5_000, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Off, 0, 0, 5_000, 7_000),
+            Plan::Apply {
+                target: 5_000,
+                one_frame: false
+            }
+        );
+        assert_eq!(
+            plan(LagMode::Bounded(1 << 20), 0, 0, 7_000, 5_000),
+            Plan::Apply {
+                target: 5_000,
+                one_frame: false
+            }
+        );
     }
 
     #[test]
     fn bounded_caps_the_target_at_floor_plus_lag() {
         // I am ahead of the floor by 1000 with a 4096 bound: 3096 more bytes may apply.
-        assert_eq!(plan(LagMode::Bounded(4096), 2_000, 3_000, HEAD, HEAD), Plan::Apply { target: 6_096, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Bounded(4096), 2_000, 3_000, HEAD, HEAD),
+            Plan::Apply {
+                target: 6_096,
+                one_frame: false
+            }
+        );
         // Cap above head: head wins.
-        assert_eq!(plan(LagMode::Bounded(1 << 20), 2_000, 3_000, HEAD, HEAD), Plan::Apply { target: HEAD, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Bounded(1 << 20), 2_000, 3_000, HEAD, HEAD),
+            Plan::Apply {
+                target: HEAD,
+                one_frame: false
+            }
+        );
         // Exactly at the bound: nothing can fit → wait.
-        assert_eq!(plan(LagMode::Bounded(4096), 2_000, 6_096, HEAD, HEAD), Plan::Wait);
+        assert_eq!(
+            plan(LagMode::Bounded(4096), 2_000, 6_096, HEAD, HEAD),
+            Plan::Wait
+        );
         // I AM the floor: the bound is measured from me.
-        assert_eq!(plan(LagMode::Bounded(4096), 3_000, 3_000, HEAD, HEAD), Plan::Apply { target: 7_096, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Bounded(4096), 3_000, 3_000, HEAD, HEAD),
+            Plan::Apply {
+                target: 7_096,
+                one_frame: false
+            }
+        );
         // Caught up with head: never Wait, always the plain CaughtUp path.
-        assert_eq!(plan(LagMode::Bounded(4096), 2_000, HEAD, HEAD, HEAD), Plan::Apply { target: HEAD, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Bounded(4096), 2_000, HEAD, HEAD, HEAD),
+            Plan::Apply {
+                target: HEAD,
+                one_frame: false
+            }
+        );
     }
 
     #[test]
     fn lockstep_applies_one_frame_only_at_the_floor() {
-        assert_eq!(plan(LagMode::Lockstep, 3_000, 3_000, HEAD, HEAD), Plan::Apply { target: HEAD, one_frame: true });
-        assert_eq!(plan(LagMode::Lockstep, 3_000, 3_128, HEAD, HEAD), Plan::Wait);
-        assert_eq!(plan(LagMode::Lockstep, 3_000, HEAD, HEAD, HEAD), Plan::Apply { target: HEAD, one_frame: false });
+        assert_eq!(
+            plan(LagMode::Lockstep, 3_000, 3_000, HEAD, HEAD),
+            Plan::Apply {
+                target: HEAD,
+                one_frame: true
+            }
+        );
+        assert_eq!(
+            plan(LagMode::Lockstep, 3_000, 3_128, HEAD, HEAD),
+            Plan::Wait
+        );
+        assert_eq!(
+            plan(LagMode::Lockstep, 3_000, HEAD, HEAD, HEAD),
+            Plan::Apply {
+                target: HEAD,
+                one_frame: false
+            }
+        );
     }
 
     #[test]
@@ -118,7 +196,11 @@ mod tests {
     #[test]
     fn floor_is_the_min_over_declared_slots() {
         let page = uc_log::cnc::CncPage::heap(&uc_log::cnc::CncMeta {
-            node_id: 1, instance_id: 7, app_id: "t".into(), buffer_bytes: 1 << 20, max_payload: 256,
+            node_id: 1,
+            instance_id: 7,
+            app_id: "t".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
         });
         page.service_slot(0).applied.store_release(900);
         page.service_slot(1).applied.store_release(300);

@@ -24,11 +24,11 @@ use serde::{Deserialize, Serialize};
 use uc_client::{Client, ClientError};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::ipc::{
-    client_from_extra, extra_client, MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SVC_QUERY,
+    MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra, extra_client,
 };
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 // ------------------------------------------------------------- the state machine
 
@@ -126,7 +126,10 @@ fn reads_return_the_applied_total() {
     // the service to catch up to the read's commit position, then answered by
     // the service with the current total.
     let lin: u64 = client.query_linearizable(&()).unwrap();
-    assert_eq!(lin, 10, "linearizable read must see all ten committed applies");
+    assert_eq!(
+        lin, 10,
+        "linearizable read must see all ten committed applies"
+    );
 
     // Snapshot read: forwarded straight to the service (epoch check skipped),
     // reads the live SM total.
@@ -155,20 +158,27 @@ fn stale_epoch_svc_query_gets_retry() {
     wait_until(|| node.can_serve());
 
     // First incarnation: epoch 1.
-    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), "q-epoch"), CountSm::default())
-        .start()
-        .unwrap();
+    let svc1 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), "q-epoch"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
     let old_epoch = svc1.epoch();
     assert_eq!(old_epoch, 1);
     svc1.crash();
 
     // Second incarnation: epoch 2. Subscribe to the service egress BEFORE
     // driving the query so the RETRY answer cannot be missed.
-    let mut egress =
-        BroadcastRing::open(&dir.path().join("egress_service.0.broadcast")).unwrap().subscribe();
-    let svc2 = ServiceBuilder::new(ServiceConfig::new(dir.path(), "q-epoch"), CountSm::default())
-        .start()
-        .unwrap();
+    let mut egress = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
+        .unwrap()
+        .subscribe();
+    let svc2 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), "q-epoch"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
     assert_eq!(svc2.epoch(), 2, "the restarted incarnation bumps the epoch");
     let cnc = uc_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "q-epoch").unwrap();
     wait_until(|| cnc.service_slot(0).epoch.load_acquire() == 2);
@@ -177,13 +187,16 @@ fn stale_epoch_svc_query_gets_retry() {
     // svc_query.ring. Payload = expected_epoch u64 LE ++ query bytes. No client
     // query is in flight, so the node's barrier never produces onto this ring
     // concurrently — the direct write is the sole producer for this window.
-    let (mut producer, _consumer) =
-        SpscRing::open(&dir.path().join("svc_query.0.ring")).unwrap().into_split();
+    let (mut producer, _consumer) = SpscRing::open(&dir.path().join("svc_query.0.ring"))
+        .unwrap()
+        .into_split();
     let query_bytes = bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap();
     let mut payload = old_epoch.to_le_bytes().to_vec();
     payload.extend_from_slice(&query_bytes);
     let extra = extra_client(0x1234_5678, 0x9abc_def0);
-    producer.try_write(MSG_V2_SVC_QUERY, 0, extra, &payload).unwrap();
+    producer
+        .try_write(MSG_V2_SVC_QUERY, 0, extra, &payload)
+        .unwrap();
 
     // The service answers with MSG_V2_RETRY addressed to our (client_id,
     // local_seq), and NEVER a MSG_V2_RESPONSE (a stale answer would be a
@@ -192,7 +205,10 @@ fn stale_epoch_svc_query_gets_retry() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut got_retry = false;
     while !got_retry {
-        assert!(Instant::now() < deadline, "no RETRY for the stale-epoch query");
+        assert!(
+            Instant::now() < deadline,
+            "no RETRY for the stale-epoch query"
+        );
         match egress.try_read(&mut buf) {
             Ok(Some(rec)) if client_from_extra(rec.header_extra) == (0x1234_5678, 0x9abc_def0) => {
                 assert_ne!(

@@ -17,16 +17,16 @@
 //! crate boundary.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ,
     CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE,
-    CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES,
-    CNC_OFF_FSM_LAG_BYTES, CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS,
-    CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICES_DECLARED,
-    CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
+    CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_FSM_LAG_BYTES,
+    CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS,
+    CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED,
+    CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM,
     CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
     CNC_SVC_STATUS_INCARNATION_SHIFT, CNC_V2_VERSION, CncHeader,
 };
@@ -243,7 +243,11 @@ pub struct AdminAuth {
 }
 
 impl AdminAuth {
-    pub const ZERO: AdminAuth = AdminAuth { tag: [0u8; 32], expiry_ns: 0, key_name_hash: 0 };
+    pub const ZERO: AdminAuth = AdminAuth {
+        tag: [0u8; 32],
+        expiry_ns: 0,
+        key_name_hash: 0,
+    };
 
     pub fn is_zero(&self) -> bool {
         *self == AdminAuth::ZERO
@@ -303,7 +307,11 @@ impl CncPage {
     /// `Region::heap_zeroed` allocates with `align(64)`, and a memory-mapped
     /// file is page-aligned (4096), a stricter multiple of 64).
     fn new(region: Region) -> Self {
-        assert_eq!(region.len(), CNC_PAGE_LEN, "cnc page must be exactly {CNC_PAGE_LEN} bytes");
+        assert_eq!(
+            region.len(),
+            CNC_PAGE_LEN,
+            "cnc page must be exactly {CNC_PAGE_LEN} bytes"
+        );
         let base = unsafe { region.ptr_at(0) } as usize;
         assert_eq!(base % 64, 0, "cnc page base must be 64-byte aligned");
         Self { region }
@@ -351,7 +359,9 @@ impl CncPage {
         page[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
 
         self.status().leader_hint.store_release(u64::MAX);
-        self.status().next_client_id.store_release(gen_unique_client_id_base() as u64);
+        self.status()
+            .next_client_id
+            .store_release(gen_unique_client_id_base() as u64);
     }
 
     /// Validate an attached (not just-created) page: magic/length (via
@@ -362,13 +372,18 @@ impl CncPage {
         let header = cnc::read_cnc_header(page).ok_or(CncError::BadHeader)?;
         let crc_expected = crc32fast::hash(&page[..CNC_OFF_HEADER_CRC]);
         let crc_actual = u32::from_le_bytes(
-            page[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].try_into().unwrap(),
+            page[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4]
+                .try_into()
+                .unwrap(),
         );
         if crc_actual != crc_expected {
             return Err(CncError::BadHeader);
         }
         if !cnc::version_compatible(CNC_V2_VERSION, header.version) {
-            return Err(CncError::VersionMismatch { local: CNC_V2_VERSION, peer: header.version });
+            return Err(CncError::VersionMismatch {
+                local: CNC_V2_VERSION,
+                peer: header.version,
+            });
         }
         let actual_app_id = cnc::read_cnc_app_id(page);
         if actual_app_id != expected_app_id {
@@ -426,7 +441,10 @@ impl CncPage {
     /// (magic/crc/version/app_id). Used by attaching parties (service,
     /// clients, a reconnecting node).
     pub fn open_file(path: &Path, expected_app_id: &str) -> Result<Arc<CncPage>, CncError> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
         // Attach-validation contract: bad magic/len/crc → BadHeader (a typed
         // error, never a panic). The file length here is EXTERNAL input (a
         // torn create_file crash, wrong path, corruption), so it must be
@@ -628,8 +646,7 @@ impl CncPage {
     pub fn ingress_holes_skipped(&self) -> u64 {
         // SAFETY: offset 3968, size 8, 8-byte aligned (3968 % 8 == 0) inside
         // the mapped page; the page base is at least 64-byte aligned.
-        let ptr =
-            unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const AtomicU64 };
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const AtomicU64 };
         unsafe { (*ptr).load(Ordering::Acquire) }
     }
 
@@ -637,8 +654,7 @@ impl CncPage {
     /// consensus agent, on change only.
     pub fn store_ingress_holes_skipped(&self, v: u64) {
         // SAFETY: offset 3968, size 8, 8-byte aligned. See the getter.
-        let ptr =
-            unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const AtomicU64 };
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const AtomicU64 };
         unsafe { (*ptr).store(v, Ordering::Release) }
     }
 
@@ -696,7 +712,14 @@ impl CncPage {
         let id = u32::from_le_bytes(page[off + 20..off + 24].try_into().unwrap());
         let ip = u32::from_le_bytes(page[off + 24..off + 28].try_into().unwrap());
         let port = u32::from_le_bytes(page[off + 28..off + 32].try_into().unwrap()) as u16;
-        Some(AdminReq { seq, nonce, op, id, ip, port })
+        Some(AdminReq {
+            seq,
+            nonce,
+            op,
+            id,
+            ip,
+            port,
+        })
     }
 
     /// M7: write admin request (fields then seq with release for seqlock semantics).
@@ -744,7 +767,12 @@ impl CncPage {
         let status = u32::from_le_bytes(page[off + 8..off + 12].try_into().unwrap());
         let reason = u32::from_le_bytes(page[off + 12..off + 16].try_into().unwrap());
         let version = u64::from_le_bytes(page[off + 16..off + 24].try_into().unwrap());
-        Some(AdminResp { seq, status, reason, version })
+        Some(AdminResp {
+            seq,
+            status,
+            reason,
+            version,
+        })
     }
 
     /// M7: write admin response (fields then seq with release).
@@ -775,7 +803,11 @@ impl CncPage {
         let tag: [u8; 32] = page[off..off + 32].try_into().unwrap();
         let expiry_ns = u64::from_le_bytes(page[off + 32..off + 40].try_into().unwrap());
         let key_name_hash = u64::from_le_bytes(page[off + 40..off + 48].try_into().unwrap());
-        AdminAuth { tag, expiry_ns, key_name_hash }
+        AdminAuth {
+            tag,
+            expiry_ns,
+            key_name_hash,
+        }
     }
 
     /// M12b: write the admin-auth line. Plain (non-atomic) stores — the
@@ -828,10 +860,14 @@ impl CncPage {
             return None;
         }
         let lo = u64::from_le_bytes(
-            page[cnc::CNC_OFF_INSTANCE_LO..cnc::CNC_OFF_INSTANCE_LO + 8].try_into().ok()?,
+            page[cnc::CNC_OFF_INSTANCE_LO..cnc::CNC_OFF_INSTANCE_LO + 8]
+                .try_into()
+                .ok()?,
         );
         let hi = u64::from_le_bytes(
-            page[cnc::CNC_OFF_INSTANCE_HI..cnc::CNC_OFF_INSTANCE_HI + 8].try_into().ok()?,
+            page[cnc::CNC_OFF_INSTANCE_HI..cnc::CNC_OFF_INSTANCE_HI + 8]
+                .try_into()
+                .ok()?,
         );
         Some(((hi as u128) << 64) | (lo as u128))
     }
@@ -875,7 +911,10 @@ mod tests {
         old.status().flags.store_release(0xFF);
         old.store_admission_bytes(123_456);
         // Recreate in place with a NEW instance id.
-        let meta2 = CncMeta { instance_id: 0xA5A5_0000_1111_2222, ..test_meta() };
+        let meta2 = CncMeta {
+            instance_id: 0xA5A5_0000_1111_2222,
+            ..test_meta()
+        };
         let fresh = CncPage::create_file(tmp.path(), &meta2).unwrap();
         assert_eq!(fresh.meta().instance_id, 0xA5A5_0000_1111_2222);
         assert_eq!(fresh.counters().append.load_acquire(), 0);
@@ -916,7 +955,10 @@ mod tests {
             })
         };
         for i in 0..500u64 {
-            let meta = CncMeta { instance_id: 0x1000 + i as u128, ..test_meta() };
+            let meta = CncMeta {
+                instance_id: 0x1000 + i as u128,
+                ..test_meta()
+            };
             let _fresh = CncPage::create_file(tmp.path(), &meta).unwrap();
         }
         stop.store(true, Ordering::Relaxed);
@@ -932,13 +974,22 @@ mod tests {
         assert_eq!(size_of::<NodeStatusV2>(), 448);
         assert_eq!(CNC_OFF_NEXT_CLIENT_ID - CNC_OFF_TERM, 384);
         assert_eq!(size_of::<SnapshotSlots>(), 192);
-        assert_eq!(CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS, 64);
+        assert_eq!(
+            CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS,
+            64
+        );
         let page = CncPage::heap(&test_meta());
         let base = page.page_base_for_tests();
         assert_eq!(page.counters() as *const _ as usize - base, CNC_OFF_APPEND);
-        assert_eq!(page.service() as *const _ as usize - base, CNC_OFF_SERVICE_APPLIED);
+        assert_eq!(
+            page.service() as *const _ as usize - base,
+            CNC_OFF_SERVICE_APPLIED
+        );
         assert_eq!(page.status() as *const _ as usize - base, CNC_OFF_TERM);
-        assert_eq!(page.snapshots() as *const _ as usize - base, CNC_OFF_SERVICE_SNAPSHOT_POS);
+        assert_eq!(
+            page.snapshots() as *const _ as usize - base,
+            CNC_OFF_SERVICE_SNAPSHOT_POS
+        );
         // M6 Task 9 observability band: archive_first_base + the 8 peer slots.
         assert_eq!(size_of::<PeerSlot>(), CNC_PEER_SLOT_STRIDE);
         assert_eq!(
@@ -954,7 +1005,10 @@ mod tests {
         }
         // Sub-field offsets within a slot pin the packing the decoder relies on.
         let s0 = page.peer_slot(0) as *const _ as usize;
-        assert_eq!(&page.peer_slot(0).id_and_role as *const _ as usize - s0, CNC_PEER_OFF_ID_AND_ROLE);
+        assert_eq!(
+            &page.peer_slot(0).id_and_role as *const _ as usize - s0,
+            CNC_PEER_OFF_ID_AND_ROLE
+        );
         assert_eq!(
             &page.peer_slot(0).reported_durable as *const _ as usize - s0,
             CNC_PEER_OFF_REPORTED_DURABLE
@@ -983,14 +1037,20 @@ mod tests {
         // M13a (final review): query_holes_skipped is the SECOND u64 of
         // ingress's line (one writer for both), so 4032..4096 stays free.
         assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 3976);
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 8);
+        assert_eq!(
+            CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED,
+            8
+        );
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
         const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
         // M14a: the boot-once pair and page 2.
         assert_eq!(cnc::CNC_OFF_SERVICES_DECLARED, 4032);
         assert_eq!(cnc::CNC_OFF_FSM_LAG_BYTES, 4040);
         assert_eq!(std::mem::size_of::<ServiceSlot>(), 512);
-        assert_eq!(std::mem::size_of::<ServiceSlot>(), cnc::CNC_SERVICE_SLOT_STRIDE);
+        assert_eq!(
+            std::mem::size_of::<ServiceSlot>(),
+            cnc::CNC_SERVICE_SLOT_STRIDE
+        );
         for i in 0..cnc::CNC_MAX_SERVICES {
             let slot = page.service_slot(i);
             let expect = cnc::CNC_OFF_SERVICE_SLOTS + i * cnc::CNC_SERVICE_SLOT_STRIDE;
@@ -998,17 +1058,38 @@ mod tests {
         }
         let s0 = page.service_slot(0);
         let s0_base = s0 as *const _ as usize;
-        assert_eq!(&s0.status as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_STATUS);
-        assert_eq!(&s0.applied as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_APPLIED);
-        assert_eq!(&s0.epoch as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_EPOCH);
+        assert_eq!(
+            &s0.status as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_STATUS
+        );
+        assert_eq!(
+            &s0.applied as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_APPLIED
+        );
+        assert_eq!(
+            &s0.epoch as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_EPOCH
+        );
         assert_eq!(
             &s0.output_completed as *const _ as usize - s0_base,
             cnc::CNC_SVC_OFF_OUTPUT_COMPLETED
         );
-        assert_eq!(&s0.snapshot_pos as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_SNAPSHOT_POS);
-        assert_eq!(&s0.heartbeat_ns as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_HEARTBEAT_NS);
-        assert_eq!(&s0.lag_waits as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_LAG_WAITS);
-        assert_eq!(&s0.reserved as *const _ as usize - s0_base, cnc::CNC_SVC_OFF_RESERVED);
+        assert_eq!(
+            &s0.snapshot_pos as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_SNAPSHOT_POS
+        );
+        assert_eq!(
+            &s0.heartbeat_ns as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_HEARTBEAT_NS
+        );
+        assert_eq!(
+            &s0.lag_waits as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_LAG_WAITS
+        );
+        assert_eq!(
+            &s0.reserved as *const _ as usize - s0_base,
+            cnc::CNC_SVC_OFF_RESERVED
+        );
         assert_eq!(page.page().len(), 8192);
     }
 
@@ -1019,11 +1100,15 @@ mod tests {
         // Dormant by default.
         assert_eq!(page.peer_slot(3).id_and_role.load_acquire(), 0);
         // Pack round-trips.
-        page.peer_slot(3).id_and_role.store_release(pack_id_and_role(7, CNC_PEER_ROLE_LEARNER));
+        page.peer_slot(3)
+            .id_and_role
+            .store_release(pack_id_and_role(7, CNC_PEER_ROLE_LEARNER));
         let raw = page.peer_slot(3).id_and_role.load_acquire();
         assert_eq!(raw >> 8, 7);
         assert_eq!((raw & 0xff) as u8, CNC_PEER_ROLE_LEARNER);
-        page.peer_slot(3).naks_plus_replay.store_release(pack_naks_plus_replay(11, 42));
+        page.peer_slot(3)
+            .naks_plus_replay
+            .store_release(pack_naks_plus_replay(11, 42));
         let np = page.peer_slot(3).naks_plus_replay.load_acquire();
         assert_eq!((np >> 32) as u32, 11);
         assert_eq!(np as u32, 42);
@@ -1035,11 +1120,19 @@ mod tests {
     #[test]
     fn snapshot_slots_init_zero_and_are_independently_writable() {
         let page = CncPage::heap(&test_meta());
-        assert_eq!(page.snapshots().service_snapshot_pos.load_acquire(), 0, "0 = no snapshot yet");
+        assert_eq!(
+            page.snapshots().service_snapshot_pos.load_acquire(),
+            0,
+            "0 = no snapshot yet"
+        );
         assert_eq!(page.snapshots().node_snapshot_floor.load_acquire(), 0);
         page.snapshots().service_snapshot_pos.store_release(4096);
         assert_eq!(page.snapshots().service_snapshot_pos.load_acquire(), 4096);
-        assert_eq!(page.snapshots().node_snapshot_floor.load_acquire(), 0, "independent slots");
+        assert_eq!(
+            page.snapshots().node_snapshot_floor.load_acquire(),
+            0,
+            "independent slots"
+        );
     }
 
     #[test]
@@ -1058,14 +1151,24 @@ mod tests {
         page.counters().append.store_release(4096);
         let re = CncPage::open_file(&p, "kv").unwrap();
         assert_eq!(re.meta().instance_id, meta.instance_id);
-        assert_eq!(re.counters().append.load_acquire(), 4096, "same mapped page, not a copy");
-        assert!(matches!(CncPage::open_file(&p, "other"), Err(CncError::AppIdMismatch { .. })));
+        assert_eq!(
+            re.counters().append.load_acquire(),
+            4096,
+            "same mapped page, not a copy"
+        );
+        assert!(matches!(
+            CncPage::open_file(&p, "other"),
+            Err(CncError::AppIdMismatch { .. })
+        ));
         assert_eq!(re.status().leader_hint.load_acquire(), u64::MAX);
         // Per-generation random base (T14): nonzero, top bit clear. Same value
         // through the shared mmap (not a fresh draw on open).
         let base = re.status().next_client_id.load_acquire();
         assert_ne!(base, 0, "0 is the reserved no-id sentinel");
-        assert!(base < (1 << 31), "top bit must be clear (generation headroom)");
+        assert!(
+            base < (1 << 31),
+            "top bit must be clear (generation headroom)"
+        );
     }
 
     #[test]
@@ -1084,7 +1187,10 @@ mod tests {
             f.write_all(&[0xFF]).unwrap();
         }
         let r = CncPage::open_file(&p, "test-app").map(|_| ());
-        assert!(matches!(r, Err(CncError::BadHeader)), "flipped crc-protected byte must be rejected: {r:?}");
+        assert!(
+            matches!(r, Err(CncError::BadHeader)),
+            "flipped crc-protected byte must be rejected: {r:?}"
+        );
     }
 
     #[test]
@@ -1186,8 +1292,14 @@ mod tests {
         // bases with the top bit clear (T14 MAJOR: generation-unique client ids
         // so an old generation's re-published (client_id, local_seq) can't
         // collide with a live client's). Statistically certain over 2^31.
-        let a = CncPage::heap(&test_meta()).status().next_client_id.load_acquire();
-        let b = CncPage::heap(&test_meta()).status().next_client_id.load_acquire();
+        let a = CncPage::heap(&test_meta())
+            .status()
+            .next_client_id
+            .load_acquire();
+        let b = CncPage::heap(&test_meta())
+            .status()
+            .next_client_id
+            .load_acquire();
         for base in [a, b] {
             assert_ne!(base, 0, "0 is the reserved no-id sentinel");
             assert_ne!(base, 1, "must NOT be the old fixed base of 1");
@@ -1211,31 +1323,65 @@ mod tests {
         // port=19100 exercises a normal value; a second req with port > 255
         // (65535) catches a width bug that a truncated/2-byte port write
         // would hide for small port numbers.
-        let req = AdminReq { seq: 1, nonce: 0xDEAD_BEEF_CAFE_F00D, op: 3, id: 42, ip: 0x0A00_0001, port: 19100 };
+        let req = AdminReq {
+            seq: 1,
+            nonce: 0xDEAD_BEEF_CAFE_F00D,
+            op: 3,
+            id: 42,
+            ip: 0x0A00_0001,
+            port: 19100,
+        };
         page.write_admin_req(&req);
         let out = page.read_admin_req(0).expect("seq 1 > last_seen 0");
         assert_eq!(out, req);
 
-        let req2 = AdminReq { seq: 2, nonce: 1, op: 5, id: 7, ip: 0x7F00_0001, port: 65535 };
+        let req2 = AdminReq {
+            seq: 2,
+            nonce: 1,
+            op: 5,
+            id: 7,
+            ip: 0x7F00_0001,
+            port: 65535,
+        };
         page.write_admin_req(&req2);
         let out2 = page.read_admin_req(1).expect("seq 2 > last_seen 1");
-        assert_eq!(out2, req2, "high port (>255) must round-trip through the u32-width field");
+        assert_eq!(
+            out2, req2,
+            "high port (>255) must round-trip through the u32-width field"
+        );
 
         // seq <= last_seen_seq must observe no new request.
-        assert!(page.read_admin_req(2).is_none(), "seq == last_seen must yield None");
-        assert!(page.read_admin_req(3).is_none(), "seq < last_seen must yield None");
+        assert!(
+            page.read_admin_req(2).is_none(),
+            "seq == last_seen must yield None"
+        );
+        assert!(
+            page.read_admin_req(3).is_none(),
+            "seq < last_seen must yield None"
+        );
     }
 
     #[test]
     fn admin_resp_roundtrip_and_seq_match() {
         let page = CncPage::heap(&test_meta());
-        let resp = AdminResp { seq: 7, status: 1, reason: 0, version: 99 };
+        let resp = AdminResp {
+            seq: 7,
+            status: 1,
+            reason: 0,
+            version: 99,
+        };
         page.write_admin_resp(&resp);
         let out = page.read_admin_resp(7).expect("seq matches");
         assert_eq!(out, resp);
 
-        assert!(page.read_admin_resp(8).is_none(), "seq mismatch (too high) must yield None");
-        assert!(page.read_admin_resp(6).is_none(), "seq mismatch (too low) must yield None");
+        assert!(
+            page.read_admin_resp(8).is_none(),
+            "seq mismatch (too high) must yield None"
+        );
+        assert!(
+            page.read_admin_resp(6).is_none(),
+            "seq mismatch (too low) must yield None"
+        );
     }
 
     #[test]
@@ -1256,7 +1402,11 @@ mod tests {
     #[test]
     fn admission_bytes_roundtrip_and_offset_pin() {
         let page = CncPage::heap(&test_meta());
-        assert_eq!(page.admission_bytes(), 0, "fresh page reads 0 (pre-0.3.0 sentinel)");
+        assert_eq!(
+            page.admission_bytes(),
+            0,
+            "fresh page reads 0 (pre-0.3.0 sentinel)"
+        );
         page.store_admission_bytes(256 * 1024);
         assert_eq!(page.admission_bytes(), 256 * 1024);
         let raw = page.page();
@@ -1270,7 +1420,11 @@ mod tests {
     #[test]
     fn seal_failures_roundtrip_and_offset_pin() {
         let page = CncPage::heap(&test_meta());
-        assert_eq!(page.seal_failures(), 0, "fresh page reads 0 (no failures yet / cleartext node)");
+        assert_eq!(
+            page.seal_failures(),
+            0,
+            "fresh page reads 0 (no failures yet / cleartext node)"
+        );
         page.store_seal_failures(7);
         assert_eq!(page.seal_failures(), 7);
         let raw = page.page();
@@ -1284,7 +1438,11 @@ mod tests {
     #[test]
     fn free_disk_bytes_roundtrip_and_offset_pin() {
         let page = CncPage::heap(&test_meta());
-        assert_eq!(page.free_disk_bytes(), 0, "fresh page reads 0 (never published)");
+        assert_eq!(
+            page.free_disk_bytes(),
+            0,
+            "fresh page reads 0 (never published)"
+        );
         page.store_free_disk_bytes(123_456_789);
         assert_eq!(page.free_disk_bytes(), 123_456_789);
         let raw = page.page();
@@ -1298,7 +1456,11 @@ mod tests {
     #[test]
     fn ingress_holes_skipped_roundtrip_and_offset_pin() {
         let page = CncPage::heap(&test_meta());
-        assert_eq!(page.ingress_holes_skipped(), 0, "fresh page reads 0 (no holes)");
+        assert_eq!(
+            page.ingress_holes_skipped(),
+            0,
+            "fresh page reads 0 (no holes)"
+        );
         page.store_ingress_holes_skipped(3);
         assert_eq!(page.ingress_holes_skipped(), 3);
         let raw = page.page();
@@ -1315,10 +1477,18 @@ mod tests {
     #[test]
     fn query_holes_skipped_roundtrip_and_offset_pin() {
         let page = CncPage::heap(&test_meta());
-        assert_eq!(page.query_holes_skipped(), 0, "fresh page reads 0 (no holes)");
+        assert_eq!(
+            page.query_holes_skipped(),
+            0,
+            "fresh page reads 0 (no holes)"
+        );
         page.store_query_holes_skipped(7);
         assert_eq!(page.query_holes_skipped(), 7);
-        assert_eq!(page.ingress_holes_skipped(), 0, "the ingress line is untouched");
+        assert_eq!(
+            page.ingress_holes_skipped(),
+            0,
+            "the ingress line is untouched"
+        );
         page.store_ingress_holes_skipped(3);
         assert_eq!(page.query_holes_skipped(), 7, "the query line is untouched");
         let raw = page.page();
@@ -1365,13 +1535,27 @@ mod tests {
         s3.status.store_release(pack_service_status(3, true, 1));
         s3.applied.store_release(4096);
         assert_eq!(s3.epoch.fetch_add(1) + 1, 1);
-        assert_eq!(unpack_service_status(s3.status.load_acquire()), (3, true, 1));
-        assert_eq!(page.service_slot(2).applied.load_acquire(), 0, "neighbour below untouched");
-        assert_eq!(page.service_slot(4).applied.load_acquire(), 0, "neighbour above untouched");
+        assert_eq!(
+            unpack_service_status(s3.status.load_acquire()),
+            (3, true, 1)
+        );
+        assert_eq!(
+            page.service_slot(2).applied.load_acquire(),
+            0,
+            "neighbour below untouched"
+        );
+        assert_eq!(
+            page.service_slot(4).applied.load_acquire(),
+            0,
+            "neighbour above untouched"
+        );
         // Byte pin: slot 3's `applied` line is at 4096 + 3*512 + 64.
         let raw = page.page();
         let off = 4096 + 3 * 512 + 64;
-        assert_eq!(u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()), 4096);
+        assert_eq!(
+            u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()),
+            4096
+        );
     }
 
     #[test]
@@ -1383,8 +1567,14 @@ mod tests {
 
     #[test]
     fn service_status_pack_roundtrips_every_field() {
-        assert_eq!(unpack_service_status(pack_service_status(0, false, 0)), (0, false, 0));
-        assert_eq!(unpack_service_status(pack_service_status(7, true, u32::MAX)), (7, true, u32::MAX));
+        assert_eq!(
+            unpack_service_status(pack_service_status(0, false, 0)),
+            (0, false, 0)
+        );
+        assert_eq!(
+            unpack_service_status(pack_service_status(7, true, u32::MAX)),
+            (7, true, u32::MAX)
+        );
         assert_eq!(pack_service_status(5, true, 2), 5 | (1 << 8) | (2u64 << 32));
     }
 
@@ -1402,7 +1592,10 @@ mod tests {
         assert_eq!(&raw[3904..3936], &[0xA5u8; 32]);
         assert_eq!(&raw[3936..3944], &0x1122_3344_5566_7788u64.to_le_bytes());
         assert_eq!(&raw[3944..3952], &0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
-        assert!(raw[3952..3968].iter().all(|&b| b == 0), "16 reserved bytes must be zero");
+        assert!(
+            raw[3952..3968].iter().all(|&b| b == 0),
+            "16 reserved bytes must be zero"
+        );
         page.write_admin_auth(&AdminAuth::ZERO);
         assert!(page.read_admin_auth().is_zero());
     }
@@ -1412,7 +1605,14 @@ mod tests {
         // Ledger minor (c): the roundtrip test is width-blind — pin the
         // wire fact directly: port occupies the u32 at +28 (T1 review fix).
         let page = CncPage::heap(&test_meta());
-        page.write_admin_req(&AdminReq { seq: 1, nonce: 0, op: 1, id: 1, ip: 0, port: 0x4A9C });
+        page.write_admin_req(&AdminReq {
+            seq: 1,
+            nonce: 0,
+            op: 1,
+            id: 1,
+            ip: 0,
+            port: 0x4A9C,
+        });
         let raw = page.page();
         assert_eq!(
             &raw[CNC_OFF_ADMIN_REQ + 28..CNC_OFF_ADMIN_REQ + 32],

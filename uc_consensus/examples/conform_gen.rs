@@ -16,7 +16,7 @@ use std::io::Write as _;
 
 use uc_consensus::commit::CommitTracker;
 use uc_consensus::election::log_ok_order;
-use uc_consensus::reconcile::{reconcile, Reconcile, MAX_TERM_MAP_WIRE_ENTRIES};
+use uc_consensus::reconcile::{MAX_TERM_MAP_WIRE_ENTRIES, Reconcile, reconcile};
 
 /// splitmix64: deterministic, platform-independent, dependency-free.
 struct Rng(u64);
@@ -87,8 +87,7 @@ fn emit_reconcile(rng: &mut Rng, out: &mut impl std::io::Write) {
     let mut own: Vec<(u32, u64)> = leader[..keep].to_vec();
     let own_tail = rng.below(3);
     push_tail(rng, &mut own, own_tail);
-    let own_durable =
-        own.last().map(|&(_, b)| b).unwrap_or(0) + rng.below(1 << 19);
+    let own_durable = own.last().map(|&(_, b)| b).unwrap_or(0) + rng.below(1 << 19);
     write_reconcile(out, &own, own_durable, &leader);
 }
 
@@ -209,7 +208,11 @@ fn emit_advance_fold(rng: &mut Rng, out: &mut impl std::io::Write) {
 fn emit_log_ok(rng: &mut Rng, out: &mut impl std::io::Write) {
     // Dense around the boundary: equal terms / equal durables are common.
     let ot = rng.below(6) as u32;
-    let ct = if rng.below(2) == 0 { ot } else { rng.below(6) as u32 };
+    let ct = if rng.below(2) == 0 {
+        ot
+    } else {
+        rng.below(6) as u32
+    };
     let od = rng.below(4);
     let cd = if rng.below(2) == 0 { od } else { rng.below(4) };
     writeln!(

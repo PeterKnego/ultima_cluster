@@ -19,30 +19,30 @@ use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use uc_crypto::{CryptoError, NodeId, ReceiveHalf};
 use uc_log::buffer::LogBuffer;
 use uc_log::writer::PositionedWriter;
-use uc_protocol::v2::crypto::{CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
+use uc_protocol::v2::crypto::{
+    CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP,
+};
 use uc_protocol::v2::datagram::{
     APPEND_POSITION_BODY_LEN, AppendPositionBody, ConfigProposalBody, ConfigReplyBody,
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, read_append_position_body,
-    write_append_position_body,
-    DGRAM_KIND_COMMIT_POSITION,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
     DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
     SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V2, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
-    SnapNakBody, StatusBody,
-    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_config_proposal_body, read_config_reply_body,
-    read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
-    read_snap_begin_body, read_snap_nak_body, read_status_body, read_term_map_body, read_vote_body,
+    SnapNakBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
+    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_status_body, read_term_map_body, read_vote_body, write_append_position_body,
     write_datagram_header, write_nak_body, write_snap_begin_body, write_snap_nak_body,
     write_status_body,
 };
@@ -175,32 +175,65 @@ pub enum NetEvent {
     /// added in protocol 0.5.0 (the term the sender attributes to the byte
     /// below `durable`); `0` means unattested — an empty log, or a pre-0.5.0
     /// peer whose report is header-only.
-    Report { from: SocketAddr, term: u32, durable: u64, durable_term: u32 },
-    CommitGossip { from: SocketAddr, term: u32, commit: u64 },
-    RequestVote { from: SocketAddr, body: RequestVoteBody },
-    Vote { from: SocketAddr, body: VoteBody },
-    TermMap { from: SocketAddr, term: u32, entries: Vec<TermMapEntryWire> },
+    Report {
+        from: SocketAddr,
+        term: u32,
+        durable: u64,
+        durable_term: u32,
+    },
+    CommitGossip {
+        from: SocketAddr,
+        term: u32,
+        commit: u64,
+    },
+    RequestVote {
+        from: SocketAddr,
+        body: RequestVoteBody,
+    },
+    Vote {
+        from: SocketAddr,
+        body: VoteBody,
+    },
+    TermMap {
+        from: SocketAddr,
+        term: u32,
+        entries: Vec<TermMapEntryWire>,
+    },
     /// Read-barrier probe (M5 §7), leader → follower. `from` is the leader's
     /// node id (from the body — the reply is addressed by it), `term` is the
     /// datagram HEADER term the follower must match to ACK (the stale-leader
     /// filter). Routed RAW like the other consensus kinds.
-    ReadProbe { nonce: u64, from: u32, term: u32 },
+    ReadProbe {
+        nonce: u64,
+        from: u32,
+        term: u32,
+    },
     /// Read-barrier ack, follower → leader. `from` is the acking follower's node
     /// id (from the body); the leader counts distinct ackers per nonce. No term
     /// field: the nonce is unique to one leader's read round, so a matching
     /// pending nonce already scopes the ack to this leader.
-    ReadProbeAck { nonce: u64, from: u32 },
+    ReadProbeAck {
+        nonce: u64,
+        from: u32,
+    },
     /// Any current-term leader traffic (data/heartbeat) seen — liveness.
-    LeaderActivity { term: u32 },
+    LeaderActivity {
+        term: u32,
+    },
     /// M7 Task 7: a follower's forwarded membership proposal (kind 16, `uc2ctl`'s
     /// admin request forwarded by a non-leader that has a leader hint). `from` is
     /// the forwarding follower's address — the leader's reply (kind 17) is
     /// addressed back to it. Routed RAW like the other consensus kinds: a stale/
     /// not-yet-leader node just drops it (the follower's forward times out).
-    ConfigProposal { from: SocketAddr, body: ConfigProposalBody },
+    ConfigProposal {
+        from: SocketAddr,
+        body: ConfigProposalBody,
+    },
     /// M7 Task 7: the leader's reply to a forwarded proposal (kind 17),
     /// follower-bound. Matched by the follower's 1-slot pending map on `nonce`.
-    ConfigReply { body: ConfigReplyBody },
+    ConfigReply {
+        body: ConfigReplyBody,
+    },
 }
 
 impl NetEvent {
@@ -244,15 +277,21 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
                 durable_term: read_append_position_body(body).map_or(0, |b| b.durable_term),
             })
         }
-        DGRAM_KIND_COMMIT_POSITION => {
-            Some(NetEvent::CommitGossip { from, term: h.leadership_term_id, commit: h.position })
-        }
+        DGRAM_KIND_COMMIT_POSITION => Some(NetEvent::CommitGossip {
+            from,
+            term: h.leadership_term_id,
+            commit: h.position,
+        }),
         DGRAM_KIND_REQUEST_VOTE if body.len() >= REQUEST_VOTE_BODY_LEN => {
-            Some(NetEvent::RequestVote { from, body: read_request_vote_body(body)? })
+            Some(NetEvent::RequestVote {
+                from,
+                body: read_request_vote_body(body)?,
+            })
         }
-        DGRAM_KIND_VOTE if body.len() >= VOTE_BODY_LEN => {
-            Some(NetEvent::Vote { from, body: read_vote_body(body)? })
-        }
+        DGRAM_KIND_VOTE if body.len() >= VOTE_BODY_LEN => Some(NetEvent::Vote {
+            from,
+            body: read_vote_body(body)?,
+        }),
         DGRAM_KIND_TERM_MAP => {
             let mut out = [TermMapEntryWire { term: 0, base: 0 }; MAX_TERM_MAP_WIRE_ENTRIES];
             let count = read_term_map_body(body, &mut out)?;
@@ -266,16 +305,26 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
             // Carry the datagram HEADER term: the follower ACKs only if it still
             // equals its own current term (the node-side stale-leader filter).
             let b = read_read_probe_body(body)?;
-            Some(NetEvent::ReadProbe { nonce: b.nonce, from: b.from, term: h.leadership_term_id })
+            Some(NetEvent::ReadProbe {
+                nonce: b.nonce,
+                from: b.from,
+                term: h.leadership_term_id,
+            })
         }
         DGRAM_KIND_READ_PROBE_ACK => {
             let b = read_read_probe_body(body)?;
-            Some(NetEvent::ReadProbeAck { nonce: b.nonce, from: b.from })
+            Some(NetEvent::ReadProbeAck {
+                nonce: b.nonce,
+                from: b.from,
+            })
         }
-        DGRAM_KIND_CONFIG_PROPOSAL => {
-            Some(NetEvent::ConfigProposal { from, body: read_config_proposal_body(body)? })
-        }
-        DGRAM_KIND_CONFIG_REPLY => Some(NetEvent::ConfigReply { body: read_config_reply_body(body)? }),
+        DGRAM_KIND_CONFIG_PROPOSAL => Some(NetEvent::ConfigProposal {
+            from,
+            body: read_config_proposal_body(body)?,
+        }),
+        DGRAM_KIND_CONFIG_REPLY => Some(NetEvent::ConfigReply {
+            body: read_config_reply_body(body)?,
+        }),
         _ => None,
     }
 }
@@ -895,14 +944,20 @@ impl FollowerReceiver {
         crypto: Option<CryptoIntake>,
     ) -> Self {
         let (crypto, peer_ids_src, hs_route, crypto_seal) = match crypto {
-            Some(CryptoIntake { half, peer_ids, handshake, transport }) => {
-                (Some(half), Some(peer_ids), Some(handshake), Some(transport))
-            }
+            Some(CryptoIntake {
+                half,
+                peer_ids,
+                handshake,
+                transport,
+            }) => (Some(half), Some(peer_ids), Some(handshake), Some(transport)),
             None => (None, None, None, None),
         };
         let start = buffer.counters().append.load_acquire();
-        let status_bytes =
-            if cfg.status_bytes == 0 { buffer.capacity() / 4 } else { cfg.status_bytes };
+        let status_bytes = if cfg.status_bytes == 0 {
+            buffer.capacity() / 4
+        } else {
+            cfg.status_bytes
+        };
         let writer = PositionedWriter::new(Arc::clone(&buffer));
         Self {
             buffer,
@@ -944,7 +999,10 @@ impl FollowerReceiver {
             straddle_hook: None,
             crypto,
             crypto_seal,
-            peer_ids: peer_ids_src.as_ref().map(PeerIds::snapshot).unwrap_or_default(),
+            peer_ids: peer_ids_src
+                .as_ref()
+                .map(PeerIds::snapshot)
+                .unwrap_or_default(),
             peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
             peer_ids_src,
             hs_route,
@@ -1028,7 +1086,9 @@ impl FollowerReceiver {
     /// then always matches, so single-life receivers are unaffected).
     #[inline]
     fn prime_gen_val(&self) -> u64 {
-        self.prime_gen.as_ref().map_or(0, |g| g.load(Ordering::Relaxed))
+        self.prime_gen
+            .as_ref()
+            .map_or(0, |g| g.load(Ordering::Relaxed))
     }
 
     /// Test-only: install a hook fired in the DATA arm between the `rebuilt`
@@ -1153,7 +1213,9 @@ impl FollowerReceiver {
             // were just cut. Moving UP has neither problem, and clearing
             // `ap_reported` here would swallow the very durable advance this
             // node owes the leader for commit ranking.
-            self.stats.counter_ahead_resyncs.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .counter_ahead_resyncs
+                .fetch_add(1, Ordering::Relaxed);
         }
         if append < self.rebuilt.contiguous() {
             self.rebuilt = Rebuilt::new(append);
@@ -1174,7 +1236,9 @@ impl FollowerReceiver {
             // dropped. Zeroing the send cadence makes the next duty cycle
             // report, instead of waiting out `append_pos_floor_ns`.
             self.last_ap_ns = 0;
-            self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .truncation_resyncs
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1217,7 +1281,9 @@ impl FollowerReceiver {
         // term's stream (same reasoning as the truncation resync).
         self.nak.poll(None, self.now_ns());
         self.leader_append = self.rebuilt.contiguous();
-        self.stats.term_change_discards.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .term_change_discards
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// One duty cycle: drain up to 64 datagrams, then NAK/status upkeep.
@@ -1353,7 +1419,10 @@ impl FollowerReceiver {
             return None;
         }
 
-        let crypto = self.crypto.as_mut().expect("checked Some at the top of this function");
+        let crypto = self
+            .crypto
+            .as_mut()
+            .expect("checked Some at the top of this function");
         match crypto.open_slice(peer_id, buf, n) {
             Ok(len) => {
                 if h.kind == DGRAM_KIND_HS_KEY {
@@ -1419,7 +1488,10 @@ impl FollowerReceiver {
     /// full/disconnected one (harmless: `Peers::tick`/a retry re-initiates,
     /// same reasoning as the consensus route's own full-channel drops).
     fn route_handshake(&mut self, from: SocketAddr, kind: u8, body: Vec<u8>) {
-        let sent = self.hs_route.as_ref().is_some_and(|tx| tx.try_send((from, kind, body)).is_ok());
+        let sent = self
+            .hs_route
+            .as_ref()
+            .is_some_and(|tx| tx.try_send((from, kind, body)).is_ok());
         if !sent {
             self.stats.dropped_handshake.fetch_add(1, Ordering::Relaxed);
         }
@@ -1628,7 +1700,10 @@ impl FollowerReceiver {
                         return;
                     }
                     self.last_published = self.rebuilt.contiguous();
-                    self.buffer.counters().append.store_release(self.rebuilt.contiguous());
+                    self.buffer
+                        .counters()
+                        .append
+                        .store_release(self.rebuilt.contiguous());
                 }
                 self.note_leader_activity(h.leadership_term_id);
             }
@@ -1649,7 +1724,11 @@ impl FollowerReceiver {
                     && let Some(route) = &self.sender_route
                     && let Some(b) = read_nak_body(body)
                 {
-                    let _ = route.try_send(CtrlMsg::Nak { from, position: b.position, length: b.length });
+                    let _ = route.try_send(CtrlMsg::Nak {
+                        from,
+                        position: b.position,
+                        length: b.length,
+                    });
                 }
             }
             DGRAM_KIND_STATUS if self.sender_route.is_some() => {
@@ -1683,7 +1762,9 @@ impl FollowerReceiver {
                     // refusal, same drop as a wrong `layout` byte. Only counted
                     // on a node that receives snapshots at all (elsewhere kinds
                     // 12/13 are ignored wholesale).
-                    self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .snap_refused_legacy_peer
+                        .fetch_add(1, Ordering::Relaxed);
                     // M14c2 (T10a): ...and once per SESSION, because the
                     // leader re-sends its BEGIN every 20 ms — so the counter
                     // above measures the resend cadence, not the number of
@@ -1691,7 +1772,9 @@ impl FollowerReceiver {
                     // flag day". The latch clears on the next decodable BEGIN.
                     if !self.snap_begin_undecodable_latched {
                         self.snap_begin_undecodable_latched = true;
-                        self.stats.snap_begin_undecodable.fetch_add(1, Ordering::Relaxed);
+                        self.stats
+                            .snap_begin_undecodable
+                            .fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "uc_net: SNAP_BEGIN from {from} could not be decoded ({} body \
                              bytes) -- almost certainly a wire-0.5.0 peer; this node cannot \
@@ -1726,7 +1809,10 @@ impl FollowerReceiver {
                 if let Some(b) = read_snap_begin_body(body)
                     && let Some(route) = &self.sender_route
                 {
-                    let _ = route.try_send(CtrlMsg::SnapDone { from, session: b.session });
+                    let _ = route.try_send(CtrlMsg::SnapDone {
+                        from,
+                        session: b.session,
+                    });
                 }
             }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
@@ -1747,7 +1833,9 @@ impl FollowerReceiver {
         let now = self.now_ns();
         if b.layout != SNAP_BEGIN_LAYOUT_V2 {
             // "peer wire 0.5.0" — a body whose discriminator we do not speak.
-            self.stats.snap_refused_legacy_peer.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .snap_refused_legacy_peer
+                .fetch_add(1, Ordering::Relaxed);
             self.snap_drop_intake_from(from);
             return;
         }
@@ -1756,7 +1844,9 @@ impl FollowerReceiver {
         // same refusal rather than panicking in debug.
         let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
         if b.services_declared != self.own_declared || b.services_declared & bit == 0 {
-            self.stats.snap_refused_declared_mismatch.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .snap_refused_declared_mismatch
+                .fetch_add(1, Ordering::Relaxed);
             self.snap_drop_intake_from(from);
             return;
         }
@@ -1798,7 +1888,10 @@ impl FollowerReceiver {
             // that skips one means an earlier BEGIN was lost, and placing this
             // one at `announced_len` anyway would give two FSMs each other's
             // bytes — a silent mis-install, not a stall. Drop it and prompt.
-            let expect = next_declared_id(cur.services_declared, cur.parts.last().map(|p| p.service_id));
+            let expect = next_declared_id(
+                cur.services_declared,
+                cur.parts.last().map(|p| p.service_id),
+            );
             if Some(b.service_id) != expect {
                 let (peer, session, at) = (cur.peer, cur.session, cur.announced_len);
                 self.snap_probe_missing_begin(peer, session, at);
@@ -1809,7 +1902,9 @@ impl FollowerReceiver {
             let Some(part) = open_snap_part(&root, &b, cur.announced_len) else {
                 // Local I/O, not the peer: counted so a follower that can never
                 // open a `.part` is diagnosable rather than a silent NAK loop.
-                self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .snap_intake_io_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             };
             cur.announced_len += part.len;
@@ -1832,7 +1927,9 @@ impl FollowerReceiver {
         // must not leak, and the new session may re-use the very same path.
         self.snap_discard_intake();
         let Some(part) = open_snap_part(&root, &b, 0) else {
-            self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .snap_intake_io_failures
+                .fetch_add(1, Ordering::Relaxed);
             return;
         };
         let announced_len = part.len;
@@ -1867,7 +1964,11 @@ impl FollowerReceiver {
     /// the peer we are actually transferring with does drop the session — its
     /// leader is speaking a wire we cannot finish the transfer on.
     fn snap_drop_intake_from(&mut self, from: SocketAddr) {
-        if self.snap_intake.as_ref().is_some_and(|cur| cur.peer == from) {
+        if self
+            .snap_intake
+            .as_ref()
+            .is_some_and(|cur| cur.peer == from)
+        {
             self.snap_discard_intake();
         }
     }
@@ -1934,7 +2035,9 @@ impl FollowerReceiver {
                     intake.parts[i].part_path.display()
                 );
             }
-            self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .snap_intake_io_failures
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         // The clock is read HERE, not on entry: a chunk with no intake, for
@@ -1998,14 +2101,18 @@ impl FollowerReceiver {
                 if file.sync_all().is_err() {
                     intake.parts[k].file = Some(file);
                     intake.last_publish_try_ns = Some(now);
-                    self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .snap_intake_io_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 drop(file);
             }
             if std::fs::rename(&intake.parts[k].part_path, &intake.parts[k].final_path).is_err() {
                 intake.last_publish_try_ns = Some(now);
-                self.stats.snap_intake_io_failures.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .snap_intake_io_failures
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
             intake.parts[k].done = true;
@@ -2032,7 +2139,12 @@ impl FollowerReceiver {
         let Some(last) = intake.parts.last() else {
             return;
         };
-        let floor = intake.parts.iter().map(|p| p.snapshot_pos).min().unwrap_or(0);
+        let floor = intake
+            .parts
+            .iter()
+            .map(|p| p.snapshot_pos)
+            .min()
+            .unwrap_or(0);
         // Ack: echo the LAST artifact's SnapBeginBody as SNAP_DONE so the leader
         // closes its session (it keys on `(peer, session)` alone).
         let ack = SnapBeginBody {
@@ -2052,7 +2164,11 @@ impl FollowerReceiver {
         self.snap_last_done = Some(SnapDone {
             peer: intake.peer,
             session: intake.session,
-            artifacts: intake.parts.iter().map(|p| (p.service_id, p.snapshot_pos)).collect(),
+            artifacts: intake
+                .parts
+                .iter()
+                .map(|p| (p.service_id, p.snapshot_pos))
+                .collect(),
         });
         self.snap_send_done(intake.peer, &ack);
         // M7 Task 6: publish the carried config BEFORE the position signal — the
@@ -2121,7 +2237,11 @@ impl FollowerReceiver {
         );
         write_snap_nak_body(
             &mut d[DATAGRAM_HEADER_LEN..],
-            &SnapNakBody { session, offset, length },
+            &SnapNakBody {
+                session,
+                offset,
+                length,
+            },
         );
         self.seal_and_send(peer, DGRAM_KIND_SNAP_NAK, &mut d)
     }
@@ -2150,7 +2270,9 @@ impl FollowerReceiver {
             self.status_at = append;
             self.ap_reported = append;
             self.last_ap_ns = 0; // report the new frontier promptly (see above)
-            self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .truncation_resyncs
+                .fetch_add(1, Ordering::Relaxed);
         }
         self.snap_adopt_pending = None;
     }
@@ -2172,10 +2294,13 @@ impl FollowerReceiver {
         // busy-spin iteration and made `snap_intake_io_failures` climb at the
         // poll rate — unreadable as the "rising count" signal the docs name.
         let due = self.snap_intake.as_ref().is_some_and(|i| {
-            i.last_publish_try_ns.is_none_or(|t| now.saturating_sub(t) >= SNAP_REDRIVE_INTERVAL_NS)
+            i.last_publish_try_ns
+                .is_none_or(|t| now.saturating_sub(t) >= SNAP_REDRIVE_INTERVAL_NS)
                 && {
                     let contiguous = i.got.contiguous();
-                    i.parts.iter().any(|p| !p.done && contiguous >= p.base + p.len)
+                    i.parts
+                        .iter()
+                        .any(|p| !p.done && contiguous >= p.base + p.len)
                 }
         });
         if due {
@@ -2198,7 +2323,9 @@ impl FollowerReceiver {
             .map(|i| i.peer)
         {
             self.snap_discard_intake();
-            self.stats.snap_intake_abandoned.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .snap_intake_abandoned
+                .fetch_add(1, Ordering::Relaxed);
             eprintln!(
                 "uc_net: abandoning the inbound snapshot transfer from {peer} -- no chunk for \
                  {} s; its unfinished .part files have been removed (any artifact already \
@@ -2271,7 +2398,10 @@ impl FollowerReceiver {
         // two reads, so a due NAK fires on a later cycle, never early; the
         // backoff deadline set by a firing poll keeps the second poll from
         // double-sending.
-        let fired = self.nak.poll(gap, now).or_else(|| self.nak.poll(gap, self.now_ns()));
+        let fired = self
+            .nak
+            .poll(gap, now)
+            .or_else(|| self.nak.poll(gap, self.now_ns()));
         if let Some((start, end)) = fired {
             let len = (end - start).min(self.cfg.nak_max_bytes as u64) as u32;
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN + NAK_BODY_LEN];
@@ -2285,7 +2415,13 @@ impl FollowerReceiver {
                     key_epoch: 0,
                 },
             );
-            write_nak_body(&mut d[DATAGRAM_HEADER_LEN..], &NakBody { position: start, length: len });
+            write_nak_body(
+                &mut d[DATAGRAM_HEADER_LEN..],
+                &NakBody {
+                    position: start,
+                    length: len,
+                },
+            );
             // M8 (T17): sealed or dropped. A dropped NAK re-fires on the
             // timer's own backoff — the same recovery a lost NAK already has.
             let leader = self.cfg.leader;
@@ -2375,7 +2511,10 @@ impl FollowerReceiver {
             );
             write_status_body(
                 &mut d[DATAGRAM_HEADER_LEN..],
-                &StatusBody { contiguous_position: contiguous, receive_window: window },
+                &StatusBody {
+                    contiguous_position: contiguous,
+                    receive_window: window,
+                },
             );
             // M8 (T17): sealed or dropped; cursors advance only on a real
             // send — see the AppendPosition site above for why.
@@ -2412,10 +2551,10 @@ mod tests {
     use uc_log::cnc::{CncMeta, CncPage};
     use uc_log::region::Region;
     use uc_protocol::v2::datagram::{
-        read_nak_body, read_status_body, write_datagram_header, write_nak_body,
-        write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
-        DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK,
-        DGRAM_KIND_STATUS, NAK_BODY_LEN, STATUS_BODY_LEN,
+        DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
+        DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader,
+        NAK_BODY_LEN, STATUS_BODY_LEN, read_nak_body, read_status_body, write_datagram_header,
+        write_nak_body, write_status_body,
     };
 
     const TERM: u32 = 9;
@@ -2431,7 +2570,11 @@ mod tests {
     }
 
     fn buffer() -> Arc<LogBuffer> {
-        Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), test_cnc(1 << 16), 256))
+        Arc::new(LogBuffer::new(
+            Region::heap_zeroed(1 << 16),
+            test_cnc(1 << 16),
+            256,
+        ))
     }
 
     fn term_handle(t: u32) -> TermHandle {
@@ -2445,7 +2588,9 @@ mod tests {
     }
     impl FakeLeader {
         fn new() -> Self {
-            Self { sock: FaultSocket::bind("127.0.0.1:0").unwrap() }
+            Self {
+                sock: FaultSocket::bind("127.0.0.1:0").unwrap(),
+            }
         }
         fn addr(&self) -> SocketAddr {
             self.sock.local_addr().unwrap()
@@ -2454,7 +2599,13 @@ mod tests {
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
             write_datagram_header(
                 &mut d,
-                &DatagramHeader { position, leadership_term_id: term, kind, flags: 0, key_epoch: 0 },
+                &DatagramHeader {
+                    position,
+                    leadership_term_id: term,
+                    kind,
+                    flags: 0,
+                    key_epoch: 0,
+                },
             );
             d.extend_from_slice(body);
             self.sock.send_to(&d, to).unwrap();
@@ -2527,7 +2678,11 @@ mod tests {
         route: mpsc::SyncSender<NetEvent>,
     ) -> FollowerReceiver {
         let mut cfg = FollowerConfig::new(leader);
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX; // no time-driven status in unit tests
         cfg.append_pos_floor_ns = u64::MAX; // advance-driven AppendPosition only
         FollowerReceiver::new(
@@ -2547,7 +2702,11 @@ mod tests {
         term: TermHandle,
     ) -> FollowerReceiver {
         let mut cfg = FollowerConfig::new(leader);
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX;
         cfg.append_pos_floor_ns = u64::MAX;
         FollowerReceiver::new(
@@ -2612,7 +2771,12 @@ mod tests {
         leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
         leader.send(to, DGRAM_KIND_DATA, runs[1].0, TERM, &runs[1].1);
         drive_until(&mut r, || b.counters().append.load_acquire() == 3 * 96);
-        assert!(r.stats().naks_sent.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        assert!(
+            r.stats()
+                .naks_sent
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
     }
 
     #[test]
@@ -2746,7 +2910,11 @@ mod tests {
         // (max_payload 256 -> max_claim 576 -> 2304). 96-byte frames lap it in
         // 42 frames + a 64-byte wrap padding.
         fn small() -> Arc<LogBuffer> {
-            Arc::new(LogBuffer::new(Region::heap_zeroed(4096), test_cnc(4096), 256))
+            Arc::new(LogBuffer::new(
+                Region::heap_zeroed(4096),
+                test_cnc(4096),
+                256,
+            ))
         }
 
         // Two honest laps of leader wire runs. The buffer is only 4096 B, so
@@ -2769,9 +2937,16 @@ mod tests {
         // [4096,8128); lap2 padding at 8128; ignore the frame at 8192 that
         // forced the padding.
         let lap1: Vec<_> = runs.iter().filter(|(p, ..)| *p < 4096).cloned().collect();
-        let lap2_frames: Vec<_> =
-            runs.iter().filter(|(p, ..)| (4096..8128).contains(p)).cloned().collect();
-        let pad2 = runs.iter().find(|(p, ..)| *p == 8128).cloned().expect("lap2 padding");
+        let lap2_frames: Vec<_> = runs
+            .iter()
+            .filter(|(p, ..)| (4096..8128).contains(p))
+            .cloned()
+            .collect();
+        let pad2 = runs
+            .iter()
+            .find(|(p, ..)| *p == 8128)
+            .cloned()
+            .expect("lap2 padding");
         // Honest-generation sanity.
         assert_eq!(lap1.len(), 43);
         assert_eq!(lap1.last().unwrap().0, 4032); // padding at 4032
@@ -2784,7 +2959,11 @@ mod tests {
         let fb = small();
         let mut leader_ep = FakeLeader::new();
         let mut cfg = FollowerConfig::new(leader_ep.addr());
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX;
         cfg.status_bytes = 96; // a status per frame's worth of progress
         let mut r = FollowerReceiver::new(
@@ -2853,7 +3032,10 @@ mod tests {
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.dropped_malformed.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "empty body never counted malformed");
+            assert!(
+                Instant::now() < deadline,
+                "empty body never counted malformed"
+            );
             r.do_work();
             std::thread::yield_now();
         }
@@ -2872,11 +3054,22 @@ mod tests {
         leader.send(to, DGRAM_KIND_DATA, 16, TERM, &runs[0].1);
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while st.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "misaligned datagram never observed");
+        while st
+            .dropped_malformed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < 1
+        {
+            assert!(
+                Instant::now() < deadline,
+                "misaligned datagram never observed"
+            );
             r.do_work();
         }
-        assert_eq!(b.counters().append.load_acquire(), 0, "misaligned position advanced the log");
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            0,
+            "misaligned position advanced the log"
+        );
     }
 
     #[test]
@@ -2893,8 +3086,15 @@ mod tests {
         leader.send(to, DGRAM_KIND_DATA, pos, TERM, &runs[0].1);
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while st.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "overflowing datagram never observed");
+        while st
+            .dropped_malformed
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < 1
+        {
+            assert!(
+                Instant::now() < deadline,
+                "overflowing datagram never observed"
+            );
             r.do_work();
         }
         assert_eq!(b.counters().append.load_acquire(), 0);
@@ -2931,18 +3131,28 @@ mod tests {
         // it holds across 50 quiescent cycles: durable unchanged + floor
         // disabled (u64::MAX in the helper) must mean NO re-send — a bug that
         // forgets to update ap_reported re-sends every cycle and fails here
-        let sent = r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed);
+        let sent = r
+            .stats()
+            .append_positions_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
         for _ in 0..50 {
             r.do_work();
         }
         assert_eq!(
-            r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed),
+            r.stats()
+                .append_positions_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
             sent,
             "re-sent AppendPosition without a durable advance"
         );
         b.counters().durable.store_release(1920); // next block
         let deadline = Instant::now() + Duration::from_secs(5);
-        while r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed) == sent {
+        while r
+            .stats()
+            .append_positions_sent
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == sent
+        {
             assert!(Instant::now() < deadline, "advance did not re-report");
             r.do_work();
         }
@@ -2973,8 +3183,8 @@ mod tests {
 
     use std::sync::atomic::AtomicBool;
     use uc_protocol::v2::datagram::{
-        write_request_vote_body, DGRAM_KIND_REQUEST_VOTE, NakBody, REQUEST_VOTE_BODY_LEN,
-        RequestVoteBody,
+        DGRAM_KIND_REQUEST_VOTE, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
+        write_request_vote_body,
     };
 
     /// A live term bump takes effect on the next datagram: DATA at the OLD term
@@ -2986,7 +3196,11 @@ mod tests {
         let mut leader = FakeLeader::new();
         let handle = term_handle(TERM);
         let mut cfg = FollowerConfig::new(leader.addr());
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX;
         cfg.append_pos_floor_ns = u64::MAX;
         let mut r = FollowerReceiver::new(
@@ -3007,10 +3221,17 @@ mod tests {
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.dropped_stale_term.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "old-term DATA never dropped after bump");
+            assert!(
+                Instant::now() < deadline,
+                "old-term DATA never dropped after bump"
+            );
             r.do_work();
         }
-        assert_eq!(b.counters().append.load_acquire(), runs[0].2, "stale DATA advanced the log");
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            runs[0].2,
+            "stale DATA advanced the log"
+        );
     }
 
     /// Consensus kinds (5–9) reach the consensus route RAW, bypassing the
@@ -3031,7 +3252,11 @@ mod tests {
         let mut rvb = vec![0u8; REQUEST_VOTE_BODY_LEN];
         write_request_vote_body(
             &mut rvb,
-            &RequestVoteBody { new_term: TERM + 5, last_term: TERM, last_durable: 320 },
+            &RequestVoteBody {
+                new_term: TERM + 5,
+                last_term: TERM,
+                last_durable: 320,
+            },
         );
         leader.send(to, DGRAM_KIND_REQUEST_VOTE, 0, TERM + 5, &rvb);
         // commit gossip at the current term
@@ -3066,7 +3291,11 @@ mod tests {
             }
         }
         // the local commit counter is never written — the consensus agent owns it
-        assert_eq!(b.counters().commit.load_acquire(), 0, "receiver stored commit locally");
+        assert_eq!(
+            b.counters().commit.load_acquire(),
+            0,
+            "receiver stored commit locally"
+        );
     }
 
     /// Read-barrier kinds 10/11 route RAW to the consensus agent, carrying the
@@ -3077,7 +3306,7 @@ mod tests {
     #[test]
     fn read_probe_kinds_route_raw_with_header_term() {
         use uc_protocol::v2::datagram::{
-            write_read_probe_body, ReadProbeBody, READ_PROBE_BODY_LEN,
+            READ_PROBE_BODY_LEN, ReadProbeBody, write_read_probe_body,
         };
         let b = buffer();
         let mut leader = FakeLeader::new();
@@ -3086,16 +3315,31 @@ mod tests {
         let to = r.local_addr();
 
         let mut body = vec![0u8; READ_PROBE_BODY_LEN];
-        write_read_probe_body(&mut body, &ReadProbeBody { nonce: 0xABCD, from: 2 });
+        write_read_probe_body(
+            &mut body,
+            &ReadProbeBody {
+                nonce: 0xABCD,
+                from: 2,
+            },
+        );
         // Probe at a term ABOVE the receiver's — must NOT be term-filtered.
         leader.send(to, DGRAM_KIND_READ_PROBE, 0, TERM + 4, &body);
-        write_read_probe_body(&mut body, &ReadProbeBody { nonce: 0xABCD, from: 1 });
+        write_read_probe_body(
+            &mut body,
+            &ReadProbeBody {
+                nonce: 0xABCD,
+                from: 1,
+            },
+        );
         leader.send(to, DGRAM_KIND_READ_PROBE_ACK, 0, TERM, &body);
 
         let (mut saw_probe, mut saw_ack) = (false, false);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !(saw_probe && saw_ack) {
-            assert!(Instant::now() < deadline, "read-barrier events never routed");
+            assert!(
+                Instant::now() < deadline,
+                "read-barrier events never routed"
+            );
             r.do_work();
             while let Ok(ev) = rx.try_recv() {
                 match ev {
@@ -3133,7 +3377,13 @@ mod tests {
         let mut pbuf = vec![0u8; CONFIG_PROPOSAL_BODY_LEN];
         write_config_proposal_body(
             &mut pbuf,
-            &ConfigProposalBody { nonce: 0x1122_3344, op: 1, id: 9, ip: 0x7F00_0001, port: 4000 },
+            &ConfigProposalBody {
+                nonce: 0x1122_3344,
+                op: 1,
+                id: 9,
+                ip: 0x7F00_0001,
+                port: 4000,
+            },
         );
         // Term deliberately mismatched from the receiver's own — must still route.
         leader.send(to, DGRAM_KIND_CONFIG_PROPOSAL, 0, TERM + 9, &pbuf);
@@ -3141,31 +3391,47 @@ mod tests {
         let mut rbuf = vec![0u8; CONFIG_REPLY_BODY_LEN];
         write_config_reply_body(
             &mut rbuf,
-            &ConfigReplyBody { nonce: 0x1122_3344, status: 0, reason: 0, version: 1 },
+            &ConfigReplyBody {
+                nonce: 0x1122_3344,
+                status: 0,
+                reason: 0,
+                version: 1,
+            },
         );
         leader.send(to, DGRAM_KIND_CONFIG_REPLY, 0, TERM, &rbuf);
 
         let (mut saw_proposal, mut saw_reply) = (false, false);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !(saw_proposal && saw_reply) {
-            assert!(Instant::now() < deadline, "config-forward events never routed");
+            assert!(
+                Instant::now() < deadline,
+                "config-forward events never routed"
+            );
             r.do_work();
             while let Ok(ev) = rx.try_recv() {
                 match ev {
                     NetEvent::ConfigProposal { body, .. } => {
-                        assert_eq!(body, ConfigProposalBody {
-                            nonce: 0x1122_3344,
-                            op: 1,
-                            id: 9,
-                            ip: 0x7F00_0001,
-                            port: 4000,
-                        });
+                        assert_eq!(
+                            body,
+                            ConfigProposalBody {
+                                nonce: 0x1122_3344,
+                                op: 1,
+                                id: 9,
+                                ip: 0x7F00_0001,
+                                port: 4000,
+                            }
+                        );
                         saw_proposal = true;
                     }
                     NetEvent::ConfigReply { body } => {
                         assert_eq!(
                             body,
-                            ConfigReplyBody { nonce: 0x1122_3344, status: 0, reason: 0, version: 1 }
+                            ConfigReplyBody {
+                                nonce: 0x1122_3344,
+                                status: 0,
+                                reason: 0,
+                                version: 1
+                            }
                         );
                         saw_reply = true;
                     }
@@ -3184,7 +3450,11 @@ mod tests {
         let mut leader = FakeLeader::new();
         let handle = term_handle(TERM);
         let mut cfg = FollowerConfig::new(leader.addr());
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX;
         cfg.append_pos_floor_ns = u64::MAX; // advance-driven AppendPosition only
         let mut r = FollowerReceiver::new(
@@ -3218,7 +3488,11 @@ mod tests {
         for _ in 0..50 {
             r.do_work();
         }
-        assert_eq!(b.counters().append.load_acquire(), base, "gated DATA advanced the log");
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            base,
+            "gated DATA advanced the log"
+        );
         assert_eq!(
             st.append_positions_sent.load(Relaxed),
             0,
@@ -3228,10 +3502,15 @@ mod tests {
         // reopen: DATA accepted AND AppendPosition now flows
         gate.store(true, Relaxed);
         leader.send(to, DGRAM_KIND_DATA, base, TERM, &runs[0].1);
-        drive_until(&mut r, || b.counters().append.load_acquire() == base + runs[0].2);
+        drive_until(&mut r, || {
+            b.counters().append.load_acquire() == base + runs[0].2
+        });
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.append_positions_sent.load(Relaxed) == 0 {
-            assert!(Instant::now() < deadline, "AppendPosition never resumed after reopen");
+            assert!(
+                Instant::now() < deadline,
+                "AppendPosition never resumed after reopen"
+            );
             r.do_work();
         }
     }
@@ -3280,7 +3559,9 @@ mod tests {
             a.append(4, 7, &[9u8; 64]).unwrap();
             a.append(4, 8, &[9u8; 64]).unwrap();
         }
-        b.counters().durable.store_release(b.counters().append.load_acquire());
+        b.counters()
+            .durable
+            .store_release(b.counters().append.load_acquire());
         let recorded = b.counters().durable.load_acquire();
         assert_eq!(recorded, 288, "the stint appended two frames");
         let before = b.recordable_slice(96, 1 << 20).map(<[u8]>::to_vec);
@@ -3360,7 +3641,9 @@ mod tests {
 
         let st = r.stats();
         leader.send(to, DGRAM_KIND_DATA, runs[1].0, TERM, &runs[1].1);
-        drive_until(&mut r, || fired.load(Relaxed) == 1 && st.datagrams.load(Relaxed) == 2);
+        drive_until(&mut r, || {
+            fired.load(Relaxed) == 1 && st.datagrams.load(Relaxed) == 2
+        });
 
         assert_eq!(
             b.counters().append.load_acquire(),
@@ -3504,9 +3787,12 @@ mod tests {
         // append==288 — the union of the two framings.
         let append = b.counters().append.load_acquire();
         assert_eq!(append, 224, "the old term's 96 B span must not be counted");
-        let slice = b
-            .recordable_slice(0, 1 << 20)
-            .unwrap_or_else(|c| panic!("archive cannot walk [0, {append}): {}", b.corrupt_report(&c)));
+        let slice = b.recordable_slice(0, 1 << 20).unwrap_or_else(|c| {
+            panic!(
+                "archive cannot walk [0, {append}): {}",
+                b.corrupt_report(&c)
+            )
+        });
         assert_eq!(slice.len(), append as usize);
     }
 
@@ -3623,12 +3909,21 @@ mod tests {
         let to = r.local_addr();
 
         let mut nb = [0u8; NAK_BODY_LEN];
-        write_nak_body(&mut nb, &NakBody { position: 96, length: 192 });
+        write_nak_body(
+            &mut nb,
+            &NakBody {
+                position: 96,
+                length: 192,
+            },
+        );
         peer.send(to, DGRAM_KIND_NAK, 0, TERM, &nb);
         let mut sb = [0u8; STATUS_BODY_LEN];
         write_status_body(
             &mut sb,
-            &StatusBody { contiguous_position: 4096, receive_window: 1 << 20 },
+            &StatusBody {
+                contiguous_position: 4096,
+                receive_window: 1 << 20,
+            },
         );
         peer.send(to, DGRAM_KIND_STATUS, 0, TERM, &sb);
         // a stale-term NAK must be dropped, never demuxed
@@ -3638,7 +3933,10 @@ mod tests {
         let mut status = None;
         let deadline = Instant::now() + Duration::from_secs(5);
         while nak.is_none() || status.is_none() {
-            assert!(Instant::now() < deadline, "control never demuxed to the sender");
+            assert!(
+                Instant::now() < deadline,
+                "control never demuxed to the sender"
+            );
             r.do_work();
             while let Ok(m) = rx.try_recv() {
                 match m {
@@ -3648,15 +3946,31 @@ mod tests {
                 }
             }
         }
-        assert!(matches!(nak, Some(CtrlMsg::Nak { position: 96, length: 192, .. })));
-        assert!(matches!(status, Some(CtrlMsg::Status { contiguous: 4096, .. })));
+        assert!(matches!(
+            nak,
+            Some(CtrlMsg::Nak {
+                position: 96,
+                length: 192,
+                ..
+            })
+        ));
+        assert!(matches!(
+            status,
+            Some(CtrlMsg::Status {
+                contiguous: 4096,
+                ..
+            })
+        ));
         use std::sync::atomic::Ordering::Relaxed;
         let deadline = Instant::now() + Duration::from_secs(5);
         while r.stats().dropped_stale_term.load(Relaxed) < 1 {
             assert!(Instant::now() < deadline, "stale-term NAK never observed");
             r.do_work();
         }
-        assert!(rx.try_recv().is_err(), "stale-term control leaked to the sender");
+        assert!(
+            rx.try_recv().is_err(),
+            "stale-term control leaked to the sender"
+        );
     }
 
     // `leader_receiver_node_mode_routes_append_position_as_report` (the
@@ -3696,7 +4010,10 @@ mod tests {
             .join("uc2-net-receiver-crypto")
             .join(format!("{tag}-{seq}"));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        assert!(
+            !dir.starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {dir:?}"
+        );
         dir
     }
 
@@ -3718,7 +4035,9 @@ mod tests {
         let dir = crypto_scratch_dir(tag);
         let key_path = dir.join("node.key");
         write_key_file(&key_path, private);
-        uc_crypto::identity::Identity::load(&key_path).unwrap().public_bytes()
+        uc_crypto::identity::Identity::load(&key_path)
+            .unwrap()
+            .public_bytes()
     }
 
     /// Minimal standard-alphabet base64 WITH padding, matching
@@ -3728,8 +4047,7 @@ mod tests {
     /// allowlist-file text. 32 bytes in, 44 base64 chars out (one trailing
     /// `=`), same as any other X25519 public key this codebase writes.
     fn b64_32(bytes: &[u8; 32]) -> String {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0] as u32;
@@ -3738,8 +4056,16 @@ mod tests {
             let n = (b0 << 16) | (b1 << 8) | b2;
             out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
             out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-            out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-            out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 1 {
+                ALPHABET[((n >> 6) & 0x3F) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[(n & 0x3F) as usize] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -3764,7 +4090,9 @@ mod tests {
             allowlist_path: allow_path,
             rotation: uc_crypto::rotation::RotationPolicy::default(),
         };
-        uc_crypto::SharedTransport::new(&cfg, self_id).unwrap().unwrap()
+        uc_crypto::SharedTransport::new(&cfg, self_id)
+            .unwrap()
+            .unwrap()
     }
 
     /// Builds a real PEER (`PEER_ID`) and RECEIVER (`RECV_ID`) `SharedTransport`
@@ -3778,7 +4106,9 @@ mod tests {
     /// just its `SendHalf`: the receiver under test now SEALS its own
     /// outgoing control datagrams, so the fixture peer needs a `ReceiveHalf`
     /// to open them with as well.
-    fn established_crypto_pair(tag: &str) -> (uc_crypto::SharedTransport, uc_crypto::SharedTransport, u16) {
+    fn established_crypto_pair(
+        tag: &str,
+    ) -> (uc_crypto::SharedTransport, uc_crypto::SharedTransport, u16) {
         let peer_pub = identity_public(&format!("{tag}-peer-pub"), PRIV_PEER);
         let recv_pub = identity_public(&format!("{tag}-recv-pub"), PRIV_RECV);
         let peer = crypto_shared(
@@ -3858,7 +4188,9 @@ mod tests {
     /// already does for OTHER epochs) rather than through a `SendHalf`,
     /// since `SendHalf::seal`'s `sealing_epoch()` is driven by `mint`/fold
     /// state that (correctly, post-fix-2) can never point at epoch 0.
-    fn established_crypto_pair_with_forced_epoch_zero(tag: &str) -> (uc_crypto::SharedTransport, [u8; 32]) {
+    fn established_crypto_pair_with_forced_epoch_zero(
+        tag: &str,
+    ) -> (uc_crypto::SharedTransport, [u8; 32]) {
         let peer_pub = identity_public(&format!("{tag}-peer-pub"), PRIV_PEER);
         let recv_pub = identity_public(&format!("{tag}-recv-pub"), PRIV_RECV);
         let peer = crypto_shared(
@@ -3926,7 +4258,13 @@ mod tests {
 
     impl CryptoPeer {
         fn header(position: u64, kind: u8, key_epoch: u16) -> DatagramHeader {
-            DatagramHeader { position, leadership_term_id: TERM, kind, flags: 0, key_epoch }
+            DatagramHeader {
+                position,
+                leadership_term_id: TERM,
+                kind,
+                flags: 0,
+                key_epoch,
+            }
         }
 
         /// A real, correctly-sealed DATA datagram — exactly what a peer with
@@ -3954,7 +4292,13 @@ mod tests {
 
         /// Sealed (under an arbitrary key -- it never gets that far), but
         /// stamped with an epoch the receiver never minted or received.
-        fn send_sealed_under_epoch(&mut self, to: SocketAddr, epoch: u16, position: u64, payload: &[u8]) {
+        fn send_sealed_under_epoch(
+            &mut self,
+            to: SocketAddr,
+            epoch: u16,
+            position: u64,
+            payload: &[u8],
+        ) {
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
             write_datagram_header(&mut d, &Self::header(position, DGRAM_KIND_DATA, epoch));
             d.extend_from_slice(payload);
@@ -3999,13 +4343,20 @@ mod tests {
         let peer_addr = peer_sock.local_addr().unwrap();
 
         let mut cfg = FollowerConfig::new(peer_addr);
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX;
         cfg.append_pos_floor_ns = u64::MAX;
 
         let recv_half = recv_shared.receive_half();
-        let peer_ids =
-            if registered { peer_ids_of([(peer_addr, PEER_ID)]) } else { PeerIds::new() };
+        let peer_ids = if registered {
+            peer_ids_of([(peer_addr, PEER_ID)])
+        } else {
+            PeerIds::new()
+        };
         let r = FollowerReceiver::with_crypto(
             Arc::clone(&b),
             FaultSocket::bind("127.0.0.1:0").unwrap(),
@@ -4037,14 +4388,20 @@ mod tests {
     /// epoch by hand (`uc_crypto::seal::seal_in_place`, same pattern
     /// `CryptoPeer::send_sealed_under_epoch` already uses for other
     /// epochs).
-    fn receiver_with_forced_epoch_zero() -> (FollowerReceiver, FaultSocket, [u8; 32], Arc<LogBuffer>) {
-        let (recv_shared, seal_key) = established_crypto_pair_with_forced_epoch_zero("forced-epoch-zero");
+    fn receiver_with_forced_epoch_zero() -> (FollowerReceiver, FaultSocket, [u8; 32], Arc<LogBuffer>)
+    {
+        let (recv_shared, seal_key) =
+            established_crypto_pair_with_forced_epoch_zero("forced-epoch-zero");
         let b = buffer();
         let peer_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
         let peer_addr = peer_sock.local_addr().unwrap();
 
         let mut cfg = FollowerConfig::new(peer_addr);
-        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.nak = NakConfig {
+            delay_min_ns: 1,
+            delay_max_ns: 2,
+            backoff_ns: 1_000_000,
+        };
         cfg.status_floor_ns = u64::MAX;
         cfg.append_pos_floor_ns = u64::MAX;
 
@@ -4085,16 +4442,29 @@ mod tests {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
         write_datagram_header(
             &mut d,
-            &DatagramHeader { position: *pos, leadership_term_id: TERM, kind: DGRAM_KIND_DATA, flags: 0, key_epoch: 0 },
+            &DatagramHeader {
+                position: *pos,
+                leadership_term_id: TERM,
+                kind: DGRAM_KIND_DATA,
+                flags: 0,
+                key_epoch: 0,
+            },
         );
         d.extend_from_slice(bytes);
         uc_crypto::seal::seal_in_place(&mut d, &seal_key, 1).unwrap();
-        assert!(d.len() >= DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "must be a genuinely sealed-length datagram");
+        assert!(
+            d.len() >= DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
+            "must be a genuinely sealed-length datagram"
+        );
         peer_sock.send_to(&d, to).unwrap();
 
         drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
         let st = r.stats();
-        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "a real epoch-0 seal must not be misdiagnosed");
+        assert_eq!(
+            st.peer_appears_cleartext.load(Relaxed),
+            0,
+            "a real epoch-0 seal must not be misdiagnosed"
+        );
         assert_eq!(st.dropped_auth_failed.load(Relaxed), 0);
         assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 0);
     }
@@ -4114,10 +4484,20 @@ mod tests {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
         write_datagram_header(
             &mut d,
-            &DatagramHeader { position: 0, leadership_term_id: TERM, kind: DGRAM_KIND_HEARTBEAT, flags: 0, key_epoch: 0 },
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: TERM,
+                kind: DGRAM_KIND_HEARTBEAT,
+                flags: 0,
+                key_epoch: 0,
+            },
         );
         uc_crypto::seal::seal_in_place(&mut d, &seal_key, 1).unwrap();
-        assert_eq!(d.len(), DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "the minimal sealed frame is exactly 40 bytes");
+        assert_eq!(
+            d.len(),
+            DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
+            "the minimal sealed frame is exactly 40 bytes"
+        );
         peer_sock.send_to(&d, to).unwrap();
 
         let st = r.stats();
@@ -4126,10 +4506,17 @@ mod tests {
         // "reached on_datagram" signal (see the T17-allowance test's own
         // doc for the same idiom).
         while st.datagrams.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "the 40-byte epoch-0 HEARTBEAT was never admitted");
+            assert!(
+                Instant::now() < deadline,
+                "the 40-byte epoch-0 HEARTBEAT was never admitted"
+            );
             r.do_work();
         }
-        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "a real epoch-0 seal must not be misdiagnosed");
+        assert_eq!(
+            st.peer_appears_cleartext.load(Relaxed),
+            0,
+            "a real epoch-0 seal must not be misdiagnosed"
+        );
         assert_eq!(st.dropped_auth_failed.load(Relaxed), 0);
         assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 0);
     }
@@ -4143,7 +4530,11 @@ mod tests {
         peer.send_sealed_data(to, *pos, bytes);
         drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
         let s = b.recordable_slice(0, 1 << 20).unwrap();
-        assert_eq!(&s[32..36], b"aaaa", "downstream sees plaintext, byte-identical to the cleartext path");
+        assert_eq!(
+            &s[32..36],
+            b"aaaa",
+            "downstream sees plaintext, byte-identical to the cleartext path"
+        );
     }
 
     /// M8 (Task 12), the M7 runtime-node-add shape: a peer whose address had
@@ -4174,7 +4565,11 @@ mod tests {
             assert!(Instant::now() < deadline, "unregistered peer never counted");
             r.do_work();
         }
-        assert_eq!(b.counters().append.load_acquire(), 0, "nothing was admitted");
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            0,
+            "nothing was admitted"
+        );
 
         // Membership publishes the joiner. No restart, no reconstruction.
         ids.store([(peer_addr, PEER_ID)]);
@@ -4199,7 +4594,11 @@ mod tests {
             r.do_work();
         }
         assert_eq!(st.dropped_auth_failed.load(Relaxed), 1);
-        assert_eq!(b.counters().append.load_acquire(), 0, "forged bytes never reach the log buffer");
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            0,
+            "forged bytes never reach the log buffer"
+        );
     }
 
     #[test]
@@ -4254,13 +4653,19 @@ mod tests {
             r.do_work();
         }
         assert_eq!(st.dropped_replay.load(Relaxed), 1);
-        assert_eq!(b.counters().append.load_acquire(), *advance, "the replay did not double-apply");
         assert_eq!(
-            st.dropped_dup.load(Relaxed), dup0,
+            b.counters().append.load_acquire(),
+            *advance,
+            "the replay did not double-apply"
+        );
+        assert_eq!(
+            st.dropped_dup.load(Relaxed),
+            dup0,
             "the replay must never reach on_datagram at all, not merely be re-rejected there as a dup"
         );
         assert_eq!(
-            st.dropped_malformed.load(Relaxed), malformed0,
+            st.dropped_malformed.load(Relaxed),
+            malformed0,
             "the replay must never reach on_datagram at all, not merely be re-rejected there as malformed"
         );
     }
@@ -4282,7 +4687,11 @@ mod tests {
             r.do_work();
         }
         assert_eq!(st.peer_appears_cleartext.load(Relaxed), 1);
-        assert_eq!(st.dropped_auth_failed.load(Relaxed), 0, "distinguishable from a generic auth failure");
+        assert_eq!(
+            st.dropped_auth_failed.load(Relaxed),
+            0,
+            "distinguishable from a generic auth failure"
+        );
         assert_eq!(b.counters().append.load_acquire(), 0);
     }
 
@@ -4295,7 +4704,10 @@ mod tests {
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.dropped_unknown_epoch.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "unknown-epoch datagram never counted");
+            assert!(
+                Instant::now() < deadline,
+                "unknown-epoch datagram never counted"
+            );
             r.do_work();
         }
         assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 1);
@@ -4370,12 +4782,23 @@ mod tests {
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.dropped_unknown_peer.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "datagram from an unregistered address never counted");
+            assert!(
+                Instant::now() < deadline,
+                "datagram from an unregistered address never counted"
+            );
             r.do_work();
         }
         assert_eq!(st.dropped_unknown_peer.load(Relaxed), 1);
-        assert_eq!(st.dropped_auth_failed.load(Relaxed), 1, "folded into the mandated auth-failed bucket too");
-        assert_eq!(b.counters().append.load_acquire(), 0, "an unresolvable sender's bytes never land");
+        assert_eq!(
+            st.dropped_auth_failed.load(Relaxed),
+            1,
+            "folded into the mandated auth-failed bucket too"
+        );
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            0,
+            "an unresolvable sender's bytes never land"
+        );
     }
 
     // ======================================================================
@@ -4401,7 +4824,11 @@ mod tests {
         /// an order the test does not control, and dropping the ones that
         /// arrive early would make the test flaky rather than discriminating.
         fn await_raw(&mut self, r: &mut FollowerReceiver, kind: u8) -> Option<Vec<u8>> {
-            if let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).unwrap().kind == kind) {
+            if let Some(i) = self
+                .stash
+                .iter()
+                .position(|d| read_datagram_header(d).unwrap().kind == kind)
+            {
                 return Some(self.stash.remove(i));
             }
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -4425,12 +4852,10 @@ mod tests {
         /// `await_raw`, then assert the datagram is a REAL seal by opening it
         /// on this peer's own `ReceiveHalf`. Returns `(wire bytes, plaintext
         /// body)`.
-        fn await_sealed(
-            &mut self,
-            r: &mut FollowerReceiver,
-            kind: u8,
-        ) -> (Vec<u8>, Vec<u8>) {
-            let wire = self.await_raw(r, kind).unwrap_or_else(|| panic!("no kind-{kind} arrived"));
+        fn await_sealed(&mut self, r: &mut FollowerReceiver, kind: u8) -> (Vec<u8>, Vec<u8>) {
+            let wire = self
+                .await_raw(r, kind)
+                .unwrap_or_else(|| panic!("no kind-{kind} arrived"));
             let mut d = wire.clone();
             let n = d.len();
             let len = self
@@ -4468,11 +4893,22 @@ mod tests {
 
         let (nak_wire, nak_body) = peer.await_sealed(&mut r, DGRAM_KIND_NAK);
         let nak = read_nak_body(&nak_body).unwrap();
-        assert_eq!(nak.position, 0, "the follower NAKs from its contiguous frontier");
+        assert_eq!(
+            nak.position, 0,
+            "the follower NAKs from its contiguous frontier"
+        );
         let mut expect = vec![0u8; NAK_BODY_LEN];
-        write_nak_body(&mut expect, &NakBody { position: nak.position, length: nak.length });
+        write_nak_body(
+            &mut expect,
+            &NakBody {
+                position: nak.position,
+                length: nak.length,
+            },
+        );
         assert!(
-            !nak_wire.windows(NAK_BODY_LEN).any(|w| w == expect.as_slice()),
+            !nak_wire
+                .windows(NAK_BODY_LEN)
+                .any(|w| w == expect.as_slice()),
             "the NAK body must not be readable on the wire"
         );
         assert_eq!(
@@ -4486,7 +4922,9 @@ mod tests {
         let mut expect = vec![0u8; STATUS_BODY_LEN];
         write_status_body(&mut expect, &status);
         assert!(
-            !st_wire.windows(STATUS_BODY_LEN).any(|w| w == expect.as_slice()),
+            !st_wire
+                .windows(STATUS_BODY_LEN)
+                .any(|w| w == expect.as_slice()),
             "the STATUS body must not be readable on the wire"
         );
 
@@ -4512,12 +4950,21 @@ mod tests {
     /// in the lib target, so this falls back to a package-relative `target/`
     /// directory — the same shape as `uc_node/src/audit.rs`'s helper.
     fn snap_scratch_dir() -> tempfile::TempDir {
-        let root = std::env::var("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_net_tests")
-        });
-        assert!(!root.starts_with("/tmp"), "test scratch must not live on tmpfs: {}", root.display());
+        let root = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_net_tests")
+            });
+        assert!(
+            !root.starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {}",
+            root.display()
+        );
         std::fs::create_dir_all(&root).expect("scratch root");
-        tempfile::Builder::new().prefix("uc2-snap-").tempdir_in(&root).expect("tempdir")
+        tempfile::Builder::new()
+            .prefix("uc2-snap-")
+            .tempdir_in(&root)
+            .expect("tempdir")
     }
 
     /// The other direction of a snapshot session — the receiving node's own
@@ -4601,8 +5048,16 @@ mod tests {
             "an unsealable control datagram must be counted, not silently sent"
         );
         assert_eq!(st.naks_sent.load(Relaxed), 0, "no NAK reached the wire");
-        assert_eq!(st.statuses_sent.load(Relaxed), 0, "no STATUS reached the wire");
-        assert_eq!(st.append_positions_sent.load(Relaxed), 0, "no AppendPosition reached the wire");
+        assert_eq!(
+            st.statuses_sent.load(Relaxed),
+            0,
+            "no STATUS reached the wire"
+        );
+        assert_eq!(
+            st.append_positions_sent.load(Relaxed),
+            0,
+            "no AppendPosition reached the wire"
+        );
         let mut buf = [0u8; 4096];
         assert!(
             peer.sock.recv_from(&mut buf).unwrap().is_none(),
@@ -4667,7 +5122,11 @@ mod tests {
             r.snap_intake.is_none(),
             "no snapshot intake may be opened by an unauthenticated SNAP_BEGIN"
         );
-        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "not the mixed-mode diagnostic");
+        assert_eq!(
+            st.peer_appears_cleartext.load(Relaxed),
+            0,
+            "not the mixed-mode diagnostic"
+        );
     }
 
     /// Same rule for `SNAP_CHUNK`: the artifact's bytes may not be written
@@ -4699,7 +5158,10 @@ mod tests {
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the sealed SNAP_BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the sealed SNAP_BEGIN never opened an intake"
+            );
             r.do_work();
         }
 
@@ -4711,11 +5173,21 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.dropped_auth_failed.load(Relaxed) == before_auth {
-            assert!(Instant::now() < deadline, "an unsealed SNAP_CHUNK was admitted");
+            assert!(
+                Instant::now() < deadline,
+                "an unsealed SNAP_CHUNK was admitted"
+            );
             r.do_work();
         }
-        let intake = r.snap_intake.as_ref().expect("the real session is still open");
-        assert_eq!(intake.got.contiguous(), 0, "no forged bytes landed in the .part");
+        let intake = r
+            .snap_intake
+            .as_ref()
+            .expect("the real session is still open");
+        assert_eq!(
+            intake.got.contiguous(),
+            0,
+            "no forged bytes landed in the .part"
+        );
     }
 
     #[test]
@@ -4761,11 +5233,23 @@ mod tests {
     #[test]
     fn next_declared_id_walks_a_sparse_declared_mask() {
         assert_eq!(next_declared_id(0b101, None), Some(0));
-        assert_eq!(next_declared_id(0b101, Some(0)), Some(2), "id 1 is NOT declared");
+        assert_eq!(
+            next_declared_id(0b101, Some(0)),
+            Some(2),
+            "id 1 is NOT declared"
+        );
         assert_eq!(next_declared_id(0b101, Some(2)), None);
-        assert_eq!(next_declared_id(0b110, None), Some(1), "a mask that does not start at 0");
+        assert_eq!(
+            next_declared_id(0b110, None),
+            Some(1),
+            "a mask that does not start at 0"
+        );
         assert_eq!(next_declared_id(1 << 63, None), Some(63));
-        assert_eq!(next_declared_id(1 << 63, Some(63)), None, "no shift past bit 63");
+        assert_eq!(
+            next_declared_id(1 << 63, Some(63)),
+            None,
+            "no shift past bit 63"
+        );
         assert_eq!(next_declared_id(0, None), None);
     }
 
@@ -4784,19 +5268,35 @@ mod tests {
         // Pin the intake's own NAK timer far into the future: every SNAP_NAK
         // this test sees is then unambiguously the missing-BEGIN probe, never
         // an ordinary gap NAK (artifact 0's 64 bytes never arrive here).
-        r.snap_nak_cfg =
-            NakConfig { delay_min_ns: 1 << 40, delay_max_ns: 1 << 40, backoff_ns: 1 << 40 };
+        r.snap_nak_cfg = NakConfig {
+            delay_min_ns: 1 << 40,
+            delay_max_ns: 1 << 40,
+            backoff_ns: 1 << 40,
+        };
         let to = r.local_addr();
 
-        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 0, 4096, 64, 0b111));
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            &snap_begin_wire(11, 0, 4096, 64, 0b111),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the first BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the first BEGIN never opened an intake"
+            );
             r.do_work();
         }
 
         // id 1 is still un-announced, so id 2 cannot be placed.
-        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 2, 8192, 64, 0b111));
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            &snap_begin_wire(11, 2, 8192, 64, 0b111),
+        );
         let (_, body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_NAK);
         let nak = read_snap_nak_body(&body).expect("a well-formed SNAP_NAK body");
         assert_eq!(
@@ -4804,7 +5304,10 @@ mod tests {
             (11, 64, 1),
             "a one-byte probe at announced_len — 'send me the BEGIN that starts here'"
         );
-        assert!(!dir.path().join("2").exists(), "the skipped-ahead artifact is not placed");
+        assert!(
+            !dir.path().join("2").exists(),
+            "the skipped-ahead artifact is not placed"
+        );
         assert_eq!(
             r.snap_intake.as_ref().unwrap().parts.len(),
             1,
@@ -4812,24 +5315,44 @@ mod tests {
         );
 
         // The prompted BEGIN lands: id 1 is placed at base 64...
-        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 1, 5120, 64, 0b111));
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            &snap_begin_wire(11, 1, 5120, 64, 0b111),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().unwrap().parts.len() < 2 {
-            assert!(Instant::now() < deadline, "the prompted BEGIN was never placed");
+            assert!(
+                Instant::now() < deadline,
+                "the prompted BEGIN was never placed"
+            );
             r.do_work();
         }
         assert!(dir.path().join("1").join("incoming-5120.part").exists());
 
         // ...and the re-sent BEGIN(2) now places, at base 128.
-        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &snap_begin_wire(11, 2, 8192, 64, 0b111));
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            &snap_begin_wire(11, 2, 8192, 64, 0b111),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().unwrap().parts.len() < 3 {
-            assert!(Instant::now() < deadline, "the re-sent BEGIN(2) was never placed");
+            assert!(
+                Instant::now() < deadline,
+                "the re-sent BEGIN(2) was never placed"
+            );
             r.do_work();
         }
         let intake = r.snap_intake.as_ref().unwrap();
         assert_eq!(
-            intake.parts.iter().map(|p| (p.service_id, p.base)).collect::<Vec<_>>(),
+            intake
+                .parts
+                .iter()
+                .map(|p| (p.service_id, p.base))
+                .collect::<Vec<_>>(),
             vec![(0, 0), (1, 64), (2, 128)],
             "each artifact sits at the SUM of its predecessors' lengths"
         );
@@ -4854,7 +5377,10 @@ mod tests {
         let (_, first) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
         assert_eq!(read_snap_begin_body(&first).unwrap().session, 21);
         let part = dir.path().join("0").join("incoming-4096.part");
-        assert!(dir.path().join("0").join("snap-4096.ultsnap").exists(), "renamed");
+        assert!(
+            dir.path().join("0").join("snap-4096.ultsnap").exists(),
+            "renamed"
+        );
         assert!(!part.exists(), "the .part is gone once renamed");
 
         // The DONE was lost on the wire: the leader re-sends the BEGIN.
@@ -4885,10 +5411,19 @@ mod tests {
         let st = r.stats();
         let to = r.local_addr();
 
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(4, 0, 4096, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(4, 0, 4096, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the BEGIN never opened an intake"
+            );
             r.do_work();
         }
         let part = dir.path().join("0").join("incoming-4096.part");
@@ -4911,10 +5446,16 @@ mod tests {
         stranger.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &legacy);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_refused_legacy_peer.load(Relaxed) == 0 {
-            assert!(Instant::now() < deadline, "the stranger's refusal was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the stranger's refusal was never counted"
+            );
             r.do_work();
         }
-        assert!(r.snap_intake.is_some(), "an unrelated peer may not kill a live transfer");
+        assert!(
+            r.snap_intake.is_some(),
+            "an unrelated peer may not kill a live transfer"
+        );
         assert!(part.exists(), "nor delete its .part");
 
         // From the peer we are actually transferring with, it does drop the
@@ -4922,11 +5463,20 @@ mod tests {
         leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &legacy);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_refused_legacy_peer.load(Relaxed) < 2 {
-            assert!(Instant::now() < deadline, "the leader's refusal was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the leader's refusal was never counted"
+            );
             r.do_work();
         }
-        assert!(r.snap_intake.is_none(), "our own leader's legacy BEGIN drops the session");
-        assert!(!part.exists(), "an abandoned .part must not leak a full-size file");
+        assert!(
+            r.snap_intake.is_none(),
+            "our own leader's legacy BEGIN drops the session"
+        );
+        assert!(
+            !part.exists(),
+            "an abandoned .part must not leak a full-size file"
+        );
     }
 
     /// M14c: a NEW session from the same peer replaces a stale intake — and
@@ -4940,23 +5490,44 @@ mod tests {
         r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
         let to = r.local_addr();
 
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(1, 0, 4096, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(1, 0, 4096, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the first BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the first BEGIN never opened an intake"
+            );
             r.do_work();
         }
         let stale = dir.path().join("0").join("incoming-4096.part");
         assert!(stale.exists());
 
         // A second session (the first one timed out at the leader), newer floor.
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(2, 0, 8192, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(2, 0, 8192, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().is_none_or(|i| i.session != 2) {
-            assert!(Instant::now() < deadline, "the replacing BEGIN never took over");
+            assert!(
+                Instant::now() < deadline,
+                "the replacing BEGIN never took over"
+            );
             r.do_work();
         }
-        assert!(dir.path().join("0").join("incoming-8192.part").exists(), "the new .part");
+        assert!(
+            dir.path().join("0").join("incoming-8192.part").exists(),
+            "the new .part"
+        );
         assert!(!stale.exists(), "the superseded .part must not be orphaned");
     }
 
@@ -4974,10 +5545,19 @@ mod tests {
         let dir = snap_scratch_dir();
         r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
         let to = r.local_addr();
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(session, 0, 4096, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(session, 0, 4096, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the BEGIN never opened an intake"
+            );
             r.do_work();
         }
         let part = dir.path().join("0").join("incoming-4096.part");
@@ -5012,13 +5592,26 @@ mod tests {
         r.snap_upkeep(opened + SNAP_INTAKE_TIMEOUT_NS);
         assert!(r.snap_intake.is_none(), "the dead intake is dropped");
         assert!(!part.exists(), "its pre-sized .part must not leak");
-        assert_eq!(st.snap_intake_abandoned.load(Ordering::Relaxed), 1, "counted exactly once");
+        assert_eq!(
+            st.snap_intake_abandoned.load(Ordering::Relaxed),
+            1,
+            "counted exactly once"
+        );
 
         // A later session opens a fresh intake, exactly as if none had existed.
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(6, 0, 8192, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(6, 0, 8192, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "a later BEGIN must open a fresh intake");
+            assert!(
+                Instant::now() < deadline,
+                "a later BEGIN must open a fresh intake"
+            );
             r.do_work();
         }
         assert_eq!(r.snap_intake.as_ref().unwrap().session, 6);
@@ -5038,7 +5631,11 @@ mod tests {
 
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 32]);
         let deadline = Instant::now() + Duration::from_secs(3);
-        while r.snap_intake.as_ref().is_none_or(|i| i.got.contiguous() == 0) {
+        while r
+            .snap_intake
+            .as_ref()
+            .is_none_or(|i| i.got.contiguous() == 0)
+        {
             assert!(Instant::now() < deadline, "the chunk never landed");
             r.do_work();
         }
@@ -5077,7 +5674,10 @@ mod tests {
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_refused_legacy_peer.load(Relaxed) < 3 {
-            assert!(Instant::now() < deadline, "the three legacy bodies were never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the three legacy bodies were never counted"
+            );
             r.do_work();
         }
         assert_eq!(
@@ -5090,14 +5690,26 @@ mod tests {
         // latch — nothing about a refusal says the peer speaks a wire we can
         // install a set over. `total_len == 0` is the cheapest decodable
         // refusal, and it returns before the latch clear.
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(9, 0, 4096, 0, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(9, 0, 4096, 0, 0b1),
+        );
         leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &short);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_refused_legacy_peer.load(Relaxed) < 4 {
-            assert!(Instant::now() < deadline, "the post-refusal legacy body was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the post-refusal legacy body was never counted"
+            );
             r.do_work();
         }
-        assert!(r.snap_intake.is_none(), "a total_len == 0 BEGIN opens no intake");
+        assert!(
+            r.snap_intake.is_none(),
+            "a total_len == 0 BEGIN opens no intake"
+        );
         assert_eq!(
             st.snap_begin_undecodable.load(Relaxed),
             1,
@@ -5105,20 +5717,36 @@ mod tests {
         );
 
         // A decodable, ACCEPTED BEGIN clears it: the wire is speakable again.
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(9, 0, 4096, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(9, 0, 4096, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the decodable BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the decodable BEGIN never opened an intake"
+            );
             r.do_work();
         }
-        assert_eq!(st.snap_begin_undecodable.load(Relaxed), 1, "a decodable BEGIN counts nothing");
+        assert_eq!(
+            st.snap_begin_undecodable.load(Relaxed),
+            1,
+            "a decodable BEGIN counts nothing"
+        );
 
         for _ in 0..2 {
             leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &short);
         }
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_refused_legacy_peer.load(Relaxed) < 6 {
-            assert!(Instant::now() < deadline, "the second legacy burst was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the second legacy burst was never counted"
+            );
             r.do_work();
         }
         assert_eq!(
@@ -5152,7 +5780,10 @@ mod tests {
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 32]);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_intake_io_failures.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "the failed chunk write was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the failed chunk write was never counted"
+            );
             r.do_work();
         }
         assert_eq!(
@@ -5164,10 +5795,16 @@ mod tests {
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 32, TERM, &[0xCDu8; 32]);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_intake_io_failures.load(Relaxed) < 2 {
-            assert!(Instant::now() < deadline, "the second failure was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the second failure was never counted"
+            );
             r.do_work();
         }
-        assert!(r.snap_intake.is_some(), "a write failure is not fatal to the intake");
+        assert!(
+            r.snap_intake.is_some(),
+            "a write failure is not fatal to the intake"
+        );
     }
 
     /// M14c ruling M(1) / M14c2 (T10a): `upkeep` calls `snap_upkeep` TWICE per
@@ -5193,16 +5830,28 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("0")).unwrap();
         std::fs::create_dir(dir.path().join("0").join("snap-4096.ultsnap")).unwrap();
 
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(14, 0, 4096, 64, 0b1));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(14, 0, 4096, 64, 0b1),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.is_none() {
-            assert!(Instant::now() < deadline, "the BEGIN never opened an intake");
+            assert!(
+                Instant::now() < deadline,
+                "the BEGIN never opened an intake"
+            );
             r.do_work();
         }
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 64]);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_intake_io_failures.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "the blocked publish was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the blocked publish was never counted"
+            );
             r.do_work();
         }
 
@@ -5223,9 +5872,11 @@ mod tests {
             2,
             "past the interval, the re-drive attempts again"
         );
-        assert!(r.snap_intake.is_some(), "the intake is still waiting on the obstacle");
+        assert!(
+            r.snap_intake.is_some(),
+            "the intake is still waiting on the obstacle"
+        );
     }
-
 
     /// M14c2 (T10a) fix round 1, REQUIRED 1: the cadence must hold on the
     /// CHUNK path too. `snap_chunk` called `snap_publish_complete_parts`
@@ -5255,8 +5906,20 @@ mod tests {
         std::fs::create_dir(dir.path().join("0").join("snap-4096.ultsnap")).unwrap();
 
         // Artifact 0: 64 B at stream base 0. Artifact 1: 640 B at base 64.
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(21, 0, 4096, 64, 0b11));
-        leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &snap_begin_wire(21, 1, 5120, 640, 0b11));
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(21, 0, 4096, 64, 0b11),
+        );
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(21, 1, 5120, 640, 0b11),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().is_none_or(|i| i.parts.len() < 2) {
             assert!(Instant::now() < deadline, "both BEGINs were never placed");
@@ -5268,7 +5931,10 @@ mod tests {
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xA0u8; 64]);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_intake_io_failures.load(Relaxed) < 1 {
-            assert!(Instant::now() < deadline, "the blocked rename was never counted");
+            assert!(
+                Instant::now() < deadline,
+                "the blocked rename was never counted"
+            );
             r.do_work();
         }
 
@@ -5285,8 +5951,15 @@ mod tests {
             leader.send(to, DGRAM_KIND_SNAP_CHUNK, 64 + k * 64, TERM, &[0xB1u8; 64]);
         }
         let deadline = Instant::now() + Duration::from_secs(3);
-        while r.snap_intake.as_ref().is_none_or(|i| i.got.contiguous() < 640) {
-            assert!(Instant::now() < deadline, "artifact 1's chunks never landed");
+        while r
+            .snap_intake
+            .as_ref()
+            .is_none_or(|i| i.got.contiguous() < 640)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "artifact 1's chunks never landed"
+            );
             r.do_work();
         }
         let burst_elapsed = burst_start.elapsed();
@@ -5309,11 +5982,16 @@ mod tests {
         // measured as a delta off whatever the count is now (so a skipped
         // assertion above never turns this one into a bare inequality).
         let before_redrive = st.snap_intake_io_failures.load(Relaxed);
-        std::thread::sleep(Duration::from_millis(SNAP_REDRIVE_INTERVAL_NS / 1_000_000 + 10));
+        std::thread::sleep(Duration::from_millis(
+            SNAP_REDRIVE_INTERVAL_NS / 1_000_000 + 10,
+        ));
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 640, TERM, &[0xB1u8; 64]);
         let deadline = Instant::now() + Duration::from_secs(3);
         while st.snap_intake_io_failures.load(Relaxed) < before_redrive + 1 {
-            assert!(Instant::now() < deadline, "the re-drive never fired past the interval");
+            assert!(
+                Instant::now() < deadline,
+                "the re-drive never fired past the interval"
+            );
             r.do_work();
         }
         assert_eq!(
@@ -5327,10 +6005,12 @@ mod tests {
         std::fs::remove_dir(dir.path().join("0").join("snap-4096.ultsnap")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !dir.path().join("1").join("snap-5120.ultsnap").is_file() {
-            assert!(Instant::now() < deadline, "the set never published once cleared");
+            assert!(
+                Instant::now() < deadline,
+                "the set never published once cleared"
+            );
             r.do_work();
         }
         assert!(dir.path().join("0").join("snap-4096.ultsnap").is_file());
     }
-
 }

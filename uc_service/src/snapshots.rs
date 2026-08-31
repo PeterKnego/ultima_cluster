@@ -74,7 +74,9 @@ impl SnapshotStore {
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(pos) = name.to_str().and_then(parse_snap_pos) else { continue };
+            let Some(pos) = name.to_str().and_then(parse_snap_pos) else {
+                continue;
+            };
             if pos > at_most {
                 continue;
             }
@@ -148,7 +150,11 @@ impl SnapshotStore {
 /// file, a foreign file an operator dropped in, a malformed number) is `None`
 /// and silently ignored by both `newest` and `retain_newest`.
 fn parse_snap_pos(file_name: &str) -> Option<u64> {
-    file_name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?.parse().ok()
+    file_name
+        .strip_prefix(PREFIX)?
+        .strip_suffix(SUFFIX)?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -171,7 +177,10 @@ mod tests {
         assert!(path.ends_with("snap-4096.ultsnap"));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
 
-        let (pos, found) = store.newest(u64::MAX).unwrap().expect("published file exists");
+        let (pos, found) = store
+            .newest(u64::MAX)
+            .unwrap()
+            .expect("published file exists");
         assert_eq!(pos, 4096);
         assert_eq!(found, path);
     }
@@ -188,14 +197,23 @@ mod tests {
             Err(SnapshotError::Codec("boom".into()))
         });
         assert!(result.is_err());
-        assert!(store.newest(u64::MAX).unwrap().is_none(), "a torn build is never `newest`");
-        assert!(!store.path_for(100).exists(), "final name was never created");
+        assert!(
+            store.newest(u64::MAX).unwrap().is_none(),
+            "a torn build is never `newest`"
+        );
+        assert!(
+            !store.path_for(100).exists(),
+            "final name was never created"
+        );
         // No leftover temp file either (best-effort cleanup on failure).
         let entries: Vec<_> = std::fs::read_dir(dir.path().join("snapshots").join("0"))
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert!(entries.is_empty(), "no stray temp file after a failed publish: {entries:?}");
+        assert!(
+            entries.is_empty(),
+            "no stray temp file after a failed publish: {entries:?}"
+        );
     }
 
     /// A `.tmp` file placed directly in the directory (simulating a process
@@ -206,7 +224,14 @@ mod tests {
     fn a_bare_temp_file_on_disk_is_never_newest() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
-        std::fs::write(dir.path().join("snapshots").join("0").join("snap-500.ultsnap.tmp"), b"torn").unwrap();
+        std::fs::write(
+            dir.path()
+                .join("snapshots")
+                .join("0")
+                .join("snap-500.ultsnap.tmp"),
+            b"torn",
+        )
+        .unwrap();
         assert!(store.newest(u64::MAX).unwrap().is_none());
         assert!(store.newest(500).unwrap().is_none());
     }
@@ -224,7 +249,11 @@ mod tests {
             .filter_map(|e| parse_snap_pos(&e.file_name().to_string_lossy()))
             .collect();
         remaining.sort_unstable();
-        assert_eq!(remaining, vec![300, 400], "keep-newest-2, oldest two unlinked");
+        assert_eq!(
+            remaining,
+            vec![300, 400],
+            "keep-newest-2, oldest two unlinked"
+        );
     }
 
     /// `newest(at_most)` picks the right one among a sparse set, per the
@@ -239,7 +268,11 @@ mod tests {
         assert_eq!(store.newest(u64::MAX).unwrap().map(|(p, _)| p), Some(900));
         assert_eq!(store.newest(500).unwrap().map(|(p, _)| p), Some(100));
         assert_eq!(store.newest(900).unwrap().map(|(p, _)| p), Some(900));
-        assert_eq!(store.newest(99).unwrap(), None, "nothing qualifies below the oldest");
+        assert_eq!(
+            store.newest(99).unwrap(),
+            None,
+            "nothing qualifies below the oldest"
+        );
     }
 
     #[test]

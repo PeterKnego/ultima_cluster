@@ -112,7 +112,13 @@ impl NodeH {
     fn restart(&mut self, members: &[(NodeId, SocketAddr)]) {
         assert!(self.node.is_none(), "restart of a live node");
         let sock = rebind(self.addr);
-        let cfg = make_config(self.id, members.to_vec(), self.instance_dir.clone(), self.seed, self.addr);
+        let cfg = make_config(
+            self.id,
+            members.to_vec(),
+            self.instance_dir.clone(),
+            self.seed,
+            self.addr,
+        );
         self.node = Some(Node::start_with_socket(cfg, sock).expect("restart"));
     }
 }
@@ -174,19 +180,35 @@ struct Cluster {
 /// Bind every node's socket FIRST (so the full member map is known before any
 /// agent runs), then start each node on its pre-bound socket.
 fn spawn_cluster(root: &Path, n: usize) -> Cluster {
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
         let instance_dir = root.join(format!("n{i}"));
         let seed = seed_for(i);
-        let cfg = make_config(i as NodeId, members.clone(), instance_dir.clone(), seed, addr);
+        let cfg = make_config(
+            i as NodeId,
+            members.clone(),
+            instance_dir.clone(),
+            seed,
+            addr,
+        );
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, instance_dir, seed, node: Some(node) });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            addr,
+            instance_dir,
+            seed,
+            node: Some(node),
+        });
     }
     Cluster { members, nodes }
 }
@@ -210,12 +232,19 @@ fn await_until(secs: u64, msg: &str, mut f: impl FnMut() -> bool) {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].live() && nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].live() && nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
             let i = serving[0];
-            assert!(nodes[i].is_leader(), "serving node {i} is not flagged leader");
+            assert!(
+                nodes[i].is_leader(),
+                "serving node {i} is not flagged leader"
+            );
             return i;
         }
         assert!(Instant::now() < deadline, "no single leader elected");
@@ -228,8 +257,15 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
 fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = idxs.iter().copied().filter(|&i| nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain among {idxs:?}: {serving:?} serve");
+        let serving: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain among {idxs:?}: {serving:?} serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -249,7 +285,10 @@ fn drive_load(node: &NodeH, secs: u64) {
         // Admission window vs commit (leader-local counters).
         loop {
             let c = node.n().counters();
-            let inflight = c.append.load_acquire().saturating_sub(c.commit.load_acquire());
+            let inflight = c
+                .append
+                .load_acquire()
+                .saturating_sub(c.commit.load_acquire());
             if inflight <= ADMISSION_BUDGET {
                 break;
             }
@@ -285,7 +324,10 @@ fn main() {
         .next()
         .expect("usage: m4_gate <journal_root> [iterations=10]")
         .into();
-    let iterations: u32 = args.next().map(|s| s.parse().expect("iterations")).unwrap_or(10);
+    let iterations: u32 = args
+        .next()
+        .map(|s| s.parse().expect("iterations"))
+        .unwrap_or(10);
     assert!(
         !root.starts_with("/tmp"),
         "journal_root must be on a real filesystem (never /tmp — RAM tmpfs)"
@@ -326,7 +368,9 @@ fn main() {
         let survivors: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
         // Committed floor a survivor observed just before the kill — nothing at
         // or below this may ever be lost.
-        let floor = c.nodes[survivors[0]].commit().min(c.nodes[survivors[1]].commit());
+        let floor = c.nodes[survivors[0]]
+            .commit()
+            .min(c.nodes[survivors[1]].commit());
         let leader_append = c.nodes[leader].append();
         let leader_commit = c.nodes[leader].commit();
 
@@ -367,7 +411,11 @@ fn main() {
             leader_append.saturating_sub(leader_commit),
             serve.as_secs_f64() * 1e3,
             advance.as_secs_f64() * 1e3,
-            if lost { "LOST-COMMITTED-DATA" } else { "no-loss" },
+            if lost {
+                "LOST-COMMITTED-DATA"
+            } else {
+                "no-loss"
+            },
         );
 
         last_term = new_term;
@@ -404,7 +452,10 @@ fn main() {
     );
     println!("truncations observed {total_truncations}  (deposed leaders cut divergent tails)");
     println!("terms consumed       {terms_consumed}  (t{first_term} -> t{last_term})");
-    println!("committed loss       {}", if zero_loss { "none" } else { "DETECTED" });
+    println!(
+        "committed loss       {}",
+        if zero_loss { "none" } else { "DETECTED" }
+    );
 
     let pass = zero_loss && worst_serve < SERVE_BUDGET;
     println!(

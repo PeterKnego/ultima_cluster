@@ -102,10 +102,14 @@ fn spawn_cluster(n: usize) -> Cluster {
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir");
     // Bind every socket first so the full member map is known before any agent.
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(u32, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(u32, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
     let mut dirs = Vec::with_capacity(n);
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
@@ -116,7 +120,12 @@ fn spawn_cluster(n: usize) -> Cluster {
         let cfg = make_config(i as u32, members.clone(), instance_dir, seed, addr);
         nodes.push(Node::start_with_socket(cfg, sock).expect("start"));
     }
-    Cluster { _dir: dir, dirs, members, nodes }
+    Cluster {
+        _dir: dir,
+        dirs,
+        members,
+        nodes,
+    }
 }
 
 /// Wait for exactly one serving leader; assert no split-brain throughout.
@@ -124,9 +133,15 @@ fn await_single_leader(nodes: &[Node], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
-            assert!(nodes[serving[0]].is_leader(), "serving node not flagged leader");
+            assert!(
+                nodes[serving[0]].is_leader(),
+                "serving node not flagged leader"
+            );
             return serving[0];
         }
         assert!(Instant::now() < deadline, "no single leader elected");
@@ -147,7 +162,9 @@ fn cut(nodes: &[Node], a: usize, b: usize, members: &[(u32, SocketAddr)]) {
 
 fn drive_submits(client: &Client, n: u64) {
     for _ in 0..n {
-        let _total: u64 = client.submit(&Cmd::Add(1)).expect("submit to serving leader");
+        let _total: u64 = client
+            .submit(&Cmd::Add(1))
+            .expect("submit to serving leader");
     }
 }
 
@@ -170,7 +187,10 @@ fn stale_leader_fails_linearizable_read_confirmation() {
     // index across a live majority and the service answered.
     drive_submits(&client, 5);
     let healthy: u64 = client.query_linearizable(&()).unwrap();
-    assert_eq!(healthy, 5, "a healthy leader's linearizable read must complete");
+    assert_eq!(
+        healthy, 5,
+        "a healthy leader's linearizable read must complete"
+    );
 
     // Partition the leader from BOTH followers.
     for f in (0..3).filter(|&i| i != leader) {
@@ -185,7 +205,10 @@ fn stale_leader_fails_linearizable_read_confirmation() {
     let res: Result<u64, ClientError> = client.query_linearizable(&());
     let elapsed = started.elapsed();
     assert!(
-        matches!(res, Err(ClientError::Retry) | Err(ClientError::NotLeader { .. })),
+        matches!(
+            res,
+            Err(ClientError::Retry) | Err(ClientError::NotLeader { .. })
+        ),
         "isolated leader answered a linearizable read (got {res:?}) — stale-read guarantee broken"
     );
     assert!(
@@ -255,7 +278,10 @@ fn concurrent_batched_reads_stay_linearizable_across_partition() {
                     let res: Result<u64, ClientError> = cl.query_linearizable(&());
                     let elapsed = started.elapsed();
                     assert!(
-                        matches!(res, Err(ClientError::Retry) | Err(ClientError::NotLeader { .. })),
+                        matches!(
+                            res,
+                            Err(ClientError::Retry) | Err(ClientError::NotLeader { .. })
+                        ),
                         "isolated leader answered a batched linearizable read (got {res:?})"
                     );
                     assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");

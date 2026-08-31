@@ -51,19 +51,29 @@ pub enum ConfigError {
     ZeroMaxInflight,
     #[error("per_conn_inflight must be greater than zero")]
     ZeroPerConnInflight,
-    #[error("per_conn_inflight ({per_conn}) exceeds max_inflight ({max}): one connection could \
-             exhaust the whole engine window")]
+    #[error(
+        "per_conn_inflight ({per_conn}) exceeds max_inflight ({max}): one connection could \
+             exhaust the whole engine window"
+    )]
     PerConnExceedsMax { per_conn: u32, max: u32 },
-    #[error("per_conn_inflight ({per_conn}) exceeds the edge's grant budget ({budget} = \
+    #[error(
+        "per_conn_inflight ({per_conn}) exceeds the edge's grant budget ({budget} = \
              max_inflight {max_inflight} less its 1/8 headroom): a single connection could \
-             promise more than the Engine window can honour")]
-    PerConnExceedsBudget { per_conn: u32, budget: u32, max_inflight: u32 },
+             promise more than the Engine window can honour"
+    )]
+    PerConnExceedsBudget {
+        per_conn: u32,
+        budget: u32,
+        max_inflight: u32,
+    },
     #[error("status_interval must be greater than zero: it is also the edge->client liveness tick")]
     ZeroStatusInterval,
     #[error("request_timeout must be greater than zero")]
     ZeroRequestTimeout,
-    #[error("max_connections must be greater than zero: an edge that accepts nothing is not an \
-             edge")]
+    #[error(
+        "max_connections must be greater than zero: an edge that accepts nothing is not an \
+             edge"
+    )]
     ZeroMaxConnections,
 }
 
@@ -223,7 +233,10 @@ mod tests {
             instance_dir: PathBuf::from("/var/lib/uc2/node0"),
             app_id: "app".into(),
             listen: "127.0.0.1:0".parse().unwrap(),
-            members: vec![Member { node_id: 0, gateway: "h0:9100".into() }],
+            members: vec![Member {
+                node_id: 0,
+                gateway: "h0:9100".into(),
+            }],
             ..EdgeConfig::defaults()
         }
     }
@@ -236,10 +249,19 @@ mod tests {
     #[test]
     fn defaults_alone_are_refused_by_name() {
         // The whole point of `defaults()`: it is a spread base, not a config.
-        assert_eq!(EdgeConfig::defaults().validate(), Err(ConfigError::MissingInstanceDir));
-        let c = EdgeConfig { instance_dir: "/x".into(), ..EdgeConfig::defaults() };
+        assert_eq!(
+            EdgeConfig::defaults().validate(),
+            Err(ConfigError::MissingInstanceDir)
+        );
+        let c = EdgeConfig {
+            instance_dir: "/x".into(),
+            ..EdgeConfig::defaults()
+        };
         assert_eq!(c.validate(), Err(ConfigError::MissingAppId));
-        let c = EdgeConfig { app_id: "app".into(), ..c };
+        let c = EdgeConfig {
+            app_id: "app".into(),
+            ..c
+        };
         assert_eq!(c.validate(), Err(ConfigError::NoMembers));
     }
 
@@ -247,14 +269,23 @@ mod tests {
     fn duplicate_and_empty_members_are_refused() {
         let c = EdgeConfig {
             members: vec![
-                Member { node_id: 1, gateway: "a:1".into() },
-                Member { node_id: 1, gateway: "b:2".into() },
+                Member {
+                    node_id: 1,
+                    gateway: "a:1".into(),
+                },
+                Member {
+                    node_id: 1,
+                    gateway: "b:2".into(),
+                },
             ],
             ..ok()
         };
         assert_eq!(c.validate(), Err(ConfigError::DuplicateMember(1)));
         let c = EdgeConfig {
-            members: vec![Member { node_id: 3, gateway: String::new() }],
+            members: vec![Member {
+                node_id: 3,
+                gateway: String::new(),
+            }],
             ..ok()
         };
         assert_eq!(c.validate(), Err(ConfigError::EmptyGateway(3)));
@@ -262,29 +293,61 @@ mod tests {
 
     #[test]
     fn per_conn_credits_may_not_exceed_the_engine_window() {
-        let c = EdgeConfig { max_inflight: 8, per_conn_inflight: 9, ..ok() };
-        assert_eq!(c.validate(), Err(ConfigError::PerConnExceedsMax { per_conn: 9, max: 8 }));
-        let c = EdgeConfig { per_conn_inflight: 0, ..ok() };
+        let c = EdgeConfig {
+            max_inflight: 8,
+            per_conn_inflight: 9,
+            ..ok()
+        };
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::PerConnExceedsMax {
+                per_conn: 9,
+                max: 8
+            })
+        );
+        let c = EdgeConfig {
+            per_conn_inflight: 0,
+            ..ok()
+        };
         assert_eq!(c.validate(), Err(ConfigError::ZeroPerConnInflight));
-        let c = EdgeConfig { max_inflight: 0, ..ok() };
+        let c = EdgeConfig {
+            max_inflight: 0,
+            ..ok()
+        };
         assert_eq!(c.validate(), Err(ConfigError::ZeroMaxInflight));
     }
 
     #[test]
     fn zero_durations_are_refused() {
-        let c = EdgeConfig { status_interval: Duration::ZERO, ..ok() };
+        let c = EdgeConfig {
+            status_interval: Duration::ZERO,
+            ..ok()
+        };
         assert_eq!(c.validate(), Err(ConfigError::ZeroStatusInterval));
-        let c = EdgeConfig { request_timeout: Duration::ZERO, ..ok() };
+        let c = EdgeConfig {
+            request_timeout: Duration::ZERO,
+            ..ok()
+        };
         assert_eq!(c.validate(), Err(ConfigError::ZeroRequestTimeout));
     }
 
     #[test]
     fn a_zero_connection_ceiling_is_refused() {
         assert_eq!(EdgeConfig::defaults().max_connections, 1024);
-        let c = EdgeConfig { max_connections: 0, ..ok() };
+        let c = EdgeConfig {
+            max_connections: 0,
+            ..ok()
+        };
         assert_eq!(c.validate(), Err(ConfigError::ZeroMaxConnections));
-        let c = EdgeConfig { max_connections: 1, ..ok() };
-        assert_eq!(c.validate(), Ok(()), "one connection is a legal, if lonely, ceiling");
+        let c = EdgeConfig {
+            max_connections: 1,
+            ..ok()
+        };
+        assert_eq!(
+            c.validate(),
+            Ok(()),
+            "one connection is a legal, if lonely, ceiling"
+        );
     }
 
     #[test]
@@ -292,7 +355,11 @@ mod tests {
         // The budget is the Engine window less its 1/8 headroom, so a
         // per-connection cap between the two is refused BY NAME rather than
         // silently over-promising the window on the very first connection.
-        let c = EdgeConfig { max_inflight: 4096, per_conn_inflight: 4096, ..ok() };
+        let c = EdgeConfig {
+            max_inflight: 4096,
+            per_conn_inflight: 4096,
+            ..ok()
+        };
         assert_eq!(
             c.validate(),
             Err(ConfigError::PerConnExceedsBudget {
@@ -301,26 +368,52 @@ mod tests {
                 max_inflight: 4096
             })
         );
-        let c = EdgeConfig { max_inflight: 4096, per_conn_inflight: 3584, ..ok() };
+        let c = EdgeConfig {
+            max_inflight: 4096,
+            per_conn_inflight: 3584,
+            ..ok()
+        };
         assert_eq!(c.validate(), Ok(()), "exactly the budget is grantable");
         // The pre-existing, coarser check still fires first for a value over
         // the window itself.
-        let c = EdgeConfig { max_inflight: 8, per_conn_inflight: 9, ..ok() };
-        assert_eq!(c.validate(), Err(ConfigError::PerConnExceedsMax { per_conn: 9, max: 8 }));
+        let c = EdgeConfig {
+            max_inflight: 8,
+            per_conn_inflight: 9,
+            ..ok()
+        };
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::PerConnExceedsMax {
+                per_conn: 9,
+                max: 8
+            })
+        );
     }
 
     #[test]
     fn a_connection_ceiling_above_the_budget_is_warned_about_not_refused() {
         // Legal — the grant simply floors at 1 for the connections past the
         // budget — but almost certainly not what the operator meant.
-        let c = EdgeConfig { max_inflight: 64, per_conn_inflight: 8, max_connections: 4096, ..ok() };
+        let c = EdgeConfig {
+            max_inflight: 64,
+            per_conn_inflight: 8,
+            max_connections: 4096,
+            ..ok()
+        };
         assert_eq!(c.validate(), Ok(()));
         let w = c.warnings();
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("max_connections"), "{}", w[0]);
-        assert!(w[0].contains("56"), "the warning must state the budget: {}", w[0]);
+        assert!(
+            w[0].contains("56"),
+            "the warning must state the budget: {}",
+            w[0]
+        );
 
-        let quiet = EdgeConfig { max_connections: 16, ..c };
+        let quiet = EdgeConfig {
+            max_connections: 16,
+            ..c
+        };
         assert!(quiet.warnings().is_empty());
         assert!(ok().warnings().is_empty(), "the defaults must not warn");
     }

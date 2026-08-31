@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use uc_gateway::{Edge, EdgeConfig, Member};
+use uc_lincheck::register::{Cmd, CmdResp};
 use uc_remote::frame::FrameType;
 use uc_remote::{RemoteClient, RemoteConfig, RemoteStats};
-use uc_lincheck::register::{Cmd, CmdResp};
 
 mod common;
 
@@ -32,7 +32,9 @@ fn enc(c: &Cmd) -> Vec<u8> {
 }
 
 fn dec(b: &[u8]) -> CmdResp {
-    bincode::serde::decode_from_slice(b, bincode::config::standard()).unwrap().0
+    bincode::serde::decode_from_slice(b, bincode::config::standard())
+        .unwrap()
+        .0
 }
 
 fn edge_config(dir: &std::path::Path, max_inflight: u32, per_conn: u32) -> EdgeConfig {
@@ -40,7 +42,10 @@ fn edge_config(dir: &std::path::Path, max_inflight: u32, per_conn: u32) -> EdgeC
         instance_dir: dir.to_path_buf(),
         app_id: common::APP.into(),
         listen: "127.0.0.1:0".parse().unwrap(),
-        members: vec![Member { node_id: 0, gateway: "127.0.0.1:0".into() }],
+        members: vec![Member {
+            node_id: 0,
+            gateway: "127.0.0.1:0".into(),
+        }],
         max_inflight,
         per_conn_inflight: per_conn,
         status_interval: Duration::from_millis(50),
@@ -60,10 +65,13 @@ fn run_client(addr: String, base: u64) -> RemoteStats {
     .unwrap();
     // Issue first, wait second: the point is to have more outstanding than the
     // window allows, so the credit gate is what paces it.
-    let tickets: Vec<_> =
-        (0..PER_CLIENT).map(|i| client.submit(&enc(&Cmd::Write(base + i))).unwrap()).collect();
+    let tickets: Vec<_> = (0..PER_CLIENT)
+        .map(|i| client.submit(&enc(&Cmd::Write(base + i))).unwrap())
+        .collect();
     for (i, t) in tickets.into_iter().enumerate() {
-        let r = t.wait().unwrap_or_else(|e| panic!("client {base} write {i}: {e:?}"));
+        let r = t
+            .wait()
+            .unwrap_or_else(|e| panic!("client {base} write {i}: {e:?}"));
         assert_eq!(dec(&r.bytes), CmdResp::WriteAck);
     }
     let s = client.stats();
@@ -106,15 +114,26 @@ fn two_clients_stay_inside_the_credits_the_edge_grants() {
             "client {who} was advertised {} credits; ceiling is per_conn=4",
             s.max_credits_seen
         );
-        assert_eq!(s.reconnects, 0, "client {who} should not have had to fail over: {s:?}");
+        assert_eq!(
+            s.reconnects, 0,
+            "client {who} should not have had to fail over: {s:?}"
+        );
         assert_eq!(s.unknown, 0, "client {who}: {s:?}");
     }
 
     let es = edge.stats();
     assert_eq!(es.connections, 2);
-    assert_eq!(es.submits, 2 * PER_CLIENT, "every write reached the ring exactly once: {es:?}");
+    assert_eq!(
+        es.submits,
+        2 * PER_CLIENT,
+        "every write reached the ring exactly once: {es:?}"
+    );
     assert_eq!(es.responses, 2 * PER_CLIENT, "one RESPONSE each: {es:?}");
-    assert_eq!((es.redirects, es.unknown), (0, 0), "a healthy single-node leader: {es:?}");
+    assert_eq!(
+        (es.redirects, es.unknown),
+        (0, 0),
+        "a healthy single-node leader: {es:?}"
+    );
     // THE POINT OF THE BUDGET. Before it, two connections were each granted
     // the full `per_conn_inflight` against a window that could not hold both,
     // and the reactive halve/relax ladder was the only thing keeping them
@@ -160,22 +179,29 @@ fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
 
     let mut first = common::dial_raw(edge.local_addr());
     common::send_hello(&mut first, 0xAAAA, common::APP);
-    let (_, hello_ok) = common::read_until_frame(&mut first, FrameType::HelloOk,
-                                                 Duration::from_secs(5))
-        .expect("HELLO_OK");
-    let granted = uc_remote::frame::HelloOk::decode(&hello_ok).unwrap().credits;
-    assert_eq!(granted, 32, "the only connection gets the whole budget, capped at per_conn");
+    let (_, hello_ok) =
+        common::read_until_frame(&mut first, FrameType::HelloOk, Duration::from_secs(5))
+            .expect("HELLO_OK");
+    let granted = uc_remote::frame::HelloOk::decode(&hello_ok)
+        .unwrap()
+        .credits;
+    assert_eq!(
+        granted, 32,
+        "the only connection gets the whole budget, capped at per_conn"
+    );
 
     // The first connection sends NOTHING from here on. Whatever it hears next
     // is unprompted.
     let mut second = common::dial_raw(edge.local_addr());
     common::send_hello(&mut second, 0xBBBB, common::APP);
     assert!(common::read_until(&mut second, FrameType::HelloOk, Duration::from_secs(5)).is_some());
-    let (_, body) = common::read_until_frame(&mut first, FrameType::Status,
-                                             Duration::from_secs(5))
+    let (_, body) = common::read_until_frame(&mut first, FrameType::Status, Duration::from_secs(5))
         .expect("no STATUS reached the idle client after its share shrank");
     let st = Status::decode(&body).unwrap();
-    assert_eq!(st.credits, 28, "the STATUS must carry the SMALLER absolute grant");
+    assert_eq!(
+        st.credits, 28,
+        "the STATUS must carry the SMALLER absolute grant"
+    );
     assert!(edge.stats().grant_changes >= 1, "stats: {:?}", edge.stats());
 
     drop(first);
@@ -215,13 +241,24 @@ fn a_squeezed_window_still_resolves_every_request() {
         (ha.join().unwrap(), hb.join().unwrap())
     });
     for (who, s) in [("a", a), ("b", b)] {
-        assert!(s.max_credits_seen <= 4, "client {who} saw {} credits", s.max_credits_seen);
+        assert!(
+            s.max_credits_seen <= 4,
+            "client {who} saw {} credits",
+            s.max_credits_seen
+        );
         assert_eq!(s.unknown, 0, "client {who}: {s:?}");
     }
 
     let es = edge.stats();
-    assert_eq!(es.responses, 2 * PER_CLIENT, "every request resolved: {es:?}");
-    assert_eq!(es.retries, 0, "backpressure is absorbed by credits, never bounced: {es:?}");
+    assert_eq!(
+        es.responses,
+        2 * PER_CLIENT,
+        "every request resolved: {es:?}"
+    );
+    assert_eq!(
+        es.retries, 0,
+        "backpressure is absorbed by credits, never bounced: {es:?}"
+    );
     // Not asserted as > 0 — whether the shared window actually fills is a
     // scheduling race (see the sibling test). What IS asserted: if it fired,
     // the client was told, unprompted.
@@ -407,7 +444,11 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget_under_a_connect_disconnect_r
         if g.len() == 4 && g.iter().all(|(_, x)| *x == want4) {
             break;
         }
-        assert!(Instant::now() < deadline, "initial 4 never settled: {:?}", edge.grants_for_tests());
+        assert!(
+            Instant::now() < deadline,
+            "initial 4 never settled: {:?}",
+            edge.grants_for_tests()
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 
@@ -435,7 +476,10 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget_under_a_connect_disconnect_r
     // between the drops and the dials.
     let dropped: Vec<_> = conns.drain(0..2).collect();
     let new_conns: Vec<_> = std::thread::scope(|s| {
-        let drop_handles: Vec<_> = dropped.into_iter().map(|c| s.spawn(move || drop(c))).collect();
+        let drop_handles: Vec<_> = dropped
+            .into_iter()
+            .map(|c| s.spawn(move || drop(c)))
+            .collect();
         let dial_handles: Vec<_> = (0..2u64)
             .map(|i| {
                 let addr = edge.local_addr();
@@ -451,7 +495,10 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget_under_a_connect_disconnect_r
         for h in drop_handles {
             h.join().unwrap();
         }
-        dial_handles.into_iter().map(|h| h.join().unwrap()).collect()
+        dial_handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
     });
     conns.extend(new_conns);
     assert_eq!(conns.len(), 4);
@@ -526,7 +573,11 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
         common::read_until_frame(&mut fourth, FrameType::HelloOk, Duration::from_secs(5))
             .expect("HELLO_OK");
     let credits = HelloOk::decode(&body).unwrap().credits;
-    assert_eq!(credits, uc_gateway::grant_for(4, budget, 32), "HELLO_OK must carry the live share");
+    assert_eq!(
+        credits,
+        uc_gateway::grant_for(4, budget, 32),
+        "HELLO_OK must carry the live share"
+    );
     assert_eq!(credits, 14);
 
     // Three of them go away; the survivor must climb back to the whole cap.
@@ -538,7 +589,10 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
         if g.len() == 1 && g[0].1 == 32 {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "the survivor never got its share back: {g:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the survivor never got its share back: {g:?}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     // …and the increase reaches the (idle) client on the STATUS timer, with no
@@ -549,9 +603,9 @@ fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
     // value arrives rather than trusting the first buffered one.
     let status_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let (_, body) = common::read_until_frame(&mut held[0], FrameType::Status,
-                                                 Duration::from_secs(5))
-            .expect("no STATUS carried the widened window");
+        let (_, body) =
+            common::read_until_frame(&mut held[0], FrameType::Status, Duration::from_secs(5))
+                .expect("no STATUS carried the widened window");
         let c = uc_remote::frame::Status::decode(&body).unwrap().credits;
         if c == 32 {
             break;

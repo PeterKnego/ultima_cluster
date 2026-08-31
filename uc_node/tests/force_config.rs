@@ -51,7 +51,11 @@ fn config_for(id: u32, addr: SocketAddr, instance_dir: PathBuf) -> NodeConfig {
 
 fn stored_member(id: u32, a: SocketAddr) -> StoredMember {
     match a.ip() {
-        std::net::IpAddr::V4(v4) => StoredMember { id, ip: u32::from(v4), port: a.port() },
+        std::net::IpAddr::V4(v4) => StoredMember {
+            id,
+            ip: u32::from(v4),
+            port: a.port(),
+        },
         std::net::IpAddr::V6(_) => panic!("ipv4 only"),
     }
 }
@@ -59,16 +63,32 @@ fn stored_member(id: u32, a: SocketAddr) -> StoredMember {
 /// Pre-seed `instance_dir/state/config.state` directly — the `learner.rs:412`
 /// pattern — without booting a node, exactly what an offline recovery tool
 /// must be able to read.
-fn seed_config(instance_dir: &Path, version: u64, voters: &[(u32, SocketAddr)], tombstones: Vec<u32>) {
+fn seed_config(
+    instance_dir: &Path,
+    version: u64,
+    voters: &[(u32, SocketAddr)],
+    tombstones: Vec<u32>,
+) {
     std::fs::create_dir_all(instance_dir.join("state")).unwrap();
     let cfg = StoredConfig {
         version,
-        voters: voters.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+        voters: voters
+            .iter()
+            .map(|(id, a)| stored_member(*id, *a))
+            .collect(),
         learners: Vec::new(),
         tombstones,
     };
-    let rec = ConfigRecord { position: 0, config: cfg.clone(), prev_position: 0, prev: cfg };
-    NodeState::open(&instance_dir.join("state")).unwrap().store_config_record(&rec).unwrap();
+    let rec = ConfigRecord {
+        position: 0,
+        config: cfg.clone(),
+        prev_position: 0,
+        prev: cfg,
+    };
+    NodeState::open(&instance_dir.join("state"))
+        .unwrap()
+        .store_config_record(&rec)
+        .unwrap();
 }
 
 fn free_addr() -> SocketAddr {
@@ -92,7 +112,10 @@ fn force_refuses_a_running_node() {
     let err =
         force_single_member(dir.path(), 0).expect_err("must refuse while a node holds the flock");
     let msg = err.to_string();
-    assert!(msg.to_lowercase().contains("running"), "unexpected refusal message: {msg}");
+    assert!(
+        msg.to_lowercase().contains("running"),
+        "unexpected refusal message: {msg}"
+    );
 
     drop(node);
 }
@@ -104,7 +127,10 @@ fn force_refuses_a_tombstoned_id() {
     seed_config(dir.path(), 3, &[(7, addr)], vec![7]);
 
     let err = force_single_member(dir.path(), 7).expect_err("must refuse a tombstoned id");
-    assert!(err.to_string().to_lowercase().contains("tombston"), "unexpected message: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("tombston"),
+        "unexpected message: {err}"
+    );
 }
 
 #[test]
@@ -115,7 +141,10 @@ fn force_refuses_a_non_member_id() {
 
     let err = force_single_member(dir.path(), 99)
         .expect_err("must refuse an id that isn't a voter or learner");
-    assert!(err.to_string().to_lowercase().contains("member"), "unexpected message: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("member"),
+        "unexpected message: {err}"
+    );
 }
 
 /// The version/position math (plan's anchor map row): a 3-voter config at
@@ -141,7 +170,10 @@ fn force_bumps_version_and_narrows_to_sole_voter() {
     assert_eq!(recovered.version, 8);
     assert_eq!(recovered.voters, vec![(1, addrs[1])]);
     assert!(recovered.learners.is_empty());
-    assert!(recovered.tombstones.is_empty(), "dropped peers must NOT be tombstoned");
+    assert!(
+        recovered.tombstones.is_empty(),
+        "dropped peers must NOT be tombstoned"
+    );
 }
 
 /// Tombstones present before the force must survive it unchanged (Global
@@ -180,14 +212,22 @@ fn force_refuses_an_uninitialized_dir_without_persisting() {
     let err = force_single_member(dir.path(), 5)
         .expect_err("a fresh instance dir has no config record yet");
     assert!(
-        err.to_string().to_lowercase().contains("no durable config record"),
+        err.to_string()
+            .to_lowercase()
+            .contains("no durable config record"),
         "unexpected message: {err}"
     );
 
     let after = std::fs::read(&config_state).unwrap();
-    assert_eq!(before, after, "force_single_member must not write anything when it refuses");
+    assert_eq!(
+        before, after,
+        "force_single_member must not write anything when it refuses"
+    );
     assert!(
-        NodeState::open(&dir.path().join("state")).unwrap().config_record().is_none(),
+        NodeState::open(&dir.path().join("state"))
+            .unwrap()
+            .config_record()
+            .is_none(),
         "no record must have been persisted by the refused call"
     );
 }
@@ -211,18 +251,35 @@ fn force_refuses_the_doubly_ahead_crash_window_without_persisting() {
         learners: Vec::new(),
         tombstones: Vec::new(),
     };
-    let prev_cfg = StoredConfig { version: 4, ..cfg.clone() };
-    let rec = ConfigRecord { position: 200, config: cfg, prev_position: 100, prev: prev_cfg };
-    NodeState::open(&dir.path().join("state")).unwrap().store_config_record(&rec).unwrap();
+    let prev_cfg = StoredConfig {
+        version: 4,
+        ..cfg.clone()
+    };
+    let rec = ConfigRecord {
+        position: 200,
+        config: cfg,
+        prev_position: 100,
+        prev: prev_cfg,
+    };
+    NodeState::open(&dir.path().join("state"))
+        .unwrap()
+        .store_config_record(&rec)
+        .unwrap();
     let config_state = dir.path().join("state").join("config.state");
     let before = std::fs::read(&config_state).unwrap();
 
     let err = force_single_member(dir.path(), 1)
         .expect_err("must refuse the doubly-ahead crash window, not fall back to an empty seed");
-    assert!(err.to_string().to_lowercase().contains("doubly-ahead"), "unexpected message: {err}");
+    assert!(
+        err.to_string().to_lowercase().contains("doubly-ahead"),
+        "unexpected message: {err}"
+    );
 
     let after = std::fs::read(&config_state).unwrap();
-    assert_eq!(before, after, "force_single_member must not write anything when it refuses");
+    assert_eq!(
+        before, after,
+        "force_single_member must not write anything when it refuses"
+    );
 }
 
 /// Fix round 1, Important 3: `uc2ctl`'s data-loss statement is lifted into
@@ -252,7 +309,12 @@ fn forced_single_node_boots_elects_and_serves() {
     // bound/booted — ids 1/2 stand in for the dead old quorum.
     let other_a: SocketAddr = "127.0.0.1:59911".parse().unwrap();
     let other_b: SocketAddr = "127.0.0.1:59912".parse().unwrap();
-    seed_config(dir.path(), 0, &[(0, addr), (1, other_a), (2, other_b)], Vec::new());
+    seed_config(
+        dir.path(),
+        0,
+        &[(0, addr), (1, other_a), (2, other_b)],
+        Vec::new(),
+    );
 
     let report = force_single_member(dir.path(), 0).expect("force");
     assert_eq!(report.new_version, 1);
@@ -261,7 +323,10 @@ fn forced_single_node_boots_elects_and_serves() {
         .expect("start forced sole voter");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !node.can_serve() {
-        assert!(Instant::now() < deadline, "forced sole voter never served within 5s");
+        assert!(
+            Instant::now() < deadline,
+            "forced sole voter never served within 5s"
+        );
         std::thread::yield_now();
     }
 
@@ -288,7 +353,10 @@ fn forced_single_node_boots_elects_and_serves() {
         if append > 0 && c.commit.load_acquire() == append && c.durable.load_acquire() == append {
             break;
         }
-        assert!(Instant::now() < commit_deadline, "forced sole voter never committed the submit");
+        assert!(
+            Instant::now() < commit_deadline,
+            "forced sole voter never committed the submit"
+        );
         std::thread::yield_now();
     }
 }

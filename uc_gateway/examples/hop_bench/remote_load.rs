@@ -9,8 +9,8 @@
 //! latency correlated through `SendClock` — no `Ticket`, no waiter pool, no
 //! channel per request.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,8 +46,12 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     if a.conns == 0 {
         anyhow::bail!("remote-load: --conns must be at least 1");
     }
-    let members: Vec<String> =
-        a.gateways.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let members: Vec<String> = a
+        .gateways
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     if members.is_empty() {
         anyhow::bail!("remote-load: --gateways is empty");
     }
@@ -68,15 +72,19 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         };
         let payload = payload.clone();
         handles.push(
-            thread::Builder::new().name(format!("hb-remote-{i}")).spawn(
-                move || -> anyhow::Result<StreamStats> { drive_one(i, cfg, payload, t0, deadline) },
-            )?,
+            thread::Builder::new()
+                .name(format!("hb-remote-{i}"))
+                .spawn(move || -> anyhow::Result<StreamStats> {
+                    drive_one(i, cfg, payload, t0, deadline)
+                })?,
         );
     }
 
     let mut merged = StreamStats::new();
     for (i, h) in handles.into_iter().enumerate() {
-        let s = h.join().map_err(|_| anyhow::anyhow!("remote conn {i} panicked"))??;
+        let s = h
+            .join()
+            .map_err(|_| anyhow::anyhow!("remote conn {i} panicked"))??;
         println!(
             "   conn {i}: sends={} responses={} lost={} responses/s={:.1}",
             s.sends,
@@ -168,7 +176,9 @@ fn drive_one(
     }
     stop.store(true, Ordering::Relaxed);
     wake.wake();
-    let mut s = poller.join().map_err(|_| anyhow::anyhow!("conn {idx}: poll thread panicked"))?;
+    let mut s = poller
+        .join()
+        .map_err(|_| anyhow::anyhow!("conn {idx}: poll thread panicked"))?;
 
     let st = send.stats();
     println!(

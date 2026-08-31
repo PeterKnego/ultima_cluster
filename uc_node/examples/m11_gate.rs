@@ -112,7 +112,15 @@ struct Verdict {
 
 impl Verdict {
     fn new_pf(row: &'static str, pass: bool, detail: String) -> Verdict {
-        Verdict { row, status: if pass { RowStatus::Pass } else { RowStatus::Fail }, detail }
+        Verdict {
+            row,
+            status: if pass {
+                RowStatus::Pass
+            } else {
+                RowStatus::Fail
+            },
+            detail,
+        }
     }
 
     fn label(&self) -> &'static str {
@@ -331,8 +339,11 @@ fn cargo_test(args: &[&str]) -> (bool, String) {
         .current_dir(repo_root())
         .output()
         .unwrap_or_else(|e| panic!("spawn cargo {}: {e}", args.join(" ")));
-    let combined =
-        format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     (out.status.success(), combined)
 }
 
@@ -361,7 +372,12 @@ fn run_survival_suite_once(run_n: usize) -> SuiteRun {
     if backup_pass != Some(true) || quorum_pass != Some(true) {
         println!("{}", tail_str(&combined, 6000));
     }
-    SuiteRun { exit_ok, backup_pass, quorum_pass, tail: tail_str(&combined, 6000) }
+    SuiteRun {
+        exit_ok,
+        backup_pass,
+        quorum_pass,
+        tail: tail_str(&combined, 6000),
+    }
 }
 
 fn run_survival_suite_x3() -> Vec<SuiteRun> {
@@ -369,8 +385,11 @@ fn run_survival_suite_x3() -> Vec<SuiteRun> {
 }
 
 fn run_backup_straddle_test() -> (bool, String) {
-    println!("  [row 1] straddle anti-vacuity: cargo test -p uc_node --test backup a_wrong_order ...");
-    let (exit_ok, combined) = cargo_test(&["test", "-p", "uc_node", "--test", "backup", "a_wrong_order"]);
+    println!(
+        "  [row 1] straddle anti-vacuity: cargo test -p uc_node --test backup a_wrong_order ..."
+    );
+    let (exit_ok, combined) =
+        cargo_test(&["test", "-p", "uc_node", "--test", "backup", "a_wrong_order"]);
     let test_pass = parse_test_line(&combined, STRADDLE_TEST);
     let pass = exit_ok && test_pass == Some(true);
     if !pass {
@@ -390,7 +409,12 @@ fn row1_verdict(runs: &[SuiteRun], straddle_pass: bool, straddle_detail: &str) -
     if !pass {
         for (i, r) in runs.iter().enumerate() {
             if r.backup_pass != Some(true) {
-                println!("  [row 1] run {}/3 exit_ok={} tail:\n{}", i + 1, r.exit_ok, r.tail);
+                println!(
+                    "  [row 1] run {}/3 exit_ok={} tail:\n{}",
+                    i + 1,
+                    r.exit_ok,
+                    r.tail
+                );
             }
         }
     }
@@ -404,7 +428,12 @@ fn row2_verdict(runs: &[SuiteRun]) -> Verdict {
     if !pass {
         for (i, r) in runs.iter().enumerate() {
             if r.quorum_pass != Some(true) {
-                println!("  [row 2] run {}/3 exit_ok={} tail:\n{}", i + 1, r.exit_ok, r.tail);
+                println!(
+                    "  [row 2] run {}/3 exit_ok={} tail:\n{}",
+                    i + 1,
+                    r.exit_ok,
+                    r.tail
+                );
             }
         }
     }
@@ -415,8 +444,14 @@ fn row2_verdict(runs: &[SuiteRun]) -> Verdict {
 
 fn run_enospc_3a() -> Verdict {
     println!("== row 3a: ENOSPC sudo-free EACCES smoke ==");
-    let (exit_ok, combined) =
-        cargo_test(&["test", "-p", "uc_crashtest", "--features", "enospc-tests", "write_denied"]);
+    let (exit_ok, combined) = cargo_test(&[
+        "test",
+        "-p",
+        "uc_crashtest",
+        "--features",
+        "enospc-tests",
+        "write_denied",
+    ]);
     let test_pass = parse_test_line(&combined, EACCES_TEST);
     let pass = exit_ok && test_pass == Some(true);
     if !pass {
@@ -441,7 +476,11 @@ fn run_enospc_3b() -> Verdict {
                 nightly.yml's sudo-enabled `survival` job."
                 .to_string();
             println!("  SKIPPED-PENDING: {msg}");
-            Verdict { row: "3b ENOSPC genuine fixture", status: RowStatus::SkippedPending, detail: msg }
+            Verdict {
+                row: "3b ENOSPC genuine fixture",
+                status: RowStatus::SkippedPending,
+                detail: msg,
+            }
         }
         Ok(dir) => {
             let (exit_ok, combined) = cargo_test(&[
@@ -481,7 +520,11 @@ fn series_present(text: &str, name: &str) -> bool {
 fn try_scrape(addr: SocketAddr) -> Option<String> {
     let mut stream = TcpStream::connect(addr).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    write!(stream, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").ok()?;
+    write!(
+        stream,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
     stream.flush().ok()?;
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).ok()?;
@@ -505,7 +548,12 @@ fn drain_in_background<R: Read + Send + 'static>(mut r: R) {
     });
 }
 
-fn write_alerts_node_toml(cfg_path: &Path, bind: SocketAddr, instance_dir: &Path, metrics_bind: SocketAddr) {
+fn write_alerts_node_toml(
+    cfg_path: &Path,
+    bind: SocketAddr,
+    instance_dir: &Path,
+    metrics_bind: SocketAddr,
+) {
     let body = format!(
         "id = 0\n\
          bind = \"{bind}\"\n\
@@ -579,7 +627,10 @@ fn check_live_free_disk_bytes_scrape(root: &Path) -> (bool, String) {
 
     let _ = child.kill();
     let _ = child.wait();
-    (found, format!("uc2_free_disk_bytes present={found} ({sample_line})"))
+    (
+        found,
+        format!("uc2_free_disk_bytes present={found} ({sample_line})"),
+    )
 }
 
 /// Run the real, unmutated `scripts/m10_alert_fire.sh`; count `PASS rule=`
@@ -592,9 +643,15 @@ fn run_alert_fire_script() -> (bool, usize, String) {
         .current_dir(repo_root())
         .output()
         .unwrap_or_else(|e| panic!("spawn scripts/m10_alert_fire.sh: {e}"));
-    let combined =
-        format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    let pass_count = combined.lines().filter(|l| l.starts_with("PASS rule=")).count();
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pass_count = combined
+        .lines()
+        .filter(|l| l.starts_with("PASS rule="))
+        .count();
     (out.status.success(), pass_count, combined)
 }
 
@@ -648,11 +705,17 @@ fn check_yaml_builders_anti_vacuity(root: &Path) -> (bool, String) {
 
     let repo = repo_root();
     let repo_str = repo.display().to_string();
-    assert!(!repo_str.contains('"'), "repo root path must not contain a double quote");
+    assert!(
+        !repo_str.contains('"'),
+        "repo root path must not contain a double quote"
+    );
     let mutated = original
         .replacen(root_needle, &format!("ROOT=\"{repo_str}\"\n"), 1)
         .replacen(builder_needle, "", 1);
-    assert_ne!(mutated, original, "the mutation must actually change the scratch copy's text");
+    assert_ne!(
+        mutated, original,
+        "the mutation must actually change the scratch copy's text"
+    );
 
     let scratch = root.join("alerts-anti-vacuity");
     let _ = std::fs::remove_dir_all(&scratch);
@@ -666,8 +729,11 @@ fn check_yaml_builders_anti_vacuity(root: &Path) -> (bool, String) {
         .arg(&scratch_script)
         .output()
         .unwrap_or_else(|e| panic!("spawn the mutated scratch copy of m10_alert_fire.sh: {e}"));
-    let combined =
-        format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let tripped = !out.status.success()
         && combined.contains("Uc2DiskLow")
         && combined.contains("have no RULE_BUILDERS entry");
@@ -677,7 +743,8 @@ fn check_yaml_builders_anti_vacuity(root: &Path) -> (bool, String) {
     // The tracked file was never opened for writing above — re-confirmed
     // cheaply here too, so a future regression in this function trips loudly
     // rather than silently.
-    let still_pristine = std::fs::read_to_string(&script_path).expect("re-read m10_alert_fire.sh") == original;
+    let still_pristine =
+        std::fs::read_to_string(&script_path).expect("re-read m10_alert_fire.sh") == original;
     assert!(
         still_pristine,
         "scripts/m10_alert_fire.sh changed during the anti-vacuity probe — this function must \
@@ -761,12 +828,16 @@ impl Drop for KillGuard {
     fn drop(&mut self) {
         for cfg in &self.0 {
             let pat = format!("uc2-node --config {}", cfg.display());
-            let _ = Command::new("pkill").args(["-TERM", "-f", "--", &pat]).status();
+            let _ = Command::new("pkill")
+                .args(["-TERM", "-f", "--", &pat])
+                .status();
         }
         std::thread::sleep(Duration::from_millis(500));
         for cfg in &self.0 {
             let pat = format!("uc2-node --config {}", cfg.display());
-            let _ = Command::new("pkill").args(["-KILL", "-f", "--", &pat]).status();
+            let _ = Command::new("pkill")
+                .args(["-KILL", "-f", "--", &pat])
+                .status();
         }
     }
 }
@@ -820,7 +891,8 @@ fn run_flagday_smoke(root: &Path) {
     while Instant::now() < deadline {
         let serving: Vec<usize> = (0..N)
             .filter(|&i| {
-                open_cnc(&instance_dirs[i], app).is_some_and(|c| c.status().flags.load_acquire() & want == want)
+                open_cnc(&instance_dirs[i], app)
+                    .is_some_and(|c| c.status().flags.load_acquire() & want == want)
             })
             .collect();
         if serving.len() == 1 {
@@ -842,8 +914,12 @@ fn run_flagday_smoke(root: &Path) {
     };
     println!("  local 3-node cluster up, leader=n{leader_idx}");
 
-    let hosts_arg =
-        format!("local:{},{},{}", cfg_paths[0].display(), cfg_paths[1].display(), cfg_paths[2].display());
+    let hosts_arg = format!(
+        "local:{},{},{}",
+        cfg_paths[0].display(),
+        cfg_paths[1].display(),
+        cfg_paths[2].display()
+    );
     let script = repo_root().join("scripts/uc2_flag_day.sh");
     let out = Command::new("bash")
         .arg(&script)
@@ -863,9 +939,15 @@ fn run_flagday_smoke(root: &Path) {
         .current_dir(repo_root())
         .output()
         .unwrap_or_else(|e| panic!("spawn scripts/uc2_flag_day.sh --local: {e}"));
-    let combined =
-        format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    let downtime_line = combined.lines().find(|l| l.starts_with("DOWNTIME:")).unwrap_or("no DOWNTIME line found");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let downtime_line = combined
+        .lines()
+        .find(|l| l.starts_with("DOWNTIME:"))
+        .unwrap_or("no DOWNTIME line found");
     println!(
         "  SMOKE (ungated — see gate doc; row 5's real bar is fleet-only): uc2_flag_day.sh \
          exit={:?}, {downtime_line}",
@@ -888,7 +970,10 @@ fn run_flagday_smoke(root: &Path) {
 // =========================================================== shared plumbing
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("uc_node has a parent dir").to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("uc_node has a parent dir")
+        .to_path_buf()
 }
 
 /// `target/<profile>/examples/m11_gate` -> `target/<profile>/m11_gate_scratch`
@@ -897,7 +982,11 @@ fn repo_root() -> PathBuf {
 fn default_root() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("m11_gate_scratch")))
+        .and_then(|exe| {
+            exe.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("m11_gate_scratch"))
+        })
         .unwrap_or_else(|| PathBuf::from("target/m11_gate_scratch"))
 }
 

@@ -37,8 +37,14 @@ impl Region {
         let layout = Layout::from_size_align(len, 64).expect("region layout");
         // SAFETY: len > 0, valid layout.
         let raw = unsafe { alloc_zeroed(layout) };
-        let Some(ptr) = NonNull::new(raw) else { handle_alloc_error(layout) };
-        Self { ptr, len, backing: Backing::Heap(layout) }
+        let Some(ptr) = NonNull::new(raw) else {
+            handle_alloc_error(layout)
+        };
+        Self {
+            ptr,
+            len,
+            backing: Backing::Heap(layout),
+        }
     }
 
     /// mmap-backed region (real instances; the file lives in the instance
@@ -48,7 +54,11 @@ impl Region {
         let len = m.len();
         assert!(len > 0);
         let ptr = NonNull::new(m.as_ptr() as *mut u8).expect("mmap ptr");
-        Self { ptr, len, backing: Backing::Mmap(m) }
+        Self {
+            ptr,
+            len,
+            backing: Backing::Mmap(m),
+        }
     }
 
     #[inline]

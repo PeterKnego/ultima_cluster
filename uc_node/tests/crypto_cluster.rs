@@ -117,8 +117,16 @@ fn b64_32(bytes: &[u8; 32]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -135,7 +143,11 @@ fn write_crypto_material(dir: &Path, n: usize) -> Vec<(PathBuf, PathBuf)> {
         std::fs::create_dir_all(&node_dir).unwrap();
         let key_path = node_dir.join("node.key");
         write_key_file(&key_path, private_key(i));
-        publics.push(uc_crypto::identity::Identity::load(&key_path).unwrap().public_bytes());
+        publics.push(
+            uc_crypto::identity::Identity::load(&key_path)
+                .unwrap()
+                .public_bytes(),
+        );
         key_paths.push(key_path);
     }
     let mut text = String::new();
@@ -146,7 +158,10 @@ fn write_crypto_material(dir: &Path, n: usize) -> Vec<(PathBuf, PathBuf)> {
     // exactly what an operator's `uc2ctl`-managed allowlist looks like.
     let allow_path = dir.join("allowlist");
     std::fs::write(&allow_path, text).unwrap();
-    key_paths.into_iter().map(|k| (k, allow_path.clone())).collect()
+    key_paths
+        .into_iter()
+        .map(|k| (k, allow_path.clone()))
+        .collect()
 }
 
 // ------------------------------------------------------------------ cluster
@@ -193,16 +208,23 @@ fn spawn_cluster(crypto_on: &[bool]) -> Cluster {
         .prefix("uc2-crypto-cluster-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir");
-    assert!(!dir.path().starts_with("/tmp"), "test scratch must not live on tmpfs");
+    assert!(
+        !dir.path().starts_with("/tmp"),
+        "test scratch must not live on tmpfs"
+    );
 
     let material = write_crypto_material(dir.path(), n);
 
     // Bind every socket first so the full member map is known before any agent
     // runs (a node that learned a peer's address late would drop its traffic).
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(u32, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(u32, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
 
     let mut dirs = Vec::with_capacity(n);
     let mut nodes = Vec::with_capacity(n);
@@ -224,7 +246,11 @@ fn spawn_cluster(crypto_on: &[bool]) -> Cluster {
         let cfg = make_config(i as u32, members.clone(), instance_dir, seed, addr, crypto);
         nodes.push(Node::start_with_socket(cfg, sock).expect("start"));
     }
-    Cluster { _dir: dir, dirs, nodes }
+    Cluster {
+        _dir: dir,
+        dirs,
+        nodes,
+    }
 }
 
 /// Wait for exactly one serving leader among `candidates`; assert no
@@ -232,11 +258,20 @@ fn spawn_cluster(crypto_on: &[bool]) -> Cluster {
 fn await_single_leader(nodes: &[Node], candidates: &[usize], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            candidates.iter().copied().filter(|&i| nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        let serving: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
-            assert!(nodes[serving[0]].is_leader(), "serving node not flagged leader");
+            assert!(
+                nodes[serving[0]].is_leader(),
+                "serving node not flagged leader"
+            );
             return serving[0];
         }
         assert!(
@@ -296,15 +331,25 @@ fn a_crypto_enabled_cluster_elects_replicates_and_serves_a_linearizable_read() {
     // quorum-committed and applied, so this is already proof that DATA
     // replication and the follower's sealed AppendPosition reports are working.
     for i in 1..=20u64 {
-        let total: u64 = client.submit(&Cmd::Add(1)).expect("submit to a serving crypto leader");
-        assert_eq!(total, i, "the state machine advanced exactly once per submit");
+        let total: u64 = client
+            .submit(&Cmd::Add(1))
+            .expect("submit to a serving crypto leader");
+        assert_eq!(
+            total, i,
+            "the state machine advanced exactly once per submit"
+        );
     }
 
     // A linearizable read: READ_PROBE fan-out (group scope, sealed through
     // `SharedTransport::seal_control` — the branch this task added) plus the
     // followers' READ_PROBE_ACKs (pairwise).
-    let seen: u64 = client.query_linearizable(&()).expect("a healthy crypto leader answers");
-    assert_eq!(seen, 20, "the linearizable read must observe every committed write");
+    let seen: u64 = client
+        .query_linearizable(&())
+        .expect("a healthy crypto leader answers");
+    assert_eq!(
+        seen, 20,
+        "the linearizable read must observe every committed write"
+    );
 
     // Every node — not just the quorum that acked — converged on the same
     // commit position, which needs the sealed commit gossip to be landing.
@@ -312,8 +357,9 @@ fn a_crypto_enabled_cluster_elects_replicates_and_serves_a_linearizable_read() {
     assert!(target > 0, "the leader actually committed something");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let laggards: Vec<usize> =
-            (0..3).filter(|&i| c.nodes[i].counters().commit.load_acquire() < target).collect();
+        let laggards: Vec<usize> = (0..3)
+            .filter(|&i| c.nodes[i].counters().commit.load_acquire() < target)
+            .collect();
         if laggards.is_empty() {
             break;
         }
@@ -357,7 +403,9 @@ fn a_cleartext_node_cannot_join_a_sealed_cluster() {
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     for _ in 0..10 {
-        let _: u64 = client.submit(&Cmd::Add(1)).expect("the sealed majority still commits");
+        let _: u64 = client
+            .submit(&Cmd::Add(1))
+            .expect("the sealed majority still commits");
     }
     let committed = c.nodes[leader].counters().commit.load_acquire();
     assert!(committed > 0, "the sealed pair committed");
@@ -366,7 +414,10 @@ fn a_cleartext_node_cannot_join_a_sealed_cluster() {
     let sealed_follower = if leader == 0 { 1 } else { 0 };
     let deadline = Instant::now() + Duration::from_secs(20);
     while c.nodes[sealed_follower].counters().append.load_acquire() < committed {
-        assert!(Instant::now() < deadline, "the sealed follower never caught up");
+        assert!(
+            Instant::now() < deadline,
+            "the sealed follower never caught up"
+        );
         std::thread::yield_now();
     }
 
@@ -430,10 +481,14 @@ fn a_cluster_forms_even_when_one_member_never_comes_up() {
 
     // Bind all three sockets so the member map is complete and node 2's
     // address is real (it just never has a node behind it).
-    let socks: Vec<UdpSocket> =
-        (0..3).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(u32, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..3)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(u32, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
 
     let mut socks = socks.into_iter();
     let mut dirs = Vec::new();
@@ -467,10 +522,14 @@ fn a_cluster_forms_even_when_one_member_never_comes_up() {
         .unwrap();
     let client = Client::connect(&leader_dir, APP).unwrap();
     for i in 1..=5u64 {
-        let total: u64 = client.submit(&Cmd::Add(1)).expect("the live majority commits");
+        let total: u64 = client
+            .submit(&Cmd::Add(1))
+            .expect("the live majority commits");
         assert_eq!(total, i);
     }
-    let seen: u64 = client.query_linearizable(&()).expect("and serves a linearizable read");
+    let seen: u64 = client
+        .query_linearizable(&())
+        .expect("and serves a linearizable read");
     assert_eq!(seen, 5);
 
     client.shutdown();

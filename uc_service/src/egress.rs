@@ -27,7 +27,10 @@ pub(crate) struct Egress {
 
 impl Egress {
     pub(crate) fn new(producer: BroadcastProducer) -> Self {
-        Self { producer, scratch: Vec::with_capacity(8 + 256) }
+        Self {
+            producer,
+            scratch: Vec::with_capacity(8 + 256),
+        }
     }
 
     /// Publish a submit response: `position LE ++ resp` on the egress
@@ -53,7 +56,9 @@ impl Egress {
         self.scratch.extend_from_slice(resp);
         let extra = extra_client(session_id as u32, correlation_id as u32);
         // flags = 0: this is a submit response, not a query answer (FLAG_V2_IS_QUERY).
-        let _ = self.producer.write(MSG_V2_RESPONSE, 0, extra, &self.scratch);
+        let _ = self
+            .producer
+            .write(MSG_V2_RESPONSE, 0, extra, &self.scratch);
     }
 
     /// Publish a QUERY answer (Task 11): `MSG_V2_RESPONSE` with
@@ -67,8 +72,12 @@ impl Egress {
         self.scratch.clear();
         self.scratch.extend_from_slice(&0u64.to_le_bytes());
         self.scratch.extend_from_slice(resp);
-        let _ =
-            self.producer.write(MSG_V2_RESPONSE, FLAG_V2_IS_QUERY, header_extra, &self.scratch);
+        let _ = self.producer.write(
+            MSG_V2_RESPONSE,
+            FLAG_V2_IS_QUERY,
+            header_extra,
+            &self.scratch,
+        );
     }
 
     /// Publish `MSG_V2_RETRY` for a query the service refuses (Task 11) — the

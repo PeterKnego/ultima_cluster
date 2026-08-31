@@ -19,8 +19,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use uc_service::{RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
 use uc_lincheck::register::RegisterSm;
+use uc_service::{
+    RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned,
+};
 
 #[derive(Parser)]
 struct Args {
@@ -61,13 +63,24 @@ fn main() -> anyhow::Result<()> {
     // in its type, so the branch has to happen here. Both arms hand the
     // service to `supervise`, which holds it alive until it fail-stops.
     if args.sessioned {
-        let svc = ServiceBuilder::new(cfg, Sessioned::new(RegisterSm::default(), SessionConfig::default()))
-            .start()?;
-        println!("service {} attached at {}", service_id, instance_dir.display());
+        let svc = ServiceBuilder::new(
+            cfg,
+            Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+        )
+        .start()?;
+        println!(
+            "service {} attached at {}",
+            service_id,
+            instance_dir.display()
+        );
         supervise(svc)
     } else {
         let svc = ServiceBuilder::new(cfg, RegisterSm::default()).start()?;
-        println!("service {} attached at {}", service_id, instance_dir.display());
+        println!(
+            "service {} attached at {}",
+            service_id,
+            instance_dir.display()
+        );
         supervise(svc)
     }
 }

@@ -48,9 +48,9 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use uc_gateway::{Edge, EdgeConfig, Member};
+use uc_lincheck::register::{Cmd, CmdResp};
 use uc_remote::conn::FramedConn;
 use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
-use uc_lincheck::register::{Cmd, CmdResp};
 
 mod common;
 
@@ -64,7 +64,9 @@ fn enc(c: &Cmd) -> Vec<u8> {
 }
 
 fn dec(b: &[u8]) -> CmdResp {
-    bincode::serde::decode_from_slice(b, bincode::config::standard()).unwrap().0
+    bincode::serde::decode_from_slice(b, bincode::config::standard())
+        .unwrap()
+        .0
 }
 
 fn read_query() -> Vec<u8> {
@@ -95,7 +97,10 @@ fn start_edge(slot: &common::Slot, listen: std::net::SocketAddr, members: &[Memb
 fn member_map(gw: &[std::net::SocketAddr]) -> Vec<Member> {
     gw.iter()
         .enumerate()
-        .map(|(i, a)| Member { node_id: i as u32, gateway: a.to_string() })
+        .map(|(i, a)| Member {
+            node_id: i as u32,
+            gateway: a.to_string(),
+        })
         .collect()
 }
 
@@ -110,7 +115,9 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     let gw: Vec<std::net::SocketAddr> = (0..3).map(|_| common::free_tcp_addr()).collect();
     let members = member_map(&gw);
     let follower = (0..3).find(|&i| i != leader).expect("a follower");
-    let other = (0..3).find(|&i| i != leader && i != follower).expect("a second follower");
+    let other = (0..3)
+        .find(|&i| i != leader && i != follower)
+        .expect("a second follower");
 
     // The two SURVIVORS' edges come up first, on purpose — see the idle client
     // below.
@@ -179,8 +186,14 @@ fn leader_crash_redirects_and_resend_is_deduped() {
         "the follower's HELLO_OK (or its REDIRECT) names the leader"
     );
     let fs = edges[follower].as_ref().unwrap().stats();
-    assert!(fs.connections >= 1, "the client really did dial the follower first: {fs:?}");
-    assert_eq!(fs.submits, 0, "a follower's edge must never accept a write: {fs:?}");
+    assert!(
+        fs.connections >= 1,
+        "the client really did dial the follower first: {fs:?}"
+    );
+    assert_eq!(
+        fs.submits, 0,
+        "a follower's edge must never accept a write: {fs:?}"
+    );
     assert_eq!(
         edges[leader].as_ref().unwrap().stats().submits,
         1,
@@ -194,7 +207,9 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     // `Conn::ready`). The edge's handshake budget is 5 s, so it stays
     // connected for the duration of this test.
     let mut silent = FramedConn::new(TcpStream::connect(gw[follower]).unwrap()).unwrap();
-    silent.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    silent
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
 
     // --- 2. Pipeline 200 writes; kill the leader half way through.
     let mut tickets = Vec::with_capacity(WRITES as usize);
@@ -235,7 +250,10 @@ fn leader_crash_redirects_and_resend_is_deduped() {
         expired.is_empty(),
         "writes reported EXPIRED — the accepted-SUBMITs-are-a-prefix invariant broke: {expired:?}"
     );
-    assert!(highest_ok > KILL_AFTER, "nothing committed after the crash (highest {highest_ok})");
+    assert!(
+        highest_ok > KILL_AFTER,
+        "nothing committed after the crash (highest {highest_ok})"
+    );
 
     // Checked HERE, as soon as the crash-and-elect window has closed, rather
     // than at the end: the edge's handshake budget is a hard 5 s, so a slow
@@ -249,7 +267,10 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     match silent.read_frame(READ_STALL) {
         Ok(None) | Err(_) => {}
         Ok(Some((h, _))) => {
-            panic!("the edge wrote {:?} at a connection that has not handshaken", h.ty)
+            panic!(
+                "the edge wrote {:?} at a connection that has not handshaken",
+                h.ty
+            )
         }
     }
     drop(silent);
@@ -258,11 +279,19 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     // that was acknowledged. (Writes are monotone, so "last acknowledged" and
     // "highest acknowledged" are the same value.)
     let q = read_query();
-    let r = client.query(&q, Consistency::Linearizable).unwrap().wait().expect("linearizable read");
-    let v: Option<u64> =
-        bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard()).unwrap().0;
+    let r = client
+        .query(&q, Consistency::Linearizable)
+        .unwrap()
+        .wait()
+        .expect("linearizable read");
+    let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
+        .unwrap()
+        .0;
     let v = v.expect("the register was written");
-    assert_eq!(v, highest_ok, "an acknowledged write was lost across the failover");
+    assert_eq!(
+        v, highest_ok,
+        "an acknowledged write was lost across the failover"
+    );
 
     // --- 5. Both clients learned the cluster had moved.
     //
@@ -278,7 +307,10 @@ fn leader_crash_redirects_and_resend_is_deduped() {
         s.redirects + s.leader_changes >= 1,
         "the busy client was never told the cluster moved: {s:?}"
     );
-    assert!(s.resends >= 1, "the failover must have forced a re-send: {s:?}");
+    assert!(
+        s.resends >= 1,
+        "the failover must have forced a re-send: {s:?}"
+    );
 
     // The idle client learned about the failover without ever asking. It is
     // pinned to a survivor's edge (see the rig above), so unlike the busy
@@ -289,10 +321,15 @@ fn leader_crash_redirects_and_resend_is_deduped() {
         idle_stats.leader_changes >= 1,
         "the idle client was never told the leader changed: {idle_stats:?}"
     );
-    assert_eq!(idle_stats.redirects, 0, "it sent nothing, so nothing could be redirected");
+    assert_eq!(
+        idle_stats.redirects, 0,
+        "it sent nothing, so nothing could be redirected"
+    );
 
-    let survivors: Vec<_> =
-        (0..3).filter(|&i| i != leader).map(|i| edges[i].as_ref().unwrap().stats()).collect();
+    let survivors: Vec<_> = (0..3)
+        .filter(|&i| i != leader)
+        .map(|i| edges[i].as_ref().unwrap().stats())
+        .collect();
     assert!(
         survivors.iter().any(|s| s.leader_changed_frames >= 1),
         "no surviving edge pushed LEADER_CHANGED: {survivors:?}"
@@ -318,7 +355,10 @@ fn leader_crash_redirects_and_resend_is_deduped() {
         transitions <= 12,
         "leader-transition storm: {transitions} for one failover ({survivors:?})"
     );
-    assert!(frames <= 40, "LEADER_CHANGED storm: {frames} frames for one failover ({survivors:?})");
+    assert!(
+        frames <= 40,
+        "LEADER_CHANGED storm: {frames} frames for one failover ({survivors:?})"
+    );
 
     idle.shutdown();
     client.shutdown();
@@ -329,5 +369,9 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     for s in slots.iter_mut() {
         s.stop();
     }
-    assert!(started.elapsed() < Duration::from_secs(120), "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(120),
+        "took {:?}",
+        started.elapsed()
+    );
 }

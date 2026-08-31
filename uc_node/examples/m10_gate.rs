@@ -58,8 +58,8 @@ use uc_net::fault::FaultConfig;
 use uc_node::obs::http::ObsServer;
 use uc_node::obs::metrics::CONTRACT_SERIES;
 use uc_node::{Node, NodeConfig};
-use uc_service::{Service, ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
+use uc_service::{Service, ServiceBuilder, ServiceConfig, StateMachine};
 
 const APP: &str = "m10-gate";
 const RING_BYTES: usize = 1 << 20;
@@ -168,7 +168,12 @@ fn main() {
             println!("\n== M10 gate local results ==");
             let mut all_pass = true;
             for v in [&v1, &v2] {
-                println!("  [{}] {} — {}", if v.pass { "PASS" } else { "FAIL" }, v.row, v.detail);
+                println!(
+                    "  [{}] {} — {}",
+                    if v.pass { "PASS" } else { "FAIL" },
+                    v.row,
+                    v.detail
+                );
                 all_pass &= v.pass;
             }
             println!(
@@ -179,7 +184,9 @@ fn main() {
                  13/13 PASS recorded in the gate doc)"
             );
             if all_pass {
-                println!("RESULT: PASS (local rows 1-2; row 3 is smoke, row 4 is a separate script)");
+                println!(
+                    "RESULT: PASS (local rows 1-2; row 3 is smoke, row 4 is a separate script)"
+                );
             } else {
                 println!("RESULT: FAIL (honest) — a locally-gated row (1 or 2) did not hold.");
                 std::process::exit(1);
@@ -204,12 +211,21 @@ fn resolve_root(root: Option<PathBuf>) -> PathBuf {
 fn default_root() -> PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("m10_gate_scratch")))
+        .and_then(|exe| {
+            exe.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("m10_gate_scratch"))
+        })
         .unwrap_or_else(|| PathBuf::from("target/m10_gate_scratch"))
 }
 
 fn report_one(v: &Verdict) {
-    println!("\n  [{}] {} — {}", if v.pass { "PASS" } else { "FAIL" }, v.row, v.detail);
+    println!(
+        "\n  [{}] {} — {}",
+        if v.pass { "PASS" } else { "FAIL" },
+        v.row,
+        v.detail
+    );
     if v.pass {
         println!("RESULT: PASS (local)");
     } else {
@@ -285,7 +301,11 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
     // Node/ObsServer, no daemon binary) — store it directly so the coverage
     // row doesn't fail on an honestly-omitted-when-0 family. The field
     // itself is real; only its writer lives outside this harness.
-    nodes[leader_idx].n().observability().cnc.store_free_disk_bytes(1);
+    nodes[leader_idx]
+        .n()
+        .observability()
+        .cnc
+        .store_free_disk_bytes(1);
 
     let addr = nodes[leader_idx].obs_addr();
     let body = scrape(addr);
@@ -299,7 +319,9 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
     }
     let peer_occupied = body.contains("uc2_peer_reported_durable_bytes{peer=");
     if !peer_occupied {
-        println!("  MISSING: no occupied uc2_peer_reported_durable_bytes{{peer=...}} sample on the leader");
+        println!(
+            "  MISSING: no occupied uc2_peer_reported_durable_bytes{{peer=...}} sample on the leader"
+        );
     }
 
     for n in nodes.iter_mut() {
@@ -387,7 +409,8 @@ fn run_probes(scratch_root: &Path) -> Verdict {
             let addr = nodes[i].obs_addr();
             let status = get_status(addr, "/readyz");
             let flags = cnc_reads[k].status().flags.load_acquire();
-            let elected_not_serving = (flags & NODE_FLAG_LEADER != 0) && (flags & NODE_FLAG_CAN_SERVE == 0);
+            let elected_not_serving =
+                (flags & NODE_FLAG_LEADER != 0) && (flags & NODE_FLAG_CAN_SERVE == 0);
             samples += 1;
             if elected_not_serving {
                 // Non-vacuity: this row proves nothing if the sampler never
@@ -428,7 +451,9 @@ fn run_probes(scratch_root: &Path) -> Verdict {
          flags=0x01); first 200 at {} (bar: zero violations, some node 200 within 5s, and the \
          window must have been sampled at all)",
         survivors.len(),
-        ready_at.map(|d| format!("{:.3}s", d.as_secs_f64())).unwrap_or_else(|| "never".into()),
+        ready_at
+            .map(|d| format!("{:.3}s", d.as_secs_f64()))
+            .unwrap_or_else(|| "never".into()),
     );
     if !non_vacuous {
         println!(
@@ -489,7 +514,11 @@ fn commit_rate_window(nodes: &[NodeH], leader_idx: usize, secs: u64, scrape_on: 
 }
 
 fn max_commit(nodes: &[NodeH]) -> u64 {
-    nodes.iter().map(|n| n.n().observability().cnc.counters().commit.load_acquire()).max().unwrap_or(0)
+    nodes
+        .iter()
+        .map(|n| n.n().observability().cnc.counters().commit.load_acquire())
+        .max()
+        .unwrap_or(0)
 }
 
 // ============================================================ cluster kit
@@ -577,10 +606,14 @@ fn spawn_cluster(
         .tempdir_in(scratch_root)
         .expect("tempdir");
 
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
@@ -596,9 +629,13 @@ fn spawn_cluster(
             admission_bytes,
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        let obs =
-            ObsServer::serve(node.observability(), "127.0.0.1:0".parse().unwrap()).expect("bind obs");
-        nodes.push(NodeH { instance_dir, node: Some(node), obs: Some(obs) });
+        let obs = ObsServer::serve(node.observability(), "127.0.0.1:0".parse().unwrap())
+            .expect("bind obs");
+        nodes.push(NodeH {
+            instance_dir,
+            node: Some(node),
+            obs: Some(obs),
+        });
     }
     (dir, nodes)
 }
@@ -609,7 +646,10 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
         let serving: Vec<usize> = (0..nodes.len())
             .filter(|&i| nodes[i].node.is_some() && nodes[i].n().can_serve())
             .collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -649,9 +689,14 @@ fn await_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
 
 fn scrape(addr: SocketAddr) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect to obs server");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout");
-    write!(stream, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set_read_timeout");
+    write!(
+        stream,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
     stream.flush().expect("flush request");
 
     let mut raw = Vec::new();
@@ -668,7 +713,12 @@ fn get_status(addr: SocketAddr, path: &str) -> u16 {
         Err(_) => return 0,
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    if write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").is_err() {
+    if write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
         return 0;
     }
     let _ = stream.flush();

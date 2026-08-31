@@ -51,7 +51,10 @@ use counter::{Applied, Command as CounterCommand, Query, QueryResponse};
 use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError};
 
 #[derive(Parser)]
-#[command(name = "counter-remote", about = "Drives the counter cluster through a uc2-gateway")]
+#[command(
+    name = "counter-remote",
+    about = "Drives the counter cluster through a uc2-gateway"
+)]
 struct Args {
     /// Every gateway's address, comma-separated: `host:port[,host:port…]`.
     /// List them all — the client dials in order and follows redirects, so
@@ -104,7 +107,11 @@ fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
 fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> Result<T, Fail> {
     bincode::serde::decode_from_slice(b, bincode::config::standard())
         .map(|(v, _)| v)
-        .map_err(|e| Fail::Run(format!("cannot decode the response ({e}) — app_id mismatch?")))
+        .map_err(|e| {
+            Fail::Run(format!(
+                "cannot decode the response ({e}) — app_id mismatch?"
+            ))
+        })
 }
 
 /// Connect, retrying while the deadline holds: a cluster that is still
@@ -143,17 +150,23 @@ fn connect(args: &Args, deadline: Instant) -> Result<RemoteClient, Fail> {
 /// What is left of the `--timeout-secs` budget, floored at a second so a
 /// request that only just got a connection still gets a chance to resolve.
 fn remaining(deadline: Instant) -> Duration {
-    deadline.saturating_duration_since(Instant::now()).max(Duration::from_secs(1))
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_secs(1))
 }
 
 fn run(args: &Args) -> Result<(), Fail> {
     for g in &args.gateways {
         if g.trim().is_empty() || !g.contains(':') {
-            return Err(Fail::Args(format!("--gateways entry {g:?} is not a host:port address")));
+            return Err(Fail::Args(format!(
+                "--gateways entry {g:?} is not a host:port address"
+            )));
         }
     }
     if args.timeout_secs == 0 {
-        return Err(Fail::Args("--timeout-secs must be greater than zero".into()));
+        return Err(Fail::Args(
+            "--timeout-secs must be greater than zero".into(),
+        ));
     }
 
     let deadline = Instant::now() + Duration::from_secs(args.timeout_secs);
@@ -172,19 +185,32 @@ fn run(args: &Args) -> Result<(), Fail> {
 }
 
 fn submit(client: &RemoteClient, cmd: &CounterCommand, deadline: Instant) -> Result<(), Fail> {
-    let ticket = client.submit(&enc(cmd)).map_err(|e| Fail::Run(e.to_string()))?;
-    let resp = ticket.wait_timeout(remaining(deadline)).map_err(|e| Fail::Run(e.to_string()))?;
+    let ticket = client
+        .submit(&enc(cmd))
+        .map_err(|e| Fail::Run(e.to_string()))?;
+    let resp = ticket
+        .wait_timeout(remaining(deadline))
+        .map_err(|e| Fail::Run(e.to_string()))?;
     let applied: Applied = dec(&resp.bytes)?;
-    println!("value={} position={} replayed={}", applied.value, resp.position, resp.replayed);
+    println!(
+        "value={} position={} replayed={}",
+        applied.value, resp.position, resp.replayed
+    );
     Ok(())
 }
 
 fn query(client: &RemoteClient, linearizable: bool, deadline: Instant) -> Result<(), Fail> {
-    let consistency =
-        if linearizable { Consistency::Linearizable } else { Consistency::Snapshot };
-    let ticket =
-        client.query(&enc(&Query::Value), consistency).map_err(|e| Fail::Run(e.to_string()))?;
-    let resp = ticket.wait_timeout(remaining(deadline)).map_err(|e| Fail::Run(e.to_string()))?;
+    let consistency = if linearizable {
+        Consistency::Linearizable
+    } else {
+        Consistency::Snapshot
+    };
+    let ticket = client
+        .query(&enc(&Query::Value), consistency)
+        .map_err(|e| Fail::Run(e.to_string()))?;
+    let resp = ticket
+        .wait_timeout(remaining(deadline))
+        .map_err(|e| Fail::Run(e.to_string()))?;
     let answer: QueryResponse = dec(&resp.bytes)?;
     println!("value={}", answer.value);
     Ok(())

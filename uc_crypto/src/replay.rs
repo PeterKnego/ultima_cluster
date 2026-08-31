@@ -162,7 +162,10 @@ mod tests {
         let mut w = ReplayWindow::new();
         assert!(w.check_and_set(1));
         assert!(w.check_and_set(2));
-        assert!(!w.check_and_set(2), "a captured-and-resent datagram is refused");
+        assert!(
+            !w.check_and_set(2),
+            "a captured-and-resent datagram is refused"
+        );
         assert!(!w.check_and_set(1));
     }
 
@@ -171,7 +174,10 @@ mod tests {
         // UC's transport reorders freely; the window must not turn that into loss.
         let mut w = ReplayWindow::new();
         assert!(w.check_and_set(10));
-        assert!(w.check_and_set(5), "late arrival within the window is legitimate");
+        assert!(
+            w.check_and_set(5),
+            "late arrival within the window is legitimate"
+        );
         assert!(!w.check_and_set(5), "but only once");
     }
 
@@ -179,7 +185,10 @@ mod tests {
     fn rejects_anything_older_than_the_window() {
         let mut w = ReplayWindow::new();
         assert!(w.check_and_set(REPLAY_WINDOW_BITS + 100));
-        assert!(!w.check_and_set(1), "far-past counter is unverifiable, so refuse");
+        assert!(
+            !w.check_and_set(1),
+            "far-past counter is unverifiable, so refuse"
+        );
     }
 
     #[test]
@@ -187,8 +196,14 @@ mod tests {
         let mut w = ReplayWindow::new();
         assert!(w.check_and_set(1));
         assert!(w.check_and_set(u64::MAX / 2));
-        assert!(!w.check_and_set(u64::MAX / 2), "still tracked after the jump");
-        assert!(!w.check_and_set(1), "the old counter fell out of the window");
+        assert!(
+            !w.check_and_set(u64::MAX / 2),
+            "still tracked after the jump"
+        );
+        assert!(
+            !w.check_and_set(1),
+            "the old counter fell out of the window"
+        );
     }
 
     // The four tests above never move a tracked run across a `u64` word
@@ -219,15 +234,27 @@ mod tests {
 
         // Direction A — a bit lost in the shift wrongly ACCEPTS a replay:
         // every previously-accepted counter must still read as seen.
-        assert!(!w.check_and_set(70), "near edge of the old run must survive the cross-word shift");
-        assert!(!w.check_and_set(35), "middle of the old run must survive the cross-word shift");
-        assert!(!w.check_and_set(1), "far edge of the old run must survive the cross-word shift");
+        assert!(
+            !w.check_and_set(70),
+            "near edge of the old run must survive the cross-word shift"
+        );
+        assert!(
+            !w.check_and_set(35),
+            "middle of the old run must survive the cross-word shift"
+        );
+        assert!(
+            !w.check_and_set(1),
+            "far edge of the old run must survive the cross-word shift"
+        );
 
         // Direction B — a bit misplaced by the shift wrongly REJECTS
         // fresh traffic: distance 20 (counter 150) was never set by
         // either the original run (distances 0..69, now 100..169) or by
         // accepting 170 itself (distance 0), so it must be accepted.
-        assert!(w.check_and_set(150), "never-before-seen counter must not be corrupted into a false replay");
+        assert!(
+            w.check_and_set(150),
+            "never-before-seen counter must not be corrupted into a false replay"
+        );
     }
 
     // Pins the two off-by-one boundaries the mandated tests never hit:

@@ -61,7 +61,10 @@ fn main() -> anyhow::Result<()> {
     //    Even alone, it does not skip that step.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !node.can_serve() {
-        anyhow::ensure!(Instant::now() < deadline, "node never became ready to serve");
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "node never became ready to serve"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     println!("node is leader and serving\n");
@@ -79,7 +82,10 @@ fn main() -> anyhow::Result<()> {
 
     for n in [1, 2, 3, 10, -6] {
         let applied: Applied = client.submit(&Command::Add(n))?;
-        println!("Add({n:>3}) -> value {:>3}  @ log position {}", applied.value, applied.position);
+        println!(
+            "Add({n:>3}) -> value {:>3}  @ log position {}",
+            applied.value, applied.position
+        );
     }
 
     // A linearizable read: the node confirms it is still leader with a quorum
@@ -93,7 +99,10 @@ fn main() -> anyhow::Result<()> {
     println!("snapshot read     -> {}", r.value);
 
     let applied: Applied = client.submit(&Command::Reset)?;
-    println!("\nReset      -> value {:>3}  @ log position {}", applied.value, applied.position);
+    println!(
+        "\nReset      -> value {:>3}  @ log position {}",
+        applied.value, applied.position
+    );
 
     println!("\nEverything above went through consensus and was fsync'd before it was acked.");
     Ok(())

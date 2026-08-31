@@ -15,8 +15,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use uc_protocol::v2::frame::{self, FrameHeader, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, HEADER_LEN};
 use uc_journal::{Durability, Journal, JournalConfig, JournalError};
+use uc_protocol::v2::frame::{
+    self, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN,
+};
 
 use crate::buffer::LogBuffer;
 
@@ -46,8 +48,16 @@ pub enum ArchiveError {
     /// the block). Archived blocks are journal-CRC-covered, so this is a
     /// recorder-side bug or on-disk corruption — surfaced as a diagnosable
     /// error (previously an unlabeled OOB slice panic in `Replay::next`).
-    #[error("corrupt archived block seq {seq} (base {base}): frame at off {off} claims len {claimed_len}, block len {block_len}")]
-    CorruptBlock { seq: u64, base: u64, off: usize, claimed_len: u32, block_len: usize },
+    #[error(
+        "corrupt archived block seq {seq} (base {base}): frame at off {off} claims len {claimed_len}, block len {block_len}"
+    )]
+    CorruptBlock {
+        seq: u64,
+        base: u64,
+        off: usize,
+        claimed_len: u32,
+        block_len: usize,
+    },
     /// Post-M7 follow-up: `LogBuffer::recordable_slice`'s frame walk hit a
     /// length word inconsistent with the committed region — a recorder-side
     /// invariant break (see `RecordableCorrupt`'s doc comment). Fail-stop
@@ -257,10 +267,16 @@ impl Archive {
             if self.durable_pos >= pos {
                 return Ok(self.durable_pos); // already covered — no-op
             }
-            return Err(ArchiveError::AdoptFloorConflict { durable: self.durable_pos, pos });
+            return Err(ArchiveError::AdoptFloorConflict {
+                durable: self.durable_pos,
+                pos,
+            });
         }
         if pos < self.durable_pos {
-            return Err(ArchiveError::AdoptFloorConflict { durable: self.durable_pos, pos });
+            return Err(ArchiveError::AdoptFloorConflict {
+                durable: self.durable_pos,
+                pos,
+            });
         }
         self.durable_pos = pos;
         self.first_base = pos;
@@ -284,8 +300,9 @@ impl Archive {
     /// returns — post-fdatasync under Consistent durability, post-buffered-
     /// write under Eventual (the journal's async fsync trails).
     pub fn do_work(&mut self, buffer: &LogBuffer) -> Result<bool, ArchiveError> {
-        let slice = buffer.recordable_slice(self.durable_pos, self.cfg.max_block_bytes).map_err(
-            |c| {
+        let slice = buffer
+            .recordable_slice(self.durable_pos, self.cfg.max_block_bytes)
+            .map_err(|c| {
                 // DIAGNOSTIC (nightly elle_partition fail-stop): dump the buffer
                 // state before the caller turns this into a fail-stop panic.
                 eprintln!(
@@ -295,13 +312,14 @@ impl Archive {
                     self.next_block_seq,
                 );
                 ArchiveError::RecorderCorrupt(c)
-            },
-        )?;
+            })?;
         if slice.is_empty() {
             return Ok(false);
         }
         let base = self.durable_pos;
-        let notifier = self.journal.append(self.next_block_seq, self.durable_pos, slice)?;
+        let notifier = self
+            .journal
+            .append(self.next_block_seq, self.durable_pos, slice)?;
         let len = slice.len() as u64;
         // If wait() errors here, next_block_seq is left unadvanced, so a
         // retry would hit NonMonotonicSeq — acceptable because a Consistent-
@@ -341,10 +359,10 @@ impl Archive {
             if (h.length as usize) < HEADER_LEN || off + aligned > block.len() {
                 break;
             }
-            if h.frame_type != FRAME_TYPE_PADDING
-                && h.leadership_term_id != self.last_observed_term
+            if h.frame_type != FRAME_TYPE_PADDING && h.leadership_term_id != self.last_observed_term
             {
-                self.term_observations.push((h.leadership_term_id, base + off as u64));
+                self.term_observations
+                    .push((h.leadership_term_id, base + off as u64));
                 self.last_observed_term = h.leadership_term_id;
             }
             // M7: CONFIG frames in the same header walk. `aligned` is already
@@ -427,7 +445,10 @@ impl Archive {
             return Ok(());
         }
         if pos > self.durable_pos {
-            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
+            return Err(ArchiveError::PositionPurged {
+                pos,
+                first_base: self.first_base,
+            });
         }
         // Alignment is only meaningful for a position we will actually cut at;
         // out-of-range values are rejected above and never reach here.
@@ -436,22 +457,24 @@ impl Archive {
             "truncation positions are frame boundaries"
         );
         let (Some(first), Some(last)) = (self.journal.first_seq(), self.journal.last_seq()) else {
-            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
+            return Err(ArchiveError::PositionPurged {
+                pos,
+                first_base: self.first_base,
+            });
         };
         let (first_base, _) = self.journal.read(first)?.expect("first block readable");
         if pos < first_base {
-            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
+            return Err(ArchiveError::PositionPurged {
+                pos,
+                first_base: self.first_base,
+            });
         }
         // Binary search: greatest block with base <= pos (replay_from's shape).
         let (mut lo, mut hi) = (first, last);
         while lo < hi {
             let mid = lo + (hi - lo).div_ceil(2);
             let (meta, _) = self.journal.read(mid)?.expect("block readable");
-            if meta <= pos {
-                lo = mid
-            } else {
-                hi = mid - 1
-            }
+            if meta <= pos { lo = mid } else { hi = mid - 1 }
         }
         let (base, bytes) = self.journal.read(lo)?.expect("block readable");
         // A cut at or inside the FIRST archived block (drop it whole when
@@ -461,7 +484,10 @@ impl Archive {
         // block seq 0. `base == first_base` here (lo == first).
         if lo == first {
             let keep = (pos - base) as usize;
-            debug_assert!(keep < bytes.len(), "first-block cut must be strictly inside the block");
+            debug_assert!(
+                keep < bytes.len(),
+                "first-block cut must be strictly inside the block"
+            );
             let prefix = bytes[..keep].to_vec();
             self.journal.truncate_all()?.wait()?;
             if pos > base {
@@ -552,7 +578,9 @@ impl Replay<'_> {
     pub fn next(&mut self) -> Result<Option<ReplayFrame>, ArchiveError> {
         loop {
             if self.off >= self.block.len() {
-                let Some(last) = self.last_seq else { return Ok(None) };
+                let Some(last) = self.last_seq else {
+                    return Ok(None);
+                };
                 if self.seq > last {
                     return Ok(None);
                 }
@@ -690,7 +718,10 @@ pub fn find_block(journal: &Journal, pos: u64) -> Result<Option<(u64, u64)>, Arc
 /// replay); it is exercised by `tests/archive_stress.rs` and the unit test
 /// below, but is not part of the crate's stable surface.
 #[doc(hidden)]
-pub fn replay_journal_from(journal: &Journal, pos: u64) -> Result<Option<Replay<'_>>, ArchiveError> {
+pub fn replay_journal_from(
+    journal: &Journal,
+    pos: u64,
+) -> Result<Option<Replay<'_>>, ArchiveError> {
     let Some(last) = journal.last_seq() else {
         // Empty journal: an exhausted replay (mirrors replay_from's shape).
         return Ok(Some(Replay {
@@ -740,7 +771,10 @@ impl Archive {
         let Some((lo, _base)) = find_block(&self.journal, pos)? else {
             // pos < durable frontier but below the first archived block: purged.
             // Report the tracked floor (the first retained block's base).
-            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
+            return Err(ArchiveError::PositionPurged {
+                pos,
+                first_base: self.first_base,
+            });
         };
         Ok(Replay {
             journal: self.journal.as_ref(),
@@ -776,8 +810,14 @@ mod tests {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_log_tests")
             });
         std::fs::create_dir_all(&base).unwrap();
-        let dir = tempfile::Builder::new().prefix("uc2-log-").tempdir_in(&base).unwrap();
-        assert!(!dir.path().starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        let dir = tempfile::Builder::new()
+            .prefix("uc2-log-")
+            .tempdir_in(&base)
+            .unwrap();
+        assert!(
+            !dir.path().starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {dir:?}"
+        );
         dir
     }
 
@@ -790,7 +830,11 @@ mod tests {
             buffer_bytes: cap as u64,
             max_payload: 256,
         });
-        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(cap), Arc::clone(&cnc), 256));
+        let b = Arc::new(LogBuffer::new(
+            Region::heap_zeroed(cap),
+            Arc::clone(&cnc),
+            256,
+        ));
         (b, cnc, dir)
     }
 
@@ -798,7 +842,10 @@ mod tests {
     /// preallocation stays on (the production default path is covered by
     /// archive_config_defaults).
     fn test_cfg(dir: &std::path::Path) -> ArchiveConfig {
-        ArchiveConfig { segment_size_bytes: 4 * 1024 * 1024, ..ArchiveConfig::new(dir) }
+        ArchiveConfig {
+            segment_size_bytes: 4 * 1024 * 1024,
+            ..ArchiveConfig::new(dir)
+        }
     }
 
     /// REPRODUCTION of the nightly `elle_partition` archive fail-stop
@@ -846,7 +893,10 @@ mod tests {
         // BecomeLeader with a STALE `base`: consensus sampled `durable` one
         // block ago (384), before the archive recorded the last frame (480).
         let base = 384;
-        assert!(base < arch.recovered_position(), "the race window: base < cursor");
+        assert!(
+            base < arch.recovered_position(),
+            "the race window: base < cursor"
+        );
         c.counters().prime(base);
 
         // The new leader rewrites from `base` with a different layout: a
@@ -858,10 +908,18 @@ mod tests {
 
         // The archive resumes at its own 480 — now mid-payload of [416, 512).
         let err = arch.do_work(&b).unwrap_err();
-        let ArchiveError::RecorderCorrupt(c) = err else { panic!("expected RecorderCorrupt: {err:?}") };
+        let ArchiveError::RecorderCorrupt(c) = err else {
+            panic!("expected RecorderCorrupt: {err:?}")
+        };
         assert_eq!(c.from, 480);
-        assert_eq!(c.end, 0, "the very first length word is garbage (CI signature)");
-        assert_eq!(c.claimed_len, 0xABAB_ABAB, "a payload byte read as a length word");
+        assert_eq!(
+            c.end, 0,
+            "the very first length word is garbage (CI signature)"
+        );
+        assert_eq!(
+            c.claimed_len, 0xABAB_ABAB,
+            "a payload byte read as a length word"
+        );
     }
 
     /// The other half of the reproduction above: routing the SAME collapse
@@ -886,7 +944,11 @@ mod tests {
         // the cut instead of being stranded above it.
         let base = 384;
         arch.truncate_to(base).unwrap();
-        assert_eq!(arch.recovered_position(), base, "the cursor moved with the cut");
+        assert_eq!(
+            arch.recovered_position(),
+            base,
+            "the cursor moved with the cut"
+        );
         c.counters().prime(base);
 
         let mut a2 = Appender::new(Arc::clone(&b), 2);
@@ -895,7 +957,10 @@ mod tests {
 
         // The archive resumes at `base`, on a frame boundary of the NEW stream.
         while arch.do_work(&b).unwrap() {}
-        assert_eq!(arch.recovered_position(), c.counters().append.load_acquire());
+        assert_eq!(
+            arch.recovered_position(),
+            c.counters().append.load_acquire()
+        );
 
         // And the journal no longer holds the discarded tail: replaying from
         // `base` yields the new leader's frames, not the old term's.
@@ -921,7 +986,11 @@ mod tests {
             let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
             assert_eq!(arch.recovered_position(), 0);
             assert_eq!(arch.adopt_floor(64 * 1024).unwrap(), 64 * 1024);
-            assert_eq!(arch.recovered_position(), 64 * 1024, "durable advanced with no data");
+            assert_eq!(
+                arch.recovered_position(),
+                64 * 1024,
+                "durable advanced with no data"
+            );
             assert_eq!(arch.first_base(), 64 * 1024);
             // Idempotent no-op when already at/below the floor.
             assert_eq!(arch.adopt_floor(64 * 1024).unwrap(), 64 * 1024);
@@ -996,7 +1065,10 @@ mod tests {
     #[cfg_attr(miri, ignore)] // real journal files + fsync
     fn blocks_split_at_max_and_meta_is_base_position() {
         let (b, _c, dir) = setup(1 << 16);
-        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
+        let cfg = ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        };
         let mut arch = Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
         for i in 0..4 {
@@ -1111,7 +1183,10 @@ mod tests {
     fn truncate_to_drops_tail_and_reappends_partial_block() {
         let (b, _c, dir) = setup(1 << 16);
         // small blocks so the stream spans several: 2 frames per block
-        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
+        let cfg = ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        };
         let mut arch = Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
         for i in 0..8 {
@@ -1152,7 +1227,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn truncate_to_block_boundary_and_noop_and_errors() {
         let (b, _c, dir) = setup(1 << 16);
-        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
+        let cfg = ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        };
         let mut arch = Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
         for i in 0..4 {
@@ -1170,8 +1248,11 @@ mod tests {
         assert!(arch.truncate_to(500).is_err());
         // survives reopen: recovery sees the truncated frontier
         drop(arch);
-        let arch = Archive::open(ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) })
-            .unwrap();
+        let arch = Archive::open(ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        })
+        .unwrap();
         assert_eq!(arch.recovered_position(), 192);
     }
 
@@ -1201,7 +1282,11 @@ mod tests {
             frames.push(a.append(1, i, &[i as u8; 64]).unwrap());
         }
         while arch.do_work(&b).unwrap() {}
-        assert_eq!(arch.blocks_recorded(), n_blocks as u64, "one block per 4 frames");
+        assert_eq!(
+            arch.blocks_recorded(),
+            n_blocks as u64,
+            "one block per 4 frames"
+        );
         (arch, b, frames, dir)
     }
 
@@ -1256,8 +1341,16 @@ mod tests {
             ..ArchiveConfig::new(&dir)
         })
         .unwrap();
-        assert_eq!(re.first_base(), first, "floor recovered from journal.first_seq");
-        assert_eq!(re.recovered_position(), frames_end(&frames), "frontier untouched by purge");
+        assert_eq!(
+            re.first_base(),
+            first,
+            "floor recovered from journal.first_seq"
+        );
+        assert_eq!(
+            re.recovered_position(),
+            frames_end(&frames),
+            "frontier untouched by purge"
+        );
     }
 
     /// Helper: an archive holding exactly ONE block of 4 frames (positions
@@ -1276,7 +1369,11 @@ mod tests {
         }
         while arch.do_work(&b).unwrap() {}
         assert_eq!(arch.recovered_position(), 384, "4 frames = one 384 B block");
-        assert_eq!(arch.blocks_recorded(), 1, "helper must record exactly one block");
+        assert_eq!(
+            arch.blocks_recorded(),
+            1,
+            "helper must record exactly one block"
+        );
         assert_eq!(frames, vec![0, 96, 192, 288]);
         (arch, b, frames, dir)
     }
@@ -1290,7 +1387,10 @@ mod tests {
         archive.truncate_to(cut).unwrap();
         assert_eq!(archive.recovered_position(), cut);
         let mut replay = archive.replay_from(0).unwrap();
-        let mut n = 0; while replay.next().unwrap().is_some() { n += 1; }
+        let mut n = 0;
+        while replay.next().unwrap().is_some() {
+            n += 1;
+        }
         assert_eq!(n, 2, "only the surviving prefix frames replay");
         let _ = buffer;
     }
@@ -1336,7 +1436,7 @@ mod tests {
 
     // ----------------------------------------------- M4 term observation (T7)
 
-    use uc_protocol::v2::frame::{write_header_except_length, FrameHeader, FRAME_TYPE_MESSAGE};
+    use uc_protocol::v2::frame::{FRAME_TYPE_MESSAGE, FrameHeader, write_header_except_length};
 
     /// A recorded block spanning a term change yields the transition at the
     /// EXACT base of the new term's first frame; draining empties the buffer.
@@ -1364,7 +1464,10 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn truncate_resets_and_reobserves_terms() {
         let (b, _c, dir) = setup(1 << 16);
-        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
+        let cfg = ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        };
         let mut arch = Archive::open(cfg).unwrap();
         // block 0 = term 1 (frames 0, 96); block 1 = term 2 (frames 192, 288)
         let mut a1 = Appender::new(Arc::clone(&b), 1);
@@ -1410,7 +1513,10 @@ mod tests {
         );
         pad[..4].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
         arch.observe_terms(&pad, 4096);
-        assert!(arch.take_term_observations().is_empty(), "padding produced a spurious term");
+        assert!(
+            arch.take_term_observations().is_empty(),
+            "padding produced a spurious term"
+        );
 
         // a real message frame at term 5 now transitions from 0 -> 5 at base 0
         let mut msg = vec![0u8; frame::align_frame_len(HEADER_LEN + 64)];
@@ -1444,7 +1550,10 @@ mod tests {
         let end = a.append_config(1, b"cfg-v1").unwrap(); // CONFIG frame next
         a.append(1, 1, &[0u8; 64]).unwrap(); // MESSAGE frame after it
         assert!(arch.do_work(&b).unwrap());
-        assert_eq!(arch.take_config_observations(), vec![(end, b"cfg-v1".to_vec())]);
+        assert_eq!(
+            arch.take_config_observations(),
+            vec![(end, b"cfg-v1".to_vec())]
+        );
         // draining consumed them
         assert!(arch.take_config_observations().is_empty());
     }
@@ -1480,7 +1589,10 @@ mod tests {
         // the truncation lands, so the reset below is the thing under test
         // rather than an already-empty buffer.
         arch.truncate_to(96).unwrap(); // drops the CONFIG frame's bytes (first-block cut)
-        assert!(arch.take_config_observations().is_empty(), "stale observation must not survive truncation");
+        assert!(
+            arch.take_config_observations().is_empty(),
+            "stale observation must not survive truncation"
+        );
     }
 
     /// Post-M7 Task 3 (review carry): `replay_journal_from` — the shared-
@@ -1497,7 +1609,9 @@ mod tests {
         // Mid-stream frame start: identical stream to replay_from.
         let mid = frames[frames.len() / 2];
         let mut a = archive.replay_from(mid).unwrap();
-        let mut b = replay_journal_from(&journal, mid).unwrap().expect("covered position");
+        let mut b = replay_journal_from(&journal, mid)
+            .unwrap()
+            .expect("covered position");
         loop {
             match (a.next().unwrap(), b.next().unwrap()) {
                 (Some(x), Some(y)) => assert_eq!(x, y),
@@ -1508,7 +1622,9 @@ mod tests {
 
         // At/beyond the durable frontier: exhausted, not an error.
         let frontier = frames_end(&frames);
-        let mut r = replay_journal_from(&journal, frontier).unwrap().expect("constructible");
+        let mut r = replay_journal_from(&journal, frontier)
+            .unwrap()
+            .expect("constructible");
         assert!(r.next().unwrap().is_none());
 
         // Below the purge floor: Ok(None) (no floor bookkeeping to report).
@@ -1516,7 +1632,9 @@ mod tests {
         let new_first = archive.purge_below(cut).unwrap();
         let journal = archive.journal_arc();
         assert!(
-            replay_journal_from(&journal, new_first.saturating_sub(1)).unwrap().is_none(),
+            replay_journal_from(&journal, new_first.saturating_sub(1))
+                .unwrap()
+                .is_none(),
             "below-floor position must yield Ok(None)"
         );
 
@@ -1606,13 +1724,21 @@ mod tests {
         notifier.wait().unwrap();
 
         let mut replay = replay_block_zero(journal);
-        let first = replay.next().unwrap().expect("the valid frame replays fine");
+        let first = replay
+            .next()
+            .unwrap()
+            .expect("the valid frame replays fine");
         assert_eq!(first.payload, b"hello");
         assert_eq!(first.header.correlation_id, 7);
 
         let err = replay.next().unwrap_err();
         match err {
-            ArchiveError::CorruptBlock { off, claimed_len, block_len, .. } => {
+            ArchiveError::CorruptBlock {
+                off,
+                claimed_len,
+                block_len,
+                ..
+            } => {
                 assert_eq!(off, valid_len);
                 assert_eq!(claimed_len, 4096);
                 assert_eq!(block_len, block.len());
@@ -1641,11 +1767,19 @@ mod tests {
         notifier.wait().unwrap();
 
         let mut replay = replay_block_zero(journal);
-        assert!(replay.next().unwrap().is_some(), "the valid frame replays fine");
+        assert!(
+            replay.next().unwrap().is_some(),
+            "the valid frame replays fine"
+        );
 
         let err = replay.next().unwrap_err();
         match err {
-            ArchiveError::CorruptBlock { off, claimed_len, block_len, .. } => {
+            ArchiveError::CorruptBlock {
+                off,
+                claimed_len,
+                block_len,
+                ..
+            } => {
                 assert_eq!(off, valid_len);
                 assert_eq!(claimed_len, 0);
                 assert_eq!(block_len, block.len());

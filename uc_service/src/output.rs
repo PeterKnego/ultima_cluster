@@ -57,11 +57,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
-use uc_journal::TailReader;
 
 use crate::traits::{OutputError, RawOutputHandler, RawStateMachine};
 
@@ -112,7 +112,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> OutputState<S, O> {
         // wants `tokio::time` inside `on_committed`; the backoff sleeps here go
         // through plain `std::thread::sleep`) — "rt + time features only" per
         // the plan.
-        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()?;
         Ok(Self {
             follower,
             sm,
@@ -159,10 +161,15 @@ pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
     }
 
     let counters = st.cnc.counters();
-    let service_applied = crate::attach::slot(&st.cnc, st.service_id).applied.load_acquire();
+    let service_applied = crate::attach::slot(&st.cnc, st.service_id)
+        .applied
+        .load_acquire();
     // Never run ahead of apply: `state` must already reflect `cmd`'s effect.
-    let target =
-        counters.commit.load_acquire().min(counters.durable.load_acquire()).min(service_applied);
+    let target = counters
+        .commit
+        .load_acquire()
+        .min(counters.durable.load_acquire())
+        .min(service_applied);
 
     let mut progressed = false;
     'cycle: loop {
@@ -190,7 +197,16 @@ pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
                     // the borrows disjoint (module doc). The frame payload goes
                     // through as bytes — a typed handler decodes it inside
                     // `TypedOutput`'s `RawOutputHandler` impl.
-                    if !deliver(&st.sm, &st.cnc, st.service_id, &st.handler, &st.rt, pos, frame_end, payload) {
+                    if !deliver(
+                        &st.sm,
+                        &st.cnc,
+                        st.service_id,
+                        &st.handler,
+                        &st.rt,
+                        pos,
+                        frame_end,
+                        payload,
+                    ) {
                         // Lost leadership mid-frame: abandon it (unpersisted —
                         // the next become-leader edge redelivers it) and stop
                         // touching the log this cycle.
@@ -382,5 +398,9 @@ fn output_replay_degrade<S: RawStateMachine, O: RawOutputHandler<S>>(
         })
         .expect("journal replay (output) scan fail-stop");
 
-    if lost_leadership { ReplayOutcome::LostLeadership(cursor) } else { ReplayOutcome::Cursor(cursor) }
+    if lost_leadership {
+        ReplayOutcome::LostLeadership(cursor)
+    } else {
+        ReplayOutcome::Cursor(cursor)
+    }
 }

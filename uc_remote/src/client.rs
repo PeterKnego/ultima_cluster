@@ -44,7 +44,10 @@ struct TicketCore {
 
 impl TicketCore {
     fn new() -> TicketCore {
-        TicketCore { done: Mutex::new(None), cv: Condvar::new() }
+        TicketCore {
+            done: Mutex::new(None),
+            cv: Condvar::new(),
+        }
     }
 
     fn set(&self, r: Result<RemoteResponse, RemoteError>) {
@@ -248,7 +251,11 @@ fn resolve(c: RemoteCompletion<'_>) {
     // runs exactly once for this pointer.
     let core = unsafe { Arc::from_raw(c.user_data as *const TicketCore) };
     let r = match c.outcome {
-        RemoteOutcome::Response { body, replayed, expired } => {
+        RemoteOutcome::Response {
+            body,
+            replayed,
+            expired,
+        } => {
             if expired {
                 Err(RemoteError::Expired)
             } else {

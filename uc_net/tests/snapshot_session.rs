@@ -54,7 +54,9 @@ fn unrouted() -> mpsc::SyncSender<NetEvent> {
 /// Deterministic snapshot payload for `id` (so both ends can be byte-compared,
 /// and the two artifacts of a stream are distinguishable).
 fn snapshot_bytes(id: u8) -> Vec<u8> {
-    (0..SNAP_LEN).map(|i| (i.wrapping_mul(31).wrapping_add(7 + id as usize)) as u8).collect()
+    (0..SNAP_LEN)
+        .map(|i| (i.wrapping_mul(31).wrapping_add(7 + id as usize)) as u8)
+        .collect()
 }
 
 /// The artifact position FSM `id` publishes in these tests.
@@ -151,9 +153,18 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
     leader_send.set_snapshot_source(snapshot_source);
 
     let mut lrcfg = FollowerConfig::new(leader_addr);
-    lrcfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 2_000_000 };
-    let mut leader_recv =
-        FollowerReceiver::new(Arc::clone(&leader_buf), recv_sock, lrcfg, Arc::clone(&term), unrouted());
+    lrcfg.nak = NakConfig {
+        delay_min_ns: 100_000,
+        delay_max_ns: 500_000,
+        backoff_ns: 2_000_000,
+    };
+    let mut leader_recv = FollowerReceiver::new(
+        Arc::clone(&leader_buf),
+        recv_sock,
+        lrcfg,
+        Arc::clone(&term),
+        unrouted(),
+    );
     leader_recv.set_sender_route(ctrl_tx.clone());
 
     // Follower: intake enabled.
@@ -162,9 +173,12 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
     std::fs::create_dir_all(&follower_snap_dir).unwrap();
     let follower_buf = heap_buffer();
     let mut fcfg = FollowerConfig::new(leader_addr);
-    fcfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 1_000_000 };
-    let mut follower =
-        FollowerReceiver::new(follower_buf, follower_sock, fcfg, term, unrouted());
+    fcfg.nak = NakConfig {
+        delay_min_ns: 100_000,
+        delay_max_ns: 500_000,
+        backoff_ns: 1_000_000,
+    };
+    let mut follower = FollowerReceiver::new(follower_buf, follower_sock, fcfg, term, unrouted());
     follower.set_snapshot_intake(follower_snap_dir.clone(), declared, None);
 
     Harness {
@@ -184,7 +198,11 @@ impl Harness {
     /// Inject the deep NAK that triggers the session.
     fn trigger(&self) {
         self.ctrl_tx
-            .send(CtrlMsg::Nak { from: self.follower_addr, position: 0, length: 96 })
+            .send(CtrlMsg::Nak {
+                from: self.follower_addr,
+                position: 0,
+                length: 96,
+            })
             .unwrap();
     }
 
@@ -204,7 +222,9 @@ impl Harness {
     }
 
     fn final_path(&self, id: u8) -> PathBuf {
-        self.follower_snap_dir.join(id.to_string()).join(format!("snap-{}.ultsnap", snap_pos(id)))
+        self.follower_snap_dir
+            .join(id.to_string())
+            .join(format!("snap-{}.ultsnap", snap_pos(id)))
     }
 
     /// Send a hand-built SNAP_BEGIN straight at the follower — the only way to
@@ -279,7 +299,11 @@ fn below_floor_nak_upgrades_to_snapshot_session_and_file_transfers_exactly() {
     h.pump_until("file transferred", |h| h.final_path(0).exists());
 
     let got = std::fs::read(h.final_path(0)).unwrap();
-    assert_eq!(got, snapshot_bytes(0), "received file is byte-identical to the source");
+    assert_eq!(
+        got,
+        snapshot_bytes(0),
+        "received file is byte-identical to the source"
+    );
     assert_eq!(
         h.leader_send.stats().snap_sessions.load(Ordering::Relaxed),
         1,
@@ -296,15 +320,27 @@ fn below_floor_nak_upgrades_to_snapshot_session_and_file_transfers_exactly() {
 fn snapshot_session_survives_chunk_loss_via_snap_nak() {
     // Drop 20% of datagrams in BOTH directions: chunks are lost → the follower
     // NAKs the gaps → repair chunks fill them. Completion is still reached.
-    let faults = FaultConfig { drop_per_million: 200_000, seed: 42, ..FaultConfig::default() };
+    let faults = FaultConfig {
+        drop_per_million: 200_000,
+        seed: 42,
+        ..FaultConfig::default()
+    };
     let mut h = build(faults, &[0]);
     h.trigger();
     h.pump_until("file transferred under loss", |h| h.final_path(0).exists());
 
     let got = std::fs::read(h.final_path(0)).unwrap();
-    assert_eq!(got, snapshot_bytes(0), "file is byte-identical despite chunk loss");
+    assert_eq!(
+        got,
+        snapshot_bytes(0),
+        "file is byte-identical despite chunk loss"
+    );
     assert!(
-        h.leader_send.stats().snap_chunk_naks.load(Ordering::Relaxed) > 0,
+        h.leader_send
+            .stats()
+            .snap_chunk_naks
+            .load(Ordering::Relaxed)
+            > 0,
         "the SNAP_NAK repair path must have run under 20% loss"
     );
 }
@@ -314,15 +350,27 @@ fn a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss() {
     // Drop 20% of datagrams in BOTH directions: chunks from BOTH artifacts are
     // lost → the follower NAKs the stream-global gaps → repair chunks fill
     // them, wherever in the stream they fall. Both files complete.
-    let faults = FaultConfig { drop_per_million: 200_000, seed: 42, ..FaultConfig::default() };
+    let faults = FaultConfig {
+        drop_per_million: 200_000,
+        seed: 42,
+        ..FaultConfig::default()
+    };
     let mut h = build(faults, &[0, 2]);
     h.trigger();
     h.pump_until("both artifacts transferred under loss", |h| {
         h.final_path(0).exists() && h.final_path(2).exists()
     });
 
-    assert_eq!(std::fs::read(h.final_path(0)).unwrap(), snapshot_bytes(0), "FSM 0's artifact");
-    assert_eq!(std::fs::read(h.final_path(2)).unwrap(), snapshot_bytes(2), "FSM 2's artifact");
+    assert_eq!(
+        std::fs::read(h.final_path(0)).unwrap(),
+        snapshot_bytes(0),
+        "FSM 0's artifact"
+    );
+    assert_eq!(
+        std::fs::read(h.final_path(2)).unwrap(),
+        snapshot_bytes(2),
+        "FSM 2's artifact"
+    );
     assert!(
         !h.follower_snap_dir.join("1").exists(),
         "an undeclared id gets no directory"
@@ -333,7 +381,11 @@ fn a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss() {
         "ONE session carries the whole set"
     );
     assert!(
-        h.leader_send.stats().snap_chunk_naks.load(Ordering::Relaxed) > 0,
+        h.leader_send
+            .stats()
+            .snap_chunk_naks
+            .load(Ordering::Relaxed)
+            > 0,
         "the SNAP_NAK repair path must have run under 20% loss"
     );
     // No `.part` survives a completed session.
@@ -371,7 +423,10 @@ fn a_failed_publish_is_counted_and_retried_not_stranded() {
     });
     assert!(h.final_path(0).is_dir(), "the obstacle is still in place");
     assert!(
-        h.follower_snap_dir.join("0").join(format!("incoming-{}.part", snap_pos(0))).exists(),
+        h.follower_snap_dir
+            .join("0")
+            .join(format!("incoming-{}.part", snap_pos(0)))
+            .exists(),
         "the completed .part is still on disk, waiting to be published"
     );
 
@@ -395,8 +450,15 @@ fn a_layout_zero_begin_is_refused_as_a_wire_050_peer() {
     h.pump_until("the legacy-layout refusal is counted", |_| {
         st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
     });
-    assert_eq!(st.snap_refused_declared_mismatch.load(Ordering::Relaxed), 0, "not the other refusal");
-    assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
+    assert_eq!(
+        st.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+        0,
+        "not the other refusal"
+    );
+    assert!(
+        !h.follower_snap_dir.join("0").exists(),
+        "no intake, no directory, no .part"
+    );
 }
 
 #[test]
@@ -407,8 +469,15 @@ fn a_mismatched_declared_set_refuses_the_session() {
     h.pump_until("the declared-set refusal is counted", |_| {
         st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
     });
-    assert_eq!(st.snap_refused_legacy_peer.load(Ordering::Relaxed), 0, "not the other refusal");
-    assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
+    assert_eq!(
+        st.snap_refused_legacy_peer.load(Ordering::Relaxed),
+        0,
+        "not the other refusal"
+    );
+    assert!(
+        !h.follower_snap_dir.join("0").exists(),
+        "no intake, no directory, no .part"
+    );
 }
 
 #[test]
@@ -422,8 +491,15 @@ fn a_too_short_0_5_0_begin_body_is_refused_as_a_legacy_peer() {
     h.pump_until("the too-short legacy body is counted as a refusal", |_| {
         st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
     });
-    assert_eq!(st.snap_refused_declared_mismatch.load(Ordering::Relaxed), 0, "not the other refusal");
-    assert!(!h.follower_snap_dir.join("0").exists(), "no intake, no directory, no .part");
+    assert_eq!(
+        st.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+        0,
+        "not the other refusal"
+    );
+    assert!(
+        !h.follower_snap_dir.join("0").exists(),
+        "no intake, no directory, no .part"
+    );
 }
 
 #[test]

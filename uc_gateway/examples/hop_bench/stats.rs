@@ -34,7 +34,10 @@ impl SendClock {
     pub fn new(t0: Instant) -> Self {
         SendClock {
             t0,
-            send_ns: (0..SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice(),
+            send_ns: (0..SLOTS)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
     #[inline]
@@ -98,7 +101,11 @@ impl StreamStats {
     }
     pub fn responses_per_sec(&self) -> f64 {
         let s = self.elapsed().as_secs_f64();
-        if s > 0.0 { self.responses as f64 / s } else { 0.0 }
+        if s > 0.0 {
+            self.responses as f64 / s
+        } else {
+            0.0
+        }
     }
     pub fn ms(&self, q: f64) -> f64 {
         self.hist.value_at_quantile(q) as f64 / 1e6

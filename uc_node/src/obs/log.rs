@@ -68,7 +68,9 @@ impl FromStr for LogLevel {
             "error" => Ok(LogLevel::Error),
             "warn" => Ok(LogLevel::Warn),
             "info" => Ok(LogLevel::Info),
-            _ => Err(format!("log.level must be one of error|warn|info, got \"{s}\"")),
+            _ => Err(format!(
+                "log.level must be one of error|warn|info, got \"{s}\""
+            )),
         }
     }
 }
@@ -273,13 +275,26 @@ mod tests {
     fn a_record_is_one_valid_json_line_with_fields_in_order() {
         let _g = TEST_LOCK.lock().unwrap();
         let buf = capture_for_tests();
-        emit(LogLevel::Info, "became_leader", &[
-            Field { key: "node", value: FieldValue::U64(0) },
-            Field { key: "term", value: FieldValue::U64(3) },
-        ]);
+        emit(
+            LogLevel::Info,
+            "became_leader",
+            &[
+                Field {
+                    key: "node",
+                    value: FieldValue::U64(0),
+                },
+                Field {
+                    key: "term",
+                    value: FieldValue::U64(3),
+                },
+            ],
+        );
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.ends_with('\n'));
-        assert!(s.contains(r#""level":"info","event":"became_leader","node":0,"term":3}"#), "{s}");
+        assert!(
+            s.contains(r#""level":"info","event":"became_leader","node":0,"term":3}"#),
+            "{s}"
+        );
         assert!(s.starts_with(r#"{"ts_ns":"#));
         stderr_for_tests();
     }
@@ -312,7 +327,14 @@ mod tests {
     fn string_values_are_escaped() {
         let _g = TEST_LOCK.lock().unwrap();
         let buf = capture_for_tests();
-        emit(LogLevel::Warn, "e", &[Field { key: "msg", value: FieldValue::Str("a\"b\\c\nd") }]);
+        emit(
+            LogLevel::Warn,
+            "e",
+            &[Field {
+                key: "msg",
+                value: FieldValue::Str("a\"b\\c\nd"),
+            }],
+        );
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(s.contains("\"msg\":\"a\\\"b\\\\c\\u000ad\""), "{s}");
         stderr_for_tests();
@@ -322,9 +344,18 @@ mod tests {
     fn the_macro_expands_to_emit() {
         let _g = TEST_LOCK.lock().unwrap();
         let buf = capture_for_tests();
-        crate::obs_event!(Info, "config_adopted", node = 1u64, version = 7u64, pending = false);
+        crate::obs_event!(
+            Info,
+            "config_adopted",
+            node = 1u64,
+            version = 7u64,
+            pending = false
+        );
         let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(s.contains(r#""event":"config_adopted","node":1,"version":7,"pending":false"#), "{s}");
+        assert!(
+            s.contains(r#""event":"config_adopted","node":1,"version":7,"pending":false"#),
+            "{s}"
+        );
         stderr_for_tests();
     }
 }

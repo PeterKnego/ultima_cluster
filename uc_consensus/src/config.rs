@@ -74,7 +74,12 @@ fn op_id(op: &ConfigOp) -> NodeId {
 
 impl ClusterConfig {
     pub fn genesis(voters: Vec<(NodeId, Addr)>, learners: Vec<(NodeId, Addr)>) -> Self {
-        Self { version: 0, voters, learners, tombstones: Vec::new() }
+        Self {
+            version: 0,
+            voters,
+            learners,
+            tombstones: Vec::new(),
+        }
     }
 
     /// PURE single-server transition — every proposal path shares it.
@@ -95,40 +100,48 @@ impl ClusterConfig {
                 }
                 next.learners.push((id, addr));
             }
-            ConfigOp::PromoteLearner { id } => match next.learners.iter().position(|(lid, _)| *lid == id) {
-                Some(pos) => {
-                    let (_, addr) = next.learners.remove(pos);
-                    next.voters.push((id, addr));
+            ConfigOp::PromoteLearner { id } => {
+                match next.learners.iter().position(|(lid, _)| *lid == id) {
+                    Some(pos) => {
+                        let (_, addr) = next.learners.remove(pos);
+                        next.voters.push((id, addr));
+                    }
+                    None if next.is_voter(id) => return Err(ProposeError::WrongRole),
+                    None => return Err(ProposeError::NotFound),
                 }
-                None if next.is_voter(id) => return Err(ProposeError::WrongRole),
-                None => return Err(ProposeError::NotFound),
-            },
-            ConfigOp::DemoteVoter { id } => match next.voters.iter().position(|(vid, _)| *vid == id) {
-                Some(_) if next.voters.len() <= 1 => return Err(ProposeError::ZeroVoters),
-                Some(pos) => {
-                    let (_, addr) = next.voters.remove(pos);
-                    next.learners.push((id, addr));
+            }
+            ConfigOp::DemoteVoter { id } => {
+                match next.voters.iter().position(|(vid, _)| *vid == id) {
+                    Some(_) if next.voters.len() <= 1 => return Err(ProposeError::ZeroVoters),
+                    Some(pos) => {
+                        let (_, addr) = next.voters.remove(pos);
+                        next.learners.push((id, addr));
+                    }
+                    None if next.is_learner(id) => return Err(ProposeError::WrongRole),
+                    None => return Err(ProposeError::NotFound),
                 }
-                None if next.is_learner(id) => return Err(ProposeError::WrongRole),
-                None => return Err(ProposeError::NotFound),
-            },
-            ConfigOp::RemoveLearner { id } => match next.learners.iter().position(|(lid, _)| *lid == id) {
-                Some(pos) => {
-                    next.learners.remove(pos);
-                    next.tombstones.push(id);
+            }
+            ConfigOp::RemoveLearner { id } => {
+                match next.learners.iter().position(|(lid, _)| *lid == id) {
+                    Some(pos) => {
+                        next.learners.remove(pos);
+                        next.tombstones.push(id);
+                    }
+                    None if next.is_voter(id) => return Err(ProposeError::WrongRole),
+                    None => return Err(ProposeError::NotFound),
                 }
-                None if next.is_voter(id) => return Err(ProposeError::WrongRole),
-                None => return Err(ProposeError::NotFound),
-            },
-            ConfigOp::RemoveVoter { id } => match next.voters.iter().position(|(vid, _)| *vid == id) {
-                Some(_) if next.voters.len() <= 1 => return Err(ProposeError::ZeroVoters),
-                Some(pos) => {
-                    next.voters.remove(pos);
-                    next.tombstones.push(id);
+            }
+            ConfigOp::RemoveVoter { id } => {
+                match next.voters.iter().position(|(vid, _)| *vid == id) {
+                    Some(_) if next.voters.len() <= 1 => return Err(ProposeError::ZeroVoters),
+                    Some(pos) => {
+                        next.voters.remove(pos);
+                        next.tombstones.push(id);
+                    }
+                    None if next.is_learner(id) => return Err(ProposeError::WrongRole),
+                    None => return Err(ProposeError::NotFound),
                 }
-                None if next.is_learner(id) => return Err(ProposeError::WrongRole),
-                None => return Err(ProposeError::NotFound),
-            },
+            }
         }
         next.version += 1;
         Ok(next)
@@ -188,7 +201,12 @@ mod tests {
     fn apply_enforces_every_precondition() {
         let g = ClusterConfig::genesis(vec![(1, (1, 1)), (2, (2, 2)), (3, (3, 3))], vec![]);
         // add + promote + demote + remove round trip
-        let c1 = g.apply(ConfigOp::AddLearner { id: 5, addr: (5, 5) }).unwrap();
+        let c1 = g
+            .apply(ConfigOp::AddLearner {
+                id: 5,
+                addr: (5, 5),
+            })
+            .unwrap();
         assert_eq!(c1.version, 1);
         assert!(c1.is_learner(5));
         let c2 = c1.apply(ConfigOp::PromoteLearner { id: 5 }).unwrap();
@@ -200,36 +218,74 @@ mod tests {
         assert!(c4.tombstones.contains(&5));
         // tombstone permanence
         assert_eq!(
-            c4.apply(ConfigOp::AddLearner { id: 5, addr: (5, 5) }),
+            c4.apply(ConfigOp::AddLearner {
+                id: 5,
+                addr: (5, 5)
+            }),
             Err(ProposeError::Tombstoned)
         );
         // structural refusals
         assert_eq!(
-            g.apply(ConfigOp::AddLearner { id: 1, addr: (9, 9) }),
+            g.apply(ConfigOp::AddLearner {
+                id: 1,
+                addr: (9, 9)
+            }),
             Err(ProposeError::AlreadyPresent)
         );
-        assert_eq!(g.apply(ConfigOp::PromoteLearner { id: 1 }), Err(ProposeError::WrongRole));
-        assert_eq!(g.apply(ConfigOp::RemoveVoter { id: 9 }), Err(ProposeError::NotFound));
+        assert_eq!(
+            g.apply(ConfigOp::PromoteLearner { id: 1 }),
+            Err(ProposeError::WrongRole)
+        );
+        assert_eq!(
+            g.apply(ConfigOp::RemoveVoter { id: 9 }),
+            Err(ProposeError::NotFound)
+        );
         let solo = ClusterConfig::genesis(vec![(1, (1, 1))], vec![]);
-        assert_eq!(solo.apply(ConfigOp::RemoveVoter { id: 1 }), Err(ProposeError::ZeroVoters));
-        assert_eq!(solo.apply(ConfigOp::DemoteVoter { id: 1 }), Err(ProposeError::ZeroVoters));
+        assert_eq!(
+            solo.apply(ConfigOp::RemoveVoter { id: 1 }),
+            Err(ProposeError::ZeroVoters)
+        );
+        assert_eq!(
+            solo.apply(ConfigOp::DemoteVoter { id: 1 }),
+            Err(ProposeError::ZeroVoters)
+        );
         // 8-cap
         let mut big = g.clone();
         for i in 10..15u32 {
-            big = big.apply(ConfigOp::AddLearner { id: i, addr: (i, 1) }).unwrap();
+            big = big
+                .apply(ConfigOp::AddLearner {
+                    id: i,
+                    addr: (i, 1),
+                })
+                .unwrap();
         }
         assert_eq!(
-            big.apply(ConfigOp::AddLearner { id: 20, addr: (20, 1) }),
+            big.apply(ConfigOp::AddLearner {
+                id: 20,
+                addr: (20, 1)
+            }),
             Err(ProposeError::TooManyMembers)
         );
     }
 
     #[test]
     fn op_code_and_reason_code_match_the_wire_table() {
-        assert_eq!(ClusterConfig::op_code(&ConfigOp::AddLearner { id: 1, addr: (1, 1) }), 1);
-        assert_eq!(ClusterConfig::op_code(&ConfigOp::PromoteLearner { id: 1 }), 2);
+        assert_eq!(
+            ClusterConfig::op_code(&ConfigOp::AddLearner {
+                id: 1,
+                addr: (1, 1)
+            }),
+            1
+        );
+        assert_eq!(
+            ClusterConfig::op_code(&ConfigOp::PromoteLearner { id: 1 }),
+            2
+        );
         assert_eq!(ClusterConfig::op_code(&ConfigOp::DemoteVoter { id: 1 }), 3);
-        assert_eq!(ClusterConfig::op_code(&ConfigOp::RemoveLearner { id: 1 }), 4);
+        assert_eq!(
+            ClusterConfig::op_code(&ConfigOp::RemoveLearner { id: 1 }),
+            4
+        );
         assert_eq!(ClusterConfig::op_code(&ConfigOp::RemoveVoter { id: 1 }), 5);
 
         assert_eq!(ClusterConfig::reason_code(&ProposeError::NotLeader), 1);
@@ -241,7 +297,10 @@ mod tests {
         assert_eq!(ClusterConfig::reason_code(&ProposeError::WrongRole), 7);
         assert_eq!(ClusterConfig::reason_code(&ProposeError::ZeroVoters), 8);
         assert_eq!(ClusterConfig::reason_code(&ProposeError::TooManyMembers), 9);
-        assert_eq!(ClusterConfig::reason_code(&ProposeError::NotCaughtUp { gap: 1 }), 10);
+        assert_eq!(
+            ClusterConfig::reason_code(&ProposeError::NotCaughtUp { gap: 1 }),
+            10
+        );
         assert_eq!(ClusterConfig::reason_code(&ProposeError::SelfDemote), 12);
     }
 }

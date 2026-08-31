@@ -18,14 +18,14 @@
 
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use uc_remote::conn::FramedConn;
 use uc_remote::frame::{
-    encode_frame, FrameType, Hello, HelloOk, HelloRefused, Header, ResponseMeta, FLAG_IS_QUERY,
-    HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, PROTOCOL_VERSION,
+    FLAG_IS_QUERY, FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, Header, Hello, HelloOk,
+    HelloRefused, PROTOCOL_VERSION, ResponseMeta, encode_frame,
 };
 
 /// Budget for the client's HELLO, matching the real edge's handshake timeout.
@@ -84,38 +84,44 @@ pub fn run(a: Args) -> anyhow::Result<()> {
 
     {
         let shared = Arc::clone(&shared);
-        std::thread::Builder::new().name("hb-edge-stats".into()).spawn(move || {
-            let mut last = 0u64;
-            let mut next = Instant::now() + Duration::from_secs(1);
-            loop {
-                let now = Instant::now();
-                if now < next {
-                    std::thread::sleep(next - now);
+        std::thread::Builder::new()
+            .name("hb-edge-stats".into())
+            .spawn(move || {
+                let mut last = 0u64;
+                let mut next = Instant::now() + Duration::from_secs(1);
+                loop {
+                    let now = Instant::now();
+                    if now < next {
+                        std::thread::sleep(next - now);
+                    }
+                    next += Duration::from_secs(1);
+                    let total = shared.responses.load(Ordering::Relaxed);
+                    let live = shared.conns.load(Ordering::Relaxed);
+                    println!("dummy-edge: conns={live} resp/s={}", total - last);
+                    let _ = std::io::stdout().flush();
+                    last = total;
                 }
-                next += Duration::from_secs(1);
-                let total = shared.responses.load(Ordering::Relaxed);
-                let live = shared.conns.load(Ordering::Relaxed);
-                println!("dummy-edge: conns={live} resp/s={}", total - last);
-                let _ = std::io::stdout().flush();
-                last = total;
-            }
-        })?;
+            })?;
     }
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let shared = Arc::clone(&shared);
-        std::thread::Builder::new().name("hb-edge-conn".into()).spawn(move || {
-            shared.conns.fetch_add(1, Ordering::Relaxed);
-            serve(&shared, stream);
-            shared.conns.fetch_sub(1, Ordering::Relaxed);
-        })?;
+        std::thread::Builder::new()
+            .name("hb-edge-conn".into())
+            .spawn(move || {
+                shared.conns.fetch_add(1, Ordering::Relaxed);
+                serve(&shared, stream);
+                shared.conns.fetch_sub(1, Ordering::Relaxed);
+            })?;
     }
     Ok(())
 }
 
 fn serve(shared: &Shared, stream: std::net::TcpStream) {
-    let Ok(mut fc) = FramedConn::new(stream) else { return };
+    let Ok(mut fc) = FramedConn::new(stream) else {
+        return;
+    };
     if fc.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
         return;
     }
@@ -173,7 +179,11 @@ fn handshake(shared: &Shared, fc: &mut FramedConn) -> bool {
         return false;
     }
     if h.version != PROTOCOL_VERSION {
-        refuse(fc, HELLO_REFUSED_VERSION, &format!("dummy edge speaks v{PROTOCOL_VERSION}"));
+        refuse(
+            fc,
+            HELLO_REFUSED_VERSION,
+            &format!("dummy edge speaks v{PROTOCOL_VERSION}"),
+        );
         return false;
     }
     let Ok(hello) = Hello::decode(&payload) else {
@@ -226,10 +236,18 @@ fn handle(shared: &Shared, out: &mut Vec<u8>, acked_seq: &mut u64, answered: &mu
         FrameType::Submit | FrameType::Query => {
             *acked_seq = (*acked_seq).max(h.seq);
             let mut payload = Vec::with_capacity(ResponseMeta::LEN + shared.body.len());
-            ResponseMeta { credits: shared.credits, acked_seq: *acked_seq, position: h.seq }
-                .encode(&mut payload);
+            ResponseMeta {
+                credits: shared.credits,
+                acked_seq: *acked_seq,
+                position: h.seq,
+            }
+            .encode(&mut payload);
             payload.extend_from_slice(&shared.body);
-            let flags = if h.ty == FrameType::Query { FLAG_IS_QUERY } else { 0 };
+            let flags = if h.ty == FrameType::Query {
+                FLAG_IS_QUERY
+            } else {
+                0
+            };
             encode_frame(
                 out,
                 Header {

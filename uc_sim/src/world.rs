@@ -154,7 +154,10 @@ pub enum DataPlane {
     /// handle-term stream, then accepts a cross-stream old-term byte its map never
     /// attributed and reports it — the acked-write-loss phantom the oracle catches
     /// (§5.4.2 / #6b family).
-    Mechanism { reopen_guard: bool, handle_keyed: bool },
+    Mechanism {
+        reopen_guard: bool,
+        handle_keyed: bool,
+    },
 }
 
 /// Deterministic xorshift64 — the crate-local RNG (matches the SM's / fault
@@ -163,7 +166,11 @@ struct XorShift64(u64);
 
 impl XorShift64 {
     fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -217,7 +224,10 @@ fn crypto_scratch_dir() -> std::path::PathBuf {
         .join("uc2-sim-crypto")
         .join(format!("call-{n}-{:?}", std::thread::current().id()));
     std::fs::create_dir_all(&d).expect("create sim crypto scratch dir");
-    assert!(!d.starts_with("/tmp"), "sim crypto scratch must not live on tmpfs: {d:?}");
+    assert!(
+        !d.starts_with("/tmp"),
+        "sim crypto scratch must not live on tmpfs: {d:?}"
+    );
     d
 }
 
@@ -371,12 +381,12 @@ impl Default for SimConfig {
             drop_per_million: 0,
             dup_per_million: 0,
             crash_per_million: 0,
-            tick_interval_ns: 10_000_000,  // 10ms
-            archive_step_ns: 5_000_000,    // 5ms
-            consensus_step_ns: 1_000_000,  // 1ms
+            tick_interval_ns: 10_000_000, // 10ms
+            archive_step_ns: 5_000_000,   // 5ms
+            consensus_step_ns: 1_000_000, // 1ms
             vote_refresh_durable: true,
-            latency_min_ns: 1_000_000,     // 1ms
-            latency_max_ns: 5_000_000,     // 5ms
+            latency_min_ns: 1_000_000, // 1ms
+            latency_max_ns: 5_000_000, // 5ms
             archive_bytes_max: 4 * FRAME,
             election_timeout_min_ns: 150_000_000, // 150ms — the SM's own default
             election_timeout_max_ns: 300_000_000, // 300ms
@@ -429,15 +439,31 @@ pub enum Msg {
     /// currently *sealing* under (`GroupPlane::sealing_epoch`). A receiver
     /// that has not installed `e` cannot open it in the real system; see the
     /// crypto gate at the top of `deliver`'s `Msg::Data` arm.
-    Data { term: u32, seg_term: u32, from_pos: u64, to_pos: u64, prev_term: u32, epoch: Option<u16> },
+    Data {
+        term: u32,
+        seg_term: u32,
+        from_pos: u64,
+        to_pos: u64,
+        prev_term: u32,
+        epoch: Option<u16>,
+    },
     /// Follower -> leader replication ack: drives the per-follower send cursor.
-    Ack { from: NodeId, term: u32, append: u64 },
+    Ack {
+        from: NodeId,
+        term: u32,
+        append: u64,
+    },
     /// Follower -> leader durable report: drives quorum commit ranking.
     /// A durable report. `durable_term` is the sender's content attestation
     /// (protocol 0.5.0): the term IT attributes to the byte below `durable`.
     /// The leader declines a report whose attestation disagrees with its own
     /// map — that is what makes its ranking a content quorum.
-    Report { from: NodeId, term: u32, durable: u64, durable_term: u32 },
+    Report {
+        from: NodeId,
+        term: u32,
+        durable: u64,
+        durable_term: u32,
+    },
     /// Leader -> follower commit gossip. `epoch` (T13, model-fidelity fix):
     /// production classifies `DGRAM_KIND_COMMIT_POSITION` as
     /// `Scope::Group` (`uc_crypto::transport::scope_of`), sealed and
@@ -448,9 +474,22 @@ pub enum Msg {
     /// crypto-gated" as part of why a follower can still learn about a new
     /// leader through an ungated path, which was false relative to
     /// production. Gated the same way `Data` is, below.
-    CommitGossip { term: u32, commit: u64, epoch: Option<u16> },
-    RequestVote { from: NodeId, new_term: u32, last_term: u32, last_durable: u64 },
-    Vote { from: NodeId, term: u32, granted: bool },
+    CommitGossip {
+        term: u32,
+        commit: u64,
+        epoch: Option<u16>,
+    },
+    RequestVote {
+        from: NodeId,
+        new_term: u32,
+        last_term: u32,
+        last_durable: u64,
+    },
+    Vote {
+        from: NodeId,
+        term: u32,
+        granted: bool,
+    },
     /// Leader -> follower term-map ship (drives reconciliation).
     TermMap { term: u32, entries: Vec<(u32, u64)> },
     /// T13: follower -> leader gap-repair request, addressed at whichever
@@ -474,9 +513,17 @@ pub enum Msg {
 /// A scheduled simulation event.
 #[derive(Clone, Debug)]
 enum SimEvent {
-    Deliver { to: usize, from: usize, msg: Msg },
-    Tick { node: usize },
-    ArchiveStep { node: usize },
+    Deliver {
+        to: usize,
+        from: usize,
+        msg: Msg,
+    },
+    Tick {
+        node: usize,
+    },
+    ArchiveStep {
+        node: usize,
+    },
     /// Issue #7: the consensus agent's duty cycle, scheduled INDEPENDENTLY of
     /// `ArchiveStep`. It is the only thing that absorbs the durable counter into
     /// `ElectionSm` (`Event::DurableAdvanced`), mirroring `Consensus::do_work`
@@ -488,12 +535,20 @@ enum SimEvent {
     /// another" was unreachable in this world, no matter how the scheduler
     /// interleaved. `inv4`/`inv5` were adequate all along; they simply had no
     /// trace to convict.
-    ConsensusStep { node: usize },
-    Restart { node: usize },
+    ConsensusStep {
+        node: usize,
+    },
+    Restart {
+        node: usize,
+    },
     /// Agent feedback for a completed truncation (`Event::Truncated`), scheduled
     /// as the next event to model the latch window. Carries the SM-allocated
     /// `epoch` so the feedback matches the in-flight truncation (M5).
-    TruncatedFeedback { node: usize, epoch: u64, to: u64 },
+    TruncatedFeedback {
+        node: usize,
+        epoch: u64,
+        to: u64,
+    },
 }
 
 /// Heap entry ordered strictly by `(time, seq)` — `seq` is globally unique so
@@ -763,7 +818,9 @@ impl World {
         assert!(cfg.election_timeout_min_ns <= cfg.election_timeout_max_ns);
         assert!(cfg.latency_min_ns <= cfg.latency_max_ns);
         assert!(
-            cfg.genesis_absent.iter().all(|id| !cfg.initial_learners.contains(id)),
+            cfg.genesis_absent
+                .iter()
+                .all(|id| !cfg.initial_learners.contains(id)),
             "genesis_absent and initial_learners must be disjoint"
         );
         let n = cfg.n_nodes;
@@ -806,8 +863,9 @@ impl World {
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
-        let admitted_ever: HashSet<usize> =
-            (0..n).filter(|id| !cfg.genesis_absent.contains(id)).collect();
+        let admitted_ever: HashSet<usize> = (0..n)
+            .filter(|id| !cfg.genesis_absent.contains(id))
+            .collect();
         let mut w = World {
             rng: XorShift64::new(cfg.seed ^ 0xD1B5_4A32_D192_ED03),
             queue: BinaryHeap::new(),
@@ -839,8 +897,14 @@ impl World {
         // still broken by `seq` deterministically.
         for id in 0..w.cfg.n_nodes {
             w.push(SimEvent::Tick { node: id }, id as u64);
-            w.push(SimEvent::ArchiveStep { node: id }, w.cfg.archive_step_ns + id as u64);
-            w.push(SimEvent::ConsensusStep { node: id }, w.cfg.consensus_step_ns + id as u64);
+            w.push(
+                SimEvent::ArchiveStep { node: id },
+                w.cfg.archive_step_ns + id as u64,
+            );
+            w.push(
+                SimEvent::ConsensusStep { node: id },
+                w.cfg.consensus_step_ns + id as u64,
+            );
         }
         w
     }
@@ -893,7 +957,9 @@ impl World {
     /// pipeline neither knows nor cares") is never a member of it and is
     /// never indexed into `self.nodes`/`cursors`.
     fn config_peers(&self, node: usize) -> Vec<usize> {
-        (0..self.nodes.len()).filter(|&p| p != node && self.admitted_ever.contains(&p)).collect()
+        (0..self.nodes.len())
+            .filter(|&p| p != node && self.admitted_ever.contains(&p))
+            .collect()
     }
 
     /// Build a node's `ElectionConfig` around the given adopted config — the
@@ -1163,7 +1229,14 @@ impl World {
             && self.draw() % 1_000_000 < self.cfg.dup_per_million as u64;
         if will_dup {
             let lat2 = self.cfg.latency_min_ns + self.draw() % span;
-            self.push(SimEvent::Deliver { to, from, msg: msg.clone() }, now + lat);
+            self.push(
+                SimEvent::Deliver {
+                    to,
+                    from,
+                    msg: msg.clone(),
+                },
+                now + lat,
+            );
             self.push(SimEvent::Deliver { to, from, msg }, now + lat2);
         } else {
             self.push(SimEvent::Deliver { to, from, msg }, now + lat);
@@ -1176,14 +1249,7 @@ impl World {
     /// `epoch` (T13) is stamped straight onto the message — see
     /// `World::data_seal_gate`, the only caller that computes a non-`None`
     /// value.
-    fn make_data(
-        &self,
-        node: usize,
-        from: u64,
-        append: u64,
-        term: u32,
-        epoch: Option<u16>,
-    ) -> Msg {
+    fn make_data(&self, node: usize, from: u64, append: u64, term: u32, epoch: Option<u16>) -> Msg {
         let map = &self.nodes[node].term_map;
         let to = match next_boundary(map, from) {
             Some(b) if b < append => b,
@@ -1191,7 +1257,14 @@ impl World {
         };
         let seg_term = term_at(map, from);
         let prev_term = if from == 0 { 0 } else { term_at(map, from - 1) };
-        Msg::Data { term, seg_term, from_pos: from, to_pos: to, prev_term, epoch }
+        Msg::Data {
+            term,
+            seg_term,
+            from_pos: from,
+            to_pos: to,
+            prev_term,
+            epoch,
+        }
     }
 
     /// T13: what `node` may do with an outgoing `DATA` send right now (see
@@ -1215,8 +1288,7 @@ impl World {
     }
 
     fn vote_blocked(&self, msg: &Msg) -> bool {
-        self.now < self.vote_drop_until
-            && matches!(msg, Msg::RequestVote { .. } | Msg::Vote { .. })
+        self.now < self.vote_drop_until && matches!(msg, Msg::RequestVote { .. } | Msg::Vote { .. })
     }
 
     // ------------------------------------------------------------- dispatch
@@ -1395,7 +1467,10 @@ impl World {
             let durable = self.nodes[node].durable;
             self.send_report(node, leader, durable, now, step)?;
         }
-        self.push(SimEvent::ArchiveStep { node }, now + self.cfg.archive_step_ns);
+        self.push(
+            SimEvent::ArchiveStep { node },
+            now + self.cfg.archive_step_ns,
+        );
         Ok(())
     }
 
@@ -1406,18 +1481,31 @@ impl World {
     /// `start_election`'s advertised credential, `become_leader`'s base,
     /// `rank_leader`'s own-durable clamp) now rides a schedule independent of
     /// the archive's.
-    fn on_consensus_step(&mut self, node: usize, now: u64, step: u64) -> Result<(), InvariantViolation> {
+    fn on_consensus_step(
+        &mut self,
+        node: usize,
+        now: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
         if self.nodes[node].up {
             self.absorb_durable(node, now, step)?;
         }
-        self.push(SimEvent::ConsensusStep { node }, now + self.cfg.consensus_step_ns);
+        self.push(
+            SimEvent::ConsensusStep { node },
+            now + self.cfg.consensus_step_ns,
+        );
         Ok(())
     }
 
     /// Absorb the durable counter into the SM if it moved. Idempotent, and the
     /// single implementation behind both the duty-cycle poll and the pre-vote
     /// refresh — the same shape as `uc_node`'s `refresh_durable`.
-    fn absorb_durable(&mut self, node: usize, now: u64, step: u64) -> Result<(), InvariantViolation> {
+    fn absorb_durable(
+        &mut self,
+        node: usize,
+        now: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
         let d = self.nodes[node].durable;
         if d == self.nodes[node].durable_absorbed {
             return Ok(());
@@ -1458,7 +1546,10 @@ impl World {
         // Restore the record's PREV level (construction seeds prev == cur), so a
         // post-restart truncation below the config frame still reverts to the
         // genuine predecessor.
-        sm.restore_prev_config(self.nodes[node].cfg_prev.clone(), self.nodes[node].cfg_prev_pos);
+        sm.restore_prev_config(
+            self.nodes[node].cfg_prev.clone(),
+            self.nodes[node].cfg_prev_pos,
+        );
         if self.cfg.revert_on_truncate_disabled {
             sm.set_revert_on_truncate(false); // counterfactual persists across restarts
         }
@@ -1549,9 +1640,12 @@ impl World {
         // §5): the adopted config must re-equal the frontier-implied config.
         // This is the check the `revert_on_truncate_disabled` counterfactual
         // turns red.
-        let implied = self.implied_config_at(node, self.nodes[node].durable).clone();
+        let implied = self
+            .implied_config_at(node, self.nodes[node].durable)
+            .clone();
         let adopted = self.nodes[node].sm.config().clone();
-        self.checker.check_revert_correctness(node as NodeId, &adopted, &implied, step)?;
+        self.checker
+            .check_revert_correctness(node as NodeId, &adopted, &implied, step)?;
         Ok(())
     }
 
@@ -1584,7 +1678,15 @@ impl World {
             .collect();
         due.sort_by_key(|(end, _)| *end); // ascending: adopt in stream order
         for (end, config) in due {
-            self.feed(node, Event::ConfigObserved { position: end, config }, now, step)?;
+            self.feed(
+                node,
+                Event::ConfigObserved {
+                    position: end,
+                    config,
+                },
+                now,
+                step,
+            )?;
         }
         Ok(())
     }
@@ -1597,8 +1699,11 @@ impl World {
     /// genesis), the world genesis otherwise.
     fn implied_config_at(&self, node: usize, upto: u64) -> &ClusterConfig {
         let nd = &self.nodes[node];
-        let mut best: &ClusterConfig =
-            if nd.cfg_cur_pos == 0 { &nd.cfg_cur } else { &self.genesis_config };
+        let mut best: &ClusterConfig = if nd.cfg_cur_pos == 0 {
+            &nd.cfg_cur
+        } else {
+            &self.genesis_config
+        };
         for f in &self.config_frames {
             if f.end <= upto
                 && f.end > 0
@@ -1618,12 +1723,7 @@ impl World {
     /// C-1 flow the gate reopens with a truncation still in flight, so the RAW
     /// divergent durable — not yet truncated — escapes into the leader's commit
     /// ranking, and the genuine-quorum oracle (inv5) catches the phantom.
-    fn reopen_gate(
-        &mut self,
-        node: usize,
-        now: u64,
-        step: u64,
-    ) -> Result<(), InvariantViolation> {
+    fn reopen_gate(&mut self, node: usize, now: u64, step: u64) -> Result<(), InvariantViolation> {
         self.nodes[node].intake_gate = true;
         if let Some(leader) = self.nodes[node].leader_hint
             && leader != node
@@ -1648,10 +1748,21 @@ impl World {
     ) -> Result<(), InvariantViolation> {
         let ceiling = self.nodes[node].apply_ceiling;
         let durable = ceiling.map_or(unclamped, |c| unclamped.min(c));
-        self.checker.on_report(node, durable, unclamped, ceiling, step)?;
+        self.checker
+            .on_report(node, durable, unclamped, ceiling, step)?;
         let (id, term) = (self.nodes[node].id, self.nodes[node].sm.current_term());
         let durable_term = self.nodes[node].sm.term_at(durable);
-        self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
+        self.send(
+            node,
+            leader,
+            Msg::Report {
+                from: id,
+                term,
+                durable,
+                durable_term,
+            },
+            now,
+        );
         Ok(())
     }
 
@@ -1692,7 +1803,10 @@ impl World {
             if let HandshakeAction::Send { to, kind, body } = act {
                 let to_idx = to as usize;
                 if kind == DGRAM_KIND_HS_KEY
-                    && self.key_delivery_blocked_until.get(&to_idx).is_some_and(|&d| now < d)
+                    && self
+                        .key_delivery_blocked_until
+                        .get(&to_idx)
+                        .is_some_and(|&d| now < d)
                 {
                     continue; // dropped at the "socket" — inside the blocked window
                 }
@@ -1735,7 +1849,14 @@ impl World {
         step: u64,
     ) -> Result<(), InvariantViolation> {
         match msg {
-            Msg::Data { term, seg_term, from_pos, to_pos, prev_term, epoch } => {
+            Msg::Data {
+                term,
+                seg_term,
+                from_pos,
+                to_pos,
+                prev_term,
+                epoch,
+            } => {
                 // T13: crypto-plane gate — checked FIRST, before ANYTHING else
                 // touches state. `epoch` is only ever `Some` when the sending
                 // leader is crypto-enabled (see `data_seal_gate`); a receiver
@@ -1775,7 +1896,15 @@ impl World {
                         // `HS_KEY` lands, never a bespoke one.
                         self.nodes[to].nak_sent += 1;
                         let (id, want_from) = (self.nodes[to].id, self.nodes[to].append);
-                        self.send(to, from, Msg::Nak { from: id, want_from }, now);
+                        self.send(
+                            to,
+                            from,
+                            Msg::Nak {
+                                from: id,
+                                want_from,
+                            },
+                            now,
+                        );
                         return Ok(());
                     }
                 }
@@ -1821,7 +1950,10 @@ impl World {
                             // the boundary); the SM is idempotent below its last.
                             self.feed(
                                 to,
-                                Event::DataTermObserved { term: seg_term, base: from_pos },
+                                Event::DataTermObserved {
+                                    term: seg_term,
+                                    base: from_pos,
+                                },
                                 now,
                                 step,
                             )?;
@@ -1833,11 +1965,24 @@ impl World {
                     // Ack our real append so the leader's cursor tracks us
                     // (advancing on match, backing off on a divergent/gap drop).
                     let (id, ap) = (self.nodes[to].id, self.nodes[to].append);
-                    self.send(to, from, Msg::Ack { from: id, term: cur, append: ap }, now);
+                    self.send(
+                        to,
+                        from,
+                        Msg::Ack {
+                            from: id,
+                            term: cur,
+                            append: ap,
+                        },
+                        now,
+                    );
                 }
                 Ok(())
             }
-            Msg::Ack { from: acker, term, append } => {
+            Msg::Ack {
+                from: acker,
+                term,
+                append,
+            } => {
                 let nd = &mut self.nodes[to];
                 if matches!(nd.sm.role(), Role::Leader) && term == nd.sm.current_term() {
                     // Track the follower's authoritative frontier (allows backing
@@ -1846,7 +1991,12 @@ impl World {
                 }
                 Ok(())
             }
-            Msg::Report { from: rep, term, durable, durable_term } => {
+            Msg::Report {
+                from: rep,
+                term,
+                durable,
+                durable_term,
+            } => {
                 // Ablation: without attestation the report is position-only
                 // (pre-0.5.0), which we model by handing the leader exactly the
                 // term it expects — the check then always passes.
@@ -1855,9 +2005,23 @@ impl World {
                 } else {
                     self.nodes[to].sm.term_at(durable)
                 };
-                self.feed(to, Event::Report { from: rep, term, durable, durable_term }, now, step)
+                self.feed(
+                    to,
+                    Event::Report {
+                        from: rep,
+                        term,
+                        durable,
+                        durable_term,
+                    },
+                    now,
+                    step,
+                )
             }
-            Msg::CommitGossip { term, commit, epoch } => {
+            Msg::CommitGossip {
+                term,
+                commit,
+                epoch,
+            } => {
                 // T13: same crypto gate as Msg::Data, checked FIRST and with
                 // the same zero-side-effect shape (see the long comment on
                 // the Data arm above for why the ordering matters) — an
@@ -1879,7 +2043,12 @@ impl World {
                 self.nodes[to].leader_hint = Some(from);
                 self.feed(to, Event::CommitGossip { term, commit }, now, step)
             }
-            Msg::RequestVote { from: cand, new_term, last_term, last_durable } => {
+            Msg::RequestVote {
+                from: cand,
+                new_term,
+                last_term,
+                last_durable,
+            } => {
                 // Issue #7 / main 26d4827: re-absorb the counter IMMEDIATELY
                 // before the grant decision, as `feed_net` does. Raft's vote rule
                 // is sound only if a voter judges a candidate against everything
@@ -1903,14 +2072,30 @@ impl World {
                 }
                 self.feed(
                     to,
-                    Event::RequestVote { from: cand, new_term, last_term, last_durable },
+                    Event::RequestVote {
+                        from: cand,
+                        new_term,
+                        last_term,
+                        last_durable,
+                    },
                     now,
                     step,
                 )
             }
-            Msg::Vote { from: voter, term, granted } => {
-                self.feed(to, Event::Vote { from: voter, term, granted }, now, step)
-            }
+            Msg::Vote {
+                from: voter,
+                term,
+                granted,
+            } => self.feed(
+                to,
+                Event::Vote {
+                    from: voter,
+                    term,
+                    granted,
+                },
+                now,
+                step,
+            ),
             Msg::TermMap { term, entries } => {
                 self.nodes[to].leader_hint = Some(from);
                 // Capture the pre-reconcile context so a resulting Truncate can
@@ -1933,7 +2118,11 @@ impl World {
                 // unchanged), and the UNGUARDED heuristic would reopen the gate
                 // mid-truncation — letting the raw divergent durable escape into
                 // the leader's commit ranking (the M4 C-1 phantom-commit path).
-                if let DataPlane::Mechanism { reopen_guard, handle_keyed } = self.cfg.data_plane {
+                if let DataPlane::Mechanism {
+                    reopen_guard,
+                    handle_keyed,
+                } = self.cfg.data_plane
+                {
                     // CLEAN-RECONCILE reopen: a term map that was processed
                     // (`term >= ours`) and needed NO truncation completes
                     // reconciliation for the adopted term, so a CLOSED gate
@@ -1968,7 +2157,10 @@ impl World {
                 }
                 Ok(())
             }
-            Msg::Nak { from: acker, want_from } => {
+            Msg::Nak {
+                from: acker,
+                want_from,
+            } => {
                 // T13: gap-repair request — see the crypto gate in the
                 // `Msg::Data` arm above. `to` here is the leader the request
                 // is addressed to; a stale/former leader simply ignores it
@@ -2002,13 +2194,7 @@ impl World {
     /// Feed one event into node `i`'s SM and translate every resulting action
     /// (including SM-local follow-ups such as `NewTermAppended`) into world
     /// effects. Down nodes ignore feeds.
-    fn feed(
-        &mut self,
-        i: usize,
-        ev: Event,
-        now: u64,
-        step: u64,
-    ) -> Result<(), InvariantViolation> {
+    fn feed(&mut self, i: usize, ev: Event, now: u64, step: u64) -> Result<(), InvariantViolation> {
         if !self.nodes[i].up {
             return Ok(());
         }
@@ -2042,22 +2228,44 @@ impl World {
                     self.send(
                         node,
                         to as usize,
-                        Msg::Vote { from, term: vote.term, granted: true },
+                        Msg::Vote {
+                            from,
+                            term: vote.term,
+                            granted: true,
+                        },
                         now,
                     );
                 }
             }
             Action::SendVoteRejection { to, term } => {
                 let from = node as NodeId;
-                self.send(node, to as usize, Msg::Vote { from, term, granted: false }, now);
+                self.send(
+                    node,
+                    to as usize,
+                    Msg::Vote {
+                        from,
+                        term,
+                        granted: false,
+                    },
+                    now,
+                );
             }
-            Action::StartElection { new_term, last_term, last_durable } => {
+            Action::StartElection {
+                new_term,
+                last_term,
+                last_durable,
+            } => {
                 let from = node as NodeId;
                 for p in self.config_peers(node) {
                     self.send(
                         node,
                         p,
-                        Msg::RequestVote { from, new_term, last_term, last_durable },
+                        Msg::RequestVote {
+                            from,
+                            new_term,
+                            last_term,
+                            last_durable,
+                        },
                         now,
                     );
                 }
@@ -2126,7 +2334,7 @@ impl World {
                 // open, no reconcile pending (mirrors uc_node::exec BecomeLeader).
                 let nd = &mut self.nodes[node];
                 nd.adopted_term = term;
-                        nd.intake_gate = true;
+                nd.intake_gate = true;
                 nd.pending_trunc_to = None;
 
                 // T13/T17 parity: the real node layer mints a fresh group-key
@@ -2207,14 +2415,31 @@ impl World {
                     };
                     let term = self.nodes[node].sm.current_term();
                     for p in self.config_peers(node) {
-                        self.send(node, p, Msg::CommitGossip { term, commit, epoch }, now);
+                        self.send(
+                            node,
+                            p,
+                            Msg::CommitGossip {
+                                term,
+                                commit,
+                                epoch,
+                            },
+                            now,
+                        );
                     }
                 }
             }
             Action::ShipTermMap { entries } => {
                 let term = self.nodes[node].sm.current_term();
                 for p in self.config_peers(node) {
-                    self.send(node, p, Msg::TermMap { term, entries: entries.clone() }, now);
+                    self.send(
+                        node,
+                        p,
+                        Msg::TermMap {
+                            term,
+                            entries: entries.clone(),
+                        },
+                        now,
+                    );
                 }
             }
             Action::PersistTermMap { new_map } => {
@@ -2223,7 +2448,8 @@ impl World {
             Action::Truncate { epoch, to, new_map } => {
                 let own_before = self.nodes[node].map_before_reconcile.clone();
                 let leader = self.nodes[node].last_leader_map.clone();
-                self.checker.on_truncate(node as NodeId, to, &own_before, &leader, step)?;
+                self.checker
+                    .on_truncate(node as NodeId, to, &own_before, &leader, step)?;
                 // inv10: a truncation cuts `durable`/`append` back to `to` (or,
                 // under `Mechanism`, defers the cut to the ack) — the node's
                 // next report legitimately restarts from a lower position.
@@ -2307,10 +2533,16 @@ impl World {
                 // `Truncate { to: 0 }` follows in the same batch (handled above).
                 self.stat_wipes += 1;
             }
-            Action::ConfigAdopted { position, config, prev_position, prev } => {
+            Action::ConfigAdopted {
+                position,
+                config,
+                prev_position,
+                prev,
+            } => {
                 // inv9 — tombstone permanence, judged on EVERY adoption
                 // (forward, revert, wipe-fiat).
-                self.checker.on_config_adopted(node as NodeId, &config, &prev, step)?;
+                self.checker
+                    .on_config_adopted(node as NodeId, &config, &prev, step)?;
                 // The sim's durable ConfigRecord mirror (cur + prev): the
                 // node-obligation persist. Survives crash; recovered into the
                 // SM at restart.
@@ -2521,8 +2753,12 @@ impl World {
                 if p == i {
                     continue;
                 }
-                let actions =
-                    self.nodes[i].crypto.as_mut().unwrap().peers.initiate(p as u32, now);
+                let actions = self.nodes[i]
+                    .crypto
+                    .as_mut()
+                    .unwrap()
+                    .peers
+                    .initiate(p as u32, now);
                 self.dispatch_handshake_actions(i, actions, now);
             }
         }
@@ -2534,8 +2770,9 @@ impl World {
     /// would pass for the WireGuard-style `current`/`pending` split even
     /// when only one side has promoted).
     pub fn all_peer_sessions_established(&self) -> bool {
-        let ids: Vec<usize> =
-            (0..self.nodes.len()).filter(|&i| self.nodes[i].crypto.is_some()).collect();
+        let ids: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].crypto.is_some())
+            .collect();
         ids.iter().all(|&i| {
             ids.iter().all(|&j| {
                 i == j
@@ -2603,7 +2840,9 @@ impl World {
     /// The current leader's durable (fsync'd) position; `0` if there is no
     /// current leader.
     pub fn leader_durable(&self) -> u64 {
-        self.current_leader().map(|l| self.nodes[l].durable).unwrap_or(0)
+        self.current_leader()
+            .map(|l| self.nodes[l].durable)
+            .unwrap_or(0)
     }
 
     /// Directly advances the current leader's append (write) position by
@@ -2676,7 +2915,14 @@ impl World {
         // `epoch: None` — this bypasses the network model entirely (a
         // scripted craft), so it also bypasses the T13 crypto gate exactly
         // like the pre-M8 behavior; see `Msg::Data`'s doc.
-        let msg = Msg::Data { term, seg_term, from_pos, to_pos, prev_term, epoch: None };
+        let msg = Msg::Data {
+            term,
+            seg_term,
+            from_pos,
+            to_pos,
+            prev_term,
+            epoch: None,
+        };
         self.deliver(to, from, msg, now, step)?;
         // Mirror `step_once`'s post-event invariant 2 sweep.
         let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
@@ -2802,15 +3048,25 @@ impl World {
         let nd = &mut self.nodes[node];
         nd.append += FRAME;
         let end = nd.append;
-        self.config_frames.push(CfgFrame { term, end, config: new_cfg.clone() });
+        self.config_frames.push(CfgFrame {
+            term,
+            end,
+            config: new_cfg.clone(),
+        });
         // Leader adopt-at-append. The self-feed can raise a violation
         // (inv9 at adoption) that this signature cannot return — park it for
         // the next step.
         self.steps += 1;
         let (now, step) = (self.now, self.steps);
-        if let Err(v) =
-            self.feed(node, Event::ConfigObserved { position: end, config: new_cfg }, now, step)
-        {
+        if let Err(v) = self.feed(
+            node,
+            Event::ConfigObserved {
+                position: end,
+                config: new_cfg,
+            },
+            now,
+            step,
+        ) {
             self.pending_violation = Some(v);
         }
         Ok(version)
@@ -2923,7 +3179,11 @@ impl World {
 
     /// The greatest committed high-water among the given nodes.
     pub fn max_commit_from(&self, nodes: &[usize]) -> u64 {
-        nodes.iter().map(|&i| self.checker.committed_hw[i]).max().unwrap_or(0)
+        nodes
+            .iter()
+            .map(|&i| self.checker.committed_hw[i])
+            .max()
+            .unwrap_or(0)
     }
 
     /// Every node except `node` (for a 3-node cluster, the surviving majority).

@@ -14,12 +14,12 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
-use uc_service::{Service, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
-use uc_log::cnc::CncPage;
 use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
+use uc_service::{Service, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
 
 use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
 
@@ -73,7 +73,10 @@ impl uc_service::SnapshotStateMachine for CountSm {
     type SnapshotHandle = (u64, Option<u64>);
 
     fn freeze(&self) -> Result<((u64, Option<u64>), u64), uc_service::SnapshotError> {
-        Ok(((self.total, self.last_applied), self.last_applied.unwrap_or(0)))
+        Ok((
+            (self.total, self.last_applied),
+            self.last_applied.unwrap_or(0),
+        ))
     }
 
     fn stream_snapshot(
@@ -225,8 +228,11 @@ fn query_total(svc: &Service<CountSm>) -> u64 {
 /// (`cnc.service_slot(0).applied`) instead of page 1's `service().service_applied`.
 fn wait_service_caught_up(cnc: &CncPage) {
     wait_until(|| {
-        let target =
-            cnc.counters().commit.load_acquire().min(cnc.counters().durable.load_acquire());
+        let target = cnc
+            .counters()
+            .commit
+            .load_acquire()
+            .min(cnc.counters().durable.load_acquire());
         target > 0 && cnc.service_slot(0).applied.load_acquire() >= target
     });
 }
@@ -251,11 +257,16 @@ fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
 
     // FIRST service attaches only now: the ring long since scrolled → the fresh
     // SM at cursor 0 hits Overrun immediately → journal replay reconstruction.
-    let svc =
-        ServiceBuilder::new(cfg(dir.path(), "rec"), CountSm::default()).start().unwrap();
+    let svc = ServiceBuilder::new(cfg(dir.path(), "rec"), CountSm::default())
+        .start()
+        .unwrap();
     let cnc = open_cnc(dir.path(), "rec");
     wait_service_caught_up(&cnc);
-    assert_eq!(query_total(&svc), 2_000, "every committed Add applied exactly once");
+    assert_eq!(
+        query_total(&svc),
+        2_000,
+        "every committed Add applied exactly once"
+    );
 
     svc.stop();
     node.stop();
@@ -278,8 +289,9 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
     );
 
     // First incarnation: reconstructs from the journal, converges to 2000.
-    let svc1 =
-        ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default()).start().unwrap();
+    let svc1 = ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default())
+        .start()
+        .unwrap();
     let cnc = open_cnc(dir.path(), "rst");
     wait_service_caught_up(&cnc);
     assert_eq!(query_total(&svc1), 2_000);
@@ -289,14 +301,23 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
     // dir. The node (and its cnc page) stay up across the service restart.
     svc1.crash();
 
-    let svc2 =
-        ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default()).start().unwrap();
+    let svc2 = ServiceBuilder::new(cfg(dir.path(), "rst"), CountSm::default())
+        .start()
+        .unwrap();
     let new_epoch = svc2.epoch();
-    assert_eq!(new_epoch, old_epoch + 1, "each attach bumps service_epoch exactly once");
+    assert_eq!(
+        new_epoch,
+        old_epoch + 1,
+        "each attach bumps service_epoch exactly once"
+    );
 
     // The fresh in-memory SM rebuilds the SAME total purely from the journal.
     wait_until(|| query_total(&svc2) == 2_000);
-    assert_eq!(query_total(&svc2), 2_000, "in-memory state fully reconstructed from the journal");
+    assert_eq!(
+        query_total(&svc2),
+        2_000,
+        "in-memory state fully reconstructed from the journal"
+    );
 
     svc2.stop();
     node.stop();
@@ -341,8 +362,8 @@ fn start_purge_node(dir: &Path, app_id: &str) -> Node {
 /// Submit one `RegisterSm` `Write(val)` through the raw ingress ring (no service
 /// response awaited — works whether or not a service is attached).
 fn write_reg(prod: &MpscProducer, local_seq: u32, val: u64) {
-    let payload = bincode::serde::encode_to_vec(RegCmd::Write(val), bincode::config::standard())
-        .unwrap();
+    let payload =
+        bincode::serde::encode_to_vec(RegCmd::Write(val), bincode::config::standard()).unwrap();
     let extra = extra_client(CLIENT_ID, local_seq);
     for attempt in 0.. {
         match prod.try_write(MSG_V2_SUBMIT, 0, extra, &payload) {
@@ -367,7 +388,9 @@ fn purged_node_after_snapshotting_service(dir: &Path, app: &str, n: u32) -> (Nod
     wait_until(|| node.can_serve());
 
     let svc1 = ServiceBuilder::new(
-        ServiceConfig::new(dir, app).snapshot_policy(SnapshotPolicy { interval_bytes: 4 * 1024 }),
+        ServiceConfig::new(dir, app).snapshot_policy(SnapshotPolicy {
+            interval_bytes: 4 * 1024,
+        }),
         RegisterSm::default(),
     )
     .start_with_snapshots()
@@ -453,11 +476,18 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
     // install a snapshot: the apply agent must fail-stop with the contract named,
     // never silently replay a partial prefix from `first_base` onto a phantom
     // cursor.
-    let svc2 = ServiceBuilder::new(cfg(dir.path(), app), CountSm::default()).start().unwrap();
+    let svc2 = ServiceBuilder::new(cfg(dir.path(), app), CountSm::default())
+        .start()
+        .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let fired = loop {
-        if PANIC_LOG.lock().unwrap().iter().any(|m| m.contains("SnapshotRequired")) {
+        if PANIC_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("SnapshotRequired"))
+        {
             break true;
         }
         if Instant::now() >= deadline {
@@ -466,7 +496,10 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
         std::thread::sleep(Duration::from_millis(5));
     };
     std::panic::set_hook(prev);
-    assert!(fired, "the apply agent must fail-stop with SnapshotRequired within the deadline");
+    assert!(
+        fired,
+        "the apply agent must fail-stop with SnapshotRequired within the deadline"
+    );
 
     // The apply thread is dead; `crash()` joins via Drop (swallowing the panic),
     // so teardown does not re-raise it.
@@ -488,7 +521,9 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
     let node = start_purge_node(dir.path(), app);
     wait_until(|| node.can_serve());
     let svc1 = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy { interval_bytes: 4 * 1024 }),
+        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy {
+            interval_bytes: 4 * 1024,
+        }),
         CountSm::default(),
     )
     .start_with_snapshots()

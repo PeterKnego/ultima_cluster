@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use uc_journal::Journal;
 use uc_log::agent::{AgentRunner, IdleStrategy};
 use uc_log::archive::{Archive, ArchiveConfig, ReplayFrame};
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
@@ -21,7 +22,6 @@ use uc_net::fault::{FaultConfig, FaultSocket};
 use uc_net::rebuild::NakConfig;
 use uc_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc_net::sender::{Sender, SenderConfig};
-use uc_journal::Journal;
 
 /// A channel end for the consensus route that nothing drains (this harness has
 /// no `ElectionSm` — the wire-level tests here don't exercise commit ranking,
@@ -39,7 +39,10 @@ pub const MAX_PAYLOAD: usize = 256;
 
 /// Small segments so parallel test journals fit the quota'd tmpfs (M1 lesson).
 pub fn test_cfg(dir: &std::path::Path) -> ArchiveConfig {
-    ArchiveConfig { segment_size_bytes: 4 * 1024 * 1024, ..ArchiveConfig::new(dir) }
+    ArchiveConfig {
+        segment_size_bytes: 4 * 1024 * 1024,
+        ..ArchiveConfig::new(dir)
+    }
 }
 
 pub fn buffer() -> Arc<LogBuffer> {
@@ -50,7 +53,11 @@ pub fn buffer() -> Arc<LogBuffer> {
         buffer_bytes: CAP,
         max_payload: MAX_PAYLOAD as u32,
     });
-    Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), cnc, MAX_PAYLOAD))
+    Arc::new(LogBuffer::new(
+        Region::heap_zeroed(CAP as usize),
+        cnc,
+        MAX_PAYLOAD,
+    ))
 }
 
 pub struct Node {
@@ -116,15 +123,28 @@ pub fn spawn_follower_on(
     let mut cfg = FollowerConfig::new(leader);
     cfg.seed = faults.seed.wrapping_add(addr.port() as u64);
     cfg.status_floor_ns = 5_000_000; // 5 ms: keep flow adverts fresh under test loads
-    cfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 2_000_000 };
+    cfg.nak = NakConfig {
+        delay_min_ns: 100_000,
+        delay_max_ns: 500_000,
+        backoff_ns: 2_000_000,
+    };
     let term = Arc::new(AtomicU32::new(TERM));
-    let mut rx =
-        FollowerReceiver::new(Arc::clone(&buffer), sock, cfg, term, unrouted_consensus());
+    let mut rx = FollowerReceiver::new(Arc::clone(&buffer), sock, cfg, term, unrouted_consensus());
     let stats = rx.stats();
-    let rxa = AgentRunner::spawn(&format!("{name}-rx"), IdleStrategy::Yield, move || rx.do_work())
-        .unwrap();
+    let rxa = AgentRunner::spawn(&format!("{name}-rx"), IdleStrategy::Yield, move || {
+        rx.do_work()
+    })
+    .unwrap();
     let (ara, _journal) = spawn_archive(&format!("{name}-ar"), &buffer, dir.path());
-    Follower { node: Node { buffer, dir, agents: vec![rxa, ara] }, stats, addr }
+    Follower {
+        node: Node {
+            buffer,
+            dir,
+            agents: vec![rxa, ara],
+        },
+        stats,
+        addr,
+    }
 }
 
 pub struct Leader {
@@ -182,9 +202,18 @@ pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultCon
         unrouted_consensus(),
     );
     receiver.set_sender_route(ctrl_tx);
-    let rxa =
-        AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || receiver.do_work()).unwrap();
-    Leader { node: Node { buffer, dir, agents: vec![txa, rxa, ara] }, stats }
+    let rxa = AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || {
+        receiver.do_work()
+    })
+    .unwrap();
+    Leader {
+        node: Node {
+            buffer,
+            dir,
+            agents: vec![txa, rxa, ara],
+        },
+        stats,
+    }
 }
 
 /// Append `n_msgs` 64 B messages, pacing admission against the LIVE followers
@@ -260,12 +289,20 @@ pub fn converge_and_compare(leader: Leader, followers: Vec<Follower>, end: u64) 
         await_pos(&f.node.buffer.counters().append, end, "follower append");
         await_pos(&f.node.buffer.counters().durable, end, "follower durable");
     }
-    await_pos(&leader.node.buffer.counters().durable, end, "leader durable");
+    await_pos(
+        &leader.node.buffer.counters().durable,
+        end,
+        "leader durable",
+    );
     let ldir = leader.node.stop();
     let golden = replayed(ldir.path());
     assert!(!golden.is_empty());
     for f in followers {
         let fdir = f.node.stop();
-        assert_eq!(replayed(fdir.path()), golden, "follower journal diverged from leader");
+        assert_eq!(
+            replayed(fdir.path()),
+            golden,
+            "follower journal diverged from leader"
+        );
     }
 }

@@ -248,7 +248,10 @@ const _: () = assert!(CNC_OFF_SERVICES_DECLARED.is_multiple_of(64));
 /// The lag bound in bytes; `0` ⇔ lockstep.
 pub const CNC_OFF_FSM_LAG_BYTES: usize = 4040;
 const _: () = assert!(CNC_OFF_FSM_LAG_BYTES == CNC_OFF_SERVICES_DECLARED + 8);
-const _: () = assert!(CNC_OFF_SERVICES_DECLARED + 64 == 4096, "page 1 is exactly full");
+const _: () = assert!(
+    CNC_OFF_SERVICES_DECLARED + 64 == 4096,
+    "page 1 is exactly full"
+);
 
 // M14a: page 2 — `ServiceSlot[CNC_MAX_SERVICES]`. One slot per service id,
 // fixed 512 B stride (eight 64 B lines), ONE WRITER PER LINE — every line is
@@ -309,7 +312,10 @@ pub struct CncHeader {
 /// terminator so [`read_cnc_app_id`] can find the end).
 pub fn write_cnc_header(page: &mut [u8], h: &CncHeader, app_id: &str) {
     assert!(page.len() >= CNC_PAGE_LEN, "cnc page too small");
-    assert!(app_id.len() <= 63, "app_id must fit in 63 bytes (NUL-padded 64-byte field)");
+    assert!(
+        app_id.len() <= 63,
+        "app_id must fit in 63 bytes (NUL-padded 64-byte field)"
+    );
 
     page[CNC_OFF_MAGIC..CNC_OFF_MAGIC + 8].copy_from_slice(CNC_MAGIC);
     page[CNC_OFF_VERSION..CNC_OFF_VERSION + 4].copy_from_slice(&h.version.to_le_bytes());
@@ -344,18 +350,29 @@ pub fn read_cnc_header(page: &[u8]) -> Option<CncHeader> {
     let version = u32::from_le_bytes(page[CNC_OFF_VERSION..CNC_OFF_VERSION + 4].try_into().ok()?);
     let node_id = u32::from_le_bytes(page[CNC_OFF_NODE_ID..CNC_OFF_NODE_ID + 4].try_into().ok()?);
     let lo = u64::from_le_bytes(
-        page[CNC_OFF_INSTANCE_LO..CNC_OFF_INSTANCE_LO + 8].try_into().ok()?,
+        page[CNC_OFF_INSTANCE_LO..CNC_OFF_INSTANCE_LO + 8]
+            .try_into()
+            .ok()?,
     );
     let hi = u64::from_le_bytes(
-        page[CNC_OFF_INSTANCE_HI..CNC_OFF_INSTANCE_HI + 8].try_into().ok()?,
+        page[CNC_OFF_INSTANCE_HI..CNC_OFF_INSTANCE_HI + 8]
+            .try_into()
+            .ok()?,
     );
-    let created_ns =
-        u64::from_le_bytes(page[CNC_OFF_CREATED_NS..CNC_OFF_CREATED_NS + 8].try_into().ok()?);
+    let created_ns = u64::from_le_bytes(
+        page[CNC_OFF_CREATED_NS..CNC_OFF_CREATED_NS + 8]
+            .try_into()
+            .ok()?,
+    );
     let buffer_bytes = u64::from_le_bytes(
-        page[CNC_OFF_BUFFER_BYTES..CNC_OFF_BUFFER_BYTES + 8].try_into().ok()?,
+        page[CNC_OFF_BUFFER_BYTES..CNC_OFF_BUFFER_BYTES + 8]
+            .try_into()
+            .ok()?,
     );
     let max_payload = u32::from_le_bytes(
-        page[CNC_OFF_MAX_PAYLOAD..CNC_OFF_MAX_PAYLOAD + 4].try_into().ok()?,
+        page[CNC_OFF_MAX_PAYLOAD..CNC_OFF_MAX_PAYLOAD + 4]
+            .try_into()
+            .ok()?,
     );
     Some(CncHeader {
         version,
@@ -476,7 +493,10 @@ mod tests {
             &page[CNC_OFF_INSTANCE_HI..CNC_OFF_INSTANCE_HI + 8],
             &[0xEF, 0xBE, 0xFE, 0xCA, 0xCE, 0xFA, 0xED, 0xFE]
         );
-        assert_eq!(read_cnc_header(&page).map(|o| o.instance_id), Some(h.instance_id));
+        assert_eq!(
+            read_cnc_header(&page).map(|o| o.instance_id),
+            Some(h.instance_id)
+        );
     }
 
     #[test]
@@ -579,12 +599,21 @@ mod tests {
         assert_eq!(NODE_FLAG_CAN_SERVE, 2);
         // M6 Task 3: SnapshotSlots.
         assert_eq!(CNC_OFF_SERVICE_SNAPSHOT_POS, 1152);
-        assert_eq!(CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS, 64);
-        assert_eq!(CNC_OFF_INCOMING_SNAPSHOT_POS - CNC_OFF_NODE_SNAPSHOT_FLOOR, 64);
+        assert_eq!(
+            CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS,
+            64
+        );
+        assert_eq!(
+            CNC_OFF_INCOMING_SNAPSHOT_POS - CNC_OFF_NODE_SNAPSHOT_FLOOR,
+            64
+        );
         assert_eq!(CNC_OFF_INCOMING_SNAPSHOT_POS, 1280);
         // M6 Task 9: observability band — archive_first_base + per-peer slots.
         assert_eq!(CNC_OFF_ARCHIVE_FIRST_BASE, 1344);
-        assert_eq!(CNC_OFF_ARCHIVE_FIRST_BASE - CNC_OFF_INCOMING_SNAPSHOT_POS, 64);
+        assert_eq!(
+            CNC_OFF_ARCHIVE_FIRST_BASE - CNC_OFF_INCOMING_SNAPSHOT_POS,
+            64
+        );
         assert_eq!(CNC_OFF_PEER_SLOTS, 1408);
         assert_eq!(CNC_PEER_SLOT_STRIDE, 256);
         assert_eq!(CNC_MAX_PEER_SLOTS, 8);
@@ -596,7 +625,10 @@ mod tests {
         assert_eq!(CNC_PEER_ROLE_LEARNER, 2);
         // The band ends at 3456, inside the 4096-byte page (the `<= CNC_PAGE_LEN`
         // bound is const-asserted at module scope).
-        assert_eq!(CNC_OFF_PEER_SLOTS + CNC_MAX_PEER_SLOTS * CNC_PEER_SLOT_STRIDE, 3456);
+        assert_eq!(
+            CNC_OFF_PEER_SLOTS + CNC_MAX_PEER_SLOTS * CNC_PEER_SLOT_STRIDE,
+            3456
+        );
         // M7: config band.
         assert_eq!(CNC_OFF_CONFIG_VERSION, 3456);
         assert_eq!(CNC_OFF_CONFIG_PENDING, 3520);
@@ -618,7 +650,10 @@ mod tests {
         // its SECOND u64 (one writer for both), so the page's last line
         // stays free.
         assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 3976);
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 8);
+        assert_eq!(
+            CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED,
+            8
+        );
         // Both counters live inside the one 64-byte line starting at 3968...
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED % 64, 0);
         const { assert!(CNC_OFF_QUERY_HOLES_SKIPPED + 8 <= CNC_OFF_INGRESS_HOLES_SKIPPED + 64) };
@@ -645,7 +680,10 @@ mod tests {
         assert_eq!(CNC_SVC_OFF_HEARTBEAT_NS, 320);
         assert_eq!(CNC_SVC_OFF_LAG_WAITS, 384);
         assert_eq!(CNC_SVC_OFF_RESERVED, 448);
-        assert_eq!(CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE, 8192);
+        assert_eq!(
+            CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE,
+            8192
+        );
         assert_eq!(CNC_PAGE_LEN, 8192);
         assert_eq!(CNC_SVC_STATUS_ATTACHED, 1 << 8);
     }

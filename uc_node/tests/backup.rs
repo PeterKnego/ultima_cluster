@@ -30,22 +30,22 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use uc_client::Client;
+use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
 use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
-use uc_node::backup::{backup_instance, restore_artifact, verify_artifact, BackupError};
-use uc_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc_node::ServicesConfig;
+use uc_node::backup::{BackupError, backup_instance, restore_artifact, verify_artifact};
+use uc_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
+use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use uc_service::snapshots::SnapshotStore;
 use uc_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
-use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
-use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
 
 const SEG_BYTES: u64 = 64 * 1024;
 
@@ -175,8 +175,11 @@ fn drive_and_quiesce(node: &Node, n: usize) {
     let mut last = u64::MAX;
     wait_until("log quiescent", || {
         let c = node.counters();
-        let (a, cm, d) =
-            (c.append.load_acquire(), c.commit.load_acquire(), c.durable.load_acquire());
+        let (a, cm, d) = (
+            c.append.load_acquire(),
+            c.commit.load_acquire(),
+            c.durable.load_acquire(),
+        );
         let quiescent = a >= expected_append && a == cm && cm == d && a == last;
         last = a;
         quiescent
@@ -231,7 +234,9 @@ fn drive_until_durable_exceeds(node: &Node, target: u64, timeout: Duration) -> u
 /// indirection for a declared node.
 fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: u64) {
     let store = SnapshotStore::open(dir, 0).expect("open snapshot store");
-    store.publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?)).expect("publish snapshot");
+    store
+        .publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
+        .expect("publish snapshot");
     let cnc = open_cnc(dir, app);
     let before = node.archive_first_base();
     // Setup precondition, same shape as `purge_safety.rs`'s "need >1 segment
@@ -251,7 +256,9 @@ fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: 
          (nothing declared) leaves page 1 to the test"
     );
     cnc.snapshots().service_snapshot_pos.store_release(pos);
-    wait_until("purge advanced the floor", || node.archive_first_base() > before || pos == 0);
+    wait_until("purge advanced the floor", || {
+        node.archive_first_base() > before || pos == 0
+    });
 }
 
 fn scratch() -> tempfile::TempDir {
@@ -304,14 +311,20 @@ fn backup_of_a_stopped_node_verifies_and_reports_positions() {
 
     let out = root.path().join("backup1-out");
     let report = backup_instance(&dir, &out).expect("backup_instance");
-    assert!(report.journal_last_pos > 0, "expected a non-trivial durable frontier");
+    assert!(
+        report.journal_last_pos > 0,
+        "expected a non-trivial durable frontier"
+    );
     assert!(report.files > 0, "expected at least one file copied");
 
     let verify_report = verify_artifact(&out).expect("verify_artifact");
     assert_eq!(verify_report.journal_last_pos, report.journal_last_pos);
 
     let manifest = std::fs::read_to_string(out.join("MANIFEST")).expect("read MANIFEST");
-    assert!(manifest.contains("format=uc2-backup-v2"), "manifest: {manifest}");
+    assert!(
+        manifest.contains("format=uc2-backup-v2"),
+        "manifest: {manifest}"
+    );
     assert!(
         manifest.contains(&format!("journal_last_pos={}", report.journal_last_pos)),
         "manifest: {manifest}"
@@ -378,8 +391,7 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     let dir = root.path().join("n0");
     let app = "backup3";
 
-    let node =
-        start_node(&dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
+    let node = start_node(&dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
 
     // Deadline-bounded, not a fixed cycle count (see `drive_until_durable_exceeds`'s
     // doc — this is the fix for the flake this test used to hit under load).
@@ -402,8 +414,11 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     std::fs::create_dir_all(out.join("snapshots").join("0")).unwrap();
     for entry in std::fs::read_dir(dir.join("snapshots").join("0")).unwrap() {
         let entry = entry.unwrap();
-        std::fs::copy(entry.path(), out.join("snapshots").join("0").join(entry.file_name()))
-            .unwrap();
+        std::fs::copy(
+            entry.path(),
+            out.join("snapshots").join("0").join(entry.file_name()),
+        )
+        .unwrap();
     }
     let newest_copied = std::fs::read_dir(out.join("snapshots").join("0"))
         .unwrap()
@@ -452,7 +467,11 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     node.stop();
 
     match verify_artifact(&out) {
-        Err(BackupError::Hole { first_base, newest_snapshot, .. }) => {
+        Err(BackupError::Hole {
+            first_base,
+            newest_snapshot,
+            ..
+        }) => {
             assert!(first_base > newest_snapshot.unwrap_or(0));
             eprintln!(
                 "observed hole: first_base={first_base} newest_snapshot={newest_snapshot:?} \
@@ -472,8 +491,7 @@ fn ordered_backup_never_produces_a_hole_under_purge_churn() {
     let dir = root.path().join("n0");
     let app = "backup4";
 
-    let node =
-        start_node(&dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
+    let node = start_node(&dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
 
     for cycle in 0..5u64 {
         drive_and_quiesce(&node, 3000);
@@ -483,9 +501,8 @@ fn ordered_backup_never_produces_a_hole_under_purge_churn() {
         publish_snapshot_and_wait_for_purge(&dir, app, &node, pos);
 
         let out = root.path().join(format!("backup4-out-{cycle}"));
-        let report = backup_instance(&dir, &out).unwrap_or_else(|e| {
-            panic!("backup_instance failed on cycle {cycle}: {e}")
-        });
+        let report = backup_instance(&dir, &out)
+            .unwrap_or_else(|e| panic!("backup_instance failed on cycle {cycle}: {e}"));
         assert!(report.files > 0);
         verify_artifact(&out)
             .unwrap_or_else(|e| panic!("verify_artifact failed on cycle {cycle}: {e}"));
@@ -553,7 +570,10 @@ fn ordered_backup_survives_a_purge_racing_the_copy() {
                     let durable = cnc.counters().durable.load_acquire();
                     if durable > SEG_BYTES {
                         let pos = durable.saturating_sub(SEG_BYTES / 2).max(1);
-                        if store.publish(pos, |w| Ok(w.write_all(b"race-snapshot")?)).is_ok() {
+                        if store
+                            .publish(pos, |w| Ok(w.write_all(b"race-snapshot")?))
+                            .is_ok()
+                        {
                             cnc.snapshots().service_snapshot_pos.store_release(pos);
                         }
                     }
@@ -762,8 +782,14 @@ fn verify_never_grows_the_artifacts_files_and_is_idempotent() {
     // must report the exact same recovered positions.
     let report2 = verify_artifact(&out).expect("verify #2");
     let after2 = file_sizes(&out);
-    assert_eq!(after1, after2, "a second verify_artifact must not mutate any file further");
-    assert_eq!(report1, report2, "a second verify_artifact must report identical positions");
+    assert_eq!(
+        after1, after2,
+        "a second verify_artifact must not mutate any file further"
+    );
+    assert_eq!(
+        report1, report2,
+        "a second verify_artifact must report identical positions"
+    );
 }
 
 // ---------------------------------------------------------------------- M11 Task 2: restore
@@ -826,7 +852,10 @@ fn restore_roundtrip_boots_and_serves() {
     for _ in 0..50u64 {
         let got: u64 = client.submit(&RestoreCmd::Add(1)).expect("submit");
         expected_total += 1;
-        assert_eq!(got, expected_total, "apply order must match submission order");
+        assert_eq!(
+            got, expected_total,
+            "apply order must match submission order"
+        );
     }
     client.shutdown();
 
@@ -849,7 +878,12 @@ fn restore_roundtrip_boots_and_serves() {
         "restore_artifact must report the artifact's own recovered positions"
     );
 
-    let restored_node = start_node_with(&fresh_dir, app, PurgePolicy::Disabled, ServicesConfig::default());
+    let restored_node = start_node_with(
+        &fresh_dir,
+        app,
+        PurgePolicy::Disabled,
+        ServicesConfig::default(),
+    );
     let restored_svc = ServiceBuilder::new(
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
@@ -861,7 +895,10 @@ fn restore_roundtrip_boots_and_serves() {
     let got: u64 = restored_client
         .query_linearizable(&())
         .expect("linearizable query after restore");
-    assert_eq!(got, expected_total, "restored cluster must serve the pre-backup value");
+    assert_eq!(
+        got, expected_total,
+        "restored cluster must serve the pre-backup value"
+    );
 
     restored_client.shutdown();
     restored_node.stop();
@@ -895,7 +932,10 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
     for _ in 0..50u64 {
         let got: u64 = client.submit(&RestoreCmd::Add(1)).expect("submit");
         expected_total += 1;
-        assert_eq!(got, expected_total, "apply order must match submission order");
+        assert_eq!(
+            got, expected_total,
+            "apply order must match submission order"
+        );
     }
     client.shutdown();
 
@@ -919,9 +959,15 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
     std::fs::write(fresh_dir.join("instance.lock"), b"stale-lock-bytes").unwrap();
     std::fs::write(fresh_dir.join("cnc2.dat"), b"garbage-not-a-real-cnc-page").unwrap();
 
-    restore_artifact(&artifact, &fresh_dir).expect("restore_artifact must accept an empty-dirs, stale-volatile-files target");
+    restore_artifact(&artifact, &fresh_dir)
+        .expect("restore_artifact must accept an empty-dirs, stale-volatile-files target");
 
-    let restored_node = start_node_with(&fresh_dir, app, PurgePolicy::Disabled, ServicesConfig::default());
+    let restored_node = start_node_with(
+        &fresh_dir,
+        app,
+        PurgePolicy::Disabled,
+        ServicesConfig::default(),
+    );
     let restored_svc = ServiceBuilder::new(
         ServiceConfig::new(&fresh_dir, app),
         RestoreCountSm::default(),
@@ -933,7 +979,10 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
     let got: u64 = restored_client
         .query_linearizable(&())
         .expect("linearizable query after restore");
-    assert_eq!(got, expected_total, "restored cluster must serve the pre-backup value");
+    assert_eq!(
+        got, expected_total,
+        "restored cluster must serve the pre-backup value"
+    );
 
     restored_client.shutdown();
     restored_node.stop();
@@ -974,8 +1023,14 @@ fn restore_refuses_a_dirty_target() {
     // nothing else was created under the target.
     let leftover = std::fs::read(target.join("journal").join("leftover.log")).unwrap();
     assert_eq!(leftover, b"junk");
-    assert!(!target.join("state").exists(), "refused restore must not create state/");
-    assert!(!target.join("snapshots").exists(), "refused restore must not create snapshots/");
+    assert!(
+        !target.join("state").exists(),
+        "refused restore must not create state/"
+    );
+    assert!(
+        !target.join("snapshots").exists(),
+        "refused restore must not create snapshots/"
+    );
 }
 
 // ---------------------------------------------------------------------- Final review, Important 1
@@ -1027,7 +1082,10 @@ fn restore_artifact_refuses_a_running_artifact_argument() {
         Err(BackupError::LooksLikeLiveInstanceDir(p)) => assert_eq!(p, dir),
         other => panic!("expected LooksLikeLiveInstanceDir, got {other:?}"),
     }
-    assert!(!target.exists(), "a refused restore must not create the target at all");
+    assert!(
+        !target.exists(),
+        "a refused restore must not create the target at all"
+    );
 
     match node.stop_draining(Duration::from_secs(10)) {
         uc_node::DrainOutcome::Drained => {}
@@ -1093,7 +1151,10 @@ fn verify_artifact_proceeds_on_a_stopped_nodes_dir_with_a_stale_lock() {
         other => panic!("expected Drained, got {other:?}"),
     }
 
-    assert!(dir.join("instance.lock").is_file(), "shutdown must leave the lock FILE in place");
+    assert!(
+        dir.join("instance.lock").is_file(),
+        "shutdown must leave the lock FILE in place"
+    );
 
     let report =
         verify_artifact(&dir).expect("a stopped node's own instance dir must verify in place");
@@ -1107,7 +1168,12 @@ fn verify_artifact_proceeds_on_a_stopped_nodes_dir_with_a_stale_lock() {
 fn two_fsm_purged_node(
     dir: &Path,
     app: &str,
-) -> (Node, uc_service::Service<RegisterSm>, uc_service::Service<RegisterSm>, u64) {
+) -> (
+    Node,
+    uc_service::Service<RegisterSm>,
+    uc_service::Service<RegisterSm>,
+    u64,
+) {
     let mut cfg = config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
     cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
     let node = Node::start(cfg).expect("node");
@@ -1116,7 +1182,9 @@ fn two_fsm_purged_node(
         ServiceBuilder::new(
             ServiceConfig::new(dir, app)
                 .service_id(id)
-                .snapshot_policy(SnapshotPolicy { interval_bytes: 32 * 1024 }),
+                .snapshot_policy(SnapshotPolicy {
+                    interval_bytes: 32 * 1024,
+                }),
             RegisterSm::default(),
         )
         .start_with_snapshots()
@@ -1144,7 +1212,10 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     let (node, s0, s1, last) = two_fsm_purged_node(&dir, app);
     for id in ["0", "1"] {
         assert!(
-            std::fs::read_dir(dir.join("snapshots").join(id)).unwrap().next().is_some(),
+            std::fs::read_dir(dir.join("snapshots").join(id))
+                .unwrap()
+                .next()
+                .is_some(),
             "snapshots/{id} has an artifact"
         );
     }
@@ -1158,7 +1229,10 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     let artifact = root.path().join("restore2-artifact");
     let report = backup_instance(&dir, &artifact)
         .expect("backup_instance — RED before Task 9: the flat copier drops snapshots/<id>/ and verify reports a Hole");
-    assert!(report.journal_first_base > 0, "vacuity: the journal must have been purged");
+    assert!(
+        report.journal_first_base > 0,
+        "vacuity: the journal must have been purged"
+    );
     assert!(
         report.newest_snapshots[0].is_some() && report.newest_snapshots[1].is_some(),
         "{report:?}"
@@ -1166,7 +1240,10 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     assert!(report.newest_snapshots[2..].iter().all(Option::is_none));
     for id in ["0", "1"] {
         assert!(
-            std::fs::read_dir(artifact.join("snapshots").join(id)).unwrap().next().is_some(),
+            std::fs::read_dir(artifact.join("snapshots").join(id))
+                .unwrap()
+                .next()
+                .is_some(),
             "artifact snapshots/{id}"
         );
     }
@@ -1181,15 +1258,25 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
     let rnode = Node::start(cfg).expect("restored node");
     wait_until("restored serving", || rnode.can_serve());
-    let rs0 = ServiceBuilder::new(ServiceConfig::new(&fresh, app).service_id(0), RegisterSm::default())
-        .start_with_snapshots()
-        .expect("restored svc 0");
-    let rs1 = ServiceBuilder::new(ServiceConfig::new(&fresh, app).service_id(1), RegisterSm::default())
-        .start_with_snapshots()
-        .expect("restored svc 1");
+    let rs0 = ServiceBuilder::new(
+        ServiceConfig::new(&fresh, app).service_id(0),
+        RegisterSm::default(),
+    )
+    .start_with_snapshots()
+    .expect("restored svc 0");
+    let rs1 = ServiceBuilder::new(
+        ServiceConfig::new(&fresh, app).service_id(1),
+        RegisterSm::default(),
+    )
+    .start_with_snapshots()
+    .expect("restored svc 1");
     let client = Client::connect(&fresh, app).expect("client");
     let got: Option<u64> = client.query_linearizable(&()).expect("read");
-    assert_eq!(got, Some(last), "FSM 0 rebuilt from its own snapshot + tail");
+    assert_eq!(
+        got,
+        Some(last),
+        "FSM 0 rebuilt from its own snapshot + tail"
+    );
     wait_until("FSM 1 rebuilt", || rs1.query(()) == Some(last));
     client.shutdown();
     rnode.stop();
@@ -1214,7 +1301,11 @@ fn verify_reports_a_hole_for_the_id_whose_snapshot_is_missing() {
         std::fs::remove_file(e.unwrap().path()).unwrap();
     }
     match verify_artifact(&artifact) {
-        Err(BackupError::Hole { service: 1, first_base, newest_snapshot: None }) => {
+        Err(BackupError::Hole {
+            service: 1,
+            first_base,
+            newest_snapshot: None,
+        }) => {
             assert_eq!(first_base, report.journal_first_base);
         }
         other => panic!("expected Hole{{service: 1}}, got {other:?}"),

@@ -216,7 +216,9 @@ impl AuditLog {
             r.outcome,
             r.reason
         );
-        let addr = r.addr.map(|(ip, port)| format!("{}:{}", Ipv4Addr::from(ip), port));
+        let addr = r
+            .addr
+            .map(|(ip, port)| format!("{}:{}", Ipv4Addr::from(ip), port));
         let fields = fields(r, addr.as_deref());
         let line = format_line_at(r.ts_ns as u128, None, "admin_op", &fields);
         // One `write_all` under `O_APPEND`: the offset is taken by the kernel
@@ -239,11 +241,26 @@ impl AuditLog {
 /// mirror use. `addr` is `null` when the op carries no address.
 fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 11] {
     [
-        Field { key: "actor", value: FieldValue::Str(r.actor) },
-        Field { key: "origin", value: FieldValue::Str(r.origin.as_str()) },
-        Field { key: "op", value: FieldValue::U64(r.op as u64) },
-        Field { key: "op_name", value: FieldValue::Str(r.op_name) },
-        Field { key: "id", value: FieldValue::U64(r.id as u64) },
+        Field {
+            key: "actor",
+            value: FieldValue::Str(r.actor),
+        },
+        Field {
+            key: "origin",
+            value: FieldValue::Str(r.origin.as_str()),
+        },
+        Field {
+            key: "op",
+            value: FieldValue::U64(r.op as u64),
+        },
+        Field {
+            key: "op_name",
+            value: FieldValue::Str(r.op_name),
+        },
+        Field {
+            key: "id",
+            value: FieldValue::U64(r.id as u64),
+        },
         Field {
             key: "addr",
             value: match addr {
@@ -251,11 +268,26 @@ fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 11] 
                 None => FieldValue::Null,
             },
         },
-        Field { key: "seq", value: FieldValue::U64(r.seq) },
-        Field { key: "nonce", value: FieldValue::U64(r.nonce) },
-        Field { key: "outcome", value: FieldValue::Str(r.outcome.as_str()) },
-        Field { key: "reason", value: FieldValue::U64(r.reason as u64) },
-        Field { key: "config_version", value: FieldValue::U64(r.config_version) },
+        Field {
+            key: "seq",
+            value: FieldValue::U64(r.seq),
+        },
+        Field {
+            key: "nonce",
+            value: FieldValue::U64(r.nonce),
+        },
+        Field {
+            key: "outcome",
+            value: FieldValue::Str(r.outcome.as_str()),
+        },
+        Field {
+            key: "reason",
+            value: FieldValue::U64(r.reason as u64),
+        },
+        Field {
+            key: "config_version",
+            value: FieldValue::U64(r.config_version),
+        },
     ]
 }
 
@@ -273,8 +305,7 @@ mod tests {
         let root = std::env::var("CARGO_TARGET_TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../target/uc_node_tests")
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_node_tests")
             });
         assert!(
             !root.starts_with("/tmp"),
@@ -282,7 +313,10 @@ mod tests {
             root.display()
         );
         std::fs::create_dir_all(&root).expect("scratch root");
-        tempfile::Builder::new().prefix("uc2-audit-").tempdir_in(&root).expect("tempdir")
+        tempfile::Builder::new()
+            .prefix("uc2-audit-")
+            .tempdir_in(&root)
+            .expect("tempdir")
     }
 
     fn rec(seq: u64) -> AuditRecord<'static> {
@@ -329,8 +363,14 @@ mod tests {
         r.reason = 20;
         a.record(&r).unwrap();
         let text = std::fs::read_to_string(a.path()).unwrap();
-        assert!(text.contains(r#""op":3,"op_name":"demote","id":4,"addr":null"#), "{text}");
-        assert!(text.contains(r#""outcome":"refused","reason":20"#), "{text}");
+        assert!(
+            text.contains(r#""op":3,"op_name":"demote","id":4,"addr":null"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""outcome":"refused","reason":20"#),
+            "{text}"
+        );
     }
 
     #[test]
@@ -379,14 +419,25 @@ mod tests {
         let dir = tempdir();
         let path = dir.path().join(AUDIT_FILE);
         std::fs::write(&path, b"").unwrap();
-        let mut a = AuditLog { file: File::open(&path).unwrap(), path: path.clone() };
-        let err = a.record(&rec(1)).expect_err("a read-only fd must not silently swallow a record");
+        let mut a = AuditLog {
+            file: File::open(&path).unwrap(),
+            path: path.clone(),
+        };
+        let err = a
+            .record(&rec(1))
+            .expect_err("a read-only fd must not silently swallow a record");
         assert!(
-            matches!(err.kind(), std::io::ErrorKind::Other | std::io::ErrorKind::PermissionDenied)
-                || err.raw_os_error() == Some(9),
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::Other | std::io::ErrorKind::PermissionDenied
+            ) || err.raw_os_error() == Some(9),
             "unexpected error: {err:?}"
         );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "nothing was recorded");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "nothing was recorded"
+        );
     }
 
     /// `open` on a directory this process cannot write is a hard error — the
@@ -417,6 +468,9 @@ mod tests {
             p.set_mode(0o700);
             std::fs::set_permissions(&sub, p).unwrap();
         }
-        assert!(r.is_err(), "an unwritable instance directory must refuse to open the audit log");
+        assert!(
+            r.is_err(),
+            "an unwritable instance directory must refuse to open the audit log"
+        );
     }
 }

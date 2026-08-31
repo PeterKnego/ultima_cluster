@@ -202,7 +202,8 @@ mod tests {
         let d = std::env::var("CARGO_TARGET_TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_crypto_tests")
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/uc_crypto_tests")
             })
             .join("uc2-crypto-identity");
         std::fs::create_dir_all(&d).unwrap();

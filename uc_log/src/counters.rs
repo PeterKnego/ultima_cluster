@@ -17,7 +17,10 @@ pub struct PaddedAtomicU64 {
 
 impl PaddedAtomicU64 {
     pub fn new(v: u64) -> Self {
-        Self { v: AtomicU64::new(v), _pad: [0; 56] }
+        Self {
+            v: AtomicU64::new(v),
+            _pad: [0; 56],
+        }
     }
     #[inline]
     pub fn load_acquire(&self) -> u64 {
@@ -127,7 +130,11 @@ mod tests {
     #[test]
     fn fetch_add_returns_prior_value_and_advances() {
         let a = PaddedAtomicU64::new(1);
-        assert_eq!(a.fetch_add(1), 1, "next_client_id-style allocation: old id returned");
+        assert_eq!(
+            a.fetch_add(1),
+            1,
+            "next_client_id-style allocation: old id returned"
+        );
         assert_eq!(a.load_acquire(), 2);
         assert_eq!(a.fetch_add(5), 2);
         assert_eq!(a.load_acquire(), 7);

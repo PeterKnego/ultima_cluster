@@ -64,15 +64,21 @@ impl AgentRunner {
         let stop_flag = Arc::clone(&stop);
         let finished = Arc::new(AtomicBool::new(false));
         let finished_flag = Arc::clone(&finished);
-        let handle = std::thread::Builder::new().name(name.to_string()).spawn(move || {
-            let _guard = FinishedGuard(finished_flag);
-            while !stop_flag.load(Ordering::Relaxed) {
-                if !work() {
-                    idle.idle();
+        let handle = std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _guard = FinishedGuard(finished_flag);
+                while !stop_flag.load(Ordering::Relaxed) {
+                    if !work() {
+                        idle.idle();
+                    }
                 }
-            }
-        })?;
-        Ok(AgentRunner { stop, handle: Some(handle), finished })
+            })?;
+        Ok(AgentRunner {
+            stop,
+            handle: Some(handle),
+            finished,
+        })
     }
 
     /// Shared liveness flag: false while the worker loop runs, set true when
@@ -99,7 +105,11 @@ impl AgentRunner {
     /// Prefer this over `drop` in teardown paths that must observe failures.
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.take().unwrap().join().expect("agent thread panicked");
+        self.handle
+            .take()
+            .unwrap()
+            .join()
+            .expect("agent thread panicked");
     }
 }
 
@@ -141,9 +151,13 @@ mod tests {
     #[test]
     fn the_finished_flag_survives_a_panicking_agent() {
         use std::time::{Duration, Instant};
-        let r = AgentRunner::spawn("panics", IdleStrategy::Sleep(Duration::from_millis(1)), || {
-            panic!("deliberate");
-        })
+        let r = AgentRunner::spawn(
+            "panics",
+            IdleStrategy::Sleep(Duration::from_millis(1)),
+            || {
+                panic!("deliberate");
+            },
+        )
         .unwrap();
         let flag = r.finished_flag();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -172,6 +186,10 @@ mod tests {
         drop(runner); // must signal stop AND join — the thread is gone after this
         let n = count.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(count.load(Ordering::Relaxed), n, "agent thread still running after drop");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            n,
+            "agent thread still running after drop"
+        );
     }
 }

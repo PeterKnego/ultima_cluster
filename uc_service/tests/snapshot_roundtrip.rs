@@ -8,10 +8,10 @@
 #![cfg(feature = "ultima_db")]
 
 use serde::{Deserialize, Serialize};
-use ultima_db::{Persistence, Store, StoreConfig};
 use uc_service::SnapshotStateMachine;
 use uc_service::StateMachine;
 use uc_service::ultima_db::StoreStateMachine;
+use ultima_db::{Persistence, Store, StoreConfig};
 
 // A minimal KV command/query vocabulary over a single `ultima_db` table. Rows
 // carry the string key; `get` scans for it (the store auto-assigns row IDs).
@@ -39,9 +39,13 @@ type Sm = StoreStateMachine<Cmd, (), Query, Option<u64>>;
 fn kv_store_sm(dir: std::path::PathBuf) -> Sm {
     // Smr (checkpoint-only) persistence: the SMR log provides durability, and
     // `install_snapshot`'s post-install `checkpoint()` needs a real dir.
-    let cfg = StoreConfig::builder().persistence(Persistence::smr(dir)).build();
+    let cfg = StoreConfig::builder()
+        .persistence(Persistence::smr(dir))
+        .build();
     let store = Store::new(cfg).expect("open store");
-    store.register_table::<KvRow>(TABLE).expect("register table");
+    store
+        .register_table::<KvRow>(TABLE)
+        .expect("register table");
     StoreStateMachine::builder(store)
         .apply_fn(|tx, cmd| {
             let Cmd::Put(k, v) = cmd;
@@ -77,7 +81,11 @@ fn store_sm_freeze_stream_install_roundtrip_at_position() {
     assert_eq!(fresh.last_applied(), None, "fresh store starts empty");
     let installed = fresh.install_snapshot(4096, &mut buf.as_slice()).unwrap();
     assert_eq!(installed, 4096);
-    assert_eq!(fresh.last_applied(), Some(4096), "position-as-version lockstep");
+    assert_eq!(
+        fresh.last_applied(),
+        Some(4096),
+        "position-as-version lockstep"
+    );
     assert_eq!(fresh.query(Query::Get("c".into())), Some(3));
     assert_eq!(fresh.query(Query::Get("a".into())), Some(1));
     assert_eq!(fresh.query(Query::Get("missing".into())), None);
@@ -120,11 +128,17 @@ fn install_snapshot_replaces_wholesale_dropping_extra_tables() {
         .build();
     let store = Store::new(cfg).expect("open store");
     store.register_table::<KvRow>(TABLE).expect("register kv");
-    store.register_table::<OrphanRow>(ORPHAN).expect("register orphan");
+    store
+        .register_table::<OrphanRow>(ORPHAN)
+        .expect("register orphan");
     {
         let mut tx = store.begin_write(Some(64)).unwrap();
         let mut kv = tx.open_table::<KvRow>(TABLE).unwrap();
-        kv.insert(KvRow { key: "z".into(), val: 99 }).unwrap();
+        kv.insert(KvRow {
+            key: "z".into(),
+            val: 99,
+        })
+        .unwrap();
         drop(kv);
         let mut orphan = tx.open_table::<OrphanRow>(ORPHAN).unwrap();
         orphan.insert(OrphanRow { v: 7 }).unwrap();
@@ -149,14 +163,20 @@ fn install_snapshot_replaces_wholesale_dropping_extra_tables() {
         .expect("build sm");
     assert_eq!(follower.last_applied(), Some(64), "divergent prior life");
 
-    let installed = follower.install_snapshot(4096, &mut buf.as_slice()).unwrap();
+    let installed = follower
+        .install_snapshot(4096, &mut buf.as_slice())
+        .unwrap();
     assert_eq!(installed, 4096);
     assert_eq!(follower.last_applied(), Some(4096));
 
     // State == snapshot EXACTLY: the leader's entry present, the divergent
     // "kv" row gone (whole-table replace)...
     assert_eq!(follower.query(Query::Get("a".into())), Some(1));
-    assert_eq!(follower.query(Query::Get("z".into())), None, "divergent row must not survive");
+    assert_eq!(
+        follower.query(Query::Get("z".into())),
+        None,
+        "divergent row must not survive"
+    );
     // ...and the extra table is GONE from the installed snapshot.
     {
         let read = probe.begin_read(None).unwrap();

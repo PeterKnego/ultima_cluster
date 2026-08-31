@@ -120,7 +120,11 @@ mod tests {
     #[test]
     fn self_seeds_one_ack_and_distinct_acks_reach_quorum() {
         let mut r = round();
-        assert_eq!(r.acks(), 1, "self-seeded (acks: 1), same discipline as today");
+        assert_eq!(
+            r.acks(),
+            1,
+            "self-seeded (acks: 1), same discipline as today"
+        );
         assert!(!r.record_ack(0), "second ack of three is not quorum");
         assert!(r.record_ack(2), "third distinct ack reaches quorum 3");
         assert_eq!(r.acks(), 3);
@@ -131,7 +135,10 @@ mod tests {
         let mut r = round();
         assert!(!r.record_ack(0));
         assert!(!r.record_ack(0), "duplicate voter must not advance");
-        assert!(!r.record_ack(1), "self is pre-seeded; a self ack must not advance");
+        assert!(
+            !r.record_ack(1),
+            "self is pre-seeded; a self ack must not advance"
+        );
         assert_eq!(r.acks(), 2);
     }
 
@@ -142,14 +149,20 @@ mod tests {
         let mut r = round();
         r.record_ack(0);
         assert!(r.record_ack(2));
-        assert!(r.record_ack(3), "a late extra voter still reports quorum reached");
+        assert!(
+            r.record_ack(3),
+            "a late extra voter still reports quorum reached"
+        );
     }
 
     #[test]
     fn certifies_exactly_the_reads_waiting_at_issue() {
         let r = round(); // seq 5
         assert!(r.certifies(4), "admitted before an earlier round: released");
-        assert!(r.certifies(5), "admitted before THIS round was issued: released");
+        assert!(
+            r.certifies(5),
+            "admitted before THIS round was issued: released"
+        );
     }
 
     #[test]

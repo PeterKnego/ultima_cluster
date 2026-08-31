@@ -20,12 +20,19 @@ const APP: &str = "fakeapp";
 const WAIT: Duration = Duration::from_secs(10);
 
 fn cfg(members: Vec<String>) -> RemoteConfig {
-    RemoteConfig { app_id: APP.into(), members, ..Default::default() }
+    RemoteConfig {
+        app_id: APP.into(),
+        members,
+        ..Default::default()
+    }
 }
 
 #[test]
 fn submit_and_wait_round_trips() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let r = client.submit(b"abc").unwrap().wait_timeout(WAIT).unwrap();
     assert_eq!(&r.bytes[..], b"cba");
@@ -42,20 +49,31 @@ fn tickets_may_outnumber_the_credit_window() {
     // The shape `uc_gateway/tests/credits.rs` and `failover.rs` rely on:
     // issue first, wait second, deeper than the grant. `submit` BLOCKS while
     // the window is closed — that block is the pacing.
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let tickets: Vec<_> = (0..20u8).map(|i| client.submit(&[i]).unwrap()).collect();
     for (i, t) in tickets.into_iter().enumerate() {
         let r = t.wait_timeout(WAIT).unwrap();
         assert_eq!(&r.bytes[..], &[i as u8]);
     }
-    assert!(edge.observed.max_unanswered.load(std::sync::atomic::Ordering::SeqCst) <= 2);
+    assert!(
+        edge.observed
+            .max_unanswered
+            .load(std::sync::atomic::Ordering::SeqCst)
+            <= 2
+    );
     client.shutdown();
 }
 
 #[test]
 fn query_round_trips_with_both_consistencies() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
     for c in [Consistency::Linearizable, Consistency::Snapshot] {
         let r = client.query(b"abc", c).unwrap().wait_timeout(WAIT).unwrap();
@@ -66,9 +84,17 @@ fn query_round_trips_with_both_consistencies() {
 
 #[test]
 fn expired_surfaces_as_error() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, expired: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        expired: true,
+        ..Default::default()
+    });
     let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
-    let err = client.submit(b"abc").unwrap().wait_timeout(WAIT).unwrap_err();
+    let err = client
+        .submit(b"abc")
+        .unwrap()
+        .wait_timeout(WAIT)
+        .unwrap_err();
     assert!(matches!(err, RemoteError::Expired), "got {err:?}");
     assert_eq!(client.stats().expired, 1);
     client.shutdown();
@@ -76,13 +102,21 @@ fn expired_surfaces_as_error() {
 
 #[test]
 fn unknown_surfaces_when_told_not_to_resend() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        unknown_once: true,
+        ..Default::default()
+    });
     let client = RemoteClient::connect(RemoteConfig {
         resend_on_unknown: false,
         ..cfg(vec![edge.addr.clone()])
     })
     .unwrap();
-    let err = client.submit(b"abc").unwrap().wait_timeout(WAIT).unwrap_err();
+    let err = client
+        .submit(b"abc")
+        .unwrap()
+        .wait_timeout(WAIT)
+        .unwrap_err();
     assert!(matches!(err, RemoteError::Unknown), "got {err:?}");
     client.shutdown();
 }
@@ -95,7 +129,11 @@ fn payload_too_large_is_terminal() {
         ..Default::default()
     });
     let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
-    let err = client.submit(b"abc").unwrap().wait_timeout(WAIT).unwrap_err();
+    let err = client
+        .submit(b"abc")
+        .unwrap()
+        .wait_timeout(WAIT)
+        .unwrap_err();
     assert!(matches!(err, RemoteError::PayloadTooLarge), "got {err:?}");
     assert_eq!(client.stats().resends, 0);
     client.shutdown();
@@ -118,7 +156,11 @@ fn shutdown_fails_outstanding_tickets_with_closed() {
 
 #[test]
 fn a_request_that_is_never_answered_times_out() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hang: true,
+        ..Default::default()
+    });
     let client = RemoteClient::connect(RemoteConfig {
         request_timeout: Duration::from_millis(200),
         ping_interval: Duration::from_millis(50),
@@ -127,7 +169,11 @@ fn a_request_that_is_never_answered_times_out() {
     })
     .unwrap();
     let t = Instant::now();
-    let err = client.submit(b"abc").unwrap().wait_timeout(Duration::from_secs(3)).unwrap_err();
+    let err = client
+        .submit(b"abc")
+        .unwrap()
+        .wait_timeout(Duration::from_secs(3))
+        .unwrap_err();
     assert!(matches!(err, RemoteError::TimedOut), "got {err:?}");
     assert!(t.elapsed() < Duration::from_secs(2));
     client.shutdown();

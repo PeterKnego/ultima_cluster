@@ -96,14 +96,23 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            AdminPolicy::Hmac { keys: Arc::new(keys), ttl: Duration::from_millis(opts.admin.request_ttl_ms) }
+            AdminPolicy::Hmac {
+                keys: Arc::new(keys),
+                ttl: Duration::from_millis(opts.admin.request_ttl_ms),
+            }
         }
     };
 
     let id = cfg.id;
     let bind = cfg.bind;
     let instance_dir = cfg.instance_dir.clone();
-    let node = match Node::start_with(cfg, StartOpts { socket: None, admin }) {
+    let node = match Node::start_with(
+        cfg,
+        StartOpts {
+            socket: None,
+            admin,
+        },
+    ) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("uc2-node: failed to start node {id}: {e}");
@@ -117,7 +126,10 @@ fn main() -> ExitCode {
     if let Some(addr) = opts.obs.metrics_bind {
         match ObsServer::serve(obs.clone(), addr) {
             Ok(s) => {
-                println!("uc2-node: observability endpoint on http://{}/metrics", s.local_addr());
+                println!(
+                    "uc2-node: observability endpoint on http://{}/metrics",
+                    s.local_addr()
+                );
                 srv = Some(s);
             }
             Err(e) => {

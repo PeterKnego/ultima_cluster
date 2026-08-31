@@ -26,9 +26,15 @@ use crate::config::{ConfigError, EdgeConfig, Member};
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigFileError {
     #[error("cannot read config file {path}: {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("invalid config file {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     #[error("{0}")]
     Invalid(#[from] ConfigError),
 }
@@ -84,7 +90,9 @@ struct SessionSection {
 
 impl Default for SessionSection {
     fn default() -> Self {
-        SessionSection { envelope: default_envelope() }
+        SessionSection {
+            envelope: default_envelope(),
+        }
     }
 }
 
@@ -127,15 +135,18 @@ fn default_envelope() -> bool {
 /// semantic-preflight step here, so this function is the whole named-refusal
 /// path for `uc2-gateway`.
 pub fn load_from_path(path: &Path) -> Result<EdgeConfig, ConfigFileError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|source| ConfigFileError::Read { path: path.to_path_buf(), source })?;
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
     // `parse_str` has no path to name, so it stamps [`IN_MEMORY_CONFIG`];
     // re-stamp the real one here so a refusal still tells the operator which
     // file to edit.
     parse_str(&text).map_err(|e| match e {
-        ConfigFileError::Parse { source, .. } => {
-            ConfigFileError::Parse { path: path.to_path_buf(), source }
-        }
+        ConfigFileError::Parse { source, .. } => ConfigFileError::Parse {
+            path: path.to_path_buf(),
+            source,
+        },
         other => other,
     })
 }
@@ -168,7 +179,14 @@ pub fn parse_str(text: &str) -> Result<EdgeConfig, ConfigFileError> {
         instance_dir: f.local.instance_dir,
         app_id: f.local.app_id,
         listen: f.local.listen,
-        members: f.members.into_iter().map(|m| Member { node_id: m.node_id, gateway: m.gateway }).collect(),
+        members: f
+            .members
+            .into_iter()
+            .map(|m| Member {
+                node_id: m.node_id,
+                gateway: m.gateway,
+            })
+            .collect(),
         session_envelope: session.envelope,
         max_inflight: limits.max_inflight,
         per_conn_inflight: limits.per_conn_inflight,

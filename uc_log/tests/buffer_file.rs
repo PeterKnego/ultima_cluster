@@ -23,14 +23,15 @@ fn file_backed_buffer_roundtrip_across_reopen_of_mapping() {
     let path = dir.path().join("log.buf");
     let cnc = test_cnc();
 
-    let b = Arc::new(
-        LogBuffer::create_file(&path, 1 << 16, Arc::clone(&cnc), 1024).unwrap(),
-    );
+    let b = Arc::new(LogBuffer::create_file(&path, 1 << 16, Arc::clone(&cnc), 1024).unwrap());
     let mut a = Appender::new(Arc::clone(&b), 1);
     let pos = a.append(5, 6, b"persisted?").unwrap();
 
     let mut out = Vec::new();
-    assert!(matches!(b.read_frame_validated(pos, &mut out), FrameRead::Frame(_)));
+    assert!(matches!(
+        b.read_frame_validated(pos, &mut out),
+        FrameRead::Frame(_)
+    ));
     drop(a);
     drop(b);
 

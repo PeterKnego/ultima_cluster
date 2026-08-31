@@ -89,13 +89,18 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use uc_journal::{StableValue, StableValueConfig};
 use uc_log::archive::{Archive, ArchiveConfig};
 use uc_log::state::{ConfigRecord, TermMap, VoteRecord};
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
-use uc_journal::{StableValue, StableValueConfig};
 
-const STATE_FILES: [&str; 5] =
-    ["vote.state", "term_map.state", "output_progress.state", "snapshot.state", "config.state"];
+const STATE_FILES: [&str; 5] = [
+    "vote.state",
+    "term_map.state",
+    "output_progress.state",
+    "snapshot.state",
+    "config.state",
+];
 
 const SNAP_PREFIX: &str = "snap-";
 const SNAP_SUFFIX: &str = ".ultsnap";
@@ -172,7 +177,11 @@ pub enum BackupError {
         "hole: service {service}: journal first_base={first_base} is not covered by any \
          retained snapshot (newest_snapshot={newest_snapshot:?})"
     )]
-    Hole { service: u8, first_base: u64, newest_snapshot: Option<u64> },
+    Hole {
+        service: u8,
+        first_base: u64,
+        newest_snapshot: Option<u64>,
+    },
     /// A `MANIFEST` is present but disagrees with the artifact's own
     /// recovered state — tampering or bitrot at the metadata level.
     #[error("manifest mismatch: {0}")]
@@ -235,7 +244,10 @@ fn refuse_if_live_instance_dir(path: &Path) -> Result<(), BackupError> {
     if !lock_path.is_file() {
         return Ok(());
     }
-    let f = fs::OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
     if f.try_lock_exclusive().is_err() {
         return Err(BackupError::LooksLikeLiveInstanceDir(path.to_path_buf()));
     }
@@ -263,11 +275,16 @@ fn looks_like_instance_layout(root: &Path) -> bool {
     if !journal_dir(root).is_dir() || !state_dir(root).is_dir() {
         return false;
     }
-    STATE_FILES.iter().all(|f| state_dir(root).join(f).is_file())
+    STATE_FILES
+        .iter()
+        .all(|f| state_dir(root).join(f).is_file())
 }
 
 fn parse_snap_pos(name: &str) -> Option<u64> {
-    name.strip_prefix(SNAP_PREFIX)?.strip_suffix(SNAP_SUFFIX)?.parse().ok()
+    name.strip_prefix(SNAP_PREFIX)?
+        .strip_suffix(SNAP_SUFFIX)?
+        .parse()
+        .ok()
 }
 
 /// Copy every regular file directly under `src` matching `keep` into `dst`
@@ -351,11 +368,7 @@ fn copy_dir_sorted(
 
 /// One attempt at [`copy_dir_sorted`]'s job — no retry, no partial-copy
 /// cleanup on failure (the caller owns both).
-fn copy_dir_sorted_once(
-    src: &Path,
-    dst: &Path,
-    keep: &impl Fn(&str) -> bool,
-) -> io::Result<usize> {
+fn copy_dir_sorted_once(src: &Path, dst: &Path, keep: &impl Fn(&str) -> bool) -> io::Result<usize> {
     fs::create_dir_all(dst)?;
     let mut names: Vec<String> = fs::read_dir(src)?
         .filter_map(|e| e.ok())
@@ -384,7 +397,10 @@ fn snapshot_ids_present(root: &Path) -> io::Result<Vec<u8>> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        if let Some(id) = entry.file_name().to_str().and_then(|n| n.parse::<u8>().ok())
+        if let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u8>().ok())
             && (id as usize) < CNC_MAX_SERVICES
         {
             ids.push(id);
@@ -511,11 +527,12 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     // only, never grow) instead of an in-memory cursor reset — still exactly
     // the one permitted mutation the module doc promises, just visible on
     // disk instead of invisible.
-    let archive_cfg =
-        ArchiveConfig { preallocate_segments: false, ..ArchiveConfig::new(journal_dir(artifact)) };
+    let archive_cfg = ArchiveConfig {
+        preallocate_segments: false,
+        ..ArchiveConfig::new(journal_dir(artifact))
+    };
     let journal_files = count_files(&journal_dir(artifact), is_journal_segment_name)?;
-    let archive =
-        Archive::open(archive_cfg).map_err(|e| BackupError::Io(io::Error::other(e)))?;
+    let archive = Archive::open(archive_cfg).map_err(|e| BackupError::Io(io::Error::other(e)))?;
     let journal_first_base = archive.first_base();
     let journal_last_pos = archive.recovered_position();
     let healed_torn_tail = archive.healed_torn_tail();
@@ -650,7 +667,11 @@ pub fn restore_artifact(artifact: &Path, instance_dir: &Path) -> Result<BackupRe
     // way out of.
     refuse_if_live_instance_dir(instance_dir)?;
 
-    for dir in [journal_dir(instance_dir), state_dir(instance_dir), snapshots_dir(instance_dir)] {
+    for dir in [
+        journal_dir(instance_dir),
+        state_dir(instance_dir),
+        snapshots_dir(instance_dir),
+    ] {
         if dir.is_dir() && fs::read_dir(&dir)?.next().is_some() {
             return Err(BackupError::TargetNotEmpty);
         }
@@ -721,7 +742,9 @@ fn scan_snapshots(dir: &Path) -> io::Result<(Option<u64>, usize)> {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pos) = parse_snap_pos(name) else { continue };
+        let Some(pos) = parse_snap_pos(name) else {
+            continue;
+        };
         count += 1;
         newest = Some(newest.map_or(pos, |n| n.max(pos)));
     }
@@ -750,8 +773,10 @@ fn manifest_value(newest_snapshot: Option<u64>) -> String {
 }
 
 fn write_manifest(dir: &Path, report: &BackupReport) -> Result<(), BackupError> {
-    let created_unix_ns =
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let created_unix_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let mut contents = format!(
         "format={}\njournal_first_base={}\njournal_last_pos={}\n",
         MANIFEST_FORMAT, report.journal_first_base, report.journal_last_pos,
@@ -785,7 +810,8 @@ fn check_manifest(path: &Path, report: &BackupReport) -> Result<(), BackupError>
     let map = parse_manifest(&text);
 
     let get = |key: &str| -> Result<&String, BackupError> {
-        map.get(key).ok_or_else(|| BackupError::ManifestMismatch(format!("missing key {key}")))
+        map.get(key)
+            .ok_or_else(|| BackupError::ManifestMismatch(format!("missing key {key}")))
     };
     let parse_u64 = |key: &str, raw: &str| -> Result<u64, BackupError> {
         raw.parse().map_err(|_| {
@@ -800,7 +826,9 @@ fn check_manifest(path: &Path, report: &BackupReport) -> Result<(), BackupError>
 
     let format = get("format")?;
     if format != MANIFEST_FORMAT {
-        return Err(BackupError::ManifestMismatch(format!("unknown format {format:?}")));
+        return Err(BackupError::ManifestMismatch(format!(
+            "unknown format {format:?}"
+        )));
     }
 
     let jfb = parse_u64("journal_first_base", get("journal_first_base")?)?;
@@ -824,16 +852,27 @@ fn check_manifest(path: &Path, report: &BackupReport) -> Result<(), BackupError>
     for id in 0..CNC_MAX_SERVICES {
         let key = format!("newest_snapshot.{id}");
         let raw = get(&key)?;
-        let ns: Option<u64> =
-            if raw == "none" { None } else { Some(parse_u64(&key, raw)?) };
+        let ns: Option<u64> = if raw == "none" {
+            None
+        } else {
+            Some(parse_u64(&key, raw)?)
+        };
         if ns != report.newest_snapshots[id] {
-            return Err(mismatch(&key, manifest_value(ns), manifest_value(report.newest_snapshots[id])));
+            return Err(mismatch(
+                &key,
+                manifest_value(ns),
+                manifest_value(report.newest_snapshots[id]),
+            ));
         }
     }
 
     let sf = parse_u64("snapshot_floor", get("snapshot_floor")?)?;
     if sf != report.snapshot_floor {
-        return Err(mismatch("snapshot_floor", sf.to_string(), report.snapshot_floor.to_string()));
+        return Err(mismatch(
+            "snapshot_floor",
+            sf.to_string(),
+            report.snapshot_floor.to_string(),
+        ));
     }
 
     // `healed_torn_tail` is NOT a stable, re-derivable property of the
@@ -953,8 +992,9 @@ mod tests {
         // reopen of the now-clean artifact correctly finds no torn tail).
         let mut reverified = healed_at_backup_time;
         reverified.healed_torn_tail = false;
-        check_manifest(&dir.path().join("MANIFEST"), &reverified)
-            .expect("manifest=true, actual=false must be accepted (expected post-heal steady state)");
+        check_manifest(&dir.path().join("MANIFEST"), &reverified).expect(
+            "manifest=true, actual=false must be accepted (expected post-heal steady state)",
+        );
     }
 
     /// The other direction stays a real mismatch: a manifest that recorded NO

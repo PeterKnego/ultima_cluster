@@ -28,11 +28,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lincheck_v2::{ClusterCfg, LinClusterV2, join_workers, serialize, spawn_workers, spawn_workers2};
-use uc_net::fault::FaultConfig;
+use lincheck_v2::{
+    ClusterCfg, LinClusterV2, join_workers, serialize, spawn_workers, spawn_workers2,
+};
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History, Outcome};
 use uc_lincheck::model::Op;
+use uc_net::fault::FaultConfig;
 
 /// Hold a partition long enough to guarantee an election + a settled loss window
 /// (election_timeout_max = 300 ms here, so a few hundred ms would do; 3.5 s is
@@ -79,7 +81,10 @@ fn dump_history(entries: &[Entry], seed: u64, label: &str) {
 /// is a TRANSIENT → `Err`, so the scenario is retried. `Linearizable` passes.
 fn check_or_transient(entries: &[Entry], seed: u64, label: &str) -> Result<(), String> {
     let ok = History::ok_count(entries);
-    eprintln!("[lin_partition_v2::{label}] seed={seed} ops={} ok={ok}", entries.len());
+    eprintln!(
+        "[lin_partition_v2::{label}] seed={seed} ops={} ok={ok}",
+        entries.len()
+    );
     match check_register(entries) {
         Verdict::Linearizable => Ok(()),
         Verdict::Inconclusive => Err(format!("checker Inconclusive (seed={seed}) — retrying")),
@@ -135,7 +140,15 @@ impl Run {
         let stop = Arc::new(AtomicBool::new(false));
         let last_seen = Arc::new(AtomicU64::new(0));
         let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, 3);
-        Run { _dir: dir, cluster, history, h1: None, equiv: Arc::new(AtomicU64::new(0)), stop, handles }
+        Run {
+            _dir: dir,
+            cluster,
+            history,
+            h1: None,
+            equiv: Arc::new(AtomicU64::new(0)),
+            stop,
+            handles,
+        }
     }
 
     /// As [`start_cfg`](Self::start_cfg) but for a two-FSM cluster (M14c2
@@ -169,9 +182,18 @@ impl Run {
         let equiv = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let last_seen = Arc::new(AtomicU64::new(0));
-        let handles =
-            spawn_workers2(&dirs, &history, &h1, &equiv, &stop, &last_seen, seed, THROTTLE, 3);
-        Run { _dir: dir, cluster, history, h1: Some(h1), equiv, stop, handles }
+        let handles = spawn_workers2(
+            &dirs, &history, &h1, &equiv, &stop, &last_seen, seed, THROTTLE, 3,
+        );
+        Run {
+            _dir: dir,
+            cluster,
+            history,
+            h1: Some(h1),
+            equiv,
+            stop,
+            handles,
+        }
     }
 
     fn ok_now(&self) -> usize {
@@ -185,7 +207,10 @@ impl Run {
         self.stop.store(true, Ordering::Relaxed);
         join_workers(self.handles);
         self.cluster.stop();
-        Arc::try_unwrap(self.history).ok().expect("sole history owner").into_entries()
+        Arc::try_unwrap(self.history)
+            .ok()
+            .expect("sole history owner")
+            .into_entries()
     }
 
     /// [`finish`](Self::finish)'s two-FSM twin: stops workers + cluster, then
@@ -197,7 +222,10 @@ impl Run {
         join_workers(self.handles);
         self.cluster.stop();
         let equiv_n = self.equiv.load(Ordering::Relaxed);
-        let h0 = Arc::try_unwrap(self.history).ok().expect("sole h0 owner").into_entries();
+        let h0 = Arc::try_unwrap(self.history)
+            .ok()
+            .expect("sole h0 owner")
+            .into_entries();
         let h1 = Arc::try_unwrap(self.h1.expect("finish_two requires a two-FSM Run"))
             .ok()
             .expect("sole h1 owner")
@@ -247,7 +275,9 @@ fn run_minority(seed: u64, ccfg: ClusterCfg, two_fsm: bool) -> Result<(), String
         let (entries0, entries1, equiv_n) = r.finish_two();
 
         if !majority_progressed {
-            return Err(format!("majority did not progress during minority partition ({before} -> {after})"));
+            return Err(format!(
+                "majority did not progress during minority partition ({before} -> {after})"
+            ));
         }
         if History::ok_count(&entries0) < MIN_OK || History::ok_count(&entries1) < MIN_OK {
             return Err("too few Ok ops; run is vacuous".into());
@@ -262,7 +292,9 @@ fn run_minority(seed: u64, ccfg: ClusterCfg, two_fsm: bool) -> Result<(), String
         let entries = r.finish();
 
         if !majority_progressed {
-            return Err(format!("majority did not progress during minority partition ({before} -> {after})"));
+            return Err(format!(
+                "majority did not progress during minority partition ({before} -> {after})"
+            ));
         }
         if History::ok_count(&entries) < MIN_OK {
             return Err("too few Ok ops; run is vacuous".into());
@@ -287,11 +319,16 @@ fn minority_partition_and_heal() {
 #[test]
 fn minority_partition_and_heal_with_crypto() {
     let _g = serialize();
-    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        crypto: true,
+        ..ClusterCfg::default()
+    };
     for attempt in 1..=3 {
         match run_minority(7, ccfg, false) {
             Ok(()) => return,
-            Err(e) => eprintln!("[lin_partition_v2::minority-crypto] attempt {attempt}/3 transient: {e}"),
+            Err(e) => {
+                eprintln!("[lin_partition_v2::minority-crypto] attempt {attempt}/3 transient: {e}")
+            }
         }
     }
     panic!("minority-with-crypto: failed after 3 transient attempts");
@@ -306,13 +343,17 @@ fn minority_partition_and_heal_with_crypto() {
 fn minority_partition_and_heal_two_fsm() {
     let _g = serialize();
     let ccfg = ClusterCfg {
-        services: lincheck_v2::FsmSet::Two { lag: uc_node::FsmLag::Bounded(64 * 1024) },
+        services: lincheck_v2::FsmSet::Two {
+            lag: uc_node::FsmLag::Bounded(64 * 1024),
+        },
         ..ClusterCfg::default()
     };
     for attempt in 1..=3 {
         match run_minority(7, ccfg, true) {
             Ok(()) => return,
-            Err(e) => eprintln!("[lin_partition_v2::minority-two-fsm] attempt {attempt}/3 transient: {e}"),
+            Err(e) => {
+                eprintln!("[lin_partition_v2::minority-two-fsm] attempt {attempt}/3 transient: {e}")
+            }
         }
     }
     panic!("minority-two-fsm: failed after 3 transient attempts");
@@ -327,7 +368,10 @@ fn run_leader_isolation(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
     let old_leader = r.cluster.leader().ok_or("no pre-partition leader")?;
 
     let isolated = r.cluster.partition_leader();
-    assert_eq!(isolated, old_leader, "partition_leader isolated a non-leader");
+    assert_eq!(
+        isolated, old_leader,
+        "partition_leader isolated a non-leader"
+    );
     std::thread::sleep(HOLD);
 
     // The majority must elect a NEW leader that can COMMIT. Only the real leader
@@ -384,7 +428,9 @@ fn leader_isolation_elects_new_leader() {
     for attempt in 1..=3 {
         match run_leader_isolation(42, ClusterCfg::default()) {
             Ok(()) => return,
-            Err(e) => eprintln!("[lin_partition_v2::leader-isolation] attempt {attempt}/3 transient: {e}"),
+            Err(e) => {
+                eprintln!("[lin_partition_v2::leader-isolation] attempt {attempt}/3 transient: {e}")
+            }
         }
     }
     panic!("leader-isolation: failed after 3 transient attempts");
@@ -394,12 +440,17 @@ fn leader_isolation_elects_new_leader() {
 #[test]
 fn leader_isolation_elects_new_leader_with_crypto() {
     let _g = serialize();
-    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        crypto: true,
+        ..ClusterCfg::default()
+    };
     for attempt in 1..=3 {
         match run_leader_isolation(42, ccfg) {
             Ok(()) => return,
             Err(e) => {
-                eprintln!("[lin_partition_v2::leader-isolation-crypto] attempt {attempt}/3 transient: {e}")
+                eprintln!(
+                    "[lin_partition_v2::leader-isolation-crypto] attempt {attempt}/3 transient: {e}"
+                )
             }
         }
     }
@@ -420,7 +471,10 @@ fn run_quorum_loss(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
     let hi = r.ok_now();
     // SAFETY (live, never retried): no op may commit `Ok` during total quorum
     // loss — an increase is a false ack / split-brain.
-    assert_eq!(lo, hi, "ops committed Ok during total quorum loss ({lo} -> {hi}) — false ack");
+    assert_eq!(
+        lo, hi,
+        "ops committed Ok during total quorum loss ({lo} -> {hi}) — false ack"
+    );
 
     r.cluster.heal();
     r.cluster.await_reconverged(20);
@@ -433,7 +487,9 @@ fn run_quorum_loss(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
     let entries = r.finish();
 
     if !resumed {
-        return Err(format!("cluster did not resume after heal ({resumed_from} -> {resumed_to})"));
+        return Err(format!(
+            "cluster did not resume after heal ({resumed_from} -> {resumed_to})"
+        ));
     }
     if History::ok_count(&entries) < MIN_OK {
         return Err("too few Ok ops; run is vacuous".into());
@@ -447,7 +503,9 @@ fn total_quorum_loss_fails_clean_then_recovers() {
     for attempt in 1..=3 {
         match run_quorum_loss(88_888, ClusterCfg::default()) {
             Ok(()) => return,
-            Err(e) => eprintln!("[lin_partition_v2::quorum-loss] attempt {attempt}/3 transient: {e}"),
+            Err(e) => {
+                eprintln!("[lin_partition_v2::quorum-loss] attempt {attempt}/3 transient: {e}")
+            }
         }
     }
     panic!("quorum-loss: failed after 3 transient attempts");
@@ -457,11 +515,16 @@ fn total_quorum_loss_fails_clean_then_recovers() {
 #[test]
 fn total_quorum_loss_fails_clean_then_recovers_with_crypto() {
     let _g = serialize();
-    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        crypto: true,
+        ..ClusterCfg::default()
+    };
     for attempt in 1..=3 {
         match run_quorum_loss(88_888, ccfg) {
             Ok(()) => return,
-            Err(e) => eprintln!("[lin_partition_v2::quorum-loss-crypto] attempt {attempt}/3 transient: {e}"),
+            Err(e) => eprintln!(
+                "[lin_partition_v2::quorum-loss-crypto] attempt {attempt}/3 transient: {e}"
+            ),
         }
     }
     panic!("quorum-loss-with-crypto: failed after 3 transient attempts");
@@ -473,7 +536,11 @@ fn run_lossy_links(seed: u64) -> Result<(), String> {
     // 10 % inbound drop on every ordered link (each node's sockets). Under UDP
     // this forces NAK/retransmit on ~1-in-10 datagrams; the cluster must elect,
     // progress, and stay linearizable through it.
-    let faults = FaultConfig { seed, drop_per_million: 100_000, ..FaultConfig::default() };
+    let faults = FaultConfig {
+        seed,
+        drop_per_million: 100_000,
+        ..FaultConfig::default()
+    };
     let r = Run::start(seed, faults);
 
     std::thread::sleep(Duration::from_millis(1000)); // warm up on the lossy link
@@ -486,7 +553,9 @@ fn run_lossy_links(seed: u64) -> Result<(), String> {
     let entries = r.finish();
 
     if !progressed {
-        return Err(format!("cluster did not progress under 10% link loss ({before} -> {after})"));
+        return Err(format!(
+            "cluster did not progress under 10% link loss ({before} -> {after})"
+        ));
     }
     if History::ok_count(&entries) < MIN_OK {
         return Err("too few Ok ops; run is vacuous".into());

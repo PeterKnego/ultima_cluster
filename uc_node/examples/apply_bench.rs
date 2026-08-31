@@ -29,10 +29,10 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{CncMeta, CncPage, unpack_service_status};
-use uc_service::{RawStateMachine, ServiceBuilder, ServiceConfig};
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
+use uc_service::{RawStateMachine, ServiceBuilder, ServiceConfig};
 
 const APP: &str = "apply-bench";
 const MIB: u64 = 1 << 20;
@@ -94,25 +94,41 @@ impl RawStateMachine for RawCount {
 }
 
 fn unix_ns() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 fn min_applied(cnc: &CncPage, fsms: u8) -> u64 {
-    (0..fsms).map(|id| cnc.service_slot(id as usize).applied.load_acquire()).min().unwrap_or(0)
+    (0..fsms)
+        .map(|id| cnc.service_slot(id as usize).applied.load_acquire())
+        .min()
+        .unwrap_or(0)
 }
 
 fn main() -> anyhow::Result<()> {
     let a = Args::parse();
-    anyhow::ensure!(!a.root.starts_with("/tmp"), "--root must not be under /tmp (RAM-backed, no swap)");
+    anyhow::ensure!(
+        !a.root.starts_with("/tmp"),
+        "--root must not be under /tmp (RAM-backed, no swap)"
+    );
     anyhow::ensure!((1..=8).contains(&a.fsms), "--fsms must be 1..=8");
-    anyhow::ensure!(a.payload as u32 <= MAX_PAYLOAD, "--payload must be <= {MAX_PAYLOAD}");
+    anyhow::ensure!(
+        a.payload as u32 <= MAX_PAYLOAD,
+        "--payload must be <= {MAX_PAYLOAD}"
+    );
     let lockstep = match a.mode.as_str() {
         "bounded" => false,
         "lockstep" => true,
         m => anyhow::bail!("--mode must be bounded|lockstep, got {m}"),
     };
     let buffer_bytes = a.buffer_mib * MIB;
-    let lag = if lockstep { 0 } else { a.lag.unwrap_or(buffer_bytes / 4) };
+    let lag = if lockstep {
+        0
+    } else {
+        a.lag.unwrap_or(buffer_bytes / 4)
+    };
     let window = a.window.unwrap_or(buffer_bytes / 2);
     let frame = align_frame_len(HEADER_LEN + a.payload) as u64;
 
@@ -131,7 +147,9 @@ fn main() -> anyhow::Result<()> {
     let mask = (1u64 << a.fsms) - 1;
     cnc.store_services_declared(mask);
     cnc.store_fsm_lag_bytes(lag);
-    cnc.status().flags.store_release(NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE);
+    cnc.status()
+        .flags
+        .store_release(NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE);
     cnc.status().leader_hint.store_release(0);
     cnc.status().node_heartbeat_ns.store_release(unix_ns());
     let buffer = Arc::new(LogBuffer::create_file(
@@ -145,8 +163,12 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(a.root.join("snapshots").join(id.to_string()))?;
         let q = SpscRing::create(&a.root.join(format!("svc_query.{id}.ring")), MIB, MAX_MSG)
             .map_err(|e| anyhow::anyhow!("svc_query ring: {e}"))?;
-        let e = BroadcastRing::create(&a.root.join(format!("egress_service.{id}.broadcast")), 4 * MIB, MAX_MSG)
-            .map_err(|e| anyhow::anyhow!("egress ring: {e}"))?;
+        let e = BroadcastRing::create(
+            &a.root.join(format!("egress_service.{id}.broadcast")),
+            4 * MIB,
+            MAX_MSG,
+        )
+        .map_err(|e| anyhow::anyhow!("egress ring: {e}"))?;
         rings.push((q, e));
     }
 
@@ -154,11 +176,25 @@ fn main() -> anyhow::Result<()> {
     let mut services = Vec::new();
     for id in 0..a.fsms {
         let cfg = ServiceConfig::new(&a.root, APP).service_id(id);
-        services.push(ServiceBuilder::new(cfg, RawCount { frames: 0, last: None }).start()?);
+        services.push(
+            ServiceBuilder::new(
+                cfg,
+                RawCount {
+                    frames: 0,
+                    last: None,
+                },
+            )
+            .start()?,
+        );
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while (0..a.fsms).any(|id| !unpack_service_status(cnc.service_slot(id as usize).status.load_acquire()).1) {
-        anyhow::ensure!(Instant::now() < deadline, "FSMs did not all attach within 10 s");
+    while (0..a.fsms)
+        .any(|id| !unpack_service_status(cnc.service_slot(id as usize).status.load_acquire()).1)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "FSMs did not all attach within 10 s"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
 
@@ -171,39 +207,43 @@ fn main() -> anyhow::Result<()> {
         let stop = Arc::clone(&stop);
         let appended = Arc::clone(&appended);
         let (fsms, batch, payload_len) = (a.fsms, a.batch, a.payload);
-        std::thread::Builder::new().name("apply-bench-driver".into()).spawn(move || {
-            let mut app = Appender::new(buffer, 1);
-            let payload = vec![0x42u8; payload_len];
-            let mut n = 0u64;
-            let mut stalls = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                match app.append(0, n, &payload) {
-                    Ok(_) => {
-                        n += 1;
-                        if n.is_multiple_of(batch) {
-                            let p = app.position();
-                            let c = cnc.counters();
-                            c.durable.store_release(p);
-                            c.commit.store_release(p);
-                            appended.store(n, Ordering::Relaxed);
-                            // Pace on the slowest FSM: the apply hop is the
-                            // thing under test, never the driver.
-                            while !stop.load(Ordering::Relaxed) && p - min_applied(&cnc, fsms) > window {
-                                stalls += 1;
-                                std::hint::spin_loop();
+        std::thread::Builder::new()
+            .name("apply-bench-driver".into())
+            .spawn(move || {
+                let mut app = Appender::new(buffer, 1);
+                let payload = vec![0x42u8; payload_len];
+                let mut n = 0u64;
+                let mut stalls = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    match app.append(0, n, &payload) {
+                        Ok(_) => {
+                            n += 1;
+                            if n.is_multiple_of(batch) {
+                                let p = app.position();
+                                let c = cnc.counters();
+                                c.durable.store_release(p);
+                                c.commit.store_release(p);
+                                appended.store(n, Ordering::Relaxed);
+                                // Pace on the slowest FSM: the apply hop is the
+                                // thing under test, never the driver.
+                                while !stop.load(Ordering::Relaxed)
+                                    && p - min_applied(&cnc, fsms) > window
+                                {
+                                    stalls += 1;
+                                    std::hint::spin_loop();
+                                }
                             }
                         }
+                        Err(AppendError::WouldOverrun) => std::thread::yield_now(),
+                        Err(e) => panic!("append: {e:?}"),
                     }
-                    Err(AppendError::WouldOverrun) => std::thread::yield_now(),
-                    Err(e) => panic!("append: {e:?}"),
                 }
-            }
-            let p = app.position();
-            cnc.counters().durable.store_release(p);
-            cnc.counters().commit.store_release(p);
-            appended.store(n, Ordering::Relaxed);
-            stalls
-        })?
+                let p = app.position();
+                cnc.counters().durable.store_release(p);
+                cnc.counters().commit.store_release(p);
+                appended.store(n, Ordering::Relaxed);
+                stalls
+            })?
     };
 
     // ---- measure ----
@@ -236,17 +276,31 @@ fn main() -> anyhow::Result<()> {
         let rate = frames as f64 / elapsed;
         let waits = after[id].1 - before[id].1;
         per.push((rate, waits));
-        println!("fsm={id} applied_frames/s={rate:.0} MB/s={:.1} lag_waits={waits}", rate * frame as f64 / 1e6);
+        println!(
+            "fsm={id} applied_frames/s={rate:.0} MB/s={:.1} lag_waits={waits}",
+            rate * frame as f64 / 1e6
+        );
     }
     let min_rate = per.iter().map(|p| p.0).fold(f64::MAX, f64::min);
     let driver_rate = (appended1 - appended0) as f64 / elapsed;
     println!("driver appended_frames/s={driver_rate:.0} pace_stalls={stalls}");
     println!("hop: min applied_frames/s={min_rate:.0}");
-    let per_json: Vec<String> =
-        per.iter().enumerate().map(|(i, p)| format!("{{\"fsm\":{i},\"rate\":{:.0},\"lag_waits\":{}}}", p.0, p.1)).collect();
+    let per_json: Vec<String> = per
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{{\"fsm\":{i},\"rate\":{:.0},\"lag_waits\":{}}}", p.0, p.1))
+        .collect();
     println!(
         "APPLY-JSON {{\"fsms\":{},\"mode\":\"{}\",\"lag\":{},\"payload\":{},\"frame\":{},\"secs\":{:.2},\"min_rate\":{:.0},\"driver_rate\":{:.0},\"per\":[{}]}}",
-        a.fsms, a.mode, lag, a.payload, frame, elapsed, min_rate, driver_rate, per_json.join(",")
+        a.fsms,
+        a.mode,
+        lag,
+        a.payload,
+        frame,
+        elapsed,
+        min_rate,
+        driver_rate,
+        per_json.join(",")
     );
 
     // The SM's own count: proves the cursor sweep applied every frame (not
@@ -257,7 +311,10 @@ fn main() -> anyhow::Result<()> {
         s.query_raw(&[], &mut out);
         let sm_frames = u64::from_le_bytes(out[..8].try_into().unwrap());
         let swept = cnc.service_slot(id).applied.load_acquire() / frame;
-        println!("fsm={id} sm_frames={sm_frames} swept_frames={swept}{}", if sm_frames == swept { "" } else { " MISMATCH" });
+        println!(
+            "fsm={id} sm_frames={sm_frames} swept_frames={swept}{}",
+            if sm_frames == swept { "" } else { " MISMATCH" }
+        );
     }
     for s in services {
         s.stop();

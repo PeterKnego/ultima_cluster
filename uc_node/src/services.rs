@@ -33,7 +33,10 @@ pub struct ServicesConfig {
 
 impl Default for ServicesConfig {
     fn default() -> Self {
-        Self { declared: 0b1, fsm_lag: None }
+        Self {
+            declared: 0b1,
+            fsm_lag: None,
+        }
     }
 }
 
@@ -43,12 +46,17 @@ impl ServicesConfig {
     /// default responder and the only FSM the remote path reaches).
     pub fn from_ids(ids: &[u8], fsm_lag: Option<FsmLag>) -> Result<Self, String> {
         if ids.is_empty() {
-            return Err("services.ids must not be empty (omit the [services] section for the default [0])".into());
+            return Err(
+                "services.ids must not be empty (omit the [services] section for the default [0])"
+                    .into(),
+            );
         }
         let mut declared = 0u64;
         for &id in ids {
             if id as usize >= CNC_MAX_SERVICES {
-                return Err(format!("services.ids: service id {id} is out of range (0..{CNC_MAX_SERVICES})"));
+                return Err(format!(
+                    "services.ids: service id {id} is out of range (0..{CNC_MAX_SERVICES})"
+                ));
             }
             if declared & (1 << id) != 0 {
                 return Err(format!("services.ids: duplicate service id {id}"));
@@ -56,7 +64,9 @@ impl ServicesConfig {
             declared |= 1 << id;
         }
         if declared & 1 == 0 {
-            return Err("services.ids: service id 0 must be declared (it is the default responder)".into());
+            return Err(
+                "services.ids: service id 0 must be declared (it is the default responder)".into(),
+            );
         }
         Ok(Self { declared, fsm_lag })
     }
@@ -68,7 +78,9 @@ impl ServicesConfig {
     pub fn from_cli(ids: Option<&str>, fsm_lag: Option<&str>) -> Result<Self, String> {
         let lag = match fsm_lag {
             None => None,
-            Some(raw) => Some(parse_fsm_lag(raw.trim()).map_err(|d| format!("--fsm-lag {raw:?}: {d}"))?),
+            Some(raw) => {
+                Some(parse_fsm_lag(raw.trim()).map_err(|d| format!("--fsm-lag {raw:?}: {d}"))?)
+            }
         };
         match ids {
             None if lag.is_none() => Ok(Self::default()),
@@ -76,7 +88,11 @@ impl ServicesConfig {
             Some(list) => {
                 let ids = list
                     .split(',')
-                    .map(|s| s.trim().parse::<u8>().map_err(|e| format!("--services {list:?}: {s:?} is not an id ({e})")))
+                    .map(|s| {
+                        s.trim()
+                            .parse::<u8>()
+                            .map_err(|e| format!("--services {list:?}: {s:?} is not an id ({e})"))
+                    })
                     .collect::<Result<Vec<u8>, String>>()?;
                 Self::from_ids(&ids, lag).map_err(|d| format!("--services {list:?}: {d}"))
             }
@@ -91,7 +107,10 @@ impl ServicesConfig {
     /// service that was never going to attach.
     #[doc(hidden)]
     pub fn none_for_tests() -> Self {
-        Self { declared: 0, fsm_lag: None }
+        Self {
+            declared: 0,
+            fsm_lag: None,
+        }
     }
 
     pub fn declared(&self) -> u64 {
@@ -261,7 +280,11 @@ pub fn parse_fsm_lag(s: &str) -> Result<FsmLag, String> {
 /// The door/ceiling term (spec §5.2): the byte bound, or one max-size frame
 /// under lockstep ("at most one frame past the FSMs"). `None` ⇔ nothing
 /// declared ⇔ no FSM term at all.
-pub fn fsm_lag_eff(services: &ServicesConfig, buffer_bytes: u64, max_payload: usize) -> Option<u64> {
+pub fn fsm_lag_eff(
+    services: &ServicesConfig,
+    buffer_bytes: u64,
+    max_payload: usize,
+) -> Option<u64> {
     if services.declared() == 0 {
         return None;
     }
@@ -329,7 +352,10 @@ mod tests {
 
     #[test]
     fn from_cli_absent_is_default_and_both_flags_parse() {
-        assert_eq!(ServicesConfig::from_cli(None, None).unwrap().declared(), 0b1);
+        assert_eq!(
+            ServicesConfig::from_cli(None, None).unwrap().declared(),
+            0b1
+        );
         let s = ServicesConfig::from_cli(Some("0, 1"), Some("65536")).unwrap();
         assert_eq!(s.declared(), 0b11);
         assert_eq!(s.resolve_lag(1 << 20), FsmLag::Bounded(65536));
@@ -343,21 +369,56 @@ mod tests {
 
     #[test]
     fn from_cli_refuses_by_flag_name() {
-        assert!(ServicesConfig::from_cli(Some("1"), None).unwrap_err().starts_with("--services"));
-        assert!(ServicesConfig::from_cli(Some("0,x"), None).unwrap_err().starts_with("--services"));
-        assert!(ServicesConfig::from_cli(Some("0"), Some("bogus")).unwrap_err().starts_with("--fsm-lag"));
+        assert!(
+            ServicesConfig::from_cli(Some("1"), None)
+                .unwrap_err()
+                .starts_with("--services")
+        );
+        assert!(
+            ServicesConfig::from_cli(Some("0,x"), None)
+                .unwrap_err()
+                .starts_with("--services")
+        );
+        assert!(
+            ServicesConfig::from_cli(Some("0"), Some("bogus"))
+                .unwrap_err()
+                .starts_with("--fsm-lag")
+        );
     }
 
     #[test]
     fn lag_validation_refuses_half_the_ring_and_zero() {
         let buf = 4u64 << 20;
-        ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded((buf / 2) - 1))).unwrap().validate(buf).unwrap();
-        let e = ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(buf / 2))).unwrap().validate(buf).unwrap_err();
-        assert!(e.contains("services.fsm_lag must be below buffer_bytes / 2"), "{e}");
-        let e = ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(0))).unwrap().validate(buf).unwrap_err();
-        assert!(e.contains("services.fsm_lag = 0 is not a bound; write \"lockstep\""), "{e}");
-        ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap().validate(buf).unwrap();
-        assert_eq!(ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap().page_lag_value(buf), 0);
+        ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded((buf / 2) - 1)))
+            .unwrap()
+            .validate(buf)
+            .unwrap();
+        let e = ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(buf / 2)))
+            .unwrap()
+            .validate(buf)
+            .unwrap_err();
+        assert!(
+            e.contains("services.fsm_lag must be below buffer_bytes / 2"),
+            "{e}"
+        );
+        let e = ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(0)))
+            .unwrap()
+            .validate(buf)
+            .unwrap_err();
+        assert!(
+            e.contains("services.fsm_lag = 0 is not a bound; write \"lockstep\""),
+            "{e}"
+        );
+        ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep))
+            .unwrap()
+            .validate(buf)
+            .unwrap();
+        assert_eq!(
+            ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep))
+                .unwrap()
+                .page_lag_value(buf),
+            0
+        );
     }
 
     #[test]
@@ -372,7 +433,11 @@ mod tests {
     #[test]
     fn service_mins_is_the_min_over_declared_ids_and_ignores_undeclared_slots() {
         let page = uc_log::cnc::CncPage::heap(&uc_log::cnc::CncMeta {
-            node_id: 1, instance_id: 7, app_id: "t".into(), buffer_bytes: 1 << 20, max_payload: 256,
+            node_id: 1,
+            instance_id: 7,
+            app_id: "t".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
         });
         let s = ServicesConfig::from_ids(&[0, 2], None).unwrap();
         page.service_slot(0).applied.store_release(500);
@@ -385,7 +450,15 @@ mod tests {
         page.service_slot(2).heartbeat_ns.store_release(2_000);
         page.service_slot(1).applied.store_release(1); // undeclared: must not count
         let m = service_mins(&page, &s).unwrap();
-        assert_eq!(m, ServiceMins { applied: 200, snapshot_pos: 400, output_completed: 50, heartbeat_ns: 1_000 });
+        assert_eq!(
+            m,
+            ServiceMins {
+                applied: 200,
+                snapshot_pos: 400,
+                output_completed: 50,
+                heartbeat_ns: 1_000
+            }
+        );
         // A declared-but-dormant id (slot 2 zeroed) drags every min to 0 — spec §5.1, intentional.
         page.service_slot(2).applied.store_release(0);
         page.service_slot(2).snapshot_pos.store_release(0);
@@ -401,7 +474,16 @@ mod tests {
         assert_eq!(parse_fsm_lag("64KiB"), Ok(FsmLag::Bounded(64 << 10)));
         assert_eq!(parse_fsm_lag("16MiB"), Ok(FsmLag::Bounded(16 << 20)));
         assert_eq!(parse_fsm_lag("1GiB"), Ok(FsmLag::Bounded(1 << 30)));
-        for bad in ["", "16 MiB", "16mb", "MiB", "1.5MiB", "-1", "99999999999GiB", "Lockstep"] {
+        for bad in [
+            "",
+            "16 MiB",
+            "16mb",
+            "MiB",
+            "1.5MiB",
+            "-1",
+            "99999999999GiB",
+            "Lockstep",
+        ] {
             let e = parse_fsm_lag(bad).unwrap_err();
             assert!(e.contains("services.fsm_lag"), "{bad:?}: {e}");
         }
@@ -411,19 +493,51 @@ mod tests {
     fn fsm_lag_eff_table() {
         let b = 4u64 << 20;
         assert_eq!(fsm_lag_eff(&ServicesConfig::none_for_tests(), b, 256), None);
-        assert_eq!(fsm_lag_eff(&ServicesConfig::default(), b, 256), Some(1 << 20));
-        assert_eq!(fsm_lag_eff(&ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(4096))).unwrap(), b, 256), Some(4096));
+        assert_eq!(
+            fsm_lag_eff(&ServicesConfig::default(), b, 256),
+            Some(1 << 20)
+        );
+        assert_eq!(
+            fsm_lag_eff(
+                &ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(4096))).unwrap(),
+                b,
+                256
+            ),
+            Some(4096)
+        );
         // Lockstep: one max-size frame — header 32 + 256 payload, 32-aligned = 288.
-        assert_eq!(fsm_lag_eff(&ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(), b, 256), Some(288));
-        assert_eq!(fsm_lag_eff(&ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(), b, 1), Some(64));
+        assert_eq!(
+            fsm_lag_eff(
+                &ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(),
+                b,
+                256
+            ),
+            Some(288)
+        );
+        assert_eq!(
+            fsm_lag_eff(
+                &ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(),
+                b,
+                1
+            ),
+            Some(64)
+        );
     }
 
     #[test]
     fn report_ceiling_never_exceeds_validated_and_is_inert_without_fsms() {
         assert_eq!(report_ceiling(10_000, 2_000, Some(4_096)), 6_096);
         assert_eq!(report_ceiling(10_000, 9_000, Some(4_096)), 10_000);
-        assert_eq!(report_ceiling(10_000, 0, Some(4_096)), 4_096, "absent FSMs cap the report at the bound");
-        assert_eq!(report_ceiling(10_000, u64::MAX, Some(4_096)), 10_000, "saturating add");
+        assert_eq!(
+            report_ceiling(10_000, 0, Some(4_096)),
+            4_096,
+            "absent FSMs cap the report at the bound"
+        );
+        assert_eq!(
+            report_ceiling(10_000, u64::MAX, Some(4_096)),
+            10_000,
+            "saturating add"
+        );
         assert_eq!(report_ceiling(10_000, 0, None), 10_000);
     }
 }

@@ -114,9 +114,18 @@ mod v2_tests {
         let mut sm = ListAppendSm::default();
         assert_eq!(sm.last_applied(), None);
         assert_eq!(sm.query(LaRead { key: 7 }), Vec::<u64>::new());
-        assert_eq!(sm.apply(128, LaCmd::Append { key: 7, val: 10 }), LaResp::AppendAck);
-        assert_eq!(sm.apply(256, LaCmd::Append { key: 7, val: 20 }), LaResp::AppendAck);
-        assert_eq!(sm.apply(384, LaCmd::Append { key: 3, val: 30 }), LaResp::AppendAck);
+        assert_eq!(
+            sm.apply(128, LaCmd::Append { key: 7, val: 10 }),
+            LaResp::AppendAck
+        );
+        assert_eq!(
+            sm.apply(256, LaCmd::Append { key: 7, val: 20 }),
+            LaResp::AppendAck
+        );
+        assert_eq!(
+            sm.apply(384, LaCmd::Append { key: 3, val: 30 }),
+            LaResp::AppendAck
+        );
         // Per-key append order is the apply order; other keys are untouched.
         assert_eq!(sm.query(LaRead { key: 7 }), vec![10, 20]);
         assert_eq!(sm.query(LaRead { key: 3 }), vec![30]);
@@ -136,11 +145,20 @@ mod v2_tests {
         ListAppendSm::stream_snapshot(handle, &mut bytes).unwrap();
 
         let mut restored = ListAppendSm::default();
-        assert_eq!(restored.install_snapshot(4096, &mut bytes.as_slice()).unwrap(), 4096);
+        assert_eq!(
+            restored
+                .install_snapshot(4096, &mut bytes.as_slice())
+                .unwrap(),
+            4096
+        );
         assert_eq!(restored.query(LaRead { key: 1 }), vec![42]);
         assert_eq!(restored.last_applied(), Some(4096));
 
         // A mis-tagged install (wrong artifact position) is refused.
-        assert!(restored.install_snapshot(99, &mut bytes.as_slice()).is_err());
+        assert!(
+            restored
+                .install_snapshot(99, &mut bytes.as_slice())
+                .is_err()
+        );
     }
 }

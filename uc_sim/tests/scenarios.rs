@@ -34,9 +34,13 @@ use uc_sim::world::{DataPlane, SimConfig, World};
 // gaps get NAK-repaired) reproduces — which it does, since every fault/
 // timing decision in the sim is schedule-driven, not payload-driven.
 
-
 fn base_cfg(seed: u64) -> SimConfig {
-    SimConfig { n_nodes: 3, seed, max_steps: 30_000, ..SimConfig::default() }
+    SimConfig {
+        n_nodes: 3,
+        seed,
+        max_steps: 30_000,
+        ..SimConfig::default()
+    }
 }
 
 /// A high-churn config tuned to exercise the intake-gate reconcile discipline:
@@ -88,7 +92,10 @@ fn nasty_reconcile_config(seed: u64) -> SimConfig {
 
 #[test]
 fn quiet_cluster_elects_exactly_one_leader_and_commits() {
-    let mut w = World::new(SimConfig { drop_per_million: 0, ..base_cfg(1) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        ..base_cfg(1)
+    });
     let stats = w.run().expect("invariants");
     assert_eq!(stats.leaders_elected, 1, "stable cluster must elect once");
     assert!(stats.max_commit > 0, "a serving leader must commit data");
@@ -101,12 +108,18 @@ fn split_vote_converges() {
     let mut w = World::new(base_cfg(7));
     w.drop_all_votes_until(500_000_000);
     let stats = w.run().expect("invariants");
-    assert!(stats.max_commit > 0, "cluster must converge after split votes");
+    assert!(
+        stats.max_commit > 0,
+        "cluster must converge after split votes"
+    );
 }
 
 #[test]
 fn minority_partition_cannot_commit_and_heals() {
-    let mut w = World::new(SimConfig { drop_per_million: 0, ..base_cfg(3) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        ..base_cfg(3)
+    });
     w.run_until_leader().expect("invariants");
     let leader = w.current_leader().unwrap();
     let commit_before = w.max_commit();
@@ -123,7 +136,10 @@ fn minority_partition_cannot_commit_and_heals() {
     // heal: the deposed leader truncates its uncommitted tail and rejoins
     w.heal();
     let stats = w.run().expect("invariants");
-    assert!(stats.truncations >= 1, "the deposed leader's tail must truncate");
+    assert!(
+        stats.truncations >= 1,
+        "the deposed leader's tail must truncate"
+    );
 }
 
 /// M14b (spec §12): a per-node apply ceiling models "the slowest FSM's
@@ -156,14 +172,21 @@ fn capped_quorum_stalls_commit_and_releasing_one_follower_resumes_it() {
         w.max_commit()
     );
     for &f in &followers {
-        assert!(w.last_report(f) <= cap, "follower {f} reported {} > cap {cap}", w.last_report(f));
+        assert!(
+            w.last_report(f) <= cap,
+            "follower {f} reported {} > cap {cap}",
+            w.last_report(f)
+        );
     }
     w.set_apply_ceiling(followers[0], None);
     assert!(
         w.run_until(|w| w.max_commit() > cap).expect("invariants"),
         "commit must resume once a quorum is uncapped (timed out)"
     );
-    assert!(w.last_report(followers[1]) <= cap, "the still-capped follower stays capped");
+    assert!(
+        w.last_report(followers[1]) <= cap,
+        "the still-capped follower stays capped"
+    );
 }
 
 /// M14b: a capped MINORITY never stalls the cluster — the leader plus the
@@ -180,10 +203,14 @@ fn a_capped_minority_does_not_stall_commit() {
     w.set_apply_ceiling(f, Some(cap));
     w.append_and_replicate(20 * FRAME);
     assert!(
-        w.run_until(|w| w.max_commit() > cap + 10 * FRAME).expect("invariants"),
+        w.run_until(|w| w.max_commit() > cap + 10 * FRAME)
+            .expect("invariants"),
         "one capped follower must not stall a 3-node cluster (timed out)"
     );
-    assert!(w.last_report(f) <= cap, "the capped follower never reports past its ceiling");
+    assert!(
+        w.last_report(f) <= cap,
+        "the capped follower never reports past its ceiling"
+    );
 }
 
 #[test]
@@ -230,7 +257,8 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     });
     w.run_until_leader().expect("setup: elect first leader");
     let x = w.current_leader().unwrap(); // term-1 leader = future divergent ex-leader X
-    w.run_steps(300).expect("setup: commit a genuine prefix on all three");
+    w.run_steps(300)
+        .expect("setup: commit a genuine prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != x).collect();
     let (a, b) = (others[0], others[1]);
     // Isolate X (pairwise, so we can partially heal later); it keeps appending an
@@ -238,16 +266,19 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     w.partition(x, a);
     w.partition(x, b);
     assert!(
-        w.run_until(|w| w.current_leader().is_some_and(|l| l != x)).unwrap(),
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != x))
+            .unwrap(),
         "setup: new leader elects timed out"
     );
     let l = w.current_leader().unwrap(); // the new higher-term leader L
     let g = if l == a { b } else { a }; // the third node = lagging follower G
-    w.run_steps(300).expect("setup: L commits with G past the old prefix");
+    w.run_steps(300)
+        .expect("setup: L commits with G past the old prefix");
     // Now cut L off from G: G lags (frozen), and L keeps appending its own term's
     // bytes (own durable runs ahead, but commit stalls — no quorum).
     w.partition(l, g);
-    w.run_steps(300).expect("setup: L's own log runs ahead of the stalled commit");
+    w.run_steps(300)
+        .expect("setup: L's own log runs ahead of the stalled commit");
     // Partially heal: reconnect ONLY X <-> L. Under RawM3 X raw-reports its
     // divergent durable to L before reconciliation repairs it; L ranks that report
     // with its own high durable and certifies a commit no genuine quorum holds.
@@ -293,17 +324,20 @@ fn raw_m3_wrong_base_term_stamp_is_caught() {
     });
     w.run_until_leader().expect("setup: elect first leader");
     let x = w.current_leader().unwrap();
-    w.run_steps(200).expect("setup: genuine prefix on all three");
+    w.run_steps(200)
+        .expect("setup: genuine prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != x).collect();
     let (a, b) = (others[0], others[1]);
     w.partition(x, a);
     w.partition(x, b);
     assert!(
-        w.run_until(|w| w.current_leader().is_some_and(|l| l != x)).unwrap(),
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != x))
+            .unwrap(),
         "setup: new leader timed out"
     );
     let l = w.current_leader().unwrap();
-    w.run_steps(150).expect("setup: X grows a modest divergent tail");
+    w.run_steps(150)
+        .expect("setup: X grows a modest divergent tail");
     // Freeze X's divergent append (crash), so the genuine majority can commit PAST
     // it (an isolated live leader would keep pace and outrun the commit).
     w.crash(x);
@@ -312,8 +346,12 @@ fn raw_m3_wrong_base_term_stamp_is_caught() {
         w.run_until(|w| w.max_commit() > d + 500).unwrap(),
         "setup: genuine commit runs past X timed out"
     );
-    assert!(w.max_commit() > d, "setup: majority must commit past X's divergence point");
-    w.restart(x).expect("setup: X returns as a follower at its frozen durable");
+    assert!(
+        w.max_commit() > d,
+        "setup: majority must commit past X's divergence point"
+    );
+    w.restart(x)
+        .expect("setup: X returns as a follower at its frozen durable");
     // Inject the current-term(2) segment at X's own append. RawM3 accepts on
     // contiguity alone and stamps term 2 at base `d` — a boundary the committed
     // lineage does not have there.
@@ -335,28 +373,43 @@ fn raw_m3_wrong_base_term_stamp_is_caught() {
 /// stays un-truncated forever.
 #[test]
 fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
-    let mut w = World::new(SimConfig { drop_per_million: 0, max_steps: 60_000, ..base_cfg(3) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        max_steps: 60_000,
+        ..base_cfg(3)
+    });
     w.run_until_leader().expect("setup: elect first leader");
     let old = w.current_leader().unwrap();
-    w.run_steps(300).expect("setup: genuine committed prefix on all three");
+    w.run_steps(300)
+        .expect("setup: genuine committed prefix on all three");
 
     // Isolate the term-1 leader: it keeps appending an uncommitted divergent
     // tail while the majority elects a higher-term leader and commits past it.
     w.partition_node(old);
     assert!(
-        w.run_until(|w| w.current_leader().is_some_and(|l| l != old)).unwrap(),
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != old))
+            .unwrap(),
         "setup: new higher-term leader elects timed out"
     );
-    w.run_steps(500).expect("setup: majority commits past the old prefix");
+    w.run_steps(500)
+        .expect("setup: majority commits past the old prefix");
     let divergent_append = w.node_append(old);
-    assert!(divergent_append > 0, "setup: old leader must hold a divergent tail");
+    assert!(
+        divergent_append > 0,
+        "setup: old leader must hold a divergent tail"
+    );
 
     // Quiesce: the new leader stops taking writes — commit PLATEAUS. From here
     // only the idle gossip floor re-ships commit + term map.
     w.set_quiet(true);
-    w.run_steps(2_000).expect("plateau settles under the idle floor");
+    w.run_steps(2_000)
+        .expect("plateau settles under the idle floor");
     let commit_plateau = w.max_commit();
-    assert_eq!(w.truncations(), 0, "no reconciliation while the divergent node is still isolated");
+    assert_eq!(
+        w.truncations(),
+        0,
+        "no reconciliation while the divergent node is still isolated"
+    );
 
     // Heal the divergent node into the now-idle cluster. With NO new submissions,
     // it must STILL reconcile — the floor-shipped term map is the only trigger.
@@ -410,7 +463,10 @@ fn mechanism_unguarded_reopen_is_caught_by_oracle() {
         let mut cfg = nasty_reconcile_config(seed); // helper: high churn, partitions, crashes
         cfg.crash_per_million = 1_000; // red-arm rate, see the doc comment above
         cfg.attest_reports = false; // isolate the reopen guard (see above)
-        cfg.data_plane = DataPlane::Mechanism { reopen_guard: false, handle_keyed: true };
+        cfg.data_plane = DataPlane::Mechanism {
+            reopen_guard: false,
+            handle_keyed: true,
+        };
         if let Err(v) = World::new(cfg).run()
             && v.invariant.contains("phantom")
         {
@@ -418,7 +474,10 @@ fn mechanism_unguarded_reopen_is_caught_by_oracle() {
             break;
         }
     }
-    assert!(caught, "the unguarded reopen must produce an inv7 phantom commit on some seed");
+    assert!(
+        caught,
+        "the unguarded reopen must produce an inv7 phantom commit on some seed"
+    );
 }
 
 /// The guarded mechanism (what uc_node actually implements) survives the
@@ -431,8 +490,13 @@ fn mechanism_unguarded_reopen_is_caught_by_oracle() {
 fn mechanism_guarded_survives_the_same_storm() {
     for seed in 0..200 {
         let mut cfg = nasty_reconcile_config(seed);
-        cfg.data_plane = DataPlane::Mechanism { reopen_guard: true, handle_keyed: true };
-        World::new(cfg).run().unwrap_or_else(|v| panic!("seed {seed}: {v:?}"));
+        cfg.data_plane = DataPlane::Mechanism {
+            reopen_guard: true,
+            handle_keyed: true,
+        };
+        World::new(cfg)
+            .run()
+            .unwrap_or_else(|v| panic!("seed {seed}: {v:?}"));
     }
 }
 
@@ -480,7 +544,10 @@ fn raw_m3_forged_report_phantom_commit_is_caught() {
             break;
         }
     }
-    assert!(caught.is_some(), "a persistently forged durable must trip an invariant");
+    assert!(
+        caught.is_some(),
+        "a persistently forged durable must trip an invariant"
+    );
 }
 
 /// M6 Task 8 — a NoCommonPrefix reconcile REACHES the wipe decision, and the
@@ -514,7 +581,10 @@ fn raw_m3_forged_report_phantom_commit_is_caught() {
 #[test]
 fn no_common_prefix_reaches_wipe_and_fatal_when_disabled() {
     let mut cfg = base_cfg(1);
-    cfg.data_plane = DataPlane::Mechanism { reopen_guard: true, handle_keyed: true };
+    cfg.data_plane = DataPlane::Mechanism {
+        reopen_guard: true,
+        handle_keyed: true,
+    };
     let mut w = World::new(cfg);
     w.run_until_leader().expect("elect leader");
     let leader = w.current_leader().unwrap();
@@ -559,7 +629,10 @@ fn fuzz_default_seeds() {
             drop_per_million: 20_000,
             dup_per_million: 5_000,
             crash_per_million: 500,
-            data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
+            data_plane: DataPlane::Mechanism {
+                reopen_guard: true,
+                handle_keyed: true,
+            },
             ..SimConfig::default()
         });
         if let Err(v) = w.run() {
@@ -640,7 +713,10 @@ fn fuzz_heavy_seeds() {
             drop_per_million: 20_000,
             dup_per_million: 10_000,
             crash_per_million: 500,
-            data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
+            data_plane: DataPlane::Mechanism {
+                reopen_guard: true,
+                handle_keyed: true,
+            },
             ..SimConfig::default()
         });
         if let Err(v) = w.run() {
@@ -702,8 +778,20 @@ fn add_promote_demote_remove_cycle_under_faults() {
 
     // add-learner (a fresh id joins as learner; id 7 has no process behind it —
     // the config pipeline neither knows nor cares).
-    assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 7, addr: (7, 1) }), 1);
-    assert!(w.run_until(|w| all_live_at_version(w, 5, 1)).unwrap(), "v1 adopted everywhere timed out");
+    assert_eq!(
+        propose_ok(
+            &mut w,
+            ConfigOp::AddLearner {
+                id: 7,
+                addr: (7, 1)
+            }
+        ),
+        1
+    );
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 5, 1)).unwrap(),
+        "v1 adopted everywhere timed out"
+    );
 
     // Fault between steps: crash a follower (auto-restarts).
     let l = w.current_leader().unwrap();
@@ -713,7 +801,10 @@ fn add_promote_demote_remove_cycle_under_faults() {
 
     // promote the caught-up learner 4 -> voter (quorum grows to 5).
     assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 4 }), 2);
-    assert!(w.run_until(|w| all_live_at_version(w, 5, 2)).unwrap(), "v2 adopted everywhere timed out");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 5, 2)).unwrap(),
+        "v2 adopted everywhere timed out"
+    );
 
     // Fault between steps: partition a follower pair, then heal.
     let l = w.current_leader().unwrap();
@@ -727,18 +818,30 @@ fn add_promote_demote_remove_cycle_under_faults() {
 
     // demote 4 back to learner.
     assert_eq!(propose_ok(&mut w, ConfigOp::DemoteVoter { id: 4 }), 3);
-    assert!(w.run_until(|w| all_live_at_version(w, 5, 3)).unwrap(), "v3 adopted everywhere timed out");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 5, 3)).unwrap(),
+        "v3 adopted everywhere timed out"
+    );
 
     // remove-learner 4: on adopting the config that drops it, 4 fail-stops.
     assert_eq!(propose_ok(&mut w, ConfigOp::RemoveLearner { id: 4 }), 4);
-    assert!(w.run_until(|w| w.halted_removed(4)).unwrap(), "4 adopts its own removal (timed out)");
+    assert!(
+        w.run_until(|w| w.halted_removed(4)).unwrap(),
+        "4 adopts its own removal (timed out)"
+    );
     assert!(w.halted_removed(4), "the removed learner must halt");
 
     // remove-voter: a NON-leader voter; it halts on adoption too.
     let l = w.current_leader().unwrap();
     let t = (0..4).find(|&i| i != l && !w.halted_removed(i)).unwrap();
-    assert_eq!(propose_ok(&mut w, ConfigOp::RemoveVoter { id: t as u32 }), 5);
-    assert!(w.run_until(|w| w.halted_removed(t)).unwrap(), "t adopts its own removal (timed out)");
+    assert_eq!(
+        propose_ok(&mut w, ConfigOp::RemoveVoter { id: t as u32 }),
+        5
+    );
+    assert!(
+        w.run_until(|w| w.halted_removed(t)).unwrap(),
+        "t adopts its own removal (timed out)"
+    );
     assert!(w.halted_removed(t), "the removed voter must halt");
 
     // The survivors converge on v5 and keep committing.
@@ -747,12 +850,22 @@ fn add_promote_demote_remove_cycle_under_faults() {
         "v5 adopted on survivors timed out"
     );
     let c = w.max_commit();
-    w.run_steps(2_000).expect("the shrunken cluster keeps serving");
-    assert!(w.max_commit() > c, "commit must still advance under the final config");
+    w.run_steps(2_000)
+        .expect("the shrunken cluster keeps serving");
+    assert!(
+        w.max_commit() > c,
+        "commit must still advance under the final config"
+    );
     // Tombstone permanence at the SM: re-adding a removed id is refused.
     let l = w.current_leader().unwrap();
     assert_eq!(
-        w.propose_config(l, ConfigOp::AddLearner { id: t as u32, addr: (t as u32, 1) }),
+        w.propose_config(
+            l,
+            ConfigOp::AddLearner {
+                id: t as u32,
+                addr: (t as u32, 1)
+            }
+        ),
         Err(ProposeError::Tombstoned),
         "a tombstoned id can never rejoin"
     );
@@ -784,7 +897,8 @@ fn second_learner_admitted_after_prior_config_history_converges() {
         genesis_absent: vec![3, 4],
         ..SimConfig::default()
     });
-    w.run_until_leader().expect("elect among the 3 genesis voters");
+    w.run_until_leader()
+        .expect("elect among the 3 genesis voters");
     w.run_steps(300).expect("a genuine committed prefix");
 
     // v1: admit node 3 as a learner. It must not halt (it is being ADDED,
@@ -796,14 +910,32 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     // unsatisfiable. The `assert!` on `run_until`'s `Ok(bool)` (task-12
     // ledger x) is now what catches that; the follow-up `all_live_at_version`
     // assert stays as a stronger, more specific message on failure.
-    assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 3, addr: (3, 1) }), 1);
+    assert_eq!(
+        propose_ok(
+            &mut w,
+            ConfigOp::AddLearner {
+                id: 3,
+                addr: (3, 1)
+            }
+        ),
+        1
+    );
     assert!(
         w.run_until(|w| all_live_at_version(w, 4, 1)).unwrap(),
         "invariants while converging on v1 timed out"
     );
-    assert!(all_live_at_version(&w, 4, 1), "v1 must actually converge on nodes 0-3");
-    assert!(!w.halted_removed(3), "node 3's own admission must not halt it");
-    assert!(!w.halted_removed(4), "node 4 (still genesis-absent) must not be affected by v1");
+    assert!(
+        all_live_at_version(&w, 4, 1),
+        "v1 must actually converge on nodes 0-3"
+    );
+    assert!(
+        !w.halted_removed(3),
+        "node 3's own admission must not halt it"
+    );
+    assert!(
+        !w.halted_removed(4),
+        "node 4 (still genesis-absent) must not be affected by v1"
+    );
 
     // v2: promote node 3 to voter.
     assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 3 }), 2);
@@ -811,9 +943,15 @@ fn second_learner_admitted_after_prior_config_history_converges() {
         w.run_until(|w| all_live_at_version(w, 4, 2)).unwrap(),
         "invariants while converging on v2 timed out"
     );
-    assert!(all_live_at_version(&w, 4, 2), "v2 must actually converge on nodes 0-3");
+    assert!(
+        all_live_at_version(&w, 4, 2),
+        "v2 must actually converge on nodes 0-3"
+    );
     assert!(!w.halted_removed(3));
-    assert!(!w.halted_removed(4), "node 4 must still be unaffected before its own admission");
+    assert!(
+        !w.halted_removed(4),
+        "node 4 must still be unaffected before its own admission"
+    );
 
     // v3: admit node 4 — the SECOND joiner, AFTER v1/v2 already exist. Its
     // catch-up must replay v1 (voters {0,1,2}, learner [3] — 4 legitimately
@@ -821,7 +959,16 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     // ever reaches v3. This is the exact bug shape: the old code would
     // wrongly halt node 4 while it replays v1/v2, and it would never reach
     // v3 at all. Node 4 is now part of the relevant set.
-    assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 4, addr: (4, 1) }), 3);
+    assert_eq!(
+        propose_ok(
+            &mut w,
+            ConfigOp::AddLearner {
+                id: 4,
+                addr: (4, 1)
+            }
+        ),
+        3
+    );
     assert!(
         w.run_until(|w| all_live_at_version(w, 5, 3)).unwrap(),
         "invariants while converging on v3 timed out"
@@ -830,8 +977,15 @@ fn second_learner_admitted_after_prior_config_history_converges() {
         !w.halted_removed(4),
         "node 4 must not halt while replaying pre-admission config history (v1/v2)"
     );
-    assert!(all_live_at_version(&w, 5, 3), "v3 must actually converge on all 5 nodes");
-    assert_eq!(w.node_config_version(4), 3, "node 4 must genuinely reach v3, not stall on replay");
+    assert!(
+        all_live_at_version(&w, 5, 3),
+        "v3 must actually converge on all 5 nodes"
+    );
+    assert_eq!(
+        w.node_config_version(4),
+        3,
+        "node 4 must genuinely reach v3, not stall on replay"
+    );
 
     // v4: promote node 4 too — proves it kept participating normally after
     // admission (not just limping along at v3 with a dead latch waiting to
@@ -841,31 +995,64 @@ fn second_learner_admitted_after_prior_config_history_converges() {
         w.run_until(|w| all_live_at_version(w, 5, 4)).unwrap(),
         "invariants while converging on v4 timed out"
     );
-    assert!(all_live_at_version(&w, 5, 4), "v4 must actually converge on all 5 nodes");
-    assert!(!w.halted_removed(4), "node 4 must not halt on its own promotion either");
+    assert!(
+        all_live_at_version(&w, 5, 4),
+        "v4 must actually converge on all 5 nodes"
+    );
+    assert!(
+        !w.halted_removed(4),
+        "node 4 must not halt on its own promotion either"
+    );
 
     // The 5-voter cluster (now {0,1,2,3,4}) keeps committing.
     let c = w.max_commit();
     w.run_steps(2_000).expect("the grown cluster keeps serving");
-    assert!(w.max_commit() > c, "commit must keep advancing under the grown 5-voter config");
+    assert!(
+        w.max_commit() > c,
+        "commit must keep advancing under the grown 5-voter config"
+    );
 }
 
 /// One-in-flight: a second proposal before the first frame commits is refused
 /// with `ChangePending`; once it commits, the next change is accepted.
 #[test]
 fn propose_during_pending_is_refused() {
-    let mut w = World::new(SimConfig { drop_per_million: 0, ..base_cfg(13) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        ..base_cfg(13)
+    });
     w.run_until_leader().expect("elect");
     let l = w.current_leader().unwrap();
-    assert_eq!(w.propose_config(l, ConfigOp::AddLearner { id: 9, addr: (9, 1) }), Ok(1));
     assert_eq!(
-        w.propose_config(l, ConfigOp::AddLearner { id: 8, addr: (8, 1) }),
+        w.propose_config(
+            l,
+            ConfigOp::AddLearner {
+                id: 9,
+                addr: (9, 1)
+            }
+        ),
+        Ok(1)
+    );
+    assert_eq!(
+        w.propose_config(
+            l,
+            ConfigOp::AddLearner {
+                id: 8,
+                addr: (8, 1)
+            }
+        ),
         Err(ProposeError::ChangePending),
         "one change in flight: the second proposal must be refused"
     );
     w.run_steps(3_000).expect("the pending frame commits");
     assert_eq!(
-        w.propose_config(l, ConfigOp::AddLearner { id: 8, addr: (8, 1) }),
+        w.propose_config(
+            l,
+            ConfigOp::AddLearner {
+                id: 8,
+                addr: (8, 1)
+            }
+        ),
         Ok(2),
         "after the commit the next change is accepted"
     );
@@ -881,17 +1068,29 @@ fn propose_during_pending_is_refused() {
 /// after every scripted step and every natural step via `step_once`).
 #[test]
 fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
-    let mut w = World::new(SimConfig { drop_per_million: 0, ..base_cfg(21) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        ..base_cfg(21)
+    });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
     w.run_steps(300).expect("a genuine committed prefix");
 
-    assert_eq!(propose_ok(&mut w, ConfigOp::RemoveVoter { id: l1 as u32 }), 1);
+    assert_eq!(
+        propose_ok(&mut w, ConfigOp::RemoveVoter { id: l1 as u32 }),
+        1
+    );
     // Removing itself: the leader keeps serving through the adoption window —
     // it must NOT halt yet (Task 8's whole point: C_new must be replicated by
     // a leader that still exists).
-    assert!(!w.halted_removed(l1), "self-removing leader must not halt at adoption");
-    assert!(w.node_is_serving_leader(l1), "leader keeps serving pre-commit");
+    assert!(
+        !w.halted_removed(l1),
+        "self-removing leader must not halt at adoption"
+    );
+    assert!(
+        w.node_is_serving_leader(l1),
+        "leader keeps serving pre-commit"
+    );
 
     // Once the removal entry itself commits, the leader steps down.
     assert!(
@@ -908,8 +1107,12 @@ fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
     let l2 = w.current_leader().unwrap();
     assert_ne!(l2, l1, "the new leader must be one of the survivors");
     let c = w.max_commit();
-    w.run_steps(2_000).expect("the shrunken cluster keeps serving");
-    assert!(w.max_commit() > c, "commit must keep advancing under the new (2-voter) config");
+    w.run_steps(2_000)
+        .expect("the shrunken cluster keeps serving");
+    assert!(
+        w.max_commit() > c,
+        "commit must keep advancing under the new (2-voter) config"
+    );
 }
 
 /// Truncation revert (spec §5): a config frame appended by a leader that gets
@@ -919,15 +1122,28 @@ fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
 /// green throughout).
 #[test]
 fn truncation_below_config_frame_reverts() {
-    let mut w =
-        World::new(SimConfig { drop_per_million: 0, max_steps: 120_000, ..base_cfg(3) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        max_steps: 120_000,
+        ..base_cfg(3)
+    });
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(300).expect("a genuine committed prefix on all three");
+    w.run_steps(300)
+        .expect("a genuine committed prefix on all three");
     // Isolate the leader FIRST, then propose: the frame lands ONLY in its own
     // stream — an uncommitted config on a soon-divergent lineage.
     w.partition_node(l1);
-    assert_eq!(w.propose_config(l1, ConfigOp::AddLearner { id: 9, addr: (9, 1) }), Ok(1));
+    assert_eq!(
+        w.propose_config(
+            l1,
+            ConfigOp::AddLearner {
+                id: 9,
+                addr: (9, 1)
+            }
+        ),
+        Ok(1)
+    );
     let p1 = w.node_append(l1); // the frame's END position
     // Its own archive makes the frame durable (adopt-at-append settles into
     // adopt-at-durable) while the majority elects a higher term without it.
@@ -938,10 +1154,21 @@ fn truncation_below_config_frame_reverts() {
         .unwrap(),
         "frame durable on L1; new leader elected without it (timed out)"
     );
-    assert_eq!(w.node_config_version(l1), 1, "isolated ex-leader adopted its own frame");
-    let l2 = (0..3).find(|&i| i != l1 && w.node_is_serving_leader(i)).unwrap();
-    w.run_steps(400).expect("majority commits past the old prefix under v0");
-    assert_eq!(w.node_config_version(l2), 0, "the frame never reached the majority");
+    assert_eq!(
+        w.node_config_version(l1),
+        1,
+        "isolated ex-leader adopted its own frame"
+    );
+    let l2 = (0..3)
+        .find(|&i| i != l1 && w.node_is_serving_leader(i))
+        .unwrap();
+    w.run_steps(400)
+        .expect("majority commits past the old prefix under v0");
+    assert_eq!(
+        w.node_config_version(l2),
+        0,
+        "the frame never reached the majority"
+    );
 
     // Heal: reconciliation truncates L1's divergent tail (strictly below the
     // frame end) -> the SM reverts to v0 and the durable record follows.
@@ -950,7 +1177,8 @@ fn truncation_below_config_frame_reverts() {
         w.run_until(|w| w.truncations() >= 1).unwrap(),
         "the divergent tail truncates (timed out)"
     );
-    w.run_steps(200).expect("the ack lands and the revert settles");
+    w.run_steps(200)
+        .expect("the ack lands and the revert settles");
     assert_eq!(
         w.node_config_version(l1),
         0,
@@ -961,7 +1189,16 @@ fn truncation_below_config_frame_reverts() {
     // when its durable crosses the new frame (same version number, different
     // content — the ledger's content-identity check keeps them apart).
     let l2 = (0..3).find(|&i| w.node_is_serving_leader(i)).unwrap();
-    assert_eq!(w.propose_config(l2, ConfigOp::AddLearner { id: 8, addr: (8, 1) }), Ok(1));
+    assert_eq!(
+        w.propose_config(
+            l2,
+            ConfigOp::AddLearner {
+                id: 8,
+                addr: (8, 1)
+            }
+        ),
+        Ok(1)
+    );
     assert!(
         w.run_until(|w| w.node_config_version(l1) == 1).unwrap(),
         "L1 re-adopts from the new stream (timed out)"
@@ -984,7 +1221,16 @@ fn counterfactual_no_revert_breaks_inv8() {
     let l1 = w.current_leader().unwrap();
     w.run_steps(300).expect("a genuine committed prefix");
     w.partition_node(l1);
-    assert_eq!(w.propose_config(l1, ConfigOp::AddLearner { id: 9, addr: (9, 1) }), Ok(1));
+    assert_eq!(
+        w.propose_config(
+            l1,
+            ConfigOp::AddLearner {
+                id: 9,
+                addr: (9, 1)
+            }
+        ),
+        Ok(1)
+    );
     let p1 = w.node_append(l1);
     assert!(
         w.run_until(|w| {
@@ -993,12 +1239,16 @@ fn counterfactual_no_revert_breaks_inv8() {
         .unwrap(),
         "frame durable on L1; new leader elected without it (timed out)"
     );
-    w.run_steps(400).expect("majority commits past the old prefix");
+    w.run_steps(400)
+        .expect("majority commits past the old prefix");
     w.heal();
     let v = w
         .run_steps(30_000)
         .expect_err("revert deleted: the truncation must strand the stale config");
-    assert!(v.invariant.contains("inv8"), "expected an inv8 violation, got: {v}");
+    assert!(
+        v.invariant.contains("inv8"),
+        "expected an inv8 violation, got: {v}"
+    );
 }
 
 /// COUNTERFACTUAL-RED (serving gate): Ongaro's 2015 single-server-change bug,
@@ -1028,7 +1278,8 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     // Phase 1: L1 serves; learner 4 tracks the stream and reports in.
     w.run_until_leader().expect("elect L1");
     let l1 = w.current_leader().unwrap();
-    w.run_steps(600).expect("commit a genuine prefix; learner 4 reports in");
+    w.run_steps(600)
+        .expect("commit a genuine prefix; learner 4 reports in");
     // Cut L1 off from every other voter, keeping only (L1, 4): the promote
     // frame will replicate to 4 alone.
     let other_voters: Vec<usize> = (0..4).filter(|&v| v != l1).collect();
@@ -1052,7 +1303,8 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     assert!(accepted, "L1 must accept the promote");
     let p1 = w.node_append(l1);
     assert!(
-        w.run_until(|w| w.node_durable(l1) >= p1 && w.node_config_version(4) == 1).unwrap(),
+        w.run_until(|w| w.node_durable(l1) >= p1 && w.node_config_version(4) == 1)
+            .unwrap(),
         "C1 durable on L1 and adopted by 4 (timed out)"
     );
     // Phase 2: L1 crashes right after proposing; 4 goes dark holding C1.
@@ -1063,12 +1315,19 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     // under C_old (L1 down + c dark = at most 2 of quorum 3), so with the
     // gate this proposal would be refused forever.
     assert!(
-        w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i))).unwrap(),
+        w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i)))
+            .unwrap(),
         "a new raw leader (timed out)"
     );
-    let l2 = (0..4).find(|&i| i != l1 && w.node_is_raw_leader(i)).unwrap();
+    let l2 = (0..4)
+        .find(|&i| i != l1 && w.node_is_raw_leader(i))
+        .unwrap();
     let c = other_voters.iter().copied().find(|&v| v != l2).unwrap();
-    let b = other_voters.iter().copied().find(|&v| v != l2 && v != c).unwrap();
+    let b = other_voters
+        .iter()
+        .copied()
+        .find(|&v| v != l2 && v != c)
+        .unwrap();
     w.partition(l2, c); // keep one C_old voter dark (in-flight datagrams too)
     assert_eq!(
         w.propose_config(l2, ConfigOp::RemoveVoter { id: l1 as u32 }),
@@ -1078,7 +1337,8 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     let p2 = w.node_append(l2);
     // C1' commits on {L2, b} — a quorum of C1'(3) but NOT of C_old(4).
     assert!(
-        w.run_until(|w| w.node_config_version(b) == 1 && w.max_commit() >= p2).unwrap(),
+        w.run_until(|w| w.node_config_version(b) == 1 && w.max_commit() >= p2)
+            .unwrap(),
         "C1' commits under its own shrunken quorum (timed out)"
     );
     // Phase 4: silence the only C1' holders; the C1 side ({L1, 4, c}) heals
@@ -1090,7 +1350,10 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     let v = w
         .run_steps(60_000)
         .expect_err("the disjoint-quorum election/commit must trip the checker");
-    assert!(v.invariant.contains("inv7"), "expected an inv7 violation, got: {v}");
+    assert!(
+        v.invariant.contains("inv7"),
+        "expected an inv7 violation, got: {v}"
+    );
 }
 
 /// M7 fuzz arm: random LEGAL AND ILLEGAL config ops — proposals from arbitrary
@@ -1158,7 +1421,14 @@ fn fuzz_heavy_config_churn() {
                 && let Some(f) = (0..n).find(|&i| i != l && !w.halted_removed(i))
             {
                 assert!(
-                    w.propose_config(f, ConfigOp::AddLearner { id: 99, addr: (99, 1) }).is_err(),
+                    w.propose_config(
+                        f,
+                        ConfigOp::AddLearner {
+                            id: 99,
+                            addr: (99, 1)
+                        }
+                    )
+                    .is_err(),
                     "seed {seed}: a non-leader proposal must be refused"
                 );
             }
@@ -1212,10 +1482,13 @@ fn serving_gate_refuses_the_premature_proposal() {
     w.crash(l1);
     w.partition_node(4);
     assert!(
-        w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i))).unwrap(),
+        w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i)))
+            .unwrap(),
         "a new raw leader (timed out)"
     );
-    let l2 = (0..4).find(|&i| i != l1 && w.node_is_raw_leader(i)).unwrap();
+    let l2 = (0..4)
+        .find(|&i| i != l1 && w.node_is_raw_leader(i))
+        .unwrap();
     let c = other_voters.iter().copied().find(|&v| v != l2).unwrap();
     w.partition(l2, c);
     // The same instant the gate-off arm proposed: the gate refuses.
@@ -1264,14 +1537,19 @@ fn serving_gate_refuses_the_premature_proposal() {
 fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     let mut w = World::new(SimConfig {
         drop_per_million: 0,
-        data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
+        data_plane: DataPlane::Mechanism {
+            reopen_guard: true,
+            handle_keyed: true,
+        },
         max_steps: 200_000,
         ..base_cfg(3)
     });
     // Phase 1: V leads term 1; a genuine committed prefix lands on all three.
-    w.run_until_leader().expect("setup: elect the term-1 leader");
+    w.run_until_leader()
+        .expect("setup: elect the term-1 leader");
     let v = w.current_leader().unwrap();
-    w.run_steps(300).expect("setup: genuine committed prefix on all three");
+    w.run_steps(300)
+        .expect("setup: genuine committed prefix on all three");
     let others: Vec<usize> = (0..3).filter(|&i| i != v).collect();
     let (a, b) = (others[0], others[1]);
 
@@ -1281,12 +1559,14 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     w.partition(v, a);
     w.partition(v, b);
     assert!(
-        w.run_until(|w| w.current_leader().is_some_and(|l| l != v)).unwrap(),
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != v))
+            .unwrap(),
         "setup: term-2 leader election timed out"
     );
     let l2 = w.current_leader().unwrap();
     let f = if l2 == a { b } else { a };
-    w.run_steps(300).expect("setup: term-2 commits past the old prefix; V's tail grows");
+    w.run_steps(300)
+        .expect("setup: term-2 commits past the old prefix; V's tail grows");
 
     // Phase 3: cut L2 from F and open V<->F. F times out and campaigns; V
     // grants (F's last_term 2 > V's 1, lexicographic vote order) and persists
@@ -1296,22 +1576,31 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     w.partition(l2, f);
     w.unpartition(v, f);
     assert!(
-        w.run_until(|w| w.node_is_raw_leader(f) && w.node_term(f) > 2).unwrap(),
+        w.run_until(|w| w.node_is_raw_leader(f) && w.node_term(f) > 2)
+            .unwrap(),
         "setup: F wins a term with V's grant (timed out)"
     );
     let t = w.node_term(f);
-    assert_eq!(w.node_term(v), t, "V granted (and adopted) F's winning term");
+    assert_eq!(
+        w.node_term(v),
+        t,
+        "V granted (and adopted) F's winning term"
+    );
     // 96 = one sim frame: V's frontier must sit beyond F's whole post-win
     // append (base + NewTerm frame), so F has nothing to ship at V's frontier
     // and the ONLY datagram V can contribute is its AppendPosition report.
-    assert!(w.node_durable(v) > w.node_durable(f) + 96, "V's divergent durable outruns F's base");
+    assert!(
+        w.node_durable(v) > w.node_durable(f) + 96,
+        "V's divergent durable outruns F's base"
+    );
 
     // Phase 4: crash V at the grant — its vote at term T is persisted, its
     // term map still ends at term 1, and NO term-T map has reached it. Let
     // F's first idle-floor map ship fire into the void (V is down), so the
     // post-reboot race window is maximal and deterministic.
     w.crash(v);
-    w.run_steps(60).expect("setup: F's initial gossip is dropped at the dark V");
+    w.run_steps(60)
+        .expect("setup: F's initial gossip is dropped at the dark V");
 
     // Phase 5: reboot V. Recovery: term = max(vote T, map last 1) = T.
     // Pre-fix the intake gate boots OPEN and V's report floor ships
@@ -1322,8 +1611,9 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     let truncations_before = w.truncations();
     let commit_before = w.max_commit();
     w.restart(v).expect("reboot the unreconciled voter");
-    w.run_steps(4_000)
-        .expect("Finding #5: rebooted unreconciled voter's report must not certify a phantom commit");
+    w.run_steps(4_000).expect(
+        "Finding #5: rebooted unreconciled voter's report must not certify a phantom commit",
+    );
 
     // Liveness of the closed-gate boot: the leader's idle-floor map reconciles
     // V (one extra reconcile round — the divergent tail truncates), and the
@@ -1396,15 +1686,23 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
         seed: 3,
         max_steps: 400_000,
         drop_per_million: 0,
-        data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
+        data_plane: DataPlane::Mechanism {
+            reopen_guard: true,
+            handle_keyed: true,
+        },
         ..SimConfig::default()
     });
     // Phase 1: elect the term-1 leader; a genuine committed prefix lands on
     // all five voters.
-    w.run_until_leader().expect("setup: elect the term-1 leader");
+    w.run_until_leader()
+        .expect("setup: elect the term-1 leader");
     let l = w.current_leader().unwrap();
-    w.run_steps(400).expect("setup: genuine committed prefix on all five");
-    assert!(w.max_commit() > 0, "setup: the prefix must genuinely commit");
+    w.run_steps(400)
+        .expect("setup: genuine committed prefix on all five");
+    assert!(
+        w.max_commit() > 0,
+        "setup: the prefix must genuinely commit"
+    );
     let followers: Vec<usize> = (0..5).filter(|&i| i != l).collect();
     let a = followers[0];
     let trio = [followers[1], followers[2], followers[3]];
@@ -1417,10 +1715,15 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
         w.partition(a, g);
     }
     assert!(
-        w.run_until(|w| trio.iter().any(|&g| w.node_is_raw_leader(g))).unwrap(),
+        w.run_until(|w| trio.iter().any(|&g| w.node_is_raw_leader(g)))
+            .unwrap(),
         "setup: the trio must elect the rival (timed out)"
     );
-    let r = trio.iter().copied().find(|&g| w.node_is_raw_leader(g)).unwrap();
+    let r = trio
+        .iter()
+        .copied()
+        .find(|&g| w.node_is_raw_leader(g))
+        .unwrap();
     let t2 = w.node_term(r);
     // The rival's divergent map entry base: its durable at the win (its
     // NewTerm frame is appended above it and archives only later).
@@ -1436,13 +1739,17 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
     // Grant-order guarantee: the granters' durables (and hence their last
     // reports, and hence the stale leader's rank) never exceed the rival's
     // election base — nothing above r_base is committed while W grows.
-    assert!(w.max_commit() <= r_base, "setup: stale commit must not pass the rival's base");
+    assert!(
+        w.max_commit() <= r_base,
+        "setup: stale commit must not pass the rival's base"
+    );
 
     // Phase 3 prep: grow W far past the rival's frame (the drain of this
     // tail at t3 is the deterministic §5.4.2 window), then quiesce and let
     // {L, A} drain fully so the t3 election base is the frozen tail end.
     assert!(
-        w.run_until(|w| w.node_append(l) >= r_base + 96 * 600).unwrap(),
+        w.run_until(|w| w.node_append(l) >= r_base + 96 * 600)
+            .unwrap(),
         "setup: the term-1 tail must grow past the rival's frame (timed out)"
     );
     w.set_quiet(true);
@@ -1455,7 +1762,10 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
         "setup: L and A must drain the tail fully (timed out)"
     );
     let pw = w.node_append(l);
-    assert!(pw > r_base + 96, "setup: W must extend past the rival's divergent frame");
+    assert!(
+        pw > r_base + 96,
+        "setup: W must extend past the rival's divergent frame"
+    );
 
     // Phase 3: silence C entirely (its lonely candidacies must not perturb
     // the t3 term), reconnect B to {L, A}. B's floor reports depose the
@@ -1473,9 +1783,16 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
         "setup: L or A must re-win above the rival's term (timed out)"
     );
     let t3l = if w.node_is_raw_leader(l) { l } else { a };
-    assert_eq!(w.node_durable(t3l), pw, "the t3 election base is the frozen tail end");
+    assert_eq!(
+        w.node_durable(t3l),
+        pw,
+        "the t3 election base is the frozen tail end"
+    );
     let commit_frozen = w.max_commit();
-    assert!(commit_frozen <= r_base, "nothing above the rival's base is committed yet");
+    assert!(
+        commit_frozen <= r_base,
+        "nothing above the rival's base is committed yet"
+    );
 
     // THE PIN. B reconciles clean, reopens its gate, re-replicates the
     // term-1 tail, and floor-reports its rising durable at term T. Pre-fix
@@ -1525,9 +1842,17 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
 /// read as green.
 #[test]
 fn run_until_reports_timeout_distinctly() {
-    let mut w = World::new(SimConfig { n_nodes: 3, seed: 99, max_steps: 50, ..SimConfig::default() });
+    let mut w = World::new(SimConfig {
+        n_nodes: 3,
+        seed: 99,
+        max_steps: 50,
+        ..SimConfig::default()
+    });
     let held = w.run_until(|_| false).unwrap();
-    assert!(!held, "an unsatisfiable predicate must report Ok(false), not silent success");
+    assert!(
+        !held,
+        "an unsatisfiable predicate must report Ok(false), not silent success"
+    );
     let held = w.run_until(|_| true).unwrap();
     assert!(held, "an already-true predicate must report Ok(true)");
 }
@@ -1544,7 +1869,12 @@ fn run_until_reports_timeout_distinctly() {
 /// (`propose_config`) is otherwise unreachable-by-design in a healthy run.
 #[test]
 fn parked_violation_surfaces_without_a_step() {
-    let mut w = World::new(SimConfig { n_nodes: 3, seed: 7, max_steps: 50, ..SimConfig::default() });
+    let mut w = World::new(SimConfig {
+        n_nodes: 3,
+        seed: 7,
+        max_steps: 50,
+        ..SimConfig::default()
+    });
     w.test_only_park_violation(InvariantViolation {
         invariant: "test-parked (task-12 ledger g)",
         step: 0,
@@ -1557,12 +1887,13 @@ fn parked_violation_surfaces_without_a_step() {
     );
 }
 
-
-
 fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, usize, u32)> {
     let mut w = World::new(SimConfig {
         drop_per_million: 0,
-        data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed },
+        data_plane: DataPlane::Mechanism {
+            reopen_guard: true,
+            handle_keyed,
+        },
         max_steps: 2_000_000,
         ..base_cfg(seed)
     });
@@ -1573,7 +1904,8 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
     let (a, b) = (others[0], others[1]);
     w.partition(l1, a);
     w.partition(l1, b);
-    w.run_until(|w| w.current_leader().is_some_and(|l| l != l1)).ok()?;
+    w.run_until(|w| w.current_leader().is_some_and(|l| l != l1))
+        .ok()?;
     let l2 = w.current_leader()?;
     let f = if l2 == a { b } else { a };
     w.run_steps(300).ok()?;
@@ -1589,13 +1921,18 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
             break;
         }
     }
-    if adopted == 0 { return None; }
+    if adopted == 0 {
+        return None;
+    }
     w.heal();
     w.partition_node(f);
     for _ in 0..2000 {
         w.run_steps(10).ok()?;
-        if w.node_is_candidate(f) && w.node_adopted_term(f) == adopted
-            && w.node_term(f) > adopted && !w.node_intake_gate(f) {
+        if w.node_is_candidate(f)
+            && w.node_adopted_term(f) == adopted
+            && w.node_term(f) > adopted
+            && !w.node_intake_gate(f)
+        {
             let ct = w.node_term(f);
             return Some((w, f, ct));
         }
@@ -1649,7 +1986,10 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     // ---- RED: the counterfactual reopens the lagged-handle candidate's gate. ----
     let (mut w, f, ct) =
         drive_to_candidate_lagged(3, false).expect("reach the lagged-handle candidate (red)");
-    assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+    assert!(
+        !w.node_intake_gate(f),
+        "precondition: candidate's gate is closed"
+    );
     assert!(
         w.node_adopted_term(f) < w.node_term(f),
         "precondition: the handle ({}) lags current_term ({})",
@@ -1660,7 +2000,8 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     // The candidate-term leader's map (identical to f's -> a clean, no-truncation
     // reconcile). `from` is any peer id; delivery bypasses the partition table.
     let from = (0..3).find(|&i| i != f).unwrap();
-    w.inject_term_map(from, f, ct, map.clone()).expect("clean reconcile (red)");
+    w.inject_term_map(from, f, ct, map.clone())
+        .expect("clean reconcile (red)");
     assert!(
         w.node_intake_gate(f),
         "RED (violating event): the lagged-handle candidate's clean reconcile of a \
@@ -1670,7 +2011,10 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     // ---- GREEN: the shipped fix keeps the gate closed; the candidate converges. ----
     let (mut w, f, ct) =
         drive_to_candidate_lagged(3, true).expect("reach the lagged-handle candidate (green)");
-    assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+    assert!(
+        !w.node_intake_gate(f),
+        "precondition: candidate's gate is closed"
+    );
     assert!(
         w.node_adopted_term(f) < w.node_term(f),
         "precondition: the handle ({}) lags current_term ({})",
@@ -1679,7 +2023,8 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     );
     let map = w.node_map(f);
     let from = (0..3).find(|&i| i != f).unwrap();
-    w.inject_term_map(from, f, ct, map.clone()).expect("clean reconcile (green)");
+    w.inject_term_map(from, f, ct, map.clone())
+        .expect("clean reconcile (green)");
     assert!(
         !w.node_intake_gate(f),
         "GREEN: the fix must keep a lagged-handle candidate's gate CLOSED on a clean reconcile"
@@ -1688,9 +2033,14 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     // term / step down and reconcile), not strand with a permanently shut gate.
     w.heal();
     let converged = w
-        .run_until(|w| w.current_leader().is_some() && !w.node_is_candidate(f) && w.node_intake_gate(f))
+        .run_until(|w| {
+            w.current_leader().is_some() && !w.node_is_candidate(f) && w.node_intake_gate(f)
+        })
         .expect("run");
-    assert!(converged, "GREEN liveness: the candidate must converge once unpartitioned");
+    assert!(
+        converged,
+        "GREEN liveness: the candidate must converge once unpartitioned"
+    );
 }
 
 /// Finding #9 — F2 twin for the SEPARATE truncating-ack reopen arm
@@ -1707,9 +2057,12 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
 #[test]
 fn finding9_truncating_arm_reopen_needs_handle_keyed() {
     for (handle_keyed, expect_open) in [(false, true), (true, false)] {
-        let (mut w, f, ct) = drive_to_candidate_lagged(3, handle_keyed)
-            .expect("reach the lagged-handle candidate");
-        assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+        let (mut w, f, ct) =
+            drive_to_candidate_lagged(3, handle_keyed).expect("reach the lagged-handle candidate");
+        assert!(
+            !w.node_intake_gate(f),
+            "precondition: candidate's gate is closed"
+        );
         assert!(
             w.node_adopted_term(f) < w.node_term(f),
             "precondition: the handle ({}) lags current_term ({})",
@@ -1737,7 +2090,8 @@ fn finding9_truncating_arm_reopen_needs_handle_keyed() {
         );
         map.push((ct, cut));
         let truncs_before = w.truncations();
-        w.inject_term_map(from, f, ct, map).expect("divergent reconcile");
+        w.inject_term_map(from, f, ct, map)
+            .expect("divergent reconcile");
         // Let the archive truncation ack land (on_truncated_feedback runs the
         // truncating-arm reopen check).
         w.run_steps(50).expect("process the truncation ack");
@@ -1760,7 +2114,12 @@ fn finding9_truncating_arm_reopen_needs_handle_keyed() {
 /// archive (5ms) events alone cost ~1800 steps/node/second, before any
 /// message traffic.
 fn crypto_cfg(seed: u64) -> SimConfig {
-    SimConfig { n_nodes: 3, seed, max_steps: 400_000, ..SimConfig::default() }
+    SimConfig {
+        n_nodes: 3,
+        seed,
+        max_steps: 400_000,
+        ..SimConfig::default()
+    }
 }
 
 /// Scenario 1 (brief): the Noise `IK` exchange plus its retry/backoff must
@@ -1812,10 +2171,14 @@ fn handshakes_complete_under_loss_and_reorder() {
     // does NOT discriminate (survives on luck — a pair only needs its one
     // shot at message 1 + message 2 to land). Seed 1 fails under the same
     // mutant (confirmed below and in the task report's re-verification).
-    let mut w = World::new(SimConfig { drop_per_million: 50_000, ..crypto_cfg(1) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 50_000,
+        ..crypto_cfg(1)
+    });
     w.enable_crypto_plane(3);
     assert!(
-        w.run_until_within(|w| w.all_peer_sessions_established(), 60_000_000_000).unwrap(),
+        w.run_until_within(|w| w.all_peer_sessions_established(), 60_000_000_000)
+            .unwrap(),
         "every pairwise session must establish within 60s of virtual time despite 5% loss"
     );
 }
@@ -1868,7 +2231,10 @@ fn handshakes_complete_under_loss_and_reorder() {
 #[test]
 #[ignore = "expected-red diagnostic (checker over-approximation, not a regression gate) — see doc comment"]
 fn known_red_inv2_over_approximation_at_20pct_loss() {
-    let mut w = World::new(SimConfig { drop_per_million: 200_000, ..crypto_cfg(78) });
+    let mut w = World::new(SimConfig {
+        drop_per_million: 200_000,
+        ..crypto_cfg(78)
+    });
     w.enable_crypto_plane(3);
     let err = w.run_until_within(|_w| false, 60_000_000_000).expect_err(
         "seed 78 @ 20% loss is EXPECTED to trip the inv2 over-approximation; if it no longer \
@@ -1900,8 +2266,12 @@ fn rotation_during_a_partition_converges_once_healed() {
         "pairwise handshakes must complete AND a leader must be elected on a quiet network"
     );
 
-    let leader = w.current_leader().expect("a leader must be elected before scripting the rotation");
-    let victim = (0..3).find(|&i| i != leader).expect("a 3-node cluster has a non-leader");
+    let leader = w
+        .current_leader()
+        .expect("a leader must be elected before scripting the rotation");
+    let victim = (0..3)
+        .find(|&i| i != leader)
+        .expect("a 3-node cluster has a non-leader");
 
     w.partition_node(victim);
     w.rotate_group_key();
@@ -1914,7 +2284,10 @@ fn rotation_during_a_partition_converges_once_healed() {
     // of GroupPlane's rule (every OTHER peer already acked instantly; the
     // isolated victim never can).
     w.run_for(3_000_000_000).unwrap();
-    assert_ne!(rotated_epoch, 0, "the leader must have actually minted an epoch");
+    assert_ne!(
+        rotated_epoch, 0,
+        "the leader must have actually minted an epoch"
+    );
     assert!(
         !w.node_has_group_epoch(victim, rotated_epoch),
         "the isolated node must not have the rotated epoch while still partitioned"
@@ -1945,8 +2318,11 @@ fn rotation_during_a_partition_converges_once_healed() {
     // that a captured-epoch version of this assertion is what surfaced the
     // storm in the first place.
     assert!(
-        w.run_until_within(|w| w.node_has_group_epoch(victim, w.current_epoch()), 20_000_000_000)
-            .unwrap(),
+        w.run_until_within(
+            |w| w.node_has_group_epoch(victim, w.current_epoch()),
+            20_000_000_000
+        )
+        .unwrap(),
         "the isolated node must converge on group traffic once healed"
     );
 }
@@ -2014,7 +2390,9 @@ fn a_node_that_missed_an_epoch_recovers_via_the_existing_nak_path() {
     );
 
     let leader = w.current_leader().expect("a leader must be elected");
-    let victim = (0..3).find(|&i| i != leader).expect("a 3-node cluster has a non-leader");
+    let victim = (0..3)
+        .find(|&i| i != leader)
+        .expect("a 3-node cluster has a non-leader");
 
     // Blocked for a SCRIPTED WINDOW (T13 review), not a one-shot drop: hold
     // the gap open past uc_crypto::group::ACTIVATION_TIMEOUT_NS (2s) so the
@@ -2046,7 +2424,8 @@ fn a_node_that_missed_an_epoch_recovers_via_the_existing_nak_path() {
     let target = w.node_append(leader);
 
     assert!(
-        w.run_until_within(|w| w.node_durable(victim) >= target, 30_000_000_000).unwrap(),
+        w.run_until_within(|w| w.node_durable(victim) >= target, 30_000_000_000)
+            .unwrap(),
         "the victim must still converge once it recovers the key"
     );
     assert!(
@@ -2072,7 +2451,10 @@ fn every_existing_safety_invariant_still_holds_with_the_crypto_plane_on() {
     });
     w.enable_crypto_plane(5);
     w.run_for(120_000_000_000).unwrap();
-    assert!(w.max_commit() > 0, "a crypto-gated cluster must still make genuine commit progress");
+    assert!(
+        w.max_commit() > 0,
+        "a crypto-gated cluster must still make genuine commit progress"
+    );
 }
 
 /// Discrimination proof for scenario 4: the crypto plane's additions to
@@ -2101,7 +2483,10 @@ fn crypto_plane_does_not_mask_the_mechanism_phantom_commit_oracle() {
         let mut cfg = nasty_reconcile_config(seed);
         cfg.crash_per_million = 1_000;
         cfg.attest_reports = false; // isolate the reopen guard (see above)
-        cfg.data_plane = DataPlane::Mechanism { reopen_guard: false, handle_keyed: true };
+        cfg.data_plane = DataPlane::Mechanism {
+            reopen_guard: false,
+            handle_keyed: true,
+        };
         let mut w = World::new(cfg);
         w.enable_crypto_plane(3);
         if let Err(v) = w.run()
@@ -2160,7 +2545,8 @@ fn cold_start_with_a_member_down_still_forms_and_seals() {
     w.enable_crypto_plane(3);
     w.partition_node(2);
     assert!(
-        w.run_until_within(|w| w.max_commit() > 0, 60_000_000_000).unwrap(),
+        w.run_until_within(|w| w.max_commit() > 0, 60_000_000_000)
+            .unwrap(),
         "the surviving majority must still form and commit despite one member \
          permanently unreachable and frequent re-election"
     );
@@ -2231,8 +2617,12 @@ fn fresh_vote_credential_survives_the_same_construction() {
 }
 
 fn issue7_world(seed: u64, vote_refresh_durable: bool) -> World {
-    let mut cfg =
-        SimConfig { n_nodes: 3, drop_per_million: 0, max_steps: 200_000, ..base_cfg(seed) };
+    let mut cfg = SimConfig {
+        n_nodes: 3,
+        drop_per_million: 0,
+        max_steps: 200_000,
+        ..base_cfg(seed)
+    };
     cfg.vote_refresh_durable = vote_refresh_durable;
     cfg.consensus_step_ns = 4 * cfg.archive_step_ns; // see the RED doc comment
     World::new(cfg)
@@ -2265,7 +2655,9 @@ fn slide_the_window(w: &mut World, target_len: usize) -> Result<(usize, bool), I
     let mut rounds = 0;
     while longest(w) < target_len && rounds < 4 * target_len {
         rounds += 1;
-        let leader = w.current_leader().expect("a leader exists at the top of every round");
+        let leader = w
+            .current_leader()
+            .expect("a leader exists at the top of every round");
         w.crash(leader);
         w.run_until_leader()?;
         w.append_and_replicate(4096);
@@ -2316,7 +2708,10 @@ fn window_slide_past_64_lifetime_terms_reconciles_healthy_followers_clean() {
     let mut w = World::new(window_slide_cfg());
     let target = MAX_TERM_MAP_WIRE_ENTRIES + 8;
     let (rounds, converged) = slide_the_window(&mut w, target).unwrap();
-    assert!(converged, "round {rounds}: the cluster did not reconverge after the restart");
+    assert!(
+        converged,
+        "round {rounds}: the cluster did not reconverge after the restart"
+    );
     let longest = (0..3).map(|i| w.node_map(i).len()).max().unwrap();
     assert!(
         longest >= target,
@@ -2324,8 +2719,16 @@ fn window_slide_past_64_lifetime_terms_reconciles_healthy_followers_clean() {
          window (longest {longest} after {rounds} rounds) — the window never slid, so this \
          test proves nothing about alignment"
     );
-    assert_eq!(w.wipes(), 0, "a healthy follower was wiped (NoCommonPrefix) by a slid window");
-    assert_eq!(w.truncations(), 0, "a healthy follower was truncated by a slid window");
+    assert_eq!(
+        w.wipes(),
+        0,
+        "a healthy follower was wiped (NoCommonPrefix) by a slid window"
+    );
+    assert_eq!(
+        w.truncations(),
+        0,
+        "a healthy follower was truncated by a slid window"
+    );
     let leader = w.current_leader().unwrap();
     for i in 0..3 {
         assert_eq!(

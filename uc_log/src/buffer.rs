@@ -99,14 +99,23 @@ pub struct RecordableCorrupt {
 impl LogBuffer {
     pub fn new(region: Region, cnc: Arc<CncPage>, max_payload: usize) -> Self {
         let capacity = region.len() as u64;
-        assert!(capacity.is_power_of_two(), "capacity must be a power of two");
+        assert!(
+            capacity.is_power_of_two(),
+            "capacity must be a power of two"
+        );
         assert!(capacity <= 1 << 31, "length commit word is u32");
         let max_claim = 2 * align_frame_len(HEADER_LEN + max_payload) as u64;
         assert!(
             capacity >= 4 * max_claim,
             "capacity too small for max_payload (need >= 4x max claim)"
         );
-        Self { region, capacity, mask: capacity - 1, max_payload, cnc }
+        Self {
+            region,
+            capacity,
+            mask: capacity - 1,
+            max_payload,
+            cnc,
+        }
     }
 
     #[inline]
@@ -161,7 +170,10 @@ impl LogBuffer {
         cnc: Arc<CncPage>,
         max_payload: usize,
     ) -> Result<Self, std::io::Error> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
         // SAFETY: see create_file.
         let m = unsafe { memmap2::MmapMut::map_mut(&file)? };
         Ok(Self::new(Region::from_mmap(m), cnc, max_payload))
@@ -276,7 +288,10 @@ impl LogBuffer {
         let foff = self.offset(fpos);
         let flo = foff.saturating_sub(64);
         let fhi = (foff + 96).min(self.region.len());
-        let _ = writeln!(s, "  FAILING FRAME at pos={fpos} (off={foff}); hexdump [{flo}, {fhi}):");
+        let _ = writeln!(
+            s,
+            "  FAILING FRAME at pos={fpos} (off={foff}); hexdump [{flo}, {fhi}):"
+        );
         // SAFETY: [flo, fhi) is inside the mapped region.
         let fbytes = unsafe { std::slice::from_raw_parts(self.region.ptr_at(flo), fhi - flo) };
         for (i, chunk) in fbytes.chunks(32).enumerate() {
@@ -308,7 +323,12 @@ impl LogBuffer {
             ));
             w += align_frame_len(len as usize) as u64;
         }
-        let _ = writeln!(s, "    ({} frames tile [from, from+{}))", walked.len(), c.end);
+        let _ = writeln!(
+            s,
+            "    ({} frames tile [from, from+{}))",
+            walked.len(),
+            c.end
+        );
         for line in walked.iter().take(3) {
             let _ = writeln!(s, "{line}");
         }
@@ -355,7 +375,11 @@ impl LogBuffer {
     /// a frame in half. CONTRACT: only the archive (the durability gate
     /// holder) may call this; the returned slice is protected from overwrite
     /// by the appender's gate against `durable`.
-    pub fn recordable_slice(&self, from: u64, max_bytes: usize) -> Result<&[u8], RecordableCorrupt> {
+    pub fn recordable_slice(
+        &self,
+        from: u64,
+        max_bytes: usize,
+    ) -> Result<&[u8], RecordableCorrupt> {
         let append = self.cnc.counters().append.load_acquire();
         if append <= from {
             return Ok(&[]);
@@ -369,11 +393,9 @@ impl LogBuffer {
         while end < hard {
             let len = u32::from_le_bytes(
                 // SAFETY: off+end within capacity (end < hard <= capacity-off).
-                unsafe {
-                    std::slice::from_raw_parts(self.region.ptr_at(off + end as usize), 4)
-                }
-                .try_into()
-                .unwrap(),
+                unsafe { std::slice::from_raw_parts(self.region.ptr_at(off + end as usize), 4) }
+                    .try_into()
+                    .unwrap(),
             );
             let aligned = align_frame_len(len as usize) as u64;
             // Frames never span the wrap and padding fills exactly to it, so
@@ -386,7 +408,12 @@ impl LogBuffer {
             // config/new-term/padding frame of length >= HEADER_LEN, so guard it
             // exactly as `Replay::next`/`observe_terms` do (Task 3 H1 audit).
             if (len as usize) < HEADER_LEN || end + aligned > hard {
-                return Err(RecordableCorrupt { from, append, end, claimed_len: len });
+                return Err(RecordableCorrupt {
+                    from,
+                    append,
+                    end,
+                    claimed_len: len,
+                });
             }
             if end > 0 && end + aligned > max_bytes as u64 {
                 break;
@@ -479,7 +506,11 @@ impl LogBuffer {
             }
             // SAFETY: o + 5 within capacity (aligned span checked above).
             let ftype = unsafe { *self.region.ptr_at(o + frame::OFF_TYPE) };
-            let copy_len = if ftype == FRAME_TYPE_PADDING { HEADER_LEN } else { aligned as usize };
+            let copy_len = if ftype == FRAME_TYPE_PADDING {
+                HEADER_LEN
+            } else {
+                aligned as usize
+            };
             if copied > 0 && copied + copy_len > max_bytes {
                 break;
             }
@@ -503,7 +534,10 @@ impl LogBuffer {
             // len == 0 at a committed position: primed-over-fresh-buffer.
             return SliceRead::Overrun;
         }
-        SliceRead::Run(RunRead { bytes: copied, advance: walked })
+        SliceRead::Run(RunRead {
+            bytes: copied,
+            advance: walked,
+        })
     }
 }
 
@@ -522,7 +556,12 @@ impl Appender {
     pub fn new(buffer: Arc<LogBuffer>, leadership_term_id: u32) -> Self {
         let pos = buffer.cnc.counters().append.load_acquire();
         let cached_durable = buffer.cnc.counters().durable.load_acquire();
-        Self { buffer, pos, cached_durable, leadership_term_id }
+        Self {
+            buffer,
+            pos,
+            cached_durable,
+            leadership_term_id,
+        }
     }
 
     #[inline]
@@ -822,7 +861,10 @@ mod tests {
         // pins the explicit-term signature.
         let end = a.append_config(9, payload).unwrap();
         // 32 header + 12 payload = 44 -> aligned 64
-        assert_eq!(end, 64, "returns the frame-END position, unlike append/append_new_term");
+        assert_eq!(
+            end, 64,
+            "returns the frame-END position, unlike append/append_new_term"
+        );
         assert_eq!(a.position(), 64);
         assert_eq!(c.counters().append.load_acquire(), 64);
 
@@ -869,12 +911,16 @@ mod tests {
         a.append(1, 0, &[0u8; 64]).unwrap(); // frame 1: 96 B, at offset 0
         a.append(1, 1, &[0u8; 64]).unwrap(); // frame 2: 96 B, at offset 96
         let second_frame_off = 96usize;
-        b.commit_word(second_frame_off).store(1 << 20, Ordering::Release); // absurd len
+        b.commit_word(second_frame_off)
+            .store(1 << 20, Ordering::Release); // absurd len
         let err = b.recordable_slice(0, 1 << 20).unwrap_err();
         assert_eq!(err.claimed_len, 1 << 20);
         assert_eq!(err.from, 0);
         assert_eq!(err.append, 192);
-        assert!(err.end > 0, "the first, intact frame was walked before the tear");
+        assert!(
+            err.end > 0,
+            "the first, intact frame was walked before the tear"
+        );
     }
 
     /// Post-M7 follow-up (Task 3 H1 audit): a torn length word whose value is
@@ -899,7 +945,10 @@ mod tests {
         b.commit_word(96).store(1, Ordering::Release);
         let err = b.recordable_slice(0, 1 << 20).unwrap_err();
         assert_eq!(err.claimed_len, 1);
-        assert_eq!(err.end, 96, "the first, intact frame was walked before the tear");
+        assert_eq!(
+            err.end, 96,
+            "the first, intact frame was walked before the tear"
+        );
         assert_eq!(err.from, 0);
         assert_eq!(err.append, 128);
     }
@@ -941,12 +990,18 @@ mod tests {
             a.append(1, i, &[0u8; 64]).unwrap();
         }
         // 4032 used; next append needs padding(64) + frame(96) -> end 4192 > 0 + 4096
-        assert_eq!(a.append(1, 500, &[0u8; 64]).unwrap_err(), AppendError::WouldOverrun);
+        assert_eq!(
+            a.append(1, 500, &[0u8; 64]).unwrap_err(),
+            AppendError::WouldOverrun
+        );
         // archive "records" one frame -> gate opens exactly enough
         c.counters().durable.store_release(96);
         assert_eq!(a.append(1, 500, &[0u8; 64]).unwrap(), 4096);
         // and closes again
-        assert_eq!(a.append(1, 501, &[0u8; 64]).unwrap_err(), AppendError::WouldOverrun);
+        assert_eq!(
+            a.append(1, 501, &[0u8; 64]).unwrap_err(),
+            AppendError::WouldOverrun
+        );
     }
 
     /// M7 Task 7 (uc_node's admin path, mandatory review carry): a
@@ -987,7 +1042,11 @@ mod tests {
 
         // No partial state: position, the shared append counter, and every
         // recorded byte are BIT-FOR-BIT what they were before the failed call.
-        assert_eq!(a.position(), pos_before, "WouldOverrun must not advance the appender's position");
+        assert_eq!(
+            a.position(),
+            pos_before,
+            "WouldOverrun must not advance the appender's position"
+        );
         assert_eq!(
             c.counters().append.load_acquire(),
             append_before,
@@ -1004,14 +1063,20 @@ mod tests {
         // attempt left nothing behind for the retry to trip over.
         c.counters().durable.store_release(4032);
         let end = a.append_config(9, &big_payload).unwrap();
-        assert_eq!(end, pos_before + 64 /* pad */ + align_frame_len(HEADER_LEN + big_payload.len()) as u64);
+        assert_eq!(
+            end,
+            pos_before + 64 /* pad */ + align_frame_len(HEADER_LEN + big_payload.len()) as u64
+        );
     }
 
     #[test]
     fn payload_too_large_is_rejected() {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1);
-        assert_eq!(a.append(1, 1, &[0u8; 257]).unwrap_err(), AppendError::PayloadTooLarge);
+        assert_eq!(
+            a.append(1, 1, &[0u8; 257]).unwrap_err(),
+            AppendError::PayloadTooLarge
+        );
     }
 
     #[test]
@@ -1029,7 +1094,10 @@ mod tests {
             other => panic!("expected Frame, got {other:?}"),
         }
         // beyond append -> NotCommitted
-        assert!(matches!(b.read_frame_validated(64, &mut out), FrameRead::NotCommitted));
+        assert!(matches!(
+            b.read_frame_validated(64, &mut out),
+            FrameRead::NotCommitted
+        ));
     }
 
     #[test]
@@ -1044,12 +1112,21 @@ mod tests {
         // Both positions pass the lap-overrun margin check (>= append +
         // max_claim - capacity = 8192 + 576 - 4096 = 4672) and previously
         // fell through to the zero commit word.
-        assert!(matches!(b.read_frame_validated(2 * CAP - 64, &mut out), FrameRead::Overrun));
-        assert!(matches!(b.read_frame_validated(4672, &mut out), FrameRead::Overrun));
+        assert!(matches!(
+            b.read_frame_validated(2 * CAP - 64, &mut out),
+            FrameRead::Overrun
+        ));
+        assert!(matches!(
+            b.read_frame_validated(4672, &mut out),
+            FrameRead::Overrun
+        ));
         // Post-restart appends still read fine.
         let mut a = Appender::new(Arc::clone(&b), 5);
         a.append(1, 7, b"post-restart").unwrap();
-        assert!(matches!(b.read_frame_validated(2 * CAP, &mut out), FrameRead::Frame(_)));
+        assert!(matches!(
+            b.read_frame_validated(2 * CAP, &mut out),
+            FrameRead::Frame(_)
+        ));
     }
 
     #[test]
@@ -1066,10 +1143,16 @@ mod tests {
         }
         // position 0 was overwritten laps ago
         let mut out = Vec::new();
-        assert!(matches!(b.read_frame_validated(0, &mut out), FrameRead::Overrun));
+        assert!(matches!(
+            b.read_frame_validated(0, &mut out),
+            FrameRead::Overrun
+        ));
         // a recent frame still reads fine (within capacity minus margin)
         let recent = a.position() - 96;
-        assert!(matches!(b.read_frame_validated(recent, &mut out), FrameRead::Frame(_)));
+        assert!(matches!(
+            b.read_frame_validated(recent, &mut out),
+            FrameRead::Frame(_)
+        ));
     }
 
     #[test]
@@ -1104,7 +1187,10 @@ mod tests {
             other => panic!("expected Run, got {other:?}"),
         }
         // caught up
-        assert!(matches!(b.read_run_validated(4 * 96, 4096, &mut out), SliceRead::NotCommitted));
+        assert!(matches!(
+            b.read_run_validated(4 * 96, 4096, &mut out),
+            SliceRead::NotCommitted
+        ));
     }
 
     #[test]
@@ -1148,10 +1234,16 @@ mod tests {
             n += 1;
         }
         let mut out = Vec::new();
-        assert!(matches!(b.read_run_validated(0, 1392, &mut out), SliceRead::Overrun));
+        assert!(matches!(
+            b.read_run_validated(0, 1392, &mut out),
+            SliceRead::Overrun
+        ));
         // primed-over-fresh-buffer (Task 1 semantics, run variant)
         let (b2, c2) = buf();
         c2.counters().prime(2 * CAP);
-        assert!(matches!(b2.read_run_validated(2 * CAP - 64, 1392, &mut out), SliceRead::Overrun));
+        assert!(matches!(
+            b2.read_run_validated(2 * CAP - 64, 1392, &mut out),
+            SliceRead::Overrun
+        ));
     }
 }

@@ -57,11 +57,11 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use uc_client::{Client, ClientError};
-use uc_log::cnc::{AdminReq, CncPage};
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp};
+use uc_log::cnc::{AdminReq, CncPage};
 
 mod common;
 use common::*;
@@ -364,8 +364,12 @@ fn spawn_workers(
     (0..n_workers)
         .map(|w| {
             let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (dir, history, last_seen, stop) =
-                (Arc::clone(dir), Arc::clone(history), Arc::clone(last_seen), Arc::clone(stop));
+            let (dir, history, last_seen, stop) = (
+                Arc::clone(dir),
+                Arc::clone(history),
+                Arc::clone(last_seen),
+                Arc::clone(stop),
+            );
             std::thread::spawn(move || worker(w, dir, history, last_seen, stop, rng, throttle))
         })
         .collect()
@@ -466,7 +470,8 @@ fn worker2(
                                 conn.drop_client();
                                 std::thread::sleep(Duration::from_millis(20));
                             }
-                            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                            Err(ClientError::Timeout(_))
+                            | Err(ClientError::ResponseOverwritten) => {
                                 conn.drop_client();
                                 break Outcome::Indeterminate;
                             }
@@ -505,7 +510,12 @@ fn worker2(
                                     if *ok {
                                         last_seen.store(new, Ordering::Relaxed);
                                     }
-                                    h0.record(id, op.clone(), inv0, Outcome::Ok(RegResp::CasOk(*ok)));
+                                    h0.record(
+                                        id,
+                                        op.clone(),
+                                        inv0,
+                                        Outcome::Ok(RegResp::CasOk(*ok)),
+                                    );
                                     h1.record(id, op, inv1, Outcome::Ok(RegResp::CasOk(*ok)));
                                 }
                                 other => panic!("cas returned non-cas response: {other:?}"),
@@ -551,7 +561,9 @@ fn spawn_workers2(
                 Arc::clone(last_seen),
                 Arc::clone(stop),
             );
-            std::thread::spawn(move || worker2(w, dir, h0, h1, equiv, last_seen, stop, rng, throttle))
+            std::thread::spawn(move || {
+                worker2(w, dir, h0, h1, equiv, last_seen, stop, rng, throttle)
+            })
         })
         .collect()
 }
@@ -574,7 +586,11 @@ fn join_workers(handles: Vec<std::thread::JoinHandle<()>>) {
 fn warmup_write(dir: &Path, history: &History, last_seen: &AtomicU64) {
     let mut conn = Conn::new(dir.to_path_buf());
     let inv = history.invoke();
-    match submit_cmd(&mut conn, &Cmd::Write(1), Instant::now() + Duration::from_secs(15)) {
+    match submit_cmd(
+        &mut conn,
+        &Cmd::Write(1),
+        Instant::now() + Duration::from_secs(15),
+    ) {
         SubmitOutcome::Ok(_) => {}
         other => panic!("warm-up write did not commit: {other:?}"),
     }
@@ -600,7 +616,11 @@ fn warmup_write(dir: &Path, history: &History, last_seen: &AtomicU64) {
 fn warmup_write2(dir: &Path, h0: &History, h1: &History, last_seen: &AtomicU64) {
     let mut conn = Conn::new(dir.to_path_buf());
     let (inv0, inv1) = (h0.invoke(), h1.invoke());
-    match submit_all_cmd(&mut conn, &Cmd::Write(1), Instant::now() + Duration::from_secs(15)) {
+    match submit_all_cmd(
+        &mut conn,
+        &Cmd::Write(1),
+        Instant::now() + Duration::from_secs(15),
+    ) {
         SubmitOutcome2::Ok(_) => {}
         other => panic!("warm-up write did not commit: {other:?}"),
     }
@@ -633,7 +653,10 @@ fn assert_linearizable(entries: &[uc_lincheck::history::Entry], dump_prefix: &st
                 s.push_str(&format!("{e:?}\n"));
             }
             let _ = std::fs::write(&path, s);
-            eprintln!("[{dump_prefix}] history ({} entries) dumped to {path}", entries.len());
+            eprintln!(
+                "[{dump_prefix}] history ({} entries) dumped to {path}",
+                entries.len()
+            );
             panic!("{dump_prefix} history NOT linearizable (tag {tag})");
         }
     }
@@ -653,7 +676,10 @@ fn assert_linearizable(entries: &[uc_lincheck::history::Entry], dump_prefix: &st
 #[test]
 fn linearizable_under_service_sigkill() {
     shorten_client_timeout();
-    let seed: u64 = std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let tmp = tempdir();
     let inst = tmp.path().join("inst");
@@ -663,8 +689,9 @@ fn linearizable_under_service_sigkill() {
     // Enabled instead of the pre-M8 Disabled default.
     let crypto_on = crypto_from_env();
     let crypto = crypto_on.then(|| provision_crypto(&inst, &[0]));
-    let crypto_args =
-        crypto.as_ref().map(|m| (m.key_paths[&0].as_path(), m.allowlist_path.as_path()));
+    let crypto_args = crypto
+        .as_ref()
+        .map(|m| (m.key_paths[&0].as_path(), m.allowlist_path.as_path()));
 
     // Node held for the whole test; service held behind a Mutex<Option<_>>
     // so the fault loop can SIGKILL + respawn it. `Option` (not a bare
@@ -716,7 +743,10 @@ fn linearizable_under_service_sigkill() {
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
 
     let ok = History::ok_count(&entries);
     eprintln!(
@@ -739,7 +769,10 @@ fn linearizable_under_service_sigkill() {
 #[test]
 fn two_fsm_service_sigkill() {
     shorten_client_timeout();
-    let seed: u64 = std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let tmp = tempdir();
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
@@ -753,8 +786,17 @@ fn two_fsm_service_sigkill() {
     let last_seen = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     warmup_write2(&inst, &h0, &h1, &last_seen);
-    let handles =
-        spawn_workers2(&dir, &h0, &h1, &equiv, &last_seen, &stop, seed, Duration::from_millis(7), 3);
+    let handles = spawn_workers2(
+        &dir,
+        &h0,
+        &h1,
+        &equiv,
+        &last_seen,
+        &stop,
+        seed,
+        Duration::from_millis(7),
+        3,
+    );
     for _ in 0..5 {
         std::thread::sleep(Duration::from_millis(700));
         let mut g = svc1.lock().unwrap();
@@ -764,14 +806,22 @@ fn two_fsm_service_sigkill() {
     std::thread::sleep(Duration::from_secs(1));
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
-    assert_eq!(equiv.load(Ordering::Relaxed), 0, "replication-equivalence violated");
+    assert_eq!(
+        equiv.load(Ordering::Relaxed),
+        0,
+        "replication-equivalence violated"
+    );
     assert_linearizable(
-        &Arc::try_unwrap(h0).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        &Arc::try_unwrap(h0)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
         "two_fsm_service_sigkill_fsm0",
         "fsm0",
     );
     assert_linearizable(
-        &Arc::try_unwrap(h1).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        &Arc::try_unwrap(h1)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
         "two_fsm_service_sigkill_fsm1",
         "fsm1",
     );
@@ -795,13 +845,18 @@ fn two_fsm_service_sigkill() {
 #[test]
 fn two_fsm_node_sigkill() {
     shorten_client_timeout();
-    let seed: u64 = std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let tmp = tempdir();
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
 
-    let node = Arc::new(Mutex::new(Some(spawn_node_with_services(&inst, "0,1", "65536"))));
+    let node = Arc::new(Mutex::new(Some(spawn_node_with_services(
+        &inst, "0,1", "65536",
+    ))));
     wait_for_ready(&inst, Duration::from_secs(10));
     let svc0 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 0))));
     let svc1 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 1))));
@@ -816,7 +871,9 @@ fn two_fsm_node_sigkill() {
 
     const N_WORKERS: u32 = 3;
     let throttle = Duration::from_millis(7);
-    let handles = spawn_workers2(&dir, &h0, &h1, &equiv, &last_seen, &stop, seed, throttle, N_WORKERS);
+    let handles = spawn_workers2(
+        &dir, &h0, &h1, &equiv, &last_seen, &stop, seed, throttle, N_WORKERS,
+    );
 
     for run in 0..3u32 {
         std::thread::sleep(Duration::from_millis(500));
@@ -871,14 +928,22 @@ fn two_fsm_node_sigkill() {
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
 
-    assert_eq!(equiv.load(Ordering::Relaxed), 0, "replication-equivalence violated");
+    assert_eq!(
+        equiv.load(Ordering::Relaxed),
+        0,
+        "replication-equivalence violated"
+    );
     assert_linearizable(
-        &Arc::try_unwrap(h0).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        &Arc::try_unwrap(h0)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
         "two_fsm_node_sigkill_fsm0",
         "fsm0",
     );
     assert_linearizable(
-        &Arc::try_unwrap(h1).map(History::into_entries).unwrap_or_else(|a| a.snapshot()),
+        &Arc::try_unwrap(h1)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
         "two_fsm_node_sigkill_fsm1",
         "fsm1",
     );
@@ -930,8 +995,9 @@ fn node_sigkill_recovery_once(run: u32) {
     // reused across the restart below (same instance dir, same node id).
     let crypto_on = crypto_from_env();
     let crypto = crypto_on.then(|| provision_crypto(&inst, &[0]));
-    let crypto_args =
-        crypto.as_ref().map(|m| (m.key_paths[&0].as_path(), m.allowlist_path.as_path()));
+    let crypto_args = crypto
+        .as_ref()
+        .map(|m| (m.key_paths[&0].as_path(), m.allowlist_path.as_path()));
 
     // `Mutex<Option<_>>` (not a bare `Reap`), same rationale as the
     // service-kill test above: an explicit `.take()` kills + reaps the OLD
@@ -1000,7 +1066,10 @@ fn node_sigkill_recovery_once(run: u32) {
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[node_sigkill_recovery] run={run} ops={} ok_before_kill={ok_before_kill} \
@@ -1056,7 +1125,11 @@ fn free_addr() -> SocketAddr {
 }
 
 fn members_arg(members: &[(u32, SocketAddr)]) -> String {
-    members.iter().map(|(id, a)| format!("{id}@{a}")).collect::<Vec<_>>().join(",")
+    members
+        .iter()
+        .map(|(id, a)| format!("{id}@{a}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
@@ -1089,7 +1162,10 @@ fn spawn_node_multi(
         .arg("--members")
         .arg(members);
     if let Some((key_path, allowlist_path)) = crypto {
-        cmd.arg("--crypto-key").arg(key_path).arg("--crypto-allowlist").arg(allowlist_path);
+        cmd.arg("--crypto-key")
+            .arg(key_path)
+            .arg("--crypto-allowlist")
+            .arg(allowlist_path);
     }
     let child = cmd
         .stdout(Stdio::inherit())
@@ -1120,11 +1196,18 @@ fn await_single_leader_multi(dirs: &[PathBuf], secs: u64) -> usize {
                 open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want)
             })
             .collect();
-        assert!(serving.len() <= 1, "split-brain: dirs {serving:?} all serve");
+        assert!(
+            serving.len() <= 1,
+            "split-brain: dirs {serving:?} all serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
-        assert!(Instant::now() < deadline, "no single leader among {} dirs within {secs}s", dirs.len());
+        assert!(
+            Instant::now() < deadline,
+            "no single leader among {} dirs within {secs}s",
+            dirs.len()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1158,7 +1241,9 @@ fn wait_for_fresh_cnc_instance(dir: &Path, old_id: Option<u128>, timeout: Durati
 /// before a lagging node catches up. Returns the settled common version.
 fn await_config_converged_one_of(dirs: &[PathBuf], v_lo: u64, v_hi: u64, secs: u64) -> u64 {
     let read_all = |dirs: &[PathBuf]| -> Option<Vec<u64>> {
-        dirs.iter().map(|d| open_cnc(d).map(|c| c.config_version())).collect()
+        dirs.iter()
+            .map(|d| open_cnc(d).map(|c| c.config_version()))
+            .collect()
     };
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -1197,7 +1282,11 @@ fn await_config_converged_one_of(dirs: &[PathBuf], v_lo: u64, v_hi: u64, secs: u
             for (i, (a, b)) in s0.iter().zip(&s1).enumerate() {
                 let hb = match (a, b) {
                     (Some(x), Some(y)) => {
-                        if y.3 > x.3 { "heartbeat MOVING" } else { "heartbeat FROZEN" }
+                        if y.3 > x.3 {
+                            "heartbeat MOVING"
+                        } else {
+                            "heartbeat FROZEN"
+                        }
                     }
                     _ => "cnc unreadable",
                 };
@@ -1237,7 +1326,11 @@ impl MultiConn {
     /// rather than index out of range.
     fn new(dirs: Arc<Vec<PathBuf>>, start: usize) -> Self {
         let target = start % dirs.len();
-        Self { dirs, target, client: None }
+        Self {
+            dirs,
+            target,
+            client: None,
+        }
     }
     fn client(&mut self) -> Option<&Client> {
         if self.client.is_none() {
@@ -1427,9 +1520,15 @@ fn spawn_workers_multi(
     (1..=n_workers)
         .map(|w| {
             let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (dirs, history, stop, last_seen) =
-                (Arc::clone(dirs), Arc::clone(history), Arc::clone(stop), Arc::clone(last_seen));
-            std::thread::spawn(move || worker_multi(w, dirs, history, stop, rng, last_seen, throttle))
+            let (dirs, history, stop, last_seen) = (
+                Arc::clone(dirs),
+                Arc::clone(history),
+                Arc::clone(stop),
+                Arc::clone(last_seen),
+            );
+            std::thread::spawn(move || {
+                worker_multi(w, dirs, history, stop, rng, last_seen, throttle)
+            })
         })
         .collect()
 }
@@ -1440,7 +1539,11 @@ fn spawn_workers_multi(
 fn warmup_write_multi(dirs: &Arc<Vec<PathBuf>>, history: &History, last_seen: &AtomicU64) {
     let mut conn = MultiConn::new(Arc::clone(dirs), 0);
     let inv = history.invoke();
-    match submit_cmd_multi(&mut conn, &Cmd::Write(1), Instant::now() + Duration::from_secs(20)) {
+    match submit_cmd_multi(
+        &mut conn,
+        &Cmd::Write(1),
+        Instant::now() + Duration::from_secs(20),
+    ) {
         SubmitOutcome::Ok(_) => {}
         other => panic!("warm-up write did not commit: {other:?}"),
     }
@@ -1471,9 +1574,12 @@ fn sigkill_mid_config_window() {
     // boot a real process (the `spare_id`s below name an admin-protocol
     // target that never actually starts a node — see the loop's comment).
     let crypto_on = crypto_from_env();
-    let crypto = crypto_on.then(|| provision_crypto(tmp.path(), &(0..N as u32).collect::<Vec<_>>()));
+    let crypto =
+        crypto_on.then(|| provision_crypto(tmp.path(), &(0..N as u32).collect::<Vec<_>>()));
     let crypto_args_for = |id: u32| -> Option<(&Path, &Path)> {
-        crypto.as_ref().map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
+        crypto
+            .as_ref()
+            .map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
     };
 
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(N);
@@ -1481,7 +1587,13 @@ fn sigkill_mid_config_window() {
     for i in 0..N as u32 {
         let d = tmp.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
-        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str, crypto_args_for(i))));
+        node_procs.push(Some(spawn_node_multi(
+            &d,
+            i,
+            addrs[i as usize],
+            &members_str,
+            crypto_args_for(i),
+        )));
         wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
     }
@@ -1500,8 +1612,15 @@ fn sigkill_mid_config_window() {
     warmup_write_multi(&dirs, &history, &last_seen);
 
     const N_WORKERS: u32 = 3;
-    let handles =
-        spawn_workers_multi(&dirs, &history, &stop, &last_seen, 0xC0FFEE, Duration::from_millis(15), N_WORKERS);
+    let handles = spawn_workers_multi(
+        &dirs,
+        &history,
+        &stop,
+        &last_seen,
+        0xC0FFEE,
+        Duration::from_millis(15),
+        N_WORKERS,
+    );
 
     const RUNS: u32 = 3;
     let mut committed_version = 0u64;
@@ -1624,7 +1743,10 @@ fn sigkill_mid_config_window() {
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[sigkill_mid_config_window] ops={} ok={ok} runs={RUNS} \
@@ -1687,9 +1809,12 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
     // M8 Task 15: UC2_CRYPTO=1 boots this real 3-PROCESS cluster with wire
     // crypto Enabled on every node.
     let crypto_on = crypto_from_env();
-    let crypto = crypto_on.then(|| provision_crypto(tmp.path(), &(0..N as u32).collect::<Vec<_>>()));
+    let crypto =
+        crypto_on.then(|| provision_crypto(tmp.path(), &(0..N as u32).collect::<Vec<_>>()));
     let crypto_args_for = |id: u32| -> Option<(&Path, &Path)> {
-        crypto.as_ref().map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
+        crypto
+            .as_ref()
+            .map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
     };
 
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(N);
@@ -1697,7 +1822,13 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
     for i in 0..N as u32 {
         let d = tmp.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
-        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str, crypto_args_for(i))));
+        node_procs.push(Some(spawn_node_multi(
+            &d,
+            i,
+            addrs[i as usize],
+            &members_str,
+            crypto_args_for(i),
+        )));
         wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
     }
@@ -1716,8 +1847,15 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
     warmup_write_multi(&dirs, &history, &last_seen);
 
     const N_WORKERS: u32 = 3;
-    let handles =
-        spawn_workers_multi(&dirs, &history, &stop, &last_seen, seed, Duration::from_millis(15), N_WORKERS);
+    let handles = spawn_workers_multi(
+        &dirs,
+        &history,
+        &stop,
+        &last_seen,
+        seed,
+        Duration::from_millis(15),
+        N_WORKERS,
+    );
 
     // Let some load land before the kill.
     std::thread::sleep(Duration::from_millis(500));
@@ -1758,7 +1896,10 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     eprintln!(
         "[leader_node_sigkill_recovery_multi] run={run} ops={} ok_before_kill={ok_before_kill} \
@@ -1775,6 +1916,10 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
          — the cluster failed to resume serving after recovery"
     );
 
-    assert_linearizable(&entries, "leader_node_sigkill_recovery_multi", &format!("run{run}"));
+    assert_linearizable(
+        &entries,
+        "leader_node_sigkill_recovery_multi",
+        &format!("run{run}"),
+    );
     // node_procs / svc_procs dropped here → killed + reaped.
 }

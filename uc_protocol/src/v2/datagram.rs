@@ -101,7 +101,9 @@ pub fn read_append_position_body(buf: &[u8]) -> Option<AppendPositionBody> {
     if buf.len() < APPEND_POSITION_BODY_LEN {
         return None;
     }
-    Some(AppendPositionBody { durable_term: u32::from_le_bytes(buf[0..4].try_into().unwrap()) })
+    Some(AppendPositionBody {
+        durable_term: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+    })
 }
 
 pub const READ_PROBE_BODY_LEN: usize = 16;
@@ -479,14 +481,22 @@ pub fn read_datagram_header(buf: &[u8]) -> Option<DatagramHeader> {
         return None;
     }
     Some(DatagramHeader {
-        position: u64::from_le_bytes(buf[OFF_DGRAM_POSITION..OFF_DGRAM_POSITION + 8].try_into().unwrap()),
+        position: u64::from_le_bytes(
+            buf[OFF_DGRAM_POSITION..OFF_DGRAM_POSITION + 8]
+                .try_into()
+                .unwrap(),
+        ),
         leadership_term_id: u32::from_le_bytes(
-            buf[OFF_DGRAM_TERM_ID..OFF_DGRAM_TERM_ID + 4].try_into().unwrap(),
+            buf[OFF_DGRAM_TERM_ID..OFF_DGRAM_TERM_ID + 4]
+                .try_into()
+                .unwrap(),
         ),
         kind: buf[OFF_DGRAM_KIND],
         flags: buf[OFF_DGRAM_FLAGS],
         key_epoch: u16::from_le_bytes(
-            buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].try_into().unwrap(),
+            buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2]
+                .try_into()
+                .unwrap(),
         ),
     })
 }
@@ -564,11 +574,17 @@ mod tests {
     #[test]
     fn short_inputs_are_none_not_panics() {
         for n in 0..DATAGRAM_HEADER_LEN {
-            assert!(read_datagram_header(&vec![0u8; n]).is_none(), "header len {n}");
+            assert!(
+                read_datagram_header(&vec![0u8; n]).is_none(),
+                "header len {n}"
+            );
         }
         assert!(read_datagram_header(&[0u8; DATAGRAM_HEADER_LEN]).is_some());
         for n in 0..REQUEST_VOTE_BODY_LEN {
-            assert!(read_request_vote_body(&vec![0u8; n]).is_none(), "request_vote len {n}");
+            assert!(
+                read_request_vote_body(&vec![0u8; n]).is_none(),
+                "request_vote len {n}"
+            );
         }
         for n in 0..VOTE_BODY_LEN {
             assert!(read_vote_body(&vec![0u8; n]).is_none(), "vote len {n}");
@@ -605,7 +621,9 @@ mod tests {
         // flags=0x5a; key_epoch=0 -> [0,0].
         assert_eq!(
             buf,
-            [0x40, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 9, 0, 0, 0, 1, 0x5a, 0, 0]
+            [
+                0x40, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 9, 0, 0, 0, 1, 0x5a, 0, 0
+            ]
         );
         // cleartext epoch stays zero here (M8: this slot is key_epoch)
         assert_eq!(&buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2], &[0, 0]);
@@ -630,7 +648,10 @@ mod tests {
         };
         write_datagram_header(&mut buf, &h);
         // Pinned at the old reserved offset — the slot the v2 spec set aside.
-        assert_eq!(&buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2], &0xBEEFu16.to_le_bytes());
+        assert_eq!(
+            &buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2],
+            &0xBEEFu16.to_le_bytes()
+        );
         assert_eq!(OFF_DGRAM_KEY_EPOCH, 14);
         assert_eq!(read_datagram_header(&buf).unwrap(), h);
     }
@@ -652,7 +673,10 @@ mod tests {
 
     #[test]
     fn control_bodies_roundtrip() {
-        let n = NakBody { position: 4096, length: 65536 };
+        let n = NakBody {
+            position: 4096,
+            length: 65536,
+        };
         let mut buf = [0u8; NAK_BODY_LEN];
         write_nak_body(&mut buf, &n);
         assert_eq!(read_nak_body(&buf).unwrap(), n);
@@ -661,7 +685,10 @@ mod tests {
         // length=65536=0x10000 -> LE [0,0,1,0]; reserved=[0,0,0,0].
         assert_eq!(buf, [0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
 
-        let s = StatusBody { contiguous_position: 1 << 33, receive_window: 1 << 28 };
+        let s = StatusBody {
+            contiguous_position: 1 << 33,
+            receive_window: 1 << 28,
+        };
         let mut buf = [0u8; STATUS_BODY_LEN];
         write_status_body(&mut buf, &s);
         assert_eq!(read_status_body(&buf).unwrap(), s);
@@ -673,7 +700,13 @@ mod tests {
 
     #[test]
     fn config_proposal_and_reply_bodies_roundtrip_and_pin_layout() {
-        let p = ConfigProposalBody { nonce: 7, op: 2, id: 5, ip: 0x0a000005, port: 19100 };
+        let p = ConfigProposalBody {
+            nonce: 7,
+            op: 2,
+            id: 5,
+            ip: 0x0a000005,
+            port: 19100,
+        };
         let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
         write_config_proposal_body(&mut buf, &p);
         assert_eq!(&buf[0..8], &7u64.to_le_bytes());
@@ -683,7 +716,12 @@ mod tests {
         assert_eq!(&buf[20..22], &19100u16.to_le_bytes());
         assert_eq!(read_config_proposal_body(&buf), Some(p));
 
-        let r = ConfigReplyBody { nonce: 7, status: 0, reason: 0, version: 4 };
+        let r = ConfigReplyBody {
+            nonce: 7,
+            status: 0,
+            reason: 0,
+            version: 4,
+        };
         let mut buf = [0u8; CONFIG_REPLY_BODY_LEN];
         write_config_reply_body(&mut buf, &r);
         assert_eq!(&buf[0..8], &7u64.to_le_bytes());
@@ -737,8 +775,8 @@ mod tests {
         assert_eq!(
             &buf[..],
             &[
-                0x0D, 0x0C, 0x0B, 0x0A, 1, 2, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0,
-                0x04, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                0x0D, 0x0C, 0x0B, 0x0A, 1, 2, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0, 0x04,
+                0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         // Short buffer is rejected (caller drops the datagram).
@@ -754,10 +792,14 @@ mod tests {
     fn a_wire_050_shaped_snap_begin_is_too_short_and_a_layout_zero_body_decodes() {
         // The exact 26 bytes a 0.5.0 `write_snap_begin_body` produced.
         let legacy: [u8; 26] = [
-            0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0, 0x04,
-            0, 0, 0, 0, 0, 0, 0,
+            0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0, 0x04, 0,
+            0, 0, 0, 0, 0, 0,
         ];
-        assert_eq!(read_snap_begin_body(&legacy), None, "26 bytes is below the 0.6.0 fixed part");
+        assert_eq!(
+            read_snap_begin_body(&legacy),
+            None,
+            "26 bytes is below the 0.6.0 fixed part"
+        );
         // 34 bytes with layout 0 DOES decode — the reader is total and hands the
         // discriminator to the caller, which is what decides (spec §14.3).
         let b = SnapBeginBody {
@@ -800,7 +842,11 @@ mod tests {
 
     #[test]
     fn snap_nak_body_roundtrips_and_pins_layout() {
-        let b = SnapNakBody { session: 0x0102_0304, offset: 0x1_0000, length: 1408 };
+        let b = SnapNakBody {
+            session: 0x0102_0304,
+            offset: 0x1_0000,
+            length: 1408,
+        };
         let mut buf = [0u8; SNAP_NAK_BODY_LEN];
         write_snap_nak_body(&mut buf, &b);
         assert_eq!(read_snap_nak_body(&buf), Some(b));
@@ -808,33 +854,48 @@ mod tests {
         // offset=0x10000 -> LE [0,0,1,0,0,0,0,0]; length=1408=0x0580 -> LE [0x80,0x05,0,0].
         assert_eq!(
             buf,
-            [0x04, 0x03, 0x02, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0x80, 0x05, 0, 0]
+            [
+                0x04, 0x03, 0x02, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0x80, 0x05, 0, 0
+            ]
         );
         assert_eq!(read_snap_nak_body(&buf[..SNAP_NAK_BODY_LEN - 1]), None);
     }
 
     #[test]
     fn vote_bodies_roundtrip_and_pin_layout() {
-        let rv = RequestVoteBody { new_term: 7, last_term: 6, last_durable: 0x0000_0001_0000_0040 };
+        let rv = RequestVoteBody {
+            new_term: 7,
+            last_term: 6,
+            last_durable: 0x0000_0001_0000_0040,
+        };
         let mut buf = [0u8; REQUEST_VOTE_BODY_LEN];
         write_request_vote_body(&mut buf, &rv);
         assert_eq!(read_request_vote_body(&buf).unwrap(), rv);
         // literal LE pin: new_term 7, last_term 6, last_durable 2^32+64
         assert_eq!(buf, [7, 0, 0, 0, 6, 0, 0, 0, 0x40, 0, 0, 0, 1, 0, 0, 0]);
 
-        let v = VoteBody { term: 7, granted: true };
+        let v = VoteBody {
+            term: 7,
+            granted: true,
+        };
         let mut buf = [0u8; VOTE_BODY_LEN];
         write_vote_body(&mut buf, &v);
         assert_eq!(read_vote_body(&buf).unwrap(), v);
         assert_eq!(buf, [7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        let v = VoteBody { term: 7, granted: false };
+        let v = VoteBody {
+            term: 7,
+            granted: false,
+        };
         write_vote_body(&mut buf, &v);
         assert_eq!(buf[4], 0);
     }
 
     #[test]
     fn read_probe_body_roundtrips_and_pins_layout() {
-        let b = ReadProbeBody { nonce: 0x0102_0304_0506_0708, from: 0x0A0B_0C0D };
+        let b = ReadProbeBody {
+            nonce: 0x0102_0304_0506_0708,
+            from: 0x0A0B_0C0D,
+        };
         let mut buf = [0u8; READ_PROBE_BODY_LEN];
         write_read_probe_body(&mut buf, &b);
         assert_eq!(read_read_probe_body(&buf), Some(b));
@@ -843,7 +904,9 @@ mod tests {
         // 0..8; from 0x0A0B0C0D -> LE bytes 8..12; bytes 12..16 zero.
         assert_eq!(
             buf,
-            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0]
+            [
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0
+            ]
         );
         // A longer buffer decodes the same 16-byte prefix (trailing bytes ignored).
         let mut long = [0xFFu8; READ_PROBE_BODY_LEN + 8];
@@ -852,7 +915,10 @@ mod tests {
         // Malformed: any buffer shorter than the 16-byte body -> None (must not
         // panic on slicing). Pin every boundary below the length.
         for short in 0..READ_PROBE_BODY_LEN {
-            assert!(read_read_probe_body(&buf[..short]).is_none(), "len {short} must reject");
+            assert!(
+                read_read_probe_body(&buf[..short]).is_none(),
+                "len {short} must reject"
+            );
         }
         assert!(read_read_probe_body(&[]).is_none());
         // The two new kind codes are stable.
@@ -863,10 +929,17 @@ mod tests {
     #[test]
     fn append_position_body_roundtrip_and_short_buffer() {
         let mut buf = [0xAAu8; APPEND_POSITION_BODY_LEN];
-        write_append_position_body(&mut buf, &AppendPositionBody { durable_term: 4_000_000_007 });
+        write_append_position_body(
+            &mut buf,
+            &AppendPositionBody {
+                durable_term: 4_000_000_007,
+            },
+        );
         assert_eq!(
             read_append_position_body(&buf),
-            Some(AppendPositionBody { durable_term: 4_000_000_007 })
+            Some(AppendPositionBody {
+                durable_term: 4_000_000_007
+            })
         );
         // Reserved tail is zeroed, not left as the caller's garbage.
         assert_eq!(&buf[4..8], &[0, 0, 0, 0]);
@@ -877,8 +950,13 @@ mod tests {
 
     #[test]
     fn term_map_body_roundtrips_and_pins_layout() {
-        let entries =
-            [TermMapEntryWire { term: 1, base: 0 }, TermMapEntryWire { term: 3, base: 4096 }];
+        let entries = [
+            TermMapEntryWire { term: 1, base: 0 },
+            TermMapEntryWire {
+                term: 3,
+                base: 4096,
+            },
+        ];
         let mut buf = [0u8; TERM_MAP_HEADER_LEN + 2 * TERM_MAP_ENTRY_LEN];
         let n = write_term_map_body(&mut buf, &entries);
         assert_eq!(n, 8 + 32);

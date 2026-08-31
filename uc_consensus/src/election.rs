@@ -39,7 +39,11 @@ struct XorShift64(u64);
 
 impl XorShift64 {
     fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -91,11 +95,25 @@ pub enum Event {
     /// imply identical prefixes (Log Matching), so it upgrades the leader's
     /// ranking from a POSITION quorum to a CONTENT quorum. `0` means
     /// unattested (an empty log, or a pre-0.5.0 peer).
-    Report { from: NodeId, term: u32, durable: u64, durable_term: u32 },
+    Report {
+        from: NodeId,
+        term: u32,
+        durable: u64,
+        durable_term: u32,
+    },
     /// CommitPosition gossip (follower role input).
     CommitGossip { term: u32, commit: u64 },
-    RequestVote { from: NodeId, new_term: u32, last_term: u32, last_durable: u64 },
-    Vote { from: NodeId, term: u32, granted: bool },
+    RequestVote {
+        from: NodeId,
+        new_term: u32,
+        last_term: u32,
+        last_durable: u64,
+    },
+    Vote {
+        from: NodeId,
+        term: u32,
+        granted: bool,
+    },
     /// The NewTerm frame this node appended (leader) reached position P.
     NewTermAppended { position: u64 },
     /// The leader shipped its term map (follower role input; term-filtered like
@@ -123,7 +141,10 @@ pub enum Event {
     /// event: it is deliberately NOT in the truncating latch's allow-list, so
     /// it is dropped while a truncation is in flight and re-observed once the
     /// data plane resumes — including the post-revert re-adoption case.
-    ConfigObserved { position: u64, config: ClusterConfig },
+    ConfigObserved {
+        position: u64,
+        config: ClusterConfig,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +155,11 @@ pub enum Action {
     /// Send a rejection (no persistence needed — nothing was promised).
     SendVoteRejection { to: NodeId, term: u32 },
     /// Broadcast RequestVote{new_term, last_term, last_durable} to peers.
-    StartElection { new_term: u32, last_term: u32, last_durable: u64 },
+    StartElection {
+        new_term: u32,
+        last_term: u32,
+        last_durable: u64,
+    },
     /// Open a term as leader: the agent must, IN ORDER: (1) append the new
     /// TermMapEntry{term, base} + persist the term map durably; (2) collapse
     /// volatile append to `base` (durable) — discarding the unreplicated
@@ -154,7 +179,11 @@ pub enum Action {
     /// `Archive::truncate_to(to)`, re-prime the write counter, then feed
     /// `Truncated{epoch, to}` back. The SM latches out data-plane events until the
     /// matching-epoch feedback arrives — even across a mid-flight term adoption.
-    Truncate { epoch: u64, to: u64, new_map: Vec<(u32, u64)> },
+    Truncate {
+        epoch: u64,
+        to: u64,
+        new_map: Vec<(u32, u64)>,
+    },
     /// Ship our term map to followers (leader only): the last
     /// `MAX_TERM_MAP_WIRE_ENTRIES` entries. Emitted on `BecomeLeader`,
     /// piggybacked on the commit-gossip cadence, AND re-emitted on the idle
@@ -180,7 +209,12 @@ pub enum Action {
     /// the `ConfigRecord`; (2) rebuild the net layer (`SetPeers`) from the new
     /// config; (3) update `cnc.dat`. If this adoption also emitted
     /// `HaltRemoved`, the halt still applies.
-    ConfigAdopted { position: u64, config: ClusterConfig, prev_position: u64, prev: ClusterConfig },
+    ConfigAdopted {
+        position: u64,
+        config: ClusterConfig,
+        prev_position: u64,
+        prev: ClusterConfig,
+    },
     /// M7: this node is not a member of the just-adopted config (and is not a
     /// leader mid-self-removal — a leader keeps serving until its own removal
     /// commits; Task 8 adds that commit-triggered step-down). The agent must
@@ -436,7 +470,10 @@ impl ElectionSm {
         // in `members` (it occupies a CommitTracker slot and votes for itself);
         // a learner's own id must NOT be — `members` is the voting set only, and
         // a learner is replicated-to without ever being counted (M6 Task 7).
-        assert!(!members_ids.is_empty(), "election membership must be non-empty");
+        assert!(
+            !members_ids.is_empty(),
+            "election membership must be non-empty"
+        );
         if can_vote {
             assert!(
                 members_ids.contains(&cfg.id),
@@ -600,7 +637,10 @@ impl ElectionSm {
         // data plane is paused during truncation and they are re-delivered once
         // it resumes, so no adoption is lost.
         if self.truncating_epoch.is_some()
-            && !matches!(ev, Event::RequestVote { .. } | Event::Vote { .. } | Event::Truncated { .. })
+            && !matches!(
+                ev,
+                Event::RequestVote { .. } | Event::Vote { .. } | Event::Truncated { .. }
+            )
         {
             return;
         }
@@ -627,8 +667,10 @@ impl ElectionSm {
                 // `current_term` distinguishes "streaming from this term's
                 // leader" (extend) from "catching up on a deposed leader's
                 // tail" (wait for reconcile to judge it).
-                let frontier_is_current_term =
-                    self.term_map.last().is_some_and(|&(t, _)| t == self.current_term);
+                let frontier_is_current_term = self
+                    .term_map
+                    .last()
+                    .is_some_and(|&(t, _)| t == self.current_term);
                 if !self.awaiting_reconcile
                     && !self.unconfirmed_boundary
                     && frontier_is_current_term
@@ -662,7 +704,12 @@ impl ElectionSm {
                 }
             }
 
-            Event::Report { from, term, durable, durable_term } => {
+            Event::Report {
+                from,
+                term,
+                durable,
+                durable_term,
+            } => {
                 if term < self.current_term {
                     return; // stale report: dropped
                 }
@@ -739,7 +786,12 @@ impl ElectionSm {
                 }
             }
 
-            Event::RequestVote { from, new_term, last_term, last_durable } => {
+            Event::RequestVote {
+                from,
+                new_term,
+                last_term,
+                last_durable,
+            } => {
                 // Symmetry with the Vote-grant membership check (M4 Info): a
                 // non-member RequestVote is ignored ENTIRELY — no rejection AND no
                 // term adoption. Only configured members participate in elections,
@@ -759,7 +811,10 @@ impl ElectionSm {
                 }
                 if new_term < self.current_term {
                     // Stale candidate: reject carrying our term so it learns.
-                    out.push(Action::SendVoteRejection { to: from, term: self.current_term });
+                    out.push(Action::SendVoteRejection {
+                        to: from,
+                        term: self.current_term,
+                    });
                     return;
                 }
                 if new_term > self.current_term {
@@ -768,7 +823,11 @@ impl ElectionSm {
                 self.handle_request_vote(from, last_term, last_durable, out);
             }
 
-            Event::Vote { from, term, granted } => {
+            Event::Vote {
+                from,
+                term,
+                granted,
+            } => {
                 if term < self.current_term {
                     return;
                 }
@@ -823,7 +882,9 @@ impl ElectionSm {
                     // would inherit that reconcile's blessing.
                     self.validated_up_to = self.validated_up_to.min(base);
                     self.unconfirmed_boundary = true;
-                    out.push(Action::PersistTermMap { new_map: self.term_map.clone() });
+                    out.push(Action::PersistTermMap {
+                        new_map: self.term_map.clone(),
+                    });
                 }
             }
 
@@ -918,7 +979,11 @@ impl ElectionSm {
     /// `UC2_TRUNC_TRACE` output so a cut below commit names its own provenance
     /// instead of leaving us to guess.
     pub fn commit_provenance(&self) -> (&'static str, u32, u64) {
-        (self.commit_source, self.commit_source_term, self.commit_seen)
+        (
+            self.commit_source,
+            self.commit_source_term,
+            self.commit_seen,
+        )
     }
 
     pub fn role(&self) -> Role {
@@ -987,7 +1052,10 @@ impl ElectionSm {
         // -> `followers`/`learners`, both filtered to `config.voters`/`learners`)
         // never addresses a tombstoned id, so a session shipping the installer its
         // OWN tombstone is unreachable by construction. Pins that invariant.
-        debug_assert!(!config.tombstones.contains(&self.id), "fiat install of our own tombstone");
+        debug_assert!(
+            !config.tombstones.contains(&self.id),
+            "fiat install of our own tombstone"
+        );
         self.config = config.clone();
         self.prev_config = config;
         self.config_position = position;
@@ -1064,7 +1132,10 @@ impl ElectionSm {
     /// The last carried durable report for `id` (used by the promote-learner
     /// catch-up precondition and by `uc2ctl status`).
     pub fn last_report(&self, id: NodeId) -> Option<u64> {
-        self.last_reports.iter().find(|(rid, _)| *rid == id).map(|(_, d)| *d)
+        self.last_reports
+            .iter()
+            .find(|(rid, _)| *rid == id)
+            .map(|(_, d)| *d)
     }
 
     /// Leader-only membership proposal (M7). `slack` = max catch-up gap a
@@ -1073,7 +1144,11 @@ impl ElectionSm {
     /// FRAME_TYPE_CONFIG frame; adoption happens via the `ConfigObserved` the
     /// append path feeds back — one adoption path for leader and follower.
     /// The SM does NOT self-adopt here.
-    pub fn propose_config(&mut self, op: ConfigOp, slack: u64) -> Result<ClusterConfig, ProposeError> {
+    pub fn propose_config(
+        &mut self,
+        op: ConfigOp,
+        slack: u64,
+    ) -> Result<ClusterConfig, ProposeError> {
         if !matches!(self.role, Role::Leader) {
             return Err(ProposeError::NotLeader);
         }
@@ -1115,7 +1190,9 @@ impl ElectionSm {
             let reported = self.last_report(id).unwrap_or(0);
             let target = self.commit_seen.saturating_sub(slack);
             if reported < target {
-                return Err(ProposeError::NotCaughtUp { gap: target - reported });
+                return Err(ProposeError::NotCaughtUp {
+                    gap: target - reported,
+                });
             }
         }
         self.config.apply(op)
@@ -1131,7 +1208,11 @@ impl ElectionSm {
     /// Randomize a fresh election deadline from `[min, max)` relative to `now`.
     fn arm_timeout(&mut self, now_ns: u64) {
         let span = self.timeout_max_ns - self.timeout_min_ns;
-        let jitter = if span == 0 { 0 } else { self.rng.next_u64() % span };
+        let jitter = if span == 0 {
+            0
+        } else {
+            self.rng.next_u64() % span
+        };
         self.timeout_deadline_ns = now_ns + self.timeout_min_ns + jitter;
     }
 
@@ -1153,8 +1234,12 @@ impl ElectionSm {
                 // gossiped, so this cannot double-fire in the same tick.
                 if now_ns.saturating_sub(self.last_gossip_ns) >= self.gossip_floor_ns {
                     self.last_gossip_ns = now_ns;
-                    out.push(Action::GossipCommit { commit: self.commit_seen });
-                    out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
+                    out.push(Action::GossipCommit {
+                        commit: self.commit_seen,
+                    });
+                    out.push(Action::ShipTermMap {
+                        entries: self.term_map_wire_tail(),
+                    });
                 }
             }
             Role::Follower | Role::Candidate => {
@@ -1191,9 +1276,17 @@ impl ElectionSm {
         // the network send) is persisted BEFORE we solicit peers.
         out.push(Action::PersistAndSendVote {
             to: self.id,
-            vote: VoteOut { term: self.current_term, voted_for: self.id, granted_to: self.id },
+            vote: VoteOut {
+                term: self.current_term,
+                voted_for: self.id,
+                granted_to: self.id,
+            },
         });
-        out.push(Action::StartElection { new_term: self.current_term, last_term, last_durable });
+        out.push(Action::StartElection {
+            new_term: self.current_term,
+            last_term,
+            last_durable,
+        });
 
         self.arm_timeout(now_ns);
         self.pending_leader_activity = false;
@@ -1253,7 +1346,11 @@ impl ElectionSm {
         // new-term adoption), which keeps a follower-side `DataTermObserved`
         // from ever pushing onto a still-phantom-bearing map. Weakening that
         // gate would re-open a second creation path this prune does not cover.
-        while self.term_map.last().is_some_and(|&(_, base)| base == self.durable) {
+        while self
+            .term_map
+            .last()
+            .is_some_and(|&(_, base)| base == self.durable)
+        {
             self.term_map.pop();
         }
         self.term_map.push((self.current_term, self.durable));
@@ -1262,9 +1359,14 @@ impl ElectionSm {
         // M7: stale-term carried reports must not certify a promote-learner
         // precondition either (mirrors the tracker reset above).
         self.last_reports.clear();
-        out.push(Action::BecomeLeader { term: self.current_term, base: self.durable });
+        out.push(Action::BecomeLeader {
+            term: self.current_term,
+            base: self.durable,
+        });
         // Ship the freshly-opened term map so followers can reconcile (spec §M4).
-        out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
+        out.push(Action::ShipTermMap {
+            entries: self.term_map_wire_tail(),
+        });
     }
 
     fn adopt_term(&mut self, new_term: u32, leader: Option<NodeId>, out: &mut Vec<Action>) {
@@ -1286,7 +1388,10 @@ impl ElectionSm {
         // and is released only by its own matching-epoch `Truncated`. The pruned
         // map it adopts is a valid prefix regardless of the new term; the new
         // leader re-ships and we re-reconcile from there.
-        out.push(Action::BecomeFollower { term: new_term, leader });
+        out.push(Action::BecomeFollower {
+            term: new_term,
+            leader,
+        });
         self.halt_if_removed_follower(out);
     }
 
@@ -1439,7 +1544,10 @@ impl ElectionSm {
 
     /// The last `MAX_TERM_MAP_WIRE_ENTRIES` term-map entries (the wire tail).
     fn term_map_wire_tail(&self) -> Vec<(u32, u64)> {
-        let start = self.term_map.len().saturating_sub(MAX_TERM_MAP_WIRE_ENTRIES);
+        let start = self
+            .term_map
+            .len()
+            .saturating_sub(MAX_TERM_MAP_WIRE_ENTRIES);
         self.term_map[start..].to_vec()
     }
 
@@ -1448,7 +1556,10 @@ impl ElectionSm {
         self.serving = false;
         self.new_term_pos = None;
         self.votes_received.clear();
-        out.push(Action::BecomeFollower { term: self.current_term, leader: None });
+        out.push(Action::BecomeFollower {
+            term: self.current_term,
+            leader: None,
+        });
         self.halt_if_removed_follower(out);
     }
 
@@ -1520,14 +1631,20 @@ impl ElectionSm {
                 self.grant_vote(from, out);
             } else {
                 // Already voted for someone else this term: reject.
-                out.push(Action::SendVoteRejection { to: from, term: self.current_term });
+                out.push(Action::SendVoteRejection {
+                    to: from,
+                    term: self.current_term,
+                });
             }
             return;
         }
         if self.log_ok(last_term, last_durable) {
             self.grant_vote(from, out);
         } else {
-            out.push(Action::SendVoteRejection { to: from, term: self.current_term });
+            out.push(Action::SendVoteRejection {
+                to: from,
+                term: self.current_term,
+            });
         }
     }
 
@@ -1537,7 +1654,11 @@ impl ElectionSm {
         self.pending_leader_activity = true;
         out.push(Action::PersistAndSendVote {
             to,
-            vote: VoteOut { term: self.current_term, voted_for: to, granted_to: to },
+            vote: VoteOut {
+                term: self.current_term,
+                voted_for: to,
+                granted_to: to,
+            },
         });
     }
 
@@ -1700,7 +1821,8 @@ impl ElectionSm {
         // the check via `Event::Vote` naturally) — staying conservative
         // (falling below majority never elects) is the safe direction; only
         // ratcheting the tally down needs no accompanying action.
-        self.votes_received.retain(|v| self.members.contains(v) || *v == self.id);
+        self.votes_received
+            .retain(|v| self.members.contains(v) || *v == self.id);
         let n = self.members.len();
         let n_followers = if self.can_vote { n - 1 } else { n };
         self.tracker = CommitTracker::new(n_followers, n_followers + 1);
@@ -1713,7 +1835,8 @@ impl ElectionSm {
         // rebuild (e.g. another AddLearner) so a later PromoteLearner still
         // sees it; a truly removed id (voter or learner) is correctly
         // dropped because `self.config.contains` is false for it.
-        self.last_reports.retain(|(id, _)| self.config.contains(*id) && *id != self.id);
+        self.last_reports
+            .retain(|(id, _)| self.config.contains(*id) && *id != self.id);
         if carry_reports {
             for &(id, durable) in &self.last_reports {
                 if let Some(slot) = self.follower_slot(id) {
@@ -1780,7 +1903,9 @@ impl ElectionSm {
             out.push(Action::GossipCommit { commit: c });
             // Piggyback the term map on the commit-gossip cadence so a lagging
             // or reconnecting follower can reconcile (spec §M4).
-            out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
+            out.push(Action::ShipTermMap {
+                entries: self.term_map_wire_tail(),
+            });
             // Serving gate: every emitted advance now has `c >= new_term_pos`
             // (the §5.4.2 clamp above), so this term's NewTerm frame is
             // quorum-committed the moment ANY advance fires — latch serving
@@ -1857,7 +1982,10 @@ impl ElectionSm {
                 self.stepped_down = true;
                 self.role = Role::Follower;
                 self.serving = false;
-                out.push(Action::BecomeFollower { term: self.current_term, leader: None });
+                out.push(Action::BecomeFollower {
+                    term: self.current_term,
+                    leader: None,
+                });
             }
         }
     }
@@ -1874,7 +2002,10 @@ mod tests {
 
     /// A genesis `ClusterConfig` with `members` all as voters, no learners.
     fn genesis_voters(members: &[NodeId]) -> ClusterConfig {
-        ClusterConfig::genesis(members.iter().map(|&id| (id, addr_of(id))).collect(), Vec::new())
+        ClusterConfig::genesis(
+            members.iter().map(|&id| (id, addr_of(id))).collect(),
+            Vec::new(),
+        )
     }
 
     fn cfg(id: NodeId) -> ElectionConfig {
@@ -1921,7 +2052,14 @@ mod tests {
     fn leader_term1() -> ElectionSm {
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         s
     }
@@ -1937,7 +2075,15 @@ mod tests {
     /// next `TermMapReceived{term:3}` reconciles to a `Truncate`.
     fn sm_with_divergent_map() -> ElectionSm {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 3,
+                last_term: 1,
+                last_durable: 7000,
+            },
+        );
         s
     }
 
@@ -1984,11 +2130,15 @@ mod tests {
         for t in 1..=50u64 {
             let acts = step(&mut s, Event::Tick { now_ns: t * 400 });
             assert!(
-                !acts.iter().any(|a| matches!(a, Action::StartElection { .. })),
+                !acts
+                    .iter()
+                    .any(|a| matches!(a, Action::StartElection { .. })),
                 "a learner must never solicit votes"
             );
             assert!(
-                !acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })),
+                !acts
+                    .iter()
+                    .any(|a| matches!(a, Action::PersistAndSendVote { .. })),
                 "a learner must never cast a vote (self or otherwise)"
             );
         }
@@ -2003,15 +2153,24 @@ mod tests {
         // reconcile) but emits ZERO vote traffic — no grant, no rejection.
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 0, new_term: 5, last_term: 1, last_durable: 10_000 },
+            Event::RequestVote {
+                from: 0,
+                new_term: 5,
+                last_term: 1,
+                last_durable: 10_000,
+            },
         );
         assert_eq!(s.current_term(), 5, "learner adopted the higher term");
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::PersistAndSendVote { .. })),
             "learner never grants a vote"
         );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::SendVoteRejection { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::SendVoteRejection { .. })),
             "learner emits no vote rejection either"
         );
         assert!(matches!(s.role(), Role::Follower));
@@ -2023,12 +2182,29 @@ mod tests {
         // peers are silent must NOT commit on a learner's (sky-high) durable Report.
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 }); // candidate, term 1
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true }); // majority → leader
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        ); // majority → leader
         assert!(matches!(s.role(), Role::Leader));
         // A learner (id 9, NOT a voting member) reports a huge durable at our term.
-        let acts = step(&mut s, Event::Report { from: 9, term: 1, durable: 1 << 40, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 9,
+                term: 1,
+                durable: 1 << 40,
+                durable_term: 1,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "a learner's Report must never advance commit (follower_slot drops it)"
         );
     }
@@ -2048,11 +2224,25 @@ mod tests {
         )));
         assert!(acts.iter().any(|a| matches!(
             a,
-            Action::StartElection { new_term: 1, last_term: 0, last_durable: 0 }
+            Action::StartElection {
+                new_term: 1,
+                last_term: 0,
+                last_durable: 0
+            }
         )));
         // one grant (self) + one from node 1 = majority of 3
-        let acts = step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { term: 1, base: 0 })));
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeLeader { term: 1, base: 0 }))
+        );
         assert!(matches!(s.role(), Role::Leader));
         assert!(!s.can_serve(), "must not serve before NewTerm commits");
     }
@@ -2064,14 +2254,31 @@ mod tests {
         // candidate behind on durable: reject
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 2, new_term: 3, last_term: 2, last_durable: 900 },
+            Event::RequestVote {
+                from: 2,
+                new_term: 3,
+                last_term: 2,
+                last_durable: 900,
+            },
         );
-        assert!(acts.iter().any(|a| matches!(a, Action::SendVoteRejection { to: 2, .. })));
-        assert!(!acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::SendVoteRejection { to: 2, .. }))
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::PersistAndSendVote { .. }))
+        );
         // candidate with a newer last_term but lower durable: lexicographic -> grant
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 0, new_term: 4, last_term: 3, last_durable: 100 },
+            Event::RequestVote {
+                from: 0,
+                new_term: 4,
+                last_term: 3,
+                last_durable: 100,
+            },
         );
         assert!(acts.iter().any(|a| matches!(
             a,
@@ -2097,10 +2304,16 @@ mod tests {
         // granted here with the vote-order check skipped.
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 2, new_term: 3, last_term: 2, last_durable: 900 },
+            Event::RequestVote {
+                from: 2,
+                new_term: 3,
+                last_term: 2,
+                last_durable: 900,
+            },
         );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { to: 2, .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::PersistAndSendVote { to: 2, .. })),
             "stale candidate must be granted with the vote-order check skipped, got: {acts:?}"
         );
     }
@@ -2108,17 +2321,47 @@ mod tests {
     #[test]
     fn one_vote_per_term_and_idempotent_regrant() {
         let mut s = sm(1);
-        let acts =
-            step(&mut s, Event::RequestVote { from: 0, new_term: 1, last_term: 0, last_durable: 0 });
-        assert!(acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { to: 0, .. })));
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 1,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::PersistAndSendVote { to: 0, .. }))
+        );
         // different candidate, same term: reject (no double vote)
-        let acts =
-            step(&mut s, Event::RequestVote { from: 2, new_term: 1, last_term: 0, last_durable: 0 });
-        assert!(acts.iter().any(|a| matches!(a, Action::SendVoteRejection { to: 2, .. })));
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 2,
+                new_term: 1,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::SendVoteRejection { to: 2, .. }))
+        );
         // same candidate re-requests (lost datagram): idempotent re-grant
-        let acts =
-            step(&mut s, Event::RequestVote { from: 0, new_term: 1, last_term: 0, last_durable: 0 });
-        assert!(acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { to: 0, .. })));
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 1,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::PersistAndSendVote { to: 0, .. }))
+        );
     }
 
     #[test]
@@ -2126,10 +2369,18 @@ mod tests {
         // restarted node had voted for 2 in term 5
         let mut s = ElectionSm::new(cfg(1), Some((5, 2)), &[], 0, 0);
         assert_eq!(s.current_term(), 5);
-        let acts =
-            step(&mut s, Event::RequestVote { from: 0, new_term: 5, last_term: 0, last_durable: 0 });
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 5,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::SendVoteRejection { to: 0, .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::SendVoteRejection { to: 0, .. })),
             "must not double-vote in a term after restart"
         );
     }
@@ -2138,13 +2389,28 @@ mod tests {
     fn leader_gates_serving_on_new_term_commit_and_ranks_reports() {
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         // agent appended the NewTerm frame at [0, 32)
         step(&mut s, Event::NewTermAppended { position: 32 });
         // own durable covers it; follower 1 reports durable 32
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         let acts2 = step(&mut s, Event::Tick { now_ns: 310 });
         let advanced = acts
             .iter()
@@ -2172,15 +2438,35 @@ mod tests {
         // Node 0 recovers an uncommitted term-1 tail [0, 100) and wins term 2.
         let mut s = ElectionSm::new(cfg(0), None, &[(1, 0)], 100, 0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        let acts = step(&mut s, Event::Vote { from: 1, term: 2, granted: true });
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 2,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { term: 2, base: 100 })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeLeader { term: 2, base: 100 }))
+        );
 
         // (a) Quorum at the election base BEFORE NewTermAppended: the ranked
         // position (100) is a prior-term-only range — no advance at all.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 100, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 2,
+                durable: 100,
+                durable_term: 1,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "5.4.2: an old-term-only range must not commit while new_term_pos is None"
         );
         assert!(!s.can_serve());
@@ -2189,10 +2475,19 @@ mod tests {
         // still suppressed.
         step(&mut s, Event::NewTermAppended { position: 132 });
         step(&mut s, Event::DurableAdvanced { durable: 132 });
-        let acts =
-            step(&mut s, Event::Report { from: 1, term: 2, durable: 110, durable_term: 2 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 2,
+                durable: 110,
+                durable_term: 2,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "5.4.2: a ranked position below new_term_pos must not commit"
         );
         assert!(!s.can_serve());
@@ -2202,9 +2497,18 @@ mod tests {
         // serving latches.
         // Byte 131 lives in the term-2 NewTerm frame (opened at 100), so the
         // attestation is term 2.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 2 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 2,
+                durable: 132,
+                durable_term: 2,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 132 })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 132 })),
             "quorum on the NewTerm frame must commit it (and the whole inherited prefix)"
         );
         assert!(s.can_serve());
@@ -2214,15 +2518,40 @@ mod tests {
     fn higher_term_deposes_leader_and_stale_events_ignored() {
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         // stale report: ignored, no panic, no action
-        let acts = step(&mut s, Event::Report { from: 1, term: 0, durable: 999, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 0,
+                durable: 999,
+                durable_term: 1,
+            },
+        );
         assert!(acts.is_empty());
         // a higher-term RequestVote deposes
-        let acts =
-            step(&mut s, Event::RequestVote { from: 2, new_term: 2, last_term: 1, last_durable: 0 });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, .. })));
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 2,
+                new_term: 2,
+                last_term: 1,
+                last_durable: 0,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeFollower { term: 2, .. }))
+        );
         assert!(matches!(s.role(), Role::Follower));
     }
 
@@ -2233,24 +2562,85 @@ mod tests {
         step(&mut s, Event::DataTermObserved { term: 1, base: 0 });
         step(&mut s, Event::DurableAdvanced { durable: 8192 });
         // adopt term 1 via a grant
-        step(&mut s, Event::RequestVote { from: 0, new_term: 1, last_term: 0, last_durable: 0 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 1,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
         // 2026-08-16: adoption arms the commit-validation latch, so this
         // position is HELD, not applied to our (as yet unvalidated) bytes.
-        assert!(step(&mut s, Event::CommitGossip { term: 1, commit: 4096 }).is_empty());
+        assert!(
+            step(
+                &mut s,
+                Event::CommitGossip {
+                    term: 1,
+                    commit: 4096
+                }
+            )
+            .is_empty()
+        );
         // The term-1 leader's map reconciles us clean → latch releases, the
         // frontier covers our whole log, and the held position replays.
-        let acts = step(&mut s, Event::TermMapReceived { term: 1, entries: vec![(1, 0)] });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 })));
-        // stale-term and regressing gossip: no action
-        assert!(step(&mut s, Event::CommitGossip { term: 0, commit: 9999 }).is_empty());
-        assert!(step(&mut s, Event::CommitGossip { term: 1, commit: 1024 }).is_empty());
-        // Validated now: same-term gossip advances immediately (no extra round).
-        let acts = step(&mut s, Event::CommitGossip { term: 1, commit: 8192 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 8192 })));
-        // ...but NEVER past the validated frontier: our log ends at 8192.
-        let acts = step(&mut s, Event::CommitGossip { term: 1, commit: 99_999 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 1,
+                entries: vec![(1, 0)],
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 }))
+        );
+        // stale-term and regressing gossip: no action
+        assert!(
+            step(
+                &mut s,
+                Event::CommitGossip {
+                    term: 0,
+                    commit: 9999
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            step(
+                &mut s,
+                Event::CommitGossip {
+                    term: 1,
+                    commit: 1024
+                }
+            )
+            .is_empty()
+        );
+        // Validated now: same-term gossip advances immediately (no extra round).
+        let acts = step(
+            &mut s,
+            Event::CommitGossip {
+                term: 1,
+                commit: 8192,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 8192 }))
+        );
+        // ...but NEVER past the validated frontier: our log ends at 8192.
+        let acts = step(
+            &mut s,
+            Event::CommitGossip {
+                term: 1,
+                commit: 99_999,
+            },
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "commit must not pass the validated frontier"
         );
     }
@@ -2267,30 +2657,74 @@ mod tests {
         // Leader of term 2 at base 100; its map is [(1,0),(2,100)].
         let mut s = ElectionSm::new(cfg(0), None, &[(1, 0)], 100, 0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 2, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 2,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 132 });
         step(&mut s, Event::DurableAdvanced { durable: 132 });
 
         // A follower reports the same POSITION but attributes byte 131 to
         // term 1 — it holds the deposed term-1 leader's bytes there, not ours.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 2,
+                durable: 132,
+                durable_term: 1,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "a report attesting another history must not certify our bytes"
         );
         assert_eq!(s.reports_unattested(), 1);
         assert!(!s.can_serve(), "and therefore must not open the read path");
 
         // Unattested (a pre-0.5.0 peer, or an empty body) is declined too.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 0 });
-        assert!(!acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 2,
+                durable: 132,
+                durable_term: 0,
+            },
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. }))
+        );
         assert_eq!(s.reports_unattested(), 2);
 
         // The same follower, once reconciled, attests term 2 and counts.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 2 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 132 })));
-        assert_eq!(s.reports_unattested(), 2, "an honest report is not counted as declined");
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 2,
+                durable: 132,
+                durable_term: 2,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 132 }))
+        );
+        assert_eq!(
+            s.reports_unattested(),
+            2,
+            "an honest report is not counted as declined"
+        );
     }
 
     /// **The 2026-08-16 apply/gossip race.** Commit gossip carries a POSITION
@@ -2307,15 +2741,26 @@ mod tests {
         step(&mut s, Event::DurableAdvanced { durable: 8192 });
         // Term 2's leader gossips commit 8192 before its map arrives. Its 8192
         // is not our 8192 — but we cannot know that yet, so we must NOT advance.
-        let acts = step(&mut s, Event::CommitGossip { term: 2, commit: 8192 });
+        let acts = step(
+            &mut s,
+            Event::CommitGossip {
+                term: 2,
+                commit: 8192,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "commit must not advance over a tail no leader has validated"
         );
         // Its map proves term 2 opened at 4096: our 4096..8192 is divergent.
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 2, entries: vec![(1, 0), (2, 4096)] },
+            Event::TermMapReceived {
+                term: 2,
+                entries: vec![(1, 0), (2, 4096)],
+            },
         );
         let (epoch, to) = acts
             .iter()
@@ -2326,7 +2771,9 @@ mod tests {
             .expect("divergent tail must be truncated");
         assert_eq!(to, 4096);
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "still unvalidated until the cut actually lands"
         );
         // Cut acked: what survives is the validated prefix, so the held
@@ -2337,9 +2784,14 @@ mod tests {
         // gossiped 8192. The rest stays deferred until we refill and the next
         // reconcile validates those bytes.
         let acts = step(&mut s, Event::Truncated { epoch, to });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 })));
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 8192 })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 }))
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 8192 })),
             "the gossiped position beyond our validated bytes must stay deferred"
         );
     }
@@ -2366,15 +2818,40 @@ mod tests {
         step(&mut s, Event::Tick { now_ns: 301 });
         assert!(matches!(s.role(), Role::Candidate));
         assert_eq!(s.current_term(), 1);
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
-        let dup = step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
+        let dup = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(
             !dup.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
             "a duplicated voter must not be counted twice"
         );
         assert!(matches!(s.role(), Role::Candidate));
-        let elect = step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
-        assert!(elect.iter().any(|a| matches!(a, Action::BecomeLeader { term: 1, .. })));
+        let elect = step(
+            &mut s,
+            Event::Vote {
+                from: 2,
+                term: 1,
+                granted: true,
+            },
+        );
+        assert!(
+            elect
+                .iter()
+                .any(|a| matches!(a, Action::BecomeLeader { term: 1, .. }))
+        );
         assert!(matches!(s.role(), Role::Leader));
     }
 
@@ -2401,7 +2878,14 @@ mod tests {
         assert_eq!(s.current_term(), 1);
 
         // Self + voter 1's grant: 2 of 5, below majority(3) — still Candidate.
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Candidate));
 
         // Voter 1 is removed from the config, durably adopted mid-candidacy.
@@ -2409,10 +2893,21 @@ mod tests {
         new_cfg.voters.retain(|(id, _)| *id != 1);
         new_cfg.tombstones.push(1);
         new_cfg.version = 1;
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
-        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: new_cfg,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. })),
             "adoption itself must never auto-check majority/become_leader — a later \
              grant re-triggers the check naturally"
         );
@@ -2422,16 +2917,35 @@ mod tests {
         // {0,2} = 2, still below the new majority(3) of 4 — must stay
         // Candidate. (Pre-fix, the stale grant from 1 would still be
         // counted — {0,1,2} = 3 — wrongly crossing majority right here.)
-        let acts = step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 2,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. })),
             "the stale grant from the removed voter must not count toward the new majority"
         );
         assert!(matches!(s.role(), Role::Candidate));
 
         // A second fresh grant (3): {0,2,3} = 3 real grants of 4 — a genuine majority.
-        let acts = step(&mut s, Event::Vote { from: 3, term: 1, granted: true });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 3,
+                term: 1,
+                granted: true,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. }))
+        );
         assert!(matches!(s.role(), Role::Leader));
     }
 
@@ -2443,9 +2957,18 @@ mod tests {
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
         assert!(matches!(s.role(), Role::Candidate));
-        let acts = step(&mut s, Event::Vote { from: 99, term: 1, granted: true });
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 99,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. })),
             "a non-member grant must never elect us"
         );
         assert!(matches!(s.role(), Role::Candidate));
@@ -2460,8 +2983,19 @@ mod tests {
         step(&mut s, Event::Tick { now_ns: 5000 }); // no activity -> term 2
         assert_eq!(s.current_term(), 2);
         assert!(matches!(s.role(), Role::Candidate));
-        let acts = step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
-        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. }))
+        );
         assert!(matches!(s.role(), Role::Candidate));
     }
 
@@ -2470,15 +3004,37 @@ mod tests {
     #[test]
     fn double_vote_rejected_even_for_better_credentials() {
         let mut s = sm(1);
-        let a =
-            step(&mut s, Event::RequestVote { from: 0, new_term: 1, last_term: 0, last_durable: 0 });
-        assert!(a.iter().any(|x| matches!(x, Action::PersistAndSendVote { to: 0, .. })));
+        let a = step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 1,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::PersistAndSendVote { to: 0, .. }))
+        );
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 2, new_term: 1, last_term: 9, last_durable: 9999 },
+            Event::RequestVote {
+                from: 2,
+                new_term: 1,
+                last_term: 9,
+                last_durable: 9999,
+            },
         );
-        assert!(acts.iter().any(|a| matches!(a, Action::SendVoteRejection { to: 2, .. })));
-        assert!(!acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::SendVoteRejection { to: 2, .. }))
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::PersistAndSendVote { .. }))
+        );
     }
 
     /// A recovered vote binds only its own term. A RequestVote in a strictly
@@ -2487,8 +3043,15 @@ mod tests {
     fn recovered_vote_allows_next_term() {
         let mut s = ElectionSm::new(cfg(1), Some((5, 2)), &[], 0, 0);
         assert_eq!(s.current_term(), 5);
-        let acts =
-            step(&mut s, Event::RequestVote { from: 0, new_term: 6, last_term: 0, last_durable: 0 });
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 6,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
         assert!(acts.iter().any(|a| matches!(
             a,
             Action::PersistAndSendVote { to: 0, vote } if vote.term == 6 && vote.voted_for == 0
@@ -2504,32 +3067,77 @@ mod tests {
         let mut s = sm(0);
         // Win term 1 and commit its NewTerm frame -> serving true.
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         assert!(!s.can_serve());
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         step(&mut s, Event::Tick { now_ns: 310 });
         assert!(s.can_serve());
         // Deposed by a higher term: serving must drop immediately.
-        step(&mut s, Event::RequestVote { from: 2, new_term: 2, last_term: 1, last_durable: 32 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 2,
+                new_term: 2,
+                last_term: 1,
+                last_durable: 32,
+            },
+        );
         assert!(!s.can_serve());
         // Re-elect in a later term (grant re-armed the timer, so two ticks).
         step(&mut s, Event::Tick { now_ns: 6000 });
         step(&mut s, Event::Tick { now_ns: 12000 });
         assert!(matches!(s.role(), Role::Candidate));
         let t = s.current_term();
-        let elect = step(&mut s, Event::Vote { from: 1, term: t, granted: true });
-        assert!(elect.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
+        let elect = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: t,
+                granted: true,
+            },
+        );
+        assert!(
+            elect
+                .iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. }))
+        );
         assert!(matches!(s.role(), Role::Leader));
-        assert!(!s.can_serve(), "can_serve must not carry across re-election");
+        assert!(
+            !s.can_serve(),
+            "can_serve must not carry across re-election"
+        );
         // Only a fresh NewTerm commit in this term re-enables serving.
         step(&mut s, Event::NewTermAppended { position: 64 });
         step(&mut s, Event::DurableAdvanced { durable: 64 });
         // Attest with the term that actually covers byte 63: this term, opened
         // at 32 by the re-election (protocol 0.5.0 content attestation).
-        step(&mut s, Event::Report { from: 1, term: t, durable: 64, durable_term: t });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: t,
+                durable: 64,
+                durable_term: t,
+            },
+        );
         step(&mut s, Event::Tick { now_ns: 12010 });
         assert!(s.can_serve());
     }
@@ -2540,18 +3148,42 @@ mod tests {
     fn leader_adopts_higher_term_from_any_event() {
         // Report{term:5}
         let mut s = leader_term1();
-        let acts = step(&mut s, Event::Report { from: 1, term: 5, durable: 0, durable_term: 1 });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 5, .. })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 5,
+                durable: 0,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeFollower { term: 5, .. }))
+        );
         assert!(matches!(s.role(), Role::Follower));
         // LeaderSeen{term:5}
         let mut s = leader_term1();
         let acts = step(&mut s, Event::LeaderSeen { term: 5 });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 5, .. })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeFollower { term: 5, .. }))
+        );
         assert!(matches!(s.role(), Role::Follower));
         // Vote{term:5}
         let mut s = leader_term1();
-        let acts = step(&mut s, Event::Vote { from: 1, term: 5, granted: true });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 5, .. })));
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 5,
+                granted: true,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeFollower { term: 5, .. }))
+        );
         assert!(matches!(s.role(), Role::Follower));
     }
 
@@ -2560,8 +3192,15 @@ mod tests {
     #[test]
     fn adopt_then_grant_action_order() {
         let mut s = sm(1);
-        let acts =
-            step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 0, last_durable: 0 });
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 3,
+                last_term: 0,
+                last_durable: 0,
+            },
+        );
         assert_eq!(acts.len(), 2, "exactly a depose then a grant");
         assert!(matches!(acts[0], Action::BecomeFollower { term: 3, .. }));
         assert!(matches!(acts[1], Action::PersistAndSendVote { to: 0, .. }));
@@ -2579,12 +3218,21 @@ mod tests {
         step(&mut s, Event::Tick { now_ns: 301 });
         assert!(matches!(s.role(), Role::Candidate));
         assert_eq!(s.current_term(), 2);
-        let acts = step(&mut s, Event::CommitGossip { term: 2, commit: 4096 });
+        let acts = step(
+            &mut s,
+            Event::CommitGossip {
+                term: 2,
+                commit: 4096,
+            },
+        );
         assert!(
             matches!(s.role(), Role::Follower),
             "same-term commit gossip must depose a candidate"
         );
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 }))
+        );
     }
 
     // ---- M4 reconciliation wiring ----
@@ -2594,10 +3242,21 @@ mod tests {
         // node 1 was a failed leader: own map (1,0),(2,4096), durable 6000
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
         // adopt term 3 via a grant, then the term-3 leader ships its map
-        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 3,
+                last_term: 1,
+                last_durable: 7000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] },
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
         );
         let trunc = acts.iter().find_map(|a| match a {
             Action::Truncate { epoch, to, new_map } => Some((*epoch, *to, new_map.clone())),
@@ -2607,30 +3266,73 @@ mod tests {
         assert_eq!(to, 4096);
         assert_eq!(new_map, vec![(1, 0)]);
         // while truncating: data-plane events latched (no commit advance)
-        assert!(step(&mut s, Event::CommitGossip { term: 3, commit: 5000 }).is_empty());
+        assert!(
+            step(
+                &mut s,
+                Event::CommitGossip {
+                    term: 3,
+                    commit: 5000
+                }
+            )
+            .is_empty()
+        );
         // agent feedback: truncation done (matching epoch releases the latch)
         step(&mut s, Event::Truncated { epoch, to: 4096 });
         assert_eq!(s.term_map(), &[(1, 0)]);
         // Commit gossip flows again — but bounded by the VALIDATED frontier
         // (2026-08-16), which the cut just put at 4096. The gossiped 5000
         // covers bytes we no longer hold, so it is deferred, not applied.
-        let acts = step(&mut s, Event::CommitGossip { term: 3, commit: 5000 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 })));
-        assert!(!acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 5000 })));
+        let acts = step(
+            &mut s,
+            Event::CommitGossip {
+                term: 3,
+                commit: 5000,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 }))
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 5000 }))
+        );
         // Refill from the term-3 leader: the stream carries its term-3 frames,
         // so we observe the boundary (which suspends frontier growth until the
         // leader's map confirms it) and then record the bytes.
-        step(&mut s, Event::DataTermObserved { term: 3, base: 4096 });
+        step(
+            &mut s,
+            Event::DataTermObserved {
+                term: 3,
+                base: 4096,
+            },
+        );
         step(&mut s, Event::DurableAdvanced { durable: 5000 });
         // Still bounded: the boundary is ours-but-unconfirmed until reconcile.
-        assert!(step(&mut s, Event::CommitGossip { term: 3, commit: 5000 }).is_empty());
+        assert!(
+            step(
+                &mut s,
+                Event::CommitGossip {
+                    term: 3,
+                    commit: 5000
+                }
+            )
+            .is_empty()
+        );
         // Re-reconcile clean: maps now agree, the frontier covers 5000, and
         // the deferred position is released.
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] },
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
         );
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 5000 })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 5000 }))
+        );
     }
 
     /// The leader re-ships its term map on the commit-gossip cadence: whenever
@@ -2640,16 +3342,38 @@ mod tests {
     fn leader_reships_term_map_on_commit_advance() {
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
         // A follower report drives a quorum commit through rank_leader.
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })));
-        assert!(acts.iter().any(|a| matches!(a, Action::GossipCommit { commit: 32 })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)])),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 32 }))
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::GossipCommit { commit: 32 }))
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)])),
             "commit advance must re-ship the term map on the gossip cadence"
         );
     }
@@ -2676,34 +3400,62 @@ mod tests {
         // when leadership began (M-4) — here the last observed tick, 301 — so the
         // first idle re-emission is a clean `gossip_floor_ns` (1000) after that.
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
 
         // No reports arrive → commit never advances; commit_seen stays 0. Each
         // floor crossing must emit exactly one commit-gossip + one term-map ship.
         let gossips = |acts: &[Action]| {
             (
-                acts.iter().filter(|a| matches!(a, Action::GossipCommit { commit: 0 })).count(),
-                acts.iter().filter(|a| matches!(a, Action::ShipTermMap { .. })).count(),
+                acts.iter()
+                    .filter(|a| matches!(a, Action::GossipCommit { commit: 0 }))
+                    .count(),
+                acts.iter()
+                    .filter(|a| matches!(a, Action::ShipTermMap { .. }))
+                    .count(),
             )
         };
 
         // Before the first crossing (1000 - 301 = 699 < 1000): nothing.
         let pre = step(&mut s, Event::Tick { now_ns: 1000 });
-        assert!(pre.is_empty(), "no re-emission before the first floor elapses");
+        assert!(
+            pre.is_empty(),
+            "no re-emission before the first floor elapses"
+        );
 
         // First crossing: 1301 - 301 >= 1000.
         let a = step(&mut s, Event::Tick { now_ns: 1301 });
-        assert_eq!(gossips(&a), (1, 1), "first floor crossing emits one commit + one map");
-        assert!(!a.iter().any(|x| matches!(x, Action::AdvanceCommit { .. })), "idle: no commit advance");
+        assert_eq!(
+            gossips(&a),
+            (1, 1),
+            "first floor crossing emits one commit + one map"
+        );
+        assert!(
+            !a.iter().any(|x| matches!(x, Action::AdvanceCommit { .. })),
+            "idle: no commit advance"
+        );
 
         // Between crossings (1800 - 1301 = 499 < 1000): nothing at all.
         let b = step(&mut s, Event::Tick { now_ns: 1800 });
-        assert!(b.is_empty(), "no re-emission before the floor elapses again");
+        assert!(
+            b.is_empty(),
+            "no re-emission before the floor elapses again"
+        );
 
         // Second crossing: 2301 - 1301 >= 1000.
         let c = step(&mut s, Event::Tick { now_ns: 2301 });
-        assert_eq!(gossips(&c), (1, 1), "second floor crossing emits one commit + one map");
+        assert_eq!(
+            gossips(&c),
+            (1, 1),
+            "second floor crossing emits one commit + one map"
+        );
 
         // Immediately after: still nothing until the floor elapses once more.
         let d = step(&mut s, Event::Tick { now_ns: 2500 });
@@ -2714,11 +3466,22 @@ mod tests {
     fn leader_ships_term_map_on_open() {
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        let acts = step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
-        assert!(acts.iter().any(
-            |a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)])
-        ));
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeLeader { .. }))
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)]))
+        );
     }
 
     /// Lean gate Finding #3 (shadowed term-map phantom): a leader that opened
@@ -2734,7 +3497,14 @@ mod tests {
         // Life 1: node 0 at durable 4096 (term-1 data) wins term 2.
         let mut s = ElectionSm::new(cfg(0), None, &[(1, 0)], 4096, 0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 2, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 2,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
         // CRASH: the map `[(1,0),(2,4096)]` was persisted (BecomeLeader step (1))
@@ -2744,7 +3514,14 @@ mod tests {
         let mut s = ElectionSm::new(cfg(0), Some((2, 0)), &[(1, 0), (2, 4096)], 4096, 0);
         // Life 2: re-win as term 3 at the same durable.
         step(&mut s, Event::Tick { now_ns: 301 });
-        let acts = step(&mut s, Event::Vote { from: 1, term: 3, granted: true });
+        let acts = step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 3,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         // The phantom (2, 4096) is shadowed by (3, 4096) at every position
         // (term_at returns the LAST entry with base <= pos) — it must be gone.
@@ -2765,10 +3542,22 @@ mod tests {
     #[test]
     fn crash_rewin_collapses_multi_phantom_chain() {
         // Recovered from two successive crashed leaderships at durable 4096.
-        let mut s =
-            ElectionSm::new(cfg(0), Some((3, 0)), &[(1, 0), (2, 4096), (3, 4096)], 4096, 0);
+        let mut s = ElectionSm::new(
+            cfg(0),
+            Some((3, 0)),
+            &[(1, 0), (2, 4096), (3, 4096)],
+            4096,
+            0,
+        );
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 4, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 4,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         assert_eq!(
             s.term_map(),
@@ -2785,7 +3574,14 @@ mod tests {
         // Term-2 bytes landed: durable 8000 > base 4096. Re-win as term 3.
         let mut s = ElectionSm::new(cfg(0), Some((2, 0)), &[(1, 0), (2, 4096)], 8000, 0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 3, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 3,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         assert_eq!(
             s.term_map(),
@@ -2815,14 +3611,20 @@ mod tests {
         // Pre-fix leader map (phantom retained): spurious truncate at 4096.
         match reconcile(&follower, 6000, &[(1, 0), (2, 4096), (3, 4096)]) {
             Reconcile::Ok(o) => {
-                assert_eq!(o.valid_up_to, 4096, "the phantom forces a truncate — the bug");
+                assert_eq!(
+                    o.valid_up_to, 4096,
+                    "the phantom forces a truncate — the bug"
+                );
             }
             other => panic!("expected Ok, got {other:?}"),
         }
         // Post-fix leader map (phantom pruned at become_leader): clean.
         match reconcile(&follower, 6000, &[(1, 0), (3, 4096)]) {
             Reconcile::Ok(o) => {
-                assert_eq!(o.valid_up_to, 6000, "caught-up follower must reconcile clean");
+                assert_eq!(
+                    o.valid_up_to, 6000,
+                    "caught-up follower must reconcile clean"
+                );
                 assert_eq!(o.new_map, follower.to_vec(), "no truncation, map unchanged");
             }
             other => panic!("expected Ok, got {other:?}"),
@@ -2839,21 +3641,44 @@ mod tests {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 3000, 0);
         // We durably streamed term-2 data opening at 2000: the map grows and the
         // agent is told to persist it.
-        let acts = step(&mut s, Event::DataTermObserved { term: 2, base: 2000 });
+        let acts = step(
+            &mut s,
+            Event::DataTermObserved {
+                term: 2,
+                base: 2000,
+            },
+        );
         assert!(acts.iter().any(
             |a| matches!(a, Action::PersistTermMap { new_map } if new_map == &vec![(1, 0), (2, 2000)])
         ));
         assert_eq!(s.term_map(), &[(1, 0), (2, 2000)]);
         // A second identical observation is idempotent — no-op (no PersistTermMap).
-        let dup = step(&mut s, Event::DataTermObserved { term: 2, base: 2000 });
+        let dup = step(
+            &mut s,
+            Event::DataTermObserved {
+                term: 2,
+                base: 2000,
+            },
+        );
         assert!(dup.is_empty(), "re-observing the same term must be a no-op");
         assert_eq!(s.term_map(), &[(1, 0), (2, 2000)]);
         // Now the term-2 leader ships its identical map: because we data-stamped
         // term 2 ourselves, reconciliation is CLEAN — no Truncate.
-        step(&mut s, Event::RequestVote { from: 0, new_term: 2, last_term: 2, last_durable: 4000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 2,
+                last_term: 2,
+                last_durable: 4000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 2, entries: vec![(1, 0), (2, 2000)] },
+            Event::TermMapReceived {
+                term: 2,
+                entries: vec![(1, 0), (2, 2000)],
+            },
         );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::Truncate { .. })),
@@ -2870,10 +3695,21 @@ mod tests {
     #[test]
     fn ex_leader_without_data_stamp_truncates() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 3000, 0);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 2, last_term: 2, last_durable: 4000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 2,
+                last_term: 2,
+                last_durable: 4000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 2, entries: vec![(1, 0), (2, 2000)] },
+            Event::TermMapReceived {
+                term: 2,
+                entries: vec![(1, 0), (2, 2000)],
+            },
         );
         let trunc = acts.iter().find_map(|a| match a {
             Action::Truncate { to, new_map, .. } => Some((*to, new_map.clone())),
@@ -2888,10 +3724,21 @@ mod tests {
     #[test]
     fn stale_term_map_is_dropped() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 2, last_durable: 7000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 3,
+                last_term: 2,
+                last_durable: 7000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 1, entries: vec![(1, 0), (9, 0)] },
+            Event::TermMapReceived {
+                term: 1,
+                entries: vec![(1, 0), (9, 0)],
+            },
         );
         assert!(acts.is_empty());
         assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
@@ -2905,14 +3752,37 @@ mod tests {
     #[test]
     fn higher_term_mid_truncation_is_adoptable_but_holds_latch() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 3,
+                last_term: 1,
+                last_durable: 7000,
+            },
+        );
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
         // A newer election reaches us while truncating: adoptable, latch held.
-        let acts =
-            step(&mut s, Event::RequestVote { from: 2, new_term: 4, last_term: 3, last_durable: 8000 });
-        assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 4, .. })));
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 2,
+                new_term: 4,
+                last_term: 3,
+                last_durable: 8000,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeFollower { term: 4, .. }))
+        );
         assert_eq!(s.current_term(), 4);
         assert!(s.is_truncating(), "adoption must NOT clear the latch (M5)");
         // The in-flight truncation acks with its own epoch → latch releases and
@@ -2936,7 +3806,10 @@ mod tests {
         assert!(acts.is_empty(), "a stale Truncated ack emits no actions");
         assert_eq!(s.current_term(), before_term, "term unchanged");
         assert_eq!(s.term_map(), before_map.as_slice(), "term map unchanged");
-        assert!(!s.is_truncating(), "latch stays clear (we never asked to truncate)");
+        assert!(
+            !s.is_truncating(),
+            "latch stays clear (we never asked to truncate)"
+        );
         // durable is now 500: the next election solicits with last_durable == 500,
         // proving the clamp took (it was 1000 before the ack).
         let acts = step(&mut s, Event::Tick { now_ns: 301 });
@@ -2944,7 +3817,11 @@ mod tests {
             Action::StartElection { last_durable, .. } => Some(*last_durable),
             _ => None,
         });
-        assert_eq!(last_durable, Some(500), "durable was clamped to the truncated point");
+        assert_eq!(
+            last_durable,
+            Some(500),
+            "durable was clamped to the truncated point"
+        );
     }
 
     /// M6 Task 8: reconciliation with no common prefix WIPES-and-rejoins by
@@ -2954,17 +3831,36 @@ mod tests {
     #[test]
     fn no_common_prefix_wipes_and_rejoins() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 41,
+                last_term: 40,
+                last_durable: 9000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+            Event::TermMapReceived {
+                term: 41,
+                entries: vec![(40, 1 << 20), (41, 2 << 20)],
+            },
         );
-        assert!(acts.iter().any(|a| matches!(a, Action::CountWipe)), "wipe was counted");
         assert!(
-            acts.iter().any(|a| matches!(a, Action::Truncate { to: 0, new_map, .. } if new_map.is_empty())),
+            acts.iter().any(|a| matches!(a, Action::CountWipe)),
+            "wipe was counted"
+        );
+        assert!(
+            acts.iter().any(
+                |a| matches!(a, Action::Truncate { to: 0, new_map, .. } if new_map.is_empty())
+            ),
             "wipe is a truncate-to-0 with an empty map"
         );
-        assert!(!acts.iter().any(|a| matches!(a, Action::Fatal { .. })), "no fail-stop");
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::Fatal { .. })),
+            "no fail-stop"
+        );
     }
 
     /// The counterfactual: with wipe DISABLED, the identical world fail-stops with
@@ -2973,10 +3869,21 @@ mod tests {
     fn no_common_prefix_fatal_when_wipe_disabled() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
         s.set_wipe_on_no_common_prefix(false);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 41,
+                last_term: 40,
+                last_durable: 9000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+            Event::TermMapReceived {
+                term: 41,
+                entries: vec![(40, 1 << 20), (41, 2 << 20)],
+            },
         );
         assert!(acts.iter().any(|a| matches!(a, Action::Fatal { .. })));
         assert!(!acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
@@ -2992,7 +3899,13 @@ mod tests {
     fn truncated_ack_with_wrong_epoch_keeps_latch() {
         let mut sm = sm_with_divergent_map();
         let mut out = Vec::new();
-        sm.step(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] }, &mut out);
+        sm.step(
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+            &mut out,
+        );
         let epoch = out
             .iter()
             .find_map(|a| match a {
@@ -3002,8 +3915,17 @@ mod tests {
             .expect("truncate issued");
         // stale ack (epoch-1): durable clamps, latch stays
         out.clear();
-        sm.step(Event::Truncated { epoch: epoch - 1, to: 4096 }, &mut out);
-        assert!(sm.is_truncating(), "stale-epoch ack must not release the latch");
+        sm.step(
+            Event::Truncated {
+                epoch: epoch - 1,
+                to: 4096,
+            },
+            &mut out,
+        );
+        assert!(
+            sm.is_truncating(),
+            "stale-epoch ack must not release the latch"
+        );
         // matching ack: latch released
         out.clear();
         sm.step(Event::Truncated { epoch, to: 4096 }, &mut out);
@@ -3017,15 +3939,38 @@ mod tests {
     fn adoption_mid_truncation_holds_latch_until_matching_ack() {
         let mut sm = sm_with_divergent_map();
         let mut out = Vec::new();
-        sm.step(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] }, &mut out);
+        sm.step(
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+            &mut out,
+        );
         let epoch = extract_truncate_epoch(&out);
         // higher-term RequestVote adopts term 4 mid-truncation
         out.clear();
-        sm.step(Event::RequestVote { from: 1, new_term: 4, last_term: 3, last_durable: 9000 }, &mut out);
-        assert!(sm.is_truncating(), "adoption must NOT clear the truncating latch (M4 I-1)");
+        sm.step(
+            Event::RequestVote {
+                from: 1,
+                new_term: 4,
+                last_term: 3,
+                last_durable: 9000,
+            },
+            &mut out,
+        );
+        assert!(
+            sm.is_truncating(),
+            "adoption must NOT clear the truncating latch (M4 I-1)"
+        );
         // duplicate term maps in the window are dropped by the latch (no actions)
         out.clear();
-        sm.step(Event::TermMapReceived { term: 4, entries: vec![(4, 0)] }, &mut out);
+        sm.step(
+            Event::TermMapReceived {
+                term: 4,
+                entries: vec![(4, 0)],
+            },
+            &mut out,
+        );
         assert!(out.is_empty());
         // the in-flight truncation acks with its own epoch → latch releases
         out.clear();
@@ -3040,8 +3985,19 @@ mod tests {
     fn request_vote_from_non_member_is_ignored() {
         let mut sm = fresh_follower(); // members [0,1,2], id 0
         let mut out = Vec::new();
-        sm.step(Event::RequestVote { from: 9, new_term: 5, last_term: 4, last_durable: 1 << 20 }, &mut out);
-        assert!(out.is_empty(), "non-member RequestVote must produce nothing");
+        sm.step(
+            Event::RequestVote {
+                from: 9,
+                new_term: 5,
+                last_term: 4,
+                last_durable: 1 << 20,
+            },
+            &mut out,
+        );
+        assert!(
+            out.is_empty(),
+            "non-member RequestVote must produce nothing"
+        );
         assert_eq!(sm.current_term(), 1, "and must not adopt the term");
     }
 
@@ -3055,17 +4011,41 @@ mod tests {
         // 3 voters {1,2,3}; self=1 becomes leader of term 1.
         let mut s = ElectionSm::new(cfg_members(1, vec![1, 2, 3]), None, &[], 0, 0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 2, term: 1, granted: true }); // majority of 3
+        step(
+            &mut s,
+            Event::Vote {
+                from: 2,
+                term: 1,
+                granted: true,
+            },
+        ); // majority of 3
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
         // Majority of 3 is 2: own + node 2's report alone already commits 32.
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 32, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 2,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })),
             "pre-adoption: quorum on the carried reports commits 32"
         );
-        step(&mut s, Event::Report { from: 3, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 3,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
 
         // Adopt v1: a higher-version config adding voter 5, fed directly as
         // the append path would (ConfigObserved does not care how the config
@@ -3073,19 +4053,48 @@ mod tests {
         let mut new_cfg = s.config().clone();
         new_cfg.voters.push((5, (5, 5)));
         new_cfg.version = 1;
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg.clone() });
-        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { position: 40, .. })));
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: new_cfg.clone(),
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { position: 40, .. }))
+        );
         assert_eq!(s.config(), &new_cfg);
         assert_eq!(s.config_position(), 40);
-        assert!(s.follower_slot(5).is_some(), "the new voter must get a tracked slot");
+        assert!(
+            s.follower_slot(5).is_some(),
+            "the new voter must get a tracked slot"
+        );
 
         // Post-adoption: fresh durable + reports from the carried members (2,3)
         // alone (no report from 5 yet) still reach quorum-of-4.
         step(&mut s, Event::DurableAdvanced { durable: 64 });
-        step(&mut s, Event::Report { from: 2, term: 1, durable: 64, durable_term: 1 });
-        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 64, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 2,
+                term: 1,
+                durable: 64,
+                durable_term: 1,
+            },
+        );
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 3,
+                term: 1,
+                durable: 64,
+                durable_term: 1,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 64 })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 64 })),
             "commit advances post-adoption via the carried reports for 2 and 3"
         );
     }
@@ -3100,34 +4109,81 @@ mod tests {
         step(&mut s, Event::Tick { now_ns: 301 });
         assert!(matches!(s.role(), Role::Candidate));
         assert_eq!(
-            s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0),
+            s.propose_config(
+                ConfigOp::AddLearner {
+                    id: 5,
+                    addr: (5, 5)
+                },
+                0
+            ),
             Err(ProposeError::NotLeader)
         );
 
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         assert!(!s.can_serve());
         assert_eq!(
-            s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0),
+            s.propose_config(
+                ConfigOp::AddLearner {
+                    id: 5,
+                    addr: (5, 5)
+                },
+                0
+            ),
             Err(ProposeError::NotServing)
         );
 
         // Commit the NewTerm frame -> serving.
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         step(&mut s, Event::Tick { now_ns: 310 });
         assert!(s.can_serve());
 
-        let new_cfg = s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0).unwrap();
+        let new_cfg = s
+            .propose_config(
+                ConfigOp::AddLearner {
+                    id: 5,
+                    addr: (5, 5),
+                },
+                0,
+            )
+            .unwrap();
         assert_eq!(new_cfg.version, 1);
 
         // The append path feeds the observed config back; it has not
         // committed yet (commit_seen stays 32 < config_position 40).
-        step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: new_cfg,
+            },
+        );
         assert!(s.config_pending());
         assert_eq!(
-            s.propose_config(ConfigOp::AddLearner { id: 6, addr: (6, 6) }, 0),
+            s.propose_config(
+                ConfigOp::AddLearner {
+                    id: 6,
+                    addr: (6, 6)
+                },
+                0
+            ),
             Err(ProposeError::ChangePending)
         );
     }
@@ -3140,11 +4196,26 @@ mod tests {
     fn self_demote_is_refused_other_demote_still_works() {
         let mut s = sm(0); // voters [0,1,2], id 0
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(s.can_serve());
 
         assert_eq!(
@@ -3158,17 +4229,49 @@ mod tests {
     /// report to be within `slack` of `commit_seen`.
     #[test]
     fn promote_requires_caught_up_learner() {
-        let mut s = ElectionSm::new(cfg_with_learners(0, vec![0, 1, 2], vec![5]), None, &[], 0, 0);
+        let mut s = ElectionSm::new(
+            cfg_with_learners(0, vec![0, 1, 2], vec![5]),
+            None,
+            &[],
+            0,
+            0,
+        );
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 100_000 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100_000, durable_term: 1 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100_000 })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 100_000,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 100_000 }))
+        );
         assert!(s.can_serve());
 
-        step(&mut s, Event::Report { from: 5, term: 1, durable: 10_000, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 5,
+                term: 1,
+                durable: 10_000,
+                durable_term: 1,
+            },
+        );
         assert_eq!(s.last_report(5), Some(10_000));
         assert!(!s.config_pending());
 
@@ -3177,8 +4280,19 @@ mod tests {
             Err(ProposeError::NotCaughtUp { gap: 57_232 })
         );
 
-        step(&mut s, Event::Report { from: 5, term: 1, durable: 90_000, durable_term: 1 });
-        assert!(s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768).is_ok());
+        step(
+            &mut s,
+            Event::Report {
+                from: 5,
+                term: 1,
+                durable: 90_000,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768)
+                .is_ok()
+        );
     }
 
     /// `ConfigObserved` adopts iff `config.version` strictly exceeds the
@@ -3191,21 +4305,49 @@ mod tests {
         cfg_v1.voters.push((5, (5, 5)));
         cfg_v1.version = 1;
 
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: cfg_v1.clone() });
-        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: cfg_v1.clone(),
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
         assert_eq!(s.config().version, 1);
 
         // Re-observation of the SAME version: one adoption total, this is a no-op.
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: cfg_v1.clone() });
-        assert!(acts.is_empty(), "same-version re-observation must be a no-op");
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: cfg_v1.clone(),
+            },
+        );
+        assert!(
+            acts.is_empty(),
+            "same-version re-observation must be a no-op"
+        );
         assert_eq!(s.config().version, 1);
 
         // A LOWER version arriving after a higher one is ignored.
         let mut cfg_v0 = cfg_v1;
         cfg_v0.version = 0;
-        let acts = step(&mut s, Event::ConfigObserved { position: 999, config: cfg_v0 });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 999,
+                config: cfg_v0,
+            },
+        );
         assert!(acts.is_empty());
-        assert_eq!(s.config().version, 1, "a stale lower version must not regress adoption");
+        assert_eq!(
+            s.config().version,
+            1,
+            "a stale lower version must not regress adoption"
+        );
     }
 
     /// A follower not present in a just-adopted config fail-stops.
@@ -3218,7 +4360,13 @@ mod tests {
         new_cfg.voters.retain(|(id, _)| *id != 3);
         new_cfg.tombstones.push(3);
         new_cfg.version = 1;
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: new_cfg,
+            },
+        );
         assert!(acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
     }
 
@@ -3250,7 +4398,13 @@ mod tests {
             vec![(60, addr_of(60))],
         );
         v1.version = 1;
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: v1 });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: v1,
+            },
+        );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "v1 (pre-admission history) must not halt a not-yet-admitted joiner"
@@ -3264,7 +4418,13 @@ mod tests {
             Vec::new(),
         );
         v2.version = 2;
-        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: v2 });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 80,
+                config: v2,
+            },
+        );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "v2 (still pre-admission history) must not halt"
@@ -3279,7 +4439,12 @@ mod tests {
         // `self_removed = true` on v1/v2, so this event would incorrectly halt.
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 0, new_term: 5, last_term: 1, last_durable: 0 },
+            Event::RequestVote {
+                from: 0,
+                new_term: 5,
+                last_term: 1,
+                last_durable: 0,
+            },
         );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
@@ -3292,8 +4457,17 @@ mod tests {
             vec![(61, addr_of(61))],
         );
         v3.version = 3;
-        let acts = step(&mut s, Event::ConfigObserved { position: 120, config: v3 });
-        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)), "own admission must never halt");
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 120,
+                config: v3,
+            },
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "own admission must never halt"
+        );
         assert!(s.config().contains(61), "61 must now participate");
         assert!(!s.config().is_voter(61), "still only a learner at v3");
     }
@@ -3316,7 +4490,13 @@ mod tests {
         demoted.voters.retain(|(id, _)| *id != 3);
         demoted.learners.push((3, addr_of(3)));
         demoted.version = 1;
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: demoted });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: demoted,
+            },
+        );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "demote alone (still present as a learner) must not halt"
@@ -3328,7 +4508,13 @@ mod tests {
         removed.learners.retain(|(id, _)| *id != 3);
         removed.tombstones.push(3);
         removed.version = 2;
-        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: removed });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 80,
+                config: removed,
+            },
+        );
         assert!(
             acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "removal-as-learner (tombstoned) must halt"
@@ -3361,7 +4547,13 @@ mod tests {
         // predicate would (wrongly) latch `self_removed = true` right here.
         let mut v1 = s.config().clone();
         v1.version = 1;
-        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: v1 });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: v1,
+            },
+        );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "absence without a tombstone must not halt a not-yet-admitted node"
@@ -3371,9 +4563,21 @@ mod tests {
         let mut v2 = s.config().clone();
         v2.voters.push((3, addr_of(3)));
         v2.version = 2;
-        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: v2 });
-        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)), "own admission must never halt");
-        assert!(s.config().contains(3) && s.config().is_voter(3), "3 is now a voting member");
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 80,
+                config: v2,
+            },
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "own admission must never halt"
+        );
+        assert!(
+            s.config().contains(3) && s.config().is_voter(3),
+            "3 is now a voting member"
+        );
 
         // v3: a REAL removal — tombstoned. Only this may latch
         // `self_removed` / emit `HaltRemoved` (the follower path); a raw
@@ -3383,7 +4587,13 @@ mod tests {
         v3.voters.retain(|(id, _)| *id != 3);
         v3.tombstones.push(3);
         v3.version = 3;
-        let acts = step(&mut s, Event::ConfigObserved { position: 120, config: v3 });
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 120,
+                config: v3,
+            },
+        );
         assert!(
             acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "a REAL tombstoned removal must latch self_removed and halt"
@@ -3405,20 +4615,46 @@ mod tests {
         // 3 voters [0,1,2]; self = 0 becomes leader of term 1.
         let mut s = sm(0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(s.can_serve(), "NewTerm committed: serving");
 
         // Propose + adopt RemoveVoter{self} (fed as the append path would;
         // config_position is set WELL above where we drive commit below, so
         // this test stays strictly in the pre-crossing window).
-        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        let new_cfg = s
+            .propose_config(ConfigOp::RemoveVoter { id: 0 }, 0)
+            .unwrap();
         assert!(!new_cfg.contains(0));
-        let acts = step(&mut s, Event::ConfigObserved { position: 200, config: new_cfg });
-        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 200,
+                config: new_cfg,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
             "a leader mid-self-removal must NOT halt at adoption"
@@ -3438,14 +4674,31 @@ mod tests {
         // still stale at 0) already ranks the quorum-of-3 and crosses;
         // follower 2's report is a same-value no-op advance (`None`).
         step(&mut s, Event::DurableAdvanced { durable: 128 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 128, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 128,
+                durable_term: 1,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 128 })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 128 })),
             "commit must keep advancing post-self-removal-adoption"
         );
         assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
         assert!(matches!(s.role(), Role::Leader));
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 128, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 2,
+                term: 1,
+                durable: 128,
+                durable_term: 1,
+            },
+        );
         assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
         assert!(matches!(s.role(), Role::Leader));
     }
@@ -3457,36 +4710,91 @@ mod tests {
     fn leader_self_removal_steps_down_once_commit_crosses_config_position() {
         let mut s = sm(0); // voters [0,1,2], id 0
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(s.can_serve());
 
-        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
-        step(&mut s, Event::ConfigObserved { position: 64, config: new_cfg });
+        let new_cfg = s
+            .propose_config(ConfigOp::RemoveVoter { id: 0 }, 0)
+            .unwrap();
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 64,
+                config: new_cfg,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
 
         // Below config_position (64): no step-down yet.
         step(&mut s, Event::DurableAdvanced { durable: 50 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 50,
+                durable_term: 1,
+            },
+        );
         assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
-        assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
+        assert!(
+            matches!(s.role(), Role::Leader),
+            "still leading pre-crossing"
+        );
 
         // Crosses config_position (64): StepDownRemoved fires alongside the
         // AdvanceCommit that crosses it.
         step(&mut s, Event::DurableAdvanced { durable: 100 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100, durable_term: 1 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 100,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 100 }))
+        );
         assert_eq!(
-            acts.iter().filter(|a| matches!(a, Action::StepDownRemoved)).count(),
+            acts.iter()
+                .filter(|a| matches!(a, Action::StepDownRemoved))
+                .count(),
             1,
             "must emit StepDownRemoved exactly once on crossing"
         );
 
         // Further driving never re-emits it.
         step(&mut s, Event::DurableAdvanced { durable: 200 });
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 2,
+                term: 1,
+                durable: 200,
+                durable_term: 1,
+            },
+        );
         assert!(
             !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
             "must not re-emit after the first crossing"
@@ -3512,10 +4820,25 @@ mod tests {
     fn leader_self_demote_steps_down_to_follower_once_commit_crosses() {
         let mut s = sm(0); // voters [0,1,2], id 0
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(s.can_serve());
 
         // Adopt our OWN demote from the log. NOT via `propose_config` (it
@@ -3524,43 +4847,117 @@ mod tests {
         // config directly. In [0,1,2], demoting 0 leaves voters [1,2], learner 0.
         let demoted = s.config().apply(ConfigOp::DemoteVoter { id: 0 }).unwrap();
         assert!(demoted.is_learner(0) && !demoted.is_voter(0));
-        assert!(!demoted.tombstones.contains(&0), "a demote leaves no tombstone");
-        let acts = step(&mut s, Event::ConfigObserved { position: 64, config: demoted });
-        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !demoted.tombstones.contains(&0),
+            "a demote leaves no tombstone"
+        );
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 64,
+                config: demoted,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
         // Leader carve-out: no halt, no step-down at adoption — the leader must
         // keep appending until C_new certifies the demote. Role stays Leader,
         // but it can no longer vote (rebuild_membership set can_vote = false).
-        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved | Action::StepDownRemoved)));
-        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
-        assert!(matches!(s.role(), Role::Leader), "still leading through the adoption window");
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::HaltRemoved | Action::StepDownRemoved))
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeFollower { .. }))
+        );
+        assert!(
+            matches!(s.role(), Role::Leader),
+            "still leading through the adoption window"
+        );
 
         // Below config_position (64): still leading.
         step(&mut s, Event::DurableAdvanced { durable: 50 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50, durable_term: 1 });
-        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
-        assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 50,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeFollower { .. }))
+        );
+        assert!(
+            matches!(s.role(), Role::Leader),
+            "still leading pre-crossing"
+        );
 
         // Commit crosses config_position (64): the demote is now certified by
         // C_new ({1,2}); relinquish leadership to a non-voting follower.
         step(&mut s, Event::DurableAdvanced { durable: 100 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100, durable_term: 1 });
-        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 100,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 100 }))
+        );
         assert_eq!(
             acts.iter()
-                .filter(|a| matches!(a, Action::BecomeFollower { term: 1, leader: None }))
+                .filter(|a| matches!(
+                    a,
+                    Action::BecomeFollower {
+                        term: 1,
+                        leader: None
+                    }
+                ))
                 .count(),
             1,
             "must relinquish leadership exactly once when the self-demote commits"
         );
         // NOT removed: a demote keeps the node in the cluster (no fail-stop).
-        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved | Action::StepDownRemoved)));
-        assert!(matches!(s.role(), Role::Follower), "now a non-voting learner-follower");
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::HaltRemoved | Action::StepDownRemoved))
+        );
+        assert!(
+            matches!(s.role(), Role::Follower),
+            "now a non-voting learner-follower"
+        );
 
         // Idempotent: further reports never re-emit the step-down (also, a
         // follower's Report path never re-enters rank_leader).
         step(&mut s, Event::DurableAdvanced { durable: 200 });
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200, durable_term: 1 });
-        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 2,
+                term: 1,
+                durable: 200,
+                durable_term: 1,
+            },
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::BecomeFollower { .. }))
+        );
     }
 
     /// T8 review finding: a self-removing LEADER preempted by a HIGHER TERM
@@ -3576,19 +4973,45 @@ mod tests {
     fn leader_self_removal_preempted_by_higher_term_halts() {
         let mut s = sm(0); // voters [0,1,2], id 0
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
 
         // Adopt our own removal; config_position (200) is well above anything
         // driven below, so we stay in the pre-crossing window throughout —
         // the carve-out keeps this leader serving with no HaltRemoved here.
-        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
-        let acts = step(&mut s, Event::ConfigObserved { position: 200, config: new_cfg });
+        let new_cfg = s
+            .propose_config(ConfigOp::RemoveVoter { id: 0 }, 0)
+            .unwrap();
+        let acts = step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 200,
+                config: new_cfg,
+            },
+        );
         assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
-        assert!(matches!(s.role(), Role::Leader), "carve-out: still leading through adoption");
+        assert!(
+            matches!(s.role(), Role::Leader),
+            "carve-out: still leading through adoption"
+        );
         assert!(!s.config().contains(0));
 
         // Preempted by a higher term via a RequestVote from a surviving
@@ -3598,10 +5021,21 @@ mod tests {
         // is the ONLY remaining chance to halt.
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 1, new_term: 2, last_term: 1, last_durable: 32 },
+            Event::RequestVote {
+                from: 1,
+                new_term: 2,
+                last_term: 1,
+                last_durable: 32,
+            },
         );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, leader: None })),
+            acts.iter().any(|a| matches!(
+                a,
+                Action::BecomeFollower {
+                    term: 2,
+                    leader: None
+                }
+            )),
             "must demote to follower of the new term"
         );
         assert!(
@@ -3621,10 +5055,16 @@ mod tests {
 
         let acts = step(
             &mut s,
-            Event::RequestVote { from: 1, new_term: 2, last_term: 1, last_durable: 0 },
+            Event::RequestVote {
+                from: 1,
+                new_term: 2,
+                last_term: 1,
+                last_durable: 0,
+            },
         );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, .. })),
+            acts.iter()
+                .any(|a| matches!(a, Action::BecomeFollower { term: 2, .. })),
             "must demote to follower of the new term"
         );
         assert!(
@@ -3645,24 +5085,56 @@ mod tests {
     fn self_removal_window_tracker_permits_leader_plus_one_of_two_new_followers() {
         let mut s = sm(0); // voters [0,1,2], id 0
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
+        step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 32,
+                durable_term: 1,
+            },
+        );
         assert!(s.can_serve());
 
-        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        let new_cfg = s
+            .propose_config(ConfigOp::RemoveVoter { id: 0 }, 0)
+            .unwrap();
         assert_eq!(new_cfg.voter_ids(), vec![1, 2]);
-        step(&mut s, Event::ConfigObserved { position: 64, config: new_cfg });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 64,
+                config: new_cfg,
+            },
+        );
         assert!(!s.config().contains(0));
 
         // The leader's own durable advances far past config_position; follower
         // 2 NEVER reports again (permanently silent — a lagging/partitioned
         // C_new voter). Only follower 1 reports.
         step(&mut s, Event::DurableAdvanced { durable: 1000 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 1000, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 1,
+                term: 1,
+                durable: 1000,
+                durable_term: 1,
+            },
+        );
         assert!(
-            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 1000 })),
+            acts.iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { commit: 1000 })),
             "own + ONE of the two C_new followers already ranks a quorum-of-3 \
              (leader's own slot + follower 1's slot) even though follower 2 \
              never reported — MORE permissive than a pure majority-of-2 over \
@@ -3678,31 +5150,71 @@ mod tests {
     fn nonmember_vote_and_report_stay_dropped_after_adoption() {
         let mut s = ElectionSm::new(cfg_members(0, vec![0, 1, 2, 3]), None, &[], 0, 0);
         step(&mut s, Event::Tick { now_ns: 301 });
-        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
-        step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
+        step(
+            &mut s,
+            Event::Vote {
+                from: 1,
+                term: 1,
+                granted: true,
+            },
+        );
+        step(
+            &mut s,
+            Event::Vote {
+                from: 2,
+                term: 1,
+                granted: true,
+            },
+        );
         assert!(matches!(s.role(), Role::Leader));
 
         let mut new_cfg = s.config().clone();
         new_cfg.voters.retain(|(id, _)| *id != 3);
         new_cfg.tombstones.push(3);
         new_cfg.version = 1;
-        step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 40,
+                config: new_cfg,
+            },
+        );
         assert!(!s.config().contains(3));
         assert!(s.follower_slot(3).is_none());
 
         // The removed voter's Report must not move commit.
-        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 1 << 30, durable_term: 1 });
+        let acts = step(
+            &mut s,
+            Event::Report {
+                from: 3,
+                term: 1,
+                durable: 1 << 30,
+                durable_term: 1,
+            },
+        );
         assert!(
-            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "a removed voter's Report must not move commit"
         );
 
         // The removed voter's RequestVote is ignored entirely: no answer, no
         // term adoption (mirrors `request_vote_from_non_member_is_ignored`).
         let before_term = s.current_term();
-        let acts =
-            step(&mut s, Event::RequestVote { from: 3, new_term: before_term + 5, last_term: 1, last_durable: 0 });
-        assert!(acts.is_empty(), "a removed voter's RequestVote must produce nothing");
+        let acts = step(
+            &mut s,
+            Event::RequestVote {
+                from: 3,
+                new_term: before_term + 5,
+                last_term: 1,
+                last_durable: 0,
+            },
+        );
+        assert!(
+            acts.is_empty(),
+            "a removed voter's RequestVote must produce nothing"
+        );
         assert_eq!(s.current_term(), before_term, "and must not adopt the term");
     }
 
@@ -3725,14 +5237,29 @@ mod tests {
         let mut s = sm_with_divergent_map(); // map [(1,0),(2,4096)], durable 6000, term 3
         let genesis = s.config().clone();
         let v1 = v1_of(&s);
-        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 5000,
+                config: v1.clone(),
+            },
+        );
         assert_eq!((s.config().version, s.config_position()), (1, 5000));
         // Divergent-map reconcile → Truncate{to: 4096} — strictly below 5000,
         // so the config frame is removed by the cut.
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
-        assert_eq!(s.config().version, 1, "config untouched until the matching-epoch ack");
+        assert_eq!(
+            s.config().version,
+            1,
+            "config untouched until the matching-epoch ack"
+        );
         let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
         assert_eq!(s.config(), &genesis, "reverted one level to prev");
         assert_eq!(s.config_position(), 0);
@@ -3751,14 +5278,33 @@ mod tests {
     fn truncation_at_config_frame_end_preserves_the_config() {
         let mut s = sm_with_divergent_map();
         let v1 = v1_of(&s);
-        step(&mut s, Event::ConfigObserved { position: 4096, config: v1.clone() });
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 4096,
+                config: v1.clone(),
+            },
+        );
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
         let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
-        assert_eq!(s.config(), &v1, "to == config_position: frame preserved, no revert");
+        assert_eq!(
+            s.config(),
+            &v1,
+            "to == config_position: frame preserved, no revert"
+        );
         assert_eq!(s.config_position(), 4096);
-        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
     }
 
     /// (c) A wipe (`Truncate{to: 0}` from NoCommonPrefix) keeps the OPERATIONAL
@@ -3768,13 +5314,33 @@ mod tests {
     fn wipe_keeps_operational_config_and_resets_record_position() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
         let v1 = v1_of(&s);
-        step(&mut s, Event::ConfigObserved { position: 3000, config: v1.clone() });
-        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 3000,
+                config: v1.clone(),
+            },
+        );
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 41,
+                last_term: 40,
+                last_durable: 9000,
+            },
+        );
         let acts = step(
             &mut s,
-            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+            Event::TermMapReceived {
+                term: 41,
+                entries: vec![(40, 1 << 20), (41, 2 << 20)],
+            },
         );
-        assert!(acts.iter().any(|a| matches!(a, Action::CountWipe)), "wipe path reached");
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::CountWipe)),
+            "wipe path reached"
+        );
         let epoch = extract_truncate_epoch(&acts);
         let acts = step(&mut s, Event::Truncated { epoch, to: 0 });
         assert_eq!(s.config(), &v1, "wipe keeps the operational config (fiat)");
@@ -3796,20 +5362,44 @@ mod tests {
     fn wrong_epoch_ack_clamps_durable_but_never_reverts_config() {
         let mut s = sm_with_divergent_map();
         let v1 = v1_of(&s);
-        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 5000,
+                config: v1.clone(),
+            },
+        );
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
-        let acts = step(&mut s, Event::Truncated { epoch: epoch + 7, to: 4096 });
+        let acts = step(
+            &mut s,
+            Event::Truncated {
+                epoch: epoch + 7,
+                to: 4096,
+            },
+        );
         assert!(s.is_truncating(), "wrong epoch: latch held");
         assert!(s.durable() <= 4096, "durable clamps to physical truth");
         assert_eq!(s.config(), &v1, "config untouched by a wrong-epoch ack");
         assert_eq!(s.config_position(), 5000);
-        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
         // The matching ack then reverts.
         let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
         assert_eq!(s.config().version, 0);
-        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
     }
 
     /// The counterfactual hook: with `set_revert_on_truncate(false)` the guard is
@@ -3820,14 +5410,29 @@ mod tests {
         let mut s = sm_with_divergent_map();
         s.set_revert_on_truncate(false);
         let v1 = v1_of(&s);
-        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        step(
+            &mut s,
+            Event::ConfigObserved {
+                position: 5000,
+                config: v1.clone(),
+            },
+        );
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
         let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
         assert_eq!(s.config(), &v1, "guard deleted: the stale config survives");
         assert_eq!(s.config_position(), 5000);
-        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
     }
 
     /// Boot recovery: `restore_prev_config` injects the durable record's PREV
@@ -3850,12 +5455,29 @@ mod tests {
         };
         let mut s = ElectionSm::new(ecfg, None, &[(1, 0), (2, 4096)], 6000, 0);
         s.restore_prev_config(genesis.clone(), 0);
-        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        step(
+            &mut s,
+            Event::RequestVote {
+                from: 0,
+                new_term: 3,
+                last_term: 1,
+                last_durable: 7000,
+            },
+        );
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
         step(&mut s, Event::Truncated { epoch, to: 4096 });
-        assert_eq!(s.config(), &genesis, "reverted to the RESTORED prev, not the seeded cur");
+        assert_eq!(
+            s.config(),
+            &genesis,
+            "reverted to the RESTORED prev, not the seeded cur"
+        );
         assert_eq!(s.config_position(), 0);
     }
 
@@ -3890,11 +5512,20 @@ mod tests {
         // a real forward adoption, installing the fiat config itself emitted no
         // `Action::ConfigAdopted` (asserted implicitly: only the truncate/ack
         // below can produce one, and it must not here either).
-        let acts =
-            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived {
+                term: 3,
+                entries: vec![(1, 0), (3, 4096)],
+            },
+        );
         let epoch = extract_truncate_epoch(&acts);
         let acts = step(&mut s, Event::Truncated { epoch, to: FLOOR });
         assert_eq!(s.config(), &floor_cfg, "to == config_position: no revert");
-        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Action::ConfigAdopted { .. }))
+        );
     }
 }

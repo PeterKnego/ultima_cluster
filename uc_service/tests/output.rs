@@ -21,12 +21,14 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use uc_client::Client;
+use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{NoopOutput, OutputError, OutputHandler, ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
-use uc_journal::TailReader;
+use uc_service::{
+    NoopOutput, OutputError, OutputHandler, ServiceBuilder, ServiceConfig, StateMachine,
+};
 
 /// `cargo test` runs every `#[test]` fn in this file as a separate OS thread
 /// within the SAME process by default. `output_thread_spawns_only_for_a_real_handler`
@@ -145,7 +147,9 @@ fn wait_until(mut f: impl FnMut() -> bool) {
 /// without exposing a test-only accessor on `Service`.
 fn thread_names() -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc/self/task") else { return out };
+    let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+        return out;
+    };
     for entry in entries.flatten() {
         if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
             out.push(comm.trim().to_string());
@@ -175,8 +179,9 @@ fn output_thread_spawns_only_for_a_real_handler() {
         "no output thread before any service attaches: {before:?}"
     );
 
-    let svc_noop =
-        ServiceBuilder::new(cfg(dir.path(), "spawn"), CountSm::default()).start().unwrap();
+    let svc_noop = ServiceBuilder::new(cfg(dir.path(), "spawn"), CountSm::default())
+        .start()
+        .unwrap();
     assert!(
         !thread_names().iter().any(|n| n == "uc2-output"),
         "default (NoopOutput) builder path must not spawn the output thread"
@@ -185,7 +190,10 @@ fn output_thread_spawns_only_for_a_real_handler() {
 
     let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
     let svc_real = ServiceBuilder::new(cfg(dir.path(), "spawn"), CountSm::default())
-        .output_handler(Recorder { seen, fail_first: AtomicBool::new(false) })
+        .output_handler(Recorder {
+            seen,
+            fail_first: AtomicBool::new(false),
+        })
         .start()
         .unwrap();
     // A NEW thread's name (`pthread_setname_np`) is set by the thread ITSELF
@@ -282,7 +290,10 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
     wait_until(|| node.can_serve());
     let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
     let svc = ServiceBuilder::new(cfg(dir.path(), "out"), CountSm::default())
-        .output_handler(Recorder { seen: seen.clone(), fail_first: AtomicBool::new(true) })
+        .output_handler(Recorder {
+            seen: seen.clone(),
+            fail_first: AtomicBool::new(true),
+        })
         .start()
         .unwrap();
     let client = Client::connect(dir.path(), "out").unwrap();
@@ -303,7 +314,10 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
     // hard service restart: marker floors the replay; positions >= marker re-delivered (at-least-once)
     svc.crash();
     let svc2 = ServiceBuilder::new(cfg(dir.path(), "out"), CountSm::default())
-        .output_handler(Recorder { seen: seen.clone(), fail_first: AtomicBool::new(false) })
+        .output_handler(Recorder {
+            seen: seen.clone(),
+            fail_first: AtomicBool::new(false),
+        })
         .start()
         .unwrap();
     for _ in 0..5 {
@@ -317,7 +331,14 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
     // qualify) — a genuine hang, reproduced directly, not a hypothetical.
     // `>=` matches this test's OWN preceding comment ("positions >= marker0
     // re-delivered"); see the task report for the full repro.
-    wait_until(|| seen.lock().unwrap().iter().filter(|&&p| p >= marker0).count() >= 5);
+    wait_until(|| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|&&p| p >= marker0)
+            .count()
+            >= 5
+    });
     // That count is still only a coarse proxy: because `marker0` legitimately
     // lags (the 100 ms persist floor), `svc2` redelivers the WHOLE `(marker0,
     // pre-crash frontier]` range on top of the 5 new submits — often more than
@@ -336,7 +357,10 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
     let mut sorted = seen.lock().unwrap().clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert!(is_contiguous_positions(&sorted), "no committed position skipped");
+    assert!(
+        is_contiguous_positions(&sorted),
+        "no committed position skipped"
+    );
     svc2.stop();
     node.stop();
 }

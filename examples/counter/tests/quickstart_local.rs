@@ -59,7 +59,9 @@ fn cargo_bin(pkg: &str, bin: &str) -> PathBuf {
             return PathBuf::from(&rest[..end]);
         }
     }
-    panic!("cargo build --message-format=json for {bin} produced no executable artifact:\n{stdout}");
+    panic!(
+        "cargo build --message-format=json for {bin} produced no executable artifact:\n{stdout}"
+    );
 }
 
 /// A directory holding exactly the five binaries the script needs, under the
@@ -72,8 +74,14 @@ fn tarball_bin_dir(at: &Path) -> PathBuf {
         (cargo_bin("uc_node", "uc2-node"), "uc2-node"),
         (cargo_bin("uc_ctl", "uc2ctl"), "uc2ctl"),
         (cargo_bin("uc_gateway", "uc2-gateway"), "uc2-gateway"),
-        (PathBuf::from(env!("CARGO_BIN_EXE_counter-service")), "counter-service"),
-        (PathBuf::from(env!("CARGO_BIN_EXE_counter-remote")), "counter-remote"),
+        (
+            PathBuf::from(env!("CARGO_BIN_EXE_counter-service")),
+            "counter-service",
+        ),
+        (
+            PathBuf::from(env!("CARGO_BIN_EXE_counter-remote")),
+            "counter-remote",
+        ),
     ];
     for (src, name) in bins {
         assert!(src.exists(), "{} does not exist", src.display());
@@ -108,7 +116,8 @@ fn dump_logs(root: &Path) -> String {
 
 #[test]
 fn quickstart_script_brings_up_a_cluster_and_a_remote_client_reads_ten() {
-    let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("qs-{}", std::process::id()));
+    let scratch =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("qs-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("create scratch");
     let bin_dir = tarball_bin_dir(&scratch);
     let root = scratch.join("run");

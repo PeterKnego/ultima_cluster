@@ -19,7 +19,7 @@ use uc_log::agent::{AgentRunner, IdleStrategy};
 use uc_log::archive::{Archive, ArchiveConfig};
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{CncMeta, CncPage};
-use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
+use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -69,15 +69,15 @@ fn main() {
     let blocks = Arc::new(AtomicU64::new(0));
     let blocks_c = Arc::clone(&blocks);
     let buf_c = Arc::clone(&buffer);
-    let agent = AgentRunner::spawn("uc2-archive", IdleStrategy::BusySpin, move || {
-        match archive.do_work(&buf_c) {
-            Ok(true) => {
-                blocks_c.store(archive.blocks_recorded(), Ordering::Relaxed);
-                true
-            }
-            Ok(false) => false,
-            Err(e) => panic!("archive: {e}"),
+    let agent = AgentRunner::spawn("uc2-archive", IdleStrategy::BusySpin, move || match archive
+        .do_work(&buf_c)
+    {
+        Ok(true) => {
+            blocks_c.store(archive.blocks_recorded(), Ordering::Relaxed);
+            true
         }
+        Ok(false) => false,
+        Err(e) => panic!("archive: {e}"),
     })
     .unwrap();
 
@@ -106,7 +106,10 @@ fn main() {
         let now = Instant::now();
         if now >= next_report {
             next_report = now + Duration::from_secs(1);
-            samples.push((start.elapsed().as_secs_f64(), cnc.counters().durable.load_acquire()));
+            samples.push((
+                start.elapsed().as_secs_f64(),
+                cnc.counters().durable.load_acquire(),
+            ));
             eprintln!(
                 "t={:>3}s appended={} durable_lag={}B",
                 start.elapsed().as_secs(),
@@ -151,9 +154,7 @@ fn main() {
         None
     };
     println!("== uc2 M1 gate ==");
-    println!(
-        "payload            {payload_len} B  ({framed} B framed at {HEADER_LEN} B header)"
-    );
+    println!("payload            {payload_len} B  ({framed} B framed at {HEADER_LEN} B header)");
     println!("duration (durable) {:.2} s", elapsed_durable.as_secs_f64());
     println!("appended           {appended} msgs");
     println!("rate (durable)     {durable_rate:.0} msgs/s");

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::error::{FrameError, RemoteError};
-use crate::frame::{decode_header, encode_frame, Header, HEADER_LEN, MAX_FRAME_LEN};
+use crate::frame::{HEADER_LEN, Header, MAX_FRAME_LEN, decode_header, encode_frame};
 
 /// A framed reader/writer over one TCP connection.
 ///
@@ -294,7 +294,9 @@ impl FramedConn {
     pub fn write_frame(&mut self, h: Header, payload: &[u8]) -> Result<(), RemoteError> {
         let len = HEADER_LEN + payload.len();
         if len > MAX_FRAME_LEN as usize {
-            return Err(RemoteError::Frame(FrameError::TooLong(len.min(u32::MAX as usize) as u32)));
+            return Err(RemoteError::Frame(FrameError::TooLong(
+                len.min(u32::MAX as usize) as u32,
+            )));
         }
         self.out.clear();
         encode_frame(&mut self.out, h, payload);
@@ -338,7 +340,10 @@ fn check_stall(partial_since: Option<Instant>, max_stall: Duration) -> Result<()
 /// A socket timeout is reported as `WouldBlock` on Unix and `TimedOut` on
 /// Windows; treat both the same.
 fn is_timeout(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 #[cfg(test)]
@@ -363,20 +368,27 @@ mod tests {
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
         // Well under the stall budget, so the budget — not the socket timeout
         // — is what ends the read.
-        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
         let (mut peer, _) = l.accept().unwrap();
         peer.write_all(&[0u8; HEADER_LEN / 2]).unwrap();
 
         let budget = Duration::from_millis(200);
         let started = Instant::now();
-        let err = client.read_frame(budget).expect_err("a stalled half-header must fail the read");
+        let err = client
+            .read_frame(budget)
+            .expect_err("a stalled half-header must fail the read");
         let took = started.elapsed();
         match err {
             RemoteError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e:?}"),
             other => panic!("expected a timeout, got {other:?}"),
         }
         assert!(took >= budget, "gave up early, after {took:?}");
-        assert!(took < budget * 2, "took {took:?}, want under 2x the {budget:?} budget");
+        assert!(
+            took < budget * 2,
+            "took {took:?}, want under 2x the {budget:?} budget"
+        );
         // The peer is still there and still silent — this was the read's own
         // verdict, not an EOF.
         drop(peer);
@@ -389,7 +401,9 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
         let (mut peer, _) = l.accept().unwrap();
 
         let mut frame = Vec::new();
@@ -408,9 +422,15 @@ mod tests {
 
         let budget = Duration::from_millis(200);
         let started = Instant::now();
-        let err = client.read_frame(budget).expect_err("a stalled payload must fail the read");
+        let err = client
+            .read_frame(budget)
+            .expect_err("a stalled payload must fail the read");
         assert!(matches!(err, RemoteError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut));
-        assert!(started.elapsed() < budget * 2, "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < budget * 2,
+            "took {:?}",
+            started.elapsed()
+        );
         drop(peer);
     }
 
@@ -422,11 +442,16 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         let (peer, _) = l.accept().unwrap();
         for _ in 0..3 {
             assert!(
-                client.read_frame(Duration::from_millis(1)).unwrap().is_none(),
+                client
+                    .read_frame(Duration::from_millis(1))
+                    .unwrap()
+                    .is_none(),
                 "an idle connection must keep reporting Ok(None), not time out"
             );
         }
@@ -458,7 +483,9 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         let (mut peer, _) = l.accept().unwrap();
 
         let mut wire = Vec::new();
@@ -468,10 +495,16 @@ mod tests {
         peer.write_all(&wire).unwrap();
 
         // First frame blocks for the read; the rest are already buffered.
-        let (h0, p0) = client.read_frame_buffered(Duration::from_secs(1)).unwrap().unwrap();
+        let (h0, p0) = client
+            .read_frame_buffered(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
         assert_eq!((h0.seq, &p0[..]), (1, &[1u8; 8][..]));
         for s in 2..=5u64 {
-            let (h, p) = client.next_buffered().unwrap().expect("frame already buffered");
+            let (h, p) = client
+                .next_buffered()
+                .unwrap()
+                .expect("frame already buffered");
             assert_eq!((h.seq, &p[..]), (s, &[s as u8; 8][..]));
         }
         // Buffer drained: nothing more without another read.
@@ -486,7 +519,9 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         let (mut peer, _) = l.accept().unwrap();
 
         let frame = a_frame(9, &[1, 2, 3, 4, 5, 6]);
@@ -501,7 +536,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
             peer2.write_all(&tail).unwrap();
         });
-        let (hdr, p) = client.read_frame_buffered(Duration::from_secs(1)).unwrap().unwrap();
+        let (hdr, p) = client
+            .read_frame_buffered(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
         assert_eq!((hdr.seq, &p[..]), (9, &[1u8, 2, 3, 4, 5, 6][..]));
         h.join().unwrap();
         drop(peer);
@@ -515,7 +553,9 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
         let (mut peer, _) = l.accept().unwrap();
         peer.write_all(&[0u8; HEADER_LEN / 2]).unwrap();
 
@@ -541,11 +581,16 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let mut client = FramedConn::new(TcpStream::connect(addr).unwrap()).unwrap();
-        client.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
         let (peer, _) = l.accept().unwrap();
         for _ in 0..3 {
             assert!(
-                client.read_frame_buffered(Duration::from_millis(1)).unwrap().is_none(),
+                client
+                    .read_frame_buffered(Duration::from_millis(1))
+                    .unwrap()
+                    .is_none(),
                 "an idle connection must keep reporting Ok(None)"
             );
         }

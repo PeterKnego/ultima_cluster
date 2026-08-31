@@ -96,7 +96,10 @@ fn instance_dir_lock_and_cnc_publication() {
     assert!(dir.path().join("query.ring").exists());
     assert!(dir.path().join("svc_query.0.ring").exists());
     assert!(dir.path().join("egress_service.0.broadcast").exists());
-    assert!(!dir.path().join("svc_query.ring").exists(), "the legacy singular name is not created");
+    assert!(
+        !dir.path().join("svc_query.ring").exists(),
+        "the legacy singular name is not created"
+    );
     assert!(dir.path().join("egress_node.broadcast").exists());
 
     node.stop();
@@ -109,7 +112,10 @@ fn single_node_cluster_elects_itself_and_serves() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while !node.can_serve() {
-        assert!(Instant::now() < deadline, "single node never elected itself");
+        assert!(
+            Instant::now() < deadline,
+            "single node never elected itself"
+        );
         std::thread::yield_now();
     }
     assert!(node.is_leader());
@@ -147,8 +153,16 @@ fn single_node_cluster_elects_itself_and_serves() {
     // the self-vote's durable store, which is the prerequisite for serving. If
     // the vote had not been persisted first, neither the term map nor the
     // committed NewTerm frame (both observed above) could exist.
-    let vote = uc_log::state::NodeState::open(&dir.path().join("state")).unwrap().vote();
-    assert_eq!(vote, Some(uc_log::state::VoteRecord { term: 1, voted_for: 0 }));
+    let vote = uc_log::state::NodeState::open(&dir.path().join("state"))
+        .unwrap()
+        .vote();
+    assert_eq!(
+        vote,
+        Some(uc_log::state::VoteRecord {
+            term: 1,
+            voted_for: 0
+        })
+    );
 }
 
 /// Task 12 review pin: the durable output-progress marker is a HIGH-WATER
@@ -183,7 +197,11 @@ fn output_progress_marker_survives_node_restart() {
 
     // The marker is durable on disk.
     let state = uc_log::state::NodeState::open(&dir.path().join("state")).unwrap();
-    assert_eq!(state.output_progress(), M, "marker durably persisted before the restart");
+    assert_eq!(
+        state.output_progress(),
+        M,
+        "marker durably persisted before the restart"
+    );
     drop(state);
 
     // Restart on the same instance dir: the fresh cnc page's output_completed
@@ -210,7 +228,11 @@ fn output_progress_marker_survives_node_restart() {
     node.stop();
 
     let state = uc_log::state::NodeState::open(&dir.path().join("state")).unwrap();
-    assert_eq!(state.output_progress(), M, "on-disk marker still M after the restart");
+    assert_eq!(
+        state.output_progress(),
+        M,
+        "on-disk marker still M after the restart"
+    );
 }
 
 /// Read the frame at `pos` via the buffer's validated read, panicking if it
@@ -238,7 +260,8 @@ fn ingress_ring_submission_reaches_commit_and_non_leader_redirects() {
     let (prod, _) = ring.into_split();
 
     let commit0 = node.counters().commit.load_acquire();
-    prod.try_write(MSG_V2_SUBMIT, 0, extra_client(7, 1), b"hello-ring").unwrap();
+    prod.try_write(MSG_V2_SUBMIT, 0, extra_client(7, 1), b"hello-ring")
+        .unwrap();
     wait_until(|| node.counters().commit.load_acquire() > commit0);
 
     // The frame carries the client identity end to end.

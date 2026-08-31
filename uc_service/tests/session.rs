@@ -4,11 +4,11 @@
 //! `Sessioned<S>` — exactly-once envelope over a raw state machine. See
 //! `uc_service::session` and `docs/reference/state-machine-contract.md`.
 
+use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 use uc_service::{
-    RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine, SESSION_HEADER_LEN,
+    RawStateMachine, SESSION_HEADER_LEN, SessionConfig, Sessioned, SnapshotStateMachine,
     TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
-use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
 fn env(client: u64, seq: u64, cmd: &Cmd) -> Vec<u8> {
     let mut v = Vec::with_capacity(SESSION_HEADER_LEN + 16);
@@ -26,7 +26,14 @@ fn resp(out: &[u8]) -> (u8, Option<CmdResp>) {
     (tag, Some(r))
 }
 fn sm(window: usize, max_clients: usize) -> Sessioned<RegisterSm> {
-    Sessioned::new(RegisterSm::default(), SessionConfig { window, max_clients, ..SessionConfig::default() })
+    Sessioned::new(
+        RegisterSm::default(),
+        SessionConfig {
+            window,
+            max_clients,
+            ..SessionConfig::default()
+        },
+    )
 }
 
 #[test]
@@ -73,7 +80,11 @@ fn clients_are_evicted_by_oldest_position_deterministically() {
     s.apply(30, &env(3, 1, &Cmd::Write(3)), &mut out); // evicts client 1 (seen at 10)
     out.clear();
     s.apply(40, &env(1, 1, &Cmd::Write(1)), &mut out);
-    assert_eq!(resp(&out).0, TAG_FRESH, "evicted client starts over: its retry is applied fresh");
+    assert_eq!(
+        resp(&out).0,
+        TAG_FRESH,
+        "evicted client starts over: its retry is applied fresh"
+    );
     out.clear();
     s.apply(50, &env(2, 1, &Cmd::Write(2)), &mut out);
     // client 2 (seen at 20) was evicted when client 1 came back at 40 (client 3 seen at 30 is newer)
@@ -104,11 +115,18 @@ fn snapshot_round_trip_carries_the_dedup_table() {
     assert_eq!(got, 200);
     out.clear();
     fresh.apply(300, &env(9, 2, &Cmd::Cas { old: 42, new: 43 }), &mut out);
-    assert_eq!(resp(&out), (TAG_REPLAYED, Some(CmdResp::CasResult(true))), "dedup survived the snapshot");
+    assert_eq!(
+        resp(&out),
+        (TAG_REPLAYED, Some(CmdResp::CasResult(true))),
+        "dedup survived the snapshot"
+    );
     // RegisterSm's Query type is `()` (a plain Read), not a `Query::Read` enum
     // variant — confirm the query path still works post-restore.
     out.clear();
-    fresh.query(&bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap(), &mut out);
+    fresh.query(
+        &bincode::serde::encode_to_vec((), bincode::config::standard()).unwrap(),
+        &mut out,
+    );
     let (v, _): (Option<u64>, usize) =
         bincode::serde::decode_from_slice(&out, bincode::config::standard()).unwrap();
     assert_eq!(v, Some(43));
@@ -153,10 +171,19 @@ fn install_refuses_mismatched_session_config() {
     // A node running a different `window` than the snapshot's origin.
     let mut mismatched = Sessioned::new(
         RegisterSm::default(),
-        SessionConfig { window: 8, max_clients: 16, ..SessionConfig::default() },
+        SessionConfig {
+            window: 8,
+            max_clients: 16,
+            ..SessionConfig::default()
+        },
     );
-    let err = mismatched.install_snapshot(100, &mut img.as_slice()).unwrap_err();
-    assert!(format!("{err}").contains("session config mismatch"), "unexpected error: {err}");
+    let err = mismatched
+        .install_snapshot(100, &mut img.as_slice())
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("session config mismatch"),
+        "unexpected error: {err}"
+    );
     // The inner SM must be untouched — the check runs BEFORE the inner install.
     assert_eq!(mismatched.inner().last_applied(), None);
 }
@@ -166,12 +193,17 @@ fn install_refuses_mismatched_session_config() {
 /// evicts the client whose frame just pushed the total over budget.
 #[test]
 fn max_bytes_evicts_oldest_clients_deterministically() {
-    let resp_size =
-        bincode::serde::encode_to_vec(CmdResp::WriteAck, bincode::config::standard()).unwrap().len();
+    let resp_size = bincode::serde::encode_to_vec(CmdResp::WriteAck, bincode::config::standard())
+        .unwrap()
+        .len();
     // Exactly one cached response fits under budget; a second tips it over.
     let mut s = Sessioned::new(
         RegisterSm::default(),
-        SessionConfig { window: 100, max_clients: 100, max_bytes: resp_size },
+        SessionConfig {
+            window: 100,
+            max_clients: 100,
+            max_bytes: resp_size,
+        },
     );
     let mut out = Vec::new();
     s.apply(10, &env(1, 1, &Cmd::Write(1)), &mut out);
@@ -182,11 +214,19 @@ fn max_bytes_evicts_oldest_clients_deterministically() {
     out.clear();
     // client 2 must have survived its own eviction pass.
     s.apply(30, &env(2, 1, &Cmd::Write(2)), &mut out);
-    assert_eq!(resp(&out).0, TAG_REPLAYED, "the just-written client is never the byte-budget victim");
+    assert_eq!(
+        resp(&out).0,
+        TAG_REPLAYED,
+        "the just-written client is never the byte-budget victim"
+    );
     out.clear();
     // client 1 was evicted by the byte budget; its retry starts over.
     s.apply(40, &env(1, 1, &Cmd::Write(1)), &mut out);
-    assert_eq!(resp(&out).0, TAG_FRESH, "client 1 was evicted by the byte budget; its retry is applied fresh");
+    assert_eq!(
+        resp(&out).0,
+        TAG_FRESH,
+        "client 1 was evicted by the byte budget; its retry is applied fresh"
+    );
 }
 
 /// `freeze()` reports the INNER SM's position, which can sit strictly below
@@ -208,7 +248,10 @@ fn freeze_with_trailing_replayed_frames_round_trips() {
     assert_eq!(resp(&out).0, TAG_REPLAYED);
 
     let (handle, pos) = s.freeze().unwrap();
-    assert_eq!(pos, 200, "freeze reports the inner SM's position, not Sessioned::last_applied()");
+    assert_eq!(
+        pos, 200,
+        "freeze reports the inner SM's position, not Sessioned::last_applied()"
+    );
     assert_eq!(s.last_applied(), Some(300));
 
     let mut img = Vec::new();
@@ -306,11 +349,17 @@ fn a_snapshot_claiming_a_huge_blob_is_refused_without_allocating_it() {
     let mut artifact = ((1u64 << 30) - 1).to_le_bytes().to_vec();
     let err = SnapshotStateMachine::install_snapshot(&mut s, 1, &mut artifact.as_slice())
         .expect_err("a blob shorter than its length prefix must be refused");
-    assert!(format!("{err}").contains("truncated"), "unexpected error: {err}");
+    assert!(
+        format!("{err}").contains("truncated"),
+        "unexpected error: {err}"
+    );
 
     // Over the bound: still refused, by the pre-existing sanity check.
     artifact = (1u64 << 40).to_le_bytes().to_vec();
     let err = SnapshotStateMachine::install_snapshot(&mut s, 1, &mut artifact.as_slice())
         .expect_err("a blob length over the sanity bound must be refused");
-    assert!(format!("{err}").contains("sanity bound"), "unexpected error: {err}");
+    assert!(
+        format!("{err}").contains("sanity bound"),
+        "unexpected error: {err}"
+    );
 }

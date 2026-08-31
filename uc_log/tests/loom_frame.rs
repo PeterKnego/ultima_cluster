@@ -66,7 +66,11 @@ fn committed_frame_is_fully_visible_to_append_bounded_reader() {
             let len = cells[base].load(Ordering::Acquire);
             assert_eq!(len, 64, "commit word must be visible below append");
             let payload = cells[base + 1].load(Ordering::Relaxed);
-            assert_eq!(payload, 0xAB00 + f as u32, "payload must be visible after acquire");
+            assert_eq!(
+                payload,
+                0xAB00 + f as u32,
+                "payload must be visible after acquire"
+            );
         }
 
         writer.join().unwrap();

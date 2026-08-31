@@ -29,7 +29,10 @@ pub enum PreflightError {
     #[error("buffer_bytes must be a power of two, got {0}")]
     BufferNotPowerOfTwo(usize),
     #[error("max_payload ({max_payload}) must be well below buffer_bytes ({buffer_bytes})")]
-    PayloadTooLarge { max_payload: usize, buffer_bytes: usize },
+    PayloadTooLarge {
+        max_payload: usize,
+        buffer_bytes: usize,
+    },
     #[error("this node's id ({0}) appears in neither members nor learners")]
     SelfNotAMember(NodeId),
     #[error("learners and members must be disjoint; id {0} appears in both")]
@@ -51,7 +54,11 @@ pub enum PreflightError {
          uc_net::sender asserts this at construction, so an oversized value panics the \
          node instead of failing here."
     )]
-    PayloadExceedsMtu { max_payload: usize, need: usize, mtu: usize },
+    PayloadExceedsMtu {
+        max_payload: usize,
+        need: usize,
+        mtu: usize,
+    },
     #[error("instance_dir {path} does not exist or cannot be probed: {detail}")]
     InstanceDirUnprobeable { path: String, detail: String },
     #[error(
@@ -93,7 +100,11 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
     // whole job is refusing by name WITH THE NUMBERS SHOWN. Saturation is now
     // reserved for values too large to represent at all, which
     // `PayloadTooLarge` above has already refused.
-    let overhead = if matches!(cfg.crypto, CryptoConfig::Enabled { .. }) { CRYPTO_OVERHEAD } else { 0 };
+    let overhead = if matches!(cfg.crypto, CryptoConfig::Enabled { .. }) {
+        CRYPTO_OVERHEAD
+    } else {
+        0
+    };
     let need = cfg
         .max_payload
         .checked_add(HEADER_LEN)
@@ -123,8 +134,7 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
         if !seen.insert(*id) {
             // A learner id colliding with a member id is the more specific
             // (and more confusing) case, so name it as such.
-            if cfg.members.iter().any(|(m, _)| m == id)
-                && cfg.learners.iter().any(|(l, _)| l == id)
+            if cfg.members.iter().any(|(m, _)| m == id) && cfg.learners.iter().any(|(l, _)| l == id)
             {
                 return Err(PreflightError::LearnerIsAlsoMember(*id));
             }
@@ -149,7 +159,6 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
     }
     Ok(())
 }
-
 
 /// Startup policy that is NOT part of the node's runtime configuration.
 ///
@@ -222,8 +231,7 @@ pub fn check_durable_fs(
     instance_dir: &std::path::Path,
     opts: &StartupOptions,
 ) -> Result<FsVerdict, PreflightError> {
-    let overridden =
-        opts.allow_volatile_fs || std::env::var_os("UC2_ALLOW_VOLATILE_FS").is_some();
+    let overridden = opts.allow_volatile_fs || std::env::var_os("UC2_ALLOW_VOLATILE_FS").is_some();
 
     // On a first boot the instance dir does not exist yet, so fall back to its
     // parent — but EXACTLY one level. Walking further up would reach `/`, which
@@ -265,7 +273,9 @@ pub fn check_durable_fs(
 /// despite a failed durability probe", whatever made the probe fail.
 fn degrade(overridden: bool, err: PreflightError) -> Result<FsVerdict, PreflightError> {
     if overridden {
-        Ok(FsVerdict::VolatileOverridden { fs: err.to_string() })
+        Ok(FsVerdict::VolatileOverridden {
+            fs: err.to_string(),
+        })
     } else {
         Err(err)
     }
@@ -407,11 +417,18 @@ mod tests {
         let err = check_semantics(&c).unwrap_err();
         let expected = align_frame_len(HEADER_LEN + 4096) + DATAGRAM_HEADER_LEN;
         match err {
-            PreflightError::PayloadExceedsMtu { max_payload, need, mtu } => {
+            PreflightError::PayloadExceedsMtu {
+                max_payload,
+                need,
+                mtu,
+            } => {
                 assert_eq!(max_payload, 4096);
                 assert_eq!(mtu, MTU_DEFAULT);
                 assert_eq!(need, expected, "must report what the frame actually needs");
-                assert!(need < 8192, "a sentinel leaked into the operator's message: {need}");
+                assert!(
+                    need < 8192,
+                    "a sentinel leaked into the operator's message: {need}"
+                );
             }
             other => panic!("expected PayloadExceedsMtu, got {other:?}"),
         }
@@ -427,7 +444,10 @@ mod tests {
         c.buffer_bytes = 1 << 26; // large enough that the buffer rule is not what fires
         let msg = check_semantics(&c).unwrap_err().to_string();
         assert!(msg.contains("max_payload"), "got: {msg}");
-        assert!(msg.contains("datagram"), "must name the real constraint, got: {msg}");
+        assert!(
+            msg.contains("datagram"),
+            "must name the real constraint, got: {msg}"
+        );
     }
 
     /// Enabling crypto shrinks the budget, so a payload that just fits in
@@ -448,7 +468,10 @@ mod tests {
             "a payload at the raw MTU cannot fit once headers and any crypto tag are added"
         );
         if cleartext.is_ok() {
-            assert!(sealed.is_err(), "crypto overhead must tighten the budget, not loosen it");
+            assert!(
+                sealed.is_err(),
+                "crypto overhead must tighten the budget, not loosen it"
+            );
         }
     }
 
@@ -477,7 +500,10 @@ mod tests {
         c.bind = "0.0.0.0:9100".parse().unwrap();
         let msg = check_semantics(&c).unwrap_err().to_string();
         assert!(msg.contains("bind"), "got: {msg}");
-        assert!(msg.contains("10.0.0.1:9100"), "error must show the expected addr, got: {msg}");
+        assert!(
+            msg.contains("10.0.0.1:9100"),
+            "error must show the expected addr, got: {msg}"
+        );
     }
 
     #[test]
@@ -521,7 +547,10 @@ mod tests {
     }
 
     fn no_override() -> StartupOptions {
-        StartupOptions { allow_volatile_fs: false, ..Default::default() }
+        StartupOptions {
+            allow_volatile_fs: false,
+            ..Default::default()
+        }
     }
 
     /// A directory known to be RAM-backed, located via `/proc/mounts` — an
@@ -579,7 +608,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("RAM-backed"), "got: {msg}");
-        assert!(msg.contains("allow_volatile_fs"), "must name the escape hatch, got: {msg}");
+        assert!(
+            msg.contains("allow_volatile_fs"),
+            "must name the escape hatch, got: {msg}"
+        );
     }
 
     /// First boot: the leaf does not exist yet, so the probe must fall back to
@@ -590,7 +622,10 @@ mod tests {
         let _g = fs_lock();
         let leaf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dir-yet");
         assert!(!leaf.exists());
-        assert_eq!(check_durable_fs(&leaf, &no_override()).unwrap(), FsVerdict::Durable);
+        assert_eq!(
+            check_durable_fs(&leaf, &no_override()).unwrap(),
+            FsVerdict::Durable
+        );
 
         // And the same fallback on a volatile parent still refuses.
         if let Some(vol) = volatile_dir() {
@@ -601,9 +636,12 @@ mod tests {
     #[test]
     fn a_missing_instance_dir_parent_is_refused() {
         let _g = fs_lock();
-        let msg = check_durable_fs(std::path::Path::new("/nonexistent-xyzzy/n1"), &no_override())
-            .unwrap_err()
-            .to_string();
+        let msg = check_durable_fs(
+            std::path::Path::new("/nonexistent-xyzzy/n1"),
+            &no_override(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(msg.contains("nonexistent-xyzzy"), "got: {msg}");
     }
 
@@ -614,7 +652,10 @@ mod tests {
             eprintln!("no RAM-backed fs available; skipping");
             return;
         };
-        let opts = StartupOptions { allow_volatile_fs: true, ..Default::default() };
+        let opts = StartupOptions {
+            allow_volatile_fs: true,
+            ..Default::default()
+        };
         // The override must suppress the REFUSAL without suppressing the
         // NOTICE: a cluster on a RAM-backed fs must never look quiet.
         let v = check_durable_fs(&vol.join("uc2-preflight-probe"), &opts).unwrap();

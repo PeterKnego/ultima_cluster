@@ -44,9 +44,18 @@ mod tests {
     fn parse_maps_known_values() {
         assert_eq!(parse(None), None);
         assert_eq!(parse(Some("")), None);
-        assert_eq!(parse(Some("commit-quorum-minus-one")), Some(Mutation::CommitQuorumMinusOne));
-        assert_eq!(parse(Some("skip-vote-order-check")), Some(Mutation::SkipVoteOrderCheck));
-        assert_eq!(parse(Some("skip-read-barrier")), Some(Mutation::SkipReadBarrier));
+        assert_eq!(
+            parse(Some("commit-quorum-minus-one")),
+            Some(Mutation::CommitQuorumMinusOne)
+        );
+        assert_eq!(
+            parse(Some("skip-vote-order-check")),
+            Some(Mutation::SkipVoteOrderCheck)
+        );
+        assert_eq!(
+            parse(Some("skip-read-barrier")),
+            Some(Mutation::SkipReadBarrier)
+        );
     }
 
     #[test]

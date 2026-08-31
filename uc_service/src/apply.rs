@@ -317,7 +317,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         // dead timeline; keep the heartbeat so the node sees a live-but-
         // poisoned service rather than a hung one.
         refuse_queries(st);
-        crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
+        crate::attach::slot(&st.cnc, st.service_id)
+            .heartbeat_ns
+            .store_release(unix_ns());
         return false;
     }
     let commit = c.commit.load_acquire();
@@ -352,8 +354,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             };
         // is_leader read inline (a direct field access, not a `&self` method)
         // so it does not conflict with the `follower` borrow the batch holds.
-        let is_leader =
-            st.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
+        let is_leader = st.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
         let cursor_before = st.follower.cursor;
         // Resolve the batch to a plain enum before touching other fields, so the
         // mutable borrow of `st.follower` the batch holds ends before the
@@ -367,8 +368,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 #[cfg(feature = "apply-profile")]
                 let batch_t0 = profile::now();
                 #[cfg(feature = "apply-profile")]
-                let (mut pf_frames, mut pf_sm, mut pf_pub, mut pf_bytes) =
-                    (0u64, 0u64, 0u64, 0u64);
+                let (mut pf_frames, mut pf_sm, mut pf_pub, mut pf_bytes) = (0u64, 0u64, 0u64, 0u64);
                 let mut sm = st.sm.lock().unwrap();
                 for (pos, hdr, payload) in frames {
                     // NEW_TERM (and any future non-MESSAGE type), and anything
@@ -391,7 +391,12 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         #[cfg(feature = "apply-profile")]
                         let t1 = profile::now();
                         if is_leader {
-                            st.egress.publish(hdr.session_id, hdr.correlation_id, pos, &st.resp_buf);
+                            st.egress.publish(
+                                hdr.session_id,
+                                hdr.correlation_id,
+                                pos,
+                                &st.resp_buf,
+                            );
                         }
                         #[cfg(feature = "apply-profile")]
                         {
@@ -416,7 +421,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     profile::add(pf_frames, pf_sm, pf_pub, pf_bytes);
                 }
                 // Publish the new applied frontier for barrier readers / clients.
-                crate::attach::slot(&st.cnc, st.service_id).applied.store_release(st.follower.cursor);
+                crate::attach::slot(&st.cnc, st.service_id)
+                    .applied
+                    .store_release(st.follower.cursor);
                 if st.follower.cursor == cursor_before {
                     // No frame cleared the target guard (target between the
                     // cursor and the next frame's end). Nothing more to do this
@@ -463,7 +470,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 Err(e) => panic!("service journal replay fail-stop: {e}"),
             };
             st.follower.cursor = cursor;
-            crate::attach::slot(&st.cnc, st.service_id).applied.store_release(cursor);
+            crate::attach::slot(&st.cnc, st.service_id)
+                .applied
+                .store_release(cursor);
             st.needs_replay = false;
             progressed = true;
             // Replay jumped the cursor: any wait episode is over.
@@ -473,7 +482,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         }
     }
     // Liveness: a wall-clock heartbeat the node compares against its own clock.
-    crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
+    crate::attach::slot(&st.cnc, st.service_id)
+        .heartbeat_ns
+        .store_release(unix_ns());
     drain_queries(st);
     // M6 Task 3: the freeze hook, last in the cycle (module doc / brief) —
     // strictly after the batch loop above has published this cycle's
@@ -502,14 +513,18 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
 /// failed build looks, from the trigger's point of view, just like a
 /// successful one that produced nothing durable.
 fn maybe_build_snapshot<S: RawStateMachine>(st: &mut ApplyState<S>) {
-    let Some(trigger) = st.snapshot_trigger.as_mut() else { return };
+    let Some(trigger) = st.snapshot_trigger.as_mut() else {
+        return;
+    };
     if trigger.policy.interval_bytes == 0 {
         return; // "never" (default policy)
     }
     if trigger.busy.load(Ordering::Acquire) {
         return; // one in-flight build max
     }
-    let applied = crate::attach::slot(&st.cnc, st.service_id).applied.load_acquire();
+    let applied = crate::attach::slot(&st.cnc, st.service_id)
+        .applied
+        .load_acquire();
     if applied.saturating_sub(trigger.last_snapshot_pos) < trigger.policy.interval_bytes {
         return;
     }
@@ -620,7 +635,8 @@ fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
                 // answer inside its blanket `RawStateMachine` impl.
                 st.resp_buf.clear();
                 st.sm.lock().unwrap().query(&buf[8..], &mut st.resp_buf);
-                st.egress.publish_query_answer(rec.header_extra, &st.resp_buf);
+                st.egress
+                    .publish_query_answer(rec.header_extra, &st.resp_buf);
             }
             Ok(None) => break,
             // Corrupt record (bad crc/magic): stop this cycle; the next retries
@@ -631,7 +647,10 @@ fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
 }
 
 fn unix_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// Fail-stop this service thread if the node it attached to has restarted (M5
@@ -672,14 +691,20 @@ fn unix_ns() -> u64 {
 /// fact (lockstep needs a free CPU per declared FSM), not a defect:
 /// `docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`.
 #[inline(never)]
-fn lockstep_wait<S: RawStateMachine>(st: &mut ApplyState<S>, commit: u64, durable: u64) -> Option<(u64, bool)> {
+fn lockstep_wait<S: RawStateMachine>(
+    st: &mut ApplyState<S>,
+    commit: u64,
+    durable: u64,
+) -> Option<(u64, bool)> {
     for i in 0..(LAG_WAIT_SPINS + LAG_WAIT_YIELDS) {
         if i < LAG_WAIT_SPINS {
             std::hint::spin_loop();
         } else {
             std::thread::yield_now();
             if (i - LAG_WAIT_SPINS).is_multiple_of(LAG_WAIT_HEARTBEAT_EVERY) {
-                crate::attach::slot(&st.cnc, st.service_id).heartbeat_ns.store_release(unix_ns());
+                crate::attach::slot(&st.cnc, st.service_id)
+                    .heartbeat_ns
+                    .store_release(unix_ns());
             }
         }
         let floor = crate::lag::floor(&st.cnc, st.declared);
@@ -813,8 +838,15 @@ mod tests {
     /// target tree (never `/tmp` — CLAUDE.md's scratch rule); removed with the
     /// returned `TempDir`.
     fn scratch() -> tempfile::TempDir {
-        let base = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        tempfile::Builder::new().prefix("uc2-apply-lagk").tempdir_in(base).unwrap()
+        let base = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        tempfile::Builder::new()
+            .prefix("uc2-apply-lagk")
+            .tempdir_in(base)
+            .unwrap()
     }
 
     /// M14c2 ruling K (`docs/benchmarks/uc2-m14c-*`): `uc_service_lag_waits_total`
@@ -880,9 +912,16 @@ mod tests {
 
         assert_eq!(waits(&cnc), 0, "nothing counted before the first cycle");
         // Cycle 1: parked at a cap that sits mid-frame — one episode.
-        assert!(!super::apply_cycle(&mut st), "no progress: the cap blocks the frame");
+        assert!(
+            !super::apply_cycle(&mut st),
+            "no progress: the cap blocks the frame"
+        );
         assert_eq!(st.follower.cursor, FRAME, "no frame moved");
-        assert_eq!(waits(&cnc), 1, "ruling K: the mid-frame cap counts a wait episode");
+        assert_eq!(
+            waits(&cnc),
+            1,
+            "ruling K: the mid-frame cap counts a wait episode"
+        );
         // Cycle 2: still the SAME episode — episodes, not cycles.
         assert!(!super::apply_cycle(&mut st));
         assert_eq!(waits(&cnc), 1, "one episode, not one per cycle");
@@ -891,10 +930,21 @@ mod tests {
         // (ending 192) clears — the episode resolves and a new one opens at
         // the new cap, 32 bytes into the frame at 192.
         cnc.service_slot(1).applied.store_release(FRAME);
-        assert!(super::apply_cycle(&mut st), "the floor moved: a frame applies");
-        assert_eq!(st.follower.cursor, 2 * FRAME, "exactly one frame cleared the new cap");
+        assert!(
+            super::apply_cycle(&mut st),
+            "the floor moved: a frame applies"
+        );
+        assert_eq!(
+            st.follower.cursor,
+            2 * FRAME,
+            "exactly one frame cleared the new cap"
+        );
         assert_eq!(st.sm.lock().unwrap().applies, 1);
-        assert_eq!(waits(&cnc), 2, "the resolve opened a SECOND episode at the new cap");
+        assert_eq!(
+            waits(&cnc),
+            2,
+            "the resolve opened a SECOND episode at the new cap"
+        );
         // ... and that second episode, too, counts once however long it lasts.
         assert!(!super::apply_cycle(&mut st));
         assert_eq!(waits(&cnc), 2, "still one episode");

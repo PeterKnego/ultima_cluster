@@ -57,7 +57,10 @@ impl InstanceDir {
             .map_err(|_| IpcError::AlreadyRunning(root.to_path_buf()))?;
         std::fs::create_dir_all(root.join("journal"))?;
         std::fs::create_dir_all(root.join("state"))?;
-        Ok(InstanceDir { root: root.to_path_buf(), _lock: lock })
+        Ok(InstanceDir {
+            root: root.to_path_buf(),
+            _lock: lock,
+        })
     }
 
     pub fn cnc_path(&self) -> PathBuf {
@@ -136,8 +139,14 @@ mod tests {
         assert_eq!(d.egress_node(), dir.path().join("egress_node.broadcast"));
         assert_eq!(d.svc_query_ring_for(0), dir.path().join("svc_query.0.ring"));
         assert_eq!(d.svc_query_ring_for(7), dir.path().join("svc_query.7.ring"));
-        assert_eq!(d.egress_service_for(3), dir.path().join("egress_service.3.broadcast"));
-        assert_eq!(d.snapshot_dir_for(1), dir.path().join("snapshots").join("1"));
+        assert_eq!(
+            d.egress_service_for(3),
+            dir.path().join("egress_service.3.broadcast")
+        );
+        assert_eq!(
+            d.snapshot_dir_for(1),
+            dir.path().join("snapshots").join("1")
+        );
         assert_eq!(d.service_lock_for(2), dir.path().join("service.2.lock"));
     }
 }

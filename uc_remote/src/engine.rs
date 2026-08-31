@@ -330,7 +330,11 @@ pub enum RemoteOutcome<'a> {
     /// `replayed` is the edge's `FLAG_REPLAYED` (the session cache answered);
     /// `expired` is `FLAG_EXPIRED` (the dedup window had moved past this seq,
     /// so the outcome of a write is unknowable) and then `body` is empty.
-    Response { body: &'a [u8], replayed: bool, expired: bool },
+    Response {
+        body: &'a [u8],
+        replayed: bool,
+        expired: bool,
+    },
     /// The edge timed the slot out and `resend_on_unknown` is false.
     Unknown,
     /// The node refused the payload. Never re-sent.
@@ -509,7 +513,7 @@ impl RemoteSendHalf {
         user_data: u64,
         bytes: &[u8],
     ) -> Result<(), SubmitError> {
-        use crate::frame::{Header, HEADER_LEN, MAX_FRAME_LEN, PROTOCOL_VERSION};
+        use crate::frame::{HEADER_LEN, Header, MAX_FRAME_LEN, PROTOCOL_VERSION};
 
         let link = &self.link;
         if link.closed() {
@@ -538,7 +542,13 @@ impl RemoteSendHalf {
         {
             return Err(SubmitError::Backpressure);
         }
-        let h = Header { ty, flags, version: PROTOCOL_VERSION, client_id: link.client_id, seq };
+        let h = Header {
+            ty,
+            flags,
+            version: PROTOCOL_VERSION,
+            client_id: link.client_id,
+            seq,
+        };
         let Some((off, len)) = out.stage_frame(h, bytes) else {
             return Err(SubmitError::Backpressure);
         };
@@ -604,7 +614,8 @@ impl RemoteSendHalf {
         // re-send — a released byte may already have been overwritten — and
         // nothing that NEEDS re-sending either, because this walk stopped at
         // the oldest LIVE slot.
-        link.oldest_unreclaimed.store(seq, std::sync::atomic::Ordering::Release);
+        link.oldest_unreclaimed
+            .store(seq, std::sync::atomic::Ordering::Release);
         let pos = if seq < next {
             // Everything below the oldest live request may go. A `None` here
             // means it resolved between the two reads — keep the previous
@@ -705,7 +716,9 @@ impl RemotePollHalf {
 
     /// A handle a poller thread can park on until something completes.
     pub fn wait_handle(&self) -> RemoteWaitHandle {
-        RemoteWaitHandle { link: Arc::clone(&self.link) }
+        RemoteWaitHandle {
+            link: Arc::clone(&self.link),
+        }
     }
 
     /// Counters for what the link had to do to keep its promise.
@@ -774,7 +787,11 @@ pub(crate) fn outcome_of(
     expired: bool,
 ) -> RemoteOutcome<'_> {
     match tag {
-        OutcomeTag::Response => RemoteOutcome::Response { body, replayed, expired },
+        OutcomeTag::Response => RemoteOutcome::Response {
+            body,
+            replayed,
+            expired,
+        },
         OutcomeTag::Unknown => RemoteOutcome::Unknown,
         OutcomeTag::PayloadTooLarge => RemoteOutcome::PayloadTooLarge,
         OutcomeTag::TimedOut => RemoteOutcome::TimedOut,
@@ -804,7 +821,10 @@ mod window_tests {
 
     #[test]
     fn a_zero_grant_admits_nothing() {
-        assert!(!admissible(0, 0, 1024), "an idle client with no grant still waits");
+        assert!(
+            !admissible(0, 0, 1024),
+            "an idle client with no grant still waits"
+        );
         assert!(!admissible(5, 0, 1024));
     }
 
@@ -814,10 +834,16 @@ mod window_tests {
     /// edge reserved their slots before it squeezed).
     #[test]
     fn a_reduced_grant_refuses_until_the_completions_drain() {
-        assert!(!admissible(4, 1, 1024), "four in flight against a grant of one");
+        assert!(
+            !admissible(4, 1, 1024),
+            "four in flight against a grant of one"
+        );
         assert!(!admissible(2, 1, 1024));
         assert!(!admissible(1, 1, 1024));
-        assert!(admissible(0, 1, 1024), "the last completion re-opens the window");
+        assert!(
+            admissible(0, 1, 1024),
+            "the last completion re-opens the window"
+        );
     }
 
     /// `max_inflight` is a local cap ON TOP of the grant; the tighter of the
@@ -825,8 +851,14 @@ mod window_tests {
     #[test]
     fn the_tighter_of_the_grant_and_the_local_cap_binds() {
         assert!(admissible(7, 1000, 8), "the local cap has room");
-        assert!(!admissible(8, 1000, 8), "max_inflight binds below a generous grant");
-        assert!(!admissible(8, 8, 1000), "the grant binds below a generous local cap");
+        assert!(
+            !admissible(8, 1000, 8),
+            "max_inflight binds below a generous grant"
+        );
+        assert!(
+            !admissible(8, 8, 1000),
+            "the grant binds below a generous local cap"
+        );
         for credits in 0..=6u32 {
             for max_inflight in 0..=6u32 {
                 for inflight in 0..=8u64 {

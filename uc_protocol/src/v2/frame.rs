@@ -64,7 +64,8 @@ pub fn write_header_except_length(buf: &mut [u8], h: &FrameHeader) {
     buf[OFF_TERM_ID..OFF_TERM_ID + 4].copy_from_slice(&h.leadership_term_id.to_le_bytes());
     buf[OFF_RESERVED1..OFF_RESERVED1 + 4].copy_from_slice(&0u32.to_le_bytes());
     buf[OFF_SESSION_ID..OFF_SESSION_ID + 8].copy_from_slice(&h.session_id.to_le_bytes());
-    buf[OFF_CORRELATION_ID..OFF_CORRELATION_ID + 8].copy_from_slice(&h.correlation_id.to_le_bytes());
+    buf[OFF_CORRELATION_ID..OFF_CORRELATION_ID + 8]
+        .copy_from_slice(&h.correlation_id.to_le_bytes());
 }
 
 /// Parse a header from a committed frame. The caller must already have
@@ -85,10 +86,14 @@ pub fn read_header(buf: &[u8]) -> FrameHeader {
         length: u32::from_le_bytes(buf[OFF_LENGTH..OFF_LENGTH + 4].try_into().unwrap()),
         frame_type: buf[OFF_TYPE],
         flags: buf[OFF_FLAGS],
-        leadership_term_id: u32::from_le_bytes(buf[OFF_TERM_ID..OFF_TERM_ID + 4].try_into().unwrap()),
+        leadership_term_id: u32::from_le_bytes(
+            buf[OFF_TERM_ID..OFF_TERM_ID + 4].try_into().unwrap(),
+        ),
         session_id: u64::from_le_bytes(buf[OFF_SESSION_ID..OFF_SESSION_ID + 8].try_into().unwrap()),
         correlation_id: u64::from_le_bytes(
-            buf[OFF_CORRELATION_ID..OFF_CORRELATION_ID + 8].try_into().unwrap(),
+            buf[OFF_CORRELATION_ID..OFF_CORRELATION_ID + 8]
+                .try_into()
+                .unwrap(),
         ),
     }
 }

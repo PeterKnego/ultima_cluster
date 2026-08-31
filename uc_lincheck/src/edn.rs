@@ -40,7 +40,10 @@ pub fn edn_line(index: u64, typ: EdnType, process: u64, time_ns: u64, op: &EdnOp
     match op {
         EdnOp::Append { key, val } => write!(v, "[:append {key} {val}]").unwrap(),
         EdnOp::Read { key, result: None } => write!(v, "[:r {key} nil]").unwrap(),
-        EdnOp::Read { key, result: Some(list) } => {
+        EdnOp::Read {
+            key,
+            result: Some(list),
+        } => {
             write!(v, "[:r {key} [").unwrap();
             for (j, x) in list.iter().enumerate() {
                 if j > 0 {
@@ -51,7 +54,9 @@ pub fn edn_line(index: u64, typ: EdnType, process: u64, time_ns: u64, op: &EdnOp
             v.push_str("]]");
         }
     }
-    format!("{{:index {index}, :type {typ}, :f :txn, :process {process}, :time {time_ns}, :value [{v}]}}")
+    format!(
+        "{{:index {index}, :type {typ}, :f :txn, :process {process}, :time {time_ns}, :value [{v}]}}"
+    )
 }
 
 /// Thread-safe event recorder: a global monotonic `:index`, `:time` in ns since
@@ -136,15 +141,42 @@ mod tests {
     #[test]
     fn edn_line_read_nil_and_lists() {
         assert_eq!(
-            edn_line(1, EdnType::Invoke, 0, 5, &EdnOp::Read { key: 1, result: None }),
+            edn_line(
+                1,
+                EdnType::Invoke,
+                0,
+                5,
+                &EdnOp::Read {
+                    key: 1,
+                    result: None
+                }
+            ),
             "{:index 1, :type :invoke, :f :txn, :process 0, :time 5, :value [[:r 1 nil]]}"
         );
         assert_eq!(
-            edn_line(9, EdnType::Ok, 0, 5, &EdnOp::Read { key: 1, result: Some(vec![12, 42]) }),
+            edn_line(
+                9,
+                EdnType::Ok,
+                0,
+                5,
+                &EdnOp::Read {
+                    key: 1,
+                    result: Some(vec![12, 42])
+                }
+            ),
             "{:index 9, :type :ok, :f :txn, :process 0, :time 5, :value [[:r 1 [12 42]]]}"
         );
         assert_eq!(
-            edn_line(2, EdnType::Ok, 0, 5, &EdnOp::Read { key: 1, result: Some(vec![]) }),
+            edn_line(
+                2,
+                EdnType::Ok,
+                0,
+                5,
+                &EdnOp::Read {
+                    key: 1,
+                    result: Some(vec![])
+                }
+            ),
             "{:index 2, :type :ok, :f :txn, :process 0, :time 5, :value [[:r 1 []]]}"
         );
     }

@@ -74,7 +74,10 @@ impl StateMachine for CounterSm {
             Command::Reset => self.value = 0,
         }
         self.last_applied = Some(position);
-        Applied { value: self.value, position }
+        Applied {
+            value: self.value,
+            position,
+        }
     }
 
     /// Answer a read from local state. Whether the caller gets a linearizable

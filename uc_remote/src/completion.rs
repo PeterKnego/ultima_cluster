@@ -120,7 +120,10 @@ impl CompletionQueue {
     /// terminate. `MAX_FRAME_LEN` bounds every body that can arrive on this
     /// wire, so an empty arena always has room for the next one.
     pub(crate) fn new(entries: usize, arena_bytes: usize) -> CompletionQueue {
-        Self::build(entries, arena_bytes.max(crate::frame::MAX_FRAME_LEN as usize))
+        Self::build(
+            entries,
+            arena_bytes.max(crate::frame::MAX_FRAME_LEN as usize),
+        )
     }
 
     /// Test-only: build with an arena BELOW the `MAX_FRAME_LEN` floor, so the
@@ -186,7 +189,10 @@ impl CompletionQueue {
         }
         let ah = self.arena_head.load(Ordering::Relaxed);
         let at = self.arena_tail.load(Ordering::Acquire);
-        debug_assert!(ah >= at, "push: arena_head must never fall behind arena_tail");
+        debug_assert!(
+            ah >= at,
+            "push: arena_head must never fall behind arena_tail"
+        );
         let arena_cap = self.arena_capacity();
         debug_assert!(
             (ah - at) as usize <= arena_cap,
@@ -243,7 +249,8 @@ impl CompletionQueue {
             (h + 1 - t) as usize <= self.entries(),
             "push: head must never pass tail + the slot count"
         );
-        self.arena_head.store(ah + body.len() as u64, Ordering::Release);
+        self.arena_head
+            .store(ah + body.len() as u64, Ordering::Release);
         self.head.store(h + 1, Ordering::Release);
         true
     }
@@ -492,7 +499,11 @@ mod tests {
         let before = q.drained().seq();
         let drained = q.drain(2, |_, _| {});
         assert_eq!(drained, 2);
-        assert_ne!(q.drained().seq(), before, "a drain must wake a parked producer");
+        assert_ne!(
+            q.drained().seq(),
+            before,
+            "a drain must wake a parked producer"
+        );
         assert!(
             q.push(Record::simple(99, OutcomeTag::Response), b"x"),
             "a drained queue takes more"
@@ -509,7 +520,10 @@ mod tests {
             pushed += 1;
             assert!(pushed < 64, "the arena never filled");
         }
-        assert!(pushed <= 4, "a 4 KiB arena cannot hold five 1000-byte bodies");
+        assert!(
+            pushed <= 4,
+            "a 4 KiB arena cannot hold five 1000-byte bodies"
+        );
         let n = q.drain(1024, |_, b| assert_eq!(b.len(), 1000));
         assert_eq!(n as u64, pushed);
         assert!(
@@ -535,11 +549,18 @@ mod tests {
             }
             let n = q.drain(1, |rec, b| {
                 assert_eq!(rec.user_data, round);
-                assert_eq!(b, &body[..], "round {round}: a wrapped body must read back whole");
+                assert_eq!(
+                    b,
+                    &body[..],
+                    "round {round}: a wrapped body must read back whole"
+                );
             });
             assert_eq!(n, 1);
         }
-        assert!(wrapped, "no body actually straddled the wrap — the test proved nothing");
+        assert!(
+            wrapped,
+            "no body actually straddled the wrap — the test proved nothing"
+        );
     }
 
     #[test]
@@ -579,11 +600,7 @@ mod tests {
         assert!(outcome.is_err(), "the callback's panic must propagate");
         assert_eq!(
             first.into_inner().unwrap(),
-            vec![
-                (0, vec![0u8; 4]),
-                (1, vec![1u8; 4]),
-                (2, vec![2u8; 4]),
-            ],
+            vec![(0, vec![0u8; 4]), (1, vec![1u8; 4]), (2, vec![2u8; 4]),],
             "records 0 and 1 completed; 2 is the one that panicked"
         );
         // 0 and 1 returned, so they are gone; 2 panicked, so it is retried and

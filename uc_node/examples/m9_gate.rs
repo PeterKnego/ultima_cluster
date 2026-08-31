@@ -54,7 +54,10 @@ const BAR_DIP_PCT: f64 = 10.0;
 // ------------------------------------------------------------------ CLI
 
 #[derive(Parser)]
-#[command(name = "m9_gate", about = "UC v2 M9 gate: restart cost of a deployable node")]
+#[command(
+    name = "m9_gate",
+    about = "UC v2 M9 gate: restart cost of a deployable node"
+)]
 struct Cli {
     #[command(subcommand)]
     role: Role,
@@ -188,7 +191,10 @@ impl SnapshotStateMachine for RegSm {
         let mut buf = Vec::new();
         src.read_to_end(&mut buf)?;
         if buf.len() < 16 {
-            return Err(SnapshotError::Codec(format!("short snapshot: {} bytes", buf.len())));
+            return Err(SnapshotError::Codec(format!(
+                "short snapshot: {} bytes",
+                buf.len()
+            )));
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -206,8 +212,9 @@ impl SnapshotStateMachine for RegSm {
 // --------------------------------------------------------- fleet roles
 
 fn spawn_service(dir: &Path, app_id: &str, snapshot_interval_bytes: u64) -> Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, app_id)
-        .snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
+    let cfg = ServiceConfig::new(dir, app_id).snapshot_policy(SnapshotPolicy {
+        interval_bytes: snapshot_interval_bytes,
+    });
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
         .expect("snapshot service start")
@@ -290,7 +297,11 @@ impl Load {
         let submitted = Arc::new(Mutex::new(0u64));
         let (s, n) = (Arc::clone(&stop), Arc::clone(&submitted));
         let handle = thread::spawn(move || load_loop(s, registry, app_id, n));
-        Load { stop, submitted, handle: Some(handle) }
+        Load {
+            stop,
+            submitted,
+            handle: Some(handle),
+        }
     }
     fn stop(mut self) -> u64 {
         self.stop.store(true, Ordering::Relaxed);
@@ -301,7 +312,12 @@ impl Load {
     }
 }
 
-fn load_loop(stop: Arc<AtomicBool>, registry: Registry, app_id: String, submitted: Arc<Mutex<u64>>) {
+fn load_loop(
+    stop: Arc<AtomicBool>,
+    registry: Registry,
+    app_id: String,
+    submitted: Arc<Mutex<u64>>,
+) {
     let mut next_val = 1u64;
     let mut cur = 0usize;
     let mut client: Option<Client> = None;
@@ -405,7 +421,9 @@ impl NodeProc {
         CncPage::open_file(&self.dir.join("cnc2.dat"), APP).ok()
     }
     fn commit(&self) -> u64 {
-        self.cnc().map(|c| c.counters().commit.load_acquire()).unwrap_or(0)
+        self.cnc()
+            .map(|c| c.counters().commit.load_acquire())
+            .unwrap_or(0)
     }
     fn is_leader(&self) -> bool {
         self.cnc()
@@ -418,13 +436,17 @@ impl NodeProc {
             .unwrap_or(false)
     }
     fn service_snapshot_pos(&self) -> u64 {
-        self.cnc().map(|c| c.snapshots().service_snapshot_pos.load_acquire()).unwrap_or(0)
+        self.cnc()
+            .map(|c| c.snapshots().service_snapshot_pos.load_acquire())
+            .unwrap_or(0)
     }
     fn instance_id(&self) -> Option<u128> {
         self.cnc().and_then(|c| c.try_instance_id())
     }
     fn incoming_snapshot_pos(&self) -> u64 {
-        self.cnc().map(|c| c.snapshots().incoming_snapshot_pos.load_acquire()).unwrap_or(0)
+        self.cnc()
+            .map(|c| c.snapshots().incoming_snapshot_pos.load_acquire())
+            .unwrap_or(0)
     }
 }
 
@@ -439,7 +461,13 @@ impl Drop for NodeProc {
     }
 }
 
-fn write_config(path: &Path, id: NodeId, addr: SocketAddr, dir: &Path, members: &[(NodeId, SocketAddr)]) {
+fn write_config(
+    path: &Path,
+    id: NodeId,
+    addr: SocketAddr,
+    dir: &Path,
+    members: &[(NodeId, SocketAddr)],
+) {
     let mut s = format!(
         "id = {id}\nbind = \"{addr}\"\ninstance_dir = \"{}\"\napp_id = \"{APP}\"\n\
          buffer_bytes = {BUFFER_BYTES}\nmax_payload = {MAX_PAYLOAD}\n\
@@ -466,14 +494,18 @@ fn spawn_node(bin: &Path, cfg_path: &Path) -> Child {
 fn default_uc_node_bin() -> PathBuf {
     // target/<profile>/examples/m9_gate -> target/<profile>/uc2-node
     let me = std::env::current_exe().expect("current_exe");
-    me.parent().and_then(|p| p.parent()).map(|p| p.join("uc2-node")).unwrap_or_default()
+    me.parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("uc2-node"))
+        .unwrap_or_default()
 }
 
 fn await_leader(nodes: &[NodeProc], secs: u64) -> Option<usize> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
-        let leaders: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].is_leader() && nodes[i].can_serve()).collect();
+        let leaders: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].is_leader() && nodes[i].can_serve())
+            .collect();
         if leaders.len() == 1 {
             return Some(leaders[0]);
         }
@@ -500,7 +532,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         std::env::set_var("UC2_CLIENT_TIMEOUT_MS", "500");
     }
 
-    let root = a.root.unwrap_or_else(|| PathBuf::from("target/m9_gate_smoke"));
+    let root = a
+        .root
+        .unwrap_or_else(|| PathBuf::from("target/m9_gate_smoke"));
     anyhow::ensure!(
         !root.starts_with("/tmp"),
         "m9_gate all: root must be on a real filesystem (never /tmp — RAM tmpfs); got {root:?}"
@@ -554,7 +588,11 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     for n in nodes.iter_mut() {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !n.dir.join("cnc2.dat").exists() {
-            anyhow::ensure!(Instant::now() < deadline, "node {} never created its cnc page", n.id);
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "node {} never created its cnc page",
+                n.id
+            );
             thread::sleep(Duration::from_millis(20));
         }
         n.svc = Some(spawn_service(&n.dir, APP, SNAPSHOT_INTERVAL_BYTES));
@@ -563,8 +601,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     let leader = await_leader(&nodes, 30).ok_or_else(|| anyhow::anyhow!("no single leader"))?;
     println!("leader elected: n{}", nodes[leader].id);
 
-    let registry: Registry =
-        Arc::new(Mutex::new(nodes.iter().map(|n| (n.id, n.dir.clone())).collect()));
+    let registry: Registry = Arc::new(Mutex::new(
+        nodes.iter().map(|n| (n.id, n.dir.clone())).collect(),
+    ));
     let load = Load::start(Arc::clone(&registry), APP.into());
 
     // ---- baseline rate, with the leader serving under load
@@ -589,7 +628,12 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     }
     let t0 = Instant::now();
     unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    let status = nodes[leader].child.take().unwrap().wait().expect("wait leader");
+    let status = nodes[leader]
+        .child
+        .take()
+        .unwrap()
+        .wait()
+        .expect("wait leader");
     let stop_elapsed = t0.elapsed();
     let row1_pass = stop_elapsed.as_secs_f64() < BAR_STOP_SECS && status.success();
     let row1 = Verdict::new(
@@ -611,14 +655,24 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         if now.is_some() && now != instance_before {
             break;
         }
-        anyhow::ensure!(Instant::now() < deadline, "restarted node never stamped a new instance id");
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "restarted node never stamped a new instance id"
+        );
         thread::sleep(Duration::from_millis(20));
     }
-    nodes[leader].svc = Some(spawn_service(&nodes[leader].dir, APP, SNAPSHOT_INTERVAL_BYTES));
+    nodes[leader].svc = Some(spawn_service(
+        &nodes[leader].dir,
+        APP,
+        SNAPSHOT_INTERVAL_BYTES,
+    ));
 
     let window = rate_over(&nodes, a.secs as f64);
-    let dip_pct =
-        if baseline > 0.0 { ((baseline - window) / baseline * 100.0).max(0.0) } else { 100.0 };
+    let dip_pct = if baseline > 0.0 {
+        ((baseline - window) / baseline * 100.0).max(0.0)
+    } else {
+        100.0
+    };
     println!("window commit rate: {window:.0} B/s");
 
     // ---- row 2: no snapshot install across the cycle
@@ -691,7 +745,12 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     println!("\n== M9 gate smoke results ==");
     let mut all_pass = true;
     for v in &verdicts {
-        println!("  [{}] {} — {}", if v.pass { "PASS" } else { "FAIL" }, v.row, v.detail);
+        println!(
+            "  [{}] {} — {}",
+            if v.pass { "PASS" } else { "FAIL" },
+            v.row,
+            v.detail
+        );
         all_pass &= v.pass;
     }
     if all_pass {
@@ -791,7 +850,11 @@ fn check_refusals(bin: &Path, root: &Path, members: &[(NodeId, SocketAddr)]) -> 
 
     let n = cases.len();
     if failures.is_empty() {
-        Verdict::new("4 refusals name the field", true, format!("{n}/{n} rules refused by name"))
+        Verdict::new(
+            "4 refusals name the field",
+            true,
+            format!("{n}/{n} rules refused by name"),
+        )
     } else {
         Verdict::new(
             "4 refusals name the field",

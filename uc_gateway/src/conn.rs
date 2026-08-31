@@ -196,7 +196,13 @@ impl Conn {
     /// A frame header for this connection: our protocol version, the peer's
     /// asserted `client_id`, and the `seq` being answered.
     pub fn hdr(&self, ty: FrameType, flags: u8, seq: u64) -> Header {
-        Header { ty, flags, version: PROTOCOL_VERSION, client_id: self.client_id(), seq }
+        Header {
+            ty,
+            flags,
+            version: PROTOCOL_VERSION,
+            client_id: self.client_id(),
+            seq,
+        }
     }
 
     /// Write one frame. Returns `false` if the connection is now dead — the
@@ -396,9 +402,9 @@ impl Conn {
     /// reverted (the connection stays pinned at 1 credit). Uncontended, this
     /// is one `lock cmpxchg`.
     pub fn squeeze(&self) {
-        let _ = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-            Some((c / 2).max(1))
-        });
+        let _ = self
+            .credits
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| Some((c / 2).max(1)));
         self.squeezed.store(true, Ordering::Release);
     }
 
@@ -418,10 +424,12 @@ impl Conn {
             return false;
         }
         let ceiling = self.ceiling();
-        let bumped = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-            let next = c.saturating_mul(2).min(ceiling);
-            if next > c { Some(next) } else { None }
-        });
+        let bumped = self
+            .credits
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                let next = c.saturating_mul(2).min(ceiling);
+                if next > c { Some(next) } else { None }
+            });
         match bumped {
             Ok(prev) => {
                 if prev.saturating_mul(2) >= ceiling {
@@ -461,15 +469,19 @@ impl Conn {
             return CeilingChange::Same;
         }
         if ceiling < prev {
-            let _ = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                if c > ceiling { Some(ceiling) } else { None }
-            });
+            let _ = self
+                .credits
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                    if c > ceiling { Some(ceiling) } else { None }
+                });
             CeilingChange::Lowered
         } else {
             if !self.squeezed.load(Ordering::Acquire) {
-                let _ = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                    if c < ceiling { Some(ceiling) } else { None }
-                });
+                let _ = self
+                    .credits
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                        if c < ceiling { Some(ceiling) } else { None }
+                    });
                 self.notify_gate();
             }
             CeilingChange::Raised
@@ -625,7 +637,11 @@ mod tests {
         t.insert(Arc::clone(&c));
         t.remove(a);
         assert!(t.get(a).is_none(), "a removed connection is gone");
-        assert_ne!(t.alloc_idx(), a, "the next connection must not inherit the index");
+        assert_ne!(
+            t.alloc_idx(),
+            a,
+            "the next connection must not inherit the index"
+        );
     }
 
     #[test]
@@ -684,9 +700,17 @@ mod tests {
         let c = a_conn(0, 32);
         assert_eq!(c.set_ceiling(32), CeilingChange::Same);
         assert_eq!(c.set_ceiling(28), CeilingChange::Lowered);
-        assert_eq!(c.credits(), 28, "the edge stops admitting the moment the share shrinks");
+        assert_eq!(
+            c.credits(),
+            28,
+            "the edge stops admitting the moment the share shrinks"
+        );
         assert_eq!(c.set_ceiling(32), CeilingChange::Raised);
-        assert_eq!(c.credits(), 32, "an unsqueezed connection takes its share back at once");
+        assert_eq!(
+            c.credits(),
+            32,
+            "an unsqueezed connection takes its share back at once"
+        );
     }
 
     #[test]
@@ -695,7 +719,11 @@ mod tests {
         c.squeeze();
         assert_eq!(c.credits(), 4);
         assert_eq!(c.set_ceiling(16), CeilingChange::Raised);
-        assert_eq!(c.credits(), 4, "a squeezed connection climbs back through relax, not here");
+        assert_eq!(
+            c.credits(),
+            4,
+            "a squeezed connection climbs back through relax, not here"
+        );
         assert!(c.relax());
         assert_eq!(c.credits(), 8, "…and relax now aims at the NEW ceiling");
     }
@@ -715,7 +743,11 @@ mod tests {
         for _ in 0..8 {
             c.squeeze();
         }
-        assert_eq!(c.credits(), 1, "a zero grant would wedge the connection forever");
+        assert_eq!(
+            c.credits(),
+            1,
+            "a zero grant would wedge the connection forever"
+        );
     }
 
     #[test]
@@ -732,7 +764,10 @@ mod tests {
         c.claim(0);
         c.notify_gate();
         assert!(h.join().unwrap(), "the gate opened once the slot came back");
-        assert!(c.wait_for_credit(&stop), "an empty window admits immediately");
+        assert!(
+            c.wait_for_credit(&stop),
+            "an empty window admits immediately"
+        );
     }
 
     #[test]

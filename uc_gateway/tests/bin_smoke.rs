@@ -7,7 +7,10 @@
 use std::process::Command;
 
 fn tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new().prefix("uc2-gw-smoke-").tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("tempdir")
+    tempfile::Builder::new()
+        .prefix("uc2-gw-smoke-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir")
 }
 
 /// A missing config file is exit 2 (a named config refusal), with the
@@ -19,9 +22,17 @@ fn a_missing_config_file_exits_2() {
         .output()
         .expect("run uc2-gateway");
 
-    assert_eq!(out.status.code(), Some(2), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("uc2-gateway:"), "stderr must be prefixed, got: {stderr}");
+    assert!(
+        stderr.contains("uc2-gateway:"),
+        "stderr must be prefixed, got: {stderr}"
+    );
 }
 
 /// A config that parses and validates but points at a node instance
@@ -55,7 +66,15 @@ gateway = "10.0.0.10:9200"
         .output()
         .expect("run uc2-gateway");
 
-    assert_eq!(out.status.code(), Some(1), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("uc2-gateway:"), "stderr must be prefixed, got: {stderr}");
+    assert!(
+        stderr.contains("uc2-gateway:"),
+        "stderr must be prefixed, got: {stderr}"
+    );
 }

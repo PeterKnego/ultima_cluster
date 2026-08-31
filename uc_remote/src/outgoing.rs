@@ -35,7 +35,7 @@ use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::frame::{encode_header_into, Header, HEADER_LEN};
+use crate::frame::{HEADER_LEN, Header, encode_header_into};
 use crate::park::WaitCell;
 
 pub(crate) struct OutRing {
@@ -298,7 +298,10 @@ impl Drop for OutRing {
         // hand it straight to `Box::from_raw` — exactly the whole-buffer
         // reference this module exists to avoid).
         unsafe {
-            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(self.ptr, self.capacity())));
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(
+                self.ptr,
+                self.capacity(),
+            )));
         }
     }
 }
@@ -306,7 +309,7 @@ impl Drop for OutRing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{decode_header, FrameType, PROTOCOL_VERSION};
+    use crate::frame::{FrameType, PROTOCOL_VERSION, decode_header};
 
     fn hdr(seq: u64) -> Header {
         Header {
@@ -328,7 +331,11 @@ mod tests {
         let r = OutRing::new(4096);
         let (off, len) = r.stage_frame(hdr(1), b"abcd").expect("room");
         assert_eq!(off, 0);
-        assert_eq!(r.write_pos(), 0, "a staged frame must not be visible to the writer");
+        assert_eq!(
+            r.write_pos(),
+            0,
+            "a staged frame must not be visible to the writer"
+        );
         assert!(r.peek_upto(u64::MAX).is_empty());
         r.commit(len);
         assert_eq!(r.write_pos(), len as u64);
@@ -348,7 +355,11 @@ mod tests {
         assert_eq!(off2, 0, "an uncommitted stage does not consume ring space");
         r.commit(len2);
         let chunk = r.peek_upto(r.write_pos());
-        assert_eq!(chunk.len(), len2 as usize, "only the committed frame is visible");
+        assert_eq!(
+            chunk.len(),
+            len2 as usize,
+            "only the committed frame is visible"
+        );
         let (h, plen) = decode_header(chunk).expect("header");
         assert_eq!(h.seq, 8);
         assert_eq!(&chunk[HEADER_LEN..HEADER_LEN + plen], b"real");
@@ -392,12 +403,20 @@ mod tests {
         assert_eq!(off, before);
         // The frame straddles the wrap, so the first peek is the head only.
         let head = r.peek_upto(r.write_pos());
-        assert!(head.len() < len as usize, "the peek must stop at the wrap: {}", head.len());
+        assert!(
+            head.len() < len as usize,
+            "the peek must stop at the wrap: {}",
+            head.len()
+        );
         assert_eq!(head.len(), cap - (off as usize & (cap - 1)));
         let n = head.len();
         r.consume(n);
         let tail = r.peek_upto(r.write_pos());
-        assert_eq!(n + tail.len(), len as usize, "head + tail is the whole frame");
+        assert_eq!(
+            n + tail.len(),
+            len as usize,
+            "head + tail is the whole frame"
+        );
     }
 
     #[test]
@@ -409,17 +428,26 @@ mod tests {
             pushed += 1;
             assert!(pushed < 100, "the ring never filled");
         }
-        assert!(pushed >= 4, "a 4 KiB ring must hold at least four 1 KiB frames");
+        assert!(
+            pushed >= 4,
+            "a 4 KiB ring must hold at least four 1 KiB frames"
+        );
         // Nothing sent yet: releasing is clamped to `send`, so it buys nothing.
         r.release_to(r.write_pos());
-        assert!(r.push_frame(hdr(1), &payload).is_none(), "release must clamp to send_pos");
+        assert!(
+            r.push_frame(hdr(1), &payload).is_none(),
+            "release must clamp to send_pos"
+        );
         // Send the whole ring, then release: room again.
         while r.send_pos() < r.write_pos() {
             let n = r.peek_upto(r.write_pos()).len();
             r.consume(n);
         }
         r.release_to(r.write_pos());
-        assert!(r.push_frame(hdr(1), &payload).is_some(), "a released ring takes new frames");
+        assert!(
+            r.push_frame(hdr(1), &payload).is_some(),
+            "a released ring takes new frames"
+        );
     }
 
     #[test]
@@ -491,8 +519,8 @@ mod tests {
     /// immediately — seeded in the fix report.
     #[test]
     fn two_threads_agree_on_every_byte_under_concurrent_push_and_drain() {
-        use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         use std::thread;
 
         let ring = Arc::new(OutRing::new(4096));
@@ -508,7 +536,9 @@ mod tests {
             state ^= state >> 7;
             state ^= state << 17;
             let len = (state % 61) as usize; // 0..=60-byte payloads
-            let payload: Vec<u8> = (0..len).map(|i| ((seq as usize + i) & 0xFF) as u8).collect();
+            let payload: Vec<u8> = (0..len)
+                .map(|i| ((seq as usize + i) & 0xFF) as u8)
+                .collect();
             let h = hdr(seq);
             expected.extend_from_slice(&encode_header_into(h, payload.len()));
             expected.extend_from_slice(&payload);
@@ -524,7 +554,8 @@ mod tests {
                 let w = reader_ring.write_pos();
                 let chunk = reader_ring.peek_upto(w);
                 if chunk.is_empty() {
-                    if reader_done.load(Ordering::Acquire) && reader_ring.send_pos() == reader_ring.write_pos()
+                    if reader_done.load(Ordering::Acquire)
+                        && reader_ring.send_pos() == reader_ring.write_pos()
                     {
                         break;
                     }
@@ -557,8 +588,17 @@ mod tests {
         done.store(true, Ordering::Release);
 
         let drained = reader.join().unwrap();
-        assert_eq!(drained, expected, "the reader's concatenated drain must equal the exact push order and bytes");
-        assert!(ring.ack_pos() <= ring.send_pos(), "ack must never pass send");
-        assert!(ring.send_pos() <= ring.write_pos(), "send must never pass write");
+        assert_eq!(
+            drained, expected,
+            "the reader's concatenated drain must equal the exact push order and bytes"
+        );
+        assert!(
+            ring.ack_pos() <= ring.send_pos(),
+            "ack must never pass send"
+        );
+        assert!(
+            ring.send_pos() <= ring.write_pos(),
+            "send must never pass write"
+        );
     }
 }

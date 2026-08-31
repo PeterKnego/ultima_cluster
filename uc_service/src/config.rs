@@ -77,7 +77,9 @@ pub enum ServiceError {
     /// The state machine reports a `last_applied` position beyond what the
     /// node's log holds — provably not this cluster's state (a stale or
     /// wrong-app on-disk SM). Refuse rather than replay off a phantom cursor.
-    #[error("state-machine/journal drift: service last_applied={service}, journal frontier={journal}")]
+    #[error(
+        "state-machine/journal drift: service last_applied={service}, journal frontier={journal}"
+    )]
     Drift { service: u64, journal: u64 },
     /// A journal-replay reconstruction (Task 9) could not read the archived
     /// log — a genuine journal I/O error (a torn/half-flushed record is handled
@@ -105,7 +107,9 @@ pub enum ServiceError {
     )]
     ServiceNotDeclared { id: u8, declared: u64 },
     /// M14a: another live process holds `service.<id>.lock`.
-    #[error("another process already holds service id {id} on this instance dir (service.{id}.lock)")]
+    #[error(
+        "another process already holds service id {id} on this instance dir (service.{id}.lock)"
+    )]
     AlreadyAttached { id: u8 },
 }
 

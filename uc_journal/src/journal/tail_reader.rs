@@ -70,7 +70,9 @@ impl TailReader {
                 format!("journal dir not found: {}", dir.display()),
             )));
         }
-        Ok(TailReader { dir: dir.to_path_buf() })
+        Ok(TailReader {
+            dir: dir.to_path_buf(),
+        })
     }
 
     /// Visit every archived record `(seq, meta, payload)` in seq order across
@@ -79,10 +81,7 @@ impl TailReader {
     /// stop early (the scan returns `Ok(())`). Truncation sentinel records are
     /// skipped. A partially-written / corrupt record conservatively ends the
     /// scan (see the module safety argument).
-    pub fn scan(
-        &self,
-        visit: impl FnMut(u64, u64, &[u8]) -> bool,
-    ) -> Result<(), JournalError> {
+    pub fn scan(&self, visit: impl FnMut(u64, u64, &[u8]) -> bool) -> Result<(), JournalError> {
         // scan(v) is exactly scan_from(0, v): with start_meta 0 no segment can
         // be skipped (only the first block has meta 0, and a skip needs the NEXT
         // segment's first meta <= 0), so every record is visited in seq order.
@@ -206,13 +205,24 @@ mod tests {
     fn tail_reader_sees_records_while_writer_appends() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
-        for s in 0..10 { j.append(s, s, &[7u8; 128]).unwrap().wait().unwrap(); }
+        for s in 0..10 {
+            j.append(s, s, &[7u8; 128]).unwrap().wait().unwrap();
+        }
         let r = TailReader::open(dir.path()).unwrap();
         let mut seqs = Vec::new();
-        r.scan(|seq, _, _| { seqs.push(seq); true }).unwrap();
+        r.scan(|seq, _, _| {
+            seqs.push(seq);
+            true
+        })
+        .unwrap();
         assert_eq!(seqs, (0..10).collect::<Vec<_>>());
         j.append(10, 10, &[7u8; 128]).unwrap().wait().unwrap(); // writer still live
-        let mut n = 0; r.scan(|_, _, _| { n += 1; true }).unwrap();
+        let mut n = 0;
+        r.scan(|_, _, _| {
+            n += 1;
+            true
+        })
+        .unwrap();
         assert_eq!(n, 11, "re-scan sees the new record");
     }
 
@@ -220,11 +230,21 @@ mod tests {
     fn scan_stops_early_when_visit_returns_false() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
-        for s in 0..5 { j.append(s, s * 10, b"x").unwrap().wait().unwrap(); }
+        for s in 0..5 {
+            j.append(s, s * 10, b"x").unwrap().wait().unwrap();
+        }
         let r = TailReader::open(dir.path()).unwrap();
         let mut seen = Vec::new();
-        r.scan(|seq, _, _| { seen.push(seq); seq < 2 }).unwrap();
-        assert_eq!(seen, vec![0, 1, 2], "stops right after the visit returns false");
+        r.scan(|seq, _, _| {
+            seen.push(seq);
+            seq < 2
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![0, 1, 2],
+            "stops right after the visit returns false"
+        );
     }
 
     #[test]
@@ -236,7 +256,10 @@ mod tests {
 
     /// Tiny segments (~8 records/segment) so a scan spans several files.
     fn small_segment_config(dir: &std::path::Path) -> JournalConfig {
-        JournalConfig { segment_size_bytes: 736, ..JournalConfig::new(dir) }
+        JournalConfig {
+            segment_size_bytes: 736,
+            ..JournalConfig::new(dir)
+        }
     }
 
     #[test]
@@ -244,13 +267,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // tiny segments so multiple files exist: ~8 records/segment
         let j = Journal::open(small_segment_config(dir.path())).unwrap();
-        for s in 0..40 { j.append(s, s * 100, &[7u8; 64]).unwrap().wait().unwrap(); }
+        for s in 0..40 {
+            j.append(s, s * 100, &[7u8; 64]).unwrap().wait().unwrap();
+        }
         let r = TailReader::open(dir.path()).unwrap();
         let mut first_seen = None;
-        r.scan_from(2_500, |seq, meta, _| { first_seen.get_or_insert((seq, meta)); true }).unwrap();
+        r.scan_from(2_500, |seq, meta, _| {
+            first_seen.get_or_insert((seq, meta));
+            true
+        })
+        .unwrap();
         let (seq, meta) = first_seen.unwrap();
         assert!(meta <= 2_500, "covering record yielded, not skipped");
-        assert!(seq >= 8, "at least one leading segment file was skipped entirely");
+        assert!(
+            seq >= 8,
+            "at least one leading segment file was skipped entirely"
+        );
         assert_eq!(r.first_meta().unwrap(), Some(0));
     }
 
@@ -258,12 +290,22 @@ mod tests {
     fn scan_from_zero_equals_scan() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(small_segment_config(dir.path())).unwrap();
-        for s in 0..40 { j.append(s, s * 100, &[7u8; 64]).unwrap().wait().unwrap(); }
+        for s in 0..40 {
+            j.append(s, s * 100, &[7u8; 64]).unwrap().wait().unwrap();
+        }
         let r = TailReader::open(dir.path()).unwrap();
         let mut via_scan = Vec::new();
-        r.scan(|seq, meta, _| { via_scan.push((seq, meta)); true }).unwrap();
+        r.scan(|seq, meta, _| {
+            via_scan.push((seq, meta));
+            true
+        })
+        .unwrap();
         let mut via_from = Vec::new();
-        r.scan_from(0, |seq, meta, _| { via_from.push((seq, meta)); true }).unwrap();
+        r.scan_from(0, |seq, meta, _| {
+            via_from.push((seq, meta));
+            true
+        })
+        .unwrap();
         assert_eq!(via_scan, via_from);
         assert_eq!(via_scan.len(), 40);
     }
@@ -283,7 +325,11 @@ mod tests {
         j.append(3, 999, b"payload").unwrap().wait().unwrap();
         let r = TailReader::open(dir.path()).unwrap();
         let mut got = None;
-        r.scan(|seq, meta, payload| { got = Some((seq, meta, payload.to_vec())); true }).unwrap();
+        r.scan(|seq, meta, payload| {
+            got = Some((seq, meta, payload.to_vec()));
+            true
+        })
+        .unwrap();
         assert_eq!(got, Some((3, 999, b"payload".to_vec())));
     }
 }

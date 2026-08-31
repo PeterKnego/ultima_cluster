@@ -295,9 +295,12 @@ fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
             let (id, addr) = part
                 .split_once('@')
                 .unwrap_or_else(|| panic!("bad --members entry {part:?}, expected id@addr"));
-            let id: NodeId = id.parse().unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
-            let addr: SocketAddr =
-                addr.parse().unwrap_or_else(|e| panic!("bad member addr {addr:?}: {e}"));
+            let id: NodeId = id
+                .parse()
+                .unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
+            let addr: SocketAddr = addr
+                .parse()
+                .unwrap_or_else(|e| panic!("bad member addr {addr:?}: {e}"));
             (id, addr)
         })
         .collect()
@@ -351,8 +354,16 @@ fn b64_32(bytes: &[u8; 32]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -376,7 +387,9 @@ fn write_crypto_material(dir: &Path, n: usize) -> Vec<(PathBuf, PathBuf)> {
                 .expect("chmod 0600 key file");
         }
         publics.push(
-            uc_crypto::identity::Identity::load(&key_path).expect("load identity").public_bytes(),
+            uc_crypto::identity::Identity::load(&key_path)
+                .expect("load identity")
+                .public_bytes(),
         );
         key_paths.push(key_path);
     }
@@ -386,7 +399,10 @@ fn write_crypto_material(dir: &Path, n: usize) -> Vec<(PathBuf, PathBuf)> {
     }
     let allow_path = dir.join("allowlist");
     std::fs::write(&allow_path, text).expect("write allowlist");
-    key_paths.into_iter().map(|k| (k, allow_path.clone())).collect()
+    key_paths
+        .into_iter()
+        .map(|k| (k, allow_path.clone()))
+        .collect()
 }
 
 fn node_config(
@@ -469,7 +485,10 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
     let cnc = a.instance_dir.join("cnc2.dat");
     let deadline = Instant::now() + Duration::from_secs(30);
     while !cnc.exists() {
-        anyhow::ensure!(Instant::now() < deadline, "timed out waiting for cnc2.dat at {cnc:?}");
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for cnc2.dat at {cnc:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let cfg = ServiceConfig::new(a.instance_dir, a.app_id);
@@ -477,7 +496,9 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
     // per state-machine tier) never need to unify.
     if a.raw_sm {
         let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
-        println!("m5_gate service up (raw-tier RawCountSm); parking (killed externally by the harness)");
+        println!(
+            "m5_gate service up (raw-tier RawCountSm); parking (killed externally by the harness)"
+        );
         loop {
             std::thread::park();
         }
@@ -585,8 +606,12 @@ fn run_client_measurement(
     // Timing slots: user_data = send index; SLOTS (1<<20) >> any window, so a
     // slot is never restamped while its request is outstanding. The old
     // `owner` array is GONE — exactly-once resolution is the engine's job now.
-    let send_ns: Arc<Box<[AtomicU64]>> =
-        Arc::new((0..SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice());
+    let send_ns: Arc<Box<[AtomicU64]>> = Arc::new(
+        (0..SLOTS)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
     let resolved = Arc::new(AtomicU64::new(0));
     let responses = Arc::new(AtomicU64::new(0));
     let not_leader = Arc::new(AtomicU64::new(0));
@@ -599,58 +624,67 @@ fn run_client_measurement(
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
 
-    let matcher = thread::Builder::new().name("m5-gate-poll".into()).spawn({
-        let send_ns = Arc::clone(&send_ns);
-        let resolved = Arc::clone(&resolved);
-        let responses = Arc::clone(&responses);
-        let not_leader = Arc::clone(&not_leader);
-        let retried = Arc::clone(&retried);
-        let lost = Arc::clone(&lost);
-        let last_response_ns = Arc::clone(&last_response_ns);
-        let hist = Arc::clone(&hist);
-        let stop = Arc::clone(&stop);
-        move || {
-            while !stop.load(Ordering::Relaxed) {
-                let n = poll.poll(|c| {
-                    match c.outcome {
-                        Outcome::Response(_) => {
-                            let idx = (c.user_data as usize) & SLOT_MASK;
-                            let now = t0.elapsed().as_nanos() as u64;
-                            let lat = now
-                                .saturating_sub(send_ns[idx].load(Ordering::Acquire))
-                                .min(HIST_MAX_NS);
-                            let _ = hist.lock().unwrap().record(lat);
-                            responses.fetch_add(1, Ordering::Relaxed);
-                            last_response_ns.fetch_max(now, Ordering::Relaxed);
+    let matcher = thread::Builder::new()
+        .name("m5-gate-poll".into())
+        .spawn({
+            let send_ns = Arc::clone(&send_ns);
+            let resolved = Arc::clone(&resolved);
+            let responses = Arc::clone(&responses);
+            let not_leader = Arc::clone(&not_leader);
+            let retried = Arc::clone(&retried);
+            let lost = Arc::clone(&lost);
+            let last_response_ns = Arc::clone(&last_response_ns);
+            let hist = Arc::clone(&hist);
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let n = poll.poll(|c| {
+                        match c.outcome {
+                            Outcome::Response(_) => {
+                                let idx = (c.user_data as usize) & SLOT_MASK;
+                                let now = t0.elapsed().as_nanos() as u64;
+                                let lat = now
+                                    .saturating_sub(send_ns[idx].load(Ordering::Acquire))
+                                    .min(HIST_MAX_NS);
+                                let _ = hist.lock().unwrap().record(lat);
+                                responses.fetch_add(1, Ordering::Relaxed);
+                                last_response_ns.fetch_max(now, Ordering::Relaxed);
+                            }
+                            Outcome::NotLeader { .. } => {
+                                not_leader.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Outcome::Retry => {
+                                retried.fetch_add(1, Ordering::Relaxed);
+                            }
+                            // The engine's deadline sweep resolves a genuinely
+                            // lost response (or a node restart) into one of
+                            // these — count it so the PASS bar can't be fooled
+                            // by zero in-flight-at-end alone.
+                            // A bench never issues a fan-in or names an id.
+                            Outcome::TimedOut
+                            | Outcome::InstanceRestart { .. }
+                            | Outcome::Responses(_)
+                            | Outcome::BadService { .. } => {
+                                lost.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        Outcome::NotLeader { .. } => { not_leader.fetch_add(1, Ordering::Relaxed); }
-                        Outcome::Retry => { retried.fetch_add(1, Ordering::Relaxed); }
-                        // The engine's deadline sweep resolves a genuinely
-                        // lost response (or a node restart) into one of
-                        // these — count it so the PASS bar can't be fooled
-                        // by zero in-flight-at-end alone.
-                        // A bench never issues a fan-in or names an id.
-                        Outcome::TimedOut
-                        | Outcome::InstanceRestart { .. }
-                        | Outcome::Responses(_)
-                        | Outcome::BadService { .. } => {
-                            lost.fetch_add(1, Ordering::Relaxed);
-                        }
+                        resolved.fetch_add(1, Ordering::Relaxed);
+                    });
+                    // Old-matcher idle parity: the pre-Engine pump slept 20us between
+                    // empty poll cycles, and that idle strategy is what produced the
+                    // recorded fleet numbers (1.64M resp/s). A dedicated-core fleet
+                    // client can flip this to spin_loop(), but on the oversubscribed
+                    // in-process smoke box (3 nodes' agents + services + this thread
+                    // sharing a handful of cores) a busy-spinning poll thread steals a
+                    // full core from the very consensus/apply agents being measured —
+                    // harness parity with the old pump beats dogma here.
+                    if n == 0 {
+                        thread::sleep(Duration::from_micros(20));
                     }
-                    resolved.fetch_add(1, Ordering::Relaxed);
-                });
-                // Old-matcher idle parity: the pre-Engine pump slept 20us between
-                // empty poll cycles, and that idle strategy is what produced the
-                // recorded fleet numbers (1.64M resp/s). A dedicated-core fleet
-                // client can flip this to spin_loop(), but on the oversubscribed
-                // in-process smoke box (3 nodes' agents + services + this thread
-                // sharing a handful of cores) a busy-spinning poll thread steals a
-                // full core from the very consensus/apply agents being measured —
-                // harness parity with the old pump beats dogma here.
-                if n == 0 { thread::sleep(Duration::from_micros(20)); }
+                }
             }
-        }
-    }).expect("spawn poll thread");
+        })
+        .expect("spawn poll thread");
 
     // Sender loop (this thread): user_data = send index; stamp send_ns
     // BEFORE try_submit (a response cannot arrive before the request is
@@ -692,15 +726,25 @@ fn run_client_measurement(
     // denominator and report the early burst's rate as the run's rate. With
     // the floor, a dead tail depresses responses/s instead of vanishing.
     let elapsed = Duration::from_nanos(
-        last_response_ns.load(Ordering::Relaxed).max(send_window_end_ns),
+        last_response_ns
+            .load(Ordering::Relaxed)
+            .max(send_window_end_ns),
     );
-    let responses_per_sec =
-        if elapsed.as_secs_f64() > 0.0 { resp as f64 / elapsed.as_secs_f64() } else { 0.0 };
+    let responses_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        resp as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
 
     let (p50_ms, p90_ms, p99_ms, max_ms) = {
         let h = hist.lock().unwrap();
         let ms = |ns: u64| ns as f64 / 1e6;
-        (ms(h.value_at_quantile(0.50)), ms(h.value_at_quantile(0.90)), ms(h.value_at_quantile(0.99)), ms(h.max()))
+        (
+            ms(h.value_at_quantile(0.50)),
+            ms(h.value_at_quantile(0.90)),
+            ms(h.value_at_quantile(0.99)),
+            ms(h.max()),
+        )
     };
 
     // PASS requires the run to have actually completed its work: zero
@@ -863,7 +907,10 @@ fn print_crypto_observability(
     after: &[CryptoSnapshot],
 ) {
     println!("---------------------------- M8 crypto plane -----------------------------");
-    println!("leader                : n{leader} (group epoch {:?})", nodes[leader].crypto_epoch());
+    println!(
+        "leader                : n{leader} (group epoch {:?})",
+        nodes[leader].crypto_epoch()
+    );
     println!("(pre-window totals in parentheses — the boot-transient NoSession window; see");
     println!(" print_crypto_observability's doc. The gate reads the IN-WINDOW delta.)");
     for i in 0..nodes.len() {
@@ -872,7 +919,11 @@ fn print_crypto_observability(
             "n{i}{}: seals {:>9} (+{:<7}) | in-window: auth_failed {} | replay {} | \
              unknown_peer {} | unknown_epoch {} | cleartext_peer {} | seal_failures {} | \
              hs_failures {}",
-            if i == leader { " (leader)" } else { "         " },
+            if i == leader {
+                " (leader)"
+            } else {
+                "         "
+            },
             a.seals - b.seals,
             b.seals,
             a.auth_failed - b.auth_failed,
@@ -911,13 +962,20 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
 fn await_single_leader(nodes: &[Node], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].can_serve() && nodes[i].is_leader()).collect();
-        assert!(serving.len() <= 1, "split-brain in smoke cluster: nodes {serving:?} all serve");
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].can_serve() && nodes[i].is_leader())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain in smoke cluster: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
-        assert!(Instant::now() < deadline, "no leader elected within {secs}s");
+        assert!(
+            Instant::now() < deadline,
+            "no leader elected within {secs}s"
+        );
         std::thread::yield_now();
     }
 }
@@ -938,7 +996,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
 }
 
 fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> anyhow::Result<()> {
-    let root = a.root.unwrap_or_else(|| PathBuf::from("target/m5_gate_smoke"));
+    let root = a
+        .root
+        .unwrap_or_else(|| PathBuf::from("target/m5_gate_smoke"));
     // Guard off /tmp (m4_gate precedent): /tmp is RAM-backed tmpfs on this dev
     // box and a real filesystem root is required for the journal-bearing
     // instance dirs (3 nodes x 256 MiB ring + journal segments).
@@ -957,19 +1017,30 @@ fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> 
     );
     println!(
         "arm                   : {}",
-        if a.crypto { "ENCRYPTED (M8 wire crypto ON)" } else { "cleartext control" }
+        if a.crypto {
+            "ENCRYPTED (M8 wire crypto ON)"
+        } else {
+            "cleartext control"
+        }
     );
     println!("state machine         : {sm_label}");
 
     const N: usize = 3;
     // Generated ONCE for the whole run, before any node boots — every node
     // must see the same allowlist.
-    let material =
-        if a.crypto { Some(write_crypto_material(&root.join("crypto"), N)) } else { None };
-    let socks: Vec<UdpSocket> =
-        (0..N).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let material = if a.crypto {
+        Some(write_crypto_material(&root.join("crypto"), N))
+    } else {
+        None
+    };
+    let socks: Vec<UdpSocket> = (0..N)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(N);
     let mut services = Vec::with_capacity(N);

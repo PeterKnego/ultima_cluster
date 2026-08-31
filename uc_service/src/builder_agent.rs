@@ -103,7 +103,13 @@ mod tests {
         })
     }
 
-    fn state(dir: &std::path::Path) -> (mpsc::SyncSender<(u64, BuildJob)>, BuilderState, Arc<AtomicBool>) {
+    fn state(
+        dir: &std::path::Path,
+    ) -> (
+        mpsc::SyncSender<(u64, BuildJob)>,
+        BuilderState,
+        Arc<AtomicBool>,
+    ) {
         let (tx, rx) = mpsc::sync_channel(1);
         let busy = Arc::new(AtomicBool::new(false));
         let st = BuilderState {
@@ -138,7 +144,10 @@ mod tests {
 
         assert!(builder_cycle(&mut st), "one job drained");
         assert_eq!(cnc.service_slot(0).snapshot_pos.load_acquire(), 4096);
-        assert!(!busy.load(Ordering::Acquire), "busy cleared after completion");
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "busy cleared after completion"
+        );
 
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
         let (pos, path) = store.newest(u64::MAX).unwrap().unwrap();
@@ -160,8 +169,15 @@ mod tests {
         tx.try_send((4096, job)).unwrap();
 
         assert!(builder_cycle(&mut st));
-        assert_eq!(cnc.service_slot(0).snapshot_pos.load_acquire(), 0, "marker not advanced");
-        assert!(!busy.load(Ordering::Acquire), "busy cleared even on failure");
+        assert_eq!(
+            cnc.service_slot(0).snapshot_pos.load_acquire(),
+            0,
+            "marker not advanced"
+        );
+        assert!(
+            !busy.load(Ordering::Acquire),
+            "busy cleared even on failure"
+        );
     }
 
     #[test]

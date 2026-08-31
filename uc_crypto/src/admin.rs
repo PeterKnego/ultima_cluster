@@ -15,8 +15,8 @@
 
 use crate::CryptoError;
 use hmac::{Hmac, Mac};
-use rand::rngs::OsRng;
 use rand::TryRngCore;
+use rand::rngs::OsRng;
 use sha2::Sha256;
 use std::fmt;
 use std::path::Path;
@@ -181,8 +181,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Signs `m` under `key` with HMAC-SHA256 over `m.canonical_bytes()`.
 pub fn sign(key: &AdminKey, m: &AdminMessage<'_>) -> [u8; ADMIN_TAG_LEN] {
-    let mut mac =
-        HmacSha256::new_from_slice(&*key.secret).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(&*key.secret).expect("HMAC accepts any key length");
     mac.update(&m.canonical_bytes());
     mac.finalize().into_bytes().into()
 }
@@ -190,8 +189,7 @@ pub fn sign(key: &AdminKey, m: &AdminMessage<'_>) -> [u8; ADMIN_TAG_LEN] {
 /// Verifies `tag` against `m` under `key` in constant time
 /// (`hmac::Mac::verify_slice`) — never compare tags with `==`.
 pub fn verify(key: &AdminKey, m: &AdminMessage<'_>, tag: &[u8; ADMIN_TAG_LEN]) -> bool {
-    let mut mac =
-        HmacSha256::new_from_slice(&*key.secret).expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(&*key.secret).expect("HMAC accepts any key length");
     mac.update(&m.canonical_bytes());
     mac.verify_slice(tag).is_ok()
 }
@@ -267,7 +265,8 @@ mod tests {
         let d = std::env::var("CARGO_TARGET_TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc_crypto_tests")
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/uc_crypto_tests")
             });
         std::fs::create_dir_all(&d).unwrap();
         assert!(

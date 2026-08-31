@@ -49,7 +49,11 @@ pub struct SessionConfig {
 }
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { window: 4096, max_clients: 65_536, max_bytes: 256 << 20 }
+        Self {
+            window: 4096,
+            max_clients: 65_536,
+            max_bytes: 256 << 20,
+        }
     }
 }
 
@@ -92,7 +96,13 @@ pub struct Sessioned<S> {
 
 impl<S: RawStateMachine> Sessioned<S> {
     pub fn new(inner: S, cfg: SessionConfig) -> Self {
-        Self { inner, cfg, clients: BTreeMap::new(), total_bytes: 0, max_pos_seen: None }
+        Self {
+            inner,
+            cfg,
+            clients: BTreeMap::new(),
+            total_bytes: 0,
+            max_pos_seen: None,
+        }
     }
     pub fn inner(&self) -> &S {
         &self.inner
@@ -140,7 +150,9 @@ impl<S: RawStateMachine> Sessioned<S> {
                 Some(id) => self.remove_client(id),
                 None => {
                     // Only `just_written` remains (or the table is empty).
-                    let Some(st) = self.clients.get_mut(&just_written) else { break };
+                    let Some(st) = self.clients.get_mut(&just_written) else {
+                        break;
+                    };
                     match st.window.pop_front() {
                         Some((_, old)) => self.total_bytes -= old.len(),
                         None => break,
@@ -220,7 +232,10 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
         out.push(TAG_FRESH);
         out.extend_from_slice(&resp);
         let resp_len = resp.len();
-        let st = self.clients.get_mut(&client_id).expect("entry inserted above");
+        let st = self
+            .clients
+            .get_mut(&client_id)
+            .expect("entry inserted above");
         st.highest_seq = Some(seq);
         st.window.push_back((seq, resp));
         self.total_bytes += resp_len;
@@ -294,14 +309,21 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
         Ok(((blob, inner_handle), pos))
     }
 
-    fn stream_snapshot(handle: Self::SnapshotHandle, dst: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+    fn stream_snapshot(
+        handle: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), SnapshotError> {
         let (blob, inner) = handle;
         dst.write_all(&(blob.len() as u64).to_le_bytes())?;
         dst.write_all(&blob)?;
         S::stream_snapshot(inner, dst)
     }
 
-    fn install_snapshot(&mut self, position: u64, src: &mut dyn std::io::Read) -> Result<u64, SnapshotError> {
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
         use std::io::Read as _;
         let mut len_buf = [0u8; 8];
         src.read_exact(&mut len_buf)?;
@@ -324,8 +346,9 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
                 blob.len()
             )));
         }
-        let (img, _): (TableImage, _) = bincode::serde::decode_from_slice(&blob, bincode::config::standard())
-            .map_err(|e| SnapshotError::Codec(format!("session table decode: {e}")))?;
+        let (img, _): (TableImage, _) =
+            bincode::serde::decode_from_slice(&blob, bincode::config::standard())
+                .map_err(|e| SnapshotError::Codec(format!("session table decode: {e}")))?;
 
         // `SessionConfig` is part of the replicated contract (module doc):
         // refuse a config mismatch BEFORE touching the inner SM, so a

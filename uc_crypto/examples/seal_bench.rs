@@ -111,7 +111,10 @@ fn main() {
     let gbs = sealed_bytes as f64 / seal_elapsed.as_secs_f64() / 1e9;
 
     println!("================= uc_crypto seal bench (AES-NI check) =================");
-    println!("payload               : {PAYLOAD_LEN} B  (sealed datagram {} B)", buf.len());
+    println!(
+        "payload               : {PAYLOAD_LEN} B  (sealed datagram {} B)",
+        buf.len()
+    );
     println!("iterations            : {ITERS}");
     println!("seal                  : {seal_ns:.1} ns/datagram   ({gbs:.2} GB/s)");
     println!("seal+open round trip  : {rt_ns:.1} ns/datagram");

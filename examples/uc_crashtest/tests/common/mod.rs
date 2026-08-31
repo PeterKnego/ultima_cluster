@@ -99,8 +99,16 @@ fn crypto_b64_32(bytes: &[u8; 32]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -135,7 +143,10 @@ pub fn provision_crypto(dir: &Path, ids: &[u32]) -> CrashtestCrypto {
     }
     let allowlist_path = dir.join("crypto-allowlist");
     std::fs::write(&allowlist_path, text).unwrap();
-    CrashtestCrypto { key_paths, allowlist_path }
+    CrashtestCrypto {
+        key_paths,
+        allowlist_path,
+    }
 }
 
 /// Anti-vacuity (M8 Task 15): poll for `instance_dir/crypto_epoch_active`,
@@ -187,9 +198,15 @@ pub fn spawn_node(instance_dir: &Path) -> Reap {
 /// byte-for-byte the pre-M8 [`spawn_node`] behavior.
 pub fn spawn_node_with(instance_dir: &Path, crypto: Option<(&Path, &Path)>) -> Reap {
     let mut cmd = Command::new(NODE_BIN);
-    cmd.arg("--instance-dir").arg(instance_dir).arg("--app-id").arg(APP_ID);
+    cmd.arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID);
     if let Some((key_path, allowlist_path)) = crypto {
-        cmd.arg("--crypto-key").arg(key_path).arg("--crypto-allowlist").arg(allowlist_path);
+        cmd.arg("--crypto-key")
+            .arg(key_path)
+            .arg("--crypto-allowlist")
+            .arg(allowlist_path);
     }
     let child = cmd
         .stdout(Stdio::inherit())
@@ -210,7 +227,10 @@ pub fn spawn_service(instance_dir: &Path) -> Reap {
 /// pre-M12 [`spawn_service`] behavior.
 pub fn spawn_service_with(instance_dir: &Path, sessioned: bool) -> Reap {
     let mut cmd = Command::new(SERVICE_BIN);
-    cmd.arg("--instance-dir").arg(instance_dir).arg("--app-id").arg(APP_ID);
+    cmd.arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID);
     if sessioned {
         cmd.arg("--sessioned");
     }
@@ -272,7 +292,11 @@ pub fn spawn_node_with_services(instance_dir: &Path, services: &str, fsm_lag: &s
 pub fn wait_for_path(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
-        assert!(Instant::now() < deadline, "timed out waiting for {}", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -341,7 +365,10 @@ pub fn connect_with_retry(instance_dir: &Path, timeout: Duration) -> Client {
         match Client::connect(instance_dir, APP_ID) {
             Ok(c) => return c,
             Err(e) => {
-                assert!(Instant::now() < deadline, "timed out connecting client: {e}");
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out connecting client: {e}"
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
         }

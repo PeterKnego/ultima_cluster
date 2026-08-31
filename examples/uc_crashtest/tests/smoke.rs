@@ -38,7 +38,10 @@ fn write_then_read_across_processes() {
     // deadline.
     let deadline = Instant::now() + Duration::from_secs(15);
     let r = submit_until_ok(&client, &Cmd::Write(7), deadline);
-    assert!(matches!(r, CmdResp::WriteAck), "expected WriteAck, got {r:?}");
+    assert!(
+        matches!(r, CmdResp::WriteAck),
+        "expected WriteAck, got {r:?}"
+    );
 
     let v = common::read_until_ok(&client, deadline);
     assert_eq!(v, Some(7), "read should observe the committed write");

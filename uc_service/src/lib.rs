@@ -67,12 +67,12 @@ use crate::output::{OutputState, output_cycle};
 use crate::snapshots::SnapshotStore;
 
 pub use crate::config::{ServiceConfig, ServiceError, SnapshotError, SnapshotPolicy};
+pub use crate::session::{
+    SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
+};
 pub use crate::traits::{
     NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
     SnapshotStateMachine, StateMachine, TypedOutput,
-};
-pub use crate::session::{
-    SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
 
 /// Default idle strategy for the apply thread: a short sleep between empty
@@ -95,7 +95,11 @@ pub struct ServiceBuilder<S: RawStateMachine, O: RawOutputHandler<S> = NoopOutpu
 
 impl<S: RawStateMachine> ServiceBuilder<S, NoopOutput> {
     pub fn new(cfg: ServiceConfig, sm: S) -> Self {
-        Self { cfg, sm, output: NoopOutput }
+        Self {
+            cfg,
+            sm,
+            output: NoopOutput,
+        }
     }
 }
 
@@ -108,14 +112,22 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     where
         S: StateMachine,
     {
-        ServiceBuilder { cfg: self.cfg, sm: self.sm, output: TypedOutput(h) }
+        ServiceBuilder {
+            cfg: self.cfg,
+            sm: self.sm,
+            output: TypedOutput(h),
+        }
     }
 
     /// Install a leader-only RAW output handler: it sees the committed command
     /// bytes straight from the log, with no codec in the way (the raw tier's
     /// counterpart to [`output_handler`](Self::output_handler)).
     pub fn raw_output_handler<O2: RawOutputHandler<S>>(self, h: O2) -> ServiceBuilder<S, O2> {
-        ServiceBuilder { cfg: self.cfg, sm: self.sm, output: h }
+        ServiceBuilder {
+            cfg: self.cfg,
+            sm: self.sm,
+            output: h,
+        }
     }
 
     /// Attach and spawn the agent threads (sync). Steps 1–5 run the attach
@@ -167,17 +179,28 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
                 instance_id,
                 service_id,
             )?;
-            let output_agent =
-                AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || output_cycle(&mut output_state))?;
+            let output_agent = AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || {
+                output_cycle(&mut output_state)
+            })?;
             // Stop order (`Service::stop`/`Drop`): output before apply — a
             // side-effect thread is lower-priority to keep running through
             // teardown than the apply thread it depends on for `state: &S`.
             agents.push(output_agent);
         }
-        let apply_agent = AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
+        let apply_agent =
+            AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
 
-        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned, service_id, _lock: lock })
+        Ok(Service {
+            agents,
+            sm,
+            _cnc: cnc,
+            instance_id,
+            epoch,
+            poisoned,
+            service_id,
+            _lock: lock,
+        })
     }
 
     /// Like [`start`](Self::start), but ALSO spawns the M6 Task 3 snapshot
@@ -228,8 +251,9 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
                 instance_id,
                 service_id,
             )?;
-            let output_agent =
-                AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || output_cycle(&mut output_state))?;
+            let output_agent = AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || {
+                output_cycle(&mut output_state)
+            })?;
             agents.push(output_agent);
         }
 
@@ -248,10 +272,13 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // Seed the interval basis from whatever the cnc marker already holds
         // (0 on a fresh page) — a service reattaching after a prior
         // incarnation already built snapshots doesn't immediately re-trigger.
-        let last_snapshot_pos = attach::slot(&cnc, cfg.service_id).snapshot_pos.load_acquire();
+        let last_snapshot_pos = attach::slot(&cnc, cfg.service_id)
+            .snapshot_pos
+            .load_acquire();
         let freeze: FreezeFn<S> = Box::new(|sm: &S| {
             let (handle, pos) = sm.freeze()?;
-            let job: BuildJob = Box::new(move |w: &mut dyn std::io::Write| S::stream_snapshot(handle, w));
+            let job: BuildJob =
+                Box::new(move |w: &mut dyn std::io::Write| S::stream_snapshot(handle, w));
             Ok((job, pos))
         });
         state.snapshot_trigger = Some(SnapshotTrigger {
@@ -268,16 +295,26 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // held) uses its own `SnapshotStore` clone to locate the newest covering
         // artifact.
         let install: crate::apply::InstallFn<S> =
-            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| sm.install_snapshot(pos, src));
+            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| {
+                sm.install_snapshot(pos, src)
+            });
         state.snapshot_restore = Some(crate::apply::SnapshotRestore {
             store: store.clone(),
             install,
         });
-        let mut builder_state = BuilderState { rx, store, cnc: Arc::clone(&cnc), busy, service_id };
-        let builder_agent =
-            AgentRunner::spawn("uc2-snapshot-builder", APPLY_IDLE, move || builder_cycle(&mut builder_state))?;
+        let mut builder_state = BuilderState {
+            rx,
+            store,
+            cnc: Arc::clone(&cnc),
+            busy,
+            service_id,
+        };
+        let builder_agent = AgentRunner::spawn("uc2-snapshot-builder", APPLY_IDLE, move || {
+            builder_cycle(&mut builder_state)
+        })?;
 
-        let apply_agent = AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
+        let apply_agent =
+            AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
         // Builder pushed LAST: `Service::stop`'s loop stops agents in
         // insertion order, so the builder is joined last — any build already
@@ -287,7 +324,16 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // it new work.
         agents.push(builder_agent);
 
-        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned, service_id, _lock: lock })
+        Ok(Service {
+            agents,
+            sm,
+            _cnc: cnc,
+            instance_id,
+            epoch,
+            poisoned,
+            service_id,
+            _lock: lock,
+        })
     }
 }
 
@@ -360,7 +406,9 @@ impl<S: RawStateMachine> Service<S> {
         let q = bincode::serde::encode_to_vec(&q, bincode::config::standard()).expect("encode");
         let mut out = Vec::new();
         self.query_raw(&q, &mut out);
-        bincode::serde::decode_from_slice(&out, bincode::config::standard()).expect("decode").0
+        bincode::serde::decode_from_slice(&out, bincode::config::standard())
+            .expect("decode")
+            .0
     }
 
     /// Are all of this incarnation's agents still running? `false` means one
@@ -386,7 +434,11 @@ impl<S: RawStateMachine> Service<S> {
     pub fn stop(self) {
         let s = attach::slot(&self._cnc, self.service_id);
         let (_, _, inc) = uc_log::cnc::unpack_service_status(s.status.load_acquire());
-        s.status.store_release(uc_log::cnc::pack_service_status(self.service_id, false, inc));
+        s.status.store_release(uc_log::cnc::pack_service_status(
+            self.service_id,
+            false,
+            inc,
+        ));
         for a in self.agents {
             a.stop();
         }

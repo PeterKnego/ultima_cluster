@@ -84,12 +84,22 @@ fn run_load(exe: &PathBuf, label: &str, args: &[String]) -> anyhow::Result<Strin
     let out = Command::new(exe).args(args).output()?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    let result = stdout.lines().find(|l| l.starts_with("RESULT ")).map(|s| s.to_string());
-    for l in stdout.lines().filter(|l| l.starts_with("   ") || l.starts_with("== ")) {
+    let result = stdout
+        .lines()
+        .find(|l| l.starts_with("RESULT "))
+        .map(|s| s.to_string());
+    for l in stdout
+        .lines()
+        .filter(|l| l.starts_with("   ") || l.starts_with("== "))
+    {
         println!("  [{label}] {l}");
     }
     if !out.status.success() {
-        println!("  [{label}] EXIT {:?} after {:.1}s\n{stderr}", out.status.code(), t.elapsed().as_secs_f64());
+        println!(
+            "  [{label}] EXIT {:?} after {:.1}s\n{stderr}",
+            out.status.code(),
+            t.elapsed().as_secs_f64()
+        );
     }
     result.ok_or_else(|| anyhow::anyhow!("{label}: no RESULT line\n{stdout}\n{stderr}"))
 }
@@ -119,24 +129,47 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     });
     let inst = root.join("dummy-node");
     std::fs::create_dir_all(&inst)?;
-    let conns: Vec<usize> = a.conns.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let conns: Vec<usize> = a
+        .conns
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
     let secs = s(a.secs);
     let payload = s(a.payload);
     let inflight = s(a.inflight);
     let mut rows: Vec<(String, String)> = Vec::new();
 
-    println!("hop_bench local smoke: root {inst:?}, {} s/point, payload {}, inflight {}", a.secs, a.payload, a.inflight);
+    println!(
+        "hop_bench local smoke: root {inst:?}, {} s/point, payload {}, inflight {}",
+        a.secs, a.payload, a.inflight
+    );
 
     // A: engine-load → dummy-node
     {
-        let sink = spawn_sink(&exe, "dummy-node", &[s("dummy-node"), s("--instance-dir"), s(inst.display())])?;
+        let sink = spawn_sink(
+            &exe,
+            "dummy-node",
+            &[s("dummy-node"), s("--instance-dir"), s(inst.display())],
+        )?;
         for engines in [1usize, 2] {
             let label = format!("A hop1 engine→dummy-node engines={engines}");
-            let r = run_load(&exe, &label, &[
-                s("engine-load"), s("--instance-dir"), s(inst.display()),
-                s("--secs"), secs.clone(), s("--payload"), payload.clone(),
-                s("--inflight"), inflight.clone(), s("--engines"), s(engines),
-            ])?;
+            let r = run_load(
+                &exe,
+                &label,
+                &[
+                    s("engine-load"),
+                    s("--instance-dir"),
+                    s(inst.display()),
+                    s("--secs"),
+                    secs.clone(),
+                    s("--payload"),
+                    payload.clone(),
+                    s("--inflight"),
+                    inflight.clone(),
+                    s("--engines"),
+                    s(engines),
+                ],
+            )?;
             rows.push((label, r));
         }
         drop(sink);
@@ -145,21 +178,57 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     // B/C: blaster / remote-load → dummy-edge
     {
         let de = format!("127.0.0.1:{}", a.dummy_edge_port);
-        let sink = spawn_sink(&exe, "dummy-edge", &[s("dummy-edge"), s("--listen"), de.clone(), s("--credits"), inflight.clone()])?;
+        let sink = spawn_sink(
+            &exe,
+            "dummy-edge",
+            &[
+                s("dummy-edge"),
+                s("--listen"),
+                de.clone(),
+                s("--credits"),
+                inflight.clone(),
+            ],
+        )?;
         for &n in &conns {
             let label = format!("B hop3-floor blaster→dummy-edge conns={n}");
-            let r = run_load(&exe, &label, &[
-                s("blaster"), s("--gateway"), de.clone(), s("--secs"), secs.clone(),
-                s("--payload"), payload.clone(), s("--inflight"), inflight.clone(), s("--conns"), s(n),
-            ])?;
+            let r = run_load(
+                &exe,
+                &label,
+                &[
+                    s("blaster"),
+                    s("--gateway"),
+                    de.clone(),
+                    s("--secs"),
+                    secs.clone(),
+                    s("--payload"),
+                    payload.clone(),
+                    s("--inflight"),
+                    inflight.clone(),
+                    s("--conns"),
+                    s(n),
+                ],
+            )?;
             rows.push((label, r));
         }
         for &n in &conns {
             let label = format!("C hop3 remote→dummy-edge conns={n}");
-            let r = run_load(&exe, &label, &[
-                s("remote-load"), s("--gateways"), de.clone(), s("--secs"), secs.clone(),
-                s("--payload"), payload.clone(), s("--inflight"), inflight.clone(), s("--conns"), s(n),
-            ])?;
+            let r = run_load(
+                &exe,
+                &label,
+                &[
+                    s("remote-load"),
+                    s("--gateways"),
+                    de.clone(),
+                    s("--secs"),
+                    secs.clone(),
+                    s("--payload"),
+                    payload.clone(),
+                    s("--inflight"),
+                    inflight.clone(),
+                    s("--conns"),
+                    s(n),
+                ],
+            )?;
             rows.push((label, r));
         }
         drop(sink);
@@ -167,26 +236,67 @@ pub fn run(a: Args) -> anyhow::Result<()> {
 
     // D/E: blaster / remote-load → edge → dummy-node
     {
-        let sink = spawn_sink(&exe, "dummy-node", &[s("dummy-node"), s("--instance-dir"), s(inst.display())])?;
+        let sink = spawn_sink(
+            &exe,
+            "dummy-node",
+            &[s("dummy-node"), s("--instance-dir"), s(inst.display())],
+        )?;
         let listen = format!("127.0.0.1:{}", a.edge_port);
-        let edge = spawn_sink(&exe, "edge", &[
-            s("edge"), s("--instance-dir"), s(inst.display()), s("--listen"), listen.clone(),
-            s("--max-inflight"), s(65536), s("--per-conn-inflight"), s(4096),
-        ])?;
+        let edge = spawn_sink(
+            &exe,
+            "edge",
+            &[
+                s("edge"),
+                s("--instance-dir"),
+                s(inst.display()),
+                s("--listen"),
+                listen.clone(),
+                s("--max-inflight"),
+                s(65536),
+                s("--per-conn-inflight"),
+                s(4096),
+            ],
+        )?;
         for &n in &conns {
             let label = format!("D hop2 blaster→edge→dummy-node conns={n}");
-            let r = run_load(&exe, &label, &[
-                s("blaster"), s("--gateway"), listen.clone(), s("--secs"), secs.clone(),
-                s("--payload"), payload.clone(), s("--inflight"), inflight.clone(), s("--conns"), s(n),
-            ])?;
+            let r = run_load(
+                &exe,
+                &label,
+                &[
+                    s("blaster"),
+                    s("--gateway"),
+                    listen.clone(),
+                    s("--secs"),
+                    secs.clone(),
+                    s("--payload"),
+                    payload.clone(),
+                    s("--inflight"),
+                    inflight.clone(),
+                    s("--conns"),
+                    s(n),
+                ],
+            )?;
             rows.push((label, r));
         }
         for &n in &conns {
             let label = format!("E hop2+3 remote→edge→dummy-node conns={n}");
-            let r = run_load(&exe, &label, &[
-                s("remote-load"), s("--gateways"), listen.clone(), s("--secs"), secs.clone(),
-                s("--payload"), payload.clone(), s("--inflight"), inflight.clone(), s("--conns"), s(n),
-            ])?;
+            let r = run_load(
+                &exe,
+                &label,
+                &[
+                    s("remote-load"),
+                    s("--gateways"),
+                    listen.clone(),
+                    s("--secs"),
+                    secs.clone(),
+                    s("--payload"),
+                    payload.clone(),
+                    s("--inflight"),
+                    inflight.clone(),
+                    s("--conns"),
+                    s(n),
+                ],
+            )?;
             rows.push((label, r));
         }
         drop(edge);
@@ -194,7 +304,10 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     }
 
     println!();
-    println!("{:<52} {:>10} {:>8} {:>8} {:>6} {:>6}", "point (dev box — relative only)", "resp/s", "p50ms", "p99ms", "lost", "retry");
+    println!(
+        "{:<52} {:>10} {:>8} {:>8} {:>6} {:>6}",
+        "point (dev box — relative only)", "resp/s", "p50ms", "p99ms", "lost", "retry"
+    );
     for (label, r) in &rows {
         println!(
             "{:<52} {:>10} {:>8} {:>8} {:>6} {:>6}",
@@ -206,7 +319,11 @@ pub fn run(a: Args) -> anyhow::Result<()> {
             field(r, "retried")
         );
     }
-    let bad: Vec<&String> = rows.iter().filter(|(_, r)| field(r, "lost") != "0").map(|(l, _)| l).collect();
+    let bad: Vec<&String> = rows
+        .iter()
+        .filter(|(_, r)| field(r, "lost") != "0")
+        .map(|(l, _)| l)
+        .collect();
     anyhow::ensure!(bad.is_empty(), "points with lost responses: {bad:?}");
     Ok(())
 }

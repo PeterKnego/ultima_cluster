@@ -349,13 +349,21 @@ fn reason_str(reason: u32) -> &'static str {
         8 => "ZeroVoters (would leave the cluster with no voters)",
         9 => "TooManyMembers (8-member cap)",
         10 => "NotCaughtUp (learner is too far behind commit to promote safely)",
-        11 => "malformed/unknown op (node didn't recognize the request — CLI/node version mismatch?)",
-        12 => "SelfDemote (a leader cannot demote itself; RemoveVoter it and rejoin a fresh id as learner)",
+        11 => {
+            "malformed/unknown op (node didn't recognize the request — CLI/node version mismatch?)"
+        }
+        12 => {
+            "SelfDemote (a leader cannot demote itself; RemoveVoter it and rejoin a fresh id as learner)"
+        }
         20 => "auth_missing (the node requires a signed request: pass --admin-key)",
         21 => "auth_bad_tag (wrong key, a stale auth line, or a tampered request)",
-        22 => "auth_expired (expired, clock skew between uc2ctl and the node, or --admin-ttl-secs wider than the node's 2×request_ttl_ms window)",
+        22 => {
+            "auth_expired (expired, clock skew between uc2ctl and the node, or --admin-ttl-secs wider than the node's 2×request_ttl_ms window)"
+        }
         23 => "auth_unknown_key (this key name is not in the node's [admin].keys)",
-        24 => "audit_failed (the node could not record the request — check its audit.jsonl and disk)",
+        24 => {
+            "audit_failed (the node could not record the request — check its audit.jsonl and disk)"
+        }
         _ => "unknown/malformed",
     }
 }
@@ -364,13 +372,18 @@ fn reason_str(reason: u32) -> &'static str {
 /// exists but this CLI has no reason to depend on that module for one clock
 /// read, so it computes the identical thing directly.
 fn unix_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// The default admin key name when `--admin-key-name` is not given: the key
 /// file's stem (`"ops-alice.key"` -> `"ops-alice"`).
 fn key_name_from_path(path: &Path) -> String {
-    path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
+    path.file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// Loads `--admin-key` (if given) into an `AdminKey`, under `--admin-key-name`
@@ -382,7 +395,10 @@ fn load_admin_key(common: &CommonArgs) -> anyhow::Result<Option<AdminKey>> {
     let Some(path) = &common.admin_key else {
         return Ok(None);
     };
-    let name = common.admin_key_name.clone().unwrap_or_else(|| key_name_from_path(path));
+    let name = common
+        .admin_key_name
+        .clone()
+        .unwrap_or_else(|| key_name_from_path(path));
     let key = AdminKey::load(&name, path).map_err(|e| {
         anyhow::anyhow!(
             "loading admin key {path:?}: {e} (a 0600 32-byte key file; generate with \
@@ -418,7 +434,8 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
     // release that publishes both (see `uc_log::cnc::AdminAuth`'s doc).
     match &key {
         Some(key) => {
-            let expiry_ns = unix_ns().saturating_add(common.admin_ttl_secs.saturating_mul(1_000_000_000));
+            let expiry_ns =
+                unix_ns().saturating_add(common.admin_ttl_secs.saturating_mul(1_000_000_000));
             let meta = cnc.meta();
             let msg = AdminMessage {
                 app_id: &meta.app_id,
@@ -432,11 +449,22 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
                 expiry_ns,
             };
             let tag = sign(key, &msg);
-            cnc.write_admin_auth(&AdminAuth { tag, expiry_ns, key_name_hash: key.name_hash });
+            cnc.write_admin_auth(&AdminAuth {
+                tag,
+                expiry_ns,
+                key_name_hash: key.name_hash,
+            });
         }
         None => cnc.write_admin_auth(&AdminAuth::ZERO),
     }
-    cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+    cnc.write_admin_req(&AdminReq {
+        seq,
+        nonce,
+        op,
+        id,
+        ip,
+        port,
+    });
 
     let result = poll_admin_response(&cnc, seq);
     // Clear the auth line on EVERY exit path — accepted, refused, retry, or
@@ -462,7 +490,11 @@ fn poll_admin_response(cnc: &CncPage, seq: u64) -> anyhow::Result<()> {
                     return Ok(());
                 }
                 1 => {
-                    println!("refused: {} (config version {})", reason_str(resp.reason), resp.version);
+                    println!(
+                        "refused: {} (config version {})",
+                        reason_str(resp.reason),
+                        resp.version
+                    );
                     anyhow::bail!("refused: {}", reason_str(resp.reason));
                 }
                 2 => {
@@ -516,7 +548,11 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     );
     println!(
         "role: leader={leader} can_serve={can_serve} term={term} leader_hint={}",
-        if leader_hint == u64::MAX { "unknown".to_string() } else { leader_hint.to_string() }
+        if leader_hint == u64::MAX {
+            "unknown".to_string()
+        } else {
+            leader_hint.to_string()
+        }
     );
     println!("log: commit={commit} durable={durable} append={append}");
     // M14c (spec §9): the per-service table, straight off page 2 of the page
@@ -528,8 +564,9 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     // header and no rows.
     let declared = cnc.services_declared();
     let fsm_lag = cnc.fsm_lag_bytes();
-    let ids: Vec<u8> =
-        (0..CNC_MAX_SERVICES as u8).filter(|i| declared & (1u64 << i) != 0).collect();
+    let ids: Vec<u8> = (0..CNC_MAX_SERVICES as u8)
+        .filter(|i| declared & (1u64 << i) != 0)
+        .collect();
     // M14c2 T10b: with NOTHING declared there is no lag policy to report. The
     // page still carries a resolved `fsm_lag_bytes` (the node writes it whether
     // or not it declares FSMs), so printing it would name a bound this node
@@ -618,7 +655,9 @@ fn print_backup_report(r: &uc_node::backup::BackupReport) {
     }
     println!(
         "newest_snapshot={}",
-        r.newest_snapshot().map(|p| p.to_string()).unwrap_or_else(|| "none".to_string())
+        r.newest_snapshot()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "none".to_string())
     );
     println!("snapshot_floor={}", r.snapshot_floor);
     println!("healed_torn_tail={}", r.healed_torn_tail);
@@ -729,7 +768,9 @@ fn run_force_single_member(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
     println!("{}", planned.data_loss_statement());
 
-    let report = planned.commit().map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
+    let report = planned
+        .commit()
+        .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
     println!("old_version={}", report.old_version);
     println!("new_version={}", report.new_version);
     println!("durable={}", report.durable);
@@ -746,7 +787,10 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
     println!("wrote {}", abs.display());
     println!("paste into the node's config file:");
     println!("[admin]");
-    println!("keys = [{{ name = \"{name}\", key_path = \"{}\" }}]", abs.display());
+    println!(
+        "keys = [{{ name = \"{name}\", key_path = \"{}\" }}]",
+        abs.display()
+    );
     Ok(())
 }
 
@@ -828,7 +872,9 @@ fn format_audit_line(line: &str) -> Option<String> {
     let outcome = json_field(line, "outcome")?;
     let reason = json_field(line, "reason")?;
     let cfg = json_field(line, "config_version")?;
-    Some(format!("{ts}  {actor}  {origin}  {op_name}  {id}  {addr}  {outcome}({reason})  cfg={cfg}"))
+    Some(format!(
+        "{ts}  {actor}  {origin}  {op_name}  {id}  {addr}  {outcome}({reason})  cfg={cfg}"
+    ))
 }
 
 fn run_audit(a: &AuditArgs) -> anyhow::Result<()> {
@@ -888,7 +934,10 @@ mod tests {
         // What `push_json_escaped` (uc_node/src/obs/log.rs) emits for an
         // admin key literally named `ops"alice\bob`.
         let line = r#"{"actor":"ops\"alice\\bob","outcome":"accepted"}"#;
-        assert_eq!(json_field(line, "actor").as_deref(), Some(r#"ops"alice\bob"#));
+        assert_eq!(
+            json_field(line, "actor").as_deref(),
+            Some(r#"ops"alice\bob"#)
+        );
     }
 
     #[test]
@@ -923,7 +972,10 @@ mod tests {
     #[test]
     fn json_field_reads_a_numeric_field() {
         let line = r#"{"ts_ns":1755600000000000000,"reason":20,"config_version":7}"#;
-        assert_eq!(json_field(line, "ts_ns").as_deref(), Some("1755600000000000000"));
+        assert_eq!(
+            json_field(line, "ts_ns").as_deref(),
+            Some("1755600000000000000")
+        );
         assert_eq!(json_field(line, "reason").as_deref(), Some("20"));
         assert_eq!(json_field(line, "config_version").as_deref(), Some("7"));
     }

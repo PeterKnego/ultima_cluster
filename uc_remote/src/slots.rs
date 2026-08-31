@@ -43,7 +43,7 @@
 //! what it has put on the wire. What is still unused is task 8's re-send
 //! bookkeeping, which carries a narrow per-item `allow` until then.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 const FREE: u64 = 0;
 const RESERVED: u64 = u64::MAX;
@@ -304,7 +304,8 @@ impl SlotTable {
         if s.owner.load(Ordering::Acquire) != seq + 1 {
             return false;
         }
-        s.sent_seq.store(if sent { seq + 1 } else { 0 }, Ordering::Relaxed);
+        s.sent_seq
+            .store(if sent { seq + 1 } else { 0 }, Ordering::Relaxed);
         true
     }
 
@@ -360,14 +361,16 @@ impl SlotTable {
         loop {
             // A value carrying anyone else's tag (or none) counts as zero for
             // this generation.
-            let count = if cur & 0xFFFF_FFFF_0000_0000 == tag { cur & 0xFFFF_FFFF } else { 0 };
+            let count = if cur & 0xFFFF_FFFF_0000_0000 == tag {
+                cur & 0xFFFF_FFFF
+            } else {
+                0
+            };
             let next = tag | (count + 1).min(0xFFFF_FFFF);
-            match s.attempts.compare_exchange_weak(
-                cur,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match s
+                .attempts
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return Some((next & 0xFFFF_FFFF) as u32),
                 Err(actual) => cur = actual,
             }
@@ -416,7 +419,11 @@ mod tests {
         let t = table();
         let n = 1 + (t.slot_count() as u64); // same index, older generation
         assert!(t.claim(n, 0xBB, ReqKind::Submit, 1_000, 0, 88));
-        assert_eq!(t.resolve(1), Resolve::Miss, "seq 1 is a stale generation of that slot");
+        assert_eq!(
+            t.resolve(1),
+            Resolve::Miss,
+            "seq 1 is a stale generation of that slot"
+        );
         assert_eq!(t.resolve(n), Resolve::Won { user_data: 0xBB });
     }
 
@@ -424,12 +431,21 @@ mod tests {
     fn the_window_is_capped_at_max_inflight() {
         let t = table();
         for seq in 1..=8u64 {
-            assert!(t.claim(seq, seq, ReqKind::Submit, 1_000, 0, 88), "seq {seq}");
+            assert!(
+                t.claim(seq, seq, ReqKind::Submit, 1_000, 0, 88),
+                "seq {seq}"
+            );
         }
-        assert!(!t.claim(9, 9, ReqKind::Submit, 1_000, 0, 88), "the 9th must be refused");
+        assert!(
+            !t.claim(9, 9, ReqKind::Submit, 1_000, 0, 88),
+            "the 9th must be refused"
+        );
         assert_eq!(t.inflight(), 8);
         assert_eq!(t.resolve(1), Resolve::Won { user_data: 1 });
-        assert!(t.claim(9, 9, ReqKind::Submit, 1_000, 0, 88), "a freed slot admits the next");
+        assert!(
+            t.claim(9, 9, ReqKind::Submit, 1_000, 0, 88),
+            "a freed slot admits the next"
+        );
     }
 
     #[test]
@@ -469,7 +485,10 @@ mod tests {
         assert!(t.is_sent(1));
         assert!(t.mark_sent_if(1, false));
         assert!(!t.is_sent(1), "a RETRY marks a slot unsent again");
-        assert!(t.set_not_before_if(1, 12_345), "a live slot takes the backoff");
+        assert!(
+            t.set_not_before_if(1, 12_345),
+            "a live slot takes the backoff"
+        );
         assert_eq!(t.not_before(1), 12_345);
         assert_eq!(t.bump_attempts_if(1), Some(1));
         assert_eq!(t.bump_attempts_if(1), Some(2));
@@ -495,15 +514,30 @@ mod tests {
         assert!(t.claim(new, 0xA2, ReqKind::Submit, u64::MAX, 4096, 64));
 
         // The gate: a stamp naming the resolved seq is refused outright.
-        assert!(!t.mark_sent_if(old, true), "a resolved seq must not take a stamp");
+        assert!(
+            !t.mark_sent_if(old, true),
+            "a resolved seq must not take a stamp"
+        );
         assert!(!t.mark_sent_if(old, false), "…in either direction");
-        assert_eq!(t.bump_attempts_if(old), None, "a resolved seq must not be counted");
+        assert_eq!(
+            t.bump_attempts_if(old),
+            None,
+            "a resolved seq must not be counted"
+        );
 
         // The new occupant is untouched: not sent, and its first real write is
         // attempt 1 — never an inherited count that would read as a re-send.
         assert!(!t.is_sent(new), "the new occupant must not inherit `sent`");
-        assert_eq!(t.bump_attempts_if(new), Some(1), "the new occupant starts at 1");
-        assert_eq!(t.live_extent(new), Some((4096, 64)), "and its extent is its own");
+        assert_eq!(
+            t.bump_attempts_if(new),
+            Some(1),
+            "the new occupant starts at 1"
+        );
+        assert_eq!(
+            t.live_extent(new),
+            Some((4096, 64)),
+            "and its extent is its own"
+        );
     }
 
     /// The residual race the gate alone cannot close: a stamp passes the gate
@@ -528,10 +562,18 @@ mod tests {
         // land here, on a slot that now belongs to `new`.
         let s = t.slot(old);
         s.sent_seq.store(old + 1, Ordering::Relaxed);
-        s.attempts.store((((old + 1) & 0xFFFF_FFFF) << 32) | 7, Ordering::Relaxed);
+        s.attempts
+            .store((((old + 1) & 0xFFFF_FFFF) << 32) | 7, Ordering::Relaxed);
 
-        assert!(!t.is_sent(new), "a stray stamp must not read as sent for the new occupant");
-        assert_eq!(t.bump_attempts_if(new), Some(1), "nor may its count be inherited");
+        assert!(
+            !t.is_sent(new),
+            "a stray stamp must not read as sent for the new occupant"
+        );
+        assert_eq!(
+            t.bump_attempts_if(new),
+            Some(1),
+            "nor may its count be inherited"
+        );
         // …and the new occupant's own stamps still work, over the top of it.
         assert!(t.mark_sent_if(new, true));
         assert!(t.is_sent(new));
@@ -581,7 +623,11 @@ mod tests {
         // index is re-claimed under a later seq while the resolver races it.
         const N: u64 = 200;
         let t = Arc::new(SlotTable::new(8));
-        assert_eq!(t.slot_count(), 64, "the sizing floor, so N must exceed it to reuse an index");
+        assert_eq!(
+            t.slot_count(),
+            64,
+            "the sizing floor, so N must exceed it to reuse an index"
+        );
 
         let resolver_t = Arc::clone(&t);
         let resolver = thread::spawn(move || {
@@ -636,7 +682,11 @@ mod tests {
             !t.claim(collide, 0xC2, ReqKind::Submit, u64::MAX, 0, 88),
             "a live occupant must refuse a same-index claim from a later generation"
         );
-        assert_eq!(t.inflight(), before, "a refused claim must not change inflight");
+        assert_eq!(
+            t.inflight(),
+            before,
+            "a refused claim must not change inflight"
+        );
         assert_eq!(
             t.kind(1),
             ReqKind::Query,

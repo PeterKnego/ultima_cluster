@@ -70,13 +70,13 @@ use uc_crypto::identity::Identity;
 use uc_crypto::{CryptoConfig, HandshakeAction, NodeId, ReceiveHalf, SharedTransport};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::v2::crypto::{CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_RESP};
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_VOTE, DatagramHeader,
     RequestVoteBody, VoteBody, read_datagram_header, read_request_vote_body, write_datagram_header,
     write_vote_body,
 };
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 const APP: &str = "crypto-adversarial";
 
@@ -102,7 +102,10 @@ fn scratch_dir(tag: &str) -> tempfile::TempDir {
         .prefix(&format!("uc2-adv-{tag}-"))
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("tempdir");
-    assert!(!dir.path().starts_with("/tmp"), "test scratch must not live on tmpfs");
+    assert!(
+        !dir.path().starts_with("/tmp"),
+        "test scratch must not live on tmpfs"
+    );
     dir
 }
 
@@ -128,8 +131,16 @@ fn b64_32(bytes: &[u8; 32]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -223,7 +234,16 @@ impl FakePeer {
         victim_addr: SocketAddr,
         victim_pub: [u8; 32],
     ) -> Self {
-        Self::new_at(dir, tag, claim_id, private, victim_id, victim_addr, victim_pub, "127.0.0.1:0".parse().unwrap())
+        Self::new_at(
+            dir,
+            tag,
+            claim_id,
+            private,
+            victim_id,
+            victim_addr,
+            victim_pub,
+            "127.0.0.1:0".parse().unwrap(),
+        )
     }
 
     /// As [`FakePeer::new`], but binds a SPECIFIC local address rather than
@@ -255,7 +275,14 @@ impl FakePeer {
         let recv = transport.receive_half();
         let sock = UdpSocket::bind(bind_addr).expect("bind the exact requested local address");
         sock.set_nonblocking(true).unwrap();
-        Self { victim_id, victim_addr, sock, transport, recv, stash: Vec::new() }
+        Self {
+            victim_id,
+            victim_addr,
+            sock,
+            transport,
+            recv,
+            stash: Vec::new(),
+        }
     }
 
     fn addr(&self) -> SocketAddr {
@@ -266,7 +293,13 @@ impl FakePeer {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
         write_datagram_header(
             &mut d,
-            &DatagramHeader { position: 0, leadership_term_id: 0, kind, flags: 0, key_epoch: 0 },
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: 0,
+                kind,
+                flags: 0,
+                key_epoch: 0,
+            },
         );
         d[DATAGRAM_HEADER_LEN..].copy_from_slice(body);
         let _ = self.sock.send_to(&d, self.victim_addr);
@@ -285,7 +318,10 @@ impl FakePeer {
     /// returned raw, or stashed if it is not `want`).
     fn poll_one(&mut self, want: Option<u8>, deadline: Instant) -> Option<Vec<u8>> {
         if let Some(w) = want
-            && let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).unwrap().kind == w)
+            && let Some(i) = self
+                .stash
+                .iter()
+                .position(|d| read_datagram_header(d).unwrap().kind == w)
         {
             return Some(self.stash.remove(i));
         }
@@ -351,7 +387,13 @@ impl FakePeer {
     /// IS the sender, no interception is required to obtain them.
     fn grant_vote(&self, term: u32) -> Vec<u8> {
         let mut body = [0u8; uc_protocol::v2::datagram::VOTE_BODY_LEN];
-        write_vote_body(&mut body, &VoteBody { term, granted: true });
+        write_vote_body(
+            &mut body,
+            &VoteBody {
+                term,
+                granted: true,
+            },
+        );
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
         write_datagram_header(
             &mut d,
@@ -364,9 +406,9 @@ impl FakePeer {
             },
         );
         d[DATAGRAM_HEADER_LEN..].copy_from_slice(&body);
-        self.transport.seal_pairwise_control(DGRAM_KIND_VOTE, self.victim_id, &mut d).expect(
-            "sealing a VOTE over an established session must succeed",
-        );
+        self.transport
+            .seal_pairwise_control(DGRAM_KIND_VOTE, self.victim_id, &mut d)
+            .expect("sealing a VOTE over an established session must succeed");
         self.sock.send_to(&d, self.victim_addr).unwrap();
         d
     }
@@ -404,7 +446,10 @@ fn a_replayed_vote_cannot_be_recounted() {
     // reserve a THIRD member slot that never comes up (majority is 2 of 3,
     // so the victim's self-vote + the one honest peer's grant is enough —
     // matches `crypto_cluster.rs`'s "one member never comes up" precedent).
-    let dead_slot = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let dead_slot = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let victim_addr = victim_sock.local_addr().unwrap();
 
@@ -415,10 +460,20 @@ fn a_replayed_vote_cannot_be_recounted() {
     write_key_file(&key_path, victim_priv);
     let allowlist_path = dir.join("victim.allowlist");
     write_allowlist(&allowlist_path, &allowlist);
-    let cfg = victim_config(0, members, dir, key_path, allowlist_path, FaultConfig::default());
+    let cfg = victim_config(
+        0,
+        members,
+        dir,
+        key_path,
+        allowlist_path,
+        FaultConfig::default(),
+    );
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
-    assert!(peer1.try_establish(Duration::from_secs(10)), "the honest peer must establish");
+    assert!(
+        peer1.try_establish(Duration::from_secs(10)),
+        "the honest peer must establish"
+    );
 
     let rv = peer1
         .recv_request_vote(Duration::from_secs(10))
@@ -438,7 +493,10 @@ fn a_replayed_vote_cannot_be_recounted() {
     // abandoned every earlier term, so a late grant can depose nobody.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !victim.is_leader() {
-        assert!(Instant::now() < deadline, "the victim never won its own election");
+        assert!(
+            Instant::now() < deadline,
+            "the victim never won its own election"
+        );
         if let Some(rv) = peer1.recv_request_vote(Duration::from_millis(20)) {
             vote_bytes = peer1.grant_vote(rv.new_term);
         }
@@ -472,8 +530,15 @@ fn a_replayed_vote_cannot_be_recounted() {
         std::thread::yield_now();
     }
 
-    assert!(victim.is_leader(), "the replay must not have disrupted leadership");
-    assert_eq!(victim.current_term(), term_before, "the replay must not have moved the term");
+    assert!(
+        victim.is_leader(),
+        "the replay must not have disrupted leadership"
+    );
+    assert_eq!(
+        victim.current_term(),
+        term_before,
+        "the replay must not have moved the term"
+    );
 
     victim.stop();
 }
@@ -503,7 +568,10 @@ fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     let victim_pub = identity_public(dir, "victim-pub", victim_priv);
     let peer_pub = identity_public(dir, "peer-pub", peer_priv);
 
-    let dead_slot = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let dead_slot = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let victim_addr = victim_sock.local_addr().unwrap();
 
@@ -527,14 +595,26 @@ fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     // failures` moves ONLY when this test's own revoked-peer dial is
     // refused.
     let dead_slot_dummy_pub = [0x33u8; 32]; // never a real key; nothing ever authenticates as id 1
-    write_allowlist(&allowlist_path, &[(1u32, dead_slot_dummy_pub), (2u32, peer_pub)]);
-    let cfg =
-        victim_config(0, members.clone(), dir, key_path, allowlist_path.clone(), FaultConfig::default());
+    write_allowlist(
+        &allowlist_path,
+        &[(1u32, dead_slot_dummy_pub), (2u32, peer_pub)],
+    );
+    let cfg = victim_config(
+        0,
+        members.clone(),
+        dir,
+        key_path,
+        allowlist_path.clone(),
+        FaultConfig::default(),
+    );
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     // Proves the key is genuinely legitimate (not vacuously-invalid fixture
     // material) before it is revoked.
-    assert!(peer_v1.try_establish(Duration::from_secs(10)), "the real key must establish while allowlisted");
+    assert!(
+        peer_v1.try_establish(Duration::from_secs(10)),
+        "the real key must establish while allowlisted"
+    );
     assert!(victim.has_crypto_session_with(2));
 
     // Revoke: rewrite the allowlist file WITHOUT node 2's entry. Id 1's
@@ -559,13 +639,31 @@ fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     // same one.
     let peer2_slot = peer_v1.addr();
     drop(peer_v1);
-    let mut peer_v2 =
-        FakePeer::new_at(dir, "peer-v2", 2, peer_priv, 0, victim_addr, victim_pub, peer2_slot);
-    assert_eq!(peer_v2.addr(), peer2_slot, "must redial from id 2's exact registered slot");
+    let mut peer_v2 = FakePeer::new_at(
+        dir,
+        "peer-v2",
+        2,
+        peer_priv,
+        0,
+        victim_addr,
+        victim_pub,
+        peer2_slot,
+    );
+    assert_eq!(
+        peer_v2.addr(),
+        peer2_slot,
+        "must redial from id 2's exact registered slot"
+    );
     let established = peer_v2.try_establish(Duration::from_secs(5));
 
-    assert!(!established, "a revoked peer's fresh dial must not reach Established");
-    assert!(!peer_v2.transport.is_established(0), "the initiator side must also see no session");
+    assert!(
+        !established,
+        "a revoked peer's fresh dial must not reach Established"
+    );
+    assert!(
+        !peer_v2.transport.is_established(0),
+        "the initiator side must also see no session"
+    );
     assert!(
         victim.crypto_handshake_failures() > failures_before,
         "the victim must have ACTIVELY refused the handshake, not just stayed silent"
@@ -593,7 +691,10 @@ fn a_revoked_peer_fixture_has_zero_handshake_failure_background_rate() {
     let victim_pub = identity_public(dir, "victim-pub", victim_priv);
     let peer_pub = identity_public(dir, "peer-pub", peer_priv);
 
-    let dead_slot = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let dead_slot = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let victim_addr = victim_sock.local_addr().unwrap();
 
@@ -603,9 +704,18 @@ fn a_revoked_peer_fixture_has_zero_handshake_failure_background_rate() {
     write_key_file(&key_path, victim_priv);
     let allowlist_path = dir.join("victim.allowlist");
     let dead_slot_dummy_pub = [0x33u8; 32];
-    write_allowlist(&allowlist_path, &[(1u32, dead_slot_dummy_pub), (2u32, peer_pub)]);
-    let cfg =
-        victim_config(0, members.clone(), dir, key_path, allowlist_path.clone(), FaultConfig::default());
+    write_allowlist(
+        &allowlist_path,
+        &[(1u32, dead_slot_dummy_pub), (2u32, peer_pub)],
+    );
+    let cfg = victim_config(
+        0,
+        members.clone(),
+        dir,
+        key_path,
+        allowlist_path.clone(),
+        FaultConfig::default(),
+    );
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     // Let the victim settle (its own handshakes with peer_v1's real slot
@@ -615,7 +725,10 @@ fn a_revoked_peer_fixture_has_zero_handshake_failure_background_rate() {
     let f0 = victim.crypto_handshake_failures();
     std::thread::sleep(Duration::from_secs(5));
     let f1 = victim.crypto_handshake_failures();
-    assert_eq!(f1, f0, "background handshake-failure rate must be zero with no attacker present");
+    assert_eq!(
+        f1, f0,
+        "background handshake-failure rate must be zero with no attacker present"
+    );
 
     victim.stop();
 }
@@ -664,7 +777,10 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     // false pass for the wrong reason. Making the victim's id the higher
     // one removes that race: `self_id < from` is never true, so the
     // tie-break never intercepts, and every attack reaches the real check.
-    let slot2_addr = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let slot2_addr = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
     let members = vec![(9, victim_addr), (2, slot2_addr)];
     let key_path = dir.join("victim.key");
     write_key_file(&key_path, victim_priv);
@@ -672,7 +788,14 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     // Genuinely allowlisted under its TRUE id — the allowlist alone must
     // not be enough to let either impostor in.
     write_allowlist(&allowlist_path, &[(2u32, peer2_pub)]);
-    let cfg = victim_config(9, members, dir, key_path, allowlist_path.clone(), FaultConfig::default());
+    let cfg = victim_config(
+        9,
+        members,
+        dir,
+        key_path,
+        allowlist_path.clone(),
+        FaultConfig::default(),
+    );
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     // Sub-attack (a): a fresh, unrelated keypair claims id 2 while sitting
@@ -681,14 +804,32 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     // the allowlist says id 2's key is.
     let f0 = victim.crypto_handshake_failures();
     let random_priv = [0x99u8; 32];
-    let mut impostor_a =
-        FakePeer::new_at(dir, "impostor-a", 2, random_priv, 9, victim_addr, victim_pub, slot2_addr);
-    assert_eq!(impostor_a.addr(), slot2_addr, "must occupy id 2's exact registered slot");
+    let mut impostor_a = FakePeer::new_at(
+        dir,
+        "impostor-a",
+        2,
+        random_priv,
+        9,
+        victim_addr,
+        victim_pub,
+        slot2_addr,
+    );
+    assert_eq!(
+        impostor_a.addr(),
+        slot2_addr,
+        "must occupy id 2's exact registered slot"
+    );
     let est_a = impostor_a.try_establish(Duration::from_secs(4));
-    assert!(!est_a, "a key that does not match id 2's allowlisted key must be refused");
+    assert!(
+        !est_a,
+        "a key that does not match id 2's allowlisted key must be refused"
+    );
     assert!(!victim.has_crypto_session_with(2));
     let f1 = victim.crypto_handshake_failures();
-    assert!(f1 > f0, "sub-attack (a) must have been actively refused, not just silently absent");
+    assert!(
+        f1 > f0,
+        "sub-attack (a) must have been actively refused, not just silently absent"
+    );
     drop(impostor_a); // free slot2_addr's port for sub-attack (b)
 
     // Sub-attack (b): peer 1's real, genuinely-allowlisted-under-id-1 key,
@@ -729,9 +870,21 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     // revocation test).
     std::thread::sleep(Duration::from_millis(1_200));
 
-    let mut impostor_b =
-        FakePeer::new_at(dir, "impostor-b", 1, peer1_priv, 9, victim_addr, victim_pub, slot2_addr);
-    assert_eq!(impostor_b.addr(), slot2_addr, "must occupy id 2's exact registered slot");
+    let mut impostor_b = FakePeer::new_at(
+        dir,
+        "impostor-b",
+        1,
+        peer1_priv,
+        9,
+        victim_addr,
+        victim_pub,
+        slot2_addr,
+    );
+    assert_eq!(
+        impostor_b.addr(),
+        slot2_addr,
+        "must occupy id 2's exact registered slot"
+    );
     // Not asserted: `impostor_b.transport.is_established(9)`. The victim's
     // OWN proactive dial to id 2's slot (`gossip_targets`, unrelated to
     // this attack) is answered by whoever occupies that slot — impostor_b
@@ -741,10 +894,19 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     // that matters is what the VICTIM concludes, never what the attacker's
     // own bookkeeping shows.
     impostor_b.try_establish(Duration::from_secs(4));
-    assert!(!victim.has_crypto_session_with(1), "must never be admitted as id 1");
-    assert!(!victim.has_crypto_session_with(2), "must never be admitted as id 2 under this key either");
+    assert!(
+        !victim.has_crypto_session_with(1),
+        "must never be admitted as id 1"
+    );
+    assert!(
+        !victim.has_crypto_session_with(2),
+        "must never be admitted as id 2 under this key either"
+    );
     let f2 = victim.crypto_handshake_failures();
-    assert!(f2 > f1, "sub-attack (b) must have been actively refused, not just silently absent");
+    assert!(
+        f2 > f1,
+        "sub-attack (b) must have been actively refused, not just silently absent"
+    );
 
     victim.stop();
 }
@@ -776,7 +938,14 @@ fn a_downgrade_to_cleartext_is_refused() {
     // the attacker below never attempts a handshake at all, it only injects
     // DATA-shaped bytes claiming to originate from that registered address.
     write_allowlist(&allowlist_path, &[(1u32, [0x22; 32])]);
-    let cfg = victim_config(0, members, dir, key_path, allowlist_path, FaultConfig::default());
+    let cfg = victim_config(
+        0,
+        members,
+        dir,
+        key_path,
+        allowlist_path,
+        FaultConfig::default(),
+    );
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     let append_before = victim.counters().append.load_acquire();
@@ -800,7 +969,10 @@ fn a_downgrade_to_cleartext_is_refused() {
         },
     );
     short[DATAGRAM_HEADER_LEN..].copy_from_slice(b"evil");
-    assert!(short.len() < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "must be shorter than any real seal");
+    assert!(
+        short.len() < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
+        "must be shorter than any real seal"
+    );
     registered.send_to(&short, victim_addr).unwrap();
 
     // Case B: a LONGER forgery that merely looks like it could be sealed
@@ -862,7 +1034,11 @@ fn a_downgrade_to_cleartext_is_refused() {
     let mut rv_body = [0u8; uc_protocol::v2::datagram::REQUEST_VOTE_BODY_LEN];
     uc_protocol::v2::datagram::write_request_vote_body(
         &mut rv_body,
-        &RequestVoteBody { new_term: injected_term, last_term: 0, last_durable: 0 },
+        &RequestVoteBody {
+            new_term: injected_term,
+            last_term: 0,
+            last_durable: 0,
+        },
     );
     let mut rv_dgram = vec![0u8; DATAGRAM_HEADER_LEN + rv_body.len()];
     write_datagram_header(
@@ -943,11 +1119,19 @@ fn spawn_storm_cluster(faults: FaultConfig) -> (tempfile::TempDir, Vec<Node>, Ve
         publics.push(identity_public(dir.path(), &format!("storm{i}"), p));
         privs.push(p);
     }
-    let socks: Vec<UdpSocket> = (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").unwrap()).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
-    let allowlist: Vec<(NodeId, [u8; 32])> =
-        publics.iter().enumerate().map(|(i, p)| (i as u32, *p)).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
+    let allowlist: Vec<(NodeId, [u8; 32])> = publics
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i as u32, *p))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     let mut dirs = Vec::with_capacity(n);
@@ -1110,8 +1294,9 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
         std::thread::yield_now();
     };
     loop {
-        let laggards: Vec<usize> =
-            (0..nodes.len()).filter(|&i| readable_floor(&nodes[i]) < target).collect();
+        let laggards: Vec<usize> = (0..nodes.len())
+            .filter(|&i| readable_floor(&nodes[i]) < target)
+            .collect();
         if laggards.is_empty() {
             break;
         }
@@ -1180,11 +1365,17 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
         }
         let first = &refs[0];
         for other in &refs[1..] {
-            assert_eq!(first, other, "divergent committed content at position {pos}");
+            assert_eq!(
+                first, other,
+                "divergent committed content at position {pos}"
+            );
         }
         frames_compared += 1;
         let step = step.expect("every branch above either sets `step` or panics");
-        assert!(step > 0, "align_frame_len returned 0 at position {pos} — a genuinely corrupt frame");
+        assert!(
+            step > 0,
+            "align_frame_len returned 0 at position {pos} — a genuinely corrupt frame"
+        );
         pos += step;
     }
     assert!(

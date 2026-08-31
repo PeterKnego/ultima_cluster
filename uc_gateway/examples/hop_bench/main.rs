@@ -41,7 +41,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "hop_bench", about = "M13 per-hop isolation bench (see the module doc)")]
+#[command(
+    name = "hop_bench",
+    about = "M13 per-hop isolation bench (see the module doc)"
+)]
 struct Cli {
     #[command(subcommand)]
     role: Role,
@@ -97,7 +100,10 @@ fn run_edge(a: EdgeArgs) -> anyhow::Result<()> {
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             let (id, addr) = s.trim().split_once('@').expect("member is id@addr");
-            Member { node_id: id.parse().expect("member id"), gateway: addr.to_string() }
+            Member {
+                node_id: id.parse().expect("member id"),
+                gateway: addr.to_string(),
+            }
         })
         .collect();
     let edge = Edge::start(EdgeConfig {
@@ -113,7 +119,10 @@ fn run_edge(a: EdgeArgs) -> anyhow::Result<()> {
         ..EdgeConfig::defaults()
     })
     .map_err(|e| anyhow::anyhow!("edge start: {e}"))?;
-    println!("hop_bench edge up on {}; parking (killed externally)", edge.local_addr());
+    println!(
+        "hop_bench edge up on {}; parking (killed externally)",
+        edge.local_addr()
+    );
     println!("READY");
     // One stats line per second, deltas, so a collapse rung shows WHAT the
     // edge is doing (backpressure events, retries, responses) not just that

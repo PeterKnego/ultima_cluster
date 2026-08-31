@@ -148,21 +148,36 @@ pub fn encode_frame(out: &mut Vec<u8>, h: Header, payload: &[u8]) {
 /// payload length. Requires `buf.len() >= HEADER_LEN`.
 pub fn decode_header(buf: &[u8]) -> Result<(Header, usize), FrameError> {
     if buf.len() < HEADER_LEN {
-        return Err(FrameError::Short { need: HEADER_LEN, have: buf.len() });
+        return Err(FrameError::Short {
+            need: HEADER_LEN,
+            have: buf.len(),
+        });
     }
     let len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if len > MAX_FRAME_LEN {
         return Err(FrameError::TooLong(len));
     }
     if (len as usize) < HEADER_LEN {
-        return Err(FrameError::Short { need: HEADER_LEN, have: len as usize });
+        return Err(FrameError::Short {
+            need: HEADER_LEN,
+            have: len as usize,
+        });
     }
     let ty = FrameType::from_u8(buf[4])?;
     let flags = buf[5];
     let version = u16::from_le_bytes(buf[6..8].try_into().unwrap());
     let client_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let seq = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    Ok((Header { ty, flags, version, client_id, seq }, len as usize - HEADER_LEN))
+    Ok((
+        Header {
+            ty,
+            flags,
+            version,
+            client_id,
+            seq,
+        },
+        len as usize - HEADER_LEN,
+    ))
 }
 
 // ---- string helper --------------------------------------------------------
@@ -176,12 +191,18 @@ fn encode_str(out: &mut Vec<u8>, s: &str) {
 /// Returns the string and the number of bytes consumed.
 fn decode_str(buf: &[u8]) -> Result<(&str, usize), FrameError> {
     if buf.len() < 2 {
-        return Err(FrameError::Short { need: 2, have: buf.len() });
+        return Err(FrameError::Short {
+            need: 2,
+            have: buf.len(),
+        });
     }
     let slen = u16::from_le_bytes(buf[0..2].try_into().unwrap()) as usize;
     let need = 2 + slen;
     if buf.len() < need {
-        return Err(FrameError::Short { need, have: buf.len() });
+        return Err(FrameError::Short {
+            need,
+            have: buf.len(),
+        });
     }
     let s = std::str::from_utf8(&buf[2..need]).map_err(|_| FrameError::BadPayload("utf8"))?;
     Ok((s, need))
@@ -223,13 +244,24 @@ impl<'a> HelloOk<'a> {
 
     pub fn decode(buf: &'a [u8]) -> Result<Self, FrameError> {
         if buf.len() < 8 {
-            return Err(FrameError::Short { need: 8, have: buf.len() });
+            return Err(FrameError::Short {
+                need: 8,
+                have: buf.len(),
+            });
         }
         let credits = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let leader_raw = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        let leader = if leader_raw == u32::MAX { None } else { Some(leader_raw) };
+        let leader = if leader_raw == u32::MAX {
+            None
+        } else {
+            Some(leader_raw)
+        };
         let (leader_addr, _) = decode_str(&buf[8..])?;
-        Ok(HelloOk { credits, leader, leader_addr })
+        Ok(HelloOk {
+            credits,
+            leader,
+            leader_addr,
+        })
     }
 }
 
@@ -276,12 +308,19 @@ impl ResponseMeta {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < Self::LEN {
-            return Err(FrameError::Short { need: Self::LEN, have: buf.len() });
+            return Err(FrameError::Short {
+                need: Self::LEN,
+                have: buf.len(),
+            });
         }
         let credits = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let acked_seq = u64::from_le_bytes(buf[4..12].try_into().unwrap());
         let position = u64::from_le_bytes(buf[12..20].try_into().unwrap());
-        Ok(ResponseMeta { credits, acked_seq, position })
+        Ok(ResponseMeta {
+            credits,
+            acked_seq,
+            position,
+        })
     }
 }
 
@@ -302,7 +341,10 @@ impl Status {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < Self::LEN {
-            return Err(FrameError::Short { need: Self::LEN, have: buf.len() });
+            return Err(FrameError::Short {
+                need: Self::LEN,
+                have: buf.len(),
+            });
         }
         let acked_seq = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let credits = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -325,7 +367,10 @@ impl<'a> Leader<'a> {
 
     pub fn decode(buf: &'a [u8]) -> Result<Self, FrameError> {
         if buf.len() < 4 {
-            return Err(FrameError::Short { need: 4, have: buf.len() });
+            return Err(FrameError::Short {
+                need: 4,
+                have: buf.len(),
+            });
         }
         let node_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let (addr, _) = decode_str(&buf[4..])?;
@@ -350,11 +395,17 @@ impl Retry {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < Self::LEN {
-            return Err(FrameError::Short { need: Self::LEN, have: buf.len() });
+            return Err(FrameError::Short {
+                need: Self::LEN,
+                have: buf.len(),
+            });
         }
         let reason = buf[0];
         let retry_after_us = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-        Ok(Retry { reason, retry_after_us })
+        Ok(Retry {
+            reason,
+            retry_after_us,
+        })
     }
 }
 
@@ -367,7 +418,10 @@ mod tests {
         let mut out = Vec::new();
         Hello { app_id: "myapp" }.encode(&mut out);
         assert_eq!(Hello::decode(&out).unwrap().app_id, "myapp");
-        assert!(matches!(Hello::decode(&out[..1]), Err(FrameError::Short { .. })));
+        assert!(matches!(
+            Hello::decode(&out[..1]),
+            Err(FrameError::Short { .. })
+        ));
     }
 
     #[test]
@@ -381,16 +435,31 @@ mod tests {
     #[test]
     fn hello_refused_round_trips_and_rejects_short() {
         let mut out = Vec::new();
-        HelloRefused { reason: HELLO_REFUSED_APP_ID, detail: "wrong app_id" }.encode(&mut out);
+        HelloRefused {
+            reason: HELLO_REFUSED_APP_ID,
+            detail: "wrong app_id",
+        }
+        .encode(&mut out);
         let hr = HelloRefused::decode(&out).unwrap();
-        assert_eq!((hr.reason, hr.detail), (HELLO_REFUSED_APP_ID, "wrong app_id"));
-        assert!(matches!(HelloRefused::decode(&[]), Err(FrameError::Short { .. })));
+        assert_eq!(
+            (hr.reason, hr.detail),
+            (HELLO_REFUSED_APP_ID, "wrong app_id")
+        );
+        assert!(matches!(
+            HelloRefused::decode(&[]),
+            Err(FrameError::Short { .. })
+        ));
     }
 
     #[test]
     fn hello_ok_leader_max_u32_decodes_as_none() {
         let mut out = Vec::new();
-        HelloOk { credits: 3, leader: Some(u32::MAX), leader_addr: "x" }.encode(&mut out);
+        HelloOk {
+            credits: 3,
+            leader: Some(u32::MAX),
+            leader_addr: "x",
+        }
+        .encode(&mut out);
         // Encoding Some(u32::MAX) is indistinguishable from None on the wire
         // by construction — assert that round trip explicitly.
         assert_eq!(HelloOk::decode(&out).unwrap().leader, None);
@@ -398,23 +467,37 @@ mod tests {
 
     #[test]
     fn hello_ok_rejects_short_buffer() {
-        assert!(matches!(HelloOk::decode(&[0u8; 4]), Err(FrameError::Short { .. })));
+        assert!(matches!(
+            HelloOk::decode(&[0u8; 4]),
+            Err(FrameError::Short { .. })
+        ));
     }
 
     #[test]
     fn status_round_trips_and_rejects_short() {
         let mut out = Vec::new();
-        Status { acked_seq: 99, credits: 5 }.encode(&mut out);
+        Status {
+            acked_seq: 99,
+            credits: 5,
+        }
+        .encode(&mut out);
         assert_eq!(out.len(), Status::LEN);
         let s = Status::decode(&out).unwrap();
         assert_eq!((s.acked_seq, s.credits), (99, 5));
-        assert!(matches!(Status::decode(&out[..3]), Err(FrameError::Short { .. })));
+        assert!(matches!(
+            Status::decode(&out[..3]),
+            Err(FrameError::Short { .. })
+        ));
     }
 
     #[test]
     fn leader_empty_addr_round_trips() {
         let mut out = Vec::new();
-        Leader { node_id: 7, addr: "" }.encode(&mut out);
+        Leader {
+            node_id: 7,
+            addr: "",
+        }
+        .encode(&mut out);
         let l = Leader::decode(&out).unwrap();
         assert_eq!((l.node_id, l.addr), (7, ""));
     }
@@ -429,7 +512,11 @@ mod tests {
         ];
         for r in REASONS {
             let mut out = Vec::new();
-            HelloRefused { reason: r, detail: "why" }.encode(&mut out);
+            HelloRefused {
+                reason: r,
+                detail: "why",
+            }
+            .encode(&mut out);
             assert_eq!(HelloRefused::decode(&out).unwrap().reason, r);
         }
         assert_eq!(
@@ -442,7 +529,11 @@ mod tests {
     #[test]
     fn retry_payload_too_large_reason_encodes() {
         let mut out = Vec::new();
-        Retry { reason: RETRY_PAYLOAD_TOO_LARGE, retry_after_us: 0 }.encode(&mut out);
+        Retry {
+            reason: RETRY_PAYLOAD_TOO_LARGE,
+            retry_after_us: 0,
+        }
+        .encode(&mut out);
         let r = Retry::decode(&out).unwrap();
         assert_eq!((r.reason, r.retry_after_us), (RETRY_PAYLOAD_TOO_LARGE, 0));
     }
@@ -460,7 +551,10 @@ mod tests {
     fn decode_str_rejects_invalid_utf8() {
         // len=1, one invalid UTF-8 byte.
         let buf: [u8; 3] = [1, 0, 0xFF];
-        assert!(matches!(Hello::decode(&buf), Err(FrameError::BadPayload("utf8"))));
+        assert!(matches!(
+            Hello::decode(&buf),
+            Err(FrameError::BadPayload("utf8"))
+        ));
     }
 }
 
@@ -481,7 +575,11 @@ mod header_tests {
         let mut whole = Vec::new();
         encode_frame(&mut whole, h, payload);
         let hdr = encode_header_into(h, payload.len());
-        assert_eq!(&whole[..HEADER_LEN], &hdr[..], "the two encoders must agree byte for byte");
+        assert_eq!(
+            &whole[..HEADER_LEN],
+            &hdr[..],
+            "the two encoders must agree byte for byte"
+        );
         assert_eq!(&whole[HEADER_LEN..], payload);
     }
 }

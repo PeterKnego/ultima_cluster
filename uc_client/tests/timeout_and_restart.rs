@@ -18,7 +18,13 @@ use uc_protocol::ring::{BroadcastRing, MpscRing};
 const MIB: u64 = 1 << 20;
 
 fn meta(app_id: &str, instance_id: u128) -> CncMeta {
-    CncMeta { node_id: 0, instance_id, app_id: app_id.into(), buffer_bytes: MIB, max_payload: 256 }
+    CncMeta {
+        node_id: 0,
+        instance_id,
+        app_id: app_id.into(),
+        buffer_bytes: MIB,
+        max_payload: 256,
+    }
 }
 
 fn make_instance(dir: &Path, app_id: &str, instance_id: u128) {
@@ -57,7 +63,11 @@ fn timeout_then_instance_restart_after_a_fresh_cnc_page() {
     // The client's already-mmap'd `Arc<CncPage>` observes the new bytes (same
     // inode, truncate-and-rewrite, never unlinked).
     let instance_b: u128 = 0x2222_2222_2222_2222;
-    CncPage::create_file(&dir.path().join("cnc2.dat"), &meta("restart-test", instance_b)).unwrap();
+    CncPage::create_file(
+        &dir.path().join("cnc2.dat"),
+        &meta("restart-test", instance_b),
+    )
+    .unwrap();
 
     let result: Result<u8, ClientError> = client.submit(&2u8);
     match result {

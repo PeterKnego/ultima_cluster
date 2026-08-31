@@ -21,7 +21,7 @@ pub const MEMBER_LEN: usize = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireMember {
     pub id: u32,
-    pub ip: u32,   // IPv4, network-order value stored as a plain u32
+    pub ip: u32, // IPv4, network-order value stored as a plain u32
     pub port: u16,
 }
 
@@ -83,7 +83,13 @@ pub fn decode_config(buf: &[u8]) -> Option<WireConfig> {
         tombstones.push(u32::from_le_bytes(buf[off..off + 4].try_into().ok()?));
         off += 4;
     }
-    Some(WireConfig { version, prev_position, voters, learners, tombstones })
+    Some(WireConfig {
+        version,
+        prev_position,
+        voters,
+        learners,
+        tombstones,
+    })
 }
 
 #[cfg(test)]
@@ -95,11 +101,27 @@ mod tests {
             version: 3,
             prev_position: 4096,
             voters: vec![
-                WireMember { id: 1, ip: u32::from_be_bytes([10, 0, 0, 1]), port: 19100 },
-                WireMember { id: 2, ip: u32::from_be_bytes([10, 0, 0, 2]), port: 19100 },
-                WireMember { id: 3, ip: u32::from_be_bytes([10, 0, 0, 3]), port: 19100 },
+                WireMember {
+                    id: 1,
+                    ip: u32::from_be_bytes([10, 0, 0, 1]),
+                    port: 19100,
+                },
+                WireMember {
+                    id: 2,
+                    ip: u32::from_be_bytes([10, 0, 0, 2]),
+                    port: 19100,
+                },
+                WireMember {
+                    id: 3,
+                    ip: u32::from_be_bytes([10, 0, 0, 3]),
+                    port: 19100,
+                },
             ],
-            learners: vec![WireMember { id: 5, ip: u32::from_be_bytes([10, 0, 0, 5]), port: 19100 }],
+            learners: vec![WireMember {
+                id: 5,
+                ip: u32::from_be_bytes([10, 0, 0, 5]),
+                port: 19100,
+            }],
             tombstones: vec![4],
         }
     }
@@ -118,14 +140,17 @@ mod tests {
         let c = sample();
         let mut buf = Vec::new();
         encode_config(&c, &mut buf);
-        assert_eq!(&buf[0..8], &3u64.to_le_bytes());          // version
-        assert_eq!(&buf[8..16], &4096u64.to_le_bytes());      // prev_position
-        assert_eq!(&buf[16..18], &3u16.to_le_bytes());        // n_voters
-        assert_eq!(&buf[18..20], &1u16.to_le_bytes());        // n_learners
-        assert_eq!(&buf[20..22], &1u16.to_le_bytes());        // n_tombstones
+        assert_eq!(&buf[0..8], &3u64.to_le_bytes()); // version
+        assert_eq!(&buf[8..16], &4096u64.to_le_bytes()); // prev_position
+        assert_eq!(&buf[16..18], &3u16.to_le_bytes()); // n_voters
+        assert_eq!(&buf[18..20], &1u16.to_le_bytes()); // n_learners
+        assert_eq!(&buf[20..22], &1u16.to_le_bytes()); // n_tombstones
         // first voter entry: id u32 | ip u32 | port u16 = 10 bytes
         assert_eq!(&buf[22..26], &1u32.to_le_bytes());
-        assert_eq!(&buf[26..30], &u32::from_be_bytes([10, 0, 0, 1]).to_le_bytes());
+        assert_eq!(
+            &buf[26..30],
+            &u32::from_be_bytes([10, 0, 0, 1]).to_le_bytes()
+        );
         assert_eq!(&buf[30..32], &19100u16.to_le_bytes());
         assert_eq!(buf.len(), 22 + 4 * 10 + 4); // header + 4 members + 1 tombstone u32
     }
@@ -137,11 +162,19 @@ mod tests {
         assert_eq!(decode_config(&buf[..buf.len() - 1]), None, "truncated");
         let mut big = sample();
         big.voters = (0..9)
-            .map(|i| WireMember { id: i, ip: 0, port: 0 })
+            .map(|i| WireMember {
+                id: i,
+                ip: 0,
+                port: 0,
+            })
             .collect();
         let mut b2 = Vec::new();
         encode_config(&big, &mut b2);
-        assert_eq!(decode_config(&b2), None, "over MAX_MEMBERS refused at decode too");
+        assert_eq!(
+            decode_config(&b2),
+            None,
+            "over MAX_MEMBERS refused at decode too"
+        );
     }
 
     #[test]

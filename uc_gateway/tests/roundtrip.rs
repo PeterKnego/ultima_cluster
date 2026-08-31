@@ -17,9 +17,9 @@
 use std::time::Duration;
 
 use uc_gateway::{Edge, EdgeConfig, Member};
+use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 use uc_remote::{Consistency, RemoteClient, RemoteConfig};
 use uc_service::{ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
-use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
 mod common;
 
@@ -28,7 +28,9 @@ fn enc(c: &Cmd) -> Vec<u8> {
 }
 
 fn dec(b: &[u8]) -> CmdResp {
-    bincode::serde::decode_from_slice(b, bincode::config::standard()).unwrap().0
+    bincode::serde::decode_from_slice(b, bincode::config::standard())
+        .unwrap()
+        .0
 }
 
 /// `RegisterSm::Query` is the unit type (`Read` is the only question there is),
@@ -42,7 +44,10 @@ fn edge_config(dir: &std::path::Path, envelope: bool) -> EdgeConfig {
         instance_dir: dir.to_path_buf(),
         app_id: common::APP.into(),
         listen: "127.0.0.1:0".parse().unwrap(),
-        members: vec![Member { node_id: 0, gateway: "127.0.0.1:0".into() }],
+        members: vec![Member {
+            node_id: 0,
+            gateway: "127.0.0.1:0".into(),
+        }],
         session_envelope: envelope,
         ..EdgeConfig::defaults()
     }
@@ -77,18 +82,30 @@ fn write_cas_read_round_trip_through_the_edge() {
     assert!(!r.replayed, "a first-time seq is FRESH, never a replay");
     assert!(r.position > 0, "a committed write reports its log position");
 
-    let r = client.submit(&enc(&Cmd::Cas { old: 7, new: 8 })).unwrap().wait().unwrap();
+    let r = client
+        .submit(&enc(&Cmd::Cas { old: 7, new: 8 }))
+        .unwrap()
+        .wait()
+        .unwrap();
     assert_eq!(dec(&r.bytes), CmdResp::CasResult(true));
     assert!(!r.replayed);
 
     let q = read_query();
-    let r = client.query(&q, Consistency::Linearizable).unwrap().wait().unwrap();
+    let r = client
+        .query(&q, Consistency::Linearizable)
+        .unwrap()
+        .wait()
+        .unwrap();
     let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
         .unwrap()
         .0;
     assert_eq!(v, Some(8), "the linearizable read sees the CAS");
 
-    let r = client.query(&q, Consistency::Snapshot).unwrap().wait().unwrap();
+    let r = client
+        .query(&q, Consistency::Snapshot)
+        .unwrap()
+        .wait()
+        .unwrap();
     let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
         .unwrap()
         .0;
@@ -96,9 +113,16 @@ fn write_cas_read_round_trip_through_the_edge() {
 
     let s = edge.stats();
     assert_eq!((s.submits, s.queries), (2, 2), "stats: {s:?}");
-    assert_eq!(s.responses, 4, "every request ended in exactly one RESPONSE: {s:?}");
+    assert_eq!(
+        s.responses, 4,
+        "every request ended in exactly one RESPONSE: {s:?}"
+    );
     assert_eq!(s.connections, 1);
-    assert_eq!((s.redirects, s.retries, s.unknown), (0, 0, 0), "a healthy leader: {s:?}");
+    assert_eq!(
+        (s.redirects, s.retries, s.unknown),
+        (0, 0, 0),
+        "a healthy leader: {s:?}"
+    );
 
     client.shutdown();
     edge.stop();
@@ -122,22 +146,42 @@ fn raw_pass_through_round_trips_with_the_envelope_off() {
     let edge = Edge::start(edge_config(&dir, false)).unwrap();
     let client = RemoteClient::connect(remote_config(&edge)).unwrap();
 
-    let r = client.submit(&enc(&Cmd::Write(42))).unwrap().wait().unwrap();
+    let r = client
+        .submit(&enc(&Cmd::Write(42)))
+        .unwrap()
+        .wait()
+        .unwrap();
     assert_eq!(dec(&r.bytes), CmdResp::WriteAck);
     assert!(!r.replayed, "raw pass-through never sets FLAG_REPLAYED");
 
-    let r = client.submit(&enc(&Cmd::Cas { old: 1, new: 2 })).unwrap().wait().unwrap();
-    assert_eq!(dec(&r.bytes), CmdResp::CasResult(false), "CAS against the wrong old value fails");
+    let r = client
+        .submit(&enc(&Cmd::Cas { old: 1, new: 2 }))
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(
+        dec(&r.bytes),
+        CmdResp::CasResult(false),
+        "CAS against the wrong old value fails"
+    );
     assert!(!r.replayed);
 
-    let r = client.query(&read_query(), Consistency::Linearizable).unwrap().wait().unwrap();
+    let r = client
+        .query(&read_query(), Consistency::Linearizable)
+        .unwrap()
+        .wait()
+        .unwrap();
     let v: Option<u64> = bincode::serde::decode_from_slice(&r.bytes, bincode::config::standard())
         .unwrap()
         .0;
     assert_eq!(v, Some(42));
 
     let s = edge.stats();
-    assert_eq!((s.submits, s.queries, s.responses), (2, 1, 3), "stats: {s:?}");
+    assert_eq!(
+        (s.submits, s.queries, s.responses),
+        (2, 1, 3),
+        "stats: {s:?}"
+    );
 
     client.shutdown();
     edge.stop();
@@ -178,7 +222,10 @@ fn an_oversized_submit_is_refused_with_payload_too_large() {
     assert_eq!(dec(&r.bytes), CmdResp::WriteAck);
 
     let s = edge.stats();
-    assert_eq!(s.submits, 1, "the oversized frame never reached the ring: {s:?}");
+    assert_eq!(
+        s.submits, 1,
+        "the oversized frame never reached the ring: {s:?}"
+    );
     assert_eq!(s.retries, 1, "exactly one RETRY frame: {s:?}");
 
     client.shutdown();

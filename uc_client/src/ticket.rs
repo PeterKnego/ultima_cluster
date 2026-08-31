@@ -388,7 +388,10 @@ mod tests {
     #[test]
     fn decode_failure_surfaces_as_decode_error() {
         let (t, core) = ticket_pair::<String>();
-        core.resolve(Ok(Resolved::One { position: 0, bytes: Bytes::from_static(&[0xFF]) })); // truncated bincode varint
+        core.resolve(Ok(Resolved::One {
+            position: 0,
+            bytes: Bytes::from_static(&[0xFF]),
+        })); // truncated bincode varint
         assert!(matches!(t.wait(), Err(crate::ClientError::Decode(_))));
     }
 
@@ -439,22 +442,16 @@ mod tests {
         std::panic::set_hook(orig_hook);
 
         // Now assert on the captured result
-        assert!(
-            second_poll_result.is_err(),
-            "Expected panic on second poll"
-        );
+        assert!(second_poll_result.is_err(), "Expected panic on second poll");
 
         // Verify exact panic message by downcasting
         let payload = second_poll_result.unwrap_err();
-        let msg = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .unwrap_or_else(|| {
-                payload
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .expect("panic payload is a string")
-            });
+        let msg = payload.downcast_ref::<&str>().copied().unwrap_or_else(|| {
+            payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .expect("panic payload is a string")
+        });
         assert!(
             msg.contains("Ticket polled after completion"),
             "wrong panic message: {msg}"
@@ -482,7 +479,9 @@ mod tests {
         h.join().unwrap();
 
         // Should timeout
-        assert!(matches!(result, Err(crate::ClientError::Timeout(d)) if d == Duration::from_millis(100)));
+        assert!(
+            matches!(result, Err(crate::ClientError::Timeout(d)) if d == Duration::from_millis(100))
+        );
 
         // Elapsed must be within budget (under 1s, over 90ms)
         assert!(
@@ -519,17 +518,26 @@ mod tests {
         }));
         assert!(matches!(t.wait(), Err(ClientError::Decode(_))));
         let (t1, core1) = ticket_pair::<u64>();
-        core1.resolve(Ok(Resolved::Many { position: 96, parts: vec![] }));
+        core1.resolve(Ok(Resolved::Many {
+            position: 96,
+            parts: vec![],
+        }));
         assert!(matches!(t1.wait(), Err(ClientError::Decode(_))));
     }
 
     #[test]
     fn fan_in_ticket_error_resolution_surfaces_the_error() {
         let (t, core) = fan_in_ticket_pair::<u64>();
-        core.resolve(Err(ClientError::ServiceNotDeclared { id: 4, declared: 0b11 }));
+        core.resolve(Err(ClientError::ServiceNotDeclared {
+            id: 4,
+            declared: 0b11,
+        }));
         assert!(matches!(
             t.wait(),
-            Err(ClientError::ServiceNotDeclared { id: 4, declared: 0b11 })
+            Err(ClientError::ServiceNotDeclared {
+                id: 4,
+                declared: 0b11
+            })
         ));
     }
 }

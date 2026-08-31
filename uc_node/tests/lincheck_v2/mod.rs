@@ -132,8 +132,16 @@ fn crypto_b64_32(bytes: &[u8; 32]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -177,7 +185,10 @@ fn write_crypto_material(dir: &Path, ids: &[NodeId]) -> CryptoMaterial {
     }
     let allowlist_path = dir.join("crypto-allowlist");
     std::fs::write(&allowlist_path, text).unwrap();
-    CryptoMaterial { key_paths, allowlist_path }
+    CryptoMaterial {
+        key_paths,
+        allowlist_path,
+    }
 }
 
 /// M14c2: which FSM set every node declares. `Single` is byte-for-byte the
@@ -275,8 +286,11 @@ fn make_config(
     // contention with 4 real nodes live). Widen it here — spare-enabled
     // clusters only, so the other three (already-tuned, already-green)
     // capstones' timing is byte-for-byte unchanged.
-    let (timeout_min_ns, timeout_max_ns) =
-        if ccfg.spare_node { (900_000_000, 1_600_000_000) } else { (150_000_000, 300_000_000) };
+    let (timeout_min_ns, timeout_max_ns) = if ccfg.spare_node {
+        (900_000_000, 1_600_000_000)
+    } else {
+        (150_000_000, 300_000_000)
+    };
     NodeConfig {
         id,
         members,
@@ -328,12 +342,16 @@ fn spawn_service<SM: SnapshotStateMachine + Default>(
 ) -> uc_service::Service<SM> {
     let cfg = ServiceConfig::new(dir, APP).service_id(id);
     if snapshot_interval_bytes == 0 {
-        ServiceBuilder::new(cfg, SM::default()).start().expect("service start")
+        ServiceBuilder::new(cfg, SM::default())
+            .start()
+            .expect("service start")
     } else {
         // M6 Task 10: snapshot-capable service — builds on-disk snapshots on the
         // policy cadence so the node can advance its purge floor. Below-floor
         // reconstruction after a service crash then goes via snapshot install.
-        let cfg = cfg.snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
+        let cfg = cfg.snapshot_policy(SnapshotPolicy {
+            interval_bytes: snapshot_interval_bytes,
+        });
         ServiceBuilder::new(cfg, SM::default())
             .start_with_snapshots()
             .expect("snapshot service start")
@@ -373,7 +391,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> No
     }
     /// Serving iff a live node that both flags leader and passes the serving gate.
     fn is_serving_leader(&self) -> bool {
-        self.node.as_ref().is_some_and(|n| n.can_serve() && n.is_leader())
+        self.node
+            .as_ref()
+            .is_some_and(|n| n.can_serve() && n.is_leader())
     }
 }
 
@@ -433,7 +453,9 @@ pub struct LinClusterV2<
     crypto: Option<CryptoMaterial>,
 }
 
-impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> LinClusterV2<SM, SM1> {
+impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
+    LinClusterV2<SM, SM1>
+{
     /// Bring up an `n`-node cluster under `root` (a caller-owned tempdir): bind
     /// every socket first (so the full member map is known before any agent
     /// runs), start each node on its pre-bound socket, then attach one service
@@ -446,10 +468,14 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
     /// (M6 Task 10 purge-churn capstone). The posture is retained so every
     /// restart reuses it.
     pub fn start_cfg(root: &Path, n: usize, faults: FaultConfig, ccfg: ClusterCfg) -> Self {
-        let socks: Vec<UdpSocket> =
-            (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-        let members: Vec<(NodeId, SocketAddr)> =
-            socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+        let socks: Vec<UdpSocket> = (0..n)
+            .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+            .collect();
+        let members: Vec<(NodeId, SocketAddr)> = socks
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+            .collect();
 
         // M8 Task 15: provision crypto material up front (base members plus,
         // for a `spare_node` cluster, the whole spare id block) so every
@@ -538,7 +564,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                 key_path: m
                     .key_paths
                     .get(&id)
-                    .unwrap_or_else(|| panic!("no provisioned crypto key for id {id} — widen crypto_ids_for"))
+                    .unwrap_or_else(|| {
+                        panic!("no provisioned crypto key for id {id} — widen crypto_ids_for")
+                    })
                     .clone(),
                 allowlist_path: m.allowlist_path.clone(),
                 rotation: RotationPolicy::default(),
@@ -558,7 +586,10 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
     /// every liveness/linearizability bar; this is the check that catches
     /// that specific failure mode.
     pub fn crypto_epoch_of(&self, node: usize) -> Option<u16> {
-        self.nodes[node].node.as_ref().and_then(|n| n.crypto_epoch())
+        self.nodes[node]
+            .node
+            .as_ref()
+            .and_then(|n| n.crypto_epoch())
     }
 
     /// The fixed `(node-id → instance-dir)` map workers route over (index i = id
@@ -623,9 +654,13 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
     pub fn await_single_serving(&self, secs: u64) -> usize {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
-            let serving: Vec<usize> =
-                (0..self.nodes.len()).filter(|&i| self.nodes[i].is_serving_leader()).collect();
-            assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+            let serving: Vec<usize> = (0..self.nodes.len())
+                .filter(|&i| self.nodes[i].is_serving_leader())
+                .collect();
+            assert!(
+                serving.len() <= 1,
+                "split-brain: nodes {serving:?} all serve"
+            );
             if serving.len() == 1 {
                 return serving[0];
             }
@@ -640,7 +675,10 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
             if serving.is_empty() && self.spare_is_serving() {
                 return self.nodes.len();
             }
-            assert!(Instant::now() < deadline, "no single serving leader within {secs}s");
+            assert!(
+                Instant::now() < deadline,
+                "no single serving leader within {secs}s"
+            );
             std::thread::yield_now();
         }
     }
@@ -657,8 +695,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
     pub fn await_reconverged(&self, secs: u64) -> usize {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
-            let serving: Vec<usize> =
-                (0..self.nodes.len()).filter(|&i| self.nodes[i].is_serving_leader()).collect();
+            let serving: Vec<usize> = (0..self.nodes.len())
+                .filter(|&i| self.nodes[i].is_serving_leader())
+                .collect();
             if serving.len() == 1 {
                 return serving[0];
             }
@@ -667,7 +706,10 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
             if serving.is_empty() && self.spare_is_serving() {
                 return self.nodes.len();
             }
-            assert!(Instant::now() < deadline, "cluster did not reconverge to one leader within {secs}s");
+            assert!(
+                Instant::now() < deadline,
+                "cluster did not reconverge to one leader within {secs}s"
+            );
             std::thread::yield_now();
         }
     }
@@ -680,7 +722,10 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
             let serving: Vec<usize> = (0..self.nodes.len())
                 .filter(|&i| i != exclude && self.nodes[i].is_serving_leader())
                 .collect();
-            assert!(serving.len() <= 1, "split-brain among survivors: {serving:?}");
+            assert!(
+                serving.len() <= 1,
+                "split-brain among survivors: {serving:?}"
+            );
             if serving.len() == 1 {
                 return serving[0];
             }
@@ -689,7 +734,10 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
             if serving.is_empty() && self.spare_is_serving() {
                 return self.nodes.len();
             }
-            assert!(Instant::now() < deadline, "no survivor leader within {secs}s");
+            assert!(
+                Instant::now() < deadline,
+                "no survivor leader within {secs}s"
+            );
             std::thread::yield_now();
         }
     }
@@ -723,7 +771,15 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
         // durable state, rejoins in the current term.
         let sock = rebind(addr);
         let crypto = self.crypto_config_for(id);
-        let cfg = make_config(id, self.members.clone(), dir.clone(), addr, self.faults, self.ccfg, crypto);
+        let cfg = make_config(
+            id,
+            self.members.clone(),
+            dir.clone(),
+            addr,
+            self.faults,
+            self.ccfg,
+            crypto,
+        );
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
         let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
@@ -753,12 +809,18 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
     pub fn supervise_services(&mut self) -> usize {
         let mut respawned = 0;
         for i in 0..self.nodes.len() {
-            let dead = self.nodes[i].service.as_ref().is_some_and(|s| !s.is_alive());
+            let dead = self.nodes[i]
+                .service
+                .as_ref()
+                .is_some_and(|s| !s.is_alive());
             // M14c2: FSM 1 is supervised the same way, INDEPENDENTLY — a
             // healthy sibling is never torn down for the other's death.
             // Always `false` under `FsmSet::Single` (`service1` is `None`), so
             // this loop's behaviour there is unchanged.
-            let dead1 = self.nodes[i].service1.as_ref().is_some_and(|s| !s.is_alive());
+            let dead1 = self.nodes[i]
+                .service1
+                .as_ref()
+                .is_some_and(|s| !s.is_alive());
             if !dead && !dead1 {
                 continue;
             }
@@ -775,8 +837,11 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                 if let Some(s1) = self.nodes[i].service1.take() {
                     s1.crash();
                 }
-                self.nodes[i].service1 =
-                    Some(spawn_service::<SM1>(&dir, self.ccfg.snapshot_interval_bytes, 1));
+                self.nodes[i].service1 = Some(spawn_service::<SM1>(
+                    &dir,
+                    self.ccfg.snapshot_interval_bytes,
+                    1,
+                ));
                 respawned += 1;
             }
         }
@@ -870,7 +935,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
 
     /// Three-way split — no side has a majority (total quorum loss).
     pub fn partition_quorum_loss(&self) {
-        let live: Vec<usize> = (0..self.nodes.len()).filter(|&i| self.nodes[i].is_live()).collect();
+        let live: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].is_live())
+            .collect();
         for a in 0..live.len() {
             for b in (a + 1)..live.len() {
                 self.cut(live[a], live[b]);
@@ -942,13 +1009,23 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
         let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
         let seq = old_seq + 1;
         let nonce = rand::random::<u64>();
-        cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce,
+            op,
+            id,
+            ip,
+            port,
+        });
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
             if let Some(resp) = cnc.read_admin_resp(seq) {
                 return resp;
             }
-            assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+            assert!(
+                Instant::now() < deadline,
+                "admin response timed out for seq {seq}"
+            );
             std::thread::yield_now();
         }
     }
@@ -975,7 +1052,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
     /// cluster with nowhere to put the spare is a harness bug, not a runtime
     /// condition to tolerate.
     pub fn random_config_op(&mut self, rng: &mut StdRng) -> bool {
-        let spare_addr = self.spare_addr.expect("random_config_op requires ClusterCfg::spare_node");
+        let spare_addr = self
+            .spare_addr
+            .expect("random_config_op requires ClusterCfg::spare_node");
         let spare_root = self.spare_root.clone().unwrap();
 
         // Light jitter: don't fire on every eligible tick, spreading this
@@ -993,9 +1072,12 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
         // a stall).
         let leader_dir = match self.leader() {
             Some(li) => self.nodes[li].instance_dir.clone(),
-            None if self.spare_is_serving() => {
-                self.spare.as_ref().expect("spare_is_serving implies a live spare").instance_dir.clone()
-            }
+            None if self.spare_is_serving() => self
+                .spare
+                .as_ref()
+                .expect("spare_is_serving implies a live spare")
+                .instance_dir
+                .clone(),
             None => return false,
         };
         let leader_cnc = Self::open_cnc(&leader_dir);
@@ -1039,7 +1121,8 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                     service1,
                 });
                 let (ip, port) = Self::addr_to_wire(spare_addr);
-                let resp = Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
+                let resp =
+                    Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
                 if resp.status == 0 {
                     self.spare_phase = SparePhase::Added;
                     self.config_ops_accepted += 1;
@@ -1048,7 +1131,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                     // Transient (Retry/ChangePending) or a genuine structural
                     // refusal racing a concurrent fault — abandon this id
                     // (fresh-forever anyway) and let the next call try again.
-                    eprintln!("[random_config_op] add-learner {id} not accepted: {resp:?} — retrying later");
+                    eprintln!(
+                        "[random_config_op] add-learner {id} not accepted: {resp:?} — retrying later"
+                    );
                     if let Some(mut slot) = self.spare.take() {
                         if let Some(n) = slot.node.take() {
                             n.stop();
@@ -1065,7 +1150,8 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
             }
             SparePhase::Added => {
                 let id = self.spare.as_ref().expect("spare live while Added").id;
-                let resp = Self::admin_request(&leader_cnc, 2 /* PromoteLearner */, id, 0, 0, 10);
+                let resp =
+                    Self::admin_request(&leader_cnc, 2 /* PromoteLearner */, id, 0, 0, 10);
                 match resp.status {
                     0 => {
                         self.spare_phase = SparePhase::Promoted;
@@ -1077,7 +1163,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                     1 if matches!(resp.reason, 3 | 10) => false,
                     2 => false,
                     _ => {
-                        eprintln!("[random_config_op] promote {id} unexpected refusal: {resp:?} — abandoning cycle");
+                        eprintln!(
+                            "[random_config_op] promote {id} unexpected refusal: {resp:?} — abandoning cycle"
+                        );
                         self.abandon_spare();
                         false
                     }
@@ -1095,7 +1183,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                     1 if resp.reason == 3 => false,
                     2 => false,
                     _ => {
-                        eprintln!("[random_config_op] demote {id} unexpected refusal: {resp:?} — abandoning cycle");
+                        eprintln!(
+                            "[random_config_op] demote {id} unexpected refusal: {resp:?} — abandoning cycle"
+                        );
                         self.abandon_spare();
                         false
                     }
@@ -1103,7 +1193,8 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
             }
             SparePhase::Demoted => {
                 let id = self.spare.as_ref().expect("spare live while Demoted").id;
-                let resp = Self::admin_request(&leader_cnc, 4 /* RemoveLearner */, id, 0, 0, 10);
+                let resp =
+                    Self::admin_request(&leader_cnc, 4 /* RemoveLearner */, id, 0, 0, 10);
                 match resp.status {
                     0 => {
                         // Tombstoned now (forever) — no reason to keep the
@@ -1117,7 +1208,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> Li
                     1 if resp.reason == 3 => false,
                     2 => false,
                     _ => {
-                        eprintln!("[random_config_op] remove-learner {id} unexpected refusal: {resp:?} — abandoning cycle");
+                        eprintln!(
+                            "[random_config_op] remove-learner {id} unexpected refusal: {resp:?} — abandoning cycle"
+                        );
                         self.abandon_spare();
                         false
                     }
@@ -1398,7 +1491,11 @@ impl WorkerConn {
         // (e.g., 4 workers on a 3-node cluster). This mirrors the invariant enforced
         // by `reconnect_to` and `rotate`.
         let target = start % dirs.len();
-        Self { dirs, target, client: None }
+        Self {
+            dirs,
+            target,
+            client: None,
+        }
     }
     /// Ensure a client attached to `self.target`; `None` if the attach failed
     /// (node mid-restart / partitioned) — the caller rotates and retries.
@@ -1627,7 +1724,8 @@ pub fn read_leader_on<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
                 }
             },
             Err(ClientError::Retry) => std::thread::sleep(Duration::from_millis(15)),
-            Err(ClientError::InstanceRestart { .. }) | Err(ClientError::Cnc(_))
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
             | Err(ClientError::Ring(_)) => {
                 conn.drop_client();
                 std::thread::sleep(Duration::from_millis(20));
@@ -1699,17 +1797,20 @@ fn worker(
                 };
                 let new = rng.random_range(1..1000u64);
                 let inv = history.invoke();
-                let outcome = match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Cas { old, new }, deadline) {
-                    SubmitOutcome::Ok(CmdResp::CasResult(b)) => {
-                        if b {
-                            last_seen.store(new, Ordering::Relaxed);
+                let outcome =
+                    match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Cas { old, new }, deadline) {
+                        SubmitOutcome::Ok(CmdResp::CasResult(b)) => {
+                            if b {
+                                last_seen.store(new, Ordering::Relaxed);
+                            }
+                            Outcome::Ok(RegResp::CasOk(b))
                         }
-                        Outcome::Ok(RegResp::CasOk(b))
-                    }
-                    SubmitOutcome::Ok(other) => panic!("cas returned non-cas response: {other:?}"),
-                    SubmitOutcome::Indeterminate => Outcome::Indeterminate,
-                    SubmitOutcome::Fatal(e) => panic!("fatal cas: {e}"),
-                };
+                        SubmitOutcome::Ok(other) => {
+                            panic!("cas returned non-cas response: {other:?}")
+                        }
+                        SubmitOutcome::Indeterminate => Outcome::Indeterminate,
+                        SubmitOutcome::Fatal(e) => panic!("fatal cas: {e}"),
+                    };
                 history.record(id, Op::Cas { old, new }, inv, outcome);
             }
         }
@@ -1731,8 +1832,12 @@ pub fn spawn_workers(
     (0..n_workers)
         .map(|w| {
             let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (dirs, history, stop, last_seen) =
-                (Arc::clone(dirs), Arc::clone(history), Arc::clone(stop), Arc::clone(last_seen));
+            let (dirs, history, stop, last_seen) = (
+                Arc::clone(dirs),
+                Arc::clone(history),
+                Arc::clone(stop),
+                Arc::clone(last_seen),
+            );
             std::thread::spawn(move || worker(w, dirs, history, stop, rng, last_seen, throttle))
         })
         .collect()
@@ -1810,11 +1915,12 @@ fn worker2(
                     h0.record(id, Op::Read, inv, outcome);
                 } else {
                     let inv = h1.invoke();
-                    let outcome = match read_leader_on::<(), Option<u64>>(&mut conn, 1, &(), deadline) {
-                        ReadOutcome::Ok(v) => Outcome::Ok(RegResp::Value(v)),
-                        ReadOutcome::Indeterminate => Outcome::Indeterminate,
-                        ReadOutcome::Fatal(e) => panic!("fatal read (fsm1): {e}"),
-                    };
+                    let outcome =
+                        match read_leader_on::<(), Option<u64>>(&mut conn, 1, &(), deadline) {
+                            ReadOutcome::Ok(v) => Outcome::Ok(RegResp::Value(v)),
+                            ReadOutcome::Indeterminate => Outcome::Indeterminate,
+                            ReadOutcome::Fatal(e) => panic!("fatal read (fsm1): {e}"),
+                        };
                     h1.record(id, Op::Read, inv, outcome);
                 }
             }
@@ -1842,7 +1948,12 @@ fn worker2(
                                     if *ok {
                                         last_seen.store(new, Ordering::Relaxed);
                                     }
-                                    h0.record(id, op.clone(), inv0, Outcome::Ok(RegResp::CasOk(*ok)));
+                                    h0.record(
+                                        id,
+                                        op.clone(),
+                                        inv0,
+                                        Outcome::Ok(RegResp::CasOk(*ok)),
+                                    );
                                     h1.record(id, op, inv1, Outcome::Ok(RegResp::CasOk(*ok)));
                                 }
                                 other => panic!("cas returned non-cas response: {other:?}"),
@@ -1887,7 +1998,17 @@ pub fn spawn_workers2(
                 Arc::clone(last_seen),
             );
             std::thread::spawn(move || {
-                worker2(w, dirs, h0, h1, equiv_failures, stop, rng, last_seen, throttle)
+                worker2(
+                    w,
+                    dirs,
+                    h0,
+                    h1,
+                    equiv_failures,
+                    stop,
+                    rng,
+                    last_seen,
+                    throttle,
+                )
             })
         })
         .collect()
@@ -1996,8 +2117,11 @@ impl CommittedTruncationWitness {
         const SAMPLE: Duration = Duration::from_millis(20);
         let stop = Arc::new(AtomicBool::new(false));
         let hit = Arc::new(Mutex::new(None));
-        let pages: Vec<Arc<CncPage>> =
-            dirs.iter().map(|d| Self::open_page(d)).collect::<Option<_>>().unwrap_or_default();
+        let pages: Vec<Arc<CncPage>> = dirs
+            .iter()
+            .map(|d| Self::open_page(d))
+            .collect::<Option<_>>()
+            .unwrap_or_default();
         let (t_stop, t_hit) = (Arc::clone(&stop), Arc::clone(&hit));
         let handle = std::thread::spawn(move || {
             // The furthest position ANY node has ever called committed.
@@ -2012,8 +2136,10 @@ impl CommittedTruncationWitness {
                 for page in &pages {
                     frontier = frontier.max(page.counters().commit.load_acquire());
                 }
-                let durables: Vec<u64> =
-                    pages.iter().map(|p| p.counters().durable.load_acquire()).collect();
+                let durables: Vec<u64> = pages
+                    .iter()
+                    .map(|p| p.counters().durable.load_acquire())
+                    .collect();
                 // `append` is what a node HOLDS; `durable` only what it has
                 // RECORDED. A prime moves `durable` back without the bytes
                 // going anywhere, so a receded recorded-frontier is not by
@@ -2022,8 +2148,10 @@ impl CommittedTruncationWitness {
                 // Sampled here so the report can say which it was; 2026-08-04,
                 // a firing whose history elle ruled VALID could not be
                 // classified from the message because only `durable` was in it.
-                let appends: Vec<u64> =
-                    pages.iter().map(|p| p.counters().append.load_acquire()).collect();
+                let appends: Vec<u64> = pages
+                    .iter()
+                    .map(|p| p.counters().append.load_acquire())
+                    .collect();
                 let orphaned = !durables.is_empty() && durables.iter().all(|&d| d < frontier);
                 streak = if orphaned { streak + 1 } else { 0 };
                 if streak >= Self::CONFIRM {
@@ -2069,7 +2197,11 @@ impl CommittedTruncationWitness {
                 std::thread::sleep(SAMPLE);
             }
         });
-        Self { stop, hit, handle: Some(handle) }
+        Self {
+            stop,
+            hit,
+            handle: Some(handle),
+        }
     }
 
     /// The witness, if it has fired at any point since `start` (sticky).

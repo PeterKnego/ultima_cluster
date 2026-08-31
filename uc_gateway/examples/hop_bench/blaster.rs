@@ -24,11 +24,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uc_remote::conn::FramedConn;
 use uc_remote::frame::{
-    encode_frame, FrameType, Hello, HelloOk, HelloRefused, Header, ResponseMeta, Status,
-    PROTOCOL_VERSION,
+    FrameType, Header, Hello, HelloOk, HelloRefused, PROTOCOL_VERSION, ResponseMeta, Status,
+    encode_frame,
 };
 
-use crate::stats::{SendClock, StreamStats, DRAIN_GRACE};
+use crate::stats::{DRAIN_GRACE, SendClock, StreamStats};
 
 /// Budget for the edge's HELLO_OK.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -100,7 +100,9 @@ pub fn run(a: Args) -> anyhow::Result<()> {
 
     let mut merged = StreamStats::new();
     for (i, h) in handles.into_iter().enumerate() {
-        let s = h.join().map_err(|_| anyhow::anyhow!("blaster conn {i} panicked"))??;
+        let s = h
+            .join()
+            .map_err(|_| anyhow::anyhow!("blaster conn {i} panicked"))??;
         println!(
             "   conn {i}: sends={} responses={} lost={} responses/s={:.1}",
             s.sends,
@@ -159,12 +161,18 @@ fn run_conn(
     };
     let credits = match h.ty {
         FrameType::HelloOk => {
-            HelloOk::decode(&reply).map_err(|e| anyhow::anyhow!("conn {idx}: HELLO_OK: {e}"))?.credits
+            HelloOk::decode(&reply)
+                .map_err(|e| anyhow::anyhow!("conn {idx}: HELLO_OK: {e}"))?
+                .credits
         }
         FrameType::HelloRefused => {
             let r = HelloRefused::decode(&reply)
                 .map_err(|e| anyhow::anyhow!("conn {idx}: HELLO_REFUSED: {e}"))?;
-            anyhow::bail!("conn {idx}: HELLO refused (reason {}): {}", r.reason, r.detail);
+            anyhow::bail!(
+                "conn {idx}: HELLO refused (reason {}): {}",
+                r.reason,
+                r.detail
+            );
         }
         other => anyhow::bail!("conn {idx}: unexpected {other:?} in answer to HELLO"),
     };
@@ -208,7 +216,11 @@ fn run_conn(
         // the latency measured is the one the caller actually waits.
         let pending_resends: Vec<u64> = {
             let mut q = state.resend.lock().expect("resend queue");
-            if q.is_empty() { Vec::new() } else { std::mem::take(&mut *q) }
+            if q.is_empty() {
+                Vec::new()
+            } else {
+                std::mem::take(&mut *q)
+            }
         };
         for seq in pending_resends {
             clock.stamp(seq);
@@ -258,7 +270,9 @@ fn run_conn(
 
     // Wake the reader out of its blocking read, then take its tally.
     conn.shutdown();
-    let mut s = reader.join().map_err(|_| anyhow::anyhow!("conn {idx}: reader panicked"))?;
+    let mut s = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("conn {idx}: reader panicked"))?;
     s.sends = sends;
     s.lost = lost;
     s.send_window_end_ns = send_window_end_ns;
@@ -288,7 +302,9 @@ fn reader_loop(mut fc: FramedConn, state: Arc<ConnState>, clock: Arc<SendClock>)
 fn handle(s: &mut StreamStats, state: &ConnState, clock: &SendClock, h: Header, payload: &[u8]) {
     match h.ty {
         FrameType::Response => {
-            let Ok(meta) = ResponseMeta::decode(payload) else { return };
+            let Ok(meta) = ResponseMeta::decode(payload) else {
+                return;
+            };
             state.credits.store(meta.credits, Ordering::Relaxed);
             state.acked_seq.fetch_max(meta.acked_seq, Ordering::Relaxed);
             state.completed.fetch_add(1, Ordering::Relaxed);
@@ -298,7 +314,9 @@ fn handle(s: &mut StreamStats, state: &ConnState, clock: &SendClock, h: Header, 
             s.last_response_ns = s.last_response_ns.max(now);
         }
         FrameType::Status => {
-            let Ok(st) = Status::decode(payload) else { return };
+            let Ok(st) = Status::decode(payload) else {
+                return;
+            };
             state.credits.store(st.credits, Ordering::Relaxed);
             state.acked_seq.fetch_max(st.acked_seq, Ordering::Relaxed);
         }

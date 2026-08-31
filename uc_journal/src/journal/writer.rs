@@ -589,7 +589,10 @@ fn write_batch(
                     // never per commit, matching the investigation's "at
                     // most one extra fdatasync per segment roll" cost
                     // accounting.
-                    sealed.fsync_handle()?.sync_data().map_err(JournalError::Io)?;
+                    sealed
+                        .fsync_handle()?
+                        .sync_data()
+                        .map_err(JournalError::Io)?;
                     #[cfg(test)]
                     {
                         let p = sealed.path().to_path_buf();
@@ -632,10 +635,7 @@ fn write_batch(
 
 /// Write all accumulated records to the active segment with a single
 /// coalesced `write_all`, then clear the run. No-op on an empty run.
-fn flush_run(
-    st: &mut WriterState,
-    run: &mut Vec<(u64, u64, &[u8])>,
-) -> Result<(), JournalError> {
+fn flush_run(st: &mut WriterState, run: &mut Vec<(u64, u64, &[u8])>) -> Result<(), JournalError> {
     if run.is_empty() {
         return Ok(());
     }

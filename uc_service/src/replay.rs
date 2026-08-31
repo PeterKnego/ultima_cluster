@@ -17,9 +17,9 @@
 
 use std::sync::Mutex;
 
+use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
-use uc_journal::TailReader;
 
 use crate::apply::SnapshotRestore;
 use crate::config::ServiceError;
@@ -130,7 +130,10 @@ pub(crate) fn replay_into<S: RawStateMachine>(
             // can advance while we replay, so a later block may legitimately be
             // (partly) applicable that an earlier snapshot would have gated.
             let counters = cnc.counters();
-            let target = counters.commit.load_acquire().min(counters.durable.load_acquire());
+            let target = counters
+                .commit
+                .load_acquire()
+                .min(counters.durable.load_acquire());
 
             let mut off = 0usize;
             while off + HEADER_LEN <= payload.len() {

@@ -48,8 +48,8 @@ fn config_for(addr: SocketAddr, instance_dir: PathBuf) -> NodeConfig {
 fn single_node(instance_dir: &Path) -> (Node, SocketAddr) {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
     let addr = sock.local_addr().unwrap();
-    let node = Node::start_with_socket(config_for(addr, instance_dir.to_path_buf()), sock)
-        .expect("start");
+    let node =
+        Node::start_with_socket(config_for(addr, instance_dir.to_path_buf()), sock).expect("start");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !node.can_serve() {
         assert!(Instant::now() < deadline, "sole voter never became leader");
@@ -115,8 +115,8 @@ fn stop_draining_leaves_durable_caught_up_with_append() {
     }
 
     // The node is stopped, so its archive is dropped and the journal is quiet.
-    let arch = Archive::open(ArchiveConfig::new(instance_dir.join("journal")))
-        .expect("reopen journal");
+    let arch =
+        Archive::open(ArchiveConfig::new(instance_dir.join("journal"))).expect("reopen journal");
     let recorded = arch.recovered_position();
     assert!(
         recorded >= append_before,
@@ -186,7 +186,10 @@ fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
     let deadline = Instant::now() + Duration::from_secs(10);
     for (name, flag) in &obs.agents {
         while !flag.load(std::sync::atomic::Ordering::Acquire) {
-            assert!(Instant::now() < deadline, "agent {name} never reported finished after stop");
+            assert!(
+                Instant::now() < deadline,
+                "agent {name} never reported finished after stop"
+            );
             std::thread::yield_now();
         }
     }
@@ -261,8 +264,14 @@ fn daemon_starts_from_a_config_file_and_stops_cleanly_on_sigterm() {
     let status = child.wait().unwrap();
     let elapsed = start.elapsed();
 
-    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
-    assert!(elapsed < Duration::from_secs(1), "SIGTERM to exit took {elapsed:?}, bar is < 1s");
+    assert!(
+        status.success(),
+        "clean shutdown must exit 0, got {status:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "SIGTERM to exit took {elapsed:?}, bar is < 1s"
+    );
 }
 
 #[test]
@@ -279,12 +288,20 @@ fn daemon_refuses_a_config_with_a_bind_mismatch() {
         .unwrap();
     assert!(!out.status.success(), "must refuse to start");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("bind"), "refusal must name the field, got: {err}");
+    assert!(
+        err.contains("bind"),
+        "refusal must name the field, got: {err}"
+    );
     // Exit 2 specifically means "this config is bad and will be bad next time".
     // packaging/systemd/uc2-node.service keys RestartPreventExitStatus on it, so
     // the code is a contract with the shipped unit, not an implementation
     // detail: drifting it to 1 turns a loud refusal back into a restart loop.
-    assert_eq!(out.status.code(), Some(2), "a config refusal must exit 2, got {:?}", out.status);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a config refusal must exit 2, got {:?}",
+        out.status
+    );
 }
 
 /// A RAM-backed instance_dir is refused by default, and the override starts the
@@ -334,9 +351,15 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
         .arg(write_cfg(""))
         .output()
         .unwrap();
-    assert!(!out.status.success(), "a RAM-backed instance_dir must be refused by default");
+    assert!(
+        !out.status.success(),
+        "a RAM-backed instance_dir must be refused by default"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("RAM-backed"), "refusal must say why, got: {err}");
+    assert!(
+        err.contains("RAM-backed"),
+        "refusal must say why, got: {err}"
+    );
 
     // Overridden: it starts, so SIGTERM it — but it must have warned first.
     let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
@@ -349,7 +372,10 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let out = child.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "the override must let the node start and stop cleanly");
+    assert!(
+        out.status.success(),
+        "the override must let the node start and stop cleanly"
+    );
     assert!(
         err.contains("WARNING") && err.contains("OVERRIDDEN"),
         "the override must never be silent, got stderr: {err}"
@@ -436,7 +462,11 @@ bind = "127.0.0.1:19605"
 /// time). The race window between drop and the daemon's own bind is
 /// accepted in-suite, matching the brief.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").expect("bind ephemeral").local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral")
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 /// A minimal blocking HTTP/1.1 GET: write the request line, half-close the
@@ -521,7 +551,13 @@ fn spawn_daemon_capturing_stdout(cfg: &Path) -> (std::process::Child, Arc<Mutex<
 
 fn wait_for_line(lines: &Mutex<Vec<String>>, needle: &str, deadline: Instant) -> Option<String> {
     loop {
-        if let Some(found) = lines.lock().unwrap().iter().find(|l| l.contains(needle)).cloned() {
+        if let Some(found) = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.contains(needle))
+            .cloned()
+        {
             return Some(found);
         }
         if Instant::now() >= deadline {
@@ -550,7 +586,10 @@ fn the_daemon_serves_metrics_when_configured_and_stops_cleanly() {
 
     let (status, body) = http_get(metrics_addr, "/metrics");
     assert_eq!(status, 200, "GET /metrics status, body: {body}");
-    assert!(body.contains("uc2_commit_bytes"), "metrics body missing uc2_commit_bytes: {body}");
+    assert!(
+        body.contains("uc2_commit_bytes"),
+        "metrics body missing uc2_commit_bytes: {body}"
+    );
 
     let (status, _) = http_get(metrics_addr, "/healthz");
     assert_eq!(status, 200, "GET /healthz status");
@@ -559,8 +598,14 @@ fn the_daemon_serves_metrics_when_configured_and_stops_cleanly() {
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = child.wait().unwrap();
     let elapsed = start.elapsed();
-    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
-    assert!(elapsed < Duration::from_secs(6), "SIGTERM to exit took {elapsed:?}, over the drain budget");
+    assert!(
+        status.success(),
+        "clean shutdown must exit 0, got {status:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "SIGTERM to exit took {elapsed:?}, over the drain budget"
+    );
 
     assert!(
         TcpStream::connect(metrics_addr).is_err(),
@@ -600,14 +645,23 @@ fn the_daemon_publishes_free_disk_bytes() {
         {
             break v;
         }
-        assert!(Instant::now() < deadline, "uc2_free_disk_bytes never appeared in a scrape");
+        assert!(
+            Instant::now() < deadline,
+            "uc2_free_disk_bytes never appeared in a scrape"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
-    assert!(value > 0, "uc2_free_disk_bytes must be a plausible >0 reading, got {value}");
+    assert!(
+        value > 0,
+        "uc2_free_disk_bytes must be a plausible >0 reading, got {value}"
+    );
 
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = child.wait().unwrap();
-    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+    assert!(
+        status.success(),
+        "clean shutdown must exit 0, got {status:?}"
+    );
 }
 
 #[test]
@@ -620,11 +674,16 @@ fn the_daemon_without_a_metrics_section_opens_no_port() {
 
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = child.wait().unwrap();
-    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+    assert!(
+        status.success(),
+        "clean shutdown must exit 0, got {status:?}"
+    );
 
     let captured = lines.lock().unwrap();
     assert!(
-        !captured.iter().any(|l| l.contains("observability endpoint")),
+        !captured
+            .iter()
+            .any(|l| l.contains("observability endpoint")),
         "no [metrics] section must mean no observability banner, got: {captured:?}"
     );
 }

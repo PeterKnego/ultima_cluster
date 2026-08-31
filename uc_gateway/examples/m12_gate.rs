@@ -80,7 +80,10 @@ use uc_client::{Engine, EngineConfig, Outcome, SubmitError};
 use uc_gateway::{Edge, EdgeConfig, Member};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, ServicesConfig};
-use uc_remote::{RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf, SubmitError as RemoteSubmitError};
+use uc_remote::{
+    RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf, RemoteSendHalf,
+    SubmitError as RemoteSubmitError,
+};
 use uc_service::{
     RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig,
     Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine, TAG_FRESH,
@@ -504,7 +507,10 @@ impl SnapshotStateMachine for CountSm {
         let mut buf = Vec::new();
         src.read_to_end(&mut buf)?;
         if buf.len() < 16 {
-            return Err(SnapshotError::Codec(format!("short snapshot: {} bytes", buf.len())));
+            return Err(SnapshotError::Codec(format!(
+                "short snapshot: {} bytes",
+                buf.len()
+            )));
         }
         let count = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -531,7 +537,10 @@ struct SpinCountSm {
 
 impl SpinCountSm {
     fn with_spin(spin: u64) -> Self {
-        Self { inner: CountSm::default(), spin }
+        Self {
+            inner: CountSm::default(),
+            spin,
+        }
     }
 }
 
@@ -726,10 +735,20 @@ fn boot_cluster2(
     app_id: &str,
     n: usize,
     spin: u64,
-) -> (Vec<Node>, Vec<Service<CountSm>>, Vec<Service<SpinCountSm>>, Vec<PathBuf>) {
-    let socks: Vec<UdpSocket> = (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(u32, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+) -> (
+    Vec<Node>,
+    Vec<Service<CountSm>>,
+    Vec<Service<SpinCountSm>>,
+    Vec<PathBuf>,
+) {
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(u32, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
     let services = ServicesConfig::from_ids(&[0, 1], None).expect("ids 0,1");
     let (mut nodes, mut s0, mut s1, mut dirs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (i, sock) in socks.into_iter().enumerate() {
@@ -737,26 +756,54 @@ fn boot_cluster2(
         let instance_dir = root.join(format!("n{i}"));
         std::fs::create_dir_all(&instance_dir).expect("instance dir");
         let cfg = node_config(
-            i as u32, members.clone(), addr, instance_dir.clone(), app_id,
-            NODE_BUFFER_BYTES, DEFAULT_ADMISSION_BYTES, services,
-            uc_node::PurgePolicy::Disabled, uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            i as u32,
+            members.clone(),
+            addr,
+            instance_dir.clone(),
+            app_id,
+            NODE_BUFFER_BYTES,
+            DEFAULT_ADMISSION_BYTES,
+            services,
+            uc_node::PurgePolicy::Disabled,
+            uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let a = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id).service_id(0), CountSm::default())
-            .start().expect("service 0");
-        let b = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id).service_id(1), SpinCountSm::with_spin(spin))
-            .start().expect("service 1");
-        nodes.push(node); s0.push(a); s1.push(b); dirs.push(instance_dir);
+        let a = ServiceBuilder::new(
+            ServiceConfig::new(&instance_dir, app_id).service_id(0),
+            CountSm::default(),
+        )
+        .start()
+        .expect("service 0");
+        let b = ServiceBuilder::new(
+            ServiceConfig::new(&instance_dir, app_id).service_id(1),
+            SpinCountSm::with_spin(spin),
+        )
+        .start()
+        .expect("service 1");
+        nodes.push(node);
+        s0.push(a);
+        s1.push(b);
+        dirs.push(instance_dir);
     }
     (nodes, s0, s1, dirs)
 }
 
-fn run_fsms_arm(root: &std::path::Path, secs: u64, payload: usize, inflight: u64) -> anyhow::Result<()> {
+fn run_fsms_arm(
+    root: &std::path::Path,
+    secs: u64,
+    payload: usize,
+    inflight: u64,
+) -> anyhow::Result<()> {
     const APP_ID: &str = "uc2-m12-gate-fsms";
     let (nodes, s0, s1, dirs) = boot_cluster2(root, APP_ID, 3, 2_000);
     let leader = await_single_leader(&nodes, 30);
     println!("[fsms] leader elected: n{leader}");
-    let opts = MeasureOpts { fan_in: true, warmup_secs: 1, measure_secs: secs.saturating_sub(2), timeline: false };
+    let opts = MeasureOpts {
+        fan_in: true,
+        warmup_secs: 1,
+        measure_secs: secs.saturating_sub(2),
+        timeline: false,
+    };
     let stats = run_client_measurement(&dirs[leader], APP_ID, secs, payload, inflight, None, &opts);
     print_report("fsms (fan-in, 2 FSMs)", &stats);
     print_result_json("fsms", &stats, secs, payload, inflight);
@@ -769,9 +816,15 @@ fn run_fsms_arm(root: &std::path::Path, secs: u64, payload: usize, inflight: u64
         expect_min: None,
         settle_secs: 10,
     })?;
-    for n in nodes { n.stop(); }
-    for s in s0 { s.stop(); }
-    for s in s1 { s.stop(); }
+    for n in nodes {
+        n.stop();
+    }
+    for s in s0 {
+        s.stop();
+    }
+    for s in s1 {
+        s.stop();
+    }
     Ok(())
 }
 
@@ -1064,9 +1117,7 @@ fn run_client_measurement(
                     let n = poll.poll(|c| {
                         match c.outcome {
                             Outcome::Response(body) => {
-                                if session_client_id.is_some()
-                                    && body.first() != Some(&TAG_FRESH)
-                                {
+                                if session_client_id.is_some() && body.first() != Some(&TAG_FRESH) {
                                     not_fresh.fetch_add(1, Ordering::Relaxed);
                                 }
                                 record(c.user_data);
@@ -1074,9 +1125,9 @@ fn run_client_measurement(
                             Outcome::Responses(parts) => {
                                 if fan_in {
                                     if session_client_id.is_some()
-                                        && !parts.iter().all(|(_, body)| {
-                                            body.first() == Some(&TAG_FRESH)
-                                        })
+                                        && !parts
+                                            .iter()
+                                            .all(|(_, body)| body.first() == Some(&TAG_FRESH))
                                     {
                                         not_fresh.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -1666,7 +1717,7 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         if now != last {
             println!(
                 "m12_gate node {id} stats: reports_unattested={} snap_refusals=({},{})",
-                now.0, now.1 .0, now.1 .1
+                now.0, now.1.0, now.1.1
             );
             last = now;
         }
@@ -1686,7 +1737,11 @@ fn start_typed_svc<S: SnapshotStateMachine>(
     b: ServiceBuilder<S>,
     snapshots: bool,
 ) -> anyhow::Result<Service<S>> {
-    if snapshots { Ok(b.start_with_snapshots()?) } else { Ok(b.start()?) }
+    if snapshots {
+        Ok(b.start_with_snapshots()?)
+    } else {
+        Ok(b.start()?)
+    }
 }
 
 fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
@@ -1709,23 +1764,41 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     );
     let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id).service_id(a.service_id);
     if a.snapshot_interval_bytes > 0 {
-        cfg = cfg.snapshot_policy(SnapshotPolicy { interval_bytes: a.snapshot_interval_bytes });
+        cfg = cfg.snapshot_policy(SnapshotPolicy {
+            interval_bytes: a.snapshot_interval_bytes,
+        });
     }
     let envelope = a.envelope == Envelope::On;
     let snapshots = a.snapshot_interval_bytes > 0;
-    let tag = format!("id={} spin={} snap={}", a.service_id, a.work_spin, a.snapshot_interval_bytes);
+    let tag = format!(
+        "id={} spin={} snap={}",
+        a.service_id, a.work_spin, a.snapshot_interval_bytes
+    );
     // Each arm diverges (parks forever), so the `Service<_>` types never need
     // to unify — `m5_gate`'s service role does the same.
     match (envelope, a.raw_sm, a.work_spin > 0) {
         (true, false, false) => {
-            let svc = ServiceBuilder::new(cfg, Sessioned::new(CountSm::default(), SessionConfig::default()));
+            let svc = ServiceBuilder::new(
+                cfg,
+                Sessioned::new(CountSm::default(), SessionConfig::default()),
+            );
             let _svc = start_typed_svc(svc, snapshots)?;
-            park_service(&format!("Sessioned<CountSm> (typed tier, envelope on, {tag})"))
+            park_service(&format!(
+                "Sessioned<CountSm> (typed tier, envelope on, {tag})"
+            ))
         }
         (true, false, true) => {
-            let svc = ServiceBuilder::new(cfg, Sessioned::new(SpinCountSm::with_spin(a.work_spin), SessionConfig::default()));
+            let svc = ServiceBuilder::new(
+                cfg,
+                Sessioned::new(
+                    SpinCountSm::with_spin(a.work_spin),
+                    SessionConfig::default(),
+                ),
+            );
             let _svc = start_typed_svc(svc, snapshots)?;
-            park_service(&format!("Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"))
+            park_service(&format!(
+                "Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"
+            ))
         }
         (false, false, false) => {
             let svc = ServiceBuilder::new(cfg, CountSm::default());
@@ -1738,8 +1811,14 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
             park_service(&format!("SpinCountSm (typed tier, envelope off, {tag})"))
         }
         (true, true, _) => {
-            let _svc = ServiceBuilder::new(cfg, Sessioned::new(RawCountSm::default(), SessionConfig::default())).start()?;
-            park_service(&format!("Sessioned<RawCountSm> (raw tier, envelope on, {tag})"))
+            let _svc = ServiceBuilder::new(
+                cfg,
+                Sessioned::new(RawCountSm::default(), SessionConfig::default()),
+            )
+            .start()?;
+            park_service(&format!(
+                "Sessioned<RawCountSm> (raw tier, envelope on, {tag})"
+            ))
         }
         (false, true, _) => {
             let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
@@ -1830,7 +1909,7 @@ fn run_client_direct_role(a: ClientDirectArgs) -> anyhow::Result<()> {
         bincode::serde::encode_to_vec(vec![0xABu8; a.payload], bincode::config::standard())
             .expect("encode fixed payload")
             .len()
-        + if envelope_on { SESSION_HEADER_LEN } else { 0 };
+            + if envelope_on { SESSION_HEADER_LEN } else { 0 };
     anyhow::ensure!(
         encoded_len <= NODE_MAX_PAYLOAD,
         "--payload {} encodes to {} B{} which exceeds the node's max_payload of {} B",
@@ -1995,7 +2074,9 @@ fn run_check_fsms_role(a: CheckFsmsArgs) -> anyhow::Result<()> {
             }
             anyhow::bail!(
                 "divergence after {}s: counts {last:?}, expect {:?}, expect_min {:?}, last_err {last_err:?}",
-                a.settle_secs, a.expect, a.expect_min
+                a.settle_secs,
+                a.expect,
+                a.expect_min
             );
         }
         thread::sleep(Duration::from_millis(100));
@@ -2003,7 +2084,10 @@ fn run_check_fsms_role(a: CheckFsmsArgs) -> anyhow::Result<()> {
     for (id, c) in &last {
         println!("FSMS {{\"id\":{id},\"count\":{c}}}");
     }
-    println!("FSMS-OK {{\"declared\":{declared},\"count\":{},\"mode\":\"{:?}\"}}", last[0].1, a.mode);
+    println!(
+        "FSMS-OK {{\"declared\":{declared},\"count\":{},\"mode\":\"{:?}\"}}",
+        last[0].1, a.mode
+    );
     Ok(())
 }
 
@@ -2016,7 +2100,10 @@ mod tests {
     fn services_from_flags_absent_is_the_node_default() {
         let s = services_from_flags(None, None).unwrap();
         assert_eq!(s.declared(), 0b1);
-        assert_eq!(s.resolve_lag(1 << 20), ServicesConfig::default().resolve_lag(1 << 20));
+        assert_eq!(
+            s.resolve_lag(1 << 20),
+            ServicesConfig::default().resolve_lag(1 << 20)
+        );
     }
 
     #[test]
@@ -2031,15 +2118,23 @@ mod tests {
 
     #[test]
     fn services_from_flags_refuses_by_name() {
-        let e = services_from_flags(Some("1"), None).unwrap_err().to_string();
+        let e = services_from_flags(Some("1"), None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("--services"), "{e}");
-        let e = services_from_flags(Some("0,x"), None).unwrap_err().to_string();
+        let e = services_from_flags(Some("0,x"), None)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("--services"), "{e}");
-        let e = services_from_flags(Some("0"), Some("bogus")).unwrap_err().to_string();
+        let e = services_from_flags(Some("0"), Some("bogus"))
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("--fsm-lag"), "{e}");
     }
 
-    fn drive<S: StateMachine<Command = Vec<u8>, Response = u64, Query = (), QueryResponse = u64>>(
+    fn drive<
+        S: StateMachine<Command = Vec<u8>, Response = u64, Query = (), QueryResponse = u64>,
+    >(
         sm: &mut S,
     ) -> Vec<u64> {
         (1..=200u64)
@@ -2055,8 +2150,14 @@ mod tests {
         // `StateMachine` and the blanket `RawStateMachine` are both in scope
         // and both implemented, so a bare `.query()`/`.last_applied()` on a
         // concrete SM is ambiguous (E0034) — disambiguate with UFCS.
-        assert_eq!(StateMachine::query(&plain, ()), StateMachine::query(&spin, ()));
-        assert_eq!(StateMachine::last_applied(&plain), StateMachine::last_applied(&spin));
+        assert_eq!(
+            StateMachine::query(&plain, ()),
+            StateMachine::query(&spin, ())
+        );
+        assert_eq!(
+            StateMachine::last_applied(&plain),
+            StateMachine::last_applied(&spin)
+        );
         // Two different K's, same answers: K prices the apply, it never
         // reaches the response (spec §15.3).
         let mut spin2 = SpinCountSm::with_spin(50);
@@ -2083,7 +2184,15 @@ mod tests {
         // completions at 0.5s, 1.5s, 2.5s, 3.5s, 9.5s, 10.5s, 11.5s with a
         // 2 s warm-up and an 8 s window → the 2.5, 3.5, 9.5 completions.
         let ns = |s: f64| (s * 1e9) as u64;
-        let done = [ns(0.5), ns(1.5), ns(2.5), ns(3.5), ns(9.5), ns(10.5), ns(11.5)];
+        let done = [
+            ns(0.5),
+            ns(1.5),
+            ns(2.5),
+            ns(3.5),
+            ns(9.5),
+            ns(10.5),
+            ns(11.5),
+        ];
         let (n, rps) = window_rate(&done, 2, 8);
         assert_eq!(n, 3);
         assert!((rps - 3.0 / 8.0).abs() < 1e-9, "{rps}");

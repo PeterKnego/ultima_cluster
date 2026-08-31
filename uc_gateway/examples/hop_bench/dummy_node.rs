@@ -107,9 +107,15 @@ impl HeaderView {
         // `size_of::<RingHeader>()` bytes are exactly that struct; this second
         // mapping is read-only and only ever loads its atomics.
         let mmap = unsafe { memmap2::Mmap::map(&f)? };
-        anyhow::ensure!(mmap.len() >= std::mem::size_of::<RingHeader>(), "ring file too short");
+        anyhow::ensure!(
+            mmap.len() >= std::mem::size_of::<RingHeader>(),
+            "ring file too short"
+        );
         let header = mmap.as_ptr().cast::<RingHeader>();
-        Ok(Self { _mmap: mmap, header })
+        Ok(Self {
+            _mmap: mmap,
+            header,
+        })
     }
 
     /// `true` when `claim_position > consumer_position` — i.e. an `Ok(None)`
@@ -119,14 +125,18 @@ impl HeaderView {
         // SAFETY: `header` points into `_mmap`, alive for `self`'s lifetime.
         let h = unsafe { &*self.header };
         h.claim_position.load(std::sync::atomic::Ordering::Acquire)
-            > h.consumer_position.load(std::sync::atomic::Ordering::Acquire)
+            > h.consumer_position
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 /// "Random enough" instance id — a fresh one per boot invalidates any stale
 /// attachment, exactly as the real node's `rand::random::<u128>()` does.
 fn rand_instance_id() -> u128 {
-    let ns = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(1);
+    let ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1);
     let pid = std::process::id() as u128;
     (ns ^ 0xA5A5_5A5A_A5A5_5A5A_u128).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (pid << 64)
 }
@@ -164,21 +174,35 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     // The four client-facing rings. Sizes are this bench's own (deliberately
     // fatter than the real node's 4 MiB / 1 MiB, so the SINK is never the
     // thing being measured); `MAX_MSG` matches the real node exactly.
-    MpscRing::create(&a.instance_dir.join("ingress.ring"), a.ingress_bytes, MAX_MSG)
-        .map_err(|e| anyhow::anyhow!("create ingress ring: {e}"))?;
+    MpscRing::create(
+        &a.instance_dir.join("ingress.ring"),
+        a.ingress_bytes,
+        MAX_MSG,
+    )
+    .map_err(|e| anyhow::anyhow!("create ingress ring: {e}"))?;
     MpscRing::create(&a.instance_dir.join("query.ring"), a.ingress_bytes, MAX_MSG)
         .map_err(|e| anyhow::anyhow!("create query ring: {e}"))?;
-    BroadcastRing::create(&a.instance_dir.join("egress_service.0.broadcast"), a.egress_bytes, MAX_MSG)
-        .map_err(|e| anyhow::anyhow!("create egress_service ring: {e}"))?;
-    BroadcastRing::create(&a.instance_dir.join("egress_node.broadcast"), a.egress_bytes, MAX_MSG)
-        .map_err(|e| anyhow::anyhow!("create egress_node ring: {e}"))?;
+    BroadcastRing::create(
+        &a.instance_dir.join("egress_service.0.broadcast"),
+        a.egress_bytes,
+        MAX_MSG,
+    )
+    .map_err(|e| anyhow::anyhow!("create egress_service ring: {e}"))?;
+    BroadcastRing::create(
+        &a.instance_dir.join("egress_node.broadcast"),
+        a.egress_bytes,
+        MAX_MSG,
+    )
+    .map_err(|e| anyhow::anyhow!("create egress_node ring: {e}"))?;
 
     // Publish "serving leader" so `SendHalf::can_serve()` / `leader_hint()`
     // and the edge's leader watch both see one.
     let status = cnc.status();
     status.term.store_release(1);
     status.leader_hint.store_release(a.node_id as u64);
-    status.flags.store_release(NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE);
+    status
+        .flags
+        .store_release(NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE);
     status.node_heartbeat_ns.store_release(now_wall_ns());
     cnc.store_admission_bytes(ADMISSION_BYTES);
 
@@ -229,16 +253,21 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     // `--idle park` parks on the ingress ring's wake word: an MPSC producer
     // bumps the commit count and `signal()`s once per commit, and only
     // syscalls when `waiters > 0`.
-    let park_handle: Option<RingWaitHandle> =
-        if a.idle == IdlePolicy::Park { Some(ingress.wait_handle()) } else { None };
+    let park_handle: Option<RingWaitHandle> = if a.idle == IdlePolicy::Park {
+        Some(ingress.wait_handle())
+    } else {
+        None
+    };
     let park_budget = Duration::from_micros(a.park_us);
 
     loop {
         let mut did = false;
-        for (idx, (ring, is_query)) in
-            [(&mut ingress as &mut MpscConsumer, false), (&mut query as &mut MpscConsumer, true)]
-                .into_iter()
-                .enumerate()
+        for (idx, (ring, is_query)) in [
+            (&mut ingress as &mut MpscConsumer, false),
+            (&mut query as &mut MpscConsumer, true),
+        ]
+        .into_iter()
+        .enumerate()
         {
             // Bounded batch per ring so neither starves the other.
             for _ in 0..256 {

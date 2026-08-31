@@ -113,18 +113,17 @@ use uc_client::{
     SubmitError,
 };
 use uc_log::cnc::CncPage;
+use uc_protocol::ring::RingWaitHandle;
 use uc_remote::conn::FramedConn;
 use uc_remote::frame::{
-    encode_frame, FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED,
-    FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED,
-    HELLO_REFUSED_VERSION, Header, Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION,
-    RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry,
-    Status,
+    FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED, FrameType,
+    HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, HELLO_REFUSED_VERSION, Header,
+    Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION, RETRY_NOT_SERVING,
+    RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry, Status, encode_frame,
 };
-use uc_protocol::ring::RingWaitHandle;
 
-use crate::conn::{CeilingChange, Conn, ConnTable};
 use crate::config::{ConfigError, EdgeConfig};
+use crate::conn::{CeilingChange, Conn, ConnTable};
 use crate::watch::LeaderWatch;
 
 // ---------------------------------------------------------------- constants
@@ -205,7 +204,9 @@ pub const BUDGET_HEADROOM_DIV: u32 = 8;
 /// stays at or under this (see [`grant_for`] for the one documented
 /// exception).
 pub fn budget_for(max_inflight: u32) -> u32 {
-    max_inflight.saturating_sub(max_inflight / BUDGET_HEADROOM_DIV).max(1)
+    max_inflight
+        .saturating_sub(max_inflight / BUDGET_HEADROOM_DIV)
+        .max(1)
 }
 
 /// One connection's share of the budget: an equal split, capped by the
@@ -428,8 +429,11 @@ impl Shared {
             }
             None => {
                 let mut out = Vec::new();
-                Retry { reason: RETRY_NOT_SERVING, retry_after_us: NOT_SERVING_BACKOFF_US }
-                    .encode(&mut out);
+                Retry {
+                    reason: RETRY_NOT_SERVING,
+                    retry_after_us: NOT_SERVING_BACKOFF_US,
+                }
+                .encode(&mut out);
                 self.stats.retries.fetch_add(1, Ordering::Relaxed);
                 conn.write(conn.hdr(FrameType::Retry, 0, seq), &out, self.now_ns());
             }
@@ -459,7 +463,9 @@ impl Shared {
                 return;
             }
             if c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &body, now) {
-                self.stats.leader_changed_frames.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .leader_changed_frames
+                    .fetch_add(1, Ordering::Relaxed);
             } else {
                 dead.push(c.idx);
             }
@@ -471,7 +477,11 @@ impl Shared {
 
     fn write_retry(&self, conn: &Conn, seq: u64, reason: u8, after_us: u32) {
         let mut out = Vec::new();
-        Retry { reason, retry_after_us: after_us }.encode(&mut out);
+        Retry {
+            reason,
+            retry_after_us: after_us,
+        }
+        .encode(&mut out);
         self.stats.retries.fetch_add(1, Ordering::Relaxed);
         conn.write(conn.hdr(FrameType::Retry, 0, seq), &out, self.now_ns());
     }
@@ -485,7 +495,11 @@ impl Shared {
             return true;
         }
         let mut out = Vec::new();
-        Status { acked_seq: conn.acked_seq(), credits: conn.credits() }.encode(&mut out);
+        Status {
+            acked_seq: conn.acked_seq(),
+            credits: conn.credits(),
+        }
+        .encode(&mut out);
         self.stats.status_frames.fetch_add(1, Ordering::Relaxed);
         conn.write(conn.hdr(FrameType::Status, 0, 0), &out, self.now_ns())
     }
@@ -506,17 +520,31 @@ impl Shared {
             }
             None => {
                 let mut out = Vec::new();
-                Retry { reason: RETRY_NOT_SERVING, retry_after_us: NOT_SERVING_BACKOFF_US }
-                    .encode(&mut out);
+                Retry {
+                    reason: RETRY_NOT_SERVING,
+                    retry_after_us: NOT_SERVING_BACKOFF_US,
+                }
+                .encode(&mut out);
                 self.stats.retries.fetch_add(1, Ordering::Relaxed);
                 encode_frame(buf, conn.hdr(FrameType::Retry, 0, seq), &out);
             }
         }
     }
 
-    fn write_retry_into(&self, buf: &mut Vec<u8>, conn: &Conn, seq: u64, reason: u8, after_us: u32) {
+    fn write_retry_into(
+        &self,
+        buf: &mut Vec<u8>,
+        conn: &Conn,
+        seq: u64,
+        reason: u8,
+        after_us: u32,
+    ) {
         let mut out = Vec::new();
-        Retry { reason, retry_after_us: after_us }.encode(&mut out);
+        Retry {
+            reason,
+            retry_after_us: after_us,
+        }
+        .encode(&mut out);
         self.stats.retries.fetch_add(1, Ordering::Relaxed);
         encode_frame(buf, conn.hdr(FrameType::Retry, 0, seq), &out);
     }
@@ -528,7 +556,11 @@ impl Shared {
             return;
         }
         let mut out = Vec::new();
-        Status { acked_seq: conn.acked_seq(), credits: conn.credits() }.encode(&mut out);
+        Status {
+            acked_seq: conn.acked_seq(),
+            credits: conn.credits(),
+        }
+        .encode(&mut out);
         self.stats.status_frames.fetch_add(1, Ordering::Relaxed);
         encode_frame(buf, conn.hdr(FrameType::Status, 0, 0), &out);
     }
@@ -550,10 +582,10 @@ impl Shared {
         for c in self.table.take_all() {
             // A connection still mid-handshake gets no frame, only the close:
             // its peer is waiting for HELLO_OK and would reject anything else.
-            if c.is_ready()
-                && c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &out, self.now_ns())
-            {
-                self.stats.leader_changed_frames.fetch_add(1, Ordering::Relaxed);
+            if c.is_ready() && c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &out, self.now_ns()) {
+                self.stats
+                    .leader_changed_frames
+                    .fetch_add(1, Ordering::Relaxed);
             }
             c.close();
         }
@@ -579,7 +611,11 @@ impl Shared {
 
     /// Every ready connection's current share, from the current `live`.
     fn current_grant(&self) -> u32 {
-        grant_for(self.live.load(Ordering::Acquire), self.budget, self.cfg.per_conn_inflight)
+        grant_for(
+            self.live.load(Ordering::Acquire),
+            self.budget,
+            self.cfg.per_conn_inflight,
+        )
     }
 
     /// Ask the driver to republish the share. Idempotent and free.
@@ -767,8 +803,11 @@ impl Edge {
         listener.set_nonblocking(true).map_err(EdgeError::Bind)?;
 
         let budget = budget_for(cfg.max_inflight);
-        let members =
-            cfg.members.iter().map(|m| (m.node_id, m.gateway.clone())).collect::<HashMap<_, _>>();
+        let members = cfg
+            .members
+            .iter()
+            .map(|m| (m.node_id, m.gateway.clone()))
+            .collect::<HashMap<_, _>>();
         let wake = poll.wait_handle();
         let shared = Arc::new(Shared {
             cfg,
@@ -957,7 +996,9 @@ fn acceptor(shared: Arc<Shared>, listener: TcpListener, send: SendHalf) {
 /// transient.
 fn refuse_busy(shared: &Arc<Shared>, stream: TcpStream) {
     shared.stats.refused_busy.fetch_add(1, Ordering::Relaxed);
-    let Ok(mut fc) = FramedConn::new(stream) else { return };
+    let Ok(mut fc) = FramedConn::new(stream) else {
+        return;
+    };
     // A bounded write: this runs on the acceptor thread, which must not be
     // held hostage by a peer that never reads.
     if fc.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
@@ -1074,7 +1115,12 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         return false;
     }
     let Ok(hello) = Hello::decode(&payload) else {
-        refuse_hello(shared, conn, HELLO_REFUSED_APP_ID, "malformed HELLO payload");
+        refuse_hello(
+            shared,
+            conn,
+            HELLO_REFUSED_APP_ID,
+            "malformed HELLO payload",
+        );
         return false;
     };
     if hello.app_id != shared.cfg.app_id {
@@ -1128,8 +1174,18 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
     let leader = send.leader_hint();
     let leader_addr = leader.and_then(|id| shared.gateway_of(id)).unwrap_or("");
     let mut out = Vec::new();
-    HelloOk { credits: grant, leader, leader_addr }.encode(&mut out);
-    let ok = conn.write_locked(&mut w, conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns());
+    HelloOk {
+        credits: grant,
+        leader,
+        leader_addr,
+    }
+    .encode(&mut out);
+    let ok = conn.write_locked(
+        &mut w,
+        conn.hdr(FrameType::HelloOk, 0, h.seq),
+        &out,
+        shared.now_ns(),
+    );
     drop(w);
     ok
 }
@@ -1137,7 +1193,11 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
 fn refuse_hello(shared: &Arc<Shared>, conn: &Arc<Conn>, reason: u8, detail: &str) {
     let mut out = Vec::new();
     HelloRefused { reason, detail }.encode(&mut out);
-    conn.write(conn.hdr(FrameType::HelloRefused, 0, 0), &out, shared.now_ns());
+    conn.write(
+        conn.hdr(FrameType::HelloRefused, 0, 0),
+        &out,
+        shared.now_ns(),
+    );
 }
 
 /// Handle one post-handshake frame. Returns `false` to end the connection.
@@ -1350,14 +1410,21 @@ fn dispatch(
         };
         match res {
             Ok(()) => {
-                let cell = if is_query { &shared.stats.queries } else { &shared.stats.submits };
+                let cell = if is_query {
+                    &shared.stats.queries
+                } else {
+                    &shared.stats.submits
+                };
                 cell.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
             Err(SubmitError::Backpressure) => {
                 if !squeezed {
                     squeezed = true;
-                    shared.stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                    shared
+                        .stats
+                        .backpressure_events
+                        .fetch_add(1, Ordering::Relaxed);
                     conn.squeeze();
                     // Tell the client its window just halved, rather than
                     // letting it find out from the next RESPONSE — by which
@@ -1575,7 +1642,9 @@ type DriverBatch = HashMap<u32, (Arc<Conn>, Vec<u8>)>;
 /// Append an already-formed frame to a connection's slot in the drain batch,
 /// keeping the `Arc<Conn>` alive for the flush.
 fn push_frame(batch: &mut DriverBatch, conn: &Arc<Conn>, h: Header, payload: &[u8]) {
-    let e = batch.entry(conn.idx).or_insert_with(|| (Arc::clone(conn), Vec::new()));
+    let e = batch
+        .entry(conn.idx)
+        .or_insert_with(|| (Arc::clone(conn), Vec::new()));
     encode_frame(&mut e.1, h, payload);
 }
 
@@ -1628,8 +1697,12 @@ fn complete(
     let corr = c.user_data as u32;
     // A completion for a connection that has since gone is dropped: nobody is
     // left to answer, and the index is never reused (see `conn.rs`).
-    let Some(conn) = shared.table.get(idx) else { return };
-    let Some((seq, is_query)) = conn.claim(corr) else { return };
+    let Some(conn) = shared.table.get(idx) else {
+        return;
+    };
+    let Some((seq, is_query)) = conn.claim(corr) else {
+        return;
+    };
 
     // Relaxing before the frame is built means a RESPONSE itself carries the
     // reopened window.
@@ -1654,7 +1727,12 @@ fn complete(
             meta.encode(&mut out);
             out.extend_from_slice(body);
             shared.stats.responses.fetch_add(1, Ordering::Relaxed);
-            push_frame(batch, &conn, conn.hdr(FrameType::Response, flags, seq), &out);
+            push_frame(
+                batch,
+                &conn,
+                conn.hdr(FrameType::Response, flags, seq),
+                &out,
+            );
             // The RESPONSE above already carried the new credits, so no
             // separate STATUS is owed here.
             return;
@@ -1667,21 +1745,24 @@ fn complete(
             if !is_query {
                 conn.latch_not_serving();
             }
-            let (_, buf) =
-                batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+            let (_, buf) = batch
+                .entry(conn.idx)
+                .or_insert_with(|| (Arc::clone(&conn), Vec::new()));
             shared.redirect_or_retry_into(buf, &conn, seq, hint.or_else(|| send.leader_hint()));
         }
         Outcome::Retry => {
-            let (_, buf) =
-                batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+            let (_, buf) = batch
+                .entry(conn.idx)
+                .or_insert_with(|| (Arc::clone(&conn), Vec::new()));
             shared.write_retry_into(buf, &conn, seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
         }
         Outcome::Responses(_) | Outcome::BadService { .. } => {
             // Unreachable on the edge: it only ever issues FSM-0 requests
             // (protocol v1 has no service selector, spec §6.4). Answer as a
             // transient so a client that somehow sees it retries.
-            let (_, buf) =
-                batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+            let (_, buf) = batch
+                .entry(conn.idx)
+                .or_insert_with(|| (Arc::clone(&conn), Vec::new()));
             shared.write_retry_into(buf, &conn, seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
         }
         Outcome::TimedOut => {
@@ -1698,7 +1779,9 @@ fn complete(
     if credits_up {
         // None of the frames above carries a credit field, so an increase has
         // to be announced on its own.
-        let (_, buf) = batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+        let (_, buf) = batch
+            .entry(conn.idx)
+            .or_insert_with(|| (Arc::clone(&conn), Vec::new()));
         shared.write_status_into(buf, &conn);
     }
 }
@@ -1790,18 +1873,28 @@ mod tests {
         let conn = a_conn();
         let now = Instant::now();
         let deadline = now + Duration::from_secs(10);
-        assert_eq!(ladder_step(&conn, false, true, now, deadline), Ladder::Gone, "stopping");
+        assert_eq!(
+            ladder_step(&conn, false, true, now, deadline),
+            Ladder::Gone,
+            "stopping"
+        );
         // A dead connection outranks even the latch: nobody is left to answer.
         conn.latch_not_serving();
         conn.close();
-        assert_eq!(ladder_step(&conn, false, false, now, deadline), Ladder::Gone);
+        assert_eq!(
+            ladder_step(&conn, false, false, now, deadline),
+            Ladder::Gone
+        );
     }
 
     #[test]
     fn the_ladder_gives_up_when_the_request_burns_its_budget() {
         let conn = a_conn();
         let now = Instant::now();
-        assert_eq!(ladder_step(&conn, false, false, now, now), Ladder::OutOfBudget);
+        assert_eq!(
+            ladder_step(&conn, false, false, now, now),
+            Ladder::OutOfBudget
+        );
         assert_eq!(
             ladder_step(&conn, true, false, now, now),
             Ladder::OutOfBudget,
@@ -1822,8 +1915,14 @@ mod tests {
 
     #[test]
     fn a_query_answer_is_flagged_and_never_unwrapped() {
-        assert_eq!(response_shape(true, true, &[9, 9]), (FLAG_IS_QUERY, &[9u8, 9][..]));
-        assert_eq!(response_shape(false, true, &[9, 9]), (FLAG_IS_QUERY, &[9u8, 9][..]));
+        assert_eq!(
+            response_shape(true, true, &[9, 9]),
+            (FLAG_IS_QUERY, &[9u8, 9][..])
+        );
+        assert_eq!(
+            response_shape(false, true, &[9, 9]),
+            (FLAG_IS_QUERY, &[9u8, 9][..])
+        );
     }
 
     #[test]
@@ -1843,13 +1942,22 @@ mod tests {
 
     #[test]
     fn an_unknown_or_missing_tag_reads_as_expired_not_fresh() {
-        assert_eq!(response_shape(true, false, &[]), (FLAG_ENVELOPED | FLAG_EXPIRED, &[][..]));
-        assert_eq!(response_shape(true, false, &[77, 1]), (FLAG_ENVELOPED | FLAG_EXPIRED, &[][..]));
+        assert_eq!(
+            response_shape(true, false, &[]),
+            (FLAG_ENVELOPED | FLAG_EXPIRED, &[][..])
+        );
+        assert_eq!(
+            response_shape(true, false, &[77, 1]),
+            (FLAG_ENVELOPED | FLAG_EXPIRED, &[][..])
+        );
     }
 
     #[test]
     fn with_the_envelope_off_bytes_pass_through_untouched() {
-        assert_eq!(response_shape(false, false, &[0, 1, 2]), (0, &[0u8, 1, 2][..]));
+        assert_eq!(
+            response_shape(false, false, &[0, 1, 2]),
+            (0, &[0u8, 1, 2][..])
+        );
     }
 
     #[test]
@@ -1860,7 +1968,11 @@ mod tests {
         // the whole window, which is still a bound, just a tight one.
         assert_eq!(budget_for(4), 4);
         assert_eq!(budget_for(1), 1);
-        assert_eq!(budget_for(0), 1, "a zero budget would wedge every connection");
+        assert_eq!(
+            budget_for(0),
+            1,
+            "a zero budget would wedge every connection"
+        );
     }
 
     #[test]
@@ -1868,7 +1980,11 @@ mod tests {
         // One connection takes the whole budget, but never more than the
         // operator allowed it.
         assert_eq!(grant_for(1, 3584, 256), 256);
-        assert_eq!(grant_for(1, 200, 256), 200, "the budget binds below the cap");
+        assert_eq!(
+            grant_for(1, 200, 256),
+            200,
+            "the budget binds below the cap"
+        );
         // Equal shares.
         assert_eq!(grant_for(2, 56, 32), 28);
         assert_eq!(grant_for(4, 56, 32), 14);

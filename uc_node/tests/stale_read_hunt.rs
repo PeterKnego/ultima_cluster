@@ -18,13 +18,13 @@
 
 mod lincheck_v2;
 
-use lincheck_v2::{read_leader, submit_cmd, ClusterCfg, LinClusterV2, ReadOutcome, WorkerConn};
+use lincheck_v2::{ClusterCfg, LinClusterV2, ReadOutcome, WorkerConn, read_leader, submit_cmd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use uc_net::fault::FaultConfig;
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
+use uc_net::fault::FaultConfig;
 
 fn tempdir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -34,7 +34,10 @@ fn tempdir() -> tempfile::TempDir {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Dump each node's cnc counters (commit / service_applied / instance flags)
@@ -72,11 +75,17 @@ fn dump_cnc(dirs: &[PathBuf]) -> String {
 fn stale_read_hunt() {
     let budget = Duration::from_secs(env_u64("STALE_HUNT_SECS", 120));
     let kill_period = Duration::from_millis(env_u64("STALE_HUNT_KILL_MS", 500));
-    let crypto = std::env::var("UC2_CRYPTO").map(|v| v == "1").unwrap_or(true);
+    let crypto = std::env::var("UC2_CRYPTO")
+        .map(|v| v == "1")
+        .unwrap_or(true);
 
     let dir = tempdir();
-    let ccfg = ClusterCfg { crypto, ..ClusterCfg::default() };
-    let mut cluster = LinClusterV2::<RegisterSm>::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let ccfg = ClusterCfg {
+        crypto,
+        ..ClusterCfg::default()
+    };
+    let mut cluster =
+        LinClusterV2::<RegisterSm>::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     let dirs = Arc::new(cluster.dirs());
 
     let acked = Arc::new(AtomicU64::new(0));
@@ -181,7 +190,10 @@ fn stale_read_hunt() {
     stop.store(true, Ordering::SeqCst);
 
     let acks = writer.join().expect("writer join");
-    let reads: u64 = readers.into_iter().map(|h| h.join().expect("reader join")).sum();
+    let reads: u64 = readers
+        .into_iter()
+        .map(|h| h.join().expect("reader join"))
+        .sum();
     eprintln!(
         "stale_read_hunt: budget={budget:?} kills={kills} acked_writes={acks} lin_reads={reads}"
     );

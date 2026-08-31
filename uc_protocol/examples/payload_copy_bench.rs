@@ -44,7 +44,10 @@ fn bench_refcount_clone(src: &Arc<[u8]>) -> f64 {
 
 fn main() {
     println!("== payload copy microbench (release) ==");
-    println!("{:<10} {:>14} {:>18}", "size(B)", "memcpy ns", "Arc-clone ns");
+    println!(
+        "{:<10} {:>14} {:>18}",
+        "size(B)", "memcpy ns", "Arc-clone ns"
+    );
     for &n in SIZES {
         let src: Vec<u8> = (0..n).map(|i| i as u8).collect();
         let arc: Arc<[u8]> = Arc::from(src.clone().into_boxed_slice());

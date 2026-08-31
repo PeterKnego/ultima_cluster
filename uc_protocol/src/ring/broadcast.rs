@@ -499,7 +499,9 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let mut i = 0u32;
             while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
-                producer.write(1, 0, [0; 8], &i.to_le_bytes()).expect("write");
+                producer
+                    .write(1, 0, [0; 8], &i.to_le_bytes())
+                    .expect("write");
                 i = i.wrapping_add(1);
             }
         });

@@ -105,12 +105,14 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use uc_client::Client;
-use uc_log::cnc::CncPage;
-use uc_remote::{Consistency, RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats};
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp};
+use uc_log::cnc::CncPage;
+use uc_remote::{
+    Consistency, RemoteClient, RemoteConfig, RemoteError, RemoteResponse, RemoteStats,
+};
 
 mod common;
 use common::*;
@@ -207,7 +209,9 @@ fn enc(c: &Cmd) -> Vec<u8> {
 }
 
 fn dec(b: &[u8]) -> CmdResp {
-    bincode::serde::decode_from_slice(b, bincode::config::standard()).expect("decode resp").0
+    bincode::serde::decode_from_slice(b, bincode::config::standard())
+        .expect("decode resp")
+        .0
 }
 
 fn read_query() -> Vec<u8> {
@@ -215,7 +219,9 @@ fn read_query() -> Vec<u8> {
 }
 
 fn dec_read(b: &[u8]) -> Option<u64> {
-    bincode::serde::decode_from_slice(b, bincode::config::standard()).expect("decode read").0
+    bincode::serde::decode_from_slice(b, bincode::config::standard())
+        .expect("decode read")
+        .0
 }
 
 // ------------------------------------------------------------- addressing
@@ -240,7 +246,11 @@ fn free_tcp_addr() -> SocketAddr {
 }
 
 fn members_arg(members: &[(u32, SocketAddr)]) -> String {
-    members.iter().map(|(id, a)| format!("{id}@{a}")).collect::<Vec<_>>().join(",")
+    members
+        .iter()
+        .map(|(id, a)| format!("{id}@{a}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Open `dir`'s cnc page read-only. `None` on any transient failure (the file
@@ -261,8 +271,9 @@ fn open_cnc(dir: &Path) -> Option<Arc<CncPage>> {
 fn find_leader(dirs: &[PathBuf]) -> Option<usize> {
     use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
     let want = NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE;
-    (0..dirs.len())
-        .find(|&i| open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want))
+    (0..dirs.len()).find(|&i| {
+        open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want)
+    })
 }
 
 /// Wait for some node to be a serving leader. Used at boot and after the
@@ -273,7 +284,11 @@ fn await_leader(dirs: &[PathBuf], secs: u64) -> usize {
         if let Some(i) = find_leader(dirs) {
             return i;
         }
-        assert!(Instant::now() < deadline, "no serving leader among {} nodes in {secs}s", dirs.len());
+        assert!(
+            Instant::now() < deadline,
+            "no serving leader among {} nodes in {secs}s",
+            dirs.len()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -441,7 +456,12 @@ impl Rig {
         }
         self.nodes[i] = None; // SIGKILL + reap
         self.svcs[i] = None;
-        self.nodes[i] = Some(spawn_node_member(&self.dirs[i], i as u32, self.udp[i], &self.node_members));
+        self.nodes[i] = Some(spawn_node_member(
+            &self.dirs[i],
+            i as u32,
+            self.udp[i],
+            &self.node_members,
+        ));
         let fresh = await_fresh_instance(&self.dirs[i], old, Duration::from_secs(15));
         self.svcs[i] = Some(spawn_service_with(&self.dirs[i], self.envelope));
         fresh
@@ -497,7 +517,10 @@ fn mutation_value(op: &Op) -> Option<u64> {
 /// Only the LAST effective mutation decides the final value, so no replay of
 /// the sequence is needed — just the set of values that could be it.
 fn expected_final_values(mutations: &[Mutation], indet_values: &[u64]) -> Vec<u64> {
-    let last_fresh = mutations.iter().filter(|m| !m.replayed).max_by_key(|m| m.position);
+    let last_fresh = mutations
+        .iter()
+        .filter(|m| !m.replayed)
+        .max_by_key(|m| m.position);
     let Some(f) = last_fresh else {
         // No fresh mutation at all (only possible if literally every ack was a
         // replay): fall back to every acknowledged value, plus the
@@ -510,7 +533,10 @@ fn expected_final_values(mutations: &[Mutation], indet_values: &[u64]) -> Vec<u6
     };
     let mut out = vec![f.value];
     out.extend(
-        mutations.iter().filter(|m| m.replayed && m.position > f.position).map(|m| m.value),
+        mutations
+            .iter()
+            .filter(|m| m.replayed && m.position > f.position)
+            .map(|m| m.value),
     );
     out.extend_from_slice(indet_values);
     out.sort_unstable();
@@ -541,7 +567,10 @@ fn connect_remote(members: &[String], client_id: u64, timeout: Duration) -> Remo
         match RemoteClient::connect(cfg) {
             Ok(c) => return c,
             Err(e) => {
-                assert!(Instant::now() < deadline, "client {client_id} could not connect: {e:?}");
+                assert!(
+                    Instant::now() < deadline,
+                    "client {client_id} could not connect: {e:?}"
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -626,7 +655,9 @@ fn worker(
             }
             1 => {
                 let inv = history.invoke();
-                let r = client.query(&read_query(), Consistency::Linearizable).and_then(|t| t.wait());
+                let r = client
+                    .query(&read_query(), Consistency::Linearizable)
+                    .and_then(|t| t.wait());
                 match resolve(r, "read") {
                     Some(resp) => {
                         let v = dec_read(&resp.bytes);
@@ -648,7 +679,9 @@ fn worker(
                 };
                 let new = rng.random_range(1..1000u64);
                 let inv = history.invoke();
-                let r = client.submit(&enc(&Cmd::Cas { old, new })).and_then(|t| t.wait());
+                let r = client
+                    .submit(&enc(&Cmd::Cas { old, new }))
+                    .and_then(|t| t.wait());
                 match resolve(r, "cas") {
                     Some(resp) => match dec(&resp.bytes) {
                         CmdResp::CasResult(b) => {
@@ -662,7 +695,11 @@ fn worker(
                                     });
                                 }
                             }
-                            (Op::Cas { old, new }, (inv, Outcome::Ok(RegResp::CasOk(b))), true)
+                            (
+                                Op::Cas { old, new },
+                                (inv, Outcome::Ok(RegResp::CasOk(b))),
+                                true,
+                            )
                         }
                         other => panic!("cas returned a non-cas response: {other:?}"),
                     },
@@ -787,7 +824,11 @@ fn assert_linearizable(entries: &[Entry], tag: &str) {
                 s.push_str(&format!("{e:?}\n"));
             }
             let _ = std::fs::write(&path, s);
-            eprintln!("[remote_lin] history ({} entries) dumped to {}", entries.len(), path.display());
+            eprintln!(
+                "[remote_lin] history ({} entries) dumped to {}",
+                entries.len(),
+                path.display()
+            );
             panic!("remote_lin history NOT linearizable (tag {tag})");
         }
     }
@@ -813,16 +854,28 @@ static SERIALIZE: Mutex<()> = Mutex::new(());
 
 fn remote_lin_once(seed: u64, envelope: bool) {
     let _serialized = lock(&SERIALIZE);
-    let tag = if envelope { "envelope_on" } else { "envelope_off" };
+    let tag = if envelope {
+        "envelope_on"
+    } else {
+        "envelope_off"
+    };
     let started = Instant::now();
     let root = tempdir();
 
     // --- 1. Addresses first: every node needs the whole member map, and
     // every edge needs the whole gateway map, before any of them starts.
     let udp: Vec<SocketAddr> = (0..N).map(|_| free_udp_addr()).collect();
-    let node_members = members_arg(&(0..N as u32).map(|i| (i, udp[i as usize])).collect::<Vec<_>>());
+    let node_members = members_arg(
+        &(0..N as u32)
+            .map(|i| (i, udp[i as usize]))
+            .collect::<Vec<_>>(),
+    );
     let gw: Vec<SocketAddr> = (0..N).map(|_| free_tcp_addr()).collect();
-    let gw_members = members_arg(&(0..N as u32).map(|i| (i, gw[i as usize])).collect::<Vec<_>>());
+    let gw_members = members_arg(
+        &(0..N as u32)
+            .map(|i| (i, gw[i as usize]))
+            .collect::<Vec<_>>(),
+    );
 
     // --- 2. Nodes, then services, then edges.
     let mut dirs = Vec::with_capacity(N);
@@ -834,7 +887,10 @@ fn remote_lin_once(seed: u64, envelope: bool) {
         wait_for_ready(&d, Duration::from_secs(20));
         dirs.push(d);
     }
-    let svcs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service_with(d, envelope))).collect();
+    let svcs: Vec<Option<Reap>> = dirs
+        .iter()
+        .map(|d| Some(spawn_service_with(d, envelope)))
+        .collect();
 
     let mut rig = Rig {
         dirs: dirs.clone(),
@@ -909,8 +965,9 @@ fn remote_lin_once(seed: u64, envelope: bool) {
             // Each worker starts on a different edge (`members[0]` is the
             // first dial), so the load is spread across all three from the
             // outset rather than piling onto whichever one is listed first.
-            let members: Vec<String> =
-                (0..N).map(|k| gw_addrs[(w as usize + k) % N].clone()).collect();
+            let members: Vec<String> = (0..N)
+                .map(|k| gw_addrs[(w as usize + k) % N].clone())
+                .collect();
             let (history, last_seen, mutations, indeterminate_values, stop) = (
                 Arc::clone(&history),
                 Arc::clone(&last_seen),
@@ -986,7 +1043,10 @@ fn remote_lin_once(seed: u64, envelope: bool) {
         if let Some(i) = find_leader(&dirs) {
             break i;
         }
-        assert!(Instant::now() < settle, "cluster never re-converged on a leader after the chaos");
+        assert!(
+            Instant::now() < settle,
+            "cluster never re-converged on a leader after the chaos"
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
 
@@ -997,10 +1057,16 @@ fn remote_lin_once(seed: u64, envelope: bool) {
         let deadline = Instant::now() + Duration::from_secs(60);
         let v = loop {
             lock(&rig).supervise();
-            match c.query(&read_query(), Consistency::Linearizable).and_then(|t| t.wait()) {
+            match c
+                .query(&read_query(), Consistency::Linearizable)
+                .and_then(|t| t.wait())
+            {
                 Ok(r) => break dec_read(&r.bytes),
                 Err(e) => {
-                    assert!(Instant::now() < deadline, "final linearizable read never answered: {e:?}");
+                    assert!(
+                        Instant::now() < deadline,
+                        "final linearizable read never answered: {e:?}"
+                    );
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -1011,7 +1077,10 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     };
 
     // --- 7. Report, then assert.
-    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
     let ok = History::ok_count(&entries);
     let totals = outs.iter().fold(RemoteStats::default(), |mut a, o| {
         a.redirects += o.stats.redirects;
@@ -1064,8 +1133,15 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     // Anti-vacuity: the faults really happened, and the clients really had to
     // deal with them. A run where the leader was never killed, or where no
     // client ever heard about it, proves nothing.
-    assert!(report.kills >= 3, "only {} leader kills — the chaos barely ran", report.kills);
-    assert_eq!(report.restart_timeouts, 0, "a restarted node never presented a fresh cnc instance");
+    assert!(
+        report.kills >= 3,
+        "only {} leader kills — the chaos barely ran",
+        report.kills
+    );
+    assert_eq!(
+        report.restart_timeouts, 0,
+        "a restarted node never presented a fresh cnc instance"
+    );
     assert!(
         totals.redirects + totals.leader_changes >= 1,
         "no client was ever told the cluster moved: {totals:?}"
@@ -1125,5 +1201,4 @@ fn remote_lin_once(seed: u64, envelope: bool) {
             indet_values.len(),
         );
     }
-
 }

@@ -41,8 +41,8 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -55,13 +55,17 @@ use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_service::{
-    ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine,
+    ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine,
+    StateMachine,
 };
 
 // ------------------------------------------------------------------ CLI
 
 #[derive(Parser)]
-#[command(name = "m6_gate", about = "UC v2 M6 gate: learner-join + purge-cycle under load (spec §9)")]
+#[command(
+    name = "m6_gate",
+    about = "UC v2 M6 gate: learner-join + purge-cycle under load (spec §9)"
+)]
 struct Cli {
     #[command(subcommand)]
     role: Role,
@@ -223,7 +227,10 @@ impl SnapshotStateMachine for RegSm {
         let mut buf = Vec::new();
         src.read_to_end(&mut buf)?;
         if buf.len() < 16 {
-            return Err(SnapshotError::Codec(format!("short snapshot: {} bytes", buf.len())));
+            return Err(SnapshotError::Codec(format!(
+                "short snapshot: {} bytes",
+                buf.len()
+            )));
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -258,11 +265,13 @@ fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
     }
     s.split(',')
         .map(|part| {
-            let (id, addr) =
-                part.split_once('@').unwrap_or_else(|| panic!("bad member {part:?}, want id@addr"));
+            let (id, addr) = part
+                .split_once('@')
+                .unwrap_or_else(|| panic!("bad member {part:?}, want id@addr"));
             (
                 id.parse().unwrap_or_else(|e| panic!("bad id {id:?}: {e}")),
-                addr.parse().unwrap_or_else(|e| panic!("bad addr {addr:?}: {e}")),
+                addr.parse()
+                    .unwrap_or_else(|e| panic!("bad addr {addr:?}: {e}")),
             )
         })
         .collect()
@@ -299,8 +308,9 @@ fn make_config(
 }
 
 fn spawn_service(dir: &std::path::Path) -> uc_service::Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, APP)
-        .snapshot_policy(SnapshotPolicy { interval_bytes: SNAPSHOT_INTERVAL_BYTES });
+    let cfg = ServiceConfig::new(dir, APP).snapshot_policy(SnapshotPolicy {
+        interval_bytes: SNAPSHOT_INTERVAL_BYTES,
+    });
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
         .expect("snapshot service start")
@@ -318,7 +328,10 @@ fn run_node(a: NodeArgs, is_learner: bool) -> anyhow::Result<()> {
     let cfg = make_config(a.id, members, learners, a.bind, a.instance_dir, a.app_id);
     let node = Node::start(cfg)?;
     let kind = if is_learner { "learner" } else { "node" };
-    println!("m6_gate {kind} {} up; parking (harness owns lifecycle)", a.id);
+    println!(
+        "m6_gate {kind} {} up; parking (harness owns lifecycle)",
+        a.id
+    );
     // Protocol 0.5.0: `reports_unattested` is a process-local counter, so the
     // cnc-reading `probe` role cannot see it. Emit it (with the wipe count) on
     // change to this unit's log — the orchestrator greps the logs, and a
@@ -489,10 +502,19 @@ impl Load {
         let stop = Arc::new(AtomicBool::new(false));
         let next_val = Arc::new(AtomicU64::new(1));
         let committed_max = Arc::new(AtomicU64::new(0));
-        let (s, nv, cm, d) =
-            (Arc::clone(&stop), Arc::clone(&next_val), Arc::clone(&committed_max), Arc::clone(&dirs));
+        let (s, nv, cm, d) = (
+            Arc::clone(&stop),
+            Arc::clone(&next_val),
+            Arc::clone(&committed_max),
+            Arc::clone(&dirs),
+        );
         let handle = thread::spawn(move || load_loop(s, nv, cm, d));
-        Load { stop, next_val, committed_max, handle: Some(handle) }
+        Load {
+            stop,
+            next_val,
+            committed_max,
+            handle: Some(handle),
+        }
     }
     fn committed_max(&self) -> u64 {
         self.committed_max.load(Ordering::Relaxed)
@@ -533,7 +555,9 @@ fn load_loop(
             Err(ClientError::NotLeader { hint }) => {
                 let c = client.take().unwrap();
                 c.shutdown();
-                target = hint.map(|h| h as usize % dirs.len()).unwrap_or((target + 1) % dirs.len());
+                target = hint
+                    .map(|h| h as usize % dirs.len())
+                    .unwrap_or((target + 1) % dirs.len());
             }
             Err(ClientError::BackpressureFull) | Err(ClientError::Retry) => {
                 thread::sleep(Duration::from_millis(2));
@@ -571,7 +595,9 @@ fn read_value(dirs: &[PathBuf], start: usize) -> Option<u64> {
         match out {
             Ok(v) => return Some(v),
             Err(ClientError::NotLeader { hint }) => {
-                target = hint.map(|h| h as usize % dirs.len()).unwrap_or((target + 1) % dirs.len());
+                target = hint
+                    .map(|h| h as usize % dirs.len())
+                    .unwrap_or((target + 1) % dirs.len());
             }
             Err(_) => {
                 thread::sleep(Duration::from_millis(20));
@@ -586,13 +612,17 @@ fn read_value(dirs: &[PathBuf], start: usize) -> Option<u64> {
 fn await_single_leader(nodes: &[Node], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].can_serve() && nodes[i].is_leader()).collect();
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].can_serve() && nodes[i].is_leader())
+            .collect();
         assert!(serving.len() <= 1, "split-brain: {serving:?}");
         if serving.len() == 1 {
             return serving[0];
         }
-        assert!(Instant::now() < deadline, "no single serving leader within {secs}s");
+        assert!(
+            Instant::now() < deadline,
+            "no single serving leader within {secs}s"
+        );
         thread::yield_now();
     }
 }
@@ -606,7 +636,9 @@ struct Verdict {
 }
 
 fn run_all(a: AllArgs) -> anyhow::Result<()> {
-    let root = a.root.unwrap_or_else(|| PathBuf::from("target/m6_gate_smoke"));
+    let root = a
+        .root
+        .unwrap_or_else(|| PathBuf::from("target/m6_gate_smoke"));
     anyhow::ensure!(
         !root.starts_with("/tmp"),
         "m6_gate all: root must be on a real filesystem (never /tmp — RAM tmpfs); got {root:?}"
@@ -614,7 +646,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root)?;
 
-    println!("== uc2 M6 gate: SMOKE (local, in-process; 3 voters + 1 learner + services + load) ==");
+    println!(
+        "== uc2 M6 gate: SMOKE (local, in-process; 3 voters + 1 learner + services + load) =="
+    );
     println!(
         "*** THIS IS NOT THE M6 GATE *** — one dev box, core-starved; the real bar (learner \
          join under fleet load + N purge cycles) is only claimable on the 3+1 c6id fleet run. \
@@ -625,11 +659,11 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     // voter's `learners` from boot (so they fan DATA out to it), but its NODE is
     // not started until the learner-join scenario.
     const NV: usize = 3;
-    let socks: Vec<UdpSocket> =
-        (0..NV + 1).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
+    let socks: Vec<UdpSocket> = (0..NV + 1)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
     let addrs: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().unwrap()).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        (0..NV).map(|i| (i as NodeId, addrs[i])).collect();
+    let members: Vec<(NodeId, SocketAddr)> = (0..NV).map(|i| (i as NodeId, addrs[i])).collect();
     let learners: Vec<(NodeId, SocketAddr)> = vec![(NV as NodeId, addrs[NV])];
 
     let mut socks = socks;
@@ -687,7 +721,12 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     println!("\n== M6 gate smoke results ==");
     let mut all_pass = true;
     for v in &verdicts {
-        println!("  [{}] {} — {}", if v.pass { "PASS" } else { "FAIL" }, v.scenario, v.detail);
+        println!(
+            "  [{}] {} — {}",
+            if v.pass { "PASS" } else { "FAIL" },
+            v.scenario,
+            v.detail
+        );
         all_pass &= v.pass;
     }
     if all_pass {
@@ -773,7 +812,9 @@ fn scenario_learner_join(
     let dip_note = if dip_measurable {
         format!("dip={dip:.1}% (fleet gate <10%)")
     } else {
-        format!("dip={dip:.1}% (window {join_secs:.2}s too short to gate on this box — informational)")
+        format!(
+            "dip={dip:.1}% (window {join_secs:.2}s too short to gate on this box — informational)"
+        )
     };
     Verdict {
         scenario: "learner-join",
@@ -807,13 +848,25 @@ fn scenario_purge_cycle(
         // Wait for purge to advance the floor (snapshot built + purged) so the
         // follower reconstruction goes below-floor via snapshot install.
         let pfloor_deadline = Instant::now() + Duration::from_secs(15);
-        while nodes.iter().map(|n| n.archive_first_base()).max().unwrap_or(0) == 0 {
+        while nodes
+            .iter()
+            .map(|n| n.archive_first_base())
+            .max()
+            .unwrap_or(0)
+            == 0
+        {
             if Instant::now() > pfloor_deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        if nodes.iter().map(|n| n.archive_first_base()).max().unwrap_or(0) > 0 {
+        if nodes
+            .iter()
+            .map(|n| n.archive_first_base())
+            .max()
+            .unwrap_or(0)
+            > 0
+        {
             purged = true;
         }
 

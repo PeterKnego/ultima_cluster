@@ -93,7 +93,10 @@ pub enum Reconcile {
 pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) -> Reconcile {
     // A leader with no map tells us nothing — our history is clean as-is.
     if leader.is_empty() {
-        return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: own.to_vec() });
+        return Reconcile::Ok(Outcome {
+            valid_up_to: own_durable,
+            new_map: own.to_vec(),
+        });
     }
 
     // ALIGN the leader's shipped window inside our (full) map before prefix
@@ -120,7 +123,10 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
             if own.is_empty() {
                 // Fresh node: nothing of ours to invalidate; our map grows
                 // only when we actually stream data.
-                return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: Vec::new() });
+                return Reconcile::Ok(Outcome {
+                    valid_up_to: own_durable,
+                    new_map: Vec::new(),
+                });
             }
             // The window starts INSIDE our byte range but our data-stamped map
             // never observed that term there: the bytes we hold at/above the
@@ -138,7 +144,10 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
                     new_map.push((term, base));
                 }
             }
-            return Reconcile::Ok(Outcome { valid_up_to: cut, new_map });
+            return Reconcile::Ok(Outcome {
+                valid_up_to: cut,
+                new_map,
+            });
         }
     };
 
@@ -188,7 +197,10 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
         }
     }
 
-    Reconcile::Ok(Outcome { valid_up_to, new_map })
+    Reconcile::Ok(Outcome {
+        valid_up_to,
+        new_map,
+    })
 }
 
 /// Mutation tooth (never in a default build): the PRE-2026-08-16 kernel,
@@ -202,9 +214,16 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
 /// twin can prove the sim catches it; selected through
 /// `ElectionSm::set_mutate_index_aligned_reconcile`.
 #[cfg(feature = "mutation-testing")]
-pub fn reconcile_index_aligned(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) -> Reconcile {
+pub fn reconcile_index_aligned(
+    own: &[(u32, u64)],
+    own_durable: u64,
+    leader: &[(u32, u64)],
+) -> Reconcile {
     if leader.is_empty() {
-        return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: own.to_vec() });
+        return Reconcile::Ok(Outcome {
+            valid_up_to: own_durable,
+            new_map: own.to_vec(),
+        });
     }
     let mut k = 0;
     while k < own.len() && k < leader.len() && own[k] == leader[k] {
@@ -227,7 +246,10 @@ pub fn reconcile_index_aligned(own: &[(u32, u64)], own_durable: u64, leader: &[(
             new_map.push((term, base));
         }
     }
-    Reconcile::Ok(Outcome { valid_up_to, new_map })
+    Reconcile::Ok(Outcome {
+        valid_up_to,
+        new_map,
+    })
 }
 
 #[cfg(test)]
@@ -393,7 +415,10 @@ mod tests {
         match reconcile(&own, durable, &leader) {
             Reconcile::Ok(o) => {
                 assert_eq!(o.valid_up_to, durable, "healthy follower must not truncate");
-                assert_eq!(o.new_map, own, "full map survives, below-window entries kept");
+                assert_eq!(
+                    o.new_map, own,
+                    "full map survives, below-window entries kept"
+                );
             }
             other => panic!("expected clean Ok, got {other:?}"),
         }
@@ -414,7 +439,11 @@ mod tests {
                 // Divergence at our (71, 70_000) vs leader (72, 69_500):
                 // leader-side clamp fires at 69_500.
                 assert_eq!(o.valid_up_to, 69_500);
-                assert!(o.new_map.iter().all(|&(_, b)| b < 69_500 || o.new_map.len() == 70));
+                assert!(
+                    o.new_map
+                        .iter()
+                        .all(|&(_, b)| b < 69_500 || o.new_map.len() == 70)
+                );
             }
             other => panic!("expected Ok with cut, got {other:?}"),
         }
@@ -443,7 +472,10 @@ mod tests {
         // entry begins far beyond our first byte, no overlap.
         let own = [(1, 0)];
         let leader = [(40, 1 << 20), (41, 2 << 20)];
-        assert!(matches!(reconcile(&own, 5000, &leader), Reconcile::NoCommonPrefix));
+        assert!(matches!(
+            reconcile(&own, 5000, &leader),
+            Reconcile::NoCommonPrefix
+        ));
     }
 
     #[test]

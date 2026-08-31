@@ -88,21 +88,27 @@ impl ObsServer {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
 
-        let thread = thread::Builder::new().name("uc2-obs".to_string()).spawn(move || {
-            let sources = sources;
-            while !stop_thread.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok((stream, _peer)) => handle_conn(stream, &sources),
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
-                    // Any other accept error (e.g. a transient EMFILE) is not
-                    // fatal to the server loop — back off the same as an
-                    // empty poll and try again.
-                    Err(_) => thread::sleep(ACCEPT_POLL),
+        let thread = thread::Builder::new()
+            .name("uc2-obs".to_string())
+            .spawn(move || {
+                let sources = sources;
+                while !stop_thread.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _peer)) => handle_conn(stream, &sources),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+                        // Any other accept error (e.g. a transient EMFILE) is not
+                        // fatal to the server loop — back off the same as an
+                        // empty poll and try again.
+                        Err(_) => thread::sleep(ACCEPT_POLL),
+                    }
                 }
-            }
-        })?;
+            })?;
 
-        Ok(ObsServer { thread: Some(thread), stop, local_addr })
+        Ok(ObsServer {
+            thread: Some(thread),
+            stop,
+            local_addr,
+        })
     }
 
     /// The bound address — meaningful when `serve` was called with port 0.
@@ -148,7 +154,10 @@ fn handle_conn(mut stream: TcpStream, sources: &ObsSources) {
             // the accept loop, hostage. Drop it and move on.
             return;
         }
-        if stream.set_read_timeout(Some(remaining.min(READ_TIMEOUT))).is_err() {
+        if stream
+            .set_read_timeout(Some(remaining.min(READ_TIMEOUT)))
+            .is_err()
+        {
             return;
         }
         match stream.read(&mut chunk) {
@@ -178,8 +187,10 @@ fn handle_conn(mut stream: TcpStream, sources: &ObsSources) {
 /// is a 404 (chosen over 405 for a single-purpose scrape/probe endpoint
 /// with no other verbs to advertise).
 fn route(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String) {
-    let request_line =
-        std::str::from_utf8(buf).ok().and_then(|text| text.lines().next()).unwrap_or("");
+    let request_line = std::str::from_utf8(buf)
+        .ok()
+        .and_then(|text| text.lines().next())
+        .unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("").split('?').next().unwrap_or("");
@@ -247,7 +258,11 @@ fn readyz(sources: &ObsSources) -> (u16, &'static str, String) {
     let can_serve = flags & NODE_FLAG_CAN_SERVE != 0;
 
     if is_leader && !can_serve {
-        return (503, "text/plain", "elected, NewTerm not yet quorum-committed\n".to_string());
+        return (
+            503,
+            "text/plain",
+            "elected, NewTerm not yet quorum-committed\n".to_string(),
+        );
     }
 
     let now = now_unix_ns();
@@ -262,7 +277,11 @@ fn readyz(sources: &ObsSources) -> (u16, &'static str, String) {
     }
 
     let role = if is_leader { "leader" } else { "follower" };
-    (200, "text/plain", format!("ok role={role} can_serve={can_serve}\n"))
+    (
+        200,
+        "text/plain",
+        format!("ok role={role} can_serve={can_serve}\n"),
+    )
 }
 
 fn first_dead_agent(sources: &ObsSources) -> Option<&'static str> {

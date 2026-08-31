@@ -168,7 +168,10 @@ impl PipelinedClient {
     /// of retry on transient `Backpressure`/`NotServing` (see the module's
     /// grace-loop docs on [`Self::dispatch`]). Returns a [`Ticket`] the
     /// driver resolves once the engine emits a completion.
-    pub fn submit<C: Serialize, R: DeserializeOwned>(&self, cmd: &C) -> Result<Ticket<R>, ClientError> {
+    pub fn submit<C: Serialize, R: DeserializeOwned>(
+        &self,
+        cmd: &C,
+    ) -> Result<Ticket<R>, ClientError> {
         let bytes = encode(cmd)?;
         self.dispatch(&bytes, true, |send, ud, b| send.try_submit(ud, b))
     }
@@ -200,7 +203,9 @@ impl PipelinedClient {
         q: &Q,
     ) -> Result<Ticket<QR>, ClientError> {
         let bytes = encode(q)?;
-        self.dispatch(&bytes, true, |send, ud, b| send.try_query(ud, b, Consistency::Snapshot))
+        self.dispatch(&bytes, true, |send, ud, b| {
+            send.try_query(ud, b, Consistency::Snapshot)
+        })
     }
 
     /// M14b: the attached node's declared-FSM set (bit i ⇔ FSM i is declared),
@@ -221,7 +226,9 @@ impl PipelinedClient {
         cmd: &C,
     ) -> Result<Ticket<R>, ClientError> {
         let bytes = encode(cmd)?;
-        self.dispatch(&bytes, true, move |send, ud, b| send.try_submit_to(ud, id, b))
+        self.dispatch(&bytes, true, move |send, ud, b| {
+            send.try_submit_to(ud, id, b)
+        })
     }
 
     /// M14b: submit a command and collect EVERY declared FSM's answer in one
@@ -358,7 +365,9 @@ impl PipelinedClient {
                         continue;
                     }
                     reclaim(user_data);
-                    return Err(ClientError::NotLeader { hint: self.leader_hint() });
+                    return Err(ClientError::NotLeader {
+                        hint: self.leader_hint(),
+                    });
                 }
                 Err(SubmitError::PayloadTooLarge { len, max }) => {
                     reclaim(user_data);
@@ -489,58 +498,62 @@ fn spawn_driver(
     request_timeout: Duration,
     declared: u64,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new().name("uc2-pipelined-driver".into()).spawn(move || {
-        let mut guard = DriverGuard(poll);
-        let wh = guard.0.wait_handle();
-        let mut resolve = |c: Completion<'_>| {
-            // SAFETY: user_data is the raw Arc<TicketCore> leaked by
-            // `PipelinedClient::dispatch`; the engine emits exactly one
-            // completion per accepted request, so this is the one matching
-            // `from_raw` for that leak.
-            let core = unsafe { Arc::from_raw(c.user_data as *const TicketCore) };
-            core.resolve(match c.outcome {
-                Outcome::Response(bytes) => Ok(Resolved::One {
-                    position: c.position.unwrap_or(0),
-                    bytes: bytes::Bytes::copy_from_slice(bytes),
-                }),
-                // M14b: cloning the pieces out of the engine's fan-in buffer
-                // is a refcount bump each, not a payload copy.
-                Outcome::Responses(parts) => Ok(Resolved::Many {
-                    position: c.position.unwrap_or(0),
-                    parts: parts.to_vec(),
-                }),
-                // M14b: the node has no ring for the id it was handed.
-                Outcome::BadService { id } => Err(ClientError::ServiceNotDeclared { id, declared }),
-                Outcome::NotLeader { hint } => Err(ClientError::NotLeader { hint }),
-                Outcome::Retry => Err(ClientError::Retry),
-                Outcome::TimedOut => Err(ClientError::Timeout(request_timeout)),
-                Outcome::InstanceRestart { attached, current } => {
-                    Err(ClientError::InstanceRestart { attached, current })
+    std::thread::Builder::new()
+        .name("uc2-pipelined-driver".into())
+        .spawn(move || {
+            let mut guard = DriverGuard(poll);
+            let wh = guard.0.wait_handle();
+            let mut resolve = |c: Completion<'_>| {
+                // SAFETY: user_data is the raw Arc<TicketCore> leaked by
+                // `PipelinedClient::dispatch`; the engine emits exactly one
+                // completion per accepted request, so this is the one matching
+                // `from_raw` for that leak.
+                let core = unsafe { Arc::from_raw(c.user_data as *const TicketCore) };
+                core.resolve(match c.outcome {
+                    Outcome::Response(bytes) => Ok(Resolved::One {
+                        position: c.position.unwrap_or(0),
+                        bytes: bytes::Bytes::copy_from_slice(bytes),
+                    }),
+                    // M14b: cloning the pieces out of the engine's fan-in buffer
+                    // is a refcount bump each, not a payload copy.
+                    Outcome::Responses(parts) => Ok(Resolved::Many {
+                        position: c.position.unwrap_or(0),
+                        parts: parts.to_vec(),
+                    }),
+                    // M14b: the node has no ring for the id it was handed.
+                    Outcome::BadService { id } => {
+                        Err(ClientError::ServiceNotDeclared { id, declared })
+                    }
+                    Outcome::NotLeader { hint } => Err(ClientError::NotLeader { hint }),
+                    Outcome::Retry => Err(ClientError::Retry),
+                    Outcome::TimedOut => Err(ClientError::Timeout(request_timeout)),
+                    Outcome::InstanceRestart { attached, current } => {
+                        Err(ClientError::InstanceRestart { attached, current })
+                    }
+                });
+            };
+            let mut idle = Idle::for_strategy(ws);
+            while !stop.load(Ordering::Relaxed) {
+                let n = guard.0.poll(&mut resolve);
+                if n > 0 {
+                    idle = Idle::for_strategy(ws); // progress resets the ladder
+                    continue;
                 }
-            });
-        };
-        let mut idle = Idle::for_strategy(ws);
-        while !stop.load(Ordering::Relaxed) {
-            let n = guard.0.poll(&mut resolve);
-            if n > 0 {
-                idle = Idle::for_strategy(ws); // progress resets the ladder
-                continue;
-            }
-            match ws {
-                WaitStrategy::BusySpin => std::hint::spin_loop(),
-                WaitStrategy::BackoffYield | WaitStrategy::Backoff => idle.idle(),
-                WaitStrategy::Park => {
-                    let seq = wh.current_seq();
-                    let _arm = ArmGuard::new(&wh); // disarms on drop, incl. on unwind
-                    if guard.0.poll(&mut resolve) == 0 && !stop.load(Ordering::Relaxed) {
-                        wh.park(seq, Duration::from_millis(1));
+                match ws {
+                    WaitStrategy::BusySpin => std::hint::spin_loop(),
+                    WaitStrategy::BackoffYield | WaitStrategy::Backoff => idle.idle(),
+                    WaitStrategy::Park => {
+                        let seq = wh.current_seq();
+                        let _arm = ArmGuard::new(&wh); // disarms on drop, incl. on unwind
+                        if guard.0.poll(&mut resolve) == 0 && !stop.load(Ordering::Relaxed) {
+                            wh.park(seq, Duration::from_millis(1));
+                        }
                     }
                 }
             }
-        }
-        // `guard` drops here (or, on an unwind out of the loop above, during
-        // stack unwinding) — its `Drop` runs the shutdown drain either way.
-    })
+            // `guard` drops here (or, on an unwind out of the loop above, during
+            // stack unwinding) — its `Drop` runs the shutdown drain either way.
+        })
 }
 
 #[cfg(test)]
@@ -572,7 +585,10 @@ mod tests {
     }
 
     fn rand_u128() -> u128 {
-        let a = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let a = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         a ^ 0xA5A5_5A5A_A5A5_5A5A_u128
     }
 
@@ -592,8 +608,7 @@ mod tests {
     fn make_instance_two_fsms(dir: &std::path::Path, app_id: &str) {
         use uc_protocol::ring::{BroadcastRing, MpscRing};
         const MIB: u64 = 1 << 20;
-        let page =
-            uc_log::cnc::CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
+        let page = uc_log::cnc::CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
         page.store_services_declared(0b11);
         MpscRing::create(&dir.join("ingress.ring"), MIB, 128).unwrap();
         MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
@@ -616,7 +631,10 @@ mod tests {
         let (send, poll) = Engine::attach(
             dir.path(),
             "guard-panic",
-            EngineConfig { serving_gate: false, ..EngineConfig::default() },
+            EngineConfig {
+                serving_gate: false,
+                ..EngineConfig::default()
+            },
         )
         .unwrap();
 
@@ -658,7 +676,10 @@ mod tests {
         let (_send, poll) = Engine::attach(
             dir.path(),
             "arm-panic",
-            EngineConfig { serving_gate: false, ..EngineConfig::default() },
+            EngineConfig {
+                serving_gate: false,
+                ..EngineConfig::default()
+            },
         )
         .unwrap();
         let wh = poll.wait_handle();
@@ -698,13 +719,19 @@ mod tests {
         let client = PipelinedClient::connect(
             dir.path(),
             "fan",
-            PipelinedConfig { serving_gate: false, ..PipelinedConfig::default() },
+            PipelinedConfig {
+                serving_gate: false,
+                ..PipelinedConfig::default()
+            },
         )
         .unwrap();
         assert_eq!(client.declared(), 0b11);
         assert!(matches!(
             client.submit_to::<u64, u64>(2, &1),
-            Err(ClientError::ServiceNotDeclared { id: 2, declared: 0b11 })
+            Err(ClientError::ServiceNotDeclared {
+                id: 2,
+                declared: 0b11
+            })
         ));
         let ticket = client.submit_all::<u64, u64>(&1).unwrap();
         let cid = client.client_id();

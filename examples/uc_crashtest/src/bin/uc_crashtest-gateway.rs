@@ -76,9 +76,13 @@ fn parse_members(s: &str) -> Vec<Member> {
             let (id, addr) = part
                 .split_once('@')
                 .unwrap_or_else(|| panic!("bad --members entry {part:?}, expected id@addr"));
-            let node_id: u32 =
-                id.parse().unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
-            Member { node_id, gateway: addr.to_string() }
+            let node_id: u32 = id
+                .parse()
+                .unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
+            Member {
+                node_id,
+                gateway: addr.to_string(),
+            }
         })
         .collect()
 }

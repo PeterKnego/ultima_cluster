@@ -102,7 +102,10 @@ fn meta(app_id: &str) -> CncMeta {
 }
 
 fn rand_u128() -> u128 {
-    let a = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let a = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     a ^ 0xA5A5_5A5A_A5A5_5A5A_u128
 }
 
@@ -147,9 +150,8 @@ fn block_on<F: std::future::Future>(mut fut: F) -> F::Output {
 }
 
 fn connect(dir: &std::path::Path) -> uc_client::PipelinedClient {
-    uc_client::PipelinedClient::connect(
-        dir, "pipe-test", uc_client::PipelinedConfig::default(),
-    ).unwrap()
+    uc_client::PipelinedClient::connect(dir, "pipe-test", uc_client::PipelinedConfig::default())
+        .unwrap()
 }
 
 #[test]
@@ -158,13 +160,17 @@ fn pipelined_submits_all_resolve_and_totals_are_a_permutation_free_prefix() {
     let node = Node::start(node_config(dir.path(), "pipe-test")).unwrap();
     wait_until(|| node.can_serve());
     let _svc = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), "pipe-test"), CountSm::default(),
-    ).start().unwrap();
+        ServiceConfig::new(dir.path(), "pipe-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     let client = connect(dir.path());
     // WINDOW of outstanding tickets — the whole point of the layer.
-    let tickets: Vec<uc_client::Ticket<u64>> =
-        (0..100).map(|_| client.submit(&Cmd::Add(1)).unwrap()).collect();
+    let tickets: Vec<uc_client::Ticket<u64>> = (0..100)
+        .map(|_| client.submit(&Cmd::Add(1)).unwrap())
+        .collect();
     let mut totals: Vec<u64> = tickets.into_iter().map(|t| t.wait().unwrap()).collect();
     // A single client's submits are applied in submission order (one MPSC
     // producer, FIFO ring, in-order apply): totals must be exactly 1..=100.
@@ -178,8 +184,11 @@ fn async_await_resolves_against_a_real_cluster() {
     let node = Node::start(node_config(dir.path(), "pipe-test")).unwrap();
     wait_until(|| node.can_serve());
     let _svc = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), "pipe-test"), CountSm::default(),
-    ).start().unwrap();
+        ServiceConfig::new(dir.path(), "pipe-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     let client = connect(dir.path());
     let got: u64 = block_on(client.submit::<_, u64>(&Cmd::Add(7)).unwrap()).unwrap();
@@ -192,11 +201,18 @@ fn queries_ride_the_same_engine() {
     let node = Node::start(node_config(dir.path(), "pipe-test")).unwrap();
     wait_until(|| node.can_serve());
     let _svc = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), "pipe-test"), CountSm::default(),
-    ).start().unwrap();
+        ServiceConfig::new(dir.path(), "pipe-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     let client = connect(dir.path());
-    client.submit::<_, u64>(&Cmd::Add(3)).unwrap().wait().unwrap();
+    client
+        .submit::<_, u64>(&Cmd::Add(3))
+        .unwrap()
+        .wait()
+        .unwrap();
     let snap: u64 = client.query_snapshot(&()).unwrap().wait().unwrap();
     assert_eq!(snap, 3);
     let lin: u64 = client.query_linearizable(&()).unwrap().wait().unwrap();
@@ -209,13 +225,20 @@ fn dropping_a_ticket_orphans_cleanly_and_later_traffic_is_unaffected() {
     let node = Node::start(node_config(dir.path(), "pipe-test")).unwrap();
     wait_until(|| node.can_serve());
     let _svc = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), "pipe-test"), CountSm::default(),
-    ).start().unwrap();
+        ServiceConfig::new(dir.path(), "pipe-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     let client = connect(dir.path());
     drop(client.submit::<_, u64>(&Cmd::Add(1)).unwrap()); // abandon interest
     // The orphan's response is discarded by the driver; nothing wedges:
-    let got: u64 = client.submit::<_, u64>(&Cmd::Add(1)).unwrap().wait().unwrap();
+    let got: u64 = client
+        .submit::<_, u64>(&Cmd::Add(1))
+        .unwrap()
+        .wait()
+        .unwrap();
     assert_eq!(got, 2);
 }
 
@@ -226,9 +249,14 @@ fn shutdown_fails_inflight_tickets_with_shutdown() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     make_instance(dir.path(), "pipe-shut", 1 << 20, 1 << 20); // synthetic.rs helper, copied in
     let client = uc_client::PipelinedClient::connect(
-        dir.path(), "pipe-shut",
-        uc_client::PipelinedConfig { serving_gate: false, ..Default::default() },
-    ).unwrap();
+        dir.path(),
+        "pipe-shut",
+        uc_client::PipelinedConfig {
+            serving_gate: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let t = client.submit::<_, u64>(&1u8).unwrap();
     client.shutdown();
     assert!(matches!(t.wait(), Err(uc_client::ClientError::ShutDown)));
@@ -248,7 +276,9 @@ fn refusal_path_reports_backpressure_full_and_shutdown_is_still_clean() {
     // Fill the ingress ring completely via a raw producer, exactly like
     // tests/synthetic.rs's `ingress_ring_stays_full_returns_backpressure_full`
     // — nobody reads it (no node/service running here), so it stays full.
-    let (filler, _consumer) = MpscRing::open(&dir.path().join("ingress.ring")).unwrap().into_split();
+    let (filler, _consumer) = MpscRing::open(&dir.path().join("ingress.ring"))
+        .unwrap()
+        .into_split();
     loop {
         if filler.try_write(1, 0, [0; 8], &[0u8; 8]).is_err() {
             break; // Full (or TooLarge for the last partial slot) — full enough.
@@ -256,9 +286,14 @@ fn refusal_path_reports_backpressure_full_and_shutdown_is_still_clean() {
     }
 
     let client = uc_client::PipelinedClient::connect(
-        dir.path(), "pipe-bp",
-        uc_client::PipelinedConfig { serving_gate: false, ..Default::default() },
-    ).unwrap();
+        dir.path(),
+        "pipe-bp",
+        uc_client::PipelinedConfig {
+            serving_gate: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     // Fail-fast: no retry loop, refused on the first attempt.
     let t0 = Instant::now();
@@ -283,8 +318,14 @@ fn refusal_path_reports_backpressure_full_and_shutdown_is_still_clean() {
         Err(e) => panic!("expected BackpressureFull, got {e:?}"),
         Ok(_) => panic!("expected BackpressureFull, got a Ticket (ring wasn't actually full)"),
     }
-    assert!(grace_elapsed >= Duration::from_millis(900), "must honor the ~1s grace: {grace_elapsed:?}");
-    assert!(grace_elapsed < Duration::from_secs(5), "must not hang well past the grace window: {grace_elapsed:?}");
+    assert!(
+        grace_elapsed >= Duration::from_millis(900),
+        "must honor the ~1s grace: {grace_elapsed:?}"
+    );
+    assert!(
+        grace_elapsed < Duration::from_secs(5),
+        "must not hang well past the grace window: {grace_elapsed:?}"
+    );
 
     // Every refusal above reclaimed its leaked Arc<TicketCore> on its own
     // error path (never handed to the driver) — shutdown must still be
@@ -300,8 +341,11 @@ fn every_wait_strategy_round_trips() {
     let node = Node::start(node_config(dir.path(), "pipe-test")).unwrap();
     wait_until(|| node.can_serve());
     let _svc = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), "pipe-test"), CountSm::default(),
-    ).start().unwrap();
+        ServiceConfig::new(dir.path(), "pipe-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     for ws in [
         uc_client::WaitStrategy::BusySpin,
@@ -310,9 +354,14 @@ fn every_wait_strategy_round_trips() {
         uc_client::WaitStrategy::Park,
     ] {
         let client = uc_client::PipelinedClient::connect(
-            dir.path(), "pipe-test",
-            uc_client::PipelinedConfig { driver_wait: ws, ..Default::default() },
-        ).unwrap();
+            dir.path(),
+            "pipe-test",
+            uc_client::PipelinedConfig {
+                driver_wait: ws,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let _: u64 = client.submit(&Cmd::Add(1)).unwrap().wait().unwrap();
         client.shutdown();
     }

@@ -166,7 +166,8 @@ impl Observed {
                   engine suite measures a grant change"
     )]
     pub fn reset_peak(&self) {
-        self.max_unanswered.store(self.unanswered.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.max_unanswered
+            .store(self.unanswered.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// The observed seqs with consecutive duplicates collapsed — a re-send after
@@ -225,7 +226,12 @@ impl FakeEdge {
                 let _ = c.join();
             }
         });
-        FakeEdge { addr, observed, stop, acceptor: Some(acceptor) }
+        FakeEdge {
+            addr,
+            observed,
+            stop,
+            acceptor: Some(acceptor),
+        }
     }
 
     fn stop_inner(&mut self) {
@@ -244,14 +250,29 @@ impl Drop for FakeEdge {
 
 /// One queued answer.
 enum Action {
-    Respond { seq: u64, is_query: bool, payload: Vec<u8> },
-    Redirect { seq: u64, addr: String },
-    Retry { seq: u64, reason: u8, after_us: u32 },
-    Unknown { seq: u64 },
+    Respond {
+        seq: u64,
+        is_query: bool,
+        payload: Vec<u8>,
+    },
+    Redirect {
+        seq: u64,
+        addr: String,
+    },
+    Retry {
+        seq: u64,
+        reason: u8,
+        after_us: u32,
+    },
+    Unknown {
+        seq: u64,
+    },
     /// A standalone `STATUS` frame carrying a fresh absolute grant. The
     /// responder fills in `acked_seq` from its own running high-water mark —
     /// the same per-connection accounting a real edge does.
-    Status { credits: u32 },
+    Status {
+        credits: u32,
+    },
     Pong,
     DropConn,
 }
@@ -261,7 +282,11 @@ type Queue = Arc<(Mutex<VecDeque<Action>>, Condvar)>;
 fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>, is_first: bool) {
     // Per-connection resolution of the two "first connection only" knobs.
     let hang = b.hang || (b.hang_first && is_first);
-    let credits = if is_first { b.credits } else { b.second_credits.unwrap_or(b.credits) };
+    let credits = if is_first {
+        b.credits
+    } else {
+        b.second_credits.unwrap_or(b.credits)
+    };
     // A raw duplicate of the socket, kept so `partial_frame_then_hang` can put
     // a DELIBERATELY incomplete frame on the wire — `FramedConn` only ever
     // writes whole ones, which is the point of it.
@@ -270,7 +295,8 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
         Ok(c) => c,
         Err(_) => return,
     };
-    rd.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    rd.set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
     let mut wr = match rd.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -296,14 +322,29 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
     let client_id = h.client_id;
     let mut out = Vec::new();
     if let Some(reason) = b.refuse_hello {
-        HelloRefused { reason, detail: "refused by the fake edge" }.encode(&mut out);
+        HelloRefused {
+            reason,
+            detail: "refused by the fake edge",
+        }
+        .encode(&mut out);
         let _ = wr.write_frame(hdr(FrameType::HelloRefused, 0, client_id, 0), &out);
         return;
     }
     let self_addr = rd.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    let advertised = b.hello_ok_leader_addr.clone().unwrap_or_else(|| self_addr.clone());
-    HelloOk { credits, leader: Some(1), leader_addr: &advertised }.encode(&mut out);
-    if wr.write_frame(hdr(FrameType::HelloOk, 0, client_id, 0), &out).is_err() {
+    let advertised = b
+        .hello_ok_leader_addr
+        .clone()
+        .unwrap_or_else(|| self_addr.clone());
+    HelloOk {
+        credits,
+        leader: Some(1),
+        leader_addr: &advertised,
+    }
+    .encode(&mut out);
+    if wr
+        .write_frame(hdr(FrameType::HelloOk, 0, client_id, 0), &out)
+        .is_err()
+    {
         return;
     }
 
@@ -313,7 +354,12 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
         let Some(mut raw) = raw else { return };
         let mut frame = Vec::new();
         let mut body = Vec::new();
-        ResponseMeta { credits, acked_seq: 0, position: 0 }.encode(&mut body);
+        ResponseMeta {
+            credits,
+            acked_seq: 0,
+            position: 0,
+        }
+        .encode(&mut body);
         encode_frame(&mut frame, hdr(FrameType::Response, 0, client_id, 1), &body);
         // Header plus one payload byte: enough to leave the peer's parser
         // committed to a frame it will never see the end of.
@@ -347,9 +393,15 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                     }
                     let once = is_first && !used_once;
                     let action = if b.redirect_to_self {
-                        Action::Redirect { seq: h.seq, addr: self_addr.clone() }
+                        Action::Redirect {
+                            seq: h.seq,
+                            addr: self_addr.clone(),
+                        }
                     } else if let Some(addr) = &b.redirect_all_to {
-                        Action::Redirect { seq: h.seq, addr: addr.clone() }
+                        Action::Redirect {
+                            seq: h.seq,
+                            addr: addr.clone(),
+                        }
                     } else if once && b.drop_after_first_request {
                         used_once = true;
                         Action::DropConn
@@ -362,13 +414,21 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                         }
                     } else if once && b.not_serving_once {
                         used_once = true;
-                        Action::Retry { seq: h.seq, reason: RETRY_NOT_SERVING, after_us: 1000 }
+                        Action::Retry {
+                            seq: h.seq,
+                            reason: RETRY_NOT_SERVING,
+                            after_us: 1000,
+                        }
                     } else if once && b.unknown_once {
                         used_once = true;
                         Action::Unknown { seq: h.seq }
                     } else if once && b.payload_too_large_once {
                         used_once = true;
-                        Action::Retry { seq: h.seq, reason: RETRY_PAYLOAD_TOO_LARGE, after_us: 0 }
+                        Action::Retry {
+                            seq: h.seq,
+                            reason: RETRY_PAYLOAD_TOO_LARGE,
+                            after_us: 0,
+                        }
                     } else {
                         let mut bytes = payload.to_vec();
                         bytes.reverse();
@@ -469,7 +529,11 @@ fn respond(
                 wr.shutdown();
                 return;
             }
-            Action::Respond { seq, is_query, payload } => {
+            Action::Respond {
+                seq,
+                is_query,
+                payload,
+            } => {
                 let mut flags = 0u8;
                 if is_query {
                     flags |= FLAG_IS_QUERY;
@@ -484,18 +548,35 @@ fn respond(
                 if !is_query {
                     acked_seq = acked_seq.max(seq);
                 }
-                ResponseMeta { credits, acked_seq, position: seq * 64 }.encode(&mut out);
+                ResponseMeta {
+                    credits,
+                    acked_seq,
+                    position: seq * 64,
+                }
+                .encode(&mut out);
                 out.extend_from_slice(&payload);
                 o.answering();
                 wr.write_frame(hdr(FrameType::Response, flags, client_id, seq), &out)
             }
             Action::Redirect { seq, addr } => {
-                Leader { node_id: 2, addr: &addr }.encode(&mut out);
+                Leader {
+                    node_id: 2,
+                    addr: &addr,
+                }
+                .encode(&mut out);
                 o.answering();
                 wr.write_frame(hdr(FrameType::Redirect, 0, client_id, seq), &out)
             }
-            Action::Retry { seq, reason, after_us } => {
-                Retry { reason, retry_after_us: after_us }.encode(&mut out);
+            Action::Retry {
+                seq,
+                reason,
+                after_us,
+            } => {
+                Retry {
+                    reason,
+                    retry_after_us: after_us,
+                }
+                .encode(&mut out);
                 o.answering();
                 wr.write_frame(hdr(FrameType::Retry, 0, client_id, seq), &out)
             }
@@ -517,5 +598,11 @@ fn respond(
 }
 
 fn hdr(ty: FrameType, flags: u8, client_id: u64, seq: u64) -> Header {
-    Header { ty, flags, version: PROTOCOL_VERSION, client_id, seq }
+    Header {
+        ty,
+        flags,
+        version: PROTOCOL_VERSION,
+        client_id,
+        seq,
+    }
 }

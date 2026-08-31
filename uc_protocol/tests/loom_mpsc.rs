@@ -341,8 +341,9 @@ impl Ring {
             // the reload unconditionally models the same admission decision
             // with the same or more room, never less.
             let consumer_pos = self.consumer_position.load(Ordering::Acquire);
-            let free =
-                self.capacity.saturating_sub(claim_pos.saturating_sub(consumer_pos) as usize);
+            let free = self
+                .capacity
+                .saturating_sub(claim_pos.saturating_sub(consumer_pos) as usize);
             if free < ADVANCE {
                 return Err(ModelError::Full);
             }
@@ -372,7 +373,10 @@ impl Ring {
             // `write_record_body_at`: plain stores, ordered only by the
             // commit's Release below.
             self.bodies[slot].store(body, Ordering::Relaxed);
-            return Ok(Claim { pos: claim_pos, lap });
+            return Ok(Claim {
+                pos: claim_pos,
+                lap,
+            });
         }
     }
 
@@ -469,7 +473,10 @@ impl Ring {
                     self.consumer_position
                         .store(consumer_pos + ADVANCE as u64, Ordering::Release);
                     self.check_positions();
-                    return Ok(Read::Record { pos: consumer_pos, body });
+                    return Ok(Read::Record {
+                        pos: consumer_pos,
+                        body,
+                    });
                 }
             }
         }
@@ -486,7 +493,10 @@ impl Ring {
     fn drain(&self, timed_out: bool, budget: usize) -> Vec<(u64, u32)> {
         let mut out = Vec::new();
         for _ in 0..budget {
-            match self.try_read(timed_out).expect("no wedge or corruption in this model") {
+            match self
+                .try_read(timed_out)
+                .expect("no wedge or corruption in this model")
+            {
                 Read::Nothing => break,
                 Read::Record { pos, body } => out.push((pos, body)),
             }
@@ -533,21 +543,35 @@ fn every_committed_record_is_delivered_exactly_once_in_claim_order() {
         // records are committed.
         delivered.extend(ring.drain(false, ring.slots()));
 
-        assert_ne!(pos_a, pos_b, "two producers must never claim the same position");
+        assert_ne!(
+            pos_a, pos_b,
+            "two producers must never claim the same position"
+        );
         assert_eq!(
             ring.commit_count.load(Ordering::Acquire),
             2,
             "both commits bumped the wake word"
         );
-        assert_eq!(ring.holes_skipped.load(Ordering::Relaxed), 0, "no holes here");
+        assert_eq!(
+            ring.holes_skipped.load(Ordering::Relaxed),
+            0,
+            "no holes here"
+        );
 
         // Exactly once, in claim order.
         let positions: Vec<u64> = delivered.iter().map(|(p, _)| *p).collect();
         let mut sorted = positions.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(positions, sorted, "delivery must follow claim order, no duplicates");
-        assert_eq!(delivered.len(), 2, "both committed records delivered, exactly once");
+        assert_eq!(
+            positions, sorted,
+            "delivery must follow claim order, no duplicates"
+        );
+        assert_eq!(
+            delivered.len(),
+            2,
+            "both committed records delivered, exactly once"
+        );
 
         // …with the claiming producer's own bytes.
         for (pos, body) in delivered {
@@ -617,9 +641,20 @@ fn a_stalled_producer_never_blocks_another_producers_commit() {
 
         let pos_b = t_b.join().unwrap();
         let pos_c = t_c.join().unwrap();
-        assert_ne!(pos_b, pos_c, "two producers must never claim the same position");
-        assert_eq!(ring.holes_skipped.load(Ordering::Relaxed), 0, "the timeout never elapsed");
-        assert_eq!(ring.commit_count.load(Ordering::Acquire), 2, "B and C committed; A has not");
+        assert_ne!(
+            pos_b, pos_c,
+            "two producers must never claim the same position"
+        );
+        assert_eq!(
+            ring.holes_skipped.load(Ordering::Relaxed),
+            0,
+            "the timeout never elapsed"
+        );
+        assert_eq!(
+            ring.commit_count.load(Ordering::Acquire),
+            2,
+            "B and C committed; A has not"
+        );
 
         // Still head-of-line: both are committed, A is not.
         assert_eq!(ring.try_read(false).expect("no wedge"), Read::Nothing);
@@ -702,7 +737,10 @@ fn a_skip_and_a_commit_race_have_exactly_one_winner() {
                     "the skip won: the record must never be delivered, saw {delivered:?}"
                 );
                 assert_eq!(holes, 1, "the skip won: exactly one hole counted");
-                assert_eq!(consumer, ADVANCE as u64, "the consumer advanced past the hole");
+                assert_eq!(
+                    consumer, ADVANCE as u64,
+                    "the consumer advanced past the hole"
+                );
             }
             Err(other) => panic!("commit can only return Ok or Skipped, got {other:?}"),
         }
@@ -728,7 +766,11 @@ fn a_later_claimant_overwrites_the_marker_and_is_delivered_normally() {
         // out and marks the skip; a second record fills slot 1 and is read,
         // leaving the consumer exactly one lap from A's slot.
         let a = ring.claim(0xA).expect("A claims");
-        assert_eq!(ring.try_read(true).expect("no wedge"), Read::Nothing, "skips + marks the hole");
+        assert_eq!(
+            ring.try_read(true).expect("no wedge"),
+            Read::Nothing,
+            "skips + marks the hole"
+        );
         assert_eq!(ring.holes_skipped.load(Ordering::Relaxed), 1);
         assert_eq!(
             ring.words[0].load(Ordering::Acquire),
@@ -741,7 +783,10 @@ fn a_later_claimant_overwrites_the_marker_and_is_delivered_normally() {
             vec![(ADVANCE as u64, 0xB)],
             "the record behind the hole is delivered"
         );
-        assert_eq!(ring.consumer_position.load(Ordering::Acquire), TWO_SLOTS as u64);
+        assert_eq!(
+            ring.consumer_position.load(Ordering::Acquire),
+            TWO_SLOTS as u64
+        );
 
         // Now race the resurrection against the later claimant that takes
         // A's exact slot on the next lap.
@@ -755,7 +800,10 @@ fn a_later_claimant_overwrites_the_marker_and_is_delivered_normally() {
             Err(ModelError::Skipped),
             "a resurrected producer whose hole was marked is always refused"
         );
-        t_later.join().unwrap().expect("the later claimant commits normally");
+        t_later
+            .join()
+            .unwrap()
+            .expect("the later claimant commits normally");
 
         assert_eq!(
             ring.drain(false, ring.slots()),
@@ -767,6 +815,10 @@ fn a_later_claimant_overwrites_the_marker_and_is_delivered_normally() {
             1,
             "a refused resurrection is not a new hole"
         );
-        assert_eq!(ring.commit_count.load(Ordering::Acquire), 2, "B and C committed; A did not");
+        assert_eq!(
+            ring.commit_count.load(Ordering::Acquire),
+            2,
+            "B and C committed; A did not"
+        );
     });
 }

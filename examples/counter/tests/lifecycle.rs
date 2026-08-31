@@ -31,7 +31,12 @@ impl Drop for Reaped {
 }
 
 fn spawn(cmd: &mut Command) -> Reaped {
-    Reaped(cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"))
+    Reaped(
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn"),
+    )
 }
 
 #[test]
@@ -54,8 +59,11 @@ fn service_template_stops_cleanly_on_sigterm() {
     );
     std::thread::sleep(Duration::from_millis(1000));
 
-    let mut svc =
-        spawn(Command::new(env!("CARGO_BIN_EXE_counter-service")).arg("--instance-dir").arg(&inst));
+    let mut svc = spawn(
+        Command::new(env!("CARGO_BIN_EXE_counter-service"))
+            .arg("--instance-dir")
+            .arg(&inst),
+    );
     std::thread::sleep(Duration::from_millis(1000));
 
     unsafe { libc::kill(svc.0.id() as i32, libc::SIGTERM) };

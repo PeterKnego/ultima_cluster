@@ -69,22 +69,26 @@ pub trait RawStateMachine: Send + 'static {
 impl<S: StateMachine> RawStateMachine for S {
     #[inline]
     fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
-        let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
-            .expect("corrupt committed frame (fail-stop)");
+        let (cmd, _) =
+            bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
+                .expect("corrupt committed frame (fail-stop)");
         let resp = StateMachine::apply(self, position, cmd);
         bincode::serde::encode_into_std_write(&resp, out, bincode::config::standard())
             .expect("response bincode-encode (fail-stop)");
     }
     #[inline]
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
-        let (q, _) = bincode::serde::decode_from_slice::<S::Query, _>(q, bincode::config::standard())
-            .expect("corrupt query frame (fail-stop)");
+        let (q, _) =
+            bincode::serde::decode_from_slice::<S::Query, _>(q, bincode::config::standard())
+                .expect("corrupt query frame (fail-stop)");
         let qr = StateMachine::query(self, q);
         bincode::serde::encode_into_std_write(&qr, out, bincode::config::standard())
             .expect("query-response bincode-encode (fail-stop)");
     }
     #[inline]
-    fn last_applied(&self) -> Option<u64> { StateMachine::last_applied(self) }
+    fn last_applied(&self) -> Option<u64> {
+        StateMachine::last_applied(self)
+    }
 }
 
 /// Optional capability: state machines that can serialize their full state and
@@ -180,7 +184,14 @@ pub trait RawOutputHandler<S: RawStateMachine>: Send + 'static {
 }
 
 impl<S: RawStateMachine> RawOutputHandler<S> for NoopOutput {
-    async fn on_committed(&self, _position: u64, _cmd: &[u8], _state: &S) -> Result<(), OutputError> { Ok(()) }
+    async fn on_committed(
+        &self,
+        _position: u64,
+        _cmd: &[u8],
+        _state: &S,
+    ) -> Result<(), OutputError> {
+        Ok(())
+    }
 }
 
 /// Adapts a typed [`OutputHandler`] to the raw tier (one bincode decode per
@@ -189,8 +200,9 @@ pub struct TypedOutput<O>(pub O);
 
 impl<S: StateMachine, O: OutputHandler<S>> RawOutputHandler<S> for TypedOutput<O> {
     async fn on_committed(&self, position: u64, cmd: &[u8], state: &S) -> Result<(), OutputError> {
-        let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
-            .expect("corrupt committed frame (fail-stop)");
+        let (cmd, _) =
+            bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
+                .expect("corrupt committed frame (fail-stop)");
         self.0.on_committed(position, &cmd, state).await
     }
 }

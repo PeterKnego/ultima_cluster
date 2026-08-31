@@ -19,7 +19,11 @@ const APP: &str = "fakeapp";
 const WAIT: Duration = Duration::from_secs(10);
 
 fn cfg(members: Vec<String>) -> RemoteConfig {
-    RemoteConfig { app_id: APP.into(), members, ..Default::default() }
+    RemoteConfig {
+        app_id: APP.into(),
+        members,
+        ..Default::default()
+    }
 }
 
 /// Drive `n` requests through the halves, returning `(user_data, position,
@@ -48,9 +52,18 @@ fn run_submits(
             }
         }
         poll.poll(|c| match c.outcome {
-            RemoteOutcome::Response { body, replayed, expired } => {
+            RemoteOutcome::Response {
+                body,
+                replayed,
+                expired,
+            } => {
                 assert!(!expired, "unexpected EXPIRED for {}", c.user_data);
-                got.push((c.user_data, c.position.unwrap_or(0), body.to_vec(), replayed));
+                got.push((
+                    c.user_data,
+                    c.position.unwrap_or(0),
+                    body.to_vec(),
+                    replayed,
+                ));
             }
             other => panic!("unexpected outcome for {}: {other:?}", c.user_data),
         });
@@ -72,14 +85,26 @@ fn until(mut pred: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn connect_completes_the_handshake_and_adopts_the_granted_credits() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let (send, _poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     assert_eq!(send.credits(), 4, "HELLO_OK's grant is the initial window");
     assert_eq!(send.stats().max_credits_seen, 4);
-    assert_eq!(send.leader().map(|(id, _)| id), Some(1), "HELLO_OK names the leader");
+    assert_eq!(
+        send.leader().map(|(id, _)| id),
+        Some(1),
+        "HELLO_OK names the leader"
+    );
     assert!(send.is_connected());
     assert_eq!(send.connected_addr(), Some(edge.addr.clone()));
-    assert_eq!(edge.observed.hellos.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        edge.observed
+            .hellos
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     send.shutdown();
 }
 
@@ -89,8 +114,11 @@ fn an_idle_status_updates_the_window_without_any_traffic_from_us() {
     // on its own timer, sends a standalone STATUS carrying a NEW absolute
     // grant. What this pins is that the reader thread applies an unsolicited
     // STATUS — the window moving with no request of ours involved.
-    let edge =
-        FakeEdge::spawn(Behaviour { credits: 3, shrink_credits_to: Some(1), ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 3,
+        shrink_credits_to: Some(1),
+        ..Default::default()
+    });
     let (send, _poll) = RemoteEngine::connect(RemoteConfig {
         ping_interval: Duration::from_millis(50),
         dead_after: Duration::from_millis(400),
@@ -104,9 +132,16 @@ fn an_idle_status_updates_the_window_without_any_traffic_from_us() {
         send.credits(),
         send.stats()
     );
-    assert!(send.is_connected(), "PING/PONG must keep an idle connection alive");
+    assert!(
+        send.is_connected(),
+        "PING/PONG must keep an idle connection alive"
+    );
     assert_eq!(send.stats().reconnects, 0);
-    assert_eq!(send.stats().max_credits_seen, 3, "max_credits_seen is a high-water mark");
+    assert_eq!(
+        send.stats().max_credits_seen,
+        3,
+        "max_credits_seen is a high-water mark"
+    );
     send.shutdown();
 }
 
@@ -120,7 +155,10 @@ fn an_idle_status_updates_the_window_without_any_traffic_from_us() {
 #[test]
 fn a_run_of_queries_never_closes_the_window() {
     const N: u64 = 6;
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let mut issued = 0u64;
     let mut done = 0u64;
@@ -142,15 +180,29 @@ fn a_run_of_queries_never_closes_the_window() {
         });
     }
     assert_eq!(done, N, "a run of queries must not close the window");
-    assert_eq!(send.acked_seq(), 0, "the edge never acks a query, and it does not have to");
+    assert_eq!(
+        send.acked_seq(),
+        0,
+        "the edge never acks a query, and it does not have to"
+    );
     let peak = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
-    assert!((1..=2).contains(&peak), "the grant must still pace the pipeline: peak {peak}");
+    assert!(
+        (1..=2).contains(&peak),
+        "the grant must still pace the pipeline: peak {peak}"
+    );
 
     // ... and a SUBMIT after that run is admitted on the same count rule, and
     // is what finally moves `acked_seq`.
     let got = run_submits(&send, &mut poll, 1, |_| b"xy".to_vec());
-    assert_eq!(got.len(), 1, "a submit after a run of queries must still be admitted");
-    assert!(until(|| send.acked_seq() == N + 1), "a SUBMIT is what advances acked_seq");
+    assert_eq!(
+        got.len(),
+        1,
+        "a submit after a run of queries must still be admitted"
+    );
+    assert!(
+        until(|| send.acked_seq() == N + 1),
+        "a SUBMIT is what advances acked_seq"
+    );
     send.shutdown();
 }
 
@@ -179,8 +231,14 @@ fn a_status_carrying_a_lower_grant_is_honoured_for_new_seqs() {
     let got = run_submits(&send, &mut poll, 8, |i| vec![i as u8]);
     assert_eq!(got.len(), 8);
     let pre = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
-    assert!(pre > 1, "a grant of 8 must pipeline, or phase two proves nothing: peak {pre}");
-    assert!(pre <= 8, "and it must never exceed the grant it was given: peak {pre}");
+    assert!(
+        pre > 1,
+        "a grant of 8 must pipeline, or phase two proves nothing: peak {pre}"
+    );
+    assert!(
+        pre <= 8,
+        "and it must never exceed the grant it was given: peak {pre}"
+    );
 
     // --- the shrink lands, and the pipeline drains under it.
     assert!(
@@ -195,11 +253,26 @@ fn a_status_carrying_a_lower_grant_is_honoured_for_new_seqs() {
 
     // --- phase two: the SAME submitter loop, now under a grant of one.
     let got = run_submits(&send, &mut poll, 6, |i| vec![i as u8]);
-    assert_eq!(got.len(), 6, "the burst must still complete, one at a time, as completions drain");
+    assert_eq!(
+        got.len(),
+        6,
+        "the burst must still complete, one at a time, as completions drain"
+    );
     let post = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
-    assert_eq!(post, 1, "a reduced grant must bind admission, not just the reported window");
-    assert_eq!(send.credits(), 1, "the last absolute grant seen is the window");
-    assert_eq!(send.stats().max_credits_seen, 8, "max_credits_seen is a high-water mark");
+    assert_eq!(
+        post, 1,
+        "a reduced grant must bind admission, not just the reported window"
+    );
+    assert_eq!(
+        send.credits(),
+        1,
+        "the last absolute grant seen is the window"
+    );
+    assert_eq!(
+        send.stats().max_credits_seen,
+        8,
+        "max_credits_seen is a high-water mark"
+    );
     send.shutdown();
 }
 
@@ -207,7 +280,10 @@ fn a_status_carrying_a_lower_grant_is_honoured_for_new_seqs() {
 /// time, however fast the submitter offers work.
 #[test]
 fn a_window_of_one_serializes_the_pipeline() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 1, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 1,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 5, |i| vec![i as u8]);
     assert_eq!(got.len(), 5);
@@ -229,11 +305,16 @@ fn the_local_inflight_cap_binds_below_the_edges_grant() {
         delay: Duration::from_millis(50),
         ..Default::default()
     });
-    let (send, _poll) =
-        RemoteEngine::connect(RemoteConfig { max_inflight: 3, ..cfg(vec![edge.addr.clone()]) })
-            .unwrap();
+    let (send, _poll) = RemoteEngine::connect(RemoteConfig {
+        max_inflight: 3,
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
     for i in 0..3u64 {
-        assert!(send.try_submit(i, b"x").is_ok(), "request {i} fits the local cap");
+        assert!(
+            send.try_submit(i, b"x").is_ok(),
+            "request {i} fits the local cap"
+        );
     }
     assert_eq!(send.try_submit(3, b"x"), Err(SubmitError::Backpressure));
     assert_eq!(send.inflight(), 3);
@@ -244,21 +325,50 @@ fn the_local_inflight_cap_binds_below_the_edges_grant() {
 /// (23–50) onto the halves.
 #[test]
 fn try_submit_pipelines_under_credits() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 6, |i| vec![i as u8]);
-    assert_eq!(got.len(), 6, "every accepted request must complete exactly once");
+    assert_eq!(
+        got.len(),
+        6,
+        "every accepted request must complete exactly once"
+    );
     for (i, (ud, pos, body, replayed)) in got.iter().enumerate() {
         let i = i as u64;
-        assert_eq!(*ud, i, "completions arrive in issue order under one connection");
-        assert_eq!(*pos, (i + 1) * 64, "the edge's position rides the completion");
-        assert_eq!(body.as_slice(), &[i as u8], "the fake edge reverses the payload");
+        assert_eq!(
+            *ud, i,
+            "completions arrive in issue order under one connection"
+        );
+        assert_eq!(
+            *pos,
+            (i + 1) * 64,
+            "the edge's position rides the completion"
+        );
+        assert_eq!(
+            body.as_slice(),
+            &[i as u8],
+            "the fake edge reverses the payload"
+        );
         assert!(!replayed, "a first-time seq is FRESH");
     }
     let peak = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
-    assert!((1..=2).contains(&peak), "the credit window must pace the pipeline: peak {peak}");
-    assert_eq!(edge.observed.seq_order(), vec![1, 2, 3, 4, 5, 6], "seqs start at 1, gap-free");
-    assert_eq!(send.inflight(), 0, "the window is empty once everything completed");
+    assert!(
+        (1..=2).contains(&peak),
+        "the credit window must pace the pipeline: peak {peak}"
+    );
+    assert_eq!(
+        edge.observed.seq_order(),
+        vec![1, 2, 3, 4, 5, 6],
+        "seqs start at 1, gap-free"
+    );
+    assert_eq!(
+        send.inflight(),
+        0,
+        "the window is empty once everything completed"
+    );
     // The whole point of M13b: many frames per socket write once the window is
     // wide enough to hold more than one. A grant of 2 cannot prove the ratio,
     // so what is pinned here is that the numerator is now counted at all —
@@ -280,7 +390,11 @@ fn try_submit_pipelines_under_credits() {
         edge.observed.seq_count() as u64,
         "the frame counter must match what the edge actually received: {s:?}"
     );
-    assert_eq!((s.reconnects, s.resends, s.retries, s.redirects), (0, 0, 0, 0), "{s:?}");
+    assert_eq!(
+        (s.reconnects, s.resends, s.retries, s.redirects),
+        (0, 0, 0, 0),
+        "{s:?}"
+    );
     send.shutdown();
 }
 
@@ -290,9 +404,15 @@ fn try_submit_pipelines_under_credits() {
 /// what this pins is that neither flag path drops the completion.
 #[test]
 fn try_query_round_trips_both_consistencies() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
-    for (i, c) in [Consistency::Linearizable, Consistency::Snapshot].into_iter().enumerate() {
+    for (i, c) in [Consistency::Linearizable, Consistency::Snapshot]
+        .into_iter()
+        .enumerate()
+    {
         send.try_query(i as u64, c, b"abc").unwrap();
         let mut body = None;
         let deadline = Instant::now() + WAIT;
@@ -311,14 +431,20 @@ fn try_query_round_trips_both_consistencies() {
 
 #[test]
 fn a_payload_larger_than_the_ring_is_refused_at_the_door() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let (send, _poll) = RemoteEngine::connect(RemoteConfig {
         out_ring_bytes: Some(8192),
         ..cfg(vec![edge.addr.clone()])
     })
     .unwrap();
     let too_big = vec![0u8; 16 * 1024];
-    assert_eq!(send.try_submit(1, &too_big), Err(SubmitError::PayloadTooLarge));
+    assert_eq!(
+        send.try_submit(1, &too_big),
+        Err(SubmitError::PayloadTooLarge)
+    );
     // ... and a merely large one still goes on the wire: the node, not the
     // client, is the authority on `max_payload` (see roundtrip.rs).
     assert!(send.try_submit(2, &vec![0u8; 4096]).is_ok());
@@ -355,7 +481,11 @@ fn a_ring_far_smaller_than_the_run_wraps_and_reclaims() {
     for (i, (ud, _, body, _)) in got.iter().enumerate() {
         let i = i as u64;
         assert_eq!(*ud, i);
-        assert_eq!(body.as_slice(), &vec![(i % 251) as u8; 200], "frame {i} came back corrupt");
+        assert_eq!(
+            body.as_slice(),
+            &vec![(i % 251) as u8; 200],
+            "frame {i} came back corrupt"
+        );
     }
     assert_eq!(
         edge.observed.seq_order(),
@@ -371,16 +501,26 @@ fn a_ring_far_smaller_than_the_run_wraps_and_reclaims() {
 /// sees a frame for and the window would wedge behind the gap.
 #[test]
 fn a_refused_request_consumes_no_seq() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         out_ring_bytes: Some(8192),
         ..cfg(vec![edge.addr.clone()])
     })
     .unwrap();
-    assert_eq!(send.try_submit(99, &vec![0u8; 16 * 1024]), Err(SubmitError::PayloadTooLarge));
+    assert_eq!(
+        send.try_submit(99, &vec![0u8; 16 * 1024]),
+        Err(SubmitError::PayloadTooLarge)
+    );
     let got = run_submits(&send, &mut poll, 2, |i| vec![i as u8]);
     assert_eq!(got.len(), 2);
-    assert_eq!(edge.observed.seq_order(), vec![1, 2], "the refusal must not have burnt seq 1");
+    assert_eq!(
+        edge.observed.seq_order(),
+        vec![1, 2],
+        "the refusal must not have burnt seq 1"
+    );
     send.shutdown();
 }
 
@@ -388,11 +528,17 @@ fn a_refused_request_consumes_no_seq() {
 /// link that can never complete it.
 #[test]
 fn a_submit_after_shutdown_is_refused() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let (send, _poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     send.shutdown();
     assert_eq!(send.try_submit(1, b"x"), Err(SubmitError::Closed));
-    assert_eq!(send.try_query(2, Consistency::Snapshot, b"x"), Err(SubmitError::Closed));
+    assert_eq!(
+        send.try_query(2, Consistency::Snapshot, b"x"),
+        Err(SubmitError::Closed)
+    );
 }
 
 /// What this pins is the LIVENESS clock, not a dropped socket: `hang` keeps
@@ -400,7 +546,11 @@ fn a_submit_after_shutdown_is_refused() {
 /// thing that can notice it. The dropped-socket case is the test below.
 #[test]
 fn a_silent_edge_is_noticed_and_the_link_is_re_established() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hang: true,
+        ..Default::default()
+    });
     let (send, _poll) = RemoteEngine::connect(RemoteConfig {
         ping_interval: Duration::from_millis(30),
         dead_after: Duration::from_millis(200),
@@ -411,7 +561,10 @@ fn a_silent_edge_is_noticed_and_the_link_is_re_established() {
     // notice the silent edge and re-dial.
     let ok = until(|| send.stats().reconnects >= 1);
     assert!(ok, "dead_after must force a redial: {:?}", send.stats());
-    assert!(until(|| send.is_connected()), "the writer thread must re-establish the link");
+    assert!(
+        until(|| send.is_connected()),
+        "the writer thread must re-establish the link"
+    );
     send.shutdown();
 }
 
@@ -432,7 +585,8 @@ fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
         ..Default::default()
     });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
-    send.try_submit(42, b"xy").expect("the first submit fits any window");
+    send.try_submit(42, b"xy")
+        .expect("the first submit fits any window");
 
     let mut got: Vec<(u64, String)> = Vec::new();
     let deadline = Instant::now() + WAIT;
@@ -440,7 +594,11 @@ fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
         poll.poll(|c| got.push((c.user_data, format!("{:?}", c.outcome))));
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(got.len(), 1, "the accepted request must resolve exactly once: {got:?}");
+    assert_eq!(
+        got.len(),
+        1,
+        "the accepted request must resolve exactly once: {got:?}"
+    );
     assert_eq!(got[0].0, 42);
     assert!(
         got[0].1.starts_with("Response { body: [121, 120]"),
@@ -450,9 +608,18 @@ fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
     assert!(send.stats().resends >= 1, "{:?}", send.stats());
 
     // The link itself recovered from the drop, whatever became of the request.
-    assert!(until(|| send.stats().reconnects >= 1), "the drop must force a redial");
-    assert!(until(|| edge.observed.conns.load(AtomicOrdering::SeqCst) >= 2), "a fresh connection");
-    assert!(until(|| send.is_connected()), "the writer must re-establish the link");
+    assert!(
+        until(|| send.stats().reconnects >= 1),
+        "the drop must force a redial"
+    );
+    assert!(
+        until(|| edge.observed.conns.load(AtomicOrdering::SeqCst) >= 2),
+        "a fresh connection"
+    );
+    assert!(
+        until(|| send.is_connected()),
+        "the writer must re-establish the link"
+    );
     assert_eq!(send.inflight(), 0, "nothing is left outstanding");
 
     // And exactly once means exactly once: no second completion follows.
@@ -486,7 +653,10 @@ fn a_stale_redial_does_not_churn_the_connection_that_replaced_it() {
     .unwrap();
     assert_eq!(send.credits(), 2, "the first connection's grant");
 
-    assert!(until(|| send.stats().reconnects >= 1), "the silent edge must force a redial");
+    assert!(
+        until(|| send.stats().reconnects >= 1),
+        "the silent edge must force a redial"
+    );
     assert!(
         until(|| send.credits() == 7),
         "the grant in effect must be the second connection's: {:?}",
@@ -496,9 +666,19 @@ fn a_stale_redial_does_not_churn_the_connection_that_replaced_it() {
     // Long enough for a churn loop (one lap per `dead_after`) to show up.
     std::thread::sleep(Duration::from_millis(600));
     let s = send.stats();
-    assert_eq!(s.reconnects, 1, "a stale redial churned the fresh connection: {s:?}");
-    assert!(send.is_connected(), "the second connection must stay up: {s:?}");
-    assert_eq!(send.credits(), 7, "the fresh grant must not be overwritten: {s:?}");
+    assert_eq!(
+        s.reconnects, 1,
+        "a stale redial churned the fresh connection: {s:?}"
+    );
+    assert!(
+        send.is_connected(),
+        "the second connection must stay up: {s:?}"
+    );
+    assert_eq!(
+        send.credits(),
+        7,
+        "the fresh grant must not be overwritten: {s:?}"
+    );
     send.shutdown();
 }
 
@@ -510,9 +690,21 @@ fn a_config_that_cannot_work_is_refused_by_name() {
         }
         other => panic!("expected a Config refusal naming {needle:?}, got {other:?}"),
     };
-    bad(RemoteConfig { app_id: String::new(), ..cfg(vec!["127.0.0.1:1".into()]) }, "app_id");
+    bad(
+        RemoteConfig {
+            app_id: String::new(),
+            ..cfg(vec!["127.0.0.1:1".into()])
+        },
+        "app_id",
+    );
     bad(cfg(vec![]), "members");
-    bad(RemoteConfig { max_inflight: 0, ..cfg(vec!["127.0.0.1:1".into()]) }, "max_inflight");
+    bad(
+        RemoteConfig {
+            max_inflight: 0,
+            ..cfg(vec!["127.0.0.1:1".into()])
+        },
+        "max_inflight",
+    );
     bad(
         RemoteConfig {
             ping_interval: Duration::from_secs(2),
@@ -526,7 +718,10 @@ fn a_config_that_cannot_work_is_refused_by_name() {
 #[test]
 fn no_reachable_member_is_reported() {
     let e = RemoteEngine::connect(cfg(vec!["127.0.0.1:1".into()])).unwrap_err();
-    assert!(matches!(e, uc_remote::RemoteError::NoMembersReachable), "got {e:?}");
+    assert!(
+        matches!(e, uc_remote::RemoteError::NoMembersReachable),
+        "got {e:?}"
+    );
 }
 
 #[test]
@@ -546,7 +741,10 @@ fn hello_refused_is_reported_by_connect() {
 
 #[test]
 fn a_faulted_member_is_skipped_and_the_next_one_serves() {
-    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let good = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let bad = FakeEdge::spawn(Behaviour {
         refuse_hello: Some(uc_remote::frame::HELLO_REFUSED_FAULTED),
         ..Default::default()
@@ -569,7 +767,10 @@ fn a_cluster_of_faulted_edges_is_unreachable() {
         ..Default::default()
     });
     let e = RemoteEngine::connect(cfg(vec![a.addr.clone(), b.addr.clone()])).unwrap_err();
-    assert!(matches!(e, uc_remote::RemoteError::NoMembersReachable), "got {e:?}");
+    assert!(
+        matches!(e, uc_remote::RemoteError::NoMembersReachable),
+        "got {e:?}"
+    );
 }
 
 #[test]
@@ -592,7 +793,10 @@ fn halves_have_the_documented_thread_bounds() {
 
 #[test]
 fn redirect_is_followed_and_the_window_is_resent_in_order() {
-    let b = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let b = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let a = FakeEdge::spawn(Behaviour {
         credits: 4,
         redirect_all_to: Some(b.addr.clone()),
@@ -605,41 +809,69 @@ fn redirect_is_followed_and_the_window_is_resent_in_order() {
         assert_eq!(*ud, i as u64);
         assert_eq!(body.as_slice(), &[i as u8]);
     }
-    assert_eq!(b.observed.seq_order(), vec![1, 2, 3], "re-sent in seq order at the new edge");
+    assert_eq!(
+        b.observed.seq_order(),
+        vec![1, 2, 3],
+        "re-sent in seq order at the new edge"
+    );
     let s = send.stats();
     assert!(s.redirects >= 1, "redirects: {}", s.redirects);
     assert!(s.reconnects >= 1, "reconnects: {}", s.reconnects);
     assert!(s.resends >= 1, "resends: {}", s.resends);
-    assert_eq!(send.leader().map(|(id, _)| id), Some(1), "leader from the new edge's HELLO_OK");
+    assert_eq!(
+        send.leader().map(|(id, _)| id),
+        Some(1),
+        "leader from the new edge's HELLO_OK"
+    );
     send.shutdown();
 }
 
 #[test]
 fn retry_is_honoured_in_place_after_its_hint() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, retry_once: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        retry_once: true,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].2.as_slice(), b"cba");
     let s = send.stats();
     assert_eq!(s.retries, 1, "one RETRY honoured");
-    assert_eq!(s.reconnects, 0, "a transient RETRY is re-sent in place, not failed over");
-    assert_eq!(edge.observed.conns.load(AtomicOrdering::SeqCst), 1, "same connection");
+    assert_eq!(
+        s.reconnects, 0,
+        "a transient RETRY is re-sent in place, not failed over"
+    );
+    assert_eq!(
+        edge.observed.conns.load(AtomicOrdering::SeqCst),
+        1,
+        "same connection"
+    );
     send.shutdown();
 }
 
 #[test]
 fn retry_not_serving_moves_the_link_rather_than_re_sending_in_place() {
-    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
-    let bad =
-        FakeEdge::spawn(Behaviour { credits: 2, not_serving_once: true, ..Default::default() });
+    let good = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
+    let bad = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        not_serving_once: true,
+        ..Default::default()
+    });
     let (send, mut poll) =
         RemoteEngine::connect(cfg(vec![bad.addr.clone(), good.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
     assert_eq!(got.len(), 1);
     let s = send.stats();
     assert_eq!(s.retries, 1);
-    assert!(s.reconnects >= 1, "NOT_SERVING is a role statement: go somewhere else");
+    assert!(
+        s.reconnects >= 1,
+        "NOT_SERVING is a role statement: go somewhere else"
+    );
     send.shutdown();
 }
 
@@ -652,10 +884,22 @@ fn connection_loss_resends_the_unanswered_window() {
     });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
-    assert_eq!(got.len(), 1, "the request survives the connection that dropped it");
+    assert_eq!(
+        got.len(),
+        1,
+        "the request survives the connection that dropped it"
+    );
     assert_eq!(got[0].2.as_slice(), b"cba");
-    assert_eq!(edge.observed.conns.load(AtomicOrdering::SeqCst), 2, "exactly one reconnect");
-    assert_eq!(edge.observed.seq_order(), vec![1], "one logical request, re-sent");
+    assert_eq!(
+        edge.observed.conns.load(AtomicOrdering::SeqCst),
+        2,
+        "exactly one reconnect"
+    );
+    assert_eq!(
+        edge.observed.seq_order(),
+        vec![1],
+        "one logical request, re-sent"
+    );
     let s = send.stats();
     assert!(s.reconnects >= 1 && s.resends >= 1, "{s:?}");
     send.shutdown();
@@ -663,7 +907,10 @@ fn connection_loss_resends_the_unanswered_window() {
 
 #[test]
 fn a_fresh_connection_sends_one_probe_before_flushing_its_window() {
-    let leader = FakeEdge::spawn(Behaviour { credits: 64, ..Default::default() });
+    let leader = FakeEdge::spawn(Behaviour {
+        credits: 64,
+        ..Default::default()
+    });
     let wrong = FakeEdge::spawn(Behaviour {
         credits: 64,
         redirect_all_to: Some(leader.addr.clone()),
@@ -691,7 +938,10 @@ fn a_fresh_connection_sends_one_probe_before_flushing_its_window() {
 
 #[test]
 fn a_hello_ok_naming_another_leader_is_followed_before_anything_is_sent() {
-    let leader = FakeEdge::spawn(Behaviour { credits: 8, ..Default::default() });
+    let leader = FakeEdge::spawn(Behaviour {
+        credits: 8,
+        ..Default::default()
+    });
     let follower = FakeEdge::spawn(Behaviour {
         credits: 8,
         hello_ok_leader_addr: Some(leader.addr.clone()),
@@ -700,18 +950,28 @@ fn a_hello_ok_naming_another_leader_is_followed_before_anything_is_sent() {
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![follower.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 3, |i| vec![i as u8]);
     assert_eq!(got.len(), 3);
-    assert_eq!(follower.observed.hellos.load(AtomicOrdering::SeqCst), 1, "dialled once");
+    assert_eq!(
+        follower.observed.hellos.load(AtomicOrdering::SeqCst),
+        1,
+        "dialled once"
+    );
     assert_eq!(follower.observed.seq_count(), 0, "and never sent a request");
     assert_eq!(leader.observed.seq_order(), vec![1, 2, 3]);
     let s = send.stats();
-    assert_eq!(s.redirects, 0, "the hop happens at the handshake, not by REDIRECT");
+    assert_eq!(
+        s.redirects, 0,
+        "the hop happens at the handshake, not by REDIRECT"
+    );
     assert_eq!(s.resends, 0, "nothing was ever sent to the wrong edge");
     send.shutdown();
 }
 
 #[test]
 fn edges_that_name_each_other_as_leader_do_not_ping_pong() {
-    let a = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let a = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        ..Default::default()
+    });
     let b = FakeEdge::spawn(Behaviour {
         credits: 4,
         hello_ok_leader_addr: Some(a.addr.clone()),
@@ -722,7 +982,10 @@ fn edges_that_name_each_other_as_leader_do_not_ping_pong() {
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![b.addr.clone()])).unwrap();
     let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
     assert_eq!(got.len(), 1);
-    assert!(t.elapsed() < Duration::from_secs(5), "the handshake hop must be bounded");
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "the handshake hop must be bounded"
+    );
     send.shutdown();
 }
 
@@ -743,16 +1006,27 @@ fn payload_too_large_is_terminal_and_never_resent() {
             outcome = Some(matches!(c.outcome, RemoteOutcome::PayloadTooLarge));
         });
     }
-    assert_eq!(outcome, Some(true), "RETRY{{PAYLOAD_TOO_LARGE}} is a terminal outcome");
-    assert_eq!(edge.observed.seq_count(), 1, "seen exactly once on the wire");
+    assert_eq!(
+        outcome,
+        Some(true),
+        "RETRY{{PAYLOAD_TOO_LARGE}} is a terminal outcome"
+    );
+    assert_eq!(
+        edge.observed.seq_count(),
+        1,
+        "seen exactly once on the wire"
+    );
     assert_eq!(send.stats().resends, 0);
     send.shutdown();
 }
 
 #[test]
 fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
-    let edge =
-        FakeEdge::spawn(Behaviour { credits: 4, redirect_to_self: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        redirect_to_self: true,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         request_timeout: Duration::from_millis(500),
         ..cfg(vec![edge.addr.clone()])
@@ -764,9 +1038,15 @@ fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
     while !timed_out && t.elapsed() < Duration::from_secs(3) {
         poll.poll(|c| timed_out = matches!(c.outcome, RemoteOutcome::TimedOut));
     }
-    assert!(timed_out, "an elected-but-not-serving self-redirect must still time out");
+    assert!(
+        timed_out,
+        "an elected-but-not-serving self-redirect must still time out"
+    );
     let frames = edge.observed.seq_count();
-    assert!((1..200).contains(&frames), "backed off, not spun: {frames} frames");
+    assert!(
+        (1..200).contains(&frames),
+        "backed off, not spun: {frames} frames"
+    );
     let conns = edge.observed.conns.load(AtomicOrdering::SeqCst);
     assert!(conns < 200, "backed off, not spun: {conns} connections");
     send.shutdown();
@@ -778,7 +1058,11 @@ fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
 /// assertions read like the old `Ticket::wait` ones.
 #[derive(Debug, PartialEq, Eq)]
 enum Got {
-    Response { body: Vec<u8>, replayed: bool, expired: bool },
+    Response {
+        body: Vec<u8>,
+        replayed: bool,
+        expired: bool,
+    },
     Unknown,
     PayloadTooLarge,
     TimedOut,
@@ -802,9 +1086,15 @@ fn one(
                 return;
             }
             got = match c.outcome {
-                RemoteOutcome::Response { body, replayed, expired } => {
-                    Got::Response { body: body.to_vec(), replayed, expired }
-                }
+                RemoteOutcome::Response {
+                    body,
+                    replayed,
+                    expired,
+                } => Got::Response {
+                    body: body.to_vec(),
+                    replayed,
+                    expired,
+                },
                 RemoteOutcome::Unknown => Got::Unknown,
                 RemoteOutcome::PayloadTooLarge => Got::PayloadTooLarge,
                 RemoteOutcome::TimedOut => Got::TimedOut,
@@ -818,7 +1108,11 @@ fn one(
 
 #[test]
 fn expired_surfaces_as_a_response_flagged_expired() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, expired: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        expired: true,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     send.try_submit(1, b"abc").unwrap();
     match one(&send, &mut poll, 1, WAIT) {
@@ -832,18 +1126,30 @@ fn expired_surfaces_as_a_response_flagged_expired() {
 #[test]
 fn unknown_is_resolved_by_a_resend_or_surfaces_as_an_outcome() {
     // Default: resend_on_unknown = true, so it resolves itself.
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        unknown_once: true,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     send.try_submit(1, b"abc").unwrap();
     assert_eq!(
         one(&send, &mut poll, 1, WAIT),
-        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false }
+        Got::Response {
+            body: b"cba".to_vec(),
+            replayed: false,
+            expired: false
+        }
     );
     assert_eq!(send.stats().unknown, 1);
     send.shutdown();
 
     // Told not to resend, it surfaces.
-    let edge2 = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let edge2 = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        unknown_once: true,
+        ..Default::default()
+    });
     let (send2, mut poll2) = RemoteEngine::connect(RemoteConfig {
         resend_on_unknown: false,
         ..cfg(vec![edge2.addr.clone()])
@@ -856,7 +1162,10 @@ fn unknown_is_resolved_by_a_resend_or_surfaces_as_an_outcome() {
 
 #[test]
 fn an_edge_that_stalls_mid_frame_is_declared_dead_and_the_request_fails_over() {
-    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let good = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let stalling = FakeEdge::spawn(Behaviour {
         credits: 2,
         partial_frame_then_hang: true,
@@ -872,7 +1181,11 @@ fn an_edge_that_stalls_mid_frame_is_declared_dead_and_the_request_fails_over() {
     let t = Instant::now();
     assert_eq!(
         one(&send, &mut poll, 1, Duration::from_secs(5)),
-        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false },
+        Got::Response {
+            body: b"cba".to_vec(),
+            replayed: false,
+            expired: false
+        },
         "a peer that vanishes mid-frame must reach the same verdict as one silent between frames"
     );
     assert!(t.elapsed() < Duration::from_secs(5));
@@ -882,8 +1195,15 @@ fn an_edge_that_stalls_mid_frame_is_declared_dead_and_the_request_fails_over() {
 
 #[test]
 fn a_silent_edge_is_declared_dead_and_the_request_fails_over() {
-    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
-    let silent = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
+    let good = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
+    let silent = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hang: true,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         ping_interval: Duration::from_millis(50),
         dead_after: Duration::from_millis(300),
@@ -893,7 +1213,11 @@ fn a_silent_edge_is_declared_dead_and_the_request_fails_over() {
     send.try_submit(1, b"abc").unwrap();
     assert_eq!(
         one(&send, &mut poll, 1, Duration::from_secs(5)),
-        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false }
+        Got::Response {
+            body: b"cba".to_vec(),
+            replayed: false,
+            expired: false
+        }
     );
     let s = send.stats();
     assert!(s.reconnects >= 1 && s.resends >= 1, "{s:?}");
@@ -902,7 +1226,10 @@ fn a_silent_edge_is_declared_dead_and_the_request_fails_over() {
 
 #[test]
 fn ping_pong_keeps_an_idle_connection_alive() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         ping_interval: Duration::from_millis(50),
         dead_after: Duration::from_millis(200),
@@ -910,20 +1237,32 @@ fn ping_pong_keeps_an_idle_connection_alive() {
     })
     .unwrap();
     std::thread::sleep(Duration::from_millis(600));
-    assert_eq!(send.stats().reconnects, 0, "PING/PONG must hold an idle connection open");
+    assert_eq!(
+        send.stats().reconnects,
+        0,
+        "PING/PONG must hold an idle connection open"
+    );
     assert_eq!(edge.observed.conns.load(AtomicOrdering::SeqCst), 1);
     assert!(send.is_connected());
     send.try_submit(1, b"abc").unwrap();
     assert_eq!(
         one(&send, &mut poll, 1, WAIT),
-        Got::Response { body: b"cba".to_vec(), replayed: false, expired: false }
+        Got::Response {
+            body: b"cba".to_vec(),
+            replayed: false,
+            expired: false
+        }
     );
     send.shutdown();
 }
 
 #[test]
 fn a_request_that_is_never_answered_completes_timed_out() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hang: true,
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         request_timeout: Duration::from_millis(200),
         ping_interval: Duration::from_millis(50),
@@ -932,7 +1271,10 @@ fn a_request_that_is_never_answered_completes_timed_out() {
     })
     .unwrap();
     send.try_submit(1, b"abc").unwrap();
-    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(3)), Got::TimedOut);
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(3)),
+        Got::TimedOut
+    );
     send.shutdown();
 }
 
@@ -960,10 +1302,18 @@ fn a_late_response_after_the_sweep_delivers_no_second_completion() {
     })
     .unwrap();
     send.try_submit(1, b"abc").unwrap();
-    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(3)), Got::TimedOut);
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(3)),
+        Got::TimedOut
+    );
     // The link stayed up: no redial, no resend — the late answer is coming on
     // the SAME connection.
-    assert_eq!(send.stats().reconnects, 0, "the connection must stay up: {:?}", send.stats());
+    assert_eq!(
+        send.stats().reconnects,
+        0,
+        "the connection must stay up: {:?}",
+        send.stats()
+    );
     assert_eq!(send.stats().resends, 0);
     // Now outlast the edge's delay and keep polling: the late RESPONSE arrives
     // and must be dropped, not delivered a second time.
@@ -973,7 +1323,10 @@ fn a_late_response_after_the_sweep_delivers_no_second_completion() {
         extra += poll.poll(|c| panic!("a second completion for {}: {:?}", c.user_data, c.outcome));
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert_eq!(extra, 0, "the late response must Miss the freed slot, not double-deliver");
+    assert_eq!(
+        extra, 0,
+        "the late response must Miss the freed slot, not double-deliver"
+    );
     assert_eq!(send.inflight(), 0);
     send.shutdown();
 }
@@ -989,7 +1342,10 @@ fn shutdown_completes_outstanding_requests_with_closed() {
     send.try_submit(1, b"abc").unwrap();
     std::thread::sleep(Duration::from_millis(50));
     send.shutdown();
-    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(2)), Got::Closed);
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(2)),
+        Got::Closed
+    );
     assert_eq!(send.try_submit(2, b"abc"), Err(SubmitError::Closed));
 }
 
@@ -1012,15 +1368,25 @@ fn request_timeout_is_enforced_through_an_endless_redirect_churn() {
     .unwrap();
     send.try_submit(1, b"abc").unwrap();
     let t = Instant::now();
-    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(4)), Got::TimedOut);
-    assert!(t.elapsed() < Duration::from_secs(2), "budget overshot: {:?}", t.elapsed());
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(4)),
+        Got::TimedOut
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "budget overshot: {:?}",
+        t.elapsed()
+    );
     assert!(send.stats().reconnects >= 1);
     send.shutdown();
 }
 
 #[test]
 fn request_timeout_and_shutdown_are_prompt_while_every_member_is_unreachable() {
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let addr = edge.addr.clone();
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
         request_timeout: Duration::from_millis(500),
@@ -1033,12 +1399,22 @@ fn request_timeout_and_shutdown_are_prompt_while_every_member_is_unreachable() {
     drop(edge); // the cluster goes away underneath a connected client
     send.try_submit(1, b"abc").unwrap();
     let t = Instant::now();
-    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(4)), Got::TimedOut);
-    assert!(t.elapsed() < Duration::from_secs(2), "budget overshot: {:?}", t.elapsed());
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(4)),
+        Got::TimedOut
+    );
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "budget overshot: {:?}",
+        t.elapsed()
+    );
     send.try_submit(2, b"abc").ok();
     let t2 = Instant::now();
     send.shutdown();
-    assert!(t2.elapsed() < Duration::from_secs(2), "shutdown mid-dial must be prompt");
+    assert!(
+        t2.elapsed() < Duration::from_secs(2),
+        "shutdown mid-dial must be prompt"
+    );
     assert!(matches!(
         one(&send, &mut poll, 2, Duration::from_secs(2)),
         Got::Closed | Got::TimedOut | Got::Nothing
@@ -1070,7 +1446,11 @@ impl ParkingMember {
                 std::thread::sleep(Duration::from_millis(2));
             }
         });
-        ParkingMember { addr, stop, acceptor: Some(acceptor) }
+        ParkingMember {
+            addr,
+            stop,
+            acceptor: Some(acceptor),
+        }
     }
 }
 
@@ -1088,7 +1468,10 @@ fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
     // Four members that accept and stall: ONE pass is 4 x connect_timeout, so
     // sweeping only "between passes" would blow the 500 ms budget.
     let parked: Vec<ParkingMember> = (0..4).map(|_| ParkingMember::spawn()).collect();
-    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        ..Default::default()
+    });
     let mut members: Vec<String> = parked.iter().map(|p| p.addr.clone()).collect();
     members.insert(0, edge.addr.clone());
     let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
@@ -1102,7 +1485,10 @@ fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
     drop(edge);
     send.try_submit(1, b"abc").unwrap();
     let t = Instant::now();
-    assert_eq!(one(&send, &mut poll, 1, Duration::from_secs(5)), Got::TimedOut);
+    assert_eq!(
+        one(&send, &mut poll, 1, Duration::from_secs(5)),
+        Got::TimedOut
+    );
     assert!(
         t.elapsed() < Duration::from_secs(3),
         "the sweep must run INSIDE a pass: {:?}",
@@ -1110,5 +1496,8 @@ fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
     );
     let t2 = Instant::now();
     send.shutdown();
-    assert!(t2.elapsed() < Duration::from_secs(2), "shutdown mid-pass must be prompt");
+    assert!(
+        t2.elapsed() < Duration::from_secs(2),
+        "shutdown mid-pass must be prompt"
+    );
 }

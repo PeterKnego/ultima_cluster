@@ -100,20 +100,30 @@ fn hundred_submits_in_order_then_two_concurrent_clients_stay_monotone_with_disti
     let node = Node::start(node_config(dir.path(), "client-test")).unwrap();
     wait_until(|| node.can_serve());
 
-    let svc = ServiceBuilder::new(ServiceConfig::new(dir.path(), "client-test"), CountSm::default())
-        .start()
-        .unwrap();
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), "client-test"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
 
     // --- Step 1: one client, 100 sequential submits, exact totals 1..=100.
     let client_a = Client::connect(dir.path(), "client-test").unwrap();
     for expected in 1..=100u64 {
         let got: u64 = client_a.submit(&Cmd::Add(1)).unwrap();
-        assert_eq!(got, expected, "apply order must match submission order for a solo client");
+        assert_eq!(
+            got, expected,
+            "apply order must match submission order for a solo client"
+        );
     }
 
     // --- Step 2: a second client gets a distinct client_id.
     let client_b = Client::connect(dir.path(), "client-test").unwrap();
-    assert_ne!(client_a.client_id(), client_b.client_id(), "client_ids must differ");
+    assert_ne!(
+        client_a.client_id(),
+        client_b.client_id(),
+        "client_ids must differ"
+    );
 
     // --- Step 3: both clients submit 100 more, concurrently; each client's
     // OWN sequence of returned totals must be strictly increasing even
@@ -138,7 +148,11 @@ fn hundred_submits_in_order_then_two_concurrent_clients_stay_monotone_with_disti
     let (client_b, seen_b) = b_handle.join().unwrap();
 
     for (name, seen) in [("a", &seen_a), ("b", &seen_b)] {
-        assert_eq!(seen.len(), 100, "client {name} must see exactly 100 responses");
+        assert_eq!(
+            seen.len(),
+            100,
+            "client {name} must see exactly 100 responses"
+        );
         assert!(
             seen.windows(2).all(|w| w[0] < w[1]),
             "client {name}'s own response sequence must be strictly increasing: {seen:?}"

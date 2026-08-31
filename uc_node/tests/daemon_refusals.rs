@@ -49,7 +49,11 @@ addr = "127.0.0.1:{port}"
 }
 
 fn run(cfg: &Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_uc2-node")).arg("--config").arg(cfg).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(cfg)
+        .output()
+        .unwrap()
 }
 
 /// A `node.toml` with `[crypto]` but no `[admin]` at all must be refused
@@ -68,7 +72,12 @@ fn daemon_refuses_a_config_missing_the_admin_section() {
         err.contains("[admin] section is required"),
         "refusal must name the missing section, got: {err}"
     );
-    assert_eq!(out.status.code(), Some(2), "a config refusal must exit 2, got {:?}", out.status);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a config refusal must exit 2, got {:?}",
+        out.status
+    );
 }
 
 /// Symmetric with the above: no `[crypto]` at all.
@@ -84,7 +93,12 @@ fn daemon_refuses_a_config_missing_the_crypto_section() {
         err.contains("[crypto] section is required"),
         "refusal must name the missing section, got: {err}"
     );
-    assert_eq!(out.status.code(), Some(2), "a config refusal must exit 2, got {:?}", out.status);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a config refusal must exit 2, got {:?}",
+        out.status
+    );
 }
 
 /// `auth = "hmac"` naming a group/world-readable (0644) key file must be
@@ -115,7 +129,18 @@ fn daemon_refuses_an_hmac_admin_key_file_that_is_world_readable() {
     let out = run(&cfg);
     assert!(!out.status.success(), "must refuse to start");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("admin key"), "refusal must name it as an admin-key problem, got: {err}");
-    assert!(err.contains("ops-alice"), "refusal must name the key, got: {err}");
-    assert_eq!(out.status.code(), Some(2), "a bad admin key file must exit 2, got {:?}", out.status);
+    assert!(
+        err.contains("admin key"),
+        "refusal must name it as an admin-key problem, got: {err}"
+    );
+    assert!(
+        err.contains("ops-alice"),
+        "refusal must name the key, got: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a bad admin key file must exit 2, got {:?}",
+        out.status
+    );
 }

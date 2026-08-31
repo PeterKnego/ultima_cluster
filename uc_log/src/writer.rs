@@ -85,7 +85,11 @@ mod tests {
             buffer_bytes: CAP,
             max_payload: 256,
         });
-        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), Arc::clone(&cnc), 256));
+        let b = Arc::new(LogBuffer::new(
+            Region::heap_zeroed(CAP as usize),
+            Arc::clone(&cnc),
+            256,
+        ));
         (b, cnc)
     }
 
@@ -138,7 +142,10 @@ mod tests {
         let (follower, fc) = buf();
         let w = PositionedWriter::new(Arc::clone(&follower));
         // Nothing recorded yet: the write lands.
-        assert!(w.write_run(64, &[7u8; 64]), "control: writable while durable is 0");
+        assert!(
+            w.write_run(64, &[7u8; 64]),
+            "control: writable while durable is 0"
+        );
         // The archive records through 128.
         fc.counters().durable.store_release(128);
         assert!(
@@ -146,7 +153,10 @@ mod tests {
             "rewrote bytes below `durable` — the archive has already journalled them"
         );
         // At/above the recorded frontier is still fine.
-        assert!(w.write_run(128, &[9u8; 64]), "writes at the durable frontier must still land");
+        assert!(
+            w.write_run(128, &[9u8; 64]),
+            "writes at the durable frontier must still land"
+        );
     }
 
     #[test]

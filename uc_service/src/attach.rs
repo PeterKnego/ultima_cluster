@@ -75,7 +75,10 @@ pub(crate) fn attach<S: RawStateMachine>(
         d => d,
     };
     if cfg.service_id as usize >= CNC_MAX_SERVICES || declared & (1u64 << cfg.service_id) == 0 {
-        return Err(ServiceError::ServiceNotDeclared { id: cfg.service_id, declared });
+        return Err(ServiceError::ServiceNotDeclared {
+            id: cfg.service_id,
+            declared,
+        });
     }
     // M14a Task 7: the lag mode this incarnation runs under, read once at
     // attach (the page's `services_declared`/`fsm_lag_bytes` are boot-once —
@@ -105,14 +108,18 @@ pub(crate) fn attach<S: RawStateMachine>(
     // 2. Open the log buffer file (read-only in spirit: the service only ever
     //    uses the read APIs; a v2.x hardening may map PROT_READ). Its max_claim
     //    margin must match the node's, so take max_payload from the cnc header.
-    let buffer =
-        Arc::new(LogBuffer::open_file(&dir.join("log.buf"), Arc::clone(&cnc), meta.max_payload as usize)?);
+    let buffer = Arc::new(LogBuffer::open_file(
+        &dir.join("log.buf"),
+        Arc::clone(&cnc),
+        meta.max_payload as usize,
+    )?);
 
     // 3. Egress producer (service→everyone responses) + svc_query consumer
     //    (node→service queries; drained by Task 11). M14a: named for this
     //    process's declared `service_id` (enforced by the declared-set gate above).
-    let egress_ring = BroadcastRing::open(&dir.join(format!("egress_service.{}.broadcast", cfg.service_id)))
-        .map_err(|e| ServiceError::Ring(e.to_string()))?;
+    let egress_ring =
+        BroadcastRing::open(&dir.join(format!("egress_service.{}.broadcast", cfg.service_id)))
+            .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let egress = Egress::new(egress_ring.producer());
     let svc_query_ring = SpscRing::open(&dir.join(format!("svc_query.{}.ring", cfg.service_id)))
         .map_err(|e| ServiceError::Ring(e.to_string()))?;
@@ -142,7 +149,10 @@ pub(crate) fn attach<S: RawStateMachine>(
     let last_applied = sm.last_applied();
     let frontier = cnc.counters().durable.load_acquire();
     if last_applied.unwrap_or(0) > frontier {
-        return Err(ServiceError::Drift { service: last_applied.unwrap_or(0), journal: frontier });
+        return Err(ServiceError::Drift {
+            service: last_applied.unwrap_or(0),
+            journal: frontier,
+        });
     }
     // The follower resumes from `last_applied` (a frame START); the apply loop's
     // idempotent-skip re-walks that one frame harmlessly, and if the live ring
@@ -156,7 +166,11 @@ pub(crate) fn attach<S: RawStateMachine>(
     // Status: attached, incarnation += 1 (the prior life's value survives a
     // crash on the same page; a node restart zeroes it with the page).
     let (_, _, incarnation) = unpack_service_status(s.status.load_acquire());
-    s.status.store_release(pack_service_status(cfg.service_id, true, incarnation.wrapping_add(1)));
+    s.status.store_release(pack_service_status(
+        cfg.service_id,
+        true,
+        incarnation.wrapping_add(1),
+    ));
     // 5. Bump the epoch AFTER applied, AcqRel — the discipline the node's
     //    capture-recheck bracket relies on (unchanged, now per slot).
     let epoch = s.epoch.fetch_add(1) + 1;

@@ -23,10 +23,10 @@ use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use uc_lincheck::register::RegisterSm;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
 use uc_service::{Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
-use uc_lincheck::register::RegisterSm;
 
 pub const APP: &str = "gw-roundtrip";
 
@@ -83,7 +83,10 @@ pub fn start_single_node_with_election(
 pub fn await_serving(node: &Node, secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while !node.can_serve() {
-        assert!(Instant::now() < deadline, "node never became a serving leader");
+        assert!(
+            Instant::now() < deadline,
+            "node never became a serving leader"
+        );
         std::thread::sleep(Duration::from_millis(2));
     }
 }
@@ -105,7 +108,9 @@ pub struct Slot {
 impl Slot {
     /// A live node that both flags leader and passes the serving gate.
     pub fn is_serving_leader(&self) -> bool {
-        self.node.as_ref().is_some_and(|n| n.can_serve() && n.is_leader())
+        self.node
+            .as_ref()
+            .is_some_and(|n| n.can_serve() && n.is_leader())
     }
 
     /// Hard crash-stop, **node before service** — a node's read barrier can
@@ -139,10 +144,14 @@ impl Slot {
 /// one from boot — the new leader after a failover already has its state
 /// machine caught up.
 pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(u32, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as u32, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(u32, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
+        .collect();
 
     let mut slots = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
@@ -176,7 +185,12 @@ pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
         )
         .start()
         .expect("service start");
-        slots.push(Slot { id: i as u32, instance_dir: dir, node: Some(node), service: Some(service) });
+        slots.push(Slot {
+            id: i as u32,
+            instance_dir: dir,
+            node: Some(node),
+            service: Some(service),
+        });
     }
     slots
 }
@@ -191,8 +205,9 @@ fn seed_for(i: usize) -> u64 {
 pub fn await_single_leader(slots: &[Slot], secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let leaders: Vec<usize> =
-            (0..slots.len()).filter(|&i| slots[i].is_serving_leader()).collect();
+        let leaders: Vec<usize> = (0..slots.len())
+            .filter(|&i| slots[i].is_serving_leader())
+            .collect();
         if leaders.len() == 1 {
             return leaders[0];
         }
@@ -224,7 +239,9 @@ pub fn free_tcp_addr() -> SocketAddr {
 /// all the `uc2-gw-*` names fit inside).
 pub fn gateway_threads() -> Vec<String> {
     let mut out = Vec::new();
-    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return out };
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return out;
+    };
     for t in tasks.flatten() {
         if let Ok(name) = std::fs::read_to_string(t.path().join("comm")) {
             let name = name.trim().to_string();
@@ -246,7 +263,10 @@ pub fn assert_no_gateway_threads() {
         if live.is_empty() {
             return;
         }
-        assert!(Instant::now() < deadline, "gateway threads outlived Edge::stop: {live:?}");
+        assert!(
+            Instant::now() < deadline,
+            "gateway threads outlived Edge::stop: {live:?}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -277,7 +297,13 @@ pub fn dial_raw(addr: std::net::SocketAddr) -> FramedConn {
 pub fn send_hello(c: &mut FramedConn, client_id: u64, app_id: &str) {
     let mut out = Vec::new();
     Hello { app_id }.encode(&mut out);
-    let h = Header { ty: FrameType::Hello, flags: 0, version: PROTOCOL_VERSION, client_id, seq: 0 };
+    let h = Header {
+        ty: FrameType::Hello,
+        flags: 0,
+        version: PROTOCOL_VERSION,
+        client_id,
+        seq: 0,
+    };
     c.write_frame(h, &out).expect("write HELLO");
 }
 

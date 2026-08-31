@@ -224,9 +224,16 @@ mod tests {
 
     fn dgram(payload: &[u8], epoch: u16) -> Vec<u8> {
         let mut v = vec![0u8; DATAGRAM_HEADER_LEN];
-        write_datagram_header(&mut v, &DatagramHeader {
-            position: 4096, leadership_term_id: 3, kind: 1, flags: 0, key_epoch: epoch,
-        });
+        write_datagram_header(
+            &mut v,
+            &DatagramHeader {
+                position: 4096,
+                leadership_term_id: 3,
+                kind: 1,
+                flags: 0,
+                key_epoch: epoch,
+            },
+        );
         v.extend_from_slice(payload);
         v
     }
@@ -237,8 +244,16 @@ mod tests {
         let mut d = dgram(b"frames go here", 1);
         let header_before = d[..DATAGRAM_HEADER_LEN].to_vec();
         seal_in_place(&mut d, &key, 42).unwrap();
-        assert_eq!(&d[..DATAGRAM_HEADER_LEN], &header_before[..], "header stays readable");
-        assert_ne!(&d[DATAGRAM_HEADER_LEN + 8..], b"frames go here", "payload is sealed");
+        assert_eq!(
+            &d[..DATAGRAM_HEADER_LEN],
+            &header_before[..],
+            "header stays readable"
+        );
+        assert_ne!(
+            &d[DATAGRAM_HEADER_LEN + 8..],
+            b"frames go here",
+            "payload is sealed"
+        );
 
         assert_eq!(open_in_place(&mut d, &key).unwrap(), 42);
         assert_eq!(&d[DATAGRAM_HEADER_LEN..], b"frames go here");
@@ -250,7 +265,10 @@ mod tests {
         let mut d = dgram(b"payload", 1);
         seal_in_place(&mut d, &key, 1).unwrap();
         d[0] ^= 0xFF; // rewrite `position`
-        assert!(matches!(open_in_place(&mut d, &key), Err(CryptoError::AuthFailed)));
+        assert!(matches!(
+            open_in_place(&mut d, &key),
+            Err(CryptoError::AuthFailed)
+        ));
     }
 
     #[test]
@@ -272,7 +290,10 @@ mod tests {
     fn a_wrong_key_fails_rather_than_producing_garbage() {
         let mut d = dgram(b"payload", 1);
         seal_in_place(&mut d, &[1u8; 32], 1).unwrap();
-        assert!(matches!(open_in_place(&mut d, &[2u8; 32]), Err(CryptoError::AuthFailed)));
+        assert!(matches!(
+            open_in_place(&mut d, &[2u8; 32]),
+            Err(CryptoError::AuthFailed)
+        ));
     }
 
     #[test]
@@ -280,7 +301,10 @@ mod tests {
         // The untrusted-input contract: never panic.
         for len in 0..DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD {
             let mut d = vec![0u8; len];
-            assert!(matches!(open_in_place(&mut d, &[1u8; 32]), Err(CryptoError::TooShort)));
+            assert!(matches!(
+                open_in_place(&mut d, &[1u8; 32]),
+                Err(CryptoError::TooShort)
+            ));
         }
     }
 
@@ -391,25 +415,26 @@ mod tests {
         // but this kind of byte-exact vector to implement against.
         let key = [0x42u8; 32];
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
-        write_datagram_header(&mut d, &DatagramHeader {
-            position: 4096,
-            leadership_term_id: 3,
-            kind: 1,
-            flags: 0,
-            key_epoch: 7,
-        });
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 4096,
+                leadership_term_id: 3,
+                kind: 1,
+                flags: 0,
+                key_epoch: 7,
+            },
+        );
         d.extend_from_slice(b"hello");
         seal_in_place(&mut d, &key, 42).unwrap();
         assert_eq!(
             d,
             vec![
                 // header: position=4096 LE, term=3 LE, kind=1, flags=0, key_epoch=7 LE
-                0, 16, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 7, 0,
-                // counter=42 LE
-                42, 0, 0, 0, 0, 0, 0, 0,
-                // ciphertext (5 bytes) ++ tag (16 bytes)
-                0x1f, 0x6e, 0xff, 0x14, 0xe1, 0x85, 0x66, 0xea, 0x05, 0x95, 0xf8, 0x56, 0x38,
-                0x7d, 0xd1, 0x6c, 0x3b, 0xe5, 0xa0, 0xbd, 0x58,
+                0, 16, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 7, 0, // counter=42 LE
+                42, 0, 0, 0, 0, 0, 0, 0, // ciphertext (5 bytes) ++ tag (16 bytes)
+                0x1f, 0x6e, 0xff, 0x14, 0xe1, 0x85, 0x66, 0xea, 0x05, 0x95, 0xf8, 0x56, 0x38, 0x7d,
+                0xd1, 0x6c, 0x3b, 0xe5, 0xa0, 0xbd, 0x58,
             ],
             "sealed envelope byte-for-byte KAT (key=[0x42;32], counter=42, \
              header {{position:4096, term:3, kind:1, flags:0, key_epoch:7}}, \
@@ -430,6 +455,9 @@ mod tests {
         // either panic or silently open.
         let key = [9u8; 32];
         let mut d = vec![0x5Au8; DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD];
-        assert!(matches!(open_in_place(&mut d, &key), Err(CryptoError::AuthFailed)));
+        assert!(matches!(
+            open_in_place(&mut d, &key),
+            Err(CryptoError::AuthFailed)
+        ));
     }
 }

@@ -23,17 +23,22 @@ use uc_node::obs::ObsSources;
 use uc_node::obs::http::ObsServer;
 use uc_node::obs::metrics::now_unix_ns;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 /// A minimal blocking HTTP/1.1 GET client: connect, send the request line,
 /// read until the peer closes (the server never keeps a connection alive),
 /// split status code and body.
 fn get(addr: SocketAddr, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("connect to obs server");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout");
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set_read_timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
     stream.flush().expect("flush request");
 
     let mut raw = Vec::new();
@@ -99,11 +104,23 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
 #[test]
 fn metrics_healthz_readyz_serve_and_404_otherwise() {
     let (srv, sources) = synthetic_server();
-    sources.cnc.status().node_heartbeat_ns.store_release(now_unix_ns());
-    sources.cnc.status().service_heartbeat_ns.store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .node_heartbeat_ns
+        .store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .service_heartbeat_ns
+        .store_release(now_unix_ns());
 
     assert_eq!(get(srv.local_addr(), "/metrics").0, 200);
-    assert!(get(srv.local_addr(), "/metrics").1.contains("uc2_commit_bytes"));
+    assert!(
+        get(srv.local_addr(), "/metrics")
+            .1
+            .contains("uc2_commit_bytes")
+    );
     assert_eq!(get(srv.local_addr(), "/healthz").0, 200);
     assert_eq!(get(srv.local_addr(), "/readyz").0, 200);
     assert_eq!(get(srv.local_addr(), "/nope").0, 404);
@@ -113,22 +130,42 @@ fn metrics_healthz_readyz_serve_and_404_otherwise() {
 #[test]
 fn an_elected_but_not_serving_leader_is_not_ready() {
     let (srv, sources) = synthetic_server();
-    sources.cnc.status().node_heartbeat_ns.store_release(now_unix_ns());
-    sources.cnc.status().service_heartbeat_ns.store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .node_heartbeat_ns
+        .store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .service_heartbeat_ns
+        .store_release(now_unix_ns());
     sources.cnc.status().flags.store_release(NODE_FLAG_LEADER); // 0x01, no CAN_SERVE
 
     let (code, body) = get(srv.local_addr(), "/readyz");
     assert_eq!(code, 503);
     assert!(body.contains("NewTerm"), "{body}");
-    assert_eq!(get(srv.local_addr(), "/healthz").0, 200, "liveness must NOT flap on 0x01");
+    assert_eq!(
+        get(srv.local_addr(), "/healthz").0,
+        200,
+        "liveness must NOT flap on 0x01"
+    );
     srv.stop();
 }
 
 #[test]
 fn a_dead_agent_fails_liveness_by_name() {
     let (srv, sources) = synthetic_server();
-    sources.cnc.status().node_heartbeat_ns.store_release(now_unix_ns());
-    sources.cnc.status().service_heartbeat_ns.store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .node_heartbeat_ns
+        .store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .service_heartbeat_ns
+        .store_release(now_unix_ns());
     sources.agents[3].1.store(true, Ordering::Release); // archive fail-stopped
 
     let (code, body) = get(srv.local_addr(), "/healthz");
@@ -143,7 +180,11 @@ fn a_stale_service_heartbeat_fails_readiness_but_not_liveness() {
     // Node heartbeat fresh, service heartbeat never stamped (reads as a
     // huge age, by the same "never written = stale" convention as the
     // metrics encoder).
-    sources.cnc.status().node_heartbeat_ns.store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .node_heartbeat_ns
+        .store_release(now_unix_ns());
 
     let (code, body) = get(srv.local_addr(), "/readyz");
     assert_eq!(code, 503);
@@ -164,15 +205,24 @@ fn a_stale_service_heartbeat_fails_readiness_but_not_liveness() {
 #[test]
 fn a_trickling_client_cannot_stall_the_server() {
     let (srv, sources) = synthetic_server();
-    sources.cnc.status().node_heartbeat_ns.store_release(now_unix_ns());
-    sources.cnc.status().service_heartbeat_ns.store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .node_heartbeat_ns
+        .store_release(now_unix_ns());
+    sources
+        .cnc
+        .status()
+        .service_heartbeat_ns
+        .store_release(now_unix_ns());
 
     // Held open for the whole test (not dropped) — a closed socket sends
     // FIN, which would let the server's read return `Ok(0)` and exit the
     // read loop on its own. The point here is a connection that stays OPEN
     // but silent, so only the wall-clock deadline can end it.
     let mut slow = TcpStream::connect(srv.local_addr()).expect("slow client connect");
-    slow.write_all(b"GET /heal").expect("slow client partial write");
+    slow.write_all(b"GET /heal")
+        .expect("slow client partial write");
     slow.flush().expect("slow client flush");
 
     let start = Instant::now();
@@ -239,8 +289,8 @@ fn config_for(addr: SocketAddr, instance_dir: std::path::PathBuf) -> NodeConfig 
 fn single_node(instance_dir: &std::path::Path) -> Node {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
     let addr = sock.local_addr().unwrap();
-    let node = Node::start_with_socket(config_for(addr, instance_dir.to_path_buf()), sock)
-        .expect("start");
+    let node =
+        Node::start_with_socket(config_for(addr, instance_dir.to_path_buf()), sock).expect("start");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !node.can_serve() {
         assert!(Instant::now() < deadline, "sole voter never became leader");

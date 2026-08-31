@@ -109,10 +109,16 @@ impl LeaderWatch {
     ) -> Transition<T> {
         let now = (can_serve, hint);
         if now == self.last {
-            return Transition { changed: false, announce: None };
+            return Transition {
+                changed: false,
+                announce: None,
+            };
         }
         self.last = now;
-        Transition { changed: true, announce: hint.and_then(resolve) }
+        Transition {
+            changed: true,
+            announce: hint.and_then(resolve),
+        }
     }
 }
 
@@ -176,7 +182,11 @@ mod tests {
             (true, Some("host1:9100")),
             "this node started serving"
         );
-        assert_eq!(observe(&mut w, true, Some(1)), (false, None), "and reports it exactly once");
+        assert_eq!(
+            observe(&mut w, true, Some(1)),
+            (false, None),
+            "and reports it exactly once"
+        );
         assert_eq!(
             observe(&mut w, false, Some(1)),
             (true, Some("host1:9100")),
@@ -219,7 +229,11 @@ mod tests {
             (true, Some("host2:9100")),
             "the resolving transition is the one that fires"
         );
-        assert_eq!(observe(&mut w, false, Some(2)), (false, None), "and only once");
+        assert_eq!(
+            observe(&mut w, false, Some(2)),
+            (false, None),
+            "and only once"
+        );
     }
 
     /// The trap the `last`-always-moves rule avoids: if an unresolvable

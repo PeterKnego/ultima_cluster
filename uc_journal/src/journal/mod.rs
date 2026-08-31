@@ -962,7 +962,10 @@ mod tests {
     fn config_preallocate_defaults_off() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = JournalConfig::new(dir.path());
-        assert!(!cfg.preallocate_segments, "preallocation is opt-in (default off)");
+        assert!(
+            !cfg.preallocate_segments,
+            "preallocation is opt-in (default off)"
+        );
     }
 
     #[test]
@@ -1224,7 +1227,12 @@ mod tests {
     fn truncate_all_empties_and_reopens_clean() {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
-        for s in 0..5 { j.append(s, s * 100, &[s as u8; 64]).unwrap().wait().unwrap(); }
+        for s in 0..5 {
+            j.append(s, s * 100, &[s as u8; 64])
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
         j.truncate_all().unwrap().wait().unwrap();
         assert_eq!(j.first_seq(), None);
         assert_eq!(j.last_seq(), None);
@@ -1254,7 +1262,11 @@ mod tests {
         write_intent_bytes(dir.path(), u64::MAX);
 
         let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
-        assert_eq!(j2.first_seq(), None, "keep-none intent must empty the journal");
+        assert_eq!(
+            j2.first_seq(),
+            None,
+            "keep-none intent must empty the journal"
+        );
         assert_eq!(j2.last_seq(), None);
         assert!(
             !dir.path().join("truncate.intent").exists(),
@@ -1407,12 +1419,18 @@ mod tests {
             .unwrap()
             .last_durable_offset;
         let body_len = 16usize + payload_len;
-        assert!(real_bytes <= body_len, "real_bytes must fit within the body");
+        assert!(
+            real_bytes <= body_len,
+            "real_bytes must fit within the body"
+        );
         let mut bytes = Vec::with_capacity(4 + body_len + 4);
         bytes.extend_from_slice(&(body_len as u32).to_le_bytes());
         bytes.extend(std::iter::repeat_n(0xABu8, real_bytes)); // real (non-zero) partial write
         bytes.extend(std::iter::repeat_n(0u8, body_len - real_bytes + 4)); // unwritten zero-fill + zero CRC trailer
-        let mut f = std::fs::OpenOptions::new().write(true).open(seg_path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(seg_path)
+            .unwrap();
         f.seek(SeekFrom::Start(offset)).unwrap();
         f.write_all(&bytes).unwrap();
         (offset, bytes.len())
@@ -1518,8 +1536,12 @@ mod tests {
         let good = segment::encode_record(2, 0, b"y");
         {
             use std::io::{Seek, SeekFrom, Write};
-            let mut f = std::fs::OpenOptions::new().write(true).open(&seg_path).unwrap();
-            f.seek(SeekFrom::Start(torn_offset + torn_len as u64)).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&seg_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(torn_offset + torn_len as u64))
+                .unwrap();
             f.write_all(&good).unwrap();
         }
 
@@ -1603,7 +1625,11 @@ mod tests {
 
         let j2 = Journal::open(cfg).unwrap();
         assert!(j2.healed_torn_tail(), "must report the heal");
-        assert_eq!(j2.last_seq(), Some(12), "the torn record was never a durable seq");
+        assert_eq!(
+            j2.last_seq(),
+            Some(12),
+            "the torn record was never a durable seq"
+        );
 
         for (path, before) in entries[..entries.len() - 1].iter().zip(sealed_before) {
             assert_eq!(
@@ -1699,7 +1725,11 @@ mod tests {
         write_intent_bytes(&dir_path, 3);
 
         let j2 = Journal::open(cfg).unwrap();
-        assert_eq!(j2.last_seq(), Some(3), "the replayed intent truncates to keep_seq=3");
+        assert_eq!(
+            j2.last_seq(),
+            Some(3),
+            "the replayed intent truncates to keep_seq=3"
+        );
         assert!(
             !dir_path.join("truncate.intent").exists(),
             "the intent must be consumed, not left to wedge every subsequent boot"
@@ -2066,7 +2096,10 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("callback did not fire");
         assert!(got.is_ok());
-        assert!(rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
     }
 
     /// `on_durable` fires inline when the seq is already durable.
@@ -2141,7 +2174,10 @@ mod tests {
             j.append(i, i * 2, &payload).unwrap().wait().unwrap();
         }
         let nseg = j.state.lock().unwrap().segments.len();
-        assert!(nseg >= 4, "want several segments to exercise pruning, got {nseg}");
+        assert!(
+            nseg >= 4,
+            "want several segments to exercise pruning, got {nseg}"
+        );
 
         // Localized partial range in the middle: leading and trailing segments prune.
         let v = j.read_range(20..=29).unwrap();
@@ -2417,11 +2453,7 @@ mod tests {
         assert!(halted, "writer kept accepting work after an fsync failure");
 
         // ...and the watermark stays at the last truly durable seq.
-        assert_eq!(
-            j.durable_seq(),
-            1,
-            "watermark advanced past a failed fsync"
-        );
+        assert_eq!(j.durable_seq(), 1, "watermark advanced past a failed fsync");
     }
 
     #[test]

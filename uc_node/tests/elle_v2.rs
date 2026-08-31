@@ -29,25 +29,31 @@ use std::time::{Duration, Instant};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+#[cfg(feature = "mutation-testing")]
+use lincheck_v2::CommittedTruncationWitness;
 use lincheck_v2::{
     ClusterCfg, FsmSet, LinClusterV2, ReadOutcome, SubmitOutcome, WorkerConn, read_leader,
     read_leader_on, serialize, submit_all_cmd, submit_cmd,
 };
-#[cfg(feature = "mutation-testing")]
-use lincheck_v2::CommittedTruncationWitness;
-use uc_net::fault::FaultConfig;
 use uc_lincheck::edn::{EdnOp, EdnRecorder, EdnType};
 use uc_lincheck::list_append::{LaCmd, LaRead, LaResp, ListAppendSm};
+use uc_net::fault::FaultConfig;
 
 // ------------------------------------------------------------------ env knobs
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 #[cfg_attr(not(feature = "mutation-testing"), allow(dead_code))]
 fn env_f64(name: &str, default: f64) -> f64 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// M8 Task 15: `UC2_CRYPTO=1` re-runs the clean elle tier with wire crypto
@@ -62,10 +68,12 @@ fn elle_dir() -> PathBuf {
     // Default to DISK, never /tmp: /tmp is RAM-backed tmpfs with no swap on this
     // box and a 50k-event history OOM-kills the run (see CLAUDE.md). The
     // elle_check.sh / elle_mutation.sh wrappers set ELLE_DIR to $HOME/.cache too.
-    std::env::var("ELLE_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(".cache/uc2-elle")
-    })
+    std::env::var("ELLE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".cache/uc2-elle")
+        })
 }
 
 /// Instance dirs on ext4 (journal segments blow the tmpfs /tmp quota).
@@ -129,7 +137,14 @@ fn elle_worker(
             rec.record(EdnType::Invoke, process, &op);
             match read_leader::<LaRead, Vec<u64>>(&mut conn, &LaRead { key }, deadline) {
                 ReadOutcome::Ok(list) => {
-                    rec.record(EdnType::Ok, process, &EdnOp::Read { key, result: Some(list) });
+                    rec.record(
+                        EdnType::Ok,
+                        process,
+                        &EdnOp::Read {
+                            key,
+                            result: Some(list),
+                        },
+                    );
                 }
                 // Reads have no side effect: a lost read definitely didn't
                 // happen — :fail, and the process may continue.
@@ -219,7 +234,10 @@ fn elle_worker2(
                     ReadOutcome::Ok(list) => rec0.record(
                         EdnType::Ok,
                         process0,
-                        &EdnOp::Read { key, result: Some(list) },
+                        &EdnOp::Read {
+                            key,
+                            result: Some(list),
+                        },
                     ),
                     ReadOutcome::Indeterminate => rec0.record(EdnType::Fail, process0, &op),
                     ReadOutcome::Fatal(e) => panic!("fatal read fsm0: {e}"),
@@ -230,7 +248,10 @@ fn elle_worker2(
                     ReadOutcome::Ok(list) => rec1.record(
                         EdnType::Ok,
                         process1,
-                        &EdnOp::Read { key, result: Some(list) },
+                        &EdnOp::Read {
+                            key,
+                            result: Some(list),
+                        },
                     ),
                     ReadOutcome::Indeterminate => rec1.record(EdnType::Fail, process1, &op),
                     ReadOutcome::Fatal(e) => panic!("fatal read fsm1: {e}"),
@@ -297,10 +318,25 @@ fn run_pass<F, V>(
     let handles: Vec<_> = (0..n_workers)
         .map(|w| {
             let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (dirs, rec, stop, values) =
-                (Arc::clone(&dirs), Arc::clone(&rec), Arc::clone(&stop), Arc::clone(&values));
+            let (dirs, rec, stop, values) = (
+                Arc::clone(&dirs),
+                Arc::clone(&rec),
+                Arc::clone(&stop),
+                Arc::clone(&values),
+            );
             std::thread::spawn(move || {
-                elle_worker(w, dirs, rec, stop, rng, keys, values, 0.5, false, Duration::from_secs(15))
+                elle_worker(
+                    w,
+                    dirs,
+                    rec,
+                    stop,
+                    rng,
+                    keys,
+                    values,
+                    0.5,
+                    false,
+                    Duration::from_secs(15),
+                )
             })
         })
         .collect();
@@ -333,7 +369,8 @@ fn run_pass<F, V>(
     cluster.stop();
 
     let out = elle_dir().join(name);
-    rec.write_to(&out.join("history.edn")).expect("write history");
+    rec.write_to(&out.join("history.edn"))
+        .expect("write history");
     std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
     // M8 Task 15 review fix: record the posture this history was ACTUALLY
     // generated under, beside the existing `seed` sidecar. `scripts/
@@ -343,7 +380,8 @@ fn run_pass<F, V>(
     // dangerous mirror: `UC2_CRYPTO=1` against cleartext histories) would
     // print a posture it never actually ran. The sidecar lets the script
     // refuse that mismatch instead of silently trusting the caller's ask.
-    std::fs::write(out.join("crypto"), if ccfg.crypto { "1\n" } else { "0\n" }).expect("write crypto sidecar");
+    std::fs::write(out.join("crypto"), if ccfg.crypto { "1\n" } else { "0\n" })
+        .expect("write crypto sidecar");
 
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
     eprintln!(
@@ -352,7 +390,10 @@ fn run_pass<F, V>(
         elapsed.as_secs_f64(),
         out.join("history.edn").display()
     );
-    assert!(vacuity_ok, "vacuous {name} pass: {vacuity_label} (faults={faults})");
+    assert!(
+        vacuity_ok,
+        "vacuous {name} pass: {vacuity_label} (faults={faults})"
+    );
     assert!(
         ok * 100 >= completed * min_ok_pct,
         "liveness: only {ok}/{completed} ops Ok (<{min_ok_pct}%) in the {name} pass"
@@ -400,7 +441,9 @@ fn run_pass2() {
     let target = env_u64("ELLE_TARGET_OPS", default_target_ops);
     let budget = Duration::from_secs(env_u64("ELLE_BUDGET_SECS", 120));
     let ccfg = ClusterCfg {
-        services: FsmSet::Two { lag: uc_node::FsmLag::Bounded(64 * 1024) },
+        services: FsmSet::Two {
+            lag: uc_node::FsmLag::Bounded(64 * 1024),
+        },
         crypto: crypto_from_env(),
         ..ClusterCfg::default()
     };
@@ -476,8 +519,10 @@ fn run_pass2() {
     let out1 = out.join("fsm1");
     std::fs::create_dir_all(&out0).expect("mkdir fsm0");
     std::fs::create_dir_all(&out1).expect("mkdir fsm1");
-    rec0.write_to(&out0.join("history.edn")).expect("write history fsm0");
-    rec1.write_to(&out1.join("history.edn")).expect("write history fsm1");
+    rec0.write_to(&out0.join("history.edn"))
+        .expect("write history fsm0");
+    rec1.write_to(&out1.join("history.edn"))
+        .expect("write history fsm1");
     std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
     // Same crypto-posture sidecar convention as `run_pass` (see its comment).
     std::fs::write(out.join("crypto"), if ccfg.crypto { "1\n" } else { "0\n" })
@@ -612,7 +657,10 @@ fn elle_purge() {
 #[test]
 #[ignore]
 fn elle_reconfig() {
-    let ccfg = ClusterCfg { spare_node: true, ..ClusterCfg::default() };
+    let ccfg = ClusterCfg {
+        spare_node: true,
+        ..ClusterCfg::default()
+    };
     // Reconfig's history size is driven by time-to-config-non-vacuity × worker
     // throughput (not the op target); at 4 workers the ~195k-event history stalls
     // elle-cli's strong-serializable cycle search — 1 worker keeps it within
@@ -711,10 +759,25 @@ fn run_mutation_pass<F, V>(
     let handles: Vec<_> = (0..n_workers)
         .map(|w| {
             let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (dirs, rec, stop, values) =
-                (Arc::clone(&dirs), Arc::clone(&rec), Arc::clone(&stop), Arc::clone(&values));
+            let (dirs, rec, stop, values) = (
+                Arc::clone(&dirs),
+                Arc::clone(&rec),
+                Arc::clone(&stop),
+                Arc::clone(&values),
+            );
             std::thread::spawn(move || {
-                elle_worker(w, dirs, rec, stop, rng, keys, values, read_frac, true, op_deadline)
+                elle_worker(
+                    w,
+                    dirs,
+                    rec,
+                    stop,
+                    rng,
+                    keys,
+                    values,
+                    read_frac,
+                    true,
+                    op_deadline,
+                )
             })
         })
         .collect();
@@ -744,7 +807,8 @@ fn run_mutation_pass<F, V>(
     cluster.stop();
 
     let out = elle_dir().join(name);
-    rec.write_to(&out.join("history.edn")).expect("write history");
+    rec.write_to(&out.join("history.edn"))
+        .expect("write history");
     std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
 
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
@@ -757,7 +821,10 @@ fn run_mutation_pass<F, V>(
     // The ONLY gate a mutation pass enforces is non-vacuity (the adversary
     // actually ran). Liveness is deliberately NOT gated — the injected bug may
     // legitimately crash a node or strand writes; the elle verdict is the oracle.
-    assert!(vacuity_ok, "vacuous {name} pass: {vacuity_label} (faults={faults})");
+    assert!(
+        vacuity_ok,
+        "vacuous {name} pass: {vacuity_label} (faults={faults})"
+    );
 }
 
 /// `commit-quorum-minus-one` tooth. Leader-isolation cycles: with commit quorum
@@ -858,9 +925,7 @@ fn elle_mut_read_barrier() {
                 &LaCmd::Append { key, val: v },
                 Instant::now() + app_deadline,
             ) {
-                SubmitOutcome::Ok(LaResp::AppendAck) => {
-                    rec.record(EdnType::Ok, appender_pid, &aop)
-                }
+                SubmitOutcome::Ok(LaResp::AppendAck) => rec.record(EdnType::Ok, appender_pid, &aop),
                 // Couldn't advance the key (majority not serving yet) → :info, retire,
                 // and skip the read: nothing committed, so nothing to be stale about.
                 SubmitOutcome::Indeterminate => {
@@ -875,9 +940,14 @@ fn elle_mut_read_barrier() {
             let rop = EdnOp::Read { key, result: None };
             rec.record(EdnType::Invoke, reader_pid, &rop);
             match stale.query_linearizable::<LaRead, Vec<u64>>(&LaRead { key }) {
-                Ok(list) => {
-                    rec.record(EdnType::Ok, reader_pid, &EdnOp::Read { key, result: Some(list) })
-                }
+                Ok(list) => rec.record(
+                    EdnType::Ok,
+                    reader_pid,
+                    &EdnOp::Read {
+                        key,
+                        result: Some(list),
+                    },
+                ),
                 Err(_) => rec.record(EdnType::Fail, reader_pid, &rop),
             }
         }
@@ -893,7 +963,8 @@ fn elle_mut_read_barrier() {
     cluster.stop();
 
     let out = elle_dir().join("mut_read_barrier");
-    rec.write_to(&out.join("history.edn")).expect("write history");
+    rec.write_to(&out.join("history.edn"))
+        .expect("write history");
     std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
     eprintln!(
@@ -902,7 +973,10 @@ fn elle_mut_read_barrier() {
         start.elapsed().as_secs_f64(),
         out.join("history.edn").display()
     );
-    assert!(faults >= min_faults, "fewer than {min_faults} leader-isolation cycles landed");
+    assert!(
+        faults >= min_faults,
+        "fewer than {min_faults} leader-isolation cycles landed"
+    );
 }
 
 /// `skip-vote-order-check` tooth. Minority-isolate a follower long enough that

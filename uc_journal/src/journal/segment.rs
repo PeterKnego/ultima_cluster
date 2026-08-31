@@ -365,10 +365,7 @@ impl SegmentFile {
     /// once, then advances `size` and maintains the sparse index per record
     /// using the same `SPARSE_INDEX_GAP` rule as a per-record append. Returns
     /// the byte offset of the first record written.
-    pub fn append_records(
-        &mut self,
-        records: &[(u64, u64, &[u8])],
-    ) -> Result<u64, JournalError> {
+    pub fn append_records(&mut self, records: &[(u64, u64, &[u8])]) -> Result<u64, JournalError> {
         let start_offset = self.size;
         if records.is_empty() {
             return Ok(start_offset);
@@ -821,11 +818,7 @@ impl SegmentFile {
     ///
     /// Only records in the read span are CRC-verified; a partial range read does
     /// not validate the whole segment (use `scan` for that).
-    pub fn read_window(
-        &self,
-        lo: u64,
-        hi: u64,
-    ) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
+    pub fn read_window(&self, lo: u64, hi: u64) -> Result<Vec<(u64, u64, Vec<u8>)>, JournalError> {
         // Defensive fallback: index not yet populated.
         if self.index.is_empty() {
             let scan = self.scan()?;
@@ -845,7 +838,11 @@ impl SegmentFile {
         // first record if lo is below the segment); end at the offset of the
         // first record with seq > hi (or EOF).
         let s = self.index.partition_point(|&(sq, _)| sq <= lo);
-        let start = if s == 0 { self.index[0].1 } else { self.index[s - 1].1 };
+        let start = if s == 0 {
+            self.index[0].1
+        } else {
+            self.index[s - 1].1
+        };
         let e = self.index.partition_point(|&(sq, _)| sq <= hi);
         let end = if e < self.index.len() {
             self.index[e].1
@@ -953,7 +950,7 @@ fn fallocate_zero_range_at(
 ) -> Result<(), JournalError> {
     #[cfg(target_os = "linux")]
     {
-        use rustix::fs::{fallocate, FallocateFlags};
+        use rustix::fs::{FallocateFlags, fallocate};
         use rustix::io::Errno;
         match fallocate(file, FallocateFlags::ZERO_RANGE, offset, len) {
             Ok(()) => {
@@ -1187,8 +1184,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // ~20 KiB payloads → records cross the 64 KiB SPARSE_INDEX_GAP every few records.
         let payload = vec![0x5Au8; 20 * 1024];
-        let recs: Vec<(u64, u64, &[u8])> =
-            (1..=12u64).map(|i| (i, i * 2, payload.as_slice())).collect();
+        let recs: Vec<(u64, u64, &[u8])> = (1..=12u64)
+            .map(|i| (i, i * 2, payload.as_slice()))
+            .collect();
 
         let p1 = dir.path().join("seg-00000000000000000001.log");
         let mut a = SegmentFile::create(&p1, 1).unwrap();
@@ -1228,8 +1226,9 @@ mod tests {
         let mut seg = SegmentFile::create(&path, 1).unwrap();
         // ~20 KiB payloads → cross the 64 KiB SPARSE_INDEX_GAP several times.
         let payload = vec![0x33u8; 20 * 1024];
-        let recs: Vec<(u64, u64, &[u8])> =
-            (1..=20u64).map(|i| (i, i * 3, payload.as_slice())).collect();
+        let recs: Vec<(u64, u64, &[u8])> = (1..=20u64)
+            .map(|i| (i, i * 3, payload.as_slice()))
+            .collect();
         seg.append_records(&recs).unwrap();
         seg.fsync().unwrap();
 
@@ -1267,7 +1266,8 @@ mod tests {
         let path = dir.path().join("seg-00000000000000000001.log");
         {
             let mut seg = SegmentFile::create(&path, 1).unwrap();
-            seg.append_records(&[(1, 100, b"x"), (2, 200, b"yy")]).unwrap();
+            seg.append_records(&[(1, 100, b"x"), (2, 200, b"yy")])
+                .unwrap();
             seg.fsync().unwrap();
         }
         // Reopen: open_for_read leaves the index empty (not yet populated).
@@ -1285,8 +1285,9 @@ mod tests {
         let mut seg = SegmentFile::create(&path, 1).unwrap();
         // ~20 KiB payloads → multiple 64 KiB index windows.
         let payload = vec![0x44u8; 20 * 1024];
-        let recs: Vec<(u64, u64, &[u8])> =
-            (1..=20u64).map(|i| (i, i * 9, payload.as_slice())).collect();
+        let recs: Vec<(u64, u64, &[u8])> = (1..=20u64)
+            .map(|i| (i, i * 9, payload.as_slice()))
+            .collect();
         seg.append_records(&recs).unwrap();
         seg.fsync().unwrap();
         assert!(seg.index_snapshot().len() > 1);
@@ -1298,8 +1299,20 @@ mod tests {
                 .map(|r| (r.seq, r.meta, r.payload.clone()))
                 .collect()
         };
-        for (lo, hi) in [(1u64, 20u64), (5, 9), (1, 1), (20, 20), (8, 15), (3, 3), (12, 100)] {
-            assert_eq!(seg.read_window(lo, hi).unwrap(), expect(lo, hi), "[{lo},{hi}]");
+        for (lo, hi) in [
+            (1u64, 20u64),
+            (5, 9),
+            (1, 1),
+            (20, 20),
+            (8, 15),
+            (3, 3),
+            (12, 100),
+        ] {
+            assert_eq!(
+                seg.read_window(lo, hi).unwrap(),
+                expect(lo, hi),
+                "[{lo},{hi}]"
+            );
         }
     }
 
@@ -1346,7 +1359,10 @@ mod tests {
         // abundant trailing zero bytes must read as end-of-records, NOT corruption.
         let buf = vec![0u8; 4096];
         let got = decode_record(&buf, "seg-test", 32).unwrap();
-        assert!(got.is_none(), "zero length-prefix must be torn tail (Ok(None))");
+        assert!(
+            got.is_none(),
+            "zero length-prefix must be torn tail (Ok(None))"
+        );
     }
 
     #[test]
@@ -1367,9 +1383,18 @@ mod tests {
         let path = dir.path().join("seg-test.log");
         let mut seg = SegmentFile::create(&path, 1).unwrap();
         let logical_before = seg.size().unwrap();
-        seg.preallocate_to(1024 * 1024, PreallocFill::ZeroWriteFull, 0).unwrap();
-        assert_eq!(seg.size().unwrap(), logical_before, "logical cursor unchanged");
-        assert_eq!(seg.physical_len().unwrap(), 1024 * 1024, "physical extended");
+        seg.preallocate_to(1024 * 1024, PreallocFill::ZeroWriteFull, 0)
+            .unwrap();
+        assert_eq!(
+            seg.size().unwrap(),
+            logical_before,
+            "logical cursor unchanged"
+        );
+        assert_eq!(
+            seg.physical_len().unwrap(),
+            1024 * 1024,
+            "physical extended"
+        );
     }
 
     #[test]
@@ -1378,22 +1403,39 @@ mod tests {
         let temp = dir.path().join("seg-prealloc.0.tmp");
         let final_path = dir.path().join("seg-00000000000000000007.log");
 
-        SegmentFile::create_prealloc_temp(&temp, 1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
+        SegmentFile::create_prealloc_temp(
+            &temp,
+            1024 * 1024,
+            crate::PreallocFill::ZeroWriteFull,
+            0,
+        )
+        .unwrap();
         assert!(temp.exists());
 
         let mut seg = SegmentFile::activate_prealloc_temp(&temp, &final_path, 7).unwrap();
         assert!(!temp.exists(), "temp renamed away");
         assert!(final_path.exists());
         assert_eq!(seg.base_seq(), 7);
-        assert_eq!(seg.size().unwrap(), SEGMENT_HEADER_SIZE as u64, "logical cursor at header");
-        assert_eq!(seg.physical_len().unwrap(), 1024 * 1024, "preallocated tail preserved");
+        assert_eq!(
+            seg.size().unwrap(),
+            SEGMENT_HEADER_SIZE as u64,
+            "logical cursor at header"
+        );
+        assert_eq!(
+            seg.physical_len().unwrap(),
+            1024 * 1024,
+            "preallocated tail preserved"
+        );
 
         // The activated segment is a normal append target.
         seg.append_records(&[(7, 0, b"first")]).unwrap();
         let scan = seg.scan().unwrap();
         assert_eq!(scan.records.len(), 1);
         assert_eq!(scan.records[0].seq, 7);
-        assert!(scan.had_torn_tail, "zero tail after the record reads as torn tail");
+        assert!(
+            scan.had_torn_tail,
+            "zero tail after the record reads as torn tail"
+        );
     }
 
     #[test]
@@ -1403,7 +1445,8 @@ mod tests {
         let p = dir.path().join("seg-prealloc.0.tmp");
         // A size that is NOT a multiple of the 4 MiB chunk to exercise the final partial sync.
         let total: u64 = 4 * 1024 * 1024 + 7;
-        SegmentFile::create_prealloc_temp(&p, total, PreallocFill::ZeroWritePaced, 4 * 1024 * 1024).unwrap();
+        SegmentFile::create_prealloc_temp(&p, total, PreallocFill::ZeroWritePaced, 4 * 1024 * 1024)
+            .unwrap();
         let meta = std::fs::metadata(&p).unwrap();
         assert_eq!(meta.len(), total, "file must be exactly total_len");
         let bytes = std::fs::read(&p).unwrap();
@@ -1419,7 +1462,13 @@ mod tests {
         let total: u64 = 2 * 1024 * 1024 + 13;
         // On a filesystem without ZERO_RANGE support this falls back to paced;
         // either way the postcondition (full-size, all zeros) must hold.
-        SegmentFile::create_prealloc_temp(&p, total, PreallocFill::FallocateZeroRange, 4 * 1024 * 1024).unwrap();
+        SegmentFile::create_prealloc_temp(
+            &p,
+            total,
+            PreallocFill::FallocateZeroRange,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
         let meta = std::fs::metadata(&p).unwrap();
         assert_eq!(meta.len(), total);
         let bytes = std::fs::read(&p).unwrap();
@@ -1431,12 +1480,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-test.log");
         let mut seg = SegmentFile::create(&path, 1).unwrap();
-        seg.preallocate_to(1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
+        seg.preallocate_to(1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0)
+            .unwrap();
         seg.append_records(&[(1, 0, b"hello")]).unwrap();
         let after_append = seg.size().unwrap();
         seg.reset_cursor(SEGMENT_HEADER_SIZE as u64);
-        assert_eq!(seg.size().unwrap(), SEGMENT_HEADER_SIZE as u64, "cursor reset");
+        assert_eq!(
+            seg.size().unwrap(),
+            SEGMENT_HEADER_SIZE as u64,
+            "cursor reset"
+        );
         assert!(after_append > SEGMENT_HEADER_SIZE as u64);
-        assert_eq!(seg.physical_len().unwrap(), 1024 * 1024, "physical preserved");
+        assert_eq!(
+            seg.physical_len().unwrap(),
+            1024 * 1024,
+            "physical preserved"
+        );
     }
 }

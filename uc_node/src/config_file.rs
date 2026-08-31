@@ -43,9 +43,15 @@ use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read config file {path}: {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("invalid config file {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     /// A field passed `deny_unknown_fields`/type-checking but failed its own
     /// semantic parse (`log.level`; the M12b `crypto.*`/`admin.*`
     /// cross-field rules below). `detail` already names the field and echoes
@@ -153,7 +159,11 @@ pub struct AdminSection {
 /// default so it is never accidentally the thing a `< 1000` test is testing.
 impl Default for AdminSection {
     fn default() -> Self {
-        AdminSection { auth: AdminAuthMode::None, keys: Vec::new(), request_ttl_ms: default_admin_ttl_ms() }
+        AdminSection {
+            auth: AdminAuthMode::None,
+            keys: Vec::new(),
+            request_ttl_ms: default_admin_ttl_ms(),
+        }
     }
 }
 
@@ -274,15 +284,18 @@ pub fn default_seed_for(id: NodeId) -> u64 {
 /// the type system enforces — call [`crate::preflight::check`] next, passing it
 /// the returned [`StartupOptions`].
 pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), ConfigError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
     // `parse_str` has no path to name, so it stamps [`IN_MEMORY_CONFIG`];
     // re-stamp the real one here so a refusal still tells the operator which
     // file to edit.
     parse_str(&text).map_err(|e| match e {
-        ConfigError::Parse { source, .. } => {
-            ConfigError::Parse { path: path.to_path_buf(), source }
-        }
+        ConfigError::Parse { source, .. } => ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        },
         other => other,
     })
 }
@@ -303,25 +316,33 @@ pub const IN_MEMORY_CONFIG: &str = "<in-memory config>";
 /// temporary file; performs NO validation beyond what `load_from_path` does,
 /// so [`crate::preflight::check`] is still the next step.
 pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError> {
-    let f: NodeConfigFile = toml::from_str(text)
-        .map_err(|source| ConfigError::Parse { path: PathBuf::from(IN_MEMORY_CONFIG), source })?;
+    let f: NodeConfigFile = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        path: PathBuf::from(IN_MEMORY_CONFIG),
+        source,
+    })?;
 
     let purge = match f.purge {
-        Some(p) => PurgePolicy::BelowSnapshot { slack_bytes: p.below_snapshot_slack_bytes },
+        Some(p) => PurgePolicy::BelowSnapshot {
+            slack_bytes: p.below_snapshot_slack_bytes,
+        },
         None => PurgePolicy::Disabled,
     };
     // M12b (spec §3.3, §5.4): explicit choice — absent `[crypto]` is itself
     // a refusal, not "off".
     let crypto_section = f.crypto.ok_or(ConfigError::CryptoChoiceRequired)?;
     let crypto = if crypto_section.enabled {
-        let key_path = crypto_section.key_path.ok_or_else(|| ConfigError::Invalid {
-            field: "crypto.key_path",
-            detail: "crypto.enabled = true requires crypto.key_path".to_string(),
-        })?;
-        let allowlist_path = crypto_section.allowlist_path.ok_or_else(|| ConfigError::Invalid {
-            field: "crypto.allowlist_path",
-            detail: "crypto.enabled = true requires crypto.allowlist_path".to_string(),
-        })?;
+        let key_path = crypto_section
+            .key_path
+            .ok_or_else(|| ConfigError::Invalid {
+                field: "crypto.key_path",
+                detail: "crypto.enabled = true requires crypto.key_path".to_string(),
+            })?;
+        let allowlist_path = crypto_section
+            .allowlist_path
+            .ok_or_else(|| ConfigError::Invalid {
+                field: "crypto.allowlist_path",
+                detail: "crypto.enabled = true requires crypto.allowlist_path".to_string(),
+            })?;
         let d = RotationPolicy::default();
         CryptoConfig::Enabled {
             key_path,
@@ -350,7 +371,10 @@ pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError
     if admin.request_ttl_ms < 1000 {
         return Err(ConfigError::Invalid {
             field: "admin.request_ttl_ms",
-            detail: format!("admin.request_ttl_ms must be >= 1000, got {}", admin.request_ttl_ms),
+            detail: format!(
+                "admin.request_ttl_ms must be >= 1000, got {}",
+                admin.request_ttl_ms
+            ),
         });
     }
     match admin.auth {
@@ -418,54 +442,71 @@ pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError
     }
     let log_level = match f.log.and_then(|l| l.level) {
         None => LogLevel::default(),
-        Some(s) => s
-            .parse::<LogLevel>()
-            .map_err(|e| ConfigError::Invalid { field: "log.level", detail: e })?,
+        Some(s) => s.parse::<LogLevel>().map_err(|e| ConfigError::Invalid {
+            field: "log.level",
+            detail: e,
+        })?,
     };
-    let metrics_bind = f.metrics.map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".parse().unwrap()));
+    let metrics_bind = f
+        .metrics
+        .map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".parse().unwrap()));
 
     let services = match f.services {
         None => ServicesConfig::default(),
         Some(s) => {
             let fsm_lag = match s.fsm_lag.as_deref() {
                 None => None,
-                Some(raw) => Some(
-                    crate::services::parse_fsm_lag(raw)
-                        .map_err(|detail| ConfigError::Invalid { field: "services.fsm_lag", detail })?,
-                ),
+                Some(raw) => Some(crate::services::parse_fsm_lag(raw).map_err(|detail| {
+                    ConfigError::Invalid {
+                        field: "services.fsm_lag",
+                        detail,
+                    }
+                })?),
             };
-            let cfg = ServicesConfig::from_ids(&s.ids, fsm_lag)
-                .map_err(|detail| ConfigError::Invalid { field: "services.ids", detail })?;
+            let cfg = ServicesConfig::from_ids(&s.ids, fsm_lag).map_err(|detail| {
+                ConfigError::Invalid {
+                    field: "services.ids",
+                    detail,
+                }
+            })?;
             cfg.validate(f.buffer_bytes as u64)
-                .map_err(|detail| ConfigError::Invalid { field: "services.fsm_lag", detail })?;
+                .map_err(|detail| ConfigError::Invalid {
+                    field: "services.fsm_lag",
+                    detail,
+                })?;
             cfg
         }
     };
 
-    Ok((NodeConfig {
-        id: f.id,
-        members: f.members.into_iter().map(|m| (m.id, m.addr)).collect(),
-        learners: f.learners.into_iter().map(|m| (m.id, m.addr)).collect(),
-        bind: f.bind,
-        instance_dir: f.instance_dir,
-        app_id: f.app_id,
-        buffer_bytes: f.buffer_bytes,
-        max_payload: f.max_payload,
-        admission_bytes: f.admission_bytes,
-        election_timeout_min_ns: f.election_timeout_min_ns,
-        election_timeout_max_ns: f.election_timeout_max_ns,
-        seed: f.seed.unwrap_or_else(|| default_seed_for(f.id)),
-        faults: FaultConfig::default(),
-        purge,
-        journal_segment_bytes: f.journal_segment_bytes,
-        crypto,
-        services,
-    },
-    StartupOptions {
-        allow_volatile_fs: f.allow_volatile_fs,
-        obs: ObsOptions { log_level, metrics_bind },
-        admin,
-    }))
+    Ok((
+        NodeConfig {
+            id: f.id,
+            members: f.members.into_iter().map(|m| (m.id, m.addr)).collect(),
+            learners: f.learners.into_iter().map(|m| (m.id, m.addr)).collect(),
+            bind: f.bind,
+            instance_dir: f.instance_dir,
+            app_id: f.app_id,
+            buffer_bytes: f.buffer_bytes,
+            max_payload: f.max_payload,
+            admission_bytes: f.admission_bytes,
+            election_timeout_min_ns: f.election_timeout_min_ns,
+            election_timeout_max_ns: f.election_timeout_max_ns,
+            seed: f.seed.unwrap_or_else(|| default_seed_for(f.id)),
+            faults: FaultConfig::default(),
+            purge,
+            journal_segment_bytes: f.journal_segment_bytes,
+            crypto,
+            services,
+        },
+        StartupOptions {
+            allow_volatile_fs: f.allow_volatile_fs,
+            obs: ObsOptions {
+                log_level,
+                metrics_bind,
+            },
+            admin,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -597,7 +638,10 @@ auth = "none"
         assert_eq!(cfg.app_id, "myapp");
         // Defaults that must NOT require the operator to state them.
         assert_eq!(cfg.buffer_bytes, 1 << 26);
-        assert_eq!(cfg.journal_segment_bytes, crate::DEFAULT_JOURNAL_SEGMENT_BYTES);
+        assert_eq!(
+            cfg.journal_segment_bytes,
+            crate::DEFAULT_JOURNAL_SEGMENT_BYTES
+        );
         assert!(matches!(cfg.purge, PurgePolicy::Disabled));
         assert!(matches!(cfg.crypto, CryptoConfig::Disabled));
         assert!(cfg.learners.is_empty());
@@ -652,7 +696,10 @@ addr = "10.0.0.1:9100"
         );
         let err = load_from_path(&p).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("buffer_bytez"), "error must name the typo, got: {msg}");
+        assert!(
+            msg.contains("buffer_bytez"),
+            "error must name the typo, got: {msg}"
+        );
     }
 
     #[test]
@@ -693,9 +740,18 @@ auth = "none"
 "#,
         );
         let (cfg, _opts) = load_from_path(&p).unwrap();
-        assert!(matches!(cfg.purge, PurgePolicy::BelowSnapshot { slack_bytes: 1048576 }));
+        assert!(matches!(
+            cfg.purge,
+            PurgePolicy::BelowSnapshot {
+                slack_bytes: 1048576
+            }
+        ));
         match cfg.crypto {
-            CryptoConfig::Enabled { ref key_path, ref allowlist_path, rotation } => {
+            CryptoConfig::Enabled {
+                ref key_path,
+                ref allowlist_path,
+                rotation,
+            } => {
                 assert_eq!(key_path.to_str().unwrap(), "/etc/uc2/node.key");
                 assert_eq!(allowlist_path.to_str().unwrap(), "/etc/uc2/allowlist.toml");
                 // Unstated rotation takes the crate default (1 h / 1 TiB).
@@ -741,10 +797,13 @@ auth = "none"
     /// the operator's first boot, not ours.
     #[test]
     fn the_packaged_example_config_is_valid() {
-        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../packaging/node.example.toml");
+        let p =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packaging/node.example.toml");
         let (cfg, opts) = load_from_path(&p).expect("packaging/node.example.toml must parse");
-        assert!(!opts.allow_volatile_fs, "the shipped example must not override durability");
+        assert!(
+            !opts.allow_volatile_fs,
+            "the shipped example must not override durability"
+        );
         crate::preflight::check_semantics(&cfg).expect("the shipped example must be startable");
     }
 
@@ -783,17 +842,24 @@ level = "info"
 
     #[test]
     fn log_and_metrics_sections_parse_into_obs_options() {
-        let (_cfg, opts) =
-            load_str(&format!("{MINIMAL}\n[log]\nlevel = \"warn\"\n[metrics]\nbind = \"127.0.0.1:9601\"\n"))
-                .unwrap();
+        let (_cfg, opts) = load_str(&format!(
+            "{MINIMAL}\n[log]\nlevel = \"warn\"\n[metrics]\nbind = \"127.0.0.1:9601\"\n"
+        ))
+        .unwrap();
         assert_eq!(opts.obs.log_level, LogLevel::Warn);
-        assert_eq!(opts.obs.metrics_bind, Some("127.0.0.1:9601".parse().unwrap()));
+        assert_eq!(
+            opts.obs.metrics_bind,
+            Some("127.0.0.1:9601".parse().unwrap())
+        );
     }
 
     #[test]
     fn a_bare_metrics_section_gets_the_default_bind() {
         let (_cfg, opts) = load_str(&format!("{MINIMAL}\n[metrics]\n")).unwrap();
-        assert_eq!(opts.obs.metrics_bind, Some("127.0.0.1:9600".parse().unwrap()));
+        assert_eq!(
+            opts.obs.metrics_bind,
+            Some("127.0.0.1:9600".parse().unwrap())
+        );
     }
 
     #[test]
@@ -807,7 +873,10 @@ level = "info"
     fn a_bad_log_level_is_a_refusal_naming_the_field() {
         let e = load_str(&format!("{MINIMAL}\n[log]\nlevel = \"verbose\"\n")).unwrap_err();
         let msg = e.to_string();
-        assert!(msg.contains("log.level") && msg.contains("verbose"), "{msg}");
+        assert!(
+            msg.contains("log.level") && msg.contains("verbose"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -824,7 +893,10 @@ level = "info"
     fn absent_crypto_section_is_an_explicit_choice_refusal() {
         let body = format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[admin]\nauth = \"none\"\n");
         let err = load_str(&body).unwrap_err();
-        assert!(matches!(err, ConfigError::CryptoChoiceRequired), "got: {err:?}");
+        assert!(
+            matches!(err, ConfigError::CryptoChoiceRequired),
+            "got: {err:?}"
+        );
         assert!(err.to_string().contains("[crypto]"), "{err}");
     }
 
@@ -836,13 +908,17 @@ level = "info"
         );
         let err = load_str(&body).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("enabled"), "must name the missing field, got: {msg}");
+        assert!(
+            msg.contains("enabled"),
+            "must name the missing field, got: {msg}"
+        );
     }
 
     #[test]
     fn crypto_enabled_without_key_path_names_it() {
-        let body =
-            format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = true\n[admin]\nauth = \"none\"\n");
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = true\n[admin]\nauth = \"none\"\n"
+        );
         let err = load_str(&body).unwrap_err();
         match err {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "crypto.key_path"),
@@ -883,14 +959,18 @@ level = "info"
     fn absent_admin_section_is_an_explicit_choice_refusal() {
         let body = format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n");
         let err = load_str(&body).unwrap_err();
-        assert!(matches!(err, ConfigError::AdminChoiceRequired), "got: {err:?}");
+        assert!(
+            matches!(err, ConfigError::AdminChoiceRequired),
+            "got: {err:?}"
+        );
         assert!(err.to_string().contains("[admin]"), "{err}");
     }
 
     #[test]
     fn admin_hmac_with_no_keys_is_refused() {
-        let body =
-            format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n");
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n"
+        );
         let err = load_str(&body).unwrap_err();
         match err {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
@@ -907,7 +987,10 @@ level = "info"
         );
         let err = load_str(&body).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("ops-alice"), "must name the duplicate key, got: {msg}");
+        assert!(
+            msg.contains("ops-alice"),
+            "must name the duplicate key, got: {msg}"
+        );
         match err {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
             other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),
@@ -931,7 +1014,10 @@ level = "info"
     fn services_section_parses_ids_and_a_byte_size_lag() {
         let body = format!("{MINIMAL}\n[services]\nids = [0, 1, 2]\nfsm_lag = \"16MiB\"\n");
         let (cfg, _) = load_str(&body).unwrap();
-        assert_eq!(cfg.services, ServicesConfig::from_ids(&[0, 1, 2], Some(FsmLag::Bounded(16 << 20))).unwrap());
+        assert_eq!(
+            cfg.services,
+            ServicesConfig::from_ids(&[0, 1, 2], Some(FsmLag::Bounded(16 << 20))).unwrap()
+        );
     }
 
     #[test]
@@ -948,15 +1034,30 @@ level = "info"
             ("ids = [0, 0]", "duplicate service id 0", "services.ids"),
             ("ids = [0, 9]", "out of range", "services.ids"),
             ("ids = [1]", "service id 0 must be declared", "services.ids"),
-            ("ids = [0]\nfsm_lag = \"16 MiB\"", "services.fsm_lag must be", "services.fsm_lag"),
-            ("ids = [0]\nfsm_lag = \"0\"", "not a bound", "services.fsm_lag"),
+            (
+                "ids = [0]\nfsm_lag = \"16 MiB\"",
+                "services.fsm_lag must be",
+                "services.fsm_lag",
+            ),
+            (
+                "ids = [0]\nfsm_lag = \"0\"",
+                "not a bound",
+                "services.fsm_lag",
+            ),
             // default buffer_bytes is 64 MiB; half is 32 MiB.
-            ("ids = [0]\nfsm_lag = \"32MiB\"", "below buffer_bytes / 2", "services.fsm_lag"),
+            (
+                "ids = [0]\nfsm_lag = \"32MiB\"",
+                "below buffer_bytes / 2",
+                "services.fsm_lag",
+            ),
         ] {
             let body = format!("{MINIMAL}\n[services]\n{tail}\n");
             let err = load_str(&body).unwrap_err();
             let msg = err.to_string();
-            assert!(msg.contains(needle), "{tail}: expected {needle:?} in {msg:?}");
+            assert!(
+                msg.contains(needle),
+                "{tail}: expected {needle:?} in {msg:?}"
+            );
             match err {
                 ConfigError::Invalid { field: f, .. } => assert_eq!(f, field, "{tail}"),
                 other => panic!("{tail}: expected Invalid, got {other:?}"),

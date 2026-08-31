@@ -79,16 +79,22 @@ struct ArmConfig {
 }
 
 fn budget_ms() -> u64 {
-    std::env::var("UC2_ARCHIVE_STRESS_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000)
+    std::env::var("UC2_ARCHIVE_STRESS_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000)
 }
 
 fn run_seed() -> u64 {
-    std::env::var("UC2_ARCHIVE_STRESS_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15)
-    })
+    std::env::var("UC2_ARCHIVE_STRESS_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        })
 }
 
 /// A journal dir on a real filesystem. `tempfile::tempdir()` lands in $TMPDIR
@@ -96,7 +102,10 @@ fn run_seed() -> u64 {
 /// so honor `UC2_ARCHIVE_STRESS_DIR` (point it at ext4 for the long runs).
 fn journal_dir() -> tempfile::TempDir {
     match std::env::var("UC2_ARCHIVE_STRESS_DIR") {
-        Ok(base) => tempfile::Builder::new().prefix("uc2-arch-stress-").tempdir_in(base).unwrap(),
+        Ok(base) => tempfile::Builder::new()
+            .prefix("uc2-arch-stress-")
+            .tempdir_in(base)
+            .unwrap(),
         Err(_) => tempfile::tempdir().unwrap(),
     }
 }
@@ -119,15 +128,21 @@ fn make_buffer() -> (Arc<LogBuffer>, Arc<CncPage>) {
         buffer_bytes: CAP,
         max_payload: MAX_PAYLOAD as u32,
     });
-    let buffer =
-        Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), Arc::clone(&cnc), MAX_PAYLOAD));
+    let buffer = Arc::new(LogBuffer::new(
+        Region::heap_zeroed(CAP as usize),
+        Arc::clone(&cnc),
+        MAX_PAYLOAD,
+    ));
     (buffer, cnc)
 }
 
 fn archive_cfg(dir: &std::path::Path) -> ArchiveConfig {
     // Small segments so a long run's on-disk journal stays modest; preallocate
     // as production does.
-    ArchiveConfig { segment_size_bytes: 4 * 1024 * 1024, ..ArchiveConfig::new(dir) }
+    ArchiveConfig {
+        segment_size_bytes: 4 * 1024 * 1024,
+        ..ArchiveConfig::new(dir)
+    }
 }
 
 /// The two structured corruption errors are the repro. Any other error is
@@ -362,9 +377,7 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                                      reported below-floor (Ok(None)) with purge excluded"
                                 );
                             }
-                            Err(e) => {
-                                fail_repro(&stop, seed, "replayer/replay_journal_from", &e)
-                            }
+                            Err(e) => fail_repro(&stop, seed, "replayer/replay_journal_from", &e),
                         }
                     }
                     drop(_t);
@@ -418,8 +431,7 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                             let mut guard_iters = 0u32;
                             while p < end && guard_iters < 8192 {
                                 guard_iters += 1;
-                                let Some((seq, base)) =
-                                    find_block(&journal, p).ok().flatten()
+                                let Some((seq, base)) = find_block(&journal, p).ok().flatten()
                                 else {
                                     break; // purged/below-floor: tolerated
                                 };
@@ -429,7 +441,10 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                                 // Append-only + front-purge never renumbers a seq,
                                 // so an existing seq's base is stable even under
                                 // the race (mirrors the production debug_assert).
-                                assert_eq!(rbase, base, "seq {seq}: read base disagrees with find_block");
+                                assert_eq!(
+                                    rbase, base,
+                                    "seq {seq}: read base disagrees with find_block"
+                                );
                                 let block_end = base + block.len() as u64;
                                 if p >= block_end {
                                     break; // at/beyond the durable frontier
@@ -561,7 +576,10 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
         "archive_stress[{arm_name}] seed={seed} OK — durable frontier {durable} B, blocks {}",
         archive.lock().unwrap().as_ref().unwrap().blocks_recorded()
     );
-    assert!(durable > 0, "harness did no work (durable frontier never advanced)");
+    assert!(
+        durable > 0,
+        "harness did no work (durable frontier never advanced)"
+    );
 }
 
 /// Arm A: concurrent append + archive + replay, wrap-heavy. Exercises H1 (the
@@ -572,7 +590,11 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
 #[cfg_attr(miri, ignore)] // real journal files + fsync + threads
 fn stress_append_archive_replay() {
     run_stress(
-        ArmConfig { truncation: false, reopen: false, nak_server: false },
+        ArmConfig {
+            truncation: false,
+            reopen: false,
+            nak_server: false,
+        },
         "A/append-archive-replay",
     );
 }
@@ -583,7 +605,14 @@ fn stress_append_archive_replay() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stress_with_truncation() {
-    run_stress(ArmConfig { truncation: true, reopen: false, nak_server: false }, "B/truncation");
+    run_stress(
+        ArmConfig {
+            truncation: true,
+            reopen: false,
+            nak_server: false,
+        },
+        "B/truncation",
+    );
 }
 
 /// Arm C: periodic drop+reopen of the Archive mid-load with counter priming —
@@ -593,7 +622,14 @@ fn stress_with_truncation() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stress_reopen() {
-    run_stress(ArmConfig { truncation: true, reopen: true, nak_server: false }, "C/reopen");
+    run_stress(
+        ArmConfig {
+            truncation: true,
+            reopen: true,
+            nak_server: false,
+        },
+        "C/reopen",
+    );
 }
 
 /// Focused t3b repro (find_block purge-race): a TIGHT purge loop (floor chases
@@ -609,7 +645,10 @@ fn stress_reopen() {
 fn find_block_tolerates_tight_purge_race() {
     let seed = run_seed();
     let budget = Duration::from_millis(budget_ms());
-    println!("find_block_tolerates_tight_purge_race seed={seed} budget_ms={}", budget.as_millis());
+    println!(
+        "find_block_tolerates_tight_purge_race seed={seed} budget_ms={}",
+        budget.as_millis()
+    );
     // One-buffer slack: the floor stays ~CAP below durable and moves whenever
     // durable advances (i.e. constantly under the appender's load).
     const SMALL_SLACK: u64 = CAP;
@@ -623,8 +662,11 @@ fn find_block_tolerates_tight_purge_race() {
 
     // appender: continuous load so the journal keeps growing (purge has supply).
     let appender_thread = {
-        let (buffer, append_gate, stop) =
-            (Arc::clone(&buffer), Arc::clone(&append_gate), Arc::clone(&stop));
+        let (buffer, append_gate, stop) = (
+            Arc::clone(&buffer),
+            Arc::clone(&append_gate),
+            Arc::clone(&stop),
+        );
         thread::Builder::new()
             .name("tight-appender".into())
             .spawn(move || {
@@ -635,7 +677,11 @@ fn find_block_tolerates_tight_purge_race() {
                     let _g = append_gate.lock().unwrap();
                     for _ in 0..16 {
                         let payload_len = 68 + (xorshift(&mut rng) as usize % (3968 - 68));
-                        match appender.append(xorshift(&mut rng), xorshift(&mut rng), &scratch[..payload_len]) {
+                        match appender.append(
+                            xorshift(&mut rng),
+                            xorshift(&mut rng),
+                            &scratch[..payload_len],
+                        ) {
                             Ok(_) => {}
                             Err(AppendError::WouldOverrun) => break,
                             Err(AppendError::PayloadTooLarge) => unreachable!("bounded above"),
@@ -650,7 +696,8 @@ fn find_block_tolerates_tight_purge_race() {
 
     // archiver: record blocks (no purge here — the purger owns that).
     let archiver_thread = {
-        let (buffer, archive, stop) = (Arc::clone(&buffer), Arc::clone(&archive), Arc::clone(&stop));
+        let (buffer, archive, stop) =
+            (Arc::clone(&buffer), Arc::clone(&archive), Arc::clone(&stop));
         thread::Builder::new()
             .name("tight-archiver".into())
             .spawn(move || {
@@ -667,7 +714,8 @@ fn find_block_tolerates_tight_purge_race() {
     // purger: TIGHT loop — purge the floor to durable-SMALL_SLACK every
     // iteration. Holds the archive mutex only for the purge call itself.
     let purger_thread = {
-        let (buffer, archive, stop) = (Arc::clone(&buffer), Arc::clone(&archive), Arc::clone(&stop));
+        let (buffer, archive, stop) =
+            (Arc::clone(&buffer), Arc::clone(&archive), Arc::clone(&stop));
         thread::Builder::new()
             .name("tight-purger".into())
             .spawn(move || {
@@ -746,7 +794,11 @@ fn find_block_tolerates_tight_purge_race() {
 #[cfg_attr(miri, ignore)]
 fn stress_nak_vs_purge() {
     run_stress(
-        ArmConfig { truncation: false, reopen: false, nak_server: true },
+        ArmConfig {
+            truncation: false,
+            reopen: false,
+            nak_server: true,
+        },
         "D/nak-vs-purge",
     );
 }

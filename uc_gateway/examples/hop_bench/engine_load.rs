@@ -16,8 +16,8 @@
 //! so a 20 µs idle sleep (which `m12_gate` can afford) would BE the result.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -84,20 +84,23 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         let instance_dir = Arc::clone(&instance_dir);
         let app_id = Arc::clone(&app_id);
         let (secs, payload, inflight) = (a.secs, a.payload, a.inflight);
-        let wait = Wait { policy: a.wait, budget: Duration::from_micros(a.park_us) };
+        let wait = Wait {
+            policy: a.wait,
+            budget: Duration::from_micros(a.park_us),
+        };
         handles.push(
             thread::Builder::new()
                 .name(format!("hop-engine-{i}"))
-                .spawn(move || {
-                    drive_one(&instance_dir, &app_id, t0, secs, payload, inflight, wait)
-                })
+                .spawn(move || drive_one(&instance_dir, &app_id, t0, secs, payload, inflight, wait))
                 .expect("spawn engine driver thread"),
         );
     }
 
     let mut merged = StreamStats::new();
     for (i, h) in handles.into_iter().enumerate() {
-        let s = h.join().map_err(|_| anyhow::anyhow!("engine {i} thread panicked"))??;
+        let s = h
+            .join()
+            .map_err(|_| anyhow::anyhow!("engine {i} thread panicked"))??;
         println!(
             "   engine[{i}]: sends={} responses={} lost={} responses/s={:.1}",
             s.sends,
@@ -237,7 +240,9 @@ fn drive_one(
         thread::sleep(Duration::from_millis(5));
     }
     stop.store(true, Ordering::Relaxed);
-    let mut s = poller.join().map_err(|_| anyhow::anyhow!("poll thread panicked"))?;
+    let mut s = poller
+        .join()
+        .map_err(|_| anyhow::anyhow!("poll thread panicked"))?;
 
     s.sends = sent;
     s.send_window_end_ns = send_window_end_ns;

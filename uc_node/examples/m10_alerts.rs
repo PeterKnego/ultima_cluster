@@ -42,8 +42,8 @@ use uc_net::sender::SenderStats;
 use uc_node::obs::ObsSources;
 use uc_node::obs::http::ObsServer;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 const APP: &str = "m10-alerts";
 const RING_BYTES: usize = 1 << 20;
@@ -68,7 +68,10 @@ const ALL_SCENARIOS: &[&str] = &[
 // ------------------------------------------------------------------ CLI
 
 #[derive(Parser)]
-#[command(name = "m10_alerts", about = "UC v2 M10: fire every shipped alert rule once")]
+#[command(
+    name = "m10_alerts",
+    about = "UC v2 M10: fire every shipped alert rule once"
+)]
 struct Cli {
     /// Run one named scenario (see ALL_SCENARIOS).
     #[arg(long)]
@@ -110,12 +113,14 @@ fn main() {
     // with a nonzero exit — there's only one scenario to isolate FROM.
     let mut failed_count = 0usize;
     for name in names {
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_scenario(&name, &scratch_root)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_scenario(&name, &scratch_root)
+        }));
         match result {
             Ok((sf, disc)) => {
                 let path = out_dir.join(format!("{name}.series"));
-                sf.write(&path).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+                sf.write(&path)
+                    .unwrap_or_else(|e| panic!("write {path:?}: {e}"));
                 println!(
                     "scenario={} rules={} state={} method: {}",
                     disc.scenario,
@@ -163,7 +168,9 @@ fn default_out_dir() -> PathBuf {
 /// future regression in the isolation path.
 fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
     if std::env::var("UC2_M10_FORCE_FAIL").as_deref() == Ok(name) {
-        panic!("UC2_M10_FORCE_FAIL={name} — deliberate forced failure for scenario-isolation testing");
+        panic!(
+            "UC2_M10_FORCE_FAIL={name} — deliberate forced failure for scenario-isolation testing"
+        );
     }
     match name {
         "agent_dead" => scenario_agent_dead(),
@@ -202,7 +209,9 @@ struct SeriesFile {
 
 impl SeriesFile {
     fn new() -> Self {
-        SeriesFile { data: BTreeMap::new() }
+        SeriesFile {
+            data: BTreeMap::new(),
+        }
     }
 
     /// Parse one scrape body and record every sample whose family is in
@@ -239,7 +248,11 @@ impl SeriesFile {
 }
 
 fn fmt_val(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{v}") }
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
 }
 
 /// Minimal Prometheus text-format line parser: `name{labels} value` or
@@ -280,9 +293,14 @@ fn parse_metrics(text: &str) -> Vec<(String, String, f64)> {
 /// import test code).
 fn scrape(addr: SocketAddr) -> String {
     let mut stream = TcpStream::connect(addr).expect("connect to obs server");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("set_read_timeout");
-    write!(stream, "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set_read_timeout");
+    write!(
+        stream,
+        "GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write request");
     stream.flush().expect("flush request");
 
     let mut raw = Vec::new();
@@ -295,9 +313,14 @@ fn scrape(addr: SocketAddr) -> String {
 
 fn get_status(addr: SocketAddr, path: &str) -> u16 {
     let mut stream = TcpStream::connect(addr).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("write");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write");
     stream.flush().expect("flush");
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read");
@@ -400,13 +423,16 @@ fn scenario_agent_dead() -> (SeriesFile, Disclosure) {
 fn scenario_no_leader(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "no-leader", 3, 256 * 1024);
     let leader_idx = await_stable_leader(&nodes, 20);
-    let follower_idx = (0..nodes.len()).find(|&i| i != leader_idx).expect("a follower exists");
+    let follower_idx = (0..nodes.len())
+        .find(|&i| i != leader_idx)
+        .expect("a follower exists");
 
     nodes[leader_idx].crash();
     nodes[follower_idx].crash();
 
-    let survivor_idx =
-        (0..nodes.len()).find(|&i| i != leader_idx && i != follower_idx).expect("a survivor exists");
+    let survivor_idx = (0..nodes.len())
+        .find(|&i| i != leader_idx && i != follower_idx)
+        .expect("a survivor exists");
     // Give the survivor time to notice it can't win an election (minority).
     thread::sleep(Duration::from_secs(2));
 
@@ -503,7 +529,10 @@ fn scenario_service_wedged(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         sf.record_round(
             "n0",
             &scrape(addr),
-            &["uc_service_heartbeat_age_seconds", "uc_node_heartbeat_age_seconds"],
+            &[
+                "uc_service_heartbeat_age_seconds",
+                "uc_node_heartbeat_age_seconds",
+            ],
         );
         thread::sleep(Duration::from_secs(1));
     }
@@ -540,8 +569,12 @@ fn scenario_leader_isolated(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 
     let addr = nodes[leader_idx].obs_addr();
     let instance = format!("n{leader_idx}");
-    let families =
-        ["uc2_commit_bytes", "uc2_append_bytes", "uc2_admission_saturation", "uc2_admission_bytes"];
+    let families = [
+        "uc2_commit_bytes",
+        "uc2_append_bytes",
+        "uc2_admission_saturation",
+        "uc2_admission_bytes",
+    ];
     let mut sf = SeriesFile::new();
     // Baseline BEFORE any load: append==commit==32 (just the NewTerm frame).
     // The busy-submit burst below floods the tiny window to its ceiling
@@ -600,10 +633,14 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         .tempdir_in(scratch_root)
         .expect("tempdir");
 
-    let socks: Vec<UdpSocket> =
-        (0..3).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..3)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut socks = socks;
     let sock2 = socks.pop().unwrap();
@@ -628,7 +665,12 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         let node = Node::start_with_socket(cfg, sock).expect("start");
         let obs =
             ObsServer::serve(node.observability(), "127.0.0.1:0".parse().unwrap()).expect("bind");
-        nodes.push(NodeH { addr: members[i].1, instance_dir, node: Some(node), obs: Some(obs) });
+        nodes.push(NodeH {
+            addr: members[i].1,
+            instance_dir,
+            node: Some(node),
+            obs: Some(obs),
+        });
     }
     await_stable_leader(&nodes, 20);
 
@@ -673,7 +715,9 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
     let admission_bytes = 16 * 1024;
     let (_dir, mut nodes) = spawn_cluster(scratch_root, "peer-lagging", 3, admission_bytes);
     let leader_idx = await_stable_leader(&nodes, 20);
-    let victim_idx = (0..nodes.len()).find(|&i| i != leader_idx).expect("a follower exists");
+    let victim_idx = (0..nodes.len())
+        .find(|&i| i != leader_idx)
+        .expect("a follower exists");
 
     // Isolate the victim from BOTH other nodes, not just from the leader.
     // Cutting ONLY leader<->victim was tried first and is UNSAFE for this
@@ -692,7 +736,11 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
         partition_pair(&nodes, victim_idx, o);
     }
 
-    let families = ["uc2_peer_replication_lag_bytes", "uc2_admission_bytes", "uc2_is_leader"];
+    let families = [
+        "uc2_peer_replication_lag_bytes",
+        "uc2_admission_bytes",
+        "uc2_is_leader",
+    ];
     let mut sf = SeriesFile::new();
     let instance = format!("n{leader_idx}");
     let addr = nodes[leader_idx].obs_addr();
@@ -739,7 +787,11 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
 fn scenario_purge_stalled() -> (SeriesFile, Disclosure) {
     let sources = synthetic_sources(0);
     let segment_bytes = 1u64 << 20; // 1 MiB
-    sources.cnc.snapshots().node_snapshot_floor.store_release(10 * segment_bytes);
+    sources
+        .cnc
+        .snapshots()
+        .node_snapshot_floor
+        .store_release(10 * segment_bytes);
     sources.cnc.archive_first_base().store_release(0);
     let mut sources = sources;
     sources.purge_enabled = true;
@@ -772,8 +824,8 @@ fn scenario_purge_stalled() -> (SeriesFile, Disclosure) {
             method: format!(
                 "synthetic ObsSources: purge_enabled=true, node_snapshot_floor={} \
                  ({segment_bytes}-byte segments), archive_first_base=0 — floor - first_base = \
-                 10 segments > the rule's 2-segment bar — rendered through the real exporter."
-                    , 10 * segment_bytes
+                 10 segments > the rule's 2-segment bar — rendered through the real exporter.",
+                10 * segment_bytes
             ),
         },
     )
@@ -828,14 +880,24 @@ fn scenario_crypto_counters() -> (SeriesFile, Disclosure) {
     let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
     let addr = srv.local_addr();
 
-    let families =
-        ["uc2_reports_unattested_total", "uc2_cleartext_peer_datagrams_total", "uc2_receiver_seal_failures_total", "uc2_is_leader"];
+    let families = [
+        "uc2_reports_unattested_total",
+        "uc2_cleartext_peer_datagrams_total",
+        "uc2_receiver_seal_failures_total",
+        "uc2_is_leader",
+    ];
     let mut sf = SeriesFile::new();
     sf.record_round("n0", &scrape(addr), &families); // all zero, is_leader=0
 
     sources.reports_unattested.fetch_add(2, Ordering::Relaxed);
-    sources.receiver.peer_appears_cleartext.fetch_add(2, Ordering::Relaxed);
-    sources.receiver.seal_failures.fetch_add(2, Ordering::Relaxed);
+    sources
+        .receiver
+        .peer_appears_cleartext
+        .fetch_add(2, Ordering::Relaxed);
+    sources
+        .receiver
+        .seal_failures
+        .fetch_add(2, Ordering::Relaxed);
     thread::sleep(Duration::from_millis(200));
     for _ in 0..3 {
         sf.record_round("n0", &scrape(addr), &families); // bumped, held
@@ -847,7 +909,11 @@ fn scenario_crypto_counters() -> (SeriesFile, Disclosure) {
         sf,
         Disclosure {
             scenario: "crypto_counters",
-            rules: &["Uc2UnattestedReports", "Uc2CleartextPeer", "Uc2FollowerSealFailures"],
+            rules: &[
+                "Uc2UnattestedReports",
+                "Uc2CleartextPeer",
+                "Uc2FollowerSealFailures",
+            ],
             state: "synthetic",
             method: "synthetic ObsSources: reports_unattested / peer_appears_cleartext / \
                      seal_failures bumped directly (their real triggers — a 0.4.0 peer, a \
@@ -928,7 +994,11 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 
     let mut sf = SeriesFile::new();
     for _ in 0..6 {
-        sf.record_round("n0", &scrape(addr), &["uc_service_attached", "uc_services_declared"]);
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc_service_attached", "uc_services_declared"],
+        );
         thread::sleep(Duration::from_millis(500));
     }
     svc0.stop();
@@ -1013,9 +1083,8 @@ fn commit_at_append_head(body: &str) -> bool {
 /// the cluster's point of view — but only `Uc2ServicePinnedAtLagBound` is
 /// adjudicated from this capture.
 fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
-    let services =
-        uc_node::ServicesConfig::from_ids(&[0, 1], Some(uc_node::FsmLag::Bounded(8192)))
-            .expect("declared set");
+    let services = uc_node::ServicesConfig::from_ids(&[0, 1], Some(uc_node::FsmLag::Bounded(8192)))
+        .expect("declared set");
     let (_dir, mut nodes) =
         spawn_cluster_with_services(scratch_root, "fsm-pinned", 1, 256 * 1024, services);
     await_stable_leader(&nodes, 20);
@@ -1029,7 +1098,11 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
         .expect("FSM 1 attaches");
 
     let addr = nodes[0].obs_addr();
-    let families = ["uc_service_lag_bytes", "uc2_fsm_lag_bytes", "uc_service_attached"];
+    let families = [
+        "uc_service_lag_bytes",
+        "uc2_fsm_lag_bytes",
+        "uc_service_attached",
+    ];
     let mut sf = SeriesFile::new();
     for _ in 0..12 {
         // Each round: top the log up until the FSM door refuses — that
@@ -1074,7 +1147,10 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             if still_pinned && commit_at_append_head(&body) {
                 break body;
             }
-            assert!(Instant::now() < deadline, "node never held still at the lag bound");
+            assert!(
+                Instant::now() < deadline,
+                "node never held still at the lag bound"
+            );
             thread::sleep(Duration::from_millis(10));
         };
         sf.record_round("n0", &body, &families);
@@ -1227,10 +1303,14 @@ fn spawn_cluster_with_services(
         .tempdir_in(scratch_root)
         .expect("tempdir");
 
-    let socks: Vec<UdpSocket> =
-        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
-    let members: Vec<(NodeId, SocketAddr)> =
-        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+    let socks: Vec<UdpSocket> = (0..n)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
 
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
@@ -1247,9 +1327,14 @@ fn spawn_cluster_with_services(
             services,
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        let obs =
-            ObsServer::serve(node.observability(), "127.0.0.1:0".parse().unwrap()).expect("bind obs");
-        nodes.push(NodeH { addr, instance_dir, node: Some(node), obs: Some(obs) });
+        let obs = ObsServer::serve(node.observability(), "127.0.0.1:0".parse().unwrap())
+            .expect("bind obs");
+        nodes.push(NodeH {
+            addr,
+            instance_dir,
+            node: Some(node),
+            obs: Some(obs),
+        });
     }
     (dir, nodes)
 }
@@ -1277,7 +1362,10 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
         let serving: Vec<usize> = (0..nodes.len())
             .filter(|&i| nodes[i].node.is_some() && nodes[i].n().can_serve())
             .collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -1318,5 +1406,3 @@ fn await_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
         assert!(Instant::now() < deadline, "leader never stabilized");
     }
 }
-
-

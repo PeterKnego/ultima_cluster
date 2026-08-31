@@ -74,8 +74,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use uc_client::Client;
-use uc_log::cnc::CncPage;
 use uc_lincheck::register::{Cmd, CmdResp};
+use uc_log::cnc::CncPage;
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 
 mod common;
@@ -106,7 +106,11 @@ fn free_addr() -> SocketAddr {
 }
 
 fn members_arg(members: &[(u32, SocketAddr)]) -> String {
-    members.iter().map(|(id, a)| format!("{id}@{a}")).collect::<Vec<_>>().join(",")
+    members
+        .iter()
+        .map(|(id, a)| format!("{id}@{a}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn spawn_node_multi(instance_dir: &Path, id: u32, bind: SocketAddr, members: &str) -> Reap {
@@ -139,9 +143,14 @@ fn open_cnc(dir: &Path) -> Option<Arc<CncPage>> {
 fn find_leader_once(dirs: &[PathBuf]) -> Option<usize> {
     let want = NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE;
     let serving: Vec<usize> = (0..dirs.len())
-        .filter(|&i| open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want))
+        .filter(|&i| {
+            open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want)
+        })
         .collect();
-    assert!(serving.len() <= 1, "split-brain: dirs {serving:?} all serve simultaneously");
+    assert!(
+        serving.len() <= 1,
+        "split-brain: dirs {serving:?} all serve simultaneously"
+    );
     serving.first().copied()
 }
 
@@ -221,8 +230,8 @@ fn write_node_toml(
          [admin]\n\
          auth = \"none\"\n",
         instance_dir.display(),
-        1u64 << 20,  // 1 MiB — power of two (preflight requires it), small.
-        32 * 1024,   // 32 KiB — well inside the brief's 16-64 KiB guidance.
+        1u64 << 20, // 1 MiB — power of two (preflight requires it), small.
+        32 * 1024,  // 32 KiB — well inside the brief's 16-64 KiB guidance.
     );
     let path = cfg_dir.join(format!("n{id}.toml"));
     std::fs::write(&path, body).expect("write node.toml");
@@ -238,7 +247,13 @@ fn spawn_daemon(config_path: &Path) -> Child {
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("spawn {} --config {}: {e}", uc_node_daemon_bin().display(), config_path.display()))
+        .unwrap_or_else(|e| {
+            panic!(
+                "spawn {} --config {}: {e}",
+                uc_node_daemon_bin().display(),
+                config_path.display()
+            )
+        })
 }
 
 /// Drain `child`'s piped stderr on a background thread — required so
@@ -248,7 +263,10 @@ fn spawn_daemon(config_path: &Path) -> Child {
 /// assertions. The thread exits on its own once the pipe closes (child
 /// exit).
 fn capture_stderr(child: &mut Child, tag: &'static str) -> Arc<Mutex<String>> {
-    let stderr = child.stderr.take().expect("child spawned with Stdio::piped() stderr");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child spawned with Stdio::piped() stderr");
     let buf = Arc::new(Mutex::new(String::new()));
     let buf2 = Arc::clone(&buf);
     std::thread::spawn(move || {
@@ -367,7 +385,10 @@ fn drive_load_until(
             continue;
         }
         let client = cur.as_ref().unwrap();
-        match client.submit::<Cmd, CmdResp>(&Cmd::Cas { old: *acked, new: *acked + 1 }) {
+        match client.submit::<Cmd, CmdResp>(&Cmd::Cas {
+            old: *acked,
+            new: *acked + 1,
+        }) {
             Ok(CmdResp::CasResult(true)) => *acked += 1,
             Ok(CmdResp::CasResult(false)) => panic!(
                 "CAS(old={}, new={}) unexpectedly failed under a single serial writer",
@@ -377,7 +398,9 @@ fn drive_load_until(
             Ok(other) => panic!("unexpected response to Cas: {other:?}"),
             Err(e) if same_client_retry(&e) => std::thread::sleep(Duration::from_millis(20)),
             Err(e) => {
-                eprintln!("[load] dropping client after {e} -- reconnecting to a (possibly new) leader");
+                eprintln!(
+                    "[load] dropping client after {e} -- reconnecting to a (possibly new) leader"
+                );
                 cur = None;
             }
         }
@@ -398,7 +421,10 @@ fn warm_up(dirs: &[PathBuf], secs: u64) {
             c.shutdown();
             return;
         }
-        assert!(Instant::now() < deadline, "no leader elected among {dirs:?} within {secs}s");
+        assert!(
+            Instant::now() < deadline,
+            "no leader elected among {dirs:?} within {secs}s"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -468,7 +494,13 @@ fn boot_cluster(tmp: &Path, dir0: PathBuf) -> Cluster {
 /// `bound_secs`, then assert exit code 1 and the fail-stop markers.
 fn run_until_failstop_and_assert(cluster: &mut Cluster, acked: &mut u64, bound_secs: u64) {
     let deadline = Instant::now() + Duration::from_secs(bound_secs);
-    let exited = drive_load_until(&cluster.dirs, Some(&mut cluster.node0_child), acked, None, deadline);
+    let exited = drive_load_until(
+        &cluster.dirs,
+        Some(&mut cluster.node0_child),
+        acked,
+        None,
+        deadline,
+    );
     assert!(
         exited,
         "node 0's daemon never exited within {bound_secs}s -- the fault was never induced, or the \
@@ -545,11 +577,22 @@ fn assert_errno_evidence(stderr_text: &str, expect_os_error: &str, expect_kind: 
 /// possibly before the crash" -- the two survivors are the only source `ok`
 /// can possibly count from, by construction (`survivor_dirs` excludes
 /// node 0 entirely).
-fn assert_survivors_keep_committing(cluster: &Cluster, acked: &mut u64, min_acks: u64, bound_secs: u64) {
+fn assert_survivors_keep_committing(
+    cluster: &Cluster,
+    acked: &mut u64,
+    min_acks: u64,
+    bound_secs: u64,
+) {
     let survivor_dirs = vec![cluster.dirs[1].clone(), cluster.dirs[2].clone()];
     let before = *acked;
     let deadline = Instant::now() + Duration::from_secs(bound_secs);
-    let ok = drive_load_until(&survivor_dirs, None, acked, Some(before + min_acks), deadline);
+    let ok = drive_load_until(
+        &survivor_dirs,
+        None,
+        acked,
+        Some(before + min_acks),
+        deadline,
+    );
     assert!(
         ok && *acked >= before + min_acks,
         "the two survivors did not keep committing without node 0 within {bound_secs}s \
@@ -568,7 +611,11 @@ fn assert_survivors_keep_committing(cluster: &Cluster, acked: &mut u64, min_acks
 fn restart_node0_and_assert_converges(cluster: &mut Cluster) {
     let mut node0_child = spawn_daemon(&cluster.node0_cfg_path);
     let _stderr = capture_stderr(&mut node0_child, "node0-restarted");
-    wait_for_fresh_instance(&cluster.dirs[0], cluster.node0_old_instance_id, Duration::from_secs(15));
+    wait_for_fresh_instance(
+        &cluster.dirs[0],
+        cluster.node0_old_instance_id,
+        Duration::from_secs(15),
+    );
     cluster.node0_child = node0_child; // now guarded by the struct's own teardown at scope-end.
 
     // The ORIGINAL service fail-stops itself on the instance_id change (its
@@ -583,7 +630,9 @@ fn restart_node0_and_assert_converges(cluster: &mut Cluster) {
     // (the service bin exits non-zero once an agent dies, like the
     // `counter-service` template) also makes the fail-stop contract an
     // assertion here instead of a side effect this harness merely relied on.
-    let mut original_svc = cluster.svc_procs[0].take().expect("node 0's service was spawned at boot");
+    let mut original_svc = cluster.svc_procs[0]
+        .take()
+        .expect("node 0's service was spawned at boot");
     let status = poll_exit(&mut original_svc.0, Duration::from_secs(15)).expect(
         "node 0's original service never fail-stopped after the node restarted with a fresh instance_id",
     );
@@ -606,8 +655,9 @@ fn restart_node0_and_assert_converges(cluster: &mut Cluster) {
         .counters()
         .commit
         .load_acquire();
-    let target_value: Option<u64> =
-        leader_client.query_linearizable(&()).expect("survivor leader linearizable read");
+    let target_value: Option<u64> = leader_client
+        .query_linearizable(&())
+        .expect("survivor leader linearizable read");
     leader_client.shutdown();
 
     let converge_deadline = Instant::now() + Duration::from_secs(30);
@@ -629,7 +679,9 @@ fn restart_node0_and_assert_converges(cluster: &mut Cluster) {
     // must also catch up and be able to answer.
     let restored_client = connect_with_retry(&cluster.dirs[0], Duration::from_secs(10));
     loop {
-        let v: Option<u64> = restored_client.query_snapshot(&()).expect("node0 snapshot read");
+        let v: Option<u64> = restored_client
+            .query_snapshot(&())
+            .expect("node0 snapshot read");
         if v.unwrap_or(0) >= target_value.unwrap_or(0) {
             break;
         }
@@ -714,8 +766,11 @@ fn write_denied_drives_the_same_failstop_chain() {
 
     // "Space returned" for this trigger = permission returned.
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(cluster.dirs[0].join("journal"), std::fs::Permissions::from_mode(0o755))
-        .expect("chmod 0755 back");
+    std::fs::set_permissions(
+        cluster.dirs[0].join("journal"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod 0755 back");
 
     restart_node0_and_assert_converges(&mut cluster);
 }
@@ -762,7 +817,11 @@ const TRIGGER_NAME: &str = "uc2-enospc-trigger";
 /// unit to 1024-byte blocks regardless of the caller's `BLOCKSIZE`/`DF_BLOCK_SIZE`
 /// environment, so the multiply below is exact rather than best-effort.
 fn df_bytes(dir: &Path, col: usize) -> u64 {
-    let out = Command::new("df").arg("-Pk").arg(dir).output().expect("run `df -Pk`");
+    let out = Command::new("df")
+        .arg("-Pk")
+        .arg(dir)
+        .output()
+        .expect("run `df -Pk`");
     assert!(
         out.status.success(),
         "df -Pk {} failed: {}",

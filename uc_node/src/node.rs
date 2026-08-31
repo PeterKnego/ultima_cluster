@@ -13,21 +13,22 @@ use std::time::{Instant, SystemTime};
 
 use uc_consensus::config::{Addr, ClusterConfig, ConfigOp};
 use uc_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
+use uc_crypto::admin::{AdminMessage, AdminPolicy};
+use uc_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
 use uc_log::agent::{AgentRunner, IdleStrategy};
 use uc_log::archive::{Archive, ArchiveConfig};
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{AdminAuth, AdminReq, AdminResp, CncMeta, CncPage, unpack_service_status};
 use uc_log::counters::LogCounters;
-use uc_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
+use uc_log::state::{
+    ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord,
+};
 use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
 };
-use uc_net::sender::{CtrlMsg, SnapArtifact, SnapshotSet, Sender, SenderConfig, SenderCrypto};
-use uc_crypto::admin::{AdminMessage, AdminPolicy};
-use uc_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
-use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
+use uc_net::sender::{CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet};
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscProducer, SpscRing,
 };
@@ -36,6 +37,7 @@ use uc_protocol::v2::cnc::{
     NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
+use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, align_frame_len};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY,
@@ -521,7 +523,13 @@ impl Node {
     /// binds every node's socket first, then hands each in — so peers know all
     /// addresses before any agent runs).
     pub fn start_with_socket(cfg: NodeConfig, sock: UdpSocket) -> io::Result<Node> {
-        Self::start_with(cfg, StartOpts { socket: Some(sock), ..Default::default() })
+        Self::start_with(
+            cfg,
+            StartOpts {
+                socket: Some(sock),
+                ..Default::default()
+            },
+        )
     }
 
     /// The one real constructor: [`start`](Self::start) and
@@ -604,9 +612,7 @@ impl Node {
             durability: journal_durability_from_env().map_err(to_io)?,
             ..ArchiveConfig::new(instance.journal_dir())
         };
-        if let Some(iv) = eventual_fsync_interval_from_env(archive_cfg.durability)
-            .map_err(to_io)?
-        {
+        if let Some(iv) = eventual_fsync_interval_from_env(archive_cfg.durability).map_err(to_io)? {
             archive_cfg.eventual_fsync_interval = iv;
         }
         // Invariant: a block records as ONE journal record and must fit within a
@@ -638,7 +644,9 @@ impl Node {
         let recovered_map = state.term_map();
         let rederived = rederive_term_map(&archive, &recovered_map).map_err(to_io)?;
         if rederived != to_pairs(&recovered_map) {
-            state.store_term_map(&to_entries(&rederived)).map_err(to_io)?;
+            state
+                .store_term_map(&to_entries(&rederived))
+                .map_err(to_io)?;
         }
 
         // 3. Re-create the cnc v2 page EVERY boot with a fresh random
@@ -682,7 +690,9 @@ impl Node {
         // sees the real floor immediately (not 0), and the persister's
         // increase-only shadow starts from it.
         let state_snapshot_floor = state.snapshot_floor();
-        cnc.snapshots().node_snapshot_floor.store_release(state_snapshot_floor);
+        cnc.snapshots()
+            .node_snapshot_floor
+            .store_release(state_snapshot_floor);
 
         // 6. Rings created fresh each boot (stale files unlinked first — any
         // prior attachment is invalidated by the new instance_id anyway).
@@ -736,8 +746,10 @@ impl Node {
         // or boot re-derivation alike). Seeded here from the just-recovered
         // record so a snapshot shipped before the first live adoption still
         // carries real bytes rather than an empty placeholder.
-        let config_bytes =
-            Arc::new(Mutex::new(config_wire_bytes(&config, config_rec.prev_position)));
+        let config_bytes = Arc::new(Mutex::new(config_wire_bytes(
+            &config,
+            config_rec.prev_position,
+        )));
 
         // Election SM over the recovered credentials + the recovered config.
         // M6 Task 7 / M7: a node whose own id is a learner in the ADOPTED
@@ -826,13 +838,15 @@ impl Node {
         // before any `Consensus` exists, so it cannot be a method call yet).
         let (id_to_addr, addr_to_id, peers, learner_ids, peer_band) =
             derive_peer_maps(&config, cfg.id);
-        let learner_addrs: Vec<SocketAddr> =
-            learner_ids.iter().map(|id| id_to_addr[id]).collect();
+        let learner_addrs: Vec<SocketAddr> = learner_ids.iter().map(|id| id_to_addr[id]).collect();
         // Leader fan-out = voters-minus-self ++ learners-minus-self (streamed
         // identically); the learner subset is excluded from flow control.
         let voting_followers: Vec<SocketAddr> = peers.iter().map(|id| id_to_addr[id]).collect();
-        let followers: Vec<SocketAddr> =
-            voting_followers.iter().chain(learner_addrs.iter()).copied().collect();
+        let followers: Vec<SocketAddr> = voting_followers
+            .iter()
+            .chain(learner_addrs.iter())
+            .copied()
+            .collect();
 
         // Channels.
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(NET_EVENT_CAPACITY);
@@ -893,7 +907,11 @@ impl Node {
         let (sender_followers, sender_learners, sender_cluster) = if is_learner {
             (Vec::new(), Vec::new(), 1)
         } else {
-            (followers, learner_addrs.clone(), sender_cluster_size(&config, cfg.id))
+            (
+                followers,
+                learner_addrs.clone(),
+                sender_cluster_size(&config, cfg.id),
+            )
         };
         let mut sender = Sender::with_crypto(
             Arc::clone(&buffer),
@@ -910,7 +928,9 @@ impl Node {
             // and need a `NodeId` for the destination. See `SenderCrypto`.
             crypto_send.map(|half| SenderCrypto {
                 half,
-                peer_ids: crypto_peer_ids.clone().expect("peer ids exist iff crypto does"),
+                peer_ids: crypto_peer_ids
+                    .clone()
+                    .expect("peer ids exist iff crypto does"),
             }),
         );
         sender.set_replay_source(journal);
@@ -965,8 +985,11 @@ impl Node {
         // derived above (`derive_peer_maps`). The consensus agent owns
         // `id_and_role` + `reported_durable`; the sender fills
         // `advertised_limit` from its flow-control view (bounded, once per cycle).
-        let sender_peer_slots: Vec<(SocketAddr, usize)> =
-            peer_band.iter().enumerate().map(|(i, (id, _))| (id_to_addr[id], i)).collect();
+        let sender_peer_slots: Vec<(SocketAddr, usize)> = peer_band
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id_to_addr[id], i))
+            .collect();
         sender.set_peer_slots(Arc::clone(&cnc), sender_peer_slots);
 
         // Receiver (unified follower-receiver + leader-control demux).
@@ -984,9 +1007,13 @@ impl Node {
         // `CryptoIntake::transport`.
         let receiver_crypto = crypto_recv.map(|half| CryptoIntake {
             half,
-            peer_ids: crypto_peer_ids.clone().expect("peer ids exist iff crypto does"),
+            peer_ids: crypto_peer_ids
+                .clone()
+                .expect("peer ids exist iff crypto does"),
             handshake: hs_tx,
-            transport: crypto.clone().expect("the receive half exists iff crypto does"),
+            transport: crypto
+                .clone()
+                .expect("the receive half exists iff crypto does"),
         });
         let mut receiver = FollowerReceiver::with_crypto(
             Arc::clone(&buffer),
@@ -1003,7 +1030,10 @@ impl Node {
         receiver.set_snapshot_intake(
             snap_root.clone(),
             cfg.services.ring_mask(),
-            Some((Arc::clone(&incoming_snapshot), Arc::clone(&incoming_snapshot_config))),
+            Some((
+                Arc::clone(&incoming_snapshot),
+                Arc::clone(&incoming_snapshot_config),
+            )),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
         // Validated frontier, published by the consensus agent and read by the
@@ -1034,8 +1064,7 @@ impl Node {
         // Diagnostic only: the consensus thread publishes its commit
         // provenance here each duty cycle so the archive thread's cut trace
         // can name where the commit it is cutting below came from.
-        let trace_prov: Arc<Mutex<(&'static str, u32, u64)>> =
-            Arc::new(Mutex::new(("none", 0, 0)));
+        let trace_prov: Arc<Mutex<(&'static str, u32, u64)>> = Arc::new(Mutex::new(("none", 0, 0)));
         // Term-observation frontier: the archive agent publishes it after
         // handing observations to the consensus agent (see `refresh_durable`).
         // Seeded at the recovered position: at boot the map was recovered (and
@@ -1236,12 +1265,14 @@ impl Node {
         let sender_stats = sender.stats();
         let sender_agent =
             AgentRunner::spawn("uc2-sender", IdleStrategy::Yield, move || sender.do_work())?;
-        let receiver_agent =
-            AgentRunner::spawn("uc2-receiver", IdleStrategy::Yield, move || receiver.do_work())?;
+        let receiver_agent = AgentRunner::spawn("uc2-receiver", IdleStrategy::Yield, move || {
+            receiver.do_work()
+        })?;
 
         // M14a (spec §5.2): the FSM term the door + report ceiling share —
         // computed once at boot from the static declared set + lag policy.
-        let fsm_lag_eff = crate::services::fsm_lag_eff(&cfg.services, cfg.buffer_bytes as u64, cfg.max_payload);
+        let fsm_lag_eff =
+            crate::services::fsm_lag_eff(&cfg.services, cfg.buffer_bytes as u64, cfg.max_payload);
 
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
@@ -1354,7 +1385,9 @@ impl Node {
             crypto_last_log_ns: 0,
         };
         let consensus_agent =
-            AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
+            AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || {
+                consensus.do_work()
+            })?;
 
         Ok(Node {
             node_id: cfg.id,
@@ -1495,8 +1528,12 @@ impl Node {
     /// record as it happens (`uc_net` carries no logging dependency).
     pub fn snapshot_session_refusals(&self) -> (u64, u64) {
         (
-            self.route_drops.snap_refused_legacy_peer.load(Ordering::Relaxed),
-            self.route_drops.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+            self.route_drops
+                .snap_refused_legacy_peer
+                .load(Ordering::Relaxed),
+            self.route_drops
+                .snap_refused_declared_mismatch
+                .load(Ordering::Relaxed),
         )
     }
 
@@ -1615,10 +1652,15 @@ impl Node {
             crypto_enabled: self.crypto.is_some(),
             purge_enabled: self.purge_enabled,
             journal_segment_bytes: self.journal_segment_bytes,
-            agents: [("consensus", 0usize), ("sender", 1), ("receiver", 2), ("archive", 3)]
-                .into_iter()
-                .map(|(name, idx)| (name, self.agents[idx].finished_flag()))
-                .collect(),
+            agents: [
+                ("consensus", 0usize),
+                ("sender", 1),
+                ("receiver", 2),
+                ("archive", 3),
+            ]
+            .into_iter()
+            .map(|(name, idx)| (name, self.agents[idx].finished_flag()))
+            .collect(),
         }
     }
 
@@ -1628,7 +1670,11 @@ impl Node {
     /// agent. Use [`net_event_drops_by_kind`](Self::net_event_drops_by_kind) to
     /// attribute the drops to a specific traffic class.
     pub fn net_event_drops(&self) -> u64 {
-        self.route_drops.net_drops.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+        self.route_drops
+            .net_drops
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Per-kind consensus-event drop counts, indexed by
@@ -1719,13 +1765,27 @@ struct AuditedReq {
 
 impl From<&AdminReq> for AuditedReq {
     fn from(r: &AdminReq) -> AuditedReq {
-        AuditedReq { op: r.op, id: r.id, ip: r.ip, port: r.port, seq: r.seq, nonce: r.nonce }
+        AuditedReq {
+            op: r.op,
+            id: r.id,
+            ip: r.ip,
+            port: r.port,
+            seq: r.seq,
+            nonce: r.nonce,
+        }
     }
 }
 
 impl From<&PendingAdminFwd> for AuditedReq {
     fn from(p: &PendingAdminFwd) -> AuditedReq {
-        AuditedReq { op: p.op, id: p.id, ip: p.ip, port: p.port, seq: p.seq, nonce: p.nonce }
+        AuditedReq {
+            op: p.op,
+            id: p.id,
+            ip: p.ip,
+            port: p.port,
+            seq: p.seq,
+            nonce: p.nonce,
+        }
     }
 }
 
@@ -2318,7 +2378,8 @@ impl Consensus {
         // here: the SM's own `serving` field is never cleared by step-down (it
         // has no reason to be), so an unconditional store would re-publish
         // `true` for `Node::can_serve()` the very cycle it just halted.
-        self.can_serve_flag.store(!self.halt_removed && self.sm.can_serve(), Ordering::Release);
+        self.can_serve_flag
+            .store(!self.halt_removed && self.sm.can_serve(), Ordering::Release);
 
         // 6. Publish the node's status onto the shared cnc page for cross-process
         // attachers (service, clients). `term` + `flags` reflect the SM every
@@ -2509,7 +2570,12 @@ impl Consensus {
             let acts = self
                 .crypto
                 .as_ref()
-                .map(|c| peers.iter().flat_map(|&p| c.initiate(p, now)).collect::<Vec<_>>())
+                .map(|c| {
+                    peers
+                        .iter()
+                        .flat_map(|&p| c.initiate(p, now))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             self.crypto_exec(acts);
         }
@@ -2528,7 +2594,11 @@ impl Consensus {
         // (c) Handshake upkeep: retransmit unanswered `HS_INIT`s with
         //     backoff, restart links asked for but not up, expire unproven
         //     pending sessions, announce promotions.
-        let acts = self.crypto.as_ref().map(|c| c.tick(now)).unwrap_or_default();
+        let acts = self
+            .crypto
+            .as_ref()
+            .map(|c| c.tick(now))
+            .unwrap_or_default();
         self.crypto_exec(acts);
 
         // (d) Rotation — LEADER ONLY. `GroupPlane::mint` is the leader's
@@ -2540,8 +2610,7 @@ impl Consensus {
             match due {
                 Some(reason) => {
                     let peers = self.gossip_targets();
-                    let minted =
-                        self.crypto.as_ref().map(|c| c.mint_group_key(&peers, now));
+                    let minted = self.crypto.as_ref().map(|c| c.mint_group_key(&peers, now));
                     if let Some((epoch, acts)) = minted {
                         self.crypto_epoch.store(epoch as u32, Ordering::Release);
                         self.crypto_last_redeliver_ns = Some(now);
@@ -2588,7 +2657,11 @@ impl Consensus {
                 // under a solo genesis config (mint correct, delivered to
                 // nobody), then adopts the real multi-voter config.
                 let missing = c.group_key_missing_peers(&self.gossip_targets());
-                if missing.is_empty() { Vec::new() } else { c.redeliver_group_key_to(&missing) }
+                if missing.is_empty() {
+                    Vec::new()
+                } else {
+                    c.redeliver_group_key_to(&missing)
+                }
             })
             .unwrap_or_default();
         self.crypto_exec(acts);
@@ -2623,7 +2696,11 @@ impl Consensus {
             budget -= 1;
             match act {
                 HandshakeAction::Send { to, kind, body } => self.crypto_send(to, kind, body),
-                HandshakeAction::Established { peer, boot_salt: _, confirmed: _ } => {
+                HandshakeAction::Established {
+                    peer,
+                    boot_salt: _,
+                    confirmed: _,
+                } => {
                     // NOTHING is cached from this action, deliberately.
                     //
                     // The plan told this task to "record the salt so
@@ -2655,7 +2732,8 @@ impl Consensus {
                     }
                 }
                 HandshakeAction::Failed { peer, reason } => {
-                    self.crypto_handshake_failures.fetch_add(1, Ordering::Relaxed);
+                    self.crypto_handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     // Eager allowlist reload on a refused handshake: the
                     // likeliest cause is an M7 joiner whose key the operator
                     // has just dropped in but this node has not re-read yet
@@ -2713,7 +2791,8 @@ impl Consensus {
             match sealed {
                 Some(Ok(())) => {}
                 other => {
-                    self.crypto_hs_key_seal_failures.fetch_add(1, Ordering::Relaxed);
+                    self.crypto_hs_key_seal_failures
+                        .fetch_add(1, Ordering::Relaxed);
                     let now = self.crypto_now_ns();
                     self.crypto_log(
                         now,
@@ -2782,7 +2861,8 @@ impl Consensus {
         // acquire-loaded once per FSM per cycle rather than twice, and both
         // readers adjudicate the SAME sample.
         let mut live = [crate::services::ServiceLiveness::default(); CNC_MAX_SERVICES];
-        let Some(m) = crate::services::service_mins_and_liveness(&self.cnc, &self.services, &mut live)
+        let Some(m) =
+            crate::services::service_mins_and_liveness(&self.cnc, &self.services, &mut live)
         else {
             self.min_applied = u64::MAX; // nothing declared: no FSM pacing
             return;
@@ -2889,8 +2969,12 @@ impl Consensus {
     /// steady-state path, no allocation on the untaken branch.
     fn report_snapshot_refusals(&mut self) {
         let now = (
-            self.snap_stats.snap_refused_legacy_peer.load(Ordering::Relaxed),
-            self.snap_stats.snap_refused_declared_mismatch.load(Ordering::Relaxed),
+            self.snap_stats
+                .snap_refused_legacy_peer
+                .load(Ordering::Relaxed),
+            self.snap_stats
+                .snap_refused_declared_mismatch
+                .load(Ordering::Relaxed),
         );
         if now.0 != self.last_snap_refusals.0 {
             crate::obs_event!(
@@ -2991,7 +3075,12 @@ impl Consensus {
         // lock and produces datagrams, neither of which belongs on an
         // adoption path that also runs during boot recovery.
         if let Some(ids) = self.crypto_peer_ids.as_ref() {
-            ids.store(self.addr_to_id.iter().map(|(a, i)| (*a, *i)).collect::<Vec<_>>());
+            ids.store(
+                self.addr_to_id
+                    .iter()
+                    .map(|(a, i)| (*a, *i))
+                    .collect::<Vec<_>>(),
+            );
             self.crypto_peers_dirty = true;
         }
     }
@@ -3062,7 +3151,10 @@ impl Consensus {
             return false;
         }
         self.adopted_incoming = pos;
-        self.cnc.snapshots().incoming_snapshot_pos.store_release(pos);
+        self.cnc
+            .snapshots()
+            .incoming_snapshot_pos
+            .store_release(pos);
         // Only adopt when we don't already cover `pos` — a mid-life follower that
         // already holds the state ignores it (the archive agent no-ops it too, but
         // skipping the command keeps the channel quiet).
@@ -3079,7 +3171,9 @@ impl Consensus {
             if !self.last_leader_map.is_empty() {
                 self.sm.adopt_snapshot_lineage(&self.last_leader_map);
                 let map = to_entries(self.sm.term_map());
-                self.state.store_term_map(&map).expect("term-map persist fail-stop");
+                self.state
+                    .store_term_map(&map)
+                    .expect("term-map persist fail-stop");
             }
             // M7 Task 6: the snapshot session carried the leader's config alongside
             // the lineage (`SnapBeginBody.config`) — adopt it by fiat for the
@@ -3109,7 +3203,9 @@ impl Consensus {
                     prev_position: pos,
                     prev: cluster_to_stored(&cfg),
                 };
-                self.state.store_config_record(&rec).expect("config persist fail-stop");
+                self.state
+                    .store_config_record(&rec)
+                    .expect("config persist fail-stop");
                 self.cnc.store_config_version(cfg.version);
                 // Post-M7 follow-up: a fiat install has no in-flight change
                 // by construction (cur == prev at the floor) — clear the
@@ -3194,8 +3290,7 @@ impl Consensus {
     fn maybe_persist_snapshot_floor(&mut self) -> bool {
         let service_pos = self.cnc.snapshots().service_snapshot_pos.load_acquire();
         let durable = self.cnc.counters().durable.load_acquire();
-        let have_new_floor =
-            service_pos > self.snapshot_persisted_floor && service_pos <= durable;
+        let have_new_floor = service_pos > self.snapshot_persisted_floor && service_pos <= durable;
         let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
         // Cheap exit every cycle when there is neither a newer floor to persist
         // nor a purge policy that might have outstanding work.
@@ -3215,7 +3310,10 @@ impl Consensus {
             self.state
                 .store_snapshot_floor(service_pos)
                 .expect("snapshot floor persist fail-stop (journal I/O)");
-            self.cnc.snapshots().node_snapshot_floor.store_release(service_pos);
+            self.cnc
+                .snapshots()
+                .node_snapshot_floor
+                .store_release(service_pos);
             self.snapshot_persisted_floor = service_pos;
             did = true;
         }
@@ -3311,7 +3409,9 @@ impl Consensus {
     /// Append one payload; `false` = ring full (caller holds it). A too-large
     /// payload is dropped (a client contract violation, not backpressure).
     fn try_append(&mut self, payload: &[u8]) -> bool {
-        let Some(app) = self.appender.as_mut() else { return false };
+        let Some(app) = self.appender.as_mut() else {
+            return false;
+        };
         match app.append(0, self.next_corr, payload) {
             Ok(_) => {
                 self.next_corr += 1;
@@ -3351,7 +3451,10 @@ impl Consensus {
             .as_mut()
             .expect("append_config_frame is leader-only")
             .append_config(term, &bytes)?;
-        self.feed(Event::ConfigObserved { position, config: new_cfg.clone() });
+        self.feed(Event::ConfigObserved {
+            position,
+            config: new_cfg.clone(),
+        });
         Ok(position)
     }
 
@@ -3534,7 +3637,9 @@ impl Consensus {
     /// client contract violation, not backpressure) — same policy as
     /// `try_append`.
     fn try_append_client(&mut self, client_id: u32, local_seq: u32, payload: &[u8]) -> bool {
-        let Some(app) = self.appender.as_mut() else { return false };
+        let Some(app) = self.appender.as_mut() else {
+            return false;
+        };
         match app.append(client_id as u64, local_seq as u64, payload) {
             Ok(_) => true,
             Err(AppendError::WouldOverrun) => false,
@@ -3552,7 +3657,9 @@ impl Consensus {
     fn send_not_leader(&mut self, client_id: u32, local_seq: u32) {
         let leader_hint = self.cnc.status().leader_hint.load_acquire();
         let extra = extra_client(client_id, local_seq);
-        let _ = self.egress_node.write(MSG_V2_NOT_LEADER, 0, extra, &leader_hint.to_le_bytes());
+        let _ = self
+            .egress_node
+            .write(MSG_V2_NOT_LEADER, 0, extra, &leader_hint.to_le_bytes());
     }
 
     /// Answer a linearizable read with `MSG_V2_RETRY` on the node egress. Emitted
@@ -3571,7 +3678,9 @@ impl Consensus {
     /// may re-issue with a different id.
     fn send_bad_service(&mut self, client_id: u32, local_seq: u32, service_id: u8) {
         let extra = extra_client(client_id, local_seq);
-        let _ = self.egress_node.write(MSG_V2_BAD_SERVICE, 0, extra, &[service_id]);
+        let _ = self
+            .egress_node
+            .write(MSG_V2_BAD_SERVICE, 0, extra, &[service_id]);
     }
 
     /// M14b: whether `svc_query.<id>.ring` exists on this node — the declared
@@ -3595,7 +3704,10 @@ impl Consensus {
         expected_epoch: u64,
         query: &[u8],
     ) -> bool {
-        let Some(producer) = self.svc_query.get_mut(service_id as usize).and_then(|p| p.as_mut())
+        let Some(producer) = self
+            .svc_query
+            .get_mut(service_id as usize)
+            .and_then(|p| p.as_mut())
         else {
             // unreachable for queries admitted by drain_query_ring (has_service_ring); kept as the safe default
             return false;
@@ -3604,7 +3716,9 @@ impl Consensus {
         payload.extend_from_slice(&expected_epoch.to_le_bytes());
         payload.extend_from_slice(query);
         let extra = extra_client(client_id, local_seq);
-        producer.try_write(MSG_V2_SVC_QUERY, 0, extra, &payload).is_ok()
+        producer
+            .try_write(MSG_V2_SVC_QUERY, 0, extra, &payload)
+            .is_ok()
     }
 
     /// Send a nonce'd READ_PROBE to every follower over the consensus socket,
@@ -3623,13 +3737,23 @@ impl Consensus {
     /// definition, so a future change to the fan-out cannot leave the crypto
     /// plane silently keyed for the old one.
     fn gossip_targets(&self) -> Vec<NodeId> {
-        self.peers.iter().chain(self.learner_ids.iter()).copied().collect()
+        self.peers
+            .iter()
+            .chain(self.learner_ids.iter())
+            .copied()
+            .collect()
     }
 
     fn send_read_probe(&mut self, nonce: u64) {
         let term = self.sm.current_term();
         let mut body = [0u8; READ_PROBE_BODY_LEN];
-        write_read_probe_body(&mut body, &ReadProbeBody { nonce, from: self.id });
+        write_read_probe_body(
+            &mut body,
+            &ReadProbeBody {
+                nonce,
+                from: self.id,
+            },
+        );
         // M8 (T17): `Scope::Group` — one seal, N sends. Every voter gets the
         // byte-identical probe, so a per-destination seal here would be N
         // AEAD calls and N nonces for one logical round.
@@ -3647,7 +3771,11 @@ impl Consensus {
         if self.current_round.is_some() {
             return;
         }
-        if !self.pending_reads.iter().any(|r| r.phase == ReadPhase::AwaitQuorum) {
+        if !self
+            .pending_reads
+            .iter()
+            .any(|r| r.phase == ReadPhase::AwaitQuorum)
+        {
             return;
         }
         let quorum = self.peers.len().div_ceil(2) + 1;
@@ -3689,13 +3817,27 @@ impl Consensus {
     /// is the teeth of the no-stale-read theorem: a deposed leader can never
     /// collect the read quorum, so it can never certify a linearizable read.
     fn on_read_probe(&mut self, nonce: u64, from: NodeId, term: u32) {
-        let Some(&addr) = self.id_to_addr.get(&from) else { return };
+        let Some(&addr) = self.id_to_addr.get(&from) else {
+            return;
+        };
         if term != self.sm.current_term() {
             return;
         }
         let mut body = [0u8; READ_PROBE_BODY_LEN];
-        write_read_probe_body(&mut body, &ReadProbeBody { nonce, from: self.id });
-        self.send(addr, DGRAM_KIND_READ_PROBE_ACK, 0, self.sm.current_term(), &body);
+        write_read_probe_body(
+            &mut body,
+            &ReadProbeBody {
+                nonce,
+                from: self.id,
+            },
+        );
+        self.send(
+            addr,
+            DGRAM_KIND_READ_PROBE_ACK,
+            0,
+            self.sm.current_term(),
+            &body,
+        );
     }
 
     /// Leader side of a READ_PROBE_ACK: membership-check the acker, match the
@@ -3709,7 +3851,9 @@ impl Consensus {
         if !self.peers.contains(&from) {
             return;
         }
-        let Some(round) = self.current_round.as_mut() else { return };
+        let Some(round) = self.current_round.as_mut() else {
+            return;
+        };
         if round.nonce != nonce {
             return; // an abandoned/completed round's straggler ack
         }
@@ -3895,7 +4039,9 @@ impl Consensus {
                 // moves the epoch and fails the recheck — so a read is never
                 // forwarded across a service incarnation boundary.
                 let ready = {
-                    let slot = self.cnc.service_slot(self.pending_reads[i].service_id as usize);
+                    let slot = self
+                        .cnc
+                        .service_slot(self.pending_reads[i].service_id as usize);
                     let e = slot.epoch.load_acquire();
                     let applied = slot.applied.load_acquire();
                     // Sentinel-collision guard (M5 final review IMPORTANT #1): a
@@ -3962,8 +4108,15 @@ impl Consensus {
     /// addresses (not a configured member) are dropped.
     fn feed_net(&mut self, ev: NetEvent) {
         let event = match ev {
-            NetEvent::Report { from, term, durable, durable_term } => {
-                let Some(id) = self.addr_to_id.get(&from).copied() else { return };
+            NetEvent::Report {
+                from,
+                term,
+                durable,
+                durable_term,
+            } => {
+                let Some(id) = self.addr_to_id.get(&from).copied() else {
+                    return;
+                };
                 // Implausibility guard (M4 I-1 carry, ported from the deleted
                 // legacy sender arm): a follower cannot hold bytes the leader
                 // never appended. The wire has no CRC, so a bit-flip that
@@ -3996,14 +4149,21 @@ impl Consensus {
                     .entry(id)
                     .and_modify(|d| *d = (*d).max(durable))
                     .or_insert(durable);
-                Event::Report { from: id, term, durable, durable_term }
+                Event::Report {
+                    from: id,
+                    term,
+                    durable,
+                    durable_term,
+                }
             }
             NetEvent::CommitGossip { from, term, commit } => {
                 self.learn_leader_hint(from, term);
                 Event::CommitGossip { term, commit }
             }
             NetEvent::RequestVote { from, body } => {
-                let Some(id) = self.addr_to_id.get(&from).copied() else { return };
+                let Some(id) = self.addr_to_id.get(&from).copied() else {
+                    return;
+                };
                 // Re-absorb the durable counter IMMEDIATELY before the grant
                 // decision. `log_ok` compares the candidate against
                 // `ElectionSm::durable`, and Raft's vote rule is sound only if
@@ -4023,16 +4183,29 @@ impl Consensus {
                 }
             }
             NetEvent::Vote { from, body } => {
-                let Some(id) = self.addr_to_id.get(&from).copied() else { return };
-                Event::Vote { from: id, term: body.term, granted: body.granted }
+                let Some(id) = self.addr_to_id.get(&from).copied() else {
+                    return;
+                };
+                Event::Vote {
+                    from: id,
+                    term: body.term,
+                    granted: body.granted,
+                }
             }
-            NetEvent::TermMap { from, term, entries } => {
+            NetEvent::TermMap {
+                from,
+                term,
+                entries,
+            } => {
                 self.learn_leader_hint(from, term);
                 let pairs: Vec<(u32, u64)> = entries.iter().map(|e| (e.term, e.base)).collect();
                 // M6 Task 8: remember the leader's authoritative lineage for the
                 // snapshot-install seed (below-floor join). Capture the newest.
                 self.last_leader_map = pairs.clone();
-                Event::TermMapReceived { term, entries: pairs }
+                Event::TermMapReceived {
+                    term,
+                    entries: pairs,
+                }
             }
             NetEvent::ReadProbe { nonce, from, term } => {
                 // Follower side: reply an ack iff still our term (handled inline,
@@ -4117,7 +4290,8 @@ impl Consensus {
             }
         };
         if matches!(self.sm.role(), Role::Leader) {
-            let (status, reason, version) = self.propose_and_append(req.op, req.id, req.ip, req.port);
+            let (status, reason, version) =
+                self.propose_and_append(req.op, req.id, req.ip, req.port);
             // Record before responding. On the accepted path the change is
             // already appended by now (see `crate::audit`'s module doc: the
             // record precedes the commit, and "accepted" means proposed and
@@ -4171,7 +4345,13 @@ impl Consensus {
             ip: req.ip,
             port: req.port,
         });
-        let body = ConfigProposalBody { nonce: req.nonce, op: req.op, id: req.id, ip: req.ip, port: req.port };
+        let body = ConfigProposalBody {
+            nonce: req.nonce,
+            op: req.op,
+            id: req.id,
+            ip: req.ip,
+            port: req.port,
+        };
         let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
         write_config_proposal_body(&mut buf, &body);
         let term = self.sm.current_term();
@@ -4348,11 +4528,17 @@ impl Consensus {
             seq: 0,
             nonce: body.nonce,
         };
-        let (status, reason, version) = self.propose_and_append(body.op, body.id, body.ip, body.port);
+        let (status, reason, version) =
+            self.propose_and_append(body.op, body.id, body.ip, body.port);
         // The dedup cache keeps the REAL answer, never an audit-failure one:
         // a later retry of the same nonce must be able to re-learn what
         // actually happened once the disk recovers.
-        let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version };
+        let reply = ConfigReplyBody {
+            nonce: body.nonce,
+            status,
+            reason,
+            version,
+        };
         self.last_config_reply = Some((body.nonce, reply));
         let (status, reason) = self.audit_admin(
             Some(&actor),
@@ -4362,7 +4548,12 @@ impl Consensus {
             reason,
             version,
         );
-        let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version };
+        let reply = ConfigReplyBody {
+            nonce: body.nonce,
+            status,
+            reason,
+            version,
+        };
         self.send_config_reply(from, &reply);
     }
 
@@ -4378,7 +4569,9 @@ impl Consensus {
     /// reply for any other nonce (stale, or a race with a since-superseded
     /// forward) is dropped rather than misattributed to the wrong response line.
     fn on_config_reply(&mut self, body: ConfigReplyBody) {
-        let Some(pending) = &self.pending_admin_fwd else { return };
+        let Some(pending) = &self.pending_admin_fwd else {
+            return;
+        };
         if pending.nonce != body.nonce {
             return;
         }
@@ -4485,7 +4678,12 @@ impl Consensus {
     /// Write the admin response line (fields-then-seq/release; the T1 accessor
     /// enforces the discipline) for `seq`.
     fn write_admin_reply(&mut self, seq: u64, status: u32, reason: u32, version: u64) {
-        self.cnc.write_admin_resp(&AdminResp { seq, status, reason, version });
+        self.cnc.write_admin_resp(&AdminResp {
+            seq,
+            status,
+            reason,
+            version,
+        });
     }
 
     /// T7 review finding 1: invalidate the admin nonce-dedup cache and any
@@ -4595,28 +4793,51 @@ impl Consensus {
                 // Persist-before-answer: the store is durable on return, THEN the
                 // datagram (self-votes skip the send — `to == self`).
                 self.state
-                    .store_vote(VoteRecord { term: vote.term, voted_for: vote.voted_for })
+                    .store_vote(VoteRecord {
+                        term: vote.term,
+                        voted_for: vote.voted_for,
+                    })
                     .expect("vote persist fail-stop");
                 if to != self.id
                     && let Some(&addr) = self.id_to_addr.get(&to)
                 {
                     let mut body = [0u8; VOTE_BODY_LEN];
-                    write_vote_body(&mut body, &VoteBody { term: vote.term, granted: true });
+                    write_vote_body(
+                        &mut body,
+                        &VoteBody {
+                            term: vote.term,
+                            granted: true,
+                        },
+                    );
                     self.send(addr, DGRAM_KIND_VOTE, 0, vote.term, &body);
                 }
             }
             Action::SendVoteRejection { to, term } => {
                 if let Some(&addr) = self.id_to_addr.get(&to) {
                     let mut body = [0u8; VOTE_BODY_LEN];
-                    write_vote_body(&mut body, &VoteBody { term, granted: false });
+                    write_vote_body(
+                        &mut body,
+                        &VoteBody {
+                            term,
+                            granted: false,
+                        },
+                    );
                     self.send(addr, DGRAM_KIND_VOTE, 0, term, &body);
                 }
             }
-            Action::StartElection { new_term, last_term, last_durable } => {
+            Action::StartElection {
+                new_term,
+                last_term,
+                last_durable,
+            } => {
                 let mut body = [0u8; REQUEST_VOTE_BODY_LEN];
                 write_request_vote_body(
                     &mut body,
-                    &RequestVoteBody { new_term, last_term, last_durable },
+                    &RequestVoteBody {
+                        new_term,
+                        last_term,
+                        last_durable,
+                    },
                 );
                 for id in self.peers.clone() {
                     let addr = self.id_to_addr[&id];
@@ -4641,7 +4862,9 @@ impl Consensus {
                 // one duty cycle later. See `ArchiveCmd::Collapse`'s doc for the
                 // corruption this ordering prevents.
                 let map = to_entries(self.sm.term_map());
-                self.state.store_term_map(&map).expect("term-map persist fail-stop");
+                self.state
+                    .store_term_map(&map)
+                    .expect("term-map persist fail-stop");
                 self.term_handle.store(term, Ordering::Release);
                 // Explicit single-writer handoff (review hardening): the gate
                 // is closed across the collapse so a UDP-reordered straggler that
@@ -4810,7 +5033,9 @@ impl Consensus {
                             prev: rec.prev,
                         }
                     };
-                    self.state.store_config_record(&reverted).expect("config persist fail-stop");
+                    self.state
+                        .store_config_record(&reverted)
+                        .expect("config persist fail-stop");
                 }
                 // Pause intake and record the emit→ack bracket (the SM allocated
                 // `epoch`; we transport it). The SM has already latched the data
@@ -4848,7 +5073,12 @@ impl Consensus {
                 self.wipes.fetch_add(1, Ordering::Relaxed);
                 crate::obs_event!(Warn, "log_wiped", node = self.id as u64);
             }
-            Action::ConfigAdopted { position, config, prev_position, prev } => {
+            Action::ConfigAdopted {
+                position,
+                config,
+                prev_position,
+                prev,
+            } => {
                 // M7: the SM adopted a higher-version `ClusterConfig` — via the
                 // leader's own append (`append_config_frame`), a follower's
                 // archive-scan observation, boot recovery, OR the SM's own
@@ -4863,7 +5093,9 @@ impl Consensus {
                     prev_position,
                     prev: cluster_to_stored(&prev),
                 };
-                self.state.store_config_record(&rec).expect("config persist fail-stop");
+                self.state
+                    .store_config_record(&rec)
+                    .expect("config persist fail-stop");
                 // Rebuild the net layer + this node's own routing/observability
                 // (and, since the final-review fix, the snapshot-session
                 // config-carry cache too — so every SNAP_BEGIN a session opens
@@ -5054,7 +5286,8 @@ impl Consensus {
     /// `AppendPosition` reports are clamped to it). Called wherever the
     /// frontier can move: a durable advance, and the end of every event drain.
     fn publish_validated_frontier(&self) {
-        self.reports_unattested.store(self.sm.reports_unattested(), Ordering::Relaxed);
+        self.reports_unattested
+            .store(self.sm.reports_unattested(), Ordering::Relaxed);
         // M14a (Q, spec §5.3): the report ceiling — validated, and no more
         // than fsm_lag past the slowest FSM. `term_at(ceiling)` is the term
         // of the byte BELOW the ceiling (the same attestation as before:
@@ -5066,7 +5299,8 @@ impl Consensus {
         );
         // Term first, then position (unchanged): a torn read fails the
         // leader's attestation check, the safe direction.
-        self.validated_term.store(self.sm.term_at(ceiling), Ordering::Release);
+        self.validated_term
+            .store(self.sm.term_at(ceiling), Ordering::Release);
         self.validated_frontier.store(ceiling, Ordering::Release);
     }
 
@@ -5095,9 +5329,14 @@ impl Consensus {
         // interleaving is reachable). Everything below is keyed off the acked
         // `to`, never `open.base` — the appender is built from the counters the
         // archive primed, so it opens the term at the real frontier.
-        debug_assert!(open.base >= to, "the archive never cuts ABOVE the requested base");
+        debug_assert!(
+            open.base >= to,
+            "the archive never cuts ABOVE the requested base"
+        );
         let mut appender = Appender::new(Arc::clone(&self.buffer), open.term);
-        appender.append_new_term().expect("NewTerm append fail-stop");
+        appender
+            .append_new_term()
+            .expect("NewTerm append fail-stop");
         // The serving gate compares COMMIT (an end/frontier position) against
         // this value, so it must be the frame's END — feeding the start would
         // flip can_serve before the NewTerm frame is quorum-committed (at base
@@ -5170,7 +5409,13 @@ impl Consensus {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
         write_datagram_header(
             &mut d,
-            &DatagramHeader { position, leadership_term_id: term, kind, flags: 0, key_epoch: 0 },
+            &DatagramHeader {
+                position,
+                leadership_term_id: term,
+                kind,
+                flags: 0,
+                key_epoch: 0,
+            },
         );
         d[DATAGRAM_HEADER_LEN..].copy_from_slice(body);
         d
@@ -5295,7 +5540,9 @@ fn open_or_create_buffer(
     cnc: Arc<CncPage>,
     max_payload: usize,
 ) -> io::Result<LogBuffer> {
-    let reuse = std::fs::metadata(path).map(|m| m.len() == capacity).unwrap_or(false);
+    let reuse = std::fs::metadata(path)
+        .map(|m| m.len() == capacity)
+        .unwrap_or(false);
     if reuse {
         LogBuffer::open_file(path, cnc, max_payload)
     } else {
@@ -5324,7 +5571,13 @@ fn open_or_create_buffer(
 fn create_rings(
     dir: &InstanceDir,
     services: &ServicesConfig,
-) -> io::Result<(Rings, MpscConsumer, BroadcastProducer, MpscConsumer, Vec<Option<SpscProducer>>)> {
+) -> io::Result<(
+    Rings,
+    MpscConsumer,
+    BroadcastProducer,
+    MpscConsumer,
+    Vec<Option<SpscProducer>>,
+)> {
     const MIB: u64 = 1 << 20;
     const MAX_MSG: u32 = 64 << 10;
     // Unlink every ring this or a PREVIOUS layout could have left (the
@@ -5364,7 +5617,13 @@ fn create_rings(
         );
         std::fs::create_dir_all(dir.snapshot_dir_for(id))?;
     }
-    Ok((Rings { egress_services }, ingress_consumer, egress_node_producer, query_consumer, svc_query))
+    Ok((
+        Rings { egress_services },
+        ingress_consumer,
+        egress_node_producer,
+        query_consumer,
+        svc_query,
+    ))
 }
 
 // --------------------------------------------------------- M7 config helpers
@@ -5399,7 +5658,10 @@ fn stored_member(id: NodeId, addr: SocketAddr) -> StoredMember {
 /// `uc2ctl`; a defensive catch-all for a malformed/future-version request).
 fn wire_to_config_op(op: u32, id: NodeId, ip: u32, port: u16) -> Option<ConfigOp> {
     match op {
-        1 => Some(ConfigOp::AddLearner { id, addr: (ip, port) }),
+        1 => Some(ConfigOp::AddLearner {
+            id,
+            addr: (ip, port),
+        }),
         2 => Some(ConfigOp::PromoteLearner { id }),
         3 => Some(ConfigOp::DemoteVoter { id }),
         4 => Some(ConfigOp::RemoveLearner { id }),
@@ -5440,12 +5702,20 @@ fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig {
         voters: c
             .voters
             .iter()
-            .map(|(id, (ip, port))| WireMember { id: *id, ip: *ip, port: *port })
+            .map(|(id, (ip, port))| WireMember {
+                id: *id,
+                ip: *ip,
+                port: *port,
+            })
             .collect(),
         learners: c
             .learners
             .iter()
-            .map(|(id, (ip, port))| WireMember { id: *id, ip: *ip, port: *port })
+            .map(|(id, (ip, port))| WireMember {
+                id: *id,
+                ip: *ip,
+                port: *port,
+            })
             .collect(),
         tombstones: c.tombstones.clone(),
     }
@@ -5483,12 +5753,20 @@ fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
         voters: c
             .voters
             .iter()
-            .map(|(id, (ip, port))| StoredMember { id: *id, ip: *ip, port: *port })
+            .map(|(id, (ip, port))| StoredMember {
+                id: *id,
+                ip: *ip,
+                port: *port,
+            })
             .collect(),
         learners: c
             .learners
             .iter()
-            .map(|(id, (ip, port))| StoredMember { id: *id, ip: *ip, port: *port })
+            .map(|(id, (ip, port))| StoredMember {
+                id: *id,
+                ip: *ip,
+                port: *port,
+            })
             .collect(),
         tombstones: c.tombstones.clone(),
     }
@@ -5542,9 +5820,17 @@ fn derive_peer_maps(
         id_to_addr.insert(*mid, sock);
         addr_to_id.insert(sock, *mid);
     }
-    let peers: Vec<NodeId> = config.voter_ids().into_iter().filter(|i| *i != id).collect();
-    let learner_ids: Vec<NodeId> =
-        config.learners.iter().map(|(lid, _)| *lid).filter(|i| *i != id).collect();
+    let peers: Vec<NodeId> = config
+        .voter_ids()
+        .into_iter()
+        .filter(|i| *i != id)
+        .collect();
+    let learner_ids: Vec<NodeId> = config
+        .learners
+        .iter()
+        .map(|(lid, _)| *lid)
+        .filter(|i| *i != id)
+        .collect();
     let peer_band: Vec<(NodeId, u8)> = peers
         .iter()
         .map(|i| (*i, CNC_PEER_ROLE_VOTER))
@@ -5559,14 +5845,25 @@ fn to_pairs(m: &TermMap) -> Vec<(u32, u64)> {
 }
 
 fn to_entries(pairs: &[(u32, u64)]) -> TermMap {
-    pairs.iter().map(|(term, base)| TermMapEntry { term: *term, base: *base }).collect()
+    pairs
+        .iter()
+        .map(|(term, base)| TermMapEntry {
+            term: *term,
+            base: *base,
+        })
+        .collect()
 }
 
 /// Encode a term-map suffix (≤ `MAX_TERM_MAP_WIRE_ENTRIES`) into a datagram body.
 fn encode_term_map(entries: &[(u32, u64)]) -> Vec<u8> {
     let n = entries.len().min(MAX_TERM_MAP_WIRE_ENTRIES);
-    let wire: Vec<TermMapEntryWire> =
-        entries[..n].iter().map(|(term, base)| TermMapEntryWire { term: *term, base: *base }).collect();
+    let wire: Vec<TermMapEntryWire> = entries[..n]
+        .iter()
+        .map(|(term, base)| TermMapEntryWire {
+            term: *term,
+            base: *base,
+        })
+        .collect();
     let mut body = vec![0u8; TERM_MAP_HEADER_LEN + n * TERM_MAP_ENTRY_LEN];
     let written = write_term_map_body(&mut body, &wire);
     body.truncate(written);
@@ -5649,16 +5946,29 @@ pub(crate) fn recover_config_record(
     let seed = || {
         let genesis = StoredConfig {
             version: 0,
-            voters: members.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
-            learners: learners.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            voters: members
+                .iter()
+                .map(|(id, a)| stored_member(*id, *a))
+                .collect(),
+            learners: learners
+                .iter()
+                .map(|(id, a)| stored_member(*id, *a))
+                .collect(),
             tombstones: Vec::new(),
         };
-        ConfigRecord { position: 0, config: genesis.clone(), prev_position: 0, prev: genesis }
+        ConfigRecord {
+            position: 0,
+            config: genesis.clone(),
+            prev_position: 0,
+            prev: genesis,
+        }
     };
     if state.config_record().is_none() {
         state.store_config_record(&seed()).map_err(to_io)?;
     }
-    let mut rec = state.config_record().expect("seeded immediately above if absent");
+    let mut rec = state
+        .config_record()
+        .expect("seeded immediately above if absent");
 
     if rec.position > durable {
         rec = if rec.prev_position > durable {
@@ -5723,7 +6033,6 @@ pub(crate) fn rederive_config(
     Ok(cur)
 }
 
-
 #[cfg(test)]
 mod journal_durability_env_tests {
     use super::journal_durability_from_env;
@@ -5751,13 +6060,22 @@ mod journal_durability_env_tests {
     #[test]
     fn unset_and_consistent_and_case_map_to_consistent() {
         with_env(None, || {
-            assert_eq!(journal_durability_from_env().unwrap(), Durability::Consistent);
+            assert_eq!(
+                journal_durability_from_env().unwrap(),
+                Durability::Consistent
+            );
         });
         with_env(Some("consistent"), || {
-            assert_eq!(journal_durability_from_env().unwrap(), Durability::Consistent);
+            assert_eq!(
+                journal_durability_from_env().unwrap(),
+                Durability::Consistent
+            );
         });
         with_env(Some("Consistent"), || {
-            assert_eq!(journal_durability_from_env().unwrap(), Durability::Consistent);
+            assert_eq!(
+                journal_durability_from_env().unwrap(),
+                Durability::Consistent
+            );
         });
     }
 
@@ -5936,7 +6254,9 @@ fn snapshot_set_for(
         if pos == 0 {
             return decline(SNAP_DECLINE_MISSING, "missing artifact");
         }
-        let path = root.join(id.to_string()).join(format!("snap-{pos}.ultsnap"));
+        let path = root
+            .join(id.to_string())
+            .join(format!("snap-{pos}.ultsnap"));
         // A declared id whose newest artifact is missing (a retention
         // race, a hand-edited dir) makes the SET incomplete — and the
         // receiver adopts the floor only on a complete set, so a partial
@@ -5951,7 +6271,12 @@ fn snapshot_set_for(
         if len == 0 {
             return decline(SNAP_DECLINE_MISSING, "missing artifact");
         }
-        artifacts.push(SnapArtifact { service_id: id, snapshot_pos: pos, path, len });
+        artifacts.push(SnapArtifact {
+            service_id: id,
+            snapshot_pos: pos,
+            path,
+            len,
+        });
     }
     // Controller amendment 1: the set must cover the mask EXACTLY. A set
     // short of a declared bit would livelock the joiner — it probes for
@@ -5959,8 +6284,9 @@ fn snapshot_set_for(
     // re-NAK re-opens the identical session — with no counter anywhere.
     // `ring_ids()` is ascending and inside `mask` by construction, so
     // this only ever trips on a future edit that breaks that pairing.
-    let covered =
-        artifacts.iter().fold(0u64, |m, a| m | 1u64.checked_shl(a.service_id as u32).unwrap_or(0));
+    let covered = artifacts.iter().fold(0u64, |m, a| {
+        m | 1u64.checked_shl(a.service_id as u32).unwrap_or(0)
+    });
     if artifacts.len() != mask.count_ones() as usize || covered != mask {
         return decline(SNAP_DECLINE_UNCOVERED, "set does not cover declared");
     }
@@ -6037,7 +6363,10 @@ mod tests {
         /// cycle that drains the collapse slot. This is what finishes a leader
         /// open now that the cut runs on the archive thread.
         fn complete_leader_open(&mut self) {
-            let cmd = self._trunc_rx.try_recv().expect("leader open commanded a collapse");
+            let cmd = self
+                ._trunc_rx
+                .try_recv()
+                .expect("leader open commanded a collapse");
             let ArchiveCmd::Collapse { epoch, to } = cmd else {
                 panic!("expected Collapse, got {cmd:?}");
             };
@@ -6048,7 +6377,11 @@ mod tests {
             // `first_base`, neither of which the consensus path reads.
             self.cons.cnc.counters().prime(to);
             self.cons.collapse_slot.post(epoch, to);
-            let (e, t) = self.cons.collapse_slot.take().expect("the ack was just posted");
+            let (e, t) = self
+                .cons
+                .collapse_slot
+                .take()
+                .expect("the ack was just posted");
             self.cons.on_collapsed(e, t);
         }
 
@@ -6122,7 +6455,10 @@ mod tests {
         // in this harness's tests — pure migration off the old `members`/
         // `can_vote` `ElectionConfig` fields).
         let config = ClusterConfig::genesis(
-            members.iter().map(|id| (*id, addr_to_pair(id_to_addr[id]))).collect(),
+            members
+                .iter()
+                .map(|id| (*id, addr_to_pair(id_to_addr[id])))
+                .collect(),
             Vec::new(),
         );
         // NOTE: the test harness deliberately does NOT wire mutation knobs onto
@@ -6172,16 +6508,23 @@ mod tests {
         // module's tests writes real ring traffic through them; that's
         // covered by uc_node/tests/smoke.rs).
         let (_ingress_producer, ingress_ring) =
-            MpscRing::create(&dir.path().join("ingress.ring"), 4096, 1024).unwrap().into_split();
+            MpscRing::create(&dir.path().join("ingress.ring"), 4096, 1024)
+                .unwrap()
+                .into_split();
         let egress_node =
             BroadcastRing::create(&dir.path().join("egress_node.broadcast"), 4096, 1024)
                 .unwrap()
                 .producer();
         let (_query_producer, query_ring) =
-            MpscRing::create(&dir.path().join("query.ring"), 4096, 1024).unwrap().into_split();
+            MpscRing::create(&dir.path().join("query.ring"), 4096, 1024)
+                .unwrap()
+                .into_split();
         let (svc_query_0, _svc_query_consumer) =
-            SpscRing::create(&dir.path().join("svc_query.0.ring"), 4096, 1024).unwrap().into_split();
-        let mut svc_query: Vec<Option<SpscProducer>> = (0..CNC_MAX_SERVICES).map(|_| None).collect();
+            SpscRing::create(&dir.path().join("svc_query.0.ring"), 4096, 1024)
+                .unwrap()
+                .into_split();
+        let mut svc_query: Vec<Option<SpscProducer>> =
+            (0..CNC_MAX_SERVICES).map(|_| None).collect();
         svc_query[0] = Some(svc_query_0);
 
         let cons = Consensus {
@@ -6213,7 +6556,11 @@ mod tests {
             next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: 256 * 1024,
-            fsm_lag_eff: crate::services::fsm_lag_eff(&ServicesConfig::none_for_tests(), 1 << 16, 4096),
+            fsm_lag_eff: crate::services::fsm_lag_eff(
+                &ServicesConfig::none_for_tests(),
+                1 << 16,
+                4096,
+            ),
             pending_ring_ingress: None,
             last_holes_published: (0, 0),
             sock,
@@ -6331,16 +6678,31 @@ mod tests {
         // Term-map #1: reconciles to a divergent tail → Action::Truncate. The node
         // persists the pruned map, records `pending_truncation`, closes the gate,
         // and commands the archive with `(epoch, to)`.
-        h.cons.feed(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
-        assert!(!h.gate_open(), "gate stays closed while the truncate is emitted");
-        let epoch = h.cons.pending_truncation.expect("a truncation is now in flight");
+        h.cons.feed(Event::TermMapReceived {
+            term: 3,
+            entries: vec![(1, 0), (3, 4096)],
+        });
+        assert!(
+            !h.gate_open(),
+            "gate stays closed while the truncate is emitted"
+        );
+        let epoch = h
+            .cons
+            .pending_truncation
+            .expect("a truncation is now in flight");
         // The truncate command reached the archive channel with its epoch.
-        assert_eq!(h._trunc_rx.try_recv().ok(), Some(ArchiveCmd::Truncate { epoch, to: 4096 }));
+        assert_eq!(
+            h._trunc_rx.try_recv().ok(),
+            Some(ArchiveCmd::Truncate { epoch, to: 4096 })
+        );
 
         // Term-map #2: the leader re-ships the SAME map while the archive
         // truncation is still in flight. The SM's truncating latch drops it with
         // zero actions. The gate MUST remain closed (C-1 guard).
-        h.cons.feed(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        h.cons.feed(Event::TermMapReceived {
+            term: 3,
+            entries: vec![(1, 0), (3, 4096)],
+        });
         assert!(
             !h.gate_open(),
             "a duplicate term map mid-truncation must NOT reopen the intake gate"
@@ -6349,7 +6711,10 @@ mod tests {
 
         // Only the archive's slot ack reopens the gate (reconciliation done).
         h.post_ack_and_drain(epoch, 4096);
-        assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
+        assert!(
+            h.gate_open(),
+            "the Truncated ack completes reconciliation and reopens"
+        );
         assert!(h.cons.pending_truncation.is_none());
     }
 
@@ -6363,8 +6728,15 @@ mod tests {
     #[test]
     fn become_follower_invalidates_stale_admin_caches() {
         let mut h = harness();
-        h.cons.last_config_reply =
-            Some((42, ConfigReplyBody { nonce: 42, status: 0, reason: 0, version: 5 }));
+        h.cons.last_config_reply = Some((
+            42,
+            ConfigReplyBody {
+                nonce: 42,
+                status: 0,
+                reason: 0,
+                version: 5,
+            },
+        ));
         h.cons.pending_admin_fwd = Some(PendingAdminFwd {
             seq: 99,
             nonce: 42,
@@ -6376,12 +6748,30 @@ mod tests {
         });
 
         // Adopt a higher term as a follower -> Action::BecomeFollower.
-        h.cons.feed(Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 3,
+            last_term: 1,
+            last_durable: 7000,
+        });
 
-        assert!(h.cons.last_config_reply.is_none(), "nonce-dedup cache must be cleared");
-        assert!(h.cons.pending_admin_fwd.is_none(), "in-flight forward must be cleared");
-        let resp = h.cons.cnc.read_admin_resp(99).expect("superseded forward gets an answer");
-        assert_eq!(resp.status, 2, "cleared forward is answered with retry, not silence");
+        assert!(
+            h.cons.last_config_reply.is_none(),
+            "nonce-dedup cache must be cleared"
+        );
+        assert!(
+            h.cons.pending_admin_fwd.is_none(),
+            "in-flight forward must be cleared"
+        );
+        let resp = h
+            .cons
+            .cnc
+            .read_admin_resp(99)
+            .expect("superseded forward gets an answer");
+        assert_eq!(
+            resp.status, 2,
+            "cleared forward is answered with retry, not silence"
+        );
     }
 
     /// M6 Task 8: a `NoCommonPrefix` reconcile drives a WIPE-AND-REJOIN end to end
@@ -6397,18 +6787,29 @@ mod tests {
         assert_eq!(h.cons.wipes.load(Ordering::Relaxed), 0);
 
         // Adopt a far-higher term (closes the gate, arms reconciliation).
-        h.cons.feed(Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 41,
+            last_term: 40,
+            last_durable: 9000,
+        });
         assert!(!h.gate_open());
 
         // A leader map whose earliest shipped entry begins at 1<<20 — its window
         // slid past our first byte (base 0). own=[(1,0),(2,4096)] shares no prefix
         // ⇒ NoCommonPrefix ⇒ wipe.
-        h.cons.feed(Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] });
+        h.cons.feed(Event::TermMapReceived {
+            term: 41,
+            entries: vec![(40, 1 << 20), (41, 2 << 20)],
+        });
 
         // The wipe was counted (distinct from a truncate) and the archive was
         // commanded to truncate to 0 (a full wipe), under an in-flight epoch.
         assert_eq!(h.cons.wipes.load(Ordering::Relaxed), 1, "wipe counted");
-        let epoch = h.cons.pending_truncation.expect("wipe truncation in flight");
+        let epoch = h
+            .cons
+            .pending_truncation
+            .expect("wipe truncation in flight");
         assert_eq!(
             h._trunc_rx.try_recv().ok(),
             Some(ArchiveCmd::Truncate { epoch, to: 0 }),
@@ -6420,9 +6821,16 @@ mod tests {
         // ready to refill from the live stream / snapshot session) and the
         // truncation is counted.
         h.post_ack_and_drain(epoch, 0);
-        assert!(h.gate_open(), "the Truncated ack reopens intake after the wipe");
+        assert!(
+            h.gate_open(),
+            "the Truncated ack reopens intake after the wipe"
+        );
         assert_eq!(h.cons.pending_truncation, None);
-        assert_eq!(h.cons.truncations.load(Ordering::Relaxed), 1, "a wipe is also a truncate");
+        assert_eq!(
+            h.cons.truncations.load(Ordering::Relaxed),
+            1,
+            "a wipe is also a truncate"
+        );
     }
 
     /// M5 residual carry: a matching-epoch ack for a truncation whose adopted term
@@ -6436,13 +6844,24 @@ mod tests {
         // adopt term 3, receive divergent map → Truncate (epoch e1) in flight
         h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
         // higher term 4 adopted mid-truncation
-        h.cons.feed(Event::RequestVote { from: 0, new_term: 4, last_term: 3, last_durable: 9000 });
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 4,
+            last_term: 3,
+            last_durable: 9000,
+        });
         assert!(!h.gate_open());
         // the e1 ack arrives (archive finished the OLD truncation)
         h.post_ack_and_drain(/*epoch*/ 1, /*to*/ 4096);
-        assert!(!h.gate_open(), "gate must stay closed: term 4 not yet reconciled");
+        assert!(
+            !h.gate_open(),
+            "gate must stay closed: term 4 not yet reconciled"
+        );
         // clean reconcile in term 4 reopens
-        h.cons.feed(Event::TermMapReceived { term: 4, entries: vec![(1, 0), (4, 4096)] });
+        h.cons.feed(Event::TermMapReceived {
+            term: 4,
+            entries: vec![(1, 0), (4, 4096)],
+        });
         assert!(h.gate_open());
     }
 
@@ -6467,10 +6886,17 @@ mod tests {
         // peer grant (2 of 3 with the self-vote) -> BecomeLeader, which appends
         // the 32 B NewTerm frame at base 6016 (append -> 6048).
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
         assert_eq!(h.cons.sm.current_term(), 3);
         h.complete_leader_open(); // issue #6: the open lands on the archive's ack
-        assert!(h.cons.leader_flag.load(Ordering::Acquire), "election did not complete");
+        assert!(
+            h.cons.leader_flag.load(Ordering::Acquire),
+            "election did not complete"
+        );
         let append = h.cons.cnc.counters().append.load_acquire();
         assert_eq!(append, 6048, "NewTerm frame must sit at [6016, 6048)");
         assert_eq!(h.cons.cnc.counters().commit.load_acquire(), 0);
@@ -6483,21 +6909,35 @@ mod tests {
         // durability. Guarded: dropped whole + counted, commit stays 0.
         {
             let dt = h.cons.sm.term_at(1 << 40);
-            h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: 1 << 40, durable_term: dt });
+            h.cons.feed_net(NetEvent::Report {
+                from: addr0,
+                term: 3,
+                durable: 1 << 40,
+                durable_term: dt,
+            });
         }
         assert_eq!(
             h.cons.cnc.counters().commit.load_acquire(),
             0,
             "implausible report manufactured a phantom commit on leader-only durability"
         );
-        assert_eq!(h.cons.reports_implausible.load(Ordering::Relaxed), 1, "drop must be counted");
+        assert_eq!(
+            h.cons.reports_implausible.load(Ordering::Relaxed),
+            1,
+            "drop must be counted"
+        );
 
         // The drop poisoned nothing: a legitimate report (durable == append)
         // from the same follower ranks normally -> quorum {6048, 6048, 0} ->
         // commit advances to 6048.
         {
             let dt = h.cons.sm.term_at(append);
-            h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append, durable_term: dt });
+            h.cons.feed_net(NetEvent::Report {
+                from: addr0,
+                term: 3,
+                durable: append,
+                durable_term: dt,
+            });
         }
         assert_eq!(
             h.cons.cnc.counters().commit.load_acquire(),
@@ -6512,14 +6952,23 @@ mod tests {
         // case arrives via term machinery, never inside a static term).
         {
             let dt = h.cons.sm.term_at(1 << 40);
-            h.cons.feed_net(NetEvent::Report { from: addr0, term: 7, durable: 1 << 40, durable_term: dt });
+            h.cons.feed_net(NetEvent::Report {
+                from: addr0,
+                term: 7,
+                durable: 1 << 40,
+                durable_term: dt,
+            });
         }
         assert_eq!(
             h.cons.sm.current_term(),
             7,
             "higher-term report must reach the SM and adopt the term"
         );
-        assert_eq!(h.cons.reports_implausible.load(Ordering::Relaxed), 1, "adoption not counted");
+        assert_eq!(
+            h.cons.reports_implausible.load(Ordering::Relaxed),
+            1,
+            "adoption not counted"
+        );
     }
 
     /// Task 7: the ingress admission door's pure decision function. Exercised
@@ -6557,7 +7006,11 @@ mod tests {
         assert_eq!(before, 6016, "boot frontier");
 
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
 
         // Phase 1: the SM leads, but NOTHING has touched the buffer yet — no
         // prime, no appender, no NewTerm frame, intake closed, not serving.
@@ -6567,15 +7020,27 @@ mod tests {
             before,
             "the consensus thread must not prime or append before the archive cut"
         );
-        assert!(h.cons.appender.is_none(), "no appender before the collapse ack");
+        assert!(
+            h.cons.appender.is_none(),
+            "no appender before the collapse ack"
+        );
         assert!(!h.cons.leader_flag.load(Ordering::Acquire));
         assert!(!h.gate_open(), "intake stays closed across the collapse");
 
         // The command the archive agent must receive.
         let cmd = h._trunc_rx.try_recv().expect("a collapse was commanded");
-        let ArchiveCmd::Collapse { epoch, to } = cmd else { panic!("expected Collapse: {cmd:?}") };
+        let ArchiveCmd::Collapse { epoch, to } = cmd else {
+            panic!("expected Collapse: {cmd:?}")
+        };
         assert_eq!(to, 6016, "collapse to `base` = the SM's durable");
-        assert_eq!(h.cons.pending_leader_open, Some(PendingLeaderOpen { epoch, term: 3, base: to }));
+        assert_eq!(
+            h.cons.pending_leader_open,
+            Some(PendingLeaderOpen {
+                epoch,
+                term: 3,
+                base: to
+            })
+        );
 
         // Phase 2: the archive cut+primed and acked. Now the open completes.
         h.cons.cnc.counters().prime(to);
@@ -6601,18 +7066,35 @@ mod tests {
     fn a_collapse_ack_after_stepping_down_does_not_resurrect_leadership() {
         let mut h = harness();
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
         let cmd = h._trunc_rx.try_recv().expect("a collapse was commanded");
-        let ArchiveCmd::Collapse { epoch, to } = cmd else { panic!("expected Collapse: {cmd:?}") };
+        let ArchiveCmd::Collapse { epoch, to } = cmd else {
+            panic!("expected Collapse: {cmd:?}")
+        };
 
         // A higher term arrives while the collapse is in flight.
-        h.cons.feed(Event::RequestVote { from: 0, new_term: 9, last_term: 3, last_durable: 9000 });
-        assert!(h.cons.pending_leader_open.is_none(), "the open was abandoned");
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 9,
+            last_term: 3,
+            last_durable: 9000,
+        });
+        assert!(
+            h.cons.pending_leader_open.is_none(),
+            "the open was abandoned"
+        );
 
         // The late ack lands. It must be inert.
         h.cons.cnc.counters().prime(to);
         h.cons.on_collapsed(epoch, to);
-        assert!(h.cons.appender.is_none(), "no appender for the abandoned term");
+        assert!(
+            h.cons.appender.is_none(),
+            "no appender for the abandoned term"
+        );
         assert!(!h.cons.leader_flag.load(Ordering::Acquire), "not a leader");
         assert_eq!(
             h.cons.cnc.counters().append.load_acquire(),
@@ -6658,7 +7140,11 @@ mod tests {
         // one. Pre-fix this was GRANTED (a tie under `log_ok_order`'s `>=`).
         h.cons.feed_net(NetEvent::RequestVote {
             from: addr0,
-            body: RequestVoteBody { new_term: 9, last_term: 2, last_durable: boot },
+            body: RequestVoteBody {
+                new_term: 9,
+                last_term: 2,
+                last_durable: boot,
+            },
         });
         assert_ne!(
             h.cons.state.vote().map(|v| (v.term, v.voted_for)),
@@ -6671,7 +7157,11 @@ mod tests {
         // caught up still gets the vote.
         h.cons.feed_net(NetEvent::RequestVote {
             from: addr0,
-            body: RequestVoteBody { new_term: 10, last_term: 2, last_durable: fsynced },
+            body: RequestVoteBody {
+                new_term: 10,
+                last_term: 2,
+                last_durable: fsynced,
+            },
         });
         assert_eq!(
             h.cons.state.vote().map(|v| (v.term, v.voted_for)),
@@ -6698,7 +7188,11 @@ mod tests {
     fn a_pending_leader_open_suppresses_durable_feeds_from_the_stale_frontier() {
         let mut h = harness();
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
         let open = h.cons.pending_leader_open.expect("leader open in flight");
         let sm_durable_at_open = h.cons.sm.durable();
         assert_eq!(open.base, sm_durable_at_open, "base IS the SM's durable");
@@ -6719,7 +7213,11 @@ mod tests {
         let after = h.cons.cnc.counters().append.load_acquire();
         h.cons.cnc.counters().durable.store_release(after);
         h.cons.do_work();
-        assert_eq!(h.cons.sm.durable(), after, "feeds resume once the open completes");
+        assert_eq!(
+            h.cons.sm.durable(),
+            after,
+            "feeds resume once the open completes"
+        );
     }
 
     /// Issue #6, load-bearing NEGATIVE result: a reconcile `Truncate` and a
@@ -6745,17 +7243,40 @@ mod tests {
     fn a_reconcile_truncating_node_cannot_also_open_a_leader_term() {
         let mut h = harness();
         // Adopt term 4 with a divergent map -> `Action::Truncate` in flight.
-        h.cons.feed(Event::RequestVote { from: 0, new_term: 4, last_term: 1, last_durable: 7000 });
-        h.cons.feed(Event::TermMapReceived { term: 4, entries: vec![(1, 0), (4, 4096)] });
-        let trunc = h._trunc_rx.try_recv().expect("a reconcile truncate was commanded");
-        assert!(matches!(trunc, ArchiveCmd::Truncate { .. }), "got {trunc:?}");
-        assert!(h.cons.pending_truncation.is_some(), "truncation bracket open");
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 4,
+            last_term: 1,
+            last_durable: 7000,
+        });
+        h.cons.feed(Event::TermMapReceived {
+            term: 4,
+            entries: vec![(1, 0), (4, 4096)],
+        });
+        let trunc = h
+            ._trunc_rx
+            .try_recv()
+            .expect("a reconcile truncate was commanded");
+        assert!(
+            matches!(trunc, ArchiveCmd::Truncate { .. }),
+            "got {trunc:?}"
+        );
+        assert!(
+            h.cons.pending_truncation.is_some(),
+            "truncation bracket open"
+        );
         assert!(!h.gate_open(), "intake closed for the truncation");
 
         // Adopting the map made us a FOLLOWER, so a grant cannot elect us; and a
         // `Tick` cannot make us a candidate while the latch holds.
-        h.cons.feed(Event::Tick { now_ns: 10_000_000_000 });
-        h.cons.feed(Event::Vote { from: 0, term: 4, granted: true });
+        h.cons.feed(Event::Tick {
+            now_ns: 10_000_000_000,
+        });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 4,
+            granted: true,
+        });
         assert!(
             h.cons.pending_leader_open.is_none(),
             "a truncating node opened a leader term — the Collapse clamp and \
@@ -6771,11 +7292,21 @@ mod tests {
     /// durable Report, which opens `can_serve`. Returns the append frontier 6048.
     fn drive_to_serving_leader(h: &mut Harness) -> u64 {
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
         // Issue #6: the open now completes on the archive's collapse ack.
-        assert!(!h.cons.leader_flag.load(Ordering::Acquire), "leading before the collapse landed");
+        assert!(
+            !h.cons.leader_flag.load(Ordering::Acquire),
+            "leading before the collapse landed"
+        );
         h.complete_leader_open();
-        assert!(h.cons.leader_flag.load(Ordering::Acquire), "election did not complete");
+        assert!(
+            h.cons.leader_flag.load(Ordering::Acquire),
+            "election did not complete"
+        );
         let append = h.cons.cnc.counters().append.load_acquire();
         assert_eq!(append, 6048);
         h.cons.feed(Event::DurableAdvanced { durable: append });
@@ -6785,9 +7316,17 @@ mod tests {
         let addr0 = h.cons.id_to_addr[&0];
         {
             let dt = h.cons.sm.term_at(append);
-            h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append, durable_term: dt });
+            h.cons.feed_net(NetEvent::Report {
+                from: addr0,
+                term: 3,
+                durable: append,
+                durable_term: dt,
+            });
         }
-        assert!(h.cons.sm.can_serve(), "commit did not open the serving gate");
+        assert!(
+            h.cons.sm.can_serve(),
+            "commit did not open the serving gate"
+        );
         append
     }
 
@@ -6822,8 +7361,9 @@ mod tests {
         h.cons.pending_reads.push(mk_read(6048, 1, far));
         let term = h.cons.sm.current_term();
         let now = h.cons.now_ns();
-        h.cons.current_round =
-            Some(crate::read_round::ProbeRound::new(1, 42, 3, h.cons.id, term, 6048, now));
+        h.cons.current_round = Some(crate::read_round::ProbeRound::new(
+            1, 42, 3, h.cons.id, term, 6048, now,
+        ));
         h.cons.next_round_seq = 2;
 
         // A non-member ack (id 99 is not in [0,1,2]) is dropped by the
@@ -6841,7 +7381,10 @@ mod tests {
         // certifies the waiting read, and is consumed.
         h.cons.on_read_probe_ack(42, 2);
         assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied);
-        assert!(h.cons.current_round.is_none(), "a completed round is consumed");
+        assert!(
+            h.cons.current_round.is_none(),
+            "a completed round is consumed"
+        );
 
         // Service not yet caught up (applied 0 < commit_at 6048): parked.
         assert!(!h.cons.advance_pending_reads());
@@ -6856,7 +7399,10 @@ mod tests {
         // A real incarnation attaches (epoch 1) → forwarded and dropped.
         h.cons.cnc.service_slot(0).epoch.store_release(1);
         assert!(h.cons.advance_pending_reads());
-        assert!(h.cons.pending_reads.is_empty(), "caught-up read must forward and drop");
+        assert!(
+            h.cons.pending_reads.is_empty(),
+            "caught-up read must forward and drop"
+        );
     }
 
     /// Rung A §3.2, the crux: a round certifies ONLY reads admitted before it
@@ -6870,18 +7416,26 @@ mod tests {
         let far = h.cons.now_ns() + 10_000_000_000;
 
         // Read A admitted, then the round is issued (harness quorum: 2).
-        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons
+            .pending_reads
+            .push(mk_read(6048, h.cons.next_round_seq, far));
         h.cons.maybe_issue_round();
         let round = h.cons.current_round.as_ref().expect("round issued");
         let (seq, nonce) = (round.seq, round.nonce);
 
         // Read B admitted MID-ROUND: records seq+1.
-        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons
+            .pending_reads
+            .push(mk_read(6048, h.cons.next_round_seq, far));
         assert_eq!(h.cons.pending_reads[1].round_seq, seq + 1);
 
         // One peer ack reaches the harness quorum of 2 → round completes.
         h.cons.on_read_probe_ack(nonce, 0);
-        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied, "A certified");
+        assert_eq!(
+            h.cons.pending_reads[0].phase,
+            ReadPhase::AwaitApplied,
+            "A certified"
+        );
         assert_eq!(
             h.cons.pending_reads[1].phase,
             ReadPhase::AwaitQuorum,
@@ -6904,7 +7458,9 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let far = h.cons.now_ns() + 10_000_000_000;
-        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons
+            .pending_reads
+            .push(mk_read(6048, h.cons.next_round_seq, far));
         h.cons.maybe_issue_round();
         let old_nonce = h.cons.current_round.as_ref().unwrap().nonce;
 
@@ -6912,11 +7468,17 @@ mod tests {
         // node cannot distinguish "same voters" cheaply and must not try).
         let members = [0u32, 1, 2];
         let config = ClusterConfig::genesis(
-            members.iter().map(|id| (*id, addr_to_pair(h.cons.id_to_addr[id]))).collect(),
+            members
+                .iter()
+                .map(|id| (*id, addr_to_pair(h.cons.id_to_addr[id])))
+                .collect(),
             Vec::new(),
         );
         h.cons.rebuild_peer_maps(&config);
-        assert!(h.cons.current_round.is_none(), "voter-set change voids the round");
+        assert!(
+            h.cons.current_round.is_none(),
+            "voter-set change voids the round"
+        );
         assert_eq!(h.cons.pending_reads.len(), 1, "reads survive the void");
         assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
 
@@ -6944,8 +7506,9 @@ mod tests {
         h.cons.pending_reads.push(mk_read(6048, 1, far));
         let stale_term = h.cons.sm.current_term() - 1;
         let now = h.cons.now_ns();
-        h.cons.current_round =
-            Some(crate::read_round::ProbeRound::new(1, 42, 2, h.cons.id, stale_term, 6048, now));
+        h.cons.current_round = Some(crate::read_round::ProbeRound::new(
+            1, 42, 2, h.cons.id, stale_term, 6048, now,
+        ));
         h.cons.next_round_seq = 2;
 
         h.cons.advance_pending_reads();
@@ -6963,8 +7526,9 @@ mod tests {
         drive_to_serving_leader(&mut h);
         let term = h.cons.sm.current_term();
         let now = h.cons.now_ns();
-        h.cons.current_round =
-            Some(crate::read_round::ProbeRound::new(1, 42, 2, h.cons.id, term, 6048, now));
+        h.cons.current_round = Some(crate::read_round::ProbeRound::new(
+            1, 42, 2, h.cons.id, term, 6048, now,
+        ));
         assert!(!h.cons.advance_pending_reads());
         assert!(h.cons.current_round.is_none());
     }
@@ -6978,7 +7542,9 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let far = h.cons.now_ns() + 10_000_000_000;
-        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons
+            .pending_reads
+            .push(mk_read(6048, h.cons.next_round_seq, far));
         h.cons.maybe_issue_round();
         assert!(h.cons.current_round.is_some());
 
@@ -7021,13 +7587,19 @@ mod tests {
         // (no service attached this generation): the guard parks the read.
         h.cons.cnc.service_slot(0).applied.store_release(6048);
         assert_eq!(h.cons.cnc.service_slot(0).epoch.load_acquire(), 0);
-        assert!(!h.cons.advance_pending_reads(), "must not forward on the epoch-0 sentinel");
+        assert!(
+            !h.cons.advance_pending_reads(),
+            "must not forward on the epoch-0 sentinel"
+        );
         assert_eq!(h.cons.pending_reads.len(), 1);
 
         // Epoch bumps to 1 (a real incarnation attached) → forwarded with
         // expected_epoch 1 and dropped from the barrier.
         h.cons.cnc.service_slot(0).epoch.store_release(1);
-        assert!(h.cons.advance_pending_reads(), "must forward once epoch >= 1");
+        assert!(
+            h.cons.advance_pending_reads(),
+            "must forward once epoch >= 1"
+        );
         assert!(h.cons.pending_reads.is_empty());
     }
 
@@ -7041,7 +7613,10 @@ mod tests {
         let read = mk_read(0, 1, 0);
         h.cons.pending_reads.push(read);
         assert!(h.cons.advance_pending_reads());
-        assert!(h.cons.pending_reads.is_empty(), "past-deadline read must retry + drop");
+        assert!(
+            h.cons.pending_reads.is_empty(),
+            "past-deadline read must retry + drop"
+        );
     }
 
     /// Task 11 barrier: leadership lost (a follower / non-serving node) retries
@@ -7055,7 +7630,10 @@ mod tests {
         let read = mk_read(0, 1, far); // deadline far off; only depose fires
         h.cons.pending_reads.push(read);
         assert!(h.cons.advance_pending_reads());
-        assert!(h.cons.pending_reads.is_empty(), "a non-serving node retries in-flight reads");
+        assert!(
+            h.cons.pending_reads.is_empty(),
+            "a non-serving node retries in-flight reads"
+        );
     }
 
     /// Veil §5 discharge, observation 1 (the parked-reads liveness blemish): a
@@ -7068,13 +7646,21 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let far = h.cons.now_ns() + 10_000_000_000;
-        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons
+            .pending_reads
+            .push(mk_read(6048, h.cons.next_round_seq, far));
         h.cons.maybe_issue_round();
         assert!(h.cons.current_round.is_some());
 
         h.cons.halt();
-        assert!(h.cons.pending_reads.is_empty(), "parked reads must be RETRYed at halt");
-        assert!(h.cons.current_round.is_none(), "nothing can ever complete a halted round");
+        assert!(
+            h.cons.pending_reads.is_empty(),
+            "parked reads must be RETRYed at halt"
+        );
+        assert!(
+            h.cons.current_round.is_none(),
+            "nothing can ever complete a halted round"
+        );
     }
 
     /// A read that slips in AFTER `halt()` within the same duty cycle — the
@@ -7086,11 +7672,19 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         h.cons.halt();
-        assert!(h.cons.sm.can_serve(), "premise: the SM serving field survives halt");
+        assert!(
+            h.cons.sm.can_serve(),
+            "premise: the SM serving field survives halt"
+        );
         let far = h.cons.now_ns() + 10_000_000_000;
-        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons
+            .pending_reads
+            .push(mk_read(6048, h.cons.next_round_seq, far));
         assert!(h.cons.advance_pending_reads());
-        assert!(h.cons.pending_reads.is_empty(), "halt gate must RETRY same-cycle admissions");
+        assert!(
+            h.cons.pending_reads.is_empty(),
+            "halt gate must RETRY same-cycle admissions"
+        );
     }
 
     // ---- M7 Task 6: persist-revert-BEFORE-truncate (`Action::Truncate` exec) ----
@@ -7117,7 +7711,10 @@ mod tests {
         let v1 = v1_of(&h);
         // Adopt v1 at position 5000 — ABOVE the divergent-map truncation target
         // (4096) the harness's own map/leader-map mismatch always produces.
-        h.cons.feed(Event::ConfigObserved { position: 5000, config: v1.clone() });
+        h.cons.feed(Event::ConfigObserved {
+            position: 5000,
+            config: v1.clone(),
+        });
         let rec = h.cons.state.config_record().expect("v1 persisted");
         assert_eq!(rec.position, 5000);
         assert_eq!(rec.config.version, 1);
@@ -7125,7 +7722,10 @@ mod tests {
         // Divergent term map -> Action::Truncate{to: 4096, ..} — strictly below
         // 5000, so the config frame backing v1 is removed by the cut.
         h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
-        let epoch = h.cons.pending_truncation.expect("a truncation is in flight");
+        let epoch = h
+            .cons
+            .pending_truncation
+            .expect("a truncation is in flight");
 
         // The record is ALREADY reverted — before any archive ack.
         let rec = h.cons.state.config_record().expect("record still present");
@@ -7151,29 +7751,51 @@ mod tests {
     fn truncate_exec_wipe_persists_fiat_record_before_truncate() {
         let mut h = harness();
         let v1 = v1_of(&h);
-        h.cons.feed(Event::ConfigObserved { position: 3000, config: v1.clone() });
+        h.cons.feed(Event::ConfigObserved {
+            position: 3000,
+            config: v1.clone(),
+        });
         assert_eq!(h.cons.state.config_record().unwrap().position, 3000);
 
         // NoCommonPrefix: the leader's shipped window begins at 1<<20, far past
         // our own map — wipe-and-rejoin, Truncate{to: 0}.
-        h.cons.feed(Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 41,
+            last_term: 40,
+            last_durable: 9000,
+        });
         h.cons.feed(Event::TermMapReceived {
             term: 41,
             entries: vec![(40, 1 << 20), (41, 2 << 20)],
         });
-        let epoch = h.cons.pending_truncation.expect("wipe truncation in flight");
+        let epoch = h
+            .cons
+            .pending_truncation
+            .expect("wipe truncation in flight");
 
         // Fiat record already persisted before any archive ack: position 0,
         // config == prev == the CURRENT (v1) config, not genesis.
         let rec = h.cons.state.config_record().expect("record still present");
         assert_eq!(rec.position, 0);
         assert_eq!(rec.prev_position, 0);
-        assert_eq!(stored_to_cluster(&rec.config), v1, "fiat keeps the CURRENT config");
-        assert_eq!(rec.config, rec.prev, "prev duplicated (fiat, not a genuine predecessor)");
+        assert_eq!(
+            stored_to_cluster(&rec.config),
+            v1,
+            "fiat keeps the CURRENT config"
+        );
+        assert_eq!(
+            rec.config, rec.prev,
+            "prev duplicated (fiat, not a genuine predecessor)"
+        );
 
         h.post_ack_and_drain(epoch, 0);
         let rec = h.cons.state.config_record().unwrap();
-        assert_eq!(stored_to_cluster(&rec.config), v1, "SM's own wipe-revert re-confirms the fiat");
+        assert_eq!(
+            stored_to_cluster(&rec.config),
+            v1,
+            "SM's own wipe-revert re-confirms the fiat"
+        );
     }
 
     /// M7 Task 6: `to == config_record().position` exactly preserves the frame
@@ -7184,12 +7806,18 @@ mod tests {
         let mut h = harness();
         let v1 = v1_of(&h);
         // Adopt v1 EXACTLY at the divergent-map scenario's truncation target.
-        h.cons.feed(Event::ConfigObserved { position: 4096, config: v1.clone() });
+        h.cons.feed(Event::ConfigObserved {
+            position: 4096,
+            config: v1.clone(),
+        });
         let before = h.cons.state.config_record().unwrap();
 
         h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
         let after = h.cons.state.config_record().unwrap();
-        assert_eq!(after, before, "to == position: no revert, record byte-identical");
+        assert_eq!(
+            after, before,
+            "to == position: no revert, record byte-identical"
+        );
     }
 
     // ---- post-M7 follow-up (Task 6): ConfigObserved position<=durable belt ----
@@ -7213,14 +7841,24 @@ mod tests {
         encode_config(&cluster_to_wire(&v1, 0), &mut bytes);
 
         // Implausible: far above durable — must be skipped, not adopted.
-        h._cfg_obs_tx.send((durable + 1_000_000, bytes.clone())).unwrap();
+        h._cfg_obs_tx
+            .send((durable + 1_000_000, bytes.clone()))
+            .unwrap();
         h.cons.do_work();
-        assert_eq!(h.cons.sm.config().version, 0, "implausible obs must not adopt");
+        assert_eq!(
+            h.cons.sm.config().version,
+            0,
+            "implausible obs must not adopt"
+        );
 
         // Plausible: the SAME config, at position <= durable — must still adopt.
         h._cfg_obs_tx.send((durable, bytes)).unwrap();
         h.cons.do_work();
-        assert_eq!(h.cons.sm.config().version, 1, "plausible obs must still adopt");
+        assert_eq!(
+            h.cons.sm.config().version,
+            1,
+            "plausible obs must still adopt"
+        );
     }
 
     // ---- post-M7 follow-up (Task 7): equal-version content-divergence check ----
@@ -7239,10 +7877,16 @@ mod tests {
         let mut b = a.clone();
         assert!(!config_content_diverges(&a, &b), "identical: benign");
         b.voters.pop();
-        assert!(config_content_diverges(&a, &b), "same version, different content");
+        assert!(
+            config_content_diverges(&a, &b),
+            "same version, different content"
+        );
         let mut c = a.clone();
         c.version += 1;
-        assert!(!config_content_diverges(&a, &c), "different version: not this check's job");
+        assert!(
+            !config_content_diverges(&a, &c),
+            "different version: not this check's job"
+        );
     }
 
     /// A same-version-different-content `ConfigObserved` through the real
@@ -7255,7 +7899,10 @@ mod tests {
         let mut h = harness();
         let durable = h.cons.cnc.counters().durable.load_acquire();
         let v1 = v1_of(&h);
-        h.cons.feed(Event::ConfigObserved { position: 0, config: v1.clone() });
+        h.cons.feed(Event::ConfigObserved {
+            position: 0,
+            config: v1.clone(),
+        });
         assert_eq!(h.cons.sm.config(), &v1, "v1 adopted directly via feed");
 
         // Same version (1) as the adopted config, different content: drop
@@ -7297,13 +7944,23 @@ mod tests {
     #[test]
     fn leader_adopting_own_demote_from_log_stays_leader_unelectable_no_halt() {
         let mut h = harness();
-        assert!(matches!(h.cons.sm.role(), Role::Follower), "harness boots a follower");
+        assert!(
+            matches!(h.cons.sm.role(), Role::Follower),
+            "harness boots a follower"
+        );
 
         // Drive to leader of term 3: election timeout, then a majority vote
         // (self + peer 0, out of voters [0,1,2]).
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
-        assert!(matches!(h.cons.sm.role(), Role::Leader), "majority vote elects");
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
+        assert!(
+            matches!(h.cons.sm.role(), Role::Leader),
+            "majority vote elects"
+        );
         assert!(!h.cons.halt_removed);
 
         // Crash-handoff shape: a `DemoteVoter{1}` a prior (now-dead) leader
@@ -7319,7 +7976,10 @@ mod tests {
         demoted.voters.retain(|(id, _)| *id != 1);
         demoted.learners.push((1, self_addr));
         demoted.version += 1;
-        h.cons.feed(Event::ConfigObserved { position: 40, config: demoted });
+        h.cons.feed(Event::ConfigObserved {
+            position: 40,
+            config: demoted,
+        });
 
         // The wedge, exactly as the finding describes: still Leader, self
         // demoted out of the voting set, not tombstoned, and no fail-stop.
@@ -7327,12 +7987,18 @@ mod tests {
             matches!(h.cons.sm.role(), Role::Leader),
             "adopting a config from the log does not itself change role"
         );
-        assert!(!h.cons.sm.config().is_voter(1), "self was demoted to a learner");
+        assert!(
+            !h.cons.sm.config().is_voter(1),
+            "self was demoted to a learner"
+        );
         assert!(
             !h.cons.sm.config().tombstones.contains(&1),
             "a demote (unlike a remove) never tombstones"
         );
-        assert!(!h.cons.halt_removed, "the wedge is silent: no halt/step-down fires");
+        assert!(
+            !h.cons.halt_removed,
+            "the wedge is silent: no halt/step-down fires"
+        );
     }
 
     // ---- M12b review carry: on_config_proposal's membership guard ----
@@ -7349,8 +8015,15 @@ mod tests {
         // Drive to leader of term 3 (mirrors the sibling test above: election
         // timeout, then a majority vote out of the 3-voter [0,1,2] cluster).
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
-        assert!(matches!(h.cons.sm.role(), Role::Leader), "majority vote elects");
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
+        assert!(
+            matches!(h.cons.sm.role(), Role::Leader),
+            "majority vote elects"
+        );
 
         let stranger: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         assert!(
@@ -7358,7 +8031,13 @@ mod tests {
             "test setup: this address must actually be a non-member"
         );
 
-        let body = ConfigProposalBody { nonce: 1, op: 1, id: 9, ip: 0, port: 0 };
+        let body = ConfigProposalBody {
+            nonce: 1,
+            op: 1,
+            id: 9,
+            ip: 0,
+            port: 0,
+        };
         h.cons.on_config_proposal(stranger, body);
 
         assert_eq!(
@@ -7380,8 +8059,15 @@ mod tests {
     fn a_dedup_re_send_is_counted_not_re_audited() {
         let mut h = harness();
         h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
-        assert!(matches!(h.cons.sm.role(), Role::Leader), "majority vote elects");
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
+        assert!(
+            matches!(h.cons.sm.role(), Role::Leader),
+            "majority vote elects"
+        );
 
         let member = *h
             .cons
@@ -7389,7 +8075,13 @@ mod tests {
             .keys()
             .next()
             .expect("the harness cluster has members");
-        let body = ConfigProposalBody { nonce: 77, op: 1, id: 9, ip: 0, port: 0 };
+        let body = ConfigProposalBody {
+            nonce: 77,
+            op: 1,
+            id: 9,
+            ip: 0,
+            port: 0,
+        };
 
         // First presentation: a fresh nonce, recorded like any admin answer.
         h.cons.on_config_proposal(member, body);
@@ -7400,14 +8092,20 @@ mod tests {
             "a fresh-nonce proposal is recorded: {after_first}"
         );
         assert_eq!(h.cons.config_proposal_dedup_resend, 0);
-        assert!(h.cons.last_config_reply.is_some(), "the answer was cached for dedup");
+        assert!(
+            h.cons.last_config_reply.is_some(),
+            "the answer was cached for dedup"
+        );
 
         // Same nonce again, five times over: cached answer re-sent, nothing
         // recorded, every re-send counted.
         for _ in 0..5 {
             h.cons.on_config_proposal(member, body);
         }
-        assert_eq!(h.cons.config_proposal_dedup_resend, 5, "every re-send is counted");
+        assert_eq!(
+            h.cons.config_proposal_dedup_resend, 5,
+            "every re-send is counted"
+        );
         assert_eq!(
             std::fs::read_to_string(h.cons.audit.path()).unwrap(),
             after_first,
@@ -7445,7 +8143,11 @@ mod tests {
 
         h.cons.do_work();
 
-        assert_eq!(h.cons.sm.config().version, 1, "fiat install adopted the carried config");
+        assert_eq!(
+            h.cons.sm.config().version,
+            1,
+            "fiat install adopted the carried config"
+        );
         assert!(
             h.cons.sm.config_pending(),
             "floor > commit_seen: the periodic mirror-clear must be blocked this cycle"
@@ -7474,7 +8176,9 @@ mod tests {
         let mut appender = Appender::new(Arc::clone(&buffer), term);
         let mut bytes = Vec::new();
         encode_config(&cluster_to_wire(cfg, 0), &mut bytes);
-        let end = appender.append_config(term, &bytes).expect("config frame append");
+        let end = appender
+            .append_config(term, &bytes)
+            .expect("config frame append");
         while archive.do_work(&buffer).expect("archive do_work") {}
         end
     }
@@ -7496,10 +8200,14 @@ mod tests {
         let mut appender = Appender::new(Arc::clone(&buffer), term);
         let mut bytes1 = Vec::new();
         encode_config(&cluster_to_wire(cfg1, 0), &mut bytes1);
-        let end1 = appender.append_config(term, &bytes1).expect("v1 config frame append");
+        let end1 = appender
+            .append_config(term, &bytes1)
+            .expect("v1 config frame append");
         let mut bytes2 = Vec::new();
         encode_config(&cluster_to_wire(cfg2, 0), &mut bytes2);
-        let end2 = appender.append_config(term, &bytes2).expect("v2 config frame append");
+        let end2 = appender
+            .append_config(term, &bytes2)
+            .expect("v2 config frame append");
         while archive.do_work(&buffer).expect("archive do_work") {}
         (end1, end2)
     }
@@ -7519,7 +8227,10 @@ mod tests {
 
         let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
         let genesis = ClusterConfig::genesis(
-            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            members
+                .iter()
+                .map(|(id, a)| (*id, addr_to_pair(*a)))
+                .collect(),
             Vec::new(),
         );
         let mut v1 = genesis.clone();
@@ -7546,7 +8257,11 @@ mod tests {
         // real `StableValue` may keep more than one file; remove whatever exists.
         for entry in std::fs::read_dir(dir.path().join("state")).unwrap() {
             let entry = entry.unwrap();
-            if entry.file_name().to_string_lossy().starts_with("config.state") {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("config.state")
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -7555,13 +8270,23 @@ mod tests {
         // fresh `NodeState::open` (config.state gone -> `config_record() == None`).
         let archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
         let state = NodeState::open(&dir.path().join("state")).unwrap();
-        assert!(state.config_record().is_none(), "the file is genuinely gone");
+        assert!(
+            state.config_record().is_none(),
+            "the file is genuinely gone"
+        );
 
         let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
-        assert_eq!(rec.config.version, 1, "rebuilt to the SAME version the lost file held");
+        assert_eq!(
+            rec.config.version, 1,
+            "rebuilt to the SAME version the lost file held"
+        );
         assert_eq!(stored_to_cluster(&rec.config), v1);
         assert_eq!(rec.position, end);
-        assert_eq!(stored_to_cluster(&rec.prev), genesis, "prev recovered as the genesis seed");
+        assert_eq!(
+            stored_to_cluster(&rec.prev),
+            genesis,
+            "prev recovered as the genesis seed"
+        );
         // The rebuilt record is durable — a subsequent read agrees.
         assert_eq!(state.config_record().unwrap(), rec);
     }
@@ -7580,7 +8305,10 @@ mod tests {
         assert_eq!(durable, 0, "empty journal: nothing durable");
 
         let genesis = ClusterConfig::genesis(
-            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            members
+                .iter()
+                .map(|(id, a)| (*id, addr_to_pair(*a)))
+                .collect(),
             Vec::new(),
         );
         let mut v1 = genesis.clone();
@@ -7602,8 +8330,16 @@ mod tests {
 
         let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
         assert_eq!(rec.position, 0, "reverted to prev's position");
-        assert_eq!(stored_to_cluster(&rec.config), genesis, "reverted to the genuine predecessor");
-        assert_eq!(state.config_record().unwrap(), rec, "the revert is itself persisted");
+        assert_eq!(
+            stored_to_cluster(&rec.config),
+            genesis,
+            "reverted to the genuine predecessor"
+        );
+        assert_eq!(
+            state.config_record().unwrap(),
+            rec,
+            "the revert is itself persisted"
+        );
     }
 
     /// T5-carry, compounding case: BOTH the record's position AND its prev's
@@ -7620,7 +8356,10 @@ mod tests {
         assert_eq!(durable, 0);
 
         let genesis = ClusterConfig::genesis(
-            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            members
+                .iter()
+                .map(|(id, a)| (*id, addr_to_pair(*a)))
+                .collect(),
             Vec::new(),
         );
         let mut v1 = genesis.clone();
@@ -7640,7 +8379,10 @@ mod tests {
 
         let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
         assert_eq!(rec.position, 0);
-        assert_eq!(rec.config.version, 0, "fresh genesis-by-fiat, not either compromised level");
+        assert_eq!(
+            rec.config.version, 0,
+            "fresh genesis-by-fiat, not either compromised level"
+        );
         assert_eq!(stored_to_cluster(&rec.config), genesis);
         assert_eq!(rec.config, rec.prev, "seed record: prev duplicated");
     }
@@ -7666,7 +8408,10 @@ mod tests {
 
         let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
         let genesis = ClusterConfig::genesis(
-            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            members
+                .iter()
+                .map(|(id, a)| (*id, addr_to_pair(*a)))
+                .collect(),
             Vec::new(),
         );
         let mut v1 = genesis.clone();
@@ -7703,11 +8448,25 @@ mod tests {
         // The discriminating assert: recovery lands on the journal-rederived
         // v2 (version AND frame-END position), not the reverted-to v1 — this
         // fails if rederivation is skipped after the revert.
-        assert_eq!(rec.config.version, 2, "must rederive forward past the revert, landing on v2");
-        assert_eq!(rec.position, end2, "position must be v2's frame-END, not v1's (the reverted level)");
+        assert_eq!(
+            rec.config.version, 2,
+            "must rederive forward past the revert, landing on v2"
+        );
+        assert_eq!(
+            rec.position, end2,
+            "position must be v2's frame-END, not v1's (the reverted level)"
+        );
         assert_eq!(stored_to_cluster(&rec.config), v2);
-        assert_eq!(stored_to_cluster(&rec.prev), v1, "prev is the level rederivation folded from");
-        assert_eq!(state.config_record().unwrap(), rec, "the rederived record is itself persisted");
+        assert_eq!(
+            stored_to_cluster(&rec.prev),
+            v1,
+            "prev is the level rederivation folded from"
+        );
+        assert_eq!(
+            state.config_record().unwrap(),
+            rec,
+            "the rederived record is itself persisted"
+        );
     }
 
     // ==================================================================
@@ -7753,7 +8512,10 @@ mod tests {
         // cross-run flake during the mutation campaign, not hypothesized.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        assert!(
+            !dir.starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {dir:?}"
+        );
         dir
     }
 
@@ -7770,8 +8532,7 @@ mod tests {
     /// allowlist parser. Hand-rolled rather than adding a `base64`
     /// dev-dependency to `uc_node` for one fixture.
     fn b64_32(bytes: &[u8; 32]) -> String {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0] as u32;
@@ -7785,7 +8546,11 @@ mod tests {
             } else {
                 '='
             });
-            out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 2 {
+                ALPHABET[(n & 0x3F) as usize] as char
+            } else {
+                '='
+            });
         }
         out
     }
@@ -7794,7 +8559,9 @@ mod tests {
         let dir = crypto_scratch_dir(tag);
         let key_path = dir.join("node.key");
         write_key_file(&key_path, private);
-        uc_crypto::identity::Identity::load(&key_path).unwrap().public_bytes()
+        uc_crypto::identity::Identity::load(&key_path)
+            .unwrap()
+            .public_bytes()
     }
 
     /// A real `CryptoConfig::Enabled` over freshly written key/allowlist files.
@@ -7884,13 +8651,18 @@ mod tests {
     fn crypto_boot_refusal_leaves_no_instance_files_and_no_lock() {
         let (mut cfg, dir) = test_node_config();
         let good = enabled_crypto_config("refusal-good-key", T12_PRIV_SELF, &[]);
-        let CryptoConfig::Enabled { key_path, .. } = good else { unreachable!() };
+        let CryptoConfig::Enabled { key_path, .. } = good else {
+            unreachable!()
+        };
         cfg.crypto = CryptoConfig::Enabled {
             key_path,
             allowlist_path: "/nonexistent/allow".into(),
             rotation: Default::default(),
         };
-        assert!(Node::start(cfg).is_err(), "an unreadable allowlist is also a refusal");
+        assert!(
+            Node::start(cfg).is_err(),
+            "an unreadable allowlist is also a refusal"
+        );
         // `cnc2.dat`, matching `InstanceDir::cnc_path` — asserting on a name
         // the node never writes would make this half of the test vacuous.
         assert!(
@@ -7905,7 +8677,10 @@ mod tests {
 
     #[test]
     fn default_config_is_disabled_so_existing_deployments_are_untouched() {
-        assert!(matches!(test_node_config().0.crypto, CryptoConfig::Disabled));
+        assert!(matches!(
+            test_node_config().0.crypto,
+            CryptoConfig::Disabled
+        ));
         assert!(matches!(CryptoConfig::default(), CryptoConfig::Disabled));
     }
 
@@ -7920,7 +8695,10 @@ mod tests {
         let node = Node::start(cfg).expect("a well-configured crypto node boots");
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while node.crypto_epoch().is_none() {
-            assert!(Instant::now() < deadline, "a fresh leader never minted a group epoch");
+            assert!(
+                Instant::now() < deadline,
+                "a fresh leader never minted a group epoch"
+            );
             std::thread::yield_now();
         }
         assert!(node.is_leader(), "the sole voter elected itself");
@@ -7965,11 +8743,19 @@ mod tests {
         /// Adopt + commit a config demoting `id` to a learner — NO tombstone.
         fn commit_config_demoting(&mut self, id: NodeId) {
             let mut c = self.h.cons.sm.config().clone();
-            let addr = c.voters.iter().find(|(v, _)| *v == id).map(|(_, a)| *a).unwrap();
+            let addr = c
+                .voters
+                .iter()
+                .find(|(v, _)| *v == id)
+                .map(|(_, a)| *a)
+                .unwrap();
             c.voters.retain(|(v, _)| *v != id);
             c.learners.push((id, addr));
             c.version += 1;
-            self.h.cons.feed(Event::ConfigObserved { position: 40, config: c });
+            self.h.cons.feed(Event::ConfigObserved {
+                position: 40,
+                config: c,
+            });
             self.h.cons.do_work();
         }
 
@@ -7980,7 +8766,10 @@ mod tests {
             c.learners.retain(|(v, _)| *v != id);
             c.tombstones.push(id);
             c.version += 1;
-            self.h.cons.feed(Event::ConfigObserved { position: 41, config: c });
+            self.h.cons.feed(Event::ConfigObserved {
+                position: 41,
+                config: c,
+            });
             self.h.cons.do_work();
         }
 
@@ -8131,9 +8920,15 @@ mod tests {
     fn winning_an_election_mints_a_fresh_epoch() {
         let mut h = crypto_harness();
         let before = h.crypto_epoch();
-        assert!(before.is_none(), "a node that has never led has never minted");
+        assert!(
+            before.is_none(),
+            "a node that has never led has never minted"
+        );
         h.drive_to_leader();
-        assert!(epoch_is_newer(h.crypto_epoch().unwrap(), before.unwrap_or(0)));
+        assert!(epoch_is_newer(
+            h.crypto_epoch().unwrap(),
+            before.unwrap_or(0)
+        ));
     }
 
     /// Rotation trigger 3: a committed `Remove*` revokes; a committed demote
@@ -8148,10 +8943,17 @@ mod tests {
         let e0 = h.crypto_epoch().unwrap();
 
         h.commit_config_demoting(2);
-        assert_eq!(h.crypto_epoch().unwrap(), e0, "a demote keeps the node replicating");
+        assert_eq!(
+            h.crypto_epoch().unwrap(),
+            e0,
+            "a demote keeps the node replicating"
+        );
 
         h.commit_config_removing(3);
-        assert!(epoch_is_newer(h.crypto_epoch().unwrap(), e0), "a removal revokes");
+        assert!(
+            epoch_is_newer(h.crypto_epoch().unwrap(), e0),
+            "a removal revokes"
+        );
     }
 
     /// The mint's `HandshakeAction::Send`s must be CONSUMED by this layer:
@@ -8187,20 +8989,30 @@ mod tests {
 
         // 2. The node answered HS_RESP on its own socket, in the clear
         //    (`Scope::Unsealed` — there is nothing to seal under yet).
-        let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("the node answered the HS_INIT");
-        let acts = h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        let resp = h
+            .recv_kind(DGRAM_KIND_HS_RESP)
+            .expect("the node answered the HS_INIT");
+        let acts = h
+            .peer
+            .on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
         assert!(
-            acts.iter().any(|a| matches!(a, HandshakeAction::Established { peer: 1, .. })),
+            acts.iter()
+                .any(|a| matches!(a, HandshakeAction::Established { peer: 1, .. })),
             "the peer's session with the node is up: {acts:?}"
         );
-        assert!(h.h.cons.crypto.as_ref().unwrap().is_established(0), "and the node's with it");
+        assert!(
+            h.h.cons.crypto.as_ref().unwrap().is_established(0),
+            "and the node's with it"
+        );
 
         // 3. The node becomes leader and mints. The HS_KEY for peer 0 is now
         //    sealable over the established pairwise session — and `recv_kind`
         //    OPENS it, which is itself the assertion that it went out sealed.
         h.drive_to_leader();
         let epoch = h.crypto_epoch().expect("the new leader minted");
-        let body = h.recv_kind(DGRAM_KIND_HS_KEY).expect("an HS_KEY was delivered");
+        let body = h
+            .recv_kind(DGRAM_KIND_HS_KEY)
+            .expect("an HS_KEY was delivered");
         assert_eq!(
             u16::from_le_bytes([body[1], body[2]]),
             epoch,
@@ -8227,15 +9039,20 @@ mod tests {
         let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
         h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
         let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("HS_RESP");
-        h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        h.peer
+            .on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
         h.drive_to_leader();
 
         // Drop the first delivery on the floor (never acked), then let the
         // re-delivery timer come due.
-        let first = h.recv_kind(DGRAM_KIND_HS_KEY).expect("the initial delivery");
+        let first = h
+            .recv_kind(DGRAM_KIND_HS_KEY)
+            .expect("the initial delivery");
         h.h.cons.crypto_last_redeliver_ns = None;
         h.h.cons.do_work();
-        let again = h.recv_kind(DGRAM_KIND_HS_KEY).expect("an un-acked epoch is re-delivered");
+        let again = h
+            .recv_kind(DGRAM_KIND_HS_KEY)
+            .expect("an un-acked epoch is re-delivered");
         assert_eq!(again, first, "the same epoch's key, re-sent verbatim");
 
         // Once acked, the sweep goes quiet: nothing further is re-delivered.
@@ -8282,7 +9099,8 @@ mod tests {
         let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
         h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
         let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("HS_RESP");
-        h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        h.peer
+            .on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
         h.drive_to_leader();
         let epoch = h.crypto_epoch().unwrap();
         let first = h.recv_kind(DGRAM_KIND_HS_KEY).expect("first-life delivery");
@@ -8290,7 +9108,12 @@ mod tests {
         let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
         h.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
         assert!(
-            !h.h.cons.crypto.as_ref().unwrap().unacked_group_key_peers().contains(&0),
+            !h.h.cons
+                .crypto
+                .as_ref()
+                .unwrap()
+                .unacked_group_key_peers()
+                .contains(&0),
             "peer 0 has acked; the un-acked sweep will never name it again"
         );
 
@@ -8302,8 +9125,11 @@ mod tests {
         let acts = h.peer.initiate(1, h.peer.now_ns());
         let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
         h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
-        let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("HS_RESP after restart");
-        h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        let resp = h
+            .recv_kind(DGRAM_KIND_HS_RESP)
+            .expect("HS_RESP after restart");
+        h.peer
+            .on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
         h.h.cons.do_work();
 
         // A fresh `Established` for a peer that was already fully acked
@@ -8318,7 +9144,9 @@ mod tests {
         // openably. What this test pins is the part that lives in THIS
         // layer: the re-delivery fires at all, which the un-acked sweep
         // alone would never do for an already-acked peer.
-        let raw = h.recv_kind_raw(DGRAM_KIND_HS_KEY).expect("the restarted peer is re-keyed");
+        let raw = h
+            .recv_kind_raw(DGRAM_KIND_HS_KEY)
+            .expect("the restarted peer is re-keyed");
         assert_eq!(
             raw.len(),
             DATAGRAM_HEADER_LEN + 35 + uc_protocol::v2::crypto::CRYPTO_OVERHEAD,
@@ -8336,17 +9164,27 @@ mod tests {
         let mut h = crypto_harness();
         h.drive_to_leader();
         let before = h.h.cons.crypto_peer_ids().unwrap().snapshot();
-        assert!(!before.values().any(|id| *id == 9), "node 9 is not a member yet");
+        assert!(
+            !before.values().any(|id| *id == 9),
+            "node 9 is not a member yet"
+        );
 
         let mut c = h.h.cons.sm.config().clone();
         let addr: SocketAddr = "127.0.0.1:9109".parse().unwrap();
         c.learners.push((9, addr_to_pair(addr)));
         c.version += 1;
-        h.h.cons.feed(Event::ConfigObserved { position: 42, config: c });
+        h.h.cons.feed(Event::ConfigObserved {
+            position: 42,
+            config: c,
+        });
 
         // Synchronously, on the adoption itself — not one duty cycle later.
         let after = h.h.cons.crypto_peer_ids().unwrap().snapshot();
-        assert_eq!(after.get(&addr), Some(&9), "the joiner is resolvable immediately");
+        assert_eq!(
+            after.get(&addr),
+            Some(&9),
+            "the joiner is resolvable immediately"
+        );
     }
 
     /// Spec §5: "an operator drops in a key and `uc2ctl add-learner` works
@@ -8421,7 +9259,9 @@ mod tests {
         h.h.cons.do_work(); // settle the boot-time `initiate` sweep first
         let failures = h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed);
         let stranger: SocketAddr = "127.0.0.1:9199".parse().unwrap();
-        h.h.hs_tx.try_send((stranger, DGRAM_KIND_HS_INIT, vec![0xAB; 116])).unwrap();
+        h.h.hs_tx
+            .try_send((stranger, DGRAM_KIND_HS_INIT, vec![0xAB; 116]))
+            .unwrap();
         h.h.cons.do_work();
         assert_eq!(h.h.cons.crypto_unresolved_peer.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -8451,12 +9291,17 @@ mod tests {
             let acts = self.peer.initiate(1, self.peer.now_ns());
             let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
             self.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
-            let resp = self.recv_kind(DGRAM_KIND_HS_RESP).expect("the node answered the HS_INIT");
-            self.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, self.peer.now_ns());
+            let resp = self
+                .recv_kind(DGRAM_KIND_HS_RESP)
+                .expect("the node answered the HS_INIT");
+            self.peer
+                .on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, self.peer.now_ns());
             assert!(self.h.cons.crypto.as_ref().unwrap().is_established(0));
 
             self.drive_to_leader();
-            let body = self.recv_kind(DGRAM_KIND_HS_KEY).expect("the new leader delivered a key");
+            let body = self
+                .recv_kind(DGRAM_KIND_HS_KEY)
+                .expect("the new leader delivered a key");
             let acts = self.peer.on_group_key_message(1, &body);
             let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
             self.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
@@ -8473,8 +9318,13 @@ mod tests {
             // back through the ordinary handshake route so the group plane
             // records it exactly as it would in production.
             let now = self.h.cons.crypto_now_ns();
-            let (_epoch, acts) =
-                self.h.cons.crypto.as_ref().unwrap().mint_group_key(&[0], now);
+            let (_epoch, acts) = self
+                .h
+                .cons
+                .crypto
+                .as_ref()
+                .unwrap()
+                .mint_group_key(&[0], now);
             for act in acts {
                 let HandshakeAction::Send { body, .. } = act else {
                     panic!("a mint must emit a Send action")
@@ -8484,7 +9334,13 @@ mod tests {
                 self.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
             }
             assert!(
-                self.h.cons.crypto.as_ref().unwrap().unacked_group_key_peers().is_empty(),
+                self.h
+                    .cons
+                    .crypto
+                    .as_ref()
+                    .unwrap()
+                    .unacked_group_key_peers()
+                    .is_empty(),
                 "the re-minted epoch is fully acked, so it activates immediately"
             );
         }
@@ -8511,8 +9367,11 @@ mod tests {
         // the gossip cadence: the harness pins `gossip_floor_ns` to
         // `u64::MAX` (no idle re-gossip), so waiting would be a race on
         // whether a commit happened to advance this cycle.
-        h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
-        let commit_raw = h.recv_kind_raw(DGRAM_KIND_COMMIT_POSITION).expect("commit gossip");
+        h.h.cons
+            .exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
+        let commit_raw = h
+            .recv_kind_raw(DGRAM_KIND_COMMIT_POSITION)
+            .expect("commit gossip");
         assert_ne!(
             read_datagram_header(&commit_raw).unwrap().key_epoch,
             0,
@@ -8526,43 +9385,72 @@ mod tests {
 
         // --- Scope::Pairwise, the term map that rides the same cadence.
         h.h.cons.exec(
-            Action::ShipTermMap { entries: vec![(2, 0), (3, 6016)] },
+            Action::ShipTermMap {
+                entries: vec![(2, 0), (3, 6016)],
+            },
             &mut Vec::new(),
         );
         let map_raw = h.recv_kind_raw(DGRAM_KIND_TERM_MAP).expect("term map");
         let mut d = map_raw.clone();
         let n = d.len();
-        let len = h.peer_recv.open_slice(1, &mut d, n).expect("TERM_MAP must open pairwise");
+        let len = h
+            .peer_recv
+            .open_slice(1, &mut d, n)
+            .expect("TERM_MAP must open pairwise");
         let map_body = d[DATAGRAM_HEADER_LEN..len].to_vec();
         assert!(!map_body.is_empty(), "a real term map, not an empty body");
         assert!(
-            !map_raw.windows(map_body.len()).any(|w| w == map_body.as_slice()),
+            !map_raw
+                .windows(map_body.len())
+                .any(|w| w == map_body.as_slice()),
             "the term map's bytes must not be readable on the wire"
         );
 
         // --- Scope::Group, driven directly (a read round needs no client).
         h.h.cons.send_read_probe(0xABCD_1234);
-        let probe = h.recv_kind(DGRAM_KIND_READ_PROBE).expect("READ_PROBE must open");
-        assert_eq!(&probe[..8], &0xABCD_1234u64.to_le_bytes(), "the nonce survives the seal");
+        let probe = h
+            .recv_kind(DGRAM_KIND_READ_PROBE)
+            .expect("READ_PROBE must open");
+        assert_eq!(
+            &probe[..8],
+            &0xABCD_1234u64.to_le_bytes(),
+            "the nonce survives the seal"
+        );
 
         // --- Scope::Pairwise, driven through `exec` exactly as the SM would.
-        h.h.cons.exec(Action::SendVoteRejection { to: 0, term: 42 }, &mut Vec::new());
+        h.h.cons.exec(
+            Action::SendVoteRejection { to: 0, term: 42 },
+            &mut Vec::new(),
+        );
         let vote = h.recv_kind(DGRAM_KIND_VOTE).expect("VOTE must open");
         assert_eq!(vote.len(), VOTE_BODY_LEN);
 
         h.h.cons.exec(
-            Action::StartElection { new_term: 43, last_term: 2, last_durable: 6016 },
+            Action::StartElection {
+                new_term: 43,
+                last_term: 2,
+                last_durable: 6016,
+            },
             &mut Vec::new(),
         );
-        let rv = h.recv_kind(DGRAM_KIND_REQUEST_VOTE).expect("REQUEST_VOTE must open");
+        let rv = h
+            .recv_kind(DGRAM_KIND_REQUEST_VOTE)
+            .expect("REQUEST_VOTE must open");
         assert_eq!(rv.len(), REQUEST_VOTE_BODY_LEN);
 
         let peer_addr = h.peer_sock.local_addr().unwrap();
         h.h.cons.send_config_reply(
             peer_addr,
-            &ConfigReplyBody { nonce: 77, status: 0, reason: 0, version: 5 },
+            &ConfigReplyBody {
+                nonce: 77,
+                status: 0,
+                reason: 0,
+                version: 5,
+            },
         );
-        let cr = h.recv_kind(DGRAM_KIND_CONFIG_REPLY).expect("CONFIG_REPLY must open");
+        let cr = h
+            .recv_kind(DGRAM_KIND_CONFIG_REPLY)
+            .expect("CONFIG_REPLY must open");
         assert_eq!(cr.len(), CONFIG_REPLY_BODY_LEN);
     }
 
@@ -8588,7 +9476,8 @@ mod tests {
         assert_eq!(h.cons.crypto_unresolved_peer.load(Ordering::Relaxed), 0);
 
         // Node 99 is in no config this harness ever adopted; node 0 is.
-        h.cons.fan_out_group(&[0, 99], DGRAM_KIND_COMMIT_POSITION, 4096, 2, &[]);
+        h.cons
+            .fan_out_group(&[0, 99], DGRAM_KIND_COMMIT_POSITION, 4096, 2, &[]);
 
         assert_eq!(
             h.cons.crypto_unresolved_peer.load(Ordering::Relaxed),
@@ -8596,8 +9485,13 @@ mod tests {
             "the unaddressable target must be counted, not dropped in silence"
         );
         let mut buf = [0u8; 2048];
-        let (n, _) = sink.recv_from(&mut buf).expect("the RESOLVABLE target still got its datagram");
-        assert_eq!(read_datagram_header(&buf[..n]).unwrap().kind, DGRAM_KIND_COMMIT_POSITION);
+        let (n, _) = sink
+            .recv_from(&mut buf)
+            .expect("the RESOLVABLE target still got its datagram");
+        assert_eq!(
+            read_datagram_header(&buf[..n]).unwrap().kind,
+            DGRAM_KIND_COMMIT_POSITION
+        );
         assert_eq!(read_datagram_header(&buf[..n]).unwrap().position, 4096);
     }
 
@@ -8618,9 +9512,12 @@ mod tests {
         while h.peer_sock.recv_from(&mut sink).is_ok() {}
         while h.peer2_sock.recv_from(&mut sink).is_ok() {}
         h.stash.clear();
-        h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
+        h.h.cons
+            .exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
 
-        let a = h.recv_kind_raw(DGRAM_KIND_COMMIT_POSITION).expect("peer 0 got the gossip");
+        let a = h
+            .recv_kind_raw(DGRAM_KIND_COMMIT_POSITION)
+            .expect("peer 0 got the gossip");
         let mut b = None;
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while Instant::now() < deadline && b.is_none() {
@@ -8632,7 +9529,10 @@ mod tests {
             }
         }
         let b = b.expect("peer 2 got the gossip");
-        assert_eq!(a, b, "byte-identical: sealed once, fanned out — not one seal per destination");
+        assert_eq!(
+            a, b,
+            "byte-identical: sealed once, fanned out — not one seal per destination"
+        );
     }
 
     /// Fail-closed on the consensus plane: with no established session and no
@@ -8645,8 +9545,12 @@ mod tests {
         // No handshake driven: no pairwise session, and this node has never
         // led so it holds no group key either.
         assert_eq!(h.h.cons.crypto_seal_failures(), 0);
-        h.h.cons.exec(Action::SendVoteRejection { to: 0, term: 7 }, &mut Vec::new());
-        h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
+        h.h.cons.exec(
+            Action::SendVoteRejection { to: 0, term: 7 },
+            &mut Vec::new(),
+        );
+        h.h.cons
+            .exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
         assert!(
             h.h.cons.crypto_seal_failures() >= 2,
             "both the pairwise VOTE and the group gossip must be counted as dropped"
@@ -8670,7 +9574,9 @@ mod tests {
         h.h.cons.do_work(); // settle the boot-time `initiate` sweep first
         let failures = h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed);
         let from = h.peer_sock.local_addr().unwrap();
-        h.h.hs_tx.try_send((from, DGRAM_KIND_HS_INIT, vec![0xAB; 116])).unwrap();
+        h.h.hs_tx
+            .try_send((from, DGRAM_KIND_HS_INIT, vec![0xAB; 116]))
+            .unwrap();
         h.h.cons.do_work();
         assert!(
             h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed) > failures,
@@ -8686,27 +9592,40 @@ mod tests {
         let mut h = harness();
         // A second producer on the harness's own ingress ring: claim, then
         // "die" (drop the claim), then write a live record behind it.
-        let (producer, _c) =
-            MpscRing::open(&h._dir.path().join("ingress.ring")).unwrap().into_split();
-        let dead =
-            producer.claim_without_commit(MSG_V2_SUBMIT, 0, extra_client(9, 1), b"lost").unwrap();
+        let (producer, _c) = MpscRing::open(&h._dir.path().join("ingress.ring"))
+            .unwrap()
+            .into_split();
+        let dead = producer
+            .claim_without_commit(MSG_V2_SUBMIT, 0, extra_client(9, 1), b"lost")
+            .unwrap();
         drop(dead);
-        producer.try_write(MSG_V2_SUBMIT, 0, extra_client(9, 2), b"kept").unwrap();
-        h.cons.ingress_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+        producer
+            .try_write(MSG_V2_SUBMIT, 0, extra_client(9, 2), b"kept")
+            .unwrap();
+        h.cons
+            .ingress_ring
+            .set_hole_timeout(std::time::Duration::from_millis(0));
 
         // `serving = false`: every drained record is answered NOT_LEADER, so
         // no appender is needed. First drain starts the hole timer; the
         // second finds it elapsed, skips, and delivers the live record.
         h.cons.drain_ingress_ring(false);
         assert_eq!(h.cons.ingress_ring.holes_skipped(), 0);
-        assert!(h.cons.drain_ingress_ring(false), "the record behind the hole is drained");
+        assert!(
+            h.cons.drain_ingress_ring(false),
+            "the record behind the hole is drained"
+        );
         assert_eq!(h.cons.ingress_ring.holes_skipped(), 1);
 
         h.cons.publish_ring_holes();
         assert_eq!(h.cons.cnc.ingress_holes_skipped(), 1);
         // Final review, Important 2: the two rings are counted separately —
         // an ingress hole must NOT show up on the query line.
-        assert_eq!(h.cons.cnc.query_holes_skipped(), 0, "the query line is independent");
+        assert_eq!(
+            h.cons.cnc.query_holes_skipped(),
+            0,
+            "the query line is independent"
+        );
     }
 
     /// Final review, Important 2: the query ring's holes land on the QUERY
@@ -8717,20 +9636,37 @@ mod tests {
     #[test]
     fn a_query_ring_hole_is_counted_on_its_own_cnc_line() {
         let mut h = harness();
-        let (producer, _c) =
-            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
-        let dead =
-            producer.claim_without_commit(uc_protocol::v2::ipc::MSG_V2_QUERY, 0, extra_client(9, 1), b"lost").unwrap();
+        let (producer, _c) = MpscRing::open(&h._dir.path().join("query.ring"))
+            .unwrap()
+            .into_split();
+        let dead = producer
+            .claim_without_commit(
+                uc_protocol::v2::ipc::MSG_V2_QUERY,
+                0,
+                extra_client(9, 1),
+                b"lost",
+            )
+            .unwrap();
         drop(dead);
-        h.cons.query_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+        h.cons
+            .query_ring
+            .set_hole_timeout(std::time::Duration::from_millis(0));
 
         h.cons.drain_query_ring(); // arms the hole timer
         h.cons.drain_query_ring(); // skips and counts it
         assert_eq!(h.cons.query_ring.holes_skipped(), 1);
 
         h.cons.publish_ring_holes();
-        assert_eq!(h.cons.cnc.query_holes_skipped(), 1, "counted on the query line");
-        assert_eq!(h.cons.cnc.ingress_holes_skipped(), 0, "NOT summed into ingress");
+        assert_eq!(
+            h.cons.cnc.query_holes_skipped(),
+            1,
+            "counted on the query line"
+        );
+        assert_eq!(
+            h.cons.cnc.ingress_holes_skipped(),
+            0,
+            "NOT summed into ingress"
+        );
     }
 
     /// M14b: the query payload's first byte names the FSM. A query naming an
@@ -8741,26 +9677,44 @@ mod tests {
         use uc_protocol::v2::ipc::{MSG_V2_BAD_SERVICE, MSG_V2_QUERY, write_query_payload};
         let mut h = harness();
         drive_to_serving_leader(&mut h);
-        let mut node_egress =
-            BroadcastRing::open(&h._dir.path().join("egress_node.broadcast")).unwrap().subscribe();
-        let (producer, _c) =
-            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
+        let mut node_egress = BroadcastRing::open(&h._dir.path().join("egress_node.broadcast"))
+            .unwrap()
+            .subscribe();
+        let (producer, _c) = MpscRing::open(&h._dir.path().join("query.ring"))
+            .unwrap()
+            .into_split();
         let mut payload = Vec::new();
         write_query_payload(5, b"q", &mut payload); // 5: no ring on the harness node
-        producer.try_write(MSG_V2_QUERY, 0, extra_client(9, 1), &payload).unwrap();
+        producer
+            .try_write(MSG_V2_QUERY, 0, extra_client(9, 1), &payload)
+            .unwrap();
         write_query_payload(200, b"q", &mut payload); // out of range: same answer
-        producer.try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 2), &payload).unwrap();
+        producer
+            .try_write(
+                MSG_V2_QUERY,
+                FLAG_V2_LINEARIZABLE,
+                extra_client(9, 2),
+                &payload,
+            )
+            .unwrap();
         assert!(h.cons.drain_query_ring());
         assert!(h.cons.pending_reads.is_empty(), "a bad id is never parked");
         let mut buf = Vec::new();
         let mut got = Vec::new();
         while let Ok(Some(rec)) = node_egress.try_read(&mut buf) {
-            got.push((rec.msg_type, client_from_extra(rec.header_extra), buf.clone()));
+            got.push((
+                rec.msg_type,
+                client_from_extra(rec.header_extra),
+                buf.clone(),
+            ));
         }
-        assert_eq!(got, vec![
-            (MSG_V2_BAD_SERVICE, (9, 1), vec![5]),
-            (MSG_V2_BAD_SERVICE, (9, 2), vec![200]),
-        ]);
+        assert_eq!(
+            got,
+            vec![
+                (MSG_V2_BAD_SERVICE, (9, 1), vec![5]),
+                (MSG_V2_BAD_SERVICE, (9, 2), vec![200]),
+            ]
+        );
     }
 
     /// M14b: a snapshot read is forwarded to the NAMED id's ring (the harness
@@ -8773,22 +9727,45 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         let (svc1_producer, mut svc1_consumer) =
-            SpscRing::create(&h._dir.path().join("svc_query.1.ring"), 4096, 1024).unwrap().into_split();
+            SpscRing::create(&h._dir.path().join("svc_query.1.ring"), 4096, 1024)
+                .unwrap()
+                .into_split();
         h.cons.svc_query[1] = Some(svc1_producer);
-        let (producer, _c) =
-            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
+        let (producer, _c) = MpscRing::open(&h._dir.path().join("query.ring"))
+            .unwrap()
+            .into_split();
         let mut payload = Vec::new();
         write_query_payload(1, b"snap", &mut payload);
-        producer.try_write(MSG_V2_QUERY, 0, extra_client(9, 3), &payload).unwrap();
+        producer
+            .try_write(MSG_V2_QUERY, 0, extra_client(9, 3), &payload)
+            .unwrap();
         write_query_payload(1, b"lin", &mut payload);
-        producer.try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 4), &payload).unwrap();
+        producer
+            .try_write(
+                MSG_V2_QUERY,
+                FLAG_V2_LINEARIZABLE,
+                extra_client(9, 4),
+                &payload,
+            )
+            .unwrap();
         assert!(h.cons.drain_query_ring());
         let mut buf = Vec::new();
-        let rec = svc1_consumer.try_read(&mut buf).unwrap().expect("forwarded to svc_query.1");
+        let rec = svc1_consumer
+            .try_read(&mut buf)
+            .unwrap()
+            .expect("forwarded to svc_query.1");
         assert_eq!(rec.msg_type, MSG_V2_SVC_QUERY);
         assert_eq!(client_from_extra(rec.header_extra), (9, 3));
-        assert_eq!(&buf[..8], &0u64.to_le_bytes(), "snapshot reads skip the epoch check");
-        assert_eq!(&buf[8..], b"snap", "the id byte is stripped before forwarding");
+        assert_eq!(
+            &buf[..8],
+            &0u64.to_le_bytes(),
+            "snapshot reads skip the epoch check"
+        );
+        assert_eq!(
+            &buf[8..],
+            b"snap",
+            "the id byte is stripped before forwarding"
+        );
         assert!(svc1_consumer.try_read(&mut buf).unwrap().is_none());
         assert_eq!(h.cons.pending_reads.len(), 1);
         assert_eq!(h.cons.pending_reads[0].service_id, 1);
@@ -8804,15 +9781,22 @@ mod tests {
         use uc_protocol::v2::ipc::MSG_V2_QUERY;
         let mut h = harness();
         drive_to_serving_leader(&mut h);
-        let mut node_egress =
-            BroadcastRing::open(&h._dir.path().join("egress_node.broadcast")).unwrap().subscribe();
-        let (producer, _c) =
-            MpscRing::open(&h._dir.path().join("query.ring")).unwrap().into_split();
-        producer.try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 5), &[]).unwrap();
+        let mut node_egress = BroadcastRing::open(&h._dir.path().join("egress_node.broadcast"))
+            .unwrap()
+            .subscribe();
+        let (producer, _c) = MpscRing::open(&h._dir.path().join("query.ring"))
+            .unwrap()
+            .into_split();
+        producer
+            .try_write(MSG_V2_QUERY, FLAG_V2_LINEARIZABLE, extra_client(9, 5), &[])
+            .unwrap();
         assert!(h.cons.drain_query_ring());
         assert!(h.cons.pending_reads.is_empty());
         let mut buf = Vec::new();
-        assert!(node_egress.try_read(&mut buf).unwrap().is_none(), "no answer for a malformed record");
+        assert!(
+            node_egress.try_read(&mut buf).unwrap().is_none(),
+            "no answer for a malformed record"
+        );
     }
 
     /// M13a: the unsized hole (`RingError::Wedged`) is not recoverable — the
@@ -8824,7 +9808,8 @@ mod tests {
     #[should_panic(expected = "IngressRingWedged")]
     fn a_wedged_ingress_ring_fail_stops_the_consensus_agent() {
         let h = harness();
-        h.cons.ring_error_fail_stop(&RingError::Wedged { position: 4096 }, "ingress");
+        h.cons
+            .ring_error_fail_stop(&RingError::Wedged { position: 4096 }, "ingress");
     }
 
     /// Hand-write an UNSIZED claim into a ring file's header: advance
@@ -8835,7 +9820,11 @@ mod tests {
     /// which can reach the header directly from inside that module; from here
     /// the ring file is mapped and the header read off offset 0.
     fn wedge_ring_file(path: &std::path::Path) {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
         let m = unsafe { memmap2::MmapMut::map_mut(&file) }.unwrap();
         let region = Region::from_mmap(m);
         // SAFETY: every ring file begins with a `RingHeader` at offset 0, and
@@ -8853,7 +9842,9 @@ mod tests {
     fn a_wedged_ingress_ring_fail_stops_through_the_real_drain() {
         let mut h = harness();
         wedge_ring_file(&h._dir.path().join("ingress.ring"));
-        h.cons.ingress_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+        h.cons
+            .ingress_ring
+            .set_hole_timeout(std::time::Duration::from_millis(0));
         // First drain arms the hole timer (the ring still reads `Ok(None)`);
         // the second finds the timeout elapsed with an unknowable length and
         // returns `RingError::Wedged` into the drain's error arm.
@@ -8868,7 +9859,9 @@ mod tests {
     fn a_wedged_query_ring_fail_stops_through_the_real_drain() {
         let mut h = harness();
         wedge_ring_file(&h._dir.path().join("query.ring"));
-        h.cons.query_ring.set_hole_timeout(std::time::Duration::from_millis(0));
+        h.cons
+            .query_ring
+            .set_hole_timeout(std::time::Duration::from_millis(0));
         h.cons.drain_query_ring();
         h.cons.drain_query_ring();
     }
@@ -8881,7 +9874,8 @@ mod tests {
         let h = harness();
         h.cons.ring_error_fail_stop(&RingError::Full, "ingress");
         h.cons.ring_error_fail_stop(&RingError::Empty, "query");
-        h.cons.ring_error_fail_stop(&RingError::Overwritten, "ingress");
+        h.cons
+            .ring_error_fail_stop(&RingError::Overwritten, "ingress");
     }
 
     /// Final review, Important 1: plant an UNDECODABLE committed record at
@@ -8895,7 +9889,11 @@ mod tests {
     /// immutable until the consumer passes it, and the consumer cannot pass
     /// a slot it cannot decode.
     fn corrupt_ring_file(path: &std::path::Path, len: u32) {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
         let m = unsafe { memmap2::MmapMut::map_mut(&file) }.unwrap();
         let region = Region::from_mmap(m);
         // SAFETY: every ring file is `RingHeader` (256 B) then the slot
@@ -8905,7 +9903,9 @@ mod tests {
         // ring.
         unsafe {
             let header = &*(region.ptr_at(0) as *const RingHeader);
-            header.claim_position.store(len.max(8) as u64, Ordering::Release);
+            header
+                .claim_position
+                .store(len.max(8) as u64, Ordering::Release);
             uc_protocol::ring::common::store_commit_word(
                 region.ptr_at(uc_protocol::ring::common::RING_HEADER_LEN),
                 0,
@@ -8944,8 +9944,15 @@ mod tests {
     /// Scratch on REAL DISK under the cargo target tree (never `/tmp` —
     /// CLAUDE.md's scratch rule); removed with the returned `TempDir`.
     fn decline_scratch() -> tempfile::TempDir {
-        let base = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        tempfile::Builder::new().prefix("uc2-decline-").tempdir_in(base).unwrap()
+        let base = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        tempfile::Builder::new()
+            .prefix("uc2-decline-")
+            .tempdir_in(base)
+            .unwrap()
     }
 
     fn write_artifact(root: &std::path::Path, id: u8, pos: u64, bytes: &[u8]) {
@@ -8996,7 +10003,11 @@ mod tests {
             "a different reason names itself (a second log line)"
         );
         assert!(call().is_none());
-        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING, "and only once");
+        assert_eq!(
+            latch.load(Ordering::Relaxed),
+            SNAP_DECLINE_MISSING,
+            "and only once"
+        );
 
         // 4. A published position whose FILE is absent is the same "missing"
         //    reason — still no new line.
@@ -9013,10 +10024,20 @@ mod tests {
         write_artifact(&root, 0, 1024, b"fsm-0 artifact");
         write_artifact(&root, 1, 2048, b"fsm-1 artifact bytes");
         let set = call().expect("a complete set ships");
-        assert_eq!(set.services_declared, 0b11, "the set covers the declared mask exactly");
-        assert_eq!(set.config, vec![0xC0, 0xFF, 0xEE], "the CURRENT config rides along");
         assert_eq!(
-            set.artifacts.iter().map(|a| (a.service_id, a.snapshot_pos, a.len)).collect::<Vec<_>>(),
+            set.services_declared, 0b11,
+            "the set covers the declared mask exactly"
+        );
+        assert_eq!(
+            set.config,
+            vec![0xC0, 0xFF, 0xEE],
+            "the CURRENT config rides along"
+        );
+        assert_eq!(
+            set.artifacts
+                .iter()
+                .map(|a| (a.service_id, a.snapshot_pos, a.len))
+                .collect::<Vec<_>>(),
             vec![(0u8, 1024u64, 14u64), (1, 2048, 20)],
         );
         assert_eq!(

@@ -284,7 +284,11 @@ fn spawn_cluster_ring(n: usize, buffer_bytes: usize) -> Cluster {
             node: Some(node),
         });
     }
-    Cluster { _dir: dir, members, nodes }
+    Cluster {
+        _dir: dir,
+        members,
+        nodes,
+    }
 }
 
 impl Cluster {
@@ -315,12 +319,19 @@ fn await_until(secs: u64, msg: &str, mut f: impl FnMut() -> bool) {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].node.is_some() && nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
+        let serving: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].node.is_some() && nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain: nodes {serving:?} all serve"
+        );
         if serving.len() == 1 {
             let i = serving[0];
-            assert!(nodes[i].is_leader(), "serving node {i} is not flagged leader");
+            assert!(
+                nodes[i].is_leader(),
+                "serving node {i} is not flagged leader"
+            );
             return i;
         }
         assert!(Instant::now() < deadline, "no single leader elected");
@@ -333,8 +344,15 @@ fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
 fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = idxs.iter().copied().filter(|&i| nodes[i].can_serve()).collect();
-        assert!(serving.len() <= 1, "split-brain among {idxs:?}: {serving:?} serve");
+        let serving: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| nodes[i].can_serve())
+            .collect();
+        assert!(
+            serving.len() <= 1,
+            "split-brain among {idxs:?}: {serving:?} serve"
+        );
         if serving.len() == 1 {
             return serving[0];
         }
@@ -349,7 +367,11 @@ fn await_all(nodes: &[NodeH], target: u64, secs: u64, what: &str, sel: impl Fn(&
         if node.node.is_none() {
             continue;
         }
-        await_until(secs, &format!("{what}: node {i} stuck below {target}"), || sel(node) >= target);
+        await_until(
+            secs,
+            &format!("{what}: node {i} stuck below {target}"),
+            || sel(node) >= target,
+        );
     }
 }
 
@@ -364,7 +386,10 @@ fn await_quiesced(node: &NodeH, secs: u64) -> u64 {
         if node.durable() == a && node.commit() == a && node.append() == a {
             return a;
         }
-        assert!(Instant::now() < deadline, "leader never quiesced (append={a})");
+        assert!(
+            Instant::now() < deadline,
+            "leader never quiesced (append={a})"
+        );
         std::thread::yield_now();
     }
 }
@@ -398,7 +423,12 @@ fn assert_replay_equal(dirs: &[&PathBuf]) {
     let golden = replayed(dirs[0]);
     assert!(!golden.is_empty(), "golden journal empty");
     for d in &dirs[1..] {
-        assert_eq!(replayed(d), golden, "journal {d:?} diverged from {:?}", dirs[0]);
+        assert_eq!(
+            replayed(d),
+            golden,
+            "journal {d:?} diverged from {:?}",
+            dirs[0]
+        );
     }
 }
 
@@ -477,23 +507,33 @@ fn restarted_follower_below_ring_gap_is_served_from_journal_not_prefilled() {
     let gap_frames = 5 * RING_FRAMES;
     submit_n(&c.nodes[leader], gap_frames);
     let target2 = target1 + gap_frames * FRAME;
-    await_until(90, "leader commit past the gap", || c.nodes[leader].commit() >= target2);
+    await_until(90, "leader commit past the gap", || {
+        c.nodes[leader].commit() >= target2
+    });
     await_until(90, "quorum follower commit past the gap", || {
         c.nodes[other].commit() >= target2
     });
-    assert_eq!(c.nodes[leader].term(), term_before, "term bumped while a follower was down");
+    assert_eq!(
+        c.nodes[leader].term(),
+        term_before,
+        "term bumped while a follower was down"
+    );
 
     let replay_before = c.nodes[leader].replay_datagrams();
 
     // Restart the follower: it recovers durable state, adopts the current term,
     // and must catch up across the below-ring gap.
     c.nodes[follower].restart(&members);
-    await_until(60, "restarted follower did not adopt the current term", || {
-        c.nodes[follower].term() == term_before
-    });
-    await_until(90, "restarted follower did not catch up across the below-ring gap", || {
-        c.nodes[follower].durable() >= target2
-    });
+    await_until(
+        60,
+        "restarted follower did not adopt the current term",
+        || c.nodes[follower].term() == term_before,
+    );
+    await_until(
+        90,
+        "restarted follower did not catch up across the below-ring gap",
+        || c.nodes[follower].durable() >= target2,
+    );
 
     // The evidence: the leader served the gap from the JOURNAL, not the ring — so
     // no node ever prefilled its ring on restart.
@@ -503,7 +543,10 @@ fn restarted_follower_below_ring_gap_is_served_from_journal_not_prefilled() {
         "below-ring catch-up served no journal-replay datagrams \
          (replay_datagrams {replay_before} -> {replay_after}); the gap was not below the ring"
     );
-    assert!(!c.nodes[follower].is_leader(), "restarted follower unexpectedly became leader");
+    assert!(
+        !c.nodes[follower].is_leader(),
+        "restarted follower unexpectedly became leader"
+    );
 
     c.stop_all();
     let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
@@ -528,7 +571,9 @@ fn leader_kill_fails_over_subsecond_without_losing_committed_data() {
     let survivors: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
     // Committed floor observed by a survivor just before the kill — nothing at
     // or below this may be lost.
-    let committed_floor = c.nodes[survivors[0]].commit().min(c.nodes[survivors[1]].commit());
+    let committed_floor = c.nodes[survivors[0]]
+        .commit()
+        .min(c.nodes[survivors[1]].commit());
     assert!(committed_floor >= target1);
 
     // Kill and time the failover: kill → a survivor serves.
@@ -541,12 +586,21 @@ fn leader_kill_fails_over_subsecond_without_losing_committed_data() {
         failover.as_secs_f64() * 1e3,
         c.nodes[new_leader].term()
     );
-    assert!(failover < Duration::from_secs(1), "failover {failover:?} exceeded 1 s budget");
-    assert!(c.nodes[new_leader].term() > old_term, "new leader did not advance the term");
+    assert!(
+        failover < Duration::from_secs(1),
+        "failover {failover:?} exceeded 1 s budget"
+    );
+    assert!(
+        c.nodes[new_leader].term() > old_term,
+        "new leader did not advance the term"
+    );
 
     // Nothing committed was lost: every survivor still holds the pre-kill floor.
     for &i in &survivors {
-        assert!(c.nodes[i].commit() >= committed_floor, "survivor {i} lost committed data");
+        assert!(
+            c.nodes[i].commit() >= committed_floor,
+            "survivor {i} lost committed data"
+        );
     }
 
     // New traffic commits under the new leader; survivors converge and stay
@@ -555,8 +609,12 @@ fn leader_kill_fails_over_subsecond_without_losing_committed_data() {
     submit_n(&c.nodes[new_leader], 1000);
     let target2 = target1 + NEW_TERM + 1000 * FRAME;
     for &i in &survivors {
-        await_until(60, &format!("survivor {i} commit"), || c.nodes[i].commit() >= target2);
-        await_until(60, &format!("survivor {i} durable"), || c.nodes[i].durable() >= target2);
+        await_until(60, &format!("survivor {i} commit"), || {
+            c.nodes[i].commit() >= target2
+        });
+        await_until(60, &format!("survivor {i} durable"), || {
+            c.nodes[i].durable() >= target2
+        });
     }
 
     for &i in &survivors {
@@ -571,11 +629,7 @@ fn leader_kill_fails_over_subsecond_without_losing_committed_data() {
 /// the (still-believing) old leader, and let the majority elect + commit
 /// `fresh` new messages. Returns `(old_leader, new_leader, pre_commit,
 /// new_leader_base)`.
-fn drive_minority_partition(
-    c: &mut Cluster,
-    phantom: u64,
-    fresh: u64,
-) -> (usize, usize, u64, u64) {
+fn drive_minority_partition(c: &mut Cluster, phantom: u64, fresh: u64) -> (usize, usize, u64, u64) {
     let old = await_single_leader(&c.nodes, 30);
     let pre = NEW_TERM + 1000 * FRAME;
     submit_n(&c.nodes[old], 1000);
@@ -635,7 +689,10 @@ fn minority_partitioned_leader_cannot_commit_phantom() {
     }
     // Its phantom appends are real bytes but uncommitted: append ran ahead of a
     // frozen commit.
-    assert!(c.nodes[old].append() > pre, "old leader never took the phantom appends");
+    assert!(
+        c.nodes[old].append() > pre,
+        "old leader never took the phantom appends"
+    );
     assert_eq!(c.nodes[old].commit(), pre, "old leader commit moved");
 
     // The majority committed strictly beyond the old leader's frozen commit — no
@@ -665,7 +722,10 @@ fn heal_truncates_divergent_tail_and_reconverges() {
 
     // Ceiling of what the old leader's phantom appends could have made durable.
     let phantom_ceiling = pre + phantom * FRAME;
-    assert!(c.nodes[old].truncations() == 0, "premature truncation before heal");
+    assert!(
+        c.nodes[old].truncations() == 0,
+        "premature truncation before heal"
+    );
 
     // Heal every link — into a FULLY IDLE cluster (no submissions).
     for node in &c.nodes {
@@ -683,10 +743,15 @@ fn heal_truncates_divergent_tail_and_reconverges() {
     // real node, the SAME property `uc_sim`'s
     // `idle_cluster_reconciles_divergent_node_via_gossip_floor` pins at the model
     // layer.
-    await_until(30, "ex-leader did not reconcile on the idle gossip floor alone", || {
-        c.nodes[old].truncations() >= 1
-    });
-    assert!(c.nodes[old].term() >= c.nodes[new].term(), "old leader did not adopt the new term");
+    await_until(
+        30,
+        "ex-leader did not reconcile on the idle gossip floor alone",
+        || c.nodes[old].truncations() >= 1,
+    );
+    assert!(
+        c.nodes[old].term() >= c.nodes[new].term(),
+        "old leader did not adopt the new term"
+    );
 
     // DATA-PLANE catch-up — with ZERO new submissions (the review's core ask;
     // previously blocked on a pre-existing `uc_net` wedge, now fixed). After the
@@ -705,7 +770,13 @@ fn heal_truncates_divergent_tail_and_reconverges() {
     // wait for every node — including the reconciled ex-leader — to reach that
     // exact position, the precondition for a byte-equal replay.
     let final_target = await_quiesced(&c.nodes[new], 60);
-    await_all(&c.nodes, final_target, 60, "reconverge durable", NodeH::durable);
+    await_all(
+        &c.nodes,
+        final_target,
+        60,
+        "reconverge durable",
+        NodeH::durable,
+    );
     // The ex-leader carries the majority's term-(N+1) tail, not its truncated
     // phantom tail: its durable climbed strictly PAST the phantom ceiling.
     assert!(
@@ -766,11 +837,17 @@ fn contested_first_election_first_block_truncation_recovers() {
         // larger means the isolated node's term-1 NewTerm replicated + committed
         // before we cut the link — not a first-block cut. Rebuild.
         let new = await_serving_among(&c.nodes, &others, 30);
-        assert!(c.nodes[new].term() > old_term, "new leader did not advance the term");
+        assert!(
+            c.nodes[new].term() > old_term,
+            "new leader did not advance the term"
+        );
         if c.nodes[new].commit() != NEW_TERM {
             // Lost the race this time — the new term opened above base 0.
             c.stop_all();
-            assert!(attempt + 1 < MAX_ATTEMPTS, "no clean base-0 construction in {MAX_ATTEMPTS} tries");
+            assert!(
+                attempt + 1 < MAX_ATTEMPTS,
+                "no clean base-0 construction in {MAX_ATTEMPTS} tries"
+            );
             continue;
         }
         // The term whose NewTerm now sits COMMITTED at base 0. It survives every
@@ -789,7 +866,11 @@ fn contested_first_election_first_block_truncation_recovers() {
                 c.nodes[o].commit() >= majority_target
             });
         }
-        assert_eq!(c.nodes[leader].truncations(), 0, "premature truncation before heal");
+        assert_eq!(
+            c.nodes[leader].truncations(),
+            0,
+            "premature truncation before heal"
+        );
 
         // Heal. The isolated ex-leader adopts the new term and truncates its
         // divergent first block (base 0) to 0 — the first-block path — driven by
@@ -798,9 +879,11 @@ fn contested_first_election_first_block_truncation_recovers() {
         for node in &c.nodes {
             node.heal();
         }
-        await_until(30, "ex-leader did not truncate its divergent first block", || {
-            c.nodes[leader].truncations() >= 1
-        });
+        await_until(
+            30,
+            "ex-leader did not truncate its divergent first block",
+            || c.nodes[leader].truncations() >= 1,
+        );
         // Await, don't assert: the truncation completing and the SM adopting the
         // new term are ordered by the truncating latch + the next gossip delivery
         // (up to the 100 ms idle floor) — a loaded CI runner can observe the
@@ -812,8 +895,20 @@ fn contested_first_election_first_block_truncation_recovers() {
         // Converge (the test completing without a panic IS the core assertion —
         // pre-fix the consensus agent panicked on the first-block cut).
         let final_target = await_quiesced(&c.nodes[new], 30);
-        await_all(&c.nodes, final_target, 15, "reconverge commit", NodeH::commit);
-        await_all(&c.nodes, final_target, 15, "reconverge durable", NodeH::durable);
+        await_all(
+            &c.nodes,
+            final_target,
+            15,
+            "reconverge commit",
+            NodeH::commit,
+        );
+        await_all(
+            &c.nodes,
+            final_target,
+            15,
+            "reconverge durable",
+            NodeH::durable,
+        );
 
         c.stop_all();
         let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
@@ -824,12 +919,18 @@ fn contested_first_election_first_block_truncation_recovers() {
         // its term-1 first block was cut to 0 (the first-block path), not shrunk
         // to a non-zero boundary.
         let golden = replayed(dirs[0]);
-        assert_eq!(golden[0].position, 0, "converged stream must start at base 0");
+        assert_eq!(
+            golden[0].position, 0,
+            "converged stream must start at base 0"
+        );
         assert_eq!(
             golden[0].header.leadership_term_id, base0_term,
             "first frame must be the base-0 term's NewTerm — the divergent term-1 first block was fully truncated"
         );
-        assert!(base0_term > old_term, "base-0 term must exceed the isolated node's term");
+        assert!(
+            base0_term > old_term,
+            "base-0 term must exceed the isolated node's term"
+        );
         return; // success
     }
 }
@@ -858,17 +959,27 @@ fn restarted_follower_recovers_state_and_rejoins() {
     submit_n(&c.nodes[leader], 500);
     let target2 = target1 + 500 * FRAME;
     let other = (0..3).find(|&i| i != leader && i != follower).unwrap();
-    await_until(60, "leader commit after follower down", || c.nodes[leader].commit() >= target2);
-    await_until(60, "quorum follower commit", || c.nodes[other].commit() >= target2);
+    await_until(60, "leader commit after follower down", || {
+        c.nodes[leader].commit() >= target2
+    });
+    await_until(60, "quorum follower commit", || {
+        c.nodes[other].commit() >= target2
+    });
     // No election happened while it was down: term is unchanged.
-    assert_eq!(c.nodes[leader].term(), term_before, "term bumped while a follower was down");
+    assert_eq!(
+        c.nodes[leader].term(),
+        term_before,
+        "term bumped while a follower was down"
+    );
 
     // Restart from the same dirs on the same port; it recovers durable state and
     // rejoins in the current term.
     c.nodes[follower].restart(&members);
-    await_until(60, "restarted follower did not adopt the current term", || {
-        c.nodes[follower].term() == term_before
-    });
+    await_until(
+        60,
+        "restarted follower did not adopt the current term",
+        || c.nodes[follower].term() == term_before,
+    );
     // Catch up to the frontier committed while it was gone — the leader's replay
     // path may serve it — with NO term bump the whole time.
     await_until(60, "restarted follower did not catch up", || {
@@ -879,7 +990,10 @@ fn restarted_follower_recovers_state_and_rejoins() {
         term_before,
         "restarted follower forced a spurious election"
     );
-    assert!(!c.nodes[follower].is_leader(), "restarted follower unexpectedly became leader");
+    assert!(
+        !c.nodes[follower].is_leader(),
+        "restarted follower unexpectedly became leader"
+    );
 
     c.stop_all();
     let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();

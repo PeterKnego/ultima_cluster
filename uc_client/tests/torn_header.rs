@@ -21,7 +21,13 @@ use uc_protocol::v2::cnc::CNC_OFF_MAGIC;
 const MIB: u64 = 1 << 20;
 
 fn meta(app_id: &str, instance_id: u128) -> CncMeta {
-    CncMeta { node_id: 0, instance_id, app_id: app_id.into(), buffer_bytes: MIB, max_payload: 256 }
+    CncMeta {
+        node_id: 0,
+        instance_id,
+        app_id: app_id.into(),
+        buffer_bytes: MIB,
+        max_payload: 256,
+    }
 }
 
 fn make_instance(dir: &Path, app_id: &str, instance_id: u128) {
@@ -52,8 +58,10 @@ fn timeout_path_does_not_panic_on_a_torn_cnc_header() {
     // MAP_SHARED mmap observes the write (shared page cache, same inode).
     {
         use std::io::{Seek, SeekFrom, Write};
-        let mut f =
-            std::fs::OpenOptions::new().write(true).open(dir.path().join("cnc2.dat")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("cnc2.dat"))
+            .unwrap();
         f.seek(SeekFrom::Start(CNC_OFF_MAGIC as u64)).unwrap();
         f.write_all(&[0u8; 8]).unwrap();
         f.flush().unwrap();
