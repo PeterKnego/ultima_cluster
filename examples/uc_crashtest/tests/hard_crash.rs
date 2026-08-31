@@ -1171,11 +1171,47 @@ fn await_config_converged_one_of(dirs: &[PathBuf], v_lo: u64, v_hi: u64, secs: u
                 }
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "config never converged to a single value in {{{v_lo}, {v_hi}}} within {secs}s (last: {:?})",
-            read_all(dirs)
-        );
+        if Instant::now() >= deadline {
+            // Diagnostic dump before panicking (2026-08-20 flake hunt): two
+            // samples 500ms apart per dir. A straggler whose HEARTBEAT is
+            // also frozen is a starved/dead process; one whose heartbeat
+            // moves while cfgv stays behind is live but not adopting — very
+            // different bugs, indistinguishable in the old message.
+            let sample = |dirs: &[PathBuf]| -> Vec<Option<(u64, u64, u64, u64)>> {
+                dirs.iter()
+                    .map(|d| {
+                        open_cnc(d).map(|c| {
+                            (
+                                c.config_version(),
+                                c.counters().commit.load_acquire(),
+                                c.counters().durable.load_acquire(),
+                                c.status().node_heartbeat_ns.load_acquire(),
+                            )
+                        })
+                    })
+                    .collect()
+            };
+            let s0 = sample(dirs);
+            std::thread::sleep(Duration::from_millis(500));
+            let s1 = sample(dirs);
+            for (i, (a, b)) in s0.iter().zip(&s1).enumerate() {
+                let hb = match (a, b) {
+                    (Some(x), Some(y)) => {
+                        if y.3 > x.3 { "heartbeat MOVING" } else { "heartbeat FROZEN" }
+                    }
+                    _ => "cnc unreadable",
+                };
+                eprintln!(
+                    "[convergence-timeout] dir {i}: t0={a:?} t0+500ms={b:?} \
+                     (cfgv, commit, durable, heartbeat_ns) -> {hb}"
+                );
+            }
+            panic!(
+                "config never converged to a single value in {{{v_lo}, {v_hi}}} within {secs}s \
+                 (last: {:?})",
+                read_all(dirs)
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1474,6 +1510,7 @@ fn sigkill_mid_config_window() {
 
     for run in 0..RUNS {
         let li = await_single_leader_multi(&dirs, 20);
+        eprintln!("[sigkill_mid_config_window] run={run} killing leader idx={li}");
 
         let spare_id = 100 + run; // fresh-forever: never reused across runs
         let spare_addr = free_addr();
@@ -1548,8 +1585,16 @@ fn sigkill_mid_config_window() {
         // Cluster-wide convergence: EITHER the pre-race version (the add
         // never committed) OR pre-race+1 (it did) — but the identical value
         // on every node, never a straddle.
+        // 90s, not 30: the budget bounds LIVENESS on a shared 4-vCPU CI
+        // runner, where scheduler starvation can stall one whole node
+        // process for tens of seconds (proven by SIGSTOP probe, 2026-08-20:
+        // a 35s stall of one follower reproduces the 2026-08-14 nightly's
+        // [x, x, x-1] straggler timeout byte-for-byte, FROZEN heartbeat in
+        // the dump — no product bug required). The PROPERTY here is
+        // agreement (never a straddle), which the loop checks regardless;
+        // the budget only needs to outlast a worst-case stall.
         let final_version =
-            await_config_converged_one_of(&dirs, committed_version, target_version, 30);
+            await_config_converged_one_of(&dirs, committed_version, target_version, 90);
         assert!(
             final_version == committed_version || final_version == target_version,
             "run {run}: converged to an unexpected version {final_version} \
