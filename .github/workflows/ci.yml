@@ -12,16 +12,20 @@ name: ci
 #     suites (smoke, failover, learner, purge_safety, query_barrier) DO run
 #     here — they're the election/truncation/reconstruction regression net,
 #     and (M12b) admin_auth / daemon_refusals, the admin authn+audit net.
+#   * fmt — `cargo fmt --all --check`. The one-shot reformat that this gate
+#     was deferred behind LANDED 2026-08-31 (3 393 hunks, 189 files); the
+#     deferral's re-run condition — both long-lived worktrees merged — was
+#     met, so the drift is now zero and CI keeps it there. It runs FIRST and
+#     is seconds long: a formatting-only failure should not cost a full
+#     clippy+test cycle to discover.
 #   * msrv — `cargo clippy -D warnings` (check is implicit in clippy) on the
 #     MSRV floor toolchain read from Cargo.toml's `rust-version`, so the
 #     stated floor can't silently drift from what actually compiles/lints
 #     clean. See that field's comment.
 # Deliberately NOT run here:
-#   * cargo fmt --check — the codebase predates a fmt pass (2 731 hunks of
-#     drift as of 2026-08-23) and two long-lived worktrees are open, so the
-#     one-shot reformat is DEFERRED with its re-run condition written down:
-#     see docs/benchmarks/uc2-m12-gate-2026-08-22.md row 13. clippy is the
-#     enforced style gate, per CLAUDE.md.
+#   * fmt over `fuzz/` — that crate is outside the workspace (its own
+#     `[workspace]` + lockfile, nightly toolchain), so `--all` never reaches
+#     it and neither does this job.
 #   * lin_v2 / lin_partition_v2 / sim-heavy / loom / hard-crash — nightly.yml.
 
 on:
@@ -44,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      - name: Formatting (cargo fmt --all --check)
+        run: cargo fmt --all -- --check
       - name: Clippy (workspace, all targets)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (uc_service + ultima_db adapter)

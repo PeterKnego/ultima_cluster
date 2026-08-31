@@ -120,10 +120,12 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility + the MPSC ring's
   per-record commit), 15 fuzz targets, Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
-- **`cargo fmt` is DEFERRED** (a one-shot reformat measures ~2 731 hunks)
-  until the long-lived worktree (`fix/remaining-flakes`) lands; then run
-  `cargo fmt --all` as a single mechanical commit and add `--check` to
-  `ci.yml`.
+- **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
+  is the first step of `ci.yml`'s `test` job, so workspace drift is zero and
+  stays zero. The long deferral (3 393 hunks by the end) was discharged as one
+  mechanical commit once `fix/remaining-flakes` landed — history before that
+  commit is unformatted, so `git blame` across it needs `-w`. `fuzz/` is
+  outside the workspace and `--all` does not reach it.
 
 Canonical documents, in order:
 
