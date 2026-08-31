@@ -1,8 +1,10 @@
 # State machine replication, explained
 
-*The one idea `ultima_cluster` is built on. No prior knowledge of Raft,
-Paxos or consensus assumed. If you already know SMR, the part worth reading
-is [What UC adds](#what-ultima_cluster-adds-to-the-picture).*
+*The one idea `ultima_cluster` (UC) is built on. No prior knowledge of Raft,
+Paxos or consensus assumed.*
+
+Already know SMR? The part worth reading is
+[What UC adds](#what-uc-adds-to-the-picture).
 
 ## The idea in one paragraph
 
@@ -117,7 +119,7 @@ the consensus nodes and the replicas are drawn as two rows to separate the two
 *jobs*. Whether they are separate processes is an implementation choice —
 in UC they are (see below), in many systems they are not.
 
-## What ultima_cluster adds to the picture
+## What UC adds to the picture
 
 UC is an SMR application server: you write the deterministic program, it
 provides everything else in the diagram. Three ways the real thing differs

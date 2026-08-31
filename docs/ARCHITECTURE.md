@@ -20,7 +20,7 @@ That is the same job Raft does. What differs is the shape.
 
 ## Background: state machine replication
 
-*Skip to [The one idea](#the-one-idea) if you already know SMR.*
+Already know SMR? Skip to [The one idea](#the-one-idea).
 
 The model: instead of replicating *data*, replicate *the sequence of commands*.
 Every replica starts in the same state and applies the same commands in the
