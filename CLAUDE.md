@@ -117,8 +117,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   + root `SECURITY.md` (supported = latest minor; GitHub private
   vulnerability reporting). The whole proof surface is mapped in
   `docs/VERIFICATION.md` — sim, lincheck/crashtest capstones, Elle, Lean
-  proofs + conformance, loom (log-buffer frame visibility + the MPSC ring's
-  per-record commit), 15 fuzz targets, Miri (pure decoders + `uc_remote`'s
+  proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
+  per-record commit, and the Broadcast ring's seqlock read barrier — the last
+  found and fixed a real weak-memory defect when it was written, 2026-08-31),
+  15 fuzz targets, Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and
@@ -175,7 +177,7 @@ scripts/elle_check.sh                            # elle consistency tier: 5 list
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 (cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
 cargo run -p uc_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
-RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc  # MPSC ring loom model (log buffer: -p uc_log --test loom_frame)
+RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc  # MPSC ring loom model (also --test loom_broadcast; log buffer: -p uc_log --test loom_frame)
 python3 bench-infra/scripts/m13_hop_bench.py --selftest  # M13 gate row arithmetic, no fleet/ssh
 ```
 

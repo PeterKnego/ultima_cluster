@@ -85,6 +85,32 @@ impl BroadcastProducer {
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
+
+        // Publish-before-body barrier. This is what makes the CONSUMER's
+        // seqlock re-check sound, and it is not obvious, so: a consumer
+        // decides its copy was safe by re-reading `publish_position` and
+        // finding the producer less than a full capacity ahead of the slot it
+        // read. That argument needs "if lap N+1's bytes are visible, then
+        // `publish_position >= N+1` is visible too". The `Release` store at
+        // the bottom of this function does NOT give that — release orders
+        // PRIOR accesses against the store, and says nothing about accesses
+        // that FOLLOW it, so the next call's `write_record_at` may be observed
+        // ahead of it. A consumer could then copy half of lap N and half of
+        // lap N+1 while still reading a stale `publish_position`, and the
+        // re-check would pass a torn record straight into the crc — which the
+        // `try_read` comment below claims cannot happen.
+        //
+        // Found by `uc_protocol/tests/loom_broadcast.rs`, which fails without
+        // this fence and passes with it. Only Broadcast needs it: SPSC and
+        // MPSC back-pressure on `consumer_position`, so their producers cannot
+        // lap a reader at all.
+        //
+        // Cost: nothing on x86_64 (TSO already forbids the store-store
+        // reordering; the fence emits no instruction, only `#MEMBARRIER`) and
+        // one `dmb ish` on aarch64 — i.e. it is paid exactly where it is
+        // needed. Verified by `rustc --emit asm` for both targets.
+        std::sync::atomic::fence(Ordering::Release);
+
         // Single producer: `publish_position` is our sole cursor. `claim_position`
         // is unused in Broadcast (consumers track their own in-memory `head` and
         // only read `publish_position`), so we never touch it on the hot path.

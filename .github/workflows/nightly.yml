@@ -11,7 +11,8 @@ name: nightly
 #                  lin_partition_v2's minority_partition_and_heal_two_fsm),
 #                  picked up by `cargo test --workspace` with no matrix change.
 #   * sim-heavy  — uc_sim's 1000-seed election/truncation fuzz tier.
-#   * loom       — the uc_log frame-visibility memory model AND the
+#   * loom       — the uc_log frame-visibility memory model, the broadcast
+#                  ring's seqlock read barrier, AND the
 #                  uc_protocol MPSC ring commit protocol (M13a: claim/commit
 #                  CAS, skip-marker race, head-of-line at a hole; exhaustive
 #                  interleaving exploration; needs `--cfg loom` + release).
@@ -100,6 +101,10 @@ jobs:
           RUSTFLAGS: --cfg loom
       - name: MPSC ring commit-protocol loom model
         run: cargo test -p uc_protocol --test loom_mpsc --release
+        env:
+          RUSTFLAGS: --cfg loom
+      - name: Broadcast ring seqlock loom model
+        run: cargo test -p uc_protocol --test loom_broadcast --release
         env:
           RUSTFLAGS: --cfg loom
 
