@@ -35,6 +35,10 @@ preconditions worth reading before you start.
 - [Upgrade a cluster](upgrade-a-cluster.md) — a scripted flag-day binary
   upgrade with a measured downtime number; a different flag day from
   encryption's, driven by wire protocol 0.5.0's flag-day posture.
+- [Record a release](record-a-release.md) — pinning what is actually running:
+  the build's digest, the config file's SHA-256 as the node itself reports it,
+  and the environment overrides in effect. Also why a ledger cannot make
+  rollback cheaper here.
 
 ## Surviving failures
 

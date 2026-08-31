@@ -1444,6 +1444,7 @@ dependencies = [
  "memmap2",
  "rand",
  "serde",
+ "sha2",
  "signal-hook",
  "tempfile",
  "thiserror",

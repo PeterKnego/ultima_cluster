@@ -291,13 +291,48 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
     // `parse_str_with_env` has no path to name, so it stamps
     // [`IN_MEMORY_CONFIG`]; re-stamp the real one here so a refusal still
     // tells the operator which file to edit.
-    parse_str_with_env(&text, |k| std::env::var(k).ok()).map_err(|e| match e {
+    let loaded = parse_str_with_env(&text, |k| std::env::var(k).ok()).map_err(|e| match e {
         ConfigError::Parse { source, .. } => ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         },
         other => other,
-    })
+    })?;
+
+    // Twelve-factor #5 asks for a "release" — a build PLUS the deploy's
+    // config — to be identifiable. UC has no deploy system of its own, so it
+    // reports the half it can see and leaves the ledger to the operator: this
+    // record is the config half, `uc2_build_info{version}` is the build half,
+    // and the `config_env_override` records above name every value that did
+    // NOT come from this file. Together they pin exactly what is running.
+    //
+    // The digest is of the FILE AS READ, before overrides. That is the
+    // artifact under version control, and hashing a post-override "effective
+    // config" would need a canonical serialisation this crate does not have
+    // and could not keep stable across releases.
+    let digest = config_sha256(&text);
+    let path_s = path.display().to_string();
+    crate::obs_event!(
+        Info,
+        "config_loaded",
+        path = path_s.as_str(),
+        sha256 = digest.as_str()
+    );
+    Ok(loaded)
+}
+
+/// Lowercase hex SHA-256 of a config file's bytes — the config half of the
+/// `(build, config)` pair twelve-factor calls a release. `sha2` is already a
+/// workspace dependency (`uc_crypto`), so this adds no crate to the lockfile.
+pub fn config_sha256(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let out = Sha256::digest(text.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// The path [`ConfigError::Parse`] carries when the text did not come from a
@@ -773,6 +808,30 @@ addr = "10.0.0.1:9100"
                 .find(|(var, _)| *var == k)
                 .map(|(_, v)| (*v).to_string())
         }
+    }
+
+    #[test]
+    fn the_config_digest_is_sha256_of_the_file_as_read() {
+        // Pinned against a known vector rather than against itself: an
+        // accidental change of algorithm or encoding must fail here, not
+        // quietly renumber every operator's release ledger.
+        assert_eq!(
+            config_sha256("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "config_sha256 must be plain SHA-256 over the file's bytes"
+        );
+        assert_eq!(
+            config_sha256(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // It digests the FILE, so two deploys of the same file agree even
+        // when their environments differ — which is what makes it usable as
+        // the config half of a release id.
+        assert_eq!(config_sha256(MINIMAL), config_sha256(MINIMAL));
+        assert_ne!(
+            config_sha256(MINIMAL),
+            config_sha256(MINIMAL_NO_CRYPTO_ADMIN)
+        );
     }
 
     #[test]

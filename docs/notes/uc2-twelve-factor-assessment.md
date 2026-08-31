@@ -78,9 +78,19 @@ Three changes are cheap and would each close a real deviation:
    `uc_obs` crate, which is what let `uc2-gateway` emit the same format
    without depending on `uc_node`. Regression-tested by
    `the_daemon_writes_nothing_to_stdout_and_everything_to_stderr`.
-3. **A release ledger (#5), if wanted.** A "release" in the page's sense is
-   an image digest plus a config-file hash, recorded append-only. It is
-   bookkeeping, not code; the rollback constraint underneath is structural.
+3. ~~**A release ledger (#5), if wanted.**~~ **ADDRESSED 2026-08-31, with
+   its limit stated.** The ledger itself stays the operator's — UC has no
+   deploy system, so it cannot own one. What was missing and is now shipped
+   is the half UC *can* guarantee: a node digests its config file at startup
+   and emits `config_loaded` {path, sha256}, plain SHA-256 over the file's
+   bytes so it checks against `sha256sum` on the copy in version control with
+   no UC tooling. With `uc2_build_info{version}` and the
+   `config_env_override` records, the `(build, config)` pair the page defines
+   is fully identifiable from a running process.
+   [Record a release](../how-to/record-a-release.md) is the recipe.
+   **The rollback constraint underneath does NOT move and no ledger can move
+   it:** the wire and cnc layout are flag days, so going back is still
+   stopping every node and starting the previous binaries together.
 
 Two things should not move:
 
