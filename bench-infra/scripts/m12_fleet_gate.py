@@ -552,12 +552,23 @@ def run_direct_arm(node_hosts, leader, a, envelope, payload=None, secs=None, cpu
     payload = a.payload if payload is None else payload
     secs = a.secs if secs is None else secs
     h = node_hosts[leader]
-    rc, out = run_foreground(h, [
+    args = [
         "client-direct", "--instance-dir", h.dir, "--app-id", APP,
         "--secs", str(secs), "--payload", str(payload),
         "--inflight", str(a.inflight), "--envelope", envelope,
-    ], timeout=secs + CLIENT_SLACK_SECS, cpus=cpus)
-    echo("direct", out)
+    ]
+    # Read off the args namespace rather than the signature, so every existing
+    # caller (m12/m14 gates, the A/B, the core sweep) is untouched and only a
+    # driver that defines `--timeline` turns it on. Emits one
+    # `TL {"sec":..,"unix_ms":..,"responses":..}` line per elapsed second.
+    if getattr(a, "timeline", False):
+        args.append("--timeline")
+    rc, out = run_foreground(h, args, timeout=secs + CLIENT_SLACK_SECS, cpus=cpus)
+    # `echo`'s 40-line tail is fine for the report block, but `--timeline`
+    # emits one TL line per bucket of a fixed-size array whose UNUSED TAIL is
+    # printed too — so a 12 s run's 12 data rows fall off the front and only
+    # zero-filled rows survive. Measured 2026-08-31: rows 32..51, all zero.
+    echo("direct", out, lines=400 if getattr(a, "timeline", False) else 40)
     d = parse_result(out, "direct")
     if d is None:
         print(f"INFO direct arm produced no RESULT line (rc={rc})", flush=True)

@@ -59,9 +59,14 @@ one cause among others. `--pin` stays opt-in
 un-re-measured. A follow-on core-count sweep (2026-08-31,
 `docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md`) answers "how many
 cores does a node need" — **4, one per polling agent, flat past 5** on the
-DIRECT shmem path — and found the harness runs in **two stable regimes** 5x
-apart in p50, independent of core count. Split fleet arms by regime before
-averaging any spread; a mixed sample inflates it. First
+DIRECT shmem path — (`docs/benchmarks/uc2-regime-probe-2026-08-31.md`). A "two stable regimes"
+reading of that sweep was **refuted the same day** by a 16-arm per-second
+timeline probe: it is one broad distribution with a long low tail, no arm
+transitions, and **pinning tightens p50 spread 31x** rather than removing a
+second state. Two standing lessons: fix a spread bar's rep count from observed
+arm-to-arm variance (n=4 cannot tell width from tail), and no fleet driver
+uses `m12_gate`'s `--warmup-secs`/`--measure-secs` steady window, so every
+published rate includes a 3-5 % warmup climb. First
 candidate for the next minor: the twelve-factor hygiene items postponed
 out of M14c2 — env-var overrides for deploy-varying config keys (#3) and
 one log stream (#11); the release-ledger line (#5) is process, not code

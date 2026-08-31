@@ -5,6 +5,21 @@
 12 s each, **zero lost responses**. Driver:
 `bench-infra/scripts/m14_core_sweep.py`.*
 
+> ## ⚠ SUPERSEDED IN PART, same day
+>
+> **The "two stable regimes" claim below is WRONG.** A 16-arm follow-up with
+> per-second timelines
+> ([`uc2-regime-probe-2026-08-31.md`](uc2-regime-probe-2026-08-31.md)) shows
+> the gap fills in with more samples: the largest p50 gap drops 0.872 ms →
+> 0.461 ms and unpinned alone spans both bands. It was **one broad
+> distribution with a long low tail**, split by a threshold chosen after
+> seeing the data. No arm ever transitions between levels.
+>
+> **The core-count answer below is unaffected** — it was computed from
+> deep-band arms only, which are the high, tight part of the one distribution.
+> What changes is the interpretation: pinning removes a **tail**, not a
+> second state.
+
 **Answer: 4 physical cores** — one per polling agent — with no measurable gain
 past 5. **But the more important result is accidental:** the harness has two
 stable operating regimes that differ 5× in latency, and which one an arm lands

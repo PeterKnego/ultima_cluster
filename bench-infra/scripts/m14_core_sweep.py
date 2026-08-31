@@ -107,6 +107,10 @@ def main():
     ap.add_argument("--payload", type=int, default=64)
     ap.add_argument("--inflight", type=int, default=4096)
     ap.add_argument("--admission-kib", type=int, default=256)
+    ap.add_argument("--timeline", action="store_true",
+                    help="ask client-direct for one TL line per elapsed second; the "
+                         "per-second series is what shows a REGIME FLIP happening "
+                         "rather than leaving it inferred from percentiles")
     ap.add_argument("--unpinned", action="store_true", default=True,
                     help="also run an unpinned control arm (default on)")
     a = ap.parse_args()

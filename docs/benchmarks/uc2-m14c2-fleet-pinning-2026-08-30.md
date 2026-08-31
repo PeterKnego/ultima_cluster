@@ -106,14 +106,20 @@ at 1 123 630 against 1 900 439 for its own rep2 — a 41 % collapse of one
 generation, p50 3.586 ms vs 2.064 ms, with zero lost responses. That is the
 effect `uc2-m14d` described, seen again on fresh hardware.
 
-> **Follow-up, 2026-08-31:** the residual variance below now has a better
-> candidate than "undiagnosed". A core-count sweep on `c8id.4xlarge` found the
-> harness has **two stable operating regimes** differing 5x in p50 latency,
-> independent of core count, with a ~25 % rate gap — and pinning went to the
-> slow regime 4/18 vs unpinned 3/3. That would explain how pinning cut the
-> spread without addressing the cause. See
-> [`uc2-node-core-count-sweep-2026-08-31.md`](uc2-node-core-count-sweep-2026-08-31.md).
-> The unpinned n is 3; this is a lead, not a conclusion.
+> **Follow-up, 2026-08-31 (corrected same day):** a first look suggested the
+> residual variance was **two stable regimes**; a 16-arm probe with per-second
+> timelines refuted that — the gap fills in with more samples and no arm ever
+> transitions between levels
+> ([`uc2-regime-probe-2026-08-31.md`](uc2-regime-probe-2026-08-31.md)).
+>
+> What the residual spread actually is: **a long low tail in the UNPINNED
+> distribution.** Measured over 8 arms each, pinning tightens p50 spread
+> **31x** (0.030 ms vs 0.929 ms) and rate spread from 22 % to 5.6 %. So
+> pinning's value is variance reduction — which is what this document was
+> trying to measure, with a rule (spread < 5 %) applied at **n=4, too few to
+> tell a distribution's width from its tail**. The −9.4 % throughput cost
+> below stands. A re-run of this adoption decision should fix its rep count
+> from observed arm-to-arm variance before adjudicating.
 
 **2. Placement is *a* cause, not *the* cause.** Pooled spread falls
 47.7 % → 14.3 % with pinning, a 3.3× reduction, and the catastrophic
