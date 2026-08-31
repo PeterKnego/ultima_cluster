@@ -10,8 +10,8 @@ load — see [Change cluster membership](change-cluster-membership.md).
 ## Confirm your state machine can snapshot
 
 Your `StateMachine` must also implement `SnapshotStateMachine`, giving it
-`build_snapshot` and `install_snapshot`. The `ultima_db` `StoreStateMachine`
-adapter does.
+`build_snapshot` and `install_snapshot`. `uc_lincheck`'s `RegisterSm` and
+`ListAppendSm` are small worked examples of the pair.
 
 Without it, `service_snapshot_pos` never advances, there is no floor, and
 nothing can be purged. If you turn purging on anyway, nothing breaks — nothing

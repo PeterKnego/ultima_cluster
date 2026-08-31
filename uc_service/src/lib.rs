@@ -46,11 +46,6 @@ mod session;
 pub mod snapshots;
 mod traits;
 
-/// Reference [`StateMachine`] + [`SnapshotStateMachine`] adapter backed by an
-/// [`ultima_db::Store`] (Cargo feature `ultima_db`, off by default).
-#[cfg(feature = "ultima_db")]
-pub mod ultima_db;
-
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;

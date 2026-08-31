@@ -545,9 +545,8 @@ because it happened: see the harness finding below.
 - **The receiver's stateful dispatch.** Each target is one decoder on one input.
   Sequences of datagrams that drive the receiver's state machine across terms,
   epochs and sessions are the simulation's and the capstones' job (§2, §3).
-- **`bincode` itself, and the `ultima-db` `snapshot_stream` adapter.** Both are
-  external crates reached through these seams; they are dependency-posture
-  questions (`deny.toml`, SBOM), not targets here.
+- **`bincode` itself.** An external crate reached through these seams; it is a
+  dependency-posture question (`deny.toml`, SBOM), not a target here.
 
 ### Miri — UB detection over the pure decoders
 
@@ -726,7 +725,7 @@ The most important section, and the one most projects omit.
   new crash from the committed corpus inside the budget. It does not mean the
   decoders are total for all inputs, and it says nothing about stateful
   sequences across the receiver's dispatch or about the external crates
-  (`bincode`, the `ultima-db` snapshot adapter) reached through those seams.
+  (`bincode`) reached through those seams.
 - **The published gate numbers are fleet measurements**, on the hardware and
   configuration each record names. They are reproducible, not universal.
 - **Multi-service (M14): the two-FSM proof gap `2.8.0` disclosed here is

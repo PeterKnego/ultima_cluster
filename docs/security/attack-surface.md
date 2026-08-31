@@ -66,10 +66,9 @@ would need. The default in `packaging/node.example.toml` is 512.
 
 ## 4. What this page deliberately does not list
 
-- **`bincode` internals and the `ultima-db` `snapshot_stream` adapter** — both
-  are external crates reached through the seams above. They are a dependency
-  posture question (`deny.toml`, the SBOM shipped with each release), not a
-  target here.
+- **`bincode` internals** — an external crate reached through the seams
+  above. That is a dependency posture question (`deny.toml`, the SBOM shipped
+  with each release), not a target here.
 - **Stateful sequences.** Every fuzz target is one decoder on one input.
   Sequences that drive the receiver's dispatch across terms, epochs and
   sessions belong to the simulation and the linearizability capstones

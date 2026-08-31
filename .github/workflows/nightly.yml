@@ -6,7 +6,7 @@ name: nightly
 #   * capstones  — the whole workspace test suite INCLUDING uc_node's WGL
 #                  lincheck capstones (lin_v2: failover + purge/snapshot-churn
 #                  linearizability; lin_partition_v2: partition / quorum-loss)
-#                  plus the uc_service ultima_db-adapter pass. Since 2.8.1
+#                  Since 2.8.1
 #                  each of those has a TWO-FSM twin (lin_v2's two_fsm_*,
 #                  lin_partition_v2's minority_partition_and_heal_two_fsm),
 #                  picked up by `cargo test --workspace` with no matrix change.
@@ -50,7 +50,7 @@ name: nightly
 
 on:
   schedule:
-    - cron: '17 3 * * *' # daily 03:17 UTC (offset from ultima_db's weekly jobs)
+    - cron: '17 3 * * *' # daily 03:17 UTC
   workflow_dispatch:
 
 permissions:
@@ -74,8 +74,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Full workspace tests (incl. lin_v2 + lin_partition_v2)
         run: cargo test --workspace
-      - name: Tests (uc_service + ultima_db adapter)
-        run: cargo test -p uc_service --features ultima_db
 
   sim-heavy:
     runs-on: ubuntu-latest

@@ -297,11 +297,6 @@ oneshots — the client matcher correlates off the ring.
   `(marker, commit]`. Monotonic persistence can only widen the replay, so
   at-least-once holds.
 
-`uc_service` ships an optional adapter for
-[`ultima-db`](https://crates.io/crates/ultima-db) behind the `ultima_db` feature,
-if you want a transactional store as your state machine rather than hand-rolling
-one.
-
 ## Membership
 
 Single-server reconfiguration (M7): promote, demote, add, or remove **one** member
@@ -339,15 +334,16 @@ can forge fan-out traffic as any node. See runbook §11.
 | `uc_crypto` | Opt-in node-to-node wire crypto (M8, off by default): Noise `IK` handshake, AES-256-GCM over the datagram envelope, rotating group key, anti-replay; plus the M12b admin-request HMAC |
 | `uc_sim` | Deterministic simulation + invariants + fuzz |
 | `uc_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
-| `uc_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
+| `uc_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction |
 | `uc_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries — to FSM 0 by default, to any declared FSM by id, or fanned in across all of them (M14) |
 | `uc_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and its Rust client: `RemoteEngine`'s split `RemoteSendHalf`/`RemotePollHalf` (two threads per connection, batched writes, no lock on the request path) plus the blocking `RemoteClient` convenience built on them — for clients that can't attach to shmem directly |
 | `uc_gateway` | The `Edge`: a per-node TCP front door relaying `uc_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
 | `uc_lincheck` | WGL linearizability checker + history recorder + register model |
 | `uc_journal` | Segmented append journal + atomic `StableValue`s |
 
-Builds standalone — the only external storage dep,
-[`ultima-db`](https://crates.io/crates/ultima-db), comes from crates.io.
+Builds standalone, with **no external storage dependency**: durability is
+`uc_journal`, in-tree. A service brings its own state machine; UC neither
+ships nor requires a store.
 
 **Published to crates.io:** thirteen crates, prepared and gated in CI,
 published **in lockstep at one version** — which is also the git tag, the

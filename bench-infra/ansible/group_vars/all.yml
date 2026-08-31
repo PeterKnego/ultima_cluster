@@ -39,26 +39,10 @@ uc_repo_url: ""                          # used when uc_src_mode=git
 # the tree you actually want on the hosts.
 uc_local_path: "{{ playbook_dir }}/../.."  # repo root (ultima_cluster), for rsync mode
 
-# --- Sibling ultima_db (OFF by default) ---
-# Only needed when Cargo.toml's `[patch.crates-io] ultima-db = { path =
-# "../ultima_db" }` line is uncommented for lockstep local development. The
-# DEFAULT build resolves ultima-db from crates.io and uc_journal from the
-# in-tree workspace member, so no sibling checkout is required and this sync is
-# skipped. Enable with `-e ud_sync=true` when running in lockstep mode.
-ud_sync: false
-# Resolved against the MAIN worktree, not `playbook_dir`: the sibling lives
-# next to the main checkout, so a playbook-relative path breaks when the
-# playbook runs from `.claude/worktrees/<name>/`. `--git-common-dir` points at
-# the main checkout's .git regardless of which worktree we are in. Evaluated
-# lazily, so the git lookup only runs when ud_sync is true.
-ud_local_path: >-
-  {{ (lookup('pipe', 'git -C ' ~ playbook_dir ~ ' rev-parse --path-format=absolute --git-common-dir') | dirname | dirname) ~ '/ultima_db' }}
-
 # --- Layout on hosts ---
 remote_home: "/opt/bench"
 aeron_deploy_dir: "/opt/bench/aeron-deploy"
 uc_src_dir: "/opt/bench/uc"
-ud_src_dir: "/opt/bench/ultima_db"   # so /opt/bench/uc/../ultima_db resolves on the host
 uc_target_bin: "/opt/bench/uc/target/release"
 
 # --- Aeron port bases (matches canonical cluster_localhost ranges) ---

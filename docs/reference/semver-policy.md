@@ -125,7 +125,7 @@ API for downstream code. They may change in any release:
 | `uc_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender`. **`2.8.0` changed these signatures, in a minor release** — see the note below. |
 | `uc_crypto` | `admin`, `group`, `handshake`, `identity`, `replay`, `rotation`, `schedule`, `seal`, `transport` |
 | `uc_node` | `audit`, `backup`, `ipc`, `obs`, `preflight`, `recovery`, and everything in `node` except `NodeConfig`/`Node::start*` |
-| `uc_service` | `snapshots`, `ultima_db` |
+| `uc_service` | `snapshots` |
 | `uc_gateway` | `config_file`; `Edge`/`EdgeStats` beyond what `gateway.toml` implies |
 | `uc_remote` | `conn`, `frame` as *Rust items* — the wire format they encode is promised (protocol v1), the Rust names are not |
 | `uc_journal` | `bench_support` (already `#[doc(hidden)]`), and the crate generally: it is the node's storage primitive, published so the workspace can be, not offered as a general-purpose journal |
@@ -154,8 +154,6 @@ Also outside the promise:
   `uc_gateway/test-util` (`Edge::fault_for_tests`),
   `uc_protocol/uc-bench-probes`, `uc_journal/bench-support`,
   `uc_node/mutation-testing` and `uc_consensus/mutation-testing`.
-  `uc_service/ultima_db` is a real adapter but its API tracks
-  `ultima-db`'s, not this promise.
 - **`uc_sim`, `uc_lincheck`, `examples/counter`, `examples/uc_crashtest`.**
   These are `publish = false`: the proof and teaching apparatus, not the
   product. Nothing in them is API, and they are not on crates.io.

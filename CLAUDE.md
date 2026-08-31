@@ -139,12 +139,11 @@ Canonical documents, in order:
    history).
 3. `docs/ops/uc2-runbook.md` — operational runbook (instance-dir layout, cnc
    decode, purge enablement, live reconfiguration ops).
-4. Storage primitives: `../ultima_db/docs/tasks/task26_journal.md`
-   (`uc_journal` log primitives) and `task27_snapshot_stream.md` (the
-   `ultima_db` snapshot wire format). The `ultima-db` *code* dependency comes
-   from crates.io (the workspace builds standalone); the sibling checkout is
-   only needed for its docs or lockstep local development
-   (`[patch.crates-io]`).
+4. Storage primitives: `../ultima_db/docs/tasks/task26_journal.md` —
+   `uc_journal`'s design notes, which live in the sibling repo for historical
+   reasons (the crate itself is in-tree). **UC has no `ultima-db` dependency**
+   since 2026-08-31; the workspace's only durability primitive is
+   `uc_journal`, and a service brings its own state machine.
 
 ## Build & Test Commands
 
@@ -165,7 +164,6 @@ cargo test                                       # in-process integration + sim 
 cargo test -p uc_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
 cargo test -p uc_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
 cargo test -p uc_crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable
-cargo test -p uc_service --features ultima_db   # the (non-default) ultima-db store adapter — the default build never compiles it
 cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with zero warnings)
 cargo run -p uc_node --release --example m5_gate # throughput gate harness (see the gate doc)
 cargo run -p uc_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
@@ -399,9 +397,11 @@ Storage primitives:
   CRC per block; block seq = block index, meta = base position).
 - Durable state: `uc_journal::StableValue<T>` (rotating two-slot atomic value)
   for vote, term map, snapshot floor, output progress, cluster-config record (config.state).
-- App state + snapshots: the user's `StateMachine`; M6 snapshots use the
-  `SnapshotStateMachine` capability and (for the default store) `ultima_db`'s
-  `snapshot_stream` wire format.
+- App state + snapshots: the user's `StateMachine`. M6 snapshots use the
+  `SnapshotStateMachine` capability; the artifact's bytes are entirely the
+  service's own business — UC ships no store and prescribes no snapshot
+  encoding. `uc_lincheck`'s `RegisterSm`/`ListAppendSm` are the worked
+  examples.
 
 Replication is reliable-UDP: the log buffer doubles as the retransmit buffer, a
 receiver that falls behind sends NAKs repaired from the buffer (or, below the
@@ -505,8 +505,12 @@ a parallel prose copy of the release history.
 - `uc_journal/` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved). Design notes:
   `../ultima_db/docs/tasks/task26_journal.md`.
-- `ultima-db` — MVCC copy-on-write B-tree store with `snapshot_stream` wire
-  format (the default app-state store + snapshot format, behind `uc_service`'s
-  non-default `ultima_db` feature). **Dependency comes from crates.io** — no
-  sibling checkout required to build. Docs live in the `../ultima_db/` repo
-  (`CLAUDE.md`, `docs/tasks/task27_snapshot_stream.md`) when checked out.
+- **`ultima-db` is no longer a dependency of any kind** (removed
+  2026-08-31). It had been an optional dep behind `uc_service`'s non-default
+  `ultima_db` feature, carrying a `StoreStateMachine` adapter that nothing in
+  the tree used except its own roundtrip test — no binary, example, gate
+  harness or capstone ever built it, and `snapshot_stream` appeared nowhere
+  outside the adapter. Removing it dropped three crates from `Cargo.lock`
+  (`ultima-db`, `dashmap`, `hashbrown`), four CI/nightly/docs steps, and
+  `uc_service`'s only crates.io coupling. Do not reintroduce it: a service
+  supplies its own `StateMachine`, and UC prescribes no store.
