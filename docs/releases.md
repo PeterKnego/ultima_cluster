@@ -167,8 +167,43 @@ distinguish a distribution's width from its tail), and **no fleet driver uses
 `m12_gate`'s `--warmup-secs`/`--measure-secs` steady window**, so every
 published rate includes a 3–5 % warm-up climb.
 
-<!-- PENDING: ci + nightly evidence — fill with the post-merge workflow run
-     ids in the M14 gate's row-g style once both have run on the tag commit -->
+### What proves the release
+
+All run ids below are on the tag commit `32024e5` (`v2.10.0`) unless stated
+otherwise.
+
+| what | evidence | result |
+|---|---|---|
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89) | run `33435180950` | success |
+| `docs.yml` (rustdoc, link check) | run `33435180996` | success |
+| `release.yml` (build, SBOM, cosign, image) | run `33435475868`, 7/7 jobs | success |
+| artifact integrity | `sha256sum -c` against the published manifest | `OK` |
+| artifact provenance | `cosign verify-blob` (keyless) | `Verified OK` |
+| the 2.10.0 stdout contract, in the shipped binary | ran `uc2-node` from the release tarball | **0 bytes on stdout**; `config_loaded`, `node_listening`, `became_leader`, `serving_changed` present as JSON-lines records |
+| crates.io | all 13 crates published in dependency order, 2026-08-31 | live at `2.10.0`, verified against the sparse index; 59 s, zero retries |
+
+Two things this table deliberately does **not** claim:
+
+- **`nightly.yml` has not run on the tag commit.** The last nightly before the
+  tag (`33379077096`, on the docs-only commit `cb3eb9d`) went red in
+  `capstones`. It was root-caused post-tag to a **test** defect, not a product
+  one: `two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client` asserted
+  page 1's `service_applied` equal to slot 0's `applied` outright, but that
+  field is the node's once-per-cycle mirror of the `min` over declared slots
+  (`Node::publish_service_mins`), so it converges a cycle later and — being a
+  min — can still hold the older sample after both slots are level. It failed
+  by exactly one 64-byte record (6368 vs 6432). The assertion is now a
+  `wait_until`. The race was not reproduced locally (it passes locally either
+  way); the diagnosis rests on the CI log and the code path.
+- **`uc2-gateway` has no `--version` flag** while `uc2-node` and `uc2ctl` do.
+  Found while verifying the tarball. A shipped-CLI inconsistency, not a
+  release blocker, and not fixed in 2.10.0.
+
+The first-ever ordered publish, at `2.9.0`, took about an hour because all
+twelve names were new and crates.io rate-limits *new names* far harder than new
+versions. `2.10.0` had exactly one new name (`uc_obs`) and took 59 seconds —
+which is the measurement behind `docs/how-to/cut-a-release.md` §6's
+rate-limit note.
 
 ## v2.9.0 — 2026-08-30 — the `uc_*` crate rename
 

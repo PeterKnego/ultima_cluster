@@ -262,9 +262,28 @@ blocked one will fail differently and confusingly, with `failed to prepare
 local package for uploading`: its path dependency on the blocked crate cannot
 resolve from the registry yet. Same cause, same remedy.
 
-The whole hour-long dance is one-time. Every later release publishes new
-*versions* of names that already exist, which is not subject to this limit —
-`2.9.0` took 62 minutes end to end; the next release will take minutes.
+The whole hour-long dance is one-time, and this is now measured rather than
+predicted. Every later release publishes new *versions* of names that already
+exist, which is not subject to this limit: `2.9.0` (twelve new names) took 62
+minutes end to end, while **`2.10.0` took 59 seconds with zero retries** — it
+carried exactly one new name, `uc_obs`, comfortably inside the burst
+allowance. Budget the hour only when a release introduces several new crate
+names at once.
+
+Before publishing a crate — and before re-running after any failure — you can
+ask the sparse index (the file cargo actually resolves against) whether that
+version is already live:
+
+```sh
+c=uc_node; curl -s -A "$USER" "https://index.crates.io/${c:0:2}/${c:2:2}/$c" \
+  | grep -o '"vers":"[^"]*"'
+```
+
+crates.io's *web API* rejects a request with no `User-Agent` with a bare
+`403`, which reads exactly like "crate does not exist" — hence the `-A`. That
+check is what makes a re-run safe: skip anything already at the target
+version, and a half-finished publish can be resumed without any risk of
+double-publishing.
 
 If a crate fails partway through the list, the ones before it are already
 public. Fix the failure, bump nothing, and re-run from the crate that failed —

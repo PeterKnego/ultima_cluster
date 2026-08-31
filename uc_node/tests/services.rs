@@ -326,10 +326,16 @@ fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
     wait_until("FSM 1 caught up", || {
         cnc.service_slot(1).applied.load_acquire() == cnc.service_slot(0).applied.load_acquire()
     });
-    assert_eq!(
-        cnc.service().service_applied.load_acquire(),
-        cnc.service_slot(0).applied.load_acquire()
-    );
+    // Page 1's singular `service_applied` is the node's once-per-cycle
+    // *mirror* of `min` over the declared slots (`Node::publish_service_mins`),
+    // not a synchronous copy of slot 0. It therefore converges a cycle later —
+    // and, being a min, it can still hold the older sample even after the wait
+    // above sees the two slots level. So this has to be waited on, not asserted
+    // outright: as a bare `assert_eq!` it raced and reddened nightly
+    // 33379077096 by exactly one 64-byte record (6368 vs 6432).
+    wait_until("page 1's mirror caught up to the slots", || {
+        cnc.service().service_applied.load_acquire() == cnc.service_slot(0).applied.load_acquire()
+    });
     assert_eq!(svc0.query(()), 100);
     assert_eq!(
         svc1.query(()),
