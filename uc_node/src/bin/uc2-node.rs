@@ -119,16 +119,25 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!("uc2-node: node {id} listening on {bind}");
+    let bind_str = bind.to_string();
+    uc_node::obs_event!(
+        Info,
+        "node_listening",
+        node = id as u64,
+        bind = bind_str.as_str()
+    );
 
     let obs = node.observability();
     let mut srv: Option<ObsServer> = None;
     if let Some(addr) = opts.obs.metrics_bind {
         match ObsServer::serve(obs.clone(), addr) {
             Ok(s) => {
-                println!(
-                    "uc2-node: observability endpoint on http://{}/metrics",
-                    s.local_addr()
+                let url = format!("http://{}/metrics", s.local_addr());
+                uc_node::obs_event!(
+                    Info,
+                    "metrics_listening",
+                    node = id as u64,
+                    url = url.as_str()
                 );
                 srv = Some(s);
             }
@@ -173,18 +182,7 @@ fn main() -> ExitCode {
     let mut last_snapshot_emit: Option<Instant> = None;
     let mut last_statvfs_warn_emit: Option<Instant> = None;
 
-    let mut was_leader = None;
     while !stop.load(Ordering::Relaxed) {
-        let is_leader = node.is_leader();
-        if was_leader != Some(is_leader) {
-            println!(
-                "uc2-node: node {id} is now {} (term {})",
-                if is_leader { "LEADER" } else { "follower" },
-                node.current_term()
-            );
-            was_leader = Some(is_leader);
-        }
-
         tick += 1;
         if tick.is_multiple_of(DERIVED_EVENTS_EVERY_N_TICKS) {
             // A dead agent makes everything downstream (the drain, the obs
@@ -195,11 +193,11 @@ fn main() -> ExitCode {
             // would re-raise it.
             if let Some((name, _)) = obs.agents.iter().find(|(_, f)| f.load(Ordering::Acquire)) {
                 uc_node::obs_event!(Error, "agent_failstopped", agent = *name);
-                eprintln!("uc2-node: agent {name} fail-stopped; exiting");
                 return ExitCode::FAILURE;
             }
 
             let now = Instant::now();
+            let is_leader = node.is_leader();
 
             let naks_dropped = obs.sender.naks_dropped.load(Ordering::Relaxed);
             let naks_served = obs.sender.naks_served.load(Ordering::Relaxed);
@@ -266,10 +264,14 @@ fn main() -> ExitCode {
                     if last_statvfs_warn_emit
                         .is_none_or(|t| now.duration_since(t) >= DERIVED_EVENT_RATE_LIMIT)
                     {
-                        eprintln!(
-                            "uc2-node: statvfs({}) failed: {}",
-                            instance_dir.display(),
-                            std::io::Error::last_os_error()
+                        let dir = instance_dir.display().to_string();
+                        let err = std::io::Error::last_os_error().to_string();
+                        uc_node::obs_event!(
+                            Warn,
+                            "statvfs_failed",
+                            node = id as u64,
+                            dir = dir.as_str(),
+                            err = err.as_str()
                         );
                         last_statvfs_warn_emit = Some(now);
                     }
@@ -280,20 +282,31 @@ fn main() -> ExitCode {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    println!("uc2-node: signalled, draining");
+    uc_node::obs_event!(Info, "draining", node = id as u64);
     if let Some(srv) = srv {
         // Scrapes must not race teardown: stop the HTTP thread before the
         // agents it reads through start winding down.
         srv.stop();
     }
     match node.stop_draining(Duration::from_secs(args.drain_timeout_secs)) {
-        DrainOutcome::Drained => println!("uc2-node: drained, stopped cleanly"),
-        DrainOutcome::DeadlineExpired { append, durable } => eprintln!(
-            "uc2-node: drain deadline expired with {} bytes unrecorded \
-             (append {append}, durable {durable}); stopped anyway — the restarted \
-             node will re-fetch them",
-            append.saturating_sub(durable)
-        ),
+        DrainOutcome::Drained => {
+            uc_node::obs_event!(Info, "stopped", node = id as u64, outcome = "drained");
+        }
+        // Not an error: the node stops either way and the restarted node
+        // re-fetches the tail. It is a `warn` because unrecorded bytes at
+        // exit are worth a human's attention, and the byte count is the
+        // field that says how much.
+        DrainOutcome::DeadlineExpired { append, durable } => {
+            uc_node::obs_event!(
+                Warn,
+                "stopped",
+                node = id as u64,
+                outcome = "drain_deadline_expired",
+                unrecorded = append.saturating_sub(durable),
+                append = append,
+                durable = durable
+            );
+        }
     }
     ExitCode::SUCCESS
 }

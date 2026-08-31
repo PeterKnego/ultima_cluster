@@ -285,6 +285,18 @@ Keys always appear in the order `ts_ns`, `level`, `event`, then the event's
 own fields in the order the call site names them — this is a machine log, so
 key order is a contract, not a cosmetic choice.
 
+**One stream, one format.** Everything `uc2-node` says from startup onward
+is a JSON record on **stderr**; it writes nothing at all to stdout, so a log
+consumer never merges two streams (twelve-factor
+[#11](https://12factor.net/logs); see
+[the assessment](../notes/uc2-twelve-factor-assessment.md)). The one stated
+exception is the handful of **pre-start refusal lines** (`refusing to start:
+…`, the volatile-fs override `WARNING`), which stay human prose on stderr:
+they are emitted before `[log] level` has been read, they are addressed to
+whoever is reading `systemctl status`, and their machine-readable half is the
+exit code — **2** for a refused config (systemd's `RestartPreventExitStatus=2`
+will not retry it) and **1** for a runtime failure (retried).
+
 Two families of sites emit records. **Consensus-driven** records fire
 exactly on the state transition they name, at the point in the code where it
 happens — no polling, no delay. **Derived** records come from the daemon's
@@ -310,6 +322,11 @@ flooding.
 | `admin_op` | `actor`, `origin`, `op`, `op_name`, `id`, `addr`, `seq`, `nonce`, `outcome`, `reason`, `config_version` | this node answered an admin request (membership change). A **mirror** of the line already written to `<instance_dir>/audit.jsonl`, which is the record of record: the file is fsynced *before* the answer is published, this stream is best-effort. `actor` is the admin key name that signed it, `filesystem` when the node authenticates nothing (`auth = "none"`), `unverified` on a request that failed authentication, or `peer:<id>` on a proposal a follower forwarded (`origin: forwarded`). `outcome` is `accepted` (proposed and appended — not necessarily committed) / `refused` / `retry`. |
 | `admin_audit_failed` | `node`, `seq`, `nonce`, `op`, `status`, `err` | the audit record for an admin request could NOT be written, so the request was refused with reason 24 rather than answered unrecorded. On an otherwise-accepted change this means the change may still be in the log — check `uc2ctl status`. Alert on this: it means the node's disk is failing or full. |
 | `agent_failstopped` | `agent` | one of the four polling agents panicked; the daemon logs this and then **exits 1 without draining**, so systemd restarts it and the replay path (not reconstruction) picks the node back up |
+| `node_listening` | `node`, `bind` | the node is up and its UDP socket is bound to `bind`. The first record of a healthy boot. |
+| `metrics_listening` | `node`, `url` | the observability endpoint is bound; `url` is the exact `/metrics` address. Absent when no `[metrics]` section is configured. |
+| `statvfs_failed` (derived) | `node`, `dir`, `err` | the ~1s pass could not stat the instance dir's filesystem, so `uc2_free_disk_bytes` still holds its previous value rather than a misleading zero. Rate-limited like the other derived records. |
+| `draining` | `node` | SIGTERM/SIGINT received; the observability endpoint is closed and the archive is draining to the `--drain-timeout-secs` deadline |
+| `stopped` | `node`, `outcome`, and on a timeout `unrecorded`, `append`, `durable` | the daemon's last record. `outcome` is `drained` (the archive caught up; a clean exit 0) or `drain_deadline_expired` (it did not, and the node stopped anyway — `unrecorded` is how many bytes the restarted node will re-fetch). One event name with an outcome field, so a consumer greps `"event":"stopped"` and reads `outcome`, rather than matching two differently-shaped lines. |
 
 `agent_failstopped` is a behavior change worth calling out on its own: before
 M10, a mid-run agent panic could leave the process running with a healthy-

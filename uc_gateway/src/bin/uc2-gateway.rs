@@ -66,7 +66,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!("uc2-gateway: listening on {}", edge.local_addr());
+    eprintln!("uc2-gateway: listening on {}", edge.local_addr());
 
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -116,7 +116,7 @@ fn main() -> ExitCode {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    println!("uc2-gateway: signalled, stopping");
+    eprintln!("uc2-gateway: signalled, stopping");
     edge.stop();
     ExitCode::SUCCESS
 }

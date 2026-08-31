@@ -524,24 +524,28 @@ bind = "127.0.0.1:{metrics_port}"
     (cfg, inst)
 }
 
-/// Spawn the daemon with stdout piped, collecting lines into a shared `Vec`
-/// on a background reader thread so the test can poll for a banner while the
-/// process keeps running (the pipe would otherwise fill and stall the child
-/// once its buffer is full).
-fn spawn_daemon_capturing_stdout(cfg: &Path) -> (std::process::Child, Arc<Mutex<Vec<String>>>) {
+/// Spawn the daemon with **stderr** piped, collecting lines into a shared
+/// `Vec` on a background reader thread so the test can poll for a record
+/// while the process keeps running (the pipe would otherwise fill and stall
+/// the child once its buffer is full).
+///
+/// stderr, not stdout, because the daemon has exactly one output stream and
+/// that is it (twelve-factor #11): every record is a JSON line on stderr,
+/// and `uc2-node` writes nothing whatsoever to stdout.
+fn spawn_daemon_capturing_stderr(cfg: &Path) -> (std::process::Child, Arc<Mutex<Vec<String>>>) {
     use std::process::Command;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
         .arg("--config")
         .arg(cfg)
-        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let stdout = child.stdout.take().unwrap();
+    let stream = child.stderr.take().unwrap();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let lines_writer = Arc::clone(&lines);
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
+        let reader = BufReader::new(stream);
         for line in reader.lines().map_while(Result::ok) {
             lines_writer.lock().unwrap().push(line);
         }
@@ -574,14 +578,16 @@ fn the_daemon_serves_metrics_when_configured_and_stops_cleanly() {
     let (cfg, _inst) = daemon_config_with_metrics(dir.path(), 19710, metrics_port);
     let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
 
-    let (mut child, lines) = spawn_daemon_capturing_stdout(&cfg);
+    let (mut child, lines) = spawn_daemon_capturing_stderr(&cfg);
 
     let deadline = Instant::now() + Duration::from_secs(10);
-    let banner = wait_for_line(&lines, "observability endpoint on http://", deadline)
-        .expect("banner line naming the observability endpoint never appeared");
+    let banner = wait_for_line(&lines, r#""event":"metrics_listening""#, deadline)
+        .expect("metrics_listening record never appeared on stderr");
     assert!(
-        banner.contains(&format!("http://127.0.0.1:{metrics_port}/metrics")),
-        "banner must name the configured addr, got: {banner}"
+        banner.contains(&format!(
+            r#""url":"http://127.0.0.1:{metrics_port}/metrics""#
+        )),
+        "the record must name the configured addr, got: {banner}"
     );
 
     let (status, body) = http_get(metrics_addr, "/metrics");
@@ -626,10 +632,10 @@ fn the_daemon_publishes_free_disk_bytes() {
     let (cfg, _inst) = daemon_config_with_metrics(dir.path(), 19712, metrics_port);
     let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
 
-    let (mut child, lines) = spawn_daemon_capturing_stdout(&cfg);
+    let (mut child, lines) = spawn_daemon_capturing_stderr(&cfg);
     let deadline = Instant::now() + Duration::from_secs(10);
-    wait_for_line(&lines, "observability endpoint on http://", deadline)
-        .expect("banner line naming the observability endpoint never appeared");
+    wait_for_line(&lines, r#""event":"metrics_listening""#, deadline)
+        .expect("metrics_listening record never appeared on stderr");
 
     // The derived-events pass runs every 10th 100ms tick (~1s) — wait past at
     // least one so free_disk_bytes has actually been stored, not just left
@@ -664,12 +670,84 @@ fn the_daemon_publishes_free_disk_bytes() {
     );
 }
 
+/// Twelve-factor #11: the daemon has ONE output stream. Everything it says
+/// — startup, role changes, derived events, drain, stop — is a JSON line on
+/// stderr, and **stdout is empty**, so a log consumer never has to merge two
+/// streams or two formats.
+///
+/// This is the regression test for the property, not a restatement of the
+/// implementation: it pipes BOTH streams, exercises a full lifecycle
+/// (start -> run -> SIGTERM -> clean exit) and asserts stdout is
+/// byte-empty while stderr carries the bracketing records.
+#[test]
+fn the_daemon_writes_nothing_to_stdout_and_everything_to_stderr() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let (cfg, _inst) = daemon_config(dir.path(), 19713, "127.0.0.1", "");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Long enough to cross at least one ~1s derived-events pass, so the run
+    // loop has had a chance to say something on either stream.
+    std::thread::sleep(Duration::from_millis(1500));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "clean shutdown must exit 0, got {:?}, stderr: {stderr}",
+        out.status
+    );
+    assert!(
+        stdout.is_empty(),
+        "the daemon must write NOTHING to stdout; got {} bytes: {stdout}",
+        stdout.len()
+    );
+
+    // The stream it does use carries the whole lifecycle, and every line on
+    // it is a JSON object — one format, not two.
+    assert!(
+        stderr.contains(r#""event":"node_listening""#),
+        "stderr must carry the node_listening record, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(r#""event":"draining""#) && stderr.contains(r#""event":"stopped""#),
+        "stderr must carry the drain/stop records, got: {stderr}"
+    );
+    // From the first record onward the stream is uniformly JSON. The scope
+    // is deliberate: the handful of PRE-START refusal/warning lines
+    // (`refusing to start: …`, the volatile-fs override WARNING) are prose
+    // on purpose — they are emitted before `[log] level` has even been read,
+    // and they are addressed to a human reading `systemctl status`, with the
+    // exit code (2 = config, 1 = runtime) as the machine-readable part. Once
+    // the node is up, every line is a record.
+    let from_first_record = stderr
+        .lines()
+        .skip_while(|l| !l.contains(r#""event":"node_listening""#));
+    for line in from_first_record.filter(|l| !l.trim().is_empty()) {
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "every line after startup must be a JSON record, got: {line}"
+        );
+    }
+}
+
 #[test]
 fn the_daemon_without_a_metrics_section_opens_no_port() {
     let dir = scratch();
     let (cfg, _inst) = daemon_config(dir.path(), 19711, "127.0.0.1", "");
 
-    let (mut child, lines) = spawn_daemon_capturing_stdout(&cfg);
+    let (mut child, lines) = spawn_daemon_capturing_stderr(&cfg);
     std::thread::sleep(Duration::from_millis(1500));
 
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
@@ -683,7 +761,7 @@ fn the_daemon_without_a_metrics_section_opens_no_port() {
     assert!(
         !captured
             .iter()
-            .any(|l| l.contains("observability endpoint")),
-        "no [metrics] section must mean no observability banner, got: {captured:?}"
+            .any(|l| l.contains(r#""event":"metrics_listening""#)),
+        "no [metrics] section must mean no metrics_listening record, got: {captured:?}"
     );
 }
