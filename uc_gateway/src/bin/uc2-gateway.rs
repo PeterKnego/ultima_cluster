@@ -32,8 +32,17 @@ use std::time::Duration;
 use clap::Parser;
 use uc_gateway::{Edge, config_file};
 
+/// `version` is not decoration: clap's derive only generates `--version` when
+/// this flag is present, and it was missing here while `uc2-node` and `uc2ctl`
+/// both had it — so `uc2-gateway --version` answered "unexpected argument"
+/// right through the 2.10.0 release. `identifies_itself_by_version` below is
+/// the regression guard.
 #[derive(Parser)]
-#[command(name = "uc2-gateway", about = "An ultima_cluster gateway edge")]
+#[command(
+    name = "uc2-gateway",
+    version,
+    about = "An ultima_cluster gateway edge"
+)]
 struct Args {
     /// Path to the gateway's TOML configuration file.
     #[arg(long)]
@@ -121,4 +130,23 @@ fn main() -> ExitCode {
     uc_obs::obs_event!(Info, "gateway_stopped");
     edge.stop();
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Args;
+    use clap::CommandFactory;
+
+    /// The whole surface a `--version` flag needs: clap emits it iff
+    /// `#[command(version)]` is set, and the string must be the crate's own
+    /// version so it moves with the lockstep workspace bump.
+    #[test]
+    fn identifies_itself_by_version() {
+        let cmd = Args::command();
+        assert_eq!(
+            cmd.get_version(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "uc2-gateway must answer --version, like uc2-node and uc2ctl"
+        );
+    }
 }

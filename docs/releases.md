@@ -195,9 +195,13 @@ Two things this table deliberately does **not** claim:
   by exactly one 64-byte record (6368 vs 6432). The assertion is now a
   `wait_until`. The race was not reproduced locally (it passes locally either
   way); the diagnosis rests on the CI log and the code path.
-- **`uc2-gateway` has no `--version` flag** while `uc2-node` and `uc2ctl` do.
-  Found while verifying the tarball. A shipped-CLI inconsistency, not a
-  release blocker, and not fixed in 2.10.0.
+- **`uc2-gateway` had no `--version` flag** while `uc2-node` and `uc2ctl` did,
+  and it shipped that way in 2.10.0 — found while verifying the tarball. The
+  cause was one missing word: clap's derive emits `--version` only when
+  `#[command(version)]` is set, and the gateway's attribute did not set it.
+  **Fixed after the tag** (on `main`, so it lands in the next release), with a
+  unit test that asserts `Args::command().get_version()` is the crate version —
+  the assertion fails (`left: None`) with the fix reverted.
 
 The first-ever ordered publish, at `2.9.0`, took about an hour because all
 twelve names were new and crates.io rate-limits *new names* far harder than new

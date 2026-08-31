@@ -55,9 +55,12 @@ names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
 Next up: **TBD by the maintainer.** `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the
-top of `docs/releases.md`). Two items it left open, neither a blocker:
-`nightly.yml` has never run on the tag commit, and `uc2-gateway` has no
-`--version` flag while `uc2-node` and `uc2ctl` do. M14c2 is done — the two-FSM capstones
+top of `docs/releases.md`). It left two items open, neither a blocker:
+`nightly.yml` has never run on the tag commit, and `uc2-gateway` shipped
+without a `--version` flag while `uc2-node` and `uc2ctl` have one — the
+second is **fixed on `main`** (clap emits `--version` only under
+`#[command(version)]`; a unit test now guards it) and lands in the next
+release. M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
 Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
 fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`. The rig's
