@@ -50,8 +50,13 @@ its rate-limit note explains why that first run took an hour.)
 Next up: **TBD by the maintainer.** M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
 Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
-fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`; the rig's
-own validation run on a fleet is still pending (spec §15.1, §16). First
+fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`. The rig's
+validation run RAN 2026-08-31 and **pinning was not adopted** — pinned
+spread 14.3 % against a pre-committed < 5 % bar, and it costs 9.4 % of mean
+throughput; it does remove the worst mode (47.7 % → 14.3 %), so placement is
+one cause among others. `--pin` stays opt-in
+(`docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md`). Row e is still
+un-re-measured. First
 candidate for the next minor: the twelve-factor hygiene items postponed
 out of M14c2 — env-var overrides for deploy-varying config keys (#3) and
 one log stream (#11); the release-ledger line (#5) is process, not code

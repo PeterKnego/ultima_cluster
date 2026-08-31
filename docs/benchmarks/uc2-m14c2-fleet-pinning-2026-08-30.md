@@ -1,92 +1,157 @@
-# Fleet CPU pinning (`--pin`) — PENDING — validation run not yet executed
+# Fleet CPU pinning (`--pin`) — RAN 2026-08-31 — NOT ADOPTED
 
-**Status:** Task 9 Step 1 (the driver change) is done and merged; Task 9
-Step 2 (the fleet validation run, ~$3, needs the user's go) has **not run
-yet**. Nothing in this document below the method/plan sections is a
-measurement — do not cite a spread or an adoption decision from this file
-until Step 2 has actually run and this stub has been replaced with the real
-numbers.
+**Status:** Task 9 Step 2 executed on a real fleet, 2026-08-31, on `main`
+`6b431ee`. The adoption rule was fixed before the run and is applied below
+unchanged. **Verdict: pinning is NOT adopted** — it does not clear the bar.
+`--pin` stays opt-in and off by default.
 
-## Why
+This run also did something the stub could not: it **verified the
+hyperthread-sibling assumption** `PIN_MAP_C6ID_2XL` was built on, which until
+now was a documented guess.
 
-`docs/benchmarks/uc2-m14d-ab-2.7.0-vs-2.8.0-2026-08-30.md` found the rig
-**multi-modal per cluster generation**: the same binary, same hosts, same
-arm produced whole-run rates 25 % apart across otherwise-identical
-generations (e.g. 2.8.0: 1.26 / 1.28 / 1.33 / 1.35 / 1.67 / 1.89 M resp/s
-over 7 arms). That doc's untested hypothesis: thread placement — the node's
-four busy-spin agents, the per-FSM service threads, and the client land on
-hyperthread siblings differently each generation on an 8-vCPU host, and a
-fast mode is a placement where no hot pair shares a physical core. The
-fix under test: pin every role to disjoint physical cores via
-`systemd-run -p CPUAffinity=` (`taskset -c` for the one client path that
-isn't a systemd unit) and see whether the spread collapses.
+## Why this was run
 
-## The pin map (`PIN_MAP_C6ID_2XL`, `bench-infra/scripts/m12_fleet_gate.py`)
+[`uc2-m14d-ab-2.7.0-vs-2.8.0-2026-08-30.md`](uc2-m14d-ab-2.7.0-vs-2.8.0-2026-08-30.md)
+found the rig **multi-modal per cluster generation**: the same binary, same
+hosts, same arm produced whole-run rates ~25 % apart across otherwise
+identical generations. Its untested hypothesis was thread placement — the
+node's four busy-spin agents, the per-FSM service threads and the client land
+on hyperthread siblings differently each generation on an 8-vCPU host, and a
+fast mode is a placement where no hot pair shares a physical core.
 
-```python
-PIN_MAP_C6ID_2XL = {
-    "node": "0,1,4,5",
-    "service0": "2",
-    "service1": "6",
-    "client": "3,7",
-    "edge": "3,7",
-}
+`--pin` pins every role to disjoint physical cores via
+`systemd-run -p CPUAffinity=`. This document is whether that fixes it.
+
+## The assumption, now verified
+
+`PIN_MAP_C6ID_2XL` assumes logical CPU `i` and `i+4` are the two SMT threads
+of one physical core. **Confirmed on all three voters** (`lscpu -e=CPU,CORE`,
+Intel Xeon Platinum 8375C @ 2.90 GHz, 4 physical cores × 2 threads):
+
+```
+CPU:  0 1 2 3 4 5 6 7
+CORE: 0 1 2 3 0 1 2 3      → sibling pairs (0,4) (1,5) (2,6) (3,7)
 ```
 
-Built for an 8-vCPU `c6id.2xlarge` (4 physical cores × 2 SMT threads). The
-node's four busy-spin polling agents (consensus/sender/receiver/archive) get
-two whole physical cores, both threads each (`0,1,4,5`) — no agent shares a
-physical core with another agent or with anything else. Each service gets
-one thread of a third core (`service0` on cpu 2, `service1` on cpu 6, its
-sibling — left idle on purpose so the two FSMs never share a physical core);
-an FSM id ≥ 2 (M14 allows up to 8) has no dedicated pin and shares
-`service1`'s thread (`m14_fleet_gate.service_cpu`). `client`/`edge` share the
-fourth core's two threads (`3,7`) — they are never both live at once on any
-arm these drivers run, so sharing costs nothing.
+That is exactly `EXPECTED_SIBLING_PAIRS`, so `require_pin_layout` accepted and
+the map pins what it claims to pin. Confirmed live in the unit commands:
+node `CPUAffinity=0,1,4,5`, service0 `=2`, service1 `=6`, client/edge `=3,7`.
 
-## The assumption that must be verified before trusting the map
+## Method as run
 
-`PIN_MAP_C6ID_2XL` **assumes** `c6id.2xlarge`'s hyperthread sibling pairs are
-`(0,4) (1,5) (2,6) (3,7)` — logical CPU `i` and `i+4` are the two SMT threads
-of one physical core. **This has not been verified on a real host yet.**
-Step 2's validation run must, before trusting any pinned number:
-
-1. Run `lscpu -e=CPU,CORE` (or `-p=CPU,CORE`) on a live `c6id.2xlarge` host
-   and record the raw output in this document, replacing this stub.
-2. Confirm `m12_fleet_gate.verify_pin_layout` (called automatically by
-   `--pin`, via `require_pin_layout`, on every host the run starts units on
-   — in `m14_fleet_gate.py` that's all 4 hosts: the 3 voters plus the row-f
-   learner, since row f pins the learner's node/service units too; in
-   `m14_ab_27_vs_28.py` it's the 3 voters only, because that driver never
-   starts units on the 4th host — before the first arm) accepted it on
-   every one of them. If the real layout doesn't match
-   `EXPECTED_SIBLING_PAIRS = {(0,4),(1,5),(2,6),(3,7)}`, `--pin` refuses to
-   run (`SystemExit`, printing the actual layout) rather than pinning onto
-   siblings silently — that refusal, if it fires, is itself the Step 2
-   finding and this map needs redrawing before any run proceeds.
-
-## Method (Step 2, not yet run)
+4 × `c6id.2xlarge`, us-east-1, one placement group; 3 voters + 1 unused
+(the driver parses 4 host entries but starts units on `hosts[:3]`).
 
 ```
 python3 bench-infra/scripts/m14_ab_27_vs_28.py --fleet --reps 4 --pin \
-    --tree27 <local 2.7.0 worktree, pointed at main too — A = B = main> \
-    --hosts <pub/priv,...>
+    --tree27 /home/claude/ultima/ultima_cluster --hosts <4 pub/priv>
+python3 bench-infra/scripts/m14_ab_27_vs_28.py --fleet --reps 4 --no-sync \
+    --tree27 /home/claude/ultima/ultima_cluster --hosts <4 pub/priv>
 ```
 
-then the same `--reps 4` **without** `--pin`. `--tree27` pointed at `main`
-makes A = B = main, so the 8 arms this produces are a pinned-vs-unpinned
-comparison of one binary against itself — isolating the pinning effect from
-any 2.7.0/2.8.0 delta. Record both runs' per-version spread
-(`spread_pct` in the driver's `SUMMARY-JSON`) here.
+`--tree27` points at `main`, so **A = B = main**: the 8 arms per run are one
+source against itself and no 2.7.0/2.8.0 delta can contaminate the spread.
+The second run uses `--no-sync`, so it reuses the **identical binaries** —
+pinning is the only variable between the two runs.
 
-## Adoption rule (spec §16.5)
-
-Adopt pinning (flip `--pin` to default **on** in `m14_fleet_gate.py`, and
-say so in the gate doc's "Reading the rules") **iff the pinned spread is
-< 5 %**. If the pinned run's spread is not clearly better than the unpinned
-run's ~25–64 % baseline (per-version spread in the A/B doc above), pinning
-is not adopted and this document records why, with both spreads, instead.
+The two arms are still two distinct *builds* of that one source
+(`d6fcdeb…` at `/opt/bench/uc`, `95e476c…` at `/opt/bench/uc27` — Rust
+embeds build paths, so same source ≠ same bytes). That does not contaminate
+the result: `spread_pct` is computed per version, so each figure is the
+spread across 4 reps of ONE binary, and build-to-build variation sits between
+A and B rather than inside either spread.
 
 ## Result
 
-**PENDING.** Nothing below this line exists yet — Step 2 has not run.
+Whole-run `responses_per_sec`, `m12_gate` client-direct, envelope on,
+inflight 4096, payload 64 B, 12 s per arm. **Zero lost responses in all 16
+arms.**
+
+| | pinned | unpinned |
+|---|---|---|
+| A mean | 1 576 963 | 1 898 841 |
+| A range | [1 465 851 .. 1 694 866] | [1 841 550 .. 1 968 240] |
+| **A spread** | **14.5 %** | **6.7 %** |
+| B mean | 1 627 123 | 1 639 369 |
+| B range | [1 605 661 .. 1 656 645] | [1 123 630 .. 1 900 439] |
+| **B spread** | **3.1 %** | **47.4 %** |
+| pooled mean (8 arms) | 1 602 043 | 1 769 105 |
+| pooled range | [1 465 851 .. 1 694 866] | [1 123 630 .. 1 968 240] |
+| **pooled spread** | **14.3 %** | **47.7 %** |
+
+Per-arm points, in run order:
+
+```
+pinned     A1 1694866  B1 1656645  A2 1587779  B2 1605661
+           A3 1559355  B3 1628618  A4 1465851  B4 1617567
+unpinned   A1 1853847  B1 1866239  A2 1968240  B2 1900439
+           A3 1841550  B3 1667167  A4 1931727  B4 1123630
+```
+
+## Adjudication against the pre-committed rule
+
+The rule (spec §16.5), fixed before any measurement:
+
+> Adopt pinning (flip `--pin` to default **on**) **iff the pinned spread is
+> < 5 %**.
+
+**Pinned pooled spread is 14.3 %; the per-version pinned spreads are 14.5 %
+and 3.1 %.** One of the two clears 5 %, the pooled figure and the other do
+not. The bar is not met. **NOT ADOPTED.**
+
+## What the numbers do say
+
+**1. The multi-modality is real and was reproduced.** Unpinned B rep4 came in
+at 1 123 630 against 1 900 439 for its own rep2 — a 41 % collapse of one
+generation, p50 3.586 ms vs 2.064 ms, with zero lost responses. That is the
+effect `uc2-m14d` described, seen again on fresh hardware.
+
+**2. Placement is *a* cause, not *the* cause.** Pooled spread falls
+47.7 % → 14.3 % with pinning, a 3.3× reduction, and the catastrophic
+low-mode arm never appears in the pinned run (pinned minimum 1 465 851, vs
+1 123 630 unpinned). So the hypothesis is partly right: pinning removes the
+worst mode. But 14.3 % residual is nowhere near 5 %, so a second source of
+variance remains unidentified.
+
+**3. NEW, and not anticipated by the hypothesis: pinning costs throughput.**
+Pooled mean drops 1 769 105 → 1 602 043, **−9.4 %**, and the pinned *maximum*
+(1 694 866) is below the unpinned *mean*. Pinning trims the top of the
+distribution as well as the bottom. A rig change that costs ~9 % of the
+number being measured needs a much better reason than it currently has.
+
+**4. Four reps is too few to estimate a spread.** The per-version figures
+disagree in direction: pinning took A from 6.7 % → 14.5 % (worse) and B from
+47.4 % → 3.1 % (much better), on identical source and identical pinning.
+Both unpinned spreads are dominated by whether an outlier happened to land in
+that particular sample of four — B's 47.4 % is one arm. **The spread statistic
+is itself noisy at n=4**, which is a limitation of the method in the spec, not
+of this execution. Any future attempt should fix the rep count from the
+observed arm-to-arm variance rather than inherit `--reps 4`.
+
+## What this does not settle
+
+- **Row e has still not been re-measured.** The M14 gate's 60× lockstep
+  finding is untouched by this run; confirming that pinning recovers it was
+  the original motivation and remains open.
+- **Why the residual 14.3 % exists.** Not diagnosed. Candidates not examined
+  here: EBS/NVMe interference, the placement group's actual topology, C-state
+  or turbo behaviour under a busy-spin load, and the interaction between
+  pinning and the 4-vCPU-per-role allocation itself.
+- **One session, one fleet.** 16 arms total. The `−9.4 %` throughput cost is
+  the firmest number here (pinned max < unpinned mean), but it is still a
+  single session.
+
+## Reproducing
+
+```bash
+cd bench-infra && make up-uc                       # 4x c6id.2xlarge, ~$1.61/hr
+python3 scripts/m14_ab_27_vs_28.py --fleet --reps 4 --pin \
+    --tree27 <checkout of main> --hosts <pub/priv x4>
+python3 scripts/m14_ab_27_vs_28.py --fleet --reps 4 --no-sync \
+    --tree27 <checkout of main> --hosts <pub/priv x4>
+cd bench-infra && make destroy && terraform -chdir=terraform state list  # must be empty
+```
+
+`ttl_hours` is an advisory tag; nothing reaps the hosts. This run's fleet was
+destroyed immediately after the second arm — 12 resources destroyed,
+`terraform state list` empty, 0 resources in state.

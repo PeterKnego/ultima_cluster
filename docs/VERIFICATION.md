@@ -797,15 +797,23 @@ The most important section, and the one most projects omit.
     not a product defect**, and no behavioural code changed →
     [`uc2-m14c2-lockstep-oversubscription-2026-08-30.md`](/docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md),
     [Limits](/docs/reference/limits.md).
-  - **Still open, and the reason this bullet is not simply deleted:** the M14
-    fleet gate measures rates, a kill and a join — it is not a correctness
-    substitute, and row e has **not** been re-measured. The `--pin` CPU-pinning
-    rig (`bench-infra/scripts/m14_fleet_gate.py`,
-    `m14_ab_27_vs_28.py`) that would confirm pinning recovers the fleet's 60×
-    is written and self-checking but **has never run on a fleet** — its record
-    (`docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md`) is a stub, and
-    the `c6id.2xlarge` sibling map in it is a documented, machine-verified
-    assumption, not an observation.
+  - **The `--pin` rig has now run (2026-08-31) and pinning was NOT adopted.**
+    16 arms on 4 × `c6id.2xlarge`, one binary against itself, pinned vs
+    unpinned. The pre-committed bar (spec §16.5) was "adopt iff the pinned
+    spread is < 5 %"; the pinned pooled spread is **14.3 %**, so the bar is
+    not met and `--pin` stays opt-in. Pinning DOES remove the worst mode
+    (pooled spread 47.7 % → 14.3 %, and the 1.12 M collapse arm never
+    appears pinned), so placement is *a* cause — but it is not the only one,
+    and pinning also **costs 9.4 % of mean throughput**, with the pinned
+    maximum below the unpinned mean. The `c6id.2xlarge` sibling map's
+    assumption is no longer an assumption: `lscpu -e=CPU,CORE` on all three
+    voters gives `CORE: 0 1 2 3 0 1 2 3`, exactly
+    `EXPECTED_SIBLING_PAIRS`. →
+    [`uc2-m14c2-fleet-pinning-2026-08-30.md`](/docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md)
+  - **Still open:** the M14 fleet gate measures rates, a kill and a join — it
+    is not a correctness substitute, and **row e has still not been
+    re-measured**. The pinning run above did not address it, and the residual
+    14.3 % spread is undiagnosed.
 - **Wire crypto is opt-in and off by default.** With it disabled the posture is a
   trusted network. With it enabled, the threat model is a network-path adversary;
   a compromised host and a malicious cluster member are explicitly **out of
