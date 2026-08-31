@@ -80,7 +80,7 @@ records what the `2.6.0` diagnosis got right and what it got wrong.
    one connection may hold while few are attached; the budget takes over as
    more arrive. A value above the budget is refused at startup by name.
 
-The signals worth watching are the stats line's `backpressure` (should be
+The signals worth watching are the stats record's `backpressure` (should be
 near zero — grants that fit the window do not hit it), `grant_changes` (moves
 when connections come and go, quiet otherwise), and the node's
 `Uc2AdmissionSaturated` alert ([Monitor a cluster](monitor-a-cluster.md)).
@@ -99,8 +99,17 @@ uc2-gateway --config /etc/uc2/gateway.toml
 ```
 
 ```text
-uc2-gateway: listening on 0.0.0.0:9200
+{"ts_ns":1788158925664811895,"level":"info","event":"gateway_listening","bind":"0.0.0.0:9200"}
 ```
+
+Everything `uc2-gateway` says is a JSON record on **stderr** — the same
+format and the same single stream `uc2-node` uses
+([one stream, one format](monitor-a-cluster.md#structured-records)). It
+writes nothing to stdout. The exception, shared with the node, is the
+handful of pre-start refusal lines (`uc2-gateway: …`), which stay human
+prose because they are emitted before anything is running and their
+machine-readable half is the exit code: **2** for a bad config, **1** for a
+runtime start failure.
 
 It attaches to the node's instance directory the way `uc_client::Engine`
 would — start the node first. Under systemd,
@@ -290,10 +299,10 @@ envelope on: it costs 16 bytes per `SUBMIT` and one byte per `RESPONSE`, and
 turns every retry-driven duplicate into a definite `replayed`/`fresh`
 instead of a silent maybe.
 
-## Stats line
+## Stats record
 
-`uc2-gateway` prints one stats line to stderr every 10 s (100 ticks of the
-main loop's 100 ms polling interval), exactly these fields in order:
+`uc2-gateway` emits one `gateway_stats` record every 10 s (100 ticks of the
+main loop's 100 ms polling interval), with exactly these fields in order:
 `conns` (connections accepted), `submits`, `queries`, `responses`,
 `redirects`, `retries`, `unknown`, `backpressure` (squeeze events),
 `grant_changes` (per-connection grant redivisions — moves as connections come
@@ -303,9 +312,9 @@ transitions), `status`
 at the `max_connections` ceiling). `EdgeStats` also tracks
 `leader_changed_frames` (`LEADER_CHANGED` frames actually written, which can
 differ from `leader_changes` — a transition to an unresolvable leader hint
-is observed but not announced) but the reference binary does not print it;
+is observed but not announced) but the reference binary does not emit it;
 read it via `Edge::stats()` if you embed the library yourself. Use the
-stats line as a coarse eyes-on-the-box signal; for anything durable, scrape
+stats record as a coarse eyes-on-the-box signal; for anything durable, scrape
 metrics off the co-located node (`../how-to/monitor-a-cluster.md`) — the
 gateway itself exposes no `/metrics` endpoint.
 

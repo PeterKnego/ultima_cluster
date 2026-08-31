@@ -42,6 +42,11 @@ pub mod ipc;
 pub(crate) mod mutation;
 mod node;
 pub mod obs;
+
+/// Re-exported so the 33 in-crate `crate::obs_event!(…)` call sites — and
+/// anything outside naming `uc_node::obs_event!` — keep resolving after the
+/// macro moved to [`uc_obs`].
+pub use uc_obs::obs_event;
 pub mod preflight;
 mod read_round;
 pub mod recovery;

@@ -1,0 +1,17 @@
+[package]
+name = "uc_obs"
+description = "UC v2 observability core: the structured JSON-lines log record format shared by every UC daemon (uc2-node, uc2-gateway)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Deliberately empty, and worth keeping that way: this crate sits UNDER every
+# daemon in the dependency graph, so anything it pulls in, they all pull in.
+# The log core is std-only by construction.
+[dependencies]

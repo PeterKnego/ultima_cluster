@@ -106,7 +106,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   remote-reachable; lag policy per node must match cluster-wide (checked on
   the snapshot path); one stalled FSM on a quorum of hosts stalls commit by
   design (report ceiling); `service.<id>.lock` per FSM.
-- **12 publishable crates, versioned in lockstep** with the tag and the
+- **13 publishable crates, versioned in lockstep** with the tag and the
   image; `uc_sim`, `uc_lincheck` and the example crates are
   `publish = false`. Publishing is manual and ordered
   (`docs/how-to/cut-a-release.md` §6); `deny.toml` + `cargo-deny` run in CI
@@ -224,6 +224,13 @@ Workspace crates:
   RFC-6479 anti-replay, and the `SharedTransport`/`SendHalf`/`ReceiveHalf`
   split that keeps the per-datagram hot path off a lock. `uc_net` calls it at
   two seams; `uc_node` owns config, handshake routing, and key rotation.
+- `uc_obs` — the structured JSON-lines log record format (`emit`, the
+  `obs_event!` macro, the level filter, and the single `format_line_at`
+  formatter the admin audit file also renders through). A dependency-free
+  leaf so it can sit under every daemon: `uc2-gateway` must not depend on
+  `uc_node`, and both emit the same records. Purpose-named on purpose —
+  it is not a `common`/`util` dumping ground, and a crate rename is a
+  major version now that the 2.9.0 carve-out is spent.
 - `uc_consensus` — pure-sync Raft-safety core over **byte positions**:
   `CommitTracker` (quorum-th highest committed position), `ElectionSm`
   (lexicographic `(last_term, last_durable)` vote, data-stamped term map,

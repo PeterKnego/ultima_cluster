@@ -328,6 +328,17 @@ flooding.
 | `draining` | `node` | SIGTERM/SIGINT received; the observability endpoint is closed and the archive is draining to the `--drain-timeout-secs` deadline |
 | `stopped` | `node`, `outcome`, and on a timeout `unrecorded`, `append`, `durable` | the daemon's last record. `outcome` is `drained` (the archive caught up; a clean exit 0) or `drain_deadline_expired` (it did not, and the node stopped anyway — `unrecorded` is how many bytes the restarted node will re-fetch). One event name with an outcome field, so a consumer greps `"event":"stopped"` and reads `outcome`, rather than matching two differently-shaped lines. |
 
+`uc2-gateway` emits the same format on the same stream, with its own
+event names so a merged journal stays unambiguous:
+
+| Event | Fields | Means |
+|---|---|---|
+| `gateway_listening` | `bind` | the edge's TCP front door is bound |
+| `gateway_stats` | `conns`, `submits`, `queries`, `responses`, `redirects`, `retries`, `unknown`, `backpressure`, `grant_changes`, `leader_changes`, `status`, `refused_busy` | the 10 s counter sample — see [Run a gateway § Stats record](run-a-gateway.md#stats-record) for what each one means |
+| `gateway_edge_faulted` | `reason` | the node's instance restarted underneath the gateway, so its attach is void; the daemon exits 1 for the supervisor to restart it against the new instance |
+| `gateway_signal_handler_failed` | `err` | the signal handler could not be installed at startup; the daemon stops rather than run unstoppable |
+| `gateway_stopped` | — | SIGTERM/SIGINT received; the edge is stopping. The gateway holds no durable state, so there is no drain and no outcome field |
+
 `agent_failstopped` is a behavior change worth calling out on its own: before
 M10, a mid-run agent panic could leave the process running with a healthy-
 looking exterior — a zombie node still holding its instance-directory lock,

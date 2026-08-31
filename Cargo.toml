@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol", "uc_log", "uc_net", "uc_consensus", "uc_sim", "uc_node", "uc_ctl", "uc_service", "uc_client", "uc_crypto", "uc_lincheck", "uc_journal", "examples/uc_crashtest", "examples/counter", "uc_remote", "uc_gateway"]
+members = ["uc_protocol", "uc_log", "uc_net", "uc_consensus", "uc_sim", "uc_node", "uc_ctl", "uc_service", "uc_client", "uc_crypto", "uc_obs", "uc_lincheck", "uc_journal", "examples/uc_crashtest", "examples/counter", "uc_remote", "uc_gateway"]
 exclude = ["fuzz"] # cargo-fuzz crate: nightly-only, its own [workspace]; see fuzz/README.md
 
 [workspace.package]

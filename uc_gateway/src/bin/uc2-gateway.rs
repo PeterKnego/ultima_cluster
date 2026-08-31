@@ -40,7 +40,7 @@ struct Args {
     config: PathBuf,
 }
 
-/// How often (in 100 ms ticks) the stats line prints to stderr — 100 * 100 ms
+/// How often (in 100 ms ticks) the stats record is emitted — 100 * 100 ms
 /// = 10 s, per the controller ruling.
 const STATS_EVERY_N_TICKS: u64 = 100;
 
@@ -66,12 +66,14 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    eprintln!("uc2-gateway: listening on {}", edge.local_addr());
+    let bind_str = edge.local_addr().to_string();
+    uc_obs::obs_event!(Info, "gateway_listening", bind = bind_str.as_str());
 
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&stop)) {
-            eprintln!("uc2-gateway: cannot install signal handler: {e}");
+            let err = e.to_string();
+            uc_obs::obs_event!(Error, "gateway_signal_handler_failed", err = err.as_str());
             edge.stop();
             return ExitCode::from(1);
         }
@@ -84,9 +86,10 @@ fn main() -> ExitCode {
         // than idle forever, so the supervisor gets a fresh gateway up
         // against the new node instance.
         if edge.is_faulted() {
-            eprintln!(
-                "uc2-gateway: edge faulted: the node's instance restarted; exiting so the \
-                 supervisor restarts the gateway"
+            uc_obs::obs_event!(
+                Error,
+                "gateway_edge_faulted",
+                reason = "node instance restarted"
             );
             return ExitCode::from(1);
         }
@@ -94,29 +97,28 @@ fn main() -> ExitCode {
         tick += 1;
         if tick.is_multiple_of(STATS_EVERY_N_TICKS) {
             let s = edge.stats();
-            eprintln!(
-                "uc2-gateway: conns={} submits={} queries={} responses={} redirects={} \
-                 retries={} unknown={} backpressure={} grant_changes={} leader_changes={} \
-                 status={} refused_busy={}",
-                s.connections,
-                s.submits,
-                s.queries,
-                s.responses,
-                s.redirects,
-                s.retries,
-                s.unknown,
-                s.backpressure_events,
-                s.grant_changes,
-                s.leader_changes,
-                s.status_frames,
-                s.refused_busy,
+            uc_obs::obs_event!(
+                Info,
+                "gateway_stats",
+                conns = s.connections,
+                submits = s.submits,
+                queries = s.queries,
+                responses = s.responses,
+                redirects = s.redirects,
+                retries = s.retries,
+                unknown = s.unknown,
+                backpressure = s.backpressure_events,
+                grant_changes = s.grant_changes,
+                leader_changes = s.leader_changes,
+                status = s.status_frames,
+                refused_busy = s.refused_busy,
             );
         }
 
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    eprintln!("uc2-gateway: signalled, stopping");
+    uc_obs::obs_event!(Info, "gateway_stopped");
     edge.stop();
     ExitCode::SUCCESS
 }

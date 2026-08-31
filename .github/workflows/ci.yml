@@ -141,7 +141,7 @@ jobs:
           command: check advisories licenses bans sources
           arguments: --all-features
 
-  # M12c Task 1: smoke-tests that the 12 publishable crates (see deny.toml's
+  # M12c Task 1: smoke-tests that the 13 publishable crates (see deny.toml's
   # bans comment in root Cargo.toml) actually package/publish, so a manifest
   # regression (a path dep missing `version =`, a stray `publish = false`,
   # a keyword crates.io would reject, ...) is caught here instead of at
@@ -173,24 +173,25 @@ jobs:
       # `-p ... -p ...` invocation against each other locally instead of
       # hitting the registry — it topo-sorts the selected set itself, so
       # neither the `-p` flag order nor the workspace `members` order
-      # matters here. So: one batched command for all 12 crates, not 12
+      # matters here. So: one batched command for all 13 crates, not 13
       # separate ones (which would each fail — see above).
-      - name: cargo package (all 12 publishable crates)
+      - name: cargo package (all 13 publishable crates)
         run: >
           cargo package --no-verify
-          -p uc_journal -p uc_protocol -p uc_crypto -p uc_log
+          -p uc_journal -p uc_protocol -p uc_obs -p uc_crypto -p uc_log
           -p uc_consensus -p uc_net -p uc_client -p uc_node
           -p uc_service -p uc_remote -p uc_gateway -p uc_ctl
-      # The 4 leaves (no path dependencies of their own: uc_journal,
-      # uc_protocol, uc_remote, uc_consensus) are the only crates that can
+      # The 5 leaves (no path dependencies of their own: uc_journal,
+      # uc_protocol, uc_obs, uc_remote, uc_consensus) are the only crates that can
       # be `cargo publish --dry-run`'d before anything is actually on
       # crates.io — every other crate's path deps can't resolve from the
       # real registry yet. The real, sequential, manual publish order for a
       # release is `docs/how-to/cut-a-release.md` (M12c Task 4); this job
       # only smoke-tests that packaging itself still works.
-      - name: cargo publish --dry-run (the 4 dependency-free leaves)
+      - name: cargo publish --dry-run (the 5 dependency-free leaves)
         run: |
           cargo publish --dry-run -p uc_journal
           cargo publish --dry-run -p uc_protocol
+          cargo publish --dry-run -p uc_obs
           cargo publish --dry-run -p uc_remote
           cargo publish --dry-run -p uc_consensus

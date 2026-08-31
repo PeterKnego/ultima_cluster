@@ -220,6 +220,7 @@ Order is dependency order — it is the only order that resolves:
 ```sh
 cargo publish -p uc_journal
 cargo publish -p uc_protocol
+cargo publish -p uc_obs
 cargo publish -p uc_crypto
 cargo publish -p uc_log
 cargo publish -p uc_consensus

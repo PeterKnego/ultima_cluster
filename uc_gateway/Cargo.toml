@@ -29,6 +29,7 @@ uc_client = { path = "../uc_client", version = "2.8.1" }
 uc_log = { path = "../uc_log", version = "2.8.1" }
 uc_remote = { path = "../uc_remote", version = "2.8.1" }
 uc_protocol = { path = "../uc_protocol", version = "2.8.1" }
+uc_obs = { path = "../uc_obs", version = "2.8.1" }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

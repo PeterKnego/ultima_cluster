@@ -26,7 +26,7 @@ name: release
 # recommends doing that once before every release.
 #
 # NOT here, on purpose: the crates.io publish. It is a manual, ordered,
-# irreversible-per-version sequence (twelve crates, each waiting for the
+# irreversible-per-version sequence (thirteen crates, each waiting for the
 # previous to index) and it is written down in docs/how-to/cut-a-release.md
 # rather than automated. CI's `publish-check` job smoke-tests that the
 # manifests still package.

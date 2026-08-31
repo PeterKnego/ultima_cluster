@@ -1378,6 +1378,7 @@ dependencies = [
  "uc_log",
  "uc_net",
  "uc_node",
+ "uc_obs",
  "uc_protocol",
  "uc_remote",
  "uc_service",
@@ -1454,9 +1455,14 @@ dependencies = [
  "uc_lincheck",
  "uc_log",
  "uc_net",
+ "uc_obs",
  "uc_protocol",
  "uc_service",
 ]
+
+[[package]]
+name = "uc_obs"
+version = "2.9.0"
 
 [[package]]
 name = "uc_protocol"

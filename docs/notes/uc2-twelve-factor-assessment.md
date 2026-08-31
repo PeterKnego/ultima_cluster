@@ -37,11 +37,15 @@ UC does not have.
 | 8 | Concurrency | **Partial** | The page's hard rule — "processes should never daemonize or write PID files. Instead, rely on the operating system's process manager" — is met: the binaries neither daemonize nor write PID files (grep over `src/bin` and `node.rs` is empty), the systemd units are `Type=simple`, and `instance.lock` is a liveness flock, not a PID file. Process *types* are real (node / `uc2-service@<id>` / gateway; ≤ 8 FSMs per node since M14). What falls short is "adding more concurrency is a simple and reliable operation": horizontal scale is M7 membership change, one node at a time under quorum rules via signed `uc2ctl` requests — reliable, not simple. Only the gateway scales like a web tier. |
 | 9 | Disposability | **Pass** | SIGTERM drains the archive to a bounded deadline (`--drain-timeout-secs`, default 5; `TimeoutStopSec=10` in `packaging/systemd/uc2-node.service`); a drain that cannot finish stops anyway and the restart re-fetches the tail. Startup refusals exit **2** and the unit sets `RestartPreventExitStatus=2` — a refused config is refused identically on every retry, so retrying only delays the operator seeing why; exit 1 (a port still held) is retried. The page's closing rule, "architected to handle unexpected, non-graceful terminations … crash-only design", is what the `uc_crashtest` tier tests literally: SIGKILL node + service mid-load, assert the history linearizable. The worker rule ("jobs … reentrant") maps to position-keyed idempotent apply and `Sessioned<S>` exactly-once. Cost: boot fallocates ~78 MiB and a restart converges by snapshot + tail-replay, so "fast" is bounded by the log gap, not constant. |
 | 10 | Dev/prod parity | **Pass on tools and personnel; partial on time** | Same binaries and image locally (`packaging/compose.yml`, labelled a demo topology), on the fleet, and in CI's compose smoke. The page says "resist the urge to use different backing services between development and production"; the one divergence is `allow_volatile_fs` (tmpfs instance dirs for tests), warned on every boot. The page's time gap wants code "deployed hours or even just minutes later"; UC's August tags are days apart (`v2.3.0` 08-19, `v2.4.0` 08-20, `v2.5.0` 08-21, `v2.7.0` 08-26, `v2.8.0` 08-30) — a milestone cadence, and the flag-day upgrade rule means a deploy is a cluster-wide event rather than a rolling one. |
-| 11 | Logs | **Pass with two deviations** | The page: "never concerns itself with routing or storage of its output stream … writes its event stream, unbuffered, to stdout". UC's structured stream is JSON lines, unbuffered (`uc_node/src/obs/log.rs` does `stderr().lock().write_all` per record, no `BufWriter`), level from `[log]`, no log files. Deviations: it goes to **stderr**, and the lifecycle lines in `uc_node/src/bin/uc2-node.rs` (`listening on`, `signalled, draining`, `drained, stopped cleanly`) go to **stdout** via `println!`, so a consumer must merge two streams; the gateway's 10 s stats line is a third format on stderr. `audit.jsonl` is not a log in the page's sense — it is fsync-per-record durable state, and the module docs say so. |
+| 11 | Logs | **Pass with one deviation** (was "two deviations"; closed 2026-08-31) | The page: "never concerns itself with routing or storage of its output stream … writes its event stream, unbuffered, to stdout". UC's structured stream is JSON lines, unbuffered (`uc_obs/src/log.rs` does `stderr().lock().write_all` per record, no `BufWriter`), level from `[log]`, no log files. **Both daemons now have exactly one stream and one format**: every record `uc2-node` and `uc2-gateway` emit from startup onward is a JSON line on stderr, and both write *nothing* to stdout — the lifecycle `println!`s became records (`node_listening`, `metrics_listening`, `draining`, `stopped`, `gateway_listening`, `gateway_stats`, `gateway_stopped`), and the log core moved to the new `uc_obs` crate so the gateway could reach it without depending on `uc_node`. **Remaining deviation:** the stream is stderr, not the page's stdout — a deliberate choice, because the pre-start refusal lines have to go somewhere before `[log] level` is even read, and stdout is left free for data output. Their machine-readable half is the exit code (2 = config, 1 = runtime). `audit.jsonl` is not a log in the page's sense — it is fsync-per-record durable state, and the module docs say so. |
 | 12 | Admin processes | **Pass** | `uc2ctl` ships in the same image at the same version (`--entrypoint /usr/local/bin/uc2ctl`), satisfying "same release … codebase and config"; `backup` / `verify-backup` / `restore` run offline against the instance dir; membership ops are HMAC-signed, audited one-shot requests. The page also wants a REPL "to run arbitrary code or inspect the app's models"; there is none — normal for a Rust binary, but a stated rule. |
 
 **Tally: 7 pass (1, 2, 7, 9, 10, 11, 12 — with the deviations noted), 2
 partial (5, 8), 1 miss by choice (3), 1 opposed by design (6), 1 vacuous (4).**
+
+*Updated 2026-08-31: #11's stream/format split is closed (see the row and
+follow-up 2). The tally is unchanged — #11 was already a pass; what changed is
+that it now carries one stated deviation instead of two.*
 
 ## What would move the score, and what should not
 
@@ -53,9 +57,18 @@ Three changes are cheap and would each close a real deviation:
    render step `packaging/compose.yml` needs today. Key material should
    *stay* file-based: 0600-checked key files are a better secret posture
    than env vars, and `configuration.md` already documents why.
-2. **One log stream (#11).** Route the `println!`/`eprintln!` lifecycle
-   lines in `uc2-node.rs` (and the gateway's stats line) through
-   `obs::log::emit`, and pick one of stdout/stderr for the whole stream.
+2. ~~**One log stream (#11).**~~ **DONE 2026-08-31.** The lifecycle lines in
+   `uc2-node.rs` and every gateway line now render through `emit`, and the
+   stream is stderr for both. Two lines were deleted rather than converted,
+   because they duplicated records the library already emitted: the daemon's
+   100 ms `is now LEADER/follower` poll (`node.rs` emits
+   `became_leader`/`became_follower` **on** the transition, so the poll was
+   also strictly worse — it could miss a flap shorter than its interval) and
+   the `agent fail-stopped` line printed beside `agent_failstopped`. The log
+   core moved from `uc_node/src/obs/log.rs` to a new dependency-free
+   `uc_obs` crate, which is what let `uc2-gateway` emit the same format
+   without depending on `uc_node`. Regression-tested by
+   `the_daemon_writes_nothing_to_stdout_and_everything_to_stderr`.
 3. **A release ledger (#5), if wanted.** A "release" in the page's sense is
    an image digest plus a config-file hash, recorded append-only. It is
    bookkeeping, not code; the rollback constraint underneath is structural.

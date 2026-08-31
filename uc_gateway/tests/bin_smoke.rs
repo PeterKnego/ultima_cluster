@@ -33,6 +33,14 @@ fn a_missing_config_file_exits_2() {
         stderr.contains("uc2-gateway:"),
         "stderr must be prefixed, got: {stderr}"
     );
+    // Twelve-factor #11: one output stream. A pre-start refusal is prose on
+    // stderr (it happens before anything is running and its machine-readable
+    // half is the exit code); stdout is unused by this daemon, always.
+    assert!(
+        out.stdout.is_empty(),
+        "uc2-gateway must write nothing to stdout, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 /// A config that parses and validates but points at a node instance
@@ -76,5 +84,13 @@ gateway = "10.0.0.10:9200"
     assert!(
         stderr.contains("uc2-gateway:"),
         "stderr must be prefixed, got: {stderr}"
+    );
+    // Twelve-factor #11: one output stream. A pre-start refusal is prose on
+    // stderr (it happens before anything is running and its machine-readable
+    // half is the exit code); stdout is unused by this daemon, always.
+    assert!(
+        out.stdout.is_empty(),
+        "uc2-gateway must write nothing to stdout, got: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }

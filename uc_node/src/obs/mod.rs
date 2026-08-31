@@ -3,9 +3,9 @@
 
 //! Observability: structured logging (M10).
 //!
-//! Zero-dependency, `std`-only structured-log core. Later M10 tasks emit
-//! records through [`crate::obs_event!`] at consensus transition sites and
-//! read [`log::LogLevel`] from the config file.
+//! Records are emitted through [`crate::obs_event!`] at consensus
+//! transition sites; [`log::LogLevel`] is read from the config file. The
+//! record format itself lives in [`uc_obs`], shared with `uc2-gateway`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -13,8 +13,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use uc_log::cnc::CncPage;
 
 pub mod http;
-pub mod log;
 pub mod metrics;
+
+/// The structured-log core, re-exported from [`uc_obs`] so that
+/// `uc_node::obs::log::…` keeps naming it. It moved out of this crate so
+/// `uc2-gateway` (which must not depend on `uc_node`) can emit the same
+/// record format — see the `uc_obs` crate docs.
+pub use uc_obs::log;
 
 /// A read-only bundle of the `Arc`-shared counters, flags, and config values
 /// a later task's metrics encoder renders into a series — a straight

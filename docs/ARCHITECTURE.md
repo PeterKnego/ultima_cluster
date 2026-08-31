@@ -349,7 +349,7 @@ can forge fan-out traffic as any node. See runbook §11.
 Builds standalone — the only external storage dep,
 [`ultima-db`](https://crates.io/crates/ultima-db), comes from crates.io.
 
-**Published to crates.io:** twelve crates, prepared and gated in CI,
+**Published to crates.io:** thirteen crates, prepared and gated in CI,
 published **in lockstep at one version** — which is also the git tag, the
 tarball name and the image tag. That is the thirteen crates in the table above, minus `uc_sim` and
 `uc_lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row

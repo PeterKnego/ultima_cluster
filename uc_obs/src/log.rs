@@ -17,7 +17,7 @@
 //! pairs into [`Field`]s without an intermediate allocation.
 //!
 //! [`format_line_at`] is the formatter both this module and the M12b admin
-//! audit log ([`crate::audit`]) render through. `admin_op` — one record per
+//! audit log (`uc_node::audit`) render through. `admin_op` — one record per
 //! admin request the node answers, carrying `actor`, `origin`, `op`,
 //! `op_name`, `id`, `addr`, `seq`, `nonce`, `outcome`, `reason` and
 //! `config_version` — is emitted here at `info` as the *mirror* of the line
@@ -184,10 +184,10 @@ fn push_json_escaped(out: &mut String, s: &str) {
 /// no level renders `{"ts_ns":…,"event":…}` with the level key absent
 /// entirely.
 ///
-/// This is the one formatter in the crate: [`emit`] renders through it, and
-/// so does [`crate::audit::AuditLog::record`], so the JSON escaping and the
+/// This is the one formatter anywhere: [`emit`] renders through it, and
+/// so does `uc_node::audit::AuditLog::record`, so the JSON escaping and the
 /// key-order contract cannot drift between the log stream and the audit file.
-pub(crate) fn format_line_at(
+pub fn format_line_at(
     ts_ns: u128,
     level: Option<LogLevel>,
     event: &'static str,
@@ -253,12 +253,12 @@ pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>]) {
 #[macro_export]
 macro_rules! obs_event {
     ($lvl:ident, $event:expr $(, $key:ident = $val:expr)* $(,)?) => {
-        $crate::obs::log::emit(
-            $crate::obs::log::LogLevel::$lvl,
+        $crate::log::emit(
+            $crate::log::LogLevel::$lvl,
             $event,
-            &[$($crate::obs::log::Field {
+            &[$($crate::log::Field {
                 key: stringify!($key),
-                value: $crate::obs::log::FieldValue::from($val),
+                value: $crate::log::FieldValue::from($val),
             }),*],
         )
     };
