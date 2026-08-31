@@ -29,7 +29,7 @@ UC does not have.
 |---|---|---|---|
 | 1 | Codebase | **Pass** | One repo; 12 crates versioned in lockstep with the tag and image (`docs/how-to/cut-a-release.md`). The page's violation, "multiple apps sharing the same code", is avoided the way the page prescribes: the service SDK is a library dependency (`uc_service` on crates.io), not shared source. |
 | 2 | Dependencies | **Pass** | `Cargo.lock` + `--locked` builds; `cargo-deny` in CI; the image is distroless with no shell. The page's extra rule — "if the app needs to shell out to a system tool, that tool should be vendored into the app" — is moot: `grep Command::new` over all nine shipped crates is empty. Java/`jq` are test-tier only (`scripts/elle_check.sh`). |
-| 3 | Config | **Miss on mechanism, pass on the litmus test** | The page's rule is env vars; UC loads one TOML file per binary (`uc2-node --config`, `deny_unknown_fields`, validated before any agent starts — `docs/reference/configuration.md`). The only production-facing env var is `UC2_CLIENT_TIMEOUT_MS`; `UC2_ALLOW_VOLATILE_FS`, `UC2_MUTATION`, `UC2_TRUNC_TRACE` are test/dev switches (`configuration.md` "Environment switches"). But the page's *litmus test* — "whether the codebase could be made open source at any moment, without compromising any credentials" — passes: the repo is Apache-2.0 public, and `packaging/node.example.toml` holds key *paths* (`key_path`, `allowlist_path`, admin `keys[].key_path`), never key bytes; the loaders refuse group/world-readable key files. The page also says config that "does not vary between deploys … is best done in the code", which endorses the non-configurable `MTU_DEFAULT` and payload ceiling. |
+| 3 | Config | **Pass on mechanism since 2026-08-31; already passed the litmus test** | The page's rule is env vars. UC loads one TOML file per binary (`uc2-node --config`, `deny_unknown_fields`, validated before any agent starts — `docs/reference/configuration.md`) **and, since 2026-08-31, takes an environment override for every key that varies between deploys** (`UC2_NODE_ID`, `UC2_BIND`, `UC2_INSTANCE_DIR`, `UC2_APP_ID`, `UC2_MEMBERS`, `UC2_LOG_LEVEL`, `UC2_METRICS_BIND`, and four `UC2_GATEWAY_*`), environment winning over file — so one image runs every node of a cluster and `packaging/compose.yml` renders two config files rather than six. What is deliberately NOT overridable is key material and tuning values, which is what the page asks for ("config that does not vary between deploys … is best done in the code"). The other production-facing env var is `UC2_CLIENT_TIMEOUT_MS`; `UC2_ALLOW_VOLATILE_FS`, `UC2_MUTATION`, `UC2_TRUNC_TRACE` are test/dev switches (`configuration.md` "Environment switches"). But the page's *litmus test* — "whether the codebase could be made open source at any moment, without compromising any credentials" — passes: the repo is Apache-2.0 public, and `packaging/node.example.toml` holds key *paths* (`key_path`, `allowlist_path`, admin `keys[].key_path`), never key bytes; the loaders refuse group/world-readable key files. The page also says config that "does not vary between deploys … is best done in the code", which endorses the non-configurable `MTU_DEFAULT` and payload ceiling. |
 | 4 | Backing services | **Vacuous** | The page defines one as "any service the app consumes over the network as part of its normal operation". UC consumes none: peers are the same app, the service and clients attach over shared memory in the instance directory (`docs/reference/instance-directory.md`), and Prometheus consumes *UC*. Where UC is on the other side of the relationship it fits the port-binding page's note that "one app can become the backing service for another app, by providing the URL … as a resource handle in the config" — a remote client's `--gateways gw0:9200,…` is exactly that. |
 | 5 | Build / release / run | **Build: strong pass. Release stage: absent. Rollback: constrained.** | *Build* is immutable, signed and traceable: `packaging/Dockerfile` unpacks the checksummed, cosign-signed release tarball so `/usr/local/bin` is byte-identical to what `sha256sum -c` verified, with no toolchain and no network in the image build. But the page defines a *release* as build **plus** the deploy's config, with "a unique release ID" in "an append-only ledger" that "cannot be mutated once it is created". UC has no such artifact — config is a host file combined at run time — and rollback is "no rollback step beyond restarting the old binaries together" (`docs/how-to/upgrade-a-cluster.md`), because the node↔node wire and the `cnc.dat` layout are flag days. |
 | 6 | Processes | **Opposed by design** | The page permits local memory/disk only as "a brief, single-transaction cache" and says "any data that needs to persist must be stored in a stateful backing service, typically a database." A node *is* its state: `journal/`, `state/` (vote, term map, floor, config record), `snapshots/`, all under one flock-guarded instance directory, with the service and clients pinned to the same host by shmem. This is the one factor UC should never try to satisfy. The stateless pieces — `uc2-gateway`, remote clients — do satisfy it. |
@@ -43,20 +43,29 @@ UC does not have.
 **Tally: 7 pass (1, 2, 7, 9, 10, 11, 12 — with the deviations noted), 2
 partial (5, 8), 1 miss by choice (3), 1 opposed by design (6), 1 vacuous (4).**
 
-*Updated 2026-08-31: #11's stream/format split is closed (see the row and
-follow-up 2). The tally is unchanged — #11 was already a pass; what changed is
-that it now carries one stated deviation instead of two.*
+*Updated 2026-08-31. Two follow-ups were executed, so the tally moves:
+**#3 goes from "miss by choice" to pass** (environment overrides for every
+deploy-varying key, key material deliberately excluded), and #11's
+stream/format split is closed — it was already a pass and now carries one
+stated deviation instead of two. **New tally: 8 pass (1, 2, 3, 7, 9, 10, 11,
+12), 2 partial (5, 8), 1 opposed by design (6), 1 vacuous (4)** — nothing is
+now a miss.*
 
 ## What would move the score, and what should not
 
 Three changes are cheap and would each close a real deviation:
 
-1. **Env-var overrides for deploy-varying keys (#3).** `bind`, `[metrics]
-   bind`, `[log] level`, the instance directory, `[[members]]`. That would
-   let a container run from one immutable config without the busybox `init`
-   render step `packaging/compose.yml` needs today. Key material should
-   *stay* file-based: 0600-checked key files are a better secret posture
-   than env vars, and `configuration.md` already documents why.
+1. ~~**Env-var overrides for deploy-varying keys (#3).**~~ **DONE
+   2026-08-31.** `UC2_NODE_ID`, `UC2_BIND`, `UC2_INSTANCE_DIR`,
+   `UC2_APP_ID`, `UC2_MEMBERS`, `UC2_LOG_LEVEL`, `UC2_METRICS_BIND` and the
+   four `UC2_GATEWAY_*` equivalents, environment winning over file, each
+   announced by a `config_env_override` record. `packaging/compose.yml` now
+   renders **two** config files instead of six — one `node.toml` and one
+   `gateway.toml`, with every per-container difference an env var — so the
+   busybox step remains only to write the admin key and chown the volumes,
+   not to template six near-identical files. Key material stayed file-based
+   as this bullet asked, and a unit test enforces it. →
+   [Configuration § Environment overrides](../reference/configuration.md#environment-overrides)
 2. ~~**One log stream (#11).**~~ **DONE 2026-08-31.** The lifecycle lines in
    `uc2-node.rs` and every gateway line now render through `emit`, and the
    stream is stderr for both. Two lines were deleted rather than converted,

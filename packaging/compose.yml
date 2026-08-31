@@ -21,7 +21,11 @@
 #
 # The image has no shell, so every `command:` here is an exec-form argv and
 # the one step that genuinely needs a shell — rendering the config files into
-# the volumes — runs in a `busybox` init container instead.
+# the volumes — runs in a `busybox` init container instead. It renders TWO
+# files, not six: one node.toml and one gateway.toml, shared by all three of
+# each. Everything that differs per node (id, bind, instance_dir, listen) is
+# a `UC2_*` environment variable on the container, which is the twelve-factor
+# shape and is why the shared files cannot drift apart.
 #
 # Reaching it from the host: the gateways publish 9200-9202 one-to-one, but
 # the addresses a gateway hands out in a REDIRECT come from the [[members]]
@@ -88,11 +92,20 @@ services:
       - -c
       - |
         set -eu
-        for i in 0 1 2; do
-          cat >"/etc/uc2/n$${i}.toml" <<EOF
-        id = $${i}
-        bind = "10.77.0.10$${i}:9100"
-        instance_dir = "/srv/uc2/n$${i}"
+        # ONE node config and ONE gateway config, shared by all three of
+        # each. Everything that differs per node — id, bind, instance_dir,
+        # listen — is an environment variable on the container below, which
+        # is what twelve-factor asks for and what keeps this from being six
+        # near-identical files that drift.
+        cat >/etc/uc2/node.toml <<EOF
+        # id / bind / instance_dir are placeholders: every node container
+        # overrides all three via UC2_NODE_ID / UC2_BIND / UC2_INSTANCE_DIR.
+        # They are still written because they are REQUIRED keys — the file
+        # must be a valid config on its own, so that running it with no
+        # environment is a working single node rather than a parse error.
+        id = 0
+        bind = "10.77.0.100:9100"
+        instance_dir = "/srv/uc2/n0"
         app_id = "quickstart"
 
         [[members]]
@@ -120,19 +133,25 @@ services:
         # [crypto].enabled = false, a follower forwards an authenticated
         # admin request to the leader over the unauthenticated peer plane —
         # cluster-wide admin authentication needs both switches on.
+        #
+        # The key stays a FILE, not an environment variable: env leaks into
+        # /proc/<pid>/environ, `docker inspect` and every child process,
+        # which is why no UC2_* override carries key material.
         [admin]
         auth = "hmac"
         keys = [{ name = "admin", key_path = "/etc/uc2/admin.key" }]
         EOF
-          cat >"/etc/uc2/gw$${i}.toml" <<EOF
+        cat >/etc/uc2/gateway.toml <<EOF
+        # instance_dir / listen are likewise overridden per container, via
+        # UC2_GATEWAY_INSTANCE_DIR / UC2_GATEWAY_LISTEN.
         [local]
-        instance_dir = "/srv/uc2/n$${i}"
+        instance_dir = "/srv/uc2/n0"
         app_id = "quickstart"
-        listen = "0.0.0.0:920$${i}"
+        listen = "0.0.0.0:9200"
 
         # Every gateway's address, keyed by node id — how a gateway that is
-        # NOT on the leader tells a client where to go. Identical in all
-        # three files, by construction.
+        # NOT on the leader tells a client where to go. Identical for all
+        # three, which is exactly why it can live in one shared file now.
         [[members]]
         node_id = 0
         gateway = "gw0:9200"
@@ -154,7 +173,6 @@ services:
         [session]
         envelope = false
         EOF
-        done
         # gen-admin-key refuses to overwrite an existing key, on purpose —
         # rotating one is a deliberate act. This is a demo stack that is torn
         # down with `down -v`, so a re-`up` gets a fresh key rather than a
@@ -162,7 +180,7 @@ services:
         rm -f /etc/uc2/admin.key
         chown -R 65532:65532 /srv/uc2/n0 /srv/uc2/n1 /srv/uc2/n2 /etc/uc2
         chmod 0755 /etc/uc2
-        echo "init: configs rendered, volumes owned by 65532"
+        echo "init: 2 configs rendered (was 6), volumes owned by 65532"
 
   # A 32-byte, mode-0600 admin key, written by the same uid the nodes run as
   # so they can read it. Its own step because the image has no shell and
@@ -191,7 +209,11 @@ services:
   # docs/how-to/monitor-a-cluster.md.)
   n0:
     image: *uc2_image
-    command: ["--config", "/etc/uc2/n0.toml"]
+    command: ["--config", "/etc/uc2/node.toml"]
+    environment:
+      UC2_NODE_ID: "0"
+      UC2_BIND: "10.77.0.100:9100"
+      UC2_INSTANCE_DIR: "/srv/uc2/n0"
     networks:
       uc2:
         ipv4_address: 10.77.0.100
@@ -211,7 +233,11 @@ services:
 
   n1:
     image: *uc2_image
-    command: ["--config", "/etc/uc2/n1.toml"]
+    command: ["--config", "/etc/uc2/node.toml"]
+    environment:
+      UC2_NODE_ID: "1"
+      UC2_BIND: "10.77.0.101:9100"
+      UC2_INSTANCE_DIR: "/srv/uc2/n1"
     networks:
       uc2:
         ipv4_address: 10.77.0.101
@@ -231,7 +257,11 @@ services:
 
   n2:
     image: *uc2_image
-    command: ["--config", "/etc/uc2/n2.toml"]
+    command: ["--config", "/etc/uc2/node.toml"]
+    environment:
+      UC2_NODE_ID: "2"
+      UC2_BIND: "10.77.0.102:9100"
+      UC2_INSTANCE_DIR: "/srv/uc2/n2"
     networks:
       uc2:
         ipv4_address: 10.77.0.102
@@ -298,7 +328,10 @@ services:
   gw0:
     image: *uc2_image
     entrypoint: ["/usr/local/bin/uc2-gateway"]
-    command: ["--config", "/etc/uc2/gw0.toml"]
+    command: ["--config", "/etc/uc2/gateway.toml"]
+    environment:
+      UC2_GATEWAY_INSTANCE_DIR: "/srv/uc2/n0"
+      UC2_GATEWAY_LISTEN: "0.0.0.0:9200"
     networks:
       uc2:
     ports:
@@ -314,7 +347,10 @@ services:
   gw1:
     image: *uc2_image
     entrypoint: ["/usr/local/bin/uc2-gateway"]
-    command: ["--config", "/etc/uc2/gw1.toml"]
+    command: ["--config", "/etc/uc2/gateway.toml"]
+    environment:
+      UC2_GATEWAY_INSTANCE_DIR: "/srv/uc2/n1"
+      UC2_GATEWAY_LISTEN: "0.0.0.0:9201"
     networks:
       uc2:
     ports:
@@ -330,7 +366,10 @@ services:
   gw2:
     image: *uc2_image
     entrypoint: ["/usr/local/bin/uc2-gateway"]
-    command: ["--config", "/etc/uc2/gw2.toml"]
+    command: ["--config", "/etc/uc2/gateway.toml"]
+    environment:
+      UC2_GATEWAY_INSTANCE_DIR: "/srv/uc2/n2"
+      UC2_GATEWAY_LISTEN: "0.0.0.0:9202"
     networks:
       uc2:
     ports:

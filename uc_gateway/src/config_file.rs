@@ -37,6 +37,12 @@ pub enum ConfigFileError {
     },
     #[error("{0}")]
     Invalid(#[from] ConfigError),
+    /// An environment override ([`ENV_OVERRIDES`]) did not parse. Separate
+    /// from [`ConfigFileError::Invalid`] on purpose: the message names the
+    /// VARIABLE, because the file is fine and pointing the operator at
+    /// `local.listen` would send them to edit the wrong thing.
+    #[error("{0}")]
+    Env(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,7 +148,7 @@ pub fn load_from_path(path: &Path) -> Result<EdgeConfig, ConfigFileError> {
     // `parse_str` has no path to name, so it stamps [`IN_MEMORY_CONFIG`];
     // re-stamp the real one here so a refusal still tells the operator which
     // file to edit.
-    parse_str(&text).map_err(|e| match e {
+    parse_str_with_env(&text, |k| std::env::var(k).ok()).map_err(|e| match e {
         ConfigFileError::Parse { source, .. } => ConfigFileError::Parse {
             path: path.to_path_buf(),
             source,
@@ -167,10 +173,82 @@ pub const IN_MEMORY_CONFIG: &str = "<in-memory config>";
 /// the `uc_gateway_toml` fuzz target) can reach the parser without staging a
 /// temporary file.
 pub fn parse_str(text: &str) -> Result<EdgeConfig, ConfigFileError> {
-    let f: EdgeConfigFile = toml::from_str(text).map_err(|source| ConfigFileError::Parse {
+    parse_str_with_env(text, |_| None)
+}
+
+/// The environment variables that override `gateway.toml`. Same posture and
+/// same reasoning as `uc_node::config_file::ENV_OVERRIDES` — only keys that
+/// vary between deploys of one image, and no key material.
+pub const ENV_OVERRIDES: &[(&str, &str)] = &[
+    ("UC2_GATEWAY_INSTANCE_DIR", "local.instance_dir"),
+    ("UC2_GATEWAY_APP_ID", "local.app_id"),
+    ("UC2_GATEWAY_LISTEN", "local.listen"),
+    ("UC2_GATEWAY_MEMBERS", "members"),
+];
+
+/// [`parse_str`] plus the twelve-factor environment layer, environment
+/// winning over file. `env` is an explicit lookup so [`parse_str`] stays a
+/// pure function of its text (it is the `uc_gateway_toml` fuzz target's entry
+/// point) and so tests need not call the `unsafe` `std::env::set_var`.
+pub fn parse_str_with_env(
+    text: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<EdgeConfig, ConfigFileError> {
+    let mut f: EdgeConfigFile = toml::from_str(text).map_err(|source| ConfigFileError::Parse {
         path: PathBuf::from(IN_MEMORY_CONFIG),
         source,
     })?;
+
+    fn note(var: &'static str, value: &str) {
+        uc_obs::obs_event!(Info, "config_env_override", var = var, value = value);
+    }
+    if let Some(v) = env("UC2_GATEWAY_INSTANCE_DIR") {
+        f.local.instance_dir = PathBuf::from(&v);
+        note("UC2_GATEWAY_INSTANCE_DIR", &v);
+    }
+    if let Some(v) = env("UC2_GATEWAY_APP_ID") {
+        f.local.app_id = v.clone();
+        note("UC2_GATEWAY_APP_ID", &v);
+    }
+    if let Some(v) = env("UC2_GATEWAY_LISTEN") {
+        f.local.listen = v.parse().map_err(|_| {
+            ConfigFileError::Env(format!(
+                "UC2_GATEWAY_LISTEN=\"{v}\" is not a socket address (host:port)"
+            ))
+        })?;
+        note("UC2_GATEWAY_LISTEN", &v);
+    }
+    if let Some(v) = env("UC2_GATEWAY_MEMBERS") {
+        // `node_id@host:port` pairs, comma-separated. REPLACES the file's
+        // table outright: the redirect map has to agree across gateways, so a
+        // half-overridden one is never what anyone means.
+        let mut out = Vec::new();
+        for entry in v.split(',').map(str::trim) {
+            let bad = ConfigFileError::Env;
+            if entry.is_empty() {
+                return Err(bad(
+                    "UC2_GATEWAY_MEMBERS has an empty entry — expected node_id@host:port pairs"
+                        .to_string(),
+                ));
+            }
+            let (id_s, gw) = entry.split_once('@').ok_or_else(|| {
+                bad(format!(
+                    "UC2_GATEWAY_MEMBERS entry \"{entry}\" has no '@' — expected node_id@host:port"
+                ))
+            })?;
+            let node_id = id_s.parse().map_err(|_| {
+                bad(format!(
+                    "UC2_GATEWAY_MEMBERS entry \"{entry}\": \"{id_s}\" is not a node id (u32)"
+                ))
+            })?;
+            out.push(MemberFile {
+                node_id,
+                gateway: gw.to_string(),
+            });
+        }
+        f.members = out;
+        note("UC2_GATEWAY_MEMBERS", &v);
+    }
 
     let limits = f.limits.unwrap_or_default();
     let session = f.session.unwrap_or_default();

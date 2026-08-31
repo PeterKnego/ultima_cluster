@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use uc_gateway::config_file::{ConfigFileError, load_from_path, parse_str};
+use uc_gateway::config_file::{ConfigFileError, load_from_path, parse_str, parse_str_with_env};
 use uc_gateway::{ConfigError, Member};
 
 /// A temp dir on real disk — `CARGO_TARGET_TMPDIR` lives under `target/`
@@ -291,4 +291,82 @@ fn parse_str_is_the_loader_without_the_file() {
         parse_str(empty_app),
         Err(ConfigFileError::Invalid(_))
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Twelve-factor #3: the environment layer.
+// ---------------------------------------------------------------------------
+
+/// A fake environment, so these tests never touch the process environment
+/// (`std::env::set_var` is `unsafe` in edition 2024 — it races every other
+/// thread in the test binary).
+fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    move |k: &str| {
+        pairs
+            .iter()
+            .find(|(var, _)| *var == k)
+            .map(|(_, v)| (*v).to_string())
+    }
+}
+
+#[test]
+fn parse_str_ignores_the_environment_entirely() {
+    // `parse_str` is the `uc_gateway_toml` fuzz target's entry point: a fuzz
+    // target whose result depends on ambient state is not reproducible.
+    let cfg = parse_str(MINIMAL).expect("MINIMAL parses");
+    assert_eq!(cfg.app_id, "myapp");
+}
+
+#[test]
+fn env_overrides_every_deploy_varying_key() {
+    let cfg = parse_str_with_env(
+        MINIMAL,
+        env_of(&[
+            ("UC2_GATEWAY_INSTANCE_DIR", "/srv/uc2/n2"),
+            ("UC2_GATEWAY_APP_ID", "otherapp"),
+            ("UC2_GATEWAY_LISTEN", "0.0.0.0:9202"),
+            ("UC2_GATEWAY_MEMBERS", "0@gw0:9200,1@gw1:9201,2@gw2:9202"),
+        ]),
+    )
+    .expect("overrides apply");
+    assert_eq!(cfg.instance_dir, std::path::PathBuf::from("/srv/uc2/n2"));
+    assert_eq!(cfg.app_id, "otherapp");
+    assert_eq!(cfg.listen.to_string(), "0.0.0.0:9202");
+    assert_eq!(
+        cfg.members.len(),
+        3,
+        "UC2_GATEWAY_MEMBERS REPLACES the file's table, never merges into it"
+    );
+    assert_eq!(cfg.members[2].gateway, "gw2:9202");
+}
+
+#[test]
+fn an_unset_variable_leaves_the_file_value_alone() {
+    let cfg = parse_str_with_env(MINIMAL, env_of(&[("UC2_GATEWAY_LISTEN", "0.0.0.0:9999")]))
+        .expect("one override applies");
+    assert_eq!(cfg.listen.to_string(), "0.0.0.0:9999", "the set one wins");
+    assert_eq!(cfg.app_id, "myapp", "the unset ones are untouched");
+}
+
+#[test]
+fn a_bad_env_value_is_refused_by_name() {
+    // The message must name the VARIABLE: the file is valid, so pointing at
+    // `local.listen` would send the operator to edit the wrong thing.
+    for (var, value) in [
+        ("UC2_GATEWAY_LISTEN", "not-an-addr"),
+        ("UC2_GATEWAY_MEMBERS", "0@gw0:9200,junk"),
+        ("UC2_GATEWAY_MEMBERS", "x@gw0:9200"),
+        ("UC2_GATEWAY_MEMBERS", "0@gw0:9200,"),
+    ] {
+        let err = parse_str_with_env(MINIMAL, env_of(&[(var, value)]))
+            .expect_err(&format!("{var}={value} must be refused"));
+        assert!(
+            matches!(err, ConfigFileError::Env(_)),
+            "{var}={value} must be ConfigFileError::Env, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(var),
+            "{var}={value} must be refused BY NAME, got: {err}"
+        );
+    }
 }

@@ -288,10 +288,10 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
         path: path.to_path_buf(),
         source,
     })?;
-    // `parse_str` has no path to name, so it stamps [`IN_MEMORY_CONFIG`];
-    // re-stamp the real one here so a refusal still tells the operator which
-    // file to edit.
-    parse_str(&text).map_err(|e| match e {
+    // `parse_str_with_env` has no path to name, so it stamps
+    // [`IN_MEMORY_CONFIG`]; re-stamp the real one here so a refusal still
+    // tells the operator which file to edit.
+    parse_str_with_env(&text, |k| std::env::var(k).ok()).map_err(|e| match e {
         ConfigError::Parse { source, .. } => ConfigError::Parse {
             path: path.to_path_buf(),
             source,
@@ -303,6 +303,146 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
 /// The path [`ConfigError::Parse`] carries when the text did not come from a
 /// file — see [`parse_str`].
 pub const IN_MEMORY_CONFIG: &str = "<in-memory config>";
+
+/// The environment variables that override `node.toml`, in the order they
+/// are applied. Public so the reference doc and the daemon's `--help` cannot
+/// drift from the implementation.
+///
+/// Only keys that legitimately VARY BETWEEN DEPLOYS of the same image are
+/// here — the twelve-factor test. Tuning knobs (`buffer_bytes`,
+/// `election_timeout_*`) are part of the build's behaviour and stay in the
+/// file, and **key material is deliberately absent**: `crypto.key_path` and
+/// the `[admin]` key paths stay file-based because a 0600-checked key file
+/// is a better secret posture than an environment variable, which leaks into
+/// `/proc/<pid>/environ`, `docker inspect` and every child process.
+pub const ENV_OVERRIDES: &[(&str, &str)] = &[
+    ("UC2_NODE_ID", "id"),
+    ("UC2_BIND", "bind"),
+    ("UC2_INSTANCE_DIR", "instance_dir"),
+    ("UC2_APP_ID", "app_id"),
+    ("UC2_MEMBERS", "members"),
+    ("UC2_LOG_LEVEL", "log.level"),
+    ("UC2_METRICS_BIND", "metrics.bind"),
+];
+
+/// Build the `Invalid` refusal for an env var that did not parse. It names
+/// the VARIABLE, not the TOML key: the operator has to edit the environment,
+/// and an error pointing at `bind` when the file's `bind` is fine is a
+/// wild-goose chase.
+fn env_invalid(var: &'static str, field: &'static str, value: &str, expected: &str) -> ConfigError {
+    ConfigError::Invalid {
+        field,
+        detail: format!("{var}=\"{value}\" is not {expected}"),
+    }
+}
+
+/// Apply the environment layer to a freshly-parsed document.
+///
+/// An unset variable leaves the file's value alone; a set one replaces it
+/// whether or not the file specified it. Each override that actually fires
+/// emits a `config_env_override` record, so an operator reading the log can
+/// always tell which values did not come from the file they are looking at —
+/// silent precedence is the thing that makes environment config hard to
+/// debug.
+fn apply_env_overrides(
+    f: &mut NodeConfigFile,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    fn note(var: &'static str, value: &str) {
+        crate::obs_event!(Info, "config_env_override", var = var, value = value);
+    }
+
+    if let Some(v) = env("UC2_NODE_ID") {
+        f.id = v
+            .parse()
+            .map_err(|_| env_invalid("UC2_NODE_ID", "id", &v, "a node id (u32)"))?;
+        note("UC2_NODE_ID", &v);
+    }
+    if let Some(v) = env("UC2_BIND") {
+        f.bind = v
+            .parse()
+            .map_err(|_| env_invalid("UC2_BIND", "bind", &v, "a socket address (host:port)"))?;
+        note("UC2_BIND", &v);
+    }
+    if let Some(v) = env("UC2_INSTANCE_DIR") {
+        f.instance_dir = PathBuf::from(&v);
+        note("UC2_INSTANCE_DIR", &v);
+    }
+    if let Some(v) = env("UC2_APP_ID") {
+        f.app_id = v.clone();
+        note("UC2_APP_ID", &v);
+    }
+    if let Some(v) = env("UC2_MEMBERS") {
+        f.members = parse_members_env(&v)?;
+        note("UC2_MEMBERS", &v);
+    }
+    if let Some(v) = env("UC2_LOG_LEVEL") {
+        // Validated here rather than left to the later `LogLevel::from_str`
+        // so the refusal names the variable.
+        if v.parse::<uc_obs::log::LogLevel>().is_err() {
+            return Err(env_invalid(
+                "UC2_LOG_LEVEL",
+                "log.level",
+                &v,
+                "one of error|warn|info",
+            ));
+        }
+        f.log = Some(LogSectionFile {
+            level: Some(v.clone()),
+        });
+        note("UC2_LOG_LEVEL", &v);
+    }
+    if let Some(v) = env("UC2_METRICS_BIND") {
+        let bind = v.parse().map_err(|_| {
+            env_invalid(
+                "UC2_METRICS_BIND",
+                "metrics.bind",
+                &v,
+                "a socket address (host:port)",
+            )
+        })?;
+        f.metrics = Some(MetricsSectionFile { bind: Some(bind) });
+        note("UC2_METRICS_BIND", &v);
+    }
+    Ok(())
+}
+
+/// `UC2_MEMBERS` = `id@addr` pairs, comma-separated:
+/// `0@10.0.0.1:9100,1@10.0.0.2:9100,2@10.0.0.3:9100`.
+///
+/// It REPLACES the file's `[[members]]` table outright rather than merging.
+/// A membership list is a set that must agree across the cluster, so a
+/// half-overridden one is never what anyone means — and the whole point of
+/// the variable is the compose/k8s case where one baked config file is shared
+/// by every node and the table is the part that differs.
+fn parse_members_env(raw: &str) -> Result<Vec<Member>, ConfigError> {
+    let mut out = Vec::new();
+    for (i, entry) in raw.split(',').map(str::trim).enumerate() {
+        if entry.is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "members",
+                detail: format!(
+                    "UC2_MEMBERS entry {i} is empty — expected id@addr pairs, \
+                     e.g. 0@10.0.0.1:9100,1@10.0.0.2:9100"
+                ),
+            });
+        }
+        let (id_s, addr_s) = entry.split_once('@').ok_or_else(|| ConfigError::Invalid {
+            field: "members",
+            detail: format!("UC2_MEMBERS entry \"{entry}\" has no '@' — expected id@addr"),
+        })?;
+        let id = id_s.parse().map_err(|_| ConfigError::Invalid {
+            field: "members",
+            detail: format!("UC2_MEMBERS entry \"{entry}\": \"{id_s}\" is not a node id (u32)"),
+        })?;
+        let addr = addr_s.parse().map_err(|_| ConfigError::Invalid {
+            field: "members",
+            detail: format!("UC2_MEMBERS entry \"{entry}\": \"{addr_s}\" is not a socket address"),
+        })?;
+        out.push(Member { id, addr });
+    }
+    Ok(out)
+}
 
 /// The file loader's pure inner: turn `node.toml` **text** into the same
 /// `(NodeConfig, StartupOptions)` pair, with the same validation and the same
@@ -316,10 +456,34 @@ pub const IN_MEMORY_CONFIG: &str = "<in-memory config>";
 /// temporary file; performs NO validation beyond what `load_from_path` does,
 /// so [`crate::preflight::check`] is still the next step.
 pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError> {
-    let f: NodeConfigFile = toml::from_str(text).map_err(|source| ConfigError::Parse {
+    parse_str_with_env(text, |_| None)
+}
+
+/// [`parse_str`] plus the twelve-factor environment layer.
+///
+/// `env` is an explicit lookup rather than a direct read of the process
+/// environment, for two reasons: `std::env::set_var` is `unsafe` in edition
+/// 2024 (it races other threads' reads), so a test that wanted to exercise
+/// overrides against the real environment could not do so soundly; and
+/// [`parse_str`] must stay a pure function of its text — it is the
+/// `uc_node_toml` fuzz target's entry point, and a fuzz target whose result
+/// depends on ambient state is not reproducible. [`parse_str`] therefore
+/// passes a lookup that always returns `None`.
+///
+/// Precedence is environment over file, per
+/// <https://12factor.net/config>. An override is applied to the parsed
+/// document BEFORE validation, so a bad value is refused by exactly the same
+/// [`ConfigError::Invalid`] path a bad file value is — naming the env var
+/// rather than the TOML key, because that is what the operator has to fix.
+pub fn parse_str_with_env(
+    text: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<(NodeConfig, StartupOptions), ConfigError> {
+    let mut f: NodeConfigFile = toml::from_str(text).map_err(|source| ConfigError::Parse {
         path: PathBuf::from(IN_MEMORY_CONFIG),
         source,
     })?;
+    apply_env_overrides(&mut f, &env)?;
 
     let purge = match f.purge {
         Some(p) => PurgePolicy::BelowSnapshot {
@@ -598,6 +762,115 @@ app_id = "myapp"
 id = 1
 addr = "10.0.0.1:9100"
 "#;
+
+    /// A fake environment: a slice of (var, value) pairs, so these tests
+    /// never touch the process environment (`set_var` is `unsafe` in edition
+    /// 2024 and would race the whole test binary's other threads).
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(var, _)| *var == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn parse_str_ignores_the_environment_entirely() {
+        // The fuzz target's entry point must be a pure function of its text.
+        // If this ever regresses, `uc_node_toml` is fuzzing ambient state.
+        let (cfg, _) = parse_str(MINIMAL).expect("MINIMAL parses");
+        assert_eq!(cfg.id, 1);
+        assert_eq!(cfg.bind.to_string(), "10.0.0.1:9100");
+    }
+
+    #[test]
+    fn env_overrides_every_deploy_varying_key() {
+        let env = env_of(&[
+            ("UC2_NODE_ID", "2"),
+            ("UC2_BIND", "10.9.9.9:7100"),
+            ("UC2_INSTANCE_DIR", "/mnt/other"),
+            ("UC2_APP_ID", "otherapp"),
+            (
+                "UC2_MEMBERS",
+                "0@10.0.0.1:9100,1@10.0.0.2:9100,2@10.9.9.9:7100",
+            ),
+            ("UC2_LOG_LEVEL", "warn"),
+            ("UC2_METRICS_BIND", "0.0.0.0:9600"),
+        ]);
+        let (cfg, opts) = parse_str_with_env(MINIMAL, env).expect("overrides apply");
+
+        assert_eq!(cfg.id, 2, "UC2_NODE_ID must win over the file's id = 1");
+        assert_eq!(cfg.bind.to_string(), "10.9.9.9:7100");
+        assert_eq!(cfg.instance_dir, PathBuf::from("/mnt/other"));
+        assert_eq!(cfg.app_id, "otherapp");
+        assert_eq!(
+            cfg.members.len(),
+            3,
+            "UC2_MEMBERS REPLACES the file's table"
+        );
+        assert_eq!(cfg.members[2].0, 2);
+        assert_eq!(cfg.members[2].1.to_string(), "10.9.9.9:7100");
+        assert_eq!(opts.obs.log_level, uc_obs::log::LogLevel::Warn);
+        assert_eq!(
+            opts.obs.metrics_bind.map(|a| a.to_string()),
+            Some("0.0.0.0:9600".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unset_variable_leaves_the_file_value_alone() {
+        let (cfg, opts) = parse_str_with_env(MINIMAL, env_of(&[("UC2_BIND", "10.9.9.9:7100")]))
+            .expect("one override applies");
+        assert_eq!(cfg.bind.to_string(), "10.9.9.9:7100", "the set one wins");
+        assert_eq!(cfg.id, 1, "the unset one is untouched");
+        assert_eq!(cfg.app_id, "myapp");
+        assert!(opts.obs.metrics_bind.is_none(), "no [metrics], none added");
+    }
+
+    #[test]
+    fn a_bad_env_value_is_refused_by_name_before_the_node_starts() {
+        // Each refusal must name the VARIABLE, not the TOML key: the file is
+        // fine, and pointing at `bind` would send the operator to edit the
+        // wrong thing.
+        for (var, value, needle) in [
+            ("UC2_NODE_ID", "not-a-number", "UC2_NODE_ID"),
+            ("UC2_BIND", "10.0.0.1", "UC2_BIND"),
+            ("UC2_METRICS_BIND", "nope", "UC2_METRICS_BIND"),
+            ("UC2_LOG_LEVEL", "chatty", "UC2_LOG_LEVEL"),
+            ("UC2_MEMBERS", "0@10.0.0.1:9100,junk", "UC2_MEMBERS"),
+            ("UC2_MEMBERS", "x@10.0.0.1:9100", "UC2_MEMBERS"),
+            ("UC2_MEMBERS", "0@not-an-addr", "UC2_MEMBERS"),
+            ("UC2_MEMBERS", "0@10.0.0.1:9100,", "UC2_MEMBERS"),
+        ] {
+            let err = parse_str_with_env(MINIMAL, env_of(&[(var, value)]))
+                .expect_err(&format!("{var}={value} must be refused"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(needle),
+                "{var}={value} must be refused BY NAME, got: {msg}"
+            );
+            assert!(
+                matches!(err, ConfigError::Invalid { .. }),
+                "{var}={value} must be ConfigError::Invalid, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_env_override_carries_key_material() {
+        // Deliberate: a 0600-checked key file beats an environment variable,
+        // which leaks into /proc/<pid>/environ, `docker inspect`, and every
+        // child process. If someone adds one, this fails and they have to
+        // argue with the reasoning above rather than slip it past review.
+        for (var, key) in ENV_OVERRIDES {
+            let k = key.to_lowercase();
+            assert!(
+                !k.contains("key") && !k.contains("secret") && !k.contains("allowlist"),
+                "{var} -> {key}: key material must stay file-based"
+            );
+        }
+    }
 
     fn load_str(body: &str) -> Result<(NodeConfig, StartupOptions), ConfigError> {
         let dir = tempfile::tempdir().unwrap();

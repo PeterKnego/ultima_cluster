@@ -210,6 +210,52 @@ To turn it on, see [Encrypt traffic between nodes](../how-to/encrypt-node-traffi
 **`faults: FaultConfig`**
 Fault-injection configuration, used by the simulation and test harnesses.
 
+## Environment overrides
+
+Every key below overrides the config file, and **the environment wins**
+(<https://12factor.net/config>). An unset variable leaves the file's value
+alone; a set one replaces it whether or not the file states it. Overrides are
+applied to the parsed document *before* validation, so a bad value is a
+startup refusal in exactly the same shape a bad file value is — except the
+message names the **variable**, because the file is fine and pointing you at
+the TOML key would send you to edit the wrong thing.
+
+They exist so one immutable image can run every node of a cluster: see
+[`packaging/compose.yml`](../../packaging/compose.yml), which renders **one**
+`node.toml` and **one** `gateway.toml` and varies the rest per container.
+
+| Variable | Overrides | Format |
+|---|---|---|
+| `UC2_NODE_ID` | `id` | a node id, e.g. `2` |
+| `UC2_BIND` | `bind` | `host:port` |
+| `UC2_INSTANCE_DIR` | `instance_dir` | a path |
+| `UC2_APP_ID` | `app_id` | a string |
+| `UC2_MEMBERS` | `[[members]]` | `id@host:port` pairs, comma-separated: `0@10.0.0.1:9100,1@10.0.0.2:9100`. **Replaces** the table, never merges — a membership list must agree cluster-wide, so a half-overridden one is never what anyone means. |
+| `UC2_LOG_LEVEL` | `[log] level` | `error` \| `warn` \| `info` |
+| `UC2_METRICS_BIND` | `[metrics] bind` | `host:port`. Setting it **creates** the section, so a file with no `[metrics]` still gets an endpoint. |
+| `UC2_GATEWAY_INSTANCE_DIR` | gateway `[local] instance_dir` | a path |
+| `UC2_GATEWAY_APP_ID` | gateway `[local] app_id` | a string |
+| `UC2_GATEWAY_LISTEN` | gateway `[local] listen` | `host:port` |
+| `UC2_GATEWAY_MEMBERS` | gateway `[[members]]` | `node_id@host:port` pairs, comma-separated. Replaces, same reasoning as above. |
+
+**No override carries key material, deliberately.** `crypto.key_path` and the
+`[admin]` key paths stay file-based: an environment variable is visible in
+`/proc/<pid>/environ`, in `docker inspect`, and to every child process, while
+a key *file* is mode-checked (the loaders refuse a group- or world-readable
+one). A unit test (`no_env_override_carries_key_material`) fails if anyone
+adds one.
+
+**Only deploy-varying keys are overridable.** Tuning values — `buffer_bytes`,
+`election_timeout_*`, `admission_bytes` — are part of the build's behaviour
+and stay in the file, which is what the twelve-factor page itself recommends
+for "config that does not vary between deploys".
+
+Each override that fires emits a `config_env_override` record naming the
+variable and its value, so a value that did not come from the file you are
+reading is never silent. These records are emitted *before* `[log] level` is
+applied, so they appear even at `warn` — the same never-silenced posture as
+the volatile-filesystem and `admin auth = "none"` boot warnings.
+
 ## Environment switches
 
 | Variable | Read by | Effect |
