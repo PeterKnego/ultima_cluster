@@ -7,8 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## v2.10.0 — <tag date>
-<!-- tag date: fill at tag time -->
+## v2.10.0 — 2026-08-31
 
 **One log stream, config from the environment, and a memory-ordering fix a
 model found.** Two changes an operator must read before upgrading — the

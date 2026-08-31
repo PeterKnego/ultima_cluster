@@ -1,7 +1,6 @@
 # ultima_cluster releases
 
-## v2.10.0 — <tag date> — one log stream, config from the environment, and a weak-memory fix
-<!-- tag date: fill at tag time -->
+## v2.10.0 — 2026-08-31 — one log stream, config from the environment, and a weak-memory fix
 
 Thirteen crates, still lockstep. No wire change (protocol stays 0.6.0), no cnc
 change, no `node.toml` schema change — a `2.9.0` config starts unmodified on
