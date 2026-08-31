@@ -1,9 +1,11 @@
 # The mute leader
 
 *Why a cluster with wire crypto ON and a config change in flight stops making
-progress — and what the honest options are for fixing it. Companion to
+progress — and what the honest options are for fixing it.*
+
+Companion to
 [`uc2-two-framings-one-position.md`](uc2-two-framings-one-position.md); that one
-is about who may write log bytes, this one is about who may hold a key.*
+is about who may write log bytes, this one is about who may hold a key.
 
 Status: mechanism **proven** by
 `uc_crypto::group::tests::a_never_acking_peer_mutes_a_fresh_leader_for_the_activation_timeout`.

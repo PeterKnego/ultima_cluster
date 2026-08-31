@@ -1,10 +1,12 @@
 # Two framings, one position
 
 *Plain-language explainer for the follower-side archive fail-stop found on
-unmutated `main`, 2026-08-02. Companion to
+unmutated `main`, 2026-08-02.*
+
+Companion to
 [`uc2-who-may-rewind-the-log.md`](uc2-who-may-rewind-the-log.md), which covers a
 different plane: who may move the log COUNTERS backward. This one is about who
-may write the log BYTES, and what a reader is entitled to assume about them.*
+may write the log BYTES, and what a reader is entitled to assume about them.
 
 ## The symptom
 

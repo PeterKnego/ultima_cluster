@@ -263,7 +263,7 @@ and holds no global budget across connections, so the protocol offers a
 client no signal that the *cluster* — as opposed to its own connection — is
 out of room. Sizing the total across connections is an operator
 responsibility until that budget exists; see
-[Operating envelope](../how-to/run-a-gateway.md#operating-envelope-260) and
+[Operating envelope](../how-to/run-a-gateway.md#operating-envelope-270) and
 the [gate record](../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact).
 
 ## Payload ceiling

@@ -2,10 +2,11 @@
 
 *What a signed admin request actually proves, why there is no replay ring, why
 the identity the signature is bound to is read from the node's memory and never
-from the file on disk — and the one plane where all of this stops holding.
+from the file on disk — and the one plane where all of this stops holding.*
+
 Reference (keys, config, the exact signed bytes):
-[configuration §Admin authentication](../reference/configuration.md#admin-authentication).
-Walkthrough: [change cluster membership](../how-to/change-cluster-membership.md).*
+[configuration § Admin authentication](../reference/configuration.md#admin-authentication).
+Walkthrough: [change cluster membership](../how-to/change-cluster-membership.md).
 
 ## What the boundary was before
 

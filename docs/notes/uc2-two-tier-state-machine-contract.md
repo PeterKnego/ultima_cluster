@@ -2,11 +2,12 @@
 
 *Why `RawStateMachine` (bytes in, bytes out) is the core state-machine contract
 and the typed `StateMachine` is an adapter on top of it — and why that was a
-one-way door worth measuring before walking through. Companion to
-[the codec budget spike](2026-08-22-codec-budget-spike.md), which is the
-measurement, and
+one-way door worth measuring before walking through.*
+
+Companion to [the codec budget spike](2026-08-22-codec-budget-spike.md), which
+is the measurement, and
 [the state-machine contract reference](../reference/state-machine-contract.md),
-which is the exact signatures.*
+which is the exact signatures.
 
 ## The shape of the problem
 

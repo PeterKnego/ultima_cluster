@@ -40,6 +40,13 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
 
+      # Internal doc links, before anything is compiled: it takes a second and
+      # a broken link should not cost a rustdoc build to discover. FAILS on a
+      # dead file or a dead GitHub anchor; md-tui slug divergences are printed
+      # as warnings only, deliberately — see the script's module docstring.
+      - name: Documentation links
+        run: python3 scripts/check_doc_links.py
+
       # --lib drops the bins (uc2ctl is an operator CLI, not an API), and the
       # two example crates are excluded outright.
       - name: Build rustdoc
