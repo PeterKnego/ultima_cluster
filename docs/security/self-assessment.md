@@ -35,7 +35,7 @@ the enumeration this assessment worked from.
    fourteen targets that existed during M12d executes ~118 M inputs; cumulative
    local execution during M12d was several hundred million. The fifteenth,
    `ring_mpsc_record`, arrived with the 2.7.0 MPSC ring rewrite.
-   [VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
+   [VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)
    is the record; [`fuzz/README.md`](/fuzz/README.md) is the operating manual.
 3. **The pre-existing correctness tiers**, which are older than this
    assessment and cover the *behaviour* rather than the parsers: machine-checked

@@ -499,7 +499,7 @@ written down.
     of** — a contract-abiding inner state machine that cleared `out` truncated
     the session tag away and panicked **on the apply thread**, killing the
     service on its first command. Found by fuzzing (F2, `7c908b1`). →
-    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
+    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)
   - **`Sessioned::install_snapshot` pre-allocated up to 1 GiB** from an
     unvalidated 8-byte length before reading a byte of the blob. Bounded;
     20 000 executions went 91.8 s → 0.34 s. Found by fuzzing (F3,
@@ -511,7 +511,7 @@ written down.
     an unauthenticated packet reaches should not rest on five call sites
     remembering. All five now return `Option`, the pre-guards are kept, and
     the hot path is byte-identical (F1, `112b81f`). →
-    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
+    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)
   - Also: `uc_remote`'s `request_timeout` is now enforced *while
     reconnecting* (it could be outlived by a reconnect loop — F5,
     `ae0f245`/`fc27536`/`b4b3b0c`), and the architecture doc's log-buffer

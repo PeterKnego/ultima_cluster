@@ -248,7 +248,7 @@ cargo test -p uc_sim --features mutation-testing --test scenarios window_slide  
 
 ---
 
-## 3. Linearizability — WGL capstones
+## 3. Linearizability: WGL capstones
 
 **Location:** [`uc_lincheck/`](/uc_lincheck) + `uc_node/tests`
 
@@ -318,7 +318,7 @@ cargo test --workspace          # includes the capstones
 
 ---
 
-## 4. Transactional safety — Elle
+## 4. Transactional safety: Elle
 
 **Record:** [`docs/benchmarks/uc2-elle-gate-2026-07-16.md`](/docs/benchmarks/uc2-elle-gate-2026-07-16.md)
 
@@ -420,7 +420,7 @@ cargo test -p uc_crashtest --features hard-crash-tests
 
 ---
 
-## 6. Memory model — loom
+## 6. Memory model: loom
 
 An exhaustive interleaving check of the frame-visibility protocol: the atomic
 handshake by which a reader observes a fully-written frame and never a torn one.
@@ -466,7 +466,7 @@ layout change cannot pass silently.
 
 ---
 
-## 7. Fuzzing — decoders total on untrusted bytes
+## 7. Fuzzing: decoders total on untrusted bytes
 
 **Location:** [`fuzz/`](/fuzz) · **Runner:** [`scripts/fuzz_smoke.sh`](/scripts/fuzz_smoke.sh)
 · **CI:** `nightly.yml`'s `fuzz-groups` + `fuzz` jobs
@@ -621,7 +621,7 @@ itself remain uncovered** — stated again in §11.
 
 ---
 
-## 8. Veil — bug-hunting only, never the record
+## 8. Veil: bug-hunting only, never the record
 
 **Location:** [`proofs-veil/`](/proofs-veil) (archive) · **Record:**
 [`docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md`](/docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md)

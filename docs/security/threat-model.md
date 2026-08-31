@@ -14,7 +14,7 @@ default**. With `[crypto].enabled = false` the posture is a trusted private
 network — the same posture stock Aeron takes — and the decoders in
 `uc_protocol::v2` are the *only* thing standing between an unauthenticated UDP
 packet and the node's state. That is why they are fuzzed
-([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)).
+([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes)).
 
 ---
 

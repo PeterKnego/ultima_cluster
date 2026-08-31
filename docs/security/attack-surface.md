@@ -7,7 +7,7 @@ inventory. [Self-assessment](self-assessment.md) records what was found in it.
 
 "Fuzz target" names a real target in [`fuzz/fuzz_targets/`](/fuzz) — there are
 fifteen, each run for 600 s per night with an asserted execution floor
-([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes),
+([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing-decoders-total-on-untrusted-bytes),
 [`fuzz/README.md`](/fuzz/README.md)).
 
 ---
