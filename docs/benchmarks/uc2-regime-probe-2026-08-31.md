@@ -106,9 +106,16 @@ measured −9.4 % mean.
 - "No bistability" is a claim about THIS operating point. It does not rule out
   genuine bimodality at other payloads, inflight windows or host types.
 - The 3-5 % warmup climb means 12 s arms include warmup. `m12_gate` has
-  `--warmup-secs`/`--measure-secs` (a steady window, `window_rps`) and **no
-  fleet driver uses them** — `window_rps` was 0 in all 37 arms measured today.
-  Using them would remove the drift from every future number.
+  `--warmup-secs`/`--measure-secs` (a steady window, `window_rps`), and the
+  driver used here — `m14_core_sweep.py` — does **not** pass them:
+  `window_rps` was 0 in all 37 arms measured today, so every rate in this doc
+  and in the core-count sweep includes the climb. (An earlier revision of this
+  bullet said *no* fleet driver used them. That is wrong:
+  `m14_fleet_gate.py` sets `WARMUP_SECS, MEASURE_SECS = 2, 8` and only rows d
+  and f opt out, so the M14 gate's rows a/b/e ARE steady-window numbers. The
+  consequence is that rates from this doc are not directly comparable with a
+  gate row.) Passing them here would remove the drift from every future
+  number.
 
 ## Reproducing
 

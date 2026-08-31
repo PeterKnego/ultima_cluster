@@ -163,9 +163,11 @@ touched. Three fleet runs were made and all three are recorded:
 
 Two standing lessons came out of that and are recorded in CLAUDE.md: size a
 spread bar's rep count from observed arm-to-arm variance (n=4 cannot
-distinguish a distribution's width from its tail), and **no fleet driver uses
-`m12_gate`'s `--warmup-secs`/`--measure-secs` steady window**, so every
-published rate includes a 3–5 % warm-up climb.
+distinguish a distribution's width from its tail), and **check whether a driver
+passes `m12_gate`'s `--warmup-secs`/`--measure-secs` steady window before
+comparing its rates with another's**. `m14_fleet_gate.py` does, so the M14
+gate's rows a/b/e are steady-window numbers; the 2026-08-31 sweep and probe
+drivers do not, so their rates include a 3–5 % warm-up climb.
 
 ### What proves the release
 

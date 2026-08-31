@@ -77,9 +77,16 @@ reading of that sweep was **refuted the same day** by a 16-arm per-second
 timeline probe: it is one broad distribution with a long low tail, no arm
 transitions, and **pinning tightens p50 spread 31x** rather than removing a
 second state. Two standing lessons: fix a spread bar's rep count from observed
-arm-to-arm variance (n=4 cannot tell width from tail), and no fleet driver
-uses `m12_gate`'s `--warmup-secs`/`--measure-secs` steady window, so every
-published rate includes a 3-5 % warmup climb. First
+arm-to-arm variance (n=4 cannot tell width from tail), and check whether a
+driver passes `m12_gate`'s `--warmup-secs`/`--measure-secs` steady window
+before comparing its rates with another's. **`m14_fleet_gate.py` does**
+(`WARMUP_SECS, MEASURE_SECS = 2, 8`; only rows d and f opt out, deliberately —
+the per-completion `done_ns` Vec would reach hundreds of MB and its doubling
+memcpy could land inside row d's 2 s recovery window), so the M14 gate's rows
+a/b/e are steady-window numbers. **Every other driver does not**, including
+`m14_core_sweep.py`, so the 2026-08-31 core-count sweep and regime-probe rates
+include a 3-5 % warmup climb — harmless for the shape/ratio conclusions those
+docs draw, but not comparable head-to-head with a gate row. First
 candidate for the next minor: the twelve-factor hygiene items postponed
 out of M14c2 — env-var overrides for deploy-varying config keys (#3) and
 one log stream (#11); the release-ledger line (#5) is process, not code
