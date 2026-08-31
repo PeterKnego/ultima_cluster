@@ -455,7 +455,8 @@ CI never executes — so it was unreachable by any test the project runs, only
 by a model. Two mutations
 (`m1_without_the_producer_publish_before_body_fence`,
 `m2_without_the_post_copy_revalidation`) are `#[should_panic]`, so a green run
-means the model has teeth rather than that it explored nothing.
+means the model has teeth rather than that it explored nothing. Plain-language
+writeup: [`docs/notes/uc2-broadcast-seqlock-explained.md`](/docs/notes/uc2-broadcast-seqlock-explained.md).
 
 All three models are of protocols, not of mappings — loom cannot see an mmap,
 so the ring's *layout* stays frozen by offset-pin tests.

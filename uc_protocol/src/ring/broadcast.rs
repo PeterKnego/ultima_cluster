@@ -101,7 +101,9 @@ impl BroadcastProducer {
         // `try_read` comment below claims cannot happen.
         //
         // Found by `uc_protocol/tests/loom_broadcast.rs`, which fails without
-        // this fence and passes with it. Only Broadcast needs it: SPSC and
+        // this fence and passes with it.
+        // Plain-language writeup:
+        // `docs/notes/uc2-broadcast-seqlock-explained.md`. Only Broadcast needs it: SPSC and
         // MPSC back-pressure on `consumer_position`, so their producers cannot
         // lap a reader at all.
         //
