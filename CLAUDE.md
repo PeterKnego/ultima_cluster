@@ -14,8 +14,11 @@ took those names in the `uc2_*` → `uc_*` rename (see `RELEASES.md`), so a
 pre-rename commit or doc naming them means the deleted v1 crate, not this
 code.
 
-**Current version: `2.9.0` (the `uc_*` crate rename; M14c2 is the last
-feature milestone). Milestones M1–M14 are all complete**, each
+**Current version: `2.10.0`** (one log stream on stderr with stdout
+byte-empty, `UC2_*` env overrides, `config_loaded` {path, sha256}, the
+`uc_obs` crate, the `ultima_db` removal, and the Broadcast-ring
+memory-ordering fix loom found; `2.9.0` was the `uc_*` crate rename).
+**M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
 the honest-failure protocol). M14c2 is **proof-only**: no new feature, no wire
@@ -43,11 +46,18 @@ the standing facts that bind new work.
 (Tag state: `v2.2.0` was never tagged — M8 and wire 0.5.0 rolled into
 `v2.3.0`; `v2.6.0` shipped as `v2.6.0-rc.1` only and is superseded by
 `v2.7.0`, with no final `v2.6.0` tag. The ordered crates.io publish ran for
-the first time on 2026-08-30 with `2.9.0` — all 12 crates are live under
-their `uc_*` names; `docs/how-to/cut-a-release.md` §6 is the procedure, and
-its rate-limit note explains why that first run took an hour.)
+the first time on 2026-08-30 with `2.9.0` — all 12 crates went live under
+their `uc_*` names, and `2.10.0` published **13** (`uc_obs` joined) on
+2026-08-31; `docs/how-to/cut-a-release.md` §6 is the procedure. Its
+rate-limit note is now measured on both runs: crates.io limits **new crate
+names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
+names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up: **TBD by the maintainer.** M14c2 is done — the two-FSM capstones
+Next up: **TBD by the maintainer.** `2.10.0` shipped 2026-08-31 (tag
+`v2.10.0`, all 13 crates published; the release-evidence table is at the
+top of `docs/releases.md`). Two items it left open, neither a blocker:
+`nightly.yml` has never run on the tag commit, and `uc2-gateway` has no
+`--version` flag while `uc2-node` and `uc2ctl` do. M14c2 is done — the two-FSM capstones
 (`lin_v2 two_fsm*`, `lin_partition_v2`, the two hard-crash scenarios, the
 Elle `quiet_two_fsm` pass), the lockstep verdict (an operating-envelope
 fact, not a defect) and the `--pin` fleet rig shipped as `2.8.1`. The rig's
