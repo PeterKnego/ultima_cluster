@@ -210,7 +210,7 @@ It should print `PASS` on a machine that has never had a Rust toolchain on it.
 
 ## 6. Publish to crates.io — manually, in this order
 
-This is not in the workflow, on purpose. Twelve crates, each of which must be
+This is not in the workflow, on purpose. Thirteen crates, each of which must be
 *indexed* by the registry before the next one can resolve it, and every
 version is permanent. An automated retry loop against an irreversible
 operation is a bad trade; a person watching each one is not.
