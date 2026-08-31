@@ -56,7 +56,12 @@ spread 14.3 % against a pre-committed < 5 % bar, and it costs 9.4 % of mean
 throughput; it does remove the worst mode (47.7 % → 14.3 %), so placement is
 one cause among others. `--pin` stays opt-in
 (`docs/benchmarks/uc2-m14c2-fleet-pinning-2026-08-30.md`). Row e is still
-un-re-measured. First
+un-re-measured. A follow-on core-count sweep (2026-08-31,
+`docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md`) answers "how many
+cores does a node need" — **4, one per polling agent, flat past 5** on the
+DIRECT shmem path — and found the harness runs in **two stable regimes** 5x
+apart in p50, independent of core count. Split fleet arms by regime before
+averaging any spread; a mixed sample inflates it. First
 candidate for the next minor: the twelve-factor hygiene items postponed
 out of M14c2 — env-var overrides for deploy-varying config keys (#3) and
 one log stream (#11); the release-ledger line (#5) is process, not code
@@ -87,10 +92,18 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   authenticated admin request to the leader over the node↔node UDP plane, so
   `[admin] auth = "hmac"` authenticates cluster-wide only when paired with
   `[crypto].enabled = true`.
-- **Command payload ceiling: ≤ 1344 B crypto-off / ≤ 1312 B crypto-on** (one
-  datagram, `MTU_DEFAULT = 1408`, not configurable — `preflight` refuses
-  above it). `bincode` is `NoLimit`; the typed tier's decode is bounded by
-  the payload cap and serde's 1 MiB pre-allocation cap, not by the codec.
+- **Command payload ceiling: ≤ 1344 B crypto-off / ≤ 1312 B crypto-on**
+  — **a property of the UDP data plane, not of the design.** One command
+  must fit one datagram, and `MTU_DEFAULT = 1408`
+  (`uc_protocol::v2::datagram`) is sized to clear a 1500 B Ethernet path
+  without IP fragmentation; the header takes 16 B and the crypto tag the
+  rest of the difference. There is no runtime knob — it is a source
+  constant, and `preflight` refuses above it. Treat the number as
+  transport-derived: a different transport (jumbo frames, or an OS-bypass
+  fabric such as EFA/SRD, whose messages are far larger) would move or
+  remove it, at the cost of a wire flag day. `bincode` is `NoLimit`; the
+  typed tier's decode is bounded by the payload cap and serde's 1 MiB
+  pre-allocation cap, not by the codec.
 - **Purge is OFF by default** (`PurgePolicy::Disabled`). The
   `/metrics`/`/healthz`/`/readyz` endpoint exists only when `[metrics]` is
   configured; readiness keys on `can_serve`, never the leader flag; the

@@ -106,6 +106,15 @@ at 1 123 630 against 1 900 439 for its own rep2 — a 41 % collapse of one
 generation, p50 3.586 ms vs 2.064 ms, with zero lost responses. That is the
 effect `uc2-m14d` described, seen again on fresh hardware.
 
+> **Follow-up, 2026-08-31:** the residual variance below now has a better
+> candidate than "undiagnosed". A core-count sweep on `c8id.4xlarge` found the
+> harness has **two stable operating regimes** differing 5x in p50 latency,
+> independent of core count, with a ~25 % rate gap — and pinning went to the
+> slow regime 4/18 vs unpinned 3/3. That would explain how pinning cut the
+> spread without addressing the cause. See
+> [`uc2-node-core-count-sweep-2026-08-31.md`](uc2-node-core-count-sweep-2026-08-31.md).
+> The unpinned n is 3; this is a lead, not a conclusion.
+
 **2. Placement is *a* cause, not *the* cause.** Pooled spread falls
 47.7 % → 14.3 % with pinning, a 3.3× reduction, and the catastrophic
 low-mode arm never appears in the pinned run (pinned minimum 1 465 851, vs
