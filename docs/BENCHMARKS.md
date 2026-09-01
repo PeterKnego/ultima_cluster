@@ -33,7 +33,7 @@ labelled as one — including where that makes a number look worse.
 
 | | |
 |---|---|
-| **3.79 M responses/s @ p50 ~0.3 ms, p99 ≤ 1.0 ms** | End to end through the SDK via the **local shmem client**, quorum-durable acks; 2025-generation hardware (`c9gd.4xlarge`), unpinned, n=8. Not a gate — a characterization sweep. Remote clients through a gateway pay 0.62–0.84× of direct on top (M13 row below) |
+| **3.79 M responses/s @ p50 ~0.3 ms, p99 ≤ 1.0 ms** | End to end through the SDK via the **local shmem client**, quorum-durable acks; 2025-generation hardware (`c9gd.4xlarge`), unpinned, n=8. Not a gate — a characterization sweep. Remote clients through a gateway pay a toll on top: ~0.5× per connection, ~0.9× aggregate (M13 rows below) |
 | **1.64 M responses/s @ p99 0.771 ms** | The M5 *gate*, on the 2020-generation fleet (`c6id.2xlarge`): quorum-fsync'd, reads linearizable. p50 0.600 ms, p90 0.682 ms |
 | **Failover p50 202 ms, 10/10 zero committed loss** | Sandbox/loopback; fleet confirmation outstanding |
 
@@ -50,6 +50,7 @@ generation only.
 |---|---|---|
 | [Architecture sweep — Intel vs Graviton](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md) | **3.79 M resp/s unpinned, p50 0.27–0.35 ms, p99 ≤ 1.0 ms** on Graviton; pinned throughput equal across arches at 3.04 M; pinning trades throughput for variance at a topology-dependent price; first full correctness pass on aarch64 | 3-host fleets, `c8id.4xlarge` + `c9gd.4xlarge` |
 | [Core-count sweep](/docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md) | a node needs **4 cores on SMT x86, 2–3 on no-SMT ARM**; flat past that | 3-host fleet, `c8id.4xlarge` |
+| [M13 rows on Graviton](/docs/benchmarks/uc2-m13-remote-on-arm-2026-09-01.md) | direct 3.41 M/s; one remote conn **0.50×** direct, aggregate **0.91×** (once measured above 1× — the direct arm shares the leader's cores); per-connection toll grew, aggregate toll shrank vs c6id. Characterization, not a gate | 3× `c9gd.2xlarge` + 2 client hosts |
 | [M13 — remote path through the gateway](/docs/benchmarks/uc2-m13-gate-2026-08-24.md) | one TCP connection **0.617× direct** (1.08 M vs 1.75 M resp/s); N=16 aggregate **0.836× direct** (1.46 M); ladder monotone, 0 lost, no collapse | 4-host fleet, `c6id.2xlarge` |
 | [M5 — end-to-end SDK](/docs/benchmarks/uc2-m5-gate-2026-07-12.md) | **1,639,187 responses/s** @ p50 0.600 / p90 0.682 / p99 0.771 ms · 4.1× the ≥400 k bar | 3-host fleet |
 | [M3 — commit pipeline](/docs/benchmarks/uc2-m3-gate-2026-07-10.md) | **2,881,511 committed/s** @ p50 0.946 / p99 1.132 ms · 7.2× the bar | 3-host fleet |

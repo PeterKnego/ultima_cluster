@@ -54,8 +54,9 @@ payloads, inflight 4096, through `uc_client`'s public `Engine` — the **local
 shared-memory client**, co-located with the leader
 → [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
 A client connecting remotely through a gateway pays a measured toll on top:
-0.62× direct on one connection, 0.84× aggregate
-→ [M13 gate](/docs/benchmarks/uc2-m13-gate-2026-08-24.md).
+~0.5× direct on one connection, ~0.9× aggregate
+→ [M13 on ARM](/docs/benchmarks/uc2-m13-remote-on-arm-2026-09-01.md)
+(0.62×/0.84× on the older fleet, [M13 gate](/docs/benchmarks/uc2-m13-gate-2026-08-24.md)).
 
 **CPU generation dominates these numbers.** The same software on the
 2020-generation fleet it was first measured on (3 × `c6id.2xlarge`) did

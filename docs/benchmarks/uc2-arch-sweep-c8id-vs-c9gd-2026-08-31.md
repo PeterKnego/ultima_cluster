@@ -179,9 +179,9 @@ budget four cores per node — two suffice at this operating point.**
   client is `uc_client::Engine` on the leader host; no gateway, no crypto;
   3-voter placement-group fleet, us-east-1, 2026-08-31/09-01. A remote
   client through a gateway measured 0.62× direct (one connection) / 0.84×
-  (N=16 aggregate) on the c6id generation
-  ([M13 gate](uc2-m13-gate-2026-08-24.md)); that ratio has NOT been
-  re-measured on these hosts.
+  (aggregate) on the c6id generation ([M13 gate](uc2-m13-gate-2026-08-24.md));
+  re-measured on Graviton 2026-09-01: **0.50× per connection, 0.91×
+  aggregate** ([M13 on ARM](uc2-m13-remote-on-arm-2026-09-01.md)).
 - The Graviton tree carried one local fix over the Intel baseline's commit:
   the failover-test construction + fault-layer muzzle (test-only + fault
   layer; nothing on the measured path). Same-source rebuild resolution is

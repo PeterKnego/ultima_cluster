@@ -41,6 +41,12 @@ numbers by clock speed.
   published binaries include aarch64. Verdict and caveats in the
   [arch sweep](../benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
 
+- **Sizing the far side of a gateway:** a remote client's throughput is
+  connection-bound (~0.5× the direct rate per connection on modern hosts;
+  aggregate reaches ~0.9×), and a *load-driving* client host saturates
+  around ~1.5 M resp/s per 8 x86 vCPUs — measured in
+  [M13 on ARM](../benchmarks/uc2-m13-remote-on-arm-2026-09-01.md).
+
 ## Memory and disk
 
 - RAM: modest. Every published fleet number ran on 32 GiB hosts; the
