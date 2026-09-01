@@ -53,7 +53,9 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up: **TBD by the maintainer.** `2.10.0` shipped 2026-08-31 (tag
+Next up: **TBD by the maintainer** — the ranked candidate directions,
+with the doc that first recorded each, are in `docs/BACKLOG.md` (2026-09-01;
+update its line when an item is taken up or dropped). `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the
 top of `docs/releases.md`). It left two items open, neither a blocker:
 `nightly.yml` has never run on the tag commit, and `uc2-gateway` shipped

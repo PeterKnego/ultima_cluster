@@ -112,7 +112,7 @@ and crash tiers had missed. Full picture, including what is *not* verified:
   performance, in plain language.
 - **[Architecture](/docs/ARCHITECTURE.md)** — how it works, and the crate map.
 - **[Quickstart](/docs/QUICKSTART.md)** — zero to a running three-node cluster.
-- **[Verification](/docs/VERIFICATION.md)** · **[Benchmarks](/docs/BENCHMARKS.md)**
+- **[Verification](/docs/VERIFICATION.md)** · **[Benchmarks](/docs/BENCHMARKS.md)** · **[Backlog](/docs/BACKLOG.md)**
   — what is proved, what is measured, on what.
 - **[How-to guides](/docs/how-to)** · **[Reference](/docs/reference)** ·
   **[Operations runbook](/docs/ops/uc2-runbook.md)** · **[API docs](https://peterknego.github.io/ultima_cluster/)**.
