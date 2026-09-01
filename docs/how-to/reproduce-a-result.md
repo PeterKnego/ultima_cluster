@@ -42,6 +42,7 @@ Fleet runs cost real money and are a deliberate, separately-approved step.
 bench-infra/scripts/m6_fleet_gate.py --fleet                  # M6
 bench-infra/scripts/m6_fleet_gate.py --fleet --m7             # M7
 bench-infra/scripts/m6_fleet_gate.py --fleet --read-profile   # read profile
+bench-infra/scripts/m14_core_sweep.py --fleet --topology 8x2  # core-count / arch sweep
 ```
 
 The orchestrator `stat -f`s every instance-directory parent, on every host, and
@@ -70,10 +71,15 @@ overriding it to `/tmp` will OOM-kill the run rather than fail it.
 
 Two things decide whether your number means anything.
 
-**Match the hardware class, or know the direction of the difference.** The
-published fleet numbers are `c6id.2xlarge`, single AZ, cluster placement group,
-journals on local NVMe, `Durability::Consistent`. A slower disk moves throughput
-down; a quieter box moves it up.
+**Match the hardware class, or know the direction of the difference.** Every
+record names its fleet: the M2–M7 gates ran `c6id.2xlarge` (2020-generation
+Xeon), the 2026-08-31 sweeps `c8id.4xlarge`/`c9gd.4xlarge` — and the
+[architecture sweep](../benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md)
+measured CPU generation moving p50 ~4× at the same rate, so cross-generation
+comparison is meaningless. All fleets: single AZ, cluster placement group,
+journals on local NVMe, `Durability::Consistent`. A slower disk moves
+throughput down; a quieter box moves it up. Sizing guidance:
+[Size a host](size-a-host.md).
 
 **For anything probabilistic, fix your sample size first.** Correctness tiers
 that fail intermittently cannot be judged by a few runs — decide how many runs

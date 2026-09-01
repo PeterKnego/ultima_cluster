@@ -13,6 +13,17 @@ apply these guides to.
 The two guides most people need first: getting nodes onto real machines, and
 keeping the disk from filling once they are there.
 
+- [Size a host for a node](size-a-host.md) — measured answers to "how many
+  cores / how much RAM / what disk": CPU generation dominates, 4 cores on SMT
+  x86 vs 2–3 on modern ARM, why pinning is a variance tool rather than a
+  speedup, and the first-class arm64 verdict.
+- [Start a fleet, the quick way](fleet_start_quick.md) — empty AWS account
+  to a serving, verified 3-node cluster in three commands
+  (`make up-uc` · `fleet_quickstart.sh` · `make destroy`).
+- [Start a fleet, the full walk](fleet_start.md) — the same thing as explicit
+  steps with a check after each; what the script does, and the path when it
+  fails or your setup diverges. Written to be followed by a person or an AI
+  agent.
 - [Run a cluster on real hosts](run-a-cluster.md) — binaries and configs onto
   each machine, the address rule that causes the most confusing failure in the
   system, where client processes must live, process supervision that does not

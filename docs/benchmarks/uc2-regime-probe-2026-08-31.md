@@ -98,6 +98,24 @@ measured −9.4 % mean.
    tail; this run needed 8 per arm before the gap filled. Any future spread
    bar should fix its rep count from observed arm-to-arm variance first.
 
+## 2026-09-01 addendum: two findings here are Intel-scoped
+
+The same probe protocol on `c9gd.4xlarge` (Graviton, 16 cores no SMT —
+[`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md))
+scopes two of this doc's findings to the hardware they ran on:
+
+- **The 3–5 % warmup climb is absent there** (−0.6 % pinned / −0.3 % unpinned,
+  first 3 s → last 3 s), so it is a property of this host class, not of the
+  harness. The "no steady window" comparability caveat still binds Intel
+  numbers.
+- **Pinning still removes the unpinned tail (p50 span 37× tighter there), but
+  costs 20 % of throughput** — unpinned *beats* pinned on the no-SMT host.
+  "Pinning trades throughput for variance" survives; the sign of the
+  throughput term is topology-dependent.
+
+What replicates unchanged: levels set in second 0 and held, no mid-run
+transitions.
+
 ## Limits
 
 - 16 arms, one host type, one session, direct shmem path only (no gateway).

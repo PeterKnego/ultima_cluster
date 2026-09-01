@@ -33,8 +33,14 @@ labelled as one — including where that makes a number look worse.
 
 | | |
 |---|---|
-| **1.64 M responses/s @ p99 0.771 ms** | End to end through the SDK, quorum-fsync'd, reads linearizable. p50 0.600 ms, p90 0.682 ms |
+| **3.79 M responses/s @ p50 ~0.3 ms, p99 ≤ 1.0 ms** | End to end through the SDK via the **local shmem client**, quorum-durable acks; 2025-generation hardware (`c9gd.4xlarge`), unpinned, n=8. Not a gate — a characterization sweep. Remote clients through a gateway pay 0.62–0.84× of direct on top (M13 row below) |
+| **1.64 M responses/s @ p99 0.771 ms** | The M5 *gate*, on the 2020-generation fleet (`c6id.2xlarge`): quorum-fsync'd, reads linearizable. p50 0.600 ms, p90 0.682 ms |
 | **Failover p50 202 ms, 10/10 zero committed loss** | Sandbox/loopback; fleet confirmation outstanding |
+
+CPU generation alone moves these headline numbers ~2× in rate and ~4× in p50
+— the [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md)
+measured it directly. Every row below names its hardware; compare within a
+generation only.
 
 ---
 
@@ -42,6 +48,9 @@ labelled as one — including where that makes a number look worse.
 
 | Record | Result | Measured on |
 |---|---|---|
+| [Architecture sweep — Intel vs Graviton](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md) | **3.79 M resp/s unpinned, p50 0.27–0.35 ms, p99 ≤ 1.0 ms** on Graviton; pinned throughput equal across arches at 3.04 M; pinning trades throughput for variance at a topology-dependent price; first full correctness pass on aarch64 | 3-host fleets, `c8id.4xlarge` + `c9gd.4xlarge` |
+| [Core-count sweep](/docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md) | a node needs **4 cores on SMT x86, 2–3 on no-SMT ARM**; flat past that | 3-host fleet, `c8id.4xlarge` |
+| [M13 — remote path through the gateway](/docs/benchmarks/uc2-m13-gate-2026-08-24.md) | one TCP connection **0.617× direct** (1.08 M vs 1.75 M resp/s); N=16 aggregate **0.836× direct** (1.46 M); ladder monotone, 0 lost, no collapse | 4-host fleet, `c6id.2xlarge` |
 | [M5 — end-to-end SDK](/docs/benchmarks/uc2-m5-gate-2026-07-12.md) | **1,639,187 responses/s** @ p50 0.600 / p90 0.682 / p99 0.771 ms · 4.1× the ≥400 k bar | 3-host fleet |
 | [M3 — commit pipeline](/docs/benchmarks/uc2-m3-gate-2026-07-10.md) | **2,881,511 committed/s** @ p50 0.946 / p99 1.132 ms · 7.2× the bar | 3-host fleet |
 | [M2 — replication stream](/docs/benchmarks/uc2-m2-gate-2026-07-10.md) | **235–323 MB/s durable per follower** · 2.3–3.2× the ≥ 100 MB/s bar — clean *and* under 0.5 % injected loss (34,870 NAKs served, `overruns 0`) | 3-host fleet |
@@ -84,10 +93,12 @@ of snapshot-read capacity — the barrier is now free.
 
 ## Hardware
 
-**Fleet** — `c6id.2xlarge` (8 vCPU, local instance-store NVMe), `us-east-1`,
+**Fleet** — `c6id.2xlarge` (8 vCPU, local instance-store NVMe) for the M2–M7
+gate era; `c8id.4xlarge` (Intel Xeon 6, 8c×2SMT) and `c9gd.4xlarge` (Graviton,
+16c no-SMT) for the 2026-08-31 sweeps — all `us-east-1`,
 single AZ, cluster placement group, private-IP binding, journals on the NVMe
 mount, `Durability::Consistent` (fdatasync per block), 64 B payloads. Host count
-varies by gate (3 for M2/M3/M5/read-profile, 4 for M6, 5 for M7). Driven by
+varies by gate (3 for M2/M3/M5/read-profile/sweeps, 4 for M6, 5 for M7). Driven by
 `bench-infra/scripts/m6_fleet_gate.py`, which `stat -f`s every instance-dir
 parent and **refuses to run on tmpfs or ramfs** — a journal on RAM makes every
 fsync a silent no-op and would void the durability claim while everything
@@ -109,6 +120,7 @@ which is why several records carry a sandbox arm and an outstanding fleet arm.
 bench-infra/scripts/m6_fleet_gate.py --fleet                  # M6
 bench-infra/scripts/m6_fleet_gate.py --fleet --m7             # M7
 bench-infra/scripts/m6_fleet_gate.py --fleet --read-profile   # read profile
+bench-infra/scripts/m14_core_sweep.py --fleet --topology 8x2  # core/arch sweep (16x1 on Graviton)
 
 # Local, in-process smoke — 3 nodes + 3 services + 1 client in one process.
 # The harness itself calls this "NOT the gate".

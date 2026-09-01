@@ -19,6 +19,13 @@
 > deep-band arms only, which are the high, tight part of the one distribution.
 > What changes is the interpretation: pinning removes a **tail**, not a
 > second state.
+>
+> **2026-09-01: the answer is also topology-specific.** On a 16-core no-SMT
+> host (`c9gd.4xlarge`, Graviton) the same sweep plateaus at **2–3 cores**
+> (one core runs the node at 87 % of the six-core rate) and unpinned-over-16
+> beats every pinned width —
+> [`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
+> "4 cores, one per polling agent" is the c8id/SMT-x86 answer, not a law.
 
 **Answer: 4 physical cores** — one per polling agent — with no measurable gain
 past 5. **But the more important result is accidental:** the harness has two

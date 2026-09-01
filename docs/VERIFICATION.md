@@ -452,7 +452,12 @@ cannot reach. The fix is one publish-before-body `Release` fence in
 forbids the reordering) and one `dmb ish` on aarch64, i.e. exactly where it is
 needed. The failure is weak-memory-only, and UC builds aarch64 binaries that
 CI never executes — so it was unreachable by any test the project runs, only
-by a model. Two mutations
+by a model. (2026-08-31, after the fix shipped: the full test stack ran once
+on real aarch64 hardware —
+[`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md)
+— which weakens nothing here: it executed the *fixed* code, and a
+weak-memory race is not reliably reachable by running tests on weak hardware
+anyway. The model remains the coverage; the hardware run is a smoke check.) Two mutations
 (`m1_without_the_producer_publish_before_body_fence`,
 `m2_without_the_post_copy_revalidation`) are `#[should_panic]`, so a green run
 means the model has teeth rather than that it explored nothing. Plain-language
@@ -752,6 +757,14 @@ The most important section, and the one most projects omit.
   (`bincode`) reached through those seams.
 - **The published gate numbers are fleet measurements**, on the hardware and
   configuration each record names. They are reproducible, not universal.
+- **CI executes tests on x86_64 only.** aarch64 binaries are built (natively,
+  on arm64 runners) but their tests never run in CI. The full correctness
+  stack — workspace, both lincheck capstones, the SIGKILL crash tier — has
+  passed on real ARM hardware exactly once (Graviton/Neoverse-V3, 2026-08-31,
+  [`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md)),
+  which also surfaced and fixed one x86-timing assumption in a test's
+  scenario construction. A one-time pass is a data point, not a regression
+  gate; ARM stays uncovered between such runs.
 - **Multi-service (M14): the two-FSM proof gap `2.8.0` disclosed here is
   closed by `2.8.1` (M14c2, spec §15.1, §16).** The record, so it can be
   audited rather than taken on trust:

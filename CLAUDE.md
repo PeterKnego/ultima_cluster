@@ -155,7 +155,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   (`docs/how-to/cut-a-release.md` §6); `deny.toml` + `cargo-deny` run in CI
   (one documented ignore: RUSTSEC-2025-0141, `bincode` unmaintained, no
   patched version exists). Docker/compose/ghcr/cosign are CI-only; aarch64
-  binaries are built but never executed in CI.
+  binaries are built but never executed in CI — but the full correctness
+  stack (workspace + lin capstones + hard-crash) first ran and passed on
+  real ARM hardware 2026-08-31
+  (`docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md`).
 - **Security posture**: `docs/security/{threat-model,attack-surface,self-assessment}.md`
   + root `SECURITY.md` (supported = latest minor; GitHub private
   vulnerability reporting). The whole proof surface is mapped in

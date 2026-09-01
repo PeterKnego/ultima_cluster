@@ -5,6 +5,12 @@
 unchanged. **Verdict: pinning is NOT adopted** — it does not clear the bar.
 `--pin` stays opt-in and off by default.
 
+**2026-09-01:** the not-adopted verdict got independent cross-architecture
+support: on a 16-core no-SMT host (`c9gd.4xlarge`, Graviton) pinning costs
+**20 %** of throughput while unpinned wins outright — the variance benefit
+(p50 span ~37× tighter) is the same, the throughput price is steeper. See
+[`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
+
 This run also did something the stub could not: it **verified the
 hyperthread-sibling assumption** `PIN_MAP_C6ID_2XL` was built on, which until
 now was a documented guess.

@@ -2,7 +2,7 @@
 
 A clustered application server, built on strong [core principles](CORE_PRINCIPLES.md), 
 allowing you to write applications that are correct, resilient and high performance.
-Built on the state-of-the-art State Machine Replication architecture, with a full non-blocking design that can perform 1.5M queries per second with response time of p99 <1ms.
+Built on the state-of-the-art State Machine Replication architecture, with a full non-blocking design measured at 3.8M operations per second with p99 ≤ 1ms on current-generation hardware.
 
 ## What it is
 
@@ -44,13 +44,24 @@ occasional snapshots are persisted), and correctness comes from the guaranteed
 order of commands across every state machine in the cluster — not from locks,
 transactions or conflict resolution.
 
-### High-perf: 1.5 M responses/s at p99 0.905 ms
+### High-perf: 3.8 M responses/s, p50 ~0.3 ms, p99 ≤ 1 ms
 
 End to end through the SDK — client submit, consensus, apply, response — with
-**every operation quorum-fsync'd before it is acked** and reads linearizable.
-p50 0.653 ms, p90 0.757 ms. Measured on 3 × `c6id.2xlarge`, 64 B payloads,
-through the **pipelined client** (`uc_client`'s public `Engine`) that ships
-today.
+**every operation quorum-durable before it is acked**. Mean of 8 runs
+3.79 M/s (span 3.55–4.17 M), p50 0.27–0.35 ms in 7 of 8 runs, p99 never above
+1.0 ms. Measured 2026-08-31 on 3 × `c9gd.4xlarge` (16-core Graviton), 64 B
+payloads, inflight 4096, through `uc_client`'s public `Engine` — the **local
+shared-memory client**, co-located with the leader
+→ [architecture sweep](/docs/benchmarks/uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
+A client connecting remotely through a gateway pays a measured toll on top:
+0.62× direct on one connection, 0.84× aggregate
+→ [M13 gate](/docs/benchmarks/uc2-m13-gate-2026-08-24.md).
+
+**CPU generation dominates these numbers.** The same software on the
+2020-generation fleet it was first measured on (3 × `c6id.2xlarge`) did
+1.5 M/s at p50 0.653 ms / p99 0.905 ms through the same pipelined client —
+so read published figures as floors from the hardware each record names, and
+size your own hosts with [Size a host](/docs/how-to/size-a-host.md).
 
 ### Leader failover p50 202 ms, zero committed loss in 10 of 10 kills
 
@@ -72,7 +83,9 @@ uc2-2.10.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
 
 Three nodes, three services and three gateways come up on this host, a real
 election happens, writes are committed by a majority and a linearizable read
-comes back through a gateway. It prints `PASS` and cleans up after itself.
+comes back through a gateway. It prints `PASS` and cleans up after itself. The same thing on a real AWS
+fleet: [three commands](/docs/how-to/fleet_start_quick.md), or
+[the full walk](/docs/how-to/fleet_start.md) with a check after every step.
 **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** has the download-and-verify
 step, the annotated configs, and the path onto real hosts.
 

@@ -6,7 +6,10 @@ matter.
 
 If you have not run one at all yet, work through
 [the quickstart](../QUICKSTART.md) first — it gets three nodes up on one box
-and is a better place to meet the moving parts.
+and is a better place to meet the moving parts. If you have no machines yet
+and AWS is fine, [Start a fleet](fleet_start.md) is this guide as one
+checkable recipe, provisioning included — or
+[the quick way](fleet_start_quick.md), three commands.
 
 ## Install the binaries on each host
 
