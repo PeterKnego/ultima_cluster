@@ -1,9 +1,20 @@
+# The AMI architecture is DERIVED from the instance type, not declared: a
+# Graviton type (c8gd/c9gd/...) silently boots an arm64 image, an x86 type an
+# amd64 one, and the two can never be mismatched by a forgotten variable.
+data "aws_ec2_instance_type" "node" {
+  instance_type = local.instance_type
+}
+
+locals {
+  ami_arch = contains(data.aws_ec2_instance_type.node.supported_architectures, "arm64") ? "arm64" : "amd64"
+}
+
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-${local.ami_arch}-server-*"]
   }
 }
 

@@ -38,22 +38,33 @@ from m12_fleet_gate import kill_unit, ssh  # noqa: E402
 from m13_hop_bench import sync_tree  # noqa: E402
 from m14_ab_27_vs_28 import one_arm  # noqa: E402
 
-# c8id.4xlarge: 16 logical / 8 physical, siblings (i, i+8). VERIFIED on all
-# three voters 2026-08-31 (`lscpu -e=CPU,CORE` -> CORE 0..7 0..7), Intel Xeon
-# 6975P-C, 1 socket. `verify_layout` re-checks it at run time rather than
-# trusting this comment.
-PHYS_CORES = 8
+# The pin map depends on the host's core/SMT layout, so the topology is
+# DECLARED (--topology) and then VERIFIED against lscpu on every voter —
+# never inferred, never assumed. Known layouts:
+#   8x2  — c8id.4xlarge: 16 logical / 8 physical, siblings (i, i+8). VERIFIED
+#          on all three voters 2026-08-31 (`lscpu -e=CPU,CORE` -> CORE 0..7
+#          0..7), Intel Xeon 6975P-C, 1 socket.
+#   16x1 — c9gd.4xlarge: 16 physical cores, no SMT (Graviton).
+# Arm definitions (node widths 1..6, service on core 6, client on core 7) are
+# IDENTICAL across topologies so arms compare across host types; only what
+# "unpinned" means differs (all 8 cores vs all 16), which is the hardware.
+TOPOLOGIES = {
+    "8x2": (8, 8),    # (physical cores, SMT sibling offset; 0 = no SMT)
+    "16x1": (16, 0),
+}
+PHYS_CORES = 8            # reset from --topology in main()
 SMT_OFFSET = 8
-SERVICE_CORE = 6          # service gets core 6 (CPUs 6,14) for every arm
-CLIENT_CORE = 7           # client  gets core 7 (CPUs 7,15) for every arm
+SERVICE_CORE = 6          # service gets core 6 (both siblings where SMT exists)
+CLIENT_CORE = 7           # client  gets core 7
 MAX_NODE_WIDTH = 6        # cores 0..5 are available to the node
 
 
 def cpus_of(cores):
-    """Both SMT threads of each physical core in `cores`."""
+    """Every CPU of each physical core in `cores` — both SMT siblings where
+    the topology has them, the core itself where it does not."""
     out = []
     for c in cores:
-        out += [c, c + SMT_OFFSET]
+        out += [c, c + SMT_OFFSET] if SMT_OFFSET else [c]
     return ",".join(str(x) for x in sorted(out))
 
 
@@ -72,10 +83,14 @@ def pin_map(width):
 
 
 def verify_layout(hosts):
-    """Refuse to run if the real sibling layout is not (i, i+8) over 8 cores —
-    the same fail-closed posture as m12.verify_pin_layout, because a wrong map
-    silently measures something other than what it claims."""
-    want = {(i, i + SMT_OFFSET) for i in range(PHYS_CORES)}
+    """Refuse to run if the real core layout differs from the declared
+    --topology — the same fail-closed posture as m12.verify_pin_layout,
+    because a wrong map silently measures something other than what it
+    claims."""
+    if SMT_OFFSET:
+        want = {(i, i + SMT_OFFSET) for i in range(PHYS_CORES)}
+    else:
+        want = {(i,) for i in range(PHYS_CORES)}
     for h in hosts:
         r = ssh(h, "lscpu -e=CPU,CORE | tail -n +2", label="lscpu")
         pairs = {}
@@ -83,14 +98,14 @@ def verify_layout(hosts):
             f = line.split()
             if len(f) >= 2 and f[0].isdigit():
                 pairs.setdefault(int(f[1]), []).append(int(f[0]))
-        got = {tuple(sorted(v)) for v in pairs.values() if len(v) == 2}
+        got = {tuple(sorted(v)) for v in pairs.values()}
         if got != want:
             raise SystemExit(
-                f"{h.public_ip}: sibling layout {sorted(got)} != expected {sorted(want)} "
-                f"— the pin map is built on (i, i+{SMT_OFFSET}) over {PHYS_CORES} cores "
-                f"and would pin the wrong CPUs. Redraw it before measuring.")
-        print(f"INFO [layout {h.public_ip}] siblings verified: (i, i+{SMT_OFFSET}) x {PHYS_CORES}",
-              flush=True)
+                f"{h.public_ip}: core layout {sorted(got)} != declared topology "
+                f"{sorted(want)} — the pin map would pin the wrong CPUs. Pass the "
+                f"right --topology (or add the new layout) before measuring.")
+        desc = f"(i, i+{SMT_OFFSET}) x {PHYS_CORES}" if SMT_OFFSET else f"{PHYS_CORES} cores, no SMT"
+        print(f"INFO [layout {h.public_ip}] verified: {desc}", flush=True)
 
 
 def main():
@@ -101,6 +116,10 @@ def main():
     ap.add_argument("--no-sync", action="store_true")
     ap.add_argument("--ssh-user", default="ubuntu")
     ap.add_argument("--ssh-key", default="/home/claude/.ssh/id_ed25519")
+    ap.add_argument("--topology", default="8x2", choices=sorted(TOPOLOGIES),
+                    help="declared host core layout, verified against lscpu before "
+                         "any arm runs: 8x2 = c8id.4xlarge (8 cores x 2 SMT), "
+                         "16x1 = c9gd.4xlarge (16 cores, no SMT)")
     ap.add_argument("--widths", default="1,2,3,4,5,6")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--secs", type=int, default=12)
@@ -115,6 +134,8 @@ def main():
                     help="also run an unpinned control arm (default on)")
     a = ap.parse_args()
 
+    global PHYS_CORES, SMT_OFFSET
+    PHYS_CORES, SMT_OFFSET = TOPOLOGIES[a.topology]
     widths = [int(w) for w in a.widths.split(",") if w.strip()]
     hosts = m6.build_fleet_hosts(m12.BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts, count=3,
                                  unit_prefix=m12.UNIT_PREFIX, remote_root=m12.REMOTE_ROOT,
@@ -161,7 +182,7 @@ def main():
         spread = 100.0 * (max(xs) - min(xs)) / mean
         if base is None:
             base = mean
-        cores = "all 8" if k == "unpinned" else k[1:]
+        cores = f"all {PHYS_CORES}" if k == "unpinned" else k[1:]
         print(f"  {k:9} ({cores:>5} cores)  mean {mean:12,.0f} resp/s  "
               f"[{min(xs):,.0f} .. {max(xs):,.0f}]  spread {spread:5.1f}%  "
               f"vs w{widths[0]} {mean / base:5.2f}x")
