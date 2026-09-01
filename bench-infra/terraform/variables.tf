@@ -20,6 +20,24 @@ variable "instance_type" {
   default     = ""
 }
 
+variable "client_instance_type" {
+  description = "AWS only: instance type for hosts past the first `voter_count` (load-driver/client hosts). Empty = same as instance_type. Lets client hosts draw from a different vCPU quota bucket (e.g. x86 clients driving an ARM cluster)."
+  type        = string
+  default     = ""
+}
+
+variable "voter_count" {
+  description = "AWS only: hosts [0, voter_count) use instance_type; the rest use client_instance_type."
+  type        = number
+  default     = 3
+}
+
+variable "client_spot" {
+  description = "AWS only: launch the client hosts (indices >= voter_count) as one-time Spot instances — a separate capacity/quota pool from On-Demand, fine for stateless load drivers."
+  type        = bool
+  default     = false
+}
+
 variable "region" {
   description = "Per-cloud region/location. Empty string uses the module default."
   type        = string

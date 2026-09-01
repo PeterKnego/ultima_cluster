@@ -200,6 +200,74 @@ def run_point(label, server_host, client_host, client_args, arm, secs, a,
     return point
 
 
+def run_point_multi(label, server_host, client_specs, arm, secs, a,
+                    edge_unit=None, extra=None):
+    """As `run_point`, but with the client load split across SEVERAL client
+    hosts running concurrently — `client_specs` is [(host, client_args), ...].
+    Exists because one 8-core TCP client host can itself be the ceiling when
+    the cluster behind the edge is fast (modern silicon): the aggregate would
+    then measure the client host, not the path. Rates/sends/lost sum across
+    hosts; latency percentiles report the WORST host (conservative); per-host
+    rates land in the point for the record."""
+    unit = "hb-client"
+    for ch, _ in client_specs:
+        ssh(ch, f"sudo rm -f {unit_log(ch, unit)}", label="ssh")
+    print(f"\nINFO --- {label} ---", flush=True)
+    t_start = time.time()
+    for ch, args in client_specs:
+        start_unit(ch, unit, args)
+    window = max(3, min(a.cpu_window_secs, int(secs - RAMP_SECS - 2)))
+    time.sleep(RAMP_SECS)
+    targets = [("server", server_host, edge_unit)] + [
+        (f"client{i}", ch, unit) for i, (ch, _) in enumerate(client_specs)]
+    samples = sample_cpu_concurrently(targets, window)
+    deadline = t_start + secs + DRAIN_SECS + SLACK_SECS
+    wait_units_done([(ch, [unit]) for ch, _ in client_specs], deadline)
+    per_host, ok = [], True
+    for ch, _ in client_specs:
+        out = tail_log(ch, unit, lines=400)
+        d = parse_result(out, arm)
+        kill_unit(ch, unit)
+        if d is None:
+            print(f"INFO {label}: NO RESULT on {ch.public_ip} (echoing tail)", flush=True)
+            echo(unit, out, lines=25)
+            ok = False
+        per_host.append(d)
+    def tot(k):
+        vals = [d.get(k) for d in per_host if d and d.get(k) is not None]
+        return sum(vals) if vals else None
+    def worst(k):
+        vals = [d.get(k) for d in per_host if d and d.get(k) is not None]
+        return max(vals) if vals else None
+    client_cpu = [samples.get(f"client{i}", {}).get("host_cpu_pct")
+                  for i in range(len(client_specs))]
+    s_ = samples.get("server", {})
+    point = {
+        "label": label, "arm": arm, "ok": ok,
+        "rps": tot("responses_per_sec"),
+        "p50_ms": worst("p50_ms"), "p95_ms": worst("p95_ms"), "p99_ms": worst("p99_ms"),
+        "lost": tot("lost"), "retried": tot("retried"), "sends": tot("sends"),
+        "server_host_cpu_pct": s_.get("host_cpu_pct"),
+        "server_proc_cpu_pct": s_.get("proc_cpu_pct"),
+        "client_host_cpu_pct": max((c for c in client_cpu if c is not None), default=None),
+        "client_hosts": len(client_specs),
+        "per_host_rps": [d.get("responses_per_sec") if d else None for d in per_host],
+        "per_host_cpu_pct": client_cpu,
+    }
+    if extra:
+        point.update(extra)
+    print("HOP-JSON " + json.dumps(point), flush=True)
+    return point
+
+
+def split_conns(n, hosts):
+    """Split n connections across up to len(hosts) hosts, at least 1 each,
+    as evenly as possible: 16 over 3 -> [6, 5, 5]; 1 over 3 -> [1]."""
+    h = min(n, len(hosts))
+    base, rem = divmod(n, h)
+    return [base + (1 if i < rem else 0) for i in range(h)]
+
+
 def ladder(s):
     return [int(x) for x in s.split(",") if x.strip()]
 
@@ -358,7 +426,10 @@ def arm_gate(m12hosts, hophosts, a, points, verdicts):
     are printed, not run.
     """
     node_hosts = m12hosts[:3]
-    C = hophosts[3]
+    K = max(1, a.gate_client_hosts)
+    if len(hophosts) < 3 + K:
+        raise SystemExit(f"--gate-client-hosts {K} needs {3 + K} hosts, have {len(hophosts)}")
+    C_hosts = hophosts[3:3 + K]
     cores = detect_cores(hophosts[0], a.gate_cores)
     direct_rps = 0.0
     m12.wipe_dirs(node_hosts)
@@ -387,15 +458,26 @@ def arm_gate(m12hosts, hophosts, a, points, verdicts):
         members = ",".join(f"{i}@{h.private_ip}:{EDGE_PORT}" for i, h in enumerate(node_hosts))
         start_hop_edge(LH, L.dir, m12.APP, a.gate_edge_inflight, a.gate_edge_per_conn,
                        members=members)
+        # Wait for the edge's TCP listener before the first rung: the n=1
+        # connect raced edge startup and lost on 2026-09-01 ("no cluster
+        # member could be reached"), voiding row a for that run.
+        r = ssh(LH, f"for i in $(seq 1 50); do ss -ltn | grep -q ':{EDGE_PORT} ' && "
+                    f"echo LISTENING && break; sleep 0.2; done", label="edge-wait")
+        if "LISTENING" not in (r.stdout or ""):
+            raise RuntimeError(f"edge never listened on :{EDGE_PORT}")
         gw = f"{L.private_ip}:{EDGE_PORT}"
         for n in ladder(a.gate_conns):
-            points.append(run_point(
-                f"GATE abc remote→edge→REAL cluster conns={n} inflight={a.conn_inflight}",
-                LH, C,
-                ["remote-load", "--gateways", gw, "--app-id", m12.APP,
-                 "--secs", str(a.secs), "--payload", str(a.payload),
-                 "--inflight", str(a.conn_inflight), "--conns", str(n)],
-                "remote", a.secs, a, edge_unit="hb-edge",
+            parts = split_conns(n, C_hosts)
+            specs = [(C_hosts[i],
+                      ["remote-load", "--gateways", gw, "--app-id", m12.APP,
+                       "--secs", str(a.secs), "--payload", str(a.payload),
+                       "--inflight", str(a.conn_inflight), "--conns", str(c)])
+                     for i, c in enumerate(parts)]
+            points.append(run_point_multi(
+                f"GATE abc remote→edge→REAL cluster conns={n} "
+                f"({'+'.join(map(str, parts))} over {len(parts)} hosts) "
+                f"inflight={a.conn_inflight}",
+                LH, specs, "remote", a.secs, a, edge_unit="hb-edge",
                 extra={"hop": "gate-c", "inflight": a.conn_inflight, "n": n,
                        "driver": "remote-load"}))
         kill_unit(LH, "hb-edge")
@@ -767,6 +849,10 @@ def main():
     ap.add_argument("--gate-edge-per-conn", type=int, default=1024,
                     help="gate rows a/b/c: the edge's per-connection credit ceiling "
                          "(must be <= the grant budget, i.e. 7/8 of --gate-edge-inflight)")
+    ap.add_argument("--gate-client-hosts", type=int, default=1,
+                    help="gate rows a/b/c: client hosts driving the remote ladder "
+                         "concurrently (hosts[3..3+K)); each rung's N total conns "
+                         "split evenly across them, rates summed")
     ap.add_argument("--gate-cores", type=int, default=0,
                     help="gate row d: cores on the server host (0 = detect with nproc)")
     a = ap.parse_args()

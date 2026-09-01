@@ -48,8 +48,11 @@ module "aws" {
   source = "./modules/aws"
   count  = local.enable_aws ? 1 : 0
 
-  node_count     = var.node_count
-  instance_type  = var.instance_type
+  node_count           = var.node_count
+  instance_type        = var.instance_type
+  client_instance_type = var.client_instance_type
+  voter_count          = var.voter_count
+  client_spot          = var.client_spot
   region         = var.region
   ssh_public_key = var.ssh_public_key
   allow_ssh_cidr = var.allow_ssh_cidr
