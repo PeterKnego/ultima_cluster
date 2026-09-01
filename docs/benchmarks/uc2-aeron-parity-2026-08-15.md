@@ -235,7 +235,34 @@ measured Aeron Cluster latency at two FIXED rates (100 k and 1 M msgs/s;
 no ceiling search) on 3 × c6in.16xlarge — 64 vCPU, network-optimized, with
 the full low-latency treatment this run deliberately skipped (CPU pinning,
 isolcpus, sysctl tuning); cluster persistence on EBS, fsync level and
-message size undisclosed.
+message size undisclosed **in the blog**.
+
+**Disclosure resolved 2026-09-01** from Adaptive's own setup guides
+(*Aeron.io — AWS Performance Testing Guide*, January 2026, p. 12-16; the
+Feb-2024 Google Cloud guide, p. 8-11):
+
+- **The guide's cluster benchmark invocation is
+  `--file-sync-level 0`** (p. 16). The same guide defines level 0 as
+  "normal write is performed (pwrite on Linux), i.e. the data is written
+  to the page cache and the OS is responsible for writing the dirty pages
+  back to the disc asynchronously" (p. 12) — level 1 is the fdatasync
+  this doc's Aeron arm was configured with. Strictly this fixes the
+  *documented* invocation, not the blog's unpublished run config, but it
+  is the vendor's own reference command. **If the published cluster
+  numbers were produced this way they are page-cache acks, not durable
+  acks**, and are a different guarantee from both arms of this scorecard.
+  This confirms the "possibly async fsync level" hypothesis below.
+- **Message size is 288 B** for the headline latency runs (the GCP page
+  states it; `MESSAGE_LENGTH` defaults to `32,288,1344`), against this
+  doc's 64 B.
+- Storage is mounted `-o defaults,noatime,nodiratime,discard,nobarrier`
+  (AWS guide p. 11) — `nobarrier` disables write barriers, weakening
+  durability further independent of the sync level.
+
+Net: the tuning-tier gap below is real, but the **durability posture gap
+is larger than it was possible to state in August** — this doc ran Aeron
+at sync level 1 to match UC's fsync-on requirement, i.e. in a *more*
+durable configuration than Adaptive's own published benchmarks document.
 
 - **Their OSS Cluster @ 1 M: p50 4,948 µs / p99 8,577 µs — queueing
   collapse.** That is this doc's knee finding, replicated independently on

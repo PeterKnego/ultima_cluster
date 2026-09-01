@@ -121,9 +121,14 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   — **a property of the UDP data plane, not of the design.** One command
   must fit one datagram, and `MTU_DEFAULT = 1408`
   (`uc_protocol::v2::datagram`) is sized to clear a 1500 B Ethernet path
-  without IP fragmentation; the header takes 16 B and the crypto tag the
-  rest of the difference. There is no runtime knob — it is a source
-  constant, and `preflight` refuses above it. Treat the number as
+  without IP fragmentation. The arithmetic is
+  `docs/security/attack-surface.md` §3 and it is pure transport geometry:
+  1408 less the 16 B datagram header less the 32 B frame header, floored to
+  `FRAME_ALIGNMENT = 32` → 1344; crypto's `CRYPTO_OVERHEAD = 24` (8 B
+  counter + 16 B GCM tag) takes the next aligned step down → 1312.
+  (Aeron, whose 1408 UC inherited, lands on the same 1344 — it is the top
+  `MESSAGE_LENGTH` in `aeron-io/benchmarks`.) There is no runtime knob — it
+  is a source constant, and `preflight` refuses above it. Treat the number as
   transport-derived: a different transport (jumbo frames, or an OS-bypass
   fabric such as EFA/SRD, whose messages are far larger) would move or
   remove it, at the cost of a wire flag day. `bincode` is `NoLimit`; the
