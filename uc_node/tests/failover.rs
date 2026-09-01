@@ -243,6 +243,13 @@ fn spawn_cluster(n: usize) -> Cluster {
 /// As [`spawn_cluster`] but with an explicit ring size (the prefill-decision pin
 /// uses a small ring). Every node — and its restarts — boots with `buffer_bytes`.
 fn spawn_cluster_ring(n: usize, buffer_bytes: usize) -> Cluster {
+    spawn_cluster_parts(n, buffer_bytes, None)
+}
+
+/// Shared spawn body. `fast_election`, when set, gives that node an 80-120 ms
+/// election band (peers keep the default 150-300 ms) — the deterministic
+/// term-1-winner bias for [`spawn_cluster_muzzled_fast_leader`].
+fn spawn_cluster_parts(n: usize, buffer_bytes: usize, fast_election: Option<usize>) -> Cluster {
     let dir = tempfile::Builder::new()
         .prefix("uc2-failover-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -265,7 +272,7 @@ fn spawn_cluster_ring(n: usize, buffer_bytes: usize) -> Cluster {
         let instance_dir = dir.path().join(format!("n{i}"));
         let journal_dir = instance_dir.join("journal");
         let seed = seed_for(i);
-        let cfg = make_config_ring(
+        let mut cfg = make_config_ring(
             i as NodeId,
             members.clone(),
             instance_dir.clone(),
@@ -273,6 +280,10 @@ fn spawn_cluster_ring(n: usize, buffer_bytes: usize) -> Cluster {
             addr,
             buffer_bytes,
         );
+        if fast_election == Some(i) {
+            cfg.election_timeout_min_ns = 80_000_000;
+            cfg.election_timeout_max_ns = 120_000_000;
+        }
         let node = Node::start_with_socket(cfg, sock).expect("start");
         nodes.push(NodeH {
             id: i as NodeId,
@@ -289,6 +300,36 @@ fn spawn_cluster_ring(n: usize, buffer_bytes: usize) -> Cluster {
         members,
         nodes,
     }
+}
+
+/// As [`spawn_cluster`], but builds the contested-first-election scenario's
+/// precondition BY CONSTRUCTION: node `fast` gets an election band strictly
+/// below its peers' (80-120 ms vs 150-300 ms, both comfortably above the
+/// 20 ms leader heartbeat) so it claims term 1 first, and its outbound links
+/// are muzzled to election-only traffic (`block_except_election`) before any
+/// peer node even starts — its NewTerm frame can never land on a follower.
+/// The old construction raced `is_leader` against the sender agent shipping
+/// that frame (~50/50 on x86); on Graviton/Neoverse-V3 the race measured
+/// 0/264, so nothing may depend on winning it.
+fn spawn_cluster_muzzled_fast_leader(n: usize, fast: usize) -> Cluster {
+    let c = spawn_cluster_parts(n, DEFAULT_RING, Some(fast));
+    let peers: Vec<SocketAddr> = c
+        .members
+        .iter()
+        .filter(|(id, _)| *id != fast as NodeId)
+        .map(|&(_, a)| a)
+        .collect();
+    for h in c.nodes[fast].n().partition_handles() {
+        for &a in &peers {
+            h.block_except_election(a);
+        }
+    }
+    // The muzzle is installed before `fast`'s first election can fire (its
+    // band starts 80 ms after agent start; these handles are set within
+    // microseconds of `spawn_cluster_parts` returning) — but nothing here
+    // RELIES on that: a frame slipping out early just fails the base-0 check
+    // and the caller rebuilds.
+    c
 }
 
 impl Cluster {
@@ -791,41 +832,56 @@ fn heal_truncates_divergent_tail_and_reconverges() {
 }
 
 /// Contested first election (M4 final-review I-2): a node wins term 1 and fsyncs
-/// its NewTerm frame but is partitioned before any datagram lands; a peer wins
+/// its NewTerm frame but is cut off before any datagram lands; a peer wins
 /// term 2 at base 0. On heal, the isolated node must truncate to 0 (a first-block
 /// cut) WITHOUT panicking and rejoin; pre-fix this was a fail-stop panic loop on
 /// every restart.
 ///
-/// Constructing it means winning a race: `is_leader` flips at the end of
-/// `BecomeLeader`, ahead of the sender agent shipping the NewTerm DATA, so we
-/// spin on `is_leader` and cut the fresh leader off from both peers the instant
-/// it appears — its term-1 NewTerm (recorded to its OWN journal at base 0) then
-/// never reaches a follower, the other two time out, and one wins term 2 ALSO at
-/// base 0. That race is ~50/50 (the sender can ship first), so we retry the
-/// construction: a new leader that opens ABOVE base 0 (its serving commit exceeds
-/// the lone NewTerm frame) means the isolated node's frame slipped through and
-/// committed — not a first-block cut — so we tear down and rebuild. Once a clean
-/// base-0 construction is in hand the outcome is deterministic.
+/// The precondition — "won the election, but its NewTerm never landed" — is
+/// built BY CONSTRUCTION, not won in a race: node 0 boots with a faster
+/// election band AND its outbound muzzled to election-only traffic
+/// ([`spawn_cluster_muzzled_fast_leader`]), so it wins term 1 while its
+/// NewTerm frame (recorded to its OWN journal at base 0) cannot leave the
+/// socket. The full both-way cut is then installed at leisure: the peers'
+/// timers reset when they granted node 0 its votes, so their term-2 candidacy
+/// is >= 150 ms out. (The original construction spun on `is_leader` and raced
+/// the sender agent's ship — "~50/50" on x86, but 0/264 on Graviton/
+/// Neoverse-V3, where the sender always shipped first; 2026-08-31.) The
+/// retry loop below survives as a belt for scheduler pathologies — a stalled
+/// node 0 losing the election, or a frame slipping out pre-muzzle — both of
+/// which fail the base-0 check and rebuild rather than mis-measure.
 #[test]
 fn contested_first_election_first_block_truncation_recovers() {
     let _g = serialize();
 
-    // Bounded retries: the isolate-before-ship race is ~50/50, so P(no clean
-    // construction in 24 tries) is < 1e-7.
     const MAX_ATTEMPTS: usize = 24;
     for attempt in 0..MAX_ATTEMPTS {
-        let mut c = spawn_cluster(3);
+        let mut c = spawn_cluster_muzzled_fast_leader(3, 0);
 
-        // Catch the FIRST node to claim leadership and isolate it immediately,
-        // before its NewTerm datagram can land on either peer.
+        // Node 0's 80-120 ms band undercuts its peers' 150-300 ms, so it
+        // claims term 1 — muzzled. A peer winning instead means the scheduler
+        // stalled node 0 clean past its band: rebuild, don't wait out the
+        // 30 s deadline.
+        let leader = 0usize;
         let deadline = deadline_secs(30);
-        let leader = loop {
-            if let Some(i) = (0..3).find(|&i| c.nodes[i].node.is_some() && c.nodes[i].is_leader()) {
-                break i;
+        let wrong_winner = loop {
+            if c.nodes[leader].node.is_some() && c.nodes[leader].is_leader() {
+                break false;
+            }
+            if (0..3).any(|i| i != leader && c.nodes[i].node.is_some() && c.nodes[i].is_leader()) {
+                break true;
             }
             assert!(Instant::now() < deadline, "no node claimed leadership");
             std::thread::yield_now();
         };
+        if wrong_winner {
+            c.stop_all();
+            assert!(
+                attempt + 1 < MAX_ATTEMPTS,
+                "no clean base-0 construction in {MAX_ATTEMPTS} tries"
+            );
+            continue;
+        }
         let others: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
         for &o in &others {
             partition(&c.nodes[leader], &c.nodes[o]);
@@ -842,7 +898,8 @@ fn contested_first_election_first_block_truncation_recovers() {
             "new leader did not advance the term"
         );
         if c.nodes[new].commit() != NEW_TERM {
-            // Lost the race this time — the new term opened above base 0.
+            // The new term opened above base 0 — node 0's frame slipped out
+            // before the muzzle landed (a spawn-time scheduler pathology).
             c.stop_all();
             assert!(
                 attempt + 1 < MAX_ATTEMPTS,

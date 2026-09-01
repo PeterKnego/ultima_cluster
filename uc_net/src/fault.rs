@@ -74,6 +74,20 @@ impl Default for FaultConfig {
     }
 }
 
+/// The two scripted cut modes a [`PartitionHandle`] can hold per peer.
+#[derive(Default)]
+struct BlockTable {
+    /// Fully cut: every datagram to these peers drops.
+    all: HashSet<SocketAddr>,
+    /// Muzzled: everything EXCEPT the election plane (`REQUEST_VOTE`/`VOTE`)
+    /// drops. Exists so a test can construct "this node WON an election but
+    /// none of its data ever landed" without racing the sender agent — that
+    /// race is scheduling-dependent and on some hardware unwinnable (first
+    /// measured on Graviton/Neoverse-V3, 2026-08-31: 0 wins in 264 tries of
+    /// a race that is ~50/50 on x86).
+    except_election: HashSet<SocketAddr>,
+}
+
 /// A shared, injectable partition table (M4, spec §8): the set of peer
 /// addresses this socket is currently partitioned away from. Cloned into a
 /// [`FaultSocket`] and driven from a test/consensus thread while the socket's
@@ -82,22 +96,45 @@ impl Default for FaultConfig {
 /// link cut). Empty-set is the steady state, so `send_to` pays exactly one
 /// uncontended read-lock (~20 ns) when nothing is blocked.
 #[derive(Clone, Default)]
-pub struct PartitionHandle(Arc<RwLock<HashSet<SocketAddr>>>);
+pub struct PartitionHandle(Arc<RwLock<BlockTable>>);
 
 impl PartitionHandle {
     /// Partition this socket away from `addr`: subsequent `send_to(addr)` drop
     /// silently until [`unblock`](Self::unblock)/[`clear`](Self::clear).
     pub fn block(&self, addr: SocketAddr) {
-        self.0.write().unwrap().insert(addr);
+        self.0.write().unwrap().all.insert(addr);
     }
-    /// Reconnect a single peer (inverse of [`block`](Self::block)).
+    /// Muzzle this socket toward `addr`: only election datagrams
+    /// (`REQUEST_VOTE`/`VOTE`) pass; DATA, heartbeats, durable reports,
+    /// term-map gossip and everything else drop. A full [`block`](Self::block)
+    /// on the same peer supersedes the muzzle.
+    pub fn block_except_election(&self, addr: SocketAddr) {
+        self.0.write().unwrap().except_election.insert(addr);
+    }
+    /// Reconnect a single peer (inverse of [`block`](Self::block); lifts a
+    /// muzzle too).
     pub fn unblock(&self, addr: SocketAddr) {
-        self.0.write().unwrap().remove(&addr);
+        let mut t = self.0.write().unwrap();
+        t.all.remove(&addr);
+        t.except_election.remove(&addr);
     }
-    /// Heal every partition on this socket.
+    /// Heal every partition (and muzzle) on this socket.
     pub fn clear(&self) {
-        self.0.write().unwrap().clear();
+        let mut t = self.0.write().unwrap();
+        t.all.clear();
+        t.except_election.clear();
     }
+}
+
+/// True iff `buf` starts with a datagram header whose kind is on the election
+/// plane. A runt shorter than the header has no kind and is NOT election
+/// traffic. Works crypto-on too: the header is AAD, sealed but not encrypted.
+fn is_election_kind(buf: &[u8]) -> bool {
+    use uc_protocol::v2::datagram::{DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_VOTE, OFF_DGRAM_KIND};
+    matches!(
+        buf.get(OFF_DGRAM_KIND),
+        Some(&DGRAM_KIND_REQUEST_VOTE) | Some(&DGRAM_KIND_VOTE)
+    )
 }
 
 /// Bound on the replay-history ring (see [`FaultSocket::remember`]) — old
@@ -172,8 +209,14 @@ impl FaultSocket {
         // seeded drop/dup/reorder run). Empty-set steady state = one
         // uncontended read-lock; a partitioned peer's datagram is dropped whole.
         {
-            let blocked = self.blocked.0.read().unwrap();
-            if !blocked.is_empty() && blocked.contains(&to) {
+            let t = self.blocked.0.read().unwrap();
+            if !t.all.is_empty() && t.all.contains(&to) {
+                return Ok(());
+            }
+            if !t.except_election.is_empty()
+                && t.except_election.contains(&to)
+                && !is_election_kind(buf)
+            {
                 return Ok(());
             }
         }
@@ -376,6 +419,52 @@ mod tests {
             recv_all(&rx, 2),
             vec![b"second".to_vec(), b"first".to_vec()]
         );
+    }
+
+    #[test]
+    fn muzzle_passes_election_traffic_only() {
+        use uc_protocol::v2::datagram::{
+            DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_REQUEST_VOTE,
+            DGRAM_KIND_VOTE, OFF_DGRAM_KIND,
+        };
+        fn dgram(kind: u8) -> Vec<u8> {
+            let mut b = vec![0u8; DATAGRAM_HEADER_LEN];
+            b[OFF_DGRAM_KIND] = kind;
+            b
+        }
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let part = tx.partition_handle();
+
+        // Muzzled: the data plane (DATA/HEARTBEAT — and anything else that is
+        // not an election kind, including a runt shorter than the header) is
+        // dropped whole; REQUEST_VOTE and VOTE pass.
+        part.block_except_election(to);
+        tx.send_to(&dgram(DGRAM_KIND_DATA), to).unwrap();
+        tx.send_to(&dgram(DGRAM_KIND_HEARTBEAT), to).unwrap();
+        tx.send_to(b"runt", to).unwrap();
+        tx.send_to(&dgram(DGRAM_KIND_REQUEST_VOTE), to).unwrap();
+        tx.send_to(&dgram(DGRAM_KIND_VOTE), to).unwrap();
+        let got = recv_all(&rx, 2);
+        assert_eq!(got.len(), 2, "exactly the two election datagrams pass");
+        assert_eq!(got[0][OFF_DGRAM_KIND], DGRAM_KIND_REQUEST_VOTE);
+        assert_eq!(got[1][OFF_DGRAM_KIND], DGRAM_KIND_VOTE);
+
+        // A full block supersedes the muzzle: now even election kinds drop.
+        part.block(to);
+        tx.send_to(&dgram(DGRAM_KIND_VOTE), to).unwrap();
+        let mut buf = [0u8; 32];
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            rx.recv_from(&mut buf).unwrap().is_none(),
+            "full block must drop votes too"
+        );
+
+        // clear() heals the muzzle along with the blocks.
+        part.clear();
+        tx.send_to(&dgram(DGRAM_KIND_DATA), to).unwrap();
+        assert_eq!(recv_all(&rx, 1).len(), 1, "clear() must lift the muzzle");
     }
 
     #[test]
