@@ -42,6 +42,12 @@ invites. Run both through the gate discipline.
     of scope"; `docs/releases.md` 2.8.0 entry).
 - **Cost:** moderate. **Output:** a backlog grounded in use, plus the two
   decisions above.
+- **Status 2026-09-01: brainstormed and PARKED** — decisions (KV store,
+  Go in a separate repo, docs-sufficiency bar, clean-room build, op set,
+  wire format, state machine) are recorded in
+  `docs/superpowers/specs/2026-09-01-uc2-dogfood-kv-and-go-client-brief.md`;
+  the maintainer paused to add features to UC first. Resume from that
+  brief's "Where the design stopped".
 
 ### 2. Rolling upgrades and leadership transfer
 
