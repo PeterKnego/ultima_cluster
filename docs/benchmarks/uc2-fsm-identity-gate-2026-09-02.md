@@ -19,12 +19,18 @@ Spec: `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §9
 ("Fleet gate"), §10. FSM identity replaces M14's numeric declared-set
 bitmask with named, positionally-checked rows: identity in code (`const
 NAME`/`const VERSION`), `[services] names` required, `SNAP_BEGIN` 0.7.0
-carrying per-row identity hashes and versions, cnc 3.1. **The hot path —
-consensus, the log frame, the ingress/egress rings, the client `Engine`
-internals, the apply loop's steady-state cost — is untouched**; every
-change here is at the config/attach/snapshot-session boundary. The expected
-throughput delta against the M14 gate's own numbers is therefore **null**,
-and this gate's rate rows say so rather than proposing a new number to beat.
+carrying per-row identity hashes and versions, cnc 3.1. **Consensus, the log
+frame, the ingress/egress rings, and the client `Engine` internals are
+untouched**; the apply loop is NOT fully untouched — it now constructs a
+48-byte `ApplyCtx` (`uc_service/src/apply.rs`, `ApplyCtx::new(pos,
+S::IDENTITY)`) once per frame, where the pre-identity binary passed a bare
+`position`. The expected throughput delta against the M14 gate's own numbers
+is **null only if that construction inlines away**, per M14a's lesson that
+code added to a hot loop's body can cost even on paths that don't touch it
+(`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`) — this gate does not get
+to assume it does. Before any null claim, the run must include an
+`apply_bench` A/B (pre-identity vs. this branch) with `scripts/hop1_ab.sh`'s
+same-source rebuild control, not just cite this section's prose.
 
 **Coverage statement.** This gate measures only what a fleet can measure:
 whether attaching, running and joining **by name** costs anything against

@@ -198,8 +198,10 @@ pub struct ApplyCtx {
     identity: FsmIdentity,
 }
 impl ApplyCtx {
-    /// For a state machine's own unit tests: `ApplyCtx::new(pos, MySm::IDENTITY)`.
     pub fn new(position: u64, identity: FsmIdentity) -> Self { Self { position, identity } }
+    /// For a state machine's own unit tests: `ApplyCtx::for_sm::<MySm>(pos)`
+    /// (built on `new`, filling in `MySm::IDENTITY` for you).
+    pub fn for_sm<S: RawStateMachine>(position: u64) -> Self { Self::new(position, S::IDENTITY) }
     /// The deterministic ID generator for THIS apply call (§3.4).
     pub fn ids(&self) -> IdGen { IdGen::new(self.position, self.identity) }
 }
@@ -568,11 +570,16 @@ so. Loom, Lean and conformance: unchanged, re-run as regression only.
 
 **Fleet gate** (`docs/benchmarks/uc2-fsm-identity-gate-<date>.md`, bars
 pre-committed before the run, honest-failure protocol): the M14 gate's
-rows with names substituted (steady-window, `m14_fleet_gate.py`). The hot
-path is untouched, so the expected delta is null; the bar is a bound
-against the harness's measured build-to-build resolution
-(`scripts/hop1_ab.sh`'s same-source rebuild control), not a hoped-for
-number.
+rows with names substituted (steady-window, `m14_fleet_gate.py`). Consensus,
+the log frame, the rings and the client `Engine` are untouched, but the
+apply loop is not: it now builds a 48-byte `ApplyCtx` per frame
+(`uc_service/src/apply.rs`). The expected delta is null only if that
+construction inlines away — M14a found that code added to a hot loop's body
+can cost even on paths that never execute it — so the run must include an
+`apply_bench` A/B (pre-identity vs. this branch) using the harness's
+measured build-to-build resolution (`scripts/hop1_ab.sh`'s same-source
+rebuild control) before treating "null" as established, not a hoped-for
+number asserted from this section's prose alone.
 
 ## 10. Release and docs
 
