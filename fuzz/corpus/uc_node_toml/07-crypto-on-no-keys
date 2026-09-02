@@ -12,3 +12,6 @@ enabled = true
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]

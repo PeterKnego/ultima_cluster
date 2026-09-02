@@ -610,6 +610,19 @@ fn an_out_of_range_service_id_is_refused_not_a_panic() {
     h.pump_until("the out-of-range id is refused, not a panic", |_| {
         st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
     });
+    // Ruling 5: the arrays agreed at every row (the forged BEGIN reused our
+    // own `identity`), so this is the "artifact's row outside the declared
+    // mask" cause, not a positional name mismatch — `RefusalKind::ArtifactId`,
+    // not `Identity`.
+    assert_eq!(
+        st.identity_refusal
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("a refusal was recorded")
+            .kind,
+        RefusalKind::ArtifactId
+    );
     assert!(
         !h.follower_snap_dir.join("0").exists(),
         "no intake, no directory, no .part"

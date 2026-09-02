@@ -111,6 +111,9 @@ enabled = false
 [admin]
 auth = \"hmac\"
 keys = [{ name = \"admin\", key_path = \"/etc/uc2/admin.key\" }]
+
+[services]
+names = [\"counter\"]
 EOF
         sudo install -m 0644 /opt/uc2-packaging/systemd/uc2-node.service /etc/systemd/system/
         sudo systemctl daemon-reload

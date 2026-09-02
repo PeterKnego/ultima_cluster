@@ -9,3 +9,6 @@ addr = "10.0.0.1:9100"
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]

@@ -236,7 +236,7 @@ struct ServiceArgs {
     /// leader has artifacts to ship. `0` = no snapshots — `start()`, byte-for-
     /// byte every prior arm. `> 0` runs `start_with_snapshots()` (typed tier
     /// only: `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
-    /// `SnapshotStateMachine`); paired with `--raw-sm` it is refused by name.
+    /// `SnapshotStateMachine`); paired with `--fsm raw` it is refused by name.
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
 }
@@ -1745,7 +1745,7 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
 /// `cfg.snapshot_policy` — only `start_with_snapshots()` spawns the M6
 /// builder thread that trips it (`uc_service/src/lib.rs:199-291`, the same
 /// method `m6_gate.rs` uses). Shared by the four typed arms below (raw arms
-/// keep plain `start()`; `--raw-sm` + `--snapshot-interval-bytes` is refused
+/// keep plain `start()`; `--fsm raw` + `--snapshot-interval-bytes` is refused
 /// by name before this is ever reached).
 fn start_typed_svc<S: SnapshotStateMachine>(
     b: ServiceBuilder<S>,

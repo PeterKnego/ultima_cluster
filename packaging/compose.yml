@@ -140,6 +140,12 @@ services:
         [admin]
         auth = "hmac"
         keys = [{ name = "admin", key_path = "/etc/uc2/admin.key" }]
+
+        # FSM identity (cnc 3.1): the row the counter-service attaches to.
+        # REQUIRED, like [crypto]/[admin] above — a node.toml with no
+        # [services] refuses to start by name.
+        [services]
+        names = ["counter"]
         EOF
         cat >/etc/uc2/gateway.toml <<EOF
         # instance_dir / listen are likewise overridden per container, via

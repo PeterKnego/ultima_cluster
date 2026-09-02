@@ -98,6 +98,16 @@ pub enum ServiceError {
          the service that is"
     )]
     UnknownFsm { name: String, declared: Vec<String> },
+    /// Same as [`UnknownFsm`](Self::UnknownFsm), but the page declares no
+    /// names at all — the node is far more likely to be older than cnc 3.1
+    /// than genuinely configured with an empty `[services]`. A separate
+    /// variant (rather than branching one shared string at runtime) so the
+    /// hint is exact and the common case's message stays unchanged.
+    #[error(
+        "FSM {name:?} is not declared on this node (declared, in row order: \
+         []); the node's page carries no names — is the node older than cnc 3.1?"
+    )]
+    UnknownFsmNoNames { name: String },
     /// M14a: another live process holds `service.<row>.lock`.
     #[error(
         "another process already holds FSM {name:?} at row {row} on this \

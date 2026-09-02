@@ -15,3 +15,6 @@ auth = "none"
 
 [log]
 level = "chatty"
+
+[services]
+names = ["sm"]

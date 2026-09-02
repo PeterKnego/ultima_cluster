@@ -21,3 +21,6 @@ enabled = false
 [admin]
 auth = "hmac"
 keys = [{ name = "admin", key_path = "/tmp/uc2-quickstart/admin.key" }]
+
+[services]
+names = ["sm"]

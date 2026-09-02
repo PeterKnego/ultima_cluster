@@ -195,7 +195,12 @@ const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, version) == cnc::C
 
 /// cnc 3.1: the slot's line 7 — the row's name (NUL-padded) and its FNV-1a
 /// hash, written ONCE by the node in `init`, before the header is published,
-/// and never again. Read-only for every attacher.
+/// and never again. Read-only for every attacher. The plain `name` bytes'
+/// only publication edge is the header CRC written after them in `init` —
+/// there is no separate release store for this field, and that is sufficient
+/// because no attacher passes `validate` (which checks that CRC) before the
+/// CRC exists, so no reader can observe the name bytes ahead of the write
+/// that publishes them.
 #[repr(C)]
 pub struct ServiceIdentityLine {
     name: [u8; cnc::CNC_SVC_NAME_LEN],

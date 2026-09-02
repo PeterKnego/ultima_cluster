@@ -27,6 +27,7 @@ use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
+    RefusalKind,
 };
 use uc_net::sender::{
     CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet, identity_mask,
@@ -3055,11 +3056,15 @@ impl Consensus {
         {
             let ours = self.name_or_hash(d.row, d.ours);
             let theirs = self.name_or_hash(d.row, d.theirs);
+            let reason = match d.kind {
+                RefusalKind::ArtifactId => "artifact id out of declared mask",
+                _ => "identity mismatch",
+            };
             crate::obs_event!(
                 Warn,
                 "snapshot_session_refused",
                 node = self.id as u64,
-                reason = "identity mismatch",
+                reason = reason,
                 total = now.1,
                 row = d.row as u64,
                 ours = ours.as_str(),
@@ -6348,7 +6353,7 @@ fn snapshot_set_for(
     // declared (`ServicesConfig::none_for_tests`) must never open a
     // snapshot session — `identity_hashes()` reads all-zero there, so
     // `identity_mask` would too, indistinguishable from a genuinely empty
-    // declared set rather than "row 0 stands in for clients" (`ring_mask`'s
+    // declared set rather than "row 0 stands in for clients" (`ring_ids`'s
     // fallback, which this function must NOT inherit). Refuse by the same
     // named reason a missing artifact uses.
     if services.count() == 0 {
@@ -10176,7 +10181,7 @@ mod tests {
     /// session, even with a floor and a row-0 artifact present. Without this,
     /// `identity_hashes()` reads all-zero, `identity_mask` reads 0 too, and a
     /// zero-artifact set would look like a covering (empty) set rather than
-    /// the harness-only "row 0 stands in for clients" fiction `ring_mask`
+    /// the harness-only "row 0 stands in for clients" fiction `ring_ids`
     /// applies everywhere else.
     #[test]
     fn a_none_for_tests_node_never_opens_a_snapshot_session() {

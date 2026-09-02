@@ -75,15 +75,19 @@ pub(crate) fn attach<S: RawStateMachine>(
     let row: u8 = if harness {
         0
     } else {
-        cnc.row_of(&S::IDENTITY.name)
-            .ok_or_else(|| ServiceError::UnknownFsm {
-                name: S::IDENTITY.name.as_str().to_string(),
-                declared: names
-                    .iter()
-                    .flatten()
-                    .map(|n| n.as_str().to_string())
-                    .collect(),
-            })?
+        cnc.row_of(&S::IDENTITY.name).ok_or_else(|| {
+            let declared: Vec<String> = names
+                .iter()
+                .flatten()
+                .map(|n| n.as_str().to_string())
+                .collect();
+            let name = S::IDENTITY.name.as_str().to_string();
+            if declared.is_empty() {
+                ServiceError::UnknownFsmNoNames { name }
+            } else {
+                ServiceError::UnknownFsm { name, declared }
+            }
+        })?
     };
     // M14a: the declared-set gate. `0` on the page is a harness node
     // (`ServicesConfig::none_for_tests`), which rings FSM 0 only.

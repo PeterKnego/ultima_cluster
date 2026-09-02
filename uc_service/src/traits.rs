@@ -38,6 +38,13 @@ impl ApplyCtx {
     pub fn new(position: u64, identity: FsmIdentity) -> ApplyCtx {
         ApplyCtx { position, identity }
     }
+    /// Convenience for a state machine's own unit tests: `ApplyCtx::for_sm::<MySm>(pos)`
+    /// builds the context with `S::IDENTITY`, the same identity the real apply
+    /// loop stamps for `S`, so a test never has to spell
+    /// `<MySm as RawStateMachine>::IDENTITY` itself (spec §3.3).
+    pub fn for_sm<S: RawStateMachine>(position: u64) -> ApplyCtx {
+        ApplyCtx::new(position, S::IDENTITY)
+    }
     pub fn identity(&self) -> FsmIdentity {
         self.identity
     }

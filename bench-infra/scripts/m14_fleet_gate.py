@@ -69,12 +69,22 @@ WARMUP_SECS, MEASURE_SECS = 2, 8
 KILL_ARM_SECS = 45          # row d: baseline [2,10) s, kill at ~12 s, 30 s to recover
 JOIN_ARM_SECS = 90          # row f: load for the whole join
 JOIN_AT_SECS = 10           # row f: add-learner this long after load starts
+# `uc2ctl status` (FSM identity, cnc 3.1): one row per declared FSM, field-keyed
+# so a reordered/extended line doesn't silently misalign the tuple. Example line
+# (uc_ctl/src/main.rs's `println!` in the status command):
+#   row=0 name=count version=1.0.0 hash=0x0123456789abcdef attached=true epoch=5 \
+#     incarnation=2 applied=1000 lag=50 snapshot_pos=900 heartbeat_age=0.123s
 STATUS_RE = re.compile(
-    r"id=(\d+) attached=(true|false) epoch=(\d+) incarnation=(\d+) "
-    r"applied=(\d+) lag=(\d+) snapshot_pos=(\d+)")
+    r"row=(\d+) name=(\S*) version=(\S+) hash=0x([0-9a-f]+) attached=(true|false) "
+    r"epoch=(\d+) incarnation=(\d+) applied=(\d+) lag=(\d+) snapshot_pos=(\d+) "
+    r"heartbeat_age=(\S+)")
 TL_RE = re.compile(r'^TL\s+(\{.*\})\s*$', re.M)
 FSMS_OK_RE = re.compile(r'^FSMS-OK\s+(\{.*\})\s*$', re.M)
-STATS_RE = re.compile(r"reports_unattested=(\d+) snap_refusals=\((\d+),(\d+)\)")
+# `m12_gate.rs`'s node role prints three snapshot-refusal counters since FSM
+# identity: legacy (peer wire <= 0.6.0), identity (positional name mismatch),
+# version (both sides versioned, differ) — e.g.
+#   m12_gate node 0 stats: reports_unattested=0 snap_refusals=(0,0,0)
+STATS_RE = re.compile(r"reports_unattested=(\d+) snap_refusals=\((\d+),(\d+),(\d+)\)")
 
 # Journal/snapshot sizing for row f. The m6/m7-era values (16 KiB / 32 KiB)
 # were written for arms whose client wrote kilobytes per second; the M13-class
@@ -217,7 +227,7 @@ def verdict_row_e(rates):
 
 
 def verdict_row_f(join):
-    """`join` = {"joined_at": s|None, "refusals": {host: (legacy, mismatch)},
+    """`join` = {"joined_at": s|None, "refusals": {host: (legacy, identity, version)},
     "artifacts": {0: n, 1: n}, "installs": n, "check_ok": bool}.
 
     `installs` is the anti-vacuity clause. Everything else row f checks is
@@ -228,7 +238,7 @@ def verdict_row_f(join):
     `snapshot_installed` record on the learner is the positive evidence that
     the wire-0.6.0 two-artifact session actually ran."""
     j = join.get("joined_at")
-    refusals_zero = all(tuple(v) == (0, 0) for v in join.get("refusals", {}).values()) and bool(join.get("refusals"))
+    refusals_zero = all(tuple(v) == (0, 0, 0) for v in join.get("refusals", {}).values()) and bool(join.get("refusals"))
     both = all(join.get("artifacts", {}).get(i, 0) > 0 for i in (0, 1))
     installs = int(join.get("installs") or 0)
     ok = j is not None and j <= BAR_F_JOIN_SECS and refusals_zero and both \
@@ -493,9 +503,11 @@ def status_slots(h):
     slots = {}
     for m in STATUS_RE.finditer(out):
         slots[int(m.group(1))] = {
-            "attached": m.group(2) == "true", "epoch": int(m.group(3)),
-            "incarnation": int(m.group(4)), "applied": int(m.group(5)),
-            "lag": int(m.group(6)), "snapshot_pos": int(m.group(7)),
+            "name": m.group(2), "version": m.group(3), "hash": m.group(4),
+            "attached": m.group(5) == "true", "epoch": int(m.group(6)),
+            "incarnation": int(m.group(7)), "applied": int(m.group(8)),
+            "lag": int(m.group(9)), "snapshot_pos": int(m.group(10)),
+            "heartbeat_age": m.group(11),
         }
     lm = re.search(r"fsm_lag=(\d+) bytes|fsm_lag=(lockstep)", out)
     if lm is None:
@@ -522,13 +534,13 @@ def log_lines(h, unit, pattern, lines=200):
 
 
 def node_stats(h):
-    """Last `stats:` line of the node unit's log → (unattested, legacy, mismatch)."""
+    """Last `stats:` line of the node unit's log → (unattested, legacy, identity, version)."""
     out = tail_log(h, "node", lines=400)
     hits = STATS_RE.findall(out or "")
     if not hits:
         return None
-    u, l, m = hits[-1]
-    return int(u), int(l), int(m)
+    u, l, i, v = hits[-1]
+    return int(u), int(l), int(i), int(v)
 
 
 def parse_timeline(out):
@@ -751,7 +763,7 @@ def arm_join(voters, learner, a, K, checks, pins=None):
     refusals = {}
     for hh in voters + [learner]:
         st = node_stats(hh)
-        refusals[hh.public_ip] = (st[1], st[2]) if st else (-1, -1)
+        refusals[hh.public_ip] = (st[1], st[2], st[3]) if st else (-1, -1, -1)
     hosts_all = voters + [learner]
     before = len(checks)
     check_all(hosts_all, leader, "join", checks, expect_min=int(d["responses"]) if d else None)
@@ -829,11 +841,11 @@ def selftest():
     tl_in = [(ms, 100) for ms in range(0, 5000, 1000)] + [(ms, 0) for ms in range(5000, 45000, 1000)]
     expect("bound_timeline drops trailing buckets past end_ms, keeps earlier",
            bound_timeline(tl_in, 5000) == [(ms, 100) for ms in range(0, 5000, 1000)])
-    good = {"joined_at": 30.0, "refusals": {"h0": (0, 0), "h1": (0, 0), "h2": (0, 0), "h3": (0, 0)},
+    good = {"joined_at": 30.0, "refusals": {"h0": (0, 0, 0), "h1": (0, 0, 0), "h2": (0, 0, 0), "h3": (0, 0, 0)},
             "artifacts": {0: 1, 1: 1}, "artifact_bytes": {0: [4096], 1: [4096]},
             "installs": 2, "check_ok": True}
     expect("row f pass", verdict_row_f(good).passed)
-    expect("row f fail on a refusal", not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (1, 0)}}).passed)
+    expect("row f fail on a refusal", not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (1, 0, 0)}}).passed)
     expect("row f fail on one artifact", not verdict_row_f({**good, "artifacts": {0: 1, 1: 0}}).passed)
     expect("row f fail late", not verdict_row_f({**good, "joined_at": 61.0}).passed)
     expect("row f fail divergence", not verdict_row_f({**good, "check_ok": False}).passed)
@@ -900,6 +912,26 @@ def selftest():
            sibling_pairs(LSCPU_WRONG) != EXPECTED_SIBLING_PAIRS)
     expect("sibling_pairs on a (i, i+1) layout is exactly {(0,1),(2,3),(4,5),(6,7)}",
            sibling_pairs(LSCPU_WRONG) == {(0, 1), (2, 3), (4, 5), (6, 7)})
+    # FSM identity: STATUS_RE/STATS_RE against literal lines copied from the
+    # producers' own format strings (uc_ctl/src/main.rs's status println!,
+    # m12_gate.rs's node-role stats println!) rather than re-derived text.
+    _status_line = ("  row=1 name=spin version=unversioned hash=0x0123456789abcdef "
+                     "attached=true epoch=5 incarnation=2 applied=1000 lag=50 "
+                     "snapshot_pos=900 heartbeat_age=0.123s")
+    _sm = STATUS_RE.search(_status_line)
+    expect("STATUS_RE matches a literal uc2ctl status row", _sm is not None)
+    if _sm:
+        expect("STATUS_RE row/name/version/hash",
+               (_sm.group(1), _sm.group(2), _sm.group(3), _sm.group(4)) == ("1", "spin", "unversioned", "0123456789abcdef"))
+        expect("STATUS_RE attached/epoch/incarnation/applied/lag/snapshot_pos/heartbeat_age",
+               (_sm.group(5), _sm.group(6), _sm.group(7), _sm.group(8), _sm.group(9), _sm.group(10), _sm.group(11))
+               == ("true", "5", "2", "1000", "50", "900", "0.123s"))
+    _stats_line = "m12_gate node 0 stats: reports_unattested=0 snap_refusals=(1,2,3)"
+    _tm = STATS_RE.search(_stats_line)
+    expect("STATS_RE matches a literal m12_gate node-role stats line", _tm is not None)
+    if _tm:
+        expect("STATS_RE unattested/legacy/identity/version",
+               _tm.groups() == ("0", "1", "2", "3"))
     print(f"selftest: {'PASS' if fails == 0 else f'FAIL ({fails})'}")
     return 0 if fails == 0 else 1
 

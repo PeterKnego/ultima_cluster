@@ -154,15 +154,12 @@ mod v2_tests {
         assert_eq!(sm.query(()), None);
         // Write, then a matching CAS, keyed on ascending byte positions.
         assert_eq!(
-            sm.apply(
-                &mut ApplyCtx::new(128, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
-                Cmd::Write(7)
-            ),
+            sm.apply(&mut ApplyCtx::for_sm::<RegisterSm>(128), Cmd::Write(7)),
             CmdResp::WriteAck
         );
         assert_eq!(
             sm.apply(
-                &mut ApplyCtx::new(256, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
+                &mut ApplyCtx::for_sm::<RegisterSm>(256),
                 Cmd::Cas { old: 7, new: 9 }
             ),
             CmdResp::CasResult(true)
@@ -170,7 +167,7 @@ mod v2_tests {
         // A non-matching CAS is a no-op with a `false` result.
         assert_eq!(
             sm.apply(
-                &mut ApplyCtx::new(384, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
+                &mut ApplyCtx::for_sm::<RegisterSm>(384),
                 Cmd::Cas { old: 7, new: 1 }
             ),
             CmdResp::CasResult(false)
@@ -186,10 +183,7 @@ mod v2_tests {
         use uc_service::SnapshotStateMachine;
 
         let mut sm = RegisterSm::default();
-        sm.apply(
-            &mut ApplyCtx::new(4096, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
-            Cmd::Write(42),
-        );
+        sm.apply(&mut ApplyCtx::for_sm::<RegisterSm>(4096), Cmd::Write(42));
         let (handle, s) = sm.freeze().unwrap();
         assert_eq!(s, 4096);
         let mut bytes = Vec::new();

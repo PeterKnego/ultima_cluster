@@ -448,9 +448,15 @@ pub const SNAP_REDRIVE_INTERVAL_NS: u64 = 250_000_000; // 250ms
 /// [`FollowerStats::identity_refusal`] / [`FollowerStats::version_refusal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalKind {
-    /// Row `r`'s FSM name hash disagreed (or named a row outside the local
-    /// declared mask).
+    /// Row `r`'s FSM name hash disagreed between the two sides' `identity`
+    /// arrays.
     Identity,
+    /// The two sides' `identity` arrays agreed at every row, but the
+    /// artifact's row is outside the sender's declared mask; `row` is the
+    /// offending `service_id` clamped to 7. Distinct from `Identity` because
+    /// a positional-array mismatch and an out-of-mask artifact id are
+    /// different failures with the same counter but different causes.
+    ArtifactId,
     /// Row `r`'s name agreed but both sides' nonzero packed version disagreed.
     Version,
 }
@@ -1931,9 +1937,20 @@ impl FollowerReceiver {
         // into range first.
         let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
         if b.identity != self.own_identity || b.declared_mask() & bit == 0 {
-            let row = (0..8)
-                .find(|&r| b.identity[r] != self.own_identity[r])
-                .unwrap_or((b.service_id as usize).min(7)) as u8;
+            let mismatch_row = (0..8).find(|&r| b.identity[r] != self.own_identity[r]);
+            let row = mismatch_row.unwrap_or((b.service_id as usize).min(7)) as u8;
+            // The arrays can agree at every row while still failing here —
+            // `declared_mask() & bit == 0` — when the artifact names a row
+            // outside the sender's own declared mask (e.g. a forged
+            // `service_id`). That is a different failure from a positional
+            // name mismatch, so it gets its own `RefusalKind` (Ruling 5)
+            // even though both are counted under the same
+            // `snap_refused_declared_mismatch` counter.
+            let kind = if mismatch_row.is_none() {
+                RefusalKind::ArtifactId
+            } else {
+                RefusalKind::Identity
+            };
             *self
                 .stats
                 .identity_refusal
@@ -1944,7 +1961,7 @@ impl FollowerReceiver {
                 theirs: b.identity.get(row as usize).copied().unwrap_or(0),
                 ours_version: 0,
                 theirs_version: 0,
-                kind: RefusalKind::Identity,
+                kind,
             });
             self.stats
                 .snap_refused_declared_mismatch

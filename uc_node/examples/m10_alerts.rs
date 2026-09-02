@@ -1466,8 +1466,8 @@ fn spawn_cluster_with_services(
     (dir, nodes)
 }
 
-/// The default declared set (`{0}`, lag bound = buffer/4) — every pre-M14c
-/// scenario.
+/// An explicit single-FSM declared set (`{0}`, lag bound = buffer/4) via
+/// `ServicesConfig::single` — every pre-M14c scenario.
 fn spawn_cluster(
     scratch_root: &Path,
     label: &str,

@@ -284,6 +284,51 @@ fn an_unknown_name_is_refused_by_name_and_a_second_attach_of_the_same_fsm_is_ref
 }
 
 #[test]
+fn an_unknown_name_against_a_nameless_declared_page_hints_at_an_old_node() {
+    // Simulates a pre-cnc-3.1 node: `services_declared` is non-zero (a real
+    // set was declared) but line 7's name field was never written, because
+    // the node predates FSM identity. `attach()` must tell the two apart —
+    // this is `UnknownFsmNoNames`, not the ordinary `UnknownFsm` (which
+    // lists the declared names) — since the empty `declared` list here is
+    // itself the symptom of an old node, not evidence of an empty
+    // `[services]`.
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["count"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    node.stop();
+
+    // Zero out row 0's name bytes directly on disk (line 7), as if the node
+    // that wrote this page never knew about names at all.
+    let name_off =
+        uc_protocol::v2::cnc::CNC_OFF_SERVICE_SLOTS + uc_protocol::v2::cnc::CNC_SVC_OFF_NAME;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("cnc2.dat"))
+            .expect("open cnc2.dat");
+        f.seek(SeekFrom::Start(name_off as u64)).unwrap();
+        f.write_all(&[0u8; uc_protocol::v2::cnc::CNC_SVC_NAME_LEN])
+            .unwrap();
+    }
+
+    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP), SlowCountSm::default())
+        .start()
+        .err()
+        .expect("row 0's name is gone, so nothing matches");
+    assert!(
+        matches!(&err, uc_service::ServiceError::UnknownFsmNoNames { name } if name == "slow-count"),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("declared, in row order: []")
+            && err.to_string().contains("older than cnc 3.1"),
+        "{err}"
+    );
+}
+
+#[test]
 fn attach_writes_the_declared_version_into_the_slot() {
     #[derive(Default)]
     struct V(CountSm);

@@ -131,7 +131,7 @@ fn main() -> anyhow::Result<()> {
                     applied.value, applied.position
                 );
             } else {
-                // Default path: FSM 0, output byte-identical to before --service-id/--all existed.
+                // Default path: FSM 0, output byte-identical to before --fsm/--all existed.
                 let applied = submit_with_retry(&client, &cmd, deadline)?;
                 if args.reset {
                     println!(

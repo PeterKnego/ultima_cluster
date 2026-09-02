@@ -145,12 +145,17 @@ def render_config(node_id, bind, instance_dir, members):
         # M12b: [crypto]/[admin] became required (explicit-choice config,
         # spec §3.3) — a node.toml missing either is now a startup refusal.
         # This gate exercises neither wire crypto nor admin auth, so both
-        # choose the cleartext/filesystem posture.
+        # choose the cleartext/filesystem posture. FSM identity (cnc 3.1)
+        # made [services] required the same way: this gate reuses m9_gate's
+        # service role, `RegSm` (uc_node/examples/m9_gate.rs), NAME "reg".
         "[crypto]",
         "enabled = false",
         "",
         "[admin]",
         'auth = "none"',
+        "",
+        "[services]",
+        'names = ["reg"]',
         "",
     ]
     for mid, maddr in members:

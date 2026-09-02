@@ -935,6 +935,9 @@ enabled = false
 [admin]
 auth = "hmac"
 keys = [{ name = "admin", key_path = "/tmp/uc2-quickstart/admin.key" }]
+
+[services]
+names = ["sm"]
 "#;
 
 /// The `gateway.toml` the quickstart renders, same provenance.
@@ -979,14 +982,19 @@ pub fn uc_node_toml() -> Vec<Seed> {
         \n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
         \n[purge]\nbelow_snapshot_slack_bytes = 1048576\n\
         \n[crypto]\nenabled = false\n\
-        \n[log]\nlevel = \"info\"\n";
+        \n[log]\nlevel = \"info\"\n\
+        \n[services]\nnames = [\"sm\"]\n";
     // …and the mirror image: no `[crypto]`, which is `CryptoChoiceRequired`.
+    // (Both refusals fire before the loader ever reaches the `[services]`
+    // check, so its presence here doesn't change which field the config is
+    // refused on — it only keeps these seeds otherwise-valid shapes.)
     let missing_crypto = "id = 1\n\
         bind = \"10.0.0.1:9100\"\n\
         instance_dir = \"/srv/uc2/n1\"\n\
         app_id = \"myapp\"\n\
         \n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
-        \n[admin]\nauth = \"none\"\n";
+        \n[admin]\nauth = \"none\"\n\
+        \n[services]\nnames = [\"sm\"]\n";
 
     vec![
         Seed::fixed("01-packaging-example", example.into_bytes()),
@@ -1000,7 +1008,8 @@ pub fn uc_node_toml() -> Vec<Seed> {
             "07-crypto-on-no-keys",
             b"id = 1\nbind = \"10.0.0.1:9100\"\ninstance_dir = \"/srv/uc2/n1\"\n\
               app_id = \"a\"\n\n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
-              \n[crypto]\nenabled = true\n\n[admin]\nauth = \"none\"\n"
+              \n[crypto]\nenabled = true\n\n[admin]\nauth = \"none\"\n\
+              \n[services]\nnames = [\"sm\"]\n"
                 .to_vec(),
         ),
         // A bad enum value behind an otherwise valid file.
@@ -1009,11 +1018,24 @@ pub fn uc_node_toml() -> Vec<Seed> {
             b"id = 1\nbind = \"10.0.0.1:9100\"\ninstance_dir = \"/srv/uc2/n1\"\n\
               app_id = \"a\"\n\n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
               \n[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\
-              \n[log]\nlevel = \"chatty\"\n"
+              \n[log]\nlevel = \"chatty\"\n\
+              \n[services]\nnames = [\"sm\"]\n"
                 .to_vec(),
         ),
         // Structurally broken TOML — the tokenizer's problem, not the schema's.
         Seed::fixed("09-not-toml", b"[[[[\n\"unterminated".to_vec()),
+        // FSM identity: `services.ids` is the pre-identity field, accepted by
+        // serde only so the loader can refuse it by name and point at
+        // `names` (`ConfigError::Invalid { field: "services.ids", .. }`,
+        // `uc_node/src/config_file.rs::services_ids_is_refused_with_a_pointer_to_names`).
+        Seed::fixed(
+            "10-services-ids-refused",
+            b"id = 1\nbind = \"10.0.0.1:9100\"\ninstance_dir = \"/srv/uc2/n1\"\n\
+              app_id = \"a\"\n\n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
+              \n[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\
+              \n[services]\nids = [0, 1]\n"
+                .to_vec(),
+        ),
     ]
 }
 

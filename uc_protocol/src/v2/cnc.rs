@@ -52,9 +52,10 @@ pub const CNC_PAGE_LEN: usize = 8192;
 /// Packed like `uc_protocol::ProtocolVersion`: `(major << 24) | (minor << 16) | patch`.
 /// 3.1 (FSM identity): each service slot's line 7 carries the row's name +
 /// identity hash (node-written at boot) and the status line's second word the
-/// attached service's version. A 3.0 attacher does not read either, and a 3.1
-/// attacher on a 3.0 page finds no names — both refuse by name. Flag day by
-/// policy (`docs/reference/semver-policy.md`).
+/// attached service's version. A 3.0 attacher on a 3.1 page refuses by
+/// VERSION (`version_compatible` fails: its own minor is lower than the
+/// page's), and a 3.1 attacher on a 3.0 page finds no names — it refuses by
+/// name instead. Flag day by policy (`docs/reference/semver-policy.md`).
 pub const CNC_V2_VERSION: u32 = (3 << 24) | (1 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
