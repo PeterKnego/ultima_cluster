@@ -250,7 +250,7 @@ pub fn group_plane_with_pending() -> uc_crypto::group::GroupPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uc_service::{RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine};
+    use uc_service::{ApplyCtx, RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine};
 
     fn envelope(client_id: u64, seq: u64, body: &[u8]) -> Vec<u8> {
         let mut v = Vec::new();
@@ -271,7 +271,11 @@ mod tests {
         let mut out = Vec::new();
         for c in 1..=8u64 {
             out.clear();
-            sm.apply(c, &envelope(c, 1, &[0xEEu8; 24]), &mut out);
+            sm.apply(
+                &mut ApplyCtx::new(c, <Sessioned<S> as RawStateMachine>::IDENTITY),
+                &envelope(c, 1, &[0xEEu8; 24]),
+                &mut out,
+            );
         }
         let (handle, _) = sm.freeze().expect("freeze");
         let mut buf = Vec::new();
