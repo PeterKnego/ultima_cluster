@@ -84,7 +84,7 @@ fn submit_with_retry(client: &Client, cmd: &Command, deadline: Instant) -> anyho
 }
 
 /// `ClientError::NotLeader` on a linearizable read, worded once and shared by
-/// both the default (FSM 0) and `--service-id` read paths.
+/// both the default (FSM 0) and `--fsm` read paths.
 fn not_leader_for_read(hint: Option<u32>) -> anyhow::Error {
     anyhow::anyhow!(
         "linearizable reads are leader-only and this node is a follower{}. \
