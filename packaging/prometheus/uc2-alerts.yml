@@ -139,3 +139,33 @@ groups:
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }
+  - alert: Uc2ServiceIdentityDrift
+    # Task 7 (spec §4.5): a row's declared NAME must be identical on every
+    # node — it is written once at boot (cnc 3.1 line 7) from each node's own
+    # `[services]` config, so two nodes disagreeing means they were started
+    # against different SM code (or a mis-ordered/mis-edited config) at the
+    # same row. SNAP_BEGIN sessions between them are refused by name (a
+    # wire-0.7.0 flag-day refusal, not a crash), so a joiner is stuck rather
+    # than converging on the wrong FSM.
+    #
+    # `uc2_service_identity_hash` has no VALUE-shaped label to group on
+    # directly, so `count_values` promotes the sample's own value into a
+    # fresh label first (one output series per distinct (row, hash) pair);
+    # the outer `count by (row)` then counts how many DISTINCT hashes exist
+    # for that row across every scraped instance — more than one is drift.
+    expr: count by (row) (count_values("hash", uc2_service_identity_hash) by (row)) > 1
+    for: 1m
+    labels: { severity: critical }
+    annotations: { summary: "row {{ $labels.row }} names different FSMs on different nodes — snapshot sessions between them are refused by name" }
+  - alert: Uc2ServiceVersionDrift
+    # Same `count_values` idiom as Uc2ServiceIdentityDrift, over the packed
+    # version word each service last wrote at attach (Task 5). `> 0` first:
+    # 0 means "no service has ever attached this slot" (a declared-but-
+    # unstarted FSM, or a service built without a `const VERSION`), which is
+    # a normal transient state — not a real disagreement to page on. A
+    # rolling upgrade holding old and new versions live at once is exactly
+    # what this catches.
+    expr: count by (row) (count_values("version", uc2_service_version > 0) by (row)) > 1
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "row {{ $labels.row }} runs different FSM versions across nodes" }

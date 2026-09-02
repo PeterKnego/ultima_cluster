@@ -20,6 +20,7 @@ use uc_node::{
     CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, FsmLag, Node, NodeConfig, PurgePolicy,
     ServicesConfig,
 };
+use uc_protocol::identity::FsmName;
 
 const APP: &str = "ctlsvc";
 
@@ -102,15 +103,29 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
         stdout.contains("services: declared=[0, 1] fsm_lag=8192 bytes"),
         "{stdout}"
     );
+    let a_hash = FsmName::parse("a").unwrap().hash();
+    let b_hash = FsmName::parse("b").unwrap().hash();
     assert!(
-        stdout.contains("id=0 attached=true epoch=1 incarnation=1 applied=4096"),
+        stdout.contains(&format!(
+            "row=0 name=a version=unversioned hash=0x{a_hash:016x}"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("attached=true epoch=1 incarnation=1 applied=4096"),
         "{stdout}"
     );
     assert!(stdout.contains("snapshot_pos=2048"), "{stdout}");
     // The declared-but-absent FSM must still get a row — it is the row that
     // explains a stalled cluster.
     assert!(
-        stdout.contains("id=1 attached=false epoch=0 incarnation=0 applied=0"),
+        stdout.contains(&format!(
+            "row=1 name=b version=unversioned hash=0x{b_hash:016x}"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("attached=false epoch=0 incarnation=0 applied=0"),
         "{stdout}"
     );
     assert!(stdout.contains("heartbeat_age=never"), "{stdout}");
@@ -172,7 +187,7 @@ fn status_prints_fsm_lag_n_a_for_a_harness_page_with_nothing_declared() {
     );
     // The header stands alone: nothing declared means no rows.
     assert!(
-        !stdout.contains("  id="),
+        !stdout.contains("  row="),
         "no declared ids, so no service rows: {stdout}"
     );
     // Every other section is byte-for-byte what it always was.

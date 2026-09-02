@@ -117,7 +117,11 @@ verify rather than a build:
   statuses, refusal reasons.
 - [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
   — which metric families carry a `service` label, what the unlabeled
-  aggregate means now, and the declared-set drift query.
+  aggregate means now, and the declared-set drift query. `Uc2ServiceIdentityDrift`
+  fires the same way when a row's declared NAME itself differs node-to-node
+  (a mis-declared `[services]` config, not a missing FSM); `Uc2ServiceVersionDrift`
+  fires when an attached FSM's version differs node-to-node (expected transiently
+  during a rolling upgrade, a bug if it persists).
 - [Configuration](../reference/configuration.md) — `NodeConfig`, environment
   switches, crypto file formats, cluster limits.
 - [Linearizable read path](../reference/read-path.md) — how reads are certified

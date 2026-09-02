@@ -55,8 +55,9 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_sent_bytes",
     "uc2_commit_bytes",
     // M14c (spec §9): the per-FSM band. The first four are the M10
-    // aggregates, which now also carry one `service="<id>"` sample per
-    // declared id in the SAME family block.
+    // aggregates, which now also carry one `service="<name>",row="<row>"`
+    // sample per declared row in the SAME family block. Task 7 (spec §4.5)
+    // added the identity-hash and version gauges.
     "uc_service_applied_bytes",
     "uc_service_epoch",
     "uc_service_snapshot_pos_bytes",
@@ -64,6 +65,8 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc_service_attached",
     "uc_service_lag_bytes",
     "uc_service_lag_waits_total",
+    "uc2_service_identity_hash",
+    "uc2_service_version",
     "uc_services_declared",
     "uc2_fsm_lag_bytes",
     "uc2_output_completed_bytes",
@@ -85,6 +88,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_reports_unattested_total",
     "uc2_snapshot_refused_legacy_peer_total",
     "uc2_snapshot_refused_declared_set_total",
+    "uc2_snapshot_refused_version_total",
     "uc2_snapshot_intake_io_failures_total",
     // M14c2 (T10a): the three counters that close M14c's snapshot-session
     // deferrals — the leader's `File::open` TOCTOU, the joiner's abandoned
@@ -179,12 +183,18 @@ fn push_labeled(out: &mut String, name: &str, help: &str, ty: &str, samples: &[(
 ///
 /// Unlike the peer band (which skips unoccupied slots), a declared id gets a
 /// row even when nothing has ever attached to it: an absent FSM must show up
-/// as `uc_service_attached{service="k"} 0`, not as a missing series —
+/// as `uc_service_attached{service="k",row="k"} 0`, not as a missing series —
 /// `Uc2ServiceAbsent` cannot alert on a series that is not there. A harness
 /// page (`services_declared == 0`) yields no rows, and the families then
 /// render as headers alone, exactly like a node with no occupied peer slots.
+///
+/// Task 7 (spec §4.5): the row keeps its cluster-wide positional meaning
+/// (`row`), but a service is FOUND by name, so every per-FSM label also
+/// carries `service="<name>"` — the row's declared FSM name, empty string
+/// for an unnamed line (only a harness page, `ServiceIdentityLine::name()`
+/// returning `None`).
 struct ServiceRow {
-    /// Pre-formatted label body, no braces: `service="0"`.
+    /// Pre-formatted label body, no braces: `service="kv",row="0"`.
     labels: String,
     attached: u64,
     applied: u64,
@@ -196,6 +206,10 @@ struct ServiceRow {
     lag_bytes: u64,
     lag_waits: u64,
     heartbeat_age: f64,
+    /// FNV-1a 64 of the row's declared name (line 7, written once at boot).
+    identity_hash: u64,
+    /// Packed semantic version the attached service last wrote (0 = none).
+    version: u64,
 }
 
 fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
@@ -209,8 +223,13 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
         let (_, attached, _) = unpack_service_status(slot.status.load_acquire());
         let applied = slot.applied.load_acquire();
         let hb = slot.heartbeat_ns.load_acquire();
+        let name = slot
+            .identity
+            .name()
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_default();
         rows.push(ServiceRow {
-            labels: format!("service=\"{id}\""),
+            labels: format!("service=\"{name}\",row=\"{id}\""),
             attached: attached as u64,
             applied,
             epoch: slot.epoch.load_acquire(),
@@ -218,6 +237,8 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             lag_bytes: commit.saturating_sub(applied),
             lag_waits: slot.lag_waits.load_acquire(),
             heartbeat_age: now.saturating_sub(hb) as f64 / 1e9,
+            identity_hash: slot.identity.hash(),
+            version: slot.status.version() as u64,
         });
     }
     rows
@@ -362,10 +383,26 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         &rows,
         |r| r.lag_waits,
     );
+    push_service_labeled(
+        out,
+        "uc2_service_identity_hash",
+        "FNV-1a 64 of the row's declared FSM name; must be identical on every node — alert on `count by (row) (uc2_service_identity_hash) > 1`.",
+        "gauge",
+        &rows,
+        |r| r.identity_hash,
+    );
+    push_service_labeled(
+        out,
+        "uc2_service_version",
+        "Packed semantic version of the attached service (0 = none/unversioned); alert on `count by (row, service) (uc2_service_version > 0) > 1`.",
+        "gauge",
+        &rows,
+        |r| r.version,
+    );
     push_gauge(
         out,
         "uc_services_declared",
-        "Bitmask of declared service ids (bit k = id k). Must match cluster-wide; a mismatch refuses snapshot sessions.",
+        "Bitmask of declared rows (contiguous from 0); must match cluster-wide; a mismatch refuses snapshot sessions.",
         s.cnc.services_declared(),
     );
     push_gauge(
@@ -687,15 +724,23 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     push_counter(
         &mut out,
         "uc2_snapshot_refused_legacy_peer_total",
-        "Snapshot sessions refused because the sender's SNAP_BEGIN was a 0.5.0 body (too short or layout 0): the fleet is mixed-version; upgrade every node (spec §14.3).",
+        "Snapshot sessions refused because the sender's SNAP_BEGIN was a pre-0.7.0 body (too short, or layout ≤ 1): the fleet is mixed-version; upgrade every node (spec §14.3).",
         s.receiver.snap_refused_legacy_peer.load(Ordering::Relaxed),
     );
     push_counter(
         &mut out,
         "uc2_snapshot_refused_declared_set_total",
-        "Snapshot sessions refused because the sender's declared service set differs from this node's [services] ids — a joiner is stuck until the sets match (spec §8).",
+        "Snapshot sessions refused because the sender's row names/identity (positional mismatch) differ from this node's declared set — a joiner is stuck until the sets match (spec §8).",
         s.receiver
             .snap_refused_declared_mismatch
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_snapshot_refused_version_total",
+        "Snapshot sessions refused because the sender declared a different version than this node's attached service for at least one row — a joiner is stuck until every node runs the same version per row (spec §4.5, §9).",
+        s.receiver
+            .snap_refused_version_mismatch
             .load(Ordering::Relaxed),
     );
     push_counter(
@@ -944,6 +989,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use uc_log::cnc::{CncMeta, CncPage, pack_id_and_role, pack_service_status};
+    use uc_protocol::identity::FsmName;
     use uc_protocol::v2::cnc::CNC_PEER_ROLE_VOTER;
 
     use super::*;
@@ -1154,47 +1200,44 @@ mod tests {
         // id 2: declared, never attached — every field stays zero.
         let text = render_prometheus(&s);
         assert!(
-            text.contains(r#"uc_service_applied_bytes{service="0"} 9000"#),
+            text.contains(r#"uc_service_applied_bytes{service="",row="0"} 9000"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_epoch{service="0"} 7"#),
+            text.contains(r#"uc_service_epoch{service="",row="0"} 7"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_snapshot_pos_bytes{service="0"} 4096"#),
+            text.contains(r#"uc_service_snapshot_pos_bytes{service="",row="0"} 4096"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_attached{service="0"} 1"#),
+            text.contains(r#"uc_service_attached{service="",row="0"} 1"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_attached{service="2"} 0"#),
+            text.contains(r#"uc_service_attached{service="",row="2"} 0"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_lag_bytes{service="0"} 1000"#),
+            text.contains(r#"uc_service_lag_bytes{service="",row="0"} 1000"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_lag_bytes{service="2"} 10000"#),
+            text.contains(r#"uc_service_lag_bytes{service="",row="2"} 10000"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_lag_waits_total{service="0"} 12"#),
+            text.contains(r#"uc_service_lag_waits_total{service="",row="0"} 12"#),
             "{text}"
         );
         assert!(
-            text.contains(r#"uc_service_heartbeat_age_seconds{service="2"}"#),
+            text.contains(r#"uc_service_heartbeat_age_seconds{service="",row="2"}"#),
             "{text}"
         );
         assert!(text.contains("\nuc_services_declared 5\n"), "{text}");
         assert!(text.contains("\nuc2_fsm_lag_bytes 65536\n"), "{text}");
-        assert!(
-            !text.contains(r#"service="1""#),
-            "id 1 is not declared: {text}"
-        );
+        assert!(!text.contains(r#"row="1""#), "id 1 is not declared: {text}");
     }
 
     /// The four M10 aggregates keep their bare names (now "slowest FSM") and
@@ -1231,7 +1274,7 @@ mod tests {
         s.cnc.counters().commit.store_release(500);
         s.cnc.service_slot(0).applied.store_release(900);
         assert!(
-            render_prometheus(&s).contains(r#"uc_service_lag_bytes{service="0"} 0"#),
+            render_prometheus(&s).contains(r#"uc_service_lag_bytes{service="",row="0"} 0"#),
             "{}",
             render_prometheus(&s)
         );
@@ -1248,6 +1291,9 @@ mod tests {
         s.receiver
             .snap_refused_declared_mismatch
             .fetch_add(1, Ordering::Relaxed);
+        s.receiver
+            .snap_refused_version_mismatch
+            .fetch_add(1, Ordering::Relaxed);
         let text = render_prometheus(&s);
         assert!(
             text.contains("uc2_snapshot_refused_legacy_peer_total 3\n"),
@@ -1255,6 +1301,76 @@ mod tests {
         );
         assert!(
             text.contains("uc2_snapshot_refused_declared_set_total 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_refused_version_total 1\n"),
+            "{text}"
+        );
+    }
+
+    /// Task 7 (spec §4.5): a service is found by NAME, so per-FSM labels
+    /// carry `service="<name>"` alongside the row's positional `row="<r>"`
+    /// — and the identity-hash / version gauges render alongside the
+    /// existing per-FSM families.
+    #[test]
+    fn per_fsm_labels_carry_name_and_the_identity_version_gauges_render() {
+        let kv = FsmName::parse("kv").unwrap();
+        let orders = FsmName::parse("orders").unwrap();
+        let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        services[0] = Some(kv);
+        services[1] = Some(orders);
+        let meta = CncMeta {
+            node_id: 7,
+            instance_id: 0x1122_3344_5566_7788,
+            app_id: "test-app".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 1200,
+            services,
+        };
+        let cnc = CncPage::heap(&meta);
+        cnc.store_services_declared(0b11);
+        cnc.service_slot(1).status.store_version(0x0102_0003);
+
+        let s = ObsSources {
+            node_id: 7,
+            cnc,
+            sender: Arc::new(SenderStats::default()),
+            receiver: Arc::new(FollowerStats::default()),
+            truncations: Arc::new(AtomicU64::new(0)),
+            wipes: Arc::new(AtomicU64::new(0)),
+            reports_unattested: Arc::new(AtomicU64::new(0)),
+            reports_implausible: Arc::new(AtomicU64::new(0)),
+            crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            crypto_enabled: false,
+            purge_enabled: false,
+            journal_segment_bytes: 64 << 20,
+            agents: vec![
+                ("consensus", Arc::new(AtomicBool::new(false))),
+                ("sender", Arc::new(AtomicBool::new(false))),
+                ("receiver", Arc::new(AtomicBool::new(false))),
+                ("archive", Arc::new(AtomicBool::new(false))),
+            ],
+        };
+
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("uc_service_attached{service=\"orders\",row=\"1\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "uc2_service_identity_hash{{service=\"orders\",row=\"1\"}} {}\n",
+                FsmName::parse("orders").unwrap().hash()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_service_version{service=\"orders\",row=\"1\"} 16908291\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# HELP uc2_snapshot_refused_version_total"),
             "{text}"
         );
     }

@@ -78,6 +78,7 @@ use clap::{Parser, Subcommand};
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
+use uc_protocol::identity::VersionDisplay;
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
     NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
@@ -596,9 +597,17 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         } else {
             format!("{:.3}s", now_ns.saturating_sub(hb) as f64 / 1e9)
         };
+        let name = s
+            .identity
+            .name()
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_default();
         println!(
-            "  id={id} attached={attached} epoch={} incarnation={incarnation} \
-             applied={applied} lag={} snapshot_pos={} heartbeat_age={age}",
+            "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
+             incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
+             heartbeat_age={age}",
+            VersionDisplay(s.status.version()),
+            s.identity.hash(),
             s.epoch.load_acquire(),
             commit.saturating_sub(applied),
             s.snapshot_pos.load_acquire(),

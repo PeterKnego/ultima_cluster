@@ -42,6 +42,7 @@ use uc_net::sender::SenderStats;
 use uc_node::obs::ObsSources;
 use uc_node::obs::http::ObsServer;
 use uc_node::{Node, NodeConfig};
+use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
 use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
@@ -63,6 +64,8 @@ const ALL_SCENARIOS: &[&str] = &[
     "disk_low",
     "service_absent",
     "fsm_pinned",
+    "identity_drift",
+    "version_drift",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -186,6 +189,8 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "disk_low" => scenario_disk_low(),
         "service_absent" => scenario_service_absent(scratch_root),
         "fsm_pinned" => scenario_fsm_pinned(scratch_root),
+        "identity_drift" => scenario_identity_drift(),
+        "version_drift" => scenario_version_drift(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -351,13 +356,22 @@ fn wait_ready(addr: SocketAddr, secs: u64) {
 /// `synthetic_sources()` fixture in `uc_node/src/obs/metrics.rs` — copied,
 /// not imported (examples can't reach `#[cfg(test)]` code).
 fn synthetic_sources(node_id: u32) -> ObsSources {
+    synthetic_sources_named(node_id, None)
+}
+
+/// Task 7 (spec §4.5): like [`synthetic_sources`], but row 0 is declared
+/// with `name` (or left undeclared for `None`) — `identity_drift` and
+/// `version_drift` need two "nodes" that agree on nothing except the row.
+fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
+    let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+    services[0] = name;
     let meta = CncMeta {
         node_id,
         instance_id: 0xC0FF_EE00_0000_0000u128 | node_id as u128,
         app_id: APP.into(),
         buffer_bytes: RING_BYTES as u64,
         max_payload: 1200,
-        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+        services,
     };
     let cnc = CncPage::heap(&meta);
     ObsSources {
@@ -1194,6 +1208,112 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
                      — and 8320 clears the un-toleranced bound anyway, so this run does NOT \
                      exercise the tolerance. A second arm at a non-dividing payload would."
                 .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 14
+
+/// Uc2ServiceIdentityDrift — **synthetic, disclosed**: two synthetic
+/// `ObsSources` ("n0", "n1") each declare row 0 with a DIFFERENT FSM name.
+/// A genuine cross-node split needs two real nodes started against two
+/// different SM binaries at the same row — out of this harness's
+/// per-scenario budget, the same reasoning `crypto_counters` and
+/// `purge_stalled` above already use for a state this harness cannot
+/// honestly host in-process. Both scrapes go through the real exporter.
+fn scenario_identity_drift() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let orders = FsmName::parse("orders").unwrap();
+    let src_a = synthetic_sources_named(0, Some(kv));
+    let src_b = synthetic_sources_named(1, Some(orders));
+    src_a.cnc.store_services_declared(0b1);
+    src_b.cnc.store_services_declared(0b1);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_service_identity_hash"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_service_identity_hash"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "identity_drift",
+            rules: &["Uc2ServiceIdentityDrift"],
+            state: "synthetic",
+            method: format!(
+                "two synthetic ObsSources, each its own real exporter: \"n0\" declares row 0 = \
+                 {:?} (hash {}), \"n1\" declares row 0 = {:?} (hash {}) — the exact shape of two \
+                 nodes started with disagreeing [services] config at the same row. Both hashes \
+                 render through the real encoder as uc2_service_identity_hash{{row=\"0\"}}; two \
+                 DISTINCT values for the same row across instances is exactly what \
+                 Uc2ServiceIdentityDrift's count_values idiom detects.",
+                kv.as_str(),
+                kv.hash(),
+                orders.as_str(),
+                orders.hash()
+            ),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 15
+
+/// Uc2ServiceVersionDrift — **synthetic, disclosed**: two synthetic
+/// `ObsSources` ("n0", "n1") declare the SAME row 0 name (so identity does
+/// not also drift) but a service on each side wrote a DIFFERENT version at
+/// attach — the exact shape of a rolling upgrade holding an old and a new
+/// binary live at once. Same synthetic-state-real-transition budget as
+/// `scenario_identity_drift` above.
+fn scenario_version_drift() -> (SeriesFile, Disclosure) {
+    let kv = FsmName::parse("kv").unwrap();
+    let src_a = synthetic_sources_named(0, Some(kv));
+    let src_b = synthetic_sources_named(1, Some(kv));
+    src_a.cnc.store_services_declared(0b1);
+    src_b.cnc.store_services_declared(0b1);
+    let v_a = uc_protocol::identity::pack_version(1, 2, 0);
+    let v_b = uc_protocol::identity::pack_version(1, 3, 0);
+    src_a.cnc.service_slot(0).status.store_version(v_a);
+    src_b.cnc.service_slot(0).status.store_version(v_b);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_service_version"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_service_version"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "version_drift",
+            rules: &["Uc2ServiceVersionDrift"],
+            state: "synthetic",
+            method: format!(
+                "two synthetic ObsSources, each its own real exporter: both declare row 0 = \
+                 {:?} (identity agrees), but \"n0\"'s attached service wrote version {v_a} \
+                 (1.2.0) and \"n1\"'s wrote {v_b} (1.3.0) — the exact shape of a rolling \
+                 upgrade holding old and new binaries live at once. Both render through the \
+                 real encoder as uc2_service_version{{row=\"0\"}}; two DISTINCT nonzero values \
+                 for the same row across instances is exactly what Uc2ServiceVersionDrift's \
+                 count_values idiom detects.",
+                kv.as_str()
+            ),
         },
     )
 }
