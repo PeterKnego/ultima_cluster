@@ -41,7 +41,7 @@ analog of `app_id`.
 | per-FSM version | `const VERSION: u32` (packed semver) beside `NAME`; attach-written to the cnc slot, carried per row on `SNAP_BEGIN`, equality-checked and exported; compatibility semantics stay with backlog item 3 | §7 |
 | what is keyed by name | refusals, `uc2ctl status`, metric labels, log records. **Disk and rings stay keyed by row** | §4.4, §4.5 |
 | client | `fsm("orders") -> u8` convenience; the row-taking API stays | §6 |
-| apply signature | `apply(&mut self, ctx: &ApplyCtx, cmd, out)` — `ApplyCtx { position }` now; the parallel time/scheduler design adds its fields later without touching the signature again | §3.3 |
+| apply signature | `apply(&mut self, ctx: &mut ApplyCtx, cmd, out)` — `ApplyCtx { position }` now; the parallel time/scheduler design adds its fields later without touching the signature again | §3.3 |
 | first consumer | `uc_service::ids::IdGen` via `ctx.ids()` — deterministic, stateless, placement-independent IDs from `(position, identity, ordinal-within-apply)`; unreachable from `query` by construction | §3.4 |
 | flag day | one combined: cnc 3.0 → 3.1 and wire 0.6.0 → 0.7.0 | §4.2, §5 |
 | deliberately not done | placement-independent rows (hash-routed artifacts, name-keyed disk, client handles, a named default) | §2.1, §11 |
@@ -211,7 +211,7 @@ pub trait RawStateMachine: Send + 'static {
     const VERSION: u32 = 0;
     /// Provided; evaluated (and validated) at first use.
     const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION);
-    fn apply(&mut self, ctx: &ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);
     fn query(&self, q: &[u8], out: &mut Vec<u8>);
     fn last_applied(&self) -> Option<u64>;
 }
@@ -228,9 +228,18 @@ this spec: §3.4's "build the generator from the position given to you" is
 `query`" gets a type-level backstop, since `query` receives no context.
 The context carries the identity **by value** (`FsmIdentity` is `Copy`,
 three words) so `ctx.ids()` needs no turbofish; the apply loop builds it
-from `S::IDENTITY`.
+from `S::IDENTITY`. The reference is **`&mut`**, not `&` (time-planning
+review, 2026-09-02): the scheduler's FSM-facing calls, `ctx.schedule(..)`
+and `ctx.cancel(..)`, push requests the apply loop drains after the call;
+a shared reference would force interior mutability into the context on the
+hot apply path — exactly the body cost the M14a apply-hop lesson warns
+about — where a mutable reference lets them land in a plain `Vec`. Nothing
+in this spec needs the mutability, but changing it later would re-touch
+every call site this work already edits. `Sessioned` still passes the
+context straight through: a mutable reference reborrows. `ApplyCtx` is
+therefore not `Copy`.
 
-The typed `StateMachine` mirrors it: `apply(&mut self, ctx: &ApplyCtx,
+The typed `StateMachine` mirrors it: `apply(&mut self, ctx: &mut ApplyCtx,
 cmd: Self::Command) -> Self::Response`, `NAME` required, `VERSION`
 provided; the blanket impl forwards both consts and passes `ctx` through.
 `Sessioned<S>` forwards `S::NAME` and `S::VERSION` and passes `ctx` to the
@@ -239,7 +248,7 @@ No `dyn` use of either trait exists in the tree (checked 2026-09-02), so
 associated consts are safe. Every state machine in the tree (≈ 24 impls:
 `uc_lincheck`'s `RegisterSm`/`ListAppendSm`, the counter example, the gate
 examples, the test SMs) gains one `NAME` line and swaps `position: u64`
-for `ctx: &ApplyCtx` (reading `ctx.position`), mechanically.
+for `ctx: &mut ApplyCtx` (reading `ctx.position`), mechanically.
 
 ### 3.4 `IdGen` — deterministic IDs
 
@@ -247,7 +256,7 @@ for `ctx: &ApplyCtx` (reading `ctx.position`), mechanically.
 `(position, identity, ordinal: u32)`.
 
 ```rust
-fn apply(&mut self, ctx: &ApplyCtx, cmd: Cmd) -> Resp {
+fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> Resp {
     let mut ids = ctx.ids();     // one generator per apply call, by construction
     let order_id = ids.next();   // u128
     let line_id  = ids.next();   // u128, no visible relation to order_id

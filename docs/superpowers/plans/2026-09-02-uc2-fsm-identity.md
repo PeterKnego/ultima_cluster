@@ -4,7 +4,7 @@
 
 **Goal:** Give every state machine an identity declared in code (`const NAME` + `const VERSION`), bind it to the cluster-wide row so a mis-attached service and a mis-declared cluster are refused **by name**, introduce the `ApplyCtx` apply signature once, and ship `IdGen` (deterministic, per-apply IDs) as its first consumer — one combined cnc 3.1 + wire 0.7.0 flag day.
 
-**Architecture:** A `core`-only `uc_protocol::identity` module (name rules, frozen FNV-1a 64 hash, packed version) is the single source every crate uses. The node writes each row's name + hash into that slot's reserved cnc line at boot (inside `CncPage::init`, before the header CRC); the service writes its version into the status line at attach; a service finds its row by scanning names. `SNAP_BEGIN`/`SNAP_DONE` carry `[u64; 8]` identity hashes and `[u32; 8]` versions in row order and the receiver compares positionally. Disk, rings, artifact routing, the client engine and the gateway are untouched. `RawStateMachine::apply` takes `&ApplyCtx` (position now; time fields later); `ctx.ids()` yields the `IdGen`.
+**Architecture:** A `core`-only `uc_protocol::identity` module (name rules, frozen FNV-1a 64 hash, packed version) is the single source every crate uses. The node writes each row's name + hash into that slot's reserved cnc line at boot (inside `CncPage::init`, before the header CRC); the service writes its version into the status line at attach; a service finds its row by scanning names. `SNAP_BEGIN`/`SNAP_DONE` carry `[u64; 8]` identity hashes and `[u32; 8]` versions in row order and the receiver compares positionally. Disk, rings, artifact routing, the client engine and the gateway are untouched. `RawStateMachine::apply` takes `&mut ApplyCtx` (position now; time fields later); `ctx.ids()` yields the `IdGen`.
 
 **Tech Stack:** Rust 1.96 workspace (MSRV 1.89 — no features newer than that; `is_multiple_of`/`offset_of!` are already used in-tree); `uc_protocol` (core-only leaf), `uc_log` (cnc page), `uc_service`, `uc_node`, `uc_net`, `uc_client`, `uc_ctl`; `fuzz/` (separate workspace, nightly); Python fleet driver `bench-infra/scripts/m14_fleet_gate.py`.
 
@@ -18,7 +18,7 @@
 - **One type, one row.** Identity is per state-machine type, so two rows cannot host the same type. Harnesses that run one type at N rows use `uc_service::Tagged<const ROW: u8, S>` (Task 5), whose names are `fsm0`..`fsm7`. Production never needs it.
 - **`[services]` is required** in `node.toml` (§4.1); `ids` is refused by field name with a pointer to `names`. Programmatic configs use `ServicesConfig::single(<Sm>::NAME)` / `from_names(..)`; `ServicesConfig::default()` no longer exists.
 - **No wire field other than `SnapBeginBody` changes.** `SNAP_DONE` echoes the same struct (`uc_net/src/receiver.rs:2196-2216`), so it moves with it.
-- **`ApplyCtx` is `#[non_exhaustive]`** with a public `position` and a private identity; only `ApplyCtx::new(position, identity)` constructs it. `IdGen` is `!Send`.
+- **`ApplyCtx` is `#[non_exhaustive]`**, not `Copy`, with a public `position` and a private identity; only `ApplyCtx::new(position, identity)` constructs it, and `apply` takes it as **`&mut ApplyCtx`** (spec §3.3: the scheduler's `schedule`/`cancel` push into it later; a `&` would force interior mutability on the hot path). `IdGen` is `!Send`.
 - **Fleet spend is user-gated** (Task 10's gate run). Local numbers are smoke, never a gate (CLAUDE.md).
 - **Never write scratch to `/tmp`**; Elle under `$HOME/.cache/uc2-elle*`.
 - Commit subjects: `type(scope): imperative summary`, as in `git log --oneline -30`.
@@ -35,7 +35,7 @@
 | `uc_protocol/src/v2/cnc.rs` | `CNC_V2_VERSION` 3.1; `CNC_SVC_OFF_VERSION`, `CNC_SVC_OFF_NAME`, `CNC_SVC_NAME_LEN`, `CNC_SVC_OFF_IDENTITY_HASH`; offset tests | 2 |
 | `uc_log/src/cnc.rs` | `ServiceStatusLine`, `ServiceIdentityLine`, `ServiceSlot` re-shaped; `CncMeta.services`; `init` writes names; accessors | 2 |
 | `uc_service/src/traits.rs`, `uc_service/src/ids.rs` (new), `session.rs`, `apply.rs`, `replay.rs`, `lib.rs` | `ApplyCtx`, `NAME`/`VERSION`/`IDENTITY`, `IdGen`, ctx-building call sites, forwarding | 3 |
-| every `impl StateMachine for` / `impl RawStateMachine for` in the tree (list in Task 3) | `const NAME`, `ctx: &ApplyCtx` | 3 |
+| every `impl StateMachine for` / `impl RawStateMachine for` in the tree (list in Task 3) | `const NAME`, `ctx: &mut ApplyCtx` | 3 |
 | `uc_node/src/services.rs`, `config_file.rs`, `node.rs` (boot), all `ServicesConfig::default()/from_ids` sites | names in config; `single`/`from_names`/`from_cli`; `[services]` required; names into `CncMeta` | 4 |
 | `uc_service/src/config.rs`, `attach.rs`, `lib.rs`, `tagged.rs` (new); every `.service_id(` site; `--service-id` flags | attach by name; `UnknownFsm`; version written; `Tagged`; binaries take `--fsm` | 5 |
 | `uc_protocol/src/v2/datagram.rs`, `uc_protocol/src/version.rs`, `uc_net/src/{sender,receiver}.rs`, `uc_node/src/node.rs` (snapshot path), `fuzz/README.md` | wire 0.7.0 body; positional identity + version checks; refusal detail; new counter | 6 |
@@ -624,14 +624,14 @@ git commit -m "feat(cnc): 3.1 — row name + hash on slot line 7 at boot, servic
 **Files:**
 - Modify: `uc_service/src/traits.rs` (both traits, the blanket impl), `uc_service/src/session.rs:166-273` (`Sessioned` impl), `uc_service/src/apply.rs:390` and `uc_service/src/replay.rs:168` (the two ctx-building call sites — confirm with `grep -rn "\.apply(" uc_service/src` that there is no third), `uc_service/src/lib.rs:64-71` (re-exports)
 - Create: `uc_service/src/ids.rs`
-- Modify (mechanical, one `const NAME` line + `position: u64` → `ctx: &ApplyCtx` reading `ctx.position`): `examples/counter/src/lib.rs:52`, `uc_lincheck/src/register.rs:48`, `uc_lincheck/src/list_append.rs:38`, `uc_client/tests/roundtrip.rs:44`, `uc_client/tests/pipelined.rs:34`, `uc_gateway/examples/m12_gate.rs:462,547,1604`, `uc_node/examples/apply_bench.rs:82`, `uc_node/examples/m5_gate.rs:233,267`, `uc_node/examples/m6_gate.rs:185`, `uc_node/examples/m7_gate.rs:277`, `uc_node/examples/m9_gate.rs:149`, `uc_node/examples/m10_gate.rs:260`, `uc_node/examples/m10_alerts.rs:501,1028`, `uc_node/examples/read_profile.rs:538`, `uc_node/tests/services.rs:157,356`, `uc_node/tests/obs_http.rs:253`, `uc_node/tests/learner.rs:672`, `uc_node/tests/backup.rs:812`, `uc_node/tests/crypto_adversarial.rs:1087`, `uc_node/tests/crypto_cluster.rs:70`, `uc_node/tests/query_barrier.rs:42`, `uc_node/tests/lincheck_v2/mod.rs:1335,1403`, `uc_service/src/apply.rs:826`, `uc_service/tests/session.rs:283`, `uc_service/tests/raw_contract.rs:25,79`, `uc_service/tests/reconstruction.rs:46`, `uc_service/tests/query.rs:49`, `uc_service/tests/output.rs:54`, `uc_service/tests/apply.rs:37`, and `fuzz/src/lib.rs:35,94` (outside the workspace — check with `cd fuzz && cargo +nightly check`).
+- Modify (mechanical, one `const NAME` line + `position: u64` → `ctx: &mut ApplyCtx` reading `ctx.position`): `examples/counter/src/lib.rs:52`, `uc_lincheck/src/register.rs:48`, `uc_lincheck/src/list_append.rs:38`, `uc_client/tests/roundtrip.rs:44`, `uc_client/tests/pipelined.rs:34`, `uc_gateway/examples/m12_gate.rs:462,547,1604`, `uc_node/examples/apply_bench.rs:82`, `uc_node/examples/m5_gate.rs:233,267`, `uc_node/examples/m6_gate.rs:185`, `uc_node/examples/m7_gate.rs:277`, `uc_node/examples/m9_gate.rs:149`, `uc_node/examples/m10_gate.rs:260`, `uc_node/examples/m10_alerts.rs:501,1028`, `uc_node/examples/read_profile.rs:538`, `uc_node/tests/services.rs:157,356`, `uc_node/tests/obs_http.rs:253`, `uc_node/tests/learner.rs:672`, `uc_node/tests/backup.rs:812`, `uc_node/tests/crypto_adversarial.rs:1087`, `uc_node/tests/crypto_cluster.rs:70`, `uc_node/tests/query_barrier.rs:42`, `uc_node/tests/lincheck_v2/mod.rs:1335,1403`, `uc_service/src/apply.rs:826`, `uc_service/tests/session.rs:283`, `uc_service/tests/raw_contract.rs:25,79`, `uc_service/tests/reconstruction.rs:46`, `uc_service/tests/query.rs:49`, `uc_service/tests/output.rs:54`, `uc_service/tests/apply.rs:37`, and `fuzz/src/lib.rs:35,94` (outside the workspace — check with `cd fuzz && cargo +nightly check`).
 
 **Interfaces:**
 - Consumes: `uc_protocol::identity::{FsmIdentity, FsmName}` (Task 1).
 - Produces (`uc_service`, re-exported at the crate root):
   - `#[non_exhaustive] pub struct ApplyCtx { pub position: u64, identity: FsmIdentity }`, `ApplyCtx::new(position: u64, identity: FsmIdentity) -> ApplyCtx`, `ApplyCtx::identity(&self) -> FsmIdentity`, `ApplyCtx::ids(&self) -> IdGen`.
-  - `RawStateMachine { const NAME: &'static str; const VERSION: u32 = 0; const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION); fn apply(&mut self, ctx: &ApplyCtx, cmd: &[u8], out: &mut Vec<u8>); fn query(..); fn last_applied(..) }`.
-  - `StateMachine` mirrors: `const NAME`, `const VERSION: u32 = 0`, `fn apply(&mut self, ctx: &ApplyCtx, cmd: Self::Command) -> Self::Response`.
+  - `RawStateMachine { const NAME: &'static str; const VERSION: u32 = 0; const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION); fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>); fn query(..); fn last_applied(..) }`.
+  - `StateMachine` mirrors: `const NAME`, `const VERSION: u32 = 0`, `fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Self::Command) -> Self::Response`.
   - `pub struct IdGen` (`!Send`): `IdGen::new(position: u64, identity: FsmIdentity) -> IdGen`, `IdGen::next(&mut self) -> u128`, `IdGen::ordinal(&self) -> u32`.
   - `pub(crate) fn permute(a: u64, b: u64) -> u128` / `unpermute(x: u128) -> (u64, u64)` in `ids.rs` (tests only).
 
@@ -719,7 +719,7 @@ fn ctx_ids_is_the_only_generator_and_sessioned_forwards_the_context() {
     struct Minter { seen: Vec<u128>, last: Option<u64> }
     impl RawStateMachine for Minter {
         const NAME: &'static str = "minter";
-        fn apply(&mut self, ctx: &ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
+        fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
             let mut ids = ctx.ids();
             self.seen.push(ids.next());
             self.last = Some(ctx.position);
@@ -731,7 +731,7 @@ fn ctx_ids_is_the_only_generator_and_sessioned_forwards_the_context() {
     let direct = {
         let mut m = Minter { seen: vec![], last: None };
         let mut out = Vec::new();
-        m.apply(&ApplyCtx::new(64, Minter::IDENTITY), &[], &mut out);
+        m.apply(&mut ApplyCtx::new(64, Minter::IDENTITY), &[], &mut out);
         m.seen[0]
     };
     let mut s = Sessioned::new(Minter { seen: vec![], last: None }, SessionConfig::default());
@@ -739,7 +739,7 @@ fn ctx_ids_is_the_only_generator_and_sessioned_forwards_the_context() {
     cmd.extend_from_slice(&1u64.to_le_bytes()); // client_id
     cmd.extend_from_slice(&1u64.to_le_bytes()); // seq
     let mut out = Vec::new();
-    s.apply(&ApplyCtx::new(64, <Sessioned<Minter> as RawStateMachine>::IDENTITY), &cmd, &mut out);
+    s.apply(&mut ApplyCtx::new(64, <Sessioned<Minter> as RawStateMachine>::IDENTITY), &cmd, &mut out);
     assert_eq!(<Sessioned<Minter> as RawStateMachine>::NAME, "minter");
     assert_eq!(s.inner().seen[0], direct, "same position, same identity → same ID through the wrapper");
     assert_eq!(s.last_applied(), Some(64));
@@ -847,7 +847,7 @@ use crate::ids::IdGen;
 /// `#[non_exhaustive]`: the timestamps/scheduler design adds fields here
 /// without changing `apply`'s signature again.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct ApplyCtx {
     /// The frame's absolute byte position (the idempotency key).
     pub position: u64,
@@ -878,7 +878,7 @@ impl ApplyCtx {
     const VERSION: u32 = 0;
 ```
 
-and change `fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response;` to `fn apply(&mut self, ctx: &ApplyCtx, cmd: Self::Command) -> Self::Response;` (doc: "`ctx.position` is the frame's absolute byte position, the idempotency key; `ctx.ids()` the deterministic ID generator").
+and change `fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response;` to `fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Self::Command) -> Self::Response;` (doc: "`ctx.position` is the frame's absolute byte position, the idempotency key; `ctx.ids()` the deterministic ID generator").
 
 `RawStateMachine` (`:55-64`): add `const NAME`, `const VERSION: u32 = 0`, and
 
@@ -888,13 +888,13 @@ and change `fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Resp
     const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION);
 ```
 
-and `fn apply(&mut self, ctx: &ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);`.
+and `fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);`.
 
 Blanket impl (`:69-92`): add `const NAME: &'static str = S::NAME; const VERSION: u32 = S::VERSION;` and change the apply signature + `StateMachine::apply(self, ctx, cmd)`.
 
-`session.rs:166`: `impl<S: RawStateMachine> RawStateMachine for Sessioned<S>` gains `const NAME: &'static str = S::NAME; const VERSION: u32 = S::VERSION;`; `fn apply(&mut self, ctx: &ApplyCtx, cmd: &[u8], out: &mut Vec<u8>)` with `let position = ctx.position;` as the first line (so the body is otherwise untouched) and `self.inner.apply(ctx, body, &mut resp);` at `:231`. Add `pub fn inner(&self) -> &S { &self.inner }` if absent.
+`session.rs:166`: `impl<S: RawStateMachine> RawStateMachine for Sessioned<S>` gains `const NAME: &'static str = S::NAME; const VERSION: u32 = S::VERSION;`; `fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>)` with `let position = ctx.position;` as the first line (so the body is otherwise untouched) and `self.inner.apply(ctx, body, &mut resp);` at `:231`. Add `pub fn inner(&self) -> &S { &self.inner }` if absent.
 
-`apply.rs:390`: `let ctx = ApplyCtx::new(pos, S::IDENTITY); sm.apply(&ctx, payload, &mut st.resp_buf);` (`S` is `apply_cycle`'s type parameter). `replay.rs:168`: `guard.apply(&ApplyCtx::new(pos, S::IDENTITY), &payload[off + HEADER_LEN..off + total], &mut scratch);`. `apply.rs:826` test SM: add `const NAME: &'static str = "count";` and the ctx signature.
+`apply.rs:390`: `let mut ctx = ApplyCtx::new(pos, S::IDENTITY); sm.apply(&mut ctx, payload, &mut st.resp_buf);` (`S` is `apply_cycle`'s type parameter). `replay.rs:168`: `guard.apply(&mut ApplyCtx::new(pos, S::IDENTITY), &payload[off + HEADER_LEN..off + total], &mut scratch);`. `apply.rs:826` test SM: add `const NAME: &'static str = "count";` and the ctx signature.
 
 `lib.rs`: `pub mod ids;` and extend the re-export: `pub use crate::traits::{ApplyCtx, ...}; pub use crate::ids::IdGen;`.
 
@@ -905,11 +905,11 @@ impl StateMachine for CountSm {
     const NAME: &'static str = "count";
     type Command = ...;
     ...
-    fn apply(&mut self, ctx: &ApplyCtx, cmd: Cmd) -> Resp {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> Resp {
         let position = ctx.position; // then the body as before
 ```
 
-Import `ApplyCtx` from `uc_service` (`use uc_service::ApplyCtx;` or the fully-qualified `uc_service::ApplyCtx` where the file uses full paths, e.g. `uc_lincheck/src/register.rs`). Raw SMs (`RawStateMachine`) take `ctx: &ApplyCtx` the same way.
+Import `ApplyCtx` from `uc_service` (`use uc_service::ApplyCtx;` or the fully-qualified `uc_service::ApplyCtx` where the file uses full paths, e.g. `uc_lincheck/src/register.rs`). Raw SMs (`RawStateMachine`) take `ctx: &mut ApplyCtx` the same way.
 
 - [ ] **Step 6: Run to verify passes**
 
@@ -1244,7 +1244,7 @@ fn attach_writes_the_declared_version_into_the_slot() {
         type Response = <CountSm as StateMachine>::Response;
         type Query = <CountSm as StateMachine>::Query;
         type QueryResponse = <CountSm as StateMachine>::QueryResponse;
-        fn apply(&mut self, ctx: &ApplyCtx, c: Self::Command) -> Self::Response { self.0.apply(ctx, c) }
+        fn apply(&mut self, ctx: &mut ApplyCtx, c: Self::Command) -> Self::Response { self.0.apply(ctx, c) }
         fn query(&self, q: Self::Query) -> Self::QueryResponse { self.0.query(q) }
         fn last_applied(&self) -> Option<u64> { self.0.last_applied() }
     }
@@ -1272,7 +1272,7 @@ mod tests {
         const NAME: &'static str = "inner";
         const VERSION: u32 = 7;
         type Command = u64; type Response = u64; type Query = (); type QueryResponse = u64;
-        fn apply(&mut self, _c: &crate::ApplyCtx, cmd: u64) -> u64 { self.0 += cmd; self.0 }
+        fn apply(&mut self, _c: &mut crate::ApplyCtx, cmd: u64) -> u64 { self.0 += cmd; self.0 }
         fn query(&self, _q: ()) -> u64 { self.0 }
         fn last_applied(&self) -> Option<u64> { None }
     }
@@ -1306,7 +1306,7 @@ impl<const ROW: u8, S: StateMachine> StateMachine for Tagged<ROW, S> {
     const NAME: &'static str = TAGGED_NAMES[ROW as usize];
     const VERSION: u32 = S::VERSION;
     type Command = S::Command; type Response = S::Response; type Query = S::Query; type QueryResponse = S::QueryResponse;
-    #[inline] fn apply(&mut self, ctx: &ApplyCtx, cmd: S::Command) -> S::Response { self.0.apply(ctx, cmd) }
+    #[inline] fn apply(&mut self, ctx: &mut ApplyCtx, cmd: S::Command) -> S::Response { self.0.apply(ctx, cmd) }
     #[inline] fn query(&self, q: S::Query) -> S::QueryResponse { self.0.query(q) }
     #[inline] fn last_applied(&self) -> Option<u64> { self.0.last_applied() }
 }
@@ -1737,7 +1737,7 @@ fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
             impl uc_service::RawStateMachine for $t {
                 const NAME: &'static str = "sum";
                 const VERSION: u32 = $v;
-                fn apply(&mut self, ctx: &ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) { self.0.apply(ctx, cmd, out) }
+                fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) { self.0.apply(ctx, cmd, out) }
                 fn query(&self, q: &[u8], out: &mut Vec<u8>) { self.0.query(q, out) }
                 fn last_applied(&self) -> Option<u64> { self.0.last_applied() }
             }
