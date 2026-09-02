@@ -129,8 +129,8 @@ fn start_single_node_with_buffer(dir: &Path, app_id: &str, buffer_bytes: usize) 
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
         // M14a: node-only harness — these tests drive 2000 submits before any
-        // service ever attaches. `ServicesConfig::default()` declares FSM 0,
-        // whose `applied` (permanently 0 with no service) would close the
+        // service ever attaches. Declaring FSM 0 (`ServicesConfig::single`)
+        // would set its `applied` (permanently 0 with no service), closing the
         // admission door at `append - min_applied <= buffer_bytes / 4` = 16
         // KiB, so `append > RING_BYTES` (64 KiB) could never hold.
         // `none_for_tests()` declares nothing: no door term, no report
