@@ -114,15 +114,18 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     // against the buffer it actually got.
     let config = vec![0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
+    let mut identity = [0u64; 8];
+    identity[0] = 0x0BAD_F00D_0000_0001;
     write_snap_begin_body(
         &mut b,
         &SnapBeginBody {
             session: 7,
-            layout: SNAP_BEGIN_LAYOUT_V2,
+            layout: SNAP_BEGIN_LAYOUT_V3,
             service_id: 0,
             snapshot_pos: 8192,
             total_len: 1 << 20,
-            services_declared: 0b1,
+            identity,
+            version: [0; 8],
             config,
         },
     );
@@ -153,24 +156,30 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("13-config-reply", datagram(DGRAM_KIND_CONFIG_REPLY, 0, 3, &b)));
 
-    // M14c / wire 0.6.0: a MULTI-service SNAP_BEGIN — a non-zero `service_id`,
-    // a multi-bit `services_declared`, and no config, so the decoder's fixed
-    // part is exercised at exactly `SNAP_BEGIN_FIXED_LEN` (the 10- seed covers
-    // the config-carrying variable-length path).
+    // Wire 0.7.0: a MULTI-FSM SNAP_BEGIN — a non-zero `service_id`, two
+    // declared rows' identity hashes + versions, and no config, so the
+    // decoder's fixed part is exercised at exactly `SNAP_BEGIN_FIXED_LEN`
+    // (the 10- seed covers the config-carrying variable-length path).
     let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+    let mut identity = [0u64; 8];
+    identity[0] = 0x0BAD_F00D_0000_0001;
+    identity[2] = 0x0BAD_F00D_0000_0003;
+    let mut version = [0u32; 8];
+    version[2] = 0x0001_0000;
     write_snap_begin_body(
         &mut b,
         &SnapBeginBody {
             session: 9,
-            layout: SNAP_BEGIN_LAYOUT_V2,
+            layout: SNAP_BEGIN_LAYOUT_V3,
             service_id: 2,
             snapshot_pos: 65536,
             total_len: 300 * 1024,
-            services_declared: 0b101,
+            identity,
+            version,
             config: vec![],
         },
     );
-    seeds.push(Seed::fixed("14-snap-begin-v2", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
+    seeds.push(Seed::fixed("14-snap-begin-v3", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
     seeds
 }

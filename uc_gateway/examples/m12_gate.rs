@@ -1725,13 +1725,13 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
     // cnc page. On a healthy throughput run it must stay 0. M14d adds the
     // snapshot-session refusal counters (below-floor joins the node had to
     // turn away).
-    let mut last = (u64::MAX, (u64::MAX, u64::MAX));
+    let mut last = (u64::MAX, (u64::MAX, u64::MAX, u64::MAX));
     loop {
         let now = (node.reports_unattested(), node.snapshot_session_refusals());
         if now != last {
             println!(
-                "m12_gate node {id} stats: reports_unattested={} snap_refusals=({},{})",
-                now.0, now.1.0, now.1.1
+                "m12_gate node {id} stats: reports_unattested={} snap_refusals=({},{},{})",
+                now.0, now.1.0, now.1.1, now.1.2
             );
             last = now;
         }

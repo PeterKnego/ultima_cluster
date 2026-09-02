@@ -29,7 +29,7 @@ use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V2,
+    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V3,
     SnapBeginBody, write_datagram_header, write_snap_begin_body,
 };
 use uc_protocol::v2::frame::{
@@ -135,12 +135,31 @@ pub struct SnapArtifact {
 /// session is refused (the peer re-NAKs) rather than opened half-formed.
 #[derive(Debug, Clone)]
 pub struct SnapshotSet {
-    /// The sender's declared FSM mask; rides every `SNAP_BEGIN` and is what
-    /// the receiver compares against its own (`declared-set mismatch`).
+    /// The sender's declared FSM mask; DERIVED from `identity` via
+    /// [`identity_mask`] — bit `r` set iff `identity[r] != 0`. Kept as an
+    /// explicit field (rather than computed inline everywhere) because the
+    /// invariant check below asserts the two agree.
     pub services_declared: u64,
+    /// Row `r`'s FSM identity hash (0 = undeclared); rides every
+    /// `SNAP_BEGIN` (wire 0.7.0) and is what the receiver compares against
+    /// its own, positionally by name.
+    pub identity: [u64; 8],
+    /// Row `r`'s attached service's packed version (0 = unknown); rides
+    /// every `SNAP_BEGIN` alongside `identity`.
+    pub version: [u32; 8],
     /// M7: the encoded `ConfigRecord.config` at ship time — see below.
     pub config: Vec<u8>,
     pub artifacts: Vec<SnapArtifact>,
+}
+
+/// The declared-FSM bitmask implied by an `identity` array: bit `r` set iff
+/// `identity[r] != 0`. Wire 0.7.0 (spec §5): `SnapshotSet::services_declared`
+/// is derived from `identity` via this function, never set independently.
+pub fn identity_mask(identity: &[u64; 8]) -> u64 {
+    identity
+        .iter()
+        .enumerate()
+        .fold(0u64, |m, (i, h)| if *h != 0 { m | (1 << i) } else { m })
 }
 
 /// M6 Task 6 / M14c: the newest durable snapshot SET the node is willing to
@@ -176,9 +195,12 @@ struct SnapPart {
 struct SnapSession {
     peer: SocketAddr,
     session: u32,
-    /// Rides every `SNAP_BEGIN`; the receiver refuses a session whose mask
-    /// differs from its own.
-    services_declared: u64,
+    /// Row `r`'s FSM identity hash; rides every `SNAP_BEGIN` (wire 0.7.0).
+    /// The declared-FSM mask a receiver checks against is derived from this
+    /// via [`identity_mask`], never stored separately.
+    identity: [u64; 8],
+    /// Row `r`'s attached service's packed version; rides every `SNAP_BEGIN`.
+    version: [u32; 8],
     /// Ascending by `service_id`, contiguous in `base`.
     parts: Vec<SnapPart>,
     /// Sum of the artifacts' lengths — the stream's byte space.
@@ -1136,7 +1158,8 @@ impl Sender {
         // closes, it probes for a BEGIN that will never come, and the transfer
         // burns the slot until the timeout instead of staying an overrun the
         // peer re-NAKs.
-        if set.artifacts.len() != set.services_declared.count_ones() as usize
+        if set.services_declared != identity_mask(&set.identity)
+            || set.artifacts.len() != set.services_declared.count_ones() as usize
             || set
                 .artifacts
                 .iter()
@@ -1193,7 +1216,8 @@ impl Sender {
         self.snap = Some(SnapSession {
             peer: to,
             session: sid,
-            services_declared: set.services_declared,
+            identity: set.identity,
+            version: set.version,
             parts,
             stream_len: base,
             cursor: 0,
@@ -1251,13 +1275,23 @@ impl Sender {
             let p = &sess.parts[target];
             let (peer, session, service_id, pos, len) =
                 (sess.peer, sess.session, p.service_id, p.snapshot_pos, p.len);
-            let declared = sess.services_declared;
+            let identity = sess.identity;
+            let version = sess.version;
             // M8 (Task 17): `begun_ns` latches only on a datagram that actually
             // reached the wire. A seal failure (no session with this peer yet)
             // must leave the artifact un-begun so the NEXT cycle retries the
             // BEGIN — latching it unconditionally would ship chunks a receiver
             // with no intake for them can only drop.
-            if self.send_snap_begin(peer, session, service_id, pos, len, declared, &sess.config) {
+            if self.send_snap_begin(
+                peer,
+                session,
+                service_id,
+                pos,
+                len,
+                &identity,
+                &version,
+                &sess.config,
+            ) {
                 sess.parts[target].begun_ns = Some(now);
                 did = true;
                 progress |= first_ever;
@@ -1394,7 +1428,8 @@ impl Sender {
         service_id: u8,
         snapshot_pos: u64,
         total_len: u64,
-        services_declared: u64,
+        identity: &[u64; 8],
+        version: &[u32; 8],
         config: &[u8],
     ) -> bool {
         let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
@@ -1402,11 +1437,12 @@ impl Sender {
             &mut body,
             &SnapBeginBody {
                 session,
-                layout: SNAP_BEGIN_LAYOUT_V2,
+                layout: SNAP_BEGIN_LAYOUT_V3,
                 service_id,
                 snapshot_pos,
                 total_len,
-                services_declared,
+                identity: *identity,
+                version: *version,
                 config: config.to_vec(),
             },
         );
@@ -3050,6 +3086,19 @@ mod tests {
         b"CLUSTER-MEMBERSHIP-RECORD".to_vec()
     }
 
+    /// A nonzero placeholder identity hash per set bit of `mask` — enough for
+    /// `identity_mask(&ident(mask)) == mask` to hold, which is all these
+    /// tests need (they exercise artifact/mask covering, not real names).
+    fn ident(mask: u64) -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for (i, h) in out.iter_mut().enumerate() {
+            if mask & (1 << i) != 0 {
+                *h = 0xF00D_0000_0000_0000 | (i as u64 + 1);
+            }
+        }
+        out
+    }
+
     /// A `Sender` with crypto on and a REAL established pairwise session with
     /// its one follower, plus a real snapshot file wired as the source.
     /// Returns the sender, the follower endpoint, the follower's
@@ -3115,6 +3164,8 @@ mod tests {
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: t17_config_bytes(),
                 artifacts: vec![SnapArtifact {
                     service_id: 0,
@@ -3152,6 +3203,8 @@ mod tests {
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: t17_config_bytes(),
                 artifacts: vec![SnapArtifact {
                     service_id: 0,
@@ -3194,6 +3247,8 @@ mod tests {
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b101,
+                identity: ident(0b101),
+                version: [0; 8],
                 config: t17_config_bytes(),
                 artifacts: vec![
                     SnapArtifact {
@@ -3242,9 +3297,10 @@ mod tests {
             }
         }
         for b in &begins {
-            assert_eq!(b.layout, SNAP_BEGIN_LAYOUT_V2);
+            assert_eq!(b.layout, SNAP_BEGIN_LAYOUT_V3);
             assert_eq!(
-                b.services_declared, 0b101,
+                b.declared_mask(),
+                0b101,
                 "the declared mask rides EVERY begin"
             );
             assert_eq!(
@@ -3341,6 +3397,8 @@ mod tests {
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared,
+                identity: ident(services_declared),
+                version: [0; 8],
                 config: t17_config_bytes(),
                 artifacts: artifacts.clone(),
             })
@@ -3526,6 +3584,8 @@ mod tests {
         // (a) ids 0 and 2 declared, only id 0 shipped.
         let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
             services_declared: 0b101,
+            identity: ident(0b101),
+            version: [0; 8],
             config: t17_config_bytes(),
             artifacts: vec![make(0)],
         });
@@ -3539,6 +3599,8 @@ mod tests {
         // (b) the right NUMBER of artifacts, one of them for an undeclared id.
         let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
             services_declared: 0b101,
+            identity: ident(0b101),
+            version: [0; 8],
             config: t17_config_bytes(),
             artifacts: vec![make(0), make(1)],
         });
@@ -3559,6 +3621,8 @@ mod tests {
         std::fs::write(&part, b"").unwrap();
         let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
             services_declared: 0b1,
+            identity: ident(0b1),
+            version: [0; 8],
             config: t17_config_bytes(),
             artifacts: vec![SnapArtifact {
                 service_id: 0,
@@ -3587,6 +3651,8 @@ mod tests {
         };
         let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
             services_declared: 0b101,
+            identity: ident(0b101),
+            version: [0; 8],
             config: t17_config_bytes(),
             artifacts: vec![make(2), make(0)],
         });
@@ -3607,6 +3673,8 @@ mod tests {
         let gone = dir.path().join("snap-2048.ultsnap"); // deliberately never created
         let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
             services_declared: 0b1,
+            identity: ident(0b1),
+            version: [0; 8],
             config: t17_config_bytes(),
             artifacts: vec![SnapArtifact {
                 service_id: 0,
@@ -3797,9 +3865,9 @@ mod tests {
             "the config survives the round trip intact"
         );
         assert_eq!(body.total_len, T17_SNAP_LEN as u64);
-        assert_eq!(body.layout, SNAP_BEGIN_LAYOUT_V2);
+        assert_eq!(body.layout, SNAP_BEGIN_LAYOUT_V3);
         assert_eq!(body.service_id, 0);
-        assert_eq!(body.services_declared, 0b1);
+        assert_eq!(body.declared_mask(), 0b1);
     }
 
     #[test]
@@ -3909,6 +3977,8 @@ mod tests {
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: t17_config_bytes(),
                 artifacts: vec![SnapArtifact {
                     service_id: 0,

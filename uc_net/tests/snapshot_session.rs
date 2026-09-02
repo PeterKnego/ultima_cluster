@@ -28,8 +28,10 @@ use uc_log::cnc::{CncMeta, CncPage};
 use uc_log::region::Region;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::rebuild::NakConfig;
-use uc_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
-use uc_net::sender::{CtrlMsg, Sender, SenderConfig};
+use uc_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent, RefusalKind};
+use uc_net::sender::{CtrlMsg, Sender, SenderConfig, identity_mask};
+use uc_protocol::identity::FsmName;
+use uc_protocol::v2::datagram::{SNAP_BEGIN_LAYOUT_V2, SNAP_BEGIN_LAYOUT_V3};
 
 const TERM: u32 = 3;
 const CAP: u64 = 1 << 20; // 1 MiB ring
@@ -71,6 +73,26 @@ fn write_snapshot_file(dir: &Path, id: u8) -> PathBuf {
     path
 }
 
+/// `FsmName::parse(s).unwrap().hash()` — the row's identity hash a real FSM
+/// would carry.
+fn name_hash(s: &str) -> u64 {
+    FsmName::parse(s).unwrap().hash()
+}
+
+/// `names[i]` is row `i`'s FSM name (an empty string = that row is
+/// undeclared — lets a test skip a row, e.g. `&["a", "", "c"]` declares rows
+/// 0 and 2 only, exactly as the old `&[u8]` id list once let tests declare a
+/// sparse mask).
+fn identity_hashes_of(names: &[&str]) -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for (i, &n) in names.iter().enumerate().take(8) {
+        if !n.is_empty() {
+            out[i] = name_hash(n);
+        }
+    }
+    out
+}
+
 struct Harness {
     leader_send: Sender,
     leader_recv: FollowerReceiver,
@@ -86,7 +108,14 @@ struct Harness {
     _follower_dir: tempfile::TempDir,
 }
 
-fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
+fn build(faults: FaultConfig, names: &[&str]) -> Harness {
+    build_with_versions(faults, names, [0u32; 8])
+}
+
+/// Same as [`build`], but the follower's own reported versions (what its
+/// `own_versions` closure returns for `SNAP_BEGIN`'s version comparison) are
+/// `versions` rather than all-zero.
+fn build_with_versions(faults: FaultConfig, names: &[&str], versions: [u32; 8]) -> Harness {
     // Leader: one socket, cloned for send + recv (as uc_node composes it).
     let leader_raw = UdpSocket::bind("127.0.0.1:0").unwrap();
     let leader_addr = leader_raw.local_addr().unwrap();
@@ -104,14 +133,19 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
     let term = Arc::new(AtomicU32::new(TERM));
     let role = Arc::new(AtomicBool::new(true));
 
+    let identity = identity_hashes_of(names);
+    let declared = identity_mask(&identity);
+
     // The leader dir holds the source snapshot; the sender ships it on a
     // below-floor NAK. NO replay source is wired, so the NAK is unservable from
     // the journal and upgrades to a session.
     let leader_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut declared = 0u64;
     let mut artifacts = Vec::new();
-    for &id in ids {
-        declared |= 1 << id;
+    for (i, &n) in names.iter().enumerate().take(8) {
+        if n.is_empty() {
+            continue;
+        }
+        let id = i as u8;
         let path = write_snapshot_file(leader_dir.path(), id);
         let len = std::fs::metadata(&path).unwrap().len();
         artifacts.push(uc_net::sender::SnapArtifact {
@@ -124,6 +158,8 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
     let snapshot_source: uc_net::sender::SnapshotSource = Arc::new(move || {
         Some(uc_net::sender::SnapshotSet {
             services_declared: declared,
+            identity,
+            version: versions,
             config: Vec::new(),
             artifacts: artifacts.clone(),
         })
@@ -180,7 +216,12 @@ fn build(faults: FaultConfig, ids: &[u8]) -> Harness {
         backoff_ns: 1_000_000,
     };
     let mut follower = FollowerReceiver::new(follower_buf, follower_sock, fcfg, term, unrouted());
-    follower.set_snapshot_intake(follower_snap_dir.clone(), declared, None);
+    follower.set_snapshot_intake(
+        follower_snap_dir.clone(),
+        identity,
+        Arc::new(move || versions),
+        None,
+    );
 
     Harness {
         leader_send,
@@ -230,7 +271,7 @@ impl Harness {
 
     /// Send a hand-built SNAP_BEGIN straight at the follower — the only way to
     /// exercise a refusal, since our own sender never emits one.
-    fn forge_begin(&self, layout: u8, services_declared: u64) {
+    fn forge_begin(&self, layout: u8, identity: [u64; 8], version: [u32; 8]) {
         use uc_protocol::v2::datagram::{
             DATAGRAM_HEADER_LEN, DGRAM_KIND_SNAP_BEGIN, DatagramHeader, SNAP_BEGIN_FIXED_LEN,
             SnapBeginBody, write_datagram_header, write_snap_begin_body,
@@ -254,7 +295,8 @@ impl Harness {
                 service_id: 0,
                 snapshot_pos: snap_pos(0),
                 total_len: 64,
-                services_declared,
+                identity,
+                version,
                 config: vec![],
             },
         );
@@ -262,16 +304,16 @@ impl Harness {
         s.send_to(&d, self.follower_addr).unwrap();
     }
 
-    /// A genuine wire-0.5.0 `SNAP_BEGIN`: its fixed body part is 26 bytes
-    /// (`session` ++ pad ++ `snapshot_pos` ++ `total_len` ++ `config_len`), so
-    /// it is too short to decode as 0.6.0 at all — the realistic flag-day
-    /// shape, which must still name the `peer wire 0.5.0` refusal rather than
-    /// vanishing as an anonymous malformed datagram.
-    fn forge_legacy_050_begin(&self) {
+    /// A genuine wire-≤0.6.0 `SNAP_BEGIN`: 34 bytes — the exact fixed part
+    /// wire 0.6.0 sent, below wire 0.7.0's `SNAP_BEGIN_FIXED_LEN` (122), so it
+    /// is too short to decode at all — the realistic flag-day shape, which
+    /// must still name the `peer wire ≤ 0.6.0` refusal rather than vanishing
+    /// as an anonymous malformed datagram.
+    fn forge_legacy_prewire070_begin(&self) {
         use uc_protocol::v2::datagram::{
             DATAGRAM_HEADER_LEN, DGRAM_KIND_SNAP_BEGIN, DatagramHeader, write_datagram_header,
         };
-        const LEGACY_FIXED_LEN: usize = 26;
+        const LEGACY_FIXED_LEN: usize = 34;
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + LEGACY_FIXED_LEN];
         write_datagram_header(
             &mut d,
@@ -285,9 +327,11 @@ impl Harness {
         );
         let body = &mut d[DATAGRAM_HEADER_LEN..];
         body[0..4].copy_from_slice(&98u32.to_le_bytes()); // session
+        body[4] = SNAP_BEGIN_LAYOUT_V2;
         body[8..16].copy_from_slice(&snap_pos(0).to_le_bytes()); // snapshot_pos
         body[16..24].copy_from_slice(&64u64.to_le_bytes()); // total_len
-        body[24..26].copy_from_slice(&0u16.to_le_bytes()); // config_len
+        body[24..32].copy_from_slice(&1u64.to_le_bytes()); // services_declared (0.6.0 shape)
+        body[32..34].copy_from_slice(&0u16.to_le_bytes()); // config_len
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         s.send_to(&d, self.follower_addr).unwrap();
     }
@@ -295,7 +339,7 @@ impl Harness {
 
 #[test]
 fn below_floor_nak_upgrades_to_snapshot_session_and_file_transfers_exactly() {
-    let mut h = build(FaultConfig::default(), &[0]);
+    let mut h = build(FaultConfig::default(), &["fsm0"]);
     h.trigger();
     h.pump_until("file transferred", |h| h.final_path(0).exists());
 
@@ -326,7 +370,7 @@ fn snapshot_session_survives_chunk_loss_via_snap_nak() {
         seed: 42,
         ..FaultConfig::default()
     };
-    let mut h = build(faults, &[0]);
+    let mut h = build(faults, &["fsm0"]);
     h.trigger();
     h.pump_until("file transferred under loss", |h| h.final_path(0).exists());
 
@@ -356,7 +400,7 @@ fn a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss() {
         seed: 42,
         ..FaultConfig::default()
     };
-    let mut h = build(faults, &[0, 2]);
+    let mut h = build(faults, &["fsm0", "", "fsm2"]);
     h.trigger();
     h.pump_until("both artifacts transferred under loss", |h| {
         h.final_path(0).exists() && h.final_path(2).exists()
@@ -410,7 +454,7 @@ fn a_two_artifact_stream_lands_in_per_id_dirs_under_chunk_loss() {
 /// cause.
 #[test]
 fn a_failed_publish_is_counted_and_retried_not_stranded() {
-    let mut h = build(FaultConfig::default(), &[0]);
+    let mut h = build(FaultConfig::default(), &["fsm0"]);
     // Sit a DIRECTORY on the artifact's final path: renaming the completed
     // `.part` onto it fails (EISDIR) — the stand-in for a read-only/full
     // snapshot dir, and deterministic on every filesystem.
@@ -444,10 +488,11 @@ fn a_failed_publish_is_counted_and_retried_not_stranded() {
 }
 
 #[test]
-fn a_layout_zero_begin_is_refused_as_a_wire_050_peer() {
-    let mut h = build(FaultConfig::default(), &[0]);
+fn a_layout_one_begin_is_refused_as_a_pre_070_peer() {
+    let mut h = build(FaultConfig::default(), &["fsm0"]);
     let st = h.follower.stats();
-    h.forge_begin(0, 0b1); // layout 0 = a 0.5.0-shaped body
+    // layout 1 (SNAP_BEGIN_LAYOUT_V2) = a wire ≤0.6.0-shaped body.
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V2, identity_hashes_of(&["fsm0"]), [0; 8]);
     h.pump_until("the legacy-layout refusal is counted", |_| {
         st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
     });
@@ -463,32 +508,85 @@ fn a_layout_zero_begin_is_refused_as_a_wire_050_peer() {
 }
 
 #[test]
-fn a_mismatched_declared_set_refuses_the_session() {
-    let mut h = build(FaultConfig::default(), &[0]); // the follower's own mask is 0b1
+fn a_mismatched_identity_refuses_the_session_and_names_the_row() {
+    let mut h = build(FaultConfig::default(), &["a"]); // the follower's own row 0 is "a"
     let st = h.follower.stats();
-    h.forge_begin(uc_protocol::v2::datagram::SNAP_BEGIN_LAYOUT_V2, 0b11);
-    h.pump_until("the declared-set refusal is counted", |_| {
+    let mut theirs = [0u64; 8];
+    theirs[0] = uc_protocol::identity::FsmName::parse("b").unwrap().hash();
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V3, theirs, [0; 8]);
+    h.pump_until("the identity refusal is counted", |_| {
         st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
     });
+    let r = st
+        .identity_refusal
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("detail recorded");
+    assert_eq!((r.row, r.kind), (0, RefusalKind::Identity));
     assert_eq!(
-        st.snap_refused_legacy_peer.load(Ordering::Relaxed),
-        0,
-        "not the other refusal"
+        r.ours,
+        uc_protocol::identity::FsmName::parse("a").unwrap().hash()
     );
-    assert!(
-        !h.follower_snap_dir.join("0").exists(),
-        "no intake, no directory, no .part"
+    assert_eq!(r.theirs, theirs[0]);
+    assert_eq!(st.snap_refused_legacy_peer.load(Ordering::Relaxed), 0);
+    assert!(!h.follower_snap_dir.join("0").exists());
+}
+
+#[test]
+fn same_names_in_a_different_row_order_are_refused_positionally() {
+    let mut h = build(FaultConfig::default(), &["a", "b"]);
+    let st = h.follower.stats();
+    let (ha, hb) = (name_hash("a"), name_hash("b"));
+    let mut theirs = [0u64; 8];
+    theirs[0] = hb;
+    theirs[1] = ha;
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V3, theirs, [0; 8]);
+    h.pump_until("refused", |_| {
+        st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
+    });
+    let r = st.identity_refusal.lock().unwrap().clone().unwrap();
+    assert_eq!((r.row, r.ours, r.theirs), (0, ha, hb));
+}
+
+#[test]
+fn a_version_mismatch_is_refused_only_when_both_sides_report_one() {
+    let mut h = build_with_versions(
+        FaultConfig::default(),
+        &["a"],
+        [0x0100_0000, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let st = h.follower.stats();
+    let ours = [name_hash("a"), 0, 0, 0, 0, 0, 0, 0];
+    // Their row 0 is unversioned: not a mismatch.
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V3, ours, [0; 8]);
+    h.pump_until("intake opened", |h| h.follower_snap_dir.join("0").exists());
+    assert_eq!(st.snap_refused_version_mismatch.load(Ordering::Relaxed), 0);
+    // Their row 0 is 2.0.0 against our 1.0.0: refused, by row, both versions.
+    h.forge_begin(
+        SNAP_BEGIN_LAYOUT_V3,
+        ours,
+        [0x0200_0000, 0, 0, 0, 0, 0, 0, 0],
+    );
+    h.pump_until("version refusal", |_| {
+        st.snap_refused_version_mismatch.load(Ordering::Relaxed) > 0
+    });
+    let r = st.identity_refusal.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        (r.row, r.kind, r.ours_version, r.theirs_version),
+        (0, RefusalKind::Version, 0x0100_0000, 0x0200_0000)
     );
 }
 
 #[test]
-fn a_too_short_0_5_0_begin_body_is_refused_as_a_legacy_peer() {
-    // The OTHER half of `peer wire 0.5.0`, and the one a real flag day
-    // produces: a 26-byte 0.5.0 body never even decodes as 0.6.0, so without
-    // the `else` arm it would be dropped with BOTH refusal counters at zero.
-    let mut h = build(FaultConfig::default(), &[0]);
+fn a_too_short_legacy_begin_body_is_refused_as_a_legacy_peer() {
+    // The OTHER half of `peer wire ≤ 0.6.0`, and the one a real flag day
+    // produces: a 34-byte pre-0.7.0-shaped body never even decodes as 0.7.0,
+    // so without the `else` arm it would be dropped with BOTH refusal
+    // counters at zero.
+    let mut h = build(FaultConfig::default(), &["fsm0"]);
     let st = h.follower.stats();
-    h.forge_legacy_050_begin();
+    h.forge_legacy_prewire070_begin();
     h.pump_until("the too-short legacy body is counted as a refusal", |_| {
         st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
     });
@@ -511,7 +609,7 @@ fn a_lost_first_begin_never_mis_bases_a_later_artifact() {
     // the NEXT BEGIN at that base anyway would give FSM 0 and FSM 2 each
     // other's bytes, complete both, and install the swap silently. Cut the link
     // for exactly the duty cycle that carries BEGIN(0).
-    let mut h = build(FaultConfig::default(), &[0, 2]);
+    let mut h = build(FaultConfig::default(), &["fsm0", "", "fsm2"]);
     h.leader_block.block(h.follower_addr);
     h.trigger();
     h.leader_send.do_work(); // BEGIN(0) + its first chunks go into the void

@@ -28,7 +28,9 @@ use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
 };
-use uc_net::sender::{CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet};
+use uc_net::sender::{
+    CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet, identity_mask,
+};
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscProducer, SpscRing,
 };
@@ -1029,9 +1031,23 @@ impl Node {
         // `CtrlMsg::SetPeers` (M7 config adoption, `Consensus::exec`).
         receiver.set_sender_route(ctrl_tx.clone());
         receiver.set_intake_gate(Arc::clone(&intake_gate));
+        // Wire 0.7.0 (spec §5): the receiver compares the sender's identity
+        // POSITIONALLY against this node's own row-`r` FSM name hash, and (via
+        // this closure, read fresh on every `SNAP_BEGIN`) its attached
+        // service's currently-published version — the cnc slot can change
+        // under a running node, so this must not be sampled once at boot.
+        let own_identity = cfg.services.identity_hashes();
+        let version_cnc = Arc::clone(&cnc);
         receiver.set_snapshot_intake(
             snap_root.clone(),
-            cfg.services.ring_mask(),
+            own_identity,
+            Arc::new(move || {
+                let mut v = [0u32; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+                for (r, slot) in v.iter_mut().enumerate() {
+                    *slot = version_cnc.service_slot(r).status.version();
+                }
+                v
+            }),
             Some((
                 Arc::clone(&incoming_snapshot),
                 Arc::clone(&incoming_snapshot_config),
@@ -1299,7 +1315,7 @@ impl Node {
             svc_query,
             services: cfg.services,
             snap_stats: Arc::clone(&route_drops),
-            last_snap_refusals: (0, 0),
+            last_snap_refusals: (0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
@@ -1521,20 +1537,24 @@ impl Node {
         &self.route_drops
     }
 
-    /// M14c (spec §14.3, §9): the two named snapshot-session refusals this node
-    /// counted — `(peer wire 0.5.0, declared-set mismatch)`. Both drop the
-    /// session; the follower keeps NAKing, so a non-zero value means a joiner is
-    /// stuck and the fleet is mixed-version or mis-declared. The observability
-    /// workstream exports these; this accessor is the single source it reads.
-    /// The consensus agent names each one in a `snapshot_session_refused` log
-    /// record as it happens (`uc_net` carries no logging dependency).
-    pub fn snapshot_session_refusals(&self) -> (u64, u64) {
+    /// Wire 0.7.0 (spec §5, §9): the three named snapshot-session refusals
+    /// this node counted — `(peer wire ≤ 0.6.0, identity mismatch, version
+    /// mismatch)`. All three drop the session; the follower keeps NAKing, so
+    /// a non-zero value means a joiner is stuck and the fleet is mixed-version
+    /// or mis-declared. The observability workstream exports these; this
+    /// accessor is the single source it reads. The consensus agent names each
+    /// one in a `snapshot_session_refused` log record as it happens (`uc_net`
+    /// carries no logging dependency).
+    pub fn snapshot_session_refusals(&self) -> (u64, u64, u64) {
         (
             self.route_drops
                 .snap_refused_legacy_peer
                 .load(Ordering::Relaxed),
             self.route_drops
                 .snap_refused_declared_mismatch
+                .load(Ordering::Relaxed),
+            self.route_drops
+                .snap_refused_version_mismatch
                 .load(Ordering::Relaxed),
         )
     }
@@ -1865,9 +1885,10 @@ struct Consensus {
     /// per duty cycle so the two named snapshot-session refusals are NAMED in a
     /// log line (`uc_net` has no logging dependency, so the node does it).
     snap_stats: Arc<uc_net::receiver::FollowerStats>,
-    /// The `(peer wire 0.5.0, declared-set mismatch)` pair as of the last cycle
-    /// — the edge detector behind `snapshot_session_refused`.
-    last_snap_refusals: (u64, u64),
+    /// The `(peer wire ≤ 0.6.0, identity mismatch, version mismatch)` triple
+    /// as of the last cycle — the edge detector behind
+    /// `snapshot_session_refused`.
+    last_snap_refusals: (u64, u64, u64),
     /// M14a: this cycle's `min(applied)` over the declared FSMs, refreshed by
     /// `publish_service_mins()` at the top of every `do_work` cycle.
     /// `u64::MAX` for a `none_for_tests` node (nothing declared: no FSM
@@ -2977,24 +2998,68 @@ impl Consensus {
             self.snap_stats
                 .snap_refused_declared_mismatch
                 .load(Ordering::Relaxed),
+            self.snap_stats
+                .snap_refused_version_mismatch
+                .load(Ordering::Relaxed),
         );
         if now.0 != self.last_snap_refusals.0 {
             crate::obs_event!(
                 Warn,
                 "snapshot_session_refused",
                 node = self.id as u64,
-                reason = "peer wire 0.5.0",
+                reason = "peer wire <= 0.6.0",
                 total = now.0
             );
         }
-        if now.1 != self.last_snap_refusals.1 {
-            crate::obs_event!(
-                Warn,
-                "snapshot_session_refused",
-                node = self.id as u64,
-                reason = "declared-set mismatch",
-                total = now.1
-            );
+        let identity_moved = now.1 != self.last_snap_refusals.1;
+        let version_moved = now.2 != self.last_snap_refusals.2;
+        if identity_moved || version_moved {
+            // Wire 0.7.0 (spec §5, §8, controller amendment 2): name the
+            // offending row. `identity_refusal` is only ever `Some` once the
+            // first refusal has landed, which a moved counter guarantees.
+            if let Some(d) = self.snap_stats.identity_refusal.lock().unwrap().clone() {
+                let ours = self
+                    .services
+                    .name_of(d.row)
+                    .map(|n| n.as_str().to_string())
+                    .unwrap_or_else(|| format!("hash:0x{:016x}", d.ours));
+                let theirs = self
+                    .services
+                    .service_names()
+                    .into_iter()
+                    .flatten()
+                    .find(|n| n.hash() == d.theirs)
+                    .map(|n| n.as_str().to_string())
+                    .unwrap_or_else(|| format!("hash:0x{:016x}", d.theirs));
+                if identity_moved {
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_session_refused",
+                        node = self.id as u64,
+                        reason = "identity mismatch",
+                        total = now.1,
+                        row = d.row as u64,
+                        ours = ours.as_str(),
+                        theirs = theirs.as_str(),
+                    );
+                }
+                if version_moved {
+                    let ours_version = uc_protocol::identity::VersionDisplay(d.ours_version);
+                    let theirs_version = uc_protocol::identity::VersionDisplay(d.theirs_version);
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_session_refused",
+                        node = self.id as u64,
+                        reason = "version mismatch",
+                        total = now.2,
+                        row = d.row as u64,
+                        ours = ours.as_str(),
+                        theirs = theirs.as_str(),
+                        ours_version = ours_version.to_string().as_str(),
+                        theirs_version = theirs_version.to_string().as_str(),
+                    );
+                }
+            }
         }
         self.last_snap_refusals = now;
     }
@@ -6249,8 +6314,22 @@ fn snapshot_set_for(
         // replay from 0 (spec §14.3's "moot" case).
         return decline(SNAP_DECLINE_FLOOR_ZERO, "floor 0");
     }
-    let mask = services.ring_mask();
+    // Ruling 1 (controller, wire 0.7.0): a harness node with nothing
+    // declared (`ServicesConfig::none_for_tests`) must never open a
+    // snapshot session — `identity_hashes()` reads all-zero there, so
+    // `identity_mask` would too, indistinguishable from a genuinely empty
+    // declared set rather than "row 0 stands in for clients" (`ring_mask`'s
+    // fallback, which this function must NOT inherit). Refuse by the same
+    // named reason a missing artifact uses.
+    if services.count() == 0 {
+        return decline(SNAP_DECLINE_MISSING, "missing artifact");
+    }
+    // Wire 0.7.0 (spec §5): `services_declared` is DERIVED from `identity`,
+    // never set independently — see [`identity_mask`].
+    let identity = services.identity_hashes();
+    let mask = identity_mask(&identity);
     let mut artifacts = Vec::new();
+    let mut version = [0u32; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
     for id in services.ring_ids() {
         let pos = cnc.service_slot(id as usize).snapshot_pos.load_acquire();
         if pos == 0 {
@@ -6273,6 +6352,7 @@ fn snapshot_set_for(
         if len == 0 {
             return decline(SNAP_DECLINE_MISSING, "missing artifact");
         }
+        version[id as usize] = cnc.service_slot(id as usize).status.version();
         artifacts.push(SnapArtifact {
             service_id: id,
             snapshot_pos: pos,
@@ -6295,6 +6375,8 @@ fn snapshot_set_for(
     decline_reason.store(SNAP_DECLINE_NONE, Ordering::Relaxed);
     Some(SnapshotSet {
         services_declared: mask,
+        identity,
+        version,
         config: config_bytes.lock().unwrap().clone(),
         artifacts,
     })
@@ -6552,7 +6634,7 @@ mod tests {
             svc_query,
             services: ServicesConfig::none_for_tests(),
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
-            last_snap_refusals: (0, 0),
+            last_snap_refusals: (0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
@@ -10057,5 +10139,31 @@ mod tests {
             SNAP_DECLINE_MISSING,
             "after a success, the same reason names itself once more"
         );
+    }
+
+    /// Ruling 1 (controller, wire 0.7.0 plan): a harness node with nothing
+    /// declared (`ServicesConfig::none_for_tests`) must NEVER open a snapshot
+    /// session, even with a floor and a row-0 artifact present. Without this,
+    /// `identity_hashes()` reads all-zero, `identity_mask` reads 0 too, and a
+    /// zero-artifact set would look like a covering (empty) set rather than
+    /// the harness-only "row 0 stands in for clients" fiction `ring_mask`
+    /// applies everywhere else.
+    #[test]
+    fn a_none_for_tests_node_never_opens_a_snapshot_session() {
+        let dir = decline_scratch();
+        let root = dir.path().join("snapshots");
+        let cnc = test_cnc();
+        let services = crate::services::ServicesConfig::none_for_tests();
+        let config_bytes = Mutex::new(Vec::new());
+        let latch = AtomicU8::new(SNAP_DECLINE_NONE);
+        cnc.snapshots().node_snapshot_floor.store_release(4096);
+        cnc.service_slot(0).snapshot_pos.store_release(1024);
+        write_artifact(&root, 0, 1024, b"fsm-0 artifact");
+        let set = snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
+        assert!(
+            set.is_none(),
+            "a none_for_tests node must never ship a snapshot set"
+        );
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
     }
 }

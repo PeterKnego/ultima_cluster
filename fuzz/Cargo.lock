@@ -923,7 +923,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uc_client"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -935,11 +935,11 @@ dependencies = [
 
 [[package]]
 name = "uc_consensus"
-version = "2.9.0"
+version = "2.10.0"
 
 [[package]]
 name = "uc_crypto"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "uc_gateway"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -985,13 +985,14 @@ dependencies = [
  "toml",
  "uc_client",
  "uc_log",
+ "uc_obs",
  "uc_protocol",
  "uc_remote",
 ]
 
 [[package]]
 name = "uc_journal"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1002,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "uc_log"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "crc32fast",
  "memmap2",
@@ -1015,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "uc_net"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "uc_crypto",
  "uc_journal",
@@ -1025,13 +1026,14 @@ dependencies = [
 
 [[package]]
 name = "uc_node"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "clap",
  "fs2",
  "libc",
  "rand",
  "serde",
+ "sha2",
  "signal-hook",
  "thiserror",
  "toml",
@@ -1040,12 +1042,17 @@ dependencies = [
  "uc_journal",
  "uc_log",
  "uc_net",
+ "uc_obs",
  "uc_protocol",
 ]
 
 [[package]]
+name = "uc_obs"
+version = "2.10.0"
+
+[[package]]
 name = "uc_protocol"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -1059,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "uc_remote"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "bytes",
  "thiserror",
@@ -1067,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "uc_service"
-version = "2.9.0"
+version = "2.10.0"
 dependencies = [
  "bincode",
  "fs2",

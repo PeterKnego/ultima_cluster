@@ -62,7 +62,17 @@ impl ProtocolVersion {
 // is documentary and is not itself checked on any receive path** — the flag
 // day rests on the standing operational rule (upgrade all nodes together,
 // `docs/how-to/upgrade-a-cluster.md`), not on a version gate.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 6, 0);
+// 0.7.0 (FSM identity, spec §5): `DGRAM_KIND_SNAP_BEGIN`'s body drops the
+// single `services_declared` bitmask and instead carries two per-row arrays
+// — `identity` (8 × u64 FSM name hashes) and `version` (8 × u32 packed
+// service versions), growing its fixed part from 34 to 122 bytes
+// (`SNAP_BEGIN_FIXED_LEN`). A receiver now compares declared FSMs
+// **positionally, by name** rather than by row-count alone, and refuses a
+// 0.6.0-or-earlier body by its `layout` discriminator
+// (`SNAP_BEGIN_LAYOUT_V2`). As with 0.6.0 this alters only the snapshot-
+// session body; the flag day rests on the standing operational rule, not a
+// version gate.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 7, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]
@@ -99,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn current_is_the_m14c_snapshot_wire() {
-        assert_eq!(CURRENT, ProtocolVersion::new(0, 6, 0));
+    fn current_is_the_fsm_identity_wire() {
+        assert_eq!(CURRENT, ProtocolVersion::new(0, 7, 0));
     }
 }

@@ -38,7 +38,7 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
     DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V2, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
+    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V3, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
     SnapNakBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
     read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
     read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
@@ -444,6 +444,32 @@ pub const SNAP_INTAKE_TIMEOUT_NS: u64 = 60_000_000_000; // 60s
 /// and clearing the obstacle still publishes within a quarter second.
 pub const SNAP_REDRIVE_INTERVAL_NS: u64 = 250_000_000; // 250ms
 
+/// Which half of a `SNAP_BEGIN` positional comparison failed — see
+/// [`FollowerStats::identity_refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// Row `r`'s FSM name hash disagreed (or named a row outside the local
+    /// declared mask).
+    Identity,
+    /// Row `r`'s name agreed but both sides' nonzero packed version disagreed.
+    Version,
+}
+
+/// Detail of the most recent `SNAP_BEGIN` identity/version refusal — wire
+/// 0.7.0 (spec §5, §8). `row` is the first row at which the two sides'
+/// arrays disagreed; `ours`/`theirs` are that row's identity hash on each
+/// side; `ours_version`/`theirs_version` are that row's packed version
+/// (0 = unknown; only populated meaningfully for `RefusalKind::Version`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityRefusal {
+    pub row: u8,
+    pub ours: u64,
+    pub theirs: u64,
+    pub ours_version: u32,
+    pub theirs_version: u32,
+    pub kind: RefusalKind,
+}
+
 #[derive(Default)]
 pub struct FollowerStats {
     pub datagrams: AtomicU64,
@@ -545,21 +571,37 @@ pub struct FollowerStats {
     /// `SNAP_DONE` costs only the leader's session slot, which times out —
     /// the local artifact is already renamed and installed by then.
     pub seal_failures: AtomicU64,
-    /// M14c (spec §14.3): a `SNAP_BEGIN` arrived whose `layout` byte is not
-    /// [`SNAP_BEGIN_LAYOUT_V2`] — the named refusal **`peer wire 0.5.0`**. The
-    /// session is dropped. NOTE this is the *defensive* half: a genuine 0.5.0
-    /// body is only 26 bytes plus its config and is usually dropped by
-    /// `read_snap_begin_body`'s length check before it ever gets here; this
-    /// fires when a 0.5.0 body happens to reach 34 bytes (an 8-byte-or-longer
-    /// carried config — i.e. every configured cluster). The follower keeps
+    /// A `SNAP_BEGIN` arrived whose `layout` byte is not
+    /// [`SNAP_BEGIN_LAYOUT_V3`] — the named refusal **`peer wire ≤ 0.6.0`**.
+    /// The session is dropped. NOTE this is the *defensive* half: a genuine
+    /// pre-0.7.0 body is shorter than [`SNAP_BEGIN_FIXED_LEN`] and is usually
+    /// dropped by `read_snap_begin_body`'s length check before it ever gets
+    /// here; this fires when a legacy-shaped body happens to reach the 0.7.0
+    /// fixed length (a long-enough carried config). The follower keeps
     /// NAKing; the operator sees the counter and finishes the flag day.
     pub snap_refused_legacy_peer: AtomicU64,
-    /// M14c (spec §8, §14.3): a `SNAP_BEGIN` arrived whose `services_declared`
-    /// differs from this node's own declared mask (or that names a service id
-    /// outside it) — the named refusal **`declared-set mismatch`**. The session
-    /// is dropped: installing a set that does not cover this node's FSMs would
-    /// strand one below an adopted floor. Declared sets must match cluster-wide.
+    /// Wire 0.7.0 (spec §5, §8): a `SNAP_BEGIN` arrived whose `identity`
+    /// array differs from this node's own at some row (an identity/name
+    /// mismatch), or that names a service id outside its own declared mask —
+    /// the named refusal **`identity (name) mismatch at some row`**. The
+    /// session is dropped: installing a set that does not name this node's
+    /// FSMs, row for row, would strand one below an adopted floor, or attach
+    /// the wrong service under a shared row. Declared identities must match
+    /// cluster-wide, positionally. See [`FollowerStats::identity_refusal`]
+    /// for the offending row's detail.
     pub snap_refused_declared_mismatch: AtomicU64,
+    /// Wire 0.7.0 (spec §5, §8): a `SNAP_BEGIN` arrived whose identity
+    /// matched at every row but whose `version` differed from this node's own
+    /// at some row where BOTH sides report a nonzero version — the named
+    /// refusal **`version mismatch`**. An unversioned side (0) is never a
+    /// mismatch: it means "unknown," not "empty." See
+    /// [`FollowerStats::identity_refusal`] for the offending row's detail.
+    pub snap_refused_version_mismatch: AtomicU64,
+    /// Detail for the most recent identity/version refusal on this receiver
+    /// — the row, both sides' hash, both sides' version, and which kind of
+    /// mismatch it was. `None` until the first refusal. Touched only on the
+    /// (rare) refusal path, never on the hot chunk-receive path.
+    pub identity_refusal: Mutex<Option<IdentityRefusal>>,
     /// M14c review round 2: a local I/O failure on the snapshot INTAKE path —
     /// a `.part` that could not be created/sized (`open_snap_part`), or a
     /// completed artifact whose `sync_all`/`rename` failed. None of these are
@@ -594,8 +636,8 @@ pub struct FollowerStats {
     /// `SNAP_DONE` comes back, so on a flag day that counter climbs at the
     /// resend rate and says nothing about how many distinct sessions were
     /// refused. This one does — and it also separates the two halves of the
-    /// `peer wire 0.5.0` refusal (a body too short to decode vs. a decodable
-    /// body carrying `layout != SNAP_BEGIN_LAYOUT_V2`), which
+    /// `peer wire ≤ 0.6.0` refusal (a body too short to decode vs. a decodable
+    /// body carrying `layout != SNAP_BEGIN_LAYOUT_V3`), which
     /// `snap_refused_legacy_peer` deliberately folds together.
     pub snap_begin_undecodable: AtomicU64,
 }
@@ -644,9 +686,15 @@ struct SnapPart {
 struct SnapIntake {
     peer: SocketAddr,
     session: u32,
-    /// From the session's first `SNAP_BEGIN`; equals this node's own mask (a
-    /// difference is refused before an intake ever opens).
-    services_declared: u64,
+    /// From the session's first `SNAP_BEGIN`; equals this node's own
+    /// `own_identity` positionally (a difference is refused before an
+    /// intake ever opens). The declared-FSM bitmask this session covers is
+    /// derived from it via [`crate::sender::identity_mask`], never stored
+    /// separately.
+    identity: [u64; 8],
+    /// From the session's first `SNAP_BEGIN`, alongside `identity` — rides
+    /// back out on the `SNAP_DONE` echo.
+    version: [u32; 8],
     /// Bit `i` set ⇔ id `i`'s artifact is complete and renamed.
     received: u64,
     /// Announced artifacts, ascending, contiguous in `base`.
@@ -741,9 +789,16 @@ pub struct FollowerReceiver {
     /// inbound transfers; each artifact lands under `<root>/<service_id>/`.
     /// `None` = this node never receives snapshots (no intake).
     snap_dir: Option<PathBuf>,
-    /// M14c: this node's own declared FSM mask, compared against every
-    /// session's `services_declared`. Set by `set_snapshot_intake`.
-    own_declared: u64,
+    /// Wire 0.7.0: this node's own row-`r` FSM identity hash, compared
+    /// positionally against every session's `SNAP_BEGIN.identity`. Set by
+    /// `set_snapshot_intake`.
+    own_identity: [u64; 8],
+    /// Wire 0.7.0: closure returning this node's own row-`r` attached
+    /// service's packed version, read fresh on every `SNAP_BEGIN` (the cnc
+    /// slot can change under a running node). `None` only in unit tests that
+    /// construct a receiver without an intake — no version comparison is
+    /// then possible or attempted. Set by `set_snapshot_intake`.
+    own_versions: Option<Arc<dyn Fn() -> [u32; 8] + Send + Sync>>,
     /// M6 Task 6: the in-flight inbound snapshot transfer, if any.
     snap_intake: Option<SnapIntake>,
     /// M14c2 (T10a): an undecodable `SNAP_BEGIN` has already been counted (and
@@ -985,7 +1040,8 @@ impl FollowerReceiver {
             gate: None,
             activity_emitted: false,
             snap_dir: None,
-            own_declared: 0,
+            own_identity: [0; 8],
+            own_versions: None,
             snap_intake: None,
             snap_begin_undecodable_latched: false,
             snap_last_done: None,
@@ -1099,25 +1155,32 @@ impl FollowerReceiver {
         self.straddle_hook = Some(hook);
     }
 
-    /// M6 Task 6 / M14c: enable INBOUND snapshot transfers. `snap_root` is the
-    /// `snapshots/` directory the per-id `.part`/final artifacts land under
-    /// (`<root>/<id>/`); `own_declared` is this node's declared FSM bitmask,
-    /// which every session's `SNAP_BEGIN` must match (`declared-set mismatch`);
-    /// `incoming` (if set) is `(position, config)`: the position cell receives
-    /// each COMPLETED session's floor — the MINIMUM over the received artifact
-    /// positions — for the consensus agent to adopt as an archive floor, and
-    /// (M7 Task 6) the config cell receives that session's carried
-    /// `SNAP_BEGIN.config` bytes for the agent's `adopt_snapshot_config`
-    /// handler. Without this call kinds 12/13 are ignored (a node that never
-    /// joins below a floor never receives snapshots).
+    /// M6 Task 6 / M14c / wire 0.7.0: enable INBOUND snapshot transfers.
+    /// `snap_root` is the `snapshots/` directory the per-id `.part`/final
+    /// artifacts land under (`<root>/<id>/`); `own_identity` is this node's
+    /// own row-`r` FSM identity hash, which every session's
+    /// `SNAP_BEGIN.identity` must match POSITIONALLY (`identity (name)
+    /// mismatch`); `own_versions` is a closure returning this node's own
+    /// row-`r` attached service's packed version, read fresh on every
+    /// `SNAP_BEGIN` for the version comparison (both sides nonzero and
+    /// disagreeing = refused); `incoming` (if set) is `(position, config)`:
+    /// the position cell receives each COMPLETED session's floor — the
+    /// MINIMUM over the received artifact positions — for the consensus
+    /// agent to adopt as an archive floor, and (M7 Task 6) the config cell
+    /// receives that session's carried `SNAP_BEGIN.config` bytes for the
+    /// agent's `adopt_snapshot_config` handler. Without this call kinds
+    /// 12/13 are ignored (a node that never joins below a floor never
+    /// receives snapshots).
     pub fn set_snapshot_intake(
         &mut self,
         snap_root: PathBuf,
-        own_declared: u64,
+        own_identity: [u64; 8],
+        own_versions: Arc<dyn Fn() -> [u32; 8] + Send + Sync>,
         incoming: Option<IncomingSnapshotSignal>,
     ) {
         self.snap_dir = Some(snap_root);
-        self.own_declared = own_declared;
+        self.own_identity = own_identity;
+        self.own_versions = Some(own_versions);
         if let Some((pos, config)) = incoming {
             self.incoming_snapshot_pos = Some(pos);
             self.incoming_snapshot_config = Some(config);
@@ -1831,24 +1894,55 @@ impl FollowerReceiver {
         // Read once, up front: every liveness stamp below is taken under a
         // `&mut self.snap_intake` borrow that excludes `self.now_ns()`.
         let now = self.now_ns();
-        if b.layout != SNAP_BEGIN_LAYOUT_V2 {
-            // "peer wire 0.5.0" — a body whose discriminator we do not speak.
+        if b.layout != SNAP_BEGIN_LAYOUT_V3 {
+            // "peer wire ≤ 0.6.0" — a body whose discriminator we do not speak.
             self.stats
                 .snap_refused_legacy_peer
                 .fetch_add(1, Ordering::Relaxed);
             self.snap_drop_intake_from(from);
             return;
         }
-        // The id must be inside the mask, and the mask must be OURS. A shift by
-        // an id >= 64 is not representable — `checked_shl` folds that into the
-        // same refusal rather than panicking in debug.
+        // The id must be inside the sender's own declared mask, and the two
+        // sides' identities must agree at EVERY row, positionally by name —
+        // not just at `service_id`'s row (spec §5, §8).
         let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
-        if b.services_declared != self.own_declared || b.services_declared & bit == 0 {
+        if b.identity != self.own_identity || b.declared_mask() & bit == 0 {
+            let row = (0..8)
+                .find(|&r| b.identity[r] != self.own_identity[r])
+                .unwrap_or(b.service_id as usize) as u8;
+            *self.stats.identity_refusal.lock().unwrap() = Some(IdentityRefusal {
+                row,
+                ours: self.own_identity[row as usize],
+                theirs: b.identity[row as usize],
+                ours_version: 0,
+                theirs_version: 0,
+                kind: RefusalKind::Identity,
+            });
             self.stats
                 .snap_refused_declared_mismatch
                 .fetch_add(1, Ordering::Relaxed);
             self.snap_drop_intake_from(from);
             return;
+        }
+        if let Some(own) = &self.own_versions {
+            let ours = own();
+            if let Some(r) =
+                (0..8).find(|&r| ours[r] != 0 && b.version[r] != 0 && ours[r] != b.version[r])
+            {
+                *self.stats.identity_refusal.lock().unwrap() = Some(IdentityRefusal {
+                    row: r as u8,
+                    ours: self.own_identity[r],
+                    theirs: b.identity[r],
+                    ours_version: ours[r],
+                    theirs_version: b.version[r],
+                    kind: RefusalKind::Version,
+                });
+                self.stats
+                    .snap_refused_version_mismatch
+                    .fetch_add(1, Ordering::Relaxed);
+                self.snap_drop_intake_from(from);
+                return;
+            }
         }
         if b.total_len == 0 {
             return;
@@ -1889,7 +1983,7 @@ impl FollowerReceiver {
             // one at `announced_len` anyway would give two FSMs each other's
             // bytes — a silent mis-install, not a stall. Drop it and prompt.
             let expect = next_declared_id(
-                cur.services_declared,
+                crate::sender::identity_mask(&cur.identity),
                 cur.parts.last().map(|p| p.service_id),
             );
             if Some(b.service_id) != expect {
@@ -1919,7 +2013,7 @@ impl FollowerReceiver {
         // A new session (or one replacing a stale one). Same placement rule: a
         // session's FIRST artifact is the lowest declared id — anything else is
         // a session already under way whose opening BEGIN we never saw.
-        if Some(b.service_id) != next_declared_id(b.services_declared, None) {
+        if Some(b.service_id) != next_declared_id(b.declared_mask(), None) {
             self.snap_probe_missing_begin(from, b.session, 0);
             return;
         }
@@ -1936,7 +2030,8 @@ impl FollowerReceiver {
         self.snap_intake = Some(SnapIntake {
             peer: from,
             session: b.session,
-            services_declared: b.services_declared,
+            identity: b.identity,
+            version: b.version,
             received: 0,
             parts: vec![part],
             announced_len,
@@ -2122,7 +2217,7 @@ impl FollowerReceiver {
         // Nothing blocked this pass: disarm, so the next completion publishes
         // the instant its bytes land.
         intake.last_publish_try_ns = None;
-        if intake.received != intake.services_declared {
+        if intake.received != crate::sender::identity_mask(&intake.identity) {
             return; // the set is incomplete — no floor is adopted yet
         }
         self.snap_complete();
@@ -2149,11 +2244,12 @@ impl FollowerReceiver {
         // closes its session (it keys on `(peer, session)` alone).
         let ack = SnapBeginBody {
             session: intake.session,
-            layout: SNAP_BEGIN_LAYOUT_V2,
+            layout: SNAP_BEGIN_LAYOUT_V3,
             service_id: last.service_id,
             snapshot_pos: last.snapshot_pos,
             total_len: last.len,
-            services_declared: intake.services_declared,
+            identity: intake.identity,
+            version: intake.version,
             config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
         };
         // M8 (T17): sealed or dropped. A dropped DONE costs only the leader's
@@ -2209,11 +2305,12 @@ impl FollowerReceiver {
             &mut d[DATAGRAM_HEADER_LEN..],
             &SnapBeginBody {
                 session: b.session,
-                layout: SNAP_BEGIN_LAYOUT_V2,
+                layout: SNAP_BEGIN_LAYOUT_V3,
                 service_id: b.service_id,
                 snapshot_pos: b.snapshot_pos,
                 total_len: b.total_len,
-                services_declared: b.services_declared,
+                identity: b.identity,
+                version: b.version,
                 config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
@@ -2358,7 +2455,7 @@ impl FollowerReceiver {
             // is also the ordinary steady state a beat before the leader ships
             // it, where the probe costs one datagram and hurries it along.)
             .or({
-                if intake.received != intake.services_declared {
+                if intake.received != crate::sender::identity_mask(&intake.identity) {
                     Some((announced_len, announced_len + 1))
                 } else {
                     None
@@ -4976,7 +5073,12 @@ mod tests {
     fn the_snapshot_intakes_snap_nak_and_snap_done_are_sealed() {
         let (mut r, mut peer, _b) = receiver_with_crypto();
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let to = r.local_addr();
 
         // Open a session of 64 bytes, then deliver ONLY the second half so a
@@ -4987,11 +5089,12 @@ mod tests {
             &mut begin,
             &SnapBeginBody {
                 session: 7,
-                layout: SNAP_BEGIN_LAYOUT_V2,
+                layout: SNAP_BEGIN_LAYOUT_V3,
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: TOTAL,
-                services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: vec![],
             },
         );
@@ -5015,7 +5118,7 @@ mod tests {
         assert_eq!(done.session, 7);
         assert_eq!(done.snapshot_pos, 4096);
         assert_eq!(done.service_id, 0);
-        assert_eq!(done.services_declared, 0b1);
+        assert_eq!(done.declared_mask(), 0b1);
         assert_eq!(
             done_wire.len(),
             DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN + CRYPTO_OVERHEAD,
@@ -5074,7 +5177,12 @@ mod tests {
         use Ordering::Relaxed;
         let (mut r, mut peer, _b) = receiver_with_crypto();
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let to = r.local_addr();
         let st = r.stats();
         let before = st.datagrams.load(Relaxed);
@@ -5087,11 +5195,12 @@ mod tests {
             &mut body,
             &SnapBeginBody {
                 session: 1,
-                layout: SNAP_BEGIN_LAYOUT_V2,
+                layout: SNAP_BEGIN_LAYOUT_V3,
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 32,
-                services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: hostile.clone(),
             },
         );
@@ -5137,7 +5246,12 @@ mod tests {
         use Ordering::Relaxed;
         let (mut r, mut peer, _b) = receiver_with_crypto();
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let to = r.local_addr();
         let st = r.stats();
 
@@ -5148,11 +5262,12 @@ mod tests {
             &mut begin,
             &SnapBeginBody {
                 session: 3,
-                layout: SNAP_BEGIN_LAYOUT_V2,
+                layout: SNAP_BEGIN_LAYOUT_V3,
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 64,
-                services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: vec![],
             },
         );
@@ -5209,6 +5324,20 @@ mod tests {
 
     // ---- M14c: the per-id intake's placement guard, probe and DONE latch ----
 
+    /// A nonzero placeholder identity hash per set bit of `mask` — enough for
+    /// `crate::sender::identity_mask(&ident(mask)) == mask` to hold, which is
+    /// all these tests need (they exercise artifact/mask covering and
+    /// placement, not real names).
+    fn ident(mask: u64) -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for (i, h) in out.iter_mut().enumerate() {
+            if mask & (1 << i) != 0 {
+                *h = 0xF00D_0000_0000_0000 | (i as u64 + 1);
+            }
+        }
+        out
+    }
+
     /// A `SNAP_BEGIN` body as the leader ships it (fixed part only, no config).
     fn snap_begin_wire(session: u32, id: u8, pos: u64, len: u64, declared: u64) -> Vec<u8> {
         let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN];
@@ -5216,11 +5345,12 @@ mod tests {
             &mut body,
             &SnapBeginBody {
                 session,
-                layout: SNAP_BEGIN_LAYOUT_V2,
+                layout: SNAP_BEGIN_LAYOUT_V3,
                 service_id: id,
                 snapshot_pos: pos,
                 total_len: len,
-                services_declared: declared,
+                identity: ident(declared),
+                version: [0; 8],
                 config: vec![],
             },
         );
@@ -5265,7 +5395,12 @@ mod tests {
     fn a_begin_that_skips_a_declared_id_is_not_placed_and_prompts_for_the_missing_one() {
         let (mut r, mut peer, _b) = receiver_with_crypto();
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b111, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b111),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         // Pin the intake's own NAK timer far into the future: every SNAP_NAK
         // this test sees is then unambiguously the missing-BEGIN probe, never
         // an ordinary gap NAK (artifact 0's 64 bytes never arrive here).
@@ -5369,7 +5504,12 @@ mod tests {
     fn a_begin_re_sent_after_the_session_completed_is_re_acked_not_re_downloaded() {
         let (mut r, mut peer, _b) = receiver_with_crypto();
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let to = r.local_addr();
         let begin = snap_begin_wire(21, 0, 4096, 64, 0b1);
 
@@ -5408,7 +5548,12 @@ mod tests {
         let mut stranger = FakeLeader::new();
         let mut r = follower(&b, leader.addr());
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let st = r.stats();
         let to = r.local_addr();
 
@@ -5436,11 +5581,12 @@ mod tests {
             &mut legacy,
             &SnapBeginBody {
                 session: 4,
-                layout: 0, // a 0.5.0-shaped body
+                layout: 0, // a pre-0.7.0-shaped body
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 64,
-                services_declared: 0b1,
+                identity: ident(0b1),
+                version: [0; 8],
                 config: vec![],
             },
         );
@@ -5488,7 +5634,12 @@ mod tests {
         let mut leader = FakeLeader::new();
         let mut r = follower(&b, leader.addr());
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let to = r.local_addr();
 
         leader.send(
@@ -5544,7 +5695,12 @@ mod tests {
         let mut leader = FakeLeader::new();
         let mut r = follower(b, leader.addr());
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let to = r.local_addr();
         leader.send(
             to,
@@ -5663,7 +5819,12 @@ mod tests {
         let mut leader = FakeLeader::new();
         let mut r = follower(&b, leader.addr());
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let st = r.stats();
         let to = r.local_addr();
 
@@ -5822,7 +5983,12 @@ mod tests {
         let mut leader = FakeLeader::new();
         let mut r = follower(&b, leader.addr());
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b1, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let st = r.stats();
         let to = r.local_addr();
         // A DIRECTORY on the artifact's final path: the rename of the completed
@@ -5898,7 +6064,12 @@ mod tests {
         let mut leader = FakeLeader::new();
         let mut r = follower(&b, leader.addr());
         let dir = snap_scratch_dir();
-        r.set_snapshot_intake(dir.path().to_path_buf(), 0b11, None);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b11),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
         let st = r.stats();
         let to = r.local_addr();
         // A DIRECTORY on artifact 0's final path: its rename fails on every

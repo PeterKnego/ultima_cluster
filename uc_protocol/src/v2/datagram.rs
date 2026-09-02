@@ -164,16 +164,23 @@ pub const DGRAM_KIND_CONFIG_PROPOSAL: u8 = 16;
 /// M7: leader→follower reply for a forwarded proposal. Body = `ConfigReplyBody`.
 pub const DGRAM_KIND_CONFIG_REPLY: u8 = 17;
 
-/// Fixed part of a [`SnapBeginBody`] (wire 0.6.0, M14c). 0.5.0's was 26; the
-/// 0.6.0 body reuses the old 4-byte pad for `layout` + `service_id` and
-/// inserts an 8-byte `services_declared` word before `config_len`. A 0.5.0
-/// body is therefore *shorter* than this and is dropped by
-/// [`read_snap_begin_body`]'s length check.
-pub const SNAP_BEGIN_FIXED_LEN: usize = 34;
+/// Fixed part of a [`SnapBeginBody`] (wire 0.7.0, FSM identity). 0.6.0's was
+/// 34; the 0.7.0 body replaces the single `services_declared` word with two
+/// per-row arrays — `identity` (8 × u64 FSM name hashes) and `version` (8 ×
+/// u32 packed service versions) — so the receiver can compare declared FSMs
+/// **by name, positionally**, not just by a bitmask. A 0.6.0 body is
+/// therefore *shorter* than this and is dropped by [`read_snap_begin_body`]'s
+/// length check.
+pub const SNAP_BEGIN_FIXED_LEN: usize = 122;
 
-/// The value [`SnapBeginBody::layout`] carries on wire 0.6.0. `0` is what a
-/// 0.5.0 sender's pad byte reads as — see [`read_snap_begin_body`].
+/// The value [`SnapBeginBody::layout`] carried on wire 0.6.0. A 0.7.0
+/// receiver refuses a body carrying this discriminator by name
+/// ("peer wire ≤ 0.6.0") rather than misreading its `services_declared` word
+/// as an `identity` array.
 pub const SNAP_BEGIN_LAYOUT_V2: u8 = 1;
+
+/// The value [`SnapBeginBody::layout`] carries on wire 0.7.0.
+pub const SNAP_BEGIN_LAYOUT_V3: u8 = 2;
 
 pub const CONFIG_PROPOSAL_BODY_LEN: usize = 22;
 
@@ -242,21 +249,24 @@ pub fn read_config_reply_body(buf: &[u8]) -> Option<ConfigReplyBody> {
 
 /// Opens (and, echoed back, acks) one artifact of a snapshot session.
 ///
-/// **M14c / wire 0.6.0.** A session is a *stream of artifacts* — one BEGIN per
-/// declared FSM, ascending by id, each followed by that artifact's chunks;
-/// chunk offsets are stream-global, so `SNAP_NAK` repair is byte-identical to
-/// 0.5.0 (spec §14.3). `session` scopes chunk/NAK traffic to one transfer;
-/// `layout` is the body discriminator (`SNAP_BEGIN_LAYOUT_V2` on 0.6.0);
-/// `service_id` names which FSM's artifact this is; `snapshot_pos` is the
-/// artifact's tag `S`; `total_len` is THAT artifact's file size (the receiver
-/// pre-sizes its `.part` to it); `services_declared` is the sender's declared
-/// FSM bitmask, which the receiver compares against its own and which tells it
-/// how many artifacts complete the session; `config` is the length-prefixed
-/// encoded config (M7, empty for M6), identical on every BEGIN of a session.
+/// **Wire 0.7.0 (FSM identity, spec §5).** A session is a *stream of
+/// artifacts* — one BEGIN per declared FSM, ascending by id, each followed by
+/// that artifact's chunks; chunk offsets are stream-global, so `SNAP_NAK`
+/// repair is byte-identical to 0.5.0/0.6.0 (spec §14.3). `session` scopes
+/// chunk/NAK traffic to one transfer; `layout` is the body discriminator
+/// (`SNAP_BEGIN_LAYOUT_V3` on 0.7.0); `service_id` names which FSM's artifact
+/// this is; `snapshot_pos` is the artifact's tag `S`; `total_len` is THAT
+/// artifact's file size (the receiver pre-sizes its `.part` to it);
+/// `identity[r]` is the sender's row-`r` FSM identity hash, `0` = undeclared;
+/// `version[r]` its attached service's packed version, `0` = unknown; the
+/// receiver compares both **positionally** and refuses by name — spec §5;
+/// `config` is the length-prefixed encoded config (M7), identical on every
+/// BEGIN of a session.
 ///
 /// LE: session 0..4, layout 4, service_id 5, 6..8 zero (u64 alignment for
 /// `snapshot_pos`), snapshot_pos 8..16, total_len 16..24,
-/// services_declared 24..32, config_len u16 32..34, config bytes 34...
+/// identity 24..88 (8 × u64), version 88..120 (8 × u32),
+/// config_len u16 120..122, config bytes 122...
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapBeginBody {
     pub session: u32,
@@ -264,13 +274,26 @@ pub struct SnapBeginBody {
     pub service_id: u8,
     pub snapshot_pos: u64,
     pub total_len: u64,
-    pub services_declared: u64,
+    pub identity: [u64; 8],
+    pub version: [u32; 8],
     pub config: Vec<u8>,
 }
 
+impl SnapBeginBody {
+    /// The declared-FSM bitmask implied by `identity`: bit `r` set iff
+    /// `identity[r] != 0`. Replaces the wire-0.6.0 `services_declared` word,
+    /// which is now derived rather than sent (spec §5).
+    pub fn declared_mask(&self) -> u64 {
+        self.identity
+            .iter()
+            .enumerate()
+            .fold(0u64, |m, (i, h)| if *h != 0 { m | (1 << i) } else { m })
+    }
+}
+
 /// Encode a snap-begin body. `layout` is written verbatim — production callers
-/// pass [`SNAP_BEGIN_LAYOUT_V2`]; a test forging a legacy-discriminator body
-/// passes 0.
+/// pass [`SNAP_BEGIN_LAYOUT_V3`]; a test forging a legacy-discriminator body
+/// passes [`SNAP_BEGIN_LAYOUT_V2`] or 0.
 pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
     buf[0..4].copy_from_slice(&b.session.to_le_bytes());
     buf[4] = b.layout;
@@ -278,10 +301,15 @@ pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
     buf[6..8].fill(0);
     buf[8..16].copy_from_slice(&b.snapshot_pos.to_le_bytes());
     buf[16..24].copy_from_slice(&b.total_len.to_le_bytes());
-    buf[24..32].copy_from_slice(&b.services_declared.to_le_bytes());
-    buf[32..34].copy_from_slice(&(b.config.len() as u16).to_le_bytes());
+    for (i, h) in b.identity.iter().enumerate() {
+        buf[24 + i * 8..32 + i * 8].copy_from_slice(&h.to_le_bytes());
+    }
+    for (i, v) in b.version.iter().enumerate() {
+        buf[88 + i * 4..92 + i * 4].copy_from_slice(&v.to_le_bytes());
+    }
+    buf[120..122].copy_from_slice(&(b.config.len() as u16).to_le_bytes());
     if !b.config.is_empty() {
-        buf[34..34 + b.config.len()].copy_from_slice(&b.config);
+        buf[122..122 + b.config.len()].copy_from_slice(&b.config);
     }
 }
 
@@ -289,18 +317,27 @@ pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
 /// [`SNAP_BEGIN_FIXED_LEN`] or than the `config_len` it declares (the caller
 /// drops a malformed datagram).
 ///
-/// **Total for every `layout` value, including 0.** Deciding what an unknown
-/// discriminator means is the receiving node's job, not the decoder's: it
-/// counts a named refusal (`peer wire 0.5.0`) and drops the session, which is
+/// **Total for every `layout` value, including 0 and
+/// [`SNAP_BEGIN_LAYOUT_V2`].** Deciding what an unrecognized discriminator
+/// means is the receiving node's job, not the decoder's: it counts a named
+/// refusal ("peer wire ≤ 0.6.0") and drops the session, which is
 /// diagnosable, where a silent `None` here would be indistinguishable from a
 /// truncated datagram.
 pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
     if buf.len() < SNAP_BEGIN_FIXED_LEN {
         return None;
     }
-    let config_len = u16::from_le_bytes(buf[32..34].try_into().ok()?) as usize;
+    let config_len = u16::from_le_bytes(buf[120..122].try_into().ok()?) as usize;
     if buf.len() < SNAP_BEGIN_FIXED_LEN + config_len {
         return None;
+    }
+    let mut identity = [0u64; 8];
+    for (i, h) in identity.iter_mut().enumerate() {
+        *h = u64::from_le_bytes(buf[24 + i * 8..32 + i * 8].try_into().unwrap());
+    }
+    let mut version = [0u32; 8];
+    for (i, v) in version.iter_mut().enumerate() {
+        *v = u32::from_le_bytes(buf[88 + i * 4..92 + i * 4].try_into().unwrap());
     }
     Some(SnapBeginBody {
         session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
@@ -308,10 +345,16 @@ pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
         service_id: buf[5],
         snapshot_pos: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
         total_len: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-        services_declared: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
-        config: buf[34..34 + config_len].to_vec(),
+        identity,
+        version,
+        config: buf[122..122 + config_len].to_vec(),
     })
 }
+
+// Body budget guard: SNAP_BEGIN_FIXED_LEN + config must stay under the
+// datagram body budget (MTU_DEFAULT - DATAGRAM_HEADER_LEN = 1392). The M7
+// config record is small; 1024 bytes of headroom is generous.
+const _: () = assert!(SNAP_BEGIN_FIXED_LEN + 1024 <= MTU_DEFAULT - DATAGRAM_HEADER_LEN);
 
 pub const SNAP_NAK_BODY_LEN: usize = 16;
 
@@ -754,89 +797,82 @@ mod tests {
     }
 
     #[test]
-    fn snap_begin_body_roundtrips_and_pins_layout() {
-        assert_eq!(SNAP_BEGIN_FIXED_LEN, 34, "0.6.0 fixed part (spec §14.3)");
+    fn snap_begin_body_070_roundtrips_and_pins_layout() {
+        assert_eq!(SNAP_BEGIN_FIXED_LEN, 122);
+        assert_eq!(SNAP_BEGIN_LAYOUT_V3, 2);
+        let mut identity = [0u64; 8];
+        identity[0] = 0x1111_2222_3333_4444;
+        identity[1] = 0x5555_6666_7777_8888;
+        let mut version = [0u32; 8];
+        version[1] = 0x0102_0003;
         let b = SnapBeginBody {
-            session: 0x0A0B_0C0D,
-            layout: SNAP_BEGIN_LAYOUT_V2,
-            service_id: 2,
-            snapshot_pos: 0x1000,
-            total_len: 300 * 1024,
-            services_declared: 0b101,
+            session: 9,
+            layout: SNAP_BEGIN_LAYOUT_V3,
+            service_id: 1,
+            snapshot_pos: 4096,
+            total_len: 77,
+            identity,
+            version,
             config: vec![],
         };
         let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(&mut buf, &b);
-        assert_eq!(read_snap_begin_body(&buf), Some(b));
-        // session=0x0A0B0C0D -> LE [0x0D,0x0C,0x0B,0x0A]; layout=1; service_id=2;
-        // [6..8] zero; snapshot_pos=0x1000 -> LE [0,0x10,0,0,0,0,0,0];
-        // total_len=307200=0x0004_B000 -> LE [0x00,0xB0,0x04,0,0,0,0,0];
-        // services_declared=0b101 -> LE [5,0,0,0,0,0,0,0]; config_len=0 -> LE [0,0].
-        assert_eq!(
-            &buf[..],
-            &[
-                0x0D, 0x0C, 0x0B, 0x0A, 1, 2, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0, 0x04,
-                0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0
-            ]
-        );
-        // Short buffer is rejected (caller drops the datagram).
+        assert_eq!(&buf[0..4], &9u32.to_le_bytes());
+        assert_eq!(buf[4], 2);
+        assert_eq!(buf[5], 1);
+        assert_eq!(&buf[24..32], &identity[0].to_le_bytes());
+        assert_eq!(&buf[32..40], &identity[1].to_le_bytes());
+        assert_eq!(&buf[92..96], &version[1].to_le_bytes());
+        assert_eq!(&buf[120..122], &0u16.to_le_bytes());
+        assert_eq!(read_snap_begin_body(&buf), Some(b.clone()));
+        assert_eq!(b.declared_mask(), 0b11);
         assert_eq!(read_snap_begin_body(&buf[..SNAP_BEGIN_FIXED_LEN - 1]), None);
     }
 
-    /// A wire-0.5.0 sender's SNAP_BEGIN is dropped by the LENGTH check, before
-    /// `layout` is even looked at: its fixed part is 26 bytes. The `layout`
-    /// refusal on the receiving node (M14c, `uc_net`) is therefore defensive —
-    /// it catches a body that is 0.6.0-SHAPED (>= 34 B, which a 0.5.0 body with
-    /// an 8-byte-or-longer config reaches) yet carries layout 0.
     #[test]
-    fn a_wire_050_shaped_snap_begin_is_too_short_and_a_layout_zero_body_decodes() {
-        // The exact 26 bytes a 0.5.0 `write_snap_begin_body` produced.
-        let legacy: [u8; 26] = [
-            0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0, 0x04, 0,
-            0, 0, 0, 0, 0, 0,
-        ];
+    fn a_wire_060_shaped_snap_begin_is_too_short_and_a_layout_one_body_decodes() {
+        // The exact 34-byte fixed part 0.6.0 sent: below the 0.7.0 fixed length.
+        let legacy = [0u8; 34];
         assert_eq!(
             read_snap_begin_body(&legacy),
             None,
-            "26 bytes is below the 0.6.0 fixed part"
+            "34 bytes is below the 0.7.0 fixed part"
         );
-        // 34 bytes with layout 0 DOES decode — the reader is total and hands the
-        // discriminator to the caller, which is what decides (spec §14.3).
+        // A 122-byte body with layout 1 DOES decode — the receiving node
+        // refuses it by name (`peer wire ≤ 0.6.0`), not the decoder.
         let b = SnapBeginBody {
             session: 1,
-            layout: 0,
+            layout: SNAP_BEGIN_LAYOUT_V2,
             service_id: 0,
-            snapshot_pos: 4096,
-            total_len: 64,
-            services_declared: 0,
+            snapshot_pos: 0,
+            total_len: 1,
+            identity: [0; 8],
+            version: [0; 8],
             config: vec![],
         };
         let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(&mut buf, &b);
-        let got = read_snap_begin_body(&buf).expect("a 34-byte body always decodes");
-        assert_eq!(got.layout, 0);
-        assert_eq!(got, b);
+        assert_eq!(read_snap_begin_body(&buf).unwrap().layout, 1);
     }
 
     /// `config` still rides at the end and its length is still re-checked
     /// against the buffer actually received.
     #[test]
     fn snap_begin_config_rides_past_the_fixed_part() {
-        let cfg = vec![0x11u8, 0x22, 0x33, 0x44];
         let b = SnapBeginBody {
-            session: 7,
-            layout: SNAP_BEGIN_LAYOUT_V2,
-            service_id: 1,
-            snapshot_pos: 8192,
-            total_len: 1 << 20,
-            services_declared: 0b11,
-            config: cfg.clone(),
+            session: 1,
+            layout: SNAP_BEGIN_LAYOUT_V3,
+            service_id: 0,
+            snapshot_pos: 0,
+            total_len: 1,
+            identity: [1; 8],
+            version: [0; 8],
+            config: vec![1, 2, 3, 4],
         };
-        let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN + cfg.len()];
+        let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN + 4];
         write_snap_begin_body(&mut buf, &b);
-        assert_eq!(&buf[32..34], &[4, 0], "config_len at [32..34]");
+        assert_eq!(&buf[120..122], &4u16.to_le_bytes());
         assert_eq!(read_snap_begin_body(&buf), Some(b));
-        // Truncated config: refused, not silently short-read.
         assert_eq!(read_snap_begin_body(&buf[..buf.len() - 1]), None);
     }
 

@@ -40,6 +40,40 @@ fn serialize() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Wire 0.7.0 (Ruling 1): `snapshot_set_for` now declines outright for a
+/// `ServicesConfig::none_for_tests()` node — a harness node with nothing
+/// NAMED can never be part of a positional identity exchange, so the tests
+/// below that drive real snapshot sessions need a REAL declared FSM row
+/// instead. But with a row genuinely declared, FSM-lag admission control
+/// (`Consensus::publish_service_mins` / `admission_open`) engages against
+/// `cnc.service_slot(id).applied` — and these tests submit raw bytes through
+/// `Node::submit` with no real service ever attached to advance it, which
+/// would deadlock the submit loop once cumulative `append` crosses the lag
+/// bound. This is a cheap stand-in for "a service is attached and instantly
+/// applying": it mirrors `durable` into `service_slot(id).applied` so
+/// admission never blocks, without pulling in a real `uc_service` (whose own
+/// automatic snapshot builder would race the test's own hand-staged
+/// snapshot floor/artifact). Stop + join it once the submit loop is done —
+/// nothing after that in these tests submits again.
+fn spawn_applied_mirror(
+    cnc: std::sync::Arc<CncPage>,
+    id: usize,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop2 = std::sync::Arc::clone(&stop);
+    let handle = std::thread::spawn(move || {
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let durable = cnc.counters().durable.load_acquire();
+            cnc.service_slot(id).applied.store_release(durable);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    });
+    (stop, handle)
+}
+
 struct NodeH {
     id: NodeId,
     addr: SocketAddr,
@@ -412,7 +446,9 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: SEG,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::none_for_tests(),
+        // Wire 0.7.0 (Ruling 1): a `none_for_tests` node can no longer ship
+        // (or accept) a snapshot session — see `spawn_applied_mirror`'s doc.
+        services: uc_node::ServicesConfig::single("fsm0"),
     };
 
     let v_dir = dir.path().join("v0");
@@ -480,6 +516,14 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         "voter booted from the pre-seeded v1 record"
     );
 
+    // Publish a snapshot floor + a real snapshot file for the sender to ship.
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+
+    // See `spawn_applied_mirror`'s doc: row 0 is now a REAL declared FSM
+    // ("fsm0"), so FSM-lag admission is live against `applied` — mirror it
+    // from `durable` for the duration of the raw submit loop below.
+    let (mirror_stop, mirror_handle) = spawn_applied_mirror(std::sync::Arc::clone(&cnc), 0);
+
     for i in 0u64..24000 {
         let mut p = vec![0u8; PAYLOAD];
         p[..8].copy_from_slice(&i.to_le_bytes());
@@ -495,9 +539,9 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         let a = c.append.load_acquire();
         a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
     });
+    mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mirror_handle.join().unwrap();
 
-    // Publish a snapshot floor + a real snapshot file for the sender to ship.
-    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
     let durable = voter.counters().durable.load_acquire();
     // Frame-aligned (a real service publishes a snapshot at an apply boundary —
     // a 128 B frame end for these 96 B payloads); a mid-frame floor would land the
@@ -937,8 +981,8 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     );
     assert_eq!(
         learner.snapshot_session_refusals(),
-        (0, 0),
-        "matching declared sets and a 0.6.0 peer: neither refusal may fire"
+        (0, 0, 0),
+        "matching declared identities/versions and a wire-0.7.0 peer: no refusal may fire"
     );
     // M14c2 T10b: the two artifacts landing is not by itself the M14c claim —
     // they must have arrived through the snapshot SESSION path, whole. Only the
@@ -1045,20 +1089,26 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         services,
     };
 
-    // The leader declares {0} (a harness node's ring mask), so every SNAP_BEGIN
-    // it sends carries `services_declared = 0b1`.
+    // The leader declares row 0 as "fsm0" (a REAL name — wire 0.7.0 Ruling 1:
+    // a `none_for_tests` node can no longer ship a snapshot session at all,
+    // see `spawn_applied_mirror`'s doc), so every SNAP_BEGIN it sends carries
+    // `identity[0] = hash("fsm0")`.
     let v_dir = dir.path().join("v0");
     let voter = Node::start_with_socket(
         cfg(
             0,
             v_addr,
             v_dir.clone(),
-            uc_node::ServicesConfig::none_for_tests(),
+            uc_node::ServicesConfig::single("fsm0"),
         ),
         v_sock,
     )
     .expect("start voter");
     await_until(30, "voter serves", || voter.can_serve());
+
+    let cnc_for_mirror =
+        CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc for mirror");
+    let (mirror_stop, mirror_handle) = spawn_applied_mirror(cnc_for_mirror, 0);
 
     for i in 0u64..24000 {
         let mut p = vec![0u8; PAYLOAD];
@@ -1075,9 +1125,10 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         let a = c.append.load_acquire();
         a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
     });
+    mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mirror_handle.join().unwrap();
 
-    // Publish a floor + a real artifact for FSM 0, exactly as the single-FSM
-    // join test above does (a `none_for_tests` node publishes no aggregate).
+    // Publish a floor + a real artifact for FSM 0.
     let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
     let durable = voter.counters().durable.load_acquire();
     let floor = (durable / 2) / 128 * 128;
@@ -1117,11 +1168,11 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     assert_eq!(
         learner.snapshot_session_refusals().0,
         0,
-        "a 0.6.0 peer must never count as 'peer wire 0.5.0'"
+        "a wire-0.7.0 peer must never count as 'peer wire <= 0.6.0'"
     );
     await_until(30, "the refusal was named in a log line", || {
         let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
-        captured.contains("snapshot_session_refused") && captured.contains("declared-set mismatch")
+        captured.contains("snapshot_session_refused") && captured.contains("identity mismatch")
     });
     // Stalled-but-safe: nothing was half-installed under the joiner's own root.
     // The directory itself always exists — `Node::start` creates `snapshots/<id>/`
