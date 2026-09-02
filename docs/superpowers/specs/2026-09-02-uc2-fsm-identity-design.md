@@ -302,6 +302,14 @@ placement-independent regardless of §2.1's cut.
   proper belongs at the client edge, where the client is a worker with a
   clock, and the FSM stores what arrives.
 
+**One type, one row.** Identity is per type, so a harness that runs one
+state machine type at several rows (apply_bench, the two-FSM lincheck
+capstones, m12_gate's fleet rows) wraps it in `uc_service::Tagged<const
+ROW: u8, S>`, a zero-cost forwarding newtype whose `NAME` is `fsm{ROW}`.
+`ServicesConfig::tagged(n)` declares `fsm0..fsm{n-1}`. A production
+deployment never needs it — two rows running the same logic on one log
+compute the same state twice.
+
 ## 4. Node (`uc_node`): config, boot, cnc, attach, observability
 
 ### 4.1 Config
@@ -334,16 +342,18 @@ the remote path reaches, and its *name* is now part of what the cluster-
 wide check compares. The consensus agent's floor computation over declared
 rows is unchanged.
 
+`ServicesConfig::single(name)` is the one-FSM programmatic form; `from_names(&[..], lag)` the general one; `from_cli` requires `--services` (absent is a refusal, as the section is).
+
 ### 4.2 Boot and the cnc page (cnc 3.0 → 3.1)
 
 The node already zeroes the slot band at every start. Additions:
 
 | where | field | width | writer |
 |---|---|---|---|
-| slot `+448..+480` (reserved line 7) | `name` — the row's name, NUL-padded | 32 B | **node, boot-once** |
-| slot `+480..+512` | reserved (zero) | 32 B | — |
-| slot `+8` (status line 0) | `identity_hash` u64 | 8 B | service, at attach (same line and writer as `status`) |
-| slot `+16` (status line 0) | `version` u32 (§7) | 4 B | service, at attach |
+| slot `+448..+480` (line 7) | `name`, NUL-padded | 32 B | **node, in `CncPage::init`** (before the header CRC) |
+| slot `+480..+488` (line 7) | `identity_hash` u64 | 8 B | node, in `CncPage::init` |
+| slot `+488..+512` | reserved (zero) | 24 B | — |
+| slot `+8` (status line 0) | `version` u32 (§7), stored as a u64 word | 8 B | service, at attach (same line and writer as `status`) |
 
 Line 7 was "reserved, written by nobody"; it becomes node-written at boot,
 which keeps the one-writer-per-line rule (the M14 spec §3.4 named line 7
@@ -422,6 +432,11 @@ declared-set check (a set difference is a positional difference) and
 compared per row only when **both sides are non-zero** (§7); a mismatch is
 refused by name with both versions and counted in a new
 `uc2_snapshot_refused_version_total`. Artifacts route by row, as today.
+`SNAP_DONE` echoes the same `SnapBeginBody` (`uc_net/src/receiver.rs`,
+`snap_send_done`), so it carries the 0.7.0 layout with no separate change.
+The receiver learns its own per-row versions through a closure the node
+installs with `set_snapshot_intake` (the services write them into the cnc
+page at attach; `uc_net` has no cnc dependency).
 
 The `SNAP_BEGIN` fuzz target moves to the new layout;
 `docs/reference/wire-protocol.md` and `docs/how-to/upgrade-a-cluster.md`
