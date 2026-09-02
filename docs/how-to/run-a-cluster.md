@@ -156,17 +156,27 @@ durable config record owns membership, and a restart with an edited `members`
 list has no effect. To change membership on a running cluster, use `uc2ctl` —
 see [Change cluster membership](change-cluster-membership.md).
 
-`[services]` (M14) declares which state-machine processes this node hosts —
-absent means `ids = [0]` only. **The set is static and must be identical on
-every node** — it is not a live-reconfiguration surface the way `members` is.
-An id may only be **added** while the journal is intact from position 0
-(purge disabled, or never fired): a new FSM rebuilds from genesis, and no
-sibling's snapshot can stand in for it because it is a different state
-machine. Add an id to a cluster with a purged prefix and the new id fails its
-attach with `SnapshotRequired` — and, being declared, it holds admission
-closed cluster-wide until the set is put back the way it was (spec §8).
-With more than one declared id and purge enabled, a learner joining below the
-purge floor also has a real gap in M14a — see the note in
+`[services]` (M14; **required** since FSM identity, 2.11 pending — spec §4.1)
+declares which state-machine processes this node hosts, by name:
+`names = ["kv", "orders"]`, row = list index. There is no default any more —
+absent used to mean `ids = [0]`; a `node.toml` without `[services]` now
+refuses to start by name, the same explicit-choice posture `[crypto]`/
+`[admin]` have had since 2.6.0, and the old `ids` key is refused outright,
+pointing at `names`. **The set is static and must be identical, in the same
+order, on every node** — it is not a live-reconfiguration surface the way
+`members` is; since FSM identity, order matters too (the same names in a
+different order are refused by name on the snapshot path, not silently
+accepted as an equivalent set). Each service attaches by scanning for its own
+`S::NAME`, not by being told a row; a service whose name is not in the list is
+refused `UnknownFsm`, naming the declared set. A name may only be **added**
+while the journal is intact from position 0 (purge disabled, or never fired):
+a new FSM rebuilds from genesis, and no sibling's snapshot can stand in for it
+because it is a different state machine. Add a name to a cluster with a
+purged prefix and the new row fails its attach with `SnapshotRequired` —
+and, being declared, it holds admission closed cluster-wide until the set is
+put back the way it was (spec §8). With more than one declared FSM and purge
+enabled, a learner joining below the purge floor also has a real gap in
+M14a — see the note in
 [Change cluster membership](change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously).
 
 ## Open the network path between the nodes
@@ -272,12 +282,16 @@ stop together and in the right order. See
 [Write a service binary](write-a-service-binary.md) for the signal handling it
 must implement.
 
-Since M14, run **one service process per declared `[services]` id**, each
-started with its own `--service-id`, and supervise all of them the same way.
-A declared id with no process attached is not merely idle: once the log runs
-`fsm_lag` bytes ahead of it, the leader's admission door closes cluster-wide
-until that id catches up or reattaches — so a missing service process for a
-declared id is an outage, not a degraded FSM.
+Since M14, run **one service process per declared `[services]` name**, each
+attaching by its own `S::NAME` (a harness binary that hosts more than one FSM
+type takes `--fsm <name>` to pick which; since FSM identity, 2.11 pending,
+there is no `--service-id` any more — a production service that links one
+state machine needs no flag at all, it attaches by the name compiled into
+it), and supervise all of them the same way. A declared name with no process
+attached is not merely idle: once the log runs `fsm_lag` bytes ahead of it,
+the leader's admission door closes cluster-wide until that FSM catches up or
+reattaches — so a missing service process for a declared name is an outage,
+not a degraded FSM.
 
 Prefer the bounded policy (the default). `"lockstep"` is correct and supported but pays an N-way handshake on every frame — on the dev box ~600 k frames/s per FSM against ~22 M bounded — and a stalled FSM under lockstep costs each of its siblings a core while they wait (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
 

@@ -308,7 +308,7 @@ counted (`Node::snapshot_session_refusals`) *and* named in a
 | refusal | meaning | fix |
 |---|---|---|
 | `peer wire 0.5.0` | the `SNAP_BEGIN` is too short for `0.6.0` (a `0.5.0` body) or its layout byte is not one we speak | finish the flag day: some node is still on `0.5.0` |
-| `declared-set mismatch` | the sender's `[services] ids` differ from this node's | make `[services] ids` identical on every node, then restart the odd one out |
+| `declared-set mismatch` | the sender's declared FSM set differs from this node's (`[services] ids` at the time of this 2.8.0 upgrade; `[services] names`, in the same order, since FSM identity 2.11 — see the section below) | make `[services]`'s declared set identical, in the same order, on every node, then restart the odd one out |
 
 Both drop the session; the joining node keeps NAKing, so the cluster is
 stalled-but-safe until the mismatch is fixed — never half-installed.
@@ -334,6 +334,76 @@ binary swap this script already performs — none of the version-specific
 sections above apply, and there is no migration or extra rollback step. Run the
 same flag day anyway: it is the procedure this system supports, and it gives
 you the same measured downtime number.
+
+## Wire + cnc change in 2.11 (pending): FSM identity (`0.7.0`, cnc `3.1`)
+
+FSM identity gives each state machine a name declared in code and binds it
+to the row (spec
+`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`; plain-language
+explainer:
+[`docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`](../notes/uc2-fsm-identity-and-deterministic-ids-explained.md)).
+It is **one combined flag day**, on both lines at once — the same-host cnc
+page (`3.0` → `3.1`) and the node-to-node wire (`0.6.0` → `0.7.0`) — because
+both changes ship in the same release.
+
+**The `[services] ids` → `names` edit, required on every host.** `[services]`
+is no longer optional (absent used to mean `ids = [0]`; it now refuses to
+start, the same posture `[crypto]`/`[admin]` have had since 2.6.0), and its
+`ids` key is refused outright rather than silently accepted:
+
+```
+services.ids was replaced by services.names (FSM identity): list the FSM
+names in row order, e.g. names = ["kv", "orders"]
+```
+
+Before restarting any host, rewrite every `node.toml`'s `[services]` from
+`ids = [0, 1]` to `names = ["<row-0-name>", "<row-1-name>"]` — **the same
+names, in the same order, on every node** (row = list index, still
+contiguous from 0). Pick each row's name to match what the attaching
+service's `S::NAME` actually is; a service that does not find its name in
+the node's list is refused `UnknownFsm`, not silently parked. `--service-id
+<id>` is gone from every harness binary; the service side now takes
+`--fsm <name>` (or, for a production service using `ServiceConfig`
+directly, nothing at all — it attaches by its own `S::NAME`).
+
+**cnc 3.1**: the once-reserved slot line 7 becomes node-written at boot
+(the row's name, NUL-padded, plus its FNV-1a 64 hash); the status line's
+second word carries the attached service's packed version, written at
+attach. Same-host restart only, exactly like the 3.0 bump.
+
+**Wire 0.7.0**: `SNAP_BEGIN`'s `services_declared` bitmask becomes a
+per-row identity-hash array (`identity: [u64; 8]`), and a per-row packed
+version array (`version: [u32; 8]`) is added — see [the wire protocol
+reference](../reference/wire-protocol.md#snap_begin-body-wire-070-fsm-identity)
+for the exact layout. A 0.6.0 sender's shorter body is dropped by the same
+length check that drops a 0.5.0 body today: **a mixed cluster stalls a
+joiner rather than installing a wrong or half-checked artifact.**
+
+Two new named, counted refusals, on top of the existing `peer wire ≤ 0.6.0`
+one:
+
+| refusal | meaning | fix |
+|---|---|---|
+| `identity mismatch` | the sender's per-row identity hashes disagree with this node's at some row `r`, positionally — same names in a different order counts as a mismatch, not just a different set | make `[services] names` identical, **in the same order**, on every node; the log line names the row and both sides' FSM names ("row 1: ours=orders, theirs=kv") |
+| `version mismatch` | both sides report a non-zero `VERSION` for the same row and they disagree | attach the same build of that FSM's service everywhere; the log line names the row, both FSM names and both packed versions. `0` on either side means *unknown* (a joiner whose service hasn't attached yet), not a mismatch — this refusal only fires when both sides are non-zero |
+
+Both are counted (`Node::snapshot_session_refusals()`, now `(u64, u64,
+u64)` — legacy-peer, identity, version) and drop the session; the joiner
+keeps NAKing, stalled-but-safe, never half-installed. Steady state: the
+row's exported `uc2_service_identity_hash`/`uc2_service_version` gauges
+differ across nodes even before any snapshot session runs, and the
+`Uc2ServiceIdentityDrift`/`Uc2ServiceVersionDrift` alerts fire — see
+[Monitor a cluster](monitor-a-cluster.md).
+
+**The flag-day procedure is the same shape as every prior one**: rewrite
+every host's `node.toml` first (`ids` → `names`, in the same order), then
+on each host, stop clients → gateway → services → node, swap binaries,
+start node → services (now attaching by name, no `--service-id`) → clients.
+`scripts/uc2_flag_day.sh` covers the binary-swap half unchanged; the config
+edit is a manual step before it, same as any other `node.toml` change.
+
+On-disk layout is **unchanged**: snapshots still live in
+`snapshots/<row>/`, keyed by row, not name — no migration.
 
 ## Where to go next
 

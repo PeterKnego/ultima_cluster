@@ -30,7 +30,7 @@ Field names match the `NodeConfig` fields below. Four differ in shape:
 | `[[members]]` / `[[learners]]` tables of `id` + `addr` | `Vec<(NodeId, SocketAddr)>` |
 | `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
 | `[crypto]` with `enabled` (required), `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` | `CryptoConfig` |
-| `[services]` with `ids`, `fsm_lag` (a string) — absent means `ids = [0]` | `ServicesConfig` |
+| `[services]` with `names`, `fsm_lag` (a string) — **required**, no default (FSM identity, 2.11 pending) | `ServicesConfig` |
 
 Two keys exist only in the file and have no `NodeConfig` field:
 
@@ -78,17 +78,28 @@ structured-event vocabulary, see
 ### `[services]`
 
 M14a: which state-machine processes (FSMs) this node hosts, and how far apart
-they may drift. Optional; **absent means `ids = [0]`** with the default lag
-bound. The set is static and must be identical on every node — it is not a
-live-reconfiguration surface the way `members` is. See
+they may drift. **Required since FSM identity (2.11 pending, spec §4.1): a
+`node.toml` without `[services]` refuses to start by name** — the same
+explicit-choice rule `[crypto]` and `[admin]` have had since 2.6.0. There is
+no default set: absent used to mean `ids = [0]`; now a node names every FSM
+it hosts or does not start. The set is static and must be identical on every
+node, in the **same order** — it is not a live-reconfiguration surface the
+way `members` is, and (since FSM identity) the list's *order* is now part of
+what a mismatched cluster is refused on. See
 [Write one config file per host](../how-to/run-a-cluster.md#write-one-config-file-per-host)
 for the operational picture and the M14a snapshot-transfer limitation.
-Background: [how multi-service works](../notes/uc2-m14-multi-service-explained.md).
+Background: [how multi-service works](../notes/uc2-m14-multi-service-explained.md)
+and [the FSM identity explainer](../notes/uc2-fsm-identity-and-deterministic-ids-explained.md).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ids` | `[0]` | The declared service ids, each `0..8`. Must include `0` (the default responder and the only FSM the remote path reaches). |
+| `names` | none — **required** | The declared FSM names, in row order (list index = row). Each `1..=32` bytes of lowercase ASCII letters, digits, `_`, `-`, starting with a letter; no duplicates; at most 8. A service attaches by scanning for its own `S::NAME` — it no longer states its row. |
 | `fsm_lag` | `buffer_bytes / 4` | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB|MiB|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). Lockstep costs an N-way cross-core handshake per frame — ~1.6 µs at N=2 on the dev box, i.e. ~600 k frames/s per FSM against ~22 M bounded (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`) — and while a sibling is stalled or dead every other FSM burns ≈ a core yielding on it. Those are **dev-box numbers, measured with the FSMs alone on the box**; on a contended host the cost is far higher — the 2026-08-29 fleet run measured lockstep at **60×** its bounded twin on a `c6id.2xlarge` leader host also running the node and the client (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`, row e). **Lockstep needs a free CPU per declared FSM on top of the node's own agents: the cost is a gradient, not a cliff at one point — 3 busy threads on 2 CPUs is ~4× down (624 k → ~150 k), the two hyperthreads of one core ~7× down (~87 k), and 3 busy threads on 1 CPU ~880× down (709 frames/s per FSM at N=2) — while bounded mode on that worst rung is unaffected at 7.4 M frames/s** (full ladder in the record) — an operating-envelope fact, not a defect: lengthening the barrier's yield ladder ×4/×16 and making it unbounded were both measured at exactly 1.00× (`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`). Size the host, or pin the FSM threads, accordingly. |
+
+`ids` is **refused by field name**, pointing at `names` — there is no shim
+(no deployments existed at the time of the change): `services.ids was
+replaced by services.names (FSM identity): list the FSM names in row order,
+e.g. names = ["kv", "orders"]`.
 
 ## Startup refusals
 
@@ -111,10 +122,12 @@ replaces:
 | unknown keys inside `[log]`/`[metrics]` are refused, by name, like every other section | M9 accepted anything inside these two sections unvalidated; M10 defines their schema, so a typo there is now caught the same way as everywhere else. |
 | `[crypto]` section must be present | M12b (spec §3.3): `enabled` is an **explicit choice**, not absent-means-off like `[purge]` — an absent section is `ConfigError::CryptoChoiceRequired`, so a `node.toml` cannot silently run cleartext by omission. `enabled = false` must not also carry `key_path`/`allowlist_path`; `enabled = true` requires both. |
 | `[admin]` section must be present | M12b (spec §3.3, §5.1): `auth` is likewise an explicit choice — an absent section is `ConfigError::AdminChoiceRequired`. `auth = "hmac"` requires at least one uniquely-named entry in `keys`; `auth = "none"` requires `keys` to be empty; `request_ttl_ms` (default 30000) must be `>= 1000` under either mode. |
-| `services.ids` must not be empty | M14a: an explicitly-empty list would leave no FSM (not even 0) declared; omit `[services]` entirely for the default `[0]` instead. |
-| `services.ids` must not contain a duplicate id | M14a: a repeated id would double-count (or alias) one FSM's slot. |
-| `services.ids` entries must be `< 8` | M14a: the cnc page's per-service band holds 8 slots. |
-| `services.ids` must include `0` | M14a: FSM 0 is the default responder and the only FSM the remote path reaches; a set without it can never answer a remote client. |
+| `[services]` section must be present | FSM identity (2.11 pending, spec §4.1): there is no default FSM set — a `node.toml` must name every row, the same explicit-choice posture as `[crypto]`/`[admin]`. |
+| `services.ids` is refused, pointing at `names` | FSM identity: `ids` was the pre-identity field; there is no shim — rewrite as `names = ["<fsm>", ...]` in row order. |
+| `services.names` must not be empty | FSM identity: an explicitly-empty list would leave no FSM declared; there is no default to fall back to. |
+| `services.names` entries must be valid FSM names | FSM identity: `1..=32` bytes of lowercase ASCII letters, digits, `_`, `-`, starting with a letter — the same rule the state-machine trait's `const NAME` is checked against at compile time. |
+| `services.names` must not contain a duplicate name | FSM identity: a repeated name would double-attach one row, or leave a service unable to tell which row it found. |
+| `services.names` entries must number at most 8 | FSM identity (was `services.ids` entries must be `< 8`): the cnc page's per-service band holds 8 slots. |
 | `services.fsm_lag` must parse | M14a: an unparsable string (wrong suffix, spaces, a fraction) is refused by name rather than silently falling back to the default bound. |
 | `services.fsm_lag` must be `> 0` and `< buffer_bytes / 2` | M14a: `0` is the page's lockstep sentinel (write `"lockstep"` instead), and a bound at or above half the buffer cannot provably keep every FSM on the ring (the other half is the appender's overrun margin plus the leader's admission window). |
 

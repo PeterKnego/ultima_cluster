@@ -9,6 +9,38 @@ plan.
 **Baseline:** `origin/main` 4fcad3c (M1–M13 complete, `v2.7.0`, wire 0.5.0,
 cnc page 2.0, remote protocol v1, ingress ring `ULTRNG2`).
 
+## Erratum (2026-09-02, FSM identity, 2.11 pending)
+
+This spec's `[services] ids` / numbered-slot design shipped as M14
+(`v2.8.0`) and is **superseded** by
+`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`, which keeps
+the row (still a required, cluster-wide-matching index) but gives each FSM
+a name declared in code and found at attach, rather than a bare
+operator-assigned number. Three places below are now historical, not
+current behavior:
+
+- **`[services] ids = [...]`** (§4, §6.3, and elsewhere in this document) is
+  now `[services] names = [...]` — `ids` is refused outright, pointing at
+  `names`. Row = list index, unchanged; the *names* must now also match, in
+  the same order, across every node.
+- **`service_id`** — `ServiceConfig::service_id` (§4, "`ServiceConfig` ...
+  gains `service_id`"), the `.service_id(id)` builder, and every
+  `--service-id` CLI flag are **gone**. A service attaches by scanning the
+  node's declared names for its own `S::NAME` (a required `const` on the
+  state-machine trait) rather than stating a row.
+- **`SNAP_BEGIN`**'s per-FSM fields (§6.3, §7.3, §8: `service_id` +
+  `services_declared: u64`) moved to wire 0.7.0: `services_declared`
+  (a bitmask) is replaced by `identity: [u64; 8]` (a per-row FSM-name hash,
+  compared **positionally**, not as a set) plus `version: [u32; 8]` (a new
+  per-row packed version, equality-checked when both sides are non-zero).
+  `service_id` (the artifact's row) is unchanged.
+
+See the new spec's §2.1 for the three-way comparison (M14 today, Aeron,
+named rows) that motivated the change, and §10 for the release note. The
+body below is left as it was written and shipped — it is the accurate
+record of what M14 (`v2.8.0`) actually built, not a description of the
+current surface.
+
 ## 0. Re-baseline 2026-08-26 — what M11–M13 changed under this design
 
 The brainstorm was held against 797bfbf (M1–M10, `v2.4.0`) and numbered this

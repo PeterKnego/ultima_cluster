@@ -219,6 +219,9 @@ addr = "127.0.0.1:9101"
 id = 2
 addr = "127.0.0.1:9102"
 
+[services]
+names = ["counter"]  # the FSMs this node hosts, by name; row = list index
+
 [crypto]
 enabled = false      # cleartext node-to-node traffic
 
@@ -227,16 +230,24 @@ auth = "hmac"        # membership changes must be signed
 keys = [{ name = "admin", key_path = "/home/you/uc2-quickstart/admin.key" }]
 ```
 
-Three rules are worth carrying away from that file:
+Four rules are worth carrying away from that file:
 
 - **`bind` and this node's own `[[members]]` entry are the identical
   address.** Not a coincidence — `uc2-node` refuses to start if they
   disagree. It is the single most common misconfiguration.
-- **`[crypto]` and `[admin]` are required sections.** Since `v2.6.0` an
-  absent one is a startup refusal that names it, never a silent default. A
-  `node.toml` written for `v2.5.0` will not start until both choices are
-  written down — see
+- **`[services]`, `[crypto]` and `[admin]` are required sections.** Since
+  `v2.6.0` an absent `[crypto]`/`[admin]` is a startup refusal that names it,
+  never a silent default; `[services]` joined them in the FSM identity work
+  (`2.11` pending) — there is no default FSM set any more, a node names
+  every FSM it hosts or does not start. A `node.toml` written for `v2.5.0`
+  will not start until both older choices are written down, and one written
+  before FSM identity needs `[services] names = [...]` added — see
   [Upgrade a cluster](/docs/how-to/upgrade-a-cluster.md).
+- **`counter-service` attaches by name, with no flag of its own.** It links
+  `CounterSm`, whose `const NAME = "counter"` matches the row this
+  `node.toml` declares; a service binary that hosts more than one FSM type
+  picks with `--fsm <name>` instead (see
+  [the FSM identity explainer](/docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md)).
 - **`enabled = false` is a *choice*, not "off".** It means cleartext between
   nodes, which is fine on loopback and not fine across a network you do not
   own. `auth = "hmac"` here means the quickstart generated a 32-byte key

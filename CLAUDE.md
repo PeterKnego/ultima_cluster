@@ -18,6 +18,8 @@ code.
 byte-empty, `UC2_*` env overrides, `config_loaded` {path, sha256}, the
 `uc_obs` crate, the `ultima_db` removal, and the Broadcast-ring
 memory-ordering fix loom found; `2.9.0` was the `uc_*` crate rename).
+**(2.11.0 pending: FSM identity — implemented on branch `uc2/fsm-identity`,
+release on hold; see "Next up" below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
@@ -53,13 +55,22 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up: **FSM identity** (`docs/BACKLOG.md` item 2, taken up
-2026-09-01; spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`,
-plan pending) — identity in code (`const NAME` + `const VERSION`); the
-row keeps its cluster-wide meaning but a service finds it by name;
-`SNAP_BEGIN` 0.7.0 carries hashes + versions per row and refuses by name;
-cnc 3.1; `IdGen` for deterministic IDs; disk, rings and the client engine
-untouched (the placement-independent variant was cut, spec §2.1). The other ranked directions, each with the
+Next up: **FSM identity** (`docs/BACKLOG.md` item 2, taken up 2026-09-01;
+spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`, plan
+`docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md`) —
+**IMPLEMENTED on branch `uc2/fsm-identity`, awaiting release.** All ten
+plan tasks (T0–T10) are done: identity in code (`const NAME` + `const
+VERSION`); the row keeps its cluster-wide meaning but a service finds it
+by name; `SNAP_BEGIN` 0.7.0 carries hashes + versions per row and refuses
+by name; cnc 3.1; `ApplyCtx` replaces the bare `position` apply parameter;
+`IdGen` for deterministic IDs; disk, rings and the client engine untouched
+(the placement-independent variant was cut, spec §2.1); explainer
+`docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`; gate doc
+skeleton `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` (bars
+pre-committed, no fleet run yet). **The release itself is on hold**: more
+changes are planned on the branch first, so no version has been bumped, no
+tag cut, no fleet gate run — see the "Standing facts" entry below and
+`docs/BACKLOG.md` item 2. The other ranked directions, each with the
 doc that first recorded it, are in `docs/BACKLOG.md` (update its line when
 an item is taken up or dropped). `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the
@@ -111,6 +122,25 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   ones; upgrade all nodes together. The client↔gateway remote protocol is
   separate and stays v1. What is API vs. what is flag-day:
   `docs/reference/semver-policy.md`.
+- **FSM identity is implemented on branch `uc2/fsm-identity`, not yet
+  released** — the facts above (wire `0.6.0`, cnc `3.0`) still describe
+  what is actually shipped. On the branch: wire `0.7.0` (`SNAP_BEGIN`
+  carries per-row identity hashes + versions, compared positionally,
+  refused by name — replaces the `services_declared` bitmask); cnc `3.1`
+  (slot line 7 = row name + hash, node-written at boot; status line word 1
+  = the attached service's packed version); `[services] names` (not
+  `ids`) is **required** in `node.toml` — the same explicit-choice posture
+  `[crypto]`/`[admin]` have had since 2.6.0, and `ids` is refused by name
+  pointing at `names`; identity lives **in code**, a required `const NAME`
+  (+ optional `const VERSION`) on the state-machine trait, not in
+  deployment config; the apply signature is now `apply(&mut self, ctx:
+  &mut ApplyCtx, cmd, out)` (`ApplyCtx` is `#[non_exhaustive]`, carries
+  `position` + the FSM's identity, and is the seam the parallel
+  timestamps/scheduler design will extend rather than break again). See
+  the "Next up" paragraph above,
+  `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`, and
+  `docs/reference/semver-policy.md`'s FSM-identity carve-out (ships as the
+  next minor, `2.11.0`, not `3.0.0`, per the maintainer's decision).
 - **Wire crypto is opt-in and OFF by default**, all-encrypted or
   all-cleartext per cluster (no mixed mode). Threat model: a network-path
   adversary; out of model: a compromised host or a malicious member — the

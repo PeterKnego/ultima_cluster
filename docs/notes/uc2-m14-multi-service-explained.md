@@ -41,7 +41,25 @@ identical on every node — it is not a live-reconfiguration surface
 run `0..8`, and **id 0 must be declared**: it is the default responder and the
 only FSM a remote client can reach, because the remote protocol stays v1 and
 its `SUBMIT`/`QUERY` frames carry no service selector
-(`uc_remote/src/frame.rs:19`, spec §6.4). Both facts are pinned as hard
+(`uc_remote/src/frame.rs:19`, spec §6.4).
+
+**Since FSM identity (2.11 pending):** `[services] ids` is `[services]
+names`, and a service no longer states which id it is — it attaches by
+scanning the node's declared names for its own `const NAME`. The row (list
+index) still means exactly what it means below — "id 0" above is now "row
+0", the default responder — but the operator-assigned number is gone from
+the config surface; the identity that used to have no representation at all
+(same number, different code, silently diverging) is now a name checked at
+attach and, positionally, on the snapshot path. See
+[the FSM identity explainer](uc2-fsm-identity-and-deterministic-ids-explained.md)
+for the full design and
+[Configuration § `[services]`](../reference/configuration.md#services) for
+the current field. What follows in this note describes the M14 (`v2.8.0`)
+mechanics as shipped — the plumbing (cnc slot band, per-id rings/files,
+`SNAP_BEGIN`'s per-artifact framing) is unchanged; only how a row gets its
+identity changed.
+
+Both facts are pinned as hard
 limits ([Limits § Hard limits](../reference/limits.md#hard-limits)).
 
 ## The lag barrier

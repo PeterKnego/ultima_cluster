@@ -82,14 +82,19 @@ today checks only the number.
   line 7; same-host, recreated per boot — confirm against
   `docs/reference/semver-policy.md` whether that is a cnc version bump or
   a flag day) + snapshot header + client/gateway name resolution.
-- **Status 2026-09-02: SPEC WRITTEN, then CUT to "named rows"** —
-  `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`: identity
-  in code (`const NAME` + `const VERSION`); the row keeps its cluster-wide
-  meaning and a service finds it by name; `SNAP_BEGIN` 0.7.0 carries hashes
-  + versions per row, compared positionally and refused by name; cnc 3.1;
-  `IdGen`; disk/rings/client engine untouched. The placement-independent
-  variant was cut by the spec's §2.1 comparison table (UC today / Aeron /
-  named rows / placement-independent). Next: the implementation plan.
+- **Status 2026-09-02: IMPLEMENTED on branch `uc2/fsm-identity`, release on
+  hold** — spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`
+  ("named rows": identity in code, `const NAME` + `const VERSION`; the row
+  keeps its cluster-wide meaning and a service finds it by name; `SNAP_BEGIN`
+  0.7.0 carries hashes + versions per row, compared positionally and refused
+  by name; cnc 3.1; `IdGen`; disk/rings/client engine untouched; the
+  placement-independent variant was cut by the spec's §2.1 comparison
+  table). Plan `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md`
+  (T0–T10), all tasks done: code (`uc_protocol`/`uc_service`/`uc_node`/
+  `uc_client`), harnesses/capstones by name, docs + explainer + gate-doc
+  skeleton. Not yet released — no version bump, no tag, no fleet run; more
+  changes are planned on this branch before a release. Explainer:
+  `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`.
 
 ### 3. Rolling upgrades and leadership transfer
 
@@ -107,7 +112,8 @@ deferred by name:
   spec or none at all."
 - **Crypto-on-by-default** was parked "revisit at M12, not before" in the
   same spec and never revisited; it belongs in this milestone.
-- **FSM version — the static half ships with FSM identity**
+- **FSM version — the static half shipped with FSM identity (implemented on
+  `uc2/fsm-identity`, release on hold); see spec §7**
   (`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7):
   `const VERSION` per FSM in Aeron's packed-semver layout, attach-written to
   the cnc slot, exported, carried per row on `SNAP_BEGIN` and

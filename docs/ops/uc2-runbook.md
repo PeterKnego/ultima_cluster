@@ -59,8 +59,9 @@ verify rather than a build:
   the `/healthz`/`/readyz` probes, and the structured JSON-lines event
   vocabulary.
 - [Diagnose a node → Which FSM is holding the cluster up?](../how-to/diagnose-a-node.md#which-fsm-is-holding-the-cluster-up)
-  — the per-FSM band (`uc2ctl status`'s services table, the
-  `service="<id>"` metric families, `Uc2ServiceAbsent` /
+  — the per-FSM band (`uc2ctl status`'s services table with its
+  `row=name=version=hash=` fields, the `service="<name>",row="<r>"` metric
+  families, `Uc2ServiceAbsent` /
   `Uc2ServicePinnedAtLagBound`, and the `service_attached`/`service_detached`
   records).
 
@@ -112,7 +113,10 @@ verify rather than a build:
   M14 (`svc_query.<id>.ring`, `egress_service.<id>.broadcast`,
   `service.<id>.lock`, `snapshots/<id>/`). *Was §1.*
 - [The cnc control page](../reference/cnc-page.md) — the pinned layout, field by
-  field. *Was §3's field tables.*
+  field, including cnc 3.1's per-slot name/hash line (7) and version word
+  (line 0, word 1) added for FSM identity (2.11 pending). *Was §3's field
+  tables.* Raw-offset walkthrough:
+  [Diagnose a node → Which FSM is holding the cluster up?](../how-to/diagnose-a-node.md#which-fsm-is-holding-the-cluster-up)
 - [`uc2ctl`](../reference/uc2ctl.md) — sub-commands, arguments, response
   statuses, refusal reasons.
 - [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)

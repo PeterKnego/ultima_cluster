@@ -1,5 +1,140 @@
 # ultima_cluster releases
 
+## Unreleased — FSM identity (next minor, 2.11.0 when cut)
+
+**Implemented on branch `uc2/fsm-identity`; not tagged. Release on hold** —
+more changes are planned on this branch first. This entry is a draft written
+ahead of the tag, per the standing writeup rule (CLAUDE.md), so the record
+is ready when the maintainer green-lights it. Spec:
+`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`. Plan:
+`docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10, all done on
+this branch).
+
+### The problem this closes
+
+M14 (`v2.8.0`) identified an FSM by a bare row number: the service declared
+it in `ServiceConfig::service_id`, the node declared the set in `[services]
+ids`, and nothing anywhere checked what *logic* a number held. Two nodes
+agreeing on the set of numbers never agreed on the code behind each one —
+same logic at different numbers stalled a joiner with an unexplained
+declared-set mismatch, and different logic at the same number diverged
+**silently**, with no refusal and no alert.
+
+### What changed
+
+- **Identity moves into code.** `RawStateMachine`/`StateMachine` gain a
+  required `const NAME: &'static str` (1..=32 bytes, lowercase ASCII +
+  `_`/`-`, starting with a letter — `uc_protocol::identity`, a new
+  `core`-only leaf module alongside `version`/`magic`) and an optional
+  `const VERSION: u32` (packed semver, `0` = unversioned).
+  `uc_service::ServiceConfig` **loses** `.service_id()`; a service attaches
+  by scanning the node's declared name lines for its own `NAME`
+  (`ServiceError::UnknownFsm { name, declared }` on no match).
+- **`[services]` becomes required, and is now `names`, not `ids`.**
+  `node.toml` without `[services]` refuses to start
+  (`ConfigError::ServicesChoiceRequired`) — the same explicit-choice
+  posture `[crypto]`/`[admin]` have had since 2.6.0. The old `ids` key is
+  refused by name, pointing at `names`; row = list index, still contiguous
+  from 0, still cluster-wide-required to match. `ServicesConfig::from_names`
+  carries the refusal set (empty, > 8, invalid name, duplicate);
+  `ServicesConfig::single`/`tagged`/`from_cli`/`none_for_tests` are the
+  programmatic/harness forms.
+- **`ApplyCtx` replaces the bare `position: u64` apply parameter.**
+  `apply(&mut self, ctx: &mut ApplyCtx, cmd, out)`; `ApplyCtx` is
+  `#[non_exhaustive]` and carries `position` plus the FSM's identity, built
+  once per frame by the apply loop, journal replay and snapshot
+  tail-replay. `#[non_exhaustive]` is deliberate: the parallel leader-
+  timestamps/scheduler design (its own future wire release) adds fields
+  here later without a second trait-signature break. `Sessioned<S>`
+  forwards `NAME`/`VERSION` and passes `ctx` straight through.
+- **`uc_service::ids::IdGen`** — `ctx.ids()` mints deterministic `u128` IDs
+  from `position ‖ ordinal:u32 ‖ fold32(identity.hash)` through a frozen
+  three-round Feistel permutation (murmur3 `fmix64` round function, golden
+  vectors pinned). The ordinal resets to zero every apply call — this, not
+  the permutation, is the actual correctness property: a snapshot-installed
+  replica and a journal-replayed one mint the identical series for the
+  identical future command, with zero state to snapshot. `IdGen` is
+  `!Send`, reachable only via `ApplyCtx::ids()`, unreachable from `query` by
+  construction (no context there to build one from).
+- **cnc 3.1** (`CNC_V2_VERSION = (3 << 24) | (1 << 16)`): the once-reserved
+  per-slot line 7 becomes node-written at boot — `name` (`[u8; 32]`,
+  NUL-padded, offset `+448`) and `identity_hash` (`u64` FNV-1a 64, offset
+  `+480`) — the one line in the service-slot band written by the **node**,
+  not the service. The status line's second word (offset `+8`) becomes the
+  attached service's packed version, service-written at attach.
+- **Wire `0.7.0`**: `SnapBeginBody`'s `services_declared: u64` bitmask is
+  replaced by `identity: [u64; 8]` (per-row identity hash, `0` = row
+  undeclared — the mask is now derived) and a new `version: [u32; 8]`
+  (per-row packed version, `0` = unknown). `SNAP_BEGIN_FIXED_LEN` grows
+  34 → 122. The receiver's check is **positional**: `identity[r]` must
+  equal the receiver's own row-`r` hash for every `r` — same names in a
+  different order now fails too, where the old bitmask compare would have
+  silently accepted it. On mismatch, refused **by name** ("row 1:
+  ours=orders, theirs=kv" — a hash the receiver recognizes anywhere in its
+  own list prints as that name), counted in the existing
+  `uc2_snapshot_refused_declared_set_total`. `version` is compared per row
+  only when both sides are non-zero; a mismatch refuses by name with both
+  versions, counted in a new `uc2_snapshot_refused_version_total`. A 0.6.0
+  sender's 34-byte body is shorter than 122, so it is dropped by the same
+  length check that has dropped every prior mismatched wire version — the
+  standing flag-day rule, unchanged: a mixed cluster stalls a joiner rather
+  than installing a wrong or half-checked artifact.
+  `Receiver::set_snapshot_intake` grows a fourth parameter — the node's own
+  per-row identity array plus a closure the receiver calls for the node's
+  own per-row versions (read fresh off the cnc slot band; `uc_net` still has
+  no cnc dependency of its own).
+- **Observability**: metric labels gain the name (`service="<name>",
+  row="<r>"`, alongside the existing `row` grouping key); two new gauges,
+  `uc2_service_identity_hash` and `uc2_service_version`, feed two new alert
+  rules, `Uc2ServiceIdentityDrift` (critical) and `Uc2ServiceVersionDrift`
+  (warning) — a cross-node config or version mismatch now pages in steady
+  state, before any snapshot session ever runs, which is the **early**
+  guard for the **late** `SNAP_BEGIN` check. `uc2ctl status` prints `row=
+  name= version= hash=` per row (`uc_ctl/src/main.rs`).
+- **Harnesses and capstones run by name**: `uc_service::Tagged<const ROW:
+  u8, S>` (zero-cost, `NAME = "fsm{ROW}"`) is the one-type-at-several-rows
+  wrapper for `apply_bench`, the two-FSM lincheck capstones and
+  `m12_gate`'s fleet rows; `m14_fleet_gate.py`'s `fsm_name`/`node_args`/
+  `service_args` translate `(row, spin)` to names at the CLI-argv boundary;
+  `m12_fleet_gate.py`'s node role gained a previously-missing `--services`
+  flag (unconditionally required since Task 4, an unrelated pre-existing
+  gap this work's scope surfaced and fixed). Two new negative scenarios in
+  `uc_node/tests/learner.rs`: same names in the other order (refused by
+  name, `RefusalKind::Identity`) and same names with differing attached
+  versions (refused with both versions, `RefusalKind::Version`).
+
+### Breaking, and why it ships as a minor
+
+Under [the semver policy](reference/semver-policy.md) this is a real
+breaking change: the trait gains a required const and changes `apply`'s
+signature, `ServiceConfig` loses a setter, `[services]` goes from optional
+to required with `ids` refused outright, and every `--service-id` CLI flag
+is gone. The maintainer's decision (spec §10, 2026-09-02) ships it as the
+**next minor**, `2.11.0`, rather than `3.0.0` — on the project having no
+external users yet, not on the "nothing published" fact `2.9.0`'s carve-out
+relied on (crates.io publishing started at `2.9.0`). This is one decision
+for one release, not a standing exception — see
+[the semver policy § FSM identity carve-out](reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor).
+
+### Release evidence
+
+**Nothing below has run yet — every row is `pending`.** No fleet gate, no
+tag, no crates.io publish. Filled in when the maintainer green-lights the
+release, following the same table shape every prior release entry in this
+file uses ("What proves the release").
+
+| what | evidence | result |
+|---|---|---|
+| `ci.yml` (fmt gate, clippy, workspace tests, MSRV 1.89) | — | pending |
+| `docs.yml` (rustdoc, link check) | — | pending |
+| `release.yml` (build, SBOM, cosign, image) | — | pending |
+| workspace correctness stack (`lin_v2`, `lin_partition_v2`, `learner`, `elle_check.sh`, hard-crash) | dev-box smoke only so far, see the branch's Task 9 report | pending (fleet-equivalent, not yet a gate) |
+| `cargo test --workspace --doc` | Task 10, this worktree | see below (run as part of this docs sweep, not a release gate on its own) |
+| FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
+| artifact integrity (`sha256sum -c`) | — | pending |
+| artifact provenance (`cosign verify-blob`) | — | pending |
+| crates.io | — | pending |
+
 ## v2.10.0 — 2026-08-31 — one log stream, config from the environment, and a weak-memory fix
 
 Thirteen crates, still lockstep. No wire change (protocol stays 0.6.0), no cnc

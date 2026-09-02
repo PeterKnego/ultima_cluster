@@ -10,15 +10,17 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 
 | Constant | Value |
 |---|---|
-| `version::CURRENT` | `0.6.0` |
-| cnc page version | 3.0 (M14: 8 KiB page) |
+| `version::CURRENT` | `0.7.0` |
+| cnc page version | 3.1 (FSM identity, 2.11 pending: the name + hash line at boot, the version word at attach) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
-independent of this one. cnc 3.0 changed the same-host shmem layout only;
-the UDP datagram format moved to 0.6.0 in M14c, when `SNAP_BEGIN` grew its
-per-FSM fields — every other datagram is byte-identical to 0.5.0. `CURRENT`
-is documentary and is not itself checked on any receive path (see
-`version.rs`); the two version lines remain independent of each other.
+independent of this one. cnc 3.1 changed the same-host shmem layout only
+(the once-reserved slot line 7); the UDP datagram format moved to 0.7.0 in
+the FSM identity work, when `SNAP_BEGIN` swapped its `services_declared`
+bitmask for a per-row identity-hash array plus a per-row version array —
+every other datagram is byte-identical to 0.6.0. `CURRENT` is documentary
+and is not itself checked on any receive path (see `version.rs`); the two
+version lines remain independent of each other.
 
 `app_id`, `instance_id`, and the protocol version are checked at every IPC
 entry point. A mismatched `app_id` means the wrong cluster; a changed
@@ -61,6 +63,43 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 13 | `SNAP_CHUNK` | pairwise |
 | 14 | `SNAP_NAK` | pairwise |
 | 15 | `SNAP_DONE` | pairwise |
+
+#### `SNAP_BEGIN` body (wire 0.7.0, FSM identity)
+
+`SNAP_BEGIN` opens (or extends) one artifact of a snapshot session; its body
+is the only wire carrier of FSM identity (commands are broadcast, durable
+reports are aggregates — neither names an FSM). `SNAP_BEGIN_FIXED_LEN = 122`,
+followed by a variable, length-prefixed `config` tail (M7's `ConfigRecord`
+bytes). `SNAP_DONE` echoes the same body as its ack, so it carries this
+layout too, with no separate change.
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0..4 | `session` | u32 | session id |
+| 4 | `layout` | u8 | body discriminator; `2` = `SNAP_BEGIN_LAYOUT_V3` (0.7.0). A shorter/older `layout` is refused as "peer wire ≤ 0.6.0" |
+| 5 | `service_id` | u8 | the row this artifact belongs to |
+| 6..8 | — | 2 B | zero (pads `snapshot_pos` to u64 alignment) |
+| 8..16 | `snapshot_pos` | u64 | this artifact's snapshot position |
+| 16..24 | `total_len` | u64 | this artifact's byte length |
+| 24..88 | `identity` | `[u64; 8]` | the sender's per-row FSM identity hash (FNV-1a 64 of the declared name), in row order; `0` = row undeclared. Replaces 0.6.0's `services_declared` bitmask — the mask is now derived (`SnapBeginBody::declared_mask`) |
+| 88..120 | `version` | `[u32; 8]` | the sender's per-row attached packed version, from the cnc slot; `0` = no service attached / unversioned |
+| 120..122 | `config_len` | u16 | length of the `config` tail |
+| 122.. | `config` | variable | the encoded `ConfigRecord`, identical on every `BEGIN` of a session |
+
+The receiver compares `identity` **positionally**: for each row `r`,
+`identity[r]` must equal the receiver's own hash for row `r` (both zero =
+both undeclared). A mismatch refuses the session **by name** ("row 1:
+ours=orders, theirs=kv" — a hash the receiver recognizes anywhere in its own
+list prints as that name, an unknown one as its hash) and counts
+`uc2_snapshot_refused_declared_set_total`; this subsumes the 0.6.0 declared-set
+check (a set difference is a positional difference). `version` is compared
+per row only when **both** sides are non-zero; a mismatch refuses by name
+with both versions and counts the new `uc2_snapshot_refused_version_total`.
+A 0.6.0 sender's body (34 B fixed) is shorter than 122 B, so the receiver
+drops it by the same length check that drops a 0.5.0 body today — the
+standing flag-day rule: a mixed cluster stalls a joiner rather than
+installing a wrong or half-checked artifact. Artifacts still route by row,
+unchanged.
 
 ### Administration
 

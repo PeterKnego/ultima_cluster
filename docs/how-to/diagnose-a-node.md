@@ -56,22 +56,36 @@ admission door is `append − min(applied) ≤ fsm_lag`, and this node's durable
 report is capped at `min(applied) + fsm_lag`. So a single sick FSM stalls
 commits cluster-wide — by design, and visibly.
 
+Reading the raw page (cnc 3.1, FSM identity): within a service slot
+(`CNC_OFF_SERVICE_SLOTS + row * CNC_SERVICE_SLOT_STRIDE`, stride 512 B), the
+status line's second word (offset `+8`, line 0 word 1) is the attached
+service's packed version, and line 7 (offset `+448..+512`) is the row's name
+— `[u8; 32]` NUL-padded at `+448`, its FNV-1a 64 hash as a `u64` at `+480` —
+**written once by the node itself at boot**, not by the service (every other
+line in the slot is written by the service). Field-by-field detail:
+[The cnc control page § Service slots](../reference/cnc-page.md#service-slots).
+
 Start with `uc2ctl status`, which prints the whole band without a scrape:
 
 ```text
 services: declared=[0, 1] fsm_lag=8192 bytes
-  id=0 attached=true epoch=3 incarnation=3 applied=1048576 lag=0 snapshot_pos=1040384 heartbeat_age=0.004s
-  id=1 attached=false epoch=0 incarnation=0 applied=0 lag=1048576 snapshot_pos=0 heartbeat_age=never
+  row=0 name=kv version=1.2.0 hash=0x9a1c4e2f7b0d3a11 attached=true epoch=3 incarnation=3 applied=1048576 lag=0 snapshot_pos=1040384 heartbeat_age=0.004s
+  row=1 name=orders version=0.0.0 hash=0x3f0e7c9a2b8d1f45 attached=false epoch=0 incarnation=0 applied=0 lag=1048576 snapshot_pos=0 heartbeat_age=never
 ```
+
+(`name=`/`version=`/`hash=` are new since FSM identity, 2.11 pending; earlier
+releases printed `id=` where `row=` now is, and no `name=`/`version=`/
+`hash=` fields.)
 
 Read it in this order:
 
-1. **`attached=false`** on a declared id (`Uc2ServiceAbsent`) — that FSM's
+1. **`attached=false`** on a declared row (`Uc2ServiceAbsent`) — that FSM's
    process is not running, or it refused to attach. Check the service's own
-   logs for `ServiceNotDeclared` (its `--service-id` is not in this node's
-   `[services] ids`) or the `service.<id>.lock` refusal (two processes, one
-   id). `heartbeat_age=never` distinguishes "never started since this node
-   booted" from "was running, stopped".
+   logs for `UnknownFsm` (its `S::NAME` — not `name=` above, which is the
+   *node's* declared name for that row — is not in this node's `[services]
+   names`, or matches no row at all) or the `service.<row>.lock` refusal (two
+   processes, one row). `heartbeat_age=never` distinguishes "never started
+   since this node booted" from "was running, stopped".
 2. **`attached=true` with a stale `heartbeat_age`** (`Uc2ServiceWedged`) —
    the apply loop is wedged inside `apply()`, not the cluster. The
    `[log]` records say which: `service_attached` then no `service_detached`

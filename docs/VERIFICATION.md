@@ -827,6 +827,50 @@ The most important section, and the one most projects omit.
     is not a correctness substitute, and **row e has still not been
     re-measured**. The pinning run above did not address it, and the residual
     14.3 % spread is undiagnosed.
+- **FSM identity (2.11 pending)**: named rows, replacing M14's numbered-set
+  bitmask (spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`).
+  The existing multi-service proof surface above (the seven two-FSM
+  capstones, `elle_quiet_two_fsm`) now runs with **named** FSMs via
+  `uc_service::Tagged<const ROW: u8, S>` (its `NAME` is `fsm{ROW}`) rather
+  than a bare row number — the same checker, the same tests, an identity
+  layer underneath them that was not there before. Two capstone-adjacent
+  bugs this task found and fixed are worth recording rather than
+  re-deriving: `uc_node/tests/lincheck_v2/mod.rs`'s `FsmSet::Single` was
+  hardcoded to `RegisterSm::NAME` regardless of the test's own state-machine
+  type, which meant every single-FSM `elle_check.sh` pass and
+  `snapshot_restart_installs_only_with_purge` would have attached under the
+  wrong declared name and refused; fixed to `SM::NAME`.
+  - **Two new negative scenarios** in `uc_node/tests/learner.rs`, both a
+    real leader + joiner `Node` over loopback UDP:
+    `a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stalls`
+    (leader declares `["sum", "fsm1"]`, joiner declares `["fsm1", "sum"]` —
+    the *same* two names, transposed, which a naive set comparison would
+    wrongly accept; refused at row 0, `kind == Identity`, named in the log
+    line) and
+    `a_joiner_running_another_fsm_version_is_refused_with_both_versions`
+    (identical names, differing packed versions via a direct cnc `status`
+    poke; refused via `kind == Version`, both versions named). Both were
+    watched red first (a temporary set-comparison / disabled-version-check
+    edit to `uc_net/src/receiver.rs`, reverted after observing the hang).
+  - **Dev-box run, not a fleet gate** (per the standing rule above): `lin_v2`
+    (14/14), `lin_partition_v2` (8/8), `learner` (7/7, including the two new
+    scenarios), and the six-pass `elle_check.sh` (`quiet failover partition
+    purge reconfig quiet_two_fsm`) all green. `cargo test -p uc_crashtest
+    --features hard-crash-tests` read 4 passed / 2 failed
+    (`linearizable_under_service_sigkill`, `two_fsm_service_sigkill`,
+    `node_sigkill_recovery`, `two_fsm_node_sigkill` all `ok`) —
+    **`sigkill_mid_config_window` and `leader_node_sigkill_recovery_multi`
+    failed reproducibly on this box, including on the pristine pre-FSM-identity
+    base commit with none of this work's changes applied** (verified by a
+    stash round-trip against `examples/uc_crashtest`, which this work does
+    not touch), both with the same `cnc attach error: No such file or
+    directory` after a real SIGKILL + respawn under a tight
+    `UC2_CLIENT_TIMEOUT_MS=1500`. This is a pre-existing flake
+    (`sigkill_mid_config_window` was already documented at ~5%), not a
+    regression from FSM identity — recorded here because this run saw it
+    fail 5/5 times on this box, a stronger rate than the documented ~5% and
+    worth a look by whoever owns that flake next, not because FSM identity
+    caused it.
 - **Wire crypto is opt-in and off by default.** With it disabled the posture is a
   trusted network. With it enabled, the threat model is a network-path adversary;
   a compromised host and a malicious cluster member are explicitly **out of

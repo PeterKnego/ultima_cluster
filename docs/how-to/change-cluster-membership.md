@@ -120,14 +120,20 @@ purging first so each new learner converges by snapshot install plus tail
 replay: [Keep the journal from growing without bound](bound-journal-growth.md).
 
 **Multi-FSM nodes (M14):** a snapshot session carries one artifact per
-declared FSM, so a learner declaring `[services]` with `ids` beyond `[0]`
-rebuilds every FSM below the floor, not only FSM 0. The learner's declared set
-must match the sender's exactly — a source whose artifact set does not cover
-`services_declared` (one per declared id, none outside it) is refused before
-a session opens, and the learner keeps waiting rather than installing a partial
-set. (M14a shipped FSM 0's artifact only, which pinned a purged-cluster learner's
-`min_applied` at 0 and made `promote` refuse `NotCaughtUp` forever; M14c fixed
-it — [Upgrade a cluster § wire change in 2.8.0](upgrade-a-cluster.md).)
+declared FSM, so a learner declaring `[services] names` with more than one
+row rebuilds every FSM below the floor, not only row 0. The learner's
+declared names must match the sender's exactly, **in the same order**
+(FSM identity, 2.11 pending: a positional check, not a set check — the same
+names in a different order are refused too) — a source whose per-row identity
+hashes do not agree with the learner's own, row for row, is refused **by
+name** before a session opens (`identity mismatch`, naming the row and both
+sides' FSM names), and the learner keeps waiting rather than installing a
+partial or mismatched set. (M14a shipped row 0's artifact only, which pinned
+a purged-cluster learner's `min_applied` at 0 and made `promote` refuse
+`NotCaughtUp` forever; M14c fixed it — [Upgrade a cluster § wire change in
+2.8.0](upgrade-a-cluster.md); FSM identity replaced the underlying
+set-membership bitmask with the positional, by-name check — [Upgrade a
+cluster § wire + cnc change in 2.11](upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-070-cnc-31).)
 
 ## Add a voter
 

@@ -261,7 +261,14 @@ bind = "127.0.0.1:$((NODE_PORT_BASE + i))"
 instance_dir = "$ROOT/n$i"
 app_id = "$APP"
 
-$members_toml# Cleartext node-to-node traffic. Both sections are REQUIRED: an absent one
+$members_toml# The declared FSM set, by name (FSM identity): REQUIRED, like [crypto] and
+# [admin] below — an absent [services] is a startup refusal naming it. This
+# node hosts one FSM, "counter" (CounterSm::NAME), at row 0; counter-service
+# attaches to it by that name, with no flag of its own.
+[services]
+names = ["counter"]
+
+# Cleartext node-to-node traffic. Both sections are REQUIRED: an absent one
 # is a startup refusal naming it, never a silent default. See
 # docs/how-to/encrypt-node-traffic.md before running this over a real network.
 [crypto]

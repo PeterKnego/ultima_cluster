@@ -119,7 +119,7 @@ API for downstream code. They may change in any release:
 
 | Crate | Not promised |
 |---|---|
-| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`. It is the wire spec, governed by the flag-day rule below, not by semver. |
+| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11 pending — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the flag-day rule below, not by semver. |
 | `uc_log` | `agent`, `archive`, `buffer`, `cnc`, `counters`, `reader`, `region`, `state`, `writer` |
 | `uc_consensus` | `commit`, `config`, `election`, `reconcile` |
 | `uc_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender`. **`2.8.0` changed these signatures, in a minor release** — see the note below. |
@@ -135,16 +135,16 @@ promised" means in practice: **`2.8.0` (M14c) changed those public signatures
 in a minor release**, deliberately, because one log now feeds N FSMs and a
 session ships one artifact per declared id rather than one per session.
 
-| item | ≤ `2.7.0` | `2.8.0` |
-|---|---|---|
-| `sender::SnapshotSource` | `Arc<dyn Fn() -> Option<(u64, PathBuf, u64, Vec<u8>)>>` | `Arc<dyn Fn() -> Option<SnapshotSet>>` |
-| `sender::SnapshotSet` / `sender::SnapArtifact` | did not exist | the set (`services_declared`, `config`, one `SnapArtifact` per declared id) |
-| `receiver::Receiver::set_snapshot_intake` | `(snap_dir, incoming)` | `(snap_root, own_declared, incoming)` |
+| item | ≤ `2.7.0` | `2.8.0` | `2.11.0` pending (FSM identity) |
+|---|---|---|---|
+| `sender::SnapshotSource` | `Arc<dyn Fn() -> Option<(u64, PathBuf, u64, Vec<u8>)>>` | `Arc<dyn Fn() -> Option<SnapshotSet>>` | unchanged |
+| `sender::SnapshotSet` / `sender::SnapArtifact` | did not exist | the set (`services_declared`, `config`, one `SnapArtifact` per declared id) | unchanged (identity/version ride on `SnapBeginBody`, not this seam) |
+| `receiver::Receiver::set_snapshot_intake` | `(snap_dir, incoming)` | `(snap_root, own_declared, incoming)` | `(snap_root, [u64; 8], Arc<dyn Fn() -> [u32; 8]>, incoming)` — the node's own per-row identity hashes plus a closure the receiver calls for the node's own per-row versions (read fresh off the cnc slot band; `uc_net` has no cnc dependency of its own) |
 
 Nothing downstream broke, because nothing downstream is supposed to be
 calling them — `uc_node` is the only caller, and it ships in lockstep. The
 wire change that rode along (`SNAP_BEGIN`) is a **flag day**, governed by the
-rule below, not by this table: wire `0.6.0`.
+rule below, not by this table: wire `0.6.0`, then `0.7.0` for FSM identity.
 
 Also outside the promise:
 
@@ -164,8 +164,8 @@ Two version numbers are deliberately *outside* this policy, because semver's
 "a minor bump is safe" contract is the wrong promise for them:
 
 - **The node-to-node wire protocol** (`uc_protocol::version::CURRENT`,
-  currently `0.6.0` — see [wire protocol](wire-protocol.md)).
-- **The `cnc.dat` page layout** (`CNC_V2_VERSION` — see
+  currently `0.7.0` — see [wire protocol](wire-protocol.md)).
+- **The `cnc.dat` page layout** (`CNC_V2_VERSION`, currently cnc 3.1 — see
   [the cnc control page](cnc-page.md)).
 
 A change to either is a **flag day**: every node in a cluster is stopped and
@@ -176,6 +176,14 @@ supported and is not made safe by the version numbers agreeing on a major.
 cluster stalls commits rather than making unsound ones. The procedure is
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
 not the crate version's major digit moved.
+
+**FSM identity (2.11 pending) is the latest flag day on both lines**: wire
+`0.6.0` → `0.7.0` (`SNAP_BEGIN`'s bitmask becomes a per-row identity-hash
+array plus a per-row version array — a 0.6.0 sender's shorter body is
+dropped by length, the same as every prior bump) and cnc `3.0` → `3.1` (the
+once-reserved slot line 7 becomes node-written at boot: name + hash). Bundled
+as one combined flag day, per the standing rule that a cnc layout change is a
+flag day regardless of the digit.
 
 ## The one-way door: one tier per type
 
@@ -242,6 +250,36 @@ no cluster and no operator command changed at all.
 This is an exception granted once, on a fact that stopped being true the
 moment `2.9.0` was published. **Any later rename of a promised path is a
 `3.0.0`**, whatever the reason.
+
+### FSM identity: a breaking trait and config change riding as a minor
+
+FSM identity (spec
+`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §10) is a
+**second, narrower carve-out**, on the project having no external users yet
+to break — not the "nothing published" fact 2.9.0 relied on (crates.io
+publishing started at `2.9.0`; every crate is live, so this one *could*
+break a resolver, in principle, if anyone depended on the changed items).
+The break, under the rule above, is real:
+
+- `RawStateMachine`/`StateMachine` gain a **required** `const NAME:
+  &'static str`; `apply`'s signature changes from `(&mut self, position:
+  u64, cmd)` to `(&mut self, ctx: &mut ApplyCtx, cmd)` — every implementor
+  in a downstream tree must add both.
+- `uc_service::ServiceConfig` **loses** its `.service_id()` setter — a
+  service no longer states its row, it is found by name.
+- `uc_node`'s `--service-id` CLI flags are **gone**, replaced by `--fsm
+  <name>` on the harness binaries and `--services <names>` on the node.
+- `[services]` goes from optional (absent ⇒ `ids = [0]`) to **required**,
+  and its `ids` key is refused outright, pointing at `names`.
+
+The maintainer's decision (spec §10, applied 2026-09-02): ship this as the
+**next minor**, `2.11.0`, rather than `3.0.0` — the same reasoning as every
+other freely-made API change on this project while it has no external
+users (there is no deprecation lane to skip, and no lockfile anywhere
+depends on the old shapes). This is **not** a standing exception: it is one
+maintainer decision for one release, recorded here so it is not mistaken
+for a change to the rule above. The next breaking change is `3.0.0` unless
+the maintainer says otherwise again, at the time.
 
 ## Related
 

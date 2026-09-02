@@ -7,6 +7,84 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## Unreleased — FSM identity (next minor, 2.11.0 when cut)
+
+**Implemented on branch `uc2/fsm-identity`; release on hold pending further
+changes.** This section is a draft, written ahead of the tag so the writeup
+is ready when the maintainer green-lights it — see
+[the release-evidence table](docs/releases.md#release-evidence) for what is
+verified so far and what still says "pending". **No version has been
+bumped, nothing has been tagged, and no fleet gate has run.**
+
+An FSM's identity — the name a state machine declares in its own code — now
+travels everywhere the cluster used to check only a bare row number, closing
+the gap where two nodes could agree on a *set* of numbered slots and never
+on what logic lived behind each one.
+
+- **An FSM declares its own name and version in code**, not in deployment
+  config: a required `const NAME: &'static str` and an optional `const
+  VERSION: u32` on the state-machine trait. `[services]` in `node.toml`
+  becomes `names = [...]` (required, no default — the same explicit-choice
+  posture `[crypto]`/`[admin]` have had since 2.6.0) and a service finds its
+  row by scanning for its own name rather than being told a number.
+  → [The FSM identity explainer](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md) ·
+  [Configuration § `[services]`](docs/reference/configuration.md#services)
+- **A mismatched cluster is refused by name, not left to silently diverge.**
+  `SNAP_BEGIN` (wire `0.7.0`) carries each row's identity hash and version
+  in row order; a receiver compares them **positionally** — same names in a
+  different order are refused too, not just a different set — and names the
+  refusal: "row 1: ours=orders, theirs=kv". This is the failure M14's bare
+  bitmask could not even detect: two nodes running different logic at the
+  same row, silently.
+  → [The FSM identity explainer](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md) ·
+  [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-070-cnc-31)
+- **`ApplyCtx` and `IdGen`: deterministic IDs with zero coordination.** The
+  apply signature becomes `apply(&mut self, ctx: &mut ApplyCtx, cmd, out)`;
+  `ctx.ids()` mints IDs from `(position, FSM identity, an ordinal that
+  resets every apply call)` — the same series on a snapshot-installed
+  replica and a journal-replayed one, by construction, with no state to
+  snapshot. `#[non_exhaustive]` on purpose: the parallel timestamps/
+  scheduler design adds fields here later without a second signature break.
+  → [The FSM identity explainer § `IdGen`](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md#idgen--deterministic-ids-and-why-per-apply-scoping-is-the-whole-story)
+- **Per-FSM version is now visible, cluster-wide, in steady state, not just
+  at snapshot time.** Two new gauges per row, `uc2_service_identity_hash`
+  and `uc2_service_version`, feed two new alert rules,
+  `Uc2ServiceIdentityDrift` and `Uc2ServiceVersionDrift` — a config or
+  binary mismatch pages before a joiner ever needs to open a session.
+  `uc2ctl status` prints `row= name= version= hash=` per row.
+  → [Monitor a cluster § The per-FSM families](docs/how-to/monitor-a-cluster.md#the-per-fsm-families-m14-labels-since-fsm-identity-211-pending)
+
+**Removed (breaking)**
+
+- **The apply trait signature changes**: `apply(&mut self, position: u64,
+  cmd)` → `apply(&mut self, ctx: &mut ApplyCtx, cmd)`, and every state
+  machine gains a required `const NAME`. `uc_service::ServiceConfig` loses
+  its `.service_id()` setter. Every `--service-id` CLI flag is gone,
+  replaced by `--fsm <name>` on harness binaries that host more than one
+  FSM type (a production service that links one state machine needs no
+  flag). `[services]` goes from optional to required, and its old `ids` key
+  is refused outright, pointing at `names`. This is a real breaking change
+  under [the semver policy](docs/reference/semver-policy.md); the
+  maintainer's decision (spec §10) is to ship it as the next minor rather
+  than a major, on the project having no external users yet to break — see
+  [the semver policy § FSM identity carve-out](docs/reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor)
+  for the reasoning, which is not a standing exception.
+- **Wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`, one combined flag day.**
+  `SNAP_BEGIN`'s `services_declared` bitmask becomes a per-row identity-hash
+  array plus a per-row version array; the cnc page's once-reserved slot line
+  7 becomes node-written at boot (name + hash). A mixed-version cluster
+  stalls a joiner rather than installing a wrong or half-checked artifact —
+  the standing rule every prior wire bump has followed.
+  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-070-cnc-31)
+
+**Performance**
+
+- **Not measured yet.** The hot commit/apply path is untouched by this
+  work — every change is at config load, attach, and the snapshot-session
+  boundary — so the expected delta is null, but no fleet run has confirmed
+  it. Bars are pre-committed, results empty, per the honest-failure
+  protocol: → [FSM identity gate skeleton](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md).
+
 ## v2.10.0 — 2026-08-31
 
 **One log stream, config from the environment, and a memory-ordering fix a

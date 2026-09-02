@@ -99,16 +99,30 @@ stamping its claim word (`IngressRingWedged`), and a record at the
 consumer position that does not decode (`IngressRingCorrupt`). See
 [Diagnose a node: my node just fail-stopped with `IngressRingWedged`](diagnose-a-node.md#my-node-just-fail-stopped-with-ingressringwedged).
 
-### The per-FSM families (M14)
+### The per-FSM families (M14; labels since FSM identity, 2.11 pending)
 
-A node runs one FSM per declared service id (`[services] ids`), and every
-service family carries a `service="<id>"` label per declared id:
+A node runs one FSM per declared row (`[services] names`), and every
+service family carries a `service="<name>",row="<r>"` label pair per
+declared row (before FSM identity this was `service="<id>"` alone — the
+`row` label keeps the same meaning the old bare `service` label had, and
+existing dashboards' grouping keys by row still work):
 `uc_service_applied_bytes`, `uc_service_epoch`,
 `uc_service_snapshot_pos_bytes`, `uc_service_heartbeat_age_seconds`,
 `uc_service_attached`, `uc_service_lag_bytes` (= `commit − applied`),
 `uc_service_lag_waits_total`. Two node-scalar gauges describe the set
-itself: `uc_services_declared` (the bitmask — bit *k* = id *k*) and
+itself: `uc_services_declared` (the bitmask — bit *k* = row *k*) and
 `uc2_fsm_lag_bytes` (the lag bound; **0 means lockstep**).
+
+**Two new gauges per row (FSM identity, 2.11 pending), exported from the cnc
+slot band**: `uc2_service_identity_hash{service="<name>",row="<r>"}` (the
+FNV-1a 64 of the row's declared name — an exact float64 sample: 64-bit
+integers up to 2^53 round-trip losslessly on the wire, and any two real
+FNV-1a 64 hashes would have to agree in their top 53 bits to collide after
+scraping) and `uc2_service_version{service="<name>",row="<r>"}` (the
+attached service's packed version; `0` = none/unversioned). These are the
+**early** guard for the late `SNAP_BEGIN` cross-node check (§2.1 of the
+spec) — a cross-node query compares them in steady state, before any
+snapshot session ever runs.
 
 Two shapes to know before writing a query:
 
@@ -135,10 +149,24 @@ case, since a byte bound rarely divides the frame stream — reported 0. Since
 actually keys on.
 
 Declared sets must match across nodes (spec §8). There is no alert rule for
-drift, because it is a query over the fleet rather than a per-node
-condition — `count(count_values("v", uc_services_declared))` is `1` on a
-healthy cluster and `> 1` the moment two nodes disagree. The dashboard ships
-it as the "Declared sets agreeing" stat.
+the bitmask's drift, because it is a query over the fleet rather than a
+per-node condition — `count(count_values("v", uc_services_declared))` is `1`
+on a healthy cluster and `> 1` the moment two nodes disagree. The dashboard
+ships it as the "Declared sets agreeing" stat.
+
+**Since FSM identity (2.11 pending), the same class of drift *does* have
+dedicated alert rules**, keyed on the two new gauges above, because they
+carry per-row identity rather than a set-membership bit:
+`Uc2ServiceIdentityDrift` — `count by (row) (count_values("hash",
+uc2_service_identity_hash) by (row)) > 1` — fires the moment two nodes'
+row-`r` FSM names disagree, and `Uc2ServiceVersionDrift` — `count by (row)
+(count_values("version", uc2_service_version > 0) by (row)) > 1` — fires
+when two nodes' row-`r` attached versions disagree (excluding the
+unattached/unversioned `0` case, so a joiner whose service hasn't started
+yet does not page). Both are per-row fleet queries like the declared-set one
+above, **not** a bare `count by (row) (uc2_service_identity_hash) > 1` —
+that counts *series* (one per node instance), not distinct values, and pages
+permanently on any multi-node cluster.
 
 ## Install the alert rules
 
@@ -184,6 +212,8 @@ table:
 | `Uc2DiskLow` | `uc2_free_disk_bytes` has sat below 4 journal segments' worth of free space for 2m — the archive fail-stops at `ENOSPC`; purge or grow the disk | warning |
 | `Uc2ServiceAbsent` | a declared FSM's `uc_service_attached` has read 0 for 30s — it was never started, or it stopped. Admission is closed and this node's durable report is capped at the lag bound, so the cluster stalls by design until it attaches | critical |
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
+| `Uc2ServiceIdentityDrift` (FSM identity, 2.11 pending) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
+| `Uc2ServiceVersionDrift` (FSM identity, 2.11 pending) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 
