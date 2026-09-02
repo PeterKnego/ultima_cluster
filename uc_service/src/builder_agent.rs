@@ -100,6 +100,7 @@ mod tests {
             app_id: "builder-test".into(),
             buffer_bytes: 1 << 20,
             max_payload: 256,
+            services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         })
     }
 

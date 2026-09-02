@@ -42,6 +42,7 @@ fn heap_buffer() -> Arc<LogBuffer> {
         app_id: "snap".into(),
         buffer_bytes: CAP,
         max_payload: 256,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     });
     Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), cnc, 256))
 }

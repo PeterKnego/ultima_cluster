@@ -13,6 +13,7 @@ fn test_cnc() -> Arc<CncPage> {
         app_id: "test".into(),
         buffer_bytes: 1 << 16,
         max_payload: 1024,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     })
 }
 

@@ -659,6 +659,8 @@ impl Node {
             app_id: cfg.app_id.clone(),
             buffer_bytes: cfg.buffer_bytes as u64,
             max_payload: cfg.max_payload as u32,
+            // cnc 3.1: no names yet — Task 4 makes the node pass real ones.
+            services: [None; CNC_MAX_SERVICES],
         };
         let cnc = CncPage::create_file(&instance.cnc_path(), &meta).map_err(to_io)?;
         cnc.counters().prime(durable);
@@ -6318,6 +6320,7 @@ mod tests {
             app_id: "test".into(),
             buffer_bytes: 1 << 16,
             max_payload: 4096,
+            services: [None; CNC_MAX_SERVICES],
         })
     }
 

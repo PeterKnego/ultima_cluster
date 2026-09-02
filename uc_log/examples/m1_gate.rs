@@ -48,6 +48,7 @@ fn main() {
         app_id: "test".into(),
         buffer_bytes: buffer_mib * 1024 * 1024,
         max_payload: 1024 * 1024,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     });
     let mut archive = Archive::open(ArchiveConfig::new(&journal_dir)).unwrap();
     cnc.counters().prime(archive.recovered_position());

@@ -72,6 +72,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         app_id: "test-app".into(),
         buffer_bytes: 1 << 20,
         max_payload: 1200,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     };
     let cnc = CncPage::heap(&meta);
 

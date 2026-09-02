@@ -79,6 +79,7 @@ impl ObsSources {
             app_id: "fuzz".into(),
             buffer_bytes: 1 << 20,
             max_payload: 1200,
+            services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         };
         ObsSources {
             node_id: 7,

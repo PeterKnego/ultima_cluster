@@ -829,6 +829,7 @@ mod tests {
             app_id: "test".into(),
             buffer_bytes: cap as u64,
             max_payload: 256,
+            services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         });
         let b = Arc::new(LogBuffer::new(
             Region::heap_zeroed(cap),

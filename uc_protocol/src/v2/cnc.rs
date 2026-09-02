@@ -50,12 +50,12 @@ pub const CNC_MAGIC: &[u8; 8] = b"UC2CNC\0\0";
 /// unchanged, page 2 is the per-service slot band (`CNC_OFF_SERVICE_SLOTS`).
 pub const CNC_PAGE_LEN: usize = 8192;
 /// Packed like `uc_protocol::ProtocolVersion`: `(major << 24) | (minor << 16) | patch`.
-/// 3.0 (M14a): the page grew to two 4 KiB pages, the singular service band on
-/// page 1 became node-written aggregates, and `MSG_V2_QUERY` gained a
-/// service-id prefix (M14b) — a 2.0 party would misread all three, so it is a
-/// major bump: every same-host attacher refuses the other side's page.
-#[allow(clippy::identity_op)] // (0 << 16) spells out the packing explicitly (minor = 0)
-pub const CNC_V2_VERSION: u32 = (3 << 24) | (0 << 16);
+/// 3.1 (FSM identity): each service slot's line 7 carries the row's name +
+/// identity hash (node-written at boot) and the status line's second word the
+/// attached service's version. A 3.0 attacher does not read either, and a 3.1
+/// attacher on a 3.0 page finds no names — both refuse by name. Flag day by
+/// policy (`docs/reference/semver-policy.md`).
+pub const CNC_V2_VERSION: u32 = (3 << 24) | (1 << 16);
 
 // ---- header (byte offsets) ------------------------------------------------
 pub const CNC_OFF_MAGIC: usize = 0; // [u8; 8]
@@ -256,16 +256,20 @@ const _: () = assert!(
 // M14a: page 2 — `ServiceSlot[CNC_MAX_SERVICES]`. One slot per service id,
 // fixed 512 B stride (eight 64 B lines), ONE WRITER PER LINE — every line is
 // written by one agent of the service process that owns the slot, except the
-// reserved line 7. Per-slot layout (offsets relative to the slot base):
+// identity line 7 (cnc 3.1: node-written once, at boot). Per-slot layout
+// (offsets relative to the slot base):
 //   +0   status          u64 = service_id (bits 0..8) | attached (bit 8)
 //                              | incarnation (bits 32..64)    writer: service (attach/detach)
+//   +8   version         u64 (low 32 = packed FSM version)   writer: service (attach)
 //   +64  applied         u64 position                          writer: service apply agent
 //   +128 epoch           u64 (attach-time fetch_add, AcqRel)   writer: service (attach)
 //   +192 output_completed u64 position                         writer: service output agent
 //   +256 snapshot_pos    u64 position                          writer: service builder agent
 //   +320 heartbeat_ns    u64 unix ns                           writer: service apply agent
 //   +384 lag_waits       u64 count                             writer: service apply agent
-//   +448 reserved (zero)
+//   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
+//   +480 identity_hash   u64 FNV-1a 64 of the name             writer: node (init, boot-once)
+//   +488 reserved (zero)
 pub const CNC_OFF_SERVICE_SLOTS: usize = 4096;
 pub const CNC_SERVICE_SLOT_STRIDE: usize = 512;
 pub const CNC_MAX_SERVICES: usize = 8;
@@ -283,6 +287,15 @@ pub const CNC_SVC_STATUS_ATTACHED: u64 = 1 << 8;
 /// `status` bits 32..64: the attach count of this id on this page (bumped
 /// per attach, so a restart is visible even before the epoch is read).
 pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
+/// cnc 3.1: the attached service's packed version (`identity::pack_version`),
+/// low 32 bits of the status line's second word. `0` = unversioned/absent.
+pub const CNC_SVC_OFF_VERSION: usize = 8;
+/// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash.
+pub const CNC_SVC_OFF_NAME: usize = 448;
+pub const CNC_SVC_NAME_LEN: usize = 32;
+pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
+const _: () = assert!(CNC_SVC_OFF_NAME == CNC_SVC_OFF_RESERVED);
+const _: () = assert!(CNC_SVC_OFF_IDENTITY_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE);
 const _: () = assert!(
     CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE <= CNC_PAGE_LEN,
     "service-slot band overruns the cnc page"
@@ -465,8 +478,8 @@ mod tests {
         write_cnc_header(&mut page, &h, "kv");
         // magic
         assert_eq!(&page[0..8], b"UC2CNC\0\0");
-        // version = (3<<24)|(0<<16) = 0x0300_0000 -> LE [0,0,0,3]
-        assert_eq!(&page[8..12], &[0x00, 0x00, 0x00, 0x03]);
+        // version = (3<<24)|(1<<16) = 0x0301_0000 -> LE [0,0,1,3]
+        assert_eq!(&page[8..12], &[0x00, 0x00, 0x01, 0x03]);
         // node_id = 7 -> LE [7,0,0,0]
         assert_eq!(&page[12..16], &[7, 0, 0, 0]);
     }
@@ -686,5 +699,20 @@ mod tests {
         );
         assert_eq!(CNC_PAGE_LEN, 8192);
         assert_eq!(CNC_SVC_STATUS_ATTACHED, 1 << 8);
+        // FSM identity (cnc 3.1): version word in the status line, name +
+        // hash on the once-reserved line 7. Both inside the 512 B slot.
+        assert_eq!(CNC_V2_VERSION, (3 << 24) | (1 << 16));
+        assert_eq!(CNC_SVC_OFF_VERSION, 8);
+        assert_eq!(CNC_SVC_OFF_NAME, 448);
+        assert_eq!(CNC_SVC_NAME_LEN, 32);
+        assert_eq!(
+            CNC_SVC_OFF_IDENTITY_HASH,
+            CNC_SVC_OFF_NAME + CNC_SVC_NAME_LEN
+        );
+        const { assert!(CNC_SVC_OFF_IDENTITY_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE) };
+        assert_eq!(
+            CNC_SVC_OFF_NAME, CNC_SVC_OFF_RESERVED,
+            "line 7 is the identity line"
+        );
     }
 }

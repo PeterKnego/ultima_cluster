@@ -142,6 +142,7 @@ fn main() -> anyhow::Result<()> {
         app_id: APP.into(),
         buffer_bytes,
         max_payload: MAX_PAYLOAD,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     };
     let cnc = CncPage::create_file(&a.root.join("cnc2.dat"), &meta)?;
     let mask = (1u64 << a.fsms) - 1;

@@ -127,6 +127,7 @@ fn make_buffer() -> (Arc<LogBuffer>, Arc<CncPage>) {
         app_id: "stress".into(),
         buffer_bytes: CAP,
         max_payload: MAX_PAYLOAD as u32,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     });
     let buffer = Arc::new(LogBuffer::new(
         Region::heap_zeroed(CAP as usize),

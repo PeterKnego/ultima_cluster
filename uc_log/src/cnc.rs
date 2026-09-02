@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ,
     CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE,
@@ -44,6 +45,10 @@ pub struct CncMeta {
     pub app_id: String,
     pub buffer_bytes: u64,
     pub max_payload: u32,
+    /// cnc 3.1: the row → name map, written into each slot's line 7 by
+    /// `init`, before the header. `None` = row undeclared. A harness page
+    /// (`ServicesConfig::none_for_tests`) is all `None`.
+    pub services: [Option<FsmName>; CNC_MAX_SERVICES],
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -163,19 +168,67 @@ pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
     ((naks_served as u64) << 32) | replay_datagrams as u64
 }
 
+/// cnc 3.1: the slot's line 0 — `status` (word 0) and the attached service's
+/// packed version (word 1). One writer (the service, at attach/detach).
+#[repr(C)]
+pub struct ServiceStatusLine {
+    status: AtomicU64,
+    version: AtomicU64,
+    _pad: [u64; 6],
+}
+impl ServiceStatusLine {
+    pub fn load_acquire(&self) -> u64 {
+        self.status.load(Ordering::Acquire)
+    }
+    pub fn store_release(&self, v: u64) {
+        self.status.store(v, Ordering::Release)
+    }
+    pub fn version(&self) -> u32 {
+        self.version.load(Ordering::Acquire) as u32
+    }
+    pub fn store_version(&self, v: u32) {
+        self.version.store(v as u64, Ordering::Release)
+    }
+}
+const _: () = assert!(std::mem::size_of::<ServiceStatusLine>() == 64);
+const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, version) == cnc::CNC_SVC_OFF_VERSION);
+
+/// cnc 3.1: the slot's line 7 — the row's name (NUL-padded) and its FNV-1a
+/// hash, written ONCE by the node in `init`, before the header is published,
+/// and never again. Read-only for every attacher.
+#[repr(C)]
+pub struct ServiceIdentityLine {
+    name: [u8; cnc::CNC_SVC_NAME_LEN],
+    hash: AtomicU64,
+    _pad: [u64; 3],
+}
+impl ServiceIdentityLine {
+    pub fn name(&self) -> Option<FsmName> {
+        FsmName::from_padded(&self.name)
+    }
+    pub fn hash(&self) -> u64 {
+        self.hash.load(Ordering::Acquire)
+    }
+}
+const _: () = assert!(std::mem::size_of::<ServiceIdentityLine>() == 64);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceIdentityLine, hash)
+        == cnc::CNC_SVC_OFF_IDENTITY_HASH - cnc::CNC_SVC_OFF_NAME
+);
+
 /// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
 /// `CNC_OFF_SERVICE_SLOTS` doc for the writer-per-line table. Same shape as
 /// [`PeerSlot`]: every field its own cache line, `#[repr(C)]`, stride pinned.
 #[repr(C)]
 pub struct ServiceSlot {
-    pub status: PaddedAtomicU64,
+    pub status: ServiceStatusLine,
     pub applied: PaddedAtomicU64,
     pub epoch: PaddedAtomicU64,
     pub output_completed: PaddedAtomicU64,
     pub snapshot_pos: PaddedAtomicU64,
     pub heartbeat_ns: PaddedAtomicU64,
     pub lag_waits: PaddedAtomicU64,
-    pub reserved: PaddedAtomicU64,
+    pub identity: ServiceIdentityLine,
 }
 
 const _: () = assert!(std::mem::size_of::<ServiceSlot>() == 512);
@@ -191,7 +244,7 @@ const _: () =
 const _: () =
     assert!(std::mem::offset_of!(ServiceSlot, heartbeat_ns) == cnc::CNC_SVC_OFF_HEARTBEAT_NS);
 const _: () = assert!(std::mem::offset_of!(ServiceSlot, lag_waits) == cnc::CNC_SVC_OFF_LAG_WAITS);
-const _: () = assert!(std::mem::offset_of!(ServiceSlot, reserved) == cnc::CNC_SVC_OFF_RESERVED);
+const _: () = assert!(std::mem::offset_of!(ServiceSlot, identity) == cnc::CNC_SVC_OFF_NAME);
 
 /// Pack a slot's `status` word: `service_id` (bits 0..8) | attached (bit 8)
 /// | `incarnation` (bits 32..64).
@@ -354,6 +407,20 @@ impl CncPage {
             max_payload: meta.max_payload,
         };
         let page = self.page_mut();
+        // cnc 3.1: names + hashes on each slot's line 7, BEFORE the header —
+        // an attacher that passes `validate` must already see them.
+        for (row, name) in meta.services.iter().enumerate() {
+            let base = cnc::CNC_OFF_SERVICE_SLOTS + row * cnc::CNC_SERVICE_SLOT_STRIDE;
+            let (n, h) = match name {
+                Some(n) => (n.padded(), n.hash()),
+                None => ([0u8; cnc::CNC_SVC_NAME_LEN], 0u64),
+            };
+            page[base + cnc::CNC_SVC_OFF_NAME
+                ..base + cnc::CNC_SVC_OFF_NAME + cnc::CNC_SVC_NAME_LEN]
+                .copy_from_slice(&n);
+            page[base + cnc::CNC_SVC_OFF_IDENTITY_HASH..base + cnc::CNC_SVC_OFF_IDENTITY_HASH + 8]
+                .copy_from_slice(&h.to_le_bytes());
+        }
         cnc::write_cnc_header(page, &header, &meta.app_id);
         let crc = crc32fast::hash(&page[..CNC_OFF_HEADER_CRC]);
         page[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
@@ -527,6 +594,21 @@ impl CncPage {
         // SAFETY: as `peer_slot` — off is 64-aligned (4096 + i*512), the slot
         // is 512 bytes, and 4096 + 8*512 = 8192 = CNC_PAGE_LEN.
         unsafe { &*(self.region.ptr_at(off) as *const ServiceSlot) }
+    }
+
+    /// cnc 3.1: every row's name (`None` = undeclared), straight off line 7.
+    pub fn service_names(&self) -> [Option<FsmName>; CNC_MAX_SERVICES] {
+        let mut out = [None; CNC_MAX_SERVICES];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.service_slot(i).identity.name();
+        }
+        out
+    }
+    /// The row declared under `name`, if any.
+    pub fn row_of(&self, name: &FsmName) -> Option<u8> {
+        (0..CNC_MAX_SERVICES)
+            .find(|&i| self.service_slot(i).identity.name() == Some(*name))
+            .map(|i| i as u8)
     }
 
     /// M14a: bit `i` set ⇔ service id `i` is declared. Boot-once, node-written.
@@ -837,6 +919,10 @@ impl CncPage {
             app_id: cnc::read_cnc_app_id(page).to_string(),
             buffer_bytes: header.buffer_bytes,
             max_payload: header.max_payload,
+            // cnc 3.1: decode straight off line 7 rather than hardcoding
+            // `None` — `init` already wrote real names before this page was
+            // ever readable, so lying here would be actively wrong.
+            services: self.service_names(),
         }
     }
 
@@ -892,6 +978,7 @@ mod tests {
             app_id: "test-app".into(),
             buffer_bytes: 1 << 20,
             max_payload: 256,
+            services: [None; CNC_MAX_SERVICES],
         }
     }
 
@@ -1087,7 +1174,7 @@ mod tests {
             cnc::CNC_SVC_OFF_LAG_WAITS
         );
         assert_eq!(
-            &s0.reserved as *const _ as usize - s0_base,
+            &s0.identity as *const _ as usize - s0_base,
             cnc::CNC_SVC_OFF_RESERVED
         );
         assert_eq!(page.page().len(), 8192);
@@ -1146,6 +1233,7 @@ mod tests {
             app_id: "kv".into(),
             buffer_bytes: 1 << 20,
             max_payload: 256,
+            services: [None; CNC_MAX_SERVICES],
         };
         let page = CncPage::create_file(&p, &meta).unwrap();
         page.counters().append.store_release(4096);
@@ -1234,6 +1322,7 @@ mod tests {
             app_id: app_id.clone(),
             buffer_bytes: 1 << 22,
             max_payload: 512,
+            services: [None; CNC_MAX_SERVICES],
         };
         let page = CncPage::heap(&meta);
         let out = page.meta();
@@ -1262,7 +1351,7 @@ mod tests {
         // the version check trips (not crc).
         {
             let mut raw = std::fs::read(&p).unwrap();
-            let newer = CNC_V2_VERSION | (1 << 16); // minor bumped
+            let newer = CNC_V2_VERSION + (1 << 16); // minor bumped past ours
             raw[CNC_OFF_VERSION..CNC_OFF_VERSION + 4].copy_from_slice(&newer.to_le_bytes());
             let crc = crc32fast::hash(&raw[..CNC_OFF_HEADER_CRC]);
             raw[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
@@ -1563,6 +1652,48 @@ mod tests {
     fn service_slot_index_is_bounds_checked() {
         let page = CncPage::heap(&test_meta());
         let _ = page.service_slot(8);
+    }
+
+    #[test]
+    fn init_writes_names_and_hashes_on_line_seven_and_attachers_find_rows() {
+        use uc_protocol::identity::FsmName;
+        let dir = tempfile::tempdir().unwrap();
+        let kv = FsmName::parse("kv").unwrap();
+        let orders = FsmName::parse("orders").unwrap();
+        let mut services = [None; CNC_MAX_SERVICES];
+        services[0] = Some(kv);
+        services[1] = Some(orders);
+        let meta = CncMeta {
+            node_id: 1,
+            instance_id: 7,
+            app_id: "app".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
+            services,
+        };
+        let page = CncPage::create_file(&dir.path().join("cnc2.dat"), &meta).unwrap();
+        assert_eq!(page.service_slot(0).identity.name(), Some(kv));
+        assert_eq!(page.service_slot(0).identity.hash(), kv.hash());
+        assert_eq!(page.service_slot(1).identity.name(), Some(orders));
+        assert_eq!(page.service_slot(2).identity.name(), None);
+        assert_eq!(page.row_of(&orders), Some(1));
+        assert_eq!(page.row_of(&FsmName::parse("nope").unwrap()), None);
+        // The version word is the service's: zero at boot, settable, read back.
+        assert_eq!(page.service_slot(1).status.version(), 0);
+        page.service_slot(1).status.store_version(0x0102_0003);
+        assert_eq!(page.service_slot(1).status.version(), 0x0102_0003);
+        // And it shares line 0 with `status` without disturbing it.
+        page.service_slot(1)
+            .status
+            .store_release(pack_service_status(1, true, 3));
+        assert_eq!(
+            unpack_service_status(page.service_slot(1).status.load_acquire()),
+            (1, true, 3)
+        );
+        assert_eq!(page.service_slot(1).status.version(), 0x0102_0003);
+        // A reopened page sees the names (they are bytes on the file).
+        let again = CncPage::open_file(&dir.path().join("cnc2.dat"), "app").unwrap();
+        assert_eq!(again.service_names()[1], Some(orders));
     }
 
     #[test]

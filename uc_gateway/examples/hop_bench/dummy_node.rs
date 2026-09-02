@@ -167,6 +167,7 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         app_id: a.app_id.clone(),
         buffer_bytes: a.ingress_bytes,
         max_payload: a.max_payload,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     };
     let cnc = CncPage::create_file(&a.instance_dir.join("cnc2.dat"), &meta)
         .map_err(|e| anyhow::anyhow!("create cnc page: {e}"))?;

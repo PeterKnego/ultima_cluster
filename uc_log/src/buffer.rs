@@ -799,6 +799,7 @@ mod tests {
             app_id: "test".into(),
             buffer_bytes: CAP,
             max_payload: 256,
+            services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         })
     }
 

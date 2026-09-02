@@ -357,6 +357,7 @@ fn synthetic_sources(node_id: u32) -> ObsSources {
         app_id: APP.into(),
         buffer_bytes: RING_BYTES as u64,
         max_payload: 1200,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     };
     let cnc = CncPage::heap(&meta);
     ObsSources {

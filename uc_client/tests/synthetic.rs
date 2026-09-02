@@ -31,6 +31,7 @@ fn meta(app_id: &str) -> CncMeta {
         app_id: app_id.into(),
         buffer_bytes: MIB,
         max_payload: 256,
+        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
     }
 }
 
