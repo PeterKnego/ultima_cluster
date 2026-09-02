@@ -62,6 +62,7 @@ use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig};
 use uc_service::{
     ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine, StateMachine,
+    Tagged,
 };
 
 use uc_lincheck::history::{History, Outcome};
@@ -261,14 +262,22 @@ impl Default for ClusterCfg {
 /// The `NodeConfig::services` a [`ClusterCfg`] declares. `Single` is
 /// `ServicesConfig::single(RegisterSm::NAME)` — the exact value every
 /// pre-M14c2 node booted with, so the `Single` path is byte-identical.
-fn services_config(ccfg: ClusterCfg) -> uc_node::ServicesConfig {
+///
+/// FSM identity: under `Two`, row 0 must be declared under the ACTUAL row-0
+/// SM's name (`SM::NAME`), not the generic `Tagged` row names `tagged(2)`
+/// used to declare — attach now finds its row by name, and row 0's service
+/// is the plain `SM`, never wrapped in `Tagged` (only row 1 is,
+/// `spawn_service_row1`). Row 1 stays the `Tagged` convention `"fsm1"`.
+fn services_config<SM: SnapshotStateMachine>(ccfg: ClusterCfg) -> uc_node::ServicesConfig {
     match ccfg.services {
         FsmSet::Single => uc_node::ServicesConfig::single(RegisterSm::NAME),
-        FsmSet::Two { lag } => uc_node::ServicesConfig::tagged(2).with_lag(Some(lag)),
+        FsmSet::Two { lag } => {
+            uc_node::ServicesConfig::from_names(&[SM::NAME, "fsm1"], Some(lag)).unwrap()
+        }
     }
 }
 
-fn make_config(
+fn make_config<SM: SnapshotStateMachine>(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
     instance_dir: PathBuf,
@@ -308,7 +317,7 @@ fn make_config(
         learners: Vec::new(),
         journal_segment_bytes: ccfg.journal_segment_bytes,
         crypto,
-        services: services_config(ccfg),
+        services: services_config::<SM>(ccfg),
     }
 }
 
@@ -331,16 +340,16 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 /// from the replicated log (journal replay, Task 9) — that reconstruction is
 /// exactly what the capstone's service-crash fault proves.
 ///
-/// M14c2: `id` is the FSM the service attaches as — `0` everywhere the
-/// pre-M14c2 harness spawned a service (`ServiceConfig::service_id(0)` is the
-/// default, so the `Single` path is unchanged), `1` for the second FSM under
-/// [`FsmSet::Two`].
+/// FSM identity: attach finds its row by `SM::NAME` now (Task 5), so this
+/// always lands wherever the node declared that name — row 0 for the
+/// `Single`/`Two` posture's first FSM. `SM1` under [`FsmSet::Two`] is always
+/// wrapped in [`Tagged<1, _>`](spawn_service_row1), never passed here
+/// directly.
 fn spawn_service<SM: SnapshotStateMachine + Default>(
     dir: &Path,
     snapshot_interval_bytes: u64,
-    id: u8,
 ) -> uc_service::Service<SM> {
-    let cfg = ServiceConfig::new(dir, APP).service_id(id);
+    let cfg = ServiceConfig::new(dir, APP);
     if snapshot_interval_bytes == 0 {
         ServiceBuilder::new(cfg, SM::default())
             .start()
@@ -358,23 +367,39 @@ fn spawn_service<SM: SnapshotStateMachine + Default>(
     }
 }
 
-/// The second FSM (id 1) under [`FsmSet::Two`], else `None`. Every path that
+/// The second FSM under [`FsmSet::Two`], row 1, declared name `"fsm1"`
+/// ([`services_config`]). FSM identity: attach now finds its row by name, so
+/// the row-1 service must present NAME `"fsm1"` — [`Tagged<1, SM1>`] does
+/// that by construction regardless of `SM1`'s own NAME (`Slow<RegisterSm,_>`
+/// and `Corrupt<RegisterSm>` both keep whatever name they were written with,
+/// which would otherwise collide with row 0 or mismatch the declared set).
+fn spawn_service_row1<SM1: SnapshotStateMachine + StateMachine + Default>(
+    dir: &Path,
+    snapshot_interval_bytes: u64,
+) -> uc_service::Service<Tagged<1, SM1>> {
+    spawn_service::<Tagged<1, SM1>>(dir, snapshot_interval_bytes)
+}
+
+/// The second FSM (row 1) under [`FsmSet::Two`], else `None`. Every path that
 /// spawns a node's service pairs it with this one, so a node under `Two` always
 /// has BOTH declared FSMs attached (a node missing one stalls commit by design
 /// — the report ceiling).
-fn spawn_service1<SM1: SnapshotStateMachine + Default>(
+fn spawn_service1<SM1: SnapshotStateMachine + StateMachine + Default>(
     dir: &Path,
     ccfg: ClusterCfg,
-) -> Option<uc_service::Service<SM1>> {
+) -> Option<uc_service::Service<Tagged<1, SM1>>> {
     matches!(ccfg.services, FsmSet::Two { .. })
-        .then(|| spawn_service::<SM1>(dir, ccfg.snapshot_interval_bytes, 1))
+        .then(|| spawn_service_row1::<SM1>(dir, ccfg.snapshot_interval_bytes))
 }
 
 // ------------------------------------------------------------------ one slot
 
 /// One cluster member: its fixed identity/address/dir plus the live node +
 /// service (taken out of their `Option`s across a crash/restart).
-pub struct NodeSlot<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> {
+pub struct NodeSlot<
+    SM: SnapshotStateMachine + Default,
+    SM1: SnapshotStateMachine + StateMachine + Default,
+> {
     id: NodeId,
     addr: SocketAddr,
     instance_dir: PathBuf,
@@ -382,10 +407,12 @@ pub struct NodeSlot<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachin
     service: Option<uc_service::Service<SM>>,
     /// M14c2: the node's FSM-1 service under [`FsmSet::Two`]; `None` under
     /// `Single`. Taken/respawned in lockstep with `service` on every crash path.
-    service1: Option<uc_service::Service<SM1>>,
+    service1: Option<uc_service::Service<Tagged<1, SM1>>>,
 }
 
-impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default> NodeSlot<SM, SM1> {
+impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachine + Default>
+    NodeSlot<SM, SM1>
+{
     fn is_live(&self) -> bool {
         self.node.is_some()
     }
@@ -424,7 +451,7 @@ enum SparePhase {
 /// meaning exactly what it did.
 pub struct LinClusterV2<
     SM: SnapshotStateMachine + Default = RegisterSm,
-    SM1: SnapshotStateMachine + Default = SM,
+    SM1: SnapshotStateMachine + StateMachine + Default = SM,
 > {
     nodes: Vec<NodeSlot<SM, SM1>>,
     members: Vec<(NodeId, SocketAddr)>,
@@ -453,7 +480,7 @@ pub struct LinClusterV2<
     crypto: Option<CryptoMaterial>,
 }
 
-impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
+impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachine + Default>
     LinClusterV2<SM, SM1>
 {
     /// Bring up an `n`-node cluster under `root` (a caller-owned tempdir): bind
@@ -499,7 +526,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
         for (i, sock) in socks.into_iter().enumerate() {
             let addr = members[i].1;
             let instance_dir = root.join(format!("n{i}"));
-            let cfg = make_config(
+            let cfg = make_config::<SM>(
                 i as NodeId,
                 members.clone(),
                 instance_dir.clone(),
@@ -512,7 +539,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
             // A follower's service follows the committed log too, so every node
             // carries a service from boot — the new leader after a failover
             // already has one attached.
-            let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes, 0);
+            let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes);
             let service1 = spawn_service1::<SM1>(&instance_dir, ccfg);
             nodes.push(NodeSlot {
                 id: i as NodeId,
@@ -771,7 +798,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
         // durable state, rejoins in the current term.
         let sock = rebind(addr);
         let crypto = self.crypto_config_for(id);
-        let cfg = make_config(
+        let cfg = make_config::<SM>(
             id,
             self.members.clone(),
             dir.clone(),
@@ -781,7 +808,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
             crypto,
         );
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         self.nodes[li].node = Some(node);
         self.nodes[li].service = Some(service);
@@ -830,17 +857,16 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
                     service.crash(); // drop-joins; swallows the fail-stop panic
                 }
                 self.nodes[i].service =
-                    Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0));
+                    Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes));
                 respawned += 1;
             }
             if dead1 {
                 if let Some(s1) = self.nodes[i].service1.take() {
                     s1.crash();
                 }
-                self.nodes[i].service1 = Some(spawn_service::<SM1>(
+                self.nodes[i].service1 = Some(spawn_service_row1::<SM1>(
                     &dir,
                     self.ccfg.snapshot_interval_bytes,
-                    1,
                 ));
                 respawned += 1;
             }
@@ -857,7 +883,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
         if let Some(s1) = self.nodes[li].service1.take() {
             s1.crash();
         }
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         self.nodes[li].service = Some(service);
         self.nodes[li].service1 = service1;
@@ -888,7 +914,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
         if let Some(s1) = self.nodes[fi].service1.take() {
             s1.crash();
         }
-        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
         self.nodes[fi].service = Some(service);
         self.nodes[fi].service1 = service1;
@@ -1096,7 +1122,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
                 let dir = spare_root.join(format!("id{id}"));
                 std::fs::create_dir_all(&dir).expect("spare instance dir");
                 let crypto = self.crypto_config_for(id);
-                let cfg = make_config(
+                let cfg = make_config::<SM>(
                     id,
                     self.members.clone(),
                     dir.clone(),
@@ -1110,7 +1136,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
                 // M14c2: the spare is a FULL node — under `FsmSet::Two` it must
                 // boot BOTH declared FSMs or the leader's declared-set check
                 // refuses its join.
-                let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes, 0);
+                let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
                 let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
                 self.spare = Some(NodeSlot {
                     id,
@@ -1250,7 +1276,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + Default>
 // Register-typed probe used by the WGL partition scenarios only. Generic in
 // `SM1` (M14c2) so a two-FSM cluster whose FSM 1 is a `Slow`/`Corrupt` wrapper
 // still gets the FSM-0 probe.
-impl<SM1: SnapshotStateMachine + Default> LinClusterV2<RegisterSm, SM1> {
+impl<SM1: SnapshotStateMachine + StateMachine + Default> LinClusterV2<RegisterSm, SM1> {
     /// Linearizable read addressed to a SPECIFIC node via a fresh client on its
     /// dir (not leader-routed) — used to probe a partitioned-away node, which
     /// must NEVER answer with a stale `Ok`. `Ok(v)` → `Outcome::Ok`; any client

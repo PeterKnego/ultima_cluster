@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use uc_log::buffer::{AppendError, Appender, LogBuffer};
 use uc_log::cnc::{CncMeta, CncPage, unpack_service_status};
+use uc_node::ServicesConfig;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
@@ -95,6 +96,47 @@ impl RawStateMachine for RawCount {
     }
 }
 
+/// FSM identity: attach finds a service's row by name now, so N instances of
+/// the same `RawCount` logic each need a DISTINCT declared name to occupy N
+/// distinct rows. `RawCount` is raw-tier (`RawStateMachine` directly, not
+/// `StateMachine`), so `uc_service::Tagged` — which only forwards the typed
+/// tier — cannot wrap it; this is that same forwarding shape, hand-written
+/// for the raw tier, local to this bench (spec §3.3 "one type, one row" is
+/// for a real service; a hop-isolation harness legitimately runs one type at
+/// every row).
+struct TaggedRaw<const ROW: u8>(RawCount);
+impl<const ROW: u8> RawStateMachine for TaggedRaw<ROW> {
+    const NAME: &'static str = uc_service::tagged::TAGGED_NAMES[ROW as usize];
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        self.0.apply(ctx, cmd, out)
+    }
+    fn query(&self, q: &[u8], out: &mut Vec<u8>) {
+        self.0.query(q, out)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.0.last_applied()
+    }
+}
+
+/// Object-safe view over a `Service<TaggedRaw<ROW>>` for an arbitrary ROW —
+/// the const generic can't be a runtime value, so the N spawned services
+/// (one per row, `ROW` fixed by a `match` at spawn time) are stored behind
+/// this trait rather than in a homogeneously-typed `Vec`.
+trait BenchService {
+    fn query_frames(&self) -> u64;
+    fn stop(self: Box<Self>);
+}
+impl<const ROW: u8> BenchService for uc_service::Service<TaggedRaw<ROW>> {
+    fn query_frames(&self) -> u64 {
+        let mut out = Vec::new();
+        self.query_raw(&[], &mut out);
+        u64::from_le_bytes(out[..8].try_into().unwrap())
+    }
+    fn stop(self: Box<Self>) {
+        (*self).stop();
+    }
+}
+
 fn unix_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -144,7 +186,10 @@ fn main() -> anyhow::Result<()> {
         app_id: APP.into(),
         buffer_bytes,
         max_payload: MAX_PAYLOAD,
-        services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
+        // FSM identity: declare `fsm0..fsm<N-1>` (the `Tagged`/`TaggedRaw`
+        // naming convention) so each of the N `TaggedRaw<ROW>` instances
+        // below finds its row by name.
+        services: ServicesConfig::tagged(a.fsms).service_names(),
     };
     let cnc = CncPage::create_file(&a.root.join("cnc2.dat"), &meta)?;
     let mask = (1u64 << a.fsms) - 1;
@@ -176,19 +221,28 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ---- the FSMs ----
-    let mut services = Vec::new();
+    // FSM identity: attach finds its row by name, and the row (a const
+    // generic on `TaggedRaw`) can't be a runtime value — `id` selects which
+    // monomorphization to spawn.
+    let mut services: Vec<Box<dyn BenchService>> = Vec::new();
     for id in 0..a.fsms {
-        let cfg = ServiceConfig::new(&a.root, APP).service_id(id);
-        services.push(
-            ServiceBuilder::new(
-                cfg,
-                RawCount {
-                    frames: 0,
-                    last: None,
-                },
-            )
-            .start()?,
-        );
+        let cfg = ServiceConfig::new(&a.root, APP);
+        let raw = RawCount {
+            frames: 0,
+            last: None,
+        };
+        let svc: Box<dyn BenchService> = match id {
+            0 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<0>(raw)).start()?),
+            1 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<1>(raw)).start()?),
+            2 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<2>(raw)).start()?),
+            3 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<3>(raw)).start()?),
+            4 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<4>(raw)).start()?),
+            5 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<5>(raw)).start()?),
+            6 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<6>(raw)).start()?),
+            7 => Box::new(ServiceBuilder::new(cfg, TaggedRaw::<7>(raw)).start()?),
+            _ => unreachable!("--fsms is bounds-checked to 1..=8 above"),
+        };
+        services.push(svc);
     }
     let deadline = Instant::now() + Duration::from_secs(10);
     while (0..a.fsms)
@@ -310,9 +364,7 @@ fn main() -> anyhow::Result<()> {
     // just advanced past them). `total` covers warmup too, so compare against
     // the total applied bytes / frame.
     for (id, s) in services.iter().enumerate() {
-        let mut out = Vec::new();
-        s.query_raw(&[], &mut out);
-        let sm_frames = u64::from_le_bytes(out[..8].try_into().unwrap());
+        let sm_frames = s.query_frames();
         let swept = cnc.service_slot(id).applied.load_acquire() / frame;
         println!(
             "fsm={id} sm_frames={sm_frames} swept_frames={swept}{}",

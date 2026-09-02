@@ -661,7 +661,7 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             members[i].1,
             RING_BYTES,
             256 * 1024,
-            // Unchanged pre-M14c default declared set: `{0}`.
+            // Unchanged pre-M14c default declared set: `services.names = ["noop"]`.
             uc_node::ServicesConfig::single(NoopSm::NAME),
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
@@ -989,7 +989,7 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     await_stable_leader(&nodes, 20);
 
     let instance_dir = nodes[0].instance_dir.clone();
-    let svc0 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP).service_id(0), NoopSm)
+    let svc0 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP), NoopSm)
         .start()
         .expect("FSM 0 attaches");
     // FSM 1 is deliberately never started.
@@ -1013,7 +1013,7 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             scenario: "service_absent",
             rules: &["Uc2ServiceAbsent"],
             state: "real",
-            method: "real single-node cluster declaring services.ids = [0, 1]; FSM 0 attaches, \
+            method: "real single-node cluster declaring services.names = [\"noop\", \"slow\"]; FSM 0 attaches, \
                      FSM 1 is never started. 6 real scrapes of the node's /metrics all read \
                      uc_service_attached{service=\"1\"} 0 (and service=\"0\" 1) — the per-FSM \
                      band renders a row for every DECLARED id, so the absent FSM is a 0 sample, \
@@ -1097,10 +1097,10 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     await_stable_leader(&nodes, 20);
 
     let instance_dir = nodes[0].instance_dir.clone();
-    let svc0 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP).service_id(0), NoopSm)
+    let svc0 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP), NoopSm)
         .start()
         .expect("FSM 0 attaches");
-    let svc1 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP).service_id(1), SlowSm)
+    let svc1 = ServiceBuilder::new(ServiceConfig::new(&instance_dir, APP), SlowSm)
         .start()
         .expect("FSM 1 attaches");
 
@@ -1175,7 +1175,7 @@ fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             scenario: "fsm_pinned",
             rules: &["Uc2ServicePinnedAtLagBound"],
             state: "real",
-            method: "real single-node cluster, services.ids = [0, 1], fsm_lag = 8 KiB, admission \
+            method: "real single-node cluster, services.names = [\"noop\", \"slow\"], fsm_lag = 8 KiB, admission \
                      window 256 KiB (so the FSM door binds first). FSM 1 sleeps 20 ms per apply, \
                      and a paced load tops the log up to the door each round; each scrape is \
                      taken while the door is verifiably still shut and the commit head is level \

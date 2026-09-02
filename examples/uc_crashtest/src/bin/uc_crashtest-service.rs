@@ -22,6 +22,7 @@ use clap::Parser;
 use uc_lincheck::register::RegisterSm;
 use uc_service::{
     RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned,
+    StateMachine, Tagged,
 };
 
 #[derive(Parser)]
@@ -40,9 +41,12 @@ struct Args {
     /// replicated contract (see `uc_service::session`).
     #[arg(long, default_value_t = false)]
     sessioned: bool,
-    /// Which declared FSM slot this process is (see [services] ids).
-    #[arg(long, default_value_t = 0)]
-    service_id: u8,
+    /// FSM identity (Task 5, spec §3.3): absent attaches as bare `RegisterSm`
+    /// (row declared under `RegisterSm::NAME`, `"register"`); `--tagged N`
+    /// (`N` in `0..8`) wraps it in `Tagged<N, RegisterSm>` (row declared
+    /// under `"fsmN"`) — a second FSM on a two-FSM node, Task 9's harness row.
+    #[arg(long)]
+    tagged: Option<u8>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,33 +59,78 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let service_id = args.service_id;
     let instance_dir = args.instance_dir.clone();
-    let cfg = ServiceConfig::new(args.instance_dir, args.app_id).service_id(service_id);
-    // Two separate `start()` calls rather than one over a boxed SM: the
-    // builder is generic over the state machine and `Service<S>` carries `S`
-    // in its type, so the branch has to happen here. Both arms hand the
-    // service to `supervise`, which holds it alive until it fail-stops.
-    if args.sessioned {
-        let svc = ServiceBuilder::new(
-            cfg,
-            Sessioned::new(RegisterSm::default(), SessionConfig::default()),
-        )
-        .start()?;
-        println!(
-            "service {} attached at {}",
-            service_id,
-            instance_dir.display()
-        );
-        supervise(svc)
-    } else {
-        let svc = ServiceBuilder::new(cfg, RegisterSm::default()).start()?;
-        println!(
-            "service {} attached at {}",
-            service_id,
-            instance_dir.display()
-        );
-        supervise(svc)
+    let cfg = ServiceConfig::new(args.instance_dir, args.app_id);
+    // Every arm hands the service to `supervise`, which holds it alive until
+    // it fail-stops; the branch has to happen here because the builder is
+    // generic over the state machine and `Service<S>` carries `S` in its
+    // type (and `Tagged<N, _>`'s `N` is a const generic, not a runtime
+    // value — the `--tagged` arm dispatches through a `match` over `0..8`).
+    match (args.tagged, args.sessioned) {
+        (None, false) => {
+            let svc = ServiceBuilder::new(cfg, RegisterSm::default()).start()?;
+            println!(
+                "service {:?} attached at {}",
+                <RegisterSm as StateMachine>::NAME,
+                instance_dir.display()
+            );
+            supervise(svc)
+        }
+        (None, true) => {
+            let svc = ServiceBuilder::new(
+                cfg,
+                Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+            )
+            .start()?;
+            println!(
+                "service {:?} attached at {}",
+                <RegisterSm as StateMachine>::NAME,
+                instance_dir.display()
+            );
+            supervise(svc)
+        }
+        (Some(row), sessioned) => {
+            macro_rules! tagged_arm {
+                ($n:literal) => {
+                    if sessioned {
+                        let svc = ServiceBuilder::new(
+                            cfg,
+                            Sessioned::new(
+                                Tagged::<$n, RegisterSm>::default(),
+                                SessionConfig::default(),
+                            ),
+                        )
+                        .start()?;
+                        println!(
+                            "service {:?} attached at {}",
+                            <Tagged<$n, RegisterSm> as StateMachine>::NAME,
+                            instance_dir.display()
+                        );
+                        supervise(svc)
+                    } else {
+                        let svc = ServiceBuilder::new(cfg, Tagged::<$n, RegisterSm>::default())
+                            .start()?;
+                        println!(
+                            "service {:?} attached at {}",
+                            <Tagged<$n, RegisterSm> as StateMachine>::NAME,
+                            instance_dir.display()
+                        );
+                        supervise(svc)
+                    }
+                };
+            }
+            match row {
+                0 => tagged_arm!(0),
+                1 => tagged_arm!(1),
+                2 => tagged_arm!(2),
+                3 => tagged_arm!(3),
+                4 => tagged_arm!(4),
+                5 => tagged_arm!(5),
+                6 => tagged_arm!(6),
+                7 => tagged_arm!(7),
+                _ => anyhow::bail!("--tagged must be 0..8, got {row}"),
+            }
+        }
     }
 }
 

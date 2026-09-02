@@ -45,7 +45,7 @@ use uc_node::backup::{BackupError, backup_instance, restore_artifact, verify_art
 use uc_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use uc_service::snapshots::SnapshotStore;
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine, Tagged};
 
 const SEG_BYTES: u64 = 64 * 1024;
 
@@ -1183,26 +1183,28 @@ fn two_fsm_purged_node(
 ) -> (
     Node,
     uc_service::Service<RegisterSm>,
-    uc_service::Service<RegisterSm>,
+    uc_service::Service<Tagged<1, RegisterSm>>,
     u64,
 ) {
     let mut cfg = config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
     cfg.services = ServicesConfig::from_names(&[RegisterSm::NAME, "fsm1"], None).unwrap();
     let node = Node::start(cfg).expect("node");
     wait_until("serving", || node.can_serve());
-    let svc = |id: u8| {
-        ServiceBuilder::new(
-            ServiceConfig::new(dir, app)
-                .service_id(id)
-                .snapshot_policy(SnapshotPolicy {
-                    interval_bytes: 32 * 1024,
-                }),
-            RegisterSm::default(),
-        )
-        .start_with_snapshots()
-        .expect("snapshot service")
+    let policy = SnapshotPolicy {
+        interval_bytes: 32 * 1024,
     };
-    let (s0, s1) = (svc(0), svc(1));
+    let s0 = ServiceBuilder::new(
+        ServiceConfig::new(dir, app).snapshot_policy(policy),
+        RegisterSm::default(),
+    )
+    .start_with_snapshots()
+    .expect("snapshot service 0");
+    let s1 = ServiceBuilder::new(
+        ServiceConfig::new(dir, app).snapshot_policy(policy),
+        Tagged::<1, RegisterSm>::default(),
+    )
+    .start_with_snapshots()
+    .expect("snapshot service 1");
     let client = Client::connect(dir, app).expect("client");
     let mut v = 0u64;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1270,15 +1272,12 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     cfg.services = ServicesConfig::from_names(&[RegisterSm::NAME, "fsm1"], None).unwrap();
     let rnode = Node::start(cfg).expect("restored node");
     wait_until("restored serving", || rnode.can_serve());
-    let rs0 = ServiceBuilder::new(
-        ServiceConfig::new(&fresh, app).service_id(0),
-        RegisterSm::default(),
-    )
-    .start_with_snapshots()
-    .expect("restored svc 0");
+    let rs0 = ServiceBuilder::new(ServiceConfig::new(&fresh, app), RegisterSm::default())
+        .start_with_snapshots()
+        .expect("restored svc 0");
     let rs1 = ServiceBuilder::new(
-        ServiceConfig::new(&fresh, app).service_id(1),
-        RegisterSm::default(),
+        ServiceConfig::new(&fresh, app),
+        Tagged::<1, RegisterSm>::default(),
     )
     .start_with_snapshots()
     .expect("restored svc 1");

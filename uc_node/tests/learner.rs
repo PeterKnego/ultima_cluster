@@ -719,13 +719,61 @@ impl uc_service::SnapshotStateMachine for SumSm {
     }
 }
 
-fn start_sum_service(dir: &Path, app: &str, id: u8) -> uc_service::Service<SumSm> {
-    let cfg = uc_service::ServiceConfig::new(dir, app)
-        .service_id(id)
-        .snapshot_policy(uc_service::SnapshotPolicy {
+fn start_sum_service(dir: &Path, app: &str) -> uc_service::Service<SumSm> {
+    let cfg =
+        uc_service::ServiceConfig::new(dir, app).snapshot_policy(uc_service::SnapshotPolicy {
             interval_bytes: 256 * 1024,
         });
     uc_service::ServiceBuilder::new(cfg, SumSm::default())
+        .start_with_snapshots()
+        .expect("service start")
+}
+
+/// FSM identity: `SumSm` is raw-tier (`RawStateMachine` directly, not
+/// `StateMachine`), so `uc_service::Tagged` — which only forwards the typed
+/// tier — cannot wrap it (see Task 5's ruling on `apply_bench`'s `TaggedRaw`).
+/// This is the same shape, local to this file, so a second FSM can attach at
+/// row 1 (declared name `"fsm1"`) with the same raw logic.
+#[derive(Default)]
+struct TaggedSum(SumSm);
+impl uc_service::RawStateMachine for TaggedSum {
+    const NAME: &'static str = "fsm1";
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        self.0.apply(ctx, cmd, out)
+    }
+    fn query(&self, q: &[u8], out: &mut Vec<u8>) {
+        self.0.query(q, out)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.0.last_applied()
+    }
+}
+impl uc_service::SnapshotStateMachine for TaggedSum {
+    type SnapshotHandle = Vec<u8>;
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc_service::SnapshotError> {
+        self.0.freeze()
+    }
+    fn stream_snapshot(
+        handle: Vec<u8>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        SumSm::stream_snapshot(handle, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        self.0.install_snapshot(position, src)
+    }
+}
+
+fn start_sum_service_row1(dir: &Path, app: &str) -> uc_service::Service<TaggedSum> {
+    let cfg =
+        uc_service::ServiceConfig::new(dir, app).snapshot_policy(uc_service::SnapshotPolicy {
+            interval_bytes: 256 * 1024,
+        });
+    uc_service::ServiceBuilder::new(cfg, TaggedSum::default())
         .start_with_snapshots()
         .expect("service start")
 }
@@ -780,8 +828,8 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     let v_dir = dir.path().join("v0");
     let voter =
         Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
-    let _v0 = start_sum_service(&v_dir, app, 0);
-    let _v1 = start_sum_service(&v_dir, app, 1);
+    let _v0 = start_sum_service(&v_dir, app);
+    let _v1 = start_sum_service_row1(&v_dir, app);
     await_until(30, "voter serves", || voter.can_serve());
 
     // Drive well past one snapshot interval per FSM so both slots publish a
@@ -819,8 +867,8 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     let l_dir = dir.path().join("l1");
     let learner =
         Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
-    let _l0 = start_sum_service(&l_dir, app, 0);
-    let _l1 = start_sum_service(&l_dir, app, 1);
+    let _l0 = start_sum_service(&l_dir, app);
+    let _l1 = start_sum_service_row1(&l_dir, app);
 
     await_until(60, "learner caught up across the purged prefix", || {
         learner.counters().durable.load_acquire() >= frontier

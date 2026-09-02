@@ -473,12 +473,15 @@ fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
         PANIC_LOG.lock().unwrap().push(info.to_string());
     }));
 
-    // Service #2 is a CountSm — NO SnapshotStateMachine capability, so `.start()`
-    // leaves `snapshot_restore = None`. Attaching below the purge floor cannot
-    // install a snapshot: the apply agent must fail-stop with the contract named,
-    // never silently replay a partial prefix from `first_base` onto a phantom
-    // cursor.
-    let svc2 = ServiceBuilder::new(cfg(dir.path(), app), CountSm::default())
+    // Service #2 attaches via plain `.start()` (not `.start_with_snapshots()`),
+    // which never wires `snapshot_restore` regardless of the SM's capability.
+    // Attaching below the purge floor cannot install a snapshot: the apply
+    // agent must fail-stop with the contract named, never silently replay a
+    // partial prefix from `first_base` onto a phantom cursor. Must be a
+    // `RegisterSm` (not `CountSm`) — FSM identity: this node declares
+    // `RegisterSm::NAME` ("register") at row 0, and attach now finds the row
+    // by name.
+    let svc2 = ServiceBuilder::new(cfg(dir.path(), app), RegisterSm::default())
         .start()
         .unwrap();
 

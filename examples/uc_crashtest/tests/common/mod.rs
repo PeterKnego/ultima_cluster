@@ -246,17 +246,23 @@ pub fn spawn_service_with(instance_dir: &Path, sessioned: bool) -> Reap {
     Reap(child)
 }
 
-/// M14c2 T6: spawn the service-only binary declaring a specific `--service-id`
-/// (unlike [`spawn_service`]/[`spawn_service_with`], which always boot the
-/// implicit FSM 0 process) — one process per FSM in a multi-service cluster.
+/// M14c2 T6, FSM identity (Task 5): spawn the service-only binary declaring
+/// FSM row `id` (unlike [`spawn_service`]/[`spawn_service_with`], which
+/// always attach the implicit row-0 `RegisterSm`) — one process per FSM in a
+/// multi-service cluster. Row 0 attaches as bare `RegisterSm` (name
+/// `"register"`, no flag needed — attach finds it by name); row `id > 0`
+/// passes `--tagged id`, so the binary attaches `Tagged<id, RegisterSm>`
+/// (name `"fsm<id>"`) — the second FSM the caller's `spawn_node_with_services`
+/// declared under that same name.
 pub fn spawn_service_id(instance_dir: &Path, id: u8) -> Reap {
     let mut cmd = Command::new(SERVICE_BIN);
     cmd.arg("--instance-dir")
         .arg(instance_dir)
         .arg("--app-id")
-        .arg(APP_ID)
-        .arg("--service-id")
-        .arg(id.to_string());
+        .arg(APP_ID);
+    if id != 0 {
+        cmd.arg("--tagged").arg(id.to_string());
+    }
     let child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

@@ -16,8 +16,8 @@
 //! m12_gate node          --id N --bind A --instance-dir D --members id@addr,… [--admission-kib K] \
 //!                         [--services 0,1] [--fsm-lag lockstep|BYTES] [--purge-below-snapshot] \
 //!                         [--journal-segment-bytes N]
-//! m12_gate service       --instance-dir D [--envelope on|off] [--raw-sm] \
-//!                         [--service-id ID] [--work-spin K] [--snapshot-interval-bytes N]
+//! m12_gate service       --instance-dir D [--envelope on|off] \
+//!                         [--fsm count|spin|raw|fsm<N>] [--work-spin K] [--snapshot-interval-bytes N]
 //! m12_gate edge          --instance-dir D --listen A --members id@gw_addr,… [--envelope on|off] [--inflight N]
 //! m12_gate client-direct --instance-dir D --secs S [--payload P] [--inflight N] [--envelope on|off] \
 //!                         [--fan-in] [--warmup-secs S] [--measure-secs S] [--timeline]
@@ -186,9 +186,10 @@ struct NodeArgs {
     /// Ingress admission window in KiB (`append - commit` backpressure gate).
     #[arg(long, default_value_t = 256)]
     admission_kib: u64,
-    /// M14d: declared FSM ids, comma-separated (`0,1`). Absent = `{0}` with
-    /// the node's default lag bound — every pre-M14 arm is byte-for-byte
-    /// unchanged. Refused by name like `node.toml`'s `[services].ids`.
+    /// M14d, FSM identity: declared FSM names, comma-separated (`count,spin`)
+    /// — row order is declaration order. Absent is a named refusal, like
+    /// `node.toml`'s `[services] names` (there is no default set to fall
+    /// back to).
     #[arg(long)]
     services: Option<String>,
     /// M14d: `lockstep` or a byte bound (`65536`, `16MiB`) — the string form
@@ -217,19 +218,18 @@ struct ServiceArgs {
     /// `client_id ++ seq` header, whoever put it there.
     #[arg(long, value_enum, default_value_t = Envelope::On)]
     envelope: Envelope,
-    /// Row 3: run the RAW-tier twin (`RawCountSm`, bytes-in/bytes-out, no
-    /// decode) instead of the typed `CountSm`. Paired with
-    /// `--features uc_service/apply-profile` this is the codec-share A/B.
-    #[arg(long, default_value_t = false)]
-    raw_sm: bool,
-    /// M14d: attach as this FSM id (`ServiceConfig::service_id`). The node
-    /// must have declared it (`--services`), else the attach is refused by
-    /// name (`ServiceNotDeclared`).
-    #[arg(long, default_value_t = 0)]
-    service_id: u8,
+    /// FSM identity (Task 5): which SM type to attach as — the name it
+    /// presents at attach, so the node must have declared the SAME name
+    /// (`--services`) or the attach is refused by name (`UnknownFsm`).
+    /// `count` -> `CountSm`; `spin` -> `SpinCountSm` (row `"spin"`, paced by
+    /// `--work-spin`); `raw` -> `RawCountSm` (row 3's raw-tier twin, no
+    /// decode — paired with `--features uc_service/apply-profile` this is
+    /// the codec-share A/B); `fsm<N>` (`N` in `0..8`) -> `Tagged<N, CountSm>`
+    /// (row `"fsm<N>"` — harness rows for a multi-FSM node, spec §3.3).
+    #[arg(long, default_value = "count")]
+    fsm: String,
     /// M14d: `> 0` runs `SpinCountSm` with this many LCG rounds per apply —
-    /// the deliberately slow FSM. `0` = plain `CountSm`. Incompatible with
-    /// `--raw-sm`.
+    /// the deliberately slow FSM. Only valid with `--fsm spin`.
     #[arg(long, default_value_t = 0)]
     work_spin: u64,
     /// M14d row f: `SnapshotPolicy { interval_bytes }` on the service so the
@@ -781,13 +781,13 @@ fn boot_cluster2(
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let a = ServiceBuilder::new(
-            ServiceConfig::new(&instance_dir, app_id).service_id(0),
+            ServiceConfig::new(&instance_dir, app_id),
             CountSm::default(),
         )
         .start()
         .expect("service 0");
         let b = ServiceBuilder::new(
-            ServiceConfig::new(&instance_dir, app_id).service_id(1),
+            ServiceConfig::new(&instance_dir, app_id),
             SpinCountSm::with_spin(spin),
         )
         .start()
@@ -1650,10 +1650,10 @@ fn parse_id_addr_list(s: &str) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// M14d: `--services` / `--fsm-lag` → the `ServicesConfig` a node boots
-/// with. Absent flags are the node default; refusals name the flag, the way
-/// `node.toml`'s loader names the field (`config_file.rs`'s `services.ids` /
-/// `services.fsm_lag`).
+/// M14d, FSM identity: `--services` / `--fsm-lag` → the `ServicesConfig` a
+/// node boots with. `--services` is REQUIRED (no default declared set) —
+/// refusals name the flag, the way `node.toml`'s loader names the field
+/// (`config_file.rs`'s `services.names` / `services.fsm_lag`).
 fn services_from_flags(
     services: Option<&str>,
     fsm_lag: Option<&str>,
@@ -1758,6 +1758,48 @@ fn start_typed_svc<S: SnapshotStateMachine>(
     }
 }
 
+/// FSM identity: which SM type `--fsm` selects. `Tagged(n)` is
+/// `uc_service::Tagged<n, CountSm>`, `n` in `0..8` — the const generic can't
+/// be a runtime value, so callers `match` over it.
+enum FsmKind {
+    Count,
+    Spin,
+    Raw,
+    Tagged(u8),
+}
+
+fn parse_fsm(s: &str) -> anyhow::Result<FsmKind> {
+    match s {
+        "count" => Ok(FsmKind::Count),
+        "spin" => Ok(FsmKind::Spin),
+        "raw" => Ok(FsmKind::Raw),
+        s => {
+            let n: u8 = s
+                .strip_prefix("fsm")
+                .and_then(|d| d.parse().ok())
+                .filter(|&n| n < 8)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--fsm must be count|spin|raw|fsm<N> (N in 0..8), got {s:?}")
+                })?;
+            Ok(FsmKind::Tagged(n))
+        }
+    }
+}
+
+/// Attach `sm` and park forever, printing `what`. One body shared by every
+/// typed arm (`CountSm`, `SpinCountSm`, `Tagged<N, CountSm>`, and each
+/// `Sessioned<_>` wrap) — they all diverge, so the `Service<_>` types never
+/// need to unify at one call site (`m5_gate`'s service role does the same).
+fn run_and_park<S: SnapshotStateMachine>(
+    cfg: ServiceConfig,
+    sm: S,
+    snapshots: bool,
+    what: String,
+) -> anyhow::Result<()> {
+    let _svc = start_typed_svc(ServiceBuilder::new(cfg, sm), snapshots)?;
+    park_service(&what)
+}
+
 fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     let cnc = a.instance_dir.join("cnc2.dat");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1768,15 +1810,16 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    let kind = parse_fsm(&a.fsm)?;
     anyhow::ensure!(
-        !(a.raw_sm && a.work_spin > 0),
-        "--raw-sm and --work-spin are exclusive: the slow FSM is the typed tier (spec §15.3)"
+        a.work_spin == 0 || matches!(kind, FsmKind::Spin),
+        "--work-spin > 0 is only valid with --fsm spin"
     );
     anyhow::ensure!(
-        !(a.raw_sm && a.snapshot_interval_bytes > 0),
-        "--raw-sm and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
+        !(matches!(kind, FsmKind::Raw) && a.snapshot_interval_bytes > 0),
+        "--fsm raw and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
     );
-    let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id).service_id(a.service_id);
+    let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
     if a.snapshot_interval_bytes > 0 {
         cfg = cfg.snapshot_policy(SnapshotPolicy {
             interval_bytes: a.snapshot_interval_bytes,
@@ -1785,46 +1828,38 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     let envelope = a.envelope == Envelope::On;
     let snapshots = a.snapshot_interval_bytes > 0;
     let tag = format!(
-        "id={} spin={} snap={}",
-        a.service_id, a.work_spin, a.snapshot_interval_bytes
+        "fsm={} spin={} snap={}",
+        a.fsm, a.work_spin, a.snapshot_interval_bytes
     );
-    // Each arm diverges (parks forever), so the `Service<_>` types never need
-    // to unify — `m5_gate`'s service role does the same.
-    match (envelope, a.raw_sm, a.work_spin > 0) {
-        (true, false, false) => {
-            let svc = ServiceBuilder::new(
-                cfg,
-                Sessioned::new(CountSm::default(), SessionConfig::default()),
-            );
-            let _svc = start_typed_svc(svc, snapshots)?;
-            park_service(&format!(
-                "Sessioned<CountSm> (typed tier, envelope on, {tag})"
-            ))
-        }
-        (true, false, true) => {
-            let svc = ServiceBuilder::new(
-                cfg,
-                Sessioned::new(
-                    SpinCountSm::with_spin(a.work_spin),
-                    SessionConfig::default(),
-                ),
-            );
-            let _svc = start_typed_svc(svc, snapshots)?;
-            park_service(&format!(
-                "Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"
-            ))
-        }
-        (false, false, false) => {
-            let svc = ServiceBuilder::new(cfg, CountSm::default());
-            let _svc = start_typed_svc(svc, snapshots)?;
-            park_service(&format!("CountSm (typed tier, envelope off, {tag})"))
-        }
-        (false, false, true) => {
-            let svc = ServiceBuilder::new(cfg, SpinCountSm::with_spin(a.work_spin));
-            let _svc = start_typed_svc(svc, snapshots)?;
-            park_service(&format!("SpinCountSm (typed tier, envelope off, {tag})"))
-        }
-        (true, true, _) => {
+    match (envelope, kind) {
+        (true, FsmKind::Count) => run_and_park(
+            cfg,
+            Sessioned::new(CountSm::default(), SessionConfig::default()),
+            snapshots,
+            format!("Sessioned<CountSm> (typed tier, envelope on, {tag})"),
+        ),
+        (true, FsmKind::Spin) => run_and_park(
+            cfg,
+            Sessioned::new(
+                SpinCountSm::with_spin(a.work_spin),
+                SessionConfig::default(),
+            ),
+            snapshots,
+            format!("Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"),
+        ),
+        (false, FsmKind::Count) => run_and_park(
+            cfg,
+            CountSm::default(),
+            snapshots,
+            format!("CountSm (typed tier, envelope off, {tag})"),
+        ),
+        (false, FsmKind::Spin) => run_and_park(
+            cfg,
+            SpinCountSm::with_spin(a.work_spin),
+            snapshots,
+            format!("SpinCountSm (typed tier, envelope off, {tag})"),
+        ),
+        (true, FsmKind::Raw) => {
             let _svc = ServiceBuilder::new(
                 cfg,
                 Sessioned::new(RawCountSm::default(), SessionConfig::default()),
@@ -1834,9 +1869,72 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
                 "Sessioned<RawCountSm> (raw tier, envelope on, {tag})"
             ))
         }
-        (false, true, _) => {
+        (false, FsmKind::Raw) => {
             let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
             park_service(&format!("RawCountSm (raw tier, envelope off, {tag})"))
+        }
+        (true, FsmKind::Tagged(n)) => {
+            macro_rules! arm {
+                ($n:literal) => {
+                    run_and_park(
+                        cfg,
+                        Sessioned::new(
+                            uc_service::Tagged::<$n, CountSm>::default(),
+                            SessionConfig::default(),
+                        ),
+                        snapshots,
+                        format!(
+                            concat!(
+                                "Sessioned<Tagged<",
+                                stringify!($n),
+                                ", CountSm>> (typed tier, envelope on, {})"
+                            ),
+                            tag
+                        ),
+                    )
+                };
+            }
+            match n {
+                0 => arm!(0),
+                1 => arm!(1),
+                2 => arm!(2),
+                3 => arm!(3),
+                4 => arm!(4),
+                5 => arm!(5),
+                6 => arm!(6),
+                7 => arm!(7),
+                _ => unreachable!("parse_fsm bounds N to 0..8"),
+            }
+        }
+        (false, FsmKind::Tagged(n)) => {
+            macro_rules! arm {
+                ($n:literal) => {
+                    run_and_park(
+                        cfg,
+                        uc_service::Tagged::<$n, CountSm>::default(),
+                        snapshots,
+                        format!(
+                            concat!(
+                                "Tagged<",
+                                stringify!($n),
+                                ", CountSm> (typed tier, envelope off, {})"
+                            ),
+                            tag
+                        ),
+                    )
+                };
+            }
+            match n {
+                0 => arm!(0),
+                1 => arm!(1),
+                2 => arm!(2),
+                3 => arm!(3),
+                4 => arm!(4),
+                5 => arm!(5),
+                6 => arm!(6),
+                7 => arm!(7),
+                _ => unreachable!("parse_fsm bounds N to 0..8"),
+            }
         }
     }
 }

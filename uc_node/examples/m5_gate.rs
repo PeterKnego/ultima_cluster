@@ -142,6 +142,13 @@ struct NodeArgs {
     /// runbook's wire-crypto section for the format).
     #[arg(long, requires = "crypto_key")]
     crypto_allowlist: Option<PathBuf>,
+    /// FSM identity: the node process is a separate binary invocation from
+    /// the service (fleet: one node process + one service process per host),
+    /// so it must be told in advance which SM tier's NAME to declare —
+    /// mirrors `ServiceArgs::raw_sm`; the two flags must agree (a mismatch is
+    /// refused at service attach, `ServiceError::UnknownFsm`).
+    #[arg(long, default_value_t = false)]
+    raw_sm: bool,
 }
 
 #[derive(clap::Args)]
@@ -409,7 +416,10 @@ fn write_crypto_material(dir: &Path, n: usize) -> Vec<(PathBuf, PathBuf)> {
         .collect()
 }
 
-fn node_config(
+/// FSM identity: `S` is whichever SM tier will attach (`CountSm` or
+/// `RawCountSm`) — the caller picks it (a CLI flag for the separate `Node`
+/// process, the same `S` `run_all_generic` is instantiated with for `all`).
+fn node_config<S: RawStateMachine>(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
     bind: SocketAddr,
@@ -435,10 +445,7 @@ fn node_config(
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
-        // The node process doesn't know which service-side SM tier
-        // (typed CountSm vs. RawCountSm) will attach — attach isn't
-        // name-checked yet (Task 5), so either name is inert here.
-        services: uc_node::ServicesConfig::single(<CountSm as StateMachine>::NAME),
+        services: uc_node::ServicesConfig::single(S::NAME),
     }
 }
 
@@ -460,15 +467,27 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
         },
         _ => uc_node::CryptoConfig::Disabled,
     };
-    let cfg = node_config(
-        a.id,
-        members,
-        a.bind,
-        a.instance_dir,
-        a.app_id,
-        a.admission_kib * 1024,
-        crypto,
-    );
+    let cfg = if a.raw_sm {
+        node_config::<RawCountSm>(
+            a.id,
+            members,
+            a.bind,
+            a.instance_dir,
+            a.app_id,
+            a.admission_kib * 1024,
+            crypto,
+        )
+    } else {
+        node_config::<CountSm>(
+            a.id,
+            members,
+            a.bind,
+            a.instance_dir,
+            a.app_id,
+            a.admission_kib * 1024,
+            crypto,
+        )
+    };
     let node = Node::start(cfg)?;
     println!("m5_gate node {id} up; parking (killed externally by the harness)");
     // Protocol 0.5.0 observability (see m6_gate): the attestation counter is
@@ -1066,7 +1085,7 @@ fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> 
             }
             None => uc_node::CryptoConfig::Disabled,
         };
-        let cfg = node_config(
+        let cfg = node_config::<S>(
             i as NodeId,
             members.clone(),
             addr,

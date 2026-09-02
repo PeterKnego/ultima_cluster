@@ -45,6 +45,9 @@ mod session;
 /// tooling read the snapshot directory directly (e.g. the M6 Task 3 e2e test
 /// cross-checks the cnc marker against `SnapshotStore::newest`).
 pub mod snapshots;
+/// `Tagged<ROW, S>`: run one state-machine type at several rows (harnesses
+/// only, spec §3.3) — see the module doc.
+pub mod tagged;
 mod traits;
 
 use std::sync::Arc;
@@ -67,6 +70,7 @@ pub use crate::ids::IdGen;
 pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
+pub use crate::tagged::Tagged;
 pub use crate::traits::{
     ApplyCtx, NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
     SnapshotStateMachine, StateMachine, TypedOutput,
@@ -263,15 +267,13 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
         // before even calling `freeze()`, and the builder thread holds it for
         // the full stream+publish duration, not just while a job sits in the
         // channel.
-        let store = SnapshotStore::open(&cfg.instance_dir, cfg.service_id)?;
+        let store = SnapshotStore::open(&cfg.instance_dir, service_id)?;
         let busy = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel::<(u64, BuildJob)>(1);
         // Seed the interval basis from whatever the cnc marker already holds
         // (0 on a fresh page) — a service reattaching after a prior
         // incarnation already built snapshots doesn't immediately re-trigger.
-        let last_snapshot_pos = attach::slot(&cnc, cfg.service_id)
-            .snapshot_pos
-            .load_acquire();
+        let last_snapshot_pos = attach::slot(&cnc, service_id).snapshot_pos.load_acquire();
         let freeze: FreezeFn<S> = Box::new(|sm: &S| {
             let (handle, pos) = sm.freeze()?;
             let job: BuildJob =
@@ -356,7 +358,7 @@ pub struct Service<S: RawStateMachine> {
     _cnc: Arc<CncPage>,
     instance_id: u128,
     epoch: u64,
-    /// M14a: which declared FSM slot this process is (`cfg.service_id`).
+    /// FSM identity: the row this process attached to, found by name.
     service_id: u8,
     /// M14a: `service.<id>.lock`, held for the service's life (dropped last,
     /// released by the OS on any exit) — enforces one process per id.
@@ -376,7 +378,7 @@ impl<S: RawStateMachine> Service<S> {
         self.epoch
     }
 
-    /// M14a: which declared FSM slot this process is (`ServiceConfig::service_id`).
+    /// FSM identity: which row this process attached to, found by name.
     pub fn service_id(&self) -> u8 {
         self.service_id
     }

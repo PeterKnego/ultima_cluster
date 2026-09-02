@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uc_client::Client;
 use uc_log::cnc::CncPage;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine, Tagged};
 
 pub const APP: &str = "m14-services";
 
@@ -186,13 +186,10 @@ impl StateMachine for CountSm {
     }
 }
 
-pub fn start_service(dir: &Path, id: u8) -> uc_service::Service<CountSm> {
-    ServiceBuilder::new(
-        ServiceConfig::new(dir, APP).service_id(id),
-        CountSm::default(),
-    )
-    .start()
-    .expect("service start")
+pub fn start_service<S: StateMachine + Default>(dir: &Path) -> uc_service::Service<S> {
+    ServiceBuilder::new(ServiceConfig::new(dir, APP), S::default())
+        .start()
+        .expect("service start")
 }
 
 #[test]
@@ -201,7 +198,7 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
     let dir = tempdir();
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let svc0 = start_service(dir.path(), 0);
+    let svc0 = start_service::<CountSm>(dir.path());
     let cnc = open_cnc(dir.path());
     let s0 = cnc.service_slot(0);
     wait_until("slot 0 attached", || {
@@ -240,84 +237,83 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
 }
 
 #[test]
-fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_refused() {
+fn an_unknown_name_is_refused_by_name_and_a_second_attach_of_the_same_fsm_is_refused() {
     let _g = serialize();
     let dir = tempdir();
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let err = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), APP).service_id(2),
-        CountSm::default(),
-    )
-    .start()
-    .err()
-    .expect("id 2 is not declared");
+    let err = ServiceBuilder::new(ServiceConfig::new(dir.path(), APP), SlowCountSm::default())
+        .start()
+        .err()
+        .expect("slow-count is not declared");
+    match &err {
+        uc_service::ServiceError::UnknownFsm { name, declared } => {
+            assert_eq!(name, "slow-count");
+            assert_eq!(declared, &["count".to_string(), "fsm1".to_string()]);
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(
-        matches!(
-            err,
-            uc_service::ServiceError::ServiceNotDeclared {
-                id: 2,
-                declared: 0b11
-            }
-        ),
-        "{err:?}"
-    );
-    assert!(
-        err.to_string().contains("service id 2 is not declared"),
+        err.to_string()
+            .contains("FSM \"slow-count\" is not declared"),
         "{err}"
     );
 
-    let svc1 = start_service(dir.path(), 1);
+    let svc1 = start_service::<Tagged<1, CountSm>>(dir.path());
     let err = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), APP).service_id(1),
-        CountSm::default(),
+        ServiceConfig::new(dir.path(), APP),
+        Tagged::<1, CountSm>::default(),
     )
     .start()
     .err()
-    .expect("id 1 is held");
+    .expect("fsm1 is held");
     assert!(
-        matches!(err, uc_service::ServiceError::AlreadyAttached { id: 1 }),
+        matches!(
+            &err,
+            uc_service::ServiceError::AlreadyAttached { row: 1, .. }
+        ),
         "{err:?}"
     );
     svc1.stop();
-    // The lock is released with the process's handle: a re-attach succeeds.
-    let svc1b = start_service(dir.path(), 1);
+    let svc1b = start_service::<Tagged<1, CountSm>>(dir.path());
     assert_eq!(svc1b.epoch(), 2);
+    // The version word is the service's: Tagged forwards CountSm's (0 here).
+    assert_eq!(open_cnc(dir.path()).service_slot(1).status.version(), 0);
     svc1b.stop();
     node.stop();
 }
 
-/// Review fix (fix round 1): `service_id` is a `u8` never range-checked
-/// before the declared-set gate's `1u64 << cfg.service_id`. The brief's
-/// original `||` order evaluated the shift first, so a `service_id` of 200
-/// (well past `CNC_MAX_SERVICES`) panicked with "attempt to shift left with
-/// overflow" in a debug/test build instead of returning the named
-/// `ServiceNotDeclared` refusal. This test runs in the default (debug,
-/// overflow-checked) test profile, so it would have panicked under the old
-/// `||` ordering.
 #[test]
-fn an_out_of_range_service_id_is_a_named_refusal_not_a_shift_overflow_panic() {
+fn attach_writes_the_declared_version_into_the_slot() {
+    #[derive(Default)]
+    struct V(CountSm);
+    impl StateMachine for V {
+        const NAME: &'static str = "count";
+        const VERSION: u32 = uc_protocol::identity::pack_version(1, 4, 0);
+        type Command = <CountSm as StateMachine>::Command;
+        type Response = <CountSm as StateMachine>::Response;
+        type Query = <CountSm as StateMachine>::Query;
+        type QueryResponse = <CountSm as StateMachine>::QueryResponse;
+        fn apply(&mut self, ctx: &mut ApplyCtx, c: Self::Command) -> Self::Response {
+            self.0.apply(ctx, c)
+        }
+        fn query(&self, q: Self::Query) -> Self::QueryResponse {
+            self.0.query(q)
+        }
+        fn last_applied(&self) -> Option<u64> {
+            self.0.last_applied()
+        }
+    }
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count"], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let err = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), APP).service_id(200),
-        CountSm::default(),
-    )
-    .start()
-    .err()
-    .expect("id 200 is out of range");
-    assert!(
-        matches!(
-            err,
-            uc_service::ServiceError::ServiceNotDeclared {
-                id: 200,
-                declared: 0b11
-            }
-        ),
-        "{err:?}"
+    let svc = start_service::<V>(dir.path());
+    assert_eq!(
+        open_cnc(dir.path()).service_slot(0).status.version(),
+        0x0104_0000
     );
+    svc.stop();
     node.stop();
 }
 
@@ -327,8 +323,8 @@ fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
     let dir = tempdir();
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let svc0 = start_service(dir.path(), 0);
-    let svc1 = start_service(dir.path(), 1);
+    let svc0 = start_service::<CountSm>(dir.path());
+    let svc1 = start_service::<Tagged<1, CountSm>>(dir.path());
     let client = Client::connect(dir.path(), APP).unwrap();
     let mut last: u64 = 0;
     for _ in 0..100 {
@@ -443,10 +439,10 @@ fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
     ))
     .unwrap();
     wait_until("serving", || node.can_serve());
-    let svc0 = start_service(dir.path(), 0);
+    let svc0 = start_service::<CountSm>(dir.path());
     let svc1 = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), APP).service_id(1),
-        SlowCountSm::default(),
+        ServiceConfig::new(dir.path(), APP),
+        Tagged::<1, SlowCountSm>::default(),
     )
     .start()
     .unwrap();
@@ -486,10 +482,10 @@ fn lockstep_holds_the_fsms_within_one_frame() {
     ))
     .unwrap();
     wait_until("serving", || node.can_serve());
-    let svc0 = start_service(dir.path(), 0);
+    let svc0 = start_service::<CountSm>(dir.path());
     let svc1 = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), APP).service_id(1),
-        SlowCountSm::default(),
+        ServiceConfig::new(dir.path(), APP),
+        Tagged::<1, SlowCountSm>::default(),
     )
     .start()
     .unwrap();
@@ -519,7 +515,7 @@ fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
     ))
     .unwrap();
     wait_until("serving", || node.can_serve());
-    let svc0 = start_service(dir.path(), 0);
+    let svc0 = start_service::<CountSm>(dir.path());
     // `max_inflight` comfortably above the ~1024 records that fit under the
     // 64 KiB door (so the client's own window isn't what stops the burst —
     // the full door-capped backlog reaches the ring either way) yet well
@@ -570,7 +566,7 @@ fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
     );
     let _ = tickets; // drop: whatever timed out, timed out
     // Attaching the missing FSM re-opens the door: both catch up, writes flow.
-    let svc1 = start_service(dir.path(), 1);
+    let svc1 = start_service::<Tagged<1, CountSm>>(dir.path());
     wait_until("door reopens", || {
         client
             .submit::<Cmd, u64>(&Cmd::Add(1))
@@ -688,16 +684,20 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
     }
     // Release: attach both FSMs on both followers; each applies to commit,
     // min_applied rises, the ceiling rises, commit follows — to the end.
-    let mut services = Vec::new();
+    let mut services0 = Vec::new();
+    let mut services1 = Vec::new();
     for i in (0..3).filter(|&i| i != leader) {
-        services.push(start_service(&dirs[i], 0));
-        services.push(start_service(&dirs[i], 1));
+        services0.push(start_service::<CountSm>(&dirs[i]));
+        services1.push(start_service::<Tagged<1, CountSm>>(&dirs[i]));
     }
     wait_until("commit reaches append", || {
         let c = leader_node.counters();
         c.commit.load_acquire() == c.append.load_acquire()
     });
-    for s in services {
+    for s in services0 {
+        s.stop();
+    }
+    for s in services1 {
         s.stop();
     }
     for n in nodes.into_iter().flatten() {
@@ -712,8 +712,8 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
     let dir = tempdir();
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
-    let svc0 = start_service(dir.path(), 0);
-    let svc1 = start_service(dir.path(), 1);
+    let svc0 = start_service::<CountSm>(dir.path());
+    let svc1 = start_service::<Tagged<1, CountSm>>(dir.path());
     let client = PipelinedClient::connect(dir.path(), APP, PipelinedConfig::default()).unwrap();
     assert_eq!(client.declared(), 0b11);
     let t1: u64 = client
@@ -874,7 +874,7 @@ fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
     let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
 
-    let svc1 = start_service(dir.path(), 1);
+    let svc1 = start_service::<Tagged<1, CountSm>>(dir.path());
     wait_until("service_attached record for FSM 1", || {
         let t = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
         t.lines().any(|l| {

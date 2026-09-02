@@ -11,7 +11,6 @@ use uc_log::buffer::LogBuffer;
 use uc_log::cnc::{CncPage, pack_service_status, unpack_service_status};
 use uc_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
-use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 
 use crate::apply::ApplyState;
 use crate::config::{ServiceConfig, ServiceError};
@@ -34,10 +33,10 @@ pub(crate) struct Attached<S: RawStateMachine> {
     /// Shared poison flag (see [`ApplyState::poisoned`]) — the `Service`
     /// handle keeps a clone so `is_alive` can report a poisoned incarnation.
     pub(crate) poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// M14a: which declared FSM slot this attach is for (`cfg.service_id`).
+    /// FSM identity: the row this attach landed on, found by `S::IDENTITY.name`.
     pub(crate) service_id: u8,
-    /// M14a: `service.<id>.lock`, held for the service's life (dropped last,
-    /// released by the OS on any exit) — enforces one process per id.
+    /// M14a: `service.<row>.lock`, held for the service's life (dropped last,
+    /// released by the OS on any exit) — enforces one process per row.
     pub(crate) _lock: std::fs::File,
 }
 
@@ -68,18 +67,30 @@ pub(crate) fn attach<S: RawStateMachine>(
     let meta = cnc.meta();
     let instance_id = meta.instance_id;
 
-    // 1b. M14a: the declared-set gate. `0` on the page is a harness node
+    // 1b. Find our row BY NAME (spec §4.3). A harness page (`none_for_tests`:
+    // `services_declared == 0` and no names declared) rings row 0 for
+    // whoever attaches — the pre-M14c multi-service-oblivious contract.
+    let names = cnc.service_names();
+    let harness = cnc.services_declared() == 0 && names.iter().all(Option::is_none);
+    let row: u8 = if harness {
+        0
+    } else {
+        cnc.row_of(&S::IDENTITY.name)
+            .ok_or_else(|| ServiceError::UnknownFsm {
+                name: S::IDENTITY.name.as_str().to_string(),
+                declared: names
+                    .iter()
+                    .flatten()
+                    .map(|n| n.as_str().to_string())
+                    .collect(),
+            })?
+    };
+    // M14a: the declared-set gate. `0` on the page is a harness node
     // (`ServicesConfig::none_for_tests`), which rings FSM 0 only.
     let declared = match cnc.services_declared() {
         0 => 1,
         d => d,
     };
-    if cfg.service_id as usize >= CNC_MAX_SERVICES || declared & (1u64 << cfg.service_id) == 0 {
-        return Err(ServiceError::ServiceNotDeclared {
-            id: cfg.service_id,
-            declared,
-        });
-    }
     // M14a Task 7: the lag mode this incarnation runs under, read once at
     // attach (the page's `services_declared`/`fsm_lag_bytes` are boot-once —
     // see the cnc layout doc). `lag_mode_for` deliberately reads the RAW page
@@ -95,15 +106,17 @@ pub(crate) fn attach<S: RawStateMachine>(
     // 1c. M14a: one process per id. Exclusive flock, held for the service's
     // life (the OS releases it on any exit), mirroring the node's
     // `instance.lock`.
-    let lock_path = dir.join(format!("service.{}.lock", cfg.service_id));
+    let lock_path = dir.join(format!("service.{}.lock", row));
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .map_err(|_| ServiceError::AlreadyAttached { id: cfg.service_id })?;
+    fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| ServiceError::AlreadyAttached {
+        name: S::IDENTITY.name.as_str().to_string(),
+        row,
+    })?;
 
     // 2. Open the log buffer file (read-only in spirit: the service only ever
     //    uses the read APIs; a v2.x hardening may map PROT_READ). Its max_claim
@@ -116,12 +129,11 @@ pub(crate) fn attach<S: RawStateMachine>(
 
     // 3. Egress producer (service→everyone responses) + svc_query consumer
     //    (node→service queries; drained by Task 11). M14a: named for this
-    //    process's declared `service_id` (enforced by the declared-set gate above).
-    let egress_ring =
-        BroadcastRing::open(&dir.join(format!("egress_service.{}.broadcast", cfg.service_id)))
-            .map_err(|e| ServiceError::Ring(e.to_string()))?;
+    //    process's row, found by name above.
+    let egress_ring = BroadcastRing::open(&dir.join(format!("egress_service.{}.broadcast", row)))
+        .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let egress = Egress::new(egress_ring.producer());
-    let svc_query_ring = SpscRing::open(&dir.join(format!("svc_query.{}.ring", cfg.service_id)))
+    let svc_query_ring = SpscRing::open(&dir.join(format!("svc_query.{}.ring", row)))
         .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let (_svc_query_producer, svc_query) = svc_query_ring.into_split();
 
@@ -161,16 +173,16 @@ pub(crate) fn attach<S: RawStateMachine>(
     // one rejoin mechanism — try-live-then-replay — covers both a caught-up
     // reattach and a fresh SM (`None -> 0`) on a long-scrolled ring.
     let start_pos = last_applied.unwrap_or(0);
-    let s = slot(&cnc, cfg.service_id);
+    let s = slot(&cnc, row);
     s.applied.store_release(start_pos);
     // Status: attached, incarnation += 1 (the prior life's value survives a
     // crash on the same page; a node restart zeroes it with the page).
     let (_, _, incarnation) = unpack_service_status(s.status.load_acquire());
-    s.status.store_release(pack_service_status(
-        cfg.service_id,
-        true,
-        incarnation.wrapping_add(1),
-    ));
+    s.status
+        .store_release(pack_service_status(row, true, incarnation.wrapping_add(1)));
+    // cnc 3.1: the attaching service's declared version, for observability
+    // (`ServiceStatusLine::version`) — written once, here, alongside status.
+    s.status.store_version(S::VERSION);
     // 5. Bump the epoch AFTER applied, AcqRel — the discipline the node's
     //    capture-recheck bracket relies on (unchanged, now per slot).
     let epoch = s.epoch.fetch_add(1) + 1;
@@ -190,7 +202,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         instance_id,
         instance_mismatch_streak: 0,
         my_epoch: epoch,
-        service_id: cfg.service_id,
+        service_id: row,
         lag_mode,
         declared,
         lag_waiting: false,
@@ -212,7 +224,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         instance_id,
         epoch,
         poisoned,
-        service_id: cfg.service_id,
+        service_id: row,
         _lock: lock,
     })
 }

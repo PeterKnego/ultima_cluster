@@ -15,9 +15,6 @@ pub struct ServiceConfig {
     /// M6 Task 3: the snapshot-building cadence. Default `SnapshotPolicy::default()`
     /// (`interval_bytes: 0`, "never") — see that type's doc.
     pub snapshot_policy: SnapshotPolicy,
-    /// M14a: which declared FSM slot this process is; default 0. Refused at
-    /// attach if not declared on the node's page.
-    pub service_id: u8,
 }
 
 impl ServiceConfig {
@@ -26,7 +23,6 @@ impl ServiceConfig {
             instance_dir: instance_dir.into(),
             app_id: app_id.into(),
             snapshot_policy: SnapshotPolicy::default(),
-            service_id: 0,
         }
     }
 
@@ -37,12 +33,6 @@ impl ServiceConfig {
     /// thread, so a policy set here is simply unused on that path.
     pub fn snapshot_policy(mut self, policy: SnapshotPolicy) -> Self {
         self.snapshot_policy = policy;
-        self
-    }
-
-    /// M14a: declare which FSM slot this process is (default 0).
-    pub fn service_id(mut self, id: u8) -> Self {
-        self.service_id = id;
         self
     }
 }
@@ -100,17 +90,20 @@ pub enum ServiceError {
          machine cannot install a covering snapshot"
     )]
     SnapshotRequired { needed: u64, first_available: u64 },
-    /// M14a: `service_id` is not in the node's declared set (cnc 4032).
+    /// FSM identity (spec §4.3): the attaching type's `S::IDENTITY.name` is
+    /// not declared on the node's page (`CncPage::row_of` found nothing).
     #[error(
-        "service id {id} is not declared on this node (declared set 0b{declared:b}); \
-         fix [services] ids on the node or --service-id on the service"
+        "FSM {name:?} is not declared on this node (declared, in row order: \
+         {declared:?}); add it to [services] names on the node, or attach \
+         the service that is"
     )]
-    ServiceNotDeclared { id: u8, declared: u64 },
-    /// M14a: another live process holds `service.<id>.lock`.
+    UnknownFsm { name: String, declared: Vec<String> },
+    /// M14a: another live process holds `service.<row>.lock`.
     #[error(
-        "another process already holds service id {id} on this instance dir (service.{id}.lock)"
+        "another process already holds FSM {name:?} at row {row} on this \
+         instance dir (service.{row}.lock)"
     )]
-    AlreadyAttached { id: u8 },
+    AlreadyAttached { name: String, row: u8 },
 }
 
 /// Why a [`SnapshotStateMachine`](crate::SnapshotStateMachine) freeze/stream/
