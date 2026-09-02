@@ -125,6 +125,10 @@ fn spawn_node_multi(instance_dir: &Path, id: u32, bind: SocketAddr, members: &st
         .arg(bind.to_string())
         .arg("--members")
         .arg(members)
+        // FSM identity: `--services` is required (Task 4) — the crashtest
+        // service binary runs `RegisterSm` ("register").
+        .arg("--services")
+        .arg("register")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -224,6 +228,9 @@ fn write_node_toml(
          journal_segment_bytes = {}\n\
          \n\
          {members_toml}\n\
+         [services]\n\
+         names = [\"register\"]\n\
+         \n\
          [crypto]\n\
          enabled = false\n\
          \n\
