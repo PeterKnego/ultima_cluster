@@ -1174,7 +1174,11 @@ fn spawn_node_multi(
         .arg("--bind")
         .arg(bind.to_string())
         .arg("--members")
-        .arg(members);
+        .arg(members)
+        // FSM identity: `--services` is required (Task 4) — the crashtest
+        // service binary runs `RegisterSm` ("register").
+        .arg("--services")
+        .arg("register");
     if let Some((key_path, allowlist_path)) = crypto {
         cmd.arg("--crypto-key")
             .arg(key_path)
