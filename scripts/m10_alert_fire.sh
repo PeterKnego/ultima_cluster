@@ -236,6 +236,8 @@ RULE_META = {
     "Uc2DiskLow": {"severity": "warning", "real": False, "scenario": "disk_low"},
     "Uc2ServiceAbsent": {"severity": "critical", "real": True, "scenario": "service_absent"},
     "Uc2ServicePinnedAtLagBound": {"severity": "warning", "real": True, "scenario": "fsm_pinned"},
+    "Uc2ServiceIdentityDrift": {"severity": "critical", "real": False, "scenario": "identity_drift"},
+    "Uc2ServiceVersionDrift": {"severity": "warning", "real": False, "scenario": "version_drift"},
 }
 
 
@@ -284,7 +286,12 @@ def build_Uc2ServiceWedged():
 
 def build_Uc2ServiceAbsent():
     rows = load_scenario("service_absent")
-    row = select(rows, "uc_service_attached", {"service": "1"})
+    # Task 7 (spec §4.5): the per-FSM label shape changed from `service="1"`
+    # (the declared id, stringified) to `service="<name>",row="1"` (a
+    # service is now found by NAME; `row` keeps the old positional meaning).
+    # Select on `row`, not `service` — `service` here is `"slow"`
+    # (`SlowSm::NAME`), not `"1"`.
+    row = select(rows, "uc_service_attached", {"row": "1"})
     r = new_rule("critical", labels_from=row)  # == 0 keeps every label
     add_hold_last(r, row, "uc_service_attached", 30)
     r["eval_time"] = total_for(30)[0]
@@ -293,13 +300,15 @@ def build_Uc2ServiceAbsent():
 
 def build_Uc2ServicePinnedAtLagBound():
     rows = load_scenario("fsm_pinned")
-    lag_row = select(rows, "uc_service_lag_bytes", {"service": "1"})
+    # Task 7 (spec §4.5): select on `row`, not `service` — see
+    # build_Uc2ServiceAbsent's comment above.
+    lag_row = select(rows, "uc_service_lag_bytes", {"row": "1"})
     bound_row = select(rows, "uc2_fsm_lag_bytes", {})
     # Review round 2: the rule is now gated on the FSM being ATTACHED (so an
     # absent FSM pages once, as Uc2ServiceAbsent, not twice). The scenario
     # already scrapes `uc_service_attached`, so the guard series is the real
     # captured one — it must be replayed here or the rule can never fire.
-    att_row = select(rows, "uc_service_attached", {"service": "1"})
+    att_row = select(rows, "uc_service_attached", {"row": "1"})
     # group_left keeps the LHS's `service` label; `and on(instance)` keeps it too.
     r = new_rule("warning", labels_from=lag_row)
     add_hold_last(r, lag_row, "uc_service_lag_bytes", 30)
@@ -436,6 +445,41 @@ def build_Uc2DiskLow():
     return r
 
 
+def build_Uc2ServiceIdentityDrift():
+    # Task 7 (spec §4.5): `identity_drift`'s scenario scrapes TWO synthetic
+    # "nodes" ("n0" declaring row 0 = "kv", "n1" declaring row 0 = "orders"),
+    # so — unlike every builder above, which selects ONE row — this one
+    # needs BOTH instances' rows: the rule's `count_values` idiom only fires
+    # when two DISTINCT hashes for the same row are visible in the same
+    # window. The rule's result vector keeps only `row` (count_values
+    # collapses `service`/`instance` away on the way to the outer
+    # `count by (row)`), so the expected ALERTS labels are built from a
+    # synthetic `labels_from` carrying just that — not either raw row.
+    rows = load_scenario("identity_drift")
+    row_a = select(rows, "uc2_service_identity_hash", {"instance": "n0"})
+    row_b = select(rows, "uc2_service_identity_hash", {"instance": "n1"})
+    r = new_rule("critical", labels_from={"labels": {"row": row_a["labels"]["row"]}})
+    add_hold_last(r, row_a, "uc2_service_identity_hash", 60)
+    add_hold_last(r, row_b, "uc2_service_identity_hash", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
+def build_Uc2ServiceVersionDrift():
+    # Same two-instance shape as build_Uc2ServiceIdentityDrift above: both
+    # synthetic "nodes" declare row 0 = "kv" (identity agrees) but wrote
+    # different nonzero versions at attach — the rule only fires when both
+    # are visible in the same window, and its result vector keeps only `row`.
+    rows = load_scenario("version_drift")
+    row_a = select(rows, "uc2_service_version", {"instance": "n0"})
+    row_b = select(rows, "uc2_service_version", {"instance": "n1"})
+    r = new_rule("warning", labels_from={"labels": {"row": row_a["labels"]["row"]}})
+    add_hold_last(r, row_a, "uc2_service_version", 300)
+    add_hold_last(r, row_b, "uc2_service_version", 300)
+    r["eval_time"] = total_for(300)[0]
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -453,6 +497,8 @@ RULE_BUILDERS = {
     "Uc2DiskLow": build_Uc2DiskLow,
     "Uc2ServiceAbsent": build_Uc2ServiceAbsent,
     "Uc2ServicePinnedAtLagBound": build_Uc2ServicePinnedAtLagBound,
+    "Uc2ServiceIdentityDrift": build_Uc2ServiceIdentityDrift,
+    "Uc2ServiceVersionDrift": build_Uc2ServiceVersionDrift,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

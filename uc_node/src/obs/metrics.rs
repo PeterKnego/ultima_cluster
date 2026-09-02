@@ -386,7 +386,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_service_identity_hash",
-        "FNV-1a 64 of the row's declared FSM name; must be identical on every node — alert on `count by (row) (uc2_service_identity_hash) > 1`.",
+        "FNV-1a 64 of the row's declared FSM name; must be identical on every node. Stored as a float64 sample on the wire (exact — 64-bit integers up to 2^53 round-trip losslessly, and any two real FNV-1a 64 hashes would have to agree in their top 53 bits to collide after scraping). Alert: Uc2ServiceIdentityDrift (packaging/prometheus/uc2-alerts.yml) — `count by (row) (count_values(\"hash\", uc2_service_identity_hash) by (row)) > 1`; a bare `count by (row) (uc2_service_identity_hash) > 1` counts SERIES (instances), not distinct values, and pages permanently on any multi-node cluster.",
         "gauge",
         &rows,
         |r| r.identity_hash,
@@ -394,7 +394,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_service_version",
-        "Packed semantic version of the attached service (0 = none/unversioned); alert on `count by (row, service) (uc2_service_version > 0) > 1`.",
+        "Packed semantic version of the attached service (0 = none/unversioned). Alert: Uc2ServiceVersionDrift (packaging/prometheus/uc2-alerts.yml) — `count by (row) (count_values(\"version\", uc2_service_version > 0) by (row)) > 1`; a bare `count by (row, service) (uc2_service_version > 0) > 1` counts SERIES, not distinct values, and pages permanently on any multi-node cluster.",
         "gauge",
         &rows,
         |r| r.version,
@@ -1371,6 +1371,29 @@ mod tests {
         );
         assert!(
             text.contains("# HELP uc2_snapshot_refused_version_total"),
+            "{text}"
+        );
+        // Review fix: the HELP text must carry the REAL PromQL — the naive
+        // `count by (row) (uc2_service_identity_hash) > 1` counts SERIES
+        // (instances), not distinct VALUES, so it would page permanently on
+        // any multi-node cluster. `count_values` is the operator that
+        // actually groups by value; the shipped alert rule
+        // (`packaging/prometheus/uc2-alerts.yml`) uses it and the HELP text
+        // must match, not the naive form.
+        assert!(
+            text.contains(
+                "count by (row) (count_values(\"hash\", uc2_service_identity_hash) by (row)) > 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("float64"),
+            "identity-hash HELP must disclose the wire-encoding precision note: {text}"
+        );
+        assert!(
+            text.contains(
+                "count by (row) (count_values(\"version\", uc2_service_version > 0) by (row)) > 1"
+            ),
             "{text}"
         );
     }
