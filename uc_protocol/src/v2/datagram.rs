@@ -820,6 +820,13 @@ mod tests {
         assert_eq!(&buf[0..4], &9u32.to_le_bytes());
         assert_eq!(buf[4], 2);
         assert_eq!(buf[5], 1);
+        assert_eq!(
+            &buf[6..8],
+            &[0, 0],
+            "reserved pad, u64 alignment for snapshot_pos"
+        );
+        assert_eq!(&buf[8..16], &4096u64.to_le_bytes(), "snapshot_pos");
+        assert_eq!(&buf[16..24], &77u64.to_le_bytes(), "total_len");
         assert_eq!(&buf[24..32], &identity[0].to_le_bytes());
         assert_eq!(&buf[32..40], &identity[1].to_le_bytes());
         assert_eq!(&buf[92..96], &version[1].to_le_bytes());

@@ -181,19 +181,6 @@ impl ServicesConfig {
         (0..CNC_MAX_SERVICES as u8).filter(move |&i| mask & (1 << i) != 0)
     }
 
-    /// [`ring_ids`](Self::ring_ids) as a bitmask — what the snapshot session
-    /// puts on the wire and compares (M14c, spec §14.3). Identical to
-    /// [`declared`](Self::declared) for any node built by `from_names`; `{0}`
-    /// for a `none_for_tests` harness node, matching M14a's standing rule that
-    /// a page whose `services_declared` reads 0 is treated as `{0}`.
-    pub fn ring_mask(&self) -> u64 {
-        if self.declared() == 0 {
-            1
-        } else {
-            self.declared()
-        }
-    }
-
     pub fn resolve_lag(&self, buffer_bytes: u64) -> FsmLag {
         self.fsm_lag.unwrap_or(FsmLag::Bounded(buffer_bytes / 4))
     }

@@ -560,8 +560,11 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     .unwrap();
     // M14c: the source closure ships each declared id's own newest artifact, so
     // the test must publish the SLOT the service owns as well as the page-1
-    // aggregate the node would normally derive from it (a `none_for_tests` node
-    // publishes no aggregates — `publish_service_mins` returns early).
+    // aggregate the node would normally derive from it — this voter now
+    // declares a real "fsm0" (wire 0.7.0 Ruling 1: a `none_for_tests` node
+    // can no longer ship a snapshot session at all, see
+    // `spawn_applied_mirror`'s doc), but still has no REAL service attached
+    // to publish the aggregate on its own, so the test publishes it by hand.
     cnc.service_slot(0).snapshot_pos.store_release(floor);
     cnc.snapshots().service_snapshot_pos.store_release(floor);
 
@@ -1047,7 +1050,7 @@ impl Drop for CaptureGuard {
 /// M14c (spec §8/§14.3), controller amendment 2: a joiner whose declared FSM
 /// set differs from the leader's must refuse the snapshot session **by name** —
 /// the counter increments AND the node emits `snapshot_session_refused` with
-/// `reason = "declared-set mismatch"`. Refusing keeps the joiner stalled-but-safe
+/// `reason = "identity mismatch"`. Refusing keeps the joiner stalled-but-safe
 /// (it re-NAKs forever) instead of installing a set that covers only some of its
 /// FSMs; the log line plus the counter are what tell an operator which it is.
 #[test]

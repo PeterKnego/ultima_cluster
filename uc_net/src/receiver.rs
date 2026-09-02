@@ -445,7 +445,7 @@ pub const SNAP_INTAKE_TIMEOUT_NS: u64 = 60_000_000_000; // 60s
 pub const SNAP_REDRIVE_INTERVAL_NS: u64 = 250_000_000; // 250ms
 
 /// Which half of a `SNAP_BEGIN` positional comparison failed — see
-/// [`FollowerStats::identity_refusal`].
+/// [`FollowerStats::identity_refusal`] / [`FollowerStats::version_refusal`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalKind {
     /// Row `r`'s FSM name hash disagreed (or named a row outside the local
@@ -588,20 +588,33 @@ pub struct FollowerStats {
     /// FSMs, row for row, would strand one below an adopted floor, or attach
     /// the wrong service under a shared row. Declared identities must match
     /// cluster-wide, positionally. See [`FollowerStats::identity_refusal`]
-    /// for the offending row's detail.
+    /// (written BEFORE this counter bumps, `Release`-ordered against it) for
+    /// the offending row's detail.
     pub snap_refused_declared_mismatch: AtomicU64,
     /// Wire 0.7.0 (spec §5, §8): a `SNAP_BEGIN` arrived whose identity
     /// matched at every row but whose `version` differed from this node's own
     /// at some row where BOTH sides report a nonzero version — the named
     /// refusal **`version mismatch`**. An unversioned side (0) is never a
     /// mismatch: it means "unknown," not "empty." See
-    /// [`FollowerStats::identity_refusal`] for the offending row's detail.
+    /// [`FollowerStats::version_refusal`] (written BEFORE this counter
+    /// bumps, `Release`-ordered against it) for the offending row's detail.
     pub snap_refused_version_mismatch: AtomicU64,
-    /// Detail for the most recent identity/version refusal on this receiver
-    /// — the row, both sides' hash, both sides' version, and which kind of
-    /// mismatch it was. `None` until the first refusal. Touched only on the
-    /// (rare) refusal path, never on the hot chunk-receive path.
+    /// Detail for the most recent IDENTITY refusal (`RefusalKind::Identity`)
+    /// on this receiver — the row, both sides' hash, and which kind of
+    /// mismatch it was (always `Identity` here). `None` until the first such
+    /// refusal. Touched only on the (rare) refusal path, never on the hot
+    /// chunk-receive path; a reader must poison-tolerate it
+    /// (`.lock().unwrap_or_else(|e| e.into_inner())`) since it is
+    /// diagnostic-only state that must never cascade a panic on this thread
+    /// into a poisoned lock elsewhere. Kept in its own cell, separate from
+    /// [`version_refusal`](Self::version_refusal), so an identity refusal and
+    /// a version refusal landing in the same duty cycle each keep their own
+    /// detail rather than one clobbering the other.
     pub identity_refusal: Mutex<Option<IdentityRefusal>>,
+    /// The `RefusalKind::Version` counterpart of
+    /// [`identity_refusal`](Self::identity_refusal) — detail for the most
+    /// recent VERSION refusal only. Same poison-tolerance requirement.
+    pub version_refusal: Mutex<Option<IdentityRefusal>>,
     /// M14c review round 2: a local I/O failure on the snapshot INTAKE path —
     /// a `.part` that could not be created/sized (`open_snap_part`), or a
     /// completed artifact whose `sync_all`/`rename` failed. None of these are
@@ -1815,11 +1828,12 @@ impl FollowerReceiver {
                 if let Some(b) = read_snap_begin_body(&d[DATAGRAM_HEADER_LEN..]) {
                     self.snap_begin(from, b);
                 } else if self.snap_dir.is_some() {
-                    // M14c: a body we cannot even DECODE is the other, and more
-                    // realistic, half of the `peer wire 0.5.0` refusal: a
-                    // genuine 0.5.0 `SNAP_BEGIN` body is 26 bytes plus its
+                    // A body we cannot even DECODE is the other, and more
+                    // realistic, half of the `peer wire ≤ 0.6.0` refusal: the
+                    // realistic undecodable body post-0.7.0 is a genuine 0.6.0
+                    // `SNAP_BEGIN`, whose fixed part is 34 bytes plus its
                     // config, so it fails `read_snap_begin_body`'s
-                    // `SNAP_BEGIN_FIXED_LEN` (34) check and would otherwise
+                    // `SNAP_BEGIN_FIXED_LEN` (122) check and would otherwise
                     // vanish with BOTH refusal counters at zero — exactly the
                     // flag-day symptom an operator needs to see. Same named
                     // refusal, same drop as a wrong `layout` byte. Only counted
@@ -1840,7 +1854,7 @@ impl FollowerReceiver {
                             .fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "uc_net: SNAP_BEGIN from {from} could not be decoded ({} body \
-                             bytes) -- almost certainly a wire-0.5.0 peer; this node cannot \
+                             bytes) -- almost certainly a wire <= 0.6.0 peer; this node cannot \
                              install its snapshot set. Upgrade every node together (the \
                              node<->node wire is a flag day)",
                             d.len().saturating_sub(DATAGRAM_HEADER_LEN)
@@ -1904,23 +1918,37 @@ impl FollowerReceiver {
         }
         // The id must be inside the sender's own declared mask, and the two
         // sides' identities must agree at EVERY row, positionally by name —
-        // not just at `service_id`'s row (spec §5, §8).
+        // not just at `service_id`'s row (spec §5, §8). `service_id` is
+        // peer-controlled and NEVER bounds-checked by the wire format (any
+        // `u8`, 0..=255, decodes) even though only rows 0..8 exist. A shift
+        // by an id >= 64 is not representable — `checked_shl` folds that into
+        // an always-false bit test rather than shifting UB — and the same
+        // caution extends to the row we RECORD for diagnostics: `service_id`
+        // must NEVER be used to index `identity`/`own_identity` directly
+        // (a `SNAP_BEGIN` whose arrays are otherwise equal but whose
+        // `service_id` is e.g. 9 would panic the receiver agent on an
+        // out-of-bounds index — remotely, and with crypto off). Clamp it
+        // into range first.
         let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
         if b.identity != self.own_identity || b.declared_mask() & bit == 0 {
             let row = (0..8)
                 .find(|&r| b.identity[r] != self.own_identity[r])
-                .unwrap_or(b.service_id as usize) as u8;
-            *self.stats.identity_refusal.lock().unwrap() = Some(IdentityRefusal {
+                .unwrap_or((b.service_id as usize).min(7)) as u8;
+            *self
+                .stats
+                .identity_refusal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(IdentityRefusal {
                 row,
-                ours: self.own_identity[row as usize],
-                theirs: b.identity[row as usize],
+                ours: self.own_identity.get(row as usize).copied().unwrap_or(0),
+                theirs: b.identity.get(row as usize).copied().unwrap_or(0),
                 ours_version: 0,
                 theirs_version: 0,
                 kind: RefusalKind::Identity,
             });
             self.stats
                 .snap_refused_declared_mismatch
-                .fetch_add(1, Ordering::Relaxed);
+                .fetch_add(1, Ordering::Release);
             self.snap_drop_intake_from(from);
             return;
         }
@@ -1929,7 +1957,11 @@ impl FollowerReceiver {
             if let Some(r) =
                 (0..8).find(|&r| ours[r] != 0 && b.version[r] != 0 && ours[r] != b.version[r])
             {
-                *self.stats.identity_refusal.lock().unwrap() = Some(IdentityRefusal {
+                *self
+                    .stats
+                    .version_refusal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(IdentityRefusal {
                     row: r as u8,
                     ours: self.own_identity[r],
                     theirs: b.identity[r],
@@ -1939,7 +1971,7 @@ impl FollowerReceiver {
                 });
                 self.stats
                     .snap_refused_version_mismatch
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Release);
                 self.snap_drop_intake_from(from);
                 return;
             }
@@ -5828,8 +5860,9 @@ mod tests {
         let st = r.stats();
         let to = r.local_addr();
 
-        // A genuine 0.5.0 fixed body is 26 bytes — too short to decode as
-        // 0.6.0 at all. The leader re-sends it; three arrive.
+        // A genuine pre-0.7.0 fixed body (0.5.0's 26 bytes, 0.6.0's 34) is
+        // too short to decode as 0.7.0 at all. The leader re-sends it; three
+        // arrive.
         let short = vec![0u8; 26];
         for _ in 0..3 {
             leader.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &short);

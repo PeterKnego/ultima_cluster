@@ -272,6 +272,20 @@ impl Harness {
     /// Send a hand-built SNAP_BEGIN straight at the follower — the only way to
     /// exercise a refusal, since our own sender never emits one.
     fn forge_begin(&self, layout: u8, identity: [u64; 8], version: [u32; 8]) {
+        self.forge_begin_with_id(layout, 0, identity, version);
+    }
+
+    /// Like [`forge_begin`](Self::forge_begin), but with an explicit
+    /// `service_id` — for a peer-supplied row that is out of the receiver's
+    /// own bounds (CRITICAL 1's regression case: `service_id` is a bare `u8`
+    /// on the wire and is never bounds-checked to 0..8).
+    fn forge_begin_with_id(
+        &self,
+        layout: u8,
+        service_id: u8,
+        identity: [u64; 8],
+        version: [u32; 8],
+    ) {
         use uc_protocol::v2::datagram::{
             DATAGRAM_HEADER_LEN, DGRAM_KIND_SNAP_BEGIN, DatagramHeader, SNAP_BEGIN_FIXED_LEN,
             SnapBeginBody, write_datagram_header, write_snap_begin_body,
@@ -292,7 +306,7 @@ impl Harness {
             &SnapBeginBody {
                 session: 99,
                 layout,
-                service_id: 0,
+                service_id,
                 snapshot_pos: snap_pos(0),
                 total_len: 64,
                 identity,
@@ -571,11 +585,42 @@ fn a_version_mismatch_is_refused_only_when_both_sides_report_one() {
     h.pump_until("version refusal", |_| {
         st.snap_refused_version_mismatch.load(Ordering::Relaxed) > 0
     });
-    let r = st.identity_refusal.lock().unwrap().clone().unwrap();
+    // Its own cell, separate from `identity_refusal` (IMPORTANT 3): a version
+    // refusal must never be mistaken for — or clobbered by — an identity one.
+    let r = st.version_refusal.lock().unwrap().clone().unwrap();
     assert_eq!(
         (r.row, r.kind, r.ours_version, r.theirs_version),
         (0, RefusalKind::Version, 0x0100_0000, 0x0200_0000)
     );
+}
+
+/// CRITICAL regression: `service_id` is a bare, peer-controlled `u8` on the
+/// wire (0..=255) and is never bounds-checked to the 8 real rows. A BEGIN
+/// whose `identity` array matches ours EXACTLY (so the array-equality half of
+/// the check passes) but whose `service_id` names a row past the end of the
+/// array must still be refused — by the "artifact bit absent" half — without
+/// ever indexing `identity`/`own_identity` with the raw `service_id`. Before
+/// the fix this panicked the receiver agent on the out-of-bounds index.
+#[test]
+fn an_out_of_range_service_id_is_refused_not_a_panic() {
+    let mut h = build(FaultConfig::default(), &["fsm0"]);
+    let st = h.follower.stats();
+    let ours = identity_hashes_of(&["fsm0"]);
+    h.forge_begin_with_id(SNAP_BEGIN_LAYOUT_V3, 9, ours, [0; 8]);
+    h.pump_until("the out-of-range id is refused, not a panic", |_| {
+        st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
+    });
+    assert!(
+        !h.follower_snap_dir.join("0").exists(),
+        "no intake, no directory, no .part"
+    );
+    // The receiver agent survived (it kept polling) and a subsequent VALID
+    // session still completes normally — the panic-free fix, not just a
+    // refused datagram.
+    h.trigger();
+    h.pump_until("a subsequent valid session still completes", |h| {
+        h.final_path(0).exists()
+    });
 }
 
 #[test]

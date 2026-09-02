@@ -3487,6 +3487,46 @@ mod tests {
         assert!(ok.snap.is_some(), "a covering set still opens a session");
     }
 
+    /// Wire 0.7.0 (spec §5): `services_declared` must equal
+    /// `identity_mask(&identity)` — the invariant `try_open_snap_session`
+    /// gained when the mask stopped being an independently-set field and
+    /// became derived. This set otherwise satisfies every OTHER invariant —
+    /// two artifacts, exactly `services_declared.count_ones()` of them, both
+    /// ids inside the mask — so if the new clause were ever removed this
+    /// case alone would start opening a session; only ONE row of `identity`
+    /// is actually non-zero (a bug in the caller, e.g.
+    /// `uc_node::snapshot_set_for` disagreeing with itself), which must
+    /// refuse the same way an uncovered artifact set does, before any
+    /// artifact file is even opened.
+    #[test]
+    fn a_declared_mask_that_disagrees_with_the_identity_array_never_opens_a_session() {
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b11,
+            identity: ident(0b1), // only row 0 is actually non-zero
+            version: [0; 8],
+            config: t17_config_bytes(),
+            artifacts: vec![
+                SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 2048,
+                    path: PathBuf::from("/nonexistent-never-opened-0"),
+                    len: 2048,
+                },
+                SnapArtifact {
+                    service_id: 1,
+                    snapshot_pos: 2048,
+                    path: PathBuf::from("/nonexistent-never-opened-1"),
+                    len: 2048,
+                },
+            ],
+        });
+        assert_snap_session_refused(
+            &mut s,
+            &f,
+            "services_declared disagrees with identity_mask(&identity)",
+        );
+    }
+
     // ==== M14c2 (T10a): `try_open_snap_session`'s refusal paths ==============
     //
     // M14c deferred the unit tests for these. Each refusal must (a) leave

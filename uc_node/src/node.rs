@@ -2990,17 +2990,49 @@ impl Consensus {
     /// mixed-version or mis-declared cluster produces one record per refusal
     /// rather than one per cycle. Two loads of an uncontended atomic on the
     /// steady-state path, no allocation on the untaken branch.
+    /// Resolve a hash to a declared name for a log line, falling back to
+    /// `hash:0x{:016x}` — shared by both the identity and the version
+    /// refusal lines below. `row` names OUR side (via `name_of`, positional);
+    /// any hash (ours or theirs) can be named by scanning our own declared
+    /// set for a match, which is what makes `theirs` readable when the peer's
+    /// row happens to hold a name we also declare, elsewhere.
+    fn name_or_hash(&self, row: u8, hash: u64) -> String {
+        self.services
+            .name_of(row)
+            .filter(|n| n.hash() == hash)
+            .or_else(|| {
+                self.services
+                    .service_names()
+                    .into_iter()
+                    .flatten()
+                    .find(|n| n.hash() == hash)
+            })
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|| format!("hash:0x{hash:016x}"))
+    }
+
+    /// Wire 0.7.0 (spec §5, §8, controller amendment 2): NAME each
+    /// snapshot-session refusal in a log line. `identity_refusal` and
+    /// `version_refusal` are separate cells (`FollowerStats`, `uc_net`) so a
+    /// refusal of one kind never clobbers the other's detail if both fire in
+    /// the same duty cycle. Counters are read `Acquire` against the
+    /// receiver's `Release` stores — `identity_refusal`/`version_refusal` are
+    /// written strictly BEFORE their counter's `fetch_add`, so a counter that
+    /// moved on this load is paired with AT LEAST that refusal's detail (a
+    /// later one may have already overwritten it, which just means this
+    /// cycle's line names the newest refusal instead of the one that moved
+    /// the counter — still a real refusal, never stale/mismatched data).
     fn report_snapshot_refusals(&mut self) {
         let now = (
             self.snap_stats
                 .snap_refused_legacy_peer
-                .load(Ordering::Relaxed),
+                .load(Ordering::Acquire),
             self.snap_stats
                 .snap_refused_declared_mismatch
-                .load(Ordering::Relaxed),
+                .load(Ordering::Acquire),
             self.snap_stats
                 .snap_refused_version_mismatch
-                .load(Ordering::Relaxed),
+                .load(Ordering::Acquire),
         );
         if now.0 != self.last_snap_refusals.0 {
             crate::obs_event!(
@@ -3011,55 +3043,53 @@ impl Consensus {
                 total = now.0
             );
         }
-        let identity_moved = now.1 != self.last_snap_refusals.1;
-        let version_moved = now.2 != self.last_snap_refusals.2;
-        if identity_moved || version_moved {
-            // Wire 0.7.0 (spec §5, §8, controller amendment 2): name the
-            // offending row. `identity_refusal` is only ever `Some` once the
-            // first refusal has landed, which a moved counter guarantees.
-            if let Some(d) = self.snap_stats.identity_refusal.lock().unwrap().clone() {
-                let ours = self
-                    .services
-                    .name_of(d.row)
-                    .map(|n| n.as_str().to_string())
-                    .unwrap_or_else(|| format!("hash:0x{:016x}", d.ours));
-                let theirs = self
-                    .services
-                    .service_names()
-                    .into_iter()
-                    .flatten()
-                    .find(|n| n.hash() == d.theirs)
-                    .map(|n| n.as_str().to_string())
-                    .unwrap_or_else(|| format!("hash:0x{:016x}", d.theirs));
-                if identity_moved {
-                    crate::obs_event!(
-                        Warn,
-                        "snapshot_session_refused",
-                        node = self.id as u64,
-                        reason = "identity mismatch",
-                        total = now.1,
-                        row = d.row as u64,
-                        ours = ours.as_str(),
-                        theirs = theirs.as_str(),
-                    );
-                }
-                if version_moved {
-                    let ours_version = uc_protocol::identity::VersionDisplay(d.ours_version);
-                    let theirs_version = uc_protocol::identity::VersionDisplay(d.theirs_version);
-                    crate::obs_event!(
-                        Warn,
-                        "snapshot_session_refused",
-                        node = self.id as u64,
-                        reason = "version mismatch",
-                        total = now.2,
-                        row = d.row as u64,
-                        ours = ours.as_str(),
-                        theirs = theirs.as_str(),
-                        ours_version = ours_version.to_string().as_str(),
-                        theirs_version = theirs_version.to_string().as_str(),
-                    );
-                }
-            }
+        // `identity_refusal` is only ever `Some` once the first identity
+        // refusal has landed, which this counter having moved guarantees.
+        if now.1 != self.last_snap_refusals.1
+            && let Some(d) = self
+                .snap_stats
+                .identity_refusal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        {
+            let ours = self.name_or_hash(d.row, d.ours);
+            let theirs = self.name_or_hash(d.row, d.theirs);
+            crate::obs_event!(
+                Warn,
+                "snapshot_session_refused",
+                node = self.id as u64,
+                reason = "identity mismatch",
+                total = now.1,
+                row = d.row as u64,
+                ours = ours.as_str(),
+                theirs = theirs.as_str(),
+            );
+        }
+        if now.2 != self.last_snap_refusals.2
+            && let Some(d) = self
+                .snap_stats
+                .version_refusal
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        {
+            let ours = self.name_or_hash(d.row, d.ours);
+            let theirs = self.name_or_hash(d.row, d.theirs);
+            let ours_version = uc_protocol::identity::VersionDisplay(d.ours_version);
+            let theirs_version = uc_protocol::identity::VersionDisplay(d.theirs_version);
+            crate::obs_event!(
+                Warn,
+                "snapshot_session_refused",
+                node = self.id as u64,
+                reason = "version mismatch",
+                total = now.2,
+                row = d.row as u64,
+                ours = ours.as_str(),
+                theirs = theirs.as_str(),
+                ours_version = ours_version.to_string().as_str(),
+                theirs_version = theirs_version.to_string().as_str(),
+            );
         }
         self.last_snap_refusals = now;
     }
