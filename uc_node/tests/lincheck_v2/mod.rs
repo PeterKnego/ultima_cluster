@@ -260,8 +260,15 @@ impl Default for ClusterCfg {
 }
 
 /// The `NodeConfig::services` a [`ClusterCfg`] declares. `Single` is
-/// `ServicesConfig::single(RegisterSm::NAME)` — the exact value every
-/// pre-M14c2 node booted with, so the `Single` path is byte-identical.
+/// `ServicesConfig::single(SM::NAME)` — row 0 is always the plain `SM`
+/// (`spawn_service::<SM>`), so the declared name must be the ACTUAL SM's
+/// name, not the harness's `RegisterSm` default. Task 9 found this hardcoded
+/// to `RegisterSm::NAME`: every `Single`-posture test whose `SM` isn't
+/// `RegisterSm` (e.g. `lin_v2::snapshot_restart_installs_only_with_purge`'s
+/// `InstallCounting`, `NAME = "install-counting"`) attached under the wrong
+/// declared name and was refused `UnknownFsm`. Fixed — `single(SM::NAME)` is
+/// still byte-for-byte the pre-M14c2 posture for every `RegisterSm`-based
+/// capstone, since `RegisterSm::NAME` and `SM::NAME` coincide there.
 ///
 /// FSM identity: under `Two`, row 0 must be declared under the ACTUAL row-0
 /// SM's name (`SM::NAME`), not the generic `Tagged` row names `tagged(2)`
@@ -270,7 +277,7 @@ impl Default for ClusterCfg {
 /// `spawn_service_row1`). Row 1 stays the `Tagged` convention `"fsm1"`.
 fn services_config<SM: SnapshotStateMachine>(ccfg: ClusterCfg) -> uc_node::ServicesConfig {
     match ccfg.services {
-        FsmSet::Single => uc_node::ServicesConfig::single(RegisterSm::NAME),
+        FsmSet::Single => uc_node::ServicesConfig::single(SM::NAME),
         FsmSet::Two { lag } => {
             uc_node::ServicesConfig::from_names(&[SM::NAME, "fsm1"], Some(lag)).unwrap()
         }

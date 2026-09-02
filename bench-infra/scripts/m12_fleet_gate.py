@@ -92,7 +92,7 @@ rebuilt with `--features uc_service/apply-profile`, the M5-ladder payload
 (509 B — the largest raw payload whose bincode encoding lands exactly on the
 node's 512 B `max_payload` door) is driven by `client-direct`, and the
 service's own `apply-profile[...]` line is read back off its unit log for the
-typed tier and again for the raw tier (`--raw-sm`). Row 3 runs with
+typed tier and again for the raw tier (`--fsm raw`). Row 3 runs with
 `--envelope off`: 509 B encodes to 512 B and the 16-byte session envelope
 would not fit under `max_payload`. The apply-profile counters print every
 1,000,000 applied frames, so a run that never reaches a million frames
@@ -470,21 +470,30 @@ def start_cluster(node_hosts, a, envelope, raw_sm=False, pins=None):
     """`pins`, when given, is a role -> CPU-list dict (see
     `PIN_MAP_C6ID_2XL`); this single-FSM cluster has one service unit, pinned
     to the map's `service0` entry. `None` (the default) pins nothing —
-    byte-identical to before `pins` existed."""
+    byte-identical to before `pins` existed.
+
+    FSM identity (Tasks 4/5): the node's `--services` (required — no default
+    set) must declare the SAME name the service role attaches under, or the
+    attach is refused by name. `--raw-sm` no longer exists on `m12_gate`'s
+    service role — `RawCountSm::NAME == "raw"`, `CountSm::NAME == "count"`
+    (`uc_gateway/examples/m12_gate.rs`), so both node and service pass
+    `--fsm`/`--services` from the same `fsm` variable. The typed arm passes
+    `--fsm count` explicitly even though it is the service role's default,
+    for symmetry with the raw arm."""
     pins = pins or {}
     ms = members_str(node_hosts)
+    fsm = "raw" if raw_sm else "count"
     for i, h in enumerate(node_hosts):
         start_unit(h, "node", [
             "node", "--id", str(i), "--bind", f"{h.private_ip}:{PORT}",
             "--instance-dir", h.dir, "--members", ms, "--app-id", APP,
             "--admission-kib", str(a.admission_kib),
+            "--services", fsm,
         ], nofile=True, cpus=pins.get("node"))
     time.sleep(BOOT_SETTLE_SECS)
     for h in node_hosts:
         args = ["service", "--instance-dir", h.dir, "--app-id", APP,
-                "--envelope", envelope]
-        if raw_sm:
-            args.append("--raw-sm")
+                "--envelope", envelope, "--fsm", fsm]
         truncate_log(h, "service")
         start_unit(h, "service", args, cpus=pins.get("service0"))
     time.sleep(BOOT_SETTLE_SECS)

@@ -28,7 +28,9 @@ use uc_consensus::election::NodeId;
 use uc_log::cnc::CncPage;
 use uc_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember};
 use uc_net::fault::FaultConfig;
+use uc_net::receiver::RefusalKind;
 use uc_node::{Node, NodeConfig, PurgePolicy};
+use uc_protocol::identity::{FsmName, pack_version};
 use uc_protocol::v2::cnc::{CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
 use uc_protocol::v2::config::decode_config;
 
@@ -1187,6 +1189,363 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         refused_dir.is_dir(),
         "the joiner declares id 1, so its snapshot dir exists"
     );
+    assert_eq!(
+        std::fs::read_dir(&refused_dir)
+            .expect("read the joiner's snapshot dir")
+            .count(),
+        0,
+        "a refused session must leave no artifact behind"
+    );
+
+    learner.stop();
+    voter.stop();
+}
+
+/// The most recent captured log line naming `event` (`"event":"<event>"`),
+/// for asserting on its other fields. Panics if none was captured — every
+/// caller pairs this with an `await_until` on the counter that says it is
+/// safe to look, so a miss here is a genuine gap, not a timing race.
+fn last_obs_record(buf: &std::sync::Arc<Mutex<Vec<u8>>>, event: &str) -> String {
+    let captured =
+        String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
+    let needle = format!("\"event\":\"{event}\"");
+    captured
+        .lines()
+        .rfind(|l| l.contains(needle.as_str()))
+        .unwrap_or_else(|| panic!("no captured line names event {event:?}:\n{captured}"))
+        .to_string()
+}
+
+/// Wire 0.7.0 (spec §8, Task 9): the SAME names, declared in the OTHER
+/// ORDER, are not the same declared set — identity is positional. Leader
+/// declares `["sum", "fsm1"]`; joiner declares `["fsm1", "sum"]`. Every name
+/// is individually valid on both sides (this is NOT
+/// `a_declared_set_mismatch_...`'s different-cardinality case), so a naive
+/// SET comparison would wrongly accept it. Refused at row 0 (the first
+/// differing row) with `ours = hash("fsm1")` (the joiner's own row-0 name)
+/// and `theirs = hash("sum")` (the leader's row-0 name).
+#[test]
+fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stalls() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let _restore = CaptureGuard;
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-order-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    let app = "learner-order-mismatch";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf, services| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        buffer_bytes: 1 << 18,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+        crypto: uc_node::CryptoConfig::Disabled,
+        services,
+    };
+
+    // The leader declares row 0 = "sum", row 1 = "fsm1".
+    let v_dir = dir.path().join("v0");
+    let voter = Node::start_with_socket(
+        cfg(
+            0,
+            v_addr,
+            v_dir.clone(),
+            uc_node::ServicesConfig::from_names(&["sum", "fsm1"], None).unwrap(),
+        ),
+        v_sock,
+    )
+    .expect("start voter");
+    await_until(30, "voter serves", || voter.can_serve());
+
+    // Two declared rows both need admission-control's `applied` mirrored, or
+    // the submit loop below deadlocks against the FSM-lag bound (same reason
+    // `a_declared_set_mismatch_...` mirrors row 0).
+    let cnc_for_mirror0 =
+        CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc for mirror 0");
+    let cnc_for_mirror1 =
+        CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc for mirror 1");
+    let (mirror0_stop, mirror0_handle) = spawn_applied_mirror(cnc_for_mirror0, 0);
+    let (mirror1_stop, mirror1_handle) = spawn_applied_mirror(cnc_for_mirror1, 1);
+
+    for i in 0u64..24000 {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match voter.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+    mirror0_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mirror0_handle.join().unwrap();
+    mirror1_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mirror1_handle.join().unwrap();
+
+    // Publish a floor + a real (hand-staged) artifact for BOTH declared rows —
+    // the sender's `snapshot_set_for` refuses (missing artifact) unless every
+    // declared id has one, so a two-row leader needs two.
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    let durable = voter.counters().durable.load_acquire();
+    let floor = (durable / 2) / 128 * 128;
+    assert!(
+        floor > SEG,
+        "need >1 segment below the floor (durable={durable})"
+    );
+    for id in [0u8, 1] {
+        let snap_dir = v_dir.join("snapshots").join(id.to_string());
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(
+            snap_dir.join(format!("snap-{floor}.ultsnap")),
+            vec![0x5Au8; 4096],
+        )
+        .unwrap();
+        cnc.service_slot(id as usize)
+            .snapshot_pos
+            .store_release(floor);
+    }
+    cnc.snapshots().service_snapshot_pos.store_release(floor);
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
+
+    // The joiner declares the SAME two names, in the OTHER order: row 0 =
+    // "fsm1", row 1 = "sum".
+    let l_dir = dir.path().join("l1");
+    let learner = Node::start_with_socket(
+        cfg(
+            1,
+            l_addr,
+            l_dir.clone(),
+            uc_node::ServicesConfig::from_names(&["fsm1", "sum"], None).unwrap(),
+        ),
+        l_sock,
+    )
+    .expect("start learner");
+
+    await_until(
+        60,
+        "the joiner refused the order-mismatched session",
+        || learner.snapshot_session_refusals().1 >= 1,
+    );
+    assert_eq!(
+        learner.snapshot_session_refusals().2,
+        0,
+        "an ORDER mismatch is an identity refusal, never a version refusal"
+    );
+    let r = learner
+        .crypto_stats()
+        .identity_refusal
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("identity refusal detail recorded");
+    assert_eq!(r.row, 0, "row 0 is the first (and only) differing row here");
+    assert_eq!(r.kind, RefusalKind::Identity);
+    assert_eq!(
+        r.ours,
+        FsmName::parse("fsm1").unwrap().hash(),
+        "the joiner's OWN row-0 name is fsm1"
+    );
+    assert_eq!(
+        r.theirs,
+        FsmName::parse("sum").unwrap().hash(),
+        "the leader's row-0 name is sum"
+    );
+
+    // Stalled-but-safe: nothing was half-installed under either declared row.
+    for id in [0u8, 1] {
+        let refused_dir = l_dir.join("snapshots").join(id.to_string());
+        assert!(
+            refused_dir.is_dir(),
+            "the joiner declares id {id}, so its snapshot dir exists"
+        );
+        assert_eq!(
+            std::fs::read_dir(&refused_dir)
+                .expect("read the joiner's snapshot dir")
+                .count(),
+            0,
+            "a refused session must leave no artifact behind"
+        );
+    }
+
+    await_until(30, "the refusal was named in a log line", || {
+        let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        captured.contains("snapshot_session_refused") && captured.contains("identity mismatch")
+    });
+    let rec = last_obs_record(&buf, "snapshot_session_refused");
+    assert!(
+        rec.contains("\"ours\":\"fsm1\"") && rec.contains("\"theirs\":\"sum\""),
+        "{rec}"
+    );
+
+    learner.stop();
+    voter.stop();
+}
+
+/// Wire 0.7.0 (spec §8, Task 9): same names on both sides — no identity
+/// refusal — but the joiner's attached service reports a DIFFERENT packed
+/// VERSION for row 0 than the leader's. Both versions are hand-staged
+/// directly onto each node's own cnc `service_slot(0).status` (the same
+/// live cell a real service's attach publishes, and the same technique
+/// `a_declared_set_mismatch_...` already uses for `snapshot_pos` — the
+/// sender/receiver read it fresh on every `SNAP_BEGIN`, so no real service
+/// needs to be running for this comparison to exercise the real wire path).
+/// Refused with `RefusalKind::Version`, both packed versions recorded.
+#[test]
+fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
+    let _g = serialize();
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-version-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    let app = "learner-version-mismatch";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        buffer_bytes: 1 << 18,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+        crypto: uc_node::CryptoConfig::Disabled,
+        services: uc_node::ServicesConfig::single("sum"),
+    };
+
+    let v_dir = dir.path().join("v0");
+    let voter =
+        Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    await_until(30, "voter serves", || voter.can_serve());
+
+    let cnc_for_mirror =
+        CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc for mirror");
+    // The leader's row-0 service reports version 1.0.0.
+    cnc_for_mirror
+        .service_slot(0)
+        .status
+        .store_version(pack_version(1, 0, 0));
+    let (mirror_stop, mirror_handle) = spawn_applied_mirror(cnc_for_mirror, 0);
+
+    for i in 0u64..24000 {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match voter.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+    mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mirror_handle.join().unwrap();
+
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    let durable = voter.counters().durable.load_acquire();
+    let floor = (durable / 2) / 128 * 128;
+    assert!(
+        floor > SEG,
+        "need >1 segment below the floor (durable={durable})"
+    );
+    let snap_dir = v_dir.join("snapshots").join("0");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    std::fs::write(
+        snap_dir.join(format!("snap-{floor}.ultsnap")),
+        vec![0x5Au8; 4096],
+    )
+    .unwrap();
+    cnc.service_slot(0).snapshot_pos.store_release(floor);
+    cnc.snapshots().service_snapshot_pos.store_release(floor);
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
+
+    // The joiner declares the SAME name, but its row-0 service reports
+    // version 2.0.0.
+    let l_dir = dir.path().join("l1");
+    let learner =
+        Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
+    let l_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
+    l_cnc
+        .service_slot(0)
+        .status
+        .store_version(pack_version(2, 0, 0));
+
+    await_until(
+        60,
+        "the joiner refused the version-mismatched session",
+        || learner.snapshot_session_refusals().2 >= 1,
+    );
+    assert_eq!(
+        learner.snapshot_session_refusals().1,
+        0,
+        "matching names must never count as an identity refusal"
+    );
+    let r = learner
+        .crypto_stats()
+        .version_refusal
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("version refusal detail recorded");
+    assert_eq!(
+        (r.kind, r.ours_version, r.theirs_version),
+        (
+            RefusalKind::Version,
+            pack_version(2, 0, 0),
+            pack_version(1, 0, 0)
+        )
+    );
+    assert_eq!(r.row, 0);
+
+    let refused_dir = l_dir.join("snapshots").join("0");
+    assert!(refused_dir.is_dir());
     assert_eq!(
         std::fs::read_dir(&refused_dir)
             .expect("read the joiner's snapshot dir")

@@ -277,11 +277,24 @@ def stop_cluster_m14(hosts):
             kill_unit(h, u)
 
 
+def fsm_name(i, spin):
+    """FSM identity (Tasks 4/5): the `--fsm`/`--services` NAME row `i` (0-based,
+    == the `fsms` list position — every caller in this file builds `fsms` in
+    row order, so `sid` and `i` always agree) presents, given whether it runs
+    the deliberately slow variant. `m12_gate`'s service role maps `count` ->
+    `CountSm` (row 0's default), `spin` -> `SpinCountSm` (paced by
+    `--work-spin`), and `fsm<N>` -> `Tagged<N, CountSm>` for any other row
+    (`uc_gateway/examples/m12_gate.rs`'s `ServiceArgs::fsm` doc)."""
+    if spin:
+        return "spin"
+    return "count" if i == 0 else f"fsm{i}"
+
+
 def node_args(h, node_id, members, fsms, lag, purge, snap):
     args = ["node", "--id", str(node_id), "--bind", f"{h.private_ip}:{PORT}",
             "--instance-dir", h.dir, "--members", members, "--app-id", APP,
             "--admission-kib", str(ADMISSION_KIB),
-            "--services", ",".join(str(i) for i, _ in fsms)]
+            "--services", ",".join(fsm_name(sid, spin) for sid, spin in fsms)]
     if lag is not None:
         args += ["--fsm-lag", lag]
     if purge:
@@ -291,7 +304,9 @@ def node_args(h, node_id, members, fsms, lag, purge, snap):
 
 def service_args(h, sid, spin, snap):
     args = ["service", "--instance-dir", h.dir, "--app-id", APP, "--envelope", "on",
-            "--service-id", str(sid), "--work-spin", str(spin)]
+            "--fsm", fsm_name(sid, spin)]
+    if spin > 0:
+        args += ["--work-spin", str(spin)]
     if snap:
         args += ["--snapshot-interval-bytes", str(snap)]
     return args
@@ -832,6 +847,7 @@ def selftest():
         public_ip = "10.0.0.1"
         private_ip = "10.0.0.1"
         gate = "/opt/bench/uc/target/release/examples/m6_gate"
+        dir = "/opt/bench/uc/instance"
 
     _fh = _FakeHost()
     _cmd_unpinned = m12.unit_start_cmd(_fh, "node", ["node"], cpus=None)
@@ -848,6 +864,22 @@ def selftest():
     expect("service_cpu id >= 2 shares service1's pin (no dedicated pin past id 1)",
            service_cpu(PIN_MAP_C6ID_2XL, 2) == PIN_MAP_C6ID_2XL["service1"])
     expect("service_cpu with no pins is unpinned", service_cpu(None, 0) is None)
+    # fsm_name (Task 9, FSM identity): row 0's default is "count", a spun row
+    # is always "spin" regardless of position, and any other row is "fsm<i>".
+    expect("fsm_name row 0 no spin -> count", fsm_name(0, 0) == "count")
+    expect("fsm_name row 0 spun -> spin", fsm_name(0, 200) == "spin")
+    expect("fsm_name row 1 no spin -> fsm1", fsm_name(1, 0) == "fsm1")
+    expect("fsm_name row 1 spun -> spin", fsm_name(1, 200) == "spin")
+    expect("fsm_name row 2 no spin -> fsm2", fsm_name(2, 0) == "fsm2")
+    _na = node_args(_fh, 0, "0@h", [(0, 0), (1, 300)], None, False, 0)
+    expect("node_args joins names, not row numbers",
+           _na[_na.index("--services") + 1] == "count,spin")
+    _sa_plain = service_args(_fh, 0, 0, 0)
+    _sa_spin = service_args(_fh, 1, 300, 0)
+    expect("service_args omits --work-spin at spin=0", "--work-spin" not in _sa_plain)
+    expect("service_args --fsm count at spin=0", _sa_plain[_sa_plain.index("--fsm") + 1] == "count")
+    expect("service_args passes --fsm spin + --work-spin when spun",
+           _sa_spin[_sa_spin.index("--fsm") + 1] == "spin" and "--work-spin" in _sa_spin)
     # sibling_pairs: canned `lscpu -p=CPU,CORE` text, both the assumed
     # layout (siblings i,i+4) and a WRONG layout (siblings i,i+1) that must
     # be rejected by verify_pin_layout's comparison.
