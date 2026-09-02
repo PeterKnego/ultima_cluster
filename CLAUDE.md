@@ -55,9 +55,11 @@ names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
 Next up: **FSM identity** (`docs/BACKLOG.md` item 2, taken up
 2026-09-01; spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`,
-plan pending) — identity in code (`const NAME`), the slot demoted to a
-node-internal row, names on disk/labels/wire, wire 0.7.0 + cnc 3.1, and
-`IdGen` for deterministic IDs. The other ranked directions, each with the
+plan pending) — identity in code (`const NAME` + `const VERSION`); the
+row keeps its cluster-wide meaning but a service finds it by name;
+`SNAP_BEGIN` 0.7.0 carries hashes + versions per row and refuses by name;
+cnc 3.1; `IdGen` for deterministic IDs; disk, rings and the client engine
+untouched (the placement-independent variant was cut, spec §2.1). The other ranked directions, each with the
 doc that first recorded it, are in `docs/BACKLOG.md` (update its line when
 an item is taken up or dropped). `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the

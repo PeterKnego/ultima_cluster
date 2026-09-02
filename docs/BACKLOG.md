@@ -82,11 +82,14 @@ today checks only the number.
   line 7; same-host, recreated per boot — confirm against
   `docs/reference/semver-policy.md` whether that is a cnc version bump or
   a flag day) + snapshot header + client/gateway name resolution.
-- **Status 2026-09-02: SPEC WRITTEN** —
-  `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` (identity
-  in code as `const NAME`; slot internal; names on disk/labels/wire;
-  `SNAP_BEGIN` 0.7.0 carries identity hashes; cnc 3.1; `IdGen`; Aeron
-  comparison in its §2). Next: the implementation plan.
+- **Status 2026-09-02: SPEC WRITTEN, then CUT to "named rows"** —
+  `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`: identity
+  in code (`const NAME` + `const VERSION`); the row keeps its cluster-wide
+  meaning and a service finds it by name; `SNAP_BEGIN` 0.7.0 carries hashes
+  + versions per row, compared positionally and refused by name; cnc 3.1;
+  `IdGen`; disk/rings/client engine untouched. The placement-independent
+  variant was cut by the spec's §2.1 comparison table (UC today / Aeron /
+  named rows / placement-independent). Next: the implementation plan.
 
 ### 3. Rolling upgrades and leadership transfer
 
@@ -104,14 +107,17 @@ deferred by name:
   spec or none at all."
 - **Crypto-on-by-default** was parked "revisit at M12, not before" in the
   same spec and never revisited; it belongs in this milestone.
-- **FSM / app version.** Deliberately *not* added to the identity work
-  (`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7, bytes
-  reserved). Aeron's shape, read from source: one cluster-wide `appVersion`
-  leader-stamped into the log at every new leadership term and into snapshot
-  markers, validated by every module and service on each term event and
-  snapshot load through a pluggable validator (default major-equality),
-  fail-stop on mismatch. The carrier in UC would be a term-boundary log
-  event, not `SNAP_BEGIN`.
+- **FSM version — the static half ships with FSM identity**
+  (`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7):
+  `const VERSION` per FSM in Aeron's packed-semver layout, attach-written to
+  the cnc slot, exported, carried per row on `SNAP_BEGIN` and
+  equality-checked. What is left for THIS item, with Aeron as the
+  comparator (read from source): the log-stamped half — the leader writes
+  the version into a term-boundary log event and snapshot markers, every
+  module and service validates its static value against it through a
+  pluggable validator (Aeron's default: major-equality), fail-stop — and
+  the rolling-upgrade semantics that follow. The carrier is a term-boundary
+  log event, not `SNAP_BEGIN`.
 - **Why:** the flag-day rule is the limit an operator hits first. This is
   the gap between "deployable" and "operable at scale".
 - **Cost:** high — both items touch consensus and are a wire flag day
