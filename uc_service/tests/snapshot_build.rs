@@ -19,7 +19,7 @@ use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy};
+use uc_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
 
 // --------------------------------------------------------------------- harness
 
@@ -42,7 +42,7 @@ fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(RegisterSm::NAME),
     }
 }
 

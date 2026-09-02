@@ -435,7 +435,10 @@ fn node_config(
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
-        services: uc_node::ServicesConfig::default(),
+        // The node process doesn't know which service-side SM tier
+        // (typed CountSm vs. RawCountSm) will attach — attach isn't
+        // name-checked yet (Task 5), so either name is inert here.
+        services: uc_node::ServicesConfig::single(<CountSm as StateMachine>::NAME),
     }
 }
 

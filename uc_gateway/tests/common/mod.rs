@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use uc_lincheck::register::RegisterSm;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
+use uc_service::{Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned, StateMachine};
 
 pub const APP: &str = "gw-roundtrip";
 
@@ -73,7 +73,7 @@ pub fn start_single_node_with_election(
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(RegisterSm::NAME),
     };
     let node = Node::start(cfg).expect("node start");
     (node, dir)
@@ -176,7 +176,7 @@ pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
             learners: Vec::new(),
             journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
             crypto: uc_node::CryptoConfig::Disabled,
-            services: uc_node::ServicesConfig::default(),
+            services: uc_node::ServicesConfig::single(RegisterSm::NAME),
         };
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let service = ServiceBuilder::new(

@@ -60,7 +60,9 @@ use uc_crypto::rotation::RotationPolicy;
 use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig};
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine};
+use uc_service::{
+    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine, StateMachine,
+};
 
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
@@ -257,14 +259,12 @@ impl Default for ClusterCfg {
 }
 
 /// The `NodeConfig::services` a [`ClusterCfg`] declares. `Single` is
-/// `ServicesConfig::default()` — the exact value every pre-M14c2 node booted
-/// with, so the `Single` path is byte-identical.
+/// `ServicesConfig::single(RegisterSm::NAME)` — the exact value every
+/// pre-M14c2 node booted with, so the `Single` path is byte-identical.
 fn services_config(ccfg: ClusterCfg) -> uc_node::ServicesConfig {
     match ccfg.services {
-        FsmSet::Single => uc_node::ServicesConfig::default(),
-        FsmSet::Two { lag } => {
-            uc_node::ServicesConfig::from_ids(&[0, 1], Some(lag)).expect("ids 0,1")
-        }
+        FsmSet::Single => uc_node::ServicesConfig::single(RegisterSm::NAME),
+        FsmSet::Two { lag } => uc_node::ServicesConfig::tagged(2).with_lag(Some(lag)),
     }
 }
 

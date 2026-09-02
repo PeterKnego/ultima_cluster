@@ -404,7 +404,7 @@ fn make_config(
         purge,
         journal_segment_bytes,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(RegSm::NAME),
     }
 }
 

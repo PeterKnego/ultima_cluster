@@ -717,7 +717,7 @@ where
             app_id,
             NODE_BUFFER_BYTES,
             DEFAULT_ADMISSION_BYTES,
-            ServicesConfig::default(),
+            ServicesConfig::single(S::NAME),
             uc_node::PurgePolicy::Disabled,
             uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         );
@@ -754,7 +754,14 @@ fn boot_cluster2(
         .enumerate()
         .map(|(i, s)| (i as u32, s.local_addr().unwrap()))
         .collect();
-    let services = ServicesConfig::from_ids(&[0, 1], None).expect("ids 0,1");
+    let services = ServicesConfig::from_names(
+        &[
+            <CountSm as StateMachine>::NAME,
+            <SpinCountSm as StateMachine>::NAME,
+        ],
+        None,
+    )
+    .expect("ids 0,1");
     let (mut nodes, mut s0, mut s1, mut dirs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
@@ -2104,36 +2111,32 @@ mod tests {
     use uc_node::FsmLag;
 
     #[test]
-    fn services_from_flags_absent_is_the_node_default() {
-        let s = services_from_flags(None, None).unwrap();
-        assert_eq!(s.declared(), 0b1);
-        assert_eq!(
-            s.resolve_lag(1 << 20),
-            ServicesConfig::default().resolve_lag(1 << 20)
-        );
+    fn services_from_flags_absent_is_refused() {
+        let e = services_from_flags(None, None).unwrap_err().to_string();
+        assert!(e.starts_with("--services is required"), "{e}");
     }
 
     #[test]
-    fn services_from_flags_two_ids_bounded_and_lockstep() {
-        let s = services_from_flags(Some("0,1"), Some("65536")).unwrap();
+    fn services_from_flags_two_names_bounded_and_lockstep() {
+        let s = services_from_flags(Some("count,spin"), Some("65536")).unwrap();
         assert_eq!(s.declared(), 0b11);
         assert_eq!(s.resolve_lag(1 << 20), FsmLag::Bounded(65536));
-        let s = services_from_flags(Some("0, 1"), Some("lockstep")).unwrap();
+        let s = services_from_flags(Some("count, spin"), Some("lockstep")).unwrap();
         assert_eq!(s.declared(), 0b11);
         assert_eq!(s.resolve_lag(1 << 20), FsmLag::Lockstep);
     }
 
     #[test]
     fn services_from_flags_refuses_by_name() {
-        let e = services_from_flags(Some("1"), None)
+        let e = services_from_flags(Some("Count"), None)
             .unwrap_err()
             .to_string();
         assert!(e.contains("--services"), "{e}");
-        let e = services_from_flags(Some("0,x"), None)
+        let e = services_from_flags(Some("count,count"), None)
             .unwrap_err()
             .to_string();
         assert!(e.contains("--services"), "{e}");
-        let e = services_from_flags(Some("0"), Some("bogus"))
+        let e = services_from_flags(Some("count"), Some("bogus"))
             .unwrap_err()
             .to_string();
         assert!(e.contains("--fsm-lag"), "{e}");

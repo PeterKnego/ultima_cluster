@@ -58,7 +58,7 @@ fn status_prints_one_row_per_declared_fsm_including_an_absent_one() {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
     let addr = sock.local_addr().unwrap();
     let dir = root.path().join("n0");
-    let services = ServicesConfig::from_ids(&[0, 1], Some(FsmLag::Bounded(8192))).unwrap();
+    let services = ServicesConfig::from_names(&["a", "b"], Some(FsmLag::Bounded(8192))).unwrap();
     let node = Node::start_with_socket(make_config(dir.clone(), addr, services), sock).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(20);

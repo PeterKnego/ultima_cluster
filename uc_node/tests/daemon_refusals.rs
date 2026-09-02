@@ -121,7 +121,7 @@ fn daemon_refuses_an_hmac_admin_key_file_that_is_world_readable() {
 
     let extra = format!(
         "[crypto]\nenabled = false\n\n[admin]\nauth = \"hmac\"\nkeys = [{{ name = \"ops-alice\", \
-         key_path = \"{}\" }}]\n",
+         key_path = \"{}\" }}]\n\n[services]\nnames = [\"sm\"]\n",
         key_path.display()
     );
     let (cfg, _inst) = write_config(dir.path(), 19803, &extra);

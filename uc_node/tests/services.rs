@@ -62,21 +62,25 @@ pub fn open_cnc(dir: &Path) -> std::sync::Arc<CncPage> {
     CncPage::open_file(&dir.join("cnc2.dat"), APP).expect("open cnc")
 }
 
-pub fn ids(ids: &[u8], lag: Option<FsmLag>) -> ServicesConfig {
-    ServicesConfig::from_ids(ids, lag).unwrap()
+pub fn names(names: &[&str], lag: Option<FsmLag>) -> ServicesConfig {
+    ServicesConfig::from_names(names, lag).unwrap()
 }
 
 #[test]
 fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
+    // FSM identity: declared rows are a contiguous prefix in `[services]
+    // names` order, so there is no longer a "declare 0 and 2, skip 1" shape
+    // to exercise — this now declares three contiguous rows and checks that
+    // row 3 (one past the declared count) gets no ring.
     let _g = serialize();
     let dir = tempdir();
     let node = Node::start(config(
         dir.path(),
-        ids(&[0, 2], Some(FsmLag::Bounded(64 << 10))),
+        names(&["count", "fsm1", "fsm2"], Some(FsmLag::Bounded(64 << 10))),
     ))
     .unwrap();
     wait_until("serving", || node.can_serve());
-    for id in [0u8, 2] {
+    for id in [0u8, 1, 2] {
         assert!(
             dir.path().join(format!("svc_query.{id}.ring")).is_file(),
             "svc_query.{id}.ring"
@@ -93,7 +97,7 @@ fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
         );
     }
     assert!(
-        !dir.path().join("svc_query.1.ring").exists(),
+        !dir.path().join("svc_query.3.ring").exists(),
         "undeclared id gets no ring"
     );
     assert!(
@@ -101,7 +105,7 @@ fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
         "legacy singular name is not created"
     );
     let cnc = open_cnc(dir.path());
-    assert_eq!(cnc.services_declared(), 0b101);
+    assert_eq!(cnc.services_declared(), 0b111);
     assert_eq!(cnc.fsm_lag_bytes(), 64 << 10);
     node.stop();
 }
@@ -110,7 +114,11 @@ fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
 fn lockstep_publishes_zero_and_none_for_tests_still_rings_fsm_zero() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0], Some(FsmLag::Lockstep)))).unwrap();
+    let node = Node::start(config(
+        dir.path(),
+        names(&["count"], Some(FsmLag::Lockstep)),
+    ))
+    .unwrap();
     wait_until("serving", || node.can_serve());
     assert_eq!(open_cnc(dir.path()).fsm_lag_bytes(), 0, "0 ⇔ lockstep");
     node.stop();
@@ -127,7 +135,10 @@ fn lockstep_publishes_zero_and_none_for_tests_still_rings_fsm_zero() {
 fn a_bad_lag_bound_is_a_named_startup_refusal_before_any_file_exists() {
     let _g = serialize();
     let dir = tempdir();
-    let cfg = config(dir.path(), ids(&[0], Some(FsmLag::Bounded(2 << 20)))); // == buffer/2
+    let cfg = config(
+        dir.path(),
+        names(&["count"], Some(FsmLag::Bounded(2 << 20))),
+    ); // == buffer/2
     let err = Node::start(cfg).err().expect("must refuse");
     assert!(
         err.to_string()
@@ -188,7 +199,7 @@ pub fn start_service(dir: &Path, id: u8) -> uc_service::Service<CountSm> {
 fn page_one_service_band_is_the_min_over_declared_ids() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
     let cnc = open_cnc(dir.path());
@@ -232,7 +243,7 @@ fn page_one_service_band_is_the_min_over_declared_ids() {
 fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_refused() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let err = ServiceBuilder::new(
         ServiceConfig::new(dir.path(), APP).service_id(2),
@@ -288,7 +299,7 @@ fn an_undeclared_id_is_refused_by_name_and_a_second_attach_on_the_same_id_is_ref
 fn an_out_of_range_service_id_is_a_named_refusal_not_a_shift_overflow_panic() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let err = ServiceBuilder::new(
         ServiceConfig::new(dir.path(), APP).service_id(200),
@@ -314,7 +325,7 @@ fn an_out_of_range_service_id_is_a_named_refusal_not_a_shift_overflow_panic() {
 fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
     let svc1 = start_service(dir.path(), 1);
@@ -428,7 +439,7 @@ fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
     const BOUND: u64 = 64 << 10;
     let node = Node::start(config(
         dir.path(),
-        ids(&[0, 1], Some(FsmLag::Bounded(BOUND))),
+        names(&["count", "fsm1"], Some(FsmLag::Bounded(BOUND))),
     ))
     .unwrap();
     wait_until("serving", || node.can_serve());
@@ -469,7 +480,11 @@ fn bounded_lag_holds_between_a_fast_and_a_slow_fsm() {
 fn lockstep_holds_the_fsms_within_one_frame() {
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], Some(FsmLag::Lockstep)))).unwrap();
+    let node = Node::start(config(
+        dir.path(),
+        names(&["count", "fsm1"], Some(FsmLag::Lockstep)),
+    ))
+    .unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
     let svc1 = ServiceBuilder::new(
@@ -500,7 +515,7 @@ fn the_leader_door_closes_at_the_bound_while_a_declared_fsm_is_absent() {
     const BOUND: u64 = 64 << 10;
     let node = Node::start(config(
         dir.path(),
-        ids(&[0, 1], Some(FsmLag::Bounded(BOUND))),
+        names(&["count", "fsm1"], Some(FsmLag::Bounded(BOUND))),
     ))
     .unwrap();
     wait_until("serving", || node.can_serve());
@@ -628,7 +643,7 @@ fn q_a_follower_quorum_with_absent_fsms_stalls_commit_at_the_bound() {
             &dirs[i],
             i,
             &members,
-            ids(&[0, 1], Some(FsmLag::Bounded(BOUND))),
+            names(&["count", "fsm1"], Some(FsmLag::Bounded(BOUND))),
         );
         nodes[i] = Some(Node::start_with_socket(cfg, sock).unwrap());
     }
@@ -695,7 +710,7 @@ fn submit_to_submit_all_and_query_on_route_by_id_end_to_end() {
     use uc_client::{Client, ClientError, PipelinedClient, PipelinedConfig};
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let svc0 = start_service(dir.path(), 0);
     let svc1 = start_service(dir.path(), 1);
@@ -815,7 +830,7 @@ fn a_raw_query_for_an_id_without_a_ring_gets_bad_service_from_the_node() {
     };
     let _g = serialize();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
     let mut node_egress = BroadcastRing::open(&dir.path().join("egress_node.broadcast"))
         .unwrap()
@@ -856,7 +871,7 @@ fn attaching_and_stopping_an_fsm_emits_the_transition_records() {
     let _g = serialize();
     let buf = uc_node::obs::log::capture_for_tests();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
 
     let svc1 = start_service(dir.path(), 1);
@@ -903,7 +918,7 @@ fn an_ageing_heartbeat_alone_emits_service_detached() {
     let _g = serialize();
     let buf = uc_node::obs::log::capture_for_tests();
     let dir = tempdir();
-    let node = Node::start(config(dir.path(), ids(&[0, 1], None))).unwrap();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
     wait_until("serving", || node.can_serve());
 
     let now_ns = || {

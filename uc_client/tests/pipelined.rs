@@ -74,7 +74,7 @@ fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(CountSm::NAME),
     }
 }
 

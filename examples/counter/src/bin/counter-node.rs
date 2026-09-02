@@ -12,9 +12,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
+use counter::CounterSm;
 use uc_consensus::election::NodeId;
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig, PurgePolicy};
+use uc_service::StateMachine;
 
 #[derive(Parser)]
 #[command(about = "A counter-example ultima_cluster node")]
@@ -84,7 +86,7 @@ fn main() -> anyhow::Result<()> {
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(CounterSm::NAME),
     })?;
 
     println!("node {} listening on {}", args.id, args.bind);

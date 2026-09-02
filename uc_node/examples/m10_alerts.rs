@@ -662,7 +662,7 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
             RING_BYTES,
             256 * 1024,
             // Unchanged pre-M14c default declared set: `{0}`.
-            uc_node::ServicesConfig::default(),
+            uc_node::ServicesConfig::single(NoopSm::NAME),
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
         let obs =
@@ -982,7 +982,8 @@ fn scenario_disk_low() -> (SeriesFile, Disclosure) {
 /// 503 forever by design. `await_stable_leader` (can_serve) is the right
 /// gate — the node is serving, it is admission that is shut.
 fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
-    let services = uc_node::ServicesConfig::from_ids(&[0, 1], None).expect("declared set");
+    let services = uc_node::ServicesConfig::from_names(&[NoopSm::NAME, SlowSm::NAME], None)
+        .expect("declared set");
     let (_dir, mut nodes) =
         spawn_cluster_with_services(scratch_root, "svc-absent", 1, 256 * 1024, services);
     await_stable_leader(&nodes, 20);
@@ -1086,8 +1087,11 @@ fn commit_at_append_head(body: &str) -> bool {
 /// the cluster's point of view — but only `Uc2ServicePinnedAtLagBound` is
 /// adjudicated from this capture.
 fn scenario_fsm_pinned(scratch_root: &Path) -> (SeriesFile, Disclosure) {
-    let services = uc_node::ServicesConfig::from_ids(&[0, 1], Some(uc_node::FsmLag::Bounded(8192)))
-        .expect("declared set");
+    let services = uc_node::ServicesConfig::from_names(
+        &[NoopSm::NAME, SlowSm::NAME],
+        Some(uc_node::FsmLag::Bounded(8192)),
+    )
+    .expect("declared set");
     let (_dir, mut nodes) =
         spawn_cluster_with_services(scratch_root, "fsm-pinned", 1, 256 * 1024, services);
     await_stable_leader(&nodes, 20);
@@ -1355,7 +1359,7 @@ fn spawn_cluster(
         label,
         n,
         admission_bytes,
-        uc_node::ServicesConfig::default(),
+        uc_node::ServicesConfig::single(NoopSm::NAME),
     )
 }
 

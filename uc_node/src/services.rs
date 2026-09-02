@@ -3,9 +3,12 @@
 
 //! M14a: the declared service set and the FSM lag policy (`[services]` in
 //! `node.toml`, `NodeConfig::services` programmatically). See the design spec
-//! §3.3 and §5.1–§5.2.
+//! §3.3 and §5.1–§5.2. FSM identity (spec §4.1-4.2): rows are named, in
+//! `[services] names` order — there is no default set, a node names its FSMs
+//! or refuses to start.
 
 use uc_log::cnc::CncPage;
+use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
@@ -20,105 +23,145 @@ pub enum FsmLag {
     Bounded(u64),
 }
 
-/// The declared service set + lag policy. Static per node; must match
-/// cluster-wide (checked on the snapshot path in M14c, exported for alerting
-/// in M14c). Absent `[services]` ⇒ `{0}` with the default bound.
+/// The declared FSM set (row → name, in `[services] names` order) + lag
+/// policy. Static per node; must match cluster-wide (checked by name on the
+/// snapshot path, exported for alerting). There is no default: a node names
+/// its FSMs or refuses to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServicesConfig {
-    /// Bit `i` set ⇔ id `i` declared. `0` only via `none_for_tests`.
-    declared: u64,
+    /// Row `i`'s name, or `None` if row `i` is undeclared. Declared rows are
+    /// always a contiguous prefix `0..count` (assignment order = list order).
+    names: [Option<FsmName>; CNC_MAX_SERVICES],
+    count: u8,
     /// `None` ⇒ `Bounded(buffer_bytes / 4)`, resolved once `buffer_bytes` is known.
     fsm_lag: Option<FsmLag>,
 }
 
-impl Default for ServicesConfig {
-    fn default() -> Self {
-        Self {
-            declared: 0b1,
-            fsm_lag: None,
-        }
-    }
-}
-
 impl ServicesConfig {
-    /// Build from an explicit id list. Refusals (each names the field, M9
-    /// style): empty list, duplicate id, id ≥ 8, id 0 missing (FSM 0 is the
-    /// default responder and the only FSM the remote path reaches).
-    pub fn from_ids(ids: &[u8], fsm_lag: Option<FsmLag>) -> Result<Self, String> {
-        if ids.is_empty() {
-            return Err(
-                "services.ids must not be empty (omit the [services] section for the default [0])"
-                    .into(),
-            );
+    /// Build from an explicit name list, in row order. Refusals (each names
+    /// the field, M9 style): empty list, more than `CNC_MAX_SERVICES`, an
+    /// invalid name (`FsmName::parse`'s own message), a duplicate name.
+    pub fn from_names(names: &[&str], fsm_lag: Option<FsmLag>) -> Result<Self, String> {
+        if names.is_empty() {
+            return Err("services.names must not be empty: list the FSM names in row order".into());
         }
-        let mut declared = 0u64;
-        for &id in ids {
-            if id as usize >= CNC_MAX_SERVICES {
-                return Err(format!(
-                    "services.ids: service id {id} is out of range (0..{CNC_MAX_SERVICES})"
-                ));
+        if names.len() > CNC_MAX_SERVICES {
+            return Err(format!(
+                "services.names: at most {CNC_MAX_SERVICES} FSMs per log, got {}",
+                names.len()
+            ));
+        }
+        let mut out = [None; CNC_MAX_SERVICES];
+        for (i, raw) in names.iter().enumerate() {
+            let n = FsmName::parse(raw).map_err(|e| format!("services.names: {raw:?}: {e}"))?;
+            if out[..i].contains(&Some(n)) {
+                return Err(format!("services.names: duplicate FSM name {raw:?}"));
             }
-            if declared & (1 << id) != 0 {
-                return Err(format!("services.ids: duplicate service id {id}"));
-            }
-            declared |= 1 << id;
+            out[i] = Some(n);
         }
-        if declared & 1 == 0 {
-            return Err(
-                "services.ids: service id 0 must be declared (it is the default responder)".into(),
-            );
-        }
-        Ok(Self { declared, fsm_lag })
+        Ok(Self {
+            names: out,
+            count: names.len() as u8,
+            fsm_lag,
+        })
     }
 
-    /// The CLI form every gate/harness binary shares: `--services 0,1`
-    /// (absent ⇒ the default set `{0}`) and `--fsm-lag lockstep|<bytes>`
-    /// (absent ⇒ the default bound), refused by flag name the way
-    /// `node.toml`'s loader refuses by field name.
-    pub fn from_cli(ids: Option<&str>, fsm_lag: Option<&str>) -> Result<Self, String> {
+    /// One FSM at row 0. Programmatic use (tests, harnesses); panics on an
+    /// invalid name, which is a bug at the call site, not a config error.
+    pub fn single(name: &str) -> Self {
+        Self::from_names(&[name], None).expect("a valid FSM name")
+    }
+
+    /// `fsm0..fsm{n-1}`: the rows `uc_service::Tagged<ROW, S>` attaches to
+    /// (Task 5's multi-FSM harness rows).
+    pub fn tagged(n: u8) -> Self {
+        let names: Vec<String> = (0..n).map(|i| format!("fsm{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        Self::from_names(&refs, None).expect("fsm0..fsm7 are valid names")
+    }
+
+    /// The CLI form every gate/harness binary shares: `--services kv,orders`
+    /// (a comma-separated list of names in row order, REQUIRED — there is no
+    /// default set) and `--fsm-lag lockstep|<bytes>` (absent ⇒ the default
+    /// bound), refused by flag name the way `node.toml`'s loader refuses by
+    /// field name.
+    pub fn from_cli(names: Option<&str>, fsm_lag: Option<&str>) -> Result<Self, String> {
         let lag = match fsm_lag {
             None => None,
             Some(raw) => {
                 Some(parse_fsm_lag(raw.trim()).map_err(|d| format!("--fsm-lag {raw:?}: {d}"))?)
             }
         };
-        match ids {
-            None if lag.is_none() => Ok(Self::default()),
-            None => Self::from_ids(&[0], lag).map_err(|d| format!("--services (default 0): {d}")),
-            Some(list) => {
-                let ids = list
-                    .split(',')
-                    .map(|s| {
-                        s.trim()
-                            .parse::<u8>()
-                            .map_err(|e| format!("--services {list:?}: {s:?} is not an id ({e})"))
-                    })
-                    .collect::<Result<Vec<u8>, String>>()?;
-                Self::from_ids(&ids, lag).map_err(|d| format!("--services {list:?}: {d}"))
-            }
-        }
+        let Some(list) = names else {
+            return Err(
+                "--services is required: a comma-separated list of FSM names in row order, e.g. --services kv,orders"
+                    .into(),
+            );
+        };
+        let parts: Vec<&str> = list.split(',').map(str::trim).collect();
+        Self::from_names(&parts, lag).map_err(|d| format!("--services {list:?}: {d}"))
     }
 
     /// HARNESS ONLY: a node with no FSMs declared. The aggregates are not
     /// published, the admission door's FSM term and the report ceiling are
     /// inert, and page 1's service band behaves as it did on cnc 2.0 (a test
-    /// may poke it). Unreachable from `node.toml` (`from_ids` refuses an
+    /// may poke it). Unreachable from `node.toml` (`from_names` refuses an
     /// empty list); exists so node-only tests are not silently stalled by a
     /// service that was never going to attach.
     #[doc(hidden)]
     pub fn none_for_tests() -> Self {
         Self {
-            declared: 0,
+            names: [None; CNC_MAX_SERVICES],
+            count: 0,
             fsm_lag: None,
         }
     }
 
+    pub fn count(&self) -> u8 {
+        self.count
+    }
+
+    /// Harness helper: the same names, another lag.
+    pub fn with_lag(mut self, lag: Option<FsmLag>) -> Self {
+        self.fsm_lag = lag;
+        self
+    }
+
+    /// Bit `i` set ⇔ row `i` declared. Rows are always a contiguous prefix,
+    /// so this is `(1 << count) - 1`.
     pub fn declared(&self) -> u64 {
-        self.declared
+        (1u64 << self.count) - 1
+    }
+
+    pub fn name_of(&self, row: u8) -> Option<FsmName> {
+        self.names.get(row as usize).copied().flatten()
+    }
+
+    pub fn row_of(&self, name: &str) -> Option<u8> {
+        let n = FsmName::parse(name).ok()?;
+        self.names
+            .iter()
+            .position(|x| *x == Some(n))
+            .map(|i| i as u8)
+    }
+
+    pub fn service_names(&self) -> [Option<FsmName>; CNC_MAX_SERVICES] {
+        self.names
+    }
+
+    /// Row `i`'s identity hash, or `0` for an undeclared row (spec §4.2).
+    pub fn identity_hashes(&self) -> [u64; CNC_MAX_SERVICES] {
+        let mut h = [0u64; CNC_MAX_SERVICES];
+        for (i, n) in self.names.iter().enumerate() {
+            if let Some(n) = n {
+                h[i] = n.hash();
+            }
+        }
+        h
     }
 
     pub fn is_declared(&self, id: u8) -> bool {
-        (id as usize) < CNC_MAX_SERVICES && self.declared & (1 << id) != 0
+        (id as usize) < CNC_MAX_SERVICES && self.declared() & (1 << id) != 0
     }
 
     /// Declared ids, ascending.
@@ -130,17 +173,25 @@ impl ServicesConfig {
     /// for a `none_for_tests` node (clients still need FSM 0's rings to
     /// attach).
     pub fn ring_ids(&self) -> impl Iterator<Item = u8> + '_ {
-        let mask = if self.declared == 0 { 1 } else { self.declared };
+        let mask = if self.declared() == 0 {
+            1
+        } else {
+            self.declared()
+        };
         (0..CNC_MAX_SERVICES as u8).filter(move |&i| mask & (1 << i) != 0)
     }
 
     /// [`ring_ids`](Self::ring_ids) as a bitmask — what the snapshot session
     /// puts on the wire and compares (M14c, spec §14.3). Identical to
-    /// [`declared`](Self::declared) for any node built by `from_ids`; `{0}` for
-    /// a `none_for_tests` harness node, matching M14a's standing rule that a
-    /// page whose `services_declared` reads 0 is treated as `{0}`.
+    /// [`declared`](Self::declared) for any node built by `from_names`; `{0}`
+    /// for a `none_for_tests` harness node, matching M14a's standing rule that
+    /// a page whose `services_declared` reads 0 is treated as `{0}`.
     pub fn ring_mask(&self) -> u64 {
-        if self.declared == 0 { 1 } else { self.declared }
+        if self.declared() == 0 {
+            1
+        } else {
+            self.declared()
+        }
     }
 
     pub fn resolve_lag(&self, buffer_bytes: u64) -> FsmLag {
@@ -319,68 +370,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_fsm_zero_with_unset_lag_resolving_to_a_quarter_buffer() {
-        let s = ServicesConfig::default();
-        assert_eq!(s.declared(), 0b1);
-        assert!(s.is_declared(0));
-        assert!(!s.is_declared(1));
-        assert_eq!(s.ids().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(s.resolve_lag(4 << 20), FsmLag::Bounded(1 << 20));
-        assert_eq!(s.page_lag_value(4 << 20), 1 << 20);
-        s.validate(4 << 20).unwrap();
-    }
-
-    #[test]
-    fn from_ids_builds_the_bitmask_in_any_order() {
-        let s = ServicesConfig::from_ids(&[2, 0, 5], None).unwrap();
-        assert_eq!(s.declared(), 0b10_0101);
-        assert_eq!(s.ids().collect::<Vec<_>>(), vec![0, 2, 5]);
-        assert_eq!(s.ring_ids().collect::<Vec<_>>(), vec![0, 2, 5]);
-    }
-
-    #[test]
-    fn from_ids_refusals_are_named() {
-        let e = ServicesConfig::from_ids(&[], None).unwrap_err();
-        assert!(e.contains("services.ids must not be empty"), "{e}");
-        let e = ServicesConfig::from_ids(&[0, 1, 1], None).unwrap_err();
-        assert!(e.contains("duplicate service id 1"), "{e}");
-        let e = ServicesConfig::from_ids(&[0, 8], None).unwrap_err();
-        assert!(e.contains("service id 8 is out of range (0..8)"), "{e}");
-        let e = ServicesConfig::from_ids(&[1, 2], None).unwrap_err();
-        assert!(e.contains("service id 0 must be declared"), "{e}");
-    }
-
-    #[test]
-    fn from_cli_absent_is_default_and_both_flags_parse() {
+    fn from_names_assigns_rows_in_list_order_and_single_is_one_row() {
+        let c = ServicesConfig::from_names(&["orders", "kv"], None).unwrap();
+        assert_eq!(c.count(), 2);
+        assert_eq!(c.declared(), 0b11);
+        assert_eq!(c.row_of("orders"), Some(0));
+        assert_eq!(c.row_of("kv"), Some(1));
+        assert_eq!(c.row_of("nope"), None);
+        assert_eq!(c.name_of(1).unwrap().as_str(), "kv");
+        assert_eq!(c.name_of(2), None);
         assert_eq!(
-            ServicesConfig::from_cli(None, None).unwrap().declared(),
-            0b1
+            c.identity_hashes()[0],
+            FsmName::parse("orders").unwrap().hash()
         );
-        let s = ServicesConfig::from_cli(Some("0, 1"), Some("65536")).unwrap();
-        assert_eq!(s.declared(), 0b11);
-        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Bounded(65536));
-        let s = ServicesConfig::from_cli(Some("0,1"), Some("lockstep")).unwrap();
-        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Lockstep);
-        // lag without ids applies to the default set
-        let s = ServicesConfig::from_cli(None, Some("lockstep")).unwrap();
-        assert_eq!(s.declared(), 0b1);
-        assert_eq!(s.resolve_lag(1 << 20), FsmLag::Lockstep);
+        assert_eq!(c.identity_hashes()[2], 0);
+        assert_eq!(c.ids().collect::<Vec<_>>(), vec![0, 1]);
+        let s = ServicesConfig::single("count");
+        assert_eq!(
+            (s.count(), s.declared(), s.resolve_lag(1 << 24)),
+            (1, 0b1, FsmLag::Bounded(1 << 22))
+        );
+        assert_eq!(ServicesConfig::tagged(3).row_of("fsm2"), Some(2));
     }
 
     #[test]
-    fn from_cli_refuses_by_flag_name() {
+    fn from_names_refusals_are_named() {
+        let e = |n: &[&str]| ServicesConfig::from_names(n, None).unwrap_err();
         assert!(
-            ServicesConfig::from_cli(Some("1"), None)
+            e(&[]).contains("services.names must not be empty"),
+            "{}",
+            e(&[])
+        );
+        assert!(e(&["a", "a"]).contains("duplicate FSM name \"a\""));
+        assert!(e(&["1abc"]).contains("services.names: \"1abc\": FSM name must start with a-z"));
+        let nine: Vec<String> = (0..9).map(|i| format!("f{i}")).collect();
+        let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+        assert!(e(&nine).contains("at most 8 FSMs"));
+    }
+
+    #[test]
+    fn from_cli_requires_services_and_parses_both_flags() {
+        let e = ServicesConfig::from_cli(None, None).unwrap_err();
+        assert!(e.starts_with("--services is required"), "{e}");
+        let c = ServicesConfig::from_cli(Some("kv, orders"), Some("lockstep")).unwrap();
+        assert_eq!(c.row_of("orders"), Some(1));
+        assert_eq!(c.resolve_lag(1 << 24), FsmLag::Lockstep);
+        assert!(
+            ServicesConfig::from_cli(Some("Kv"), None)
                 .unwrap_err()
                 .starts_with("--services")
         );
         assert!(
-            ServicesConfig::from_cli(Some("0,x"), None)
-                .unwrap_err()
-                .starts_with("--services")
-        );
-        assert!(
-            ServicesConfig::from_cli(Some("0"), Some("bogus"))
+            ServicesConfig::from_cli(Some("kv"), Some("16 MiB"))
                 .unwrap_err()
                 .starts_with("--fsm-lag")
         );
@@ -389,11 +430,11 @@ mod tests {
     #[test]
     fn lag_validation_refuses_half_the_ring_and_zero() {
         let buf = 4u64 << 20;
-        ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded((buf / 2) - 1)))
+        ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded((buf / 2) - 1)))
             .unwrap()
             .validate(buf)
             .unwrap();
-        let e = ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(buf / 2)))
+        let e = ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded(buf / 2)))
             .unwrap()
             .validate(buf)
             .unwrap_err();
@@ -401,7 +442,7 @@ mod tests {
             e.contains("services.fsm_lag must be below buffer_bytes / 2"),
             "{e}"
         );
-        let e = ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(0)))
+        let e = ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded(0)))
             .unwrap()
             .validate(buf)
             .unwrap_err();
@@ -409,12 +450,12 @@ mod tests {
             e.contains("services.fsm_lag = 0 is not a bound; write \"lockstep\""),
             "{e}"
         );
-        ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep))
+        ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep))
             .unwrap()
             .validate(buf)
             .unwrap();
         assert_eq!(
-            ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep))
+            ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep))
                 .unwrap()
                 .page_lag_value(buf),
             0
@@ -440,16 +481,16 @@ mod tests {
             max_payload: 256,
             services: [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES],
         });
-        let s = ServicesConfig::from_ids(&[0, 2], None).unwrap();
+        let s = ServicesConfig::from_names(&["a", "b"], None).unwrap();
         page.service_slot(0).applied.store_release(500);
         page.service_slot(0).snapshot_pos.store_release(400);
         page.service_slot(0).output_completed.store_release(300);
         page.service_slot(0).heartbeat_ns.store_release(1_000);
-        page.service_slot(2).applied.store_release(200);
-        page.service_slot(2).snapshot_pos.store_release(900);
-        page.service_slot(2).output_completed.store_release(50);
-        page.service_slot(2).heartbeat_ns.store_release(2_000);
-        page.service_slot(1).applied.store_release(1); // undeclared: must not count
+        page.service_slot(1).applied.store_release(200);
+        page.service_slot(1).snapshot_pos.store_release(900);
+        page.service_slot(1).output_completed.store_release(50);
+        page.service_slot(1).heartbeat_ns.store_release(2_000);
+        page.service_slot(5).applied.store_release(1); // undeclared: must not count
         let m = service_mins(&page, &s).unwrap();
         assert_eq!(
             m,
@@ -460,9 +501,9 @@ mod tests {
                 heartbeat_ns: 1_000
             }
         );
-        // A declared-but-dormant id (slot 2 zeroed) drags every min to 0 — spec §5.1, intentional.
-        page.service_slot(2).applied.store_release(0);
-        page.service_slot(2).snapshot_pos.store_release(0);
+        // A declared-but-dormant id (slot 1 zeroed) drags every min to 0 — spec §5.1, intentional.
+        page.service_slot(1).applied.store_release(0);
+        page.service_slot(1).snapshot_pos.store_release(0);
         assert_eq!(service_mins(&page, &s).unwrap().applied, 0);
         assert_eq!(service_mins(&page, &s).unwrap().snapshot_pos, 0);
         assert!(service_mins(&page, &ServicesConfig::none_for_tests()).is_none());
@@ -495,12 +536,12 @@ mod tests {
         let b = 4u64 << 20;
         assert_eq!(fsm_lag_eff(&ServicesConfig::none_for_tests(), b, 256), None);
         assert_eq!(
-            fsm_lag_eff(&ServicesConfig::default(), b, 256),
+            fsm_lag_eff(&ServicesConfig::single("a"), b, 256),
             Some(1 << 20)
         );
         assert_eq!(
             fsm_lag_eff(
-                &ServicesConfig::from_ids(&[0], Some(FsmLag::Bounded(4096))).unwrap(),
+                &ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded(4096))).unwrap(),
                 b,
                 256
             ),
@@ -509,7 +550,7 @@ mod tests {
         // Lockstep: one max-size frame — header 32 + 256 payload, 32-aligned = 288.
         assert_eq!(
             fsm_lag_eff(
-                &ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(),
+                &ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep)).unwrap(),
                 b,
                 256
             ),
@@ -517,7 +558,7 @@ mod tests {
         );
         assert_eq!(
             fsm_lag_eff(
-                &ServicesConfig::from_ids(&[0], Some(FsmLag::Lockstep)).unwrap(),
+                &ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep)).unwrap(),
                 b,
                 1
             ),

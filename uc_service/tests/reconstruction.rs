@@ -337,7 +337,7 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
 const PURGE_SEG: u64 = 64 * 1024;
 const PURGE_BUF: usize = 64 * 1024;
 
-fn start_purge_node(dir: &Path, app_id: &str) -> Node {
+fn start_purge_node(dir: &Path, app_id: &str, sm_name: &str) -> Node {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     Node::start(NodeConfig {
         id: 0,
@@ -356,7 +356,7 @@ fn start_purge_node(dir: &Path, app_id: &str) -> Node {
         learners: Vec::new(),
         journal_segment_bytes: PURGE_SEG,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(sm_name),
     })
     .unwrap()
 }
@@ -386,7 +386,7 @@ fn write_reg(prod: &MpscProducer, local_seq: u32, val: u64) {
 /// committed + durable. Returns the ingress producer so the caller can drive
 /// further node-only commits.
 fn purged_node_after_snapshotting_service(dir: &Path, app: &str, n: u32) -> (Node, MpscProducer) {
-    let node = start_purge_node(dir, app);
+    let node = start_purge_node(dir, app, RegisterSm::NAME);
     wait_until(|| node.can_serve());
 
     let svc1 = ServiceBuilder::new(
@@ -520,7 +520,7 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
     let app = "rec_count_snap";
     let n = 4_000u32;
 
-    let node = start_purge_node(dir.path(), app);
+    let node = start_purge_node(dir.path(), app, CountSm::NAME);
     wait_until(|| node.can_serve());
     let svc1 = ServiceBuilder::new(
         ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy {

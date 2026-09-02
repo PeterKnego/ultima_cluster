@@ -21,7 +21,7 @@
 //! (permanently 0) falls behind. `publish_service_mins` is a no-op when
 //! nothing is declared, so a direct page-1 poke sticks (no mirror clobbers
 //! it back). The few tests that attach a real FSM 0 service use
-//! `start_node_with(.., ServicesConfig::default())` instead.
+//! `start_node_with(.., ServicesConfig::single(RestoreCountSm::NAME))` instead.
 //!
 //! Journals use tiny segments (`SEG_BYTES`) on the ext4 `CARGO_TARGET_TMPDIR`
 //! so a purge cycle actually drops whole segment files without megabytes of
@@ -67,7 +67,7 @@ const FRAME_BYTES: u64 = align_frame_len(HEADER_LEN + PAYLOAD_BYTES) as u64;
 // this file mixes fake-service tests with a few real ones. The handful of
 // tests that DO attach a real service for FSM 0 (`restore_roundtrip_boots_and_serves`,
 // `restore_accepts_a_target_with_empty_dirs_and_a_stale_lock`) use
-// `start_node_with` + `ServicesConfig::default()` explicitly instead.
+// `start_node_with` + `ServicesConfig::single(RestoreCountSm::NAME)` explicitly instead.
 fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
     config_with(dir, app, purge, uc_node::ServicesConfig::none_for_tests())
 }
@@ -844,7 +844,12 @@ fn restore_roundtrip_boots_and_serves() {
     let dir = root.path().join("n0");
     let app = "restore1";
 
-    let node = start_node_with(&dir, app, PurgePolicy::Disabled, ServicesConfig::default());
+    let node = start_node_with(
+        &dir,
+        app,
+        PurgePolicy::Disabled,
+        ServicesConfig::single(RestoreCountSm::NAME),
+    );
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
         .start()
         .expect("start service");
@@ -884,7 +889,7 @@ fn restore_roundtrip_boots_and_serves() {
         &fresh_dir,
         app,
         PurgePolicy::Disabled,
-        ServicesConfig::default(),
+        ServicesConfig::single(RestoreCountSm::NAME),
     );
     let restored_svc = ServiceBuilder::new(
         ServiceConfig::new(&fresh_dir, app),
@@ -924,7 +929,12 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
     let dir = root.path().join("n0");
     let app = "restore3";
 
-    let node = start_node_with(&dir, app, PurgePolicy::Disabled, ServicesConfig::default());
+    let node = start_node_with(
+        &dir,
+        app,
+        PurgePolicy::Disabled,
+        ServicesConfig::single(RestoreCountSm::NAME),
+    );
     let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
         .start()
         .expect("start service");
@@ -968,7 +978,7 @@ fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
         &fresh_dir,
         app,
         PurgePolicy::Disabled,
-        ServicesConfig::default(),
+        ServicesConfig::single(RestoreCountSm::NAME),
     );
     let restored_svc = ServiceBuilder::new(
         ServiceConfig::new(&fresh_dir, app),
@@ -1177,7 +1187,7 @@ fn two_fsm_purged_node(
     u64,
 ) {
     let mut cfg = config(dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
-    cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
+    cfg.services = ServicesConfig::from_names(&[RegisterSm::NAME, "fsm1"], None).unwrap();
     let node = Node::start(cfg).expect("node");
     wait_until("serving", || node.can_serve());
     let svc = |id: u8| {
@@ -1257,7 +1267,7 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     let fresh = root.path().join("n0-restored");
     restore_artifact(&artifact, &fresh).expect("restore");
     let mut cfg = config(&fresh, app, PurgePolicy::Disabled);
-    cfg.services = ServicesConfig::from_ids(&[0, 1], None).unwrap();
+    cfg.services = ServicesConfig::from_names(&[RegisterSm::NAME, "fsm1"], None).unwrap();
     let rnode = Node::start(cfg).expect("restored node");
     wait_until("restored serving", || rnode.can_serve());
     let rs0 = ServiceBuilder::new(

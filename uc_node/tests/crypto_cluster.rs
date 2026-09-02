@@ -193,7 +193,7 @@ fn make_config(
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(CountSm::NAME),
     }
 }
 

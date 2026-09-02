@@ -227,6 +227,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 "#,
             inst.display()
         ),
@@ -338,7 +341,8 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
             format!(
                 "{extra}\nid = 1\nbind = \"127.0.0.1:19703\"\ninstance_dir = \"{}\"\n\
                  app_id = \"lifecycle\"\n\n[[members]]\nid = 1\naddr = \"127.0.0.1:19703\"\n\n\
-                 [crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n",
+                 [crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\n\
+                 [services]\nnames = [\"sm\"]\n",
                 inst.display()
             ),
         )
@@ -418,6 +422,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 
 [log]
 level = "info"
@@ -513,6 +520,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 
 [metrics]
 bind = "127.0.0.1:{metrics_port}"

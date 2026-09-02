@@ -22,7 +22,7 @@ use counter::{Applied, Command, CounterSm, Query, QueryResponse};
 use uc_client::Client;
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig, PurgePolicy};
-use uc_service::{ServiceBuilder, ServiceConfig};
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 const APP_ID: &str = "counter";
 
@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::default(),
+        services: uc_node::ServicesConfig::single(CounterSm::NAME),
     })?;
 
     // 2. Wait until this node has won its election and appended (and committed)

@@ -75,6 +75,14 @@ pub enum ConfigError {
          (filesystem access is the boundary)"
     )]
     AdminChoiceRequired,
+    /// FSM identity (spec §4.1): `[services]` is likewise an explicit
+    /// choice — there is no default FSM set, so a `node.toml` must name every
+    /// row.
+    #[error(
+        "[services] section is required: names = [\"<fsm>\", ...] in row order, identical on \
+         every node (FSM identity, 2.11)"
+    )]
+    ServicesChoiceRequired,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,13 +193,18 @@ struct MetricsSectionFile {
     bind: Option<SocketAddr>,
 }
 
-/// M14a: `[services]` — the declared FSM set and the lag policy (spec §3.3).
-/// `fsm_lag` is a STRING (`"16MiB"`, `"lockstep"`), parsed by
-/// `services::parse_fsm_lag` so the refusal can name the field.
+/// FSM identity (spec §3.3, §4.1): `[services]` — the declared FSM set, by
+/// name in row order, and the lag policy. `fsm_lag` is a STRING (`"16MiB"`,
+/// `"lockstep"`), parsed by `services::parse_fsm_lag` so the refusal can name
+/// the field. `ids` is accepted by serde ONLY so the loader can refuse it by
+/// name and point at `names` — `services.ids` was the pre-identity field.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServicesSection {
-    ids: Vec<u8>,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    ids: Option<Vec<u8>>,
     #[serde(default)]
     fsm_lag: Option<String>,
 }
@@ -651,8 +664,16 @@ pub fn parse_str_with_env(
         .map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".parse().unwrap()));
 
     let services = match f.services {
-        None => ServicesConfig::default(),
+        None => return Err(ConfigError::ServicesChoiceRequired),
         Some(s) => {
+            if s.ids.is_some() {
+                return Err(ConfigError::Invalid {
+                    field: "services.ids",
+                    detail: "services.ids was replaced by services.names (FSM identity): list \
+                             the FSM names in row order, e.g. names = [\"kv\", \"orders\"]"
+                        .into(),
+                });
+            }
             let fsm_lag = match s.fsm_lag.as_deref() {
                 None => None,
                 Some(raw) => Some(crate::services::parse_fsm_lag(raw).map_err(|detail| {
@@ -662,9 +683,10 @@ pub fn parse_str_with_env(
                     }
                 })?),
             };
-            let cfg = ServicesConfig::from_ids(&s.ids, fsm_lag).map_err(|detail| {
+            let refs: Vec<&str> = s.names.iter().map(String::as_str).collect();
+            let cfg = ServicesConfig::from_names(&refs, fsm_lag).map_err(|detail| {
                 ConfigError::Invalid {
-                    field: "services.ids",
+                    field: "services.names",
                     detail,
                 }
             })?;
@@ -782,6 +804,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 "#;
 
     /// Like `MINIMAL` but WITHOUT `[crypto]`/`[admin]` — the base every
@@ -961,6 +986,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 "#,
         );
         let (cfg, opts) = load_from_path(&p).unwrap();
@@ -977,7 +1005,7 @@ auth = "none"
         assert!(matches!(cfg.purge, PurgePolicy::Disabled));
         assert!(matches!(cfg.crypto, CryptoConfig::Disabled));
         assert!(cfg.learners.is_empty());
-        assert_eq!(cfg.services, ServicesConfig::default());
+        assert_eq!(cfg.services, ServicesConfig::single("sm"));
     }
 
     /// The defaults must produce a config the node can actually START on.
@@ -1003,6 +1031,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 "#,
         );
         let (cfg, _opts) = load_from_path(&p).unwrap();
@@ -1069,6 +1100,9 @@ allowlist_path = "/etc/uc2/allowlist.toml"
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 "#,
         );
         let (cfg, _opts) = load_from_path(&p).unwrap();
@@ -1111,6 +1145,9 @@ enabled = false
 
 [admin]
 auth = "none"
+
+[services]
+names = ["sm"]
 "#;
         let p = write(dir.path(), body);
         let (_cfg, opts) = load_from_path(&p).unwrap();
@@ -1337,69 +1374,89 @@ level = "info"
     /// a real 64-bit FNV-1a collision needs ~2^32 work, so the check is
     /// carried on its argument, not on a fixture.)
     #[test]
-    fn services_section_absent_means_fsm_zero_and_the_default_bound() {
-        let (cfg, _) = load_str(MINIMAL).unwrap();
-        assert_eq!(cfg.services, ServicesConfig::default());
+    fn services_section_is_required_like_crypto_and_admin() {
+        let body = MINIMAL.replace("[services]\nnames = [\"sm\"]\n", "");
+        assert!(!body.contains("[services]"));
+        let err = load_str(&body).unwrap_err();
+        assert!(matches!(err, ConfigError::ServicesChoiceRequired), "{err}");
+        assert!(err.to_string().contains("[services] section is required"));
     }
 
     #[test]
-    fn services_section_parses_ids_and_a_byte_size_lag() {
-        let body = format!("{MINIMAL}\n[services]\nids = [0, 1, 2]\nfsm_lag = \"16MiB\"\n");
+    fn services_section_parses_names_in_row_order_and_a_lag() {
+        let body = MINIMAL.replace(
+            "names = [\"sm\"]",
+            "names = [\"kv\", \"orders\"]\nfsm_lag = \"16MiB\"",
+        );
         let (cfg, _) = load_str(&body).unwrap();
         assert_eq!(
             cfg.services,
-            ServicesConfig::from_ids(&[0, 1, 2], Some(FsmLag::Bounded(16 << 20))).unwrap()
+            ServicesConfig::from_names(&["kv", "orders"], Some(FsmLag::Bounded(16 << 20))).unwrap()
         );
     }
 
     #[test]
-    fn services_section_parses_lockstep() {
-        let body = format!("{MINIMAL}\n[services]\nids = [0, 3]\nfsm_lag = \"lockstep\"\n");
-        let (cfg, _) = load_str(&body).unwrap();
-        assert_eq!(cfg.services.resolve_lag(1 << 26), FsmLag::Lockstep);
+    fn services_ids_is_refused_with_a_pointer_to_names() {
+        let body = MINIMAL.replace("names = [\"sm\"]", "ids = [0, 1]");
+        let err = load_str(&body).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    field: "services.ids",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("replaced by services.names"),
+            "{err}"
+        );
     }
 
     #[test]
     fn services_refusals_name_the_field() {
-        for (tail, needle, field) in [
-            ("ids = []", "services.ids must not be empty", "services.ids"),
-            ("ids = [0, 0]", "duplicate service id 0", "services.ids"),
-            ("ids = [0, 9]", "out of range", "services.ids"),
-            ("ids = [1]", "service id 0 must be declared", "services.ids"),
+        for (repl, needle, field) in [
             (
-                "ids = [0]\nfsm_lag = \"16 MiB\"",
+                "names = []",
+                "services.names must not be empty",
+                "services.names",
+            ),
+            (
+                "names = [\"a\", \"a\"]",
+                "duplicate FSM name",
+                "services.names",
+            ),
+            (
+                "names = [\"Orders\"]",
+                "must start with a-z",
+                "services.names",
+            ),
+            (
+                "names = [\"sm\"]\nfsm_lag = \"16 MiB\"",
                 "services.fsm_lag must be",
                 "services.fsm_lag",
             ),
-            (
-                "ids = [0]\nfsm_lag = \"0\"",
-                "not a bound",
-                "services.fsm_lag",
-            ),
-            // default buffer_bytes is 64 MiB; half is 32 MiB.
-            (
-                "ids = [0]\nfsm_lag = \"32MiB\"",
-                "below buffer_bytes / 2",
-                "services.fsm_lag",
-            ),
         ] {
-            let body = format!("{MINIMAL}\n[services]\n{tail}\n");
+            let body = MINIMAL.replace("names = [\"sm\"]", repl);
             let err = load_str(&body).unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains(needle),
-                "{tail}: expected {needle:?} in {msg:?}"
-            );
             match err {
-                ConfigError::Invalid { field: f, .. } => assert_eq!(f, field, "{tail}"),
-                other => panic!("{tail}: expected Invalid, got {other:?}"),
+                ConfigError::Invalid { field: f, detail } => {
+                    assert_eq!(f, field, "{repl}");
+                    assert!(detail.contains(needle), "{repl}: {detail}");
+                }
+                other => panic!("{repl}: {other}"),
             }
         }
     }
 
     #[test]
     fn a_typo_inside_services_is_refused() {
-        let body = format!("{MINIMAL}\n[services]\nids = [0]\nfsm_lagg = \"1MiB\"\n");
+        let body = MINIMAL.replace(
+            "[services]\nnames = [\"sm\"]\n",
+            "[services]\nnames = [\"sm\"]\nfsm_lagg = \"1MiB\"\n",
+        );
         let err = load_str(&body).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
     }
@@ -1466,7 +1523,7 @@ level = "info"
         let body = format!(
             "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n\
              keys = [{{ name = \"ops-alice\", key_path = \"/etc/uc2/admin/alice.key\" }}]\n\
-             request_ttl_ms = 5000\n"
+             request_ttl_ms = 5000\n[services]\nnames = [\"sm\"]\n"
         );
         let (_cfg, opts) = load_str(&body).unwrap();
         assert!(matches!(opts.admin.auth, AdminAuthMode::Hmac));

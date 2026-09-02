@@ -770,7 +770,11 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 4096 },
         journal_segment_bytes: SEG,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::from_ids(&[0, 1], None).unwrap(),
+        services: uc_node::ServicesConfig::from_names(
+            &[<SumSm as uc_service::RawStateMachine>::NAME, "fsm1"],
+            None,
+        )
+        .unwrap(),
     };
 
     let v_dir = dir.path().join("v0");
@@ -1046,14 +1050,14 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         voter.archive_first_base() > 0
     });
 
-    // The joiner declares {0, 1} — a genuine `[services] ids` mismatch.
+    // The joiner declares {0, 1} — a genuine `[services] names` mismatch.
     let l_dir = dir.path().join("l1");
     let learner = Node::start_with_socket(
         cfg(
             1,
             l_addr,
             l_dir.clone(),
-            uc_node::ServicesConfig::from_ids(&[0, 1], None).unwrap(),
+            uc_node::ServicesConfig::from_names(&["fsm0", "fsm1"], None).unwrap(),
         ),
         l_sock,
     )

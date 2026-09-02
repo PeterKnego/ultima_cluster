@@ -201,7 +201,11 @@ pub fn spawn_node_with(instance_dir: &Path, crypto: Option<(&Path, &Path)>) -> R
     cmd.arg("--instance-dir")
         .arg(instance_dir)
         .arg("--app-id")
-        .arg(APP_ID);
+        .arg(APP_ID)
+        // FSM identity: `--services` is required (Task 4) — the crashtest
+        // service binary runs `RegisterSm` ("register").
+        .arg("--services")
+        .arg("register");
     if let Some((key_path, allowlist_path)) = crypto {
         cmd.arg("--crypto-key")
             .arg(key_path)

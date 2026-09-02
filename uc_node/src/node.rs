@@ -659,8 +659,8 @@ impl Node {
             app_id: cfg.app_id.clone(),
             buffer_bytes: cfg.buffer_bytes as u64,
             max_payload: cfg.max_payload as u32,
-            // cnc 3.1: no names yet — Task 4 makes the node pass real ones.
-            services: [None; CNC_MAX_SERVICES],
+            // cnc 3.1: the declared FSM names, in row order (spec §4.1-4.2).
+            services: cfg.services.service_names(),
         };
         let cnc = CncPage::create_file(&instance.cnc_path(), &meta).map_err(to_io)?;
         cnc.counters().prime(durable);
@@ -8618,7 +8618,7 @@ mod tests {
             purge: PurgePolicy::Disabled,
             journal_segment_bytes: DEFAULT_JOURNAL_SEGMENT_BYTES,
             crypto: CryptoConfig::Disabled,
-            services: ServicesConfig::default(),
+            services: ServicesConfig::single("sm"),
         };
         (cfg, dir)
     }
@@ -9979,7 +9979,7 @@ mod tests {
         let dir = decline_scratch();
         let root = dir.path().join("snapshots");
         let cnc = test_cnc();
-        let services = crate::services::ServicesConfig::from_ids(&[0, 1], None).unwrap();
+        let services = crate::services::ServicesConfig::from_names(&["a", "b"], None).unwrap();
         let config_bytes = Mutex::new(vec![0xC0, 0xFF, 0xEE]);
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
         let call = || snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);

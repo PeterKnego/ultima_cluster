@@ -776,7 +776,7 @@ fn two_fsm_service_sigkill() {
     let tmp = tempdir();
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
-    let _node = spawn_node_with_services(&inst, "0,1", "65536");
+    let _node = spawn_node_with_services(&inst, "register,fsm1", "65536");
     wait_for_ready(&inst, Duration::from_secs(10));
     let _svc0 = spawn_service_id(&inst, 0);
     let svc1 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 1))));
@@ -855,7 +855,9 @@ fn two_fsm_node_sigkill() {
     std::fs::create_dir_all(&inst).unwrap();
 
     let node = Arc::new(Mutex::new(Some(spawn_node_with_services(
-        &inst, "0,1", "65536",
+        &inst,
+        "register,fsm1",
+        "65536",
     ))));
     wait_for_ready(&inst, Duration::from_secs(10));
     let svc0 = Arc::new(Mutex::new(Some(spawn_service_id(&inst, 0))));
@@ -904,7 +906,7 @@ fn two_fsm_node_sigkill() {
         // service0, then service1 (module doc: node-first-then-services).
         {
             let mut g = node.lock().unwrap();
-            *g = Some(spawn_node_with_services(&inst, "0,1", "65536"));
+            *g = Some(spawn_node_with_services(&inst, "register,fsm1", "65536"));
         }
         wait_for_fresh_instance(&inst, old_instance_id, Duration::from_secs(10));
         {
