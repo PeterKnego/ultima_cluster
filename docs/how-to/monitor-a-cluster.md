@@ -99,8 +99,9 @@ stamping its claim word (`IngressRingWedged`), and a record at the
 consumer position that does not decode (`IngressRingCorrupt`). See
 [Diagnose a node: my node just fail-stopped with `IngressRingWedged`](diagnose-a-node.md#my-node-just-fail-stopped-with-ingressringwedged).
 
-### The per-FSM families (M14; labels since FSM identity, 2.11 pending)
+### The per-FSM families (M14)
 
+Since FSM identity (2.11 pending), the labels below carry the FSM's name too.
 A node runs one FSM per declared row (`[services] names`), and every
 service family carries a `service="<name>",row="<r>"` label pair per
 declared row (before FSM identity this was `service="<id>"` alone — the

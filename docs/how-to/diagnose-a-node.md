@@ -70,7 +70,7 @@ Start with `uc2ctl status`, which prints the whole band without a scrape:
 ```text
 services: declared=[0, 1] fsm_lag=8192 bytes
   row=0 name=kv version=1.2.0 hash=0x9a1c4e2f7b0d3a11 attached=true epoch=3 incarnation=3 applied=1048576 lag=0 snapshot_pos=1040384 heartbeat_age=0.004s
-  row=1 name=orders version=0.0.0 hash=0x3f0e7c9a2b8d1f45 attached=false epoch=0 incarnation=0 applied=0 lag=1048576 snapshot_pos=0 heartbeat_age=never
+  row=1 name=orders version=unversioned hash=0x3f0e7c9a2b8d1f45 attached=false epoch=0 incarnation=0 applied=0 lag=1048576 snapshot_pos=0 heartbeat_age=never
 ```
 
 (`name=`/`version=`/`hash=` are new since FSM identity, 2.11 pending; earlier

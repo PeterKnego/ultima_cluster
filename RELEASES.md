@@ -52,7 +52,7 @@ on what logic lived behind each one.
   `Uc2ServiceIdentityDrift` and `Uc2ServiceVersionDrift` — a config or
   binary mismatch pages before a joiner ever needs to open a session.
   `uc2ctl status` prints `row= name= version= hash=` per row.
-  → [Monitor a cluster § The per-FSM families](docs/how-to/monitor-a-cluster.md#the-per-fsm-families-m14-labels-since-fsm-identity-211-pending)
+  → [Monitor a cluster § The per-FSM families](docs/how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
 
 **Removed (breaking)**
 
