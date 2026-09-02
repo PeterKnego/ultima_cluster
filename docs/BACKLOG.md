@@ -49,7 +49,46 @@ invites. Run both through the gate discipline.
   the maintainer paused to add features to UC first. Resume from that
   brief's "Where the design stopped".
 
-### 2. Rolling upgrades and leadership transfer
+### 2. FSM identity — name the state machine, not the slot
+
+*Added 2026-09-01; taken up the same day (brainstorm in progress).*
+
+M14 identifies an FSM only by its slot number. Attach validates `app_id`
+and the per-boot `instance_id` (`uc_service/src/attach.rs`), then checks
+that the numeric `service_id` is in the node's declared set — and nothing
+else. Two nodes agree on the *set of slot numbers*
+(`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md`, "Declared
+set" and "Command delivery" rows) and never on what logic each slot holds.
+The slot is placement; nothing states identity. An FSM name is the per-FSM
+analog of `app_id`: a declared identity checked at every boundary that
+today checks only the number.
+
+- **What it binds:** attach refusal by name (service's declared name vs. the
+  node's slot→name map); the cluster-wide agreement check the snapshot path
+  already runs for the declared set and lag policy; snapshot artifacts
+  (install rejects a foreign FSM's artifact the way it rejects a mis-tagged
+  position); query routing by name instead of slot, closing the wrong-slot
+  read hazard (queries are slot-routed: `query.ring` payload is
+  `service_id:u8 ++ query`, spec §5.4); and deterministic ID derivation.
+- **First consumer:** a deterministic ID utility in `uc_service` — the same
+  series of IDs on every replica, per `(position, FSM identity, ordinal
+  within this apply)`, stateless so a snapshot-installed replica and a
+  journal-replayed one agree by construction. The identity is what keeps
+  the IDs placement-independent; without it the utility would need a
+  hand-rolled domain tag that this work would then replace.
+- **What it does not do:** a name says two replicas *intend* to be the same
+  FSM; it does not verify they run the same code.
+- **Cost:** moderate. Config + attach + a cnc slot-band field (reserved
+  line 7; same-host, recreated per boot — confirm against
+  `docs/reference/semver-policy.md` whether that is a cnc version bump or
+  a flag day) + snapshot header + client/gateway name resolution.
+- **Status 2026-09-02: SPEC WRITTEN** —
+  `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` (identity
+  in code as `const NAME`; slot internal; names on disk/labels/wire;
+  `SNAP_BEGIN` 0.7.0 carries identity hashes; cnc 3.1; `IdGen`; Aeron
+  comparison in its §2). Next: the implementation plan.
+
+### 3. Rolling upgrades and leadership transfer
 
 The two operations items `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md`
 deferred by name:
@@ -65,12 +104,20 @@ deferred by name:
   spec or none at all."
 - **Crypto-on-by-default** was parked "revisit at M12, not before" in the
   same spec and never revisited; it belongs in this milestone.
+- **FSM / app version.** Deliberately *not* added to the identity work
+  (`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` §7, bytes
+  reserved). Aeron's shape, read from source: one cluster-wide `appVersion`
+  leader-stamped into the log at every new leadership term and into snapshot
+  markers, validated by every module and service on each term event and
+  snapshot load through a pluggable validator (default major-equality),
+  fail-stop on mismatch. The carrier in UC would be a term-boundary log
+  event, not `SNAP_BEGIN`.
 - **Why:** the flag-day rule is the limit an operator hits first. This is
   the gap between "deployable" and "operable at scale".
 - **Cost:** high — both items touch consensus and are a wire flag day
   themselves.
 
-### 3. Geo — async cross-region learner with a stale-read mode
+### 4. Geo — async cross-region learner with a stale-read mode
 
 `docs/notes/uc2-m7-vs-aeron-cluster-standby-2026-07-24.md` found that a
 UC learner is already most of an Aeron Cluster Standby, and sketched a
@@ -85,7 +132,7 @@ scoped* consistency weakening.
 - **Cost:** moderate for Phase A; Phase C is a product decision before it
   is code.
 
-### 4. Verification debt
+### 5. Verification debt
 
 `docs/VERIFICATION.md` §11 and `docs/superpowers/specs/2026-08-01-uc2-formal-roadmap.md`
 record what is not proved:
@@ -114,7 +161,7 @@ record what is not proved:
 - **Why:** every proof gate so far found exactly one real bug; this is the
   direction most likely to find the next one.
 
-### 5. Performance, round three
+### 6. Performance, round three
 
 All framed by the docs as characterisation, not defects:
 
@@ -135,7 +182,7 @@ All framed by the docs as characterisation, not defects:
 - **Why not first:** no user is asking for more than the current ceiling;
   every number here is a fleet characterisation with its caveats disclosed.
 
-### 6. External review
+### 7. External review
 
 `docs/security/self-assessment.md` §4 "What an external review should focus on" ranks seven
 areas for outside eyes, led by the pre-auth UDP dispatch with crypto OFF and
