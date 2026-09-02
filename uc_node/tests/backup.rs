@@ -45,7 +45,7 @@ use uc_node::backup::{BackupError, backup_instance, restore_artifact, verify_art
 use uc_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use uc_service::snapshots::SnapshotStore;
-use uc_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
 
 const SEG_BYTES: u64 = 64 * 1024;
 
@@ -810,15 +810,17 @@ struct RestoreCountSm {
 }
 
 impl StateMachine for RestoreCountSm {
+    const NAME: &'static str = "restore-count";
+
     type Command = RestoreCmd;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, cmd: RestoreCmd) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: RestoreCmd) -> u64 {
         let RestoreCmd::Add(n) = cmd;
         self.total += n;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.total
     }
 

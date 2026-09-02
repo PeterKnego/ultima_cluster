@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uc_client::Client;
 use uc_log::cnc::CncPage;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
 pub const APP: &str = "m14-services";
 
@@ -155,14 +155,16 @@ pub struct CountSm {
     last: Option<u64>,
 }
 impl StateMachine for CountSm {
+    const NAME: &'static str = "count";
+
     type Command = Cmd;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
-    fn apply(&mut self, position: u64, cmd: Cmd) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
         let Cmd::Add(n) = cmd;
         self.total += n;
-        self.last = Some(position);
+        self.last = Some(ctx.position);
         self.total
     }
     fn query(&self, _q: ()) -> u64 {
@@ -354,13 +356,15 @@ fn two_fsms_apply_the_same_log_and_fsm_zero_answers_the_client() {
 #[derive(Default)]
 pub struct SlowCountSm(CountSm);
 impl StateMachine for SlowCountSm {
+    const NAME: &'static str = "slow-count";
+
     type Command = Cmd;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
-    fn apply(&mut self, position: u64, cmd: Cmd) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
         std::thread::sleep(Duration::from_millis(1));
-        self.0.apply(position, cmd)
+        self.0.apply(ctx, cmd)
     }
     fn query(&self, q: ()) -> u64 {
         self.0.query(q)

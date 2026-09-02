@@ -25,7 +25,7 @@ use crate::builder_agent::BuildJob;
 use crate::config::SnapshotError;
 use crate::egress::Egress;
 use crate::replay::replay_into;
-use crate::traits::RawStateMachine;
+use crate::traits::{ApplyCtx, RawStateMachine};
 
 /// Spike-only apply-budget probes (feature `apply-profile`). Counters are
 /// process-global; printed every `PRINT_EVERY` frames and at drop. Since M12a
@@ -387,7 +387,8 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         // bytes are trusted; a decode failure there is
                         // unrecoverable corruption and fail-stops.
                         st.resp_buf.clear();
-                        sm.apply(pos, payload, &mut st.resp_buf);
+                        let mut ctx = ApplyCtx::new(pos, S::IDENTITY);
+                        sm.apply(&mut ctx, payload, &mut st.resp_buf);
                         #[cfg(feature = "apply-profile")]
                         let t1 = profile::now();
                         if is_leader {
@@ -764,6 +765,7 @@ pub(crate) fn check_node_instance(cnc: &CncPage, attached: u128, streak: &mut u8
 #[cfg(test)]
 mod tests {
     use super::check_node_instance;
+    use crate::traits::ApplyCtx;
     use std::sync::Arc;
     use uc_log::cnc::{CncMeta, CncPage};
 
@@ -825,9 +827,10 @@ mod tests {
     }
 
     impl crate::traits::RawStateMachine for CountSm {
-        fn apply(&mut self, position: u64, _cmd: &[u8], _out: &mut Vec<u8>) {
+        const NAME: &'static str = "count";
+        fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], _out: &mut Vec<u8>) {
             self.applies += 1;
-            self.last = Some(position);
+            self.last = Some(ctx.position);
         }
         fn query(&self, _q: &[u8], _out: &mut Vec<u8>) {}
         fn last_applied(&self) -> Option<u64> {

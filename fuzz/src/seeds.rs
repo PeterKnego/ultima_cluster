@@ -780,7 +780,7 @@ pub fn uc_protocol_log_frame() -> Vec<Seed> {
 pub fn uc_service_session() -> Vec<Seed> {
     use uc_service::RawStateMachine;
     use uc_service::SnapshotStateMachine;
-    use uc_service::{SESSION_HEADER_LEN, SessionConfig, Sessioned};
+    use uc_service::{ApplyCtx, SESSION_HEADER_LEN, SessionConfig, Sessioned};
 
     fn envelope(client_id: u64, seq: u64, body: &[u8]) -> Vec<u8> {
         let mut v = Vec::with_capacity(SESSION_HEADER_LEN + body.len());
@@ -824,9 +824,17 @@ pub fn uc_service_session() -> Vec<Seed> {
     // are the ones `install_snapshot` will actually try to read.
     let mut sm = Sessioned::new(crate::EchoSm::default(), SessionConfig::default());
     let mut out = Vec::new();
-    sm.apply(1, &envelope(1, 1, b"one"), &mut out);
+    sm.apply(
+        &mut ApplyCtx::new(1, <Sessioned<crate::EchoSm> as RawStateMachine>::IDENTITY),
+        &envelope(1, 1, b"one"),
+        &mut out,
+    );
     out.clear();
-    sm.apply(2, &envelope(2, 1, b"two"), &mut out);
+    sm.apply(
+        &mut ApplyCtx::new(2, <Sessioned<crate::EchoSm> as RawStateMachine>::IDENTITY),
+        &envelope(2, 1, b"two"),
+        &mut out,
+    );
     let (handle, _pos) = sm.freeze().expect("freeze session table");
     let mut artifact = Vec::new();
     <Sessioned<crate::EchoSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut artifact)

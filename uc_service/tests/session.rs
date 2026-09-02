@@ -6,9 +6,16 @@
 
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 use uc_service::{
-    RawStateMachine, SESSION_HEADER_LEN, SessionConfig, Sessioned, SnapshotStateMachine,
+    ApplyCtx, RawStateMachine, SESSION_HEADER_LEN, SessionConfig, Sessioned, SnapshotStateMachine,
     TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
+
+/// `s.apply(N, ...)` shorthand: this file exercises `Sessioned<S>` (never
+/// `S` bare, so `RawStateMachine`/`StateMachine` both being in scope never
+/// makes a call ambiguous), always at the same identity for a given `S`.
+fn ctx_for<S: RawStateMachine>(position: u64) -> ApplyCtx {
+    ApplyCtx::new(position, S::IDENTITY)
+}
 
 fn env(client: u64, seq: u64, cmd: &Cmd) -> Vec<u8> {
     let mut v = Vec::with_capacity(SESSION_HEADER_LEN + 16);
@@ -40,20 +47,40 @@ fn sm(window: usize, max_clients: usize) -> Sessioned<RegisterSm> {
 fn fresh_then_replayed_then_expired() {
     let mut s = sm(2, 16);
     let mut out = Vec::new();
-    s.apply(100, &env(7, 1, &Cmd::Write(10)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(100),
+        &env(7, 1, &Cmd::Write(10)),
+        &mut out,
+    );
     assert_eq!(resp(&out), (TAG_FRESH, Some(CmdResp::WriteAck)));
     out.clear();
-    s.apply(200, &env(7, 2, &Cmd::Cas { old: 10, new: 11 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(200),
+        &env(7, 2, &Cmd::Cas { old: 10, new: 11 }),
+        &mut out,
+    );
     assert_eq!(resp(&out), (TAG_FRESH, Some(CmdResp::CasResult(true))));
     // retry of seq 2: replayed, NOT re-applied (a second CAS 10->11 would be false)
     out.clear();
-    s.apply(300, &env(7, 2, &Cmd::Cas { old: 10, new: 11 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(300),
+        &env(7, 2, &Cmd::Cas { old: 10, new: 11 }),
+        &mut out,
+    );
     assert_eq!(resp(&out), (TAG_REPLAYED, Some(CmdResp::CasResult(true))));
     out.clear();
-    s.apply(400, &env(7, 3, &Cmd::Write(1)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(400),
+        &env(7, 3, &Cmd::Write(1)),
+        &mut out,
+    );
     // window = 2 holds seqs 2,3 now; seq 1 fell out
     out.clear();
-    s.apply(500, &env(7, 1, &Cmd::Write(10)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(500),
+        &env(7, 1, &Cmd::Write(10)),
+        &mut out,
+    );
     assert_eq!(resp(&out), (TAG_EXPIRED, None));
     assert_eq!(s.last_applied(), Some(500));
 }
@@ -62,10 +89,18 @@ fn fresh_then_replayed_then_expired() {
 fn a_gap_is_applied_fresh_and_lower_unseen_is_expired() {
     let mut s = sm(8, 16);
     let mut out = Vec::new();
-    s.apply(1, &env(1, 5, &Cmd::Write(5)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(1),
+        &env(1, 5, &Cmd::Write(5)),
+        &mut out,
+    );
     assert_eq!(resp(&out).0, TAG_FRESH);
     out.clear();
-    s.apply(2, &env(1, 3, &Cmd::Write(3)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(2),
+        &env(1, 3, &Cmd::Write(3)),
+        &mut out,
+    );
     assert_eq!(resp(&out).0, TAG_EXPIRED);
 }
 
@@ -73,20 +108,40 @@ fn a_gap_is_applied_fresh_and_lower_unseen_is_expired() {
 fn clients_are_evicted_by_oldest_position_deterministically() {
     let mut s = sm(4, 2);
     let mut out = Vec::new();
-    s.apply(10, &env(1, 1, &Cmd::Write(1)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(10),
+        &env(1, 1, &Cmd::Write(1)),
+        &mut out,
+    );
     out.clear();
-    s.apply(20, &env(2, 1, &Cmd::Write(2)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(20),
+        &env(2, 1, &Cmd::Write(2)),
+        &mut out,
+    );
     out.clear();
-    s.apply(30, &env(3, 1, &Cmd::Write(3)), &mut out); // evicts client 1 (seen at 10)
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(30),
+        &env(3, 1, &Cmd::Write(3)),
+        &mut out,
+    ); // evicts client 1 (seen at 10)
     out.clear();
-    s.apply(40, &env(1, 1, &Cmd::Write(1)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(40),
+        &env(1, 1, &Cmd::Write(1)),
+        &mut out,
+    );
     assert_eq!(
         resp(&out).0,
         TAG_FRESH,
         "evicted client starts over: its retry is applied fresh"
     );
     out.clear();
-    s.apply(50, &env(2, 1, &Cmd::Write(2)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(50),
+        &env(2, 1, &Cmd::Write(2)),
+        &mut out,
+    );
     // client 2 (seen at 20) was evicted when client 1 came back at 40 (client 3 seen at 30 is newer)
     assert_eq!(resp(&out).0, TAG_FRESH);
 }
@@ -95,7 +150,7 @@ fn clients_are_evicted_by_oldest_position_deterministically() {
 fn malformed_envelope_is_expired_not_a_panic() {
     let mut s = sm(4, 4);
     let mut out = Vec::new();
-    s.apply(1, b"short", &mut out);
+    s.apply(&mut ctx_for::<Sessioned<RegisterSm>>(1), b"short", &mut out);
     assert_eq!(out, vec![TAG_EXPIRED]);
 }
 
@@ -103,9 +158,17 @@ fn malformed_envelope_is_expired_not_a_panic() {
 fn snapshot_round_trip_carries_the_dedup_table() {
     let mut s = sm(4, 16);
     let mut out = Vec::new();
-    s.apply(100, &env(9, 1, &Cmd::Write(42)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(100),
+        &env(9, 1, &Cmd::Write(42)),
+        &mut out,
+    );
     out.clear();
-    s.apply(200, &env(9, 2, &Cmd::Cas { old: 42, new: 43 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(200),
+        &env(9, 2, &Cmd::Cas { old: 42, new: 43 }),
+        &mut out,
+    );
     let (handle, pos) = s.freeze().unwrap();
     assert_eq!(pos, 200);
     let mut img = Vec::new();
@@ -114,7 +177,11 @@ fn snapshot_round_trip_carries_the_dedup_table() {
     let got = fresh.install_snapshot(200, &mut img.as_slice()).unwrap();
     assert_eq!(got, 200);
     out.clear();
-    fresh.apply(300, &env(9, 2, &Cmd::Cas { old: 42, new: 43 }), &mut out);
+    fresh.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(300),
+        &env(9, 2, &Cmd::Cas { old: 42, new: 43 }),
+        &mut out,
+    );
     assert_eq!(
         resp(&out),
         (TAG_REPLAYED, Some(CmdResp::CasResult(true))),
@@ -143,15 +210,27 @@ fn seq_zero_is_deduplicated() {
     let mut out = Vec::new();
     // Seed the register via a different client so client 3's first-ever
     // command can be a CAS that is expected to succeed exactly once.
-    s.apply(50, &env(99, 1, &Cmd::Write(10)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(50),
+        &env(99, 1, &Cmd::Write(10)),
+        &mut out,
+    );
     out.clear();
-    s.apply(100, &env(3, 0, &Cmd::Cas { old: 10, new: 11 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(100),
+        &env(3, 0, &Cmd::Cas { old: 10, new: 11 }),
+        &mut out,
+    );
     assert_eq!(resp(&out), (TAG_FRESH, Some(CmdResp::CasResult(true))));
     out.clear();
     // Retry of seq 0: must be REPLAYED. Under the old bug this hits FRESH
     // again, re-running CAS{old:10,new:11} against the now-11 register,
     // which would return `CasResult(false)` — visibly wrong.
-    s.apply(200, &env(3, 0, &Cmd::Cas { old: 10, new: 11 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(200),
+        &env(3, 0, &Cmd::Cas { old: 10, new: 11 }),
+        &mut out,
+    );
     assert_eq!(resp(&out), (TAG_REPLAYED, Some(CmdResp::CasResult(true))));
 }
 
@@ -162,7 +241,11 @@ fn seq_zero_is_deduplicated() {
 fn install_refuses_mismatched_session_config() {
     let mut s = sm(4, 16);
     let mut out = Vec::new();
-    s.apply(100, &env(1, 1, &Cmd::Write(1)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(100),
+        &env(1, 1, &Cmd::Write(1)),
+        &mut out,
+    );
     let (handle, pos) = s.freeze().unwrap();
     assert_eq!(pos, 100);
     let mut img = Vec::new();
@@ -206,14 +289,26 @@ fn max_bytes_evicts_oldest_clients_deterministically() {
         },
     );
     let mut out = Vec::new();
-    s.apply(10, &env(1, 1, &Cmd::Write(1)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(10),
+        &env(1, 1, &Cmd::Write(1)),
+        &mut out,
+    );
     out.clear();
     // client 2's insert pushes total_bytes to 2*resp_size > max_bytes: client
     // 1 (older last_seen_pos) is evicted, never client 2 (just written).
-    s.apply(20, &env(2, 1, &Cmd::Write(2)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(20),
+        &env(2, 1, &Cmd::Write(2)),
+        &mut out,
+    );
     out.clear();
     // client 2 must have survived its own eviction pass.
-    s.apply(30, &env(2, 1, &Cmd::Write(2)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(30),
+        &env(2, 1, &Cmd::Write(2)),
+        &mut out,
+    );
     assert_eq!(
         resp(&out).0,
         TAG_REPLAYED,
@@ -221,7 +316,11 @@ fn max_bytes_evicts_oldest_clients_deterministically() {
     );
     out.clear();
     // client 1 was evicted by the byte budget; its retry starts over.
-    s.apply(40, &env(1, 1, &Cmd::Write(1)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(40),
+        &env(1, 1, &Cmd::Write(1)),
+        &mut out,
+    );
     assert_eq!(
         resp(&out).0,
         TAG_FRESH,
@@ -239,12 +338,24 @@ fn max_bytes_evicts_oldest_clients_deterministically() {
 fn freeze_with_trailing_replayed_frames_round_trips() {
     let mut s = sm(4, 16);
     let mut out = Vec::new();
-    s.apply(100, &env(5, 1, &Cmd::Write(7)), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(100),
+        &env(5, 1, &Cmd::Write(7)),
+        &mut out,
+    );
     out.clear();
-    s.apply(200, &env(5, 2, &Cmd::Cas { old: 7, new: 8 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(200),
+        &env(5, 2, &Cmd::Cas { old: 7, new: 8 }),
+        &mut out,
+    );
     out.clear();
     // A trailing REPLAYED frame at a position above the inner SM's last apply.
-    s.apply(300, &env(5, 2, &Cmd::Cas { old: 7, new: 8 }), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(300),
+        &env(5, 2, &Cmd::Cas { old: 7, new: 8 }),
+        &mut out,
+    );
     assert_eq!(resp(&out).0, TAG_REPLAYED);
 
     let (handle, pos) = s.freeze().unwrap();
@@ -261,7 +372,11 @@ fn freeze_with_trailing_replayed_frames_round_trips() {
     assert_eq!(got, 200);
 
     out.clear();
-    fresh.apply(400, &env(5, 2, &Cmd::Cas { old: 7, new: 8 }), &mut out);
+    fresh.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(400),
+        &env(5, 2, &Cmd::Cas { old: 7, new: 8 }),
+        &mut out,
+    );
     assert_eq!(
         resp(&out),
         (TAG_REPLAYED, Some(CmdResp::CasResult(true))),
@@ -281,9 +396,11 @@ struct ClearsOutSm {
     applied: Option<u64>,
 }
 impl RawStateMachine for ClearsOutSm {
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = "clears-out";
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
         out.clear();
-        self.applied = Some(position);
+        self.applied = Some(ctx.position);
         out.extend_from_slice(cmd);
     }
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
@@ -309,18 +426,30 @@ fn an_inner_sm_that_clears_out_does_not_panic_the_apply_thread() {
     let mut out = Vec::new();
 
     // Empty body: the inner writes nothing at all, the hardest case.
-    s.apply(10, &env_raw(1, 1, b""), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<ClearsOutSm>>(10),
+        &env_raw(1, 1, b""),
+        &mut out,
+    );
     assert_eq!(out, vec![TAG_FRESH]);
 
     // Non-empty body: tag then the inner's bytes, in that order.
     out.clear();
-    s.apply(20, &env_raw(1, 2, b"hello"), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<ClearsOutSm>>(20),
+        &env_raw(1, 2, b"hello"),
+        &mut out,
+    );
     assert_eq!(out[0], TAG_FRESH);
     assert_eq!(&out[1..], b"hello");
 
     // And the cached response is the inner's bytes, so a replay reproduces it.
     out.clear();
-    s.apply(30, &env_raw(1, 2, b"hello"), &mut out);
+    s.apply(
+        &mut ctx_for::<Sessioned<ClearsOutSm>>(30),
+        &env_raw(1, 2, b"hello"),
+        &mut out,
+    );
     assert_eq!(out[0], TAG_REPLAYED);
     assert_eq!(&out[1..], b"hello");
 }

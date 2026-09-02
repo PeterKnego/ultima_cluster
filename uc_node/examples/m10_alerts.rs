@@ -43,7 +43,7 @@ use uc_node::obs::ObsSources;
 use uc_node::obs::http::ObsServer;
 use uc_node::{Node, NodeConfig};
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
 const APP: &str = "m10-alerts";
 const RING_BYTES: usize = 1 << 20;
@@ -500,11 +500,12 @@ fn scenario_leader_not_serving() -> (SeriesFile, Disclosure) {
 
 struct NoopSm;
 impl StateMachine for NoopSm {
+    const NAME: &'static str = "noop";
     type Command = ();
     type Response = ();
     type Query = ();
     type QueryResponse = ();
-    fn apply(&mut self, _position: u64, _cmd: ()) {}
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: ()) {}
     fn query(&self, _q: ()) {}
     fn last_applied(&self) -> Option<u64> {
         None
@@ -1027,11 +1028,12 @@ fn scenario_service_absent(scratch_root: &Path) -> (SeriesFile, Disclosure) {
 /// up with the load loop and the lag barrier pins the whole node to it.
 struct SlowSm;
 impl StateMachine for SlowSm {
+    const NAME: &'static str = "slow";
     type Command = ();
     type Response = ();
     type Query = ();
     type QueryResponse = ();
-    fn apply(&mut self, _position: u64, _cmd: ()) {
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: ()) {
         thread::sleep(Duration::from_millis(20));
     }
     fn query(&self, _q: ()) {}

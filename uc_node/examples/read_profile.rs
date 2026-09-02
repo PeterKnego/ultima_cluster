@@ -186,7 +186,7 @@ use uc_protocol::v2::ipc::{
     FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
     MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client, write_query_payload,
 };
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
 /// Well-known file names under the instance dir — the shared contract with
 /// `uc_node::InstanceDir` (`uc_node/src/ipc.rs`). Hardcoded here rather than
@@ -536,14 +536,16 @@ struct ProfileSm {
 }
 
 impl StateMachine for ProfileSm {
+    const NAME: &'static str = "profile";
+
     type Command = Vec<u8>;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, _cmd: Vec<u8>) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: Vec<u8>) -> u64 {
         self.count += 1;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.count
     }
 

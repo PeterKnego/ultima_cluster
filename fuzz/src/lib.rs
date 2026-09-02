@@ -33,7 +33,9 @@ pub fn split(data: &[u8], n: usize) -> Vec<&[u8]> {
 pub struct NoopSm;
 
 impl uc_service::RawStateMachine for NoopSm {
-    fn apply(&mut self, _position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = "noop";
+
+    fn apply(&mut self, _ctx: &mut uc_service::ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
         out.clear();
     }
     fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
@@ -92,8 +94,10 @@ pub struct EchoSm {
 }
 
 impl uc_service::RawStateMachine for EchoSm {
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
-        self.applied = Some(position);
+    const NAME: &'static str = "echo";
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        self.applied = Some(ctx.position);
         out.extend_from_slice(cmd);
     }
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {

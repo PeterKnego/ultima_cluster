@@ -670,13 +670,15 @@ struct SumSm {
 }
 
 impl uc_service::RawStateMachine for SumSm {
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = "sum";
+
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
         if cmd.len() >= 8 {
             self.total = self
                 .total
                 .wrapping_add(u64::from_le_bytes(cmd[..8].try_into().unwrap()));
         }
-        self.last = Some(position);
+        self.last = Some(ctx.position);
         out.extend_from_slice(&self.total.to_le_bytes());
     }
     fn query(&self, _q: &[u8], out: &mut Vec<u8>) {

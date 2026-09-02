@@ -19,7 +19,7 @@ use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
-use uc_service::{Service, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
+use uc_service::{ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
 
 use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
 
@@ -44,15 +44,17 @@ struct CountSm {
 }
 
 impl StateMachine for CountSm {
+    const NAME: &'static str = "count";
+
     type Command = Cmd;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, cmd: Cmd) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
         let Cmd::Add(n) = cmd;
         self.total += n;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.total
     }
 

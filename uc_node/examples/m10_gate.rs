@@ -59,7 +59,7 @@ use uc_node::obs::http::ObsServer;
 use uc_node::obs::metrics::CONTRACT_SERIES;
 use uc_node::{Node, NodeConfig};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
-use uc_service::{Service, ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, Service, ServiceBuilder, ServiceConfig, StateMachine};
 
 const APP: &str = "m10-gate";
 const RING_BYTES: usize = 1 << 20;
@@ -258,11 +258,12 @@ impl Verdict {
 /// unsatisfiable by construction, not by the property under test.
 struct NoopSm;
 impl StateMachine for NoopSm {
+    const NAME: &'static str = "noop";
     type Command = ();
     type Response = ();
     type Query = ();
     type QueryResponse = ();
-    fn apply(&mut self, _position: u64, _cmd: ()) {}
+    fn apply(&mut self, _ctx: &mut ApplyCtx, _cmd: ()) {}
     fn query(&self, _q: ()) {}
     fn last_applied(&self) -> Option<u64> {
         None

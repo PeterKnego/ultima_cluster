@@ -23,7 +23,7 @@ use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_l
 
 use crate::apply::SnapshotRestore;
 use crate::config::ServiceError;
-use crate::traits::RawStateMachine;
+use crate::traits::{ApplyCtx, RawStateMachine};
 
 /// Replay archived journal blocks into `sm`, returning the byte cursor after the
 /// last applied/skipped frame — the point at which the live [`LogFollower`] can
@@ -165,7 +165,11 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // user data.
                 if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > guard.last_applied() {
                     scratch.clear();
-                    guard.apply(pos, &payload[off + HEADER_LEN..off + total], &mut scratch);
+                    guard.apply(
+                        &mut ApplyCtx::new(pos, S::IDENTITY),
+                        &payload[off + HEADER_LEN..off + total],
+                        &mut scratch,
+                    );
                 }
                 cursor = end;
                 off += aligned;

@@ -90,7 +90,7 @@ use uc_client::{Engine, EngineConfig, Outcome, SubmitError};
 use uc_consensus::election::NodeId;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{RawStateMachine, ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, RawStateMachine, ServiceBuilder, ServiceConfig, StateMachine};
 
 // --------------------------------------------------------------- CLI shape
 
@@ -231,14 +231,16 @@ struct CountSm {
 }
 
 impl StateMachine for CountSm {
+    const NAME: &'static str = "count";
+
     type Command = Vec<u8>;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, _cmd: Vec<u8>) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: Vec<u8>) -> u64 {
         self.count += 1;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.count
     }
 
@@ -265,9 +267,11 @@ struct RawCountSm {
 }
 
 impl RawStateMachine for RawCountSm {
-    fn apply(&mut self, position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = "raw";
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
         self.count += 1;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         out.extend_from_slice(&self.count.to_le_bytes());
     }
 

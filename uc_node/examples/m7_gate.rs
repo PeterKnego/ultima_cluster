@@ -94,8 +94,8 @@ use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 use uc_service::{
-    Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine,
-    StateMachine,
+    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy,
+    SnapshotStateMachine, StateMachine,
 };
 
 // ------------------------------------------------------------------ CLI
@@ -275,16 +275,18 @@ struct RegSm {
 }
 
 impl StateMachine for RegSm {
+    const NAME: &'static str = "reg";
+
     type Command = Vec<u8>;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, cmd: Vec<u8>) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Vec<u8>) -> u64 {
         if cmd.len() >= 8 {
             self.value = u64::from_le_bytes(cmd[..8].try_into().unwrap());
         }
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.value
     }
     fn query(&self, _q: ()) -> u64 {

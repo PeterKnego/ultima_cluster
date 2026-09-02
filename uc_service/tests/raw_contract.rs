@@ -1,7 +1,7 @@
 //! The raw contract and its blanket typed adapter produce the same bytes the
 //! v2.5.0 framework produced (position prefix ++ bincode(resp)) — clients
 //! built against 2.5.0 keep decoding responses unchanged.
-use uc_service::{RawStateMachine, StateMachine};
+use uc_service::{ApplyCtx, RawStateMachine, StateMachine};
 
 #[derive(serde::Serialize, serde::Deserialize)]
 enum Cmd {
@@ -23,14 +23,17 @@ struct Counter {
     last: Option<u64>,
 }
 impl StateMachine for Counter {
+    const NAME: &'static str = "counter";
+
     type Command = Cmd;
     type Response = Resp;
     type Query = Q;
     type QueryResponse = i64;
-    fn apply(&mut self, position: u64, cmd: Cmd) -> Resp {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> Resp {
         match cmd {
             Cmd::Add(n) => self.v += n,
         }
+        let position = ctx.position;
         self.last = Some(position);
         Resp {
             value: self.v,
@@ -51,7 +54,12 @@ fn typed_sm_is_a_raw_sm_with_byte_identical_wire() {
     let cmd_bytes =
         bincode::serde::encode_to_vec(Cmd::Add(5), bincode::config::standard()).unwrap();
     let mut out = Vec::new();
-    RawStateMachine::apply(&mut sm, 4096, &cmd_bytes, &mut out);
+    RawStateMachine::apply(
+        &mut sm,
+        &mut ApplyCtx::new(4096, Counter::IDENTITY),
+        &cmd_bytes,
+        &mut out,
+    );
     // exactly what v2.5.0's egress encoded after the 8-byte position prefix
     let expected = bincode::serde::encode_to_vec(
         &Resp {
@@ -77,8 +85,10 @@ struct Echo {
     last: Option<u64>,
 }
 impl RawStateMachine for Echo {
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
-        self.last = Some(position);
+    const NAME: &'static str = "echo";
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        self.last = Some(ctx.position);
         out.extend_from_slice(cmd);
     }
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
@@ -93,6 +103,65 @@ impl RawStateMachine for Echo {
 fn raw_sm_sees_the_bytes_untouched() {
     let mut sm = Echo { last: None };
     let mut out = Vec::new();
-    RawStateMachine::apply(&mut sm, 7, b"\x00\x01raw", &mut out);
+    RawStateMachine::apply(
+        &mut sm,
+        &mut ApplyCtx::new(7, Echo::IDENTITY),
+        b"\x00\x01raw",
+        &mut out,
+    );
     assert_eq!(out, b"\x00\x01raw");
+}
+
+#[test]
+fn ctx_ids_is_the_only_generator_and_sessioned_forwards_the_context() {
+    use uc_service::{ApplyCtx, RawStateMachine, SessionConfig, Sessioned};
+    struct Minter {
+        seen: Vec<u128>,
+        last: Option<u64>,
+    }
+    impl RawStateMachine for Minter {
+        const NAME: &'static str = "minter";
+        fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
+            let mut ids = ctx.ids();
+            self.seen.push(ids.next());
+            self.last = Some(ctx.position);
+            out.extend_from_slice(&ctx.position.to_le_bytes());
+        }
+        fn query(&self, _q: &[u8], _out: &mut Vec<u8>) {}
+        fn last_applied(&self) -> Option<u64> {
+            self.last
+        }
+    }
+    let direct = {
+        let mut m = Minter {
+            seen: vec![],
+            last: None,
+        };
+        let mut out = Vec::new();
+        m.apply(&mut ApplyCtx::new(64, Minter::IDENTITY), &[], &mut out);
+        m.seen[0]
+    };
+    let mut s = Sessioned::new(
+        Minter {
+            seen: vec![],
+            last: None,
+        },
+        SessionConfig::default(),
+    );
+    let mut cmd = Vec::new();
+    cmd.extend_from_slice(&1u64.to_le_bytes()); // client_id
+    cmd.extend_from_slice(&1u64.to_le_bytes()); // seq
+    let mut out = Vec::new();
+    s.apply(
+        &mut ApplyCtx::new(64, <Sessioned<Minter> as RawStateMachine>::IDENTITY),
+        &cmd,
+        &mut out,
+    );
+    assert_eq!(<Sessioned<Minter> as RawStateMachine>::NAME, "minter");
+    assert_eq!(
+        s.inner().seen[0],
+        direct,
+        "same position, same identity → same ID through the wrapper"
+    );
+    assert_eq!(s.last_applied(), Some(64));
 }

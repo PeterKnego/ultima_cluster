@@ -46,14 +46,16 @@ pub struct RegisterSm {
 // path on the trait keeps its name out of this module's namespace.
 #[cfg(feature = "v2")]
 impl uc_service::StateMachine for RegisterSm {
+    const NAME: &'static str = "register";
+
     type Command = Cmd;
     type Response = CmdResp;
     type Query = (); // Read
     type QueryResponse = Option<u64>;
 
-    fn apply(&mut self, position: u64, cmd: Cmd) -> CmdResp {
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: Cmd) -> CmdResp {
         let resp = apply_cmd(&mut self.value, cmd);
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         resp
     }
     fn query(&self, _q: ()) -> Option<u64> {
@@ -142,7 +144,7 @@ fn apply_cmd(value: &mut Option<u64>, cmd: Cmd) -> CmdResp {
 #[cfg(all(test, feature = "v2"))]
 mod v2_tests {
     use super::{Cmd, CmdResp, RegisterSm};
-    use uc_service::StateMachine;
+    use uc_service::{ApplyCtx, StateMachine};
 
     #[test]
     fn apply_query_roundtrip_via_v2_trait() {
@@ -151,14 +153,26 @@ mod v2_tests {
         assert_eq!(sm.last_applied(), None);
         assert_eq!(sm.query(()), None);
         // Write, then a matching CAS, keyed on ascending byte positions.
-        assert_eq!(sm.apply(128, Cmd::Write(7)), CmdResp::WriteAck);
         assert_eq!(
-            sm.apply(256, Cmd::Cas { old: 7, new: 9 }),
+            sm.apply(
+                &mut ApplyCtx::new(128, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
+                Cmd::Write(7)
+            ),
+            CmdResp::WriteAck
+        );
+        assert_eq!(
+            sm.apply(
+                &mut ApplyCtx::new(256, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
+                Cmd::Cas { old: 7, new: 9 }
+            ),
             CmdResp::CasResult(true)
         );
         // A non-matching CAS is a no-op with a `false` result.
         assert_eq!(
-            sm.apply(384, Cmd::Cas { old: 7, new: 1 }),
+            sm.apply(
+                &mut ApplyCtx::new(384, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
+                Cmd::Cas { old: 7, new: 1 }
+            ),
             CmdResp::CasResult(false)
         );
         assert_eq!(sm.query(()), Some(9));
@@ -172,7 +186,10 @@ mod v2_tests {
         use uc_service::SnapshotStateMachine;
 
         let mut sm = RegisterSm::default();
-        sm.apply(4096, Cmd::Write(42));
+        sm.apply(
+            &mut ApplyCtx::new(4096, <RegisterSm as uc_service::RawStateMachine>::IDENTITY),
+            Cmd::Write(42),
+        );
         let (handle, s) = sm.freeze().unwrap();
         assert_eq!(s, 4096);
         let mut bytes = Vec::new();

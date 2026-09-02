@@ -5,7 +5,7 @@
 use libfuzzer_sys::fuzz_target;
 use uc_fuzz::EchoSm;
 use uc_service::RawStateMachine;
-use uc_service::{SessionConfig, Sessioned};
+use uc_service::{ApplyCtx, SessionConfig, Sessioned};
 
 // `Sessioned` is the exactly-once envelope: the first thing a REMOTE client's
 // bytes reach after the gateway relays them, and the owner of a snapshot
@@ -58,7 +58,11 @@ fuzz_target!(|data: &[u8]| {
     // window trim, and the byte-budget path many times per iteration.
     for (i, part) in parts[..8].iter().enumerate() {
         out.clear();
-        sm.apply(i as u64 + 1, part, &mut out);
+        sm.apply(
+            &mut ApplyCtx::new(i as u64 + 1, <Sessioned<EchoSm> as RawStateMachine>::IDENTITY),
+            part,
+            &mut out,
+        );
     }
 
     // install_snapshot over a Cursor — a mismatched replicated `SessionConfig`

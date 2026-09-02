@@ -32,7 +32,7 @@ use uc_log::cnc::{CncMeta, CncPage, unpack_service_status};
 use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
-use uc_service::{RawStateMachine, ServiceBuilder, ServiceConfig};
+use uc_service::{ApplyCtx, RawStateMachine, ServiceBuilder, ServiceConfig};
 
 const APP: &str = "apply-bench";
 const MIB: u64 = 1 << 20;
@@ -80,9 +80,11 @@ struct RawCount {
 }
 
 impl RawStateMachine for RawCount {
-    fn apply(&mut self, position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = "raw";
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
         self.frames += 1;
-        self.last = Some(position);
+        self.last = Some(ctx.position);
         out.extend_from_slice(&self.frames.to_le_bytes());
     }
     fn query(&self, _q: &[u8], out: &mut Vec<u8>) {

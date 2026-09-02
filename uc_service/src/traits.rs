@@ -16,7 +16,36 @@
 //! can serialize/restore their full state (what gates log purge). Existing SMs
 //! that don't implement it are untouched.
 
+use uc_protocol::identity::FsmIdentity;
+
 use crate::config::SnapshotError;
+use crate::ids::IdGen;
+
+/// Everything the framework knows about the committed frame being applied
+/// (spec §3.3). Built by the apply loop and by journal replay, once per
+/// frame; a state machine constructs one only in its own unit tests.
+/// `#[non_exhaustive]`: the timestamps/scheduler design adds fields here
+/// without changing `apply`'s signature again.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ApplyCtx {
+    /// The frame's absolute byte position (the idempotency key).
+    pub position: u64,
+    identity: FsmIdentity,
+}
+
+impl ApplyCtx {
+    pub fn new(position: u64, identity: FsmIdentity) -> ApplyCtx {
+        ApplyCtx { position, identity }
+    }
+    pub fn identity(&self) -> FsmIdentity {
+        self.identity
+    }
+    /// The deterministic ID generator for THIS apply call (spec §3.4).
+    pub fn ids(&self) -> IdGen {
+        IdGen::new(self.position, self.identity)
+    }
+}
 
 /// The user's deterministic business logic.
 ///
@@ -25,14 +54,21 @@ use crate::config::SnapshotError;
 /// handle. This is non-negotiable for state-machine-replication correctness —
 /// every replica must reach the same state from the same committed log.
 pub trait StateMachine: Send + 'static {
+    /// The FSM's identity — the same wherever this type attaches (spec §3).
+    const NAME: &'static str;
+    /// Packed semantic version of this FSM's logic (`identity::pack_version`);
+    /// `0` = unversioned. Equality-checked cluster-wide, never an ID input.
+    const VERSION: u32 = 0;
+
     type Command: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
     type Response: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
     type Query: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
     type QueryResponse: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
 
-    /// Apply one committed command. `position` is the frame's absolute byte
-    /// position (the v2 log_index analog and the natural idempotency key).
-    fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response;
+    /// Apply one committed command. `ctx.position` is the frame's absolute
+    /// byte position (the v2 log_index analog and the natural idempotency
+    /// key); `ctx.ids()` is the deterministic ID generator for this call.
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Self::Command) -> Self::Response;
 
     /// Answer a read. Same method whether the framework routes it linearizable
     /// or snapshot (Task 11) — the IPC boundary carries typed queries, not
@@ -53,10 +89,19 @@ pub trait StateMachine: Send + 'static {
 /// implement [`StateMachine`] (typed, serde + bincode) and get this for free
 /// via the blanket impl below. A type implements ONE of the two.
 pub trait RawStateMachine: Send + 'static {
-    /// Apply the committed command at `position` (the absolute log byte
+    /// The FSM's identity — the same wherever this type attaches (spec §3).
+    const NAME: &'static str;
+    /// Packed semantic version of this FSM's logic (`identity::pack_version`);
+    /// `0` = unversioned. Equality-checked cluster-wide, never an ID input.
+    const VERSION: u32 = 0;
+    /// Provided; evaluated (and validated) at first use — a bad `NAME` is a
+    /// compile-time error where `IDENTITY` is first named.
+    const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION);
+
+    /// Apply the committed command at `ctx.position` (the absolute log byte
     /// offset, the idempotency key). Write the response bytes into `out`
     /// (cleared by the caller). Deterministic, sync, no I/O.
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>);
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);
     /// Answer a read. `out` is cleared by the caller.
     fn query(&self, q: &[u8], out: &mut Vec<u8>);
     /// Highest position applied so far (`None` before the first).
@@ -67,12 +112,15 @@ pub trait RawStateMachine: Send + 'static {
 /// apply, encode the response with bincode-standard — exactly the codec the
 /// framework used through v2.5.0, so the wire is byte-identical.
 impl<S: StateMachine> RawStateMachine for S {
+    const NAME: &'static str = S::NAME;
+    const VERSION: u32 = S::VERSION;
+
     #[inline]
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
         let (cmd, _) =
             bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
                 .expect("corrupt committed frame (fail-stop)");
-        let resp = StateMachine::apply(self, position, cmd);
+        let resp = StateMachine::apply(self, ctx, cmd);
         bincode::serde::encode_into_std_write(&resp, out, bincode::config::standard())
             .expect("response bincode-encode (fail-stop)");
     }

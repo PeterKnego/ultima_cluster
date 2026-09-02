@@ -60,7 +60,7 @@ use uc_crypto::rotation::RotationPolicy;
 use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine};
 
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
@@ -1289,13 +1289,15 @@ pub struct Slow<SM, const MICROS: u64>(pub SM);
 impl<SM: uc_service::StateMachine, const MICROS: u64> uc_service::StateMachine
     for Slow<SM, MICROS>
 {
+    const NAME: &'static str = SM::NAME;
+
     type Command = SM::Command;
     type Response = SM::Response;
     type Query = SM::Query;
     type QueryResponse = SM::QueryResponse;
-    fn apply(&mut self, position: u64, cmd: SM::Command) -> SM::Response {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: SM::Command) -> SM::Response {
         std::thread::sleep(Duration::from_micros(MICROS));
-        uc_service::StateMachine::apply(&mut self.0, position, cmd)
+        uc_service::StateMachine::apply(&mut self.0, ctx, cmd)
     }
     fn query(&self, q: SM::Query) -> SM::QueryResponse {
         uc_service::StateMachine::query(&self.0, q)
@@ -1333,12 +1335,14 @@ impl<SM: uc_service::SnapshotStateMachine + uc_service::StateMachine, const MICR
 pub struct Corrupt<SM>(pub SM);
 
 impl uc_service::StateMachine for Corrupt<RegisterSm> {
+    const NAME: &'static str = "corrupt";
+
     type Command = Cmd;
     type Response = CmdResp;
     type Query = ();
     type QueryResponse = Option<u64>;
-    fn apply(&mut self, position: u64, cmd: Cmd) -> CmdResp {
-        match uc_service::StateMachine::apply(&mut self.0, position, cmd) {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> CmdResp {
+        match uc_service::StateMachine::apply(&mut self.0, ctx, cmd) {
             CmdResp::CasResult(b) => CmdResp::CasResult(!b),
             other => other,
         }
@@ -1401,12 +1405,14 @@ pub static INSTALLS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 pub struct InstallCounting(pub RegisterSm);
 
 impl uc_service::StateMachine for InstallCounting {
+    const NAME: &'static str = "install-counting";
+
     type Command = Cmd;
     type Response = CmdResp;
     type Query = ();
     type QueryResponse = Option<u64>;
-    fn apply(&mut self, position: u64, cmd: Cmd) -> CmdResp {
-        uc_service::StateMachine::apply(&mut self.0, position, cmd)
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> CmdResp {
+        uc_service::StateMachine::apply(&mut self.0, ctx, cmd)
     }
     fn query(&self, q: ()) -> Option<u64> {
         uc_service::StateMachine::query(&self.0, q)

@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::config::SnapshotError;
-use crate::traits::{RawStateMachine, SnapshotStateMachine};
+use crate::traits::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 pub const SESSION_HEADER_LEN: usize = 16;
 pub const TAG_FRESH: u8 = 0;
@@ -164,7 +164,11 @@ impl<S: RawStateMachine> Sessioned<S> {
 }
 
 impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = S::NAME;
+    const VERSION: u32 = S::VERSION;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        let position = ctx.position;
         // A malformed envelope (shorter than the fixed header) is treated as
         // unanswerable rather than panicking the apply thread — but the frame
         // still occupied a log position, so it still counts toward
@@ -228,7 +232,7 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
         // common case of a client whose responses are all about one size.
         let hint = st.window.back().map_or(0, |(_, prev)| prev.len());
         let mut resp = Vec::with_capacity(hint);
-        self.inner.apply(position, body, &mut resp);
+        self.inner.apply(ctx, body, &mut resp);
         out.push(TAG_FRESH);
         out.extend_from_slice(&resp);
         let resp_len = resp.len();

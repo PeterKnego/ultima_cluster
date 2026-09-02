@@ -36,15 +36,17 @@ pub struct ListAppendSm {
 
 #[cfg(feature = "v2")]
 impl uc_service::StateMachine for ListAppendSm {
+    const NAME: &'static str = "list-append";
+
     type Command = LaCmd;
     type Response = LaResp;
     type Query = LaRead;
     type QueryResponse = Vec<u64>;
 
-    fn apply(&mut self, position: u64, cmd: LaCmd) -> LaResp {
+    fn apply(&mut self, ctx: &mut uc_service::ApplyCtx, cmd: LaCmd) -> LaResp {
         let LaCmd::Append { key, val } = cmd;
         self.lists.entry(key).or_default().push(val);
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         LaResp::AppendAck
     }
     fn query(&self, q: LaRead) -> Vec<u64> {
@@ -107,7 +109,12 @@ impl uc_service::SnapshotStateMachine for ListAppendSm {
 #[cfg(all(test, feature = "v2"))]
 mod v2_tests {
     use super::{LaCmd, LaRead, LaResp, ListAppendSm};
-    use uc_service::StateMachine;
+    use uc_service::{ApplyCtx, StateMachine};
+
+    // `<ListAppendSm as RawStateMachine>::IDENTITY` is spelled via UFCS at
+    // each call site rather than importing `RawStateMachine` — that trait's
+    // `apply` would shadow `StateMachine::apply`, making every
+    // `sm.apply(...)` call below ambiguous.
 
     #[test]
     fn apply_query_roundtrip_via_v2_trait() {
@@ -115,15 +122,24 @@ mod v2_tests {
         assert_eq!(sm.last_applied(), None);
         assert_eq!(sm.query(LaRead { key: 7 }), Vec::<u64>::new());
         assert_eq!(
-            sm.apply(128, LaCmd::Append { key: 7, val: 10 }),
+            sm.apply(
+                &mut ApplyCtx::new(128, <ListAppendSm as uc_service::RawStateMachine>::IDENTITY),
+                LaCmd::Append { key: 7, val: 10 }
+            ),
             LaResp::AppendAck
         );
         assert_eq!(
-            sm.apply(256, LaCmd::Append { key: 7, val: 20 }),
+            sm.apply(
+                &mut ApplyCtx::new(256, <ListAppendSm as uc_service::RawStateMachine>::IDENTITY),
+                LaCmd::Append { key: 7, val: 20 }
+            ),
             LaResp::AppendAck
         );
         assert_eq!(
-            sm.apply(384, LaCmd::Append { key: 3, val: 30 }),
+            sm.apply(
+                &mut ApplyCtx::new(384, <ListAppendSm as uc_service::RawStateMachine>::IDENTITY),
+                LaCmd::Append { key: 3, val: 30 }
+            ),
             LaResp::AppendAck
         );
         // Per-key append order is the apply order; other keys are untouched.
@@ -138,7 +154,13 @@ mod v2_tests {
         use uc_service::SnapshotStateMachine;
 
         let mut sm = ListAppendSm::default();
-        sm.apply(4096, LaCmd::Append { key: 1, val: 42 });
+        sm.apply(
+            &mut ApplyCtx::new(
+                4096,
+                <ListAppendSm as uc_service::RawStateMachine>::IDENTITY,
+            ),
+            LaCmd::Append { key: 1, val: 42 },
+        );
         let (handle, s) = sm.freeze().unwrap();
         assert_eq!(s, 4096);
         let mut bytes = Vec::new();

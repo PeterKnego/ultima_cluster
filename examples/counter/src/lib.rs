@@ -8,7 +8,7 @@
 //! three methods below.
 
 use serde::{Deserialize, Serialize};
-use uc_service::StateMachine;
+use uc_service::{ApplyCtx, StateMachine};
 
 /// What clients send. Commands go through consensus and are applied on every
 /// replica, in the same order.
@@ -50,6 +50,8 @@ pub struct CounterSm {
 }
 
 impl StateMachine for CounterSm {
+    const NAME: &'static str = "counter";
+
     type Command = Command;
     type Response = Applied;
     type Query = Query;
@@ -68,11 +70,12 @@ impl StateMachine for CounterSm {
     /// behaviour depending on how a replica was compiled is exactly the kind of
     /// nondeterminism that fractures a cluster. It is a contrived risk for a
     /// counter and a very real one in a matching engine.
-    fn apply(&mut self, position: u64, cmd: Command) -> Applied {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Command) -> Applied {
         match cmd {
             Command::Add(n) => self.value = self.value.wrapping_add(n),
             Command::Reset => self.value = 0,
         }
+        let position = ctx.position;
         self.last_applied = Some(position);
         Applied {
             value: self.value,

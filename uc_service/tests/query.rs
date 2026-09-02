@@ -28,7 +28,7 @@ use uc_protocol::ring::{BroadcastRing, SpscRing};
 use uc_protocol::v2::ipc::{
     MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra, extra_client,
 };
-use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
 
 // ------------------------------------------------------------- the state machine
 
@@ -47,15 +47,17 @@ struct CountSm {
 }
 
 impl StateMachine for CountSm {
+    const NAME: &'static str = "count";
+
     type Command = Cmd;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, cmd: Cmd) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
         let Cmd::Add(n) = cmd;
         self.total += n;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.total
     }
 

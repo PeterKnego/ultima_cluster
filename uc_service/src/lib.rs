@@ -35,6 +35,7 @@ mod attach;
 mod builder_agent;
 mod config;
 mod egress;
+mod ids;
 mod lag;
 mod output;
 mod replay;
@@ -62,11 +63,12 @@ use crate::output::{OutputState, output_cycle};
 use crate::snapshots::SnapshotStore;
 
 pub use crate::config::{ServiceConfig, ServiceError, SnapshotError, SnapshotPolicy};
+pub use crate::ids::IdGen;
 pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
 pub use crate::traits::{
-    NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
+    ApplyCtx, NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
     SnapshotStateMachine, StateMachine, TypedOutput,
 };
 

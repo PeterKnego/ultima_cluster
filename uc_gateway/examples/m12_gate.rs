@@ -85,8 +85,9 @@ use uc_remote::{
     SubmitError as RemoteSubmitError,
 };
 use uc_service::{
-    RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig,
-    Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine, TAG_FRESH,
+    ApplyCtx, RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig,
+    SessionConfig, Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine,
+    TAG_FRESH,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -460,14 +461,16 @@ struct CountSm {
 }
 
 impl StateMachine for CountSm {
+    const NAME: &'static str = "count";
+
     type Command = Vec<u8>;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, _cmd: Vec<u8>) -> u64 {
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: Vec<u8>) -> u64 {
         self.count += 1;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         self.count
     }
 
@@ -545,13 +548,15 @@ impl SpinCountSm {
 }
 
 impl StateMachine for SpinCountSm {
+    const NAME: &'static str = "spin";
+
     type Command = Vec<u8>;
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
 
-    fn apply(&mut self, position: u64, cmd: Vec<u8>) -> u64 {
-        let mut x: u64 = position ^ 0x9E37_79B9_7F4A_7C15;
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Vec<u8>) -> u64 {
+        let mut x: u64 = ctx.position ^ 0x9E37_79B9_7F4A_7C15;
         for _ in 0..self.spin {
             x = x
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -563,7 +568,7 @@ impl StateMachine for SpinCountSm {
         // are in scope and CountSm implements both (the latter via the
         // blanket impl), so a bare `self.inner.apply(..)` is ambiguous
         // (E0034) — disambiguate with UFCS.
-        StateMachine::apply(&mut self.inner, position, cmd)
+        StateMachine::apply(&mut self.inner, ctx, cmd)
     }
 
     fn query(&self, q: ()) -> u64 {
@@ -1602,9 +1607,11 @@ struct RawCountSm {
 }
 
 impl RawStateMachine for RawCountSm {
-    fn apply(&mut self, position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = "raw";
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: &[u8], out: &mut Vec<u8>) {
         self.count += 1;
-        self.last_applied = Some(position);
+        self.last_applied = Some(ctx.position);
         out.extend_from_slice(&self.count.to_le_bytes());
     }
 
@@ -2138,7 +2145,12 @@ mod tests {
         sm: &mut S,
     ) -> Vec<u64> {
         (1..=200u64)
-            .map(|i| sm.apply(i * 64, vec![(i & 0xff) as u8; 8]))
+            .map(|i| {
+                sm.apply(
+                    &mut ApplyCtx::new(i * 64, S::IDENTITY),
+                    vec![(i & 0xff) as u8; 8],
+                )
+            })
             .collect()
     }
 
