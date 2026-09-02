@@ -217,6 +217,18 @@ impl PipelinedClient {
         self.declared
     }
 
+    /// cnc 3.1: the row declared under `name` on the attached node (spec
+    /// §6). See [`crate::SendHalf::fsm`].
+    pub fn fsm(&self, name: &str) -> Result<u8, ClientError> {
+        self.send.lock().unwrap().fsm(name)
+    }
+
+    /// cnc 3.1: declared FSM names in row order. See
+    /// [`crate::SendHalf::declared_names`].
+    pub fn declared_names(&self) -> Vec<uc_protocol::identity::FsmName> {
+        self.send.lock().unwrap().declared_names()
+    }
+
     /// M14b: submit a command; FSM `id` answers (every declared FSM applies
     /// it — only the named one's response is awaited). Retries transient
     /// refusals like [`Self::submit`].

@@ -126,6 +126,18 @@ impl Client {
         self.inner.declared()
     }
 
+    /// cnc 3.1: the row declared under `name` on the attached node (spec
+    /// §6). See [`crate::SendHalf::fsm`].
+    pub fn fsm(&self, name: &str) -> Result<u8, ClientError> {
+        self.inner.fsm(name)
+    }
+
+    /// cnc 3.1: declared FSM names in row order. See
+    /// [`crate::SendHalf::declared_names`].
+    pub fn declared_names(&self) -> Vec<uc_protocol::identity::FsmName> {
+        self.inner.declared_names()
+    }
+
     /// M14b: submit a command; FSM `id` answers. Blocks like [`Self::submit`].
     pub fn submit_to<C: Serialize, R: DeserializeOwned>(
         &self,

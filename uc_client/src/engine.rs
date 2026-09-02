@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use uc_log::cnc::CncPage;
+use uc_protocol::identity::FsmName;
 use uc_protocol::ring::{
     BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing, RecordHeader, RingError,
 };
@@ -214,6 +215,14 @@ struct Shared {
     /// M14b: bit `i` set ⇔ FSM `i` exists on the attached node. A page
     /// reading 0 (a harness node) folds to `0b1`.
     declared: u64,
+    /// cnc 3.1: every row's declared name (`None` = undeclared), read once
+    /// at attach off `CncPage::service_names` (line 7) — a boot-time
+    /// property of the node, like `declared`. Backs `SendHalf::fsm`/
+    /// `declared_names`. A harness node's `declared` fold to `0b1` does NOT
+    /// synthesize a name here: an unnamed declared row (`meta().services`
+    /// left `None`) is a legitimate state — `fsm` finds nothing for it,
+    /// `declared_names` reports it as absent, same as any other undeclared row.
+    names: [Option<FsmName>; CNC_MAX_SERVICES],
 }
 
 /// Namespace for [`Engine::attach`].
@@ -354,6 +363,11 @@ impl Engine {
         // posture: a shared-memory page never panics an attacher), reported
         // as FSM 0 undeclared with the RAW page value, the same shape the
         // per-request door refusal uses.
+        // cnc 3.1: every row's declared name, straight off line 7 — read
+        // once here, alongside the declared mask, and never touched again
+        // (see `Shared::names`'s doc for why a harness node's `0b1` fold
+        // does not synthesize a name).
+        let names = cnc.service_names();
         let raw = cnc.services_declared();
         let masked = raw & ((1u64 << CNC_MAX_SERVICES) - 1);
         let declared = match (raw, masked) {
@@ -388,6 +402,7 @@ impl Engine {
             max_payload,
             serving_gate: cfg.serving_gate,
             declared,
+            names,
         });
         let slots = shared.table.slot_count();
         Ok((
@@ -477,6 +492,33 @@ impl SendHalf {
     /// never 0 and never names a ring the engine did not open.
     pub fn declared(&self) -> u64 {
         self.shared.declared
+    }
+
+    /// cnc 3.1: the row declared under `name` on the attached node (spec
+    /// §6). `name` need not itself be a valid [`FsmName`] — an invalid
+    /// string simply matches no row, same as a well-formed but undeclared
+    /// one, and is reported that way in [`ClientError::UnknownFsm`].
+    pub fn fsm(&self, name: &str) -> Result<u8, ClientError> {
+        let wanted = FsmName::parse(name).ok();
+        self.shared
+            .names
+            .iter()
+            .position(|n| n.is_some() && *n == wanted)
+            .map(|i| i as u8)
+            .ok_or_else(|| ClientError::UnknownFsm {
+                name: name.to_string(),
+                declared: self
+                    .declared_names()
+                    .iter()
+                    .map(|n| n.as_str().to_string())
+                    .collect(),
+            })
+    }
+
+    /// cnc 3.1: declared FSM names, in row order (undeclared/unnamed rows
+    /// omitted).
+    pub fn declared_names(&self) -> Vec<FsmName> {
+        self.shared.names.iter().flatten().copied().collect()
     }
 
     /// Submit a command; FSM 0 answers. Nonblocking. See the module's central
@@ -1035,6 +1077,55 @@ mod tests {
         BroadcastRing::create(&dir.join(egress_service_ring(0)), MIB, 128).unwrap();
         BroadcastRing::create(&dir.join(egress_service_ring(1)), MIB, 128).unwrap();
         BroadcastRing::create(&dir.join(EGRESS_NODE), MIB, 128).unwrap();
+    }
+
+    /// As [`make_instance_two_fsms`], but row 0 is named `kv` and row 1
+    /// `orders` (spec §6): exercises `SendHalf::fsm`/`declared_names` against
+    /// a page whose line 7 actually carries names, not just the declared mask.
+    fn make_instance_two_fsms_named(dir: &Path, app_id: &str) {
+        const MIB: u64 = 1 << 20;
+        let mut services = [None; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
+        services[0] = Some(FsmName::parse("kv").unwrap());
+        services[1] = Some(FsmName::parse("orders").unwrap());
+        let m = uc_log::cnc::CncMeta {
+            services,
+            ..meta(app_id)
+        };
+        let page = uc_log::cnc::CncPage::create_file(&dir.join(CNC_FILE), &m).unwrap();
+        page.store_services_declared(0b11);
+        MpscRing::create(&dir.join(INGRESS_RING), MIB, 128).unwrap();
+        MpscRing::create(&dir.join(QUERY_RING), MIB, 256).unwrap();
+        BroadcastRing::create(&dir.join(egress_service_ring(0)), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join(egress_service_ring(1)), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join(EGRESS_NODE), MIB, 128).unwrap();
+    }
+
+    /// cnc 3.1: a page with real names on line 7 resolves `fsm(name)` to the
+    /// declaring row, `declared_names()` reports them in row order, and an
+    /// unnamed FSM is refused with `ClientError::UnknownFsm`.
+    #[test]
+    fn fsm_resolves_declared_names_to_rows_and_refuses_unknown_names() {
+        let dir = tempfile::tempdir_in(scratch_base()).unwrap();
+        make_instance_two_fsms_named(dir.path(), "fsm-names");
+        let (send, _poll) =
+            Engine::attach(dir.path(), "fsm-names", EngineConfig::default()).unwrap();
+
+        assert_eq!(send.fsm("kv").unwrap(), 0);
+        assert_eq!(send.fsm("orders").unwrap(), 1);
+        assert_eq!(
+            send.declared_names()
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>(),
+            ["kv", "orders"]
+        );
+        match send.fsm("nope") {
+            Err(ClientError::UnknownFsm { name, declared }) => {
+                assert_eq!(name, "nope");
+                assert_eq!(declared, ["kv", "orders"]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     fn producer(dir: &Path, file: &str) -> uc_protocol::ring::BroadcastProducer {

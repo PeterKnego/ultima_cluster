@@ -171,3 +171,44 @@ fn hundred_submits_in_order_then_two_concurrent_clients_stay_monotone_with_disti
     svc.stop();
     node.stop();
 }
+
+#[test]
+fn fsm_resolves_a_name_to_its_row_and_refuses_an_unknown_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(node_config(dir.path(), "client-test-fsm")).unwrap();
+    wait_until(|| node.can_serve());
+
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), "client-test-fsm"),
+        CountSm::default(),
+    )
+    .start()
+    .unwrap();
+
+    let client = Client::connect(dir.path(), "client-test-fsm").unwrap();
+
+    assert_eq!(client.fsm("count").unwrap(), 0);
+    assert_eq!(
+        client
+            .declared_names()
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>(),
+        ["count"]
+    );
+    match client.fsm("orders") {
+        Err(uc_client::ClientError::UnknownFsm { name, declared }) => {
+            assert_eq!(name, "orders");
+            assert_eq!(declared, ["count"]);
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let row = client.fsm("count").unwrap();
+    let r: u64 = client.submit_to(row, &Cmd::Add(1)).unwrap();
+    assert_eq!(r, 1);
+
+    client.shutdown();
+    svc.stop();
+    node.stop();
+}

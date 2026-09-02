@@ -87,6 +87,15 @@ pub enum ClientError {
     /// and no in-range id is either.
     #[error("service id {id} is not declared on this node (declared set 0b{declared:b})")]
     ServiceNotDeclared { id: u8, declared: u64 },
+    /// cnc 3.1: `name` is not declared on the attached node's line 7 —
+    /// [`crate::SendHalf::fsm`]/[`crate::Client::fsm`]/
+    /// [`crate::PipelinedClient::fsm`] resolve a name to its row and refuse
+    /// with this when no row carries it. `declared` is
+    /// [`crate::SendHalf::declared_names`] in row order, rendered as strings.
+    #[error(
+        "FSM {name:?} is not declared on the attached node (declared, in row order: {declared:?})"
+    )]
+    UnknownFsm { name: String, declared: Vec<String> },
     /// The client was shut down while this request was still in flight.
     #[error("client shut down")]
     ShutDown,

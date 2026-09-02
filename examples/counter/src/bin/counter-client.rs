@@ -42,9 +42,10 @@ struct Args {
     /// Wait up to this long for the node to become able to serve.
     #[arg(long, default_value_t = 30)]
     wait_secs: u64,
-    /// Ask FSM <id> instead of FSM 0.
+    /// Ask the FSM declared under this name instead of FSM 0 (resolved
+    /// through `Client::fsm`).
     #[arg(long)]
-    service_id: Option<u8>,
+    fsm: Option<String>,
     /// Submit to every declared FSM and print each answer.
     #[arg(long)]
     all: bool,
@@ -98,6 +99,12 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let client = Client::connect(&args.instance_dir, &args.app_id)?;
     let deadline = Instant::now() + Duration::from_secs(args.wait_secs);
+    // Resolve --fsm <name> to its row once, up front — the old code used
+    // `service_id.unwrap_or(0)` at each call site; `id` plays the same role.
+    let id: Option<u8> = match &args.fsm {
+        Some(name) => Some(client.fsm(name)?),
+        None => None,
+    };
 
     if !args.read_only {
         let cmd = if args.reset {
@@ -116,7 +123,7 @@ fn main() -> anyhow::Result<()> {
                         applied.value, applied.position
                     );
                 }
-            } else if let Some(id) = args.service_id {
+            } else if let Some(id) = id {
                 let applied =
                     retry_with(deadline, || client.submit_to::<Command, Applied>(id, &cmd))?;
                 println!(
@@ -141,7 +148,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    if let Some(id) = args.service_id {
+    if let Some(id) = id {
         if args.snapshot {
             let r: QueryResponse = client.query_snapshot_on(id, &Query::Value)?;
             println!("FSM {id}: snapshot read -> {}", r.value);
