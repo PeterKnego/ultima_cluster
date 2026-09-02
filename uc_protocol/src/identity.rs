@@ -101,6 +101,7 @@ impl FsmName {
     }
 
     /// Hash of exactly the name's bytes (no padding).
+    /// Loop duplicated from `fnv1a_64`: MSRV 1.89 const fn cannot slice a struct field through a temporary.
     pub const fn hash(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut i = 0;
@@ -125,6 +126,14 @@ impl FsmName {
         if len == 0 {
             return None;
         }
+        // All bytes from len onwards must be NUL (fail closed on garbage).
+        let mut i = len;
+        while i < FSM_NAME_MAX_LEN {
+            if b[i] != 0 {
+                return None;
+            }
+            i += 1;
+        }
         let s = core::str::from_utf8(&b[..len]).ok()?;
         FsmName::parse(s).ok()
     }
@@ -136,6 +145,7 @@ pub const fn pack_version(major: u8, minor: u8, patch: u16) -> u32 {
     ((major as u32) << 24) | ((minor as u32) << 16) | patch as u32
 }
 
+/// Inverse of [`pack_version`]. FROZEN.
 pub const fn unpack_version(v: u32) -> (u8, u8, u16) {
     ((v >> 24) as u8, (v >> 16) as u8, v as u16)
 }
@@ -215,6 +225,17 @@ mod tests {
         assert_eq!(FsmName::parse("a").unwrap().hash(), fnv1a_64(b"a"));
     }
 
+    /// FROZEN: major:8 ‖ minor:8 ‖ patch:16. Never change this.
+    #[test]
+    fn pack_version_layout_golden() {
+        assert_eq!(pack_version(1, 2, 3), 0x0102_0003);
+        assert_eq!(pack_version(255, 255, 65535), 0xFFFF_FFFF);
+        assert_eq!(unpack_version(0x0102_0003), (1, 2, 3));
+        // Round trip.
+        let v = pack_version(10, 20, 30000);
+        assert_eq!(unpack_version(v), (10, 20, 30000));
+    }
+
     #[test]
     fn padded_roundtrip_and_zero_line_is_none() {
         let n = FsmName::parse("orders").unwrap();
@@ -230,6 +251,15 @@ mod tests {
             None,
             "a corrupt line is not a name"
         );
+        // Garbage after the NUL must fail closed.
+        let mut trash = p;
+        trash[10] = b'x';
+        assert_eq!(FsmName::from_padded(&trash), None);
+        // Full 32-byte name (no NUL at all) round-trips.
+        let full = FsmName::parse("a2345678901234567890123456789010").unwrap();
+        let full_p = full.padded();
+        assert_eq!(full_p.iter().position(|&c| c == 0), None);
+        assert_eq!(FsmName::from_padded(&full_p), Some(full));
     }
 
     #[test]
