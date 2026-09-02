@@ -2,7 +2,9 @@
 
 **Date:** 2026-09-02 (amended the same day: cut from "placement-independent
 rows" to **named rows** after the §2.1 comparison; per-FSM version added
-in §7)
+in §7; **`ApplyCtx` introduced in §3.3** — carried back from the
+timestamps/scheduler design running in parallel, so the apply signature is
+rewritten once, not twice)
 **Status:** approved design (brainstorm 2026-09-01/02; five sections
 approved in turn; the cut and the version decision approved 2026-09-02;
 Aeron comparison read from source). Next: the implementation plan.
@@ -39,7 +41,8 @@ analog of `app_id`.
 | per-FSM version | `const VERSION: u32` (packed semver) beside `NAME`; attach-written to the cnc slot, carried per row on `SNAP_BEGIN`, equality-checked and exported; compatibility semantics stay with backlog item 3 | §7 |
 | what is keyed by name | refusals, `uc2ctl status`, metric labels, log records. **Disk and rings stay keyed by row** | §4.4, §4.5 |
 | client | `fsm("orders") -> u8` convenience; the row-taking API stays | §6 |
-| first consumer | `uc_service::ids::IdGen` — deterministic, stateless, placement-independent IDs from `(position, identity, ordinal-within-apply)` | §3.4 |
+| apply signature | `apply(&mut self, ctx: &ApplyCtx, cmd, out)` — `ApplyCtx { position }` now; the parallel time/scheduler design adds its fields later without touching the signature again | §3.3 |
+| first consumer | `uc_service::ids::IdGen` via `ctx.ids()` — deterministic, stateless, placement-independent IDs from `(position, identity, ordinal-within-apply)`; unreachable from `query` by construction | §3.4 |
 | flag day | one combined: cnc 3.0 → 3.1 and wire 0.6.0 → 0.7.0 | §4.2, §5 |
 | deliberately not done | placement-independent rows (hash-routed artifacts, name-keyed disk, client handles, a named default) | §2.1, §11 |
 
@@ -183,6 +186,24 @@ the provided const below, not a runtime refusal.
 ### 3.3 Trait change
 
 ```rust
+/// Everything the framework knows about the committed frame being applied.
+/// Built by the apply loop (and by journal replay / snapshot tail-replay)
+/// once per frame; a state machine never constructs one on the live path.
+/// `#[non_exhaustive]`: the timestamps/scheduler design adds `time_ns`,
+/// `term` and schedule/cancel here without changing `apply`'s signature.
+#[non_exhaustive]
+pub struct ApplyCtx {
+    /// The frame's absolute byte position (the idempotency key).
+    pub position: u64,
+    identity: FsmIdentity,
+}
+impl ApplyCtx {
+    /// For a state machine's own unit tests: `ApplyCtx::new(pos, MySm::IDENTITY)`.
+    pub fn new(position: u64, identity: FsmIdentity) -> Self { Self { position, identity } }
+    /// The deterministic ID generator for THIS apply call (§3.4).
+    pub fn ids(&self) -> IdGen { IdGen::new(self.position, self.identity) }
+}
+
 pub trait RawStateMachine: Send + 'static {
     /// The FSM's identity — the same wherever this type attaches.
     const NAME: &'static str;
@@ -190,21 +211,35 @@ pub trait RawStateMachine: Send + 'static {
     const VERSION: u32 = 0;
     /// Provided; evaluated (and validated) at first use.
     const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION);
-    /// Provided: the deterministic ID generator for one apply call.
-    fn ids(position: u64) -> IdGen { IdGen::new(position, Self::IDENTITY) }
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>);
+    fn apply(&mut self, ctx: &ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);
     fn query(&self, q: &[u8], out: &mut Vec<u8>);
     fn last_applied(&self) -> Option<u64>;
 }
 ```
 
-The typed `StateMachine` gets the same `NAME` (required) and `VERSION`
-(provided) and `ids()`; the blanket impl forwards both consts. `Sessioned<S>`
-forwards `S::NAME` and `S::VERSION`. No `dyn` use of either trait exists in
-the tree (checked 2026-09-02), so associated consts are safe. Every state
-machine in the tree (≈ 24 impls: `uc_lincheck`'s `RegisterSm`/`ListAppendSm`,
-the counter example, the gate examples, the test SMs) gains one line,
-mechanically.
+**Why a context, and why now.** The parallel timestamps/scheduler design
+(leader-stamped `time_ns`, term, schedule/cancel — its own spec and wire
+release, nothing here depends on it) needs the same signature change one
+release later. This plan already rewrites every `apply` impl, so the
+context lands here and that work adds fields to a `#[non_exhaustive]`
+struct instead of breaking the trait a second time. Two benefits inside
+this spec: §3.4's "build the generator from the position given to you" is
+*enforced* — there is no other position to pass — and "never call it from
+`query`" gets a type-level backstop, since `query` receives no context.
+The context carries the identity **by value** (`FsmIdentity` is `Copy`,
+three words) so `ctx.ids()` needs no turbofish; the apply loop builds it
+from `S::IDENTITY`.
+
+The typed `StateMachine` mirrors it: `apply(&mut self, ctx: &ApplyCtx,
+cmd: Self::Command) -> Self::Response`, `NAME` required, `VERSION`
+provided; the blanket impl forwards both consts and passes `ctx` through.
+`Sessioned<S>` forwards `S::NAME` and `S::VERSION` and passes `ctx` to the
+inner apply unchanged (it reads `ctx.position` where it read `position`).
+No `dyn` use of either trait exists in the tree (checked 2026-09-02), so
+associated consts are safe. Every state machine in the tree (≈ 24 impls:
+`uc_lincheck`'s `RegisterSm`/`ListAppendSm`, the counter example, the gate
+examples, the test SMs) gains one `NAME` line and swaps `position: u64`
+for `ctx: &ApplyCtx` (reading `ctx.position`), mechanically.
 
 ### 3.4 `IdGen` — deterministic IDs
 
@@ -212,10 +247,12 @@ mechanically.
 `(position, identity, ordinal: u32)`.
 
 ```rust
-// in apply — built once per call from the position handed to you
-let mut ids = Self::ids(position);
-let order_id = ids.next();   // u128
-let line_id  = ids.next();   // u128, no visible relation to order_id
+fn apply(&mut self, ctx: &ApplyCtx, cmd: Cmd) -> Resp {
+    let mut ids = ctx.ids();     // one generator per apply call, by construction
+    let order_id = ids.next();   // u128
+    let line_id  = ids.next();   // u128, no visible relation to order_id
+    ...
+}
 ```
 
 **Input (128 bits):** `position: u64 ‖ ordinal: u32 ‖ fold32(identity.hash)`
@@ -242,9 +279,13 @@ placement-independent regardless of §2.1's cut.
 
 **Documented rules (SDK docs + the explainer):**
 
-- Build the generator once per apply from the position given to you. Never
-  call it from `query` — a read has no position that means the same thing
-  on every replica.
+- Build the generator from `ctx` inside apply. Both halves of the old
+  rule are now structural: the only position available is the frame's
+  (via `ctx`), and `query` receives no context, so it cannot mint. A
+  state machine that stashes a `ctx.ids()` generator in `self` and uses
+  it later reintroduces the lifetime-counter divergence above; the docs
+  say so, and `IdGen` is `!Send` so the obvious stash into shared state
+  fails to compile.
 - Under `Sessioned`, a replayed command returns the cached response, so the
   IDs a client sees are stable across retries. Without it, a retry is a new
   position and a new ID — the ordinary at-least-once duplicate, not
@@ -416,9 +457,11 @@ else.
 
 **Decision (2026-09-02):** each state machine declares
 `const VERSION: u32` beside `NAME`, provided with default `0` =
-unversioned, in Aeron's packed `SemanticVersion` layout (`major:8 ‖
-minor:8 ‖ patch:16`) so a future validator can do major-equality without
-a re-encoding. The maintainer asked for a per-FSM designator (UC's FSMs are
+unversioned, packed `major:8 ‖ minor:8 ‖ patch:16` — UC's own
+`ProtocolVersion` layout (Aeron's `SemanticVersion` is 8/8/8; both put the
+major in the high bits, so the packed integer compares in semver order) —
+so a future validator can do major-equality or a floor without a
+re-encoding. The maintainer asked for a per-FSM designator (UC's FSMs are
 separate binaries, deployed separately), so this is **per FSM**, not
 per-application as Aeron's is.
 
@@ -478,7 +521,11 @@ which fix each one was reverted against):
 - `uc_service`: `IdGen` golden vectors; inverse round trip proving the
   permutation is a bijection (sampled + an exhaustive small-domain case);
   disjoint series for two identities; `VERSION` not an input; `Sessioned`
-  forwards `NAME`/`VERSION`; the unknown-name attach refusal; attach writes
+  forwards `NAME`/`VERSION` and passes `ctx` through unchanged (its own
+  `max_pos_seen` still advances from `ctx.position`); the apply loop,
+  journal replay and snapshot tail-replay each build `ApplyCtx` with the
+  frame's position (one assertion per path); the unknown-name attach
+  refusal; attach writes
   hash + version; the raw-contract and session suites updated for `NAME`.
 - `uc_node`: every `[services]` refusal by field name (`ids` and the
   missing section included); boot writes names before publish; positional
@@ -536,8 +583,10 @@ number.
   replicas *intend* to be the same FSM at the same logic; they do not
   verify it. That is the user's determinism obligation, stated in the
   explainer.
-- Leader-stamped timestamps in the frame (the input a Snowflake-style ID
-  would need) — a frame-header flag day with no requester.
+- Leader-stamped timestamps and a deterministic scheduler are being
+  designed separately and will follow as their own wire release; nothing
+  here depends on them. They add fields to `ApplyCtx` (§3.3), not a new
+  signature. (A Snowflake-style ID would take its time input from there.)
 - Stage-2 multi-log (M14 spec §10) — unaffected; a name is per log.
 
 ## 12. Implementation order (for the plan)
@@ -545,9 +594,10 @@ number.
 1. `uc_protocol`: `identity` module (rules, FNV, packed semver,
    `FsmIdentity`), cnc 3.1 offsets + `uc_log` pins, `SnapBeginBody` 0.7.0 +
    fuzz target.
-2. `uc_service`: trait `NAME`/`VERSION`/`IDENTITY`/`ids()`, `IdGen` (frozen +
-   golden), attach-by-name writing hash + version, `Sessioned` forwarding,
-   all in-tree SM impls.
+2. `uc_service`: `ApplyCtx` + trait `NAME`/`VERSION`/`IDENTITY`, `IdGen`
+   (frozen + golden) via `ctx.ids()`, the three ctx-building call sites
+   (apply loop, replay, tail-replay), attach-by-name writing hash +
+   version, `Sessioned` forwarding, all in-tree SM impls.
 3. `uc_node`: `ServicesConfig` by name (section required), boot writes,
    positional snapshot-path check + version check, metrics + alert rule,
    `uc2ctl`.
