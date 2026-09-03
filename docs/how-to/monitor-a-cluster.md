@@ -76,6 +76,7 @@ joiner not converging?", and they split it cleanly between the two ends:
 | `uc2_snapshot_open_failed_total` | leader | this node could not open an artifact its own snapshot store had just listed, so it refused to ship the set. A one-off is a purge racing a session; a persistent count means look at *this* node's snapshot directory while a peer is trying to join. |
 | `uc2_snapshot_begin_undecodable_total` | joiner | one refused session per count, because the sender's `SNAP_BEGIN` could not be decoded at all — the realistic wire-0.5.0 flag-day shape. Nonzero means the fleet is mixed-version; upgrade every node together. |
 | `uc2_snapshot_refused_legacy_peer_total` | joiner | every such datagram, not every session — the leader re-sends a `SNAP_BEGIN` every 20 ms, so this one measures the resend cadence. Read the row above it for "how many sessions". |
+| `uc2_snapshot_table_stray_total` (`2.11.0`) | joiner | **episodes** of stray `SNAP_TABLE` — the schedule table a snapshot session carries (kind 21) arriving for no session this node is receiving: a refused or unknown session (no intake open), a different peer, or a different session id. Latched once per episode, not per datagram, because the leader re-sends `BEGIN`+`TABLE` every 20 ms for its 30 s session timeout; an expected re-send for an intake that already has one, or for the session just completed, is not counted at all. Nonzero usually means this node **refused** the session — read it beside `uc2_snapshot_refused_declared_set_total` / `_version_total` / `_legacy_peer_total`, which name why. Otherwise a leader and this node disagree about which session is live, or a datagram is being injected. |
 
 Two families worth calling out because their shape is easy to misread:
 `uc2_ingress_holes_skipped_total` and `uc2_query_holes_skipped_total`
@@ -212,26 +213,32 @@ consensus pass, or the leader's passes are being delayed.
 `count(count_values("p", uc2_schedule_table_position)) > 1`. Every node adopts
 the table from the same log at the same position, so more than one distinct
 value across the fleet means one node is not running the schedule the others
-are. The common cause is a node that joined **below the purge floor**: the
-table is not carried in the snapshot stream, so a joiner whose table frame was
-purged holds position `0` while everyone else holds the adopted position. The
-rarer ones are a node that crashed in the sub-millisecond window between the
+are. Two causes. A node that crashed in the sub-millisecond window between the
 archive recording the frame and the consensus agent persisting
-`state/schedules.state`, and a node that was **wiped** (truncated to 0 with no
+`state/schedules.state`; or a node that was **wiped** (truncated to 0 with no
 common prefix): a wipe deliberately **keeps** the table armed but zeroes its
-position, by the same rule `ConfigRecord` uses, because the table is not in the
-snapshot stream and dropping it would leave the node ticking nothing while its
-peers tick on. So `uc2_schedule_entries > 0` with
-`uc2_schedule_table_position == 0` is the wipe signature, and
-`schedule_table_reverted` with `position=0` is the record that names it. All
-three have the same remedy — re-run `uc2ctl schedule apply`, which appends a
-fresh frame every node adopts.
+position, by the same rule `ConfigRecord` uses, because dropping it would leave
+the node ticking nothing while its peers tick on. So `uc2_schedule_entries > 0`
+with `uc2_schedule_table_position == 0` is the wipe signature, and
+`schedule_table_reverted` with `position=0` is the record that names it. Both
+have the same remedy — re-run `uc2ctl schedule apply`, which appends a fresh
+frame every node adopts.
+
+A **below-floor join is no longer a cause.** Since `2.11.0` the snapshot
+session carries the table (`SNAP_TABLE`, kind 21, sent after every
+`SNAP_BEGIN`), and the joiner installs it by fiat before its floor advances —
+so it holds the cluster's table before it can serve a read or win an election.
+That matters cluster-wide rather than per node: only the leader appends timer
+frames, so a leader holding no table would stop every scheduled recurrence on
+every node. A fresh joiner still at `0` with no entries means the leader had no
+table to give, or it had been restarted and its commit counter was not yet
+primed when it shipped; re-apply either way.
 
 **Five records** go with them — one at info, four at warn:
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
-| `schedule_table_adopted` | info | `node`, `position`, `entries` | this node adopted a table at `position` and armed `entries` of it. Emitted on **every** adoption: the leader's at append, a follower's off the archive walk, and the one a node makes at boot from its own `state/schedules.state`. Nothing to do — this is the healthy signal |
+| `schedule_table_adopted` | info | `node`, `position`, `entries`, `source` | this node adopted a table at `position` and armed `entries` of it. Emitted on **every** adoption, and `source` names which: `"log"` (the leader's at append, or a follower's off the archive walk), `"boot"` (the one a node makes from its own `state/schedules.state`) or `"snapshot"` (the table a snapshot session carried, installed by fiat at the floor — how a below-floor joiner gets it). Nothing to do — this is the healthy signal |
 | `schedule_apply_refused` | warn | `node`, `reason` | an `uc2ctl schedule apply` was refused; `reason` is the same 40–43 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). Read the code, fix the file or re-run against the leader. Retries (a follower's, or the leader's single-in-flight one) are **not** refusals and do not appear here |
 | `schedule_table_reverted` | warn | `node`, `position`, `entries`, `to` | this node's log was truncated to `to` (a reconciliation cut, or the leader-open collapse) and its schedule record was reverted below it: `position` is what is in effect now, `entries` what is armed. Expected right after a leader change that cut uncommitted bytes. **`position=0` is the one to look at**: this node now has no adopted position, so `Uc2ScheduleTableDiverged` will light. Re-apply the table if it does not clear |
 | `schedule_record_unreadable` | warn | `node`, `err`, and `position` when the bytes decoded far enough to have one | the boot-time load of `state/schedules.state` failed — the file could not be read, or its bytes will not decode. The node boots **without a table rather than refusing to start**: the record is a node-local cache, and stranding the node would be worse. It arms nothing until it observes the next table frame, so re-apply if the cluster is quiet |
@@ -411,7 +418,7 @@ flooding.
 | `serving_changed` | `node`, `term`, `can_serve` | edge-triggered on the `CAN_SERVE` cnc flag flipping — fires once per transition, not once per cycle |
 | `log_truncated` | `node`, `epoch`, `to` | the log was cut back to position `to` as part of reconciliation epoch `epoch` |
 | `log_wiped` | `node` | a stronger case of the above: no common prefix with the leader, so the node truncated to 0 and will rejoin from the snapshot floor (`wipes_total` also increments) |
-| `snapshot_installed` | `node`, `pos` | the incoming-snapshot floor advanced to `pos`. **This fires whenever the floor marker moves, including the sub-case where the node already held the bytes and only the marker advanced** — it means "this node adopted a snapshot floor," not necessarily "a snapshot transfer happened." Don't read it as proof of a wire transfer. |
+| `snapshot_installed` | `node`, `pos`, `table_position` | the incoming-snapshot floor advanced to `pos`. **This fires whenever the floor marker moves, including the sub-case where the node already held the bytes and only the marker advanced** — it means "this node adopted a snapshot floor," not necessarily "a snapshot transfer happened." Don't read it as proof of a wire transfer. `table_position` (`2.11.0`) is the schedule-table position this node holds once the install is done: the carried table's on the fiat path a below-floor joiner takes, and this node's own, unchanged, on the mid-life path that adopts nothing. |
 | `config_adopted` | `node`, `position`, `version`, `prev_position` | a new `ClusterConfig` (version `version`) was adopted at `position`, superseding the one at `prev_position` |
 | `halt_removed` | `node`, `term`, `msg` | this node is not a member of the just-adopted config and has fail-stopped (parked permanently; the process keeps running but never serves again) |
 | `stepdown_removed` | `node`, `term`, `msg` | this node's own self-removal just committed while it was leader; it fail-stopped the same way as `halt_removed` |

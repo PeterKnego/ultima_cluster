@@ -81,8 +81,10 @@ verify rather than a build:
   not. `uc2_schedule_entries` counts the adopted entries (a parked `once`
   included, unlike `uc2_timers_pending`), and
   `uc2_schedule_apply_refused_total` counts refused applies. Five records:
-  `schedule_table_adopted` (info, on every adoption — leader at append,
-  follower off the archive walk, and each node's own boot load) plus four at
+  `schedule_table_adopted` (info, on every adoption, with `source` naming the
+  path — `"log"` for the leader at append and a follower off the archive walk,
+  `"boot"` for a node's own durable load, `"snapshot"` for the table a
+  snapshot session carried) plus four at
   warn — `schedule_apply_refused` (with the 40–43 reason code),
   `schedule_table_reverted` (a truncation or the leader-open collapse cut the
   adopted frame and the record fell back to `position`; expected after a leader
@@ -92,12 +94,22 @@ verify rather than a build:
   table frame) and `schedule_staged_file_kept` (the append succeeded but
   `schedules.pending` could not be deleted; remove it by hand). **A node
   reading position `0` while its peers read a nonzero one is not running their
-  table's position** — it joined below the purge floor (the table is not in the
-  snapshot stream), it crashed in the narrow window between recording the frame
-  and persisting it, or it was wiped (a wipe deliberately **keeps** the table
-  armed and zeroes only the position, so `uc2_schedule_entries > 0` alongside
-  it is the wipe signature). The remedy for all three is the same: re-run
-  `uc2ctl schedule apply`.
+  table's position** — it crashed in the narrow window between recording the
+  frame and persisting it, or it was wiped (a wipe deliberately **keeps** the
+  table armed and zeroes only the position, so `uc2_schedule_entries > 0`
+  alongside it is the wipe signature). The remedy for both is the same: re-run
+  `uc2ctl schedule apply`. **A below-floor join is no longer one of the
+  causes**: since `2.11.0` the snapshot session carries the table
+  (`SNAP_TABLE`, kind 21, after every `SNAP_BEGIN`), so a joiner under purge
+  installs the leader's table by fiat before its floor moves — before it can
+  serve a read or win an election. Its adoption logs as
+  `schedule_table_adopted` with `source="snapshot"`, and the
+  `snapshot_installed` record's `table_position` field is the schedule
+  position that node holds once the install is done (the carried table's on
+  the fiat path, and unchanged on the mid-life path that adopts nothing). If a
+  fresh joiner still reads `0` with no entries, the leader had no table to
+  ship, or it was restarted and had not yet seen a commit advance when it
+  shipped — re-apply.
 
 ## Changing a running cluster
 

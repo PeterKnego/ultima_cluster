@@ -23,7 +23,9 @@ for a per-row identity-hash array plus a per-row version array. Log time and
 timers: the log frame header was **relaid** to carry a leader-written
 `time_ns` stamp, with a `TIMER` (5) frame type beside it. The replicated
 schedule table, built on that: a second new frame type, `SCHEDULE_TABLE`
-(6). Every other datagram is byte-identical to 0.6.0. `CURRENT` is
+(6), and one new datagram kind, `SNAP_TABLE` (21), which carries that table
+on a snapshot session so a below-floor joiner gets it too. Every other
+datagram is byte-identical to 0.6.0. `CURRENT` is
 documentary and is not itself checked on any receive path (see
 `version.rs`); the two version lines remain independent of each other.
 
@@ -68,6 +70,11 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 13 | `SNAP_CHUNK` | pairwise |
 | 14 | `SNAP_NAK` | pairwise |
 | 15 | `SNAP_DONE` | pairwise |
+| 21 | `SNAP_TABLE` | pairwise |
+
+`SNAP_TABLE` belongs to this group but takes kind **21**, not 16: the
+administration and crypto-handshake kinds below already own 16–20, and a
+kind byte is never reused.
 
 #### `SNAP_BEGIN` body (wire 0.7.0, FSM identity)
 
@@ -105,6 +112,46 @@ drops it by the same length check that drops a 0.5.0 body today — the
 standing flag-day rule: a mixed cluster stalls a joiner rather than
 installing a wrong or half-checked artifact. Artifacts still route by row,
 unchanged.
+
+#### `SNAP_TABLE` body (wire 0.7.0)
+
+`SNAP_TABLE` carries the leader's adopted **replicated schedule table** to a
+joiner that is below the purge floor and therefore cannot read the table's own
+log frame. The leader sends it **immediately after every `SNAP_BEGIN` of a
+session** — the initial one and each resend on the `SNAP_BEGIN_RESEND_NS`
+(20 ms) cadence — so it needs no reliability machinery of its own: the same
+resend that repairs a lost `BEGIN` repairs a lost `TABLE`.
+`SNAP_TABLE_FIXED_LEN = 22`, followed by the encoded table.
+
+| bytes | field | width | meaning |
+|---|---|---|---|
+| 0..4 | `session` | u32 | session id; must match the intake's, or the datagram is a stray |
+| 4..12 | `position` | u64 | the adopted table frame's END position on the leader; `0` = the leader has no table |
+| 12..20 | `time_ns` | u64 | the adopting frame's log-time stamp, recorded on the joiner's record for diagnostics — **not** what the joiner arms from |
+| 20..22 | `table_len` | u16 | length of the encoded table |
+| 22.. | `table` | variable | `uc_protocol::v2::schedule::encode_schedule_table` bytes (a full 32-entry table is 1064 B) |
+
+`read_snap_table_body` is **total** on any input and does not decode the
+table itself (the node does, fail-stop, exactly as it does for a `CONFIG`
+frame body). It enforces `(position == 0) ⇔ (table_len == 0)`, so "the leader
+has none" has exactly one encoding on the wire, and a ceiling of
+`SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES × SCHEDULE_ENTRY_LEN`. A full
+table is `22 + 1064 = 1086 B` total, pinned below the crypto-on datagram
+budget by a `const` assert beside the constant.
+
+The receiver records the table on the session's intake, **withholds
+`SNAP_DONE` until it has one**, ignores expected re-sends, and counts a
+genuine stray (a refused or unknown session, a different peer, or a different
+session id) once per episode in `uc2_snapshot_table_stray_total`. On
+completion it publishes table → config → floor signal, in that order, so the
+consensus agent installs the table before the floor moves. The install is by
+**fiat** — a wholesale replace with `prev = None`, like the carried config —
+because below the floor the joiner's own bytes are gone. Position `0` with an
+empty table installs "no table" as a record rather than leaving the joiner's
+stale one. A `0.6.0` peer sends no `SNAP_TABLE` at all, but withholding
+`SNAP_DONE` is not how that is caught: its `SNAP_BEGIN` is already refused by
+the `layout` check above, so the flag-day rule still bites at the same place
+it did before.
 
 ### Administration
 

@@ -191,21 +191,28 @@ groups:
     # count how many distinct ones exist. More than one is divergence.
     #
     # A node reading 0 while its peers read a nonzero position is not
-    # holding their table's position. Three causes, one remedy:
-    #   * it joined BELOW THE PURGE FLOOR — the table is not carried in the
-    #     snapshot stream, so a joiner whose table frame was purged has
-    #     adopted nothing and holds position 0 with NO entries armed;
+    # holding their table's position. Two causes, one remedy:
     #   * it crashed in the sub-millisecond window between the archive
     #     recording the frame and the consensus agent persisting
     #     state/schedules.state (there is no journal re-scan for type-6
     #     frames);
     #   * it was WIPED (truncated to 0, no common prefix). A wipe
     #     deliberately KEEPS the table armed and zeroes only the position —
-    #     the same rule ConfigRecord uses — because the table is not in the
-    #     snapshot stream and dropping it would leave this node ticking
-    #     nothing while its peers tick on. So position 0 WITH
-    #     uc2_schedule_entries > 0 on the same node is the wipe signature,
-    #     and the `schedule_table_reverted` record with position=0 names it.
+    #     the same rule ConfigRecord uses — because dropping it would leave
+    #     this node ticking nothing while its peers tick on. So position 0
+    #     WITH uc2_schedule_entries > 0 on the same node is the wipe
+    #     signature, and the `schedule_table_reverted` record with
+    #     position=0 names it.
+    #
+    # A BELOW-FLOOR JOIN IS NO LONGER A CAUSE. Plan 3 (2.11.0) puts the
+    # table on the snapshot session — a SNAP_TABLE datagram (kind 21) after
+    # every SNAP_BEGIN — and the joiner installs it BY FIAT before its floor
+    # advances, so it holds the cluster's table before it can serve a read or
+    # win an election. Its adoption logs as schedule_table_adopted with
+    # source="snapshot". A fresh joiner still at 0 with no entries means the
+    # leader had no table to ship, or the leader had been restarted and its
+    # commit counter was not yet primed when it shipped (a restarted node
+    # under-ships until its first commit advance) — re-apply either way.
     # This is a cluster-wide risk, not one node's: only the LEADER appends
     # timer frames, so if the node holding no table wins an election, every
     # scheduled recurrence in the cluster stops — every FSM on every node —
@@ -217,4 +224,4 @@ groups:
     expr: count(count_values("p", uc2_schedule_table_position)) > 1
     for: 60s
     labels: { severity: warning }
-    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 has not adopted this table: with uc2_schedule_entries > 0 on that same node it was wiped (table kept, position zeroed), with 0 entries it joined below the purge floor or crashed before persisting. Only the leader appends timer frames, so if the node at 0 wins an election EVERY scheduled recurrence in the cluster stops; re-run `uc2ctl schedule apply` either way" }
+    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 has not adopted this table: with uc2_schedule_entries > 0 on that same node it was wiped (table kept, position zeroed), with 0 entries it crashed between recording the table frame and persisting it (a below-floor join is NOT a cause since 2.11.0 — the snapshot session carries the table). Only the leader appends timer frames, so if the node at 0 wins an election EVERY scheduled recurrence in the cluster stops; re-run `uc2ctl schedule apply` either way" }

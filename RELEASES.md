@@ -107,7 +107,14 @@ schedule table an operator applies with one command.
   anchor, `at "02:00"` (daily, UTC), or `once` at a fixed instant. The leader
   appends the table as a log frame; every other node adopts it from the same
   archive walk that adopts a config change, so there is no per-host file and no
-  per-host drift to detect. Ticks arrive at the FSM's existing `on_timer` with
+  per-host drift to detect. A node that joins **below the purge floor** — where
+  the table's own frame is already gone — gets the table on the snapshot
+  session instead (a `SNAP_TABLE` datagram after every `SNAP_BEGIN`), installed
+  before its floor advances, so it holds the cluster's schedule before it can
+  serve a read or win an election. That matters cluster-wide rather than per
+  node: only the leader appends timer frames, so a leader running no table
+  would stop every recurrence everywhere.
+  Ticks arrive at the FSM's existing `on_timer` with
   `ev.table` set. Two behaviours are worth knowing before you use it: applying
   **replaces** the whole table (to drop an entry, apply a file without it), and
   a cluster that was down past several occurrences of a rule fires **one**
@@ -122,6 +129,7 @@ schedule table an operator applies with one command.
   they are running.
   → [Log time and timers, explained § The schedule table](docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table) ·
   [`uc2ctl` § `schedule apply`](docs/reference/uc2ctl.md#schedule-apply) ·
+  [Wire protocol § `SNAP_TABLE` body](docs/reference/wire-protocol.md#snap_table-body-wire-070) ·
   [UC v2 operations § Changing a running cluster](docs/ops/uc2-runbook.md#changing-a-running-cluster)
 
 **Removed (breaking)**

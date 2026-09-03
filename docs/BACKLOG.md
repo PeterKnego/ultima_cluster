@@ -146,16 +146,64 @@ the one-tick catch-up moved from arm time to fire time; single-in-flight apply
 plus `ScheduleRecord.prev` and revert-on-truncation; and `once` as a third
 rule kind that parks rather than leaving the table.
 
+**Plan 3, the schedule table on the snapshot session, is IMPLEMENTED too** —
+same branch, same unreleased `2.11.0` flag day. Plan:
+`docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md` (T0–T5,
+all done), against the same spec §5's as-built errata. What shipped:
+`DGRAM_KIND_SNAP_TABLE = 21` with a total, fuzzed codec (body `session ‖
+position ‖ time_ns ‖ table_len ‖ table`, ≤ 1086 B, `position == 0` iff the
+table is empty); the leader sending it after **every** `SNAP_BEGIN` of a
+session, gated on its own commit counter; a receiver that withholds
+`SNAP_DONE` until the table arrives, drops strays
+(`uc2_snapshot_table_stray_total`, latched per episode) and publishes
+table → config → floor; a fiat install (`Consensus::install_snapshot_table`,
+`prev: None`) that runs before the floor advances; `schedule_table_adopted`
+gaining a `source` field and `snapshot_installed` a `table_position`. It
+closes the first bullet below and adds the two after it.
+
 **What is left under this feature** — each documented in
 `docs/reference/limits.md` and the explainer's "Known limits of the table",
 none a blocker, none scheduled:
 
-- **The table is not carried in the snapshot stream.** With purge ON, a node
-  that joins below the floor and whose table frame was purged runs with no
-  table until the next `uc2ctl schedule apply`; its
-  `uc2_schedule_table_position` sits at 0 and `Uc2ScheduleTableDiverged`
-  fires. Closing it means putting the table in `SNAP_BEGIN` or in the artifact,
-  which is a wire change and therefore a flag day — not worth one on its own.
+- ~~**The table is not carried in the snapshot stream.**~~ — CLOSED
+  2026-09-03 by plan 3,
+  `docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md`
+  (spec §5's as-built errata). The judgement that closing it needed a wire
+  change was right; what changed is that `2.11.0` was already an unreleased
+  flag day, so the change cost nothing extra. It is a new datagram kind
+  rather than a `SNAP_BEGIN` field: `SNAP_TABLE` (21, ≤ 1086 B) sent after
+  **every** `SNAP_BEGIN` of a session, withheld `SNAP_DONE` until it arrives,
+  installed by fiat before the floor advances — so a below-floor joiner holds
+  the cluster's table before it can serve a read or win an election.
+- **A restarted node under-ships the table for one window** (plan 3 residual
+  a). The cnc commit counter is not primed at boot, so `shippable_schedule`'s
+  commit gate cannot yet clear the node's own record: it offers the one-level
+  `prev`, or nothing, until the first commit advance. That is the safe
+  direction — no uncommitted table is ever handed on — but a joiner served
+  inside that window can end up with an older table, or none until the next
+  `uc2ctl schedule apply`, if the frame is below the shipper's own floor.
+  Priming the counter at boot, or seeding the gate from the durable record,
+  would close it.
+- **A position-`0` record with a non-empty body is shipped verbatim, and the
+  wire refuses it** (plan 3 residual b, sharpened into a defect by Task 5's
+  review on 2026-09-03 — **open, not benign**). Three states leave a node's
+  schedule record at position `0` with a NON-empty `table`: a wipe
+  (`revert_schedule_below(0)` keeps the table by design and zeroes only the
+  position); a revert with no usable predecessor (`ScheduleRecord::empty()`,
+  whose `table` is the canonical **8-byte** encoding of an empty table, not a
+  zero-length `Vec`); and a fiat install of "no table" off a snapshot session,
+  which canonicalises the same way and additionally sets `known_committed`.
+  `shippable_schedule` passes such a record through unchanged — position `0`
+  is `<=` any commit counter — and `send_snap_table` writes it verbatim, but
+  `read_snap_table_body` enforces `(position == 0)` ⇔ `(table_len == 0)` and
+  returns `None`. The receiver therefore drops the datagram and, because it
+  withholds `SNAP_DONE` until a table lands, **never completes that session**:
+  the joiner stalls until the shipper adopts a fresh table. The fix is one
+  normalisation at the ship seam — position `0` ships `(0, 0, [])` — and the
+  existing `a_leader_without_a_table_ships_none_and_the_joiner_installs_none`
+  does not catch it, because it exercises the `rec: None` shape, which is the
+  one that already encodes correctly; the uncaught shape is the *joiner* from
+  that very test being the next session's source.
 - **One crash window loses one adoption.** A node that dies between the
   archive recording a table frame and the consensus agent persisting
   `state/schedules.state` comes back without it: there is no journal re-scan

@@ -75,16 +75,21 @@ tag cut, no fleet gate run — see the "Standing facts" entry below and
 
 Also on that branch and in the same `2.11.0` flag day: **time and timers**
 (spec `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`),
-**both plans IMPLEMENTED** — plan 1
+**all three plans IMPLEMENTED** — plan 1
 (`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md`, T0–T14),
-leader-stamped log time and a deterministic scheduler, and plan 2
+leader-stamped log time and a deterministic scheduler; plan 2
 (`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md`, T0–T8), the
 **replicated schedule table** (spec §5): `FRAME_TYPE_SCHEDULE_TABLE = 6`,
 `uc2ctl schedule apply/show`, adoption through the archive walk, and table
-ticks that fire through the same heap and the same `TIMER` frame. Requested by
+ticks that fire through the same heap and the same `TIMER` frame; and plan 3
+(`docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md`, T0–T5,
+spec §5 errata), which puts that table on the **snapshot session**
+(`SNAP_TABLE`, datagram kind 21) so a below-floor joiner installs it before it
+can serve or lead — the one limitation plan 2 shipped with, closed on the same
+flag day. Requested by
 the maintainer 2026-09-02, not a ranked backlog item; still release-on-hold.
-Explainer `docs/notes/uc2-log-time-and-timers-explained.md` (plan 2 is its
-"The schedule table" section); gate skeleton
+Explainer `docs/notes/uc2-log-time-and-timers-explained.md` (plans 2 and 3
+are its "The schedule table" section); gate skeleton
 `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars pre-committed,
 no run; row d is an isolated `apply_bench` A/B, because unlike identity this
 work does touch two hot loops, and row e runs a full 32-entry table under the
@@ -213,11 +218,20 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     downtime, never a backlog. `Timed<S>` dedups on `table_last`. Metrics
     `uc2_schedule_table_position` / `uc2_schedule_entries` /
     `uc2_schedule_apply_refused_total`, alert `Uc2ScheduleTableDiverged`.
-    **Documented limits**: not carried in the snapshot stream (a below-floor
-    joiner runs without it until the next apply), lost by a crash in the
+    The table also **rides the snapshot session** (plan 3): `SNAP_TABLE`
+    (datagram kind 21, ≤ 1086 B) after every `SNAP_BEGIN`, no `SNAP_DONE`
+    until it arrives, installed by fiat before the floor advances — so a
+    below-floor joiner holds the cluster's table before it can serve or lead;
+    the leader ships only a committed record, and `schedule_table_adopted`
+    gained `source` (`log`/`boot`/`snapshot`).
+    **Documented limits**: lost by a crash in the
     sub-millisecond window between archive record and persist (no journal
     re-scan for type-6 frames), one possible duplicate tick per entry after a
-    restart (`Timed` drops it), no timezones and no cron.
+    restart (`Timed` drops it), no timezones and no cron; plus plan 3's two
+    ship-side windows (a restarted node under-ships until its first commit
+    advance; and an OPEN defect — a record at position `0` with a non-empty
+    body is shipped verbatim and the wire refuses it, stalling that session,
+    `docs/BACKLOG.md` § 2a residual b).
   - **The relayout is the sharper half of this flag day.** Every prior wire
     bump was caught by a length check, so a mixed cluster stalled. A relaid
     header is the *same length*: a `0.6.0` peer's frames parse and mean
@@ -225,7 +239,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   - See the "Next up" paragraph above,
     `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`,
     `docs/notes/uc2-log-time-and-timers-explained.md` (its "The schedule
-    table" section for plan 2), and `docs/reference/semver-policy.md`'s
+    table" section for plans 2 and 3), and `docs/reference/semver-policy.md`'s
     FSM-identity carve-out (ships as the next minor, `2.11.0`, not `3.0.0`,
     per the maintainer's decision). One process gap to close before the M10
     gate's row 4 can be re-run: `Uc2LogTimeFrozen` and

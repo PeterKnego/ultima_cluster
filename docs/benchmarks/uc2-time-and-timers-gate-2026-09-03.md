@@ -159,6 +159,20 @@ bound, or delayed passes), plus one of row e's own: an entry armed from a log
 clock that had fallen behind, which the one-tick catch-up should absorb into a
 single late fire rather than a run of them.
 
+**Plan 3 (the schedule table on the snapshot session) leaves row e's rationale
+unchanged — checked 2026-09-03, and recorded here so it is not re-derived.**
+Row e is a steady-state firing row on a live cluster: no purge floor, no
+joiner, no snapshot session, so the `SNAP_TABLE` path is never entered while it
+runs. What plan 3 adds on the paths row e *does* touch is one `Mutex` cache
+refresh per adoption — a table is applied once, at the start of the row, not
+per tick — and one extra clone at `snapshot_set_for`, which a snapshot session
+reaches, not a timer pass. Neither the leader's advance-at-append nor the
+followers' advance-on-`TableConsumed` nor `Timed`'s `table_last` dedup changed.
+The bars stand as committed, and no row is added: a below-floor joiner's table
+install is a correctness claim, adjudicated by
+`a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads` and
+the two `learner.rs` scenarios beside it, not by a rate.
+
 **What would fail this gate, if it ran.** Row a failing would mean the
 per-pass clock read, the ring drain, or the stamp write costs measurable
 throughput, which would be a surprise worth investigating rather than a

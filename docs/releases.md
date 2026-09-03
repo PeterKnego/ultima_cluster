@@ -19,7 +19,13 @@ release was cut, and all three move the wire to `0.7.0` and the cnc page to
 
 Plan 2 was written and executed on the same branch after plan 1 landed, so
 all three features share the `0.7.0` / `3.1` flag day. Plan 2 adds one frame
-type and one admin verb; it changes nothing plan 1 shipped.
+type and one admin verb; it changes nothing plan 1 shipped. A third plan on
+the same branch —
+`docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md` (T0–T5,
+all done), against the same spec's §5 errata — closes the one limitation plan
+2 shipped with, by carrying the table on the snapshot session; it adds one
+datagram kind (`SNAP_TABLE`, 21) to the same flag day and is not a fourth
+feature.
 
 ### The problem this closes
 
@@ -314,6 +320,30 @@ plain-language section:
   in `backup`'s five-file `STATE_FILES` set — an artifact taken before this
   feature existed must still verify — but the copy is whole-directory, so it
   travels with a backup anyway.
+- **The snapshot session carries the table** (plan 3). Adoption off the log
+  works only for a node that *has* the log, and a joiner below the purge floor
+  does not: the table's own frame may already be gone. So the leader sends a
+  `SNAP_TABLE` datagram (kind 21, body `session ‖ position ‖ time_ns ‖
+  table_len ‖ table`, at most **1086 B**, so always one datagram) right after
+  **every** `SNAP_BEGIN` of a session — the initial one and each 20 ms resend,
+  which is why it needs no reliability of its own. The receiver holds it on the
+  intake, **withholds `SNAP_DONE` until it has one**, and on completion
+  publishes table → config → floor signal, so the consensus agent installs the
+  table *before* the floor advances — before that node can serve a read or win
+  an election, which is what actually matters, since only the leader appends
+  timer frames. The install is **by fiat**: `ScheduleRecord { position,
+  time_ns, table, prev: None }`, a wholesale replace on the same argument the
+  carried config already rests on. The joiner records the leader's `time_ns`
+  but arms from its own log clock. What the leader may ship is gated on
+  **commit** — the newest record at or below its commit counter, else that
+  record's one-level `prev`, else `(0, 0, [])` — so an appended-but-uncommitted
+  table is never handed on; a record that itself arrived by fiat is exempt,
+  having been gated once already by the node that shipped it. Position `0` with
+  an empty table means "the leader has none" (one encoding, enforced by the
+  decoder) and installs as such. `schedule_table_adopted` gained a `source`
+  field (`"log"` / `"boot"` / `"snapshot"`), `snapshot_installed` gained
+  `table_position`, and a table for no open intake is counted once per episode
+  in `uc2_snapshot_table_stray_total`.
 - **Firing: three deliberate differences from a programmatic timer.** Table
   ticks go through the same per-row heap and the same `TIMER` frame, with
   `FLAG_TIMER_TABLE` set and `ev.table` true at the FSM. (1) **The node
@@ -361,7 +391,20 @@ plain-language section:
   table fires (they carry no `Schedule` record, so the programmatic clauses
   skip them) and is exercised by the `two_fsm_timer_churn_under_failover`
   capstone; and the `uc_protocol_schedule_table` fuzz target, taking the tier
-  from 17 to **18**.
+  from 17 to **18**. Plan 3 adds, on the same branch:
+  `uc_node/tests/learner.rs::a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table`
+  and `::a_leader_without_a_table_ships_none_and_the_joiner_installs_none`
+  (real leader + joiner `Node`s over loopback UDP, under purge);
+  `uc_node/tests/timers.rs::a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads`
+  (the capstone: the joiner is promoted, wins, and the table keeps ticking);
+  `uc_net` unit tests `a_snap_table_follows_every_snap_begin_with_the_same_session`,
+  `a_session_does_not_complete_until_its_snap_table_arrives_and_publishes_it_first`
+  and `a_stray_snap_table_is_counted_once_per_episode_not_once_per_resend`;
+  `uc_node` unit tests `a_fiat_snapshot_install_replaces_the_schedule_record_and_arms_it`
+  and `the_snapshot_session_ships_only_a_committed_schedule_table`;
+  `uc_protocol`'s byte-freezing `snap_table_body_pins_bytes_and_is_total`; and
+  two new seeds in the existing `uc_protocol_datagram` target
+  (`15-snap-table`, `16-snap-table-bad-len`) — no new target.
 - **Three execution rulings that amend spec §5**, recorded there as as-built
   errata: the one-tick catch-up moved from arm time to **fire** time (arming
   alone cannot help, because the recovered log clock can be hours behind the
@@ -369,16 +412,26 @@ plain-language section:
   and revert-on-truncation (the spec's record had no `prev`); and `once` as a
   third rule kind that **parks** on firing (the spec had two rules and no park).
 - **Known limits, documented rather than fixed** (also in
-  `docs/reference/limits.md` and `docs/BACKLOG.md` § 2a): the table is not
-  carried in the snapshot stream, so with purge ON a below-floor joiner whose
-  table frame was purged runs without it until the next apply; a node that
+  `docs/reference/limits.md` and `docs/BACKLOG.md` § 2a): a node that
   crashes in the sub-millisecond window between the archive recording a table
   frame and the consensus agent persisting it loses that adoption, there being
   no journal re-scan for type-6 frames; boot arming has no delivered set until
   the service announces, so a restart may re-append the latest occurrence of
   every entry once (a parked `once` included) and `Timed` drops it; and there
   is no timezone and no cron syntax — `at` is UTC, and a cron-shaped rule would
-  be a fourth kind byte.
+  be a fourth kind byte. Plan 3's own two residuals join that list, both about
+  what a *shipper* offers rather than what a joiner does with it: the cnc
+  commit counter is not primed at boot, so a **restarted** node under-ships
+  (its `prev`, or nothing) until its first commit advance — the safe
+  direction, but a joiner served in that window can end up with an older table
+  or none. The second is **an open defect rather than a residual**, found in
+  the writeup's own review: a node whose record sits at position `0` with a
+  non-empty body — a wipe (which keeps the table by design), a revert with no
+  usable predecessor, or a fiat install of "no table", the last two both
+  storing the canonical 8-byte empty encoding — ships that record verbatim,
+  and `read_snap_table_body`'s `(position == 0)` ⇔ empty rule refuses it, so
+  the session it serves never completes. One normalisation at the ship seam
+  closes it; `docs/BACKLOG.md` § 2a residual b carries the detail.
 - **One process gap, not a code one.** `Uc2LogTimeFrozen` (plan 1) and
   `Uc2ScheduleTableDiverged` (plan 2) both ship without a `RULE_BUILDERS` entry
   in `scripts/m10_alert_fire.sh`, whose completeness cross-check therefore

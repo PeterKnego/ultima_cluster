@@ -127,6 +127,13 @@ lockstep accounting is unchanged).
 advances `last_applied` from it exactly as it does in `apply`. That is what
 makes re-entry after a restart idempotent.
 
+Playing the tape is enough only for a replica that *has* the tape. A node
+that joins below the purge floor never sees the frames that were purged, so
+the one thing it cannot learn by playing is the replicated schedule table
+(§ [The schedule table](#the-schedule-table)) — which is why the snapshot
+session hands it over directly, in a `SNAP_TABLE` datagram after every
+`SNAP_BEGIN`, before the joiner can serve or lead.
+
 ### 6. Two safety nets, because a leader can die mid-fire
 
 The node layer promises **at least once**. If a leader appends a `TIMER`
@@ -396,22 +403,61 @@ row will ever fire.
 These are stated because an operator will meet them, not because they are
 about to be fixed.
 
-- **The table is not in the snapshot stream.** With purge on, a node that
-  joins below the floor and whose table frame was purged runs with no table
-  until the next apply. Its `uc2_schedule_table_position` sits at `0` while
-  everyone else's holds the adopted position — which is exactly what
-  `Uc2ScheduleTableDiverged` is for. The remedy is to re-apply, and it is not
-  a remedy you can leave for later: only the leader appends timer frames, so
-  **if that node later wins an election, every scheduled recurrence in the
-  cluster stops** — every FSM on every node, not just the new leader's — until
-  an operator re-applies. That is why the alert is worth having rather than a
-  gauge you glance at. The same
-  absence shapes what a **wipe** does: a node truncated to 0 with no common
-  prefix **keeps** its table armed and zeroes only the position, by the rule
-  `ConfigRecord` already uses, because dropping it would leave that node
-  ticking nothing while its peers tick on. So `uc2_schedule_entries > 0` with
-  `uc2_schedule_table_position == 0` is the wipe signature, and a
-  `schedule_table_reverted` record with `position=0` names it.
+- **The table used to be missing from the snapshot stream. That is closed —
+  here is how.** The limitation was real and it was not one node's problem:
+  only the leader appends timer frames, so a below-floor joiner that had
+  adopted nothing and later won an election stopped **every scheduled
+  recurrence in the cluster** — every FSM on every node — until an operator
+  re-applied. So the table now rides the snapshot session. The leader sends a
+  `SNAP_TABLE` datagram (kind 21) right after **every** `SNAP_BEGIN`, the
+  initial one and each 20 ms resend, which is why it needs no reliability of
+  its own: whatever repairs a lost `BEGIN` repairs a lost `TABLE`. The body is
+  `session ‖ position ‖ time_ns ‖ table_len ‖ table` — at most 1086 bytes, so
+  always one datagram — and its decoder is total, with `position == 0` and an
+  empty table as the single encoding of "the leader has none".
+
+  The receiver holds the table on the session's intake and **will not complete
+  the session without one**: no `SNAP_DONE` until the table has arrived. On
+  completion it publishes the table first, then the config, then the floor
+  signal, so the consensus agent has installed the table *before* the floor
+  moves — before this node can serve a read or win an election. The install is
+  by **fiat**, a wholesale replace with no `prev`, on the same argument the
+  carried config already rests on: below the floor this node's own bytes are
+  gone, so there is nothing to reconcile against and nothing to revert to.
+  The joiner records the leader's `time_ns` for diagnostics but arms from its
+  own log clock, which is the value every replica agrees on. A leader with no
+  table ships position `0`, and the joiner installs "no table" as a record
+  rather than keeping a stale one.
+
+  What the leader may ship is gated on **commit**: the newest record at or
+  below its commit counter, else that record's one-level `prev`, else nothing.
+  A table that is appended but not yet committed is never handed to a joiner,
+  because the shipping leader could still lose it to a truncation. A record
+  that arrived by fiat off another session is exempt from the gate — it was
+  already gated once, by the node that shipped it, and on a catching-up joiner
+  it sits far above the local commit for the whole join.
+
+  Two narrow windows survive, both recorded in `docs/BACKLOG.md` § 2a. The cnc
+  commit counter is not primed at boot, so a **restarted** node under-ships —
+  `prev`, or nothing — until its first commit advance; that is the safe
+  direction, but a joiner served inside that window can end up with an older
+  table, or none until the next apply, if the frame is below the shipper's own
+  floor. The second is **an open defect rather than a residual**, and it is
+  recorded here because an operator can meet it: a node whose own record sits
+  at position `0` with a *non-empty* body ships that record verbatim, and the
+  wire's `(position == 0)` ⇔ empty rule refuses it, so the session that node
+  is serving never completes — the joiner waits, because `SNAP_DONE` is
+  withheld until a table lands. Three states produce such a record: a **wipe**
+  (a node truncated to 0 with no common prefix **keeps** its table armed and
+  zeroes only the position, by the rule `ConfigRecord` already uses, because
+  dropping it would leave that node ticking nothing while its peers tick on);
+  a revert with no usable predecessor; and a fiat install of "no table", the
+  last two both storing the canonical empty *encoding* rather than zero bytes.
+  One normalisation at the ship seam closes it; `docs/BACKLOG.md` § 2a
+  residual b carries the detail. The wipe rule itself is unchanged and still
+  right: `uc2_schedule_entries > 0` with `uc2_schedule_table_position == 0` is
+  the wipe signature, a `schedule_table_reverted` record with `position=0`
+  names it, and `Uc2ScheduleTableDiverged` still catches the disagreement.
 - **A crash in one narrow window loses one adoption.** There is no journal
   re-scan for type-6 frames on the recovery path, so a node that dies between
   the archive recording a table frame and the consensus agent persisting
@@ -515,8 +561,10 @@ Every one of these is a designed-for case, not a bug report.
 - `uc2ctl status` prints `schedule_position=` on the `config:` line;
   `uc2ctl schedule show` prints the adopted table itself.
 - Five more structured records. `schedule_table_adopted` (info) on every
-  adoption, including the one a node makes at boot from its own durable
-  record — the healthy signal. Four at warn:
+  adoption, with a `source` field naming which path it came from — `"log"`
+  (the leader at append, or a follower off the archive walk), `"boot"` (this
+  node's own durable record) or `"snapshot"` (the table a snapshot session
+  carried, installed by fiat at the floor) — the healthy signal. Four at warn:
   `schedule_apply_refused` {`node`, `reason`}, carrying the 40–43 code, so
   read the code and fix the file or re-run against the leader;
   `schedule_table_reverted` {`node`, `position`, `entries`, `to`}, when a
@@ -549,7 +597,9 @@ read from.
 - [`uc2ctl` § `schedule apply`](../reference/uc2ctl.md#schedule-apply) for the
   TOML shape, the refusal reasons, and what `schedule show` prints.
 - [The wire protocol § `SCHEDULE_TABLE` body](../reference/wire-protocol.md#schedule_table-body-wire-070)
-  for the table's frozen byte layout.
+  for the table's frozen byte layout, and
+  [§ `SNAP_TABLE` body](../reference/wire-protocol.md#snap_table-body-wire-070)
+  for how that table reaches a below-floor joiner.
 - [The design spec](../superpowers/specs/2026-09-02-uc2-time-and-timers-design.md)
   for the decisions, the rejected alternatives, and the as-built errata on
   both plans.
