@@ -7,7 +7,7 @@
 //! global deadline order, and `Timed<S>` delivers it to `on_timer` exactly
 //! once on every replica.
 //!
-//! Two tests:
+//! The tests:
 //!
 //! 1. One node: a timer fires once, at its deadline, in pass order (the §4.3
 //!    partition property), a cancelled timer never fires, and the pending
@@ -20,6 +20,13 @@
 //!    is hit, so the pass appends NO client frame and the 100 TIMER frames
 //!    land contiguously. The held clients are answered normally one pass
 //!    later and every fire is on time.
+//! 4. Plan 2 (spec §5), one node: an applied SCHEDULE TABLE ticks its `every`
+//!    entry once per occurrence and advances from the tick, and its `once`
+//!    entry fires once and parks (leaving the cnc pending word at 1).
+//! 5. Plan 2, across a restart: five periods of downtime are caught up by ONE
+//!    tick, at the latest occurrence at or before the leader's clock, and the
+//!    already-delivered `once` is not delivered a second time even though the
+//!    node may re-append it.
 //!
 //! Every instance dir is on the ext4 cargo target volume, never /tmp.
 
@@ -32,9 +39,14 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uc_client::{Client, PipelinedClient, PipelinedConfig};
 use uc_consensus::election::NodeId;
-use uc_log::cnc::CncPage;
+use uc_log::cnc::{AdminReq, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
+use uc_protocol::identity::FsmName;
+use uc_protocol::v2::cnc::ADMIN_OP_SCHEDULE_APPLY;
+use uc_protocol::v2::schedule::{
+    ScheduleEntry, ScheduleRule, ScheduleTable, decode_schedule_table, encode_schedule_table,
+};
 use uc_service::{
     ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, StateMachine, Timed,
     TimerEvent,
@@ -145,6 +157,9 @@ struct Fired {
     deadline_ns: u64,
     time_ns: u64,
     late: bool,
+    /// Plan 2: the fire came from the replicated SCHEDULE TABLE
+    /// (`FLAG_TIMER_TABLE`), not from a `ctx.schedule` this SM asked for.
+    table: bool,
 }
 
 #[derive(Default)]
@@ -188,6 +203,7 @@ impl StateMachine for ClockSm {
             deadline_ns: ev.deadline_ns,
             time_ns: ctx.time_ns,
             late: ev.late(ctx),
+            table: ev.table,
         });
         self.stamps.push((ctx.position, ctx.time_ns, 1));
         self.last = Some(ctx.position);
@@ -649,4 +665,340 @@ fn a_timer_in_flight_at_a_leader_change_fires_late_and_is_delivered_once() {
             n.stop();
         }
     }
+}
+
+// --------------------------------------------- 4. the replicated schedule table
+
+/// The table tests' period. Long enough that a tick lands in its own pass on a
+/// busy box, short enough that five of them fit in a test.
+const TABLE_PERIOD_NS: u64 = 200_000_000;
+
+/// Stage a table in `dir` and drive `ADMIN_OP_SCHEDULE_APPLY` through the cnc
+/// admin band — `uc2ctl schedule apply` minus the bin. Under the default
+/// [`uc_node::AdminPolicy::Filesystem`] the auth line is ignored, so nothing is
+/// signed here; `admin_auth.rs` covers the signed path. Returns the accepted
+/// table's position (the frame END).
+fn apply_schedule_table(dir: &Path, cnc: &CncPage, table: &ScheduleTable) -> u64 {
+    let mut bytes = Vec::new();
+    encode_schedule_table(table, &mut bytes);
+    std::fs::write(dir.join(uc_node::SCHEDULE_PENDING_FILE), &bytes).expect("stage the table");
+    let (id, ip, port) = uc_node::schedule_digest(&bytes);
+    let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+    cnc.write_admin_req(&AdminReq {
+        seq,
+        nonce: rand::random::<u64>(),
+        op: ADMIN_OP_SCHEDULE_APPLY,
+        id,
+        ip,
+        port,
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(resp) = cnc.read_admin_resp(seq) {
+            assert_eq!(
+                resp.status, 0,
+                "schedule apply was not accepted: status {} reason {}",
+                resp.status, resp.reason
+            );
+            return resp.version;
+        }
+        assert!(Instant::now() < deadline, "schedule apply timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Row 0's identity hash — what a table entry names its FSM by.
+fn clock_hash() -> u64 {
+    FsmName::parse(<ClockSm as StateMachine>::NAME)
+        .expect("a valid FSM name")
+        .hash()
+}
+
+/// The two-entry table both tests apply: a repeating `every` and a one-shot
+/// `once` 300 ms out, both on row 0.
+fn two_entry_table(anchor_ns: u64, once_at_ns: u64) -> ScheduleTable {
+    ScheduleTable {
+        entries: vec![
+            ScheduleEntry {
+                identity_hash: clock_hash(),
+                timer_id: 1,
+                rule: ScheduleRule::Every {
+                    period_ns: TABLE_PERIOD_NS,
+                    anchor_ns,
+                },
+            },
+            ScheduleEntry {
+                identity_hash: clock_hash(),
+                timer_id: 2,
+                rule: ScheduleRule::Once { at_ns: once_at_ns },
+            },
+        ],
+    }
+}
+
+/// Plan 2 (spec §5), one node: an applied table ticks its `every` entry once
+/// per occurrence and ADVANCES FROM THE TICK (never from the pass clock, which
+/// would drift), and its `once` entry fires exactly once and then parks — the
+/// parked entry drops out of the cnc pending word while the repeating one
+/// stays.
+///
+/// The FIRST tick is deliberately a catch-up: the anchor is `now` rounded down
+/// to a period boundary, so the entry is already due the moment it is adopted.
+/// It is therefore stamped at the table frame's own clock (the appender clamps
+/// a TIMER frame's stamp up to `last_stamp`) and reads LATE — every tick after
+/// it is stamped exactly at its deadline, which is what "advances from the
+/// tick" means.
+#[test]
+fn a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc = start_service_with(dir.path(), Timed::new(ClockSm::default()));
+    let client = Client::connect(dir.path(), APP).unwrap();
+    let cnc = open_cnc(dir.path());
+
+    // One command to learn the LOG's clock: an anchor in any other clock is a
+    // different rule (the node arms and fires against log time alone).
+    let t0: u64 = client.submit(&Cmd::Nop).unwrap();
+    let anchor = t0 - t0 % TABLE_PERIOD_NS;
+    let once_at = t0 + 300_000_000;
+    let table = two_entry_table(anchor, once_at);
+    let position = apply_schedule_table(dir.path(), &cnc, &table);
+    assert!(position > 0, "an accepted apply reports the frame END");
+
+    wait_until("five ticks of the every entry", || {
+        query(&svc).0.iter().filter(|f| f.id == 1).count() >= 5
+    });
+    wait_until("the once entry fired", || {
+        query(&svc).0.iter().any(|f| f.id == 2)
+    });
+    // The parked `once` must fall out of the pending word; the repeating entry
+    // must not.
+    wait_until("the parked once left the pending word", || {
+        cnc.service_slot(0).identity.timers_pending() == 1
+    });
+
+    let (fired, _) = query(&svc);
+    assert!(
+        fired.iter().all(|f| f.table),
+        "every fire here came from the table: {fired:?}"
+    );
+    let mut seen: Vec<(u64, u64)> = fired.iter().map(|f| (f.id, f.deadline_ns)).collect();
+    let before = seen.len();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        before,
+        "a (id, deadline) fired twice: {fired:?}"
+    );
+
+    let every: Vec<&Fired> = fired.iter().filter(|f| f.id == 1).collect();
+    assert!(every.len() >= 5, "{every:?}");
+    assert_eq!(
+        (every[0].deadline_ns - anchor) % TABLE_PERIOD_NS,
+        0,
+        "the first tick is an occurrence of the rule: {:?}",
+        every[0]
+    );
+    assert!(every[0].time_ns >= every[0].deadline_ns, "{:?}", every[0]);
+    for w in every.windows(2) {
+        assert_eq!(
+            w[1].deadline_ns - w[0].deadline_ns,
+            TABLE_PERIOD_NS,
+            "consecutive ticks are exactly one period apart: {:?} then {:?}",
+            w[0],
+            w[1]
+        );
+        assert!(
+            w[1].position > w[0].position,
+            "ticks arrive in log order: {:?} then {:?}",
+            w[0],
+            w[1]
+        );
+    }
+    // Every tick after the catch-up is stamped AT its deadline: the entry
+    // advanced from the tick that fired, not from the clock that fired it.
+    for f in &every[1..] {
+        assert!(!f.late, "a steady-state tick was late: {f:?}");
+        assert_eq!(f.time_ns, f.deadline_ns, "{f:?}");
+    }
+
+    let once: Vec<&Fired> = fired.iter().filter(|f| f.id == 2).collect();
+    assert_eq!(once.len(), 1, "the once fired exactly once: {once:?}");
+    assert_eq!(once[0].deadline_ns, once_at, "{:?}", once[0]);
+    assert!(
+        !once[0].late,
+        "the once was in the future when applied: {once:?}"
+    );
+
+    // ... and it stays fired-once: give the heap several more periods to
+    // re-offer it before believing the park.
+    std::thread::sleep(Duration::from_millis(600));
+    let (fired, _) = query(&svc);
+    assert_eq!(
+        fired.iter().filter(|f| f.id == 2).count(),
+        1,
+        "a parked once fired again: {fired:?}"
+    );
+
+    // The durable record is what a restart re-arms from (test 5): the table
+    // is on disk, at the position the apply reported, with both entries.
+    let rec = uc_node::read_record(dir.path())
+        .expect("read the record")
+        .expect("a record exists once a table has been adopted");
+    assert_eq!(rec.position, position);
+    assert_eq!(
+        decode_schedule_table(&rec.table).expect("the record holds wire bytes"),
+        table
+    );
+
+    client.shutdown();
+    svc.stop();
+    node.stop();
+}
+
+/// Plan 2 (spec §5), the one-tick catch-up across a restart: a node down for
+/// five periods comes back and fires the `every` entry ONCE, at the latest
+/// occurrence at or before the leader's clock — not five times walking the
+/// backlog. The `once` entry is a second, sharper case: boot arming has no
+/// delivered set (the record does not carry one), so the node MAY re-append
+/// the already-fired instance before the service announces its `table_last`,
+/// and `Timed` is what must drop that duplicate — the FSM sees it at most once
+/// across both runs.
+#[test]
+fn a_restarted_node_resumes_the_table_with_one_catch_up_tick() {
+    let _g = serialize();
+    let dir = tempdir();
+    let anchor;
+    let once_at;
+    let position;
+    let pre: Vec<Fired>;
+    {
+        let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
+        wait_until("serving", || node.can_serve());
+        let svc = start_service_with(dir.path(), Timed::new(ClockSm::default()));
+        let client = Client::connect(dir.path(), APP).unwrap();
+        let cnc = open_cnc(dir.path());
+
+        let t0: u64 = client.submit(&Cmd::Nop).unwrap();
+        anchor = t0 - t0 % TABLE_PERIOD_NS;
+        once_at = t0 + 300_000_000;
+        position = apply_schedule_table(dir.path(), &cnc, &two_entry_table(anchor, once_at));
+
+        wait_until("three ticks of the every entry", || {
+            query(&svc).0.iter().filter(|f| f.id == 1).count() >= 3
+        });
+        wait_until("the once entry fired", || {
+            query(&svc).0.iter().any(|f| f.id == 2)
+        });
+        // The record's clock is the LOG's, published by the archive agent;
+        // boot arming reads that word, so wait for it to be real rather than
+        // racing the archive.
+        wait_until("the archive published a stamp", || cnc.log_time_ns() > 0);
+        pre = query(&svc).0;
+        client.shutdown();
+        svc.stop();
+        node.stop();
+    }
+    let last_pre = pre
+        .iter()
+        .filter(|f| f.id == 1)
+        .map(|f| f.deadline_ns)
+        .max()
+        .expect("the every entry ticked before the restart");
+
+    // Five periods of downtime — the backlog a naive "advance one period per
+    // fire" implementation would replay.
+    std::thread::sleep(Duration::from_millis(1_000));
+
+    let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
+    // Read BEFORE anything can be adopted off the log: the table a restarted
+    // node runs comes from the durable record, not from a replay.
+    let rec = uc_node::read_record(dir.path())
+        .expect("read the record")
+        .expect("the record survived the restart");
+    assert_eq!(rec.position, position, "the record was reloaded as adopted");
+    assert_eq!(
+        decode_schedule_table(&rec.table).map(|t| t.entries.len()),
+        Some(2)
+    );
+
+    let svc = start_service_with(dir.path(), Timed::new(ClockSm::default()));
+    wait_until("serving again", || node.can_serve());
+    wait_until("three ticks after the restart", || {
+        query(&svc)
+            .0
+            .iter()
+            .filter(|f| f.id == 1 && f.deadline_ns > last_pre)
+            .count()
+            >= 3
+    });
+    let (fired, _) = query(&svc);
+
+    // The FSM's whole record — the pre-restart fires come back through
+    // journal replay, so this is both runs at once.
+    let rule = ScheduleRule::Every {
+        period_ns: TABLE_PERIOD_NS,
+        anchor_ns: anchor,
+    };
+    let every: Vec<&Fired> = fired.iter().filter(|f| f.id == 1).collect();
+    let post: Vec<&Fired> = every
+        .iter()
+        .copied()
+        .filter(|f| f.deadline_ns > last_pre)
+        .collect();
+    let catch_up = post[0];
+    // ONE tick, not five: the first fire after the gap is the LATEST
+    // occurrence at or before the leader's clock when it fired (ruling R11),
+    // and the four or so occurrences the downtime covered are simply absent.
+    assert_eq!(
+        rule.latest_at_or_before(catch_up.time_ns),
+        Some(catch_up.deadline_ns),
+        "the catch-up tick is not the newest occurrence its own stamp admits \
+         — a backlog was replayed: {catch_up:?}"
+    );
+    assert!(
+        catch_up.deadline_ns >= last_pre + 4 * TABLE_PERIOD_NS,
+        "the 1 s gap covered at least four occurrences, so the catch-up must \
+         skip them: last before the restart {last_pre}, first after {catch_up:?}"
+    );
+    assert_eq!(
+        every
+            .iter()
+            .filter(|f| f.deadline_ns > last_pre && f.deadline_ns <= catch_up.deadline_ns)
+            .count(),
+        1,
+        "exactly one tick covered the whole gap: {every:?}"
+    );
+    // ... and the entry keeps ticking from there, one period at a time.
+    for w in post.windows(2) {
+        assert_eq!(
+            w[1].deadline_ns - w[0].deadline_ns,
+            TABLE_PERIOD_NS,
+            "{:?} then {:?}",
+            w[0],
+            w[1]
+        );
+    }
+    assert!(
+        post[1..].iter().all(|f| !f.late),
+        "a steady-state tick after the restart was late: {post:?}"
+    );
+    assert!(
+        fired.iter().all(|f| f.table),
+        "every fire here came from the table: {fired:?}"
+    );
+
+    // The parked `once`: the node may well have re-appended it (boot arming
+    // has no delivered set), but the FSM must not see it twice.
+    assert_eq!(
+        fired.iter().filter(|f| f.id == 2).count(),
+        1,
+        "the parked once was delivered again after the restart: {fired:?}"
+    );
+
+    svc.stop();
+    node.stop();
 }

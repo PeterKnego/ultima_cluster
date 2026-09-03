@@ -42,6 +42,7 @@
 //! replay of `TIMER` frames through `Timed`.
 
 use serde::{Deserialize, Serialize};
+use uc_protocol::v2::schedule::ScheduleRule;
 
 use crate::register::{Cmd, CmdResp, RegisterSm};
 
@@ -90,6 +91,12 @@ pub struct FiredRec {
     pub id: u64,
     pub deadline_ns: u64,
     pub time_ns: u64,
+    /// Plan 2: this fire came from the replicated SCHEDULE TABLE
+    /// (`FLAG_TIMER_TABLE`), not from a `TimerCmd::Schedule` this SM asked
+    /// for. The two are adjudicated by different clauses — a table tick has
+    /// no `Schedule` record to match, and its deadlines are the rule's
+    /// occurrences rather than an instance the SM named.
+    pub table: bool,
 }
 
 impl FiredRec {
@@ -194,6 +201,7 @@ impl uc_service::StateMachine for TimerSm {
             id: ev.id,
             deadline_ns: ev.deadline_ns,
             time_ns: ctx.time_ns,
+            table: ev.table,
         });
         self.stamps.push((ctx.position, ctx.time_ns));
         self.last = Some(ctx.position);
@@ -335,6 +343,10 @@ pub struct TimerStats {
     /// un-superseded, and older than [`COMPLETENESS_MARGIN_NS`]). A run whose
     /// `completeness_checked` is 0 proved nothing about loss.
     pub completeness_checked: usize,
+    /// Plan 2: fires that came from the replicated schedule table (clause 7).
+    /// Counted separately because they are adjudicated by a different clause
+    /// and are not part of `scheduled`/`cancelled` at all.
+    pub table_fires: usize,
 }
 
 /// The timer oracle, shared by the in-process capstone
@@ -371,7 +383,37 @@ pub struct TimerStats {
 ///    [`COMPLETENESS_MARGIN_NS`] before the last stamp, HAS a fire `(id, d)`
 ///    at a position after `p`. Without this, (3) alone is only *at most* once:
 ///    a node that armed nothing would pass.
-pub fn assert_timer_report(tag: &str, report: &TimerReport) -> TimerStats {
+/// 7. **The schedule table's one-tick catch-up** (plan 2), over the fires
+///    flagged `table` — which carry no `Schedule` record, so clauses (5) and
+///    (6) skip them and this one takes their place. `table_rules` names the
+///    rule the test APPLIED for each table timer id; a `table` fire for an id
+///    that is not in it is itself a violation. Per id:
+///
+///    * every deadline is a genuine occurrence of the rule
+///      (`rule.latest_at_or_before(d) == Some(d)`), and they strictly
+///      increase — no repeat, no going backwards;
+///    * **no backlog replay**: `rule.latest_at_or_before(time_ns) ==
+///      Some(deadline_ns)` — the tick fired at the NEWEST occurrence its own
+///      stamp admits. This is exactly the fire-time rule (`RowTimers::
+///      table_fire_deadline`) made observable from the record, and it is
+///      what convicts a node that walks a backlog one period at a time after
+///      a gap: those ticks are stamped at the new leader's clock with
+///      deadlines far behind it, so `latest_at_or_before(time_ns)` is a
+///      later occurrence than the one delivered.
+///
+///    It also SUBSUMES "a skip is explained": if the fire before it obeys the
+///    clause, no occurrence lies in `(previous deadline, previous stamp]`, so
+///    every occurrence a catch-up skipped is strictly after the previous fire
+///    — it only became due while the log was not moving. Note that a
+///    catch-up tick is NOT necessarily *late*: it is stamped
+///    `max(deadline, last_stamp)` and a new leader's `last_stamp` is usually
+///    below the caught-up deadline, so the tick reads on-time. That is why
+///    the clause is phrased against the stamp rather than against lateness.
+pub fn assert_timer_report(
+    tag: &str,
+    report: &TimerReport,
+    table_rules: &[(u64, ScheduleRule)],
+) -> TimerStats {
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -413,7 +455,7 @@ pub fn assert_timer_report(tag: &str, report: &TimerReport) -> TimerStats {
     // clause can demand a fire AFTER the schedule it is checking (not merely
     // somewhere in the record).
     let mut fired_at: HashMap<(u64, u64), Vec<u64>> = HashMap::new();
-    for r in &report.fired {
+    for r in report.fired.iter().filter(|r| !r.table) {
         fired_at
             .entry((r.id, r.deadline_ns))
             .or_default()
@@ -430,12 +472,15 @@ pub fn assert_timer_report(tag: &str, report: &TimerReport) -> TimerStats {
             rec.time_ns,
             rec.deadline_ns
         );
-        // (3) at most once.
+        // (3) at most once. Keyed on the KIND too: a table tick and a
+        // programmatic instance are different objects even at the same
+        // `(id, deadline)`.
         assert!(
-            seen.insert((rec.id, rec.deadline_ns)),
-            "[{tag}] timer ({}, deadline {}) delivered TWICE — {rec:?}",
+            seen.insert((rec.table, rec.id, rec.deadline_ns)),
+            "[{tag}] timer ({}, deadline {}, table={}) delivered TWICE — {rec:?}",
             rec.id,
-            rec.deadline_ns
+            rec.deadline_ns,
+            rec.table
         );
         // (4) ordering, both windows excluding the firing frame itself.
         let lo = st.partition_point(|&(p, _)| p < rec.position);
@@ -460,6 +505,12 @@ pub fn assert_timer_report(tag: &str, report: &TimerReport) -> TimerStats {
             suffix_min[hi],
             rec.time_ns
         );
+        // Plan 2: a TABLE tick has no `Schedule` record behind it — clause
+        // (7) below adjudicates it instead. Everything above (never early,
+        // at most once, the §4.3 ordering windows) applied to it already.
+        if rec.table {
+            continue;
+        }
         // (5) the fire matches a live, un-cancelled, un-superseded instance.
         let list = sched_by_id.get(&rec.id).unwrap_or_else(|| {
             panic!(
@@ -523,12 +574,59 @@ pub fn assert_timer_report(tag: &str, report: &TimerReport) -> TimerStats {
         completeness_checked += 1;
     }
 
+    // (7) the schedule table's one-tick catch-up.
+    let mut table_fires = 0usize;
+    let mut last_table: HashMap<u64, &FiredRec> = HashMap::new();
+    for rec in report.fired.iter().filter(|r| r.table) {
+        table_fires += 1;
+        let rule = table_rules
+            .iter()
+            .find(|(id, _)| *id == rec.id)
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| {
+                panic!(
+                    "[{tag}] a TABLE tick fired for id {} — no such entry was applied \
+                     (applied: {:?}) — {rec:?}",
+                    rec.id,
+                    table_rules.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            rule.latest_at_or_before(rec.deadline_ns),
+            Some(rec.deadline_ns),
+            "[{tag}] table tick delivered at {} — not an occurrence of {rule:?} — {rec:?}",
+            rec.deadline_ns
+        );
+        // No backlog replay: the newest occurrence this fire's own stamp
+        // admits IS the one delivered.
+        assert_eq!(
+            rule.latest_at_or_before(rec.time_ns),
+            Some(rec.deadline_ns),
+            "[{tag}] table tick for id {} delivered deadline {} while its own stamp {} \
+             already admitted a NEWER occurrence — a backlog was being replayed one \
+             period at a time instead of catching up in one tick — {rec:?}",
+            rec.id,
+            rec.deadline_ns,
+            rec.time_ns
+        );
+        if let Some(prev) = last_table.insert(rec.id, rec) {
+            assert!(
+                rec.deadline_ns > prev.deadline_ns,
+                "[{tag}] table tick for id {} went backwards: {} after {} — {rec:?}",
+                rec.id,
+                rec.deadline_ns,
+                prev.deadline_ns
+            );
+        }
+    }
+
     TimerStats {
         fires: report.fired.len(),
         late,
         scheduled: report.scheduled.len(),
         cancelled: report.cancelled.len(),
         completeness_checked,
+        table_fires,
     }
 }
 
@@ -592,6 +690,7 @@ mod v2_tests {
                 id: 7,
                 deadline_ns: 50_001_000,
                 time_ns: 50_001_000,
+                table: false,
             }]
         );
         assert!(!report.fired[0].late());
@@ -699,6 +798,7 @@ mod v2_tests {
 #[cfg(test)]
 mod oracle_tests {
     use super::{FiredRec, TimerReport, assert_timer_report};
+    use uc_protocol::v2::schedule::ScheduleRule;
 
     /// Two timers, both scheduled, both fired on time, both deadlines well
     /// past the last stamp's completeness margin.
@@ -713,12 +813,14 @@ mod oracle_tests {
                     id: 1,
                     deadline_ns: 1_000,
                     time_ns: 1_000,
+                    table: false,
                 },
                 FiredRec {
                     position: 400,
                     id: 2,
                     deadline_ns: 2_000,
                     time_ns: 2_000,
+                    table: false,
                 },
             ],
             stamps: vec![
@@ -735,7 +837,7 @@ mod oracle_tests {
 
     #[test]
     fn a_clean_record_passes_and_the_no_loss_clause_is_armed() {
-        let stats = assert_timer_report("clean", &clean());
+        let stats = assert_timer_report("clean", &clean(), &[]);
         assert_eq!(stats.fires, 2);
         assert_eq!(stats.late, 0);
         assert_eq!(stats.scheduled, 2);
@@ -753,7 +855,7 @@ mod oracle_tests {
         r.stamps[1].1 = 500;
         r.fired[0].time_ns = 600;
         r.stamps[2].1 = 600;
-        assert_timer_report("early", &r);
+        assert_timer_report("early", &r, &[]);
     }
 
     #[test]
@@ -765,9 +867,10 @@ mod oracle_tests {
             id: 1,
             deadline_ns: 1_000,
             time_ns: 2_000,
+            table: false,
         });
         r.stamps.insert(4, (450, 2_000));
-        assert_timer_report("dup", &r);
+        assert_timer_report("dup", &r, &[]);
     }
 
     #[test]
@@ -775,7 +878,7 @@ mod oracle_tests {
     fn a_cancelled_timer_that_fires_is_convicted() {
         let mut r = clean();
         r.cancelled.push((250, 1));
-        assert_timer_report("cancelled", &r);
+        assert_timer_report("cancelled", &r, &[]);
     }
 
     #[test]
@@ -785,7 +888,7 @@ mod oracle_tests {
         // id 1 re-scheduled to a different deadline before the old instance
         // fired; the old instance must never be delivered.
         r.scheduled.push((250, 1, 9_000));
-        assert_timer_report("superseded", &r);
+        assert_timer_report("superseded", &r, &[]);
     }
 
     #[test]
@@ -793,7 +896,7 @@ mod oracle_tests {
     fn a_lost_timer_is_convicted() {
         let mut r = clean();
         r.fired.remove(0); // id 1 armed, never cancelled, never delivered
-        assert_timer_report("lost", &r);
+        assert_timer_report("lost", &r, &[]);
     }
 
     #[test]
@@ -801,7 +904,7 @@ mod oracle_tests {
     fn a_fire_with_no_schedule_is_convicted() {
         let mut r = clean();
         r.scheduled.remove(0);
-        assert_timer_report("unscheduled", &r);
+        assert_timer_report("unscheduled", &r, &[]);
     }
 
     #[test]
@@ -809,7 +912,100 @@ mod oracle_tests {
     fn a_non_monotone_stamp_series_is_convicted() {
         let mut r = clean();
         r.stamps[3].1 = 700;
-        assert_timer_report("non-monotone", &r);
+        assert_timer_report("non-monotone", &r, &[]);
+    }
+
+    // ------------------------------------------- plan 2: the table clause (7)
+
+    const P: u64 = 150_000_000;
+    const RULE: ScheduleRule = ScheduleRule::Every {
+        period_ns: P,
+        anchor_ns: 3 * P,
+    };
+    /// The rule set the table tests pass to the oracle: one entry, id 9.
+    fn rules() -> Vec<(u64, ScheduleRule)> {
+        vec![(9, RULE)]
+    }
+
+    /// Three ticks of id 9, all on time and one period apart, on top of the
+    /// clean programmatic record. Clause (7) must accept it — and the
+    /// programmatic clauses must not demand a `Schedule` for a table tick.
+    fn with_table(deadlines: &[(u64, u64)]) -> TimerReport {
+        let mut r = clean();
+        let mut pos = 1_000u64;
+        for &(d, t) in deadlines {
+            r.fired.push(FiredRec {
+                position: pos,
+                id: 9,
+                deadline_ns: d,
+                time_ns: t,
+                table: true,
+            });
+            r.stamps.push((pos, t));
+            pos += 100;
+        }
+        r
+    }
+
+    #[test]
+    fn a_clean_table_record_passes_and_is_counted() {
+        let stats = assert_timer_report(
+            "table-clean",
+            &with_table(&[(3 * P, 3 * P), (4 * P, 4 * P), (6 * P, 6 * P)]),
+            &rules(),
+        );
+        // The third tick SKIPPED 5·P — a one-tick catch-up after a gap, and
+        // `latest_at_or_before(last)` is 6·P, so it is honest.
+        assert_eq!(stats.table_fires, 3);
+        // The programmatic clauses are untouched by the table ticks.
+        assert_eq!(stats.fires, 5);
+        assert_eq!(stats.scheduled, 2);
+    }
+
+    /// A backlog replayed one period at a time: each tick is stamped at the
+    /// new leader's clock (well past its own deadline) while a NEWER
+    /// occurrence was already due. This is the defect the one-tick catch-up
+    /// exists to prevent, and the only clause that sees it is (7).
+    #[test]
+    #[should_panic(expected = "backlog was being replayed")]
+    fn a_replayed_backlog_is_convicted() {
+        let now = 9 * P;
+        assert_timer_report(
+            "table-backlog",
+            &with_table(&[(3 * P, now), (4 * P, now), (5 * P, now)]),
+            &rules(),
+        );
+    }
+
+    /// A deadline that is not an occurrence of the rule at all.
+    #[test]
+    #[should_panic(expected = "not an occurrence")]
+    fn a_table_tick_off_the_rule_is_convicted() {
+        assert_timer_report(
+            "table-off-rule",
+            &with_table(&[(3 * P + 7, 3 * P + 7)]),
+            &rules(),
+        );
+    }
+
+    /// The same occurrence delivered twice — `Timed`'s `table_last` is what
+    /// must drop the re-append after a leadership change.
+    #[test]
+    #[should_panic(expected = "delivered TWICE")]
+    fn a_repeated_table_tick_is_convicted() {
+        assert_timer_report(
+            "table-dup",
+            &with_table(&[(3 * P, 3 * P), (3 * P, 3 * P)]),
+            &rules(),
+        );
+    }
+
+    /// A tick for an id the test never put in the table: the node fired
+    /// something no operator asked for.
+    #[test]
+    #[should_panic(expected = "no such entry was applied")]
+    fn a_table_tick_for_an_unapplied_id_is_convicted() {
+        assert_timer_report("table-unknown", &with_table(&[(3 * P, 3 * P)]), &[]);
     }
 
     /// The no-loss clause must not fire on an instance still legitimately in
@@ -819,7 +1015,7 @@ mod oracle_tests {
         let mut r = clean();
         r.fired.remove(0);
         r.stamps.pop(); // last stamp is now 2_000, inside id 1's margin
-        let stats = assert_timer_report("in-flight", &r);
+        let stats = assert_timer_report("in-flight", &r, &[]);
         // id 2's fire is at the last stamp, so it too is inside the margin.
         assert_eq!(stats.completeness_checked, 0);
     }

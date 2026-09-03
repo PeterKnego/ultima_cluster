@@ -23,5 +23,11 @@ v2 = ["dep:uc_service"]
 
 [dependencies]
 uc_service = { path = "../uc_service", version = "2.10.0", optional = true }
+# The oracle's table clause (time-and-timers plan 2) reasons with the FROZEN
+# recurrence arithmetic itself (`ScheduleRule::latest_at_or_before`), not a
+# re-derivation of it — a second implementation of the rule in the checker
+# could agree with a wrong node. Non-optional: the oracle is compiled with or
+# without the `v2` feature.
+uc_protocol = { path = "../uc_protocol", version = "2.10.0" }
 serde       = { workspace = true }
 bincode     = { workspace = true }

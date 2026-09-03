@@ -31,11 +31,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uc_consensus::election::NodeId;
 use uc_crypto::admin::{AdminMessage, sign};
+use uc_lincheck::register::RegisterSm;
 use uc_log::cnc::{AdminAuth, AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{
     AdminKey, AdminPolicy, Node, NodeConfig, REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED,
     REASON_AUTH_MISSING, REASON_AUTH_UNKNOWN_KEY, StartOpts,
+};
+use uc_protocol::v2::cnc::ADMIN_OP_SCHEDULE_APPLY;
+use uc_protocol::v2::schedule::{
+    ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
 
 /// The admin-key TTL every `Hmac` test runs under; the far-future-expiry case
@@ -83,6 +88,12 @@ struct NodeH {
     addr: SocketAddr,
     members: Vec<(NodeId, SocketAddr)>,
     seed: u64,
+    /// The declared FSM set this node booted with — carried so a restart
+    /// declares the same one. `none_for_tests()` for every reconfiguration
+    /// scenario in this file; the schedule-apply test declares one real row,
+    /// because `REASON_SCHEDULE_UNKNOWN_FSM` is defined against the declared
+    /// set.
+    services: uc_node::ServicesConfig,
     node: Option<Node>,
 }
 
@@ -126,6 +137,7 @@ impl NodeH {
             self.addr,
             self.instance_dir.clone(),
             self.seed,
+            self.services,
         );
         let opts = StartOpts {
             socket: Some(sock),
@@ -151,6 +163,7 @@ fn make_config(
     addr: SocketAddr,
     instance_dir: PathBuf,
     seed: u64,
+    services: uc_node::ServicesConfig,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -169,7 +182,7 @@ fn make_config(
         purge: uc_node::PurgePolicy::Disabled,
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::none_for_tests(),
+        services,
     }
 }
 
@@ -180,6 +193,13 @@ fn seed_for(i: usize) -> u64 {
 /// Bind every voter's socket first (so the full member map is known up
 /// front), then start each node under `policy`.
 fn spawn_cluster(n: usize, policy: AdminPolicy) -> Cluster {
+    spawn_cluster_with(n, policy, uc_node::ServicesConfig::none_for_tests())
+}
+
+/// As [`spawn_cluster`], with a declared FSM set. Only the schedule-apply test
+/// uses a non-empty one — and it must then ATTACH a service per node, or the
+/// declared-but-absent row holds the report ceiling down and nothing commits.
+fn spawn_cluster_with(n: usize, policy: AdminPolicy, services: uc_node::ServicesConfig) -> Cluster {
     let dir = tempfile::Builder::new()
         .prefix("uc2-admin-auth-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -204,6 +224,7 @@ fn spawn_cluster(n: usize, policy: AdminPolicy) -> Cluster {
             addr,
             instance_dir.clone(),
             seed_for(i),
+            services,
         );
         let opts = StartOpts {
             socket: Some(sock),
@@ -216,6 +237,7 @@ fn spawn_cluster(n: usize, policy: AdminPolicy) -> Cluster {
             addr,
             members: members.clone(),
             seed: seed_for(i),
+            services,
             node: Some(node),
         });
     }
@@ -1058,5 +1080,222 @@ fn a_forwarded_request_is_recorded_on_both_nodes() {
     assert_eq!(field(&lline, "op_name"), "add_learner");
     assert_eq!(field(&lline, "config_version"), resp.version.to_string());
 
+    c.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Time-and-timers plan 2: `schedule apply` (wire op 6).
+// ---------------------------------------------------------------------------
+
+/// The one declared row this test's cluster runs, and the identity hash a
+/// table entry names it by.
+const SCHEDULE_ROW: &str = "register";
+
+fn schedule_row_hash() -> u64 {
+    uc_protocol::identity::FsmName::parse(SCHEDULE_ROW)
+        .expect("a valid FSM name")
+        .hash()
+}
+
+/// A one-entry table for `hash`, encoded on the wire.
+fn schedule_bytes(hash: u64) -> Vec<u8> {
+    let table = ScheduleTable {
+        entries: vec![ScheduleEntry {
+            identity_hash: hash,
+            timer_id: 1,
+            rule: ScheduleRule::Every {
+                period_ns: 60 * 1_000_000_000,
+                anchor_ns: 0,
+            },
+        }],
+    };
+    let mut bytes = Vec::new();
+    encode_schedule_table(&table, &mut bytes);
+    bytes
+}
+
+/// Stage `bytes` as `<instance_dir>/schedules.pending` — what `uc2ctl schedule
+/// apply` writes before it signs the digest. Per instance dir, deliberately:
+/// the file is node-local, which is why a follower answers retry instead of
+/// forwarding.
+fn stage_schedule(instance_dir: &std::path::Path, bytes: &[u8]) {
+    std::fs::create_dir_all(instance_dir).expect("instance dir");
+    std::fs::write(instance_dir.join(uc_node::SCHEDULE_PENDING_FILE), bytes)
+        .expect("stage the table");
+}
+
+/// Plan 2 (spec §5): the whole `schedule apply` admission path under
+/// `AdminPolicy::Hmac` — signed like every other admin op, digest-checked
+/// against the file the operator actually staged, refused whole on an
+/// undeclared FSM, leader-only, and audited under its own `op_name` whatever
+/// the answer.
+///
+/// The staged file is written per instance dir (it is node-local), including
+/// on the follower — so the follower's `retry` is by ROLE, not because it had
+/// nothing to read.
+///
+/// The accepted case runs LAST: an accepted apply is the only one that
+/// appends, and the single-in-flight rule would answer `retry` to a second
+/// apply until that frame commits.
+#[test]
+fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
+    let _g = serialize();
+    let services = uc_node::ServicesConfig::from_names(&[SCHEDULE_ROW], None).unwrap();
+    let c = spawn_cluster_with(3, hmac_policy(), services);
+    // A declared row with no service attached holds the report ceiling down,
+    // so every node runs a real one.
+    let svcs: Vec<uc_service::Service<RegisterSm>> = c
+        .nodes
+        .iter()
+        .map(|h| {
+            uc_service::ServiceBuilder::new(
+                uc_service::ServiceConfig::new(&h.instance_dir, APP),
+                RegisterSm::default(),
+            )
+            .start()
+            .expect("service start")
+        })
+        .collect();
+    let leader = await_single_leader(&c.nodes, 30);
+    let follower = (0..c.nodes.len()).find(|&i| i != leader).unwrap();
+    let dir = c.nodes[leader].instance_dir.clone();
+    let cnc = open_cnc(&dir);
+    let key = test_key();
+    let signed = || Auth::Signed {
+        key: &key,
+        ttl: TTL,
+        corrupt_tag: false,
+        expiry_override: None,
+    };
+    let good = schedule_bytes(schedule_row_hash());
+
+    // (a) the digest does not match the staged bytes: the operator signed one
+    // file and staged another (or the file changed under them). Refused, and
+    // nothing was appended.
+    stage_schedule(&dir, &good);
+    let (other_id, other_ip, other_port) = uc_node::schedule_digest(b"a different table entirely");
+    let (_, resp, line) = admin_request(
+        &cnc,
+        &dir,
+        ADMIN_OP_SCHEDULE_APPLY,
+        other_id,
+        (other_ip, other_port),
+        signed(),
+    );
+    assert_eq!(resp.status, 1, "a mismatched digest must be refused");
+    assert_eq!(resp.reason, uc_node::REASON_SCHEDULE_DIGEST);
+    assert_record(
+        &line,
+        "ops-test",
+        "refused",
+        uc_node::REASON_SCHEDULE_DIGEST,
+    );
+    assert_eq!(field(&line, "op"), ADMIN_OP_SCHEDULE_APPLY.to_string());
+    assert_eq!(field(&line, "op_name"), "schedule_apply", "{line}");
+    assert_eq!(resp.version, 0, "nothing was adopted");
+    assert!(
+        dir.join(uc_node::SCHEDULE_PENDING_FILE).exists(),
+        "a refused apply leaves the staged file for the operator to re-sign"
+    );
+
+    // (b) an entry naming an FSM this cluster does not declare — a typo'd or
+    // stale name. Refused WHOLE, so no half-armed table.
+    let unknown = schedule_bytes(schedule_row_hash() ^ 0xDEAD_BEEF);
+    stage_schedule(&dir, &unknown);
+    let (id, ip, port) = uc_node::schedule_digest(&unknown);
+    let (_, resp, line) = admin_request(
+        &cnc,
+        &dir,
+        ADMIN_OP_SCHEDULE_APPLY,
+        id,
+        (ip, port),
+        signed(),
+    );
+    assert_eq!(resp.status, 1, "an undeclared FSM must be refused");
+    assert_eq!(resp.reason, uc_node::REASON_SCHEDULE_UNKNOWN_FSM);
+    assert_record(
+        &line,
+        "ops-test",
+        "refused",
+        uc_node::REASON_SCHEDULE_UNKNOWN_FSM,
+    );
+    assert_eq!(field(&line, "op_name"), "schedule_apply", "{line}");
+
+    // (c) the same, correctly signed, correctly staged request on a FOLLOWER:
+    // answered retry. Not forwarded (the leader has no such file) and not
+    // applied locally (a follower cannot append) — and the file is genuinely
+    // there, so this is a refusal by role, not by absence.
+    let fdir = c.nodes[follower].instance_dir.clone();
+    stage_schedule(&fdir, &good);
+    let fcnc = open_cnc(&fdir);
+    let (id, ip, port) = uc_node::schedule_digest(&good);
+    let (_, resp, line) = admin_request(
+        &fcnc,
+        &fdir,
+        ADMIN_OP_SCHEDULE_APPLY,
+        id,
+        (ip, port),
+        signed(),
+    );
+    assert_eq!(
+        resp.status, 2,
+        "a follower must answer retry, not apply: reason {}",
+        resp.reason
+    );
+    assert_eq!(field(&line, "outcome"), "retry", "{line}");
+    assert_eq!(field(&line, "op_name"), "schedule_apply", "{line}");
+    assert_eq!(field(&line, "actor"), "ops-test", "{line}");
+    assert!(
+        fdir.join(uc_node::SCHEDULE_PENDING_FILE).exists(),
+        "a retry is side-effect-free: the staged file survives for the retry"
+    );
+    assert!(
+        uc_node::read_record(&fdir)
+            .expect("read the record")
+            .is_none(),
+        "the follower adopted nothing"
+    );
+
+    // (d) correctly signed, correct digest, on the leader: accepted, the
+    // version is the frame END, and the staged file is consumed.
+    stage_schedule(&dir, &good);
+    let (_, resp, line) = admin_request(
+        &cnc,
+        &dir,
+        ADMIN_OP_SCHEDULE_APPLY,
+        id,
+        (ip, port),
+        signed(),
+    );
+    assert_eq!(
+        resp.status, 0,
+        "a signed, digest-matching apply was refused: reason {}",
+        resp.reason
+    );
+    assert!(resp.version > 0, "the version is the frame END");
+    assert_record(&line, "ops-test", "accepted", 0);
+    assert_eq!(field(&line, "op_name"), "schedule_apply", "{line}");
+    assert_eq!(
+        field(&line, "config_version"),
+        resp.version.to_string(),
+        "the record carries the same position the answer did: {line}"
+    );
+    assert!(
+        !dir.join(uc_node::SCHEDULE_PENDING_FILE).exists(),
+        "an accepted apply consumes the staged file, so re-presenting the \
+         request cannot append the same table twice"
+    );
+    let rec = uc_node::read_record(&dir)
+        .expect("read the record")
+        .expect("the leader adopted the table");
+    assert_eq!(rec.position, resp.version);
+    assert_eq!(
+        rec.table, good,
+        "the record holds the staged bytes verbatim"
+    );
+
+    for s in svcs {
+        s.stop();
+    }
     c.stop();
 }

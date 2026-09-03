@@ -2180,7 +2180,7 @@ fn two_fsm_timer_service_sigkill() {
     }
 
     let report = timer_report_until_ok(&inst, Instant::now() + Duration::from_secs(30));
-    let stats = assert_timer_report("two_fsm_timer_service_sigkill", &report);
+    let stats = assert_timer_report("two_fsm_timer_service_sigkill", &report, &[]);
     let fires = stats.fires;
     eprintln!(
         "[two_fsm_timer_service_sigkill] seed={seed} acked_schedules={} {stats:?} \

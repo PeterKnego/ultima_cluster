@@ -60,6 +60,8 @@ use uc_crypto::rotation::RotationPolicy;
 use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig};
+use uc_protocol::v2::cnc::ADMIN_OP_SCHEDULE_APPLY;
+use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
 use uc_service::{
     ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine, StateMachine,
     Tagged, Timed,
@@ -1134,6 +1136,27 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         bincode::serde::decode_from_slice(&out, bincode::config::standard())
             .expect("decode TimerReport")
             .0
+    }
+
+    /// Time-and-timers plan 2: stage a schedule table in `node`'s instance
+    /// directory and apply it through the cnc admin band — `uc2ctl schedule
+    /// apply` minus the bin. The harness boots every node under the default
+    /// [`uc_node::AdminPolicy::Filesystem`], so nothing is signed here
+    /// (`uc_node/tests/admin_auth.rs` covers the signed path); what this
+    /// exercises is the STAGED-FILE + digest channel, which is the same on
+    /// both policies.
+    ///
+    /// The staged file is node-local, so this must target the LEADER: a
+    /// follower answers `retry` by design. Returns the whole answer so the
+    /// caller can insist on `status == 0` with its own message.
+    pub fn apply_schedule_table(&self, node: usize, table: &ScheduleTable, secs: u64) -> AdminResp {
+        let dir = &self.nodes[node].instance_dir;
+        let mut bytes = Vec::new();
+        encode_schedule_table(table, &mut bytes);
+        std::fs::write(dir.join(uc_node::SCHEDULE_PENDING_FILE), &bytes).expect("stage the table");
+        let (id, ip, port) = uc_node::schedule_digest(&bytes);
+        let cnc = Self::open_cnc(dir);
+        Self::admin_request(&cnc, ADMIN_OP_SCHEDULE_APPLY, id, ip, port, secs)
     }
 
     /// M14c2: FSM `id`'s `applied` byte position as published on `node`'s cnc

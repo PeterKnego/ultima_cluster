@@ -33,9 +33,10 @@ use lincheck_v2::{
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History};
 use uc_lincheck::register::{Cmd, CmdResp};
-use uc_lincheck::timer::{MixedCmd, MixedRegisterSm, TimerReport, assert_timer_report};
+use uc_lincheck::timer::{MixedCmd, MixedRegisterSm, TimerReport, TimerSm, assert_timer_report};
 use uc_net::fault::FaultConfig;
 use uc_node::PurgePolicy;
+use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable};
 
 /// A tempdir on the ext4 target volume (64 MiB journal segments would blow the
 /// tmpfs `/tmp` quota — see the harness module docs).
@@ -1416,10 +1417,14 @@ fn snapshot_restart_installs_only_with_purge() {
 /// (b) `uc_lincheck::timer::assert_timer_report` per node — the SHARED oracle
 ///     the SIGKILL scenario runs too: never early, at most once, the §4.3
 ///     order with both windows excluding the firing frame, every fire matching
-///     a live un-cancelled un-superseded instance, and no LOSS (every live
-///     schedule past the completeness margin fired);
-/// (c) non-vacuity: enough fires, at least one leader change, and the no-loss
-///     clause actually armed for something;
+///     a live un-cancelled un-superseded instance, no LOSS (every live
+///     schedule past the completeness margin fired), and — plan 2 — the
+///     SCHEDULE TABLE clause over the table ticks: genuine, strictly
+///     increasing occurrences of the applied rule, each fired at the newest
+///     occurrence its own stamp admits (the one-tick catch-up, never a
+///     replayed backlog);
+/// (c) non-vacuity: enough PROGRAMMATIC fires, enough table ticks, at least
+///     one leader change, and the no-loss clause actually armed for something;
 ///
 /// then `check_register(&entries)` for FSM 0, exactly as the copied test does.
 #[test]
@@ -1437,6 +1442,15 @@ fn two_fsm_timer_churn_under_failover() {
     const FAULT_PERIOD: Duration = Duration::from_secs(1);
     // Non-vacuity floors (ruling 4e).
     const MIN_FIRES: usize = 50;
+    // Plan 2: the replicated table applied to row 1 before the churn. The run
+    // ends when `TARGET_OPS` is reached (8-10 s on a dev box, longer on a
+    // loaded one), so a 150 ms period yields 50+ ticks; the bar is deliberately
+    // far below that, because what it guards is "the table kept ticking across
+    // the failovers at all", not the rate.
+    const MIN_TABLE_FIRES: usize = 20;
+    const TABLE_PERIOD_NS: u64 = 150_000_000;
+    // Far out of the timer workers' id space (`(worker << 32) | n`).
+    const TABLE_TIMER_ID: u64 = 0x7000_0000_0000_0001;
     // Env-tunable like the other two-FSM capstones (nightly sets
     // UC2_LIN_BUDGET_SECS=240 for the whole capstones job).
     let budget = Duration::from_secs(
@@ -1464,7 +1478,37 @@ fn two_fsm_timer_churn_under_failover() {
     // every frame). `SM1` is unused under `TwoTimed`.
     let mut cluster: LinClusterV2<MixedRegisterSm> =
         LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
-    cluster.await_single_serving(30);
+    let first_leader = cluster.await_single_serving(30);
+
+    // Plan 2: apply the schedule table to row 1 BEFORE any churn, on the
+    // initial leader (the staged file is node-local, so a follower would
+    // answer retry). `anchor_ns = 0` needs no clock probe: log time is a
+    // UNIX-epoch nanosecond count, so the occurrences are simply every
+    // multiple of the period, and the entry is due the moment it is adopted.
+    let table_rule = ScheduleRule::Every {
+        period_ns: TABLE_PERIOD_NS,
+        anchor_ns: 0,
+    };
+    let table_rules = [(TABLE_TIMER_ID, table_rule)];
+    {
+        let table = ScheduleTable {
+            entries: vec![ScheduleEntry {
+                identity_hash: uc_protocol::identity::FsmName::parse(
+                    <TimerSm as uc_service::StateMachine>::NAME,
+                )
+                .expect("a valid FSM name")
+                .hash(),
+                timer_id: TABLE_TIMER_ID,
+                rule: table_rule,
+            }],
+        };
+        let resp = cluster.apply_schedule_table(first_leader, &table, 20);
+        assert_eq!(
+            resp.status, 0,
+            "[{LABEL}] the schedule table was not applied: status {} reason {}",
+            resp.status, resp.reason
+        );
+    }
 
     let dirs = Arc::new(cluster.dirs());
     let history = Arc::new(History::default());
@@ -1510,6 +1554,36 @@ fn two_fsm_timer_churn_under_failover() {
     join_workers(handles);
     join_workers(timer_handles);
 
+    // Plan 2: STOP the table before reading anything. A table entry ticks
+    // forever — the log would never go quiet, the apply frontiers would never
+    // agree for three samples running, and the per-node reports (read one at a
+    // time) could not be compared at all. Applying an EMPTY table replaces the
+    // row's entry set with nothing, which is also the only re-apply this
+    // capstone makes: the second table has to reach every replica through the
+    // same channel the first did, after the churn.
+    cluster.supervise_services();
+    let empty = ScheduleTable {
+        entries: Vec::new(),
+    };
+    let mut stopped = false;
+    for _ in 0..20 {
+        let leader = cluster.await_single_serving(60);
+        let resp = cluster.apply_schedule_table(leader, &empty, 20);
+        if resp.status == 0 {
+            stopped = true;
+            break;
+        }
+        // `2` = retry (a leader-open window, or the previous table still
+        // uncommitted). Anything else is a genuine refusal.
+        assert_eq!(
+            resp.status, 2,
+            "[{LABEL}] stopping the table was refused: reason {}",
+            resp.reason
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(stopped, "[{LABEL}] the table never stopped ticking");
+
     // Let every instance still in flight reach its deadline (the longest is
     // 200 ms) and the resulting TIMER frames commit and replicate, then wait
     // for the row-1 apply frontier to agree across the cluster: `fired` is
@@ -1543,10 +1617,12 @@ fn two_fsm_timer_churn_under_failover() {
         .expect("sole history owner")
         .into_entries();
     let ok = History::ok_count(&entries);
-    let fires = reports[0].fired.len();
+    let fires = reports[0].fired.iter().filter(|f| !f.table).count();
+    let table_fires = reports[0].fired.iter().filter(|f| f.table).count();
     eprintln!(
         "[{LABEL}] seed={seed} faults={faults} leader_changes={leader_changes} \
-         ops={} ok={ok} scheduled={} fires={fires} stamps={} elapsed={:.1}s — checking",
+         ops={} ok={ok} scheduled={} fires={fires} table_fires={table_fires} \
+         stamps={} elapsed={:.1}s — checking",
         entries.len(),
         scheduled.load(Ordering::Relaxed),
         reports[0].stamps.len(),
@@ -1580,7 +1656,7 @@ fn two_fsm_timer_churn_under_failover() {
     let stats: Vec<_> = reports
         .iter()
         .enumerate()
-        .map(|(i, r)| assert_timer_report(&format!("{LABEL} node {i}"), r))
+        .map(|(i, r)| assert_timer_report(&format!("{LABEL} node {i}"), r, &table_rules))
         .collect();
     eprintln!("[{LABEL}] per-node timer stats: {stats:?}");
 
@@ -1588,7 +1664,13 @@ fn two_fsm_timer_churn_under_failover() {
     // it never demanded a fire of anything.
     assert!(
         fires >= MIN_FIRES,
-        "[{LABEL}] only {fires} timers fired (< {MIN_FIRES}) — the timer arm was vacuous"
+        "[{LABEL}] only {fires} programmatic timers fired (< {MIN_FIRES}) — the timer \
+         arm was vacuous"
+    );
+    assert!(
+        stats.iter().all(|s| s.table_fires >= MIN_TABLE_FIRES),
+        "[{LABEL}] the schedule table ticked fewer than {MIN_TABLE_FIRES} times on some \
+         node — clause (7) proved nothing: {stats:?}"
     );
     assert!(
         leader_changes >= 1,
