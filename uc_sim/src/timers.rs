@@ -29,9 +29,33 @@
 //! stepped past.
 //!
 //! [`PassModel::check`] is the reference predicate for the §4.3 ordering
-//! invariant: stamps never decrease across the frame sequence, and no timer
-//! frame is stamped earlier than its own deadline (never early) or lets an
-//! on-time firing be preceded by a frame stamped past that deadline.
+//! invariant, five rules:
+//!
+//! 1. stamps never decrease across the frame sequence;
+//! 2. an on-time timer frame (`stamp == deadline`) is never preceded by a
+//!    frame stamped past that deadline;
+//! 3. every frame after a timer frame is stamped no earlier than that
+//!    timer's own stamp;
+//! 4. no timer frame is stamped earlier than its own deadline (never early);
+//! 5. **lateness must pre-date the pass.** A timer frame stamped *past* its
+//!    deadline (late) is legitimate only when that deadline was already
+//!    behind the clock *before this pass began* — a previous leader's clock
+//!    ran ahead (`leader_change`'s seed), or the deadline was already past
+//!    when scheduled. Rules 1-4 alone cannot tell a genuinely late timer
+//!    from the clients-before-timers bug: the clamp (`stamp =
+//!    max(natural, last_stamp)`) makes *any* consistently-clamped append
+//!    order monotone and clamp-safe by construction, whichever kind runs
+//!    first — reordering the two loops with the clamp intact trips none of
+//!    rules 1-4 (proven, and confirmed empirically: see the report for
+//!    Task 12). What it DOES do is convert what should have been an
+//!    on-time firing into a late one, because an earlier same-pass frame
+//!    (the misplaced clients) advanced `last_stamp` past the timer's
+//!    deadline before the timer's own turn. Rule 5 catches exactly that: it
+//!    records, on every frame, the `last_stamp` value at the start of the
+//!    pass that produced it (`pass_start_stamp`), and requires that any
+//!    late timer's deadline already precede that value — i.e. the timer was
+//!    *already* overdue when the pass began, not made overdue by a
+//!    same-pass predecessor.
 
 /// A tiny crate-local xorshift64 RNG, matching the shape of
 /// [`crate::world`]'s private copy (kept separate — that one is private to
@@ -90,11 +114,15 @@ pub enum Kind {
 }
 
 /// One appended frame. `deadline` is `Some` only for `Kind::Timer`.
+/// `pass_start_stamp` is `last_stamp` as it stood when the pass that
+/// produced this frame began — every frame from the same `pass()` call
+/// carries the same value, which is what rule 5 keys on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     pub kind: Kind,
     pub stamp: u64,
     pub deadline: Option<u64>,
+    pub pass_start_stamp: u64,
 }
 
 /// A pending, not-yet-fired timer: `(id, deadline)`.
@@ -154,6 +182,9 @@ impl PassModel {
     /// ordering is the invariant under test.
     pub fn pass(&mut self, k: usize) {
         let now = self.now;
+        // Captured once, before any frame of this pass is appended — every
+        // frame this call produces carries this same value (rule 5).
+        let pass_start_stamp = self.last_stamp;
 
         // Step 2: fire due timers in global deadline order. Re-scan each
         // iteration rather than pre-sorting once — no timer becomes newly
@@ -179,6 +210,7 @@ impl PassModel {
                 kind: Kind::Timer,
                 stamp,
                 deadline: Some(deadline),
+                pass_start_stamp,
             });
         }
 
@@ -190,6 +222,7 @@ impl PassModel {
                 kind: Kind::Client,
                 stamp,
                 deadline: None,
+                pass_start_stamp,
             });
         }
     }
@@ -260,6 +293,50 @@ impl PassModel {
                     f.stamp
                 ));
             }
+        }
+
+        // (e) rule 5: lateness must pre-date the pass. A TIMER frame stamped
+        // past its own deadline (late) is legitimate only if that deadline
+        // was already behind the clock before this pass began
+        // (deadline < pass_start_stamp). A late timer whose deadline was
+        // NOT yet behind the pass's own start stamp can only have become
+        // late because some earlier frame in the SAME pass (same
+        // pass_start_stamp) already pushed the clock past its deadline
+        // before this timer's turn — the clients-before-timers bug. Name
+        // both the late timer's index and, when found, the same-pass
+        // predecessor's index that is responsible.
+        for (i, f) in self.frames.iter().enumerate() {
+            if f.kind != Kind::Timer {
+                continue;
+            }
+            let deadline = f.deadline.expect("timer frame missing deadline");
+            if f.stamp <= deadline {
+                continue; // on-time or early (already ruled out by (d)) — not late
+            }
+            if deadline < f.pass_start_stamp {
+                continue; // legitimately late: already overdue before this pass began
+            }
+            let culprit = self.frames[..i]
+                .iter()
+                .enumerate()
+                .find(|(_, g)| g.pass_start_stamp == f.pass_start_stamp && g.stamp > deadline);
+            return Err(match culprit {
+                Some((j, g)) => format!(
+                    "timer frame {i} (deadline {deadline}) fired late (stamp {}) though its \
+                     deadline was not yet due when its pass began (pass_start_stamp {}); frame \
+                     {j} (stamp {}), appended earlier in the SAME pass, already moved the clock \
+                     past the deadline before this timer's turn — a same-pass frame ran ahead of \
+                     a due timer",
+                    f.stamp, f.pass_start_stamp, g.stamp
+                ),
+                None => format!(
+                    "timer frame {i} (deadline {deadline}) fired late (stamp {}) though its \
+                     deadline was not yet due when its pass began (pass_start_stamp {}), and no \
+                     same-pass predecessor frame was found to blame — the model itself is \
+                     inconsistent, investigate",
+                    f.stamp, f.pass_start_stamp
+                ),
+            });
         }
 
         Ok(())
