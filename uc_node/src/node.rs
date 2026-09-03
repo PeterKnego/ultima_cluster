@@ -1272,20 +1272,20 @@ impl Node {
                         }
                     }
                     ArchiveCmd::AdoptFloor { pos } => {
-                        // M6 Task 6: a learner installed the snapshot at `pos`.
-                        // Advance the archive floor with no bytes and prime the
-                        // counters there so the live stream (positions >= pos) is
-                        // accepted. A conflict (real data below pos) logs + drops.
-                        match archive.adopt_floor(pos) {
-                            Ok(new_floor) => {
-                                arc_cnc.counters().prime(new_floor);
-                                arc_prime_gen.fetch_add(1, Ordering::Release);
-                                arc_first_base.store(new_floor, Ordering::Release);
-                            }
-                            Err(e) => {
-                                eprintln!("uc_node: archive adopt_floor({pos}) failed: {e}");
-                            }
-                        }
+                        // M6 Task 6: a joiner installed the snapshot at `pos`.
+                        // Advance the archive floor and prime the counters there
+                        // so the live stream (positions >= pos) is accepted. A
+                        // non-empty archive below `pos` is dropped first
+                        // (wipe-and-adopt: its bytes are committed history the
+                        // snapshot subsumes, and the span up to `pos` is purged
+                        // at the leader — nightly 33488022809). The only `Err`
+                        // left is journal I/O, the archive's fail-stop class.
+                        let new_floor = archive
+                            .adopt_floor(pos)
+                            .expect("archive fail-stop: adopt_floor journal I/O");
+                        arc_cnc.counters().prime(new_floor);
+                        arc_prime_gen.fetch_add(1, Ordering::Release);
+                        arc_first_base.store(new_floor, Ordering::Release);
                     }
                 }
                 did = true;

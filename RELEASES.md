@@ -124,6 +124,36 @@ schedule table an operator applies with one command.
   [`uc2ctl` § `schedule apply`](docs/reference/uc2ctl.md#schedule-apply) ·
   [UC v2 operations § Changing a running cluster](docs/ops/uc2-runbook.md#changing-a-running-cluster)
 
+**Fixed**
+
+- **A node could run one config version behind, forever, after a restart.**
+  A follower re-archiving a config frame while a reconcile truncation was in
+  flight lost that frame's one observation to the state machine's truncating
+  latch, and nothing re-derived it until the next restart — the nightly
+  `sigkill_mid_config_window` failure of 2026-09-02, where the respawned
+  ex-leader replicated normally at v1 while its peers ran v2. Config
+  observations are now held across the latch and replayed at the ack, exactly
+  as term observations already were; the simulator, which could not express
+  a lost observation, now models the archive's exactly-once emission and
+  carries a red-twin pin for it.
+  → [Verification § Deterministic simulation](docs/VERIFICATION.md#2-deterministic-simulation)
+- **A learner joining below a still-climbing purge floor could wedge for
+  good.** After adopting one snapshot floor, a learner that fell behind the
+  leader's next purge could neither fetch the purged span nor adopt the next
+  floor over its non-empty journal; the refusal was one stderr line and the
+  learner never converged (the nightly two-FSM learner failure of
+  2026-09-01). The archive now drops its committed-and-subsumed prefix and
+  adopts the new floor, the same wipe-and-rejoin posture `NoCommonPrefix`
+  takes.
+  → [Change cluster membership § pair with snapshots](docs/how-to/change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously)
+- **A second FSM row no longer fail-stops when its snapshot sits above the
+  set's floor.** A two-row snapshot set is adopted at the lower of its rows'
+  positions, so the other row's artifact is briefly above what the node has
+  committed; the gap guard treated that as unbridgeable and killed the apply
+  agent. It now waits for the tail (reported once per wait) and fail-stops
+  only when no covering artifact exists at all.
+  → [Change cluster membership § pair with snapshots](docs/how-to/change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously)
+
 **Removed (breaking)**
 
 - **The apply trait signature changes**: `apply(&mut self, position: u64,

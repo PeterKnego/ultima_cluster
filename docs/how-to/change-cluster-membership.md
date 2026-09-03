@@ -135,6 +135,16 @@ a purged-cluster learner's `min_applied` at 0 and made `promote` refuse
 set-membership bitmask with the positional, by-name check — [Upgrade a
 cluster § wire + cnc change in 2.11](upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31).)
 
+**A floor that keeps climbing while the learner joins** (2.11 pending) is
+handled, not a wedge: if the leader purges past what the learner has
+fetched since its first snapshot install, the next session's floor is
+adopted over the learner's non-empty journal (the prefix it held is
+committed history the new snapshot subsumes), and a row whose artifact sits
+above the set's floor waits for its tail instead of fail-stopping — the
+service logs `replay waits for snapshot artifact` once per wait. Before
+this, the learner stayed at its first floor forever and one FSM row could
+die with `SnapshotRequired`.
+
 ## Add a voter
 
 Two independent changes, in order.

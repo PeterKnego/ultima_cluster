@@ -27,7 +27,7 @@ use uc_protocol::v2::ipc::{MSG_V2_SCHED, SchedOp, SchedRecord, write_sched_recor
 use crate::builder_agent::BuildJob;
 use crate::config::SnapshotError;
 use crate::egress::Egress;
-use crate::replay::replay_into;
+use crate::replay::{Replay, replay_into};
 use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 
 /// Time-and-timers §4.8: how many spins `write_sched` has taken waiting on a
@@ -226,6 +226,10 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// reconstruction is degrading the follower back onto the live buffer.
     /// Cleared once replay rejoins.
     pub(crate) needs_replay: bool,
+    /// The artifact position a below-floor replay is waiting on
+    /// (`Replay::AwaitArtifact`), so the wait is reported once per episode
+    /// rather than once per cycle; `None` when not waiting.
+    pub(crate) replay_wait: Option<u64>,
     /// The node `instance_id` this incarnation attached to (M5 final review
     /// #2c). A change means the node restarted and recreated the cnc page in
     /// place — this attachment is invalidated and this thread must fail-stop
@@ -550,12 +554,28 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 &st.journal_dir,
                 st.snapshot_restore.as_ref(),
             ) {
-                Ok(cursor) => cursor,
+                Ok(Replay::Rejoin(cursor)) => cursor,
+                // The covering artifact is above `min(commit, durable)`: the
+                // counters are still climbing toward it. Leave the cursor
+                // where it is and let the agent idle; the next cycle overruns
+                // again and re-checks. Reported once per wait episode.
+                Ok(Replay::AwaitArtifact { artifact, target }) => {
+                    if st.replay_wait != Some(artifact) {
+                        eprintln!(
+                            "uc_service: service {} replay waits for snapshot artifact at {artifact} \
+                             (apply target {target}); the tail is still arriving",
+                            st.service_id
+                        );
+                        st.replay_wait = Some(artifact);
+                    }
+                    break;
+                }
                 // Fail-stop with the contract named (Display carries it). The
                 // SnapshotRequired case is the deliberate below-floor-without-
                 // -snapshot outcome; any other Err is genuine journal I/O.
                 Err(e) => panic!("service journal replay fail-stop: {e}"),
             };
+            st.replay_wait = None;
             st.follower.cursor = cursor;
             crate::attach::slot(&st.cnc, st.service_id)
                 .applied
@@ -944,6 +964,138 @@ mod tests {
             .unwrap()
     }
 
+    // ------------------- nightly 33488022809: replay must WAIT for a covering artifact
+
+    /// Nightly 33488022809 (2026-09-01, the two-FSM learner capstone). A
+    /// learner adopts a two-row snapshot set at the `min` of the rows'
+    /// positions, so the row whose artifact sits ABOVE that floor has an
+    /// artifact the gap guard cannot use yet: `newest(target)` with `target =
+    /// min(commit, durable)` below the artifact finds nothing, and the guard
+    /// treated "not durable enough yet" as "unbridgeable" — a
+    /// `SnapshotRequired` fail-stop of the apply agent (`uc2-apply` panicked
+    /// at apply.rs:470 on 502878c). The counters were still climbing; a later
+    /// cycle would have installed it. The guard must fail-stop only when NO
+    /// artifact at or above the purge floor exists at all; an artifact above
+    /// the target means wait for the target to reach it.
+    #[test]
+    fn a_gap_with_an_artifact_above_the_target_waits_then_installs() {
+        let dir = scratch();
+        let cnc = page(0x5151);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        // Lap the ring: 1400 frames of 96 B through a 64 KiB ring, recorded
+        // into a real journal by the real archive as we go (the appender
+        // never overwrites unrecorded bytes). Cursor 0 is then far below
+        // what the ring retains. Frame positions come from the appender (it
+        // pads at each wrap).
+        let journal_dir = dir.path().join("journal");
+        let mut archive = uc_log::archive::Archive::open(uc_log::archive::ArchiveConfig {
+            segment_size_bytes: 16 * 1024,
+            preallocate_segments: false,
+            ..uc_log::archive::ArchiveConfig::new(&journal_dir)
+        })
+        .unwrap();
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        const N: usize = 1400;
+        let mut pos = Vec::with_capacity(N);
+        for i in 0..N {
+            pos.push(appender.append(1, i as u32, &[1u8; 64]).unwrap());
+            if i % 100 == 99 {
+                while archive.do_work(&buffer).unwrap() {}
+            }
+        }
+        while archive.do_work(&buffer).unwrap() {}
+        let head = cnc.counters().append.load_acquire();
+        assert_eq!(cnc.counters().durable.load_acquire(), head, "all recorded");
+        // The journal is purged below frame 300 (segment-granular, so the
+        // floor F lands on a block base at or below it — above 0 is what
+        // matters); the one artifact sits at P = frame 1300, inside the
+        // ring's retained window.
+        let p_pos = pos[1300];
+        let f_base = archive.purge_below(pos[300]).unwrap();
+        assert!(
+            f_base > 0 && f_base <= pos[300],
+            "purged below frame 300: F = {f_base}"
+        );
+        drop(archive);
+        let store = crate::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+        store
+            .publish(p_pos, |w| w.write_all(b"snap").map_err(Into::into))
+            .unwrap();
+        let restore = super::SnapshotRestore::<CountSm> {
+            store,
+            install: Box::new(|sm, pos, _r| {
+                sm.last = Some(pos);
+                Ok(pos)
+            }),
+        };
+        // Commit lags the artifact: target = min(commit, durable) < P.
+        cnc.counters().commit.store_release(pos[1200]);
+
+        let egress_ring =
+            uc_protocol::ring::BroadcastRing::create(&dir.path().join("egress.bc"), 1 << 16, 1024)
+                .unwrap();
+        let (_qp, svc_query) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_query.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let (svc_sched, _sp) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_sched.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let mut st = super::ApplyState {
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            follower: uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0),
+            sm: Arc::new(std::sync::Mutex::new(CountSm::default())),
+            cnc: Arc::clone(&cnc),
+            egress: crate::egress::Egress::new(egress_ring.producer()),
+            resp_buf: Vec::new(),
+            journal_dir,
+            svc_query,
+            svc_sched,
+            announce_pending: false,
+            needs_replay: false,
+            replay_wait: None,
+            instance_id: 0x5151,
+            instance_mismatch_streak: 0,
+            my_epoch: 1,
+            service_id: 0,
+            lag_mode: crate::lag::LagMode::Off,
+            declared: 0b1,
+            lag_waiting: false,
+            snapshot_trigger: None,
+            snapshot_restore: Some(restore),
+        };
+
+        // Cycle 1: overrun -> replay -> the artifact is above the target.
+        // Not a fail-stop: wait, cursor untouched, nothing applied.
+        assert!(
+            !super::apply_cycle(&mut st),
+            "no progress while the artifact is above the target"
+        );
+        assert_eq!(st.follower.cursor, 0, "cursor untouched while waiting");
+        assert_eq!(st.sm.lock().unwrap().last, None);
+        // Still waiting on the next cycle (no panic, no progress).
+        assert!(!super::apply_cycle(&mut st));
+
+        // The target reaches the artifact: install at P, rejoin the live ring
+        // at P, apply the tail P..head.
+        cnc.counters().commit.store_release(head);
+        assert!(super::apply_cycle(&mut st), "install + tail");
+        let sm = st.sm.lock().unwrap();
+        assert_eq!(
+            sm.applies,
+            (N - 1301) as u64,
+            "exactly the frames above P (P itself is in the snapshot)"
+        );
+        assert_eq!(sm.last, Some(pos[N - 1]));
+        assert_eq!(st.follower.cursor, head);
+    }
+
     /// M14c2 ruling K (`docs/benchmarks/uc2-m14c-*`): `uc_service_lag_waits_total`
     /// read 0 while a BOUNDED FSM sat parked at the barrier, because the cap
     /// landed MID-FRAME. `lag::plan` only says `Wait` when the cap is at or
@@ -999,6 +1151,7 @@ mod tests {
             svc_sched,
             announce_pending: false,
             needs_replay: false,
+            replay_wait: None,
             instance_id: 0x1234,
             instance_mismatch_streak: 0,
             my_epoch: 1,

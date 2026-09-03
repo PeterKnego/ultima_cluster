@@ -37,12 +37,6 @@ pub enum ArchiveError {
     Journal(#[from] JournalError),
     #[error("position {pos} is below the first archived block (first base {first_base})")]
     PositionPurged { pos: u64, first_base: u64 },
-    /// M6 Task 6: `adopt_floor(pos)` on a non-empty archive whose durable
-    /// frontier is below `pos` — adopting would orphan the real prefix in
-    /// `[durable, pos)`. Legal only for an empty archive (the learner-join case)
-    /// or as a no-op when the frontier already covers `pos`.
-    #[error("cannot adopt snapshot floor {pos}: archive already holds data up to {durable}")]
-    AdoptFloorConflict { durable: u64, pos: u64 },
     /// Post-M7 follow-up: a recorded block whose frame headers are inconsistent
     /// with the block length (sub-header claimed length, or a frame overrunning
     /// the block). Archived blocks are journal-CRC-covered, so this is a
@@ -347,20 +341,26 @@ impl Archive {
     /// a non-empty archive BELOW `pos` errors — adopting would orphan the real
     /// prefix in `[durable, pos)`. Returns the new `durable`/`first_base`.
     pub fn adopt_floor(&mut self, pos: u64) -> Result<u64, ArchiveError> {
-        if self.journal.last_seq().is_some() {
-            if self.durable_pos >= pos {
-                return Ok(self.durable_pos); // already covered — no-op
-            }
-            return Err(ArchiveError::AdoptFloorConflict {
-                durable: self.durable_pos,
-                pos,
-            });
+        if self.durable_pos >= pos {
+            return Ok(self.durable_pos); // already covered — no-op
         }
-        if pos < self.durable_pos {
-            return Err(ArchiveError::AdoptFloorConflict {
-                durable: self.durable_pos,
-                pos,
-            });
+        if self.journal.last_seq().is_some() {
+            // Wipe-and-adopt (nightly 33488022809). A floor the leader ships
+            // is at or below its commit, so every byte this archive holds
+            // below it is committed history the snapshot subsumes — and the
+            // span `[durable, pos)` is purged at the leader, so nothing can
+            // ever fill it. Refusing here wedged a learner for good (it could
+            // neither fetch the span nor adopt the floor); dropping the
+            // journal and adopting is the same posture `NoCommonPrefix`'s
+            // wipe-and-rejoin takes. The node re-primes the counters at the
+            // new floor and re-seeds the SM's lineage from the leader's map
+            // before commanding this, exactly as for an empty archive.
+            self.journal.truncate_all()?.wait()?;
+            self.next_block_seq = 0;
+            self.last_observed_term = 0;
+            self.term_observations.clear();
+            self.config_observations.clear();
+            self.table_observations.clear();
         }
         self.durable_pos = pos;
         self.first_base = pos;
@@ -1111,23 +1111,67 @@ mod tests {
         }
     }
 
+    /// Nightly 33488022809 (2026-09-01, the two-FSM learner capstone): a
+    /// learner adopted floor F1 on an empty archive, deep-NAK replay fetched a
+    /// few blocks, and the leader's purge floor climbed past them to F2. The
+    /// second session's `adopt_floor(F2)` was refused ("archive already holds
+    /// data up to D") and the learner was wedged for good: it could neither
+    /// fetch `[D, F2)` (purged at the leader) nor adopt F2 (non-empty). A floor
+    /// the leader ships is at or below its commit, so every byte in `[.., D]`
+    /// is committed history the snapshot at F2 subsumes: drop the journal and
+    /// adopt — the same wipe-and-rejoin posture `NoCommonPrefix` has.
     #[test]
     #[cfg_attr(miri, ignore)] // real journal files + fsync
-    fn adopt_floor_on_nonempty_below_pos_is_rejected() {
-        let (b, _c, dir) = setup(1 << 16);
+    fn adopt_floor_above_a_nonempty_archive_wipes_and_adopts() {
+        let (b, c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..5 {
             a.append(1, i, &[7u8; 64]).unwrap();
         }
         arch.do_work(&b).unwrap(); // durable = 480, journal non-empty
-        // Adopting a floor ABOVE the real frontier would orphan the prefix.
-        assert!(matches!(
-            arch.adopt_floor(64 * 1024),
-            Err(ArchiveError::AdoptFloorConflict { .. })
-        ));
-        // But adopting one we already cover is a harmless no-op.
-        assert_eq!(arch.adopt_floor(0).unwrap(), arch.recovered_position());
+        assert_eq!(arch.recovered_position(), 480);
+
+        // Adopting one we already cover is a harmless no-op.
+        assert_eq!(arch.adopt_floor(0).unwrap(), 480);
+
+        // A floor ABOVE the frontier: the prefix is dropped, the floor adopted.
+        assert_eq!(arch.adopt_floor(64 * 1024).unwrap(), 64 * 1024);
+        assert_eq!(arch.recovered_position(), 64 * 1024, "durable = the floor");
+        assert_eq!(arch.first_base(), 64 * 1024, "first_base = the floor");
+        assert_eq!(
+            arch.journal().last_seq(),
+            None,
+            "the orphaned prefix is gone"
+        );
+
+        // The live stream continues from the floor: the node primes the
+        // counters there and the next recorded block is seq 0 at base = floor.
+        c.counters().prime(64 * 1024);
+        let mut a = Appender::new(Arc::clone(&b), 2, 0);
+        a.append(2, 0, &[9u8; 64]).unwrap();
+        assert!(arch.do_work(&b).unwrap());
+        assert_eq!(arch.journal().first_seq(), Some(0));
+        let (base, _) = arch.journal().read(0).unwrap().expect("block 0");
+        assert_eq!(
+            base,
+            64 * 1024,
+            "the first block after the wipe sits at the floor"
+        );
+        assert_eq!(arch.recovered_position(), 64 * 1024 + 96);
+    }
+
+    /// A floor BELOW the frontier never lowers it: a no-op returning the
+    /// frontier, on an empty archive as on a non-empty one.
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn adopt_floor_below_the_frontier_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        assert_eq!(arch.adopt_floor(64 * 1024).unwrap(), 64 * 1024);
+        assert_eq!(arch.adopt_floor(32 * 1024).unwrap(), 64 * 1024);
+        assert_eq!(arch.recovered_position(), 64 * 1024);
+        assert_eq!(arch.first_base(), 64 * 1024);
     }
 
     #[test]

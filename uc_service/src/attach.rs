@@ -211,6 +211,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         svc_sched,
         announce_pending: true,
         needs_replay: false,
+        replay_wait: None,
         instance_id,
         instance_mismatch_streak: 0,
         my_epoch: epoch,
