@@ -61,7 +61,7 @@ use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp};
-use uc_lincheck::timer::{MixedCmd, TimerCmd, TimerReport, TimerResp};
+use uc_lincheck::timer::{MixedCmd, TimerCmd, TimerReport, TimerResp, assert_timer_report};
 use uc_log::cnc::{AdminReq, CncPage};
 
 mod common;
@@ -2034,64 +2034,6 @@ fn timer_report_until_ok(dir: &Path, deadline: Instant) -> TimerReport {
     }
 }
 
-/// The §4.3 order + exactly-once oracle over ONE node's timer record — the
-/// multi-process twin of `lin_v2.rs`'s `assert_section_4_3` /
-/// `assert_exactly_once`. Returns `(fires, late)`.
-fn check_timer_report(tag: &str, report: &TimerReport) -> (usize, usize) {
-    let st = &report.stamps;
-    // (d) log time never goes backwards along the applied series.
-    assert!(
-        st.windows(2).all(|w| w[0].1 <= w[1].1),
-        "[{tag}] log time went backwards in the stamp series"
-    );
-    // (b) exactly-once through `Timed`.
-    let mut seen = std::collections::HashSet::new();
-    for rec in &report.fired {
-        assert!(
-            seen.insert((rec.id, rec.deadline_ns)),
-            "[{tag}] timer ({}, deadline {}) delivered TWICE — {rec:?}",
-            rec.id,
-            rec.deadline_ns
-        );
-    }
-    // (c) §4.3: prefix-max / suffix-min over the stamp series, exactly as the
-    // in-process capstone does (see `lin_v2.rs::assert_section_4_3`).
-    let mut prefix_max = vec![0u64; st.len() + 1];
-    for i in 0..st.len() {
-        prefix_max[i + 1] = prefix_max[i].max(st[i].1);
-    }
-    let mut suffix_min = vec![u64::MAX; st.len() + 1];
-    for i in (0..st.len()).rev() {
-        suffix_min[i] = suffix_min[i + 1].min(st[i].1);
-    }
-    let mut late = 0usize;
-    for rec in &report.fired {
-        let lo = st.partition_point(|&(p, _)| p < rec.position);
-        let hi = st.partition_point(|&(p, _)| p <= rec.position);
-        if rec.time_ns > rec.deadline_ns {
-            late += 1;
-        } else {
-            assert!(
-                prefix_max[lo] <= rec.deadline_ns,
-                "[{tag}] a frame before the timer at {} is stamped {} > its deadline {} \
-                 (on-time fire) — {rec:?}",
-                rec.position,
-                prefix_max[lo],
-                rec.deadline_ns
-            );
-        }
-        assert!(
-            suffix_min[hi] >= rec.time_ns,
-            "[{tag}] a frame after the timer at {} is stamped {} < the fire's own stamp {} \
-             — {rec:?}",
-            rec.position,
-            suffix_min[hi],
-            rec.time_ns
-        );
-    }
-    (report.fired.len(), late)
-}
-
 /// Time-and-timers T11: `two_fsm_service_sigkill`'s twin with the row-1
 /// service running `Timed<TimerSm>` — a REAL `kill -9` of the timer FSM's OS
 /// process, three times, under sustained schedule/cancel load.
@@ -2104,11 +2046,12 @@ fn check_timer_report(tag: &str, report: &TimerReport) -> (usize, usize) {
 /// decode the shared `MixedCmd` wire (see the `uc_lincheck::timer` module doc)
 /// and its register transition is untouched by them.
 ///
-/// Oracle on the recovered service's own record (one node → one report, so
-/// (a) replication equivalence is trivially satisfied and the in-process
-/// capstone carries it): (b) no `(id, deadline_ns)` twice, (c) the §4.3 order,
-/// (d) a non-decreasing stamp series — plus fires kept arriving after EVERY
-/// restart, and the register history stays linearizable throughout.
+/// Oracle: `uc_lincheck::timer::assert_timer_report` on the recovered service's
+/// own record — the SAME checker the in-process capstone runs (never early, at
+/// most once, the §4.3 order, every fire matching a live un-cancelled
+/// un-superseded instance, and no LOSS). Cross-replica identity is the
+/// capstone's job; one node has one report. Plus: fires kept arriving after
+/// EVERY restart, and the register history stays linearizable throughout.
 #[test]
 fn two_fsm_timer_service_sigkill() {
     shorten_client_timeout();
@@ -2237,9 +2180,10 @@ fn two_fsm_timer_service_sigkill() {
     }
 
     let report = timer_report_until_ok(&inst, Instant::now() + Duration::from_secs(30));
-    let (fires, late) = check_timer_report("two_fsm_timer_service_sigkill", &report);
+    let stats = assert_timer_report("two_fsm_timer_service_sigkill", &report);
+    let fires = stats.fires;
     eprintln!(
-        "[two_fsm_timer_service_sigkill] seed={seed} scheduled={} fires={fires} late={late} \
+        "[two_fsm_timer_service_sigkill] seed={seed} acked_schedules={} {stats:?} \
          per-restart fires={fires_after:?}",
         scheduled.load(Ordering::Relaxed)
     );
@@ -2258,6 +2202,12 @@ fn two_fsm_timer_service_sigkill() {
     assert!(
         fires >= 20,
         "only {fires} timers fired — the timer arm was vacuous"
+    );
+    // The no-loss clause proves nothing unless it demanded a fire of something.
+    assert!(
+        stats.completeness_checked >= 20,
+        "the no-loss clause armed for only {} schedules — it proved nothing: {stats:?}",
+        stats.completeness_checked
     );
 
     assert_linearizable(

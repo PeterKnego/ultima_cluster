@@ -33,7 +33,7 @@ use lincheck_v2::{
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History};
 use uc_lincheck::register::{Cmd, CmdResp};
-use uc_lincheck::timer::{MixedCmd, MixedRegisterSm, TimerReport};
+use uc_lincheck::timer::{MixedCmd, MixedRegisterSm, TimerReport, assert_timer_report};
 use uc_net::fault::FaultConfig;
 use uc_node::PurgePolicy;
 
@@ -1389,81 +1389,6 @@ fn snapshot_restart_installs_only_with_purge() {
 
 // ------------------------------------- time-and-timers T11: the timer capstone
 
-/// The §4.3 order check for one node's record (ruling 4c/4d). Returns the
-/// number of LATE fires so the caller can report it.
-///
-/// Over the node's own `(position, time_ns)` series:
-///
-/// * the series is non-decreasing in `time_ns` (log time never goes backwards);
-/// * for every fire, every stamp STRICTLY BEFORE its position is at or before
-///   its `deadline_ns` — unless the fire was late (`time_ns > deadline_ns`),
-///   the post-failover case §4.3 explicitly allows, where the leader could not
-///   place the instance at its deadline and the property degrades to "not
-///   before";
-/// * every stamp STRICTLY AFTER its position is at or after the fire's own
-///   stamp.
-///
-/// Prefix-max / suffix-min arrays make this O(stamps + fires log stamps)
-/// instead of the O(fires x stamps) the naive scan would be at ~10^3 fires and
-/// ~10^4 stamps.
-fn assert_section_4_3(label: &str, node: usize, report: &TimerReport) -> usize {
-    let st = &report.stamps;
-    assert!(
-        st.windows(2).all(|w| w[0].1 <= w[1].1),
-        "[{label}] node {node}: log time went backwards in the stamp series"
-    );
-    // `prefix_max[i]` = max time_ns over stamps[..i]; `suffix_min[i]` = min
-    // time_ns over stamps[i..].
-    let mut prefix_max = vec![0u64; st.len() + 1];
-    for i in 0..st.len() {
-        prefix_max[i + 1] = prefix_max[i].max(st[i].1);
-    }
-    let mut suffix_min = vec![u64::MAX; st.len() + 1];
-    for i in (0..st.len()).rev() {
-        suffix_min[i] = suffix_min[i + 1].min(st[i].1);
-    }
-    let mut late = 0usize;
-    for rec in &report.fired {
-        // Stamps are recorded in apply order, so `position` is ascending.
-        let lo = st.partition_point(|&(p, _)| p < rec.position);
-        let hi = st.partition_point(|&(p, _)| p <= rec.position);
-        if rec.time_ns > rec.deadline_ns {
-            late += 1;
-        } else {
-            assert!(
-                prefix_max[lo] <= rec.deadline_ns,
-                "[{label}] node {node}: a frame before the timer at {} is stamped {} > its \
-                 deadline {} (on-time fire) — {rec:?}",
-                rec.position,
-                prefix_max[lo],
-                rec.deadline_ns
-            );
-        }
-        assert!(
-            suffix_min[hi] >= rec.time_ns,
-            "[{label}] node {node}: a frame after the timer at {} is stamped {} < the fire's \
-             own stamp {} — {rec:?}",
-            rec.position,
-            suffix_min[hi],
-            rec.time_ns
-        );
-    }
-    late
-}
-
-/// Exactly-once through `Timed`: no `(id, deadline_ns)` was delivered twice.
-fn assert_exactly_once(label: &str, node: usize, report: &TimerReport) {
-    let mut seen = std::collections::HashSet::new();
-    for rec in &report.fired {
-        assert!(
-            seen.insert((rec.id, rec.deadline_ns)),
-            "[{label}] node {node}: timer ({}, deadline {}) delivered TWICE — {rec:?}",
-            rec.id,
-            rec.deadline_ns
-        );
-    }
-}
-
 /// Time-and-timers T11 capstone: `linearizable_under_failover_v2`'s workload
 /// and fault loop, on a HETEROGENEOUS two-FSM cluster — row 0 the register
 /// (WGL-checked exactly as today), row 1 `Timed<TimerSm>` under continuous
@@ -1482,14 +1407,19 @@ fn assert_exactly_once(label: &str, node: usize, report: &TimerReport) {
 ///
 /// The oracle, after the workers stop and every node's row-1 `applied` agrees:
 ///
-/// (a) every node's `fired` vector is IDENTICAL (replication equivalence — the
-///     `two_fsm_oracle_bites` pattern, here over the FSM's own record rather
-///     than a per-op fan-in comparison, because a timer op has no client-side
-///     answer to compare);
-/// (b) within a node, no `(id, deadline_ns)` fired twice (exactly-once);
-/// (c)+(d) the §4.3 ordering property over each node's own stamp series;
-/// (e) non-vacuity: enough fires actually happened, and at least one leader
-///     change did;
+/// (a) every node's `fired`/`scheduled`/`cancelled` vectors are IDENTICAL
+///     (replication equivalence — the `two_fsm_oracle_bites` pattern, here
+///     over the FSM's own record rather than a per-op fan-in comparison,
+///     because a timer op has no client-side answer to compare; all three are
+///     pure functions of the applied frames, and the per-node oracle's verdict
+///     is only comparable between nodes if its inputs are);
+/// (b) `uc_lincheck::timer::assert_timer_report` per node — the SHARED oracle
+///     the SIGKILL scenario runs too: never early, at most once, the §4.3
+///     order with both windows excluding the firing frame, every fire matching
+///     a live un-cancelled un-superseded instance, and no LOSS (every live
+///     schedule past the completeness margin fired);
+/// (c) non-vacuity: enough fires, at least one leader change, and the no-loss
+///     clause actually armed for something;
 ///
 /// then `check_register(&entries)` for FSM 0, exactly as the copied test does.
 #[test]
@@ -1623,9 +1553,10 @@ fn two_fsm_timer_churn_under_failover() {
         elapsed.as_secs_f64()
     );
 
-    // (a) replication equivalence: the same fires, in the same order, on
-    // every replica — including the ones whose service was crashed and
-    // rebuilt from the journal mid-run.
+    // (a) replication equivalence: the same fires — and the same schedule /
+    // cancel inputs the per-node oracle reasons over — in the same order on
+    // every replica, including the ones whose service was crashed and rebuilt
+    // from the journal mid-run.
     for (i, r) in reports.iter().enumerate().skip(1) {
         assert_eq!(
             r.fired,
@@ -1635,16 +1566,26 @@ fn two_fsm_timer_churn_under_failover() {
             reports[0].fired.len(),
             r.fired.len()
         );
+        assert_eq!(
+            r.scheduled, reports[0].scheduled,
+            "[{LABEL}] node {i} and node 0 disagree on what was SCHEDULED"
+        );
+        assert_eq!(
+            r.cancelled, reports[0].cancelled,
+            "[{LABEL}] node {i} and node 0 disagree on what was CANCELLED"
+        );
     }
-    // (b) exactly-once, (c)+(d) the §4.3 order, per node.
-    let mut late_total = 0usize;
-    for (i, r) in reports.iter().enumerate() {
-        assert_exactly_once(LABEL, i, r);
-        late_total += assert_section_4_3(LABEL, i, r);
-    }
-    eprintln!("[{LABEL}] late fires (per node): {}", late_total / n);
+    // (b) the SHARED per-node oracle (never early, at most once, §4.3 order,
+    // every fire matching a live instance, no loss).
+    let stats: Vec<_> = reports
+        .iter()
+        .enumerate()
+        .map(|(i, r)| assert_timer_report(&format!("{LABEL} node {i}"), r))
+        .collect();
+    eprintln!("[{LABEL}] per-node timer stats: {stats:?}");
 
-    // (e) non-vacuity.
+    // (c) non-vacuity — including the no-loss clause, which proves nothing if
+    // it never demanded a fire of anything.
     assert!(
         fires >= MIN_FIRES,
         "[{LABEL}] only {fires} timers fired (< {MIN_FIRES}) — the timer arm was vacuous"
@@ -1652,6 +1593,11 @@ fn two_fsm_timer_churn_under_failover() {
     assert!(
         leader_changes >= 1,
         "[{LABEL}] no leader change happened — the re-arm path was never exercised"
+    );
+    assert!(
+        stats.iter().all(|s| s.completeness_checked >= MIN_FIRES),
+        "[{LABEL}] the no-loss clause armed for fewer than {MIN_FIRES} schedules on some \
+         node — it proved nothing: {stats:?}"
     );
 
     // FSM 0's own bars, exactly as the copied capstone makes them.
