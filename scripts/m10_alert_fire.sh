@@ -238,6 +238,8 @@ RULE_META = {
     "Uc2ServicePinnedAtLagBound": {"severity": "warning", "real": True, "scenario": "fsm_pinned"},
     "Uc2ServiceIdentityDrift": {"severity": "critical", "real": False, "scenario": "identity_drift"},
     "Uc2ServiceVersionDrift": {"severity": "warning", "real": False, "scenario": "version_drift"},
+    "Uc2LogTimeFrozen": {"severity": "warning", "real": False, "scenario": "log_time_frozen"},
+    "Uc2ScheduleTableDiverged": {"severity": "warning", "real": False, "scenario": "schedule_diverged"},
 }
 
 
@@ -480,6 +482,40 @@ def build_Uc2ServiceVersionDrift():
     return r
 
 
+def build_Uc2LogTimeFrozen():
+    # Time-and-timers plan 1: `uc2_log_time_lag_seconds > 5 and on(instance)
+    # uc2_is_leader == 1`. Same two-series `and` shape as
+    # build_Uc2LeaderNotServing, and the result vector keeps the LHS's
+    # labels, so `labels_from` is the lag row. The scenario parks a synthetic
+    # leader's cnc log-time word 60s behind the wall clock and lets the REAL
+    # exporter compute the lag from it.
+    rows = load_scenario("log_time_frozen")
+    lag_row = select(rows, "uc2_log_time_lag_seconds", {})
+    leader_row = select(rows, "uc2_is_leader", {})
+    r = new_rule("warning", labels_from=lag_row)  # LHS of `and on(instance)`
+    add_hold_last(r, lag_row, "uc2_log_time_lag_seconds", 30)
+    add_hold_last(r, leader_row, "uc2_is_leader", 30)
+    r["eval_time"] = total_for(30)[0]
+    return r
+
+
+def build_Uc2ScheduleTableDiverged():
+    # Time-and-timers plan 2 (spec §5): the same two-instance `count_values`
+    # shape as build_Uc2ServiceIdentityDrift — the rule only fires when two
+    # DISTINCT positions are visible in the same window, so both synthetic
+    # "nodes" rows are needed. Unlike the drift rules, the outer `count(...)`
+    # here has no `by`, so it strips EVERY label: `labels_from=None`, the
+    # same as build_Uc2NoLeader's `max()`.
+    rows = load_scenario("schedule_diverged")
+    row_a = select(rows, "uc2_schedule_table_position", {"instance": "n0"})
+    row_b = select(rows, "uc2_schedule_table_position", {"instance": "n1"})
+    r = new_rule("warning", labels_from=None)
+    add_hold_last(r, row_a, "uc2_schedule_table_position", 60)
+    add_hold_last(r, row_b, "uc2_schedule_table_position", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -499,6 +535,8 @@ RULE_BUILDERS = {
     "Uc2ServicePinnedAtLagBound": build_Uc2ServicePinnedAtLagBound,
     "Uc2ServiceIdentityDrift": build_Uc2ServiceIdentityDrift,
     "Uc2ServiceVersionDrift": build_Uc2ServiceVersionDrift,
+    "Uc2LogTimeFrozen": build_Uc2LogTimeFrozen,
+    "Uc2ScheduleTableDiverged": build_Uc2ScheduleTableDiverged,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

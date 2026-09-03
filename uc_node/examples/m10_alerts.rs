@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
@@ -66,6 +66,8 @@ const ALL_SCENARIOS: &[&str] = &[
     "fsm_pinned",
     "identity_drift",
     "version_drift",
+    "log_time_frozen",
+    "schedule_diverged",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -191,6 +193,8 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "fsm_pinned" => scenario_fsm_pinned(scratch_root),
         "identity_drift" => scenario_identity_drift(),
         "version_drift" => scenario_version_drift(),
+        "log_time_frozen" => scenario_log_time_frozen(),
+        "schedule_diverged" => scenario_schedule_diverged(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -1318,6 +1322,119 @@ fn scenario_version_drift() -> (SeriesFile, Disclosure) {
                  count_values idiom detects.",
                 kv.as_str()
             ),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 16
+
+/// Uc2LogTimeFrozen — **synthetic, disclosed**: one synthetic `ObsSources`
+/// holding `NODE_FLAG_LEADER` with the cnc log-time word parked 60 s behind
+/// wall time, rendered through the real exporter (which computes
+/// `uc2_log_time_lag_seconds` itself, leader-gated, from exactly those two
+/// readings). The REAL state — a leader whose appender has stalled, or whose
+/// wall clock stepped backwards far enough that `max(now, last)` holds the
+/// stamp — is either a minutes-long idle window or a system-clock
+/// manipulation; both are out of this harness's per-scenario budget, the
+/// same reasoning `leader_not_serving` uses for its own flag store.
+fn scenario_log_time_frozen() -> (SeriesFile, Disclosure) {
+    let sources = synthetic_sources(0);
+    sources.cnc.status().flags.store_release(NODE_FLAG_LEADER);
+    // The exporter reads wall time itself, so park the log clock a fixed
+    // distance BEHIND it rather than writing a lag directly.
+    let behind_ns: u64 = 60 * 1_000_000_000;
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("wall clock after the epoch")
+        .as_nanos() as u64;
+    sources.cnc.store_log_time_ns(now_ns - behind_ns);
+
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc2_log_time_lag_seconds", "uc2_is_leader"],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "log_time_frozen",
+            rules: &["Uc2LogTimeFrozen"],
+            state: "synthetic",
+            method: "synthetic ObsSources: cnc status flags stored as NODE_FLAG_LEADER \
+                     and the cnc log-time word stored 60s behind the wall clock read at the \
+                     same instant — a leader whose log clock has stopped advancing. The \
+                     exporter computes uc2_log_time_lag_seconds itself (leader-gated, wall \
+                     minus log clock), so the ~60 that lands in the series is the REAL \
+                     encoder's arithmetic over a planted pair of readings, not a planted lag."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 17
+
+/// Uc2ScheduleTableDiverged — **synthetic, disclosed**: two synthetic
+/// `ObsSources` ("n0" at an adopted table position, "n1" still at 0), each
+/// its own real exporter — the shape of a node that joined below the purge
+/// floor (the table is NOT carried in the snapshot stream, ruling R13) while
+/// its peers hold the table. Producing it for real needs a purge floor above
+/// a real table frame plus a real joiner, a multi-node scenario an order of
+/// magnitude larger than this rule's share of the harness; same
+/// synthetic-state/real-transition budget as `identity_drift` above.
+fn scenario_schedule_diverged() -> (SeriesFile, Disclosure) {
+    let src_a = synthetic_sources(0);
+    let src_b = synthetic_sources(1);
+    // n0 adopted the table at frame-END 8192 (3 entries armed); n1 never saw
+    // it and holds the fresh-node reading, 0.
+    src_a.schedule_table_position.store(8192, Ordering::Release);
+    src_a.schedule_entries.store(3, Ordering::Release);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round(
+            "n0",
+            &scrape(addr_a),
+            &["uc2_schedule_table_position", "uc2_schedule_entries"],
+        );
+        sf.record_round(
+            "n1",
+            &scrape(addr_b),
+            &["uc2_schedule_table_position", "uc2_schedule_entries"],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "schedule_diverged",
+            rules: &["Uc2ScheduleTableDiverged"],
+            state: "synthetic",
+            method: "two synthetic ObsSources, each its own real exporter: \"n0\" has \
+                     adopted the table (uc2_schedule_table_position 8192, \
+                     uc2_schedule_entries 3) and \"n1\" has not (0 and 0) — a node that joined \
+                     BELOW THE PURGE FLOOR, where the table is not carried in the snapshot \
+                     stream. Both positions render through the real encoder; two DISTINCT \
+                     values across instances is exactly what Uc2ScheduleTableDiverged's \
+                     count_values idiom detects. The entries gauge is captured alongside \
+                     because it is what tells the wipe signature (position 0 WITH entries > 0) \
+                     apart from this one, though the rule itself reads only the position."
+                .into(),
         },
     )
 }
