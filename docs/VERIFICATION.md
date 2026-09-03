@@ -240,6 +240,27 @@ restores the pre-fix index-aligned match through a `mutation-testing` tooth
 (`reconcile::reconcile_index_aligned`, the old body verbatim) and pins that
 the sim then sees the wipes. Nightly runs both.
 
+It was blind in a third place until 2026-09-03. `observe_config_frames`
+re-fed `ConfigObserved` for *every* ledger frame at or below durable on
+*every* archive step, "idempotent by version monotonicity" — but the real
+archive emits each observation exactly once, on its own thread, and
+`ElectionSm`'s truncating latch drops whatever is fed under it. So the
+class "a config observation lost across a truncation" was unexpressible,
+and nightly 33605909828 (`sigkill_mid_config_window`, 2026-09-02) found it
+on a 4-vCPU runner instead: a restarted ex-leader re-archived its own
+CONFIG v2 frame, the reconcile cut landed at exactly that frame's end, the
+one observation died under the latch, and the node replicated at v1 for
+90 s. The sim now emits once per node, delivers `archive_obs_latency_ns`
+after the counter moves (`SimEvent::CfgObsDelivered` — the archive thread's
+store-then-send window), consumes on the consensus cadence, and holds
+across the latch exactly as `uc_node` does since `cc4e321`.
+`config_observation_under_the_latch_is_adopted_at_the_ack` stages the
+interleaving with `set_archive_frozen` + an injected term map and pins the
+adoption; its red twin
+`counterfactual_unheld_config_observation_breaks_inv8` deletes the hold
+(`config_obs_latch_buffer = false`, the pre-fix node) and pins that inv8
+fires at the ack.
+
 **Timers (`2.11.0`).** [`uc_sim::timers`](/uc_sim/src/timers.rs) is a pure,
 dependency-free reference model of the leader-pass algorithm (spec §4.3): 64
 seeds sweep five rules, including that lateness must pre-date the pass — a

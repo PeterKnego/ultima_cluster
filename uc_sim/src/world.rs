@@ -369,6 +369,24 @@ pub struct SimConfig {
     /// removes a config frame then leaves the stale config adopted, and inv8
     /// must go red.
     pub revert_on_truncate_disabled: bool,
+    /// COUNTERFACTUAL (default `true` = the shipped node since main
+    /// `cc4e321`): the node layer holds durably-recorded CONFIG observations
+    /// while the SM's truncating latch is up and replays them (at/below the
+    /// cut) once the ack lands. `false` reproduces the pre-fix node, which fed
+    /// them straight into the latch: the archive never re-emits, so a config
+    /// frame whose end the archive crossed during a reconcile truncation is
+    /// never adopted — the restarted ex-leader of nightly 33605909828 ran one
+    /// config version behind, replicating normally, until its next restart.
+    /// inv6 must go red.
+    pub config_obs_latch_buffer: bool,
+    /// Delay from an `ArchiveStep` moving the durable counter to its CONFIG
+    /// observation reaching the node layer (`SimEvent::CfgObsDelivered`).
+    /// Default 0: the same instant, queued behind whatever is already due.
+    /// Non-zero opens the archive-thread preemption window of nightly
+    /// 33605909828: the consensus agent absorbs the counter, a term map
+    /// reconciles against it and raises the truncating latch, and only then
+    /// does the observation arrive — under the latch.
+    pub archive_obs_latency_ns: u64,
 }
 
 impl Default for SimConfig {
@@ -397,6 +415,8 @@ impl Default for SimConfig {
             genesis_absent: Vec::new(),
             serving_gate_disabled: false,
             revert_on_truncate_disabled: false,
+            config_obs_latch_buffer: true,
+            archive_obs_latency_ns: 0,
         }
     }
 }
@@ -524,6 +544,20 @@ enum SimEvent {
     ArchiveStep {
         node: usize,
     },
+    /// The archive agent's CONFIG observation reaching the node layer's
+    /// channel (`Consensus::cfg_obs_rx`). Scheduled by `ArchiveStep`
+    /// `archive_obs_latency_ns` after the durable counter moved: in the real
+    /// node the recorder store_release's `durable` inside `do_work` and the
+    /// agent sends its observations only after `do_work` returns — a window
+    /// in which a preempted archive thread leaves the counter visible to the
+    /// consensus agent with the observation still in its outbox (nightly
+    /// 33605909828). `boot` guards a delivery that outlives a restart.
+    CfgObsDelivered {
+        node: usize,
+        boot: u64,
+        position: u64,
+        config: ClusterConfig,
+    },
     /// Issue #7: the consensus agent's duty cycle, scheduled INDEPENDENTLY of
     /// `ArchiveStep`. It is the only thing that absorbs the durable counter into
     /// `ElectionSm` (`Event::DurableAdvanced`), mirroring `Consensus::do_work`
@@ -644,6 +678,29 @@ struct Node {
     cfg_cur_pos: u64,
     cfg_prev: ClusterConfig,
     cfg_prev_pos: u64,
+    /// Frame ENDs this node's archive scan has already emitted a
+    /// `ConfigObserved` for. The real archive emits each observation EXACTLY
+    /// ONCE (`Archive::observe_terms` → `Consensus::do_work` step 1c) and
+    /// nothing re-derives a dropped one until the next boot's journal walk —
+    /// so the sim must not re-feed either, or a lost observation is
+    /// unexpressible (nightly 33605909828). Entries above a truncation's cut
+    /// are forgotten at the ack (the bytes are gone; a refill re-scans them),
+    /// and the set is cleared at restart (the boot re-scan).
+    cfg_observed: HashSet<u64>,
+    /// The node layer's hold across the SM's truncating latch — the mirror of
+    /// `Consensus::pending_cfg_obs` (main `cc4e321`). Fed in position order
+    /// once no truncation is in flight; entries above the cut are dropped at
+    /// the ack. `SimConfig::config_obs_latch_buffer = false` deletes the hold
+    /// (the pre-fix node: fed under the latch, dropped, lost).
+    pending_cfg_obs: Vec<(u64, ClusterConfig)>,
+    /// Bumped at every restart: a `CfgObsDelivered` scheduled by the previous
+    /// process is dropped (its channel died with it; the boot re-scan
+    /// re-emits).
+    archive_boot: u64,
+    /// `CfgObsDelivered` events scheduled for this boot and not yet handled —
+    /// emitted by the archive, not yet in the node layer's hold. inv6 exempts
+    /// a node with any (the same transient as a held one).
+    cfg_obs_in_flight: u32,
     /// `Action::HaltRemoved` fired: the node fail-stopped permanently (removed
     /// from the cluster). Like a crash, but no restart is ever scheduled and
     /// `restart()` refuses.
@@ -740,6 +797,10 @@ pub struct World {
     // BTreeSet or collect+sort first.
     isolated: HashSet<usize>,
     blocked_pairs: HashSet<(usize, usize)>,
+    /// Nodes whose archive agent is stalled (`set_archive_frozen`): they keep
+    /// APPENDING what the leader ships but make nothing durable — the
+    /// scripting lever for "bytes held, not yet fsync'd" (a lagging archive).
+    archive_frozen: HashSet<usize>,
     vote_drop_until: u64,
     crash_on_truncate: bool,
     // ---- M7 config modeling ----
@@ -856,6 +917,10 @@ impl World {
                 cfg_cur_pos: 0,
                 cfg_prev: genesis.clone(),
                 cfg_prev_pos: 0,
+                cfg_observed: HashSet::new(),
+                pending_cfg_obs: Vec::new(),
+                archive_boot: 0,
+                cfg_obs_in_flight: 0,
                 halted: false,
                 crypto: None,
                 nak_sent: 0,
@@ -875,6 +940,7 @@ impl World {
             checker,
             isolated: HashSet::new(),
             blocked_pairs: HashSet::new(),
+            archive_frozen: HashSet::new(),
             vote_drop_until: 0,
             crash_on_truncate: false,
             config_frames: Vec::new(),
@@ -1159,9 +1225,16 @@ impl World {
         // truncation in flight are exempt — the mid-window state (pruned map
         // adopted, physical cut pending) is a legitimate transient, and inv8
         // re-checks the settled state at the ack. Down/halted nodes are frozen.
+        // A node whose archive has EMITTED an observation the consensus agent
+        // has not yet CONSUMED (in flight to the channel, or held: the
+        // thread split of issue #7 applied to config observations) is the
+        // same kind of transient — exempt until it drains. A LOST
+        // observation is never pending (it was consumed and dropped), so this
+        // exemption never hides the `config_obs_latch_buffer = false` defect.
         for i in 0..self.cfg.n_nodes {
             let nd = &self.nodes[i];
-            if !nd.up || nd.truncating {
+            if !nd.up || nd.truncating || nd.cfg_obs_in_flight > 0 || !nd.pending_cfg_obs.is_empty()
+            {
                 continue;
             }
             let adopted = nd.sm.config().clone();
@@ -1298,6 +1371,24 @@ impl World {
             SimEvent::Tick { node } => self.on_tick(node, now, step),
             SimEvent::ArchiveStep { node } => self.on_archive(node, now, step),
             SimEvent::ConsensusStep { node } => self.on_consensus_step(node, now, step),
+            SimEvent::CfgObsDelivered {
+                node,
+                boot,
+                position,
+                config,
+            } => {
+                let nd = &mut self.nodes[node];
+                if nd.archive_boot != boot {
+                    return Ok(()); // a dead process's delivery; the boot re-scan re-emits
+                }
+                nd.cfg_obs_in_flight = nd.cfg_obs_in_flight.saturating_sub(1);
+                // Bytes a settled cut has since removed (the node's
+                // `position > durable` belt) are dropped; a refill re-scans.
+                if nd.up && position <= nd.durable {
+                    nd.pending_cfg_obs.push((position, config));
+                }
+                Ok(())
+            }
             SimEvent::Restart { node } => self.on_restart(node, now),
             SimEvent::TruncatedFeedback { node, epoch, to } => {
                 self.on_truncated_feedback(node, epoch, to, now, step)
@@ -1378,7 +1469,10 @@ impl World {
     }
 
     fn on_archive(&mut self, node: usize, now: u64, step: u64) -> Result<(), InvariantViolation> {
-        if self.nodes[node].up && !self.nodes[node].truncating {
+        if self.nodes[node].up
+            && !self.nodes[node].truncating
+            && !self.archive_frozen.contains(&node)
+        {
             let nd = &self.nodes[node];
             if nd.append > nd.durable {
                 let want = 1 + self.draw() % self.cfg.archive_bytes_max;
@@ -1396,7 +1490,7 @@ impl World {
                 // M7 adopt-at-durable: the archive frame-scan surfaces config
                 // frames whose END the fresh durable just crossed (and whose
                 // bytes this node genuinely holds).
-                self.observe_config_frames(node, now, step)?;
+                self.observe_config_frames(node, now);
                 // A follower reports its fresh durable to the current leader —
                 // but only up to `matched` (the frontier confirmed consistent
                 // with this leader). Never report divergent bytes it has fsync'd
@@ -1489,6 +1583,10 @@ impl World {
     ) -> Result<(), InvariantViolation> {
         if self.nodes[node].up {
             self.absorb_durable(node, now, step)?;
+            // do_work step 1c: the archive EMITTED (at its own step); the
+            // consensus agent CONSUMES here, a duty cycle later — the window
+            // in which a term map can raise the truncating latch first.
+            self.drain_cfg_obs(node, now, step)?;
         }
         self.push(
             SimEvent::ConsensusStep { node },
@@ -1563,6 +1661,12 @@ impl World {
         nd.append = durable;
         nd.commit = 0;
         nd.truncating = false;
+        // Boot re-scan (`rederive_config`): every frame at/below durable is
+        // observed afresh; the SM's version gate drops what it already holds.
+        nd.cfg_observed.clear();
+        nd.pending_cfg_obs.clear();
+        nd.archive_boot += 1;
+        nd.cfg_obs_in_flight = 0;
         nd.new_term_pos = None;
         nd.leader_hint = None;
         nd.matched = 0;
@@ -1635,6 +1739,17 @@ impl World {
                 self.reopen_gate(node, now, step)?;
             }
         }
+        // The cut removed every byte above `to`: the archive's scan forgets
+        // those frames (a refill re-scans and re-emits them) and the node
+        // layer drops any held observation for them, then replays the rest —
+        // the `on_truncated` prune + next-cycle step 1c, folded into the
+        // settle point so inv8 judges the settled state.
+        {
+            let nd = &mut self.nodes[node];
+            nd.cfg_observed.retain(|end| *end <= to);
+            nd.pending_cfg_obs.retain(|(end, _)| *end <= to);
+        }
+        self.drain_cfg_obs(node, now, step)?;
         // inv8 — revert correctness, pinned at the exact point the truncation
         // SETTLES (durable clamped, map adopted, config reverted/kept per spec
         // §5): the adopted config must re-equal the frontier-implied config.
@@ -1649,22 +1764,23 @@ impl World {
         Ok(())
     }
 
-    /// M7: feed `Event::ConfigObserved` for every ledger frame whose END is at
+    /// M7: emit `Event::ConfigObserved` for every ledger frame whose END is at
     /// or below the node's durable AND whose bytes the node genuinely holds
     /// (content identity: the node's lineage at the frame's last byte is the
-    /// appending term — spec §6). This is the sim's archive frame-scan: the
-    /// ONLY follower adoption path (adopt-at-durable), and also what RE-adopts
-    /// a config after a truncation + refill re-crosses a surviving frame. The
-    /// SM's version monotonicity makes re-feeding idempotent; the version
-    /// filter here just avoids feed spam.
-    fn observe_config_frames(
-        &mut self,
-        node: usize,
-        now: u64,
-        step: u64,
-    ) -> Result<(), InvariantViolation> {
+    /// appending term — spec §6) AND that this node has not emitted before.
+    /// This is the sim's archive frame-scan: the ONLY follower adoption path
+    /// (adopt-at-durable). It only EMITS: the observation reaches the node
+    /// layer's hold `archive_obs_latency_ns` later (`SimEvent::
+    /// CfgObsDelivered`) and the consensus duty cycle consumes it
+    /// (`on_consensus_step` → `drain_cfg_obs`), as in the real node — issue
+    /// #7's thread split, applied to config observations. Exactly-once per
+    /// node, like the real archive: what
+    /// re-adopts a config after a truncation + refill re-crosses a surviving
+    /// frame is the ack forgetting every end above the cut (`on_truncated_
+    /// feedback`), never a re-feed. Every config frame is emitted regardless
+    /// of version — the SM's version gate is what makes adoption idempotent.
+    fn observe_config_frames(&mut self, node: usize, now: u64) {
         let durable = self.nodes[node].durable;
-        let cur_version = self.nodes[node].sm.config().version;
         let mut due: Vec<(u64, ClusterConfig)> = self
             .config_frames
             .iter()
@@ -1672,21 +1788,44 @@ impl World {
                 f.end <= durable
                     && f.end > 0
                     && term_at(&self.nodes[node].term_map, f.end - 1) == f.term
-                    && f.config.version > cur_version
+                    && !self.nodes[node].cfg_observed.contains(&f.end)
             })
             .map(|f| (f.end, f.config.clone()))
             .collect();
         due.sort_by_key(|(end, _)| *end); // ascending: adopt in stream order
-        for (end, config) in due {
-            self.feed(
-                node,
-                Event::ConfigObserved {
-                    position: end,
+        let boot = self.nodes[node].archive_boot;
+        let at = now + self.cfg.archive_obs_latency_ns;
+        for (position, config) in due {
+            self.nodes[node].cfg_observed.insert(position);
+            self.nodes[node].cfg_obs_in_flight += 1;
+            self.push(
+                SimEvent::CfgObsDelivered {
+                    node,
+                    boot,
+                    position,
                     config,
                 },
-                now,
-                step,
-            )?;
+                at,
+            );
+        }
+    }
+
+    /// The node layer's do_work step 1c: feed held observations in position
+    /// order — unless a truncation is in flight and the hold is enabled, in
+    /// which case they wait for the ack. With the hold deleted
+    /// (`config_obs_latch_buffer = false`) they are fed anyway, and the SM's
+    /// truncating latch silently drops them: the pre-`cc4e321` node.
+    fn drain_cfg_obs(
+        &mut self,
+        node: usize,
+        now: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if self.nodes[node].truncating && self.cfg.config_obs_latch_buffer {
+            return Ok(());
+        }
+        for (position, config) in std::mem::take(&mut self.nodes[node].pending_cfg_obs) {
+            self.feed(node, Event::ConfigObserved { position, config }, now, step)?;
         }
         Ok(())
     }
@@ -2634,6 +2773,19 @@ impl World {
     /// Block a specific directed-agnostic pair `(a, b)`.
     pub fn partition(&mut self, a: usize, b: usize) {
         self.blocked_pairs.insert((a.min(b), a.max(b)));
+    }
+
+    /// Stall (or resume) `node`'s archive agent: while frozen the node appends
+    /// what the leader ships but its durable frontier does not move, so a
+    /// config frame it holds stays unobserved until the thaw. Scripts the
+    /// "archive crosses the frame within one consensus cadence of a term map"
+    /// window of nightly 33605909828 without depending on cadence luck.
+    pub fn set_archive_frozen(&mut self, node: usize, frozen: bool) {
+        if frozen {
+            self.archive_frozen.insert(node);
+        } else {
+            self.archive_frozen.remove(&node);
+        }
     }
 
     /// Heal all partitions (isolated nodes and blocked pairs).

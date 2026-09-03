@@ -28,9 +28,26 @@ use crate::apply::SnapshotRestore;
 use crate::config::ServiceError;
 use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 
-/// Replay archived journal blocks into `sm`, returning the byte cursor after the
-/// last applied/skipped frame — the point at which the live [`LogFollower`] can
-/// resume.
+/// What a replay pass produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// Replay ran: the byte cursor after the last applied/skipped frame — the
+    /// point at which the live [`LogFollower`] resumes.
+    ///
+    /// [`LogFollower`]: uc_log::reader::LogFollower
+    Rejoin(u64),
+    /// The gap guard found a covering artifact, but ABOVE the live apply
+    /// target `min(commit, durable)`: installing it would put the SM ahead of
+    /// what this node has committed and durable. Not a gap — the counters
+    /// are still climbing (a two-row snapshot set adopts the floor at the
+    /// `min` of its rows' positions, so the other row's artifact sits above
+    /// the floor until the tail catches up; nightly 33488022809). Nothing was
+    /// applied; the caller retries next cycle.
+    AwaitArtifact { artifact: u64, target: u64 },
+}
+
+/// Replay archived journal blocks into `sm` (see [`Replay`] for the two
+/// outcomes).
 ///
 /// For each block (`meta` = base stream position) it walks the block's frames
 /// and dispatches every `MESSAGE` frame — and every `TIMER` frame naming this
@@ -55,7 +72,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     cnc: &CncPage,
     journal_dir: &std::path::Path,
     restore: Option<&SnapshotRestore<S>>,
-) -> Result<u64, ServiceError> {
+) -> Result<Replay, ServiceError> {
     let reader = TailReader::open(journal_dir).map_err(|e| ServiceError::Replay(e.to_string()))?;
     let mut guard = sm.lock().unwrap();
     // The live rejoin point: advances over every frame walked (applied,
@@ -108,9 +125,34 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 start_pos = installed;
                 cursor = installed;
             }
-            // No install capability, or no snapshot covers the floor: the gap is
-            // unbridgeable. Fail-stop, contract named (kills the silent-gap class).
-            _ => {
+            // A covering artifact exists but sits ABOVE the live target: the
+            // journal's tail `[first, target]` cannot yet meet it. Not a gap —
+            // wait for the counters (nightly 33488022809: the fail-stop here
+            // killed a learner's second FSM whose artifact was above the
+            // two-row set's `min` floor while its tail was still arriving).
+            (Some(r), _) => {
+                let above = r
+                    .store
+                    .newest(u64::MAX)
+                    .map_err(|e| ServiceError::Replay(e.to_string()))?;
+                match above {
+                    Some((s_pos, _)) if s_pos >= first && s_pos > target => {
+                        return Ok(Replay::AwaitArtifact {
+                            artifact: s_pos,
+                            target,
+                        });
+                    }
+                    _ => {
+                        return Err(ServiceError::SnapshotRequired {
+                            needed: start_pos,
+                            first_available: first,
+                        });
+                    }
+                }
+            }
+            // No install capability: the gap is unbridgeable. Fail-stop,
+            // contract named (kills the silent-gap class).
+            (None, _) => {
                 return Err(ServiceError::SnapshotRequired {
                     needed: start_pos,
                     first_available: first,
@@ -213,5 +255,5 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         })
         .map_err(|e| ServiceError::Replay(e.to_string()))?;
 
-    Ok(cursor)
+    Ok(Replay::Rejoin(cursor))
 }

@@ -447,6 +447,61 @@ plain-language section:
   until both builders exist. Called out here rather than left to be
   rediscovered.
 
+### Fixed on the way (2026-09-03)
+
+Three product defects found by the nightlies of 2026-09-01 and 2026-09-02,
+root-caused and fixed on `main` while the release was on hold. None is a
+regression from the features above; all three date to M6/M7.
+
+- **Config observation lost across the truncating latch** (nightly
+  33605909828, `sigkill_mid_config_window`, config versions `[2, 2, 1]` for
+  90 s with commit and durable moving on all three nodes). The archive emits
+  each CONFIG-frame observation exactly once; `ElectionSm::step`'s truncating
+  latch drops every event but `RequestVote | Vote | Truncated`; and
+  `Consensus::do_work` step 1c fed `ConfigObserved` straight through it,
+  while step 1b had buffered term observations across the same latch since
+  the 2026-08-16 hunt. The CI interleaving: the restarted ex-leader
+  re-archived its own v2 frame ending at 16512, the archive's durable store
+  reached the consensus agent before the observation did (a preempted
+  archive thread on a 4-vCPU runner), the peer's term map cut to exactly
+  16512, and the observation arrived under the latch. Fix: `pending_cfg_obs`
+  held across the latch, replayed at the ack with entries above the cut
+  dropped (main `cc4e321`; unit test watched RED). The simulator re-fed
+  every config frame every archive step and so could not express the loss;
+  it now emits once per node, delivers on `archive_obs_latency_ns`, consumes
+  on the consensus cadence and holds across the latch, with a green pin and
+  an inv8 red twin (`config_obs_latch_buffer = false`) that stage the exact
+  interleaving (main `8c0b99d`; 400 churn seeds could not reach the window,
+  the directed stage is the detector) — the simulator's third recorded blind
+  spot, `docs/VERIFICATION.md` §2.
+- **Learner wedged below a climbing purge floor** (nightly 33488022809,
+  `fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge`:
+  "cannot adopt snapshot floor 2948992: archive already holds data up to
+  2421504"). `Archive::adopt_floor` accepted a floor only on an empty
+  journal; a learner that adopted F1, fetched three deep-NAK rounds, then
+  saw the leader purge to F2 had its second session's adoption refused,
+  logged to stderr, and dropped — with `adopted_incoming` latched so no
+  later session could retry. Any non-empty archive below the leader's floor
+  hit it. Fix: wipe-and-adopt — a shipped floor is at or below the leader's
+  commit, so the archive's prefix is committed history the snapshot
+  subsumes and the span up to the floor is purged at the leader; the journal
+  is dropped and the floor adopted, the node re-primes and re-seeds lineage
+  as for an empty archive. The archive arm's only remaining error is journal
+  I/O, now a fail-stop like the rest of the archive. Unit test watched RED.
+- **Second FSM row fail-stopped on a snapshot above the set's floor** (same
+  nightly: `SnapshotRequired: ... needs 0, first available 2391936`). A
+  two-row set adopts `min` of the rows' positions; `replay_into`'s gap guard
+  looked only for an artifact at or below `min(commit, durable)`, so the row
+  whose artifact sat above the floor found nothing and panicked while the
+  tail was still arriving. Fix: `Replay::AwaitArtifact` — an artifact at or
+  above the purge floor but above the target means wait (the cursor stays,
+  the agent idles, reported once per episode); `SnapshotRequired` remains
+  for no artifact at all. Unit test drives a real apply cycle through an
+  overrun against an archive-recorded, purged journal; watched RED. The
+  harness that found it starts the learner while the leader's FSMs are
+  still applying, so the floor keeps moving during the join — a realistic
+  path, deliberately left as is now that both defects are fixed.
+
 ### Breaking, and why it ships as a minor
 
 Under [the semver policy](reference/semver-policy.md) this is a real
