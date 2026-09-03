@@ -126,7 +126,7 @@ resend that repairs a lost `BEGIN` repairs a lost `TABLE`.
 | bytes | field | width | meaning |
 |---|---|---|---|
 | 0..4 | `session` | u32 | session id; must match the intake's, or the datagram is a stray |
-| 4..12 | `position` | u64 | the adopted table frame's END position on the leader; `0` = the leader has no table |
+| 4..12 | `position` | u64 | the adopted table frame's END position on the leader; `0` = the leader has none, or its table is unanchored (position 0 after a wipe) |
 | 12..20 | `time_ns` | u64 | the adopting frame's log-time stamp, recorded on the joiner's record for diagnostics — **not** what the joiner arms from |
 | 20..22 | `table_len` | u16 | length of the encoded table |
 | 22.. | `table` | variable | `uc_protocol::v2::schedule::encode_schedule_table` bytes (a full 32-entry table is 1064 B) |
@@ -152,6 +152,14 @@ stale one. A `0.6.0` peer sends no `SNAP_TABLE` at all, but withholding
 `SNAP_DONE` is not how that is caught: its `SNAP_BEGIN` is already refused by
 the `layout` check above, so the flag-day rule still bites at the same place
 it did before.
+
+A session whose `SNAP_TABLE` is systematically lost (never one that just
+arrives late — the leader keeps resending it on the same 20 ms cadence as
+`SNAP_BEGIN`) is not left withholding `SNAP_DONE` forever: the intake's
+"no chunk" timeout (`SNAP_INTAKE_TIMEOUT_NS`, 60 s) fires against it exactly
+as it would a lost chunk, since no further chunk arrives once every part has
+already renamed — the intake is discarded and the joiner re-downloads on a
+fresh session rather than wedging.
 
 ### Administration
 

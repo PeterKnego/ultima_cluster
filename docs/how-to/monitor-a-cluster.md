@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 76 families — is the
+exposition. The full series contract — 89 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
