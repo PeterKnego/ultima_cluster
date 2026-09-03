@@ -167,6 +167,14 @@ and the seed in §3.2 is always the last frame, whatever its type.
   **`log_time_ns`** (§6). A new leader seeds `last_stamp` from that word
   after the collapse ack, when the frontier *is* the archived frontier. On
   a fresh cluster the word is 0 and the first stamp is `now`.
+
+  After the leader-open collapse the archive has cut its journal to `base`, but
+  `log_time_ns` may still hold the stamp of a frame above `base` that the cut
+  discarded. Seeding from it is **monotone-safe**: the new leader's first stamps
+  are at or above what any replica could have seen, never below. A stamp that is
+  slightly ahead of wall time for one pass is the same "late" case §4.3 already
+  accepts; a stamp that goes backwards would not be. The archive never lowers the
+  word.
 - **Followers do nothing.** The receiver writes frames verbatim at their
   position; the archive records them verbatim; replay reads them verbatim.
 - **Cost claim, to be measured, not asserted:** one vDSO clock read and one
@@ -199,8 +207,12 @@ impl ApplyCtx {
     pub(crate) fn take_timers(&mut self) -> Vec<TimerReq>;      // NEW, apply loop only
 }
 
-`TimerReq` is `Schedule { id, at_ns } | Cancel { id } | Consumed { id, deadline_ns }`;
-only the first two are constructible from outside the crate.
+`TimerReq` is `Schedule { id, at_ns } | Cancel { id }` — the two things a state
+machine may ask. `consumed` is not a variant: `Timed` reports it through a
+`pub(crate)` method that pushes into a private list, and the apply loop takes
+both lists at once as wire records (`ApplyCtx::take_sched_records() ->
+Vec<SchedRecord>`, `uc_protocol::v2::ipc::SchedRecord`). Nothing outside the
+crate can forge a `consumed`.
 ```
 
 The three build sites (`apply.rs:390`, `replay.rs:169`, and the snapshot
@@ -329,6 +341,12 @@ egress ring is (spin; the node drains every pass, so it is transient) and
 counted (§6). The consensus agent polls the eight rings once per pass; an
 empty SPSC poll is one load.
 
+`svc_sched` is the first per-row ring the node **consumes** — `svc_query`'s
+consumer half is dropped at creation (`node.rs` `create_rings`) — so the
+consensus agent's drain of it is new code beside `drain_query_ring`, not a
+refactor of it. The node keeps `Vec<Option<SpscConsumer>>` by row, the shape
+`svc_query` uses for its producers.
+
 ### 4.5 The node heap — at-least-once
 
 Per row, on **every** node regardless of role: `pending: HashMap<id,
@@ -420,14 +438,13 @@ gets an as-built erratum saying so (§9).
   (`session.rs:289-345`): a length-prefixed blob (both maps, bounded by
   the same sanity ceiling) ahead of the inner artifact; `freeze` returns
   the inner position; `install_snapshot` reads the blob, then the inner.
-- **Re-announce.** After `install_snapshot` and after journal replay
-  completes (the apply loop knows both boundaries — they are where it
-  transitions to live polling), the loop asks the wrapper for its pending
-  set — `trait TimerSource { fn pending_timers(&self) -> Vec<(u64, u64)> }`,
-  implemented by `Timed`, a no-op default for everything else — and writes
-  one `schedule` record per entry to the ring. That is how a restarted or
-  freshly joined node's heap converges, and why a new leader whose service
-  is behind fires late rather than never.
+- **Re-announce.** The apply loop carries `announce_pending: bool`, set at
+  attach, and set again whenever `replay_into` returns (which is also the only
+  path a snapshot install takes, so install is covered without a second hook).
+  When the flag is set, the top of the next `apply_cycle` asks the wrapper for
+  its pending set — `trait TimerSource { fn pending_timers(&self) -> Vec<(u64,
+  u64)> }`, implemented by `Timed`, a no-op default for everything else — and
+  writes one `Schedule` record per entry before delivering any frame.
 - Journal replay re-runs `apply`, so the inner SM's schedule calls are
   re-made and the wrapper's maps are rebuilt from the log; TIMER frames in
   the replayed range re-run the §4.6 test. Both paths end at the same maps
@@ -499,14 +516,16 @@ backwards: the log's time then freezes until the wall clock catches up
 row. `obs_event!` records: `timer_fired {name, id, deadline_ns, time_ns,
 late}`, `schedule_table_adopted {position, entries}`.
 
-**cnc:** `log_time_ns` is one u64 word on page 1, written by the archive
-agent (the frame-walk owner). cnc `3.1` is unreleased, so the word joins it
-with no further version bump; the plan places it on a line whose existing
-writer is the archive agent or on the boot-once `4032` line (a boot-once
-word and a later single writer never race), pinned in both `uc_protocol`
-and `uc_log` with the offset-assertion tests. Service-side duplicate-drop
-counts would need a service-written word; the identity spec reserves 24 B
-in slot line 7, and whether to spend 8 of them is left to the plan.
+**cnc:** two words, both inside the unreleased cnc `3.1`. `log_time_ns` is page
+1 offset `4048` (the third word of the boot-once `4032` line; `4032`/`4040` are
+written once before publish and never again, so the archive agent is the line's
+only live writer). `timers_pending` is slot line 7 offset `+488` (the word after
+`identity_hash`; line 7's writer is the node, and the consensus agent is the
+node). Offsets are pinned in both `uc_protocol` and `uc_log`. `uc2_timers_pending`
+and `uc2ctl status` read the slot word; the fired/late/re-armed counters are
+process-local atomics in `ObsSources`. `uc2_sched_ring_full_total` is **not**
+exported in plan 1: it would need a service-written word and the reserved slot
+bytes are not spent here; the service counts it in a log record instead.
 
 ## 7. Failure modes
 
@@ -557,12 +576,17 @@ which fix each is reverted against):
   + first-deadline-from-frame-time; `uc2ctl schedule apply` refusals;
   metrics and the alert rule; `uc2ctl status` output.
 
-**Sim tier.** Stamping and firing touch neither `CommitTracker` nor
-`ElectionSm`; the Lean model, conformance vectors and loom models are
-re-run as regression only. `uc_sim` gains the §4.3 invariant as a
-world-level check and a seeded fault scenario in which leaders die
-mid-fire, asserting every scheduled instance appears on the committed log
-at least once and is delivered (through `Timed`) exactly once.
+**Sim tier.** `uc_sim`'s world has no frames — a command is a 96-byte append
+counter and the only per-position fact is the term map — so the §4.3 invariant
+cannot be a world-level check without inventing a frame model the world does not
+need. It is instead a **pure model of the leader pass** in `uc_sim::timers`:
+a virtual clock, random client appends and timer deadlines, leader changes with
+lagging and leading clocks, driven by the same seeded RNG, asserting the §4.3
+property and the clamp on every step. Stamping and firing touch neither
+`CommitTracker` nor `ElectionSm`, so the Lean model, conformance vectors and
+loom models are re-run as regression only. The "leaders die mid-fire" scenario
+runs against real code in the `lin_v2` capstone (§8, Capstones), where it
+belongs.
 
 **Capstones.** A `uc_lincheck::TimerSm` whose commands schedule and
 cancel, and whose `on_timer` appends to its history, run through `lin_v2`
@@ -651,7 +675,10 @@ release").
    install/replay.
 4. `uc_node`: `svc_sched` ring creation; per-row heap with `in_flight` and
    re-arm on every leader-exit path; the §4.3 pass; seed on leader open;
-   metrics, alert rule, `uc2ctl status`.
+   metrics, alert rule, `uc2ctl status`. Re-arm runs on both leader-exit paths:
+   `Action::BecomeFollower` (which already drops the appender) and `halt()`
+   (removed from the cluster). The pending ingress payloads carry across a role
+   flip by design and are not touched.
 5. Sim invariant + fault scenario; `TimerSm` capstone through `lin_v2` and
    the hard-crash harness; loom/Lean/conform regression.
 6. Docs + release writeup; fleet gate rows.
