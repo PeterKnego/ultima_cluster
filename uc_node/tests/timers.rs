@@ -1071,13 +1071,54 @@ fn a_restarted_node_resumes_the_table_with_one_catch_up_tick() {
 /// put a fresh joiner genuinely below it.
 const CAPSTONE_SEG: u64 = 64 * 1024;
 
-/// The joiner's election window. Short — an order of magnitude under the
-/// original voters' — so that when the leader dies the promoted joiner is the
-/// only node whose timer can expire, and the survivor grants rather than
-/// campaigns. See the test's own comment for why that is sound and not just
-/// convenient.
-const JOINER_ELECTION_NS: (u64, u64) = (150_000_000, 250_000_000);
-const ORIGINAL_ELECTION_NS: (u64, u64) = (1_200_000_000, 2_000_000_000);
+/// The joiner's election window, and the original voters'. Skewed by a factor
+/// of ~30 — when the leader dies the promoted joiner is the only node whose
+/// timer can plausibly expire, so the survivor grants rather than campaigns.
+/// See the test's own comment for why that is sound and not just convenient.
+/// (The joiner's floor stays well above the sender's 20 ms heartbeat, so a
+/// live leader keeps resetting it and it never campaigns spuriously.)
+const JOINER_ELECTION_NS: (u64, u64) = (100_000_000, 150_000_000);
+const ORIGINAL_ELECTION_NS: (u64, u64) = (3_000_000_000, 5_000_000_000);
+
+/// The capstone's own table period — deliberately LONGER than
+/// [`TABLE_PERIOD_NS`], which the single-node table tests use. Every fire is
+/// checked with `latest_at_or_before(time_ns) == Some(deadline)`, and the
+/// margin that assertion has before a stamp slips into the next occurrence is
+/// one period minus however late the stamp is; a cluster of three debug-build
+/// nodes on a loaded box wants two periods' worth of it, not one. Five fires
+/// is then a ~2 s window — still far inside the budget.
+const CAPSTONE_PERIOD_NS: u64 = 400_000_000;
+
+/// Headroom on top of one period plus one election in the gap bar below: the
+/// new leader's leader-open collapse and its service's re-attach both sit
+/// between the election and the first append, and neither is instant in a
+/// debug build. Not derived from a measurement — it is deliberate slack.
+/// Measured on this fixture (at the 200 ms period it first used): a real
+/// outage of roughly 300 ms showed up as a **400 ms** two-period gap.
+const CAPSTONE_GAP_SLACK_NS: u64 = 300_000_000;
+
+/// The gap bar: one period plus one election plus the slack above — 850 ms at
+/// these constants.
+///
+/// MEASURED on this fixture (six instrumented runs, every link printed): EVERY
+/// gap in the chain is exactly one period, 400 ms, the failover gap included.
+/// A failover does not skip an occurrence here — the pending occurrence is
+/// fired LATE at its own grid point rather than passed over — so the bar needs
+/// no rounding onto the grid, and 850 ms is a 2.1x margin over what is
+/// observed. It still bites on the regression shape that matters: a node that
+/// arms from the wrong clock, or walks a backlog, skips whole occurrences and
+/// lands at 1 200 ms or beyond.
+const CAPSTONE_MAX_GAP_NS: u64 = CAPSTONE_PERIOD_NS + JOINER_ELECTION_NS.1 + CAPSTONE_GAP_SLACK_NS;
+
+/// Both survivors hold every byte the leader has appended. This is the
+/// precondition that makes the promoted joiner's vote credentials
+/// (`(last_term, last_durable)`) at least as good as the surviving original's,
+/// and therefore the precondition for the joiner winning the election the
+/// crash below starts.
+fn survivors_caught_up(leader: &Node, joiner: &Node, survivor: &Node) -> bool {
+    let a = leader.counters().append.load_acquire();
+    joiner.counters().durable.load_acquire() >= a && survivor.counters().durable.load_acquire() >= a
+}
 
 /// [`node_config`] with purge ON, a small ring (so a fresh joiner's NAK from 0
 /// falls below the floor into the purged region → snapshot session) and a
@@ -1166,14 +1207,14 @@ fn admin_request_ok(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u
 }
 
 /// The capstone's table: one repeating entry on row 0, every
-/// [`TABLE_PERIOD_NS`] from `anchor_ns`.
+/// [`CAPSTONE_PERIOD_NS`] from `anchor_ns`.
 fn every_table(anchor_ns: u64) -> ScheduleTable {
     ScheduleTable {
         entries: vec![ScheduleEntry {
             identity_hash: clock_hash(),
             timer_id: 1,
             rule: ScheduleRule::Every {
-                period_ns: TABLE_PERIOD_NS,
+                period_ns: CAPSTONE_PERIOD_NS,
                 anchor_ns,
             },
         }],
@@ -1193,16 +1234,18 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// times out.
 ///
 /// **Why the joiner wins the election deterministically.** Two things, both
-/// necessary. (1) The election windows are skewed by an order of magnitude —
-/// the joiner's timer expires in 150–250 ms, the surviving original's in
-/// 1.2–2 s — so the joiner is the only node that campaigns in the window.
-/// (2) A vote is granted on `(last_term, last_durable) >= (ours, our
-/// durable)`, so the joiner must be at least as up to date as the survivor:
-/// the test QUIESCES first, waiting until both survivors' durable counters
-/// have reached the leader's append, and kills the leader immediately after.
-/// The residual race — a TIMER frame reaching one survivor and not the other
-/// inside the kill window — is one 50 µs transfer against a 200 ms period,
-/// and it fails LOUDLY (no leader) rather than silently.
+/// necessary. (1) The election windows are skewed ~30x — the joiner's timer
+/// expires in 100–150 ms, the surviving original's in 3–5 s — so the joiner is
+/// the only node that can campaign in the window. (2) A vote is granted on
+/// `(last_term, last_durable) >= (ours, our durable)`, so the joiner must be
+/// at least as up to date as the survivor: the test QUIESCES first, waiting
+/// until both survivors' durable counters have reached the leader's append,
+/// re-checks that on a fresh reading, and kills the leader with NOTHING in
+/// between (the `d_kill` read, an IPC round trip, was deliberately hoisted
+/// above the quiesce for this). The residual race — a TIMER frame reaching one
+/// survivor and not the other inside those few instructions — is far under a
+/// millisecond against a 400 ms period, and it fails LOUDLY (no leader) rather
+/// than silently.
 #[test]
 fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     let _g = serialize();
@@ -1247,10 +1290,10 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     // ---- the table, adopted and COMMITTED before anything is purged.
     let client = Client::connect(&leader_dir, APP).unwrap();
     let t0: u64 = client.submit(&Cmd::Nop).unwrap();
-    let anchor = t0 - t0 % TABLE_PERIOD_NS;
+    let anchor = t0 - t0 % CAPSTONE_PERIOD_NS;
     let table = every_table(anchor);
     let rule = ScheduleRule::Every {
-        period_ns: TABLE_PERIOD_NS,
+        period_ns: CAPSTONE_PERIOD_NS,
         anchor_ns: anchor,
     };
     let table_position = apply_schedule_table(&leader_dir, &leader_cnc, &table);
@@ -1407,36 +1450,52 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
                 .all(|h| h.node.as_ref().unwrap().config_version() >= 2)
     });
 
-    // ---- quiesce (see the doc comment: this is what makes the joiner's vote
-    // ---- credentials at least as good as the survivor's), then kill the
-    // ---- leader's service and node together.
-    wait_until("both survivors hold the leader's whole log", || {
-        let a = nodes[leader]
-            .node
-            .as_ref()
-            .unwrap()
-            .counters()
-            .append
-            .load_acquire();
-        j_node.counters().durable.load_acquire() >= a
-            && nodes[survivor]
-                .node
-                .as_ref()
-                .unwrap()
-                .counters()
-                .durable
-                .load_acquire()
-                >= a
+    // ---- a LOWER BOUND on the last tick fired before the leadership moves.
+    // Taken HERE, before the quiesce, on purpose: reading it is a full
+    // `query` IPC round trip to the joiner's service, and anything between
+    // the quiesce and the `crash()` below widens the window in which a TIMER
+    // frame can reach one survivor and not the other — which is the one race
+    // that could hand the election to the wrong node. A `d_kill` that is only
+    // a lower bound costs nothing: ticks the old leader appends after it just
+    // lengthen the chain checked at the end, all of them steady-state.
+    wait_until("the joiner's FSM saw a table tick", || {
+        query(&j_svc).0.iter().any(|f| f.id == 1)
     });
-    // The last tick anyone had fired before the leadership moved. Every fire
-    // after it is what the FAILOVER GAP is measured across.
     let d_kill = query(&j_svc)
         .0
         .iter()
         .filter(|f| f.id == 1)
         .map(|f| f.deadline_ns)
         .max()
-        .expect("the table ticked before the failover");
+        .expect("the wait above returned on a tick");
+
+    // ---- quiesce (see the doc comment: this is what makes the joiner's vote
+    // ---- credentials at least as good as the survivor's), then kill the
+    // ---- leader's service and node together. NOTHING may sit between the
+    // ---- final check and the kill.
+    wait_until("both survivors hold the leader's whole log", || {
+        survivors_caught_up(
+            nodes[leader].node.as_ref().unwrap(),
+            &j_node,
+            nodes[survivor].node.as_ref().unwrap(),
+        )
+    });
+    assert!(
+        nodes[leader].is_leader(),
+        "the intended leader lost the leadership before the kill — the \
+         election skew let another node campaign while the leader was alive"
+    );
+    // Re-check on a fresh reading: the leader has kept appending TIMER frames
+    // while the assertion above ran, so the state the first wait returned on
+    // is already one tick old. This converges immediately in the steady state
+    // and is what actually bounds the kill window.
+    wait_until("both survivors still hold the leader's whole log", || {
+        survivors_caught_up(
+            nodes[leader].node.as_ref().unwrap(),
+            &j_node,
+            nodes[survivor].node.as_ref().unwrap(),
+        )
+    });
     svcs[leader].take().unwrap().crash();
     nodes[leader].node.take().unwrap().crash();
 
@@ -1498,7 +1557,7 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     // backlog it inherited.
     for f in &chain {
         assert_eq!(
-            (f.deadline_ns - anchor) % TABLE_PERIOD_NS,
+            (f.deadline_ns - anchor) % CAPSTONE_PERIOD_NS,
             0,
             "not an occurrence of the rule: {f:?}"
         );
@@ -1508,13 +1567,11 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
             "the tick is not the newest occurrence its own stamp admits: {f:?}"
         );
     }
-    // One period plus one election is the whole budget, and the FAILOVER gap
+    // [`CAPSTONE_MAX_GAP_NS`] is the whole budget, and the FAILOVER gap
     // (`d_kill` → the first tick the new leader appended) is the first link of
     // this chain, so it is measured under the same bar as every steady-state
-    // gap after it. The slack covers the new leader's leader-open collapse and
-    // its service's re-attach, both of which sit between the election and the
-    // first append.
-    let max_gap = TABLE_PERIOD_NS + JOINER_ELECTION_NS.1 + 300_000_000;
+    // gap after it.
+    let max_gap = CAPSTONE_MAX_GAP_NS;
     let mut prev = d_kill;
     for f in &chain {
         assert!(

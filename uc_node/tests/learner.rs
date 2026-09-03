@@ -1976,9 +1976,23 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
     );
     assert!(got.prev.is_none());
 
-    // Nothing is armed, on either side.
+    // Nothing is armed on the learner — and this is a LIVE reading, not the
+    // page's initial zero. Two things make it one: the record wait above
+    // orders it after the fiat install, and the consensus agent republishes
+    // every declared row's pending count on EVERY pass
+    // (`publish_timers_pending`, step 6), so after a settle of many passes the
+    // word is whatever the row's heap currently holds. An install that wrongly
+    // armed something would have overwritten it by now.
     let l_cnc = CncPage::open_file(&f.l_dir.join("cnc2.dat"), "learner-nosched").expect("open cnc");
-    assert_eq!(l_cnc.service_slot(0).identity.timers_pending(), 0);
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        assert_eq!(
+            l_cnc.service_slot(0).identity.timers_pending(),
+            0,
+            "the no-table install armed something"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     f.stop();
 }
