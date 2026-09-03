@@ -13,14 +13,36 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::AtomicU64;
 
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
+use uc_protocol::v2::schedule::ScheduleRule;
+
+/// A table entry (spec §5, plan 2): unlike a programmatic `schedule`d
+/// instance, a table entry never leaves on fire — it advances to its next
+/// occurrence and stays keyed by `id` in `RowTimers::table`. `next == None`
+/// means parked: a `Once` rule already delivered, holding no deadline and
+/// not counted as pending.
+///
+/// `Consumed by: Task 4` (plan 2) — nothing outside `mod tests` builds or
+/// adopts a table yet, so the whole-table API below is allowed dead code
+/// until then, same as `in_flight_len` further down.
+#[allow(dead_code)]
+struct TableEntry {
+    rule: ScheduleRule,
+    next: Option<u64>,
+    last_delivered: Option<u64>,
+}
 
 pub struct RowTimers {
     hash: u64,
     /// id → deadline of the pending instance (one per id).
     pending: HashMap<u64, u64>,
-    /// (deadline, id), lazily deleted: an entry whose deadline no longer
-    /// matches `pending[id]` is stale and skipped.
-    heap: BinaryHeap<Reverse<(u64, u64)>>,
+    /// id → table entry (spec §5, plan 2). Same id space as `pending`, but a
+    /// disjoint kind: the heap's `bool` tag tells them apart.
+    table: HashMap<u64, TableEntry>,
+    /// (deadline, id, is_table_entry), lazily deleted: a programmatic entry
+    /// is stale when its deadline no longer matches `pending[id]`; a table
+    /// entry is stale when it no longer matches `table[id].next`. The `bool`
+    /// keeps the two kinds from colliding on the same `(deadline, id)`.
+    heap: BinaryHeap<Reverse<(u64, u64, bool)>>,
     /// Appended by this node as leader, not yet reported consumed.
     in_flight: HashMap<u64, u64>,
 }
@@ -30,6 +52,7 @@ impl RowTimers {
         Self {
             hash: identity_hash,
             pending: HashMap::new(),
+            table: HashMap::new(),
             heap: BinaryHeap::new(),
             in_flight: HashMap::new(),
         }
@@ -40,7 +63,7 @@ impl RowTimers {
     pub fn schedule(&mut self, id: u64, deadline_ns: u64) {
         self.in_flight.remove(&id); // a newer instance supersedes an in-flight one
         self.pending.insert(id, deadline_ns);
-        self.heap.push(Reverse((deadline_ns, id)));
+        self.heap.push(Reverse((deadline_ns, id, false)));
     }
     pub fn cancel(&mut self, id: u64) {
         self.pending.remove(&id);
@@ -54,37 +77,113 @@ impl RowTimers {
             self.pending.remove(&id);
         }
     }
-    /// Earliest pending instance with `deadline <= now_ns`, or `None`.
-    pub fn peek_due(&mut self, now_ns: u64) -> Option<(u64, u64)> {
-        while let Some(Reverse((dl, id))) = self.heap.peek().copied() {
-            if self.pending.get(&id) != Some(&dl) {
+    /// Replaces this row's table wholesale: an id not in `entries` is
+    /// dropped (its heap entries lazily discarded on the next `peek_due`); a
+    /// kept id keeps its `last_delivered`. Every entry's `next` is
+    /// (re)computed via `rule.arm(last_delivered, log_time_ns)` (spec §5
+    /// one-tick catch-up) and pushed if `Some`.
+    #[allow(dead_code)]
+    pub fn adopt_table(&mut self, entries: &[(u64, ScheduleRule)], log_time_ns: u64) {
+        let mut new_table = HashMap::with_capacity(entries.len());
+        for &(id, rule) in entries {
+            let last_delivered = self.table.get(&id).and_then(|e| e.last_delivered);
+            let next = rule.arm(last_delivered, log_time_ns);
+            if let Some(n) = next {
+                self.heap.push(Reverse((n, id, true)));
+            }
+            new_table.insert(
+                id,
+                TableEntry {
+                    rule,
+                    next,
+                    last_delivered,
+                },
+            );
+        }
+        self.table = new_table;
+    }
+    /// Leader, after a successful append of a table tick: advances to the
+    /// next occurrence, or parks (`next = None`) when nothing follows (a
+    /// `Once` already fired). Never touches `in_flight` — a table tick is
+    /// never in flight.
+    #[allow(dead_code)]
+    pub fn table_fired(&mut self, id: u64, deadline_ns: u64) {
+        if let Some(e) = self.table.get_mut(&id)
+            && e.next == Some(deadline_ns)
+        {
+            e.next = e.rule.next_after(deadline_ns);
+            if let Some(n) = e.next {
+                self.heap.push(Reverse((n, id, true)));
+            }
+        }
+    }
+    /// From the service's `TableConsumed` (follower path, and the
+    /// post-attach announce): raises `last_delivered` monotonically, and
+    /// advances `next` past `deadline_ns` if it hadn't already.
+    #[allow(dead_code)]
+    pub fn table_delivered(&mut self, id: u64, deadline_ns: u64) {
+        if let Some(e) = self.table.get_mut(&id) {
+            e.last_delivered = Some(e.last_delivered.map_or(deadline_ns, |l| l.max(deadline_ns)));
+            if e.next.is_none_or(|n| n <= deadline_ns) {
+                e.next = e.rule.next_after(deadline_ns);
+                if let Some(n) = e.next {
+                    self.heap.push(Reverse((n, id, true)));
+                }
+            }
+        }
+    }
+    /// Earliest due instance across both kinds with `deadline <= now_ns`, or
+    /// `None`. The third field says whether the head is a table entry.
+    pub fn peek_due(&mut self, now_ns: u64) -> Option<(u64, u64, bool)> {
+        while let Some(Reverse((dl, id, table))) = self.heap.peek().copied() {
+            let current = if table {
+                self.table.get(&id).and_then(|e| e.next)
+            } else {
+                self.pending.get(&id).copied()
+            };
+            if current != Some(dl) {
                 self.heap.pop(); // stale
                 continue;
             }
-            return if dl <= now_ns { Some((id, dl)) } else { None };
+            return if dl <= now_ns {
+                Some((id, dl, table))
+            } else {
+                None
+            };
         }
         None
     }
     /// After the leader appended `(id, deadline)`: pending → in-flight.
+    /// Must NOT be called for a table head — a table entry is never
+    /// in-flight; `table_fired` is its equivalent.
     pub fn take_in_flight(&mut self, id: u64, deadline_ns: u64) {
         if self.pending.get(&id) == Some(&deadline_ns) {
             self.pending.remove(&id);
             let popped = self.heap.pop(); // it was the head `peek_due` returned
-            debug_assert_eq!(popped, Some(Reverse((deadline_ns, id))));
+            debug_assert_eq!(popped, Some(Reverse((deadline_ns, id, false))));
             self.in_flight.insert(id, deadline_ns);
         }
     }
-    /// Leadership lost: every in-flight instance is pending again.
+    /// Leadership lost: every in-flight instance is pending again. Table
+    /// entries are never in `in_flight`, so this ignores them by
+    /// construction.
     pub fn rearm(&mut self) -> usize {
         let n = self.in_flight.len();
         for (id, dl) in self.in_flight.drain() {
             self.pending.insert(id, dl);
-            self.heap.push(Reverse((dl, id)));
+            self.heap.push(Reverse((dl, id, false)));
         }
         n
     }
+    /// Programmatic + table entries that currently hold a deadline (a
+    /// parked `Once` does not count).
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.table.values().filter(|e| e.next.is_some()).count()
+    }
+    /// Every table entry, parked ones included.
+    #[allow(dead_code)]
+    pub fn table_len(&self) -> usize {
+        self.table.len()
     }
     /// The companion to [`RowTimers::pending_len`]. Only the tests read it
     /// today — the cnc slot word and `/metrics` publish the PENDING count,
@@ -116,11 +215,11 @@ mod tests {
         t.schedule(1, 400); // replace
         assert_eq!(t.pending_len(), 2);
         assert_eq!(t.peek_due(299), None);
-        assert_eq!(t.peek_due(300), Some((2, 300)));
+        assert_eq!(t.peek_due(300), Some((2, 300, false)));
         t.cancel(2);
         assert_eq!(
             t.peek_due(1_000),
-            Some((1, 400)),
+            Some((1, 400, false)),
             "stale heap entry for (2,300) and (1,500) skipped"
         );
         t.take_in_flight(1, 400);
@@ -132,7 +231,7 @@ mod tests {
     fn consumed_clears_in_flight_on_the_leader_and_pending_on_a_follower() {
         let mut leader = RowTimers::new(1);
         leader.schedule(9, 100);
-        assert_eq!(leader.peek_due(100), Some((9, 100)));
+        assert_eq!(leader.peek_due(100), Some((9, 100, false)));
         leader.take_in_flight(9, 100);
         leader.consumed(9, 100);
         assert_eq!((leader.pending_len(), leader.in_flight_len()), (0, 0));
@@ -161,9 +260,9 @@ mod tests {
         t.take_in_flight(4, 50);
         t.take_in_flight(5, 60);
         assert_eq!(t.rearm(), 2);
-        assert_eq!(t.peek_due(100), Some((4, 50)));
+        assert_eq!(t.peek_due(100), Some((4, 50, false)));
         t.take_in_flight(4, 50);
-        assert_eq!(t.peek_due(100), Some((5, 60)));
+        assert_eq!(t.peek_due(100), Some((5, 60, false)));
         assert_eq!(t.rearm(), 1, "only the still in-flight one");
     }
 
@@ -178,6 +277,117 @@ mod tests {
             0,
             "the old instance can no longer be re-armed"
         );
-        assert_eq!(t.peek_due(20), Some((7, 20)));
+        assert_eq!(t.peek_due(20), Some((7, 20, false)));
+    }
+
+    #[test]
+    fn table_entries_advance_on_fire_and_never_enter_in_flight() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        let r = ScheduleRule::Every {
+            period_ns: 100,
+            anchor_ns: 1_000,
+        };
+        t.adopt_table(&[(7, r)], 1_250); // log clock 1_250: latest missed occurrence 1_200 (one-tick catch-up)
+        assert_eq!(t.peek_due(1_199), None);
+        assert_eq!(t.peek_due(1_200), Some((7, 1_200, true)));
+        t.table_fired(7, 1_200);
+        assert_eq!(t.in_flight_len(), 0, "table ticks are never in flight");
+        assert_eq!(t.peek_due(1_299), None);
+        assert_eq!(
+            t.peek_due(1_300),
+            Some((7, 1_300, true)),
+            "advanced from the fired deadline, not the clock"
+        );
+        assert_eq!(t.rearm(), 0);
+        assert_eq!(t.table_len(), 1);
+    }
+
+    #[test]
+    fn table_delivered_advances_a_follower_and_adopt_keeps_last_delivered() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let r = ScheduleRule::Every {
+            period_ns: 100,
+            anchor_ns: 0,
+        };
+        let mut f = RowTimers::new(1);
+        f.adopt_table(&[(7, r)], 0);
+        assert_eq!(
+            f.peek_due(u64::MAX),
+            Some((7, 0, true)),
+            "first occurrence at the anchor"
+        );
+        f.table_delivered(7, 300); // the log delivered ticks up to 300
+        assert_eq!(f.peek_due(u64::MAX), Some((7, 400, true)));
+        f.table_delivered(7, 100); // an old report never moves it back
+        assert_eq!(f.peek_due(u64::MAX), Some((7, 400, true)));
+        // re-adoption of the same id keeps last_delivered and re-arms from the clock
+        f.adopt_table(&[(7, r), (8, r)], 950);
+        assert_eq!(
+            f.peek_due(u64::MAX),
+            Some((7, 900, true)),
+            "one-tick catch-up above last_delivered=300"
+        );
+        assert_eq!(f.table_len(), 2);
+        // an id dropped from the table disappears
+        f.adopt_table(&[(8, r)], 950);
+        f.table_fired(8, 900);
+        assert_eq!(f.peek_due(u64::MAX), Some((8, 1_000, true)));
+        assert_eq!(f.table_len(), 1);
+    }
+
+    #[test]
+    fn programmatic_and_table_share_the_heap_in_deadline_order() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        t.schedule(1, 500);
+        t.adopt_table(
+            &[(
+                1,
+                ScheduleRule::Every {
+                    period_ns: 1_000,
+                    anchor_ns: 400,
+                },
+            )],
+            0,
+        ); // same id 1: distinct kinds
+        assert_eq!(t.peek_due(1_000), Some((1, 400, true)));
+        t.table_fired(1, 400);
+        assert_eq!(t.peek_due(1_000), Some((1, 500, false)));
+        t.take_in_flight(1, 500);
+        assert_eq!(t.peek_due(1_000), None);
+        assert_eq!(
+            t.pending_len(),
+            1,
+            "the table entry (next 1_400) still counts as pending"
+        );
+    }
+
+    #[test]
+    fn once_entries_fire_once_park_and_survive_re_adoption() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        let r = ScheduleRule::Once { at_ns: 500 };
+        t.adopt_table(&[(3, r)], 0);
+        assert_eq!(t.pending_len(), 1);
+        assert_eq!(t.peek_due(499), None);
+        assert_eq!(t.peek_due(500), Some((3, 500, true)));
+        t.table_fired(3, 500);
+        assert_eq!(t.peek_due(u64::MAX), None, "nothing follows a once");
+        assert_eq!(t.pending_len(), 0, "a parked once is not pending");
+        assert_eq!(t.table_len(), 1, "but it is still in the table");
+        t.table_delivered(3, 500); // the service reported it (leader or follower)
+        t.adopt_table(&[(3, r)], 9_000);
+        assert_eq!(
+            t.peek_due(u64::MAX),
+            None,
+            "re-applying the same once does not re-fire a delivered one"
+        );
+        t.adopt_table(&[(3, ScheduleRule::Once { at_ns: 7_000 })], 9_000);
+        assert_eq!(
+            t.peek_due(u64::MAX),
+            Some((3, 7_000, true)),
+            "a newer deadline for the same id fires (late, once)"
+        );
     }
 }

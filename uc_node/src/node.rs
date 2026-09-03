@@ -3685,10 +3685,15 @@ impl Consensus {
             let mut best: Option<(usize, u64, u64)> = None; // (row, id, deadline)
             for (row, slot) in self.timers.iter_mut().enumerate() {
                 if let Some(t) = slot
-                    && let Some((id, dl)) = t.peek_due(now)
-                    && best.is_none_or(|(_, _, bdl)| dl < bdl)
+                    && let Some((id, dl, table)) = t.peek_due(now)
                 {
-                    best = Some((row, id, dl));
+                    if table {
+                        // Task 4 (plan 2) fires table heads with FLAG_TIMER_TABLE.
+                        continue;
+                    }
+                    if best.is_none_or(|(_, _, bdl)| dl < bdl) {
+                        best = Some((row, id, dl));
+                    }
                 }
             }
             let Some((row, id, dl)) = best else {
