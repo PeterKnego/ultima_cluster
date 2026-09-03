@@ -51,7 +51,6 @@ pub mod preflight;
 mod read_round;
 pub mod recovery;
 pub mod services;
-#[allow(dead_code)] // used from Task 8
 pub(crate) mod timers;
 
 pub use config_file::load_from_path;
@@ -62,6 +61,11 @@ pub use node::{
     REASON_AUTH_UNKNOWN_KEY, StartOpts, SubmitError,
 };
 pub use services::{FsmLag, ServicesConfig};
+/// Time-and-timers §6: the per-row timer counters carried by
+/// [`obs::ObsSources`]. Re-exported (the module itself stays crate-private —
+/// `RowTimers` is consensus-agent internals) so an out-of-crate caller that
+/// builds an `ObsSources` by hand can name the type.
+pub use timers::TimerStats;
 /// M8: node-to-node wire crypto configuration, re-exported so a deployment
 /// that only depends on `uc_node` can build a [`NodeConfig`] without naming
 /// `uc_crypto` directly. `CryptoConfig::Disabled` (the `Default`) is exactly

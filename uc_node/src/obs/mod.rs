@@ -46,6 +46,9 @@ pub struct ObsSources {
     pub receiver: Arc<uc_net::receiver::FollowerStats>,
     pub truncations: Arc<AtomicU64>,
     pub wipes: Arc<AtomicU64>,
+    /// Time-and-timers §6: per-row `fired`/`late`/`rearmed` counters, the
+    /// SAME allocation the consensus agent bumps.
+    pub timer_stats: Arc<crate::timers::TimerStats>,
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
@@ -88,6 +91,7 @@ impl ObsSources {
             receiver: Arc::new(uc_net::receiver::FollowerStats::default()),
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
+            timer_stats: Arc::new(crate::timers::TimerStats::default()),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

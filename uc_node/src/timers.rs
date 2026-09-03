@@ -86,6 +86,11 @@ impl RowTimers {
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
+    /// The companion to [`RowTimers::pending_len`]. Only the tests read it
+    /// today — the cnc slot word and `/metrics` publish the PENDING count,
+    /// which is the operator-meaningful half (an in-flight instance is
+    /// already on the log).
+    #[allow(dead_code)]
     pub fn in_flight_len(&self) -> usize {
         self.in_flight.len()
     }

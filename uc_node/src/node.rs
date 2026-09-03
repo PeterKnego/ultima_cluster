@@ -44,8 +44,9 @@ use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_conf
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, TimerBody, align_frame_len};
 use uc_protocol::v2::ipc::{
-    FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY,
-    client_from_extra, extra_client, split_query_payload,
+    FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SCHED,
+    MSG_V2_SVC_QUERY, SchedOp, client_from_extra, extra_client, read_sched_record,
+    split_query_payload,
 };
 
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
@@ -275,6 +276,11 @@ const INGRESS_CAPACITY: usize = 8192;
 const NET_DRAIN_PER_CYCLE: usize = 4096;
 /// Payloads appended per duty cycle (bounded work; plan §Task 8).
 const INGRESS_PER_CYCLE: usize = 256;
+/// Time-and-timers §4.3: due timer frames appended per pass (bounded work).
+/// Hitting the bound HOLDS this pass's client frames — see `fire_due_timers`.
+const TIMERS_PER_PASS: usize = 64;
+/// Time-and-timers §4.4: `svc_sched` records absorbed per ring per pass.
+const SCHED_DRAIN_PER_CYCLE: usize = 256;
 /// NetEvent channel depth (T7 observability: a full channel counts a drop).
 const NET_EVENT_CAPACITY: usize = 4096;
 /// M8: handshake-plane channel depth (kinds 18/19/20, receiver → consensus).
@@ -465,6 +471,9 @@ pub struct Node {
     /// subset of `truncations` (a wipe is also a truncate), tracked separately for
     /// observability and the wipe-safety tests.
     wipes: Arc<AtomicU64>,
+    /// Time-and-timers §6: the consensus agent's per-row timer counters —
+    /// the SAME `Arc` it bumps, handed on by `observability()`.
+    timer_stats: Arc<crate::timers::TimerStats>,
     reports_implausible: Arc<AtomicU64>,
     /// Protocol 0.5.0: reports DECLINED because their content attestation
     /// (`durable_term`) disagreed with our own term map. Mirrored out of the
@@ -1303,6 +1312,10 @@ impl Node {
         let fsm_lag_eff =
             crate::services::fsm_lag_eff(&cfg.services, cfg.buffer_bytes as u64, cfg.max_payload);
 
+        // Time-and-timers §6: the per-row timer counters, shared between the
+        // consensus agent (the only writer) and `Node::observability`.
+        let timer_stats = Arc::new(crate::timers::TimerStats::default());
+
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
             reports_unattested: Arc::clone(&reports_unattested),
@@ -1325,6 +1338,19 @@ impl Node {
             query_ring,
             svc_query,
             svc_sched,
+            // Time-and-timers §4.5: one heap per DECLARED row, keyed by the
+            // row's FsmName hash (the same FNV-1a 64 the service side's
+            // `S::IDENTITY.hash()` yields, so a TIMER frame's body routes by
+            // identity, not by row).
+            timers: (0..CNC_MAX_SERVICES as u8)
+                .map(|row| {
+                    cfg.services
+                        .name_of(row)
+                        .map(|n| crate::timers::RowTimers::new(n.hash()))
+                })
+                .collect(),
+            timer_stats: Arc::clone(&timer_stats),
+            pass_now_ns: 0,
             services: cfg.services,
             snap_stats: Arc::clone(&route_drops),
             last_snap_refusals: (0, 0, 0),
@@ -1431,6 +1457,7 @@ impl Node {
             buffer,
             truncations,
             wipes,
+            timer_stats,
             reports_implausible,
             reports_unattested,
             archive_first_base,
@@ -1690,6 +1717,7 @@ impl Node {
             receiver: Arc::clone(&self.route_drops),
             truncations: Arc::clone(&self.truncations),
             wipes: Arc::clone(&self.wipes),
+            timer_stats: Arc::clone(&self.timer_stats),
             reports_unattested: Arc::clone(&self.reports_unattested),
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
@@ -1901,10 +1929,23 @@ struct Consensus {
     /// Time-and-timers §4.4: the service→node schedule rings' consumer halves,
     /// one per declared ring id (`Vec` len [`CNC_MAX_SERVICES`], `Some` for
     /// every declared ring id) — the consensus agent is each ring's single
-    /// reader. Not yet polled (Task 8) — held so the mmap'd file stays live
-    /// for the attaching service.
-    #[allow(dead_code)]
+    /// reader. Drained by `drain_sched_rings` at the top of EVERY pass, in
+    /// every role: a follower keeps its `timers` heap warm so a later leader
+    /// open fires from a populated set.
     svc_sched: Vec<Option<SpscConsumer>>,
+    /// Time-and-timers §4.5: the per-row timer heaps, `Some` for every
+    /// declared row (index = row id, sparse like `svc_query`). Fed from
+    /// `svc_sched` on every node; only the leader pops by time
+    /// (`fire_due_timers`).
+    timers: Vec<Option<crate::timers::RowTimers>>,
+    /// Time-and-timers §6: per-row `fired`/`late`/`rearmed` counters —
+    /// the SAME `Arc` `Node::observability` hands the metrics encoder.
+    timer_stats: Arc<crate::timers::TimerStats>,
+    /// Time-and-timers §3.2/§4.3: the ONE wall-clock reading of this pass
+    /// (`wall_now_ns`), sampled at the top of `do_work` and used for every
+    /// deadline comparison and every `Appender::set_now` in the pass, so a
+    /// pass's frames share one clock. `0` until the first pass.
+    pass_now_ns: u64,
     /// M14a: a copy of `NodeConfig::services` — the declared set + lag policy.
     /// Read by `publish_service_mins` every cycle; Task 6 also answers
     /// `MSG_V2_BAD_SERVICE` from it.
@@ -2253,12 +2294,12 @@ struct Consensus {
     crypto_last_log_ns: u64,
 }
 
-/// Wall-clock nanoseconds since the Unix epoch — the appender's `set_now`
-/// input on leader open (time-and-timers spec §3.2). `Consensus::now_ns` is
-/// monotonic-but-arbitrary-origin (`Instant`-based) and unsuitable as a log
-/// stamp; this is the real clock reading. Task 8 replaces the one call site
-/// below with a `pass_now_ns` sampled once per pass; this stays the leaf
-/// clock read either way.
+/// Wall-clock nanoseconds since the Unix epoch — the leaf clock read behind
+/// [`Consensus::pass_now_ns`] (time-and-timers spec §3.2). `Consensus::now_ns`
+/// is monotonic-but-arbitrary-origin (`Instant`-based) and unsuitable as a log
+/// stamp; this is the real clock reading. Called EXACTLY ONCE per consensus
+/// pass, at the top of `do_work`: every stamp, deadline comparison and
+/// `Appender::set_now` in that pass shares the one reading.
 fn wall_now_ns() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -2280,6 +2321,17 @@ impl Consensus {
         // M14a: the FSM aggregates first — everything below reads them.
         self.publish_service_mins();
         let mut did = false;
+
+        // Time-and-timers spec §3.2/§4.3 — ONE wall-clock read per pass. The
+        // appender clamps every stamp to max(now, last), so this is the only
+        // place the log's clock advances. Sched rings drain first so a timer
+        // scheduled by the service this pass can fire this pass.
+        let now_wall = wall_now_ns();
+        self.pass_now_ns = now_wall;
+        if let Some(app) = self.appender.as_mut() {
+            app.set_now(now_wall);
+        }
+        did |= self.drain_sched_rings();
 
         // 0. Absorb the durable counter BEFORE anything that reads our own log
         // as a credential — `Event::Tick` may start a candidacy in step 4, and
@@ -2404,19 +2456,36 @@ impl Consensus {
             did = true;
         }
 
-        // 3. Drain the in-process ingress queue (leader && serving only, the
-        // harness/embedded path), bounded.
+        // 3. Fire due timers BEFORE any client frame of this pass (spec §4.3):
+        // a client frame appended between two due timers would take a stamp
+        // clamped past the second one's deadline and make it late.
         let serving = self.leader_flag.load(Ordering::Relaxed) && self.sm.can_serve();
+        let mut hold_clients = false;
         if serving {
-            did |= self.drain_ingress();
+            let (d, hold) = self.fire_due_timers();
+            did |= d;
+            hold_clients = hold;
         }
-
+        // 3a. Drain the in-process ingress queue (leader && serving only, the
+        // harness/embedded path), bounded.
+        //
         // 3b. Drain the client ingress MPSC ring (Task 7): appends while
         // serving, subject to the admission window, or redirects each record
         // with `MSG_V2_NOT_LEADER` while not. Runs every cycle regardless of
         // role — bounded by `INGRESS_PER_CYCLE` either way so a saturated
         // ring cannot starve the rest of the duty cycle.
-        did |= self.drain_ingress_ring(serving);
+        //
+        // Both are skipped ENTIRELY when the timer bound was hit or the buffer
+        // would overrun, so no client frame can land between two due timers.
+        // The ring drain is skipped rather than called with `serving = false`:
+        // holding is not a role change, and clients must not be redirected
+        // with `MSG_V2_NOT_LEADER` by a node that is still the leader.
+        if serving && !hold_clients {
+            did |= self.drain_ingress();
+        }
+        if !(serving && hold_clients) {
+            did |= self.drain_ingress_ring(serving);
+        }
 
         // 3c. Drain the client query ring (Task 11): snapshot reads forward to
         // the service immediately (epoch check skipped); linearizable reads open
@@ -3517,10 +3586,172 @@ impl Consensus {
         status.node_heartbeat_ns.store_release(now_ns);
         self.last_wall_ns = now_ns;
         self.publish_ring_holes();
+        self.publish_timers_pending();
     }
 
     fn now_ns(&self) -> u64 {
         self.base.elapsed().as_nanos() as u64
+    }
+
+    /// Every role: absorb the services' schedule/cancel/consumed records off
+    /// the `svc_sched` rings (time-and-timers §4.4). Run at the TOP of the
+    /// pass, before `fire_due_timers`, so a timer the service scheduled this
+    /// pass can fire this pass. A follower drains too: its heap is a warm
+    /// cache so a later leader open fires from a populated set.
+    fn drain_sched_rings(&mut self) -> bool {
+        let mut did = false;
+        let mut err: Option<(RingError, &'static str)> = None;
+        for row in 0..CNC_MAX_SERVICES {
+            let (Some(cons), Some(t)) = (self.svc_sched[row].as_mut(), self.timers[row].as_mut())
+            else {
+                continue;
+            };
+            let mut buf = Vec::new();
+            for _ in 0..SCHED_DRAIN_PER_CYCLE {
+                match cons.try_read(&mut buf) {
+                    Ok(Some(rec)) => {
+                        did = true;
+                        // Only MSG_V2_SCHED belongs on this ring; anything
+                        // else (and any undecodable payload) is skipped
+                        // rather than fail-stopped — the ring is written by
+                        // a separate process.
+                        if rec.msg_type != MSG_V2_SCHED {
+                            continue;
+                        }
+                        if let Some(r) = read_sched_record(&buf) {
+                            match r.op {
+                                SchedOp::Schedule => t.schedule(r.timer_id, r.deadline_ns),
+                                SchedOp::Cancel => t.cancel(r.timer_id),
+                                SchedOp::Consumed => t.consumed(r.timer_id, r.deadline_ns),
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        err = Some((e, "svc_sched"));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((e, ring)) = err {
+            self.ring_error_fail_stop(&e, ring);
+        }
+        did
+    }
+
+    /// Leader only. Appends every DUE timer instance, in global deadline
+    /// order across rows, before any client frame of this pass (spec §4.3).
+    ///
+    /// Returns `(did, hold_clients)`: `hold_clients` is true when the
+    /// per-pass bound was hit or the buffer would overrun — either way no
+    /// client frame may be appended this pass, because a client frame's
+    /// stamp would clamp the log clock past a deadline still waiting to
+    /// fire and make that timer late.
+    fn fire_due_timers(&mut self) -> (bool, bool) {
+        let now = self.pass_now_ns;
+        // `self.timers` and `self.appender` are disjoint fields, but the
+        // scan below needs `&mut self.timers` while the append needs the
+        // appender: take it out for the duration and put it back on the way
+        // out (there is exactly one exit path).
+        let Some(mut app) = self.appender.take() else {
+            return (false, false);
+        };
+        let mut did = false;
+        // The bound was hit unless the scan runs dry first.
+        let mut hold = true;
+        for _ in 0..TIMERS_PER_PASS {
+            // earliest due instance across all rows — global deadline order,
+            // so two rows' timers never clamp each other into "late"
+            let mut best: Option<(usize, u64, u64)> = None; // (row, id, deadline)
+            for (row, slot) in self.timers.iter_mut().enumerate() {
+                if let Some(t) = slot
+                    && let Some((id, dl)) = t.peek_due(now)
+                    && best.is_none_or(|(_, _, bdl)| dl < bdl)
+                {
+                    best = Some((row, id, dl));
+                }
+            }
+            let Some((row, id, dl)) = best else {
+                hold = false;
+                break;
+            };
+            // `peek_due(now)` only ever yields `deadline <= now`. A future
+            // deadline appended here would drag the log clock forward.
+            debug_assert!(dl <= now, "fire_due_timers appends only DUE timers");
+            let t = self.timers[row].as_mut().unwrap();
+            let body = TimerBody {
+                identity_hash: t.hash(),
+                timer_id: id,
+                deadline_ns: dl,
+            };
+            match app.append_timer(&body, 0) {
+                Ok((position, stamp)) => {
+                    t.take_in_flight(id, dl);
+                    did = true;
+                    self.timer_stats.fired[row].fetch_add(1, Ordering::Relaxed);
+                    let late = stamp > dl;
+                    if late {
+                        self.timer_stats.late[row].fetch_add(1, Ordering::Relaxed);
+                    }
+                    crate::obs_event!(
+                        Info,
+                        "timer_fired",
+                        node = self.id as u64,
+                        row = row as u64,
+                        timer_id = id,
+                        deadline_ns = dl,
+                        time_ns = stamp,
+                        position = position,
+                        late = late
+                    );
+                }
+                // The stamp is computed only after the overrun gate, so this
+                // leaves the log clock untouched: hold the clients and retry
+                // the same instance next pass.
+                Err(AppendError::WouldOverrun) => break,
+                Err(AppendError::PayloadTooLarge) => {
+                    unreachable!("a 24-byte timer body never exceeds max_payload")
+                }
+            }
+        }
+        self.appender = Some(app);
+        (did, hold)
+    }
+
+    /// Leadership lost: every in-flight instance is pending again (spec
+    /// §4.5). At-least-once by design — a re-armed instance whose TIMER
+    /// frame did commit is delivered twice and `Timed<S>` drops the
+    /// duplicate.
+    fn rearm_timers(&mut self) {
+        for (row, slot) in self.timers.iter_mut().enumerate() {
+            if let Some(t) = slot {
+                let n = t.rearm();
+                if n > 0 {
+                    self.timer_stats.rearmed[row].fetch_add(n as u64, Ordering::Relaxed);
+                    crate::obs_event!(
+                        Info,
+                        "timers_rearmed",
+                        node = self.id as u64,
+                        row = row as u64,
+                        count = n as u64
+                    );
+                }
+            }
+        }
+    }
+
+    /// Publish each declared row's pending count into its cnc identity slot
+    /// (spec §6) — an operator-visible "how much is armed" word.
+    fn publish_timers_pending(&self) {
+        for (row, slot) in self.timers.iter().enumerate() {
+            if let Some(t) = slot {
+                self.cnc
+                    .service_slot(row)
+                    .identity
+                    .store_timers_pending(t.pending_len() as u64);
+            }
+        }
     }
 
     /// Append pending + queued payloads via the leader appender, bounded.
@@ -5078,6 +5309,11 @@ impl Consensus {
                 self.term_handle.store(term, Ordering::Release);
                 self.leader_flag.store(false, Ordering::Release);
                 self.appender = None;
+                // Time-and-timers §4.5: we no longer append, so every
+                // instance this node put on the log without a consumed
+                // report goes back to pending — the next leader (possibly
+                // us again) fires it.
+                self.rearm_timers();
                 // Issue #6: abandon any leader open still awaiting its collapse
                 // ack. The cut itself is already commanded and remains correct
                 // (it drops only this node's own unreplicated tail), but the
@@ -5368,6 +5604,9 @@ impl Consensus {
     fn halt(&mut self) {
         self.halt_removed = true;
         self.leader_flag.store(false, Ordering::Release);
+        // Time-and-timers §4.5: the other leader-exit path — this node will
+        // never append again, so nothing may stay in flight here either.
+        self.rearm_timers();
         self.can_serve_flag.store(false, Ordering::Release);
         // Veil §5 discharge, observation 1 (the parked-reads liveness
         // blemish): `do_work` short-circuits every SUBSEQUENT cycle, so a
@@ -5501,7 +5740,9 @@ impl Consensus {
         );
         let mut appender =
             Appender::new(Arc::clone(&self.buffer), open.term, self.cnc.log_time_ns());
-        appender.set_now(wall_now_ns());
+        // Time-and-timers §3.2: the pass's ONE clock reading, not a second
+        // `SystemTime::now()` — every frame of this pass shares one clock.
+        appender.set_now(self.pass_now_ns);
         appender
             .append_new_term()
             .expect("NewTerm append fail-stop");
@@ -6752,6 +6993,15 @@ mod tests {
             query_ring,
             svc_query,
             svc_sched,
+            timers: (0..CNC_MAX_SERVICES as u8)
+                .map(|row| {
+                    ServicesConfig::none_for_tests()
+                        .name_of(row)
+                        .map(|n| crate::timers::RowTimers::new(n.hash()))
+                })
+                .collect(),
+            timer_stats: Arc::new(crate::timers::TimerStats::default()),
+            pass_now_ns: 0,
             services: ServicesConfig::none_for_tests(),
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0),

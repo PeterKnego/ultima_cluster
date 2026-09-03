@@ -83,6 +83,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         receiver: Arc::new(FollowerStats::default()),
         truncations: Arc::new(AtomicU64::new(0)),
         wipes: Arc::new(AtomicU64::new(0)),
+        timer_stats: Arc::new(uc_node::TimerStats::default()),
         reports_unattested: Arc::new(AtomicU64::new(0)),
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
