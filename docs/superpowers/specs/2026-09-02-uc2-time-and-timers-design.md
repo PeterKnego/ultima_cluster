@@ -352,7 +352,8 @@ refactor of it. The node keeps `Vec<Option<SpscConsumer>>` by row, the shape
 Per row, on **every** node regardless of role: `pending: HashMap<id,
 deadline>` + a min-heap on `(deadline, id)` with lazy deletion (an entry
 whose `pending[id]` no longer matches is skipped). Schedule inserts or
-replaces; cancel removes; **consumed** removes.
+replaces; cancel removes; **consumed** removes. Plan 2's table entries are
+the exception: they never leave, they advance (§5).
 
 - **Leader, on append (step 2):** the entry moves to `in_flight: HashMap<id,
   (deadline, position)>`; it leaves `in_flight` on the service's `consumed`
@@ -463,12 +464,34 @@ every M7/M12 admin op). The leader appends it as **`FRAME_TYPE_SCHEDULE_TABLE
 = 6`**; every node adopts it through the archive's existing header walk,
 the same path that adopts CONFIG frames today (`archive.rs:372`, effective
 at the frame's end position), and persists it as a `StableValue` in
-`state/schedules.state` beside the cluster-config record. Applying replaces
-the whole table. No per-host file, hence no per-host mismatch to detect —
-the reason the alternative, a `[schedules]` section in `node.toml` checked
-cluster-wide like the lag policy, was rejected as the primary form (it
-turns a schedule edit into a rolling edit plus a leader change; it can be
-added later as a boot-time convenience that calls the admin op).
+`state/schedules.state` (`ScheduleRecord { position, time_ns, table }`; at
+boot the node re-arms every entry from the record and the recovered log
+clock before its service attaches — an FSM with no attached service still
+ticks on the leader; the tick is dropped on delivery only if no service
+ever attaches, which is the operator's problem to see through
+`uc2_timers_pending` and the attach gauges) beside the cluster-config
+record. Applying replaces the whole table. No per-host file, hence no
+per-host mismatch to detect — the reason the alternative, a `[schedules]`
+section in `node.toml` checked cluster-wide like the lag policy, was
+rejected as the primary form (it turns a schedule edit into a rolling
+edit plus a leader change; it can be added later as a boot-time
+convenience that calls the admin op).
+
+**How the bytes reach the leader.** The cnc admin request line is 64
+bytes of fixed fields (`seq, nonce, op, id, ip, port`), and the HMAC
+covers exactly those fields — a table cannot ride it. `uc2ctl schedule
+apply` therefore (1) encodes the table, (2) writes the bytes to
+`<instance_dir>/schedules.pending` (0600, fsync, rename), and (3) writes
+an admin request with `op = 6` whose `id ‖ ip ‖ port` fields carry the
+first 80 bits of SHA-256 over the encoded bytes. The node verifies the
+request as it does every admin op, reads the staged file, recomputes the
+digest, and refuses by name on a mismatch (reason `schedule_digest`).
+Under `[admin] auth = "hmac"` the payload is thereby authenticated
+through the signed digest; under the filesystem policy it is trusted the
+way every admin request already is. **Apply is leader-only**: a follower
+answers `status = 2` with the leader hint, as it does when it cannot
+forward — there is nothing to forward but the digest, and the leader
+cannot read the follower's file.
 
 ```toml
 # schedules.toml — applied with `uc2ctl schedule apply`
@@ -480,10 +503,21 @@ every = "1h"            # from `anchor` (RFC 3339, UTC); OR
 anchor = "2026-01-01T00:00:00Z"
 ```
 
-- Payload: bincode of `ScheduleTable { entries: Vec<Entry> }`, **≤ 64
-  entries** so it always fits the 1344 B payload ceiling (a config frame
-  has the same bound). Two rules only: `every` (period + anchor) and `at`
-  (seconds-of-day, UTC). No cron expressions, no time zones (§10).
+- Payload: a hand-laid, bounded, total codec (`uc_protocol::v2::schedule`,
+  the same style as `v2::config`'s), **≤ 32 entries**, each keyed by the
+  FSM's **identity hash** rather than its name (`hash u64 ‖ id u64 ‖ kind u8
+  ‖ a u64 ‖ b u64` = 33 B; 32 entries + an 8-byte header = 1064 B, inside
+  the 1312 B crypto-on ceiling). Names appear only in the operator's TOML;
+  `uc2ctl` resolves each against the node's cnc name lines and refuses an
+  undeclared one before any request is written. Three rules: `every`
+  (`period_ns`, `anchor_ns`), `at` (`secs_of_day`, UTC) and `once`
+  (`at_ns`, one fixed deadline). A `once` entry fires one tick and then
+  **parks**: it stays in the table as delivered, with no next deadline, so
+  re-applying the same file does not fire it again; changing its time (or
+  its id) does. After a restart the node may re-append a past `once` tick —
+  boot arming has no delivered set until the service announces its
+  `table_last` — and `Timed` drops the duplicate (§4.6), the same
+  at-least-once/exactly-once split every table tick has.
 - **Next deadline is computed from the deadline just fired**, never from
   the clock: `next = fired + period`, or the next day's `at`. So recurrence
   never drifts and every node computes the same value. On adoption the
@@ -491,8 +525,24 @@ anchor = "2026-01-01T00:00:00Z"
   `time_ns` — again from the tape, not from a local clock.
 - Table timers go through the same heap (§4.5) and the same TIMER frame
   with `flags` bit 0 set; the FSM sees them in the same `on_timer` with
-  `ev.table = true`. Exactly-once is the `table_last` rule (§4.6): the FSM
-  never asked for these, so they cannot be in `pending`.
+  `ev.table = true`. Exactly-once is the `table_last` rule (§4.6). Three
+  differences from a programmatic instance, all deliberate:
+  - **The node advances the entry at append** (`next = rule.next_after
+    (fired)`; for `once` that is *no* deadline, and the entry parks), so a
+    leader keeps a table on schedule without waiting for its service; a follower advances on the service's `TableConsumed
+    (id, deadline)` report, so a new leader starts from what its own
+    service last delivered. A leader whose service lagged may re-fire ticks
+    the old leader already fired; `Timed` drops them (at-least-once, as
+    §4.5).
+  - **No re-arm on leadership loss.** A table tick whose frame was
+    truncated is not fired again; the next tick is. (A programmatic
+    instance IS re-armed, because it has no successor.)
+  - **One-tick catch-up.** When an entry is armed — at adoption, at boot
+    from `state/schedules.state`, or when the service announces its
+    `table_last` — its next deadline is the LATEST occurrence at or below
+    the log's clock if that occurrence is newer than the last delivered
+    one, else the first occurrence after it. A cluster that was down for an
+    hour with a one-second rule fires one tick on recovery, not 3 600.
 - Ids share the FSM's id space with programmatic timers; the docs say to
   reserve a range. The wrapper's two maps never confuse them because the
   frame flag routes them.
