@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use uc_protocol::v2::frame::{
     self, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
-    FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN, TIMER_BODY_LEN, TimerBody, align_frame_len,
+    FRAME_TYPE_SCHEDULE_TABLE, FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN, TIMER_BODY_LEN,
+    TimerBody, align_frame_len,
 };
 
 use crate::cnc::CncPage;
@@ -794,6 +795,78 @@ impl Appender {
         Ok(end)
     }
 
+    /// Append a `FRAME_TYPE_SCHEDULE_TABLE` entry (time-and-timers plan 2):
+    /// payload = the replicated schedule table's own encoding, stamped with
+    /// `term` — the caller's current leadership term, passed explicitly for
+    /// the same reason as `append_config`'s `term` parameter. `client_id =
+    /// seq = 0`, stamped like every frame (`max(now, last)`). Returns the
+    /// frame-END position, matching `append_config`'s convention (the
+    /// adoption effect point), NOT the frame start. Same wrap/overrun/commit
+    /// discipline as `append_config` — this is that method's body with the
+    /// frame type swapped.
+    pub fn append_schedule_table(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
+        if payload.len() > self.buffer.max_payload {
+            return Err(AppendError::PayloadTooLarge);
+        }
+        let total = HEADER_LEN + payload.len();
+        let aligned = align_frame_len(total) as u64;
+        let b = &self.buffer;
+
+        let off = b.offset(self.pos);
+        let to_end = b.capacity - off as u64;
+        let pad = if aligned > to_end { to_end } else { 0 };
+        let end = self.pos + pad + aligned;
+
+        // The one hard gate: never claim past durable + capacity.
+        if end > self.cached_durable + b.capacity {
+            self.cached_durable = b.cnc.counters().durable.load_acquire();
+            if end > self.cached_durable + b.capacity {
+                return Err(AppendError::WouldOverrun);
+            }
+        }
+
+        // The clamp, inline (final-review I1) — see `append_config`.
+        let time_ns = self.now_ns.max(self.last_stamp);
+        self.last_stamp = time_ns;
+
+        let frame_pos = if pad > 0 {
+            self.write_padding(off, pad as u32, time_ns);
+            self.pos + pad
+        } else {
+            self.pos
+        };
+        let foff = b.offset(frame_pos);
+
+        // SAFETY (all raw writes): within capacity; bytes in [append,
+        // durable+capacity) are writer-owned per the gate; ordering via the
+        // commit word + append counter release stores below.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                b.region.ptr_at(foff + HEADER_LEN),
+                payload.len(),
+            );
+            let hdr = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), HEADER_LEN);
+            frame::write_header_except_length(
+                hdr,
+                &FrameHeader {
+                    length: 0,
+                    frame_type: FRAME_TYPE_SCHEDULE_TABLE,
+                    flags: 0,
+                    leadership_term_id: term,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns,
+                },
+            );
+        }
+        b.commit_word(foff).store(total as u32, Ordering::Release);
+
+        self.pos = end;
+        b.cnc.counters().append.store_release(self.pos);
+        Ok(end)
+    }
+
     /// Append a TIMER frame (time-and-timers spec §4.2/§4.3). Stamped with the
     /// deadline, clamped to `last_stamp` — so `stamp > body.deadline_ns` means
     /// the timer is late. Returns `(frame_start, stamp)`.
@@ -886,8 +959,8 @@ mod tests {
     use std::sync::Arc;
     use uc_protocol::v2::frame::{
         FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM,
-        FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, HEADER_LEN, TIMER_BODY_LEN, TimerBody, read_header,
-        read_timer_body,
+        FRAME_TYPE_PADDING, FRAME_TYPE_SCHEDULE_TABLE, FRAME_TYPE_TIMER, HEADER_LEN,
+        TIMER_BODY_LEN, TimerBody, read_header, read_timer_body,
     };
 
     const CAP: u64 = 4096;
@@ -980,6 +1053,25 @@ mod tests {
         // a data frame after it opens exactly at the returned frame-end
         let dpos = a.append(1, 0, &[0u8; 64]).unwrap();
         assert_eq!(dpos, 64);
+    }
+
+    #[test]
+    fn append_schedule_table_is_a_stamped_type_6_frame_returning_the_end() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 4, 0);
+        a.set_now(1_000);
+        let end = a.append_schedule_table(4, b"table-bytes").unwrap();
+        assert_eq!(
+            end, 64,
+            "32 header + 11 payload -> aligned 64; END returned"
+        );
+        let s = b.recordable_slice(0, 64).unwrap();
+        let h = read_header(s);
+        assert_eq!(h.frame_type, FRAME_TYPE_SCHEDULE_TABLE);
+        assert_eq!((h.client_id, h.seq, h.flags), (0, 0, 0));
+        assert_eq!(h.time_ns, 1_000);
+        assert_eq!(&s[HEADER_LEN..HEADER_LEN + 11], b"table-bytes");
+        assert_eq!(a.last_stamp(), 1_000);
     }
 
     #[test]

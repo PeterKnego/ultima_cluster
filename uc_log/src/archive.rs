@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use uc_journal::{Durability, Journal, JournalConfig, JournalError};
 use uc_protocol::v2::frame::{
-    self, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN,
+    self, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, FRAME_TYPE_SCHEDULE_TABLE, FrameHeader, HEADER_LEN,
 };
 
 use crate::buffer::LogBuffer;
@@ -141,6 +141,15 @@ pub struct Archive {
     /// `truncate_to` exactly like `term_observations`: any observation from a
     /// dropped tail is stale and must not be re-fed as if still durable.
     config_observations: Vec<(u64, Vec<u8>)>,
+    /// Time-and-timers plan 2: `(frame-END position, time_ns, payload bytes)`
+    /// for every `FRAME_TYPE_SCHEDULE_TABLE` frame durably recorded since the
+    /// last `take_table_observations` call — detected in the SAME header walk
+    /// as `term_observations`/`config_observations` (one scan, three
+    /// outputs). Position-ordered by construction. `frame_end = base + off +
+    /// align_frame_len(h.length)`, matching the CONFIG convention. Reset by
+    /// `truncate_to` exactly like `config_observations`: an observation from
+    /// a dropped tail is stale and must not be re-fed as if still durable.
+    table_observations: Vec<(u64, u64, Vec<u8>)>,
     /// The highest `time_ns` stamp seen by `observe_terms`'s header walk
     /// (time-and-timers spec §3.2), published to the cnc `log_time_ns` word
     /// after every recorded block. Monotonic — `do_work` never lowers the
@@ -241,6 +250,7 @@ impl Archive {
             last_observed_term: 0,
             term_observations: Vec::new(),
             config_observations: Vec::new(),
+            table_observations: Vec::new(),
             last_time_ns,
         })
     }
@@ -462,6 +472,15 @@ impl Archive {
                     block[payload_start..payload_end].to_vec(),
                 ));
             }
+            if h.frame_type == FRAME_TYPE_SCHEDULE_TABLE {
+                let payload_start = off + HEADER_LEN;
+                let payload_end = off + h.length as usize;
+                self.table_observations.push((
+                    base + off as u64 + aligned as u64,
+                    h.time_ns,
+                    block[payload_start..payload_end].to_vec(),
+                ));
+            }
             off += aligned;
         }
     }
@@ -474,6 +493,23 @@ impl Archive {
     /// is durable).
     pub fn take_config_observations(&mut self) -> Vec<(u64, Vec<u8>)> {
         std::mem::take(&mut self.config_observations)
+    }
+
+    /// Drain the SCHEDULE_TABLE-frame observations detected since the last
+    /// call (time-and-timers plan 2): `(frame-END position, time_ns, payload
+    /// bytes)`, position-ordered. Modelled on `take_config_observations`.
+    pub fn take_table_observations(&mut self) -> Vec<(u64, u64, Vec<u8>)> {
+        std::mem::take(&mut self.table_observations)
+    }
+
+    /// Give back observations that a caller drained but could not deliver
+    /// (e.g. the consensus agent's outbound channel was full): `unsent` is
+    /// prepended to whatever has accumulated since, so draining order is
+    /// preserved — the unsent ones first, then anything newly observed.
+    pub fn retain_table_observations(&mut self, unsent: Vec<(u64, u64, Vec<u8>)>) {
+        let mut restored = unsent;
+        restored.append(&mut self.table_observations);
+        self.table_observations = restored;
     }
 
     /// Drain the term transitions detected since the last call (M4). Each entry
@@ -592,6 +628,7 @@ impl Archive {
             self.last_observed_term = 0;
             self.term_observations.clear();
             self.config_observations.clear();
+            self.table_observations.clear();
             return Ok(());
         }
         if base == pos {
@@ -618,6 +655,7 @@ impl Archive {
         self.last_observed_term = 0;
         self.term_observations.clear();
         self.config_observations.clear();
+        self.table_observations.clear();
         Ok(())
     }
 }
@@ -1763,6 +1801,38 @@ mod tests {
         assert!(
             arch.take_config_observations().is_empty(),
             "stale observation must not survive truncation"
+        );
+    }
+
+    // ------------------------------------------------- schedule-table scan
+
+    /// A recorded SCHEDULE_TABLE frame yields `(frame-END position, time_ns,
+    /// payload)`, draining and retaining mirror the CONFIG pair, and the two
+    /// observation kinds never cross-contaminate.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn archive_observes_schedule_table_frames_with_end_position_and_stamp() {
+        let (b, _c, dir) = setup(1 << 16);
+        let mut archive = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        a.set_now(500);
+        a.append(1, 1, b"x").unwrap(); // [0, 64)
+        a.set_now(700);
+        let end = a.append_schedule_table(1, b"tbl").unwrap(); // [64, 128)
+        assert_eq!(end, 128);
+        archive.do_work(&b).unwrap();
+        let obs = archive.take_table_observations();
+        assert_eq!(obs, vec![(128, 700, b"tbl".to_vec())]);
+        assert!(archive.take_table_observations().is_empty(), "drained");
+        archive.retain_table_observations(obs.clone());
+        assert_eq!(
+            archive.take_table_observations(),
+            obs,
+            "retained comes back"
+        );
+        assert!(
+            archive.take_config_observations().is_empty(),
+            "not confused with CONFIG"
         );
     }
 
