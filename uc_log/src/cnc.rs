@@ -25,7 +25,7 @@ use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ,
     CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE,
     CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_FSM_LAG_BYTES,
-    CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS,
+    CNC_OFF_HEADER_CRC, CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_LOG_TIME_NS, CNC_OFF_PEER_SLOTS,
     CNC_OFF_QUERY_HOLES_SKIPPED, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED,
     CNC_OFF_SERVICE_SLOTS, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_SERVICES_DECLARED, CNC_OFF_TERM,
     CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_SERVICE_SLOT_STRIDE, CNC_SVC_STATUS_ATTACHED,
@@ -200,12 +200,15 @@ const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, version) == cnc::C
 /// there is no separate release store for this field, and that is sufficient
 /// because no attacher passes `validate` (which checks that CRC) before the
 /// CRC exists, so no reader can observe the name bytes ahead of the write
-/// that publishes them.
+/// that publishes them. `timers_pending` (time-and-timers spec §6) is the one
+/// live word on this otherwise-frozen line: node-written, refreshed once per
+/// consensus-agent pass.
 #[repr(C)]
 pub struct ServiceIdentityLine {
     name: [u8; cnc::CNC_SVC_NAME_LEN],
     hash: AtomicU64,
-    _pad: [u64; 3],
+    timers_pending: AtomicU64,
+    _pad: [u64; 2],
 }
 impl ServiceIdentityLine {
     pub fn name(&self) -> Option<FsmName> {
@@ -214,11 +217,22 @@ impl ServiceIdentityLine {
     pub fn hash(&self) -> u64 {
         self.hash.load(Ordering::Acquire)
     }
+    /// Pending timers for this row (time-and-timers spec §6); node-written.
+    pub fn timers_pending(&self) -> u64 {
+        self.timers_pending.load(Ordering::Acquire)
+    }
+    pub fn store_timers_pending(&self, v: u64) {
+        self.timers_pending.store(v, Ordering::Release)
+    }
 }
 const _: () = assert!(std::mem::size_of::<ServiceIdentityLine>() == 64);
 const _: () = assert!(
     std::mem::offset_of!(ServiceIdentityLine, hash)
         == cnc::CNC_SVC_OFF_IDENTITY_HASH - cnc::CNC_SVC_OFF_NAME
+);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceIdentityLine, timers_pending)
+        == cnc::CNC_SVC_OFF_TIMERS_PENDING - cnc::CNC_SVC_OFF_NAME
 );
 
 /// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
@@ -645,6 +659,20 @@ impl CncPage {
         // SAFETY: as `fsm_lag_bytes`.
         unsafe {
             (*(self.region.ptr_at(CNC_OFF_FSM_LAG_BYTES) as *const AtomicU64))
+                .store(v, Ordering::Release)
+        }
+    }
+    /// The archive agent's last recorded frame stamp (time-and-timers §3.2).
+    pub fn log_time_ns(&self) -> u64 {
+        // SAFETY: 4048 is 8-aligned and 4048 + 8 <= CNC_PAGE_LEN.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_LOG_TIME_NS) as *const AtomicU64)).load(Ordering::Acquire)
+        }
+    }
+    pub fn store_log_time_ns(&self, v: u64) {
+        // SAFETY: as `log_time_ns`.
+        unsafe {
+            (*(self.region.ptr_at(CNC_OFF_LOG_TIME_NS) as *const AtomicU64))
                 .store(v, Ordering::Release)
         }
     }
@@ -1138,6 +1166,11 @@ mod tests {
         // M14a: the boot-once pair and page 2.
         assert_eq!(cnc::CNC_OFF_SERVICES_DECLARED, 4032);
         assert_eq!(cnc::CNC_OFF_FSM_LAG_BYTES, 4040);
+        assert_eq!(cnc::CNC_OFF_LOG_TIME_NS, 4048);
+        assert_eq!(
+            std::mem::offset_of!(ServiceIdentityLine, timers_pending),
+            cnc::CNC_SVC_OFF_TIMERS_PENDING - cnc::CNC_SVC_OFF_NAME
+        );
         assert_eq!(std::mem::size_of::<ServiceSlot>(), 512);
         assert_eq!(
             std::mem::size_of::<ServiceSlot>(),
@@ -1614,6 +1647,38 @@ mod tests {
             "offset pin: fsm_lag_bytes lives at 4040"
         );
         assert_eq!(page.query_holes_skipped(), 0, "the 3968 line is untouched");
+    }
+
+    #[test]
+    fn log_time_and_timers_pending_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.log_time_ns(), 0, "fresh page: no stamp yet");
+        page.store_log_time_ns(1_700_000_000_000_000_123);
+        assert_eq!(page.log_time_ns(), 1_700_000_000_000_000_123);
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[4048..4056].try_into().unwrap()),
+            1_700_000_000_000_000_123,
+            "offset pin: log_time_ns lives at 4048"
+        );
+        assert_eq!(
+            page.fsm_lag_bytes(),
+            0,
+            "the neighbouring boot-once word is untouched"
+        );
+        let slot = page.service_slot(2);
+        assert_eq!(slot.identity.timers_pending(), 0);
+        slot.identity.store_timers_pending(17);
+        assert_eq!(slot.identity.timers_pending(), 17);
+        let raw = page.page();
+        let base = cnc::CNC_OFF_SERVICE_SLOTS
+            + 2 * cnc::CNC_SERVICE_SLOT_STRIDE
+            + cnc::CNC_SVC_OFF_TIMERS_PENDING;
+        assert_eq!(
+            u64::from_le_bytes(raw[base..base + 8].try_into().unwrap()),
+            17,
+            "offset pin: timers_pending lives at slot +488"
+        );
     }
 
     #[test]

@@ -240,15 +240,25 @@ const _: () = assert!(CNC_OFF_QUERY_HOLES_SKIPPED == CNC_OFF_INGRESS_HOLES_SKIPP
 // M14a: the boot-once pair on page 1's last line. Both are written ONCE by
 // the node at startup (`Node::start_with`, before any agent runs) and read
 // by every attaching service and client, which take the declared set and the
-// lag policy from the PAGE, not from the config file. Two plain `AtomicU64`s
-// sharing one 64-byte line, for the same reason as 3968/3976: one writer,
-// and `PaddedAtomicU64` cannot sit at +8.
+// lag policy from the PAGE, not from the config file. Plain `AtomicU64`s
+// sharing one 64-byte line, for the same reason as 3968/3976: one writer per
+// word, and `PaddedAtomicU64` cannot sit at +8/+16. Time-and-timers adds a
+// third, live word to the same line (`CNC_OFF_LOG_TIME_NS`, +16): unlike the
+// first two it is NOT boot-once — the archive agent updates it every frame.
 /// Bit `i` set ⇔ service id `i` is declared in this node's `[services] ids`.
 pub const CNC_OFF_SERVICES_DECLARED: usize = 4032;
 const _: () = assert!(CNC_OFF_SERVICES_DECLARED.is_multiple_of(64));
 /// The lag bound in bytes; `0` ⇔ lockstep.
 pub const CNC_OFF_FSM_LAG_BYTES: usize = 4040;
 const _: () = assert!(CNC_OFF_FSM_LAG_BYTES == CNC_OFF_SERVICES_DECLARED + 8);
+/// Time-and-timers spec §3.2/§6: the highest `time_ns` the archive agent has
+/// recorded — the seed a new leader clamps its first stamps against, and the
+/// `uc2_log_time_ns` gauge. Third word of the 4032 line; `4032`/`4040` are
+/// written once before the page is published, so the archive agent is this
+/// line's only live writer. Writer: archive agent; init = 0.
+pub const CNC_OFF_LOG_TIME_NS: usize = 4048;
+const _: () = assert!(CNC_OFF_LOG_TIME_NS == CNC_OFF_FSM_LAG_BYTES + 8);
+const _: () = assert!(CNC_OFF_LOG_TIME_NS + 8 <= 4096);
 const _: () = assert!(
     CNC_OFF_SERVICES_DECLARED + 64 == 4096,
     "page 1 is exactly full"
@@ -270,7 +280,8 @@ const _: () = assert!(
 //   +384 lag_waits       u64 count                             writer: service apply agent
 //   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
 //   +480 identity_hash   u64 FNV-1a 64 of the name             writer: node (init, boot-once)
-//   +488 reserved (zero)
+//   +488 timers_pending  u64 pending-timer count for this row  writer: node (consensus agent)
+//   +496 reserved (zero)
 pub const CNC_OFF_SERVICE_SLOTS: usize = 4096;
 pub const CNC_SERVICE_SLOT_STRIDE: usize = 512;
 pub const CNC_MAX_SERVICES: usize = 8;
@@ -291,10 +302,16 @@ pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
 /// cnc 3.1: the attached service's packed version (`identity::pack_version`),
 /// low 32 bits of the status line's second word. `0` = unversioned/absent.
 pub const CNC_SVC_OFF_VERSION: usize = 8;
-/// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash.
+/// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
+/// then (time-and-timers) its pending-timer count.
 pub const CNC_SVC_OFF_NAME: usize = 448;
 pub const CNC_SVC_NAME_LEN: usize = 32;
 pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
+/// Time-and-timers spec §6: this row's pending-timer count, the word after
+/// `identity_hash` on line 7 (node-written, like the rest of the line; the
+/// consensus agent refreshes it once per pass). Reader: `/metrics`, `uc2ctl`.
+pub const CNC_SVC_OFF_TIMERS_PENDING: usize = 488;
+const _: () = assert!(CNC_SVC_OFF_TIMERS_PENDING == CNC_SVC_OFF_IDENTITY_HASH + 8);
 const _: () = assert!(CNC_SVC_OFF_NAME == CNC_SVC_OFF_RESERVED);
 const _: () = assert!(CNC_SVC_OFF_IDENTITY_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE);
 const _: () = assert!(
@@ -679,6 +696,13 @@ mod tests {
         assert_eq!(CNC_OFF_SERVICES_DECLARED % 64, 0);
         assert_eq!(CNC_OFF_FSM_LAG_BYTES, 4040);
         assert_eq!(CNC_OFF_FSM_LAG_BYTES - CNC_OFF_SERVICES_DECLARED, 8);
+        // time-and-timers spec §6 (FROZEN): the archive's last recorded stamp,
+        // third word of the boot-once 4032 line.
+        assert_eq!(CNC_OFF_LOG_TIME_NS, 4048);
+        assert_eq!(CNC_OFF_LOG_TIME_NS, CNC_OFF_FSM_LAG_BYTES + 8);
+        // per-row pending-timer count, the word after identity_hash on line 7.
+        assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, 488);
+        assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, CNC_SVC_OFF_IDENTITY_HASH + 8);
         const { assert!(CNC_OFF_FSM_LAG_BYTES + 8 <= CNC_OFF_SERVICES_DECLARED + 64) };
         // Page 1 is now FULL: the pair's line ends exactly where page 2 starts.
         assert_eq!(CNC_OFF_SERVICES_DECLARED + 64, 4096);
