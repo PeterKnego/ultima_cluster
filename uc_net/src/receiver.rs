@@ -664,13 +664,22 @@ pub struct FollowerStats {
     /// `session` id. Dropped: applying it would install a foreign (or forged)
     /// schedule table into the intake that happens to be open.
     ///
-    /// A table for the session we JUST completed is not counted here — the
-    /// leader re-sends BEGIN+TABLE until its `SNAP_DONE` lands, so those
-    /// duplicates are expected traffic and counting them would make this
-    /// counter measure the resend cadence instead of the anomaly (the same
+    /// Counted ONCE PER EPISODE, not once per datagram (fix round 1): latched
+    /// on the first stray and re-armed only when an intake next opens. The
+    /// common source is a session this node REFUSED — an identity/version
+    /// mismatch, `total_len == 0`, an artifact that could not be placed —
+    /// after which no intake is open while the leader, unaware, re-sends
+    /// BEGIN+TABLE every 20 ms for its whole 30 s session timeout. Per-datagram
+    /// counting would measure that cadence instead of the anomaly, the same
     /// distinction `snap_begin_undecodable` draws against
-    /// `snap_refused_legacy_peer`). A rising count means a leader and this
-    /// node disagree about which session is live — or someone is injecting.
+    /// `snap_refused_legacy_peer`.
+    ///
+    /// A table for the session we JUST completed is not counted at all — the
+    /// same resend cadence, but expected traffic.
+    ///
+    /// A rising count means a leader and this node disagree about which
+    /// session is live — read it WITH the refusal counters, which name why —
+    /// or someone is injecting.
     pub snap_table_stray: AtomicU64,
 }
 
@@ -858,6 +867,17 @@ pub struct FollowerReceiver {
     /// `SNAP_BEGIN` — the wire is speakable again, so a later refusal is a
     /// genuinely new one. See [`FollowerStats::snap_begin_undecodable`].
     snap_begin_undecodable_latched: bool,
+    /// Time-and-timers plan 3 (fix round 1): a stray `SNAP_TABLE` has already
+    /// been counted for the current episode. Cleared whenever an intake OPENS
+    /// (a `SNAP_BEGIN` this node accepted), so the counter measures episodes
+    /// rather than the leader's 20 ms resend cadence. Without it, a REFUSED
+    /// BEGIN — an identity/version mismatch, `total_len == 0`, an unplaceable
+    /// artifact — leaves no intake open while the leader keeps re-sending
+    /// BEGIN+TABLE for its whole 30 s session timeout, and every one of those
+    /// TABLEs would count: the exact defect
+    /// [`snap_begin_undecodable_latched`](Self::snap_begin_undecodable_latched)
+    /// exists to avoid. See [`FollowerStats::snap_table_stray`].
+    snap_table_stray_latched: bool,
     /// M14c: the last session that COMPLETED here. The sender keeps re-sending
     /// a `SNAP_BEGIN` on a 20 ms cadence until our `SNAP_DONE` reaches it, so a
     /// lost DONE would otherwise re-open (and re-download) a set we already
@@ -1102,6 +1122,7 @@ impl FollowerReceiver {
             own_versions: None,
             snap_intake: None,
             snap_begin_undecodable_latched: false,
+            snap_table_stray_latched: false,
             snap_last_done: None,
             incoming_snapshot_pos: None,
             incoming_snapshot_config: None,
@@ -2128,6 +2149,9 @@ impl FollowerReceiver {
             return;
         };
         let announced_len = part.len;
+        // Plan 3 (fix round 1): an intake is OPEN again, so the next stray
+        // `SNAP_TABLE` starts a new episode and is worth its own count.
+        self.snap_table_stray_latched = false;
         self.snap_intake = Some(SnapIntake {
             peer: from,
             session: b.session,
@@ -2192,7 +2216,18 @@ impl FollowerReceiver {
         {
             return; // a re-send for the session we already completed
         }
-        self.stats.snap_table_stray.fetch_add(1, Ordering::Relaxed);
+        // Counted ONCE PER EPISODE, latched exactly like
+        // `snap_begin_undecodable`. The common way to get here is a REFUSED
+        // BEGIN (identity/version mismatch, `total_len == 0`, an artifact we
+        // could not place): no intake is open, and the leader — which has no
+        // idea we refused — keeps re-sending BEGIN+TABLE every 20 ms until its
+        // 30 s session timeout. Counting each one would make this a measure of
+        // the resend cadence rather than of the anomaly. The latch clears when
+        // an intake next opens.
+        if !self.snap_table_stray_latched {
+            self.snap_table_stray_latched = true;
+            self.stats.snap_table_stray.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// M14c: drop the in-flight intake, if any, deleting its `.part` files.
@@ -2380,11 +2415,14 @@ impl FollowerReceiver {
     fn snap_complete(&mut self) {
         // Time-and-timers plan 3: a session is COMPLETE only once its schedule
         // table has landed too. Checked before the `take()` — the intake must
-        // stay open, so the next chunk, the duty cycle, or the TABLE's own
-        // arrival re-runs this. The leader re-sends BEGIN+TABLE every
-        // `SNAP_BEGIN_RESEND_NS` until our `SNAP_DONE`, so a lost TABLE is
-        // retried on that cadence and this can never wedge: withholding the
-        // ack is exactly what keeps the retries coming.
+        // stay open so a later arrival can re-run this. Which arrival: a
+        // remaining chunk, or (once every part is renamed) the TABLE itself
+        // and nothing else — `snap_upkeep`'s re-drive walks parts and a set
+        // with no unpublished part left cannot fire it, so `snap_table` MUST
+        // call the completion check itself. The leader re-sends BEGIN+TABLE
+        // every `SNAP_BEGIN_RESEND_NS` until our `SNAP_DONE`, so a lost TABLE
+        // is retried on that cadence and this can never wedge: withholding
+        // the ack is exactly what keeps the retries coming.
         if self.snap_intake.as_ref().is_some_and(|i| i.table.is_none()) {
             return;
         }
@@ -6029,6 +6067,125 @@ mod tests {
         assert_eq!(st.snap_table_stray.load(Relaxed), 1, "and is not a stray");
         assert_eq!(*table_cell.lock().unwrap(), (4096, 99, b"tbl".to_vec()));
         assert_eq!(pos_cell.load(Relaxed), 4096);
+    }
+
+    /// Fix round 1: `snap_table_stray` counts EPISODES, not datagrams. The
+    /// realistic way to get a stray is a session this node refused — here an
+    /// identity (name) mismatch. The leader has no idea it was refused, so it
+    /// keeps re-sending BEGIN+TABLE every 20 ms until its own 30 s session
+    /// timeout; a per-datagram counter would climb at that cadence and say
+    /// nothing about how many sessions actually went wrong. The latch clears
+    /// when an intake next OPENS, so a genuinely new anomaly is counted again.
+    ///
+    /// Also pins the wrong-PEER half of the guard: a table naming the live
+    /// intake's own session, from a different address, is dropped — never
+    /// applied to the intake it names.
+    #[test]
+    fn a_stray_snap_table_is_counted_once_per_episode_not_once_per_resend() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut stranger = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
+        let st = r.stats();
+        let to = r.local_addr();
+
+        // A BEGIN this node REFUSES: the sender declares (and names) row 1,
+        // which our own identity does not. No intake opens.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(3, 0, 4096, 64, 0b11),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_declared_mismatch.load(Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "the BEGIN was never refused");
+            r.do_work();
+        }
+        assert!(r.snap_intake.is_none(), "a refused BEGIN opens no intake");
+
+        // Three re-sends of that session's table, exactly as the leader keeps
+        // shipping them. ONE episode.
+        for _ in 0..3 {
+            leader.send(
+                to,
+                DGRAM_KIND_SNAP_TABLE,
+                0,
+                TERM,
+                &snap_table_wire(3, 4096, 99, b"tbl"),
+            );
+        }
+        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
+        assert_eq!(
+            st.snap_table_stray.load(Relaxed),
+            1,
+            "the resend cadence must not drive the counter"
+        );
+
+        // A BEGIN we ACCEPT re-arms the latch.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(4, 0, 4096, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the BEGIN never opened an intake"
+            );
+            r.do_work();
+        }
+
+        // Wrong PEER, RIGHT session id: a stranger must not install its table
+        // into the session we are running with the leader.
+        stranger.send(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            TERM,
+            &snap_table_wire(4, 8192, 7, b"forged"),
+        );
+        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
+        assert_eq!(
+            st.snap_table_stray.load(Relaxed),
+            2,
+            "a new episode, after an intake re-armed the latch"
+        );
+        let intake = r.snap_intake.as_ref().expect("the live intake survives");
+        assert_eq!(intake.session, 4);
+        assert!(
+            intake.table.is_none(),
+            "a foreign peer's table must not be applied to our session"
+        );
+
+        // And a wrong-SESSION table from the leader itself, inside the same
+        // episode, is dropped without a second count.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            TERM,
+            &snap_table_wire(9, 4096, 99, b"tbl"),
+        );
+        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
+        assert_eq!(
+            st.snap_table_stray.load(Relaxed),
+            2,
+            "still one episode: the latch holds until an intake opens again"
+        );
+        assert!(r.snap_intake.as_ref().unwrap().table.is_none());
     }
 
     // ---- M14c2 (T10a): the intake's timeout, latches and re-drive cadence ----

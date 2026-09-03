@@ -1319,8 +1319,7 @@ impl Sender {
                 // un-latching `begun_ns`: a failed seal here costs one more
                 // resend round, whereas re-sending the BEGIN as if it had
                 // never gone out would restart the artifact's chunk flow.
-                let table = sess.table.clone();
-                self.send_snap_table(peer, session, &table);
+                self.send_snap_table(peer, session, &sess.table);
             } else if first_ever {
                 // Nothing in this artifact can make progress until the peer has
                 // its BEGIN; keep the slot and retry next cycle. `false` (no
