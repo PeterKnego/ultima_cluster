@@ -181,6 +181,49 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("14-snap-begin-v3", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
+    // Plan 3 (schedule table in snapshot): SNAP_TABLE (kind
+    // DGRAM_KIND_SNAP_TABLE = 21 — NOT the brief's literal 18, which is
+    // already `uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT`) carrying a
+    // real 3-entry encoded schedule table.
+    use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table};
+    let table = ScheduleTable {
+        entries: vec![
+            ScheduleEntry {
+                identity_hash: 0x0BAD_F00D_0000_0001,
+                timer_id: 1,
+                rule: ScheduleRule::Every { period_ns: 1_000_000_000, anchor_ns: 0 },
+            },
+            ScheduleEntry {
+                identity_hash: 0x0BAD_F00D_0000_0001,
+                timer_id: 2,
+                rule: ScheduleRule::DailyAt { secs_of_day: 3600 },
+            },
+            ScheduleEntry {
+                identity_hash: 0x0BAD_F00D_0000_0002,
+                timer_id: 1,
+                rule: ScheduleRule::Once { at_ns: 123_456_789 },
+            },
+        ],
+    };
+    let mut encoded = Vec::new();
+    encode_schedule_table(&table, &mut encoded);
+    let mut b = vec![0u8; SNAP_TABLE_FIXED_LEN + encoded.len()];
+    write_snap_table_body(
+        &mut b,
+        &SnapTableBody { session: 7, position: 4096, time_ns: 99, table: encoded },
+    );
+    seeds.push(Seed::fixed("15-snap-table", datagram(DGRAM_KIND_SNAP_TABLE, 0, 3, &b)));
+
+    // table_len one past the ceiling (SCHEDULE_HEADER_LEN +
+    // MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN + 1) — the reader's ceiling
+    // check, not the buffer-length check.
+    use uc_protocol::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
+    let over = SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN + 1;
+    let mut b = vec![0u8; SNAP_TABLE_FIXED_LEN + over];
+    b[4..12].copy_from_slice(&1u64.to_le_bytes()); // position != 0
+    b[20..22].copy_from_slice(&(over as u16).to_le_bytes());
+    seeds.push(Seed::fixed("16-snap-table-bad-len", datagram(DGRAM_KIND_SNAP_TABLE, 0, 3, &b)));
+
     seeds
 }
 

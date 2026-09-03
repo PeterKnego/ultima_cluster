@@ -356,6 +356,71 @@ pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
 // config record is small; 1024 bytes of headroom is generous.
 const _: () = assert!(SNAP_BEGIN_FIXED_LEN + 1024 <= MTU_DEFAULT - DATAGRAM_HEADER_LEN);
 
+/// Time-and-timers plan 3: the leader's current schedule table, sent once
+/// after every `SNAP_BEGIN` of a session so a below-floor joiner installs
+/// the table it could not read from the purged log. Pairwise scope.
+///
+/// NOT 18: `uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT` already owns 18 in
+/// this same on-wire kind-byte space (`HS_RESP` = 19, `HS_KEY` = 20), so this
+/// kind takes the next free value, 21.
+pub const DGRAM_KIND_SNAP_TABLE: u8 = 21;
+/// `session u32 ‖ position u64 ‖ time_ns u64 ‖ table_len u16`, then the
+/// encoded table (`v2::schedule::encode_schedule_table` bytes).
+pub const SNAP_TABLE_FIXED_LEN: usize = 22;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapTableBody {
+    pub session: u32,
+    /// The adopted table frame's END position on the leader; `0` = no table
+    /// (then `table` is empty).
+    pub position: u64,
+    /// The adopting frame's stamp — what the joiner's record carries.
+    pub time_ns: u64,
+    pub table: Vec<u8>,
+}
+
+pub fn write_snap_table_body(buf: &mut [u8], b: &SnapTableBody) {
+    buf[0..4].copy_from_slice(&b.session.to_le_bytes());
+    buf[4..12].copy_from_slice(&b.position.to_le_bytes());
+    buf[12..20].copy_from_slice(&b.time_ns.to_le_bytes());
+    buf[20..22].copy_from_slice(&(b.table.len() as u16).to_le_bytes());
+    buf[22..22 + b.table.len()].copy_from_slice(&b.table);
+}
+
+/// Total on any input; does NOT decode the table (the node does, fail-stop).
+pub fn read_snap_table_body(buf: &[u8]) -> Option<SnapTableBody> {
+    use crate::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
+    if buf.len() < SNAP_TABLE_FIXED_LEN {
+        return None;
+    }
+    let session = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    let position = u64::from_le_bytes(buf[4..12].try_into().ok()?);
+    let time_ns = u64::from_le_bytes(buf[12..20].try_into().ok()?);
+    let table_len = u16::from_le_bytes(buf[20..22].try_into().ok()?) as usize;
+    if table_len > SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN {
+        return None;
+    }
+    if buf.len() != SNAP_TABLE_FIXED_LEN + table_len {
+        return None;
+    }
+    if (position == 0) != (table_len == 0) {
+        return None;
+    }
+    Some(SnapTableBody {
+        session,
+        position,
+        time_ns,
+        table: buf[22..].to_vec(),
+    })
+}
+
+const _: () = assert!(
+    SNAP_TABLE_FIXED_LEN
+        + crate::v2::schedule::SCHEDULE_HEADER_LEN
+        + crate::v2::schedule::MAX_SCHEDULE_ENTRIES * crate::v2::schedule::SCHEDULE_ENTRY_LEN
+        <= MTU_DEFAULT - DATAGRAM_HEADER_LEN - crate::v2::crypto::CRYPTO_OVERHEAD
+);
+
 pub const SNAP_NAK_BODY_LEN: usize = 16;
 
 /// Requests a missing chunk of the snapshot file: `[offset, offset+length)`.
@@ -794,6 +859,10 @@ mod tests {
         assert_eq!(DGRAM_KIND_SNAP_DONE, 15);
         assert_eq!(DGRAM_KIND_CONFIG_PROPOSAL, 16);
         assert_eq!(DGRAM_KIND_CONFIG_REPLY, 17);
+        // NOT 18: uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT already owns 18
+        // (HS_RESP=19, HS_KEY=20) in this same on-wire kind-byte space, so
+        // SNAP_TABLE takes the next free value, 21.
+        assert_eq!(DGRAM_KIND_SNAP_TABLE, 21);
     }
 
     #[test]
@@ -881,6 +950,63 @@ mod tests {
         assert_eq!(&buf[120..122], &4u16.to_le_bytes());
         assert_eq!(read_snap_begin_body(&buf), Some(b));
         assert_eq!(read_snap_begin_body(&buf[..buf.len() - 1]), None);
+    }
+
+    /// FROZEN: kind 21 and the SNAP_TABLE body layout. Never change these
+    /// bytes. (Kind is 21, not the brief's literal 18: `18` is already
+    /// `uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT` in this same kind-byte
+    /// space — see `kind_codes_are_stable`'s note.)
+    #[test]
+    fn snap_table_body_pins_bytes_and_is_total() {
+        use crate::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
+        assert_eq!(DGRAM_KIND_SNAP_TABLE, 21);
+        assert_eq!(SNAP_TABLE_FIXED_LEN, 22);
+        let b = SnapTableBody {
+            session: 7,
+            position: 4096,
+            time_ns: 99,
+            table: vec![1, 2, 3],
+        };
+        let mut buf = vec![0u8; SNAP_TABLE_FIXED_LEN + 3];
+        write_snap_table_body(&mut buf, &b);
+        assert_eq!(&buf[0..4], &7u32.to_le_bytes());
+        assert_eq!(&buf[4..12], &4096u64.to_le_bytes());
+        assert_eq!(&buf[12..20], &99u64.to_le_bytes());
+        assert_eq!(&buf[20..22], &3u16.to_le_bytes());
+        assert_eq!(&buf[22..], &[1, 2, 3]);
+        assert_eq!(read_snap_table_body(&buf), Some(b.clone()));
+        // no table at all: position 0, len 0
+        let none = SnapTableBody {
+            session: 7,
+            position: 0,
+            time_ns: 0,
+            table: vec![],
+        };
+        let mut nb = vec![0u8; SNAP_TABLE_FIXED_LEN];
+        write_snap_table_body(&mut nb, &none);
+        assert_eq!(read_snap_table_body(&nb), Some(none));
+        // totality
+        assert_eq!(read_snap_table_body(&buf[..21]), None, "short");
+        assert_eq!(
+            read_snap_table_body(&buf[..buf.len() - 1]),
+            None,
+            "length mismatch"
+        );
+        let mut z = buf.clone();
+        z[4..12].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(read_snap_table_body(&z), None, "position 0 with a table");
+        let mut p = nb.clone();
+        p[4..12].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(read_snap_table_body(&p), None, "position without a table");
+        let max = SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN;
+        let mut big = vec![0u8; SNAP_TABLE_FIXED_LEN + max + 1];
+        big[4..12].copy_from_slice(&1u64.to_le_bytes());
+        big[20..22].copy_from_slice(&((max + 1) as u16).to_le_bytes());
+        assert_eq!(read_snap_table_body(&big), None, "over the table ceiling");
+        assert!(
+            SNAP_TABLE_FIXED_LEN + max <= MTU_DEFAULT - DATAGRAM_HEADER_LEN - 24,
+            "fits crypto-on"
+        );
     }
 
     #[test]
