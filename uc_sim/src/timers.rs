@@ -20,7 +20,11 @@
 //! [`PassModel::leader_change`] models the clamp seed a fresh leader inherits
 //! on takeover: `last_stamp = max(last_stamp, new_seed)` — a new leader may
 //! inherit a stamp from a leader whose *clock* ran ahead of this one's `now`,
-//! so the model must never let a frame's stamp regress relative to it.
+//! so the model must never let a frame's stamp regress relative to it. A
+//! lower seed than the current `last_stamp` must leave it unchanged; see
+//! `tests::leader_change_clamps_up_never_down_and_the_next_frame_reflects_it`
+//! below, which pins both directions with a real assertion (not just by
+//! reading the `max` in this doc comment).
 //!
 //! Only *due* timers fire in a pass — a timer scheduled with a deadline
 //! already in the past relative to the pass's `now` still waits for the next
@@ -29,7 +33,12 @@
 //! stepped past.
 //!
 //! [`PassModel::check`] is the reference predicate for the §4.3 ordering
-//! invariant, five rules:
+//! invariant, five rules. **Rules 1, 4 and 5 are load-bearing — rules 2 and
+//! 3 are logical consequences of rule 1 (stamps non-decreasing ⇒
+//! transitively implies both) and exist only for diagnosis, because their
+//! error messages name the specific timer and its deadline rather than just
+//! two arbitrary out-of-order frames** — `check()` runs 2 and 3 before 1 so
+//! that, when both would fire, the more specific message wins.
 //!
 //! 1. stamps never decrease across the frame sequence;
 //! 2. an on-time timer frame (`stamp == deadline`) is never preceded by a
@@ -230,22 +239,18 @@ impl PassModel {
     /// The §4.3 ordering + monotonicity predicate, checked against the frame
     /// sequence appended so far. Returns the first violation found, naming
     /// the offending frame indices.
+    ///
+    /// Rules 2 and 3 run BEFORE rule 1: they are logical consequences of
+    /// rule 1 (non-decreasing stamps transitively implies both), so if rule
+    /// 1 ran first its `Err` would always fire first and rules 2/3's more
+    /// specific, timer-and-deadline-named messages would be unreachable
+    /// dead code. Rules 1, 4 and 5 are the load-bearing ones; 2 and 3 exist
+    /// purely for diagnosis.
     pub fn check(&self) -> Result<(), String> {
-        // (a) stamps non-decreasing over the whole sequence.
-        for i in 1..self.frames.len() {
-            if self.frames[i].stamp < self.frames[i - 1].stamp {
-                return Err(format!(
-                    "stamp decreased: frame {} (stamp {}) < frame {} (stamp {})",
-                    i,
-                    self.frames[i].stamp,
-                    i - 1,
-                    self.frames[i - 1].stamp
-                ));
-            }
-        }
-
-        // (b) an on-time timer frame (stamp == deadline) is never preceded
-        // by a frame stamped past its deadline.
+        // Rule 2: an on-time timer frame (stamp == deadline) is never
+        // preceded by a frame stamped past its deadline. Diagnostic only —
+        // implied by rule 1 — run first so its message wins when it names
+        // the same violation.
         for (i, f) in self.frames.iter().enumerate() {
             if f.kind != Kind::Timer {
                 continue;
@@ -264,8 +269,9 @@ impl PassModel {
             }
         }
 
-        // (c) every frame after a timer frame is stamped no earlier than
-        // that timer's own stamp.
+        // Rule 3: every frame after a timer frame is stamped no earlier
+        // than that timer's own stamp. Diagnostic only — implied by rule 1
+        // — run before it for the same reason as rule 2.
         for (i, f) in self.frames.iter().enumerate() {
             if f.kind != Kind::Timer {
                 continue;
@@ -281,7 +287,22 @@ impl PassModel {
             }
         }
 
-        // (d) no timer frame fires early: stamp >= deadline, always.
+        // Rule 1 (load-bearing): stamps non-decreasing over the whole
+        // sequence.
+        for i in 1..self.frames.len() {
+            if self.frames[i].stamp < self.frames[i - 1].stamp {
+                return Err(format!(
+                    "stamp decreased: frame {} (stamp {}) < frame {} (stamp {})",
+                    i,
+                    self.frames[i].stamp,
+                    i - 1,
+                    self.frames[i - 1].stamp
+                ));
+            }
+        }
+
+        // Rule 4 (load-bearing): no timer frame fires early: stamp >=
+        // deadline, always.
         for (i, f) in self.frames.iter().enumerate() {
             if f.kind != Kind::Timer {
                 continue;
@@ -295,9 +316,9 @@ impl PassModel {
             }
         }
 
-        // (e) rule 5: lateness must pre-date the pass. A TIMER frame stamped
-        // past its own deadline (late) is legitimate only if that deadline
-        // was already behind the clock before this pass began
+        // Rule 5 (load-bearing): lateness must pre-date the pass. A TIMER
+        // frame stamped past its own deadline (late) is legitimate only if
+        // that deadline was already behind the clock before this pass began
         // (deadline < pass_start_stamp). A late timer whose deadline was
         // NOT yet behind the pass's own start stamp can only have become
         // late because some earlier frame in the SAME pass (same
@@ -311,7 +332,7 @@ impl PassModel {
             }
             let deadline = f.deadline.expect("timer frame missing deadline");
             if f.stamp <= deadline {
-                continue; // on-time or early (already ruled out by (d)) — not late
+                continue; // on-time or early (already ruled out by rule 4) — not late
             }
             if deadline < f.pass_start_stamp {
                 continue; // legitimately late: already overdue before this pass began
@@ -340,5 +361,47 @@ impl PassModel {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins `leader_change`'s clamp directly: a lower seed must leave
+    /// `last_stamp` unchanged (never regress it), a higher seed must raise
+    /// it, and the very next frame appended must be stamped at the raised
+    /// value even when `now` is below it — the clamp, not just `now`,
+    /// governs the stamp. The seeded property test
+    /// (`leader_pass_model_keeps_timers_in_order_across_leader_changes`)
+    /// exercises `leader_change` with real up/down seeds too (Task 12 fix
+    /// 2), but this unit test pins the exact mechanism with a single,
+    /// readable trace, independent of any RNG draw.
+    #[test]
+    fn leader_change_clamps_up_never_down_and_the_next_frame_reflects_it() {
+        let mut m = PassModel::new(1_000);
+
+        // A lower seed must leave last_stamp unchanged (never regress it).
+        m.leader_change(500);
+        assert_eq!(
+            m.last_stamp(),
+            1_000,
+            "a lower seed must not lower last_stamp"
+        );
+
+        // A higher seed must raise last_stamp.
+        m.leader_change(5_000);
+        assert_eq!(m.last_stamp(), 5_000, "a higher seed must raise last_stamp");
+
+        // Even with `now` well below the raised last_stamp, the next client
+        // frame must be stamped at the raised value, never at `now`.
+        m.set_now(100);
+        m.pass(1);
+        let frame = m.frames().last().expect("pass(1) should append one frame");
+        assert_eq!(frame.kind, Kind::Client);
+        assert_eq!(
+            frame.stamp, 5_000,
+            "the client frame must be clamped to last_stamp, not now"
+        );
     }
 }

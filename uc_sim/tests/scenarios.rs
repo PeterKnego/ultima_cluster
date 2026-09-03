@@ -2791,9 +2791,18 @@ fn leader_pass_model_keeps_timers_in_order_across_leader_changes() {
             now += rng.range(0, 50_000);
             if rng.range(0, 10) == 0 {
                 // a new leader whose clock lags or leads by up to 1 s
-                let skew = rng.range_i64(-1_000_000_000, 1_000_000_000);
-                now = (now as i64 + skew).max(0) as u64;
-                m.leader_change(m.last_stamp());
+                let now_skew = rng.range_i64(-1_000_000_000, 1_000_000_000);
+                now = (now as i64 + now_skew).max(0) as u64;
+                // The seed itself can also run ahead of or behind the
+                // current last_stamp by up to 1 s, independent of now's own
+                // skew — this exercises leader_change's clamp both ways: a
+                // higher seed must raise last_stamp, a lower one must leave
+                // it alone (Task 12 fix 2 — m.last_stamp() alone is a no-op
+                // under both a correct max and a buggy overwrite, so it
+                // verified nothing).
+                let seed_skew = rng.range_i64(-1_000_000_000, 1_000_000_000);
+                let new_seed = (m.last_stamp() as i64 + seed_skew).max(0) as u64;
+                m.leader_change(new_seed);
             }
             m.set_now(now);
             let n_scheduled = rng.range(0, 3);
