@@ -1502,12 +1502,23 @@ fn two_fsm_timer_churn_under_failover() {
                 rule: table_rule,
             }],
         };
-        let resp = cluster.apply_schedule_table(first_leader, &table, 20);
-        assert_eq!(
-            resp.status, 0,
-            "[{LABEL}] the schedule table was not applied: status {} reason {}",
-            resp.status, resp.reason
-        );
+        let mut applied = false;
+        for _ in 0..20 {
+            let resp = cluster.apply_schedule_table(first_leader, &table, 20);
+            if resp.status == 0 {
+                applied = true;
+                break;
+            }
+            // `2` = retry (a leader-open window). Side-effect-free, and the
+            // staged file survives for the next attempt.
+            assert_eq!(
+                resp.status, 2,
+                "[{LABEL}] the schedule table was refused: reason {}",
+                resp.reason
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(applied, "[{LABEL}] the schedule table was never applied");
     }
 
     let dirs = Arc::new(cluster.dirs());

@@ -681,30 +681,41 @@ const TABLE_PERIOD_NS: u64 = 200_000_000;
 fn apply_schedule_table(dir: &Path, cnc: &CncPage, table: &ScheduleTable) -> u64 {
     let mut bytes = Vec::new();
     encode_schedule_table(table, &mut bytes);
-    std::fs::write(dir.join(uc_node::SCHEDULE_PENDING_FILE), &bytes).expect("stage the table");
-    let (id, ip, port) = uc_node::schedule_digest(&bytes);
-    let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
-    cnc.write_admin_req(&AdminReq {
-        seq,
-        nonce: rand::random::<u64>(),
-        op: ADMIN_OP_SCHEDULE_APPLY,
-        id,
-        ip,
-        port,
-    });
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(resp) = cnc.read_admin_resp(seq) {
-            assert_eq!(
-                resp.status, 0,
-                "schedule apply was not accepted: status {} reason {}",
-                resp.status, resp.reason
-            );
+    for _ in 0..20 {
+        std::fs::write(dir.join(uc_node::SCHEDULE_PENDING_FILE), &bytes).expect("stage the table");
+        let (id, ip, port) = uc_node::schedule_digest(&bytes);
+        let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce: rand::random::<u64>(),
+            op: ADMIN_OP_SCHEDULE_APPLY,
+            id,
+            ip,
+            port,
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let resp = loop {
+            if let Some(resp) = cnc.read_admin_resp(seq) {
+                break resp;
+            }
+            assert!(Instant::now() < deadline, "schedule apply timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if resp.status == 0 {
             return resp.version;
         }
-        assert!(Instant::now() < deadline, "schedule apply timed out");
-        std::thread::sleep(Duration::from_millis(10));
+        // `2` = retry, side-effect-free: a leader that has the role but has
+        // not finished its leader-open collapse has no appender yet, and
+        // `uc2ctl` polls through exactly that window. Anything else is a
+        // genuine refusal and the test should say so.
+        assert_eq!(
+            resp.status, 2,
+            "schedule apply was refused: reason {}",
+            resp.reason
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
+    panic!("schedule apply never left the retry window");
 }
 
 /// Row 0's identity hash — what a table entry names its FSM by.
