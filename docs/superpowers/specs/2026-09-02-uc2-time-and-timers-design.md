@@ -618,7 +618,7 @@ as written and annotated rather than rewritten.
    different entry, which arms normally.
 
 - **Errata (plan 3, snapshot carry).** The table IS carried by the snapshot
-  session: the leader sends a `SNAP_TABLE` datagram (kind 18, body `session ‖
+  session: the leader sends a `SNAP_TABLE` datagram (kind 21, body `session ‖
   position ‖ time_ns ‖ table_len ‖ table`, ≤ 1086 B) after every `SNAP_BEGIN`
   of a session; the receiver withholds `SNAP_DONE` until it has one and
   publishes it to the consensus agent before the floor signal, which installs
