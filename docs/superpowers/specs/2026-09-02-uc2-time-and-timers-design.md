@@ -444,7 +444,9 @@ gets an as-built erratum saying so (§9).
   When the flag is set, the top of the next `apply_cycle` asks the wrapper for
   its pending set — `trait TimerSource { fn pending_timers(&self) -> Vec<(u64,
   u64)> }`, implemented by `Timed`, a no-op default for everything else — and
-  writes one `Schedule` record per entry before delivering any frame.
+  writes one `Schedule` record per entry before delivering any frame. That is
+  how a restarted or freshly joined node's heap converges, and why a new leader
+  whose service is behind fires late rather than never.
 - Journal replay re-runs `apply`, so the inner SM's schedule calls are
   re-made and the wrapper's maps are rebuilt from the log; TIMER frames in
   the replayed range re-run the §4.6 test. Both paths end at the same maps
