@@ -3691,21 +3691,28 @@ impl Consensus {
                     t.take_in_flight(id, dl);
                     did = true;
                     self.timer_stats.fired[row].fetch_add(1, Ordering::Relaxed);
+                    // ONLY the late case gets a line. A per-fire record on the
+                    // consensus single-writer is a stderr write per timer —
+                    // up to TIMERS_PER_PASS of them per pass — on the agent
+                    // that also drives commit and elections. An on-time fire
+                    // is the steady state and stays visible through the
+                    // `fired` counter (`uc2_timers_fired_total`); a LATE fire
+                    // is the operational signal, and it is rare by
+                    // construction, so it earns the write.
                     let late = stamp > dl;
                     if late {
                         self.timer_stats.late[row].fetch_add(1, Ordering::Relaxed);
+                        crate::obs_event!(
+                            Info,
+                            "timer_late",
+                            node = self.id as u64,
+                            row = row as u64,
+                            timer_id = id,
+                            deadline_ns = dl,
+                            time_ns = stamp,
+                            position = position
+                        );
                     }
-                    crate::obs_event!(
-                        Info,
-                        "timer_fired",
-                        node = self.id as u64,
-                        row = row as u64,
-                        timer_id = id,
-                        deadline_ns = dl,
-                        time_ns = stamp,
-                        position = position,
-                        late = late
-                    );
                 }
                 // The stamp is computed only after the overrun gate, so this
                 // leaves the log clock untouched: hold the clients and retry
