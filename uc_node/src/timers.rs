@@ -129,7 +129,10 @@ impl RowTimers {
         if let Some(e) = self.table.get_mut(&id)
             && e.next.is_some_and(|n| n <= deadline_ns)
         {
-            e.next = e.rule.next_after(deadline_ns);
+            // STRICTLY later, or park: `next_after` saturates, so an `Every`
+            // fired at the top of the range answers the deadline itself — a
+            // fixpoint that would re-append this entry every pass forever.
+            e.next = e.rule.next_after(deadline_ns).filter(|n| *n > deadline_ns);
             if let Some(n) = e.next {
                 self.heap.push(Reverse((n, id, true)));
             }
@@ -357,6 +360,36 @@ mod tests {
         o.table_fired(3, 500);
         assert_eq!(o.table_fire_deadline(3, 9_999), None, "parked");
         assert_eq!(o.table_fire_deadline(99, 9_999), None, "absent id");
+    }
+
+    /// Final-review minor 10: `next_after` SATURATES, so an `Every` entry
+    /// fired at the top of the range would otherwise re-arm at exactly the
+    /// deadline it just fired — a fixpoint the pass clock is always at or
+    /// above, i.e. an entry that appends a timer frame every pass, forever.
+    /// A poisoned log clock is the only way in, but the answer costs one
+    /// `filter`: only a STRICTLY later occurrence re-arms; anything else
+    /// parks.
+    #[test]
+    fn an_every_entry_fired_at_the_top_of_the_range_parks() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        let r = ScheduleRule::Every {
+            period_ns: 1,
+            anchor_ns: 0,
+        };
+        t.adopt_table(&[(7, r)], u64::MAX);
+        assert_eq!(
+            r.next_after(u64::MAX),
+            Some(u64::MAX),
+            "the saturation this guards against"
+        );
+        t.table_fired(7, u64::MAX);
+        assert_eq!(
+            t.peek_due(u64::MAX),
+            None,
+            "parked, not re-armed at the same instant"
+        );
+        assert_eq!(t.table_len(), 1, "still adopted, just with nothing due");
     }
 
     #[test]

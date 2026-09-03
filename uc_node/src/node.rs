@@ -4211,6 +4211,20 @@ impl Consensus {
     /// cache file whose only job is to bridge a restart; refusing to boot
     /// over it would strand the node, and the next observed table frame (or
     /// re-apply) restores the set.
+    ///
+    /// The record is judged against `durable` FIRST, exactly as the archive
+    /// drain (step 1c') judges an observation. The leader persists at APPEND,
+    /// which is BEFORE the archive has recorded the frame, so a node that
+    /// dies in that window comes back holding a record no durable byte
+    /// backs. Arming it would leave `schedule_position` above `durable`,
+    /// where a later table frame at or below that position is ignored as a
+    /// re-observation on this node alone — and if this node then leads, it
+    /// fires the old table. `revert_schedule_below(durable)` is exactly the
+    /// right shape: it promotes the one-level predecessor (or
+    /// `ScheduleRecord::empty()`), persists, arms from it and names the fact
+    /// with `schedule_table_reverted`. The durable counter is already seeded
+    /// from the journal by the time this runs (`Node::start_with_socket`
+    /// primes it in step 2, and calls this after).
     fn arm_schedule_at_boot(&mut self) {
         let rec = match crate::schedule_state::load(&self.schedule_state) {
             Ok(Some(rec)) => rec,
@@ -4226,6 +4240,14 @@ impl Consensus {
                 return;
             }
         };
+        let durable = self.cnc.counters().durable.load_acquire();
+        if rec.position > durable {
+            // Implausible: no durable byte backs this record. Revert (and
+            // arm) one level down instead of adopting it — see this
+            // function's doc comment.
+            self.revert_schedule_below(durable);
+            return;
+        }
         let Some(table) = decode_schedule_table(&rec.table) else {
             crate::obs_event!(
                 Warn,
@@ -5394,17 +5416,35 @@ impl Consensus {
         // multi-gigabyte read on the thread that drives commit and
         // elections. An over-long file is not a decodable table either, so
         // the honest refusal is the same one the decoder would give.
-        let meta = match std::fs::metadata(&self.schedule_pending) {
-            Ok(m) => m,
+        //
+        // ONE path resolution, then everything off the HANDLE: a
+        // `metadata(path)` followed by a `read(path)` resolves the name
+        // twice, and anything with instance-dir write access could swap a
+        // FIFO in between — an unbounded blocking read on the consensus
+        // agent. `take(MAX + 1)` bounds the read regardless of what the
+        // handle turns out to be, so the length check is a check and not a
+        // promise.
+        let mut f = match std::fs::File::open(&self.schedule_pending) {
+            Ok(f) => f,
             Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
         };
-        if !meta.is_file() || meta.len() > MAX_SCHEDULE_TABLE_BYTES {
+        match f.metadata() {
+            Ok(m) if m.is_file() && m.len() <= MAX_SCHEDULE_TABLE_BYTES => {}
+            Ok(_) => return self.refuse_schedule(REASON_SCHEDULE_DECODE),
+            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
+        }
+        use std::io::Read as _;
+        let mut bytes = Vec::new();
+        if (&mut f)
+            .take(MAX_SCHEDULE_TABLE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return self.refuse_schedule(REASON_SCHEDULE_MISSING);
+        }
+        if bytes.len() as u64 > MAX_SCHEDULE_TABLE_BYTES {
             return self.refuse_schedule(REASON_SCHEDULE_DECODE);
         }
-        let bytes = match std::fs::read(&self.schedule_pending) {
-            Ok(b) => b,
-            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
-        };
         if schedule_digest(&bytes) != (id, ip, port) {
             return self.refuse_schedule(REASON_SCHEDULE_DIGEST);
         }
@@ -5439,9 +5479,13 @@ impl Consensus {
             }
             // Nothing appended, nothing adopted, staged file still present:
             // safe to retry whole (`append_config_frame`'s argument).
-            Err(AppendError::WouldOverrun) | Err(AppendError::PayloadTooLarge) => {
-                (2, 0, self.schedule_position)
-            }
+            Err(AppendError::WouldOverrun) => (2, 0, self.schedule_position),
+            // NOT retryable. `MAX_SCHEDULE_TABLE_BYTES` (1064 B, 32 entries)
+            // is under the payload ceiling, so this is unreachable today —
+            // but a permanent error must never be answered `2`, which tells
+            // `uc2ctl` to poll for a commit that can never happen. It is a
+            // refusal for the same reason an undecodable body is.
+            Err(AppendError::PayloadTooLarge) => self.refuse_schedule(REASON_SCHEDULE_DECODE),
         }
     }
 
@@ -7798,6 +7842,84 @@ mod tests {
         assert_eq!(
             h.cons.schedule_position, 4096,
             "finishing the open does not resurrect the cut frame"
+        );
+    }
+
+    /// Plan 2 (final review, Important 2): BOOT arming needs the archive
+    /// drain's durable-plausibility check too. The leader persists the record
+    /// at APPEND, before the archive has recorded the frame; a node that dies
+    /// in that window restarts holding a record no durable byte backs. Arming
+    /// it would park `schedule_position` above `durable`, where a later table
+    /// frame landing at or below that position is ignored as a
+    /// re-observation — on this node alone — and if it then leads it fires the
+    /// old table.
+    ///
+    /// The harness's durable counter is 6016, so a record at 8192 is
+    /// implausible and its predecessor at 4096 is not: boot must promote the
+    /// predecessor, persist it, and arm from it. (No predecessor reverts to
+    /// `ScheduleRecord::empty()`, covered by `schedule_state`'s own unit
+    /// test; `durable == 0` is the wipe branch, which keeps the table at
+    /// position 0 by fiat — `revert_schedule_below`'s documented case.)
+    #[test]
+    fn a_boot_record_above_durable_reverts_before_arming() {
+        let mut h = harness();
+        let bytes = ScheduleRecord::empty().table; // a decodable, empty table
+        let rec = ScheduleRecord {
+            position: 8192,
+            time_ns: 77,
+            table: bytes.clone(),
+            prev: Some(Box::new(ScheduleRecord {
+                position: 4096,
+                time_ns: 11,
+                table: bytes,
+                prev: None,
+            })),
+        };
+        crate::schedule_state::store(&h.cons.schedule_state, &rec).unwrap();
+        assert_eq!(
+            h.cons.cnc.counters().durable.load_acquire(),
+            6016,
+            "the counter boot arming judges against"
+        );
+
+        h.cons.arm_schedule_at_boot();
+
+        assert_eq!(
+            h.cons.schedule_position, 4096,
+            "the record above durable is not adopted; its predecessor is"
+        );
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 4096);
+        let back = crate::schedule_state::load(&h.cons.schedule_state)
+            .unwrap()
+            .expect("a record is still stored");
+        assert_eq!(back.position, 4096, "persisted, not just in memory");
+        assert_eq!(back.prev, None, "the one-level history is exhausted");
+    }
+
+    /// The other side of the same guard: a plausible record (at or below
+    /// durable) is adopted at boot exactly as before, so the revert is a
+    /// narrow safety check and not a new way to lose a table across a bounce.
+    #[test]
+    fn a_boot_record_at_or_below_durable_is_armed_unchanged() {
+        let mut h = harness();
+        let rec = ScheduleRecord {
+            position: 6016, // == durable: the common case, a committed frame
+            time_ns: 77,
+            table: ScheduleRecord::empty().table,
+            prev: None,
+        };
+        crate::schedule_state::store(&h.cons.schedule_state, &rec).unwrap();
+
+        h.cons.arm_schedule_at_boot();
+
+        assert_eq!(h.cons.schedule_position, 6016);
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 6016);
+        assert_eq!(
+            crate::schedule_state::load(&h.cons.schedule_state)
+                .unwrap()
+                .map(|r| r.position),
+            Some(6016),
+            "untouched on disk"
         );
     }
 
