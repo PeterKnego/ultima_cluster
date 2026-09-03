@@ -1401,6 +1401,7 @@ impl Node {
             validated_term: cons_validated_term,
             obs_frontier: cons_obs_frontier,
             pending_obs: Vec::new(),
+            pending_cfg_obs: Vec::new(),
             trace_prov: cons_trace_prov,
             trunc_trace,
             id: cfg.id,
@@ -1994,6 +1995,16 @@ struct Consensus {
     /// Term observations held while the SM is mid-truncation (its data-plane
     /// latch would drop them, and nothing re-derives a dropped observation).
     pending_obs: Vec<(u32, u64)>,
+    /// Durably-recorded CONFIG-frame observations held across the SM's
+    /// truncating latch (do_work step 1c), the same way `pending_obs` holds
+    /// term observations. The archive emits each one EXACTLY ONCE and the
+    /// latch drops every data-plane event, so feeding under the latch loses
+    /// the observation for good (nightly 33605909828: a restarted ex-leader
+    /// re-archived its own CONFIG v2 frame while a reconcile cut landed at
+    /// that frame's end, and ran at v1 until the next restart). Replayed in
+    /// position order once the ack lands; entries above the cut are dropped
+    /// there, since the bytes they describe are gone.
+    pending_cfg_obs: Vec<(u64, Vec<u8>)>,
     /// Diagnostic (UC2_TRUNC_TRACE): last commit provenance, published for
     /// the archive thread's cut trace. Both fields are inert unless the env
     /// var is set.
@@ -2531,34 +2542,24 @@ impl Consensus {
         // adoption is idempotent by version). A decode failure is fail-stop:
         // the archive's block is journal-CRC-covered, so a malformed payload
         // here is a BUG, never something to shrug off.
-        while let Ok((position, payload)) = self.cfg_obs_rx.try_recv() {
-            let wire = decode_config(&payload)
-                .unwrap_or_else(|| panic!("corrupt CONFIG frame at {position}"));
-            // Belt (post-M7 follow-up): observations are drained AFTER the
-            // archive agent's do_work returned, and do_work store_release's
-            // durable as its LAST step — so a durably-recorded CONFIG
-            // frame's end position can never exceed the durable counter
-            // here. A violation is a mis-based observation (recorder bug):
-            // adopting it would park config_position above durable, where
-            // config_pending could never clear. Skip + log, don't adopt.
-            let durable = self.cnc.counters().durable.load_acquire();
-            if position > durable {
-                eprintln!(
-                    "node {}: ignoring implausible ConfigObserved at {position} (durable {durable})",
-                    self.id
-                );
+        //
+        // Held across the SM's truncating latch exactly like step 1b's term
+        // observations: the latch drops data-plane events, the archive never
+        // re-emits, and an observation for a frame at/below the cut must
+        // still adopt once the ack lands (`on_truncated` prunes the ones
+        // above it).
+        while let Ok(obs) = self.cfg_obs_rx.try_recv() {
+            self.pending_cfg_obs.push(obs);
+        }
+        if self.sm.is_truncating() {
+            if !self.pending_cfg_obs.is_empty() {
                 did = true;
-                continue;
             }
-            let config = wire_to_cluster_config(&wire);
-            if config_content_diverges(self.sm.config(), &config) {
-                eprintln!(
-                    "node {}: DIVERGENT config observed at {position}: version {} content differs from adopted",
-                    self.id, config.version
-                );
+        } else {
+            for (position, payload) in std::mem::take(&mut self.pending_cfg_obs) {
+                self.observe_config(position, payload);
+                did = true;
             }
-            self.feed(Event::ConfigObserved { position, config });
-            did = true;
         }
 
         // 1c'. Drain durably-recorded SCHEDULE_TABLE observations (plan 2,
@@ -6452,10 +6453,43 @@ impl Consensus {
         self.cnc.status().leader_hint.store_release(self.id as u64);
     }
 
+    /// do_work step 1c, one observation: decode, apply the position<=durable
+    /// belt, flag equal-version content divergence, feed `ConfigObserved`.
+    fn observe_config(&mut self, position: u64, payload: Vec<u8>) {
+        let wire =
+            decode_config(&payload).unwrap_or_else(|| panic!("corrupt CONFIG frame at {position}"));
+        // Belt (post-M7 follow-up): observations are drained AFTER the
+        // archive agent's do_work returned, and do_work store_release's
+        // durable as its LAST step — so a durably-recorded CONFIG
+        // frame's end position can never exceed the durable counter
+        // here. A violation is a mis-based observation (recorder bug):
+        // adopting it would park config_position above durable, where
+        // config_pending could never clear. Skip + log, don't adopt.
+        let durable = self.cnc.counters().durable.load_acquire();
+        if position > durable {
+            eprintln!(
+                "node {}: ignoring implausible ConfigObserved at {position} (durable {durable})",
+                self.id
+            );
+            return;
+        }
+        let config = wire_to_cluster_config(&wire);
+        if config_content_diverges(self.sm.config(), &config) {
+            eprintln!(
+                "node {}: DIVERGENT config observed at {position}: version {} content differs from adopted",
+                self.id, config.version
+            );
+        }
+        self.feed(Event::ConfigObserved { position, config });
+    }
+
     fn on_truncated(&mut self, epoch: u64, to: u64) {
         // The archive re-primed the counters to `to`; keep our shadow in step so
         // we don't refeed a spurious DurableAdvanced.
         self.durable_seen = to;
+        // Observations for frames ending above the cut describe bytes that are
+        // gone; a re-received tail is re-scanned and re-emitted by the archive.
+        self.pending_cfg_obs.retain(|(position, _)| *position <= to);
         let matching = self.pending_truncation == Some(epoch);
         self.feed(Event::Truncated { epoch, to });
         if matching {
@@ -7672,6 +7706,7 @@ mod tests {
             validated_term: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             pending_obs: Vec::new(),
+            pending_cfg_obs: Vec::new(),
             trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
             trunc_trace: false,
             id: 1,
@@ -9184,6 +9219,86 @@ mod tests {
             h.cons.sm.config().version,
             1,
             "plausible obs must still adopt"
+        );
+    }
+
+    // ---- 2026-09-03 nightly 33605909828: ConfigObserved lost to the truncating latch ----
+
+    /// REGRESSION. A `ConfigObserved` that the archive emits while a reconcile
+    /// truncation is in flight must be ADOPTED once the ack lands, not lost.
+    ///
+    /// The archive emits each config observation exactly once (do_work step
+    /// 1c has no steady-state repair path), and `ElectionSm::step`'s truncating
+    /// latch drops every event but `RequestVote | Vote | Truncated`. Step 1b
+    /// buffers term observations across that latch (the 2026-08-16 hunt);
+    /// step 1c fed config observations straight through it. Nightly
+    /// 33605909828 (`sigkill_mid_config_window`) hit exactly that: the
+    /// restarted ex-leader re-received and archived the CONFIG v2 frame ending
+    /// at 16512 while its reconcile cut to exactly 16512 — the bytes survived,
+    /// the one observation died, and the node replicated at v1 for 90 s.
+    /// This drives the same shape through the real drain path: the harness's
+    /// boot map [(1,0),(2,4096)] reconciles against [(1,0),(3,4096)] to a cut
+    /// at 4096, and the observation names a frame ending at the cut.
+    #[test]
+    fn config_observation_during_truncation_is_adopted_after_the_ack() {
+        let mut h = harness();
+        let v1 = v1_of(&h);
+        let mut bytes = Vec::new();
+        encode_config(&cluster_to_wire(&v1, 0), &mut bytes);
+
+        // A reconcile truncation to 4096 is in flight; the SM latch is up.
+        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
+        assert!(h.cons.sm.is_truncating(), "latch up");
+        let epoch = h.cons.pending_truncation.expect("bracket open");
+
+        // The archive records the CONFIG frame ending exactly at the cut and
+        // emits its one observation; the duty cycle drains it under the latch.
+        h._cfg_obs_tx.send((4096, bytes)).unwrap();
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.sm.config().version,
+            0,
+            "nothing adopts while the latch is up"
+        );
+
+        // The archive cuts to 4096 (re-priming the counters there) and acks;
+        // `to == frame end`, so the frame's bytes survive the cut.
+        h.cons.cnc.counters().prime(4096);
+        h.post_ack_and_drain(epoch, 4096);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.sm.config().version,
+            1,
+            "the observation drained under the latch must be adopted after the ack"
+        );
+    }
+
+    /// Boundary of the replay above: an observation naming a frame that ends
+    /// ABOVE the cut describes bytes the truncation removed. It must not be
+    /// adopted after the ack — if the node re-receives those bytes the archive
+    /// re-scans them and emits a fresh observation. (This never failed before
+    /// the fix — the latch dropped everything — it pins the fix's boundary.)
+    #[test]
+    fn config_observation_above_the_cut_is_not_adopted_after_the_ack() {
+        let mut h = harness();
+        let v1 = v1_of(&h);
+        let mut bytes = Vec::new();
+        encode_config(&cluster_to_wire(&v1, 0), &mut bytes);
+
+        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
+        let epoch = h.cons.pending_truncation.expect("bracket open");
+
+        // The frame ended at the boot frontier 6016, above the 4096 cut.
+        h._cfg_obs_tx.send((6016, bytes)).unwrap();
+        h.cons.do_work();
+
+        h.cons.cnc.counters().prime(4096);
+        h.post_ack_and_drain(epoch, 4096);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.sm.config().version,
+            0,
+            "a frame above the cut was truncated away; its observation is stale"
         );
     }
 
