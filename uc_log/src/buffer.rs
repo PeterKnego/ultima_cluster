@@ -583,20 +583,6 @@ impl Appender {
     }
 
     #[inline]
-    fn stamp(&mut self) -> u64 {
-        let s = self.now_ns.max(self.last_stamp);
-        self.last_stamp = s;
-        s
-    }
-
-    #[inline]
-    fn stamp_at(&mut self, want: u64) -> u64 {
-        let s = want.max(self.last_stamp);
-        self.last_stamp = s;
-        s
-    }
-
-    #[inline]
     pub fn position(&self) -> u64 {
         self.pos
     }
@@ -609,7 +595,7 @@ impl Appender {
         }
         let total = HEADER_LEN + payload.len();
         let aligned = align_frame_len(total) as u64;
-        let b = Arc::clone(&self.buffer);
+        let b = &self.buffer;
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -624,7 +610,12 @@ impl Appender {
             }
         }
 
-        let time_ns = self.stamp();
+        // The clamp, inline (final-review I1): a `&mut self` method call here
+        // would conflict with the shared borrow of `self.buffer`; writing the
+        // field directly is a disjoint borrow and costs no Arc refcount traffic
+        // per append. Non-strict — equal stamps are allowed (spec §3.2).
+        let time_ns = self.now_ns.max(self.last_stamp);
+        self.last_stamp = time_ns;
 
         let frame_pos = if pad > 0 {
             self.write_padding(off, pad as u32, time_ns);
@@ -674,7 +665,7 @@ impl Appender {
     pub fn append_new_term(&mut self) -> Result<u64, AppendError> {
         let total = HEADER_LEN; // header-only no-op frame
         let aligned = align_frame_len(total) as u64;
-        let b = Arc::clone(&self.buffer);
+        let b = &self.buffer;
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -688,7 +679,12 @@ impl Appender {
             }
         }
 
-        let time_ns = self.stamp();
+        // The clamp, inline (final-review I1): a `&mut self` method call here
+        // would conflict with the shared borrow of `self.buffer`; writing the
+        // field directly is a disjoint borrow and costs no Arc refcount traffic
+        // per append. Non-strict — equal stamps are allowed (spec §3.2).
+        let time_ns = self.now_ns.max(self.last_stamp);
+        self.last_stamp = time_ns;
 
         let frame_pos = if pad > 0 {
             self.write_padding(off, pad as u32, time_ns);
@@ -738,7 +734,7 @@ impl Appender {
         }
         let total = HEADER_LEN + payload.len();
         let aligned = align_frame_len(total) as u64;
-        let b = Arc::clone(&self.buffer);
+        let b = &self.buffer;
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -753,7 +749,12 @@ impl Appender {
             }
         }
 
-        let time_ns = self.stamp();
+        // The clamp, inline (final-review I1): a `&mut self` method call here
+        // would conflict with the shared borrow of `self.buffer`; writing the
+        // field directly is a disjoint borrow and costs no Arc refcount traffic
+        // per append. Non-strict — equal stamps are allowed (spec §3.2).
+        let time_ns = self.now_ns.max(self.last_stamp);
+        self.last_stamp = time_ns;
 
         let frame_pos = if pad > 0 {
             self.write_padding(off, pad as u32, time_ns);
@@ -799,7 +800,7 @@ impl Appender {
     pub fn append_timer(&mut self, body: &TimerBody, flags: u8) -> Result<(u64, u64), AppendError> {
         let total = HEADER_LEN + TIMER_BODY_LEN;
         let aligned = align_frame_len(total) as u64;
-        let b = Arc::clone(&self.buffer);
+        let b = &self.buffer;
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -814,7 +815,11 @@ impl Appender {
             }
         }
 
-        let time_ns = self.stamp_at(body.deadline_ns);
+        // The clamp, inline (final-review I1) — see `append`. A TIMER frame is
+        // stamped with its DEADLINE, clamped up to `last_stamp` when a previous
+        // leader already stamped past it (spec §4.3: that is the `late` case).
+        let time_ns = body.deadline_ns.max(self.last_stamp);
+        self.last_stamp = time_ns;
 
         let frame_pos = if pad > 0 {
             self.write_padding(off, pad as u32, time_ns);
