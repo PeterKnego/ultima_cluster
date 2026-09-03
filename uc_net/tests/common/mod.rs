@@ -239,7 +239,7 @@ pub fn load(leader: &Arc<LogBuffer>, live: &[&Arc<LogBuffer>], n_msgs: u64) -> u
     for i in 0..n_msgs {
         loop {
             assert!(Instant::now() < deadline, "load timed out at msg {i}");
-            match a.append(1, i, &[i as u8; 64]) {
+            match a.append(1, i as u32, &[i as u8; 64]) {
                 Ok(_) => break,
                 Err(AppendError::WouldOverrun) => std::thread::yield_now(),
                 Err(e) => panic!("{e}"),

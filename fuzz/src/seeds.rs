@@ -766,8 +766,9 @@ pub fn uc_protocol_log_frame() -> Vec<Seed> {
                 frame_type,
                 flags: 0,
                 leadership_term_id: 3,
-                session_id: 7,
-                correlation_id: 11,
+                client_id: 7,
+                seq: 11,
+                time_ns: 0,
             },
         );
         buf[OFF_LENGTH..OFF_LENGTH + 4].copy_from_slice(&length.to_le_bytes());

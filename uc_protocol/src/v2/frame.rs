@@ -17,9 +17,10 @@ pub const OFF_TYPE: usize = 4; // u8
 pub const OFF_FLAGS: usize = 5; // u8
 pub const OFF_RESERVED0: usize = 6; // u16 — reserved, written as zero
 pub const OFF_TERM_ID: usize = 8; // u32 LE — leadership_term_id
-pub const OFF_RESERVED1: usize = 12; // u32 — reserved, written as zero
-pub const OFF_SESSION_ID: usize = 16; // u64 LE
-pub const OFF_CORRELATION_ID: usize = 24; // u64 LE
+pub const OFF_CLIENT_ID: usize = 12; // u32 LE — the submitting client (0 for node-originated frames)
+pub const OFF_SEQ: usize = 16; // u32 LE — the client's local sequence (0 for node-originated frames)
+pub const OFF_RESERVED1: usize = 20; // u32 — reserved, written as zero
+pub const OFF_TIME_NS: usize = 24; // u64 LE — leader-stamped ns since the Unix epoch; non-decreasing along the log
 
 /// Application message; payload = user command bytes.
 pub const FRAME_TYPE_MESSAGE: u8 = 1;
@@ -38,6 +39,14 @@ pub const FRAME_TYPE_NEW_TERM: u8 = 3;
 /// Replicated/archived/replayed like any frame; the apply layer skips every
 /// non-MESSAGE type, so services never see it.
 pub const FRAME_TYPE_CONFIG: u8 = 4;
+/// Scheduled timer fired by the leader (time-and-timers spec §4.2): a 24-byte
+/// body ([`TimerBody`]); `client_id`/`seq` are 0; `time_ns` is the deadline
+/// unless the frame is late (`time_ns > deadline_ns`). Delivered to exactly the
+/// FSM whose identity hash it names; every other apply loop skips it.
+pub const FRAME_TYPE_TIMER: u8 = 5;
+/// `flags` bit 0 on a TIMER frame: fired from the replicated schedule table
+/// (plan 2), not from a state machine's `schedule` call.
+pub const FLAG_TIMER_TABLE: u8 = 0x01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -45,8 +54,9 @@ pub struct FrameHeader {
     pub frame_type: u8,
     pub flags: u8,
     pub leadership_term_id: u32,
-    pub session_id: u64,
-    pub correlation_id: u64,
+    pub client_id: u32,
+    pub seq: u32,
+    pub time_ns: u64,
 }
 
 /// Round a total frame length up to the 32-byte slot size.
@@ -60,12 +70,12 @@ pub const fn align_frame_len(total: usize) -> usize {
 pub fn write_header_except_length(buf: &mut [u8], h: &FrameHeader) {
     buf[OFF_TYPE] = h.frame_type;
     buf[OFF_FLAGS] = h.flags;
-    buf[OFF_RESERVED0..OFF_RESERVED0 + 2].copy_from_slice(&0u16.to_le_bytes());
+    buf[OFF_RESERVED0..OFF_RESERVED0 + 2].copy_from_slice(&[0, 0]);
     buf[OFF_TERM_ID..OFF_TERM_ID + 4].copy_from_slice(&h.leadership_term_id.to_le_bytes());
-    buf[OFF_RESERVED1..OFF_RESERVED1 + 4].copy_from_slice(&0u32.to_le_bytes());
-    buf[OFF_SESSION_ID..OFF_SESSION_ID + 8].copy_from_slice(&h.session_id.to_le_bytes());
-    buf[OFF_CORRELATION_ID..OFF_CORRELATION_ID + 8]
-        .copy_from_slice(&h.correlation_id.to_le_bytes());
+    buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 4].copy_from_slice(&h.client_id.to_le_bytes());
+    buf[OFF_SEQ..OFF_SEQ + 4].copy_from_slice(&h.seq.to_le_bytes());
+    buf[OFF_RESERVED1..OFF_RESERVED1 + 4].copy_from_slice(&[0, 0, 0, 0]);
+    buf[OFF_TIME_NS..OFF_TIME_NS + 8].copy_from_slice(&h.time_ns.to_le_bytes());
 }
 
 /// Parse a header from a committed frame. The caller must already have
@@ -89,13 +99,46 @@ pub fn read_header(buf: &[u8]) -> FrameHeader {
         leadership_term_id: u32::from_le_bytes(
             buf[OFF_TERM_ID..OFF_TERM_ID + 4].try_into().unwrap(),
         ),
-        session_id: u64::from_le_bytes(buf[OFF_SESSION_ID..OFF_SESSION_ID + 8].try_into().unwrap()),
-        correlation_id: u64::from_le_bytes(
-            buf[OFF_CORRELATION_ID..OFF_CORRELATION_ID + 8]
-                .try_into()
-                .unwrap(),
-        ),
+        client_id: u32::from_le_bytes(buf[OFF_CLIENT_ID..OFF_CLIENT_ID + 4].try_into().unwrap()),
+        seq: u32::from_le_bytes(buf[OFF_SEQ..OFF_SEQ + 4].try_into().unwrap()),
+        time_ns: u64::from_le_bytes(buf[OFF_TIME_NS..OFF_TIME_NS + 8].try_into().unwrap()),
     }
+}
+
+/// The TIMER frame body: fixed, 24 bytes, three LE `u64`s.
+pub const TIMER_BODY_LEN: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerBody {
+    /// `FsmIdentity::hash()` of the FSM this timer belongs to.
+    pub identity_hash: u64,
+    /// The FSM's own id for the timer.
+    pub timer_id: u64,
+    /// What was asked for; compare with the header's `time_ns` for lateness.
+    pub deadline_ns: u64,
+}
+
+/// Write a [`TimerBody`]. `buf` must be at least [`TIMER_BODY_LEN`] bytes
+/// (panics otherwise, like [`write_header_except_length`]).
+pub fn write_timer_body(buf: &mut [u8], b: &TimerBody) {
+    buf[0..8].copy_from_slice(&b.identity_hash.to_le_bytes());
+    buf[8..16].copy_from_slice(&b.timer_id.to_le_bytes());
+    buf[16..24].copy_from_slice(&b.deadline_ns.to_le_bytes());
+}
+
+/// Total on any input: `None` when shorter than [`TIMER_BODY_LEN`]; longer
+/// input is accepted and the tail ignored (a committed frame is trusted; the
+/// length check is what keeps this decoder safe on a fuzzed slice).
+pub fn read_timer_body(buf: &[u8]) -> Option<TimerBody> {
+    if buf.len() < TIMER_BODY_LEN {
+        return None;
+    }
+    let u = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+    Some(TimerBody {
+        identity_hash: u(0),
+        timer_id: u(8),
+        deadline_ns: u(16),
+    })
 }
 
 #[cfg(test)]
@@ -112,29 +155,61 @@ mod tests {
         assert_eq!(align_frame_len(HEADER_LEN + 64), 96);
     }
 
+    /// FROZEN layout (spec §3.1). Never change these.
     #[test]
-    fn header_roundtrip_except_length() {
+    fn field_offsets_are_the_relaid_layout() {
+        // length(4) type(1) flags(1) rsvd(2) term(4) client_id(4) seq(4) rsvd(4) time_ns(8) = 32
+        assert_eq!(OFF_LENGTH, 0);
+        assert_eq!(OFF_TYPE, 4);
+        assert_eq!(OFF_FLAGS, 5);
+        assert_eq!(OFF_RESERVED0, 6);
+        assert_eq!(OFF_TERM_ID, 8);
+        assert_eq!(OFF_CLIENT_ID, 12);
+        assert_eq!(OFF_SEQ, 16);
+        assert_eq!(OFF_RESERVED1, 20);
+        assert_eq!(OFF_TIME_NS, 24);
+        assert_eq!(HEADER_LEN, 32);
+        assert_eq!(FRAME_ALIGNMENT, 32);
+    }
+
+    #[test]
+    fn header_roundtrip_except_length_pins_the_bytes() {
+        let mut buf = [0xAAu8; HEADER_LEN];
         let h = FrameHeader {
-            length: 0, // not written by write_header_except_length
+            length: 0,
             frame_type: FRAME_TYPE_MESSAGE,
             flags: 0x5a,
             leadership_term_id: 7,
-            session_id: 0x1122_3344_5566_7788,
-            correlation_id: 42,
+            client_id: 0x0102_0304,
+            seq: 0x0506_0708,
+            time_ns: 0x1122_3344_5566_7788,
         };
-        let mut buf = [0u8; HEADER_LEN];
         write_header_except_length(&mut buf, &h);
-        // length bytes untouched (commit word is written atomically elsewhere, last)
-        assert_eq!(&buf[OFF_LENGTH..OFF_LENGTH + 4], &[0, 0, 0, 0]);
-        // simulate the runtime's commit-word store
-        buf[OFF_LENGTH..OFF_LENGTH + 4].copy_from_slice(&(HEADER_LEN as u32 + 64).to_le_bytes());
+        assert_eq!(
+            &buf[0..4],
+            &[0xAA; 4],
+            "length is the commit word: untouched"
+        );
+        assert_eq!(&buf[6..8], &[0, 0], "reserved0 written as zero");
+        assert_eq!(
+            &buf[12..16],
+            &[0x04, 0x03, 0x02, 0x01],
+            "client_id LE at 12"
+        );
+        assert_eq!(&buf[16..20], &[0x08, 0x07, 0x06, 0x05], "seq LE at 16");
+        assert_eq!(&buf[20..24], &[0, 0, 0, 0], "reserved1 written as zero");
+        assert_eq!(
+            &buf[24..32],
+            &0x1122_3344_5566_7788u64.to_le_bytes(),
+            "time_ns LE at 24"
+        );
         let out = read_header(&buf);
-        assert_eq!(out.length, HEADER_LEN as u32 + 64);
         assert_eq!(out.frame_type, FRAME_TYPE_MESSAGE);
         assert_eq!(out.flags, 0x5a);
         assert_eq!(out.leadership_term_id, 7);
-        assert_eq!(out.session_id, 0x1122_3344_5566_7788);
-        assert_eq!(out.correlation_id, 42);
+        assert_eq!(out.client_id, 0x0102_0304);
+        assert_eq!(out.seq, 0x0506_0708);
+        assert_eq!(out.time_ns, 0x1122_3344_5566_7788);
     }
 
     #[test]
@@ -143,18 +218,32 @@ mod tests {
         assert_eq!(FRAME_TYPE_PADDING, 2);
         assert_eq!(FRAME_TYPE_NEW_TERM, 3);
         assert_eq!(FRAME_TYPE_CONFIG, 4);
+        assert_eq!(FRAME_TYPE_TIMER, 5);
+        assert_eq!(FLAG_TIMER_TABLE, 0x01);
     }
 
+    /// FROZEN: the 24-byte TIMER body (spec §4.2).
     #[test]
-    fn field_offsets_do_not_overlap() {
-        // layout: length(4) type(1) flags(1) rsvd(2) term(4) rsvd(4) session(8) correlation(8) = 32
-        assert_eq!(OFF_LENGTH, 0);
-        assert_eq!(OFF_TYPE, 4);
-        assert_eq!(OFF_FLAGS, 5);
-        assert_eq!(OFF_TERM_ID, 8);
-        assert_eq!(OFF_SESSION_ID, 16);
-        assert_eq!(OFF_CORRELATION_ID, 24);
-        assert_eq!(HEADER_LEN, 32);
-        assert_eq!(FRAME_ALIGNMENT, 32);
+    fn timer_body_roundtrip_and_short_input_is_none() {
+        let b = TimerBody {
+            identity_hash: 0xdead_beef_cafe_f00d,
+            timer_id: 42,
+            deadline_ns: 1_700_000_000_000_000_000,
+        };
+        let mut buf = [0u8; TIMER_BODY_LEN];
+        write_timer_body(&mut buf, &b);
+        assert_eq!(&buf[0..8], &b.identity_hash.to_le_bytes());
+        assert_eq!(&buf[8..16], &42u64.to_le_bytes());
+        assert_eq!(&buf[16..24], &b.deadline_ns.to_le_bytes());
+        assert_eq!(read_timer_body(&buf), Some(b));
+        assert_eq!(read_timer_body(&buf[..23]), None);
+        assert_eq!(read_timer_body(&[]), None);
+        let mut longer = [7u8; 40];
+        longer[..24].copy_from_slice(&buf);
+        assert_eq!(
+            read_timer_body(&longer),
+            Some(b),
+            "trailing bytes are ignored"
+        );
     }
 }

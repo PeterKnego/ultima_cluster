@@ -272,7 +272,7 @@ fn main() -> anyhow::Result<()> {
                 let mut n = 0u64;
                 let mut stalls = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    match app.append(0, n, &payload) {
+                    match app.append(0, n as u32, &payload) {
                         Ok(_) => {
                             n += 1;
                             if n.is_multiple_of(batch) {

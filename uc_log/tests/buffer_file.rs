@@ -44,7 +44,7 @@ fn file_backed_buffer_roundtrip_across_reopen_of_mapping() {
     let mut out2 = Vec::new();
     match b2.read_frame_validated(0, &mut out2) {
         FrameRead::Frame(h) => {
-            assert_eq!(h.session_id, 5);
+            assert_eq!(h.client_id, 5);
             assert_eq!(&out2[32..], b"persisted?");
         }
         other => panic!("expected Frame, got {other:?}"),

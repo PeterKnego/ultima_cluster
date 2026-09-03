@@ -249,7 +249,7 @@ fn read_frame_at(node: &Node, pos: u64, buf: &mut Vec<u8>) -> uc_protocol::v2::f
 /// process path — no `Node::submit`), writes a `MSG_V2_SUBMIT` record
 /// carrying its `(client_id, local_seq)` in `header_extra`, and the consensus
 /// agent's ring drain appends it — stamping the log frame's
-/// `session_id`/`correlation_id` from that same identity end to end.
+/// `client_id`/`seq` from that same identity end to end.
 #[test]
 fn ingress_ring_submission_reaches_commit_and_non_leader_redirects() {
     let dir = tempfile::tempdir().unwrap();
@@ -267,8 +267,8 @@ fn ingress_ring_submission_reaches_commit_and_non_leader_redirects() {
     // The frame carries the client identity end to end.
     let mut buf = Vec::new();
     let hdr = read_frame_at(&node, commit0, &mut buf);
-    assert_eq!(hdr.session_id, 7);
-    assert_eq!(hdr.correlation_id, 1);
+    assert_eq!(hdr.client_id, 7);
+    assert_eq!(hdr.seq, 1);
 
     node.stop();
 }

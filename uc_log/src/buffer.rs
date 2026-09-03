@@ -571,12 +571,7 @@ impl Appender {
 
     /// Append one message frame; returns its position. `WouldOverrun` is
     /// retryable (backpressure), `PayloadTooLarge` is not.
-    pub fn append(
-        &mut self,
-        session_id: u64,
-        correlation_id: u64,
-        payload: &[u8],
-    ) -> Result<u64, AppendError> {
+    pub fn append(&mut self, client_id: u32, seq: u32, payload: &[u8]) -> Result<u64, AppendError> {
         if payload.len() > self.buffer.max_payload {
             return Err(AppendError::PayloadTooLarge);
         }
@@ -622,8 +617,9 @@ impl Appender {
                     frame_type: FRAME_TYPE_MESSAGE,
                     flags: 0,
                     leadership_term_id: self.leadership_term_id,
-                    session_id,
-                    correlation_id,
+                    client_id,
+                    seq,
+                    time_ns: 0,
                 },
             );
         }
@@ -676,8 +672,9 @@ impl Appender {
                     frame_type: FRAME_TYPE_NEW_TERM,
                     flags: 0,
                     leadership_term_id: self.leadership_term_id,
-                    session_id: 0,
-                    correlation_id: 0,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns: 0,
                 },
             );
         }
@@ -745,8 +742,9 @@ impl Appender {
                     frame_type: FRAME_TYPE_CONFIG,
                     flags: 0,
                     leadership_term_id: term,
-                    session_id: 0,
-                    correlation_id: 0,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns: 0,
                 },
             );
         }
@@ -770,8 +768,9 @@ impl Appender {
                     frame_type: FRAME_TYPE_PADDING,
                     flags: 0,
                     leadership_term_id: self.leadership_term_id,
-                    session_id: 0,
-                    correlation_id: 0,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns: 0,
                 },
             );
         }
@@ -829,8 +828,8 @@ mod tests {
         assert_eq!(h.length, (HEADER_LEN + 12) as u32);
         assert_eq!(h.frame_type, FRAME_TYPE_MESSAGE);
         assert_eq!(h.leadership_term_id, 3);
-        assert_eq!(h.session_id, 11);
-        assert_eq!(h.correlation_id, 42);
+        assert_eq!(h.client_id, 11);
+        assert_eq!(h.seq, 42);
         assert_eq!(&s[HEADER_LEN..HEADER_LEN + 12], b"hello world!");
     }
 
@@ -979,7 +978,7 @@ mod tests {
         // and the next slice (post-wrap) starts with the message frame
         let s = b.recordable_slice(4096, 1 << 20).unwrap();
         assert_eq!(s.len(), 96);
-        assert_eq!(read_header(s).correlation_id, 99);
+        assert_eq!(read_header(s).seq, 99);
     }
 
     #[test]
@@ -1088,7 +1087,7 @@ mod tests {
         let mut out = Vec::new();
         match b.read_frame_validated(0, &mut out) {
             FrameRead::Frame(h) => {
-                assert_eq!(h.correlation_id, 77);
+                assert_eq!(h.seq, 77);
                 assert_eq!(h.length as usize, HEADER_LEN + 3);
                 assert_eq!(&out[HEADER_LEN..], b"abc");
             }
@@ -1136,7 +1135,7 @@ mod tests {
         let mut a = Appender::new(Arc::clone(&b), 1);
         // write ~3 capacities worth, letting the gate breathe by keeping
         // durable glued to append (as a healthy archive would)
-        let mut n = 0u64;
+        let mut n = 0u32;
         while a.position() < 3 * CAP {
             a.append(1, n, &[0u8; 64]).unwrap();
             c.counters().durable.store_release(a.position());
@@ -1169,8 +1168,8 @@ mod tests {
             SliceRead::Run(r) => {
                 assert_eq!((r.bytes, r.advance), (192, 192));
                 assert_eq!(out.len(), 192);
-                assert_eq!(read_header(&out).correlation_id, 0);
-                assert_eq!(read_header(&out[96..]).correlation_id, 1);
+                assert_eq!(read_header(&out).seq, 0);
+                assert_eq!(read_header(&out[96..]).seq, 1);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -1178,7 +1177,7 @@ mod tests {
         match b.read_run_validated(192, 4096, &mut out) {
             SliceRead::Run(r) => {
                 assert_eq!((r.bytes, r.advance), (192, 192)); // frames 2,3
-                assert_eq!(read_header(&out).correlation_id, 2);
+                assert_eq!(read_header(&out).seq, 2);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -1218,7 +1217,7 @@ mod tests {
         match b.read_run_validated(4096, 1392, &mut out) {
             SliceRead::Run(r) => {
                 assert_eq!((r.bytes, r.advance), (96, 96));
-                assert_eq!(read_header(&out).correlation_id, 99);
+                assert_eq!(read_header(&out).seq, 99);
             }
             other => panic!("expected Run, got {other:?}"),
         }
@@ -1228,7 +1227,7 @@ mod tests {
     fn run_read_detects_overrun_and_primed_fresh_buffer() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1);
-        let mut n = 0u64;
+        let mut n = 0u32;
         while a.position() < 3 * CAP {
             a.append(1, n, &[0u8; 64]).unwrap();
             c.counters().durable.store_release(a.position());

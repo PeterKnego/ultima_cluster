@@ -1582,7 +1582,7 @@ impl Node {
     /// Read the committed message frame at `pos` (which must be a frame
     /// start) via the log buffer's validated read. Exposed for
     /// harness/embedded callers (e.g. the smoke test) that want to inspect a
-    /// frame's stamped `session_id`/`correlation_id` end to end; the real
+    /// frame's stamped `client_id`/`seq` end to end; the real
     /// service/client SDKs read frames off the shared-memory rings instead.
     pub fn read_frame_validated(&self, pos: u64, out: &mut Vec<u8>) -> FrameRead {
         self.buffer.read_frame_validated(pos, out)
@@ -1859,7 +1859,7 @@ struct Consensus {
     cnc: Arc<CncPage>,
     buffer: Arc<LogBuffer>,
     appender: Option<Appender>,
-    next_corr: u64,
+    next_corr: u32,
     pending_ingress: Option<Vec<u8>>,
     /// The client ingress ring's consumer half (Task 7) — the consensus
     /// thread is its sole reader.
@@ -3516,12 +3516,12 @@ impl Consensus {
         };
         match app.append(0, self.next_corr, payload) {
             Ok(_) => {
-                self.next_corr += 1;
+                self.next_corr = self.next_corr.wrapping_add(1);
                 true
             }
             Err(AppendError::WouldOverrun) => false,
             Err(AppendError::PayloadTooLarge) => {
-                self.next_corr += 1;
+                self.next_corr = self.next_corr.wrapping_add(1);
                 true // consumed (dropped) — do not wedge the queue on it
             }
         }
@@ -3742,7 +3742,7 @@ impl Consensus {
         let Some(app) = self.appender.as_mut() else {
             return false;
         };
-        match app.append(client_id as u64, local_seq as u64, payload) {
+        match app.append(client_id, local_seq, payload) {
             Ok(_) => true,
             Err(AppendError::WouldOverrun) => false,
             Err(AppendError::PayloadTooLarge) => true, // consumed (dropped)

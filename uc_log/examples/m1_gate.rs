@@ -95,7 +95,7 @@ fn main() {
     let mut samples: Vec<(f64, u64)> = Vec::new();
     while Instant::now() < deadline {
         for _ in 0..1024 {
-            match appender.append(1, appended, &payload) {
+            match appender.append(1, appended as u32, &payload) {
                 Ok(_) => appended += 1,
                 Err(AppendError::WouldOverrun) => {
                     overruns += 1;

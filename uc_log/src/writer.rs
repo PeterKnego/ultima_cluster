@@ -116,7 +116,7 @@ mod tests {
         fc.counters().append.store_release(pos);
         let s = follower.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), 384);
-        assert_eq!(read_header(&s[96..]).correlation_id, 1);
+        assert_eq!(read_header(&s[96..]).seq, 1);
         assert_eq!(&s[3 * 96 + 32..3 * 96 + 96], &[3u8; 64]);
         // idempotent duplicate rewrite: same bytes, still fine
         let mut run2 = Vec::new();

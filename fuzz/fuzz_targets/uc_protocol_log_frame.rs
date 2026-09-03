@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let h = read_header(data);
-    let _ = (h.length, h.frame_type, h.flags, h.leadership_term_id, h.session_id, h.correlation_id);
+    let _ = (h.length, h.frame_type, h.flags, h.leadership_term_id, h.client_id, h.seq, h.time_ns);
     // The alignment helper the log buffer runs on every decoded length.
     let _ = align_frame_len(h.length as usize % (1 << 20));
 });

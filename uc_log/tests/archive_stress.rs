@@ -256,8 +256,8 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                     for _ in 0..16 {
                         // total frame 100..=4000 B => payload 68..=3968 B
                         let payload_len = 68 + (xorshift(&mut rng) as usize % (3968 - 68));
-                        let sid = xorshift(&mut rng);
-                        let cid = xorshift(&mut rng);
+                        let sid = xorshift(&mut rng) as u32;
+                        let cid = xorshift(&mut rng) as u32;
                         match appender.append(sid, cid, &scratch[..payload_len]) {
                             Ok(_) => {}
                             Err(AppendError::WouldOverrun) => break, // let the archive drain
@@ -679,8 +679,8 @@ fn find_block_tolerates_tight_purge_race() {
                     for _ in 0..16 {
                         let payload_len = 68 + (xorshift(&mut rng) as usize % (3968 - 68));
                         match appender.append(
-                            xorshift(&mut rng),
-                            xorshift(&mut rng),
+                            xorshift(&mut rng) as u32,
+                            xorshift(&mut rng) as u32,
                             &scratch[..payload_len],
                         ) {
                             Ok(_) => {}

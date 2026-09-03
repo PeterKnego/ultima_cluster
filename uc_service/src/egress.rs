@@ -6,7 +6,7 @@
 //!
 //! **Pinned frame layout (Task 8 / Task 10 matcher must agree byte-for-byte):**
 //! a submit response is `MSG_V2_RESPONSE` with
-//! `header_extra = extra_client(session_id as u32, correlation_id as u32)` —
+//! `header_extra = extra_client(client_id, seq)` —
 //! the SAME `(client_id, local_seq)` pair the client stamped on submit, so the
 //! client can pick its own answer out of the shared broadcast — and payload
 //! `position: u64 LE ++ response bytes` (for a typed state machine those bytes
@@ -44,17 +44,11 @@ impl Egress {
     /// a duplicate response for an already-committed op — harmless: committed is
     /// committed, and the client matcher takes the first answer for a
     /// `(client_id, local_seq)` pair.
-    pub(crate) fn publish(
-        &mut self,
-        session_id: u64,
-        correlation_id: u64,
-        position: u64,
-        resp: &[u8],
-    ) {
+    pub(crate) fn publish(&mut self, client_id: u32, seq: u32, position: u64, resp: &[u8]) {
         self.scratch.clear();
         self.scratch.extend_from_slice(&position.to_le_bytes());
         self.scratch.extend_from_slice(resp);
-        let extra = extra_client(session_id as u32, correlation_id as u32);
+        let extra = extra_client(client_id, seq);
         // flags = 0: this is a submit response, not a query answer (FLAG_V2_IS_QUERY).
         let _ = self
             .producer

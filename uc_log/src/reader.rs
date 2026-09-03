@@ -179,7 +179,7 @@ mod tests {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1);
         // Three 96-byte frames at 0, 96, 192 (append = 288).
-        for i in 0..3u64 {
+        for i in 0..3u32 {
             a.append(1, i, &[i as u8; 64]).unwrap();
         }
         let mut f = LogFollower::new(Arc::clone(&b), 0);
@@ -189,7 +189,7 @@ mod tests {
         // physically copied more. This is the load-bearing guard.
         match f.next_batch(96) {
             Batch::Frames(it) => {
-                let v: Vec<(u64, u64)> = it.map(|(pos, h, _)| (pos, h.correlation_id)).collect();
+                let v: Vec<(u64, u32)> = it.map(|(pos, h, _)| (pos, h.seq)).collect();
                 assert_eq!(v, vec![(0, 0)], "only the frame ending <= target");
             }
             _ => panic!("expected Frames"),
@@ -202,7 +202,7 @@ mod tests {
         // Raising the target to the full frontier yields the remaining two.
         match f.next_batch(288) {
             Batch::Frames(it) => {
-                let v: Vec<(u64, u64)> = it.map(|(pos, h, _)| (pos, h.correlation_id)).collect();
+                let v: Vec<(u64, u32)> = it.map(|(pos, h, _)| (pos, h.seq)).collect();
                 assert_eq!(v, vec![(96, 1), (192, 2)]);
             }
             _ => panic!("expected Frames"),
@@ -238,7 +238,7 @@ mod tests {
     fn padding_is_skipped_and_cursor_advances_over_its_full_span() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1);
-        for i in 0..42u64 {
+        for i in 0..42u32 {
             a.append(1, i, &[0u8; 64]).unwrap(); // fill to 4032
         }
         c.counters().durable.store_release(4032); // let the wrap append through
@@ -259,7 +259,7 @@ mod tests {
         // The post-wrap frame comes as its own run.
         match f.next_batch(4192) {
             Batch::Frames(it) => {
-                let v: Vec<(u64, u64)> = it.map(|(pos, h, _)| (pos, h.correlation_id)).collect();
+                let v: Vec<(u64, u32)> = it.map(|(pos, h, _)| (pos, h.seq)).collect();
                 assert_eq!(v, vec![(4096, 99)]);
             }
             _ => panic!("expected Frames"),

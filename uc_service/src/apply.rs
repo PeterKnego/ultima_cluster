@@ -392,12 +392,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         #[cfg(feature = "apply-profile")]
                         let t1 = profile::now();
                         if is_leader {
-                            st.egress.publish(
-                                hdr.session_id,
-                                hdr.correlation_id,
-                                pos,
-                                &st.resp_buf,
-                            );
+                            st.egress.publish(hdr.client_id, hdr.seq, pos, &st.resp_buf);
                         }
                         #[cfg(feature = "apply-profile")]
                         {
@@ -874,7 +869,7 @@ mod tests {
             256,
         ));
         let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1);
-        for i in 0..5u64 {
+        for i in 0..5u32 {
             appender.append(1, i, &[i as u8; 64]).unwrap();
         }
         let head = 5 * FRAME;

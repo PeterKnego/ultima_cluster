@@ -236,7 +236,7 @@ fn egress_frame_layout_is_byte_pinned() {
         }
     };
 
-    // header_extra = extra_client(session_id, correlation_id), same LE pair the
+    // header_extra = extra_client(client_id, seq), same LE pair the
     // client stamped on submit.
     assert_eq!(
         rec.header_extra,

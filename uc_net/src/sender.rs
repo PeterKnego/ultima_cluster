@@ -1781,7 +1781,7 @@ mod tests {
             assert_eq!(h.leadership_term_id, 9);
             assert_eq!(h.position, 0);
             assert_eq!(body.len(), 3 * 96); // all three frames packed in one datagram
-            assert_eq!(read_header(&body[96..]).correlation_id, 1);
+            assert_eq!(read_header(&body[96..]).seq, 1);
             assert_eq!(
                 &body[2 * 96 + HEADER_LEN..2 * 96 + HEADER_LEN + 64],
                 &[2u8; 64]
@@ -2055,7 +2055,7 @@ mod tests {
 
     /// Hand-build a valid message frame of `total` bytes (header + payload,
     /// zero-filled) with correlation id `corr`.
-    fn msg_frame(total: u32, corr: u64) -> Vec<u8> {
+    fn msg_frame(total: u32, corr: u32) -> Vec<u8> {
         let mut f = vec![0u8; align_frame_len(total as usize)];
         write_header_except_length(
             &mut f,
@@ -2064,8 +2064,9 @@ mod tests {
                 frame_type: FRAME_TYPE_MESSAGE,
                 flags: 0,
                 leadership_term_id: 9,
-                session_id: 0,
-                correlation_id: corr,
+                client_id: 0,
+                seq: corr,
+                time_ns: 0,
             },
         );
         f[..4].copy_from_slice(&total.to_le_bytes());
@@ -2258,7 +2259,7 @@ mod tests {
         };
         let mut arch = uc_log::archive::Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 9);
-        let mut n = 0u64;
+        let mut n = 0u32;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {
                 Ok(_) => n += 1,
@@ -2298,7 +2299,7 @@ mod tests {
         let (h, body) = f1.recv().expect("replayed datagram");
         assert_eq!(h.kind, DGRAM_KIND_DATA);
         assert_eq!(h.position, 0);
-        assert_eq!(read_header(&body).correlation_id, 0);
+        assert_eq!(read_header(&body).seq, 0);
         assert_eq!(&body[HEADER_LEN..HEADER_LEN + 64], &[0u8; 64]);
         assert!(
             s.stats()
@@ -2652,7 +2653,7 @@ mod tests {
         // (sealed 1384B, fits); budget 1392 (missing the subtraction) packs
         // 43 = 1376B body (sealed 1416B > the 1408B MTU).
         let mut a = Appender::new(Arc::clone(&s.buffer), 9);
-        for i in 0..64u64 {
+        for i in 0..64u32 {
             a.append(4, i, &[]).unwrap();
         }
         s.do_work();
@@ -2680,7 +2681,7 @@ mod tests {
         // the 24-byte boundary).
         let (mut s, f) = sender_with_crypto_to_one_follower();
         let mut a = Appender::new(Arc::clone(&s.buffer), 9);
-        for i in 0..64u64 {
+        for i in 0..64u32 {
             a.append(4, i, &[]).unwrap();
         }
         s.do_work();
@@ -2801,7 +2802,7 @@ mod tests {
         };
         let mut arch = uc_log::archive::Archive::open(acfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 9);
-        let mut n = 0u64;
+        let mut n = 0u32;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {
                 Ok(_) => n += 1,
@@ -2874,7 +2875,7 @@ mod tests {
         };
         let mut arch = uc_log::archive::Archive::open(acfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 9);
-        let mut n = 0u64;
+        let mut n = 0u32;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {
                 Ok(_) => n += 1,

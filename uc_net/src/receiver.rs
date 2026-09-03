@@ -2779,7 +2779,7 @@ mod tests {
         let b = buffer();
         let mut a = Appender::new(Arc::clone(&b), TERM);
         for (i, p) in payloads.iter().enumerate() {
-            a.append(4, i as u64, p).unwrap();
+            a.append(4, i as u32, p).unwrap();
         }
         let mut runs = Vec::new();
         let mut pos = 0u64;
@@ -3025,7 +3025,7 @@ mod tests {
         let cap = b.capacity();
         let fill = (cap / per) as usize; // 682 frames -> 65472, 64 short of the wrap
         for i in 0..fill {
-            a.append(4, i as u64, &[0u8; 64]).unwrap();
+            a.append(4, i as u32, &[0u8; 64]).unwrap();
             c.counters().durable.store_release(a.position());
         }
         let pad_pos = a.position();
@@ -3072,7 +3072,7 @@ mod tests {
         let mut runs: Vec<(u64, Vec<u8>, u64)> = Vec::new();
         let mut read_pos = 0u64;
         let mut out = Vec::new();
-        for i in 0..85u64 {
+        for i in 0..85u32 {
             a.append(4, i, &[0u8; 64]).unwrap();
             leader.counters().durable.store_release(a.position());
             while let SliceRead::Run(r) = leader.read_run_validated(read_pos, 96, &mut out) {

@@ -882,7 +882,7 @@ mod tests {
 
         // Old leader's stream: 96-byte frames (32 header + 64 payload).
         let mut a = Appender::new(Arc::clone(&b), 1);
-        for n in 0..5u64 {
+        for n in 0..5u32 {
             a.append(1, n, &[0xAB; 64]).unwrap();
         }
         assert_eq!(c.counters().append.load_acquire(), 480);
@@ -935,7 +935,7 @@ mod tests {
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
 
         let mut a = Appender::new(Arc::clone(&b), 1);
-        for n in 0..5u64 {
+        for n in 0..5u32 {
             a.append(1, n, &[0xAB; 64]).unwrap();
         }
         while arch.do_work(&b).unwrap() {}
@@ -1086,7 +1086,7 @@ mod tests {
         assert_eq!((meta1, blk1.len()), (192, 192));
         // block content is raw frames: header parses, payload intact
         let h = read_header(&blk1);
-        assert_eq!(h.correlation_id, 2);
+        assert_eq!(h.seq, 2);
     }
 
     #[test]
@@ -1140,7 +1140,7 @@ mod tests {
         let (b, c, dir) = setup(4096);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
-        let mut n = 0u64;
+        let mut n = 0u32;
         let mut positions = Vec::new();
         while a.position() < 5000 {
             match a.append(1, n, &[n as u8; 64]) {
@@ -1163,7 +1163,7 @@ mod tests {
         for (p, corr) in &positions {
             let f = r.next().unwrap().expect("frame");
             assert_eq!(f.position, *p);
-            assert_eq!(f.header.correlation_id, *corr);
+            assert_eq!(f.header.seq, *corr);
             assert_eq!(f.payload, vec![*corr as u8; 64]);
         }
         assert!(r.next().unwrap().is_none());
@@ -1172,7 +1172,7 @@ mod tests {
         let (mid_pos, mid_corr) = positions[positions.len() / 2];
         let mut r = arch.replay_from(mid_pos).unwrap();
         let f = r.next().unwrap().expect("frame");
-        assert_eq!((f.position, f.header.correlation_id), (mid_pos, mid_corr));
+        assert_eq!((f.position, f.header.seq), (mid_pos, mid_corr));
 
         // at/beyond durable: empty replay, not an error
         let mut r = arch.replay_from(arch.recovered_position()).unwrap();
@@ -1200,9 +1200,9 @@ mod tests {
         assert_eq!(arch.recovered_position(), 480);
         // replay sees exactly frames 0..4 (positions 0..480), nothing beyond
         let mut r = arch.replay_from(0).unwrap();
-        for i in 0..5u64 {
+        for i in 0..5u32 {
             let f = r.next().unwrap().expect("frame");
-            assert_eq!(f.header.correlation_id, i);
+            assert_eq!(f.header.seq, i);
         }
         assert!(r.next().unwrap().is_none());
         // reopen-pin the PARTIAL-block path (the whole-block path is pinned
@@ -1279,7 +1279,7 @@ mod tests {
         let mut arch = Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
         let mut frames = Vec::new();
-        for i in 0..(n_blocks as u64 * 4) {
+        for i in 0..(n_blocks as u32 * 4) {
             frames.push(a.append(1, i, &[i as u8; 64]).unwrap());
         }
         while arch.do_work(&b).unwrap() {}
@@ -1508,8 +1508,9 @@ mod tests {
                 frame_type: FRAME_TYPE_PADDING,
                 flags: 0,
                 leadership_term_id: 5,
-                session_id: 0,
-                correlation_id: 0,
+                client_id: 0,
+                seq: 0,
+                time_ns: 0,
             },
         );
         pad[..4].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
@@ -1528,8 +1529,9 @@ mod tests {
                 frame_type: FRAME_TYPE_MESSAGE,
                 flags: 0,
                 leadership_term_id: 5,
-                session_id: 0,
-                correlation_id: 0,
+                client_id: 0,
+                seq: 0,
+                time_ns: 0,
             },
         );
         msg[..4].copy_from_slice(&((HEADER_LEN + 64) as u32).to_le_bytes());
@@ -1653,7 +1655,7 @@ mod tests {
     /// matching `Appender::append`'s wire layout: payload, then header-sans-
     /// length via `write_header_except_length`, then the unaligned
     /// header+payload byte count written into the leading commit word.
-    fn push_frame(buf: &mut Vec<u8>, payload: &[u8], correlation_id: u64) {
+    fn push_frame(buf: &mut Vec<u8>, payload: &[u8], seq: u32) {
         let total = HEADER_LEN + payload.len();
         let start = buf.len();
         buf.resize(start + frame::align_frame_len(total), 0u8);
@@ -1665,8 +1667,9 @@ mod tests {
                 frame_type: FRAME_TYPE_MESSAGE,
                 flags: 0,
                 leadership_term_id: 0,
-                session_id: 0,
-                correlation_id,
+                client_id: 0,
+                seq,
+                time_ns: 0,
             },
         );
         buf[start..start + 4].copy_from_slice(&(total as u32).to_le_bytes());
@@ -1685,8 +1688,9 @@ mod tests {
                 frame_type: FRAME_TYPE_MESSAGE,
                 flags: 0,
                 leadership_term_id: 0,
-                session_id: 0,
-                correlation_id: 0,
+                client_id: 0,
+                seq: 0,
+                time_ns: 0,
             },
         );
         buf[start..start + 4].copy_from_slice(&claimed_len.to_le_bytes());
@@ -1730,7 +1734,7 @@ mod tests {
             .unwrap()
             .expect("the valid frame replays fine");
         assert_eq!(first.payload, b"hello");
-        assert_eq!(first.header.correlation_id, 7);
+        assert_eq!(first.header.seq, 7);
 
         let err = replay.next().unwrap_err();
         match err {
