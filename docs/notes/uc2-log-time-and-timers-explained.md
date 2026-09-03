@@ -442,22 +442,35 @@ about to be fixed.
   `prev`, or nothing — until its first commit advance; that is the safe
   direction, but a joiner served inside that window can end up with an older
   table, or none until the next apply, if the frame is below the shipper's own
-  floor. The second is **an open defect rather than a residual**, and it is
-  recorded here because an operator can meet it: a node whose own record sits
-  at position `0` with a *non-empty* body ships that record verbatim, and the
-  wire's `(position == 0)` ⇔ empty rule refuses it, so the session that node
-  is serving never completes — the joiner waits, because `SNAP_DONE` is
-  withheld until a table lands. Three states produce such a record: a **wipe**
-  (a node truncated to 0 with no common prefix **keeps** its table armed and
-  zeroes only the position, by the rule `ConfigRecord` already uses, because
-  dropping it would leave that node ticking nothing while its peers tick on);
-  a revert with no usable predecessor; and a fiat install of "no table", the
-  last two both storing the canonical empty *encoding* rather than zero bytes.
-  One normalisation at the ship seam closes it; `docs/BACKLOG.md` § 2a
-  residual b carries the detail. The wipe rule itself is unchanged and still
-  right: `uc2_schedule_entries > 0` with `uc2_schedule_table_position == 0` is
-  the wipe signature, a `schedule_table_reverted` record with `position=0`
-  names it, and `Uc2ScheduleTableDiverged` still catches the disagreement.
+  floor. The second is the **position-0 rule**, and it is the more
+  interesting of the two, because it is a deliberate choice rather than a
+  gap. A node whose newest shippable record sits at position `0` ships
+  `(0, 0, [])` — "no table" — so a joiner it serves installs nothing and
+  learns the real table from the next frame or the next apply.
+
+  Two records have that shape. One is the **wipe** record: a node truncated to
+  0 with no common prefix **keeps** its table armed and zeroes only the
+  position, by the rule `ConfigRecord` already uses, because dropping it would
+  leave that node ticking nothing while its peers tick on. The other is the
+  canonical "no table" record, whose bytes are an 8-byte encoded *empty* table
+  rather than zero bytes. The ship gate maps both onto "no table", along with
+  any record whose bytes will not decode or decode to no entries.
+
+  It has to, for a mechanical reason and a design one. Mechanically, the wire
+  freezes `(position == 0)` ⇔ `(table_len == 0)`, and a session completes only
+  once its table arrives — so a position-0 record shipped *with* a body would
+  be refused on every re-send and quietly stall the joiner instead of failing
+  loudly. By design, position 0 means the table is **unanchored in the log**:
+  the wipe keep-alive is a local fiat that keeps one node ticking until the
+  next table frame, not a cluster fact a joiner should write down. A joiner
+  given it would hold a table no position backs — which is precisely the
+  divergence `Uc2ScheduleTableDiverged` exists to catch.
+
+  So the wipe rule itself is unchanged and still right, and its operator
+  reading is unchanged too: `uc2_schedule_entries > 0` with
+  `uc2_schedule_table_position == 0` is the wipe signature, a
+  `schedule_table_reverted` record with `position=0` names it, and
+  `Uc2ScheduleTableDiverged` still catches the disagreement.
 - **A crash in one narrow window loses one adoption.** There is no journal
   re-scan for type-6 frames on the recovery path, so a node that dies between
   the archive recording a table frame and the consensus agent persisting

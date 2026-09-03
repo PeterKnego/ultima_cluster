@@ -229,9 +229,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     re-scan for type-6 frames), one possible duplicate tick per entry after a
     restart (`Timed` drops it), no timezones and no cron; plus plan 3's two
     ship-side windows (a restarted node under-ships until its first commit
-    advance; and an OPEN defect — a record at position `0` with a non-empty
-    body is shipped verbatim and the wire refuses it, stalling that session,
-    `docs/BACKLOG.md` § 2a residual b).
+    advance; and a node whose newest shippable record is at position `0` —
+    a wiped node, or one holding the canonical "no table" record — ships
+    `(0, 0, [])`, so a joiner it serves installs no table until the next
+    frame: the wipe keep-alive is local-only by design, ruling R7).
   - **The relayout is the sharper half of this flag day.** Every prior wire
     bump was caught by a length check, so a mixed cluster stalled. A relaid
     header is the *same length*: a `0.6.0` peer's frames parse and mean

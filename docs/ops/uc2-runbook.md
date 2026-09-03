@@ -107,9 +107,11 @@ verify rather than a build:
   `snapshot_installed` record's `table_position` field is the schedule
   position that node holds once the install is done (the carried table's on
   the fiat path, and unchanged on the mid-life path that adopts nothing). If a
-  fresh joiner still reads `0` with no entries, the leader had no table to
-  ship, or it was restarted and had not yet seen a commit advance when it
-  shipped — re-apply.
+  fresh joiner still reads `0` with no entries, the node that served it had
+  none to give: it had no table at all, or it had been restarted and had not
+  yet seen a commit advance, or its own table was **unanchored** (position
+  `0` — a wiped node keeps its table armed locally but does not pass it on).
+  Re-apply.
 
 ## Changing a running cluster
 

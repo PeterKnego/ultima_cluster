@@ -230,9 +230,11 @@ session carries the table (`SNAP_TABLE`, kind 21, sent after every
 so it holds the cluster's table before it can serve a read or win an election.
 That matters cluster-wide rather than per node: only the leader appends timer
 frames, so a leader holding no table would stop every scheduled recurrence on
-every node. A fresh joiner still at `0` with no entries means the leader had no
-table to give, or it had been restarted and its commit counter was not yet
-primed when it shipped; re-apply either way.
+every node. A fresh joiner still at `0` with no entries means the node that served it had
+none to give: no table at all, or a restart whose commit counter was not yet
+primed, or a table of its own still **unanchored** at position `0` — a wiped
+node keeps its table armed locally and deliberately does not pass it on.
+Re-apply either way.
 
 **Five records** go with them — one at info, four at warn:
 

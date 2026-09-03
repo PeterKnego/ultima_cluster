@@ -210,9 +210,11 @@ groups:
     # advances, so it holds the cluster's table before it can serve a read or
     # win an election. Its adoption logs as schedule_table_adopted with
     # source="snapshot". A fresh joiner still at 0 with no entries means the
-    # leader had no table to ship, or the leader had been restarted and its
-    # commit counter was not yet primed when it shipped (a restarted node
-    # under-ships until its first commit advance) — re-apply either way.
+    # node that served it had none to give: no table at all, a restart whose
+    # commit counter was not yet primed (a restarted node under-ships until
+    # its first commit advance), or a table still UNANCHORED at position 0 —
+    # a wiped node keeps its table armed locally and deliberately does not
+    # pass it on (ruling R7) — re-apply either way.
     # This is a cluster-wide risk, not one node's: only the LEADER appends
     # timer frames, so if the node holding no table wins an election, every
     # scheduled recurrence in the cluster stops — every FSM on every node —

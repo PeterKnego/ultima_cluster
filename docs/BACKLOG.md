@@ -161,6 +161,17 @@ table → config → floor; a fiat install (`Consensus::install_snapshot_table`,
 gaining a `source` field and `snapshot_installed` a `table_position`. It
 closes the first bullet below and adds the two after it.
 
+**One execution ruling, R7 (2026-09-03), amends the ship gate.** Task 5's
+writeup review found that `shippable_schedule` passed a position-`0` record
+through with its body, which the wire's frozen `(position == 0)` ⇔
+`(table_len == 0)` rule refuses — and because a session completes only once
+its table arrives, that would have STALLED the joiner on every re-send rather
+than failing loudly. Fixed in `c87fd4a`: a record at position `0`, or one
+whose bytes will not decode or decode to no entries, ships as `(0, 0, [])`.
+The deliberate consequence is the third bullet below — a wiped node's kept
+table is local-only. The R7 vectors ride the existing
+`the_snapshot_session_ships_only_a_committed_schedule_table`.
+
 **What is left under this feature** — each documented in
 `docs/reference/limits.md` and the explainer's "Known limits of the table",
 none a blocker, none scheduled:
@@ -184,26 +195,23 @@ none a blocker, none scheduled:
   `uc2ctl schedule apply`, if the frame is below the shipper's own floor.
   Priming the counter at boot, or seeding the gate from the durable record,
   would close it.
-- **A position-`0` record with a non-empty body is shipped verbatim, and the
-  wire refuses it** (plan 3 residual b, sharpened into a defect by Task 5's
-  review on 2026-09-03 — **open, not benign**). Three states leave a node's
-  schedule record at position `0` with a NON-empty `table`: a wipe
-  (`revert_schedule_below(0)` keeps the table by design and zeroes only the
-  position); a revert with no usable predecessor (`ScheduleRecord::empty()`,
-  whose `table` is the canonical **8-byte** encoding of an empty table, not a
-  zero-length `Vec`); and a fiat install of "no table" off a snapshot session,
-  which canonicalises the same way and additionally sets `known_committed`.
-  `shippable_schedule` passes such a record through unchanged — position `0`
-  is `<=` any commit counter — and `send_snap_table` writes it verbatim, but
-  `read_snap_table_body` enforces `(position == 0)` ⇔ `(table_len == 0)` and
-  returns `None`. The receiver therefore drops the datagram and, because it
-  withholds `SNAP_DONE` until a table lands, **never completes that session**:
-  the joiner stalls until the shipper adopts a fresh table. The fix is one
-  normalisation at the ship seam — position `0` ships `(0, 0, [])` — and the
-  existing `a_leader_without_a_table_ships_none_and_the_joiner_installs_none`
-  does not catch it, because it exercises the `rec: None` shape, which is the
-  one that already encodes correctly; the uncaught shape is the *joiner* from
-  that very test being the next session's source.
+- **A wiped node's kept table does not propagate by snapshot** (plan 3
+  residual b, in its post-R7 form). A node whose newest shippable record sits
+  at position `0` ships `(0, 0, [])`, so a joiner it serves installs **no
+  table** and learns the real one from the next table frame or the next
+  `uc2ctl schedule apply`. Two records have that shape: the `to == 0` wipe
+  record (`revert_schedule_below` keeps the table body at position 0 so a
+  wiped node keeps ticking) and the canonical no-table record
+  (`ScheduleRecord::empty`, whose bytes are an 8-byte encoded *empty* table
+  rather than zero bytes); `shippable_schedule` maps both, plus any record
+  whose bytes will not decode or decode to no entries, onto "no table".
+  This is deliberate, not a gap: position `0` means the table is **unanchored
+  in the log**, so the wipe keep-alive is a local fiat that keeps one node
+  ticking until the next frame, not a cluster fact a joiner should record — a
+  joiner given it would hold a table no position backs, which is the
+  divergence `Uc2ScheduleTableDiverged` exists to catch. Closing it properly
+  means a wiped node re-anchoring its own table, which is a re-apply, not a
+  ship-seam change.
 - **One crash window loses one adoption.** A node that dies between the
   archive recording a table frame and the consensus agent persisting
   `state/schedules.state` comes back without it: there is no journal re-scan

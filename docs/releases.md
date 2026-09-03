@@ -424,14 +424,21 @@ plain-language section:
   commit counter is not primed at boot, so a **restarted** node under-ships
   (its `prev`, or nothing) until its first commit advance — the safe
   direction, but a joiner served in that window can end up with an older table
-  or none. The second is **an open defect rather than a residual**, found in
-  the writeup's own review: a node whose record sits at position `0` with a
-  non-empty body — a wipe (which keeps the table by design), a revert with no
-  usable predecessor, or a fiat install of "no table", the last two both
-  storing the canonical 8-byte empty encoding — ships that record verbatim,
-  and `read_snap_table_body`'s `(position == 0)` ⇔ empty rule refuses it, so
-  the session it serves never completes. One normalisation at the ship seam
-  closes it; `docs/BACKLOG.md` § 2a residual b carries the detail.
+  or none. The second is **the position-0 rule**, ruling R7: a node whose
+  newest shippable record sits at position `0` ships `(0, 0, [])`, so a joiner
+  it serves installs **no table** until the next table frame or the next
+  apply. Two records have that shape — the `to == 0` wipe record, which keeps
+  its table body at position 0 so a wiped node keeps ticking, and the
+  canonical no-table record, whose bytes are an 8-byte encoded *empty* table
+  rather than zero bytes — and `shippable_schedule` now maps both, plus any
+  record whose bytes will not decode or decode to no entries, onto "no table".
+  It has to: the wire freezes `(position == 0)` ⇔ `(table_len == 0)`, so a
+  position-0 record shipped *with* a body would be refused on every re-send
+  and stall the joiner instead of failing loudly. The consequence is
+  deliberate — **a wiped node's kept table does not propagate by snapshot**,
+  because position 0 means the table is unanchored in the log and the wipe
+  keep-alive is a local fiat, not a cluster fact a joiner should record.
+  `docs/BACKLOG.md` § 2a carries it.
 - **One process gap, not a code one.** `Uc2LogTimeFrozen` (plan 1) and
   `Uc2ScheduleTableDiverged` (plan 2) both ship without a `RULE_BUILDERS` entry
   in `scripts/m10_alert_fire.sh`, whose completeness cross-check therefore
