@@ -25,14 +25,17 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use uc_consensus::election::NodeId;
-use uc_log::cnc::CncPage;
+use uc_log::cnc::{AdminReq, CncPage};
 use uc_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember};
 use uc_net::fault::FaultConfig;
 use uc_net::receiver::RefusalKind;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::identity::{FsmName, pack_version};
-use uc_protocol::v2::cnc::{CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
+use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
 use uc_protocol::v2::config::decode_config;
+use uc_protocol::v2::schedule::{
+    ScheduleEntry, ScheduleRule, ScheduleTable, decode_schedule_table, encode_schedule_table,
+};
 
 const PAYLOAD: usize = 96;
 
@@ -1626,4 +1629,356 @@ fn learner_alone_cannot_supply_a_voter_quorum() {
     for node in &mut c.nodes {
         node.stop();
     }
+}
+
+// ------------------------- time-and-timers plan 3: the table on the session
+
+/// The declared row every fixture below names, and the identity hash a
+/// schedule entry addresses it by.
+const ROW0: &str = "fsm0";
+
+fn row0_hash() -> u64 {
+    FsmName::parse(ROW0).expect("a valid FSM name").hash()
+}
+
+/// Wall-clock ns — the same clock the leader stamps the log with, so a
+/// deadline built from it is genuinely in the log's future.
+fn wall_now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_nanos() as u64
+}
+
+/// Two entries on row 0, both armed and both an HOUR out, so the table is
+/// adopted and stays armed without a single TIMER frame ever being appended:
+/// this fixture is about what the SESSION carries, and a firing table would
+/// only add log traffic (and, on a node with no service attached to apply it,
+/// nothing else) to the thing under test.
+fn two_far_future_entries() -> ScheduleTable {
+    let hour = wall_now_ns() + 3_600_000_000_000;
+    ScheduleTable {
+        entries: vec![
+            ScheduleEntry {
+                identity_hash: row0_hash(),
+                timer_id: 1,
+                rule: ScheduleRule::Every {
+                    period_ns: 600_000_000_000,
+                    anchor_ns: hour,
+                },
+            },
+            ScheduleEntry {
+                identity_hash: row0_hash(),
+                timer_id: 2,
+                rule: ScheduleRule::Once { at_ns: hour },
+            },
+        ],
+    }
+}
+
+/// `timers.rs::apply_schedule_table`, duplicated rather than shared because
+/// each integration test file is its own binary: stage the table under the
+/// instance dir and drive `ADMIN_OP_SCHEDULE_APPLY` through the cnc admin
+/// band (`uc2ctl schedule apply` minus the bin; the default
+/// [`uc_node::AdminPolicy::Filesystem`] ignores the auth line). Returns the
+/// accepted table's position — the frame END.
+fn apply_schedule_table(dir: &Path, cnc: &CncPage, table: &ScheduleTable) -> u64 {
+    let mut bytes = Vec::new();
+    encode_schedule_table(table, &mut bytes);
+    for _ in 0..20 {
+        std::fs::write(dir.join(uc_node::SCHEDULE_PENDING_FILE), &bytes).expect("stage the table");
+        let (id, ip, port) = uc_node::schedule_digest(&bytes);
+        let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce: rand::random::<u64>(),
+            op: ADMIN_OP_SCHEDULE_APPLY,
+            id,
+            ip,
+            port,
+        });
+        let deadline = deadline_secs(20);
+        let resp = loop {
+            if let Some(resp) = cnc.read_admin_resp(seq) {
+                break resp;
+            }
+            assert!(Instant::now() < deadline, "schedule apply timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if resp.status == 0 {
+            return resp.version;
+        }
+        // `2` = retry, side-effect-free (a leader whose leader-open collapse
+        // has not finished has no appender yet). Anything else is a genuine
+        // refusal and the test should say so.
+        assert_eq!(
+            resp.status, 2,
+            "schedule apply was refused: reason {}",
+            resp.reason
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("schedule apply never left the retry window");
+}
+
+/// What a below-floor join leaves behind, for the caller to assert on.
+struct JoinFixture {
+    _dir: tempfile::TempDir,
+    voter: Node,
+    learner: Node,
+    v_dir: PathBuf,
+    l_dir: PathBuf,
+}
+
+impl JoinFixture {
+    fn stop(self) {
+        self.learner.stop();
+        self.voter.stop();
+    }
+}
+
+/// The `fresh_learner_joins_a_purged_leader_via_snapshot_session` fixture,
+/// trimmed to what plan 3 needs (no pre-seeded config record, no routing
+/// assertions — those stay that test's job) and parameterised by the schedule
+/// table the voter adopts BEFORE it purges.
+///
+/// The table frame therefore lands below the floor the learner adopts: the
+/// learner can never replay it, so a table it holds afterwards came off the
+/// session's `SNAP_TABLE` and nowhere else.
+fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-sched-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        // A SMALL ring so a fresh learner's NAK from 0 falls BELOW the ring
+        // floor into the PURGED journal region → snapshot session.
+        buffer_bytes: 1 << 18,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+        crypto: uc_node::CryptoConfig::Disabled,
+        services: uc_node::ServicesConfig::single(ROW0),
+    };
+
+    let v_dir = dir.path().join("v0");
+    let voter =
+        Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    await_until(30, "voter serves", || voter.can_serve());
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+
+    // The table goes on FIRST, so its frame is inside the prefix the purge
+    // below destroys.
+    if let Some(t) = table {
+        let position = apply_schedule_table(&v_dir, &cnc, t);
+        assert!(position > 0, "an accepted apply reports the frame END");
+        // Ruling 3: the ship gate (`shippable_schedule`) only offers a record
+        // at or below the sender's COMMIT counter, so a table still in flight
+        // would correctly ship as `prev`/none and this fixture would be
+        // asserting the wrong thing. One voter commits on its own durable
+        // report, but not instantly — wait for it explicitly.
+        await_until(30, "the applied table committed", || {
+            voter.counters().commit.load_acquire() >= position
+        });
+    }
+
+    // See `spawn_applied_mirror`'s doc: row 0 is a REAL declared FSM with no
+    // service attached, so FSM-lag admission needs `applied` mirrored from
+    // `durable` for the duration of the raw submit loop.
+    let (mirror_stop, mirror_handle) = spawn_applied_mirror(std::sync::Arc::clone(&cnc), 0);
+    for i in 0u64..24000 {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match voter.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+    mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    mirror_handle.join().unwrap();
+
+    // Publish a snapshot floor + a real snapshot file for the sender to ship
+    // (frame-aligned: a mid-frame floor lands the journal-replay datagram
+    // below the adopted position and is dropped as a dup).
+    let durable = voter.counters().durable.load_acquire();
+    let floor = (durable / 2) / 128 * 128;
+    assert!(
+        floor > SEG,
+        "need >1 segment below the floor (durable={durable})"
+    );
+    let snap_dir = v_dir.join("snapshots").join("0");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    std::fs::write(
+        snap_dir.join(format!("snap-{floor}.ultsnap")),
+        vec![0x5Au8; 4096],
+    )
+    .unwrap();
+    cnc.service_slot(0).snapshot_pos.store_release(floor);
+    cnc.snapshots().service_snapshot_pos.store_release(floor);
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
+    let first_base = voter.archive_first_base();
+    let frontier = voter.counters().append.load_acquire();
+
+    let l_dir = dir.path().join("l1");
+    let learner =
+        Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
+    await_until(40, "learner caught up across the purged prefix", || {
+        learner.counters().durable.load_acquire() >= frontier
+            && learner.counters().commit.load_acquire() >= frontier
+    });
+    assert!(
+        learner.archive_first_base() >= first_base,
+        "the learner must have adopted the shipped snapshot floor, not replayed from 0"
+    );
+
+    JoinFixture {
+        _dir: dir,
+        voter,
+        learner,
+        v_dir,
+        l_dir,
+    }
+}
+
+/// Plan 3 (spec §5), the headline: a fresh learner whose join is BELOW the
+/// leader's purge floor ends up holding the leader's schedule table — record
+/// for record — and with both of its entries ARMED.
+///
+/// The table frame is below the floor by construction (it is appended before
+/// the churn the purge destroys), so replay cannot be the source: the only
+/// path from the leader's record to the learner's is the session's
+/// `SNAP_TABLE` and the fiat install at the floor.
+#[test]
+fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
+    let _g = serialize();
+    let table = two_far_future_entries();
+    let f = below_floor_join("learner-sched", Some(&table));
+
+    let want = uc_node::read_record(&f.v_dir)
+        .expect("read the voter's record")
+        .expect("the voter adopted a table");
+    assert_eq!(
+        decode_schedule_table(&want.table).as_ref(),
+        Some(&table),
+        "sanity: the voter's record holds the table this test applied"
+    );
+
+    // The install happens on the consensus agent at floor adoption, which the
+    // catch-up wait above does not itself order against — poll for it.
+    await_until(30, "the learner installed a schedule record", || {
+        uc_node::read_record(&f.l_dir)
+            .expect("read the learner's record")
+            .is_some()
+    });
+    let got = uc_node::read_record(&f.l_dir).unwrap().unwrap();
+    assert_eq!(
+        got.position, want.position,
+        "the learner's record is at the leader's table position"
+    );
+    assert_eq!(got.time_ns, want.time_ns, "…with the leader's frame stamp");
+    assert_eq!(got.table, want.table, "…and the leader's table bytes");
+    assert_eq!(
+        decode_schedule_table(&got.table).as_ref(),
+        Some(&table),
+        "the installed bytes decode to the applied table"
+    );
+    assert!(
+        got.prev.is_none(),
+        "a fiat install keeps no history — nothing below the floor is \
+         truncatable, so there is nothing to revert to: {:?}",
+        got.prev
+    );
+
+    // Both entries are ARMED on the learner, not merely recorded: the fiat
+    // install runs `install_table`, and the consensus agent publishes the
+    // row's pending count into its cnc identity slot every pass.
+    let l_cnc = CncPage::open_file(&f.l_dir.join("cnc2.dat"), "learner-sched").expect("open cnc");
+    await_until(30, "the learner armed both table entries", || {
+        l_cnc.service_slot(0).identity.timers_pending() == 2
+    });
+
+    f.stop();
+}
+
+/// Plan 3 (spec §5), the other half: a leader that has NEVER adopted a table
+/// still sends a `SNAP_TABLE` — carrying the wire's honest "no table",
+/// `(position 0, stamp 0, no bytes)`. Two things must hold, and the second is
+/// what the receiver's withhold rule puts at risk: the joiner installs the
+/// canonical no-table record, AND the session still completes.
+///
+/// The completion half is not a spare assertion — the receiver refuses to
+/// emit `SNAP_DONE` until a table has landed, so a sender that stayed silent
+/// for want of a table would wedge every joiner. The catch-up wait inside
+/// `below_floor_join` is that check: without the `SNAP_TABLE`, the learner
+/// never adopts the floor and never reaches the frontier.
+#[test]
+fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
+    let _g = serialize();
+    let f = below_floor_join("learner-nosched", None);
+
+    assert!(
+        uc_node::read_record(&f.v_dir)
+            .expect("read the voter's record")
+            .is_none(),
+        "sanity: this leader never adopted a table"
+    );
+
+    // `install_snapshot_table` canonicalises "no table" rather than leaving
+    // the record absent — the stored bytes must ALWAYS decode, because boot
+    // arming and `revert_schedule_below` both read them back. So the joiner
+    // holds a record, at position 0, whose table is empty.
+    await_until(30, "the learner installed the no-table record", || {
+        uc_node::read_record(&f.l_dir)
+            .expect("read the learner's record")
+            .is_some()
+    });
+    let got = uc_node::read_record(&f.l_dir).unwrap().unwrap();
+    assert_eq!(
+        got.position, 0,
+        "position 0 is the wire's 'this leader has no table'"
+    );
+    assert_eq!(got.time_ns, 0);
+    assert_eq!(
+        decode_schedule_table(&got.table),
+        Some(ScheduleTable {
+            entries: Vec::new()
+        }),
+        "the canonical empty encoding, not raw empty bytes"
+    );
+    assert!(got.prev.is_none());
+
+    // Nothing is armed, on either side.
+    let l_cnc = CncPage::open_file(&f.l_dir.join("cnc2.dat"), "learner-nosched").expect("open cnc");
+    assert_eq!(l_cnc.service_slot(0).identity.timers_pending(), 0);
+
+    f.stop();
 }

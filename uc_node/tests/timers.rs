@@ -39,11 +39,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uc_client::{Client, PipelinedClient, PipelinedConfig};
 use uc_consensus::election::NodeId;
-use uc_log::cnc::{AdminReq, CncPage};
+use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
 use uc_protocol::identity::FsmName;
-use uc_protocol::v2::cnc::ADMIN_OP_SCHEDULE_APPLY;
+use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS};
 use uc_protocol::v2::schedule::{
     ScheduleEntry, ScheduleRule, ScheduleTable, decode_schedule_table, encode_schedule_table,
 };
@@ -207,6 +207,56 @@ impl StateMachine for ClockSm {
         });
         self.stamps.push((ctx.position, ctx.time_ns, 1));
         self.last = Some(ctx.position);
+    }
+}
+
+/// Plan 3's capstone needs a below-floor joiner, and a joiner only falls below
+/// a floor that MOVES — which takes a real snapshotting service. `ClockSm`'s
+/// whole state is its two vectors, so the artifact is just their serde image.
+/// (`Timed<S>` gets `SnapshotStateMachine` for free from this one, wrapping it
+/// with its own exactly-once image.)
+#[derive(Serialize, Deserialize)]
+struct ClockImage {
+    fired: Vec<Fired>,
+    stamps: Vec<(u64, u64, u8)>,
+}
+
+impl uc_service::SnapshotStateMachine for ClockSm {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc_service::SnapshotError> {
+        let img = ClockImage {
+            fired: self.fired.clone(),
+            stamps: self.stamps.clone(),
+        };
+        let bytes = bincode::serde::encode_to_vec(&img, bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(format!("clock image encode: {e}")))?;
+        Ok((bytes, self.last.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(
+        handle: Vec<u8>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        let (img, _): (ClockImage, _) =
+            bincode::serde::decode_from_slice(&buf, bincode::config::standard()).map_err(|e| {
+                uc_service::SnapshotError::Codec(format!("clock image decode: {e}"))
+            })?;
+        self.fired = img.fired;
+        self.stamps = img.stamps;
+        self.last = Some(position);
+        Ok(position)
     }
 }
 
@@ -1012,4 +1062,483 @@ fn a_restarted_node_resumes_the_table_with_one_catch_up_tick() {
 
     svc.stop();
     node.stop();
+}
+
+// ------------- 6. plan 3: the promoted below-floor joiner keeps the schedule
+
+/// The capstone's journal segment (and snapshot interval): small, so a few
+/// thousand commands are enough to move the purge floor a whole segment and
+/// put a fresh joiner genuinely below it.
+const CAPSTONE_SEG: u64 = 64 * 1024;
+
+/// The joiner's election window. Short — an order of magnitude under the
+/// original voters' — so that when the leader dies the promoted joiner is the
+/// only node whose timer can expire, and the survivor grants rather than
+/// campaigns. See the test's own comment for why that is sound and not just
+/// convenient.
+const JOINER_ELECTION_NS: (u64, u64) = (150_000_000, 250_000_000);
+const ORIGINAL_ELECTION_NS: (u64, u64) = (1_200_000_000, 2_000_000_000);
+
+/// [`node_config`] with purge ON, a small ring (so a fresh joiner's NAK from 0
+/// falls below the floor into the purged region → snapshot session) and a
+/// caller-chosen election window.
+fn capstone_config(
+    id: NodeId,
+    members: Vec<(NodeId, SocketAddr)>,
+    instance_dir: PathBuf,
+    seed: u64,
+    addr: SocketAddr,
+    election_ns: (u64, u64),
+) -> NodeConfig {
+    NodeConfig {
+        buffer_bytes: 1 << 18,
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: CAPSTONE_SEG,
+        election_timeout_min_ns: election_ns.0,
+        election_timeout_max_ns: election_ns.1,
+        ..node_config(
+            id,
+            members,
+            instance_dir,
+            seed,
+            addr,
+            names(&["clock"], None),
+        )
+    }
+}
+
+/// `start_service_with`, but snapshot-capable: the capstone needs the FLOOR to
+/// move on its own (a real service publishing real artifacts), because that is
+/// what puts the joiner below it.
+fn start_snapshot_service(dir: &Path) -> Service<Timed<ClockSm>> {
+    let cfg = ServiceConfig::new(dir, APP).snapshot_policy(uc_service::SnapshotPolicy {
+        interval_bytes: CAPSTONE_SEG,
+    });
+    ServiceBuilder::new(cfg, Timed::new(ClockSm::default()))
+        .start_with_snapshots()
+        .expect("service start")
+}
+
+/// `reconfig.rs::admin_request_ok`, duplicated because each integration test
+/// file is its own binary: drive one `uc2ctl` mutating command through the cnc
+/// admin band, tolerating the transient refusals a live cluster legitimately
+/// produces (`status=2` retry, and the NotServing / ChangePending / NotCaughtUp
+/// reasons 2/3/10). Any other refusal panics — every op here is legal.
+fn admin_request_ok(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u64) -> AdminResp {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce: rand::random::<u64>(),
+            op,
+            id,
+            ip,
+            port,
+        });
+        let resp = loop {
+            if let Some(resp) = cnc.read_admin_resp(seq) {
+                break resp;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "admin op {op} response timed out"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        match resp.status {
+            0 => return resp,
+            2 => {}
+            1 if matches!(resp.reason, 2 | 3 | 10) => {}
+            _ => panic!(
+                "admin op {op} on id {id} refused: status={} reason={}",
+                resp.status, resp.reason
+            ),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "admin op {op} on id {id} never accepted (last status={} reason={})",
+            resp.status,
+            resp.reason
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The capstone's table: one repeating entry on row 0, every
+/// [`TABLE_PERIOD_NS`] from `anchor_ns`.
+fn every_table(anchor_ns: u64) -> ScheduleTable {
+    ScheduleTable {
+        entries: vec![ScheduleEntry {
+            identity_hash: clock_hash(),
+            timer_id: 1,
+            rule: ScheduleRule::Every {
+                period_ns: TABLE_PERIOD_NS,
+                anchor_ns,
+            },
+        }],
+    }
+}
+
+/// Plan 3's capstone (spec §5): a node that joined the cluster ENTIRELY below
+/// the purge floor — it never saw the table's frame and never can — is
+/// promoted to voter, wins the next election, and goes on firing the
+/// replicated schedule without a beat missed.
+///
+/// The chain under test, end to end: the leader's `SNAP_TABLE` → the
+/// receiver's withhold-and-publish → the consensus agent's fiat
+/// `install_snapshot_table` → the row's armed heap → `fire_due_timers` on a
+/// node that has just taken the leadership. Break any link and the joiner
+/// leads with an empty table: the log goes silent and the ≥ 5 assertion below
+/// times out.
+///
+/// **Why the joiner wins the election deterministically.** Two things, both
+/// necessary. (1) The election windows are skewed by an order of magnitude —
+/// the joiner's timer expires in 150–250 ms, the surviving original's in
+/// 1.2–2 s — so the joiner is the only node that campaigns in the window.
+/// (2) A vote is granted on `(last_term, last_durable) >= (ours, our
+/// durable)`, so the joiner must be at least as up to date as the survivor:
+/// the test QUIESCES first, waiting until both survivors' durable counters
+/// have reached the leader's append, and kills the leader immediately after.
+/// The residual race — a TIMER frame reaching one survivor and not the other
+/// inside the kill window — is one 50 µs transfer against a 200 ms period,
+/// and it fails LOUDLY (no leader) rather than silently.
+#[test]
+fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
+    let _g = serialize();
+    let dir = tempdir();
+
+    // ---- two voters, both slow to campaign, each with a real snapshotting
+    // ---- service so the purge floor moves on its own.
+    let socks: Vec<UdpSocket> = (0..2)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind"))
+        .collect();
+    let members: Vec<(NodeId, SocketAddr)> = socks
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as NodeId, s.local_addr().unwrap()))
+        .collect();
+    let mut nodes: Vec<NodeH> = Vec::new();
+    for (i, sock) in socks.into_iter().enumerate() {
+        let instance_dir = dir.path().join(format!("n{i}"));
+        let seed = 0xA1B2_C3D4_5566_7788 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let cfg = capstone_config(
+            i as NodeId,
+            members.clone(),
+            instance_dir.clone(),
+            seed,
+            members[i].1,
+            ORIGINAL_ELECTION_NS,
+        );
+        nodes.push(NodeH {
+            instance_dir,
+            node: Some(Node::start_with_socket(cfg, sock).expect("start")),
+        });
+    }
+    let mut svcs: Vec<Option<Service<Timed<ClockSm>>>> = nodes
+        .iter()
+        .map(|h| Some(start_snapshot_service(&h.instance_dir)))
+        .collect();
+    let leader = await_leader_among(&nodes, &[0, 1], 40);
+    let survivor = 1 - leader;
+    let leader_dir = nodes[leader].instance_dir.clone();
+    let leader_cnc = open_cnc(&leader_dir);
+
+    // ---- the table, adopted and COMMITTED before anything is purged.
+    let client = Client::connect(&leader_dir, APP).unwrap();
+    let t0: u64 = client.submit(&Cmd::Nop).unwrap();
+    let anchor = t0 - t0 % TABLE_PERIOD_NS;
+    let table = every_table(anchor);
+    let rule = ScheduleRule::Every {
+        period_ns: TABLE_PERIOD_NS,
+        anchor_ns: anchor,
+    };
+    let table_position = apply_schedule_table(&leader_dir, &leader_cnc, &table);
+    // Ruling 3: the ship gate only offers a record at or below the sender's
+    // COMMIT counter, so an uncommitted table would correctly ship as none and
+    // the joiner would install nothing — a green test proving the wrong thing.
+    wait_until("the applied table committed", || {
+        nodes[leader]
+            .node
+            .as_ref()
+            .unwrap()
+            .counters()
+            .commit
+            .load_acquire()
+            >= table_position
+    });
+    client.shutdown();
+
+    // ---- churn, so the floor rises well ABOVE the table's frame and the
+    // ---- prefix holding it is gone from the journal.
+    {
+        let c = PipelinedClient::connect(&leader_dir, APP, PipelinedConfig::default()).unwrap();
+        let mut inflight = std::collections::VecDeque::new();
+        for _ in 0..6000u32 {
+            loop {
+                match c.try_submit::<_, u64>(&Cmd::Nop) {
+                    Ok(t) => {
+                        inflight.push_back(t);
+                        break;
+                    }
+                    // The ring is full: retire one outstanding ticket to make
+                    // room (or yield, if this producer holds none).
+                    Err(_) => match inflight.pop_front() {
+                        Some(t) => {
+                            t.wait().expect("answered");
+                        }
+                        None => std::thread::yield_now(),
+                    },
+                }
+            }
+            if inflight.len() >= 256 {
+                inflight.pop_front().unwrap().wait().expect("answered");
+            }
+        }
+        for t in inflight {
+            t.wait().expect("answered");
+        }
+        c.shutdown();
+    }
+    wait_until(
+        "the leader purged the prefix holding the table frame",
+        || nodes[leader].node.as_ref().unwrap().archive_first_base() > table_position,
+    );
+    let leader_first_base = nodes[leader].node.as_ref().unwrap().archive_first_base();
+
+    // ---- a FRESH node joins as a learner, entirely below that floor.
+    const JOINER: NodeId = 50;
+    let j_sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let j_addr = j_sock.local_addr().unwrap();
+    let (j_ip, j_port) = match j_addr {
+        SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+        SocketAddr::V6(_) => panic!("ipv4 loopback only"),
+    };
+    let resp = admin_request_ok(
+        &leader_cnc,
+        1, /* AddLearner */
+        JOINER,
+        j_ip,
+        j_port,
+        30,
+    );
+    assert_eq!(resp.version, 1, "add-learner landed at v1");
+    let j_dir = dir.path().join("n50");
+    let j_node = Node::start_with_socket(
+        capstone_config(
+            JOINER,
+            members.clone(),
+            j_dir.clone(),
+            0xDEAD_BEEF,
+            j_addr,
+            JOINER_ELECTION_NS,
+        ),
+        j_sock,
+    )
+    .expect("start the joiner");
+    let j_svc = start_snapshot_service(&j_dir);
+    let j_cnc = open_cnc(&j_dir);
+
+    let frontier = nodes[leader]
+        .node
+        .as_ref()
+        .unwrap()
+        .counters()
+        .append
+        .load_acquire();
+    wait_until("the joiner caught up across the purged prefix", || {
+        j_node.counters().durable.load_acquire() >= frontier
+            && j_node.counters().commit.load_acquire() >= frontier
+    });
+    assert!(
+        j_node.archive_first_base() >= leader_first_base,
+        "the joiner must have adopted the shipped snapshot floor, not replayed from 0"
+    );
+
+    // ---- and it holds the leader's table, record for record. The frame is
+    // ---- below the floor it just adopted, so `SNAP_TABLE` is the only way
+    // ---- these bytes could be here.
+    let want = uc_node::read_record(&leader_dir)
+        .expect("read the leader's record")
+        .expect("the leader adopted a table");
+    assert_eq!(want.position, table_position);
+    wait_until("the joiner installed the schedule record", || {
+        uc_node::read_record(&j_dir).expect("read").is_some()
+    });
+    let got = uc_node::read_record(&j_dir).unwrap().unwrap();
+    assert_eq!(
+        got.position, want.position,
+        "at the leader's table position"
+    );
+    assert_eq!(got.time_ns, want.time_ns, "with the leader's frame stamp");
+    assert_eq!(
+        decode_schedule_table(&got.table).as_ref(),
+        Some(&table),
+        "and the leader's table"
+    );
+    assert!(got.prev.is_none(), "a fiat install keeps no history");
+    wait_until("the joiner armed the table entry", || {
+        j_cnc.service_slot(0).identity.timers_pending() == 1
+    });
+
+    // ---- promote it. Poll the leader's own view of its catch-up first, so
+    // ---- the promote is a decision and not a retry loop.
+    let target = nodes[leader]
+        .node
+        .as_ref()
+        .unwrap()
+        .counters()
+        .commit
+        .load_acquire();
+    wait_until("the leader saw the joiner catch up", || {
+        (0..CNC_MAX_PEER_SLOTS).any(|i| {
+            let raw = leader_cnc.peer_slot(i).id_and_role.load_acquire();
+            raw != 0
+                && (raw >> 8) as u32 == JOINER
+                && leader_cnc.peer_slot(i).reported_durable.load_acquire() >= target
+        })
+    });
+    let resp = admin_request_ok(&leader_cnc, 2 /* PromoteLearner */, JOINER, 0, 0, 30);
+    assert_eq!(resp.version, 2, "promote landed at v2");
+    wait_until("the promotion converged cluster-wide", || {
+        j_node.config_version() >= 2
+            && nodes
+                .iter()
+                .all(|h| h.node.as_ref().unwrap().config_version() >= 2)
+    });
+
+    // ---- quiesce (see the doc comment: this is what makes the joiner's vote
+    // ---- credentials at least as good as the survivor's), then kill the
+    // ---- leader's service and node together.
+    wait_until("both survivors hold the leader's whole log", || {
+        let a = nodes[leader]
+            .node
+            .as_ref()
+            .unwrap()
+            .counters()
+            .append
+            .load_acquire();
+        j_node.counters().durable.load_acquire() >= a
+            && nodes[survivor]
+                .node
+                .as_ref()
+                .unwrap()
+                .counters()
+                .durable
+                .load_acquire()
+                >= a
+    });
+    // The last tick anyone had fired before the leadership moved. Every fire
+    // after it is what the FAILOVER GAP is measured across.
+    let d_kill = query(&j_svc)
+        .0
+        .iter()
+        .filter(|f| f.id == 1)
+        .map(|f| f.deadline_ns)
+        .max()
+        .expect("the table ticked before the failover");
+    svcs[leader].take().unwrap().crash();
+    nodes[leader].node.take().unwrap().crash();
+
+    wait_until("the promoted joiner took the leadership", || {
+        j_node.is_leader()
+    });
+    assert!(
+        !nodes[survivor].is_leader(),
+        "the surviving ORIGINAL voter won instead — the election skew did not hold"
+    );
+
+    // Everything the joiner's FSM has fired up to HERE could still be the dead
+    // leader's work replayed. Let its apply agent drain to the commit it holds
+    // as leader, then take the high-water deadline: every table tick after
+    // this one was appended by the joiner itself.
+    wait_until("the joiner's service caught up to its own commit", || {
+        j_cnc.service_slot(0).applied.load_acquire() >= j_node.counters().commit.load_acquire()
+    });
+    let d_lead = query(&j_svc)
+        .0
+        .iter()
+        .filter(|f| f.id == 1)
+        .map(|f| f.deadline_ns)
+        .max()
+        .expect("the joiner's FSM holds the ticks it replayed");
+    assert!(d_lead >= d_kill);
+
+    wait_until("five table ticks appended by the new leader", || {
+        query(&j_svc)
+            .0
+            .iter()
+            .filter(|f| f.id == 1 && f.deadline_ns > d_lead)
+            .count()
+            >= 5
+    });
+
+    let fired = query(&j_svc).0;
+    let post: Vec<&Fired> = fired
+        .iter()
+        .filter(|f| f.id == 1 && f.deadline_ns > d_lead)
+        .collect();
+    assert!(
+        post.len() >= 5,
+        "fewer than five ticks after the joiner led: {post:?}"
+    );
+    // The whole run across the leadership change: every tick from the last one
+    // the OLD leader appended (`d_kill`) onwards.
+    let chain: Vec<&Fired> = fired
+        .iter()
+        .filter(|f| f.id == 1 && f.deadline_ns > d_kill)
+        .collect();
+    assert!(
+        chain.iter().all(|f| f.table),
+        "every fire here came from the replicated table: {chain:?}"
+    );
+    // Each deadline is an occurrence of the rule, and each is the NEWEST
+    // occurrence its own stamp admits — the one-tick catch-up property, which
+    // is what says the joiner is running the RULE rather than walking a
+    // backlog it inherited.
+    for f in &chain {
+        assert_eq!(
+            (f.deadline_ns - anchor) % TABLE_PERIOD_NS,
+            0,
+            "not an occurrence of the rule: {f:?}"
+        );
+        assert_eq!(
+            rule.latest_at_or_before(f.time_ns),
+            Some(f.deadline_ns),
+            "the tick is not the newest occurrence its own stamp admits: {f:?}"
+        );
+    }
+    // One period plus one election is the whole budget, and the FAILOVER gap
+    // (`d_kill` → the first tick the new leader appended) is the first link of
+    // this chain, so it is measured under the same bar as every steady-state
+    // gap after it. The slack covers the new leader's leader-open collapse and
+    // its service's re-attach, both of which sit between the election and the
+    // first append.
+    let max_gap = TABLE_PERIOD_NS + JOINER_ELECTION_NS.1 + 300_000_000;
+    let mut prev = d_kill;
+    for f in &chain {
+        assert!(
+            f.deadline_ns > prev,
+            "deadlines must strictly increase: {prev} then {f:?}"
+        );
+        assert!(
+            f.deadline_ns - prev <= max_gap,
+            "the schedule skipped {} ns (> one period + one election) at {f:?}",
+            f.deadline_ns - prev
+        );
+        prev = f.deadline_ns;
+    }
+
+    j_svc.stop();
+    j_node.stop();
+    for s in svcs.iter_mut() {
+        if let Some(s) = s.take() {
+            s.stop();
+        }
+    }
+    for h in &mut nodes {
+        if let Some(n) = h.node.take() {
+            n.stop();
+        }
+    }
 }
