@@ -2764,3 +2764,51 @@ fn window_slide_with_index_aligned_reconcile_wipes_healthy_followers() {
         w.wipes()
     );
 }
+
+// ============================================================================
+// Task 12: the leader-pass model (spec §4.3) — timers strictly before
+// clients, every pass, across leader changes.
+//
+// `uc_sim`'s `World` has no frames (spec §8 amendment), so this is a PURE
+// MODEL of the real node's leader pass in `uc_sim::timers`, not a
+// world-level invariant — see that module's docs for the exact steps
+// modelled. This test drives it with the crate's own dependency-free
+// `timers::Rng` (no `rand`, matching `uc_sim`'s existing xorshift-only
+// policy — see `world.rs`'s private `XorShift64`), 64 seeds x 2000 steps
+// each, with periodic leader changes whose wall-clock skew can run up to 1s
+// either direction, and asserts `PassModel::check()` — the §4.3 ordering +
+// monotonicity predicate — never finds a violation.
+
+#[test]
+fn leader_pass_model_keeps_timers_in_order_across_leader_changes() {
+    use uc_sim::timers::{Kind, PassModel, Rng};
+
+    for seed in 1..=64u64 {
+        let mut rng = Rng::new(seed);
+        let mut m = PassModel::new(0);
+        let mut now = 1_000_000u64;
+        for step in 0..2_000u64 {
+            now += rng.range(0, 50_000);
+            if rng.range(0, 10) == 0 {
+                // a new leader whose clock lags or leads by up to 1 s
+                let skew = rng.range_i64(-1_000_000_000, 1_000_000_000);
+                now = (now as i64 + skew).max(0) as u64;
+                m.leader_change(m.last_stamp());
+            }
+            m.set_now(now);
+            let n_scheduled = rng.range(0, 3);
+            for _ in 0..n_scheduled {
+                let id = step * 8 + rng.range(0, 8);
+                let deadline = now.saturating_sub(100_000) + rng.range(0, 400_000);
+                m.schedule(id, deadline);
+            }
+            let k = rng.range(0, 4) as usize;
+            m.pass(k);
+        }
+        m.check().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+        assert!(
+            m.frames().iter().any(|f| f.kind == Kind::Timer),
+            "seed {seed} fired nothing"
+        );
+    }
+}
