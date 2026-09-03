@@ -686,6 +686,15 @@ impl Node {
         };
         let cnc = CncPage::create_file(&instance.cnc_path(), &meta).map_err(to_io)?;
         cnc.counters().prime(durable);
+        // Time-and-timers spec §3.2 (final-review C1): seed the log-time word
+        // from the journal BEFORE any agent runs — i.e. before this node can
+        // win an election and open an appender against it. The page is
+        // recreated zeroed every boot and the archive agent only publishes
+        // after recording a NEW block, so without this a restarted node that
+        // becomes leader before recording anything would stamp from its raw
+        // wall clock and could go below the previous leader's last stamp.
+        // `0` only for a fresh instance dir (empty journal).
+        cnc.store_log_time_ns(archive.recovered_log_time_ns());
 
         // M14a: the declared set and the lag policy, published ONCE, before
         // any agent runs; services and clients read them from the page.

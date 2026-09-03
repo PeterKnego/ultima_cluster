@@ -559,6 +559,7 @@ bytes are not spent here; the service counts it in a log record instead.
 | cancel races a fire already on the log | the frame arrives, the instance is no longer pending → dropped; cancel wins on every replica |
 | service restarts between `schedule` and `consumed` | replay re-runs apply → request re-made → re-announced; heap converges |
 | node restarts | heap empty until its service re-announces (snapshot or replay); timers due in the gap fire late if it is leader |
+| node restarts and wins the next election before recording a block | **as-built (final-review C1):** the cnc page is recreated zeroed every boot, so the seed cannot come from the page. `Archive::open` walks the last recorded block's frame headers (back up to 8 blocks past padding-only ones) and the node writes `recovered_log_time_ns()` into `log_time_ns` before any agent runs. The clamp therefore survives a restart; only a fresh instance dir (empty journal) starts from wall time. |
 | `svc_sched` ring full | apply loop spins as on egress; node drains every pass; counted |
 | state machine without `Timed` | at-least-once timers; documented, same trade as no `Sessioned` |
 | TIMER frame for a hash no local row declares | skipped by every apply loop; counted as a yielded frame for lag accounting |

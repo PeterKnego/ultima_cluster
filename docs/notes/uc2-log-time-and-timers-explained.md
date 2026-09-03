@@ -46,6 +46,13 @@ last value until wall time catches up. They never decrease. That clamp lives
 inside `uc_log::Appender`, the one place every frame type is written, so it
 is a property of the log rather than of any caller.
 
+The clamp survives a restart: the archive recovers the last stamp from the
+journal when it opens, and the node publishes it into the control page before
+any agent runs — so a node that reboots and immediately wins an election
+still clamps against the previous leader's last stamp. The only restart with
+no seed is a fresh instance directory, where the journal is empty and the
+first stamp is plain wall time.
+
 ### 2. The state machine reads the tape
 
 `apply` receives an `&mut ApplyCtx`. It carries `ctx.position` (the frame's

@@ -150,6 +150,32 @@ pub struct Archive {
     last_time_ns: u64,
 }
 
+/// How many recorded blocks `Archive::open` walks back looking for a
+/// non-padding frame to recover the log-time seed from. One is normally
+/// enough; a block that is entirely wrap padding is possible, and this bounds
+/// the scan so a pathological journal cannot make `open` walk the whole log.
+const RECOVER_TIME_BLOCK_SCAN: u32 = 8;
+
+/// Highest `time_ns` over the non-padding frames of one recorded block, or
+/// `None` if the block holds no non-padding frame. Header-only walk with the
+/// same defensive stop as `Archive::observe_terms`.
+fn max_frame_time_ns(block: &[u8]) -> Option<u64> {
+    let mut off = 0usize;
+    let mut best: Option<u64> = None;
+    while off + HEADER_LEN <= block.len() {
+        let h = frame::read_header(&block[off..]);
+        let aligned = frame::align_frame_len(h.length as usize);
+        if (h.length as usize) < HEADER_LEN || off + aligned > block.len() {
+            break;
+        }
+        if h.frame_type != FRAME_TYPE_PADDING {
+            best = Some(best.map_or(h.time_ns, |b: u64| b.max(h.time_ns)));
+        }
+        off += aligned;
+    }
+    best
+}
+
 impl Archive {
     /// Open the journal and recover the durable frontier: the last block's
     /// base position + length. Fresh dir -> position 0.
@@ -178,6 +204,34 @@ impl Archive {
             None => durable_pos,
             Some(first) => journal.read(first)?.expect("first block readable").0,
         };
+        // Time-and-timers spec §3.2 (final-review C1): recover the log-time
+        // seed from the journal. The cnc page is recreated zeroed every boot
+        // and the archive only publishes `log_time_ns` after recording a NEW
+        // block, so without this a node that restarts and wins an election
+        // before recording anything would seed its appender with 0 and stamp
+        // from its raw wall clock — below the previous leader's last stamp if
+        // this host's clock lags. Stamps are non-decreasing along the log, so
+        // the last non-padding frame carries the maximum: walk the last
+        // recorded block's frame headers (exactly as `observe_terms` does) and
+        // step back a bounded number of blocks while we only find padding.
+        let mut last_time_ns = 0u64;
+        if let Some(last) = journal.last_seq() {
+            let floor = journal.first_seq().unwrap_or(last);
+            let mut seq = last;
+            for _ in 0..RECOVER_TIME_BLOCK_SCAN {
+                if let Some((_meta, payload)) = journal.read(seq)?
+                    && let Some(t) = max_frame_time_ns(&payload)
+                {
+                    last_time_ns = t;
+                    break;
+                }
+                if seq == floor {
+                    break;
+                }
+                seq -= 1;
+            }
+        }
+
         Ok(Self {
             journal,
             cfg,
@@ -187,8 +241,20 @@ impl Archive {
             last_observed_term: 0,
             term_observations: Vec::new(),
             config_observations: Vec::new(),
-            last_time_ns: 0,
+            last_time_ns,
         })
+    }
+
+    /// The log-time seed recovered from the journal at `open` — the highest
+    /// `time_ns` stamp on a non-padding frame in the last recorded block(s).
+    /// The node stores this into the cnc `log_time_ns` word BEFORE any agent
+    /// runs, so a restarted node that wins the next election seeds its
+    /// appender's clamp from it and can never stamp below the previous
+    /// leader's last stamp (time-and-timers spec §3.2). `0` only for a fresh
+    /// instance dir (empty journal), where the first stamp is wall time.
+    #[inline]
+    pub fn recovered_log_time_ns(&self) -> u64 {
+        self.last_time_ns
     }
 
     /// Where the log resumes after recovery (counters.prime(this)).
@@ -1498,6 +1564,67 @@ mod tests {
         a.append(1, 3, b"c").unwrap();
         archive.do_work(&b).unwrap();
         assert_eq!(c.log_time_ns(), 1_500, "the archive never lowers the word");
+    }
+
+    /// Final-review C1: the log-time seed survives a restart. A reopened
+    /// archive recovers the highest stamp from the last recorded block, so a
+    /// node that restarts and wins an election before recording anything still
+    /// clamps its first stamps against the previous leader's last one.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn archive_recovers_the_log_time_seed_from_the_journal_at_open() {
+        let (b, c, dir) = setup(1 << 16);
+        {
+            let mut archive = Archive::open(test_cfg(dir.path())).unwrap();
+            let mut a = Appender::new(Arc::clone(&b), 1, 0);
+            a.set_now(700);
+            a.append(1, 1, b"a").unwrap();
+            a.set_now(900);
+            a.append(1, 2, b"b").unwrap();
+            archive.do_work(&b).unwrap();
+            assert_eq!(c.log_time_ns(), 900);
+        }
+        // A restart recreates the cnc page zeroed; the seed must come back from
+        // the journal, not from the (now empty) word.
+        let reopened = Archive::open(test_cfg(dir.path())).unwrap();
+        assert_eq!(
+            reopened.recovered_log_time_ns(),
+            900,
+            "the reopened archive must recover the last recorded stamp"
+        );
+    }
+
+    /// The seed walk skips padding: a padding-only block yields no stamp (so
+    /// `open` steps back a block), and a mixed block yields the highest
+    /// non-padding stamp.
+    #[test]
+    fn max_frame_time_ns_skips_padding_and_takes_the_highest() {
+        fn frame(ftype: u8, len: usize, time_ns: u64) -> Vec<u8> {
+            let mut f = vec![0u8; frame::align_frame_len(len)];
+            write_header_except_length(
+                &mut f,
+                &FrameHeader {
+                    length: 0,
+                    frame_type: ftype,
+                    flags: 0,
+                    leadership_term_id: 1,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns,
+                },
+            );
+            f[..4].copy_from_slice(&(len as u32).to_le_bytes());
+            f
+        }
+        // padding carries a stale stamp and must not seed anything
+        let pad = frame(FRAME_TYPE_PADDING, HEADER_LEN, 9_999);
+        assert_eq!(max_frame_time_ns(&pad), None);
+        // mixed block: two messages then padding -> the highest MESSAGE stamp
+        let mut block = frame(FRAME_TYPE_MESSAGE, HEADER_LEN + 64, 700);
+        block.extend_from_slice(&frame(FRAME_TYPE_MESSAGE, HEADER_LEN + 64, 900));
+        block.extend_from_slice(&pad);
+        assert_eq!(max_frame_time_ns(&block), Some(900));
+        assert_eq!(max_frame_time_ns(&[]), None);
     }
 
     /// Truncation resets the observation cursor; re-recording the still-in-ring

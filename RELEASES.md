@@ -68,7 +68,11 @@ clock a state machine has ever had, and a scheduler built on it.
   not before. The stamp cost **nothing on the wire**: the 32-byte frame header
   was relaid, narrowing two `u64` id fields the client only ever half-filled
   into `client_id: u32` + `seq: u32`, which freed exactly the 8 bytes it
-  needed. The command payload ceiling is unchanged.
+  needed. The command payload ceiling is unchanged. The clamp survives a
+  restart: the archive recovers the last stamp from the journal at open and
+  the node seeds the control page with it before any agent runs, so a
+  stop-all/start-all upgrade cannot rewind the log's clock. Only a fresh
+  instance directory starts from wall time.
   → [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
   [Wire protocol § Log frames](docs/reference/wire-protocol.md#log-frames)
 - **A state machine can schedule its own callbacks, and they arrive in the

@@ -252,6 +252,51 @@ fn a_scheduled_timer_fires_at_its_deadline_in_order_and_once() {
     node.stop();
 }
 
+/// Final-review C1: the log-time seed survives a node restart. The cnc page is
+/// recreated zeroed at every boot, so without the archive's `open`-time
+/// recovery a restarted node that wins the next election would seed its
+/// appender with 0 and stamp from its raw wall clock — below the previous
+/// leader's last stamp if this host's clock lags. Read the word immediately
+/// after `Node::start` returns, i.e. before the election can append anything.
+#[test]
+fn the_log_time_seed_survives_a_restart_of_the_same_instance_dir() {
+    let _g = serialize();
+    let dir = tempdir();
+    let before: u64;
+    {
+        let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
+        wait_until("serving", || node.can_serve());
+        let svc = start_service_with(dir.path(), Timed::new(ClockSm::default()));
+        let client = Client::connect(dir.path(), APP).unwrap();
+        let _: u64 = client
+            .submit(&Cmd::At {
+                id: 7,
+                in_ms: 10_000,
+            })
+            .unwrap();
+        // The word only moves once the archive has recorded the block holding
+        // the frame; wait for it rather than racing the archive agent.
+        let cnc = open_cnc(dir.path());
+        wait_until("archive published a stamp", || cnc.log_time_ns() > 0);
+        before = cnc.log_time_ns();
+        client.shutdown();
+        svc.stop();
+        node.stop();
+    }
+
+    let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
+    let seeded = open_cnc(dir.path()).log_time_ns();
+    assert!(
+        seeded >= before,
+        "log time went backwards across a restart: {seeded} < {before}"
+    );
+    assert_ne!(
+        seeded, 0,
+        "the seed must be recovered from the journal before any new frame"
+    );
+    node.stop();
+}
+
 // -------------------------------------------------------- 2. leader change
 
 /// One cluster member: its instance dir (a service attaches there) and the

@@ -172,7 +172,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `on_timer(&mut self, ctx, ev)` on both tiers, `TimerEvent::late(ctx)`.
     Two more cnc words in the same page version: `log_time_ns` at page 1
     offset `4048` (archive-agent-written, never lowered — a new leader seeds
-    its clamp from it) and per-row `timers_pending` at slot line 7 `+488`
+    its clamp from it; the node seeds the word itself at boot from
+    `Archive::recovered_log_time_ns()`, a journal walk at `open`, so the
+    clamp survives a restart and only a fresh instance dir starts from wall
+    time) and per-row `timers_pending` at slot line 7 `+488`
     (consensus-agent-written each pass). One new per-row IPC ring,
     `svc_sched.<row>.ring` (SPSC, service → node, 1 MiB, `MSG_V2_SCHED`),
     the first per-row ring the **node consumes**; it takes the per-row
