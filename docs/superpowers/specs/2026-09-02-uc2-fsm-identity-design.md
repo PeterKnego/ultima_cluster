@@ -307,11 +307,23 @@ placement-independent regardless of §2.1's cut.
 - Renaming an FSM changes the series it mints from then on and never
   collides with what it minted before (the input differs).
 - IDs are unique within one cluster (one `app_id`), not across clusters.
-- Wall-clock-sortable IDs (Snowflake, ULID) are *not* provided: the FSM has
-  no clock, and a leader-stamped time would be a frame-header change. The
-  position already gives strict, global, time-correlated order; Snowflake
-  proper belongs at the client edge, where the client is a worker with a
-  clock, and the FSM stores what arrives.
+- Wall-clock-sortable IDs (Snowflake, ULID) are *not* provided by `IdGen`
+  itself. The position already gives strict, global, time-correlated order;
+  Snowflake proper belongs at the client edge, where the client is a worker
+  with a clock, and the FSM stores what arrives.
+
+  **As-built erratum (2026-09-03).** The premise of the first clause has since
+  changed: "the FSM has no clock, and a leader-stamped time would be a
+  frame-header change" was true when this was written, and the frame-header
+  change was then made. Log time and timers
+  (`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`) relaid
+  the header and put a leader-written `time_ns` stamp in every frame, so an
+  FSM now has **`ctx.time_ns`**: a deterministic clock, the same on every
+  replica. `IdGen`'s inputs are unchanged (`position ‖ ordinal ‖
+  fold32(hash)`, deliberately — see the paragraph above), but a state machine
+  that wants a Snowflake-shaped id can now build one itself by prefixing
+  `ctx.time_ns` to an `IdGen` value, without leaving the apply contract. The
+  conclusion of this bullet stands; only its reason is out of date.
 
 **One type, one row.** Identity is per type, so a harness that runs one
 state machine type at several rows (apply_bench, the two-FSM lincheck
@@ -618,6 +630,18 @@ number asserted from this section's prose alone.
   designed separately and will follow as their own wire release; nothing
   here depends on them. They add fields to `ApplyCtx` (§3.3), not a new
   signature. (A Snowflake-style ID would take its time input from there.)
+
+  **As-built erratum (2026-09-03): they did not get their own wire release.**
+  Plan 1 of the time-and-timers spec is implemented on this same branch and
+  **ships in the same unreleased `2.11.0` flag day** as FSM identity: wire
+  `0.6.0` → `0.7.0` and cnc `3.0` → `3.1` carry both features at once, because
+  nothing had shipped speaking `0.7.0` when the second one landed (time spec
+  §9). Everything else in this bullet held: `ApplyCtx` gained `time_ns` and
+  `term` as fields with no second signature change, exactly what
+  `#[non_exhaustive]` was carried here for, and nothing in the identity work
+  depended on the timestamps. The `&mut ApplyCtx` seam this spec introduced
+  turned out to be load-bearing for timers too: `schedule`/`cancel` are
+  outputs of apply collected on it.
 - Stage-2 multi-log (M14 spec §10) — unaffected; a name is per log.
 
 ## 12. Implementation order (for the plan)

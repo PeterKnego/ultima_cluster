@@ -1,14 +1,23 @@
 # ultima_cluster releases
 
-## Unreleased — FSM identity (next minor, 2.11.0 when cut)
+## Unreleased — FSM identity and log time (next minor, 2.11.0 when cut)
 
 **Implemented on branch `uc2/fsm-identity`; not tagged. Release on hold** —
 more changes are planned on this branch first. This entry is a draft written
 ahead of the tag, per the standing writeup rule (CLAUDE.md), so the record
-is ready when the maintainer green-lights it. Spec:
-`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`. Plan:
-`docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10, all done on
-this branch).
+is ready when the maintainer green-lights it.
+
+**Two features, one flag day.** Both were implemented before the release was
+cut, and both move the wire to `0.7.0` and the cnc page to `3.1`, so they
+ship together:
+
+| feature | spec | plan |
+|---|---|---|
+| FSM identity | `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` | `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10, all done) |
+| Log time and timers, plan 1 | `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md` (T0–T14, all done) |
+
+Plan 2 of the time spec (the replicated schedule table, §5) is **not** in
+this release; it is the next item under that feature in `docs/BACKLOG.md`.
 
 ### The problem this closes
 
@@ -103,13 +112,142 @@ declared-set mismatch, and different logic at the same number diverged
   name, `RefusalKind::Identity`) and same names with differing attached
   versions (refused with both versions, `RefusalKind::Version`).
 
+### Log time and timers, plan 1
+
+**The problem it closes.** A state machine may not read a clock (the apply
+contract: "no clock, no randomness"), and until now it had no substitute. The
+log frame header carried no time, `ApplyCtx` carried only the position and the
+identity, and nothing in the shipped stack needed one — the session layer's
+`EXPIRED` is a sequence window, not a TTL. A TTL, a rate window, an expiry, or
+"do X at 14:00" was therefore impossible to express deterministically. This
+puts time **on the log**, where every replica reads it identically, and builds
+one thing on it: a scheduler whose fired timers are frames on the same log,
+placed so the timestamp series stays in order across them. Plain-language
+explainer: `docs/notes/uc2-log-time-and-timers-explained.md`.
+
+- **The frame header is relaid, not grown.** Through `0.6.0` the 32-byte
+  header carried `session_id: u64` and `correlation_id: u64`, of which the
+  client only ever filled 32 bits each (the shmem ingress record packs
+  `client_id: u32 ‖ local_seq: u32` into one word and the leader widened
+  them). They become `client_id: u32` at offset 12, `seq: u32` at 16, four
+  reserved bytes at 20, and **`time_ns: u64` at 24**. `HEADER_LEN`,
+  `FRAME_ALIGNMENT`, `MTU_DEFAULT` and the payload ceiling (1344 / 1312) are
+  all unchanged. This is the sharper half of the flag day: unlike every prior
+  wire bump, an old peer's frames are the same length and *parse*, so a mixed
+  cluster misreads rather than stalls. `docs/how-to/upgrade-a-cluster.md` says
+  so explicitly.
+- **The leader stamps, once per pass, with a monotone clamp.** One wall-clock
+  read per consensus pass (not per frame), and `stamp = max(now, last_stamp)`
+  applied inside `uc_log::Appender`, the one place every frame type is
+  written — so the clamp is a property of the log, not of any caller. Equal
+  stamps are allowed and expected: position is the order, time is never a
+  tie-breaker. Every frame type is stamped (MESSAGE, NEW_TERM, CONFIG,
+  PADDING, TIMER), so the log's time is defined at every position. The archive
+  agent carries the highest recorded stamp into the new cnc word
+  `log_time_ns`, and a new leader seeds its clamp from it after the
+  leader-open collapse; the word is never lowered, which is what makes the
+  seed monotone-safe even when the collapse cut a frame above the archived
+  base.
+- **`ApplyCtx` gains `time_ns` and `term`** as public fields (this is exactly
+  what `#[non_exhaustive]` was carried into the identity spec for — no second
+  signature change), plus `schedule(id, at_ns)`, `cancel(id)` and `timers()`.
+  **`query` receives no time**: a read has no position that means the same
+  thing on every replica, and time is no better defined there.
+- **`FRAME_TYPE_TIMER = 5`**, a fixed 24-byte body of three LE `u64`s
+  (`identity_hash ‖ timer_id ‖ deadline_ns`), 64 B total after alignment.
+  `client_id`/`seq` are 0; `FLAG_TIMER_TABLE = 0x01` is reserved for plan 2.
+  It names the FSM by **identity hash, not row**, because a log frame outlives
+  a row reorder. Id-only, no payload: an FSM keeps a timer's context in its own
+  state, keyed by the id. **One pending instance per `(fsm, id)`** —
+  re-scheduling replaces the deadline, Aeron's per-correlation-id semantics.
+- **This is the first per-FSM frame in a broadcast log**, and the M14 spec now
+  carries an as-built erratum saying so. A `TIMER` frame is delivered only to
+  the FSM whose hash it names and skipped by every other apply loop, while
+  still counting as a yielded frame for bounded-lag and lockstep accounting.
+  The same erratum records a second consequence the same-type `Tagged`
+  harnesses had masked: **heterogeneous FSMs on one log must share one wire
+  command type** (an envelope enum), or each must treat the other's commands
+  as a deterministic no-op. `uc_lincheck::timer::MixedCmd` is the worked
+  example.
+- **The ordering guarantee, and why it holds.** Each leader pass: read the
+  clock; fire every due timer (stamped with its **deadline**, clamped),
+  bounded by `TIMERS_PER_PASS = 64`; only then append client frames. At the
+  bound, or on `WouldOverrun`, the pass appends **no** client frames at all,
+  because interleaving one between two due timers would stamp it above a later
+  deadline. So: a timer with deadline `D` fired in pass `k` was not due in
+  pass `k-1`, whose `now` was therefore below `D`, and pass `k` places it
+  before anything stamped `now >= D`. The one case the invariant cannot hold
+  is a leader that stamped past `D` and died before firing: the clamp writes
+  `last_stamp` in the header and leaves `D` in the body, and `ev.late(ctx)` is
+  true. That is an OS timer firing late under load, not a correctness loss.
+- **At-least-once at the node, exactly-once at the service.** Each node keeps
+  a per-row `pending` map plus a lazy-deletion min-heap, on **every** role;
+  only the leader pops by time. On any leader exit (`BecomeFollower` and
+  `halt`) every in-flight instance is **re-armed**, so a *missed* fire is
+  impossible: the only way an instance leaves every node's heap is a
+  `consumed` record from a service that saw it on the log. `uc_service::
+  Timed<S>` turns that into exactly-once, deterministically, from log content
+  alone: it delivers only when `(id, deadline)` is still in its own
+  log-derived pending set. Without the wrapper a state machine gets
+  at-least-once timers, documented as the same trade as running without
+  `Sessioned`. No node-side persistence: the heap is a cache of what the
+  services know, re-announced after attach and after replay.
+- **`svc_sched.<row>.ring`** (SPSC, service → node, 1 MiB, `MSG_V2_SCHED = 8`,
+  17-byte records `op ‖ timer_id ‖ deadline_ns`) is the first per-row ring the
+  **node consumes**; `svc_query`'s consumer half is dropped at creation, so
+  the consensus agent's drain is new code beside `drain_query_ring`, not a
+  refactor of it. It takes the per-row reservation from 5 MiB to 6 MiB
+  (~79 MiB boot reservation with one FSM, ~121 MiB with eight).
+- **cnc 3.1 gains two words in place**, both inside the same unreleased page
+  version: `log_time_ns` at page 1 offset `4048` (the third word of the
+  boot-once `4032` line, whose only live writer is the archive agent) and
+  per-row `timers_pending` at slot line 7 `+488` (consensus-agent-written each
+  pass). Offsets pinned in both `uc_protocol` and `uc_log`, as always.
+- **Observability**: `uc2_timers_{pending,fired_total,late_total,rearmed_total}`
+  per row, `uc2_log_time_ns` everywhere, `uc2_log_time_lag_seconds` on the
+  leader only, and the `Uc2LogTimeFrozen` rule
+  (`uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`, 30 s,
+  warning). `uc2ctl status` prints `log_time_ns=` (raw ns — `uc_ctl` has no
+  date formatter, and the raw value is what the metric and the cnc word both
+  hold) and a per-row `timers_pending=`. **Two** `[log]` records, not three:
+  `timer_late` fires only when a fire is late, and `timers_rearmed` on
+  leadership loss. There is deliberately **no per-fire record** — that would
+  be a `stderr` write per timer on the consensus agent, and `uc_obs` has no
+  Debug level to demote it to; `uc2_timers_fired_total` is the on-time signal.
+  (Spec §6 erratum.)
+- **Proof surface**: `uc_log`'s pass-order property test at the appender;
+  `uc_node/tests/timers.rs` (two end-to-end tests, in the CI fast list);
+  `uc_sim::timers::PassModel`, a pure model of the leader pass across seeds
+  and leader changes, whose `check()` has **five** rules — the spec's four
+  plus "lateness must pre-date the pass", added during execution because the
+  first four cannot tell a clients-before-timers order swap from legitimate
+  lateness once the clamp is applied (spec §8 erratum); two capstones,
+  `two_fsm_timer_churn_under_failover` (`lin_v2`) and
+  `two_fsm_timer_service_sigkill` (hard-crash), both adjudicated by **one
+  shared oracle**, `uc_lincheck::timer::assert_timer_report` (never-early;
+  exactly-once as *no duplicate* **and** *no loss*, with a 250 ms completeness
+  margin justified by the asynchronous service → node ring hop;
+  cancel-honoured; §4.3 order; replication equivalence); and two new fuzz
+  targets, `uc_protocol_timer_frame` and `uc_protocol_sched_record`, taking
+  the tier from 15 to 17. Lean, conformance vectors and the loom models are
+  re-run as regression only: the stamp is data carried by consensus, not a
+  consensus decision.
+- **One spec deviation worth naming**: §4.8's proposed `trait TimerSource` is
+  as built a provided `RawStateMachine::pending_timers()` with an empty
+  default, overridden by `Timed`. A separate trait would have added a second
+  bound to every generic path the apply loop already threads
+  `S: RawStateMachine` through, for a hook whose default is "nothing".
+
 ### Breaking, and why it ships as a minor
 
 Under [the semver policy](reference/semver-policy.md) this is a real
 breaking change: the trait gains a required const and changes `apply`'s
 signature, `ServiceConfig` loses a setter, `[services]` goes from optional
 to required with `ids` refused outright, and every `--service-id` CLI flag
-is gone. The maintainer's decision (spec §10, 2026-09-02) ships it as the
+is gone. Log time and timers adds nothing further to that list — its whole
+`uc_service` surface is additive (`#[non_exhaustive]` fields, two provided
+trait methods with defaults, new types, a new wrapper), and `uc_protocol`'s
+`FrameHeader` change is on an item the policy does not promise. The maintainer's decision (spec §10, 2026-09-02) ships it as the
 **next minor**, `2.11.0`, rather than `3.0.0` — on the project having no
 external users yet, not on the "nothing published" fact `2.9.0`'s carve-out
 relied on (crates.io publishing started at `2.9.0`). This is one decision
@@ -131,6 +269,7 @@ file uses ("What proves the release").
 | workspace correctness stack (`lin_v2`, `lin_partition_v2`, `learner`, `elle_check.sh`, hard-crash) | dev-box smoke only so far, see the branch's Task 9 report | pending (fleet-equivalent, not yet a gate) |
 | `cargo test --workspace --doc` | Task 10, this worktree | see below (run as part of this docs sweep, not a release gate on its own) |
 | FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
+| time-and-timers gate (rows a/b/c/d) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — bars committed, no run. Row d is an isolated `apply_bench` A/B under `scripts/hop1_ab.sh`'s same-source rebuild control, added because this work *does* touch two hot loops (M14a's codegen lesson) |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |
 | crates.io | — | pending |

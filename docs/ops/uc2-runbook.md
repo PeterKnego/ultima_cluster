@@ -64,6 +64,17 @@ verify rather than a build:
   families, `Uc2ServiceAbsent` /
   `Uc2ServicePinnedAtLagBound`, and the `service_attached`/`service_detached`
   records).
+- **Is the log's clock moving?** `uc2_log_time_ns` on every node is the highest
+  leader stamp the archive has recorded; `uc2_log_time_lag_seconds` on the
+  **leader only** (rendered `0` elsewhere) is wall clock minus that. A grown lag
+  means the leader's clock stepped backwards (stamps hold flat until wall time
+  catches up) or nothing is being appended; `Uc2LogTimeFrozen` fires above 5 s
+  for 30 s. Per-row timer counters are `uc2_timers_pending`,
+  `uc2_timers_fired_total`, `uc2_timers_late_total` and
+  `uc2_timers_rearmed_total`; the two `[log]` records are `timer_late` (emitted
+  only when a fire is late — there is deliberately no per-fire record on the
+  consensus agent's hot path) and `timers_rearmed` (on a leadership loss). See
+  [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
 
 ## Changing a running cluster
 
@@ -111,14 +122,27 @@ verify rather than a build:
 - [Instance directory](../reference/instance-directory.md) — every file, its
   owner, and its durability class, including the per-declared-FSM files since
   M14 (`svc_query.<id>.ring`, `egress_service.<id>.broadcast`,
-  `service.<id>.lock`, `snapshots/<id>/`). *Was §1.*
+  `service.<id>.lock`, `snapshots/<id>/`) and, since log time and timers
+  (2.11 pending), `svc_sched.<id>.ring` — the first per-row ring the **node**
+  consumes (service → node: schedule, cancel and consumed requests). It takes
+  the per-row reservation from 5 MiB to 6 MiB. *Was §1.*
 - [The cnc control page](../reference/cnc-page.md) — the pinned layout, field by
   field, including cnc 3.1's per-slot name/hash line (7) and version word
-  (line 0, word 1) added for FSM identity (2.11 pending). *Was §3's field
-  tables.* Raw-offset walkthrough:
+  (line 0, word 1) added for FSM identity, plus the two words log time added
+  in the same page version (2.11 pending): `log_time_ns` at page 1 offset
+  `4048` (written by the **archive agent**, never lowered — the highest leader
+  stamp recorded, and what a new leader seeds its clamp from) and
+  `timers_pending` at slot line 7 `+488` (written by the **consensus agent**,
+  republished every pass). Decoding them raw: they are plain LE `u64`s, so
+  `od -A d -t u8 -j 4048 -N 8 cnc2.dat` reads the log clock in nanoseconds and
+  `-j $((4096 + 512*ROW + 488))` reads a row's pending-timer count. *Was §3's
+  field tables.* Raw-offset walkthrough:
   [Diagnose a node → Which FSM is holding the cluster up?](../how-to/diagnose-a-node.md#which-fsm-is-holding-the-cluster-up)
 - [`uc2ctl`](../reference/uc2ctl.md) — sub-commands, arguments, response
-  statuses, refusal reasons.
+  statuses, refusal reasons. `status`'s `services:` line gained
+  `log_time_ns=<ns>` (raw nanoseconds since the Unix epoch, not RFC 3339 —
+  there is no formatter in the binary) and each per-FSM row gained
+  `timers_pending=<n>`, both since log time and timers (2.11 pending).
 - [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
   — which metric families carry a `service` label, what the unlabeled
   aggregate means now, and the declared-set drift query. `Uc2ServiceIdentityDrift`

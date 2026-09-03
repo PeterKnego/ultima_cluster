@@ -96,6 +96,54 @@ today checks only the number.
   changes are planned on this branch before a release. Explainer:
   `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`.
 
+### 2a. Time and timers, plan 2 — the replicated schedule table
+
+*Added 2026-09-03, when plan 1 was implemented. Not a ranked item on the
+2026-09-01 list: leader-stamped log time and a deterministic scheduler were
+requested by the maintainer directly on 2026-09-02 and specced beside FSM
+identity, which is why this line sits under item 2 rather than getting a
+number of its own.*
+
+**Plan 1 is IMPLEMENTED on the same branch as FSM identity, release on
+hold.** Spec:
+`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`; plan:
+`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md` (T0–T14, all
+tasks done). What shipped: a leader-written `time_ns` in every frame header
+(the header was relaid to pay for it, so the payload ceiling is unchanged),
+the `max(now, last)` clamp, `ApplyCtx::{time_ns, term, schedule, cancel}`, a
+provided `on_timer` on both tiers, `FRAME_TYPE_TIMER` with deadline-stamped
+in-order placement, the per-row node heap with re-arm on leadership loss,
+`uc_service::Timed<S>` for exactly-once delivery, one new per-row IPC ring
+(`svc_sched.<row>.ring`), two cnc words, six metric families and one alert
+rule. Explainer:
+`docs/notes/uc2-log-time-and-timers-explained.md`; gate skeleton:
+`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars committed, no
+run). It rides the same unreleased `2.11.0` flag day as FSM identity.
+
+**What is left, and is the next item under this feature: plan 2, the
+replicated schedule table** (spec §5, and §11's steps 7–10). An operator
+writes a TOML file of recurrences and applies it with a signed
+`uc2ctl schedule apply <file.toml>`; the leader appends it as
+`FRAME_TYPE_SCHEDULE_TABLE = 6`; every node adopts it through the archive's
+existing header walk (the path CONFIG frames already take) and persists it as
+a `StableValue` in `state/schedules.state`. Two recurrence rules only
+(`every` from an anchor, and daily `at`), UTC, ≤ 64 entries so the payload
+always fits one datagram, next deadline computed **from the deadline just
+fired** rather than from a clock.
+
+- **Why it was cut from plan 1:** plan 1 already gives "declarative" in the
+  FSM-level sense (an FSM can schedule its own recurrence from `on_timer`,
+  bootstrapped by one command), so the table is the operator-facing
+  convenience on top, and it is the part most likely to change shape once
+  plan 1 has been used in anger.
+- **What already exists for it:** `FLAG_TIMER_TABLE = 0x01` is reserved in
+  the frame header, `TimerEvent.table` is on the delivered event, and
+  `Timed`'s snapshot image already carries the `table_last` map, so the
+  snapshot format does not change when the table lands.
+- **Cost:** small-to-moderate. One frame type + codec + fuzz target, adoption
+  through an existing path, the next-deadline arithmetic, one admin verb with
+  auth and audit, and the `table_last` rule in `Timed`.
+
 ### 3. Rolling upgrades and leadership transfer
 
 The two operations items `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md`

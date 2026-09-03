@@ -16,7 +16,7 @@ To read a live page while diagnosing a node, see
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 8 B | magic | `UC2CNC\0\0` |
-| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity, 2.11 pending) |
+| 8 | u32 LE | version | `CNC_V2_VERSION` = `(3 << 24) \| (1 << 16)` (cnc 3.1, FSM identity + log time, 2.11 pending) |
 | 12 | u32 LE | node id | |
 | 16 | u64 LE | instance id, low | changes on every node restart |
 | 24 | u64 LE | instance id, high | |
@@ -66,8 +66,11 @@ writer.
 | 3976 | `query_holes_skipped` | M13: same counter for the **query** ring — deliberately the second u64 of the 3968 line (same writer, on-change only) |
 | 4032 | `services_declared` | node, once at boot (bit *i* ⇔ id *i* declared). **Unchanged by cnc 3.1 / FSM identity**: this same-host bitmask is unrelated to the wire's per-row `SnapBeginBody.identity` array (`docs/reference/wire-protocol.md`) — the two are derived from the same `[services] names` config but serve different readers |
 | 4040 | `fsm_lag_bytes` | node, once at boot (`0` ⇔ lockstep) — shares 4032's line |
+| 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11 pending) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
 
 Counters are absolute byte positions in the replicated log, not indices.
+`log_time_ns` is the one exception: it is a wall-clock nanosecond value, not a
+position.
 
 ### `node_flags`
 
@@ -124,7 +127,7 @@ Fields within a slot (each its own 64 B line, one writer):
 | 384 | `lag_waits` | service apply agent (one per wait episode at the lag barrier) |
 | 448 | `name` (line 7) — `[u8; 32]`, NUL-padded FSM name | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 480 | `identity_hash` (line 7) — u64, FNV-1a 64 of `name` | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
-| 488 | reserved (zero) | — |
+| 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time |
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
@@ -137,3 +140,10 @@ prints `row= name= version= hash=` per row from these two lines plus the
 status line's version word; `/metrics` exports them as
 `uc2_service_identity_hash{service="<name>",row="<r>"}` and
 `uc2_service_version{service="<name>",row="<r>"}`.
+
+Line 7's third word, `timers_pending` (`+488`), breaks the pattern a second
+way: its writer is the node's **consensus agent**, and unlike `name`/
+`identity_hash` it is republished on every pass rather than written once at
+boot. It is exported as `uc2_timers_pending{service="<name>",row="<r>"}` and
+printed by `uc2ctl status` as `timers_pending=` on each per-FSM row. See
+[Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).

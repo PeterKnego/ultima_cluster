@@ -85,7 +85,7 @@ Decisions locked during the brainstorm:
 | Decision | Choice |
 |---|---|
 | Staging | **Stage 1 (this spec):** one log → N FSMs. **Stage 2 (future, not this spec):** N independent logs, each with its own FSM set, in one daemon — "N of stage 1 in parallel". Stage 1 must not close that door (§10). |
-| Command delivery | **Broadcast** — every FSM applies every committed frame. No per-command routing to a subset, no service id in the log frame or on the wire. |
+| Command delivery | **Broadcast** — every FSM applies every committed frame. No per-command routing to a subset, no service id in the log frame or on the wire. *(As-built erratum 2026-09-03: the second sentence acquired an exception — see below.)* |
 | Process model | **One process per FSM.** Each attaches to the instance dir with a `service_id`. In-process hosting of several FSMs is not provided (a user may spawn N attaches in one binary; nothing stops it, nothing helps it). |
 | Response to the client | **Designated responder, chosen per request.** Every FSM publishes its response on its own egress ring; `submit` defaults to FSM 0's answer; `submit_to(cmd, id)` and `submit_all(cmd)` select one or fan in all. |
 | FSM pacing (`fsm_lag`) | **Bounded with back-pressure, always.** One knob: `lockstep` (no FSM starts frame *k+1* until every FSM finished frame *k*) or a byte bound. **There is no unbounded mode** — an FSM slower than the log's sustained rate can never catch up from journal replay (replay is strictly slower than live apply), so "unbounded" is a silent death spiral, not graceful degradation. Default `buffer_bytes / 4`. |
@@ -94,6 +94,40 @@ Decisions locked during the brainstorm:
 | Cap | **8 FSMs per log** (`CNC_MAX_SERVICES = 8`). Stage 2 multiplies logs, not slots. |
 | Single-service compatibility | No `[services]` section ⇒ `{0}`, default lag. `counter-service` and every existing deployment behave as before after the flag-day cnc/wire bump. |
 | Versioning | cnc page 2.0 → 3.0 (same-host flag day); wire 0.5.0 → 0.6.0 (`SNAP_BEGIN` payload only; cross-host flag day). |
+
+**As-built erratum (2026-09-03, log time and timers plan 1) — two things this
+row's "broadcast, no per-command routing" line no longer says completely.**
+
+1. **`TIMER` frames are the first per-FSM frame in a broadcast log.** The
+   time-and-timers work
+   (`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` §4.2,
+   §4.7) adds `FRAME_TYPE_TIMER = 5`, whose 24-byte body names one FSM by its
+   identity hash. It is delivered **only** to the FSM whose hash it carries;
+   every other row's apply loop skips it, exactly as it skips `NEW_TERM` and
+   `CONFIG` today. Two consequences for this spec's machinery: the frame is
+   still **counted as a yielded frame** for bounded-lag and lockstep
+   accounting (the comment at `apply.rs:374-380` covers it, unchanged), and
+   the identity hash rather than the row number is what a `TIMER` frame
+   carries, so a log frame outlives a row reorder. `MESSAGE` frames are still
+   pure broadcast and still carry no FSM selector.
+
+2. **Heterogeneous FSMs on one log must share one wire command type.** This
+   follows from the broadcast rule and was always true; it was never written
+   down, because every harness in the tree ran the *same* state-machine type
+   at several rows (`uc_service::Tagged<ROW, S>`), which masks it completely.
+   Two FSMs of **different** types on one log cannot each define their own
+   `Command`: each row is handed the other row's committed bytes and will
+   either fail-stop on the decode or, worse, decode them into a
+   valid-but-wrong command of its own (bincode ignores trailing bytes, so two
+   unrelated enums sharing a discriminant prefix decode into each other). The
+   two ways out are (a) **one envelope enum** both rows decode, each ignoring
+   the other's variants as a deterministic no-op, or (b) a raw-tier framing in
+   which each row can cheaply recognise and skip foreign bytes. The worked
+   example of (a) is `uc_lincheck::timer::MixedCmd { Reg(..), Timer(..) }`,
+   the shared wire the two-FSM timer capstones run on: row 0 runs the
+   untouched register transition for `Reg` and ignores `Timer`, row 1 the
+   reverse. This is a real design constraint on multi-FSM deployments, not a
+   test artifact.
 
 ### What does not change
 

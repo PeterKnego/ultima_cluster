@@ -169,6 +169,41 @@ above, **not** a bare `count by (row) (uc2_service_identity_hash) > 1` —
 that counts *series* (one per node instance), not distinct values, and pages
 permanently on any multi-node cluster.
 
+### The log clock and the timer families (2.11 pending)
+
+Since log time and timers, every log frame carries a leader-written timestamp
+and a state machine can schedule callbacks on it
+([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Six new
+families:
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `uc2_log_time_ns` | gauge | none | the highest leader stamp the archive on **this** node has recorded: the log's clock, in ns since the Unix epoch. Identical on every node once caught up |
+| `uc2_log_time_lag_seconds` | gauge | none | **leader only** (rendered `0` on followers): wall clock minus `uc2_log_time_ns` |
+| `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row on this node. Every node holds the same set; the leader is the only one that fires it |
+| `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
+| `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
+| `uc2_timers_rearmed_total` | counter | `service`, `row` | in-flight instances moved back to pending on a leadership loss. Each may fire again; `uc_service::Timed<S>` drops the duplicate |
+
+**One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
+`uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The
+`uc2_is_leader` join is what makes it meaningful: the lag series is
+leader-only, so without the join a follower's constant `0` would be
+indistinguishable from a healthy leader. A firing rule means the leader's wall
+clock stepped **backwards** (stamps hold flat at their last value until wall
+time catches up, by the monotone clamp) or nothing is being appended at all.
+Either way the log's clock has frozen relative to wall time, and every pending
+timer is waiting on it.
+
+There is **no per-fire log record**. `timer_late` is emitted only when a fire
+is late, because a `stderr` write per timer would sit on the consensus agent's
+hot path; the on-time signal is `rate(uc2_timers_fired_total[..])`. The other
+record is `timers_rearmed`, on a leadership loss.
+
+A rising `uc2_timers_late_total` on a cluster that is not changing leaders is
+worth a look: either more than `TIMERS_PER_PASS` (64) timers are coming due per
+consensus pass, or the leader's passes are being delayed.
+
 ## Install the alert rules
 
 [`packaging/prometheus/uc2-alerts.yml`](../../packaging/prometheus/uc2-alerts.yml)

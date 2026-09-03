@@ -141,7 +141,8 @@ writes frames at their offsets when follower. Because writes are position-addres
 duplicate and reordered datagrams are idempotent by construction.
 
 **Frames** carry a 32-byte header — length (the atomic-after-write commit word),
-type/flags, `leadership_term_id`, `session_id`, `correlation_id` — followed by a
+type/flags, `leadership_term_id`, `client_id`, `seq`, and `time_ns` (the
+leader's stamp, `max(now, last_stamp)`, one clock read per pass) — followed by a
 32-byte-aligned payload. Padding frames absorb the wrap, so no frame straddles the
 buffer end.
 
@@ -237,7 +238,8 @@ plus the cnc page, and runs:
 
 ```
 while service_applied < min(commit, contiguous_durable):
-    read frame → user's apply(position, cmd) → advance counter
+    read frame → user's apply(ctx, cmd) → advance counter
+              (ctx: position, time_ns, term, identity)
 ```
 
 There is exactly **one deliberate copy**, at the apply boundary: the payload is
@@ -246,15 +248,16 @@ position seqlock-style, re-reading on wrap-over. Borrowed views into an
 overwritable ring would be unsound, and at KV payload sizes the copy measured as
 noise.
 
-**Responses bypass the node.** The client stamps `(session_id, correlation_id)`;
+**Responses bypass the node.** The client stamps `(client_id, seq)`;
 consensus carries them in the frame header; the service echoes them plus the
 position directly onto an egress broadcast ring. There are no per-message
 oneshots — the client matcher correlates off the ring.
 
 ### What you implement
 
-- **`StateMachine`** — synchronous, deterministic `apply(position, cmd)` and
-  `query`. No I/O, no clock, no ambient state. `AppCommand` is `Bytes`; reads are
+- **`StateMachine`** — synchronous, deterministic `apply(ctx, cmd)` and
+  `query`. No I/O, no host clock (`ctx.time_ns` is the log's, and deterministic),
+  no ambient state. `AppCommand` is `Bytes`; reads are
   typed rather than closures. `StateMachine` is one of two tiers a service can
   implement; see
   [the state-machine contract reference](reference/state-machine-contract.md)

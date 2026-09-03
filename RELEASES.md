@@ -7,7 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## Unreleased — FSM identity (next minor, 2.11.0 when cut)
+## Unreleased — FSM identity and log time (next minor, 2.11.0 when cut)
 
 **Implemented on branch `uc2/fsm-identity`; release on hold pending further
 changes.** This section is a draft, written ahead of the tag so the writeup
@@ -16,10 +16,15 @@ is ready when the maintainer green-lights it — see
 verified so far and what still says "pending". **No version has been
 bumped, nothing has been tagged, and no fleet gate has run.**
 
+Two features share this release, because both landed before it was cut, and
+both are on the same wire `0.7.0` / cnc `3.1` flag day.
+
 An FSM's identity — the name a state machine declares in its own code — now
 travels everywhere the cluster used to check only a bare row number, closing
 the gap where two nodes could agree on a *set* of numbered slots and never
-on what logic lived behind each one.
+on what logic lived behind each one. And the log now carries **time**: a
+leader-written timestamp on every frame, which is the first deterministic
+clock a state machine has ever had, and a scheduler built on it.
 
 - **An FSM declares its own name and version in code**, not in deployment
   config: a required `const NAME: &'static str` and an optional `const
@@ -37,7 +42,7 @@ on what logic lived behind each one.
   bitmask could not even detect: two nodes running different logic at the
   same row, silently.
   → [The FSM identity explainer](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md) ·
-  [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-070-cnc-31)
+  [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31)
 - **`ApplyCtx` and `IdGen`: deterministic IDs with zero coordination.** The
   apply signature becomes `apply(&mut self, ctx: &mut ApplyCtx, cmd, out)`;
   `ctx.ids()` mints IDs from `(position, FSM identity, an ordinal that
@@ -53,6 +58,42 @@ on what logic lived behind each one.
   binary mismatch pages before a joiner ever needs to open a session.
   `uc2ctl status` prints `row= name= version= hash=` per row.
   → [Monitor a cluster § The per-FSM families](docs/how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
+- **Every log frame now carries the time the leader accepted it, so a state
+  machine finally has a clock it is allowed to read.** `apply` gets
+  `ctx.time_ns`: nanoseconds since the Unix epoch, written by the leader at
+  append, identical on every replica, non-decreasing along the log (the stamp
+  is `max(now, last)`, so a leader whose clock steps backwards freezes the
+  log's time rather than rewinding it). A TTL, an expiry, a rate window or "is
+  this lease still valid" is now expressible deterministically, which it was
+  not before. The stamp cost **nothing on the wire**: the 32-byte frame header
+  was relaid, narrowing two `u64` id fields the client only ever half-filled
+  into `client_id: u32` + `seq: u32`, which freed exactly the 8 bytes it
+  needed. The command payload ceiling is unchanged.
+  → [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
+  [Wire protocol § Log frames](docs/reference/wire-protocol.md#log-frames)
+- **A state machine can schedule its own callbacks, and they arrive in the
+  right place on the log.** `ctx.schedule(id, at_ns)` and `ctx.cancel(id)`
+  from inside `apply`; delivery through a **provided** `on_timer(&mut self,
+  ctx, ev)` on both tiers, so every existing state machine compiles and
+  behaves exactly as before. Because a schedule is an output of `apply`, every
+  node derives the same pending set from the same log, and a new leader
+  already holds it. The leader fires due timers **before** that pass's client
+  commands, stamped with the deadline, which buys a guarantee Aeron does not
+  offer: *a timer is never delivered early; when it is delivered on time, no
+  earlier frame is stamped past its deadline; when it is late, it says so*
+  (`ev.late(ctx)`). Wrap your state machine in `uc_service::Timed<S>` for
+  exactly-once delivery per scheduled instance; without it, timers are
+  at-least-once, the same trade as running without `Sessioned`.
+  → [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
+  [State-machine contract § Timers](docs/reference/state-machine-contract.md#timers-on_timer-and-timeds)
+- **The log's clock and the timer set are observable, and a frozen clock
+  pages.** Six new metric families: `uc2_log_time_ns` on every node,
+  `uc2_log_time_lag_seconds` on the leader, and
+  `uc2_timers_{pending,fired_total,late_total,rearmed_total}` per row. One new
+  alert rule, `Uc2LogTimeFrozen`, fires when the leader's log time falls more
+  than 5 s behind wall time for 30 s. `uc2ctl status` prints `log_time_ns=`
+  and a per-row `timers_pending=`.
+  → [Monitor a cluster § The log clock and the timer families](docs/how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending)
 
 **Removed (breaking)**
 
@@ -69,21 +110,37 @@ on what logic lived behind each one.
   than a major, on the project having no external users yet to break — see
   [the semver policy § FSM identity carve-out](docs/reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor)
   for the reasoning, which is not a standing exception.
-- **Wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`, one combined flag day.**
-  `SNAP_BEGIN`'s `services_declared` bitmask becomes a per-row identity-hash
-  array plus a per-row version array; the cnc page's once-reserved slot line
-  7 becomes node-written at boot (name + hash). A mixed-version cluster
-  stalls a joiner rather than installing a wrong or half-checked artifact —
-  the standing rule every prior wire bump has followed.
-  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-070-cnc-31)
+- **Wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`, one combined flag day
+  carrying both features.** `SNAP_BEGIN`'s `services_declared` bitmask becomes
+  a per-row identity-hash array plus a per-row version array; the cnc page's
+  once-reserved slot line 7 becomes node-written at boot (name + hash); the
+  log frame header is relaid for `time_ns` and a `TIMER` frame type is added;
+  two more cnc words appear (`log_time_ns`, per-row `timers_pending`).
+  **Read the upgrade note before this one.** Every prior wire bump was caught
+  by a length check, so a mixed cluster stalled. A relaid header is the *same
+  length*: a `0.6.0` peer's frames parse on a `0.7.0` node and mean something
+  different. Stop every node before starting any node.
+  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31)
+- **One new file per declared FSM in the instance directory**,
+  `svc_sched.<row>.ring` (1 MiB, service → node). The per-row reservation goes
+  from 5 MiB to 6 MiB, so the boot reservation is ~79 MiB at the defaults with
+  one FSM and ~121 MiB with eight. A host that cannot reserve it refuses to
+  start, by name.
+  → [Instance directory § Limits](docs/reference/instance-directory.md#limits)
 
 **Performance**
 
-- **Not measured yet.** The hot commit/apply path is untouched by this
-  work — every change is at config load, attach, and the snapshot-session
-  boundary — so the expected delta is null, but no fleet run has confirmed
-  it. Bars are pre-committed, results empty, per the honest-failure
-  protocol: → [FSM identity gate skeleton](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md).
+- **Not measured yet.** Two gate skeletons carry pre-committed bars with
+  empty results, per the honest-failure protocol.
+  FSM identity's hot path is untouched — every change is at config load,
+  attach, and the snapshot-session boundary — so its expected delta is null:
+  → [FSM identity gate skeleton](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md).
+  Log time and timers **does** add to two hot loops (one clock read and one
+  heap peek per leader pass; a `time_ns`/`term` fill and a `TIMER` branch per
+  applied frame), so its gate carries an isolated apply-hop A/B alongside the
+  throughput rows, because M14a proved that code added to a hot loop's body
+  can cost even on paths that never run:
+  → [Time-and-timers gate skeleton](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md).
 
 ## v2.10.0 — 2026-08-31
 

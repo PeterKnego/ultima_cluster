@@ -442,9 +442,10 @@ gets an as-built erratum saying so (§9).
   attach, and set again whenever `replay_into` returns (which is also the only
   path a snapshot install takes, so install is covered without a second hook).
   When the flag is set, the top of the next `apply_cycle` asks the wrapper for
-  its pending set — `trait TimerSource { fn pending_timers(&self) -> Vec<(u64,
-  u64)> }`, implemented by `Timed`, a no-op default for everything else — and
-  writes one `Schedule` record per entry before delivering any frame. That is
+  its pending set — as built a **provided `RawStateMachine::pending_timers(&self)
+  -> Vec<(u64, u64)>`** with an empty default, overridden by `Timed`, rather
+  than the separate `TimerSource` trait this line first proposed (§8 erratum)
+  — and writes one `Schedule` record per entry before delivering any frame. That is
   how a restarted or freshly joined node's heap converges, and why a new leader
   whose service is behind fires late rather than never.
 - Journal replay re-runs `apply`, so the inner SM's schedule calls are
@@ -518,6 +519,23 @@ backwards: the log's time then freezes until the wall clock catches up
 row. `obs_event!` records: `timer_fired {name, id, deadline_ns, time_ns,
 late}`, `schedule_table_adopted {position, entries}`.
 
+**As-built erratum (plan 1, 2026-09-03) — two corrections to this paragraph.**
+
+1. There is **no `timer_fired` record**. The per-fire record as built is
+   `timer_late {node, row, timer_id, deadline_ns, time_ns, position}`, emitted
+   **only when the fire is late**. The spec's version would have put a
+   `stderr` write per fired timer on the consensus agent, the single writer
+   that also drives commit and elections, at up to `TIMERS_PER_PASS` per pass.
+   Demoting it to a Debug level was considered and is not available: `uc_obs`
+   has no Debug level. An on-time fire is the steady state and stays visible
+   through `uc2_timers_fired_total`; a late fire is the operational signal and
+   is rare by construction, so it earns the write. A second record,
+   `timers_rearmed {node, row, count}`, is emitted on leadership loss.
+2. `uc2ctl status` prints **`log_time_ns=<n>`, raw nanoseconds**, not RFC 3339.
+   `uc_ctl` carries no date formatter and adding a dependency for one status
+   line was not worth it; the raw value is also exactly what `uc2_log_time_ns`
+   and the cnc word hold, so the three agree literally.
+
 **cnc:** two words, both inside the unreleased cnc `3.1`. `log_time_ns` is page
 1 offset `4048` (the third word of the boot-once `4032` line; `4032`/`4040` are
 written once before publish and never again, so the archive agent is the line's
@@ -590,6 +608,20 @@ loom models are re-run as regression only. The "leaders die mid-fire" scenario
 runs against real code in the `lin_v2` capstone (§8, Capstones), where it
 belongs.
 
+**As-built erratum (plan 1, 2026-09-03).** `uc_sim::timers::PassModel::check`
+has **five** rules, not the four this section implies. Rules 1-4 are the
+spec's (stamps non-decreasing; no client frame between two due timers; a
+timer's own stamp at or above its deadline; never early). Rule 5, **"lateness
+must pre-date the pass"**, was added during execution because the first four
+cannot distinguish a genuine clients-before-timers order swap from legitimate
+lateness once the clamp has been applied: the two produce the same stamp
+relation. Rule 5 keys on the fact that every frame a single pass produces
+carries that pass's `now`, so a timer marked late must have been late
+*before* the pass began; an order swap is caught, a real post-failover late
+fire is not. Rules 2 and 3 are logical consequences of rule 1 and are run
+**before** it, deliberately, so their more specific message wins when they
+name the same violation.
+
 **Capstones.** A `uc_lincheck::TimerSm` whose commands schedule and
 cancel, and whose `on_timer` appends to its history, run through `lin_v2`
 (failover and purge/snapshot churn) and the hard-crash harness, asserting:
@@ -597,7 +629,35 @@ exactly-once delivery per instance, at the same position on every replica;
 the §4.3 ordering over the whole history; `late()` only after a leader
 change. Elle: unchanged.
 
-**Fleet gate** (`docs/benchmarks/uc2-time-and-timers-gate-<date>.md`,
+**As-built erratum (plan 1, 2026-09-03) — the oracle is shared, and
+"exactly-once" needed a completeness half.** The assertions above are not
+written twice: they live in one function,
+`uc_lincheck::timer::assert_timer_report(tag, &TimerReport) -> TimerStats`,
+called by both `lin_v2`'s `two_fsm_timer_churn_under_failover` and the
+hard-crash harness's `two_fsm_timer_service_sigkill`. It checks never-early,
+the §4.3 order, replication equivalence, and **exactly-once as two halves**:
+no duplicate `(id, deadline)`, *and* no loss (every scheduled instance that
+was not cancelled and not superseded has a fire). The no-loss half needs a
+completeness margin, because a run's history ends while instances are
+legitimately still in flight: `COMPLETENESS_MARGIN_NS = 250 ms`, and an
+instance whose deadline is within that of the last observed stamp is skipped
+rather than reported lost. 250 ms is sized by the asynchronous service → node
+hop a schedule request makes (the `svc_sched` SPSC ring, drained once per
+consensus pass), not by the timer machinery, which is why it is generous.
+Without the no-loss half the duplicate check alone is nearly unfalsifiable: a
+state machine that silently dropped every timer would pass it.
+
+**As-built erratum (plan 1, 2026-09-03) — `TimerSource` did not survive
+contact.** §4.8's `trait TimerSource { fn pending_timers(&self) -> Vec<(u64,
+u64)> }` is as built a **provided method on `RawStateMachine`** with a
+`Vec::new()` default, overridden by `Timed`. A separate trait would have made
+the apply loop carry a second bound on every generic path it already threads
+`S: RawStateMachine` through, for a hook whose default is "nothing". The
+semantics are the spec's, unchanged.
+
+**Fleet gate** (`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`,
+committed as a bars-only skeleton with an added row d, the isolated apply-hop
+A/B M14a's codegen lesson demands;
 bars pre-committed, honest-failure protocol): a null throughput bar
 (steady-window rows from `m14_fleet_gate.py`) bounded by the harness's
 measured build-to-build resolution (`scripts/hop1_ab.sh` same-source

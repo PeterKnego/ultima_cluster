@@ -335,13 +335,22 @@ sections above apply, and there is no migration or extra rollback step. Run the
 same flag day anyway: it is the procedure this system supports, and it gives
 you the same measured downtime number.
 
-## Wire + cnc change in 2.11 (pending): FSM identity (`0.7.0`, cnc `3.1`)
+## Wire + cnc change in 2.11 (pending): FSM identity **and** log time (`0.7.0`, cnc `3.1`)
 
-FSM identity gives each state machine a name declared in code and binds it
-to the row (spec
-`docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`; plain-language
-explainer:
-[`docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`](../notes/uc2-fsm-identity-and-deterministic-ids-explained.md)).
+Two features share this flag day, because both were implemented before the
+release was cut:
+
+- **FSM identity** gives each state machine a name declared in code and binds
+  it to the row (spec
+  `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`;
+  plain-language explainer:
+  [`docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`](../notes/uc2-fsm-identity-and-deterministic-ids-explained.md)).
+- **Log time and timers** puts a leader-written timestamp in every log frame
+  header and adds a `TIMER` frame type (spec
+  `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`;
+  explainer:
+  [`docs/notes/uc2-log-time-and-timers-explained.md`](../notes/uc2-log-time-and-timers-explained.md)).
+
 It is **one combined flag day**, on both lines at once — the same-host cnc
 page (`3.0` → `3.1`) and the node-to-node wire (`0.6.0` → `0.7.0`) — because
 both changes ship in the same release.
@@ -369,15 +378,45 @@ directly, nothing at all — it attaches by its own `S::NAME`).
 **cnc 3.1**: the once-reserved slot line 7 becomes node-written at boot
 (the row's name, NUL-padded, plus its FNV-1a 64 hash); the status line's
 second word carries the attached service's packed version, written at
-attach. Same-host restart only, exactly like the 3.0 bump.
+attach. Log time adds two more previously-unused words to the same page
+version: `log_time_ns` at page 1 offset `4048` (archive-agent-written, never
+lowered) and per-row `timers_pending` at slot line 7 `+488`
+(consensus-agent-written, republished every pass). Same-host restart only,
+exactly like the 3.0 bump.
 
-**Wire 0.7.0**: `SNAP_BEGIN`'s `services_declared` bitmask becomes a
-per-row identity-hash array (`identity: [u64; 8]`), and a per-row packed
-version array (`version: [u32; 8]`) is added — see [the wire protocol
+**One new file per declared FSM in the instance directory**:
+`svc_sched.<row>.ring` (SPSC, service → node, 1 MiB), created by the node at
+boot. The per-row reservation goes from 5 MiB to **6 MiB**, so the boot
+reservation is ~79 MiB at the defaults with one FSM and ~121 MiB with eight
+([Instance directory § Limits](../reference/instance-directory.md#limits)).
+Check free space on each host before the flag day; a host that cannot reserve
+it gets a named startup refusal, not a mid-run failure.
+
+**Wire 0.7.0, part one (FSM identity)**: `SNAP_BEGIN`'s `services_declared`
+bitmask becomes a per-row identity-hash array (`identity: [u64; 8]`), and a
+per-row packed version array (`version: [u32; 8]`) is added — see [the wire
+protocol
 reference](../reference/wire-protocol.md#snap_begin-body-wire-070-fsm-identity)
 for the exact layout. A 0.6.0 sender's shorter body is dropped by the same
 length check that drops a 0.5.0 body today: **a mixed cluster stalls a
 joiner rather than installing a wrong or half-checked artifact.**
+
+**Wire 0.7.0, part two (log time and timers)**: the 32-byte **log frame
+header is relaid**. `session_id: u64` and `correlation_id: u64`, of which the
+client only ever filled 32 bits each, become `client_id: u32` + `seq: u32`,
+freeing 8 bytes for `time_ns: u64` — the leader's stamp on the frame. A new
+frame type, `TIMER = 5`, carries a 24-byte body (`identity_hash ‖ timer_id ‖
+deadline_ns`). See [the wire protocol reference](../reference/wire-protocol.md#log-frames).
+
+**This half of the flag day is sharper than every previous one, and deserves
+saying plainly.** Every prior wire bump was caught by a length check: an old
+peer's body was too short, so it was dropped and the cluster stalled. A relaid
+header is the same length. A `0.6.0` peer's frames *parse* on a `0.7.0` node
+and mean something different (its `correlation_id` reads as a timestamp; its
+`session_id`'s low half reads as a sequence). **Stop every node before
+starting any node on the new binaries.** The header is still 32 bytes and the
+command payload ceiling is unchanged (1344 B crypto-off / 1312 B crypto-on),
+so nothing about sizing or configuration moves.
 
 Two new named, counted refusals, on top of the existing `peer wire ≤ 0.6.0`
 one:
@@ -402,8 +441,18 @@ start node → services (now attaching by name, no `--service-id`) → clients.
 `scripts/uc2_flag_day.sh` covers the binary-swap half unchanged; the config
 edit is a manual step before it, same as any other `node.toml` change.
 
-On-disk layout is **unchanged**: snapshots still live in
-`snapshots/<row>/`, keyed by row, not name — no migration.
+On-disk layout is **unchanged** for durable data: snapshots still live in
+`snapshots/<row>/`, keyed by row, not name — no migration. The journal's
+recorded frames carry the new header from the moment a `2.11.0` leader
+appends, and older recorded frames are replayed with whatever header they
+were written with; nothing rewrites the archive.
+
+**After the flag day**, three things are new to watch
+([Monitor a cluster](monitor-a-cluster.md)): `uc2_log_time_ns` should be
+advancing on every node, `uc2_log_time_lag_seconds` should sit near zero on
+the leader (the `Uc2LogTimeFrozen` rule fires above 5 s for 30 s), and
+`uc2ctl status` prints `log_time_ns=` plus a `timers_pending=` field on each
+per-FSM row.
 
 ## Where to go next
 

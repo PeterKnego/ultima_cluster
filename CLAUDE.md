@@ -18,8 +18,9 @@ code.
 byte-empty, `UC2_*` env overrides, `config_loaded` {path, sha256}, the
 `uc_obs` crate, the `ultima_db` removal, and the Broadcast-ring
 memory-ordering fix loom found; `2.9.0` was the `uc_*` crate rename).
-**(2.11.0 pending: FSM identity — implemented on branch `uc2/fsm-identity`,
-release on hold; see "Next up" below.)**
+**(2.11.0 pending: FSM identity plus log time and timers — both implemented
+on branch `uc2/fsm-identity`, one flag day, release on hold; see "Next up"
+below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
@@ -70,7 +71,20 @@ skeleton `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` (bars
 pre-committed, no fleet run yet). **The release itself is on hold**: more
 changes are planned on the branch first, so no version has been bumped, no
 tag cut, no fleet gate run — see the "Standing facts" entry below and
-`docs/BACKLOG.md` item 2. The other ranked directions, each with the
+`docs/BACKLOG.md` item 2.
+
+Also on that branch and in the same `2.11.0` flag day: **time and timers,
+plan 1** (spec
+`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`, plan
+`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md`, T0–T14 all
+done) — leader-stamped log time and a deterministic scheduler. Requested by
+the maintainer 2026-09-02, not a ranked backlog item. **Plan 2 (the
+replicated schedule table, spec §5) is NOT built** and is the next item under
+this feature (`docs/BACKLOG.md` item 2a). Explainer
+`docs/notes/uc2-log-time-and-timers-explained.md`; gate skeleton
+`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars pre-committed,
+no run; its row d is an isolated `apply_bench` A/B, because unlike identity
+this work does touch two hot loops). The other ranked directions, each with the
 doc that first recorded it, are in `docs/BACKLOG.md` (update its line when
 an item is taken up or dropped). `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the
@@ -122,25 +136,58 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   ones; upgrade all nodes together. The client↔gateway remote protocol is
   separate and stays v1. What is API vs. what is flag-day:
   `docs/reference/semver-policy.md`.
-- **FSM identity is implemented on branch `uc2/fsm-identity`, not yet
+- **`2.11.0` is implemented on branch `uc2/fsm-identity` and not yet
   released** — the facts above (wire `0.6.0`, cnc `3.0`) still describe
-  what is actually shipped. On the branch: wire `0.7.0` (`SNAP_BEGIN`
-  carries per-row identity hashes + versions, compared positionally,
-  refused by name — replaces the `services_declared` bitmask); cnc `3.1`
-  (slot line 7 = row name + hash, node-written at boot; status line word 1
-  = the attached service's packed version); `[services] names` (not
-  `ids`) is **required** in `node.toml` — the same explicit-choice posture
-  `[crypto]`/`[admin]` have had since 2.6.0, and `ids` is refused by name
-  pointing at `names`; identity lives **in code**, a required `const NAME`
-  (+ optional `const VERSION`) on the state-machine trait, not in
-  deployment config; the apply signature is now `apply(&mut self, ctx:
-  &mut ApplyCtx, cmd, out)` (`ApplyCtx` is `#[non_exhaustive]`, carries
-  `position` + the FSM's identity, and is the seam the parallel
-  timestamps/scheduler design will extend rather than break again). See
-  the "Next up" paragraph above,
-  `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`, and
-  `docs/reference/semver-policy.md`'s FSM-identity carve-out (ships as the
-  next minor, `2.11.0`, not `3.0.0`, per the maintainer's decision).
+  what is actually shipped. **Two features, one flag day** on the branch:
+  wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`.
+  - **FSM identity.** `SNAP_BEGIN` carries per-row identity hashes +
+    versions, compared positionally, refused by name (replaces the
+    `services_declared` bitmask); cnc slot line 7 = row name + hash,
+    node-written at boot, and status line word 1 = the attached service's
+    packed version; `[services] names` (not `ids`) is **required** in
+    `node.toml` — the same explicit-choice posture `[crypto]`/`[admin]`
+    have had since 2.6.0, and `ids` is refused by name pointing at
+    `names`; identity lives **in code**, a required `const NAME` (+
+    optional `const VERSION`) on the state-machine trait, not in
+    deployment config; the apply signature is now `apply(&mut self, ctx:
+    &mut ApplyCtx, cmd, out)`.
+  - **Log time and timers (plan 1).** The 32-byte frame header is
+    **relaid**: `client_id: u32` @12, `seq: u32` @16, `time_ns: u64` @24
+    (the two `u64` id fields were only ever half-filled, which paid for the
+    stamp; header size and the payload ceiling are unchanged). The leader
+    reads its clock **once per pass** and stamps every frame
+    `max(now, last)` inside `uc_log::Appender`, so the log's time never
+    goes backwards; `ctx.time_ns` is the FSM's deterministic "now" and
+    `query` gets none. `FRAME_TYPE_TIMER = 5` (24-byte body
+    `identity_hash ‖ timer_id ‖ deadline_ns`) is the **first per-FSM frame
+    in a broadcast log**: delivered only to the FSM whose hash it names,
+    skipped by every other apply loop but still counted as a yielded frame
+    for lag/lockstep. Due timers are fired **before** the pass's client
+    frames, stamped with the deadline, bounded by `TIMERS_PER_PASS = 64`
+    (at the bound the pass appends no client frames at all). Node layer is
+    **at-least-once** (in-flight instances re-armed on `BecomeFollower` and
+    `halt`); `uc_service::Timed<S>` makes delivery exactly-once from the
+    log-derived pending set. New SDK surface, all additive:
+    `ApplyCtx::{time_ns, term, schedule, cancel, timers}`, a **provided**
+    `on_timer(&mut self, ctx, ev)` on both tiers, `TimerEvent::late(ctx)`.
+    Two more cnc words in the same page version: `log_time_ns` at page 1
+    offset `4048` (archive-agent-written, never lowered — a new leader seeds
+    its clamp from it) and per-row `timers_pending` at slot line 7 `+488`
+    (consensus-agent-written each pass). One new per-row IPC ring,
+    `svc_sched.<row>.ring` (SPSC, service → node, 1 MiB, `MSG_V2_SCHED`),
+    the first per-row ring the **node consumes**; it takes the per-row
+    reservation from 5 to 6 MiB. Only `timer_late` and `timers_rearmed` are
+    logged (no per-fire record: `uc_obs` has no Debug level and a `stderr`
+    write per timer on the consensus agent was rejected).
+  - **The relayout is the sharper half of this flag day.** Every prior wire
+    bump was caught by a length check, so a mixed cluster stalled. A relaid
+    header is the *same length*: a `0.6.0` peer's frames parse and mean
+    something different. Stop every node before starting any node.
+  - See the "Next up" paragraph above,
+    `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`,
+    `docs/notes/uc2-log-time-and-timers-explained.md`, and
+    `docs/reference/semver-policy.md`'s FSM-identity carve-out (ships as the
+    next minor, `2.11.0`, not `3.0.0`, per the maintainer's decision).
 - **Wire crypto is opt-in and OFF by default**, all-encrypted or
   all-cleartext per cluster (no mixed mode). Threat model: a network-path
   adversary; out of model: a compromised host or a malicious member — the
@@ -179,6 +226,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 - **Instance dirs reserve ~78 MiB at boot** (the IPC backing files are
   fallocated, not sparse, so a full disk is a named startup refusal instead
   of a SIGBUS mid-run); a node that cannot reserve it refuses to start.
+  ~79 MiB on the unreleased `2.11.0` branch, where `svc_sched.<row>.ring`
+  takes the per-row cost from 5 to 6 MiB.
 - **M13 mechanics worth knowing**: the MPSC ingress ring commits per record
   (ring magic `ULTRNG2` — a same-host restart re-initialises the ring; a
   dead producer's hole is skipped and counted, cnc offsets 3968/3976);
@@ -209,7 +258,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
-  15 fuzz targets, Miri (pure decoders + `uc_remote`'s
+  15 fuzz targets (17 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and

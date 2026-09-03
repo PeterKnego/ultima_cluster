@@ -294,16 +294,19 @@ All of it, from [`examples/counter/src/lib.rs`](/examples/counter/src/lib.rs):
 
 ```rust
 impl StateMachine for CounterSm {
+    const NAME: &'static str = "counter";
+
     type Command = Command;
     type Response = Applied;
     type Query = Query;
     type QueryResponse = QueryResponse;
 
-    fn apply(&mut self, position: u64, cmd: Command) -> Applied {
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Command) -> Applied {
         match cmd {
             Command::Add(n) => self.value = self.value.wrapping_add(n),
             Command::Reset => self.value = 0,
         }
+        let position = ctx.position;
         self.last_applied = Some(position);
         Applied { value: self.value, position }
     }
@@ -329,6 +332,16 @@ command, same result on every node forever — and plain `+` would panic on
 overflow in debug while wrapping in release, so two replicas built differently
 would diverge. See
 [the apply contract](/docs/ARCHITECTURE.md#the-apply-path-and-the-sdk).
+
+`ctx` carries more than the position. `ctx.time_ns` is the leader's timestamp
+on this frame, the deterministic substitute for a clock a state machine may not
+read; `ctx.ids()` mints deterministic IDs; `ctx.schedule(id, at_ns)` asks for a
+callback into a provided `on_timer(&mut self, ctx, ev)`, which `CounterSm` does
+not implement because it does not need one. All three arrived with `2.11.0`
+(pending) — see
+[Log time and timers, explained](/docs/notes/uc2-log-time-and-timers-explained.md)
+and
+[the FSM identity explainer](/docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md).
 
 `StateMachine` is the *typed* tier: the framework does one bincode decode per
 command and one encode per response for you. The other tier,

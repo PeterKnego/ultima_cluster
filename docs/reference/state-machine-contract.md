@@ -32,47 +32,119 @@ blanket impl makes it also `RawStateMachine`.
 /// `apply` the committed frame payload exactly as it sits in the log buffer
 /// and reuses `out` across calls — no decode, no allocation in steady state.
 pub trait RawStateMachine: Send + 'static {
-    /// Apply the committed command at `position` (the absolute log byte
+    /// The FSM's identity, declared in code (FSM identity, 2.11 pending).
+    const NAME: &'static str;
+    /// Packed semantic version of this FSM's logic; `0` = unversioned.
+    const VERSION: u32 = 0;
+    /// Provided, derived from the two above.
+    const IDENTITY: FsmIdentity = FsmIdentity::parse(Self::NAME, Self::VERSION);
+
+    /// Apply the committed command at `ctx.position` (the absolute log byte
     /// offset, the idempotency key). Write the response bytes into `out`
     /// (cleared by the caller). Deterministic, sync, no I/O.
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>);
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>);
     /// Answer a read. `out` is cleared by the caller.
     fn query(&self, q: &[u8], out: &mut Vec<u8>);
     /// Highest position applied so far (`None` before the first).
     fn last_applied(&self) -> Option<u64>;
+
+    /// A timer this FSM scheduled has reached its position on the log.
+    /// PROVIDED, default no-op (log time and timers, 2.11 pending).
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {}
+    /// Framework hook: the pending instances a wrapper holds, re-announced
+    /// to the node after attach and after replay. PROVIDED, default empty.
+    fn pending_timers(&self) -> Vec<(u64, u64)> { Vec::new() }
 }
 ```
 
 ```rust
 /// The user's deterministic business logic, typed.
 pub trait StateMachine: Send + 'static {
+    const NAME: &'static str;
+    const VERSION: u32 = 0;
+
     type Command: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
     type Response: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
     type Query: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
     type QueryResponse: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
 
-    fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response;
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Self::Command) -> Self::Response;
     fn query(&self, q: Self::Query) -> Self::QueryResponse;
     fn last_applied(&self) -> Option<u64>;
+
+    /// PROVIDED, default no-op.
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {}
 }
 ```
 
-Both are sync, deterministic, no I/O, no clock, no randomness — non-negotiable
-for state-machine-replication correctness, and the reason neither signature
-takes `async` or a context handle.
+Both are sync, deterministic, no I/O, **no host clock**, no randomness —
+non-negotiable for state-machine-replication correctness, and the reason
+neither signature takes `async`.
+
+## `ApplyCtx`: position, time, term, identity
+
+`apply` receives `&mut ApplyCtx` rather than a bare `position: u64` (FSM
+identity, 2.11 pending). It is `#[non_exhaustive]`, built once per frame by
+the apply loop, by journal replay and by snapshot tail-replay, and it carries:
+
+| item | what it is |
+|---|---|
+| `ctx.position: u64` | the frame's absolute byte position — the idempotency key, exactly what `position` used to be |
+| `ctx.time_ns: u64` | **the leader's stamp on this frame**: ns since the Unix epoch, non-decreasing along the log, identical on every replica. This is your `now()` (log time and timers, 2.11 pending) |
+| `ctx.term: u32` | the frame's `leadership_term_id` |
+| `ctx.ids()` | an `IdGen` for this apply call: deterministic IDs from `(position, identity, an ordinal that resets every call)` |
+| `ctx.schedule(id, at_ns)` / `ctx.cancel(id)` | ask for / withdraw a timer (log time and timers) |
+
+`ApplyCtx::for_sm::<MySm>(position)` builds one in your own unit tests, with
+`.with_time(..)` and `.with_term(..)` as builders.
+
+**`query` gets no context**, so it has neither time nor `IdGen`: a read has no
+position that means the same thing on every replica, and time is no better
+defined there than position is.
+
+## Timers: `on_timer` and `Timed<S>`
+
+`on_timer` is a **provided** method on both tiers with a no-op default, so an
+existing state machine compiles and behaves exactly as before. Implement it
+to receive the timers your `apply` scheduled:
+
+```rust
+fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+    // ev.id is the id you passed to ctx.schedule; ev.deadline_ns is what you asked for.
+    // ctx.time_ns is the frame's stamp: equal to the deadline unless ev.late(ctx).
+    if ev.late(ctx) { /* fired after a leader change, or scheduled in the past */ }
+    self.last_applied = Some(ctx.position);   // advance it exactly as in `apply`
+}
+```
+
+The node fires timers **at least once**: an instance in flight when a leader
+loses leadership is re-armed and may fire again. `uc_service::Timed<S>` wraps
+either tier and makes delivery **exactly once** per scheduled instance, by
+keeping the pending set that your own `schedule`/`cancel` calls implied and
+dropping any frame that is no longer pending. It composes with `Sessioned`
+(`Timed<Sessioned<S>>`), forwards `NAME`/`VERSION`, and carries its maps in
+the snapshot artifact ahead of the inner state machine's. Running without it
+is the same trade as running without `Sessioned`: correct under a contract you
+have to honour, weaker.
+
+Full semantics, the ordering guarantee, and the failure-mode table:
+[Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
 
 ## The blanket adapter and the byte-identity promise
 
 ```rust
 impl<S: StateMachine> RawStateMachine for S {
-    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+    const NAME: &'static str = S::NAME;
+    const VERSION: u32 = S::VERSION;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
         let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
             .expect("corrupt committed frame (fail-stop)");
-        let resp = StateMachine::apply(self, position, cmd);
+        let resp = StateMachine::apply(self, ctx, cmd);
         bincode::serde::encode_into_std_write(&resp, out, bincode::config::standard())
             .expect("response bincode-encode (fail-stop)");
     }
-    // query, last_applied: same shape
+    // query, last_applied, on_timer: same shape (on_timer forwards straight through)
 }
 ```
 

@@ -11,16 +11,20 @@ self-locating header is in [Architecture](../ARCHITECTURE.md).
 | Constant | Value |
 |---|---|
 | `version::CURRENT` | `0.7.0` |
-| cnc page version | 3.1 (FSM identity, 2.11 pending: the name + hash line at boot, the version word at attach) |
+| cnc page version | 3.1 (FSM identity + log time, 2.11 pending: the name + hash line at boot, the version word at attach, `log_time_ns`, per-row `timers_pending`) |
 
 The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
-(the once-reserved slot line 7); the UDP datagram format moved to 0.7.0 in
-the FSM identity work, when `SNAP_BEGIN` swapped its `services_declared`
-bitmask for a per-row identity-hash array plus a per-row version array —
-every other datagram is byte-identical to 0.6.0. `CURRENT` is documentary
-and is not itself checked on any receive path (see `version.rs`); the two
-version lines remain independent of each other.
+(the once-reserved slot line 7, plus two previously-unused words —
+`log_time_ns` and the per-row `timers_pending`). The UDP datagram format
+moved to 0.7.0 for **two** changes shipping on the same unreleased `2.11.0`
+flag day: `SNAP_BEGIN` swapped its `services_declared` bitmask for a per-row
+identity-hash array plus a per-row version array (FSM identity), and the log
+frame header was **relaid** to carry a leader-written `time_ns` stamp, with a
+new `TIMER` frame type beside it (log time and timers). Every other datagram
+is byte-identical to 0.6.0. `CURRENT` is documentary and is not itself checked
+on any receive path (see `version.rs`); the two version lines remain
+independent of each other.
 
 `app_id`, `instance_id`, and the protocol version are checked at every IPC
 entry point. A mismatched `app_id` means the wrong cluster; a changed
@@ -131,12 +135,68 @@ their own protection.
 Frame lengths are aligned up to `FRAME_ALIGNMENT`. Frames never span the buffer
 wrap; padding fills exactly to it.
 
+### Header (wire 0.7.0, relaid for `time_ns`)
+
+| Offset | Field | Width | Notes |
+|---|---|---|---|
+| 0 | `length` | u32 LE | the commit word: total frame length (header + payload), written LAST with a release store; `0` = not yet committed |
+| 4 | `type` | u8 | see the type table below |
+| 5 | `flags` | u8 | `FLAG_TIMER_TABLE = 0x01` on a `TIMER` frame (reserved for the plan-2 schedule table); zero on every other type today |
+| 6 | reserved | u16 | written as zero |
+| 8 | `leadership_term_id` | u32 LE | |
+| 12 | `client_id` | u32 LE | the submitting client; `0` for node-originated frames |
+| 16 | `seq` | u32 LE | that client's local sequence; `0` for node-originated frames |
+| 20 | reserved | u32 | written as zero |
+| 24 | `time_ns` | u64 LE | **the leader's stamp**: ns since the Unix epoch, non-decreasing along the log |
+
+The header is still 32 bytes, and the payload ceiling is unchanged (1344 B
+crypto-off / 1312 B crypto-on). `2.11.0` **relaid** it rather than growing it:
+through `0.6.0` the two id fields were `session_id: u64` and
+`correlation_id: u64`, of which the client only ever filled 32 bits each, so
+narrowing them to `client_id: u32` + `seq: u32` freed exactly the 8 bytes
+`time_ns` needed. A `0.6.0` peer's frames therefore *parse* on a `0.7.0` node
+and mean something different, which is why the wire is a flag day: upgrade
+every node together ([Upgrade a cluster](../how-to/upgrade-a-cluster.md)).
+
+**The stamp rule.** The leader reads its wall clock **once per consensus
+pass** and writes `max(now, last_stamp)` into every frame it appends, whatever
+the type. The clamp lives in `uc_log::Appender`, so the log's time never goes
+backwards, and equal stamps are allowed (position, not time, is the order). A
+`TIMER` frame is stamped with its **deadline** instead, clamped the same way,
+so a timer whose deadline has already been passed by the log's clock carries
+`time_ns > deadline_ns` and is *late*. Followers, the archive and replay copy
+headers verbatim and never re-stamp. The archive agent carries the highest
+recorded stamp into the cnc page's `log_time_ns` word
+([cnc page](cnc-page.md#counters-and-status)), which is what a new leader
+seeds its clamp from.
+
 | Type | Name | Notes |
 |---|---|---|
 | 1 | `MESSAGE` | an application command |
 | 2 | `PADDING` | wrap padding; header-only on the wire, and its declared length is the full span it covers |
 | 3 | `NEW_TERM` | written by a leader when it opens a term; header-only, 32 B |
 | 4 | `CONFIG` | a cluster configuration record |
+| 5 | `TIMER` | **new in 0.7.0**: a scheduled timer the leader fired. 24-byte body, below |
+
+#### `TIMER` body (wire 0.7.0)
+
+`TIMER_BODY_LEN = 24`, three LE `u64`s, so the whole frame is 64 B after
+alignment. `client_id` and `seq` are `0`.
+
+| bytes | field | meaning |
+|---|---|---|
+| 0..8 | `identity_hash` | the FNV-1a 64 of the owning FSM's declared name (see [`SNAP_BEGIN`](#snap_begin-body-wire-070-fsm-identity) for the same hash on the snapshot path) |
+| 8..16 | `timer_id` | the FSM's own id for this timer |
+| 16..24 | `deadline_ns` | what was asked for; compare against the header's `time_ns` for lateness |
+
+This is the **first per-FSM frame** in a broadcast log. Every declared FSM
+applies every `MESSAGE` frame; a `TIMER` frame is delivered only to the FSM
+whose `identity_hash` it names, and every other row's apply loop skips it
+while still counting it as a yielded frame for lag and lockstep accounting.
+The body is id-only by design: there is no payload, and an FSM keeps whatever
+context a timer needs in its own state, keyed by `timer_id`. Semantics,
+delivery and the ordering guarantee:
+[Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
 
 Per-record framing uses an atomic-after-write length prefix: a reader that sees
 length `0` has found a record that is not yet committed. A non-zero length below

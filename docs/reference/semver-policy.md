@@ -84,6 +84,19 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   The metric series contract is not itself in the promised-surface table —
   `uc_node::obs` is listed as not promised — but it is treated as an
   operator interface in practice: families are added, not renamed.
+- **Log time and timers (2.11 pending) add to `uc_service` additively**, on
+  top of FSM identity's already-breaking trait change: `ApplyCtx` gains
+  `time_ns` and `term` (it is `#[non_exhaustive]` for exactly this) plus
+  `schedule`/`cancel`/`timers`; `TimerReq` and `TimerEvent` are new types; a
+  **provided** `on_timer(&mut self, ctx, ev)` and a provided
+  `pending_timers()` land on both `RawStateMachine` and `StateMachine`, so
+  every existing implementor compiles unchanged; `uc_service::Timed<S>` is a
+  new wrapper alongside `Sessioned<S>`. Nothing was renamed or removed. New
+  metric families (`uc2_timers_{pending,fired_total,late_total,rearmed_total}`,
+  `uc2_log_time_ns`, `uc2_log_time_lag_seconds`), one new alert rule
+  (`Uc2LogTimeFrozen`), two new `[log]` records (`timer_late`,
+  `timers_rearmed`) and two new `uc2ctl status` fields (`log_time_ns=`,
+  per-row `timers_pending=`) follow the same "added, not renamed" convention.
 
 The normative descriptions live where the surface does:
 [the state-machine contract](state-machine-contract.md),
@@ -119,7 +132,7 @@ API for downstream code. They may change in any release:
 
 | Crate | Not promised |
 |---|---|
-| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11 pending — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the flag-day rule below, not by semver. |
+| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`, `identity` (FSM identity, 2.11 pending — `FsmName`, `FsmIdentity`, `fnv1a_64`, packed version). It is the wire spec, governed by the flag-day rule below, not by semver. `2.11.0` also **relays `FrameHeader`** (`session_id`/`correlation_id: u64` become `client_id`/`seq: u32` plus `time_ns: u64`) and adds `FRAME_TYPE_TIMER`, `TimerBody`, `MSG_V2_SCHED` and `SchedRecord` — a breaking Rust change on an unpromised item, and a flag day on the wire. |
 | `uc_log` | `agent`, `archive`, `buffer`, `cnc`, `counters`, `reader`, `region`, `state`, `writer` |
 | `uc_consensus` | `commit`, `config`, `election`, `reconcile` |
 | `uc_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender`. **`2.8.0` changed these signatures, in a minor release** — see the note below. |
@@ -177,13 +190,25 @@ cluster stalls commits rather than making unsound ones. The procedure is
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md); it applies whether or
 not the crate version's major digit moved.
 
-**FSM identity (2.11 pending) is the latest flag day on both lines**: wire
-`0.6.0` → `0.7.0` (`SNAP_BEGIN`'s bitmask becomes a per-row identity-hash
-array plus a per-row version array — a 0.6.0 sender's shorter body is
-dropped by length, the same as every prior bump) and cnc `3.0` → `3.1` (the
-once-reserved slot line 7 becomes node-written at boot: name + hash). Bundled
-as one combined flag day, per the standing rule that a cnc layout change is a
-flag day regardless of the digit.
+**The pending `2.11.0` is the latest flag day on both lines**, and it carries
+**two** features at once: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`,
+bundled as one combined flag day per the standing rule that a cnc layout
+change is a flag day regardless of the digit.
+
+- **FSM identity** — `SNAP_BEGIN`'s bitmask becomes a per-row identity-hash
+  array plus a per-row version array (a 0.6.0 sender's shorter body is dropped
+  by length, the same as every prior bump); the once-reserved cnc slot line 7
+  becomes node-written at boot (name + hash).
+- **Log time and timers** — the 32-byte log frame header is **relaid**:
+  `session_id: u64` and `correlation_id: u64`, of which the client filled only
+  32 bits each, become `client_id: u32` + `seq: u32`, freeing 8 bytes for a
+  leader-written `time_ns: u64` stamp. A new frame type (`TIMER = 5`) rides
+  along, plus two cnc words (`log_time_ns` at page 1 offset 4048, and per-row
+  `timers_pending` at slot line 7 `+488`) and one new per-row IPC ring
+  (`svc_sched.<row>.ring`). The relayout is the sharper half of this flag day:
+  a `0.6.0` peer's frames still *parse* on a `0.7.0` node and mean something
+  different, so mixing versions is not merely unsupported, it is unsound.
+  Upgrade every node together.
 
 ## The one-way door: one tier per type
 

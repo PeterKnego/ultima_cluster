@@ -103,7 +103,12 @@ writer ⇒ plain stores + one release-store commit; no atomics beyond the commit
 
 **Frame format** (`uc_protocol` v2, no_std): 32 B header — `length` (atomic-after-write
 commit word; v1 discipline), type/flags, `leadership_term_id`, `session_id`,
-`correlation_id` — then payload, 32-byte aligned. Position implicit from offset. Padding
+`correlation_id` — then payload, 32-byte aligned.
+*(As-built erratum 2026-09-03, wire 0.7.0: still 32 B, but the two `u64` id
+fields were only ever half-filled and were **relaid** into `client_id: u32`,
+`seq: u32`, 4 reserved bytes, and `time_ns: u64` — the leader's stamp. See
+`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` §3.1 and
+`docs/reference/wire-protocol.md`, which is the current layout of record.)* Position implicit from offset. Padding
 frames absorb the wrap; no frame straddles the buffer end. No CRC in the buffer
 (single-host memory); CRC is per journal block.
 
@@ -233,7 +238,9 @@ no per-entry handoff.
 - A lagging service degrades to direct read-only journal replay (shared instance dir)
   and rejoins the live buffer when caught up — same mechanism as reconstruction.
 
-**Responses bypass the node.** Client stamps `(session_id, correlation_id)`; consensus
+**Responses bypass the node.** Client stamps `(session_id, correlation_id)` — as
+built since wire 0.7.0, `(client_id, seq)`, the same two 32-bit values under
+their real names; consensus
 carries them in the frame header; the service echoes them + position onto the **egress
 broadcast ring** directly (leader-only; follower offers are no-ops). No per-message
 oneshots; the client matcher correlates off the ring.
