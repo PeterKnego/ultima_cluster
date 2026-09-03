@@ -50,6 +50,7 @@ pub use uc_obs::obs_event;
 pub mod preflight;
 mod read_round;
 pub mod recovery;
+mod schedule_state;
 pub mod services;
 pub(crate) mod timers;
 
@@ -58,7 +59,16 @@ pub use ipc::{InstanceDir, IpcError};
 pub use node::{
     DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy,
     REASON_AUDIT_FAILED, REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED, REASON_AUTH_MISSING,
-    REASON_AUTH_UNKNOWN_KEY, StartOpts, SubmitError,
+    REASON_AUTH_UNKNOWN_KEY, REASON_SCHEDULE_DECODE, REASON_SCHEDULE_DIGEST,
+    REASON_SCHEDULE_MISSING, REASON_SCHEDULE_UNKNOWN_FSM, StartOpts, SubmitError,
+};
+/// Time-and-timers plan 2 (spec §5): the durable schedule-table record, the
+/// staged-file name, and the digest. Re-exported because `uc2ctl` must stage
+/// the file the node reads, compute the SAME digest over it, and read the
+/// record back for `schedule show` — two implementations of that digest
+/// would make every apply refuse with [`REASON_SCHEDULE_DIGEST`].
+pub use schedule_state::{
+    SCHEDULE_PENDING_FILE, SCHEDULE_STATE_FILE, ScheduleRecord, schedule_digest,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

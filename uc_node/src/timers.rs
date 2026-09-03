@@ -20,11 +20,6 @@ use uc_protocol::v2::schedule::ScheduleRule;
 /// occurrence and stays keyed by `id` in `RowTimers::table`. `next == None`
 /// means parked: a `Once` rule already delivered, holding no deadline and
 /// not counted as pending.
-///
-/// `Consumed by: Task 4` (plan 2) — nothing outside `mod tests` builds or
-/// adopts a table yet, so the whole-table API below is allowed dead code
-/// until then, same as `in_flight_len` further down.
-#[allow(dead_code)]
 struct TableEntry {
     rule: ScheduleRule,
     next: Option<u64>,
@@ -82,7 +77,6 @@ impl RowTimers {
     /// kept id keeps its `last_delivered`. Every entry's `next` is
     /// (re)computed via `rule.arm(last_delivered, log_time_ns)` (spec §5
     /// one-tick catch-up) and pushed if `Some`.
-    #[allow(dead_code)]
     pub fn adopt_table(&mut self, entries: &[(u64, ScheduleRule)], log_time_ns: u64) {
         let mut new_table = HashMap::with_capacity(entries.len());
         for &(id, rule) in entries {
@@ -106,7 +100,6 @@ impl RowTimers {
     /// next occurrence, or parks (`next = None`) when nothing follows (a
     /// `Once` already fired). Never touches `in_flight` — a table tick is
     /// never in flight.
-    #[allow(dead_code)]
     pub fn table_fired(&mut self, id: u64, deadline_ns: u64) {
         if let Some(e) = self.table.get_mut(&id)
             && e.next == Some(deadline_ns)
@@ -120,7 +113,6 @@ impl RowTimers {
     /// From the service's `TableConsumed` (follower path, and the
     /// post-attach announce): raises `last_delivered` monotonically, and
     /// advances `next` past `deadline_ns` if it hadn't already.
-    #[allow(dead_code)]
     pub fn table_delivered(&mut self, id: u64, deadline_ns: u64) {
         if let Some(e) = self.table.get_mut(&id) {
             e.last_delivered = Some(e.last_delivered.map_or(deadline_ns, |l| l.max(deadline_ns)));
@@ -181,7 +173,6 @@ impl RowTimers {
         self.pending.len() + self.table.values().filter(|e| e.next.is_some()).count()
     }
     /// Every table entry, parked ones included.
-    #[allow(dead_code)]
     pub fn table_len(&self) -> usize {
         self.table.len()
     }

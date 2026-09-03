@@ -49,6 +49,14 @@ pub struct ObsSources {
     /// Time-and-timers §6: per-row `fired`/`late`/`rearmed` counters, the
     /// SAME allocation the consensus agent bumps.
     pub timer_stats: Arc<crate::timers::TimerStats>,
+    /// Time-and-timers plan 2 (§6): the adopted schedule table's frame-END
+    /// position (0 = none) and its entry count, published by the consensus
+    /// agent when a table is adopted (at append, from the archive, or at
+    /// boot from `state/schedules.state`).
+    pub schedule_table_position: Arc<AtomicU64>,
+    pub schedule_entries: Arc<AtomicU64>,
+    /// Plan 2: `schedule apply` requests this node refused, for any reason.
+    pub schedule_apply_refused: Arc<AtomicU64>,
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
@@ -92,6 +100,9 @@ impl ObsSources {
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
+            schedule_table_position: Arc::new(AtomicU64::new(0)),
+            schedule_entries: Arc::new(AtomicU64::new(0)),
+            schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

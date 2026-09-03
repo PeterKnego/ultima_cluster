@@ -71,6 +71,10 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_timers_fired_total",
     "uc2_timers_late_total",
     "uc2_timers_rearmed_total",
+    // Plan 2 (spec §6): the replicated schedule table.
+    "uc2_schedule_table_position",
+    "uc2_schedule_entries",
+    "uc2_schedule_apply_refused_total",
     "uc_services_declared",
     "uc2_fsm_lag_bytes",
     "uc2_log_time_ns",
@@ -449,6 +453,24 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "counter",
         &rows,
         |r| r.rearmed,
+    );
+    push_gauge(
+        out,
+        "uc2_schedule_table_position",
+        "Frame-END position of the schedule table this node has ADOPTED (0 = none); identical on every node once caught up (time-and-timers spec §5). Alert: Uc2ScheduleTableDiverged.",
+        s.schedule_table_position.load(Ordering::Relaxed),
+    );
+    push_gauge(
+        out,
+        "uc2_schedule_entries",
+        "Entries in the adopted schedule table, armed across every declared row — a parked `once` (already delivered) still counts here, unlike uc2_timers_pending.",
+        s.schedule_entries.load(Ordering::Relaxed),
+    );
+    push_counter(
+        out,
+        "uc2_schedule_apply_refused_total",
+        "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). A retry answered to a follower is not counted.",
+        s.schedule_apply_refused.load(Ordering::Relaxed),
     );
     push_gauge(
         out,
@@ -1105,6 +1127,9 @@ mod tests {
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
+            schedule_table_position: Arc::new(AtomicU64::new(0)),
+            schedule_entries: Arc::new(AtomicU64::new(0)),
+            schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -1412,6 +1437,9 @@ mod tests {
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
+            schedule_table_position: Arc::new(AtomicU64::new(0)),
+            schedule_entries: Arc::new(AtomicU64::new(0)),
+            schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),

@@ -37,12 +37,12 @@ use uc_protocol::ring::{
     SpscProducer, SpscRing,
 };
 use uc_protocol::v2::cnc::{
-    CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
-    NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
+    ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER,
+    CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
-use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, TimerBody, align_frame_len};
+use uc_protocol::v2::frame::{FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, TimerBody, align_frame_len};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SCHED,
     MSG_V2_SVC_QUERY, SchedOp, client_from_extra, extra_client, read_sched_record,
@@ -52,7 +52,9 @@ use uc_protocol::v2::ipc::{
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
+use crate::schedule_state::{SCHEDULE_PENDING_FILE, ScheduleRecord, schedule_digest};
 use crate::services::ServicesConfig;
+use uc_journal::StableValue;
 use uc_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
@@ -63,6 +65,10 @@ use uc_protocol::v2::datagram::{
     RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN,
     VoteBody, write_config_proposal_body, write_config_reply_body, write_datagram_header,
     write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
+};
+use uc_protocol::v2::schedule::{
+    MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule, ScheduleTable,
+    decode_schedule_table, encode_schedule_table,
 };
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
@@ -325,6 +331,12 @@ const OUTPUT_PROGRESS_FLOOR_NS: u64 = 100_000_000;
 /// previously a deliberate reuse of 6/NotFound).
 const REASON_MALFORMED_OP: u32 = 11;
 
+/// Plan 2 (spec §5): the longest a staged schedule-table file can possibly
+/// be — a full 32-entry table. The node size-checks the file against this
+/// before reading it (the read happens on the consensus agent).
+const MAX_SCHEDULE_TABLE_BYTES: u64 =
+    (SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN) as u64;
+
 // ---- M14c: why the snapshot source DECLINED to open a session ------------
 // The source closure is called once per below-floor NAK, so a decline that
 // logged unconditionally would be a per-NAK log storm. These codes latch the
@@ -375,6 +387,31 @@ pub const REASON_AUTH_UNKNOWN_KEY: u32 = 23;
 /// assuming the change was rejected. The node also logs `admin_audit_failed`
 /// at `error` with the underlying io error.
 pub const REASON_AUDIT_FAILED: u32 = 24;
+
+// ---- Plan 2: `schedule apply` refusal reasons (time-and-timers §5) -------
+// Wire `reason` codes on a refused (`status = 1`) `ADMIN_OP_SCHEDULE_APPLY`.
+// Disjoint from the SM's `ProposeError` codes (1-10, 12), the node's own
+// `REASON_MALFORMED_OP` (11) and the auth band (20-24), so `uc2ctl` can name
+// exactly which of the four staged-file checks refused the apply.
+/// The staged file's digest does not match the `(id, ip, port)` triple the
+/// request carried (and, under `Hmac`, signed): the file changed between
+/// staging and applying, or a different file was staged than was signed.
+pub const REASON_SCHEDULE_DIGEST: u32 = 40;
+/// There is no `<instance_dir>/schedules.pending` to read — the request
+/// reached a node the file was never staged on (an admin request forwarded
+/// by a follower would be one way; the staged file is node-local), or it was
+/// already consumed by an earlier apply.
+pub const REASON_SCHEDULE_MISSING: u32 = 41;
+/// The staged bytes are not a decodable schedule table (`decode_schedule_table`
+/// is total and refuses a bad version, > 32 entries, a wrong length, an
+/// unknown rule kind, a zero period, an out-of-range time, or a duplicate
+/// `(fsm, id)` pair).
+pub const REASON_SCHEDULE_DECODE: u32 = 42;
+/// An entry names an `identity_hash` that is not one of THIS cluster's
+/// declared rows. Refused whole rather than partially adopted: a table with
+/// an unroutable entry is a typo'd or stale FSM name, and silently dropping
+/// that entry would leave the operator believing a timer is armed.
+pub const REASON_SCHEDULE_UNKNOWN_FSM: u32 = 43;
 
 /// Phase of an in-flight linearizable read (the ReadIndex barrier state
 /// machine, spec §7 / v1 task14).
@@ -474,6 +511,12 @@ pub struct Node {
     /// Time-and-timers §6: the consensus agent's per-row timer counters —
     /// the SAME `Arc` it bumps, handed on by `observability()`.
     timer_stats: Arc<crate::timers::TimerStats>,
+    /// Plan 2 (spec §6): the adopted table's frame-END position, its entry
+    /// count, and the refused-apply counter — the SAME `Arc`s the consensus
+    /// agent publishes into, handed on by `observability()`.
+    schedule_pos_pub: Arc<AtomicU64>,
+    schedule_entries_pub: Arc<AtomicU64>,
+    schedule_refused: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     /// Protocol 0.5.0: reports DECLINED because their content attestation
     /// (`durable_term`) disagreed with our own term map. Mirrored out of the
@@ -656,6 +699,10 @@ impl Node {
         // advance the floor) and exposed via `Node::archive_first_base` for tests.
         let archive_first_base = Arc::new(AtomicU64::new(archive.first_base()));
         let state = NodeState::open(&instance.state_dir()).map_err(to_io)?;
+        // Plan 2 (spec §5): the adopted schedule table, in its own rotating
+        // two-slot `StableValue` beside the consensus state files — see
+        // `crate::schedule_state` for why it is not a `NodeState` field.
+        let schedule_state = crate::schedule_state::open(&instance.state_dir()).map_err(to_io)?;
 
         // Recovery re-derivation (T4 carry 4): if the persisted term map does not
         // cover the durable journal frontier — a crash after the bytes fsynced
@@ -891,6 +938,11 @@ impl Node {
         // forwards here; the consensus agent decodes + feeds `Event::ConfigObserved`
         // (do_work step 1c). Same shape/rationale as `obs_tx`/`obs_rx` above.
         let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(1024);
+        // Plan 2 (spec §5): the same shape for durably-recorded SCHEDULE_TABLE
+        // frames, `(frame-END position, frame stamp, payload bytes)` — the
+        // archive detects them in the SAME header walk and
+        // `take_table_observations` forwards them here.
+        let (tbl_obs_tx, tbl_obs_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(1024);
         // Truncation command channel carries `(epoch, to)`; the ack rides an
         // infallible single slot (one truncation in flight — the SM latch).
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
@@ -1306,6 +1358,18 @@ impl Node {
                 }
                 did = true;
             }
+            // Plan 2 (spec §5): SCHEDULE_TABLE observations ride the same
+            // discipline for the same reason — a table frame is rarer than a
+            // config change (an operator action), observed exactly once on the
+            // recording pass, and a dropped observation would leave a FOLLOWER
+            // holding no table at all until its next restart. Blocking send;
+            // a send error means the receiver is gone (shutdown).
+            for obs in archive.take_table_observations() {
+                if tbl_obs_tx.send(obs).is_err() {
+                    break;
+                }
+                did = true;
+            }
             did
         })?;
 
@@ -1324,6 +1388,11 @@ impl Node {
         // Time-and-timers §6: the per-row timer counters, shared between the
         // consensus agent (the only writer) and `Node::observability`.
         let timer_stats = Arc::new(crate::timers::TimerStats::default());
+        // Plan 2 (spec §6): refused `schedule apply` requests, shared with
+        // `Node::observability` (`uc2_schedule_apply_refused_total`).
+        let schedule_refused = Arc::new(AtomicU64::new(0));
+        let schedule_pos_pub = Arc::new(AtomicU64::new(0));
+        let schedule_entries_pub = Arc::new(AtomicU64::new(0));
 
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
@@ -1383,6 +1452,13 @@ impl Node {
             net_rx,
             obs_rx,
             cfg_obs_rx,
+            tbl_obs_rx,
+            schedule_position: 0,
+            schedule_state,
+            schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
+            schedule_pos_pub: Arc::clone(&schedule_pos_pub),
+            schedule_entries_pub: Arc::clone(&schedule_entries_pub),
+            schedule_refused: Arc::clone(&schedule_refused),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -1449,6 +1525,13 @@ impl Node {
             crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
         };
+        // Plan 2 (spec §5): re-arm the persisted schedule table BEFORE the
+        // consensus agent starts. The log-time word is already seeded from the
+        // journal (step 3 above), no service has attached, and no election can
+        // have been won — so a node that restarts and immediately becomes
+        // leader fires the catch-up tick from the LOG's clock on its very
+        // first pass instead of going silent until an operator re-applies.
+        consensus.arm_schedule_at_boot();
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || {
                 consensus.do_work()
@@ -1467,6 +1550,9 @@ impl Node {
             truncations,
             wipes,
             timer_stats,
+            schedule_pos_pub,
+            schedule_entries_pub,
+            schedule_refused,
             reports_implausible,
             reports_unattested,
             archive_first_base,
@@ -1727,6 +1813,9 @@ impl Node {
             truncations: Arc::clone(&self.truncations),
             wipes: Arc::clone(&self.wipes),
             timer_stats: Arc::clone(&self.timer_stats),
+            schedule_table_position: Arc::clone(&self.schedule_pos_pub),
+            schedule_entries: Arc::clone(&self.schedule_entries_pub),
+            schedule_apply_refused: Arc::clone(&self.schedule_refused),
             reports_unattested: Arc::clone(&self.reports_unattested),
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
@@ -2032,6 +2121,47 @@ struct Consensus {
     /// scan, `(frame-END position, payload bytes)` — decoded + fed as
     /// `Event::ConfigObserved` in `do_work` step 1c.
     cfg_obs_rx: mpsc::Receiver<(u64, Vec<u8>)>,
+    /// Plan 2 (spec §5): durably-recorded SCHEDULE_TABLE observations from the
+    /// SAME archive scan, `(frame-END position, frame stamp, payload bytes)`
+    /// — the follower / boot-recovery half of table adoption, drained in
+    /// `do_work` step 1c'. The CONFIG channel's exact twin, including its
+    /// blocking-send losslessness argument.
+    tbl_obs_rx: mpsc::Receiver<(u64, u64, Vec<u8>)>,
+    /// Plan 2: frame-END position of the newest table this node has adopted
+    /// (0 = none). The idempotency key — the leader adopts at append and the
+    /// archive re-observes the same frame later, so adoption must be a no-op
+    /// at or below this.
+    ///
+    /// Known narrow gap (reported with this task, not fixed here): a table
+    /// frame appended by a leader that loses leadership before the frame
+    /// replicates is truncated, and this node keeps a position no committed
+    /// frame supports. A NEXT table frame whose END lands at or below it
+    /// would then be ignored on this node alone (the
+    /// `Uc2ScheduleTableDiverged` alert is what would catch it). Any traffic
+    /// at all moves positions past the stale value within milliseconds, so
+    /// the window is an apply landing immediately after a truncation on an
+    /// otherwise idle cluster.
+    schedule_position: u64,
+    /// Plan 2: `state/schedules.state` — the newest adopted table, so a
+    /// restarted node re-arms its heaps before the log replays anything.
+    /// Its own `StableValue` rather than a `NodeState` field: optional,
+    /// node-local, irrelevant to consensus safety (see
+    /// [`crate::schedule_state`]).
+    schedule_state: StableValue<ScheduleRecord>,
+    /// Plan 2: `<instance_dir>/schedules.pending` — the file an admin client
+    /// stages and this node reads back under `ADMIN_OP_SCHEDULE_APPLY`. Held
+    /// as a path because `Consensus` never sees the `InstanceDir` itself
+    /// (`Node` owns the flock for the process's life).
+    schedule_pending: PathBuf,
+    /// Plan 2 (spec §6): the `/metrics` mirrors of `schedule_position` and
+    /// the adopted entry count, published on adoption (rare) so the exporter
+    /// thread never reaches into this agent's state. `uc2_schedule_table_position`
+    /// / `uc2_schedule_entries`.
+    schedule_pos_pub: Arc<AtomicU64>,
+    schedule_entries_pub: Arc<AtomicU64>,
+    /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
+    /// whatever the reason. Shared with `Node::observability`.
+    schedule_refused: Arc<AtomicU64>,
     ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
@@ -2428,6 +2558,28 @@ impl Consensus {
                 );
             }
             self.feed(Event::ConfigObserved { position, config });
+            did = true;
+        }
+
+        // 1c'. Drain durably-recorded SCHEDULE_TABLE observations (plan 2,
+        // spec §5) — the follower / boot-recovery half of table adoption,
+        // exactly as 1c is for CONFIG. The leader adopted at append; this is
+        // how everyone else learns, and how the leader harmlessly
+        // re-confirms (adoption is idempotent by position). Same
+        // implausibility skip as above: a durably-recorded frame's END can
+        // never exceed the durable counter, so a violation is a recorder bug
+        // and adopting it would park `schedule_position` above durable.
+        while let Ok((position, time_ns, payload)) = self.tbl_obs_rx.try_recv() {
+            let durable = self.cnc.counters().durable.load_acquire();
+            if position > durable {
+                eprintln!(
+                    "node {}: ignoring implausible ScheduleTableObserved at {position} (durable {durable})",
+                    self.id
+                );
+                did = true;
+                continue;
+            }
+            self.adopt_table_frame(position, time_ns, &payload);
             did = true;
         }
 
@@ -3637,11 +3789,15 @@ impl Consensus {
                                 SchedOp::Schedule => t.schedule(r.timer_id, r.deadline_ns),
                                 SchedOp::Cancel => t.cancel(r.timer_id),
                                 SchedOp::Consumed => t.consumed(r.timer_id, r.deadline_ns),
-                                // Plan 2 (schedule table): no producer writes
-                                // this op on `svc_sched` yet — the table-tick
-                                // pending set is a later task. Exhaustive
-                                // match only; not reachable today.
-                                SchedOp::TableConsumed => {}
+                                // Plan 2 (spec §5): the service reporting
+                                // which table tick it has DELIVERED. Raises
+                                // `last_delivered` monotonically and advances
+                                // `next` past it — the follower's only way to
+                                // learn a tick happened, and the leader's
+                                // confirmation.
+                                SchedOp::TableConsumed => {
+                                    t.table_delivered(r.timer_id, r.deadline_ns)
+                                }
                             }
                         }
                     }
@@ -3682,21 +3838,17 @@ impl Consensus {
         for _ in 0..TIMERS_PER_PASS {
             // earliest due instance across all rows — global deadline order,
             // so two rows' timers never clamp each other into "late"
-            let mut best: Option<(usize, u64, u64)> = None; // (row, id, deadline)
+            // (row, id, deadline, is_table_entry)
+            let mut best: Option<(usize, u64, u64, bool)> = None;
             for (row, slot) in self.timers.iter_mut().enumerate() {
                 if let Some(t) = slot
                     && let Some((id, dl, table)) = t.peek_due(now)
+                    && best.is_none_or(|(_, _, bdl, _)| dl < bdl)
                 {
-                    if table {
-                        // Task 4 (plan 2) fires table heads with FLAG_TIMER_TABLE.
-                        continue;
-                    }
-                    if best.is_none_or(|(_, _, bdl)| dl < bdl) {
-                        best = Some((row, id, dl));
-                    }
+                    best = Some((row, id, dl, table));
                 }
             }
-            let Some((row, id, dl)) = best else {
+            let Some((row, id, dl, table)) = best else {
                 hold = false;
                 break;
             };
@@ -3709,9 +3861,20 @@ impl Consensus {
                 timer_id: id,
                 deadline_ns: dl,
             };
-            match app.append_timer(&body, 0) {
+            // Plan 2 (spec §5): a table tick is flagged on the wire so the
+            // service can tell it from a programmatic one (`Timed<S>` keys
+            // its exactly-once pending set differently for the two), and it
+            // ADVANCES the entry instead of going in flight — a table entry
+            // is never re-armed on a leadership loss, it is simply recomputed
+            // from the rule.
+            let flags = if table { FLAG_TIMER_TABLE } else { 0 };
+            match app.append_timer(&body, flags) {
                 Ok((position, stamp)) => {
-                    t.take_in_flight(id, dl);
+                    if table {
+                        t.table_fired(id, dl);
+                    } else {
+                        t.take_in_flight(id, dl);
+                    }
                     did = true;
                     self.timer_stats.fired[row].fetch_add(1, Ordering::Relaxed);
                     // ONLY the late case gets a line. A per-fire record on the
@@ -3884,6 +4047,158 @@ impl Consensus {
             config: new_cfg.clone(),
         });
         Ok(position)
+    }
+
+    /// Plan 2 (spec §5) leader append path: encode `table` as a
+    /// `FRAME_TYPE_SCHEDULE_TABLE` payload, append it via the leader
+    /// appender, and adopt-at-append — the archive re-observes the same
+    /// durable frame later (`do_work` step 1c'), a harmless no-op
+    /// re-adoption (idempotent by position). Returns the frame-END position,
+    /// which is the admin reply's `version` field.
+    ///
+    /// The appender's `last_stamp()` after a successful append IS this
+    /// frame's stamp (`append_schedule_table` clamps `max(now, last)` and
+    /// stores it), so the rows arm from the log's clock at the frame, not
+    /// from a second wall-clock reading.
+    ///
+    /// On `Err` nothing was appended and nothing adopted, so the caller may
+    /// retry the whole request — the same argument `append_config_frame`'s
+    /// caller relies on.
+    fn append_schedule_table_frame(&mut self, table: &ScheduleTable) -> Result<u64, AppendError> {
+        let term = self.sm.current_term();
+        let mut bytes = Vec::new();
+        encode_schedule_table(table, &mut bytes);
+        let (position, stamp) = {
+            let app = self
+                .appender
+                .as_mut()
+                .expect("append_schedule_table_frame is leader-only");
+            let position = app.append_schedule_table(term, &bytes)?;
+            (position, app.last_stamp())
+        };
+        self.adopt_table_frame(position, stamp, &bytes);
+        Ok(position)
+    }
+
+    /// Plan 2 (spec §5): adopt the table carried by the frame ending at
+    /// `position`, stamped `time_ns`. Called from three places — the leader's
+    /// own append (above), the archive's observation of the durable frame
+    /// (`do_work` step 1c'), and nothing else; boot goes through
+    /// [`Self::arm_schedule_at_boot`], which arms from the LOG's clock rather
+    /// than a historical frame stamp.
+    ///
+    /// A decode failure is fail-stop, exactly as for CONFIG: the archive's
+    /// block is journal-CRC-covered and the bytes were decodable when they
+    /// were appended, so a malformed payload here is a BUG.
+    ///
+    /// Persist-before-effect: the record is durable before the heaps change,
+    /// so a crash in the window recovers a node whose armed set matches its
+    /// recorded position.
+    fn adopt_table_frame(&mut self, position: u64, time_ns: u64, payload: &[u8]) {
+        let table = decode_schedule_table(payload)
+            .unwrap_or_else(|| panic!("corrupt SCHEDULE_TABLE frame at {position}"));
+        // Idempotent by position: the leader adopts at append and then sees
+        // its own frame come back off the archive.
+        if position <= self.schedule_position {
+            return;
+        }
+        let rec = ScheduleRecord {
+            position,
+            time_ns,
+            table: payload.to_vec(),
+        };
+        crate::schedule_state::store(&self.schedule_state, &rec)
+            .expect("schedule record persist fail-stop");
+        self.install_table(position, &table, time_ns);
+    }
+
+    /// Plan 2 (spec §5): hand every DECLARED row the entries that name its
+    /// identity hash and publish the `/metrics` mirrors. A row with no entry
+    /// in the table adopts an EMPTY set — that is how an operator removes an
+    /// entry: apply a table without it.
+    ///
+    /// `log_time_ns` is the instant the rules arm against
+    /// (`ScheduleRule::arm`'s one-tick catch-up). Every replica adopts the
+    /// same frame with the same stamp, so every replica arms identically.
+    fn install_table(&mut self, position: u64, table: &ScheduleTable, log_time_ns: u64) {
+        for slot in self.timers.iter_mut() {
+            let Some(t) = slot else { continue };
+            let hash = t.hash();
+            let entries: Vec<(u64, ScheduleRule)> = table
+                .entries
+                .iter()
+                .filter(|e| e.identity_hash == hash)
+                .map(|e| (e.timer_id, e.rule))
+                .collect();
+            t.adopt_table(&entries, log_time_ns);
+        }
+        // What is actually ARMED across the rows, parked `once` entries
+        // included. Equal to `table.entries.len()` whenever every entry names
+        // a declared row — which the apply path enforces (an unknown hash is
+        // refused whole) — and, on a node whose declared set has somehow
+        // diverged from the cluster's, the more useful of the two truths.
+        let armed: u64 = self
+            .timers
+            .iter()
+            .flatten()
+            .map(|t| t.table_len() as u64)
+            .sum();
+        self.schedule_position = position;
+        self.schedule_pos_pub.store(position, Ordering::Relaxed);
+        self.schedule_entries_pub.store(armed, Ordering::Relaxed);
+        crate::obs_event!(
+            Info,
+            "schedule_table_adopted",
+            node = self.id as u64,
+            position = position,
+            entries = armed
+        );
+    }
+
+    /// Plan 2 (spec §5): boot arming, called once before this agent's thread
+    /// starts. Arms from `cnc.log_time_ns()` — the log's clock, seeded from
+    /// the journal at boot — and NEVER from the record's own `time_ns` or a
+    /// wall clock: a node down for a week must catch up by ONE tick per
+    /// entry, and the log clock is the only reading every replica agrees on.
+    ///
+    /// A record that will not decode is dropped with a warning rather than
+    /// fail-stopped. Unlike a frame off the archive this is a node-local
+    /// cache file whose only job is to bridge a restart; refusing to boot
+    /// over it would strand the node, and the next observed table frame (or
+    /// re-apply) restores the set.
+    fn arm_schedule_at_boot(&mut self) {
+        let rec = match crate::schedule_state::load(&self.schedule_state) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => return,
+            Err(e) => {
+                let err = e.to_string();
+                crate::obs_event!(
+                    Warn,
+                    "schedule_record_unreadable",
+                    node = self.id as u64,
+                    err = err.as_str()
+                );
+                return;
+            }
+        };
+        let Some(table) = decode_schedule_table(&rec.table) else {
+            crate::obs_event!(
+                Warn,
+                "schedule_record_unreadable",
+                node = self.id as u64,
+                position = rec.position,
+                err = "undecodable table bytes"
+            );
+            return;
+        };
+        self.install_table(rec.position, &table, self.cnc.log_time_ns());
+    }
+
+    /// Plan 2: is `hash` one of THIS cluster's declared rows? The
+    /// `REASON_SCHEDULE_UNKNOWN_FSM` check — `self.timers` holds exactly one
+    /// entry per declared row, keyed by the row's `FsmName` hash.
+    fn is_declared_hash(&self, hash: u64) -> bool {
+        self.timers.iter().flatten().any(|t| t.hash() == hash)
     }
 
     /// M13a: a ring error from a client-facing MPSC ring. Two of them are
@@ -4717,6 +5032,39 @@ impl Consensus {
                 return;
             }
         };
+        // Plan 2 (spec §5): `schedule apply` is its own pipeline — the table
+        // is far too large for the admin request line, so what the operator
+        // signs is the DIGEST of a file staged in the instance directory.
+        // Placed here, right after authentication and before the
+        // leader/forward split, because the staged file is NODE-LOCAL: a
+        // follower must not forward the request (the leader has no such file)
+        // and must not read its own copy either (it cannot append). It
+        // answers retry — side-effect-free — and `uc2ctl` re-stages against
+        // the node the leader hint names.
+        if req.op == ADMIN_OP_SCHEDULE_APPLY {
+            // `appender.is_some()` alongside the role: a leader still waiting
+            // on its leader-open collapse ack HAS the role but no appender
+            // yet, and appending in that window would panic. It is the same
+            // window `propose_config`'s `NotServing` refusal covers for the
+            // reconfiguration ops; here it answers retry, which is what
+            // `uc2ctl` polls through.
+            let leader = matches!(self.sm.role(), Role::Leader) && self.appender.is_some();
+            let (status, reason, version) = if leader {
+                self.apply_schedule_table(req.id, req.ip, req.port)
+            } else {
+                (2, 0, self.schedule_position)
+            };
+            let (status, reason) = self.audit_admin(
+                actor.as_deref(),
+                AuditOrigin::Local,
+                audited,
+                status,
+                reason,
+                version,
+            );
+            self.write_admin_reply(req.seq, status, reason, version);
+            return;
+        }
         if matches!(self.sm.role(), Role::Leader) {
             let (status, reason, version) =
                 self.propose_and_append(req.op, req.id, req.ip, req.port);
@@ -4889,6 +5237,96 @@ impl Consensus {
             }
             Err(e) => (1, ClusterConfig::reason_code(&e), self.cnc.config_version()),
         }
+    }
+
+    /// Plan 2 (spec §5): the leader half of `ADMIN_OP_SCHEDULE_APPLY`. Reads
+    /// the staged `<instance_dir>/schedules.pending` back, checks it against
+    /// the `(id, ip, port)` digest the request carried (and, under
+    /// `AdminPolicy::Hmac`, SIGNED), decodes it, checks every entry names a
+    /// declared row, and appends it. Returns the wire reply triple
+    /// `(status, reason, version)`:
+    /// * `0, 0, position` — appended and adopted; `version` is the frame-END.
+    /// * `1, REASON_SCHEDULE_*, schedule_position` — refused; nothing changed.
+    /// * `2, 0, schedule_position` — the buffer was momentarily full; the
+    ///   staged file is still there, so the whole request is retryable.
+    ///
+    /// The `version` word means "the schedule table position in effect" for
+    /// this op (the NEW one on the accepted path) rather than the config
+    /// version the reconfiguration ops report — one meaning per op, which is
+    /// also what the audit record's `config_version` field then carries.
+    ///
+    /// **Refuse whole, never partially.** An unknown FSM hash fails the whole
+    /// table: it is a typo'd or stale FSM name, and adopting the rest would
+    /// leave the operator believing a timer is armed that no row will ever
+    /// fire.
+    fn apply_schedule_table(&mut self, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
+        // Size-check before reading. The file is written by anything with
+        // instance-dir write access, and this runs on the consensus agent —
+        // an oversized (or non-regular) staged file must not become a
+        // multi-gigabyte read on the thread that drives commit and
+        // elections. An over-long file is not a decodable table either, so
+        // the honest refusal is the same one the decoder would give.
+        let meta = match std::fs::metadata(&self.schedule_pending) {
+            Ok(m) => m,
+            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
+        };
+        if !meta.is_file() || meta.len() > MAX_SCHEDULE_TABLE_BYTES {
+            return self.refuse_schedule(REASON_SCHEDULE_DECODE);
+        }
+        let bytes = match std::fs::read(&self.schedule_pending) {
+            Ok(b) => b,
+            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
+        };
+        if schedule_digest(&bytes) != (id, ip, port) {
+            return self.refuse_schedule(REASON_SCHEDULE_DIGEST);
+        }
+        let Some(table) = decode_schedule_table(&bytes) else {
+            return self.refuse_schedule(REASON_SCHEDULE_DECODE);
+        };
+        if !table
+            .entries
+            .iter()
+            .all(|e| self.is_declared_hash(e.identity_hash))
+        {
+            return self.refuse_schedule(REASON_SCHEDULE_UNKNOWN_FSM);
+        }
+        match self.append_schedule_table_frame(&table) {
+            Ok(position) => {
+                // Only now: the table is on the log and adopted, so the
+                // staged copy has done its job. Deleting it earlier would
+                // lose the request on an append failure; deleting it at all
+                // is what keeps a re-presented request from appending the
+                // same table twice (it refuses with MISSING instead).
+                if let Err(e) = std::fs::remove_file(&self.schedule_pending) {
+                    let err = e.to_string();
+                    crate::obs_event!(
+                        Warn,
+                        "schedule_staged_file_kept",
+                        node = self.id as u64,
+                        position = position,
+                        err = err.as_str()
+                    );
+                }
+                (0, 0, position)
+            }
+            // Nothing appended, nothing adopted, staged file still present:
+            // safe to retry whole (`append_config_frame`'s argument).
+            Err(AppendError::WouldOverrun) | Err(AppendError::PayloadTooLarge) => {
+                (2, 0, self.schedule_position)
+            }
+        }
+    }
+
+    /// Count + name one refused `schedule apply` and build its reply triple.
+    fn refuse_schedule(&self, reason: u32) -> (u32, u32, u64) {
+        self.schedule_refused.fetch_add(1, Ordering::Relaxed);
+        crate::obs_event!(
+            Warn,
+            "schedule_apply_refused",
+            node = self.id as u64,
+            reason = reason as u64
+        );
+        (1, reason, self.schedule_position)
     }
 
     /// M7 Task 7: leader-side handling of a follower-forwarded proposal (kind
@@ -6802,6 +7240,7 @@ mod tests {
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
         _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
+        _tbl_obs_tx: mpsc::SyncSender<(u64, u64, Vec<u8>)>,
         _ingress_tx: mpsc::SyncSender<Ingress>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
@@ -6956,6 +7395,7 @@ mod tests {
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
         let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(64);
+        let (tbl_obs_tx, tbl_obs_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Ingress>(64);
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
@@ -7060,6 +7500,13 @@ mod tests {
             net_rx,
             obs_rx,
             cfg_obs_rx,
+            tbl_obs_rx,
+            schedule_position: 0,
+            schedule_state: crate::schedule_state::open(dir.path()).unwrap(),
+            schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),
+            schedule_pos_pub: Arc::new(AtomicU64::new(0)),
+            schedule_entries_pub: Arc::new(AtomicU64::new(0)),
+            schedule_refused: Arc::new(AtomicU64::new(0)),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -7132,6 +7579,7 @@ mod tests {
             _net_tx: net_tx,
             _obs_tx: obs_tx,
             _cfg_obs_tx: cfg_obs_tx,
+            _tbl_obs_tx: tbl_obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
             _dir: dir,
