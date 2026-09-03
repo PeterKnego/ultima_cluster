@@ -617,6 +617,17 @@ as written and annotated rather than rewritten.
    `uc2_schedule_entries`). Changing a `once`'s time or its id makes it a
    different entry, which arms normally.
 
+- **Errata (plan 3, snapshot carry).** The table IS carried by the snapshot
+  session: the leader sends a `SNAP_TABLE` datagram (kind 18, body `session ‖
+  position ‖ time_ns ‖ table_len ‖ table`, ≤ 1086 B) after every `SNAP_BEGIN`
+  of a session; the receiver withholds `SNAP_DONE` until it has one and
+  publishes it to the consensus agent before the floor signal, which installs
+  it by fiat (a wholesale replace, `prev = None`, like the carried config). A
+  below-floor joiner therefore holds the cluster's table before it can serve
+  or lead. Position `0` with an empty table means "the leader has none" and
+  is installed as such. This supersedes the "not carried in the snapshot
+  stream" limitation recorded above.
+
 ## 6. Observability
 
 Node-side, per row (labels `service="<name>",row="<r>"` as the identity
