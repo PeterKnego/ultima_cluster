@@ -341,3 +341,20 @@ fn a_real_single_node_cluster_serves_and_becomes_ready() {
     drop(svc);
     node.stop();
 }
+
+#[test]
+fn timer_and_log_time_families_are_in_the_contract() {
+    for name in [
+        "uc2_timers_pending",
+        "uc2_timers_fired_total",
+        "uc2_timers_late_total",
+        "uc2_timers_rearmed_total",
+        "uc2_log_time_ns",
+        "uc2_log_time_lag_seconds",
+    ] {
+        assert!(
+            uc_node::obs::metrics::CONTRACT_SERIES.contains(&name),
+            "{name}"
+        );
+    }
+}

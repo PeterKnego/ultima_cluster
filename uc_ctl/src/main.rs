@@ -580,7 +580,10 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     } else {
         format!("{fsm_lag} bytes")
     };
-    println!("services: declared={ids:?} fsm_lag={lag_desc}");
+    println!(
+        "services: declared={ids:?} fsm_lag={lag_desc} log_time_ns={}",
+        cnc.log_time_ns()
+    );
     let now_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -605,12 +608,13 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         println!(
             "  row={id} name={name} version={} hash=0x{:016x} attached={attached} epoch={} \
              incarnation={incarnation} applied={applied} lag={} snapshot_pos={} \
-             heartbeat_age={age}",
+             heartbeat_age={age} timers_pending={}",
             VersionDisplay(s.status.version()),
             s.identity.hash(),
             s.epoch.load_acquire(),
             commit.saturating_sub(applied),
             s.snapshot_pos.load_acquire(),
+            s.identity.timers_pending(),
         );
     }
     println!("members:");

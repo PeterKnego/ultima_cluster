@@ -139,6 +139,18 @@ groups:
     for: 30s
     labels: { severity: warning }
     annotations: { summary: "FSM {{ $labels.service }} on {{ $labels.instance }} is pinned at the fsm_lag bound — it is pacing the whole cluster" }
+  - alert: Uc2LogTimeFrozen
+    # Time-and-timers spec §3: `uc2_log_time_lag_seconds` is leader-only
+    # (rendered 0 on followers), so the `uc2_is_leader == 1` join picks out
+    # the one instance where a nonzero lag is meaningful. A grown lag means
+    # either the leader's wall clock stepped backwards (log-time stamps hold
+    # at their last value until wall time catches back up) or nothing is
+    # being appended at all — either way the log's clock has frozen relative
+    # to wall time.
+    expr: uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1
+    for: 30s
+    labels: { severity: warning }
+    annotations: { summary: "log time on the leader is {{ $value }}s behind wall time — its clock stepped backwards, or the appender is stalled" }
   - alert: Uc2ServiceIdentityDrift
     # Task 7 (spec §4.5): a row's declared NAME must be identical on every
     # node — it is written once at boot (cnc 3.1 line 7) from each node's own

@@ -67,8 +67,14 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc_service_lag_waits_total",
     "uc2_service_identity_hash",
     "uc2_service_version",
+    "uc2_timers_pending",
+    "uc2_timers_fired_total",
+    "uc2_timers_late_total",
+    "uc2_timers_rearmed_total",
     "uc_services_declared",
     "uc2_fsm_lag_bytes",
+    "uc2_log_time_ns",
+    "uc2_log_time_lag_seconds",
     "uc2_output_completed_bytes",
     "uc2_output_progress_bytes",
     "uc_node_snapshot_floor_bytes",
@@ -210,6 +216,15 @@ struct ServiceRow {
     identity_hash: u64,
     /// Packed semantic version the attached service last wrote (0 = none).
     version: u64,
+    /// Time-and-timers §6: pending scheduled timers for this row (cnc slot
+    /// line 7's live word, refreshed once per consensus-agent pass).
+    timers_pending: u64,
+    /// TIMER frames this node appended as leader for the row.
+    fired: u64,
+    /// Fired timers whose stamp exceeded their deadline.
+    late: u64,
+    /// In-flight timers moved back to pending on a leadership loss.
+    rearmed: u64,
 }
 
 fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
@@ -239,6 +254,10 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             heartbeat_age: now.saturating_sub(hb) as f64 / 1e9,
             identity_hash: slot.identity.hash(),
             version: slot.status.version() as u64,
+            timers_pending: slot.identity.timers_pending(),
+            fired: s.timer_stats.fired[id as usize].load(Ordering::Relaxed),
+            late: s.timer_stats.late[id as usize].load(Ordering::Relaxed),
+            rearmed: s.timer_stats.rearmed[id as usize].load(Ordering::Relaxed),
         });
     }
     rows
@@ -399,6 +418,38 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         &rows,
         |r| r.version,
     );
+    push_service_labeled(
+        out,
+        "uc2_timers_pending",
+        "Pending scheduled timers for this row on this node (time-and-timers spec §6); every node holds the same set, the leader fires it.",
+        "gauge",
+        &rows,
+        |r| r.timers_pending,
+    );
+    push_service_labeled(
+        out,
+        "uc2_timers_fired_total",
+        "TIMER frames this node appended as leader for the row.",
+        "counter",
+        &rows,
+        |r| r.fired,
+    );
+    push_service_labeled(
+        out,
+        "uc2_timers_late_total",
+        "Fired timers whose stamp exceeded their deadline (post-failover or scheduled in the past).",
+        "counter",
+        &rows,
+        |r| r.late,
+    );
+    push_service_labeled(
+        out,
+        "uc2_timers_rearmed_total",
+        "In-flight timers moved back to pending on a leadership loss; each may fire again (the service drops the duplicate).",
+        "counter",
+        &rows,
+        |r| r.rearmed,
+    );
     push_gauge(
         out,
         "uc_services_declared",
@@ -410,6 +461,26 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "uc2_fsm_lag_bytes",
         "The configured FSM lag bound in bytes; 0 means lockstep.",
         s.cnc.fsm_lag_bytes(),
+    );
+
+    let is_leader = status.flags.load_acquire() & NODE_FLAG_LEADER != 0;
+    let log_time = s.cnc.log_time_ns();
+    push_gauge(
+        out,
+        "uc2_log_time_ns",
+        "The highest leader stamp the archive has recorded: the log's clock, identical on every replica once caught up (time-and-timers spec §3).",
+        log_time,
+    );
+    let lag_s = if is_leader && log_time > 0 {
+        now.saturating_sub(log_time) / 1_000_000_000
+    } else {
+        0
+    };
+    push_gauge(
+        out,
+        "uc2_log_time_lag_seconds",
+        "Leader only (0 elsewhere): wall clock minus the log's clock. Grows when the leader's clock stepped backwards (stamps hold until wall time catches up) or nothing is being appended. Alert: Uc2LogTimeFrozen.",
+        lag_s,
     );
 }
 
