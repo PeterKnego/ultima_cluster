@@ -96,13 +96,38 @@ impl RowTimers {
         }
         self.table = new_table;
     }
+    /// The deadline a DUE table head must actually be fired at (spec §5's
+    /// one-tick catch-up, enforced at FIRE time): the LATEST occurrence at or
+    /// before `now_ns`, never below the armed `next`. `None` when the entry
+    /// is absent or parked.
+    ///
+    /// Why here and not at arming: a node arms from the log's clock, which
+    /// after a restart is the clock as of the last recorded frame and can be
+    /// hours behind the new leader's wall clock. Advancing one period per
+    /// fire from that point would replay the whole downtime
+    /// (`fired + period`, then again, then again) — the backlog spec §5
+    /// promises never happens. Which occurrence is due is the one
+    /// clock-driven choice the determinism rule allows, and the chosen
+    /// deadline rides the TIMER frame, so every replica advances from the
+    /// same value.
+    pub fn table_fire_deadline(&self, id: u64, now_ns: u64) -> Option<u64> {
+        let e = self.table.get(&id)?;
+        let n = e.next?;
+        Some(n.max(e.rule.latest_at_or_before(now_ns).unwrap_or(n)))
+    }
     /// Leader, after a successful append of a table tick: advances to the
     /// next occurrence, or parks (`next = None`) when nothing follows (a
     /// `Once` already fired). Never touches `in_flight` — a table tick is
     /// never in flight.
+    ///
+    /// `deadline_ns` is the deadline that was APPENDED, which
+    /// [`RowTimers::table_fire_deadline`] may have moved forward past the
+    /// armed `next`. Hence the `<=` guard rather than an equality: anything
+    /// at or after what we hold is a fire of this instance, and the next
+    /// occurrence is computed from the deadline that actually rode the frame.
     pub fn table_fired(&mut self, id: u64, deadline_ns: u64) {
         if let Some(e) = self.table.get_mut(&id)
-            && e.next == Some(deadline_ns)
+            && e.next.is_some_and(|n| n <= deadline_ns)
         {
             e.next = e.rule.next_after(deadline_ns);
             if let Some(n) = e.next {
@@ -292,6 +317,46 @@ mod tests {
         );
         assert_eq!(t.rearm(), 0);
         assert_eq!(t.table_len(), 1);
+    }
+
+    /// Spec §5's one-tick catch-up, enforced at FIRE time (plan-2 fix round
+    /// 1): an entry armed against a log clock that is far behind the leader's
+    /// fires the LATEST due occurrence, not the head of a backlog, and then
+    /// advances from THAT.
+    #[test]
+    fn a_due_table_head_fires_at_the_latest_occurrence_not_the_backlog() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        let r = ScheduleRule::Every {
+            period_ns: 100,
+            anchor_ns: 1_000,
+        };
+        t.adopt_table(&[(7, r)], 1_250);
+        assert_eq!(t.peek_due(u64::MAX), Some((7, 1_200, true)));
+        assert_eq!(
+            t.table_fire_deadline(7, 1_950),
+            Some(1_900),
+            "the latest occurrence at or before the pass clock"
+        );
+        assert_eq!(
+            t.table_fire_deadline(7, 1_150),
+            Some(1_200),
+            "never below the armed next"
+        );
+        t.table_fired(7, 1_900);
+        assert_eq!(
+            t.peek_due(u64::MAX),
+            Some((7, 2_000, true)),
+            "advanced from the deadline that was appended, not from 1_200"
+        );
+        // A parked `once` has no fire deadline, and neither has an id the
+        // table does not hold.
+        let mut o = RowTimers::new(1);
+        o.adopt_table(&[(3, ScheduleRule::Once { at_ns: 500 })], 0);
+        assert_eq!(o.table_fire_deadline(3, 9_999), Some(500));
+        o.table_fired(3, 500);
+        assert_eq!(o.table_fire_deadline(3, 9_999), None, "parked");
+        assert_eq!(o.table_fire_deadline(99, 9_999), None, "absent id");
     }
 
     #[test]

@@ -33,6 +33,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use uc_journal::{StableValue, StableValueConfig, StableValueError};
+use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
 
 /// The staged table file an admin client writes under the instance directory
 /// before sending `ADMIN_OP_SCHEDULE_APPLY`. Relative to `<instance_dir>`,
@@ -64,6 +65,47 @@ pub struct ScheduleRecord {
     /// the record's format is the frozen wire format and nothing here can
     /// drift from it.
     pub table: Vec<u8>,
+    /// ONE level of history — the record this one superseded, with its own
+    /// `prev` cleared. Exactly [`uc_log::state::ConfigRecord`]'s discipline
+    /// and for the same reason: a table frame that a truncation drops must
+    /// revert to a predecessor rather than survive claiming a position the
+    /// log no longer backs, and one level suffices because a new table is
+    /// only appliable once the previous one has COMMITTED (the
+    /// single-in-flight rule in `Consensus::apply_schedule_table`), and
+    /// committed frames are never truncated — so at most one table frame is
+    /// ever truncation-exposed.
+    pub prev: Option<Box<ScheduleRecord>>,
+}
+
+impl ScheduleRecord {
+    /// The predecessor this record superseded, its own history exhausted
+    /// (nothing below a reverted record is recoverable). `None` when there is
+    /// no predecessor — the node then holds no table at all, for which
+    /// [`ScheduleRecord::empty`] is the durable representation.
+    pub fn reverted(self) -> Option<ScheduleRecord> {
+        self.prev.map(|p| ScheduleRecord { prev: None, ..*p })
+    }
+
+    /// The canonical "no table adopted" record: position 0, stamp 0, and an
+    /// encoded EMPTY table. A `StableValue` cannot be cleared, so this is
+    /// what a revert with no predecessor stores — and boot arming then
+    /// disarms every row (an empty entry set per row) instead of re-arming a
+    /// table the log no longer holds.
+    pub fn empty() -> ScheduleRecord {
+        let mut table = Vec::new();
+        encode_schedule_table(
+            &ScheduleTable {
+                entries: Vec::new(),
+            },
+            &mut table,
+        );
+        ScheduleRecord {
+            position: 0,
+            time_ns: 0,
+            table,
+            prev: None,
+        }
+    }
 }
 
 /// Open (create if absent) `<dir>/schedules.state`, where `dir` is the
@@ -161,6 +203,12 @@ mod tests {
             position: 4096,
             time_ns: 1_767_225_600_000_000_000,
             table: vec![1, 2, 3, 4, 5],
+            prev: Some(Box::new(ScheduleRecord {
+                position: 2048,
+                time_ns: 1_767_225_500_000_000_000,
+                table: vec![9, 9],
+                prev: None,
+            })),
         };
         store(&sv, &rec).expect("store");
         assert_eq!(load(&sv).expect("load"), Some(rec.clone()));
@@ -169,5 +217,35 @@ mod tests {
         let sv = open(dir.path()).expect("reopen");
         assert_eq!(load(&sv).expect("load"), Some(rec));
         assert!(dir.path().join(SCHEDULE_STATE_FILE).is_file());
+    }
+
+    /// The one-level revert a truncation runs (plan-2 fix round 1): prev is
+    /// promoted, its own history is exhausted, and a record with no prev
+    /// reverts to nothing — for which `empty()` is the durable stand-in
+    /// (`StableValue` has no clear), and which decodes as a table with zero
+    /// entries so every row disarms.
+    #[test]
+    fn reverted_promotes_one_level_and_exhausts_the_history() {
+        let older = ScheduleRecord {
+            position: 2048,
+            time_ns: 7,
+            table: vec![9, 9],
+            prev: None,
+        };
+        let newer = ScheduleRecord {
+            position: 4096,
+            time_ns: 9,
+            table: vec![1],
+            prev: Some(Box::new(older.clone())),
+        };
+        let back = newer.reverted().expect("one level of history");
+        assert_eq!(back, older, "prev promoted verbatim, its own prev cleared");
+        assert_eq!(back.clone().reverted(), None, "history exhausted");
+
+        let e = ScheduleRecord::empty();
+        assert_eq!((e.position, e.time_ns, e.prev.clone()), (0, 0, None));
+        let table = uc_protocol::v2::schedule::decode_schedule_table(&e.table)
+            .expect("the empty record's bytes are a decodable table");
+        assert!(table.entries.is_empty(), "zero entries: every row disarms");
     }
 }

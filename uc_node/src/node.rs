@@ -3852,14 +3852,31 @@ impl Consensus {
                 hold = false;
                 break;
             };
-            // `peek_due(now)` only ever yields `deadline <= now`. A future
-            // deadline appended here would drag the log clock forward.
-            debug_assert!(dl <= now, "fire_due_timers appends only DUE timers");
             let t = self.timers[row].as_mut().unwrap();
+            // Plan 2 (spec §5), the one-tick catch-up: a table head is fired
+            // at the LATEST occurrence at or before this pass's clock, not at
+            // the head of a backlog. A node arms from the log's clock, which
+            // after a restart is the clock as of the last recorded frame and
+            // can be hours behind the new leader's — advancing one period per
+            // fire from there would replay the whole downtime. Which
+            // occurrence is due is the one clock-driven choice the
+            // determinism rule allows, and the chosen deadline RIDES the
+            // frame, so every replica advances from the same value. A
+            // programmatic instance has exactly one deadline and keeps it.
+            let fire_dl = if table {
+                t.table_fire_deadline(id, now).unwrap_or(dl)
+            } else {
+                dl
+            };
+            // `peek_due(now)` only ever yields `deadline <= now`, and the
+            // catch-up above only moves it forward to an occurrence at or
+            // before `now`. A future deadline appended here would drag the
+            // log clock forward.
+            debug_assert!(fire_dl <= now, "fire_due_timers appends only DUE timers");
             let body = TimerBody {
                 identity_hash: t.hash(),
                 timer_id: id,
-                deadline_ns: dl,
+                deadline_ns: fire_dl,
             };
             // Plan 2 (spec §5): a table tick is flagged on the wire so the
             // service can tell it from a programmatic one (`Timed<S>` keys
@@ -3871,9 +3888,9 @@ impl Consensus {
             match app.append_timer(&body, flags) {
                 Ok((position, stamp)) => {
                     if table {
-                        t.table_fired(id, dl);
+                        t.table_fired(id, fire_dl);
                     } else {
-                        t.take_in_flight(id, dl);
+                        t.take_in_flight(id, fire_dl);
                     }
                     did = true;
                     self.timer_stats.fired[row].fetch_add(1, Ordering::Relaxed);
@@ -3885,7 +3902,7 @@ impl Consensus {
                     // `fired` counter (`uc2_timers_fired_total`); a LATE fire
                     // is the operational signal, and it is rare by
                     // construction, so it earns the write.
-                    let late = stamp > dl;
+                    let late = stamp > fire_dl;
                     if late {
                         self.timer_stats.late[row].fetch_add(1, Ordering::Relaxed);
                         crate::obs_event!(
@@ -3894,7 +3911,7 @@ impl Consensus {
                             node = self.id as u64,
                             row = row as u64,
                             timer_id = id,
-                            deadline_ns = dl,
+                            deadline_ns = fire_dl,
                             time_ns = stamp,
                             position = position
                         );
@@ -4102,14 +4119,32 @@ impl Consensus {
         if position <= self.schedule_position {
             return;
         }
+        // One level of history, exactly as `ConfigRecord` keeps it: the
+        // record this one supersedes, with its own `prev` cleared, so a
+        // truncation that drops THIS frame can revert to its predecessor.
+        let prev = crate::schedule_state::load(&self.schedule_state)
+            .ok()
+            .flatten()
+            .map(|mut p| {
+                p.prev = None;
+                Box::new(p)
+            });
         let rec = ScheduleRecord {
             position,
             time_ns,
             table: payload.to_vec(),
+            prev,
         };
         crate::schedule_state::store(&self.schedule_state, &rec)
             .expect("schedule record persist fail-stop");
-        self.install_table(position, &table, time_ns);
+        let armed = self.install_table(position, &table, time_ns);
+        crate::obs_event!(
+            Info,
+            "schedule_table_adopted",
+            node = self.id as u64,
+            position = position,
+            entries = armed
+        );
     }
 
     /// Plan 2 (spec §5): hand every DECLARED row the entries that name its
@@ -4120,7 +4155,11 @@ impl Consensus {
     /// `log_time_ns` is the instant the rules arm against
     /// (`ScheduleRule::arm`'s one-tick catch-up). Every replica adopts the
     /// same frame with the same stamp, so every replica arms identically.
-    fn install_table(&mut self, position: u64, table: &ScheduleTable, log_time_ns: u64) {
+    ///
+    /// Returns the number of ARMED entries — what `uc2_schedule_entries`
+    /// publishes. The caller names the event (adoption, boot arming and a
+    /// truncation revert are three different operational facts).
+    fn install_table(&mut self, position: u64, table: &ScheduleTable, log_time_ns: u64) -> u64 {
         for slot in self.timers.iter_mut() {
             let Some(t) = slot else { continue };
             let hash = t.hash();
@@ -4146,13 +4185,7 @@ impl Consensus {
         self.schedule_position = position;
         self.schedule_pos_pub.store(position, Ordering::Relaxed);
         self.schedule_entries_pub.store(armed, Ordering::Relaxed);
-        crate::obs_event!(
-            Info,
-            "schedule_table_adopted",
-            node = self.id as u64,
-            position = position,
-            entries = armed
-        );
+        armed
     }
 
     /// Plan 2 (spec §5): boot arming, called once before this agent's thread
@@ -4191,7 +4224,76 @@ impl Consensus {
             );
             return;
         };
-        self.install_table(rec.position, &table, self.cnc.log_time_ns());
+        let armed = self.install_table(rec.position, &table, self.cnc.log_time_ns());
+        crate::obs_event!(
+            Info,
+            "schedule_table_adopted",
+            node = self.id as u64,
+            position = rec.position,
+            entries = armed
+        );
+    }
+
+    /// Plan 2 (spec §5): persist-revert-BEFORE-truncate for the schedule
+    /// table — the twin of the `ConfigRecord` revert in `Action::Truncate`,
+    /// and called from the same place for the same reason. If this
+    /// truncation drops the table frame this node adopted (`to` lands
+    /// strictly below its recorded position), the durable record must not
+    /// survive claiming a position the truncated log no longer backs: a
+    /// later table frame landing at or below that position would be ignored
+    /// as a re-observation and this node alone would run a table the cluster
+    /// does not have.
+    ///
+    /// Reverts one level (`ScheduleRecord::reverted`), persists, and re-arms
+    /// every row from the reverted table — or from an EMPTY set when there
+    /// is no predecessor, which is what disarms a row whose only entries came
+    /// from the dropped frame.
+    fn revert_schedule_below(&mut self, to: u64) {
+        let Ok(Some(rec)) = crate::schedule_state::load(&self.schedule_state) else {
+            return;
+        };
+        if to >= rec.position {
+            return;
+        }
+        let reverted = if to == 0 {
+            // Wipe-and-rejoin, mirroring the `ConfigRecord`'s own wipe
+            // branch: keep the CURRENT table by fiat rather than dropping to
+            // a predecessor a wiped node has no further use for. The table is
+            // not carried in a snapshot, so a wiped node that dropped it
+            // would run with nothing armed until an operator re-applied,
+            // while its peers keep ticking. The POSITION still goes to 0, so
+            // the next table frame (or a re-apply) adopts.
+            ScheduleRecord {
+                position: 0,
+                time_ns: rec.time_ns,
+                table: rec.table.clone(),
+                prev: None,
+            }
+        } else {
+            // One level is enough because a new table is only appliable once
+            // the previous one committed (`apply_schedule_table`'s
+            // single-in-flight refusal) and committed frames are never
+            // truncated. The `filter` makes that argument fail-SAFE rather
+            // than fail-stale: a predecessor that is somehow also above the
+            // cut is discarded for "no table" instead of parking a stale
+            // position.
+            rec.reverted()
+                .filter(|r| r.position <= to)
+                .unwrap_or_else(ScheduleRecord::empty)
+        };
+        crate::schedule_state::store(&self.schedule_state, &reverted)
+            .expect("schedule record persist fail-stop");
+        let table = decode_schedule_table(&reverted.table)
+            .unwrap_or_else(|| panic!("corrupt reverted schedule record at {}", reverted.position));
+        let armed = self.install_table(reverted.position, &table, self.cnc.log_time_ns());
+        crate::obs_event!(
+            Warn,
+            "schedule_table_reverted",
+            node = self.id as u64,
+            position = reverted.position,
+            entries = armed,
+            to = to
+        );
     }
 
     /// Plan 2: is `hash` one of THIS cluster's declared rows? The
@@ -5260,6 +5362,18 @@ impl Consensus {
     /// leave the operator believing a timer is armed that no row will ever
     /// fire.
     fn apply_schedule_table(&mut self, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
+        // SINGLE IN FLIGHT (the config path's `ChangePending` refusal, in the
+        // node layer because the schedule table is not an SM concern): refuse
+        // to append a second table while the previous one is still
+        // truncation-exposed. It is what makes ONE level of `prev` sufficient
+        // — with two uncommitted frames a truncation could drop both and the
+        // record would have nothing valid to revert to. `status 2` (retry,
+        // side-effect-free): `uc2ctl` polls, and the wait is one commit
+        // round-trip.
+        let commit = self.cnc.counters().commit.load_acquire();
+        if self.schedule_position > commit {
+            return (2, 0, self.schedule_position);
+        }
         // Size-check before reading. The file is written by anything with
         // instance-dir write access, and this runs on the consensus agent —
         // an oversized (or non-regular) staged file must not become a
@@ -5908,6 +6022,16 @@ impl Consensus {
                         .store_config_record(&reverted)
                         .expect("config persist fail-stop");
                 }
+                // Plan 2 (spec §5): the SAME persist-revert-before-truncate
+                // step for the schedule-table record. This is the only place
+                // the node cuts bytes BELOW its own durable frontier — the
+                // leader-open `ArchiveCmd::Collapse` only drops the volatile
+                // tail above `base`, and a locally-appended table frame is
+                // recorded (hence at or below `base`) before this node could
+                // ever collapse — so hooking `Action::Truncate` covers every
+                // cut that can drop an adopted table frame, wipe-and-rejoin
+                // (`to == 0`) included.
+                self.revert_schedule_below(to);
                 // Pause intake and record the emit→ack bracket (the SM allocated
                 // `epoch`; we transport it). The SM has already latched the data
                 // plane. Emitting the truncate IS the reconcile decision for the
