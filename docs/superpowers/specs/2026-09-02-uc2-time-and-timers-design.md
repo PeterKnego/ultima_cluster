@@ -626,7 +626,9 @@ as written and annotated rather than rewritten.
   below-floor joiner therefore holds the cluster's table before it can serve
   or lead. Position `0` with an empty table means "the leader has none" and
   is installed as such. This supersedes the "not carried in the snapshot
-  stream" limitation recorded above.
+  stream" limitation plan 2 recorded in `docs/reference/limits.md`,
+  `docs/BACKLOG.md` (item 2a) and the explainer's known-limits section;
+  plan 3's Task 5 closes those.
 
 ## 6. Observability
 
