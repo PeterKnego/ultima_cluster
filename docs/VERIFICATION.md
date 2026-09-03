@@ -28,7 +28,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, **and the Broadcast ring's seqlock read barrier** |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the seventeen decoders that see bytes the process did not write |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the eighteen decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 
@@ -501,7 +501,7 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The seventeen targets
+### The eighteen targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
@@ -509,6 +509,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
 | `uc_protocol_timer_frame` | `2.11.0` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
 | `uc_protocol_sched_record` | `2.11.0` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |
+| `uc_protocol_schedule_table` | `2.11.0` — the replicated schedule table: the `SCHEDULE_TABLE` frame body every node decodes off the log, and the bytes an operator stages in `schedules.pending` for the leader to read back. Also a **property** target: the recurrence arithmetic (`next_after`, `latest_at_or_before`, `arm`) runs on the consensus agent, so it must be total for any rule and any clock. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 8 KiB control page (page-2 service-slot band and the 4032 pair since M14a) every attaching process maps and parses. A file on disk any local process with write access can corrupt. |
 | `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write. |
 | `uc_remote_frame` | `uc_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. Input from any client that can open a socket to the gateway. |

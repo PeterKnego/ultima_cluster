@@ -164,6 +164,7 @@ growth.
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header` behind the real caller's `len >= HEADER_LEN` guard (that reader is deliberately caller-guarded — see its doc). |
 | `uc_protocol_timer_frame` | `uc_protocol::v2::frame`'s `TimerBody` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
 | `uc_protocol_sched_record` | `uc_protocol::v2::ipc`'s `SchedRecord` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |
+| `uc_protocol_schedule_table` | `uc_protocol::v2::schedule` — the replicated schedule table's wire body (off the log, and off the operator-staged `schedules.pending` file), plus a PROPERTY half: `next_after`/`latest_at_or_before`/`arm` must be total on every decoded rule for a fuzzed `t`. |
 | `uc_service_session` | `Sessioned<S>` — the exactly-once envelope (under a fuzz-derived, deliberately tiny `SessionConfig`, so client/byte eviction and the window trim are reachable) and its snapshot install path. |
 | `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |

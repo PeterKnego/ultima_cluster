@@ -121,6 +121,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "uc_protocol_schedule_table"
+path = "fuzz_targets/uc_protocol_schedule_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "uc_service_session"
 path = "fuzz_targets/uc_service_session.rs"
 test = false

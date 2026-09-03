@@ -70,6 +70,7 @@ fn main() -> std::io::Result<()> {
     write_target(root, "uc_protocol_log_frame", seeds::uc_protocol_log_frame())?;
     write_target(root, "uc_protocol_timer_frame", seeds::uc_protocol_timer_frame())?;
     write_target(root, "uc_protocol_sched_record", seeds::uc_protocol_sched_record())?;
+    write_target(root, "uc_protocol_schedule_table", seeds::uc_protocol_schedule_table())?;
     write_target(root, "uc_service_session", seeds::uc_service_session())?;
     write_target(root, "uc_node_toml", seeds::uc_node_toml())?;
     write_target(root, "uc_gateway_toml", seeds::uc_gateway_toml())?;

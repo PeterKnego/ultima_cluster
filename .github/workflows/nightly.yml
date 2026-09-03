@@ -295,7 +295,7 @@ jobs:
             uc_crypto_open uc_crypto_handshake uc_crypto_group_key uc_crypto_admin
             uc_journal_record uc_journal_stable_value uc_service_session ring_mpsc_record
             uc_node_toml uc_gateway_toml uc_node_http
-            uc_protocol_timer_frame uc_protocol_sched_record
+            uc_protocol_timer_frame uc_protocol_sched_record uc_protocol_schedule_table
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"

@@ -882,6 +882,100 @@ pub fn uc_protocol_sched_record() -> Vec<Seed> {
     ]
 }
 
+/// `uc_protocol_schedule_table` — the replicated schedule table's wire body,
+/// prefixed by the eight bytes the target reads as the fuzzed `t_ns` (see the
+/// target's own doc). One of each rule kind, a full 32-entry table, and the
+/// four refusals the decoder owes: a short buffer, an unknown kind, a `Once`
+/// with a non-zero `b`, and a duplicate `(identity_hash, timer_id)`.
+pub fn uc_protocol_schedule_table() -> Vec<Seed> {
+    use uc_protocol::v2::schedule::*;
+
+    /// A plausible log clock: 2023-11-14T22:13:20Z, the same instant the
+    /// timer-frame seeds stamp.
+    const T: u64 = 1_700_000_000_000_000_000;
+    const HOUR: u64 = 3_600_000_000_000;
+
+    fn encoded(t_ns: u64, entries: Vec<ScheduleEntry>) -> Vec<u8> {
+        let mut v = t_ns.to_le_bytes().to_vec();
+        encode_schedule_table(&ScheduleTable { entries }, &mut v);
+        v
+    }
+    fn entry(timer_id: u64, rule: ScheduleRule) -> ScheduleEntry {
+        ScheduleEntry {
+            // FNV-1a 64 of "clock" — a real `FsmName` hash shape, not a
+            // round number, so a mutation of it stays plausible.
+            identity_hash: uc_protocol::identity::fnv1a_64(b"clock"),
+            timer_id,
+            rule,
+        }
+    }
+
+    let three = vec![
+        entry(
+            1,
+            ScheduleRule::Every {
+                period_ns: HOUR,
+                anchor_ns: T - T % HOUR,
+            },
+        ),
+        entry(2, ScheduleRule::DailyAt { secs_of_day: 14 * 3_600 }),
+        entry(3, ScheduleRule::Once { at_ns: T + HOUR }),
+    ];
+
+    // The two invalid variants are built by mutating a VALID encoding, so the
+    // fuzzer starts one byte away from the refusal boundary.
+    let mut bad_kind = encoded(T, three.clone());
+    bad_kind[8 + SCHEDULE_HEADER_LEN + 16] = 4; // kind byte of entry 0
+    let mut once_b_nonzero = encoded(T, three.clone());
+    {
+        // entry 2 is the `Once`; its `b` field is the last 8 bytes.
+        let o = 8 + SCHEDULE_HEADER_LEN + 2 * SCHEDULE_ENTRY_LEN + 25;
+        once_b_nonzero[o..o + 8].copy_from_slice(&1u64.to_le_bytes());
+    }
+
+    let mut duplicate = three.clone();
+    duplicate.push(three[0]);
+
+    vec![
+        // One entry of each kind, all valid.
+        Seed::fixed("01-three-kinds", encoded(T, three.clone())),
+        // A FULL table (MAX_SCHEDULE_ENTRIES), the largest body the decoder
+        // accepts — 8 + 32*33 = 1064 bytes, inside the crypto-on payload cap.
+        Seed::fixed(
+            "02-full-table",
+            encoded(
+                T,
+                (0..MAX_SCHEDULE_ENTRIES as u64)
+                    .map(|i| {
+                        entry(
+                            i,
+                            ScheduleRule::Every {
+                                period_ns: (i + 1) * 1_000_000,
+                                anchor_ns: T - T % 1_000_000,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        ),
+        // Shorter than the 8-byte header (after the `t_ns` prefix).
+        Seed::fixed("03-short", {
+            let mut v = T.to_le_bytes().to_vec();
+            v.extend_from_slice(&[1, 0, 0, 0, 3]);
+            v
+        }),
+        // An unknown rule kind: refused whole.
+        Seed::fixed("04-bad-kind", bad_kind),
+        // A `Once` whose reserved `b` word is non-zero: refused whole.
+        Seed::fixed("05-once-b-nonzero", once_b_nonzero),
+        // A duplicate (identity_hash, timer_id): refused whole.
+        Seed::fixed("06-duplicate", encoded(T, duplicate)),
+        // `t_ns` at the top of the range, where the arithmetic's saturation
+        // and overflow guards are the property under test.
+        Seed::fixed("07-t-max", encoded(u64::MAX, three)),
+    ]
+}
+
 /// `uc_service_session` — the exactly-once envelope, including a genuine
 /// frozen snapshot of a two-client table.
 pub fn uc_service_session() -> Vec<Seed> {

@@ -46,7 +46,10 @@ impl ScheduleRule {
                 if t_ns < anchor_ns {
                     return Some(anchor_ns);
                 }
-                let k = (t_ns - anchor_ns) / period_ns + 1;
+                // Saturating throughout — a period of 1 at the top of the
+                // range makes the quotient itself `u64::MAX`, so even the
+                // `+ 1` overflows (found by `uc_protocol_schedule_table`).
+                let k = ((t_ns - anchor_ns) / period_ns).saturating_add(1);
                 Some(anchor_ns.saturating_add(k.saturating_mul(period_ns)))
             }
             ScheduleRule::DailyAt { secs_of_day } => {
@@ -84,9 +87,15 @@ impl ScheduleRule {
             ScheduleRule::DailyAt { secs_of_day } => {
                 let off = secs_of_day as u64 * NS_PER_SEC;
                 let day = t_ns / NS_PER_DAY;
-                let today = day * NS_PER_DAY + off;
-                if today <= t_ns {
-                    Some(today)
+                // `base <= t_ns` by construction, but `base + off` can
+                // OVERFLOW in the last day of the u64 range (found by
+                // `uc_protocol_schedule_table`: `t_ns` near `u64::MAX` with a
+                // large `secs_of_day`). An occurrence that overflows is by
+                // definition after `t_ns`, so it falls through to yesterday's
+                // — which cannot overflow, being at most `t_ns`.
+                let base = day * NS_PER_DAY;
+                if u64::MAX - base >= off && base + off <= t_ns {
+                    Some(base + off)
                 } else if day == 0 {
                     None
                 } else {
@@ -350,6 +359,33 @@ mod tests {
             Some(5 * H),
             "re-applied with a newer deadline than the delivered one: fires"
         );
+    }
+
+    /// Totality at the top of the range (found by the
+    /// `uc_protocol_schedule_table` fuzz target): the naive
+    /// `day * NS_PER_DAY + secs_of_day` overflows in the last day of the u64
+    /// range. Every rule kind must answer, not panic, for any `t_ns`.
+    #[test]
+    fn the_arithmetic_is_total_at_the_top_of_the_range() {
+        for secs in [0u32, 1, 50_400, 86_399] {
+            let r = ScheduleRule::DailyAt { secs_of_day: secs };
+            // An answer, not a panic — and a real occurrence of the rule
+            // (`secs` past a day boundary), never above `t_ns`.
+            let l = r.latest_at_or_before(u64::MAX).unwrap();
+            assert_eq!(l % NS_PER_DAY, secs as u64 * NS_PER_SEC, "{secs}: {l}");
+            let _ = r.next_after(u64::MAX);
+            let _ = r.arm(None, u64::MAX);
+            let _ = r.arm(Some(u64::MAX), u64::MAX);
+        }
+        let e = ScheduleRule::Every {
+            period_ns: 1,
+            anchor_ns: 0,
+        };
+        assert_eq!(e.latest_at_or_before(u64::MAX), Some(u64::MAX));
+        assert_eq!(e.next_after(u64::MAX), Some(u64::MAX), "saturates");
+        let o = ScheduleRule::Once { at_ns: u64::MAX };
+        assert_eq!(o.latest_at_or_before(u64::MAX), Some(u64::MAX));
+        assert_eq!(o.next_after(u64::MAX), None);
     }
 
     #[test]
