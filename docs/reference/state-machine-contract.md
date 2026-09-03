@@ -127,8 +127,17 @@ the snapshot artifact ahead of the inner state machine's. Running without it
 is the same trade as running without `Sessioned`: correct under a contract you
 have to honour, weaker.
 
+Timers also arrive from a second source: the **replicated schedule table**, a
+list of recurrences an operator applies with
+[`uc2ctl schedule apply`](uc2ctl.md#schedule-apply). Those reach the same
+`on_timer` with `ev.table` set, at ids the operator's file chose — so reserve
+a range of timer ids for the table if your FSM uses both. `Timed<S>` makes
+table ticks exactly-once the same way it does programmatic ones.
+
 Full semantics, the ordering guarantee, and the failure-mode table:
-[Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
+[Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md)
+(the table specifically:
+[The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table)).
 
 ## The blanket adapter and the byte-identity promise
 

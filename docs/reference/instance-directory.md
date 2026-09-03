@@ -13,7 +13,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `cnc2.dat` | node | The 8 KiB control page (page 1: the M1–M13 layout; page 2: the per-FSM service-slot band since M14). See [The cnc control page](cnc-page.md). |
 | `log.buf` | node | The log ring buffer, `buffer_bytes` long. Recreated on each boot. |
 | `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
-| `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. |
+| `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record — plus, since the schedule table (2.11 pending), `schedules.state`, the newest **adopted** schedule table (its frame-end position, the frame's stamp, the encoded bytes, and one level of predecessor to revert to if the frame is truncated). `schedules.state` is deliberately **not** in `backup`'s five-file `STATE_FILES` checklist, so a backup artifact taken before this feature existed still verifies; the copy is whole-directory, so the record travels with a backup anyway. |
 | `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships and installs them. `<pos>` is the absolute log byte position the snapshot represents. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
 | `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
@@ -22,6 +22,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `egress_service.<id>.broadcast` | node → service | Apply and output stream to FSM `id`'s service. One per declared id since M14. A client opens every declared id's ring and accepts a response only from the FSM(s) its request named. |
 | `egress_node.broadcast` | node → clients | Node-originated answers to clients: `MSG_V2_NOT_LEADER` (with the leader hint), `MSG_V2_RETRY`, and `MSG_V2_BAD_SERVICE` (the query named an id this node has no ring for). Submit and query *responses* come from the FSMs' own rings. |
 | `service.<id>.lock` | service | Exclusive `flock`, held for FSM `id`'s service process's life — one process per declared id (M14). |
+| `schedules.pending` | admin client → node | The staged schedule table `uc2ctl schedule apply` writes (mode `0600`, fsync, rename) before sending the admin request that carries its digest. Transient: the node reads it, checks the digest, and **deletes it after a successful append**. A refused or timed-out apply leaves it in place so a retry needs nothing re-staged. Present only between a stage and a successful apply. |
 | `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. One exception: a byte-identical re-send of an already-answered, already-recorded proposal (same nonce) is counted, not re-recorded — it repeats an answer already in the file rather than being a new admin event. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
 
 Since M14, the per-service files are named by id: `svc_query.<id>.ring` and
@@ -53,6 +54,7 @@ together on this upgrade — see
 | Durable | `journal/`, `state/`, `snapshots/` | Must survive power loss. |
 | Durable, node-local | `audit.jsonl` | Must survive power loss; **not** replicated and not part of a backup's consistency story — each node records only what it itself answered. |
 | Volatile-safe | `cnc2.dat`, `log.buf`, all `*.ring` and `*.broadcast` files | Rebuilt or re-primed on boot. |
+| Transient request payload | `schedules.pending` | Not durable state and not backed up. Losing it costs a re-run of `uc2ctl schedule apply`; the adopted table lives in `state/schedules.state` and on the log. |
 
 `audit.jsonl` is opened `O_APPEND` at node start (a node that cannot open it
 refuses to start) and every record is `fsync`ed **before** the answer it

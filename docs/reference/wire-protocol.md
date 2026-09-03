@@ -17,11 +17,12 @@ The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
 (the once-reserved slot line 7, plus two previously-unused words —
 `log_time_ns` and the per-row `timers_pending`). The UDP datagram format
-moved to 0.7.0 for **two** changes shipping on the same unreleased `2.11.0`
-flag day: `SNAP_BEGIN` swapped its `services_declared` bitmask for a per-row
-identity-hash array plus a per-row version array (FSM identity), and the log
-frame header was **relaid** to carry a leader-written `time_ns` stamp, with a
-new `TIMER` frame type beside it (log time and timers). Every other datagram
+moved to 0.7.0 for **two features** shipping on the same unreleased `2.11.0`
+flag day. FSM identity: `SNAP_BEGIN` swapped its `services_declared` bitmask
+for a per-row identity-hash array plus a per-row version array. Log time and
+timers: the log frame header was **relaid** to carry a leader-written
+`time_ns` stamp, and two frame types were added beside it — `TIMER` (5) and,
+for the replicated schedule table, `SCHEDULE_TABLE` (6). Every other datagram
 is byte-identical to 0.6.0. `CURRENT` is documentary and is not itself checked
 on any receive path (see `version.rs`); the two version lines remain
 independent of each other.
@@ -141,7 +142,7 @@ wrap; padding fills exactly to it.
 |---|---|---|---|
 | 0 | `length` | u32 LE | the commit word: total frame length (header + payload), written LAST with a release store; `0` = not yet committed |
 | 4 | `type` | u8 | see the type table below |
-| 5 | `flags` | u8 | `FLAG_TIMER_TABLE = 0x01` on a `TIMER` frame (reserved for the plan-2 schedule table); zero on every other type today |
+| 5 | `flags` | u8 | `FLAG_TIMER_TABLE = 0x01` on a `TIMER` frame — this tick came from the replicated schedule table, not from a state machine's own `schedule` call; zero on every other type today |
 | 6 | reserved | u16 | written as zero |
 | 8 | `leadership_term_id` | u32 LE | |
 | 12 | `client_id` | u32 LE | the submitting client; `0` for node-originated frames |
@@ -177,6 +178,7 @@ seeds its clamp from.
 | 3 | `NEW_TERM` | written by a leader when it opens a term; header-only, 32 B |
 | 4 | `CONFIG` | a cluster configuration record |
 | 5 | `TIMER` | **new in 0.7.0**: a scheduled timer the leader fired. 24-byte body, below |
+| 6 | `SCHEDULE_TABLE` | **new in 0.7.0**: the replicated schedule table an operator applied. Variable body, below |
 
 #### `TIMER` body (wire 0.7.0)
 
@@ -197,6 +199,51 @@ The body is id-only by design: there is no payload, and an FSM keeps whatever
 context a timer needs in its own state, keyed by `timer_id`. Semantics,
 delivery and the ordering guarantee:
 [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
+
+#### `SCHEDULE_TABLE` body (wire 0.7.0)
+
+`FRAME_TYPE_SCHEDULE_TABLE = 6` carries the whole replicated schedule table —
+the recurrences an operator applied with
+[`uc2ctl schedule apply`](uc2ctl.md#schedule-apply). Applying **replaces** the
+table; there is no incremental edit and no delete verb. The codec is
+`uc_protocol::v2::schedule` (`encode_schedule_table` / `decode_schedule_table`),
+hand-laid and total in the same style as `v2::config`'s.
+
+An 8-byte header followed by `count` fixed 33-byte entries:
+
+| bytes | field | meaning |
+|---|---|---|
+| 0..4 | `version` | u32 LE, currently `1`; any other value decodes to `None` |
+| 4..6 | `count` | u16 LE, `0..=MAX_SCHEDULE_ENTRIES` (**32**) |
+| 6..8 | reserved | written as zero |
+
+Each entry, `SCHEDULE_ENTRY_LEN = 33`:
+
+| bytes | field | meaning |
+|---|---|---|
+| 0..8 | `identity_hash` | u64 LE — the owning FSM's name hash, the same one a `TIMER` frame names |
+| 8..16 | `timer_id` | u64 LE — the id that FSM's `on_timer` will see |
+| 16 | `kind` | u8: `1` = `every`, `2` = `at`, `3` = `once` |
+| 17..25 | `a` | u64 LE — `every`: `period_ns` (must be > 0); `at`: `secs_of_day` (< 86 400, UTC); `once`: `at_ns` |
+| 25..33 | `b` | u64 LE — `every`: `anchor_ns`; **must be zero** for `at` and `once` |
+
+A full table is `8 + 32 × 33 = 1064` bytes, inside the 1312 B crypto-on
+payload ceiling, so the frame always fits one datagram
+([Limits](limits.md#hard-limits)).
+
+The decoder refuses — returns `None`, never panics or allocates from a
+peer-supplied length — on a short buffer, a version other than `1`, a `count`
+above 32, a total length other than `8 + 33 × count`, an unknown `kind`, a
+zero `period_ns`, a `secs_of_day >= 86_400`, a non-zero `b` on an `at`/`once`
+entry, or a duplicate `(identity_hash, timer_id)` pair. It is fuzzed as
+`uc_protocol_schedule_table` and its byte layout is frozen by
+`table_codec_pins_bytes_and_is_total`.
+
+The apply layer never sees this frame: like `CONFIG`, it is skipped by every
+FSM's apply loop. The leader adopts the table at append; every other node
+adopts it from the archive's header walk, the same path `CONFIG` takes. What
+the table then does is
+[Log time and timers, explained § The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table).
 
 Per-record framing uses an atomic-after-write length prefix: a reader that sees
 length `0` has found a record that is not yet committed. A non-zero length below

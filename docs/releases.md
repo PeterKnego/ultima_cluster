@@ -15,9 +15,11 @@ ship together:
 |---|---|---|
 | FSM identity | `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` | `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10, all done) |
 | Log time and timers, plan 1 | `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md` (T0–T14, all done) |
+| Log time and timers, plan 2 (the replicated schedule table) | the same spec, §5 | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md` (T0–T8, all done) |
 
-Plan 2 of the time spec (the replicated schedule table, §5) is **not** in
-this release; it is the next item under that feature in `docs/BACKLOG.md`.
+Plan 2 was written and executed on the same branch after plan 1 landed, so
+all three features share the `0.7.0` / `3.1` flag day. Plan 2 adds one frame
+type and one admin verb; it changes nothing plan 1 shipped.
 
 ### The problem this closes
 
@@ -238,14 +240,161 @@ explainer: `docs/notes/uc2-log-time-and-timers-explained.md`.
   bound to every generic path the apply loop already threads
   `S: RawStateMachine` through, for a hook whose default is "nothing".
 
+### Log time and timers, plan 2 — the replicated schedule table
+
+**The problem it closes.** Plan 1 makes an FSM able to schedule *itself*, from
+inside `apply`. It does nothing for the schedules an operator owns — "run the
+nightly reconciliation at 02:00", "sweep every ten minutes" — which today have
+to be bootstrapped by a command someone remembers to send, and re-sent after
+every wipe-and-rejoin. Plan 2 makes that a replicated table: applied once,
+adopted by every node from the log, fired by whoever is leading. Spec §5;
+plain-language section:
+`docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table`.
+
+- **`FRAME_TYPE_SCHEDULE_TABLE = 6`**, a hand-laid total codec in
+  `uc_protocol::v2::schedule` in `v2::config`'s style: an 8-byte header
+  (`version u32 = 1 ‖ count u16 ‖ reserved u16`) plus `count × 33` bytes
+  (`identity_hash u64 ‖ timer_id u64 ‖ kind u8 ‖ a u64 ‖ b u64`), with
+  `MAX_SCHEDULE_ENTRIES = 32` so a full table is **1064 B** — inside the
+  1312 B crypto-on ceiling, hence always one datagram. Three kinds: `1 = every
+  {period_ns, anchor_ns}`, `2 = at {secs_of_day, 0}` (daily, UTC), `3 = once
+  {at_ns, 0}`. Entries are keyed by the FSM's **identity hash**, not its row —
+  names appear only in the operator's TOML, and `uc2ctl` resolves them against
+  the node's own cnc name lines before staging anything. The layout is frozen
+  by `table_codec_pins_bytes_and_is_total` and the decoder is fuzzed as
+  `uc_protocol_schedule_table`, the **eighteenth** target; that target found
+  real `u64`-range overflows in the recurrence arithmetic, which is now
+  saturating throughout.
+- **A `once` parks rather than leaving.** Applying replaces the whole table, so
+  an operator who adds one rule re-applies a file that still contains last
+  week's `once`. If a fired `once` were dropped from the table, that re-apply
+  would arm and re-fire it. So it stays, marked delivered, with no next
+  deadline: not counted in `uc2_timers_pending`, still counted in
+  `uc2_schedule_entries`, and immune to re-application unless its time or its
+  id changes.
+- **How the bytes reach the leader.** The cnc admin line is 64 fixed bytes and
+  the HMAC covers exactly those, so a 1064-byte table cannot ride it.
+  `uc2ctl schedule apply` therefore (1) parses and resolves, (2) writes the
+  encoded bytes to `<instance_dir>/schedules.pending` (`0600`, fsync, rename),
+  and (3) sends admin op 6 whose signed `id ‖ ip ‖ port` fields carry the first
+  **80 bits** of SHA-256 over those bytes (`uc_node::schedule_digest`, frozen
+  and pinned against the canonical `SHA-256("abc")` vector). The node verifies
+  the request as it verifies every admin op, size-checks the file against
+  `MAX_SCHEDULE_TABLE_BYTES` and rejects a non-regular one **before** reading
+  it (this runs on the consensus agent), recomputes the digest, decodes, and
+  checks every entry names a declared row. Four named refusals:
+  `40 schedule_digest`, `41 schedule_missing`, `42 schedule_decode`,
+  `43 schedule_unknown_fsm` (`uc_node::REASON_SCHEDULE_*`). An unknown FSM
+  fails the **whole** table — a partially adopted table would leave an operator
+  believing a timer is armed that no row will fire.
+- **Leader-only, single-in-flight, and side-effect-free on refusal.** The check
+  sits after authentication and *before* the leader/forward split, because the
+  staged file is node-local: a follower can neither forward (the leader has no
+  such file) nor act (it cannot append), so it answers `status 2` with the
+  leader hint. The leader answers `status 2` too while the previous table frame
+  is still above commit — the config path's `ChangePending` idea, in the node
+  layer. That single-in-flight rule is what makes **one** level of
+  `ScheduleRecord.prev` sufficient: committed frames are never truncated, so at
+  most one table frame is ever truncation-exposed. The staged file is deleted
+  **only** after a successful append, so a refusal or a timeout is retryable
+  whole, and a re-presented request after a success refuses `schedule_missing`
+  rather than appending twice. Every outcome is audited as `schedule_apply`
+  (op 6); in that record the `id`/`addr` fields render the digest, not an
+  address. On the accepted path the reply's `version` word is the new table's
+  frame-END position — one meaning per op.
+- **Adoption mirrors CONFIG exactly.** The leader adopts at append; every other
+  node adopts from the archive's header walk. Each node persists
+  `ScheduleRecord { position, time_ns, table, prev }` in
+  `state/schedules.state` as its own `StableValue` (not inside `NodeState`,
+  whose single cache lock is on the consensus hot path), and **reverts to
+  `prev`** when its log is truncated below the adopted frame — both on
+  `Truncate` and on the leader-open `Collapse`. At boot every entry is re-armed
+  from the recovered log clock before the service attaches, so a `DailyAt` rule
+  does not go silent for a day after a bounce. The record is deliberately not
+  in `backup`'s five-file `STATE_FILES` set — an artifact taken before this
+  feature existed must still verify — but the copy is whole-directory, so it
+  travels with a backup anyway.
+- **Firing: three deliberate differences from a programmatic timer.** Table
+  ticks go through the same per-row heap and the same `TIMER` frame, with
+  `FLAG_TIMER_TABLE` set and `ev.table` true at the FSM. (1) **The node
+  advances the entry at append** on the leader (`RowTimers::table_fired`) and
+  on the service's `SchedOp::TableConsumed` report on a follower
+  (`table_delivered`), so a leader keeps a table on schedule without waiting
+  for its own service and a new leader starts from what *its* service last
+  delivered. (2) **A truncated table tick is not re-armed** — unlike a
+  programmatic instance, it has a successor already armed, and re-arming would
+  fire the entry twice for one period. (3) **One-tick catch-up at fire time**:
+  `RowTimers::table_fire_deadline` fires the *latest* occurrence at or before
+  the leader's clock, so an hour of downtime with a one-second rule produces
+  one late tick and then continues from it, rather than replaying 3 600. Which
+  occurrence is due is the one clock-driven choice the determinism rule allows,
+  and the chosen deadline rides the frame, so every replica advances from the
+  same value.
+- **Exactly-once for table ticks** is `Timed<S>`'s `table_last` map: a tick is
+  delivered only when its deadline is newer than the last one delivered for
+  that id, and `TableConsumed` is reported **even for a dropped duplicate**, so
+  the node clears its state either way. The map was already in `Timed`'s
+  snapshot image before plan 2 landed, so the snapshot format did not change.
+- **Observability**: `uc2_schedule_table_position` (gauge — the adopted frame
+  END, `0` = none), `uc2_schedule_entries` (gauge — parked `once` entries
+  included, which is the one place it differs from `uc2_timers_pending`) and
+  `uc2_schedule_apply_refused_total` (counter; **retries are not counted** —
+  neither a follower's nor a leader's single-in-flight one). Records:
+  `schedule_table_adopted` (info) and `schedule_apply_refused` (warn), plus
+  `schedule_staged_file_kept` (warn) for the one case where the append
+  succeeded but the staged file could not be removed. New alert rule
+  `Uc2ScheduleTableDiverged`
+  (`count(count_values("p", uc2_schedule_table_position)) > 1`, 60 s, warning),
+  using `Uc2ServiceIdentityDrift`'s `count_values` idiom. `uc2ctl status`
+  prints `schedule_position=` on the `config:` line and `uc2ctl schedule show`
+  renders the adopted table, resolving hashes back to names.
+- **Proof surface**:
+  `uc_node/tests/timers.rs::a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick`
+  and `::a_restarted_node_resumes_the_table_with_one_catch_up_tick`;
+  `uc_node/tests/admin_auth.rs::schedule_apply_is_signed_digest_checked_leader_only_and_audited`;
+  four `RowTimers` unit tests in `uc_node/src/timers.rs`
+  (`table_entries_advance_on_fire_and_never_enter_in_flight`,
+  `table_delivered_advances_a_follower_and_adopt_keeps_last_delivered`,
+  `programmatic_and_table_share_the_heap_in_deadline_order`,
+  `once_entries_fire_once_park_and_survive_re_adoption`); clause **(7)** of the
+  shared `uc_lincheck::timer::assert_timer_report` oracle, which adjudicates
+  table fires (they carry no `Schedule` record, so the programmatic clauses
+  skip them) and is exercised by the `two_fsm_timer_churn_under_failover`
+  capstone; and the `uc_protocol_schedule_table` fuzz target, taking the tier
+  from 17 to **18**.
+- **Three execution rulings that amend spec §5**, recorded there as as-built
+  errata: the one-tick catch-up moved from arm time to **fire** time (arming
+  alone cannot help, because the recovered log clock can be hours behind the
+  new leader's wall clock); single-in-flight apply plus `ScheduleRecord.prev`
+  and revert-on-truncation (the spec's record had no `prev`); and `once` as a
+  third rule kind that **parks** on firing (the spec had two rules and no park).
+- **Known limits, documented rather than fixed** (also in
+  `docs/reference/limits.md` and `docs/BACKLOG.md` § 2a): the table is not
+  carried in the snapshot stream, so with purge ON a below-floor joiner whose
+  table frame was purged runs without it until the next apply; a node that
+  crashes in the sub-millisecond window between the archive recording a table
+  frame and the consensus agent persisting it loses that adoption, there being
+  no journal re-scan for type-6 frames; boot arming has no delivered set until
+  the service announces, so a restart may re-append the latest occurrence of
+  every entry once (a parked `once` included) and `Timed` drops it; and there
+  is no timezone and no cron syntax — `at` is UTC, and a cron-shaped rule would
+  be a fourth kind byte.
+- **One process gap, not a code one.** `Uc2LogTimeFrozen` (plan 1) and
+  `Uc2ScheduleTableDiverged` (plan 2) both ship without a `RULE_BUILDERS` entry
+  in `scripts/m10_alert_fire.sh`, whose completeness cross-check therefore
+  names them and exits 1. That script is a local gate harness, not a CI job, so
+  nothing is red today — but the M10 gate's row 4 cannot be re-run as written
+  until both builders exist. Called out here rather than left to be
+  rediscovered.
+
 ### Breaking, and why it ships as a minor
 
 Under [the semver policy](reference/semver-policy.md) this is a real
 breaking change: the trait gains a required const and changes `apply`'s
 signature, `ServiceConfig` loses a setter, `[services]` goes from optional
 to required with `ids` refused outright, and every `--service-id` CLI flag
-is gone. Log time and timers adds nothing further to that list — its whole
-`uc_service` surface is additive (`#[non_exhaustive]` fields, two provided
+is gone. Log time and timers adds nothing further to that list — in either plan; its
+whole `uc_service` surface is additive (`#[non_exhaustive]` fields, two provided
 trait methods with defaults, new types, a new wrapper), and `uc_protocol`'s
 `FrameHeader` change is on an item the policy does not promise. The maintainer's decision (spec §10, 2026-09-02) ships it as the
 **next minor**, `2.11.0`, rather than `3.0.0` — on the project having no
@@ -269,7 +418,7 @@ file uses ("What proves the release").
 | workspace correctness stack (`lin_v2`, `lin_partition_v2`, `learner`, `elle_check.sh`, hard-crash) | dev-box smoke only so far, see the branch's Task 9 report | pending (fleet-equivalent, not yet a gate) |
 | `cargo test --workspace --doc` | Task 10, this worktree | see below (run as part of this docs sweep, not a release gate on its own) |
 | FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
-| time-and-timers gate (rows a/b/c/d) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — bars committed, no run. Row d is an isolated `apply_bench` A/B under `scripts/hop1_ab.sh`'s same-source rebuild control, added because this work *does* touch two hot loops (M14a's codegen lesson) |
+| time-and-timers gate (rows a/b/c/d/e) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — bars committed, no run. Row d is an isolated `apply_bench` A/B under `scripts/hop1_ab.sh`'s same-source rebuild control, added because this work *does* touch two hot loops (M14a's codegen lesson); row e re-runs the throughput rows with a full 32-entry schedule table live |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |
 | crates.io | — | pending |

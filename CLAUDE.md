@@ -73,18 +73,22 @@ changes are planned on the branch first, so no version has been bumped, no
 tag cut, no fleet gate run — see the "Standing facts" entry below and
 `docs/BACKLOG.md` item 2.
 
-Also on that branch and in the same `2.11.0` flag day: **time and timers,
-plan 1** (spec
-`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`, plan
-`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md`, T0–T14 all
-done) — leader-stamped log time and a deterministic scheduler. Requested by
-the maintainer 2026-09-02, not a ranked backlog item. **Plan 2 (the
-replicated schedule table, spec §5) is NOT built** and is the next item under
-this feature (`docs/BACKLOG.md` item 2a). Explainer
-`docs/notes/uc2-log-time-and-timers-explained.md`; gate skeleton
+Also on that branch and in the same `2.11.0` flag day: **time and timers**
+(spec `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`),
+**both plans IMPLEMENTED** — plan 1
+(`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md`, T0–T14),
+leader-stamped log time and a deterministic scheduler, and plan 2
+(`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md`, T0–T8), the
+**replicated schedule table** (spec §5): `FRAME_TYPE_SCHEDULE_TABLE = 6`,
+`uc2ctl schedule apply/show`, adoption through the archive walk, and table
+ticks that fire through the same heap and the same `TIMER` frame. Requested by
+the maintainer 2026-09-02, not a ranked backlog item; still release-on-hold.
+Explainer `docs/notes/uc2-log-time-and-timers-explained.md` (plan 2 is its
+"The schedule table" section); gate skeleton
 `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars pre-committed,
-no run; its row d is an isolated `apply_bench` A/B, because unlike identity
-this work does touch two hot loops). The other ranked directions, each with the
+no run; row d is an isolated `apply_bench` A/B, because unlike identity this
+work does touch two hot loops, and row e runs a full 32-entry table under the
+throughput load). The other ranked directions, each with the
 doc that first recorded it, are in `docs/BACKLOG.md` (update its line when
 an item is taken up or dropped). `2.10.0` shipped 2026-08-31 (tag
 `v2.10.0`, all 13 crates published; the release-evidence table is at the
@@ -138,8 +142,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   `docs/reference/semver-policy.md`.
 - **`2.11.0` is implemented on branch `uc2/fsm-identity` and not yet
   released** — the facts above (wire `0.6.0`, cnc `3.0`) still describe
-  what is actually shipped. **Two features, one flag day** on the branch:
-  wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`.
+  what is actually shipped. **Three features, one flag day** on the branch
+  (FSM identity, log time and timers plan 1, and the replicated schedule
+  table): wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`.
   - **FSM identity.** `SNAP_BEGIN` carries per-row identity hashes +
     versions, compared positionally, refused by name (replaces the
     `services_declared` bitmask); cnc slot line 7 = row name + hash,
@@ -182,15 +187,51 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     reservation from 5 to 6 MiB. Only `timer_late` and `timers_rearmed` are
     logged (no per-fire record: `uc_obs` has no Debug level and a `stderr`
     write per timer on the consensus agent was rejected).
+  - **The replicated schedule table (plan 2).**
+    `FRAME_TYPE_SCHEDULE_TABLE = 6` carries the whole table: an 8-byte header
+    plus `count × 33` bytes, `MAX_SCHEDULE_ENTRIES = 32` → 1064 B, inside the
+    1312 B crypto-on ceiling. Three rules — `every {period_ns, anchor_ns}`,
+    `at {secs_of_day}` (daily, UTC) and `once {at_ns}`, which **parks** after
+    firing (stays in the table as delivered, so re-applying the same file does
+    not re-fire it; changing its time or id does). `uc2ctl schedule apply
+    <file.toml>` encodes, stages `<instance_dir>/schedules.pending` (0600,
+    fsync, rename) and signs the first 80 bits of its SHA-256 in admin op 6's
+    `id ‖ ip ‖ port` fields — so a 64-byte admin line authenticates a
+    1064-byte payload. **Leader-only** (the staged file is node-local: a
+    follower answers retry, never forwards) and **single-in-flight** (the
+    leader answers retry while the previous table frame is above commit, which
+    is what makes one level of `ScheduleRecord.prev` enough). Refusals
+    `40 schedule_digest` / `41 schedule_missing` / `42 schedule_decode` /
+    `43 schedule_unknown_fsm`; audited as `schedule_apply`. Adoption mirrors
+    CONFIG (leader at append, followers from the archive walk), persisted in
+    `state/schedules.state`, reverted to `prev` on truncation, re-armed at boot
+    from the log clock. Ticks fire as `TIMER` frames with `FLAG_TIMER_TABLE`;
+    the node advances the entry **at append** (leader) or on the service's
+    `TableConsumed` (followers); a truncated table tick is **not** re-armed;
+    and a due entry fires at the **latest** occurrence at or before the
+    leader's clock (`RowTimers::table_fire_deadline`) — one catch-up tick after
+    downtime, never a backlog. `Timed<S>` dedups on `table_last`. Metrics
+    `uc2_schedule_table_position` / `uc2_schedule_entries` /
+    `uc2_schedule_apply_refused_total`, alert `Uc2ScheduleTableDiverged`.
+    **Documented limits**: not carried in the snapshot stream (a below-floor
+    joiner runs without it until the next apply), lost by a crash in the
+    sub-millisecond window between archive record and persist (no journal
+    re-scan for type-6 frames), one possible duplicate tick per entry after a
+    restart (`Timed` drops it), no timezones and no cron.
   - **The relayout is the sharper half of this flag day.** Every prior wire
     bump was caught by a length check, so a mixed cluster stalled. A relaid
     header is the *same length*: a `0.6.0` peer's frames parse and mean
     something different. Stop every node before starting any node.
   - See the "Next up" paragraph above,
     `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`,
-    `docs/notes/uc2-log-time-and-timers-explained.md`, and
-    `docs/reference/semver-policy.md`'s FSM-identity carve-out (ships as the
-    next minor, `2.11.0`, not `3.0.0`, per the maintainer's decision).
+    `docs/notes/uc2-log-time-and-timers-explained.md` (its "The schedule
+    table" section for plan 2), and `docs/reference/semver-policy.md`'s
+    FSM-identity carve-out (ships as the next minor, `2.11.0`, not `3.0.0`,
+    per the maintainer's decision). One process gap to close before the M10
+    gate's row 4 can be re-run: `Uc2LogTimeFrozen` and
+    `Uc2ScheduleTableDiverged` ship with no `RULE_BUILDERS` entry in
+    `scripts/m10_alert_fire.sh`, whose completeness cross-check names them and
+    exits 1 (a local harness, not a CI job, so nothing is red today).
 - **Wire crypto is opt-in and OFF by default**, all-encrypted or
   all-cleartext per cluster (no mixed mode). Threat model: a network-path
   adversary; out of model: a compromised host or a malicious member — the
@@ -261,7 +302,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
-  15 fuzz targets (17 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
+  15 fuzz targets (18 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and

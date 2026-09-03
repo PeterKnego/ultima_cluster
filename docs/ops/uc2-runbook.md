@@ -75,6 +75,18 @@ verify rather than a build:
   only when a fire is late — there is deliberately no per-fire record on the
   consensus agent's hot path) and `timers_rearmed` (on a leadership loss). See
   [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
+- **Do all nodes hold the same schedule table?** `uc2_schedule_table_position`
+  is the frame-end position of the table this node has adopted (`0` = none) and
+  must be identical everywhere; `Uc2ScheduleTableDiverged` fires when it is
+  not. `uc2_schedule_entries` counts the adopted entries (a parked `once`
+  included, unlike `uc2_timers_pending`), and
+  `uc2_schedule_apply_refused_total` counts refused applies. The records are
+  `schedule_table_adopted` (info, on every adoption) and
+  `schedule_apply_refused` (warn, with the reason code). **A node reading
+  position `0` while its peers read a nonzero one has not adopted the table** —
+  it joined below the purge floor (the table is not in the snapshot stream), or
+  it crashed in the narrow window between recording the frame and persisting
+  it. The remedy for both is the same: re-run `uc2ctl schedule apply`.
 
 ## Changing a running cluster
 
@@ -83,6 +95,28 @@ verify rather than a build:
   replace hardware; **signed admin requests** (`--admin-key`,
   `gen-admin-key`, the `auth_*`/`audit_failed` reason codes) and reading
   `uc2ctl audit` (M12b, `v2.6.0`). *Was §6.*
+- **Apply a schedule table** (2.11 pending):
+  `uc2ctl schedule apply <file.toml> --instance-dir D --app-id A [--admin-key K]`
+  parses the TOML, stages the encoded bytes as `<instance_dir>/schedules.pending`
+  (mode `0600`, fsync, rename), and sends admin op `6` carrying that file's
+  SHA-256 digest in the signed request fields — so under `[admin] auth = "hmac"`
+  the table's contents are authenticated even though they never fit the 64-byte
+  admin line. **Run it against the leader**: the staged file is node-local, so a
+  follower answers `retry` (status `2`) with the leader hint rather than
+  forwarding a request whose payload the leader cannot see. The leader also
+  answers `retry` while the previous table frame is still above commit (single
+  in flight); `uc2ctl` does not poll through a retry — it exits non-zero and
+  names the staged file, so re-run the same command. Refusals are `40 schedule_digest`,
+  `41 schedule_missing`, `42 schedule_decode`, `43 schedule_unknown_fsm`
+  ([`uc2ctl` § Refusal reasons](../reference/uc2ctl.md#refusal-reasons)); a
+  refused or timed-out apply **leaves the staged file in place**, so a retry
+  needs nothing re-staged, and the node deletes it only after a successful
+  append. Every outcome is audited as `schedule_apply` (its `id`/`addr` fields
+  render the digest, not an address). Applying **replaces the whole table** —
+  to drop one entry, apply a file without it. Read the adopted table back with
+  `uc2ctl schedule show`, which reads `<instance_dir>/state/schedules.state`,
+  and see the position on `uc2ctl status`'s `config:` line as
+  `schedule_position=`.
 - [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md) — key
   material, the flag-day rollout, health counters, and rotation; pair with
   `[admin] auth = "hmac"` — see its "Known interaction with admin
@@ -125,7 +159,13 @@ verify rather than a build:
   `service.<id>.lock`, `snapshots/<id>/`) and, since log time and timers
   (2.11 pending), `svc_sched.<id>.ring` — the first per-row ring the **node**
   consumes (service → node: schedule, cancel and consumed requests). It takes
-  the per-row reservation from 5 MiB to 6 MiB. *Was §1.*
+  the per-row reservation from 5 MiB to 6 MiB. The schedule table adds two more
+  paths in the same release: `state/schedules.state` (durable, the newest
+  **adopted** table; copied by `backup`/`restore` with the rest of `state/`, and
+  optional — it is not in the verify checklist, so a pre-2.11 artifact stays
+  valid) and `schedules.pending` in the instance root (transient, written by
+  `uc2ctl schedule apply`, deleted by the node after a successful append).
+  *Was §1.*
 - [The cnc control page](../reference/cnc-page.md) — the pinned layout, field by
   field, including cnc 3.1's per-slot name/hash line (7) and version word
   (line 0, word 1) added for FSM identity, plus the two words log time added
@@ -142,7 +182,9 @@ verify rather than a build:
   statuses, refusal reasons. `status`'s `services:` line gained
   `log_time_ns=<ns>` (raw nanoseconds since the Unix epoch, not RFC 3339 —
   there is no formatter in the binary) and each per-FSM row gained
-  `timers_pending=<n>`, both since log time and timers (2.11 pending).
+  `timers_pending=<n>`, both since log time and timers (2.11 pending); the
+  `config:` line gained `schedule_position=<n>` and the sub-command list gained
+  `schedule apply` / `schedule show` with reason codes 40–43.
 - [Monitor a cluster → The per-FSM families](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
   — which metric families carry a `service` label, what the unlabeled
   aggregate means now, and the declared-set drift query. `Uc2ServiceIdentityDrift`

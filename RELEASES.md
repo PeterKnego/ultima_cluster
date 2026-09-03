@@ -24,7 +24,8 @@ travels everywhere the cluster used to check only a bare row number, closing
 the gap where two nodes could agree on a *set* of numbered slots and never
 on what logic lived behind each one. And the log now carries **time**: a
 leader-written timestamp on every frame, which is the first deterministic
-clock a state machine has ever had, and a scheduler built on it.
+clock a state machine has ever had, a scheduler built on it, and a replicated
+schedule table an operator applies with one command.
 
 - **An FSM declares its own name and version in code**, not in deployment
   config: a required `const NAME: &'static str` and an optional `const
@@ -98,6 +99,29 @@ clock a state machine has ever had, and a scheduler built on it.
   than 5 s behind wall time for 30 s. `uc2ctl status` prints `log_time_ns=`
   and a per-row `timers_pending=`.
   → [Monitor a cluster § The log clock and the timer families](docs/how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending)
+- **An operator can now declare recurrences without touching the code, and
+  every node runs the same ones.** `uc2ctl schedule apply <file.toml>` applies
+  a **replicated schedule table**: a list of at most 32 entries, each naming an
+  FSM by name, a timer id, and one of three rules — `every "10m"` from an
+  anchor, `at "02:00"` (daily, UTC), or `once` at a fixed instant. The leader
+  appends the table as a log frame; every other node adopts it from the same
+  archive walk that adopts a config change, so there is no per-host file and no
+  per-host drift to detect. Ticks arrive at the FSM's existing `on_timer` with
+  `ev.table` set. Two behaviours are worth knowing before you use it: applying
+  **replaces** the whole table (to drop an entry, apply a file without it), and
+  a cluster that was down past several occurrences of a rule fires **one**
+  catch-up tick per entry, not the backlog. Applying is leader-only and
+  authenticated even though the table is far larger than the 64-byte admin
+  request line: `uc2ctl` stages the encoded bytes in the instance directory and
+  signs their SHA-256 digest, and the node refuses unless the file it reads back
+  matches. `uc2ctl schedule show` prints the adopted table;
+  `uc2_schedule_table_position`, `uc2_schedule_entries` and
+  `uc2_schedule_apply_refused_total` export it, and the new
+  `Uc2ScheduleTableDiverged` rule pages when nodes disagree about which table
+  they are running.
+  → [Log time and timers, explained § The schedule table](docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table) ·
+  [`uc2ctl` § `schedule apply`](docs/reference/uc2ctl.md#schedule-apply) ·
+  [UC v2 operations § Changing a running cluster](docs/ops/uc2-runbook.md#changing-a-running-cluster)
 
 **Removed (breaking)**
 
@@ -118,13 +142,21 @@ clock a state machine has ever had, and a scheduler built on it.
   carrying both features.** `SNAP_BEGIN`'s `services_declared` bitmask becomes
   a per-row identity-hash array plus a per-row version array; the cnc page's
   once-reserved slot line 7 becomes node-written at boot (name + hash); the
-  log frame header is relaid for `time_ns` and a `TIMER` frame type is added;
-  two more cnc words appear (`log_time_ns`, per-row `timers_pending`).
+  log frame header is relaid for `time_ns` and two frame types are added
+  (`TIMER`, `SCHEDULE_TABLE`); two more cnc words appear (`log_time_ns`,
+  per-row `timers_pending`).
   **Read the upgrade note before this one.** Every prior wire bump was caught
   by a length check, so a mixed cluster stalled. A relaid header is the *same
   length*: a `0.6.0` peer's frames parse on a `0.7.0` node and mean something
   different. Stop every node before starting any node.
   → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31)
+- **Two new instance-directory paths for the schedule table**:
+  `state/schedules.state` (durable — the newest adopted table; copied by
+  `backup`/`restore` with the rest of `state/`, and deliberately outside the
+  five-file verify checklist so a pre-2.11 artifact still verifies) and a
+  transient `schedules.pending` that `uc2ctl schedule apply` stages and the node
+  deletes after a successful append.
+  → [Instance directory § Files](docs/reference/instance-directory.md#files)
 - **One new file per declared FSM in the instance directory**,
   `svc_sched.<row>.ring` (1 MiB, service → node). The per-row reservation goes
   from 5 MiB to 6 MiB, so the boot reservation is ~79 MiB at the defaults with
@@ -143,7 +175,8 @@ clock a state machine has ever had, and a scheduler built on it.
   heap peek per leader pass; a `time_ns`/`term` fill and a `TIMER` branch per
   applied frame), so its gate carries an isolated apply-hop A/B alongside the
   throughput rows, because M14a proved that code added to a hot loop's body
-  can cost even on paths that never run:
+  can cost even on paths that never run, plus a row that runs a full 32-entry
+  schedule table under the throughput load:
   → [Time-and-timers gate skeleton](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md).
 
 ## v2.10.0 — 2026-08-31

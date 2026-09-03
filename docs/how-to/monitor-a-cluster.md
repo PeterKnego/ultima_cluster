@@ -173,8 +173,9 @@ permanently on any multi-node cluster.
 
 Since log time and timers, every log frame carries a leader-written timestamp
 and a state machine can schedule callbacks on it
-([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Six new
-families:
+([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Nine new
+families — six for the clock and the timer set, three for the replicated
+schedule table:
 
 | family | type | labels | meaning |
 |---|---|---|---|
@@ -184,6 +185,9 @@ families:
 | `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
 | `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
 | `uc2_timers_rearmed_total` | counter | `service`, `row` | in-flight instances moved back to pending on a leadership loss. Each may fire again; `uc_service::Timed<S>` drops the duplicate |
+| `uc2_schedule_table_position` | gauge | none | frame-END position of the schedule table this node has **adopted**; `0` = none. Must be identical on every node once caught up |
+| `uc2_schedule_entries` | gauge | none | entries in that adopted table, armed across every declared row. A parked `once` — one that has already fired — still counts here, unlike `uc2_timers_pending` |
+| `uc2_schedule_apply_refused_total` | counter | none | `uc2ctl schedule apply` requests this node refused. **Retries are not counted**: neither a follower's (the staged file is node-local, so the request is never forwarded) nor the leader's while a previous table frame is still above commit |
 
 **One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
 `uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The
@@ -203,6 +207,29 @@ record is `timers_rearmed`, on a leadership loss.
 A rising `uc2_timers_late_total` on a cluster that is not changing leaders is
 worth a look: either more than `TIMERS_PER_PASS` (64) timers are coming due per
 consensus pass, or the leader's passes are being delayed.
+
+**A second alert rule**, `Uc2ScheduleTableDiverged` (warning, `for: 60s`):
+`count(count_values("p", uc2_schedule_table_position)) > 1`. Every node adopts
+the table from the same log at the same position, so more than one distinct
+value across the fleet means one node is not running the schedule the others
+are. The common cause is a node that joined **below the purge floor**: the
+table is not carried in the snapshot stream, so a joiner whose table frame was
+purged holds position `0` while everyone else holds the adopted position. The
+rarer one is a node that crashed in the sub-millisecond window between the
+archive recording the frame and the consensus agent persisting
+`state/schedules.state`. Both have the same remedy — re-run `uc2ctl schedule
+apply`, which appends a fresh frame every node adopts.
+
+Two records go with them: `schedule_table_adopted` {`node`, `position`,
+`entries`} at info on every adoption (including the one a node makes at boot
+from its own durable record), and `schedule_apply_refused` {`node`, `reason`}
+at warn, whose `reason` is the same 40–43 code
+[`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). A third,
+`schedule_staged_file_kept`, is emitted at warn in the one case where the table
+*was* appended but the staged file could not be deleted afterwards. Deleting it
+is what normally makes a re-presented request refuse `schedule_missing` instead
+of appending the same table a second time, so remove
+`<instance_dir>/schedules.pending` by hand if you see this.
 
 ## Install the alert rules
 

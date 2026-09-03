@@ -51,7 +51,8 @@ fails otherwise. This is a wrong-cluster guard, not a credential — it is
 checked, but it proves nothing about who is asking.
 
 Every **mutating** admin-band command (`add-learner`, `promote`, `demote`,
-`remove-learner`, `remove-voter`) additionally takes (M12b, `v2.6.0`):
+`remove-learner`, `remove-voter`, and `schedule apply` since 2.11 pending)
+additionally takes (M12b, `v2.6.0`):
 
 **`--admin-key <PATH>`**
 Sign this request with a named admin HMAC key — a 32-byte, mode-`0600` key
@@ -82,7 +83,7 @@ window.
 ## Sub-commands
 
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
-`remove-voter`, `status`.
+`remove-voter`, `schedule apply`, `schedule show`, `status`.
 
 ### `add-learner`
 
@@ -118,6 +119,94 @@ Permanently removes a voter. The id is tombstoned. Wire op `5`.
 
 - `--id <U32>`
 
+### `schedule apply`
+
+Replicated schedule table (2.11 pending). Parse a TOML file of recurrences,
+stage it, sign its digest, and apply it. Wire op `6`.
+
+```
+uc2ctl schedule apply <FILE.toml> --instance-dir <DIR> --app-id <ID> [--admin-key <PATH>]
+```
+
+The TOML is a list of `[[schedule]]` tables. Exactly one of `every` / `at` /
+`once` per entry; `every` requires `anchor` and `anchor` requires `every`:
+
+```toml
+[[schedule]]
+fsm    = "orders"                    # an FSM name from the cluster's [services] names
+id     = 1                           # the timer id this FSM's on_timer will see
+every  = "1h"                        # ns/us/ms/s/m/d suffixes
+anchor = "2026-01-01T00:00:00Z"      # RFC 3339, UTC
+
+[[schedule]]
+fsm = "orders"
+id  = 2
+at  = "14:00"                        # HH:MM or HH:MM:SS, daily, UTC
+
+[[schedule]]
+fsm  = "kv"
+id   = 100
+once = "2026-12-24T18:00:00Z"        # fires once, then parks in the table
+```
+
+`every` takes an `ns`/`us`/`ms`/`s`/`m`/`d` suffix and must be > 0; `at` takes
+`HH:MM` or `HH:MM:SS`; `anchor` and `once` take RFC 3339 with a `Z`, and a
+calendrically invalid date (`2026-02-30`) is refused rather than normalised.
+
+**Applying replaces the whole table.** There is no per-entry add or delete
+verb: to remove an entry, apply a file without it; to empty the table, apply a
+file with no `[[schedule]]` entries at all. Timer ids share the FSM's id space
+with the ids its `apply` schedules programmatically, so reserve a range.
+
+`uc2ctl` resolves every `fsm = "…"` against the node's own cnc name lines
+**before** it stages anything, so a typo'd or stale name is refused locally
+with the entry index — the request is never written. It then writes the
+encoded bytes to `<instance_dir>/schedules.pending` (mode `0600`, fsync,
+rename) and sends the admin request carrying that file's digest — the first
+ten bytes of its SHA-256 — in the signed `id`/`ip`/`port` fields. Under
+`[admin] auth = "hmac"` the table's *contents* are therefore authenticated,
+even though the table itself is far too large for the 64-byte admin line.
+
+Three consequences worth knowing:
+
+- **Leader-only.** The staged file is node-local, so a follower cannot forward
+  the request and cannot read the leader's file. It answers `retry` (status
+  `2`) with the leader hint; re-run against the node the hint names.
+- **Single in flight.** The leader also answers `retry` while the previous
+  table frame is still above the commit position — the wait is one commit
+  round trip. `uc2ctl` does **not** poll through a `retry`: it prints the
+  staged file's path and exits non-zero, so re-run the same command.
+- **A refused or timed-out apply leaves the staged file in place**, so a retry
+  needs nothing re-staged. The node deletes `schedules.pending` only after a
+  successful append — which is also what stops a re-presented request from
+  appending the same table twice (it then refuses `schedule_missing`).
+
+On success the printed `version` word is the **frame-end position of the new
+table**, not a config version — one meaning per op. Every outcome, accepted or
+refused, is recorded in `audit.jsonl` as `schedule_apply`; in that record the
+`id` and `addr` fields render the digest, not an address.
+
+### `schedule show`
+
+Print the newest **adopted** schedule table from this node's durable state
+(`<instance_dir>/state/schedules.state`) — not the staged file, which a
+successful apply consumes. Read-only: it writes no admin request.
+
+```
+uc2ctl schedule show --instance-dir <DIR> --app-id <ID>
+```
+
+```
+position=8192 time_ns=1788000000000000000
+fsm=orders id=1 rule=every 1h anchor 2026-01-01T00:00:00Z
+fsm=orders id=2 rule=at 14:00:00
+```
+
+Each entry's `identity_hash` is resolved back to a name through the same cnc
+name lines `apply` used to resolve forward; a hash with no matching declared
+row prints as `0x…`. A node that has adopted nothing prints
+`no schedule table adopted`.
+
 ### `status`
 
 Prints the node's current config version and pending state, per-member
@@ -133,6 +222,7 @@ Output fields:
 
 | Field | Meaning |
 |---|---|
+| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11 pending) — `schedule_position=<n>`, the frame-end position of the adopted schedule table read from `state/schedules.state` (`0` = none adopted). It is the same number `uc2_schedule_table_position` exports and must be identical on every node |
 | `leader` | `NODE_FLAG_LEADER` is set |
 | `can_serve` | `NODE_FLAG_CAN_SERVE` is set |
 | `term` | current term |
@@ -308,6 +398,16 @@ failure (the single `process::exit(1)`), `2` for a command-line usage error
 | `1` | `refused: <reason>` | exit 1 (runtime failure) |
 | `2` | `retry: leader unknown or the append ring was momentarily full` | exit 1 (runtime failure) |
 
+`schedule apply` uses the same three statuses with its own wording, because
+its `version` word is a schedule position rather than a config version and
+because its `retry` has a second cause:
+
+| Status | Printed as | Process outcome |
+|---|---|---|
+| `0` | `applied: position=<N>` | exit 0 |
+| `1` | `refused: <reason> (schedule position <N>) — staged file kept at <PATH>` | exit 1 |
+| `2` | `retry: leader unknown or a previous table is still uncommitted (schedule position <N>) — staged file kept at <PATH>, try again` | exit 1 |
+
 ## Refusal reasons
 
 The `reason` field of a status-`1` response. Codes 1–10 and 12 are the
@@ -316,7 +416,9 @@ defensive catch-all; 20–24 (M12b, `v2.6.0`) are admin-authentication
 refusals (`uc_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — produced only
 under `[admin] auth = "hmac"`, and disjoint from the `ProposeError` band so a
 caller can tell "the cluster refused this change" from "the cluster refused
-to believe this was you" without consulting the policy.
+to believe this was you" without consulting the policy. 40–43 (2.11 pending)
+are `schedule apply`'s own refusals (`uc_node::REASON_SCHEDULE_*`), in their
+own band for the same reason.
 
 | Code | Reason |
 |---|---|
@@ -337,6 +439,10 @@ to believe this was you" without consulting the policy.
 | 22 | `auth_expired` — the signature's window is past, or stretched implausibly far into the future; check clock skew |
 | 23 | `auth_unknown_key` — this key name is not in the node's `[admin].keys` |
 | 24 | `audit_failed` — the node could not record the request (a full or failing disk) and refused rather than act unaccountably; **not** "nothing happened" — check `uc2ctl status` |
+| 40 | `schedule_digest` — the staged file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `schedule apply` |
+| 41 | `schedule_missing` — no staged file on this node. Either `schedule apply` was run against a different instance directory, or a successful apply already consumed it |
+| 42 | `schedule_decode` — the staged file is not a decodable schedule table (or is longer than a full 32-entry one) |
+| 43 | `schedule_unknown_fsm` — an entry names an FSM that is not one of this node's declared rows. The **whole** table is refused, never partially adopted: a typo'd name would otherwise leave an operator believing a timer is armed that no row will ever fire |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

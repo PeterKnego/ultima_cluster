@@ -1,7 +1,8 @@
 # uc2 time-and-timers gate — SKELETON, no fleet run yet
 
-**Date:** 2026-09-03 (bars committed). **Fleet run: NOT RUN — release on
-hold.** Log time and timers (plan 1) land on the same unreleased `2.11.0`
+**Date:** 2026-09-03 (bars committed; row e added the same day with plan 2).
+**Fleet run: NOT RUN — release on hold.** Log time and timers (plan 1 **and**
+plan 2, the replicated schedule table) land on the same unreleased `2.11.0`
 flag day as FSM identity; the maintainer has not green-lit fleet spend for
 either gate.
 
@@ -22,8 +23,11 @@ Spec:
 §8 ("Fleet gate"), §9. Plan 1 puts a leader-written `time_ns` stamp in every
 log frame header and adds a scheduler: a `TIMER` frame type, a per-row node
 heap, `ApplyCtx::{schedule, cancel}`, a provided `on_timer` on both tiers,
-and `uc_service::Timed<S>` for exactly-once delivery. Plain-language
-explainer:
+and `uc_service::Timed<S>` for exactly-once delivery. Plan 2 (§5) adds the
+**replicated schedule table**: `FRAME_TYPE_SCHEDULE_TABLE`, an admin verb
+(`uc2ctl schedule apply`), adoption from the archive walk, and table ticks
+that fire through the same heap and the same frame — row e is its bar.
+Plain-language explainer:
 [`docs/notes/uc2-log-time-and-timers-explained.md`](../notes/uc2-log-time-and-timers-explained.md).
 
 Two claims need a fleet to test, and this gate exists for exactly those:
@@ -61,7 +65,14 @@ is where the ordering and exactly-once properties are actually proved:
 across seeds, `uc_node/tests/timers.rs`, and the two capstones
 (`two_fsm_timer_churn_under_failover` in `lin_v2`,
 `two_fsm_timer_service_sigkill` in the hard-crash harness), both adjudicated
-by the shared `uc_lincheck::timer::assert_timer_report` oracle. See
+by the shared `uc_lincheck::timer::assert_timer_report` oracle. Plan 2's own
+correctness rows are
+`uc_node/tests/timers.rs::a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick`
+and `::a_restarted_node_resumes_the_table_with_one_catch_up_tick`,
+`uc_node/tests/admin_auth.rs::schedule_apply_is_signed_digest_checked_leader_only_and_audited`,
+the `RowTimers` unit tests in `uc_node/src/timers.rs`, the oracle's clause (7)
+exercised by the capstone, and the `uc_protocol_schedule_table` fuzz target.
+See
 [VERIFICATION §2, §3, §4](../VERIFICATION.md) for those rows and
 [VERIFICATION §11](../VERIFICATION.md#11-what-is-not-verified) for what none
 of it covers.
@@ -72,8 +83,12 @@ Pre-committed. Rows a and b run on the same fleet shape as the M14 gate
 (4 × `c6id.2xlarge`, `m12_gate` roles +
 [`bench-infra/scripts/m14_fleet_gate.py`](/bench-infra/scripts/m14_fleet_gate.py)),
 reusing that driver's rows a/b/e and its steady window (`WARMUP_SECS,
-MEASURE_SECS = 2, 8`). Row c is new. Row d is a dev-box-legal isolated A/B,
-not a fleet rate.
+MEASURE_SECS = 2, 8`). Row e here runs the same three driver rows again with a
+schedule table live, so it needs no new driver either — only the one
+`uc2ctl schedule apply` before the window opens. (The driver's rows a/b/e and
+this document's rows a–e are different namespaces; where it matters below, the
+driver's are called "the driver's rows a/b/e".) Row c is new. Row d is a
+dev-box-legal isolated A/B, not a fleet rate.
 
 Rows a, b and d are **null bars against measurement noise, not ratios
 against a target**: "within the same-source rebuild resolution measured by
@@ -90,6 +105,7 @@ pair; fresh builds of the same two commits read ±0.3 %, and two builds of the
 | b | the same three rows with one declared FSM scheduling **1 000 timers/s** sustained through the measure window | throughput within the same resolution as row a; **`uc2_timers_late_total == 0`** on every node after the warm-up window | not run — release on hold |
 | c | timer precision: the distribution of `time_ns − deadline_ns` over **≥ 10 000 on-time fires** under row b's load | **p99 ≤ 2 × the measured consensus-pass length on the rig.** Measure the pass length first, on the day, and write it into the results table before comparing anything to it | not run — release on hold |
 | d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), run under `scripts/hop1_ab.sh`'s same-source rebuild control, at N=1 and N=2, bounded lag | within the measured same-source rebuild resolution (the control arm of the same run) | **not run: no runner.** `scripts/hop1_ab.sh` drives `hop_bench`, not `apply_bench` — it launches the sink as `"$SINK" dummy-node --instance-dir … --app-id …` and each driver as `"$bin" engine-load --instance-dir … --app-id … --secs … --payload … --inflight … --engines …`, and parses a `RESULT {json}` line carrying `responses_per_sec`/`p50_ms`/`p90_ms`/`p99_ms`/`lost`. `apply_bench` has no subcommands at all (`clap` `Args`: `--root --fsms --mode --lag --secs …`); both invocations are refused with `error: unexpected argument 'dummy-node' found` / `'engine-load' found` (checked on `f59a0b5`, release build). Row d needs an `apply_bench`-shaped A/B runner with the same rebuild-control arm before it can be adjudicated; no substitute measurement was improvised. |
+| e | a 32-entry schedule table (`MAX_SCHEDULE_ENTRIES`, the cap) with **100 ms** `every` rules, all on **one** declared FSM, applied with `uc2ctl schedule apply` and left running through row a's three rows | **`uc2_timers_late_total` == 0** on every node after the warm-up window, and throughput within row a's resolution (the same-source rebuild number recorded on the day) | not run — release on hold |
 
 ### Reading the rules
 
@@ -124,6 +140,25 @@ sense, but its *bar* is a ratio against a control arm measured in the same
 run, which is exactly the construction the dev-box-is-not-a-bench rule
 permits.
 
+**Row e is the schedule table at its cap, not at a plausible setting.** 32
+entries is `MAX_SCHEDULE_ENTRIES` and 100 ms is fast for an operator-declared
+recurrence, so together they are 320 table ticks per second on one row. That
+is *below* row b's 1 000 programmatic timers/s deliberately: the rate is not
+what row e is probing — row b already covers the firing rate, and 320/s is
+comfortably under `TIMERS_PER_PASS = 64` per pass, so step 3 of the leader
+pass is never skipped here either. The point is to put every table-specific
+path under sustained load at once — the leader's advance-at-append, the
+followers' advance-on-`TableConsumed`, and
+`Timed`'s `table_last` dedup — while the throughput rows are being measured
+beside them. All 32 entries sit on **one** FSM deliberately: that is the
+worst case for a single row's heap, and it is the row whose
+`uc2_timers_pending` and `uc2_timers_late_total` the bar reads. A nonzero
+`uc2_timers_late_total` after warm-up is a fail and is diagnosed, not
+accommodated — the likely causes are the same two row b names (the per-pass
+bound, or delayed passes), plus one of row e's own: an entry armed from a log
+clock that had fallen behind, which the one-tick catch-up should absorb into a
+single late fire rather than a run of them.
+
 **What would fail this gate, if it ran.** Row a failing would mean the
 per-pass clock read, the ring drain, or the stamp write costs measurable
 throughput, which would be a surprise worth investigating rather than a
@@ -131,7 +166,10 @@ tuning target. Row b failing while row a passes would isolate the cost to
 firing itself. Row c failing points at pass scheduling, not at the timer
 heap. Row d failing while row a passes would be the M14a codegen effect
 again, and the fix would be moving the added frame-loop body out of line, as
-M14a's `lockstep_wait` was.
+M14a's `lockstep_wait` was. Row e failing while rows a and b pass would
+isolate the cost to the table path specifically — most plausibly the
+`TableConsumed` round trip through `svc_sched`, since that is the one hop a
+programmatic timer does not have on the firing side.
 
 ## Results
 
@@ -145,6 +183,7 @@ empty until the maintainer green-lights a run:
 | b | not run — release on hold |
 | c | not run — release on hold |
 | d | **not run: no runner** — `scripts/hop1_ab.sh` drives `hop_bench`'s `dummy-node`/`engine-load` subcommands, which `apply_bench` does not have (see the bar table's row d for the exact refusals, checked 2026-09-03 on `f59a0b5`). Not a hold decision and not a measurement: the procedure as written has no runner for this row. |
+| e | not run — release on hold |
 
 Numbers to record on the day, before any comparison:
 
@@ -163,7 +202,11 @@ Numbers to record on the day, before any comparison:
 3. Run `bench-infra/scripts/m14_fleet_gate.py`'s rows a/b/e against this
    branch's binaries with `Timed<..>` services and no timers (row a), then
    again with the 1 000 timers/s arm (rows b and c).
-4. Run row d's apply-hop A/B, including its same-source control arm.
+4. Run row e: apply the 32-entry, 100 ms table with `uc2ctl schedule apply`
+   against the leader, confirm every node's `uc2_schedule_table_position`
+   agrees (`Uc2ScheduleTableDiverged` must not fire) before the measure
+   window opens, then re-run row a's three rows with it live.
+5. Run row d's apply-hop A/B, including its same-source control arm.
    **`scripts/hop1_ab.sh` cannot do this as written** (2026-09-03): it is a
    `hop_bench` runner — it starts the sink with the `dummy-node` subcommand
    and each driver with `engine-load`, neither of which `apply_bench`
@@ -171,9 +214,9 @@ Numbers to record on the day, before any comparison:
    `--root`/`--fsms`/`--mode`/`--secs` invocation and its `RESULT` line) or
    write a sibling runner; whichever it is, keep the same-source rebuild
    control arm, because that arm IS row d's bar.
-5. Fill in the results table above; do not edit the bar table to match
+6. Fill in the results table above; do not edit the bar table to match
    whatever the run produced.
-6. Only after this gate, the FSM identity gate, and the maintainer's
+7. Only after this gate, the FSM identity gate, and the maintainer's
    version-number decision
    ([the semver policy](../reference/semver-policy.md)) does
    [Cut a release](../how-to/cut-a-release.md) apply.

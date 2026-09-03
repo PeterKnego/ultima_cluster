@@ -96,9 +96,11 @@ today checks only the number.
   changes are planned on this branch before a release. Explainer:
   `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`.
 
-### 2a. Time and timers, plan 2 — the replicated schedule table
+### 2a. Time and timers — DONE (both plans), release on hold
 
-*Added 2026-09-03, when plan 1 was implemented. Not a ranked item on the
+*Added 2026-09-03, when plan 1 was implemented; plan 2 followed the same day.
+Kept here as the record of a finished item rather than deleted (see this
+page's preamble). Not a ranked item on the
 2026-09-01 list: leader-stamped log time and a deterministic scheduler were
 requested by the maintainer directly on 2026-09-02 and specced beside FSM
 identity, which is why this line sits under item 2 rather than getting a
@@ -120,29 +122,63 @@ rule. Explainer:
 `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars committed, no
 run). It rides the same unreleased `2.11.0` flag day as FSM identity.
 
-**What is left, and is the next item under this feature: plan 2, the
-replicated schedule table** (spec §5, and §11's steps 7–10). An operator
-writes a TOML file of recurrences and applies it with a signed
-`uc2ctl schedule apply <file.toml>`; the leader appends it as
-`FRAME_TYPE_SCHEDULE_TABLE = 6`; every node adopts it through the archive's
-existing header walk (the path CONFIG frames already take) and persists it as
-a `StableValue` in `state/schedules.state`. Two recurrence rules only
-(`every` from an anchor, and daily `at`), UTC, ≤ 64 entries so the payload
-always fits one datagram, next deadline computed **from the deadline just
-fired** rather than from a clock.
+**Plan 2, the replicated schedule table, is IMPLEMENTED too** — same branch,
+same unreleased `2.11.0` flag day, release still on hold. Plan:
+`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md` (T0–T8, all
+tasks done). What shipped: `FRAME_TYPE_SCHEDULE_TABLE = 6` with a frozen,
+total, fuzzed codec (`MAX_SCHEDULE_ENTRIES = 32`, 33-byte entries, 1064 B
+full — always one datagram); three rules (`every` from an anchor, `at` daily
+UTC, and `once`, which parks in the table after firing); `uc2ctl schedule
+apply <file.toml>` staging `<instance_dir>/schedules.pending` and signing its
+SHA-256 digest into admin op 6, leader-only and single-in-flight, with four
+named refusals and an audit record; adoption through the archive's header
+walk exactly as CONFIG takes, persisted in `state/schedules.state` with one
+level of `prev` to revert to on truncation and re-armed at boot from the log
+clock; table ticks firing as `TIMER` frames with `FLAG_TIMER_TABLE`, advanced
+at append on the leader and on `TableConsumed` on a follower, with one-tick
+catch-up at fire time; `Timed`'s `table_last` dedup; three metric families,
+two records and the `Uc2ScheduleTableDiverged` alert. Explainer section:
+`docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table`; gate row
+e in `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`.
 
-- **Why it was cut from plan 1:** plan 1 already gives "declarative" in the
-  FSM-level sense (an FSM can schedule its own recurrence from `on_timer`,
-  bootstrapped by one command), so the table is the operator-facing
-  convenience on top, and it is the part most likely to change shape once
-  plan 1 has been used in anger.
-- **What already exists for it:** `FLAG_TIMER_TABLE = 0x01` is reserved in
-  the frame header, `TimerEvent.table` is on the delivered event, and
-  `Timed`'s snapshot image already carries the `table_last` map, so the
-  snapshot format does not change when the table lands.
-- **Cost:** small-to-moderate. One frame type + codec + fuzz target, adoption
-  through an existing path, the next-deadline arithmetic, one admin verb with
-  auth and audit, and the `table_last` rule in `Timed`.
+Three execution rulings amended spec §5 (recorded there as as-built errata):
+the one-tick catch-up moved from arm time to fire time; single-in-flight apply
+plus `ScheduleRecord.prev` and revert-on-truncation; and `once` as a third
+rule kind that parks rather than leaving the table.
+
+**What is left under this feature** — each documented in
+`docs/reference/limits.md` and the explainer's "Known limits of the table",
+none a blocker, none scheduled:
+
+- **The table is not carried in the snapshot stream.** With purge ON, a node
+  that joins below the floor and whose table frame was purged runs with no
+  table until the next `uc2ctl schedule apply`; its
+  `uc2_schedule_table_position` sits at 0 and `Uc2ScheduleTableDiverged`
+  fires. Closing it means putting the table in `SNAP_BEGIN` or in the artifact,
+  which is a wire change and therefore a flag day — not worth one on its own.
+- **One crash window loses one adoption.** A node that dies between the
+  archive recording a table frame and the consensus agent persisting
+  `state/schedules.state` comes back without it: there is no journal re-scan
+  for type-6 frames on the recovery path. Sub-millisecond, same symptom, same
+  remedy (re-apply). A recovery-path scan would close it.
+- **A restart may re-append one tick per entry.** Boot arming has no delivered
+  set until the service attaches and announces its `table_last`, so a
+  restarted node may append the latest occurrence of every entry once — a
+  parked `once` included. `Timed` drops it; a state machine without the
+  wrapper sees it, which is the at-least-once trade it already accepted.
+- **No timezones and no cron syntax.** `at` is UTC. "02:00 local, with DST"
+  is not expressible — a timezone database is replicated state that must agree
+  on every node and across every upgrade. Cron-style rules are a possible
+  fourth `kind` byte; the codec has room.
+- **Two alert rules have no `m10_alert_fire.sh` builder** — `Uc2LogTimeFrozen`
+  (plan 1) and `Uc2ScheduleTableDiverged` (plan 2). That script's completeness
+  cross-check names them and exits 1. It is a local gate harness, not a CI
+  job, so nothing is red today, but the M10 gate's row 4 cannot be re-run as
+  written until both builders exist.
+- **`node.toml [schedules]` as a boot-time convenience** stays the door spec
+  §10 left open: a per-host section that simply calls the admin op at startup.
+  Deliberately not the primary form — it turns a schedule edit into a rolling
+  edit plus a leader change.
 
 ### 3. Rolling upgrades and leadership transfer
 

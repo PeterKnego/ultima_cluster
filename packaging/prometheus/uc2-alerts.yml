@@ -181,3 +181,27 @@ groups:
     for: 5m
     labels: { severity: warning }
     annotations: { summary: "row {{ $labels.row }} runs different FSM versions across nodes" }
+  - alert: Uc2ScheduleTableDiverged
+    # Time-and-timers spec §5 (plan 2): every node adopts the replicated
+    # schedule table from the same log at the same frame-END position — the
+    # leader at append, every other node from the archive's header walk — so
+    # `uc2_schedule_table_position` must hold ONE value fleet-wide. The
+    # `count_values` idiom is Uc2ServiceIdentityDrift's: promote the sample's
+    # own value into a label (one output series per distinct position), then
+    # count how many distinct ones exist. More than one is divergence.
+    #
+    # A node reading 0 while its peers read a nonzero position has not
+    # adopted the table at all. Two causes, one remedy:
+    #   * it joined BELOW THE PURGE FLOOR — the table is not carried in the
+    #     snapshot stream, so a joiner whose table frame was purged keeps
+    #     position 0, the same rule ConfigRecord uses for a wiped node;
+    #   * it crashed in the sub-millisecond window between the archive
+    #     recording the frame and the consensus agent persisting
+    #     state/schedules.state (there is no journal re-scan for type-6
+    #     frames).
+    # Re-run `uc2ctl schedule apply` against the leader: it appends a fresh
+    # frame that every node adopts.
+    expr: count(count_values("p", uc2_schedule_table_position)) > 1
+    for: 60s
+    labels: { severity: warning }
+    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 with uc2_schedule_entries > 0 elsewhere never adopted the table (purged frame, or a crash before it was persisted); re-run `uc2ctl schedule apply`" }

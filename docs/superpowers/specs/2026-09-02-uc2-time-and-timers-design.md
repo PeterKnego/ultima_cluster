@@ -464,7 +464,8 @@ every M7/M12 admin op). The leader appends it as **`FRAME_TYPE_SCHEDULE_TABLE
 = 6`**; every node adopts it through the archive's existing header walk,
 the same path that adopts CONFIG frames today (`archive.rs:372`, effective
 at the frame's end position), and persists it as a `StableValue` in
-`state/schedules.state` (`ScheduleRecord { position, time_ns, table }`; at
+`state/schedules.state` (`ScheduleRecord { position, time_ns, table }` —
+**as built it also carries `prev`; erratum 2 below**; at
 boot the node re-arms every entry from the record and the recovered log
 clock before its service attaches — an FSM with no attached service still
 ticks on the leader; the tick is dropped on delivery only if no service
@@ -519,8 +520,10 @@ anchor = "2026-01-01T00:00:00Z"
   `table_last` — and `Timed` drops the duplicate (§4.6), the same
   at-least-once/exactly-once split every table tick has.
 - **Next deadline is computed from the deadline just fired**, never from
-  the clock: `next = fired + period`, or the next day's `at`. So recurrence
-  never drifts and every node computes the same value. On adoption the
+  the clock: `next = fired + period`, or the next day's `at`, or — for a
+  `once` — **no next deadline at all: the entry parks in the table as
+  delivered** (erratum 3 below). So recurrence never drifts and every node
+  computes the same value. On adoption the
   first deadline is the first occurrence `≥` the table frame's own
   `time_ns` — again from the tape, not from a local clock.
 - Table timers go through the same heap (§4.5) and the same TIMER frame
@@ -543,6 +546,8 @@ anchor = "2026-01-01T00:00:00Z"
     the log's clock if that occurrence is newer than the last delivered
     one, else the first occurrence after it. A cluster that was down for an
     hour with a one-second rule fires one tick on recovery, not 3 600.
+    (**As built the catch-up is applied again at FIRE time, not only at arm
+    time — erratum 1 below.** Arming alone is not enough.)
 - Ids share the FSM's id space with programmatic timers; the docs say to
   reserve a range. The wrapper's two maps never confuse them because the
   frame flag routes them.
@@ -552,6 +557,62 @@ table is plan 2 of this spec. Plan 1 already gives "declarative" in the
 FSM-level sense — an FSM can schedule its own recurrence from `on_timer`,
 bootstrapped by one command — so plan 2 is the operator-facing convenience
 on top, and the part most likely to change shape once plan 1 has been used.
+
+**As-built errata (plan 2, 2026-09-03) — three execution rulings that amend
+this section.** Implemented across `b71a1f6..a0c2cd8`; §5's text above is left
+as written and annotated rather than rewritten.
+
+1. **The one-tick catch-up is applied at FIRE time, not only at arm time.**
+   This section arms an entry to "the latest occurrence at or below the log's
+   clock" and then advances one period per fire. That is correct only if the
+   clock the entry was armed against is close to the clock the leader is
+   stamping with. It is not, on the path that matters: after a restart the
+   node arms from `cnc.log_time_ns()`, the clock **as of the last recorded
+   frame**, which can be hours behind the wall clock a newly elected leader
+   reads. Advancing one period per fire from that armed value would replay the
+   whole downtime — exactly the backlog this bullet promises never happens. As
+   built, `RowTimers::table_fire_deadline(id, now_ns)` recomputes at the
+   moment of firing: `next.max(rule.latest_at_or_before(now_ns))`, so the
+   deadline that actually rides the frame is the latest missed occurrence, and
+   `table_fired` advances from **that** value rather than from the armed one
+   (hence its `<=` guard instead of an equality). Which occurrence is due is
+   the one clock-driven choice the determinism rule allows, and it is made
+   once, by the leader; every replica advances from the chosen deadline
+   because it is on the frame. `ScheduleRule::{next_after,
+   latest_at_or_before, arm}` are the pure arithmetic; all three return
+   `Option<u64>` — `next_after` and `arm` because a delivered `Once` has no
+   successor (erratum 3), `latest_at_or_before` because a clock before the
+   first occurrence has no predecessor.
+
+2. **`ScheduleRecord` carries one level of `prev`, applies are
+   single-in-flight, and a truncation reverts.** This section's record is
+   `{ position, time_ns, table }`, which cannot survive its own frame being
+   cut: a truncation below the adopted position would leave a record claiming
+   a position the log no longer backs. As built the record is
+   `{ position, time_ns, table, prev: Option<Box<ScheduleRecord>> }` — exactly
+   `uc_log::state::ConfigRecord`'s discipline, for exactly its reason — and
+   both truncation paths revert to `prev`: `Truncate` and the leader-open
+   `Collapse`. **One** level suffices only because a second rule was added
+   with it: `Consensus::apply_schedule_table` refuses (`status 2`, retry,
+   side-effect-free) while `schedule_position > commit`, so a second table can
+   never be appended while the first is still truncation-exposed. Committed
+   frames are never truncated, so at most one table frame is ever exposed.
+   This is the config path's `ChangePending` idea, placed in the node layer
+   because the schedule table is not a state-machine concern.
+
+3. **`once` is a third rule kind, and it parks rather than leaving.** This
+   section's TOML sketch shows two rules; the payload bullet already names
+   three, and `once {at_ns}` (`kind = 3`) is what shipped. The ruling worth
+   recording is the *park*: a fired `once` stays in the table marked
+   delivered, with `next = None`. Dropping it would be wrong the second time
+   an operator applies a file, because applying replaces the whole table — an
+   operator adding one `every` rule re-applies a file that still contains last
+   week's `once`, and a dropped entry would arm and fire again from a file
+   they did not think they were changing. Parked entries are excluded from
+   `pending_len()` (so from the cnc `timers_pending` word and
+   `uc2_timers_pending`) and included in `table_len()` (so in
+   `uc2_schedule_entries`). Changing a `once`'s time or its id makes it a
+   different entry, which arms normally.
 
 ## 6. Observability
 
@@ -796,10 +857,35 @@ release").
    the hard-crash harness; loom/Lean/conform regression.
 6. Docs + release writeup; fleet gate rows.
 
-**Plan 2 — the schedule table**
+**Plan 2 — the schedule table** — **AS BUILT 2026-09-03**, plan
+`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md` (T0–T8),
+commits `b71a1f6..a0c2cd8` on the same unreleased `2.11.0` flag day. Every
+item below is done; see the as-built errata at the end of §5 for the three
+rulings that amend this section's design.
 
-7. `uc_protocol`: `FRAME_TYPE_SCHEDULE_TABLE` + codec + fuzz target.
+7. `uc_protocol`: `FRAME_TYPE_SCHEDULE_TABLE` + codec + fuzz target. **Done**
+   (`d5fc6a3`, `b38abb0`, `bdf3e63`): `FRAME_TYPE_SCHEDULE_TABLE = 6`,
+   `FLAG_TIMER_TABLE` un-reserved, the frozen 33-byte-entry codec with
+   `Every`/`DailyAt`/`Once` arithmetic, `SchedOp::TableConsumed = 4`,
+   `ADMIN_OP_SCHEDULE_APPLY = 6`, and `uc_protocol_schedule_table` as the
+   eighteenth fuzz target — which found the saturating-arithmetic overflows at
+   the top of the `u64` range.
 8. `uc_node`: adoption via the archive walk; `state/schedules.state`;
    next-deadline arithmetic; `uc2ctl schedule apply` (admin auth, audit).
-9. `uc_service`: the `table_last` rule in `Timed`; `ev.table`.
-10. Tests, runbook, attack-surface entry, release bullet.
+   **Done** (`3776f3a`, `5bb51a8`, `09c3ed4`, `46c3143`, `e133aa1`,
+   `f3e6e29`, `59c79d8`): `uc_log::Appender::append_schedule_table` + the
+   archive's table observations; `RowTimers`' table half; adoption, the
+   `ScheduleRecord` with `prev`, boot arming, firing with the flag, the admin
+   op with its four refusals, and the three metric families; then `uc2ctl
+   schedule apply` / `schedule show`.
+9. `uc_service`: the `table_last` rule in `Timed`; `ev.table`. **Done**
+   (`e282a0a`): `Timed` reports table ticks as `TableConsumed` — including
+   for a dropped duplicate, so the node clears its state either way — and
+   announces `table_last` after attach and after replay.
+10. Tests, runbook, attack-surface entry, release bullet. **Done**
+    (`d19053f`, `a0c2cd8`, and this docs pass): two end-to-end tests in
+    `uc_node/tests/timers.rs`, the signed/digest-checked/leader-only/audited
+    admin test, four `RowTimers` unit tests, clause (7) of the shared
+    `assert_timer_report` oracle exercised by
+    `two_fsm_timer_churn_under_failover`, the fuzz target, and the reference /
+    runbook / attack-surface / explainer / release / gate-row-e writeup.
