@@ -27,8 +27,8 @@
 //!
 //! **Semver:** see `docs/reference/semver-policy.md`. Promised surface:
 //! [`RawStateMachine`], [`StateMachine`], [`SnapshotStateMachine`],
-//! [`OutputHandler`]/[`RawOutputHandler`], [`Sessioned`]/[`SessionConfig`], and
-//! [`TimerEvent`]/[`TimerReq`].
+//! [`OutputHandler`]/[`RawOutputHandler`], [`Sessioned`]/[`SessionConfig`],
+//! [`Timed`], and [`TimerEvent`]/[`TimerReq`].
 
 mod apply;
 mod attach;
@@ -48,6 +48,7 @@ pub mod snapshots;
 /// `Tagged<ROW, S>`: run one state-machine type at several rows (harnesses
 /// only, spec §3.3) — see the module doc.
 pub mod tagged;
+mod timed;
 mod traits;
 
 use std::sync::Arc;
@@ -71,6 +72,7 @@ pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
 pub use crate::tagged::Tagged;
+pub use crate::timed::Timed;
 pub use crate::traits::{
     ApplyCtx, NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
     SnapshotStateMachine, StateMachine, TimerEvent, TimerReq, TypedOutput,
