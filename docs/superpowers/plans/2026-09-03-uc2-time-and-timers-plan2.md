@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(decode_schedule_table(&b[..7]), None, "short header");
         assert_eq!(decode_schedule_table(&b[..b.len() - 1]), None, "length mismatch");
         let mut v = b.clone(); v[0] = 2; assert_eq!(decode_schedule_table(&v), None, "version");
-        let mut k = b.clone(); k[24] = 3; assert_eq!(decode_schedule_table(&k), None, "kind");
+        let mut k = b.clone(); k[24] = 4; assert_eq!(decode_schedule_table(&k), None, "unknown kind (3 is Once)");
         let mut z = b.clone(); z[25..33].copy_from_slice(&0u64.to_le_bytes()); assert_eq!(decode_schedule_table(&z), None, "period 0");
         let mut d = b.clone(); d[41 + 17..41 + 25].copy_from_slice(&86_400u64.to_le_bytes()); assert_eq!(decode_schedule_table(&d), None, "secs_of_day out of range");
         let mut ob = b.clone(); ob[74 + 25..74 + 33].copy_from_slice(&1u64.to_le_bytes()); assert_eq!(decode_schedule_table(&ob), None, "once: b must be 0");
