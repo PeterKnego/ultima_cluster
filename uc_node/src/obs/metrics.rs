@@ -106,6 +106,9 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_open_failed_total",
     "uc2_snapshot_intake_abandoned_total",
     "uc2_snapshot_begin_undecodable_total",
+    // Time-and-timers plan 3: stray SNAP_TABLE datagrams (see the family's
+    // own HELP text below for what "stray" means).
+    "uc2_snapshot_table_stray_total",
     "uc2_reports_implausible_total",
     "uc_crypto_handshake_failures_total",
     "uc2_sender_seal_failures_total",
@@ -1551,9 +1554,7 @@ mod tests {
 
     /// Time-and-timers plan 3: the stray-SNAP_TABLE counter renders off its
     /// own receiver cell (a value no neighbouring counter carries, so a
-    /// copy-pasted field is caught). Its CONTRACT_SERIES row is plan 3 Task
-    /// 5's call, not this one's — rendering is one-directional (the contract
-    /// test asserts every contract name renders, not the reverse).
+    /// copy-pasted field is caught).
     #[test]
     fn the_stray_snapshot_table_counter_renders_from_its_own_stats_cell() {
         let s = synthetic_sources();

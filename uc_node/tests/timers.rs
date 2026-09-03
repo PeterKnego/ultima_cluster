@@ -1246,6 +1246,19 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// survivor and not the other inside those few instructions — is far under a
 /// millisecond against a 400 ms period, and it fails LOUDLY (no leader) rather
 /// than silently.
+///
+/// **What that loud failure looks like on a loaded box.** The wait-until
+/// above can itself stall for ~100 ms under scheduler contention (the same
+/// busy-spin-agents-vs-CPU-count pressure every capstone runs under on a
+/// noisy dev box) — long enough for the intended leader's own election timer
+/// (3–5 s, so normally nowhere near firing) to still not be the risk, but
+/// long enough for the JOINER's much tighter 100–150 ms window to lapse and
+/// let it campaign early, before the kill. When that happens the test fails
+/// on the `assert!(nodes[leader].is_leader(), ...)` a few lines below with
+/// "the intended leader lost the leadership before the kill — the election
+/// skew let another node campaign while the leader was alive" — a
+/// timing-sensitivity flake, not a schedule-table defect; re-run to confirm
+/// before suspecting the chain under test.
 #[test]
 fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     let _g = serialize();

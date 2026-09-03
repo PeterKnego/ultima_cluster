@@ -4467,6 +4467,7 @@ impl Consensus {
             return;
         };
         let armed = self.install_table(rec.position, &table, self.cnc.log_time_ns());
+        // Restated defensively; `install_table` already refreshed.
         self.refresh_schedule_ship(false);
         crate::obs_event!(
             Info,
@@ -4534,6 +4535,7 @@ impl Consensus {
         let table = decode_schedule_table(&reverted.table)
             .unwrap_or_else(|| panic!("corrupt reverted schedule record at {}", reverted.position));
         let armed = self.install_table(reverted.position, &table, self.cnc.log_time_ns());
+        // Restated defensively; `install_table` already refreshed.
         self.refresh_schedule_ship(false);
         crate::obs_event!(
             Warn,
@@ -7675,7 +7677,17 @@ fn snapshot_set_for(
 /// position 0 so a wiped node keeps ticking, and the canonical no-table
 /// record (`ScheduleRecord::empty`), whose bytes are an 8-byte encoded EMPTY
 /// table rather than zero bytes. Both ship as `(0, 0, [])`, and so does any
-/// record whose bytes will not decode or decode to no entries.
+/// record whose bytes will not decode at all.
+///
+/// Ruling R8 — an EMPTY table at a REAL position is NOT the position-0 case
+/// above and ships as itself: `apply_schedule_table` committing a table with
+/// no entries ("apply a file without the entry") is a legitimate outcome,
+/// the wire accepts a `position != 0` body whose `table_len` is the 8-byte
+/// canonical-empty encoding, and collapsing it to `(0, 0, [])` made a joiner
+/// read position 0 for a table its peers correctly hold at a real position —
+/// tripping `Uc2ScheduleTableDiverged` rather than converging. Only
+/// UNDECODABLE bytes fall back to "no table"; an empty-but-decodable one
+/// ships.
 ///
 /// The consequence is deliberate: **a wiped node's kept table does not
 /// propagate by snapshot.** Position 0 means the table is unanchored in the
@@ -7706,17 +7718,22 @@ fn shippable_schedule(ship: &Mutex<ScheduleShip>, commit: u64) -> (u64, u64, Vec
             None => return none,
         }
     };
-    // The position-0 rule, and its companion: a body the wire would carry
-    // must be a table with entries. An empty (or undecodable) table means
-    // the same thing as no table, and `(0, 0, [])` is how the wire says it.
+    // The position-0 rule (forced by the wire: `read_snap_table_body`'s
+    // frozen biconditional refuses a body at position 0) and its companion:
+    // an UNDECODABLE table means the same thing as no table, and `(0, 0,
+    // [])` is how the wire says it. Ruling R8: an EMPTY table does NOT fall
+    // into this case — a committed empty table at a real position is a
+    // legitimate apply result ("apply a file with no entries"), the wire
+    // accepts it (`position != 0`, `table_len == 8` for the canonical empty
+    // encoding), and shipping it as `(0, 0, [])` made the joiner read
+    // position 0 and trip `Uc2ScheduleTableDiverged` against every peer that
+    // correctly adopted the empty table at its real position.
     if selected.position == 0 {
         return none;
     }
     match decode_schedule_table(&selected.table) {
-        Some(t) if !t.entries.is_empty() => {
-            (selected.position, selected.time_ns, selected.table.clone())
-        }
-        _ => none,
+        Some(_) => (selected.position, selected.time_ns, selected.table.clone()),
+        None => none,
     }
 }
 
@@ -10093,6 +10110,31 @@ mod tests {
             (0, 0, Vec::new()),
             "and so does the canonical no-table record — the joiner one hop \
              past `a_leader_without_a_table_ships_none_…` holds exactly this"
+        );
+
+        // ---- ruling R8: an EMPTY table at a REAL position ships as itself ----
+        //
+        // Distinct from the two position-0 cases above: this record's
+        // position is real (committed at 8192), so the wire accepts a body
+        // for it (`table_len == 8`, the canonical empty encoding, is not 0).
+        // The old `!entries.is_empty()` guard collapsed this to `(0, 0, [])`
+        // and made the joiner read position 0 for a table its peers hold at
+        // 8192 — tripping `Uc2ScheduleTableDiverged`. It must ship as
+        // `(8192, 7, <its bytes>)`.
+        let empty_at_real_position = ScheduleShip {
+            rec: Some(ScheduleRecord {
+                position: 8192,
+                time_ns: 7,
+                table: ScheduleRecord::empty().table,
+                prev: None,
+            }),
+            known_committed: true,
+        };
+        assert_eq!(
+            shippable_schedule(&Mutex::new(empty_at_real_position), 8192),
+            (8192, 7, ScheduleRecord::empty().table),
+            "a committed empty table at a real position is a legitimate \
+             apply result and ships, unlike an empty table AT position 0"
         );
     }
 

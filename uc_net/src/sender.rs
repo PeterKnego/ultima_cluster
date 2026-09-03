@@ -1492,14 +1492,12 @@ impl Sender {
     ///
     /// Sealed exactly like the BEGIN (`Scope::Pairwise`, same `assemble_snap`
     /// path): the table is replicated state the receiver installs by fiat, so
-    /// an unauthenticated one is attacker-chosen timer state. Returns `false`
-    /// if it could not be sealed and was dropped — the next resend retries it.
-    fn send_snap_table(
-        &mut self,
-        peer: SocketAddr,
-        session: u32,
-        table: &(u64, u64, Vec<u8>),
-    ) -> bool {
+    /// an unauthenticated one is attacker-chosen timer state. The sole caller
+    /// does not gate on the outcome (see its call site's comment) — a failed
+    /// seal costs one more resend round on the same 20 ms cadence as the
+    /// BEGIN, nothing more, so there is nothing for a caller to do with a
+    /// success/failure signal here.
+    fn send_snap_table(&mut self, peer: SocketAddr, session: u32, table: &(u64, u64, Vec<u8>)) {
         let mut body = vec![0u8; SNAP_TABLE_FIXED_LEN + table.2.len()];
         write_snap_table_body(
             &mut body,
@@ -1511,10 +1509,9 @@ impl Sender {
             },
         );
         if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_TABLE, &body) {
-            return false;
+            return;
         }
         let _ = self.sock.send_to(&self.scratch, peer);
-        true
     }
 
     /// Assemble a snapshot-session datagram (header + explicit body) into

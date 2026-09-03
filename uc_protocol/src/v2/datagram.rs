@@ -1003,6 +1003,19 @@ mod tests {
         big[4..12].copy_from_slice(&1u64.to_le_bytes());
         big[20..22].copy_from_slice(&((max + 1) as u16).to_le_bytes());
         assert_eq!(read_snap_table_body(&big), None, "over the table ceiling");
+        // The boundary itself (exactly 1064 B, the max entry count) is
+        // ACCEPTED — the ceiling check is `>`, not `>=`.
+        let mut at_max = vec![0u8; SNAP_TABLE_FIXED_LEN + max];
+        at_max[4..12].copy_from_slice(&1u64.to_le_bytes());
+        at_max[20..22].copy_from_slice(&(max as u16).to_le_bytes());
+        assert_eq!(
+            max, 1064,
+            "the boundary value asserted below must track this constant"
+        );
+        assert!(
+            read_snap_table_body(&at_max).is_some(),
+            "table_len exactly at the ceiling is accepted"
+        );
         assert!(
             SNAP_TABLE_FIXED_LEN + max <= MTU_DEFAULT - DATAGRAM_HEADER_LEN - 24,
             "fits crypto-on"
