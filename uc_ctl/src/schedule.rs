@@ -249,6 +249,11 @@ pub fn parse_table(
     let table = ScheduleTable { entries };
     let mut buf = Vec::new();
     encode_schedule_table(&table, &mut buf);
+    // Fix round 1, Minor 3: unreachable under the current frozen 33-byte
+    // per-entry wire format — the `TooManyEntries` check above always fires
+    // first, since encoded length is a deterministic function of entry
+    // count. Kept as a guard against a future format change that makes an
+    // individual entry's encoded size vary.
     let ceiling = SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN;
     if buf.len() > ceiling {
         return Err(ScheduleFileError::TooLarge {
@@ -377,7 +382,7 @@ fn parse_rfc3339(s: &str) -> Result<u64, String> {
     if !(1..=12).contains(&month) {
         return Err(format!("month out of range in {s:?}"));
     }
-    if !(1..=31).contains(&day) {
+    if day < 1 || day > days_in_month(year, month) {
         return Err(format!("day out of range in {s:?}"));
     }
     if hour > 23 || minute > 59 || second > 59 {
@@ -408,6 +413,31 @@ fn render_rfc3339(ns: u64) -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+/// The proleptic Gregorian leap rule: divisible by 4, except centuries not
+/// divisible by 400 (so 2000 is a leap year, 1900 and 2100 are not).
+fn is_leap_year(y: i64) -> bool {
+    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+}
+
+/// Days in `m` (`1..=12`) of year `y`, respecting [`is_leap_year`] for
+/// February. Used to bound `parse_rfc3339`'s `day` field — without this a
+/// day of `29..=31` is silently accepted for every month (`2026-02-30`
+/// would otherwise roll over to March).
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0, // unreachable: `month` is already range-checked to 1..=12
+    }
 }
 
 /// Howard Hinnant's `days_from_civil` — proleptic Gregorian, days relative to
@@ -478,8 +508,15 @@ pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("staging {}: {e}", pending_path.display()))?;
 
     let (id, ip, port) = uc_node::schedule_digest(&bytes);
-    let resp = crate::signed_admin_request(common, ADMIN_OP_SCHEDULE_APPLY, id, ip, port)
-        .map_err(|e| anyhow::anyhow!("{e} (staged file kept at {})", pending_path.display()))?;
+    let resp = crate::signed_admin_request(
+        common,
+        ADMIN_OP_SCHEDULE_APPLY,
+        id,
+        ip,
+        port,
+        "schedule position",
+    )
+    .map_err(|e| anyhow::anyhow!("{e} (staged file kept at {})", pending_path.display()))?;
 
     match resp.status {
         0 => {
@@ -700,6 +737,13 @@ once = "2026-01-01T00:00:00Z"
         assert!(parse_duration_ns("h").is_err(), "no number");
         assert!(parse_duration_ns("5").is_err(), "no unit");
         assert!(parse_duration_ns("").is_err(), "empty");
+        // Fix round 1, Minor 2: overflows u64 nanoseconds rather than
+        // wrapping — 99_999_999_999 days * 86_400_000_000_000 ns/day is
+        // far past u64::MAX.
+        assert!(
+            parse_duration_ns("99999999999d").is_err(),
+            "overflow must error, not wrap"
+        );
         // round-trips through the show-side renderer
         for s in ["7d", "3h", "45m", "20s", "500ms", "250us", "999ns"] {
             let ns = parse_duration_ns(s).unwrap();
@@ -753,5 +797,26 @@ once = "2026-01-01T00:00:00Z"
         assert!(parse_rfc3339("2026-01-32T00:00:00Z").is_err(), "bad day");
         assert!(parse_rfc3339("2026-01-01T24:00:00Z").is_err(), "bad hour");
         assert!(parse_rfc3339("not-a-date").is_err());
+    }
+
+    /// Fix round 1, Important 1: `day` was only bounded to `1..=31`, so
+    /// `2026-02-30`/`2026-04-31`/a non-leap `2026-02-29` silently rolled
+    /// over into the following month instead of being refused.
+    #[test]
+    fn rfc3339_rejects_calendrically_invalid_dates() {
+        for s in [
+            "2026-02-30T00:00:00Z", // Feb never has 30 days
+            "2026-04-31T00:00:00Z", // Apr has 30 days
+            "2026-02-29T00:00:00Z", // 2026 is not a leap year
+            "1900-02-29T00:00:00Z", // century, not divisible by 400: not a leap year
+        ] {
+            assert!(parse_rfc3339(s).is_err(), "{s} must be rejected");
+        }
+        for s in [
+            "2024-02-29T00:00:00Z", // ordinary leap year
+            "2000-02-29T00:00:00Z", // century divisible by 400: a leap year
+        ] {
+            assert!(parse_rfc3339(s).is_ok(), "{s} must be accepted");
+        }
     }
 }

@@ -129,8 +129,9 @@ pub fn load(sv: &StableValue<ScheduleRecord>) -> Result<Option<ScheduleRecord>, 
 /// Safe beside a running node: `StableValue::open` takes no file lock and
 /// caches both slots at open, so this is a plain read, not a contended
 /// attach. Deliberately NOT `uc_node::backup::open_state_readonly` — that
-/// helper is `pub(crate)` and scoped to the backup/restore artifact path,
-/// not a general read of a live instance directory's `state/`.
+/// helper is private (not even `pub(crate)`) and scoped to the
+/// backup/restore artifact path, not a general read of a live instance
+/// directory's `state/`.
 pub fn read_record(instance_dir: &Path) -> Result<Option<ScheduleRecord>, StableValueError> {
     let sv = open(&instance_dir.join("state"))?;
     load(&sv)

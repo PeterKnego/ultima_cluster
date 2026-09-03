@@ -470,6 +470,11 @@ fn load_admin_key(common: &CommonArgs) -> anyhow::Result<Option<AdminKey>> {
 /// ops 1-5, a schedule-table position for op 6), so interpreting and
 /// printing the triple is the caller's job (`run_mutate`, `schedule::apply`).
 /// `Err` only on a bad key file, an attach failure, or a poll timeout.
+/// `state_desc` names what `version` means for THIS op ("config version",
+/// "schedule position", …) — folded only into the timeout message's
+/// `uc2ctl status` pointer (fix round 1, Minor 4: restores ops 1-5's
+/// original wording instead of the generic "authoritative state" a first
+/// pass left behind).
 /// CONTRACT: one admin client (this CLI, m7_gate, or any direct write_admin_req caller) per instance dir at a time; concurrent invocations may produce a nonsense request.
 fn signed_admin_request(
     common: &CommonArgs,
@@ -477,6 +482,7 @@ fn signed_admin_request(
     id: u32,
     ip: u32,
     port: u16,
+    state_desc: &str,
 ) -> anyhow::Result<uc_log::cnc::AdminResp> {
     let cnc = open(common)?;
     // Load the key (if any) BEFORE writing anything to the admin band — a
@@ -530,7 +536,7 @@ fn signed_admin_request(
         port,
     });
 
-    let result = poll_admin_response_raw(&cnc, seq);
+    let result = poll_admin_response_raw(&cnc, seq, state_desc);
     // Clear the auth line on EVERY exit path — accepted, refused, retry, or
     // timeout. This is tidiness, not a security control: a stale line CANNOT
     // authenticate anything, because the tag covers `seq` and the next
@@ -544,8 +550,14 @@ fn signed_admin_request(
 
 /// Poll the admin response line for `seq` until it appears or the deadline
 /// passes. Returns the response AS-IS for any status (0/1/2/other) —
-/// interpreting `status` is the caller's job.
-fn poll_admin_response_raw(cnc: &CncPage, seq: u64) -> anyhow::Result<uc_log::cnc::AdminResp> {
+/// interpreting `status` is the caller's job. `state_desc` (see
+/// `signed_admin_request`) names what the timeout message's
+/// `uc2ctl status` pointer refers to.
+fn poll_admin_response_raw(
+    cnc: &CncPage,
+    seq: u64,
+    state_desc: &str,
+) -> anyhow::Result<uc_log::cnc::AdminResp> {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         if let Some(resp) = cnc.read_admin_resp(seq) {
@@ -555,7 +567,7 @@ fn poll_admin_response_raw(cnc: &CncPage, seq: u64) -> anyhow::Result<uc_log::cn
             anyhow::bail!(
                 "timeout waiting {POLL_TIMEOUT:?} for a response to seq {seq} — a newer admin \
                  request may have superseded this one (only one forward is in flight at a time); \
-                 `uc2ctl status` shows the authoritative state"
+                 `uc2ctl status` shows the authoritative {state_desc}"
             );
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -565,7 +577,7 @@ fn poll_admin_response_raw(cnc: &CncPage, seq: u64) -> anyhow::Result<uc_log::cn
 /// `run_mutate`'s ops (1-5, reconfiguration): send, then print/interpret the
 /// response the way this verb always has — `version` is the config version.
 fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> anyhow::Result<()> {
-    let resp = signed_admin_request(common, op, id, ip, port)?;
+    let resp = signed_admin_request(common, op, id, ip, port, "config version")?;
     match resp.status {
         0 => {
             println!("accepted: config version now {}", resp.version);
