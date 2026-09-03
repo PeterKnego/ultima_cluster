@@ -3637,6 +3637,11 @@ impl Consensus {
                                 SchedOp::Schedule => t.schedule(r.timer_id, r.deadline_ns),
                                 SchedOp::Cancel => t.cancel(r.timer_id),
                                 SchedOp::Consumed => t.consumed(r.timer_id, r.deadline_ns),
+                                // Plan 2 (schedule table): no producer writes
+                                // this op on `svc_sched` yet — the table-tick
+                                // pending set is a later task. Exhaustive
+                                // match only; not reachable today.
+                                SchedOp::TableConsumed => {}
                             }
                         }
                     }

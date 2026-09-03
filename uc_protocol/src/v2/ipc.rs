@@ -114,6 +114,9 @@ pub enum SchedOp {
     Cancel = 2,
     /// `Timed` delivered (or dropped) this instance; the node clears it.
     Consumed = 3,
+    /// Plan 2: the schedule-table apply loop delivered (or dropped) this
+    /// instance of a table-driven timer; the node clears its pending state.
+    TableConsumed = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +135,7 @@ pub fn write_sched_record(r: &SchedRecord) -> [u8; SCHED_RECORD_LEN] {
     out
 }
 
-/// Total: `None` on a short slice or an op byte outside `1..=3`.
+/// Total: `None` on a short slice or an op byte outside `1..=4`.
 pub fn read_sched_record(buf: &[u8]) -> Option<SchedRecord> {
     if buf.len() < SCHED_RECORD_LEN {
         return None;
@@ -141,6 +144,7 @@ pub fn read_sched_record(buf: &[u8]) -> Option<SchedRecord> {
         1 => SchedOp::Schedule,
         2 => SchedOp::Cancel,
         3 => SchedOp::Consumed,
+        4 => SchedOp::TableConsumed,
         _ => return None,
     };
     Some(SchedRecord {
@@ -196,7 +200,11 @@ mod tests {
         assert_eq!(&b[1..9], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
         assert_eq!(&b[9..17], &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
         assert_eq!(read_sched_record(&b), Some(r));
-        for (op, code) in [(SchedOp::Cancel, 2u8), (SchedOp::Consumed, 3u8)] {
+        for (op, code) in [
+            (SchedOp::Cancel, 2u8),
+            (SchedOp::Consumed, 3u8),
+            (SchedOp::TableConsumed, 4u8),
+        ] {
             let r = SchedRecord {
                 op,
                 timer_id: 1,
@@ -208,8 +216,8 @@ mod tests {
         let mut bad = b;
         bad[0] = 0;
         assert_eq!(read_sched_record(&bad), None, "op 0 is not a record");
-        bad[0] = 4;
-        assert_eq!(read_sched_record(&bad), None, "op 4 is not a record");
+        bad[0] = 5;
+        assert_eq!(read_sched_record(&bad), None, "op 5 is not a record");
         assert_eq!(read_sched_record(&b[..16]), None);
         assert_eq!(MSG_V2_SCHED, 8);
     }

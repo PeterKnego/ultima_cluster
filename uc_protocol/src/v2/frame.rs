@@ -49,6 +49,11 @@ pub const FRAME_TYPE_TIMER: u8 = 5;
 /// `flags` bit 0 on a TIMER frame: fired from the replicated schedule table
 /// (plan 2), not from a state machine's `schedule` call.
 pub const FLAG_TIMER_TABLE: u8 = 0x01;
+/// The replicated schedule table (time-and-timers spec §5, plan 2): payload =
+/// `v2::schedule::encode_schedule_table` bytes; appended by a serving leader
+/// on a verified `schedule_apply` admin request; adopted at append (leader) /
+/// at durable recording (follower, archive scan); the apply layer skips it.
+pub const FRAME_TYPE_SCHEDULE_TABLE: u8 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -222,6 +227,7 @@ mod tests {
         assert_eq!(FRAME_TYPE_CONFIG, 4);
         assert_eq!(FRAME_TYPE_TIMER, 5);
         assert_eq!(FLAG_TIMER_TABLE, 0x01);
+        assert_eq!(FRAME_TYPE_SCHEDULE_TABLE, 6);
     }
 
     /// FROZEN: the 24-byte TIMER body (spec §4.2).

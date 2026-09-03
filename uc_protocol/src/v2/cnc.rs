@@ -129,8 +129,13 @@ pub const CNC_OFF_CONFIG_PENDING: usize = 3520;
 /// M7 — admin REQUEST line (writer: uc2ctl, same-host). seq u64 @+0 is the
 /// commit word — the admin writes the fields, then seq, with release; the
 /// consensus agent acts on seq > last-seen. Fields: nonce u64 @+8, op u32
-/// @+16, id u32 @+20, ip u32 @+24, port u32 @+28.
+/// @+16, id u32 @+20, ip u32 @+24, port u32 @+28. Ops 1–5 are the
+/// reconfiguration ops named in `uc_node::audit::op_name`;
+/// [`ADMIN_OP_SCHEDULE_APPLY`] is the next one.
 pub const CNC_OFF_ADMIN_REQ: usize = 3584;
+/// Time-and-timers plan 2: replace the leader-serving row's schedule table
+/// (spec §5). Same admin-request line as the reconfiguration ops above.
+pub const ADMIN_OP_SCHEDULE_APPLY: u32 = 6;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
 /// version u64 @+16.
