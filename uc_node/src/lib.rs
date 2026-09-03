@@ -51,6 +51,8 @@ pub mod preflight;
 mod read_round;
 pub mod recovery;
 pub mod services;
+#[allow(dead_code)] // used from Task 8
+pub(crate) mod timers;
 
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
