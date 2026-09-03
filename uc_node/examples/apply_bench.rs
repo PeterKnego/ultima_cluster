@@ -267,7 +267,7 @@ fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("apply-bench-driver".into())
             .spawn(move || {
-                let mut app = Appender::new(buffer, 1);
+                let mut app = Appender::new(buffer, 1, 0);
                 let payload = vec![0x42u8; payload_len];
                 let mut n = 0u64;
                 let mut stalls = 0u64;

@@ -2777,7 +2777,7 @@ mod tests {
     /// run read — keeps wire bytes honest).
     fn frame_runs(payloads: &[&[u8]], chunk: usize) -> Vec<(u64, Vec<u8>, u64)> {
         let b = buffer();
-        let mut a = Appender::new(Arc::clone(&b), TERM);
+        let mut a = Appender::new(Arc::clone(&b), TERM, 0);
         for (i, p) in payloads.iter().enumerate() {
             a.append(4, i as u32, p).unwrap();
         }
@@ -3020,7 +3020,7 @@ mod tests {
         // padding-only run from a wrapping buffer
         let b = buffer();
         let c = Arc::clone(b.cnc());
-        let mut a = Appender::new(Arc::clone(&b), TERM);
+        let mut a = Appender::new(Arc::clone(&b), TERM, 0);
         let per = 96u64;
         let cap = b.capacity();
         let fill = (cap / per) as usize; // 682 frames -> 65472, 64 short of the wrap
@@ -3068,7 +3068,7 @@ mod tests {
         // lap 2 overwrites lap 1's offsets — capture each run right after its
         // append, before it is clobbered. Glue durable to append so it laps.
         let leader = small();
-        let mut a = Appender::new(Arc::clone(&leader), TERM);
+        let mut a = Appender::new(Arc::clone(&leader), TERM, 0);
         let mut runs: Vec<(u64, Vec<u8>, u64)> = Vec::new();
         let mut read_pos = 0u64;
         let mut out = Vec::new();
@@ -3701,7 +3701,7 @@ mod tests {
         // The leader stint: THIS node's appender writes 96..288 and its archive
         // records all of it. The receiver's tracker is untouched at 96.
         {
-            let mut a = Appender::new(Arc::clone(&b), TERM);
+            let mut a = Appender::new(Arc::clone(&b), TERM, 0);
             assert_eq!(a.position(), 96);
             a.append(4, 7, &[9u8; 64]).unwrap();
             a.append(4, 8, &[9u8; 64]).unwrap();
@@ -3909,7 +3909,7 @@ mod tests {
         term.store(new_term, Relaxed);
         let nt = {
             let nb = buffer();
-            let mut a = Appender::new(Arc::clone(&nb), new_term);
+            let mut a = Appender::new(Arc::clone(&nb), new_term, 0);
             a.append_new_term().unwrap();
             let mut out = Vec::new();
             let SliceRead::Run(rr) = nb.read_run_validated(0, 96, &mut out) else {

@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn target_guard_stops_at_the_committed_frontier() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         // Three 96-byte frames at 0, 96, 192 (append = 288).
         for i in 0..3u32 {
             a.append(1, i, &[i as u8; 64]).unwrap();
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn new_term_frame_is_yielded_but_carries_no_payload() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 5);
+        let mut a = Appender::new(Arc::clone(&b), 5, 0);
         a.append_new_term().unwrap(); // 32 B header-only frame at 0
         a.append(9, 1, b"data").unwrap(); // MESSAGE at 32
         let mut f = LogFollower::new(Arc::clone(&b), 0);
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn padding_is_skipped_and_cursor_advances_over_its_full_span() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..42u32 {
             a.append(1, i, &[0u8; 64]).unwrap(); // fill to 4032
         }
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn caught_up_when_cursor_at_or_past_target() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap();
         let mut f = LogFollower::new(Arc::clone(&b), 96);
         assert!(

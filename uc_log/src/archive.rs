@@ -141,6 +141,13 @@ pub struct Archive {
     /// `truncate_to` exactly like `term_observations`: any observation from a
     /// dropped tail is stale and must not be re-fed as if still durable.
     config_observations: Vec<(u64, Vec<u8>)>,
+    /// The highest `time_ns` stamp seen by `observe_terms`'s header walk
+    /// (time-and-timers spec §3.2), published to the cnc `log_time_ns` word
+    /// after every recorded block. Monotonic — `do_work` never lowers the
+    /// word even if this value would (it can't: it only grows). NOT reset by
+    /// `truncate_to` (Task 0 step 2): a truncated tail's stamps were already
+    /// published and a new leader's `seed_stamp` must still be `>=` them.
+    last_time_ns: u64,
 }
 
 impl Archive {
@@ -180,6 +187,7 @@ impl Archive {
             last_observed_term: 0,
             term_observations: Vec::new(),
             config_observations: Vec::new(),
+            last_time_ns: 0,
         })
     }
 
@@ -331,6 +339,14 @@ impl Archive {
         // payload touch. `slice` is the contiguous prefix in stream order, so
         // the pushed observations are position-ordered by construction.
         self.observe_terms(slice, base);
+        // Time-and-timers spec §3.2: the highest recorded stamp, the seed for
+        // the next leader and the `uc2_log_time_ns` gauge. Never lowered — the
+        // archive is the single writer of this word, so read-then-write here
+        // is race-free.
+        let cur = buffer.cnc().log_time_ns();
+        if self.last_time_ns > cur {
+            buffer.cnc().store_log_time_ns(self.last_time_ns);
+        }
         // The first block ever recorded (fresh journal, or one just cleared by a
         // first-block `truncate_to`) seeds the floor at its base.
         if self.next_block_seq == 0 {
@@ -364,6 +380,9 @@ impl Archive {
                 self.term_observations
                     .push((h.leadership_term_id, base + off as u64));
                 self.last_observed_term = h.leadership_term_id;
+            }
+            if h.frame_type != FRAME_TYPE_PADDING && h.time_ns > self.last_time_ns {
+                self.last_time_ns = h.time_ns;
             }
             // M7: CONFIG frames in the same header walk. `aligned` is already
             // the frame's end offset within `block` — `base + off + aligned`
@@ -881,7 +900,7 @@ mod tests {
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
 
         // Old leader's stream: 96-byte frames (32 header + 64 payload).
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for n in 0..5u32 {
             a.append(1, n, &[0xAB; 64]).unwrap();
         }
@@ -902,7 +921,7 @@ mod tests {
 
         // The new leader rewrites from `base` with a different layout: a
         // 32-byte NewTerm frame, then a 96-byte frame that STRADDLES 480.
-        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        let mut a2 = Appender::new(Arc::clone(&b), 2, 0);
         a2.append_new_term().unwrap();
         a2.append(1, 99, &[0xAB; 64]).unwrap();
         assert_eq!(c.counters().append.load_acquire(), 512);
@@ -934,7 +953,7 @@ mod tests {
         let (b, c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
 
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for n in 0..5u32 {
             a.append(1, n, &[0xAB; 64]).unwrap();
         }
@@ -952,7 +971,7 @@ mod tests {
         );
         c.counters().prime(base);
 
-        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        let mut a2 = Appender::new(Arc::clone(&b), 2, 0);
         a2.append_new_term().unwrap();
         a2.append(1, 99, &[0xAB; 64]).unwrap();
 
@@ -1003,7 +1022,7 @@ mod tests {
     fn adopt_floor_on_nonempty_below_pos_is_rejected() {
         let (b, _c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..5 {
             a.append(1, i, &[7u8; 64]).unwrap();
         }
@@ -1024,7 +1043,7 @@ mod tests {
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         assert_eq!(arch.recovered_position(), 0);
 
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..10 {
             a.append(1, i, &[7u8; 64]).unwrap();
         }
@@ -1049,7 +1068,7 @@ mod tests {
             ..test_cfg(dir.path())
         };
         let mut arch = Archive::open(cfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..10 {
             a.append(1, i, &[7u8; 64]).unwrap();
         }
@@ -1071,7 +1090,7 @@ mod tests {
             ..test_cfg(dir.path())
         };
         let mut arch = Archive::open(cfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..4 {
             a.append(1, i, &[0u8; 64]).unwrap(); // 4 x 96 B
         }
@@ -1097,7 +1116,7 @@ mod tests {
         // and journal.durable_seq() covers every block we advanced over.
         let (b, c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[1u8; 64]).unwrap();
         arch.do_work(&b).unwrap();
         assert_eq!(c.counters().durable.load_acquire(), 96);
@@ -1111,7 +1130,7 @@ mod tests {
         let (b, c, dir) = setup(1 << 16);
         {
             let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-            let mut a = Appender::new(Arc::clone(&b), 1);
+            let mut a = Appender::new(Arc::clone(&b), 1, 0);
             for i in 0..5 {
                 a.append(1, i, &[0u8; 64]).unwrap();
             }
@@ -1123,7 +1142,7 @@ mod tests {
         let (b2, c2, _) = setup(1 << 16);
         c2.counters().prime(arch.recovered_position());
         let mut arch = arch;
-        let mut a2 = Appender::new(Arc::clone(&b2), 2);
+        let mut a2 = Appender::new(Arc::clone(&b2), 2, 0);
         // Appender::new picks up position from the primed counters
         assert_eq!(a2.position(), 480);
         let pos = a2.append(1, 100, &[0u8; 64]).unwrap();
@@ -1139,7 +1158,7 @@ mod tests {
         // small buffer so a wrap (padding frame) lands in the journal
         let (b, c, dir) = setup(4096);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         let mut n = 0u32;
         let mut positions = Vec::new();
         while a.position() < 5000 {
@@ -1189,7 +1208,7 @@ mod tests {
             ..test_cfg(dir.path())
         };
         let mut arch = Archive::open(cfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..8 {
             a.append(1, i, &[i as u8; 64]).unwrap(); // 8 x 96 B = 768
         }
@@ -1218,7 +1237,7 @@ mod tests {
         // the archive keeps working after truncation: append + record resumes
         let (b2, c2, _) = setup(1 << 16);
         c2.counters().prime(480);
-        let mut a2 = Appender::new(Arc::clone(&b2), 2);
+        let mut a2 = Appender::new(Arc::clone(&b2), 2, 0);
         assert_eq!(a2.append(1, 100, &[9u8; 64]).unwrap(), 480);
         assert!(arch.do_work(&b2).unwrap());
         assert_eq!(arch.recovered_position(), 576);
@@ -1233,7 +1252,7 @@ mod tests {
             ..test_cfg(dir.path())
         };
         let mut arch = Archive::open(cfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..4 {
             a.append(1, i, &[0u8; 64]).unwrap();
         }
@@ -1277,7 +1296,7 @@ mod tests {
             ..ArchiveConfig::new(dir.path())
         };
         let mut arch = Archive::open(cfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         let mut frames = Vec::new();
         for i in 0..(n_blocks as u32 * 4) {
             frames.push(a.append(1, i, &[i as u8; 64]).unwrap());
@@ -1363,7 +1382,7 @@ mod tests {
         let (b, _c, dir) = setup(1 << 16);
         // Default 1 MiB block cap: all 4 frames (384 B) land in ONE block.
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         let mut frames = Vec::new();
         for i in 0..4 {
             frames.push(a.append(1, i, &[i as u8; 64]).unwrap());
@@ -1414,7 +1433,7 @@ mod tests {
         let (b, _c, dir) = setup(1 << 16);
         {
             let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-            let mut a = Appender::new(Arc::clone(&b), 1);
+            let mut a = Appender::new(Arc::clone(&b), 1, 0);
             for i in 0..4 {
                 a.append(1, i, &[i as u8; 64]).unwrap();
             }
@@ -1447,16 +1466,38 @@ mod tests {
         let (b, _c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         // term 1 frames at 0, 96; term 2 frames at 192, 288 (one block, 384 B)
-        let mut a1 = Appender::new(Arc::clone(&b), 1);
+        let mut a1 = Appender::new(Arc::clone(&b), 1, 0);
         a1.append(1, 0, &[0u8; 64]).unwrap();
         a1.append(1, 1, &[0u8; 64]).unwrap();
-        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        let mut a2 = Appender::new(Arc::clone(&b), 2, 0);
         a2.append(1, 2, &[0u8; 64]).unwrap();
         a2.append(1, 3, &[0u8; 64]).unwrap();
         assert!(arch.do_work(&b).unwrap());
         assert_eq!(arch.take_term_observations(), vec![(1, 0), (2, 192)]);
         // draining consumed them
         assert!(arch.take_term_observations().is_empty());
+    }
+
+    /// Task 3: the archive publishes the highest recorded `time_ns` stamp to
+    /// the cnc word after every recorded block, and never lowers it (a value
+    /// left by a previous leader life must survive a lower-stamped block).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn archive_publishes_the_highest_recorded_stamp_and_never_lowers_it() {
+        let (b, c, dir) = setup(1 << 16);
+        let mut archive = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        a.set_now(700);
+        a.append(1, 1, b"a").unwrap();
+        a.set_now(900);
+        a.append(1, 2, b"b").unwrap();
+        archive.do_work(&b).unwrap();
+        assert_eq!(c.log_time_ns(), 900);
+        c.store_log_time_ns(1_500); // e.g. a value left by a previous leader life
+        a.set_now(1_000);
+        a.append(1, 3, b"c").unwrap();
+        archive.do_work(&b).unwrap();
+        assert_eq!(c.log_time_ns(), 1_500, "the archive never lowers the word");
     }
 
     /// Truncation resets the observation cursor; re-recording the still-in-ring
@@ -1471,11 +1512,11 @@ mod tests {
         };
         let mut arch = Archive::open(cfg).unwrap();
         // block 0 = term 1 (frames 0, 96); block 1 = term 2 (frames 192, 288)
-        let mut a1 = Appender::new(Arc::clone(&b), 1);
+        let mut a1 = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..2 {
             a1.append(1, i, &[0u8; 64]).unwrap();
         }
-        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        let mut a2 = Appender::new(Arc::clone(&b), 2, 0);
         for i in 2..4 {
             a2.append(1, i, &[0u8; 64]).unwrap();
         }
@@ -1548,7 +1589,7 @@ mod tests {
     fn config_observations_capture_frame_at_exact_frame_end() {
         let (b, _c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // ordinary MESSAGE frame first (96 B)
         let end = a.append_config(1, b"cfg-v1").unwrap(); // CONFIG frame next
         a.append(1, 1, &[0u8; 64]).unwrap(); // MESSAGE frame after it
@@ -1567,7 +1608,7 @@ mod tests {
     fn config_observations_empty_for_message_and_padding_only_block() {
         let (b, _c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..4 {
             a.append(1, i, &[0u8; 64]).unwrap();
         }
@@ -1584,7 +1625,7 @@ mod tests {
     fn truncate_resets_config_observations() {
         let (b, _c, dir) = setup(1 << 16);
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // [0, 96)
         a.append_config(1, b"cfg-v1").unwrap(); // [96, 160), same (only) block
         assert!(arch.do_work(&b).unwrap());

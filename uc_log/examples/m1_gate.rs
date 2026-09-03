@@ -83,7 +83,7 @@ fn main() {
     .unwrap();
 
     let payload = vec![0xa5u8; payload_len];
-    let mut appender = Appender::new(Arc::clone(&buffer), 1);
+    let mut appender = Appender::new(Arc::clone(&buffer), 1, 0);
     let start = Instant::now();
     let deadline = start + Duration::from_secs(secs);
     let mut appended = 0u64;

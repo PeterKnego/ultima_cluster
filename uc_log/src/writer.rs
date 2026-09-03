@@ -100,7 +100,7 @@ mod tests {
     fn leader_run_rewritten_on_follower_reads_back_identically() {
         let (leader, _lc) = buf();
         let (follower, fc) = buf();
-        let mut a = Appender::new(Arc::clone(&leader), 7);
+        let mut a = Appender::new(Arc::clone(&leader), 7, 0);
         for i in 0..4 {
             a.append(2, i, &[i as u8; 64]).unwrap();
         }

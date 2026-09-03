@@ -868,7 +868,7 @@ mod tests {
             std::sync::Arc::clone(&cnc),
             256,
         ));
-        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1);
+        let mut appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
         for i in 0..5u32 {
             appender.append(1, i, &[i as u8; 64]).unwrap();
         }

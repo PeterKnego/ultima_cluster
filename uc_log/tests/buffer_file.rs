@@ -25,7 +25,7 @@ fn file_backed_buffer_roundtrip_across_reopen_of_mapping() {
     let cnc = test_cnc();
 
     let b = Arc::new(LogBuffer::create_file(&path, 1 << 16, Arc::clone(&cnc), 1024).unwrap());
-    let mut a = Appender::new(Arc::clone(&b), 1);
+    let mut a = Appender::new(Arc::clone(&b), 1, 0);
     let pos = a.append(5, 6, b"persisted?").unwrap();
 
     let mut out = Vec::new();

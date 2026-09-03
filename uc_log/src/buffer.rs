@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use uc_protocol::v2::frame::{
     self, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
-    FrameHeader, HEADER_LEN, align_frame_len,
+    FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN, TIMER_BODY_LEN, TimerBody, align_frame_len,
 };
 
 use crate::cnc::CncPage;
@@ -550,10 +550,17 @@ pub struct Appender {
     pos: u64,
     cached_durable: u64,
     leadership_term_id: u32,
+    /// The pass's clock reading (`set_now`); a stamp is `max(now_ns, last_stamp)`.
+    now_ns: u64,
+    /// The last stamp written — the log's clock never goes backwards.
+    last_stamp: u64,
 }
 
 impl Appender {
-    pub fn new(buffer: Arc<LogBuffer>, leadership_term_id: u32) -> Self {
+    /// `seed_stamp`: the highest stamp already on the log (the cnc `log_time_ns`
+    /// word at leader open; `0` on a fresh cluster). Every stamp this appender
+    /// writes is `>= seed_stamp`.
+    pub fn new(buffer: Arc<LogBuffer>, leadership_term_id: u32, seed_stamp: u64) -> Self {
         let pos = buffer.cnc.counters().append.load_acquire();
         let cached_durable = buffer.cnc.counters().durable.load_acquire();
         Self {
@@ -561,7 +568,32 @@ impl Appender {
             pos,
             cached_durable,
             leadership_term_id,
+            now_ns: seed_stamp,
+            last_stamp: seed_stamp,
         }
+    }
+
+    /// Once per leader pass (time-and-timers spec §3.2).
+    pub fn set_now(&mut self, now_ns: u64) {
+        self.now_ns = now_ns;
+    }
+
+    pub fn last_stamp(&self) -> u64 {
+        self.last_stamp
+    }
+
+    #[inline]
+    fn stamp(&mut self) -> u64 {
+        let s = self.now_ns.max(self.last_stamp);
+        self.last_stamp = s;
+        s
+    }
+
+    #[inline]
+    fn stamp_at(&mut self, want: u64) -> u64 {
+        let s = want.max(self.last_stamp);
+        self.last_stamp = s;
+        s
     }
 
     #[inline]
@@ -577,7 +609,7 @@ impl Appender {
         }
         let total = HEADER_LEN + payload.len();
         let aligned = align_frame_len(total) as u64;
-        let b = &self.buffer;
+        let b = Arc::clone(&self.buffer);
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -592,8 +624,10 @@ impl Appender {
             }
         }
 
+        let time_ns = self.stamp();
+
         let frame_pos = if pad > 0 {
-            self.write_padding(off, pad as u32);
+            self.write_padding(off, pad as u32, time_ns);
             self.pos + pad
         } else {
             self.pos
@@ -619,7 +653,7 @@ impl Appender {
                     leadership_term_id: self.leadership_term_id,
                     client_id,
                     seq,
-                    time_ns: 0,
+                    time_ns,
                 },
             );
         }
@@ -640,7 +674,7 @@ impl Appender {
     pub fn append_new_term(&mut self) -> Result<u64, AppendError> {
         let total = HEADER_LEN; // header-only no-op frame
         let aligned = align_frame_len(total) as u64;
-        let b = &self.buffer;
+        let b = Arc::clone(&self.buffer);
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -654,8 +688,10 @@ impl Appender {
             }
         }
 
+        let time_ns = self.stamp();
+
         let frame_pos = if pad > 0 {
-            self.write_padding(off, pad as u32);
+            self.write_padding(off, pad as u32, time_ns);
             self.pos + pad
         } else {
             self.pos
@@ -674,7 +710,7 @@ impl Appender {
                     leadership_term_id: self.leadership_term_id,
                     client_id: 0,
                     seq: 0,
-                    time_ns: 0,
+                    time_ns,
                 },
             );
         }
@@ -702,7 +738,7 @@ impl Appender {
         }
         let total = HEADER_LEN + payload.len();
         let aligned = align_frame_len(total) as u64;
-        let b = &self.buffer;
+        let b = Arc::clone(&self.buffer);
 
         let off = b.offset(self.pos);
         let to_end = b.capacity - off as u64;
@@ -717,8 +753,10 @@ impl Appender {
             }
         }
 
+        let time_ns = self.stamp();
+
         let frame_pos = if pad > 0 {
-            self.write_padding(off, pad as u32);
+            self.write_padding(off, pad as u32, time_ns);
             self.pos + pad
         } else {
             self.pos
@@ -744,7 +782,7 @@ impl Appender {
                     leadership_term_id: term,
                     client_id: 0,
                     seq: 0,
-                    time_ns: 0,
+                    time_ns,
                 },
             );
         }
@@ -755,8 +793,65 @@ impl Appender {
         Ok(end)
     }
 
+    /// Append a TIMER frame (time-and-timers spec §4.2/§4.3). Stamped with the
+    /// deadline, clamped to `last_stamp` — so `stamp > body.deadline_ns` means
+    /// the timer is late. Returns `(frame_start, stamp)`.
+    pub fn append_timer(&mut self, body: &TimerBody, flags: u8) -> Result<(u64, u64), AppendError> {
+        let total = HEADER_LEN + TIMER_BODY_LEN;
+        let aligned = align_frame_len(total) as u64;
+        let b = Arc::clone(&self.buffer);
+
+        let off = b.offset(self.pos);
+        let to_end = b.capacity - off as u64;
+        let pad = if aligned > to_end { to_end } else { 0 };
+        let end = self.pos + pad + aligned;
+
+        // The one hard gate: never claim past durable + capacity.
+        if end > self.cached_durable + b.capacity {
+            self.cached_durable = b.cnc.counters().durable.load_acquire();
+            if end > self.cached_durable + b.capacity {
+                return Err(AppendError::WouldOverrun);
+            }
+        }
+
+        let time_ns = self.stamp_at(body.deadline_ns);
+
+        let frame_pos = if pad > 0 {
+            self.write_padding(off, pad as u32, time_ns);
+            self.pos + pad
+        } else {
+            self.pos
+        };
+        let foff = b.offset(frame_pos);
+
+        // SAFETY (all raw writes): within capacity; bytes in [append,
+        // durable+capacity) are writer-owned per the gate; ordering via the
+        // commit word + append counter release stores below.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), aligned as usize);
+            frame::write_header_except_length(
+                dst,
+                &FrameHeader {
+                    length: 0,
+                    frame_type: FRAME_TYPE_TIMER,
+                    flags,
+                    leadership_term_id: self.leadership_term_id,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns,
+                },
+            );
+            frame::write_timer_body(&mut dst[HEADER_LEN..], body);
+        }
+        b.commit_word(foff).store(total as u32, Ordering::Release);
+
+        self.pos = end;
+        b.cnc.counters().append.store_release(self.pos);
+        Ok((frame_pos, time_ns))
+    }
+
     /// Padding frame: header only; `length` spans to the buffer end.
-    fn write_padding(&self, off: usize, pad_len: u32) {
+    fn write_padding(&self, off: usize, pad_len: u32, time_ns: u64) {
         let b = &self.buffer;
         // SAFETY: as in append().
         unsafe {
@@ -770,7 +865,7 @@ impl Appender {
                     leadership_term_id: self.leadership_term_id,
                     client_id: 0,
                     seq: 0,
-                    time_ns: 0,
+                    time_ns,
                 },
             );
         }
@@ -785,8 +880,9 @@ mod tests {
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::{
-        FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, HEADER_LEN,
-        read_header,
+        FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM,
+        FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, HEADER_LEN, TIMER_BODY_LEN, TimerBody, read_header,
+        read_timer_body,
     };
 
     const CAP: u64 = 4096;
@@ -815,7 +911,7 @@ mod tests {
     #[test]
     fn append_then_recordable_roundtrip() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 3);
+        let mut a = Appender::new(Arc::clone(&b), 3, 0);
         let pos = a.append(11, 42, b"hello world!").unwrap();
         assert_eq!(pos, 0);
         // 32 header + 12 payload = 44 -> aligned 64
@@ -836,7 +932,7 @@ mod tests {
     #[test]
     fn append_new_term_is_header_only_32_bytes() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 7);
+        let mut a = Appender::new(Arc::clone(&b), 7, 0);
         let pos = a.append_new_term().unwrap();
         assert_eq!(pos, 0);
         assert_eq!(a.position(), 32, "the NewTerm frame is header-only (32 B)");
@@ -855,7 +951,7 @@ mod tests {
     #[test]
     fn append_config_records_type_term_and_payload_returns_frame_end() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 7);
+        let mut a = Appender::new(Arc::clone(&b), 7, 0);
         let payload = b"cfg-bytes-v1";
         // Stamped with the PASSED term (9), not the appender's own (7) —
         // pins the explicit-term signature.
@@ -884,7 +980,7 @@ mod tests {
     #[test]
     fn recordable_slice_is_bounded_and_frame_aligned() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..4 {
             a.append(1, i, &[0u8; 64]).unwrap(); // 96 B frames
         }
@@ -907,7 +1003,7 @@ mod tests {
     #[test]
     fn recordable_slice_surfaces_torn_length_word() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // frame 1: 96 B, at offset 0
         a.append(1, 1, &[0u8; 64]).unwrap(); // frame 2: 96 B, at offset 96
         let second_frame_off = 96usize;
@@ -935,7 +1031,7 @@ mod tests {
     #[test]
     fn recordable_slice_surfaces_subheader_length_word() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // frame 1: 96 B at offset 0
         a.append_new_term().unwrap(); // frame 2: 32 B header-only at offset 96
         assert_eq!(a.position(), 128, "committed region is exactly [0, 128)");
@@ -956,7 +1052,7 @@ mod tests {
     #[test]
     fn wrap_emits_padding_and_slice_stops_at_wrap() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         // fill to 4032: 42 frames of 96 B
         for i in 0..42 {
             a.append(1, i, &[0u8; 64]).unwrap();
@@ -984,7 +1080,7 @@ mod tests {
     #[test]
     fn overrun_gate_blocks_until_durable_advances() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         // durable stays 0: we can fill exactly one capacity, no more
         for i in 0..42 {
             a.append(1, i, &[0u8; 64]).unwrap();
@@ -1017,7 +1113,7 @@ mod tests {
     #[test]
     fn append_config_would_overrun_leaves_no_partial_state() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         // Fill to exactly capacity (durable stays 0): 42 frames of 96 B = 4032,
         // 64 B of headroom left — too little for a config frame (32 header +
         // 12 payload = 44 -> aligned 64, but the overrun gate compares against
@@ -1072,7 +1168,7 @@ mod tests {
     #[test]
     fn payload_too_large_is_rejected() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         assert_eq!(
             a.append(1, 1, &[0u8; 257]).unwrap_err(),
             AppendError::PayloadTooLarge
@@ -1082,7 +1178,7 @@ mod tests {
     #[test]
     fn validated_read_roundtrip_and_not_committed() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 2);
+        let mut a = Appender::new(Arc::clone(&b), 2, 0);
         a.append(9, 77, b"abc").unwrap();
         let mut out = Vec::new();
         match b.read_frame_validated(0, &mut out) {
@@ -1121,7 +1217,7 @@ mod tests {
             FrameRead::Overrun
         ));
         // Post-restart appends still read fine.
-        let mut a = Appender::new(Arc::clone(&b), 5);
+        let mut a = Appender::new(Arc::clone(&b), 5, 0);
         a.append(1, 7, b"post-restart").unwrap();
         assert!(matches!(
             b.read_frame_validated(2 * CAP, &mut out),
@@ -1132,7 +1228,7 @@ mod tests {
     #[test]
     fn validated_read_detects_overrun_after_wrap() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         // write ~3 capacities worth, letting the gate breathe by keeping
         // durable glued to append (as a healthy archive would)
         let mut n = 0u32;
@@ -1158,7 +1254,7 @@ mod tests {
     #[test]
     fn run_read_packs_whole_frames_up_to_max_bytes() {
         let (b, _c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..4 {
             a.append(1, i, &[i as u8; 64]).unwrap(); // 4 x 96 B frames
         }
@@ -1196,7 +1292,7 @@ mod tests {
     #[test]
     fn run_read_padding_is_header_only_with_full_advance() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         for i in 0..42 {
             a.append(1, i, &[0u8; 64]).unwrap(); // fill to 4032
         }
@@ -1226,7 +1322,7 @@ mod tests {
     #[test]
     fn run_read_detects_overrun_and_primed_fresh_buffer() {
         let (b, c) = buf();
-        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
         let mut n = 0u32;
         while a.position() < 3 * CAP {
             a.append(1, n, &[0u8; 64]).unwrap();
@@ -1245,5 +1341,169 @@ mod tests {
             b2.read_run_validated(2 * CAP - 64, 1392, &mut out),
             SliceRead::Overrun
         ));
+    }
+
+    // ------------------------------------------ time-and-timers (Task 3)
+
+    fn headers(b: &LogBuffer, end: u64) -> Vec<FrameHeader> {
+        let s = b.recordable_slice(0, end as usize).unwrap();
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + HEADER_LEN <= s.len() {
+            let h = read_header(&s[off..]);
+            if h.length == 0 {
+                break;
+            }
+            out.push(h);
+            off += align_frame_len(h.length as usize);
+        }
+        out
+    }
+
+    #[test]
+    fn every_frame_type_is_stamped_and_the_clamp_never_goes_backwards() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 3, 1_000);
+        a.append_new_term().unwrap(); // stamped with the seed
+        a.set_now(5_000);
+        a.append(1, 1, b"x").unwrap();
+        a.set_now(4_000); // the clock stepped back: the stamp must hold at 5_000
+        a.append(1, 2, b"y").unwrap();
+        a.append_config(3, b"cfg").unwrap();
+        a.set_now(6_000);
+        a.append(1, 3, b"z").unwrap();
+        let hs = headers(&b, a.position());
+        let stamps: Vec<u64> = hs.iter().map(|h| h.time_ns).collect();
+        assert_eq!(stamps, vec![1_000, 5_000, 5_000, 5_000, 6_000]);
+        assert_eq!(a.last_stamp(), 6_000);
+        assert!(
+            hs.iter()
+                .all(|h| h.frame_type != FRAME_TYPE_PADDING || h.time_ns > 0)
+        );
+    }
+
+    #[test]
+    fn append_timer_stamps_the_deadline_and_marks_late_by_clamp() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 3, 0);
+        a.set_now(100);
+        a.append(1, 1, b"a").unwrap();
+        let body = TimerBody {
+            identity_hash: 9,
+            timer_id: 42,
+            deadline_ns: 150,
+        };
+        let (pos, stamp) = a.append_timer(&body, 0).unwrap();
+        assert_eq!(stamp, 150, "on time: stamped with the deadline");
+        let s = b.recordable_slice(pos, 64).unwrap();
+        let h = read_header(s);
+        assert_eq!(h.frame_type, FRAME_TYPE_TIMER);
+        assert_eq!((h.client_id, h.seq, h.flags), (0, 0, 0));
+        assert_eq!(h.length as usize, HEADER_LEN + TIMER_BODY_LEN);
+        assert_eq!(read_timer_body(&s[HEADER_LEN..]), Some(body));
+        // late: the log is already past the deadline
+        a.set_now(1_000);
+        a.append(1, 2, b"b").unwrap();
+        let late = TimerBody {
+            identity_hash: 9,
+            timer_id: 43,
+            deadline_ns: 500,
+        };
+        let (_, stamp) = a.append_timer(&late, FLAG_TIMER_TABLE).unwrap();
+        assert_eq!(
+            stamp, 1_000,
+            "late: clamped to last_stamp, deadline kept in the body"
+        );
+        let hs = headers(&b, a.position());
+        assert_eq!(hs.last().unwrap().flags, FLAG_TIMER_TABLE);
+        let stamps: Vec<u64> = hs.iter().map(|h| h.time_ns).collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
+    }
+
+    /// Spec §4.3, pinned at the appender: drive random passes of
+    /// (set_now, due timers first, then client frames) and assert no frame
+    /// before a TIMER carries a stamp above its deadline unless the TIMER is
+    /// late.
+    #[test]
+    fn pass_order_property_no_earlier_frame_exceeds_an_on_time_deadline() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut now = 1_000u64;
+        let mut pending: Vec<(u64, u64)> = Vec::new(); // (id, deadline)
+        let mut id = 0u64;
+        'passes: for _ in 0..40 {
+            now += next() % 300;
+            a.set_now(now);
+            // schedule a few timers for the near future or the past
+            for _ in 0..(next() % 3) {
+                id += 1;
+                pending.push((id, now.saturating_sub(200) + next() % 600));
+            }
+            pending.sort_by_key(|p| p.1);
+            while let Some(&(tid, dl)) = pending.first() {
+                if dl > now {
+                    break;
+                }
+                pending.remove(0);
+                if a.append_timer(
+                    &TimerBody {
+                        identity_hash: 1,
+                        timer_id: tid,
+                        deadline_ns: dl,
+                    },
+                    0,
+                )
+                .is_err()
+                {
+                    break 'passes;
+                }
+            }
+            for _ in 0..(next() % 4) {
+                if a.append(1, 1, b"c").is_err() {
+                    break 'passes;
+                }
+            }
+        }
+        let hs = headers(&b, a.position());
+        assert!(
+            hs.len() > 20,
+            "the buffer filled too early to mean anything: {}",
+            hs.len()
+        );
+        for (i, h) in hs.iter().enumerate() {
+            if h.frame_type != FRAME_TYPE_TIMER {
+                continue;
+            }
+            let body = read_timer_body(
+                &b.recordable_slice(
+                    hs[..i]
+                        .iter()
+                        .map(|x| align_frame_len(x.length as usize) as u64)
+                        .sum(),
+                    64,
+                )
+                .unwrap()[HEADER_LEN..],
+            )
+            .unwrap();
+            let late = h.time_ns > body.deadline_ns;
+            if !late {
+                assert!(
+                    hs[..i].iter().all(|e| e.time_ns <= body.deadline_ns),
+                    "frame before an on-time timer stamped past its deadline: {:?} vs {body:?}",
+                    &hs[..i]
+                );
+            }
+            assert!(
+                hs[i..].iter().all(|e| e.time_ns >= h.time_ns),
+                "a later frame stamped below the timer"
+            );
+        }
     }
 }

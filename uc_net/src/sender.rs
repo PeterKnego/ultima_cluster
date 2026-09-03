@@ -1770,7 +1770,7 @@ mod tests {
         let b = buffer();
         let (f1, f2) = (Fake::new(), Fake::new());
         let (mut s, _tx) = sender_to(&[&f1, &f2], &b);
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         for i in 0..3 {
             a.append(4, i, &[i as u8; 64]).unwrap();
         }
@@ -1855,7 +1855,7 @@ mod tests {
             window: 96,
         })
         .unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         for i in 0..4 {
             a.append(4, i, &[0u8; 64]).unwrap();
         }
@@ -1886,7 +1886,7 @@ mod tests {
         let b = buffer();
         let (f1, f2) = (Fake::new(), Fake::new());
         let (mut s, tx) = sender_to(&[&f1, &f2], &b);
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         for i in 0..4 {
             a.append(4, i, &[0u8; 64]).unwrap();
         }
@@ -1936,7 +1936,7 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         for i in 0..2 {
             a.append(4, i, &[i as u8; 64]).unwrap(); // frames at 0 and 96
         }
@@ -1984,7 +1984,7 @@ mod tests {
         let b = buffer();
         let (f1, f2) = (Fake::new(), Fake::new());
         let (mut s, tx) = sender_to(&[&f1, &f2], &b);
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         for i in 0..4 {
             a.append(4, i, &[0u8; 64]).unwrap();
         }
@@ -2219,7 +2219,7 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         a.append(4, 0, &[0u8; 64]).unwrap();
         s.do_work();
         // first datagram is the data; a heartbeat follows within the cycle(s)
@@ -2258,7 +2258,7 @@ mod tests {
             ..uc_log::archive::ArchiveConfig::new(dir.path())
         };
         let mut arch = uc_log::archive::Archive::open(cfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         let mut n = 0u32;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {
@@ -2344,7 +2344,7 @@ mod tests {
             always_leader(),
         );
         // the appender stamps its frames with term 7 (its own leadership term)
-        let mut a = Appender::new(Arc::clone(&b), 7);
+        let mut a = Appender::new(Arc::clone(&b), 7, 0);
         a.append(4, 0, &[0u8; 64]).unwrap();
         // the consensus agent bumps the sender's handle to 8 before the send:
         // the DATA datagram must carry 8 while the frame inside still carries 7
@@ -2387,7 +2387,7 @@ mod tests {
             term_handle(9),
             Arc::clone(&flag),
         );
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         for i in 0..3 {
             a.append(4, i, &[0u8; 64]).unwrap();
         }
@@ -2570,7 +2570,7 @@ mod tests {
     /// the real ring, so a NAK re-read of the same position (the retransmit
     /// test) sees the same committed bytes the first send did.
     fn append_and_flush(s: &mut Sender, payload: &[u8]) {
-        let mut a = Appender::new(Arc::clone(&s.buffer), 9);
+        let mut a = Appender::new(Arc::clone(&s.buffer), 9, 0);
         let max = s.buffer.max_payload();
         for chunk in payload.chunks(max) {
             loop {
@@ -2652,7 +2652,7 @@ mod tests {
         // and not: budget 1368 (correct) packs 42 frames = 1344B body
         // (sealed 1384B, fits); budget 1392 (missing the subtraction) packs
         // 43 = 1376B body (sealed 1416B > the 1408B MTU).
-        let mut a = Appender::new(Arc::clone(&s.buffer), 9);
+        let mut a = Appender::new(Arc::clone(&s.buffer), 9, 0);
         for i in 0..64u32 {
             a.append(4, i, &[]).unwrap();
         }
@@ -2680,7 +2680,7 @@ mod tests {
         // above (needed for the same reason: coarse frames never straddle
         // the 24-byte boundary).
         let (mut s, f) = sender_with_crypto_to_one_follower();
-        let mut a = Appender::new(Arc::clone(&s.buffer), 9);
+        let mut a = Appender::new(Arc::clone(&s.buffer), 9, 0);
         for i in 0..64u32 {
             a.append(4, i, &[]).unwrap();
         }
@@ -2801,7 +2801,7 @@ mod tests {
             ..uc_log::archive::ArchiveConfig::new(dir.path())
         };
         let mut arch = uc_log::archive::Archive::open(acfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         let mut n = 0u32;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {
@@ -2874,7 +2874,7 @@ mod tests {
             ..uc_log::archive::ArchiveConfig::new(dir.path())
         };
         let mut arch = uc_log::archive::Archive::open(acfg).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
         let mut n = 0u32;
         while a.position() < 3 * 4096 {
             match a.append(1, n, &[n as u8; 64]) {

@@ -241,7 +241,7 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                 let mut rng = seed ^ 0xA5A5_A5A5;
                 let mut term: u32 = 1;
                 let mut my_gen = generation.load(Ordering::Acquire);
-                let mut appender = Appender::new(Arc::clone(&buffer), term);
+                let mut appender = Appender::new(Arc::clone(&buffer), term, 0);
                 let scratch = vec![0xABu8; MAX_PAYLOAD];
                 while !stop.load(Ordering::Relaxed) {
                     let _g = append_gate.lock().unwrap();
@@ -251,7 +251,7 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                         // the new frontier (uc_node's post-prime `Appender::new`).
                         my_gen = cur;
                         term = term.wrapping_add(1).max(1);
-                        appender = Appender::new(Arc::clone(&buffer), term);
+                        appender = Appender::new(Arc::clone(&buffer), term, 0);
                     }
                     for _ in 0..16 {
                         // total frame 100..=4000 B => payload 68..=3968 B
@@ -672,7 +672,7 @@ fn find_block_tolerates_tight_purge_race() {
             .name("tight-appender".into())
             .spawn(move || {
                 let mut rng = seed ^ 0xA5A5_A5A5;
-                let mut appender = Appender::new(Arc::clone(&buffer), 1);
+                let mut appender = Appender::new(Arc::clone(&buffer), 1, 0);
                 let scratch = vec![0xABu8; MAX_PAYLOAD];
                 while !stop.load(Ordering::Relaxed) {
                     let _g = append_gate.lock().unwrap();

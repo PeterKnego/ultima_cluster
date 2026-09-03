@@ -234,7 +234,7 @@ pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultCon
 /// gap that scrolls out of the ring is an unrecoverable wedge). `live` excludes
 /// a deliberately-dead follower so quorum pacing is preserved.
 pub fn load(leader: &Arc<LogBuffer>, live: &[&Arc<LogBuffer>], n_msgs: u64) -> u64 {
-    let mut a = Appender::new(Arc::clone(leader), TERM);
+    let mut a = Appender::new(Arc::clone(leader), TERM, 0);
     let deadline = Instant::now() + Duration::from_secs(60);
     for i in 0..n_msgs {
         loop {

@@ -2225,6 +2225,19 @@ struct Consensus {
     crypto_last_log_ns: u64,
 }
 
+/// Wall-clock nanoseconds since the Unix epoch — the appender's `set_now`
+/// input on leader open (time-and-timers spec §3.2). `Consensus::now_ns` is
+/// monotonic-but-arbitrary-origin (`Instant`-based) and unsuitable as a log
+/// stamp; this is the real clock reading. Task 8 replaces the one call site
+/// below with a `pass_now_ns` sampled once per pass; this stays the leaf
+/// clock read either way.
+fn wall_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 impl Consensus {
     /// One consensus duty cycle (binding order, plan §Task 8).
     fn do_work(&mut self) -> bool {
@@ -5435,7 +5448,9 @@ impl Consensus {
             open.base >= to,
             "the archive never cuts ABOVE the requested base"
         );
-        let mut appender = Appender::new(Arc::clone(&self.buffer), open.term);
+        let mut appender =
+            Appender::new(Arc::clone(&self.buffer), open.term, self.cnc.log_time_ns());
+        appender.set_now(wall_now_ns());
         appender
             .append_new_term()
             .expect("NewTerm append fail-stop");
@@ -8293,7 +8308,7 @@ mod tests {
     fn append_and_archive_config(archive: &mut Archive, term: u32, cfg: &ClusterConfig) -> u64 {
         let cnc = test_cnc();
         let buffer = Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), cnc, 4096));
-        let mut appender = Appender::new(Arc::clone(&buffer), term);
+        let mut appender = Appender::new(Arc::clone(&buffer), term, 0);
         let mut bytes = Vec::new();
         encode_config(&cluster_to_wire(cfg, 0), &mut bytes);
         let end = appender
@@ -8317,7 +8332,7 @@ mod tests {
     ) -> (u64, u64) {
         let cnc = test_cnc();
         let buffer = Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), cnc, 4096));
-        let mut appender = Appender::new(Arc::clone(&buffer), term);
+        let mut appender = Appender::new(Arc::clone(&buffer), term, 0);
         let mut bytes1 = Vec::new();
         encode_config(&cluster_to_wire(cfg1, 0), &mut bytes1);
         let end1 = appender
