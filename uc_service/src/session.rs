@@ -283,6 +283,9 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
     fn pending_timers(&self) -> Vec<(u64, u64)> {
         self.inner.pending_timers()
     }
+    fn table_delivered(&self) -> Vec<(u64, u64)> {
+        self.inner.table_delivered()
+    }
 }
 
 /// The wire image of the dedup table carried inside a `Sessioned` snapshot,

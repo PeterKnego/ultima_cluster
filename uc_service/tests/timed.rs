@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
+use uc_protocol::v2::ipc::SchedOp;
 use uc_service::{
     ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine, Timed, TimerEvent,
 };
@@ -41,6 +42,13 @@ fn ev(id: u64, dl: u64) -> TimerEvent {
         id,
         deadline_ns: dl,
         table: false,
+    }
+}
+fn tev(id: u64, dl: u64) -> TimerEvent {
+    TimerEvent {
+        id,
+        deadline_ns: dl,
+        table: true,
     }
 }
 
@@ -88,6 +96,37 @@ fn a_bare_state_machine_gets_every_frame_but_timed_filters() {
     bare.on_timer(&mut ApplyCtx::for_sm::<Rec>(1).with_time(1), ev(1, 1));
     bare.on_timer(&mut ApplyCtx::for_sm::<Rec>(2).with_time(1), ev(1, 1));
     assert_eq!(bare.fired.len(), 2, "at-least-once without the wrapper");
+}
+
+#[test]
+fn table_ticks_deliver_strictly_increasing_deadlines_and_report_table_consumed() {
+    let mut t = Timed::new(Rec::default());
+    let mut c = ctx(64, 1_000);
+    t.on_timer(&mut c, tev(5, 1_000));
+    assert_eq!(t.inner().fired, vec![(64, 5, 1_000)]);
+    let recs = c.take_sched_records_for_test(); // see note
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        (recs[0].op, recs[0].timer_id, recs[0].deadline_ns),
+        (SchedOp::TableConsumed, 5, 1_000)
+    );
+    let mut c = ctx(128, 1_000);
+    t.on_timer(&mut c, tev(5, 1_000)); // duplicate (a re-fire): dropped, still reported
+    assert_eq!(t.inner().fired.len(), 1);
+    assert_eq!(
+        c.take_sched_records_for_test()[0].op,
+        SchedOp::TableConsumed
+    );
+    let mut c = ctx(192, 900);
+    t.on_timer(&mut c, tev(5, 900)); // an OLDER tick after a newer one: dropped
+    assert_eq!(t.inner().fired.len(), 1);
+    t.on_timer(&mut ctx(256, 2_000), tev(5, 2_000));
+    assert_eq!(t.inner().fired.len(), 2);
+    assert_eq!(t.table_delivered(), vec![(5, 2_000)]);
+    // programmatic and table ids do not interfere
+    t.apply(&mut ctx(300, 2_000), b"s5@3000", &mut Vec::new());
+    assert_eq!(t.pending(), vec![(5, 3_000)]);
+    assert_eq!(t.table_delivered(), vec![(5, 2_000)]);
 }
 
 // --- snapshot round trip ---
@@ -143,6 +182,9 @@ fn snapshot_round_trip_preserves_pending_and_delivery_decisions() {
     // deliver id 7, leave id 9 pending
     t.on_timer(&mut ctx(128, 500), ev(7, 500));
     assert_eq!(t.pending(), vec![(9, 700)]);
+    // a table tick too, so table_delivered() round-trips alongside pending
+    t.on_timer(&mut ctx(144, 1_200), tev(11, 1_200));
+    assert_eq!(t.table_delivered(), vec![(11, 1_200)]);
 
     let (handle, pos) = t.freeze().unwrap();
     let mut bytes = Vec::new();
@@ -153,6 +195,7 @@ fn snapshot_round_trip_preserves_pending_and_delivery_decisions() {
     assert_eq!(installed, pos);
     assert_eq!(t2.pending(), t.pending());
     assert_eq!(t2.last_applied(), Some(pos));
+    assert_eq!(t2.table_delivered(), t.table_delivered());
 
     // the still-pending instance (9, 700) is delivered
     t2.on_timer(&mut ctx(160, 700), ev(9, 700));

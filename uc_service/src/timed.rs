@@ -93,7 +93,11 @@ impl<S: RawStateMachine> RawStateMachine for Timed<S> {
             let reqs: Vec<TimerReq> = ctx.timers()[before..].to_vec();
             self.absorb(&reqs);
         }
-        ctx.consumed(ev.id, ev.deadline_ns);
+        if ev.table {
+            ctx.consumed_table(ev.id, ev.deadline_ns);
+        } else {
+            ctx.consumed(ev.id, ev.deadline_ns);
+        }
     }
 
     fn query(&self, q: &[u8], out: &mut Vec<u8>) {
@@ -106,6 +110,10 @@ impl<S: RawStateMachine> RawStateMachine for Timed<S> {
 
     fn pending_timers(&self) -> Vec<(u64, u64)> {
         self.pending()
+    }
+
+    fn table_delivered(&self) -> Vec<(u64, u64)> {
+        self.table_last.iter().map(|(&i, &d)| (i, d)).collect()
     }
 }
 

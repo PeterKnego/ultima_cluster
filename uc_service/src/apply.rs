@@ -215,10 +215,12 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// this process is the producer, the node's consensus agent the consumer.
     pub(crate) svc_sched: SpscProducer,
     /// Time-and-timers §4.8: re-announce this incarnation's pending timers
-    /// (`sm.pending_timers()`) to the node on the FIRST cycle after attach,
+    /// (`sm.pending_timers()`) and, plan 2, its delivered table ticks
+    /// (`sm.table_delivered()`) to the node on the FIRST cycle after attach,
     /// and again after every replay pass — a fresh incarnation's in-memory
-    /// wrapper state (e.g. `Timed`'s table) is otherwise invisible to the
-    /// node's scheduler until something re-declares it.
+    /// wrapper state (e.g. `Timed`'s pending set and `table_last`) is
+    /// otherwise invisible to the node's scheduler until something
+    /// re-declares it.
     pub(crate) announce_pending: bool,
     /// Observability: set while a batch has surfaced `Overrun` and the replay
     /// reconstruction is degrading the follower back onto the live buffer.
@@ -361,8 +363,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
     }
     if st.announce_pending {
         st.announce_pending = false;
-        let pending = st.sm.lock().unwrap().pending_timers();
-        let recs: Vec<SchedRecord> = pending
+        let (pending, table_delivered) = {
+            let sm = st.sm.lock().unwrap();
+            (sm.pending_timers(), sm.table_delivered())
+        };
+        let mut recs: Vec<SchedRecord> = pending
             .into_iter()
             .map(|(id, dl)| SchedRecord {
                 op: SchedOp::Schedule,
@@ -370,6 +375,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 deadline_ns: dl,
             })
             .collect();
+        recs.extend(table_delivered.into_iter().map(|(id, dl)| SchedRecord {
+            op: SchedOp::TableConsumed,
+            timer_id: id,
+            deadline_ns: dl,
+        }));
         write_sched(&mut st.svc_sched, &recs);
     }
     let commit = c.commit.load_acquire();

@@ -63,6 +63,7 @@ pub struct ApplyCtx {
     identity: FsmIdentity,
     timers: Vec<TimerReq>,
     consumed: Vec<(u64, u64)>,
+    consumed_table: Vec<(u64, u64)>,
 }
 
 impl ApplyCtx {
@@ -74,6 +75,7 @@ impl ApplyCtx {
             identity,
             timers: Vec::new(),
             consumed: Vec::new(),
+            consumed_table: Vec::new(),
         }
     }
     /// Convenience for a state machine's own unit tests: `ApplyCtx::for_sm::<MySm>(pos)`
@@ -114,14 +116,20 @@ impl ApplyCtx {
         &self.timers
     }
     /// `Timed` only: this instance was delivered or dropped; the node may clear it.
-    /// Not yet called (Task 6's `Timed` wrapper is the caller).
-    #[allow(dead_code)]
     pub(crate) fn consumed(&mut self, id: u64, deadline_ns: u64) {
         self.consumed.push((id, deadline_ns));
     }
+    /// `Timed` only: a **table** tick (plan 2's replicated schedule table)
+    /// was delivered or dropped; the node advances that entry's
+    /// `last_delivered` from this instead of `Consumed` (`RowTimers::
+    /// table_delivered`, Task 4), so a re-fired tick never re-advances it.
+    pub(crate) fn consumed_table(&mut self, id: u64, deadline_ns: u64) {
+        self.consumed_table.push((id, deadline_ns));
+    }
     /// Apply loop only: drain both lists as wire records, requests first.
     pub(crate) fn take_sched_records(&mut self) -> Vec<SchedRecord> {
-        let mut out = Vec::with_capacity(self.timers.len() + self.consumed.len());
+        let mut out =
+            Vec::with_capacity(self.timers.len() + self.consumed.len() + self.consumed_table.len());
         for r in self.timers.drain(..) {
             out.push(match r {
                 TimerReq::Schedule { id, at_ns } => SchedRecord {
@@ -143,7 +151,21 @@ impl ApplyCtx {
                 deadline_ns: dl,
             });
         }
+        for (id, dl) in self.consumed_table.drain(..) {
+            out.push(SchedRecord {
+                op: SchedOp::TableConsumed,
+                timer_id: id,
+                deadline_ns: dl,
+            });
+        }
         out
+    }
+    /// Test-only alias of [`Self::take_sched_records`] for the integration
+    /// test in `uc_service/tests/timed.rs`, which cannot see the `pub(crate)`
+    /// method.
+    #[doc(hidden)]
+    pub fn take_sched_records_for_test(&mut self) -> Vec<SchedRecord> {
+        self.take_sched_records()
     }
 }
 
@@ -228,6 +250,18 @@ pub trait RawStateMachine: Send + 'static {
     /// holds, re-announced to the node after attach and after replay. Only
     /// `Timed` overrides it; a bare state machine has none.
     fn pending_timers(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
+
+    /// Framework hook (time-and-timers plan 2): the table ticks this wrapper
+    /// has delivered (`id -> last delivered deadline`), re-announced to the
+    /// node after attach and after replay so a node rebuilds `last_delivered`
+    /// for every table entry from the service that actually delivered them —
+    /// the same purpose `pending_timers` serves for the programmatic set.
+    /// Only `Timed` overrides it; a bare state machine has none. NOT
+    /// forwarded by the blanket `StateMachine` impl (typed SMs never see the
+    /// table directly — only a `Timed` wrapper does).
+    fn table_delivered(&self) -> Vec<(u64, u64)> {
         Vec::new()
     }
 }
