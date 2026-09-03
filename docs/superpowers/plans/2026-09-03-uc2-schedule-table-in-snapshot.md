@@ -4,7 +4,7 @@
 
 **Goal:** A below-floor joiner (a fresh learner, a cold-started node, a crashed-and-restarted service host under `PurgePolicy::BelowSnapshot`) adopts the leader's current schedule table as part of the snapshot session it installs, so a node can never become a voter, or lead, without the table the cluster has — closing plan 2's ruling R13 and the "every scheduled recurrence stops if that node later leads" limitation.
 
-**Architecture:** The table cannot ride `SNAP_BEGIN`: that body is `SNAP_BEGIN_FIXED_LEN = 122` plus up to 1024 B of config against a 1392 B datagram body budget, and an encoded table is up to 1064 B. So the leader sends one new pairwise datagram, `SNAP_TABLE` (kind 18), immediately after every `SNAP_BEGIN` it sends or re-sends (same session id, same 20 ms cadence, same sealing). The receiver records it on the session's intake, refuses to complete the session until it has one, and on completion publishes `(position, time_ns, table bytes)` to a cell the consensus agent reads **before** the position signal — the exact discipline the carried config already uses (`incoming_snapshot_config`). The consensus agent installs it **by fiat** (a wholesale replace with `prev = None`, like `adopt_snapshot_config`), because below the floor a joiner's own record carries nothing genuine. The leader's side mirrors `config_bytes`: a cache the consensus agent refreshes on every adoption/revert and the sender's `SnapshotSource` closure reads at ship time.
+**Architecture:** The table cannot ride `SNAP_BEGIN`: that body is `SNAP_BEGIN_FIXED_LEN = 122` plus up to 1024 B of config against a 1392 B datagram body budget, and an encoded table is up to 1064 B. So the leader sends one new pairwise datagram, `SNAP_TABLE` (kind 21), immediately after every `SNAP_BEGIN` it sends or re-sends (same session id, same 20 ms cadence, same sealing). The receiver records it on the session's intake, refuses to complete the session until it has one, and on completion publishes `(position, time_ns, table bytes)` to a cell the consensus agent reads **before** the position signal — the exact discipline the carried config already uses (`incoming_snapshot_config`). The consensus agent installs it **by fiat** (a wholesale replace with `prev = None`, like `adopt_snapshot_config`), because below the floor a joiner's own record carries nothing genuine. The leader's side mirrors `config_bytes`: a cache the consensus agent refreshes on every adoption/revert and the sender's `SnapshotSource` closure reads at ship time.
 
 **Tech Stack:** Rust 1.96 workspace (MSRV 1.89); `uc_protocol` (core-only leaf), `uc_net` (sender/receiver agents), `uc_node`, `uc_node/tests/learner.rs` + `timers.rs`, `fuzz/` (nightly + cargo-fuzz), docs.
 
@@ -14,7 +14,7 @@
 
 - **Whole workspace green after every task**: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p uc_service --features apply-profile --all-targets -- -D warnings`, `cargo clippy -p uc_gateway --features test-util --all-targets -- -D warnings`, `cargo test --workspace --exclude uc_node`, `cargo test -p uc_node --lib --test smoke --test failover --test learner --test purge_safety --test query_barrier --test admin_auth --test daemon_refusals --test timers --test services`; after Task 1, `(cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check)`.
 - **Still the unreleased 2.11.0 flag day**: `uc_protocol::version::CURRENT` stays `0.7.0`, `CNC_V2_VERSION` stays 3.1. A new datagram kind is an addition to an unreleased wire; no shipped node speaks it, so there is no mixed-version case to design for — but the docs say so explicitly.
-- **Frozen after it ships**: `DGRAM_KIND_SNAP_TABLE = 18`; `SNAP_TABLE_FIXED_LEN = 22`; the body layout (`session u32 @0 ‖ position u64 @4 ‖ time_ns u64 @12 ‖ table_len u16 @20 ‖ table @22`); pinned by a test whose comment says so.
+- **Frozen after it ships**: `DGRAM_KIND_SNAP_TABLE = 21`; `SNAP_TABLE_FIXED_LEN = 22`; the body layout (`session u32 @0 ‖ position u64 @4 ‖ time_ns u64 @12 ‖ table_len u16 @20 ‖ table @22`); pinned by a test whose comment says so.
 - **Budget**: `SNAP_TABLE_FIXED_LEN + SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES × SCHEDULE_ENTRY_LEN = 22 + 1064 = 1086 ≤ MTU_DEFAULT − DATAGRAM_HEADER_LEN − CRYPTO_OVERHEAD = 1408 − 16 − 24 = 1368` (a `const` assert, like `SNAP_BEGIN`'s).
 - **Plan-2 surfaces this builds on (as built)**: `uc_protocol::v2::schedule::{decode_schedule_table, encode_schedule_table, ScheduleTable, MAX_SCHEDULE_ENTRIES, SCHEDULE_HEADER_LEN, SCHEDULE_ENTRY_LEN}`; `uc_node::schedule_state::{ScheduleRecord { position, time_ns, table, prev }, open, load, store, read_record}`; `Consensus::{adopt_table_frame(position, time_ns, payload), install_table(position, &ScheduleTable, log_time_ns) -> entries, revert_schedule_below(to), arm_schedule_at_boot}` in `uc_node/src/node.rs` (~4126–4300), `schedule_position`, the `schedule_pos_pub`/entries gauges, obs records `schedule_table_adopted`/`schedule_table_reverted`; the snapshot path: `SnapshotSource`/`SnapshotSet` (`uc_net/src/sender.rs:137–215`), `snapshot_set_for` (`uc_node/src/node.rs:7337`), `send_snap_begin` (`sender.rs:1424`), `assemble_snap` (`:1491`), the BEGIN resend at `SNAP_BEGIN_RESEND_NS` (`:76`, `:1273`, `:3877`); receiver: `SnapIntake` (`receiver.rs:705`), `snap_begin` (`:1910`), the intake creation (`:2079`), `snap_complete` (`:2279`) publishing `incoming_snapshot_config` then `incoming_snapshot_pos` (`:2324–2330`), `set_snapshot_intake` (`:1193`) with `IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>)` (`:668`); the consensus install handler that reads the config cell and calls `adopt_snapshot_config` (`node.rs:3555–3605`, emits `snapshot_installed`); the config cache `config_bytes: Arc<Mutex<Vec<u8>>>` (`node.rs:544`, `:829`, `:2280`) refreshed by `rebuild_net_for_config`.
 - **Determinism**: the table a joiner installs is byte-identical to the leader's record; `time_ns` is the leader's record's `time_ns` (the adopting frame's stamp), never a clock; arming uses the joiner's cnc log clock as `install_table` already does.
@@ -32,7 +32,7 @@
 | `uc_net/src/sender.rs`, `uc_net/src/receiver.rs` | `SnapshotSet.table`; `send_snap_table` after every `send_snap_begin`; `SnapIntake.table`; `SNAP_TABLE` arm; completion withheld until the table arrived; `incoming_snapshot_table` cell published before the position signal | 2 |
 | `uc_node/src/node.rs` | the `schedule_bytes` cache (refreshed by `install_table`/`revert_schedule_below`/boot), read by `snapshot_set_for`; the fiat install `install_snapshot_table(position, time_ns, bytes)` in the snapshot-install handler; `snapshot_installed` gains `table_position` | 3 |
 | `uc_node/tests/learner.rs`, `uc_node/tests/timers.rs` | the below-floor joiner adopts the table (record equality); the "no table" case; the capstone: a promoted below-floor joiner that becomes leader keeps the schedule ticking | 4 |
-| docs, `RELEASES.md`, `docs/releases.md`, alert annotation, `CLAUDE.md`, `docs/BACKLOG.md`, `docs/VERIFICATION.md` | the limitation becomes a closed item; kind 18 in the wire reference; runbook/explainer/limits/attack-surface updates | 5 |
+| docs, `RELEASES.md`, `docs/releases.md`, alert annotation, `CLAUDE.md`, `docs/BACKLOG.md`, `docs/VERIFICATION.md` | the limitation becomes a closed item; kind 21 in the wire reference; runbook/explainer/limits/attack-surface updates | 5 |
 
 ---
 
@@ -45,7 +45,7 @@
 
 ```markdown
 - **Errata (plan 3, snapshot carry).** The table IS carried by the snapshot
-  session: the leader sends a `SNAP_TABLE` datagram (kind 18, body `session ‖
+  session: the leader sends a `SNAP_TABLE` datagram (kind 21, body `session ‖
   position ‖ time_ns ‖ table_len ‖ table`, ≤ 1086 B) after every `SNAP_BEGIN`
   of a session; the receiver withholds `SNAP_DONE` until it has one and
   publishes it to the consensus agent before the floor signal, which installs
@@ -69,7 +69,7 @@
 
 **Interfaces:**
 - Produces:
-  - `pub const DGRAM_KIND_SNAP_TABLE: u8 = 18;` (pairwise scope — add it to whatever `Transport::scope_of` table in `uc_crypto` maps kinds 12/13 to `Scope::Pairwise`; grep `DGRAM_KIND_SNAP_BEGIN` in `uc_crypto/src`).
+  - `pub const DGRAM_KIND_SNAP_TABLE: u8 = 21;` (pairwise scope — add it to whatever `Transport::scope_of` table in `uc_crypto` maps kinds 12/13 to `Scope::Pairwise`; grep `DGRAM_KIND_SNAP_BEGIN` in `uc_crypto/src`).
   - `pub const SNAP_TABLE_FIXED_LEN: usize = 22;`
   - `#[derive(Debug, Clone, PartialEq, Eq)] pub struct SnapTableBody { pub session: u32, pub position: u64, pub time_ns: u64, pub table: Vec<u8> }`
   - `pub fn write_snap_table_body(buf: &mut [u8], b: &SnapTableBody)` (caller sizes `buf` to `SNAP_TABLE_FIXED_LEN + b.table.len()`).
@@ -79,13 +79,13 @@
 - [ ] **Step 1: Write the failing test** in `datagram.rs`'s `mod tests`:
 
 ```rust
-    /// FROZEN: kind 18 and the SNAP_TABLE body layout. Never change these bytes.
+    /// FROZEN: kind 21 and the SNAP_TABLE body layout. Never change these bytes.
     #[test]
     fn snap_table_body_pins_bytes_and_is_total() {
         use crate::v2::schedule::{
             MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN,
         };
-        assert_eq!(DGRAM_KIND_SNAP_TABLE, 18);
+        assert_eq!(DGRAM_KIND_SNAP_TABLE, 21);
         assert_eq!(SNAP_TABLE_FIXED_LEN, 22);
         let b = SnapTableBody { session: 7, position: 4096, time_ns: 99, table: vec![1, 2, 3] };
         let mut buf = vec![0u8; SNAP_TABLE_FIXED_LEN + 3];
@@ -125,7 +125,7 @@
 /// Time-and-timers plan 3: the leader's current schedule table, sent once
 /// after every `SNAP_BEGIN` of a session so a below-floor joiner installs
 /// the table it could not read from the purged log. Pairwise scope.
-pub const DGRAM_KIND_SNAP_TABLE: u8 = 18;
+pub const DGRAM_KIND_SNAP_TABLE: u8 = 21;
 /// `session u32 ‖ position u64 ‖ time_ns u64 ‖ table_len u16`, then the
 /// encoded table (`v2::schedule::encode_schedule_table` bytes).
 pub const SNAP_TABLE_FIXED_LEN: usize = 22;
@@ -179,11 +179,11 @@ const _: () = assert!(
 );
 ```
 
-(`24` is `CRYPTO_OVERHEAD`; import it from `v2::crypto` if that module is reachable from `datagram.rs` without a cycle — it is a sibling in `v2`, so `use crate::v2::crypto::CRYPTO_OVERHEAD` should work; if it does not, keep the literal with a comment naming the constant.) Add kind 18 to `uc_crypto`'s pairwise-scope table beside 12/13 and to its scope test. Add two seeds to `fuzz/src/seeds.rs::uc_protocol_datagram`: `"11-snap-table"` (kind 18, a three-entry table encoded with `encode_schedule_table`) and `"12-snap-table-bad-len"` (table_len one over the ceiling). Regenerate the corpus (`cd fuzz && cargo +nightly run --bin seed-corpus`, per `fuzz/README.md`).
+(`24` is `CRYPTO_OVERHEAD`; import it from `v2::crypto` if that module is reachable from `datagram.rs` without a cycle — it is a sibling in `v2`, so `use crate::v2::crypto::CRYPTO_OVERHEAD` should work; if it does not, keep the literal with a comment naming the constant.) Add kind 21 to `uc_crypto`'s pairwise-scope table beside 12/13 and to its scope test. Add two seeds to `fuzz/src/seeds.rs::uc_protocol_datagram`: `"11-snap-table"` (kind 21, a three-entry table encoded with `encode_schedule_table`) and `"12-snap-table-bad-len"` (table_len one over the ceiling). Regenerate the corpus (`cd fuzz && cargo +nightly run --bin seed-corpus`, per `fuzz/README.md`).
 
 - [ ] **Step 4: Run** `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test -p uc_protocol && cargo test -p uc_crypto && (cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check)` → PASS.
 
-- [ ] **Step 5: Commit** `feat(uc_protocol): SNAP_TABLE datagram (kind 18) — the leader's schedule table on the snapshot session (test: snap_table_body_pins_bytes_and_is_total)`.
+- [ ] **Step 5: Commit** `feat(uc_protocol): SNAP_TABLE datagram (kind 21) — the leader's schedule table on the snapshot session (test: snap_table_body_pins_bytes_and_is_total)`.
 
 ---
 
@@ -207,7 +207,7 @@ Sender (`sender.rs` `mod tests`, using the existing harness that captures what `
         // setup: a sender whose SnapshotSource yields one artifact and
         // table = (4096, 99, b"tbl".to_vec()); drive one snapshot cycle
         // and capture the datagrams sent to the peer, in order.
-        // assert: [0] kind 12 (SNAP_BEGIN) with session S; [1] kind 18 whose
+        // assert: [0] kind 12 (SNAP_BEGIN) with session S; [1] kind 21 whose
         // read_snap_table_body == Some(SnapTableBody { session: S, position: 4096, time_ns: 99, table: b"tbl" });
         // advance the clock past SNAP_BEGIN_RESEND_NS with no SNAP_DONE and
         // assert the resend is again BEGIN then TABLE, same session.
@@ -303,7 +303,7 @@ Fill both in against the real harness (the plan gives the assertions; the harnes
 ### Task 5: Docs, release, alert, backlog
 
 **Files:**
-- Modify: `docs/reference/wire-protocol.md` (kind 18 in the snapshot-session table + a `SNAP_TABLE` body subsection beside `SNAP_BEGIN`'s), `docs/reference/limits.md` (the "not in the snapshot stream" row → removed, replaced by a one-line "carried on the snapshot session since plan 3" note in the table's rationale column), `docs/ops/uc2-runbook.md` (the below-floor-joiner paragraph: what a joiner now installs; the `snapshot_installed` record's `table_position` field), `docs/notes/uc2-log-time-and-timers-explained.md` (the known-limits section: the limitation becomes "closed — how"; the "Every replica gets the wake-up by playing the tape" section gains one sentence on the snapshot carry), `docs/security/attack-surface.md` (a `SNAP_TABLE` row: pairwise-sealed under crypto, total decoder, node-side decode is fail-stop like CONFIG, ≤ 1086 B), `packaging/prometheus/uc2-alerts.yml` (`Uc2ScheduleTableDiverged`'s comment/annotation: a below-floor join is no longer a cause; the remaining causes are the record-vs-persist crash window and a wipe), `RELEASES.md` + `docs/releases.md` (fold into the schedule-table bullet: "carried on the snapshot session"), `CLAUDE.md` (the standing-facts sub-bullet: one sentence), `docs/BACKLOG.md` (2a's R13 line → closed, pointer to this plan), `docs/VERIFICATION.md` (the datagram fuzz row mentions kind 18's seeds; the learner/timers rows name the three new tests), `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (row e's rationale unaffected — check and say so)
+- Modify: `docs/reference/wire-protocol.md` (kind 21 in the snapshot-session table + a `SNAP_TABLE` body subsection beside `SNAP_BEGIN`'s), `docs/reference/limits.md` (the "not in the snapshot stream" row → removed, replaced by a one-line "carried on the snapshot session since plan 3" note in the table's rationale column), `docs/ops/uc2-runbook.md` (the below-floor-joiner paragraph: what a joiner now installs; the `snapshot_installed` record's `table_position` field), `docs/notes/uc2-log-time-and-timers-explained.md` (the known-limits section: the limitation becomes "closed — how"; the "Every replica gets the wake-up by playing the tape" section gains one sentence on the snapshot carry), `docs/security/attack-surface.md` (a `SNAP_TABLE` row: pairwise-sealed under crypto, total decoder, node-side decode is fail-stop like CONFIG, ≤ 1086 B), `packaging/prometheus/uc2-alerts.yml` (`Uc2ScheduleTableDiverged`'s comment/annotation: a below-floor join is no longer a cause; the remaining causes are the record-vs-persist crash window and a wipe), `RELEASES.md` + `docs/releases.md` (fold into the schedule-table bullet: "carried on the snapshot session"), `CLAUDE.md` (the standing-facts sub-bullet: one sentence), `docs/BACKLOG.md` (2a's R13 line → closed, pointer to this plan), `docs/VERIFICATION.md` (the datagram fuzz row mentions kind 21's seeds; the learner/timers rows name the three new tests), `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (row e's rationale unaffected — check and say so)
 - The sweep check: every constant/name in the docs exists in the tree; every link resolves; `promtool check rules` green.
 
 - [ ] **Step 1–3**: write; `ls` every linked path; grep every named constant.
