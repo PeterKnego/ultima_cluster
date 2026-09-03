@@ -1251,6 +1251,166 @@ fn counterfactual_no_revert_breaks_inv8() {
     );
 }
 
+/// Stage the interleaving of nightly 33605909828 (`sigkill_mid_config_window`,
+/// 2026-09-02): a follower holds a COMMITTED config frame P it has not yet
+/// observed, plus a divergent tail above it; its archive crosses P and the
+/// consensus agent absorbs the counter while the observation is still in the
+/// archive thread's outbox; the new leader's term map reconciles against that
+/// counter and cuts the tail at exactly P's end — latch up — and only then does
+/// the observation arrive. The archive never re-emits (P survives the cut, so
+/// no refill re-scans it). The shipped node (`cc4e321`) holds the observation
+/// across the latch and replays it at the ack; the pre-fix node fed it under
+/// the latch and lost it, running one config version behind, replicating
+/// normally, until its next restart.
+///
+/// Returns the world with L2's map just delivered to F (green so far in both
+/// arms), F's index, and P's end.
+fn stage_config_observation_under_the_latch(hold: bool) -> (World, usize, u64) {
+    const N: usize = 5;
+    let mut w = World::new(SimConfig {
+        n_nodes: N,
+        seed: 1,
+        max_steps: 400_000,
+        drop_per_million: 0,
+        // The archive thread is preempted between its durable store and its
+        // observation send: the consensus agent sees the counter first.
+        archive_obs_latency_ns: 50_000_000,
+        // The cut takes an archive duty cycle; the consensus agent keeps
+        // cycling meanwhile (1 ms cadence), so it drains under the latch.
+        truncate_latency_ns: 250_000_000,
+        config_obs_latch_buffer: hold,
+        ..SimConfig::default()
+    });
+    w.run_until_leader().expect("elect L1");
+    let l1 = w.current_leader().unwrap();
+    w.run_steps(300).expect("a committed prefix");
+    let f = (0..N).find(|&i| i != l1).unwrap();
+    let others: Vec<usize> = (0..N).filter(|&i| i != l1 && i != f).collect();
+    // No data frames from here on: the only bytes past the prefix are P and,
+    // later, L1's divergent tail.
+    w.set_quiet(true);
+    // F appends what L1 ships but makes nothing durable — P stays unobserved.
+    w.set_archive_frozen(f, true);
+    assert_eq!(
+        w.propose_config(
+            l1,
+            ConfigOp::AddLearner {
+                id: 9,
+                addr: (9, 1)
+            }
+        ),
+        Ok(1)
+    );
+    let p_end = w.node_append(l1);
+    {
+        let o = others.clone();
+        assert!(
+            w.run_until(|w| {
+                o.iter().all(|&i| w.node_durable(i) >= p_end) && w.node_append(f) >= p_end
+            })
+            .unwrap(),
+            "P replicated everywhere, durable on the majority (timed out)"
+        );
+    }
+    // L1 + F on one side: L1 keeps leading F and ships it a tail the majority
+    // never sees.
+    for &o in &others {
+        w.partition(l1, o);
+        w.partition(f, o);
+    }
+    w.set_quiet(false);
+    {
+        let want = p_end + 3 * 96;
+        assert!(
+            w.run_until(|w| w.node_append(f) >= want).unwrap(),
+            "divergent tail appended on F (timed out)"
+        );
+    }
+    w.set_quiet(true);
+    let q_end = w.node_append(f);
+    // The majority elects L2, which holds P (v1) and none of the tail.
+    {
+        let o = others.clone();
+        assert!(
+            w.run_until(|w| o.iter().any(|&i| w.node_is_serving_leader(i)))
+                .unwrap(),
+            "L2 elected on the majority (timed out)"
+        );
+    }
+    let l2 = others
+        .iter()
+        .copied()
+        .find(|&i| w.node_is_serving_leader(i))
+        .unwrap();
+    assert_eq!(w.node_config_version(l2), 1, "L2 adopted P");
+    assert_eq!(
+        w.node_config_version(f),
+        0,
+        "frozen archive: F never crossed P"
+    );
+    // Thaw: F's archive crosses P and the tail. The counter is visible at
+    // once; the observation is still in the archive thread's outbox.
+    w.set_archive_frozen(f, false);
+    assert!(
+        w.run_until(|w| w.node_durable(f) >= q_end).unwrap(),
+        "F's archive caught up (timed out)"
+    );
+    w.run_for(2_000_000)
+        .expect("the consensus agent absorbs the counter");
+    assert_eq!(
+        w.node_config_version(f),
+        0,
+        "the observation has not been delivered yet"
+    );
+    // L2's map reaches F: the reconcile cuts the tail at P's end — latch up.
+    w.partition_node(l1);
+    for &o in &others {
+        w.unpartition(f, o);
+    }
+    let (t, m) = (w.node_term(l2), w.node_map(l2));
+    w.inject_term_map(l2, f, t, m)
+        .expect("the map lands; the cut is in flight");
+    (w, f, p_end)
+}
+
+/// GREEN PIN (the shipped node, main `cc4e321`): the observation delivered
+/// under the latch is held and replayed at the ack; F adopts v1 and the
+/// cluster runs on green.
+#[test]
+fn config_observation_under_the_latch_is_adopted_at_the_ack() {
+    let (mut w, f, p_end) = stage_config_observation_under_the_latch(true);
+    w.run_for(400_000_000)
+        .expect("delivery under the latch, then the ack: held, then replayed");
+    assert_eq!(w.truncations(), 1, "exactly the staged cut");
+    assert!(w.node_durable(f) >= p_end, "P survived the cut");
+    assert_eq!(
+        w.node_config_version(f),
+        1,
+        "the held observation is adopted once the latch drops"
+    );
+    w.set_quiet(false);
+    w.run_steps(2_000).expect("green steady state");
+}
+
+/// COUNTERFACTUAL-RED (`config_obs_latch_buffer` deleted — the node before
+/// `cc4e321`): the observation is fed under the latch, the SM drops it, the
+/// archive never re-emits, and at the ack F settles at v0 over a log whose
+/// frontier implies v1 — inv8 catches it at the ack (measured: "node 0
+/// finished a truncation still adopting config v0 while its durable frontier
+/// implies v1", step 5227, seed 1).
+#[test]
+fn counterfactual_unheld_config_observation_breaks_inv8() {
+    let (mut w, f, _) = stage_config_observation_under_the_latch(false);
+    let v = w
+        .run_for(400_000_000)
+        .expect_err("hold deleted: the truncation must strand the stale config");
+    assert!(
+        v.invariant.contains("inv8"),
+        "expected an inv8 violation at the ack, got: {v}"
+    );
+    assert_eq!(w.node_config_version(f), 0, "F never adopted P");
+}
+
 /// COUNTERFACTUAL-RED (serving gate): Ongaro's 2015 single-server-change bug,
 /// staged mechanically with the gate deleted (`serving_gate_disabled`).
 ///
