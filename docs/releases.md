@@ -7,9 +7,9 @@ more changes are planned on this branch first. This entry is a draft written
 ahead of the tag, per the standing writeup rule (CLAUDE.md), so the record
 is ready when the maintainer green-lights it.
 
-**Two features, one flag day.** Both were implemented before the release was
-cut, and both move the wire to `0.7.0` and the cnc page to `3.1`, so they
-ship together:
+**Three features, one flag day.** All three were implemented before the
+release was cut, and all three move the wire to `0.7.0` and the cnc page to
+`3.1`, so they ship together:
 
 | feature | spec | plan |
 |---|---|---|

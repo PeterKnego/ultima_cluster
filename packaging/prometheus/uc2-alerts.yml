@@ -190,18 +190,25 @@ groups:
     # own value into a label (one output series per distinct position), then
     # count how many distinct ones exist. More than one is divergence.
     #
-    # A node reading 0 while its peers read a nonzero position has not
-    # adopted the table at all. Two causes, one remedy:
+    # A node reading 0 while its peers read a nonzero position is not
+    # holding their table's position. Three causes, one remedy:
     #   * it joined BELOW THE PURGE FLOOR — the table is not carried in the
-    #     snapshot stream, so a joiner whose table frame was purged keeps
-    #     position 0, the same rule ConfigRecord uses for a wiped node;
+    #     snapshot stream, so a joiner whose table frame was purged has
+    #     adopted nothing and holds position 0 with NO entries armed;
     #   * it crashed in the sub-millisecond window between the archive
     #     recording the frame and the consensus agent persisting
     #     state/schedules.state (there is no journal re-scan for type-6
-    #     frames).
+    #     frames);
+    #   * it was WIPED (truncated to 0, no common prefix). A wipe
+    #     deliberately KEEPS the table armed and zeroes only the position —
+    #     the same rule ConfigRecord uses — because the table is not in the
+    #     snapshot stream and dropping it would leave this node ticking
+    #     nothing while its peers tick on. So position 0 WITH
+    #     uc2_schedule_entries > 0 on the same node is the wipe signature,
+    #     and the `schedule_table_reverted` record with position=0 names it.
     # Re-run `uc2ctl schedule apply` against the leader: it appends a fresh
     # frame that every node adopts.
     expr: count(count_values("p", uc2_schedule_table_position)) > 1
     for: 60s
     labels: { severity: warning }
-    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 with uc2_schedule_entries > 0 elsewhere never adopted the table (purged frame, or a crash before it was persisted); re-run `uc2ctl schedule apply`" }
+    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 has not adopted this table: with uc2_schedule_entries > 0 on that same node it was wiped (table kept, position zeroed), with 0 entries it joined below the purge floor or crashed before persisting; re-run `uc2ctl schedule apply` either way" }

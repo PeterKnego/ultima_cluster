@@ -16,8 +16,9 @@ is ready when the maintainer green-lights it — see
 verified so far and what still says "pending". **No version has been
 bumped, nothing has been tagged, and no fleet gate has run.**
 
-Two features share this release, because both landed before it was cut, and
-both are on the same wire `0.7.0` / cnc `3.1` flag day.
+Three features share this release, because all three landed before it was
+cut, and all three are on the same wire `0.7.0` / cnc `3.1` flag day: FSM
+identity, log time and timers, and the replicated schedule table built on it.
 
 An FSM's identity — the name a state machine declares in its own code — now
 travels everywhere the cluster used to check only a bare row number, closing
@@ -139,7 +140,7 @@ schedule table an operator applies with one command.
   [the semver policy § FSM identity carve-out](docs/reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor)
   for the reasoning, which is not a standing exception.
 - **Wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`, one combined flag day
-  carrying both features.** `SNAP_BEGIN`'s `services_declared` bitmask becomes
+  carrying all three features.** `SNAP_BEGIN`'s `services_declared` bitmask becomes
   a per-row identity-hash array plus a per-row version array; the cnc page's
   once-reserved slot line 7 becomes node-written at boot (name + hash); the
   log frame header is relaid for `time_ns` and two frame types are added

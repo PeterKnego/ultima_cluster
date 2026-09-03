@@ -337,8 +337,8 @@ you the same measured downtime number.
 
 ## Wire + cnc change in 2.11 (pending): FSM identity **and** log time (`0.7.0`, cnc `3.1`)
 
-Two features share this flag day, because both were implemented before the
-release was cut:
+Three features share this flag day, because all three were implemented before
+the release was cut:
 
 - **FSM identity** gives each state machine a name declared in code and binds
   it to the row (spec
@@ -350,10 +350,17 @@ release was cut:
   `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`;
   explainer:
   [`docs/notes/uc2-log-time-and-timers-explained.md`](../notes/uc2-log-time-and-timers-explained.md)).
+- **The replicated schedule table**, built on that, adds a second frame type,
+  `SCHEDULE_TABLE` (same spec, §5; explainer section:
+  [The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table)).
+  It needs **no per-host edit**: the table lives on the log, and a fresh
+  cluster simply has none until an operator applies one. Two new
+  instance-directory paths appear on their own —
+  `state/schedules.state` and, transiently, `schedules.pending`.
 
 It is **one combined flag day**, on both lines at once — the same-host cnc
 page (`3.0` → `3.1`) and the node-to-node wire (`0.6.0` → `0.7.0`) — because
-both changes ship in the same release.
+all three changes ship in the same release.
 
 **The `[services] ids` → `names` edit, required on every host.** `[services]`
 is no longer optional (absent used to mean `ids = [0]`; it now refuses to

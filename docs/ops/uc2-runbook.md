@@ -80,13 +80,24 @@ verify rather than a build:
   must be identical everywhere; `Uc2ScheduleTableDiverged` fires when it is
   not. `uc2_schedule_entries` counts the adopted entries (a parked `once`
   included, unlike `uc2_timers_pending`), and
-  `uc2_schedule_apply_refused_total` counts refused applies. The records are
-  `schedule_table_adopted` (info, on every adoption) and
-  `schedule_apply_refused` (warn, with the reason code). **A node reading
-  position `0` while its peers read a nonzero one has not adopted the table** —
-  it joined below the purge floor (the table is not in the snapshot stream), or
-  it crashed in the narrow window between recording the frame and persisting
-  it. The remedy for both is the same: re-run `uc2ctl schedule apply`.
+  `uc2_schedule_apply_refused_total` counts refused applies. Five records:
+  `schedule_table_adopted` (info, on every adoption — leader at append,
+  follower off the archive walk, and each node's own boot load) plus four at
+  warn — `schedule_apply_refused` (with the 40–43 reason code),
+  `schedule_table_reverted` (a truncation or the leader-open collapse cut the
+  adopted frame and the record fell back to `position`; expected after a leader
+  change, worth acting on when `position=0`), `schedule_record_unreadable` (the
+  boot-time `state/schedules.state` load failed — the node boots with nothing
+  armed rather than refusing to start, and picks the table up from the next
+  table frame) and `schedule_staged_file_kept` (the append succeeded but
+  `schedules.pending` could not be deleted; remove it by hand). **A node
+  reading position `0` while its peers read a nonzero one is not running their
+  table's position** — it joined below the purge floor (the table is not in the
+  snapshot stream), it crashed in the narrow window between recording the frame
+  and persisting it, or it was wiped (a wipe deliberately **keeps** the table
+  armed and zeroes only the position, so `uc2_schedule_entries > 0` alongside
+  it is the wipe signature). The remedy for all three is the same: re-run
+  `uc2ctl schedule apply`.
 
 ## Changing a running cluster
 

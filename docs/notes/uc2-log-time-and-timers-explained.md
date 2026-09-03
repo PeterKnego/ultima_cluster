@@ -400,7 +400,13 @@ about to be fixed.
   joins below the floor and whose table frame was purged runs with no table
   until the next apply. Its `uc2_schedule_table_position` sits at `0` while
   everyone else's holds the adopted position — which is exactly what
-  `Uc2ScheduleTableDiverged` is for. The remedy is to re-apply.
+  `Uc2ScheduleTableDiverged` is for. The remedy is to re-apply. The same
+  absence shapes what a **wipe** does: a node truncated to 0 with no common
+  prefix **keeps** its table armed and zeroes only the position, by the rule
+  `ConfigRecord` already uses, because dropping it would leave that node
+  ticking nothing while its peers tick on. So `uc2_schedule_entries > 0` with
+  `uc2_schedule_table_position == 0` is the wipe signature, and a
+  `schedule_table_reverted` record with `position=0` names it.
 - **A crash in one narrow window loses one adoption.** There is no journal
   re-scan for type-6 frames on the recovery path, so a node that dies between
   the archive recording a table frame and the consensus agent persisting
@@ -503,9 +509,23 @@ Every one of these is a designed-for case, not a bug report.
   retries are not refusals and are not counted.
 - `uc2ctl status` prints `schedule_position=` on the `config:` line;
   `uc2ctl schedule show` prints the adopted table itself.
-- Two more structured records: `schedule_table_adopted` on every adoption
-  (including the one a node makes at boot from its own durable record) and
-  `schedule_apply_refused` with the 40–43 reason code.
+- Five more structured records. `schedule_table_adopted` (info) on every
+  adoption, including the one a node makes at boot from its own durable
+  record — the healthy signal. Four at warn:
+  `schedule_apply_refused` {`node`, `reason`}, carrying the 40–43 code, so
+  read the code and fix the file or re-run against the leader;
+  `schedule_table_reverted` {`node`, `position`, `entries`, `to`}, when a
+  truncation or the leader-open collapse cut the adopted frame and the record
+  fell back — expected right after a leader change, but a `position=0` means
+  this node holds no adopted position and will light
+  `Uc2ScheduleTableDiverged`, so re-apply if it does not clear;
+  `schedule_record_unreadable` {`node`, `err`, and `position` when there is
+  one}, when the boot-time load of `state/schedules.state` failed — the node
+  boots with nothing armed rather than refusing to start, and picks the table
+  up from the next table frame it sees, so re-apply on a quiet cluster; and
+  `schedule_staged_file_kept` {`node`, `position`, `err`}, when the append
+  succeeded but `schedules.pending` could not be deleted — remove it by hand,
+  or a re-presented request appends the same table twice.
 
 See [Monitor a cluster](../how-to/monitor-a-cluster.md#the-per-fsm-families-m14)
 for the queries and

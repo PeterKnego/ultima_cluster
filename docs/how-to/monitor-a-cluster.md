@@ -215,21 +215,27 @@ value across the fleet means one node is not running the schedule the others
 are. The common cause is a node that joined **below the purge floor**: the
 table is not carried in the snapshot stream, so a joiner whose table frame was
 purged holds position `0` while everyone else holds the adopted position. The
-rarer one is a node that crashed in the sub-millisecond window between the
+rarer ones are a node that crashed in the sub-millisecond window between the
 archive recording the frame and the consensus agent persisting
-`state/schedules.state`. Both have the same remedy — re-run `uc2ctl schedule
-apply`, which appends a fresh frame every node adopts.
+`state/schedules.state`, and a node that was **wiped** (truncated to 0 with no
+common prefix): a wipe deliberately **keeps** the table armed but zeroes its
+position, by the same rule `ConfigRecord` uses, because the table is not in the
+snapshot stream and dropping it would leave the node ticking nothing while its
+peers tick on. So `uc2_schedule_entries > 0` with
+`uc2_schedule_table_position == 0` is the wipe signature, and
+`schedule_table_reverted` with `position=0` is the record that names it. All
+three have the same remedy — re-run `uc2ctl schedule apply`, which appends a
+fresh frame every node adopts.
 
-Two records go with them: `schedule_table_adopted` {`node`, `position`,
-`entries`} at info on every adoption (including the one a node makes at boot
-from its own durable record), and `schedule_apply_refused` {`node`, `reason`}
-at warn, whose `reason` is the same 40–43 code
-[`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). A third,
-`schedule_staged_file_kept`, is emitted at warn in the one case where the table
-*was* appended but the staged file could not be deleted afterwards. Deleting it
-is what normally makes a re-presented request refuse `schedule_missing` instead
-of appending the same table a second time, so remove
-`<instance_dir>/schedules.pending` by hand if you see this.
+**Five records** go with them — one at info, four at warn:
+
+| Event | Level | Fields | Means, and what to do |
+|---|---|---|---|
+| `schedule_table_adopted` | info | `node`, `position`, `entries` | this node adopted a table at `position` and armed `entries` of it. Emitted on **every** adoption: the leader's at append, a follower's off the archive walk, and the one a node makes at boot from its own `state/schedules.state`. Nothing to do — this is the healthy signal |
+| `schedule_apply_refused` | warn | `node`, `reason` | an `uc2ctl schedule apply` was refused; `reason` is the same 40–43 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). Read the code, fix the file or re-run against the leader. Retries (a follower's, or the leader's single-in-flight one) are **not** refusals and do not appear here |
+| `schedule_table_reverted` | warn | `node`, `position`, `entries`, `to` | this node's log was truncated to `to` (a reconciliation cut, or the leader-open collapse) and its schedule record was reverted below it: `position` is what is in effect now, `entries` what is armed. Expected right after a leader change that cut uncommitted bytes. **`position=0` is the one to look at**: this node now has no adopted position, so `Uc2ScheduleTableDiverged` will light. Re-apply the table if it does not clear |
+| `schedule_record_unreadable` | warn | `node`, `err`, and `position` when the bytes decoded far enough to have one | the boot-time load of `state/schedules.state` failed — the file could not be read, or its bytes will not decode. The node boots **without a table rather than refusing to start**: the record is a node-local cache, and stranding the node would be worse. It arms nothing until it observes the next table frame, so re-apply if the cluster is quiet |
+| `schedule_staged_file_kept` | warn | `node`, `position`, `err` | the table *was* appended, but `<instance_dir>/schedules.pending` could not be deleted afterwards. Deleting it is what normally makes a re-presented request refuse `schedule_missing` instead of appending the same table a second time — remove the file by hand |
 
 ## Install the alert rules
 

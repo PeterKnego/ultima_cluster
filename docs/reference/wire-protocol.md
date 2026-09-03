@@ -17,12 +17,12 @@ The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
 (the once-reserved slot line 7, plus two previously-unused words —
 `log_time_ns` and the per-row `timers_pending`). The UDP datagram format
-moved to 0.7.0 for **two features** shipping on the same unreleased `2.11.0`
+moved to 0.7.0 for **three features** shipping on the same unreleased `2.11.0`
 flag day. FSM identity: `SNAP_BEGIN` swapped its `services_declared` bitmask
 for a per-row identity-hash array plus a per-row version array. Log time and
 timers: the log frame header was **relaid** to carry a leader-written
-`time_ns` stamp, and two frame types were added beside it — `TIMER` (5) and,
-for the replicated schedule table, `SCHEDULE_TABLE` (6). Every other datagram
+`time_ns` stamp, with a `TIMER` (5) frame type beside it. The replicated
+schedule table, built on that: a second new frame type, `SCHEDULE_TABLE` (6). Every other datagram
 is byte-identical to 0.6.0. `CURRENT` is documentary and is not itself checked
 on any receive path (see `version.rs`); the two version lines remain
 independent of each other.
