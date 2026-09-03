@@ -1427,6 +1427,7 @@ impl Node {
             obs_frontier: cons_obs_frontier,
             pending_obs: Vec::new(),
             pending_cfg_obs: Vec::new(),
+            pending_tbl_obs: Vec::new(),
             trace_prov: cons_trace_prov,
             trunc_trace,
             id: cfg.id,
@@ -2063,6 +2064,19 @@ struct Consensus {
     /// position order once the ack lands; entries above the cut are dropped
     /// there, since the bytes they describe are gone.
     pending_cfg_obs: Vec<(u64, Vec<u8>)>,
+    /// Durably-recorded SCHEDULE_TABLE-frame observations held across the
+    /// SM's truncating latch (do_work step 1c'), the exact twin of
+    /// `pending_cfg_obs`. `adopt_table_frame` does not run through the SM, so
+    /// the "lost under the latch" half of nightly 33605909828 does not apply
+    /// here — the STALE half does: an observation for a frame ABOVE an
+    /// in-flight cut can sit in the channel while `Action::Truncate`'s
+    /// `revert_schedule_below` already ran, and adopting it afterwards would
+    /// park `schedule_position` at a position no surviving byte backs (the
+    /// durable-plausibility skip does not catch it once durable has climbed
+    /// past that position again over DIFFERENT bytes). Held until the ack,
+    /// then replayed in position order; `on_truncated` prunes the ones above
+    /// the cut.
+    pending_tbl_obs: Vec<(u64, u64, Vec<u8>)>,
     /// Diagnostic (UC2_TRUNC_TRACE): last commit provenance, published for
     /// the archive thread's cut trace. Both fields are inert unless the env
     /// var is set.
@@ -2642,18 +2656,26 @@ impl Consensus {
         // implausibility skip as above: a durably-recorded frame's END can
         // never exceed the durable counter, so a violation is a recorder bug
         // and adopting it would park `schedule_position` above durable.
-        while let Ok((position, time_ns, payload)) = self.tbl_obs_rx.try_recv() {
-            let durable = self.cnc.counters().durable.load_acquire();
-            if position > durable {
-                eprintln!(
-                    "node {}: ignoring implausible ScheduleTableObserved at {position} (durable {durable})",
-                    self.id
-                );
+        //
+        // Held across the SM's truncating latch exactly like step 1c's config
+        // observations, and pruned above the cut by the same `on_truncated`
+        // step. Adoption does not go THROUGH the latch here (there is no
+        // `Event` for it), so nothing is lost by feeding under it — what is
+        // wrong is adopting a frame an in-flight truncation is about to
+        // remove: `Action::Truncate`'s `revert_schedule_below` has already
+        // run by then, so the stale position would survive the cut.
+        while let Ok(obs) = self.tbl_obs_rx.try_recv() {
+            self.pending_tbl_obs.push(obs);
+        }
+        if self.sm.is_truncating() {
+            if !self.pending_tbl_obs.is_empty() {
                 did = true;
-                continue;
             }
-            self.adopt_table_frame(position, time_ns, &payload);
-            did = true;
+        } else {
+            for (position, time_ns, payload) in std::mem::take(&mut self.pending_tbl_obs) {
+                self.observe_table(position, time_ns, &payload);
+                did = true;
+            }
         }
 
         // 1d. Drain the truncation ack slot (a later cycle after emitting
@@ -6697,6 +6719,25 @@ impl Consensus {
         self.feed(Event::ConfigObserved { position, config });
     }
 
+    /// do_work step 1c', one observation: the durable-plausibility belt, then
+    /// `adopt_table_frame`. A durably-recorded frame's END can never exceed
+    /// the durable counter (observations are drained after the archive
+    /// agent's `do_work` returned, and that stores durable last), so a
+    /// violation is a recorder bug: adopting it would park
+    /// `schedule_position` above durable, where a later table frame at or
+    /// below that position is ignored as a re-observation.
+    fn observe_table(&mut self, position: u64, time_ns: u64, payload: &[u8]) {
+        let durable = self.cnc.counters().durable.load_acquire();
+        if position > durable {
+            eprintln!(
+                "node {}: ignoring implausible ScheduleTableObserved at {position} (durable {durable})",
+                self.id
+            );
+            return;
+        }
+        self.adopt_table_frame(position, time_ns, payload);
+    }
+
     fn on_truncated(&mut self, epoch: u64, to: u64) {
         // The archive re-primed the counters to `to`; keep our shadow in step so
         // we don't refeed a spurious DurableAdvanced.
@@ -6704,6 +6745,11 @@ impl Consensus {
         // Observations for frames ending above the cut describe bytes that are
         // gone; a re-received tail is re-scanned and re-emitted by the archive.
         self.pending_cfg_obs.retain(|(position, _)| *position <= to);
+        // The same for table observations: `Action::Truncate` already reverted
+        // the RECORD below the cut (`revert_schedule_below`); this drops the
+        // not-yet-adopted observations that would put it straight back.
+        self.pending_tbl_obs
+            .retain(|(position, _, _)| *position <= to);
         let matching = self.pending_truncation == Some(epoch);
         self.feed(Event::Truncated { epoch, to });
         if matching {
@@ -8017,6 +8063,7 @@ mod tests {
             obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             pending_obs: Vec::new(),
             pending_cfg_obs: Vec::new(),
+            pending_tbl_obs: Vec::new(),
             trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
             trunc_trace: false,
             id: 1,
@@ -9614,6 +9661,89 @@ mod tests {
             h.cons.sm.config().version,
             0,
             "a frame above the cut was truncated away; its observation is stale"
+        );
+    }
+
+    /// Parity with the two tests above, for the SCHEDULE_TABLE half (plan
+    /// 2/3, do_work step 1c'). The table path was written from the OLD config
+    /// pattern and carries the same latent class, minus the "lost under the
+    /// latch" half (`adopt_table_frame` does not run through the SM, so
+    /// nothing drops): an observation naming a frame ABOVE an in-flight cut
+    /// can sit in the channel while `Action::Truncate` has already run
+    /// `revert_schedule_below`, and adopting it afterwards parks
+    /// `schedule_position` at a position the cut removed — on this node
+    /// alone, where a later table frame landing at or below it is then
+    /// ignored as a re-observation.
+    ///
+    /// The harness reconciles to a cut at 4096 with durable at 6016, so the
+    /// observation at 6016 is above the cut yet passes the durable
+    /// plausibility skip — exactly the case the skip cannot catch. Before the
+    /// fix it is adopted immediately, under the latch, and survives the cut
+    /// (the 4096 one is then swallowed by `adopt_table_frame`'s
+    /// `position <= schedule_position` guard).
+    #[test]
+    fn a_table_observation_above_the_cut_is_dropped_and_the_one_at_it_adopts() {
+        use uc_protocol::v2::schedule::ScheduleEntry;
+
+        let mut h = harness();
+        let table_with = |timer_id: u64| {
+            let mut bytes = Vec::new();
+            encode_schedule_table(
+                &ScheduleTable {
+                    entries: vec![ScheduleEntry {
+                        identity_hash: 0xfeed_face_dead_beef,
+                        timer_id,
+                        rule: ScheduleRule::Every {
+                            period_ns: 100,
+                            anchor_ns: 0,
+                        },
+                    }],
+                },
+                &mut bytes,
+            );
+            bytes
+        };
+        let above = table_with(9);
+        let at_cut = table_with(1);
+
+        // A reconcile truncation to 4096 is in flight; the SM latch is up.
+        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
+        assert!(h.cons.sm.is_truncating(), "latch up");
+        let epoch = h.cons.pending_truncation.expect("bracket open");
+        assert_eq!(
+            h.cons.cnc.counters().durable.load_acquire(),
+            6016,
+            "the counter the plausibility skip judges against, still pre-cut"
+        );
+
+        // The archive emits both observations; the duty cycle drains them
+        // while the latch is up. Neither may be adopted here.
+        h._tbl_obs_tx.send((6016, 77, above)).unwrap();
+        h._tbl_obs_tx.send((4096, 11, at_cut.clone())).unwrap();
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.schedule_position, 0,
+            "nothing adopts while the latch is up"
+        );
+
+        // The archive cuts to 4096 (re-priming the counters there) and acks.
+        h.cons.cnc.counters().prime(4096);
+        h.post_ack_and_drain(epoch, 4096);
+        h.cons.do_work();
+
+        assert_eq!(
+            h.cons.schedule_position, 4096,
+            "the frame at the cut survived it and must be adopted; the one \
+             above it was truncated away and its observation is stale"
+        );
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 4096);
+        let back = crate::schedule_state::load(&h.cons.schedule_state)
+            .unwrap()
+            .expect("a record is stored");
+        assert_eq!(
+            (back.position, back.time_ns, back.table),
+            (4096, 11, at_cut),
+            "and it is the frame AT the cut, bytes and stamp"
         );
     }
 
