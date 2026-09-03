@@ -111,6 +111,24 @@ fn node_creates_per_id_rings_dirs_and_publishes_the_declared_set() {
 }
 
 #[test]
+fn node_creates_one_sched_ring_per_declared_row_and_the_service_opens_it() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["count", "fsm1"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    assert!(dir.path().join("svc_sched.0.ring").is_file());
+    assert!(dir.path().join("svc_sched.1.ring").is_file());
+    assert!(
+        !dir.path().join("svc_sched.2.ring").exists(),
+        "undeclared rows get no ring"
+    );
+    let svc = start_service::<CountSm>(dir.path());
+    // attach succeeded ⇒ the producer half opened; nothing is written yet
+    svc.stop();
+    node.stop();
+}
+
+#[test]
 fn lockstep_publishes_zero_and_none_for_tests_still_rings_fsm_zero() {
     let _g = serialize();
     let dir = tempdir();

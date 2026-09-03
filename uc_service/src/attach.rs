@@ -141,6 +141,12 @@ pub(crate) fn attach<S: RawStateMachine>(
         .map_err(|e| ServiceError::Ring(e.to_string()))?;
     let (_svc_query_producer, svc_query) = svc_query_ring.into_split();
 
+    // Time-and-timers §4.4: the service→node schedule ring; this process is the
+    // producer, the node's consensus agent the consumer.
+    let svc_sched_ring = SpscRing::open(&dir.join(format!("svc_sched.{}.ring", row)))
+        .map_err(|e| ServiceError::Ring(e.to_string()))?;
+    let (svc_sched, _svc_sched_consumer) = svc_sched_ring.into_split();
+
     // 4. Publish the applied frontier. Over-reporting above the journal
     //    frontier is a drift (wrong/stale SM) — refuse. Under-reporting is
     //    safe (the apply loop's idempotent-skip re-applies nothing already
@@ -202,6 +208,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         resp_buf: Vec::with_capacity(256),
         journal_dir: dir.join("journal"),
         svc_query,
+        svc_sched,
         needs_replay: false,
         instance_id,
         instance_mismatch_streak: 0,

@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
-use uc_protocol::ring::SpscConsumer;
+use uc_protocol::ring::{SpscConsumer, SpscProducer};
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
 use uc_protocol::v2::frame::FRAME_TYPE_MESSAGE;
 
@@ -201,6 +201,12 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// The node→service query ring consumer half. Drained by Task 11's
     /// `drain_queries`; held here so the apply thread owns it (single reader).
     pub(crate) svc_query: SpscConsumer,
+    /// Time-and-timers §4.4: the service→node schedule ring producer half —
+    /// this process is the producer, the node's consensus agent the consumer.
+    /// Not yet written (Task 5) — held here so the apply thread owns the ring
+    /// handle from attach onward.
+    #[allow(dead_code)]
+    pub(crate) svc_sched: SpscProducer,
     /// Observability: set while a batch has surfaced `Overrun` and the replay
     /// reconstruction is degrading the follower back onto the live buffer.
     /// Cleared once replay rejoins.
@@ -887,6 +893,10 @@ mod tests {
             uc_protocol::ring::SpscRing::create(&dir.path().join("svc_query.ring"), 1 << 16, 1024)
                 .unwrap()
                 .into_split();
+        let (svc_sched, _sp) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_sched.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
         let mut st = super::ApplyState {
             poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             follower: uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), FRAME),
@@ -896,6 +906,7 @@ mod tests {
             resp_buf: Vec::new(),
             journal_dir: dir.path().join("journal"),
             svc_query,
+            svc_sched,
             needs_replay: false,
             instance_id: 0x1234,
             instance_mismatch_streak: 0,

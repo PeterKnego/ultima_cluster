@@ -18,6 +18,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
 | `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
 | `svc_query.<id>.ring` | node → service | Forwarded queries for FSM `id`. One per declared id since M14. |
+| `svc_sched.<id>.ring` | service → node | Schedule/cancel/consumed requests for FSM `id`'s timers (time-and-timers spec §4.4). One per declared id. |
 | `egress_service.<id>.broadcast` | node → service | Apply and output stream to FSM `id`'s service. One per declared id since M14. A client opens every declared id's ring and accepts a response only from the FSM(s) its request named. |
 | `egress_node.broadcast` | node → clients | Node-originated answers to clients: `MSG_V2_NOT_LEADER` (with the leader hint), `MSG_V2_RETRY`, and `MSG_V2_BAD_SERVICE` (the query named an id this node has no ring for). Submit and query *responses* come from the FSMs' own rings. |
 | `service.<id>.lock` | service | Exclusive `flock`, held for FSM `id`'s service process's life — one process per declared id (M14). |
@@ -88,7 +89,7 @@ disk requires bind mounts.
 
 | Limit | Value |
 |---|---|
-| Free space needed before boot | `buffer_bytes` + 14 MiB of rings + **5 MiB × (N − 1)** for N declared FSMs (`svc_query.<id>.ring` 1 MiB + `egress_service.<id>.broadcast` 4 MiB each) + 4 KiB for the second cnc page — ~78 MiB at the defaults with one FSM, ~113 MiB with eight; reserved at startup — see below |
+| Free space needed before boot | `buffer_bytes` + 15 MiB of rings + **6 MiB × (N − 1)** for N declared FSMs (`svc_query.<id>.ring` 1 MiB + `svc_sched.<id>.ring` 1 MiB + `egress_service.<id>.broadcast` 4 MiB each) + 4 KiB for the second cnc page — ~79 MiB at the defaults with one FSM, ~121 MiB with eight; reserved at startup — see below |
 | Nodes per instance directory | 1, enforced by `instance.lock` |
 | Admin clients per instance directory | 1 at a time |
 

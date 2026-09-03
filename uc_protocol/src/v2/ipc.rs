@@ -28,6 +28,8 @@
 //!     [`MSG_V2_BAD_SERVICE`] — payload is `service_id: u8` (M14b).
 //!   * Either broadcast ring may also carry [`MSG_V2_RETRY`] — a transient
 //!     failure the client should retry, no payload contract beyond that.
+//!   * `svc_sched.<id>.ring` (SPSC, service → node): [`MSG_V2_SCHED`] —
+//!     payload a [`SchedRecord`].
 //!
 //! Every client-originated (and client-targeted) ring record carries the
 //! originating client's identity in the record's `header_extra: [u8; 8]`
@@ -57,6 +59,10 @@ pub const MSG_V2_RETRY: u16 = 6;
 /// node's non-zero id. Payload = `service_id: u8` (the offending id). Kind-
 /// agnostic like [`MSG_V2_RETRY`]: no side effect happened, the slot resolves.
 pub const MSG_V2_BAD_SERVICE: u16 = 7;
+/// `svc_sched.<id>.ring` (SPSC, service → node, time-and-timers spec §4.4):
+/// a schedule, cancel or consumed request for that row's timers. `header_extra`
+/// is unused (zero).
+pub const MSG_V2_SCHED: u16 = 8;
 
 /// `query.ring` `flags` bit 0: linearizable (vs. snapshot) read.
 pub const FLAG_V2_LINEARIZABLE: u16 = 1;
@@ -99,6 +105,51 @@ pub fn write_query_payload(service_id: u8, query: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(query);
 }
 
+pub const SCHED_RECORD_LEN: usize = 17;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SchedOp {
+    Schedule = 1,
+    Cancel = 2,
+    /// `Timed` delivered (or dropped) this instance; the node clears it.
+    Consumed = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedRecord {
+    pub op: SchedOp,
+    pub timer_id: u64,
+    /// `0` for `Cancel`.
+    pub deadline_ns: u64,
+}
+
+pub fn write_sched_record(r: &SchedRecord) -> [u8; SCHED_RECORD_LEN] {
+    let mut out = [0u8; SCHED_RECORD_LEN];
+    out[0] = r.op as u8;
+    out[1..9].copy_from_slice(&r.timer_id.to_le_bytes());
+    out[9..17].copy_from_slice(&r.deadline_ns.to_le_bytes());
+    out
+}
+
+/// Total: `None` on a short slice or an op byte outside `1..=3`.
+pub fn read_sched_record(buf: &[u8]) -> Option<SchedRecord> {
+    if buf.len() < SCHED_RECORD_LEN {
+        return None;
+    }
+    let op = match buf[0] {
+        1 => SchedOp::Schedule,
+        2 => SchedOp::Cancel,
+        3 => SchedOp::Consumed,
+        _ => return None,
+    };
+    Some(SchedRecord {
+        op,
+        timer_id: u64::from_le_bytes(buf[1..9].try_into().unwrap()),
+        deadline_ns: u64::from_le_bytes(buf[9..17].try_into().unwrap()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +181,37 @@ mod tests {
         assert_eq!(split_query_payload(&[]), None);
         // Any byte is a valid id at this layer (range/declared checks are the node's).
         assert_eq!(split_query_payload(&[255, 1]), Some((255, &[1][..])));
+    }
+
+    /// FROZEN: op(1) ++ timer_id(8, LE) ++ deadline_ns(8, LE) = 17.
+    #[test]
+    fn sched_record_pins_literal_bytes_and_rejects_bad_ops() {
+        let r = SchedRecord {
+            op: SchedOp::Schedule,
+            timer_id: 0x0102_0304_0506_0708,
+            deadline_ns: 0x1122_3344_5566_7788,
+        };
+        let b = write_sched_record(&r);
+        assert_eq!(b[0], 1);
+        assert_eq!(&b[1..9], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(&b[9..17], &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(read_sched_record(&b), Some(r));
+        for (op, code) in [(SchedOp::Cancel, 2u8), (SchedOp::Consumed, 3u8)] {
+            let r = SchedRecord {
+                op,
+                timer_id: 1,
+                deadline_ns: 2,
+            };
+            assert_eq!(write_sched_record(&r)[0], code);
+            assert_eq!(read_sched_record(&write_sched_record(&r)), Some(r));
+        }
+        let mut bad = b;
+        bad[0] = 0;
+        assert_eq!(read_sched_record(&bad), None, "op 0 is not a record");
+        bad[0] = 4;
+        assert_eq!(read_sched_record(&bad), None, "op 4 is not a record");
+        assert_eq!(read_sched_record(&b[..16]), None);
+        assert_eq!(MSG_V2_SCHED, 8);
     }
 
     #[test]

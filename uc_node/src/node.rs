@@ -33,7 +33,8 @@ use uc_net::sender::{
     CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet, identity_mask,
 };
 use uc_protocol::ring::{
-    BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscProducer, SpscRing,
+    BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscConsumer,
+    SpscProducer, SpscRing,
 };
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
@@ -703,7 +704,7 @@ impl Node {
         // prior attachment is invalidated by the new instance_id anyway).
         // `ingress`/`egress_node` are pre-split: the consensus agent is the
         // sole owner of the consumer/producer half it drives (Task 7).
-        let (rings, ingress_ring, egress_node, query_ring, svc_query) =
+        let (rings, ingress_ring, egress_node, query_ring, svc_query, svc_sched) =
             create_rings(&instance, &cfg.services)?;
 
         // M7 (spec 2026-07-13): recover the durable `ConfigRecord` — genesis-seed
@@ -1314,6 +1315,7 @@ impl Node {
             egress_node,
             query_ring,
             svc_query,
+            svc_sched,
             services: cfg.services,
             snap_stats: Arc::clone(&route_drops),
             last_snap_refusals: (0, 0, 0),
@@ -1877,6 +1879,13 @@ struct Consensus {
     /// ring id) — the consensus agent is each ring's single writer
     /// (`MSG_V2_SVC_QUERY`; payload = `expected_epoch: u64 LE ++ query bytes`).
     svc_query: Vec<Option<SpscProducer>>,
+    /// Time-and-timers §4.4: the service→node schedule rings' consumer halves,
+    /// one per declared ring id (`Vec` len [`CNC_MAX_SERVICES`], `Some` for
+    /// every declared ring id) — the consensus agent is each ring's single
+    /// reader. Not yet polled (Task 8) — held so the mmap'd file stays live
+    /// for the attaching service.
+    #[allow(dead_code)]
+    svc_sched: Vec<Option<SpscConsumer>>,
     /// M14a: a copy of `NodeConfig::services` — the declared set + lag policy.
     /// Read by `publish_service_mins` every cycle; Task 6 also answers
     /// `MSG_V2_BAD_SERVICE` from it.
@@ -5670,20 +5679,23 @@ fn open_or_create_buffer(
 /// Create the node's shared-memory IPC ring files fresh (unlinking any stale
 /// file first — a prior instance's attachment is invalidated by the new
 /// instance_id anyway). Sizes are fixed by the spec: ingress 4 MiB, query
-/// 1 MiB, svc_query 1 MiB, both broadcasts 4 MiB; 64 KiB max message each.
+/// 1 MiB, svc_query 1 MiB, svc_sched 1 MiB, both broadcasts 4 MiB; 64 KiB max
+/// message each.
 /// M14a: one `svc_query.<id>.ring` (SPSC, 1 MiB) + one
 /// `egress_service.<id>.broadcast` (broadcast, 4 MiB) + one `snapshots/<id>/`
-/// per id in `services.ring_ids()` — 5 MiB per id, part of the boot
+/// per id in `services.ring_ids()`. Time-and-timers §4.4 adds one
+/// `svc_sched.<id>.ring` (SPSC, 1 MiB) per id — 6 MiB per id, part of the boot
 /// reservation (instance-directory.md).
-/// Returns the retained `Rings`, plus the four node-side ring halves the
+/// Returns the retained `Rings`, plus the node-side ring halves the
 /// consensus agent drives: the ingress ring's CONSUMER + the node egress ring's
 /// PRODUCER (Task 7), the query ring's CONSUMER (Task 11 — the node reads
-/// client queries and forwards barrier-passed reads to the service), and the
-/// per-id `svc_query` PRODUCERs (`Some` for every ring id, `None` otherwise).
+/// client queries and forwards barrier-passed reads to the service), the
+/// per-id `svc_query` PRODUCERs (`Some` for every ring id, `None` otherwise),
+/// and the per-id `svc_sched` CONSUMERs (same shape — Task 8 polls them).
 /// Every counterpart half (the ingress + query producers, the egress_node
-/// consumer, the svc_query consumers) is dropped here: the node never uses
-/// them, and attaching clients/service open the files themselves to get their
-/// own halves.
+/// consumer, the svc_query consumers, the svc_sched producers) is dropped
+/// here: the node never uses them, and attaching clients/service open the
+/// files themselves to get their own halves.
 #[allow(clippy::type_complexity)]
 fn create_rings(
     dir: &InstanceDir,
@@ -5694,6 +5706,7 @@ fn create_rings(
     BroadcastProducer,
     MpscConsumer,
     Vec<Option<SpscProducer>>,
+    Vec<Option<SpscConsumer>>,
 )> {
     const MIB: u64 = 1 << 20;
     const MAX_MSG: u32 = 64 << 10;
@@ -5710,6 +5723,7 @@ fn create_rings(
     for id in 0..CNC_MAX_SERVICES as u8 {
         stale.push(dir.svc_query_ring_for(id));
         stale.push(dir.egress_service_for(id));
+        stale.push(dir.svc_sched_ring_for(id));
     }
     for p in stale {
         let _ = std::fs::remove_file(&p);
@@ -5721,14 +5735,19 @@ fn create_rings(
     let query = MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?;
     let (_query_producer, query_consumer) = query.into_split();
     // M14a: one svc_query (SPSC, 1 MiB) + one egress_service (broadcast,
-    // 4 MiB) + one snapshots/<id>/ per ring id. 5 MiB per id, fallocated —
+    // 4 MiB) + one snapshots/<id>/ per ring id. Time-and-timers §4.4: one
+    // svc_sched (SPSC, 1 MiB) per ring id too. 6 MiB per id, fallocated —
     // part of the boot reservation (instance-directory.md).
     let mut svc_query: Vec<Option<SpscProducer>> = (0..CNC_MAX_SERVICES).map(|_| None).collect();
+    let mut svc_sched: Vec<Option<SpscConsumer>> = (0..CNC_MAX_SERVICES).map(|_| None).collect();
     let mut egress_services = Vec::new();
     for id in services.ring_ids() {
         let ring = SpscRing::create(&dir.svc_query_ring_for(id), MIB, MAX_MSG).map_err(to_io)?;
         let (producer, _consumer) = ring.into_split();
         svc_query[id as usize] = Some(producer);
+        let sched = SpscRing::create(&dir.svc_sched_ring_for(id), MIB, MAX_MSG).map_err(to_io)?;
+        let (_producer, consumer) = sched.into_split();
+        svc_sched[id as usize] = Some(consumer);
         egress_services.push(
             BroadcastRing::create(&dir.egress_service_for(id), 4 * MIB, MAX_MSG).map_err(to_io)?,
         );
@@ -5740,6 +5759,7 @@ fn create_rings(
         egress_node_producer,
         query_consumer,
         svc_query,
+        svc_sched,
     ))
 }
 
@@ -6661,6 +6681,13 @@ mod tests {
         let mut svc_query: Vec<Option<SpscProducer>> =
             (0..CNC_MAX_SERVICES).map(|_| None).collect();
         svc_query[0] = Some(svc_query_0);
+        let (_svc_sched_0_producer, svc_sched_0) =
+            SpscRing::create(&dir.path().join("svc_sched.0.ring"), 4096, 1024)
+                .unwrap()
+                .into_split();
+        let mut svc_sched: Vec<Option<SpscConsumer>> =
+            (0..CNC_MAX_SERVICES).map(|_| None).collect();
+        svc_sched[0] = Some(svc_sched_0);
 
         let cons = Consensus {
             reports_unattested: Arc::new(AtomicU64::new(0)),
@@ -6682,6 +6709,7 @@ mod tests {
             egress_node,
             query_ring,
             svc_query,
+            svc_sched,
             services: ServicesConfig::none_for_tests(),
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0),

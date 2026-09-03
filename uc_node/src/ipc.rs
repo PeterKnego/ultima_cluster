@@ -92,6 +92,10 @@ impl InstanceDir {
     pub fn egress_service_for(&self, id: u8) -> PathBuf {
         self.root.join(format!("egress_service.{id}.broadcast"))
     }
+    /// Time-and-timers §4.4: the service→node schedule ring for row `id`.
+    pub fn svc_sched_ring_for(&self, id: u8) -> PathBuf {
+        self.root.join(format!("svc_sched.{id}.ring"))
+    }
     /// M14a: service `id`'s snapshot directory (`snapshots/<id>/`).
     pub fn snapshot_dir_for(&self, id: u8) -> PathBuf {
         self.root.join("snapshots").join(id.to_string())
@@ -139,6 +143,8 @@ mod tests {
         assert_eq!(d.egress_node(), dir.path().join("egress_node.broadcast"));
         assert_eq!(d.svc_query_ring_for(0), dir.path().join("svc_query.0.ring"));
         assert_eq!(d.svc_query_ring_for(7), dir.path().join("svc_query.7.ring"));
+        assert_eq!(d.svc_sched_ring_for(0), dir.path().join("svc_sched.0.ring"));
+        assert_eq!(d.svc_sched_ring_for(7), dir.path().join("svc_sched.7.ring"));
         assert_eq!(
             d.egress_service_for(3),
             dir.path().join("egress_service.3.broadcast")
