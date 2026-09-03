@@ -62,7 +62,7 @@ jobs:
           cargo test -p uc_node --lib
           --test smoke --test failover --test learner
           --test purge_safety --test query_barrier
-          --test admin_auth --test daemon_refusals
+          --test admin_auth --test daemon_refusals --test timers
 
   # MSRV floor gate. Reads the floor from Cargo.toml's `rust-version`
   # (`[workspace.package]`, single source of truth — see that field's
