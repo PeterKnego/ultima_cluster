@@ -782,6 +782,103 @@ pub fn uc_protocol_log_frame() -> Vec<Seed> {
         Seed::fixed("04-config", header(FRAME_TYPE_CONFIG, HEADER_LEN as u32 + 32)),
         Seed::fixed("05-length-max", header(FRAME_TYPE_MESSAGE, u32::MAX)),
         Seed::fixed("06-length-zero", header(FRAME_TYPE_MESSAGE, 0)),
+        Seed::fixed(
+            "07-timer",
+            header(FRAME_TYPE_TIMER, HEADER_LEN as u32 + TIMER_BODY_LEN as u32),
+        ),
+    ]
+}
+
+/// `uc_protocol_timer_frame` — a header (any frame type; the target only
+/// cares that it decodes) followed by a `TimerBody`, both built with the
+/// real encoders, plus short/overlong body variants.
+pub fn uc_protocol_timer_frame() -> Vec<Seed> {
+    use uc_protocol::v2::frame::*;
+
+    fn header(frame_type: u8, length: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; HEADER_LEN];
+        write_header_except_length(
+            &mut buf,
+            &FrameHeader {
+                length,
+                frame_type,
+                flags: 0,
+                leadership_term_id: 3,
+                client_id: 0,
+                seq: 0,
+                time_ns: 1_700_000_000_000_000_000,
+            },
+        );
+        buf[OFF_LENGTH..OFF_LENGTH + 4].copy_from_slice(&length.to_le_bytes());
+        buf
+    }
+
+    fn body(identity_hash: u64, timer_id: u64, deadline_ns: u64) -> Vec<u8> {
+        let mut buf = [0u8; TIMER_BODY_LEN];
+        write_timer_body(
+            &mut buf,
+            &TimerBody { identity_hash, timer_id, deadline_ns },
+        );
+        buf.to_vec()
+    }
+
+    fn frame(length: u32, body: Vec<u8>) -> Vec<u8> {
+        let mut v = header(FRAME_TYPE_TIMER, length);
+        v.extend_from_slice(&body);
+        v
+    }
+
+    let on_time = body(0x1234_5678_9abc_def0, 42, 1_700_000_000_000_000_000);
+    let late = body(0x1234_5678_9abc_def0, 43, 1_000_000_000_000_000_000);
+
+    vec![
+        // An on-time TIMER frame: header.time_ns == body.deadline_ns.
+        Seed::fixed(
+            "01-on-time",
+            frame(HEADER_LEN as u32 + TIMER_BODY_LEN as u32, on_time),
+        ),
+        // A late TIMER frame: header.time_ns > body.deadline_ns.
+        Seed::fixed("02-late", frame(HEADER_LEN as u32 + TIMER_BODY_LEN as u32, late)),
+        // A body shorter than TIMER_BODY_LEN: read_timer_body returns None.
+        Seed::fixed(
+            "03-short-body",
+            frame(HEADER_LEN as u32 + 8, body(1, 2, 3)[..8].to_vec()),
+        ),
+        // A body with trailing bytes past TIMER_BODY_LEN: the tail is ignored.
+        Seed::fixed("04-trailing-bytes", {
+            let mut v = frame(HEADER_LEN as u32 + TIMER_BODY_LEN as u32, body(7, 8, 9));
+            v.extend_from_slice(&[0xAAu8; 5]);
+            v
+        }),
+        // No body at all: header only.
+        Seed::fixed("05-header-only", header(FRAME_TYPE_TIMER, HEADER_LEN as u32)),
+        // Shorter than HEADER_LEN: the target's own guard returns before
+        // touching `read_header`.
+        Seed::fixed("06-short-header", header(FRAME_TYPE_TIMER, HEADER_LEN as u32)[..16].to_vec()),
+    ]
+}
+
+/// `uc_protocol_sched_record` — the three valid ops, an invalid op (`0`), an
+/// invalid op (`4`), and a record shorter than `SCHED_RECORD_LEN`.
+pub fn uc_protocol_sched_record() -> Vec<Seed> {
+    use uc_protocol::v2::ipc::*;
+
+    fn record(op: SchedOp, timer_id: u64, deadline_ns: u64) -> Vec<u8> {
+        write_sched_record(&SchedRecord { op, timer_id, deadline_ns }).to_vec()
+    }
+
+    let mut bad_op_0 = record(SchedOp::Schedule, 1, 2);
+    bad_op_0[0] = 0;
+    let mut bad_op_4 = record(SchedOp::Schedule, 1, 2);
+    bad_op_4[0] = 4;
+
+    vec![
+        Seed::fixed("01-schedule", record(SchedOp::Schedule, 100, 1_700_000_000_000_000_000)),
+        Seed::fixed("02-cancel", record(SchedOp::Cancel, 100, 0)),
+        Seed::fixed("03-consumed", record(SchedOp::Consumed, 100, 1_700_000_000_000_000_000)),
+        Seed::fixed("04-bad-op-0", bad_op_0),
+        Seed::fixed("05-bad-op-4", bad_op_4),
+        Seed::fixed("06-short", vec![0u8; 16]),
     ]
 }
 

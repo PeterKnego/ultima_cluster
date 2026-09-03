@@ -84,15 +84,15 @@ is a long `cargo fuzz run` with a large `-max_total_time`.
 
 `nightly.yml` has two jobs (`.github/workflows/nightly.yml`):
 
-* **`fuzz-groups`** — the four matrix legs are declared once, in that job's
+* **`fuzz-groups`** — the five matrix legs are declared once, in that job's
   `FUZZ_GROUPS` env, and a ~10-second Python step asserts their union is
   **exactly** the set of `[[bin]]` targets in `fuzz/Cargo.toml` (minus the
   `seed-corpus` generator), with no target in two legs and no leg naming a
-  target that no longer exists. Adding a fifteenth target without assigning it
+  target that no longer exists. Adding a target without assigning it
   to a group fails the workflow here, before any sanitizer build. This is the
   mechanism that keeps "every target is fuzzed nightly" a fact rather than an
   intention — so when you add a target (see below), add it to a group.
-* **`fuzz`** — four parallel legs, `600` seconds per target on the committed
+* **`fuzz`** — five parallel legs, `600` seconds per target on the committed
   corpus, `--min-runs 10000`, `fail-fast: false`. A crash fails the leg and
   uploads `fuzz/artifacts` as a workflow artifact. A second cheap step
   re-checks the declared list against what `cargo fuzz list` actually
@@ -105,9 +105,9 @@ two to three minutes. (The global `CARGO_TARGET_DIR` caveat below is a
 property of this dev box, not of CI: runners have no such setting, so the
 fuzz builds land under `fuzz/target/` there and the cache action finds them.)
 
-Budget arithmetic, for whoever adds target fifteen: 600 s per target against a
-60-minute job timeout means **four targets per leg is the ceiling**, minus the
-build. Add a fifth leg rather than a fifth target.
+Budget arithmetic, for whoever adds the next target: 600 s per target against
+a 60-minute job timeout means **four targets per leg is the ceiling**, minus
+the build. Add a new leg once the last one is full rather than overloading it.
 
 ## Regenerating the seed corpus
 
@@ -162,6 +162,8 @@ growth.
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. |
 | `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write, and, for a query record, the M14b `service_id ++ query` split (`split_query_payload`). |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header` behind the real caller's `len >= HEADER_LEN` guard (that reader is deliberately caller-guarded — see its doc). |
+| `uc_protocol_timer_frame` | `uc_protocol::v2::frame`'s `TimerBody` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
+| `uc_protocol_sched_record` | `uc_protocol::v2::ipc`'s `SchedRecord` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |
 | `uc_service_session` | `Sessioned<S>` — the exactly-once envelope (under a fuzz-derived, deliberately tiny `SessionConfig`, so client/byte eviction and the window trim are reachable) and its snapshot install path. |
 | `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |

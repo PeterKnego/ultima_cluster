@@ -28,7 +28,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict), single- and two-FSM — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load — single- and two-FSM |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol, the MPSC ring's per-record commit protocol, **and the Broadcast ring's seqlock read barrier** |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fifteen decoders that see bytes the process did not write |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the seventeen decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 
@@ -240,6 +240,12 @@ restores the pre-fix index-aligned match through a `mutation-testing` tooth
 (`reconcile::reconcile_index_aligned`, the old body verbatim) and pins that
 the sim then sees the wipes. Nightly runs both.
 
+**Timers (`2.11.0`).** [`uc_sim::timers`](/uc_sim/src/timers.rs) is a pure,
+dependency-free reference model of the leader-pass algorithm (spec §4.3): 64
+seeds sweep five rules, including that lateness must pre-date the pass — a
+`TIMER` frame's `time_ns` may exceed its `deadline_ns` only when the pass that
+emitted it was itself running late, never as an artefact of decoding order.
+
 ```bash
 cargo test -p uc_sim                          # standard tier
 cargo test -p uc_sim --features sim-heavy     # 1000-seed fuzz
@@ -273,6 +279,7 @@ as `Indeterminate` in both histories rather than silently taken from FSM 0.
 | `minority_partition_and_heal_two_fsm` | `uc_node/tests/lin_partition_v2.rs` | minority partition, quorum loss and heal, per-FSM WGL before and after |
 | `two_fsm_service_sigkill` | `examples/uc_crashtest/tests/hard_crash.rs` | §5 — FSM 1's process `SIGKILL`ed mid-load |
 | `two_fsm_node_sigkill` | `examples/uc_crashtest/tests/hard_crash.rs` | §5 — the node and both services killed together |
+| `two_fsm_timer_churn_under_failover` | `uc_node/tests/lin_v2.rs` | `2.11.0` — row 1 is `Timed<TimerSm>` under sustained schedule/cancel churn plus node kills forcing leader changes with instances in flight; every node's `fired`/`scheduled`/`cancelled` record must agree (replication equivalence) and pass the shared `uc_lincheck::timer::assert_timer_report` oracle |
 
 Two more tests keep those honest rather than adding coverage of their own:
 
@@ -414,6 +421,15 @@ under load, and `two_fsm_node_sigkill` kills the node and both services
 together, then brings the node back and reattaches both. Six kill cycles across
 the two tests, every FSM history `Linearizable`, `equiv == 0` throughout.
 
+**Timers (`2.11.0`).** `two_fsm_timer_service_sigkill` is
+`two_fsm_service_sigkill`'s twin with the row-1 service running
+`Timed<TimerSm>`: a real `kill -9` of the timer FSM's process, three times,
+under sustained schedule/cancel load. The process comes back with an empty
+`Timed<TimerSm>`, so both its timer record and `Timed`'s own pending set are
+rebuilt entirely by journal replay of `TIMER` frames — the reconstruction path
+the in-process capstones never cross a process boundary on — and is checked
+by the same `uc_lincheck::timer::assert_timer_report` oracle §3 uses.
+
 ```bash
 cargo test -p uc_crashtest --features hard-crash-tests
 ```
@@ -485,12 +501,14 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The fifteen targets
+### The seventeen targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
 | `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
+| `uc_protocol_timer_frame` | `2.11.0` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
+| `uc_protocol_sched_record` | `2.11.0` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 8 KiB control page (page-2 service-slot band and the 4032 pair since M14a) every attaching process maps and parses. A file on disk any local process with write access can corrupt. |
 | `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write. |
 | `uc_remote_frame` | `uc_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. Input from any client that can open a socket to the gateway. |
@@ -510,7 +528,7 @@ takes the process down. Availability is the thing being defended here.
 Seeds are generated from fixed literals by the real encoders (`cargo +nightly
 run --bin seed-corpus`), so the committed corpus is deterministic and a corpus
 change is reviewable in a diff. Nightly CI runs every target for **600 seconds**
-on that corpus across four matrix legs; a crash fails the leg and uploads the
+on that corpus across five matrix legs; a crash fails the leg and uploads the
 artifact. The `fuzz-groups` job asserts the legs' union is exactly the set of
 declared targets, so a new target cannot be silently left unfuzzed.
 
@@ -706,7 +724,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (five legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---

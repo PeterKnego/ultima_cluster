@@ -107,6 +107,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "uc_protocol_timer_frame"
+path = "fuzz_targets/uc_protocol_timer_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc_protocol_sched_record"
+path = "fuzz_targets/uc_protocol_sched_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "uc_service_session"
 path = "fuzz_targets/uc_service_session.rs"
 test = false

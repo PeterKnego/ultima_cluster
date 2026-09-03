@@ -34,7 +34,7 @@ name: nightly
 #                  tarball — this job keeps it honest between tags.
 #   * fuzz       — M12d: libFuzzer over every decoder that sees bytes it did
 #                  not write (fuzz/README.md's target table), 600 s per
-#                  target, four matrix legs gated by `fuzz-groups` so a new
+#                  target, five matrix legs gated by `fuzz-groups` so a new
 #                  target can never be silently left unfuzzed. Nightly
 #                  toolchain; the fuzz crate is outside the workspace.
 #   * miri       — M12d: UB detection over the PURE decoders only
@@ -270,10 +270,11 @@ jobs:
             --out "$HOME/.cache/uc2-conform/vectors.jsonl" --count 100000 --seed "$(date +%Y%m%d)"
           cd proofs && lake exe conform "$HOME/.cache/uc2-conform/vectors.jsonl"
 
-  # M12d: the four fuzz matrix legs are declared HERE, once, and this job
-  # asserts their union is exactly the set of fuzz targets declared in
-  # fuzz/Cargo.toml. Adding a 15th [[bin]] without assigning it to a group
-  # fails the workflow here, in ~10 seconds, before any sanitizer build —
+  # M12d: the fuzz matrix legs (five since the time-and-timers targets) are
+  # declared HERE, once, and this job asserts their union is exactly the set
+  # of fuzz targets declared in fuzz/Cargo.toml. Adding a target without
+  # assigning it to a group fails the workflow here, in ~10 seconds, before
+  # any sanitizer build —
   # which is the only way "every target is fuzzed nightly" stays true. No
   # toolchain needed: it reads the manifest, it does not build it.
   fuzz-groups:
@@ -294,6 +295,7 @@ jobs:
             uc_crypto_open uc_crypto_handshake uc_crypto_group_key uc_crypto_admin
             uc_journal_record uc_journal_stable_value uc_service_session ring_mpsc_record
             uc_node_toml uc_gateway_toml uc_node_http
+            uc_protocol_timer_frame uc_protocol_sched_record
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
@@ -353,9 +355,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-          # `shared-key`, not `key`: all four matrix legs build the SAME
+          # `shared-key`, not `key`: all five matrix legs build the SAME
           # sanitizer artifacts, so they share one ~500 MB cache entry instead
-          # of writing four and LRU-evicting the other nightly jobs' caches.
+          # of writing five and LRU-evicting the other nightly jobs' caches.
           shared-key: fuzz
       - name: Install cargo-fuzz
         # Explicit `+nightly`: rust-toolchain.toml pins stable 1.96.0 for this
