@@ -2135,8 +2135,11 @@ struct Consensus {
     service_was_live: [bool; CNC_MAX_SERVICES],
     /// M14c: the wall-clock ns `publish_status` last stamped into
     /// `node_heartbeat_ns`, reused by `note_service_transitions` so the
-    /// transition check costs no second clock read per duty cycle. One cycle
-    /// stale, which is immaterial against a 3 s bar; `0` until the first
+    /// transition check costs no second clock read per duty cycle. Since the
+    /// final-review M5 fix this is [`Consensus::pass_now_ns`], the pass's one
+    /// reading, so `publish_status` reads no clock of its own. One cycle
+    /// stale for `note_service_transitions` (which runs before the pass's
+    /// read), which is immaterial against a 3 s bar; `0` until the first
     /// `publish_status`, which reads as "everything fresh" and therefore can
     /// never emit a spurious detach at boot.
     last_wall_ns: u64,
@@ -3589,10 +3592,11 @@ impl Consensus {
             );
         }
         self.last_flags = flags;
-        let now_ns = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
+        // Final-review M5: reuse THIS pass's one clock reading (`wall_now_ns` is
+        // documented as called exactly once per pass, at the top of `do_work`,
+        // and `publish_status` runs only from step 6 of that same pass) rather
+        // than taking a second `SystemTime::now()` for the heartbeat.
+        let now_ns = self.pass_now_ns;
         status.node_heartbeat_ns.store_release(now_ns);
         self.last_wall_ns = now_ns;
         self.publish_ring_holes();

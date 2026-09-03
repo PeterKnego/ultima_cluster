@@ -421,15 +421,19 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 let (mut pf_frames, mut pf_sm, mut pf_pub, mut pf_bytes) = (0u64, 0u64, 0u64, 0u64);
                 let mut sm = st.sm.lock().unwrap();
                 for (pos, hdr, payload) in frames {
-                    // NEW_TERM (and any future non-MESSAGE type), and anything
+                    // PADDING, NEW_TERM, CONFIG (and any future type that is
+                    // neither MESSAGE nor a TIMER for THIS row), and anything
                     // already applied (idempotent re-entry: a restart replays
                     // from `last_applied`), are simply not applied/published —
                     // the `one_frame` break below still fires after THIS
                     // yielded frame regardless of its type, so lockstep's
                     // "one frame per next_batch" counts every yielded frame,
                     // not only ones that were actually applied.
-                    let above = Some(pos) > sm.last_applied();
-                    if hdr.frame_type == FRAME_TYPE_MESSAGE && above {
+                    //
+                    // The cheap frame-type test comes FIRST in each arm
+                    // (final-review M1): `last_applied()` is a trait call and
+                    // must not run for a frame the arm is going to skip anyway.
+                    if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > sm.last_applied() {
                         #[cfg(feature = "apply-profile")]
                         let t0 = profile::now();
                         // Bytes straight from the frame to the state machine. Typed
@@ -460,7 +464,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             write_sched(&mut st.svc_sched, &recs);
                         }
                     } else if hdr.frame_type == FRAME_TYPE_TIMER
-                        && above
+                        && Some(pos) > sm.last_applied()
                         && let Some(body) = read_timer_body(payload)
                         && body.identity_hash == S::IDENTITY.hash()
                     {

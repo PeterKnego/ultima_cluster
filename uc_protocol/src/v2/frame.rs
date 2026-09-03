@@ -31,13 +31,15 @@ pub const FRAME_TYPE_PADDING: u8 = 2;
 /// New-term no-op (spec §6, Raft §5.4.2): a zero-payload frame the new
 /// leader appends immediately on opening a term and must see COMMIT before
 /// serving. Replicated/archived/replayed like any message frame; the apply
-/// layer (M5) skips every non-MESSAGE type.
+/// layer (M5) applies only MESSAGE frames and TIMER frames addressed to the
+/// row.
 pub const FRAME_TYPE_NEW_TERM: u8 = 3;
 /// Cluster-config entry (M7, spec 2026-07-13): payload =
 /// `v2::config::encode_config` bytes. Appended by a serving leader; adopted
 /// at append (leader) / at durable recording (follower, archive scan).
-/// Replicated/archived/replayed like any frame; the apply layer skips every
-/// non-MESSAGE type, so services never see it.
+/// Replicated/archived/replayed like any frame; the apply layer applies only
+/// MESSAGE frames and TIMER frames addressed to the row, so services never
+/// see it.
 pub const FRAME_TYPE_CONFIG: u8 = 4;
 /// Scheduled timer fired by the leader (time-and-timers spec §4.2): a 24-byte
 /// body ([`TimerBody`]); `client_id`/`seq` are 0; `time_ns` is the deadline

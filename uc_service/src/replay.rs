@@ -13,7 +13,8 @@
 //! archive (see its module doc for the safety argument). Each journal record is
 //! one archived BLOCK whose `meta` is the block's base stream position and whose
 //! payload is the raw frames of that block concatenated (exactly as they lay in
-//! the ring). Replay walks those frames and dispatches each `MESSAGE`.
+//! the ring). Replay walks those frames and dispatches each `MESSAGE`, and
+//! each `TIMER` frame addressed to this row (spec §4.8).
 
 use std::sync::Mutex;
 
@@ -32,7 +33,8 @@ use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 /// resume.
 ///
 /// For each block (`meta` = base stream position) it walks the block's frames
-/// and dispatches every `MESSAGE` frame whose position is `> sm.last_applied()`
+/// and dispatches every `MESSAGE` frame — and every `TIMER` frame naming this
+/// row's identity hash — whose position is `> sm.last_applied()`
 /// (idempotent-skip: re-walking an overlap already reflected in the SM applies
 /// nothing) AND whose frame END is `<= target`, where `target = min(commit,
 /// durable)` is RE-READ per block (both counters can advance while replay runs).
@@ -157,16 +159,20 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 if end > target {
                     return false;
                 }
-                // Dispatch MESSAGE frames not already reflected in the SM. NEW_TERM
-                // / PADDING (and any future non-MESSAGE type) are not user data.
-                // Leader-publish suppressed: apply only (see the doc), so the
-                // response bytes land in the throwaway scratch. A typed SM
-                // decodes inside its blanket `RawStateMachine` impl and
+                // Dispatch MESSAGE frames, and TIMER frames addressed to THIS
+                // row, that are not already reflected in the SM. PADDING /
+                // NEW_TERM / CONFIG (and any future type that is neither) are
+                // not user data. Leader-publish suppressed: apply only (see the
+                // doc), so the response bytes land in the throwaway scratch. A
+                // typed SM decodes inside its blanket `RawStateMachine` impl and
                 // fail-stops there on a committed, archived frame that will not
                 // decode — unrecoverable corruption, never a silent skip of
                 // user data.
-                let above = Some(pos) > guard.last_applied();
-                if hdr.frame_type == FRAME_TYPE_MESSAGE && above {
+                //
+                // The cheap frame-type test comes FIRST in each arm
+                // (final-review M1): `last_applied()` is a trait call and must
+                // not run for a frame the arm is going to skip anyway.
+                if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > guard.last_applied() {
                     scratch.clear();
                     guard.apply(
                         &mut ApplyCtx::new(pos, S::IDENTITY)
@@ -176,7 +182,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         &mut scratch,
                     );
                 } else if hdr.frame_type == FRAME_TYPE_TIMER
-                    && above
+                    && Some(pos) > guard.last_applied()
                     && let Some(body) =
                         frame::read_timer_body(&payload[off + HEADER_LEN..off + total])
                     && body.identity_hash == S::IDENTITY.hash()
