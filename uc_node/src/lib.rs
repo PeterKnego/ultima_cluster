@@ -68,7 +68,7 @@ pub use node::{
 /// record back for `schedule show` — two implementations of that digest
 /// would make every apply refuse with [`REASON_SCHEDULE_DIGEST`].
 pub use schedule_state::{
-    SCHEDULE_PENDING_FILE, SCHEDULE_STATE_FILE, ScheduleRecord, schedule_digest,
+    SCHEDULE_PENDING_FILE, SCHEDULE_STATE_FILE, ScheduleRecord, read_record, schedule_digest,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

@@ -120,6 +120,22 @@ pub fn load(sv: &StableValue<ScheduleRecord>) -> Result<Option<ScheduleRecord>, 
     sv.load()
 }
 
+/// Read `<instance_dir>/state/schedules.state` directly, for a caller (`uc2ctl
+/// schedule show`, `uc2ctl status`'s `schedule_position=`) that only needs
+/// one snapshot of the record rather than a `StableValue` to keep open.
+/// `instance_dir` is the INSTANCE directory (not its `state/` subdirectory —
+/// this joins it), matching every other `uc2ctl`-facing path in this crate.
+///
+/// Safe beside a running node: `StableValue::open` takes no file lock and
+/// caches both slots at open, so this is a plain read, not a contended
+/// attach. Deliberately NOT `uc_node::backup::open_state_readonly` — that
+/// helper is `pub(crate)` and scoped to the backup/restore artifact path,
+/// not a general read of a live instance directory's `state/`.
+pub fn read_record(instance_dir: &Path) -> Result<Option<ScheduleRecord>, StableValueError> {
+    let sv = open(&instance_dir.join("state"))?;
+    load(&sv)
+}
+
 /// Durable on return, exactly like `NodeState::store_config_record` — the
 /// caller may take the in-memory effect only after this returns `Ok`.
 pub fn store(sv: &StableValue<ScheduleRecord>, r: &ScheduleRecord) -> Result<(), StableValueError> {
@@ -217,6 +233,35 @@ mod tests {
         let sv = open(dir.path()).expect("reopen");
         assert_eq!(load(&sv).expect("load"), Some(rec));
         assert!(dir.path().join(SCHEDULE_STATE_FILE).is_file());
+    }
+
+    /// `read_record` is `uc2ctl`'s (`schedule show`, `status`'s
+    /// `schedule_position=`) entry point — joins `state/` onto the INSTANCE
+    /// dir itself (unlike `open`/`load` above, which already take the
+    /// `state/` subdirectory), and works as a plain read beside an open
+    /// `StableValue` on the same file (no lock taken).
+    #[test]
+    fn read_record_reads_the_instance_dirs_state_subdirectory() {
+        let dir = tempdir();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        assert_eq!(
+            read_record(dir.path()).expect("read"),
+            None,
+            "nothing stored yet"
+        );
+
+        let sv = open(&state_dir).expect("open");
+        let rec = ScheduleRecord {
+            position: 128,
+            time_ns: 9,
+            table: vec![1, 2, 3],
+            prev: None,
+        };
+        store(&sv, &rec).expect("store");
+        // read_record works alongside the still-open StableValue, not just
+        // after it's dropped — a running node holds this open the whole time.
+        assert_eq!(read_record(dir.path()).expect("read"), Some(rec));
     }
 
     /// The one-level revert a truncation runs (plan-2 fix round 1): prev is

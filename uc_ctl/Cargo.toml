@@ -45,6 +45,11 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 # A per-request nonce, so a response can never be mistaken for a stale one.
 rand = { workspace = true }
+# `schedule apply`: the operator's TOML file (spec §5) -> `ScheduleTable`.
+# Same crate + version `uc_node::config_file` already parses `node.toml` with.
+toml = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # admin_auth_bin.rs starts a real node IN-PROCESS (uc_node is already a

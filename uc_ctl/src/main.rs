@@ -76,6 +76,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
+mod schedule;
+
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
 use uc_protocol::identity::VersionDisplay;
@@ -252,6 +254,38 @@ struct AuditArgs {
     json: bool,
 }
 
+// ---------------------------------------------------------------- plan 2: schedule table
+
+#[derive(clap::Args)]
+struct ScheduleArgs {
+    #[command(subcommand)]
+    cmd: ScheduleCmd,
+}
+
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    /// Parse, stage, sign and apply a schedule table (`ADMIN_OP_SCHEDULE_APPLY`,
+    /// wire op 6) — see `uc_ctl::schedule`'s module doc for the TOML shape.
+    Apply(ScheduleApplyArgs),
+    /// Print the newest ADOPTED schedule table (durable node state, not the
+    /// staged file).
+    Show(ScheduleShowArgs),
+}
+
+#[derive(clap::Args)]
+struct ScheduleApplyArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Path to the schedule TOML file (time-and-timers spec §5).
+    file: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct ScheduleShowArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Add a fresh learner (wire op 1).
@@ -299,6 +333,9 @@ enum Cmd {
     /// (`<instance_dir>/audit.jsonl`). OFFLINE — reads the file directly,
     /// no cnc admin-band interaction.
     Audit(AuditArgs),
+    /// Time-and-timers plan 2 (spec §5): apply or show the replicated
+    /// schedule table (`ADMIN_OP_SCHEDULE_APPLY`, wire op 6).
+    Schedule(ScheduleArgs),
 }
 
 fn main() {
@@ -316,6 +353,10 @@ fn main() {
         Cmd::ForceSingleMember(a) => run_force_single_member(&a),
         Cmd::GenAdminKey(a) => run_gen_admin_key(&a),
         Cmd::Audit(a) => run_audit(&a),
+        Cmd::Schedule(a) => match a.cmd {
+            ScheduleCmd::Apply(args) => schedule::apply(&args.common, &args.file),
+            ScheduleCmd::Show(args) => schedule::show(&args.common),
+        },
     };
     if let Err(e) = r {
         eprintln!("uc2ctl error: {e}");
@@ -365,6 +406,18 @@ fn reason_str(reason: u32) -> &'static str {
         24 => {
             "audit_failed (the node could not record the request — check its audit.jsonl and disk)"
         }
+        // Time-and-timers plan 2 (spec §5): `ADMIN_OP_SCHEDULE_APPLY` (wire op
+        // 6) refusal reasons — `uc_node::REASON_SCHEDULE_*` (`uc_node::node`).
+        40 => {
+            "schedule_digest (the staged file changed between staging and applying, or a different file was staged than was signed — re-run `schedule apply`)"
+        }
+        41 => {
+            "schedule_missing (no staged file on this node — was `schedule apply` run against this same instance dir, or already consumed?)"
+        }
+        42 => "schedule_decode (the staged file is not a decodable schedule table)",
+        43 => {
+            "schedule_unknown_fsm (an entry names an fsm that is not one of this cluster's declared rows)"
+        }
         _ => "unknown/malformed",
     }
 }
@@ -409,12 +462,22 @@ fn load_admin_key(common: &CommonArgs) -> anyhow::Result<Option<AdminKey>> {
     Ok(Some(key))
 }
 
-/// Shared mutating-command flow: attach, write the admin auth line (M12b —
-/// signed under `--admin-key`, or cleared for an unsigned request), write a
-/// fresh admin request (`seq = old_seq + 1`, a random nonce), poll the
-/// response line, print + exit.
+/// Shared admin-band flow: attach, write the admin auth line (M12b — signed
+/// under `--admin-key`, or cleared for an unsigned request), write a fresh
+/// admin request (`seq = old_seq + 1`, a random nonce), poll the response
+/// line, and return it RAW (`status`/`reason`/`version` uninterpreted) —
+/// every op means something different by `version` (a config version for
+/// ops 1-5, a schedule-table position for op 6), so interpreting and
+/// printing the triple is the caller's job (`run_mutate`, `schedule::apply`).
+/// `Err` only on a bad key file, an attach failure, or a poll timeout.
 /// CONTRACT: one admin client (this CLI, m7_gate, or any direct write_admin_req caller) per instance dir at a time; concurrent invocations may produce a nonsense request.
-fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> anyhow::Result<()> {
+fn signed_admin_request(
+    common: &CommonArgs,
+    op: u32,
+    id: u32,
+    ip: u32,
+    port: u16,
+) -> anyhow::Result<uc_log::cnc::AdminResp> {
     let cnc = open(common)?;
     // Load the key (if any) BEFORE writing anything to the admin band — a
     // bad key file must fail cleanly without ever touching the page.
@@ -467,7 +530,7 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
         port,
     });
 
-    let result = poll_admin_response(&cnc, seq);
+    let result = poll_admin_response_raw(&cnc, seq);
     // Clear the auth line on EVERY exit path — accepted, refused, retry, or
     // timeout. This is tidiness, not a security control: a stale line CANNOT
     // authenticate anything, because the tag covers `seq` and the next
@@ -479,44 +542,52 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
     result
 }
 
-/// Poll the admin response line for `seq`, print the outcome, and return the
-/// verdict as a `Result` — `Ok` only for `status == 0` (accepted).
-fn poll_admin_response(cnc: &CncPage, seq: u64) -> anyhow::Result<()> {
+/// Poll the admin response line for `seq` until it appears or the deadline
+/// passes. Returns the response AS-IS for any status (0/1/2/other) —
+/// interpreting `status` is the caller's job.
+fn poll_admin_response_raw(cnc: &CncPage, seq: u64) -> anyhow::Result<uc_log::cnc::AdminResp> {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         if let Some(resp) = cnc.read_admin_resp(seq) {
-            match resp.status {
-                0 => {
-                    println!("accepted: config version now {}", resp.version);
-                    return Ok(());
-                }
-                1 => {
-                    println!(
-                        "refused: {} (config version {})",
-                        reason_str(resp.reason),
-                        resp.version
-                    );
-                    anyhow::bail!("refused: {}", reason_str(resp.reason));
-                }
-                2 => {
-                    println!(
-                        "retry: leader unknown or the append ring was momentarily full \
-                         (config version {}) — try again",
-                        resp.version
-                    );
-                    anyhow::bail!("retry: try again");
-                }
-                other => anyhow::bail!("unrecognized response status {other}"),
-            }
+            return Ok(resp);
         }
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "timeout waiting {POLL_TIMEOUT:?} for a response to seq {seq} — a newer admin \
                  request may have superseded this one (only one forward is in flight at a time); \
-                 `uc2ctl status` shows the authoritative config version"
+                 `uc2ctl status` shows the authoritative state"
             );
         }
         std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// `run_mutate`'s ops (1-5, reconfiguration): send, then print/interpret the
+/// response the way this verb always has — `version` is the config version.
+fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> anyhow::Result<()> {
+    let resp = signed_admin_request(common, op, id, ip, port)?;
+    match resp.status {
+        0 => {
+            println!("accepted: config version now {}", resp.version);
+            Ok(())
+        }
+        1 => {
+            println!(
+                "refused: {} (config version {})",
+                reason_str(resp.reason),
+                resp.version
+            );
+            anyhow::bail!("refused: {}", reason_str(resp.reason));
+        }
+        2 => {
+            println!(
+                "retry: leader unknown or the append ring was momentarily full \
+                 (config version {}) — try again",
+                resp.version
+            );
+            anyhow::bail!("retry: try again");
+        }
+        other => anyhow::bail!("unrecognized response status {other}"),
     }
 }
 
@@ -542,8 +613,18 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         }
     });
 
+    // Time-and-timers plan 2 (spec §5): the newest ADOPTED schedule table's
+    // position, from durable node state (`uc_node::read_record`) — 0 when
+    // this node has never adopted one. Read directly off disk (like
+    // `schedule show`), not through the cnc page: the schedule record isn't
+    // on the cnc page at all (a deliberate design choice — see
+    // `uc_node::schedule_state`'s module doc).
+    let schedule_position = uc_node::read_record(&a.common.instance_dir)
+        .map_err(|e| anyhow::anyhow!("reading schedule state: {e}"))?
+        .map(|r| r.position)
+        .unwrap_or(0);
     println!(
-        "config: version={} pending={}",
+        "config: version={} pending={} schedule_position={schedule_position}",
         cnc.config_version(),
         cnc.config_pending() != 0
     );
