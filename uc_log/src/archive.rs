@@ -502,16 +502,6 @@ impl Archive {
         std::mem::take(&mut self.table_observations)
     }
 
-    /// Give back observations that a caller drained but could not deliver
-    /// (e.g. the consensus agent's outbound channel was full): `unsent` is
-    /// prepended to whatever has accumulated since, so draining order is
-    /// preserved — the unsent ones first, then anything newly observed.
-    pub fn retain_table_observations(&mut self, unsent: Vec<(u64, u64, Vec<u8>)>) {
-        let mut restored = unsent;
-        restored.append(&mut self.table_observations);
-        self.table_observations = restored;
-    }
-
     /// Drain the term transitions detected since the last call (M4). Each entry
     /// is `(term, base position of that term's first frame in the recorded
     /// stream)` — the NewTerm frame's position for an election-opened term.
@@ -1807,8 +1797,8 @@ mod tests {
     // ------------------------------------------------- schedule-table scan
 
     /// A recorded SCHEDULE_TABLE frame yields `(frame-END position, time_ns,
-    /// payload)`, draining and retaining mirror the CONFIG pair, and the two
-    /// observation kinds never cross-contaminate.
+    /// payload)`, draining mirrors the CONFIG pair, and the two observation
+    /// kinds never cross-contaminate.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn archive_observes_schedule_table_frames_with_end_position_and_stamp() {
@@ -1824,12 +1814,6 @@ mod tests {
         let obs = archive.take_table_observations();
         assert_eq!(obs, vec![(128, 700, b"tbl".to_vec())]);
         assert!(archive.take_table_observations().is_empty(), "drained");
-        archive.retain_table_observations(obs.clone());
-        assert_eq!(
-            archive.take_table_observations(),
-            obs,
-            "retained comes back"
-        );
         assert!(
             archive.take_config_observations().is_empty(),
             "not confused with CONFIG"
