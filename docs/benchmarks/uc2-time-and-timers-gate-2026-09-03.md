@@ -89,7 +89,7 @@ pair; fresh builds of the same two commits read ±0.3 %, and two builds of the
 | a | `m14_fleet_gate.py` rows a/b/e with every service wrapped in `Timed<..>` and **no timers scheduled**, steady window, against the same rows on the pre-time-and-timers binary | within the same-source rebuild resolution measured by `scripts/hop1_ab.sh` on the day (record the number first) | not run — release on hold |
 | b | the same three rows with one declared FSM scheduling **1 000 timers/s** sustained through the measure window | throughput within the same resolution as row a; **`uc2_timers_late_total == 0`** on every node after the warm-up window | not run — release on hold |
 | c | timer precision: the distribution of `time_ns − deadline_ns` over **≥ 10 000 on-time fires** under row b's load | **p99 ≤ 2 × the measured consensus-pass length on the rig.** Measure the pass length first, on the day, and write it into the results table before comparing anything to it | not run — release on hold |
-| d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), run under `scripts/hop1_ab.sh`'s same-source rebuild control, at N=1 and N=2, bounded lag | within the measured same-source rebuild resolution (the control arm of the same run) | not run — release on hold |
+| d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), run under `scripts/hop1_ab.sh`'s same-source rebuild control, at N=1 and N=2, bounded lag | within the measured same-source rebuild resolution (the control arm of the same run) | **not run: no runner.** `scripts/hop1_ab.sh` drives `hop_bench`, not `apply_bench` — it launches the sink as `"$SINK" dummy-node --instance-dir … --app-id …` and each driver as `"$bin" engine-load --instance-dir … --app-id … --secs … --payload … --inflight … --engines …`, and parses a `RESULT {json}` line carrying `responses_per_sec`/`p50_ms`/`p90_ms`/`p99_ms`/`lost`. `apply_bench` has no subcommands at all (`clap` `Args`: `--root --fsms --mode --lag --secs …`); both invocations are refused with `error: unexpected argument 'dummy-node' found` / `'engine-load' found` (checked on `f59a0b5`, release build). Row d needs an `apply_bench`-shaped A/B runner with the same rebuild-control arm before it can be adjudicated; no substitute measurement was improvised. |
 
 ### Reading the rules
 
@@ -144,7 +144,7 @@ empty until the maintainer green-lights a run:
 | a | not run — release on hold |
 | b | not run — release on hold |
 | c | not run — release on hold |
-| d | not run — release on hold |
+| d | **not run: no runner** — `scripts/hop1_ab.sh` drives `hop_bench`'s `dummy-node`/`engine-load` subcommands, which `apply_bench` does not have (see the bar table's row d for the exact refusals, checked 2026-09-03 on `f59a0b5`). Not a hold decision and not a measurement: the procedure as written has no runner for this row. |
 
 Numbers to record on the day, before any comparison:
 
@@ -163,8 +163,14 @@ Numbers to record on the day, before any comparison:
 3. Run `bench-infra/scripts/m14_fleet_gate.py`'s rows a/b/e against this
    branch's binaries with `Timed<..>` services and no timers (row a), then
    again with the 1 000 timers/s arm (rows b and c).
-4. Run `scripts/hop1_ab.sh` over `apply_bench` for row d, including its
-   same-source control arm.
+4. Run row d's apply-hop A/B, including its same-source control arm.
+   **`scripts/hop1_ab.sh` cannot do this as written** (2026-09-03): it is a
+   `hop_bench` runner — it starts the sink with the `dummy-node` subcommand
+   and each driver with `engine-load`, neither of which `apply_bench`
+   accepts. Either teach the script an `apply_bench` mode (its own
+   `--root`/`--fsms`/`--mode`/`--secs` invocation and its `RESULT` line) or
+   write a sibling runner; whichever it is, keep the same-source rebuild
+   control arm, because that arm IS row d's bar.
 5. Fill in the results table above; do not edit the bar table to match
    whatever the run produced.
 6. Only after this gate, the FSM identity gate, and the maintainer's
