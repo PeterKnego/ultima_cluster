@@ -206,9 +206,15 @@ groups:
     #     nothing while its peers tick on. So position 0 WITH
     #     uc2_schedule_entries > 0 on the same node is the wipe signature,
     #     and the `schedule_table_reverted` record with position=0 names it.
+    # This is a cluster-wide risk, not one node's: only the LEADER appends
+    # timer frames, so if the node holding no table wins an election, every
+    # scheduled recurrence in the cluster stops — every FSM on every node —
+    # until an operator re-applies. That is why a warning here is worth
+    # paging on rather than watching.
+    #
     # Re-run `uc2ctl schedule apply` against the leader: it appends a fresh
     # frame that every node adopts.
     expr: count(count_values("p", uc2_schedule_table_position)) > 1
     for: 60s
     labels: { severity: warning }
-    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 has not adopted this table: with uc2_schedule_entries > 0 on that same node it was wiped (table kept, position zeroed), with 0 entries it joined below the purge floor or crashed before persisting; re-run `uc2ctl schedule apply` either way" }
+    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 has not adopted this table: with uc2_schedule_entries > 0 on that same node it was wiped (table kept, position zeroed), with 0 entries it joined below the purge floor or crashed before persisting. Only the leader appends timer frames, so if the node at 0 wins an election EVERY scheduled recurrence in the cluster stops; re-run `uc2ctl schedule apply` either way" }

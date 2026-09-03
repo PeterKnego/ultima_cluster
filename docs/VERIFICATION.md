@@ -312,6 +312,16 @@ Two more tests keep those honest rather than adding coverage of their own:
   barrier's behaviour at the bound. The barrier at the bound is covered by
   `uc_service`'s `lag` unit tests and the apply-hop bench, not here.
 
+**Timers and the schedule table, end to end (`2.11.0`).** Not a
+linearizability capstone — the oracle is direct assertion rather than a WGL
+search — but the same kind of evidence, on the same kind of subject: real
+node and service processes over a real instance directory on the cargo target
+volume, with the timer mechanics driven through the public SDK.
+
+| test | file | what it drives |
+|---|---|---|
+| `a_scheduled_timer_fires_at_its_deadline_in_order_and_once`, `the_log_time_seed_survives_a_restart_of_the_same_instance_dir`, `the_timer_bound_holds_client_frames_for_a_pass`, `a_timer_in_flight_at_a_leader_change_fires_late_and_is_delivered_once` (plan 1); `a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick`, `a_restarted_node_resumes_the_table_with_one_catch_up_tick` (plan 2) | `uc_node/tests/timers.rs` | one timer fires once at its deadline in pass order and a cancelled one never fires; the cnc log-time word survives a restart of the same instance dir; more than `TIMERS_PER_PASS` due at one instant holds every client frame for a pass and still fires on time; an instance in flight at a leader change is delivered exactly once — late or on time, never twice, never at diverging positions; an applied schedule table ticks once per occurrence and advances from the tick while its `once` entry parks; and five periods of downtime are caught up by **one** tick with the already-delivered `once` not re-delivered |
+
 One more pin, from the M14d row-d lesson —
 `snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a `SnapshotPolicy`
 shortens a service restart **only together with purge, and only once the live

@@ -599,6 +599,18 @@ pub fn assert_timer_report(
         );
         // No backlog replay: the newest occurrence this fire's own stamp
         // admits IS the one delivered.
+        //
+        // ASSUMES a single log clock, which is what makes this an equality
+        // and not a bound: the fire is stamped `max(deadline, last_stamp)`
+        // where `last_stamp` came from the PREVIOUS leader, so if that
+        // leader's clock ran more than one period ahead of the firing
+        // leader's, the stamp admits an occurrence the firing leader could
+        // not have known about and this convicts an honest tick. In-process
+        // (every node on one host's clock) that cannot happen. A fleet rig
+        // with clock skew above the rule's period could hit it, and the
+        // clause would need `>= Some(deadline_ns)` — weaker, and no longer
+        // able to convict a one-period-at-a-time backlog walk with a period
+        // under the skew.
         assert_eq!(
             rule.latest_at_or_before(rec.time_ns),
             Some(rec.deadline_ns),

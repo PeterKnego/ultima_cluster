@@ -523,9 +523,12 @@ anchor = "2026-01-01T00:00:00Z"
   the clock: `next = fired + period`, or the next day's `at`, or — for a
   `once` — **no next deadline at all: the entry parks in the table as
   delivered** (erratum 3 below). So recurrence never drifts and every node
-  computes the same value. On adoption the
-  first deadline is the first occurrence `≥` the table frame's own
-  `time_ns` — again from the tape, not from a local clock.
+  computes the same value. **As built**, on adoption the first deadline is
+  the LATEST occurrence at or before the log clock the frame is adopted
+  against (the one-tick catch-up), which then fires at the latest occurrence
+  at or before the firing pass's clock — not the first occurrence `≥` the
+  frame's own `time_ns`, as this bullet originally said. Either way it comes
+  from the tape, not from a local clock; see erratum 1 below.
 - Table timers go through the same heap (§4.5) and the same TIMER frame
   with `flags` bit 0 set; the FSM sees them in the same `on_timer` with
   `ev.table = true`. Exactly-once is the `table_last` rule (§4.6). Three

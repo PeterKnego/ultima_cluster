@@ -632,11 +632,12 @@ number asserted from this section's prose alone.
   signature. (A Snowflake-style ID would take its time input from there.)
 
   **As-built erratum (2026-09-03): they did not get their own wire release.**
-  Plan 1 of the time-and-timers spec is implemented on this same branch and
-  **ships in the same unreleased `2.11.0` flag day** as FSM identity: wire
-  `0.6.0` → `0.7.0` and cnc `3.0` → `3.1` carry both features at once, because
-  nothing had shipped speaking `0.7.0` when the second one landed (time spec
-  §9). Everything else in this bullet held: `ApplyCtx` gained `time_ns` and
+  Plans 1 and 2 of the time-and-timers spec are implemented on this same
+  branch and **ship in the same unreleased `2.11.0` flag day** as FSM
+  identity: wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1` carry all THREE
+  features at once — FSM identity, log time and timers, and the replicated
+  schedule table — because nothing had shipped speaking `0.7.0` when the
+  later ones landed (time spec §9). Everything else in this bullet held: `ApplyCtx` gained `time_ns` and
   `term` as fields with no second signature change, exactly what
   `#[non_exhaustive]` was carried here for, and nothing in the identity work
   depended on the timestamps. The `&mut ApplyCtx` seam this spec introduced

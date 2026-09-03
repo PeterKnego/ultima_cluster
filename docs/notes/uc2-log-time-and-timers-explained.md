@@ -400,7 +400,12 @@ about to be fixed.
   joins below the floor and whose table frame was purged runs with no table
   until the next apply. Its `uc2_schedule_table_position` sits at `0` while
   everyone else's holds the adopted position — which is exactly what
-  `Uc2ScheduleTableDiverged` is for. The remedy is to re-apply. The same
+  `Uc2ScheduleTableDiverged` is for. The remedy is to re-apply, and it is not
+  a remedy you can leave for later: only the leader appends timer frames, so
+  **if that node later wins an election, every scheduled recurrence in the
+  cluster stops** — every FSM on every node, not just the new leader's — until
+  an operator re-applies. That is why the alert is worth having rather than a
+  gauge you glance at. The same
   absence shapes what a **wipe** does: a node truncated to 0 with no common
   prefix **keeps** its table armed and zeroes only the position, by the rule
   `ConfigRecord` already uses, because dropping it would leave that node

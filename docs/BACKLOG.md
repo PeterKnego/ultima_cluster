@@ -170,11 +170,19 @@ none a blocker, none scheduled:
   is not expressible — a timezone database is replicated state that must agree
   on every node and across every upgrade. Cron-style rules are a possible
   fourth `kind` byte; the codec has room.
-- **Two alert rules have no `m10_alert_fire.sh` builder** — `Uc2LogTimeFrozen`
-  (plan 1) and `Uc2ScheduleTableDiverged` (plan 2). That script's completeness
-  cross-check names them and exits 1. It is a local gate harness, not a CI
-  job, so nothing is red today, but the M10 gate's row 4 cannot be re-run as
-  written until both builders exist.
+- ~~**Two alert rules have no `m10_alert_fire.sh` builder**~~ — CLOSED in the
+  final fix wave (2026-09-03). `Uc2LogTimeFrozen` and
+  `Uc2ScheduleTableDiverged` now have builders backed by two new
+  `m10_alerts` scenarios (`log_time_frozen`, `schedule_diverged`), both
+  synthetic-state / real-exporter in `identity_drift`'s shape and disclosed
+  by name, so the M10 gate's row 4 can be re-run as written.
+- **`append_schedule_table` duplicates `append_config`'s body deliberately**
+  (ruling R8). `uc_log::Appender` now carries four specialised append bodies;
+  the shared writer that would collapse them touches the hot `append` path,
+  and M14a's inline-ladder lesson is that code added to a hot loop's body
+  costs even on the arms that never execute (9 % at N=1, from codegen alone).
+  So the follow-up is "extract it **with an A/B** against `apply_bench` and
+  the client hop, on rebuilt-same-source controls", not "deduplicate".
 - **`node.toml [schedules]` as a boot-time convenience** stays the door spec
   §10 left open: a per-host section that simply calls the admin op at startup.
   Deliberately not the primary form — it turns a schedule edit into a rolling

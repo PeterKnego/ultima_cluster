@@ -135,7 +135,7 @@ The TOML is a list of `[[schedule]]` tables. Exactly one of `every` / `at` /
 [[schedule]]
 fsm    = "orders"                    # an FSM name from the cluster's [services] names
 id     = 1                           # the timer id this FSM's on_timer will see
-every  = "1h"                        # ns/us/ms/s/m/d suffixes
+every  = "1h"                        # ns/us/ms/s/m/h/d suffixes
 anchor = "2026-01-01T00:00:00Z"      # RFC 3339, UTC
 
 [[schedule]]
@@ -149,7 +149,7 @@ id   = 100
 once = "2026-12-24T18:00:00Z"        # fires once, then parks in the table
 ```
 
-`every` takes an `ns`/`us`/`ms`/`s`/`m`/`d` suffix and must be > 0; `at` takes
+`every` takes an `ns`/`us`/`ms`/`s`/`m`/`h`/`d` suffix and must be > 0; `at` takes
 `HH:MM` or `HH:MM:SS`; `anchor` and `once` take RFC 3339 with a `Z`, and a
 calendrically invalid date (`2026-02-30`) is refused rather than normalised.
 

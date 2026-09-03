@@ -22,10 +22,10 @@ flag day. FSM identity: `SNAP_BEGIN` swapped its `services_declared` bitmask
 for a per-row identity-hash array plus a per-row version array. Log time and
 timers: the log frame header was **relaid** to carry a leader-written
 `time_ns` stamp, with a `TIMER` (5) frame type beside it. The replicated
-schedule table, built on that: a second new frame type, `SCHEDULE_TABLE` (6). Every other datagram
-is byte-identical to 0.6.0. `CURRENT` is documentary and is not itself checked
-on any receive path (see `version.rs`); the two version lines remain
-independent of each other.
+schedule table, built on that: a second new frame type, `SCHEDULE_TABLE`
+(6). Every other datagram is byte-identical to 0.6.0. `CURRENT` is
+documentary and is not itself checked on any receive path (see
+`version.rs`); the two version lines remain independent of each other.
 
 `app_id`, `instance_id`, and the protocol version are checked at every IPC
 entry point. A mismatched `app_id` means the wrong cluster; a changed
