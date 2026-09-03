@@ -1039,7 +1039,7 @@ impl Node {
         let incoming_snapshot_table: ScheduleTableCell = Arc::new(Mutex::new((0, 0, Vec::new())));
         // Plan 3: the snapshot-session table-carry cache — the twin of
         // `config_bytes`, holding whatever table this node has ADOPTED
-        // (`refresh_schedule_bytes`, called wherever the adopted table
+        // (`refresh_schedule_ship`, called wherever the adopted table
         // changes). Read by the sender's `SnapshotSource` closure at ship
         // time, through the commit gate `shippable_schedule`. Seeded with no
         // record — the honest "this node has no table" — and filled by
@@ -1069,7 +1069,7 @@ impl Node {
         // ships whatever config is CURRENT at the moment a peer's NAK opens a
         // session, never a boot-time snapshot of it.
         let src_config_bytes = Arc::clone(&config_bytes);
-        // Plan 3: the same cell `refresh_schedule_bytes` writes — the table
+        // Plan 3: the same cell `refresh_schedule_ship` writes — the table
         // that is CURRENT when a peer's NAK opens the session, never a
         // boot-time snapshot of it.
         let src_schedule_ship = Arc::clone(&schedule_ship);
@@ -2222,7 +2222,7 @@ struct Consensus {
     schedule_refused: Arc<AtomicU64>,
     /// Plan 3 (spec §5): the snapshot-session table-carry cache — the table
     /// this node has ADOPTED, refreshed by
-    /// [`Consensus::refresh_schedule_bytes`] wherever that changes (a table
+    /// [`Consensus::refresh_schedule_ship`] wherever that changes (a table
     /// frame, boot arming, a truncation revert, a fiat install) and read by
     /// the sender's `SnapshotSource` closure at ship time, through the
     /// commit gate [`shippable_schedule`]. The twin of `config_bytes`, and
@@ -4320,7 +4320,7 @@ impl Consensus {
         // above the local commit for the whole catch-up, and a session THIS
         // node serves in that window must pass the table on rather than ship
         // "no table" (which the next joiner could not learn its way out of).
-        self.refresh_schedule_bytes(true);
+        self.refresh_schedule_ship(true);
         crate::obs_event!(
             Info,
             "schedule_table_adopted",
@@ -4369,7 +4369,7 @@ impl Consensus {
         self.schedule_position = position;
         self.schedule_pos_pub.store(position, Ordering::Relaxed);
         self.schedule_entries_pub.store(armed, Ordering::Relaxed);
-        self.refresh_schedule_bytes(false);
+        self.refresh_schedule_ship(false);
         armed
     }
 
@@ -4397,7 +4397,7 @@ impl Consensus {
     /// (see [`ScheduleShip::known_committed`]): `install_table`'s tail passes
     /// the conservative `false`, and `install_snapshot_table` re-runs it with
     /// `true` afterwards.
-    fn refresh_schedule_bytes(&self, known_committed: bool) {
+    fn refresh_schedule_ship(&self, known_committed: bool) {
         let rec = crate::schedule_state::load(&self.schedule_state)
             .ok()
             .flatten();
@@ -4467,7 +4467,7 @@ impl Consensus {
             return;
         };
         let armed = self.install_table(rec.position, &table, self.cnc.log_time_ns());
-        self.refresh_schedule_bytes(false);
+        self.refresh_schedule_ship(false);
         crate::obs_event!(
             Info,
             "schedule_table_adopted",
@@ -4534,7 +4534,7 @@ impl Consensus {
         let table = decode_schedule_table(&reverted.table)
             .unwrap_or_else(|| panic!("corrupt reverted schedule record at {}", reverted.position));
         let armed = self.install_table(reverted.position, &table, self.cnc.log_time_ns());
-        self.refresh_schedule_bytes(false);
+        self.refresh_schedule_ship(false);
         crate::obs_event!(
             Warn,
             "schedule_table_reverted",
@@ -7651,8 +7651,10 @@ fn snapshot_set_for(
 
 /// Plan 3 (review R6): the SHIP-TIME commit gate on the schedule table —
 /// what a snapshot session may carry, given the cache and this node's commit
-/// counter. Returns `SnapshotSet.table`'s `(position, time_ns, bytes)`, with
-/// `(0, 0, [])` meaning "this node has no table to give".
+/// counter. Returns `SnapshotSet.table`'s `(position, time_ns, bytes)`;
+/// `(0, 0, [])` is what this session offers when there is no ANCHORED,
+/// committed, non-empty table to pass on — which is not quite "this node has
+/// no table" (see the position-0 rule below).
 ///
 /// A record is shippable when it is at or below `commit`, or when it came in
 /// by fiat off another session (see [`ScheduleShip::known_committed`]).
@@ -7664,7 +7666,26 @@ fn snapshot_set_for(
 /// that argument fail-SAFE rather than fail-stale, exactly as
 /// `revert_schedule_below`'s does.
 ///
-/// Why the gate lives HERE and not in `refresh_schedule_bytes`: the commit
+/// Review R7 — the POSITION-0 rule. The wire freezes
+/// `(position == 0) <=> (table_len == 0)` (`read_snap_table_body`), and a
+/// session completes only once its table arrives, so a position-0 record
+/// shipped WITH a body is refused on every re-send and STALLS the joiner
+/// instead of failing loudly. Two records have that shape: the `to == 0`
+/// wipe record (`revert_schedule_below`), which keeps its table body at
+/// position 0 so a wiped node keeps ticking, and the canonical no-table
+/// record (`ScheduleRecord::empty`), whose bytes are an 8-byte encoded EMPTY
+/// table rather than zero bytes. Both ship as `(0, 0, [])`, and so does any
+/// record whose bytes will not decode or decode to no entries.
+///
+/// The consequence is deliberate: **a wiped node's kept table does not
+/// propagate by snapshot.** Position 0 means the table is unanchored in the
+/// log — the wipe keep-alive is a LOCAL fiat that keeps this node ticking
+/// until the next table frame, not a cluster fact a joiner should record.
+/// A joiner given it would hold a table no position backs, which is the
+/// divergence `Uc2ScheduleTableDiverged` exists to catch; it gets "no table"
+/// and learns the real one from the next frame.
+///
+/// Why the gate lives HERE and not in `refresh_schedule_ship`: the commit
 /// counter crossing a record's position produces no adoption and therefore no
 /// refresh, so a cache filtered at write time would hold a stale "not yet"
 /// verdict forever. Read time is the only time this question has an answer.
@@ -7677,12 +7698,25 @@ fn shippable_schedule(ship: &Mutex<ScheduleShip>, commit: u64) -> (u64, u64, Vec
     let Some(rec) = g.rec.as_ref() else {
         return none;
     };
-    if g.known_committed || rec.position <= commit {
-        return (rec.position, rec.time_ns, rec.table.clone());
+    let selected = if g.known_committed || rec.position <= commit {
+        rec
+    } else {
+        match rec.prev.as_deref().filter(|p| p.position <= commit) {
+            Some(p) => p,
+            None => return none,
+        }
+    };
+    // The position-0 rule, and its companion: a body the wire would carry
+    // must be a table with entries. An empty (or undecodable) table means
+    // the same thing as no table, and `(0, 0, [])` is how the wire says it.
+    if selected.position == 0 {
+        return none;
     }
-    match rec.prev.as_deref().filter(|p| p.position <= commit) {
-        Some(p) => (p.position, p.time_ns, p.table.clone()),
-        None => none,
+    match decode_schedule_table(&selected.table) {
+        Some(t) if !t.entries.is_empty() => {
+            (selected.position, selected.time_ns, selected.table.clone())
+        }
+        _ => none,
     }
 }
 
@@ -9882,9 +9916,10 @@ mod tests {
         );
         assert_eq!(
             shippable_schedule(&h.cons.schedule_ship, 0),
-            (0, 0, ScheduleRecord::empty().table),
-            "and the ship cache says 'no table' onward — position 0 over the \
-             canonical empty encoding, which is what a stored record holds"
+            (0, 0, Vec::new()),
+            "and the ship cache says 'no table' onward as the WIRE says it — \
+             the stored record holds position 0 over the canonical empty \
+             encoding, and `(position == 0) <=> (table_len == 0)` (R7)"
         );
     }
 
@@ -9902,16 +9937,35 @@ mod tests {
     /// stamped into the cache would never be revisited.
     #[test]
     fn the_snapshot_session_ships_only_a_committed_schedule_table() {
-        let tbl = |b: u8| vec![b, b, b];
+        // Real encoded one-entry tables — distinguishable by their hash, and
+        // decodable, which R7's ship rule now requires of anything that goes
+        // on the wire.
+        let tbl = |hash: u64| {
+            let mut out = Vec::new();
+            encode_schedule_table(
+                &ScheduleTable {
+                    entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                        identity_hash: hash,
+                        timer_id: 1,
+                        rule: ScheduleRule::Every {
+                            period_ns: 100,
+                            anchor_ns: 0,
+                        },
+                    }],
+                },
+                &mut out,
+            );
+            out
+        };
         let with_prev = |known_committed: bool| ScheduleShip {
             rec: Some(ScheduleRecord {
                 position: 8192,
                 time_ns: 77,
-                table: tbl(0xAA),
+                table: tbl(0xAA_u64),
                 prev: Some(Box::new(ScheduleRecord {
                     position: 4096,
                     time_ns: 11,
-                    table: tbl(0xBB),
+                    table: tbl(0xBB_u64),
                     prev: None,
                 })),
             }),
@@ -9921,13 +9975,13 @@ mod tests {
         // Appended but not committed: the predecessor ships instead.
         assert_eq!(
             shippable_schedule(&Mutex::new(with_prev(false)), 6016),
-            (4096, 11, tbl(0xBB)),
+            (4096, 11, tbl(0xBB_u64)),
             "an uncommitted record falls back to its committed predecessor"
         );
         // Committed: the record itself ships.
         assert_eq!(
             shippable_schedule(&Mutex::new(with_prev(false)), 8192),
-            (8192, 77, tbl(0xAA)),
+            (8192, 77, tbl(0xAA_u64)),
             "commit at the record's position is committed ENOUGH (positions \
              are frame-END offsets, so `<=` is the right comparison)"
         );
@@ -9939,7 +9993,7 @@ mod tests {
                     rec: Some(ScheduleRecord {
                         position: 8192,
                         time_ns: 77,
-                        table: tbl(0xAA),
+                        table: tbl(0xAA_u64),
                         prev: None,
                     }),
                     known_committed: false,
@@ -9953,7 +10007,7 @@ mod tests {
         // commit counter, and during catch-up it sits above this node's.
         assert_eq!(
             shippable_schedule(&Mutex::new(with_prev(true)), 6016),
-            (8192, 77, tbl(0xAA)),
+            (8192, 77, tbl(0xAA_u64)),
             "a fiat-installed record ships whatever this node's commit reads"
         );
         // And a node with no record at all gives nothing.
@@ -9966,6 +10020,79 @@ mod tests {
                 u64::MAX
             ),
             (0, 0, Vec::new()),
+        );
+        // A `prev` that is ALSO above commit (the fail-SAFE filter, which
+        // plan 2's single-in-flight rule says cannot happen): nothing to give
+        // rather than a stale position.
+        assert_eq!(
+            shippable_schedule(
+                &Mutex::new(ScheduleShip {
+                    rec: Some(ScheduleRecord {
+                        position: 8192,
+                        time_ns: 77,
+                        table: tbl(0xAA_u64),
+                        prev: Some(Box::new(ScheduleRecord {
+                            position: 6016,
+                            time_ns: 11,
+                            table: tbl(0xBB_u64),
+                            prev: None,
+                        })),
+                    }),
+                    known_committed: false,
+                }),
+                4096
+            ),
+            (0, 0, Vec::new()),
+            "a predecessor above commit is discarded, not shipped"
+        );
+
+        // ---- review R7: a POSITION-0 record ships as "no table" ----
+        //
+        // `read_snap_table_body`'s frozen rule is
+        // `(position == 0) <=> (table_len == 0)`, so a position-0 record with
+        // a body would be REFUSED by the receiver — and since a session
+        // completes only once its table arrives, every re-send would be
+        // refused too and the joiner would stall rather than fail loudly.
+        // Two such records exist. First, the `to == 0` wipe record: it keeps
+        // the table body by fiat (so a wiped node keeps ticking) at position
+        // 0. That local keep-alive does NOT propagate — position 0 means the
+        // table is unanchored in the log, and a joiner given it would record
+        // a table no position backs.
+        assert_eq!(
+            shippable_schedule(
+                &Mutex::new(ScheduleShip {
+                    rec: Some(ScheduleRecord {
+                        position: 0,
+                        time_ns: 5,
+                        table: tbl(0xABCD_u64),
+                        prev: None,
+                    }),
+                    known_committed: false,
+                }),
+                u64::MAX
+            ),
+            (0, 0, Vec::new()),
+            "the wipe record's kept table is local-only: position 0 ships as \
+             'no table', never as a body the wire refuses"
+        );
+        // Second, a fiat/revert "no table" record: position 0 over the
+        // CANONICAL EMPTY encoding (8 bytes), which is not zero bytes either.
+        assert_eq!(
+            shippable_schedule(
+                &Mutex::new(ScheduleShip {
+                    rec: Some(ScheduleRecord {
+                        position: 0,
+                        time_ns: 0,
+                        table: ScheduleRecord::empty().table,
+                        prev: None,
+                    }),
+                    known_committed: false,
+                }),
+                u64::MAX
+            ),
+            (0, 0, Vec::new()),
+            "and so does the canonical no-table record — the joiner one hop \
+             past `a_leader_without_a_table_ships_none_…` holds exactly this"
         );
     }
 
@@ -11789,14 +11916,26 @@ mod tests {
         let services = crate::services::ServicesConfig::from_names(&["a", "b"], None).unwrap();
         let config_bytes = Mutex::new(vec![0xC0, 0xFF, 0xEE]);
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
-        // A committed record (the harness cnc's commit counter is 0, so the
-        // fiat exemption is what makes it shippable here — the gate itself is
-        // adjudicated by `the_snapshot_session_ships_only_a_committed_schedule_table`).
+        // A committed record over a real one-entry table (the harness cnc's
+        // commit counter is 0, so the fiat exemption is what makes it
+        // shippable here; the gate and R7's ship rule are adjudicated by
+        // `the_snapshot_session_ships_only_a_committed_schedule_table`).
+        let mut table_bytes = Vec::new();
+        encode_schedule_table(
+            &ScheduleTable {
+                entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                    identity_hash: 0x5CED,
+                    timer_id: 1,
+                    rule: ScheduleRule::Once { at_ns: 9 },
+                }],
+            },
+            &mut table_bytes,
+        );
         let schedule_ship = Mutex::new(ScheduleShip {
             rec: Some(ScheduleRecord {
                 position: 6016,
                 time_ns: 77,
-                table: vec![0x5C, 0xED],
+                table: table_bytes.clone(),
                 prev: None,
             }),
             known_committed: true,
@@ -11867,7 +12006,7 @@ mod tests {
         );
         assert_eq!(
             set.table,
-            (6016, 77, vec![0x5C, 0xED]),
+            (6016, 77, table_bytes),
             "and so does the CURRENT schedule table (plan 3)"
         );
         assert_eq!(
