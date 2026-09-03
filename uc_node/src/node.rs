@@ -3837,7 +3837,19 @@ impl Consensus {
         let mut hold = true;
         for _ in 0..TIMERS_PER_PASS {
             // earliest due instance across all rows — global deadline order,
-            // so two rows' timers never clamp each other into "late"
+            // so two rows' timers never clamp each other into "late".
+            //
+            // Plan 2: the order is by the ARMED deadline, not by the deadline
+            // a table head will actually fire at (`fire_dl` below, which the
+            // one-tick catch-up may move forward). Two rows both in backlog
+            // with different periods can therefore append their catch-up
+            // ticks out of fired-deadline order; the frame stamps stay
+            // monotonic either way (the appender clamps to `last_stamp`) and
+            // the later frame is simply counted late, which is honest. The
+            // alternative — sorting by `fire_dl` — means computing it for
+            // every row on every iteration of this loop, and the loop body is
+            // codegen-sensitive (M14a: an inline wait ladder cost 9 % on a
+            // path that never ran).
             // (row, id, deadline, is_table_entry)
             let mut best: Option<(usize, u64, u64, bool)> = None;
             for (row, slot) in self.timers.iter_mut().enumerate() {
@@ -4234,20 +4246,22 @@ impl Consensus {
         );
     }
 
-    /// Plan 2 (spec §5): persist-revert-BEFORE-truncate for the schedule
-    /// table — the twin of the `ConfigRecord` revert in `Action::Truncate`,
-    /// and called from the same place for the same reason. If this
-    /// truncation drops the table frame this node adopted (`to` lands
-    /// strictly below its recorded position), the durable record must not
-    /// survive claiming a position the truncated log no longer backs: a
-    /// later table frame landing at or below that position would be ignored
-    /// as a re-observation and this node alone would run a table the cluster
+    /// Plan 2 (spec §5): persist-revert-BEFORE-the-cut for the schedule
+    /// table — the twin of the `ConfigRecord` revert, run from BOTH cut
+    /// paths: `Action::Truncate` (reconcile + wipe-and-rejoin) and
+    /// `Action::BecomeLeader`'s leader-open `ArchiveCmd::Collapse`. If the
+    /// cut drops the table frame this node adopted (`to` lands strictly
+    /// below its recorded position), the durable record must not survive
+    /// claiming a position no surviving byte backs: a later table frame
+    /// landing at or below that position would be ignored as a
+    /// re-observation, and this node alone would run a table the cluster
     /// does not have.
     ///
     /// Reverts one level (`ScheduleRecord::reverted`), persists, and re-arms
     /// every row from the reverted table — or from an EMPTY set when there
     /// is no predecessor, which is what disarms a row whose only entries came
-    /// from the dropped frame.
+    /// from the dropped frame. Idempotent and cheap when nothing is at risk:
+    /// one cached `load` and an early return unless `to < position`.
     fn revert_schedule_below(&mut self, to: u64) {
         let Ok(Some(rec)) = crate::schedule_state::load(&self.schedule_state) else {
             return;
@@ -5845,6 +5859,21 @@ impl Consensus {
                 self.state
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
+                // Plan 2 (spec §5), review round 2: the collapse is a
+                // truncation too, so it gets the SAME
+                // persist-revert-before-the-cut step as `Action::Truncate`.
+                // `base` is `ElectionSm::durable` sampled in an EARLIER duty
+                // cycle than the vote drain that produced this action (see
+                // `ArchiveCmd::Collapse`'s doc), so the archive may have
+                // fsynced a block since — including a table frame THIS node
+                // appended as a previous leader and recorded locally. Such a
+                // frame sits above `base` and the collapse drops it, which
+                // without this would leave `schedule_position` claiming a
+                // position no surviving byte backs. Reverting is safe by the
+                // election's own guarantee: an elected leader's durable is at
+                // or above every committed position, so everything above
+                // `base` is uncommitted.
+                self.revert_schedule_below(base);
                 self.term_handle.store(term, Ordering::Release);
                 // Explicit single-writer handoff (review hardening): the gate
                 // is closed across the collapse so a UDP-reordered straggler that
@@ -6023,14 +6052,16 @@ impl Consensus {
                         .expect("config persist fail-stop");
                 }
                 // Plan 2 (spec §5): the SAME persist-revert-before-truncate
-                // step for the schedule-table record. This is the only place
-                // the node cuts bytes BELOW its own durable frontier — the
-                // leader-open `ArchiveCmd::Collapse` only drops the volatile
-                // tail above `base`, and a locally-appended table frame is
-                // recorded (hence at or below `base`) before this node could
-                // ever collapse — so hooking `Action::Truncate` covers every
-                // cut that can drop an adopted table frame, wipe-and-rejoin
-                // (`to == 0`) included.
+                // step for the schedule-table record. The invariant, stated
+                // once for both cuts: EVERY path that can drop an adopted
+                // table frame reverts the record first — this one (reconcile
+                // truncation and wipe-and-rejoin, `to == 0`) and the
+                // leader-open `ArchiveCmd::Collapse` in `Action::BecomeLeader`
+                // (which can also cut below an adopted position, since `base`
+                // is a durable value sampled an earlier duty cycle than the
+                // action). `ArchiveCmd::AdoptFloor` is not such a path: it
+                // moves the archive floor UP under an installed snapshot and
+                // drops no frame the node holds durably.
                 self.revert_schedule_below(to);
                 // Pause intake and record the emit→ack bracket (the SM allocated
                 // `epoch`; we transport it). The SM has already latched the data
@@ -7708,6 +7739,66 @@ mod tests {
             _trunc_rx: trunc_rx,
             _dir: dir,
         }
+    }
+
+    /// Plan 2 (review round 2): the leader-open COLLAPSE is a truncation
+    /// too. `base` is `ElectionSm::durable` sampled an earlier duty cycle
+    /// than the vote drain that elects us, so the archive can have recorded a
+    /// table frame THIS node appended as a previous leader — a frame above
+    /// `base` that the collapse drops. Without a revert `schedule_position`
+    /// would keep claiming it, and the next table frame (landing at or below
+    /// that position) would be ignored on this node alone.
+    ///
+    /// The harness's `base` is 6016, so a record at 8192 is above the cut and
+    /// its predecessor at 4096 is below it: the arm must promote the
+    /// predecessor. (The no-predecessor case reverts to
+    /// `ScheduleRecord::empty()`, covered by `schedule_state`'s own unit
+    /// test.)
+    #[test]
+    fn a_leader_open_collapse_below_the_adopted_table_reverts_the_record() {
+        let mut h = harness();
+        let bytes = ScheduleRecord::empty().table; // a decodable, empty table
+        let rec = ScheduleRecord {
+            position: 8192,
+            time_ns: 77,
+            table: bytes.clone(),
+            prev: Some(Box::new(ScheduleRecord {
+                position: 4096,
+                time_ns: 11,
+                table: bytes,
+                prev: None,
+            })),
+        };
+        crate::schedule_state::store(&h.cons.schedule_state, &rec).unwrap();
+        h.cons.schedule_position = 8192;
+        h.cons.schedule_pos_pub.store(8192, Ordering::Relaxed);
+
+        // Win the election: Tick -> candidate term 3, one grant -> BecomeLeader
+        // with base = durable = 6016 < 8192.
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
+
+        assert_eq!(
+            h.cons.schedule_position, 4096,
+            "the frame above base is gone; its predecessor is adopted"
+        );
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 4096);
+        let back = crate::schedule_state::load(&h.cons.schedule_state)
+            .unwrap()
+            .expect("a record is still stored");
+        assert_eq!(back.position, 4096, "persisted, not just in memory");
+        assert_eq!(back.prev, None, "the one-level history is exhausted");
+        // The collapse itself still went out, unchanged.
+        h.complete_leader_open();
+        assert!(h.cons.leader_flag.load(Ordering::Acquire));
+        assert_eq!(
+            h.cons.schedule_position, 4096,
+            "finishing the open does not resurrect the cut frame"
+        );
     }
 
     /// C-1 regression: a DUPLICATE term map delivered AFTER `Action::Truncate`

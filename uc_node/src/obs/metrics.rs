@@ -469,7 +469,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_counter(
         out,
         "uc2_schedule_apply_refused_total",
-        "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). A retry answered to a follower is not counted.",
+        "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). Retries are NOT counted: neither the one a follower answers (the staged file is node-local, so the request is never forwarded) nor the one the leader answers while the previous table frame is still above commit (single-in-flight).",
         s.schedule_apply_refused.load(Ordering::Relaxed),
     );
     push_gauge(
