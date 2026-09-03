@@ -36,15 +36,15 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
-    DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    DGRAM_KIND_SNAP_TABLE, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
     SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V3, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
-    SnapNakBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
-    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
-    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
-    read_status_body, read_term_map_body, read_vote_body, write_append_position_body,
-    write_datagram_header, write_nak_body, write_snap_begin_body, write_snap_nak_body,
-    write_status_body,
+    SnapNakBody, SnapTableBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
+    read_append_position_body, read_config_proposal_body, read_config_reply_body,
+    read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
+    read_snap_begin_body, read_snap_nak_body, read_snap_table_body, read_status_body,
+    read_term_map_body, read_vote_body, write_append_position_body, write_datagram_header,
+    write_nak_body, write_snap_begin_body, write_snap_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -659,13 +659,38 @@ pub struct FollowerStats {
     /// body carrying `layout != SNAP_BEGIN_LAYOUT_V3`), which
     /// `snap_refused_legacy_peer` deliberately folds together.
     pub snap_begin_undecodable: AtomicU64,
+    /// Time-and-timers plan 3: a `SNAP_TABLE` that belongs to no session we
+    /// are running — no intake open, a different peer, or a different
+    /// `session` id. Dropped: applying it would install a foreign (or forged)
+    /// schedule table into the intake that happens to be open.
+    ///
+    /// A table for the session we JUST completed is not counted here — the
+    /// leader re-sends BEGIN+TABLE until its `SNAP_DONE` lands, so those
+    /// duplicates are expected traffic and counting them would make this
+    /// counter measure the resend cadence instead of the anomaly (the same
+    /// distinction `snap_begin_undecodable` draws against
+    /// `snap_refused_legacy_peer`). A rising count means a leader and this
+    /// node disagree about which session is live — or someone is injecting.
+    pub snap_table_stray: AtomicU64,
 }
 
-/// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
-/// wires in — the position cell for `ArchiveCmd::AdoptFloor`, the config cell
-/// for `adopt_snapshot_config`. Named to keep `set_snapshot_intake`'s signature
-/// under clippy's type-complexity threshold.
-pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>);
+/// M7 Task 6 / time-and-timers plan 3: the `(position, config, table)`
+/// companion cells `set_snapshot_intake` wires in — the position cell for
+/// `ArchiveCmd::AdoptFloor`, the config cell for `adopt_snapshot_config`, and
+/// the table cell (`(position, time_ns, encoded bytes)`; `(0, 0, vec![])` =
+/// the leader shipped no schedule table) for the install handler's table
+/// adoption. Named to keep `set_snapshot_intake`'s signature under clippy's
+/// type-complexity threshold.
+///
+/// Both mutex cells are written BEFORE the position cell's `Release` store,
+/// and the reader samples the position `Acquire` first — so a floor it can
+/// see implies both cells hold THIS session's bytes.
+pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>, ScheduleTableCell);
+
+/// The schedule-table half of [`IncomingSnapshotSignal`]: `(position,
+/// time_ns, encoded bytes)` of the table the completed session carried.
+/// Named for the same reason the tuple above is — it is a field type too.
+pub type ScheduleTableCell = Arc<Mutex<(u64, u64, Vec<u8>)>>;
 
 /// M14c: the identity of the last INBOUND session that completed here — what
 /// [`FollowerReceiver::snap_last_done`] re-acks a straggling `SNAP_BEGIN`
@@ -730,6 +755,14 @@ struct SnapIntake {
     /// Forwarded to `incoming_snapshot_config` on completion, alongside
     /// `incoming_snapshot_pos`, for the consensus agent's install handler.
     config: Vec<u8>,
+    /// Time-and-timers plan 3: the schedule table this session carries, from
+    /// its own `SNAP_TABLE` datagram — `None` until it lands. The session does
+    /// NOT complete while this is `None`: a joiner that adopted the floor
+    /// without the table would run with no timers at all and no way to learn
+    /// of them (the adopting frame is below the purged floor). The leader
+    /// re-sends BEGIN+TABLE every 20 ms until our `SNAP_DONE`, so a lost
+    /// TABLE costs one cadence, never the session.
+    table: Option<(u64, u64, Vec<u8>)>,
     /// M14c2 (T10a): when this intake last saw evidence the transfer is LIVE —
     /// a chunk that landed, or a new artifact's `SNAP_BEGIN`. The
     /// [`SNAP_INTAKE_TIMEOUT_NS`] deadline is measured from here, so an
@@ -842,6 +875,12 @@ pub struct FollowerReceiver {
     /// guaranteed to see this cell's matching content — the mutex lock/unlock
     /// pair is itself a release/acquire fence). `None` in unit tests.
     incoming_snapshot_config: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Time-and-timers plan 3: the second companion cell for
+    /// `incoming_snapshot_pos` — the schedule table (`(position, time_ns,
+    /// encoded bytes)`) the SAME completed transfer carried, on the same
+    /// publish-before-the-position rule as `incoming_snapshot_config`. `None`
+    /// in unit tests.
+    incoming_snapshot_table: Option<ScheduleTableCell>,
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
@@ -1066,6 +1105,7 @@ impl FollowerReceiver {
             snap_last_done: None,
             incoming_snapshot_pos: None,
             incoming_snapshot_config: None,
+            incoming_snapshot_table: None,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
             snap_adopt_pending: None,
@@ -1200,9 +1240,10 @@ impl FollowerReceiver {
         self.snap_dir = Some(snap_root);
         self.own_identity = own_identity;
         self.own_versions = Some(own_versions);
-        if let Some((pos, config)) = incoming {
+        if let Some((pos, config, table)) = incoming {
             self.incoming_snapshot_pos = Some(pos);
             self.incoming_snapshot_config = Some(config);
+            self.incoming_snapshot_table = Some(table);
         }
     }
 
@@ -1872,6 +1913,17 @@ impl FollowerReceiver {
             DGRAM_KIND_SNAP_CHUNK => {
                 self.snap_chunk(from, h.position, &d[DATAGRAM_HEADER_LEN..]);
             }
+            // Time-and-timers plan 3: the schedule table of the session this
+            // node is receiving — its own datagram, sent after every
+            // `SNAP_BEGIN`, because `SNAP_BEGIN` has no room for it and a
+            // below-floor joiner cannot read the adopting frame out of the
+            // purged log. An undecodable body is simply dropped (total
+            // decoder, no counter): the leader re-sends on its own cadence.
+            DGRAM_KIND_SNAP_TABLE => {
+                if let Some(b) = read_snap_table_body(&d[DATAGRAM_HEADER_LEN..]) {
+                    self.snap_table(from, b);
+                }
+            }
             // OUTBOUND session control (this node is the leader shipping a
             // snapshot): demux the peer's repair NAK / completion to our sender.
             DGRAM_KIND_SNAP_NAK if self.sender_route.is_some() => {
@@ -2087,11 +2139,60 @@ impl FollowerReceiver {
             got: Rebuilt::new(0),
             nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
             config: b.config,
+            table: None,
             last_chunk_ns: now,
             last_publish_try_ns: None,
             write_failure_logged: false,
         });
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Time-and-timers plan 3: record this session's schedule table, then
+    /// re-run the completion check — the TABLE can arrive after the session's
+    /// last chunk, and nothing else would fire afterwards.
+    ///
+    /// Accepted only for the OPEN intake, and only from its own peer under its
+    /// own `session` id; anything else is dropped and counted
+    /// ([`FollowerStats::snap_table_stray`]) rather than applied, since an
+    /// intake that adopts a foreign table installs foreign timer state. Two
+    /// benign duplicates are deliberately NOT strays: a second TABLE for the
+    /// intake that already has one (the 20 ms BEGIN+TABLE cadence, still
+    /// running while our chunks land) and one for the session we just
+    /// completed (the same cadence, still running until our `SNAP_DONE`
+    /// arrives) — counting either would turn this counter into a measure of
+    /// the resend rate.
+    fn snap_table(&mut self, from: SocketAddr, b: SnapTableBody) {
+        if self.snap_dir.is_none() {
+            return; // this node does not receive snapshots
+        }
+        // `now_ns()` up front: the completion re-drive below needs it, and it
+        // cannot be taken under the `&mut self.snap_intake` borrow.
+        let now = self.now_ns();
+        if let Some(intake) = self.snap_intake.as_mut()
+            && intake.peer == from
+            && intake.session == b.session
+        {
+            if intake.table.is_some() {
+                return; // duplicate: this session's table is already in
+            }
+            intake.table = Some((b.position, b.time_ns, b.table));
+            // The last chunk may have landed BEFORE this table did, in which
+            // case `snap_publish_complete_parts` already ran and
+            // `snap_complete` withheld. Re-run it here: every part it finds is
+            // `done` (the walk skips them), so on the ordinary ordering this
+            // is a no-op, and on the late-table ordering it is what completes
+            // the session.
+            self.snap_publish_complete_parts(now);
+            return;
+        }
+        if self
+            .snap_last_done
+            .as_ref()
+            .is_some_and(|d| d.peer == from && d.session == b.session)
+        {
+            return; // a re-send for the session we already completed
+        }
+        self.stats.snap_table_stray.fetch_add(1, Ordering::Relaxed);
     }
 
     /// M14c: drop the in-flight intake, if any, deleting its `.part` files.
@@ -2277,6 +2378,16 @@ impl FollowerReceiver {
     /// positions, which is exactly the node floor the leader shipped from, so
     /// every FSM's own artifact sits at or above it.
     fn snap_complete(&mut self) {
+        // Time-and-timers plan 3: a session is COMPLETE only once its schedule
+        // table has landed too. Checked before the `take()` — the intake must
+        // stay open, so the next chunk, the duty cycle, or the TABLE's own
+        // arrival re-runs this. The leader re-sends BEGIN+TABLE every
+        // `SNAP_BEGIN_RESEND_NS` until our `SNAP_DONE`, so a lost TABLE is
+        // retried on that cadence and this can never wedge: withholding the
+        // ack is exactly what keeps the retries coming.
+        if self.snap_intake.as_ref().is_some_and(|i| i.table.is_none()) {
+            return;
+        }
         let Some(intake) = self.snap_intake.take() else {
             return;
         };
@@ -2316,11 +2427,18 @@ impl FollowerReceiver {
                 .collect(),
         });
         self.snap_send_done(intake.peer, &ack);
-        // M7 Task 6: publish the carried config BEFORE the position signal — the
-        // consensus agent's install handler samples the position (Acquire) and
-        // only then reads this cell, so publishing it first (the mutex itself is
-        // a release fence) guarantees it sees THIS transfer's bytes, never a
-        // stale or absent value from a prior/no session.
+        // M7 Task 6 / plan 3: publish the carried cells BEFORE the position
+        // signal — the consensus agent's install handler samples the position
+        // (Acquire) and only then reads them, so publishing them first (each
+        // mutex is itself a release fence) guarantees it sees THIS transfer's
+        // bytes, never a stale or absent value from a prior/no session. Order
+        // among the cells themselves: TABLE, then config, then the floor.
+        if let Some(cell) = &self.incoming_snapshot_table {
+            // `table` is `Some` here — `snap_complete` returned above while it
+            // was `None` — so the cell never receives a placeholder over a
+            // real table. `(0, 0, vec![])` means the LEADER had none.
+            *cell.lock().unwrap() = intake.table.clone().unwrap_or((0, 0, Vec::new()));
+        }
         if let Some(cell) = &self.incoming_snapshot_config {
             *cell.lock().unwrap() = intake.config.clone();
         }
@@ -2699,8 +2817,8 @@ mod tests {
     use uc_protocol::v2::datagram::{
         DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
         DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader,
-        NAK_BODY_LEN, STATUS_BODY_LEN, read_nak_body, read_status_body, write_datagram_header,
-        write_nak_body, write_status_body,
+        NAK_BODY_LEN, SNAP_TABLE_FIXED_LEN, STATUS_BODY_LEN, read_nak_body, read_status_body,
+        write_datagram_header, write_nak_body, write_snap_table_body, write_status_body,
     };
 
     const TERM: u32 = 9;
@@ -5148,6 +5266,15 @@ mod tests {
             },
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
+        // Plan 3: the leader sends its schedule table after every BEGIN, and
+        // the session does not complete without one — this one is sealed on
+        // the same pairwise channel as everything else in this test.
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            &snap_table_wire(7, 4096, 5, b"tbl"),
+        );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 32, &[0xEEu8; 32]);
 
         let (nak_wire, nak_body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_NAK);
@@ -5563,6 +5690,14 @@ mod tests {
         let begin = snap_begin_wire(21, 0, 4096, 64, 0b1);
 
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
+        // Plan 3: the leader sends its schedule table after every BEGIN, and
+        // the session does not complete without one.
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            &snap_table_wire(21, 0, 0, b""),
+        );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 0, &[0xABu8; 64]);
         let (_, first) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
         assert_eq!(read_snap_begin_body(&first).unwrap().session, 21);
@@ -5730,6 +5865,170 @@ mod tests {
             "the new .part"
         );
         assert!(!stale.exists(), "the superseded .part must not be orphaned");
+    }
+
+    // ---- time-and-timers plan 3: the session's SNAP_TABLE ----
+
+    /// A `SNAP_TABLE` body as the leader ships it.
+    fn snap_table_wire(session: u32, position: u64, time_ns: u64, table: &[u8]) -> Vec<u8> {
+        let mut body = vec![0u8; SNAP_TABLE_FIXED_LEN + table.len()];
+        write_snap_table_body(
+            &mut body,
+            &SnapTableBody {
+                session,
+                position,
+                time_ns,
+                table: table.to_vec(),
+            },
+        );
+        body
+    }
+
+    /// Drive the receiver for a bounded window and count the `SNAP_DONE`s it
+    /// sent. Bounded rather than `FakeLeader::recv`'s 5 s wait-for-one: the
+    /// first assertion here is that NO ack goes out, which a blocking read
+    /// can only prove by timing out.
+    fn pump_and_count_dones(r: &mut FollowerReceiver, leader: &FakeLeader) -> usize {
+        let mut n = 0;
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            r.do_work();
+            let mut buf = [0u8; 2048];
+            while let Some((len, _)) = leader.sock.recv_from(&mut buf).unwrap() {
+                if len >= DATAGRAM_HEADER_LEN
+                    && read_datagram_header(&buf).unwrap().kind == DGRAM_KIND_SNAP_DONE
+                {
+                    n += 1;
+                }
+            }
+            std::thread::yield_now();
+        }
+        n
+    }
+
+    /// Time-and-timers plan 3: a below-floor joiner installs the leader's
+    /// schedule table off the same session that carries the snapshot set —
+    /// it cannot read the adopting frame out of the purged log. The table is
+    /// its own datagram (`SNAP_BEGIN` has no room), so the session is only
+    /// COMPLETE once both halves have landed: the ack is withheld until the
+    /// table arrives, and the table cell is published BEFORE the floor signal
+    /// the consensus agent's install handler keys on.
+    #[test]
+    fn a_session_does_not_complete_until_its_snap_table_arrives_and_publishes_it_first() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        let pos_cell = Arc::new(AtomicU64::new(0));
+        let config_cell = Arc::new(Mutex::new(Vec::new()));
+        let table_cell = Arc::new(Mutex::new((0u64, 0u64, Vec::new())));
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            Some((
+                Arc::clone(&pos_cell),
+                Arc::clone(&config_cell),
+                Arc::clone(&table_cell),
+            )),
+        );
+        let st = r.stats();
+        let to = r.local_addr();
+
+        // A one-artifact session whose every byte lands: pre-change this is
+        // exactly the point `snap_complete` fired.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(7, 0, 4096, 64, 0b1),
+        );
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0xABu8; 64]);
+        assert_eq!(
+            pump_and_count_dones(&mut r, &leader),
+            0,
+            "the session must not be acked before its table arrives"
+        );
+        assert_eq!(
+            pos_cell.load(Relaxed),
+            0,
+            "and no floor may be signalled — the install handler would run \
+             without the table"
+        );
+        assert!(
+            dir.path().join("0").join("snap-4096.ultsnap").exists(),
+            "the artifact itself is still renamed; only COMPLETION is withheld"
+        );
+
+        // A table naming a session we know nothing about is dropped and
+        // counted — never applied to whatever intake happens to be open.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            TERM,
+            &snap_table_wire(8, 4096, 99, b"other"),
+        );
+        assert_eq!(pump_and_count_dones(&mut r, &leader), 0, "still withheld");
+        assert_eq!(
+            st.snap_table_stray.load(Relaxed),
+            1,
+            "a mismatched session is counted, not silently swallowed"
+        );
+        assert_eq!(pos_cell.load(Relaxed), 0);
+        assert_eq!(*table_cell.lock().unwrap(), (0, 0, Vec::new()));
+
+        // The session's own table: it completes, and both cells carry it.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            TERM,
+            &snap_table_wire(7, 4096, 99, b"tbl"),
+        );
+        assert_eq!(
+            pump_and_count_dones(&mut r, &leader),
+            1,
+            "the table completed the session"
+        );
+        assert_eq!(
+            pos_cell.load(Relaxed),
+            4096,
+            "the floor is signalled once, on the complete session"
+        );
+        assert_eq!(
+            *table_cell.lock().unwrap(),
+            (4096, 99, b"tbl".to_vec()),
+            "the table cell carries this session's bytes"
+        );
+        // ORDER, by construction: `snap_complete` writes the table cell, then
+        // the config cell, then `store(Release)`s the floor — and the install
+        // handler samples the floor (Acquire) before reading either mutex, so
+        // a floor it can see implies both cells are this session's. Asserting
+        // the two after the fact (floor set AND table set) is what a
+        // single-threaded test can observe; the ordering itself is pinned by
+        // the code and its comment.
+        assert_eq!(st.snap_table_stray.load(Relaxed), 1, "no new stray");
+
+        // The leader re-sends BEGIN+TABLE until its session closes, so the
+        // duplicate must be inert — not a second ack, not a stray.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_TABLE,
+            0,
+            TERM,
+            &snap_table_wire(7, 4096, 99, b"tbl"),
+        );
+        assert_eq!(
+            pump_and_count_dones(&mut r, &leader),
+            0,
+            "a re-sent table must not re-ack a closed session"
+        );
+        assert_eq!(st.snap_table_stray.load(Relaxed), 1, "and is not a stray");
+        assert_eq!(*table_cell.lock().unwrap(), (4096, 99, b"tbl".to_vec()));
+        assert_eq!(pos_cell.load(Relaxed), 4096);
     }
 
     // ---- M14c2 (T10a): the intake's timeout, latches and re-drive cadence ----

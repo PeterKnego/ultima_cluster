@@ -1132,6 +1132,11 @@ impl Node {
             Some((
                 Arc::clone(&incoming_snapshot),
                 Arc::clone(&incoming_snapshot_config),
+                // Time-and-timers plan 3: the installed session's schedule
+                // table. Wired but not yet read — plan 3 Task 3 consumes it in
+                // the consensus agent's install handler, alongside the config
+                // cell above.
+                Arc::new(Mutex::new((0, 0, Vec::new()))),
             )),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
@@ -7423,6 +7428,12 @@ fn snapshot_set_for(
         identity,
         version,
         config: config_bytes.lock().unwrap().clone(),
+        // Time-and-timers plan 3: the schedule table this session ships.
+        // Empty here — plan 3 Task 3 reads the node's adopted table into it;
+        // `(0, 0, vec![])` is the honest "this leader has no table" value the
+        // wire already carries, so shipping it until then is correct, not a
+        // placeholder the receiver has to special-case.
+        table: (0, 0, Vec::new()),
         artifacts,
     })
 }

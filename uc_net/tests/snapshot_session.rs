@@ -161,6 +161,7 @@ fn build_with_versions(faults: FaultConfig, names: &[&str], versions: [u32; 8]) 
             identity,
             version: versions,
             config: Vec::new(),
+            table: (0, 0, Vec::new()),
             artifacts: artifacts.clone(),
         })
     });
