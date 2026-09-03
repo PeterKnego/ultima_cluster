@@ -2322,10 +2322,11 @@ impl Consensus {
         self.publish_service_mins();
         let mut did = false;
 
-        // Time-and-timers spec §3.2/§4.3 — ONE wall-clock read per pass. The
-        // appender clamps every stamp to max(now, last), so this is the only
-        // place the log's clock advances. Sched rings drain first so a timer
-        // scheduled by the service this pass can fire this pass.
+        // Time-and-timers spec §3.2/§4.3 — ONE wall-clock read per pass, so
+        // the pass's one reading bounds every stamp in it: TIMER frames stamp
+        // at max(deadline, last), and only DUE deadlines are ever appended
+        // (the debug_assert in `fire_due_timers`). Sched rings drain first so
+        // a timer scheduled by the service this pass can fire this pass.
         let now_wall = wall_now_ns();
         self.pass_now_ns = now_wall;
         if let Some(app) = self.appender.as_mut() {
