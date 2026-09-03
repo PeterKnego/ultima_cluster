@@ -132,8 +132,21 @@ pub fn load(sv: &StableValue<ScheduleRecord>) -> Result<Option<ScheduleRecord>, 
 /// helper is private (not even `pub(crate)`) and scoped to the
 /// backup/restore artifact path, not a general read of a live instance
 /// directory's `state/`.
+///
+/// It borrows that helper's ONE guard, though, and for the same reason:
+/// `StableValue::open` is `read+write+create` and writes a header when the
+/// path is absent, so opening unconditionally would (a) CREATE
+/// `state/schedules.state` as a side effect of an operator running `uc2ctl
+/// status`, and (b) fail with `PermissionDenied` on a `state/` the caller may
+/// read but not write. An absent record is not an error — it is a node that
+/// has never adopted a table — so a path that is not a regular file answers
+/// `Ok(None)` without opening anything.
 pub fn read_record(instance_dir: &Path) -> Result<Option<ScheduleRecord>, StableValueError> {
-    let sv = open(&instance_dir.join("state"))?;
+    let state_dir = instance_dir.join("state");
+    if !state_dir.join(SCHEDULE_STATE_FILE).is_file() {
+        return Ok(None);
+    }
+    let sv = open(&state_dir)?;
     load(&sv)
 }
 
@@ -263,6 +276,59 @@ mod tests {
         // read_record works alongside the still-open StableValue, not just
         // after it's dropped — a running node holds this open the whole time.
         assert_eq!(read_record(dir.path()).expect("read"), Some(rec));
+    }
+
+    /// `read_record` is a READ. Its callers are `uc2ctl status` and `uc2ctl
+    /// schedule show` — an operator command run against someone else's
+    /// instance directory, sometimes without write access to it. Opening the
+    /// `StableValue` would CREATE `state/schedules.state` (header + two
+    /// zeroed slots) as a side effect of printing a status line, and would
+    /// fail outright on a `state/` the caller cannot write. Neither is
+    /// acceptable: absent means "no table adopted", which is `None`.
+    #[test]
+    fn read_record_on_a_fresh_directory_returns_none_and_creates_nothing() {
+        let dir = tempdir();
+        // No `state/` at all (an instance dir that has never booted).
+        assert_eq!(read_record(dir.path()).expect("read"), None);
+        assert!(!dir.path().join("state").exists(), "no state/ created");
+        // `state/` present, record absent (every node before this feature).
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        assert_eq!(read_record(dir.path()).expect("read"), None);
+        assert!(
+            !state_dir.join(SCHEDULE_STATE_FILE).exists(),
+            "no record file created"
+        );
+    }
+
+    /// The same guard from the other side: a `state/` the caller may read but
+    /// not write must still answer `None` rather than an error that aborts
+    /// the whole `uc2ctl status` print.
+    #[test]
+    fn read_record_does_not_need_a_writable_state_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("state dir");
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod r-x");
+        // Root ignores the mode bits, so as root this test proves nothing.
+        // Probe rather than ask for the uid (no `libc` dependency here), and
+        // SKIP when the probe succeeds.
+        let is_root = std::fs::File::create(state_dir.join(".probe")).is_ok();
+        let out = read_record(dir.path());
+        // Restore before any assertion so `TempDir` can always clean up.
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod back");
+        if is_root {
+            let _ = std::fs::remove_file(state_dir.join(".probe"));
+            return; // skipped: running as root, where mode bits do not apply
+        }
+        assert_eq!(
+            out.expect("an unwritable state/ is not an error"),
+            None,
+            "absent record reads as None, not as a write failure"
+        );
     }
 
     /// The one-level revert a truncation runs (plan-2 fix round 1): prev is

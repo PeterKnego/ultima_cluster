@@ -631,10 +631,15 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     // `schedule show`), not through the cnc page: the schedule record isn't
     // on the cnc page at all (a deliberate design choice — see
     // `uc_node::schedule_state`'s module doc).
-    let schedule_position = uc_node::read_record(&a.common.instance_dir)
-        .map_err(|e| anyhow::anyhow!("reading schedule state: {e}"))?
-        .map(|r| r.position)
-        .unwrap_or(0);
+    // A read failure DEGRADES to `?` rather than aborting: `status` is the
+    // command an operator runs when something is wrong, and one unreadable
+    // (corrupt, or unreadable-by-this-uid) cache file must not take the role,
+    // log and per-service lines down with it. `schedule show` is the command
+    // that reports the record's own health.
+    let schedule_position = match uc_node::read_record(&a.common.instance_dir) {
+        Ok(rec) => rec.map(|r| r.position).unwrap_or(0).to_string(),
+        Err(_) => "?".to_string(),
+    };
     println!(
         "config: version={} pending={} schedule_position={schedule_position}",
         cnc.config_version(),
