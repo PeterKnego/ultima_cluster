@@ -669,6 +669,8 @@ mod tests {
         assert_eq!(CNC_OFF_CONFIG_VERSION, 3456);
         assert_eq!(CNC_OFF_CONFIG_PENDING, 3520);
         assert_eq!(CNC_OFF_ADMIN_REQ, 3584);
+        // FROZEN: plan-2 admin op, same request line as the reconfiguration ops.
+        assert_eq!(ADMIN_OP_SCHEDULE_APPLY, 6);
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
         // Post-M7 (0.3.0): admission_bytes.
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);

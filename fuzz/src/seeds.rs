@@ -859,7 +859,7 @@ pub fn uc_protocol_timer_frame() -> Vec<Seed> {
 }
 
 /// `uc_protocol_sched_record` — the three valid ops, an invalid op (`0`), an
-/// invalid op (`4`), and a record shorter than `SCHED_RECORD_LEN`.
+/// invalid op (`5`), and a record shorter than `SCHED_RECORD_LEN`.
 pub fn uc_protocol_sched_record() -> Vec<Seed> {
     use uc_protocol::v2::ipc::*;
 
@@ -869,15 +869,15 @@ pub fn uc_protocol_sched_record() -> Vec<Seed> {
 
     let mut bad_op_0 = record(SchedOp::Schedule, 1, 2);
     bad_op_0[0] = 0;
-    let mut bad_op_4 = record(SchedOp::Schedule, 1, 2);
-    bad_op_4[0] = 4;
+    let mut bad_op_5 = record(SchedOp::Schedule, 1, 2);
+    bad_op_5[0] = 5;
 
     vec![
         Seed::fixed("01-schedule", record(SchedOp::Schedule, 100, 1_700_000_000_000_000_000)),
         Seed::fixed("02-cancel", record(SchedOp::Cancel, 100, 0)),
         Seed::fixed("03-consumed", record(SchedOp::Consumed, 100, 1_700_000_000_000_000_000)),
         Seed::fixed("04-bad-op-0", bad_op_0),
-        Seed::fixed("05-bad-op-4", bad_op_4),
+        Seed::fixed("05-bad-op-5", bad_op_5),
         Seed::fixed("06-short", vec![0u8; 16]),
     ]
 }
