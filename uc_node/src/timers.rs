@@ -145,7 +145,14 @@ impl RowTimers {
         if let Some(e) = self.table.get_mut(&id) {
             e.last_delivered = Some(e.last_delivered.map_or(deadline_ns, |l| l.max(deadline_ns)));
             if e.next.is_none_or(|n| n <= deadline_ns) {
-                e.next = e.rule.next_after(deadline_ns);
+                // Same saturation guard as `table_fired`: `next_after`
+                // saturates at `u64::MAX`, so an unfiltered `next` would
+                // re-arm exactly at the deadline just delivered — a
+                // fixpoint that re-pushes a heap entry on every repeated
+                // `TableConsumed` at the top of the range, unbounded under a
+                // poisoned log clock. Only a STRICTLY later occurrence
+                // re-arms; anything else parks.
+                e.next = e.rule.next_after(deadline_ns).filter(|n| *n > deadline_ns);
                 if let Some(n) = e.next {
                     self.heap.push(Reverse((n, id, true)));
                 }
@@ -389,6 +396,38 @@ mod tests {
             None,
             "parked, not re-armed at the same instant"
         );
+        assert_eq!(t.table_len(), 1, "still adopted, just with nothing due");
+    }
+
+    /// The `table_delivered` mirror of
+    /// `an_every_entry_fired_at_the_top_of_the_range_parks`: the follower
+    /// path (`TableConsumed`) hits the same saturation, and a REPEATED
+    /// `TableConsumed` at the top of the range (a poisoned log clock, or a
+    /// re-delivered report) must not keep re-pushing a heap entry at
+    /// `u64::MAX` — that is unbounded heap growth, not just a wasted fire.
+    #[test]
+    fn a_repeated_delivered_at_the_top_of_the_range_parks_and_does_not_grow_the_heap() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        let r = ScheduleRule::Every {
+            period_ns: 1,
+            anchor_ns: 0,
+        };
+        t.adopt_table(&[(7, r)], u64::MAX);
+        t.table_delivered(7, u64::MAX);
+        assert_eq!(
+            t.peek_due(u64::MAX),
+            None,
+            "parked, not re-armed at the same instant"
+        );
+        assert_eq!(t.pending_len(), 0);
+        // A second, repeated delivery at the same top-of-range deadline must
+        // not re-push a heap entry: without the filter, `next_after`'s
+        // saturation would make every repeat push another stale-but-present
+        // `(u64::MAX, 7, true)` entry, growing the heap without bound.
+        t.table_delivered(7, u64::MAX);
+        assert_eq!(t.peek_due(u64::MAX), None, "still parked");
+        assert_eq!(t.pending_len(), 0);
         assert_eq!(t.table_len(), 1, "still adopted, just with nothing due");
     }
 

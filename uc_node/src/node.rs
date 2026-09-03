@@ -4224,7 +4224,8 @@ impl Consensus {
     /// `ScheduleRecord::empty()`), persists, arms from it and names the fact
     /// with `schedule_table_reverted`. The durable counter is already seeded
     /// from the journal by the time this runs (`Node::start_with_socket`
-    /// primes it in step 2, and calls this after).
+    /// recovers it from the archive in step 2 and primes it into the cnc
+    /// page in step 3, and calls this after).
     fn arm_schedule_at_boot(&mut self) {
         let rec = match crate::schedule_state::load(&self.schedule_state) {
             Ok(Some(rec)) => rec,
@@ -5413,18 +5414,41 @@ impl Consensus {
         // Size-check before reading. The file is written by anything with
         // instance-dir write access, and this runs on the consensus agent —
         // an oversized (or non-regular) staged file must not become a
-        // multi-gigabyte read on the thread that drives commit and
-        // elections. An over-long file is not a decodable table either, so
-        // the honest refusal is the same one the decoder would give.
+        // multi-gigabyte OR a blocking read on the thread that drives commit
+        // and elections. An over-long file is not a decodable table either,
+        // so the honest refusal is the same one the decoder would give.
         //
-        // ONE path resolution, then everything off the HANDLE: a
-        // `metadata(path)` followed by a `read(path)` resolves the name
-        // twice, and anything with instance-dir write access could swap a
-        // FIFO in between — an unbounded blocking read on the consensus
-        // agent. `take(MAX + 1)` bounds the read regardless of what the
-        // handle turns out to be, so the length check is a check and not a
-        // promise.
-        let mut f = match std::fs::File::open(&self.schedule_pending) {
+        // Three layers, none of them sufficient alone:
+        // 1. `metadata(path)` BEFORE any open: the cheap, common-case
+        //    rejection — a FIFO or an oversized file staged before this call
+        //    started is refused without ever opening it.
+        // 2. The open itself is `O_RDONLY | O_NONBLOCK`. A path resolves
+        //    twice between the stat above and the open below (anything with
+        //    instance-dir write access can swap the name in that window), so
+        //    the stat alone cannot promise what `open` will find. Without
+        //    `O_NONBLOCK`, `open` on a FIFO with no writer blocks the
+        //    consensus agent forever (`open(2)`); `O_NONBLOCK` makes the
+        //    open on a FIFO return immediately regardless of writer state,
+        //    and has no effect on a regular file, so the happy path is
+        //    unchanged.
+        // 3. `f.metadata()` — an `fstat` on the HANDLE the open just
+        //    returned, not a second `stat` of the path — re-checks
+        //    `is_file()` and the size bound against what was actually
+        //    opened, catching a FIFO (or anything else) swapped in between
+        //    steps 1 and 2. `take(MAX + 1).read_to_end` then bounds the read
+        //    regardless of what step 3 missed, so the length check is a
+        //    check and not a promise.
+        match std::fs::metadata(&self.schedule_pending) {
+            Ok(m) if m.is_file() && m.len() <= MAX_SCHEDULE_TABLE_BYTES => {}
+            Ok(_) => return self.refuse_schedule(REASON_SCHEDULE_DECODE),
+            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
+        }
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.schedule_pending)
+        {
             Ok(f) => f,
             Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
         };
@@ -7921,6 +7945,37 @@ mod tests {
             Some(6016),
             "untouched on disk"
         );
+    }
+
+    /// Regression: `apply_schedule_table` must never block the consensus
+    /// agent opening the staged file. A FIFO with no writer, staged at
+    /// `schedules.pending`, used to hang a plain `File::open` forever
+    /// (`open(2)` `O_RDONLY` blocks without `O_NONBLOCK`); the pre-`open`
+    /// `metadata` stat now refuses it as `REASON_SCHEDULE_DECODE` before any
+    /// open happens at all, and the open itself carries `O_NONBLOCK` as a
+    /// second layer in case a FIFO is swapped in between the stat and the
+    /// open. Driven on a background thread with a bounded `recv_timeout` so
+    /// a reintroduced blocking open fails this test as a timeout, not a
+    /// hang.
+    #[test]
+    fn apply_schedule_table_refuses_a_fifo_without_blocking() {
+        let h = harness();
+        let path = h.cons.schedule_pending.clone();
+        let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let mut cons = h.cons;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let resp = cons.apply_schedule_table(1, 0, 0);
+            let _ = tx.send(resp);
+        });
+        let (status, reason, _version) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("apply_schedule_table blocked opening the staged FIFO instead of refusing it");
+        assert_eq!(status, 1, "refused, not appended or retried");
+        assert_eq!(reason, REASON_SCHEDULE_DECODE);
     }
 
     /// C-1 regression: a DUPLICATE term map delivered AFTER `Action::Truncate`

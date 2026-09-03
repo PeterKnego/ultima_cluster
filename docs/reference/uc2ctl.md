@@ -222,7 +222,7 @@ Output fields:
 
 | Field | Meaning |
 |---|---|
-| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11 pending) — `schedule_position=<n>`, the frame-end position of the adopted schedule table read from `state/schedules.state` (`0` = none adopted). It is the same number `uc2_schedule_table_position` exports and must be identical on every node |
+| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11 pending) — `schedule_position=<n>`, the frame-end position of the adopted schedule table read from `state/schedules.state` (`0` = none adopted; `?` = the record could not be read — a read error, not "no table" — so a role/log/service line down with it never happens over one unreadable cache file). It is the same number `uc2_schedule_table_position` exports and must be identical on every node |
 | `leader` | `NODE_FLAG_LEADER` is set |
 | `can_serve` | `NODE_FLAG_CAN_SERVE` is set |
 | `term` | current term |
