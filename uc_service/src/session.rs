@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::config::SnapshotError;
-use crate::traits::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
+use crate::traits::{ApplyCtx, RawStateMachine, SnapshotStateMachine, TimerEvent};
 
 pub const SESSION_HEADER_LEN: usize = 16;
 pub const TAG_FRESH: u8 = 0;
@@ -274,6 +274,14 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
     /// it only changes how much redundant re-processing a restart does.
     fn last_applied(&self) -> Option<u64> {
         self.max_pos_seen.max(self.inner.last_applied())
+    }
+
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        self.max_pos_seen = Some(ctx.position).max(self.max_pos_seen);
+        self.inner.on_timer(ctx, ev)
+    }
+    fn pending_timers(&self) -> Vec<(u64, u64)> {
+        self.inner.pending_timers()
     }
 }
 

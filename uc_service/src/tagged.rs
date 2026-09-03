@@ -6,7 +6,7 @@
 //! `NAME` is `fsm<ROW>`; `ServicesConfig::tagged(n)` declares the rows.
 
 use crate::config::SnapshotError;
-use crate::{ApplyCtx, SnapshotStateMachine, StateMachine};
+use crate::{ApplyCtx, SnapshotStateMachine, StateMachine, TimerEvent};
 
 pub const TAGGED_NAMES: [&str; 8] = [
     "fsm0", "fsm1", "fsm2", "fsm3", "fsm4", "fsm5", "fsm6", "fsm7",
@@ -33,6 +33,10 @@ impl<const ROW: u8, S: StateMachine> StateMachine for Tagged<ROW, S> {
     #[inline]
     fn last_applied(&self) -> Option<u64> {
         self.0.last_applied()
+    }
+    #[inline]
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        self.0.on_timer(ctx, ev)
     }
 }
 

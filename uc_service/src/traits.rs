@@ -17,9 +17,33 @@
 //! that don't implement it are untouched.
 
 use uc_protocol::identity::FsmIdentity;
+use uc_protocol::v2::ipc::{SchedOp, SchedRecord};
 
 use crate::config::SnapshotError;
 use crate::ids::IdGen;
+
+/// A request a state machine made during one apply (time-and-timers §3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerReq {
+    Schedule { id: u64, at_ns: u64 },
+    Cancel { id: u64 },
+}
+
+/// A fired timer, as delivered to `on_timer` (time-and-timers §4.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerEvent {
+    pub id: u64,
+    pub deadline_ns: u64,
+    /// Fired from the replicated schedule table (plan 2), not from `schedule`.
+    pub table: bool,
+}
+impl TimerEvent {
+    /// The leader could not place this timer at its deadline (spec §4.3's
+    /// post-failover case): `ctx.time_ns > deadline_ns`.
+    pub fn late(&self, ctx: &ApplyCtx) -> bool {
+        ctx.time_ns > self.deadline_ns
+    }
+}
 
 /// Everything the framework knows about the committed frame being applied
 /// (spec §3.3). Built by the apply loop and by journal replay, once per
@@ -31,12 +55,26 @@ use crate::ids::IdGen;
 pub struct ApplyCtx {
     /// The frame's absolute byte position (the idempotency key).
     pub position: u64,
+    /// The frame's leader stamp: ns since the Unix epoch, non-decreasing along
+    /// the log, identical on every replica (time-and-timers §3). "Now".
+    pub time_ns: u64,
+    /// The frame's `leadership_term_id`.
+    pub term: u32,
     identity: FsmIdentity,
+    timers: Vec<TimerReq>,
+    consumed: Vec<(u64, u64)>,
 }
 
 impl ApplyCtx {
     pub fn new(position: u64, identity: FsmIdentity) -> ApplyCtx {
-        ApplyCtx { position, identity }
+        ApplyCtx {
+            position,
+            time_ns: 0,
+            term: 0,
+            identity,
+            timers: Vec::new(),
+            consumed: Vec::new(),
+        }
     }
     /// Convenience for a state machine's own unit tests: `ApplyCtx::for_sm::<MySm>(pos)`
     /// builds the context with `S::IDENTITY`, the same identity the real apply
@@ -45,6 +83,16 @@ impl ApplyCtx {
     pub fn for_sm<S: RawStateMachine>(position: u64) -> ApplyCtx {
         ApplyCtx::new(position, S::IDENTITY)
     }
+    /// Test builder; the apply loop sets the field from the frame header.
+    pub fn with_time(mut self, time_ns: u64) -> ApplyCtx {
+        self.time_ns = time_ns;
+        self
+    }
+    /// Test builder; the apply loop sets the field from the frame header.
+    pub fn with_term(mut self, term: u32) -> ApplyCtx {
+        self.term = term;
+        self
+    }
     pub fn identity(&self) -> FsmIdentity {
         self.identity
     }
@@ -52,14 +100,60 @@ impl ApplyCtx {
     pub fn ids(&self) -> IdGen {
         IdGen::new(self.position, self.identity)
     }
+    /// Ask for `on_timer(id)` at `at_ns` (log time). Re-scheduling a pending id
+    /// replaces its deadline. Deterministic: an output of apply, replayed
+    /// identically on every replica (time-and-timers §4.4).
+    pub fn schedule(&mut self, id: u64, at_ns: u64) {
+        self.timers.push(TimerReq::Schedule { id, at_ns });
+    }
+    pub fn cancel(&mut self, id: u64) {
+        self.timers.push(TimerReq::Cancel { id });
+    }
+    /// What this apply has asked so far, in order (read by `Timed`).
+    pub fn timers(&self) -> &[TimerReq] {
+        &self.timers
+    }
+    /// `Timed` only: this instance was delivered or dropped; the node may clear it.
+    /// Not yet called (Task 6's `Timed` wrapper is the caller).
+    #[allow(dead_code)]
+    pub(crate) fn consumed(&mut self, id: u64, deadline_ns: u64) {
+        self.consumed.push((id, deadline_ns));
+    }
+    /// Apply loop only: drain both lists as wire records, requests first.
+    pub(crate) fn take_sched_records(&mut self) -> Vec<SchedRecord> {
+        let mut out = Vec::with_capacity(self.timers.len() + self.consumed.len());
+        for r in self.timers.drain(..) {
+            out.push(match r {
+                TimerReq::Schedule { id, at_ns } => SchedRecord {
+                    op: SchedOp::Schedule,
+                    timer_id: id,
+                    deadline_ns: at_ns,
+                },
+                TimerReq::Cancel { id } => SchedRecord {
+                    op: SchedOp::Cancel,
+                    timer_id: id,
+                    deadline_ns: 0,
+                },
+            });
+        }
+        for (id, dl) in self.consumed.drain(..) {
+            out.push(SchedRecord {
+                op: SchedOp::Consumed,
+                timer_id: id,
+                deadline_ns: dl,
+            });
+        }
+        out
+    }
 }
 
 /// The user's deterministic business logic.
 ///
-/// **`apply` is sync, deterministic, no I/O, no clock, no randomness.** The
-/// signature enforces it: a `&mut self` transition with no `async`, no context
-/// handle. This is non-negotiable for state-machine-replication correctness —
-/// every replica must reach the same state from the same committed log.
+/// **`apply` is sync, deterministic, no I/O, no clock of its own: `ctx.time_ns`
+/// is the log's, no randomness.** The signature enforces it: a `&mut self`
+/// transition with no `async`, no context handle beyond `ApplyCtx`. This is
+/// non-negotiable for state-machine-replication correctness — every replica
+/// must reach the same state from the same committed log.
 pub trait StateMachine: Send + 'static {
     /// The FSM's identity — the same wherever this type attaches (spec §3).
     const NAME: &'static str;
@@ -87,6 +181,14 @@ pub trait StateMachine: Send + 'static {
     /// nothing already seen); over-reporting above the journal frontier is
     /// refused at attach ([`ServiceError::Drift`](crate::ServiceError::Drift)).
     fn last_applied(&self) -> Option<u64>;
+
+    /// A timer this FSM scheduled (or the schedule table fired) has reached
+    /// its position on the log. `ctx.time_ns` is the frame's stamp — the
+    /// deadline unless `ev.late(ctx)`. Advance `last_applied` from
+    /// `ctx.position` exactly as in `apply`. Default: ignore timers.
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        let _ = (ctx, ev);
+    }
 }
 
 /// The core state-machine contract: bytes in, bytes out. The framework hands
@@ -113,6 +215,21 @@ pub trait RawStateMachine: Send + 'static {
     fn query(&self, q: &[u8], out: &mut Vec<u8>);
     /// Highest position applied so far (`None` before the first).
     fn last_applied(&self) -> Option<u64>;
+
+    /// A timer this FSM scheduled (or the schedule table fired) has reached
+    /// its position on the log. `ctx.time_ns` is the frame's stamp — the
+    /// deadline unless `ev.late(ctx)`. Advance `last_applied` from
+    /// `ctx.position` exactly as in `apply`. Default: ignore timers.
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        let _ = (ctx, ev);
+    }
+
+    /// Framework hook (time-and-timers §4.8): the pending instances a wrapper
+    /// holds, re-announced to the node after attach and after replay. Only
+    /// `Timed` overrides it; a bare state machine has none.
+    fn pending_timers(&self) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
 }
 
 /// Every typed state machine is a raw one: decode with bincode-standard,
@@ -143,6 +260,10 @@ impl<S: StateMachine> RawStateMachine for S {
     #[inline]
     fn last_applied(&self) -> Option<u64> {
         StateMachine::last_applied(self)
+    }
+    #[inline]
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        StateMachine::on_timer(self, ctx, ev)
     }
 }
 

@@ -209,6 +209,7 @@ pub(crate) fn attach<S: RawStateMachine>(
         journal_dir: dir.join("journal"),
         svc_query,
         svc_sched,
+        announce_pending: true,
         needs_replay: false,
         instance_id,
         instance_mismatch_streak: 0,

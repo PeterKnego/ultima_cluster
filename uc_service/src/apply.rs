@@ -17,15 +17,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
-use uc_protocol::ring::{SpscConsumer, SpscProducer};
+use uc_protocol::ring::{RingError, SpscConsumer, SpscProducer};
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
-use uc_protocol::v2::frame::FRAME_TYPE_MESSAGE;
+use uc_protocol::v2::frame::{
+    FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_TIMER, read_timer_body,
+};
+use uc_protocol::v2::ipc::{MSG_V2_SCHED, SchedOp, SchedRecord, write_sched_record};
 
 use crate::builder_agent::BuildJob;
 use crate::config::SnapshotError;
 use crate::egress::Egress;
 use crate::replay::replay_into;
-use crate::traits::{ApplyCtx, RawStateMachine};
+use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
+
+/// Time-and-timers §4.8: how many spins `write_sched` has taken waiting on a
+/// full `svc_sched` ring, process-wide. Not yet exported through a metrics
+/// surface (uc_service has no `uc_obs` dependency) — a later task may wire
+/// it up; for now it exists so a spin storm leaves a countable trace.
+pub(crate) static SCHED_RING_FULL_SPINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Spike-only apply-budget probes (feature `apply-profile`). Counters are
 /// process-global; printed every `PRINT_EVERY` frames and at drop. Since M12a
@@ -203,10 +213,13 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     pub(crate) svc_query: SpscConsumer,
     /// Time-and-timers §4.4: the service→node schedule ring producer half —
     /// this process is the producer, the node's consensus agent the consumer.
-    /// Not yet written (Task 5) — held here so the apply thread owns the ring
-    /// handle from attach onward.
-    #[allow(dead_code)]
     pub(crate) svc_sched: SpscProducer,
+    /// Time-and-timers §4.8: re-announce this incarnation's pending timers
+    /// (`sm.pending_timers()`) to the node on the FIRST cycle after attach,
+    /// and again after every replay pass — a fresh incarnation's in-memory
+    /// wrapper state (e.g. `Timed`'s table) is otherwise invisible to the
+    /// node's scheduler until something re-declares it.
+    pub(crate) announce_pending: bool,
     /// Observability: set while a batch has surfaced `Overrun` and the replay
     /// reconstruction is degrading the follower back onto the live buffer.
     /// Cleared once replay rejoins.
@@ -264,6 +277,24 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// `Some` only for a snapshot-capable service; `None` makes a below-floor
     /// gap fail-stop with [`ServiceError::SnapshotRequired`].
     pub(crate) snapshot_restore: Option<SnapshotRestore<S>>,
+}
+
+/// Write schedule records to the node; a full ring is transient (the node
+/// drains every pass), so spin like the egress path does, and count it.
+fn write_sched(prod: &mut SpscProducer, recs: &[SchedRecord]) {
+    for r in recs {
+        let bytes = write_sched_record(r);
+        loop {
+            match prod.try_write(MSG_V2_SCHED, 0, [0; 8], &bytes) {
+                Ok(()) => break,
+                Err(RingError::Full) => {
+                    SCHED_RING_FULL_SPINS.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("svc_sched ring fail-stop: {e}"),
+            }
+        }
+    }
 }
 
 /// One apply duty cycle. Returns `true` iff it made progress (drove the idle
@@ -328,6 +359,19 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             .store_release(unix_ns());
         return false;
     }
+    if st.announce_pending {
+        st.announce_pending = false;
+        let pending = st.sm.lock().unwrap().pending_timers();
+        let recs: Vec<SchedRecord> = pending
+            .into_iter()
+            .map(|(id, dl)| SchedRecord {
+                op: SchedOp::Schedule,
+                timer_id: id,
+                deadline_ns: dl,
+            })
+            .collect();
+        write_sched(&mut st.svc_sched, &recs);
+    }
     let commit = c.commit.load_acquire();
     // The log's own frontier, for ruling K's "who set this target?" test below.
     let head = commit.min(durable);
@@ -384,7 +428,8 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                     // yielded frame regardless of its type, so lockstep's
                     // "one frame per next_batch" counts every yielded frame,
                     // not only ones that were actually applied.
-                    if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > sm.last_applied() {
+                    let above = Some(pos) > sm.last_applied();
+                    if hdr.frame_type == FRAME_TYPE_MESSAGE && above {
                         #[cfg(feature = "apply-profile")]
                         let t0 = profile::now();
                         // Bytes straight from the frame to the state machine. Typed
@@ -393,7 +438,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         // bytes are trusted; a decode failure there is
                         // unrecoverable corruption and fail-stops.
                         st.resp_buf.clear();
-                        let mut ctx = ApplyCtx::new(pos, S::IDENTITY);
+                        let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
+                            .with_time(hdr.time_ns)
+                            .with_term(hdr.leadership_term_id);
                         sm.apply(&mut ctx, payload, &mut st.resp_buf);
                         #[cfg(feature = "apply-profile")]
                         let t1 = profile::now();
@@ -407,6 +454,30 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             pf_sm += t1 - t0; // apply incl. codec
                             pf_pub += t2 - t1;
                             pf_bytes += payload.len() as u64;
+                        }
+                        let recs = ctx.take_sched_records();
+                        if !recs.is_empty() {
+                            write_sched(&mut st.svc_sched, &recs);
+                        }
+                    } else if hdr.frame_type == FRAME_TYPE_TIMER
+                        && above
+                        && let Some(body) = read_timer_body(payload)
+                        && body.identity_hash == S::IDENTITY.hash()
+                    {
+                        let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
+                            .with_time(hdr.time_ns)
+                            .with_term(hdr.leadership_term_id);
+                        sm.on_timer(
+                            &mut ctx,
+                            TimerEvent {
+                                id: body.timer_id,
+                                deadline_ns: body.deadline_ns,
+                                table: hdr.flags & FLAG_TIMER_TABLE != 0,
+                            },
+                        );
+                        let recs = ctx.take_sched_records();
+                        if !recs.is_empty() {
+                            write_sched(&mut st.svc_sched, &recs);
                         }
                     }
                     if one_frame {
@@ -479,6 +550,11 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             progressed = true;
             // Replay jumped the cursor: any wait episode is over.
             st.lag_waiting = false;
+            // Time-and-timers §4.8: replay dropped any `on_timer` requests it
+            // saw (`replay_into` discards them) — re-announce this
+            // incarnation's pending timers on the next cycle so the node's
+            // scheduler sees them again.
+            st.announce_pending = true;
             // Re-loop: read live from the rejoin point (may CaughtUp, apply
             // more, or Overrun again if the ring lapped us during replay).
         }
@@ -907,6 +983,7 @@ mod tests {
             journal_dir: dir.path().join("journal"),
             svc_query,
             svc_sched,
+            announce_pending: false,
             needs_replay: false,
             instance_id: 0x1234,
             instance_mismatch_streak: 0,

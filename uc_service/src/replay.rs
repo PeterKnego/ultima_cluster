@@ -19,11 +19,13 @@ use std::sync::Mutex;
 
 use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
-use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
+use uc_protocol::v2::frame::{
+    self, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
+};
 
 use crate::apply::SnapshotRestore;
 use crate::config::ServiceError;
-use crate::traits::{ApplyCtx, RawStateMachine};
+use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 
 /// Replay archived journal blocks into `sm`, returning the byte cursor after the
 /// last applied/skipped frame — the point at which the live [`LogFollower`] can
@@ -163,13 +165,40 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // fail-stops there on a committed, archived frame that will not
                 // decode — unrecoverable corruption, never a silent skip of
                 // user data.
-                if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > guard.last_applied() {
+                let above = Some(pos) > guard.last_applied();
+                if hdr.frame_type == FRAME_TYPE_MESSAGE && above {
                     scratch.clear();
                     guard.apply(
-                        &mut ApplyCtx::new(pos, S::IDENTITY),
+                        &mut ApplyCtx::new(pos, S::IDENTITY)
+                            .with_time(hdr.time_ns)
+                            .with_term(hdr.leadership_term_id),
                         &payload[off + HEADER_LEN..off + total],
                         &mut scratch,
                     );
+                } else if hdr.frame_type == FRAME_TYPE_TIMER
+                    && above
+                    && let Some(body) =
+                        frame::read_timer_body(&payload[off + HEADER_LEN..off + total])
+                    && body.identity_hash == S::IDENTITY.hash()
+                {
+                    // Deliver exactly as the live loop would (same guard, same
+                    // hash check); any `on_timer` requests made here are
+                    // dropped — the re-announce after replay
+                    // (`ApplyState::announce_pending`, set once this pass
+                    // rejoins the live buffer) covers them, which is the
+                    // whole point of §4.8.
+                    let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
+                        .with_time(hdr.time_ns)
+                        .with_term(hdr.leadership_term_id);
+                    guard.on_timer(
+                        &mut ctx,
+                        TimerEvent {
+                            id: body.timer_id,
+                            deadline_ns: body.deadline_ns,
+                            table: hdr.flags & FLAG_TIMER_TABLE != 0,
+                        },
+                    );
+                    let _ = ctx.take_sched_records();
                 }
                 cursor = end;
                 off += aligned;

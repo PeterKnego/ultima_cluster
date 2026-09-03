@@ -42,7 +42,7 @@ use uc_protocol::v2::cnc::{
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
-use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, align_frame_len};
+use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, TimerBody, align_frame_len};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY,
     client_from_extra, extra_client, split_query_payload,
@@ -431,6 +431,15 @@ struct Rings {
     egress_services: Vec<BroadcastRing>,
 }
 
+/// The in-process ingress channel's item type. `Payload` is the harness/
+/// embedded submit path (`Node::submit`); `TimerForTest` (time-and-timers
+/// plan Task 5) lets a test append a TIMER frame as the leader would, ahead
+/// of the real node-side scheduler.
+enum Ingress {
+    Payload(Vec<u8>),
+    TimerForTest(TimerBody),
+}
+
 pub struct Node {
     /// M10 (Task 4): this node's id, captured from `cfg.id` at boot — nothing
     /// else on `Node` retains it (the consensus SM has its own copy). Exposed
@@ -440,7 +449,7 @@ pub struct Node {
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
-    ingress_tx: mpsc::SyncSender<Vec<u8>>,
+    ingress_tx: mpsc::SyncSender<Ingress>,
     /// Ingress admission budget (`append - commit`), mirrored from
     /// `NodeConfig` so `submit` (the in-process path) enforces the same
     /// door as the client ring drain.
@@ -857,7 +866,7 @@ impl Node {
         // Channels.
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(NET_EVENT_CAPACITY);
         let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(1024);
-        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(INGRESS_CAPACITY);
+        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Ingress>(INGRESS_CAPACITY);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(1024);
         // M7: durably-recorded CONFIG-frame observations, `(frame-END position,
         // payload bytes)` — the archive agent's config scan (`take_config_observations`)
@@ -1610,11 +1619,21 @@ impl Node {
                 return Err(SubmitError::Full);
             }
         }
-        match self.ingress_tx.try_send(payload) {
+        match self.ingress_tx.try_send(Ingress::Payload(payload)) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(_)) => Err(SubmitError::Full),
             Err(mpsc::TrySendError::Disconnected(_)) => Err(SubmitError::NotServing),
         }
+    }
+
+    /// Test-only (time-and-timers plan Task 5): append a TIMER frame as the
+    /// leader would, so a service test can drive `on_timer` before the
+    /// node-side scheduler exists. Same in-process ingress path as `submit`.
+    #[doc(hidden)]
+    pub fn append_timer_for_test(&self, body: TimerBody) -> Result<(), String> {
+        self.ingress_tx
+            .send(Ingress::TimerForTest(body))
+            .map_err(|e| e.to_string())
     }
 
     /// Partition handles for every one of the node's outbound sockets (receiver,
@@ -1862,7 +1881,7 @@ struct Consensus {
     buffer: Arc<LogBuffer>,
     appender: Option<Appender>,
     next_corr: u32,
-    pending_ingress: Option<Vec<u8>>,
+    pending_ingress: Option<Ingress>,
     /// The client ingress ring's consumer half (Task 7) — the consensus
     /// thread is its sole reader.
     ingress_ring: MpscConsumer,
@@ -1963,7 +1982,7 @@ struct Consensus {
     /// scan, `(frame-END position, payload bytes)` — decoded + fed as
     /// `Event::ConfigObserved` in `do_work` step 1c.
     cfg_obs_rx: mpsc::Receiver<(u64, Vec<u8>)>,
-    ingress_rx: mpsc::Receiver<Vec<u8>>,
+    ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
     /// Issue #6: ack slot for [`ArchiveCmd::Collapse`], the leader-open cut.
@@ -3507,19 +3526,19 @@ impl Consensus {
     /// Append pending + queued payloads via the leader appender, bounded.
     fn drain_ingress(&mut self) -> bool {
         let mut did = false;
-        // Retry a payload held back by a prior WouldOverrun before taking more.
-        if let Some(p) = self.pending_ingress.take() {
-            if !self.try_append(&p) {
-                self.pending_ingress = Some(p);
+        // Retry an item held back by a prior WouldOverrun before taking more.
+        if let Some(item) = self.pending_ingress.take() {
+            if !self.try_append_ingress(&item) {
+                self.pending_ingress = Some(item);
                 return did;
             }
             did = true;
         }
         for _ in 0..INGRESS_PER_CYCLE {
             match self.ingress_rx.try_recv() {
-                Ok(p) => {
-                    if !self.try_append(&p) {
-                        self.pending_ingress = Some(p); // ring full: hold, retry next cycle
+                Ok(item) => {
+                    if !self.try_append_ingress(&item) {
+                        self.pending_ingress = Some(item); // ring full: hold, retry next cycle
                         break;
                     }
                     did = true;
@@ -3528,6 +3547,15 @@ impl Consensus {
             }
         }
         did
+    }
+
+    /// Dispatch one ingress item to the leader appender. `false` = ring full
+    /// (caller holds it and retries next cycle).
+    fn try_append_ingress(&mut self, item: &Ingress) -> bool {
+        match item {
+            Ingress::Payload(p) => self.try_append(p),
+            Ingress::TimerForTest(body) => self.try_append_timer(body),
+        }
     }
 
     /// Append one payload; `false` = ring full (caller holds it). A too-large
@@ -3546,6 +3574,20 @@ impl Consensus {
                 self.next_corr = self.next_corr.wrapping_add(1);
                 true // consumed (dropped) — do not wedge the queue on it
             }
+        }
+    }
+
+    /// Test-only (time-and-timers plan Task 5): append one TIMER frame,
+    /// exactly like the leader-side scheduler Task 8 adds will. Same
+    /// WouldOverrun hold-back as `try_append`.
+    fn try_append_timer(&mut self, body: &TimerBody) -> bool {
+        let Some(app) = self.appender.as_mut() else {
+            return false;
+        };
+        match app.append_timer(body, 0) {
+            Ok(_) => true,
+            Err(AppendError::WouldOverrun) => false,
+            Err(AppendError::PayloadTooLarge) => true, // unreachable: fixed-size body
         }
     }
 
@@ -6488,7 +6530,7 @@ mod tests {
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
         _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
-        _ingress_tx: mpsc::SyncSender<Vec<u8>>,
+        _ingress_tx: mpsc::SyncSender<Ingress>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
     }
@@ -6642,7 +6684,7 @@ mod tests {
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
         let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(64);
-        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
+        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Ingress>(64);
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
         let collapse_slot = TruncationSlot::default();

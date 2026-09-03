@@ -27,8 +27,8 @@
 //!
 //! **Semver:** see `docs/reference/semver-policy.md`. Promised surface:
 //! [`RawStateMachine`], [`StateMachine`], [`SnapshotStateMachine`],
-//! [`OutputHandler`]/[`RawOutputHandler`], and
-//! [`Sessioned`]/[`SessionConfig`].
+//! [`OutputHandler`]/[`RawOutputHandler`], [`Sessioned`]/[`SessionConfig`], and
+//! [`TimerEvent`]/[`TimerReq`].
 
 mod apply;
 mod attach;
@@ -73,7 +73,7 @@ pub use crate::session::{
 pub use crate::tagged::Tagged;
 pub use crate::traits::{
     ApplyCtx, NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
-    SnapshotStateMachine, StateMachine, TypedOutput,
+    SnapshotStateMachine, StateMachine, TimerEvent, TimerReq, TypedOutput,
 };
 
 /// Default idle strategy for the apply thread: a short sleep between empty

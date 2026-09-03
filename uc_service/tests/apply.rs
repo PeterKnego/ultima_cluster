@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing};
+use uc_protocol::v2::frame::TimerBody;
 use uc_protocol::v2::ipc::{MSG_V2_RESPONSE, MSG_V2_SUBMIT, client_from_extra, extra_client};
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine};
+use uc_service::{
+    ApplyCtx, RawStateMachine, ServiceBuilder, ServiceConfig, StateMachine, TimerEvent,
+};
 
 // ------------------------------------------------------------- the state machine
 
@@ -60,7 +63,10 @@ impl StateMachine for CountSm {
 
 // --------------------------------------------------------------------- harness
 
-fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
+// Task 5: `app_id` (the node's cnc identity) and the declared FSM name are
+// independent concepts — `node_config` takes the FSM name explicitly
+// (`svc_name`) so a test can attach a state machine other than `CountSm`.
+fn node_config(dir: &Path, app_id: &str, svc_name: &str) -> NodeConfig {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     NodeConfig {
         id: 0,
@@ -79,7 +85,7 @@ fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
         learners: Vec::new(),
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::single(CountSm::NAME),
+        services: uc_node::ServicesConfig::single(svc_name),
     }
 }
 
@@ -145,7 +151,12 @@ fn drain_responses(sub: &mut BroadcastConsumer, client_id: u32, max_total: &mut 
 #[test]
 fn service_applies_committed_frames_and_publishes_responses() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::start(node_config(dir.path(), "svc-test")).unwrap();
+    let node = Node::start(node_config(
+        dir.path(),
+        "svc-test",
+        <CountSm as StateMachine>::NAME,
+    ))
+    .unwrap();
     wait_until(|| node.can_serve());
 
     // Subscribe to the egress BEFORE submitting: a broadcast subscriber is
@@ -209,7 +220,12 @@ fn service_applies_committed_frames_and_publishes_responses() {
 #[test]
 fn egress_frame_layout_is_byte_pinned() {
     let dir = tempfile::tempdir().unwrap();
-    let node = Node::start(node_config(dir.path(), "layout")).unwrap();
+    let node = Node::start(node_config(
+        dir.path(),
+        "layout",
+        <CountSm as StateMachine>::NAME,
+    ))
+    .unwrap();
     wait_until(|| node.can_serve());
 
     let mut sub = BroadcastRing::open(&dir.path().join("egress_service.0.broadcast"))
@@ -254,6 +270,80 @@ fn egress_frame_layout_is_byte_pinned() {
         "no trailing bytes beyond position ++ bincode(resp)"
     );
 
+    svc.stop();
+    node.stop();
+}
+
+// ------------------------------------------------------------ TIMER delivery
+
+#[derive(Default)]
+struct TimerCountSm {
+    fired: Vec<(u64, u64, u64)>, // (position, id, time_ns)
+    last: Option<u64>,
+}
+impl StateMachine for TimerCountSm {
+    const NAME: &'static str = "svc-test";
+    type Command = u8;
+    type Response = u64; // the stamp the command was applied at
+    type Query = ();
+    type QueryResponse = Vec<(u64, u64, u64)>;
+    fn apply(&mut self, ctx: &mut ApplyCtx, _cmd: u8) -> u64 {
+        self.last = Some(ctx.position);
+        ctx.time_ns
+    }
+    fn query(&self, _q: ()) -> Vec<(u64, u64, u64)> {
+        self.fired.clone()
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.last
+    }
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        self.fired.push((ctx.position, ev.id, ctx.time_ns));
+        self.last = Some(ctx.position);
+    }
+}
+
+#[test]
+fn timer_frame_is_delivered_to_the_named_fsm_only_and_responses_carry_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(node_config(
+        dir.path(),
+        "svc-test",
+        <TimerCountSm as StateMachine>::NAME,
+    ))
+    .unwrap();
+    wait_until(|| node.can_serve());
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), "svc-test"),
+        TimerCountSm::default(),
+    )
+    .start()
+    .unwrap();
+    let hash = <TimerCountSm as RawStateMachine>::IDENTITY.hash();
+    node.append_timer_for_test(TimerBody {
+        identity_hash: hash ^ 1,
+        timer_id: 1,
+        deadline_ns: 1,
+    })
+    .unwrap(); // foreign: skipped
+    node.append_timer_for_test(TimerBody {
+        identity_hash: hash,
+        timer_id: 2,
+        deadline_ns: 1,
+    })
+    .unwrap();
+    wait_until(|| svc.query(()).len() == 1);
+    let fired = svc.query(());
+    assert_eq!(
+        fired[0].1, 2,
+        "only the frame naming this FSM's hash was delivered: {fired:?}"
+    );
+    assert!(fired[0].2 > 0, "the frame carries a stamp: {fired:?}");
+    // a client command applied after the timer carries a stamp >= the timer's
+    let client = uc_client::Client::connect(dir.path(), "svc-test").unwrap();
+    let stamp: u64 = client.submit(&7u8).unwrap();
+    assert!(stamp >= fired[0].2, "monotone: {stamp} < {}", fired[0].2);
+    client.shutdown();
     svc.stop();
     node.stop();
 }
