@@ -27,7 +27,7 @@ use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
-    RefusalKind,
+    RefusalKind, ScheduleTableCell,
 };
 use uc_net::sender::{
     CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet, identity_mask,
@@ -1032,6 +1032,20 @@ impl Node {
         // stashed by the receiver in `snap_complete` and consumed by the
         // consensus agent's `maybe_adopt_incoming_snapshot`.
         let incoming_snapshot_config = Arc::new(Mutex::new(Vec::new()));
+        // Time-and-timers plan 3 (spec §5): the third companion cell — the
+        // schedule table the same completed transfer carried (`SNAP_TABLE`'s
+        // `(position, time_ns, bytes)`), stashed by the receiver BEFORE it
+        // publishes the floor and consumed by the same install handler.
+        let incoming_snapshot_table: ScheduleTableCell = Arc::new(Mutex::new((0, 0, Vec::new())));
+        // Plan 3: the snapshot-session table-carry cache — the twin of
+        // `config_bytes`, holding whatever table this node has ADOPTED
+        // (`refresh_schedule_bytes`, called wherever the adopted table
+        // changes). Read by the sender's `SnapshotSource` closure at ship
+        // time, so a session always carries the CURRENT table. Seeded
+        // `(0, 0, [])` — the honest "no table" value — and filled by
+        // `arm_schedule_at_boot` below when this node has a record.
+        let schedule_bytes: Arc<Mutex<(u64, u64, Vec<u8>)>> =
+            Arc::new(Mutex::new((0, 0, Vec::new())));
         // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
         // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
         // around a DATA datagram to detect a prime that straddled its processing and
@@ -1053,6 +1067,10 @@ impl Node {
         // ships whatever config is CURRENT at the moment a peer's NAK opens a
         // session, never a boot-time snapshot of it.
         let src_config_bytes = Arc::clone(&config_bytes);
+        // Plan 3: the same cell `refresh_schedule_bytes` writes — the table
+        // that is CURRENT when a peer's NAK opens the session, never a
+        // boot-time snapshot of it.
+        let src_schedule_bytes = Arc::clone(&schedule_bytes);
         let src_id = cfg.id;
         sender.set_snapshot_source(Arc::new(move || {
             snapshot_set_for(
@@ -1060,6 +1078,7 @@ impl Node {
                 &src_root,
                 &src_services,
                 &src_config_bytes,
+                &src_schedule_bytes,
                 src_id,
                 &src_decline_reason,
             )
@@ -1133,10 +1152,9 @@ impl Node {
                 Arc::clone(&incoming_snapshot),
                 Arc::clone(&incoming_snapshot_config),
                 // Time-and-timers plan 3: the installed session's schedule
-                // table. Wired but not yet read — plan 3 Task 3 consumes it in
-                // the consensus agent's install handler, alongside the config
-                // cell above.
-                Arc::new(Mutex::new((0, 0, Vec::new()))),
+                // table, read by the consensus agent's install handler
+                // alongside the config cell above.
+                Arc::clone(&incoming_snapshot_table),
             )),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
@@ -1464,6 +1482,7 @@ impl Node {
             schedule_pos_pub: Arc::clone(&schedule_pos_pub),
             schedule_entries_pub: Arc::clone(&schedule_entries_pub),
             schedule_refused: Arc::clone(&schedule_refused),
+            schedule_bytes: Arc::clone(&schedule_bytes),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -1495,6 +1514,7 @@ impl Node {
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::clone(&incoming_snapshot),
             incoming_snapshot_config: Arc::clone(&incoming_snapshot_config),
+            incoming_snapshot_table: Arc::clone(&incoming_snapshot_table),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
@@ -2167,6 +2187,15 @@ struct Consensus {
     /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
     /// whatever the reason. Shared with `Node::observability`.
     schedule_refused: Arc<AtomicU64>,
+    /// Plan 3 (spec §5): the snapshot-session table-carry cache —
+    /// `(position, time_ns, encoded bytes)` of the table this node has
+    /// ADOPTED, refreshed by [`Consensus::refresh_schedule_bytes`] wherever
+    /// that changes (adoption, boot arming, a truncation revert, a fiat
+    /// install) and read by the sender's `SnapshotSource` closure at ship
+    /// time. The exact twin of `config_bytes`, and for the same reason: a
+    /// below-floor joiner has no genuine table of its own, so the session
+    /// must carry the leader's.
+    schedule_bytes: Arc<Mutex<(u64, u64, Vec<u8>)>>,
     ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
@@ -2241,6 +2270,11 @@ struct Consensus {
     /// and adopted by fiat (`ElectionSm::adopt_snapshot_config`) alongside the
     /// archive-floor adoption in `maybe_adopt_incoming_snapshot`.
     incoming_snapshot_config: Arc<Mutex<Vec<u8>>>,
+    /// Plan 3 (spec §5): the third companion cell — the encoded schedule
+    /// table (with its position and stamp) the same completed transfer
+    /// carried, read by `maybe_adopt_incoming_snapshot` right after the
+    /// config cell and installed BY FIAT ([`Consensus::install_snapshot_table`]).
+    incoming_snapshot_table: ScheduleTableCell,
     /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
     /// AdoptFloor command + cnc mirror fire once per completed transfer).
     adopted_incoming: u64,
@@ -3602,9 +3636,31 @@ impl Consensus {
                 // wholesale-replace install: `rec.prev == rec.config` at `pos`.
                 self.rebuild_net_for_config(&cfg, pos);
             }
+            // Plan 3 (spec §5): and the session carried the leader's SCHEDULE
+            // TABLE too — the third fiat install on this path (lineage,
+            // config, table), by the identical argument
+            // (`install_snapshot_table`'s doc comment). AFTER the config, which may have rebuilt the net
+            // layer, and BEFORE `AdoptFloor`: the floor adoption is what
+            // re-primes `append` and lets this node catch up (and, once
+            // promoted, lead), and a node that can lead must already hold the
+            // schedule it is expected to fire. The cell was written by the
+            // receiver before the `Release` store of the floor this handler
+            // `Acquire`-loaded, so it holds THIS session's bytes.
+            let (tbl_pos, tbl_time, tbl_bytes) =
+                self.incoming_snapshot_table.lock().unwrap().clone();
+            self.install_snapshot_table(tbl_pos, tbl_time, &tbl_bytes);
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
-        crate::obs_event!(Info, "snapshot_installed", node = self.id as u64, pos = pos);
+        crate::obs_event!(
+            Info,
+            "snapshot_installed",
+            node = self.id as u64,
+            pos = pos,
+            // The schedule position this node holds once the install is done:
+            // the carried table's position on the fiat path, and (unchanged)
+            // this node's own on the mid-life path that adopts nothing.
+            table_position = self.schedule_position
+        );
         true
     }
 
@@ -4160,7 +4216,76 @@ impl Consensus {
             "schedule_table_adopted",
             node = self.id as u64,
             position = position,
-            entries = armed
+            entries = armed,
+            source = "log"
+        );
+    }
+
+    /// Plan 3 (spec §5): install the table the snapshot session carried, BY
+    /// FIAT at the floor — the exact twin of `adopt_snapshot_config`, and by
+    /// the same argument: below the floor this node's own bytes are gone, so
+    /// its own record is not genuine and there is nothing to be idempotent
+    /// AGAINST. Deliberately NO `position <= schedule_position` check (the
+    /// frame path's guard, which exists because the leader sees its own
+    /// frame come back off the archive) — a joiner's stale record can sit
+    /// ABOVE the carried position, and that record is exactly what must go.
+    ///
+    /// `position == 0` with empty bytes is the wire's honest "this leader has
+    /// no table": every row disarms and the record goes to the canonical
+    /// no-table shape ([`ScheduleRecord::empty`]), which is what this node
+    /// would hold had it never adopted. The record's bytes are canonicalised
+    /// rather than stored verbatim precisely so that a stored record ALWAYS
+    /// decodes — boot arming and `revert_schedule_below` both rely on it (the
+    /// latter fail-stops otherwise).
+    ///
+    /// A decode failure on non-empty bytes is fail-stop, exactly as for
+    /// CONFIG (`maybe_adopt_incoming_snapshot`): the session is sealed and
+    /// CRC/AEAD-covered, the leader encoded the bytes from a table it holds,
+    /// and `decode_schedule_table` is total — so a `None` here is a BUG, not
+    /// a hostile peer.
+    ///
+    /// Persist-before-effect, as everywhere else on this path: the record is
+    /// durable before the heaps change, so a crash in the window recovers a
+    /// node whose armed set matches its recorded position.
+    ///
+    /// Arms from `cnc.log_time_ns()` — the LOG's clock — and never from the
+    /// carried `time_ns`: that stamp is the leader's frame stamp, recorded
+    /// for diagnostics, while arming is a one-tick catch-up from the clock
+    /// every replica agrees on (`arm_schedule_at_boot` makes the same
+    /// choice for the same reason).
+    fn install_snapshot_table(&mut self, position: u64, time_ns: u64, bytes: &[u8]) {
+        let (table, stored) = if bytes.is_empty() {
+            (
+                ScheduleTable {
+                    entries: Vec::new(),
+                },
+                ScheduleRecord::empty().table,
+            )
+        } else {
+            let table = decode_schedule_table(bytes).unwrap_or_else(|| {
+                panic!("corrupt snapshot-carried SCHEDULE_TABLE at floor {position}")
+            });
+            (table, bytes.to_vec())
+        };
+        // No `prev`: the one-level history is a TRUNCATION affordance, and
+        // nothing below the floor is truncatable — reverting to a record the
+        // joiner cannot have the bytes for would be worse than holding none.
+        let rec = ScheduleRecord {
+            position,
+            time_ns,
+            table: stored,
+            prev: None,
+        };
+        crate::schedule_state::store(&self.schedule_state, &rec)
+            .expect("schedule record persist fail-stop");
+        let armed = self.install_table(position, &table, self.cnc.log_time_ns());
+        crate::obs_event!(
+            Info,
+            "schedule_table_adopted",
+            node = self.id as u64,
+            position = position,
+            entries = armed,
+            source = "snapshot"
         );
     }
 
@@ -4202,7 +4327,32 @@ impl Consensus {
         self.schedule_position = position;
         self.schedule_pos_pub.store(position, Ordering::Relaxed);
         self.schedule_entries_pub.store(armed, Ordering::Relaxed);
+        self.refresh_schedule_bytes();
         armed
+    }
+
+    /// Plan 3 (spec §5): re-fill the snapshot-session table-carry cache from
+    /// the DURABLE record, so a session this node ships carries the table it
+    /// actually holds. The one writer of `schedule_bytes`, called from the
+    /// tail of [`Self::install_table`] — which every adoption path goes
+    /// through (a table frame, boot arming, a truncation revert, and the
+    /// snapshot fiat install) — and restated at the tails of
+    /// `arm_schedule_at_boot` and `revert_schedule_below`, so an edit that
+    /// ever gives either its own arming path cannot silently leave the cache
+    /// stale. (An early return in those two — no record, an unreadable one —
+    /// deliberately does NOT refresh: nothing was armed, so the seeded
+    /// `(0, 0, [])` is already the truth.)
+    ///
+    /// Reads the record rather than tracking the bytes in memory: the record
+    /// is the durable truth, and `StableValue::load` serves both slots from
+    /// its in-memory cache, so this is a clone of a small `Vec`, not I/O.
+    /// A node with no record caches `(0, 0, [])` — the wire's "no table".
+    fn refresh_schedule_bytes(&self) {
+        let cached = match crate::schedule_state::load(&self.schedule_state) {
+            Ok(Some(rec)) => (self.schedule_position, rec.time_ns, rec.table),
+            _ => (0, 0, Vec::new()),
+        };
+        *self.schedule_bytes.lock().unwrap() = cached;
     }
 
     /// Plan 2 (spec §5): boot arming, called once before this agent's thread
@@ -4265,12 +4415,14 @@ impl Consensus {
             return;
         };
         let armed = self.install_table(rec.position, &table, self.cnc.log_time_ns());
+        self.refresh_schedule_bytes();
         crate::obs_event!(
             Info,
             "schedule_table_adopted",
             node = self.id as u64,
             position = rec.position,
-            entries = armed
+            entries = armed,
+            source = "boot"
         );
     }
 
@@ -4300,11 +4452,13 @@ impl Consensus {
         let reverted = if to == 0 {
             // Wipe-and-rejoin, mirroring the `ConfigRecord`'s own wipe
             // branch: keep the CURRENT table by fiat rather than dropping to
-            // a predecessor a wiped node has no further use for. The table is
-            // not carried in a snapshot, so a wiped node that dropped it
-            // would run with nothing armed until an operator re-applied,
-            // while its peers keep ticking. The POSITION still goes to 0, so
-            // the next table frame (or a re-apply) adopts.
+            // a predecessor a wiped node has no further use for. A wiped
+            // node that dropped it would run with nothing armed while its
+            // peers keep ticking — and a snapshot session, which since plan
+            // 3 does carry the table, is not always what a wiped node
+            // rejoins by (a node still above the leader's floor rejoins by
+            // replay). The POSITION still goes to 0, so the next table frame
+            // — or a snapshot install, or a re-apply — adopts.
             ScheduleRecord {
                 position: 0,
                 time_ns: rec.time_ns,
@@ -4328,6 +4482,7 @@ impl Consensus {
         let table = decode_schedule_table(&reverted.table)
             .unwrap_or_else(|| panic!("corrupt reverted schedule record at {}", reverted.position));
         let armed = self.install_table(reverted.position, &table, self.cnc.log_time_ns());
+        self.refresh_schedule_bytes();
         crate::obs_event!(
             Warn,
             "schedule_table_reverted",
@@ -7344,6 +7499,7 @@ fn snapshot_set_for(
     root: &std::path::Path,
     services: &crate::services::ServicesConfig,
     config_bytes: &Mutex<Vec<u8>>,
+    schedule_bytes: &Mutex<(u64, u64, Vec<u8>)>,
     node_id: NodeId,
     decline_reason: &AtomicU8,
 ) -> Option<SnapshotSet> {
@@ -7428,12 +7584,12 @@ fn snapshot_set_for(
         identity,
         version,
         config: config_bytes.lock().unwrap().clone(),
-        // Time-and-timers plan 3: the schedule table this session ships.
-        // Empty here — plan 3 Task 3 reads the node's adopted table into it;
-        // `(0, 0, vec![])` is the honest "this leader has no table" value the
-        // wire already carries, so shipping it until then is correct, not a
-        // placeholder the receiver has to special-case.
-        table: (0, 0, Vec::new()),
+        // Time-and-timers plan 3: the schedule table this session ships —
+        // whatever this node has ADOPTED at ship time, exactly as `config`
+        // above. `(0, 0, [])` on a node that holds no table is the honest
+        // "this leader has no table" value the wire carries, and the joiner
+        // installs "no table" from it.
+        table: schedule_bytes.lock().unwrap().clone(),
         artifacts,
     })
 }
@@ -7741,6 +7897,7 @@ mod tests {
             schedule_pos_pub: Arc::new(AtomicU64::new(0)),
             schedule_entries_pub: Arc::new(AtomicU64::new(0)),
             schedule_refused: Arc::new(AtomicU64::new(0)),
+            schedule_bytes: Arc::new(Mutex::new((0, 0, Vec::new()))),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -7768,6 +7925,7 @@ mod tests {
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::new(AtomicU64::new(0)),
             incoming_snapshot_config: Arc::new(Mutex::new(Vec::new())),
+            incoming_snapshot_table: Arc::new(Mutex::new((0, 0, Vec::new()))),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
@@ -9493,6 +9651,138 @@ mod tests {
             h.cons.cnc.config_pending(),
             0,
             "the fiat install itself must clear the pending mirror"
+        );
+    }
+
+    // ---- plan 3 Task 3: the snapshot session carries the schedule table ----
+
+    /// Plan 3 (spec §5): a joiner below the floor installs the table the
+    /// session carried BY FIAT — the same argument `adopt_snapshot_config`
+    /// makes for the config, for the same reason: below the floor this node's
+    /// own record is not genuine (its bytes are gone), so there is nothing to
+    /// be idempotent AGAINST. The stale record here sits ABOVE the carried
+    /// position (8192 > 6016), which the frame path's
+    /// `position <= schedule_position` guard would have made a no-op — that
+    /// guard is exactly what must not be here.
+    ///
+    /// The floor is driven at `1 << 20` rather than the carried position: the
+    /// adopt branch is gated on `durable < pos`, and the harness's durable
+    /// counter is 6016. The TABLE's position (what the record and the gauge
+    /// take) is the leader's table-frame position, 6016, which is at or below
+    /// its floor by construction.
+    ///
+    /// Obs is not asserted directly: capturing `schedule_table_adopted` /
+    /// `snapshot_installed` means swapping the PROCESS-GLOBAL log sink, which
+    /// `obs::log`'s own unit tests also swap, in the same binary, in parallel
+    /// (see `the_snapshot_decline_latch_names_each_distinct_reason_once`). The
+    /// gauge, the durable record, the ship cache and the row's armed set are
+    /// the same facts the events report.
+    #[test]
+    fn a_fiat_snapshot_install_replaces_the_schedule_record_and_arms_it() {
+        use uc_protocol::v2::schedule::ScheduleEntry;
+
+        let mut h = harness();
+        // One declared row for the table's entries to land on (the harness is
+        // `none_for_tests`, which declares none).
+        let hash = crate::services::ServicesConfig::from_names(&["kv"], None)
+            .unwrap()
+            .name_of(0)
+            .unwrap()
+            .hash();
+        h.cons.timers[0] = Some(crate::timers::RowTimers::new(hash));
+
+        // The joiner's own, non-genuine record: a table at 8192 over a
+        // predecessor at 4096.
+        let stale = ScheduleRecord::empty().table;
+        crate::schedule_state::store(
+            &h.cons.schedule_state,
+            &ScheduleRecord {
+                position: 8192,
+                time_ns: 5,
+                table: stale.clone(),
+                prev: Some(Box::new(ScheduleRecord {
+                    position: 4096,
+                    time_ns: 1,
+                    table: stale,
+                    prev: None,
+                })),
+            },
+        )
+        .unwrap();
+        h.cons.schedule_position = 8192;
+        h.cons.schedule_pos_pub.store(8192, Ordering::Relaxed);
+
+        // The leader's table, as the receiver publishes it: the table cell
+        // BEFORE the position cell (which is what `Release`/`Acquire` on the
+        // position makes safe to read).
+        let mut bytes = Vec::new();
+        encode_schedule_table(
+            &ScheduleTable {
+                entries: vec![ScheduleEntry {
+                    identity_hash: hash,
+                    timer_id: 9,
+                    rule: ScheduleRule::Every {
+                        period_ns: 100,
+                        anchor_ns: 0,
+                    },
+                }],
+            },
+            &mut bytes,
+        );
+        *h.cons.incoming_snapshot_table.lock().unwrap() = (6016, 77, bytes.clone());
+        let floor = 1u64 << 20;
+        assert!(floor > h.cons.cnc.counters().durable.load_acquire());
+        h.cons.incoming_snapshot.store(floor, Ordering::Release);
+
+        h.cons.do_work();
+
+        let back = crate::schedule_state::load(&h.cons.schedule_state)
+            .unwrap()
+            .expect("a record is stored");
+        assert_eq!(
+            (back.position, back.time_ns, back.table.clone(), back.prev),
+            (6016, 77, bytes.clone(), None),
+            "the carried record replaces the joiner's own, with no history"
+        );
+        assert_eq!(h.cons.schedule_position, 6016);
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 6016);
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_len(),
+            1,
+            "the row is armed from the carried table"
+        );
+        assert_eq!(
+            *h.cons.schedule_bytes.lock().unwrap(),
+            (6016, 77, bytes),
+            "and the ship cache now carries it onward to the NEXT joiner"
+        );
+
+        // A leader with no table ships `(0, 0, [])`, which installs "no
+        // table": the record goes to position 0 and every row disarms.
+        *h.cons.incoming_snapshot_table.lock().unwrap() = (0, 0, Vec::new());
+        h.cons
+            .incoming_snapshot
+            .store(floor + 4096, Ordering::Release);
+
+        h.cons.do_work();
+
+        let back = crate::schedule_state::load(&h.cons.schedule_state)
+            .unwrap()
+            .expect("a record is stored");
+        assert_eq!(back.position, 0, "no table: the canonical position");
+        assert_eq!(
+            decode_schedule_table(&back.table)
+                .expect("a stored record's bytes always decode")
+                .entries,
+            Vec::new(),
+            "and an empty table, stored in its canonical encoding"
+        );
+        assert_eq!(h.cons.schedule_position, 0);
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_len(),
+            0,
+            "the row is disarmed"
         );
     }
 
@@ -11316,7 +11606,18 @@ mod tests {
         let services = crate::services::ServicesConfig::from_names(&["a", "b"], None).unwrap();
         let config_bytes = Mutex::new(vec![0xC0, 0xFF, 0xEE]);
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
-        let call = || snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
+        let schedule_bytes = Mutex::new((6016u64, 77u64, vec![0x5C, 0xED]));
+        let call = || {
+            snapshot_set_for(
+                &cnc,
+                &root,
+                &services,
+                &config_bytes,
+                &schedule_bytes,
+                7,
+                &latch,
+            )
+        };
 
         // 1. Nothing has snapshotted: decline "floor 0" — the first of its kind,
         //    so the latch TRANSITIONS (that is the log line).
@@ -11371,6 +11672,11 @@ mod tests {
             "the CURRENT config rides along"
         );
         assert_eq!(
+            set.table,
+            (6016, 77, vec![0x5C, 0xED]),
+            "and so does the CURRENT schedule table (plan 3)"
+        );
+        assert_eq!(
             set.artifacts
                 .iter()
                 .map(|a| (a.service_id, a.snapshot_pos, a.len))
@@ -11411,7 +11717,16 @@ mod tests {
         cnc.snapshots().node_snapshot_floor.store_release(4096);
         cnc.service_slot(0).snapshot_pos.store_release(1024);
         write_artifact(&root, 0, 1024, b"fsm-0 artifact");
-        let set = snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
+        let schedule_bytes = Mutex::new((0u64, 0u64, Vec::new()));
+        let set = snapshot_set_for(
+            &cnc,
+            &root,
+            &services,
+            &config_bytes,
+            &schedule_bytes,
+            7,
+            &latch,
+        );
         assert!(
             set.is_none(),
             "a none_for_tests node must never ship a snapshot set"
