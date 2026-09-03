@@ -56,8 +56,15 @@ The tree recon (2026-09-03) found five places where §5 as written cannot be bui
   ‖ a u64 ‖ b u64` = 33 B; 32 entries + an 8-byte header = 1064 B, inside
   the 1312 B crypto-on ceiling). Names appear only in the operator's TOML;
   `uc2ctl` resolves each against the node's cnc name lines and refuses an
-  undeclared one before any request is written. Two rules only: `every`
-  (`period_ns`, `anchor_ns`) and `at` (`secs_of_day`, UTC).
+  undeclared one before any request is written. Three rules: `every`
+  (`period_ns`, `anchor_ns`), `at` (`secs_of_day`, UTC) and `once`
+  (`at_ns`, one fixed deadline). A `once` entry fires one tick and then
+  **parks**: it stays in the table as delivered, with no next deadline, so
+  re-applying the same file does not fire it again; changing its time (or
+  its id) does. After a restart the node may re-append a past `once` tick —
+  boot arming has no delivered set until the service announces its
+  `table_last` — and `Timed` drops the duplicate (§4.6), the same
+  at-least-once/exactly-once split every table tick has.
 ```
 
 - [ ] **Step 2: §5, how the table reaches the leader.** After the first paragraph add:
@@ -88,8 +95,8 @@ cannot read the follower's file.
   `ev.table = true`. Exactly-once is the `table_last` rule (§4.6). Three
   differences from a programmatic instance, all deliberate:
   - **The node advances the entry at append** (`next = rule.next_after
-    (fired)`), so a leader keeps a table on schedule without waiting for
-    its service; a follower advances on the service's `TableConsumed
+    (fired)`; for `once` that is *no* deadline, and the entry parks), so a
+    leader keeps a table on schedule without waiting for its service; a follower advances on the service's `TableConsumed
     (id, deadline)` report, so a new leader starts from what its own
     service last delivered. A leader whose service lagged may re-fire ticks
     the old leader already fired; `Timed` drops them (at-least-once, as
@@ -124,11 +131,11 @@ cannot read the follower's file.
 - Produces (all `core`-only; `alloc::vec::Vec` is already used by `v2::config` — follow it):
   - `pub const FRAME_TYPE_SCHEDULE_TABLE: u8 = 6;`
   - `pub const MAX_SCHEDULE_ENTRIES: usize = 32; pub const SCHEDULE_ENTRY_LEN: usize = 33; pub const SCHEDULE_HEADER_LEN: usize = 8;` (header = `version: u32 ‖ count: u16 ‖ reserved: u16`, version fixed at `1`)
-  - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ScheduleRule { Every { period_ns: u64, anchor_ns: u64 }, DailyAt { secs_of_day: u32 } }` (kind byte `1` / `2`; `a ‖ b` = `period_ns ‖ anchor_ns` or `secs_of_day as u64 ‖ 0`)
+  - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ScheduleRule { Every { period_ns: u64, anchor_ns: u64 }, DailyAt { secs_of_day: u32 }, Once { at_ns: u64 } }` (kind byte `1` / `2` / `3`; `a ‖ b` = `period_ns ‖ anchor_ns`, `secs_of_day as u64 ‖ 0`, or `at_ns ‖ 0`)
   - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct ScheduleEntry { pub identity_hash: u64, pub timer_id: u64, pub rule: ScheduleRule }`
   - `#[derive(Debug, Clone, PartialEq, Eq)] pub struct ScheduleTable { pub entries: Vec<ScheduleEntry> }`
-  - `pub fn encode_schedule_table(t: &ScheduleTable, out: &mut Vec<u8>)`; `pub fn decode_schedule_table(buf: &[u8]) -> Option<ScheduleTable>` — total: `None` on a short buffer, a version ≠ 1, `count > 32`, a length ≠ `8 + 33·count`, an unknown kind, `period_ns == 0`, `secs_of_day >= 86_400`, or a duplicate `(identity_hash, timer_id)`.
-  - `impl ScheduleRule { pub const fn next_after(&self, t_ns: u64) -> u64 }` — the first occurrence strictly after `t_ns`; `pub const fn latest_at_or_before(&self, t_ns: u64) -> Option<u64>` — the latest occurrence `≤ t_ns` (`None` if before the anchor); `pub const fn arm(&self, last_delivered_ns: Option<u64>, log_time_ns: u64) -> u64` — the one-tick catch-up rule of spec §5: `match latest_at_or_before(log_time_ns) { Some(o) if Some(o) > last_delivered_ns => o, _ => next_after(last_delivered_ns.unwrap_or(log_time_ns)) }` (for `DailyAt`, "the anchor" is Unix epoch day 0). All saturating, all `u64`.
+  - `pub fn encode_schedule_table(t: &ScheduleTable, out: &mut Vec<u8>)`; `pub fn decode_schedule_table(buf: &[u8]) -> Option<ScheduleTable>` — total: `None` on a short buffer, a version ≠ 1, `count > 32`, a length ≠ `8 + 33·count`, an unknown kind, `period_ns == 0`, `secs_of_day >= 86_400`, a non-zero `b` on a `DailyAt`/`Once`, or a duplicate `(identity_hash, timer_id)`.
+  - `impl ScheduleRule { pub const fn next_after(&self, t_ns: u64) -> Option<u64> }` — the first occurrence strictly after `t_ns`; `None` only when nothing follows (a `Once` at or before `t_ns`); `pub const fn latest_at_or_before(&self, t_ns: u64) -> Option<u64>` — the latest occurrence `≤ t_ns` (`None` if before the anchor); `pub const fn arm(&self, last_delivered_ns: Option<u64>, log_time_ns: u64) -> Option<u64>` — the one-tick catch-up rule of spec §5: `match latest_at_or_before(log_time_ns) { Some(o) if Some(o) > last_delivered_ns => Some(o), _ => next_after(last_delivered_ns.unwrap_or(log_time_ns)) }` (for `DailyAt`, "the anchor" is Unix epoch day 0; for `Once` the only occurrence is `at_ns`, so a delivered `Once` arms to `None` = parked). All saturating, all `u64`.
   - `uc_protocol::v2::ipc::SchedOp::TableConsumed = 4`.
   - `pub const ADMIN_OP_SCHEDULE_APPLY: u32 = 6;` (in `uc_protocol/src/v2/cnc.rs` beside the admin-line docs) and the reason codes the node will use: `ADMIN_REASON_SCHEDULE_DIGEST = 40`, `ADMIN_REASON_SCHEDULE_MISSING = 41`, `ADMIN_REASON_SCHEDULE_DECODE = 42`, `ADMIN_REASON_SCHEDULE_UNKNOWN_FSM = 43` (check the existing reason-code range in `uc_node/src/audit.rs` and pick the next free block if 40 collides — say so in the report).
 - Consumed by: Tasks 2, 3, 4, 5, 6, 7.
@@ -150,13 +157,14 @@ mod tests {
             entries: alloc::vec![
                 ScheduleEntry { identity_hash: 0x0102_0304_0506_0708, timer_id: 7, rule: ScheduleRule::Every { period_ns: H, anchor_ns: 5 } },
                 ScheduleEntry { identity_hash: 9, timer_id: 8, rule: ScheduleRule::DailyAt { secs_of_day: 14 * 3600 } },
+                ScheduleEntry { identity_hash: 9, timer_id: 9, rule: ScheduleRule::Once { at_ns: 42 } },
             ],
         };
         let mut b = alloc::vec::Vec::new();
         encode_schedule_table(&t, &mut b);
-        assert_eq!(b.len(), SCHEDULE_HEADER_LEN + 2 * SCHEDULE_ENTRY_LEN);
+        assert_eq!(b.len(), SCHEDULE_HEADER_LEN + 3 * SCHEDULE_ENTRY_LEN);
         assert_eq!(&b[0..4], &1u32.to_le_bytes(), "version 1");
-        assert_eq!(&b[4..6], &2u16.to_le_bytes(), "count");
+        assert_eq!(&b[4..6], &3u16.to_le_bytes(), "count");
         assert_eq!(&b[6..8], &[0, 0], "reserved");
         assert_eq!(&b[8..16], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01], "hash LE");
         assert_eq!(&b[16..24], &7u64.to_le_bytes());
@@ -164,6 +172,9 @@ mod tests {
         assert_eq!(&b[25..33], &H.to_le_bytes());
         assert_eq!(&b[33..41], &5u64.to_le_bytes());
         assert_eq!(b[41 + 16], 2, "kind DailyAt");
+        assert_eq!(b[74 + 16], 3, "kind Once");
+        assert_eq!(&b[74 + 17..74 + 25], &42u64.to_le_bytes(), "once: a = at_ns");
+        assert_eq!(&b[74 + 25..74 + 33], &0u64.to_le_bytes(), "once: b = 0");
         assert_eq!(decode_schedule_table(&b), Some(t.clone()));
         // totality
         assert_eq!(decode_schedule_table(&b[..7]), None, "short header");
@@ -172,6 +183,7 @@ mod tests {
         let mut k = b.clone(); k[24] = 3; assert_eq!(decode_schedule_table(&k), None, "kind");
         let mut z = b.clone(); z[25..33].copy_from_slice(&0u64.to_le_bytes()); assert_eq!(decode_schedule_table(&z), None, "period 0");
         let mut d = b.clone(); d[41 + 17..41 + 25].copy_from_slice(&86_400u64.to_le_bytes()); assert_eq!(decode_schedule_table(&d), None, "secs_of_day out of range");
+        let mut ob = b.clone(); ob[74 + 25..74 + 33].copy_from_slice(&1u64.to_le_bytes()); assert_eq!(decode_schedule_table(&ob), None, "once: b must be 0");
         let mut dup = t.clone(); dup.entries.push(dup.entries[0]);
         let mut db = alloc::vec::Vec::new(); encode_schedule_table(&dup, &mut db);
         assert_eq!(decode_schedule_table(&db), None, "duplicate (hash, id)");
@@ -185,30 +197,44 @@ mod tests {
     #[test]
     fn every_rule_arithmetic() {
         let r = ScheduleRule::Every { period_ns: H, anchor_ns: 10 * H };
-        assert_eq!(r.next_after(0), 10 * H, "before the anchor: the anchor");
-        assert_eq!(r.next_after(10 * H), 11 * H, "strictly after");
-        assert_eq!(r.next_after(10 * H + 1), 11 * H);
+        assert_eq!(r.next_after(0), Some(10 * H), "before the anchor: the anchor");
+        assert_eq!(r.next_after(10 * H), Some(11 * H), "strictly after");
+        assert_eq!(r.next_after(10 * H + 1), Some(11 * H));
         assert_eq!(r.latest_at_or_before(9 * H), None);
         assert_eq!(r.latest_at_or_before(10 * H), Some(10 * H));
         assert_eq!(r.latest_at_or_before(12 * H + 5), Some(12 * H));
         // arm: one-tick catch-up
-        assert_eq!(r.arm(None, 12 * H + 5), 12 * H, "missed ticks collapse to the latest");
-        assert_eq!(r.arm(Some(12 * H), 12 * H + 5), 13 * H, "already delivered: the next");
-        assert_eq!(r.arm(Some(11 * H), 12 * H + 5), 12 * H, "one behind: the latest, once");
-        assert_eq!(r.arm(None, 0), 10 * H, "before the anchor: the anchor");
-        assert_eq!(r.next_after(u64::MAX - 1), u64::MAX, "saturates");
+        assert_eq!(r.arm(None, 12 * H + 5), Some(12 * H), "missed ticks collapse to the latest");
+        assert_eq!(r.arm(Some(12 * H), 12 * H + 5), Some(13 * H), "already delivered: the next");
+        assert_eq!(r.arm(Some(11 * H), 12 * H + 5), Some(12 * H), "one behind: the latest, once");
+        assert_eq!(r.arm(None, 0), Some(10 * H), "before the anchor: the anchor");
+        assert_eq!(r.next_after(u64::MAX - 1), Some(u64::MAX), "saturates");
+    }
+
+    #[test]
+    fn once_rule_arithmetic() {
+        let r = ScheduleRule::Once { at_ns: 5 * H };
+        assert_eq!(r.next_after(0), Some(5 * H));
+        assert_eq!(r.next_after(5 * H - 1), Some(5 * H));
+        assert_eq!(r.next_after(5 * H), None, "nothing follows a once");
+        assert_eq!(r.latest_at_or_before(5 * H - 1), None);
+        assert_eq!(r.latest_at_or_before(9 * H), Some(5 * H));
+        assert_eq!(r.arm(None, 0), Some(5 * H), "in the future: the deadline");
+        assert_eq!(r.arm(None, 9 * H), Some(5 * H), "missed: fires once, late");
+        assert_eq!(r.arm(Some(5 * H), 9 * H), None, "delivered: parked");
+        assert_eq!(r.arm(Some(4 * H), 9 * H), Some(5 * H), "re-applied with a newer deadline than the delivered one: fires");
     }
 
     #[test]
     fn daily_rule_arithmetic() {
         let r = ScheduleRule::DailyAt { secs_of_day: 14 * 3600 };
         let d0_14 = 14 * H;
-        assert_eq!(r.next_after(0), d0_14);
-        assert_eq!(r.next_after(d0_14), DAY + d0_14, "strictly after");
+        assert_eq!(r.next_after(0), Some(d0_14));
+        assert_eq!(r.next_after(d0_14), Some(DAY + d0_14), "strictly after");
         assert_eq!(r.latest_at_or_before(d0_14 - 1), None);
         assert_eq!(r.latest_at_or_before(DAY + d0_14 + 1), Some(DAY + d0_14));
-        assert_eq!(r.arm(None, 3 * DAY + 1), 2 * DAY + d0_14, "latest past occurrence, once");
-        assert_eq!(r.arm(Some(2 * DAY + d0_14), 3 * DAY + 1), 3 * DAY + d0_14);
+        assert_eq!(r.arm(None, 3 * DAY + 1), Some(2 * DAY + d0_14), "latest past occurrence, once");
+        assert_eq!(r.arm(Some(2 * DAY + d0_14), 3 * DAY + 1), Some(3 * DAY + d0_14));
     }
 }
 ```
@@ -245,6 +271,8 @@ pub enum ScheduleRule {
     Every { period_ns: u64, anchor_ns: u64 },
     /// Once a day at `secs_of_day` UTC (occurrences: k·day + secs).
     DailyAt { secs_of_day: u32 },
+    /// One fixed deadline; after it, nothing (the entry parks).
+    Once { at_ns: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,21 +288,25 @@ pub struct ScheduleTable {
 }
 
 impl ScheduleRule {
-    /// First occurrence strictly after `t_ns` (saturating).
-    pub const fn next_after(&self, t_ns: u64) -> u64 {
+    /// First occurrence strictly after `t_ns` (saturating); `None` when
+    /// nothing follows — only a `Once` at or before `t_ns`.
+    pub const fn next_after(&self, t_ns: u64) -> Option<u64> {
         match *self {
             ScheduleRule::Every { period_ns, anchor_ns } => {
                 if t_ns < anchor_ns {
-                    return anchor_ns;
+                    return Some(anchor_ns);
                 }
                 let k = (t_ns - anchor_ns) / period_ns + 1;
-                anchor_ns.saturating_add(k.saturating_mul(period_ns))
+                Some(anchor_ns.saturating_add(k.saturating_mul(period_ns)))
             }
             ScheduleRule::DailyAt { secs_of_day } => {
                 let off = secs_of_day as u64 * NS_PER_SEC;
                 let day = t_ns / NS_PER_DAY;
                 let today = day.saturating_mul(NS_PER_DAY).saturating_add(off);
-                if today > t_ns { today } else { (day + 1).saturating_mul(NS_PER_DAY).saturating_add(off) }
+                Some(if today > t_ns { today } else { (day + 1).saturating_mul(NS_PER_DAY).saturating_add(off) })
+            }
+            ScheduleRule::Once { at_ns } => {
+                if t_ns < at_ns { Some(at_ns) } else { None }
             }
         }
     }
@@ -293,15 +325,19 @@ impl ScheduleRule {
                 let today = day * NS_PER_DAY + off;
                 if today <= t_ns { Some(today) } else if day == 0 { None } else { Some((day - 1) * NS_PER_DAY + off) }
             }
+            ScheduleRule::Once { at_ns } => {
+                if at_ns <= t_ns { Some(at_ns) } else { None }
+            }
         }
     }
     /// Spec §5 one-tick catch-up: the latest missed occurrence if any is
-    /// newer than what was delivered, else the next one.
-    pub const fn arm(&self, last_delivered_ns: Option<u64>, log_time_ns: u64) -> u64 {
+    /// newer than what was delivered, else the next one; `None` = parked
+    /// (a `Once` already delivered).
+    pub const fn arm(&self, last_delivered_ns: Option<u64>, log_time_ns: u64) -> Option<u64> {
         let latest = self.latest_at_or_before(log_time_ns);
         match (latest, last_delivered_ns) {
-            (Some(o), None) => o,
-            (Some(o), Some(l)) if o > l => o,
+            (Some(o), None) => Some(o),
+            (Some(o), Some(l)) if o > l => Some(o),
             (_, Some(l)) => self.next_after(l),
             (None, None) => self.next_after(log_time_ns),
         }
@@ -318,6 +354,7 @@ pub fn encode_schedule_table(t: &ScheduleTable, out: &mut Vec<u8>) {
         let (kind, a, b) = match e.rule {
             ScheduleRule::Every { period_ns, anchor_ns } => (1u8, period_ns, anchor_ns),
             ScheduleRule::DailyAt { secs_of_day } => (2u8, secs_of_day as u64, 0),
+            ScheduleRule::Once { at_ns } => (3u8, at_ns, 0),
         };
         out.push(kind);
         out.extend_from_slice(&a.to_le_bytes());
@@ -346,6 +383,7 @@ pub fn decode_schedule_table(buf: &[u8]) -> Option<ScheduleTable> {
         let rule = match kind {
             1 if a > 0 => ScheduleRule::Every { period_ns: a, anchor_ns: b },
             2 if a < 86_400 && b == 0 => ScheduleRule::DailyAt { secs_of_day: a as u32 },
+            3 if b == 0 => ScheduleRule::Once { at_ns: a },
             _ => return None,
         };
         if entries.iter().any(|e: &ScheduleEntry| e.identity_hash == identity_hash && e.timer_id == timer_id) {
@@ -362,7 +400,7 @@ pub fn decode_schedule_table(buf: &[u8]) -> Option<ScheduleTable> {
 - [ ] **Step 4: Run** `cargo fmt --all && cargo clippy -p uc_protocol --all-targets -- -D warnings && cargo test -p uc_protocol && (cd fuzz && RUSTFLAGS="--cfg fuzzing" cargo +nightly check)` — the existing `uc_protocol_sched_record` fuzz target must still compile (it round-trips any decoded op).
 Expected: PASS.
 
-- [ ] **Step 5: Commit** `feat(uc_protocol): schedule table — FRAME_TYPE_SCHEDULE_TABLE, frozen 33-byte-entry codec, Every/DailyAt arithmetic with one-tick arm, SchedOp::TableConsumed, admin op 6 (tests: table_codec_pins_bytes_and_is_total, every_rule_arithmetic, daily_rule_arithmetic)`.
+- [ ] **Step 5: Commit** `feat(uc_protocol): schedule table — FRAME_TYPE_SCHEDULE_TABLE, frozen 33-byte-entry codec, Every/DailyAt/Once arithmetic with one-tick arm, SchedOp::TableConsumed, admin op 6 (tests: table_codec_pins_bytes_and_is_total, every_rule_arithmetic, daily_rule_arithmetic, once_rule_arithmetic)`.
 
 ---
 
@@ -453,11 +491,11 @@ plus `take_table_observations`/`retain_table_observations` modelled on the confi
 **Interfaces:**
 - Produces on `RowTimers`:
   - `pub fn adopt_table(&mut self, entries: &[(u64 /*id*/, ScheduleRule)], log_time_ns: u64)` — replaces this row's table: entries not in the new list are dropped (and their heap entries lazily discarded); a kept id keeps its `last_delivered`; every entry's `next` is recomputed with `rule.arm(last_delivered, log_time_ns)`.
-  - `pub fn table_fired(&mut self, id: u64, deadline_ns: u64)` — leader, after a successful append: `next = rule.next_after(deadline_ns)`, re-pushed; nothing goes to `in_flight`.
-  - `pub fn table_delivered(&mut self, id: u64, deadline_ns: u64)` — from the service's `TableConsumed` (follower path, and the post-attach announce): `last_delivered = max(last, deadline)`; if `next <= deadline` then `next = rule.next_after(deadline)` and re-push.
+  - `pub fn table_fired(&mut self, id: u64, deadline_ns: u64)` — leader, after a successful append: `next = rule.next_after(deadline_ns)`, re-pushed if `Some`; a `Once` gets `None` and **parks** (stays in the table, holds no deadline); nothing goes to `in_flight`.
+  - `pub fn table_delivered(&mut self, id: u64, deadline_ns: u64)` — from the service's `TableConsumed` (follower path, and the post-attach announce): `last_delivered = max(last, deadline)`; if `next` is `None` or `<= deadline` then `next = rule.next_after(deadline)` and re-push if `Some`.
   - `peek_due(&mut self, now) -> Option<(u64, u64, bool /*table*/)>` — the heap is shared; the third field says which kind the head is (a table entry is stale in the heap when its deadline ≠ `entry.next`, exactly as a programmatic one is stale when ≠ `pending[id]`).
   - `take_in_flight` is unchanged and must NOT be called for a table head; `rearm` ignores table entries by construction (they are never in `in_flight`).
-  - `pub fn table_len(&self) -> usize`; `pending_len()` now counts programmatic + table.
+  - `pub fn table_len(&self) -> usize` (every entry, parked ones included); `pending_len()` now counts programmatic + table entries that hold a deadline (a parked `Once` is not pending).
   - A heap key that cannot collide between the two kinds: use `Reverse<(u64 /*deadline*/, u64 /*id*/, bool /*table*/)>`.
 - Consumed by: Task 4.
 
@@ -515,6 +553,26 @@ plus `take_table_observations`/`retain_table_observations` modelled on the confi
         assert_eq!(t.peek_due(1_000), None);
         assert_eq!(t.pending_len(), 1, "the table entry (next 1_400) still counts as pending");
     }
+
+    #[test]
+    fn once_entries_fire_once_park_and_survive_re_adoption() {
+        use uc_protocol::v2::schedule::ScheduleRule;
+        let mut t = RowTimers::new(1);
+        let r = ScheduleRule::Once { at_ns: 500 };
+        t.adopt_table(&[(3, r)], 0);
+        assert_eq!(t.pending_len(), 1);
+        assert_eq!(t.peek_due(499), None);
+        assert_eq!(t.peek_due(500), Some((3, 500, true)));
+        t.table_fired(3, 500);
+        assert_eq!(t.peek_due(u64::MAX), None, "nothing follows a once");
+        assert_eq!(t.pending_len(), 0, "a parked once is not pending");
+        assert_eq!(t.table_len(), 1, "but it is still in the table");
+        t.table_delivered(3, 500); // the service reported it (leader or follower)
+        t.adopt_table(&[(3, r)], 9_000);
+        assert_eq!(t.peek_due(u64::MAX), None, "re-applying the same once does not re-fire a delivered one");
+        t.adopt_table(&[(3, ScheduleRule::Once { at_ns: 7_000 })], 9_000);
+        assert_eq!(t.peek_due(u64::MAX), Some((3, 7_000, true)), "a newer deadline for the same id fires (late, once)");
+    }
 ```
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p uc_node --lib timers` → compile errors.
@@ -522,17 +580,17 @@ plus `take_table_observations`/`retain_table_observations` modelled on the confi
 - [ ] **Step 3: Implement.** Add to `RowTimers`:
 
 ```rust
-struct TableEntry { rule: ScheduleRule, next: u64, last_delivered: Option<u64> }
+struct TableEntry { rule: ScheduleRule, next: Option<u64> /* None = parked */, last_delivered: Option<u64> }
 // field:
 table: HashMap<u64, TableEntry>,
 // heap element becomes Reverse<(u64, u64, bool)>
 ```
 
-`peek_due` checks staleness per kind: `table == false` → `pending.get(&id) == Some(&dl)`; `table == true` → `self.table.get(&id).map(|e| e.next) == Some(dl)`. `adopt_table`: retain `last_delivered` for kept ids, drop others, `next = rule.arm(last_delivered, log_time_ns)`, push. `table_fired`: `if let Some(e) = self.table.get_mut(&id) && e.next == deadline_ns { e.next = e.rule.next_after(deadline_ns); heap.push(...) }`. `table_delivered`: `e.last_delivered = max(..)`; `if e.next <= deadline_ns { e.next = e.rule.next_after(deadline_ns); push }`. `pending_len = pending.len() + table.len()`. Existing tests must stay green (they use the `(id, dl)` shape of `peek_due` — update their destructuring to the triple).
+`peek_due` checks staleness per kind: `table == false` → `pending.get(&id) == Some(&dl)`; `table == true` → `self.table.get(&id).and_then(|e| e.next) == Some(dl)`. `adopt_table`: retain `last_delivered` for kept ids, drop others, `next = rule.arm(last_delivered, log_time_ns)`, push if `Some`. `table_fired`: `if let Some(e) = self.table.get_mut(&id) && e.next == Some(deadline_ns) { e.next = e.rule.next_after(deadline_ns); if let Some(n) = e.next { heap.push(...) } }`. `table_delivered`: `e.last_delivered = max(..)`; `if e.next.is_none_or(|n| n <= deadline_ns) { e.next = e.rule.next_after(deadline_ns); push if Some }`. `pending_len = pending.len() + table.values().filter(|e| e.next.is_some()).count()`. Existing tests must stay green (they use the `(id, dl)` shape of `peek_due` — update their destructuring to the triple).
 
-- [ ] **Step 4: Run** `cargo fmt --all && cargo clippy -p uc_node --all-targets -- -D warnings && cargo test -p uc_node --lib timers` → PASS (7 tests).
+- [ ] **Step 4: Run** `cargo fmt --all && cargo clippy -p uc_node --all-targets -- -D warnings && cargo test -p uc_node --lib timers` → PASS (8 tests).
 
-- [ ] **Step 5: Commit** `feat(uc_node): RowTimers table entries — adopt/arm, advance on fire, advance on delivered, shared heap by kind (tests: table_entries_advance_on_fire_and_never_enter_in_flight, table_delivered_advances_a_follower_and_adopt_keeps_last_delivered, programmatic_and_table_share_the_heap_in_deadline_order)`.
+- [ ] **Step 5: Commit** `feat(uc_node): RowTimers table entries — adopt/arm, advance on fire, advance on delivered, shared heap by kind, once entries park (tests: table_entries_advance_on_fire_and_never_enter_in_flight, table_delivered_advances_a_follower_and_adopt_keeps_last_delivered, programmatic_and_table_share_the_heap_in_deadline_order, once_entries_fire_once_park_and_survive_re_adoption)`.
 
 ---
 
@@ -553,7 +611,7 @@ table: HashMap<u64, TableEntry>,
 - `fire_due_timers`: when `peek_due` says `table == true`, append with `flags = FLAG_TIMER_TABLE`, then `t.table_fired(id, dl)` instead of `take_in_flight`; counters as today.
 - `drain_sched_rings`: `SchedOp::TableConsumed => t.table_delivered(r.timer_id, r.deadline_ns)`.
 - `handle_admin`, new arm for `req.op == ADMIN_OP_SCHEDULE_APPLY` after `verify_admin`: leader-only (follower: `status = 2`, reason `0`, no forward — reuse the "no leader / cannot forward" reply shape but skip the forward); read `<instance_dir>/schedules.pending` (missing → `1`/`SCHEDULE_MISSING`), check `schedule_digest(&bytes) == (req.id, req.ip, req.port)` (else `1`/`SCHEDULE_DIGEST`), decode (else `1`/`SCHEDULE_DECODE`), every `identity_hash` must be a declared row's hash (else `1`/`SCHEDULE_UNKNOWN_FSM`), append (`WouldOverrun` → `2`), reply `0` with `version = position`; audit every outcome through `audit_admin` with the op name `schedule_apply` (the `AuditedReq` carries `id/ip/port`, which here are the digest — fine, it is what was signed); delete the staged file after a successful append.
-- Metrics: `uc2_schedule_table_position` (gauge: the adopted frame END, 0 = none), `uc2_schedule_entries` (gauge), `uc2_schedule_apply_refused_total` (counter, `ObsSources` field). `CONTRACT_SERIES` updated; `uc2ctl status` prints `schedule_position=` (Task 6).
+- Metrics: `uc2_schedule_table_position` (gauge: the adopted frame END, 0 = none), `uc2_schedule_entries` (gauge: every adopted entry, parked `once` ones included — `uc2_timers_pending` is the one that excludes them), `uc2_schedule_apply_refused_total` (counter, `ObsSources` field). `CONTRACT_SERIES` updated; `uc2ctl status` prints `schedule_position=` (Task 6).
 
 - [ ] **Step 1: Write the failing tests.** `uc_node/src/schedule_state.rs` `mod tests`: `digest_is_the_first_ten_bytes_of_sha256_le` (pin against a known vector: SHA-256 of `b"abc"` starts `ba7816bf 8f01cfea 414140de`, so `id = 0xbf1678ba`, `ip = 0xeacf018f`, `port = 0x4041`), `record_roundtrips_through_a_stable_value` (temp dir under the cargo target tree). `uc_node/tests/services.rs`: `a_node_reloads_its_schedule_record_at_boot_and_arms_from_the_log_clock` — start a node, write a `ScheduleRecord` for a declared row through the crate's `pub(crate)`... — not reachable from an integration test; instead make this a `#[cfg(test)]` unit test in `node.rs` if the two in-module constructors allow (they do: `node.rs` has `mod tests` with `on_collapsed` helpers), or defer the boot-arming assertion to Task 7's end-to-end restart test (preferred: Task 7's test restarts a node with a live table and asserts ticks resume without a flood). Choose the latter and say so.
 
@@ -639,8 +697,8 @@ fn table_ticks_deliver_strictly_increasing_deadlines_and_report_table_consumed()
 - Test: `uc_ctl/src/schedule.rs` `mod tests` (parsing + validation + encoding), `uc_node/tests/admin_auth.rs` (Task 7 runs the request end to end)
 
 **Interfaces:**
-- TOML per spec §5: `[[schedule]] fsm = "<name>" id = <u64> every = "<dur>" anchor = "<rfc3339>"` OR `at = "HH:MM[:SS]"`. Durations: `<n>(ns|us|ms|s|m|h|d)`; RFC 3339 parsed with the crate the tree already uses for timestamps (`grep -rn "chrono\|time = " Cargo.toml uc_*/Cargo.toml`; if none, accept only the `YYYY-MM-DDTHH:MM:SSZ` form and parse it by hand — the plan does not add a date crate for one field).
-- `pub fn parse_table(toml_text: &str, resolve: impl Fn(&str) -> Option<u64>) -> Result<ScheduleTable, ScheduleFileError>` — `resolve` maps an FSM name to its identity hash via the node's cnc name lines (`cnc.service_slot(row).identity.name()/hash()` for each declared row); errors by name: unknown fsm, duplicate `(fsm, id)`, both/neither of `every`/`at`, bad duration, bad time, > 32 entries, encoded length > the ceiling.
+- TOML per spec §5: `[[schedule]] fsm = "<name>" id = <u64>` plus exactly one of `every = "<dur>" anchor = "<rfc3339>"`, `at = "HH:MM[:SS]"`, or `once = "<rfc3339>"`. Durations: `<n>(ns|us|ms|s|m|h|d)`; RFC 3339 parsed with the crate the tree already uses for timestamps (`grep -rn "chrono\|time = " Cargo.toml uc_*/Cargo.toml`; if none, accept only the `YYYY-MM-DDTHH:MM:SSZ` form and parse it by hand — the plan does not add a date crate for one field).
+- `pub fn parse_table(toml_text: &str, resolve: impl Fn(&str) -> Option<u64>) -> Result<ScheduleTable, ScheduleFileError>` — `resolve` maps an FSM name to its identity hash via the node's cnc name lines (`cnc.service_slot(row).identity.name()/hash()` for each declared row); errors by name: unknown fsm, duplicate `(fsm, id)`, not exactly one of `every`/`at`/`once` (message contains "exactly one of"), `anchor` without `every`, bad duration, bad time, > 32 entries, encoded length > the ceiling.
 - `pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()>`: parse → encode → write `<instance_dir>/schedules.pending` (write to a temp name, fsync, rename; mode 0600) → `schedule_digest` (the same function as the node's; put it in `uc_protocol::v2::schedule` as `pub fn digest_fields(bytes) -> (u32, u32, u16)` so both sides share it — move Task 4's helper there) → build `AdminReq { op: ADMIN_OP_SCHEDULE_APPLY, id, ip, port, .. }` and send it through the existing signed-request helper (`uc_ctl/src/main.rs` ~416-490: `write_admin_req` + `read_admin_resp` + the HMAC line) → print `applied: position=<version>` or the refusal by reason name (extend the reason-name table with the four new codes).
 - `pub fn show(common: &CommonArgs)`: read `state/schedules.state` through `uc_node::backup`'s `open_state_readonly::<ScheduleRecord>` (make `ScheduleRecord` `pub` in `uc_node` and re-export it) and print one line per entry (`fsm=<name via cnc> id=<id> rule=<every …|at …>`), or `no schedule table adopted`.
 
@@ -660,15 +718,22 @@ anchor = "2026-01-01T00:00:00Z"
 fsm = "kv"
 id = 2
 at = "14:00"
+[[schedule]]
+fsm = "kv"
+id = 3
+once = "2026-01-01T00:00:00Z"
 "#, resolve).unwrap();
-        assert_eq!(t.entries.len(), 2);
+        assert_eq!(t.entries.len(), 3);
         assert_eq!(t.entries[0].identity_hash, 0xabc);
         assert_eq!(t.entries[0].rule, ScheduleRule::Every { period_ns: 3_600_000_000_000, anchor_ns: 1_767_225_600_000_000_000 });
         assert_eq!(t.entries[1].rule, ScheduleRule::DailyAt { secs_of_day: 50_400 });
+        assert_eq!(t.entries[2].rule, ScheduleRule::Once { at_ns: 1_767_225_600_000_000_000 });
         let e = parse_table("[[schedule]]\nfsm = \"nope\"\nid = 1\nevery = \"1s\"\nanchor = \"2026-01-01T00:00:00Z\"\n", resolve).unwrap_err();
         assert!(e.to_string().contains("nope"), "{e}");
         let e = parse_table("[[schedule]]\nfsm = \"kv\"\nid = 1\nevery = \"1s\"\nat = \"14:00\"\n", resolve).unwrap_err();
-        assert!(e.to_string().contains("either"), "{e}");
+        assert!(e.to_string().contains("exactly one of"), "{e}");
+        let e = parse_table("[[schedule]]\nfsm = \"kv\"\nid = 1\nonce = \"2026-01-01T00:00:00Z\"\nat = \"14:00\"\n", resolve).unwrap_err();
+        assert!(e.to_string().contains("exactly one of"), "{e}");
         let e = parse_table("[[schedule]]\nfsm = \"kv\"\nid = 1\nevery = \"0s\"\nanchor = \"2026-01-01T00:00:00Z\"\n", resolve).unwrap_err();
         assert!(e.to_string().contains("period"), "{e}");
     }
@@ -693,11 +758,11 @@ at = "14:00"
 
 **Tests to write (each watched red — say against what):**
 
-1. `uc_node/tests/timers.rs::a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick` — single node, `Timed<ClockSm>`; apply a table (`every = 200ms`, anchor = now rounded down) through the in-process admin path (write the staged file + `write_admin_req` as `admin_auth.rs` does; `AdminPolicy::Filesystem`); wait for ≥ 5 fires; assert every fire has `table == true` (extend `ClockSm::Fired` with `table: bool`), deadlines strictly increase by exactly 200 ms, each `time_ns == deadline_ns` (on time), no duplicates, and `uc2_schedule_entries`/the cnc `timers_pending` count ≥ 1. Red: with the `fire_due_timers` table branch stubbed.
-2. `uc_node/tests/timers.rs::a_restarted_node_resumes_the_table_with_one_catch_up_tick` — same, then stop the node and service, sleep 1 s (5 ticks' worth), restart both on the same dir; assert the first post-restart fire's deadline is the LATEST missed occurrence (one tick, not five) and ticks continue; assert the record was reloaded (`uc2_schedule_table_position` > 0 immediately after start, via `/metrics` or the `uc2ctl status` line). Red: with boot arming disabled.
+1. `uc_node/tests/timers.rs::a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick` — single node, `Timed<ClockSm>`; apply a table with two entries — id 1 `every = 200ms`, anchor = now rounded down; id 2 `once` = now + 300 ms — through the in-process admin path (write the staged file + `write_admin_req` as `admin_auth.rs` does; `AdminPolicy::Filesystem`); wait for ≥ 5 fires of id 1; assert every fire has `table == true` (extend `ClockSm::Fired` with `table: bool`), id 1's deadlines strictly increase by exactly 200 ms, each `time_ns == deadline_ns` (on time), no duplicates, id 2 fired exactly once at its deadline and never again within the window, and `uc2_schedule_entries == 2` while the cnc `timers_pending` count is 1 after the once has parked. Red: with the `fire_due_timers` table branch stubbed.
+2. `uc_node/tests/timers.rs::a_restarted_node_resumes_the_table_with_one_catch_up_tick` — same, then stop the node and service, sleep 1 s (5 ticks' worth), restart both on the same dir; assert the first post-restart fire of id 1 is the LATEST missed occurrence (one tick, not five) and ticks continue; assert the FSM does not see id 2 (the parked `once`) fire again — the node may re-append it before the service announces its `table_last`, and `Timed` must drop that duplicate; assert the record was reloaded (`uc2_schedule_table_position` > 0 immediately after start, via `/metrics` or the `uc2ctl status` line). Red: with boot arming disabled.
 3. `uc_node/tests/admin_auth.rs::schedule_apply_is_signed_digest_checked_leader_only_and_audited` — under `AdminPolicy::Hmac`: a correctly signed request with a matching digest is accepted (`status 0`, audit line `op=schedule_apply outcome=accepted`); a request whose digest does not match the staged bytes is refused (`reason = SCHEDULE_DIGEST`, audited as refused); the same request on a follower answers `status 2`; a request naming an undeclared FSM hash is refused (`SCHEDULE_UNKNOWN_FSM`). Red: each branch by commenting out its check.
-4. Capstone: `TimerSm` gains `table: bool` on `FiredRec`; `assert_timer_report` gains clause (7): table fires per `(id)` have strictly increasing deadlines, each `deadline == rule.next_after(previous)` for the rule the test applied (pass the rule into the checker), and `time_ns >= deadline`; `two_fsm_timer_churn_under_failover` applies a 150 ms `every` table to row 1 (leader-only apply at start) and asserts ≥ 20 table fires with the clause, replication-equivalent across nodes. Red: with `table_fired` not advancing.
-5. Fuzz: `uc_protocol_schedule_table` (decode → encode → decode equality; `arm`/`next_after` total on the decoded rules for a fuzzed `t`), seeds: the two-entry table, a 32-entry table, short, bad kind, duplicate.
+4. Capstone: `TimerSm` gains `table: bool` on `FiredRec`; `assert_timer_report` gains clause (7): table fires per `(id)` have strictly increasing deadlines, each `Some(deadline) == rule.next_after(previous)` for the rule the test applied (pass the rule into the checker), and `time_ns >= deadline`; `two_fsm_timer_churn_under_failover` applies a 150 ms `every` table to row 1 (leader-only apply at start) and asserts ≥ 20 table fires with the clause, replication-equivalent across nodes. Red: with `table_fired` not advancing.
+5. Fuzz: `uc_protocol_schedule_table` (decode → encode → decode equality; `arm`/`next_after` total on the decoded rules for a fuzzed `t`), seeds: the three-entry table (one of each kind), a 32-entry table, short, bad kind, a once with `b ≠ 0`, duplicate.
 
 - [ ] **Step 1–3**: write, run red, implement per the list; the capstone and crashtest runs record seeds/wall time/fire counts.
 - [ ] **Step 4: Run** the Global Constraints set + `cargo test -p uc_node --test timers -- --test-threads=1` + `cargo test -p uc_node --test lin_v2 two_fsm_timer_churn_under_failover -- --nocapture` + `scripts/fuzz_smoke.sh --min-runs 1000 30 uc_protocol_schedule_table` (check the script's argument order first).
@@ -708,7 +773,7 @@ at = "14:00"
 ### Task 8: Docs, release bullet, runbook, attack surface, gate rows
 
 **Files:**
-- Modify: `docs/reference/wire-protocol.md` (frame type 6 + the body), `docs/reference/limits.md` (32 entries, the 1064 B body), `docs/reference/uc2ctl.md` (`schedule apply/show`), `docs/ops/uc2-runbook.md` (the staged file, the reason codes, `state/schedules.state`, `uc2ctl status`'s `schedule_position=`), `docs/how-to/monitor-a-cluster.md` (the three families), `docs/security/attack-surface.md` (the staged file is a local-write surface authenticated by the signed 80-bit digest under `hmac`, trusted under the filesystem policy like every admin op; the frame decoder is total and fuzzed), `docs/notes/uc2-log-time-and-timers-explained.md` (a "the schedule table" section: the one-tick catch-up, why the node advances at append, why a truncated tick is not re-fired), `RELEASES.md` + `docs/releases.md` (the third time bullet: the replicated schedule table), `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (row e: a 32-entry table with 100 ms rules on one FSM, bar = `uc2_timers_late_total == 0` after warm-up and throughput within row a's resolution; result cell empty), `packaging/prometheus/uc2-alerts.yml` (`Uc2ScheduleTableDiverged`: `count(count_values("p", uc2_schedule_table_position)) > 1` for 60 s — every node must hold the same adopted position), `CLAUDE.md` ("Standing facts": the table; "Next up": plan 2 done), `docs/BACKLOG.md` (item 2a → done, pointer to the plan), the spec (§11 plan-2 items marked as-built)
+- Modify: `docs/reference/wire-protocol.md` (frame type 6 + the body), `docs/reference/limits.md` (32 entries, three rule kinds, the 1064 B body), `docs/reference/uc2ctl.md` (`schedule apply/show`), `docs/ops/uc2-runbook.md` (the staged file, the reason codes, `state/schedules.state`, `uc2ctl status`'s `schedule_position=`), `docs/how-to/monitor-a-cluster.md` (the three families), `docs/security/attack-surface.md` (the staged file is a local-write surface authenticated by the signed 80-bit digest under `hmac`, trusted under the filesystem policy like every admin op; the frame decoder is total and fuzzed), `docs/notes/uc2-log-time-and-timers-explained.md` (a "the schedule table" section: the one-tick catch-up, why the node advances at append, why a truncated tick is not re-fired, why a `once` parks in the table instead of leaving it — so a re-apply cannot re-fire it — and how an operator removes an entry: apply a table without it), `RELEASES.md` + `docs/releases.md` (the third time bullet: the replicated schedule table), `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (row e: a 32-entry table with 100 ms rules on one FSM, bar = `uc2_timers_late_total == 0` after warm-up and throughput within row a's resolution; result cell empty), `packaging/prometheus/uc2-alerts.yml` (`Uc2ScheduleTableDiverged`: `count(count_values("p", uc2_schedule_table_position)) > 1` for 60 s — every node must hold the same adopted position), `CLAUDE.md` ("Standing facts": the table; "Next up": plan 2 done), `docs/BACKLOG.md` (item 2a → done, pointer to the plan), the spec (§11 plan-2 items marked as-built)
 - The sweep check: every constant/name in the docs exists in the tree; every link resolves.
 
 - [ ] **Step 1–3**: write; `ls` every linked path; grep every named constant.
@@ -718,8 +783,8 @@ at = "14:00"
 
 ## Self-review (run before handing this plan over)
 
-**Spec coverage (§5 as amended by Task 0).** Admin-applied TOML → Task 6; leader appends frame type 6 → Tasks 1, 2, 4; every node adopts from the archive walk → Tasks 2, 4; persisted in `state/schedules.state` → Task 4; applying replaces the whole table → Task 3 (`adopt_table` drops absent ids) + Task 4; entries hash-keyed, ≤ 32, two rules → Task 1; next deadline from the fired deadline → Tasks 1, 3, 4; first deadline from the frame's own stamp (and the one-tick catch-up) → Tasks 1, 3, 4; same heap, same TIMER frame with the flag, `ev.table` → Tasks 3, 4, 5 (+ plan 1's `Timed`); exactly-once via `table_last` → plan 1 + Task 5's `TableConsumed`; leader-only apply with the staged file + digest → Tasks 4, 6; observability → Tasks 4, 8; tests → Task 7; docs/release → Task 8. §10's "`node.toml [schedules]` as a boot-time convenience" stays a door.
+**Spec coverage (§5 as amended by Task 0).** Admin-applied TOML → Task 6; leader appends frame type 6 → Tasks 1, 2, 4; every node adopts from the archive walk → Tasks 2, 4; persisted in `state/schedules.state` → Task 4; applying replaces the whole table → Task 3 (`adopt_table` drops absent ids) + Task 4; entries hash-keyed, ≤ 32, three rules (`every`, `at`, `once`) → Task 1; next deadline from the fired deadline → Tasks 1, 3, 4; first deadline from the frame's own stamp (and the one-tick catch-up) → Tasks 1, 3, 4; same heap, same TIMER frame with the flag, `ev.table` → Tasks 3, 4, 5 (+ plan 1's `Timed`); exactly-once via `table_last` → plan 1 + Task 5's `TableConsumed`; leader-only apply with the staged file + digest → Tasks 4, 6; observability → Tasks 4, 8; tests → Task 7; docs/release → Task 8. §10's "`node.toml [schedules]` as a boot-time convenience" stays a door.
 
 **Placeholders.** Task 4's `handle_admin` arm and Task 6's `apply` are described against named existing helpers rather than reproduced (the admin path is 300 lines of existing code the executor reads); every other code step has code. Task 7 lists each test's assertions and its red condition.
 
-**Type consistency.** `ScheduleRule::{next_after, latest_at_or_before, arm}` (Task 1) are what `RowTimers` (Task 3) and the capstone clause (Task 7) call. `RowTimers::{adopt_table, table_fired, table_delivered}` and the triple-returning `peek_due` (Task 3) are what `fire_due_timers`/`drain_sched_rings`/`adopt_table_frame` (Task 4) call. `SchedOp::TableConsumed` (Task 1) is what `ApplyCtx::consumed_table` emits (Task 5) and `drain_sched_rings` maps to `table_delivered` (Task 4). `ADMIN_OP_SCHEDULE_APPLY` + the four reason codes (Task 1) are what `handle_admin` (Task 4), `audit::op_name` (Task 4) and `uc2ctl` (Task 6) use. `digest_fields` lives in `uc_protocol::v2::schedule` and is shared by Tasks 4 and 6. `ScheduleRecord` is `pub` in `uc_node` for Task 6's `show`.
+**Type consistency.** `ScheduleRule::{next_after, latest_at_or_before, arm}` (Task 1), all returning `Option<u64>` since the `once` rule, are what `RowTimers` (Task 3, `TableEntry.next: Option<u64>`) and the capstone clause (Task 7) call. `RowTimers::{adopt_table, table_fired, table_delivered}` and the triple-returning `peek_due` (Task 3) are what `fire_due_timers`/`drain_sched_rings`/`adopt_table_frame` (Task 4) call. `SchedOp::TableConsumed` (Task 1) is what `ApplyCtx::consumed_table` emits (Task 5) and `drain_sched_rings` maps to `table_delivered` (Task 4). `ADMIN_OP_SCHEDULE_APPLY` + the four reason codes (Task 1) are what `handle_admin` (Task 4), `audit::op_name` (Task 4) and `uc2ctl` (Task 6) use. `digest_fields` lives in `uc_protocol::v2::schedule` and is shared by Tasks 4 and 6. `ScheduleRecord` is `pub` in `uc_node` for Task 6's `show`.
