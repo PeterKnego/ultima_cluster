@@ -33,6 +33,7 @@ use lincheck_v2::{
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History};
 use uc_lincheck::register::{Cmd, CmdResp};
+use uc_lincheck::timer::{MixedCmd, MixedRegisterSm, TimerReport};
 use uc_net::fault::FaultConfig;
 use uc_node::PurgePolicy;
 
@@ -1384,4 +1385,295 @@ fn snapshot_restart_installs_only_with_purge() {
         1,
         "purge on: the newest artifact is installed exactly once"
     );
+}
+
+// ------------------------------------- time-and-timers T11: the timer capstone
+
+/// The §4.3 order check for one node's record (ruling 4c/4d). Returns the
+/// number of LATE fires so the caller can report it.
+///
+/// Over the node's own `(position, time_ns)` series:
+///
+/// * the series is non-decreasing in `time_ns` (log time never goes backwards);
+/// * for every fire, every stamp STRICTLY BEFORE its position is at or before
+///   its `deadline_ns` — unless the fire was late (`time_ns > deadline_ns`),
+///   the post-failover case §4.3 explicitly allows, where the leader could not
+///   place the instance at its deadline and the property degrades to "not
+///   before";
+/// * every stamp STRICTLY AFTER its position is at or after the fire's own
+///   stamp.
+///
+/// Prefix-max / suffix-min arrays make this O(stamps + fires log stamps)
+/// instead of the O(fires x stamps) the naive scan would be at ~10^3 fires and
+/// ~10^4 stamps.
+fn assert_section_4_3(label: &str, node: usize, report: &TimerReport) -> usize {
+    let st = &report.stamps;
+    assert!(
+        st.windows(2).all(|w| w[0].1 <= w[1].1),
+        "[{label}] node {node}: log time went backwards in the stamp series"
+    );
+    // `prefix_max[i]` = max time_ns over stamps[..i]; `suffix_min[i]` = min
+    // time_ns over stamps[i..].
+    let mut prefix_max = vec![0u64; st.len() + 1];
+    for i in 0..st.len() {
+        prefix_max[i + 1] = prefix_max[i].max(st[i].1);
+    }
+    let mut suffix_min = vec![u64::MAX; st.len() + 1];
+    for i in (0..st.len()).rev() {
+        suffix_min[i] = suffix_min[i + 1].min(st[i].1);
+    }
+    let mut late = 0usize;
+    for rec in &report.fired {
+        // Stamps are recorded in apply order, so `position` is ascending.
+        let lo = st.partition_point(|&(p, _)| p < rec.position);
+        let hi = st.partition_point(|&(p, _)| p <= rec.position);
+        if rec.time_ns > rec.deadline_ns {
+            late += 1;
+        } else {
+            assert!(
+                prefix_max[lo] <= rec.deadline_ns,
+                "[{label}] node {node}: a frame before the timer at {} is stamped {} > its \
+                 deadline {} (on-time fire) — {rec:?}",
+                rec.position,
+                prefix_max[lo],
+                rec.deadline_ns
+            );
+        }
+        assert!(
+            suffix_min[hi] >= rec.time_ns,
+            "[{label}] node {node}: a frame after the timer at {} is stamped {} < the fire's \
+             own stamp {} — {rec:?}",
+            rec.position,
+            suffix_min[hi],
+            rec.time_ns
+        );
+    }
+    late
+}
+
+/// Exactly-once through `Timed`: no `(id, deadline_ns)` was delivered twice.
+fn assert_exactly_once(label: &str, node: usize, report: &TimerReport) {
+    let mut seen = std::collections::HashSet::new();
+    for rec in &report.fired {
+        assert!(
+            seen.insert((rec.id, rec.deadline_ns)),
+            "[{label}] node {node}: timer ({}, deadline {}) delivered TWICE — {rec:?}",
+            rec.id,
+            rec.deadline_ns
+        );
+    }
+}
+
+/// Time-and-timers T11 capstone: `linearizable_under_failover_v2`'s workload
+/// and fault loop, on a HETEROGENEOUS two-FSM cluster — row 0 the register
+/// (WGL-checked exactly as today), row 1 `Timed<TimerSm>` under continuous
+/// timer churn.
+///
+/// The faults are the copied test's: leader node-kill+restart and leader
+/// service-crash+restart. Both matter here for reasons the single-node Task 10
+/// tests could not reach:
+///
+/// * a node kill forces a **leader change with instances in flight**, so the
+///   new leader must re-arm them (and may fire them LATE) while `Timed` must
+///   still deliver each exactly once;
+/// * a service crash brings the row back EMPTY, so its whole timer record —
+///   `fired`, `stamps`, and `Timed`'s own pending set — is rebuilt by
+///   **journal replay of `TIMER` frames**, the second gap Task 10 left.
+///
+/// The oracle, after the workers stop and every node's row-1 `applied` agrees:
+///
+/// (a) every node's `fired` vector is IDENTICAL (replication equivalence — the
+///     `two_fsm_oracle_bites` pattern, here over the FSM's own record rather
+///     than a per-op fan-in comparison, because a timer op has no client-side
+///     answer to compare);
+/// (b) within a node, no `(id, deadline_ns)` fired twice (exactly-once);
+/// (c)+(d) the §4.3 ordering property over each node's own stamp series;
+/// (e) non-vacuity: enough fires actually happened, and at least one leader
+///     change did;
+///
+/// then `check_register(&entries)` for FSM 0, exactly as the copied test does.
+#[test]
+fn two_fsm_timer_churn_under_failover() {
+    const LABEL: &str = "two_fsm_timer_churn";
+    const DEFAULT_SEED: u64 = 0x1107;
+    const TARGET_OPS: usize = 600;
+    const N_WORKERS: u32 = 3;
+    const N_TIMER_WORKERS: u32 = 2;
+    const THROTTLE: Duration = Duration::from_millis(20);
+    // Timer workers pace faster than register workers: each schedule is one
+    // small frame and the run needs enough instances in flight at every fault
+    // for the re-arm path to be exercised repeatedly.
+    const TIMER_THROTTLE: Duration = Duration::from_millis(10);
+    const FAULT_PERIOD: Duration = Duration::from_secs(1);
+    // Non-vacuity floors (ruling 4e).
+    const MIN_FIRES: usize = 50;
+    // Env-tunable like the other two-FSM capstones (nightly sets
+    // UC2_LIN_BUDGET_SECS=240 for the whole capstones job).
+    let budget = Duration::from_secs(
+        std::env::var("UC2_LIN_BUDGET_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(115),
+    );
+
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SEED);
+
+    let _g = serialize();
+    let dir = tempdir();
+    let ccfg = ClusterCfg {
+        services: lincheck_v2::FsmSet::TwoTimed {
+            lag: uc_node::FsmLag::Bounded(64 * 1024),
+        },
+        ..ClusterCfg::default()
+    };
+    // Row 0 is the register on the shared `MixedCmd` wire (see the
+    // `uc_lincheck::timer` module doc: one broadcast log, so both rows decode
+    // every frame). `SM1` is unused under `TwoTimed`.
+    let mut cluster: LinClusterV2<MixedRegisterSm> =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    cluster.await_single_serving(30);
+
+    let dirs = Arc::new(cluster.dirs());
+    let history = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let scheduled = Arc::new(AtomicU64::new(0));
+
+    let handles = lincheck_v2::spawn_workers_as::<MixedCmd>(
+        &dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS,
+    );
+    let timer_handles = lincheck_v2::spawn_timer_workers(
+        &dirs,
+        &stop,
+        &scheduled,
+        seed,
+        TIMER_THROTTLE,
+        N_TIMER_WORKERS,
+    );
+
+    // Fault scheduler (this thread owns `&mut cluster`), the copied test's:
+    // one quorum-preserving fault at a time, 50/50 node-kill vs service-crash.
+    let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let mut faults = 0u32;
+    let mut leader_changes = 0u32;
+    let start = Instant::now();
+    while History::ok_count(&history.snapshot()) < TARGET_OPS {
+        std::thread::sleep(FAULT_PERIOD);
+        cluster.supervise_services();
+        if frng.random_bool(0.5) {
+            cluster.kill_and_restart_leader();
+            leader_changes += 1;
+        } else {
+            cluster.crash_and_restart_leader_service();
+        }
+        faults += 1;
+        if start.elapsed() > budget {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    join_workers(timer_handles);
+
+    // Let every instance still in flight reach its deadline (the longest is
+    // 200 ms) and the resulting TIMER frames commit and replicate, then wait
+    // for the row-1 apply frontier to agree across the cluster: `fired` is
+    // only comparable between replicas that have consumed the same log.
+    std::thread::sleep(Duration::from_millis(1500));
+    let n = dirs.len();
+    let converge_deadline = Instant::now() + Duration::from_secs(60);
+    let mut stable = 0u32;
+    loop {
+        let applied: Vec<u64> = (0..n).map(|i| cluster.service_applied(i, 1)).collect();
+        let agree = applied.iter().all(|&a| a == applied[0]);
+        stable = if agree { stable + 1 } else { 0 };
+        // Three agreeing samples in a row: the pages are read one at a time,
+        // so a single agreeing sample could be a torn read of a moving
+        // frontier.
+        if stable >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < converge_deadline,
+            "[{LABEL}] FSM 1 never converged across nodes: applied={applied:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let reports: Vec<TimerReport> = (0..n).map(|i| cluster.timer_report(i)).collect();
+    cluster.stop();
+
+    let entries = Arc::try_unwrap(history)
+        .ok()
+        .expect("sole history owner")
+        .into_entries();
+    let ok = History::ok_count(&entries);
+    let fires = reports[0].fired.len();
+    eprintln!(
+        "[{LABEL}] seed={seed} faults={faults} leader_changes={leader_changes} \
+         ops={} ok={ok} scheduled={} fires={fires} stamps={} elapsed={:.1}s — checking",
+        entries.len(),
+        scheduled.load(Ordering::Relaxed),
+        reports[0].stamps.len(),
+        elapsed.as_secs_f64()
+    );
+
+    // (a) replication equivalence: the same fires, in the same order, on
+    // every replica — including the ones whose service was crashed and
+    // rebuilt from the journal mid-run.
+    for (i, r) in reports.iter().enumerate().skip(1) {
+        assert_eq!(
+            r.fired,
+            reports[0].fired,
+            "[{LABEL}] node {i} and node 0 disagree on what fired \
+             (node 0: {} fires, node {i}: {} fires)",
+            reports[0].fired.len(),
+            r.fired.len()
+        );
+    }
+    // (b) exactly-once, (c)+(d) the §4.3 order, per node.
+    let mut late_total = 0usize;
+    for (i, r) in reports.iter().enumerate() {
+        assert_exactly_once(LABEL, i, r);
+        late_total += assert_section_4_3(LABEL, i, r);
+    }
+    eprintln!("[{LABEL}] late fires (per node): {}", late_total / n);
+
+    // (e) non-vacuity.
+    assert!(
+        fires >= MIN_FIRES,
+        "[{LABEL}] only {fires} timers fired (< {MIN_FIRES}) — the timer arm was vacuous"
+    );
+    assert!(
+        leader_changes >= 1,
+        "[{LABEL}] no leader change happened — the re-arm path was never exercised"
+    );
+
+    // FSM 0's own bars, exactly as the copied capstone makes them.
+    assert!(
+        ok * 100 >= entries.len() * 80,
+        "[{LABEL}] liveness: only {ok}/{} ops Ok (<80%) — cluster failed to progress",
+        entries.len()
+    );
+    assert!(
+        elapsed < budget + Duration::from_secs(5),
+        "[{LABEL}] capstone took {elapsed:?} — exceeded its budget"
+    );
+    match check_register(&entries) {
+        Verdict::Linearizable => {}
+        Verdict::Violation => {
+            dump_history(&entries, seed);
+            panic!("[{LABEL}] LINEARIZABILITY VIOLATION (seed={seed}); history dumped");
+        }
+        Verdict::Inconclusive => {
+            panic!(
+                "[{LABEL}] checker Inconclusive (seed={seed}); raise THROTTLE / lower TARGET_OPS"
+            )
+        }
+    }
 }

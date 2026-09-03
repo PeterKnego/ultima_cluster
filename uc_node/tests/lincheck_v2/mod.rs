@@ -62,12 +62,13 @@ use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, Node, NodeConfig};
 use uc_service::{
     ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine, StateMachine,
-    Tagged,
+    Tagged, Timed,
 };
 
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
+use uc_lincheck::timer::{MixedCmd, TimerCmd, TimerReport, TimerResp, TimerSm};
 
 /// `pub` since M14c2: the per-FSM cnc samplers/oracles in the capstone test
 /// binaries open the same cnc pages this harness does, and must name the same
@@ -200,7 +201,23 @@ fn write_crypto_material(dir: &Path, ids: &[NodeId]) -> CryptoMaterial {
 #[derive(Clone, Copy)]
 pub enum FsmSet {
     Single,
-    Two { lag: uc_node::FsmLag },
+    Two {
+        lag: uc_node::FsmLag,
+    },
+    /// Time-and-timers T11: a HETEROGENEOUS pair — row 0 is the caller's `SM`
+    /// (the capstone's [`uc_lincheck::timer::MixedRegisterSm`]), row 1 is
+    /// `Timed<TimerSm>` under its own name `"timer"`. `SM1` is unused here.
+    ///
+    /// Row 1 is NOT `Tagged`: attach finds its row by name, and `Timed<S>`
+    /// forwards `S::NAME`, so `Timed<TimerSm>` presents `"timer"` — the name
+    /// [`services_config`] declares for row 1 in this posture.
+    ///
+    /// Both rows read ONE command wire ([`uc_lincheck::timer::MixedCmd`]):
+    /// UC's log is a broadcast, so every declared FSM applies every committed
+    /// MESSAGE frame — see the `uc_lincheck::timer` module doc.
+    TwoTimed {
+        lag: uc_node::FsmLag,
+    },
 }
 
 /// Per-node config with the shared harness knobs (election 150–300 ms for
@@ -281,6 +298,11 @@ fn services_config<SM: SnapshotStateMachine>(ccfg: ClusterCfg) -> uc_node::Servi
         FsmSet::Two { lag } => {
             uc_node::ServicesConfig::from_names(&[SM::NAME, "fsm1"], Some(lag)).unwrap()
         }
+        FsmSet::TwoTimed { lag } => uc_node::ServicesConfig::from_names(
+            &[SM::NAME, <TimerSm as StateMachine>::NAME],
+            Some(lag),
+        )
+        .unwrap(),
     }
 }
 
@@ -399,6 +421,41 @@ fn spawn_service1<SM1: SnapshotStateMachine + StateMachine + Default>(
         .then(|| spawn_service_row1::<SM1>(dir, ccfg.snapshot_interval_bytes))
 }
 
+/// Time-and-timers T11: the row-1 service under [`FsmSet::TwoTimed`].
+/// `Timed<TimerSm>` has no `Default` and is a RAW state machine (`Timed<S>`
+/// implements `RawStateMachine`, never `StateMachine`), so it cannot go
+/// through the generic [`spawn_service`] — the wrapping is the point, and
+/// `ServiceBuilder` only needs the raw tier.
+fn spawn_service_timer(
+    dir: &Path,
+    snapshot_interval_bytes: u64,
+) -> uc_service::Service<Timed<TimerSm>> {
+    let cfg = ServiceConfig::new(dir, APP);
+    if snapshot_interval_bytes == 0 {
+        ServiceBuilder::new(cfg, Timed::new(TimerSm::default()))
+            .start()
+            .expect("timer service start")
+    } else {
+        let cfg = cfg.snapshot_policy(SnapshotPolicy {
+            interval_bytes: snapshot_interval_bytes,
+        });
+        ServiceBuilder::new(cfg, Timed::new(TimerSm::default()))
+            .start_with_snapshots()
+            .expect("timer snapshot service start")
+    }
+}
+
+/// The row-1 timer service under [`FsmSet::TwoTimed`], else `None` — the
+/// [`spawn_service1`] twin, so every path that spawns a node's services pairs
+/// them the same way (a node missing a declared FSM stalls commit by design).
+fn spawn_service_timer_opt(
+    dir: &Path,
+    ccfg: ClusterCfg,
+) -> Option<uc_service::Service<Timed<TimerSm>>> {
+    matches!(ccfg.services, FsmSet::TwoTimed { .. })
+        .then(|| spawn_service_timer(dir, ccfg.snapshot_interval_bytes))
+}
+
 // ------------------------------------------------------------------ one slot
 
 /// One cluster member: its fixed identity/address/dir plus the live node +
@@ -415,6 +472,10 @@ pub struct NodeSlot<
     /// M14c2: the node's FSM-1 service under [`FsmSet::Two`]; `None` under
     /// `Single`. Taken/respawned in lockstep with `service` on every crash path.
     service1: Option<uc_service::Service<Tagged<1, SM1>>>,
+    /// Time-and-timers T11: the node's row-1 service under
+    /// [`FsmSet::TwoTimed`]; `None` in every other posture. Taken/respawned in
+    /// lockstep with `service`, exactly like `service1`.
+    service_timer: Option<uc_service::Service<Timed<TimerSm>>>,
 }
 
 impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachine + Default>
@@ -548,6 +609,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             // already has one attached.
             let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes);
             let service1 = spawn_service1::<SM1>(&instance_dir, ccfg);
+            let service_timer = spawn_service_timer_opt(&instance_dir, ccfg);
             nodes.push(NodeSlot {
                 id: i as NodeId,
                 addr,
@@ -555,6 +617,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 node: Some(node),
                 service: Some(service),
                 service1,
+                service_timer,
             });
         }
         // M7 Task 10: reserve (bind-then-drop, same tolerance as `rebind`
@@ -799,6 +862,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         if let Some(s1) = self.nodes[li].service1.take() {
             s1.crash();
         }
+        if let Some(st) = self.nodes[li].service_timer.take() {
+            st.crash();
+        }
         // Survivors re-elect (quorum 2/3 holds).
         self.await_serving_excluding(li, 20);
         // Restart on the persisted dir + same port (static membership): recovers
@@ -817,9 +883,11 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
         let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+        let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
         self.nodes[li].node = Some(node);
         self.nodes[li].service = Some(service);
         self.nodes[li].service1 = service1;
+        self.nodes[li].service_timer = service_timer;
         // Full cluster settles back to a single serving leader.
         self.await_single_serving(20);
     }
@@ -855,7 +923,14 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 .service1
                 .as_ref()
                 .is_some_and(|s| !s.is_alive());
-            if !dead && !dead1 {
+            // Time-and-timers T11: the row-1 TIMER service is supervised
+            // exactly like `service1`, and just as independently. Always
+            // `false` outside [`FsmSet::TwoTimed`] (`service_timer` is `None`).
+            let dead_timer = self.nodes[i]
+                .service_timer
+                .as_ref()
+                .is_some_and(|s| !s.is_alive());
+            if !dead && !dead1 && !dead_timer {
                 continue;
             }
             let dir = self.nodes[i].instance_dir.clone();
@@ -877,6 +952,14 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 ));
                 respawned += 1;
             }
+            if dead_timer {
+                if let Some(st) = self.nodes[i].service_timer.take() {
+                    st.crash();
+                }
+                self.nodes[i].service_timer =
+                    Some(spawn_service_timer(&dir, self.ccfg.snapshot_interval_bytes));
+                respawned += 1;
+            }
         }
         respawned
     }
@@ -890,10 +973,15 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         if let Some(s1) = self.nodes[li].service1.take() {
             s1.crash();
         }
+        if let Some(st) = self.nodes[li].service_timer.take() {
+            st.crash();
+        }
         let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+        let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
         self.nodes[li].service = Some(service);
         self.nodes[li].service1 = service1;
+        self.nodes[li].service_timer = service_timer;
         // The node never lost quorum, so a serving leader still exists.
         self.await_single_serving(20);
     }
@@ -921,10 +1009,15 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         if let Some(s1) = self.nodes[fi].service1.take() {
             s1.crash();
         }
+        if let Some(st) = self.nodes[fi].service_timer.take() {
+            st.crash();
+        }
         let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+        let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
         self.nodes[fi].service = Some(service);
         self.nodes[fi].service1 = service1;
+        self.nodes[fi].service_timer = service_timer;
         // The leader never lost quorum; a serving leader still exists.
         self.await_single_serving(20);
     }
@@ -1002,6 +1095,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             if let Some(s1) = spare.service1.take() {
                 s1.stop();
             }
+            if let Some(st) = spare.service_timer.take() {
+                st.stop();
+            }
         }
         for s in &mut self.nodes {
             if let Some(node) = s.node.take() {
@@ -1013,7 +1109,31 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             if let Some(s1) = s.service1.take() {
                 s1.stop();
             }
+            if let Some(st) = s.service_timer.take() {
+                st.stop();
+            }
         }
+    }
+
+    /// Time-and-timers T11: node `node`'s row-1 [`TimerSm`] record, read
+    /// straight off the live service on the apply thread (`query_raw` — the
+    /// typed `Service::query` is typed-tier only, and `Timed<S>` is a RAW
+    /// state machine; `Timed::query` forwards to the inner SM's). Same
+    /// bincode-standard codec the blanket `RawStateMachine` impl uses.
+    ///
+    /// The capstone's replication-equivalence oracle compares these across
+    /// every node once their row-1 `applied` positions agree.
+    pub fn timer_report(&self, node: usize) -> TimerReport {
+        let svc = self.nodes[node]
+            .service_timer
+            .as_ref()
+            .expect("timer_report on a cluster that is not FsmSet::TwoTimed");
+        let q = bincode::serde::encode_to_vec((), bincode::config::standard()).expect("encode");
+        let mut out = Vec::new();
+        svc.query_raw(&q, &mut out);
+        bincode::serde::decode_from_slice(&out, bincode::config::standard())
+            .expect("decode TimerReport")
+            .0
     }
 
     /// M14c2: FSM `id`'s `applied` byte position as published on `node`'s cnc
@@ -1145,6 +1265,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                 // refuses its join.
                 let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
                 let service1 = spawn_service1::<SM1>(&dir, self.ccfg);
+                let service_timer = spawn_service_timer_opt(&dir, self.ccfg);
                 self.spare = Some(NodeSlot {
                     id,
                     addr: spare_addr,
@@ -1152,6 +1273,7 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                     node: Some(node),
                     service: Some(service),
                     service1,
+                    service_timer,
                 });
                 let (ip, port) = Self::addr_to_wire(spare_addr);
                 let resp =
@@ -1176,6 +1298,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
                         }
                         if let Some(s1) = slot.service1.take() {
                             s1.stop();
+                        }
+                        if let Some(st) = slot.service_timer.take() {
+                            st.stop();
                         }
                     }
                     false
@@ -1265,6 +1390,9 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             }
             if let Some(s1) = slot.service1.take() {
                 s1.stop();
+            }
+            if let Some(st) = slot.service_timer.take() {
+                st.stop();
             }
         }
     }
@@ -1693,6 +1821,60 @@ pub fn submit_all_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
     }
 }
 
+/// [`submit_cmd`]'s single-row twin — `client.submit_to(id, ..)` instead of
+/// `client.submit`, same routing/retry/classification discipline (see
+/// [`submit_cmd`]'s doc for why only `NotLeader`/`BackpressureFull`/`Retry`
+/// may ever be retried).
+pub fn submit_cmd_to<C: serde::Serialize, R: serde::de::DeserializeOwned>(
+    conn: &mut WorkerConn,
+    id: u8,
+    cmd: &C,
+    deadline: Instant,
+) -> SubmitOutcome<R> {
+    loop {
+        if Instant::now() > deadline {
+            return SubmitOutcome::Indeterminate; // gave up routing → in-limbo
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.rotate();
+            continue;
+        };
+        match client.submit_to::<C, R>(id, cmd) {
+            Ok(r) => return SubmitOutcome::Ok(r),
+            // Guaranteed-not-committed → safe to route + retry.
+            Err(ClientError::NotLeader { hint }) => match hint {
+                Some(h) => conn.reconnect_to(h as usize),
+                None => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    conn.rotate();
+                }
+            },
+            Err(ClientError::BackpressureFull) | Err(ClientError::Retry) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Maybe-committed → indeterminate, NEVER retried.
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_)) => {
+                conn.drop_client();
+                return SubmitOutcome::Indeterminate;
+            }
+            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                return SubmitOutcome::Indeterminate;
+            }
+            // Harness/wiring bugs.
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::UnknownFsm { .. })
+            | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
 /// Linearizable read against the current leader, same routing discipline as
 /// [`submit_cmd`]. A `RETRY` (barrier could not confirm within its deadline) is
 /// retried while routing; on the overall deadline it is `Indeterminate` (dropped
@@ -1800,7 +1982,7 @@ pub fn read_leader_on<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
 /// is shared so CAS picks a recently-observed value often enough that some
 /// succeed. `throttle` paces each op so per-failover op counts stay modest
 /// (keeps the checker's search bounded). Each op is given a 15 s routing budget.
-fn worker(
+fn worker<C: serde::Serialize + From<Cmd>>(
     id: u32,
     dirs: Arc<Vec<PathBuf>>,
     history: Arc<History>,
@@ -1819,11 +2001,12 @@ fn worker(
             0 => {
                 let v = rng.random_range(1..1000u64);
                 let inv = history.invoke();
-                let outcome = match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Write(v), deadline) {
-                    SubmitOutcome::Ok(_) => Outcome::Ok(RegResp::Ack),
-                    SubmitOutcome::Indeterminate => Outcome::Indeterminate,
-                    SubmitOutcome::Fatal(e) => panic!("fatal submit: {e}"),
-                };
+                let outcome =
+                    match submit_cmd::<_, CmdResp>(&mut conn, &C::from(Cmd::Write(v)), deadline) {
+                        SubmitOutcome::Ok(_) => Outcome::Ok(RegResp::Ack),
+                        SubmitOutcome::Indeterminate => Outcome::Indeterminate,
+                        SubmitOutcome::Fatal(e) => panic!("fatal submit: {e}"),
+                    };
                 history.record(id, Op::Write(v), inv, outcome);
             }
             1 => {
@@ -1848,20 +2031,23 @@ fn worker(
                 };
                 let new = rng.random_range(1..1000u64);
                 let inv = history.invoke();
-                let outcome =
-                    match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Cas { old, new }, deadline) {
-                        SubmitOutcome::Ok(CmdResp::CasResult(b)) => {
-                            if b {
-                                last_seen.store(new, Ordering::Relaxed);
-                            }
-                            Outcome::Ok(RegResp::CasOk(b))
+                let outcome = match submit_cmd::<_, CmdResp>(
+                    &mut conn,
+                    &C::from(Cmd::Cas { old, new }),
+                    deadline,
+                ) {
+                    SubmitOutcome::Ok(CmdResp::CasResult(b)) => {
+                        if b {
+                            last_seen.store(new, Ordering::Relaxed);
                         }
-                        SubmitOutcome::Ok(other) => {
-                            panic!("cas returned non-cas response: {other:?}")
-                        }
-                        SubmitOutcome::Indeterminate => Outcome::Indeterminate,
-                        SubmitOutcome::Fatal(e) => panic!("fatal cas: {e}"),
-                    };
+                        Outcome::Ok(RegResp::CasOk(b))
+                    }
+                    SubmitOutcome::Ok(other) => {
+                        panic!("cas returned non-cas response: {other:?}")
+                    }
+                    SubmitOutcome::Indeterminate => Outcome::Indeterminate,
+                    SubmitOutcome::Fatal(e) => panic!("fatal cas: {e}"),
+                };
                 history.record(id, Op::Cas { old, new }, inv, outcome);
             }
         }
@@ -1880,6 +2066,25 @@ pub fn spawn_workers(
     throttle: Duration,
     n_workers: u32,
 ) -> Vec<JoinHandle<()>> {
+    spawn_workers_as::<Cmd>(dirs, history, stop, last_seen, seed, throttle, n_workers)
+}
+
+/// [`spawn_workers`] over an explicit command wire `C`. Identical workload and
+/// identical recorded history — only the bytes on the wire differ: the
+/// heterogeneous timer capstone drives the register through
+/// [`uc_lincheck::timer::MixedCmd`] so its sibling FSM can decode the same
+/// frames (see the `uc_lincheck::timer` module doc). `spawn_workers` is
+/// `spawn_workers_as::<Cmd>`, so every existing capstone is byte-for-byte
+/// unchanged.
+pub fn spawn_workers_as<C: serde::Serialize + From<Cmd> + Send + 'static>(
+    dirs: &Arc<Vec<PathBuf>>,
+    history: &Arc<History>,
+    stop: &Arc<AtomicBool>,
+    last_seen: &Arc<AtomicU64>,
+    seed: u64,
+    throttle: Duration,
+    n_workers: u32,
+) -> Vec<JoinHandle<()>> {
     (0..n_workers)
         .map(|w| {
             let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -1889,7 +2094,9 @@ pub fn spawn_workers(
                 Arc::clone(stop),
                 Arc::clone(last_seen),
             );
-            std::thread::spawn(move || worker(w, dirs, history, stop, rng, last_seen, throttle))
+            std::thread::spawn(move || {
+                worker::<C>(w, dirs, history, stop, rng, last_seen, throttle)
+            })
         })
         .collect()
 }
@@ -2061,6 +2268,90 @@ pub fn spawn_workers2(
                     throttle,
                 )
             })
+        })
+        .collect()
+}
+
+// ------------------------------------------------- time-and-timers workers
+
+/// One timer worker: until `stop`, schedule a fresh instance on FSM 1 with a
+/// 5–200 ms relative deadline, and every so often cancel the id it scheduled
+/// last (so cancellation is exercised on the live path and some instances
+/// never fire). Ids are `(worker << 32) | n`, so no two workers — and no two
+/// rounds of one worker — ever share an id, which is what makes the
+/// capstone's "no `(id, deadline_ns)` twice" check a genuine exactly-once
+/// oracle rather than a coincidence.
+///
+/// Nothing is recorded into a WGL history here: the timer FSM's oracle is
+/// replication equivalence + exactly-once + the §4.3 ordering property over
+/// the SM's own record, adjudicated after the run (`Op`/`RegResp` are
+/// register-shaped and could not describe a timer op honestly). An
+/// `Indeterminate` submit is simply a schedule that may or may not have
+/// happened — harmless, because every check is over what the FSMs actually
+/// recorded, never over what a client believed.
+fn timer_worker(
+    id: u32,
+    dirs: Arc<Vec<PathBuf>>,
+    stop: Arc<AtomicBool>,
+    mut rng: StdRng,
+    throttle: Duration,
+    scheduled: Arc<AtomicU64>,
+) {
+    let mut conn = WorkerConn::new(dirs, id as usize);
+    let mut n: u64 = 0;
+    let mut prev: Option<u64> = None;
+    while !stop.load(Ordering::Relaxed) {
+        if !throttle.is_zero() {
+            std::thread::sleep(throttle);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        // ~1 in 5 rounds cancels the previous instance instead of scheduling.
+        if let Some(p) = prev.take()
+            && rng.random_bool(0.2)
+        {
+            let cmd = MixedCmd::Timer(TimerCmd::Cancel { id: p });
+            match submit_cmd_to::<_, TimerResp>(&mut conn, 1, &cmd, deadline) {
+                SubmitOutcome::Ok(_) | SubmitOutcome::Indeterminate => {}
+                SubmitOutcome::Fatal(e) => panic!("fatal timer cancel: {e}"),
+            }
+            continue;
+        }
+        n += 1;
+        let tid = ((id as u64) << 32) | n;
+        let in_ns = rng.random_range(5_000_000..200_000_000u64);
+        let cmd = MixedCmd::Timer(TimerCmd::Schedule { id: tid, in_ns });
+        match submit_cmd_to::<_, TimerResp>(&mut conn, 1, &cmd, deadline) {
+            SubmitOutcome::Ok(TimerResp::Stamp(_)) => {
+                scheduled.fetch_add(1, Ordering::Relaxed);
+                prev = Some(tid);
+            }
+            SubmitOutcome::Indeterminate => prev = Some(tid),
+            SubmitOutcome::Fatal(e) => panic!("fatal timer schedule: {e}"),
+        }
+    }
+    conn.drop_client();
+}
+
+/// Spawn `n_workers` timer-driving threads against FSM 1 (see [`timer_worker`]).
+/// Same per-worker seeding / starting-node discipline as [`spawn_workers`];
+/// `scheduled` counts the schedules the cluster acknowledged, a non-vacuity
+/// floor for the capstone.
+pub fn spawn_timer_workers(
+    dirs: &Arc<Vec<PathBuf>>,
+    stop: &Arc<AtomicBool>,
+    scheduled: &Arc<AtomicU64>,
+    seed: u64,
+    throttle: Duration,
+    n_workers: u32,
+) -> Vec<JoinHandle<()>> {
+    (0..n_workers)
+        .map(|w| {
+            let rng = StdRng::seed_from_u64(
+                seed ^ 0x71_4D_45_52 ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            let (dirs, stop, scheduled) =
+                (Arc::clone(dirs), Arc::clone(stop), Arc::clone(scheduled));
+            std::thread::spawn(move || timer_worker(w, dirs, stop, rng, throttle, scheduled))
         })
         .collect()
 }

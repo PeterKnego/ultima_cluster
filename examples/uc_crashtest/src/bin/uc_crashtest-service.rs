@@ -13,6 +13,11 @@
 //! service can sit behind a gateway edge running with its session envelope
 //! on — see the flag's own doc for why the two switches must agree.
 //!
+//! `--timer` / `--mixed-register` (time-and-timers T11) are the two halves of
+//! a mixed register/timer node: the row-1 `Timed<TimerSm>` and the row-0
+//! register on the shared `MixedCmd` command wire. See each flag's doc, and
+//! the `uc_lincheck::timer` module doc for why one wire is required.
+//!
 //! Sync, like the node bin — no tokio.
 
 use std::path::PathBuf;
@@ -20,9 +25,10 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use uc_lincheck::register::RegisterSm;
+use uc_lincheck::timer::{MixedRegisterSm, TimerSm};
 use uc_service::{
     RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned,
-    StateMachine, Tagged,
+    StateMachine, Tagged, Timed,
 };
 
 #[derive(Parser)]
@@ -47,6 +53,21 @@ struct Args {
     /// under `"fsmN"`) — a second FSM on a two-FSM node, Task 9's harness row.
     #[arg(long)]
     tagged: Option<u8>,
+    /// Time-and-timers (T11): attach `Timed<TimerSm>` — the timer FSM behind
+    /// the exactly-once delivery wrapper — instead of the register.
+    /// `TimerSm::NAME` is `"timer"`, so the node must declare that name
+    /// (`--services register,timer`). Mutually exclusive with `--tagged` /
+    /// `--sessioned`.
+    #[arg(long, default_value_t = false)]
+    timer: bool,
+    /// Time-and-timers (T11): attach `MixedRegisterSm` — the register
+    /// transition reached through the shared `MixedCmd` command wire — under
+    /// the register's own name. Required for row 0 of a mixed
+    /// register/timer node: UC's log is a broadcast, so row 0 is handed the
+    /// timer row's frames too and a bare `RegisterSm` would mis-decode them
+    /// (see the `uc_lincheck::timer` module doc).
+    #[arg(long, default_value_t = false)]
+    mixed_register: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,6 +82,37 @@ fn main() -> anyhow::Result<()> {
 
     let instance_dir = args.instance_dir.clone();
     let cfg = ServiceConfig::new(args.instance_dir, args.app_id);
+
+    // Time-and-timers T11: the two mixed-cluster arms, checked before the
+    // `(tagged, sessioned)` matrix below — neither composes with it.
+    anyhow::ensure!(
+        !(args.timer && args.mixed_register),
+        "--timer and --mixed-register are mutually exclusive"
+    );
+    if args.timer || args.mixed_register {
+        anyhow::ensure!(
+            args.tagged.is_none() && !args.sessioned,
+            "--timer/--mixed-register do not compose with --tagged/--sessioned"
+        );
+        if args.timer {
+            // `Timed<S>` is a RAW state machine (no `StateMachine` impl), so
+            // its name comes off `RawStateMachine`; it forwards `TimerSm`'s.
+            let svc = ServiceBuilder::new(cfg, Timed::new(TimerSm::default())).start()?;
+            println!(
+                "service {:?} attached at {}",
+                <Timed<TimerSm> as RawStateMachine>::NAME,
+                instance_dir.display()
+            );
+            return supervise(svc);
+        }
+        let svc = ServiceBuilder::new(cfg, MixedRegisterSm::default()).start()?;
+        println!(
+            "service {:?} attached at {}",
+            <MixedRegisterSm as StateMachine>::NAME,
+            instance_dir.display()
+        );
+        return supervise(svc);
+    }
     // Every arm hands the service to `supervise`, which holds it alive until
     // it fail-stops; the branch has to happen here because the builder is
     // generic over the state machine and `Service<S>` carries `S` in its

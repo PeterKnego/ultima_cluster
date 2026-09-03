@@ -271,6 +271,35 @@ pub fn spawn_service_id(instance_dir: &Path, id: u8) -> Reap {
     Reap(child)
 }
 
+/// Time-and-timers T11: spawn the service-only binary running
+/// `Timed<TimerSm>` (`--timer`). Its FSM name is `"timer"`, so the node must
+/// have been spawned with that name in its `--services` list.
+pub fn spawn_service_timer(instance_dir: &Path) -> Reap {
+    spawn_service_flag(instance_dir, "--timer")
+}
+
+/// Time-and-timers T11: spawn the service-only binary running
+/// `MixedRegisterSm` (`--mixed-register`) — row 0 of a mixed register/timer
+/// node, which must decode the timer row's frames instead of fail-stopping on
+/// them (see the `uc_lincheck::timer` module doc).
+pub fn spawn_service_mixed_register(instance_dir: &Path) -> Reap {
+    spawn_service_flag(instance_dir, "--mixed-register")
+}
+
+fn spawn_service_flag(instance_dir: &Path, flag: &str) -> Reap {
+    let child = Command::new(SERVICE_BIN)
+        .arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID)
+        .arg(flag)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {SERVICE_BIN}: {e}"));
+    Reap(child)
+}
+
 /// M14c2 T6: spawn the node-only binary declaring `--services`/`--fsm-lag`
 /// (Task 1) — a multi-FSM single-node cluster, unlike [`spawn_node`]/
 /// [`spawn_node_with`] which always boot the implicit single-FSM default.

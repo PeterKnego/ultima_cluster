@@ -10,6 +10,10 @@ name: nightly
 #                  each of those has a TWO-FSM twin (lin_v2's two_fsm_*,
 #                  lin_partition_v2's minority_partition_and_heal_two_fsm),
 #                  picked up by `cargo test --workspace` with no matrix change.
+#                  Since 2.11.0 lin_v2 also carries the time-and-timers
+#                  capstone (two_fsm_timer_churn_under_failover: a register
+#                  row + a Timed<TimerSm> row under timer churn and the same
+#                  fault loop) — likewise no matrix change.
 #   * sim-heavy  — uc_sim's 1000-seed election/truncation fuzz tier.
 #   * loom       — the uc_log frame-visibility memory model, the broadcast
 #                  ring's seqlock read barrier, AND the
@@ -19,7 +23,9 @@ name: nightly
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
 #                  (uc_crashtest bins spawned via CARGO_BIN_EXE_*), including
 #                  the 2.8.1 two-FSM scenarios (two_fsm_service_sigkill,
-#                  two_fsm_node_sigkill) — same feature flag, no matrix change.
+#                  two_fsm_node_sigkill) and, since 2.11.0, the timer one
+#                  (two_fsm_timer_service_sigkill) — same feature flag, no
+#                  matrix change.
 #   * quickstart — packaging/quickstart-local.sh run for real: three nodes,
 #                  three services, three gateways and a remote client, driven
 #                  from a bin dir that holds nothing but the five shipped

@@ -61,6 +61,7 @@ use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
 use uc_lincheck::register::{Cmd, CmdResp};
+use uc_lincheck::timer::{MixedCmd, TimerCmd, TimerReport, TimerResp};
 use uc_log::cnc::{AdminReq, CncPage};
 
 mod common;
@@ -240,6 +241,55 @@ fn submit_all_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcom
             // would be a wiring bug, same class as the arms above.
             | Err(e @ ClientError::UnknownFsm { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome2::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
+/// Time-and-timers T11: [`submit_cmd`]'s generic single-row twin —
+/// `client.submit_to(id, ..)` over the shared [`MixedCmd`] wire. Same
+/// routing/retry/classification discipline as [`submit_cmd`] (see its doc and
+/// the module doc); the response type is erased because the two rows answer
+/// differently (`CmdResp` on row 0, [`TimerResp`] on row 1) and nothing here
+/// inspects the value — a register op's WGL outcome is `Ack` on success, and
+/// a timer op has no client-side answer to check.
+fn submit_mixed(conn: &mut Conn, id: u8, cmd: &MixedCmd, deadline: Instant) -> SubmitOutcome {
+    loop {
+        if Instant::now() > deadline {
+            return SubmitOutcome::Indeterminate;
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        // Decode into the row's own response type so a codec mismatch would
+        // surface as `Decode` (Fatal) rather than passing silently.
+        let r = if id == 0 {
+            client.submit_to::<MixedCmd, CmdResp>(id, cmd).map(|_| ())
+        } else {
+            client.submit_to::<MixedCmd, TimerResp>(id, cmd).map(|_| ())
+        };
+        match r {
+            Ok(()) => return SubmitOutcome::Ok(CmdResp::WriteAck),
+            Err(ClientError::NotLeader { .. })
+            | Err(ClientError::BackpressureFull)
+            | Err(ClientError::Retry) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_))
+            | Err(ClientError::Timeout(_))
+            | Err(ClientError::ResponseOverwritten) => {
+                conn.drop_client();
+                return SubmitOutcome::Indeterminate;
+            }
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
+            | Err(e @ ClientError::ServiceNotDeclared { .. })
+            | Err(e @ ClientError::UnknownFsm { .. })
+            | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
 }
@@ -1946,4 +1996,276 @@ fn leader_node_sigkill_recovery_multi_once(run: u32) {
         &format!("run{run}"),
     );
     // node_procs / svc_procs dropped here → killed + reaped.
+}
+
+// -------------------------------------- time-and-timers T11: timers + SIGKILL
+
+/// Retry a linearizable read of FSM 1's [`TimerReport`] until it lands. While
+/// the timer service is dead the node has no row-1 applier, so the read
+/// legitimately answers `Retry`/`Timeout` (and, on a single-node cluster, the
+/// missing FSM stalls commit by design — the report ceiling); everything else
+/// is a harness bug and panics.
+fn timer_report_until_ok(dir: &Path, deadline: Instant) -> TimerReport {
+    let mut conn = Conn::new(dir.to_path_buf());
+    loop {
+        if let Some(client) = conn.client() {
+            match client.query_linearizable_on::<(), TimerReport>(1, &()) {
+                Ok(r) => return r,
+                Err(ClientError::Decode(_))
+                | Err(ClientError::AppIdMismatch { .. })
+                | Err(ClientError::VersionMismatch { .. })
+                | Err(ClientError::ServiceNotDeclared { .. })
+                | Err(ClientError::UnknownFsm { .. }) => {
+                    panic!("harness bug reading the timer report")
+                }
+                Err(ClientError::InstanceRestart { .. })
+                | Err(ClientError::Cnc(_))
+                | Err(ClientError::Ring(_))
+                | Err(ClientError::Timeout(_))
+                | Err(ClientError::ResponseOverwritten) => conn.drop_client(),
+                Err(_) => {}
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out reading FSM 1's timer report"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The §4.3 order + exactly-once oracle over ONE node's timer record — the
+/// multi-process twin of `lin_v2.rs`'s `assert_section_4_3` /
+/// `assert_exactly_once`. Returns `(fires, late)`.
+fn check_timer_report(tag: &str, report: &TimerReport) -> (usize, usize) {
+    let st = &report.stamps;
+    // (d) log time never goes backwards along the applied series.
+    assert!(
+        st.windows(2).all(|w| w[0].1 <= w[1].1),
+        "[{tag}] log time went backwards in the stamp series"
+    );
+    // (b) exactly-once through `Timed`.
+    let mut seen = std::collections::HashSet::new();
+    for rec in &report.fired {
+        assert!(
+            seen.insert((rec.id, rec.deadline_ns)),
+            "[{tag}] timer ({}, deadline {}) delivered TWICE — {rec:?}",
+            rec.id,
+            rec.deadline_ns
+        );
+    }
+    // (c) §4.3: prefix-max / suffix-min over the stamp series, exactly as the
+    // in-process capstone does (see `lin_v2.rs::assert_section_4_3`).
+    let mut prefix_max = vec![0u64; st.len() + 1];
+    for i in 0..st.len() {
+        prefix_max[i + 1] = prefix_max[i].max(st[i].1);
+    }
+    let mut suffix_min = vec![u64::MAX; st.len() + 1];
+    for i in (0..st.len()).rev() {
+        suffix_min[i] = suffix_min[i + 1].min(st[i].1);
+    }
+    let mut late = 0usize;
+    for rec in &report.fired {
+        let lo = st.partition_point(|&(p, _)| p < rec.position);
+        let hi = st.partition_point(|&(p, _)| p <= rec.position);
+        if rec.time_ns > rec.deadline_ns {
+            late += 1;
+        } else {
+            assert!(
+                prefix_max[lo] <= rec.deadline_ns,
+                "[{tag}] a frame before the timer at {} is stamped {} > its deadline {} \
+                 (on-time fire) — {rec:?}",
+                rec.position,
+                prefix_max[lo],
+                rec.deadline_ns
+            );
+        }
+        assert!(
+            suffix_min[hi] >= rec.time_ns,
+            "[{tag}] a frame after the timer at {} is stamped {} < the fire's own stamp {} \
+             — {rec:?}",
+            rec.position,
+            suffix_min[hi],
+            rec.time_ns
+        );
+    }
+    (report.fired.len(), late)
+}
+
+/// Time-and-timers T11: `two_fsm_service_sigkill`'s twin with the row-1
+/// service running `Timed<TimerSm>` — a REAL `kill -9` of the timer FSM's OS
+/// process, three times, under sustained schedule/cancel load.
+///
+/// The row-1 process comes back with an EMPTY `Timed<TimerSm>`, so both its
+/// timer record AND `Timed`'s own pending set are rebuilt by **journal replay
+/// of `TIMER` frames** — the reconstruction path Task 10's in-process tests
+/// never crossed a process boundary on. Row 0 is `MixedRegisterSm`: one
+/// broadcast log means row 0 is handed the timer row's frames too, so it must
+/// decode the shared `MixedCmd` wire (see the `uc_lincheck::timer` module doc)
+/// and its register transition is untouched by them.
+///
+/// Oracle on the recovered service's own record (one node → one report, so
+/// (a) replication equivalence is trivially satisfied and the in-process
+/// capstone carries it): (b) no `(id, deadline_ns)` twice, (c) the §4.3 order,
+/// (d) a non-decreasing stamp series — plus fires kept arriving after EVERY
+/// restart, and the register history stays linearizable throughout.
+#[test]
+fn two_fsm_timer_service_sigkill() {
+    shorten_client_timeout();
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let tmp = tempdir();
+    let inst = tmp.path().join("inst");
+    std::fs::create_dir_all(&inst).unwrap();
+    let _node = spawn_node_with_services(&inst, "register,timer", "65536");
+    wait_for_ready(&inst, Duration::from_secs(10));
+    let _svc0 = spawn_service_mixed_register(&inst);
+    let svc1 = Arc::new(Mutex::new(Some(spawn_service_timer(&inst))));
+
+    let h0 = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let scheduled = Arc::new(AtomicU64::new(0));
+
+    // Warm-up write (the WGL init=None gotcha — see `warmup_write`), on the
+    // shared wire.
+    {
+        let mut conn = Conn::new(inst.clone());
+        let inv = h0.invoke();
+        let ok = matches!(
+            submit_mixed(
+                &mut conn,
+                0,
+                &MixedCmd::Reg(Cmd::Write(1)),
+                Instant::now() + Duration::from_secs(20),
+            ),
+            SubmitOutcome::Ok(_)
+        );
+        assert!(ok, "warm-up write did not commit");
+        h0.record(0, Op::Write(1), inv, Outcome::Ok(RegResp::Ack));
+        conn.drop_client();
+    }
+
+    // One driver thread: short timers on row 1, register writes on row 0.
+    // Writes only — no CAS, no read: FSM 0 is here to keep the shared log
+    // moving and to prove the mixed wire leaves the register transition alone,
+    // and `check_register` adjudicates the resulting history either way.
+    let handle = {
+        let (dir, h0, stop, scheduled) = (
+            inst.clone(),
+            Arc::clone(&h0),
+            Arc::clone(&stop),
+            Arc::clone(&scheduled),
+        );
+        std::thread::spawn(move || {
+            let mut rng = StdRng::seed_from_u64(seed ^ 0x7113);
+            let mut conn = Conn::new(dir);
+            let mut n: u64 = 0;
+            let mut prev: Option<u64> = None;
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(7));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                if rng.random_bool(0.3) {
+                    // A register op on row 0, recorded in the WGL history.
+                    let v = rng.random_range(1..1000u64);
+                    let inv = h0.invoke();
+                    let outcome =
+                        match submit_mixed(&mut conn, 0, &MixedCmd::Reg(Cmd::Write(v)), deadline) {
+                            SubmitOutcome::Ok(_) => Outcome::Ok(RegResp::Ack),
+                            SubmitOutcome::Indeterminate => Outcome::Indeterminate,
+                            SubmitOutcome::Fatal(e) => panic!("fatal register submit: {e}"),
+                        };
+                    h0.record(1, Op::Write(v), inv, outcome);
+                    continue;
+                }
+                if let Some(p) = prev.take()
+                    && rng.random_bool(0.2)
+                {
+                    let cmd = MixedCmd::Timer(TimerCmd::Cancel { id: p });
+                    match submit_mixed(&mut conn, 1, &cmd, deadline) {
+                        SubmitOutcome::Ok(_) | SubmitOutcome::Indeterminate => {}
+                        SubmitOutcome::Fatal(e) => panic!("fatal timer cancel: {e}"),
+                    }
+                    continue;
+                }
+                n += 1;
+                // Short deadlines (20-120 ms): a SIGKILL lands with several
+                // instances in flight, and the survivors fire soon after the
+                // replacement process has replayed.
+                let in_ns = rng.random_range(20_000_000..120_000_000u64);
+                let cmd = MixedCmd::Timer(TimerCmd::Schedule { id: n, in_ns });
+                match submit_mixed(&mut conn, 1, &cmd, deadline) {
+                    SubmitOutcome::Ok(_) => {
+                        scheduled.fetch_add(1, Ordering::Relaxed);
+                        prev = Some(n);
+                    }
+                    SubmitOutcome::Indeterminate => prev = Some(n),
+                    SubmitOutcome::Fatal(e) => panic!("fatal timer schedule: {e}"),
+                }
+            }
+            conn.drop_client();
+        })
+    };
+
+    // Three real SIGKILLs of the timer service, sampling the fire count after
+    // each recovery: it must keep climbing, or the row came back inert.
+    let mut fires_after: Vec<usize> = Vec::new();
+    for run in 0..3u32 {
+        std::thread::sleep(Duration::from_millis(700));
+        {
+            let mut g = svc1.lock().unwrap();
+            g.take(); // SIGKILL + reap the timer FSM
+            *g = Some(spawn_service_timer(&inst));
+        }
+        // Recovery = replay of every MESSAGE and TIMER frame in the journal.
+        std::thread::sleep(Duration::from_millis(1500));
+        let report = timer_report_until_ok(&inst, Instant::now() + Duration::from_secs(30));
+        eprintln!(
+            "[two_fsm_timer_service_sigkill] run={run} fires={} stamps={}",
+            report.fired.len(),
+            report.stamps.len()
+        );
+        fires_after.push(report.fired.len());
+    }
+
+    std::thread::sleep(Duration::from_secs(1));
+    stop.store(true, Ordering::Relaxed);
+    if let Err(e) = handle.join() {
+        std::panic::resume_unwind(e);
+    }
+
+    let report = timer_report_until_ok(&inst, Instant::now() + Duration::from_secs(30));
+    let (fires, late) = check_timer_report("two_fsm_timer_service_sigkill", &report);
+    eprintln!(
+        "[two_fsm_timer_service_sigkill] seed={seed} scheduled={} fires={fires} late={late} \
+         per-restart fires={fires_after:?}",
+        scheduled.load(Ordering::Relaxed)
+    );
+
+    // Fires kept arriving across every restart (and after the last one).
+    for w in fires_after.windows(2) {
+        assert!(
+            w[1] > w[0],
+            "no timer fired between two restarts: {fires_after:?} — the row came back inert"
+        );
+    }
+    assert!(
+        fires > *fires_after.last().unwrap(),
+        "no timer fired after the last restart: {fires} vs {fires_after:?}"
+    );
+    assert!(
+        fires >= 20,
+        "only {fires} timers fired — the timer arm was vacuous"
+    );
+
+    assert_linearizable(
+        &Arc::try_unwrap(h0)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
+        "two_fsm_timer_service_sigkill_fsm0",
+        "fsm0",
+    );
+    // _node / svc0 / svc1 Reaps dropped here → killed + reaped.
 }

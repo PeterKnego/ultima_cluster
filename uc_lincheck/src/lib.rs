@@ -9,3 +9,4 @@ pub mod history;
 pub mod list_append;
 pub mod model;
 pub mod register;
+pub mod timer;
