@@ -1425,6 +1425,49 @@ mod tests {
         assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "{stamps:?}");
     }
 
+    /// Final-review I2, unit half: `fire_due_timers`'s `WouldOverrun` exit
+    /// holds the clients and retries the SAME instance next pass. That is only
+    /// sound because the stamp is computed AFTER the overrun gate — a failed
+    /// `append_timer` must leave `last_stamp` (and the frontier) untouched, or
+    /// the retry's clamp would already have moved and the timer would report
+    /// itself late for a frame that was never written.
+    #[test]
+    fn append_timer_would_overrun_leaves_last_stamp_untouched() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1, 0);
+        a.set_now(100);
+        for i in 0..42 {
+            a.append(1, i, &[0u8; 64]).unwrap(); // 4032 used, durable still 0
+        }
+        // One more 32 B frame: 4064 used, 32 B of headroom — too little for a
+        // 64 B timer frame, and padding to the wrap would land it past
+        // durable(0) + capacity(4096).
+        a.append(1, 99, &[]).unwrap();
+        let (pos_before, stamp_before) = (a.position(), a.last_stamp());
+        let append_before = c.counters().append.load_acquire();
+        let body = TimerBody {
+            identity_hash: 9,
+            timer_id: 42,
+            deadline_ns: 9_000, // far above last_stamp: would move the clamp
+        };
+        assert_eq!(
+            a.append_timer(&body, 0).unwrap_err(),
+            AppendError::WouldOverrun
+        );
+        assert_eq!(
+            a.last_stamp(),
+            stamp_before,
+            "a gated timer append must not move the log clock"
+        );
+        assert_eq!(a.position(), pos_before);
+        assert_eq!(c.counters().append.load_acquire(), append_before);
+        // The retry, once the gate reopens, stamps with the deadline as if the
+        // first attempt had never happened.
+        c.counters().durable.store_release(4096);
+        let (_, stamp) = a.append_timer(&body, 0).unwrap();
+        assert_eq!(stamp, 9_000);
+    }
+
     /// Spec §4.3, pinned at the appender: drive random passes of
     /// (set_now, due timers first, then client frames) and assert no frame
     /// before a TIMER carries a stamp above its deadline unless the TIMER is

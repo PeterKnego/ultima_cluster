@@ -15,16 +15,22 @@
 //! 2. Three nodes: a timer in flight at a leader change is delivered exactly
 //!    once, at the same log position on every surviving replica, either on
 //!    time or late — never twice, never at diverging positions.
+//! 3. One node, final-review I2: MORE than `TIMERS_PER_PASS` (64) timers due
+//!    at one instant, under continuous pipelined client load — the pass bound
+//!    is hit, so the pass appends NO client frame and the 100 TIMER frames
+//!    land contiguously. The held clients are answered normally one pass
+//!    later and every fire is on time.
 //!
 //! Every instance dir is on the ext4 cargo target volume, never /tmp.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use uc_client::Client;
+use uc_client::{Client, PipelinedClient, PipelinedConfig};
 use uc_consensus::election::NodeId;
 use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
@@ -115,8 +121,21 @@ fn start_service_with<S: RawStateMachine>(dir: &Path, sm: S) -> Service<S> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Cmd {
-    At { id: u64, in_ms: u64 },
-    Cancel { id: u64 },
+    At {
+        id: u64,
+        in_ms: u64,
+    },
+    /// Schedule at an ABSOLUTE log time — so a batch of these all share one
+    /// deadline and all become due in the same leader pass (test 3).
+    AtAbs {
+        id: u64,
+        at_ns: u64,
+    },
+    Cancel {
+        id: u64,
+    },
+    /// Pure load: touches no timer, just puts a MESSAGE frame on the log.
+    Nop,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,7 +150,8 @@ struct Fired {
 #[derive(Default)]
 struct ClockSm {
     fired: Vec<Fired>,
-    stamps: Vec<(u64, u64)>,
+    /// `(position, time_ns, kind)`; kind 0 = MESSAGE apply, 1 = TIMER fire.
+    stamps: Vec<(u64, u64, u8)>,
     last: Option<u64>,
 }
 
@@ -142,14 +162,16 @@ impl StateMachine for ClockSm {
     /// The leader stamp the command was applied at.
     type Response = u64;
     type Query = ();
-    type QueryResponse = (Vec<Fired>, Vec<(u64, u64)>);
+    type QueryResponse = (Vec<Fired>, Vec<(u64, u64, u8)>);
 
     fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
         match cmd {
             Cmd::At { id, in_ms } => ctx.schedule(id, ctx.time_ns + in_ms * 1_000_000),
+            Cmd::AtAbs { id, at_ns } => ctx.schedule(id, at_ns),
             Cmd::Cancel { id } => ctx.cancel(id),
+            Cmd::Nop => {}
         }
-        self.stamps.push((ctx.position, ctx.time_ns));
+        self.stamps.push((ctx.position, ctx.time_ns, 0));
         self.last = Some(ctx.position);
         ctx.time_ns
     }
@@ -167,7 +189,7 @@ impl StateMachine for ClockSm {
             time_ns: ctx.time_ns,
             late: ev.late(ctx),
         });
-        self.stamps.push((ctx.position, ctx.time_ns));
+        self.stamps.push((ctx.position, ctx.time_ns, 1));
         self.last = Some(ctx.position);
     }
 }
@@ -176,7 +198,7 @@ impl StateMachine for ClockSm {
 /// (no `StateMachine` impl, so no associated `Query` type to route). Go through
 /// the raw path with the same bincode-standard codec the blanket impl uses —
 /// `Timed::query` forwards straight to the inner SM's.
-fn query(svc: &Service<Timed<ClockSm>>) -> (Vec<Fired>, Vec<(u64, u64)>) {
+fn query(svc: &Service<Timed<ClockSm>>) -> (Vec<Fired>, Vec<(u64, u64, u8)>) {
     let q = bincode::serde::encode_to_vec((), bincode::config::standard()).expect("encode");
     let mut out = Vec::new();
     svc.query_raw(&q, &mut out);
@@ -227,13 +249,14 @@ fn a_scheduled_timer_fires_at_its_deadline_in_order_and_once() {
 
     // §4.3: every frame before the timer is stamped <= its deadline, every
     // frame after it >= the deadline.
-    let (before, after): (Vec<_>, Vec<_>) = stamps.iter().partition(|(p, _)| *p < f1[0].position);
+    let (before, after): (Vec<_>, Vec<_>) =
+        stamps.iter().partition(|(p, _, _)| *p < f1[0].position);
     assert!(
-        before.iter().all(|(_, t)| *t <= f1[0].deadline_ns),
+        before.iter().all(|(_, t, _)| *t <= f1[0].deadline_ns),
         "{before:?}"
     );
     assert!(
-        after.iter().all(|(_, t)| *t >= f1[0].deadline_ns),
+        after.iter().all(|(_, t, _)| *t >= f1[0].deadline_ns),
         "{after:?}"
     );
     assert!(
@@ -294,6 +317,174 @@ fn the_log_time_seed_survives_a_restart_of_the_same_instance_dir() {
         seeded, 0,
         "the seed must be recovered from the journal before any new frame"
     );
+    node.stop();
+}
+
+// ------------------------------------------------ 3. the per-pass timer bound
+
+/// Final-review I2: `TIMERS_PER_PASS = 64` is the rule that keeps §4.3's
+/// ordering guarantee honest — when step 2 hits the bound, step 3 appends no
+/// client frame at all, because a client frame between two due timers would
+/// clamp the log clock past the second one's deadline and make it late.
+///
+/// 100 timers share one absolute deadline, so they all come due in the same
+/// pass: 64 fire, clients are held, 36 fire next pass. A pipelined client
+/// keeps the ingress ring continuously non-empty across that window, so the
+/// hold is what keeps the TIMER frames contiguous — remove the `hold_clients`
+/// skip in `do_work` and a MESSAGE frame lands between them.
+#[test]
+fn the_timer_bound_holds_client_frames_for_a_pass() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc = start_service_with(dir.path(), Timed::new(ClockSm::default()));
+    let client =
+        Arc::new(PipelinedClient::connect(dir.path(), APP, PipelinedConfig::default()).unwrap());
+
+    // GROUPS batches of PER_GROUP timers. Each batch shares one absolute
+    // deadline, so its members all come due in the same pass and, being more
+    // than `TIMERS_PER_PASS = 64`, span several passes that must append no
+    // client frame at all. The batches are 20 ms apart, so the test looks at
+    // the rule several times over, at different points of the client load.
+    const GROUPS: u64 = 10;
+    const PER_GROUP: u64 = 200;
+    const N: u64 = GROUPS * PER_GROUP;
+    const _: () = assert!(PER_GROUP > 64, "a batch must exceed TIMERS_PER_PASS");
+
+    // One command to learn the log's clock, then absolute deadlines far
+    // enough out that every schedule is pending before the first one arrives.
+    let t0: u64 = client.submit(&Cmd::Nop).unwrap().wait().unwrap();
+    let deadline = |g: u64| t0 + 300_000_000 + g * 20_000_000;
+    let armed: Vec<_> = (0..GROUPS)
+        .flat_map(|g| {
+            (0..PER_GROUP)
+                .map(move |i| (g, g * PER_GROUP + i))
+                .map(|(g, id)| {
+                    client
+                        .submit::<_, u64>(&Cmd::AtAbs {
+                            id,
+                            at_ns: deadline(g),
+                        })
+                        .unwrap()
+                })
+        })
+        .collect();
+    for t in armed {
+        t.wait().unwrap();
+    }
+
+    // Continuous pipelined load: eight INDEPENDENT clients (one `SendHalf`
+    // mutex each — sharing one `PipelinedClient` across threads serialises the
+    // producers and empties the ring), each holding a deep window of
+    // outstanding MESSAGE frames, so the ingress ring is non-empty when the
+    // timers come due.
+    let stop = Arc::new(AtomicBool::new(false));
+    let loads: Vec<_> = (0..8)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            let dir = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let c = PipelinedClient::connect(&dir, APP, PipelinedConfig::default()).unwrap();
+                let mut inflight = std::collections::VecDeque::new();
+                let mut answered = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    while inflight.len() < 256 {
+                        match c.try_submit::<_, u64>(&Cmd::Nop) {
+                            Ok(t) => inflight.push_back(t),
+                            Err(_) => break, // ring full: exactly the state we want
+                        }
+                    }
+                    if let Some(t) = inflight.pop_front() {
+                        // A held client command must still be ANSWERED — the
+                        // hold is one pass of backpressure, not a refusal.
+                        t.wait().expect("a held client command is still answered");
+                        answered += 1;
+                    }
+                }
+                for t in inflight {
+                    let _ = t.wait();
+                }
+                c.shutdown();
+                answered
+            })
+        })
+        .collect();
+
+    wait_until("all timers fired", || query(&svc).0.len() as u64 >= N);
+    stop.store(true, Ordering::Relaxed);
+    let answered: u64 = loads
+        .into_iter()
+        .map(|h| h.join().expect("load thread"))
+        .sum();
+    assert!(answered > 0, "the load threads answered nothing");
+
+    let (fired, stamps) = query(&svc);
+    assert_eq!(fired.len() as u64, N, "each instance fired exactly once");
+
+    for g in 0..GROUPS {
+        let d = deadline(g);
+        let grp: Vec<_> = fired.iter().filter(|f| f.deadline_ns == d).collect();
+        assert_eq!(
+            grp.len() as u64,
+            PER_GROUP,
+            "group {g}: wrong size, {} fired",
+            grp.len()
+        );
+        // (a) the batch's TIMER frames are contiguous: no MESSAGE frame
+        // between the first and the last, though client load was in flight
+        // the whole time. This is the `hold_clients` rule.
+        let first = grp.iter().map(|f| f.position).min().unwrap();
+        let last = grp.iter().map(|f| f.position).max().unwrap();
+        let between: Vec<_> = stamps
+            .iter()
+            .filter(|(p, _, kind)| *kind == 0 && *p > first && *p < last)
+            .collect();
+        assert!(
+            between.is_empty(),
+            "group {g}: {} client frames landed between two due timers \
+             (timers {first}..={last}); first few: {:?}",
+            between.len(),
+            &between[..between.len().min(4)]
+        );
+        // (c) every fire on time — which is the consequence: a client frame
+        // inside the run would clamp the clock past the deadline.
+        assert!(
+            grp.iter().all(|f| !f.late && f.time_ns == d),
+            "group {g}: a fire was late: {:?}",
+            grp.iter().filter(|f| f.late).take(4).collect::<Vec<_>>()
+        );
+    }
+
+    // The load really was flowing across the whole window: client frames on
+    // both sides of the first and the last timer run.
+    let (lo, hi) = (
+        fired.iter().map(|f| f.position).min().unwrap(),
+        fired.iter().map(|f| f.position).max().unwrap(),
+    );
+    assert!(
+        stamps.iter().any(|(p, _, k)| *k == 0 && *p < lo),
+        "no client frame before the timer runs"
+    );
+    assert!(
+        stamps.iter().any(|(p, _, k)| *k == 0 && *p > hi),
+        "no client frame after the timer runs — the hold was never released"
+    );
+    // (b) the held frames were applied, not dropped (the load threads also
+    // unwrapped every ticket).
+    assert!(
+        stamps.iter().filter(|(_, _, k)| *k == 0).count() as u64 > N,
+        "client commands were applied normally"
+    );
+    // The whole log stays monotone in time across every hold.
+    assert!(
+        stamps.windows(2).all(|w| w[0].1 <= w[1].1),
+        "monotone: {} stamps",
+        stamps.len()
+    );
+
+    Arc::try_unwrap(client).ok().unwrap().shutdown();
+    svc.stop();
     node.stop();
 }
 
