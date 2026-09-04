@@ -5,9 +5,10 @@ placement group, us-east-1a); client hosts `c6i.2xlarge` (x86, 8 vCPU, off
 the measured path — the edge and cluster are ARM). Driver
 `bench-infra/scripts/m13_hop_bench.py --arms gate --gate-client-hosts 2`,
 10 s rungs, payload 64 B, per-connection inflight 1024. Zero lost responses
-on every remote rung of every run. Closes the "not re-measured on modern
-hosts" caveat in
-[`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).*
+on every remote rung of every run.*
+
+Closes the "not re-measured on modern hosts" caveat in
+[`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31`](uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md).
 
 **This is a characterization, not a gate.** The driver adjudicates the
 pre-committed *c6id-era* bars from
