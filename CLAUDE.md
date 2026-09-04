@@ -18,9 +18,14 @@ code.
 byte-empty, `UC2_*` env overrides, `config_loaded` {path, sha256}, the
 `uc_obs` crate, the `ultima_db` removal, and the Broadcast-ring
 memory-ordering fix loom found; `2.9.0` was the `uc_*` crate rename).
-**(2.11.0 pending: FSM identity plus log time and timers — merged to `main`
-and pushed 2026-09-04, one flag day, release on hold; see "Next up"
-below.)**
+**(2.11.0 IN PREPARATION: FSM identity plus log time and timers, one flag
+day. The release hold was lifted 2026-09-04 and the workspace version is
+**bumped in-tree to `2.11.0`** — but `v2.10.0` is still the newest TAG and
+the newest crates.io version, so "what is released" is 2.10.0 until the tag
+exists. **Both 2.11.0 gate docs are still 0-of-9 rows run**, and
+`docs/how-to/cut-a-release.md` §1's writeup de-scaffolding is deliberately
+left until those results are in, because the release-evidence table needs
+them. See "Next up" below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —

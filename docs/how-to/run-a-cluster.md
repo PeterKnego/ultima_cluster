@@ -31,7 +31,7 @@ Take the tarball for the host's architecture from
 **verify it**, then install:
 
 ```bash
-VER=2.10.0
+VER=2.11.0
 TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
 BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
 
@@ -65,15 +65,15 @@ The identity pin on `cosign verify-blob` is not optional dressing; see
 ### Or from the container image
 
 ```bash
-docker pull ghcr.io/peterknego/uc2:2.10.0
+docker pull ghcr.io/peterknego/uc2:2.11.0
 
 cosign verify \
   --certificate-identity-regexp \
     'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/peterknego/uc2:2.10.0
+  ghcr.io/peterknego/uc2:2.11.0
 
-docker run --rm ghcr.io/peterknego/uc2:2.10.0 --version   # ENTRYPOINT is uc2-node
+docker run --rm ghcr.io/peterknego/uc2:2.11.0 --version   # ENTRYPOINT is uc2-node
 ```
 
 Multi-architecture (amd64 + arm64), built from the same tarballs the release

@@ -71,7 +71,7 @@ On **each** of the three hosts (pick the tarball matching the host: `aarch64`
 for Graviton types, `x86_64` for Intel/AMD; substitute the current version):
 
 ```bash
-VER=2.10.0; ARCH=$(uname -m)  # aarch64 or x86_64
+VER=2.11.0; ARCH=$(uname -m)  # aarch64 or x86_64
 curl -fsSLO "https://github.com/PeterKnego/ultima_cluster/releases/download/v${VER}/uc2-${VER}-${ARCH}-unknown-linux-gnu.tar.gz"
 curl -fsSLO "https://github.com/PeterKnego/ultima_cluster/releases/download/v${VER}/uc2-${VER}-${ARCH}-unknown-linux-gnu.tar.gz.sha256"
 sha256sum -c "uc2-${VER}-${ARCH}-unknown-linux-gnu.tar.gz.sha256"
