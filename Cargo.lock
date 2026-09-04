@@ -1443,6 +1443,7 @@ dependencies = [
  "uc_obs",
  "uc_protocol",
  "uc_service",
+ "uc_sim",
 ]
 
 [[package]]

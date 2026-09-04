@@ -267,6 +267,34 @@ seeds sweep five rules, including that lateness must pre-date the pass — a
 `TIMER` frame's `time_ns` may exceed its `deadline_ns` only when the pass that
 emitted it was itself running late, never as an artefact of decoding order.
 
+**And the same oracle now runs over the shipped code.** The model above has no
+`use` statements at all — nothing linked it to `uc_node`, so it could drift from
+the algorithm it mirrors without any test noticing. The predicate is therefore
+split out as `uc_sim::timers::check_frames` (a free function over a frame slice,
+not a method on the model), and
+`uc_node::node::tests::the_real_leader_pass_satisfies_the_sim_oracle_across_seeds`
+drives the **real** `Consensus::do_work` one pass at a time — real
+`fire_due_timers`, real `RowTimers` heap, real `Appender` clamp, real
+step-3-before-3b ordering — reads back the frames the pass appended, and hands
+the sequence to that same predicate. 24 seeds × 10 passes × 2 timer rows, with
+client payloads queued behind the timers and one pass in eight arming a burst
+past `TIMERS_PER_PASS`. The pass clock is pinned through a `#[cfg(test)]`
+override on the single `wall_now_ns()` read, so the release build carries
+neither the field nor a branch; `pass_start_stamp` — rule 5's one input that is
+not on the wire — needs no instrumentation, because a test that calls
+`do_work()` itself owns the pass boundaries.
+
+The test is **mutation-checked, and the mutation survives everything else**.
+Reordering `do_work` so `drain_ingress` runs before `fire_due_timers` — the
+clients-before-timers bug rule 5 exists to name — leaves all seven
+`uc_node/tests/timers.rs` integration tests GREEN, including
+`a_scheduled_timer_fires_at_its_deadline_in_order_and_once` and its
+`time_ns == deadline_ns` assertion, which does not expose the reorder because
+its scenario has no client frame in flight during the timer's pass. The
+differential test kills it on seed 1, naming the late timer, its deadline, the
+pass start stamp and the culprit frame. The mutation was applied by hand and
+reverted; it is not a shipped feature flag.
+
 ```bash
 cargo test -p uc_sim                          # standard tier
 cargo test -p uc_sim --features sim-heavy     # 1000-seed fuzz
@@ -787,6 +815,16 @@ The most important section, and the one most projects omit.
   produces divergence that no layer here can catch.
 - **Bounded model checks are bounded.** Veil's clean runs are exhaustive to a
   depth, not to all executions (§8).
+- **The leader pass is checked for ORDERING, not for which occurrence fires.**
+  The differential test in §2 puts `uc_sim`'s §4.3 oracle on the real pass, so
+  the mirror can no longer drift on stamp ordering, monotonicity or lateness
+  attribution. It does **not** cover the schedule table's recurrence choice —
+  `RowTimers::table_fire_deadline`'s one-tick catch-up, which picks the latest
+  occurrence at or before the leader's clock. That arithmetic is covered by the
+  `uc_protocol_schedule_table` property fuzz target (totality, §7) and by
+  `a_restarted_node_resumes_the_table_with_one_catch_up_tick` (one scenario),
+  and by nothing seeded. A wrong-but-total occurrence choice would pass both the
+  fuzzer and the ordering oracle.
 - **The IPC rings' interleavings and UB are covered by nothing — except MPSC
   and Broadcast** (§6, §7).
   `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` — the one place

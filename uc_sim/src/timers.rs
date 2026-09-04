@@ -236,132 +236,146 @@ impl PassModel {
         }
     }
 
-    /// The §4.3 ordering + monotonicity predicate, checked against the frame
-    /// sequence appended so far. Returns the first violation found, naming
-    /// the offending frame indices.
-    ///
-    /// Rules 2 and 3 run BEFORE rule 1: they are logical consequences of
-    /// rule 1 (non-decreasing stamps transitively implies both), so if rule
-    /// 1 ran first its `Err` would always fire first and rules 2/3's more
-    /// specific, timer-and-deadline-named messages would be unreachable
-    /// dead code. Rules 1, 4 and 5 are the load-bearing ones; 2 and 3 exist
-    /// purely for diagnosis.
+    /// The §4.3 ordering + monotonicity predicate over this model's own
+    /// frame sequence — a thin wrapper over [`check_frames`], which is the
+    /// predicate itself and is deliberately NOT a method: `uc_node`'s
+    /// differential test runs it over frames a REAL leader pass appended,
+    /// so the oracle must not be reachable only through the model that
+    /// mirrors the algorithm.
     pub fn check(&self) -> Result<(), String> {
-        // Rule 2: an on-time timer frame (stamp == deadline) is never
-        // preceded by a frame stamped past its deadline. Diagnostic only —
-        // implied by rule 1 — run first so its message wins when it names
-        // the same violation.
-        for (i, f) in self.frames.iter().enumerate() {
-            if f.kind != Kind::Timer {
-                continue;
-            }
-            let deadline = f.deadline.expect("timer frame missing deadline");
-            if f.stamp != deadline {
-                continue;
-            }
-            for (j, g) in self.frames[..i].iter().enumerate() {
-                if g.stamp > deadline {
-                    return Err(format!(
-                        "frame {j} (stamp {}) precedes on-time timer frame {i} (deadline {deadline}) but exceeds the deadline",
-                        g.stamp
-                    ));
-                }
-            }
-        }
-
-        // Rule 3: every frame after a timer frame is stamped no earlier
-        // than that timer's own stamp. Diagnostic only — implied by rule 1
-        // — run before it for the same reason as rule 2.
-        for (i, f) in self.frames.iter().enumerate() {
-            if f.kind != Kind::Timer {
-                continue;
-            }
-            for (j, g) in self.frames[i + 1..].iter().enumerate() {
-                let j = i + 1 + j;
-                if g.stamp < f.stamp {
-                    return Err(format!(
-                        "frame {j} (stamp {}) follows timer frame {i} (stamp {}) but has a smaller stamp",
-                        g.stamp, f.stamp
-                    ));
-                }
-            }
-        }
-
-        // Rule 1 (load-bearing): stamps non-decreasing over the whole
-        // sequence.
-        for i in 1..self.frames.len() {
-            if self.frames[i].stamp < self.frames[i - 1].stamp {
-                return Err(format!(
-                    "stamp decreased: frame {} (stamp {}) < frame {} (stamp {})",
-                    i,
-                    self.frames[i].stamp,
-                    i - 1,
-                    self.frames[i - 1].stamp
-                ));
-            }
-        }
-
-        // Rule 4 (load-bearing): no timer frame fires early: stamp >=
-        // deadline, always.
-        for (i, f) in self.frames.iter().enumerate() {
-            if f.kind != Kind::Timer {
-                continue;
-            }
-            let deadline = f.deadline.expect("timer frame missing deadline");
-            if f.stamp < deadline {
-                return Err(format!(
-                    "timer frame {i} fired early: stamp {} < deadline {deadline}",
-                    f.stamp
-                ));
-            }
-        }
-
-        // Rule 5 (load-bearing): lateness must pre-date the pass. A TIMER
-        // frame stamped past its own deadline (late) is legitimate only if
-        // that deadline was already behind the clock before this pass began
-        // (deadline < pass_start_stamp). A late timer whose deadline was
-        // NOT yet behind the pass's own start stamp can only have become
-        // late because some earlier frame in the SAME pass (same
-        // pass_start_stamp) already pushed the clock past its deadline
-        // before this timer's turn — the clients-before-timers bug. Name
-        // both the late timer's index and, when found, the same-pass
-        // predecessor's index that is responsible.
-        for (i, f) in self.frames.iter().enumerate() {
-            if f.kind != Kind::Timer {
-                continue;
-            }
-            let deadline = f.deadline.expect("timer frame missing deadline");
-            if f.stamp <= deadline {
-                continue; // on-time or early (already ruled out by rule 4) — not late
-            }
-            if deadline < f.pass_start_stamp {
-                continue; // legitimately late: already overdue before this pass began
-            }
-            let culprit = self.frames[..i]
-                .iter()
-                .enumerate()
-                .find(|(_, g)| g.pass_start_stamp == f.pass_start_stamp && g.stamp > deadline);
-            return Err(match culprit {
-                Some((j, g)) => format!(
-                    "timer frame {i} (deadline {deadline}) fired late (stamp {}) though its \
-                     deadline was not yet due when its pass began (pass_start_stamp {}); frame \
-                     {j} (stamp {}), appended earlier in the SAME pass, already moved the clock \
-                     past the deadline before this timer's turn — a same-pass frame ran ahead of \
-                     a due timer",
-                    f.stamp, f.pass_start_stamp, g.stamp
-                ),
-                None => format!(
-                    "timer frame {i} (deadline {deadline}) fired late (stamp {}) though its \
-                     deadline was not yet due when its pass began (pass_start_stamp {}), and no \
-                     same-pass predecessor frame was found to blame — the model itself is \
-                     inconsistent, investigate",
-                    f.stamp, f.pass_start_stamp
-                ),
-            });
-        }
-
-        Ok(())
+        check_frames(&self.frames)
     }
+}
+
+/// The §4.3 ordering + monotonicity predicate, checked against the frame
+/// sequence appended so far. Returns the first violation found, naming
+/// the offending frame indices.
+///
+/// Rules 2 and 3 run BEFORE rule 1: they are logical consequences of
+/// rule 1 (non-decreasing stamps transitively implies both), so if rule
+/// 1 ran first its `Err` would always fire first and rules 2/3's more
+/// specific, timer-and-deadline-named messages would be unreachable
+/// dead code. Rules 1, 4 and 5 are the load-bearing ones; 2 and 3 exist
+/// purely for diagnosis.
+///
+/// Takes the frames as a slice rather than `&self`: the sequence may come
+/// from [`PassModel::pass`] (the model) or from a real node's log (the
+/// differential test in `uc_node`), and the predicate must not care which.
+pub fn check_frames(frames: &[Frame]) -> Result<(), String> {
+    // Rule 2: an on-time timer frame (stamp == deadline) is never
+    // preceded by a frame stamped past its deadline. Diagnostic only —
+    // implied by rule 1 — run first so its message wins when it names
+    // the same violation.
+    for (i, f) in frames.iter().enumerate() {
+        if f.kind != Kind::Timer {
+            continue;
+        }
+        let deadline = f.deadline.expect("timer frame missing deadline");
+        if f.stamp != deadline {
+            continue;
+        }
+        for (j, g) in frames[..i].iter().enumerate() {
+            if g.stamp > deadline {
+                return Err(format!(
+                    "frame {j} (stamp {}) precedes on-time timer frame {i} (deadline {deadline}) but exceeds the deadline",
+                    g.stamp
+                ));
+            }
+        }
+    }
+
+    // Rule 3: every frame after a timer frame is stamped no earlier
+    // than that timer's own stamp. Diagnostic only — implied by rule 1
+    // — run before it for the same reason as rule 2.
+    for (i, f) in frames.iter().enumerate() {
+        if f.kind != Kind::Timer {
+            continue;
+        }
+        for (j, g) in frames[i + 1..].iter().enumerate() {
+            let j = i + 1 + j;
+            if g.stamp < f.stamp {
+                return Err(format!(
+                    "frame {j} (stamp {}) follows timer frame {i} (stamp {}) but has a smaller stamp",
+                    g.stamp, f.stamp
+                ));
+            }
+        }
+    }
+
+    // Rule 1 (load-bearing): stamps non-decreasing over the whole
+    // sequence.
+    for i in 1..frames.len() {
+        if frames[i].stamp < frames[i - 1].stamp {
+            return Err(format!(
+                "stamp decreased: frame {} (stamp {}) < frame {} (stamp {})",
+                i,
+                frames[i].stamp,
+                i - 1,
+                frames[i - 1].stamp
+            ));
+        }
+    }
+
+    // Rule 4 (load-bearing): no timer frame fires early: stamp >=
+    // deadline, always.
+    for (i, f) in frames.iter().enumerate() {
+        if f.kind != Kind::Timer {
+            continue;
+        }
+        let deadline = f.deadline.expect("timer frame missing deadline");
+        if f.stamp < deadline {
+            return Err(format!(
+                "timer frame {i} fired early: stamp {} < deadline {deadline}",
+                f.stamp
+            ));
+        }
+    }
+
+    // Rule 5 (load-bearing): lateness must pre-date the pass. A TIMER
+    // frame stamped past its own deadline (late) is legitimate only if
+    // that deadline was already behind the clock before this pass began
+    // (deadline < pass_start_stamp). A late timer whose deadline was
+    // NOT yet behind the pass's own start stamp can only have become
+    // late because some earlier frame in the SAME pass (same
+    // pass_start_stamp) already pushed the clock past its deadline
+    // before this timer's turn — the clients-before-timers bug. Name
+    // both the late timer's index and, when found, the same-pass
+    // predecessor's index that is responsible.
+    for (i, f) in frames.iter().enumerate() {
+        if f.kind != Kind::Timer {
+            continue;
+        }
+        let deadline = f.deadline.expect("timer frame missing deadline");
+        if f.stamp <= deadline {
+            continue; // on-time or early (already ruled out by rule 4) — not late
+        }
+        if deadline < f.pass_start_stamp {
+            continue; // legitimately late: already overdue before this pass began
+        }
+        let culprit = frames[..i]
+            .iter()
+            .enumerate()
+            .find(|(_, g)| g.pass_start_stamp == f.pass_start_stamp && g.stamp > deadline);
+        return Err(match culprit {
+            Some((j, g)) => format!(
+                "timer frame {i} (deadline {deadline}) fired late (stamp {}) though its \
+                 deadline was not yet due when its pass began (pass_start_stamp {}); frame \
+                 {j} (stamp {}), appended earlier in the SAME pass, already moved the clock \
+                 past the deadline before this timer's turn — a same-pass frame ran ahead of \
+                 a due timer",
+                f.stamp, f.pass_start_stamp, g.stamp
+            ),
+            None => format!(
+                "timer frame {i} (deadline {deadline}) fired late (stamp {}) though its \
+                 deadline was not yet due when its pass began (pass_start_stamp {}), and no \
+                 same-pass predecessor frame was found to blame — the model itself is \
+                 inconsistent, investigate",
+                f.stamp, f.pass_start_stamp
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

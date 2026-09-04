@@ -55,6 +55,14 @@ uc_client = { path = "../uc_client", version = "2.10.0" }
 # it to resolve from the registry and fail forever. Cargo silently strips a
 # path dev-dependency with no version from the packaged manifest instead.
 uc_lincheck = { path = "../uc_lincheck", default-features = false, features = ["v2"] }
+# The §4.3 leader-pass ORACLE (`uc_sim::timers::check_frames`), reused by
+# `tests::timers_differential` over the frame sequence a real `do_work` pass
+# appended — so the ordering predicate is checked against the shipped code and
+# not only against `uc_sim`'s hand-written model of it. Same unversioned idiom
+# as `uc_lincheck` above and for the same reason: `uc_sim` is `publish = false`,
+# so a `version =` here would make `cargo package` demand it from the registry.
+# No dependency cycle: `uc_sim` does not depend on `uc_node`.
+uc_sim = { path = "../uc_sim" }
 serde = { workspace = true }
 bincode = { workspace = true }
 tempfile = { workspace = true }

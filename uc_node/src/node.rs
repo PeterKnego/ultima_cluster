@@ -1456,6 +1456,8 @@ impl Node {
                 .collect(),
             timer_stats: Arc::clone(&timer_stats),
             pass_now_ns: 0,
+            #[cfg(test)]
+            test_now_ns: None,
             services: cfg.services,
             snap_stats: Arc::clone(&route_drops),
             last_snap_refusals: (0, 0, 0),
@@ -2127,6 +2129,14 @@ struct Consensus {
     /// deadline comparison and every `Appender::set_now` in the pass, so a
     /// pass's frames share one clock. `0` until the first pass.
     pass_now_ns: u64,
+    /// Test-only clock override for the one `wall_now_ns()` reading per pass.
+    /// `#[cfg(test)]`, so the shipped binary has neither the field nor the
+    /// branch — M14a's rule is that code in a hot body costs even on paths
+    /// that never run, and this one is genuinely ABSENT rather than merely
+    /// unreachable. Set by `tests::timers_differential`, which has to place
+    /// passes at chosen instants to drive the §4.3 ordering deterministically.
+    #[cfg(test)]
+    test_now_ns: Option<u64>,
     /// M14a: a copy of `NodeConfig::services` — the declared set + lag policy.
     /// Read by `publish_service_mins` every cycle; Task 6 also answers
     /// `MSG_V2_BAD_SERVICE` from it.
@@ -2547,6 +2557,24 @@ fn wall_now_ns() -> u64 {
 }
 
 impl Consensus {
+    /// The pass's one clock reading. In a release build this IS
+    /// [`wall_now_ns`] — the `#[cfg(not(test))]` body is `#[inline(always)]`
+    /// and the override field does not exist — so `do_work`'s hot top is
+    /// byte-for-byte what it was before the seam went in.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn pass_clock(&self) -> u64 {
+        wall_now_ns()
+    }
+
+    /// Test build: honour `test_now_ns` when the test has placed the pass at a
+    /// chosen instant, else read the real clock so every pre-existing test
+    /// keeps its current behaviour.
+    #[cfg(test)]
+    fn pass_clock(&self) -> u64 {
+        self.test_now_ns.unwrap_or_else(wall_now_ns)
+    }
+
     /// One consensus duty cycle (binding order, plan §Task 8).
     fn do_work(&mut self) -> bool {
         // M7: a removed node fail-stops permanently (`Action::HaltRemoved`) —
@@ -2566,7 +2594,7 @@ impl Consensus {
         // at max(deadline, last), and only DUE deadlines are ever appended
         // (the debug_assert in `fire_due_timers`). Sched rings drain first so
         // a timer scheduled by the service this pass can fire this pass.
-        let now_wall = wall_now_ns();
+        let now_wall = self.pass_clock();
         self.pass_now_ns = now_wall;
         if let Some(app) = self.appender.as_mut() {
             app.set_now(now_wall);
@@ -8088,6 +8116,8 @@ mod tests {
                 .collect(),
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
             pass_now_ns: 0,
+            #[cfg(test)]
+            test_now_ns: None,
             services: ServicesConfig::none_for_tests(),
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0),
@@ -12355,5 +12385,213 @@ mod tests {
             "a none_for_tests node must never ship a snapshot set"
         );
         assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
+    }
+
+    // ---- §4.3 differential: the SHIPPED pass, checked by the sim's oracle ----
+    //
+    // `uc_sim::timers::PassModel` is a hand-written mirror of the leader-pass
+    // algorithm: it has no `use` statements at all, so nothing links it to the
+    // code that ships. Its `check_frames` predicate is the valuable half — in
+    // particular rule 5, which is the only rule that separates a genuinely late
+    // timer from the clients-before-timers bug (rules 1-4 are satisfied by ANY
+    // consistently-clamped order, so they cannot see that reordering).
+    //
+    // This test points that predicate at the real thing: it drives
+    // `Consensus::do_work` one pass at a time with the pass clock pinned, reads
+    // back the frames the pass actually appended, and hands the sequence to the
+    // same oracle. What the mirror still buys is combinatorial breadth; what
+    // this buys is that the sequence came out of `fire_due_timers`, the real
+    // `RowTimers` heap, `Appender`'s clamp, and `do_work`'s step-3-before-3b
+    // ordering.
+    //
+    // `pass_start_stamp` — the one input the oracle needs that is not on the
+    // wire — costs nothing here: a test that calls `do_work()` itself owns the
+    // pass boundaries.
+
+    use uc_protocol::v2::frame::{
+        FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, HEADER_LEN, read_timer_body,
+    };
+    use uc_sim::timers::{Frame as SimFrame, Kind as SimKind, Rng as SimRng, check_frames};
+
+    /// Read every frame in `[cursor, append)`, convert it to the oracle's
+    /// vocabulary, and advance `cursor`. `pass_start_stamp` tags every frame
+    /// this call collects — the caller passes the stamp high-water mark as it
+    /// stood before the `do_work` that produced them.
+    fn collect_frames(
+        h: &Harness,
+        cursor: &mut u64,
+        pass_start_stamp: u64,
+        out: &mut Vec<SimFrame>,
+    ) {
+        let append = h.cons.cnc.counters().append.load_acquire();
+        let mut buf = Vec::new();
+        while *cursor < append {
+            let hdr = match h.cons.buffer.read_frame_validated(*cursor, &mut buf) {
+                FrameRead::Frame(hdr) => hdr,
+                // The harness buffer is 64 KiB and a run appends a few
+                // hundred bytes, so neither is reachable — assert rather
+                // than skip, so a future change that DOES reach one is a
+                // failure and not a silently shortened frame sequence.
+                other => panic!("frame at {} unreadable: {other:?}", *cursor),
+            };
+            let next = *cursor + align_frame_len(hdr.length as usize) as u64;
+            match hdr.frame_type {
+                FRAME_TYPE_TIMER => {
+                    let body = read_timer_body(&buf[HEADER_LEN..])
+                        .expect("a TIMER frame the node itself appended must decode");
+                    out.push(SimFrame {
+                        kind: SimKind::Timer,
+                        stamp: hdr.time_ns,
+                        deadline: Some(body.deadline_ns),
+                        pass_start_stamp,
+                    });
+                }
+                // A padding frame is a buffer-wrap artefact carrying no stamp
+                // of its own. Unreachable at this buffer size, but skipping is
+                // the right behaviour if it ever is reached.
+                FRAME_TYPE_PADDING => {}
+                // EVERY other frame type maps to the model's `Client`, which
+                // does not mean "submitted by a client" — it means "stamped
+                // `max(now, last_stamp)`", the clamp all four non-timer append
+                // paths in `uc_log::buffer` share (a MESSAGE, a NEW_TERM, a
+                // CONFIG and a SCHEDULE_TABLE frame are indistinguishable to
+                // §4.3, as is `FRAME_TYPE_MESSAGE` itself). Classifying them rather than skipping them is what
+                // lets rule 5 blame a NEW_TERM or CONFIG frame that ran ahead
+                // of a due timer, not just a client submission.
+                _ => out.push(SimFrame {
+                    kind: SimKind::Client,
+                    stamp: hdr.time_ns,
+                    deadline: None,
+                    pass_start_stamp,
+                }),
+            }
+            *cursor = next;
+        }
+    }
+
+    /// One seeded run: `passes` leader passes over `rows` timer rows, with
+    /// timers armed around the pass clock and client payloads queued behind
+    /// them. Returns the frame sequence the real node appended.
+    fn drive_seeded_passes(seed: u64, rows: usize, passes: usize) -> Vec<SimFrame> {
+        let mut h = harness();
+        let append = drive_to_serving_leader(&mut h);
+
+        // Give the node real timer rows. `ServicesConfig::none_for_tests()`
+        // declares nothing, so `timers` is all-`None` out of the harness and
+        // `fire_due_timers` would have no row to select from. Installing
+        // `RowTimers` directly (rather than declaring services) is deliberate:
+        // `fire_due_timers` reads only `self.timers`, while declaring a
+        // service that never attaches would move the serving gate that
+        // `drive_to_serving_leader` — and every other harness test — depends on.
+        for row in 0..rows {
+            h.cons.timers[row] = Some(crate::timers::RowTimers::new(0xF5A0_0000 + row as u64));
+        }
+
+        // Self-calibrate the clock above whatever the election frames were
+        // stamped with: the appender clamps to its high-water mark, so a pass
+        // clock BELOW that mark would make every frame in this test "late" and
+        // the run would prove nothing.
+        let mut frames = Vec::new();
+        let mut cursor = 6016;
+        collect_frames(&h, &mut cursor, 0, &mut frames);
+        let t_base = frames.iter().map(|f| f.stamp).max().unwrap_or(0);
+        frames.clear();
+        assert_eq!(cursor, append, "election frames not fully consumed");
+
+        let mut rng = SimRng::new(seed);
+        let mut now = t_base + 1_000_000;
+        let mut last_stamp = t_base;
+        let mut next_id = 1u64;
+
+        for _ in 0..passes {
+            // The clock moves forward by 0..50 ms per pass.
+            now += rng.range(0, 50_000_000);
+
+            // Arm 0..3 timers, each with a deadline within ±20 ms of the
+            // pass clock: some are already due and fire this pass, some are
+            // not and wait. A deadline in the past is what makes a LATE
+            // firing legitimate (rule 5's escape hatch), so both kinds must
+            // appear or rule 5 is never exercised on its true branch.
+            for _ in 0..rng.range(0, 4) {
+                let row = rng.range(0, rows as u64) as usize;
+                let skew = rng.range_i64(-20_000_000, 20_000_000);
+                let deadline = (now as i64 + skew).max(0) as u64;
+                h.cons.timers[row]
+                    .as_mut()
+                    .unwrap()
+                    .schedule(next_id, deadline);
+                next_id += 1;
+            }
+
+            // One pass in eight arms a burst past TIMERS_PER_PASS, so the
+            // bound's "hold every client frame for a pass" branch is on the
+            // real code path under the oracle rather than only in the model.
+            if rng.chance(8) {
+                for _ in 0..(TIMERS_PER_PASS + 6) {
+                    let row = rng.range(0, rows as u64) as usize;
+                    h.cons.timers[row]
+                        .as_mut()
+                        .unwrap()
+                        .schedule(next_id, now - rng.range(1, 5_000_000));
+                    next_id += 1;
+                }
+            }
+
+            // Queue 0..3 client payloads. These are what a reordered pass
+            // would let run ahead of a due timer.
+            for _ in 0..rng.range(0, 4) {
+                h._ingress_tx
+                    .try_send(Ingress::Payload(vec![7u8; 16]))
+                    .expect("harness ingress channel full");
+            }
+
+            h.cons.test_now_ns = Some(now);
+            let pass_start_stamp = last_stamp;
+            h.cons.do_work();
+            collect_frames(&h, &mut cursor, pass_start_stamp, &mut frames);
+            last_stamp = frames.iter().map(|f| f.stamp).max().unwrap_or(last_stamp);
+        }
+
+        frames
+    }
+
+    /// The §4.3 ordering invariant, checked over frames a REAL leader pass
+    /// appended rather than over `uc_sim`'s model of one. 24 seeds.
+    #[test]
+    fn the_real_leader_pass_satisfies_the_sim_oracle_across_seeds() {
+        let mut total_timers = 0usize;
+        let mut total_clients = 0usize;
+        let mut late_legitimately = 0usize;
+
+        for seed in 1..=24u64 {
+            let frames = drive_seeded_passes(seed, 2, 10);
+            check_frames(&frames)
+                .unwrap_or_else(|e| panic!("seed {seed}: §4.3 violated by the real pass: {e}"));
+
+            total_timers += frames.iter().filter(|f| f.kind == SimKind::Timer).count();
+            total_clients += frames.iter().filter(|f| f.kind == SimKind::Client).count();
+            late_legitimately += frames
+                .iter()
+                .filter(|f| f.kind == SimKind::Timer && f.deadline.is_some_and(|d| f.stamp > d))
+                .count();
+        }
+
+        // A green oracle over an empty or timer-free sequence proves nothing.
+        // These bars are deliberately far below what the seeds actually
+        // produce; they exist to fail loudly if a future change stops the
+        // harness from appending one of the two frame kinds at all.
+        assert!(
+            total_timers > 200,
+            "too few TIMER frames ({total_timers}) — the oracle ran on a vacuous sequence"
+        );
+        assert!(
+            total_clients > 50,
+            "too few client frames ({total_clients}) — a reordering bug would be invisible"
+        );
+        assert!(
+            late_legitimately > 0,
+            "no legitimately-late timer fired — rule 5's true branch was never taken, so \
+             the seeds are not exercising the case it exists to distinguish"
+        );
     }
 }
