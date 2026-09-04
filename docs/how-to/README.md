@@ -33,6 +33,10 @@ keeping the disk from filling once they are there.
 - [Monitor a cluster](monitor-a-cluster.md) — Prometheus scraping, the alert
   rules, the Grafana dashboard, the `/healthz`/`/readyz` probes, and the
   structured-event vocabulary.
+- [Run work on a schedule](run-work-on-a-schedule.md) — the replicated schedule
+  table: write the TOML, apply it against the leader, confirm every node
+  adopted the same one, and what a restart or a rebuilt node does to it. UTC
+  only, 32 entries, no cron.
 
 ## Changing a running cluster
 
@@ -71,6 +75,10 @@ something is wrong" below.
 - [Write a service binary](write-a-service-binary.md) — the lifecycle template
   for the half that runs your state machine: signal handling, apply-agent
   supervision, and why leaving either out fails quietly.
+- [Schedule work inside a state machine](schedule-work-in-a-service.md) — name
+  your FSM, give it a deterministic clock, ask to be woken with
+  `ctx.schedule`, handle it in `on_timer`, and decide whether you need
+  `Timed<S>` for exactly-once delivery.
 - [Cut a release](cut-a-release.md) — for maintainers: the tag, what the
   release workflow proves before it publishes anything, how to verify the
   signed artifacts as a stranger would, and the manual crates.io order.

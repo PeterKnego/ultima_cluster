@@ -75,7 +75,8 @@ schedule table an operator applies with one command.
   the node seeds the control page with it before any agent runs, so a
   stop-all/start-all upgrade cannot rewind the log's clock. Only a fresh
   instance directory starts from wall time.
-  → [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
+  → [Schedule work inside a state machine](docs/how-to/schedule-work-in-a-service.md) ·
+  [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
   [Wire protocol § Log frames](docs/reference/wire-protocol.md#log-frames)
 - **A state machine can schedule its own callbacks, and they arrive in the
   right place on the log.** `ctx.schedule(id, at_ns)` and `ctx.cancel(id)`
@@ -127,7 +128,8 @@ schedule table an operator applies with one command.
   `uc2_schedule_apply_refused_total` export it, and the new
   `Uc2ScheduleTableDiverged` rule pages when nodes disagree about which table
   they are running.
-  → [Log time and timers, explained § The schedule table](docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table) ·
+  → [Run work on a schedule](docs/how-to/run-work-on-a-schedule.md) ·
+  [Log time and timers, explained § The schedule table](docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table) ·
   [`uc2ctl` § `schedule apply`](docs/reference/uc2ctl.md#schedule-apply) ·
   [Wire protocol § `SNAP_TABLE` body](docs/reference/wire-protocol.md#snap_table-body-wire-070) ·
   [UC v2 operations § Changing a running cluster](docs/ops/uc2-runbook.md#changing-a-running-cluster)

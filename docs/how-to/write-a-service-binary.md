@@ -107,6 +107,9 @@ gets this right for free. See
 
 ## Related
 
+- [Schedule work inside a state machine](schedule-work-in-a-service.md) — the
+  other half of what your state machine can do since `2.11.0`: a deterministic
+  clock, timers, and deterministic IDs.
 - [Run a cluster on real hosts](run-a-cluster.md) — where these binaries go and
   how they are supervised.
 - [Diagnose a node that is not serving](diagnose-a-node.md) — when the service
