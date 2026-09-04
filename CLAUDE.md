@@ -61,7 +61,7 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up: **FSM identity** (`docs/BACKLOG.md` item 2, taken up 2026-09-01;
+Next up: **FSM identity** (`docs/BACKLOG.md` § Shipped, taken up 2026-09-01;
 spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`, plan
 `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md`) —
 **MERGED to `main`, pushed 2026-09-04, awaiting release.** All ten
@@ -76,7 +76,7 @@ skeleton `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` (bars
 pre-committed, no fleet run yet). **The release itself is on hold**: more
 changes are planned on `main` first, so no version has been bumped, no
 tag cut, no fleet gate run — see the "Standing facts" entry below and
-`docs/BACKLOG.md` item 2.
+`docs/BACKLOG.md` § Shipped (its still-open residuals are now backlog item 2).
 
 Also on `main` and in the same `2.11.0` flag day: **time and timers**
 (spec `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`),

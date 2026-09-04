@@ -412,7 +412,7 @@ plain-language section:
   and revert-on-truncation (the spec's record had no `prev`); and `once` as a
   third rule kind that **parks** on firing (the spec had two rules and no park).
 - **Known limits, documented rather than fixed** (also in
-  `docs/reference/limits.md` and `docs/BACKLOG.md` § 2a): a node that
+  `docs/reference/limits.md` and `docs/BACKLOG.md` item 2): a node that
   crashes in the sub-millisecond window between the archive recording a table
   frame and the consensus agent persisting it loses that adoption, there being
   no journal re-scan for type-6 frames; boot arming has no delivered set until
@@ -438,7 +438,7 @@ plain-language section:
   deliberate — **a wiped node's kept table does not propagate by snapshot**,
   because position 0 means the table is unanchored in the log and the wipe
   keep-alive is a local fiat, not a cluster fact a joiner should record.
-  `docs/BACKLOG.md` § 2a carries it.
+  `docs/BACKLOG.md` item 2 carries it.
 - **One process gap, not a code one.** `Uc2LogTimeFrozen` (plan 1) and
   `Uc2ScheduleTableDiverged` (plan 2) both ship without a `RULE_BUILDERS` entry
   in `scripts/m10_alert_fire.sh`, whose completeness cross-check therefore

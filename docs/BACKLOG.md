@@ -49,143 +49,16 @@ invites. Run both through the gate discipline.
   the maintainer paused to add features to UC first. Resume from that
   brief's "Where the design stopped".
 
-### 2. FSM identity — name the state machine, not the slot
+### 2. Schedule-table and timer follow-ons
 
-*Added 2026-09-01; taken up the same day (brainstorm in progress).*
+*What is left of items 2 and 2a after both shipped in `2.11.0` (see
+[Shipped](#shipped-since-this-list-was-written) below). Every bullet is a
+KNOWN, documented residual, not a defect: each is stated in
+`docs/reference/limits.md` and reachable by a user, and each has a remedy or a
+reason it is deliberate. Kept as a numbered item so it stays a candidate
+direction rather than a footnote to a finished one. The references that used
+to point at "§ 2a" for these residuals now point here.*
 
-M14 identifies an FSM only by its slot number. Attach validates `app_id`
-and the per-boot `instance_id` (`uc_service/src/attach.rs`), then checks
-that the numeric `service_id` is in the node's declared set — and nothing
-else. Two nodes agree on the *set of slot numbers*
-(`docs/superpowers/specs/2026-08-21-uc2-multi-service-design.md`, "Declared
-set" and "Command delivery" rows) and never on what logic each slot holds.
-The slot is placement; nothing states identity. An FSM name is the per-FSM
-analog of `app_id`: a declared identity checked at every boundary that
-today checks only the number.
-
-- **What it binds:** attach refusal by name (service's declared name vs. the
-  node's slot→name map); the cluster-wide agreement check the snapshot path
-  already runs for the declared set and lag policy; snapshot artifacts
-  (install rejects a foreign FSM's artifact the way it rejects a mis-tagged
-  position); query routing by name instead of slot, closing the wrong-slot
-  read hazard (queries are slot-routed: `query.ring` payload is
-  `service_id:u8 ++ query`, spec §5.4); and deterministic ID derivation.
-- **First consumer:** a deterministic ID utility in `uc_service` — the same
-  series of IDs on every replica, per `(position, FSM identity, ordinal
-  within this apply)`, stateless so a snapshot-installed replica and a
-  journal-replayed one agree by construction. The identity is what keeps
-  the IDs placement-independent; without it the utility would need a
-  hand-rolled domain tag that this work would then replace.
-- **What it does not do:** a name says two replicas *intend* to be the same
-  FSM; it does not verify they run the same code.
-- **Cost:** moderate. Config + attach + a cnc slot-band field (reserved
-  line 7; same-host, recreated per boot — confirm against
-  `docs/reference/semver-policy.md` whether that is a cnc version bump or
-  a flag day) + snapshot header + client/gateway name resolution.
-- **Status 2026-09-02: IMPLEMENTED on branch `uc2/fsm-identity`, release on
-  hold** — spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`
-  ("named rows": identity in code, `const NAME` + `const VERSION`; the row
-  keeps its cluster-wide meaning and a service finds it by name; `SNAP_BEGIN`
-  0.7.0 carries hashes + versions per row, compared positionally and refused
-  by name; cnc 3.1; `IdGen`; disk/rings/client engine untouched; the
-  placement-independent variant was cut by the spec's §2.1 comparison
-  table). Plan `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md`
-  (T0–T10), all tasks done: code (`uc_protocol`/`uc_service`/`uc_node`/
-  `uc_client`), harnesses/capstones by name, docs + explainer + gate-doc
-  skeleton. Not yet released — no version bump, no tag, no fleet run; more
-  changes are planned on this branch before a release. Explainer:
-  `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`.
-
-### 2a. Time and timers — DONE (both plans), release on hold
-
-*Added 2026-09-03, when plan 1 was implemented; plan 2 followed the same day.
-Kept here as the record of a finished item rather than deleted (see this
-page's preamble). Not a ranked item on the
-2026-09-01 list: leader-stamped log time and a deterministic scheduler were
-requested by the maintainer directly on 2026-09-02 and specced beside FSM
-identity, which is why this line sits under item 2 rather than getting a
-number of its own.*
-
-**Plan 1 is IMPLEMENTED on the same branch as FSM identity, release on
-hold.** Spec:
-`docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`; plan:
-`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md` (T0–T14, all
-tasks done). What shipped: a leader-written `time_ns` in every frame header
-(the header was relaid to pay for it, so the payload ceiling is unchanged),
-the `max(now, last)` clamp, `ApplyCtx::{time_ns, term, schedule, cancel}`, a
-provided `on_timer` on both tiers, `FRAME_TYPE_TIMER` with deadline-stamped
-in-order placement, the per-row node heap with re-arm on leadership loss,
-`uc_service::Timed<S>` for exactly-once delivery, one new per-row IPC ring
-(`svc_sched.<row>.ring`), two cnc words, six metric families and one alert
-rule. Explainer:
-`docs/notes/uc2-log-time-and-timers-explained.md`; gate skeleton:
-`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars committed, no
-run). It rides the same unreleased `2.11.0` flag day as FSM identity.
-
-**Plan 2, the replicated schedule table, is IMPLEMENTED too** — same branch,
-same unreleased `2.11.0` flag day, release still on hold. Plan:
-`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md` (T0–T8, all
-tasks done). What shipped: `FRAME_TYPE_SCHEDULE_TABLE = 6` with a frozen,
-total, fuzzed codec (`MAX_SCHEDULE_ENTRIES = 32`, 33-byte entries, 1064 B
-full — always one datagram); three rules (`every` from an anchor, `at` daily
-UTC, and `once`, which parks in the table after firing); `uc2ctl schedule
-apply <file.toml>` staging `<instance_dir>/schedules.pending` and signing its
-SHA-256 digest into admin op 6, leader-only and single-in-flight, with four
-named refusals and an audit record; adoption through the archive's header
-walk exactly as CONFIG takes, persisted in `state/schedules.state` with one
-level of `prev` to revert to on truncation and re-armed at boot from the log
-clock; table ticks firing as `TIMER` frames with `FLAG_TIMER_TABLE`, advanced
-at append on the leader and on `TableConsumed` on a follower, with one-tick
-catch-up at fire time; `Timed`'s `table_last` dedup; three metric families,
-two records and the `Uc2ScheduleTableDiverged` alert. Explainer section:
-`docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table`; gate row
-e in `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`.
-
-Three execution rulings amended spec §5 (recorded there as as-built errata):
-the one-tick catch-up moved from arm time to fire time; single-in-flight apply
-plus `ScheduleRecord.prev` and revert-on-truncation; and `once` as a third
-rule kind that parks rather than leaving the table.
-
-**Plan 3, the schedule table on the snapshot session, is IMPLEMENTED too** —
-same branch, same unreleased `2.11.0` flag day. Plan:
-`docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md` (T0–T5,
-all done), against the same spec §5's as-built errata. What shipped:
-`DGRAM_KIND_SNAP_TABLE = 21` with a total, fuzzed codec (body `session ‖
-position ‖ time_ns ‖ table_len ‖ table`, ≤ 1086 B, `position == 0` iff the
-table is empty); the leader sending it after **every** `SNAP_BEGIN` of a
-session, gated on its own commit counter; a receiver that withholds
-`SNAP_DONE` until the table arrives, drops strays
-(`uc2_snapshot_table_stray_total`, latched per episode) and publishes
-table → config → floor; a fiat install (`Consensus::install_snapshot_table`,
-`prev: None`) that runs before the floor advances; `schedule_table_adopted`
-gaining a `source` field and `snapshot_installed` a `table_position`. It
-closes the first bullet below and adds the two after it.
-
-**One execution ruling, R7 (2026-09-03), amends the ship gate.** Task 5's
-writeup review found that `shippable_schedule` passed a position-`0` record
-through with its body, which the wire's frozen `(position == 0)` ⇔
-`(table_len == 0)` rule refuses — and because a session completes only once
-its table arrives, that would have STALLED the joiner on every re-send rather
-than failing loudly. Fixed in `c87fd4a`: a record at position `0`, or one
-whose bytes will not decode or decode to no entries, ships as `(0, 0, [])`.
-The deliberate consequence is the third bullet below — a wiped node's kept
-table is local-only. The R7 vectors ride the existing
-`the_snapshot_session_ships_only_a_committed_schedule_table`.
-
-**What is left under this feature** — each documented in
-`docs/reference/limits.md` and the explainer's "Known limits of the table",
-none a blocker, none scheduled:
-
-- ~~**The table is not carried in the snapshot stream.**~~ — CLOSED
-  2026-09-03 by plan 3,
-  `docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md`
-  (spec §5's as-built errata). The judgement that closing it needed a wire
-  change was right; what changed is that `2.11.0` was already an unreleased
-  flag day, so the change cost nothing extra. It is a new datagram kind
-  rather than a `SNAP_BEGIN` field: `SNAP_TABLE` (21, ≤ 1086 B) sent after
-  **every** `SNAP_BEGIN` of a session, withheld `SNAP_DONE` until it arrives,
-  installed by fiat before the floor advances — so a below-floor joiner holds
-  the cluster's table before it can serve a read or win an election.
 - **A restarted node under-ships the table for one window** (plan 3 residual
   a). The cnc commit counter is not primed at boot, so `shippable_schedule`'s
   commit gate cannot yet clear the node's own record: it offers the one-level
@@ -226,12 +99,6 @@ none a blocker, none scheduled:
   is not expressible — a timezone database is replicated state that must agree
   on every node and across every upgrade. Cron-style rules are a possible
   fourth `kind` byte; the codec has room.
-- ~~**Two alert rules have no `m10_alert_fire.sh` builder**~~ — CLOSED in the
-  final fix wave (2026-09-03). `Uc2LogTimeFrozen` and
-  `Uc2ScheduleTableDiverged` now have builders backed by two new
-  `m10_alerts` scenarios (`log_time_frozen`, `schedule_diverged`), both
-  synthetic-state / real-exporter in `identity_drift`'s shape and disclosed
-  by name, so the M10 gate's row 4 can be re-run as written.
 - **`append_schedule_table` duplicates `append_config`'s body deliberately**
   (ruling R8). `uc_log::Appender` now carries four specialised append bodies;
   the shared writer that would collapse them touches the hot `append` path,
@@ -243,6 +110,13 @@ none a blocker, none scheduled:
   §10 left open: a per-host section that simply calls the admin op at startup.
   Deliberately not the primary form — it turns a schedule edit into a rolling
   edit plus a leader change.
+- **Why:** none of these blocks anyone today, which is exactly why the list is
+  worth keeping — a residual nobody wrote down becomes a surprise. The first
+  two are the ones a user meets by accident (a joiner served inside a restart
+  window); the last two are conveniences.
+- **Cost:** low each, and independent. Priming the cnc commit counter at boot
+  and a recovery-path scan for type-6 frames are the two with a clear fix
+  sketch already written above.
 
 ### 3. Rolling upgrades and leadership transfer
 
@@ -397,3 +271,55 @@ without a new argument:
   fact, not a defect
   (`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`,
   `docs/reference/limits.md`).
+
+
+## Shipped since this list was written
+
+Kept per this page's preamble — an item that is taken up gets its line updated
+rather than deleted, so the reasoning stays re-checkable. Both of these are in
+`2.11.0`; what remains open from them is item 2 above.
+
+### FSM identity — name the state machine, not the slot (was item 2)
+
+Taken up 2026-09-01, IMPLEMENTED 2026-09-02, merged to `main` 2026-09-04.
+Identity lives **in code** — a required `const NAME` plus an optional
+`const VERSION` on the state-machine trait — and the row keeps its
+cluster-wide meaning while a service finds it by name. `SNAP_BEGIN` 0.7.0
+carries hashes and versions per row, compared positionally and refused by
+name; cnc 3.1; `ApplyCtx` replaced the bare `position` apply parameter;
+`IdGen` gives deterministic ids. The placement-independent variant was cut by
+the spec's §2.1 comparison table.
+
+Spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` · plan
+`docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10) · explainer
+[`docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`](notes/uc2-fsm-identity-and-deterministic-ids-explained.md)
+· how-to [Schedule work inside a state machine](how-to/schedule-work-in-a-service.md)
+· gate `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` (bars committed,
+**rows not yet run**).
+
+### Time and timers, and the replicated schedule table (was item 2a)
+
+Requested by the maintainer directly on 2026-09-02 — never a ranked item on
+the 2026-09-01 list — and specced beside FSM identity, which is why it sat
+under item 2. **All three plans are implemented** and merged to `main`:
+leader-stamped log time plus a deterministic scheduler (plan 1); the
+replicated schedule table, `FRAME_TYPE_SCHEDULE_TABLE = 6` and
+`uc2ctl schedule apply/show` (plan 2); and that table on the snapshot session,
+`SNAP_TABLE` datagram kind 21, so a below-floor joiner installs it before it
+can serve or lead (plan 3) — which closed the one limitation plan 2 shipped
+with.
+
+One item recorded here as open has since **closed**: `Uc2LogTimeFrozen` and
+`Uc2ScheduleTableDiverged` gained `m10_alert_fire.sh` builders in the final
+fix wave (2026-09-03), backed by the `log_time_frozen` and `schedule_diverged`
+scenarios, so the M10 gate's row 4 can be re-run as written.
+
+Specs `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` ·
+plans `2026-09-03-uc2-time-and-timers-plan{1,2}.md` and
+`2026-09-03-uc2-schedule-table-in-snapshot.md` · explainer
+[`docs/notes/uc2-log-time-and-timers-explained.md`](notes/uc2-log-time-and-timers-explained.md)
+· how-tos [Schedule work inside a state machine](how-to/schedule-work-in-a-service.md)
+and [Run work on a schedule](how-to/run-work-on-a-schedule.md) · gate
+`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (bars committed,
+**rows not yet run**; row d has no runner).
+

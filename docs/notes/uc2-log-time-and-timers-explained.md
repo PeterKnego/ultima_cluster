@@ -437,7 +437,7 @@ about to be fixed.
   already gated once, by the node that shipped it, and on a catching-up joiner
   it sits far above the local commit for the whole join.
 
-  Two narrow windows survive, both recorded in `docs/BACKLOG.md` § 2a. The cnc
+  Two narrow windows survive, both recorded in `docs/BACKLOG.md` item 2. The cnc
   commit counter is not primed at boot, so a **restarted** node under-ships —
   `prev`, or nothing — until its first commit advance; that is the safe
   direction, but a joiner served inside that window can end up with an older
