@@ -201,7 +201,7 @@ The framework **publishes** a response only on the leader (`is_leader` gates
 the egress-ring write). It does **not** gate `apply` itself: every replica —
 every follower doing steady-state apply, and the replay path a service uses
 to reconstruct state after a restart or below-floor catch-up — calls
-`sm.apply(pos, payload, &mut out)` on every committed frame, whether or not
+`sm.apply(ctx, payload, &mut out)` on every committed frame, whether or not
 that replica ever publishes the result. For a typed `StateMachine`, the
 blanket adapter's `apply` both decodes the command **and** encodes the
 response inside that one call — so the response encode a typed tier pays is

@@ -626,7 +626,8 @@ Commit / apply pipeline (steady state):
 - The leader appends to the log buffer, replicates via the sender agent, and the
   consensus agent advances the commit counter when a quorum's durable positions cross it.
 - The service's apply agent polls `min(commit, durable)` in the log buffer in
-  place and calls `state_machine.apply(position, cmd)`, publishing the response
+  place and calls `state_machine.apply(ctx, cmd)` (the position lives on the
+  ctx since 2.11.0), publishing the response
   to the egress broadcast (position-keyed) for the client's matcher.
 
 Snapshots + purge (M6, **OFF by default** — `PurgePolicy::Disabled`): a
@@ -654,8 +655,15 @@ multi-process SIGKILL crashtest (`examples/uc_crashtest`).
   import nothing outside `core`; the ring buffers need `std::sync::atomic` + `memmap2`.
   No `tokio` in the protocol layer.
 - **Apply is sync, deterministic, no I/O.** The trait signature enforces it:
-  `fn apply(&mut self, position: u64, cmd: Self::Command) -> Self::Response`. No
-  `async`, no clock, no randomness. Non-negotiable for SMR correctness. `position`
+  `fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Self::Command) -> Self::Response`
+  (2.11.0 replaced the bare `position: u64` parameter with `ApplyCtx`, which
+  carries `position`, the deterministic `time_ns`, `term`, and the timer
+  handles `schedule`/`cancel`). No `async`, and no AMBIENT clock or randomness
+  — 2.11.0 did not weaken this, it replaced both with replicated substitutes:
+  `ctx.time_ns` is the leader's stamp carried on the frame (every replica
+  applies the same value), and `IdGen` derives ids from the position, so
+  reaching for `SystemTime::now()` or an RNG inside `apply` is still the
+  divergence bug it always was. Non-negotiable for SMR correctness. `position`
   (the absolute byte offset) is the idempotency key.
 - **Consensus is pure-sync.** `uc_consensus` (CommitTracker, ElectionSm) has no
   async and no I/O — it is driven by the node's polling agents and the sim. Safety

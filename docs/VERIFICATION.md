@@ -812,7 +812,13 @@ The most important section, and the one most projects omit.
 - **Your state machine's determinism is your responsibility.** SMR replicates
   bytes and guarantees every replica applies the same commands in the same order.
   Nondeterminism in `apply` — clocks, iteration order, floats, ambient state —
-  produces divergence that no layer here can catch.
+  produces divergence that no layer here can catch. `2.11.0` narrows the two
+  most common sources rather than removing the rule: `ctx.time_ns` is a
+  replicated clock reading (the leader's stamp, on the frame) and `IdGen`
+  derives ids from the position, so a state machine that needs a clock or an
+  id now has a deterministic one to reach for — but an ambient
+  `SystemTime::now()` or RNG inside `apply` diverges exactly as it always did,
+  and nothing in this document would catch it.
 - **Bounded model checks are bounded.** Veil's clean runs are exhaustive to a
   depth, not to all executions (§8).
 - **The leader pass is checked for ORDERING, not for which occurrence fires.**
