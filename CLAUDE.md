@@ -18,8 +18,8 @@ code.
 byte-empty, `UC2_*` env overrides, `config_loaded` {path, sha256}, the
 `uc_obs` crate, the `ultima_db` removal, and the Broadcast-ring
 memory-ordering fix loom found; `2.9.0` was the `uc_*` crate rename).
-**(2.11.0 pending: FSM identity plus log time and timers — both implemented
-on branch `uc2/fsm-identity`, one flag day, release on hold; see "Next up"
+**(2.11.0 pending: FSM identity plus log time and timers — merged to `main`
+and pushed 2026-09-04, one flag day, release on hold; see "Next up"
 below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
@@ -59,7 +59,7 @@ names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 Next up: **FSM identity** (`docs/BACKLOG.md` item 2, taken up 2026-09-01;
 spec `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md`, plan
 `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md`) —
-**IMPLEMENTED on branch `uc2/fsm-identity`, awaiting release.** All ten
+**MERGED to `main`, pushed 2026-09-04, awaiting release.** All ten
 plan tasks (T0–T10) are done: identity in code (`const NAME` + `const
 VERSION`); the row keeps its cluster-wide meaning but a service finds it
 by name; `SNAP_BEGIN` 0.7.0 carries hashes + versions per row and refuses
@@ -69,11 +69,11 @@ by name; cnc 3.1; `ApplyCtx` replaces the bare `position` apply parameter;
 `docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md`; gate doc
 skeleton `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` (bars
 pre-committed, no fleet run yet). **The release itself is on hold**: more
-changes are planned on the branch first, so no version has been bumped, no
+changes are planned on `main` first, so no version has been bumped, no
 tag cut, no fleet gate run — see the "Standing facts" entry below and
 `docs/BACKLOG.md` item 2.
 
-Also on that branch and in the same `2.11.0` flag day: **time and timers**
+Also on `main` and in the same `2.11.0` flag day: **time and timers**
 (spec `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`),
 **all three plans IMPLEMENTED** — plan 1
 (`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md`, T0–T14),
@@ -136,7 +136,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
 
 ### Standing facts that bind new work
 
-- **Wire protocol is 0.6.0** (`uc_protocol::version::CURRENT`) (`0.6.0`
+- **The wire protocol last SHIPPED is 0.6.0** — but
+  `uc_protocol::version::CURRENT` on `main` is already `0.7.0`, the
+  unreleased `2.11.0` flag day (next bullet). (`0.6.0`
   changed `SNAP_BEGIN` only; a `0.5.0` sender's session is refused by name,
   so a mixed cluster stalls a joiner rather than installing half a set); the
   node↔node wire and the `cnc.dat` page layout are **flag days, never
@@ -145,11 +147,12 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   ones; upgrade all nodes together. The client↔gateway remote protocol is
   separate and stays v1. What is API vs. what is flag-day:
   `docs/reference/semver-policy.md`.
-- **`2.11.0` is implemented on branch `uc2/fsm-identity` and not yet
-  released** — the facts above (wire `0.6.0`, cnc `3.0`) still describe
-  what is actually shipped. **Three features, one flag day** on the branch
-  (FSM identity, log time and timers plan 1, and the replicated schedule
-  table): wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`.
+- **`2.11.0` is merged to `main` (pushed 2026-09-04) and not yet
+  released** — wire `0.6.0` and cnc `3.0` still describe what is
+  actually shipped; the tree is already at `0.7.0` / `3.1`. **Three
+  features, one flag day** on `main` (FSM identity, log time and timers
+  plan 1, and the replicated schedule table): wire `0.6.0` → `0.7.0` and
+  cnc `3.0` → `3.1`.
   - **FSM identity.** `SNAP_BEGIN` carries per-row identity hashes +
     versions, compared positionally, refused by name (replaces the
     `services_declared` bitmask); cnc slot line 7 = row name + hash,
@@ -242,11 +245,12 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `docs/notes/uc2-log-time-and-timers-explained.md` (its "The schedule
     table" section for plans 2 and 3), and `docs/reference/semver-policy.md`'s
     FSM-identity carve-out (ships as the next minor, `2.11.0`, not `3.0.0`,
-    per the maintainer's decision). One process gap to close before the M10
-    gate's row 4 can be re-run: `Uc2LogTimeFrozen` and
-    `Uc2ScheduleTableDiverged` ship with no `RULE_BUILDERS` entry in
-    `scripts/m10_alert_fire.sh`, whose completeness cross-check names them and
-    exits 1 (a local harness, not a CI job, so nothing is red today).
+    per the maintainer's decision). `Uc2LogTimeFrozen` and
+    `Uc2ScheduleTableDiverged` have `RULE_BUILDERS` entries in
+    `scripts/m10_alert_fire.sh` since `e8e3a25`, backed by the
+    `log_time_frozen` and `schedule_diverged` scenarios, so its completeness
+    cross-check passes and the M10 gate's row 4 can be re-run as written —
+    it has not been run on a cluster yet.
 - **Wire crypto is opt-in and OFF by default**, all-encrypted or
   all-cleartext per cluster (no mixed mode). Threat model: a network-path
   adversary; out of model: a compromised host or a malicious member — the
