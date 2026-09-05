@@ -33,7 +33,8 @@ user, freezes at the same log position.
 | how it is changed | **commands on the log**: one frame type `FRAME_TYPE_CLUSTER = 4` (reusing `CONFIG`'s number) with a command-kind byte; admin ops become commands | §4.3 |
 | membership's two time bases | one `Membership` command frame, **two consumers**: the consensus kernel keeps its durable-time view (Raft), the cluster FSM applies at commit and is the snapshot authority | §4.6 |
 | the snapshot instant | `FRAME_TYPE_SNAPSHOT = 7`, appended by the leader; every user row and the cluster FSM freeze at its frame-end position P | §5 |
-| what triggers it | `uc2ctl snapshot` (admin op 8) or `settings.snapshot.interval_bytes` of log since the last complete instant, evaluated by the leader from the **replicated** settings record | §5.5, §6 |
+| what triggers it | `uc2ctl snapshot [--standby]` (admin op 8) or `settings.snapshot.interval_bytes` of log since the last complete instant, evaluated by the leader from the **replicated** settings record | §5.5, §6 |
+| standby instants | `FLAG_SNAPSHOT_STANDBY` in the frame's header flags: only **learners** freeze; voters ignore it and never pay the freeze. Voters obtain the set by a **pull** (`uc2ctl snapshot fetch`, `SNAP_REQUEST` kind 22, a learner serving the session). The freeze-on-a-quorum commit stall (§5.7) is why this is in plan 2, not a door | §5.7 |
 | what a set is | every declared row's artifact at P **plus** the cluster FSM's artifact at P; complete or nothing | §5.3 |
 | the ship gate | "the complete set at my floor" — committed by construction through apply's own gate, durable across restarts; no counter | §5.4 |
 | failure | an incomplete instant is **abandoned**; the next supersedes it; commit, apply and replication never wait on a snapshot; loud metrics | §10 |
@@ -338,11 +339,13 @@ The table simply has one source of truth now.
 
 ```
 FRAME_TYPE_SNAPSHOT = 7        // empty body; the position is the identity
+header flags: FLAG_SNAPSHOT_STANDBY = 0x01   // the same header byte FLAG_TIMER_TABLE rides in
 ```
 
 Appended by the leader through the same path as any leader frame, stamped
 like every frame. **Broadcast**: every user row *and* the cluster FSM act on
-it. Its frame-end position is **P**, the instant.
+it — subject to the standby flag (§5.7). Its frame-end position is **P**, the
+instant.
 
 ### 5.2 What every row does at P
 
@@ -402,12 +405,17 @@ which one reads zero.
 
 Leader-only, two triggers:
 
-- **`uc2ctl snapshot`** — admin op **8**, `snapshot`. On a follower: `retry`
-  with the leader hint, as `schedule apply` does. Audited as `snapshot`.
+- **`uc2ctl snapshot [--standby]`** — admin op **8**, `snapshot`, the flag
+  carried in the request. On a follower: `retry` with the leader hint, as
+  `schedule apply` does. Audited as `snapshot`. `--standby` is refused
+  `49 snapshot_no_learner` when the cluster FSM's membership has no learner.
 - **Cadence** — the leader appends `SNAPSHOT` when
   `settings.snapshot.interval_bytes` of log has accrued since the last
-  *complete* instant on the leader. Read from the replicated settings (§6),
-  so the cadence is the same on whichever node leads.
+  *complete* instant on the leader, flagged per `settings.snapshot.target`
+  (§6). Read from the replicated settings, so the cadence and the target are
+  the same on whichever node leads. With `target = learners`, "complete"
+  means complete on the leader **by fetch** (§5.7), so cadence does not
+  outrun the pull.
 
 Both are **refused with a named reason** (`48 snapshot_unsupported`, naming
 the row) if any declared row lacks the capability bit — a cluster with a
@@ -440,6 +448,82 @@ writes the artifacts, installs the cluster artifact through the cluster FSM's
 from the installed membership (a joiner below the floor has no durable-time
 history to be ahead with).
 
+### 5.7 Standby instants — who freezes, and how the set comes back
+
+**The problem a plain instant creates.** A row's `freeze()` runs on its apply
+thread — the reference typed-tier implementation serialises the whole state
+inline under the lock (`uc_lincheck/src/register.rs:78–84`) — so a freeze is
+O(state) during which that row's `applied` does not move. A node's durable
+report is capped at `min(validated_up_to, min_applied + fsm_lag_eff)`
+(`uc_node/src/services.rs:351`, M14a's report ceiling). M6's per-service
+byte triggers staggered by accident; a coordinated instant freezes **every
+row on every node at the same P**, so a quorum's reports all cap at
+`P + fsm_lag` and **commit stalls cluster-wide** until the slowest freeze
+ends. With `fsm_lag = buffer_bytes / 4` and a 64 MiB buffer that is 16 MiB of
+runway — of the order of 150 ms at 100 MB/s of appended log (an illustration,
+not a measurement; §11's gate row makes it one). UC cannot bound the freeze,
+because the artifact and the freeze are the service's own bytes and code.
+That is Aeron's pause arriving through the back door, and the only lever that
+works for any state size is not freezing the voters.
+
+**Aeron's shape, verified** (`ConsensusModuleAgent.java:2575–2583`,
+`:1581`; `service/ClusteredServiceAgent.java:852`, `:1094–1097`): the standby
+snapshot is the **same** `SNAPSHOT` action with a flag. A member's consensus
+module never enters the `SNAPSHOT` state for it (the replay handler pauses
+only on default flags), and a member's services skip it (`shouldSnapshot`
+accepts the standby flag only when attached to a standby log). The return
+path is a **pull**: the standby announces its recordings to the leader
+(`:1283`), and a member copies them archive-to-archive when an operator flips
+the `REPLICATE_STANDBY_SNAPSHOT` toggle (`:2671–2690`) or at startup
+(`:3603`). The producing standby node is not in the open-source tree; only
+the consumer half is.
+
+**UC's version.**
+
+1. **The flag.** `FLAG_SNAPSHOT_STANDBY` in the frame's header flags byte.
+   The body stays empty.
+2. **Role visible to the row.** The node writes one cnc status bit per row,
+   `CNC_SVC_STATUS_LEARNER = 1 << 10`, from the kernel's durable-time
+   membership shadow (role is consensus-plane), republished on every
+   adoption. A row acts on a standby-flagged instant **only if that bit is
+   set**; a voter's rows yield the frame like any other node-only frame. The
+   cluster FSM follows the same rule from the same shadow.
+3. **Completeness is unchanged.** §5.3 already works per node: the learner
+   completes its own set at P and its floor moves. A voter has no set at P
+   and its floor does not move — yet.
+4. **The return path.** A voter needs the set for its purge floor and to
+   serve joiners (§5.6). The snapshot session already carries a set node to
+   node; what is missing is a trigger other than a below-floor NAK, and a
+   serving side other than the leader. So: `DGRAM_KIND_SNAP_REQUEST = 22`
+   (`session ‖ position`), sent by a voter to a learner; the learner's
+   sender — every node's sender already holds the `SnapshotSource`
+   (`node.rs:1077`) — opens an ordinary session for the set at that position
+   from its own artifacts, and the voter's receiver takes it in a new
+   **store-only** mode: artifacts are written and the set is marked complete
+   at P, but nothing is installed by fiat and the floor is adopted through
+   §5.3's ordinary completion path, not through `snap_complete`'s install
+   (`uc_net/src/receiver.rs:2415`). A voter above P storing a set at P is
+   not a joiner; it must not be treated as one.
+5. **Who initiates the pull.** `uc2ctl snapshot fetch --from <learner-id>
+   [--position P]` (admin op **9**, `snapshot_fetch`, runs on the voter it is
+   pointed at; leader-local, not a cluster command — it changes nothing
+   cluster-wide). Default position: the learner's newest complete set. That is
+   Aeron's open-source half exactly: flagged instants plus an operator-driven
+   replicate. **Automatic** replication — a voter fetching on its own once the
+   learner announces completion — is deferred (§13): it needs the learner to
+   publish "complete at P" somewhere voters can read it, and the honest
+   channel for that is a cluster-FSM command the leader appends on the
+   learner's behalf, which is a fourth kind and a design of its own.
+6. **Until a voter has fetched**, its floor stays where it was and a joiner
+   is served by whichever node holds the set — the leader answers a
+   below-floor NAK it cannot serve with a **redirect** to a learner that can
+   (`SNAP_REDIRECT`, kind 23, `learner id ‖ position`), and the joiner sends
+   its `SNAP_REQUEST` there. Purge on voters waits for the fetch, which is
+   the operator's trade for not paying the freeze.
+
+`settings.snapshot.target = all | learners` (§6) selects the flag for
+cadence-issued instants; `uc2ctl snapshot --standby` overrides per command.
+
 ## 6. The settings record
 
 ```rust
@@ -447,7 +531,7 @@ struct Settings {
     version:         u32,           // encoding version
     fsm_lag:         FsmLag,        // was [services] fsm_lag — per-host, "must match cluster-wide"
     admission_bytes: u64,           // was top-level admission_bytes — the leader's ingress window
-    snapshot:        SnapshotCadence { interval_bytes: u64 },   // 0 = on demand only
+    snapshot:        SnapshotCadence { interval_bytes: u64, target: Target /* All | Learners */ },   // 0 = on demand only
 }
 ```
 
@@ -472,10 +556,10 @@ All inside `2.11.0`'s unreleased `0.7.0` / `3.1`:
 
 | surface | change |
 |---|---|
-| frame types | `4` becomes `CLUSTER` (was `CONFIG`); `6` retired; `7` = `SNAPSHOT` |
-| datagrams | `SNAP_BEGIN` layout V4 (one `snapshot_pos`, no `config`); kind `21` retired |
-| cnc 3.1 | status bit 9 = snapshot-capable; the `fsm_lag` word becomes node-republished on settings change |
-| admin ops | `7 settings_apply`, `8 snapshot`; refusals `44–48` |
+| frame types | `4` becomes `CLUSTER` (was `CONFIG`); `6` retired; `7` = `SNAPSHOT` with header flag `FLAG_SNAPSHOT_STANDBY = 0x01` |
+| datagrams | `SNAP_BEGIN` layout V4 (one `snapshot_pos`, no `config`); kind `21` retired; `22` = `SNAP_REQUEST`, `23` = `SNAP_REDIRECT` |
+| cnc 3.1 | status bit 9 = snapshot-capable, bit 10 = this node is a learner; the `fsm_lag` word becomes node-republished on settings change |
+| admin ops | `7 settings_apply`, `8 snapshot` (with `--standby`), `9 snapshot_fetch`; refusals `44–49` |
 | service SDK | `SnapshotPolicy` and `interval_bytes` **removed**; `start_with_snapshots` sets the capability bit; no trait change |
 | `node.toml` | `[settings]` (genesis seed); `admission_bytes` and `services.fsm_lag` refused outside it; `uc_` names refused |
 | instance dir | `snapshots/cluster/`; `state/schedules.state` never exists; `schedules.pending` and a new `settings.pending` |
@@ -489,7 +573,8 @@ users; the maintainer's standing ruling).
 
 | verb | op | notes |
 |---|---|---|
-| `snapshot` | 8 | leader-only; `retry` + hint on a follower; refused `48` naming the row |
+| `snapshot [--standby]` | 8 | leader-only; `retry` + hint on a follower; refused `48` naming the row, `49` if `--standby` and no learner |
+| `snapshot fetch --from <id> [--position P]` | 9 | runs on the voter it targets; pulls a learner's complete set store-only (§5.7) |
 | `settings apply <file>` | 7 | `schedule apply`'s shape; `settings show` reads the adopted record |
 | `schedule apply` / `show` | 6 | unchanged surface; now a `CLUSTER kind=2` command |
 | `add-learner` … `remove-voter` | 1–5 | unchanged surface; now `CLUSTER kind=1` commands |
@@ -500,8 +585,10 @@ users; the maintainer's standing ruling).
 Metrics: `uc2_snapshot_instant_position` (last commanded P, leader),
 `uc2_snapshot_set_position` (last complete set, every node — **must agree
 cluster-wide once caught up**), `uc2_snapshot_row_incomplete_total{row}`
-(instants a row failed to reach), `uc2_cluster_fsm_position` (its `applied`),
-`uc2_settings_position`. Alerts: `Uc2SnapshotStalled` when commanded and
+(instants a row failed to reach), `uc2_snapshot_freeze_seconds{row}` (a
+histogram of freeze duration — the number §5.7's stall argument turns on),
+`uc2_snapshot_fetched_position` (a voter's newest pulled set),
+`uc2_cluster_fsm_position` (its `applied`), `uc2_settings_position`. Alerts: `Uc2SnapshotStalled` when commanded and
 complete diverge for more than two instants — "one broken FSM silently stops
 all purging", made loud; `Uc2SnapshotSetDiverged`, the
 `Uc2ScheduleTableDiverged` shape over `uc2_snapshot_set_position`.
@@ -524,6 +611,9 @@ Log records: `snapshot_commanded` (leader), `snapshot_set_complete`,
 | joiner served a set, then the shipper restarts | the set is at the shipper's durable floor; no window, no counter — the residual this spec exists to remove |
 | `[settings]` disagrees between hosts at genesis | the first frame wins; the file is ignored thereafter; `uc2ctl settings show` is the truth |
 | a `uc_`-prefixed name in `[services]` | startup refusal by name |
+| a freeze on a quorum outlasts `fsm_lag` of appended log | commit stalls at `P + fsm_lag` until the slowest freeze ends (§5.7) — by design, and the reason standby instants exist; `uc2_snapshot_freeze_seconds` shows it |
+| a standby instant with the only learner down | no node completes the set; the instant is abandoned like any other; voters were never asked to freeze |
+| a voter purges below a P it fetched, then the learner that produced it is lost | nothing: the voter **holds** the set, which is why the floor moves only on fetch and never on a learner's announcement |
 
 What this spec does **not** claim to fix: the sub-millisecond window between
 the archive recording a `CLUSTER` frame and the cluster FSM's state being
@@ -555,10 +645,20 @@ not zero either, and the cluster FSM's recovery (§4.7) is what closes it.
 - **Fuzz**: `uc_node_cluster_artifact` (the cluster image decoder),
   `uc_protocol_cluster_frame` (the kind-dispatched body), `SNAP_BEGIN` V4
   seeds in `uc_protocol_datagram`.
+- **Standby** (`uc_node/tests/learner.rs`): a standby-flagged instant on a
+  3-voter + 1-learner cluster leaves every voter's `applied` moving and
+  completes only on the learner; `uc2ctl snapshot fetch` lands the set on a
+  voter store-only with its FSMs untouched and its floor advanced; a joiner
+  below the voters' floor is redirected to the learner and converges.
 - **Gate rows** added to `uc2-time-and-timers-gate-2026-09-03.md`: commanded
   instants under the throughput load (cost of the extra arm in the apply
   hot path — A/B'd, per M14a); a below-floor join with the shipper restarted
-  mid-window (time to converge, and that it converges at all).
+  mid-window (time to converge, and that it converges at all); and **freeze
+  duration vs commit stall** — a deliberately large state (hundreds of MiB)
+  under the throughput load, measuring `uc2_snapshot_freeze_seconds` against
+  the observed commit pause for an all-nodes instant, then the same instant
+  `--standby`, so the report-ceiling interaction is a number rather than an
+  argument.
 - **Acceptance**: every retired symbol in §7 is gone from the tree; the
   backlog's under-ship and wiped-node residuals are closed by name; the
   differential timer test from `6ea3325` still passes.
@@ -583,9 +683,11 @@ the two closed residuals; `upgrade-a-cluster.md`'s 2.11 section names the
   FSM's verdict, and `* show` as linearizable queries of the cluster FSM.
 - A replicated form of `election_timeout_*`, `[purge]` or `crypto.rotation_*`
   if per-host ever bites; each has a stated reason to stay local (§3.3).
-- Aeron-style **standby snapshots** (`CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT`)
-  — a learner taking the instant's snapshot on behalf of a loaded cluster.
-  The set semantics make it possible; nothing here needs it.
+- **Automatic standby replication** — a voter pulling a learner's set
+  without an operator's `snapshot fetch`. Needs the learner's completion to
+  be visible cluster-wide (a cluster-FSM command the leader appends on the
+  learner's behalf) — a design of its own, deferred as Aeron's open-source
+  half defers it (§5.7).
 - Timezones and cron in the schedule table: unchanged, still out.
 
 ## 14. Implementation order
@@ -604,7 +706,10 @@ Three plans, each shippable to `main` on its own with the tree green:
 2. **Coordinated instants** — `FRAME_TYPE_SNAPSHOT`, the apply-loop arm, the
    capability bit, set completeness, the floor, the V4 session, `uc2ctl
    snapshot`, cadence, retention, the alerts, the learner test that is red
-   today.
+   today — **and standby instants** (§5.7): the flag, the learner bit,
+   `SNAP_REQUEST`/`SNAP_REDIRECT`, the store-only receive, `snapshot fetch`.
+   In this plan, not a later one, because without it a coordinated instant
+   is a cluster-wide commit pause for any state large enough to matter.
 3. **Retirement and proof** — every §7 symbol deleted, the gate rows, the
    explainer, the release writeup.
 
