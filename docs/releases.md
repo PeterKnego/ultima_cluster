@@ -90,7 +90,12 @@ declared-set mismatch, and different logic at the same number diverged
   replaced by `identity: [u64; 8]` (per-row identity hash, `0` = row
   undeclared — the mask is now derived) and a new `version: [u32; 8]`
   (per-row packed version, `0` = unknown). `SNAP_BEGIN_FIXED_LEN` grows
-  34 → 122. The receiver's check is **positional**: `identity[r]` must
+  34 → 122, with a trailing carried `config` after it (`layout` discriminator
+  `SNAP_BEGIN_LAYOUT_V3 = 2`). *(Superseded in the same release: the cluster
+  FSM drops the config tail, so the shipped body is **fixed-length at 120**
+  under `SNAP_BEGIN_LAYOUT_V4 = 3`, and V3 is reserved and refused by name.
+  The identity/version arrays and the positional check below are unchanged.)*
+  The receiver's check is **positional**: `identity[r]` must
   equal the receiver's own row-`r` hash for every `r` — same names in a
   different order now fails too, where the old bitmask compare would have
   silently accepted it. On mismatch, refused **by name** ("row 1:
@@ -99,7 +104,8 @@ declared-set mismatch, and different logic at the same number diverged
   `uc2_snapshot_refused_declared_set_total`. `version` is compared per row
   only when both sides are non-zero; a mismatch refuses by name with both
   versions, counted in a new `uc2_snapshot_refused_version_total`. A 0.6.0
-  sender's 34-byte body is shorter than 122, so it is dropped by the same
+  sender's 34-byte body is shorter than the fixed part (122 then, 120 as
+  shipped), so it is dropped by the same
   length check that has dropped every prior mismatched wire version — the
   standing flag-day rule, unchanged: a mixed cluster stalls a joiner rather
   than installing a wrong or half-checked artifact.

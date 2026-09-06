@@ -236,23 +236,27 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     leader answers retry while the previous table frame is above commit, which
     is what makes one level of `ScheduleRecord.prev` enough). Refusals
     `40 schedule_digest` / `41 schedule_missing` / `42 schedule_decode` /
-    `43 schedule_unknown_fsm`; audited as `schedule_apply`. Adoption mirrors
-    CONFIG (leader at append, followers from the archive walk), persisted in
-    `state/schedules.state`, reverted to `prev` on truncation, re-armed at boot
-    from the log clock. Ticks fire as `TIMER` frames with `FLAG_TIMER_TABLE`;
-    the node advances the entry **at append** (leader) or on the service's
-    `TableConsumed` (followers); a truncated table tick is **not** re-armed;
-    and a due entry fires at the **latest** occurrence at or before the
-    leader's clock (`RowTimers::table_fire_deadline`) — one catch-up tick after
-    downtime, never a backlog. `Timed<S>` dedups on `table_last`. Metrics
+    `43 schedule_unknown_fsm`; audited as `schedule_apply`. Ticks fire as
+    `TIMER` frames with `FLAG_TIMER_TABLE`; a truncated table tick is **not**
+    re-armed; and a due entry fires at the **latest** occurrence at or before
+    the leader's clock (`RowTimers::table_fire_deadline`) — one catch-up tick
+    after downtime, never a backlog. `Timed<S>` dedups on `table_last`. Metrics
     `uc2_schedule_table_position` / `uc2_schedule_entries` /
     `uc2_schedule_apply_refused_total`, alert `Uc2ScheduleTableDiverged`.
-    The table also **rides the snapshot session** (plan 3): `SNAP_TABLE`
-    (datagram kind 21, ≤ 1086 B) after every `SNAP_BEGIN`, no `SNAP_DONE`
-    until it arrives, installed by fiat before the floor advances — so a
-    below-floor joiner holds the cluster's table before it can serve or lead;
-    the leader ships only a committed record, and `schedule_table_adopted`
-    gained `source` (`log`/`boot`/`snapshot`).
+    **Three parts of plan 2 and ALL of plan 3 were superseded before shipping,
+    in the same unreleased flag day** — read the cluster-FSM sub-bullet below
+    for what actually ships. (a) `FRAME_TYPE_SCHEDULE_TABLE = 6` is retired and
+    reserved; the table is a `CLUSTER kind = 2` payload. (b) The plan-2
+    adoption path — leader-at-append / followers-from-the-archive-walk,
+    persisted in `state/schedules.state`, reverted to `ScheduleRecord.prev` on
+    truncation, and the follower's `TableConsumed` advance — is gone: **every**
+    node applies the table at COMMIT in the cluster FSM, there is no durable
+    record and nothing to revert, and only the leader holds a heap to advance.
+    Single-in-flight is still one command, but now spans all three `CLUSTER`
+    kinds rather than tables alone. (c) Plan 3's `SNAP_TABLE` (datagram kind
+    21) is retired and reserved; the table rides the cluster FSM's artifact
+    (`service_id = 255`) instead, and `schedule_table_adopted`'s `source` is
+    the single value `cluster_fsm`, not `log`/`boot`/`snapshot`.
     **Documented limits**: one possible duplicate tick per entry after a
     promotion (`Timed` drops it), no timezones and no cron. Plan 2's
     crash-between-record-and-persist window and plan 3's two ship-side windows

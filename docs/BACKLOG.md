@@ -311,8 +311,17 @@ leader-stamped log time plus a deterministic scheduler (plan 1); the
 replicated schedule table, `FRAME_TYPE_SCHEDULE_TABLE = 6` and
 `uc2ctl schedule apply/show` (plan 2); and that table on the snapshot session,
 `SNAP_TABLE` datagram kind 21, so a below-floor joiner installs it before it
-can serve or lead (plan 3) — which closed the one limitation plan 2 shipped
-with.
+can serve or lead (plan 3).
+
+**Superseded before shipping, in the same unreleased `2.11.0`**: the cluster
+FSM took over both carries. `FRAME_TYPE_SCHEDULE_TABLE = 6` becomes
+`CLUSTER kind = 2` and `SNAP_TABLE` kind 21 is **retired** — the table rides
+the cluster FSM's own snapshot artifact under `service_id = 255` instead, which
+is what actually closed the limitation plan 2 shipped with (plan 3's own two
+ship-side residuals went with it; see the struck bullets under item 2 above).
+Both numbers are reserved so they are never reassigned. Read plans 2 and 3 as
+the reasoning that motivated the cluster FSM, not as what ships:
+[`docs/notes/uc2-cluster-fsm-explained.md`](notes/uc2-cluster-fsm-explained.md).
 
 One item recorded here as open has since **closed**: `Uc2LogTimeFrozen` and
 `Uc2ScheduleTableDiverged` gained `m10_alert_fire.sh` builders in the final
