@@ -295,12 +295,16 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `docs/notes/uc2-cluster-fsm-explained.md`; spec
     `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
     (§5, coordinated snapshot instants, is that spec's plan 2 and is NOT in
-    the tree). **Known gaps, all recorded**: `uc2_cluster_fsm_position` /
-    `uc2_settings_position` were designed and not built; `uc2_agent_alive`
-    still names four agents, not the fifth; `uc2ctl backup` does not copy
-    `snapshots/cluster/`; the cluster image decoder has no fuzz target; and
-    `schedule show`/`settings show` read the artifact, so they say "no cluster
-    artifact yet" until every declared row has snapshotted.
+    the tree). A pre-final pass closed four of the gaps plan 1 first left:
+    the §9 gauges `uc2_cluster_fsm_position` (the FSM's consumed position, a
+    per-node stall reading — NOT a fleet-wide constant, so no alert keys on
+    it) and `uc2_settings_position`; the fifth `uc2_agent_alive` sample
+    (`agent="cluster"`, which `/healthz`/`/readyz` and the daemon's fail-stop
+    loop now cover too); the `uc_node_cluster_artifact` fuzz target; and
+    `snapshots/cluster/` in `uc2ctl backup`/`verify-backup`/`restore`
+    (`MANIFEST` is `uc2-backup-v3`). **The one recorded gap left**:
+    `schedule show`/`settings show`/`status` read the artifact, so they say
+    "no cluster artifact yet" until every declared row has snapshotted.
   - **The relayout is the sharper half of this flag day.** Every prior wire
     bump was caught by a length check, so a mixed cluster stalled. A relaid
     header is the *same length*: a `0.6.0` peer's frames parse and mean

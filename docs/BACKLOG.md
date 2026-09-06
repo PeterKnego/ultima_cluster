@@ -51,9 +51,10 @@ invites. Run both through the gate discipline.
 
 ### 2. Schedule-table and timer follow-ons
 
-*What is left of items 2 and 2a after both shipped in `2.11.0` (see
-[Shipped](#shipped-since-this-list-was-written) below). Every bullet is a
-KNOWN, documented residual, not a defect: each is stated in
+See [Shipped](#shipped-since-this-list-was-written) below.
+
+*What is left of items 2 and 2a after both shipped in `2.11.0`. Every bullet
+is a KNOWN, documented residual, not a defect: each is stated in
 `docs/reference/limits.md` and reachable by a user, and each has a remedy or a
 reason it is deliberate. Kept as a numbered item so it stays a candidate
 direction rather than a footnote to a finished one. The references that used
@@ -110,19 +111,17 @@ to point at "§ 2a" for these residuals now point here.*
   read the newest **cluster artifact**, a file beside the running node, so
   they lag the live view and say "no cluster artifact yet" until every declared
   row has snapshotted; a live reading needs the response-on-the-egress-broadcast
-  path the design left to a phase 2. `uc2ctl backup` does not copy
-  `snapshots/cluster/`, so a restore rebuilds the cluster FSM from the restored
-  journal — correct wherever that journal reaches genesis. The cluster FSM's
-  applied position and the settings position are **not exported** as metrics
-  (`uc2_cluster_fsm_position`, `uc2_settings_position` were designed and not
-  built), and `uc2_agent_alive` still covers four agents, not the fifth.
+  path the design left to a phase 2. (Three other residuals listed here were
+  closed by plan 1's pre-final pass: `uc2ctl backup` now carries
+  `snapshots/cluster/`; `uc2_cluster_fsm_position` and `uc2_settings_position`
+  are exported; and `uc2_agent_alive` carries the fifth agent.)
 - **Why:** none of these blocks anyone today, which is exactly why the list is
   worth keeping — a residual nobody wrote down becomes a surprise. The three
   struck-through entries above are the ones a user actually met by accident,
   and they are closed; what is left is conveniences and observability.
-- **Cost:** low each, and independent. The two metrics and the fifth
-  `uc2_agent_alive` sample are the cheapest, and the ones a stalled
-  `uc2-cluster` agent would be diagnosed with.
+- **Cost:** low, and what remains is one item: a live reading for
+  `schedule show` / `settings show` / `status`, which needs the
+  response-on-the-egress-broadcast path (spec §13 phase 2).
 
 ### 3. Rolling upgrades and leadership transfer
 

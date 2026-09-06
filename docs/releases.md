@@ -603,16 +603,24 @@ mechanism works.
   binary** through the two moved keys and the reserved prefix, and one pinning
   that it **starts** with the same keys under `[settings]`; and two new fuzz
   targets, `uc_protocol_cluster_frame` and `uc_protocol_settings`, taking the
-  tier from 18 to **20**.
-- **Not done, and recorded rather than discovered**: the cluster FSM's own
-  applied position and the settings position are not exported as metrics
-  (`uc2_cluster_fsm_position` / `uc2_settings_position` were designed, not
-  built); `uc2_agent_alive` still covers four agents, not the fifth;
-  `uc2ctl backup` does not copy `snapshots/cluster/`; the cluster image decoder
-  has no fuzz target of its own; and `schedule show` / `settings show` read the
-  artifact rather than the live view, so they say "no cluster artifact yet"
-  until every declared row has snapshotted (spec §13 phase 2 is what would
-  close that). `docs/BACKLOG.md` item 2 carries them.
+  tier from 18 to **20** — and, in the pre-final pass below,
+  `uc_node_cluster_artifact` to **21**.
+- **Closed in the pre-final pass**, before the whole-branch review: the two §9
+  gauges (`uc2_cluster_fsm_position`, the cluster FSM's consumed position, and
+  `uc2_settings_position`) are exported, read off the view's atomics at scrape
+  time; `uc2_agent_alive` carries a fifth sample, `agent="cluster"` (so
+  `/healthz`, `/readyz` and the daemon's fail-stop loop cover that agent too);
+  the cluster image decoder has its own fuzz target; and
+  `uc2ctl backup`/`verify-backup`/`restore` carry `snapshots/cluster/` as an
+  artifact family, verified through the same decoder a joiner installs it with
+  (`MANIFEST` format `uc2-backup-v3`). `Uc2ScheduleTableDiverged` deliberately
+  stays on `uc2_schedule_table_position` rather than moving to the cluster
+  FSM's position as §9 suggested: Ruling R17 made that position the apply
+  loop's cursor, which advances at each node's own pace.
+- **Not done, and recorded rather than discovered**: `schedule show` /
+  `settings show` read the artifact rather than the live view, so they say "no
+  cluster artifact yet" until every declared row has snapshotted (spec §13
+  phase 2 is what would close that). `docs/BACKLOG.md` item 2 carries it.
 
 ### Fixed on the way (2026-09-03)
 

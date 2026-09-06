@@ -456,8 +456,10 @@ that ring is written and drained only while a node **leads**.
 (the cluster FSM's `snap-<pos>.ultcluster` artifacts) and a transient
 `settings.pending` beside `schedules.pending`. There is **no**
 `state/schedules.state` — the schedule table is cluster data and lives in the
-artifact. Note that `uc2ctl backup` does not copy `snapshots/cluster/`, so a
-restore rebuilds the cluster FSM from the restored journal's cluster commands.
+artifact. `uc2ctl backup`/`verify-backup`/`restore` carry `snapshots/cluster/`
+like any other artifact family, so a restored node comes back with the
+cluster's membership, schedule table and settings rather than rebuilding them
+from the restored journal.
 
 **Wire 0.7.0, part one (FSM identity)**: `SNAP_BEGIN`'s `services_declared`
 bitmask becomes a per-row identity-hash array (`identity: [u64; 8]`), and a

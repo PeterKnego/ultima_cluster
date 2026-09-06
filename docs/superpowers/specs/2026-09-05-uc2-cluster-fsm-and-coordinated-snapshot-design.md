@@ -896,22 +896,23 @@ section it amends and the ruling that decided it.*
 
 ### Designed and not built in plan 1
 
-Recorded so they are not mistaken for shipped surface:
+Recorded so they are not mistaken for shipped surface.
 
-- `uc2_cluster_fsm_position` and `uc2_settings_position` (§9) are **not
-  exported**. `uc2_schedule_table_position` is the only view-derived gauge,
-  and it moves only when a table command commits.
-- `uc2_agent_alive` still carries four `agent=` samples, not the fifth
-  (`uc2-cluster`).
-- The fuzz target §11 names `uc_node_cluster_artifact` does not exist. The
-  `CLUSTER` frame body and the settings record are fuzzed
-  (`uc_protocol_cluster_frame`, `uc_protocol_settings`); the cluster **image**
-  decoder is covered only by its own bounds checks and unit tests, and a
-  joiner installs it by fiat.
-- `uc2ctl backup` does not copy `snapshots/cluster/` — `snapshot_ids_present`
-  parses each subdirectory name as a `u8`, so `cluster` is skipped. A restore
-  rebuilds the cluster FSM from its genesis seed plus the restored journal's
-  `CLUSTER` frames.
+**Closed by plan 1's pre-final pass** (Ruling R22), and listed here only so a
+reader of an earlier draft is not misled: the two §9 gauges
+(`uc2_cluster_fsm_position`, `uc2_settings_position`) and the fifth
+`uc2_agent_alive` sample are exported; the §11 fuzz target
+`uc_node_cluster_artifact` exists; and `uc2ctl backup`/`verify-backup`/
+`restore` carry `snapshots/cluster/`. One §9 sentence did NOT survive
+contact with the code: `Uc2ScheduleTableDiverged` cannot key on
+`uc2_cluster_fsm_position`, because Ruling R17 made the cluster FSM's
+`applied` its apply loop's CURSOR — it advances with ordinary traffic at each
+node's own pace, so nodes legitimately differ and a `count_values` over it
+would page permanently. The rule stays on `uc2_schedule_table_position`;
+`uc2_cluster_fsm_position` is the per-node stall reading instead.
+
+Still open:
+
 - `uc2ctl schedule show` / `settings show` / `status`'s `schedule_position=`
   read the newest **artifact**, not the live view (§13 phase 2 is what would
   give them a live reading), so they answer "no cluster artifact yet" on a

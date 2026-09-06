@@ -238,8 +238,10 @@ schedule table an operator applies with one command.
   the instance root, `schedules.pending` and `settings.pending`, each written by
   its `uc2ctl … apply` and deleted by the node after a successful append. There
   is **no** `state/schedules.state`: the table is cluster data and lives in the
-  artifact. Note that `uc2ctl backup` does not copy `snapshots/cluster/`, so a
-  restore rebuilds the cluster FSM from the restored journal's `CLUSTER` frames.
+  artifact. `uc2ctl backup`/`verify-backup`/`restore` carry `snapshots/cluster/`
+  as an artifact family of its own (`MANIFEST` format `uc2-backup-v3`, with a
+  `newest_cluster_snapshot=` line), so a restored node comes back with the
+  cluster's membership, table and settings.
   → [Instance directory § Files](docs/reference/instance-directory.md#files)
 - **`uc_node` now depends on `uc_service`**, so the ordered crates.io publish
   flips: `uc_service` goes before `uc_node`. The cluster FSM implements the
