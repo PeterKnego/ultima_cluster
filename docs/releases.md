@@ -1,14 +1,15 @@
 # ultima_cluster releases
 
-## Unreleased — FSM identity and log time (next minor, 2.11.0 when cut)
+## Unreleased — FSM identity, log time, and the cluster FSM (next minor, 2.11.0 when cut)
 
-**Implemented on branch `uc2/fsm-identity`; not tagged. Release on hold** —
-more changes are planned on this branch first. This entry is a draft written
-ahead of the tag, per the standing writeup rule (CLAUDE.md), so the record
-is ready when the maintainer green-lights it.
+**Implemented; not tagged. Release on hold** — the maintainer **stopped** the
+release on 2026-09-05 for the cluster-FSM and coordinated-snapshot work, which
+is why there is a fourth feature below. This entry is a draft written ahead of
+the tag, per the standing writeup rule (CLAUDE.md), so the record is ready when
+the maintainer green-lights it.
 
-**Three features, one flag day.** All three were implemented before the
-release was cut, and all three move the wire to `0.7.0` and the cnc page to
+**Four features, one flag day.** All four were implemented before the
+release was cut, and all four move the wire to `0.7.0` and the cnc page to
 `3.1`, so they ship together:
 
 | feature | spec | plan |
@@ -16,16 +17,22 @@ release was cut, and all three move the wire to `0.7.0` and the cnc page to
 | FSM identity | `docs/superpowers/specs/2026-09-02-uc2-fsm-identity-design.md` | `docs/superpowers/plans/2026-09-02-uc2-fsm-identity.md` (T0–T10, all done) |
 | Log time and timers, plan 1 | `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md` (T0–T14, all done) |
 | Log time and timers, plan 2 (the replicated schedule table) | the same spec, §5 | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md` (T0–T8, all done) |
+| **The cluster FSM** | `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md` | `docs/superpowers/plans/2026-09-06-uc2-cluster-fsm-plan1.md` (T0–T12, all done) |
 
-Plan 2 was written and executed on the same branch after plan 1 landed, so
-all three features share the `0.7.0` / `3.1` flag day. Plan 2 adds one frame
-type and one admin verb; it changes nothing plan 1 shipped. A third plan on
-the same branch —
+Plan 2 was written and executed on the same branch after plan 1 landed. A third
+plan against the time-and-timers spec —
 `docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md` (T0–T5,
-all done), against the same spec's §5 errata — closes the one limitation plan
-2 shipped with, by carrying the table on the snapshot session; it adds one
-datagram kind (`SNAP_TABLE`, 21) to the same flag day and is not a fourth
-feature.
+all done), against that spec's §5 errata — put the table on the snapshot
+session as a `SNAP_TABLE` datagram, closing the one limitation plan 2 shipped
+with. **The cluster FSM then superseded it entirely**, along with the
+membership carry M6 gave the snapshot session: `SNAP_TABLE` (kind 21),
+`FRAME_TYPE_SCHEDULE_TABLE` (6) and `SnapBeginBody.config` are all retired
+before shipping, and none of them ever appeared in a release. That is why they
+are recorded below as reserved numbers rather than as features.
+
+The coordinated-snapshot half of the cluster-FSM spec (§5: a `SNAPSHOT` frame
+at whose frame-end position every row and the cluster FSM freeze together, plus
+standby instants) is **plan 2 of that spec and is not in this release**.
 
 ### The problem this closes
 
@@ -222,7 +229,10 @@ explainer: `docs/notes/uc2-log-time-and-timers-explained.md`.
   leadership loss. There is deliberately **no per-fire record** — that would
   be a `stderr` write per timer on the consensus agent, and `uc_obs` has no
   Debug level to demote it to; `uc2_timers_fired_total` is the on-time signal.
-  (Spec §6 erratum.)
+  (Spec §6 erratum.) **Superseded in the same release**: the cluster FSM makes
+  the heap leader-only, which deletes `uc2_timers_rearmed_total` and the
+  `timers_rearmed` record and makes `uc2_timers_pending` the leader's count
+  with followers at `0` — see *The cluster FSM* below.
 - **Proof surface**: `uc_log`'s pass-order property test at the appender;
   `uc_node/tests/timers.rs` (two end-to-end tests, in the CI fast list);
   `uc_sim::timers::PassModel`, a pure model of the leader pass across seeds
@@ -308,8 +318,13 @@ plain-language section:
   (op 6); in that record the `id`/`addr` fields render the digest, not an
   address. On the accepted path the reply's `version` word is the new table's
   frame-END position — one meaning per op.
-- **Adoption mirrors CONFIG exactly.** The leader adopts at append; every other
-  node adopts from the archive's header walk. Each node persists
+- **Adoption mirrors CONFIG exactly.** *(Superseded in the same release: the
+  cluster FSM applies the table at COMMIT on every node and there is no
+  `state/schedules.state`, no `ScheduleRecord`, no `prev` and no revert. This
+  bullet and the next record what plan 2 and plan 3 built, because the
+  cluster-FSM section below is only readable against them.)* The leader adopts
+  at append; every other node adopts from the archive's header walk. Each node
+  persists
   `ScheduleRecord { position, time_ns, table, prev }` in
   `state/schedules.state` as its own `StableValue` (not inside `NodeState`,
   whose single cache lock is on the consensus hot path), and **reverts to
@@ -320,7 +335,10 @@ plain-language section:
   in `backup`'s five-file `STATE_FILES` set — an artifact taken before this
   feature existed must still verify — but the copy is whole-directory, so it
   travels with a backup anyway.
-- **The snapshot session carries the table** (plan 3). Adoption off the log
+- **The snapshot session carries the table** (plan 3). *(Superseded in the
+  same release: the table rides the cluster FSM's own artifact under
+  `service_id = 255`, and `SNAP_TABLE` is retired before shipping.)* Adoption
+  off the log
   works only for a node that *has* the log, and a joiner below the purge floor
   does not: the table's own frame may already be gone. So the leader sends a
   `SNAP_TABLE` datagram (kind 21, body `session ‖ position ‖ time_ns ‖
@@ -412,40 +430,189 @@ plain-language section:
   and revert-on-truncation (the spec's record had no `prev`); and `once` as a
   third rule kind that **parks** on firing (the spec had two rules and no park).
 - **Known limits, documented rather than fixed** (also in
-  `docs/reference/limits.md` and `docs/BACKLOG.md` item 2): a node that
-  crashes in the sub-millisecond window between the archive recording a table
-  frame and the consensus agent persisting it loses that adoption, there being
-  no journal re-scan for type-6 frames; boot arming has no delivered set until
-  the service announces, so a restart may re-append the latest occurrence of
-  every entry once (a parked `once` included) and `Timed` drops it; and there
-  is no timezone and no cron syntax — `at` is UTC, and a cron-shaped rule would
-  be a fourth kind byte. Plan 3's own two residuals join that list, both about
-  what a *shipper* offers rather than what a joiner does with it: the cnc
-  commit counter is not primed at boot, so a **restarted** node under-ships
-  (its `prev`, or nothing) until its first commit advance — the safe
-  direction, but a joiner served in that window can end up with an older table
-  or none. The second is **the position-0 rule**, ruling R7: a node whose
-  newest shippable record sits at position `0` ships `(0, 0, [])`, so a joiner
-  it serves installs **no table** until the next table frame or the next
-  apply. Two records have that shape — the `to == 0` wipe record, which keeps
-  its table body at position 0 so a wiped node keeps ticking, and the
-  canonical no-table record, whose bytes are an 8-byte encoded *empty* table
-  rather than zero bytes — and `shippable_schedule` now maps both, plus any
-  record whose bytes will not decode or decode to no entries, onto "no table".
-  It has to: the wire freezes `(position == 0)` ⇔ `(table_len == 0)`, so a
-  position-0 record shipped *with* a body would be refused on every re-send
-  and stall the joiner instead of failing loudly. The consequence is
-  deliberate — **a wiped node's kept table does not propagate by snapshot**,
-  because position 0 means the table is unanchored in the log and the wipe
-  keep-alive is a local fiat, not a cluster fact a joiner should record.
-  `docs/BACKLOG.md` item 2 carries it.
+  `docs/reference/limits.md` and `docs/BACKLOG.md` item 2): boot arming has no
+  delivered set until the service announces, so a promotion may re-append the
+  latest occurrence of every entry once (a parked `once` included) and `Timed`
+  drops it; and there is no timezone and no cron syntax — `at` is UTC, and a
+  cron-shaped rule would be a fourth kind byte.
+
+  **Three limits plan 2 and plan 3 shipped with are closed by the cluster FSM,
+  below, and are recorded here only because they explain what that feature is
+  for**: a crash in the sub-millisecond window between the archive recording a
+  table frame and the consensus agent persisting `state/schedules.state`; a
+  **restarted** node under-shipping the table until its first commit advance,
+  because the cnc commit counter is deliberately not primed at boot; and **the
+  position-0 rule** (ruling R7), under which a wiped node's kept table did not
+  propagate by snapshot. All three were consequences of shipping the table by a
+  *live read gated on a counter*, and the cluster FSM removes the read and the
+  gate together.
 - **One process gap, not a code one.** `Uc2LogTimeFrozen` (plan 1) and
-  `Uc2ScheduleTableDiverged` (plan 2) both ship without a `RULE_BUILDERS` entry
-  in `scripts/m10_alert_fire.sh`, whose completeness cross-check therefore
-  names them and exits 1. That script is a local gate harness, not a CI job, so
-  nothing is red today — but the M10 gate's row 4 cannot be re-run as written
-  until both builders exist. Called out here rather than left to be
-  rediscovered.
+  `Uc2ScheduleTableDiverged` (plan 2) both got `RULE_BUILDERS` entries in
+  `scripts/m10_alert_fire.sh` at `e8e3a25`, backed by the `log_time_frozen` and
+  `schedule_diverged` scenarios, so its completeness cross-check passes and the
+  M10 gate's row 4 can be re-run as written — **it has not been run on a
+  cluster yet**.
+
+### The cluster FSM
+
+**The problem it closes.** After plan 3, cluster-wide state reached a
+below-floor joiner by **three** mechanisms: membership carried live on
+`SNAP_BEGIN` (since M6, with no freshness gate at all), the schedule table
+carried live on `SNAP_TABLE` behind a commit gate, and every user FSM's state
+as a snapshot artifact tagged with the position it represents. Only the third
+answers the question a joiner is actually asking. The first two are **live
+reads of a shipping node's memory**, and the gate the second needed reads the
+cnc commit counter, which is deliberately not primed at boot
+(`uc_log/src/counters.rs`) — which is exactly where the "a restarted node
+under-ships" residual came from. The residual was a symptom; the cause is that
+UC had no node-owned notion of *cluster state as of position P*.
+Plain-language argument: `docs/notes/uc2-cluster-fsm-explained.md`.
+
+**The line.** Node data is local, never replicated and never snapshotted;
+cluster data is replicated through the log and captured in a snapshot. The test
+is *would the cluster be wrong if two nodes disagreed?* Node: vote, term map,
+snapshot floor, output progress, the `log_time_ns` clamp, crypto session keys,
+the timer heap. Cluster: membership, the schedule table, settings, every user
+FSM's state — plus, already, `Sessioned<S>`'s session table and `Timed<S>`'s
+pending timer set, which is the existence proof that the right-hand column's
+mechanism works.
+
+- **One internal state machine.** `uc_node::cluster_fsm::ClusterFsm`,
+  `const NAME = "uc_cluster"`, implements `RawStateMachine` and
+  `SnapshotStateMachine` like any user FSM and holds exactly three records:
+  `membership: ClusterConfig`, `table: ScheduleTable` (+ its `table_position`),
+  and `settings: Settings`. It is **in-process** — consensus cannot depend on
+  an external process being alive to know its own quorum — on a fifth polling
+  agent, `uc2-cluster`, with its own apply loop over the same `LogBuffer`, no
+  cnc slot (page 2 is exactly eight service slots) and **outside the lag
+  policy**, so a stalled user FSM cannot stall the node's view of its own
+  configuration. `uc_node` gains a dependency on `uc_service`, which flips the
+  crates.io publish order.
+- **`FRAME_TYPE_CLUSTER = 4`**, reusing the retired `CONFIG`'s number inside a
+  flag day that was happening anyway. Body: `kind: u8 ‖ reserved [u8; 7] ‖
+  payload`, `CLUSTER_BODY_PREFIX_LEN = 8`, with `read_cluster_prefix` total on
+  any slice and refusing a non-zero reserved byte so the bytes stay claimable.
+  Kinds `1 = Membership` (the `ClusterConfig` encoding `CONFIG` already
+  carried), `2 = ScheduleTable` (≤ 1064 B) and `3 = Settings`
+  (`SETTINGS_LEN = 29`). The log is a broadcast log, so the frame type is the
+  only router: user apply loops act on `MESSAGE` and their own `TIMER` frames
+  and yield `CLUSTER` for free. `FRAME_TYPE_SCHEDULE_TABLE = 6` is retired
+  (`FRAME_TYPE_SCHEDULE_TABLE_RETIRED`), and `append_schedule_table` /
+  `append_config` collapse into `append_cluster(term, kind, payload)`.
+- **Membership: one frame, two consumers.** Raft §4.1 requires a node to use
+  the newest configuration *in its log, committed or not*; an FSM applies at
+  commit. So the consensus kernel keeps its durable-time view, fed by the
+  archive walk (which now reads the kind byte), with `state/config.state`, its
+  one-level `prev` and its revert — and everything downstream of the Raft rule
+  runs on it: commit ranking's quorum, vote grant and count, the `is_voter`
+  report filter, the own-id tombstone halt, the reconfiguration-in-flight gate,
+  the sender's fan-out. The cluster FSM applies the same frame at commit and is
+  the **snapshot authority**. `uc_sim` sweeps the relation as **inv12** after
+  every event: the FSM's membership is always a committed prefix of the
+  kernel's.
+- **The published view, and clamping at use.** The FSM publishes a
+  position-tagged `ClusterView` at the end of every batch that applied
+  something. Readers: the timer heap's arming, the ingress door's
+  `admission_bytes`, and the cnc `fsm_lag` word — all of which change *timing*,
+  never *state*, which is the test for whether the committed view is a legal
+  reader. `refresh_from_view`'s steady-state cost is a single `Acquire` load of
+  the view's position word compared against a shadow; the mutex behind the view
+  is taken only on a pass where that position actually moved (a committed
+  `CLUSTER` frame, or the pass right after this node was promoted). Anything
+  node-local is **clamped at use, never refused in `apply`** — `apply` cannot
+  see the host it lands on.
+- **`snapshots/cluster/snap-<pos>.ultcluster`.** `UCCLUST1` magic, image
+  version, applied position, table position, the length-prefixed membership and
+  table encodings, the 29-byte settings record and a trailing CRC32. The
+  position is the agent's **consumed cursor** (frame-end of the last frame
+  walked), not the last command's end — the node's purge floor is bounded by
+  this tag, and a cluster can run for days without a `CLUSTER` frame while the
+  rows' floor climbs with ordinary traffic (ruling R17). `install_snapshot`
+  bounds-checks every length-prefixed read before slicing: the CRC32 is a
+  checksum, not a MAC, so a crafted body must not be able to panic the decoder.
+  Plan 1 writes the artifact from a **bridging trigger** — once every declared
+  row has snapshotted and the agent's own applied position has reached the
+  lowest of theirs — which the coordinated snapshot instant (spec §5, plan 2)
+  replaces with one commanded position.
+- **On the snapshot session, under id 255.** A session becomes a stream of
+  artifacts: one `SNAP_BEGIN` per declared row, ascending, then one for the
+  cluster artifact under the reserved `service_id = 255`, always last and
+  outside the declared mask. `SNAP_BEGIN` becomes **fixed-length** at
+  `SNAP_BEGIN_FIXED_LEN = 120`, layout **V4** (`SNAP_BEGIN_LAYOUT_V4 = 3`), with
+  the trailing `config_len` + config gone; `SNAP_BEGIN_LAYOUT_V3 = 2` and
+  `DGRAM_KIND_SNAP_TABLE_RETIRED = 21` are reserved so the numbers are never
+  reassigned, and a body carrying an older discriminator is refused **by name**
+  rather than silently by a length check. The joiner installs the artifact by
+  fiat **before** its purge floor advances, idempotently (a joiner can complete
+  more than one session for the same floor), and fail-stops on an artifact that
+  will not parse.
+- **Recovery, and the overrun rule.** The agent recovers from the newest
+  artifact under `snapshots/cluster/`, or from genesis, then replays. On a log
+  buffer overrun it **always** replays from the journal — a journal purged
+  below its cursor makes it idle with one Warn until a session's artifact
+  installs, never a cursor skip (ruling R18). One duty cycle never loops on a
+  target it cannot reach: a batch that lands mid-frame yields rather than
+  spinning (fix `a37003b`, found as a wedged `Node::stop`).
+- **The replicated settings record (spec §6).** `fsm_lag`, `admission_bytes`,
+  `snapshot_interval_bytes` and `snapshot_target`, chosen from the whole
+  `NodeConfig` field list as the only cluster-wide policy that was living per
+  host. `fsm_lag` was documented as "must match cluster-wide" with nothing
+  checking it; `admission_bytes`'s effective value silently changed on
+  failover. `[settings]` in `node.toml` seeds genesis only; the moved
+  spellings are refused **by name** (`admission_bytes is a cluster-wide setting
+  since the cluster FSM (2.11.0): …`, and the same for `services.fsm_lag`),
+  pointing at `uc2ctl settings apply`. In the wire record `0` means "derive at
+  use" — which is why lockstep needs its own sentinel, `FSM_LAG_LOCKSTEP =
+  u64::MAX`, rather than reusing the cnc page's `0`; `page_lag_from_setting` is
+  the single place that maps between the two (ruling R8').
+- **`uc2ctl settings apply` / `settings show`** — `schedule apply`'s shape
+  verbatim: staged at `<instance_dir>/settings.pending` (`0600`, fsync,
+  rename), the first 80 bits of its SHA-256 signed into `id ‖ ip ‖ port`, admin
+  op **7** (`ADMIN_OP_SETTINGS_APPLY`), leader-only, refusals
+  `44 settings_digest` / `45 settings_missing` / `46 settings_decode` /
+  `47 settings_bounds`, audited as `settings_apply`. **Single in flight now
+  spans all three kinds**: the leader answers `retry` while any previous
+  `CLUSTER` frame is above the committed view, and `validate_cluster_command`
+  runs the FSM's **own** acceptance function against a clone of the committed
+  view, so the leader's immediate answer and a replica's apply-time verdict
+  cannot drift apart by construction.
+- **The timer heap goes leader-only (spec §4.9).** Everything in it is
+  reconstructible from cluster data a new leader already holds. The service
+  gates every `svc_sched` write on the leader flag it already reads once per
+  cycle, announces its whole pending set on that flag's **rising edge**, and
+  the node drains the ring and fires only while leading; a demotion
+  **discards** the heap, so `rearm_timers` and `uc2_timers_rearmed_total` are
+  deleted and `uc2_timers_pending` becomes the leader's count with followers at
+  `0` (rulings R15/R15'). Gating the write is load-bearing, not tidiness:
+  `write_sched` on a full ring spins forever, so a ring nobody drains would
+  eventually block a follower's apply thread for good. The cost, stated: a
+  timer due inside the promotion window fires one service cycle plus one ring
+  round trip later — failover already made timers late, so only the width of an
+  existing window moved.
+- **`uc_` is a reserved FSM-name prefix.** `[services] names` refuses any entry
+  starting with it, by name, because the cluster FSM declares `uc_cluster`.
+- **Proof surface**: `uc_sim` inv12 with a non-vacuity count and the red twin
+  `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`
+  (which pins **inv6**, not inv7/inv4 — the spec's §11 sentence is an erratum,
+  ruling R20); `uc_node/tests/timers.rs::timers_pending_on_the_old_leader_fire_exactly_once_on_the_new_one_after_its_announce`
+  (the leader-only heap and the rising-edge announce, watched red by inverting
+  the §4.9 half); `uc_node/tests/learner.rs::a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table`
+  (the residual, staged exactly);
+  `uc_node/tests/services.rs::a_uc_prefixed_fsm_name_is_reserved_and_refused_by_name`;
+  four `uc_node/tests/daemon_refusals.rs` tests driving the **real `uc2-node`
+  binary** through the two moved keys and the reserved prefix, and one pinning
+  that it **starts** with the same keys under `[settings]`; and two new fuzz
+  targets, `uc_protocol_cluster_frame` and `uc_protocol_settings`, taking the
+  tier from 18 to **20**.
+- **Not done, and recorded rather than discovered**: the cluster FSM's own
+  applied position and the settings position are not exported as metrics
+  (`uc2_cluster_fsm_position` / `uc2_settings_position` were designed, not
+  built); `uc2_agent_alive` still covers four agents, not the fifth;
+  `uc2ctl backup` does not copy `snapshots/cluster/`; the cluster image decoder
+  has no fuzz target of its own; and `schedule show` / `settings show` read the
+  artifact rather than the live view, so they say "no cluster artifact yet"
+  until every declared row has snapshotted (spec §13 phase 2 is what would
+  close that). `docs/BACKLOG.md` item 2 carries them.
 
 ### Fixed on the way (2026-09-03)
 
@@ -511,7 +678,18 @@ to required with `ids` refused outright, and every `--service-id` CLI flag
 is gone. Log time and timers adds nothing further to that list — in either plan; its
 whole `uc_service` surface is additive (`#[non_exhaustive]` fields, two provided
 trait methods with defaults, new types, a new wrapper), and `uc_protocol`'s
-`FrameHeader` change is on an item the policy does not promise. The maintainer's decision (spec §10, 2026-09-02) ships it as the
+`FrameHeader` change is on an item the policy does not promise.
+
+The cluster FSM adds **two config breaks and no API break**: a top-level
+`admission_bytes` and a `[services] fsm_lag` in an existing `node.toml` are now
+startup refusals pointing at `uc2ctl settings apply`, and an FSM named with the
+`uc_` prefix is refused. `NodeConfig::admission_bytes` is renamed to
+`admission_bytes_default` and gains `settings_genesis` — a library-caller
+break on a promised type, in the same release as the `apply` signature change
+and covered by the same decision. `uc_service`'s surface is untouched; what
+changes is that `uc_node` now **depends on** it.
+
+The maintainer's decision (spec §10, 2026-09-02) ships it as the
 **next minor**, `2.11.0`, rather than `3.0.0` — on the project having no
 external users yet, not on the "nothing published" fact `2.9.0`'s carve-out
 relied on (crates.io publishing started at `2.9.0`). This is one decision
@@ -534,6 +712,7 @@ file uses ("What proves the release").
 | `cargo test --workspace --doc` | Task 10, this worktree | see below (run as part of this docs sweep, not a release gate on its own) |
 | FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
 | time-and-timers gate (rows a/b/c/d/e) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — bars committed, no run. Row d is an isolated `apply_bench` A/B under `scripts/hop1_ab.sh`'s same-source rebuild control, added because this work *does* touch two hot loops (M14a's codegen lesson); row e re-runs the throughput rows with a full 32-entry schedule table live |
+| cluster FSM | no gate doc of its own | **n/a by design** — the fifth agent's frames are operator-rate, and its one hot-path addition is a single `Acquire` load of the view's position word per consensus duty cycle, compared against a shadow, with the view's mutex taken only on a pass where that position moved. A row belongs in the time-and-timers gate's throughput arm when that gate is run |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |
 | crates.io | — | pending |

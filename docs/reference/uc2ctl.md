@@ -51,7 +51,8 @@ fails otherwise. This is a wrong-cluster guard, not a credential — it is
 checked, but it proves nothing about who is asking.
 
 Every **mutating** admin-band command (`add-learner`, `promote`, `demote`,
-`remove-learner`, `remove-voter`, and `schedule apply` since 2.11 pending)
+`remove-learner`, `remove-voter`, and — since 2.11 pending — `schedule apply`
+and `settings apply`)
 additionally takes (M12b, `v2.6.0`):
 
 **`--admin-key <PATH>`**
@@ -83,7 +84,19 @@ window.
 ## Sub-commands
 
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
-`remove-voter`, `schedule apply`, `schedule show`, `status`.
+`remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
+`settings show`, `status`.
+
+Every mutating one is a **cluster-FSM command** since 2.11 (pending): the
+reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
+appends `CLUSTER kind = 2`, and `settings apply` appends `CLUSTER kind = 3`.
+The operator-facing surface is unchanged; what changed is that one internal
+state machine now applies all three at commit
+([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)).
+**Single in flight, across all three**: the leader answers `retry` while any
+previous `CLUSTER` command is still above the committed cluster view — so a
+`settings apply` will retry behind an in-flight membership change, and vice
+versa.
 
 ### `add-learner`
 
@@ -172,10 +185,12 @@ Three consequences worth knowing:
 - **Leader-only.** The staged file is node-local, so a follower cannot forward
   the request and cannot read the leader's file. It answers `retry` (status
   `2`) with the leader hint; re-run against the node the hint names.
-- **Single in flight.** The leader also answers `retry` while the previous
-  table frame is still above the commit position — the wait is one commit
-  round trip. `uc2ctl` does **not** poll through a `retry`: it prints the
-  staged file's path and exits non-zero, so re-run the same command.
+- **Single in flight, across every cluster command.** The leader also answers
+  `retry` while the previous `CLUSTER` command — a table, a settings record or
+  a membership change — is still above the committed cluster view; the wait is
+  one commit round trip. `uc2ctl` does **not** poll through a `retry`: it
+  prints the staged file's path and exits non-zero, so re-run the same
+  command.
 - **A refused or timed-out apply leaves the staged file in place**, so a retry
   needs nothing re-staged. The node deletes `schedules.pending` only after a
   successful append — which is also what stops a re-presented request from
@@ -188,24 +203,90 @@ refused, is recorded in `audit.jsonl` as `schedule_apply`; in that record the
 
 ### `schedule show`
 
-Print the newest **adopted** schedule table from this node's durable state
-(`<instance_dir>/state/schedules.state`) — not the staged file, which a
-successful apply consumes. Read-only: it writes no admin request.
+Print the newest **committed** schedule table from this node's newest cluster
+artifact (`<instance_dir>/snapshots/cluster/snap-<pos>.ultcluster`) — not the
+staged file, which a successful apply consumes. Read-only: it writes no admin
+request.
+
+It reads a **file**, beside the running node, taking no lock — so it lags the
+node's live view. The artifact is written once every declared row has
+snapshotted, so on a cluster whose rows have not snapshotted yet this prints
+`no cluster artifact yet (the table is committed on the log; an artifact
+appears once every declared row has snapshotted)` rather than implying an empty
+table was adopted. There is no live, in-process reading in 2.11: one process
+cannot read another's memory, and the honest offline answer was preferred to a
+misleading one.
 
 ```
 uc2ctl schedule show --instance-dir <DIR> --app-id <ID>
 ```
 
 ```
-position=8192 time_ns=1788000000000000000
+position=8192
 fsm=orders id=1 rule=every 1h anchor 2026-01-01T00:00:00Z
 fsm=orders id=2 rule=at 14:00:00
 ```
 
 Each entry's `identity_hash` is resolved back to a name through the same cnc
 name lines `apply` used to resolve forward; a hash with no matching declared
-row prints as `0x…`. A node that has adopted nothing prints
-`no schedule table adopted`.
+row prints as `0x…`.
+
+### `settings apply`
+
+The cluster's **replicated settings record** (2.11 pending, cluster-FSM spec
+§6). Wire op `7`. `schedule apply`'s shape verbatim: parse a TOML file, encode
+it, stage it at `<instance_dir>/settings.pending` (mode `0600`, fsync, rename),
+and sign the first ten bytes of its SHA-256 into the request's `id`/`ip`/`port`
+fields.
+
+```
+uc2ctl settings apply <FILE.toml> --instance-dir <DIR> --app-id <ID> [--admin-key <PATH>]
+```
+
+Every key is optional; an absent key keeps the record's "derive at use"
+default rather than inventing a value:
+
+```toml
+admission_bytes         = 262144       # 0 / absent = derive (256 KiB)
+fsm_lag                 = "16MiB"      # or "lockstep"; absent = derive (buffer_bytes / 4)
+snapshot_interval_bytes = 0            # 0 = on demand only
+snapshot_target         = "all"        # "all" or "learners"
+```
+
+An unknown key is refused locally by name, before anything is staged. The same
+three consequences `schedule apply` carries apply here: **leader-only** (the
+staged file is node-local, so a follower answers `retry` with the leader hint),
+**single in flight** across every `CLUSTER` command, and **a refused or
+timed-out apply leaves the staged file in place** so a retry needs nothing
+re-staged.
+
+These are cluster-wide values, applied at one log position on every node.
+`[settings]` in `node.toml` seeds them at genesis only; the old per-host
+spellings (top-level `admission_bytes`, `[services] fsm_lag`) are startup
+refusals pointing here. See
+[Configuration § `[settings]`](configuration.md#settings).
+
+On success the printed `version` word is the **frame-end position of the new
+settings record**. Every outcome is recorded in `audit.jsonl` as
+`settings_apply`, with the digest rendered in the `id`/`addr` fields.
+
+### `settings show`
+
+Print the **committed** settings record from this node's newest cluster
+artifact. Read-only: it writes no admin request, and it carries the same
+artifact-lag caveat as [`schedule show`](#schedule-show).
+
+```
+uc2ctl settings show --instance-dir <DIR> --app-id <ID>
+```
+
+```
+position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 snapshot_target=all
+```
+
+`fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
+count, or a raw byte count when it is neither. A node with no cluster artifact
+yet prints `no cluster artifact yet`.
 
 ### `status`
 
@@ -222,7 +303,7 @@ Output fields:
 
 | Field | Meaning |
 |---|---|
-| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11 pending) — `schedule_position=<n>`, the frame-end position of the adopted schedule table read from `state/schedules.state` (`0` = none adopted; `?` = the record could not be read — a read error, not "no table" — so a role/log/service line down with it never happens over one unreadable cache file). It is the same number `uc2_schedule_table_position` exports and must be identical on every node |
+| `config` | the adopted config version, whether a change is pending, and — since the schedule table (2.11 pending) — `schedule_position=<n>`, the frame-end position of the committed schedule table, read from this node's newest **cluster artifact** (`snapshots/cluster/`) since the cluster FSM. `none` = no artifact yet, or an artifact holding no table; `?` = the artifact could not be read — a read error, not "no table", and it degrades to `?` rather than aborting so one unreadable file never takes the role/log/service lines down with it. It is the same number `uc2_schedule_table_position` exports and must be identical on every node once caught up |
 | `leader` | `NODE_FLAG_LEADER` is set |
 | `can_serve` | `NODE_FLAG_CAN_SERVE` is set |
 | `term` | current term |
@@ -408,6 +489,15 @@ because its `retry` has a second cause:
 | `1` | `refused: <reason> (schedule position <N>) — staged file kept at <PATH>` | exit 1 |
 | `2` | `retry: leader unknown or a previous table is still uncommitted (schedule position <N>) — staged file kept at <PATH>, try again` | exit 1 |
 
+`settings apply` does the same, with the cluster FSM's own view position as its
+`version` word:
+
+| Status | Printed as | Process outcome |
+|---|---|---|
+| `0` | `applied: version=<N>` (the new record's frame-end position) | exit 0 |
+| `1` | `refused: <reason> (cluster position <N>) — staged file kept at <PATH>` | exit 1 |
+| `2` | `retry: leader unknown or a previous cluster command is still uncommitted (cluster position <N>) — staged file kept at <PATH>, try again` | exit 1 |
+
 ## Refusal reasons
 
 The `reason` field of a status-`1` response. Codes 1–10 and 12 are the
@@ -417,8 +507,9 @@ refusals (`uc_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — produced only
 under `[admin] auth = "hmac"`, and disjoint from the `ProposeError` band so a
 caller can tell "the cluster refused this change" from "the cluster refused
 to believe this was you" without consulting the policy. 40–43 (2.11 pending)
-are `schedule apply`'s own refusals (`uc_node::REASON_SCHEDULE_*`), in their
-own band for the same reason.
+are `schedule apply`'s own refusals (`uc_node::REASON_SCHEDULE_*`) and 44–47
+(2.11 pending) are `settings apply`'s (`uc_node::REASON_SETTINGS_*`), each in
+its own band for the same reason.
 
 | Code | Reason |
 |---|---|
@@ -443,6 +534,10 @@ own band for the same reason.
 | 41 | `schedule_missing` — no staged file on this node. Either `schedule apply` was run against a different instance directory, or a successful apply already consumed it |
 | 42 | `schedule_decode` — the staged file is not a decodable schedule table (or is longer than a full 32-entry one) |
 | 43 | `schedule_unknown_fsm` — an entry names an FSM that is not one of this node's declared rows. The **whole** table is refused, never partially adopted: a typo'd name would otherwise leave an operator believing a timer is armed that no row will ever fire |
+| 44 | `settings_digest` — the staged settings file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `settings apply` |
+| 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
+| 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
+| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

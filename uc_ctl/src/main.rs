@@ -266,7 +266,8 @@ struct ScheduleArgs {
 #[derive(Subcommand)]
 enum ScheduleCmd {
     /// Parse, stage, sign and apply a schedule table (`ADMIN_OP_SCHEDULE_APPLY`,
-    /// wire op 6) — see `uc_ctl::schedule`'s module doc for the TOML shape.
+    /// wire op 6) — see the `schedule` module's own doc for the TOML shape, and
+    /// `docs/reference/uc2ctl.md` for the operator-facing description.
     Apply(ScheduleApplyArgs),
     /// Print the newest ADOPTED schedule table (durable node state, not the
     /// staged file).

@@ -5,9 +5,13 @@ restart, a failover and a node rebuild — a nightly reconciliation, an hourly
 sweep — without a cron box outside the cluster deciding when.
 
 The mechanism is the **replicated schedule table**: a small table of
-recurrences that lives in the log, is adopted identically by every node, rides
+recurrences that lives in the log, is applied identically by every node, rides
 the snapshot session to a joiner, and fires into your state machine's
-`on_timer`. This guide is the operator half. The FSM side — implementing
+`on_timer`. Since the cluster FSM (2.11 pending) the table is a record inside
+the node's own internal state machine — applied at commit, snapshotted in the
+cluster artifact — which is why the paragraphs below say "applied" where an
+earlier draft said "adopted from the archive walk". Nothing in the procedure
+changed; see [the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md). This guide is the operator half. The FSM side — implementing
 `on_timer`, and scheduling from inside `apply` — is
 [Schedule work inside a state machine](schedule-work-in-a-service.md).
 
@@ -80,7 +84,7 @@ uc2ctl schedule show --instance-dir /srv/uc2/n0 --app-id myapp
 ```
 
 ```
-position=8192 time_ns=1788000000000000000
+position=8192
 fsm=orders id=1000 rule=every 1h anchor 2026-01-01T00:00:00Z
 fsm=orders id=1001 rule=at 14:00:00
 ```
@@ -91,8 +95,13 @@ caught up. The Prometheus equivalent — and the right thing to alert on — is
 nodes disagree. See
 [Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending).
 
-`schedule show` reads the node's own durable state, not the staged file, so it
-tells you what that node will actually tick.
+`schedule show` reads the node's newest **cluster artifact**
+(`snapshots/cluster/`), not the staged file. That is a file beside the running
+node, so it lags: an artifact is written once every declared row has
+snapshotted, and until then the command prints `no cluster artifact yet` even
+though the table is committed and ticking. On a cluster that is not snapshotting
+yet, `uc2_schedule_table_position` from `/metrics` is the live reading — it is
+published straight off the cluster FSM's view.
 
 ## When an apply is refused
 
@@ -124,18 +133,15 @@ needs nothing re-staged.
   re-applying the same file does not re-fire it. Changing its time or its id
   makes it a new entry, which does fire.
 - **A joiner installs the table from the snapshot session** before it can serve
-  or lead. Two narrow windows leave a joiner with an older table or none — a
-  node restarted but not yet past its first commit advance, and a node whose
-  newest shippable record sits at position `0`. Both are listed under
-  [Limits](../reference/limits.md); the remedy for both is re-applying the
-  table.
-- **A crash in the sub-millisecond window** between the archive recording the
-  table frame and the node persisting `state/schedules.state` loses that
-  adoption — there is no journal re-scan for table frames. Same remedy:
-  re-apply.
+  or lead — inside the cluster FSM's own artifact, tagged with the position it
+  was committed at. The two ship-side windows an earlier draft of this feature
+  documented (a restarted node under-shipping, and a wiped node's table not
+  propagating) are **closed**: there is no live read and no commit gate on the
+  ship path any more.
 
-That remedy being "re-apply the table" for every one of these is why keeping
-the TOML in version control beside your `node.toml` is worth doing.
+Keeping the TOML in version control beside your `node.toml` is still worth
+doing — a re-apply is the remedy for a refusal, and the file is the only record
+of what you meant to schedule.
 
 ## Capacity
 

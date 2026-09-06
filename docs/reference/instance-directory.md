@@ -13,16 +13,18 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `cnc2.dat` | node | The 8 KiB control page (page 1: the M1–M13 layout; page 2: the per-FSM service-slot band since M14). See [The cnc control page](cnc-page.md). |
 | `log.buf` | node | The log ring buffer, `buffer_bytes` long. Recreated on each boot. |
 | `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
-| `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record — plus, since the schedule table (2.11 pending), `schedules.state`, the newest **adopted** schedule table (its frame-end position, the frame's stamp, the encoded bytes, and one level of predecessor to revert to if the frame is truncated). `schedules.state` is deliberately **not** in `backup`'s five-file `STATE_FILES` checklist, so a backup artifact taken before this feature existed still verifies; the copy is whole-directory, so the record travels with a backup anyway. |
+| `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. These five are exactly `backup`'s `STATE_FILES` checklist. All five are **node data** under the cluster FSM's line (2.11 pending): local, never replicated, never snapshotted. `config.state` is the one that looks like an exception and is not — it is the consensus kernel's *durable-time* membership shadow, a different reader at a different time base from the cluster FSM's committed view ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)). There is **no** `schedules.state`: the schedule table is cluster data and lives in the cluster FSM's artifact. |
 | `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships and installs them. `<pos>` is the absolute log byte position the snapshot represents. |
+| `snapshots/cluster/` | node (`uc2-cluster` agent) | `snap-<pos>.ultcluster` — the **cluster FSM's** artifact (2.11 pending): membership, the schedule table and the settings record as of `<pos>`, with a `UCCLUST1` magic, an image version and a trailing CRC32. Written by the node itself, not by a service, and shipped on the snapshot session under the reserved `service_id = 255` so a below-floor joiner installs it before its floor advances. Also what `uc2ctl schedule show`, `uc2ctl settings show` and `uc2ctl status`'s `schedule_position=` read. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
 | `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
 | `svc_query.<id>.ring` | node → service | Forwarded queries for FSM `id`. One per declared id since M14. |
-| `svc_sched.<id>.ring` | service → node | Schedule/cancel/consumed requests for FSM `id`'s timers (time-and-timers spec §4.4). One per declared id. |
+| `svc_sched.<id>.ring` | service → node | Schedule/cancel/consumed requests for FSM `id`'s timers (time-and-timers spec §4.4). One per declared id. Since the cluster FSM (2.11 pending) the timer heap is **leader-only**: the service writes to this ring only while its node holds `NODE_FLAG_LEADER`, and only a leading node drains it. A follower's ring therefore stays empty by construction, which is what keeps `write_sched`'s ring-full spin out of a follower's apply thread. |
 | `egress_service.<id>.broadcast` | node → service | Apply and output stream to FSM `id`'s service. One per declared id since M14. A client opens every declared id's ring and accepts a response only from the FSM(s) its request named. |
 | `egress_node.broadcast` | node → clients | Node-originated answers to clients: `MSG_V2_NOT_LEADER` (with the leader hint), `MSG_V2_RETRY`, and `MSG_V2_BAD_SERVICE` (the query named an id this node has no ring for). Submit and query *responses* come from the FSMs' own rings. |
 | `service.<id>.lock` | service | Exclusive `flock`, held for FSM `id`'s service process's life — one process per declared id (M14). |
 | `schedules.pending` | admin client → node | The staged schedule table `uc2ctl schedule apply` writes (mode `0600`, fsync, rename) before sending the admin request that carries its digest. Transient: the node reads it, checks the digest, and **deletes it after a successful append**. A refused or timed-out apply leaves it in place so a retry needs nothing re-staged. Present only between a stage and a successful apply. |
+| `settings.pending` | admin client → node | The same, for `uc2ctl settings apply` (2.11 pending): the encoded 29-byte settings record, staged and digested identically. |
 | `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. One exception: a byte-identical re-send of an already-answered, already-recorded proposal (same nonce) is counted, not re-recorded — it repeats an answer already in the file rather than being a new admin event. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
 
 Since M14, the per-service files are named by id: `svc_query.<id>.ring` and
@@ -54,7 +56,7 @@ together on this upgrade — see
 | Durable | `journal/`, `state/`, `snapshots/` | Must survive power loss. |
 | Durable, node-local | `audit.jsonl` | Must survive power loss; **not** replicated and not part of a backup's consistency story — each node records only what it itself answered. |
 | Volatile-safe | `cnc2.dat`, `log.buf`, all `*.ring` and `*.broadcast` files | Rebuilt or re-primed on boot. |
-| Transient request payload | `schedules.pending` | Not durable state and not backed up. Losing it costs a re-run of `uc2ctl schedule apply`; the adopted table lives in `state/schedules.state` and on the log. |
+| Transient request payload | `schedules.pending`, `settings.pending` | Not durable state and not backed up. Losing either costs a re-run of the corresponding `uc2ctl … apply`; the committed table and settings live in the cluster FSM's artifact and on the log. |
 
 `audit.jsonl` is opened `O_APPEND` at node start (a node that cannot open it
 refuses to start) and every record is `fsync`ed **before** the answer it
@@ -75,6 +77,15 @@ which is load-bearing, not incidental (see that page for why). The volatile
 row below is never copied and never needs to be: a node's next boot recreates
 every file in it unconditionally, whether after an ordinary restart or after
 a restore.
+
+**`snapshots/cluster/` is not copied by `backup` (2.11 pending).** The copy
+walks `snapshots/<id>/` for the numeric ids present, so the cluster artifact is
+skipped, and a restore therefore rebuilds the cluster FSM from its genesis seed
+plus the restored journal's `CLUSTER` frames. That is correct wherever the
+journal still reaches genesis, which is the case a `verify-backup` already
+checks; a restore from a purged journal is the case where it is not, and the
+remedy is a re-`apply` of the schedule table and the settings record. Recorded
+here rather than left to be discovered.
 
 The durable paths all live under the instance directory, so the directory as a
 whole must sit on a real filesystem. An instance directory on `tmpfs` makes

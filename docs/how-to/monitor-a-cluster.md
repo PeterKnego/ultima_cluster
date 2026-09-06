@@ -76,7 +76,6 @@ joiner not converging?", and they split it cleanly between the two ends:
 | `uc2_snapshot_open_failed_total` | leader | this node could not open an artifact its own snapshot store had just listed, so it refused to ship the set. A one-off is a purge racing a session; a persistent count means look at *this* node's snapshot directory while a peer is trying to join. |
 | `uc2_snapshot_begin_undecodable_total` | joiner | one refused session per count, because the sender's `SNAP_BEGIN` could not be decoded at all — the realistic wire-0.5.0 flag-day shape. Nonzero means the fleet is mixed-version; upgrade every node together. |
 | `uc2_snapshot_refused_legacy_peer_total` | joiner | every such datagram, not every session — the leader re-sends a `SNAP_BEGIN` every 20 ms, so this one measures the resend cadence. Read the row above it for "how many sessions". |
-| `uc2_snapshot_table_stray_total` (`2.11.0`) | joiner | **episodes** of stray `SNAP_TABLE` — the schedule table a snapshot session carries (kind 21) arriving for no session this node is receiving: a refused or unknown session (no intake open), a different peer, or a different session id. Latched once per episode, not per datagram, because the leader re-sends `BEGIN`+`TABLE` every 20 ms for its 30 s session timeout; an expected re-send for an intake that already has one, or for the session just completed, is not counted at all. Nonzero usually means this node **refused** the session — read it beside `uc2_snapshot_refused_declared_set_total` / `_version_total` / `_legacy_peer_total`, which name why. Otherwise a leader and this node disagree about which session is live, or a datagram is being injected. |
 
 Two families worth calling out because their shape is easy to misread:
 `uc2_ingress_holes_skipped_total` and `uc2_query_holes_skipped_total`
@@ -174,20 +173,19 @@ permanently on any multi-node cluster.
 
 Since log time and timers, every log frame carries a leader-written timestamp
 and a state machine can schedule callbacks on it
-([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Nine new
-families — six for the clock and the timer set, three for the replicated
+([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Eight new
+families — five for the clock and the timer set, three for the replicated
 schedule table:
 
 | family | type | labels | meaning |
 |---|---|---|---|
 | `uc2_log_time_ns` | gauge | none | the highest leader stamp the archive on **this** node has recorded: the log's clock, in ns since the Unix epoch. Identical on every node once caught up |
 | `uc2_log_time_lag_seconds` | gauge | none | **leader only** (rendered `0` on followers): wall clock minus `uc2_log_time_ns` |
-| `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row on this node. Every node holds the same set; the leader is the only one that fires it |
+| `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row **on the leader**. The timer heap is leader-only since the cluster FSM (2.11 pending), so a follower always exports `0` — that is the healthy reading, not a gap, and there is deliberately no divergence alert over this family |
 | `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
 | `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
-| `uc2_timers_rearmed_total` | counter | `service`, `row` | in-flight instances moved back to pending on a leadership loss. Each may fire again; `uc_service::Timed<S>` drops the duplicate |
-| `uc2_schedule_table_position` | gauge | none | frame-END position of the schedule table this node has **adopted**; `0` = none. Must be identical on every node once caught up |
-| `uc2_schedule_entries` | gauge | none | entries in that adopted table, armed across every declared row. A parked `once` — one that has already fired — still counts here, unlike `uc2_timers_pending` |
+| `uc2_schedule_table_position` | gauge | none | frame-END position of the schedule table this node's **cluster FSM** has applied; `0` = none. The table is cluster-FSM state applied at commit, so this must be identical on every node once caught up |
+| `uc2_schedule_entries` | gauge | none | entries in that committed table naming a row **this node declares** — read from the cluster FSM's view, not from the timer heap, so it reads identically on leader and follower even though the heap is leader-only. A parked `once` — one that has already fired — still counts here, unlike `uc2_timers_pending` |
 | `uc2_schedule_apply_refused_total` | counter | none | `uc2ctl schedule apply` requests this node refused. **Retries are not counted**: neither a follower's (the staged file is node-local, so the request is never forwarded) nor the leader's while a previous table frame is still above commit |
 
 **One alert rule**, `Uc2LogTimeFrozen` (warning, `for: 30s`):
@@ -202,49 +200,69 @@ timer is waiting on it.
 
 There is **no per-fire log record**. `timer_late` is emitted only when a fire
 is late, because a `stderr` write per timer would sit on the consensus agent's
-hot path; the on-time signal is `rate(uc2_timers_fired_total[..])`. The other
-record is `timers_rearmed`, on a leadership loss.
+hot path; the on-time signal is `rate(uc2_timers_fired_total[..])`. There is no
+re-arm record either: the heap is leader-only since the cluster FSM, so a
+demotion **discards** it rather than re-arming, and a promotion rebuilds it
+from the service's re-announce plus the cluster FSM's table view.
+`uc2_timers_rearmed_total` and the `timers_rearmed` record are **gone**.
 
 A rising `uc2_timers_late_total` on a cluster that is not changing leaders is
 worth a look: either more than `TIMERS_PER_PASS` (64) timers are coming due per
 consensus pass, or the leader's passes are being delayed.
 
 **A second alert rule**, `Uc2ScheduleTableDiverged` (warning, `for: 60s`):
-`count(count_values("p", uc2_schedule_table_position)) > 1`. Every node adopts
-the table from the same log at the same position, so more than one distinct
-value across the fleet means one node is not running the schedule the others
-are. Two causes. A node that crashed in the sub-millisecond window between the
-archive recording the frame and the consensus agent persisting
-`state/schedules.state`; or a node that was **wiped** (truncated to 0 with no
-common prefix): a wipe deliberately **keeps** the table armed but zeroes its
-position, by the same rule `ConfigRecord` uses, because dropping it would leave
-the node ticking nothing while its peers tick on. So `uc2_schedule_entries > 0`
-with `uc2_schedule_table_position == 0` is the wipe signature, and
-`schedule_table_reverted` with `position=0` is the record that names it. Both
-have the same remedy — re-run `uc2ctl schedule apply`, which appends a fresh
-frame every node adopts.
+`count(count_values("p", uc2_schedule_table_position)) > 1`. The table is
+**cluster-FSM state applied at commit**, so every node reaches the same
+position by the same route and more than one distinct value across the fleet
+means one node is not running the schedule the others are. That matters
+cluster-wide rather than per node: only the leader appends timer frames, so if
+the node holding the odd table wins an election, every scheduled recurrence in
+the cluster stops.
 
-A **below-floor join is no longer a cause.** Since `2.11.0` the snapshot
-session carries the table (`SNAP_TABLE`, kind 21, sent after every
-`SNAP_BEGIN`), and the joiner installs it by fiat before its floor advances —
-so it holds the cluster's table before it can serve a read or win an election.
-That matters cluster-wide rather than per node: only the leader appends timer
-frames, so a leader holding no table would stop every scheduled recurrence on
-every node. A fresh joiner still at `0` with no entries means the node that served it had
-none to give: no table at all, or a restart whose commit counter was not yet
-primed, or a table of its own still **unanchored** at position `0` — a wiped
-node keeps its table armed locally and deliberately does not pass it on.
-Re-apply either way.
+Since the cluster FSM (2.11 pending) this is a **narrow** alert, because the
+mechanisms that used to make it fire are gone:
 
-**Five records** go with them — one at info, four at warn:
+- there is no `state/schedules.state` and no `ScheduleRecord`, so the
+  crash-between-record-and-persist window is closed — the cluster agent
+  replays the journal;
+- there is no revert-on-truncation and no wipe keep-alive, because an
+  uncommitted frame is never applied in the first place; the
+  `uc2_schedule_entries > 0` with `uc2_schedule_table_position == 0` "wipe
+  signature" no longer exists, and neither does the `schedule_table_reverted`
+  record;
+- a **below-floor join** is not a cause: the snapshot session carries the
+  cluster FSM's own artifact (`service_id = 255`), installed before the
+  joiner's floor advances, so it holds the cluster's table before it can serve
+  a read or win an election. There is no ship-time freshness gate left to get
+  wrong.
+
+So a node reading a different position now means its **cluster FSM is not
+caught up**: read `uc2_schedule_table_position` beside `uc2_commit_bytes` on
+the same node — a table position that is stale while commit is moving is a
+`uc2-cluster` agent that is not applying. A node reading `0` while its peers
+read nonzero has applied no table at all. The remedy is unchanged: re-run
+`uc2ctl schedule apply`, which appends a fresh frame every node applies.
+
+**Two gaps to know about in this release.** The cluster FSM's own applied
+position and the settings record's position are **not exported yet** — the
+design names `uc2_cluster_fsm_position` and `uc2_settings_position` and plan 1
+did not add them, so `uc2_schedule_table_position` (which moves only when a
+table command commits) is the only view-derived gauge, and
+`uc2ctl settings show` is how you read the committed settings. The
+`uc2_agent_alive` family likewise still covers **four** agents
+(`consensus`, `sender`, `receiver`, `archive`) and not the fifth,
+`uc2-cluster`.
+
+**Six records** go with them — three at info, three at warn:
 
 | Event | Level | Fields | Means, and what to do |
 |---|---|---|---|
-| `schedule_table_adopted` | info | `node`, `position`, `entries`, `source` | this node adopted a table at `position` and armed `entries` of it. Emitted on **every** adoption, and `source` names which: `"log"` (the leader's at append, or a follower's off the archive walk), `"boot"` (the one a node makes from its own `state/schedules.state`) or `"snapshot"` (the table a snapshot session carried, installed by fiat at the floor — how a below-floor joiner gets it). Nothing to do — this is the healthy signal |
+| `schedule_table_adopted` | info | `node`, `position`, `entries`, `source` | this node's cluster FSM applied a table at `position` holding `entries` that name a declared row. `source` is `"cluster_fsm"` — the single path since 2.11 (pending), whether the command arrived off the log, off a journal replay, or inside an installed cluster artifact. Nothing to do; this is the healthy signal |
 | `schedule_apply_refused` | warn | `node`, `reason` | an `uc2ctl schedule apply` was refused; `reason` is the same 40–43 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons). Read the code, fix the file or re-run against the leader. Retries (a follower's, or the leader's single-in-flight one) are **not** refusals and do not appear here |
-| `schedule_table_reverted` | warn | `node`, `position`, `entries`, `to` | this node's log was truncated to `to` (a reconciliation cut, or the leader-open collapse) and its schedule record was reverted below it: `position` is what is in effect now, `entries` what is armed. Expected right after a leader change that cut uncommitted bytes. **`position=0` is the one to look at**: this node now has no adopted position, so `Uc2ScheduleTableDiverged` will light. Re-apply the table if it does not clear |
-| `schedule_record_unreadable` | warn | `node`, `err`, and `position` when the bytes decoded far enough to have one | the boot-time load of `state/schedules.state` failed — the file could not be read, or its bytes will not decode. The node boots **without a table rather than refusing to start**: the record is a node-local cache, and stranding the node would be worse. It arms nothing until it observes the next table frame, so re-apply if the cluster is quiet |
-| `schedule_staged_file_kept` | warn | `node`, `position`, `err` | the table *was* appended, but `<instance_dir>/schedules.pending` could not be deleted afterwards. Deleting it is what normally makes a re-presented request refuse `schedule_missing` instead of appending the same table a second time — remove the file by hand |
+| `schedule_staged_file_kept` | warn | `node`, `position`, `file`, `err` | the command *was* appended, but the staged file could not be deleted afterwards. `file` names which — `schedules.pending` or `settings.pending`, since both apply ops share this path. Deleting it is what normally makes a re-presented request refuse `schedule_missing`/`settings_missing` instead of appending the same payload a second time — remove the file by hand |
+| `settings_apply_refused` | warn | `node`, `reason` | a `uc2ctl settings apply` was refused; `reason` is the same 44–47 code [`uc2ctl` prints](../reference/uc2ctl.md#refusal-reasons) |
+| `cluster_command_applied` | info | `position`, `kind`, `accepted`, `reason` | this node's cluster FSM applied a `CLUSTER` command at frame-end `position`. `kind` is `1` Membership / `2` ScheduleTable / `3` Settings; `accepted` is `1` or `0`, with `reason` naming the refusal code when it is `0`. A refusal here is **deterministic and identical on every node** — it is the FSM's own validation, not a node-local judgement |
+| `cluster_artifact_installed` | info | `position`, `path` | a snapshot session's cluster artifact was installed by fiat at `position`; this node now holds the cluster's membership, schedule table and settings as of that position, before its purge floor advances |
 
 ## Install the alert rules
 

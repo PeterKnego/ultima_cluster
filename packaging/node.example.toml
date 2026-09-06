@@ -83,9 +83,10 @@ addr = "10.0.0.12:9100"
 # budget is a startup refusal.
 # max_payload = 512
 
-# Ingress admission budget in bytes: the append-minus-commit backpressure gate.
-# Default 256 KiB.
-# admission_bytes = 262144
+# NOTE: admission_bytes moved. Since the cluster FSM (2.11.0) the ingress
+# admission budget is a REPLICATED setting, not a per-host one: a top-level
+# `admission_bytes` here is refused BY NAME at startup, pointing at
+# `[settings]` below and at `uc2ctl settings apply`.
 
 # Randomised election timeout window. min must be < max. Defaults 150 ms/300 ms.
 # election_timeout_min_ns = 150000000
@@ -150,12 +151,37 @@ enabled = false
 # state the SAME names in the SAME order; changing the set is a restart, and a
 # name may only be ADDED while the journal is intact from position 0 (purge
 # disabled or never fired) — a new FSM rebuilds from genesis.
-# fsm_lag bounds how far any FSM may run ahead of the slowest ("lockstep" =
-# one frame); it must be below buffer_bytes / 2. Every row beyond 0 reserves a
-# further 5 MiB of ring files at boot (see instance-directory.md).
+# Every row beyond 0 reserves a further 6 MiB of ring files at boot (see
+# instance-directory.md). The `uc_` name prefix is RESERVED for UC's own
+# internal state machines (the cluster FSM is `uc_cluster`); a name starting
+# with it is refused by name.
+#
+# NOTE: fsm_lag moved. Since the cluster FSM (2.11.0) the lag policy is a
+# REPLICATED setting: `fsm_lag` under [services] is refused BY NAME, pointing
+# at `[settings]` below and at `uc2ctl settings apply`.
 [services]
 names = ["kv"]
+
+# Cluster FSM (2.11.0): the GENESIS SEED for the cluster's replicated settings
+# record. These four keys are cluster-wide, not per-host — this section is read
+# only when the instance directory is fresh and no settings record exists yet.
+# After that the file's copy is ignored and the live values come from the log;
+# change them with `uc2ctl settings apply <file.toml>` and read them back with
+# `uc2ctl settings show`.
+#
+# admission_bytes: the ingress append-minus-commit backpressure gate, clamped
+#   at use to this host's buffer_bytes / 2. Absent/0 = derive (256 KiB).
+# fsm_lag: how far any FSM may run ahead of the slowest ("lockstep" = one
+#   frame). Absent/0 = derive (buffer_bytes / 4); a byte bound is clamped
+#   below buffer_bytes / 2 at use rather than refused.
+# snapshot_interval_bytes / snapshot_target: carried by this release, read by
+#   the coordinated-snapshot work. Absent/0 = on demand only; target is "all"
+#   or "learners".
+# [settings]
+# admission_bytes = 262144
 # fsm_lag = "16MiB"
+# snapshot_interval_bytes = 0
+# snapshot_target = "all"
 
 # Admin authentication: who may change cluster membership (add/remove/
 # promote/demote) via uc2ctl. REQUIRED (not absent-means-off), like

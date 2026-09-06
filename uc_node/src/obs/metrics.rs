@@ -445,19 +445,19 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_schedule_table_position",
-        "Frame-END position of the schedule table this node has ADOPTED (0 = none); identical on every node once caught up (time-and-timers spec §5). Alert: Uc2ScheduleTableDiverged.",
+        "Frame-END position of the schedule table this node's cluster FSM has APPLIED (0 = none); the table is cluster-FSM state applied at COMMIT, so this is identical on every node once caught up (cluster-FSM spec §4.3). Alert: Uc2ScheduleTableDiverged.",
         s.schedule_table_position.load(Ordering::Relaxed),
     );
     push_gauge(
         out,
         "uc2_schedule_entries",
-        "Entries in the adopted schedule table, armed across every declared row — a parked `once` (already delivered) still counts here, unlike uc2_timers_pending.",
+        "Entries in the COMMITTED schedule table the cluster FSM's view holds that name a row this node declares — read from the view, not from the timer heap, so it is identical on leader and follower alike (the heap is leader-only since the cluster FSM). A parked `once` (already delivered) still counts here, unlike uc2_timers_pending.",
         s.schedule_entries.load(Ordering::Relaxed),
     );
     push_counter(
         out,
         "uc2_schedule_apply_refused_total",
-        "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). Retries are NOT counted: neither the one a follower answers (the staged file is node-local, so the request is never forwarded) nor the one the leader answers while the previous table frame is still above commit (single-in-flight).",
+        "`uc2ctl schedule apply` requests this node refused (bad digest, missing or undecodable staged file, or an entry naming an undeclared FSM). Retries are NOT counted: neither the one a follower answers (the staged file is node-local, so the request is never forwarded) nor the one the leader answers while the previous cluster command is still above commit (single-in-flight).",
         s.schedule_apply_refused.load(Ordering::Relaxed),
     );
     push_gauge(

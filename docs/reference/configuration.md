@@ -30,7 +30,8 @@ Field names match the `NodeConfig` fields below. Four differ in shape:
 | `[[members]]` / `[[learners]]` tables of `id` + `addr` | `Vec<(NodeId, SocketAddr)>` |
 | `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
 | `[crypto]` with `enabled` (required), `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` | `CryptoConfig` |
-| `[services]` with `names`, `fsm_lag` (a string) — **required**, no default (FSM identity, 2.11 pending) | `ServicesConfig` |
+| `[services]` with `names` — **required**, no default (FSM identity, 2.11 pending) | `ServicesConfig` |
+| `[settings]` with `admission_bytes`, `fsm_lag` (a string), `snapshot_interval_bytes`, `snapshot_target` — optional; the **genesis seed** for the cluster's replicated settings record (the cluster FSM, 2.11 pending) | `Settings` (`NodeConfig::settings_genesis`) |
 
 Two keys exist only in the file and have no `NodeConfig` field:
 
@@ -93,13 +94,50 @@ and [the FSM identity explainer](../notes/uc2-fsm-identity-and-deterministic-ids
 
 | Key | Default | Meaning |
 |---|---|---|
-| `names` | none — **required** | The declared FSM names, in row order (list index = row). Each `1..=32` bytes of lowercase ASCII letters, digits, `_`, `-`, starting with a letter; no duplicates; at most 8. A service attaches by scanning for its own `S::NAME` — it no longer states its row. |
-| `fsm_lag` | `buffer_bytes / 4` | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB|MiB|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). Lockstep costs an N-way cross-core handshake per frame — ~1.6 µs at N=2 on the dev box, i.e. ~600 k frames/s per FSM against ~22 M bounded (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`) — and while a sibling is stalled or dead every other FSM burns ≈ a core yielding on it. Those are **dev-box numbers, measured with the FSMs alone on the box**; on a contended host the cost is far higher — the 2026-08-29 fleet run measured lockstep at **60×** its bounded twin on a `c6id.2xlarge` leader host also running the node and the client (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`, row e). **Lockstep needs a free CPU per declared FSM on top of the node's own agents: the cost is a gradient, not a cliff at one point — 3 busy threads on 2 CPUs is ~4× down (624 k → ~150 k), the two hyperthreads of one core ~7× down (~87 k), and 3 busy threads on 1 CPU ~880× down (709 frames/s per FSM at N=2) — while bounded mode on that worst rung is unaffected at 7.4 M frames/s** (full ladder in the record) — an operating-envelope fact, not a defect: lengthening the barrier's yield ladder ×4/×16 and making it unbounded were both measured at exactly 1.00× (`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`). Size the host, or pin the FSM threads, accordingly. |
+| `names` | none — **required** | The declared FSM names, in row order (list index = row). Each `1..=32` bytes of lowercase ASCII letters, digits, `_`, `-`, starting with a letter; no duplicates; at most 8; **the `uc_` prefix is reserved** for UC's own internal state machines and is refused by name. A service attaches by scanning for its own `S::NAME` — it no longer states its row. |
 
 `ids` is **refused by field name**, pointing at `names` — there is no shim
 (no deployments existed at the time of the change): `services.ids was
 replaced by services.names (FSM identity): list the FSM names in row order,
 e.g. names = ["kv", "orders"]`.
+
+`fsm_lag` **moved out of this section** with the cluster FSM (2.11 pending):
+it is a cluster-wide policy, so it lives in the replicated settings record and
+is seeded by [`[settings]`](#settings) below. A `fsm_lag` under `[services]`
+is refused by name, pointing at `uc2ctl settings apply`.
+
+The `uc_` prefix is reserved because UC's own cluster FSM declares
+`const NAME = "uc_cluster"`; see
+[the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md).
+
+### `[settings]`
+
+The cluster FSM (2.11 pending, spec §6): the four **cluster-wide** policies
+that used to live per host. This section is a **genesis seed only** — it is
+read when the instance directory is fresh and there is no settings record
+yet, and ignored from the first `CLUSTER` frame onward, exactly as
+`[[members]]` has been since M7. The live values come from the log; change
+them with [`uc2ctl settings apply`](uc2ctl.md#settings-apply) and read them
+back with `uc2ctl settings show`. An absent section seeds
+`Settings::genesis_default()` — every numeric key `0`, `snapshot_target =
+"all"`.
+
+Every key's `0` means **"derive at use"**, not "zero", and every replicated
+value is **clamped against this host's own geometry at the point of use**
+rather than refused in `apply` — the state machine that applies a settings
+record cannot see the host it lands on.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `admission_bytes` | `0` → derive (256 KiB, `NodeConfig::admission_bytes_default`) | The ingress admission budget: the `append - commit` backpressure gate at the leader's door. Clamped to this host's `buffer_bytes / 2` at use. Published on the cnc page at offset 3712 and as `uc2_admission_bytes`. |
+| `fsm_lag` | `0` → derive (`buffer_bytes / 4`) | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB\|MiB\|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). A byte bound is **clamped** below this host's `buffer_bytes / 2` at use rather than refused. Lockstep costs an N-way cross-core handshake per frame — ~1.6 µs at N=2 on the dev box, i.e. ~600 k frames/s per FSM against ~22 M bounded (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`) — and while a sibling is stalled or dead every other FSM burns ≈ a core yielding on it. Those are **dev-box numbers, measured with the FSMs alone on the box**; on a contended host the cost is far higher — the 2026-08-29 fleet run measured lockstep at **60×** its bounded twin on a `c6id.2xlarge` leader host also running the node and the client (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`, row e). **Lockstep needs a free CPU per declared FSM on top of the node's own agents: the cost is a gradient, not a cliff at one point — 3 busy threads on 2 CPUs is ~4× down (624 k → ~150 k), the two hyperthreads of one core ~7× down (~87 k), and 3 busy threads on 1 CPU ~880× down (709 frames/s per FSM at N=2) — while bounded mode on that worst rung is unaffected at 7.4 M frames/s** (full ladder in the record) — an operating-envelope fact, not a defect: lengthening the barrier's yield ladder ×4/×16 and making it unbounded were both measured at exactly 1.00× (`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`). Size the host, or pin the FSM threads, accordingly. |
+| `snapshot_interval_bytes` | `0` → on demand only | Carried by this release and read by the coordinated-snapshot work; `0` means no cadence. |
+| `snapshot_target` | `"all"` | `"all"` or `"learners"`; any other value is refused by name. Carried, not yet acted on. |
+
+`fsm_lag = 0` in the **wire record** is "derive at use", so lockstep has its
+own sentinel there (`FSM_LAG_LOCKSTEP = u64::MAX`) rather than reusing the cnc
+page's `0`. You never write that number: `"lockstep"` in the TOML is what maps
+onto it.
 
 ## Startup refusals
 
@@ -128,8 +166,11 @@ replaces:
 | `services.names` entries must be valid FSM names | FSM identity: `1..=32` bytes of lowercase ASCII letters, digits, `_`, `-`, starting with a letter — the same rule the state-machine trait's `const NAME` is checked against at compile time. |
 | `services.names` must not contain a duplicate name | FSM identity: a repeated name would double-attach one row, or leave a service unable to tell which row it found. |
 | `services.names` entries must number at most 8 | FSM identity (was `services.ids` entries must be `< 8`): the cnc page's per-service band holds 8 slots. |
-| `services.fsm_lag` must parse | M14a: an unparsable string (wrong suffix, spaces, a fraction) is refused by name rather than silently falling back to the default bound. |
-| `services.fsm_lag` must be `> 0` and `< buffer_bytes / 2` | M14a: `0` is the page's lockstep sentinel (write `"lockstep"` instead), and a bound at or above half the buffer cannot provably keep every FSM on the ring (the other half is the appender's overrun margin plus the leader's admission window). |
+| `services.names` entries must not start with `uc_` | The cluster FSM (2.11 pending, spec §4.1): `uc_` is reserved for UC's own internal state machines (`uc_cluster`), so a user FSM cannot collide with one. |
+| `services.fsm_lag` is refused, pointing at `[settings]` | The cluster FSM (2.11 pending, spec §6): the lag policy is cluster-wide, so it moved into the replicated settings record — `put fsm_lag under [settings] to seed genesis, and change it with uc2ctl settings apply`. |
+| top-level `admission_bytes` is refused, pointing at `[settings]` | The same change: the admission window is cluster-wide, and its effective value used to change silently on failover. |
+| `settings.fsm_lag` must parse | M14a's rule, now on the seed: an unparsable string (wrong suffix, spaces, a fraction) is refused by name rather than silently falling back to the derived bound. |
+| `settings.snapshot_target` must be `"all"` or `"learners"` | The cluster FSM (2.11 pending): an unknown target would silently pick one. |
 
 The RAM-backed-filesystem refusal has two override channels, and **neither is
 silent** — the override suppresses the refusal, never the notice, and the
@@ -184,9 +225,18 @@ a node that cannot reserve it refuses to start.
 **`max_payload: usize`**
 Maximum payload size.
 
-**`admission_bytes: u64`**
-Ingress admission budget in bytes — the `append - commit` backpressure gate.
-Published on the cnc page at offset 3712 since wire protocol 0.3.0.
+**`admission_bytes_default: u64`**
+The **fallback** ingress admission budget in bytes — the `append - commit`
+backpressure gate — used while the replicated `Settings::admission_bytes`
+still reads `0` ("derive at use"). Renamed from `admission_bytes` by the
+cluster FSM (2.11 pending), which moved the live value cluster-wide. The
+effective value is published on the cnc page at offset 3712 (since wire
+protocol 0.3.0) and re-published whenever the committed setting moves.
+
+**`settings_genesis: Settings`**
+The cluster FSM (2.11 pending): the [`[settings]`](#settings) seed, installed
+as the cluster FSM's genesis image on a fresh instance directory and ignored
+thereafter.
 
 **`journal_segment_bytes: u64`**
 Journal segment size. The archive rolls a new segment at this boundary.
@@ -259,9 +309,13 @@ one). A unit test (`no_env_override_carries_key_material`) fails if anyone
 adds one.
 
 **Only deploy-varying keys are overridable.** Tuning values — `buffer_bytes`,
-`election_timeout_*`, `admission_bytes` — are part of the build's behaviour
-and stay in the file, which is what the twelve-factor page itself recommends
-for "config that does not vary between deploys".
+`election_timeout_*`, `journal_segment_bytes` — are part of the build's
+behaviour and stay in the file, which is what the twelve-factor page itself
+recommends for "config that does not vary between deploys". The cluster-wide
+policies under [`[settings]`](#settings) are not overridable for a stronger
+reason: they are not per-host at all, and a per-host environment variable that
+appeared to change one would be a lie. Change them with
+[`uc2ctl settings apply`](uc2ctl.md#settings-apply).
 
 Each override that fires emits a `config_env_override` record naming the
 variable and its value, so a value that did not come from the file you are

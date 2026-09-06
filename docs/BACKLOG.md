@@ -59,64 +59,70 @@ reason it is deliberate. Kept as a numbered item so it stays a candidate
 direction rather than a footnote to a finished one. The references that used
 to point at "§ 2a" for these residuals now point here.*
 
-- **A restarted node under-ships the table for one window** (plan 3 residual
-  a). The cnc commit counter is not primed at boot, so `shippable_schedule`'s
-  commit gate cannot yet clear the node's own record: it offers the one-level
-  `prev`, or nothing, until the first commit advance. That is the safe
-  direction — no uncommitted table is ever handed on — but a joiner served
-  inside that window can end up with an older table, or none until the next
-  `uc2ctl schedule apply`, if the frame is below the shipper's own floor.
-  Priming the counter at boot, or seeding the gate from the durable record,
-  would close it.
-- **A wiped node's kept table does not propagate by snapshot** (plan 3
-  residual b, in its post-R7 form). A node whose newest shippable record sits
-  at position `0` ships `(0, 0, [])`, so a joiner it serves installs **no
-  table** and learns the real one from the next table frame or the next
-  `uc2ctl schedule apply`. Two records have that shape: the `to == 0` wipe
-  record (`revert_schedule_below` keeps the table body at position 0 so a
-  wiped node keeps ticking) and the canonical no-table record
-  (`ScheduleRecord::empty`, whose bytes are an 8-byte encoded *empty* table
-  rather than zero bytes); `shippable_schedule` maps both, plus any record
-  whose bytes will not decode or decode to no entries, onto "no table".
-  This is deliberate, not a gap: position `0` means the table is **unanchored
-  in the log**, so the wipe keep-alive is a local fiat that keeps one node
-  ticking until the next frame, not a cluster fact a joiner should record — a
-  joiner given it would hold a table no position backs, which is the
-  divergence `Uc2ScheduleTableDiverged` exists to catch. Closing it properly
-  means a wiped node re-anchoring its own table, which is a re-apply, not a
-  ship-seam change.
-- **One crash window loses one adoption.** A node that dies between the
-  archive recording a table frame and the consensus agent persisting
-  `state/schedules.state` comes back without it: there is no journal re-scan
-  for type-6 frames on the recovery path. Sub-millisecond, same symptom, same
-  remedy (re-apply). A recovery-path scan would close it.
-- **A restart may re-append one tick per entry.** Boot arming has no delivered
-  set until the service attaches and announces its `table_last`, so a
-  restarted node may append the latest occurrence of every entry once — a
-  parked `once` included. `Timed` drops it; a state machine without the
-  wrapper sees it, which is the at-least-once trade it already accepted.
+- ~~**A restarted node under-ships the table for one window**~~ (plan 3
+  residual a) — **CLOSED by the cluster FSM (2.11 pending), plan 1.** The
+  cause was structural: the table was shipped by a **live read** of the
+  shipping node's memory, gated on the cnc commit counter, which is
+  deliberately not primed at boot. Both the read and the gate are gone. The
+  table is a record inside the internal cluster FSM, and the snapshot session
+  carries that FSM's own **artifact** (`service_id = 255`), which is committed
+  by construction and durable across a restart. Pinned by
+  `uc_node/tests/learner.rs::a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table`.
+  → [The cluster FSM, explained](notes/uc2-cluster-fsm-explained.md)
+- ~~**A wiped node's kept table does not propagate by snapshot**~~ (plan 3
+  residual b, post-R7) — **CLOSED by the same change.** There is no wipe
+  keep-alive to propagate: `ScheduleRecord`, `revert_schedule_below` and
+  `shippable_schedule` are all gone, and the position-0 encoding rule they
+  needed went with them. The table is FSM state applied at **commit**, so an
+  uncommitted frame is never applied and a truncated one never existed as far
+  as the FSM is concerned — there is nothing to revert and nothing to keep
+  alive at an unanchored position.
+  → [The cluster FSM, explained](notes/uc2-cluster-fsm-explained.md)
+- ~~**One crash window loses one adoption**~~ — **CLOSED by the same change.**
+  There is no `state/schedules.state` to crash between recording and
+  persisting; the `uc2-cluster` agent recovers by replaying the journal above
+  its artifact, exactly as every other FSM does.
+- **A promotion may re-append one tick per entry.** Still open, in a slightly
+  different shape: the timer heap is leader-only since plan 1, so a newly
+  promoted leader arms the table from the cluster FSM's view and has no
+  delivered set until its service announces its `table_last`. It may append
+  the latest occurrence of every entry once — a parked `once` included.
+  `Timed` drops it; a state machine without the wrapper sees it, which is the
+  at-least-once trade it already accepted.
 - **No timezones and no cron syntax.** `at` is UTC. "02:00 local, with DST"
   is not expressible — a timezone database is replicated state that must agree
   on every node and across every upgrade. Cron-style rules are a possible
   fourth `kind` byte; the codec has room.
-- **`append_schedule_table` duplicates `append_config`'s body deliberately**
-  (ruling R8). `uc_log::Appender` now carries four specialised append bodies;
-  the shared writer that would collapse them touches the hot `append` path,
-  and M14a's inline-ladder lesson is that code added to a hot loop's body
-  costs even on the arms that never execute (9 % at N=1, from codegen alone).
-  So the follow-up is "extract it **with an A/B** against `apply_bench` and
-  the client hop, on rebuilt-same-source controls", not "deduplicate".
+- ~~**`append_schedule_table` duplicates `append_config`'s body**~~ (ruling
+  R8) — **moot**: the cluster FSM collapsed both into one `append_cluster`
+  with a kind byte, because there is one frame type now. The underlying rule
+  stands for any future append body: extract **with an A/B** against
+  `apply_bench` and the client hop, on rebuilt-same-source controls, never by
+  inspection — M14a's inline-ladder lesson is that code added to a hot loop's
+  body costs even on the arms that never execute (9 % at N=1, from codegen
+  alone).
 - **`node.toml [schedules]` as a boot-time convenience** stays the door spec
   §10 left open: a per-host section that simply calls the admin op at startup.
   Deliberately not the primary form — it turns a schedule edit into a rolling
   edit plus a leader change.
+- **New in the cluster-FSM shape, and worth a line each.**
+  `uc2ctl schedule show` / `settings show` / `status`'s `schedule_position=`
+  read the newest **cluster artifact**, a file beside the running node, so
+  they lag the live view and say "no cluster artifact yet" until every declared
+  row has snapshotted; a live reading needs the response-on-the-egress-broadcast
+  path the design left to a phase 2. `uc2ctl backup` does not copy
+  `snapshots/cluster/`, so a restore rebuilds the cluster FSM from the restored
+  journal — correct wherever that journal reaches genesis. The cluster FSM's
+  applied position and the settings position are **not exported** as metrics
+  (`uc2_cluster_fsm_position`, `uc2_settings_position` were designed and not
+  built), and `uc2_agent_alive` still covers four agents, not the fifth.
 - **Why:** none of these blocks anyone today, which is exactly why the list is
-  worth keeping — a residual nobody wrote down becomes a surprise. The first
-  two are the ones a user meets by accident (a joiner served inside a restart
-  window); the last two are conveniences.
-- **Cost:** low each, and independent. Priming the cnc commit counter at boot
-  and a recovery-path scan for type-6 frames are the two with a clear fix
-  sketch already written above.
+  worth keeping — a residual nobody wrote down becomes a surprise. The three
+  struck-through entries above are the ones a user actually met by accident,
+  and they are closed; what is left is conveniences and observability.
+- **Cost:** low each, and independent. The two metrics and the fifth
+  `uc2_agent_alive` sample are the cheapest, and the ones a stalled
+  `uc2-cluster` agent would be diagnosed with.
 
 ### 3. Rolling upgrades and leadership transfer
 

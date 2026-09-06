@@ -17,17 +17,26 @@ The cnc page carries its own version gate, `CNC_V2_VERSION`, which is
 independent of this one. cnc 3.1 changed the same-host shmem layout only
 (the once-reserved slot line 7, plus two previously-unused words —
 `log_time_ns` and the per-row `timers_pending`). The UDP datagram format
-moved to 0.7.0 for **three features** shipping on the same unreleased `2.11.0`
+moved to 0.7.0 for **four features** shipping on the same unreleased `2.11.0`
 flag day. FSM identity: `SNAP_BEGIN` swapped its `services_declared` bitmask
 for a per-row identity-hash array plus a per-row version array. Log time and
 timers: the log frame header was **relaid** to carry a leader-written
 `time_ns` stamp, with a `TIMER` (5) frame type beside it. The replicated
-schedule table, built on that: a second new frame type, `SCHEDULE_TABLE`
-(6), and one new datagram kind, `SNAP_TABLE` (21), which carries that table
-on a snapshot session so a below-floor joiner gets it too. Every other
-datagram is byte-identical to 0.6.0. `CURRENT` is
+schedule table, built on that. And **the cluster FSM**, which subsumed the
+table's own carriage: frame type `4` becomes `CLUSTER`, a kind-dispatched
+command carrying membership, the schedule table or the settings record;
+`SCHEDULE_TABLE` (6) and `SNAP_TABLE` (21) are **retired before shipping**;
+`SNAP_BEGIN` loses its trailing `config` tail and becomes fixed-length
+(layout **V4**), because the snapshot session now carries the cluster FSM's
+own artifact under the reserved `service_id = 255`. Every other datagram is
+byte-identical to 0.6.0. `CURRENT` is
 documentary and is not itself checked on any receive path (see
 `version.rs`); the two version lines remain independent of each other.
+
+None of `0.7.0`'s intermediate shapes ever shipped — the whole of `2.11.0` is
+one unreleased flag day — but every retired number is **reserved, never
+reassigned**: `FRAME_TYPE_SCHEDULE_TABLE_RETIRED = 6`,
+`DGRAM_KIND_SNAP_TABLE_RETIRED = 21`, `SNAP_BEGIN_LAYOUT_V3 = 2`.
 
 `app_id`, `instance_id`, and the protocol version are checked at every IPC
 entry point. A mismatched `app_id` means the wrong cluster; a changed
@@ -70,33 +79,47 @@ The header is authenticated as AAD when wire crypto is enabled, and carries a
 | 13 | `SNAP_CHUNK` | pairwise |
 | 14 | `SNAP_NAK` | pairwise |
 | 15 | `SNAP_DONE` | pairwise |
-| 21 | `SNAP_TABLE` | pairwise |
 
-`SNAP_TABLE` belongs to this group but takes kind **21**, not 16: the
-administration and crypto-handshake kinds below already own 16–20, and a
-kind byte is never reused.
+Kind **21** was `SNAP_TABLE` — the schedule table carried beside a session —
+and is **retired** (`DGRAM_KIND_SNAP_TABLE_RETIRED`). The table now rides the
+session as part of the cluster artifact; the number is reserved so it is never
+reassigned to something a pre-release build might misread.
 
-#### `SNAP_BEGIN` body (wire 0.7.0, FSM identity)
+A session is a **stream of artifacts**: one `SNAP_BEGIN` per declared FSM,
+ascending by row, then one for the **cluster artifact** under the reserved
+`service_id = 255` — always last, and deliberately outside the declared mask
+so it is never mistaken for a row. Chunk offsets are stream-global, so
+`SNAP_NAK` repair is byte-identical to `0.5.0`/`0.6.0`. The joiner installs the
+cluster artifact **before** its purge floor advances, which is what makes
+membership, the schedule table and the settings record present before it can
+serve a read or win an election.
+
+#### `SNAP_BEGIN` body (wire 0.7.0, layout V4)
 
 `SNAP_BEGIN` opens (or extends) one artifact of a snapshot session; its body
 is the only wire carrier of FSM identity (commands are broadcast, durable
-reports are aggregates — neither names an FSM). `SNAP_BEGIN_FIXED_LEN = 122`,
-followed by a variable, length-prefixed `config` tail (M7's `ConfigRecord`
-bytes). `SNAP_DONE` echoes the same body as its ack, so it carries this
-layout too, with no separate change.
+reports are aggregates — neither names an FSM). Since the cluster FSM it is
+**fixed-length**: `SNAP_BEGIN_FIXED_LEN = 120`, no tail. `SNAP_DONE` echoes the
+same body as its ack, so it carries this layout too, with no separate change.
 
 | bytes | field | width | meaning |
 |---|---|---|---|
 | 0..4 | `session` | u32 | session id |
-| 4 | `layout` | u8 | body discriminator; `2` = `SNAP_BEGIN_LAYOUT_V3` (0.7.0). A shorter/older `layout` is refused as "peer wire ≤ 0.6.0" |
-| 5 | `service_id` | u8 | the row this artifact belongs to |
+| 4 | `layout` | u8 | body discriminator; `3` = `SNAP_BEGIN_LAYOUT_V4` (0.7.0 as shipped). `1` = `SNAP_BEGIN_LAYOUT_V2` (0.6.0) and `2` = `SNAP_BEGIN_LAYOUT_V3` (the intermediate 0.7.0 shape with a carried config, never released) are refused **by name** at the node layer |
+| 5 | `service_id` | u8 | the row this artifact belongs to, or `255` = the **cluster artifact** |
 | 6..8 | — | 2 B | zero (pads `snapshot_pos` to u64 alignment) |
 | 8..16 | `snapshot_pos` | u64 | this artifact's snapshot position |
 | 16..24 | `total_len` | u64 | this artifact's byte length |
 | 24..88 | `identity` | `[u64; 8]` | the sender's per-row FSM identity hash (FNV-1a 64 of the declared name), in row order; `0` = row undeclared. Replaces 0.6.0's `services_declared` bitmask — the mask is now derived (`SnapBeginBody::declared_mask`) |
 | 88..120 | `version` | `[u32; 8]` | the sender's per-row attached packed version, from the cnc slot; `0` = no service attached / unversioned |
-| 120..122 | `config_len` | u16 | length of the `config` tail |
-| 122.. | `config` | variable | the encoded `ConfigRecord`, identical on every `BEGIN` of a session |
+
+The trailing `config_len` + `config` tail that the intermediate V3 shape
+carried is **gone**. Membership was the last thing read live off the shipper at
+ship time; it now rides the cluster artifact, tagged with the position it was
+committed at, like every other piece of cluster state. `read_snap_begin_body`
+**ignores** trailing bytes past the fixed part rather than refusing them, so a
+peer speaking an older `0.7.0` shape is refused by its `layout` with a name
+instead of silently by a length check.
 
 The receiver compares `identity` **positionally**: for each row `r`,
 `identity[r]` must equal the receiver's own hash for row `r` (both zero =
@@ -107,59 +130,11 @@ list prints as that name, an unknown one as its hash) and counts
 check (a set difference is a positional difference). `version` is compared
 per row only when **both** sides are non-zero; a mismatch refuses by name
 with both versions and counts the new `uc2_snapshot_refused_version_total`.
-A 0.6.0 sender's body (34 B fixed) is shorter than 122 B, so the receiver
+A 0.6.0 sender's body (34 B fixed) is shorter than 120 B, so the receiver
 drops it by the same length check that drops a 0.5.0 body today — the
 standing flag-day rule: a mixed cluster stalls a joiner rather than
 installing a wrong or half-checked artifact. Artifacts still route by row,
 unchanged.
-
-#### `SNAP_TABLE` body (wire 0.7.0)
-
-`SNAP_TABLE` carries the leader's adopted **replicated schedule table** to a
-joiner that is below the purge floor and therefore cannot read the table's own
-log frame. The leader sends it **immediately after every `SNAP_BEGIN` of a
-session** — the initial one and each resend on the `SNAP_BEGIN_RESEND_NS`
-(20 ms) cadence — so it needs no reliability machinery of its own: the same
-resend that repairs a lost `BEGIN` repairs a lost `TABLE`.
-`SNAP_TABLE_FIXED_LEN = 22`, followed by the encoded table.
-
-| bytes | field | width | meaning |
-|---|---|---|---|
-| 0..4 | `session` | u32 | session id; must match the intake's, or the datagram is a stray |
-| 4..12 | `position` | u64 | the adopted table frame's END position on the leader; `0` = the leader has none, or its table is unanchored (position 0 after a wipe) |
-| 12..20 | `time_ns` | u64 | the adopting frame's log-time stamp, recorded on the joiner's record for diagnostics — **not** what the joiner arms from |
-| 20..22 | `table_len` | u16 | length of the encoded table |
-| 22.. | `table` | variable | `uc_protocol::v2::schedule::encode_schedule_table` bytes (a full 32-entry table is 1064 B) |
-
-`read_snap_table_body` is **total** on any input and does not decode the
-table itself (the node does, fail-stop, exactly as it does for a `CONFIG`
-frame body). It enforces `(position == 0) ⇔ (table_len == 0)`, so "the leader
-has none" has exactly one encoding on the wire, and a ceiling of
-`SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES × SCHEDULE_ENTRY_LEN`. A full
-table is `22 + 1064 = 1086 B` total, pinned below the crypto-on datagram
-budget by a `const` assert beside the constant.
-
-The receiver records the table on the session's intake, **withholds
-`SNAP_DONE` until it has one**, ignores expected re-sends, and counts a
-genuine stray (a refused or unknown session, a different peer, or a different
-session id) once per episode in `uc2_snapshot_table_stray_total`. On
-completion it publishes table → config → floor signal, in that order, so the
-consensus agent installs the table before the floor moves. The install is by
-**fiat** — a wholesale replace with `prev = None`, like the carried config —
-because below the floor the joiner's own bytes are gone. Position `0` with an
-empty table installs "no table" as a record rather than leaving the joiner's
-stale one. A `0.6.0` peer sends no `SNAP_TABLE` at all, but withholding
-`SNAP_DONE` is not how that is caught: its `SNAP_BEGIN` is already refused by
-the `layout` check above, so the flag-day rule still bites at the same place
-it did before.
-
-A session whose `SNAP_TABLE` is systematically lost (never one that just
-arrives late — the leader keeps resending it on the same 20 ms cadence as
-`SNAP_BEGIN`) is not left withholding `SNAP_DONE` forever: the intake's
-"no chunk" timeout (`SNAP_INTAKE_TIMEOUT_NS`, 60 s) fires against it exactly
-as it would a lost chunk, since no further chunk arrives once every part has
-already renamed — the intake is discarded and the joiner re-downloads on a
-fresh session rather than wedging.
 
 ### Administration
 
@@ -231,9 +206,54 @@ seeds its clamp from.
 | 1 | `MESSAGE` | an application command |
 | 2 | `PADDING` | wrap padding; header-only on the wire, and its declared length is the full span it covers |
 | 3 | `NEW_TERM` | written by a leader when it opens a term; header-only, 32 B |
-| 4 | `CONFIG` | a cluster configuration record |
+| 4 | `CLUSTER` | **relabelled in 0.7.0** (was `CONFIG`): a cluster-FSM command. Kind-dispatched body, below |
 | 5 | `TIMER` | **new in 0.7.0**: a scheduled timer the leader fired. 24-byte body, below |
-| 6 | `SCHEDULE_TABLE` | **new in 0.7.0**: the replicated schedule table an operator applied. Variable body, below |
+| 6 | — | `SCHEDULE_TABLE` in an intermediate 0.7.0 shape; **retired before shipping** (`FRAME_TYPE_SCHEDULE_TABLE_RETIRED`) and reserved so the number is never reassigned |
+
+#### `CLUSTER` body (wire 0.7.0)
+
+`FRAME_TYPE_CLUSTER = 4` carries every change to the cluster's own state —
+membership, the replicated schedule table, and the replicated settings record.
+It reuses `CONFIG`'s number: `2.11.0` is a flag day anyway, and no shipped node
+ever emitted a frame `4` that was not a membership record.
+
+The log is a **broadcast** log — it carries no service id and does no routing —
+so the frame type is the only router there is. One type, one kind byte:
+
+| bytes | field | meaning |
+|---|---|---|
+| 0 | `kind` | `1` = Membership, `2` = ScheduleTable, `3` = Settings; any other value is undecodable |
+| 1..8 | reserved | written as zero, and a **non-zero** reserved byte makes the body undecodable — the bytes are claimable by a later kind without ambiguity |
+| 8.. | `payload` | the kind's own encoding |
+
+`CLUSTER_BODY_PREFIX_LEN = 8`, and `read_cluster_prefix` is total: it returns
+`None` on a short body, an unknown kind, or a non-zero reserved byte, and
+otherwise the kind plus the payload slice. Per kind:
+
+| kind | payload | codec |
+|---|---|---|
+| `1` Membership | the `ClusterConfig` encoding `CONFIG` carried through `0.6.0`, unchanged | `uc_protocol::v2::config` |
+| `2` ScheduleTable | the whole table — an 8-byte header plus `count × 33` bytes, at most `MAX_SCHEDULE_ENTRIES = 32`, so **≤ 1064 B**. Layout below | `uc_protocol::v2::schedule` |
+| `3` Settings | `SETTINGS_LEN = 29` bytes exactly: `version u32 = 1 ‖ fsm_lag_bytes u64 ‖ admission_bytes u64 ‖ snapshot_interval_bytes u64 ‖ snapshot_target u8`. `0` in any u64 means "derive at use"; `fsm_lag_bytes = u64::MAX` (`FSM_LAG_LOCKSTEP`) means lockstep; `snapshot_target` is `0` = all, `1` = learners. No trailing bytes are tolerated | `uc_protocol::v2::settings` |
+
+The largest of the three is the table at 1064 B, inside the 1312 B crypto-on
+payload ceiling, so a `CLUSTER` frame always fits one datagram
+([Limits](limits.md#hard-limits)).
+
+**Two consumers, one frame.** Every FSM's apply loop yields a `CLUSTER` frame,
+so it costs a user row nothing. The node's fifth polling agent, `uc2-cluster`,
+acts on it: it applies the command at **commit** into the cluster FSM, which is
+the snapshot authority for all three records. *Additionally*, for `kind = 1`
+only, the archive's header walk reads the kind byte and feeds the membership
+payload to the consensus kernel at **durability**, exactly as it fed `CONFIG`
+— because Raft requires a node to use the newest configuration in its log
+whether or not it is committed. Two readers, two time bases, one frame; the
+reasoning is
+[the cluster FSM explainer § Membership](../notes/uc2-cluster-fsm-explained.md#membership-one-frame-two-readers-and-why-that-is-safe).
+
+Decode is fuzzed as `uc_protocol_cluster_frame` (the prefix plus all three
+payload codecs) and `uc_protocol_settings` (the settings record alone, with a
+re-encode round-trip).
 
 #### `TIMER` body (wire 0.7.0)
 
@@ -242,7 +262,7 @@ alignment. `client_id` and `seq` are `0`.
 
 | bytes | field | meaning |
 |---|---|---|
-| 0..8 | `identity_hash` | the FNV-1a 64 of the owning FSM's declared name (see [`SNAP_BEGIN`](#snap_begin-body-wire-070-fsm-identity) for the same hash on the snapshot path) |
+| 0..8 | `identity_hash` | the FNV-1a 64 of the owning FSM's declared name (see [`SNAP_BEGIN`](#snap_begin-body-wire-070-layout-v4) for the same hash on the snapshot path) |
 | 8..16 | `timer_id` | the FSM's own id for this timer |
 | 16..24 | `deadline_ns` | what was asked for; compare against the header's `time_ns` for lateness |
 
@@ -255,9 +275,9 @@ context a timer needs in its own state, keyed by `timer_id`. Semantics,
 delivery and the ordering guarantee:
 [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
 
-#### `SCHEDULE_TABLE` body (wire 0.7.0)
+#### `ScheduleTable` payload (`CLUSTER` kind 2, wire 0.7.0)
 
-`FRAME_TYPE_SCHEDULE_TABLE = 6` carries the whole replicated schedule table —
+The `CLUSTER kind = 2` payload carries the whole replicated schedule table —
 the recurrences an operator applied with
 [`uc2ctl schedule apply`](uc2ctl.md#schedule-apply). Applying **replaces** the
 table; there is no incremental edit and no delete verb. The codec is
@@ -282,9 +302,9 @@ Each entry, `SCHEDULE_ENTRY_LEN = 33`:
 | 17..25 | `a` | u64 LE — `every`: `period_ns` (must be > 0); `at`: `secs_of_day` (< 86 400, UTC); `once`: `at_ns` |
 | 25..33 | `b` | u64 LE — `every`: `anchor_ns`; **must be zero** for `at` and `once` |
 
-A full table is `8 + 32 × 33 = 1064` bytes, inside the 1312 B crypto-on
-payload ceiling, so the frame always fits one datagram
-([Limits](limits.md#hard-limits)).
+A full table is `8 + 32 × 33 = 1064` bytes; with the 8-byte `CLUSTER` prefix
+that is 1072 B of payload, inside the 1312 B crypto-on ceiling, so the frame
+always fits one datagram ([Limits](limits.md#hard-limits)).
 
 The decoder refuses — returns `None`, never panics or allocates from a
 peer-supplied length — on a short buffer, a version other than `1`, a `count`
@@ -294,10 +314,12 @@ entry, or a duplicate `(identity_hash, timer_id)` pair. It is fuzzed as
 `uc_protocol_schedule_table` and its byte layout is frozen by
 `table_codec_pins_bytes_and_is_total`.
 
-The apply layer never sees this frame: like `CONFIG`, it is skipped by every
-FSM's apply loop. The leader adopts the table at append; every other node
-adopts it from the archive's header walk, the same path `CONFIG` takes. What
-the table then does is
+The apply layer never sees this frame: every FSM's apply loop yields
+`CLUSTER`. **Every** node adopts the table the same way — the cluster FSM
+applies the command at commit and publishes it on the view; there is no
+leader-at-append / follower-at-walk split any more, and no durable
+`ScheduleRecord` with a predecessor to revert to, because a committed frame is
+never truncated. What the table then does is
 [Log time and timers, explained § The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table).
 
 Per-record framing uses an atomic-after-write length prefix: a reader that sees

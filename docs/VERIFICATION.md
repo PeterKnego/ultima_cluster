@@ -193,8 +193,9 @@ toolchain to ≥ v4.32.0.
 
 A virtual-time cluster driving the *real* `ElectionSm` — `world.rs` wires
 `uc_consensus` directly, so a fix in the consensus crate is automatically
-reflected rather than mirrored by hand. Seeded fault fuzz with ten whole-cluster
-safety invariants swept after **every** event:
+reflected rather than mirrored by hand. Seeded fault fuzz with eleven whole-cluster
+safety invariants swept after **every** event (inv11, *set alignment*, belongs
+to the coordinated-snapshot work and is not in the tree):
 
 | | Invariant |
 |---|---|
@@ -208,6 +209,7 @@ safety invariants swept after **every** event:
 | inv8 | Revert correctness after truncation settles |
 | inv9 | Tombstone permanence |
 | inv10 | Report ceiling — a clamped report never exceeds its unclamped value or its apply ceiling, and never decreases except across a truncation, restart, role change or ceiling change (M14b) |
+| inv12 | Two readers — the cluster FSM's membership is always a **committed prefix** of the consensus kernel's durable-time config (`2.11.0`, cluster-FSM spec §4.6) |
 
 Directed scenarios stage specific historical bugs as permanent regression pins —
 including `rebooted_unreconciled_voter_must_not_certify_phantom_commit` (Finding
@@ -260,6 +262,39 @@ adoption; its red twin
 `counterfactual_unheld_config_observation_breaks_inv8` deletes the hold
 (`config_obs_latch_buffer = false`, the pre-fix node) and pins that inv8
 fires at the ack.
+
+**Two readers (`2.11.0`, inv12).** Membership is carried by one frame and read
+by two consumers at two different time bases: the consensus kernel at
+*durability* (Raft §4.1 requires the newest configuration in the log, committed
+or not) and the cluster FSM at *commit* (an FSM applies at commit, and is the
+snapshot authority). inv12 pins the relation between them — at every step the
+FSM's membership equals the kernel's durable-time config at some position at or
+below commit, and at every committed position the kernel's config equals what
+the FSM applied there. The sim has no cluster FSM (it has no frames at all), so
+the FSM's membership is the derived quantity the spec defines: the
+highest-version config frame the node genuinely holds at or below
+`min(commit, durable)`. Each sweep returns how many `(node, frame)` pairs it
+actually related, so a scenario can prove it was not vacuous
+(`inv12_the_cluster_fsms_membership_is_a_committed_prefix_of_the_kernels`
+asserts a non-zero count).
+
+**The red twin, and an honest note about what it pins.**
+`counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`
+(behind `mutation-testing`) feeds the kernel from the **committed** view — the
+reader an FSM-first design reaches for, and the one Raft forbids — and pins
+that the invariant set sees it. What fires is **inv6**, config determinism,
+whose durable-time adoption oracle the wrong reader deletes head-on; it fires
+at the first config frame a follower makes durable, on 64 of 64 seeds.
+
+inv12 itself stays green under that tooth, and that is correct rather than a
+weakness in the test: inv12 pins *FSM ⊆ kernel*, and a kernel reading the
+committed view is not ahead of the FSM, it is level with it. **In the sim,
+inv12 is therefore largely a corollary of inv6** — with inv6 suppressed inv12
+does fire, on 64/64 seeds, but off the archive-scan lag rather than off the
+prefix relation. The pair pins the reader; neither half does it alone. (inv7
+and inv5 are reachable only with inv6 *and* inv12 both suppressed and the fault
+rate raised to the storm settings, at 1 seed in 64. The spec's §11 sentence
+naming "inv7 or inv4" is an erratum, recorded as such.)
 
 **Timers (`2.11.0`).** [`uc_sim::timers`](/uc_sim/src/timers.rs) is a pure,
 dependency-free reference model of the leader-pass algorithm (spec §4.3): 64
@@ -369,7 +404,11 @@ volume, with the timer mechanics driven through the public SDK.
 
 | test | file | what it drives |
 |---|---|---|
-| `a_scheduled_timer_fires_at_its_deadline_in_order_and_once`, `the_log_time_seed_survives_a_restart_of_the_same_instance_dir`, `the_timer_bound_holds_client_frames_for_a_pass`, `a_timer_in_flight_at_a_leader_change_fires_late_and_is_delivered_once` (plan 1); `a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick`, `a_restarted_node_resumes_the_table_with_one_catch_up_tick` (plan 2); `a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads`, `a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table`, `a_leader_without_a_table_ships_none_and_the_joiner_installs_none` (plan 3) | `uc_node/tests/timers.rs`; the last two in `uc_node/tests/learner.rs` | one timer fires once at its deadline in pass order and a cancelled one never fires; the cnc log-time word survives a restart of the same instance dir; more than `TIMERS_PER_PASS` due at one instant holds every client frame for a pass and still fires on time; an instance in flight at a leader change is delivered exactly once — late or on time, never twice, never at diverging positions; an applied schedule table ticks once per occurrence and advances from the tick while its `once` entry parks; and five periods of downtime are caught up by **one** tick with the already-delivered `once` not re-delivered; and, for plan 3, that a joiner **below the purge floor** installs the leader's table off the snapshot session (a real leader + joiner `Node` pair over loopback UDP, under purge), that a leader holding no table ships "none" and the joiner installs "none" rather than keeping a stale one, and that such a joiner, once promoted and leading, keeps the schedule ticking — which is exactly what the limitation plan 2 documented said it would not do |
+| `a_scheduled_timer_fires_at_its_deadline_in_order_and_once`, `the_log_time_seed_survives_a_restart_of_the_same_instance_dir`, `the_timer_bound_holds_client_frames_for_a_pass`, `a_timer_in_flight_at_a_leader_change_fires_late_and_is_delivered_once`, `a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick`, `a_restarted_node_resumes_the_table_with_one_catch_up_tick`, `a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads` | `uc_node/tests/timers.rs` | one timer fires once at its deadline in pass order and a cancelled one never fires; the cnc log-time word survives a restart of the same instance dir; more than `TIMERS_PER_PASS` due at one instant holds every client frame for a pass and still fires on time; an instance in flight at a leader change is delivered exactly once — late or on time, never twice, never at diverging positions; an applied schedule table ticks once per occurrence and advances from the tick while its `once` entry parks; five periods of downtime are caught up by **one** tick with the already-delivered `once` not re-delivered; and a joiner that was below the purge floor, once promoted and leading, keeps the schedule ticking |
+| `timers_pending_on_the_old_leader_fire_exactly_once_on_the_new_one_after_its_announce` (cluster FSM) | `uc_node/tests/timers.rs` | the **leader-only heap** (cluster-FSM spec §4.9): three nodes, two instances armed on the leader, the leader crashed with both in flight. Every follower's per-row `timers_pending` cnc word reads `0` across a settle window while the leader's reads `2` — a live reading, republished every pass — and the new leader's rising-edge **announce** rebuilds the whole set and fires it exactly once, with every surviving service's fired record compared as a whole struct so positions, stamps and lateness must agree. Watched red by inverting the §4.9 half in place |
+| `a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table`, `a_leader_without_a_table_ships_none_and_the_joiner_installs_none`, `a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table` | `uc_node/tests/learner.rs` | a real leader + joiner `Node` pair over loopback UDP, under purge: a joiner **below the purge floor** installs the cluster's schedule table off the snapshot session's cluster artifact; a leader holding no table ships none and the joiner installs none rather than keeping a stale one; and — the residual this work exists to close — a leader **restarted before its first commit advance** still ships the committed table, because the artifact is committed by construction rather than gated on a counter that is zeroed at boot |
+| `a_uc_prefixed_fsm_name_is_reserved_and_refused_by_name` | `uc_node/tests/services.rs` | the `uc_` reservation, refused at the door with the name in the message |
+| `daemon_refuses_a_services_fsm_lag_pointing_at_settings_apply` and its siblings | `uc_node/tests/daemon_refusals.rs` | the **real `uc2-node` binary** refuses a top-level `admission_bytes`, a `[services] fsm_lag` and `names = ["uc_cluster"]` by name with exit 2, each pointing at `uc2ctl settings apply` or at the reservation — and **starts** with the same two keys under `[settings]`, observed as a bounded poll for its cnc page and its own `node_listening`/`stopped` records |
 
 One more pin, from the M14d row-d lesson —
 `snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a `SnapshotPolicy`
@@ -564,7 +603,7 @@ takes the process down. Availability is the thing being defended here.
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
-| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. Two `2.11.0` seeds cover the new `SNAP_TABLE` (kind 21) body, which carries the schedule table on a snapshot session: `15-snap-table` (a real 3-entry encoded table) and `16-snap-table-bad-len` (`table_len` one past the ceiling, exercising the reader's ceiling check rather than its buffer-length check). |
+| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. Three `2.11.0` seeds cover the `SNAP_BEGIN` shapes the flag day produced: `10-snap-begin-legacy-tail` (a body with a trailing carry, which the fixed-length reader must ignore rather than refuse), `14-snap-begin-v4` (the shipped layout) and `15-snap-begin-cluster` (`service_id = 255`, the cluster artifact). The `SNAP_TABLE` body reader those seeds replaced is retired with kind 21. |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
 | `uc_protocol_timer_frame` | `2.11.0` — the TIMER body the apply loop decodes from a committed frame; guarded by length, total on any slice. |
 | `uc_protocol_sched_record` | `2.11.0` — the 17-byte service→node schedule record the consensus agent decodes from a shared-memory ring any local process can write. |
@@ -823,6 +862,20 @@ The most important section, and the one most projects omit.
   and nothing in this document would catch it.
 - **Bounded model checks are bounded.** Veil's clean runs are exhaustive to a
   depth, not to all executions (§8).
+- **inv12 is largely a corollary of inv6 *in the sim*** (§2). The red twin that
+  feeds the consensus kernel from the committed view is caught by **inv6**, the
+  durable-time adoption oracle; inv12 stays green under it, correctly, because
+  a kernel on the committed view is level with the FSM rather than ahead of it.
+  The **pair** pins the reader. So the sim's evidence for the two-readers rule
+  is real but not independent, and inv12 alone would not catch a design that
+  collapsed the two readers into one. Recorded rather than resolved.
+- **The cluster FSM's own artifact decoder has no fuzz target.** The
+  cluster-FSM design named `uc_node_cluster_artifact` and plan 1 did not add
+  it; the `CLUSTER` frame body and the settings record it wraps *are* fuzzed
+  (`uc_protocol_cluster_frame`, `uc_protocol_settings`, §7), and the image
+  decoder bounds-checks every length-prefixed read before slicing behind a
+  CRC32 that is a checksum and not a MAC — but a joiner installs that image
+  **by fiat**, so the seam deserves a target it does not have yet.
 - **The leader pass is checked for ORDERING, not for which occurrence fires.**
   The differential test in §2 puts `uc_sim`'s §4.3 oracle on the real pass, so
   the mirror can no longer drift on stamp ordering, monotonicity or lateness
@@ -842,7 +895,16 @@ The most important section, and the one most projects omit.
   target (2.7.0), and Broadcast has a seqlock-barrier loom model
   (2026-08-31) which found and fixed a real weak-memory defect the moment it
   was written. **SPSC, the futex layer and the mapping itself remain
-  uncovered.** Miri does not support file-backed memory mappings. A Vec-backed
+  uncovered** — and `svc_sched.<row>.ring`, the service→node schedule ring, is
+  an **SPSC** ring, so its interleavings are in the uncovered set. What `2.11.0`
+  adds there is a structural narrowing rather than a proof: since the cluster
+  FSM the service writes that ring **only while its node leads**
+  (`write_sched_if_leader`, gated on the same `NODE_FLAG_LEADER` read the apply
+  loop already does per cycle) and only a leading node drains it, so a follower
+  never exercises the ring-full spin at all. The gate itself is covered by
+  integration assertion (`a_follower_does_not_drain_sched_rings_and_demotion_discards_the_heap`,
+  `timers_pending_on_the_old_leader_fire_exactly_once_on_the_new_one_after_its_announce`),
+  not by loom. Miri does not support file-backed memory mappings. A Vec-backed
   ring variant would let Miri run and would be checking a different object
   than the one that ships; it has not been built, and that trade-off is
   recorded rather than resolved.

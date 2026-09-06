@@ -56,16 +56,16 @@ writer.
 | 1344 | `archive_first_base` | consensus agent; mirrors the archive agent's first-base atomic |
 | 3456 | `config_version` | |
 | 3520 | `config_pending` | |
-| 3584 | `admin_req` | admin request slot |
+| 3584 | `admin_req` | admin request slot — `seq u64 @+0` (the commit word) ‖ `nonce u64 @+8` ‖ `op u32 @+16` ‖ `id u32 @+20` ‖ `ip u32 @+24` ‖ `port u32 @+28`. Ops: `1..=5` the reconfiguration ops, `6 ADMIN_OP_SCHEDULE_APPLY`, `7 ADMIN_OP_SETTINGS_APPLY` (the cluster FSM, 2.11 pending). The two apply ops carry no payload here — the line is 64 fixed bytes and the HMAC covers exactly those, so the payload is staged in the instance directory and `id ‖ ip ‖ port` carry the first 80 bits of its SHA-256 instead |
 | 3648 | `admin_resp` | admin response slot |
-| 3712 | `admission_bytes` | the node's configured admission window |
+| 3712 | `admission_bytes` | the node's admission window **in effect**. Observability only — nothing else gates on it. Since the cluster FSM (2.11 pending) the value is the committed `Settings::admission_bytes` clamped to this host's `buffer_bytes / 2`, or `NodeConfig::admission_bytes_default` while the setting reads `0`, re-published whenever the committed value moves rather than written once at boot |
 | 3776 | `seal_failures` | crypto seal failures |
 | 3840 | `free_disk_bytes` | free bytes on the instance dir's filesystem; writer: the `uc2-node` daemon only, `0` = never published |
 | 3904 | `admin_auth` | M12b: HMAC-SHA256 auth line for the admin request slot (tag ‖ `expiry_ns` ‖ key-name hash); all-zero = no auth attached |
 | 3968 | `ingress_holes_skipped` | M13: dead-producer holes skipped on the client **ingress** MPSC ring; writer: the consensus agent, published on change only |
 | 3976 | `query_holes_skipped` | M13: same counter for the **query** ring — deliberately the second u64 of the 3968 line (same writer, on-change only) |
 | 4032 | `services_declared` | node, once at boot (bit *i* ⇔ id *i* declared). **Unchanged by cnc 3.1 / FSM identity**: this same-host bitmask is unrelated to the wire's per-row `SnapBeginBody.identity` array (`docs/reference/wire-protocol.md`) — the two are derived from the same `[services] names` config but serve different readers |
-| 4040 | `fsm_lag_bytes` | node, once at boot (`0` ⇔ lockstep) — shares 4032's line |
+| 4040 | `fsm_lag_bytes` | node (`0` ⇔ lockstep) — shares 4032's line. Since the cluster FSM (2.11 pending) this is derived from the committed `Settings::fsm_lag_bytes` and **re-published when that setting moves**, not written once at boot. The record's own `0` means "derive at use" and lockstep is `u64::MAX` there, so `page_lag_from_setting` is the one place that maps the record's sentinels onto this word's |
 | 4048 | `log_time_ns` | **archive agent** (cnc 3.1, log time, 2.11 pending) — the highest leader stamp the archive has recorded, ns since the Unix epoch. The third word of the `4032` line, and its only *live* writer: `4032`/`4040` are written once before publish and never again. **Never lowered.** A new leader seeds its stamp clamp from this word after the leader-open collapse; `/metrics` exports it as `uc2_log_time_ns` and `uc2ctl status` prints `log_time_ns=` (raw ns, not RFC 3339) |
 
 Counters are absolute byte positions in the replicated log, not indices.
@@ -127,7 +127,7 @@ Fields within a slot (each its own 64 B line, one writer):
 | 384 | `lag_waits` | service apply agent (one per wait episode at the lag barrier) |
 | 448 | `name` (line 7) — `[u8; 32]`, NUL-padded FSM name | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 480 | `identity_hash` (line 7) — u64, FNV-1a 64 of `name` | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
-| 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time |
+| 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time. Since the cluster FSM (2.11 pending) the timer heap is **leader-only**, so this is the leader's count and a follower always publishes `0` |
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart

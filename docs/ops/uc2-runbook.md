@@ -70,48 +70,42 @@ verify rather than a build:
   means the leader's clock stepped backwards (stamps hold flat until wall time
   catches up) or nothing is being appended; `Uc2LogTimeFrozen` fires above 5 s
   for 30 s. Per-row timer counters are `uc2_timers_pending`,
-  `uc2_timers_fired_total`, `uc2_timers_late_total` and
-  `uc2_timers_rearmed_total`; the two `[log]` records are `timer_late` (emitted
-  only when a fire is late — there is deliberately no per-fire record on the
-  consensus agent's hot path) and `timers_rearmed` (on a leadership loss). See
+  `uc2_timers_fired_total` and `uc2_timers_late_total`; `uc2_timers_pending` is
+  the **leader's** count and a follower exports `0`, because the timer heap is
+  leader-only since the cluster FSM. The one `[log]` record is `timer_late`
+  (emitted only when a fire is late — there is deliberately no per-fire record
+  on the consensus agent's hot path). See
   [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
 - **Do all nodes hold the same schedule table?** `uc2_schedule_table_position`
-  is the frame-end position of the table this node has adopted (`0` = none) and
-  must be identical everywhere; `Uc2ScheduleTableDiverged` fires when it is
-  not. `uc2_schedule_entries` counts the adopted entries (a parked `once`
-  included, unlike `uc2_timers_pending`), and
-  `uc2_schedule_apply_refused_total` counts refused applies. Five records:
-  `schedule_table_adopted` (info, on every adoption, with `source` naming the
-  path — `"log"` for the leader at append and a follower off the archive walk,
-  `"boot"` for a node's own durable load, `"snapshot"` for the table a
-  snapshot session carried) plus four at
-  warn — `schedule_apply_refused` (with the 40–43 reason code),
-  `schedule_table_reverted` (a truncation or the leader-open collapse cut the
-  adopted frame and the record fell back to `position`; expected after a leader
-  change, worth acting on when `position=0`), `schedule_record_unreadable` (the
-  boot-time `state/schedules.state` load failed — the node boots with nothing
-  armed rather than refusing to start, and picks the table up from the next
-  table frame) and `schedule_staged_file_kept` (the append succeeded but
-  `schedules.pending` could not be deleted; remove it by hand). **A node
-  reading position `0` while its peers read a nonzero one is not running their
-  table's position** — it crashed in the narrow window between recording the
-  frame and persisting it, or it was wiped (a wipe deliberately **keeps** the
-  table armed and zeroes only the position, so `uc2_schedule_entries > 0`
-  alongside it is the wipe signature). The remedy for both is the same: re-run
-  `uc2ctl schedule apply`. **A below-floor join is no longer one of the
-  causes**: since `2.11.0` the snapshot session carries the table
-  (`SNAP_TABLE`, kind 21, after every `SNAP_BEGIN`), so a joiner under purge
-  installs the leader's table by fiat before its floor moves — before it can
-  serve a read or win an election. Its adoption logs as
-  `schedule_table_adopted` with `source="snapshot"`, and the
-  `snapshot_installed` record's `table_position` field is the schedule
-  position that node holds once the install is done (the carried table's on
-  the fiat path, and unchanged on the mid-life path that adopts nothing). If a
-  fresh joiner still reads `0` with no entries, the node that served it had
-  none to give: it had no table at all, or it had been restarted and had not
-  yet seen a commit advance, or its own table was **unanchored** (position
-  `0` — a wiped node keeps its table armed locally but does not pass it on).
-  Re-apply.
+  is the frame-end position of the table this node's **cluster FSM** has
+  applied (`0` = none) and must be identical everywhere;
+  `Uc2ScheduleTableDiverged` fires when it is not. `uc2_schedule_entries`
+  counts the committed entries naming a row this node declares (a parked `once`
+  included, unlike `uc2_timers_pending`), read from the cluster FSM's view so
+  it is identical on leader and follower alike; and
+  `uc2_schedule_apply_refused_total` counts refused applies. Three records:
+  `schedule_table_adopted` (info, whenever the view's table position moves,
+  with `source="cluster_fsm"` — one path now) and `cluster_command_applied`
+  (info, on every applied `CLUSTER` command, naming the kind and whether the
+  FSM accepted it), plus at warn `schedule_apply_refused` (with the 40–43
+  reason code) and `schedule_staged_file_kept` (the append succeeded but the
+  staged file — `schedules.pending` or `settings.pending`, named in the `file`
+  field — could not be deleted; remove it by hand). Since the cluster FSM
+  (2.11 pending) this alert is **narrow**: the table is state applied at
+  commit, so there is no `state/schedules.state` crash window, no
+  revert-on-truncation, no wipe keep-alive signature, and a below-floor join
+  is not a cause — the snapshot session carries the cluster FSM's own artifact
+  (`service_id = 255`), installed before the joiner's floor advances. A node
+  reading a different position is a node whose `uc2-cluster` agent is not
+  applying; read the position beside `uc2_commit_bytes` on that node. The
+  remedy is unchanged: re-run `uc2ctl schedule apply`.
+- **What settings is this cluster running?** `uc2ctl settings show` prints the
+  committed `admission_bytes`, `fsm_lag`, `snapshot_interval_bytes` and
+  `snapshot_target` out of the newest cluster artifact; change them with
+  `uc2ctl settings apply <file.toml>` (admin op 7, refusals 44–47, audited as
+  `settings_apply`). `[settings]` in `node.toml` seeds genesis only. Both
+  `show` commands read a **file**, so they lag the live view and say
+  `no cluster artifact yet` until every declared row has snapshotted.
 
 ## Changing a running cluster
 
@@ -129,8 +123,9 @@ verify rather than a build:
   admin line. **Run it against the leader**: the staged file is node-local, so a
   follower answers `retry` (status `2`) with the leader hint rather than
   forwarding a request whose payload the leader cannot see. The leader also
-  answers `retry` while the previous table frame is still above commit (single
-  in flight); `uc2ctl` does not poll through a retry — it exits non-zero and
+  answers `retry` while any previous `CLUSTER` frame — a table, a settings
+  record or a membership change — is still above the committed cluster view
+  (single in flight, across all three); `uc2ctl` does not poll through a retry — it exits non-zero and
   names the staged file, so re-run the same command. Refusals are `40 schedule_digest`,
   `41 schedule_missing`, `42 schedule_decode`, `43 schedule_unknown_fsm`
   ([`uc2ctl` § Refusal reasons](../reference/uc2ctl.md#refusal-reasons)); a
@@ -138,10 +133,13 @@ verify rather than a build:
   needs nothing re-staged, and the node deletes it only after a successful
   append. Every outcome is audited as `schedule_apply` (its `id`/`addr` fields
   render the digest, not an address). Applying **replaces the whole table** —
-  to drop one entry, apply a file without it. Read the adopted table back with
-  `uc2ctl schedule show`, which reads `<instance_dir>/state/schedules.state`,
-  and see the position on `uc2ctl status`'s `config:` line as
-  `schedule_position=`.
+  to drop one entry, apply a file without it. Read the committed table back with
+  `uc2ctl schedule show`, which reads this node's newest cluster artifact under
+  `<instance_dir>/snapshots/cluster/`, and see the position on `uc2ctl
+  status`'s `config:` line as `schedule_position=`. Both lag the live view —
+  an artifact appears once every declared row has snapshotted — so on a cluster
+  that is not snapshotting yet they say `no cluster artifact yet` and
+  `uc2_schedule_table_position` from `/metrics` is the live reading.
 - [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md) — key
   material, the flag-day rollout, health counters, and rotation; pair with
   `[admin] auth = "hmac"` — see its "Known interaction with admin
@@ -184,13 +182,16 @@ verify rather than a build:
   `service.<id>.lock`, `snapshots/<id>/`) and, since log time and timers
   (2.11 pending), `svc_sched.<id>.ring` — the first per-row ring the **node**
   consumes (service → node: schedule, cancel and consumed requests). It takes
-  the per-row reservation from 5 MiB to 6 MiB. The schedule table adds two more
-  paths in the same release: `state/schedules.state` (durable, the newest
-  **adopted** table; copied by `backup`/`restore` with the rest of `state/`, and
-  optional — it is not in the verify checklist, so a pre-2.11 artifact stays
-  valid) and `schedules.pending` in the instance root (transient, written by
-  `uc2ctl schedule apply`, deleted by the node after a successful append).
-  *Was §1.*
+  the per-row reservation from 5 MiB to 6 MiB. Since the cluster FSM (2.11
+  pending) `svc_sched.<id>.ring` is written **only by a leading node's
+  service** and drained only while leading. The same release adds
+  `snapshots/cluster/` (durable — `snap-<pos>.ultcluster`, the cluster FSM's
+  own artifact holding membership, the schedule table and the settings record
+  as of `<pos>`; note that `uc2ctl backup` does **not** copy it, so a restore
+  rebuilds the cluster FSM from the restored journal) and two transient staged
+  payloads in the instance root, `schedules.pending` and `settings.pending`,
+  each written by its `uc2ctl … apply` and deleted by the node after a
+  successful append. There is no `state/schedules.state`. *Was §1.*
 - [The cnc control page](../reference/cnc-page.md) — the pinned layout, field by
   field, including cnc 3.1's per-slot name/hash line (7) and version word
   (line 0, word 1) added for FSM identity, plus the two words log time added

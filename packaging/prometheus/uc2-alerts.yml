@@ -182,48 +182,43 @@ groups:
     labels: { severity: warning }
     annotations: { summary: "row {{ $labels.row }} runs different FSM versions across nodes" }
   - alert: Uc2ScheduleTableDiverged
-    # Time-and-timers spec §5 (plan 2): every node adopts the replicated
-    # schedule table from the same log at the same frame-END position — the
-    # leader at append, every other node from the archive's header walk — so
+    # Cluster-FSM spec §4.3: the replicated schedule table is a record inside
+    # the node's own internal cluster FSM, changed by a CLUSTER frame (type 4,
+    # kind 2) and applied at COMMIT on every node — so
     # `uc2_schedule_table_position` must hold ONE value fleet-wide. The
     # `count_values` idiom is Uc2ServiceIdentityDrift's: promote the sample's
     # own value into a label (one output series per distinct position), then
     # count how many distinct ones exist. More than one is divergence.
     #
-    # A node reading 0 while its peers read a nonzero position is not
-    # holding their table's position. Two causes, one remedy:
-    #   * it crashed in the sub-millisecond window between the archive
-    #     recording the frame and the consensus agent persisting
-    #     state/schedules.state (there is no journal re-scan for type-6
-    #     frames);
-    #   * it was WIPED (truncated to 0, no common prefix). A wipe
-    #     deliberately KEEPS the table armed and zeroes only the position —
-    #     the same rule ConfigRecord uses — because dropping it would leave
-    #     this node ticking nothing while its peers tick on. So position 0
-    #     WITH uc2_schedule_entries > 0 on the same node is the wipe
-    #     signature, and the `schedule_table_reverted` record with
-    #     position=0 names it.
+    # This is a NARROW alert since 2.11.0, because the mechanisms that used to
+    # make it fire are gone:
+    #   * there is no state/schedules.state and no ScheduleRecord, so the
+    #     crash-between-recording-and-persisting window is closed — the
+    #     uc2-cluster agent replays the journal above its artifact;
+    #   * there is no revert-on-truncation and no wipe keep-alive, because an
+    #     uncommitted frame is never applied in the first place. The old
+    #     "uc2_schedule_entries > 0 with position 0" wipe signature and the
+    #     schedule_table_reverted record no longer exist;
+    #   * a BELOW-FLOOR JOIN is not a cause. The snapshot session carries the
+    #     cluster FSM's own artifact (service_id 255), installed by fiat before
+    #     the joiner's purge floor advances, so it holds the cluster's table
+    #     before it can serve a read or win an election. There is no ship-time
+    #     freshness gate left to get wrong.
     #
-    # A BELOW-FLOOR JOIN IS NO LONGER A CAUSE. Plan 3 (2.11.0) puts the
-    # table on the snapshot session — a SNAP_TABLE datagram (kind 21) after
-    # every SNAP_BEGIN — and the joiner installs it BY FIAT before its floor
-    # advances, so it holds the cluster's table before it can serve a read or
-    # win an election. Its adoption logs as schedule_table_adopted with
-    # source="snapshot". A fresh joiner still at 0 with no entries means the
-    # node that served it had none to give: no table at all, a restart whose
-    # commit counter was not yet primed (a restarted node under-ships until
-    # its first commit advance), or a table still UNANCHORED at position 0 —
-    # a wiped node keeps its table armed locally and deliberately does not
-    # pass it on (ruling R7) — re-apply either way.
+    # So a node reading a different position is a node whose uc2-cluster agent
+    # is not applying: compare its uc2_schedule_table_position against
+    # uc2_commit_bytes on the same node. A node reading 0 while its peers read
+    # nonzero has applied no table at all.
+    #
     # This is a cluster-wide risk, not one node's: only the LEADER appends
-    # timer frames, so if the node holding no table wins an election, every
-    # scheduled recurrence in the cluster stops — every FSM on every node —
-    # until an operator re-applies. That is why a warning here is worth
+    # timer frames, so if the node holding the odd table wins an election,
+    # every scheduled recurrence in the cluster stops — every FSM on every node
+    # — until an operator re-applies. That is why a warning here is worth
     # paging on rather than watching.
     #
     # Re-run `uc2ctl schedule apply` against the leader: it appends a fresh
-    # frame that every node adopts.
+    # frame that every node applies.
     expr: count(count_values("p", uc2_schedule_table_position)) > 1
     for: 60s
     labels: { severity: warning }
-    annotations: { summary: "nodes disagree on the adopted schedule-table position — a node at 0 has not adopted this table: with uc2_schedule_entries > 0 on that same node it was wiped (table kept, position zeroed), with 0 entries it crashed between recording the table frame and persisting it (a below-floor join is no longer the usual cause since 2.11.0 — the snapshot session carries the table; see the runbook's Observing a cluster section for the residuals). Only the leader appends timer frames, so if the node at 0 wins an election EVERY scheduled recurrence in the cluster stops; re-run `uc2ctl schedule apply` either way" }
+    annotations: { summary: "nodes disagree on the committed schedule-table position — since 2.11.0 the table is cluster-FSM state applied at commit, so a node at an odd position is a node whose uc2-cluster agent is not applying (compare uc2_schedule_table_position against uc2_commit_bytes on that node); one at 0 has applied no table at all. Only the leader appends timer frames, so if that node wins an election EVERY scheduled recurrence in the cluster stops; re-run `uc2ctl schedule apply`" }

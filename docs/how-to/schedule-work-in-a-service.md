@@ -105,9 +105,18 @@ timer that re-arms itself.
 
 ## Decide whether you need `Timed<S>`
 
-**The node layer delivers at-least-once.** When a leader loses leadership with
-timer instances in flight, the next leader re-arms them, so an instance can
-fire twice. That is deliberate: the alternative loses timers.
+**The node layer delivers at-least-once.** The node's timer heap is
+**leader-only** (the cluster FSM, 2.11 pending): a demoted leader discards it,
+and a newly promoted one rebuilds it from your service's re-announce of its own
+pending set plus the cluster's schedule table. An instance that was in flight
+when the old leader lost leadership is still in that pending set, so the new
+leader fires it again and it can fire twice. That is deliberate: the
+alternative loses timers.
+
+The cost of the leader-only heap is one extra round trip inside the promotion
+window — a timer due there fires one service cycle plus one ring hop later than
+it would have. A failover already made timers late (`ev.late(ctx)` says so), so
+the semantics are unchanged; only the width of an existing window moved.
 
 `uc_service::Timed<S>` wraps either tier and makes delivery **exactly-once**.
 It keeps the pending set your FSM asked for, rebuilt from the log on replay and
@@ -141,12 +150,13 @@ attempt fails to compile.
 
 ## Check it is working
 
-`uc2_timers_pending`, `uc2_timers_fired_total`, `uc2_timers_late_total` and
-`uc2_timers_rearmed_total` are exported per row; see
+`uc2_timers_pending`, `uc2_timers_fired_total` and `uc2_timers_late_total` are
+exported per row; see
 [Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending).
-Every node holds the same pending set — only the leader fires — so
-`uc2_timers_pending` disagreeing across a settled cluster means a replica
-diverged.
+`uc2_timers_pending` is the **leader's** count and a follower exports `0`, so
+do not alert on the fleet disagreeing about it — that is the healthy reading.
+(`uc2_timers_rearmed_total` existed in an earlier draft of this feature and is
+gone: with a leader-only heap there is nothing to re-arm on demotion.)
 
 A rising `uc2_timers_late_total` on a cluster that is **not** changing leaders
 is worth investigating; after a failover it is expected.

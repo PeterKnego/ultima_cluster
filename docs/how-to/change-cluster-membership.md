@@ -133,7 +133,7 @@ a purged-cluster learner's `min_applied` at 0 and made `promote` refuse
 `NotCaughtUp` forever; M14c fixed it — [Upgrade a cluster § wire change in
 2.8.0](upgrade-a-cluster.md); FSM identity replaced the underlying
 set-membership bitmask with the positional, by-name check — [Upgrade a
-cluster § wire + cnc change in 2.11](upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31).)
+cluster § wire + cnc change in 2.11](upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31).)
 
 **A floor that keeps climbing while the learner joins** (2.11 pending) is
 handled, not a wedge: if the leader purges past what the learner has

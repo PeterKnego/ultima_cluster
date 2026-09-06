@@ -7,18 +7,20 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## Unreleased — FSM identity and log time (next minor, 2.11.0 when cut)
+## Unreleased — FSM identity, log time, and the cluster FSM (next minor, 2.11.0 when cut)
 
-**Implemented on branch `uc2/fsm-identity`; release on hold pending further
-changes.** This section is a draft, written ahead of the tag so the writeup
-is ready when the maintainer green-lights it — see
+**Implemented; release on hold pending further changes.** This section is a
+draft, written ahead of the tag so the writeup is ready when the maintainer
+green-lights it — see
 [the release-evidence table](docs/releases.md#release-evidence) for what is
 verified so far and what still says "pending". **No version has been
-bumped, nothing has been tagged, and no fleet gate has run.**
+tagged, and no fleet gate has run.**
 
-Three features share this release, because all three landed before it was
-cut, and all three are on the same wire `0.7.0` / cnc `3.1` flag day: FSM
-identity, log time and timers, and the replicated schedule table built on it.
+Four features share this release, because all four landed before it was
+cut, and all four are on the same wire `0.7.0` / cnc `3.1` flag day: FSM
+identity, log time and timers, the replicated schedule table built on it, and
+the cluster FSM, which took over how all of the cluster's own state reaches a
+node that has fallen behind.
 
 An FSM's identity — the name a state machine declares in its own code — now
 travels everywhere the cluster used to check only a bare row number, closing
@@ -44,7 +46,7 @@ schedule table an operator applies with one command.
   bitmask could not even detect: two nodes running different logic at the
   same row, silently.
   → [The FSM identity explainer](docs/notes/uc2-fsm-identity-and-deterministic-ids-explained.md) ·
-  [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31)
+  [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31)
 - **`ApplyCtx` and `IdGen`: deterministic IDs with zero coordination.** The
   apply signature becomes `apply(&mut self, ctx: &mut ApplyCtx, cmd, out)`;
   `ctx.ids()` mints IDs from `(position, FSM identity, an ordinal that
@@ -94,9 +96,11 @@ schedule table an operator applies with one command.
   → [Log time and timers, explained](docs/notes/uc2-log-time-and-timers-explained.md) ·
   [State-machine contract § Timers](docs/reference/state-machine-contract.md#timers-on_timer-and-timeds)
 - **The log's clock and the timer set are observable, and a frozen clock
-  pages.** Six new metric families: `uc2_log_time_ns` on every node,
+  pages.** Five new metric families: `uc2_log_time_ns` on every node,
   `uc2_log_time_lag_seconds` on the leader, and
-  `uc2_timers_{pending,fired_total,late_total,rearmed_total}` per row. One new
+  `uc2_timers_{pending,fired_total,late_total}` per row. `uc2_timers_pending`
+  is the **leader's** count — the heap is leader-only — so a follower exports
+  `0` and the fleet disagreeing about it is the healthy reading. One new
   alert rule, `Uc2LogTimeFrozen`, fires when the leader's log time falls more
   than 5 s behind wall time for 30 s. `uc2ctl status` prints `log_time_ns=`
   and a per-row `timers_pending=`.
@@ -107,14 +111,14 @@ schedule table an operator applies with one command.
   FSM by name, a timer id, and one of three rules — `every "10m"` from an
   anchor, `at "02:00"` (daily, UTC), or `once` at a fixed instant. The leader
   appends the table as a log frame; every other node adopts it from the same
-  archive walk that adopts a config change, so there is no per-host file and no
+  log every node applies at commit, so there is no per-host file and no
   per-host drift to detect. A node that joins **below the purge floor** — where
-  the table's own frame is already gone — gets the table on the snapshot
-  session instead (a `SNAP_TABLE` datagram after every `SNAP_BEGIN`), installed
-  before its floor advances, so it holds the cluster's schedule before it can
-  serve a read or win an election. That matters cluster-wide rather than per
-  node: only the leader appends timer frames, so a leader running no table
-  would stop every recurrence everywhere.
+  the table's own frame is already gone — gets the table inside the cluster
+  FSM's snapshot artifact (next bullet), installed before its floor advances,
+  so it holds the cluster's schedule before it can serve a read or win an
+  election. That matters cluster-wide rather than per node: only the leader
+  appends timer frames, so a leader running no table would stop every
+  recurrence everywhere.
   Ticks arrive at the FSM's existing `on_timer` with
   `ev.table` set. Two behaviours are worth knowing before you use it: applying
   **replaces** the whole table (to drop an entry, apply a file without it), and
@@ -131,8 +135,42 @@ schedule table an operator applies with one command.
   → [Run work on a schedule](docs/how-to/run-work-on-a-schedule.md) ·
   [Log time and timers, explained § The schedule table](docs/notes/uc2-log-time-and-timers-explained.md#the-schedule-table) ·
   [`uc2ctl` § `schedule apply`](docs/reference/uc2ctl.md#schedule-apply) ·
-  [Wire protocol § `SNAP_TABLE` body](docs/reference/wire-protocol.md#snap_table-body-wire-070) ·
+  [Wire protocol § `ScheduleTable` payload](docs/reference/wire-protocol.md#scheduletable-payload-cluster-kind-2-wire-070) ·
   [UC v2 operations § Changing a running cluster](docs/ops/uc2-runbook.md#changing-a-running-cluster)
+- **The cluster's own state now lives in a state machine, and reaches a
+  below-floor joiner the way every other state does — as a snapshot artifact.**
+  Before this, membership rode live on a `SNAP_BEGIN` datagram and the schedule
+  table rode live on its own, gated on a counter that is deliberately zeroed at
+  boot — which is where the "a restarted node under-ships the table" limitation
+  came from. Both are gone. Membership, the schedule table and a new
+  **replicated settings record** are now three records inside one internal
+  state machine, the **cluster FSM** (`uc_cluster`), applied at commit by a
+  fifth polling agent and snapshotted into its own artifact
+  (`snapshots/cluster/snap-<pos>.ultcluster`), which the snapshot session ships
+  under the reserved `service_id = 255`. "What was in force at position P" is a
+  file now, not a memory read. Two consequences an operator sees: the two
+  documented ship-side windows are **closed by construction** rather than
+  worked around, and the timer heap becomes **leader-only** (a follower exports
+  `uc2_timers_pending = 0`, and a new leader rebuilds the set from its
+  service's re-announce).
+  → [The cluster FSM, explained](docs/notes/uc2-cluster-fsm-explained.md) ·
+  [Wire protocol § `CLUSTER` body](docs/reference/wire-protocol.md#cluster-body-wire-070) ·
+  [Instance directory § Files](docs/reference/instance-directory.md#files)
+- **Four cluster-wide settings stop being per-host config.** `fsm_lag`,
+  `admission_bytes` and a snapshot cadence (`snapshot_interval_bytes`,
+  `snapshot_target`) are a replicated record on the log: `[settings]` in
+  `node.toml` **seeds genesis only**, `uc2ctl settings apply <file.toml>`
+  changes them cluster-wide, and `uc2ctl settings show` prints what is
+  committed. The old per-host spellings — top-level `admission_bytes` and
+  `[services] fsm_lag` — are startup **refusals by name**, pointing at the new
+  verb. `fsm_lag` was already documented as "must match cluster-wide" with
+  nothing checking it, and `admission_bytes`'s effective value silently changed
+  on failover; both are now true by construction. Anything host-specific is
+  **clamped at the point of use**, never refused — a small host runs a smaller
+  window rather than diverging. The `uc_` FSM-name prefix is reserved in the
+  same change.
+  → [Configuration § `[settings]`](docs/reference/configuration.md#settings) ·
+  [`uc2ctl` § `settings apply`](docs/reference/uc2ctl.md#settings-apply)
 
 **Fixed**
 
@@ -183,21 +221,32 @@ schedule table an operator applies with one command.
   carrying all three features.** `SNAP_BEGIN`'s `services_declared` bitmask becomes
   a per-row identity-hash array plus a per-row version array; the cnc page's
   once-reserved slot line 7 becomes node-written at boot (name + hash); the
-  log frame header is relaid for `time_ns` and two frame types are added
-  (`TIMER`, `SCHEDULE_TABLE`); two more cnc words appear (`log_time_ns`,
-  per-row `timers_pending`).
+  log frame header is relaid for `time_ns` and a `TIMER` frame type is added;
+  two more cnc words appear (`log_time_ns`, per-row `timers_pending`); and the
+  cluster FSM turns frame type `4` into a kind-dispatched `CLUSTER` command
+  while making `SNAP_BEGIN` fixed-length (layout V4, no carried config). Three
+  numbers are **retired before shipping** and reserved so they are never
+  reassigned: frame type `6` (`SCHEDULE_TABLE`), datagram kind `21`
+  (`SNAP_TABLE`) and `SNAP_BEGIN` layout `2`.
   **Read the upgrade note before this one.** Every prior wire bump was caught
   by a length check, so a mixed cluster stalled. A relaid header is the *same
   length*: a `0.6.0` peer's frames parse on a `0.7.0` node and mean something
   different. Stop every node before starting any node.
-  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-and-log-time-070-cnc-31)
-- **Two new instance-directory paths for the schedule table**:
-  `state/schedules.state` (durable — the newest adopted table; copied by
-  `backup`/`restore` with the rest of `state/`, and deliberately outside the
-  five-file verify checklist so a pre-2.11 artifact still verifies) and a
-  transient `schedules.pending` that `uc2ctl schedule apply` stages and the node
-  deletes after a successful append.
+  → [Upgrade a cluster § 2.11](docs/how-to/upgrade-a-cluster.md#wire--cnc-change-in-211-pending-fsm-identity-log-time-and-the-cluster-fsm-070-cnc-31)
+- **New instance-directory paths**: `snapshots/cluster/` (durable — the cluster
+  FSM's `snap-<pos>.ultcluster` artifacts) and two transient staged payloads in
+  the instance root, `schedules.pending` and `settings.pending`, each written by
+  its `uc2ctl … apply` and deleted by the node after a successful append. There
+  is **no** `state/schedules.state`: the table is cluster data and lives in the
+  artifact. Note that `uc2ctl backup` does not copy `snapshots/cluster/`, so a
+  restore rebuilds the cluster FSM from the restored journal's `CLUSTER` frames.
   → [Instance directory § Files](docs/reference/instance-directory.md#files)
+- **`uc_node` now depends on `uc_service`**, so the ordered crates.io publish
+  flips: `uc_service` goes before `uc_node`. The cluster FSM implements the
+  same `RawStateMachine`/`SnapshotStateMachine` traits a user's state machine
+  does, which is the point — every mechanism the user FSMs already have becomes
+  the cluster data's mechanism for free.
+  → [Cut a release](docs/how-to/cut-a-release.md)
 - **One new file per declared FSM in the instance directory**,
   `svc_sched.<row>.ring` (1 MiB, service → node). The per-row reservation goes
   from 5 MiB to 6 MiB, so the boot reservation is ~79 MiB at the defaults with
@@ -219,6 +268,13 @@ schedule table an operator applies with one command.
   can cost even on paths that never run, plus a row that runs a full 32-entry
   schedule table under the throughput load:
   → [Time-and-timers gate skeleton](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md).
+  The cluster FSM has **no gate doc of its own**: it adds a fifth polling
+  agent whose frames are operator-rate (a reconfiguration, a table, a settings
+  change — not traffic), and its one hot-path addition is a single `Acquire`
+  load of the published view's position word per consensus duty cycle, compared
+  against a shadow, with the mutex behind the view taken only on a pass where
+  that position actually moved. A row for it belongs in the time-and-timers
+  gate's throughput arm when that gate is run.
 
 ## v2.10.0 — 2026-08-31
 

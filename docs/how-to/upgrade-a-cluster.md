@@ -335,9 +335,9 @@ sections above apply, and there is no migration or extra rollback step. Run the
 same flag day anyway: it is the procedure this system supports, and it gives
 you the same measured downtime number.
 
-## Wire + cnc change in 2.11 (pending): FSM identity **and** log time (`0.7.0`, cnc `3.1`)
+## Wire + cnc change in 2.11 (pending): FSM identity, log time and the cluster FSM (`0.7.0`, cnc `3.1`)
 
-Three features share this flag day, because all three were implemented before
+Four features share this flag day, because all four were implemented before
 the release was cut:
 
 - **FSM identity** gives each state machine a name declared in code and binds
@@ -350,17 +350,23 @@ the release was cut:
   `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md`;
   explainer:
   [`docs/notes/uc2-log-time-and-timers-explained.md`](../notes/uc2-log-time-and-timers-explained.md)).
-- **The replicated schedule table**, built on that, adds a second frame type,
-  `SCHEDULE_TABLE` (same spec, §5; explainer section:
+- **The replicated schedule table**, built on that (same spec, §5; explainer
+  section:
   [The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table)).
   It needs **no per-host edit**: the table lives on the log, and a fresh
-  cluster simply has none until an operator applies one. Two new
-  instance-directory paths appear on their own —
-  `state/schedules.state` and, transiently, `schedules.pending`.
+  cluster simply has none until an operator applies one.
+- **The cluster FSM** puts membership, that schedule table and a new
+  replicated settings record into one internal state machine, applied at
+  commit and snapshotted into its own artifact (spec
+  `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`;
+  explainer:
+  [`docs/notes/uc2-cluster-fsm-explained.md`](../notes/uc2-cluster-fsm-explained.md)).
+  **This one does need a per-host edit** — two moved `node.toml` keys — see
+  below.
 
 It is **one combined flag day**, on both lines at once — the same-host cnc
 page (`3.0` → `3.1`) and the node-to-node wire (`0.6.0` → `0.7.0`) — because
-all three changes ship in the same release.
+all four changes ship in the same release.
 
 **The `[services] ids` → `names` edit, required on every host.** `[services]`
 is no longer optional (absent used to mean `ids = [0]`; it now refuses to
@@ -382,6 +388,52 @@ the node's list is refused `UnknownFsm`, not silently parked. `--service-id
 `--fsm <name>` (or, for a production service using `ServiceConfig`
 directly, nothing at all — it attaches by its own `S::NAME`).
 
+**The `uc_` name prefix is now reserved**, for UC's own internal state
+machines (the cluster FSM declares `uc_cluster`). A `[services] names` entry
+starting with it is a named startup refusal; rename the row before the flag
+day if you have one.
+
+**The `admission_bytes` and `fsm_lag` edit, required on every host that sets
+either.** Both are cluster-wide policies now, so both are **refused by name**
+where they used to live:
+
+```
+admission_bytes is a cluster-wide setting since the cluster FSM (2.11.0):
+put it under [settings] to seed genesis, and change it with
+`uc2ctl settings apply`
+```
+
+```
+services.fsm_lag is a cluster-wide setting since the cluster FSM (2.11.0):
+put `fsm_lag` under [settings] to seed genesis, and change it with
+`uc2ctl settings apply`
+```
+
+Move both into a new `[settings]` section, with the **same values on every
+host** — the section is a **genesis seed**, read only when the instance
+directory is fresh, and from the first cluster command onward the file's copy
+is ignored:
+
+```toml
+[settings]
+admission_bytes = 262144
+fsm_lag = "16MiB"
+```
+
+On an **existing** cluster the seed is never read at all, so the values that
+take effect are whatever the cluster FSM's genesis defaults were — "derive at
+use" for both. If your fleet ran a non-default `admission_bytes` or `fsm_lag`,
+apply it explicitly after the upgrade rather than relying on the file:
+
+```sh
+uc2ctl settings apply settings.toml --instance-dir /srv/uc2/n0 --app-id myapp \
+  --admin-key /etc/uc2/admin/alice.key
+uc2ctl settings show --instance-dir /srv/uc2/n0 --app-id myapp
+```
+
+See [Configuration § `[settings]`](../reference/configuration.md#settings) and
+[`uc2ctl` § `settings apply`](../reference/uc2ctl.md#settings-apply).
+
 **cnc 3.1**: the once-reserved slot line 7 becomes node-written at boot
 (the row's name, NUL-padded, plus its FNV-1a 64 hash); the status line's
 second word carries the attached service's packed version, written at
@@ -397,13 +449,21 @@ boot. The per-row reservation goes from 5 MiB to **6 MiB**, so the boot
 reservation is ~79 MiB at the defaults with one FSM and ~121 MiB with eight
 ([Instance directory § Limits](../reference/instance-directory.md#limits)).
 Check free space on each host before the flag day; a host that cannot reserve
-it gets a named startup refusal, not a mid-run failure.
+it gets a named startup refusal, not a mid-run failure. Since the cluster FSM
+that ring is written and drained only while a node **leads**.
+
+**New instance-directory paths, created on their own**: `snapshots/cluster/`
+(the cluster FSM's `snap-<pos>.ultcluster` artifacts) and a transient
+`settings.pending` beside `schedules.pending`. There is **no**
+`state/schedules.state` — the schedule table is cluster data and lives in the
+artifact. Note that `uc2ctl backup` does not copy `snapshots/cluster/`, so a
+restore rebuilds the cluster FSM from the restored journal's cluster commands.
 
 **Wire 0.7.0, part one (FSM identity)**: `SNAP_BEGIN`'s `services_declared`
 bitmask becomes a per-row identity-hash array (`identity: [u64; 8]`), and a
 per-row packed version array (`version: [u32; 8]`) is added — see [the wire
 protocol
-reference](../reference/wire-protocol.md#snap_begin-body-wire-070-fsm-identity)
+reference](../reference/wire-protocol.md#snap_begin-body-wire-070-layout-v4)
 for the exact layout. A 0.6.0 sender's shorter body is dropped by the same
 length check that drops a 0.5.0 body today: **a mixed cluster stalls a
 joiner rather than installing a wrong or half-checked artifact.**
@@ -414,6 +474,16 @@ client only ever filled 32 bits each, become `client_id: u32` + `seq: u32`,
 freeing 8 bytes for `time_ns: u64` — the leader's stamp on the frame. A new
 frame type, `TIMER = 5`, carries a 24-byte body (`identity_hash ‖ timer_id ‖
 deadline_ns`). See [the wire protocol reference](../reference/wire-protocol.md#log-frames).
+
+**Wire 0.7.0, part three (the cluster FSM)**: frame type `4` becomes
+`CLUSTER`, a kind-dispatched command (`1` membership, `2` the schedule table,
+`3` the settings record) where it used to be `CONFIG`; `SNAP_BEGIN` loses its
+trailing `config` tail and becomes fixed-length at 120 B (layout **V4**),
+because the snapshot session now carries the cluster FSM's own artifact under
+the reserved `service_id = 255`. Three numbers are **retired before shipping**
+and reserved so they are never reassigned: frame type `6`
+(`SCHEDULE_TABLE`), datagram kind `21` (`SNAP_TABLE`) and `SNAP_BEGIN`
+layout `2`. A body carrying a retired discriminator is refused **by name**.
 
 **This half of the flag day is sharper than every previous one, and deserves
 saying plainly.** Every prior wire bump was caught by a length check: an old

@@ -1632,8 +1632,12 @@ fn every_refusal_surfaces() {
     let leader = await_single_leader(&c.nodes, 20);
     let mut leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
     await_config_settled(&leader_cnc, 20);
-    // Post-M7 (0.3.0): the node mirrors its configured admission window onto
-    // the cnc page once at boot (`make_config`'s `admission_bytes: 256 * 1024`).
+    // Post-M7 (0.3.0): the node mirrors its admission window onto the cnc
+    // page. Since the cluster FSM (2.11.0) the window is a REPLICATED setting
+    // (`Settings::admission_bytes`), republished by `refresh_from_view`
+    // whenever the committed value moves; while that setting reads 0 ("derive
+    // at use") the node falls back to `make_config`'s
+    // `admission_bytes_default: 256 * 1024`, which is what this cluster runs.
     assert_eq!(leader_cnc.admission_bytes(), 256 * 1024);
 
     // ---- AlreadyPresent: add-learner on an existing VOTER id ----

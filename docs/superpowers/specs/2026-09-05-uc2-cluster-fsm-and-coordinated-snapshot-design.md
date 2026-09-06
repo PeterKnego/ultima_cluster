@@ -820,3 +820,102 @@ settled before the corresponding task is written:
    carries the table's delivered marks as the same `SchedOp` the follower's
    `TableConsumed` path uses today, so a promoted node arms table entries
    from the right occurrence and does not re-fire a delivered `once`.
+
+---
+
+## Errata (plan 1, as built)
+
+*Appended 2026-09-06 after plan 1 landed. The body above is retained
+scaffolding and is deliberately **not** rewritten in place; where it and the
+shipped code disagree, this section is what shipped. Each entry names the
+section it amends and the ruling that decided it.*
+
+1. **§11 — the red twin's invariant.** The spec says a kernel fed from the
+   committed view "pins that inv7 or inv4 fires". It does not. What fires is
+   **inv6**, config determinism — the sim's durable-time adoption oracle,
+   whose premise ("the adopted config is the one this node's own log implies
+   at its durable frontier") the wrong reader deletes head-on — at the first
+   config frame a follower makes durable, on **64 of 64** seeds. inv7 and inv5
+   are reachable only with inv6 **and** inv12 both suppressed and the fault
+   rate raised to the storm parameters, at 1 seed in 64. inv12 itself stays
+   green under the tooth, correctly: it pins *FSM ⊆ kernel*, and a kernel on
+   the committed view is level with the FSM rather than ahead of it. The pair
+   pins the reader; neither half does it alone. Ruling **R20**; the `uc_sim`
+   test is
+   `counterfactual_kernel_on_the_committed_view_is_caught_by_inv6_the_durable_time_oracle`.
+
+2. **§4.7 — what position tags the cluster artifact.** The artifact is tagged
+   with the agent's **consumed cursor** — the frame-end of the last frame it
+   walked, set by `ClusterFsm::set_consumed` after every batch — not with the
+   end of the last `CLUSTER` command. It has to be: the node's purge floor is
+   bounded by this tag (`maybe_persist_snapshot_floor`), `CLUSTER` frames are
+   operator actions and a cluster can run for days without one, while the
+   rows' snapshot floor climbs with ordinary traffic. A tag that only moved on
+   `CLUSTER` frames would pin the purge floor at the last reconfiguration
+   forever. The two readings are consistent because the cursor only ever
+   advances over frames actually walked (see erratum 3). Ruling **R17**.
+
+3. **§4.7/§4.8 — overrun and the drain loop.** On a log-buffer overrun the
+   cluster agent **always** replays from the journal; there is no cursor skip
+   and no prime generation. A journal purged below its cursor makes the agent
+   **idle** (one `Warn`, `cluster_agent_journal_replay_gap_purged`, reported
+   once per episode) until a snapshot session's artifact installs and resets
+   the cursor by fiat — which is the only thing that moves a below-floor
+   node's cursor forward. Ruling **R18**. Plus the drain-loop rule: one duty
+   cycle never loops on a target it cannot reach — a batch whose head lands
+   mid-frame yields rather than spinning, which is what a report-ceiling-paced
+   node produced as a wedged `uc2-cluster` agent and a wedged `Node::stop`
+   (fix `a37003b`).
+
+4. **§4.9 — followers and the promotion re-arm.** Followers export
+   `timers_pending = 0`; the heap does not exist on them at all. A new leader
+   re-arms from the cluster FSM's view on its **first pass**, and that pass is
+   forced to re-read the view (`on_collapsed` marks the position shadow stale)
+   precisely so a promotion with no intervening committed table still arms
+   from whatever table is already committed. Table arming is gated on the
+   table's position, not on the view's. Rulings **R15/R15'**.
+
+5. **§6 — the settings sentinels.** `fsm_lag_bytes == 0` in the replicated
+   record means "**this node's boot-derived lag**" (`buffer_bytes / 4`), not
+   "no lag policy"; `admission_bytes == 0` and `snapshot_interval_bytes == 0`
+   mean "derive at use" likewise. Because `0` is taken, lockstep needs its own
+   sentinel in this record: `FSM_LAG_LOCKSTEP = u64::MAX`, which no real byte
+   bound can reach (`fsm_lag_from_setting` clamps every finite value below
+   half the ring). `uc_node::services::page_lag_from_setting` is the single
+   place that maps it back onto the cnc page's own lockstep sentinel, `0`.
+   Ruling **R8'**.
+
+6. **§5.6 — `SnapBeginBody.config` retires with layout V4.** The spec's plan-1
+   share of §5.6 is as built with one addition: the carried config tail is
+   removed, `SNAP_BEGIN_FIXED_LEN` drops to **120** and
+   `SNAP_BEGIN_LAYOUT_V4 = 3` is the shipped discriminator
+   (`SNAP_BEGIN_LAYOUT_V3 = 2`, the intermediate shape with a carried config,
+   is reserved and refused by name). Membership on a joiner is fed from the
+   **installed cluster image**, through the view, rather than from a tail on
+   every `BEGIN`.
+
+### Designed and not built in plan 1
+
+Recorded so they are not mistaken for shipped surface:
+
+- `uc2_cluster_fsm_position` and `uc2_settings_position` (§9) are **not
+  exported**. `uc2_schedule_table_position` is the only view-derived gauge,
+  and it moves only when a table command commits.
+- `uc2_agent_alive` still carries four `agent=` samples, not the fifth
+  (`uc2-cluster`).
+- The fuzz target §11 names `uc_node_cluster_artifact` does not exist. The
+  `CLUSTER` frame body and the settings record are fuzzed
+  (`uc_protocol_cluster_frame`, `uc_protocol_settings`); the cluster **image**
+  decoder is covered only by its own bounds checks and unit tests, and a
+  joiner installs it by fiat.
+- `uc2ctl backup` does not copy `snapshots/cluster/` — `snapshot_ids_present`
+  parses each subdirectory name as a `u8`, so `cluster` is skipped. A restore
+  rebuilds the cluster FSM from its genesis seed plus the restored journal's
+  `CLUSTER` frames.
+- `uc2ctl schedule show` / `settings show` / `status`'s `schedule_position=`
+  read the newest **artifact**, not the live view (§13 phase 2 is what would
+  give them a live reading), so they answer "no cluster artifact yet" on a
+  cluster whose declared rows have not snapshotted.
+- The artifact is written by a **bridging trigger** — once every declared row
+  has snapshotted and the agent's applied position has reached the lowest of
+  theirs — standing in for §5's commanded instant, which is plan 2.
