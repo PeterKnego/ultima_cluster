@@ -623,6 +623,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path, including its own `EdgeConfig::validate`. |
 | `uc_node_http` | `uc_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
+| `uc_node_cluster_artifact` | `ClusterFsm::install_snapshot` — the cluster IMAGE a below-floor joiner installs **by fiat** off a snapshot session, and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen. |
 
 ### Method
 
@@ -869,13 +870,13 @@ The most important section, and the one most projects omit.
   The **pair** pins the reader. So the sim's evidence for the two-readers rule
   is real but not independent, and inv12 alone would not catch a design that
   collapsed the two readers into one. Recorded rather than resolved.
-- **The cluster FSM's own artifact decoder has no fuzz target.** The
-  cluster-FSM design named `uc_node_cluster_artifact` and plan 1 did not add
-  it; the `CLUSTER` frame body and the settings record it wraps *are* fuzzed
-  (`uc_protocol_cluster_frame`, `uc_protocol_settings`, §7), and the image
-  decoder bounds-checks every length-prefixed read before slicing behind a
-  CRC32 that is a checksum and not a MAC — but a joiner installs that image
-  **by fiat**, so the seam deserves a target it does not have yet.
+- **The cluster FSM's artifact decoder is fuzzed as of plan 1's pre-final
+  pass** (`uc_node_cluster_artifact`, §7) — the gap the design named and the
+  plan first left open. 17.7 M runs over its five seeds found no crash; the
+  seeds include a crc-CONSISTENT body whose membership length prefix lies,
+  the shape that would index out of bounds without the decoder's `.get(..)`
+  checks. The `CLUSTER` frame body and the settings record it wraps have
+  their own targets (`uc_protocol_cluster_frame`, `uc_protocol_settings`).
 - **The leader pass is checked for ORDERING, not for which occurrence fires.**
   The differential test in §2 puts `uc_sim`'s §4.3 oracle on the real pass, so
   the mirror can no longer drift on stamp ordering, monotonicity or lateness

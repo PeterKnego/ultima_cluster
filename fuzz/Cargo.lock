@@ -960,6 +960,7 @@ name = "uc_fuzz"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "crc32fast",
  "libfuzzer-sys",
  "uc_crypto",
  "uc_gateway",

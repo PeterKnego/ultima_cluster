@@ -73,6 +73,11 @@ fn main() -> std::io::Result<()> {
     write_target(root, "uc_protocol_schedule_table", seeds::uc_protocol_schedule_table())?;
     write_target(root, "uc_protocol_cluster_frame", seeds::uc_protocol_cluster_frame())?;
     write_target(root, "uc_protocol_settings", seeds::uc_protocol_settings())?;
+    write_target(
+        root,
+        "uc_node_cluster_artifact",
+        seeds::uc_node_cluster_artifact(),
+    )?;
     write_target(root, "uc_service_session", seeds::uc_service_session())?;
     write_target(root, "uc_node_toml", seeds::uc_node_toml())?;
     write_target(root, "uc_gateway_toml", seeds::uc_gateway_toml())?;

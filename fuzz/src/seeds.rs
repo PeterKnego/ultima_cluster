@@ -1389,6 +1389,83 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
     ]
 }
 
+/// `uc_node_cluster_artifact` — the cluster IMAGE a joiner installs by fiat
+/// off a snapshot session and a restarting node reads off disk (cluster-FSM
+/// spec §4.7, §11). Built by the REAL `freeze` over a state that has applied
+/// both a Settings and a ScheduleTable command, so the seed exercises every
+/// length-prefixed section; plus the four refusals the decoder owes — a
+/// flipped CRC, a truncated image, wrong magic, and a crc-CONSISTENT body
+/// whose membership length prefix lies (the shape that would index out of
+/// bounds without the `.get(..)` checks).
+pub fn uc_node_cluster_artifact() -> Vec<Seed> {
+    use uc_node::{ClusterCommand, ClusterFsm, ClusterState};
+    use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, write_cluster_prefix};
+    use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable};
+    use uc_protocol::v2::settings::Settings;
+    use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
+
+    // One declared row, so the table command below is accepted rather than
+    // refused for naming an unknown FSM.
+    let hash = uc_protocol::identity::fnv1a_64(b"clock");
+
+    fn body(cmd: &ClusterCommand) -> Vec<u8> {
+        let mut v = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
+        let kind = ClusterFsm::encode_command(cmd, &mut v);
+        write_cluster_prefix(&mut v, kind);
+        v
+    }
+
+    let mut fsm = ClusterFsm::new(ClusterState::genesis_empty(), vec![hash]);
+    let mut out = Vec::new();
+    fsm.apply(
+        &mut ApplyCtx::for_sm::<ClusterFsm>(320),
+        &body(&ClusterCommand::Settings(Settings {
+            snapshot_interval_bytes: 1 << 30,
+            ..Settings::genesis_default()
+        })),
+        &mut out,
+    );
+    fsm.apply(
+        &mut ApplyCtx::for_sm::<ClusterFsm>(640),
+        &body(&ClusterCommand::ScheduleTable(ScheduleTable {
+            entries: vec![ScheduleEntry {
+                identity_hash: hash,
+                timer_id: 1,
+                rule: ScheduleRule::Once { at_ns: 1_700_000_000_000_000_000 },
+            }],
+        })),
+        &mut out,
+    );
+    let (image, _pos) = fsm.freeze().expect("freeze the cluster image");
+
+    let mut bad_crc = image.clone();
+    *bad_crc.last_mut().expect("non-empty image") ^= 1;
+
+    let truncated = image[..image.len() / 2].to_vec();
+
+    let mut bad_magic = image.clone();
+    bad_magic[0] ^= 0xFF;
+
+    // Layout: magic(8) | version(4) | applied(8) | table_position(8) |
+    // settings_position(8) | membership length(4) — overwrite that length
+    // with one far past the image, then re-checksum so the tampered body
+    // clears the CRC gate and reaches the bounds checks.
+    let mut lying_length = image.clone();
+    const ML_OFFSET: usize = 8 + 4 + 8 + 8 + 8;
+    lying_length[ML_OFFSET..ML_OFFSET + 4].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+    let body_len = lying_length.len() - 4;
+    let crc = crc32fast::hash(&lying_length[..body_len]);
+    lying_length[body_len..].copy_from_slice(&crc.to_le_bytes());
+
+    vec![
+        Seed::fixed("01-image", image),
+        Seed::fixed("02-bad-crc", bad_crc),
+        Seed::fixed("03-truncated", truncated),
+        Seed::fixed("04-bad-magic", bad_magic),
+        Seed::fixed("05-lying-membership-length", lying_length),
+    ]
+}
+
 /// `uc_protocol_settings` — the replicated settings record (cluster-FSM spec
 /// §6): the genesis default, a non-default encoding, and the three refusals
 /// the decoder owes: a wrong length, an unknown version, an unknown target.

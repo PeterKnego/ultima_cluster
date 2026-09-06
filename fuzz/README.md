@@ -171,6 +171,7 @@ growth.
 | `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |
 | `uc_node_http` | `uc_node::obs::http::route_raw` — the unauthenticated `/metrics` + `/healthz` + `/readyz` request parser. |
+| `uc_node_cluster_artifact` | `uc_node::ClusterFsm::install_snapshot` — the cluster IMAGE (cluster-FSM spec §4.7, §11), which a below-floor joiner installs BY FIAT off a snapshot session and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen; the target calls the decoder twice per input, once at position 0 and once at the position the image itself claims, so a mutated-but-valid image gets past the position gate. |
 
 ## `cfg(fuzzing)` seams
 

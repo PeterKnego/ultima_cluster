@@ -28,6 +28,10 @@ uc_journal = { path = "../uc_journal" }
 # from-bytes constructor by design). Same versions the workspace pins.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
+# Only for the `uc_node_cluster_artifact` seed that re-checksums a tampered
+# cluster image, so the crafted body clears the CRC gate and actually reaches
+# the decoder's bounds checks. Same version the workspace pins.
+crc32fast = "1"
 
 [[bin]]
 name = "uc_protocol_datagram"
@@ -172,6 +176,13 @@ bench = false
 [[bin]]
 name = "ring_mpsc_record"
 path = "fuzz_targets/ring_mpsc_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc_node_cluster_artifact"
+path = "fuzz_targets/uc_node_cluster_artifact.rs"
 test = false
 doc = false
 bench = false
