@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Per-row timer heap (time-and-timers spec §4.5). Kept on EVERY node from the
-//! row's service `svc_sched` records; only the leader pops by time. No
-//! persistence: the heap is a cache of what the service knows and converges
-//! from the service's re-announce after a restart. At-least-once by design —
-//! `rearm` after a leadership loss may fire an instance twice; `Timed<S>` on
-//! the service side drops the duplicate.
+//! Per-row timer heap (time-and-timers spec §4.5, cluster-FSM spec §4.9).
+//! **Leader-only since §4.9**: only the leader drains its row's `svc_sched`
+//! records and pops by time; on any leader exit the heap is DISCARDED
+//! ([`RowTimers::discard`]), not re-armed — everything in it is
+//! reconstructible from cluster data a new leader already holds (the
+//! service's re-announce for the programmatic set, the cluster FSM's view
+//! for the table). At-least-once by design regardless: an in-flight instance
+//! whose TIMER frame did commit before the leader exited is delivered again
+//! by the next leader; `Timed<S>` on the service side drops the duplicate.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -191,16 +194,23 @@ impl RowTimers {
             self.in_flight.insert(id, deadline_ns);
         }
     }
-    /// Leadership lost: every in-flight instance is pending again. Table
-    /// entries are never in `in_flight`, so this ignores them by
-    /// construction.
-    pub fn rearm(&mut self) -> usize {
-        let n = self.in_flight.len();
-        for (id, dl) in self.in_flight.drain() {
-            self.pending.insert(id, dl);
-            self.heap.push(Reverse((dl, id, false)));
+    /// Spec §4.9: the heap is leader-only. On any leader exit the heap is
+    /// DISCARDED, not re-armed — `in_flight` is leader bookkeeping a new
+    /// leader never inherits anyway (the at-least-once trade), and the
+    /// programmatic `pending` set is reconstructible from the service's
+    /// re-announce on the next promotion (`ApplyState::pending`/
+    /// `sm.pending_timers()`). Table entries stay in `table` (their
+    /// `last_delivered` is worth keeping), but every armed `next` is
+    /// cleared: `pending_len` must read 0 for a discarded row (a follower
+    /// reports no pending timers), and the caller resets `schedule_position`
+    /// so the next `refresh_from_view` re-arms the table wholesale.
+    pub fn discard(&mut self) {
+        self.pending.clear();
+        self.heap.clear();
+        self.in_flight.clear();
+        for e in self.table.values_mut() {
+            e.next = None;
         }
-        n
     }
     /// Programmatic + table entries that currently hold a deadline (a
     /// parked `Once` does not count).
@@ -226,7 +236,6 @@ impl RowTimers {
 pub struct TimerStats {
     pub fired: [AtomicU64; CNC_MAX_SERVICES],
     pub late: [AtomicU64; CNC_MAX_SERVICES],
-    pub rearmed: [AtomicU64; CNC_MAX_SERVICES],
 }
 
 #[cfg(test)]
@@ -278,18 +287,30 @@ mod tests {
         );
     }
 
+    /// Spec §4.9: the heap is leader-only, so a leader exit DISCARDS rather
+    /// than re-arms — `discard` drops in-flight/pending instances wholesale
+    /// (a new leader rebuilds `pending` from the service's re-announce, not
+    /// from this node's own in-flight bookkeeping).
     #[test]
-    fn rearm_moves_in_flight_back_and_they_fire_again() {
+    fn discard_drops_pending_in_flight_and_parks_the_table() {
+        use uc_protocol::v2::schedule::ScheduleRule;
         let mut t = RowTimers::new(1);
         t.schedule(4, 50);
         t.schedule(5, 60);
         t.take_in_flight(4, 50);
-        t.take_in_flight(5, 60);
-        assert_eq!(t.rearm(), 2);
-        assert_eq!(t.peek_due(100), Some((4, 50, false)));
-        t.take_in_flight(4, 50);
-        assert_eq!(t.peek_due(100), Some((5, 60, false)));
-        assert_eq!(t.rearm(), 1, "only the still in-flight one");
+        t.adopt_table(&[(9, ScheduleRule::Once { at_ns: 70 })], 0);
+        assert_eq!(t.pending_len(), 2, "one pending id + one armed table entry");
+        assert_eq!(t.in_flight_len(), 1);
+
+        t.discard();
+        assert_eq!(t.pending_len(), 0, "pending id and armed table entry gone");
+        assert_eq!(t.in_flight_len(), 0);
+        assert_eq!(t.peek_due(u64::MAX), None);
+        assert_eq!(
+            t.table_len(),
+            1,
+            "the table entry itself survives — only its `next` is cleared"
+        );
     }
 
     #[test]
@@ -325,7 +346,6 @@ mod tests {
             Some((7, 1_300, true)),
             "advanced from the fired deadline, not the clock"
         );
-        assert_eq!(t.rearm(), 0);
         assert_eq!(t.table_len(), 1);
     }
 

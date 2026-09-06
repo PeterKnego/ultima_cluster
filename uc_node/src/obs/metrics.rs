@@ -70,7 +70,6 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_timers_pending",
     "uc2_timers_fired_total",
     "uc2_timers_late_total",
-    "uc2_timers_rearmed_total",
     // Plan 2 (spec §6): the replicated schedule table.
     "uc2_schedule_table_position",
     "uc2_schedule_entries",
@@ -230,8 +229,6 @@ struct ServiceRow {
     fired: u64,
     /// Fired timers whose stamp exceeded their deadline.
     late: u64,
-    /// In-flight timers moved back to pending on a leadership loss.
-    rearmed: u64,
 }
 
 fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
@@ -264,7 +261,6 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             timers_pending: slot.identity.timers_pending(),
             fired: s.timer_stats.fired[id as usize].load(Ordering::Relaxed),
             late: s.timer_stats.late[id as usize].load(Ordering::Relaxed),
-            rearmed: s.timer_stats.rearmed[id as usize].load(Ordering::Relaxed),
         });
     }
     rows
@@ -428,7 +424,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_timers_pending",
-        "Pending scheduled timers for this row on this node (time-and-timers spec §6); every node holds the same set, the leader fires it.",
+        "Pending scheduled timers for this row (time-and-timers spec §6, cluster-FSM spec §4.9): the heap is leader-only, so this is the leader's count — a follower always exports 0.",
         "gauge",
         &rows,
         |r| r.timers_pending,
@@ -448,14 +444,6 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "counter",
         &rows,
         |r| r.late,
-    );
-    push_service_labeled(
-        out,
-        "uc2_timers_rearmed_total",
-        "In-flight timers moved back to pending on a leadership loss; each may fire again (the service drops the duplicate).",
-        "counter",
-        &rows,
-        |r| r.rearmed,
     );
     push_gauge(
         out,

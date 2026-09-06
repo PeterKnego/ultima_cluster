@@ -2225,12 +2225,13 @@ struct Consensus {
     /// open fires from a populated set.
     svc_sched: Vec<Option<SpscConsumer>>,
     /// Time-and-timers §4.5: the per-row timer heaps, `Some` for every
-    /// declared row (index = row id, sparse like `svc_query`). Fed from
-    /// `svc_sched` on every node; only the leader pops by time
-    /// (`fire_due_timers`).
+    /// declared row (index = row id, sparse like `svc_query`). Cluster-FSM
+    /// spec §4.9: leader-only — fed from `svc_sched` and popped by time only
+    /// while this node leads (`drain_sched_rings`, `fire_due_timers`);
+    /// discarded, not re-armed, on any leader exit (`discard_timers`).
     timers: Vec<Option<crate::timers::RowTimers>>,
-    /// Time-and-timers §6: per-row `fired`/`late`/`rearmed` counters —
-    /// the SAME `Arc` `Node::observability` hands the metrics encoder.
+    /// Time-and-timers §6: per-row `fired`/`late` counters — the SAME `Arc`
+    /// `Node::observability` hands the metrics encoder.
     timer_stats: Arc<crate::timers::TimerStats>,
     /// Time-and-timers §3.2/§4.3: the ONE wall-clock reading of this pass
     /// (`wall_now_ns`), sampled at the top of `do_work` and used for every
@@ -4024,12 +4025,19 @@ impl Consensus {
         self.base.elapsed().as_nanos() as u64
     }
 
-    /// Every role: absorb the services' schedule/cancel/consumed records off
-    /// the `svc_sched` rings (time-and-timers §4.4). Run at the TOP of the
-    /// pass, before `fire_due_timers`, so a timer the service scheduled this
-    /// pass can fire this pass. A follower drains too: its heap is a warm
-    /// cache so a later leader open fires from a populated set.
+    /// Leader only (spec §4.9): absorb the services' schedule/cancel/consumed
+    /// records off the `svc_sched` rings (time-and-timers §4.4). Run at the
+    /// TOP of the pass, before `fire_due_timers`, so a timer the service
+    /// scheduled this pass can fire this pass. A follower must NOT drain —
+    /// `uc_service::apply::write_sched` spins forever on a full ring, and the
+    /// service now gates every write on its own leader flag, so a follower's
+    /// ring never fills; a record written in the demotion window (flag read
+    /// true, then this node demoted mid-batch) simply sits until the next
+    /// promotion, when it is drained and is harmless.
     fn drain_sched_rings(&mut self) -> bool {
+        if !self.leader_flag.load(Ordering::Relaxed) {
+            return false;
+        }
         let mut did = false;
         let mut err: Option<(RingError, &'static str)> = None;
         for row in 0..CNC_MAX_SERVICES {
@@ -4207,26 +4215,18 @@ impl Consensus {
         (did, hold)
     }
 
-    /// Leadership lost: every in-flight instance is pending again (spec
-    /// §4.5). At-least-once by design — a re-armed instance whose TIMER
-    /// frame did commit is delivered twice and `Timed<S>` drops the
-    /// duplicate.
-    fn rearm_timers(&mut self) {
-        for (row, slot) in self.timers.iter_mut().enumerate() {
-            if let Some(t) = slot {
-                let n = t.rearm();
-                if n > 0 {
-                    self.timer_stats.rearmed[row].fetch_add(n as u64, Ordering::Relaxed);
-                    crate::obs_event!(
-                        Info,
-                        "timers_rearmed",
-                        node = self.id as u64,
-                        row = row as u64,
-                        count = n as u64
-                    );
-                }
-            }
+    /// Spec §4.9: the heap is leader-only. On any leader exit it is
+    /// discarded, not re-armed; the next promotion rebuilds it from the
+    /// service's edge announce and the cluster FSM's table.
+    fn discard_timers(&mut self) {
+        for slot in self.timers.iter_mut().flatten() {
+            slot.discard();
         }
+        // Force `arm_table_from_view` to run again on the next
+        // `refresh_from_view`, which mirrors `schedule_position` from the
+        // view's `table_position` and only re-arms when the two disagree.
+        self.schedule_position = 0;
+        self.publish_timers_pending();
     }
 
     /// Publish each declared row's pending count into its cnc identity slot
@@ -6224,11 +6224,11 @@ impl Consensus {
                 self.term_handle.store(term, Ordering::Release);
                 self.leader_flag.store(false, Ordering::Release);
                 self.appender = None;
-                // Time-and-timers §4.5: we no longer append, so every
-                // instance this node put on the log without a consumed
-                // report goes back to pending — the next leader (possibly
-                // us again) fires it.
-                self.rearm_timers();
+                // Cluster-FSM spec §4.9: the heap is leader-only — we no
+                // longer append, so it is discarded rather than re-armed
+                // (the next leader, possibly us again, rebuilds it from the
+                // service's edge announce and the cluster FSM's table).
+                self.discard_timers();
                 // Cluster FSM (spec §4.4): and the single-in-flight gate
                 // opens. A CLUSTER command this node appended under a term it
                 // no longer leads may never commit at all, so a gate still
@@ -6530,9 +6530,9 @@ impl Consensus {
     fn halt(&mut self) {
         self.halt_removed = true;
         self.leader_flag.store(false, Ordering::Release);
-        // Time-and-timers §4.5: the other leader-exit path — this node will
-        // never append again, so nothing may stay in flight here either.
-        self.rearm_timers();
+        // Cluster-FSM spec §4.9: the other leader-exit path — this node will
+        // never append again, so the heap is discarded here too.
+        self.discard_timers();
         // …and the same for the cluster-command gate (`BecomeFollower`).
         self.last_cluster_append = 0;
         self.can_serve_flag.store(false, Ordering::Release);
@@ -7761,6 +7761,11 @@ mod tests {
         /// `ClusterView` and `cluster_snapshot_pos` with `cons`, exactly as
         /// `Node::start_with_socket` wires them.
         cluster: ClusterAgent,
+        /// Cluster-FSM spec §4.9 Task 7: the producer half of row 0's
+        /// `svc_sched` ring — the real service process's side, kept alive so
+        /// a test can write a record exactly as `uc_service::apply::
+        /// write_sched` would (`push_sched_record_for_test`).
+        svc_sched_producer_0: SpscProducer,
         /// M8 Task 12: the producer half of the handshake route the receiver
         /// agent would own in a real node — lets a test inject a handshake
         /// datagram exactly as `crypto_admit` would deliver one.
@@ -7994,7 +7999,11 @@ mod tests {
         let mut svc_query: Vec<Option<SpscProducer>> =
             (0..CNC_MAX_SERVICES).map(|_| None).collect();
         svc_query[0] = Some(svc_query_0);
-        let (_svc_sched_0_producer, svc_sched_0) =
+        // Kept in the `Harness` (not discarded) so a test can write records
+        // onto row 0's ring exactly as the real service process would
+        // (`push_sched_record_for_test`), rather than poking `RowTimers`
+        // directly — needed to exercise `drain_sched_rings`'s leader gate.
+        let (svc_sched_0_producer, svc_sched_0) =
             SpscRing::create(&dir.path().join("svc_sched.0.ring"), 4096, 1024)
                 .unwrap()
                 .into_split();
@@ -8183,6 +8192,7 @@ mod tests {
         Harness {
             cons,
             cluster,
+            svc_sched_producer_0: svc_sched_0_producer,
             hs_tx,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
@@ -8594,6 +8604,58 @@ mod tests {
         h.cons.do_work();
         assert_eq!(h.cons.timers[0].as_ref().unwrap().table_len(), 0);
         assert_eq!(h.cons.schedule_position, end2);
+    }
+
+    /// Cluster-FSM spec §4.9 Task 7: the heap is leader-only. A follower must
+    /// not drain `svc_sched` at all (the load-bearing reason:
+    /// `uc_service::apply::write_sched` spins forever on a full ring, so a
+    /// follower that drained would let a service that keeps writing wedge
+    /// itself once the ring fills — but since the service now gates every
+    /// write on ITS OWN leader flag, a follower's ring never even fills; this
+    /// test covers the node's own half of that contract). On promotion the
+    /// leftover record is drained; on demotion the whole heap is discarded,
+    /// not re-armed.
+    #[test]
+    fn a_follower_does_not_drain_sched_rings_and_demotion_discards_the_heap() {
+        let mut h = harness();
+        // Freeze the pass clock well below the pushed record's deadline so
+        // this test exercises only the drain/discard gate, never
+        // `fire_due_timers` (which would move the entry straight to
+        // in-flight and defeat the "drained on promotion" assertion below).
+        h.cons.test_now_ns = Some(0);
+        h.cons.timers[0] = Some(crate::timers::RowTimers::new(0xF5A0));
+        push_sched_record_for_test(&mut h, 0, SchedOp::Schedule, 1, 500);
+
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().pending_len(),
+            0,
+            "a follower ignores the ring"
+        );
+
+        drive_to_serving_leader(&mut h);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().pending_len(),
+            1,
+            "drained on promotion"
+        );
+
+        // Adopt a strictly higher term as a follower -> Action::BecomeFollower
+        // (the same recipe `the_cluster_command_gate_is_cleared_on_both_leader_exits`
+        // uses to demote an established leader) -> `discard_timers`.
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 9,
+            last_term: 9,
+            last_durable: 1 << 20,
+        });
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().pending_len(),
+            0,
+            "discarded on demotion"
+        );
+        assert_eq!(h.cons.timers[0].as_ref().unwrap().in_flight_len(), 0);
     }
 
     /// Spec §4.4 / Ruling R5: an entry naming an FSM this cluster does not
@@ -9417,6 +9479,29 @@ mod tests {
             "commit did not open the serving gate"
         );
         append
+    }
+
+    /// Cluster-FSM spec §4.9 Task 7: write one `MSG_V2_SCHED` record onto
+    /// `row`'s `svc_sched` ring through the producer half, exactly as
+    /// `uc_service::apply::write_sched` would — so a test can exercise
+    /// `drain_sched_rings`'s leader gate rather than poking `RowTimers`
+    /// directly.
+    fn push_sched_record_for_test(
+        h: &mut Harness,
+        row: usize,
+        op: SchedOp,
+        id: u64,
+        deadline: u64,
+    ) {
+        assert_eq!(row, 0, "the harness only wires row 0's producer half");
+        let bytes = uc_protocol::v2::ipc::write_sched_record(&uc_protocol::v2::ipc::SchedRecord {
+            op,
+            timer_id: id,
+            deadline_ns: deadline,
+        });
+        h.svc_sched_producer_0
+            .try_write(MSG_V2_SCHED, 0, [0; 8], &bytes)
+            .expect("svc_sched ring not full in this test");
     }
 
     /// Push a linearizable read into the barrier for the harness node.

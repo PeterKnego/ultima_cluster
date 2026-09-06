@@ -8,6 +8,7 @@
 //! replay (Task 9) and rejoins the live buffer at the byte position replay
 //! reached.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -222,6 +223,23 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// otherwise invisible to the node's scheduler until something
     /// re-declares it.
     pub(crate) announce_pending: bool,
+    /// Cluster-FSM spec §4.9: the leader flag as of the PREVIOUS cycle — the
+    /// edge (`false -> true`) is what sets `announce_pending`, race-free by
+    /// ordering: `publish_status` sets the node's flag before the node could
+    /// fire anything, so every record applied before this incarnation sees
+    /// the edge is in the pending set the edge flushes, and every record
+    /// applied after is written directly under a now-true gate.
+    pub(crate) was_leader: bool,
+    /// Cluster-FSM spec §4.9: the in-loop mirror of every SM's pending
+    /// timers, maintained from `take_sched_records()` and from delivered
+    /// `TIMER` frames — parity with `Timed<S>::pending_timers()` for a BARE
+    /// state machine, which has no pending set of its own to re-announce.
+    /// The edge-announce flushes the SM's own hook when it overrides one
+    /// (`Timed`) and this map otherwise.
+    pub(crate) pending: HashMap<u64, u64>,
+    /// The same for the schedule table's delivered ticks (parity with
+    /// `Timed<S>::table_delivered()`).
+    pub(crate) table_last: HashMap<u64, u64>,
     /// Observability: set while a batch has surfaced `Overrun` and the replay
     /// reconstruction is degrading the follower back onto the live buffer.
     /// Cleared once replay rejoins.
@@ -303,6 +321,55 @@ fn write_sched(prod: &mut SpscProducer, recs: &[SchedRecord]) {
     }
 }
 
+/// Cluster-FSM spec §4.9: maintain the loop's own mirror of every SM's
+/// pending timers and delivered table ticks from a batch of
+/// `take_sched_records()` — parity with `Timed<S>::pending_timers()`/
+/// `table_delivered()` for a BARE state machine, which has neither.
+fn track_sched(
+    pending: &mut HashMap<u64, u64>,
+    table_last: &mut HashMap<u64, u64>,
+    recs: &[SchedRecord],
+) {
+    for r in recs {
+        match r.op {
+            SchedOp::Schedule => {
+                pending.insert(r.timer_id, r.deadline_ns);
+            }
+            SchedOp::Cancel | SchedOp::Consumed => {
+                pending.remove(&r.timer_id);
+            }
+            SchedOp::TableConsumed => {
+                table_last.insert(r.timer_id, r.deadline_ns);
+            }
+        }
+    }
+}
+
+/// Cluster-FSM spec §4.9: the ring must not be written on a follower — a
+/// full `svc_sched` ring nobody drains would spin `write_sched` forever and
+/// wedge this apply thread for good. Every record is still tracked in the
+/// loop's own maps regardless of role (a follower's timers are not lost,
+/// just not announced yet), and written to the node only while leader.
+///
+/// Takes the three fields it touches individually rather than
+/// `&mut ApplyState<S>` as a whole: both call sites run while a batch's
+/// `FrameIter` still holds a live borrow of `st.follower` (its `cursor` and
+/// `buf`), so a helper taking the whole struct would conflict with it —
+/// these three are, like `st.egress`/`st.resp_buf` at the same call sites,
+/// statically disjoint fields.
+fn write_sched_if_leader(
+    svc_sched: &mut SpscProducer,
+    pending: &mut HashMap<u64, u64>,
+    table_last: &mut HashMap<u64, u64>,
+    recs: &[SchedRecord],
+    is_leader: bool,
+) {
+    track_sched(pending, table_last, recs);
+    if is_leader {
+        write_sched(svc_sched, recs);
+    }
+}
+
 /// One apply duty cycle. Returns `true` iff it made progress (drove the idle
 /// strategy). Follows the plan skeleton exactly:
 /// target = `min(commit, durable)`; apply every committed `MESSAGE` up to it;
@@ -365,12 +432,30 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             .store_release(unix_ns());
         return false;
     }
-    if st.announce_pending {
+    // Cluster-FSM spec §4.9: read the leader flag ONCE, at the top of the
+    // cycle — before the announce flush below, so the rising edge is
+    // detected before anything can gate on `is_leader`, and reused for the
+    // whole cycle's batch (a direct field access, not a `&self` method, so
+    // it does not conflict with the `follower` borrow the batch holds).
+    let is_leader = st.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
+    if is_leader && !st.was_leader {
+        st.announce_pending = true; // spec §4.9: announce on the rising edge
+    }
+    st.was_leader = is_leader;
+
+    if st.announce_pending && is_leader {
         st.announce_pending = false;
-        let (pending, table_delivered) = {
+        let (mut pending, mut table_delivered) = {
             let sm = st.sm.lock().unwrap();
             (sm.pending_timers(), sm.table_delivered())
         };
+        // A bare SM's hooks are provided no-ops (`Timed` is the only
+        // override) — fall back to the loop's own maps, which track every
+        // SM's pending set regardless of whether it wraps in `Timed`.
+        if pending.is_empty() && table_delivered.is_empty() {
+            pending = st.pending.iter().map(|(&id, &dl)| (id, dl)).collect();
+            table_delivered = st.table_last.iter().map(|(&id, &dl)| (id, dl)).collect();
+        }
         let mut recs: Vec<SchedRecord> = pending
             .into_iter()
             .map(|(id, dl)| SchedRecord {
@@ -386,6 +471,10 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         }));
         write_sched(&mut st.svc_sched, &recs);
     }
+    // `!is_leader` leaves `announce_pending` set (a follower attaching or
+    // finishing replay set it true above/at attach) — a follower must never
+    // write the ring (`write_sched` spins forever on a full one), so the
+    // flush waits for this incarnation's first promotion.
     let commit = c.commit.load_acquire();
     // The log's own frontier, for ruling K's "who set this target?" test below.
     let head = commit.min(durable);
@@ -416,9 +505,9 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 }
                 crate::lag::Plan::Apply { target, one_frame } => (target, one_frame),
             };
-        // is_leader read inline (a direct field access, not a `&self` method)
-        // so it does not conflict with the `follower` borrow the batch holds.
-        let is_leader = st.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
+        // `is_leader` was read once at the top of this cycle (cluster-FSM
+        // spec §4.9: the edge-detection needs it before the announce flush)
+        // and is reused here, unchanged, for the whole batch.
         let cursor_before = st.follower.cursor;
         // Resolve the batch to a plain enum before touching other fields, so the
         // mutable borrow of `st.follower` the batch holds ends before the
@@ -475,13 +564,28 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         }
                         let recs = ctx.take_sched_records();
                         if !recs.is_empty() {
-                            write_sched(&mut st.svc_sched, &recs);
+                            write_sched_if_leader(
+                                &mut st.svc_sched,
+                                &mut st.pending,
+                                &mut st.table_last,
+                                &recs,
+                                is_leader,
+                            );
                         }
                     } else if hdr.frame_type == FRAME_TYPE_TIMER
                         && Some(pos) > sm.last_applied()
                         && let Some(body) = read_timer_body(payload)
                         && body.identity_hash == S::IDENTITY.hash()
                     {
+                        // Delivery bookkeeping BEFORE `on_timer`: this instance is
+                        // no longer pending regardless of what the SM does with
+                        // it, and a table tick's delivery raises `table_last` —
+                        // parity with `Timed<S>`'s own bookkeeping, for the bare
+                        // SM the loop's maps serve.
+                        st.pending.remove(&body.timer_id);
+                        if hdr.flags & FLAG_TIMER_TABLE != 0 {
+                            st.table_last.insert(body.timer_id, body.deadline_ns);
+                        }
                         let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
                             .with_time(hdr.time_ns)
                             .with_term(hdr.leadership_term_id);
@@ -495,7 +599,13 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         );
                         let recs = ctx.take_sched_records();
                         if !recs.is_empty() {
-                            write_sched(&mut st.svc_sched, &recs);
+                            write_sched_if_leader(
+                                &mut st.svc_sched,
+                                &mut st.pending,
+                                &mut st.table_last,
+                                &recs,
+                                is_leader,
+                            );
                         }
                     }
                     if one_frame {
@@ -875,7 +985,7 @@ pub(crate) fn check_node_instance(cnc: &CncPage, attached: u128, streak: &mut u8
 
 #[cfg(test)]
 mod tests {
-    use super::check_node_instance;
+    use super::{MSG_V2_SCHED, NODE_FLAG_LEADER, SchedOp, SchedRecord, check_node_instance};
     use crate::traits::ApplyCtx;
     use std::sync::Arc;
     use uc_log::cnc::{CncMeta, CncPage};
@@ -962,6 +1072,174 @@ mod tests {
             .prefix("uc2-apply-lagk")
             .tempdir_in(base)
             .unwrap()
+    }
+
+    // ------------------- Cluster-FSM spec §4.9 Task 7: leader-only timer heap
+
+    /// A tiny test SM whose `apply` parses `"schedule <id> @ <ns>"` and calls
+    /// `ctx.schedule`. Deliberately does NOT override `pending_timers`/
+    /// `table_delivered` — the bare-SM case `ApplyState::pending`/
+    /// `table_last` exist for.
+    #[derive(Default)]
+    struct TimerySm {
+        last: Option<u64>,
+    }
+
+    impl crate::traits::RawStateMachine for TimerySm {
+        const NAME: &'static str = "timery";
+        fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], _out: &mut Vec<u8>) {
+            self.last = Some(ctx.position);
+            let s = std::str::from_utf8(cmd).expect("test payload is ASCII");
+            let rest = s
+                .strip_prefix("schedule ")
+                .expect("test payload starts with `schedule `");
+            let (id_str, ns_str) = rest
+                .split_once(" @ ")
+                .expect("test payload has the form `schedule <id> @ <ns>`");
+            ctx.schedule(
+                id_str.trim().parse().unwrap(),
+                ns_str.trim().parse().unwrap(),
+            );
+        }
+        fn query(&self, _q: &[u8], _out: &mut Vec<u8>) {}
+        fn last_applied(&self) -> Option<u64> {
+            self.last
+        }
+    }
+
+    /// Build an `ApplyState<S>` over a heap-backed log buffer plus real ring
+    /// files on disk (never `/tmp`), the same shape the `write_sched` tests
+    /// above use. Returns the state, the cnc page (to flip
+    /// `NODE_FLAG_LEADER`), the `svc_sched` consumer half (the node's side),
+    /// and an `Appender` for `append_and_commit`. The `TempDir` must be kept
+    /// alive for the ring files' lifetime.
+    fn apply_state_for_test<S: crate::traits::RawStateMachine>(
+        sm: S,
+    ) -> (
+        super::ApplyState<S>,
+        Arc<CncPage>,
+        uc_protocol::ring::SpscConsumer,
+        uc_log::buffer::Appender,
+        tempfile::TempDir,
+    ) {
+        let dir = scratch();
+        let cnc = page(0x7777);
+        cnc.store_services_declared(0b1);
+        let buffer = std::sync::Arc::new(uc_log::buffer::LogBuffer::new(
+            uc_log::region::Region::heap_zeroed(CAP as usize),
+            std::sync::Arc::clone(&cnc),
+            256,
+        ));
+        let appender = uc_log::buffer::Appender::new(std::sync::Arc::clone(&buffer), 1, 0);
+        let egress_ring =
+            uc_protocol::ring::BroadcastRing::create(&dir.path().join("egress.bc"), 1 << 16, 1024)
+                .unwrap();
+        let (_qp, svc_query) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_query.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let (svc_sched, sched_consumer) =
+            uc_protocol::ring::SpscRing::create(&dir.path().join("svc_sched.ring"), 1 << 16, 1024)
+                .unwrap()
+                .into_split();
+        let st = super::ApplyState {
+            poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            follower: uc_log::reader::LogFollower::new(std::sync::Arc::clone(&buffer), 0),
+            sm: Arc::new(std::sync::Mutex::new(sm)),
+            cnc: Arc::clone(&cnc),
+            egress: crate::egress::Egress::new(egress_ring.producer()),
+            resp_buf: Vec::new(),
+            journal_dir: dir.path().join("journal"),
+            svc_query,
+            svc_sched,
+            announce_pending: false,
+            was_leader: false,
+            pending: std::collections::HashMap::new(),
+            table_last: std::collections::HashMap::new(),
+            needs_replay: false,
+            replay_wait: None,
+            instance_id: 0x7777,
+            instance_mismatch_streak: 0,
+            my_epoch: 1,
+            service_id: 0,
+            lag_mode: crate::lag::LagMode::Off,
+            declared: 0b1,
+            lag_waiting: false,
+            snapshot_trigger: None,
+            snapshot_restore: None,
+        };
+        (st, cnc, sched_consumer, appender, dir)
+    }
+
+    /// Append `payloads` as `MESSAGE` frames and advance `durable`/`commit`
+    /// to the new head — the same "no real archive needed" shortcut
+    /// `a_bounded_cap_mid_frame_counts_one_lag_wait_per_episode` (below)
+    /// uses.
+    fn append_and_commit(
+        appender: &mut uc_log::buffer::Appender,
+        cnc: &CncPage,
+        payloads: &[&[u8]],
+    ) {
+        for p in payloads {
+            appender.append(1, 0, p).unwrap();
+        }
+        let head = appender.position();
+        cnc.counters().durable.store_release(head);
+        cnc.counters().commit.store_release(head);
+    }
+
+    /// Drain every `MSG_V2_SCHED` record currently on the ring.
+    fn drain_all(consumer: &mut uc_protocol::ring::SpscConsumer) -> Vec<SchedRecord> {
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(hdr) = consumer.try_read(&mut buf).unwrap() {
+            assert_eq!(
+                hdr.msg_type, MSG_V2_SCHED,
+                "only MSG_V2_SCHED belongs on this ring"
+            );
+            out.push(uc_protocol::v2::ipc::read_sched_record(&buf).expect("a well-formed record"));
+        }
+        out
+    }
+
+    /// Cluster-FSM spec §4.9: a follower must never write the `svc_sched`
+    /// ring — `write_sched` spins forever on a full one, the load-bearing
+    /// reason the service must gate every write on its own leader flag.
+    /// Records are still tracked in the loop's `pending` map regardless of
+    /// role, and flushed to the node on the rising edge to leader.
+    #[test]
+    fn a_follower_never_writes_the_sched_ring_and_announces_on_the_leader_edge() {
+        let (mut st, cnc, mut sched_consumer, mut appender, _dir) =
+            apply_state_for_test(TimerySm::default());
+        cnc.status().flags.store_release(0); // follower
+        append_and_commit(&mut appender, &cnc, &[b"schedule 1 @ 500"]);
+        super::apply_cycle(&mut st);
+        assert!(
+            sched_consumer.try_read(&mut Vec::new()).unwrap().is_none(),
+            "no record on a follower"
+        );
+        assert_eq!(
+            st.pending.get(&1),
+            Some(&500),
+            "tracked in the loop regardless"
+        );
+
+        cnc.status().flags.store_release(NODE_FLAG_LEADER);
+        super::apply_cycle(&mut st); // the rising edge
+        let recs = drain_all(&mut sched_consumer);
+        assert!(
+            recs.iter()
+                .any(|r| r.op == SchedOp::Schedule && r.timer_id == 1 && r.deadline_ns == 500),
+            "announced on the edge: {recs:?}"
+        );
+
+        append_and_commit(&mut appender, &cnc, &[b"schedule 2 @ 600"]);
+        super::apply_cycle(&mut st);
+        let recs = drain_all(&mut sched_consumer);
+        assert!(
+            recs.iter().any(|r| r.timer_id == 2),
+            "written directly once leader"
+        );
     }
 
     // ------------------- nightly 33488022809: replay must WAIT for a covering artifact
@@ -1058,6 +1336,9 @@ mod tests {
             svc_query,
             svc_sched,
             announce_pending: false,
+            was_leader: false,
+            pending: std::collections::HashMap::new(),
+            table_last: std::collections::HashMap::new(),
             needs_replay: false,
             replay_wait: None,
             instance_id: 0x5151,
@@ -1150,6 +1431,9 @@ mod tests {
             svc_query,
             svc_sched,
             announce_pending: false,
+            was_leader: false,
+            pending: std::collections::HashMap::new(),
+            table_last: std::collections::HashMap::new(),
             needs_replay: false,
             replay_wait: None,
             instance_id: 0x1234,

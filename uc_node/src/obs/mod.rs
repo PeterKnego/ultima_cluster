@@ -46,8 +46,8 @@ pub struct ObsSources {
     pub receiver: Arc<uc_net::receiver::FollowerStats>,
     pub truncations: Arc<AtomicU64>,
     pub wipes: Arc<AtomicU64>,
-    /// Time-and-timers §6: per-row `fired`/`late`/`rearmed` counters, the
-    /// SAME allocation the consensus agent bumps.
+    /// Time-and-timers §6: per-row `fired`/`late` counters, the SAME
+    /// allocation the consensus agent bumps.
     pub timer_stats: Arc<crate::timers::TimerStats>,
     /// Time-and-timers plan 2 (§6): the adopted schedule table's frame-END
     /// position (0 = none) and its entry count, published by the consensus

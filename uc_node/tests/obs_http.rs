@@ -352,7 +352,6 @@ fn timer_and_log_time_families_are_in_the_contract() {
         "uc2_timers_pending",
         "uc2_timers_fired_total",
         "uc2_timers_late_total",
-        "uc2_timers_rearmed_total",
         "uc2_log_time_ns",
         "uc2_log_time_lag_seconds",
     ] {
