@@ -61,9 +61,12 @@ pub fn read_committed_table(instance_dir: &Path) -> io::Result<(u64, ScheduleTab
 /// `uc2ctl settings show`'s reader (plan 1 task 8): the settings this
 /// instance directory's newest CLUSTER ARTIFACT holds, as `Some((position,
 /// settings))` — `position` is [`ClusterState::applied`], "the view's
-/// position tag and the artifact's position" (there is no separate
-/// per-settings position field the way `table_position` tracks the schedule
-/// table specifically). `None` when there is no artifact yet — the SAME
+/// position tag and the artifact's position", i.e. how FRESH this reading is.
+/// Deliberately not [`ClusterState::settings_position`] (which does exist, and
+/// is what `/metrics` exports as `uc2_settings_position`): that one answers
+/// "which command set these", a different question, and `settings show`'s
+/// contract is the artifact's own stamp — the same one `schedule show` and
+/// `status` print. `None` when there is no artifact yet — the SAME
 /// staleness caveat as [`read_committed_table`] applies: this reads the
 /// artifact, not the live view, so it lags a freshly-applied settings record
 /// until every declared row has snapshotted.
