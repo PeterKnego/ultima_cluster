@@ -175,7 +175,15 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Timed<S> {
         let got = self.inner.install_snapshot(position, src)?;
         self.pending = img.pending;
         self.table_last = img.table_last;
-        self.max_pos_seen = Some(got);
+        // Coordinated-snapshot spec §5.2 / ruling P6: `position` is the INSTANT
+        // P — the frame-END of the `SNAPSHOT` frame, an exclusive frontier — so
+        // a user frame normally starts exactly AT it. `last_applied()` here is
+        // `max(inner, max_pos_seen)` and the apply loop's guard is
+        // `pos > last_applied()`, so seeding this with `got` (== P) would make
+        // every `Timed<S>` service silently SKIP the first frame above the
+        // instant. Take the inner SM's restored cursor instead; `got` is only
+        // the resume point, and it is still what this returns.
+        self.max_pos_seen = self.inner.last_applied();
         Ok(got)
     }
 }

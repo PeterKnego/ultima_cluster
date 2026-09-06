@@ -564,3 +564,90 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
     svc2.stop();
     node.stop();
 }
+
+/// Coordinated-snapshot ruling P6. The artifact TAG is a file name, and a name
+/// can lie: a `uc2ctl restore` of a mis-copied backup — or any rename — can
+/// present an artifact built at `P0` as a later `P`. Installing it would leave
+/// every frame in `(P0, P)` unapplied: a SILENT state gap, exactly the class
+/// the reconstruction gap guard exists to fail-stop on, and one no SM-side
+/// payload check can catch (the tag is an exclusive frontier, so the payload's
+/// cursor legitimately sits below it). The framework's 16-byte envelope names
+/// the instant the artifact was really built at, and reconstruction refuses by
+/// name when the two disagree.
+#[test]
+fn a_renamed_artifact_is_refused_by_name_and_a_correct_one_installs() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let app = "rec_mistag";
+    let (node, prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
+    // Node-only commits above the instant, so a wrongly-installed artifact
+    // would visibly lose the frames between the two positions.
+    for i in 4_001..=4_200u32 {
+        write_reg(&prod, i, i as u64);
+    }
+    wait_commit_covers_all(&node);
+
+    let store = uc_service::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+    let (p0, real) = store.newest(u64::MAX).unwrap().expect("an artifact at P0");
+    // The envelope says P0 whatever the file is called.
+    let head = std::fs::read(&real).unwrap();
+    assert_eq!(
+        uc_service::snapshots::decode_snapshot_envelope(&head),
+        Ok(p0),
+        "the artifact carries UC's envelope naming its own instant"
+    );
+
+    // Rename it to claim a LATER position — the newest artifact `newest()`
+    // will now pick, above the purge floor, so reconstruction reaches for it.
+    let liar = real.with_file_name(format!("snap-{}.ultsnap", p0 + 64));
+    std::fs::rename(&real, &liar).unwrap();
+
+    // The refusal lands on the apply thread's first below-floor cycle, so
+    // capture it the way `gap_without_snapshot_capability_fails_stop_with_named_contract`
+    // does: a scoped panic hook over this test's window.
+    PANIC_LOG.lock().unwrap().clear();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        PANIC_LOG.lock().unwrap().push(info.to_string());
+    }));
+    let svc_bad = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), RegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let fired = loop {
+        if PANIC_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("MistaggedSnapshot"))
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    std::panic::set_hook(prev);
+    assert!(
+        fired,
+        "a renamed artifact must be refused BY NAME, never installed into a gap"
+    );
+    svc_bad.crash();
+
+    // Put the name back: the same artifact now verifies and installs, and the
+    // frames above it replay.
+    std::fs::rename(&liar, &real).unwrap();
+    let svc =
+        uc_service::ServiceBuilder::new(ServiceConfig::new(dir.path(), app), RegisterSm::default())
+            .start_with_snapshots()
+            .unwrap();
+    let cnc = open_cnc(dir.path(), app);
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_reg(&svc),
+        Some(4_200),
+        "install + tail replay: nothing between P0 and the frontier was lost"
+    );
+    svc.stop();
+    node.stop();
+}

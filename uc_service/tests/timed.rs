@@ -212,3 +212,50 @@ fn snapshot_round_trip_preserves_pending_and_delivery_decisions() {
         "consumed instance dropped after snapshot install"
     );
 }
+
+/// Coordinated-snapshot ruling P6. The artifact tag is the INSTANT **P** — the
+/// frame-END of the `SNAPSHOT` frame, an EXCLUSIVE frontier — so a user frame
+/// normally starts exactly AT it. `Timed` reports
+/// `last_applied() = max(inner, max_pos_seen)`, and the apply loop's
+/// idempotency guard is `pos > last_applied()`: seeding `max_pos_seen` from
+/// the install's RETURN (which is P) made every `Timed<S>` service silently
+/// swallow the first frame above the instant — the same one-command loss the
+/// bare-SM case showed as 4199-instead-of-4200.
+#[test]
+fn an_install_at_an_instant_does_not_swallow_the_frame_that_starts_at_it() {
+    // 64: the last user frame. 64..96 would be the `SNAPSHOT` frame, so P = 96
+    // and the NEXT user frame starts at exactly 96.
+    const P: u64 = 96;
+    let mut t = Timed::new(Rec::default());
+    t.apply(&mut ctx(64, 100), b"s7@500", &mut Vec::new());
+    let (handle, pos) = t.freeze().unwrap();
+    assert_eq!(
+        pos, 64,
+        "the SM's own cursor sits strictly below the instant"
+    );
+    let mut bytes = Vec::new();
+    Timed::<Rec>::stream_snapshot(handle, &mut bytes).unwrap();
+
+    let mut t2 = Timed::new(Rec::default());
+    assert_eq!(
+        t2.install_snapshot(P, &mut &bytes[..]).unwrap(),
+        P,
+        "the return value is the resume point — the instant"
+    );
+    assert_eq!(
+        t2.last_applied(),
+        Some(64),
+        "the cursor the artifact recorded, never the tag"
+    );
+    assert!(
+        Some(P) > t2.last_applied(),
+        "the apply loop's `pos > last_applied()` guard must let the frame at P through"
+    );
+
+    t2.apply(&mut ctx(P, 100), b"s9@700", &mut Vec::new());
+    assert_eq!(
+        t2.pending(),
+        vec![(7, 500), (9, 700)],
+        "the frame starting at P was applied, exactly once"
+    );
+}

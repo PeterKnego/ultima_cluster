@@ -1479,6 +1479,36 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
     ]
 }
 
+/// `uc_service_snapshot_envelope` — the 16-byte artifact envelope every
+/// `snap-<pos>.ultsnap` starts with (coordinated-snapshot ruling P6): the
+/// well-formed header, and the three refusals the decoder owes — empty, one
+/// byte short, and wrong magic — plus a header with a payload behind it (the
+/// shape every real install path reads).
+pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
+    use uc_service::snapshots::write_snapshot_envelope;
+
+    fn envelope(pos: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        write_snapshot_envelope(&mut v, pos).expect("a Vec never fails");
+        v
+    }
+
+    let ok = envelope(4096);
+    let short = ok[..ok.len() - 1].to_vec();
+    let mut bad_magic = ok.clone();
+    bad_magic[0] ^= 0xFF;
+    let mut with_payload = envelope(1 << 40);
+    with_payload.extend_from_slice(b"state machine bytes");
+
+    vec![
+        Seed::fixed("01-envelope", ok),
+        Seed::fixed("02-empty", Vec::new()),
+        Seed::fixed("03-one-byte-short", short),
+        Seed::fixed("04-bad-magic", bad_magic),
+        Seed::fixed("05-envelope-plus-payload", with_payload),
+    ]
+}
+
 /// `uc_protocol_settings` — the replicated settings record (cluster-FSM spec
 /// §6): the genesis default, a non-default encoding, and the three refusals
 /// the decoder owes: a wrong length, an unknown version, an unknown target.

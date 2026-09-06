@@ -116,8 +116,29 @@ pub(crate) fn replay_into<S: RawStateMachine>(
             (Some(r), Some((s_pos, path))) if s_pos >= first => {
                 let mut file =
                     std::fs::File::open(&path).map_err(|e| ServiceError::Replay(e.to_string()))?;
+                // Ruling P6, BEFORE a byte reaches the state machine: strip and
+                // check the framework's 16-byte envelope. The file NAME is what
+                // `newest` picked `s_pos` from, and a name is only a name — a
+                // `uc2ctl restore` of a mis-copied backup, or any rename, can
+                // present an artifact built at `P0` as `P`, and installing it
+                // would leave `(P0, P)` unapplied. That is a silent state gap,
+                // so it is a NAMED refusal here rather than an install. The
+                // joiner path lands here too: the receiver writes the shipped
+                // bytes verbatim under `snapshots/<row>/`, so the artifact a
+                // snapshot session produced carries the shipper's envelope and
+                // is checked by this same line.
+                crate::snapshots::verify_snapshot_envelope(&mut file, s_pos).map_err(|e| {
+                    ServiceError::MistaggedSnapshot {
+                        path: path.display().to_string(),
+                        source: e,
+                    }
+                })?;
                 let installed = (r.install)(&mut guard, s_pos, &mut file)
                     .map_err(|e| ServiceError::Replay(format!("snapshot install: {e}")))?;
+                // A self-check on the TRAIT contract ("returns the post-install
+                // position, which MUST equal `position`"), not on the artifact:
+                // the mis-tag guarantee is the envelope check above, which is
+                // the framework's and cannot be weakened by an SM.
                 debug_assert_eq!(installed, s_pos, "install must land at the artifact's tag");
                 // The SM is now at `installed`; tail replay continues from there.
                 // (`installed >= first`, so the journal's retained tail is a
@@ -161,14 +182,16 @@ pub(crate) fn replay_into<S: RawStateMachine>(
         }
     }
 
-    // Skip whole segment FILES entirely below what the SM has already applied:
-    // replay only dispatches frames with `pos > last_applied`, so a segment
-    // whose records all end at/below `last_applied` contributes nothing. This is
-    // pure perf plumbing — `scan_from` still yields the COVERING segment (the
-    // one holding `last_applied`) and the per-frame `> last_applied` skip below
-    // is unchanged, so the applied set and the returned `cursor` are identical
-    // to the old full `scan`; only the wasted re-read of purged/applied leading
-    // segments is removed (the O(journal)-per-overrun M5 carry).
+    // Skip whole segment FILES entirely below what the SM has already applied.
+    // Replay only dispatches frames with `pos > last_applied`, so a segment
+    // whose records all end at or below `last_applied` contributes nothing.
+    //
+    // This is pure perf plumbing. `scan_from` still yields the COVERING segment
+    // (the one holding `last_applied`), and the per-frame `> last_applied` skip
+    // below is unchanged — so the applied set and the returned `cursor` are
+    // identical to the old full `scan`. All that is removed is the wasted
+    // re-read of purged or already-applied leading segments (the
+    // O(journal)-per-overrun M5 carry).
 
     reader
         .scan_from(start_pos, |_seq, base, payload| {

@@ -79,6 +79,11 @@ fn main() -> std::io::Result<()> {
         seeds::uc_node_cluster_artifact(),
     )?;
     write_target(root, "uc_service_session", seeds::uc_service_session())?;
+    write_target(
+        root,
+        "uc_service_snapshot_envelope",
+        seeds::uc_service_snapshot_envelope(),
+    )?;
     write_target(root, "uc_node_toml", seeds::uc_node_toml())?;
     write_target(root, "uc_gateway_toml", seeds::uc_gateway_toml())?;
     write_target(root, "uc_node_http", seeds::uc_node_http())?;

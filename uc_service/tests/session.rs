@@ -492,3 +492,57 @@ fn a_snapshot_claiming_a_huge_blob_is_refused_without_allocating_it() {
         "unexpected error: {err}"
     );
 }
+
+/// Coordinated-snapshot ruling P6, `Timed`'s twin. `Sessioned` reports
+/// `last_applied() = max(max_pos_seen, inner)`, so seeding `max_pos_seen` from
+/// the install's return (the instant P, an EXCLUSIVE frontier) made the apply
+/// loop's `pos > last_applied()` guard swallow the client frame that starts at
+/// P — a silent one-command loss in every `Sessioned<S>` service.
+#[test]
+fn an_install_at_an_instant_does_not_swallow_the_frame_that_starts_at_it() {
+    // 200: the last client frame. 200..232 would be the `SNAPSHOT` frame, so
+    // P = 232 and the next client frame starts at exactly 232.
+    const P: u64 = 232;
+    let mut s = sm(4, 16);
+    let mut out = Vec::new();
+    s.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(200),
+        &env(9, 1, &Cmd::Write(42)),
+        &mut out,
+    );
+    let (handle, pos) = s.freeze().unwrap();
+    assert_eq!(
+        pos, 200,
+        "the inner SM's own cursor sits strictly below the instant"
+    );
+    let mut img = Vec::new();
+    <Sessioned<RegisterSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut img).unwrap();
+
+    let mut fresh = sm(4, 16);
+    assert_eq!(
+        fresh.install_snapshot(P, &mut img.as_slice()).unwrap(),
+        P,
+        "the return value is the resume point — the instant"
+    );
+    assert_eq!(
+        fresh.last_applied(),
+        Some(200),
+        "the cursor the artifact recorded, never the tag"
+    );
+    assert!(
+        Some(P) > fresh.last_applied(),
+        "the apply loop's `pos > last_applied()` guard must let the frame at P through"
+    );
+
+    out.clear();
+    fresh.apply(
+        &mut ctx_for::<Sessioned<RegisterSm>>(P),
+        &env(9, 2, &Cmd::Cas { old: 42, new: 43 }),
+        &mut out,
+    );
+    assert_eq!(
+        resp(&out),
+        (TAG_FRESH, Some(CmdResp::CasResult(true))),
+        "the frame starting at P was applied, exactly once"
+    );
+}

@@ -1327,6 +1327,65 @@ fn verify_reports_a_hole_for_the_id_whose_snapshot_is_missing() {
     // the Hole is reported first (coverage before cross-check, as today).
 }
 
+/// Coordinated-snapshot ruling P6: `verify_artifact` checks every row
+/// artifact's 16-byte UC envelope against the position its NAME claims — the
+/// same bytes the service's reconstruction path verifies before it installs.
+/// A name is only a name: a mis-copied backup, or any rename, can present an
+/// artifact built at `P0` under a later `P`, and installing it would leave
+/// every frame in `(P0, P)` unapplied. Verify must catch that here, before an
+/// operator restores it and finds out on a live node.
+#[test]
+fn verify_refuses_a_row_artifact_whose_envelope_disagrees_with_its_name() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "mistag";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 500);
+    let store = SnapshotStore::open(&dir, 0).expect("open snapshot store");
+    let pos = node.counters().durable.load_acquire();
+    store
+        .publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
+        .expect("publish snapshot");
+    node.stop();
+
+    let out = root.path().join("mistag-out");
+    backup_instance(&dir, &out).expect("backup_instance");
+    verify_artifact(&out).expect("the untouched artifact verifies");
+
+    // Rename the row artifact so its name claims a later instant than the
+    // envelope inside it.
+    let from = out
+        .join("snapshots")
+        .join("0")
+        .join(format!("snap-{pos}.ultsnap"));
+    let to = out
+        .join("snapshots")
+        .join("0")
+        .join(format!("snap-{}.ultsnap", pos + 64));
+    std::fs::rename(&from, &to).expect("rename the artifact");
+
+    match verify_artifact(&out) {
+        Err(BackupError::SnapshotArtifactCorrupt { path, reason }) => {
+            assert_eq!(path, to);
+            assert!(
+                reason.contains(&format!("built at position {pos}")),
+                "the refusal names both positions: {reason}"
+            );
+        }
+        other => panic!("expected SnapshotArtifactCorrupt, got {other:?}"),
+    }
+
+    // And a truncated artifact is refused by the same check.
+    std::fs::rename(&to, &from).expect("rename back");
+    std::fs::write(&from, b"nope").expect("truncate the artifact");
+    match verify_artifact(&out) {
+        Err(BackupError::SnapshotArtifactCorrupt { .. }) => {}
+        other => panic!("expected SnapshotArtifactCorrupt for a stub file, got {other:?}"),
+    }
+}
+
 // --------------------------------------------------------------------- Test 16
 
 /// The genesis cluster state — the seed `cluster_agent::recover` is handed

@@ -107,10 +107,20 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
         0,
         "no instant commanded yet: no artifact"
     );
+    // Nothing else appends once the submits have returned, so the append
+    // counter right after the instant lands IS P, the SNAPSHOT frame's end.
+    let before_append = cnc.counters().append.load_acquire();
     node.append_snapshot_for_test(0).unwrap();
+    wait_until(|| cnc.counters().append.load_acquire() > before_append);
+    let p = cnc.counters().append.load_acquire();
 
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
     let s = cnc.snapshots().service_snapshot_pos.load_acquire();
+    assert_eq!(
+        s, p,
+        "the artifact is tagged with the instant P — the SNAPSHOT frame's END, \
+         not the SM's own cursor and not merely 'some applied position'"
+    );
     assert!(
         s <= cnc.service().service_applied.load_acquire(),
         "snapshot at an applied position"

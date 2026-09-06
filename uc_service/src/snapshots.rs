@@ -17,14 +17,31 @@
 //! slot `snapshot_pos`, written by the builder agent, not this module) is
 //! updated only AFTER `publish` returns `Ok`.
 //!
-//! **Retention.** After a successful publish, `publish` unlinks every snapshot
-//! file except the newest 2 (by position) — keep-newest-2, not keep-last-N-by-
-//! mtime, so retention is correct even if publishes ever raced (they don't:
-//! the builder thread is single-threaded and one-in-flight, but the retention
-//! rule itself doesn't depend on that for correctness).
+//! **The envelope** (coordinated-snapshot ruling P6). Every file this module
+//! writes starts with 16 framework-owned bytes — [`SNAPSHOT_ENVELOPE_MAGIC`]
+//! then the position `P` it was built at, LE — ahead of the state machine's
+//! own bytes. UC prescribes no payload encoding, but it does own the header,
+//! and that is what makes a MIS-TAGGED artifact detectable: the file name is
+//! just a name (a `uc2ctl restore` of a mis-copied backup, or any rename, can
+//! make an artifact built at `P0` claim `P`), and installing an older image
+//! under a newer tag leaves a silent state gap — the exact bug class the
+//! reconstruction gap guard exists to prevent. The SM's own payload-position
+//! check cannot catch it, because the tag is an EXCLUSIVE frontier and the
+//! payload's cursor legitimately sits below it (see
+//! [`crate::SnapshotStateMachine::install_snapshot`]). So the framework checks
+//! the envelope on every install path, and the SM's check stays as
+//! belt-and-suspenders.
+//!
+//! **Retention.** `publish` does NOT prune (coordinated-snapshot spec §5.3,
+//! ruling P1): only the NODE can see which artifacts form a complete SET at an
+//! instant, so it owns retention — keeping the newest complete set plus
+//! anything newer. A per-writer keep-newest-N here would happily delete the
+//! artifact at the floor once two later instants were abandoned, and the ship
+//! gate would then decline `MISSING` forever. [`SnapshotStore::retain_newest`]
+//! remains for the node-side pruner.
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::SnapshotError;
@@ -32,6 +49,86 @@ use crate::config::SnapshotError;
 const DIR_NAME: &str = "snapshots";
 const PREFIX: &str = "snap-";
 const SUFFIX: &str = ".ultsnap";
+
+/// The framework-owned artifact header: 8 magic bytes then `P` as `u64` LE.
+/// Written by [`SnapshotStore::publish`], stripped and verified by every
+/// install path (module doc, ruling P6).
+pub const SNAPSHOT_ENVELOPE_LEN: usize = 16;
+
+/// The envelope's magic. `1` is the envelope's own layout version — the
+/// artifact's PAYLOAD is versioned by the state machine, never by UC.
+pub const SNAPSHOT_ENVELOPE_MAGIC: &[u8; 8] = b"ULTSNAP1";
+
+/// Why an artifact's 16-byte envelope did not verify. All three are refusals,
+/// never silent: an artifact that fails any of them is not installed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EnvelopeError {
+    /// Fewer than [`SNAPSHOT_ENVELOPE_LEN`] bytes — a truncated or empty file
+    /// (or one written by something that is not UC).
+    #[error(
+        "truncated artifact: {0} bytes, need {len} for the envelope",
+        len = SNAPSHOT_ENVELOPE_LEN
+    )]
+    Short(usize),
+    /// The first 8 bytes are not [`SNAPSHOT_ENVELOPE_MAGIC`].
+    #[error("not a UC snapshot artifact: magic {0:02x?}, expected {SNAPSHOT_ENVELOPE_MAGIC:?}")]
+    BadMagic([u8; 8]),
+    /// The envelope verified but names a DIFFERENT instant than the caller
+    /// asked to land at — a renamed, mis-copied or stale artifact. Installing
+    /// it would leave every frame in `(built, presented)` unapplied.
+    #[error("artifact was built at position {built} but is presented as {presented}")]
+    Mistagged { built: u64, presented: u64 },
+}
+
+/// Decode the 16-byte envelope at the head of an artifact, returning the
+/// position it was built at. A **pure** decoder — no I/O, no allocation, total
+/// on any slice (fuzz target `uc_service_snapshot_envelope`).
+pub fn decode_snapshot_envelope(bytes: &[u8]) -> Result<u64, EnvelopeError> {
+    let Some(head) = bytes.get(..SNAPSHOT_ENVELOPE_LEN) else {
+        return Err(EnvelopeError::Short(bytes.len()));
+    };
+    let magic: [u8; 8] = head[..8].try_into().expect("8 bytes");
+    if &magic != SNAPSHOT_ENVELOPE_MAGIC {
+        return Err(EnvelopeError::BadMagic(magic));
+    }
+    Ok(u64::from_le_bytes(head[8..16].try_into().expect("8 bytes")))
+}
+
+/// Write the envelope for an artifact built at `pos`.
+pub fn write_snapshot_envelope(dst: &mut dyn Write, pos: u64) -> io::Result<()> {
+    dst.write_all(SNAPSHOT_ENVELOPE_MAGIC)?;
+    dst.write_all(&pos.to_le_bytes())
+}
+
+/// Read the envelope off the front of `src` and check it names `expected`,
+/// leaving the reader positioned at the state machine's first payload byte —
+/// the one call every install path makes before handing the stream to
+/// [`crate::SnapshotStateMachine::install_snapshot`].
+///
+/// Reads with a short-read loop rather than `read_exact` so a truncated file
+/// is [`EnvelopeError::Short`] (a named refusal) instead of an opaque
+/// `UnexpectedEof`.
+pub fn verify_snapshot_envelope(src: &mut dyn Read, expected: u64) -> Result<(), EnvelopeError> {
+    let mut buf = [0u8; SNAPSHOT_ENVELOPE_LEN];
+    let mut n = 0usize;
+    while n < SNAPSHOT_ENVELOPE_LEN {
+        match src.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            // An I/O error mid-header is indistinguishable from a short file
+            // for this decision, and both are refusals.
+            Err(_) => break,
+        }
+    }
+    let built = decode_snapshot_envelope(&buf[..n])?;
+    if built != expected {
+        return Err(EnvelopeError::Mistagged {
+            built,
+            presented: expected,
+        });
+    }
+    Ok(())
+}
 
 /// Owns the `instance_dir/snapshots` directory: position-tagged file naming,
 /// atomic publish, and keep-newest-2 retention. Cheap to construct — no open
@@ -106,6 +203,12 @@ impl SnapshotStore {
         let tmp_path = self.tmp_path_for(pos);
         let result = (|| -> Result<(), SnapshotError> {
             let mut f = File::create(&tmp_path)?;
+            // Ruling P6: the framework's 16 bytes go first, ahead of the state
+            // machine's own. This is the ONE write site for a
+            // `snap-<pos>.ultsnap`, so "every artifact on disk carries an
+            // envelope naming its instant" is an invariant of this module
+            // rather than a convention its callers have to remember.
+            write_snapshot_envelope(&mut f, pos)?;
             write(&mut f)?;
             f.sync_all()?;
             Ok(())
@@ -175,6 +278,44 @@ mod tests {
         }
     }
 
+    /// Ruling P6: the pure decoder is total, and every refusal is named.
+    #[test]
+    fn the_envelope_decodes_round_trip_and_refuses_short_bad_magic_and_a_mis_tag() {
+        let mut buf = Vec::new();
+        write_snapshot_envelope(&mut buf, 4096).unwrap();
+        assert_eq!(buf.len(), SNAPSHOT_ENVELOPE_LEN);
+        assert_eq!(decode_snapshot_envelope(&buf), Ok(4096));
+
+        assert_eq!(decode_snapshot_envelope(&[]), Err(EnvelopeError::Short(0)));
+        assert_eq!(
+            decode_snapshot_envelope(&buf[..15]),
+            Err(EnvelopeError::Short(15))
+        );
+        let mut bad = buf.clone();
+        bad[0] ^= 0xFF;
+        assert!(matches!(
+            decode_snapshot_envelope(&bad),
+            Err(EnvelopeError::BadMagic(_))
+        ));
+
+        // The case the envelope exists for: an artifact built at 4096 renamed
+        // to claim a later instant.
+        let mut src = buf.as_slice();
+        assert_eq!(
+            verify_snapshot_envelope(&mut src, 8192),
+            Err(EnvelopeError::Mistagged {
+                built: 4096,
+                presented: 8192
+            })
+        );
+        // And a trailing payload is left for the state machine, untouched.
+        let mut with_payload = buf.clone();
+        with_payload.extend_from_slice(b"sm bytes");
+        let mut src = with_payload.as_slice();
+        verify_snapshot_envelope(&mut src, 4096).unwrap();
+        assert_eq!(src, b"sm bytes");
+    }
+
     #[test]
     fn publish_creates_the_pinned_file_name_and_newest_finds_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -182,7 +323,13 @@ mod tests {
         let path = store.publish(4096, ok_write(b"hello")).unwrap();
         assert_eq!(path, store.path_for(4096));
         assert!(path.ends_with("snap-4096.ultsnap"));
-        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        // Ruling P6: the file is UC's 16-byte envelope, then the SM's bytes.
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[SNAPSHOT_ENVELOPE_LEN..], b"hello");
+        assert_eq!(decode_snapshot_envelope(&raw), Ok(4096));
+        let mut src = raw.as_slice();
+        verify_snapshot_envelope(&mut src, 4096).expect("verifies at its own P");
+        assert_eq!(src, b"hello", "the reader is left at the payload");
 
         let (pos, found) = store
             .newest(u64::MAX)

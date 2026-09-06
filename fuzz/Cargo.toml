@@ -187,6 +187,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "uc_service_snapshot_envelope"
+path = "fuzz_targets/uc_service_snapshot_envelope.rs"
+test = false
+doc = false
+bench = false
+
 # one [[bin]] per target.
 
 [workspace]

@@ -58,6 +58,20 @@ pub enum ServiceError {
          machine cannot install a covering snapshot"
     )]
     SnapshotRequired { needed: u64, first_available: u64 },
+    /// Coordinated-snapshot ruling P6: an on-disk snapshot artifact's
+    /// framework envelope does not verify — it is truncated, is not a UC
+    /// artifact at all, or (the case this exists for) names a DIFFERENT
+    /// instant than the file name claims. A renamed or mis-copied artifact
+    /// installed under a newer tag would leave every frame between the two
+    /// positions unapplied — a silent state gap, the class
+    /// [`SnapshotRequired`](Self::SnapshotRequired) exists to fail-stop on.
+    /// Refuse by name instead.
+    #[error("MistaggedSnapshot: {path}: {source}")]
+    MistaggedSnapshot {
+        path: String,
+        #[source]
+        source: crate::snapshots::EnvelopeError,
+    },
     /// FSM identity (spec §4.3): the attaching type's `S::IDENTITY.name` is
     /// not declared on the node's page (`CncPage::row_of` found nothing).
     #[error(

@@ -737,6 +737,14 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
 /// inline into that loop body cost 9 % at N=1 through codegen alone — on a
 /// path N=1 never executes (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
 ///
+/// The freeze runs INSIDE the batch's SM lock span (this is called from the
+/// frames loop, which holds the guard), not in a short span of its own at the
+/// end of the cycle as the M6 byte-trigger did — so this cycle's `applied`
+/// publication is delayed by one freeze. That is the cost spec §5.7/§10 already
+/// state for a non-standby instant: on a quorum it is what stalls commit at
+/// `P + fsm_lag`, and standby instants exist to avoid paying it on voters. Only
+/// the STREAMING must stay off-lock, and it still does (`builder_agent`).
+///
 /// The frame is never *applied*: it carries no user bytes, publishes no
 /// response and does not move `last_applied`. It is still a YIELDED frame —
 /// the caller's `one_frame` break fires after it exactly as it does after a
