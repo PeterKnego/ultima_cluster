@@ -136,6 +136,12 @@ pub const CNC_OFF_ADMIN_REQ: usize = 3584;
 /// Time-and-timers plan 2: replace the leader-serving row's schedule table
 /// (spec §5). Same admin-request line as the reconfiguration ops above.
 pub const ADMIN_OP_SCHEDULE_APPLY: u32 = 6;
+/// Cluster FSM (spec §6): replace the cluster's replicated `Settings` record.
+/// Same admin-request line and the same staged-file + digest shape as
+/// [`ADMIN_OP_SCHEDULE_APPLY`] — the payload (`<instance_dir>/settings.pending`)
+/// is too large for the 64-byte request line, so what the operator signs is
+/// the first 80 bits of its SHA-256, carried in `id ‖ ip ‖ port`.
+pub const ADMIN_OP_SETTINGS_APPLY: u32 = 7;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
 /// version u64 @+16.
@@ -671,6 +677,8 @@ mod tests {
         assert_eq!(CNC_OFF_ADMIN_REQ, 3584);
         // FROZEN: plan-2 admin op, same request line as the reconfiguration ops.
         assert_eq!(ADMIN_OP_SCHEDULE_APPLY, 6);
+        // FROZEN: cluster-FSM settings apply, the same request line again.
+        assert_eq!(ADMIN_OP_SETTINGS_APPLY, 7);
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
         // Post-M7 (0.3.0): admission_bytes.
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);

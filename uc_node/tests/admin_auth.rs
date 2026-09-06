@@ -1251,9 +1251,15 @@ fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
         "a retry is side-effect-free: the staged file survives for the retry"
     );
     assert!(
-        uc_node::read_record(&fdir)
-            .expect("read the record")
-            .is_none(),
+        c.nodes[follower]
+            .node
+            .as_ref()
+            .unwrap()
+            .cluster_view()
+            .snapshot_inner()
+            .table
+            .entries
+            .is_empty(),
         "the follower adopted nothing"
     );
 
@@ -1286,14 +1292,21 @@ fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
         "an accepted apply consumes the staged file, so re-presenting the \
          request cannot append the same table twice"
     );
-    let rec = uc_node::read_record(&dir)
-        .expect("read the record")
-        .expect("the leader adopted the table");
-    assert_eq!(rec.position, resp.version);
-    assert_eq!(
-        rec.table, good,
-        "the record holds the staged bytes verbatim"
-    );
+    // The command travels as a CLUSTER frame and takes effect at COMMIT, so
+    // the leader's committed view catches up a round-trip after the answer.
+    let leader_node = c.nodes[leader].node.as_ref().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while leader_node.cluster_view().snapshot_inner().table_position != resp.version {
+        assert!(
+            Instant::now() < deadline,
+            "the leader never committed the table it appended"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let view = leader_node.cluster_view().snapshot_inner();
+    let mut bytes = Vec::new();
+    encode_schedule_table(&view.table, &mut bytes);
+    assert_eq!(bytes, good, "the committed table is the staged one");
 
     for s in svcs {
         s.stop();

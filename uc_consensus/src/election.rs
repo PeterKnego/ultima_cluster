@@ -1141,7 +1141,7 @@ impl ElectionSm {
     /// Leader-only membership proposal (M7). `slack` = max catch-up gap a
     /// learner may have and still be promoted (the node passes its admission
     /// window). Returns the NEW config for the node to append as a
-    /// FRAME_TYPE_CONFIG frame; adoption happens via the `ConfigObserved` the
+    /// CLUSTER kind=Membership frame; adoption happens via the `ConfigObserved` the
     /// append path feeds back — one adoption path for leader and follower.
     /// The SM does NOT self-adopt here.
     pub fn propose_config(

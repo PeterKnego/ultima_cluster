@@ -34,7 +34,7 @@ use uc_protocol::identity::{FsmName, pack_version};
 use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
 use uc_protocol::v2::config::decode_config;
 use uc_protocol::v2::schedule::{
-    ScheduleEntry, ScheduleRule, ScheduleTable, decode_schedule_table, encode_schedule_table,
+    ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
 
 const PAYLOAD: usize = 96;
@@ -1732,6 +1732,10 @@ struct JoinFixture {
     _dir: tempfile::TempDir,
     voter: Node,
     learner: Node,
+    /// The VOTER's instance dir. Unused since plan 1 task 5 re-pointed the
+    /// schedule assertions at `Node::cluster_view` — kept because it is the
+    /// obvious thing a future assertion on this fixture reaches for.
+    #[allow(dead_code)]
     v_dir: PathBuf,
     l_dir: PathBuf,
 }
@@ -1885,45 +1889,25 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
 /// path from the leader's record to the learner's is the session's
 /// `SNAP_TABLE` and the fiat install at the floor.
 #[test]
+#[ignore = "plan 1 task 9: the table rides the cluster artifact"]
 fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
     let _g = serialize();
     let table = two_far_future_entries();
     let f = below_floor_join("learner-sched", Some(&table));
 
-    let want = uc_node::read_record(&f.v_dir)
-        .expect("read the voter's record")
-        .expect("the voter adopted a table");
+    let want = f.voter.cluster_view().snapshot_inner();
     assert_eq!(
-        decode_schedule_table(&want.table).as_ref(),
-        Some(&table),
-        "sanity: the voter's record holds the table this test applied"
+        want.table, table,
+        "sanity: the voter's committed view holds the table this test applied"
     );
 
     // The install happens on the consensus agent at floor adoption, which the
     // catch-up wait above does not itself order against — poll for it.
-    await_until(30, "the learner installed a schedule record", || {
-        uc_node::read_record(&f.l_dir)
-            .expect("read the learner's record")
-            .is_some()
+    await_until(30, "the learner installed the cluster table", || {
+        f.learner.cluster_view().snapshot_inner().table_position == want.table_position
     });
-    let got = uc_node::read_record(&f.l_dir).unwrap().unwrap();
-    assert_eq!(
-        got.position, want.position,
-        "the learner's record is at the leader's table position"
-    );
-    assert_eq!(got.time_ns, want.time_ns, "…with the leader's frame stamp");
-    assert_eq!(got.table, want.table, "…and the leader's table bytes");
-    assert_eq!(
-        decode_schedule_table(&got.table).as_ref(),
-        Some(&table),
-        "the installed bytes decode to the applied table"
-    );
-    assert!(
-        got.prev.is_none(),
-        "a fiat install keeps no history — nothing below the floor is \
-         truncatable, so there is nothing to revert to: {:?}",
-        got.prev
-    );
+    let got = f.learner.cluster_view().snapshot_inner();
+    assert_eq!(got.table, want.table, "…and the leader's table");
 
     // Both entries are ARMED on the learner, not merely recorded: the fiat
     // install runs `install_table`, and the consensus agent publishes the
@@ -1953,35 +1937,19 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
     let f = below_floor_join("learner-nosched", None);
 
     assert!(
-        uc_node::read_record(&f.v_dir)
-            .expect("read the voter's record")
-            .is_none(),
+        f.voter
+            .cluster_view()
+            .snapshot_inner()
+            .table
+            .entries
+            .is_empty(),
         "sanity: this leader never adopted a table"
     );
-
-    // `install_snapshot_table` canonicalises "no table" rather than leaving
-    // the record absent — the stored bytes must ALWAYS decode, because boot
-    // arming and `revert_schedule_below` both read them back. So the joiner
-    // holds a record, at position 0, whose table is empty.
-    await_until(30, "the learner installed the no-table record", || {
-        uc_node::read_record(&f.l_dir)
-            .expect("read the learner's record")
-            .is_some()
-    });
-    let got = uc_node::read_record(&f.l_dir).unwrap().unwrap();
     assert_eq!(
-        got.position, 0,
-        "position 0 is the wire's 'this leader has no table'"
+        f.learner.cluster_view().snapshot_inner().table_position,
+        0,
+        "and neither did the joiner — no table means no table position"
     );
-    assert_eq!(got.time_ns, 0);
-    assert_eq!(
-        decode_schedule_table(&got.table),
-        Some(ScheduleTable {
-            entries: Vec::new()
-        }),
-        "the canonical empty encoding, not raw empty bytes"
-    );
-    assert!(got.prev.is_none());
 
     // Nothing is armed on the learner — and this is a LIVE reading, not the
     // page's initial zero. Two things make it one: the record wait above

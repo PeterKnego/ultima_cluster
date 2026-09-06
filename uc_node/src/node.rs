@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime};
@@ -37,18 +37,13 @@ use uc_protocol::ring::{
     SpscProducer, SpscRing,
 };
 use uc_protocol::v2::cnc::{
-    ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER,
-    CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
+    ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES,
+    CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
-// TODO(plan 1 task 5): FRAME_TYPE_CONFIG is a deprecated alias for
-// FRAME_TYPE_CLUSTER (kind=Membership); the frame-type DISPATCH callers
-// migrate in task 5 (the append-side callers already moved to
-// `append_cluster`/`ClusterKind::Membership` in task 2).
-#[allow(deprecated)]
 use uc_protocol::v2::frame::{
-    ClusterKind, FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, TimerBody, align_frame_len,
+    ClusterKind, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, TimerBody, align_frame_len,
     read_cluster_prefix,
 };
 use uc_protocol::v2::ipc::{
@@ -58,12 +53,13 @@ use uc_protocol::v2::ipc::{
 };
 
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
-use crate::cluster_fsm::{ClusterState, ClusterView};
+use crate::cluster_fsm::{
+    ClusterCommand, ClusterFsm, ClusterState, ClusterView, ClusterViewInner, SCHEDULE_PENDING_FILE,
+    SETTINGS_PENDING_FILE, staged_digest,
+};
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
-use crate::schedule_state::{SCHEDULE_PENDING_FILE, ScheduleRecord, schedule_digest};
 use crate::services::ServicesConfig;
-use uc_journal::StableValue;
 use uc_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
@@ -77,9 +73,9 @@ use uc_protocol::v2::datagram::{
 };
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule, ScheduleTable,
-    decode_schedule_table, encode_schedule_table,
+    decode_schedule_table,
 };
-use uc_protocol::v2::settings::Settings;
+use uc_protocol::v2::settings::{Settings, decode_settings};
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -181,7 +177,7 @@ pub struct NodeConfig {
     /// M7: this is the SEED config — authoritative only for a FRESH instance
     /// directory (no durable `ConfigRecord` yet). Once a node has booted once,
     /// the durable `ConfigRecord` (`uc_log::state::NodeState::config_record`)
-    /// plus the `FRAME_TYPE_CONFIG` stream own the cluster's actual membership;
+    /// plus the `CLUSTER kind=Membership` stream own the cluster's actual membership;
     /// this field is then ignored (a restart with a stale/edited `members` list
     /// has no effect). A cluster that never appends a config frame behaves
     /// exactly as before M7 — the genesis record IS this seed, verbatim.
@@ -436,6 +432,104 @@ pub const REASON_SCHEDULE_DECODE: u32 = 42;
 /// an unroutable entry is a typo'd or stale FSM name, and silently dropping
 /// that entry would leave the operator believing a timer is armed.
 pub const REASON_SCHEDULE_UNKNOWN_FSM: u32 = 43;
+
+// ---- Cluster FSM: `settings apply` refusal reasons (spec §6) -------------
+// The exact twin of the 40-43 band, for `ADMIN_OP_SETTINGS_APPLY` — the same
+// staged-file + digest pipeline over `<instance_dir>/settings.pending`. Their
+// own numbers rather than a shared band: an operator reading an audit line
+// must be able to tell which op refused without also reading the `op` field.
+/// The staged file's digest does not match the `(id, ip, port)` triple the
+/// request carried (and, under `Hmac`, signed).
+pub const REASON_SETTINGS_DIGEST: u32 = 44;
+/// There is no `<instance_dir>/settings.pending` to read — the request
+/// reached a node the file was never staged on, or it was already consumed.
+pub const REASON_SETTINGS_MISSING: u32 = 45;
+/// The staged bytes are not a decodable `Settings` record
+/// (`decode_settings` is total: exact length, known version, known target).
+pub const REASON_SETTINGS_DECODE: u32 = 46;
+/// The record decodes but `ClusterFsm::validate` refuses it — a field outside
+/// the bounds every replica checks. Produced by
+/// [`crate::cluster_fsm::ClusterRefusal::reason_code`], never by this module,
+/// so the leader's pre-append answer and a replica's apply-time refusal are
+/// the same number by construction.
+pub const REASON_SETTINGS_BOUNDS: u32 = 47;
+
+/// Plan 1 (spec §6): the longest a staged settings file can be. `Settings` is
+/// fixed-width, so this is exact — anything else is refused unread.
+const MAX_SETTINGS_BYTES: u64 = uc_protocol::v2::settings::SETTINGS_LEN as u64;
+
+/// What [`read_staged`] found at a staged admin payload's path.
+enum StagedRead {
+    Bytes(Vec<u8>),
+    /// Absent, or it could not be opened or read at all — the request reached
+    /// a node the file was never staged on, or an earlier apply consumed it.
+    Missing,
+    /// Present but not a regular file, or longer than the op's ceiling. An
+    /// over-long file is not a decodable payload either, so the honest refusal
+    /// is the same one the decoder would give.
+    Unusable,
+}
+
+/// Read a staged admin payload (`schedules.pending`, `settings.pending`) off
+/// the instance directory, bounded by `max_bytes`.
+///
+/// The file is written by anything with instance-dir write access, and this
+/// runs on the CONSENSUS AGENT — an oversized (or non-regular) staged file
+/// must not become a multi-gigabyte read, or a blocking one, on the thread
+/// that drives commit and elections. Three layers, none of them sufficient
+/// alone:
+///
+/// 1. `metadata(path)` BEFORE any open: the cheap, common-case rejection — a
+///    FIFO or an oversized file staged before this call started is refused
+///    without ever opening it.
+/// 2. The open itself is `O_RDONLY | O_NONBLOCK`. A path resolves twice
+///    between the stat above and the open below (anything with instance-dir
+///    write access can swap the name in that window), so the stat alone
+///    cannot promise what `open` will find. Without `O_NONBLOCK`, `open` on a
+///    FIFO with no writer blocks the consensus agent forever (`open(2)`);
+///    `O_NONBLOCK` makes the open on a FIFO return immediately regardless of
+///    writer state, and has no effect on a regular file, so the happy path is
+///    unchanged.
+/// 3. `f.metadata()` — an `fstat` on the HANDLE the open just returned, not a
+///    second `stat` of the path — re-checks `is_file()` and the size bound
+///    against what was actually opened, catching a FIFO (or anything else)
+///    swapped in between steps 1 and 2. `take(max + 1).read_to_end` then
+///    bounds the read regardless of what step 3 missed, so the length check is
+///    a check and not a promise.
+fn read_staged(path: &Path, max_bytes: u64) -> StagedRead {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() <= max_bytes => {}
+        Ok(_) => return StagedRead::Unusable,
+        Err(_) => return StagedRead::Missing,
+    }
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(_) => return StagedRead::Missing,
+    };
+    match f.metadata() {
+        Ok(m) if m.is_file() && m.len() <= max_bytes => {}
+        Ok(_) => return StagedRead::Unusable,
+        Err(_) => return StagedRead::Missing,
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    if (&mut f)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return StagedRead::Missing;
+    }
+    if bytes.len() as u64 > max_bytes {
+        return StagedRead::Unusable;
+    }
+    StagedRead::Bytes(bytes)
+}
 
 /// Phase of an in-flight linearizable read (the ReadIndex barrier state
 /// machine, spec §7 / v1 task14).
@@ -727,10 +821,6 @@ impl Node {
         // advance the floor) and exposed via `Node::archive_first_base` for tests.
         let archive_first_base = Arc::new(AtomicU64::new(archive.first_base()));
         let state = NodeState::open(&instance.state_dir()).map_err(to_io)?;
-        // Plan 2 (spec §5): the adopted schedule table, in its own rotating
-        // two-slot `StableValue` beside the consensus state files — see
-        // `crate::schedule_state` for why it is not a `NodeState` field.
-        let schedule_state = crate::schedule_state::open(&instance.state_dir()).map_err(to_io)?;
 
         // Recovery re-derivation (T4 carry 4): if the persisted term map does not
         // cover the durable journal frontier — a crash after the bytes fsynced
@@ -966,11 +1056,6 @@ impl Node {
         // forwards here; the consensus agent decodes + feeds `Event::ConfigObserved`
         // (do_work step 1c). Same shape/rationale as `obs_tx`/`obs_rx` above.
         let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(1024);
-        // Plan 2 (spec §5): the same shape for durably-recorded SCHEDULE_TABLE
-        // frames, `(frame-END position, frame stamp, payload bytes)` — the
-        // archive detects them in the SAME header walk and
-        // `take_table_observations` forwards them here.
-        let (tbl_obs_tx, tbl_obs_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(1024);
         // Truncation command channel carries `(epoch, to)`; the ack rides an
         // infallible single slot (one truncation in flight — the SM latch).
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
@@ -1065,22 +1150,13 @@ impl Node {
         // stashed by the receiver in `snap_complete` and consumed by the
         // consensus agent's `maybe_adopt_incoming_snapshot`.
         let incoming_snapshot_config = Arc::new(Mutex::new(Vec::new()));
-        // Time-and-timers plan 3 (spec §5): the third companion cell — the
-        // schedule table the same completed transfer carried (`SNAP_TABLE`'s
-        // `(position, time_ns, bytes)`), stashed by the receiver BEFORE it
-        // publishes the floor and consumed by the same install handler.
+        // The receiver's `SNAP_TABLE` landing cell. WRITE-ONLY in the task
+        // 5→9 window (Ruling R4): the receive side of the session is
+        // untouched until task 9, so the receiver still stashes whatever the
+        // sender carried here — and every sender in this window carries the
+        // wire's honest "no table". Nothing reads it; task 9 replaces both
+        // ends with the cluster artifact.
         let incoming_snapshot_table: ScheduleTableCell = Arc::new(Mutex::new((0, 0, Vec::new())));
-        // Plan 3: the snapshot-session table-carry cache — the twin of
-        // `config_bytes`, holding whatever table this node has ADOPTED
-        // (`refresh_schedule_ship`, called wherever the adopted table
-        // changes). Read by the sender's `SnapshotSource` closure at ship
-        // time, through the commit gate `shippable_schedule`. Seeded with no
-        // record — the honest "this node has no table" — and filled by
-        // `arm_schedule_at_boot` below when this node has one.
-        let schedule_ship = Arc::new(Mutex::new(ScheduleShip {
-            rec: None,
-            known_committed: false,
-        }));
         // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
         // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
         // around a DATA datagram to detect a prime that straddled its processing and
@@ -1102,10 +1178,6 @@ impl Node {
         // ships whatever config is CURRENT at the moment a peer's NAK opens a
         // session, never a boot-time snapshot of it.
         let src_config_bytes = Arc::clone(&config_bytes);
-        // Plan 3: the same cell `refresh_schedule_ship` writes — the table
-        // that is CURRENT when a peer's NAK opens the session, never a
-        // boot-time snapshot of it.
-        let src_schedule_ship = Arc::clone(&schedule_ship);
         let src_id = cfg.id;
         sender.set_snapshot_source(Arc::new(move || {
             snapshot_set_for(
@@ -1113,7 +1185,6 @@ impl Node {
                 &src_root,
                 &src_services,
                 &src_config_bytes,
-                &src_schedule_ship,
                 src_id,
                 &src_decline_reason,
             )
@@ -1416,25 +1487,6 @@ impl Node {
                 }
                 did = true;
             }
-            // Plan 2 (spec §5): SCHEDULE_TABLE observations ride the same
-            // discipline for the same reason — a table frame is rarer than a
-            // config change (an operator action), observed exactly once on the
-            // recording pass, and a dropped observation would leave a FOLLOWER
-            // holding no table at all until its next restart. Blocking send;
-            // a send error means the receiver is gone (shutdown).
-            //
-            // TODO(plan 1 task 5): `take_table_observations` is a deprecated
-            // shim (plan 1 task 2) that always returns empty now — the table
-            // travels as a `CLUSTER kind=ScheduleTable` frame with no separate
-            // observation feed. This loop is a no-op until task 5 reroutes
-            // follower table adoption through the cluster FSM's own apply path.
-            #[allow(deprecated)]
-            for obs in archive.take_table_observations() {
-                if tbl_obs_tx.send(obs).is_err() {
-                    break;
-                }
-                did = true;
-            }
             did
         })?;
 
@@ -1504,7 +1556,6 @@ impl Node {
             obs_frontier: cons_obs_frontier,
             pending_obs: Vec::new(),
             pending_cfg_obs: Vec::new(),
-            pending_tbl_obs: Vec::new(),
             trace_prov: cons_trace_prov,
             trunc_trace,
             id: cfg.id,
@@ -1544,6 +1595,9 @@ impl Node {
             next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: cfg.admission_bytes_default,
+            admission_bytes_default: cfg.admission_bytes_default,
+            buffer_bytes: cfg.buffer_bytes as u64,
+            max_payload: cfg.max_payload,
             fsm_lag_eff,
             pending_ring_ingress: None,
             last_holes_published: (0, 0),
@@ -1558,14 +1612,14 @@ impl Node {
             net_rx,
             obs_rx,
             cfg_obs_rx,
-            tbl_obs_rx,
+            view_position_seen: 0,
+            last_cluster_append: 0,
             schedule_position: 0,
-            schedule_state,
             schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
+            settings_pending: instance.root.join(SETTINGS_PENDING_FILE),
             schedule_pos_pub: Arc::clone(&schedule_pos_pub),
             schedule_entries_pub: Arc::clone(&schedule_entries_pub),
             schedule_refused: Arc::clone(&schedule_refused),
-            schedule_ship: Arc::clone(&schedule_ship),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -1597,7 +1651,6 @@ impl Node {
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::clone(&incoming_snapshot),
             incoming_snapshot_config: Arc::clone(&incoming_snapshot_config),
-            incoming_snapshot_table: Arc::clone(&incoming_snapshot_table),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
@@ -1635,13 +1688,16 @@ impl Node {
             cluster_view: Arc::clone(&cluster_view),
             cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
         };
-        // Plan 2 (spec §5): re-arm the persisted schedule table BEFORE the
-        // consensus agent starts. The log-time word is already seeded from the
-        // journal (step 3 above), no service has attached, and no election can
-        // have been won — so a node that restarts and immediately becomes
-        // leader fires the catch-up tick from the LOG's clock on its very
-        // first pass instead of going silent until an operator re-applies.
-        consensus.arm_schedule_at_boot();
+        // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
+        // consensus agent starts. The view already holds genesis or the
+        // newest cluster artifact (`cluster_agent::recover`, above), the
+        // log-time word is already seeded from the journal (step 3), no
+        // service has attached and no election can have been won — so a node
+        // that restarts and immediately becomes leader fires the catch-up tick
+        // from the LOG's clock on its very first pass instead of going silent.
+        // `refresh_from_view` is idempotent on an unchanged position, so the
+        // agent's own per-pass call costs nothing extra after this.
+        consensus.refresh_from_view();
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || {
                 consensus.do_work()
@@ -2106,37 +2162,6 @@ struct PendingAdminFwd {
     port: u16,
 }
 
-/// Plan 3 (review R6): what the snapshot-session table-carry cache holds —
-/// the whole [`ScheduleRecord`] rather than the three wire fields, because
-/// the SHIP-TIME commit gate ([`shippable_schedule`]) needs the record's
-/// one-level `prev` as its fallback.
-///
-/// Why a gate at all: `adopt_table_frame` persists the record at APPEND,
-/// which is before the frame commits. A joiner that installed an
-/// UNCOMMITTED table would be strictly worse off than the leader that
-/// shipped it — the leader reverts the record when the frame is truncated
-/// (`revert_schedule_below`), but the joiner never sees that truncation (the
-/// range is below its floor), so it can never revert; its next boot then
-/// finds `rec.position > durable` and reverts it to empty. So the session
-/// ships the newest record the leader KNOWS committed.
-struct ScheduleShip {
-    /// The newest adopted record, or `None` on a node that holds no table.
-    rec: Option<ScheduleRecord>,
-    /// Is `rec` known to have been committed where it came from? `true` only
-    /// for a record installed BY FIAT off a snapshot session
-    /// ([`Consensus::install_snapshot_table`]): that table was gated on the
-    /// SENDER's commit counter, but during catch-up it can sit above THIS
-    /// node's commit — and a joiner that then serves a session of its own
-    /// must pass it on rather than ship "no table", which the next joiner
-    /// would have no way to learn its way out of.
-    ///
-    /// `false` for every locally-adopted record (frame, boot, revert). The
-    /// conservative default matters: a path that forgets to say otherwise
-    /// can only under-ship (a joiner learns the table from the next frame),
-    /// never over-ship an uncommitted one.
-    known_committed: bool,
-}
-
 struct Consensus {
     id: NodeId,
     /// Mirror of `ElectionSm::reports_unattested` for `Node::reports_unattested`.
@@ -2162,19 +2187,6 @@ struct Consensus {
     /// position order once the ack lands; entries above the cut are dropped
     /// there, since the bytes they describe are gone.
     pending_cfg_obs: Vec<(u64, Vec<u8>)>,
-    /// Durably-recorded SCHEDULE_TABLE-frame observations held across the
-    /// SM's truncating latch (do_work step 1c'), the exact twin of
-    /// `pending_cfg_obs`. `adopt_table_frame` does not run through the SM, so
-    /// the "lost under the latch" half of nightly 33605909828 does not apply
-    /// here — the STALE half does: an observation for a frame ABOVE an
-    /// in-flight cut can sit in the channel while `Action::Truncate`'s
-    /// `revert_schedule_below` already ran, and adopting it afterwards would
-    /// park `schedule_position` at a position no surviving byte backs (the
-    /// durable-plausibility skip does not catch it once durable has climbed
-    /// past that position again over DIFFERENT bytes). Held until the ack,
-    /// then replayed in position order; `on_truncated` prunes the ones above
-    /// the cut.
-    pending_tbl_obs: Vec<(u64, u64, Vec<u8>)>,
     /// Diagnostic (UC2_TRUNC_TRACE): last commit provenance, published for
     /// the archive thread's cut trace. Both fields are inert unless the env
     /// var is set.
@@ -2264,9 +2276,20 @@ struct Consensus {
     /// Monotonic per-node nonce — scopes each probe ROUND (no longer each
     /// read) so acks attribute to the right round on the wire.
     next_nonce: u64,
-    /// Mirror of `NodeConfig::admission_bytes_default` (the `append - commit`
-    /// door budget for the ring drain).
+    /// The `append - commit` door budget for the ring drain, IN EFFECT: the
+    /// committed `Settings::admission_bytes` clamped to `buffer_bytes / 2`, or
+    /// `admission_bytes_default` while the setting reads `0` ("derive at
+    /// use"). Refreshed by `refresh_from_view`.
     admission_bytes: u64,
+    /// `NodeConfig::admission_bytes_default` — what `admission_bytes` falls
+    /// back to while the replicated setting is unset (spec §4.4).
+    admission_bytes_default: u64,
+    /// `NodeConfig::buffer_bytes` / `max_payload`, the two node-local bounds
+    /// every replicated setting is clamped against at USE (spec §4.4). A host
+    /// with a smaller ring clamps rather than diverging from the committed
+    /// cluster state.
+    buffer_bytes: u64,
+    max_payload: usize,
     /// M14a (spec §5.2): the FSM term — `Some(fsm_lag)` when at least one
     /// service is declared, `None` (inert) for a `none_for_tests` node.
     /// Computed once at boot (`crate::services::fsm_lag_eff`) from the
@@ -2310,38 +2333,31 @@ struct Consensus {
     /// scan, `(frame-END position, payload bytes)` — decoded + fed as
     /// `Event::ConfigObserved` in `do_work` step 1c.
     cfg_obs_rx: mpsc::Receiver<(u64, Vec<u8>)>,
-    /// Plan 2 (spec §5): durably-recorded SCHEDULE_TABLE observations from the
-    /// SAME archive scan, `(frame-END position, frame stamp, payload bytes)`
-    /// — the follower / boot-recovery half of table adoption, drained in
-    /// `do_work` step 1c'. The CONFIG channel's exact twin, including its
-    /// blocking-send losslessness argument.
-    tbl_obs_rx: mpsc::Receiver<(u64, u64, Vec<u8>)>,
-    /// Plan 2: frame-END position of the newest table this node has adopted
-    /// (0 = none). The idempotency key — the leader adopts at append and the
-    /// archive re-observes the same frame later, so adoption must be a no-op
-    /// at or below this.
-    ///
-    /// Known narrow gap (reported with this task, not fixed here): a table
-    /// frame appended by a leader that loses leadership before the frame
-    /// replicates is truncated, and this node keeps a position no committed
-    /// frame supports. A NEXT table frame whose END lands at or below it
-    /// would then be ignored on this node alone (the
-    /// `Uc2ScheduleTableDiverged` alert is what would catch it). Any traffic
-    /// at all moves positions past the stale value within milliseconds, so
-    /// the window is an apply landing immediately after a truncation on an
-    /// otherwise idle cluster.
+    /// Cluster FSM (spec §4.5): the view's position as of the last
+    /// `refresh_from_view`. The shadow that makes the per-pass read a single
+    /// `Acquire` load with no lock.
+    view_position_seen: u64,
+    /// Cluster FSM (spec §4.4): the frame-END of the newest CLUSTER command
+    /// THIS node appended as leader, or 0. The SINGLE-IN-FLIGHT gate for the
+    /// two staged-file ops: while it is above the view's position the previous
+    /// command has not committed, and a second apply is answered `retry`.
+    /// Reset on every leader exit (`BecomeFollower`, `halt`) — a command
+    /// appended under a term this node no longer leads may never commit at
+    /// all, and holding the gate shut on it would wedge the next leader.
+    last_cluster_append: u64,
+    /// Cluster FSM: MIRROR of the view's `table_position` — the table this
+    /// node's rows are armed from. Written only by `refresh_from_view`, which
+    /// re-arms whenever it moves; also the "version in effect" word a
+    /// `schedule apply` reply carries.
     schedule_position: u64,
-    /// Plan 2: `state/schedules.state` — the newest adopted table, so a
-    /// restarted node re-arms its heaps before the log replays anything.
-    /// Its own `StableValue` rather than a `NodeState` field: optional,
-    /// node-local, irrelevant to consensus safety (see
-    /// [`crate::schedule_state`]).
-    schedule_state: StableValue<ScheduleRecord>,
     /// Plan 2: `<instance_dir>/schedules.pending` — the file an admin client
     /// stages and this node reads back under `ADMIN_OP_SCHEDULE_APPLY`. Held
     /// as a path because `Consensus` never sees the `InstanceDir` itself
     /// (`Node` owns the flock for the process's life).
     schedule_pending: PathBuf,
+    /// The same for `ADMIN_OP_SETTINGS_APPLY` (spec §6):
+    /// `<instance_dir>/settings.pending`.
+    settings_pending: PathBuf,
     /// Plan 2 (spec §6): the `/metrics` mirrors of `schedule_position` and
     /// the adopted entry count, published on adoption (rare) so the exporter
     /// thread never reaches into this agent's state. `uc2_schedule_table_position`
@@ -2351,15 +2367,6 @@ struct Consensus {
     /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
     /// whatever the reason. Shared with `Node::observability`.
     schedule_refused: Arc<AtomicU64>,
-    /// Plan 3 (spec §5): the snapshot-session table-carry cache — the table
-    /// this node has ADOPTED, refreshed by
-    /// [`Consensus::refresh_schedule_ship`] wherever that changes (a table
-    /// frame, boot arming, a truncation revert, a fiat install) and read by
-    /// the sender's `SnapshotSource` closure at ship time, through the
-    /// commit gate [`shippable_schedule`]. The twin of `config_bytes`, and
-    /// for the same reason: a below-floor joiner has no genuine table of its
-    /// own, so the session must carry the leader's.
-    schedule_ship: Arc<Mutex<ScheduleShip>>,
     ingress_rx: mpsc::Receiver<Ingress>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
@@ -2434,11 +2441,6 @@ struct Consensus {
     /// and adopted by fiat (`ElectionSm::adopt_snapshot_config`) alongside the
     /// archive-floor adoption in `maybe_adopt_incoming_snapshot`.
     incoming_snapshot_config: Arc<Mutex<Vec<u8>>>,
-    /// Plan 3 (spec §5): the third companion cell — the encoded schedule
-    /// table (with its position and stamp) the same completed transfer
-    /// carried, read by `maybe_adopt_incoming_snapshot` right after the
-    /// config cell and installed BY FIAT ([`Consensus::install_snapshot_table`]).
-    incoming_snapshot_table: ScheduleTableCell,
     /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
     /// AdoptFloor command + cnc mirror fire once per completed transfer).
     adopted_incoming: u64,
@@ -2638,13 +2640,13 @@ struct Consensus {
     /// [`CRYPTO_LOG_INTERVAL_NS`]).
     crypto_last_log_ns: u64,
     /// Cluster-FSM spec §4.5: the SAME `Arc<ClusterView>` the `uc2-cluster`
-    /// agent publishes into. Not yet read here — read by plan 1 task 5.
-    #[allow(dead_code)]
+    /// agent publishes into — this agent's window onto the committed cluster
+    /// state, read once per pass by [`Consensus::refresh_from_view`].
     cluster_view: Arc<ClusterView>,
     /// Cluster-FSM spec §4.7 / Ruling R2: the `uc2-cluster` agent's newest
-    /// complete artifact position, mirrored by that agent. Not yet read here
-    /// — read by plan 1 task 5.
-    #[allow(dead_code)]
+    /// complete artifact position, mirrored by that agent. Folded into the
+    /// purge floor (`maybe_persist_snapshot_floor`) so a purge never drops
+    /// journal that agent still needs.
     cluster_snapshot_pos: Arc<AtomicU64>,
 }
 
@@ -2692,6 +2694,11 @@ impl Consensus {
         }
         // M14a: the FSM aggregates first — everything below reads them.
         self.publish_service_mins();
+        // Cluster FSM (spec §4.5): and the committed cluster state second —
+        // the admission door, the FSM door and the armed schedule below all
+        // read what this publishes. One `Acquire` load unless a CLUSTER frame
+        // committed since the last pass.
+        self.refresh_from_view();
         let mut did = false;
 
         // Time-and-timers spec §3.2/§4.3 — ONE wall-clock read per pass, so
@@ -2781,35 +2788,12 @@ impl Consensus {
             }
         }
 
-        // 1c'. Drain durably-recorded SCHEDULE_TABLE observations (plan 2,
-        // spec §5) — the follower / boot-recovery half of table adoption,
-        // exactly as 1c is for CONFIG. The leader adopted at append; this is
-        // how everyone else learns, and how the leader harmlessly
-        // re-confirms (adoption is idempotent by position). Same
-        // implausibility skip as above: a durably-recorded frame's END can
-        // never exceed the durable counter, so a violation is a recorder bug
-        // and adopting it would park `schedule_position` above durable.
-        //
-        // Held across the SM's truncating latch exactly like step 1c's config
-        // observations, and pruned above the cut by the same `on_truncated`
-        // step. Adoption does not go THROUGH the latch here (there is no
-        // `Event` for it), so nothing is lost by feeding under it — what is
-        // wrong is adopting a frame an in-flight truncation is about to
-        // remove: `Action::Truncate`'s `revert_schedule_below` has already
-        // run by then, so the stale position would survive the cut.
-        while let Ok(obs) = self.tbl_obs_rx.try_recv() {
-            self.pending_tbl_obs.push(obs);
-        }
-        if self.sm.is_truncating() {
-            if !self.pending_tbl_obs.is_empty() {
-                did = true;
-            }
-        } else {
-            for (position, time_ns, payload) in std::mem::take(&mut self.pending_tbl_obs) {
-                self.observe_table(position, time_ns, &payload);
-                did = true;
-            }
-        }
+        // (Plan 1 task 5: there is no step 1c' any more. The schedule table
+        // is a CLUSTER command now, applied at COMMIT by the `uc2-cluster`
+        // agent and read back here through `refresh_from_view` at the top of
+        // this pass — so it needs no durable-time observation feed, no
+        // truncating-latch buffer, and no revert-before-the-cut: a truncated
+        // frame simply never commits, and the view never moves.)
 
         // 1d. Drain the truncation ack slot (a later cycle after emitting
         // `Truncate`). The infallible single slot holds at most one ack.
@@ -3825,20 +3809,13 @@ impl Consensus {
                 // wholesale-replace install: `rec.prev == rec.config` at `pos`.
                 self.rebuild_net_for_config(&cfg, pos);
             }
-            // Plan 3 (spec §5): and the session carried the leader's
-            // SCHEDULE TABLE too — the third fiat install on this path
-            // (lineage, config, table), by the identical argument
-            // (`install_snapshot_table`'s doc comment). AFTER the config,
-            // which may have rebuilt the net layer, and BEFORE `AdoptFloor`:
-            // the floor adoption is what re-primes `append` and lets this
-            // node catch up (and, once promoted, lead), and a node that can
-            // lead must already hold the schedule it is expected to fire.
-            // The cell was written by the receiver before the `Release`
-            // store of the floor this handler `Acquire`-loaded, so it holds
-            // THIS session's bytes.
-            let (tbl_pos, tbl_time, tbl_bytes) =
-                self.incoming_snapshot_table.lock().unwrap().clone();
-            self.install_snapshot_table(tbl_pos, tbl_time, &tbl_bytes);
+            // Plan 1 task 9 (spec §4.8) will install the CLUSTER ARTIFACT the
+            // session carries here, by the same fiat argument the config
+            // install above makes. Until then a below-floor joiner learns the
+            // cluster row (table, settings) from the log once it catches up —
+            // the session's `SNAP_TABLE` still travels (`uc_net` is untouched
+            // until task 9) but carries the wire's honest "no table",
+            // `(0, 0, [])`, and nothing on this node reads it.
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
         crate::obs_event!(
@@ -3916,7 +3893,25 @@ impl Consensus {
     /// advance the floor (archive not yet caught up, or a prior best-effort
     /// purge that failed) simply retries on the next tick.
     fn maybe_persist_snapshot_floor(&mut self) -> bool {
-        let service_pos = self.cnc.snapshots().service_snapshot_pos.load_acquire();
+        // Cluster FSM (spec §4.7): the cluster artifact is a snapshot like any
+        // other, so the floor is the minimum over the USER rows AND it. A
+        // floor above the cluster artifact would let the purge drop journal
+        // the `uc2-cluster` agent still needs to replay from after a restart.
+        //
+        // `> 0` GUARD: `0` means "no cluster artifact yet", which must not pin
+        // the floor at 0 forever. It converges — the agent's bridging trigger
+        // takes a snapshot as soon as every declared row has one, i.e. as soon
+        // as `service_snapshot_pos` itself is non-zero — and until then the
+        // node has no floor worth purging under anyway.
+        let cluster_pos = self.cluster_snapshot_pos.load(Ordering::Acquire);
+        let service_pos = {
+            let rows = self.cnc.snapshots().service_snapshot_pos.load_acquire();
+            if cluster_pos > 0 {
+                rows.min(cluster_pos)
+            } else {
+                rows
+            }
+        };
         let durable = self.cnc.counters().durable.load_acquire();
         let have_new_floor = service_pos > self.snapshot_persisted_floor && service_pos <= durable;
         let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
@@ -4296,219 +4291,113 @@ impl Consensus {
         }
     }
 
-    /// M7 leader append path: encode `new_cfg` as a `FRAME_TYPE_CONFIG` payload
-    /// superseding the currently-adopted config (`self.sm.config_position()`
-    /// is the wire `prev_position` audit field), append it via the leader
-    /// appender, and adopt-at-append by feeding the event back to ourselves
-    /// immediately — the archive re-observes the same durable frame later
-    /// (`do_work` step 1c), which is a harmless no-op re-adoption (idempotent
-    /// by version). Returns the frame-END position (the new
-    /// `ConfigRecord.position`).
+    /// The one leader-side append path for every `CLUSTER` command (spec
+    /// §4.3/§4.6): encode the payload, append a `FRAME_TYPE_CLUSTER` frame
+    /// with the command's kind byte, and return the frame-END position.
+    /// LEADER-ONLY — it panics without an appender, exactly as its M7
+    /// ancestor `append_config_frame` did.
     ///
-    /// Task 7's admin propose path (`ElectionSm::propose_config` ->
-    /// `propose_and_append` -> this) is the caller. On `Err` (the ring is
-    /// momentarily full, `AppendError::WouldOverrun`, or the vanishingly
-    /// unlikely `PayloadTooLarge`) nothing has been appended and nothing has
-    /// been fed to the SM — `propose_config` never mutated state either, so
-    /// the caller's retry sees a byte-for-byte unchanged SM (see
-    /// `propose_and_append`'s doc for the full argument).
-    fn append_config_frame(&mut self, new_cfg: &ClusterConfig) -> Result<u64, AppendError> {
+    /// **`Membership` keeps the kernel's adopt-at-append path unchanged**
+    /// (spec §4.6). Two things are special about it and only about it:
+    ///
+    /// * the payload's `prev_position` field is filled from
+    ///   `self.sm.config_position()` — the record this one supersedes — which
+    ///   is kernel state the cluster FSM does not have, so
+    ///   `ClusterFsm::encode_command`'s `0` is overwritten here;
+    /// * the event is fed back to the SM IMMEDIATELY, at durable time, before
+    ///   commit. The archive re-observes the same frame later (`do_work` step
+    ///   1c), a harmless no-op re-adoption (idempotent by version). The
+    ///   cluster FSM's own copy of the membership row advances at COMMIT and
+    ///   is never what the kernel votes or reconciles on.
+    ///
+    /// The other two kinds have no durable-time effect at all: they take
+    /// effect when the `uc2-cluster` agent applies the committed frame and
+    /// publishes the view, which this agent picks up in `refresh_from_view`.
+    ///
+    /// On `Err` (the ring is momentarily full, `AppendError::WouldOverrun`, or
+    /// the vanishingly unlikely `PayloadTooLarge`) nothing has been appended
+    /// and nothing has been fed to the SM — `propose_config` never mutated
+    /// state either, so the caller's retry sees a byte-for-byte unchanged SM
+    /// (see `propose_and_append`'s doc for the full argument).
+    fn append_cluster_frame(&mut self, cmd: &ClusterCommand) -> Result<u64, AppendError> {
         let term = self.sm.current_term();
-        let wire = cluster_to_wire(new_cfg, self.sm.config_position());
-        let mut bytes = Vec::new();
-        encode_config(&wire, &mut bytes);
+        let mut payload = Vec::new();
+        let kind = match cmd {
+            ClusterCommand::Membership(c) => {
+                encode_config(&cluster_to_wire(c, self.sm.config_position()), &mut payload);
+                ClusterKind::Membership
+            }
+            other => ClusterFsm::encode_command(other, &mut payload),
+        };
         let position = self
             .appender
             .as_mut()
-            .expect("append_config_frame is leader-only")
-            .append_cluster(term, ClusterKind::Membership, &bytes)?;
-        self.feed(Event::ConfigObserved {
-            position,
-            config: new_cfg.clone(),
-        });
-        Ok(position)
-    }
-
-    /// Plan 2 (spec §5) leader append path: encode `table` as a
-    /// `FRAME_TYPE_SCHEDULE_TABLE` payload, append it via the leader
-    /// appender, and adopt-at-append — the archive re-observes the same
-    /// durable frame later (`do_work` step 1c'), a harmless no-op
-    /// re-adoption (idempotent by position). Returns the frame-END position,
-    /// which is the admin reply's `version` field.
-    ///
-    /// The appender's `last_stamp()` after a successful append IS this
-    /// frame's stamp (`append_schedule_table` clamps `max(now, last)` and
-    /// stores it), so the rows arm from the log's clock at the frame, not
-    /// from a second wall-clock reading.
-    ///
-    /// On `Err` nothing was appended and nothing adopted, so the caller may
-    /// retry the whole request — the same argument `append_config_frame`'s
-    /// caller relies on.
-    ///
-    /// TODO(plan 1 task 5): `Appender::append_schedule_table` is a deprecated
-    /// shim (plan 1 task 2) forwarding to `append_cluster(kind=ScheduleTable)`;
-    /// this call site reroutes to `append_cluster` directly in task 5.
-    #[allow(deprecated)]
-    fn append_schedule_table_frame(&mut self, table: &ScheduleTable) -> Result<u64, AppendError> {
-        let term = self.sm.current_term();
-        let mut bytes = Vec::new();
-        encode_schedule_table(table, &mut bytes);
-        let (position, stamp) = {
-            let app = self
-                .appender
-                .as_mut()
-                .expect("append_schedule_table_frame is leader-only");
-            let position = app.append_schedule_table(term, &bytes)?;
-            (position, app.last_stamp())
-        };
-        self.adopt_table_frame(position, stamp, &bytes);
-        Ok(position)
-    }
-
-    /// Plan 2 (spec §5): adopt the table carried by the frame ending at
-    /// `position`, stamped `time_ns`. Called from three places — the leader's
-    /// own append (above), the archive's observation of the durable frame
-    /// (`do_work` step 1c'), and nothing else; boot goes through
-    /// [`Self::arm_schedule_at_boot`], which arms from the LOG's clock rather
-    /// than a historical frame stamp.
-    ///
-    /// A decode failure is fail-stop, exactly as for CONFIG: the archive's
-    /// block is journal-CRC-covered and the bytes were decodable when they
-    /// were appended, so a malformed payload here is a BUG.
-    ///
-    /// Persist-before-effect: the record is durable before the heaps change,
-    /// so a crash in the window recovers a node whose armed set matches its
-    /// recorded position.
-    fn adopt_table_frame(&mut self, position: u64, time_ns: u64, payload: &[u8]) {
-        let table = decode_schedule_table(payload)
-            .unwrap_or_else(|| panic!("corrupt SCHEDULE_TABLE frame at {position}"));
-        // Idempotent by position: the leader adopts at append and then sees
-        // its own frame come back off the archive.
-        if position <= self.schedule_position {
-            return;
+            .expect("append_cluster_frame is leader-only")
+            .append_cluster(term, kind, &payload)?;
+        // The single-in-flight gate for the non-kernel kinds (spec §4.4): the
+        // newest command THIS leader put on the log. Compared against the
+        // view's position, which only moves at commit, so a second apply is
+        // answered `retry` until the first one lands. Reset on every leader
+        // exit (`BecomeFollower`, `halt`) — a command appended by a term we no
+        // longer lead may never be committed at all, and holding the gate shut
+        // on it would wedge the next leader (possibly us again).
+        self.last_cluster_append = position;
+        if let ClusterCommand::Membership(c) = cmd {
+            self.feed(Event::ConfigObserved {
+                position,
+                config: c.clone(),
+            });
         }
-        // One level of history, exactly as `ConfigRecord` keeps it: the
-        // record this one supersedes, with its own `prev` cleared, so a
-        // truncation that drops THIS frame can revert to its predecessor.
-        let prev = crate::schedule_state::load(&self.schedule_state)
-            .ok()
-            .flatten()
-            .map(|mut p| {
-                p.prev = None;
-                Box::new(p)
-            });
-        let rec = ScheduleRecord {
-            position,
-            time_ns,
-            table: payload.to_vec(),
-            prev,
-        };
-        crate::schedule_state::store(&self.schedule_state, &rec)
-            .expect("schedule record persist fail-stop");
-        let armed = self.install_table(position, &table, time_ns);
-        crate::obs_event!(
-            Info,
-            "schedule_table_adopted",
-            node = self.id as u64,
-            position = position,
-            entries = armed,
-            source = "log"
-        );
+        Ok(position)
     }
 
-    /// Plan 3 (spec §5): install the table the snapshot session carried, BY
-    /// FIAT at the floor — the exact twin of `adopt_snapshot_config`, and by
-    /// the same argument: below the floor this node's own bytes are gone, so
-    /// its own record is not genuine and there is nothing to be idempotent
-    /// AGAINST. Deliberately NO `position <= schedule_position` check (the
-    /// frame path's guard, which exists because the leader sees its own
-    /// frame come back off the archive) — a joiner's stale record can sit
-    /// ABOVE the carried position, and that record is exactly what must go.
-    ///
-    /// `position == 0` with empty bytes is the wire's honest "this leader has
-    /// no table": every row disarms and the record goes to the canonical
-    /// no-table shape ([`ScheduleRecord::empty`]), which is what this node
-    /// would hold had it never adopted. The record's bytes are canonicalised
-    /// rather than stored verbatim precisely so that a stored record ALWAYS
-    /// decodes — boot arming and `revert_schedule_below` both rely on it (the
-    /// latter fail-stops otherwise).
-    ///
-    /// A decode failure on non-empty bytes is fail-stop, exactly as for
-    /// CONFIG (`maybe_adopt_incoming_snapshot`): the session is sealed and
-    /// CRC/AEAD-covered, the leader encoded the bytes from a table it holds,
-    /// and `decode_schedule_table` is total — so a `None` here is a BUG, not
-    /// a hostile peer.
-    ///
-    /// Persist-before-effect, as everywhere else on this path: the record is
-    /// durable before the heaps change, so a crash in the window recovers a
-    /// node whose armed set matches its recorded position.
-    ///
-    /// Arms from `cnc.log_time_ns()` — the LOG's clock — and never from the
-    /// carried `time_ns`: that stamp is the leader's frame stamp, recorded
-    /// for diagnostics, while arming is a one-tick catch-up from the clock
-    /// every replica agrees on (`arm_schedule_at_boot` makes the same
-    /// choice for the same reason).
-    fn install_snapshot_table(&mut self, position: u64, time_ns: u64, bytes: &[u8]) {
-        let (table, stored) = if bytes.is_empty() {
-            (
-                ScheduleTable {
-                    entries: Vec::new(),
-                },
-                ScheduleRecord::empty().table,
-            )
-        } else {
-            let table = decode_schedule_table(bytes).unwrap_or_else(|| {
-                panic!("corrupt snapshot-carried SCHEDULE_TABLE at floor {position}")
-            });
-            (table, bytes.to_vec())
-        };
-        // No `prev`: the one-level history is a TRUNCATION affordance, and
-        // nothing below the floor is truncatable — reverting to a record the
-        // joiner cannot have the bytes for would be worse than holding none.
-        let rec = ScheduleRecord {
-            position,
-            time_ns,
-            table: stored,
-            prev: None,
-        };
-        crate::schedule_state::store(&self.schedule_state, &rec)
-            .expect("schedule record persist fail-stop");
-        let armed = self.install_table(position, &table, self.cnc.log_time_ns());
-        // Review R6: `install_table`'s tail already cached this record with
-        // the conservative `known_committed = false`; re-cache it as EXEMPT.
-        // The sender that shipped it gated it on ITS commit counter, so the
-        // table is committed cluster-wide — but on this joiner it can sit far
-        // above the local commit for the whole catch-up, and a session THIS
-        // node serves in that window must pass the table on rather than ship
-        // "no table" (which the next joiner could not learn its way out of).
-        self.refresh_schedule_ship(true);
-        crate::obs_event!(
-            Info,
-            "schedule_table_adopted",
-            node = self.id as u64,
-            position = position,
-            entries = armed,
-            source = "snapshot"
-        );
+    /// The DECLARED rows' identity hashes — the cluster FSM's one node-local
+    /// input (spec §3.3), fixed at boot and identical cluster-wide by the
+    /// bootstrap boundary. Derived from `self.timers`, which holds exactly one
+    /// entry per declared row keyed by that row's `FsmName` hash, so this is
+    /// the same set `cluster_agent`'s own `ClusterFsm` was built with
+    /// (`ServicesConfig::identity_hashes`, non-zero entries).
+    fn declared_hashes(&self) -> Vec<u64> {
+        self.timers.iter().flatten().map(|t| t.hash()).collect()
     }
 
-    /// Plan 2 (spec §5): hand every DECLARED row the entries that name its
-    /// identity hash and publish the `/metrics` mirrors. A row with no entry
-    /// in the table adopts an EMPTY set — that is how an operator removes an
-    /// entry: apply a table without it.
+    /// The leader's PRE-APPEND acceptance check (spec §4.4, Ruling R5): run
+    /// the FSM's own `validate` against the newest COMMITTED state this node
+    /// can see, so the admin request is answered with the same verdict every
+    /// replica's apply loop will reach. ONE acceptance function, never a
+    /// parallel node-side copy of it.
     ///
-    /// `log_time_ns` is the instant the rules arm against
-    /// (`ScheduleRule::arm`'s one-tick catch-up). Every replica adopts the
-    /// same frame with the same stamp, so every replica arms identically.
+    /// NOT applied to `Membership`: that kind's acceptance is the kernel's
+    /// (`ElectionSm::propose_config`, at durable time against the ADOPTED
+    /// config), and re-checking it against the committed view — which lags
+    /// adoption by a commit round-trip — would refuse legitimate changes.
+    fn validate_cluster_command(&self, cmd: &ClusterCommand) -> Result<(), u32> {
+        ClusterFsm::new(self.cluster_view.to_state(), self.declared_hashes())
+            .validate(cmd)
+            .map_err(|r| r.reason_code())
+    }
+
+    /// Cluster FSM (spec §4.5): hand every DECLARED row the entries the
+    /// COMMITTED table names for it, and publish the `/metrics` mirrors. A row
+    /// with no entry in the table adopts an EMPTY set — that is how an
+    /// operator removes an entry: apply a table without it.
+    ///
+    /// Called only from [`Self::refresh_from_view`], i.e. only when the view's
+    /// position moved. Arms against `cnc.log_time_ns()` — the LOG's clock,
+    /// seeded from the journal at boot — and never a wall clock or a frame
+    /// stamp: every replica agrees on that reading, so every replica arms
+    /// identically, and a node down for a week catches up by ONE tick per
+    /// entry instead of replaying a backlog (`ScheduleRule::arm`).
     ///
     /// Returns the number of ARMED entries — what `uc2_schedule_entries`
-    /// publishes. The caller names the event (adoption, boot arming and a
-    /// truncation revert are three different operational facts).
-    fn install_table(&mut self, position: u64, table: &ScheduleTable, log_time_ns: u64) -> u64 {
+    /// publishes.
+    fn arm_table_from_view(&mut self, inner: &ClusterViewInner) -> u64 {
+        let log_time_ns = self.cnc.log_time_ns();
         for slot in self.timers.iter_mut() {
             let Some(t) = slot else { continue };
             let hash = t.hash();
-            let entries: Vec<(u64, ScheduleRule)> = table
+            let entries: Vec<(u64, ScheduleRule)> = inner
+                .table
                 .entries
                 .iter()
                 .filter(|e| e.identity_hash == hash)
@@ -4518,204 +4407,115 @@ impl Consensus {
         }
         // What is actually ARMED across the rows, parked `once` entries
         // included. Equal to `table.entries.len()` whenever every entry names
-        // a declared row — which the apply path enforces (an unknown hash is
-        // refused whole) — and, on a node whose declared set has somehow
-        // diverged from the cluster's, the more useful of the two truths.
+        // a declared row — which the FSM's `validate` enforces (an unknown
+        // hash is refused whole) — and, on a node whose declared set has
+        // somehow diverged from the cluster's, the more useful of the two
+        // truths.
         let armed: u64 = self
             .timers
             .iter()
             .flatten()
             .map(|t| t.table_len() as u64)
             .sum();
-        self.schedule_position = position;
-        self.schedule_pos_pub.store(position, Ordering::Relaxed);
+        self.schedule_pos_pub
+            .store(inner.table_position, Ordering::Relaxed);
         self.schedule_entries_pub.store(armed, Ordering::Relaxed);
-        self.refresh_schedule_ship(false);
         armed
     }
 
-    /// Plan 3 (spec §5): re-fill the snapshot-session table-carry cache from
-    /// the DURABLE record, so a session this node ships carries the table it
-    /// actually holds. The one writer of `schedule_ship`, called from the
-    /// tail of [`Self::install_table`] — which every adoption path goes
-    /// through (a table frame, boot arming, a truncation revert, and the
-    /// snapshot fiat install) — and restated at the tails of
-    /// `arm_schedule_at_boot` and `revert_schedule_below`, so an edit that
-    /// ever gives either its own arming path cannot silently leave the cache
-    /// stale. (An early return in those two — no record, an unreadable one —
-    /// deliberately does NOT refresh: nothing was armed, so the seeded
-    /// "no record" is already the truth.)
+    /// Cluster FSM (spec §4.5): the ONE place this agent reads the committed
+    /// cluster state. Called once per `do_work` pass, right after
+    /// `publish_service_mins`, and once more at the end of construction (so a
+    /// node boots with the recovered artifact's table already armed, before
+    /// its first pass).
     ///
-    /// The WHOLE record is cached, taken from one `load` — so the position,
-    /// stamp, bytes and `prev` the ship gate reads are self-consistent by
-    /// construction, never a pairing of the in-memory position with another
-    /// record's bytes. Reading it back rather than tracking the bytes in
-    /// memory keeps the durable record the single truth, and
-    /// `StableValue::load` serves both slots from its in-memory cache, so
-    /// this is a small clone, not I/O.
+    /// The steady-state cost is a SINGLE `Acquire` load of the view's position
+    /// word compared against a shadow — the consensus duty cycle is a measured
+    /// hot path (M14a: code in a hot loop's body costs even on paths that
+    /// never run), so nothing else may be added here. The mutex behind
+    /// `snapshot_inner` is taken only on the pass where the position actually
+    /// moved, which is a committed CLUSTER frame — an operator action or a
+    /// reconfiguration, not traffic.
     ///
-    /// `known_committed` is the caller's claim about the record's PROVENANCE
-    /// (see [`ScheduleShip::known_committed`]): `install_table`'s tail passes
-    /// the conservative `false`, and `install_snapshot_table` re-runs it with
-    /// `true` afterwards.
-    fn refresh_schedule_ship(&self, known_committed: bool) {
-        let rec = crate::schedule_state::load(&self.schedule_state)
-            .ok()
-            .flatten();
-        *self.schedule_ship.lock().unwrap() = ScheduleShip {
-            rec,
-            known_committed,
-        };
-    }
-
-    /// Plan 2 (spec §5): boot arming, called once before this agent's thread
-    /// starts. Arms from `cnc.log_time_ns()` — the log's clock, seeded from
-    /// the journal at boot — and NEVER from the record's own `time_ns` or a
-    /// wall clock: a node down for a week must catch up by ONE tick per
-    /// entry, and the log clock is the only reading every replica agrees on.
-    ///
-    /// A record that will not decode is dropped with a warning rather than
-    /// fail-stopped. Unlike a frame off the archive this is a node-local
-    /// cache file whose only job is to bridge a restart; refusing to boot
-    /// over it would strand the node, and the next observed table frame (or
-    /// re-apply) restores the set.
-    ///
-    /// The record is judged against `durable` FIRST, exactly as the archive
-    /// drain (step 1c') judges an observation. The leader persists at APPEND,
-    /// which is BEFORE the archive has recorded the frame, so a node that
-    /// dies in that window comes back holding a record no durable byte
-    /// backs. Arming it would leave `schedule_position` above `durable`,
-    /// where a later table frame at or below that position is ignored as a
-    /// re-observation on this node alone — and if this node then leads, it
-    /// fires the old table. `revert_schedule_below(durable)` is exactly the
-    /// right shape: it promotes the one-level predecessor (or
-    /// `ScheduleRecord::empty()`), persists, arms from it and names the fact
-    /// with `schedule_table_reverted`. The durable counter is already seeded
-    /// from the journal by the time this runs (`Node::start_with_socket`
-    /// recovers it from the archive in step 2 and primes it into the cnc
-    /// page in step 3, and calls this after).
-    fn arm_schedule_at_boot(&mut self) {
-        let rec = match crate::schedule_state::load(&self.schedule_state) {
-            Ok(Some(rec)) => rec,
-            Ok(None) => return,
-            Err(e) => {
-                let err = e.to_string();
-                crate::obs_event!(
-                    Warn,
-                    "schedule_record_unreadable",
-                    node = self.id as u64,
-                    err = err.as_str()
-                );
-                return;
-            }
-        };
-        let durable = self.cnc.counters().durable.load_acquire();
-        if rec.position > durable {
-            // Implausible: no durable byte backs this record. Revert (and
-            // arm) one level down instead of adopting it — see this
-            // function's doc comment.
-            self.revert_schedule_below(durable);
+    /// `position` is stored LAST with `Release` by `ClusterView::publish`, so
+    /// a reader that sees the new position and then locks sees the new inner
+    /// (and the four scalars, stored before it).
+    fn refresh_from_view(&mut self) {
+        let vp = self.cluster_view.position.load(Ordering::Acquire);
+        if vp == self.view_position_seen {
             return;
         }
-        let Some(table) = decode_schedule_table(&rec.table) else {
+        self.view_position_seen = vp;
+        let inner = self.cluster_view.snapshot_inner();
+        if inner.table_position != self.schedule_position {
+            self.schedule_position = inner.table_position;
+            let armed = self.arm_table_from_view(&inner);
             crate::obs_event!(
-                Warn,
-                "schedule_record_unreadable",
+                Info,
+                "schedule_table_adopted",
                 node = self.id as u64,
-                position = rec.position,
-                err = "undecodable table bytes"
+                position = inner.table_position,
+                entries = armed,
+                source = "cluster_fsm"
             );
-            return;
-        };
-        let armed = self.install_table(rec.position, &table, self.cnc.log_time_ns());
-        // Restated defensively; `install_table` already refreshed.
-        self.refresh_schedule_ship(false);
-        crate::obs_event!(
-            Info,
-            "schedule_table_adopted",
-            node = self.id as u64,
-            position = rec.position,
-            entries = armed,
-            source = "boot"
-        );
-    }
-
-    /// Plan 2 (spec §5): persist-revert-BEFORE-the-cut for the schedule
-    /// table — the twin of the `ConfigRecord` revert, run from BOTH cut
-    /// paths: `Action::Truncate` (reconcile + wipe-and-rejoin) and
-    /// `Action::BecomeLeader`'s leader-open `ArchiveCmd::Collapse`. If the
-    /// cut drops the table frame this node adopted (`to` lands strictly
-    /// below its recorded position), the durable record must not survive
-    /// claiming a position no surviving byte backs: a later table frame
-    /// landing at or below that position would be ignored as a
-    /// re-observation, and this node alone would run a table the cluster
-    /// does not have.
-    ///
-    /// Reverts one level (`ScheduleRecord::reverted`), persists, and re-arms
-    /// every row from the reverted table — or from an EMPTY set when there
-    /// is no predecessor, which is what disarms a row whose only entries came
-    /// from the dropped frame. Idempotent and cheap when nothing is at risk:
-    /// one cached `load` and an early return unless `to < position`.
-    fn revert_schedule_below(&mut self, to: u64) {
-        let Ok(Some(rec)) = crate::schedule_state::load(&self.schedule_state) else {
-            return;
-        };
-        if to >= rec.position {
-            return;
         }
-        let reverted = if to == 0 {
-            // Wipe-and-rejoin, mirroring the `ConfigRecord`'s own wipe
-            // branch: keep the CURRENT table by fiat rather than dropping to
-            // a predecessor a wiped node has no further use for. A wiped
-            // node that dropped it would run with nothing armed while its
-            // peers keep ticking — and a snapshot session, which since plan
-            // 3 does carry the table, is not always what a wiped node
-            // rejoins by (a node still above the leader's floor rejoins by
-            // replay). The POSITION still goes to 0, so the next table frame
-            // — or a snapshot install, or a re-apply — adopts.
-            ScheduleRecord {
-                position: 0,
-                time_ns: rec.time_ns,
-                table: rec.table.clone(),
-                prev: None,
+        // The two node-local clamps (spec §4.4): the record carries a
+        // cluster-wide INTENT, and each node bounds it against its own ring at
+        // USE, never at apply — so a host with a smaller buffer clamps rather
+        // than diverging from the cluster's committed state.
+        //
+        // The FSM door stays inert on a node with nothing declared
+        // (`fsm_lag_eff == None` ⇔ no FSM term at all, `services::fsm_lag_eff`):
+        // a settings record must not conjure a door where there are no FSMs to
+        // pace.
+        //
+        // `fsm_lag_bytes == 0` means "derive at use" (spec §6), and what this
+        // node derived at BOOT is `services::fsm_lag_eff` over its own
+        // `ServicesConfig` — `buffer_bytes / 4` for a `node.toml`-built node,
+        // which is bit-for-bit what `fsm_lag_from_setting(0, …)` returns, and
+        // the caller's explicit choice for a programmatically-built
+        // `NodeConfig`. Falling back to it rather than recomputing keeps a
+        // committed CLUSTER frame from silently WIDENING a door the embedder
+        // asked to be narrow, and still lets an operator revert an explicit
+        // setting to the default by applying a record with `0`.
+        if self.fsm_lag_eff.is_some() {
+            let lag = self.cluster_view.fsm_lag_bytes.load(Ordering::Acquire);
+            let (lag_eff, page) = if lag == 0 {
+                (
+                    crate::services::fsm_lag_eff(
+                        &self.services,
+                        self.buffer_bytes,
+                        self.max_payload,
+                    ),
+                    self.services.page_lag_value(self.buffer_bytes),
+                )
+            } else {
+                (
+                    crate::services::fsm_lag_from_setting(lag, self.buffer_bytes, self.max_payload),
+                    crate::services::page_lag_from_setting(lag, self.buffer_bytes),
+                )
+            };
+            if lag_eff != self.fsm_lag_eff {
+                self.fsm_lag_eff = lag_eff;
+                self.cnc.store_fsm_lag_bytes(page);
             }
+        }
+        let adm = self.cluster_view.admission_bytes.load(Ordering::Acquire);
+        let adm_eff = if adm == 0 {
+            self.admission_bytes_default
         } else {
-            // One level is enough because a new table is only appliable once
-            // the previous one committed (`apply_schedule_table`'s
-            // single-in-flight refusal) and committed frames are never
-            // truncated. The `filter` makes that argument fail-SAFE rather
-            // than fail-stale: a predecessor that is somehow also above the
-            // cut is discarded for "no table" instead of parking a stale
-            // position.
-            rec.reverted()
-                .filter(|r| r.position <= to)
-                .unwrap_or_else(ScheduleRecord::empty)
+            adm.min(self.buffer_bytes / 2)
         };
-        crate::schedule_state::store(&self.schedule_state, &reverted)
-            .expect("schedule record persist fail-stop");
-        let table = decode_schedule_table(&reverted.table)
-            .unwrap_or_else(|| panic!("corrupt reverted schedule record at {}", reverted.position));
-        let armed = self.install_table(reverted.position, &table, self.cnc.log_time_ns());
-        // Restated defensively; `install_table` already refreshed.
-        self.refresh_schedule_ship(false);
-        crate::obs_event!(
-            Warn,
-            "schedule_table_reverted",
-            node = self.id as u64,
-            position = reverted.position,
-            entries = armed,
-            to = to
-        );
+        if adm_eff != self.admission_bytes {
+            self.admission_bytes = adm_eff;
+            // The cnc word is observability only (`uc2ctl status`,
+            // `uc2_admission_bytes`) — no other process gates on it — but a
+            // door that moved and a page that says otherwise is exactly the
+            // confusion an operator debugs a stalled cluster with.
+            self.cnc.store_admission_bytes(adm_eff);
+        }
     }
 
-    /// Plan 2: is `hash` one of THIS cluster's declared rows? The
-    /// `REASON_SCHEDULE_UNKNOWN_FSM` check — `self.timers` holds exactly one
-    /// entry per declared row, keyed by the row's `FsmName` hash.
-    fn is_declared_hash(&self, hash: u64) -> bool {
-        self.timers.iter().flatten().any(|t| t.hash() == hash)
-    }
-
-    /// M13a: a ring error from a client-facing MPSC ring. Two of them are
     /// UNRECOVERABLE and fail-stop; everything else (`Full`, `Empty`, …) ends
     /// this drain cycle and is genuinely retried next cycle.
     ///
@@ -5546,16 +5346,18 @@ impl Consensus {
                 return;
             }
         };
-        // Plan 2 (spec §5): `schedule apply` is its own pipeline — the table
-        // is far too large for the admin request line, so what the operator
-        // signs is the DIGEST of a file staged in the instance directory.
+        // The two STAGED-FILE ops (`schedule apply`, plan 2 spec §5; `settings
+        // apply`, cluster-FSM spec §6) are their own pipeline — the payload is
+        // far too large for the 64-byte admin request line, so what the
+        // operator signs is the DIGEST of a file staged in the instance
+        // directory.
         // Placed here, right after authentication and before the
         // leader/forward split, because the staged file is NODE-LOCAL: a
         // follower must not forward the request (the leader has no such file)
         // and must not read its own copy either (it cannot append). It
         // answers retry — side-effect-free — and `uc2ctl` re-stages against
         // the node the leader hint names.
-        if req.op == ADMIN_OP_SCHEDULE_APPLY {
+        if req.op == ADMIN_OP_SCHEDULE_APPLY || req.op == ADMIN_OP_SETTINGS_APPLY {
             // `appender.is_some()` alongside the role: a leader still waiting
             // on its leader-open collapse ack HAS the role but no appender
             // yet, and appending in that window would panic. It is the same
@@ -5563,10 +5365,15 @@ impl Consensus {
             // reconfiguration ops; here it answers retry, which is what
             // `uc2ctl` polls through.
             let leader = matches!(self.sm.role(), Role::Leader) && self.appender.is_some();
-            let (status, reason, version) = if leader {
-                self.apply_schedule_table(req.id, req.ip, req.port)
-            } else {
-                (2, 0, self.schedule_position)
+            let settings = req.op == ADMIN_OP_SETTINGS_APPLY;
+            let (status, reason, version) = match (leader, settings) {
+                (true, false) => self.apply_schedule_table(req.id, req.ip, req.port),
+                (true, true) => self.apply_settings(req.id, req.ip, req.port),
+                // Not the leader: retry, with the "version in effect" word
+                // each op reports — the table's position for `schedule`, the
+                // committed cluster position for `settings`.
+                (false, false) => (2, 0, self.schedule_position),
+                (false, true) => (2, 0, self.cluster_view.position.load(Ordering::Acquire)),
             };
             let (status, reason) = self.audit_admin(
                 actor.as_deref(),
@@ -5742,7 +5549,7 @@ impl Consensus {
         match self.sm.propose_config(config_op, self.admission_bytes) {
             Ok(new_cfg) => {
                 let version = new_cfg.version;
-                match self.append_config_frame(&new_cfg) {
+                match self.append_cluster_frame(&ClusterCommand::Membership(new_cfg)) {
                     Ok(_position) => (0, 0, version),
                     Err(AppendError::WouldOverrun) | Err(AppendError::PayloadTooLarge) => {
                         (2, 0, self.cnc.config_version())
@@ -5774,110 +5581,49 @@ impl Consensus {
     /// leave the operator believing a timer is armed that no row will ever
     /// fire.
     fn apply_schedule_table(&mut self, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
-        // SINGLE IN FLIGHT (the config path's `ChangePending` refusal, in the
-        // node layer because the schedule table is not an SM concern): refuse
-        // to append a second table while the previous one is still
-        // truncation-exposed. It is what makes ONE level of `prev` sufficient
-        // — with two uncommitted frames a truncation could drop both and the
-        // record would have nothing valid to revert to. `status 2` (retry,
+        // SINGLE IN FLIGHT (spec §4.4): refuse to append a second CLUSTER
+        // command while the previous one is still above the COMMITTED view.
+        // `last_cluster_append` is the frame-END this leader last appended;
+        // the view's position only moves at commit, so this is exactly "the
+        // previous command has not landed yet". `status 2` (retry,
         // side-effect-free): `uc2ctl` polls, and the wait is one commit
         // round-trip.
-        let commit = self.cnc.counters().commit.load_acquire();
-        if self.schedule_position > commit {
-            return (2, 0, self.schedule_position);
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return (2, 0, view_position);
         }
         // Size-check before reading. The file is written by anything with
         // instance-dir write access, and this runs on the consensus agent —
         // an oversized (or non-regular) staged file must not become a
         // multi-gigabyte OR a blocking read on the thread that drives commit
-        // and elections. An over-long file is not a decodable table either,
-        // so the honest refusal is the same one the decoder would give.
-        //
-        // Three layers, none of them sufficient alone:
-        // 1. `metadata(path)` BEFORE any open: the cheap, common-case
-        //    rejection — a FIFO or an oversized file staged before this call
-        //    started is refused without ever opening it.
-        // 2. The open itself is `O_RDONLY | O_NONBLOCK`. A path resolves
-        //    twice between the stat above and the open below (anything with
-        //    instance-dir write access can swap the name in that window), so
-        //    the stat alone cannot promise what `open` will find. Without
-        //    `O_NONBLOCK`, `open` on a FIFO with no writer blocks the
-        //    consensus agent forever (`open(2)`); `O_NONBLOCK` makes the
-        //    open on a FIFO return immediately regardless of writer state,
-        //    and has no effect on a regular file, so the happy path is
-        //    unchanged.
-        // 3. `f.metadata()` — an `fstat` on the HANDLE the open just
-        //    returned, not a second `stat` of the path — re-checks
-        //    `is_file()` and the size bound against what was actually
-        //    opened, catching a FIFO (or anything else) swapped in between
-        //    steps 1 and 2. `take(MAX + 1).read_to_end` then bounds the read
-        //    regardless of what step 3 missed, so the length check is a
-        //    check and not a promise.
-        match std::fs::metadata(&self.schedule_pending) {
-            Ok(m) if m.is_file() && m.len() <= MAX_SCHEDULE_TABLE_BYTES => {}
-            Ok(_) => return self.refuse_schedule(REASON_SCHEDULE_DECODE),
-            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
-        }
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&self.schedule_pending)
-        {
-            Ok(f) => f,
-            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
+        // and elections (see [`read_staged`]).
+        let bytes = match read_staged(&self.schedule_pending, MAX_SCHEDULE_TABLE_BYTES) {
+            StagedRead::Bytes(b) => b,
+            StagedRead::Missing => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
+            StagedRead::Unusable => return self.refuse_schedule(REASON_SCHEDULE_DECODE),
         };
-        match f.metadata() {
-            Ok(m) if m.is_file() && m.len() <= MAX_SCHEDULE_TABLE_BYTES => {}
-            Ok(_) => return self.refuse_schedule(REASON_SCHEDULE_DECODE),
-            Err(_) => return self.refuse_schedule(REASON_SCHEDULE_MISSING),
-        }
-        use std::io::Read as _;
-        let mut bytes = Vec::new();
-        if (&mut f)
-            .take(MAX_SCHEDULE_TABLE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return self.refuse_schedule(REASON_SCHEDULE_MISSING);
-        }
-        if bytes.len() as u64 > MAX_SCHEDULE_TABLE_BYTES {
-            return self.refuse_schedule(REASON_SCHEDULE_DECODE);
-        }
-        if schedule_digest(&bytes) != (id, ip, port) {
+        if staged_digest(&bytes) != (id, ip, port) {
             return self.refuse_schedule(REASON_SCHEDULE_DIGEST);
         }
         let Some(table) = decode_schedule_table(&bytes) else {
             return self.refuse_schedule(REASON_SCHEDULE_DECODE);
         };
-        if !table
-            .entries
-            .iter()
-            .all(|e| self.is_declared_hash(e.identity_hash))
-        {
-            return self.refuse_schedule(REASON_SCHEDULE_UNKNOWN_FSM);
+        // Spec §4.4 / Ruling R5: the FSM's OWN acceptance function, run
+        // against the committed view — `REASON_SCHEDULE_UNKNOWN_FSM` (43) and
+        // `REASON_SCHEDULE_DECODE` (42, an over-long table) come back from
+        // `ClusterRefusal::reason_code`, so the leader's answer and a
+        // replica's apply-time refusal cannot drift apart.
+        let cmd = ClusterCommand::ScheduleTable(table);
+        if let Err(reason) = self.validate_cluster_command(&cmd) {
+            return self.refuse_schedule(reason);
         }
-        match self.append_schedule_table_frame(&table) {
+        match self.append_cluster_frame(&cmd) {
             Ok(position) => {
-                // Only now: the table is on the log and adopted, so the
-                // staged copy has done its job. Deleting it earlier would
-                // lose the request on an append failure; deleting it at all
-                // is what keeps a re-presented request from appending the
-                // same table twice (it refuses with MISSING instead).
-                if let Err(e) = std::fs::remove_file(&self.schedule_pending) {
-                    let err = e.to_string();
-                    crate::obs_event!(
-                        Warn,
-                        "schedule_staged_file_kept",
-                        node = self.id as u64,
-                        position = position,
-                        err = err.as_str()
-                    );
-                }
+                self.consume_staged(&self.schedule_pending, position);
                 (0, 0, position)
             }
             // Nothing appended, nothing adopted, staged file still present:
-            // safe to retry whole (`append_config_frame`'s argument).
+            // safe to retry whole (`append_cluster_frame`'s argument).
             Err(AppendError::WouldOverrun) => (2, 0, self.schedule_position),
             // NOT retryable. `MAX_SCHEDULE_TABLE_BYTES` (1064 B, 32 entries)
             // is under the payload ceiling, so this is unreachable today —
@@ -5885,6 +5631,79 @@ impl Consensus {
             // `uc2ctl` to poll for a commit that can never happen. It is a
             // refusal for the same reason an undecodable body is.
             Err(AppendError::PayloadTooLarge) => self.refuse_schedule(REASON_SCHEDULE_DECODE),
+        }
+    }
+
+    /// Cluster FSM (spec §6): the leader half of `ADMIN_OP_SETTINGS_APPLY` —
+    /// [`Self::apply_schedule_table`]'s exact twin over
+    /// `<instance_dir>/settings.pending`, with its own refusal band (44-47).
+    /// Returns the wire reply triple `(status, reason, version)`:
+    /// * `0, 0, position` — appended; `version` is the frame-END.
+    /// * `1, REASON_SETTINGS_*, view_position` — refused; nothing changed.
+    /// * `2, 0, view_position` — the previous CLUSTER command has not
+    ///   committed yet, or the buffer was momentarily full; the staged file is
+    ///   still there, so the whole request is retryable.
+    ///
+    /// Like `schedule apply` this is leader-only and node-local: the staged
+    /// file lives in THIS node's instance directory, so a follower answers
+    /// retry rather than forwarding a request whose payload the leader does
+    /// not have.
+    fn apply_settings(&mut self, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
+        let view_position = self.cluster_view.position.load(Ordering::Acquire);
+        if self.last_cluster_append > view_position {
+            return (2, 0, view_position);
+        }
+        let bytes = match read_staged(&self.settings_pending, MAX_SETTINGS_BYTES) {
+            StagedRead::Bytes(b) => b,
+            StagedRead::Missing => return self.refuse_settings(REASON_SETTINGS_MISSING),
+            StagedRead::Unusable => return self.refuse_settings(REASON_SETTINGS_DECODE),
+        };
+        if staged_digest(&bytes) != (id, ip, port) {
+            return self.refuse_settings(REASON_SETTINGS_DIGEST);
+        }
+        let Some(settings) = decode_settings(&bytes) else {
+            return self.refuse_settings(REASON_SETTINGS_DECODE);
+        };
+        let cmd = ClusterCommand::Settings(settings);
+        if let Err(reason) = self.validate_cluster_command(&cmd) {
+            return self.refuse_settings(reason);
+        }
+        match self.append_cluster_frame(&cmd) {
+            Ok(position) => {
+                self.consume_staged(&self.settings_pending, position);
+                (0, 0, position)
+            }
+            Err(AppendError::WouldOverrun) => (2, 0, view_position),
+            // Unreachable: `SETTINGS_LEN` is 29 bytes. Refused rather than
+            // retried, for `apply_schedule_table`'s reason.
+            Err(AppendError::PayloadTooLarge) => self.refuse_settings(REASON_SETTINGS_DECODE),
+        }
+    }
+
+    /// Test helper: re-read whatever is staged at `settings.pending`, compute
+    /// its digest, and present it as an authenticated request — what `uc2ctl
+    /// settings apply` does, minus the bin and the signature.
+    #[cfg(test)]
+    fn apply_settings_staged(&mut self) -> (u32, u32, u64) {
+        let bytes = std::fs::read(&self.settings_pending).expect("settings staged for this call");
+        let (id, ip, port) = staged_digest(&bytes);
+        self.apply_settings(id, ip, port)
+    }
+
+    /// The staged file has done its job once the command is on the log.
+    /// Deleting it earlier would lose the request on an append failure;
+    /// deleting it at all is what keeps a re-presented request from appending
+    /// the same payload twice (it refuses with MISSING instead).
+    fn consume_staged(&self, path: &Path, position: u64) {
+        if let Err(e) = std::fs::remove_file(path) {
+            let err = e.to_string();
+            crate::obs_event!(
+                Warn,
+                "schedule_staged_file_kept",
+                node = self.id as u64,
+                position = position,
+                err = err.as_str()
+            );
         }
     }
 
@@ -5898,6 +5717,26 @@ impl Consensus {
             reason = reason as u64
         );
         (1, reason, self.schedule_position)
+    }
+
+    /// The same for a refused `settings apply`. It shares
+    /// `uc2_schedule_apply_refused_total`'s counter deliberately: the metric
+    /// answers "are staged-file admin requests being rejected", the audit
+    /// record and the log line carry which op and why, and a second gauge for
+    /// an op an operator runs by hand is noise.
+    fn refuse_settings(&self, reason: u32) -> (u32, u32, u64) {
+        self.schedule_refused.fetch_add(1, Ordering::Relaxed);
+        crate::obs_event!(
+            Warn,
+            "settings_apply_refused",
+            node = self.id as u64,
+            reason = reason as u64
+        );
+        (
+            1,
+            reason,
+            self.cluster_view.position.load(Ordering::Acquire),
+        )
     }
 
     /// M7 Task 7: leader-side handling of a follower-forwarded proposal (kind
@@ -6302,21 +6141,12 @@ impl Consensus {
                 self.state
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
-                // Plan 2 (spec §5), review round 2: the collapse is a
-                // truncation too, so it gets the SAME
-                // persist-revert-before-the-cut step as `Action::Truncate`.
-                // `base` is `ElectionSm::durable` sampled in an EARLIER duty
-                // cycle than the vote drain that produced this action (see
-                // `ArchiveCmd::Collapse`'s doc), so the archive may have
-                // fsynced a block since — including a table frame THIS node
-                // appended as a previous leader and recorded locally. Such a
-                // frame sits above `base` and the collapse drops it, which
-                // without this would leave `schedule_position` claiming a
-                // position no surviving byte backs. Reverting is safe by the
-                // election's own guarantee: an elected leader's durable is at
-                // or above every committed position, so everything above
-                // `base` is uncommitted.
-                self.revert_schedule_below(base);
+                // (Plan 1 task 5: no schedule-record revert here any more. The
+                // table lives in the cluster FSM, which advances only at
+                // COMMIT, and the collapse cuts only this node's own
+                // UNCOMMITTED tail — so a table frame the cut drops was never
+                // in the view to begin with, and there is nothing to revert.
+                // The same argument retires `Action::Truncate`'s revert.)
                 self.term_handle.store(term, Ordering::Release);
                 // Explicit single-writer handoff (review hardening): the gate
                 // is closed across the collapse so a UDP-reordered straggler that
@@ -6369,6 +6199,12 @@ impl Consensus {
                 // report goes back to pending — the next leader (possibly
                 // us again) fires it.
                 self.rearm_timers();
+                // Cluster FSM (spec §4.4): and the single-in-flight gate
+                // opens. A CLUSTER command this node appended under a term it
+                // no longer leads may never commit at all, so a gate still
+                // holding its position would refuse every later apply — on
+                // this node, forever.
+                self.last_cluster_append = 0;
                 // Issue #6: abandon any leader open still awaiting its collapse
                 // ack. The cut itself is already commanded and remains correct
                 // (it drops only this node's own unreplicated tail), but the
@@ -6494,18 +6330,11 @@ impl Consensus {
                         .store_config_record(&reverted)
                         .expect("config persist fail-stop");
                 }
-                // Plan 2 (spec §5): the SAME persist-revert-before-truncate
-                // step for the schedule-table record. The invariant, stated
-                // once for both cuts: EVERY path that can drop an adopted
-                // table frame reverts the record first — this one (reconcile
-                // truncation and wipe-and-rejoin, `to == 0`) and the
-                // leader-open `ArchiveCmd::Collapse` in `Action::BecomeLeader`
-                // (which can also cut below an adopted position, since `base`
-                // is a durable value sampled an earlier duty cycle than the
-                // action). `ArchiveCmd::AdoptFloor` is not such a path: it
-                // moves the archive floor UP under an installed snapshot and
-                // drops no frame the node holds durably.
-                self.revert_schedule_below(to);
+                // (Plan 1 task 5: no schedule-record revert here either — see
+                // `Action::BecomeLeader`. A cut only ever drops UNCOMMITTED
+                // bytes, and the cluster FSM only ever applies COMMITTED ones,
+                // so a truncation can no longer strand this node running a
+                // table the cluster does not have.)
                 // Pause intake and record the emit→ack bracket (the SM allocated
                 // `epoch`; we transport it). The SM has already latched the data
                 // plane. Emitting the truncate IS the reconcile decision for the
@@ -6674,6 +6503,8 @@ impl Consensus {
         // Time-and-timers §4.5: the other leader-exit path — this node will
         // never append again, so nothing may stay in flight here either.
         self.rearm_timers();
+        // …and the same for the cluster-command gate (`BecomeFollower`).
+        self.last_cluster_append = 0;
         self.can_serve_flag.store(false, Ordering::Release);
         // Veil §5 discharge, observation 1 (the parked-reads liveness
         // blemish): `do_work` short-circuits every SUBSEQUENT cycle, so a
@@ -6857,25 +6688,6 @@ impl Consensus {
         self.feed(Event::ConfigObserved { position, config });
     }
 
-    /// do_work step 1c', one observation: the durable-plausibility belt, then
-    /// `adopt_table_frame`. A durably-recorded frame's END can never exceed
-    /// the durable counter (observations are drained after the archive
-    /// agent's `do_work` returned, and that stores durable last), so a
-    /// violation is a recorder bug: adopting it would park
-    /// `schedule_position` above durable, where a later table frame at or
-    /// below that position is ignored as a re-observation.
-    fn observe_table(&mut self, position: u64, time_ns: u64, payload: &[u8]) {
-        let durable = self.cnc.counters().durable.load_acquire();
-        if position > durable {
-            eprintln!(
-                "node {}: ignoring implausible ScheduleTableObserved at {position} (durable {durable})",
-                self.id
-            );
-            return;
-        }
-        self.adopt_table_frame(position, time_ns, payload);
-    }
-
     fn on_truncated(&mut self, epoch: u64, to: u64) {
         // The archive re-primed the counters to `to`; keep our shadow in step so
         // we don't refeed a spurious DurableAdvanced.
@@ -6883,11 +6695,6 @@ impl Consensus {
         // Observations for frames ending above the cut describe bytes that are
         // gone; a re-received tail is re-scanned and re-emitted by the archive.
         self.pending_cfg_obs.retain(|(position, _)| *position <= to);
-        // The same for table observations: `Action::Truncate` already reverted
-        // the RECORD below the cut (`revert_schedule_below`); this drops the
-        // not-yet-adopted observations that would put it straight back.
-        self.pending_tbl_obs
-            .retain(|(position, _, _)| *position <= to);
         let matching = self.pending_truncation == Some(epoch);
         self.feed(Event::Truncated { epoch, to });
         if matching {
@@ -7214,7 +7021,7 @@ fn wire_to_config_op(op: u32, id: NodeId, ip: u32, port: u16) -> Option<ConfigOp
     }
 }
 
-/// `WireConfig` (the decoded `FRAME_TYPE_CONFIG` payload) -> `ClusterConfig`
+/// `WireConfig` (the decoded `CLUSTER kind=Membership` payload) -> `ClusterConfig`
 /// (the SM's in-memory form). Purely numeric — `WireMember`'s `(ip, port)` IS
 /// the `Addr` shape already, no `SocketAddr` involved.
 pub(crate) fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig {
@@ -7235,7 +7042,7 @@ pub(crate) fn config_content_diverges(current: &ClusterConfig, incoming: &Cluste
     incoming.version == current.version && incoming != current
 }
 
-/// `ClusterConfig` -> the `WireConfig` to append as a `FRAME_TYPE_CONFIG`
+/// `ClusterConfig` -> the `WireConfig` to append as a `CLUSTER kind=Membership`
 /// payload. `prev_position` is an audit-trail field only (the durable
 /// `ConfigRecord` keeps the authoritative prev) — the caller passes the
 /// CURRENTLY-adopted config's position, the entry `c` supersedes.
@@ -7450,7 +7257,7 @@ fn rederive_term_map(
 /// 1. **Genesis-seed** a fresh instance dir (no record yet) from `members`/
 ///    `learners` — authoritative only here (see `NodeConfig::members`'s doc);
 ///    every subsequent boot, and every live reconfiguration, is owned by the
-///    durable record + the `FRAME_TYPE_CONFIG` stream from here on.
+///    durable record + the `CLUSTER kind=Membership` stream from here on.
 ///    Behavior-preservation: a cluster that never appends a config frame gets
 ///    this genesis record (version 0, `prev == config`) verbatim forever —
 ///    nothing observably changes from the pre-M7 static wiring.
@@ -7537,19 +7344,18 @@ pub(crate) fn recover_config_record(
 
 /// M7 Task 6 (Step 3a): recovery counterpart of `rederive_term_map` above for
 /// the `ConfigRecord` — see the boot call site's doc for the crash window this
-/// closes (a follower durably archives a `FRAME_TYPE_CONFIG` frame and only a
+/// closes (a follower durably archives a `CLUSTER kind=Membership` frame and only a
 /// LATER duty cycle drains it into the persisted record; a crash in between
 /// loses the persist but not the archived bytes). Scans archived frames from
 /// `rec.position` (clamped to `archive.first_base()`, exactly like
 /// `rederive_term_map`'s clamp — everything below it is either already folded
 /// into `rec` or covered by a snapshot floor) forward, folding in every
-/// `FRAME_TYPE_CONFIG` frame whose decoded version strictly exceeds the
+/// `CLUSTER kind=Membership` frame whose decoded version strictly exceeds the
 /// currently-folded config's version (idempotent / monotone, exactly
 /// `Event::ConfigObserved`'s own adoption guard). Produces the same one-level
 /// prev/cur shape `Action::ConfigAdopted`'s exec arm persists, so even a
 /// multi-hop scan (more than one adoption crash-exposed in the same window)
 /// folds down to a valid one-level record.
-#[allow(deprecated)] // FRAME_TYPE_CONFIG: see the import above
 pub(crate) fn rederive_config(
     archive: &Archive,
     rec: ConfigRecord,
@@ -7558,7 +7364,7 @@ pub(crate) fn rederive_config(
     let mut cur = rec;
     let mut replay = archive.replay_from(start)?;
     while let Some(frame) = replay.next()? {
-        if frame.header.frame_type != FRAME_TYPE_CONFIG {
+        if frame.header.frame_type != FRAME_TYPE_CLUSTER {
             continue;
         }
         // Plan 1 task 2 (spec §4.3/§4.6): this walk reads the archived frame
@@ -7566,6 +7372,14 @@ pub(crate) fn rederive_config(
         // already strips the prefix and filters by kind), so it must do both
         // itself — a `ScheduleTable`/`Settings` CLUSTER frame in the same
         // scan window is the cluster FSM's business, not a config change.
+        //
+        // A frame-4 body whose PREFIX will not read is silently SKIPPED, not
+        // fail-stopped, and that narrowing is deliberate: it mirrors the
+        // archive walk (`Archive::observe_terms`), which is the other half of
+        // the same adoption path, and it is the honest reading — an
+        // unreadable prefix does not say the frame was a membership change.
+        // The fail-stop below still stands for a `Membership` body that will
+        // not decode, which IS a corrupt config frame.
         let Some((ClusterKind::Membership, payload)) = read_cluster_prefix(&frame.payload) else {
             continue;
         };
@@ -7780,7 +7594,6 @@ fn snapshot_set_for(
     root: &std::path::Path,
     services: &crate::services::ServicesConfig,
     config_bytes: &Mutex<Vec<u8>>,
-    schedule_ship: &Mutex<ScheduleShip>,
     node_id: NodeId,
     decline_reason: &AtomicU8,
 ) -> Option<SnapshotSet> {
@@ -7864,104 +7677,21 @@ fn snapshot_set_for(
     // that lives until the end of a literal holds its mutex across the other
     // lock, and neither is a lock this thread should be holding twice over.
     let config = config_bytes.lock().unwrap().clone();
-    // Time-and-timers plan 3: the schedule table this session ships — the
-    // newest table this node has adopted AND knows committed, at ship time,
-    // exactly as `config` above is the config at ship time.
-    let table = shippable_schedule(schedule_ship, cnc.counters().commit.load_acquire());
     Some(SnapshotSet {
         services_declared: mask,
         identity,
         version,
         config,
-        table,
+        // Plan 1 task 5→9 window (Ruling R4): the schedule table no longer
+        // rides a `SNAP_TABLE` of its own — it is part of the CLUSTER ARTIFACT
+        // task 9 puts on the session. Until then the wire field still exists
+        // (`uc_net` is untouched) and carries the wire's honest "no table",
+        // `(0, 0, [])`: the receiver's withhold rule is satisfied so sessions
+        // still complete, and a below-floor joiner learns the table from the
+        // log once it catches up rather than from the session.
+        table: (0, 0, Vec::new()),
         artifacts,
     })
-}
-
-/// Plan 3 (review R6): the SHIP-TIME commit gate on the schedule table —
-/// what a snapshot session may carry, given the cache and this node's commit
-/// counter. Returns `SnapshotSet.table`'s `(position, time_ns, bytes)`;
-/// `(0, 0, [])` is what this session offers when there is no ANCHORED,
-/// committed, non-empty table to pass on — which is not quite "this node has
-/// no table" (see the position-0 rule below).
-///
-/// A record is shippable when it is at or below `commit`, or when it came in
-/// by fiat off another session (see [`ScheduleShip::known_committed`]).
-/// Otherwise the leader appended the frame but has not committed it yet, and
-/// the fallback is the record's one-level `prev` — which plan 2's
-/// single-in-flight rule (`apply_schedule_table` refuses a second table while
-/// one is in flight) guarantees committed, since a table can only be applied
-/// once its predecessor has. The `position <= commit` filter on `prev` makes
-/// that argument fail-SAFE rather than fail-stale, exactly as
-/// `revert_schedule_below`'s does.
-///
-/// Review R7 — the POSITION-0 rule. The wire freezes
-/// `(position == 0) <=> (table_len == 0)` (`read_snap_table_body`), and a
-/// session completes only once its table arrives, so a position-0 record
-/// shipped WITH a body is refused on every re-send and STALLS the joiner
-/// instead of failing loudly. Two records have that shape: the `to == 0`
-/// wipe record (`revert_schedule_below`), which keeps its table body at
-/// position 0 so a wiped node keeps ticking, and the canonical no-table
-/// record (`ScheduleRecord::empty`), whose bytes are an 8-byte encoded EMPTY
-/// table rather than zero bytes. Both ship as `(0, 0, [])`, and so does any
-/// record whose bytes will not decode at all.
-///
-/// Ruling R8 — an EMPTY table at a REAL position is NOT the position-0 case
-/// above and ships as itself: `apply_schedule_table` committing a table with
-/// no entries ("apply a file without the entry") is a legitimate outcome,
-/// the wire accepts a `position != 0` body whose `table_len` is the 8-byte
-/// canonical-empty encoding, and collapsing it to `(0, 0, [])` made a joiner
-/// read position 0 for a table its peers correctly hold at a real position —
-/// tripping `Uc2ScheduleTableDiverged` rather than converging. Only
-/// UNDECODABLE bytes fall back to "no table"; an empty-but-decodable one
-/// ships.
-///
-/// The consequence is deliberate: **a wiped node's kept table does not
-/// propagate by snapshot.** Position 0 means the table is unanchored in the
-/// log — the wipe keep-alive is a LOCAL fiat that keeps this node ticking
-/// until the next table frame, not a cluster fact a joiner should record.
-/// A joiner given it would hold a table no position backs, which is the
-/// divergence `Uc2ScheduleTableDiverged` exists to catch; it gets "no table"
-/// and learns the real one from the next frame.
-///
-/// Why the gate lives HERE and not in `refresh_schedule_ship`: the commit
-/// counter crossing a record's position produces no adoption and therefore no
-/// refresh, so a cache filtered at write time would hold a stale "not yet"
-/// verdict forever. Read time is the only time this question has an answer.
-///
-/// It costs nothing on the hot path — a snapshot session is opened by a
-/// below-floor peer's NAK, not per datagram.
-fn shippable_schedule(ship: &Mutex<ScheduleShip>, commit: u64) -> (u64, u64, Vec<u8>) {
-    let none = (0, 0, Vec::new());
-    let g = ship.lock().unwrap();
-    let Some(rec) = g.rec.as_ref() else {
-        return none;
-    };
-    let selected = if g.known_committed || rec.position <= commit {
-        rec
-    } else {
-        match rec.prev.as_deref().filter(|p| p.position <= commit) {
-            Some(p) => p,
-            None => return none,
-        }
-    };
-    // The position-0 rule (forced by the wire: `read_snap_table_body`'s
-    // frozen biconditional refuses a body at position 0) and its companion:
-    // an UNDECODABLE table means the same thing as no table, and `(0, 0,
-    // [])` is how the wire says it. Ruling R8: an EMPTY table does NOT fall
-    // into this case — a committed empty table at a real position is a
-    // legitimate apply result ("apply a file with no entries"), the wire
-    // accepts it (`position != 0`, `table_len == 8` for the canonical empty
-    // encoding), and shipping it as `(0, 0, [])` made the joiner read
-    // position 0 and trip `Uc2ScheduleTableDiverged` against every peer that
-    // correctly adopted the empty table at its real position.
-    if selected.position == 0 {
-        return none;
-    }
-    match decode_schedule_table(&selected.table) {
-        Some(_) => (selected.position, selected.time_ns, selected.table.clone()),
-        None => none,
-    }
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
@@ -7971,9 +7701,12 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster_agent::ClusterAgent;
     use uc_log::region::Region;
     use uc_protocol::ring::RingHeader;
     use uc_protocol::v2::ipc::MSG_V2_SUBMIT;
+    use uc_protocol::v2::schedule::encode_schedule_table;
+    use uc_protocol::v2::settings::encode_settings;
 
     /// Build a heap-backed cnc page for the bare-`Consensus` harness (no file,
     /// no flock — these tests drive `feed`/`exec` directly).
@@ -7992,6 +7725,12 @@ mod tests {
     /// senders/receivers don't disconnect while we drive `feed` directly.
     struct Harness {
         cons: Consensus,
+        /// Cluster FSM (spec §4.1): the `uc2-cluster` agent the real node runs
+        /// on its own thread, here driven a cycle at a time by
+        /// [`Harness::commit_through`]. Shares this harness's buffer, cnc page,
+        /// `ClusterView` and `cluster_snapshot_pos` with `cons`, exactly as
+        /// `Node::start_with_socket` wires them.
+        cluster: ClusterAgent,
         /// M8 Task 12: the producer half of the handshake route the receiver
         /// agent would own in a real node — lets a test inject a handshake
         /// datagram exactly as `crypto_admit` would deliver one.
@@ -8000,7 +7739,6 @@ mod tests {
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
         _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
-        _tbl_obs_tx: mpsc::SyncSender<(u64, u64, Vec<u8>)>,
         _ingress_tx: mpsc::SyncSender<Ingress>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
@@ -8009,6 +7747,22 @@ mod tests {
     impl Harness {
         fn gate_open(&self) -> bool {
             self.cons.intake_gate.load(Ordering::Acquire)
+        }
+
+        /// Commit (and make durable) everything up to `end`, then run the
+        /// `uc2-cluster` agent one cycle — which is what publishes the
+        /// `ClusterView` the consensus agent reads back in `refresh_from_view`.
+        /// The two counters are moved forward only, never back: the harness
+        /// primes them at 6016 and an election advances them further.
+        fn commit_through(&mut self, end: u64) {
+            let c = self.cons.cnc.counters();
+            if c.durable.load_acquire() < end {
+                c.durable.store_release(end);
+            }
+            if c.commit.load_acquire() < end {
+                c.commit.store_release(end);
+            }
+            self.cluster.do_work();
         }
 
         /// Adopt `term` (higher-term RequestVote), then deliver a divergent term
@@ -8155,7 +7909,6 @@ mod tests {
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
         let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(64);
-        let (tbl_obs_tx, tbl_obs_rx) = mpsc::sync_channel::<(u64, u64, Vec<u8>)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Ingress>(64);
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
@@ -8203,6 +7956,40 @@ mod tests {
             (0..CNC_MAX_SERVICES).map(|_| None).collect();
         svc_sched[0] = Some(svc_sched_0);
 
+        // Cluster FSM (spec §4.1/§4.5): one genesis state, one view, one
+        // `cluster_snapshot_pos` — shared between the `uc2-cluster` agent this
+        // harness drives by hand and the `Consensus` under test, exactly as
+        // `Node::start_with_socket` shares them.
+        let cluster_genesis = ClusterState {
+            membership: config.clone(),
+            table: ScheduleTable { entries: vec![] },
+            table_position: 0,
+            settings: Settings::genesis_default(),
+            applied: 0,
+        };
+        let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
+        let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
+        // Declared hashes: none. The harness node is `none_for_tests`, and a
+        // test that arms a row pokes `cons.timers[row]` AND
+        // `cluster.set_declared_rows_for_test`/its own FSM if it needs the
+        // agent to accept a table naming that row.
+        let cluster = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            ClusterFsm::new(cluster_genesis, Vec::new()),
+            Arc::clone(&cluster_view),
+            dir.path().join("snapshots/cluster"),
+            // The harness primes the counters at 6016, so that (not 0) is
+            // where this agent's follower starts — below it the ring holds
+            // nothing this node ever wrote.
+            6016,
+            Arc::clone(&cluster_snapshot_pos),
+            Arc::new(AtomicU64::new(0)),
+            Archive::open(ArchiveConfig::new(dir.path().join("cluster-journal")))
+                .unwrap()
+                .journal_arc(),
+        );
+
         let cons = Consensus {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
@@ -8210,7 +7997,6 @@ mod tests {
             obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             pending_obs: Vec::new(),
             pending_cfg_obs: Vec::new(),
-            pending_tbl_obs: Vec::new(),
             trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
             trunc_trace: false,
             id: 1,
@@ -8246,6 +8032,9 @@ mod tests {
             next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: 256 * 1024,
+            admission_bytes_default: 256 * 1024,
+            buffer_bytes: 1 << 16,
+            max_payload: 4096,
             fsm_lag_eff: crate::services::fsm_lag_eff(
                 &ServicesConfig::none_for_tests(),
                 1 << 16,
@@ -8264,17 +8053,14 @@ mod tests {
             net_rx,
             obs_rx,
             cfg_obs_rx,
-            tbl_obs_rx,
+            view_position_seen: 0,
+            last_cluster_append: 0,
             schedule_position: 0,
-            schedule_state: crate::schedule_state::open(dir.path()).unwrap(),
             schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),
+            settings_pending: dir.path().join(SETTINGS_PENDING_FILE),
             schedule_pos_pub: Arc::new(AtomicU64::new(0)),
             schedule_entries_pub: Arc::new(AtomicU64::new(0)),
             schedule_refused: Arc::new(AtomicU64::new(0)),
-            schedule_ship: Arc::new(Mutex::new(ScheduleShip {
-                rec: None,
-                known_committed: false,
-            })),
             ingress_rx,
             trunc_tx,
             trunc_slot,
@@ -8302,7 +8088,6 @@ mod tests {
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::new(AtomicU64::new(0)),
             incoming_snapshot_config: Arc::new(Mutex::new(Vec::new())),
-            incoming_snapshot_table: Arc::new(Mutex::new((0, 0, Vec::new()))),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
@@ -8340,164 +8125,443 @@ mod tests {
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
-            cluster_view: Arc::new(ClusterView::new(&ClusterState {
-                membership: config.clone(),
-                table: ScheduleTable { entries: vec![] },
-                table_position: 0,
-                settings: Settings::genesis_default(),
-                applied: 0,
-            })),
-            cluster_snapshot_pos: Arc::new(AtomicU64::new(0)),
+            cluster_view,
+            cluster_snapshot_pos,
         };
 
         Harness {
             cons,
+            cluster,
             hs_tx,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
             _cfg_obs_tx: cfg_obs_tx,
-            _tbl_obs_tx: tbl_obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
             _dir: dir,
         }
     }
 
-    /// Plan 2 (review round 2): the leader-open COLLAPSE is a truncation
-    /// too. `base` is `ElectionSm::durable` sampled an earlier duty cycle
-    /// than the vote drain that elects us, so the archive can have recorded a
-    /// table frame THIS node appended as a previous leader — a frame above
-    /// `base` that the collapse drops. Without a revert `schedule_position`
-    /// would keep claiming it, and the next table frame (landing at or below
-    /// that position) would be ignored on this node alone.
-    ///
-    /// The harness's `base` is 6016, so a record at 8192 is above the cut and
-    /// its predecessor at 4096 is below it: the arm must promote the
-    /// predecessor. (The no-predecessor case reverts to
-    /// `ScheduleRecord::empty()`, covered by `schedule_state`'s own unit
-    /// test.)
+    // ---- plan 1 task 5: the leader issues CLUSTER commands, the view answers ----
+
+    /// Stage `settings` as `<instance_dir>/settings.pending` — what `uc2ctl
+    /// settings apply` writes before it signs the digest.
+    fn stage_settings_for_test(h: &Harness, settings: &Settings) {
+        let mut bytes = Vec::new();
+        encode_settings(settings, &mut bytes);
+        std::fs::write(&h.cons.settings_pending, &bytes).expect("stage the settings");
+    }
+
+    /// Spec §4.3/§4.5: a `Settings` command travels as a `CLUSTER` frame, and
+    /// nothing on this node changes until the `uc2-cluster` agent APPLIES it
+    /// at commit and publishes the view. The consensus agent then reads the
+    /// new value back on its next pass — this is the whole loop, end to end.
     #[test]
-    fn a_leader_open_collapse_below_the_adopted_table_reverts_the_record() {
+    fn a_settings_command_is_appended_as_a_cluster_frame_and_the_view_follows_at_commit() {
         let mut h = harness();
-        let bytes = ScheduleRecord::empty().table; // a decodable, empty table
-        let rec = ScheduleRecord {
-            position: 8192,
-            time_ns: 77,
-            table: bytes.clone(),
-            prev: Some(Box::new(ScheduleRecord {
-                position: 4096,
-                time_ns: 11,
-                table: bytes,
-                prev: None,
-            })),
+        drive_to_serving_leader(&mut h);
+        let s = Settings {
+            admission_bytes: 4096,
+            ..Settings::genesis_default()
         };
-        crate::schedule_state::store(&h.cons.schedule_state, &rec).unwrap();
-        h.cons.schedule_position = 8192;
-        h.cons.schedule_pos_pub.store(8192, Ordering::Relaxed);
-
-        // Win the election: Tick -> candidate term 3, one grant -> BecomeLeader
-        // with base = durable = 6016 < 8192.
-        h.cons.feed(Event::Tick { now_ns: 301 });
-        h.cons.feed(Event::Vote {
-            from: 0,
-            term: 3,
-            granted: true,
-        });
-
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(s))
+            .unwrap();
+        // Appended, not committed: the view is still genesis and the door is
+        // still the node's own default.
         assert_eq!(
-            h.cons.schedule_position, 4096,
-            "the frame above base is gone; its predecessor is adopted"
+            h.cons.cluster_view.admission_bytes.load(Ordering::Acquire),
+            0
         );
-        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 4096);
-        let back = crate::schedule_state::load(&h.cons.schedule_state)
-            .unwrap()
-            .expect("a record is still stored");
-        assert_eq!(back.position, 4096, "persisted, not just in memory");
-        assert_eq!(back.prev, None, "the one-level history is exhausted");
-        // The collapse itself still went out, unchanged.
-        h.complete_leader_open();
-        assert!(h.cons.leader_flag.load(Ordering::Acquire));
+        h.cons.do_work();
         assert_eq!(
-            h.cons.schedule_position, 4096,
-            "finishing the open does not resurrect the cut frame"
+            h.cons.admission_bytes,
+            256 * 1024,
+            "an appended-but-uncommitted setting must not move the door"
+        );
+
+        h.commit_through(end);
+        assert_eq!(
+            h.cons.cluster_view.admission_bytes.load(Ordering::Acquire),
+            4096,
+            "the uc2-cluster agent applied the committed frame"
+        );
+        h.cons.do_work();
+        assert_eq!(h.cons.admission_bytes, 4096, "the door read the view");
+        assert_eq!(
+            h.cons.cnc.admission_bytes(),
+            4096,
+            "and the cnc mirror an operator reads follows it"
+        );
+        assert_eq!(
+            h.cons.view_position_seen, end,
+            "and the shadow tracks the view's position tag"
         );
     }
 
-    /// Plan 2 (final review, Important 2): BOOT arming needs the archive
-    /// drain's durable-plausibility check too. The leader persists the record
-    /// at APPEND, before the archive has recorded the frame; a node that dies
-    /// in that window restarts holding a record no durable byte backs. Arming
-    /// it would park `schedule_position` above `durable`, where a later table
-    /// frame landing at or below that position is ignored as a
-    /// re-observation — on this node alone — and if it then leads it fires the
-    /// old table.
-    ///
-    /// The harness's durable counter is 6016, so a record at 8192 is
-    /// implausible and its predecessor at 4096 is not: boot must promote the
-    /// predecessor, persist it, and arm from it. (No predecessor reverts to
-    /// `ScheduleRecord::empty()`, covered by `schedule_state`'s own unit
-    /// test; `durable == 0` is the wipe branch, which keeps the table at
-    /// position 0 by fiat — `revert_schedule_below`'s documented case.)
+    /// Spec §4.4/§6: the replicated `fsm_lag` moves the FSM door and the cnc
+    /// mirror, clamped to this host's ring — and reverting it to `0` returns
+    /// the door to what THIS node derived at boot, never to a wider one.
     #[test]
-    fn a_boot_record_above_durable_reverts_before_arming() {
+    fn the_replicated_fsm_lag_moves_the_door_and_reverts_to_the_boot_value() {
         let mut h = harness();
-        let bytes = ScheduleRecord::empty().table; // a decodable, empty table
-        let rec = ScheduleRecord {
-            position: 8192,
-            time_ns: 77,
-            table: bytes.clone(),
-            prev: Some(Box::new(ScheduleRecord {
-                position: 4096,
-                time_ns: 11,
-                table: bytes,
-                prev: None,
-            })),
-        };
-        crate::schedule_state::store(&h.cons.schedule_state, &rec).unwrap();
+        // The harness node is `none_for_tests` (nothing declared), where the
+        // door is inert by design — declare a row so there is a door at all.
+        h.cons.services = crate::services::ServicesConfig::from_names(
+            &["kv"],
+            Some(crate::services::FsmLag::Lockstep),
+        )
+        .unwrap();
+        let boot = crate::services::fsm_lag_eff(&h.cons.services, 1 << 16, 4096);
+        h.cons.fsm_lag_eff = boot;
+        assert_eq!(boot, Some(4128), "lockstep: one max-size frame");
+        drive_to_serving_leader(&mut h);
+
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings {
+                fsm_lag_bytes: 4096,
+                ..Settings::genesis_default()
+            }))
+            .unwrap();
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(h.cons.fsm_lag_eff, Some(4096), "the committed bound");
+        assert_eq!(h.cons.cnc.fsm_lag_bytes(), 4096, "and the cnc mirror");
+
+        // An absurd bound is CLAMPED at use, never refused — the record is a
+        // cluster-wide intent and this host's ring is the bound.
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings {
+                fsm_lag_bytes: 1 << 40,
+                ..Settings::genesis_default()
+            }))
+            .unwrap();
+        h.commit_through(end);
+        h.cons.do_work();
         assert_eq!(
-            h.cons.cnc.counters().durable.load_acquire(),
+            h.cons.fsm_lag_eff,
+            Some((1u64 << 16) / 2 - 1),
+            "clamped below half this host's ring"
+        );
+
+        // Back to `0` — "derive at use": this node's OWN boot value, not a
+        // recomputed default that would silently widen a lockstep door.
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings::genesis_default()))
+            .unwrap();
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(h.cons.fsm_lag_eff, boot);
+        assert_eq!(
+            h.cons.cnc.fsm_lag_bytes(),
+            0,
+            "the page's lockstep sentinel"
+        );
+    }
+
+    /// Spec §4.4: SINGLE IN FLIGHT. A second staged apply while the previous
+    /// CLUSTER command is still above the committed view is answered `retry`
+    /// (status 2, side-effect-free) — `uc2ctl` polls, and the wait is one
+    /// commit round-trip.
+    #[test]
+    fn settings_apply_is_single_in_flight_on_the_view_position() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                snapshot_interval_bytes: 5,
+                ..Settings::genesis_default()
+            },
+        );
+        let (status, reason, end) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (0, 0), "the first apply is accepted");
+
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                snapshot_interval_bytes: 6,
+                ..Settings::genesis_default()
+            },
+        );
+        let (status, reason, version) = h.cons.apply_settings_staged();
+        assert_eq!(
+            (status, reason),
+            (2, 0),
+            "retry while the previous command is above the view"
+        );
+        assert_eq!(
+            version,
+            h.cons.cluster_view.position.load(Ordering::Acquire),
+            "the retry reports the committed cluster position"
+        );
+        assert!(
+            h.cons.settings_pending.exists(),
+            "a retry is side-effect-free: the staged file survives it"
+        );
+
+        h.commit_through(end);
+        h.cons.do_work();
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!(
+            (status, reason),
+            (0, 0),
+            "once the first command commits, the gate opens"
+        );
+        assert!(
+            !h.cons.settings_pending.exists(),
+            "an accepted apply consumes the staged file"
+        );
+    }
+
+    /// Spec §4.6, the load-bearing one: **the kernel's membership path is
+    /// unchanged.** A `Membership` command still adopts at APPEND — durable
+    /// time, before commit — because that is what makes a reconfiguration
+    /// safe (the new config must be in force for the very quorum that
+    /// commits it). The cluster FSM's own copy of the row advances at commit,
+    /// later, and is never what the kernel votes or reconciles on.
+    #[test]
+    fn the_kernel_still_adopts_membership_at_append_on_the_leader() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let next = h
+            .cons
+            .sm
+            .config()
+            .apply(ConfigOp::AddLearner {
+                id: 7,
+                addr: addr_to_pair("127.0.0.7:9107".parse().unwrap()),
+            })
+            .unwrap();
+        let before = h.cons.cluster_view.membership().version;
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Membership(next.clone()))
+            .unwrap();
+        assert_eq!(
+            h.cons.sm.config().version,
+            next.version,
+            "durable-time adoption, before commit"
+        );
+        assert_eq!(h.cons.sm.config_position(), end);
+        assert_eq!(
+            h.cons.cluster_view.membership().version,
+            before,
+            "the cluster FSM waits for commit"
+        );
+
+        // …and once it commits, the FSM's row agrees with the kernel's.
+        h.commit_through(end);
+        assert_eq!(h.cons.cluster_view.membership().version, next.version);
+    }
+
+    /// Spec §4.5: the rows arm from the COMMITTED table, through the view.
+    /// The re-pointed half of the deleted `adopt_table_frame` coverage — the
+    /// leader used to arm at append off its own durable record; it now arms
+    /// when the `uc2-cluster` agent publishes, and `schedule_position` is a
+    /// mirror of the view's `table_position`.
+    #[test]
+    fn the_rows_arm_from_the_committed_table_not_from_the_append() {
+        let mut h = harness();
+        // One declared row for the table's entry to land on (the harness is
+        // `none_for_tests`, which declares none) — on BOTH sides: the
+        // consensus agent's `timers` and the cluster agent's own FSM, which
+        // refuses a table naming an undeclared row.
+        let hash = crate::services::ServicesConfig::from_names(&["kv"], None)
+            .unwrap()
+            .name_of(0)
+            .unwrap()
+            .hash();
+        h.cons.timers[0] = Some(crate::timers::RowTimers::new(hash));
+        h.cluster = ClusterAgent::new(
+            Arc::clone(&h.cons.buffer),
+            Arc::clone(&h.cons.cnc),
+            ClusterFsm::new(
+                ClusterState {
+                    membership: h.cons.sm.config().clone(),
+                    table: ScheduleTable { entries: vec![] },
+                    table_position: 0,
+                    settings: Settings::genesis_default(),
+                    applied: 0,
+                },
+                vec![hash],
+            ),
+            Arc::clone(&h.cons.cluster_view),
+            h._dir.path().join("snapshots/cluster"),
             6016,
-            "the counter boot arming judges against"
+            Arc::clone(&h.cons.cluster_snapshot_pos),
+            Arc::new(AtomicU64::new(0)),
+            Archive::open(ArchiveConfig::new(h._dir.path().join("rows-journal")))
+                .unwrap()
+                .journal_arc(),
         );
+        drive_to_serving_leader(&mut h);
 
-        h.cons.arm_schedule_at_boot();
-
+        let table = ScheduleTable {
+            entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                identity_hash: hash,
+                timer_id: 9,
+                rule: ScheduleRule::Every {
+                    period_ns: 100,
+                    anchor_ns: 0,
+                },
+            }],
+        };
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::ScheduleTable(table.clone()))
+            .unwrap();
+        h.cons.do_work();
         assert_eq!(
-            h.cons.schedule_position, 4096,
-            "the record above durable is not adopted; its predecessor is"
+            h.cons.timers[0].as_ref().unwrap().table_len(),
+            0,
+            "nothing arms off an uncommitted table frame"
         );
-        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 4096);
-        let back = crate::schedule_state::load(&h.cons.schedule_state)
-            .unwrap()
-            .expect("a record is still stored");
-        assert_eq!(back.position, 4096, "persisted, not just in memory");
-        assert_eq!(back.prev, None, "the one-level history is exhausted");
+        assert_eq!(h.cons.schedule_position, 0);
+
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_len(),
+            1,
+            "the row arms once the frame commits"
+        );
+        assert_eq!(
+            h.cons.schedule_position, end,
+            "schedule_position mirrors the view's table_position"
+        );
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), end);
+        assert_eq!(h.cons.schedule_entries_pub.load(Ordering::Relaxed), 1);
+
+        // An EMPTY table is how an operator removes an entry: apply a file
+        // without it. The row disarms, and the position moves on.
+        let end2 = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::ScheduleTable(ScheduleTable {
+                entries: Vec::new(),
+            }))
+            .unwrap();
+        h.commit_through(end2);
+        h.cons.do_work();
+        assert_eq!(h.cons.timers[0].as_ref().unwrap().table_len(), 0);
+        assert_eq!(h.cons.schedule_position, end2);
     }
 
-    /// The other side of the same guard: a plausible record (at or below
-    /// durable) is adopted at boot exactly as before, so the revert is a
-    /// narrow safety check and not a new way to lose a table across a bounce.
+    /// Spec §4.4 / Ruling R5: an entry naming an FSM this cluster does not
+    /// declare is refused WHOLE, by the FSM's own `validate` — so the
+    /// leader's `REASON_SCHEDULE_UNKNOWN_FSM` and a replica's apply-time
+    /// refusal are the same number by construction, and nothing is appended.
     #[test]
-    fn a_boot_record_at_or_below_durable_is_armed_unchanged() {
+    fn a_table_naming_an_undeclared_row_is_refused_before_it_is_appended() {
         let mut h = harness();
-        let rec = ScheduleRecord {
-            position: 6016, // == durable: the common case, a committed frame
-            time_ns: 77,
-            table: ScheduleRecord::empty().table,
-            prev: None,
-        };
-        crate::schedule_state::store(&h.cons.schedule_state, &rec).unwrap();
+        drive_to_serving_leader(&mut h);
+        let mut bytes = Vec::new();
+        encode_schedule_table(
+            &ScheduleTable {
+                entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                    identity_hash: 0xDEAD_BEEF,
+                    timer_id: 1,
+                    rule: ScheduleRule::Once { at_ns: 5 },
+                }],
+            },
+            &mut bytes,
+        );
+        std::fs::write(&h.cons.schedule_pending, &bytes).expect("stage the table");
+        let (id, ip, port) = staged_digest(&bytes);
+        let append_before = h.cons.cnc.counters().append.load_acquire();
 
-        h.cons.arm_schedule_at_boot();
+        let (status, reason, _) = h.cons.apply_schedule_table(id, ip, port);
 
-        assert_eq!(h.cons.schedule_position, 6016);
-        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 6016);
+        assert_eq!(status, 1, "refused, not appended or retried");
+        assert_eq!(reason, REASON_SCHEDULE_UNKNOWN_FSM);
         assert_eq!(
-            crate::schedule_state::load(&h.cons.schedule_state)
-                .unwrap()
-                .map(|r| r.position),
-            Some(6016),
-            "untouched on disk"
+            h.cons.cnc.counters().append.load_acquire(),
+            append_before,
+            "a refused apply appends nothing"
+        );
+        assert_eq!(h.cons.last_cluster_append, 0, "and holds no gate shut");
+        assert!(
+            h.cons.schedule_pending.exists(),
+            "a refused apply leaves the staged file for the operator to re-sign"
+        );
+    }
+
+    /// Spec §6: the `settings apply` staged-file band (44-47), including the
+    /// `validate`-sourced bounds refusal, which is the ONE reason code this
+    /// module does not produce itself.
+    #[test]
+    fn settings_apply_refuses_a_bad_digest_a_missing_file_and_out_of_bounds() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+
+        // (a) nothing staged.
+        let (status, reason, _) = h.cons.apply_settings(1, 2, 3);
+        assert_eq!((status, reason), (1, REASON_SETTINGS_MISSING));
+
+        // (b) staged, but the request carries a different file's digest.
+        stage_settings_for_test(&h, &Settings::genesis_default());
+        let (other_id, other_ip, other_port) = staged_digest(b"a different file entirely");
+        let (status, reason, _) = h.cons.apply_settings(other_id, other_ip, other_port);
+        assert_eq!((status, reason), (1, REASON_SETTINGS_DIGEST));
+
+        // (c) staged bytes that are not a `Settings` record at all.
+        std::fs::write(&h.cons.settings_pending, b"not settings").unwrap();
+        let (id, ip, port) = staged_digest(b"not settings");
+        let (status, reason, _) = h.cons.apply_settings(id, ip, port);
+        assert_eq!((status, reason), (1, REASON_SETTINGS_DECODE));
+
+        // (d) a decodable record the cluster FSM refuses — the reason comes
+        //     back from `ClusterRefusal::reason_code`, not from this module.
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                admission_bytes: u64::MAX,
+                ..Settings::genesis_default()
+            },
+        );
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (1, REASON_SETTINGS_BOUNDS));
+        assert_eq!(
+            h.cons.last_cluster_append, 0,
+            "nothing was appended by any of the four refusals"
+        );
+    }
+
+    /// Spec §4.7 / the floor rule: the purge floor is the minimum over the
+    /// user rows AND the cluster artifact — but a `0` cluster artifact ("none
+    /// yet") must NOT pin the floor at 0 forever.
+    #[test]
+    fn the_purge_floor_includes_the_cluster_artifact_but_only_once_it_exists() {
+        let mut h = harness();
+        h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+        h.cons
+            .cnc
+            .snapshots()
+            .service_snapshot_pos
+            .store_release(4096);
+
+        // No cluster artifact yet: the rows' floor stands on its own.
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, 4096);
+
+        // The rows move on, but the cluster artifact lags: the floor follows
+        // the artifact, not the rows.
+        h.cons
+            .cnc
+            .snapshots()
+            .service_snapshot_pos
+            .store_release(6016);
+        h.cons.cluster_snapshot_pos.store(5000, Ordering::Release);
+        h.cons.snapshot_floor_last_persist_ns = None; // skip the 100 ms fsync floor
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, 5000,
+            "the cluster artifact holds the floor down, so a purge cannot \
+             drop journal the uc2-cluster agent still replays from"
         );
     }
 
@@ -9821,89 +9885,6 @@ mod tests {
         );
     }
 
-    /// Parity with the two tests above, for the SCHEDULE_TABLE half (plan
-    /// 2/3, do_work step 1c'). The table path was written from the OLD config
-    /// pattern and carries the same latent class, minus the "lost under the
-    /// latch" half (`adopt_table_frame` does not run through the SM, so
-    /// nothing drops): an observation naming a frame ABOVE an in-flight cut
-    /// can sit in the channel while `Action::Truncate` has already run
-    /// `revert_schedule_below`, and adopting it afterwards parks
-    /// `schedule_position` at a position the cut removed — on this node
-    /// alone, where a later table frame landing at or below it is then
-    /// ignored as a re-observation.
-    ///
-    /// The harness reconciles to a cut at 4096 with durable at 6016, so the
-    /// observation at 6016 is above the cut yet passes the durable
-    /// plausibility skip — exactly the case the skip cannot catch. Before the
-    /// fix it is adopted immediately, under the latch, and survives the cut
-    /// (the 4096 one is then swallowed by `adopt_table_frame`'s
-    /// `position <= schedule_position` guard).
-    #[test]
-    fn a_table_observation_above_the_cut_is_dropped_and_the_one_at_it_adopts() {
-        use uc_protocol::v2::schedule::ScheduleEntry;
-
-        let mut h = harness();
-        let table_with = |timer_id: u64| {
-            let mut bytes = Vec::new();
-            encode_schedule_table(
-                &ScheduleTable {
-                    entries: vec![ScheduleEntry {
-                        identity_hash: 0xfeed_face_dead_beef,
-                        timer_id,
-                        rule: ScheduleRule::Every {
-                            period_ns: 100,
-                            anchor_ns: 0,
-                        },
-                    }],
-                },
-                &mut bytes,
-            );
-            bytes
-        };
-        let above = table_with(9);
-        let at_cut = table_with(1);
-
-        // A reconcile truncation to 4096 is in flight; the SM latch is up.
-        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
-        assert!(h.cons.sm.is_truncating(), "latch up");
-        let epoch = h.cons.pending_truncation.expect("bracket open");
-        assert_eq!(
-            h.cons.cnc.counters().durable.load_acquire(),
-            6016,
-            "the counter the plausibility skip judges against, still pre-cut"
-        );
-
-        // The archive emits both observations; the duty cycle drains them
-        // while the latch is up. Neither may be adopted here.
-        h._tbl_obs_tx.send((6016, 77, above)).unwrap();
-        h._tbl_obs_tx.send((4096, 11, at_cut.clone())).unwrap();
-        h.cons.do_work();
-        assert_eq!(
-            h.cons.schedule_position, 0,
-            "nothing adopts while the latch is up"
-        );
-
-        // The archive cuts to 4096 (re-priming the counters there) and acks.
-        h.cons.cnc.counters().prime(4096);
-        h.post_ack_and_drain(epoch, 4096);
-        h.cons.do_work();
-
-        assert_eq!(
-            h.cons.schedule_position, 4096,
-            "the frame at the cut survived it and must be adopted; the one \
-             above it was truncated away and its observation is stale"
-        );
-        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 4096);
-        let back = crate::schedule_state::load(&h.cons.schedule_state)
-            .unwrap()
-            .expect("a record is stored");
-        assert_eq!(
-            (back.position, back.time_ns, back.table),
-            (4096, 11, at_cut),
-            "and it is the frame AT the cut, bytes and stamp"
-        );
-    }
-
     // ---- post-M7 follow-up (Task 7): equal-version content-divergence check ----
 
     /// Pure-function unit test: same version + different content diverges;
@@ -10202,344 +10183,6 @@ mod tests {
         );
     }
 
-    // ---- plan 3 Task 3: the snapshot session carries the schedule table ----
-
-    /// Plan 3 (spec §5): a joiner below the floor installs the table the
-    /// session carried BY FIAT — the same argument `adopt_snapshot_config`
-    /// makes for the config, for the same reason: below the floor this node's
-    /// own record is not genuine (its bytes are gone), so there is nothing to
-    /// be idempotent AGAINST. The stale record here sits ABOVE the carried
-    /// position (8192 > 6016), which the frame path's
-    /// `position <= schedule_position` guard would have made a no-op — that
-    /// guard is exactly what must not be here.
-    ///
-    /// The floor is driven at `1 << 20` rather than the carried position: the
-    /// adopt branch is gated on `durable < pos`, and the harness's durable
-    /// counter is 6016. The TABLE's position (what the record and the gauge
-    /// take) is the leader's table-frame position, 6016, which is at or below
-    /// its floor by construction.
-    ///
-    /// Obs is not asserted directly: capturing `schedule_table_adopted` /
-    /// `snapshot_installed` means swapping the PROCESS-GLOBAL log sink, which
-    /// `obs::log`'s own unit tests also swap, in the same binary, in parallel
-    /// (see `the_snapshot_decline_latch_names_each_distinct_reason_once`). The
-    /// gauge, the durable record, the ship cache and the row's armed set are
-    /// the same facts the events report.
-    #[test]
-    fn a_fiat_snapshot_install_replaces_the_schedule_record_and_arms_it() {
-        use uc_protocol::v2::schedule::ScheduleEntry;
-
-        let mut h = harness();
-        // One declared row for the table's entries to land on (the harness is
-        // `none_for_tests`, which declares none).
-        let hash = crate::services::ServicesConfig::from_names(&["kv"], None)
-            .unwrap()
-            .name_of(0)
-            .unwrap()
-            .hash();
-        h.cons.timers[0] = Some(crate::timers::RowTimers::new(hash));
-
-        // The joiner's own, non-genuine record: a table at 8192 over a
-        // predecessor at 4096.
-        let stale = ScheduleRecord::empty().table;
-        crate::schedule_state::store(
-            &h.cons.schedule_state,
-            &ScheduleRecord {
-                position: 8192,
-                time_ns: 5,
-                table: stale.clone(),
-                prev: Some(Box::new(ScheduleRecord {
-                    position: 4096,
-                    time_ns: 1,
-                    table: stale,
-                    prev: None,
-                })),
-            },
-        )
-        .unwrap();
-        h.cons.schedule_position = 8192;
-        h.cons.schedule_pos_pub.store(8192, Ordering::Relaxed);
-
-        // The leader's table, as the receiver publishes it: the table cell
-        // BEFORE the position cell (which is what `Release`/`Acquire` on the
-        // position makes safe to read).
-        let mut bytes = Vec::new();
-        encode_schedule_table(
-            &ScheduleTable {
-                entries: vec![ScheduleEntry {
-                    identity_hash: hash,
-                    timer_id: 9,
-                    rule: ScheduleRule::Every {
-                        period_ns: 100,
-                        anchor_ns: 0,
-                    },
-                }],
-            },
-            &mut bytes,
-        );
-        *h.cons.incoming_snapshot_table.lock().unwrap() = (6016, 77, bytes.clone());
-        let floor = 1u64 << 20;
-        assert!(floor > h.cons.cnc.counters().durable.load_acquire());
-        h.cons.incoming_snapshot.store(floor, Ordering::Release);
-
-        h.cons.do_work();
-
-        let back = crate::schedule_state::load(&h.cons.schedule_state)
-            .unwrap()
-            .expect("a record is stored");
-        assert_eq!(
-            (back.position, back.time_ns, back.table.clone(), back.prev),
-            (6016, 77, bytes.clone(), None),
-            "the carried record replaces the joiner's own, with no history"
-        );
-        assert_eq!(h.cons.schedule_position, 6016);
-        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 6016);
-        assert_eq!(
-            h.cons.timers[0].as_ref().unwrap().table_len(),
-            1,
-            "the row is armed from the carried table"
-        );
-        assert_eq!(
-            shippable_schedule(&h.cons.schedule_ship, 0),
-            (6016, 77, bytes),
-            "and the ship cache carries it onward to the NEXT joiner — at a \
-             commit of 0, which only the fiat exemption clears"
-        );
-
-        // A leader with no table ships `(0, 0, [])`, which installs "no
-        // table": the record goes to position 0 and every row disarms.
-        *h.cons.incoming_snapshot_table.lock().unwrap() = (0, 0, Vec::new());
-        h.cons
-            .incoming_snapshot
-            .store(floor + 4096, Ordering::Release);
-
-        h.cons.do_work();
-
-        let back = crate::schedule_state::load(&h.cons.schedule_state)
-            .unwrap()
-            .expect("a record is stored");
-        assert_eq!(back.position, 0, "no table: the canonical position");
-        assert_eq!(
-            decode_schedule_table(&back.table)
-                .expect("a stored record's bytes always decode")
-                .entries,
-            Vec::new(),
-            "and an empty table, stored in its canonical encoding"
-        );
-        assert_eq!(h.cons.schedule_position, 0);
-        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            h.cons.timers[0].as_ref().unwrap().table_len(),
-            0,
-            "the row is disarmed"
-        );
-        assert_eq!(
-            shippable_schedule(&h.cons.schedule_ship, 0),
-            (0, 0, Vec::new()),
-            "and the ship cache says 'no table' onward as the WIRE says it — \
-             the stored record holds position 0 over the canonical empty \
-             encoding, and `(position == 0) <=> (table_len == 0)` (R7)"
-        );
-    }
-
-    /// Plan 3 (review R6): a session must never carry a table the leader has
-    /// only APPENDED. The leader itself survives that — a truncation reverts
-    /// its record — but a joiner cannot: the truncated range is below its
-    /// floor, so it never sees the cut, can never revert, and its next boot
-    /// finds `rec.position > durable` and reverts the table to EMPTY. So the
-    /// gate runs at ship time, against the commit counter, with the record's
-    /// one-level `prev` (committed by plan 2's single-in-flight rule) as the
-    /// fallback.
-    ///
-    /// It is read-time and not write-time because commit crossing a record's
-    /// position produces no adoption and so no cache refresh: a verdict
-    /// stamped into the cache would never be revisited.
-    #[test]
-    fn the_snapshot_session_ships_only_a_committed_schedule_table() {
-        // Real encoded one-entry tables — distinguishable by their hash, and
-        // decodable, which R7's ship rule now requires of anything that goes
-        // on the wire.
-        let tbl = |hash: u64| {
-            let mut out = Vec::new();
-            encode_schedule_table(
-                &ScheduleTable {
-                    entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
-                        identity_hash: hash,
-                        timer_id: 1,
-                        rule: ScheduleRule::Every {
-                            period_ns: 100,
-                            anchor_ns: 0,
-                        },
-                    }],
-                },
-                &mut out,
-            );
-            out
-        };
-        let with_prev = |known_committed: bool| ScheduleShip {
-            rec: Some(ScheduleRecord {
-                position: 8192,
-                time_ns: 77,
-                table: tbl(0xAA_u64),
-                prev: Some(Box::new(ScheduleRecord {
-                    position: 4096,
-                    time_ns: 11,
-                    table: tbl(0xBB_u64),
-                    prev: None,
-                })),
-            }),
-            known_committed,
-        };
-
-        // Appended but not committed: the predecessor ships instead.
-        assert_eq!(
-            shippable_schedule(&Mutex::new(with_prev(false)), 6016),
-            (4096, 11, tbl(0xBB_u64)),
-            "an uncommitted record falls back to its committed predecessor"
-        );
-        // Committed: the record itself ships.
-        assert_eq!(
-            shippable_schedule(&Mutex::new(with_prev(false)), 8192),
-            (8192, 77, tbl(0xAA_u64)),
-            "commit at the record's position is committed ENOUGH (positions \
-             are frame-END offsets, so `<=` is the right comparison)"
-        );
-        // Uncommitted with no predecessor: "no table" — the joiner learns it
-        // from the next table frame instead.
-        assert_eq!(
-            shippable_schedule(
-                &Mutex::new(ScheduleShip {
-                    rec: Some(ScheduleRecord {
-                        position: 8192,
-                        time_ns: 77,
-                        table: tbl(0xAA_u64),
-                        prev: None,
-                    }),
-                    known_committed: false,
-                }),
-                6016
-            ),
-            (0, 0, Vec::new()),
-            "nothing committed to give"
-        );
-        // A record installed BY FIAT is exempt: it was gated on the SENDER's
-        // commit counter, and during catch-up it sits above this node's.
-        assert_eq!(
-            shippable_schedule(&Mutex::new(with_prev(true)), 6016),
-            (8192, 77, tbl(0xAA_u64)),
-            "a fiat-installed record ships whatever this node's commit reads"
-        );
-        // And a node with no record at all gives nothing.
-        assert_eq!(
-            shippable_schedule(
-                &Mutex::new(ScheduleShip {
-                    rec: None,
-                    known_committed: false
-                }),
-                u64::MAX
-            ),
-            (0, 0, Vec::new()),
-        );
-        // A `prev` that is ALSO above commit (the fail-SAFE filter, which
-        // plan 2's single-in-flight rule says cannot happen): nothing to give
-        // rather than a stale position.
-        assert_eq!(
-            shippable_schedule(
-                &Mutex::new(ScheduleShip {
-                    rec: Some(ScheduleRecord {
-                        position: 8192,
-                        time_ns: 77,
-                        table: tbl(0xAA_u64),
-                        prev: Some(Box::new(ScheduleRecord {
-                            position: 6016,
-                            time_ns: 11,
-                            table: tbl(0xBB_u64),
-                            prev: None,
-                        })),
-                    }),
-                    known_committed: false,
-                }),
-                4096
-            ),
-            (0, 0, Vec::new()),
-            "a predecessor above commit is discarded, not shipped"
-        );
-
-        // ---- review R7: a POSITION-0 record ships as "no table" ----
-        //
-        // `read_snap_table_body`'s frozen rule is
-        // `(position == 0) <=> (table_len == 0)`, so a position-0 record with
-        // a body would be REFUSED by the receiver — and since a session
-        // completes only once its table arrives, every re-send would be
-        // refused too and the joiner would stall rather than fail loudly.
-        // Two such records exist. First, the `to == 0` wipe record: it keeps
-        // the table body by fiat (so a wiped node keeps ticking) at position
-        // 0. That local keep-alive does NOT propagate — position 0 means the
-        // table is unanchored in the log, and a joiner given it would record
-        // a table no position backs.
-        assert_eq!(
-            shippable_schedule(
-                &Mutex::new(ScheduleShip {
-                    rec: Some(ScheduleRecord {
-                        position: 0,
-                        time_ns: 5,
-                        table: tbl(0xABCD_u64),
-                        prev: None,
-                    }),
-                    known_committed: false,
-                }),
-                u64::MAX
-            ),
-            (0, 0, Vec::new()),
-            "the wipe record's kept table is local-only: position 0 ships as \
-             'no table', never as a body the wire refuses"
-        );
-        // Second, a fiat/revert "no table" record: position 0 over the
-        // CANONICAL EMPTY encoding (8 bytes), which is not zero bytes either.
-        assert_eq!(
-            shippable_schedule(
-                &Mutex::new(ScheduleShip {
-                    rec: Some(ScheduleRecord {
-                        position: 0,
-                        time_ns: 0,
-                        table: ScheduleRecord::empty().table,
-                        prev: None,
-                    }),
-                    known_committed: false,
-                }),
-                u64::MAX
-            ),
-            (0, 0, Vec::new()),
-            "and so does the canonical no-table record — the joiner one hop \
-             past `a_leader_without_a_table_ships_none_…` holds exactly this"
-        );
-
-        // ---- ruling R8: an EMPTY table at a REAL position ships as itself ----
-        //
-        // Distinct from the two position-0 cases above: this record's
-        // position is real (committed at 8192), so the wire accepts a body
-        // for it (`table_len == 8`, the canonical empty encoding, is not 0).
-        // The old `!entries.is_empty()` guard collapsed this to `(0, 0, [])`
-        // and made the joiner read position 0 for a table its peers hold at
-        // 8192 — tripping `Uc2ScheduleTableDiverged`. It must ship as
-        // `(8192, 7, <its bytes>)`.
-        let empty_at_real_position = ScheduleShip {
-            rec: Some(ScheduleRecord {
-                position: 8192,
-                time_ns: 7,
-                table: ScheduleRecord::empty().table,
-                prev: None,
-            }),
-            known_committed: true,
-        };
-        assert_eq!(
-            shippable_schedule(&Mutex::new(empty_at_real_position), 8192),
-            (8192, 7, ScheduleRecord::empty().table),
-            "a committed empty table at a real position is a legitimate \
-             apply result and ships, unlike an empty table AT position 0"
-        );
-    }
-
     // ---- M7 Task 6: boot recovery of the ConfigRecord ----
 
     /// A genesis `ClusterConfig` over a one-voter seed `[(0, addr)]`.
@@ -10547,9 +10190,9 @@ mod tests {
         vec![(0, "127.0.0.1:9200".parse().unwrap())]
     }
 
-    /// Append a real `FRAME_TYPE_CONFIG` frame carrying `cfg` into `archive` (via
+    /// Append a real `CLUSTER kind=Membership` frame carrying `cfg` into `archive` (via
     /// a throwaway heap-backed buffer + `Appender`, exactly the bytes
-    /// `Consensus::append_config_frame` would produce) and durably record it
+    /// `Consensus::append_cluster_frame` would produce) and durably record it
     /// (`do_work` to exhaustion). Returns the frame-END position.
     fn append_and_archive_config(archive: &mut Archive, term: u32, cfg: &ClusterConfig) -> u64 {
         let cnc = test_cnc();
@@ -10564,7 +10207,7 @@ mod tests {
         end
     }
 
-    /// Like `append_and_archive_config`, but appends TWO real `FRAME_TYPE_CONFIG`
+    /// Like `append_and_archive_config`, but appends TWO real `CLUSTER kind=Membership`
     /// frames (`cfg1` then `cfg2`) onto the SAME buffer before draining —
     /// modeling two adoptions durably archived in the same run (unlike two
     /// separate calls to `append_and_archive_config`, which would each start a
@@ -10593,7 +10236,7 @@ mod tests {
         (end1, end2)
     }
 
-    /// Step 3a: a follower durably archives a `FRAME_TYPE_CONFIG` frame (the data
+    /// Step 3a: a follower durably archives a `CLUSTER kind=Membership` frame (the data
     /// plane), but a crash before the NEXT duty cycle drains it means the
     /// `ConfigRecord` file itself never reflects the adoption — modeled here by
     /// deleting `config.state` outright from a stopped instance dir. On reboot,
@@ -12361,41 +12004,7 @@ mod tests {
         let services = crate::services::ServicesConfig::from_names(&["a", "b"], None).unwrap();
         let config_bytes = Mutex::new(vec![0xC0, 0xFF, 0xEE]);
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
-        // A committed record over a real one-entry table (the harness cnc's
-        // commit counter is 0, so the fiat exemption is what makes it
-        // shippable here; the gate and R7's ship rule are adjudicated by
-        // `the_snapshot_session_ships_only_a_committed_schedule_table`).
-        let mut table_bytes = Vec::new();
-        encode_schedule_table(
-            &ScheduleTable {
-                entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
-                    identity_hash: 0x5CED,
-                    timer_id: 1,
-                    rule: ScheduleRule::Once { at_ns: 9 },
-                }],
-            },
-            &mut table_bytes,
-        );
-        let schedule_ship = Mutex::new(ScheduleShip {
-            rec: Some(ScheduleRecord {
-                position: 6016,
-                time_ns: 77,
-                table: table_bytes.clone(),
-                prev: None,
-            }),
-            known_committed: true,
-        });
-        let call = || {
-            snapshot_set_for(
-                &cnc,
-                &root,
-                &services,
-                &config_bytes,
-                &schedule_ship,
-                7,
-                &latch,
-            )
-        };
+        let call = || snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
 
         // 1. Nothing has snapshotted: decline "floor 0" — the first of its kind,
         //    so the latch TRANSITIONS (that is the log line).
@@ -12451,8 +12060,10 @@ mod tests {
         );
         assert_eq!(
             set.table,
-            (6016, 77, table_bytes),
-            "and so does the CURRENT schedule table (plan 3)"
+            (0, 0, Vec::new()),
+            "the schedule table no longer rides a SNAP_TABLE of its own — the \
+             wire field carries the honest 'no table' until task 9 puts the \
+             cluster artifact on the session (Ruling R4)"
         );
         assert_eq!(
             set.artifacts
@@ -12495,19 +12106,7 @@ mod tests {
         cnc.snapshots().node_snapshot_floor.store_release(4096);
         cnc.service_slot(0).snapshot_pos.store_release(1024);
         write_artifact(&root, 0, 1024, b"fsm-0 artifact");
-        let schedule_ship = Mutex::new(ScheduleShip {
-            rec: None,
-            known_committed: false,
-        });
-        let set = snapshot_set_for(
-            &cnc,
-            &root,
-            &services,
-            &config_bytes,
-            &schedule_ship,
-            7,
-            &latch,
-        );
+        let set = snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
         assert!(
             set.is_none(),
             "a none_for_tests node must never ship a snapshot set"

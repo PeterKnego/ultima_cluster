@@ -119,15 +119,17 @@ impl AuditOrigin {
 
 /// The wire op codes: 1-5 as `wire_to_config_op` decodes them, plus
 /// `6 = schedule_apply` (time-and-timers plan 2 — the replicated schedule
-/// table, which is not a configuration change and never reaches
-/// `wire_to_config_op`). An op outside 1..=6 is recorded as `"unknown"`
-/// rather than dropped — a malformed request is exactly the kind of thing an
-/// audit log exists to keep.
+/// table) and `7 = settings_apply` (cluster-FSM spec §6 — the replicated
+/// settings record). Neither of the last two is a configuration change and
+/// neither reaches `wire_to_config_op`. An op outside 1..=7 is recorded as
+/// `"unknown"` rather than dropped — a malformed request is exactly the kind
+/// of thing an audit log exists to keep.
 ///
-/// For `schedule_apply` the record's `id`/`addr` fields carry the staged
+/// For both STAGED-FILE ops the record's `id`/`addr` fields carry the staged
 /// file's DIGEST rather than a member address (that is what the operator
-/// signed), and `config_version` carries the schedule table's position
-/// rather than the config version.
+/// signed), and `config_version` carries the position the op reports (the
+/// schedule table's, or the committed cluster position) rather than the
+/// config version.
 pub fn op_name(op: u32) -> &'static str {
     match op {
         1 => "add_learner",
@@ -136,6 +138,7 @@ pub fn op_name(op: u32) -> &'static str {
         4 => "remove_learner",
         5 => "remove_voter",
         6 => "schedule_apply",
+        7 => "settings_apply",
         _ => "unknown",
     }
 }
@@ -404,7 +407,8 @@ mod tests {
     fn unknown_ops_are_recorded_not_dropped() {
         assert_eq!(op_name(0), "unknown");
         assert_eq!(op_name(6), "schedule_apply");
-        assert_eq!(op_name(7), "unknown");
+        assert_eq!(op_name(7), "settings_apply");
+        assert_eq!(op_name(8), "unknown");
         assert_eq!(op_name(2), "promote");
         assert_eq!(op_name(4), "remove_learner");
         assert_eq!(op_name(5), "remove_voter");

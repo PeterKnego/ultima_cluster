@@ -794,7 +794,6 @@ pub fn ring_mpsc_record() -> Vec<Seed> {
 }
 
 /// `uc_protocol_log_frame` — one header per frame type the log buffer carries.
-#[allow(deprecated)] // FRAME_TYPE_CONFIG: kept as a seed of the pre-rename number; see uc_protocol::v2::frame
 pub fn uc_protocol_log_frame() -> Vec<Seed> {
     use uc_protocol::v2::frame::*;
 
@@ -823,7 +822,7 @@ pub fn uc_protocol_log_frame() -> Vec<Seed> {
         Seed::fixed("01-message", header(FRAME_TYPE_MESSAGE, HEADER_LEN as u32 + 64)),
         Seed::fixed("02-padding", header(FRAME_TYPE_PADDING, HEADER_LEN as u32)),
         Seed::fixed("03-new-term", header(FRAME_TYPE_NEW_TERM, HEADER_LEN as u32)),
-        Seed::fixed("04-config", header(FRAME_TYPE_CONFIG, HEADER_LEN as u32 + 32)),
+        Seed::fixed("04-cluster", header(FRAME_TYPE_CLUSTER, HEADER_LEN as u32 + 32)),
         Seed::fixed("05-length-max", header(FRAME_TYPE_MESSAGE, u32::MAX)),
         Seed::fixed("06-length-zero", header(FRAME_TYPE_MESSAGE, 0)),
         Seed::fixed(

@@ -6,7 +6,7 @@ use libfuzzer_sys::fuzz_target;
 use uc_protocol::v2::schedule::*;
 
 // The replicated schedule table (time-and-timers plan 2): the wire body of a
-// `FRAME_TYPE_SCHEDULE_TABLE` frame, which every node decodes off the log, and
+// `CLUSTER kind=ScheduleTable` frame, which every node decodes off the log, and
 // which an operator stages as a FILE in the instance directory
 // (`schedules.pending`) for the leader to read back. Both are bytes the node
 // did not write.

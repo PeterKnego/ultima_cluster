@@ -164,5 +164,12 @@ mod tests {
             d.cluster_snapshot_dir(),
             dir.path().join("snapshots").join("cluster")
         );
+        // PINNED equal to the lock-free reader `uc2ctl` uses: the two build
+        // the same path, and a change to either without the other would make
+        // `schedule show` read an empty directory beside a running node.
+        assert_eq!(
+            d.cluster_snapshot_dir(),
+            crate::cluster_agent::snapshot_dir_of(dir.path())
+        );
     }
 }

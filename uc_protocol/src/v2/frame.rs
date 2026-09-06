@@ -41,13 +41,6 @@ pub const FRAME_TYPE_NEW_TERM: u8 = 3;
 /// the cluster FSM's loop acts on it; the archive walk reads the kind byte
 /// to feed `Membership` payloads to the consensus kernel at durability.
 pub const FRAME_TYPE_CLUSTER: u8 = 4;
-/// Deprecated name for [`FRAME_TYPE_CLUSTER`] (M7-era, spec 2026-07-13, when
-/// this frame type carried only `v2::config::encode_config` bytes). Same
-/// number, same wire meaning once every `CONFIG` body is reread as a
-/// `Membership`-kind `CLUSTER` body (task 2). Kept so the workspace stays
-/// green while callers migrate; removed in plan 1 task 5.
-#[deprecated(note = "renamed FRAME_TYPE_CLUSTER (spec §4.3); removed in plan 1 task 5")]
-pub const FRAME_TYPE_CONFIG: u8 = FRAME_TYPE_CLUSTER;
 /// Scheduled timer fired by the leader (time-and-timers spec §4.2): a 24-byte
 /// body ([`TimerBody`]); `client_id`/`seq` are 0; `time_ns` is the deadline
 /// unless the frame is late (`time_ns > deadline_ns`). Delivered to exactly the
@@ -59,14 +52,6 @@ pub const FLAG_TIMER_TABLE: u8 = 0x01;
 /// Retired before it shipped (was `SCHEDULE_TABLE`, plan 2). Reserved so the
 /// number is never reassigned to something a pre-release build might misread.
 pub const FRAME_TYPE_SCHEDULE_TABLE_RETIRED: u8 = 6;
-/// Deprecated name for the old standalone schedule-table frame type (now
-/// [`FRAME_TYPE_SCHEDULE_TABLE_RETIRED`]): the table now travels as a
-/// `CLUSTER kind=ScheduleTable` body (spec §4.3). Kept so the workspace
-/// stays green while callers migrate; removed in plan 1 task 5.
-#[deprecated(
-    note = "the table now travels as a CLUSTER kind=ScheduleTable body; removed in plan 1 task 5"
-)]
-pub const FRAME_TYPE_SCHEDULE_TABLE: u8 = 6;
 /// `kind ‖ reserved` — the fixed prefix of every `CLUSTER` body.
 pub const CLUSTER_BODY_PREFIX_LEN: usize = 8;
 

@@ -2,7 +2,7 @@
 // Copyright 2026 Peter Knego
 
 //! The replicated schedule table (time-and-timers spec §5, plan 2): the
-//! frozen wire body of a `FRAME_TYPE_SCHEDULE_TABLE` frame and the pure
+//! frozen wire body of a `CLUSTER kind=ScheduleTable` frame and the pure
 //! recurrence arithmetic every node runs identically. `core`-only.
 
 pub const MAX_SCHEDULE_ENTRIES: usize = 32;

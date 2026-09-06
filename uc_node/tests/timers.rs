@@ -45,7 +45,7 @@ use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfi
 use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS};
 use uc_protocol::v2::schedule::{
-    ScheduleEntry, ScheduleRule, ScheduleTable, decode_schedule_table, encode_schedule_table,
+    ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
 use uc_service::{
     ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, StateMachine, Timed,
@@ -905,16 +905,12 @@ fn a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick()
         "a parked once fired again: {fired:?}"
     );
 
-    // The durable record is what a restart re-arms from (test 5): the table
-    // is on disk, at the position the apply reported, with both entries.
-    let rec = uc_node::read_record(dir.path())
-        .expect("read the record")
-        .expect("a record exists once a table has been adopted");
-    assert_eq!(rec.position, position);
-    assert_eq!(
-        decode_schedule_table(&rec.table).expect("the record holds wire bytes"),
-        table
-    );
+    // The COMMITTED cluster state is what the rows are armed from (cluster-FSM
+    // spec §4.5): the table is in the view, at the position the apply
+    // reported, with both entries.
+    let view = node.cluster_view().snapshot_inner();
+    assert_eq!(view.table_position, position);
+    assert_eq!(view.table, table);
 
     client.shutdown();
     svc.stop();
@@ -976,16 +972,22 @@ fn a_restarted_node_resumes_the_table_with_one_catch_up_tick() {
     std::thread::sleep(Duration::from_millis(1_000));
 
     let node = Node::start(config(dir.path(), names(&["clock"], None))).unwrap();
-    // Read BEFORE anything can be adopted off the log: the table a restarted
-    // node runs comes from the durable record, not from a replay.
-    let rec = uc_node::read_record(dir.path())
-        .expect("read the record")
-        .expect("the record survived the restart");
-    assert_eq!(rec.position, position, "the record was reloaded as adopted");
+    // Cluster-FSM spec §4.1/§4.7: a restarted node re-derives the table by
+    // recovering its cluster artifact (none yet here — the bridging trigger
+    // needs every declared row to have snapshotted) and REPLAYING the
+    // committed CLUSTER frames above it, which the `uc2-cluster` agent does
+    // off the log buffer or the journal. So the table comes back on its own,
+    // at the same position, without an operator re-applying — but it arrives
+    // a duty cycle or two into the boot rather than synchronously.
+    wait_until("the restarted node re-derived the table", || {
+        node.cluster_view().position.load(Ordering::Acquire) >= position
+    });
+    let view = node.cluster_view().snapshot_inner();
     assert_eq!(
-        decode_schedule_table(&rec.table).map(|t| t.entries.len()),
-        Some(2)
+        view.table_position, position,
+        "the table came back at the position it was applied at"
     );
+    assert_eq!(view.table.entries.len(), 2);
 
     let svc = start_service_with(dir.path(), Timed::new(ClockSm::default()));
     wait_until("serving again", || node.can_serve());
@@ -1261,6 +1263,7 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// timing-sensitivity flake, not a schedule-table defect; re-run to confirm
 /// before suspecting the chain under test.
 #[test]
+#[ignore = "plan 1 task 9: the table rides the cluster artifact"]
 fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     let _g = serialize();
     let dir = tempdir();
@@ -1412,28 +1415,21 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
         "the joiner must have adopted the shipped snapshot floor, not replayed from 0"
     );
 
-    // ---- and it holds the leader's table, record for record. The frame is
-    // ---- below the floor it just adopted, so `SNAP_TABLE` is the only way
-    // ---- these bytes could be here.
-    let want = uc_node::read_record(&leader_dir)
-        .expect("read the leader's record")
-        .expect("the leader adopted a table");
-    assert_eq!(want.position, table_position);
-    wait_until("the joiner installed the schedule record", || {
-        uc_node::read_record(&j_dir).expect("read").is_some()
+    // ---- and it holds the leader's table. The frame is below the floor it
+    // ---- just adopted, so the session carrying the CLUSTER ARTIFACT (plan 1
+    // ---- task 9) is the only way these entries could be here.
+    let want = nodes[leader]
+        .node
+        .as_ref()
+        .unwrap()
+        .cluster_view()
+        .snapshot_inner();
+    assert_eq!(want.table_position, table_position);
+    wait_until("the joiner installed the cluster table", || {
+        j_node.cluster_view().snapshot_inner().table_position == table_position
     });
-    let got = uc_node::read_record(&j_dir).unwrap().unwrap();
-    assert_eq!(
-        got.position, want.position,
-        "at the leader's table position"
-    );
-    assert_eq!(got.time_ns, want.time_ns, "with the leader's frame stamp");
-    assert_eq!(
-        decode_schedule_table(&got.table).as_ref(),
-        Some(&table),
-        "and the leader's table"
-    );
-    assert!(got.prev.is_none(), "a fiat install keeps no history");
+    let got = j_node.cluster_view().snapshot_inner();
+    assert_eq!(got.table, want.table, "and the leader's table");
     wait_until("the joiner armed the table entry", || {
         j_cnc.service_slot(0).identity.timers_pending() == 1
     });

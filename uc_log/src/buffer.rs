@@ -819,18 +819,6 @@ impl Appender {
         Ok(end)
     }
 
-    /// Deprecated shim (plan 1 task 2, removed in task 5): the replicated
-    /// schedule table now travels as a `CLUSTER kind=ScheduleTable` body
-    /// (spec §4.3) rather than its own standalone frame type, so this just
-    /// forwards to [`Self::append_cluster`]. Kept so `uc_node`'s pre-task-5
-    /// schedule-table call sites and tests keep compiling and passing.
-    #[deprecated(
-        note = "the table now travels as a CLUSTER kind=ScheduleTable body; removed in plan 1 task 5"
-    )]
-    pub fn append_schedule_table(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
-        self.append_cluster(term, ClusterKind::ScheduleTable, payload)
-    }
-
     /// Append a TIMER frame (time-and-timers spec §4.2/§4.3). Stamped with the
     /// deadline, clamped to `last_stamp` — so `stamp > body.deadline_ns` means
     /// the timer is late. Returns `(frame_start, stamp)`.
@@ -1066,15 +1054,17 @@ mod tests {
         assert_eq!(payload, &[9u8; 29]);
     }
 
-    /// The deprecated shim emits a real `CLUSTER kind=ScheduleTable` frame —
-    /// keeps `uc_node`'s pre-task-5 schedule-table call sites/tests passing.
+    /// The replicated schedule table is a `CLUSTER kind=ScheduleTable` frame
+    /// (spec §4.3) — the same header shape as a `Membership` one, a different
+    /// kind byte, and the appender's `max(now, last)` stamp.
     #[test]
-    #[allow(deprecated)]
-    fn append_schedule_table_shim_emits_a_cluster_schedule_table_frame() {
+    fn append_cluster_schedule_table_frame_layout() {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 4, 0);
         a.set_now(1_000);
-        let end = a.append_schedule_table(4, b"table-bytes").unwrap();
+        let end = a
+            .append_cluster(4, ClusterKind::ScheduleTable, b"table-bytes")
+            .unwrap();
         assert_eq!(
             end, 64,
             "32 header + 8 prefix + 11 payload -> aligned 64; END returned"

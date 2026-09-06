@@ -2,7 +2,7 @@
 // Copyright 2026 Peter Knego
 
 //! Cluster-config wire codec (M7, spec 2026-07-13): the payload of a
-//! `FRAME_TYPE_CONFIG` frame, the snapshot-session config carry, and the
+//! `CLUSTER kind=Membership` frame body, the snapshot-session config carry, and the
 //! durable record's canonical byte form. Core-only: addresses are
 //! `(ipv4 u32, port u16)` — `SocketAddr` conversion happens in `uc_node`.
 //!

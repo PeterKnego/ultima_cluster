@@ -26,6 +26,37 @@ use crate::node::{cluster_to_wire, wire_to_cluster_config};
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
 pub const CLUSTER_IMAGE_VERSION: u32 = 1;
 
+/// The staged table file an admin client writes under the instance directory
+/// before sending `ADMIN_OP_SCHEDULE_APPLY`. Relative to `<instance_dir>`,
+/// NOT to `state/` — it is a request payload, not durable node state, and the
+/// node deletes it once the command is appended.
+pub const SCHEDULE_PENDING_FILE: &str = "schedules.pending";
+/// The same, for `ADMIN_OP_SETTINGS_APPLY` (spec §6).
+pub const SETTINGS_PENDING_FILE: &str = "settings.pending";
+
+/// The first TEN bytes of SHA-256 over `bytes`, read little-endian as an
+/// admin request's `(id, ip, port)` fields — 80 bits of collision resistance
+/// against an operator staging one file and signing another, which is all
+/// those three fields have room for.
+///
+/// FROZEN: `uc2ctl` computes this over the file it stages and the node
+/// recomputes it over the file it read. Changing the byte selection or the
+/// endianness makes every apply refuse with
+/// [`crate::node::REASON_SCHEDULE_DIGEST`] (or its settings twin).
+///
+/// Shared by both staged-file ops — the digest is a property of the FILE, not
+/// of what is in it. It lives here rather than in `uc_protocol`: that crate is
+/// a `core`-friendly, dependency-light leaf with no `sha2`.
+pub fn staged_digest(bytes: &[u8]) -> (u32, u32, u16) {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(bytes);
+    (
+        u32::from_le_bytes(h[0..4].try_into().expect("4 bytes")),
+        u32::from_le_bytes(h[4..8].try_into().expect("4 bytes")),
+        u16::from_le_bytes(h[8..10].try_into().expect("2 bytes")),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterState {
     pub membership: ClusterConfig,
@@ -376,6 +407,37 @@ impl ClusterView {
     pub fn snapshot_inner(&self) -> ClusterViewInner {
         self.inner.lock().unwrap().clone()
     }
+
+    /// The view as a [`ClusterState`] — the inner clone plus the four scalar
+    /// atomics, with `applied` taken from `position`.
+    ///
+    /// This is what the leader's PRE-APPEND check runs `ClusterFsm::validate`
+    /// against (spec §4.4, Ruling R5): the leader answers the admin request
+    /// from the newest COMMITTED state it can see, so a command it accepts is
+    /// one every replica's apply loop will also accept — and there is exactly
+    /// ONE acceptance function, never a parallel node-side reimplementation of
+    /// it. A read of the four atomics can straddle a concurrent `publish`
+    /// (they are stored one at a time), which costs nothing here: the four are
+    /// only ever bounds-checked, and the authoritative decision is the apply
+    /// loop's on the committed state.
+    pub fn to_state(&self) -> ClusterState {
+        let inner = self.snapshot_inner();
+        ClusterState {
+            membership: inner.membership,
+            table: inner.table,
+            table_position: inner.table_position,
+            settings: Settings {
+                fsm_lag_bytes: self.fsm_lag_bytes.load(Ordering::Acquire),
+                admission_bytes: self.admission_bytes.load(Ordering::Acquire),
+                snapshot_interval_bytes: self.snapshot_interval_bytes.load(Ordering::Acquire),
+                snapshot_target: match self.snapshot_target.load(Ordering::Acquire) {
+                    1 => uc_protocol::v2::settings::Target::Learners,
+                    _ => uc_protocol::v2::settings::Target::All,
+                },
+            },
+            applied: self.position.load(Ordering::Acquire),
+        }
+    }
     pub fn membership(&self) -> ClusterConfig {
         self.inner.lock().unwrap().membership.clone()
     }
@@ -626,6 +688,49 @@ mod tests {
             &before,
             "a refused install must not mutate state"
         );
+    }
+
+    /// FROZEN (moved here from the deleted `schedule_state` module, body
+    /// unchanged): the digest is the first TEN bytes of SHA-256 over the
+    /// staged bytes, read little-endian as the admin request's
+    /// `(id, ip, port)` fields. Pinned against the canonical `SHA-256("abc")`
+    /// vector `ba7816bf 8f01cfea 414140de 5dae2223 …`, so `uc2ctl` and the
+    /// node can never drift: they must compute the same three numbers or every
+    /// apply is refused with `REASON_SCHEDULE_DIGEST`.
+    #[test]
+    fn staged_digest_is_the_first_ten_bytes_of_sha256_le() {
+        let (id, ip, port) = staged_digest(b"abc");
+        assert_eq!(id, 0xbf16_78ba, "bytes 0..4 LE");
+        assert_eq!(ip, 0xeacf_018f, "bytes 4..8 LE");
+        assert_eq!(port, 0x4141, "bytes 8..10 LE");
+        // Any other bytes give a different triple (the whole point).
+        assert_ne!(staged_digest(b"abd"), (id, ip, port));
+        assert_ne!(staged_digest(b""), (id, ip, port));
+    }
+
+    /// Ruling R5: `ClusterView::to_state` is what the leader validates
+    /// against, so it must reconstruct EVERY field the FSM's `validate` can
+    /// read — the structured half from the mutex and the settings half from
+    /// the four atomics — with `applied` taken from the view's position tag.
+    #[test]
+    fn to_state_round_trips_the_published_state() {
+        let f = fsm();
+        let mut st = f.state().clone();
+        st.applied = 900;
+        st.table_position = 640;
+        st.settings = Settings {
+            fsm_lag_bytes: 1 << 20,
+            admission_bytes: 4096,
+            snapshot_interval_bytes: 1 << 30,
+            snapshot_target: uc_protocol::v2::settings::Target::Learners,
+        };
+        let v = ClusterView::new(&st);
+        assert_eq!(v.to_state(), st);
+        // And it is a genuine snapshot, not a handle: a later publish moves it.
+        st.settings.admission_bytes = 8192;
+        st.applied = 1000;
+        v.publish(&st);
+        assert_eq!(v.to_state(), st);
     }
 
     #[test]

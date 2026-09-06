@@ -36,7 +36,7 @@ use serde::Deserialize;
 use uc_protocol::v2::cnc::ADMIN_OP_SCHEDULE_APPLY;
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleEntry, ScheduleRule,
-    ScheduleTable, decode_schedule_table, encode_schedule_table,
+    ScheduleTable, encode_schedule_table,
 };
 
 use crate::CommonArgs;
@@ -547,19 +547,24 @@ pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- show
 
-/// `uc2ctl schedule show`: the newest ADOPTED table, from durable node state
-/// (`uc_node::read_record`), with each entry's `identity_hash` resolved back
-/// to a name through the cnc page's declared rows.
+/// `uc2ctl schedule show`: the COMMITTED table, read out of this instance
+/// directory's newest cluster artifact
+/// (`uc_node::cluster_agent::read_committed_table`), with each entry's
+/// `identity_hash` resolved back to a name through the cnc page's declared
+/// rows.
+///
+/// Cluster-FSM plan 1 task 5→8 window: the artifact lags the live view (it is
+/// written by the `uc2-cluster` agent's bridging trigger, once every declared
+/// row has snapshotted), so a table applied on a cluster whose rows have not
+/// snapshotted yet reads as "no schedule table adopted" here. Task 8 gives
+/// this command the live reading.
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
-    let Some(record) = uc_node::read_record(&common.instance_dir)
-        .map_err(|e| anyhow::anyhow!("reading schedule state: {e}"))?
-    else {
+    let (position, table) = uc_node::cluster_agent::read_committed_table(&common.instance_dir)
+        .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?;
+    if position == 0 && table.entries.is_empty() {
         println!("no schedule table adopted");
         return Ok(());
-    };
-
-    let table = decode_schedule_table(&record.table)
-        .ok_or_else(|| anyhow::anyhow!("durable schedule record failed to decode"))?;
+    }
 
     let cnc = crate::open(common)?;
     let names = cnc.service_names();
@@ -572,7 +577,7 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
             .unwrap_or_else(|| format!("0x{hash:016x}"))
     };
 
-    println!("position={} time_ns={}", record.position, record.time_ns);
+    println!("position={position}");
     for e in &table.entries {
         let rule = match e.rule {
             ScheduleRule::Every {

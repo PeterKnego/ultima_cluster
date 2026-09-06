@@ -62,7 +62,7 @@
 //!   `rec.position > durable` — pinning at exactly `durable` means that
 //!   never holds).
 //! - `version` is one past the recovered version — it beats every archived
-//!   `FRAME_TYPE_CONFIG` frame at or below `durable` (`rederive_config`
+//!   `CLUSTER kind=Membership` frame at or below `durable` (`rederive_config`
 //!   already folded everything up to `durable` into `recovered.version`,
 //!   and nothing exists above `durable` by definition of that being the
 //!   journal's own recovered frontier), so this node's own next boot
@@ -177,7 +177,7 @@ pub fn data_loss_statement(node_id: u32, durable: u64, dropped_peers: &[u32]) ->
 /// the doubly-ahead case above is excluded, this is the ordinary single-crash
 /// case) and the forward re-derive fold (`rederive_config`'s own
 /// `state.store_config_record(&rederived)`, fired when the archive holds a
-/// `FRAME_TYPE_CONFIG` frame not yet folded into the persisted record). Both
+/// `CLUSTER kind=Membership` frame not yet folded into the persisted record). Both
 /// recover REAL, previously-adopted data (a prior config generation, or an
 /// archived frame) rather than inventing anything — the hazard this module
 /// guards against — so [`recovered_config`] is read-only in CONTRACT (never

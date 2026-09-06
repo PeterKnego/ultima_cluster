@@ -483,19 +483,6 @@ impl Archive {
         std::mem::take(&mut self.config_observations)
     }
 
-    /// Deprecated shim (plan 1 task 2, removed in task 5): the schedule
-    /// table no longer has its own observation feed — a table frame is a
-    /// `CLUSTER kind=ScheduleTable` frame now, which `observe_terms` does not
-    /// forward anywhere (it is the cluster FSM's own business at commit).
-    /// Always empty. Kept so `uc_node`'s pre-task-5 call site keeps
-    /// compiling; task 5 removes it along with that call site.
-    #[deprecated(
-        note = "the schedule table has no separate observation feed anymore; removed in plan 1 task 5"
-    )]
-    pub fn take_table_observations(&mut self) -> Vec<(u64, u64, Vec<u8>)> {
-        Vec::new()
-    }
-
     /// Drain the term transitions detected since the last call (M4). Each entry
     /// is `(term, base position of that term's first frame in the recorded
     /// stream)` — the NewTerm frame's position for an election-opened term.

@@ -36,7 +36,12 @@
 
 pub mod audit;
 pub mod backup;
-mod cluster_agent;
+/// The `uc2-cluster` agent (spec §4.1/§4.7). `pub` for
+/// [`cluster_agent::read_committed_table`] alone: `uc2ctl schedule show` and
+/// `uc2ctl status` read the newest cluster artifact under `snapshots/cluster/`
+/// out of process, the same way they used to read `state/schedules.state`.
+/// Internal otherwise — see the module doc.
+pub mod cluster_agent;
 pub mod cluster_fsm;
 pub mod config_file;
 pub mod ipc;
@@ -52,26 +57,26 @@ pub use uc_obs::obs_event;
 pub mod preflight;
 mod read_round;
 pub mod recovery;
-mod schedule_state;
 pub mod services;
 pub(crate) mod timers;
 
-pub use cluster_fsm::{ClusterCommand, ClusterFsm, ClusterRefusal, ClusterState, ClusterView};
+/// The staged-file digest under its plan-2 name. `uc2ctl` computes it over
+/// the file it stages for `schedule apply`; the same function now also serves
+/// `settings apply`, hence the neutral canonical name [`staged_digest`].
+pub use cluster_fsm::staged_digest as schedule_digest;
+pub use cluster_fsm::{
+    ClusterCommand, ClusterFsm, ClusterRefusal, ClusterState, ClusterView, SCHEDULE_PENDING_FILE,
+    SETTINGS_PENDING_FILE, staged_digest,
+};
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{
     DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy,
     REASON_AUDIT_FAILED, REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED, REASON_AUTH_MISSING,
     REASON_AUTH_UNKNOWN_KEY, REASON_SCHEDULE_DECODE, REASON_SCHEDULE_DIGEST,
-    REASON_SCHEDULE_MISSING, REASON_SCHEDULE_UNKNOWN_FSM, StartOpts, SubmitError,
-};
-/// Time-and-timers plan 2 (spec §5): the durable schedule-table record, the
-/// staged-file name, and the digest. Re-exported because `uc2ctl` must stage
-/// the file the node reads, compute the SAME digest over it, and read the
-/// record back for `schedule show` — two implementations of that digest
-/// would make every apply refuse with [`REASON_SCHEDULE_DIGEST`].
-pub use schedule_state::{
-    SCHEDULE_PENDING_FILE, SCHEDULE_STATE_FILE, ScheduleRecord, read_record, schedule_digest,
+    REASON_SCHEDULE_MISSING, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
+    REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING, StartOpts,
+    SubmitError,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

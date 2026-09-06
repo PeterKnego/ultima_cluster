@@ -19,12 +19,49 @@ use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use uc_protocol::v2::frame::{FRAME_TYPE_CLUSTER, align_frame_len};
+use uc_protocol::v2::schedule::ScheduleTable;
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 use crate::cluster_fsm::{ClusterFsm, ClusterState, ClusterView};
 
 pub fn artifact_path(dir: &Path, position: u64) -> PathBuf {
     dir.join(format!("snap-{position}.ultcluster"))
+}
+
+/// Where the cluster artifacts live under an instance directory — the same
+/// path [`crate::ipc::InstanceDir::cluster_snapshot_dir`] builds (pinned equal
+/// by that module's own test), for a reader that must NOT take the instance
+/// flock an `InstanceDir` holds.
+pub fn snapshot_dir_of(instance_dir: &Path) -> PathBuf {
+    instance_dir.join("snapshots").join("cluster")
+}
+
+/// `uc2ctl schedule show`/`status`'s reader: the schedule table this instance
+/// directory's newest CLUSTER ARTIFACT holds, as `(table_position, table)`.
+/// `(0, no entries)` when there is no artifact yet.
+///
+/// **It reads the artifact, not the live view** — a plain file read beside a
+/// running node, taking no lock. The consequence is that it lags: the artifact
+/// is written by the `uc2-cluster` agent's bridging trigger, which fires once
+/// every declared row has snapshotted, so on a node whose rows have not
+/// snapshotted yet this answers `(0, [])` even though the live view holds a
+/// table. Plan 1 task 8 gives `uc2ctl` the live reading; until then this is
+/// the honest offline one.
+pub fn read_committed_table(instance_dir: &Path) -> io::Result<(u64, ScheduleTable)> {
+    let genesis = ClusterState {
+        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
+        table: ScheduleTable {
+            entries: Vec::new(),
+        },
+        table_position: 0,
+        settings: uc_protocol::v2::settings::Settings::genesis_default(),
+        applied: 0,
+    };
+    // No declared hashes: this reader never APPLIES a command, and
+    // `install_snapshot` does not consult them.
+    let (fsm, _) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
+    let st = fsm.state();
+    Ok((st.table_position, st.table.clone()))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
@@ -428,7 +465,6 @@ mod tests {
     use uc_log::region::Region;
     use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
     use uc_protocol::v2::frame::ClusterKind;
-    use uc_protocol::v2::schedule::ScheduleTable;
     use uc_protocol::v2::settings::{Settings, encode_settings};
 
     use super::*;
