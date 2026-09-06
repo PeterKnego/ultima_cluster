@@ -8162,9 +8162,10 @@ mod tests {
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
         // Declared hashes: none. The harness node is `none_for_tests`, and a
-        // test that arms a row pokes `cons.timers[row]` AND
-        // `cluster.set_declared_rows_for_test`/its own FSM if it needs the
-        // agent to accept a table naming that row.
+        // test that arms a row pokes `cons.timers[row]` and its own FSM if it
+        // needs the agent to accept a table naming that row (coordinated-
+        // snapshot plan 2: the agent no longer tracks a declared-rows list of
+        // its own — that lived only in the retired bridging trigger).
         // Spec §5.6: the snapshot session's cluster-artifact route and the
         // agent's ack, wired exactly as `Node::start_with_socket` wires them —
         // the producer half is kept on the harness so a test can hand over an
