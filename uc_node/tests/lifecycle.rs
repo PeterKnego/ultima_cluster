@@ -151,14 +151,17 @@ fn stop_draining_honours_its_deadline() {
     );
 }
 
-/// M10 (Task 4) smoke: `Node::observability()` sees a live 4-agent bundle
+/// M10 (Task 4) smoke: `Node::observability()` sees a live 5-agent bundle
 /// while the node runs, and every agent's flag flips true once the node is
 /// stopped (agents are told to stop and their threads join). The Arcs
 /// returned by `observability()` are cloned BEFORE `stop()` runs (which
 /// consumes the node), so polling them afterwards is genuinely observing the
 /// worker threads exit, not a stale snapshot.
+///
+/// Five since the cluster FSM: `uc2-cluster` is a polling agent like the
+/// other four, and `uc2_agent_alive` carries a sample for it (spec §9).
 #[test]
-fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
+fn observability_reports_every_agent_alive_then_all_finished_after_stop() {
     let dir = tempfile::Builder::new()
         .prefix("uc2-lifecycle-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -166,7 +169,7 @@ fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
     let (node, _addr) = single_node(&dir.path().join("n0"));
 
     let obs = node.observability();
-    assert_eq!(obs.agents.len(), 4, "expected exactly 4 agents: {:?}", {
+    assert_eq!(obs.agents.len(), 5, "expected exactly 5 agents: {:?}", {
         obs.agents.iter().map(|(n, _)| *n).collect::<Vec<_>>()
     });
     for (name, flag) in &obs.agents {
@@ -178,7 +181,7 @@ fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
     let names: Vec<&'static str> = obs.agents.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         names,
-        vec!["consensus", "sender", "receiver", "archive"],
+        vec!["consensus", "sender", "receiver", "archive", "cluster"],
         "agents must be reported in this fixed order regardless of spawn order"
     );
 
