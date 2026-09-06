@@ -1506,6 +1506,9 @@ impl Node {
             table: ScheduleTable { entries: vec![] },
             table_position: 0,
             settings: cfg.settings_genesis,
+            // 0 = the genesis record, from `[settings]` in node.toml — it
+            // never crossed the log, so there is no frame-END to name.
+            settings_position: 0,
             applied: 0,
         };
         let (cluster_fsm, cluster_start) = crate::cluster_agent::recover(
@@ -1959,10 +1962,10 @@ impl Node {
     /// is the SAME allocation the owning agent writes through, so this adds
     /// no new synchronization and never goes stale relative to the source.
     ///
-    /// `agents` is always exactly 4 entries in the FIXED order `consensus,
-    /// sender, receiver, archive` — NOT spawn order (spawn order is archive,
-    /// sender, receiver, consensus) — because a later task's metric labels
-    /// are positional against this order.
+    /// `agents` is always exactly 5 entries in the FIXED order `consensus,
+    /// sender, receiver, archive, cluster` — NOT spawn order (spawn order is
+    /// archive, sender, receiver, cluster, consensus) — because a later
+    /// task's metric labels are positional against this order.
     pub fn observability(&self) -> crate::obs::ObsSources {
         crate::obs::ObsSources {
             node_id: self.node_id,
@@ -1975,6 +1978,7 @@ impl Node {
             schedule_table_position: Arc::clone(&self.schedule_pos_pub),
             schedule_entries: Arc::clone(&self.schedule_entries_pub),
             schedule_apply_refused: Arc::clone(&self.schedule_refused),
+            cluster_view: Arc::clone(&self.cluster_view),
             reports_unattested: Arc::clone(&self.reports_unattested),
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
@@ -1986,6 +1990,10 @@ impl Node {
                 ("sender", 1),
                 ("receiver", 2),
                 ("archive", 3),
+                // The fifth (cluster-FSM spec §9): `uc2-cluster`, appended
+                // last in `agents` above. Labelled `cluster`, matching the
+                // four bare names beside it rather than the thread name.
+                ("cluster", 4),
             ]
             .into_iter()
             .map(|(name, idx)| (name, self.agents[idx].finished_flag()))
@@ -8092,6 +8100,7 @@ mod tests {
             table: ScheduleTable { entries: vec![] },
             table_position: 0,
             settings: settings_genesis,
+            settings_position: 0,
             applied: 0,
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
@@ -8622,6 +8631,7 @@ mod tests {
                     table: ScheduleTable { entries: vec![] },
                     table_position: 0,
                     settings: Settings::genesis_default(),
+                    settings_position: 0,
                     applied: 0,
                 },
                 vec![hash],
@@ -8715,6 +8725,7 @@ mod tests {
                     table: ScheduleTable { entries: vec![] },
                     table_position: 0,
                     settings: Settings::genesis_default(),
+                    settings_position: 0,
                     applied: 0,
                 },
                 vec![hash],
@@ -10770,6 +10781,7 @@ mod tests {
                 table: ScheduleTable { entries: vec![] },
                 table_position: 0,
                 settings: Settings::genesis_default(),
+                settings_position: 0,
                 applied: position,
             },
             Vec::new(),

@@ -72,6 +72,9 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_timers_late_total",
     // Plan 2 (spec §6): the replicated schedule table.
     "uc2_schedule_table_position",
+    // Cluster FSM (spec §9): the cluster row's own two positions.
+    "uc2_cluster_fsm_position",
+    "uc2_settings_position",
     "uc2_schedule_entries",
     "uc2_schedule_apply_refused_total",
     "uc_services_declared",
@@ -447,6 +450,18 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "uc2_schedule_table_position",
         "Frame-END position of the schedule table this node's cluster FSM has APPLIED (0 = none); the table is cluster-FSM state applied at COMMIT, so this is identical on every node once caught up (cluster-FSM spec §4.3). Alert: Uc2ScheduleTableDiverged.",
         s.schedule_table_position.load(Ordering::Relaxed),
+    );
+    push_gauge(
+        out,
+        "uc2_cluster_fsm_position",
+        "Frame-END position this node's cluster FSM has CONSUMED the log up to (its `applied`, cluster-FSM spec §4.3) — the position tag on the view it publishes and on the artifact it writes. It advances with the agent's walk, not only on CLUSTER commands, so it is a per-node liveness reading (compare it against uc2_commit_bytes on the SAME node: a stalled uc2-cluster agent is one whose position sits still while commit moves) and NOT a cluster-wide constant — Uc2ScheduleTableDiverged keys on uc2_schedule_table_position for exactly that reason.",
+        s.cluster_view.position.load(Ordering::Acquire),
+    );
+    push_gauge(
+        out,
+        "uc2_settings_position",
+        "Frame-END position of the last `CLUSTER kind=Settings` command this node's cluster FSM applied; 0 = the genesis record from `[settings]` in node.toml, which never crossed the log. Identical on every node once caught up, exactly like uc2_schedule_table_position.",
+        s.cluster_view.settings_position.load(Ordering::Acquire),
     );
     push_gauge(
         out,
@@ -1077,6 +1092,19 @@ mod tests {
     use uc_net::receiver::FollowerStats;
     use uc_net::sender::SenderStats;
 
+    /// A PUBLISHED cluster view (cluster-FSM spec §9) with both position
+    /// words non-zero, so `uc2_cluster_fsm_position` and
+    /// `uc2_settings_position` render real samples in the fixture rather
+    /// than a vacuous `0` that any bug would also produce.
+    fn test_cluster_view() -> Arc<crate::cluster_fsm::ClusterView> {
+        let st = crate::cluster_fsm::ClusterState {
+            settings_position: 2048,
+            applied: 4096,
+            ..crate::cluster_fsm::ClusterState::genesis_empty()
+        };
+        Arc::new(crate::cluster_fsm::ClusterView::new(&st))
+    }
+
     fn synthetic_sources() -> ObsSources {
         let meta = CncMeta {
             node_id: 7,
@@ -1118,6 +1146,7 @@ mod tests {
             schedule_table_position: Arc::new(AtomicU64::new(0)),
             schedule_entries: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            cluster_view: test_cluster_view(),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -1129,7 +1158,44 @@ mod tests {
                 ("sender", Arc::new(AtomicBool::new(false))),
                 ("receiver", Arc::new(AtomicBool::new(false))),
                 ("archive", Arc::new(AtomicBool::new(false))),
+                ("cluster", Arc::new(AtomicBool::new(false))),
             ],
+        }
+    }
+
+    /// Cluster FSM (spec §9): the cluster row's own two gauges, and the
+    /// FIFTH `uc2_agent_alive` sample. `uc2_cluster_fsm_position` is the
+    /// view's position word (the FSM's `applied`) and `uc2_settings_position`
+    /// the frame-END of the last Settings command it applied — both read
+    /// straight off the view's atomics AT SCRAPE TIME, never published into
+    /// the consensus pass (M14a's lesson about a hot loop's body).
+    #[test]
+    fn the_cluster_gauges_and_the_fifth_agent_sample_are_exported() {
+        let s = synthetic_sources();
+        let text = render_prometheus(&s);
+        assert!(
+            series_present(&text, "uc2_cluster_fsm_position"),
+            "missing uc2_cluster_fsm_position: {text}"
+        );
+        assert!(
+            series_present(&text, "uc2_settings_position"),
+            "missing uc2_settings_position: {text}"
+        );
+        assert!(
+            text.contains("\nuc2_cluster_fsm_position 4096\n"),
+            "the view's position word, verbatim: {text}"
+        );
+        assert!(
+            text.contains("\nuc2_settings_position 2048\n"),
+            "the view's settings position, verbatim: {text}"
+        );
+        // The four M10 agents plus `uc2-cluster` — every sample alive (the
+        // fixture's finished flags are all false).
+        for agent in ["consensus", "sender", "receiver", "archive", "cluster"] {
+            assert!(
+                text.contains(&format!("uc2_agent_alive{{agent=\"{agent}\"}} 1")),
+                "missing the {agent} agent sample: {text}"
+            );
         }
     }
 
@@ -1428,6 +1494,7 @@ mod tests {
             schedule_table_position: Arc::new(AtomicU64::new(0)),
             schedule_entries: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            cluster_view: test_cluster_view(),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -1439,6 +1506,7 @@ mod tests {
                 ("sender", Arc::new(AtomicBool::new(false))),
                 ("receiver", Arc::new(AtomicBool::new(false))),
                 ("archive", Arc::new(AtomicBool::new(false))),
+                ("cluster", Arc::new(AtomicBool::new(false))),
             ],
         };
 

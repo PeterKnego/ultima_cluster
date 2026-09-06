@@ -60,6 +60,14 @@ pub struct ObsSources {
     pub schedule_entries: Arc<AtomicU64>,
     /// Plan 2: `schedule apply` requests this node refused, for any reason.
     pub schedule_apply_refused: Arc<AtomicU64>,
+    /// Cluster FSM (spec §9): the cluster FSM's published view — the SAME
+    /// allocation the `uc2-cluster` agent publishes into. Two gauges are read
+    /// straight off its atomics AT SCRAPE TIME (`uc2_cluster_fsm_position`
+    /// from `position`, `uc2_settings_position` from `settings_position`),
+    /// one `Acquire` load each and no lock: deliberately NOT published into
+    /// the consensus pass the way `schedule_table_position` is, because that
+    /// pass is a measured hot path and a scrape is not.
+    pub cluster_view: Arc<crate::cluster_fsm::ClusterView>,
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
@@ -67,9 +75,12 @@ pub struct ObsSources {
     pub purge_enabled: bool,
     pub journal_segment_bytes: u64,
     /// One entry per polling agent, in the FIXED order `consensus, sender,
-    /// receiver, archive` regardless of spawn order — a later task's metric
-    /// labels are positional against this order, so it must not drift with
-    /// `Node::start`'s internal spawn sequence.
+    /// receiver, archive, cluster` regardless of spawn order — a later task's
+    /// metric labels are positional against this order, so it must not drift
+    /// with `Node::start`'s internal spawn sequence. `cluster` is the fifth
+    /// agent (`uc2-cluster`, the cluster FSM's apply loop), added with the
+    /// cluster FSM; it is labelled like its four siblings, without the
+    /// `uc2-` thread-name prefix.
     pub agents: Vec<(&'static str, Arc<AtomicBool>)>,
 }
 
@@ -106,6 +117,9 @@ impl ObsSources {
             schedule_table_position: Arc::new(AtomicU64::new(0)),
             schedule_entries: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+            cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
+                &crate::cluster_fsm::ClusterState::genesis_empty(),
+            )),
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -117,6 +131,7 @@ impl ObsSources {
                 ("sender", Arc::new(AtomicBool::new(false))),
                 ("receiver", Arc::new(AtomicBool::new(false))),
                 ("archive", Arc::new(AtomicBool::new(false))),
+                ("cluster", Arc::new(AtomicBool::new(false))),
             ],
         }
     }

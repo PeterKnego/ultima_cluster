@@ -210,6 +210,17 @@ groups:
     # uc2_commit_bytes on the same node. A node reading 0 while its peers read
     # nonzero has applied no table at all.
     #
+    # NOT keyed on uc2_cluster_fsm_position, which spec §9 suggested before
+    # Ruling R17 made the cluster FSM's `applied` its apply loop's CURSOR
+    # rather than the last CLUSTER command's position. That cursor advances
+    # with ordinary traffic, at each node's own pace, so nodes legitimately
+    # read different values at any instant and a `count_values` over it would
+    # page permanently. `uc2_schedule_table_position` (and, equally,
+    # uc2_settings_position) moves only when a CLUSTER command commits, which
+    # is the "identical fleet-wide once caught up" property this rule needs.
+    # uc2_cluster_fsm_position is still the right gauge for the STALL
+    # question, per node, against that node's uc2_commit_bytes.
+    #
     # This is a cluster-wide risk, not one node's: only the LEADER appends
     # timer frames, so if the node holding the odd table wins an election,
     # every scheduled recurrence in the cluster stops — every FSM on every node

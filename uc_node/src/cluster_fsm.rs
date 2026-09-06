@@ -64,6 +64,14 @@ pub struct ClusterState {
     /// Frame-END position of the command that installed `table`; 0 = none.
     pub table_position: u64,
     pub settings: Settings,
+    /// Frame-END position of the command that installed `settings`; 0 = none
+    /// (the genesis record, which came from `[settings]` in `node.toml` and
+    /// never crossed the log). `table_position`'s twin, and exported as
+    /// `uc2_settings_position` (spec §9). Like the table's, it is a property
+    /// of the STATE — it rides the image, so a restarted node and a joiner
+    /// installing the artifact both report the position the settings
+    /// actually came from rather than 0.
+    pub settings_position: u64,
     /// Frame-END position this FSM has CONSUMED the log up to — and
     /// therefore the view's position tag and the artifact's position. It
     /// advances on two things: a CLUSTER command applied here (accepted or
@@ -84,6 +92,39 @@ pub struct ClusterState {
     /// the journal rather than skipping it, so a position recorded here is
     /// always one whose every CLUSTER frame this FSM has seen.
     pub applied: u64,
+}
+
+impl ClusterState {
+    /// The genesis state: a membership and a settings record, an empty
+    /// schedule table, and nothing applied — what a node seeds the FSM with
+    /// on a fresh instance directory (`node.toml`'s `[services]` members and
+    /// `[settings]`), and what every offline reader hands
+    /// [`crate::cluster_agent::recover`] before it overwrites it with the
+    /// newest artifact. Both positions are `0`: neither record crossed the
+    /// log.
+    pub fn genesis(membership: ClusterConfig, settings: Settings) -> ClusterState {
+        ClusterState {
+            membership,
+            table: ScheduleTable {
+                entries: Vec::new(),
+            },
+            table_position: 0,
+            settings,
+            settings_position: 0,
+            applied: 0,
+        }
+    }
+
+    /// [`Self::genesis`] with an EMPTY membership and the default settings —
+    /// the seed for a reader that only wants what the artifact holds
+    /// (`install_snapshot` replaces every field, and never consults the
+    /// declared hashes), and for test fixtures that need a published view.
+    pub fn genesis_empty() -> ClusterState {
+        ClusterState::genesis(
+            ClusterConfig::genesis(Vec::new(), Vec::new()),
+            Settings::genesis_default(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +280,10 @@ impl RawStateMachine for ClusterFsm {
                 self.state.table = t;
                 self.state.table_position = ctx.position;
             }
-            ClusterCommand::Settings(s) => self.state.settings = s,
+            ClusterCommand::Settings(s) => {
+                self.state.settings = s;
+                self.state.settings_position = ctx.position;
+            }
         }
         out.push(0);
     }
@@ -263,9 +307,9 @@ impl RawStateMachine for ClusterFsm {
 }
 
 /// The frozen image: magic ‖ version u32 ‖ applied u64 ‖ table_position u64
-/// ‖ membership (u32 len ‖ encode_config) ‖ table (u32 len ‖
-/// encode_schedule_table) ‖ settings (SETTINGS_LEN) ‖ crc32 of everything
-/// before it.
+/// ‖ settings_position u64 ‖ membership (u32 len ‖ encode_config) ‖ table
+/// (u32 len ‖ encode_schedule_table) ‖ settings (SETTINGS_LEN) ‖ crc32 of
+/// everything before it.
 pub type ClusterImage = Vec<u8>;
 
 impl SnapshotStateMachine for ClusterFsm {
@@ -277,6 +321,7 @@ impl SnapshotStateMachine for ClusterFsm {
         img.extend_from_slice(&CLUSTER_IMAGE_VERSION.to_le_bytes());
         img.extend_from_slice(&self.state.applied.to_le_bytes());
         img.extend_from_slice(&self.state.table_position.to_le_bytes());
+        img.extend_from_slice(&self.state.settings_position.to_le_bytes());
         let mut m = Vec::new();
         encode_config(&cluster_to_wire(&self.state.membership, 0), &mut m);
         img.extend_from_slice(&(m.len() as u32).to_le_bytes());
@@ -303,7 +348,8 @@ impl SnapshotStateMachine for ClusterFsm {
         let mut img = Vec::new();
         src.read_to_end(&mut img).map_err(SnapshotError::from)?;
         let bad = |what: &'static str| SnapshotError::Codec(what.into());
-        if img.len() < 8 + 4 + 8 + 8 + 4 + 4 + SETTINGS_LEN + 4 || &img[0..8] != CLUSTER_IMAGE_MAGIC
+        if img.len() < 8 + 4 + 8 + 8 + 8 + 4 + 4 + SETTINGS_LEN + 4
+            || &img[0..8] != CLUSTER_IMAGE_MAGIC
         {
             return Err(bad("cluster image magic"));
         }
@@ -339,6 +385,8 @@ impl SnapshotStateMachine for ClusterFsm {
         }
         let table_position = u64_at(o)?;
         o += 8;
+        let settings_position = u64_at(o)?;
+        o += 8;
         let ml = u32_at(o)? as usize;
         o += 4;
         let m_bytes = o
@@ -369,6 +417,7 @@ impl SnapshotStateMachine for ClusterFsm {
             table,
             table_position,
             settings,
+            settings_position,
             applied,
         };
         Ok(applied)
@@ -380,6 +429,12 @@ impl SnapshotStateMachine for ClusterFsm {
 /// sit behind a mutex taken only when `position` changed.
 pub struct ClusterView {
     pub position: AtomicU64,
+    /// Spec §9: `uc2_settings_position`, the frame-END of the last Settings
+    /// command applied (0 = the genesis record). An atomic beside the four
+    /// settings scalars, for the same reason they are: `/metrics` reads it
+    /// at SCRAPE time with one load and no lock, so nothing about this gauge
+    /// costs the consensus pass anything.
+    pub settings_position: AtomicU64,
     pub admission_bytes: AtomicU64,
     pub fsm_lag_bytes: AtomicU64,
     pub snapshot_interval_bytes: AtomicU64,
@@ -398,6 +453,7 @@ impl ClusterView {
     pub fn new(genesis: &ClusterState) -> ClusterView {
         let v = ClusterView {
             position: AtomicU64::new(0),
+            settings_position: AtomicU64::new(0),
             admission_bytes: AtomicU64::new(0),
             fsm_lag_bytes: AtomicU64::new(0),
             snapshot_interval_bytes: AtomicU64::new(0),
@@ -421,6 +477,8 @@ impl ClusterView {
             g.table = st.table.clone();
             g.table_position = st.table_position;
         }
+        self.settings_position
+            .store(st.settings_position, Ordering::Release);
         self.admission_bytes
             .store(st.settings.admission_bytes, Ordering::Release);
         self.fsm_lag_bytes
@@ -463,6 +521,7 @@ impl ClusterView {
                     _ => uc_protocol::v2::settings::Target::All,
                 },
             },
+            settings_position: self.settings_position.load(Ordering::Acquire),
             applied: self.position.load(Ordering::Acquire),
         }
     }
@@ -491,6 +550,7 @@ mod tests {
             table: ScheduleTable { entries: vec![] },
             table_position: 0,
             settings: Settings::genesis_default(),
+            settings_position: 0,
             applied: 0,
         }
     }
@@ -647,6 +707,50 @@ mod tests {
         assert!(f.validate(&ClusterCommand::Settings(ok)).is_ok());
     }
 
+    /// Spec §9: `settings_position` is `table_position`'s twin — set by the
+    /// Settings command's own frame-END, untouched by any other kind, and
+    /// carried on the image, so a restarted node (and a joiner installing the
+    /// artifact) exports `uc2_settings_position` as the position the settings
+    /// really came from rather than 0.
+    #[test]
+    fn settings_position_tracks_the_settings_command_and_rides_the_image() {
+        let mut f = fsm();
+        let mut out = Vec::new();
+        assert_eq!(f.state().settings_position, 0, "genesis: never on the log");
+        f.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(320),
+            &body(&ClusterCommand::Settings(Settings {
+                snapshot_interval_bytes: 7,
+                ..Settings::genesis_default()
+            })),
+            &mut out,
+        );
+        assert_eq!(f.state().settings_position, 320);
+        // A table command moves `table_position` and `applied`, never this.
+        f.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(640),
+            &body(&ClusterCommand::ScheduleTable(ScheduleTable {
+                entries: vec![],
+            })),
+            &mut out,
+        );
+        assert_eq!(f.state().settings_position, 320);
+        assert_eq!(f.state().table_position, 640);
+
+        let (handle, _) = f.freeze().unwrap();
+        let mut img = Vec::new();
+        ClusterFsm::stream_snapshot(handle, &mut img).unwrap();
+        let mut g = ClusterFsm::new(genesis(), vec![0xF5A0, 0xF5A1]);
+        g.install_snapshot(640, &mut img.as_slice()).unwrap();
+        assert_eq!(g.state().settings_position, 320);
+
+        // And it reaches the view, where `/metrics` reads it (spec §9).
+        let view = ClusterView::new(g.state());
+        assert_eq!(view.settings_position.load(Ordering::Acquire), 320);
+        assert_eq!(view.position.load(Ordering::Acquire), 640);
+        assert_eq!(view.to_state().settings_position, 320);
+    }
+
     #[test]
     fn image_roundtrips_and_refuses_bad_magic_version_and_crc() {
         let mut f = fsm();
@@ -699,10 +803,11 @@ mod tests {
         ClusterFsm::stream_snapshot(handle, &mut img).unwrap();
 
         // Layout: magic(8) | version u32(4) | applied u64(8) |
-        // table_position u64(8) | ml u32(4) | ... — overwrite `ml` with a
-        // value far past the image's actual length, then recompute the CRC
-        // so the tampered image still clears the checksum gate.
-        const ML_OFFSET: usize = 8 + 4 + 8 + 8;
+        // table_position u64(8) | settings_position u64(8) | ml u32(4) |
+        // ... — overwrite `ml` with a value far past the image's actual
+        // length, then recompute the CRC so the tampered image still clears
+        // the checksum gate.
+        const ML_OFFSET: usize = 8 + 4 + 8 + 8 + 8;
         img[ML_OFFSET..ML_OFFSET + 4].copy_from_slice(&9999u32.to_le_bytes());
         let body_len = img.len() - 4;
         let crc = crc32fast::hash(&img[..body_len]);

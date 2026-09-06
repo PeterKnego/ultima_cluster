@@ -389,6 +389,9 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         schedule_table_position: Arc::new(AtomicU64::new(0)),
         schedule_entries: Arc::new(AtomicU64::new(0)),
         schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+        cluster_view: Arc::new(uc_node::ClusterView::new(
+            &uc_node::ClusterState::genesis_empty(),
+        )),
         reports_unattested: Arc::new(AtomicU64::new(0)),
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -400,6 +403,7 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
             ("sender", Arc::new(AtomicBool::new(false))),
             ("receiver", Arc::new(AtomicBool::new(false))),
             ("archive", Arc::new(AtomicBool::new(false))),
+            ("cluster", Arc::new(AtomicBool::new(false))),
         ],
     }
 }

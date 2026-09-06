@@ -881,21 +881,15 @@ fn check_cluster_artifact(dir: &Path, pos: u64) -> Result<(), BackupError> {
     use uc_service::SnapshotStateMachine;
     let path = crate::cluster_agent::artifact_path(dir, pos);
     let mut f = fs::File::open(&path)?;
-    let genesis = crate::cluster_fsm::ClusterState {
-        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
-        table: uc_protocol::v2::schedule::ScheduleTable {
-            entries: Vec::new(),
-        },
-        table_position: 0,
-        settings: uc_protocol::v2::settings::Settings::genesis_default(),
-        applied: 0,
-    };
-    crate::cluster_fsm::ClusterFsm::new(genesis, Vec::new())
-        .install_snapshot(pos, &mut f)
-        .map_err(|e| BackupError::ClusterArtifactCorrupt {
-            path: path.clone(),
-            reason: e.to_string(),
-        })?;
+    crate::cluster_fsm::ClusterFsm::new(
+        crate::cluster_fsm::ClusterState::genesis_empty(),
+        Vec::new(),
+    )
+    .install_snapshot(pos, &mut f)
+    .map_err(|e| BackupError::ClusterArtifactCorrupt {
+        path: path.clone(),
+        reason: e.to_string(),
+    })?;
     Ok(())
 }
 
@@ -1128,16 +1122,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cdir = cluster_snapshots_dir(dir.path());
         fs::create_dir_all(&cdir).unwrap();
-        let genesis = crate::cluster_fsm::ClusterState {
-            membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
-            table: uc_protocol::v2::schedule::ScheduleTable {
-                entries: Vec::new(),
-            },
-            table_position: 0,
-            settings: uc_protocol::v2::settings::Settings::genesis_default(),
-            applied: 0,
-        };
-        let mut fsm = crate::cluster_fsm::ClusterFsm::new(genesis, Vec::new());
+        let mut fsm = crate::cluster_fsm::ClusterFsm::new(
+            crate::cluster_fsm::ClusterState::genesis_empty(),
+            Vec::new(),
+        );
         fsm.set_consumed(4096);
         let (mut img, pos) = fsm.freeze().unwrap();
         fs::write(crate::cluster_agent::artifact_path(&cdir, pos), &img).unwrap();

@@ -87,6 +87,9 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         schedule_table_position: Arc::new(AtomicU64::new(0)),
         schedule_entries: Arc::new(AtomicU64::new(0)),
         schedule_apply_refused: Arc::new(AtomicU64::new(0)),
+        cluster_view: Arc::new(uc_node::ClusterView::new(
+            &uc_node::ClusterState::genesis_empty(),
+        )),
         reports_unattested: Arc::new(AtomicU64::new(0)),
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
@@ -98,6 +101,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
             ("sender", Arc::new(AtomicBool::new(false))),
             ("receiver", Arc::new(AtomicBool::new(false))),
             ("archive", Arc::new(AtomicBool::new(false))),
+            ("cluster", Arc::new(AtomicBool::new(false))),
         ],
     };
 
@@ -354,6 +358,9 @@ fn timer_and_log_time_families_are_in_the_contract() {
         "uc2_timers_late_total",
         "uc2_log_time_ns",
         "uc2_log_time_lag_seconds",
+        // Cluster FSM (spec §9): the cluster row's own two positions.
+        "uc2_cluster_fsm_position",
+        "uc2_settings_position",
     ] {
         assert!(
             uc_node::obs::metrics::CONTRACT_SERIES.contains(&name),

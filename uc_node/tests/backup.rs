@@ -1339,6 +1339,7 @@ fn cluster_genesis() -> uc_node::ClusterState {
         },
         table_position: 0,
         settings: uc_protocol::v2::settings::Settings::genesis_default(),
+        settings_position: 0,
         applied: 0,
     }
 }

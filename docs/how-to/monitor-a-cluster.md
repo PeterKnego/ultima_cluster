@@ -243,15 +243,24 @@ the same node — a table position that is stale while commit is moving is a
 read nonzero has applied no table at all. The remedy is unchanged: re-run
 `uc2ctl schedule apply`, which appends a fresh frame every node applies.
 
-**Two gaps to know about in this release.** The cluster FSM's own applied
-position and the settings record's position are **not exported yet** — the
-design names `uc2_cluster_fsm_position` and `uc2_settings_position` and plan 1
-did not add them, so `uc2_schedule_table_position` (which moves only when a
-table command commits) is the only view-derived gauge, and
-`uc2ctl settings show` is how you read the committed settings. The
-`uc2_agent_alive` family likewise still covers **four** agents
-(`consensus`, `sender`, `receiver`, `archive`) and not the fifth,
-`uc2-cluster`.
+**Two more gauges beside it**, both read off the cluster FSM's published view
+at scrape time:
+
+- `uc2_cluster_fsm_position` — the position this node's cluster FSM has
+  **consumed** the log up to (its `applied`). Unlike the table and settings
+  positions, this advances with the agent's walk over ordinary traffic, so it
+  is **not** a fleet-wide constant and nothing alerts on it diverging: it is
+  the per-node stall reading. A position sitting still while that same node's
+  `uc2_commit_bytes` climbs is a `uc2-cluster` agent that is not applying.
+- `uc2_settings_position` — the frame-END of the last `settings apply` this
+  node's cluster FSM applied; `0` means the genesis record from `[settings]`
+  in `node.toml`, which never crossed the log. Fleet-wide identical once
+  caught up, exactly like `uc2_schedule_table_position`. `uc2ctl settings
+  show` still prints the settings themselves.
+
+The `uc2_agent_alive` family covers **five** agents — `consensus`, `sender`,
+`receiver`, `archive`, and `cluster` (the `uc2-cluster` agent, labelled like
+its four siblings without the thread-name prefix).
 
 **Six records** go with them — three at info, three at warn:
 
@@ -378,7 +387,7 @@ with more explanation.
 
 | Probe | Answers | 200 when | 503 when |
 |---|---|---|---|
-| `/healthz` | should this process be restarted? | all four agents alive and the node heartbeat is fresh (<3s) | any agent fail-stopped, or the node heartbeat is stale |
+| `/healthz` | should this process be restarted? | all five agents alive and the node heartbeat is fresh (<3s) | any agent fail-stopped, or the node heartbeat is stale |
 | `/readyz` | should traffic be routed here? | role-aware: a leader needs `can_serve` too; a follower/learner needs only to be healthy — both need a fresh **service** heartbeat as well | any `/healthz` failure, OR a leader with `can_serve == 0` (elected but its NewTerm frame isn't yet quorum-committed — flags `0x01`), OR a stale service heartbeat |
 
 `/healthz` is deliberately role- and `can_serve`-blind: an elected-but-not-
@@ -447,7 +456,7 @@ flooding.
 | `snapshot_published` (derived) | `node`, `pos` | this node's own service-side snapshot position advanced to `pos` |
 | `admin_op` | `actor`, `origin`, `op`, `op_name`, `id`, `addr`, `seq`, `nonce`, `outcome`, `reason`, `config_version` | this node answered an admin request (membership change). A **mirror** of the line already written to `<instance_dir>/audit.jsonl`, which is the record of record: the file is fsynced *before* the answer is published, this stream is best-effort. `actor` is the admin key name that signed it, `filesystem` when the node authenticates nothing (`auth = "none"`), `unverified` on a request that failed authentication, or `peer:<id>` on a proposal a follower forwarded (`origin: forwarded`). `outcome` is `accepted` (proposed and appended — not necessarily committed) / `refused` / `retry`. |
 | `admin_audit_failed` | `node`, `seq`, `nonce`, `op`, `status`, `err` | the audit record for an admin request could NOT be written, so the request was refused with reason 24 rather than answered unrecorded. On an otherwise-accepted change this means the change may still be in the log — check `uc2ctl status`. Alert on this: it means the node's disk is failing or full. |
-| `agent_failstopped` | `agent` | one of the four polling agents panicked; the daemon logs this and then **exits 1 without draining**, so systemd restarts it and the replay path (not reconstruction) picks the node back up |
+| `agent_failstopped` | `agent` | one of the five polling agents panicked (`cluster` is the fifth, since 2.11); the daemon logs this and then **exits 1 without draining**, so systemd restarts it and the replay path (not reconstruction) picks the node back up |
 | `config_loaded` | `path`, `sha256` | the config file that was read, and plain SHA-256 over its bytes — the config half of a release identity, checkable with `sha256sum`. See [Record a release](record-a-release.md). |
 | `config_env_override` | `var`, `value` | one `UC2_*` [environment override](../reference/configuration.md#environment-overrides) took effect, so this value did NOT come from the config file. Emitted before `[log] level` is applied, so it appears even at `warn`. |
 | `node_listening` | `node`, `bind` | the node is up and its UDP socket is bound to `bind`. The first record of a healthy boot. |

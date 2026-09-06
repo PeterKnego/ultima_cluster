@@ -50,15 +50,7 @@ pub fn snapshot_dir_of(instance_dir: &Path) -> PathBuf {
 /// `schedule show`/`status` print `(0, [])`/`0` as "no cluster artifact yet"
 /// rather than implying an empty table was adopted.
 pub fn read_committed_table(instance_dir: &Path) -> io::Result<(u64, ScheduleTable)> {
-    let genesis = ClusterState {
-        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
-        table: ScheduleTable {
-            entries: Vec::new(),
-        },
-        table_position: 0,
-        settings: uc_protocol::v2::settings::Settings::genesis_default(),
-        applied: 0,
-    };
+    let genesis = ClusterState::genesis_empty();
     // No declared hashes: this reader never APPLIES a command, and
     // `install_snapshot` does not consult them.
     let (fsm, _) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
@@ -78,15 +70,7 @@ pub fn read_committed_table(instance_dir: &Path) -> io::Result<(u64, ScheduleTab
 pub fn read_committed_settings(
     instance_dir: &Path,
 ) -> io::Result<Option<(u64, uc_protocol::v2::settings::Settings)>> {
-    let genesis = ClusterState {
-        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
-        table: ScheduleTable {
-            entries: Vec::new(),
-        },
-        table_position: 0,
-        settings: uc_protocol::v2::settings::Settings::genesis_default(),
-        applied: 0,
-    };
+    let genesis = ClusterState::genesis_empty();
     // No declared hashes: this reader never APPLIES a command, and
     // `install_snapshot` does not consult them.
     let (fsm, start) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
@@ -659,6 +643,7 @@ mod tests {
             table: ScheduleTable { entries: vec![] },
             table_position: 0,
             settings: Settings::genesis_default(),
+            settings_position: 0,
             applied: 0,
         }
     }

@@ -225,7 +225,8 @@ fn not_found() -> (u16, &'static str, String) {
     (404, "text/plain", "not found\n".to_string())
 }
 
-/// Liveness: are this node's four polling agents still running, and is the
+/// Liveness: are this node's five polling agents still running (the four
+/// data-plane ones plus `uc2-cluster` since the cluster FSM), and is the
 /// node itself still stamping its own heartbeat? Deliberately independent of
 /// role or `CAN_SERVE` — an elected-but-not-yet-serving leader (the `0x01`
 /// state) is alive; it just isn't ready. See [`readyz`].
