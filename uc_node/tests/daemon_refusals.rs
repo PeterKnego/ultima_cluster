@@ -244,12 +244,29 @@ fn daemon_starts_with_the_same_two_keys_under_settings() {
                  names = [\"kv\"]\n\n[settings]\nadmission_bytes = 4096\nfsm_lag = \"1MiB\"\n";
     let (cfg, inst) = write_config(dir.path(), 19806, extra);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
         .arg("--config")
         .arg(&cfg)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
+
+    // Every `panic!`/`assert!` in the poll below unwinds out of this test —
+    // and a `Child` that is merely dropped leaves the daemon RUNNING, holding
+    // its instance dir, its port and four busy-spin threads for the rest of
+    // the suite (the tempdir unlinks under a live node, so it is not even
+    // visible as a leak). The guard kills it on the way out; the happy path
+    // disarms it and takes the child back for the SIGTERM assertions below.
+    struct KillOnDrop(Option<std::process::Child>);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let mut guard = KillOnDrop(Some(child));
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let page = inst.join("cnc2.dat");
@@ -257,7 +274,7 @@ fn daemon_starts_with_the_same_two_keys_under_settings() {
         if page.exists() {
             break;
         }
-        match child.try_wait().unwrap() {
+        match guard.0.as_mut().expect("armed").try_wait().unwrap() {
             Some(status) => panic!(
                 "the daemon exited before creating its cnc page: {status:?} — \
                  `[settings]` must be an ACCEPTED home for these keys"
@@ -270,6 +287,8 @@ fn daemon_starts_with_the_same_two_keys_under_settings() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
+    // Disarmed: from here the child is reaped by `wait_with_output` below.
+    let child = guard.0.take().expect("armed");
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let out = child.wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);

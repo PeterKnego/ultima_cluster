@@ -818,11 +818,20 @@ fn timers_pending_on_the_old_leader_fire_exactly_once_on_the_new_one_after_its_a
     wait_until("the new leader announced the pending set", || {
         pending(new_leader) == 2
     });
-    assert_eq!(
-        pending(bystander),
-        0,
-        "node {bystander} is still a follower and must hold no heap"
-    );
+    // Sampled across a settle window, exactly like the pre-failover check
+    // above: the word is republished every consensus pass, so a single-shot
+    // read right after the announce could catch a bystander that arms one
+    // pass later and then reads 0 again — or miss one that arms and stays
+    // armed. A window catches both.
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        assert_eq!(
+            pending(bystander),
+            0,
+            "node {bystander} is still a follower and must hold no heap"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // ---- and both fire, on every survivor.
     for &i in &followers {

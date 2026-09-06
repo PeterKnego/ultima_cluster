@@ -2270,6 +2270,22 @@ fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_i
     });
     let got = f.learner.cluster_view().snapshot_inner();
     assert_eq!(got.table, table, "…record for record");
+    // Spec §11 asks for "table AND membership": the image carries the whole
+    // cluster row, and the membership half is what lets the joiner serve and
+    // vote — a session that shipped the table but not the membership would
+    // pass every assertion above. WEAK HERE BY CONSTRUCTION, and deliberately
+    // so: this fixture's nodes all start from the same genesis membership
+    // (`cfg`'s shared `members`/`learners`), so an equal reading does not by
+    // itself prove the joiner took it from the image. The NON-genesis case —
+    // a membership at version 1, present only in the leader's artifact — is
+    // `fresh_learner_joins_a_purged_leader_via_snapshot_session`'s
+    // `learner_membership` block. What this adds is that the restarted
+    // shipper's own re-derived row and the joiner's agree in FULL, not only
+    // on the table.
+    assert_eq!(
+        got.membership, want.membership,
+        "…and the shipper's membership, which came from the same image"
+    );
 
     // And nothing is armed on it: the row heap is leader-only (spec §4.9) and
     // this joiner is a learner. A live reading — the consensus agent
