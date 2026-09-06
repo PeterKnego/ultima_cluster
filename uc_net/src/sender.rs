@@ -212,12 +212,13 @@ pub fn identity_mask(identity: &[u64; 8]) -> u64 {
 /// M6 Task 6 / M14c: the newest durable snapshot SET the node is willing to
 /// ship. The node wires this to each declared FSM's `SnapshotStore` filtered by
 /// its PERSISTED floor marker (never a half-written file). `None` = nothing
-/// shippable (the NAK stays an overrun). M7 Task 6: `config` is the
-/// `v2::config::encode_config` bytes of the CURRENT `ConfigRecord.config` at
-/// ship time — carried in every `SNAP_BEGIN` so a below-floor joiner adopts the
-/// leader's membership alongside its lineage. Over-delivery (shipping to a peer
-/// whose config is already current) is safe: the receiver adopts by fiat only
-/// on a genuine install, and adoption is idempotent by version.
+/// shippable (the NAK stays an overrun). Cluster-FSM spec §5.6: the set also
+/// carries the CLUSTER ARTIFACT under [`CLUSTER_ARTIFACT_ID`] — the cluster
+/// FSM's own image, which is how the leader's membership, schedule table and
+/// settings now reach a below-floor joiner (0.7.0 retired the per-`SNAP_BEGIN`
+/// `config` carry). Over-delivery (shipping to a peer that is already current)
+/// is safe: the receiver installs by fiat only on a genuine completed session,
+/// and the install is idempotent by the artifact's position.
 pub type SnapshotSource = Arc<dyn Fn() -> Option<SnapshotSet> + Send + Sync>;
 
 /// One artifact inside an in-flight outbound session. `base` is its first

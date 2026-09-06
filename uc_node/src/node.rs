@@ -1527,7 +1527,6 @@ impl Node {
             instance.cluster_snapshot_dir(),
             cluster_start,
             Arc::clone(&cluster_snapshot_pos),
-            Arc::clone(&prime_generation),
             cluster_journal,
             cluster_install_rx,
             Arc::clone(&cluster_installed),
@@ -8118,7 +8117,6 @@ mod tests {
             // nothing this node ever wrote.
             6016,
             Arc::clone(&cluster_snapshot_pos),
-            Arc::new(AtomicU64::new(0)),
             Archive::open(ArchiveConfig::new(dir.path().join("cluster-journal")))
                 .unwrap()
                 .journal_arc(),
@@ -8632,7 +8630,6 @@ mod tests {
             h._dir.path().join("snapshots/cluster"),
             6016,
             Arc::clone(&h.cons.cluster_snapshot_pos),
-            Arc::new(AtomicU64::new(0)),
             Archive::open(ArchiveConfig::new(h._dir.path().join("rows-journal")))
                 .unwrap()
                 .journal_arc(),
@@ -8726,7 +8723,6 @@ mod tests {
             h._dir.path().join("snapshots/cluster"),
             6016,
             Arc::clone(&h.cons.cluster_snapshot_pos),
-            Arc::new(AtomicU64::new(0)),
             Archive::open(ArchiveConfig::new(h._dir.path().join("rows-journal")))
                 .unwrap()
                 .journal_arc(),

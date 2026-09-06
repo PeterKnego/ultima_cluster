@@ -157,26 +157,18 @@ pub struct ClusterAgent {
     cluster_snapshot_pos: Arc<AtomicU64>,
     declared_rows: Vec<usize>,
     out: Vec<u8>,
-    /// Ruling R11: the SAME node-internal generation counter the archive
-    /// agent bumps immediately after every `LogCounters::prime` (truncate,
-    /// AdoptFloor, leader-open collapse) — `uc_net::receiver`'s
-    /// `prime_generation` field, shared here for the identical purpose:
-    /// telling a benign forward re-prime apart from a genuine live overrun.
-    prime_generation: Arc<AtomicU64>,
-    /// The generation as of the last time we actually EXPLAINED an Overrun
-    /// with it (not merely "as of the top of the last cycle" — a prime's
-    /// generation bump and its effect on `commit`/`durable` becoming visible
-    /// to THIS thread are two independent atomics with no ordering between
-    /// them, so the two can be observed on different cycles; refreshing this
-    /// unconditionally on every idle cycle would spend the "explained"
-    /// credit before an Overrun ever needed it).
-    last_prime_gen: u64,
     /// Ruling R12: the SAME journal handle the archive agent records into
     /// (`Archive::journal_arc`). The appender never overwrites bytes the
     /// archive has not yet recorded, so a live overrun (no prime explains
     /// it) always has its missing frames retained here — `do_work`'s Overrun
     /// arm replays from it instead of fail-stopping the node.
     journal: Arc<Journal>,
+    /// Ruling R18: the "journal purged below this cursor" warning has already
+    /// been emitted for the CURRENT episode. That condition is re-checked
+    /// every duty cycle and the agent now IDLES on it (rather than skipping
+    /// forward), so an unlatched line would be written thousands of times a
+    /// second. Cleared by a replay that reaches frames, and by an install.
+    replay_gap_logged: bool,
     /// Spec §5.6: the snapshot session's cluster-artifact route. The
     /// `uc_net` receiver agent sends `(position, path)` here the moment a
     /// session completes, BEFORE it publishes the session's floor — the
@@ -196,10 +188,8 @@ impl ClusterAgent {
     /// position, or 0). `cluster_snapshot_pos` (Ruling R2) is seeded here from
     /// the recovered artifact's position and updated (Release) by
     /// [`Self::take_snapshot`]; the consensus agent (task 5) reads it.
-    /// `prime_generation` (Ruling R11) is the node-wide re-prime generation
-    /// counter, shared with `uc_net::receiver`. `journal` (Ruling R12) is
-    /// the archive's own journal handle (`Archive::journal_arc`), the
-    /// fallback source for a live overrun with no explaining prime.
+    /// `journal` (Rulings R12/R18) is the archive's own journal handle
+    /// (`Archive::journal_arc`) — the source EVERY overrun replays from.
     /// `install` (spec §5.6) is the receive end of the snapshot session's
     /// cluster-artifact route — the receiver agent hands `(position, path)`
     /// over it on a completed session and `do_work` drains it FIRST, before
@@ -214,7 +204,6 @@ impl ClusterAgent {
         snapshot_dir: PathBuf,
         start: u64,
         cluster_snapshot_pos: Arc<AtomicU64>,
-        prime_generation: Arc<AtomicU64>,
         journal: Arc<Journal>,
         install: mpsc::Receiver<(u64, PathBuf)>,
         installed: Arc<AtomicU64>,
@@ -224,7 +213,6 @@ impl ClusterAgent {
         let declared_rows = (0..CNC_MAX_SERVICES)
             .filter(|r| cnc.service_slot(*r).identity.hash() != 0)
             .collect();
-        let last_prime_gen = prime_generation.load(Ordering::Acquire);
         ClusterAgent {
             follower: LogFollower::new(buffer, start),
             cnc,
@@ -235,9 +223,8 @@ impl ClusterAgent {
             cluster_snapshot_pos,
             declared_rows,
             out: Vec::new(),
-            prime_generation,
-            last_prime_gen,
             journal,
+            replay_gap_logged: false,
             install,
             installed,
         }
@@ -292,71 +279,36 @@ impl ClusterAgent {
         let head = c.commit.load_acquire().min(c.durable.load_acquire());
         let mut applied_any = false;
         loop {
-            // Ruling R11: sample the prime generation before calling
-            // `next_batch`, mirroring `uc_net::receiver`'s DATA-arm `gen0`
-            // (its per-read straddle guard, ~line 1745). Compared against
-            // `last_prime_gen` — the generation we last actually ACCOUNTED
-            // for, not merely "as of the top of this cycle": a prime
-            // (AdoptFloor, truncate, leader-open collapse) can complete, and
-            // its generation bump land, long before this agent is next
-            // scheduled to notice `head` has moved (the archive bumps the
-            // generation right after `LogCounters::prime`, but `commit` is a
-            // separate counter written by a different agent on a different
-            // cadence — so the two are not guaranteed to become visible to
-            // this thread on the same cycle).
-            let gen0 = self.prime_generation.load(Ordering::Acquire);
             match self.follower.next_batch(head) {
                 Batch::CaughtUp => break,
                 Batch::Overrun => {
-                    // Recheck (the same belt-and-suspenders the receiver's
-                    // DATA arm uses at its own Overrun-adjacent site): a
-                    // prime racing concurrently with THIS call's own
-                    // execution may not yet have been visible in `gen0`.
-                    let gen1 = self.prime_generation.load(Ordering::Acquire);
-                    let primed = gen0 != self.last_prime_gen || gen1 != self.last_prime_gen;
-                    if primed {
-                        self.last_prime_gen = gen1;
-                        // A prime explains it. The below-floor JOIN case no
-                        // longer reaches here: `install_from` has already
-                        // reset this cursor to the installed artifact's
-                        // position (at or above the floor `AdoptFloor` primes
-                        // to), and it runs at the TOP of this same `do_work`,
-                        // before the walk — the receiver hands the artifact
-                        // over before it publishes the floor the consensus
-                        // agent adopts. What is left here is the other two
-                        // primes: a truncation and a leader-open collapse,
-                        // both BACKWARD, where resyncing the cursor to `head`
-                        // is exactly right (there is nothing above it to
-                        // read). Kept, rather than a fail-stop, for the same
-                        // reason it was written: this agent has no admission
-                        // door, so a prime racing its walk is ordinary.
-                        crate::obs_event!(
-                            Warn,
-                            "cluster_agent_resynced_over_overrun",
-                            cursor = self.follower.cursor,
-                            head = head
-                        );
-                        self.follower.cursor = head;
-                    } else {
-                        // Ruling R12: no prime explains this. Fix round 2
-                        // found that fail-stopping here anyway punishes a
-                        // perfectly healthy node — this agent has no
-                        // admission door (spec §4.1, "outside the lag
-                        // policy") and the shared ring holds every frame
-                        // type, so ordinary heavy write throughput on a
-                        // small ring can outrun it with no prime in sight.
-                        // But the appender never overwrites bytes the
-                        // archive has not recorded, so every frame this
-                        // agent missed is still in the journal — replay it
-                        // from there instead of resyncing blind or
-                        // panicking. This converges: if the buffer's base is
-                        // still above the cursor afterward, the next
-                        // `next_batch` overruns again and replays again,
-                        // because the journal is always ahead of the
-                        // buffer's base.
-                        if self.replay_from_journal(head) {
-                            applied_any = true;
-                        }
+                    // Ruling R18: EVERY overrun replays from the journal.
+                    // There is no case in which skipping forward is sound,
+                    // and R17 (the FSM's position is the CURSOR) made the old
+                    // "a prime explains it, resync to head" arm actively
+                    // unsafe: the skipped span would be recorded as consumed,
+                    // `take_snapshot` would tag an artifact at a position
+                    // whose CLUSTER frames this node never applied, and a
+                    // joiner installing that artifact would set its cursor to
+                    // the tag and never be able to recover them.
+                    //
+                    // Nothing is lost by dropping the distinction, because
+                    // every frame in `[cursor, buffer base)` is in the journal
+                    // BY CONSTRUCTION: the appender never overwrites bytes the
+                    // archive has not yet recorded. That covers all three
+                    // primes as well as a plain live overrun — a truncation
+                    // cuts only ABOVE commit, which is at or above this
+                    // cursor; a leader-open collapse touches nothing durable;
+                    // and a below-floor join never reaches here at all, since
+                    // `install_from` runs at the top of this same `do_work`
+                    // and resets the cursor to the installed position.
+                    //
+                    // This converges: if the buffer's base is still above the
+                    // cursor afterwards, the next `next_batch` overruns and
+                    // replays again, because the journal is always ahead of
+                    // the buffer's base.
+                    if self.replay_from_journal(head) {
+                        applied_any = true;
                     }
                     break;
                 }
@@ -417,8 +369,9 @@ impl ClusterAgent {
     /// follower cursor to the installed position: the log below it is purged
     /// on this node and `AdoptFloor` is about to prime the counters straight
     /// to the session's floor, so a cursor left where it was would read bytes
-    /// that no longer exist (the `Overrun` the R13 interim could only resync
-    /// blind over).
+    /// that exist neither in the ring nor in this node's journal. This is the
+    /// ONLY thing that moves a below-floor node's cursor forward — Ruling R18
+    /// removed the overrun skip that used to paper over the same situation.
     ///
     /// An artifact that is empty, truncated or fails its CRC is an
     /// `io::Error` and the caller fail-stops. `ClusterFsm::install_snapshot`
@@ -448,10 +401,7 @@ impl ClusterAgent {
         // The artifact IS every CLUSTER frame up to `got`, so the next frame
         // to read is the one starting there.
         self.follower.cursor = got;
-        // `AdoptFloor`'s prime bumps the generation: adopt the CURRENT one as
-        // already explained, so the forward re-prime that follows is not read
-        // as a live overrun.
-        self.last_prime_gen = self.prime_generation.load(Ordering::Acquire);
+        self.replay_gap_logged = false;
         crate::obs_event!(
             Info,
             "cluster_artifact_installed",
@@ -466,9 +416,9 @@ impl ClusterAgent {
         Ok(())
     }
 
-    /// Ruling R12: a live overrun with no explaining prime degrades to
-    /// journal replay, exactly as the service's apply loop does below the
-    /// floor. Walks `uc_log::archive::replay_journal_from` from
+    /// Rulings R12/R18: an overrun — any overrun — degrades to journal
+    /// replay, exactly as the service's apply loop does below the floor.
+    /// Walks `uc_log::archive::replay_journal_from` from
     /// `self.follower.cursor`, applying every `FRAME_TYPE_CLUSTER` frame
     /// through the FSM with the same frame-END `ApplyCtx` the live path
     /// uses, and stops at the first frame whose END exceeds `head` — never
@@ -482,22 +432,34 @@ impl ClusterAgent {
         let mut replay = match replay_journal_from(&self.journal, from) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                // Below the journal's own retained floor (purged) — R12
-                // doesn't cover this edge (it assumes the journal always
-                // has what the live buffer no longer does, which holds
-                // absent purge). The snapshot session's cluster artifact
-                // (spec §5.6) is what covers a below-floor node now, and it
-                // resets this cursor itself; a node that still lands here
-                // has purged frames it never received a set for, so there is
-                // nothing left to replay — resync forward rather than wedge
-                // the node forever on an unreadable gap.
-                crate::obs_event!(
-                    Warn,
-                    "cluster_agent_journal_replay_gap_purged",
-                    from = from,
-                    head = head
-                );
-                self.follower.cursor = head;
+                // Below the journal's own retained floor: the frames are gone
+                // from this node entirely. Ruling R18: IDLE — do not skip
+                // forward. Skipping would silently drop CLUSTER commands and
+                // then let `take_snapshot` tag an artifact claiming them,
+                // which a joiner would install and never recover from.
+                //
+                // On a healthy node this is unreachable: R17 makes the FSM's
+                // position the cursor, `take_snapshot` tags the artifact at
+                // that position, and `maybe_persist_snapshot_floor` bounds the
+                // purge floor by `cluster_snapshot_pos` — so a purge below
+                // THIS cursor cannot happen unless the node is itself below
+                // the floor. A node that IS below the floor is served a
+                // snapshot session, whose id-255 part lands in `install_from`
+                // and moves the cursor with real state behind it. So the
+                // correct behaviour here is to wait for that.
+                //
+                // Latched: one line per episode, cleared by any successful
+                // replay or install, because this is polled every duty cycle
+                // and a per-cycle line would bury the log.
+                if !self.replay_gap_logged {
+                    self.replay_gap_logged = true;
+                    crate::obs_event!(
+                        Warn,
+                        "cluster_agent_journal_replay_gap_purged",
+                        from = from,
+                        head = head
+                    );
+                }
                 return false;
             }
             Err(e) => {
@@ -531,6 +493,7 @@ impl ClusterAgent {
             }
         }
         self.follower.cursor = cursor;
+        self.replay_gap_logged = false;
         crate::obs_event!(
             Warn,
             "cluster_agent_journal_replay",
@@ -733,7 +696,6 @@ mod tests {
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
@@ -748,6 +710,77 @@ mod tests {
         assert_eq!(view.position.load(Ordering::Acquire), e3);
         assert_eq!(view.snapshot_interval_bytes.load(Ordering::Acquire), 9);
         assert!(!agent.do_work(), "caught up: no work");
+    }
+
+    /// Ruling R17: the position the view and the artifact carry is the apply
+    /// loop's CURSOR after the batch — everything committed this FSM has
+    /// consumed — not merely the last CLUSTER command's own frame-end.
+    ///
+    /// Staged so the two are DIFFERENT: the batch's last frame is a plain
+    /// MESSAGE, appended after the command. Under the pre-R17 reading both
+    /// assertions below would read `e_cmd`; the cursor reading is `e_msg`, and
+    /// that difference is exactly what lets the artifact (and with it the
+    /// node's purge floor) advance on a cluster whose CLUSTER frames are rare.
+    #[test]
+    fn the_view_and_artifact_position_is_the_cursor_not_the_last_command() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let e_cmd = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(7))
+            .unwrap();
+        // Two ordinary frames AFTER it: yielded by this loop, but walked.
+        let _ = app.append(1, 1, b"client frame").unwrap();
+        let e_msg = app.append(1, 1, b"another client frame").unwrap();
+        assert!(e_msg > e_cmd);
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let cluster_pos = Arc::new(AtomicU64::new(0));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            Arc::clone(&view),
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::clone(&cluster_pos),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        cnc.counters().durable.store_release(e_msg);
+        cnc.counters().commit.store_release(e_msg);
+        assert!(agent.do_work());
+
+        assert_eq!(
+            agent.applied(),
+            e_msg,
+            "the FSM's position is the cursor — the END of the last frame WALKED"
+        );
+        assert_eq!(
+            view.position.load(Ordering::Acquire),
+            e_msg,
+            "…and so is the view's position tag, published on the pass that applied"
+        );
+        assert_eq!(
+            view.snapshot_interval_bytes.load(Ordering::Acquire),
+            7,
+            "sanity: the command itself did apply"
+        );
+
+        // The artifact carries the same position, which is what the purge
+        // floor is bounded by, and it recovers at it.
+        let pos = agent.take_snapshot().expect("freeze");
+        assert_eq!(pos, e_msg);
+        assert_eq!(cluster_pos.load(Ordering::Acquire), e_msg);
+        let (_, start2) = recover(
+            &dir.path().join("snapshots/cluster"),
+            genesis_state(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(start2, e_msg, "recovery resumes at the consumed position");
     }
 
     #[test]
@@ -767,7 +800,6 @@ mod tests {
             view,
             dir.path().join("snapshots/cluster"),
             start,
-            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
             no_install_route(),
@@ -807,7 +839,6 @@ mod tests {
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
@@ -840,9 +871,38 @@ mod tests {
         head
     }
 
+    /// Ruling R18: an overrun that a PRIME explains must still replay the
+    /// journal — it must never skip the cursor forward.
+    ///
+    /// The regression this pins is a real data loss, and only R17 made it
+    /// visible: the old arm set `follower.cursor = head`, R17's
+    /// `set_consumed(cursor)` then recorded the skipped span as consumed, and
+    /// `take_snapshot` tags the artifact at that position — so the node would
+    /// ship an artifact CLAIMING CLUSTER commands it never applied, and a
+    /// joiner installing it would set its own cursor to the tag and never be
+    /// able to recover them. There is no sound case for the skip: every frame
+    /// in the gap is in the journal by construction (the appender never
+    /// overwrites bytes the archive has not recorded).
+    ///
+    /// Deliberately the same staging as the no-prime test below, plus the
+    /// generation bump the archive does right after `LogCounters::prime` —
+    /// which is exactly what used to select the losing branch.
     #[test]
-    fn an_overrun_after_a_prime_resyncs_and_warns() {
+    fn an_overrun_after_a_prime_replays_the_journal_rather_than_skipping() {
         let (buffer, cnc, dir) = world();
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let _e1 = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(7))
+            .unwrap();
+        let _e2 = app.append(1, 1, b"client frame").unwrap(); // yielded, not applied
+        let e3 = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(9))
+            .unwrap();
+        while archive.do_work(&buffer).unwrap() {}
+        let journal = archive.journal_arc();
+
         let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
         let view = Arc::new(ClusterView::new(fsm.state()));
         let prime_gen = Arc::new(AtomicU64::new(0));
@@ -850,37 +910,48 @@ mod tests {
             Arc::clone(&buffer),
             Arc::clone(&cnc),
             fsm,
-            view,
+            Arc::clone(&view),
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
-            Arc::clone(&prime_gen),
-            empty_journal(dir.path()),
+            journal,
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
         );
         // The archive bumps the generation right after `LogCounters::prime` —
-        // do the same here, THEN stage the overrun, matching how `AdoptFloor`
-        // orders the two writes in `node.rs`.
+        // do the same, THEN stage the overrun, matching how `AdoptFloor`
+        // orders the two writes in `node.rs`. Under the old arm this is what
+        // made the agent skip.
         prime_gen.fetch_add(1, Ordering::Release);
         let head = stage_overrun(&buffer, &cnc);
-        assert!(
-            !agent.do_work(),
-            "resynced, not panicked; nothing was actually applied"
+        assert!(head > e3, "the prime moves the head well past the frames");
+
+        assert!(agent.do_work(), "the gap is replayed, not skipped");
+        assert_eq!(
+            view.snapshot_interval_bytes.load(Ordering::Acquire),
+            9,
+            "every CLUSTER frame in the overrun span was applied — the LAST \
+             command's value, so nothing in between was skipped either"
         );
         assert_eq!(
-            agent.follower.cursor, head,
-            "the follower resyncs to the new head"
+            agent.applied(),
+            e3,
+            "the position is where the replay actually REACHED, not the head \
+             the prime moved to — an artifact tagged at `head` would claim \
+             frames this node never applied"
+        );
+        assert_eq!(agent.follower.cursor, e3);
+        assert!(
+            agent.applied() < head,
+            "and it is strictly below the head, which is the whole point"
         );
     }
 
-    /// Ruling R12: a live overrun with no explaining prime must not lose
-    /// data — the appender never overwrites bytes the archive has not
-    /// recorded, so every frame this agent missed is still in the journal.
-    /// Stages the SAME shape of overrun as `an_overrun_after_a_prime_...`,
-    /// but this time the frames it must recover are REAL, recorded ones
-    /// (not the resync test's "nothing was actually applied"), and the
-    /// generation is never bumped — a live overrun, not a prime.
+    /// Ruling R12: a live overrun — the ring simply outran this agent, with
+    /// no prime anywhere — must not lose data either. Since R18 this takes
+    /// the identical path as the test above (there is one arm now), and the
+    /// pair is kept deliberately: together they say that WHY the overrun
+    /// happened no longer selects a behaviour.
     #[test]
     fn an_overrun_without_a_prime_replays_the_gap_from_the_journal() {
         let (buffer, cnc, dir) = world();
@@ -913,7 +984,6 @@ mod tests {
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)), // prime_generation: never bumped
             journal,
             no_install_route(),
             Arc::new(AtomicU64::new(0)),

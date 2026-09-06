@@ -578,13 +578,17 @@ pub struct FollowerStats {
     /// the local artifact is already renamed and installed by then.
     pub seal_failures: AtomicU64,
     /// A `SNAP_BEGIN` arrived whose `layout` byte is not
-    /// [`SNAP_BEGIN_LAYOUT_V3`] — the named refusal **`peer wire ≤ 0.6.0`**.
-    /// The session is dropped. NOTE this is the *defensive* half: a genuine
+    /// [`SNAP_BEGIN_LAYOUT_V4`] — the named refusal **`peer speaks a
+    /// SNAP_BEGIN shape we do not`**. The session is dropped. Two shapes reach
+    /// it: wire ≤ 0.6.0 (`SNAP_BEGIN_LAYOUT_V2`) and the retired intermediate
+    /// 0.7.0 body that carried a trailing config (`SNAP_BEGIN_LAYOUT_V3`,
+    /// cluster-FSM spec §5.6) — whose first 120 bytes decode identically to a
+    /// V4 body, so this discriminator is the ONLY thing separating them.
+    /// NOTE this is the *defensive* half for the 0.6.0 case: a genuine
     /// pre-0.7.0 body is shorter than [`SNAP_BEGIN_FIXED_LEN`] and is usually
     /// dropped by `read_snap_begin_body`'s length check before it ever gets
-    /// here; this fires when a legacy-shaped body happens to reach the 0.7.0
-    /// fixed length (a long-enough carried config). The follower keeps
-    /// NAKing; the operator sees the counter and finishes the flag day.
+    /// here. The follower keeps NAKing; the operator sees the counter and
+    /// finishes the flag day.
     pub snap_refused_legacy_peer: AtomicU64,
     /// Wire 0.7.0 (spec §5, §8): a `SNAP_BEGIN` arrived whose `identity`
     /// array differs from this node's own at some row (an identity/name
@@ -655,8 +659,8 @@ pub struct FollowerStats {
     /// `SNAP_DONE` comes back, so on a flag day that counter climbs at the
     /// resend rate and says nothing about how many distinct sessions were
     /// refused. This one does — and it also separates the two halves of the
-    /// `peer wire ≤ 0.6.0` refusal (a body too short to decode vs. a decodable
-    /// body carrying `layout != SNAP_BEGIN_LAYOUT_V3`), which
+    /// wrong-shape refusal (a body too short to decode vs. a decodable body
+    /// carrying `layout != SNAP_BEGIN_LAYOUT_V4`), which
     /// `snap_refused_legacy_peer` deliberately folds together.
     pub snap_begin_undecodable: AtomicU64,
 }
@@ -2413,18 +2417,40 @@ impl FollowerReceiver {
         // usefully do with a set whose cluster image it cannot deliver. The
         // channel is sized for the one install a session produces, so in
         // practice it never blocks; the only `Err` is a disconnected
-        // `uc2-cluster` agent, which means the node is already dead.
-        let cluster = intake
+        // `uc2-cluster` agent, and that failure is NAMED below rather than
+        // discarded — the floor is published either way (the artifacts are
+        // renamed on disk and the peer must not be left re-NAKing), so an
+        // operator whose node then never adopts it needs this line to know
+        // why.
+        //
+        // `expect`, not a silent skip: `snap_complete` is only reached once
+        // `cluster_received` is set, so the part is there by construction.
+        // Skipping quietly would be the worst outcome — the cluster-position
+        // cell would keep the PREVIOUS session's value, which the consensus
+        // agent's `cluster_installed >= want` wait would find already
+        // satisfied, and it would adopt this floor with the wrong image.
+        let p = intake
             .parts
             .iter()
-            .find(|p| p.service_id == CLUSTER_ARTIFACT_ID);
-        if let Some(p) = cluster {
-            if let Some(cell) = &self.incoming_cluster_pos {
-                cell.store(p.snapshot_pos, Ordering::Release);
-            }
-            if let Some(tx) = &self.cluster_install {
-                let _ = tx.send((p.snapshot_pos, p.final_path.clone()));
-            }
+            .find(|p| p.service_id == CLUSTER_ARTIFACT_ID)
+            .expect("a session completes only once its CLUSTER ARTIFACT is renamed (§5.6)");
+        if let Some(cell) = &self.incoming_cluster_pos {
+            cell.store(p.snapshot_pos, Ordering::Release);
+        }
+        if let Some(tx) = &self.cluster_install
+            && tx.send((p.snapshot_pos, p.final_path.clone())).is_err()
+        {
+            // `uc_net` has no logging dependency (the node layer owns the
+            // naming for this crate), so this is the same `eprintln!` shape
+            // `snap_open_failed` uses. Not latched: it can only happen once
+            // per dead agent, and the node is on its way down.
+            eprintln!(
+                "uc_net: the uc2-cluster agent is gone -- cannot install the snapshot session's \
+                 cluster artifact {} at position {}. This node will adopt the session's floor \
+                 with the cluster row (membership, schedule table, settings) it booted with",
+                p.final_path.display(),
+                p.snapshot_pos
+            );
         }
         // Signal the consensus agent to adopt the floor + mirror observability.
         if let Some(slot) = &self.incoming_snapshot_pos {

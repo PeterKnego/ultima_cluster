@@ -64,13 +64,14 @@ pub struct ClusterState {
     /// Frame-END position of the command that installed `table`; 0 = none.
     pub table_position: u64,
     pub settings: Settings,
-    /// Frame-END position this FSM has CONSUMED the log up to — the last
-    /// CLUSTER command's end, or (via [`ClusterFsm::set_consumed`]) the apply
-    /// loop's cursor when it has walked past one. Task 4's brief:
-    /// "the follower's cursor after a batch is also a frame-end; `applied` is
-    /// that cursor".
+    /// Frame-END position this FSM has CONSUMED the log up to — and
+    /// therefore the view's position tag and the artifact's position. It
+    /// advances on two things: a CLUSTER command applied here (accepted or
+    /// refused alike), and the apply loop's cursor after a batch, via
+    /// [`ClusterFsm::set_consumed`]. Task 4's brief: "the follower's cursor
+    /// after a batch is also a frame-end; `applied` is that cursor".
     ///
-    /// It has to be the cursor, not just the last command: this position tags
+    /// It has to be the cursor, not just the last command. This position tags
     /// the artifact, and the node's purge floor is bounded BY the artifact
     /// (`maybe_persist_snapshot_floor`). CLUSTER frames are operator actions —
     /// a cluster can run for days without one — while the rows' snapshot floor
@@ -78,8 +79,10 @@ pub struct ClusterState {
     /// frames would pin the purge floor at the last reconfiguration forever and
     /// leave the cluster artifact permanently below the set a joiner needs.
     ///
-    /// Frame-END position of the last CLUSTER command applied (accepted or
-    /// refused) — the view's position tag and the artifact's position.
+    /// The two are consistent because the cursor is only ever advanced over
+    /// frames actually WALKED: since Ruling R18 an overrun replays the gap from
+    /// the journal rather than skipping it, so a position recorded here is
+    /// always one whose every CLUSTER frame this FSM has seen.
     pub applied: u64,
 }
 

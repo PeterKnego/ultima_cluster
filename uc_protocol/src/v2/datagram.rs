@@ -264,13 +264,15 @@ pub fn read_config_reply_body(buf: &[u8]) -> Option<ConfigReplyBody> {
 
 /// Opens (and, echoed back, acks) one artifact of a snapshot session.
 ///
-/// **Wire 0.7.0 (FSM identity, spec §5).** A session is a *stream of
-/// artifacts* — one BEGIN per declared FSM, ascending by id, each followed by
-/// that artifact's chunks; chunk offsets are stream-global, so `SNAP_NAK`
-/// repair is byte-identical to 0.5.0/0.6.0 (spec §14.3). `session` scopes
-/// chunk/NAK traffic to one transfer; `layout` is the body discriminator
-/// (`SNAP_BEGIN_LAYOUT_V3` on 0.7.0); `service_id` names which FSM's artifact
-/// this is; `snapshot_pos` is the artifact's tag `S`; `total_len` is THAT
+/// **Wire 0.7.0 (FSM identity, spec §5; the cluster FSM, spec §5.6).** A
+/// session is a *stream of artifacts* — one BEGIN per declared FSM, ascending
+/// by id, then one for the CLUSTER ARTIFACT (`service_id = 255`, outside the
+/// declared mask, always last) — each followed by that artifact's chunks;
+/// chunk offsets are stream-global, so `SNAP_NAK` repair is byte-identical to
+/// 0.5.0/0.6.0 (spec §14.3). `session` scopes chunk/NAK traffic to one
+/// transfer; `layout` is the body discriminator
+/// ([`SNAP_BEGIN_LAYOUT_V4`] on 0.7.0 as shipped); `service_id` names which
+/// artifact this is; `snapshot_pos` is the artifact's tag `S`; `total_len` is THAT
 /// artifact's file size (the receiver pre-sizes its `.part` to it);
 /// `identity[r]` is the sender's row-`r` FSM identity hash, `0` = undeclared;
 /// `version[r]` its attached service's packed version, `0` = unknown; the
@@ -330,8 +332,8 @@ pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
 /// peer speaking an older 0.7.0 shape, refused by its `layout` at the node
 /// layer with a name, not silently by a length check here.
 ///
-/// **Total for every `layout` value, including 0,
-/// [`SNAP_BEGIN_LAYOUT_V2`] and [`SNAP_BEGIN_LAYOUT_V3`].** Deciding what an unrecognized discriminator
+/// **Total for every `layout` value** — 0, [`SNAP_BEGIN_LAYOUT_V2`],
+/// [`SNAP_BEGIN_LAYOUT_V3`] and the shipped [`SNAP_BEGIN_LAYOUT_V4`] alike. Deciding what an unrecognized discriminator
 /// means is the receiving node's job, not the decoder's: it counts a named
 /// refusal ("peer wire ≤ 0.6.0") and drops the session, which is
 /// diagnosable, where a silent `None` here would be indistinguishable from a
