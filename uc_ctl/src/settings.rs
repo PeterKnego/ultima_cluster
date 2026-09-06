@@ -71,10 +71,14 @@ pub fn parse_settings(toml_text: &str) -> Result<Settings, String> {
 
     let fsm_lag_bytes = match &file.fsm_lag {
         None => 0,
-        Some(s) => match parse_fsm_lag(s) {
+        // The staged file's own key name — this parser leads every message
+        // with whatever the caller read the value under, and the one name it
+        // must never print here is `services.fsm_lag` (a `node.toml` key
+        // that is refused outright since the cluster FSM).
+        Some(s) => match parse_fsm_lag("fsm_lag", s) {
             Ok(FsmLag::Lockstep) => FSM_LAG_LOCKSTEP,
             Ok(FsmLag::Bounded(b)) => b,
-            Err(e) => return Err(format!("fsm_lag: {e}")),
+            Err(e) => return Err(e),
         },
     };
     let snapshot_target = match file.snapshot_target.as_deref() {

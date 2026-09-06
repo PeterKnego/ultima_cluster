@@ -96,7 +96,9 @@ impl ServicesConfig {
         let lag = match fsm_lag {
             None => None,
             Some(raw) => {
-                Some(parse_fsm_lag(raw.trim()).map_err(|d| format!("--fsm-lag {raw:?}: {d}"))?)
+                // The detail already leads with the flag name and quotes the
+                // offending value, so no outer wrapper is needed.
+                Some(parse_fsm_lag("--fsm-lag", raw.trim())?)
             }
         };
         let Some(list) = names else {
@@ -294,8 +296,17 @@ pub fn service_mins_and_liveness(
 
 /// `"lockstep"`, or a byte count as `<digits>` with an optional `KiB`/`MiB`/
 /// `GiB` suffix (no spaces, no fractions, binary units only — the same
-/// vocabulary the spec uses). Errors name the field.
-pub fn parse_fsm_lag(s: &str) -> Result<FsmLag, String> {
+/// vocabulary the spec uses).
+///
+/// `field` is the name the CALLER read the value under, and every message
+/// this returns leads with it — `settings.fsm_lag` for `node.toml`'s
+/// `[settings]` block (cluster-FSM spec §6), `fsm_lag` for the file
+/// `uc2ctl settings apply` stages, `--fsm-lag` for the harness CLI. It is a
+/// parameter rather than a constant because the ONE key this parser must
+/// never name is `services.fsm_lag`: `node.toml` refuses that key outright
+/// now, pointing at `[settings]`, so naming it in a refusal would send an
+/// operator to the one place the value cannot be written.
+pub fn parse_fsm_lag(field: &str, s: &str) -> Result<FsmLag, String> {
     if s == "lockstep" {
         return Ok(FsmLag::Lockstep);
     }
@@ -310,16 +321,16 @@ pub fn parse_fsm_lag(s: &str) -> Result<FsmLag, String> {
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
-            "services.fsm_lag must be \"lockstep\" or <digits>[KiB|MiB|GiB], got {s:?}"
+            "{field} must be \"lockstep\" or <digits>[KiB|MiB|GiB], got {s:?}"
         ));
     }
     let n: u64 = digits
         .parse()
-        .map_err(|_| format!("services.fsm_lag: {digits:?} does not fit in u64"))?;
+        .map_err(|_| format!("{field}: {digits:?} does not fit in u64"))?;
     n.checked_shl(shift)
         .filter(|v| shift == 0 || *v >> shift == n)
         .map(FsmLag::Bounded)
-        .ok_or_else(|| format!("services.fsm_lag: {s:?} overflows u64"))
+        .ok_or_else(|| format!("{field}: {s:?} overflows u64"))
 }
 
 /// The door/ceiling term (spec §5.2): the byte bound, or one max-size frame
@@ -562,11 +573,12 @@ mod tests {
 
     #[test]
     fn parse_fsm_lag_table() {
-        assert_eq!(parse_fsm_lag("lockstep"), Ok(FsmLag::Lockstep));
-        assert_eq!(parse_fsm_lag("65536"), Ok(FsmLag::Bounded(65536)));
-        assert_eq!(parse_fsm_lag("64KiB"), Ok(FsmLag::Bounded(64 << 10)));
-        assert_eq!(parse_fsm_lag("16MiB"), Ok(FsmLag::Bounded(16 << 20)));
-        assert_eq!(parse_fsm_lag("1GiB"), Ok(FsmLag::Bounded(1 << 30)));
+        let f = "settings.fsm_lag";
+        assert_eq!(parse_fsm_lag(f, "lockstep"), Ok(FsmLag::Lockstep));
+        assert_eq!(parse_fsm_lag(f, "65536"), Ok(FsmLag::Bounded(65536)));
+        assert_eq!(parse_fsm_lag(f, "64KiB"), Ok(FsmLag::Bounded(64 << 10)));
+        assert_eq!(parse_fsm_lag(f, "16MiB"), Ok(FsmLag::Bounded(16 << 20)));
+        assert_eq!(parse_fsm_lag(f, "1GiB"), Ok(FsmLag::Bounded(1 << 30)));
         for bad in [
             "",
             "16 MiB",
@@ -577,8 +589,13 @@ mod tests {
             "99999999999GiB",
             "Lockstep",
         ] {
-            let e = parse_fsm_lag(bad).unwrap_err();
-            assert!(e.contains("services.fsm_lag"), "{bad:?}: {e}");
+            // Every message leads with the CALLER's field name, and never
+            // with `services.fsm_lag` (the key node.toml refuses outright).
+            for field in [f, "fsm_lag", "--fsm-lag"] {
+                let e = parse_fsm_lag(field, bad).unwrap_err();
+                assert!(e.starts_with(field), "{bad:?}: {e}");
+                assert!(!e.contains("services.fsm_lag"), "{bad:?}: {e}");
+            }
         }
     }
 

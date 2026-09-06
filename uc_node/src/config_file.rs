@@ -750,12 +750,12 @@ pub fn parse_str_with_env(
             let fsm_lag_bytes = match s.fsm_lag.as_deref() {
                 None => 0,
                 Some(raw) => {
-                    match crate::services::parse_fsm_lag(raw).map_err(|detail| {
-                        ConfigError::Invalid {
+                    match crate::services::parse_fsm_lag("settings.fsm_lag", raw).map_err(
+                        |detail| ConfigError::Invalid {
                             field: "settings.fsm_lag",
                             detail,
-                        }
-                    })? {
+                        },
+                    )? {
                         FsmLag::Lockstep => FSM_LAG_LOCKSTEP,
                         FsmLag::Bounded(b) => b,
                     }
@@ -1612,6 +1612,26 @@ level = "info"
             load_str(MINIMAL).unwrap().0.settings_genesis,
             Settings::genesis_default()
         );
+    }
+
+    /// A bad `[settings] fsm_lag` must be refused naming THAT key — the
+    /// parser is shared with `--fsm-lag` and `uc2ctl settings apply`, and
+    /// until the field name was threaded through it, every one of them said
+    /// `services.fsm_lag`: a key `node.toml` now refuses outright, pointing
+    /// an operator at the one place the value cannot be written.
+    #[test]
+    fn a_bad_settings_fsm_lag_is_refused_naming_settings_not_services() {
+        for bad in ["16MB", "", "lock step", "1.5MiB", "-1"] {
+            let toml = format!("{MINIMAL}\n[settings]\nfsm_lag = \"{bad}\"\n");
+            match load_str(&toml).unwrap_err() {
+                ConfigError::Invalid { field, detail } => {
+                    assert_eq!(field, "settings.fsm_lag", "{bad:?}");
+                    assert!(detail.contains("settings.fsm_lag"), "{bad:?}: {detail}");
+                    assert!(!detail.contains("services.fsm_lag"), "{bad:?}: {detail}");
+                }
+                other => panic!("{bad:?}: {other}"),
+            }
+        }
     }
 
     /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved
