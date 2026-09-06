@@ -553,16 +553,27 @@ pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()> {
 /// `identity_hash` resolved back to a name through the cnc page's declared
 /// rows.
 ///
-/// Cluster-FSM plan 1 task 5→8 window: the artifact lags the live view (it is
-/// written by the `uc2-cluster` agent's bridging trigger, once every declared
-/// row has snapshotted), so a table applied on a cluster whose rows have not
-/// snapshotted yet reads as "no schedule table adopted" here. Task 8 gives
-/// this command the live reading.
+/// The artifact lags the live view (it is written by the `uc2-cluster`
+/// agent's bridging trigger, once every declared row has snapshotted), so a
+/// table applied on a cluster whose rows have not snapshotted yet reads as
+/// "no cluster artifact yet" here. Task 8 (spec §13 phase 2 is what would
+/// close this) does NOT give this command a live, in-process reading — there
+/// is no way to read another process's in-memory view, so this stays the
+/// honest offline one, and the message says so instead of implying an empty
+/// table was adopted.
 pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
     let (position, table) = uc_node::cluster_agent::read_committed_table(&common.instance_dir)
         .map_err(|e| anyhow::anyhow!("reading the cluster artifact: {e}"))?;
     if position == 0 && table.entries.is_empty() {
-        println!("no schedule table adopted");
+        // Task 8's deferred finding from task 5: this reads `(0, [])` both
+        // when nothing has ever been applied AND right after a successful
+        // `schedule apply` on a fresh cluster (no cluster artifact exists
+        // yet — one appears only once every declared row has snapshotted).
+        // Say so honestly rather than implying an empty table was adopted.
+        println!(
+            "no cluster artifact yet (the table is committed on the log; an artifact appears \
+             once every declared row has snapshotted)"
+        );
         return Ok(());
     }
 

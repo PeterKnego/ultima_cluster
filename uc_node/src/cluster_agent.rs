@@ -45,8 +45,10 @@ pub fn snapshot_dir_of(instance_dir: &Path) -> PathBuf {
 /// is written by the `uc2-cluster` agent's bridging trigger, which fires once
 /// every declared row has snapshotted, so on a node whose rows have not
 /// snapshotted yet this answers `(0, [])` even though the live view holds a
-/// table. Plan 1 task 8 gives `uc2ctl` the live reading; until then this is
-/// the honest offline one.
+/// table. Plan 1 task 8 does NOT give `uc2ctl` a live, in-process reading
+/// (spec §13 phase 2 is what would) — this stays the honest offline one, and
+/// `schedule show`/`status` print `(0, [])`/`0` as "no cluster artifact yet"
+/// rather than implying an empty table was adopted.
 pub fn read_committed_table(instance_dir: &Path) -> io::Result<(u64, ScheduleTable)> {
     let genesis = ClusterState {
         membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
@@ -62,6 +64,41 @@ pub fn read_committed_table(instance_dir: &Path) -> io::Result<(u64, ScheduleTab
     let (fsm, _) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
     let st = fsm.state();
     Ok((st.table_position, st.table.clone()))
+}
+
+/// `uc2ctl settings show`'s reader (plan 1 task 8): the settings this
+/// instance directory's newest CLUSTER ARTIFACT holds, as `Some((position,
+/// settings))` — `position` is [`ClusterState::applied`], "the view's
+/// position tag and the artifact's position" (there is no separate
+/// per-settings position field the way `table_position` tracks the schedule
+/// table specifically). `None` when there is no artifact yet — the SAME
+/// staleness caveat as [`read_committed_table`] applies: this reads the
+/// artifact, not the live view, so it lags a freshly-applied settings record
+/// until every declared row has snapshotted.
+pub fn read_committed_settings(
+    instance_dir: &Path,
+) -> io::Result<Option<(u64, uc_protocol::v2::settings::Settings)>> {
+    let genesis = ClusterState {
+        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
+        table: ScheduleTable {
+            entries: Vec::new(),
+        },
+        table_position: 0,
+        settings: uc_protocol::v2::settings::Settings::genesis_default(),
+        applied: 0,
+    };
+    // No declared hashes: this reader never APPLIES a command, and
+    // `install_snapshot` does not consult them.
+    let (fsm, start) = recover(&snapshot_dir_of(instance_dir), genesis, Vec::new())?;
+    if start == 0 {
+        // No artifact under `dir` (`recover` returns position 0 for
+        // genesis) — a real committed CLUSTER frame never lands at position
+        // 0, so this is an unambiguous "nothing yet" rather than a
+        // legitimate reading colliding with the sentinel.
+        return Ok(None);
+    }
+    let st = fsm.state();
+    Ok(Some((st.applied, st.settings)))
 }
 
 /// Recovery (spec §4.7): the newest `snap-*.ultcluster` under `dir`, or
