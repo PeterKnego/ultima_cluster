@@ -64,6 +64,20 @@ pub struct ClusterState {
     /// Frame-END position of the command that installed `table`; 0 = none.
     pub table_position: u64,
     pub settings: Settings,
+    /// Frame-END position this FSM has CONSUMED the log up to — the last
+    /// CLUSTER command's end, or (via [`ClusterFsm::set_consumed`]) the apply
+    /// loop's cursor when it has walked past one. Task 4's brief:
+    /// "the follower's cursor after a batch is also a frame-end; `applied` is
+    /// that cursor".
+    ///
+    /// It has to be the cursor, not just the last command: this position tags
+    /// the artifact, and the node's purge floor is bounded BY the artifact
+    /// (`maybe_persist_snapshot_floor`). CLUSTER frames are operator actions —
+    /// a cluster can run for days without one — while the rows' snapshot floor
+    /// climbs with ordinary traffic, so an `applied` that only moved on CLUSTER
+    /// frames would pin the purge floor at the last reconfiguration forever and
+    /// leave the cluster artifact permanently below the set a joiner needs.
+    ///
     /// Frame-END position of the last CLUSTER command applied (accepted or
     /// refused) — the view's position tag and the artifact's position.
     pub applied: u64,
@@ -111,6 +125,17 @@ impl ClusterFsm {
             declared_hashes,
         }
     }
+    /// Advance the consumed position to `position` — the apply loop's cursor
+    /// after a batch, which is a frame-END like every command's. Monotone: a
+    /// lower value is ignored, so this can never walk the artifact's tag (or
+    /// the view's position tag) backwards. Changes no cluster STATE, which is
+    /// why the agent does not publish the view for it.
+    pub fn set_consumed(&mut self, position: u64) {
+        if position > self.state.applied {
+            self.state.applied = position;
+        }
+    }
+
     pub fn state(&self) -> &ClusterState {
         &self.state
     }

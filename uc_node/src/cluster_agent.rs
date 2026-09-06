@@ -9,8 +9,8 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 
 use uc_journal::Journal;
 use uc_log::archive::replay_journal_from;
@@ -177,6 +177,18 @@ pub struct ClusterAgent {
     /// it) always has its missing frames retained here — `do_work`'s Overrun
     /// arm replays from it instead of fail-stopping the node.
     journal: Arc<Journal>,
+    /// Spec §5.6: the snapshot session's cluster-artifact route. The
+    /// `uc_net` receiver agent sends `(position, path)` here the moment a
+    /// session completes, BEFORE it publishes the session's floor — the
+    /// cluster FSM lives on THIS thread, so an install has to travel rather
+    /// than happen at the receiver.
+    install: mpsc::Receiver<(u64, PathBuf)>,
+    /// Spec §5.6: the ack for the above — the position of the newest cluster
+    /// artifact this agent has installed (`Release`). The consensus agent's
+    /// install handler waits for this to reach the session's cluster position
+    /// before it adopts the floor, so a joiner never serves or leads off a
+    /// floor whose cluster row it has not installed.
+    installed: Arc<AtomicU64>,
 }
 
 impl ClusterAgent {
@@ -188,6 +200,11 @@ impl ClusterAgent {
     /// counter, shared with `uc_net::receiver`. `journal` (Ruling R12) is
     /// the archive's own journal handle (`Archive::journal_arc`), the
     /// fallback source for a live overrun with no explaining prime.
+    /// `install` (spec §5.6) is the receive end of the snapshot session's
+    /// cluster-artifact route — the receiver agent hands `(position, path)`
+    /// over it on a completed session and `do_work` drains it FIRST, before
+    /// anything else it does that pass; `installed` is the ack the consensus
+    /// agent's install handler waits on before it adopts the floor.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<LogBuffer>,
@@ -199,6 +216,8 @@ impl ClusterAgent {
         cluster_snapshot_pos: Arc<AtomicU64>,
         prime_generation: Arc<AtomicU64>,
         journal: Arc<Journal>,
+        install: mpsc::Receiver<(u64, PathBuf)>,
+        installed: Arc<AtomicU64>,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
@@ -219,6 +238,8 @@ impl ClusterAgent {
             prime_generation,
             last_prime_gen,
             journal,
+            install,
+            installed,
         }
     }
 
@@ -244,6 +265,29 @@ impl ClusterAgent {
     /// `min(commit, durable)`; publish the view if anything applied; run the
     /// bridging trigger. Returns whether it did work.
     pub fn do_work(&mut self) -> bool {
+        // Spec §5.6: the snapshot session's cluster artifact, FIRST. A
+        // below-floor joiner's log has nothing this agent can apply — the
+        // CLUSTER frames that built the image are below the leader's purge
+        // floor — so the install must land before the walk below reads
+        // counters that `AdoptFloor` is about to move. Drained in a loop (a
+        // burst is possible in principle; each install is idempotent by
+        // position) and FAIL-STOP on error: a cluster image that does not
+        // parse would leave this node serving off whatever cluster row it had
+        // before the join, which is the divergence this path exists to
+        // prevent — the same posture the retired config-carry install had.
+        let mut installed_any = false;
+        while let Ok((position, path)) = self.install.try_recv() {
+            if let Err(e) = self.install_from(position, &path) {
+                panic!(
+                    "uc2-cluster: cannot install the snapshot session's cluster artifact {} at \
+                     position {position}: {e} (the session completed, so this node's cluster row \
+                     -- membership, schedule table, settings -- would otherwise stay whatever it \
+                     was before the join)",
+                    path.display()
+                );
+            }
+            installed_any = true;
+        }
         let c = self.cnc.counters();
         let head = c.commit.load_acquire().min(c.durable.load_acquire());
         let mut applied_any = false;
@@ -272,20 +316,20 @@ impl ClusterAgent {
                     let primed = gen0 != self.last_prime_gen || gen1 != self.last_prime_gen;
                     if primed {
                         self.last_prime_gen = gen1;
-                        // Below the buffer: a below-floor joiner (a fresh
-                        // learner, a wipe-and-rejoin) has its counters primed
-                        // straight to the installed snapshot's position by
-                        // `AdoptFloor`, well past this follower's cursor —
-                        // the same shape as the service apply loop's
-                        // below-floor case, but plan 1 has not yet given the
-                        // snapshot session a cluster artifact to install
-                        // from (task 9 does: `ClusterAgent::install_from`
-                        // resets the cursor to the installed position).
-                        // Until then, resync forward rather than
-                        // fail-stopping the whole node over a component
-                        // nothing reads yet — any CLUSTER frames in the
-                        // skipped span are missed on THIS node until task 9
-                        // lands.
+                        // A prime explains it. The below-floor JOIN case no
+                        // longer reaches here: `install_from` has already
+                        // reset this cursor to the installed artifact's
+                        // position (at or above the floor `AdoptFloor` primes
+                        // to), and it runs at the TOP of this same `do_work`,
+                        // before the walk — the receiver hands the artifact
+                        // over before it publishes the floor the consensus
+                        // agent adopts. What is left here is the other two
+                        // primes: a truncation and a leader-open collapse,
+                        // both BACKWARD, where resyncing the cursor to `head`
+                        // is exactly right (there is nothing above it to
+                        // read). Kept, rather than a fail-stop, for the same
+                        // reason it was written: this agent has no admission
+                        // door, so a prime racing its walk is ordinary.
                         crate::obs_event!(
                             Warn,
                             "cluster_agent_resynced_over_overrun",
@@ -340,11 +384,86 @@ impl ClusterAgent {
                 }
             }
         }
+        // Task 4's brief: "the follower's cursor after a batch is also a
+        // frame-end; `applied` is that cursor." The FSM's position is what it
+        // has CONSUMED, not just the last CLUSTER frame it acted on — a frame
+        // it yielded is accounted for exactly as the user apply loop accounts
+        // for one it skipped. Without this the artifact's tag can only ever be
+        // the last operator action's position, and since the node's purge
+        // floor is bounded by that tag (`maybe_persist_snapshot_floor`), a
+        // cluster with no reconfiguration for a day would purge nothing and
+        // ship no set a joiner's floor could sit above — the bridging trigger
+        // below would never fire, because the rows' floor climbs with ordinary
+        // traffic and this position would not.
+        //
+        // Deliberately NOT a view publish: nothing about the cluster's STATE
+        // changed, and `refresh_from_view`'s per-pass mutex is taken exactly
+        // when the position it sees moves (a hot path — M14a's lesson). The
+        // view's tag catches up on the next pass that really applies something.
+        self.fsm.set_consumed(self.follower.cursor);
         if applied_any {
             self.view.publish(self.fsm.state());
         }
         self.bridging_trigger();
-        applied_any
+        applied_any || installed_any
+    }
+
+    /// Spec §5.6: install the cluster artifact a snapshot session carried, by
+    /// FIAT — this node is below the leader's purge floor, so the CLUSTER
+    /// frames that built the image are unreadable here and there is nothing
+    /// local to reconcile against.
+    ///
+    /// Publishes the view, seeds both snapshot-position words, and RESETS the
+    /// follower cursor to the installed position: the log below it is purged
+    /// on this node and `AdoptFloor` is about to prime the counters straight
+    /// to the session's floor, so a cursor left where it was would read bytes
+    /// that no longer exist (the `Overrun` the R13 interim could only resync
+    /// blind over).
+    ///
+    /// An artifact that is empty, truncated or fails its CRC is an
+    /// `io::Error` and the caller fail-stops. `ClusterFsm::install_snapshot`
+    /// bounds-checks every read, so a corrupt image is refused by name rather
+    /// than panicking inside the decoder.
+    ///
+    /// IDEMPOTENT, and it has to be: a joiner can complete more than one
+    /// session for the same floor (a leader whose `SNAP_DONE` was lost opens a
+    /// fresh session on the next below-floor NAK), and a node that is NOT
+    /// below the floor can be shipped a set it does not need. Installing an
+    /// image this FSM has already consumed past would rewind the cursor over
+    /// CLUSTER frames it has since applied and replay them — so an artifact at
+    /// or below the consumed position is acknowledged and ignored.
+    pub fn install_from(&mut self, position: u64, path: &Path) -> io::Result<()> {
+        if position <= self.fsm.state().applied {
+            self.installed.fetch_max(position, Ordering::Release);
+            return Ok(());
+        }
+        let mut f = File::open(path)?;
+        let got = self
+            .fsm
+            .install_snapshot(position, &mut f)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.view.publish(self.fsm.state());
+        self.snapshot_pos = got;
+        self.cluster_snapshot_pos.store(got, Ordering::Release);
+        // The artifact IS every CLUSTER frame up to `got`, so the next frame
+        // to read is the one starting there.
+        self.follower.cursor = got;
+        // `AdoptFloor`'s prime bumps the generation: adopt the CURRENT one as
+        // already explained, so the forward re-prime that follows is not read
+        // as a live overrun.
+        self.last_prime_gen = self.prime_generation.load(Ordering::Acquire);
+        crate::obs_event!(
+            Info,
+            "cluster_artifact_installed",
+            position = got,
+            path = path.display().to_string().as_str()
+        );
+        // The ack — LAST, and `Release`, so a handler that sees it also sees
+        // the view and both position words above. `fetch_max`, not `store`:
+        // the ack is a high-water mark the consensus agent compares against,
+        // and must never go backwards.
+        self.installed.fetch_max(got, Ordering::Release);
+        Ok(())
     }
 
     /// Ruling R12: a live overrun with no explaining prime degrades to
@@ -366,10 +485,11 @@ impl ClusterAgent {
                 // Below the journal's own retained floor (purged) — R12
                 // doesn't cover this edge (it assumes the journal always
                 // has what the live buffer no longer does, which holds
-                // absent purge). Task 9's artifact-carrying snapshot
-                // install is the real fix for a below-floor node; until
-                // then there is nothing left to replay, so resync forward
-                // (the same interim posture as a prime) rather than wedge
+                // absent purge). The snapshot session's cluster artifact
+                // (spec §5.6) is what covers a below-floor node now, and it
+                // resets this cursor itself; a node that still lands here
+                // has purged frames it never received a set for, so there is
+                // nothing left to replay — resync forward rather than wedge
                 // the node forever on an unreadable gap.
                 crate::obs_event!(
                     Warn,
@@ -535,6 +655,14 @@ mod tests {
             .expect("tempdir")
     }
 
+    /// The cluster-artifact install route for a test that never installs one
+    /// (spec §5.6): the sending half is dropped immediately, so the drain at
+    /// the top of `do_work` sees `Disconnected` and does nothing.
+    fn no_install_route() -> mpsc::Receiver<(u64, PathBuf)> {
+        let (_tx, rx) = mpsc::sync_channel(1);
+        rx
+    }
+
     fn addr(i: u32) -> Addr {
         (u32::from_be_bytes([127, 0, 0, i as u8]), 9100 + i as u16)
     }
@@ -607,6 +735,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e3);
         cnc.counters().commit.store_release(e1); // only the first command is committed
@@ -640,6 +770,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -677,6 +809,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -722,6 +856,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&prime_gen),
             empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
         );
         // The archive bumps the generation right after `LogCounters::prime` —
         // do the same here, THEN stage the overrun, matching how `AdoptFloor`
@@ -779,6 +915,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)), // prime_generation: never bumped
             journal,
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
         );
 
         // Stage a LIVE overrun exactly like `stage_overrun` does — the ring
