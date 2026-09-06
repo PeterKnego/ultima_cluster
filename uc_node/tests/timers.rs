@@ -14,7 +14,11 @@
 //!    word on the cnc page reflects the still-armed instance.
 //! 2. Three nodes: a timer in flight at a leader change is delivered exactly
 //!    once, at the same log position on every surviving replica, either on
-//!    time or late — never twice, never at diverging positions.
+//!    time or late — never twice, never at diverging positions. Its companion
+//!    (cluster-FSM spec §4.9) pins the LEADER-ONLY heap: the followers' per-row
+//!    `timers_pending` word reads 0 while the leader's reads 2, and after the
+//!    failover the new leader's ANNOUNCE rebuilds the whole set and fires it
+//!    exactly once, identically, on every survivor.
 //! 3. One node, final-review I2: MORE than `TIMERS_PER_PASS` (64) timers due
 //!    at one instant, under continuous pipelined client load — the pass bound
 //!    is hit, so the pass appends NO client frame and the 100 TIMER frames
@@ -30,6 +34,7 @@
 //!
 //! Every instance dir is on the ext4 cargo target volume, never /tmp.
 
+use std::collections::BTreeSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -709,6 +714,161 @@ fn a_timer_in_flight_at_a_leader_change_fires_late_and_is_delivered_once() {
     }
 
     for &i in &survivors {
+        svcs[i].take().unwrap().stop();
+    }
+    for h in &mut c.nodes {
+        if let Some(n) = h.node.take() {
+            n.stop();
+        }
+    }
+}
+
+/// Cluster-FSM spec §4.9, the leader-only heap: the timer heap lives on the
+/// LEADER and nowhere else, so a leader change moves the whole pending set to
+/// a node that has never held it. The new leader rebuilds it from the
+/// service's edge announce on its first pass and fires every instance —
+/// exactly once, at one position the whole cluster agrees on.
+///
+/// Two halves, both load-bearing:
+///
+/// 1. **Followers hold no heap.** Their per-row `timers_pending` word reads 0
+///    while the leader's reads 2. This is a LIVE reading, not the page's
+///    initial zero: the consensus agent republishes every declared row's
+///    pending count on EVERY pass (`publish_timers_pending`), so a settle of
+///    many passes says what the heap holds, not what the page was born with.
+///    Invert it — assert `2` on a follower — and this fails, which is the
+///    cheap red twin for this half.
+/// 2. **Exactly once, cluster-wide.** After the failover every SURVIVING
+///    service's fired record is identical: the same two ids, at the same
+///    positions, with the same deadlines and stamps. A re-announce that
+///    double-appended, or one that armed on only one replica, breaks it.
+///
+/// The deadlines are ~4 s out on purpose. The announce is observed through
+/// the pending word, and an instance that fired before the observation would
+/// make the word drop to 1 and then 0 — a race the test would lose on a
+/// loaded box. Four seconds is many times a debug-build election plus a
+/// leader-open collapse; the fires themselves are then waited for.
+#[test]
+fn timers_pending_on_the_old_leader_fire_exactly_once_on_the_new_one_after_its_announce() {
+    let _g = serialize();
+    let mut c = spawn_cluster(3);
+    let all: Vec<usize> = (0..3).collect();
+    let mut svcs: Vec<Option<Service<Timed<ClockSm>>>> = c
+        .nodes
+        .iter()
+        .map(|h| {
+            Some(start_service_with(
+                &h.instance_dir,
+                Timed::new(ClockSm::default()),
+            ))
+        })
+        .collect();
+    let cncs: Vec<_> = c.nodes.iter().map(|h| open_cnc(&h.instance_dir)).collect();
+    let pending = |i: usize| cncs[i].service_slot(0).identity.timers_pending();
+    let leader = await_leader_among(&c.nodes, &all, 30);
+
+    // Two instances, both long-dated, armed on the leader.
+    let client = Client::connect(&c.nodes[leader].instance_dir, APP).unwrap();
+    let t1: u64 = client
+        .submit(&Cmd::At {
+            id: 1,
+            in_ms: 4_000,
+        })
+        .unwrap();
+    let t2: u64 = client
+        .submit(&Cmd::At {
+            id: 2,
+            in_ms: 4_500,
+        })
+        .unwrap();
+    client.shutdown();
+    let want_deadlines = [t1 + 4_000_000_000, t2 + 4_500_000_000];
+
+    wait_until("both instances pending on the leader", || {
+        pending(leader) == 2
+    });
+
+    // §4.9: the followers hold NO heap. Ordered after the leader's word
+    // reached 2 (so many passes have run on every node), and sampled across a
+    // settle window so this is the live republished value.
+    let followers: Vec<usize> = all.iter().copied().filter(|&i| i != leader).collect();
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        for &i in &followers {
+            assert_eq!(
+                pending(i),
+                0,
+                "node {i} is a FOLLOWER and must hold no timer heap (spec §4.9)"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // ---- the leadership moves, with both instances still in flight.
+    svcs[leader].take().unwrap().crash();
+    c.nodes[leader].node.take().unwrap().crash();
+    let new_leader = await_leader_among(&c.nodes, &followers, 30);
+    let bystander = followers
+        .iter()
+        .copied()
+        .find(|&i| i != new_leader)
+        .expect("three nodes, one dead, one new leader");
+
+    // ---- the announce: the new leader's heap holds the set it never had.
+    wait_until("the new leader announced the pending set", || {
+        pending(new_leader) == 2
+    });
+    assert_eq!(
+        pending(bystander),
+        0,
+        "node {bystander} is still a follower and must hold no heap"
+    );
+
+    // ---- and both fire, on every survivor.
+    for &i in &followers {
+        let svc = svcs[i].as_ref().unwrap();
+        wait_until(&format!("node {i} saw both timers"), || {
+            let f = query(svc).0;
+            f.iter().any(|x| x.id == 1) && f.iter().any(|x| x.id == 2)
+        });
+    }
+    // Give a duplicate a chance to land before reading the final answer: a
+    // re-announce that re-appended an already-delivered instance would show
+    // up here, and `Timed` is what must drop it.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut records: Vec<(usize, Vec<Fired>)> = Vec::new();
+    for &i in &followers {
+        let fired = query(svcs[i].as_ref().unwrap()).0;
+        let mut mine: Vec<Fired> = fired
+            .iter()
+            .filter(|f| f.id == 1 || f.id == 2)
+            .cloned()
+            .collect();
+        mine.sort_by_key(|f| f.id);
+        assert_eq!(
+            mine.iter().map(|f| f.id).collect::<BTreeSet<u64>>(),
+            BTreeSet::from([1, 2]),
+            "node {i}: both ids present: {fired:?}"
+        );
+        assert_eq!(mine.len(), 2, "node {i}: exactly once: {fired:?}");
+        for (f, want) in mine.iter().zip(want_deadlines.iter()) {
+            assert_eq!(f.deadline_ns, *want, "node {i}: {f:?}");
+            assert!(!f.table, "node {i}: these came from ctx.schedule: {f:?}");
+        }
+        records.push((i, mine));
+    }
+    // Exactly once CLUSTER-WIDE: the surviving replicas agree record for
+    // record — same positions, same deadlines, same stamps, same lateness.
+    let (first, want) = (records[0].0, records[0].1.clone());
+    for (i, got) in &records[1..] {
+        assert_eq!(
+            *got, want,
+            "node {i} and node {first} disagree on the fired record"
+        );
+    }
+
+    for &i in &followers {
         svcs[i].take().unwrap().stop();
     }
     for h in &mut c.nodes {

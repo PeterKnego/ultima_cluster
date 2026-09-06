@@ -20,10 +20,20 @@ fn scratch() -> tempfile::TempDir {
         .expect("tempdir")
 }
 
-/// Write a single-voter `node.toml` with `{extra}` prepended (document root,
-/// same convention as `lifecycle.rs::daemon_config`) — the caller supplies
-/// whatever `[crypto]`/`[admin]` text (or none at all) the test needs.
+/// Write a single-voter `node.toml` with `{extra}` appended after
+/// `[[members]]` (so a `[table]` header in it captures nothing it shouldn't)
+/// — the caller supplies whatever `[crypto]`/`[admin]` text (or none at all)
+/// the test needs.
 fn write_config(dir: &Path, port: u16, extra: &str) -> (PathBuf, PathBuf) {
+    write_config_rooted(dir, port, "", extra)
+}
+
+/// [`write_config`] with a second block spliced in at the DOCUMENT ROOT,
+/// above `[[members]]`. A bare key placed in `extra` would be read as a field
+/// of the `[[members]]` table and refused as an unknown field (the loader is
+/// `deny_unknown_fields`), which is not the refusal a top-level-key test means
+/// to observe.
+fn write_config_rooted(dir: &Path, port: u16, root: &str, extra: &str) -> (PathBuf, PathBuf) {
     let inst = dir.join("n1");
     std::fs::create_dir_all(&inst).unwrap();
     let cfg = dir.join("node.toml");
@@ -34,6 +44,7 @@ fn write_config(dir: &Path, port: u16, extra: &str) -> (PathBuf, PathBuf) {
 bind = "127.0.0.1:{port}"
 instance_dir = "{}"
 app_id = "daemon-refusals"
+{root}
 
 [[members]]
 id = 1
@@ -47,6 +58,11 @@ addr = "127.0.0.1:{port}"
     .unwrap();
     (cfg, inst)
 }
+
+/// The `[crypto]`/`[admin]`/`[services]` block every config below needs to get
+/// PAST the M12b explicit-choice refusals and reach the cluster-FSM ones.
+const VALID_TAIL: &str =
+    "[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\n[services]\nnames = [\"kv\"]\n";
 
 fn run(cfg: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_uc2-node"))
@@ -141,6 +157,163 @@ fn daemon_refuses_an_hmac_admin_key_file_that_is_world_readable() {
         out.status.code(),
         Some(2),
         "a bad admin key file must exit 2, got {:?}",
+        out.status
+    );
+}
+
+// ---- the cluster FSM (spec §3.3, §6): two keys moved cluster-wide --------
+
+/// `admission_bytes` at the document root and `fsm_lag` under `[services]`
+/// were per-host `node.toml` keys until the cluster FSM made both REPLICATED
+/// settings. They are not silently ignored and not silently honoured: the
+/// DAEMON refuses by name, exit 2, and the message points at where the value
+/// lives now (`[settings]` to seed genesis, `uc2ctl settings apply` to change
+/// a running cluster).
+///
+/// The daemon, not just the loader: `config_file`'s own unit tests already
+/// cover `load_str`, but an operator meets this through the binary, and exit 2
+/// is a contract with the shipped systemd unit
+/// (`RestartPreventExitStatus`) — a refusal that exited 1 would be a restart
+/// loop instead of a loud stop.
+#[test]
+fn daemon_refuses_a_top_level_admission_bytes_pointing_at_settings_apply() {
+    let dir = scratch();
+    let (cfg, _inst) = write_config_rooted(dir.path(), 19804, "admission_bytes = 4096", VALID_TAIL);
+
+    let out = run(&cfg);
+    assert!(!out.status.success(), "must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("admission_bytes"),
+        "refusal must name the field, got: {err}"
+    );
+    assert!(
+        err.contains("uc2ctl settings apply"),
+        "refusal must point at the replacement, got: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a config refusal must exit 2, got {:?}",
+        out.status
+    );
+}
+
+/// The twin, under `[services]`.
+#[test]
+fn daemon_refuses_a_services_fsm_lag_pointing_at_settings_apply() {
+    let dir = scratch();
+    let extra = "[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\n[services]\n\
+                 names = [\"kv\"]\nfsm_lag = \"1MiB\"\n";
+    let (cfg, _inst) = write_config(dir.path(), 19805, extra);
+
+    let out = run(&cfg);
+    assert!(!out.status.success(), "must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("services.fsm_lag"),
+        "refusal must name the field, got: {err}"
+    );
+    assert!(
+        err.contains("uc2ctl settings apply"),
+        "refusal must point at the replacement, got: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a config refusal must exit 2, got {:?}",
+        out.status
+    );
+}
+
+/// The other half of the same rule, and the half that makes the two refusals
+/// above actionable rather than a dead end: the SAME two keys under
+/// `[settings]` are accepted, and the daemon starts.
+///
+/// "Starts" is observed as a bounded poll, never a bare sleep: the daemon
+/// creates its cnc page only after the config has loaded and preflight has
+/// passed, so `cnc2.dat` appearing under the instance dir while the child is
+/// still alive IS the start. Then SIGTERM and assert a clean exit, so a node
+/// that started and immediately died cannot pass.
+#[test]
+fn daemon_starts_with_the_same_two_keys_under_settings() {
+    use std::time::{Duration, Instant};
+
+    let dir = scratch();
+    let extra = "[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\n[services]\n\
+                 names = [\"kv\"]\n\n[settings]\nadmission_bytes = 4096\nfsm_lag = \"1MiB\"\n";
+    let (cfg, inst) = write_config(dir.path(), 19806, extra);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let page = inst.join("cnc2.dat");
+    loop {
+        if page.exists() {
+            break;
+        }
+        match child.try_wait().unwrap() {
+            Some(status) => panic!(
+                "the daemon exited before creating its cnc page: {status:?} — \
+                 `[settings]` must be an ACCEPTED home for these keys"
+            ),
+            None => assert!(
+                Instant::now() < deadline,
+                "timeout waiting for the daemon to create its cnc page"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the node started, so SIGTERM must exit 0, got {:?}; stderr: {err}",
+        out.status
+    );
+    // The page could in principle be a leftover; the daemon's own records
+    // cannot be. It announced its listener and it drained on the signal.
+    assert!(
+        err.contains("\"event\":\"node_listening\""),
+        "the daemon must have reached its listening record, got: {err}"
+    );
+    assert!(
+        err.contains("\"event\":\"stopped\""),
+        "…and stopped cleanly, got: {err}"
+    );
+}
+
+/// Cluster-FSM spec §4.1: `uc_` is reserved for the internal state machines,
+/// so a `node.toml` that claims `uc_cluster` as a user row is a named startup
+/// refusal from the daemon. The message itself is `ServicesConfig`'s
+/// (`services.rs`'s `a_uc_prefixed_fsm_name_is_reserved_and_refused_by_name`
+/// pins its wording at that door); this pins that an operator meets it
+/// through the binary, with the same exit 2 as every other config refusal.
+#[test]
+fn daemon_refuses_a_uc_prefixed_service_name() {
+    let dir = scratch();
+    let extra = "[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\n[services]\nnames = [\"uc_cluster\"]\n";
+    let (cfg, _inst) = write_config(dir.path(), 19807, extra);
+
+    let out = run(&cfg);
+    assert!(!out.status.success(), "must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("services.names"),
+        "refusal must name the field, got: {err}"
+    );
+    assert!(err.contains("reserved"), "refusal must say why, got: {err}");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a config refusal must exit 2, got {:?}",
         out.status
     );
 }

@@ -1726,6 +1726,10 @@ fn apply_schedule_table(dir: &Path, cnc: &CncPage, table: &ScheduleTable) -> u64
 struct JoinFixture {
     _dir: tempfile::TempDir,
     voter: Node,
+    /// The second voter, present only for [`JoinOpts::restart_shipper`] — it
+    /// is what holds the restarted leader's commit counter down (see the
+    /// fixture's own comment).
+    peer_voter: Option<Node>,
     learner: Node,
     /// The VOTER's instance dir. Unused since plan 1 task 5 re-pointed the
     /// schedule assertions at `Node::cluster_view` — kept because it is the
@@ -1733,13 +1737,59 @@ struct JoinFixture {
     #[allow(dead_code)]
     v_dir: PathBuf,
     l_dir: PathBuf,
+    /// The frame-end position the voter's `schedule apply` reported, or `0`
+    /// when the fixture staged no table.
+    table_position: u64,
 }
 
 impl JoinFixture {
     fn stop(self) {
         self.learner.stop();
         self.voter.stop();
+        if let Some(p) = self.peer_voter {
+            p.stop();
+        }
     }
+}
+
+/// How a [`below_floor_join_with`] fixture is staged.
+#[derive(Default)]
+struct JoinOpts<'a> {
+    /// The schedule table the voter adopts BEFORE it purges.
+    table: Option<&'a ScheduleTable>,
+    /// Frames appended before the table is applied. `0` for the plain
+    /// fixtures; the restart case needs the table's frame-end position to
+    /// land above the post-restart report ceiling — see `restart_shipper`.
+    pre_frames: u64,
+    /// Stop and restart the voter between the purge and the joiner's first
+    /// NAK, and let NOTHING advance its commit counter afterwards.
+    restart_shipper: bool,
+}
+
+/// `voter.submit`, `n` times, spinning on a full ring — the raw byte path the
+/// fixture drives instead of a real client (there is no service attached).
+fn submit_frames(node: &Node, n: u64) {
+    for i in 0u64..n {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match node.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+}
+
+/// The two plain callers' form: no pre-traffic, no restart.
+fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
+    below_floor_join_with(
+        app,
+        JoinOpts {
+            table,
+            ..Default::default()
+        },
+    )
 }
 
 /// The `fresh_learner_joins_a_purged_leader_via_snapshot_session` fixture,
@@ -1750,7 +1800,7 @@ impl JoinFixture {
 /// The table frame therefore lands below the floor the learner adopts: the
 /// learner can never replay it, so a table it holds afterwards came off the
 /// session's CLUSTER ARTIFACT (spec §5.6) and nowhere else.
-fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
+fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
     let dir = tempfile::Builder::new()
         .prefix("uc2-learner-sched-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -1761,8 +1811,29 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let v_addr = v_sock.local_addr().unwrap();
     let l_addr = l_sock.local_addr().unwrap();
-    let members = vec![(0u32, v_addr)];
-    let learners = vec![(1u32, l_addr)];
+
+    // The restart case needs a SECOND voter, and it is not decoration: a
+    // leader's own durable position enters its commit ranking UN-ceilinged
+    // (`Consensus::refresh_durable` feeds the raw counter; the FSM report
+    // ceiling clamps only what a node REPORTS to a leader,
+    // `publish_validated_frontier`). A solo voter therefore re-derives commit
+    // straight back to its whole log the moment it boots, and "before its
+    // first commit advance" cannot be held open at all. With two voters the
+    // quorum is both, so the peer's ceilinged report is the commit — and a
+    // peer whose declared row has no service pins it at `fsm_lag` forever.
+    // Its election window is skewed ~40x so node 0, the only node holding
+    // snapshot artifacts, is always the leader and always the shipper.
+    let peer = opts.restart_shipper;
+    let w_sock = peer.then(|| UdpSocket::bind("127.0.0.1:0").unwrap());
+    let w_addr = w_sock.as_ref().map(|s| s.local_addr().unwrap());
+    let l_id: NodeId = if peer { 2 } else { 1 };
+    let mut members = vec![(0u32, v_addr)];
+    if let Some(a) = w_addr {
+        members.push((1u32, a));
+    }
+    let learners = vec![(l_id, l_addr)];
+    const FAST_ELECTION_NS: (u64, u64) = (50_000_000, 100_000_000);
+    const SLOW_ELECTION_NS: (u64, u64) = (3_000_000_000, 5_000_000_000);
 
     let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
         id,
@@ -1777,8 +1848,16 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
         settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
-        election_timeout_min_ns: 50_000_000,
-        election_timeout_max_ns: 100_000_000,
+        election_timeout_min_ns: if id == 1 && peer {
+            SLOW_ELECTION_NS.0
+        } else {
+            FAST_ELECTION_NS.0
+        },
+        election_timeout_max_ns: if id == 1 && peer {
+            SLOW_ELECTION_NS.1
+        } else {
+            FAST_ELECTION_NS.1
+        },
         seed: 0xC0FFEE ^ id as u64,
         faults: FaultConfig::default(),
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
@@ -1788,40 +1867,52 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     };
 
     let v_dir = dir.path().join("v0");
-    let voter =
+    let w_dir = dir.path().join("v1");
+    let mut voter =
         Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    let mut peer_voter = w_sock.map(|s| {
+        Node::start_with_socket(cfg(1, w_addr.unwrap(), w_dir.clone()), s)
+            .expect("start peer voter")
+    });
     await_until(30, "voter serves", || voter.can_serve());
-    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
-
-    // The table goes on FIRST, so its frame is inside the prefix the purge
-    // below destroys.
-    if let Some(t) = table {
-        let position = apply_schedule_table(&v_dir, &cnc, t);
-        assert!(position > 0, "an accepted apply reports the frame END");
-        // Ruling 3: the ship gate (`shippable_schedule`) only offers a record
-        // at or below the sender's COMMIT counter, so a table still in flight
-        // would correctly ship as `prev`/none and this fixture would be
-        // asserting the wrong thing. One voter commits on its own durable
-        // report, but not instantly — wait for it explicitly.
-        await_until(30, "the applied table committed", || {
-            voter.counters().commit.load_acquire() >= position
-        });
-    }
+    let mut cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
 
     // See `spawn_applied_mirror`'s doc: row 0 is a REAL declared FSM with no
     // service attached, so FSM-lag admission needs `applied` mirrored from
-    // `durable` for the duration of the raw submit loop.
+    // `durable` for the duration of the raw submit loops. Hoisted ABOVE the
+    // table apply because `pre_frames` runs before it. The peer voter needs
+    // the same mirror, for the same reason on the REPORT side: without it its
+    // report is ceilinged at `fsm_lag` from the first byte and nothing ever
+    // commits.
     let (mirror_stop, mirror_handle) = spawn_applied_mirror(std::sync::Arc::clone(&cnc), 0);
-    for i in 0u64..24000 {
-        let mut p = vec![0u8; PAYLOAD];
-        p[..8].copy_from_slice(&i.to_le_bytes());
-        loop {
-            match voter.submit(p.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
+    let peer_mirror = peer_voter.as_ref().map(|_| {
+        let p = CncPage::open_file(&w_dir.join("cnc2.dat"), app).expect("open peer cnc");
+        spawn_applied_mirror(p, 0)
+    });
+
+    // Pre-traffic, so the table's frame lands high enough in the log that a
+    // restarted shipper's report ceiling cannot reach it (see the restart
+    // block below for the arithmetic). Zero for the plain fixtures.
+    submit_frames(&voter, opts.pre_frames);
+
+    // The table goes on before the churn, so its frame is inside the prefix
+    // the purge below destroys.
+    let mut table_position = 0;
+    if let Some(t) = opts.table {
+        let position = apply_schedule_table(&v_dir, &cnc, t);
+        assert!(position > 0, "an accepted apply reports the frame END");
+        // The apply must COMMIT before the fixture goes on: a table still in
+        // flight is not yet cluster state, so the artifact the `uc2-cluster`
+        // agent writes would not carry it and this fixture would be asserting
+        // the wrong thing. One voter commits on its own durable report, but
+        // not instantly — wait for it explicitly.
+        await_until(30, "the applied table committed", || {
+            voter.counters().commit.load_acquire() >= position
+        });
+        table_position = position;
     }
+
+    submit_frames(&voter, 24000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -1829,6 +1920,10 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     });
     mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mirror_handle.join().unwrap();
+    if let Some((stop, handle)) = peer_mirror {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap();
+    }
 
     // Publish a snapshot floor + a real snapshot file for the sender to ship
     // (frame-aligned: a mid-frame floor lands the journal-replay datagram
@@ -1851,15 +1946,95 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
     });
+
+    if opts.restart_shipper {
+        // ---- the residual, staged (spec §11).
+        //
+        // What must be true before the shipper goes down: its CLUSTER ARTIFACT
+        // must exist, because the artifact — not any live read — is what the
+        // session ships. The `uc2-cluster` agent's bridging trigger fires once
+        // every declared row has snapshotted, which the hand-published
+        // `snapshot_pos` above has only just made true, so poll for it rather
+        // than racing the agent's next duty cycle.
+        await_until(30, "the voter wrote a cluster artifact", || {
+            std::fs::read_dir(uc_node::cluster_agent::snapshot_dir_of(&v_dir))
+                .map(|rd| {
+                    rd.flatten()
+                        .any(|e| e.file_name().to_string_lossy().ends_with(".ultcluster"))
+                })
+                .unwrap_or(false)
+        });
+        if table_position > 0 {
+            await_until(30, "…and the artifact carries the applied table", || {
+                uc_node::cluster_agent::read_committed_table(&v_dir)
+                    .map(|(p, _)| p)
+                    .unwrap_or(0)
+                    == table_position
+            });
+        }
+
+        // Both voters go down and come back — a cluster restart, the honest
+        // shape of "the shipper was restarted". Nothing else is touched: the
+        // journals, the artifacts and the purged prefix are all still there.
+        voter.stop();
+        if let Some(p) = peer_voter.take() {
+            p.stop();
+        }
+        voter = Node::start(cfg(0, v_addr, v_dir.clone())).expect("restart the voter");
+        peer_voter =
+            w_addr.map(|a| Node::start(cfg(1, a, w_dir.clone())).expect("restart the peer voter"));
+        cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("reopen voter cnc");
+        // The cnc page is recreated ZEROED at every boot, and this fixture has
+        // no real service to re-publish row 0's newest artifact position at
+        // attach — so re-publish it by hand, exactly as `uc_service`'s builder
+        // agent would. Without it `snapshot_set_for` declines the session
+        // outright ("missing artifact") and there is no residual to test.
+        cnc.service_slot(0).snapshot_pos.store_release(floor);
+        cnc.snapshots().service_snapshot_pos.store_release(floor);
+        // `is_leader`, not `can_serve`: a leader starts SERVING only once its
+        // own `NewTerm` frame COMMITS (`ElectionSm::can_serve`), and the whole
+        // point of this staging is that nothing above `fsm_lag` commits. That
+        // is not a contrivance — it is exactly the state a cluster is in when
+        // a restarted peer's FSM has not caught up — and shipping a snapshot
+        // set is a SENDER-agent job that does not consult the serving flag.
+        await_until(30, "the restarted voter took the leadership again", || {
+            voter.is_leader()
+        });
+        // NOTHING advances the cluster's commit counter from here on: no
+        // client traffic, no ticks, no mirrored `applied` on either node.
+        // `LogCounters` is deliberately not primed at boot
+        // (`uc_log/src/counters.rs:55`), and the PEER's report is clamped to
+        // `min_applied + fsm_lag` (`services::report_ceiling`) with
+        // `min_applied` back at 0 on its fresh page — so with a two-voter
+        // quorum the leader's commit sits at `fsm_lag` (`buffer_bytes / 4` =
+        // 64 KiB here) for as long as the test runs, far below a table frame
+        // that `pre_frames` put a quarter of a megabyte up the log.
+        let settle = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < settle {
+            let c = voter.counters().commit.load_acquire();
+            assert!(
+                c < table_position.max(1),
+                "the restarted cluster's commit ({c}) climbed past the table at \
+                 {table_position} — the residual is no longer staged"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     let first_base = voter.archive_first_base();
     let frontier = voter.counters().append.load_acquire();
 
     let l_dir = dir.path().join("l1");
     let learner =
-        Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
+        Node::start_with_socket(cfg(l_id, l_addr, l_dir.clone()), l_sock).expect("start learner");
     await_until(40, "learner caught up across the purged prefix", || {
         learner.counters().durable.load_acquire() >= frontier
-            && learner.counters().commit.load_acquire() >= frontier
+            // A restarted shipper's own commit counter is pinned at its report
+            // ceiling (see above), and a learner's commit is that number
+            // gossiped — so this half of the catch-up is meaningless there and
+            // would simply time out. Durable + the floor assertion below are
+            // what say the session completed.
+            && (opts.restart_shipper || learner.counters().commit.load_acquire() >= frontier)
     });
     assert!(
         learner.archive_first_base() >= first_base,
@@ -1869,9 +2044,11 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     JoinFixture {
         _dir: dir,
         voter,
+        peer_voter,
         learner,
         v_dir,
         l_dir,
+        table_position,
     }
 }
 
@@ -2004,6 +2181,106 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
             l_cnc.service_slot(0).identity.timers_pending(),
             0,
             "the no-table install armed something"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    f.stop();
+}
+
+/// Spec §11, the residual staged exactly: a leader ships a set, is
+/// **restarted**, and serves a joiner **before its first commit advance** —
+/// the joiner must still install the cluster's table.
+///
+/// **Why this used to be red.** The retired `SNAP_TABLE` carry read LIVE state
+/// at ship time and gated it on the sender's commit counter
+/// (`shippable_schedule(ship, cnc.counters().commit)` — a leader only offered
+/// a record at or below what it knew to be committed). `LogCounters` is
+/// deliberately not primed at boot (`uc_log/src/counters.rs:55`), so a
+/// restarted node re-derives commit from live quorum reports, and a node whose
+/// own report is ceilinged never gets back past the ceiling on its own. The
+/// leader therefore shipped the wire's honest "no table", `(0, 0, [])`, and
+/// the joiner installed none — the "restarted node under-ships for one window"
+/// residual, which on this fixture is not a window at all but permanent.
+///
+/// **Why it is green now.** The session carries the CLUSTER ARTIFACT (id 255),
+/// a file the `uc2-cluster` agent wrote at a position it had already applied.
+/// The artifact IS the content: there is no counter to consult at ship time,
+/// and `cluster_snapshot_pos` is seeded from the recovered artifact when the
+/// agent is constructed, so a node that has just booted can ship it on its
+/// first NAK.
+///
+/// **What makes the staging real, and not a green test proving nothing.**
+/// Three assertions below, in order: the shipper's commit counter really is
+/// below the table's frame position when the joiner is served (so the retired
+/// gate would have shut); the artifact on the shipper's disk really carries
+/// the table; and the joiner's installed view really holds it at the same
+/// position. The pre-traffic in the fixture is what buys the first — the
+/// report ceiling after a restart is `0 + fsm_lag` = 64 KiB, and 2 000
+/// pre-frames put the table's frame end a quarter of a megabyte above it.
+#[test]
+fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table()
+{
+    let _g = serialize();
+    let table = two_far_future_entries();
+    let f = below_floor_join_with(
+        "learner-restart",
+        JoinOpts {
+            table: Some(&table),
+            // The table's frame end must clear the post-restart report ceiling
+            // (`fsm_lag` = `buffer_bytes / 4` = 64 KiB): 2 000 frames of
+            // `PAYLOAD` bytes plus a 32-byte header, frame-aligned, is ~256 KiB.
+            pre_frames: 2_000,
+            restart_shipper: true,
+        },
+    );
+
+    // 1. The staging: the shipper's commit counter is BELOW the table's frame
+    //    position — the state the retired gate read as "I know of no
+    //    committed table".
+    let commit = f.voter.counters().commit.load_acquire();
+    assert!(
+        commit < f.table_position,
+        "the residual is not staged: the restarted shipper's commit ({commit}) already \
+         reached the table at {}",
+        f.table_position
+    );
+
+    // 2. The artifact is the thing that travelled, and it carries the table.
+    let (shipped_position, shipped) = uc_node::cluster_agent::read_committed_table(&f.v_dir)
+        .expect("the restarted voter's cluster artifact must be readable");
+    assert_eq!(
+        shipped, table,
+        "the restarted voter's cluster artifact carries the table it shipped"
+    );
+    assert_eq!(shipped_position, f.table_position);
+    // …and the restarted node's own live view came back from that artifact.
+    let want = f.voter.cluster_view().snapshot_inner();
+    assert_eq!(
+        want.table, table,
+        "the restarted voter re-derived the table"
+    );
+    assert_eq!(want.table_position, f.table_position);
+
+    // 3. The joiner installed it. The table's frame is far below the floor the
+    //    joiner adopted, so replay cannot be the source; and no CLUSTER frame
+    //    was appended after the restart, so a live carry cannot be either.
+    await_until(30, "the joiner installed the cluster table", || {
+        f.learner.cluster_view().snapshot_inner().table_position == f.table_position
+    });
+    let got = f.learner.cluster_view().snapshot_inner();
+    assert_eq!(got.table, table, "…record for record");
+
+    // And nothing is armed on it: the row heap is leader-only (spec §4.9) and
+    // this joiner is a learner. A live reading — the consensus agent
+    // republishes the count every pass.
+    let l_cnc = CncPage::open_file(&f.l_dir.join("cnc2.dat"), "learner-restart").expect("open cnc");
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        assert_eq!(
+            l_cnc.service_slot(0).identity.timers_pending(),
+            0,
+            "the row heap is leader-only: a learner that installed a table must arm nothing"
         );
         std::thread::sleep(Duration::from_millis(10));
     }

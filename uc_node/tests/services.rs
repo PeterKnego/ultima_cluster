@@ -174,6 +174,37 @@ fn a_bad_lag_bound_is_a_named_startup_refusal_before_any_file_exists() {
     );
 }
 
+/// Cluster-FSM spec §4.1: the `uc_` prefix belongs to the INTERNAL state
+/// machines — `uc_cluster` is one of them, applied in-node with no cnc slot —
+/// so a deployment may not claim it for a user FSM. Refused by name at the
+/// `ServicesConfig` door, which is the one gate every entry point shares
+/// (`node.toml`'s `[services] names`, `--services`, and the programmatic
+/// constructors), and therefore before a node ever exists.
+///
+/// The whole prefix is reserved, not just the one name in use: a future
+/// internal FSM must not collide with a user row that was legal yesterday.
+#[test]
+fn a_uc_prefixed_fsm_name_is_reserved_and_refused_by_name() {
+    let err = ServicesConfig::from_names(&["uc_cluster"], None).expect_err("must refuse");
+    assert!(err.contains("services.names"), "names the field: {err}");
+    assert!(err.contains("uc_cluster"), "names the offending row: {err}");
+    assert!(err.contains("reserved"), "says why: {err}");
+
+    // Any row, any `uc_` name — not just row 0 and not just the cluster FSM's
+    // own name.
+    let err = ServicesConfig::from_names(&["kv", "uc_anything"], None).expect_err("must refuse");
+    assert!(err.contains("uc_anything"), "{err}");
+    assert!(err.contains("reserved"), "{err}");
+
+    // …and the CLI door refuses the same list through the same message.
+    let err = ServicesConfig::from_cli(Some("kv,uc_cluster"), None).expect_err("must refuse");
+    assert!(err.contains("reserved"), "{err}");
+
+    // The near miss is NOT reserved: the rule is the `uc_` prefix, not the
+    // substring, so an ordinary name that merely contains it still parses.
+    ServicesConfig::from_names(&["my_uc_kv"], None).expect("only the PREFIX is reserved");
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum Cmd {
     Add(u64),
