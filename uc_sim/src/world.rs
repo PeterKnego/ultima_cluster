@@ -835,6 +835,11 @@ pub struct World {
     /// [`World::set_mutate_index_aligned_reconcile`].
     #[cfg(feature = "mutation-testing")]
     mutate_index_aligned_reconcile: bool,
+    /// Sim red-twin tooth (cluster-FSM spec §4.6, §11): the kernel's config
+    /// reader is fed from the COMMITTED view instead of the durable one — the
+    /// wrong reader. See [`World::set_kernel_reads_committed_view`].
+    #[cfg(feature = "mutation-testing")]
+    kernel_reads_committed_view: bool,
     /// When set, a serving leader stops appending NEW frames — modeling a client
     /// that has stopped submitting. The leader still heartbeats its existing tail
     /// and re-gossips commit + term map on the idle floor, so commit PLATEAUS.
@@ -846,6 +851,10 @@ pub struct World {
     stat_wipes: u32,
     stat_restarts: u32,
     stat_stale_vote_window: u64,
+    /// inv12 non-vacuity: how many (node, config frame) pairs the two-readers
+    /// sweep has actually ASSERTED — a frame the node genuinely holds at or
+    /// below its committed frontier. A run whose count is 0 proved nothing.
+    stat_two_readers_checks: u64,
 
     // ---- T13: crypto plane ----
     /// `HS_KEY` (kind 20) deliveries addressed to a given node index are
@@ -871,6 +880,9 @@ pub struct Stats {
     pub wipes: u32,
     pub restarts: u32,
     pub steps: u64,
+    /// inv12 non-vacuity: (node, config frame) pairs the two-readers sweep
+    /// actually asserted over the run (see `World::two_readers_checks`).
+    pub two_readers_checks: u64,
 }
 
 impl World {
@@ -949,12 +961,15 @@ impl World {
             pending_violation: None,
             #[cfg(feature = "mutation-testing")]
             mutate_index_aligned_reconcile: false,
+            #[cfg(feature = "mutation-testing")]
+            kernel_reads_committed_view: false,
             quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
             stat_wipes: 0,
             stat_restarts: 0,
             stat_stale_vote_window: 0,
+            stat_two_readers_checks: 0,
             key_delivery_blocked_until: HashMap::new(),
             nodes,
             cfg,
@@ -1248,6 +1263,10 @@ impl World {
                 step,
             )?;
         }
+        // inv12 — the two readers (cluster-FSM spec §4.6), swept beside inv6:
+        // everything the cluster FSM has applied at commit, the kernel has at
+        // least observed at durable. See `check_two_readers`.
+        self.stat_two_readers_checks += self.check_two_readers(step)?;
         Ok(true)
     }
 
@@ -1259,6 +1278,7 @@ impl World {
             wipes: self.stat_wipes,
             restarts: self.stat_restarts,
             steps: self.steps,
+            two_readers_checks: self.stat_two_readers_checks,
         }
     }
 
@@ -1780,6 +1800,17 @@ impl World {
     /// feedback`), never a re-feed. Every config frame is emitted regardless
     /// of version — the SM's version gate is what makes adoption idempotent.
     fn observe_config_frames(&mut self, node: usize, now: u64) {
+        // The archive walk's frontier: what this node has made DURABLE
+        // (Raft's "newest configuration in the log, committed or not" —
+        // cluster-FSM spec §4.6). The `kernel_reads_committed_view` tooth
+        // swaps in the node's COMMIT instead: the wrong reader.
+        #[cfg(feature = "mutation-testing")]
+        let durable = if self.kernel_reads_committed_view {
+            self.nodes[node].commit
+        } else {
+            self.nodes[node].durable
+        };
+        #[cfg(not(feature = "mutation-testing"))]
         let durable = self.nodes[node].durable;
         let mut due: Vec<(u64, ClusterConfig)> = self
             .config_frames
@@ -1828,6 +1859,105 @@ impl World {
             self.feed(node, Event::ConfigObserved { position, config }, now, step)?;
         }
         Ok(())
+    }
+
+    /// inv12 — THE TWO READERS (cluster-FSM spec §4.6). Swept after every
+    /// event beside inv2/inv6. Returns how many (node, frame) pairs it
+    /// actually asserted, so a scenario can prove the sweep was not vacuous.
+    ///
+    /// `uc_sim` has no cluster FSM (it has no frames at all — spec §8
+    /// amendment), so the FSM's membership is the DERIVED quantity the spec
+    /// defines it to be: the highest-version config frame this node genuinely
+    /// holds at or below its APPLIED frontier, `min(commit, durable)` — the
+    /// position the real apply loop polls, and the reason a stale commit
+    /// shadow above a truncated durable is not an FSM application. That is
+    /// exactly `implied_config_at(node, frontier)`.
+    ///
+    /// Two halves, per `InvariantChecker::check_two_readers`:
+    ///
+    /// (a) every held frame at or below the frontier is in the node's
+    ///     `cfg_observed` — the kernel's archive scan emitted it. NO
+    ///     exemptions: `cfg_observed` is written at EMISSION, not at
+    ///     adoption, so the observation pipeline's in-flight window (which
+    ///     inv6 must exempt) cannot produce a transient here; and a node that
+    ///     is down, halted or mid-restart has `commit == 0`, which makes the
+    ///     half vacuous rather than exempt. Keeping it unexempted is what
+    ///     makes it able to fail at all.
+    ///
+    /// (b) the FSM's derived version never EXCEEDS the kernel's adopted one.
+    ///     This half does take inv6's transient exemptions — down/halted
+    ///     nodes (a frozen SM whose adopted config is a snapshot of the last
+    ///     live instant), a truncation in flight (the mid-window state is a
+    ///     legitimate transient that inv8 re-judges at the ack), and an
+    ///     emitted-but-not-yet-consumed observation (issue #7's thread split:
+    ///     the archive has seen the frame, the SM has not adopted it yet) —
+    ///     because unlike (a) it reads the SM's ADOPTED config, which is the
+    ///     lagging end of exactly those pipelines. Today (b) is implied by
+    ///     inv6 under the same exemptions (inv6 pins adopted ==
+    ///     implied-at-durable, and implied is monotone in the frontier, with
+    ///     `min(commit, durable) <= durable`); it is stated anyway because it
+    ///     is the spec's clause, and because a future widening of inv6's
+    ///     exemptions must not silently drop it.
+    fn check_two_readers(&self, step: u64) -> Result<u64, InvariantViolation> {
+        // Fast exit for the overwhelming majority of scenarios: no config
+        // frame was ever appended, so there is nothing to relate. Keeps the
+        // per-event sweep free for the election/crypto/window-slide tiers.
+        if self.config_frames.is_empty() {
+            return Ok(0);
+        }
+        let mut checks = 0u64;
+        for i in 0..self.cfg.n_nodes {
+            let nd = &self.nodes[i];
+            let frontier = nd.commit.min(nd.durable);
+            let mut unobserved: Vec<(u64, u64)> = Vec::new();
+            for f in &self.config_frames {
+                if f.end == 0 || f.end > frontier {
+                    continue;
+                }
+                // Content identity: a frame from a lineage this node does not
+                // hold was never in ITS log, so its FSM never applied it (the
+                // ledger is cluster-wide, the log is per node).
+                if term_at(&nd.term_map, f.end - 1) != f.term {
+                    continue;
+                }
+                checks += 1;
+                // The kernel "has" a frame two ways: its archive scan emitted
+                // an observation for it (`cfg_observed`), or its DURABLE
+                // config record already sits at or past that position — which
+                // is what a restart recovers (`recover_config_record`, mirrored
+                // by `cfg_cur`/`cfg_cur_pos`) and what the boot re-derivation
+                // re-emits from. `cfg_observed` is cleared at every restart, so
+                // without the second disjunct this half would fire on a node
+                // that recovered its config perfectly and simply has no new
+                // bytes to re-scan yet (see the task-10 report's sim-modelling
+                // note on the lazy boot re-scan).
+                if !nd.cfg_observed.contains(&f.end) && f.end > nd.cfg_cur_pos {
+                    unobserved.push((f.end, f.config.version));
+                }
+            }
+            // (b) reads the SM's ADOPTED config — the lagging end of the
+            // observation pipeline — so it takes inv6's transient exemptions.
+            // A version of 0 can never exceed an adopted version, so this
+            // suppresses that half alone; (a) above stays unexempted.
+            let transient = !nd.up
+                || nd.truncating
+                || nd.cfg_obs_in_flight > 0
+                || !nd.pending_cfg_obs.is_empty();
+            let fsm_version = if transient {
+                0
+            } else {
+                self.implied_config_at(i, frontier).version
+            };
+            self.checker.check_two_readers(
+                i as NodeId,
+                frontier,
+                &unobserved,
+                fsm_version,
+                nd.sm.config().version,
+                step,
+            )?;
+        }
+        Ok(checks)
     }
 
     /// M7 (inv6/inv8 oracle): the config implied by node `node`'s content at
@@ -2825,6 +2955,28 @@ impl World {
         for n in &mut self.nodes {
             n.sm.set_mutate_index_aligned_reconcile(on);
         }
+    }
+
+    /// Mutation tooth (red twin of the inv12 scenario, cluster-FSM spec §4.6
+    /// / §11): feed the consensus kernel's config reader from the COMMITTED
+    /// view instead of the durable one. The archive frame-scan then emits a
+    /// `ConfigObserved` only once the node's COMMIT has crossed the frame end
+    /// — the wrong reader, the one Raft's §4.1 rule forbids ("a server always
+    /// uses the latest configuration in its log, regardless of whether it is
+    /// committed"). Leader adopt-at-append is untouched: this models a
+    /// follower-side reader, exactly as an FSM-first design would get it
+    /// wrong. `mutation-testing` builds only.
+    #[cfg(feature = "mutation-testing")]
+    pub fn set_kernel_reads_committed_view(&mut self, on: bool) {
+        self.kernel_reads_committed_view = on;
+    }
+
+    /// inv12 non-vacuity: how many (node, config frame) pairs the two-readers
+    /// sweep has asserted so far. Zero means the scenario never put a config
+    /// frame below any node's committed frontier — the invariant proved
+    /// nothing.
+    pub fn two_readers_checks(&self) -> u64 {
+        self.stat_two_readers_checks
     }
 
     pub fn set_apply_ceiling(&mut self, node: usize, ceiling: Option<u64>) {

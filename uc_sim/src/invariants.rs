@@ -627,6 +627,68 @@ impl InvariantChecker {
         Ok(())
     }
 
+    /// Invariant 12 — THE TWO READERS (cluster-FSM spec §4.6): the cluster
+    /// FSM's membership is always a COMMITTED PREFIX of the kernel's
+    /// durable-time config.
+    ///
+    /// Membership has two consumers by design. The consensus kernel adopts a
+    /// config frame when it is DURABLE on that node (the archive walk —
+    /// Raft's "newest configuration in the log, committed or not"; inv6 pins
+    /// that half). The cluster FSM applies the same frame at COMMIT and is the
+    /// snapshot authority. The two readers must never invert: everything the
+    /// FSM has applied, the kernel must already have seen.
+    ///
+    /// The sim keeps no per-node config history, so this is the LEDGER form
+    /// (world.rs `check_two_readers` computes the arguments):
+    ///
+    /// * `unobserved` — held config frames at or below the node's applied
+    ///   frontier (`min(commit, durable)`, the position the apply loop polls)
+    ///   whose end the node's archive scan has never emitted a
+    ///   `ConfigObserved` for. Must be empty: the FSM applied a frame the
+    ///   kernel never saw.
+    /// * `fsm_version` vs `adopted_version` — the version the FSM's derived
+    ///   membership carries at that frontier vs the version the kernel has
+    ///   actually adopted. The FSM may lag (it reads at commit); it may never
+    ///   LEAD. Together with inv6's "adopted == the frontier-implied config"
+    ///   this stands in for the spec's "at every committed position the
+    ///   kernel's config equals what the FSM applied there" — the sim has no
+    ///   config history to compare position by position.
+    pub fn check_two_readers(
+        &self,
+        node: NodeId,
+        frontier: u64,
+        unobserved: &[(u64, u64)],
+        fsm_version: u64,
+        adopted_version: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if let Some(&(end, version)) = unobserved.first() {
+            return Err(self.viol(
+                "two readers (inv12)",
+                step,
+                format!(
+                    "node {node} has applied config frame v{version} (ends {end}) at its \
+                     committed frontier {frontier} — the cluster FSM's membership — but the \
+                     kernel never observed that frame ({} unobserved in total): the FSM's \
+                     membership is not a prefix of the kernel's",
+                    unobserved.len()
+                ),
+            ));
+        }
+        if fsm_version > adopted_version {
+            return Err(self.viol(
+                "two readers (inv12)",
+                step,
+                format!(
+                    "node {node}'s cluster FSM holds membership v{fsm_version} at committed \
+                     frontier {frontier} while the kernel has adopted only v{adopted_version} \
+                     — the committed-time reader has run AHEAD of the durable-time one"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Invariant 8 — revert correctness: once a truncation SETTLES (the
     /// matching-epoch ack landed: durable clamped, map adopted, config
     /// reverted/kept per spec §5), the adopted config must re-equal the

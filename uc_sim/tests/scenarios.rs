@@ -1994,6 +1994,161 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
     );
 }
 
+// ============ Cluster FSM (spec §4.6, §11): inv12, the two readers ============
+
+/// Drive real membership churn through the frame pipeline: `rounds` x
+/// (add-learner 7, remove-learner 7) — id 7 has no process behind it, so the
+/// voter set stays {0,1,2} and every round appends two config frames — with a
+/// follower crash + restart in the middle, so the inv12 sweep also runs over a
+/// node whose `cfg_observed` a boot has cleared.
+///
+/// A copy of `propose_ok`'s retry loop rather than a call to it: `propose_ok`
+/// `.expect()`s inside, and a red twin needs the violation PROPAGATED so it
+/// can assert which invariant fired. Returns the number of config frames
+/// actually appended (0 if the cluster never accepted one — a stalled world is
+/// not itself an invariant breach, and the caller asserts on the count).
+fn churn_membership(w: &mut World, rounds: usize) -> Result<u64, InvariantViolation> {
+    w.run_until_leader()?;
+    w.run_steps(300)?; // a genuine committed prefix before the first frame
+    let mut appended = 0u64;
+    for round in 0..rounds {
+        // A FRESH id each round: removing a learner tombstones its id
+        // permanently (inv9), so the same id cannot be re-added.
+        let id = (7 + round) as u32;
+        let ops = [
+            ConfigOp::AddLearner {
+                id: id as _,
+                addr: (id, 1),
+            },
+            ConfigOp::RemoveLearner { id: id as _ },
+        ];
+        for op in ops {
+            let mut version = None;
+            for _ in 0..300 {
+                let Some(l) = w.current_leader() else {
+                    w.run_steps(500)?;
+                    continue;
+                };
+                match w.propose_config(l, op) {
+                    Ok(v) => {
+                        version = Some(v);
+                        break;
+                    }
+                    Err(
+                        ProposeError::ChangePending
+                        | ProposeError::NotCaughtUp { .. }
+                        | ProposeError::NotLeader
+                        | ProposeError::NotServing,
+                    ) => w.run_steps(500)?,
+                    Err(e) => panic!("unexpected structural refusal: {e:?}"),
+                }
+            }
+            let Some(version) = version else {
+                return Ok(appended); // the cluster stopped accepting; caller judges
+            };
+            appended += 1;
+            // Adoption first (the kernel's durable-time reader), then enough
+            // virtual time for COMMIT to carry the frame under every node's
+            // committed frontier — inv12 is vacuous until it does.
+            w.run_until(|w| all_live_at_version(w, 3, version))?;
+            w.run_for(20_000_000)?;
+        }
+        if round == 1 {
+            // A crash mid-churn: the restart clears `cfg_observed` and the
+            // kernel recovers its config from the durable record instead —
+            // the exact state inv12's "observed OR already in the record"
+            // reading has to get right.
+            let l = w.current_leader().unwrap_or(0);
+            let f = (0..3).find(|&i| i != l).expect("a follower exists");
+            w.crash(f);
+            w.run_steps(2_000)?; // ride the crash and its automatic restart
+        }
+    }
+    Ok(appended)
+}
+
+fn two_readers_cfg() -> SimConfig {
+    SimConfig {
+        n_nodes: 3,
+        seed: 7,
+        max_steps: 400_000,
+        ..SimConfig::default()
+    }
+}
+
+/// inv12 — THE TWO READERS (cluster-FSM spec §4.6). Membership has two
+/// consumers: the consensus kernel adopts a config frame when it is DURABLE
+/// (Raft's "newest configuration in the log, committed or not"), the cluster
+/// FSM applies the same frame at COMMIT and is the snapshot authority. The
+/// FSM's membership must therefore always be a committed PREFIX of the
+/// kernel's — never ahead of it, and never over a frame the kernel has not
+/// seen. Swept after every event, like inv2 and inv6.
+#[test]
+fn inv12_the_cluster_fsms_membership_is_a_committed_prefix_of_the_kernels() {
+    let mut w = World::new(two_readers_cfg());
+    let appended = churn_membership(&mut w, 4).expect("invariants (membership churn)");
+    assert_eq!(
+        appended, 8,
+        "the churn must actually append 2 frames per round"
+    );
+    // Non-vacuity: the sweep asserted real (node, frame) pairs — a config
+    // frame the node genuinely holds, at or below its committed frontier.
+    assert!(
+        w.two_readers_checks() > 0,
+        "inv12 never asserted anything: no config frame ever sat below a \
+         node's committed frontier"
+    );
+}
+
+/// RED TWIN of the above: the kernel's config reader fed from the COMMITTED
+/// view instead of the durable one (`set_kernel_reads_committed_view`) — the
+/// reader an FSM-first design would reach for, and the one Raft §4.1 forbids.
+/// The invariant set must SEE it.
+///
+/// NOTE (task 10 report): this pin is `#[ignore]`d because the tooth does not
+/// reach inv7/inv5 — inv6 (config determinism), the sim's existing
+/// durable-time oracle, fires first on every seed tried, deterministically and
+/// by construction. The tooth IS caught (see
+/// `counterfactual_kernel_on_the_committed_view_is_caught_by_the_invariant_set`
+/// below, which runs); what is unproven is that the deeper safety invariants
+/// would catch it if inv6 were not there. Left in place, unweakened, rather
+/// than re-pinned to an invariant it does not actually trip.
+#[cfg(feature = "mutation-testing")]
+#[test]
+#[ignore = "twin did not go red on inv7/inv5 (inv6 fires first): see task-10 report"]
+fn counterfactual_kernel_on_the_committed_view_breaks_quorum_legality() {
+    let mut w = World::new(two_readers_cfg());
+    w.set_kernel_reads_committed_view(true);
+    let e =
+        churn_membership(&mut w, 4).expect_err("the wrong reader must break a safety invariant");
+    assert!(
+        e.invariant.starts_with("quorum legality (inv7)")
+            || e.invariant.starts_with("leader completeness (inv5)"),
+        "{e:?}"
+    );
+}
+
+/// The tooth above, pinned to what it ACTUALLY trips, so `mutation-testing`
+/// keeps exercising it: a kernel that adopts membership at commit is caught
+/// by the invariant set — on inv6, the durable-time adoption oracle, whose
+/// premise ("the adopted config is the one this node's own log implies at its
+/// durable frontier") the wrong reader deletes directly. inv12 stays green
+/// under the tooth, and that is correct: inv12 pins FSM ⊆ kernel, and a
+/// kernel that reads the committed view is not AHEAD of the FSM, it is level
+/// with it. The pair is what pins the reader; neither half does it alone.
+#[cfg(feature = "mutation-testing")]
+#[test]
+fn counterfactual_kernel_on_the_committed_view_is_caught_by_the_invariant_set() {
+    let mut w = World::new(two_readers_cfg());
+    w.set_kernel_reads_committed_view(true);
+    let e =
+        churn_membership(&mut w, 4).expect_err("the wrong reader must break a safety invariant");
+    assert!(
+        e.invariant.starts_with("config determinism (inv6)"),
+        "expected the durable-time adoption oracle to fire: {e:?}"
+    );
+}
+
 // ================= Task 12 ledger: run_until timeout signal + parked violation =================
 
 /// Ledger minor (x): `run_until` must distinguish "predicate held" from
