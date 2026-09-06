@@ -18,7 +18,7 @@ use uc_protocol::v2::frame::{ClusterKind, read_cluster_prefix};
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, ScheduleTable, decode_schedule_table, encode_schedule_table,
 };
-use uc_protocol::v2::settings::{Settings, decode_settings, encode_settings};
+use uc_protocol::v2::settings::{SETTINGS_LEN, Settings, decode_settings, encode_settings};
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine};
 
 use crate::node::{cluster_to_wire, wire_to_cluster_config};
@@ -244,38 +244,66 @@ impl SnapshotStateMachine for ClusterFsm {
         let mut img = Vec::new();
         src.read_to_end(&mut img).map_err(SnapshotError::from)?;
         let bad = |what: &'static str| SnapshotError::Codec(what.into());
-        if img.len() < 8 + 4 + 8 + 8 + 4 + 4 + 29 + 4 || &img[0..8] != CLUSTER_IMAGE_MAGIC {
+        if img.len() < 8 + 4 + 8 + 8 + 4 + 4 + SETTINGS_LEN + 4 || &img[0..8] != CLUSTER_IMAGE_MAGIC
+        {
             return Err(bad("cluster image magic"));
         }
         let (body, crc) = img.split_at(img.len() - 4);
         if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
             return Err(bad("cluster image crc"));
         }
+        // CRC32 is a public checksum, not a MAC: a crafted-or-corrupt body can
+        // still match it, so every length-prefixed and fixed-width read below
+        // is bounds-checked with `.get(..)` before slicing — no declared
+        // length, however wrong, may panic (mirrors
+        // `uc_protocol::v2::config::decode_config`'s check-before-index
+        // posture).
+        let u32_at = |o: usize| -> Result<u32, SnapshotError> {
+            body.get(o..o + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .ok_or_else(|| bad("cluster image truncated"))
+        };
+        let u64_at = |o: usize| -> Result<u64, SnapshotError> {
+            body.get(o..o + 8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .ok_or_else(|| bad("cluster image truncated"))
+        };
         let mut o = 8;
-        let u32_at = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
-        let u64_at = |o: usize| u64::from_le_bytes(body[o..o + 8].try_into().unwrap());
-        if u32_at(o) != CLUSTER_IMAGE_VERSION {
+        if u32_at(o)? != CLUSTER_IMAGE_VERSION {
             return Err(bad("cluster image version"));
         }
         o += 4;
-        let applied = u64_at(o);
+        let applied = u64_at(o)?;
         o += 8;
         if applied != position {
             return Err(bad("cluster image position"));
         }
-        let table_position = u64_at(o);
+        let table_position = u64_at(o)?;
         o += 8;
-        let ml = u32_at(o) as usize;
+        let ml = u32_at(o)? as usize;
         o += 4;
+        let m_bytes = o
+            .checked_add(ml)
+            .and_then(|end| body.get(o..end))
+            .ok_or_else(|| bad("cluster image membership length"))?;
         let membership = wire_to_cluster_config(
-            &decode_config(&body[o..o + ml]).ok_or_else(|| bad("cluster image membership"))?,
+            &decode_config(m_bytes).ok_or_else(|| bad("cluster image membership"))?,
         );
         o += ml;
-        let tl = u32_at(o) as usize;
+        let tl = u32_at(o)? as usize;
         o += 4;
-        let table =
-            decode_schedule_table(&body[o..o + tl]).ok_or_else(|| bad("cluster image table"))?;
+        let t_bytes = o
+            .checked_add(tl)
+            .and_then(|end| body.get(o..end))
+            .ok_or_else(|| bad("cluster image table length"))?;
+        let table = decode_schedule_table(t_bytes).ok_or_else(|| bad("cluster image table"))?;
         o += tl;
+        // `decode_settings` is itself exact-length (no trailing bytes
+        // tolerated), so require the remainder to be exactly `SETTINGS_LEN`
+        // rather than handing it a slice that could run past `body`'s end.
+        if o.checked_add(SETTINGS_LEN) != Some(body.len()) {
+            return Err(bad("cluster image settings length"));
+        }
         let settings = decode_settings(&body[o..]).ok_or_else(|| bad("cluster image settings"))?;
         self.state = ClusterState {
             membership,
@@ -558,6 +586,45 @@ mod tests {
         assert!(
             g.install_snapshot(501, &mut img.as_slice()).is_err(),
             "position mismatch refused"
+        );
+    }
+
+    #[test]
+    fn install_refuses_a_crc_valid_image_with_a_lying_length_prefix() {
+        // CRC32 is a public checksum, not a MAC — a below-floor joiner
+        // installs an artifact received from a peer over the wire, so a
+        // tampered-but-checksum-consistent image must be refused, not panic.
+        let mut f = fsm();
+        let mut out = Vec::new();
+        f.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(500),
+            &body(&ClusterCommand::Settings(Settings {
+                snapshot_interval_bytes: 7,
+                ..Settings::genesis_default()
+            })),
+            &mut out,
+        );
+        let (handle, _pos) = f.freeze().unwrap();
+        let mut img = Vec::new();
+        ClusterFsm::stream_snapshot(handle, &mut img).unwrap();
+
+        // Layout: magic(8) | version u32(4) | applied u64(8) |
+        // table_position u64(8) | ml u32(4) | ... — overwrite `ml` with a
+        // value far past the image's actual length, then recompute the CRC
+        // so the tampered image still clears the checksum gate.
+        const ML_OFFSET: usize = 8 + 4 + 8 + 8;
+        img[ML_OFFSET..ML_OFFSET + 4].copy_from_slice(&9999u32.to_le_bytes());
+        let body_len = img.len() - 4;
+        let crc = crc32fast::hash(&img[..body_len]);
+        img[body_len..].copy_from_slice(&crc.to_le_bytes());
+
+        let mut g = ClusterFsm::new(genesis(), vec![0xF5A0, 0xF5A1]);
+        let before = g.state().clone();
+        assert!(g.install_snapshot(500, &mut img.as_slice()).is_err());
+        assert_eq!(
+            g.state(),
+            &before,
+            "a refused install must not mutate state"
         );
     }
 
