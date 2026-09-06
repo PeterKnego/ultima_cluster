@@ -40,6 +40,7 @@ user, freezes at the same log position.
 | failure | an incomplete instant is **abandoned**; the next supersedes it; commit, apply and replication never wait on a snapshot; loud metrics | §10 |
 | settings | a third replicated record: `fsm_lag`, `admission_bytes`, `snapshot.interval_bytes`; moved keys refused by name in `node.toml`; genesis-seed only | §6 |
 | bootstrap boundary | a setting that is a precondition for *reading the log* stays in `node.toml`, enforced by refusal: `app_id`, `[crypto]`, `[services] names`, `max_payload`, `[[members]]` (genesis) | §3.3 |
+| the timer heap | **leader-only** — followers stop draining `svc_sched`; a new leader rebuilds the heap from its service's pending set (the re-announce path that already serves restart) and the cluster FSM's table view. Removes a derived cache whose only justification was one round trip inside a failover window that already exists | §4.9 |
 | retired before shipping | `FRAME_TYPE_SCHEDULE_TABLE = 6`, `DGRAM_KIND_SNAP_TABLE = 21`, `SnapBeginBody.config`, `state/schedules.state`, `ScheduleShip`/`shippable_schedule`/`known_committed`, per-service `SnapshotPolicy` | §7 |
 | flag day | inside `2.11.0`'s existing unreleased flag day: wire `0.7.0`, cnc `3.1`. Zero extra cost | §12 |
 
@@ -108,7 +109,7 @@ oracle. Three hand-written `StableValue`-plus-`prev` chains become one
 | output progress | node | `state/output_progress.state` | never |
 | `log_time_ns` clamp | node (derived) | cnc page 1 `+4048`, re-seeded from a journal walk at boot | rederived |
 | crypto session keys, epoch | node | — | handshake |
-| timer heap (`RowTimers`) | node (a cache) | — | rebuilt from the service's re-announce + the table |
+| timer heap (`RowTimers`) | node — a cache **derived from two cluster sources**: the row's `Timed<S>` pending set (its own `ctx.schedule` calls, over the `svc_sched` ring) and the schedule table (`adopt_table`); the `next`/`last_delivered` per table entry are node-computed; `in_flight` is leader bookkeeping | — | **leader-only since plan 1 (§4.9)**: rebuilt on `BecomeLeader` from the service's re-announce + the cluster FSM's view |
 | **membership** | **cluster** — with a node-side shadow, §4.6 | cluster FSM artifact; shadow in `state/config.state` | cluster FSM artifact at P, then tail replay |
 | **schedule table** | **cluster** | cluster FSM artifact | same |
 | **settings** | **cluster** | cluster FSM artifact | same |
@@ -325,13 +326,47 @@ writes `snapshots/cluster/snap-{P}.ultcluster`: magic, image version, the
 three records, CRC. Installed by a joiner through `install_snapshot(P, …)`.
 A fuzz target covers the decoder, since a joiner installs it by fiat.
 
-### 4.9 What stays node-fired
+### 4.9 What stays node-fired, and the heap goes leader-only
 
-Table ticks. A tick must be **delivered to the target row** as a `TIMER`
-frame, and an FSM cannot append frames, so the node still arms per-row
-entries from the view's table and fires them exactly as plan 2 built
+**Firing stays on the node, and on the leader only** — as today: a tick or a
+programmatic timer must be **delivered to the target row** as a `TIMER`
+frame, an FSM cannot append frames, and `fire_due_timers` already runs only
+under the leader flag. The node still arms per-row table entries from the
+view's table and fires them exactly as plan 2 built
 (`RowTimers::table_fire_deadline`, `FLAG_TIMER_TABLE`, the one-tick catch-up).
 The table simply has one source of truth now.
+
+**The heap itself becomes leader-only (plan 1 decision).** Plan 1 as shipped
+keeps `RowTimers` on **every** node, drained from `svc_sched` every pass
+(`uc_node/src/node.rs:2602`, unconditional) so that a new leader holds the
+pending set on its first pass — the same choice Aeron makes
+(`timerService` updated on every node at `ConsensusModuleAgent.java:1453`,
+polled only under `LEADER == role` at `:2484`). Under §3's line that cache
+is legitimate but unjustified: everything in it is reconstructible from
+cluster data a new leader already holds — its service's `Timed<S>` pending
+set, and the table in the cluster FSM's view — through the re-announce path
+that already serves restart. The only thing not reconstructible,
+`in_flight`, is leader bookkeeping a new leader never inherits anyway (the
+at-least-once trade, §4.5 of the time-and-timers spec).
+
+So:
+
+- **Followers do not drain `svc_sched`.** The ring becomes leader-consumed,
+  as the ingress ring is. A follower's service still writes its schedule
+  records (they are outputs of `apply`, emitted identically everywhere); the
+  ring simply fills to its high-water mark and is drained from the tail on
+  promotion — `uc2_sched_ring_full_total` counts the case where a follower
+  was one for longer than the ring holds, which the re-announce covers.
+- **`BecomeLeader` requests the pending set.** The consensus agent sends the
+  row's service the same re-announce request restart uses; the service
+  walks `Timed<S>`'s pending set and `table_last` into the ring; the leader
+  arms from that plus the view's table. `rearm_timers` and the
+  `BecomeLeader` path collapse into this one request.
+- **Cost, stated:** timers due inside the promotion window fire one ring
+  round trip later than they would have. Failover already makes them late
+  (time-and-timers §4.3's post-failover case, `ev.late(ctx)`), so the
+  semantics are unchanged and only the width of an existing window moves.
+  `uc2_timers_late_total` and the timer gate's row c (precision) measure it.
 
 ## 5. Coordinated snapshot instants
 
@@ -636,7 +671,10 @@ not zero either, and the cluster FSM's recovery (§4.7) is what closes it.
   `uc_`-prefixed name is refused; a cluster with one non-snapshotting row
   refuses `uc2ctl snapshot` with `48`.
 - **Timers** (`uc_node/tests/timers.rs`): the existing nine pass unchanged
-  in outcome; the table is read from the view.
+  in outcome; the table is read from the view; plus a failover test that
+  arms timers on the old leader, kills it, and asserts the new leader fires
+  every pending instance exactly once after its re-announce — late, never
+  lost, never at diverging positions (the §4.9 leader-only heap).
 - **lincheck** (`lin_v2`): the purge/snapshot-churn capstone re-run with
   commanded instants driving the churn instead of per-service intervals.
 - **Hard crash** (`uc_crashtest`): SIGKILL a service mid-build at P; assert
@@ -696,7 +734,8 @@ Three plans, each shippable to `main` on its own with the tree green:
 
 1. **The cluster FSM** — the internal apply loop, `FRAME_TYPE_CLUSTER`, the
    three kinds, the view, genesis, the two-reader invariant in the sim, the
-   settings record and `uc2ctl settings`. Membership and the table move in;
+   settings record and `uc2ctl settings`; **and the leader-only timer heap**
+   (§4.9) — followers stop draining `svc_sched`, `BecomeLeader` re-announces. Membership and the table move in;
    `SNAP_TABLE` and `schedules.state` go; the session ships the cluster
    artifact under id 255 at *the cluster FSM's newest* position, relying on
    the existing M14c per-row resume rule (each row installs its own artifact
@@ -728,3 +767,7 @@ settled before the corresponding task is written:
 4. That `install_snapshot` on a user FSM tolerates a set position equal to
    the FSM's own `applied` (a row that snapshotted at P and then installs
    P — a no-op today?).
+5. Whether any timers test pins "fires on the very first pass after
+   failover" as a bar rather than an observation — the leader-only heap
+   (§4.9) widens that window by one ring round trip, and a test written to
+   the old width must be re-baselined, not weakened silently.
