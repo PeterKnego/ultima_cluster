@@ -27,10 +27,11 @@ use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
-    RefusalKind, ScheduleTableCell,
+    RefusalKind,
 };
 use uc_net::sender::{
-    CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet, identity_mask,
+    CLUSTER_ARTIFACT_ID, CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet,
+    identity_mask,
 };
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, RingError, SpscConsumer,
@@ -654,12 +655,6 @@ pub struct Node {
     /// rather than prefilling its ring).
     sender_stats: Arc<uc_net::sender::SenderStats>,
     partition_handles: Vec<PartitionHandle>,
-    /// Final-review fix (Item 1 test): a clone of the SAME `Arc<Mutex<Vec<u8>>>`
-    /// the consensus agent's `config_bytes` field and the sender's
-    /// `SnapshotSource` closure read — i.e. observing this from a test is
-    /// observing exactly what a SNAP_BEGIN this node ships would carry, not a
-    /// proxy for it. Exposed via [`Node::snapshot_config_bytes`].
-    config_bytes: Arc<Mutex<Vec<u8>>>,
     /// M8 (Task 12): the newest group-key epoch this node has minted (0 =
     /// never). Written by the consensus agent; read by [`Node::crypto_epoch`].
     crypto_epoch: Arc<AtomicU32>,
@@ -937,18 +932,6 @@ impl Node {
         cnc.store_config_version(config.version);
         cnc.store_admission_bytes(cfg.admission_bytes_default);
 
-        // M7 Task 6: the snapshot-session config-carry cache — the encoded
-        // CURRENT `ConfigRecord.config` (`v2::config::encode_config` bytes), read
-        // by the sender's `SnapshotSource` closure at ship time and refreshed by
-        // `Action::ConfigAdopted`'s exec arm on every adoption (forward, revert,
-        // or boot re-derivation alike). Seeded here from the just-recovered
-        // record so a snapshot shipped before the first live adoption still
-        // carries real bytes rather than an empty placeholder.
-        let config_bytes = Arc::new(Mutex::new(config_wire_bytes(
-            &config,
-            config_rec.prev_position,
-        )));
-
         // Election SM over the recovered credentials + the recovered config.
         // M6 Task 7 / M7: a node whose own id is a learner in the ADOPTED
         // config boots in learner mode — replicated-to, never counted.
@@ -1145,18 +1128,23 @@ impl Node {
         let snap_root = instance.snapshot_root();
         let _ = std::fs::create_dir_all(&snap_root);
         let incoming_snapshot = Arc::new(AtomicU64::new(0));
-        // M7 Task 6: companion cell for `incoming_snapshot` — the encoded config
-        // carried by the SAME completed inbound transfer (`SnapBeginBody.config`),
-        // stashed by the receiver in `snap_complete` and consumed by the
-        // consensus agent's `maybe_adopt_incoming_snapshot`.
-        let incoming_snapshot_config = Arc::new(Mutex::new(Vec::new()));
-        // The receiver's `SNAP_TABLE` landing cell. WRITE-ONLY in the task
-        // 5→9 window (Ruling R4): the receive side of the session is
-        // untouched until task 9, so the receiver still stashes whatever the
-        // sender carried here — and every sender in this window carries the
-        // wire's honest "no table". Nothing reads it; task 9 replaces both
-        // ends with the cluster artifact.
-        let incoming_snapshot_table: ScheduleTableCell = Arc::new(Mutex::new((0, 0, Vec::new())));
+        // Cluster-FSM spec §5.6: companion cell for `incoming_snapshot` — the
+        // position of the CLUSTER ARTIFACT the SAME completed transfer
+        // carried. The receiver writes it before the floor, and the consensus
+        // agent's install handler waits for `cluster_installed` to reach it.
+        let incoming_cluster_pos = Arc::new(AtomicU64::new(0));
+        // ...and the route the artifact itself takes to the `uc2-cluster`
+        // agent, which owns the cluster FSM. Depth 1: a session produces one
+        // install, and the agent drains it at the top of every duty cycle.
+        let (cluster_install_tx, cluster_install_rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
+        // The agent's ack: the position it has actually installed.
+        let cluster_installed = Arc::new(AtomicU64::new(0));
+        // Spec §5.6 / Ruling R2: the newest cluster artifact this node holds,
+        // written (Release) by the `uc2-cluster` agent. Hoisted ABOVE the
+        // snapshot-source closure below, which offers it as the set's id-255
+        // artifact — the agent itself is built further down, once the cluster
+        // FSM has been recovered.
+        let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
         // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
         // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
         // around a DATA datagram to detect a prime that straddled its processing and
@@ -1174,17 +1162,19 @@ impl Node {
         // reason instead of once per NAK (a below-floor peer re-NAKs on a timer).
         // `uc_net` has no logging dependency, so the naming lives here.
         let src_decline_reason = AtomicU8::new(SNAP_DECLINE_NONE);
-        // M7 Task 6: the same cell `Action::ConfigAdopted`'s exec arm refreshes —
-        // ships whatever config is CURRENT at the moment a peer's NAK opens a
-        // session, never a boot-time snapshot of it.
-        let src_config_bytes = Arc::clone(&config_bytes);
+        // Spec §5.6: the CLUSTER ARTIFACT the set carries under id 255 —
+        // whichever one the `uc2-cluster` agent has most recently written,
+        // read at the moment a peer's NAK opens a session.
+        let src_cluster_pos = Arc::clone(&cluster_snapshot_pos);
+        let src_cluster_dir = instance.cluster_snapshot_dir();
         let src_id = cfg.id;
         sender.set_snapshot_source(Arc::new(move || {
             snapshot_set_for(
                 &src_cnc,
                 &src_root,
                 &src_services,
-                &src_config_bytes,
+                &src_cluster_pos,
+                &src_cluster_dir,
                 src_id,
                 &src_decline_reason,
             )
@@ -1256,11 +1246,8 @@ impl Node {
             }),
             Some((
                 Arc::clone(&incoming_snapshot),
-                Arc::clone(&incoming_snapshot_config),
-                // Time-and-timers plan 3: the installed session's schedule
-                // table, read by the consensus agent's install handler
-                // alongside the config cell above.
-                Arc::clone(&incoming_snapshot_table),
+                Arc::clone(&incoming_cluster_pos),
+                cluster_install_tx,
             )),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
@@ -1532,7 +1519,6 @@ impl Node {
                 .collect(),
         )?;
         let cluster_view = Arc::new(ClusterView::new(cluster_fsm.state()));
-        let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
         let mut cluster_agent = crate::cluster_agent::ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -1543,6 +1529,8 @@ impl Node {
             Arc::clone(&cluster_snapshot_pos),
             Arc::clone(&prime_generation),
             cluster_journal,
+            cluster_install_rx,
+            Arc::clone(&cluster_installed),
         );
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
@@ -1651,7 +1639,8 @@ impl Node {
             snapshot_persisted_floor: state_snapshot_floor,
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::clone(&incoming_snapshot),
-            incoming_snapshot_config: Arc::clone(&incoming_snapshot_config),
+            incoming_cluster_pos: Arc::clone(&incoming_cluster_pos),
+            cluster_installed: Arc::clone(&cluster_installed),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
@@ -1659,7 +1648,6 @@ impl Node {
             service_last_epoch: [0; CNC_MAX_SERVICES],
             service_was_live: [false; CNC_MAX_SERVICES],
             last_wall_ns: 0,
-            config_bytes: Arc::clone(&config_bytes),
             admin,
             // C1: the SAME values written into `CncMeta` above — the tag is
             // bound to this node's boot-time state, never to what the
@@ -1726,7 +1714,6 @@ impl Node {
             route_drops,
             sender_stats,
             partition_handles,
-            config_bytes: Arc::clone(&config_bytes),
             crypto_epoch,
             crypto,
             crypto_handshake_failures,
@@ -1883,17 +1870,6 @@ impl Node {
     /// a joiner's config converges with the leader's after a snapshot install.
     pub fn config_version(&self) -> u64 {
         self.cnc.config_version()
-    }
-
-    /// Final-review fix (Item 1 test): the raw encoded-`ClusterConfig` bytes
-    /// currently cached for the sender's `SnapshotSource` closure — i.e.
-    /// exactly what a SNAP_BEGIN this node ships right now would carry in
-    /// `SnapBeginBody.config`. Exposed for tests asserting the snapshot-fiat
-    /// install path (`maybe_adopt_incoming_snapshot`) refreshed this cache,
-    /// not just the SM/record/cnc-version (which `rebuild_net_for_config`
-    /// alone used to leave stale on that path — see the doc comment there).
-    pub fn snapshot_config_bytes(&self) -> Vec<u8> {
-        self.config_bytes.lock().unwrap().clone()
     }
 
     /// Read the committed message frame at `pos` (which must be a frame
@@ -2475,11 +2451,17 @@ struct Consensus {
     /// newest COMPLETE inbound snapshot transfer (0 = none). Sampled each cycle;
     /// on a new value we adopt it as the archive floor + mirror to cnc.
     incoming_snapshot: Arc<AtomicU64>,
-    /// M7 Task 6: companion cell for `incoming_snapshot` — the encoded config
-    /// carried by the SAME completed transfer (`SnapBeginBody.config`), decoded
-    /// and adopted by fiat (`ElectionSm::adopt_snapshot_config`) alongside the
-    /// archive-floor adoption in `maybe_adopt_incoming_snapshot`.
-    incoming_snapshot_config: Arc<Mutex<Vec<u8>>>,
+    /// Cluster-FSM spec §5.6: companion cell for `incoming_snapshot` — the
+    /// position of the CLUSTER ARTIFACT the SAME completed transfer carried.
+    /// `maybe_adopt_incoming_snapshot` waits for `cluster_installed` to reach
+    /// it before adopting the floor, and then seeds the kernel's membership
+    /// shadow by fiat (`ElectionSm::adopt_snapshot_config`) from the installed
+    /// image via `cluster_view.membership()`.
+    incoming_cluster_pos: Arc<AtomicU64>,
+    /// Cluster-FSM spec §5.6: the `uc2-cluster` agent's ack — the position of
+    /// the newest cluster artifact it has installed. Written (Release) by that
+    /// agent's `install_from`, read here only.
+    cluster_installed: Arc<AtomicU64>,
     /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
     /// AdoptFloor command + cnc mirror fire once per completed transfer).
     adopted_incoming: u64,
@@ -2517,11 +2499,6 @@ struct Consensus {
     /// `publish_status`, which reads as "everything fresh" and therefore can
     /// never emit a spurious detach at boot.
     last_wall_ns: u64,
-    /// M7 Task 6: the snapshot-session config-carry cache — refreshed with the
-    /// newly-adopted config's encoded bytes on every `Action::ConfigAdopted`;
-    /// read by the sender's `SnapshotSource` closure (a separate `Arc` clone) so
-    /// every SNAP_BEGIN ships whatever config is CURRENT at ship time.
-    config_bytes: Arc<Mutex<Vec<u8>>>,
     /// M12b: how this node authenticates admin requests off the cnc admin
     /// band — `Filesystem` (the default: the instance dir's permissions are
     /// the boundary, and the auth line is never read) or `Hmac` (named keys +
@@ -3722,16 +3699,12 @@ impl Consensus {
     /// (T7 shipped live reconfiguration), so it needs exactly this rebuild too,
     /// not a second hand-rolled copy that could drift from this one.
     ///
-    /// Final-review fix: ALSO refreshes the `config_bytes` snapshot-session
-    /// config-carry cache here (`config_wire_bytes(config, prev_position)`) —
-    /// this is now the single site both live callers share, so the
-    /// snapshot-fiat install path (which calls this but never used to touch
-    /// the cache) can no longer leave it stale. `prev_position` is the
-    /// audit-trail field the caller would otherwise pass to `cluster_to_wire`
-    /// itself (the exec arm's adopted `prev_position`; the fiat path's own
-    /// floor position, since a wholesale-replace install sets `prev == config`
-    /// at that same position).
-    fn rebuild_net_for_config(&mut self, config: &ClusterConfig, prev_position: u64) {
+    /// Cluster-FSM spec §5.6 retired this function's third job — refreshing
+    /// the snapshot-session config-carry cache. `SNAP_BEGIN` carries no config
+    /// any more (the CLUSTER ARTIFACT does), so there is no cache, and no way
+    /// for a below-floor rejoiner that later leads to ship a stale one: what
+    /// it ships is whatever image the `uc2-cluster` agent last wrote.
+    fn rebuild_net_for_config(&mut self, config: &ClusterConfig) {
         // Rebuild the net layer: voters-minus-self / learners-minus-self,
         // DISJOINT sets (`CtrlMsg::SetPeers`'s documented convention —
         // the sender recombines them for its own fan-out).
@@ -3761,9 +3734,6 @@ impl Consensus {
             learners,
             cluster_size: sender_cluster_size(config, self.id),
         });
-        // Final-review fix: refresh the snapshot-session config-carry cache —
-        // see the doc comment above for why this lives here now.
-        *self.config_bytes.lock().unwrap() = config_wire_bytes(config, prev_position);
         // Refresh the node's own routing + observability.
         self.rebuild_peer_maps(config);
         self.publish_peer_band();
@@ -3776,6 +3746,22 @@ impl Consensus {
     fn maybe_adopt_incoming_snapshot(&mut self) -> bool {
         let pos = self.incoming_snapshot.load(Ordering::Acquire);
         if pos <= self.adopted_incoming {
+            return false;
+        }
+        // Cluster-FSM spec §5.6: the session also carried the CLUSTER
+        // ARTIFACT, and the `uc2-cluster` agent — which owns the cluster FSM
+        // on its own thread — installs it. WAIT for its ack before doing
+        // anything else here: the membership below is read out of the
+        // installed image, and the floor must not advance under a node whose
+        // cluster row (membership, schedule table, settings) is still the one
+        // it booted with. Not a spin: `adopted_incoming` is left untouched, so
+        // this simply retries on the next duty cycle. It cannot wait forever —
+        // an artifact the agent cannot install is a fail-stop panic there.
+        //
+        // Both cells were written by the receiver BEFORE the floor's Release
+        // store that `pos` came from, so this reads THIS session's position.
+        let want_cluster = self.incoming_cluster_pos.load(Ordering::Acquire);
+        if self.cluster_installed.load(Ordering::Acquire) < want_cluster {
             return false;
         }
         self.adopted_incoming = pos;
@@ -3803,11 +3789,14 @@ impl Consensus {
                     .store_term_map(&map)
                     .expect("term-map persist fail-stop");
             }
-            // M7 Task 6: the snapshot session carried the leader's config alongside
-            // the lineage (`SnapBeginBody.config`) — adopt it by fiat for the
-            // identical reason the lineage is: our own absent local bytes carry
-            // nothing genuine to fall back to below the floor. Persist-before-
-            // adopt-floor, same ordering discipline as the lineage seed above.
+            // M7 Task 6 / cluster-FSM spec §5.6: the snapshot session carried
+            // the leader's membership alongside the lineage — inside the
+            // CLUSTER ARTIFACT, which the `uc2-cluster` agent has installed by
+            // the time we get here (the ack above). Seed the kernel's shadow
+            // from THAT installed image, by fiat, for the identical reason the
+            // lineage is: our own absent local bytes carry nothing genuine to
+            // fall back to below the floor. Persist-before-adopt-floor, same
+            // ordering discipline as the lineage seed above.
             // M7 Task 9: the installed config can DIFFER from this joiner's boot
             // seed — T7 shipped the admin propose path, so membership can have
             // changed live since the seed was drawn. Left as-is, this node would
@@ -3819,11 +3808,8 @@ impl Consensus {
             // drift). The one-in-flight rule (`ElectionSm::propose_config`'s
             // ChangePending refusal) is what keeps the one-level ConfigRecord
             // history sufficient here — do not weaken it.
-            let cfg_bytes = self.incoming_snapshot_config.lock().unwrap().clone();
-            if !cfg_bytes.is_empty() {
-                let wire = decode_config(&cfg_bytes)
-                    .unwrap_or_else(|| panic!("corrupt snapshot-carried CONFIG at floor {pos}"));
-                let cfg = wire_to_cluster_config(&wire);
+            {
+                let cfg = self.cluster_view.membership();
                 self.sm.adopt_snapshot_config(pos, cfg.clone());
                 let rec = ConfigRecord {
                     position: pos,
@@ -3840,21 +3826,13 @@ impl Consensus {
                 // pending mirror too, or a stale pre-crash `true` sticks
                 // until the NEXT live change commits.
                 self.cnc.store_config_pending(false);
-                // Final-review fix: this call now ALSO refreshes `config_bytes`
-                // (previously only `Action::ConfigAdopted`'s exec arm did, so a
-                // below-floor rejoiner that later became leader would ship its
-                // STALE pre-fall config in SNAP_BEGIN to the next joiner). `pos`
-                // doubles as the prev_position audit field since this is a
-                // wholesale-replace install: `rec.prev == rec.config` at `pos`.
-                self.rebuild_net_for_config(&cfg, pos);
+                self.rebuild_net_for_config(&cfg);
             }
-            // Plan 1 task 9 (spec §4.8) will install the CLUSTER ARTIFACT the
-            // session carries here, by the same fiat argument the config
-            // install above makes. Until then a below-floor joiner learns the
-            // cluster row (table, settings) from the log once it catches up —
-            // the session's `SNAP_TABLE` still travels (`uc_net` is untouched
-            // until task 9) but carries the wire's honest "no table",
-            // `(0, 0, [])`, and nothing on this node reads it.
+            // The cluster row itself — the schedule table and the settings
+            // alongside the membership above — is already installed: the
+            // `uc2-cluster` agent did it off the session's CLUSTER ARTIFACT
+            // before the ack this function waited for, and published the view.
+            // `refresh_from_view` picks the rest up on its own next pass.
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
         crate::obs_event!(
@@ -6501,15 +6479,12 @@ impl Consensus {
                 self.state
                     .store_config_record(&rec)
                     .expect("config persist fail-stop");
-                // Rebuild the net layer + this node's own routing/observability
-                // (and, since the final-review fix, the snapshot-session
-                // config-carry cache too — so every SNAP_BEGIN a session opens
-                // from here on ships THIS config; over-delivery to a peer that
-                // doesn't need it is safe, adopt-by-version idempotence on the
-                // receiving end). Shared with the snapshot-fiat install path in
-                // `maybe_adopt_incoming_snapshot` (M7 Task 9) — one derivation for
-                // "what changes when membership changes" everywhere it changes.
-                self.rebuild_net_for_config(&config, prev_position);
+                // Rebuild the net layer + this node's own routing and
+                // observability. Shared with the snapshot-fiat install path in
+                // `maybe_adopt_incoming_snapshot` (M7 Task 9) — one derivation
+                // for "what changes when membership changes" everywhere it
+                // changes.
+                self.rebuild_net_for_config(&config);
                 self.cnc.store_config_version(config.version);
                 // Cleared once commit crosses `position` (do_work step 11).
                 self.cnc.store_config_pending(true);
@@ -7188,21 +7163,6 @@ pub(crate) fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConf
     }
 }
 
-/// The single derivation of the snapshot-session config-carry cache's bytes
-/// (final-review fix): `encode_config(&cluster_to_wire(..))`, called from
-/// every site that refreshes `config_bytes` — boot-time construction AND
-/// `rebuild_net_for_config` (shared in turn by the live-adoption exec arm and
-/// the snapshot-fiat install path). One derivation means the three sites
-/// cannot drift apart the way construction/exec-arm vs. fiat-install did
-/// before this fix (fiat install rebuilt peers/routing but never refreshed
-/// this cache, so a below-floor rejoiner that later became leader would ship
-/// its STALE pre-fall config to the next joiner).
-fn config_wire_bytes(config: &ClusterConfig, prev_position: u64) -> Vec<u8> {
-    let mut wire_bytes = Vec::new();
-    encode_config(&cluster_to_wire(config, prev_position), &mut wire_bytes);
-    wire_bytes
-}
-
 /// `StoredConfig` (the durable `ConfigRecord`'s `config`/`prev`) -> `ClusterConfig`.
 fn stored_to_cluster(s: &StoredConfig) -> ClusterConfig {
     ClusterConfig {
@@ -7709,7 +7669,8 @@ fn snapshot_set_for(
     cnc: &CncPage,
     root: &std::path::Path,
     services: &crate::services::ServicesConfig,
-    config_bytes: &Mutex<Vec<u8>>,
+    cluster_snapshot_pos: &AtomicU64,
+    cluster_dir: &std::path::Path,
     node_id: NodeId,
     decline_reason: &AtomicU8,
 ) -> Option<SnapshotSet> {
@@ -7781,31 +7742,52 @@ fn snapshot_set_for(
     // the missing id forever, the leader's session times out at 30 s, the
     // re-NAK re-opens the identical session — with no counter anywhere.
     // `ring_ids()` is ascending and inside `mask` by construction, so
-    // this only ever trips on a future edit that breaks that pairing.
+    // this only ever trips on a future edit that breaks that pairing. It runs
+    // BEFORE the cluster artifact is appended, deliberately: 255 is outside
+    // the mask by design (spec §5.6), and `uc_net::sender::set_is_valid` is
+    // what checks its own invariant.
     let covered = artifacts.iter().fold(0u64, |m, a| {
         m | 1u64.checked_shl(a.service_id as u32).unwrap_or(0)
     });
     if artifacts.len() != mask.count_ones() as usize || covered != mask {
         return decline(SNAP_DECLINE_UNCOVERED, "set does not cover declared");
     }
+    // Cluster-FSM spec §5.6: the CLUSTER ARTIFACT, LAST — the cluster row's
+    // own image (membership, the replicated schedule table, the settings),
+    // which a below-floor joiner installs by fiat before the floor advances.
+    // Its position is the one the `uc2-cluster` agent published when it wrote
+    // the file, never a live counter: the artifact IS the content, which is
+    // the whole reason the retired `SNAP_TABLE` carry (which read live state
+    // at ship time) had to go.
+    //
+    // `0` = the agent has never snapshotted. On a settled leader the bridging
+    // trigger prevents that — it fires once every declared row has snapshotted,
+    // which is the same condition `floor != 0` above already checked — so this
+    // is the narrow window between a row publishing its artifact and the
+    // cluster agent's next duty cycle. Decline: the peer re-NAKs and the next
+    // attempt has it.
+    let cluster_pos = cluster_snapshot_pos.load(Ordering::Acquire);
+    if cluster_pos == 0 {
+        return decline(SNAP_DECLINE_MISSING, "missing cluster artifact");
+    }
+    let cluster_path = crate::cluster_agent::artifact_path(cluster_dir, cluster_pos);
+    let Ok(meta) = std::fs::metadata(&cluster_path) else {
+        return decline(SNAP_DECLINE_MISSING, "missing cluster artifact");
+    };
+    if meta.len() == 0 {
+        return decline(SNAP_DECLINE_MISSING, "missing cluster artifact");
+    }
+    artifacts.push(SnapArtifact {
+        service_id: CLUSTER_ARTIFACT_ID,
+        snapshot_pos: cluster_pos,
+        path: cluster_path,
+        len: meta.len(),
+    });
     decline_reason.store(SNAP_DECLINE_NONE, Ordering::Relaxed);
-    // Both caches are cloned into locals BEFORE the struct literal: a guard
-    // that lives until the end of a literal holds its mutex across the other
-    // lock, and neither is a lock this thread should be holding twice over.
-    let config = config_bytes.lock().unwrap().clone();
     Some(SnapshotSet {
         services_declared: mask,
         identity,
         version,
-        config,
-        // Plan 1 task 5→9 window (Ruling R4): the schedule table no longer
-        // rides a `SNAP_TABLE` of its own — it is part of the CLUSTER ARTIFACT
-        // task 9 puts on the session. Until then the wire field still exists
-        // (`uc_net` is untouched) and carries the wire's honest "no table",
-        // `(0, 0, [])`: the receiver's withhold rule is satisfied so sessions
-        // still complete, and a below-floor joiner learns the table from the
-        // log once it catches up rather than from the session.
-        table: (0, 0, Vec::new()),
         artifacts,
     })
 }
@@ -7847,6 +7829,11 @@ mod tests {
         /// `ClusterView` and `cluster_snapshot_pos` with `cons`, exactly as
         /// `Node::start_with_socket` wires them.
         cluster: ClusterAgent,
+        /// Cluster-FSM spec §5.6: the producer half of the cluster-artifact
+        /// install route the `uc_net` receiver agent owns in a real node —
+        /// lets a test hand `cluster` an artifact exactly as a completed
+        /// snapshot session would.
+        cluster_install_tx: mpsc::SyncSender<(u64, PathBuf)>,
         /// Cluster-FSM spec §4.9 Task 7: the producer half of row 0's
         /// `svc_sched` ring — the real service process's side, kept alive so
         /// a test can write a record exactly as `uc_service::apply::
@@ -8114,6 +8101,12 @@ mod tests {
         // test that arms a row pokes `cons.timers[row]` AND
         // `cluster.set_declared_rows_for_test`/its own FSM if it needs the
         // agent to accept a table naming that row.
+        // Spec §5.6: the snapshot session's cluster-artifact route and the
+        // agent's ack, wired exactly as `Node::start_with_socket` wires them —
+        // the producer half is kept on the harness so a test can hand over an
+        // artifact the way the `uc_net` receiver agent would.
+        let (cluster_install_tx, cluster_install_rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
+        let cluster_installed = Arc::new(AtomicU64::new(0));
         let cluster = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -8129,6 +8122,8 @@ mod tests {
             Archive::open(ArchiveConfig::new(dir.path().join("cluster-journal")))
                 .unwrap()
                 .journal_arc(),
+            cluster_install_rx,
+            Arc::clone(&cluster_installed),
         );
 
         let mut cons = Consensus {
@@ -8229,7 +8224,8 @@ mod tests {
             snapshot_persisted_floor: 0,
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::new(AtomicU64::new(0)),
-            incoming_snapshot_config: Arc::new(Mutex::new(Vec::new())),
+            incoming_cluster_pos: Arc::new(AtomicU64::new(0)),
+            cluster_installed: Arc::clone(&cluster_installed),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
@@ -8237,7 +8233,6 @@ mod tests {
             service_last_epoch: [0; CNC_MAX_SERVICES],
             service_was_live: [false; CNC_MAX_SERVICES],
             last_wall_ns: 0,
-            config_bytes: Arc::new(Mutex::new(Vec::new())),
             admin: AdminPolicy::Filesystem,
             // Inert under `Filesystem` (verify_admin returns before reading
             // them), but set to plausible values rather than junk.
@@ -8279,6 +8274,7 @@ mod tests {
         Harness {
             cons,
             cluster,
+            cluster_install_tx,
             svc_sched_producer_0: svc_sched_0_producer,
             hs_tx,
             _net_tx: net_tx,
@@ -8640,6 +8636,14 @@ mod tests {
             Archive::open(ArchiveConfig::new(h._dir.path().join("rows-journal")))
                 .unwrap()
                 .journal_arc(),
+            // This rebuild replaces the harness's agent; nothing here installs
+            // a snapshot session's cluster artifact, so a dropped-producer
+            // route is exactly right (the drain sees `Disconnected`).
+            {
+                let (_tx, rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
+                rx
+            },
+            Arc::clone(&h.cons.cluster_installed),
         );
         drive_to_serving_leader(&mut h);
 
@@ -8726,6 +8730,14 @@ mod tests {
             Archive::open(ArchiveConfig::new(h._dir.path().join("rows-journal")))
                 .unwrap()
                 .journal_arc(),
+            // This rebuild replaces the harness's agent; nothing here installs
+            // a snapshot session's cluster artifact, so a dropped-producer
+            // route is exactly right (the drain sees `Disconnected`).
+            {
+                let (_tx, rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
+                rx
+            },
+            Arc::clone(&h.cons.cluster_installed),
         );
         (h, hash)
     }
@@ -10746,6 +10758,44 @@ mod tests {
 
     // ---- post-M7 follow-up (Task 10 fix): fiat install clears the pending mirror ----
 
+    /// Cluster-FSM spec §5.6: write a CLUSTER ARTIFACT at `position` carrying
+    /// `membership`, hand it to the harness's `uc2-cluster` agent over the same
+    /// route the `uc_net` receiver agent uses, and run the agent one cycle so
+    /// the install (and its ack) has actually happened — the state a real
+    /// consensus agent finds when it samples the floor.
+    fn install_cluster_artifact_for_test(
+        h: &mut Harness,
+        position: u64,
+        membership: &ClusterConfig,
+    ) {
+        let fsm = ClusterFsm::new(
+            ClusterState {
+                membership: membership.clone(),
+                table: ScheduleTable { entries: vec![] },
+                table_position: 0,
+                settings: Settings::genesis_default(),
+                applied: position,
+            },
+            Vec::new(),
+        );
+        let (img, pos) = uc_service::SnapshotStateMachine::freeze(&fsm).expect("freeze the image");
+        assert_eq!(pos, position);
+        let dir = h._dir.path().join("incoming-cluster");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = crate::cluster_agent::artifact_path(&dir, position);
+        std::fs::write(&path, &img).unwrap();
+        h.cluster_install_tx.send((position, path)).unwrap();
+        assert!(
+            h.cluster.do_work(),
+            "the agent's drain must install the artifact"
+        );
+        assert_eq!(
+            h.cons.cluster_installed.load(Ordering::Acquire),
+            position,
+            "…and acknowledge it, which is what the install handler waits on"
+        );
+    }
+
     /// Discriminating proof for the fiat `store_config_pending(false)` in
     /// `maybe_adopt_incoming_snapshot` (Task 10): the learner-join e2e test's
     /// canary cannot tell the fiat clear from do_work's periodic mirror-clear
@@ -10762,12 +10812,14 @@ mod tests {
         let v1 = v1_of(&h);
         // A completed inbound snapshot at a floor ABOVE our durable frontier
         // (the learner-join shape: `durable < pos` is what routes
-        // `maybe_adopt_incoming_snapshot` into the adopt/fiat branch), with
-        // the leader's config carried alongside — exactly the two slots the
-        // receiver's `snap_complete` publishes (config cell BEFORE position).
+        // `maybe_adopt_incoming_snapshot` into the adopt/fiat branch), whose
+        // CLUSTER ARTIFACT carries the leader's membership — exactly what the
+        // receiver's `snap_complete` hands over and publishes (the route and
+        // the cluster-position cell BEFORE the floor).
         let floor = 1u64 << 20;
         assert!(floor > h.cons.cnc.counters().durable.load_acquire());
-        *h.cons.incoming_snapshot_config.lock().unwrap() = config_wire_bytes(&v1, 0);
+        install_cluster_artifact_for_test(&mut h, floor, &v1);
+        h.cons.incoming_cluster_pos.store(floor, Ordering::Release);
         h.cons.incoming_snapshot.store(floor, Ordering::Release);
         // A stale pre-crash `true` in the pending mirror.
         h.cons.cnc.store_config_pending(true);
@@ -12609,9 +12661,22 @@ mod tests {
         let root = dir.path().join("snapshots");
         let cnc = test_cnc();
         let services = crate::services::ServicesConfig::from_names(&["a", "b"], None).unwrap();
-        let config_bytes = Mutex::new(vec![0xC0, 0xFF, 0xEE]);
+        // Spec §5.6: the cluster artifact's position, as the `uc2-cluster`
+        // agent publishes it, and the directory it writes into.
+        let cluster_pos = AtomicU64::new(0);
+        let cluster_dir = dir.path().join("snapshots").join("cluster");
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
-        let call = || snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
+        let call = || {
+            snapshot_set_for(
+                &cnc,
+                &root,
+                &services,
+                &cluster_pos,
+                &cluster_dir,
+                7,
+                &latch,
+            )
+        };
 
         // 1. Nothing has snapshotted: decline "floor 0" — the first of its kind,
         //    so the latch TRANSITIONS (that is the log line).
@@ -12652,32 +12717,48 @@ mod tests {
         assert!(call().is_none());
         assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
 
-        // 5. The complete set ships — and CLEARS the latch.
+        // 5. Every ROW artifact is present, but the CLUSTER ARTIFACT is not
+        //    (spec §5.6): still the same "missing" family, and still no
+        //    session — a joiner that adopted this floor would have no
+        //    membership, no schedule table and no settings.
         write_artifact(&root, 0, 1024, b"fsm-0 artifact");
         write_artifact(&root, 1, 2048, b"fsm-1 artifact bytes");
+        assert!(
+            call().is_none(),
+            "the rows cover the mask, but the cluster artifact does not exist yet"
+        );
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
+        // A published position whose FILE is absent is the same reason.
+        cluster_pos.store(4096, Ordering::Release);
+        assert!(
+            call().is_none(),
+            "the position is published, the file is not"
+        );
+        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
+
+        // 6. The complete set ships — and CLEARS the latch.
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        std::fs::write(
+            crate::cluster_agent::artifact_path(&cluster_dir, 4096),
+            b"cluster image",
+        )
+        .unwrap();
         let set = call().expect("a complete set ships");
         assert_eq!(
             set.services_declared, 0b11,
-            "the set covers the declared mask exactly"
-        );
-        assert_eq!(
-            set.config,
-            vec![0xC0, 0xFF, 0xEE],
-            "the CURRENT config rides along"
-        );
-        assert_eq!(
-            set.table,
-            (0, 0, Vec::new()),
-            "the schedule table no longer rides a SNAP_TABLE of its own — the \
-             wire field carries the honest 'no table' until task 9 puts the \
-             cluster artifact on the session (Ruling R4)"
+            "the set covers the declared mask exactly — and 255 is OUTSIDE it"
         );
         assert_eq!(
             set.artifacts
                 .iter()
                 .map(|a| (a.service_id, a.snapshot_pos, a.len))
                 .collect::<Vec<_>>(),
-            vec![(0u8, 1024u64, 14u64), (1, 2048, 20)],
+            vec![
+                (0u8, 1024u64, 14u64),
+                (1, 2048, 20),
+                (CLUSTER_ARTIFACT_ID, 4096, 13)
+            ],
+            "the cluster artifact is one more artifact, LAST"
         );
         assert_eq!(
             latch.load(Ordering::Relaxed),
@@ -12685,7 +12766,7 @@ mod tests {
             "a successful set resets the latch"
         );
 
-        // 6. ... so the NEXT decline of the same kind is named again.
+        // 7. ... so the NEXT decline of the same kind is named again.
         std::fs::remove_file(root.join("1").join("snap-2048.ultsnap")).unwrap();
         assert!(call().is_none());
         assert_eq!(
@@ -12708,12 +12789,27 @@ mod tests {
         let root = dir.path().join("snapshots");
         let cnc = test_cnc();
         let services = crate::services::ServicesConfig::none_for_tests();
-        let config_bytes = Mutex::new(Vec::new());
+        let cluster_pos = AtomicU64::new(4096);
+        let cluster_dir = dir.path().join("snapshots").join("cluster");
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        std::fs::write(
+            crate::cluster_agent::artifact_path(&cluster_dir, 4096),
+            b"cluster image",
+        )
+        .unwrap();
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
         cnc.snapshots().node_snapshot_floor.store_release(4096);
         cnc.service_slot(0).snapshot_pos.store_release(1024);
         write_artifact(&root, 0, 1024, b"fsm-0 artifact");
-        let set = snapshot_set_for(&cnc, &root, &services, &config_bytes, 7, &latch);
+        let set = snapshot_set_for(
+            &cnc,
+            &root,
+            &services,
+            &cluster_pos,
+            &cluster_dir,
+            7,
+            &latch,
+        );
         assert!(
             set.is_none(),
             "a none_for_tests node must never ship a snapshot set"

@@ -32,7 +32,6 @@ use uc_net::receiver::RefusalKind;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::identity::{FsmName, pack_version};
 use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
-use uc_protocol::v2::config::decode_config;
 use uc_protocol::v2::schedule::{
     ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
@@ -617,11 +616,13 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         "a fiat install is never pending — the cnc mirror must read clear"
     );
 
-    // M7 Task 6: the snapshot session carries the leader's config alongside its
-    // lineage (`SnapBeginBody.config`) — the joiner decodes + adopts it by fiat
-    // (`adopt_snapshot_config`) on install completion, so its `config_version`
-    // converges with the leader's PRE-SEEDED v1 (not the learner's own genesis
-    // v0) — a real cross-node version bump, not a trivial 0 == 0 coincidence.
+    // M7 Task 6 / cluster-FSM spec §5.6: the snapshot session carries the
+    // leader's membership alongside its lineage — inside the CLUSTER ARTIFACT
+    // now, not on every `SNAP_BEGIN` — and the joiner adopts it by fiat
+    // (`adopt_snapshot_config`, fed from the installed image) on install
+    // completion, so its `config_version` converges with the leader's
+    // PRE-SEEDED v1 (not the learner's own genesis v0) — a real cross-node
+    // version bump, not a trivial 0 == 0 coincidence.
     assert_eq!(
         voter.config_version(),
         1,
@@ -663,51 +664,45 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
          config — the snapshot-fiat install did not rebuild peer routing"
     );
 
-    // Final-review fix (Item 1): assert the SNAP_BEGIN config-carry cache
-    // itself converged — not just `config_version`/peer-routing, which are
-    // proxies. Before this fix, `maybe_adopt_incoming_snapshot`'s fiat-install
-    // block persisted the record and rebuilt peer routing but never refreshed
-    // `config_bytes`, so the joiner's cache would still hold ITS OWN stale
-    // boot-seed derivation (version 0, no `extra_learner_id`) rather than the
-    // leader's installed v1 config — meaning a below-floor rejoiner that later
-    // became leader would ship the WRONG config to the next joiner. Compare
-    // the decoded MEMBERSHIP content, not the raw bytes: `prev_position` is a
-    // deliberately audit-trail-only field (per `cluster_to_wire`'s doc) and
-    // legitimately differs here — the voter's cache carries its genuinely
-    // historical prev_position (0, from the pre-seeded record), while the
-    // joiner's fiat wholesale-replace install collapses prev_position to the
-    // installed floor itself (`rebuild_net_for_config(&cfg, pos)` — see the
-    // fiat-install call site's comment); the two are not supposed to match.
-    let voter_decoded =
-        decode_config(&voter.snapshot_config_bytes()).expect("voter's cached config must decode");
-    let learner_decoded = decode_config(&learner.snapshot_config_bytes())
-        .expect("joiner's cached config must decode");
+    // Cluster-FSM spec §5.6: assert the joiner's CLUSTER VIEW converged, not
+    // just `config_version`/peer-routing, which are proxies for it. This
+    // replaces the old `SnapBeginBody.config` cache assertion — with the carry
+    // retired there is no cache to go stale, and the view IS what a
+    // below-floor rejoiner that later becomes leader would ship on: the
+    // `uc2-cluster` agent freezes the same state into the next artifact.
+    //
+    // Compared field by field rather than as a whole `ClusterConfig`: this is
+    // the membership the joiner installed BY FIAT off the leader's image, so
+    // every member the leader knows must be in it, `extra_learner_id`
+    // included — which the joiner's own boot seed never contained.
+    let voter_membership = voter.cluster_view().membership();
+    let learner_membership = learner.cluster_view().membership();
     assert_eq!(
-        learner_decoded.version, voter_decoded.version,
-        "cache version must converge"
+        learner_membership.version, voter_membership.version,
+        "the installed view's version must converge"
     );
     assert_eq!(
-        learner_decoded.voters, voter_decoded.voters,
-        "cache voters must converge"
+        learner_membership.voters, voter_membership.voters,
+        "…its voters"
     );
     assert_eq!(
-        learner_decoded.learners, voter_decoded.learners,
-        "cache learners must converge"
+        learner_membership.learners, voter_membership.learners,
+        "…its learners"
     );
     assert_eq!(
-        learner_decoded.tombstones, voter_decoded.tombstones,
-        "cache tombstones must converge"
+        learner_membership.tombstones, voter_membership.tombstones,
+        "…and its tombstones"
     );
     assert_eq!(
-        learner_decoded.version, 1,
-        "decoded cache must carry the installed v1 config"
+        learner_membership.version, 1,
+        "the installed view carries the leader's v1 config"
     );
     assert!(
-        learner_decoded
+        learner_membership
             .learners
             .iter()
-            .any(|m| m.id == extra_learner_id),
-        "decoded cache must contain the extra learner from the installed config"
+            .any(|(id, _)| *id == extra_learner_id),
+        "…including the extra learner the joiner's own boot seed never had"
     );
 
     learner.stop();
@@ -1748,13 +1743,13 @@ impl JoinFixture {
 }
 
 /// The `fresh_learner_joins_a_purged_leader_via_snapshot_session` fixture,
-/// trimmed to what plan 3 needs (no pre-seeded config record, no routing
-/// assertions — those stay that test's job) and parameterised by the schedule
-/// table the voter adopts BEFORE it purges.
+/// trimmed to what the schedule-table capstones need (no pre-seeded config
+/// record, no routing assertions — those stay that test's job) and
+/// parameterised by the schedule table the voter adopts BEFORE it purges.
 ///
 /// The table frame therefore lands below the floor the learner adopts: the
 /// learner can never replay it, so a table it holds afterwards came off the
-/// session's `SNAP_TABLE` and nowhere else.
+/// session's CLUSTER ARTIFACT (spec §5.6) and nowhere else.
 fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     let dir = tempfile::Builder::new()
         .prefix("uc2-learner-sched-")
@@ -1880,16 +1875,15 @@ fn below_floor_join(app: &str, table: Option<&ScheduleTable>) -> JoinFixture {
     }
 }
 
-/// Plan 3 (spec §5), the headline: a fresh learner whose join is BELOW the
-/// leader's purge floor ends up holding the leader's schedule table — record
-/// for record — and with both of its entries ARMED.
+/// The headline (spec §5.6): a fresh learner whose join is BELOW the leader's
+/// purge floor ends up holding the leader's schedule table, record for record.
 ///
 /// The table frame is below the floor by construction (it is appended before
 /// the churn the purge destroys), so replay cannot be the source: the only
-/// path from the leader's record to the learner's is the session's
-/// `SNAP_TABLE` and the fiat install at the floor.
+/// path from the leader's record to the learner's is the CLUSTER ARTIFACT the
+/// session streams under id 255 and the `uc2-cluster` agent's fiat install of
+/// it, before the floor advances.
 #[test]
-#[ignore = "plan 1 task 9: the table rides the cluster artifact"]
 fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
     let _g = serialize();
     let table = two_far_future_entries();
@@ -1900,6 +1894,16 @@ fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
         want.table, table,
         "sanity: the voter's committed view holds the table this test applied"
     );
+    // …and so does the ARTIFACT the voter shipped, which is the thing that
+    // actually travelled: the artifact IS the content (no live read at ship
+    // time — the whole reason the `SNAP_TABLE` carry was retired).
+    let (shipped_position, shipped) = uc_node::cluster_agent::read_committed_table(&f.v_dir)
+        .expect("the voter's newest cluster artifact must be readable");
+    assert_eq!(
+        shipped, table,
+        "the voter's cluster artifact carries the table it shipped"
+    );
+    assert_eq!(shipped_position, want.table_position);
 
     // The install happens on the consensus agent at floor adoption, which the
     // catch-up wait above does not itself order against — poll for it.
@@ -1909,28 +1913,41 @@ fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
     let got = f.learner.cluster_view().snapshot_inner();
     assert_eq!(got.table, want.table, "…and the leader's table");
 
-    // Both entries are ARMED on the learner, not merely recorded: the fiat
-    // install runs `install_table`, and the consensus agent publishes the
-    // row's pending count into its cnc identity slot every pass.
+    // NOT armed, and that is the rule, not a gap: the row heap is LEADER-ONLY
+    // (spec §4.9) and this joiner is a learner, so it holds the table without
+    // a single timer instance in it. This is a LIVE reading, not the page's
+    // initial zero — the consensus agent republishes every declared row's
+    // pending count on EVERY pass (`publish_timers_pending`), so after a
+    // settle of many passes the word is whatever the row's heap holds.
+    //
+    // What arms it is a PROMOTION, and the end-to-end proof of that is
+    // `timers.rs`'s `a_promoted_below_floor_joiner_keeps_the_schedule_ticking_
+    // when_it_leads`: this same install, then a promotion, then real ticks.
     let l_cnc = CncPage::open_file(&f.l_dir.join("cnc2.dat"), "learner-sched").expect("open cnc");
-    await_until(30, "the learner armed both table entries", || {
-        l_cnc.service_slot(0).identity.timers_pending() == 2
-    });
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        assert_eq!(
+            l_cnc.service_slot(0).identity.timers_pending(),
+            0,
+            "the row heap is leader-only: a learner that installed a table must arm nothing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     f.stop();
 }
 
-/// Plan 3 (spec §5), the other half: a leader that has NEVER adopted a table
-/// still sends a `SNAP_TABLE` — carrying the wire's honest "no table",
-/// `(position 0, stamp 0, no bytes)`. Two things must hold, and the second is
-/// what the receiver's withhold rule puts at risk: the joiner installs the
-/// canonical no-table record, AND the session still completes.
+/// The other half (spec §5.6): a leader that has NEVER adopted a table still
+/// ships a CLUSTER ARTIFACT — one carrying an EMPTY table. Two things must
+/// hold, and the second is what the receiver's completion rule puts at risk:
+/// the joiner installs that empty-table image, AND the session still
+/// completes.
 ///
-/// The completion half is not a spare assertion — the receiver refuses to
-/// emit `SNAP_DONE` until a table has landed, so a sender that stayed silent
-/// for want of a table would wedge every joiner. The catch-up wait inside
-/// `below_floor_join` is that check: without the `SNAP_TABLE`, the learner
-/// never adopts the floor and never reaches the frontier.
+/// The completion half is not a spare assertion — the receiver refuses to emit
+/// `SNAP_DONE` until the cluster artifact has landed, so a leader that shipped
+/// a set without one would wedge every joiner. The catch-up wait inside
+/// `below_floor_join` is that check: without the artifact, the learner never
+/// adopts the floor and never reaches the frontier.
 #[test]
 fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
     let _g = serialize();
@@ -1945,10 +1962,32 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
             .is_empty(),
         "sanity: this leader never adopted a table"
     );
+    // What makes this non-vacuous — a fresh joiner's untouched genesis view
+    // ALSO reads "no table" — is the ordering the fixture already asserted: it
+    // waited for the learner to adopt the shipped floor
+    // (`archive_first_base() >= first_base`), and since spec §5.6 the floor is
+    // adopted only AFTER the `uc2-cluster` agent acknowledges installing the
+    // session's cluster artifact (`maybe_adopt_incoming_snapshot` returns early
+    // until then). So the state read here IS the installed image, and what it
+    // says is: the leader had no table, and neither does the joiner.
+    let installed = f.learner.cluster_view().snapshot_inner();
     assert_eq!(
-        f.learner.cluster_view().snapshot_inner().table_position,
-        0,
-        "and neither did the joiner — no table means no table position"
+        installed.table_position, 0,
+        "the installed image carries no table: schedule position 0"
+    );
+    assert!(installed.table.entries.is_empty(), "…and 0 entries in it");
+    // A regression canary, NOT discriminating on its own: the view's position
+    // tag moved off genesis. An install is the only way it can move on a joiner
+    // whose every CLUSTER frame is below the purged floor — but a CLUSTER frame
+    // arriving ABOVE the floor would move it too, so this corroborates the
+    // assertions above rather than proving them.
+    assert!(
+        f.learner
+            .cluster_view()
+            .position
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0,
+        "the joiner's cluster view never moved off genesis"
     );
 
     // Nothing is armed on the learner — and this is a LIVE reading, not the

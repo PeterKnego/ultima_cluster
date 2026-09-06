@@ -109,11 +109,13 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     write_read_probe_body(&mut b, &ReadProbeBody { nonce: 0x0102_0304_0506_0708, from: 2 });
     seeds.push(Seed::fixed("09-read-probe", datagram(DGRAM_KIND_READ_PROBE, 0, 3, &b)));
 
-    // SNAP_BEGIN with a NON-EMPTY config — the only variable-length body on
-    // this path, and the one whose `config_len` the reader must re-check
-    // against the buffer it actually got.
+    // A SNAP_BEGIN LONGER than the fixed part, carrying the retired
+    // `SNAP_BEGIN_LAYOUT_V3` discriminator (cluster-FSM spec §5.6 made the
+    // body fixed-length; the intermediate 0.7.0 shape appended
+    // `config_len ‖ config`). The decoder must still be total on it — it
+    // ignores the tail, and the NODE refuses it by its `layout`.
     let config = vec![0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-    let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
+    let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN];
     let mut identity = [0u64; 8];
     identity[0] = 0x0BAD_F00D_0000_0001;
     write_snap_begin_body(
@@ -126,10 +128,11 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
             total_len: 1 << 20,
             identity,
             version: [0; 8],
-            config,
         },
     );
-    seeds.push(Seed::fixed("10-snap-begin-config", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
+    b.extend_from_slice(&(config.len() as u16).to_le_bytes());
+    b.extend_from_slice(&config);
+    seeds.push(Seed::fixed("10-snap-begin-legacy-tail", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
     let mut b = [0u8; SNAP_NAK_BODY_LEN];
     write_snap_nak_body(&mut b, &SnapNakBody { session: 7, offset: 65536, length: 4096 });
@@ -156,10 +159,10 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("13-config-reply", datagram(DGRAM_KIND_CONFIG_REPLY, 0, 3, &b)));
 
-    // Wire 0.7.0: a MULTI-FSM SNAP_BEGIN — a non-zero `service_id`, two
-    // declared rows' identity hashes + versions, and no config, so the
-    // decoder's fixed part is exercised at exactly `SNAP_BEGIN_FIXED_LEN`
-    // (the 10- seed covers the config-carrying variable-length path).
+    // Wire 0.7.0: a MULTI-FSM SNAP_BEGIN — a non-zero `service_id` and two
+    // declared rows' identity hashes + versions, at exactly
+    // `SNAP_BEGIN_FIXED_LEN` (the 10- seed covers the longer-than-fixed
+    // legacy-tail path).
     let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN];
     let mut identity = [0u64; 8];
     identity[0] = 0x0BAD_F00D_0000_0001;
@@ -170,59 +173,34 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
         &mut b,
         &SnapBeginBody {
             session: 9,
-            layout: SNAP_BEGIN_LAYOUT_V3,
+            layout: SNAP_BEGIN_LAYOUT_V4,
             service_id: 2,
             snapshot_pos: 65536,
             total_len: 300 * 1024,
             identity,
             version,
-            config: vec![],
         },
     );
-    seeds.push(Seed::fixed("14-snap-begin-v3", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
+    seeds.push(Seed::fixed("14-snap-begin-v4", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
-    // Plan 3 (schedule table in snapshot): SNAP_TABLE (kind
-    // DGRAM_KIND_SNAP_TABLE = 21 — NOT the brief's literal 18, which is
-    // already `uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT`) carrying a
-    // real 3-entry encoded schedule table.
-    use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table};
-    let table = ScheduleTable {
-        entries: vec![
-            ScheduleEntry {
-                identity_hash: 0x0BAD_F00D_0000_0001,
-                timer_id: 1,
-                rule: ScheduleRule::Every { period_ns: 1_000_000_000, anchor_ns: 0 },
-            },
-            ScheduleEntry {
-                identity_hash: 0x0BAD_F00D_0000_0001,
-                timer_id: 2,
-                rule: ScheduleRule::DailyAt { secs_of_day: 3600 },
-            },
-            ScheduleEntry {
-                identity_hash: 0x0BAD_F00D_0000_0002,
-                timer_id: 1,
-                rule: ScheduleRule::Once { at_ns: 123_456_789 },
-            },
-        ],
-    };
-    let mut encoded = Vec::new();
-    encode_schedule_table(&table, &mut encoded);
-    let mut b = vec![0u8; SNAP_TABLE_FIXED_LEN + encoded.len()];
-    write_snap_table_body(
+    // Cluster-FSM spec §5.6: the CLUSTER ARTIFACT's own BEGIN — `service_id`
+    // 255, deliberately OUTSIDE the declared mask the same body advertises.
+    // `service_id` is a bare `u8` on the wire and 255 is the value a receiver
+    // must treat as the reserved artifact rather than as row 255.
+    let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+    write_snap_begin_body(
         &mut b,
-        &SnapTableBody { session: 7, position: 4096, time_ns: 99, table: encoded },
+        &SnapBeginBody {
+            session: 9,
+            layout: SNAP_BEGIN_LAYOUT_V4,
+            service_id: 255,
+            snapshot_pos: 131_072,
+            total_len: 1086,
+            identity,
+            version,
+        },
     );
-    seeds.push(Seed::fixed("15-snap-table", datagram(DGRAM_KIND_SNAP_TABLE, 0, 3, &b)));
-
-    // table_len one past the ceiling (SCHEDULE_HEADER_LEN +
-    // MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN + 1) — the reader's ceiling
-    // check, not the buffer-length check.
-    use uc_protocol::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
-    let over = SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN + 1;
-    let mut b = vec![0u8; SNAP_TABLE_FIXED_LEN + over];
-    b[4..12].copy_from_slice(&1u64.to_le_bytes()); // position != 0
-    b[20..22].copy_from_slice(&(over as u16).to_le_bytes());
-    seeds.push(Seed::fixed("16-snap-table-bad-len", datagram(DGRAM_KIND_SNAP_TABLE, 0, 3, &b)));
+    seeds.push(Seed::fixed("15-snap-begin-cluster", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
     seeds
 }

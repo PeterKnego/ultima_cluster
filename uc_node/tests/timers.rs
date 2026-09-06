@@ -1229,12 +1229,13 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// promoted to voter, wins the next election, and goes on firing the
 /// replicated schedule without a beat missed.
 ///
-/// The chain under test, end to end: the leader's `SNAP_TABLE` → the
-/// receiver's withhold-and-publish → the consensus agent's fiat
-/// `install_snapshot_table` → the row's armed heap → `fire_due_timers` on a
-/// node that has just taken the leadership. Break any link and the joiner
-/// leads with an empty table: the log goes silent and the ≥ 5 assertion below
-/// times out.
+/// The chain under test, end to end: the leader's CLUSTER ARTIFACT (spec
+/// §5.6 — `service_id` 255 on the snapshot session) → the receiver's
+/// withhold-and-route → the `uc2-cluster` agent's fiat `install_from` and the
+/// view it publishes → the consensus agent's `refresh_from_view` arming the
+/// row's heap → `fire_due_timers` on a node that has just taken the
+/// leadership. Break any link and the joiner leads with an empty table: the
+/// log goes silent and the ≥ 5 assertion below times out.
 ///
 /// **Why the joiner wins the election deterministically.** Two things, both
 /// necessary. (1) The election windows are skewed ~30x — the joiner's timer
@@ -1263,7 +1264,6 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// timing-sensitivity flake, not a schedule-table defect; re-run to confirm
 /// before suspecting the chain under test.
 #[test]
-#[ignore = "plan 1 task 9: the table rides the cluster artifact"]
 fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     let _g = serialize();
     let dir = tempdir();
@@ -1416,8 +1416,8 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     );
 
     // ---- and it holds the leader's table. The frame is below the floor it
-    // ---- just adopted, so the session carrying the CLUSTER ARTIFACT (plan 1
-    // ---- task 9) is the only way these entries could be here.
+    // ---- just adopted, so the session's CLUSTER ARTIFACT (spec §5.6) is the
+    // ---- only way these entries could be here.
     let want = nodes[leader]
         .node
         .as_ref()
@@ -1430,9 +1430,20 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     });
     let got = j_node.cluster_view().snapshot_inner();
     assert_eq!(got.table, want.table, "and the leader's table");
-    wait_until("the joiner armed the table entry", || {
-        j_cnc.service_slot(0).identity.timers_pending() == 1
-    });
+    // …and arms NOTHING while it is a learner: the row heap is leader-only
+    // (spec §4.9). A live reading, not the page's initial zero — the consensus
+    // agent republishes every declared row's pending count on every pass, so
+    // after a settle of many passes this word is whatever the heap holds. The
+    // arming is the PROMOTION's job, and the ticks below are its proof.
+    let settle = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < settle {
+        assert_eq!(
+            j_cnc.service_slot(0).identity.timers_pending(),
+            0,
+            "a learner that installed a table must arm nothing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // ---- promote it. Poll the leader's own view of its catch-up first, so
     // ---- the promote is a decision and not a retry loop.

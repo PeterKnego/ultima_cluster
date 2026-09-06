@@ -105,9 +105,6 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_open_failed_total",
     "uc2_snapshot_intake_abandoned_total",
     "uc2_snapshot_begin_undecodable_total",
-    // Time-and-timers plan 3: stray SNAP_TABLE datagrams (see the family's
-    // own HELP text below for what "stray" means).
-    "uc2_snapshot_table_stray_total",
     "uc2_reports_implausible_total",
     "uc_crypto_handshake_failures_total",
     "uc2_sender_seal_failures_total",
@@ -847,12 +844,6 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
-        "uc2_snapshot_table_stray_total",
-        "Episodes of stray SNAP_TABLE datagrams (the schedule table a snapshot session carries) — a table belonging to no session this node is receiving: a refused or unknown session (no intake open), a different peer, or a different session id. Counted once per episode, not per datagram: the leader re-sends BEGIN+TABLE every 20 ms for its 30 s session timeout, so a per-datagram count would measure that cadence. Expected re-sends (a table for the intake that already has one, or for the session just completed) are not counted at all. Nonzero usually means this node REFUSED the session — read it with uc2_snapshot_refused_declared_set_total / _version_total / _legacy_peer_total, which name why — and otherwise means a leader and this node disagree about which session is live, or a datagram is being injected.",
-        s.receiver.snap_table_stray.load(Ordering::Relaxed),
-    );
-    push_counter(
-        &mut out,
         "uc2_reports_implausible_total",
         "Durable reports declined for disagreeing with this node's term map.",
         s.reports_implausible.load(Ordering::Relaxed),
@@ -1536,20 +1527,6 @@ mod tests {
         );
         assert!(
             text.contains("uc2_snapshot_begin_undecodable_total 7\n"),
-            "{text}"
-        );
-    }
-
-    /// Time-and-timers plan 3: the stray-SNAP_TABLE counter renders off its
-    /// own receiver cell (a value no neighbouring counter carries, so a
-    /// copy-pasted field is caught).
-    #[test]
-    fn the_stray_snapshot_table_counter_renders_from_its_own_stats_cell() {
-        let s = synthetic_sources();
-        s.receiver.snap_table_stray.fetch_add(9, Ordering::Relaxed);
-        let text = render_prometheus(&s);
-        assert!(
-            text.contains("uc2_snapshot_table_stray_total 9\n"),
             "{text}"
         );
     }

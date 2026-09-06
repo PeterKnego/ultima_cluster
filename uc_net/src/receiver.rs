@@ -2354,7 +2354,11 @@ impl FollowerReceiver {
     /// cluster artifact to the `uc2-cluster` agent, and signal the floor — the
     /// MINIMUM over the received positions, which is exactly the node floor
     /// the leader shipped from, so every FSM's own artifact sits at or above
-    /// it.
+    /// it. The CLUSTER ARTIFACT is in that minimum too (spec §5.6): a leader
+    /// only writes one once every declared row has snapshotted, so in practice
+    /// it sits above the rows' minimum and does not move the floor — and if it
+    /// ever did not, taking the lower value is the conservative direction
+    /// (more journal retained, never a row stranded below its own artifact).
     fn snap_complete(&mut self) {
         let Some(intake) = self.snap_intake.take() else {
             return;
