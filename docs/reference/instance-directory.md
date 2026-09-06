@@ -78,14 +78,16 @@ row below is never copied and never needs to be: a node's next boot recreates
 every file in it unconditionally, whether after an ordinary restart or after
 a restore.
 
-**`snapshots/cluster/` is not copied by `backup` (2.11 pending).** The copy
-walks `snapshots/<id>/` for the numeric ids present, so the cluster artifact is
-skipped, and a restore therefore rebuilds the cluster FSM from its genesis seed
-plus the restored journal's `CLUSTER` frames. That is correct wherever the
-journal still reaches genesis, which is the case a `verify-backup` already
-checks; a restore from a purged journal is the case where it is not, and the
-remedy is a re-`apply` of the schedule table and the settings record. Recorded
-here rather than left to be discovered.
+**`snapshots/cluster/` is copied by `backup` (2.11 pending)**, as an artifact
+family of its own beside the numeric `snapshots/<id>/` ones — `cluster` is not
+a `u8`, so the two are walked separately. `verify-backup` decodes the newest
+`snap-<pos>.ultcluster` through the same image decoder a joiner installs it
+with (magic, image version, CRC32, every bounds check) and refuses a corrupt
+one by name; where the family is present and the journal is purged, its newest
+artifact must cover `first_base`, reported as `hole: service 255`. A purged
+journal with **no** cluster family is deliberately not a hole: a node
+legitimately purges under its rows' floor alone in the window before the
+`uc2-cluster` agent writes its first artifact.
 
 The durable paths all live under the instance directory, so the directory as a
 whole must sit on a real filesystem. An instance directory on `tmpfs` makes
