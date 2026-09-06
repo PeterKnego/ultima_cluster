@@ -4401,9 +4401,10 @@ impl Consensus {
         Ok(position)
     }
 
-    /// The DECLARED rows' identity hashes — the cluster FSM's one node-local
-    /// input (spec §3.3), fixed at boot and identical cluster-wide by the
-    /// bootstrap boundary. Derived from `self.timers`, which holds exactly one
+    /// The DECLARED rows' identity hashes — the leader's DOOR input only
+    /// (spec §3.3, Ruling R24): `[services] names` is node-local, so the
+    /// replicated `apply` never reads it (`validate_replicated`); only this
+    /// pre-append check does. Derived from `self.timers`, which holds exactly one
     /// entry per declared row keyed by that row's `FsmName` hash, so this is
     /// the same set `cluster_agent`'s own `ClusterFsm` was built with
     /// (`ServicesConfig::identity_hashes`, non-zero entries).
@@ -4411,11 +4412,12 @@ impl Consensus {
         self.timers.iter().flatten().map(|t| t.hash()).collect()
     }
 
-    /// The leader's PRE-APPEND acceptance check (spec §4.4, Ruling R5): run
-    /// the FSM's own `validate` against the newest COMMITTED state this node
-    /// can see, so the admin request is answered with the same verdict every
-    /// replica's apply loop will reach. ONE acceptance function, never a
-    /// parallel node-side copy of it.
+    /// The leader's PRE-APPEND acceptance check (spec §4.4, Rulings R5, R24):
+    /// run the FSM's own `validate` against the newest COMMITTED state this
+    /// node can see. It is `validate_replicated` (what every replica's apply
+    /// loop runs — one acceptance function, never a parallel node-side copy)
+    /// PLUS the door-only declared-hash check (43), which is node-local and
+    /// therefore refused here, never at apply time.
     ///
     /// NOT applied to `Membership`: that kind's acceptance is the kernel's
     /// (`ElectionSm::propose_config`, at durable time against the ADOPTED
@@ -5708,11 +5710,12 @@ impl Consensus {
         let Some(table) = decode_schedule_table(&bytes) else {
             return self.refuse_schedule(REASON_SCHEDULE_DECODE);
         };
-        // Spec §4.4 / Ruling R5: the FSM's OWN acceptance function, run
-        // against the committed view — `REASON_SCHEDULE_UNKNOWN_FSM` (43) and
-        // `REASON_SCHEDULE_DECODE` (42, an over-long table) come back from
-        // `ClusterRefusal::reason_code`, so the leader's answer and a
-        // replica's apply-time refusal cannot drift apart.
+        // Spec §4.4 / Rulings R5, R24: the FSM's OWN acceptance function, run
+        // against the committed view — `REASON_SCHEDULE_DECODE` (42, an
+        // over-long table) is replicated (a replica's apply refuses it the
+        // same way), while `REASON_SCHEDULE_UNKNOWN_FSM` (43) is DOOR-ONLY:
+        // the declared set is node-local, so a committed table naming an
+        // undeclared row is adopted by every replica and simply never arms here.
         let cmd = ClusterCommand::ScheduleTable(table);
         if let Err(reason) = self.validate_cluster_command(&cmd) {
             return self.refuse_schedule(reason);
