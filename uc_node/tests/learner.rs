@@ -81,34 +81,89 @@ fn command_instant(node: &Node) -> u64 {
 /// the retained `[P, append)` tail a below-floor joiner must replay once it
 /// has installed the set. That tail is the property the old hand-picked
 /// `durable / 2` floor provided.
+///
+/// # Why it RETRIES (fix round 1)
+///
+/// An instant commanded while the `uc2-cluster` agent is LAPPING is abandoned
+/// — by design, and it never completes however long you wait. These fixtures
+/// run a 256 KiB ring and push megabytes through it, so that agent overruns
+/// and catches up through the journal (Ruling R18), and
+/// `ClusterAgent::replay_from_journal` deliberately does **not** act on a
+/// `FRAME_TYPE_SNAPSHOT` frame buried in a catch-up span (see its comment:
+/// freezing at an instant the agent is already past would tag a stale
+/// artifact). The frame is consumed, the cursor moves past it, and no cluster
+/// artifact is ever written at that P.
+///
+/// That is spec §10's documented outcome — "a row never reaches P: the set
+/// stays incomplete; the next instant supersedes it" — with the cluster row
+/// as the row that missed. In production the cadence supersedes on its own;
+/// here the fixture does what the operator would, and
+/// `command_snapshot_operator` (which `Node::command_snapshot` runs) always
+/// supersedes. Each attempt leaves the agent's cursor further forward, so
+/// once the ring stops lapping the next attempt is walked LIVE and freezes.
+///
+/// Reproduced at 1 run in 20 of
+/// `a_joiner_whose_rows_are_named_in_the_other_order_…` before the retry:
+/// `P=695328 set=0 cluster_artifact=0 view=0 append=commit=durable=1536256`,
+/// i.e. the whole log durable and committed with the agent's artifact still
+/// at 0 — a stall, not slowness, which is why the wait stays at 30 s per
+/// attempt rather than being widened.
 fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]) -> u64 {
     for &row in rows {
         let slot = cnc.service_slot(row as usize);
         slot.status
             .store_release(slot.status.load_acquire() | CNC_SVC_STATUS_SNAPSHOT_CAPABLE);
     }
-    let p = command_instant(node);
-    for &row in rows {
-        let snap_dir = v_dir.join("snapshots").join(row.to_string());
-        std::fs::create_dir_all(&snap_dir).unwrap();
-        std::fs::write(
-            snap_dir.join(format!("snap-{p}.ultsnap")),
-            vec![0x5Au8; 4096],
-        )
-        .unwrap();
-        cnc.service_slot(row as usize).snapshot_pos.store_release(p);
+    const ATTEMPTS: usize = 5;
+    for attempt in 1..=ATTEMPTS {
+        let p = command_instant(node);
+        for &row in rows {
+            let snap_dir = v_dir.join("snapshots").join(row.to_string());
+            std::fs::create_dir_all(&snap_dir).unwrap();
+            std::fs::write(
+                snap_dir.join(format!("snap-{p}.ultsnap")),
+                vec![0x5Au8; 4096],
+            )
+            .unwrap();
+            cnc.service_slot(row as usize).snapshot_pos.store_release(p);
+        }
+        // Observability only since spec §5.3, but `uc2ctl status` and the
+        // backup report read it — keep it truthful.
+        cnc.snapshots().service_snapshot_pos.store_release(p);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if node.snapshot_set_position() >= p {
+                return p;
+            }
+            std::thread::yield_now();
+        }
+        let c = node.counters();
+        let state: Vec<(u8, u64, u64)> = rows
+            .iter()
+            .map(|&r| {
+                (
+                    r,
+                    cnc.service_slot(r as usize).snapshot_pos.load_acquire(),
+                    cnc.service_slot(r as usize).applied.load_acquire(),
+                )
+            })
+            .collect();
+        eprintln!(
+            "instant {p} abandoned (attempt {attempt}/{ATTEMPTS}): set={} cluster_artifact={} \
+             append={} commit={} durable={} rows(row,snapshot_pos,applied)={state:?} \
+             — the uc2-cluster agent was catching up through the journal and skipped the \
+             SNAPSHOT frame (spec §10); superseding",
+            node.snapshot_set_position(),
+            node.cluster_snapshot_position(),
+            c.append.load_acquire(),
+            c.commit.load_acquire(),
+            c.durable.load_acquire(),
+        );
     }
-    // Observability only since spec §5.3, but `uc2ctl status` and the backup
-    // report read it — keep it truthful.
-    cnc.snapshots().service_snapshot_pos.store_release(p);
-    // 60 s, not 30: the `uc2-cluster` agent has to WALK to P before it can
-    // freeze, and its walk is paced by `min(commit, durable)` behind whatever
-    // traffic this fixture is pushing. Measured flaking at 30 s on a loaded
-    // box while the rest of this file's cluster tests ran alongside.
-    await_until(60, "the set at the instant completed", || {
-        node.snapshot_set_position() >= p
-    });
-    p
+    panic!(
+        "no instant completed in {ATTEMPTS} attempts — the uc2-cluster agent never caught up \
+         to the live ring, which is NOT the documented abandonment this retry covers"
+    );
 }
 
 /// Wire 0.7.0 (Ruling 1): `snapshot_set_for` now declines outright for a

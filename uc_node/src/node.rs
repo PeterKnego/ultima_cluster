@@ -723,6 +723,13 @@ pub struct Node {
     snapshot_set_position: Arc<AtomicU64>,
     /// Spec §9: the last instant this node commanded (leader-local).
     snapshot_instant_pub: Arc<AtomicU64>,
+    /// Spec §9: per-row missed-instant counters, and the count of abandoned
+    /// instants. Read-only here; the consensus agent owns the writes.
+    snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES],
+    snapshot_instants_abandoned: Arc<AtomicU64>,
+    /// Spec §5.3: the `uc2-cluster` agent's newest artifact position — the
+    /// candidate P of every completeness poll.
+    cluster_snapshot_pos: Arc<AtomicU64>,
     /// Ingress admission budget (`append - commit`), mirrored from
     /// `NodeConfig` so `submit` (the in-process path) enforces the same
     /// door as the client ring drain.
@@ -1269,6 +1276,7 @@ impl Node {
         let snapshot_instant_pub = Arc::new(AtomicU64::new(0));
         let snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES] =
             std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
+        let snapshot_instants_abandoned = Arc::new(AtomicU64::new(0));
         // Spec §5.5: `Node::command_snapshot`'s request channel. Depth 1 —
         // one operator command at a time; a second concurrent caller is
         // answered `retry`, which is what it would get from the single-in-
@@ -1802,7 +1810,7 @@ impl Node {
             snapshot_set_position: Arc::clone(&snapshot_set_position),
             snapshot_instant_pub: Arc::clone(&snapshot_instant_pub),
             snapshot_row_incomplete: snapshot_row_incomplete.clone(),
-            snapshot_instants_abandoned: Arc::new(AtomicU64::new(0)),
+            snapshot_instants_abandoned: Arc::clone(&snapshot_instants_abandoned),
             snapshot_interval_bytes: 0,
             snapshot_target_learners: false,
             snap_root: snap_root.clone(),
@@ -1836,6 +1844,9 @@ impl Node {
             snapshot_cmd_tx,
             snapshot_set_position,
             snapshot_instant_pub,
+            snapshot_row_incomplete,
+            snapshot_instants_abandoned,
+            cluster_snapshot_pos,
             admission_bytes: cfg.admission_bytes_default,
             fsm_door: fsm_lag_eff,
             buffer,
@@ -2097,6 +2108,32 @@ impl Node {
     /// reading is whatever it last commanded in some earlier term.
     pub fn snapshot_instant_position(&self) -> u64 {
         self.snapshot_instant_pub.load(Ordering::Relaxed)
+    }
+
+    /// Spec §9: `uc2_snapshot_row_incomplete_total{row}` — how many instants
+    /// row `row` failed to reach before being superseded. `0` for an
+    /// undeclared row.
+    pub fn snapshot_row_incomplete(&self, row: u8) -> u64 {
+        self.snapshot_row_incomplete
+            .get(row as usize)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Spec §10: instants this node abandoned — one per supersession of an
+    /// incomplete instant, whatever the number of rows that missed it. The
+    /// deterministic companion to the `snapshot_instant_abandoned` record.
+    pub fn snapshot_instants_abandoned(&self) -> u64 {
+        self.snapshot_instants_abandoned.load(Ordering::Relaxed)
+    }
+
+    /// Spec §5.3: the position of the newest artifact the `uc2-cluster` agent
+    /// has written — one member of every set, and the candidate P the
+    /// completeness poll compares each declared row against. Diagnostic: a
+    /// set that is not completing is either this word lagging (the agent has
+    /// not walked to P) or a row's slot disagreeing with it.
+    pub fn cluster_snapshot_position(&self) -> u64 {
+        self.cluster_snapshot_pos.load(Ordering::Acquire)
     }
 
     /// Partition handles for every one of the node's outbound sockets (receiver,
@@ -4241,6 +4278,22 @@ impl Consensus {
                 .node_snapshot_floor
                 .store_release(service_pos);
             self.snapshot_persisted_floor = service_pos;
+            // Ruling P1 (fix round 1): retention runs HERE — below the floor
+            // this pass just PUBLISHED — not on the completion edge.
+            //
+            // The ship gate reads the persisted `node_snapshot_floor`, and
+            // this persist is throttled to `OUTPUT_PROGRESS_FLOOR_NS`. Pruning
+            // at completion instead would open a window of up to that
+            // throttle in which the floor still names P1 while P1's artifacts
+            // have already been unlinked in favour of P2 — every session in
+            // that window declines `SNAP_DECLINE_MISSING`, and a joiner
+            // re-NAKs into it. Pruning below the published floor cannot
+            // produce that state: the set the floor names is, by definition,
+            // at or above the cut.
+            //
+            // Still rare and still off the hot path: this branch runs only
+            // when the floor actually moved, which is once per complete set.
+            self.prune_snapshots_below(service_pos);
             did = true;
         }
         if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
@@ -4668,6 +4721,14 @@ impl Consensus {
     /// Nothing is mutated until the append SUCCEEDS, so every refusal — and a
     /// momentarily full buffer — leaves this agent byte-for-byte unchanged
     /// and the whole request retryable.
+    ///
+    /// **What the cadence's clock actually is** (accepted by the controller,
+    /// and a fact `docs/` should carry): `snapshot_last_commanded_bytes`
+    /// tracks the last *commanded* instant, not the last *complete* one as
+    /// spec §5.5's prose says, and it is re-based to the append frontier at
+    /// every leader open so election churn cannot become a snapshot storm.
+    /// Both make the cadence err LATE (a longer gap than asked for) and never
+    /// early, which is the safe side for a knob whose only cost is disk.
     fn command_snapshot_inner(
         &mut self,
         standby: bool,
@@ -4831,12 +4892,6 @@ impl Consensus {
             node = self.id as u64,
             position = p
         );
-        // Ruling P1: retention is NODE-owned and runs HERE, on the completion
-        // branch only — never after an individual freeze, where a per-writer
-        // "keep the newest N" sweep cannot see sets and two abandoned
-        // instants could delete the very artifact the newest complete set is
-        // made of.
-        self.prune_snapshots_below(p);
     }
 
     /// Spec §5.3 (Ruling P1): the node-owned, **delete-only** retention
@@ -9455,6 +9510,96 @@ mod tests {
         assert_eq!(
             h.cons.snapshot_instants_abandoned.load(Ordering::Relaxed),
             2
+        );
+    }
+
+    /// Ruling P1 as amended in fix round 1: retention prunes below the floor
+    /// this node has PUBLISHED, not below the newest complete set.
+    ///
+    /// The two differ for as long as `maybe_persist_snapshot_floor`'s fsync
+    /// throttle holds a completed set back, and the ship gate
+    /// (`snapshot_set_for`) reads the published floor — so pruning on the
+    /// completion edge would leave a window in which the floor names P1 while
+    /// P1's artifacts are already unlinked, and every snapshot session opened
+    /// in it declines `SNAP_DECLINE_MISSING`.
+    #[test]
+    fn retention_waits_for_the_floor_to_publish_and_never_outruns_the_ship_gate() {
+        let mut h = harness_with_rows(&["a"]);
+        let p1 = 4096u64;
+        let p2 = 6016u64;
+        // Two complete sets' worth of artifacts on disk, plus a `.tmp` the
+        // sweep must never touch and a foreign file it must ignore.
+        for p in [p1, p2] {
+            let row = h.cons.snap_root.join("0");
+            std::fs::create_dir_all(&row).unwrap();
+            std::fs::write(row.join(format!("snap-{p}.ultsnap")), b"row").unwrap();
+            std::fs::create_dir_all(&h.cons.cluster_snapshot_dir).unwrap();
+            std::fs::write(
+                h.cons
+                    .cluster_snapshot_dir
+                    .join(format!("snap-{p}.ultcluster")),
+                b"cluster",
+            )
+            .unwrap();
+        }
+        let row_dir = h.cons.snap_root.join("0");
+        std::fs::write(row_dir.join(format!("snap-{p2}.ultsnap.tmp")), b"building").unwrap();
+        std::fs::write(row_dir.join("notes.txt"), b"an operator's").unwrap();
+        let names = |d: &std::path::Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+
+        // The set at p1 completes AND its floor publishes: nothing below it,
+        // so nothing goes.
+        h.row_froze_at(0, p1);
+        h.cluster_snapshot_pos.store(p1, Ordering::Release);
+        h.cons.check_set_completeness();
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, p1);
+        assert!(names(&row_dir).contains(&format!("snap-{p1}.ultsnap")));
+
+        // The set at p2 completes, but the fsync throttle holds the floor at
+        // p1. p1's artifacts MUST survive — the ship gate is still pointing
+        // at them.
+        h.row_froze_at(0, p2);
+        h.cluster_snapshot_pos.store(p2, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), p2);
+        h.cons.maybe_persist_snapshot_floor(); // throttled: no floor move
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, p1,
+            "the throttle is what this test is about"
+        );
+        assert!(
+            names(&row_dir).contains(&format!("snap-{p1}.ultsnap")),
+            "the artifacts at the PUBLISHED floor must outlive a newer set: {:?}",
+            names(&row_dir)
+        );
+
+        // ...and go the moment the floor actually moves to p2.
+        h.advance_floor_timer();
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, p2);
+        assert_eq!(
+            names(&row_dir),
+            vec![
+                format!("notes.txt"),
+                format!("snap-{p2}.ultsnap"),
+                format!("snap-{p2}.ultsnap.tmp"),
+            ],
+            "exact names only: the `.tmp` a builder may still be writing and a \
+             foreign file are both invisible to the sweep"
+        );
+        assert_eq!(
+            names(&h.cons.cluster_snapshot_dir),
+            vec![format!("snap-{p2}.ultcluster")]
         );
     }
 
