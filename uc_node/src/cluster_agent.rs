@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use uc_journal::Journal;
+use uc_log::archive::replay_journal_from;
 use uc_log::buffer::LogBuffer;
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
@@ -95,12 +97,12 @@ pub struct ClusterAgent {
     /// unconditionally on every idle cycle would spend the "explained"
     /// credit before an Overrun ever needed it).
     last_prime_gen: u64,
-    /// Set the first time this follower EVER makes forward progress (a
-    /// resync, a `CaughtUp`, or a successful `Frames` batch) since
-    /// construction; never cleared again. See `do_work`'s Overrun arm for
-    /// why the fail-stop panic is gated on this rather than firing on every
-    /// Overrun a fresh generation doesn't explain (Ruling R11, fix round 2).
-    made_progress: bool,
+    /// Ruling R12: the SAME journal handle the archive agent records into
+    /// (`Archive::journal_arc`). The appender never overwrites bytes the
+    /// archive has not yet recorded, so a live overrun (no prime explains
+    /// it) always has its missing frames retained here — `do_work`'s Overrun
+    /// arm replays from it instead of fail-stopping the node.
+    journal: Arc<Journal>,
 }
 
 impl ClusterAgent {
@@ -109,7 +111,9 @@ impl ClusterAgent {
     /// the recovered artifact's position and updated (Release) by
     /// [`Self::take_snapshot`]; the consensus agent (task 5) reads it.
     /// `prime_generation` (Ruling R11) is the node-wide re-prime generation
-    /// counter, shared with `uc_net::receiver`.
+    /// counter, shared with `uc_net::receiver`. `journal` (Ruling R12) is
+    /// the archive's own journal handle (`Archive::journal_arc`), the
+    /// fallback source for a live overrun with no explaining prime.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<LogBuffer>,
@@ -120,6 +124,7 @@ impl ClusterAgent {
         start: u64,
         cluster_snapshot_pos: Arc<AtomicU64>,
         prime_generation: Arc<AtomicU64>,
+        journal: Arc<Journal>,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
@@ -139,7 +144,7 @@ impl ClusterAgent {
             out: Vec::new(),
             prime_generation,
             last_prime_gen,
-            made_progress: false,
+            journal,
         }
     }
 
@@ -183,10 +188,7 @@ impl ClusterAgent {
             // this thread on the same cycle).
             let gen0 = self.prime_generation.load(Ordering::Acquire);
             match self.follower.next_batch(head) {
-                Batch::CaughtUp => {
-                    self.made_progress = true;
-                    break;
-                }
+                Batch::CaughtUp => break,
                 Batch::Overrun => {
                     // Recheck (the same belt-and-suspenders the receiver's
                     // DATA arm uses at its own Overrun-adjacent site): a
@@ -194,29 +196,8 @@ impl ClusterAgent {
                     // execution may not yet have been visible in `gen0`.
                     let gen1 = self.prime_generation.load(Ordering::Acquire);
                     let primed = gen0 != self.last_prime_gen || gen1 != self.last_prime_gen;
-                    // Fix round 2 (Ruling R11 follow-up): a fleet-scale
-                    // finding, not a synthetic corner — this agent has no
-                    // admission door (spec §4.1, "outside the lag policy"),
-                    // and the shared ring holds EVERY frame type, not just
-                    // CLUSTER ones. A write-heavy workload on a small ring
-                    // (`uc_node/tests/learner.rs`'s 24k-submit setup, 256 KiB
-                    // buffer) reliably overruns a live, healthy leader's OWN
-                    // cluster agent with NO prime anywhere in sight — plain
-                    // scheduling arithmetic, not a stuck thread. Gating the
-                    // panic on `primed` ALONE fail-stops perfectly healthy
-                    // nodes under ordinary load, which is worse than the
-                    // resync it replaces. `made_progress` narrows the panic
-                    // to what it can actually still prove: a reader that has
-                    // NEVER once caught up or read a frame, overrunning with
-                    // no prime to explain it — i.e. broken from birth (a
-                    // misconfigured buffer/cnc pairing), not merely slow.
-                    // Once any progress has been observed, an unexplained
-                    // Overrun is resynced like every other one; task 9's
-                    // artifact-carrying snapshot install removes the need
-                    // for any of this by replacing replay with an install.
-                    if primed || self.made_progress {
+                    if primed {
                         self.last_prime_gen = gen1;
-                        self.made_progress = true;
                         // Below the buffer: a below-floor joiner (a fresh
                         // learner, a wipe-and-rejoin) has its counters primed
                         // straight to the installed snapshot's position by
@@ -238,17 +219,30 @@ impl ClusterAgent {
                             head = head
                         );
                         self.follower.cursor = head;
-                        break;
+                    } else {
+                        // Ruling R12: no prime explains this. Fix round 2
+                        // found that fail-stopping here anyway punishes a
+                        // perfectly healthy node — this agent has no
+                        // admission door (spec §4.1, "outside the lag
+                        // policy") and the shared ring holds every frame
+                        // type, so ordinary heavy write throughput on a
+                        // small ring can outrun it with no prime in sight.
+                        // But the appender never overwrites bytes the
+                        // archive has not recorded, so every frame this
+                        // agent missed is still in the journal — replay it
+                        // from there instead of resyncing blind or
+                        // panicking. This converges: if the buffer's base is
+                        // still above the cursor afterward, the next
+                        // `next_batch` overruns again and replays again,
+                        // because the journal is always ahead of the
+                        // buffer's base.
+                        if self.replay_from_journal(head) {
+                            applied_any = true;
+                        }
                     }
-                    // Never once made progress, and no prime explains this:
-                    // broken from birth, the fail-stop the brief specified.
-                    panic!(
-                        "uc2-cluster: log buffer overrun at {}",
-                        self.follower.cursor
-                    );
+                    break;
                 }
                 Batch::Frames(iter) => {
-                    self.made_progress = true;
                     for (pos, hdr, payload) in iter {
                         if hdr.frame_type != FRAME_TYPE_CLUSTER {
                             continue; // yielded, not applied: the mirror image of the user loop
@@ -276,6 +270,80 @@ impl ClusterAgent {
             self.view.publish(self.fsm.state());
         }
         self.bridging_trigger();
+        applied_any
+    }
+
+    /// Ruling R12: a live overrun with no explaining prime degrades to
+    /// journal replay, exactly as the service's apply loop does below the
+    /// floor. Walks `uc_log::archive::replay_journal_from` from
+    /// `self.follower.cursor`, applying every `FRAME_TYPE_CLUSTER` frame
+    /// through the FSM with the same frame-END `ApplyCtx` the live path
+    /// uses, and stops at the first frame whose END exceeds `head` — never
+    /// applying an uncommitted frame. Advances `self.follower.cursor` to
+    /// wherever the replay actually reached (which then resumes reading
+    /// from the live buffer on the next cycle). Returns whether anything
+    /// was applied. Panics only if the journal replay itself errors (an
+    /// `ArchiveError`) — a fail-stop in the archive's own class.
+    fn replay_from_journal(&mut self, head: u64) -> bool {
+        let from = self.follower.cursor;
+        let mut replay = match replay_journal_from(&self.journal, from) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                // Below the journal's own retained floor (purged) — R12
+                // doesn't cover this edge (it assumes the journal always
+                // has what the live buffer no longer does, which holds
+                // absent purge). Task 9's artifact-carrying snapshot
+                // install is the real fix for a below-floor node; until
+                // then there is nothing left to replay, so resync forward
+                // (the same interim posture as a prime) rather than wedge
+                // the node forever on an unreadable gap.
+                crate::obs_event!(
+                    Warn,
+                    "cluster_agent_journal_replay_gap_purged",
+                    from = from,
+                    head = head
+                );
+                self.follower.cursor = head;
+                return false;
+            }
+            Err(e) => {
+                panic!("uc2-cluster: log buffer overrun at {from} (journal replay: {e})")
+            }
+        };
+        let mut cursor = from;
+        let mut frames = 0u64;
+        let mut applied_any = false;
+        loop {
+            match replay.next() {
+                Ok(Some(rf)) => {
+                    let end = rf.position + align_frame_len(rf.header.length as usize) as u64;
+                    if end > head {
+                        break; // never apply an uncommitted frame
+                    }
+                    cursor = end;
+                    if rf.header.frame_type == FRAME_TYPE_CLUSTER {
+                        let mut ctx = ApplyCtx::new(end, ClusterFsm::IDENTITY)
+                            .with_time(rf.header.time_ns)
+                            .with_term(rf.header.leadership_term_id);
+                        self.fsm.apply(&mut ctx, &rf.payload, &mut self.out);
+                        applied_any = true;
+                        frames += 1;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    panic!("uc2-cluster: log buffer overrun at {cursor} (journal replay: {e})")
+                }
+            }
+        }
+        self.follower.cursor = cursor;
+        crate::obs_event!(
+            Warn,
+            "cluster_agent_journal_replay",
+            from = from,
+            to = cursor,
+            frames = frames
+        );
         applied_any
     }
 
@@ -354,6 +422,7 @@ impl ClusterAgent {
 #[cfg(test)]
 mod tests {
     use uc_consensus::config::{Addr, ClusterConfig};
+    use uc_log::archive::{Archive, ArchiveConfig};
     use uc_log::buffer::LogBuffer;
     use uc_log::cnc::{CncMeta, CncPage};
     use uc_log::region::Region;
@@ -363,6 +432,17 @@ mod tests {
     use uc_protocol::v2::settings::{Settings, encode_settings};
 
     use super::*;
+
+    /// A journal with nothing recorded — for tests that need a valid
+    /// `Arc<Journal>` but never exercise `replay_from_journal` (the Overrun
+    /// path is either never hit, or explained by a prime). Built the same
+    /// way `uc_log::archive`'s own tests build one (`Archive::open` +
+    /// `journal_arc`), per Ruling R12.
+    fn empty_journal(dir: &std::path::Path) -> Arc<Journal> {
+        Archive::open(ArchiveConfig::new(dir.join("journal")))
+            .unwrap()
+            .journal_arc()
+    }
 
     /// A scratch directory on REAL DISK, never `/tmp` (RAM-backed tmpfs with
     /// no swap on the dev box — CLAUDE.md). `CARGO_TARGET_TMPDIR` is set only
@@ -453,6 +533,7 @@ mod tests {
             start,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
         );
         cnc.counters().durable.store_release(e3);
         cnc.counters().commit.store_release(e1); // only the first command is committed
@@ -485,6 +566,7 @@ mod tests {
             start,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -521,6 +603,7 @@ mod tests {
             start,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -565,6 +648,7 @@ mod tests {
             start,
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&prime_gen),
+            empty_journal(dir.path()),
         );
         // The archive bumps the generation right after `LogCounters::prime` —
         // do the same here, THEN stage the overrun, matching how `AdoptFloor`
@@ -581,26 +665,88 @@ mod tests {
         );
     }
 
+    /// Ruling R12: a live overrun with no explaining prime must not lose
+    /// data — the appender never overwrites bytes the archive has not
+    /// recorded, so every frame this agent missed is still in the journal.
+    /// Stages the SAME shape of overrun as `an_overrun_after_a_prime_...`,
+    /// but this time the frames it must recover are REAL, recorded ones
+    /// (not the resync test's "nothing was actually applied"), and the
+    /// generation is never bumped — a live overrun, not a prime.
     #[test]
-    #[should_panic(expected = "uc2-cluster: log buffer overrun")]
-    fn an_overrun_without_a_prime_is_a_fail_stop() {
+    fn an_overrun_without_a_prime_replays_the_gap_from_the_journal() {
         let (buffer, cnc, dir) = world();
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let _e1 = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(7))
+            .unwrap();
+        let _e2 = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(8))
+            .unwrap();
+        let e3 = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(9))
+            .unwrap();
+        // Record all three into a REAL journal, driving the archive the way
+        // `uc_log::archive`'s own tests do — this also advances `durable` to
+        // `e3`, matching what the archive would really do before any of
+        // this test's synthetic priming below.
+        while archive.do_work(&buffer).unwrap() {}
+        let journal = archive.journal_arc();
+
         let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
         let view = Arc::new(ClusterView::new(fsm.state()));
-        // Same staging as the resync test, but the generation is NEVER
-        // bumped: nothing explains the gap, so this must fail-stop exactly
-        // as the brief specified.
         let mut agent = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
             fsm,
-            view,
+            Arc::clone(&view),
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)), // prime_generation: never bumped
+            journal,
         );
-        stage_overrun(&buffer, &cnc);
-        agent.do_work();
+
+        // Stage a LIVE overrun exactly like `stage_overrun` does — the ring
+        // physically moved on past the follower's cursor (still 0) with NO
+        // prime to explain it — but the journal above genuinely holds every
+        // frame the live buffer no longer does.
+        let head = stage_overrun(&buffer, &cnc);
+
+        assert!(agent.do_work(), "replayed real work from the journal");
+        assert_eq!(
+            view.position.load(Ordering::Acquire),
+            e3,
+            "nothing was skipped — the view is at the LAST command's frame-end"
+        );
+        assert_eq!(
+            view.snapshot_interval_bytes.load(Ordering::Acquire),
+            9,
+            "the view holds the LAST command's value, not an earlier one"
+        );
+        assert_eq!(agent.applied(), e3);
+        // The journal only ever held these 3 real frames (nothing beyond
+        // `e3` was ever appended) — the replay correctly stops there, NOT
+        // at the synthetic `head` the staged overrun claims durable up to;
+        // the next `do_work` cycle will overrun again from this cursor
+        // (still below `head`) and replay again, converging once the
+        // journal catches up in a real system.
+        assert_eq!(
+            agent.follower.cursor, e3,
+            "the replay stops at the journal's real content, not at the staged head"
+        );
+        assert!(e3 < head, "sanity: the staged head is beyond real content");
     }
+
+    // A `should_panic` test for the journal-error fail-stop path (a
+    // corrupted/truncated journal below the cursor) is deliberately NOT
+    // included: staging one cheaply would require reaching into
+    // `uc_journal`'s on-disk segment format (record framing + checksums) to
+    // corrupt exactly the archived payload bytes without tripping the
+    // journal's OWN corruption handling differently (e.g. failing
+    // `Journal::open`'s recovery scan instead of `Replay::next`), which is
+    // an implementation detail of a different crate — getting it subtly
+    // wrong risks a flaky or falsely-passing test rather than a real one.
+    // See the task-4 report's "Fix round 2" section.
 }

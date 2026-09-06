@@ -1006,6 +1006,11 @@ impl Node {
         sender_cfg.crypto_enabled = crypto_send.is_some();
         sender_cfg.heartbeat_ns = 20_000_000; // 20 ms: brisk tail-loss detection
         let journal = archive.journal_arc();
+        // Ruling R12: the `uc2-cluster` agent's fallback source for a live
+        // overrun with no explaining prime — a separate clone taken here
+        // because `archive` itself is moved into the archive agent's
+        // closure below before the cluster agent is constructed.
+        let cluster_journal = archive.journal_arc();
         // A learner never leads, so its sender streams to no one: give it a solo
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
@@ -1485,6 +1490,7 @@ impl Node {
             cluster_start,
             Arc::clone(&cluster_snapshot_pos),
             Arc::clone(&prime_generation),
+            cluster_journal,
         );
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
