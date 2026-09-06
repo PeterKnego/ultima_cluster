@@ -51,10 +51,16 @@ pub fn recover(
     match newest {
         None => Ok((fsm, 0)),
         Some((pos, path)) => {
-            let mut f = File::open(path)?;
-            let got = fsm
-                .install_snapshot(pos, &mut f)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut f = File::open(&path)?;
+            let got = fsm.install_snapshot(pos, &mut f).map_err(|e| {
+                crate::obs_event!(
+                    Warn,
+                    "cluster_artifact_corrupt",
+                    path = path.display().to_string().as_str(),
+                    err = e.to_string().as_str()
+                );
+                io::Error::other(e.to_string())
+            })?;
             Ok((fsm, got))
         }
     }
@@ -75,6 +81,26 @@ pub struct ClusterAgent {
     cluster_snapshot_pos: Arc<AtomicU64>,
     declared_rows: Vec<usize>,
     out: Vec<u8>,
+    /// Ruling R11: the SAME node-internal generation counter the archive
+    /// agent bumps immediately after every `LogCounters::prime` (truncate,
+    /// AdoptFloor, leader-open collapse) — `uc_net::receiver`'s
+    /// `prime_generation` field, shared here for the identical purpose:
+    /// telling a benign forward re-prime apart from a genuine live overrun.
+    prime_generation: Arc<AtomicU64>,
+    /// The generation as of the last time we actually EXPLAINED an Overrun
+    /// with it (not merely "as of the top of the last cycle" — a prime's
+    /// generation bump and its effect on `commit`/`durable` becoming visible
+    /// to THIS thread are two independent atomics with no ordering between
+    /// them, so the two can be observed on different cycles; refreshing this
+    /// unconditionally on every idle cycle would spend the "explained"
+    /// credit before an Overrun ever needed it).
+    last_prime_gen: u64,
+    /// Set the first time this follower EVER makes forward progress (a
+    /// resync, a `CaughtUp`, or a successful `Frames` batch) since
+    /// construction; never cleared again. See `do_work`'s Overrun arm for
+    /// why the fail-stop panic is gated on this rather than firing on every
+    /// Overrun a fresh generation doesn't explain (Ruling R11, fix round 2).
+    made_progress: bool,
 }
 
 impl ClusterAgent {
@@ -82,6 +108,9 @@ impl ClusterAgent {
     /// position, or 0). `cluster_snapshot_pos` (Ruling R2) is seeded here from
     /// the recovered artifact's position and updated (Release) by
     /// [`Self::take_snapshot`]; the consensus agent (task 5) reads it.
+    /// `prime_generation` (Ruling R11) is the node-wide re-prime generation
+    /// counter, shared with `uc_net::receiver`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<LogBuffer>,
         cnc: Arc<CncPage>,
@@ -90,12 +119,14 @@ impl ClusterAgent {
         snapshot_dir: PathBuf,
         start: u64,
         cluster_snapshot_pos: Arc<AtomicU64>,
+        prime_generation: Arc<AtomicU64>,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
         let declared_rows = (0..CNC_MAX_SERVICES)
             .filter(|r| cnc.service_slot(*r).identity.hash() != 0)
             .collect();
+        let last_prime_gen = prime_generation.load(Ordering::Acquire);
         ClusterAgent {
             follower: LogFollower::new(buffer, start),
             cnc,
@@ -106,6 +137,9 @@ impl ClusterAgent {
             cluster_snapshot_pos,
             declared_rows,
             out: Vec::new(),
+            prime_generation,
+            last_prime_gen,
+            made_progress: false,
         }
     }
 
@@ -135,31 +169,86 @@ impl ClusterAgent {
         let head = c.commit.load_acquire().min(c.durable.load_acquire());
         let mut applied_any = false;
         loop {
+            // Ruling R11: sample the prime generation before calling
+            // `next_batch`, mirroring `uc_net::receiver`'s DATA-arm `gen0`
+            // (its per-read straddle guard, ~line 1745). Compared against
+            // `last_prime_gen` — the generation we last actually ACCOUNTED
+            // for, not merely "as of the top of this cycle": a prime
+            // (AdoptFloor, truncate, leader-open collapse) can complete, and
+            // its generation bump land, long before this agent is next
+            // scheduled to notice `head` has moved (the archive bumps the
+            // generation right after `LogCounters::prime`, but `commit` is a
+            // separate counter written by a different agent on a different
+            // cadence — so the two are not guaranteed to become visible to
+            // this thread on the same cycle).
+            let gen0 = self.prime_generation.load(Ordering::Acquire);
             match self.follower.next_batch(head) {
-                Batch::CaughtUp => break,
-                Batch::Overrun => {
-                    // Below the buffer: a below-floor joiner (a fresh learner,
-                    // a wipe-and-rejoin) has its counters primed straight to
-                    // the installed snapshot's position by `AdoptFloor`, well
-                    // past this follower's cursor — the same shape as the
-                    // service apply loop's below-floor case, but plan 1 has
-                    // not yet given the snapshot session a cluster artifact to
-                    // install from (task 9 does: `ClusterAgent::install_from`
-                    // resets the cursor to the installed position). Until
-                    // then, resync forward rather than fail-stopping the
-                    // whole node over a component nothing reads yet — any
-                    // CLUSTER frames in the skipped span are missed on THIS
-                    // node until task 9 lands.
-                    crate::obs_event!(
-                        Warn,
-                        "cluster_agent_resynced_over_overrun",
-                        cursor = self.follower.cursor,
-                        head = head
-                    );
-                    self.follower.cursor = head;
+                Batch::CaughtUp => {
+                    self.made_progress = true;
                     break;
                 }
+                Batch::Overrun => {
+                    // Recheck (the same belt-and-suspenders the receiver's
+                    // DATA arm uses at its own Overrun-adjacent site): a
+                    // prime racing concurrently with THIS call's own
+                    // execution may not yet have been visible in `gen0`.
+                    let gen1 = self.prime_generation.load(Ordering::Acquire);
+                    let primed = gen0 != self.last_prime_gen || gen1 != self.last_prime_gen;
+                    // Fix round 2 (Ruling R11 follow-up): a fleet-scale
+                    // finding, not a synthetic corner — this agent has no
+                    // admission door (spec §4.1, "outside the lag policy"),
+                    // and the shared ring holds EVERY frame type, not just
+                    // CLUSTER ones. A write-heavy workload on a small ring
+                    // (`uc_node/tests/learner.rs`'s 24k-submit setup, 256 KiB
+                    // buffer) reliably overruns a live, healthy leader's OWN
+                    // cluster agent with NO prime anywhere in sight — plain
+                    // scheduling arithmetic, not a stuck thread. Gating the
+                    // panic on `primed` ALONE fail-stops perfectly healthy
+                    // nodes under ordinary load, which is worse than the
+                    // resync it replaces. `made_progress` narrows the panic
+                    // to what it can actually still prove: a reader that has
+                    // NEVER once caught up or read a frame, overrunning with
+                    // no prime to explain it — i.e. broken from birth (a
+                    // misconfigured buffer/cnc pairing), not merely slow.
+                    // Once any progress has been observed, an unexplained
+                    // Overrun is resynced like every other one; task 9's
+                    // artifact-carrying snapshot install removes the need
+                    // for any of this by replacing replay with an install.
+                    if primed || self.made_progress {
+                        self.last_prime_gen = gen1;
+                        self.made_progress = true;
+                        // Below the buffer: a below-floor joiner (a fresh
+                        // learner, a wipe-and-rejoin) has its counters primed
+                        // straight to the installed snapshot's position by
+                        // `AdoptFloor`, well past this follower's cursor —
+                        // the same shape as the service apply loop's
+                        // below-floor case, but plan 1 has not yet given the
+                        // snapshot session a cluster artifact to install
+                        // from (task 9 does: `ClusterAgent::install_from`
+                        // resets the cursor to the installed position).
+                        // Until then, resync forward rather than
+                        // fail-stopping the whole node over a component
+                        // nothing reads yet — any CLUSTER frames in the
+                        // skipped span are missed on THIS node until task 9
+                        // lands.
+                        crate::obs_event!(
+                            Warn,
+                            "cluster_agent_resynced_over_overrun",
+                            cursor = self.follower.cursor,
+                            head = head
+                        );
+                        self.follower.cursor = head;
+                        break;
+                    }
+                    // Never once made progress, and no prime explains this:
+                    // broken from birth, the fail-stop the brief specified.
+                    panic!(
+                        "uc2-cluster: log buffer overrun at {}",
+                        self.follower.cursor
+                    );
+                }
                 Batch::Frames(iter) => {
+                    self.made_progress = true;
                     for (pos, hdr, payload) in iter {
                         if hdr.frame_type != FRAME_TYPE_CLUSTER {
                             continue; // yielded, not applied: the mirror image of the user loop
@@ -238,8 +327,23 @@ impl ClusterAgent {
             f.sync_all()?;
         }
         fs::rename(&tmp, &final_path)?;
-        if let Ok(d) = File::open(&self.snapshot_dir) {
-            let _ = d.sync_all();
+        match File::open(&self.snapshot_dir) {
+            Ok(d) => {
+                if let Err(e) = d.sync_all() {
+                    crate::obs_event!(
+                        Warn,
+                        "cluster_snapshot_dir_fsync_failed",
+                        err = e.to_string().as_str()
+                    );
+                }
+            }
+            Err(e) => {
+                crate::obs_event!(
+                    Warn,
+                    "cluster_snapshot_dir_fsync_failed",
+                    err = e.to_string().as_str()
+                );
+            }
         }
         self.snapshot_pos = pos;
         self.cluster_snapshot_pos.store(pos, Ordering::Release);
@@ -348,6 +452,7 @@ mod tests {
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e3);
         cnc.counters().commit.store_release(e1); // only the first command is committed
@@ -378,6 +483,7 @@ mod tests {
             view,
             dir.path().join("snapshots/cluster"),
             start,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e1);
@@ -414,6 +520,7 @@ mod tests {
             dir.path().join("snapshots/cluster"),
             start,
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -427,5 +534,73 @@ mod tests {
             e1,
             "the cluster artifact caught up to the rows' floor"
         );
+    }
+
+    /// Stages an `Overrun` the same way `uc_log::reader`'s own
+    /// `overrun_surfaces_after_a_prime_over_fresh_region` does: prime the
+    /// counters straight to `2 * capacity` over a follower cursor still at 0
+    /// (a fresh instance dir's genesis start) — the same shape as a
+    /// below-floor joiner's `AdoptFloor`. `commit` is set alongside `durable`
+    /// since `prime` deliberately leaves it alone (`LogCounters::prime`'s
+    /// doc) and `do_work` heads on `min(commit, durable)`.
+    fn stage_overrun(buffer: &Arc<LogBuffer>, cnc: &Arc<CncPage>) -> u64 {
+        let head = 2 * buffer.capacity();
+        cnc.counters().prime(head);
+        cnc.counters().commit.store_release(head);
+        head
+    }
+
+    #[test]
+    fn an_overrun_after_a_prime_resyncs_and_warns() {
+        let (buffer, cnc, dir) = world();
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let prime_gen = Arc::new(AtomicU64::new(0));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&prime_gen),
+        );
+        // The archive bumps the generation right after `LogCounters::prime` —
+        // do the same here, THEN stage the overrun, matching how `AdoptFloor`
+        // orders the two writes in `node.rs`.
+        prime_gen.fetch_add(1, Ordering::Release);
+        let head = stage_overrun(&buffer, &cnc);
+        assert!(
+            !agent.do_work(),
+            "resynced, not panicked; nothing was actually applied"
+        );
+        assert_eq!(
+            agent.follower.cursor, head,
+            "the follower resyncs to the new head"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "uc2-cluster: log buffer overrun")]
+    fn an_overrun_without_a_prime_is_a_fail_stop() {
+        let (buffer, cnc, dir) = world();
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        // Same staging as the resync test, but the generation is NEVER
+        // bumped: nothing explains the gap, so this must fail-stop exactly
+        // as the brief specified.
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        stage_overrun(&buffer, &cnc);
+        agent.do_work();
     }
 }

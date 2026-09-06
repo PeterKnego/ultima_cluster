@@ -1484,6 +1484,7 @@ impl Node {
             instance.cluster_snapshot_dir(),
             cluster_start,
             Arc::clone(&cluster_snapshot_pos),
+            Arc::clone(&prime_generation),
         );
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
