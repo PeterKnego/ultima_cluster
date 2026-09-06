@@ -4573,7 +4573,11 @@ impl Consensus {
             } else {
                 (
                     crate::services::fsm_lag_from_setting(lag, self.buffer_bytes, self.max_payload),
-                    crate::services::page_lag_from_setting(lag, self.buffer_bytes),
+                    crate::services::page_lag_from_setting(
+                        lag,
+                        self.buffer_bytes,
+                        self.max_payload,
+                    ),
                 )
             };
             if lag_eff != self.fsm_lag_eff {
@@ -8466,14 +8470,40 @@ mod tests {
         let end = h
             .cons
             .append_cluster_frame(&ClusterCommand::Settings(Settings {
-                fsm_lag_bytes: 4096,
+                fsm_lag_bytes: 8192,
                 ..Settings::genesis_default()
             }))
             .unwrap();
         h.commit_through(end);
         h.cons.do_work();
-        assert_eq!(h.cons.fsm_lag_eff, Some(4096), "the committed bound");
-        assert_eq!(h.cons.cnc.fsm_lag_bytes(), 4096, "and the cnc mirror");
+        assert_eq!(h.cons.fsm_lag_eff, Some(8192), "the committed bound");
+        assert_eq!(h.cons.cnc.fsm_lag_bytes(), 8192, "and the cnc mirror");
+
+        // I1: a bound the DOOR accepts (above `MIN_FSM_LAG_BYTES`, the
+        // cluster-wide constant) but that is still below ONE FRAME on this
+        // host — the harness runs an out-of-MTU `max_payload = 4096` — is
+        // clamped UP at use, both in the door and in the page. Below one
+        // frame the report ceiling can sit inside the next frame forever, so
+        // there is no such thing as honouring this value.
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings {
+                fsm_lag_bytes: 2048,
+                ..Settings::genesis_default()
+            }))
+            .unwrap();
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.fsm_lag_eff,
+            Some(4128),
+            "clamped up to one max-size frame on THIS host"
+        );
+        assert_eq!(
+            h.cons.cnc.fsm_lag_bytes(),
+            4128,
+            "and the cnc mirror agrees"
+        );
 
         // An absurd bound is CLAMPED at use, never refused — the record is a
         // cluster-wide intent and this host's ring is the bound.
@@ -9128,9 +9158,30 @@ mod tests {
         );
         let (status, reason, _) = h.cons.apply_settings_staged();
         assert_eq!((status, reason), (1, REASON_SETTINGS_BOUNDS));
+
+        // (e) I1: a SUB-FRAME `fsm_lag`. `uc2ctl settings apply` will happily
+        //     parse and stage `fsm_lag = "1"` (bare digits are legal — the
+        //     tool validates only what only it can), and adopting it would
+        //     pin the report ceiling inside the next frame and wedge commit
+        //     cluster-wide with no in-band way back. The door refuses it by
+        //     the same 47 every other bounds refusal uses.
+        stage_settings_for_test(
+            &h,
+            &Settings {
+                fsm_lag_bytes: 1,
+                ..Settings::genesis_default()
+            },
+        );
+        let (status, reason, _) = h.cons.apply_settings_staged();
+        assert_eq!((status, reason), (1, REASON_SETTINGS_BOUNDS));
+        assert!(
+            h.cons.settings_pending.exists(),
+            "a refused apply leaves the staged file for the operator to re-sign"
+        );
+
         assert_eq!(
             h.cons.last_cluster_append, 0,
-            "nothing was appended by any of the four refusals"
+            "nothing was appended by any of the five refusals"
         );
     }
 

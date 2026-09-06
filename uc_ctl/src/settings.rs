@@ -249,6 +249,23 @@ mod tests {
         assert_eq!(s.fsm_lag_bytes, 65536);
     }
 
+    /// I1: a sub-frame `fsm_lag` parses and stages here — `uc2ctl` validates
+    /// only what only it can (the TOML shape, the vocabulary, the digest),
+    /// and a BOUND is the cluster FSM's decision, so the node answers
+    /// `47 settings_bounds`. Pinned so nobody "helpfully" adds a local bound
+    /// check here and lets the two verdicts drift: the node-side end-to-end
+    /// refusal is `uc_node`'s
+    /// `settings_apply_refuses_a_bad_digest_a_missing_file_and_out_of_bounds`.
+    #[test]
+    fn a_sub_frame_fsm_lag_parses_here_and_is_the_nodes_47_to_refuse() {
+        let s = parse_settings("fsm_lag = \"1\"\n").unwrap();
+        assert_eq!(s.fsm_lag_bytes, 1);
+        assert!(
+            s.fsm_lag_bytes < uc_protocol::v2::settings::MIN_FSM_LAG_BYTES,
+            "the value this test is about must be below the door's bound"
+        );
+    }
+
     #[test]
     fn snapshot_target_all_is_accepted_explicitly() {
         let s = parse_settings("snapshot_target = \"all\"\n").unwrap();

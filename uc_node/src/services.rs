@@ -355,10 +355,15 @@ pub fn fsm_lag_eff(
 /// config-declared [`ServicesConfig`] bound, for the replicated-settings path
 /// later tasks wire up. `0` reads as "derive the default"
 /// (`buffer_bytes / 4`, the same default `fsm_lag_eff` falls back to for a
-/// `None` `ServicesConfig::fsm_lag`); an out-of-range word is clamped below
-/// half the ring rather than refused — this feeds a sync/deterministic apply
-/// path with no `Result`, unlike `ServicesConfig::validate`, which runs once
-/// at config load and can still error.
+/// `None` `ServicesConfig::fsm_lag`); an out-of-range word is CLAMPED rather
+/// than refused — this feeds a sync/deterministic apply path with no
+/// `Result`, unlike `ServicesConfig::validate`, which runs once at config
+/// load and can still error.
+///
+/// The clamp is TWO-sided (I1): below half the ring, and at or above one
+/// max-size frame ([`one_frame`]). A sub-frame bound is not a tighter
+/// policy — it wedges commit permanently, and the only channel that could
+/// undo it is the one it wedges. See [`clamp_lag`].
 ///
 /// The three readings of the word are disjoint (Ruling R8): `0` = derive the
 /// default, [`FSM_LAG_LOCKSTEP`] (`u64::MAX`) = lockstep, anything else = a
@@ -373,25 +378,64 @@ pub fn fsm_lag_eff(
 /// it with its own declared-set check.
 pub fn fsm_lag_from_setting(setting: u64, buffer_bytes: u64, max_payload: usize) -> Option<u64> {
     if setting == FSM_LAG_LOCKSTEP {
-        Some(align_frame_len(HEADER_LEN + max_payload) as u64)
+        Some(one_frame(max_payload))
     } else if setting == 0 {
         Some(buffer_bytes / 4)
     } else {
-        Some(setting.min(buffer_bytes.max(2) / 2 - 1))
+        Some(clamp_lag(setting, buffer_bytes, max_payload))
     }
+}
+
+/// One max-size frame ON THIS HOST: the lockstep sentinel's value, and the
+/// FLOOR every finite byte bound is clamped up to.
+///
+/// It is the minimum survivable runway. `report_ceiling` caps this node's
+/// attested frontier at `min_applied + lag`, commit is the quorum-th such
+/// report, and `LogFollower::next_batch(head)` refuses to yield a frame whose
+/// END exceeds `head` — so a `lag` shorter than one frame can land the
+/// ceiling strictly inside the next frame forever: nothing applies,
+/// `min_applied` never moves, commit never moves, and the `CLUSTER` frame
+/// that would fix the setting can never commit either.
+fn one_frame(max_payload: usize) -> u64 {
+    align_frame_len(HEADER_LEN + max_payload) as u64
+}
+
+/// Spec §4.4's "clamp at the point of use", BOTH sides (I1). The upper bound
+/// keeps every FSM provably on the ring (below half the buffer); the lower
+/// bound keeps the log moving at all ([`one_frame`]).
+///
+/// The upper bound wins on a degenerate ring: a buffer too small to hold one
+/// frame is a `preflight` refusal (`max_payload > buffer_bytes / 4`), so the
+/// two can only cross on a synthetic value, and clamping DOWN there matches
+/// what this helper did before — it never returns a lag the ring cannot hold.
+///
+/// The leader's pre-append `ClusterFsm::validate` refuses a sub-frame bound
+/// outright (`MIN_FSM_LAG_BYTES`, reason 47), so in practice this floor only
+/// catches a record that never passed that door: a genesis `[settings]` seed,
+/// or one written by a host whose frames are wider than this one's.
+fn clamp_lag(setting: u64, buffer_bytes: u64, max_payload: usize) -> u64 {
+    setting
+        .max(one_frame(max_payload))
+        .min(buffer_bytes.max(2) / 2 - 1)
 }
 
 /// The cnc 4040 encoding over the same raw setting — mirrors
 /// [`ServicesConfig::page_lag_value`]'s arithmetic (the byte bound the page
 /// carries, clamped the same way [`fsm_lag_from_setting`] is), with
 /// [`FSM_LAG_LOCKSTEP`] mapped onto the PAGE's own lockstep sentinel, `0`.
-pub fn page_lag_from_setting(setting: u64, buffer_bytes: u64) -> u64 {
+///
+/// Takes `max_payload` for the same reason its twin does (I1): the clamp is
+/// two-sided now, and its floor is one max-size frame on THIS host. The page
+/// word is what every service's apply loop paces on, so a page that disagreed
+/// with the node's own door by even one byte would be the same wedge one
+/// layer down.
+pub fn page_lag_from_setting(setting: u64, buffer_bytes: u64, max_payload: usize) -> u64 {
     if setting == FSM_LAG_LOCKSTEP {
         0
     } else if setting == 0 {
         buffer_bytes / 4
     } else {
-        setting.min(buffer_bytes.max(2) / 2 - 1)
+        clamp_lag(setting, buffer_bytes, max_payload)
     }
 }
 
@@ -664,21 +708,72 @@ mod tests {
         assert_eq!(fsm_lag_from_setting(4096, 0, 256), Some(0));
     }
 
+    /// I1: the clamp is TWO-sided. A replicated `fsm_lag` below one max-size
+    /// frame pins `report_ceiling = min_applied + lag` strictly inside the
+    /// next frame — nothing applies, `min_applied` never moves, commit never
+    /// moves, and the only way to change a replicated setting is a `CLUSTER`
+    /// frame that has to commit. The cluster bricks itself permanently. Spec
+    /// §4.4's "clamp at the point of use" is exactly the fix, and this is
+    /// the one place that owns the arithmetic.
+    #[test]
+    fn fsm_lag_from_setting_clamps_a_sub_frame_bound_up_to_one_frame() {
+        let b = 4u64 << 20;
+        // header 32 + 256 payload, 32-aligned = 288 — the SAME value the
+        // lockstep sentinel resolves to, because one max-size frame is the
+        // minimum survivable runway either way.
+        let floor = 288;
+        assert_eq!(fsm_lag_from_setting(1, b, 256), Some(floor));
+        assert_eq!(fsm_lag_from_setting(floor - 1, b, 256), Some(floor));
+        assert_eq!(fsm_lag_from_setting(floor, b, 256), Some(floor));
+        assert_eq!(
+            fsm_lag_from_setting(floor + 1, b, 256),
+            Some(floor + 1),
+            "a legal bound is untouched"
+        );
+        // The two sentinels keep their meanings: `0` is still "derive the
+        // default", lockstep is still lockstep.
+        assert_eq!(fsm_lag_from_setting(0, b, 256), Some(b / 4));
+        assert_eq!(fsm_lag_from_setting(FSM_LAG_LOCKSTEP, b, 256), Some(floor));
+        // A degenerate ring: the UPPER clamp still wins, so the floor can
+        // never push the bound above half the buffer.
+        assert_eq!(fsm_lag_from_setting(1, 0, 256), Some(0));
+        assert_eq!(fsm_lag_from_setting(1, 512, 256), Some(255));
+    }
+
+    /// The page word must agree with [`fsm_lag_from_setting`] bound for
+    /// bound: the cnc 4040 word is what every service's apply loop paces on,
+    /// so a page that says 1 while the node's door says 288 is the same wedge
+    /// one layer down.
+    #[test]
+    fn page_lag_from_setting_clamps_the_same_sub_frame_bound() {
+        let b = 4u64 << 20;
+        assert_eq!(page_lag_from_setting(1, b, 256), 288);
+        assert_eq!(page_lag_from_setting(287, b, 256), 288);
+        assert_eq!(page_lag_from_setting(4096, b, 256), 4096);
+        assert_eq!(
+            page_lag_from_setting(FSM_LAG_LOCKSTEP, b, 256),
+            0,
+            "the record's lockstep sentinel still maps onto the page's own"
+        );
+        assert_eq!(page_lag_from_setting(0, b, 256), b / 4);
+        assert_eq!(page_lag_from_setting(1, 0, 256), 0, "no underflow");
+    }
+
     /// The cnc 4040 encoding over the same raw setting — mirrors
     /// [`ServicesConfig::page_lag_value`]'s arithmetic, including its
     /// lockstep sentinel (the PAGE's `0`, which is NOT the record's `0`).
     #[test]
     fn page_lag_from_setting_table() {
         let b = 4u64 << 20;
-        assert_eq!(page_lag_from_setting(0, b), b / 4);
-        assert_eq!(page_lag_from_setting(4096, b), 4096);
-        assert_eq!(page_lag_from_setting(b, b), b / 2 - 1);
+        assert_eq!(page_lag_from_setting(0, b, 256), b / 4);
+        assert_eq!(page_lag_from_setting(4096, b, 256), 4096);
+        assert_eq!(page_lag_from_setting(b, b, 256), b / 2 - 1);
         assert_eq!(
-            page_lag_from_setting(FSM_LAG_LOCKSTEP, b),
+            page_lag_from_setting(FSM_LAG_LOCKSTEP, b, 256),
             0,
             "the record's lockstep sentinel maps onto the page's own"
         );
-        assert_eq!(page_lag_from_setting(4096, 0), 0, "no underflow");
+        assert_eq!(page_lag_from_setting(4096, 0, 256), 0, "no underflow");
     }
 
     #[test]

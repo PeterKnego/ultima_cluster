@@ -18,7 +18,9 @@ use uc_protocol::v2::frame::{ClusterKind, read_cluster_prefix};
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, ScheduleTable, decode_schedule_table, encode_schedule_table,
 };
-use uc_protocol::v2::settings::{SETTINGS_LEN, Settings, decode_settings, encode_settings};
+use uc_protocol::v2::settings::{
+    FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, SETTINGS_LEN, Settings, decode_settings, encode_settings,
+};
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine};
 
 use crate::node::{cluster_to_wire, wire_to_cluster_config};
@@ -215,6 +217,30 @@ impl ClusterFsm {
                 }
                 if s.snapshot_interval_bytes == u64::MAX {
                     return Err(ClusterRefusal::SettingsBounds("snapshot.interval_bytes"));
+                }
+                // I1: the one settings value whose too-SMALL side is
+                // unrecoverable. `report_ceiling` caps an attested frontier
+                // at `min_applied + fsm_lag`; below one max-size frame that
+                // ceiling can sit strictly inside the next frame forever, so
+                // nothing applies, commit stops cluster-wide, and the only
+                // channel that could change a replicated setting is a
+                // `CLUSTER` frame that has to COMMIT. Everything else here is
+                // clamped at the point of use (spec §4.4) and still is — the
+                // clamp in `services::fsm_lag_from_setting` is two-sided —
+                // but a value that would have bricked the cluster is worth an
+                // operator being TOLD about rather than silently corrected.
+                //
+                // `MIN_FSM_LAG_BYTES` is a compile-time constant (the widest
+                // frame the transport can carry on ANY host), never this
+                // host's `max_payload`, so this verdict stays a function of
+                // FSM state and constants alone. `0` ("derive this node's
+                // boot value") and `FSM_LAG_LOCKSTEP` (`u64::MAX`) are
+                // sentinels, not byte bounds, and keep their meanings.
+                if s.fsm_lag_bytes != 0
+                    && s.fsm_lag_bytes != FSM_LAG_LOCKSTEP
+                    && s.fsm_lag_bytes < MIN_FSM_LAG_BYTES
+                {
+                    return Err(ClusterRefusal::SettingsBounds("fsm_lag"));
                 }
                 Ok(())
             }
@@ -705,6 +731,46 @@ mod tests {
         };
         // Larger than any host's buffer — ACCEPTED here; clamped at use (spec §4.4).
         assert!(f.validate(&ClusterCommand::Settings(ok)).is_ok());
+    }
+
+    /// I1: a sub-frame `fsm_lag` is refused AT THE DOOR, by name, rather than
+    /// silently clamped. It is the one settings value whose too-SMALL side is
+    /// unrecoverable — a lag below one frame pins the report ceiling inside
+    /// the next frame, commit stops, and the only way to change a replicated
+    /// setting is a `CLUSTER` frame that has to commit. The clamp at the point
+    /// of use (`services::fsm_lag_from_setting`) still exists as the last
+    /// line of defence for a record that came from genesis or from a host
+    /// with a smaller frame; this refusal is so an operator is TOLD.
+    ///
+    /// The bound is [`MIN_FSM_LAG_BYTES`], a compile-time constant — the
+    /// widest frame the transport can carry, on any host — so the verdict
+    /// stays a function of FSM state and constants, never of this host.
+    #[test]
+    fn a_sub_frame_fsm_lag_is_refused_by_name_and_the_two_sentinels_are_not() {
+        let f = fsm();
+        let with_lag = |b: u64| {
+            ClusterCommand::Settings(Settings {
+                fsm_lag_bytes: b,
+                ..Settings::genesis_default()
+            })
+        };
+        for bad in [1u64, 32, MIN_FSM_LAG_BYTES - 1] {
+            assert!(
+                matches!(
+                    f.validate(&with_lag(bad)),
+                    Err(ClusterRefusal::SettingsBounds("fsm_lag"))
+                ),
+                "fsm_lag = {bad} must be refused"
+            );
+            assert_eq!(f.validate(&with_lag(bad)).unwrap_err().reason_code(), 47);
+        }
+        // `0` keeps its "derive this node's boot value" meaning and lockstep
+        // keeps its own; neither is a byte bound, so neither is refused.
+        assert!(f.validate(&with_lag(0)).is_ok());
+        assert!(f.validate(&with_lag(FSM_LAG_LOCKSTEP)).is_ok());
+        // Exactly one max-size frame is legal.
+        assert!(f.validate(&with_lag(MIN_FSM_LAG_BYTES)).is_ok());
+        assert!(f.validate(&with_lag(16 << 20)).is_ok());
     }
 
     /// Spec §9: `settings_position` is `table_position`'s twin — set by the

@@ -21,6 +21,30 @@ pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1;
 /// is the one place that maps it back onto the page's `0`.
 pub const FSM_LAG_LOCKSTEP: u64 = u64::MAX;
 
+/// The smallest byte bound `fsm_lag_bytes` may name: **one max-size frame**,
+/// as the transport bounds it.
+///
+/// A lag below one frame is not a tighter policy, it is a WEDGE. The report
+/// ceiling is `min_applied + lag` (`uc_node::services::report_ceiling`) and a
+/// log follower refuses to yield a frame whose END exceeds that head, so a
+/// sub-frame lag can pin the ceiling permanently inside the next frame:
+/// nothing applies, `min_applied` never moves, commit never moves — and the
+/// only way to change a replicated setting is a `CLUSTER` frame that has to
+/// COMMIT. Operators who want the tightest possible pacing want
+/// [`FSM_LAG_LOCKSTEP`], which is a barrier rather than a byte bound.
+///
+/// This is the CLUSTER-WIDE bound, so it must hold on every host and cannot
+/// read any host's `max_payload`: it is the largest aligned frame the UDP
+/// data plane can carry at all (`MTU_DEFAULT - DATAGRAM_HEADER_LEN`, floored
+/// to `FRAME_ALIGNMENT`) = 1376 B. A host whose own `max_payload` is smaller
+/// clamps up to its own one-frame floor at the point of use
+/// (`uc_node::services::fsm_lag_from_setting`), per spec §4.4; this constant
+/// is only what the leader's pre-append `validate` refuses BELOW, so an
+/// operator is told rather than silently clamped.
+pub const MIN_FSM_LAG_BYTES: u64 = ((crate::v2::datagram::MTU_DEFAULT
+    - crate::v2::datagram::DATAGRAM_HEADER_LEN)
+    & !(crate::v2::frame::FRAME_ALIGNMENT - 1)) as u64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Target {
@@ -31,8 +55,11 @@ pub enum Target {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     /// `0` = "derive `buffer_bytes / 4` at use"; [`FSM_LAG_LOCKSTEP`]
-    /// (`u64::MAX`) = lockstep; anything else is a byte bound, clamped below
-    /// half the ring at use.
+    /// (`u64::MAX`) = lockstep; anything else is a byte bound, clamped at use
+    /// into the range from one max-size frame up to half the ring — and a
+    /// bound below [`MIN_FSM_LAG_BYTES`] is refused at the leader's door
+    /// (`47 settings_bounds`) rather than silently clamped, because adopting
+    /// one would wedge commit cluster-wide and permanently.
     pub fsm_lag_bytes: u64,
     /// `0` = derive at use (the node's `NodeConfig::admission_bytes` default).
     pub admission_bytes: u64,
@@ -88,6 +115,9 @@ pub fn decode_settings(buf: &[u8]) -> Option<Settings> {
 }
 
 const _: () = assert!(SETTINGS_LEN + crate::v2::frame::CLUSTER_BODY_PREFIX_LEN <= 1344);
+// The lockstep sentinel must stay clear of the byte-bound floor, or
+// `ClusterFsm::validate` would refuse lockstep as a sub-frame bound.
+const _: () = assert!(FSM_LAG_LOCKSTEP > MIN_FSM_LAG_BYTES);
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +132,12 @@ mod tests {
         // The lockstep sentinel is a WORD VALUE in this record, not the cnc
         // page's `0` — `0` here is already "derive the default at use".
         assert_eq!(FSM_LAG_LOCKSTEP, u64::MAX);
+        // One max-size frame on the widest path the transport allows: 1408
+        // MTU - 16 datagram header = 1392, floored to the 32-byte frame
+        // alignment. Pinned so a reader can check the arithmetic without
+        // recomputing it, and so a change to either input is a test failure
+        // rather than a silent widening of the settings door.
+        assert_eq!(MIN_FSM_LAG_BYTES, 1376);
         let s = Settings {
             fsm_lag_bytes: 16 << 20,
             admission_bytes: 4 << 20,

@@ -537,7 +537,7 @@ its own band for the same reason.
 | 44 | `settings_digest` — the staged settings file's digest is not the one the request signed: a different file was staged than was signed, or it changed in between. Re-run `settings apply` |
 | 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
 | 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
-| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which |
+| 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which. Three values are out of range: `admission_bytes` or `snapshot_interval_bytes` equal to `u64::MAX` (the reserved sentinel), and an `fsm_lag` byte bound **below 1376 B** — one max-size frame. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 
