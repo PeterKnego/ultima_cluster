@@ -556,12 +556,17 @@ the consumer half is.
 
 1. **The flag.** `FLAG_SNAPSHOT_STANDBY` in the frame's header flags byte.
    The body stays empty.
-2. **Role visible to the row.** The node writes one cnc status bit per row,
-   `CNC_SVC_STATUS_LEARNER = 1 << 10`, from the kernel's durable-time
-   membership shadow (role is consensus-plane), republished on every
-   adoption. A row acts on a standby-flagged instant **only if that bit is
-   set**; a voter's rows yield the frame like any other node-only frame. The
-   cluster FSM follows the same rule from the same shadow.
+2. **Role visible to the row.** The node publishes `NODE_FLAG_LEARNER = 4`
+   in the **node-written** status flags word — the same word the service
+   apply loop already reads `NODE_FLAG_LEADER` from once per cycle
+   (`uc_service/src/apply.rs:421`) — set from the kernel's durable-time
+   membership shadow in `publish_status` on every adoption. A row acts on a
+   standby-flagged instant **only if that flag is set**; a voter's rows yield
+   the frame like any other node-only frame. The cluster FSM follows the
+   same rule from the same word. (An earlier draft put this in a per-row
+   slot status bit; that was wrong twice over — the slot's status word is
+   service-written (`cnc.rs:277`), and role is a node property, not a row
+   property. Corrected while writing plan 2.)
 3. **Completeness is unchanged.** §5.3 already works per node: the learner
    completes its own set at P and its floor moves. A voter has no set at P
    and its floor does not move — yet.
@@ -632,7 +637,7 @@ All inside `2.11.0`'s unreleased `0.7.0` / `3.1`:
 |---|---|
 | frame types | `4` becomes `CLUSTER` (was `CONFIG`); `6` retired; `7` = `SNAPSHOT` with header flag `FLAG_SNAPSHOT_STANDBY = 0x01` |
 | datagrams | `SNAP_BEGIN` layout V4 (one `snapshot_pos`, no `config`); kind `21` retired; `22` = `SNAP_REQUEST`, `23` = `SNAP_REDIRECT` |
-| cnc 3.1 | status bit 9 = snapshot-capable, bit 10 = this node is a learner; the `fsm_lag` word becomes node-republished on settings change |
+| cnc 3.1 | slot status bit 9 (service-written) = snapshot-capable; `NODE_FLAG_LEARNER = 4` in the node flags word; the `fsm_lag` word becomes node-republished on settings change |
 | admin ops | `7 settings_apply`, `8 snapshot` (with `--standby`), `9 snapshot_fetch`; refusals `44–49` |
 | service SDK | `SnapshotPolicy` and `interval_bytes` **removed**; `start_with_snapshots` sets the capability bit; no trait change |
 | `node.toml` | `[settings]` (genesis seed); `admission_bytes` and `services.fsm_lag` refused outside it; `uc_` names refused |
