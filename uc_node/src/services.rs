@@ -349,30 +349,38 @@ pub fn fsm_lag_eff(
 /// path with no `Result`, unlike `ServicesConfig::validate`, which runs once
 /// at config load and can still error.
 ///
-/// `Settings::fsm_lag_bytes`'s own doc names `FSM_LAG_LOCKSTEP` (`0`) as what
-/// an EXPLICIT `settings apply` to lockstep encodes — the same word genesis's
-/// "derive the default" uses, distinguishable only via `Settings::has_fsm_lag`
-/// (not yet built). This function sees only the raw word, so `0` currently
-/// always takes the derive-default reading; the `FSM_LAG_LOCKSTEP` branch
-/// below is where a future task threads `has_fsm_lag` through once it exists.
+/// The three readings of the word are disjoint (Ruling R8): `0` = derive the
+/// default, [`FSM_LAG_LOCKSTEP`] (`u64::MAX`) = lockstep, anything else = a
+/// byte bound. The record's `0` cannot ALSO be the lockstep sentinel the cnc
+/// page uses — one word, two meanings — so the sentinel here is `u64::MAX`,
+/// and [`page_lag_from_setting`] is the one place that maps it back onto the
+/// page's `0`.
+///
+/// Note: `Settings` is never a `RawStateMachine` decision, so this never
+/// refuses. Returns `Some` unconditionally — the `Option` mirrors
+/// [`fsm_lag_eff`]'s shape (`None` ⇔ nothing declared), and the caller pairs
+/// it with its own declared-set check.
 pub fn fsm_lag_from_setting(setting: u64, buffer_bytes: u64, max_payload: usize) -> Option<u64> {
-    if setting == 0 {
-        Some(buffer_bytes / 4)
-    } else if setting == FSM_LAG_LOCKSTEP {
+    if setting == FSM_LAG_LOCKSTEP {
         Some(align_frame_len(HEADER_LEN + max_payload) as u64)
+    } else if setting == 0 {
+        Some(buffer_bytes / 4)
     } else {
-        Some(setting.min(buffer_bytes / 2 - 1))
+        Some(setting.min(buffer_bytes.max(2) / 2 - 1))
     }
 }
 
 /// The cnc 4040 encoding over the same raw setting — mirrors
 /// [`ServicesConfig::page_lag_value`]'s arithmetic (the byte bound the page
-/// carries, clamped the same way [`fsm_lag_from_setting`] is).
+/// carries, clamped the same way [`fsm_lag_from_setting`] is), with
+/// [`FSM_LAG_LOCKSTEP`] mapped onto the PAGE's own lockstep sentinel, `0`.
 pub fn page_lag_from_setting(setting: u64, buffer_bytes: u64) -> u64 {
-    if setting == 0 {
+    if setting == FSM_LAG_LOCKSTEP {
+        0
+    } else if setting == 0 {
         buffer_bytes / 4
     } else {
-        setting.min(buffer_bytes / 2 - 1)
+        setting.min(buffer_bytes.max(2) / 2 - 1)
     }
 }
 
@@ -609,12 +617,14 @@ mod tests {
         );
     }
 
-    /// Cluster-FSM settings (spec §6, task 6 scaffolding): the effective-lag
-    /// arithmetic over a raw `Settings::fsm_lag_bytes` word rather than a
-    /// config-declared `ServicesConfig` bound. `0` reads as "derive the
-    /// default" (same `buffer_bytes / 4` `fsm_lag_eff` uses); an explicit
-    /// value is clamped below half the ring rather than refused, because the
-    /// apply path this feeds is sync/deterministic/no-`Result` (unlike
+    /// Cluster-FSM settings (spec §6): the effective-lag arithmetic over a
+    /// raw `Settings::fsm_lag_bytes` word rather than a config-declared
+    /// `ServicesConfig` bound. Ruling R8's three DISJOINT readings: `0` =
+    /// "derive the default" (same `buffer_bytes / 4` `fsm_lag_eff` uses),
+    /// `FSM_LAG_LOCKSTEP` (`u64::MAX`) = lockstep (one max-size frame, same
+    /// as `fsm_lag_eff`'s lockstep arm), anything else = a byte bound,
+    /// clamped below half the ring rather than refused, because the apply
+    /// path this feeds is sync/deterministic/no-`Result` (unlike
     /// `ServicesConfig::validate`, which runs once at config load and can
     /// still error).
     #[test]
@@ -627,21 +637,31 @@ mod tests {
             Some(b / 2 - 1),
             "an out-of-range setting is clamped, never refused, at this layer"
         );
-        assert_eq!(
-            fsm_lag_from_setting(u64::MAX, b, 256),
-            Some(b / 2 - 1),
-            "clamped even from an absurd word"
-        );
+        // The lockstep sentinel — the SAME value `fsm_lag_eff`'s lockstep arm
+        // returns (header 32 + 256 payload, 32-aligned = 288), so a cluster
+        // that sets lockstep by settings and one that sets it in `node.toml`
+        // run the identical door.
+        assert_eq!(fsm_lag_from_setting(FSM_LAG_LOCKSTEP, b, 256), Some(288));
+        assert_eq!(fsm_lag_from_setting(FSM_LAG_LOCKSTEP, b, 1), Some(64));
+        // A degenerate ring must not underflow the clamp's `/ 2 - 1`.
+        assert_eq!(fsm_lag_from_setting(4096, 0, 256), Some(0));
     }
 
     /// The cnc 4040 encoding over the same raw setting — mirrors
-    /// [`ServicesConfig::page_lag_value`]'s arithmetic.
+    /// [`ServicesConfig::page_lag_value`]'s arithmetic, including its
+    /// lockstep sentinel (the PAGE's `0`, which is NOT the record's `0`).
     #[test]
     fn page_lag_from_setting_table() {
         let b = 4u64 << 20;
         assert_eq!(page_lag_from_setting(0, b), b / 4);
         assert_eq!(page_lag_from_setting(4096, b), 4096);
         assert_eq!(page_lag_from_setting(b, b), b / 2 - 1);
+        assert_eq!(
+            page_lag_from_setting(FSM_LAG_LOCKSTEP, b),
+            0,
+            "the record's lockstep sentinel maps onto the page's own"
+        );
+        assert_eq!(page_lag_from_setting(4096, 0), 0, "no underflow");
     }
 
     #[test]

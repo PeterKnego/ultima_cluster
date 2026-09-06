@@ -11,9 +11,15 @@
 pub const SETTINGS_VERSION: u32 = 1;
 /// The exact encoded length — no trailing bytes are tolerated.
 pub const SETTINGS_LEN: usize = 4 + 8 + 8 + 8 + 1;
-/// `fsm_lag_bytes` value meaning lockstep — the cnc page's existing sentinel,
-/// reused so the word the service apply loops read and the setting agree.
-pub const FSM_LAG_LOCKSTEP: u64 = 0;
+/// `fsm_lag_bytes` value meaning lockstep.
+///
+/// NOT the cnc page's `0` sentinel: in THIS record `0` already means "derive
+/// the default at use" (`buffer_bytes / 4`), and one word cannot carry both
+/// meanings. `u64::MAX` is the sentinel here — no real byte bound can reach
+/// it (`fsm_lag_from_setting` clamps every finite value below half the ring),
+/// so the two readings stay disjoint. `uc_node::services::page_lag_from_setting`
+/// is the one place that maps it back onto the page's `0`.
+pub const FSM_LAG_LOCKSTEP: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -24,9 +30,9 @@ pub enum Target {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
-    /// `0` at genesis = "derive `buffer_bytes / 4` at use"; `FSM_LAG_LOCKSTEP`
-    /// once set explicitly means lockstep. The two zeros are distinguishable
-    /// by `Settings::has_fsm_lag`, set by `settings apply`.
+    /// `0` = "derive `buffer_bytes / 4` at use"; [`FSM_LAG_LOCKSTEP`]
+    /// (`u64::MAX`) = lockstep; anything else is a byte bound, clamped below
+    /// half the ring at use.
     pub fsm_lag_bytes: u64,
     /// `0` = derive at use (the node's `NodeConfig::admission_bytes` default).
     pub admission_bytes: u64,
@@ -93,6 +99,9 @@ mod tests {
         // admission_bytes u64 @12, snapshot_interval_bytes u64 @20, target u8 @28.
         assert_eq!(SETTINGS_VERSION, 1);
         assert_eq!(SETTINGS_LEN, 29);
+        // The lockstep sentinel is a WORD VALUE in this record, not the cnc
+        // page's `0` — `0` here is already "derive the default at use".
+        assert_eq!(FSM_LAG_LOCKSTEP, u64::MAX);
         let s = Settings {
             fsm_lag_bytes: 16 << 20,
             admission_bytes: 4 << 20,
