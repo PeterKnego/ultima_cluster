@@ -36,22 +36,22 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
-    DGRAM_KIND_SNAP_TABLE, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V3, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
-    SnapNakBody, SnapTableBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
-    read_append_position_body, read_config_proposal_body, read_config_reply_body,
-    read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
-    read_snap_begin_body, read_snap_nak_body, read_snap_table_body, read_status_body,
-    read_term_map_body, read_vote_body, write_append_position_body, write_datagram_header,
-    write_nak_body, write_snap_begin_body, write_snap_nak_body, write_status_body,
+    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
+    SnapNakBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
+    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_status_body, read_term_map_body, read_vote_body, write_append_position_body,
+    write_datagram_header, write_nak_body, write_snap_begin_body, write_snap_nak_body,
+    write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
 use crate::TermHandle;
 use crate::fault::FaultSocket;
 use crate::rebuild::{NakConfig, NakTimer, Rebuilt};
-use crate::sender::CtrlMsg;
+use crate::sender::{CLUSTER_ARTIFACT_ID, CtrlMsg};
 
 /// M8 (Task 11): a handshake-plane datagram (kinds 18/19/20) forwarded off
 /// the receive seam, `(from, kind, opened-body-if-any)`. `HS_INIT`/`HS_RESP`
@@ -659,47 +659,32 @@ pub struct FollowerStats {
     /// body carrying `layout != SNAP_BEGIN_LAYOUT_V3`), which
     /// `snap_refused_legacy_peer` deliberately folds together.
     pub snap_begin_undecodable: AtomicU64,
-    /// Time-and-timers plan 3: a `SNAP_TABLE` that belongs to no session we
-    /// are running — no intake open, a different peer, or a different
-    /// `session` id. Dropped: applying it would install a foreign (or forged)
-    /// schedule table into the intake that happens to be open.
-    ///
-    /// Counted ONCE PER EPISODE, not once per datagram (fix round 1): latched
-    /// on the first stray and re-armed only when an intake next opens. The
-    /// common source is a session this node REFUSED — an identity/version
-    /// mismatch, `total_len == 0`, an artifact that could not be placed —
-    /// after which no intake is open while the leader, unaware, re-sends
-    /// BEGIN+TABLE every 20 ms for its whole 30 s session timeout. Per-datagram
-    /// counting would measure that cadence instead of the anomaly, the same
-    /// distinction `snap_begin_undecodable` draws against
-    /// `snap_refused_legacy_peer`.
-    ///
-    /// A table for the session we JUST completed is not counted at all — the
-    /// same resend cadence, but expected traffic.
-    ///
-    /// A rising count means a leader and this node disagree about which
-    /// session is live — read it WITH the refusal counters, which name why —
-    /// or someone is injecting.
-    pub snap_table_stray: AtomicU64,
 }
 
-/// M7 Task 6 / time-and-timers plan 3: the `(position, config, table)`
-/// companion cells `set_snapshot_intake` wires in — the position cell for
-/// `ArchiveCmd::AdoptFloor`, the config cell for `adopt_snapshot_config`, and
-/// the table cell (`(position, time_ns, encoded bytes)`; `(0, 0, vec![])` =
-/// the leader shipped no schedule table) for the install handler's table
-/// adoption. Named to keep `set_snapshot_intake`'s signature under clippy's
+/// What `set_snapshot_intake` wires in for a COMPLETED inbound session
+/// (cluster-FSM spec §5.6):
+///
+/// * `Arc<AtomicU64>` — the session's floor (the MINIMUM over the received
+///   artifact positions), for the consensus agent's `ArchiveCmd::AdoptFloor`.
+/// * `Arc<AtomicU64>` — the position of the CLUSTER ARTIFACT the same session
+///   carried, so the consensus agent knows exactly which install to wait for
+///   before it adopts that floor.
+/// * `SyncSender<(u64, PathBuf)>` — the route to the `uc2-cluster` agent: the
+///   cluster artifact's `(position, path)`, handed over BEFORE the floor is
+///   published. The agent owns the cluster FSM (it lives on its own thread),
+///   so the receiver cannot install it itself.
+///
+/// Named to keep `set_snapshot_intake`'s signature under clippy's
 /// type-complexity threshold.
 ///
-/// Both mutex cells are written BEFORE the position cell's `Release` store,
-/// and the reader samples the position `Acquire` first — so a floor it can
-/// see implies both cells hold THIS session's bytes.
-pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>, ScheduleTableCell);
-
-/// The schedule-table half of [`IncomingSnapshotSignal`]: `(position,
-/// time_ns, encoded bytes)` of the table the completed session carried.
-/// Named for the same reason the tuple above is — it is a field type too.
-pub type ScheduleTableCell = Arc<Mutex<(u64, u64, Vec<u8>)>>;
+/// The first two are written BEFORE the floor cell's `Release` store, and the
+/// reader samples the floor `Acquire` first — so a floor it can see implies
+/// the cluster position it reads belongs to THIS session.
+pub type IncomingSnapshotSignal = (
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    mpsc::SyncSender<(u64, PathBuf)>,
+);
 
 /// M14c: the identity of the last INBOUND session that completed here — what
 /// [`FollowerReceiver::snap_last_done`] re-acks a straggling `SNAP_BEGIN`
@@ -748,8 +733,17 @@ struct SnapIntake {
     /// From the session's first `SNAP_BEGIN`, alongside `identity` — rides
     /// back out on the `SNAP_DONE` echo.
     version: [u32; 8],
-    /// Bit `i` set ⇔ id `i`'s artifact is complete and renamed.
+    /// Bit `i` set ⇔ id `i`'s artifact is complete and renamed. Row ids
+    /// only: the CLUSTER ARTIFACT is not a row and has no bit here — see
+    /// `cluster_received`.
     received: u64,
+    /// Cluster-FSM spec §5.6: the [`crate::sender::CLUSTER_ARTIFACT_ID`]
+    /// artifact is complete and renamed. A session completes only once every
+    /// declared row's bit AND this flag are set: a joiner that adopted the
+    /// floor without the cluster image would run with no membership, no
+    /// schedule table and no settings, and no way to learn them (their frames
+    /// are below the purged floor).
+    cluster_received: bool,
     /// Announced artifacts, ascending, contiguous in `base`.
     parts: Vec<SnapPart>,
     /// Sum of the announced artifacts' lengths — how far the stream is known
@@ -758,20 +752,6 @@ struct SnapIntake {
     /// Contiguity over `[0, announced_len)` STREAM offsets.
     got: Rebuilt,
     nak: NakTimer,
-    /// M7 Task 6: the encoded `ConfigRecord.config` carried in `SNAP_BEGIN`
-    /// (`v2::config::encode_config` bytes; empty if the leader shipped none;
-    /// identical on every BEGIN of a session — taken from the first).
-    /// Forwarded to `incoming_snapshot_config` on completion, alongside
-    /// `incoming_snapshot_pos`, for the consensus agent's install handler.
-    config: Vec<u8>,
-    /// Time-and-timers plan 3: the schedule table this session carries, from
-    /// its own `SNAP_TABLE` datagram — `None` until it lands. The session does
-    /// NOT complete while this is `None`: a joiner that adopted the floor
-    /// without the table would run with no timers at all and no way to learn
-    /// of them (the adopting frame is below the purged floor). The leader
-    /// re-sends BEGIN+TABLE every 20 ms until our `SNAP_DONE`, so a lost
-    /// TABLE costs one cadence, never the session.
-    table: Option<(u64, u64, Vec<u8>)>,
     /// M14c2 (T10a): when this intake last saw evidence the transfer is LIVE —
     /// a chunk that landed, or a new artifact's `SNAP_BEGIN`. The
     /// [`SNAP_INTAKE_TIMEOUT_NS`] deadline is measured from here, so an
@@ -867,17 +847,6 @@ pub struct FollowerReceiver {
     /// `SNAP_BEGIN` — the wire is speakable again, so a later refusal is a
     /// genuinely new one. See [`FollowerStats::snap_begin_undecodable`].
     snap_begin_undecodable_latched: bool,
-    /// Time-and-timers plan 3 (fix round 1): a stray `SNAP_TABLE` has already
-    /// been counted for the current episode. Cleared whenever an intake OPENS
-    /// (a `SNAP_BEGIN` this node accepted), so the counter measures episodes
-    /// rather than the leader's 20 ms resend cadence. Without it, a REFUSED
-    /// BEGIN — an identity/version mismatch, `total_len == 0`, an unplaceable
-    /// artifact — leaves no intake open while the leader keeps re-sending
-    /// BEGIN+TABLE for its whole 30 s session timeout, and every one of those
-    /// TABLEs would count: the exact defect
-    /// [`snap_begin_undecodable_latched`](Self::snap_begin_undecodable_latched)
-    /// exists to avoid. See [`FollowerStats::snap_table_stray`].
-    snap_table_stray_latched: bool,
     /// M14c: the last session that COMPLETED here. The sender keeps re-sending
     /// a `SNAP_BEGIN` on a 20 ms cadence until our `SNAP_DONE` reaches it, so a
     /// lost DONE would otherwise re-open (and re-download) a set we already
@@ -888,19 +857,19 @@ pub struct FollowerReceiver {
     /// inbound snapshot (written on rename). The consensus agent samples it to
     /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
     incoming_snapshot_pos: Option<Arc<AtomicU64>>,
-    /// M7 Task 6: companion cell for `incoming_snapshot_pos` — the encoded
-    /// config carried by the SAME completed transfer. Written in `snap_complete`
-    /// BEFORE `incoming_snapshot_pos` is stored (so the consensus agent's
-    /// `Acquire` load of the position, once it observes the new value, is
-    /// guaranteed to see this cell's matching content — the mutex lock/unlock
-    /// pair is itself a release/acquire fence). `None` in unit tests.
-    incoming_snapshot_config: Option<Arc<Mutex<Vec<u8>>>>,
-    /// Time-and-timers plan 3: the second companion cell for
-    /// `incoming_snapshot_pos` — the schedule table (`(position, time_ns,
-    /// encoded bytes)`) the SAME completed transfer carried, on the same
-    /// publish-before-the-position rule as `incoming_snapshot_config`. `None`
-    /// in unit tests.
-    incoming_snapshot_table: Option<ScheduleTableCell>,
+    /// Cluster-FSM spec §5.6: companion cell for `incoming_snapshot_pos` —
+    /// the position of the CLUSTER ARTIFACT the SAME completed transfer
+    /// carried. Written in `snap_complete` BEFORE `incoming_snapshot_pos` is
+    /// stored (so the consensus agent, which samples the position `Acquire`
+    /// first, can never read a stale one), and what its install handler waits
+    /// for the `uc2-cluster` agent to acknowledge before adopting the floor.
+    incoming_cluster_pos: Option<Arc<AtomicU64>>,
+    /// Cluster-FSM spec §5.6: the route the completed session's cluster
+    /// artifact takes to the `uc2-cluster` agent, which owns the cluster FSM
+    /// and installs it (`ClusterAgent::install_from`). Sent BEFORE
+    /// `incoming_snapshot_pos` is stored, for the same reason the cell above
+    /// is written first.
+    cluster_install: Option<mpsc::SyncSender<(u64, PathBuf)>>,
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
@@ -980,9 +949,22 @@ pub struct FollowerReceiver {
     cleartext_peer_log: HashMap<SocketAddr, u64>,
 }
 
-/// M14c: the lowest id in `declared` strictly above `after` (`None` = the
-/// lowest of all). The artifacts of a session are announced in exactly this
-/// order, which is what lets the receiver place each one's STREAM base.
+/// M14c: the id a session announces next — the lowest id in `declared`
+/// strictly above `after` (`None` = the lowest of all), and once the declared
+/// rows are exhausted, the CLUSTER ARTIFACT (cluster-FSM spec §5.6), which is
+/// always LAST. `None` means the session has announced everything.
+///
+/// The artifacts of a session are announced in exactly this order, which is
+/// what lets the receiver place each one's STREAM base.
+fn next_expected_id(declared: u64, after: Option<u8>) -> Option<u8> {
+    if after == Some(CLUSTER_ARTIFACT_ID) {
+        return None; // the cluster artifact is the last one
+    }
+    next_declared_id(declared, after).or(Some(CLUSTER_ARTIFACT_ID))
+}
+
+/// The row half of [`next_expected_id`]: the lowest id in `declared` strictly
+/// above `after`, `None` when the declared rows are exhausted.
 fn next_declared_id(declared: u64, after: Option<u8>) -> Option<u8> {
     let from = after.map_or(0u32, |id| id as u32 + 1);
     if from >= u64::BITS {
@@ -1013,11 +995,28 @@ fn discard_snap_parts(parts: Vec<SnapPart>) {
 
 /// M14c: open the `.part` for one announced artifact under `<root>/<id>/`. Free
 /// function so it borrows neither the receiver nor the intake.
+///
+/// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT lands where the node's OWN
+/// `uc2-cluster` agent writes and recovers its artifacts —
+/// `<root>/cluster/snap-{pos}.ultcluster`, the path
+/// `uc_node::cluster_agent::artifact_path` builds — NOT under a `255/`
+/// subdirectory of its own. It is the same file, written by the session
+/// instead of by a local freeze, so a joiner that installs one and then
+/// restarts recovers from it exactly as it would from its own.
 fn open_snap_part(root: &Path, b: &SnapBeginBody, base: u64) -> Option<SnapPart> {
-    let dir = root.join(b.service_id.to_string());
+    let cluster = b.service_id == CLUSTER_ARTIFACT_ID;
+    let dir = if cluster {
+        root.join("cluster")
+    } else {
+        root.join(b.service_id.to_string())
+    };
     std::fs::create_dir_all(&dir).ok()?;
     let part_path = dir.join(format!("incoming-{}.part", b.snapshot_pos));
-    let final_path = dir.join(format!("snap-{}.ultsnap", b.snapshot_pos));
+    let final_path = dir.join(if cluster {
+        format!("snap-{}.ultcluster", b.snapshot_pos)
+    } else {
+        format!("snap-{}.ultsnap", b.snapshot_pos)
+    });
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -1122,11 +1121,10 @@ impl FollowerReceiver {
             own_versions: None,
             snap_intake: None,
             snap_begin_undecodable_latched: false,
-            snap_table_stray_latched: false,
             snap_last_done: None,
             incoming_snapshot_pos: None,
-            incoming_snapshot_config: None,
-            incoming_snapshot_table: None,
+            incoming_cluster_pos: None,
+            cluster_install: None,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
             snap_adopt_pending: None,
@@ -1243,14 +1241,11 @@ impl FollowerReceiver {
     /// mismatch`); `own_versions` is a closure returning this node's own
     /// row-`r` attached service's packed version, read fresh on every
     /// `SNAP_BEGIN` for the version comparison (both sides nonzero and
-    /// disagreeing = refused); `incoming` (if set) is `(position, config)`:
-    /// the position cell receives each COMPLETED session's floor — the
-    /// MINIMUM over the received artifact positions — for the consensus
-    /// agent to adopt as an archive floor, and (M7 Task 6) the config cell
-    /// receives that session's carried `SNAP_BEGIN.config` bytes for the
-    /// agent's `adopt_snapshot_config` handler. Without this call kinds
-    /// 12/13 are ignored (a node that never joins below a floor never
-    /// receives snapshots).
+    /// disagreeing = refused); `incoming` (if set) is the
+    /// [`IncomingSnapshotSignal`] triple — the floor cell, the cluster
+    /// artifact's position cell, and the route that hands that artifact to
+    /// the `uc2-cluster` agent. Without this call kinds 12/13 are ignored
+    /// (a node that never joins below a floor never receives snapshots).
     pub fn set_snapshot_intake(
         &mut self,
         snap_root: PathBuf,
@@ -1261,10 +1256,10 @@ impl FollowerReceiver {
         self.snap_dir = Some(snap_root);
         self.own_identity = own_identity;
         self.own_versions = Some(own_versions);
-        if let Some((pos, config, table)) = incoming {
+        if let Some((pos, cluster_pos, cluster_install)) = incoming {
             self.incoming_snapshot_pos = Some(pos);
-            self.incoming_snapshot_config = Some(config);
-            self.incoming_snapshot_table = Some(table);
+            self.incoming_cluster_pos = Some(cluster_pos);
+            self.cluster_install = Some(cluster_install);
         }
     }
 
@@ -1516,8 +1511,8 @@ impl FollowerReceiver {
         // existed. Both now do, both directions of a snapshot session are
         // sealed, and SNAP is authenticated exactly like every other pairwise
         // kind by falling through to `open_slice` below. The hole it left
-        // open — a forged `SNAP_BEGIN` carrying `SnapBeginBody.config`
-        // straight into `maybe_adopt_incoming_snapshot`, i.e. attacker-chosen
+        // open — a forged session whose CLUSTER ARTIFACT is installed by
+        // fiat by `maybe_adopt_incoming_snapshot`, i.e. attacker-chosen
         // application state AND attacker-chosen cluster membership on a
         // joining or below-floor node — is closed by that fall-through.
         // Pinned by `an_unsealed_snap_begin_is_refused_now_that_t17_landed`.
@@ -1901,7 +1896,7 @@ impl FollowerReceiver {
                     // realistic undecodable body post-0.7.0 is a genuine 0.6.0
                     // `SNAP_BEGIN`, whose fixed part is 34 bytes plus its
                     // config, so it fails `read_snap_begin_body`'s
-                    // `SNAP_BEGIN_FIXED_LEN` (122) check and would otherwise
+                    // `SNAP_BEGIN_FIXED_LEN` (120) check and would otherwise
                     // vanish with BOTH refusal counters at zero — exactly the
                     // flag-day symptom an operator needs to see. Same named
                     // refusal, same drop as a wrong `layout` byte. Only counted
@@ -1933,17 +1928,6 @@ impl FollowerReceiver {
             }
             DGRAM_KIND_SNAP_CHUNK => {
                 self.snap_chunk(from, h.position, &d[DATAGRAM_HEADER_LEN..]);
-            }
-            // Time-and-timers plan 3: the schedule table of the session this
-            // node is receiving — its own datagram, sent after every
-            // `SNAP_BEGIN`, because `SNAP_BEGIN` has no room for it and a
-            // below-floor joiner cannot read the adopting frame out of the
-            // purged log. An undecodable body is simply dropped (total
-            // decoder, no counter): the leader re-sends on its own cadence.
-            DGRAM_KIND_SNAP_TABLE => {
-                if let Some(b) = read_snap_table_body(&d[DATAGRAM_HEADER_LEN..]) {
-                    self.snap_table(from, b);
-                }
             }
             // OUTBOUND session control (this node is the leader shipping a
             // snapshot): demux the peer's repair NAK / completion to our sender.
@@ -1987,8 +1971,13 @@ impl FollowerReceiver {
         // Read once, up front: every liveness stamp below is taken under a
         // `&mut self.snap_intake` borrow that excludes `self.now_ns()`.
         let now = self.now_ns();
-        if b.layout != SNAP_BEGIN_LAYOUT_V3 {
-            // "peer wire ≤ 0.6.0" — a body whose discriminator we do not speak.
+        if b.layout != SNAP_BEGIN_LAYOUT_V4 {
+            // "peer speaks a SNAP_BEGIN shape we do not" — wire ≤ 0.6.0
+            // (`SNAP_BEGIN_LAYOUT_V2`), or the intermediate 0.7.0 shape that
+            // carried a trailing config (`SNAP_BEGIN_LAYOUT_V3`, retired by
+            // spec §5.6). Both are refused here by NAME rather than misread:
+            // the V3 body's first 120 bytes decode identically, so nothing
+            // but this discriminator separates them.
             self.stats
                 .snap_refused_legacy_peer
                 .fetch_add(1, Ordering::Relaxed);
@@ -2008,8 +1997,15 @@ impl FollowerReceiver {
         // `service_id` is e.g. 9 would panic the receiver agent on an
         // out-of-bounds index — remotely, and with crypto off). Clamp it
         // into range first.
+        //
+        // Cluster-FSM spec §5.6: `CLUSTER_ARTIFACT_ID` (255) is deliberately
+        // OUTSIDE the declared mask — it is not a row — so the mask half of
+        // the test does not apply to it. The identity half still does: every
+        // BEGIN of a session, the cluster artifact's included, carries the
+        // sender's row identities and must agree with ours positionally.
         let bit = 1u64.checked_shl(b.service_id as u32).unwrap_or(0);
-        if b.identity != self.own_identity || b.declared_mask() & bit == 0 {
+        let outside_mask = b.service_id != CLUSTER_ARTIFACT_ID && b.declared_mask() & bit == 0;
+        if b.identity != self.own_identity || outside_mask {
             let mismatch_row = (0..8).find(|&r| b.identity[r] != self.own_identity[r]);
             let row = mismatch_row.unwrap_or((b.service_id as usize).min(7)) as u8;
             // The arrays can agree at every row while still failing here —
@@ -2020,6 +2016,8 @@ impl FollowerReceiver {
             // even though both are counted under the same
             // `snap_refused_declared_mismatch` counter.
             let kind = if mismatch_row.is_none() {
+                // `outside_mask` is what failed: the artifact names a row the
+                // sender did not declare (a forged `service_id`).
                 RefusalKind::ArtifactId
             } else {
                 RefusalKind::Identity
@@ -2104,7 +2102,7 @@ impl FollowerReceiver {
             // that skips one means an earlier BEGIN was lost, and placing this
             // one at `announced_len` anyway would give two FSMs each other's
             // bytes — a silent mis-install, not a stall. Drop it and prompt.
-            let expect = next_declared_id(
+            let expect = next_expected_id(
                 crate::sender::identity_mask(&cur.identity),
                 cur.parts.last().map(|p| p.service_id),
             );
@@ -2135,7 +2133,7 @@ impl FollowerReceiver {
         // A new session (or one replacing a stale one). Same placement rule: a
         // session's FIRST artifact is the lowest declared id — anything else is
         // a session already under way whose opening BEGIN we never saw.
-        if Some(b.service_id) != next_declared_id(b.declared_mask(), None) {
+        if Some(b.service_id) != next_expected_id(b.declared_mask(), None) {
             self.snap_probe_missing_begin(from, b.session, 0);
             return;
         }
@@ -2149,85 +2147,22 @@ impl FollowerReceiver {
             return;
         };
         let announced_len = part.len;
-        // Plan 3 (fix round 1): an intake is OPEN again, so the next stray
-        // `SNAP_TABLE` starts a new episode and is worth its own count.
-        self.snap_table_stray_latched = false;
         self.snap_intake = Some(SnapIntake {
             peer: from,
             session: b.session,
             identity: b.identity,
             version: b.version,
             received: 0,
+            cluster_received: false,
             parts: vec![part],
             announced_len,
             got: Rebuilt::new(0),
             nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
-            config: b.config,
-            table: None,
             last_chunk_ns: now,
             last_publish_try_ns: None,
             write_failure_logged: false,
         });
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Time-and-timers plan 3: record this session's schedule table, then
-    /// re-run the completion check — the TABLE can arrive after the session's
-    /// last chunk, and nothing else would fire afterwards.
-    ///
-    /// Accepted only for the OPEN intake, and only from its own peer under its
-    /// own `session` id; anything else is dropped and counted
-    /// ([`FollowerStats::snap_table_stray`]) rather than applied, since an
-    /// intake that adopts a foreign table installs foreign timer state. Two
-    /// benign duplicates are deliberately NOT strays: a second TABLE for the
-    /// intake that already has one (the 20 ms BEGIN+TABLE cadence, still
-    /// running while our chunks land) and one for the session we just
-    /// completed (the same cadence, still running until our `SNAP_DONE`
-    /// arrives) — counting either would turn this counter into a measure of
-    /// the resend rate.
-    fn snap_table(&mut self, from: SocketAddr, b: SnapTableBody) {
-        if self.snap_dir.is_none() {
-            return; // this node does not receive snapshots
-        }
-        // `now_ns()` up front: the completion re-drive below needs it, and it
-        // cannot be taken under the `&mut self.snap_intake` borrow.
-        let now = self.now_ns();
-        if let Some(intake) = self.snap_intake.as_mut()
-            && intake.peer == from
-            && intake.session == b.session
-        {
-            if intake.table.is_some() {
-                return; // duplicate: this session's table is already in
-            }
-            intake.table = Some((b.position, b.time_ns, b.table));
-            // The last chunk may have landed BEFORE this table did, in which
-            // case `snap_publish_complete_parts` already ran and
-            // `snap_complete` withheld. Re-run it here: every part it finds is
-            // `done` (the walk skips them), so on the ordinary ordering this
-            // is a no-op, and on the late-table ordering it is what completes
-            // the session.
-            self.snap_publish_complete_parts(now);
-            return;
-        }
-        if self
-            .snap_last_done
-            .as_ref()
-            .is_some_and(|d| d.peer == from && d.session == b.session)
-        {
-            return; // a re-send for the session we already completed
-        }
-        // Counted ONCE PER EPISODE, latched exactly like
-        // `snap_begin_undecodable`. The common way to get here is a REFUSED
-        // BEGIN (identity/version mismatch, `total_len == 0`, an artifact we
-        // could not place): no intake is open, and the leader — which has no
-        // idea we refused — keeps re-sending BEGIN+TABLE every 20 ms until its
-        // 30 s session timeout. Counting each one would make this a measure of
-        // the resend cadence rather than of the anomaly. The latch clears when
-        // an intake next opens.
-        if !self.snap_table_stray_latched {
-            self.snap_table_stray_latched = true;
-            self.stats.snap_table_stray.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     /// M14c: drop the in-flight intake, if any, deleting its `.part` files.
@@ -2396,36 +2331,31 @@ impl FollowerReceiver {
                 return;
             }
             intake.parts[k].done = true;
-            // id < 64: checked in `snap_begin`
-            intake.received |= 1u64 << intake.parts[k].service_id;
+            if intake.parts[k].service_id == CLUSTER_ARTIFACT_ID {
+                // Not a row: it has no bit in `received` (cluster-FSM §5.6).
+                intake.cluster_received = true;
+            } else {
+                // id < 64: checked in `snap_begin`
+                intake.received |= 1u64 << intake.parts[k].service_id;
+            }
         }
         // Nothing blocked this pass: disarm, so the next completion publishes
         // the instant its bytes land.
         intake.last_publish_try_ns = None;
-        if intake.received != crate::sender::identity_mask(&intake.identity) {
+        if intake.received != crate::sender::identity_mask(&intake.identity)
+            || !intake.cluster_received
+        {
             return; // the set is incomplete — no floor is adopted yet
         }
         self.snap_complete();
     }
 
-    /// Every artifact of the session is renamed: ack with SNAP_DONE, publish the
-    /// carried config, and signal the floor — the MINIMUM over the received
-    /// positions, which is exactly the node floor the leader shipped from, so
-    /// every FSM's own artifact sits at or above it.
+    /// Every artifact of the session is renamed: ack with SNAP_DONE, hand the
+    /// cluster artifact to the `uc2-cluster` agent, and signal the floor — the
+    /// MINIMUM over the received positions, which is exactly the node floor
+    /// the leader shipped from, so every FSM's own artifact sits at or above
+    /// it.
     fn snap_complete(&mut self) {
-        // Time-and-timers plan 3: a session is COMPLETE only once its schedule
-        // table has landed too. Checked before the `take()` — the intake must
-        // stay open so a later arrival can re-run this. Which arrival: a
-        // remaining chunk, or (once every part is renamed) the TABLE itself
-        // and nothing else — `snap_upkeep`'s re-drive walks parts and a set
-        // with no unpublished part left cannot fire it, so `snap_table` MUST
-        // call the completion check itself. The leader re-sends BEGIN+TABLE
-        // every `SNAP_BEGIN_RESEND_NS` until our `SNAP_DONE`, so a lost TABLE
-        // is retried on that cadence and this can never wedge: withholding
-        // the ack is exactly what keeps the retries coming.
-        if self.snap_intake.as_ref().is_some_and(|i| i.table.is_none()) {
-            return;
-        }
         let Some(intake) = self.snap_intake.take() else {
             return;
         };
@@ -2442,13 +2372,12 @@ impl FollowerReceiver {
         // closes its session (it keys on `(peer, session)` alone).
         let ack = SnapBeginBody {
             session: intake.session,
-            layout: SNAP_BEGIN_LAYOUT_V3,
+            layout: SNAP_BEGIN_LAYOUT_V4,
             service_id: last.service_id,
             snapshot_pos: last.snapshot_pos,
             total_len: last.len,
             identity: intake.identity,
             version: intake.version,
-            config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
         };
         // M8 (T17): sealed or dropped. A dropped DONE costs only the leader's
         // session slot (it times out); the local artifacts are already renamed,
@@ -2465,20 +2394,33 @@ impl FollowerReceiver {
                 .collect(),
         });
         self.snap_send_done(intake.peer, &ack);
-        // M7 Task 6 / plan 3: publish the carried cells BEFORE the position
-        // signal — the consensus agent's install handler samples the position
-        // (Acquire) and only then reads them, so publishing them first (each
-        // mutex is itself a release fence) guarantees it sees THIS transfer's
-        // bytes, never a stale or absent value from a prior/no session. Order
-        // among the cells themselves: TABLE, then config, then the floor.
-        if let Some(cell) = &self.incoming_snapshot_table {
-            // `table` is `Some` here — `snap_complete` returned above while it
-            // was `None` — so the cell never receives a placeholder over a
-            // real table. `(0, 0, vec![])` means the LEADER had none.
-            *cell.lock().unwrap() = intake.table.clone().unwrap_or((0, 0, Vec::new()));
-        }
-        if let Some(cell) = &self.incoming_snapshot_config {
-            *cell.lock().unwrap() = intake.config.clone();
+        // Cluster-FSM spec §5.6: hand the CLUSTER ARTIFACT to the
+        // `uc2-cluster` agent, and publish its position, BEFORE the floor
+        // signal — the consensus agent's install handler samples the floor
+        // (Acquire) and only then reads the cluster position and waits for the
+        // agent's ack, so doing both first is what guarantees it sees THIS
+        // transfer's artifact rather than a stale or absent one. The agent
+        // owns the cluster FSM (it runs on its own thread), which is why this
+        // is a route and not an install here.
+        //
+        // A BLOCKING `send`, deliberately — not `try_send`. A dropped
+        // hand-off would leave the consensus agent waiting forever for an ack
+        // that never comes, and there is nothing else this receiver could
+        // usefully do with a set whose cluster image it cannot deliver. The
+        // channel is sized for the one install a session produces, so in
+        // practice it never blocks; the only `Err` is a disconnected
+        // `uc2-cluster` agent, which means the node is already dead.
+        let cluster = intake
+            .parts
+            .iter()
+            .find(|p| p.service_id == CLUSTER_ARTIFACT_ID);
+        if let Some(p) = cluster {
+            if let Some(cell) = &self.incoming_cluster_pos {
+                cell.store(p.snapshot_pos, Ordering::Release);
+            }
+            if let Some(tx) = &self.cluster_install {
+                let _ = tx.send((p.snapshot_pos, p.final_path.clone()));
+            }
         }
         // Signal the consensus agent to adopt the floor + mirror observability.
         if let Some(slot) = &self.incoming_snapshot_pos {
@@ -2510,13 +2452,12 @@ impl FollowerReceiver {
             &mut d[DATAGRAM_HEADER_LEN..],
             &SnapBeginBody {
                 session: b.session,
-                layout: SNAP_BEGIN_LAYOUT_V3,
+                layout: SNAP_BEGIN_LAYOUT_V4,
                 service_id: b.service_id,
                 snapshot_pos: b.snapshot_pos,
                 total_len: b.total_len,
                 identity: b.identity,
                 version: b.version,
-                config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
         self.seal_and_send(peer, DGRAM_KIND_SNAP_DONE, &mut d);
@@ -2855,8 +2796,8 @@ mod tests {
     use uc_protocol::v2::datagram::{
         DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
         DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader,
-        NAK_BODY_LEN, SNAP_TABLE_FIXED_LEN, STATUS_BODY_LEN, read_nak_body, read_status_body,
-        write_datagram_header, write_nak_body, write_snap_table_body, write_status_body,
+        NAK_BODY_LEN, STATUS_BODY_LEN, read_nak_body, read_status_body, write_datagram_header,
+        write_nak_body, write_status_body,
     };
 
     const TERM: u32 = 9;
@@ -5294,25 +5235,15 @@ mod tests {
             &mut begin,
             &SnapBeginBody {
                 session: 7,
-                layout: SNAP_BEGIN_LAYOUT_V3,
+                layout: SNAP_BEGIN_LAYOUT_V4,
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: TOTAL,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: vec![],
             },
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
-        // Plan 3: the leader sends its schedule table after every BEGIN, and
-        // the session does not complete without one — this one is sealed on
-        // the same pairwise channel as everything else in this test.
-        peer.send_sealed_pairwise(
-            to,
-            DGRAM_KIND_SNAP_TABLE,
-            0,
-            &snap_table_wire(7, 4096, 5, b"tbl"),
-        );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 32, &[0xEEu8; 32]);
 
         let (nak_wire, nak_body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_NAK);
@@ -5325,13 +5256,25 @@ mod tests {
             "exactly the counter+tag overhead"
         );
 
-        // Fill the gap; the intake completes and acks SNAP_DONE.
+        // Fill the gap, then the CLUSTER ARTIFACT (spec §5.6) — 16 bytes at
+        // stream base 64, sealed on the same pairwise channel. Only then does
+        // the intake complete and ack SNAP_DONE.
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 0, &[0xDDu8; 32]);
+        peer.send_sealed_pairwise(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
+        );
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, TOTAL, &[0xCCu8; 16]);
         let (done_wire, done_body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
         let done = read_snap_begin_body(&done_body).expect("a well-formed SNAP_DONE body");
         assert_eq!(done.session, 7);
-        assert_eq!(done.snapshot_pos, 4096);
-        assert_eq!(done.service_id, 0);
+        assert_eq!(done.snapshot_pos, 8192);
+        assert_eq!(
+            done.service_id, CLUSTER_ARTIFACT_ID,
+            "the ack echoes the session's LAST artifact — always the cluster one"
+        );
         assert_eq!(done.declared_mask(), 0b1);
         assert_eq!(
             done_wire.len(),
@@ -5341,6 +5284,13 @@ mod tests {
         assert!(
             dir.path().join("0").join("snap-4096.ultsnap").exists(),
             "the sealed session actually completed end to end"
+        );
+        assert!(
+            dir.path()
+                .join("cluster")
+                .join("snap-8192.ultcluster")
+                .exists(),
+            "...and its cluster artifact landed where the uc2-cluster agent recovers from"
         );
     }
 
@@ -5401,21 +5351,21 @@ mod tests {
         let st = r.stats();
         let before = st.datagrams.load(Relaxed);
 
-        // A well-formed, entirely cleartext SNAP_BEGIN carrying a hostile
-        // membership record — exactly the forgery T11's allowance admitted.
-        let hostile = b"ATTACKER-CHOSEN-MEMBERSHIP".to_vec();
-        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + hostile.len()];
+        // A well-formed, entirely cleartext SNAP_BEGIN opening a session
+        // whose CLUSTER ARTIFACT this node would install by fiat — membership,
+        // schedule table and settings, attacker-chosen. Exactly the forgery
+        // T11's allowance admitted.
+        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(
             &mut body,
             &SnapBeginBody {
                 session: 1,
-                layout: SNAP_BEGIN_LAYOUT_V3,
+                layout: SNAP_BEGIN_LAYOUT_V4,
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 32,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: hostile.clone(),
             },
         );
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
@@ -5476,13 +5426,12 @@ mod tests {
             &mut begin,
             &SnapBeginBody {
                 session: 3,
-                layout: SNAP_BEGIN_LAYOUT_V3,
+                layout: SNAP_BEGIN_LAYOUT_V4,
                 service_id: 0,
                 snapshot_pos: 4096,
                 total_len: 64,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: vec![],
             },
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
@@ -5552,20 +5501,20 @@ mod tests {
         out
     }
 
-    /// A `SNAP_BEGIN` body as the leader ships it (fixed part only, no config).
+    /// A `SNAP_BEGIN` body as the leader ships it (fixed-length since spec
+    /// §5.6). `id` is a declared row, or [`CLUSTER_ARTIFACT_ID`].
     fn snap_begin_wire(session: u32, id: u8, pos: u64, len: u64, declared: u64) -> Vec<u8> {
         let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(
             &mut body,
             &SnapBeginBody {
                 session,
-                layout: SNAP_BEGIN_LAYOUT_V3,
+                layout: SNAP_BEGIN_LAYOUT_V4,
                 service_id: id,
                 snapshot_pos: pos,
                 total_len: len,
                 identity: ident(declared),
                 version: [0; 8],
-                config: vec![],
             },
         );
         body
@@ -5596,6 +5545,31 @@ mod tests {
             "no shift past bit 63"
         );
         assert_eq!(next_declared_id(0, None), None);
+    }
+
+    /// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT is announced LAST, after
+    /// every declared row — that is the whole of its placement rule, and 255
+    /// sorting above every row id is what makes "ascending by `service_id`"
+    /// already say so.
+    #[test]
+    fn next_expected_id_puts_the_cluster_artifact_last() {
+        assert_eq!(next_expected_id(0b101, None), Some(0));
+        assert_eq!(next_expected_id(0b101, Some(0)), Some(2));
+        assert_eq!(
+            next_expected_id(0b101, Some(2)),
+            Some(CLUSTER_ARTIFACT_ID),
+            "the declared rows are exhausted: the cluster artifact is next"
+        );
+        assert_eq!(
+            next_expected_id(0b101, Some(CLUSTER_ARTIFACT_ID)),
+            None,
+            "and nothing follows it"
+        );
+        assert_eq!(
+            next_expected_id(0, None),
+            Some(CLUSTER_ARTIFACT_ID),
+            "a set with no declared row is still a set with a cluster artifact"
+        );
     }
 
     /// M14c: an artifact's STREAM base is the SUM of its predecessors' lengths,
@@ -5728,15 +5702,16 @@ mod tests {
         let begin = snap_begin_wire(21, 0, 4096, 64, 0b1);
 
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
-        // Plan 3: the leader sends its schedule table after every BEGIN, and
-        // the session does not complete without one.
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 0, &[0xABu8; 64]);
+        // Spec §5.6: the session's CLUSTER ARTIFACT, last — without it the
+        // set is incomplete and no DONE ever goes out.
         peer.send_sealed_pairwise(
             to,
-            DGRAM_KIND_SNAP_TABLE,
+            DGRAM_KIND_SNAP_BEGIN,
             0,
-            &snap_table_wire(21, 0, 0, b""),
+            &snap_begin_wire(21, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
         );
-        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 0, &[0xABu8; 64]);
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 64, &[0xCDu8; 16]);
         let (_, first) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
         assert_eq!(read_snap_begin_body(&first).unwrap().session, 21);
         let part = dir.path().join("0").join("incoming-4096.part");
@@ -5809,7 +5784,6 @@ mod tests {
                 total_len: 64,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: vec![],
             },
         );
         stranger.send(to, DGRAM_KIND_SNAP_BEGIN, 0, TERM, &legacy);
@@ -5905,22 +5879,7 @@ mod tests {
         assert!(!stale.exists(), "the superseded .part must not be orphaned");
     }
 
-    // ---- time-and-timers plan 3: the session's SNAP_TABLE ----
-
-    /// A `SNAP_TABLE` body as the leader ships it.
-    fn snap_table_wire(session: u32, position: u64, time_ns: u64, table: &[u8]) -> Vec<u8> {
-        let mut body = vec![0u8; SNAP_TABLE_FIXED_LEN + table.len()];
-        write_snap_table_body(
-            &mut body,
-            &SnapTableBody {
-                session,
-                position,
-                time_ns,
-                table: table.to_vec(),
-            },
-        );
-        body
-    }
+    // ---- cluster-FSM spec §5.6: the session's CLUSTER ARTIFACT ----
 
     /// Drive the receiver for a bounded window and count the `SNAP_DONE`s it
     /// sent. Bounded rather than `FakeLeader::recv`'s 5 s wait-for-one: the
@@ -5944,38 +5903,38 @@ mod tests {
         n
     }
 
-    /// Time-and-timers plan 3: a below-floor joiner installs the leader's
-    /// schedule table off the same session that carries the snapshot set —
-    /// it cannot read the adopting frame out of the purged log. The table is
-    /// its own datagram (`SNAP_BEGIN` has no room), so the session is only
-    /// COMPLETE once both halves have landed: the ack is withheld until the
-    /// table arrives, and the table cell is published BEFORE the floor signal
-    /// the consensus agent's install handler keys on.
+    /// Cluster-FSM spec §5.6: a below-floor joiner gets the cluster row —
+    /// membership, the replicated schedule table, the settings — off the same
+    /// session that carries the snapshot set, as one more artifact under
+    /// [`CLUSTER_ARTIFACT_ID`]. It cannot read those frames out of the purged
+    /// log, so this is the only way they reach it.
+    ///
+    /// A session is therefore COMPLETE only once that artifact has landed too:
+    /// the `SNAP_DONE` is withheld until then (which is what keeps the
+    /// leader's 20 ms BEGIN cadence coming), the artifact is routed to the
+    /// `uc2-cluster` agent that owns the cluster FSM, and its position is
+    /// published — both BEFORE the floor signal the consensus agent's install
+    /// handler keys on.
     #[test]
-    fn a_session_does_not_complete_until_its_snap_table_arrives_and_publishes_it_first() {
+    fn a_session_does_not_complete_until_its_cluster_artifact_lands_and_routes_it_first() {
         use Ordering::Relaxed;
         let b = buffer();
         let mut leader = FakeLeader::new();
         let mut r = follower(&b, leader.addr());
         let dir = snap_scratch_dir();
         let pos_cell = Arc::new(AtomicU64::new(0));
-        let config_cell = Arc::new(Mutex::new(Vec::new()));
-        let table_cell = Arc::new(Mutex::new((0u64, 0u64, Vec::new())));
+        let cluster_cell = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
         r.set_snapshot_intake(
             dir.path().to_path_buf(),
             ident(0b1),
             Arc::new(|| [0u32; 8]),
-            Some((
-                Arc::clone(&pos_cell),
-                Arc::clone(&config_cell),
-                Arc::clone(&table_cell),
-            )),
+            Some((Arc::clone(&pos_cell), Arc::clone(&cluster_cell), tx)),
         );
-        let st = r.stats();
         let to = r.local_addr();
 
-        // A one-artifact session whose every byte lands: pre-change this is
-        // exactly the point `snap_complete` fired.
+        // Row 0's artifact, every byte landed: before §5.6 this was exactly
+        // the point `snap_complete` fired.
         leader.send(
             to,
             DGRAM_KIND_SNAP_BEGIN,
@@ -5987,205 +5946,82 @@ mod tests {
         assert_eq!(
             pump_and_count_dones(&mut r, &leader),
             0,
-            "the session must not be acked before its table arrives"
+            "the session must not be acked before its cluster artifact arrives"
         );
         assert_eq!(
             pos_cell.load(Relaxed),
             0,
-            "and no floor may be signalled — the install handler would run \
-             without the table"
+            "and no floor may be signalled — the install handler would adopt it \
+             with no membership, no table and no settings"
         );
         assert!(
             dir.path().join("0").join("snap-4096.ultsnap").exists(),
-            "the artifact itself is still renamed; only COMPLETION is withheld"
+            "the row artifact itself is still renamed; only COMPLETION is withheld"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and nothing is handed to the uc2-cluster agent yet"
         );
 
-        // A table naming a session we know nothing about is dropped and
-        // counted — never applied to whatever intake happens to be open.
+        // The cluster artifact: 16 bytes at stream base 64.
         leader.send(
             to,
-            DGRAM_KIND_SNAP_TABLE,
+            DGRAM_KIND_SNAP_BEGIN,
             0,
             TERM,
-            &snap_table_wire(8, 4096, 99, b"other"),
+            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
         );
-        assert_eq!(pump_and_count_dones(&mut r, &leader), 0, "still withheld");
-        assert_eq!(
-            st.snap_table_stray.load(Relaxed),
-            1,
-            "a mismatched session is counted, not silently swallowed"
-        );
-        assert_eq!(pos_cell.load(Relaxed), 0);
-        assert_eq!(*table_cell.lock().unwrap(), (0, 0, Vec::new()));
-
-        // The session's own table: it completes, and both cells carry it.
-        leader.send(
-            to,
-            DGRAM_KIND_SNAP_TABLE,
-            0,
-            TERM,
-            &snap_table_wire(7, 4096, 99, b"tbl"),
-        );
+        leader.send(to, DGRAM_KIND_SNAP_CHUNK, 64, TERM, &[0xCDu8; 16]);
         assert_eq!(
             pump_and_count_dones(&mut r, &leader),
             1,
-            "the table completed the session"
+            "the cluster artifact completed the session"
+        );
+        let landed = dir.path().join("cluster").join("snap-8192.ultcluster");
+        assert!(
+            landed.is_file(),
+            "it lands under snapshots/cluster/ — the same path the node's own \
+             uc2-cluster agent writes and recovers from, not a 255/ directory"
+        );
+        assert_eq!(
+            rx.try_recv().expect("the artifact is routed to the agent"),
+            (8192, landed),
+            "position and path, so the agent installs by fiat at that position"
+        );
+        assert_eq!(
+            cluster_cell.load(Relaxed),
+            8192,
+            "and its position is published for the install handler to wait on"
         );
         assert_eq!(
             pos_cell.load(Relaxed),
             4096,
-            "the floor is signalled once, on the complete session"
+            "the floor is the MINIMUM over the set, unchanged by the new artifact"
         );
-        assert_eq!(
-            *table_cell.lock().unwrap(),
-            (4096, 99, b"tbl".to_vec()),
-            "the table cell carries this session's bytes"
-        );
-        // ORDER, by construction: `snap_complete` writes the table cell, then
-        // the config cell, then `store(Release)`s the floor — and the install
-        // handler samples the floor (Acquire) before reading either mutex, so
-        // a floor it can see implies both cells are this session's. Asserting
-        // the two after the fact (floor set AND table set) is what a
-        // single-threaded test can observe; the ordering itself is pinned by
-        // the code and its comment.
-        assert_eq!(st.snap_table_stray.load(Relaxed), 1, "no new stray");
+        // ORDER, by construction: `snap_complete` publishes the cluster
+        // position and routes the artifact, then `store(Release)`s the floor —
+        // and the install handler samples the floor (Acquire) before reading
+        // either. Asserting all three after the fact is what a single-threaded
+        // test can observe; the ordering itself is pinned by the code.
 
-        // The leader re-sends BEGIN+TABLE until its session closes, so the
-        // duplicate must be inert — not a second ack, not a stray.
+        // The leader re-sends BEGINs until its session closes, so a duplicate
+        // must be inert — a re-ack, not a second install.
         leader.send(
             to,
-            DGRAM_KIND_SNAP_TABLE,
+            DGRAM_KIND_SNAP_BEGIN,
             0,
             TERM,
-            &snap_table_wire(7, 4096, 99, b"tbl"),
+            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
         );
         assert_eq!(
             pump_and_count_dones(&mut r, &leader),
-            0,
-            "a re-sent table must not re-ack a closed session"
-        );
-        assert_eq!(st.snap_table_stray.load(Relaxed), 1, "and is not a stray");
-        assert_eq!(*table_cell.lock().unwrap(), (4096, 99, b"tbl".to_vec()));
-        assert_eq!(pos_cell.load(Relaxed), 4096);
-    }
-
-    /// Fix round 1: `snap_table_stray` counts EPISODES, not datagrams. The
-    /// realistic way to get a stray is a session this node refused — here an
-    /// identity (name) mismatch. The leader has no idea it was refused, so it
-    /// keeps re-sending BEGIN+TABLE every 20 ms until its own 30 s session
-    /// timeout; a per-datagram counter would climb at that cadence and say
-    /// nothing about how many sessions actually went wrong. The latch clears
-    /// when an intake next OPENS, so a genuinely new anomaly is counted again.
-    ///
-    /// Also pins the wrong-PEER half of the guard: a table naming the live
-    /// intake's own session, from a different address, is dropped — never
-    /// applied to the intake it names.
-    #[test]
-    fn a_stray_snap_table_is_counted_once_per_episode_not_once_per_resend() {
-        use Ordering::Relaxed;
-        let b = buffer();
-        let mut leader = FakeLeader::new();
-        let mut stranger = FakeLeader::new();
-        let mut r = follower(&b, leader.addr());
-        let dir = snap_scratch_dir();
-        r.set_snapshot_intake(
-            dir.path().to_path_buf(),
-            ident(0b1),
-            Arc::new(|| [0u32; 8]),
-            None,
-        );
-        let st = r.stats();
-        let to = r.local_addr();
-
-        // A BEGIN this node REFUSES: the sender declares (and names) row 1,
-        // which our own identity does not. No intake opens.
-        leader.send(
-            to,
-            DGRAM_KIND_SNAP_BEGIN,
-            0,
-            TERM,
-            &snap_begin_wire(3, 0, 4096, 64, 0b11),
-        );
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while st.snap_refused_declared_mismatch.load(Relaxed) == 0 {
-            assert!(Instant::now() < deadline, "the BEGIN was never refused");
-            r.do_work();
-        }
-        assert!(r.snap_intake.is_none(), "a refused BEGIN opens no intake");
-
-        // Three re-sends of that session's table, exactly as the leader keeps
-        // shipping them. ONE episode.
-        for _ in 0..3 {
-            leader.send(
-                to,
-                DGRAM_KIND_SNAP_TABLE,
-                0,
-                TERM,
-                &snap_table_wire(3, 4096, 99, b"tbl"),
-            );
-        }
-        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
-        assert_eq!(
-            st.snap_table_stray.load(Relaxed),
             1,
-            "the resend cadence must not drive the counter"
+            "a re-sent BEGIN for a completed session is re-acked"
         );
-
-        // A BEGIN we ACCEPT re-arms the latch.
-        leader.send(
-            to,
-            DGRAM_KIND_SNAP_BEGIN,
-            0,
-            TERM,
-            &snap_begin_wire(4, 0, 4096, 64, 0b1),
-        );
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while r.snap_intake.is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "the BEGIN never opened an intake"
-            );
-            r.do_work();
-        }
-
-        // Wrong PEER, RIGHT session id: a stranger must not install its table
-        // into the session we are running with the leader.
-        stranger.send(
-            to,
-            DGRAM_KIND_SNAP_TABLE,
-            0,
-            TERM,
-            &snap_table_wire(4, 8192, 7, b"forged"),
-        );
-        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
-        assert_eq!(
-            st.snap_table_stray.load(Relaxed),
-            2,
-            "a new episode, after an intake re-armed the latch"
-        );
-        let intake = r.snap_intake.as_ref().expect("the live intake survives");
-        assert_eq!(intake.session, 4);
         assert!(
-            intake.table.is_none(),
-            "a foreign peer's table must not be applied to our session"
+            rx.try_recv().is_err(),
+            "but the artifact is NOT handed to the agent a second time"
         );
-
-        // And a wrong-SESSION table from the leader itself, inside the same
-        // episode, is dropped without a second count.
-        leader.send(
-            to,
-            DGRAM_KIND_SNAP_TABLE,
-            0,
-            TERM,
-            &snap_table_wire(9, 4096, 99, b"tbl"),
-        );
-        assert_eq!(pump_and_count_dones(&mut r, &leader), 0);
-        assert_eq!(
-            st.snap_table_stray.load(Relaxed),
-            2,
-            "still one episode: the latch holds until an intake opens again"
-        );
-        assert!(r.snap_intake.as_ref().unwrap().table.is_none());
     }
 
     // ---- M14c2 (T10a): the intake's timeout, latches and re-drive cadence ----

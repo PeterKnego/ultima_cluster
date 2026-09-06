@@ -25,14 +25,13 @@ use uc_log::archive::find_block;
 use uc_log::buffer::{LogBuffer, SliceRead};
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
+#[cfg(test)]
+use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_TABLE, DatagramHeader, MTU_DEFAULT,
-    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V3, SNAP_TABLE_FIXED_LEN, SnapBeginBody, SnapTableBody,
-    write_datagram_header, write_snap_begin_body, write_snap_table_body,
+    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
+    SnapBeginBody, write_datagram_header, write_snap_begin_body,
 };
-#[cfg(test)]
-use uc_protocol::v2::datagram::{read_snap_begin_body, read_snap_table_body};
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
 };
@@ -131,9 +130,11 @@ pub struct SnapArtifact {
 
 /// M14c (spec §7.3/§14.3): everything one snapshot session ships — one
 /// artifact per declared FSM, **ascending by `service_id`, non-empty, every
-/// `len > 0`**, plus the declared bitmask and the config the session carries.
+/// `len > 0`**, plus the declared bitmask. Cluster-FSM spec §5.6 adds exactly
+/// one more artifact under [`CLUSTER_ARTIFACT_ID`], last and outside the mask.
 /// A source that cannot honour those invariants must return `None`: the
-/// session is refused (the peer re-NAKs) rather than opened half-formed.
+/// session is refused (the peer re-NAKs) rather than opened half-formed —
+/// see [`set_is_valid`].
 #[derive(Debug, Clone)]
 pub struct SnapshotSet {
     /// The sender's declared FSM mask; DERIVED from `identity` via
@@ -148,19 +149,54 @@ pub struct SnapshotSet {
     /// Row `r`'s attached service's packed version (0 = unknown); rides
     /// every `SNAP_BEGIN` alongside `identity`.
     pub version: [u32; 8],
-    /// M7: the encoded `ConfigRecord.config` at ship time — see below.
-    pub config: Vec<u8>,
-    /// Time-and-timers plan 3: the leader's schedule table at ship time —
-    /// `(position, time_ns, bytes)`, where `position` is the adopting frame's
-    /// END position and `bytes` is the `v2::schedule::encode_schedule_table`
-    /// encoding. `(0, 0, vec![])` = the leader has no table.
-    ///
-    /// It does NOT ride `SNAP_BEGIN` (no room in that body); it is its own
-    /// [`DGRAM_KIND_SNAP_TABLE`] datagram sent right after every BEGIN of the
-    /// session. A below-floor joiner cannot read the adopting frame out of
-    /// the purged log, so this is the only way it gets the table.
-    pub table: (u64, u64, Vec<u8>),
+    /// The declared rows' artifacts ascending by `service_id`, then EXACTLY
+    /// ONE [`CLUSTER_ARTIFACT_ID`] entry last (cluster-FSM spec §5.6).
     pub artifacts: Vec<SnapArtifact>,
+}
+
+/// Cluster-FSM spec §5.6: the reserved `service_id` the CLUSTER ARTIFACT — the
+/// cluster FSM's own image (membership, schedule table, settings) — streams
+/// under. It is **not** a row: it is outside `services_declared`, it has no
+/// cnc slot, and 255 sorts above every real row id (0..8) so "ascending by
+/// `service_id`" already puts it last with no special case in the stream
+/// layout.
+///
+/// Exactly one such artifact is REQUIRED in every set — a joiner installs the
+/// cluster row by fiat before the floor advances, so a set without it would
+/// strand the joiner with no membership, no table and no settings.
+pub const CLUSTER_ARTIFACT_ID: u8 = 255;
+
+/// The set invariant `try_open_snap_session` gates on, as a free function so
+/// it is unit-testable without a socket (cluster-FSM spec §5.6).
+///
+/// A set must COVER the declared mask exactly — one artifact per declared id
+/// and no row artifact outside it — and carry exactly one
+/// [`CLUSTER_ARTIFACT_ID`] artifact, which is deliberately NOT part of that
+/// mask. Without the coverage half, a source that lost one FSM's file (or
+/// gained a stray one) opens a session whose BEGINs advertise a
+/// `services_declared` the stream can never satisfy: the receiver's
+/// `received != services_declared` never closes, it probes for a BEGIN that
+/// will never come, and the transfer burns the slot until the timeout instead
+/// of staying an overrun the peer re-NAKs. Without the cluster half, the
+/// joiner's own completion rule (which requires the cluster artifact too)
+/// never closes for the mirror-image reason.
+pub fn set_is_valid(set: &SnapshotSet) -> bool {
+    if set.services_declared != identity_mask(&set.identity) {
+        return false;
+    }
+    let mut rows = 0usize;
+    let mut cluster = 0usize;
+    for a in &set.artifacts {
+        if a.service_id == CLUSTER_ARTIFACT_ID {
+            cluster += 1;
+            continue;
+        }
+        if a.service_id >= 64 || set.services_declared & (1u64 << a.service_id) == 0 {
+            return false;
+        }
+        rows += 1;
+    }
+    cluster == 1 && rows == set.services_declared.count_ones() as usize
 }
 
 /// The declared-FSM bitmask implied by an `identity` array: bit `r` set iff
@@ -221,13 +257,6 @@ struct SnapSession {
     /// Peer-requested missing STREAM ranges (repair), served before the cursor.
     naks: VecDeque<(u64, u32)>,
     last_activity_ns: u64,
-    /// M7 Task 6: the encoded `ConfigRecord.config` at the moment this session
-    /// opened (from the `SnapshotSource` closure) — carried in every `SNAP_BEGIN`.
-    config: Vec<u8>,
-    /// Time-and-timers plan 3: the schedule table this session ships, captured
-    /// at open time exactly like `config` — one `SNAP_TABLE` datagram after
-    /// every `SNAP_BEGIN` (see [`SnapshotSet::table`]).
-    table: (u64, u64, Vec<u8>),
 }
 
 impl SnapSession {
@@ -1162,24 +1191,7 @@ impl Sender {
         let Some(set) = src() else {
             return false;
         };
-        if set.artifacts.is_empty() {
-            return false;
-        }
-        // M14c review: the set must COVER the declared mask exactly — one
-        // artifact per declared id and no artifact outside it. Without this a
-        // source that lost one FSM's file (or gained a stray one) opens a
-        // session whose BEGINs advertise `services_declared` the stream can
-        // never satisfy: the receiver's `received != services_declared` never
-        // closes, it probes for a BEGIN that will never come, and the transfer
-        // burns the slot until the timeout instead of staying an overrun the
-        // peer re-NAKs.
-        if set.services_declared != identity_mask(&set.identity)
-            || set.artifacts.len() != set.services_declared.count_ones() as usize
-            || set
-                .artifacts
-                .iter()
-                .any(|a| a.service_id >= 64 || set.services_declared & (1u64 << a.service_id) == 0)
-        {
+        if !set_is_valid(&set) {
             return false;
         }
         // Build the parts eagerly: every file must open and every invariant
@@ -1238,8 +1250,6 @@ impl Sender {
             cursor: 0,
             naks: VecDeque::new(),
             last_activity_ns: self.base.elapsed().as_nanos() as u64,
-            config: set.config,
-            table: set.table,
         });
         self.stats.snap_sessions.fetch_add(1, Ordering::Relaxed);
         // A set that opened proves the snapshot dir is readable again: re-arm
@@ -1298,28 +1308,10 @@ impl Sender {
             // must leave the artifact un-begun so the NEXT cycle retries the
             // BEGIN — latching it unconditionally would ship chunks a receiver
             // with no intake for them can only drop.
-            if self.send_snap_begin(
-                peer,
-                session,
-                service_id,
-                pos,
-                len,
-                &identity,
-                &version,
-                &sess.config,
-            ) {
+            if self.send_snap_begin(peer, session, service_id, pos, len, &identity, &version) {
                 sess.parts[target].begun_ns = Some(now);
                 did = true;
                 progress |= first_ever;
-                // Time-and-timers plan 3: the schedule table follows its BEGIN
-                // on the wire, every time — the receiver withholds its
-                // `SNAP_DONE` until the table lands, so a dropped TABLE is
-                // retried by this same 20 ms cadence rather than needing its
-                // own timer. Deliberately NOT gated on success and NOT
-                // un-latching `begun_ns`: a failed seal here costs one more
-                // resend round, whereas re-sending the BEGIN as if it had
-                // never gone out would restart the artifact's chunk flow.
-                self.send_snap_table(peer, session, &sess.table);
             } else if first_ever {
                 // Nothing in this artifact can make progress until the peer has
                 // its BEGIN; keep the slot and retry next cycle. `false` (no
@@ -1440,9 +1432,10 @@ impl Sender {
     }
 
     /// Ship one artifact's SNAP_BEGIN (header `position` = 0; body carries
-    /// session / layout / service_id / pos / len / declared / config). M7 Task 6:
-    /// `config` is the encoded `ConfigRecord.config` this session's
-    /// `SnapshotSource` closure captured at open time — the body grows to fit it.
+    /// session / layout / service_id / pos / len / identity / version). The
+    /// body is FIXED-LENGTH since the cluster-FSM flag day (spec §5.6): the
+    /// membership that used to ride here on every BEGIN is inside the CLUSTER
+    /// ARTIFACT the session streams under [`CLUSTER_ARTIFACT_ID`].
     /// Returns `false` if the datagram could not be sealed and was therefore
     /// dropped (M8 Task 17) — the caller must NOT latch the artifact as begun.
     #[allow(clippy::too_many_arguments)]
@@ -1455,20 +1448,18 @@ impl Sender {
         total_len: u64,
         identity: &[u64; 8],
         version: &[u32; 8],
-        config: &[u8],
     ) -> bool {
-        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
+        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(
             &mut body,
             &SnapBeginBody {
                 session,
-                layout: SNAP_BEGIN_LAYOUT_V3,
+                layout: SNAP_BEGIN_LAYOUT_V4,
                 service_id,
                 snapshot_pos,
                 total_len,
                 identity: *identity,
                 version: *version,
-                config: config.to_vec(),
             },
         );
         if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_BEGIN, &body) {
@@ -1476,42 +1467,6 @@ impl Sender {
         }
         let _ = self.sock.send_to(&self.scratch, peer);
         true
-    }
-
-    /// Time-and-timers plan 3: ship this session's schedule table (header
-    /// `position` = 0; the table's own position rides the body). Sent right
-    /// after every `SNAP_BEGIN`, including the [`SNAP_BEGIN_RESEND_NS`]
-    /// re-sends: `SNAP_BEGIN` has no room for the table, and a below-floor
-    /// joiner cannot read the adopting frame out of the purged log, so this
-    /// datagram is the only way the table reaches it.
-    ///
-    /// A leader with NO table still sends one (`position == 0`, empty body):
-    /// silence is indistinguishable from a lost datagram, and the receiver
-    /// completes a session only once a table has landed — so a table-less
-    /// leader that stayed silent would wedge every joiner.
-    ///
-    /// Sealed exactly like the BEGIN (`Scope::Pairwise`, same `assemble_snap`
-    /// path): the table is replicated state the receiver installs by fiat, so
-    /// an unauthenticated one is attacker-chosen timer state. The sole caller
-    /// does not gate on the outcome (see its call site's comment) — a failed
-    /// seal costs one more resend round on the same 20 ms cadence as the
-    /// BEGIN, nothing more, so there is nothing for a caller to do with a
-    /// success/failure signal here.
-    fn send_snap_table(&mut self, peer: SocketAddr, session: u32, table: &(u64, u64, Vec<u8>)) {
-        let mut body = vec![0u8; SNAP_TABLE_FIXED_LEN + table.2.len()];
-        write_snap_table_body(
-            &mut body,
-            &SnapTableBody {
-                session,
-                position: table.0,
-                time_ns: table.1,
-                table: table.2.clone(),
-            },
-        );
-        if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_TABLE, &body) {
-            return;
-        }
-        let _ = self.sock.send_to(&self.scratch, peer);
     }
 
     /// Assemble a snapshot-session datagram (header + explicit body) into
@@ -1531,13 +1486,15 @@ impl Sender {
     ///   artifact — the complete serialized state machine — with the file
     ///   offset in the header, so a passive capture reassembles the whole
     ///   database with no work.
-    /// * `send_snap_begin`'s body carries `SnapBeginBody.config`, the encoded
-    ///   cluster `ConfigRecord`, and the receive path feeds that straight into
-    ///   `maybe_adopt_incoming_snapshot`. Unsealed means UNAUTHENTICATED: an
-    ///   on-path attacker forges a `SNAP_BEGIN` to a joining or below-floor
-    ///   node and installs **attacker-chosen application state AND
+    /// * the CLUSTER ARTIFACT ([`CLUSTER_ARTIFACT_ID`]) streams over this same
+    ///   path, and the receive path installs it BY FIAT — membership, the
+    ///   replicated schedule table and the cluster settings. Unsealed means
+    ///   UNAUTHENTICATED: an on-path attacker forges a session to a joining or
+    ///   below-floor node and installs **attacker-chosen application state AND
     ///   attacker-chosen cluster membership** — a consensus-integrity
-    ///   primitive.
+    ///   primitive. (Before the cluster-FSM flag day the membership half rode
+    ///   `SnapBeginBody.config`; the exposure is the same, in one artifact
+    ///   instead of on every BEGIN.)
     ///
     /// Sealed through this `Sender`'s own `SendHalf` (`peer: Some(id)`), NOT
     /// through a second half or a `SharedTransport` clone: the half already
@@ -3142,17 +3099,25 @@ mod tests {
             .collect()
     }
 
-    /// The `ConfigRecord` bytes `SnapBeginBody.config` carries — the
-    /// integrity half of this task.
-    fn t17_config_bytes() -> Vec<u8> {
-        b"CLUSTER-MEMBERSHIP-RECORD".to_vec()
+    /// The CLUSTER ARTIFACT's bytes (cluster-FSM spec §5.6) — recognizable
+    /// on the wire, for the same reason `t17_snapshot_bytes` is: the artifact
+    /// carries the cluster's membership, schedule table and settings, and a
+    /// receiver installs it BY FIAT, so "is this readable (and therefore
+    /// forgeable) on the wire?" is the integrity half of this task.
+    fn t17_cluster_bytes() -> Vec<u8> {
+        b"CLUSTER-MEMBERSHIP-AND-SCHEDULE-IMAGE".to_vec()
     }
 
-    /// The encoded schedule table the session's `SNAP_TABLE` carries
-    /// (time-and-timers plan 3) — recognizable on the wire, for the same
-    /// reason `t17_config_bytes` is.
-    fn t17_table_bytes() -> Vec<u8> {
-        b"REPLICATED-SCHEDULE-TABLE".to_vec()
+    /// The CLUSTER ARTIFACT every valid set must carry, written into `dir`.
+    fn cluster_artifact(dir: &std::path::Path, pos: u64) -> SnapArtifact {
+        let path = dir.join(format!("snap-{pos}.ultcluster"));
+        std::fs::write(&path, t17_cluster_bytes()).unwrap();
+        SnapArtifact {
+            service_id: CLUSTER_ARTIFACT_ID,
+            snapshot_pos: pos,
+            path,
+            len: t17_cluster_bytes().len() as u64,
+        }
     }
 
     /// A nonzero placeholder identity hash per set bit of `mask` — enough for
@@ -3230,35 +3195,28 @@ mod tests {
                 peer_ids,
             }),
         );
+        let cluster = cluster_artifact(dir.path(), 4096);
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b1,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: t17_config_bytes(),
-                table: (4096, 99, t17_table_bytes()),
-                artifacts: vec![SnapArtifact {
-                    service_id: 0,
-                    snapshot_pos: 4096,
-                    path: snap_path.clone(),
-                    len: total,
-                }],
+                artifacts: vec![
+                    SnapArtifact {
+                        service_id: 0,
+                        snapshot_pos: 4096,
+                        path: snap_path.clone(),
+                        len: total,
+                    },
+                    cluster.clone(),
+                ],
             })
         }));
         (s, f, peer, dir)
     }
 
-    /// Same shape, crypto OFF — the cleartext-parity control. Its session
-    /// carries no schedule table (`(0, 0, vec![])` = "the leader has none").
+    /// Same shape, crypto OFF — the cleartext-parity control.
     fn sender_without_crypto_and_snapshot_source() -> (Sender, Fake, tempfile::TempDir) {
-        sender_without_crypto_with_table((0, 0, Vec::new()))
-    }
-
-    /// As [`sender_without_crypto_and_snapshot_source`], but with an explicit
-    /// schedule table on the offered set (time-and-timers plan 3).
-    fn sender_without_crypto_with_table(
-        table: (u64, u64, Vec<u8>),
-    ) -> (Sender, Fake, tempfile::TempDir) {
         let f = Fake::new();
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("snap-4096.ultsnap");
@@ -3279,19 +3237,21 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
+        let cluster = cluster_artifact(dir.path(), 4096);
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b1,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: t17_config_bytes(),
-                table: table.clone(),
-                artifacts: vec![SnapArtifact {
-                    service_id: 0,
-                    snapshot_pos: 4096,
-                    path: snap_path.clone(),
-                    len: total,
-                }],
+                artifacts: vec![
+                    SnapArtifact {
+                        service_id: 0,
+                        snapshot_pos: 4096,
+                        path: snap_path.clone(),
+                        len: total,
+                    },
+                    cluster.clone(),
+                ],
             })
         }));
         (s, f, dir)
@@ -3324,13 +3284,12 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
+        let cluster = cluster_artifact(dir.path(), 8192);
         s.set_snapshot_source(Arc::new(move || {
             Some(SnapshotSet {
                 services_declared: 0b101,
                 identity: ident(0b101),
                 version: [0; 8],
-                config: t17_config_bytes(),
-                table: (0, 0, Vec::new()),
                 artifacts: vec![
                     SnapArtifact {
                         service_id: 0,
@@ -3344,6 +3303,7 @@ mod tests {
                         path: p2.clone(),
                         len: 3000,
                     },
+                    cluster.clone(),
                 ],
             })
         }));
@@ -3378,20 +3338,16 @@ mod tests {
             }
         }
         for b in &begins {
-            assert_eq!(b.layout, SNAP_BEGIN_LAYOUT_V3);
+            assert_eq!(b.layout, SNAP_BEGIN_LAYOUT_V4);
             assert_eq!(
                 b.declared_mask(),
                 0b101,
-                "the declared mask rides EVERY begin"
+                "the declared mask rides EVERY begin — and the cluster artifact \
+                 is OUTSIDE it (spec §5.6), so it does not change here either"
             );
             assert_eq!(
                 b.session, begins[0].session,
                 "one session for the whole stream"
-            );
-            assert_eq!(
-                b.config,
-                t17_config_bytes(),
-                "config rides every begin unchanged"
             );
         }
         // A re-send is byte-identical to its original, so distinct bodies ==
@@ -3399,8 +3355,8 @@ mod tests {
         begins.dedup();
         assert_eq!(
             begins.len(),
-            2,
-            "one distinct BEGIN per artifact: {begins:?}"
+            3,
+            "one distinct BEGIN per artifact, the cluster one included: {begins:?}"
         );
         assert_eq!(
             (
@@ -3418,6 +3374,15 @@ mod tests {
             ),
             (2, 4096, 3000)
         );
+        assert_eq!(
+            (
+                begins[2].service_id,
+                begins[2].snapshot_pos,
+                begins[2].total_len
+            ),
+            (CLUSTER_ARTIFACT_ID, 8192, t17_cluster_bytes().len() as u64),
+            "spec §5.6: the CLUSTER ARTIFACT is one more artifact, announced LAST"
+        );
         // Stream-global offsets, contiguous over [0, 5048), and no datagram
         // straddles the 2048 boundary (the receiver writes one datagram into
         // exactly one `.part`).
@@ -3426,14 +3391,20 @@ mod tests {
         let mut want = 0u64;
         for &(off, len) in &chunks {
             assert_eq!(off, want, "chunks fill the stream contiguously: {chunks:?}");
-            assert!(
-                off >= 2048 || off + len as u64 <= 2048,
-                "chunk [{off}, {}) spans the artifact boundary at 2048",
-                off + len as u64
-            );
+            for edge in [2048u64, 5048] {
+                assert!(
+                    off >= edge || off + len as u64 <= edge,
+                    "chunk [{off}, {}) spans the artifact boundary at {edge}",
+                    off + len as u64
+                );
+            }
             want = off + len as u64;
         }
-        assert_eq!(want, 5048, "the whole 2048 + 3000 byte stream was sent");
+        assert_eq!(
+            want,
+            5048 + t17_cluster_bytes().len() as u64,
+            "the whole 2048 + 3000 + cluster-artifact byte stream was sent"
+        );
     }
 
     /// M14c review round 2: the same shape as
@@ -3459,6 +3430,8 @@ mod tests {
                     len: 2048,
                 }
             })
+            // Spec §5.6: every valid set carries the cluster artifact, last.
+            .chain(std::iter::once(cluster_artifact(dir.path(), 4096)))
             .collect();
         let b = buffer();
         b.counters().prime(4 * b.capacity());
@@ -3480,8 +3453,6 @@ mod tests {
                 services_declared,
                 identity: ident(services_declared),
                 version: [0; 8],
-                config: t17_config_bytes(),
-                table: (0, 0, Vec::new()),
                 artifacts: artifacts.clone(),
             })
         }));
@@ -3569,6 +3540,55 @@ mod tests {
         assert!(ok.snap.is_some(), "a covering set still opens a session");
     }
 
+    /// Cluster-FSM spec §5.6: the set-coverage invariant gained an explicit
+    /// carve-out — EXACTLY ONE artifact with [`CLUSTER_ARTIFACT_ID`], and it
+    /// is not part of the declared mask. Both directions matter: without the
+    /// artifact a joiner adopts a floor with no membership, no schedule table
+    /// and no settings; with two, the stream's ascending-id rule has no
+    /// meaning and the receiver would install one of them arbitrarily.
+    ///
+    /// Checked through [`set_is_valid`] directly — no socket, no files: the
+    /// predicate runs before a single artifact is opened, which is exactly
+    /// what makes a broken set stay a recoverable overrun.
+    #[test]
+    fn the_set_requires_exactly_one_cluster_artifact_outside_the_declared_mask() {
+        let dir = snap_scratch_dir();
+        let row = |id: u8| SnapArtifact {
+            service_id: id,
+            snapshot_pos: 2048,
+            path: dir.path().join(format!("snap-{id}.ultsnap")),
+            len: 2048,
+        };
+        let mut set = SnapshotSet {
+            services_declared: 0b11,
+            identity: ident(0b11),
+            version: [0; 8],
+            artifacts: vec![row(0), row(1)],
+        };
+        assert!(
+            !set_is_valid(&set),
+            "no cluster artifact: refused, however well the rows cover the mask"
+        );
+
+        set.artifacts.push(cluster_artifact(dir.path(), 4096));
+        assert!(
+            set_is_valid(&set),
+            "the rows cover the mask and exactly one cluster artifact rides along"
+        );
+
+        set.artifacts.push(cluster_artifact(dir.path(), 8192));
+        assert!(!set_is_valid(&set), "two cluster artifacts: refused");
+        set.artifacts.pop();
+
+        // The carve-out is exactly that: 255 is OUTSIDE the mask, and a row
+        // id outside it is still refused.
+        set.artifacts.insert(2, row(2));
+        assert!(
+            !set_is_valid(&set),
+            "a ROW outside the declared mask is refused as it always was"
+        );
+    }
+
     /// Wire 0.7.0 (spec §5): `services_declared` must equal
     /// `identity_mask(&identity)` — the invariant `try_open_snap_session`
     /// gained when the mask stopped being an independently-set field and
@@ -3586,8 +3606,6 @@ mod tests {
             services_declared: 0b11,
             identity: ident(0b1), // only row 0 is actually non-zero
             version: [0; 8],
-            config: t17_config_bytes(),
-            table: (0, 0, Vec::new()),
             artifacts: vec![
                 SnapArtifact {
                     service_id: 0,
@@ -3600,6 +3618,14 @@ mod tests {
                     snapshot_pos: 2048,
                     path: PathBuf::from("/nonexistent-never-opened-1"),
                     len: 2048,
+                },
+                // Spec §5.6: present, so the ONLY thing wrong with this set is
+                // the mask/identity disagreement it exists to pin.
+                SnapArtifact {
+                    service_id: CLUSTER_ARTIFACT_ID,
+                    snapshot_pos: 4096,
+                    path: PathBuf::from("/nonexistent-never-opened-cluster"),
+                    len: 16,
                 },
             ],
         });
@@ -3709,9 +3735,7 @@ mod tests {
             services_declared: 0b101,
             identity: ident(0b101),
             version: [0; 8],
-            config: t17_config_bytes(),
-            table: (0, 0, Vec::new()),
-            artifacts: vec![make(0)],
+            artifacts: vec![make(0), cluster_artifact(dir.path(), 4096)],
         });
         assert_snap_session_refused(&mut s, &f, "a declared id with no artifact");
         assert_eq!(
@@ -3725,9 +3749,7 @@ mod tests {
             services_declared: 0b101,
             identity: ident(0b101),
             version: [0; 8],
-            config: t17_config_bytes(),
-            table: (0, 0, Vec::new()),
-            artifacts: vec![make(0), make(1)],
+            artifacts: vec![make(0), make(1), cluster_artifact(dir.path(), 4096)],
         });
         assert_snap_session_refused(&mut s, &f, "an artifact for an undeclared id");
         assert_eq!(s.stats().snap_open_failed.load(Ordering::Relaxed), 0);
@@ -3748,14 +3770,15 @@ mod tests {
             services_declared: 0b1,
             identity: ident(0b1),
             version: [0; 8],
-            config: t17_config_bytes(),
-            table: (0, 0, Vec::new()),
-            artifacts: vec![SnapArtifact {
-                service_id: 0,
-                snapshot_pos: 2048,
-                path: part,
-                len: 0,
-            }],
+            artifacts: vec![
+                SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 2048,
+                    path: part,
+                    len: 0,
+                },
+                cluster_artifact(dir.path(), 4096),
+            ],
         });
         assert_snap_session_refused(&mut s, &f, "a half-written .part offered with len 0");
         assert_eq!(
@@ -3779,9 +3802,7 @@ mod tests {
             services_declared: 0b101,
             identity: ident(0b101),
             version: [0; 8],
-            config: t17_config_bytes(),
-            table: (0, 0, Vec::new()),
-            artifacts: vec![make(2), make(0)],
+            artifacts: vec![make(2), make(0), cluster_artifact(dir.path(), 4096)],
         });
         assert_snap_session_refused(&mut s, &f, "a set whose ids do not strictly ascend");
     }
@@ -3802,14 +3823,15 @@ mod tests {
             services_declared: 0b1,
             identity: ident(0b1),
             version: [0; 8],
-            config: t17_config_bytes(),
-            table: (0, 0, Vec::new()),
-            artifacts: vec![SnapArtifact {
-                service_id: 0,
-                snapshot_pos: 2048,
-                path: gone,
-                len: 2048,
-            }],
+            artifacts: vec![
+                SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 2048,
+                    path: gone,
+                    len: 2048,
+                },
+                cluster_artifact(dir.path(), 4096),
+            ],
         });
         assert_snap_session_refused(&mut s, &f, "an artifact whose file cannot be opened");
         assert_eq!(
@@ -3906,122 +3928,6 @@ mod tests {
         out
     }
 
-    /// Drive a snapshot session and collect the session-CONTROL datagrams —
-    /// `SNAP_BEGIN` and `SNAP_TABLE` — as `(kind, body)` **in wire order**.
-    /// Order is the whole point here: a `SNAP_TABLE` is only meaningful to a
-    /// receiver that already has the intake its `session` names, so it must
-    /// never precede its BEGIN. Chunks are filtered out (they interleave).
-    fn snap_begin_and_table_datagrams(
-        s: &mut Sender,
-        f: &Fake,
-        to: SocketAddr,
-        cycles: usize,
-    ) -> Vec<(u8, Vec<u8>)> {
-        s.on_nak(to, 0, 96); // below the ring floor → upgrades to a session
-        let mut out = Vec::new();
-        for _ in 0..cycles {
-            s.do_work();
-            while let Some(d) = f.recv_raw() {
-                if d.len() < DATAGRAM_HEADER_LEN {
-                    continue;
-                }
-                let kind = read_datagram_header(&d).unwrap().kind;
-                if kind == DGRAM_KIND_SNAP_BEGIN || kind == DGRAM_KIND_SNAP_TABLE {
-                    out.push((kind, d[DATAGRAM_HEADER_LEN..].to_vec()));
-                }
-            }
-        }
-        out
-    }
-
-    /// Time-and-timers plan 3: the leader's schedule table rides the snapshot
-    /// session as its own datagram, sent immediately after EVERY `SNAP_BEGIN`
-    /// — the first one and every 20 ms re-send. A below-floor joiner cannot
-    /// read the adopting frame out of the purged log, and `SNAP_BEGIN` has no
-    /// room to carry the table, so it is a separate kind on the same session:
-    /// [`DGRAM_KIND_SNAP_TABLE`] = **21**, not 18 (the crypto handshake's
-    /// `HS_INIT` owns 18 in this same kind-byte space).
-    ///
-    /// Pairing it with the BEGIN — rather than sending it once at session
-    /// open — is what makes a lost TABLE self-healing: the receiver withholds
-    /// its `SNAP_DONE` until the table lands, so the leader keeps re-sending
-    /// BEGIN+TABLE on its own cadence until one pair gets through.
-    #[test]
-    fn a_snap_table_follows_every_snap_begin_with_the_same_session() {
-        let (mut s, f, _dir) = sender_without_crypto_with_table((4096, 99, b"tbl".to_vec()));
-        let addr = f.addr();
-        // Four duty cycles: `Fake::recv_raw`'s 500 ms empty-drain spin makes
-        // SNAP_BEGIN_RESEND_NS (20 ms) elapse between them, so this covers the
-        // first send AND the re-sends with no SNAP_DONE ever answering.
-        let seq = snap_begin_and_table_datagrams(&mut s, &f, addr, 4);
-        assert!(
-            seq.len() >= 4,
-            "expected at least the first BEGIN+TABLE and one re-send pair, got {}",
-            seq.len()
-        );
-        assert!(
-            seq.len().is_multiple_of(2),
-            "every BEGIN is paired: {seq:?}"
-        );
-        const {
-            assert!(
-                SNAP_BEGIN_RESEND_NS < 500_000_000,
-                "this test's re-send arm relies on the 500 ms drain outrunning the cadence"
-            )
-        };
-
-        let session = read_snap_begin_body(&seq[0].1)
-            .expect("well-formed BEGIN")
-            .session;
-        let want = SnapTableBody {
-            session,
-            position: 4096,
-            time_ns: 99,
-            table: b"tbl".to_vec(),
-        };
-        for (i, (kind, body)) in seq.iter().enumerate() {
-            if i % 2 == 0 {
-                assert_eq!(*kind, DGRAM_KIND_SNAP_BEGIN, "datagram {i} opens the pair");
-                assert_eq!(
-                    read_snap_begin_body(body)
-                        .expect("well-formed BEGIN")
-                        .session,
-                    session,
-                    "one session throughout"
-                );
-            } else {
-                assert_eq!(
-                    *kind, DGRAM_KIND_SNAP_TABLE,
-                    "datagram {i} must be the TABLE that follows its BEGIN"
-                );
-                assert_eq!(
-                    read_snap_table_body(body),
-                    Some(want.clone()),
-                    "the table body round-trips, under the BEGIN's own session"
-                );
-            }
-        }
-    }
-
-    /// The other half of the same wire rule: a leader with NO schedule table
-    /// still sends the datagram, carrying `position == 0` and an empty table.
-    /// Silence would be indistinguishable from a lost TABLE, and the receiver
-    /// withholds its `SNAP_DONE` until one arrives — so a table-less leader
-    /// would wedge every below-floor joiner.
-    #[test]
-    fn a_leader_with_no_schedule_table_still_sends_an_empty_snap_table() {
-        let (mut s, f, _dir) = sender_without_crypto_with_table((0, 0, Vec::new()));
-        let addr = f.addr();
-        let seq = snap_begin_and_table_datagrams(&mut s, &f, addr, 2);
-        let (kind, body) = seq.get(1).expect("a TABLE follows the BEGIN");
-        assert_eq!(*kind, DGRAM_KIND_SNAP_TABLE);
-        let b = read_snap_table_body(body).expect("well-formed empty TABLE");
-        assert_eq!(b.session, read_snap_begin_body(&seq[0].1).unwrap().session);
-        assert_eq!(b.position, 0, "0 = the leader has no table");
-        assert_eq!(b.time_ns, 0);
-        assert!(b.table.is_empty());
-    }
-
     #[test]
     fn a_snapshot_chunk_is_sealed_and_respects_the_shrunken_mtu_budget() {
         let (mut s, f, peer, _dir) = sender_with_crypto_and_established_session("chunk-sealed");
@@ -4067,27 +3973,26 @@ mod tests {
         );
     }
 
+    /// The integrity half of T17, restated for spec §5.6: what a forged
+    /// `SNAP_BEGIN` buys an attacker is a SESSION — and a completed session's
+    /// CLUSTER ARTIFACT is installed by fiat on the joiner, so an unsealed
+    /// BEGIN is attacker-chosen membership, schedule table and settings.
+    /// (Before §5.6 the membership rode `SnapBeginBody.config` on the BEGIN
+    /// itself; the artifact replaced the carry, not the exposure.)
     #[test]
-    fn a_snapshot_begin_is_sealed_so_its_carried_config_cannot_be_forged() {
-        // The integrity half: `SnapBeginBody.config` reaches the receiving
-        // node's `maybe_adopt_incoming_snapshot`. Unsealed = unauthenticated
-        // = attacker-chosen membership.
+    fn a_snapshot_begin_is_sealed_so_a_session_cannot_be_forged() {
         let (mut s, f, peer, _dir) = sender_with_crypto_and_established_session("begin-sealed");
         let addr = f.addr();
         let begins = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_BEGIN);
         assert!(!begins.is_empty(), "a session opens with a SNAP_BEGIN");
-        let cfgb = t17_config_bytes();
         // M14c: the BEGIN is re-sent on the [`SNAP_BEGIN_RESEND_NS`] cadence
         // (`Fake::recv_raw`'s 500 ms empty-drain spin makes that elapse here),
-        // so open EVERY one: each must be sealed, and all must be the SAME
-        // body — a re-send is a byte-identical no-op at the receiver.
+        // so open EVERY one: each must be sealed, and the DISTINCT ones are
+        // one per artifact — a re-send is a byte-identical no-op at the
+        // receiver.
         let mut recv = peer.receive_half();
         let mut bodies = Vec::new();
         for d in &begins {
-            assert!(
-                !d.windows(cfgb.len()).any(|w| w == cfgb.as_slice()),
-                "the cluster config must not be readable (or forgeable) on the wire"
-            );
             let mut open = d.clone();
             let n = open.len();
             let len = recv
@@ -4097,51 +4002,36 @@ mod tests {
                 read_snap_begin_body(&open[DATAGRAM_HEADER_LEN..len]).expect("well-formed body"),
             );
         }
+        bodies.sort_by_key(|b| b.service_id);
         bodies.dedup();
-        assert_eq!(
-            bodies.len(),
-            1,
-            "exactly one DISTINCT SNAP_BEGIN opens a session"
+        assert!(
+            bodies.len() <= 2,
+            "at most two DISTINCT BEGINs — row 0's and the cluster artifact's: {bodies:?}"
         );
         let body = &bodies[0];
-        assert_eq!(
-            body.config, cfgb,
-            "the config survives the round trip intact"
-        );
+        assert_eq!(body.service_id, 0, "row 0's artifact is announced first");
         assert_eq!(body.total_len, T17_SNAP_LEN as u64);
-        assert_eq!(body.layout, SNAP_BEGIN_LAYOUT_V3);
-        assert_eq!(body.service_id, 0);
+        assert_eq!(body.layout, SNAP_BEGIN_LAYOUT_V4);
         assert_eq!(body.declared_mask(), 0b1);
     }
 
-    /// Time-and-timers plan 3: the TABLE is sealed exactly like the BEGIN
-    /// beside it. It is not a footnote — the receiver installs the carried
-    /// table by fiat, so an unauthenticated one is attacker-chosen timer
-    /// state on a joining node, the same shape as `SnapBeginBody.config`'s
-    /// attacker-chosen membership. Both go out through `assemble_snap`, so
-    /// this pins that kind 21 never grew a raw `send_to` of its own.
+    /// Spec §5.6: the CLUSTER ARTIFACT's bytes are as sensitive as any row's
+    /// — they ARE the cluster's membership, schedule table and settings, and
+    /// the joiner installs them by fiat. They travel as ordinary
+    /// `SNAP_CHUNK`s of the same stream, so they get the same seal; this pins
+    /// that the new artifact did not grow a raw `send_to` path of its own.
     #[test]
-    fn a_snapshot_table_is_sealed_like_the_begin_it_follows() {
-        let (mut s, f, peer, _dir) = sender_with_crypto_and_established_session("table-sealed");
+    fn the_cluster_artifacts_bytes_are_sealed_like_every_other_artifacts() {
+        let (mut s, f, _peer, _dir) = sender_with_crypto_and_established_session("cluster-sealed");
         let addr = f.addr();
-        let tables = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_TABLE);
-        assert!(!tables.is_empty(), "a session ships its schedule table");
-        let raw = t17_table_bytes();
-        let mut recv = peer.receive_half();
-        for d in &tables {
+        let chunks = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_CHUNK);
+        assert!(!chunks.is_empty(), "the session ships chunks");
+        let raw = t17_cluster_bytes();
+        for d in &chunks {
             assert!(
                 !d.windows(raw.len()).any(|w| w == raw.as_slice()),
-                "the schedule table must not be readable (or forgeable) on the wire"
+                "the cluster image must not be readable (or forgeable) on the wire"
             );
-            let mut open = d.clone();
-            let n = open.len();
-            let len = recv
-                .open_slice(T17_LEADER_ID, &mut open, n)
-                .expect("the peer must open the sealed SNAP_TABLE");
-            let body =
-                read_snap_table_body(&open[DATAGRAM_HEADER_LEN..len]).expect("well-formed body");
-            assert_eq!((body.position, body.time_ns), (4096, 99));
-            assert_eq!(body.table, raw, "the table survives the round trip intact");
         }
     }
 
@@ -4158,6 +4048,10 @@ mod tests {
         let raw = t17_snapshot_bytes();
         let d = &chunks[0];
         let off = read_datagram_header(d).unwrap().position as usize;
+        assert!(
+            off + (d.len() - DATAGRAM_HEADER_LEN) <= raw.len(),
+            "the first chunk is inside row 0's artifact, before the cluster one"
+        );
         assert_eq!(
             &d[DATAGRAM_HEADER_LEN..],
             &raw[off..off + (d.len() - DATAGRAM_HEADER_LEN)],
@@ -4228,6 +4122,7 @@ mod tests {
         let snap_path = dir.path().join("snap-4096.ultsnap");
         std::fs::write(&snap_path, t17_snapshot_bytes()).unwrap();
         let total = T17_SNAP_LEN as u64;
+        let cluster = cluster_artifact(dir.path(), 4096);
         let b = buffer();
         b.counters().prime(4 * b.capacity());
         let (_tx, rx) = mpsc::sync_channel(16);
@@ -4254,14 +4149,15 @@ mod tests {
                 services_declared: 0b1,
                 identity: ident(0b1),
                 version: [0; 8],
-                config: t17_config_bytes(),
-                table: (0, 0, Vec::new()),
-                artifacts: vec![SnapArtifact {
-                    service_id: 0,
-                    snapshot_pos: 4096,
-                    path: snap_path.clone(),
-                    len: total,
-                }],
+                artifacts: vec![
+                    SnapArtifact {
+                        service_id: 0,
+                        snapshot_pos: 4096,
+                        path: snap_path.clone(),
+                        len: total,
+                    },
+                    cluster.clone(),
+                ],
             })
         }));
         let addr = f.addr();

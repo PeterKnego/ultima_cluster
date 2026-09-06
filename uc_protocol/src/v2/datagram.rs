@@ -164,14 +164,19 @@ pub const DGRAM_KIND_CONFIG_PROPOSAL: u8 = 16;
 /// M7: leader→follower reply for a forwarded proposal. Body = `ConfigReplyBody`.
 pub const DGRAM_KIND_CONFIG_REPLY: u8 = 17;
 
-/// Fixed part of a [`SnapBeginBody`] (wire 0.7.0, FSM identity). 0.6.0's was
-/// 34; the 0.7.0 body replaces the single `services_declared` word with two
-/// per-row arrays — `identity` (8 × u64 FSM name hashes) and `version` (8 ×
-/// u32 packed service versions) — so the receiver can compare declared FSMs
-/// **by name, positionally**, not just by a bitmask. A 0.6.0 body is
-/// therefore *shorter* than this and is dropped by [`read_snap_begin_body`]'s
-/// length check.
-pub const SNAP_BEGIN_FIXED_LEN: usize = 122;
+/// The `SnapBeginBody` on wire 0.7.0 (FSM identity + the cluster FSM): the
+/// body is now FIXED-LENGTH. 0.6.0's fixed part was 34 and replaced the
+/// single `services_declared` word with two per-row arrays — `identity`
+/// (8 × u64 FSM name hashes) and `version` (8 × u32 packed service versions)
+/// — so the receiver can compare declared FSMs **by name, positionally**, not
+/// just by a bitmask. A 0.6.0 body is therefore *shorter* than this and is
+/// dropped by [`read_snap_begin_body`]'s length check.
+///
+/// The cluster-FSM flag day (spec §5.6) dropped the trailing
+/// `config_len: u16` + config bytes: the cluster's membership now rides the
+/// session as the CLUSTER ARTIFACT (`service_id = 255`), one more artifact in
+/// the stream, so nothing needs a second, ad-hoc carry on every BEGIN.
+pub const SNAP_BEGIN_FIXED_LEN: usize = 120;
 
 /// The value [`SnapBeginBody::layout`] carried on wire 0.6.0. A 0.7.0
 /// receiver refuses a body carrying this discriminator by name
@@ -179,8 +184,18 @@ pub const SNAP_BEGIN_FIXED_LEN: usize = 122;
 /// as an `identity` array.
 pub const SNAP_BEGIN_LAYOUT_V2: u8 = 1;
 
-/// The value [`SnapBeginBody::layout`] carries on wire 0.7.0.
+/// The value [`SnapBeginBody::layout`] carried by the intermediate 0.7.0
+/// shape — the FSM-identity arrays plus a trailing carried `config`. Never
+/// shipped in a release (0.7.0 is one unreleased flag day) and retired by
+/// spec §5.6; kept as a named constant so the discriminator value is never
+/// re-used and a body carrying it is refused by name, exactly as
+/// [`SNAP_BEGIN_LAYOUT_V2`] is.
 pub const SNAP_BEGIN_LAYOUT_V3: u8 = 2;
+
+/// The value [`SnapBeginBody::layout`] carries on wire 0.7.0 as shipped:
+/// the fixed-length body, no carried config, cluster artifact under
+/// `service_id = 255`.
+pub const SNAP_BEGIN_LAYOUT_V4: u8 = 3;
 
 pub const CONFIG_PROPOSAL_BODY_LEN: usize = 22;
 
@@ -259,14 +274,15 @@ pub fn read_config_reply_body(buf: &[u8]) -> Option<ConfigReplyBody> {
 /// artifact's file size (the receiver pre-sizes its `.part` to it);
 /// `identity[r]` is the sender's row-`r` FSM identity hash, `0` = undeclared;
 /// `version[r]` its attached service's packed version, `0` = unknown; the
-/// receiver compares both **positionally** and refuses by name — spec §5;
-/// `config` is the length-prefixed encoded config (M7), identical on every
-/// BEGIN of a session.
+/// receiver compares both **positionally** and refuses by name — spec §5.
+///
+/// `service_id = 255` is the reserved CLUSTER ARTIFACT (spec §5.6): the
+/// cluster FSM's own image, shipped LAST, outside the declared mask.
 ///
 /// LE: session 0..4, layout 4, service_id 5, 6..8 zero (u64 alignment for
 /// `snapshot_pos`), snapshot_pos 8..16, total_len 16..24,
-/// identity 24..88 (8 × u64), version 88..120 (8 × u32),
-/// config_len u16 120..122, config bytes 122...
+/// identity 24..88 (8 × u64), version 88..120 (8 × u32). Total 120 —
+/// fixed-length, no trailing carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapBeginBody {
     pub session: u32,
@@ -276,7 +292,6 @@ pub struct SnapBeginBody {
     pub total_len: u64,
     pub identity: [u64; 8],
     pub version: [u32; 8],
-    pub config: Vec<u8>,
 }
 
 impl SnapBeginBody {
@@ -292,8 +307,8 @@ impl SnapBeginBody {
 }
 
 /// Encode a snap-begin body. `layout` is written verbatim — production callers
-/// pass [`SNAP_BEGIN_LAYOUT_V3`]; a test forging a legacy-discriminator body
-/// passes [`SNAP_BEGIN_LAYOUT_V2`] or 0.
+/// pass [`SNAP_BEGIN_LAYOUT_V4`]; a test forging a legacy-discriminator body
+/// passes [`SNAP_BEGIN_LAYOUT_V3`], [`SNAP_BEGIN_LAYOUT_V2`] or 0.
 pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
     buf[0..4].copy_from_slice(&b.session.to_le_bytes());
     buf[4] = b.layout;
@@ -307,28 +322,22 @@ pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
     for (i, v) in b.version.iter().enumerate() {
         buf[88 + i * 4..92 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
-    buf[120..122].copy_from_slice(&(b.config.len() as u16).to_le_bytes());
-    if !b.config.is_empty() {
-        buf[122..122 + b.config.len()].copy_from_slice(&b.config);
-    }
 }
 
 /// Decode a snap-begin body, or `None` if the buffer is shorter than
-/// [`SNAP_BEGIN_FIXED_LEN`] or than the `config_len` it declares (the caller
-/// drops a malformed datagram).
+/// [`SNAP_BEGIN_FIXED_LEN`] (the caller drops a malformed datagram). Trailing
+/// bytes past the fixed part are IGNORED, not refused — a longer body is a
+/// peer speaking an older 0.7.0 shape, refused by its `layout` at the node
+/// layer with a name, not silently by a length check here.
 ///
-/// **Total for every `layout` value, including 0 and
-/// [`SNAP_BEGIN_LAYOUT_V2`].** Deciding what an unrecognized discriminator
+/// **Total for every `layout` value, including 0,
+/// [`SNAP_BEGIN_LAYOUT_V2`] and [`SNAP_BEGIN_LAYOUT_V3`].** Deciding what an unrecognized discriminator
 /// means is the receiving node's job, not the decoder's: it counts a named
 /// refusal ("peer wire ≤ 0.6.0") and drops the session, which is
 /// diagnosable, where a silent `None` here would be indistinguishable from a
 /// truncated datagram.
 pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
     if buf.len() < SNAP_BEGIN_FIXED_LEN {
-        return None;
-    }
-    let config_len = u16::from_le_bytes(buf[120..122].try_into().ok()?) as usize;
-    if buf.len() < SNAP_BEGIN_FIXED_LEN + config_len {
         return None;
     }
     let mut identity = [0u64; 8];
@@ -347,79 +356,29 @@ pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
         total_len: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
         identity,
         version,
-        config: buf[122..122 + config_len].to_vec(),
     })
 }
 
-// Body budget guard: SNAP_BEGIN_FIXED_LEN + config must stay under the
-// datagram body budget (MTU_DEFAULT - DATAGRAM_HEADER_LEN = 1392). The M7
-// config record is small; 1024 bytes of headroom is generous.
+// Body budget guard: the (now fixed-length) SNAP_BEGIN body must stay under
+// the datagram body budget (MTU_DEFAULT - DATAGRAM_HEADER_LEN = 1392), with
+// room to spare for a future field.
 const _: () = assert!(SNAP_BEGIN_FIXED_LEN + 1024 <= MTU_DEFAULT - DATAGRAM_HEADER_LEN);
 
-/// Time-and-timers plan 3: the leader's current schedule table, sent once
-/// after every `SNAP_BEGIN` of a session so a below-floor joiner installs
-/// the table it could not read from the purged log. Pairwise scope.
+/// RETIRED before it ever shipped (cluster-FSM spec §5.6). Kind 21 carried
+/// the leader's schedule table as its own datagram after every `SNAP_BEGIN`
+/// (time-and-timers plan 3); the table is now part of the CLUSTER ARTIFACT
+/// the session streams under `service_id = 255`, so nothing sends this kind
+/// and a receiver that sees it counts it as an unknown kind, exactly as it
+/// would any other unassigned value.
+///
+/// The constant stays so the value is never re-used: 0.7.0 is one unreleased
+/// flag day, but a future kind assignment must not collide with a datagram a
+/// mid-flag-day binary could still put on the wire.
 ///
 /// NOT 18: `uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT` already owns 18 in
 /// this same on-wire kind-byte space (`HS_RESP` = 19, `HS_KEY` = 20), so this
-/// kind takes the next free value, 21.
-pub const DGRAM_KIND_SNAP_TABLE: u8 = 21;
-/// `session u32 ‖ position u64 ‖ time_ns u64 ‖ table_len u16`, then the
-/// encoded table (`v2::schedule::encode_schedule_table` bytes).
-pub const SNAP_TABLE_FIXED_LEN: usize = 22;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapTableBody {
-    pub session: u32,
-    /// The adopted table frame's END position on the leader; `0` = no table
-    /// (then `table` is empty).
-    pub position: u64,
-    /// The adopting frame's stamp — what the joiner's record carries.
-    pub time_ns: u64,
-    pub table: Vec<u8>,
-}
-
-pub fn write_snap_table_body(buf: &mut [u8], b: &SnapTableBody) {
-    buf[0..4].copy_from_slice(&b.session.to_le_bytes());
-    buf[4..12].copy_from_slice(&b.position.to_le_bytes());
-    buf[12..20].copy_from_slice(&b.time_ns.to_le_bytes());
-    buf[20..22].copy_from_slice(&(b.table.len() as u16).to_le_bytes());
-    buf[22..22 + b.table.len()].copy_from_slice(&b.table);
-}
-
-/// Total on any input; does NOT decode the table (the node does, fail-stop).
-pub fn read_snap_table_body(buf: &[u8]) -> Option<SnapTableBody> {
-    use crate::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
-    if buf.len() < SNAP_TABLE_FIXED_LEN {
-        return None;
-    }
-    let session = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-    let position = u64::from_le_bytes(buf[4..12].try_into().ok()?);
-    let time_ns = u64::from_le_bytes(buf[12..20].try_into().ok()?);
-    let table_len = u16::from_le_bytes(buf[20..22].try_into().ok()?) as usize;
-    if table_len > SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN {
-        return None;
-    }
-    if buf.len() != SNAP_TABLE_FIXED_LEN + table_len {
-        return None;
-    }
-    if (position == 0) != (table_len == 0) {
-        return None;
-    }
-    Some(SnapTableBody {
-        session,
-        position,
-        time_ns,
-        table: buf[22..].to_vec(),
-    })
-}
-
-const _: () = assert!(
-    SNAP_TABLE_FIXED_LEN
-        + crate::v2::schedule::SCHEDULE_HEADER_LEN
-        + crate::v2::schedule::MAX_SCHEDULE_ENTRIES * crate::v2::schedule::SCHEDULE_ENTRY_LEN
-        <= MTU_DEFAULT - DATAGRAM_HEADER_LEN - crate::v2::crypto::CRYPTO_OVERHEAD
-);
+/// kind took the next free value, 21.
+pub const DGRAM_KIND_SNAP_TABLE_RETIRED: u8 = 21;
 
 pub const SNAP_NAK_BODY_LEN: usize = 16;
 
@@ -861,14 +820,16 @@ mod tests {
         assert_eq!(DGRAM_KIND_CONFIG_REPLY, 17);
         // NOT 18: uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT already owns 18
         // (HS_RESP=19, HS_KEY=20) in this same on-wire kind-byte space, so
-        // SNAP_TABLE takes the next free value, 21.
-        assert_eq!(DGRAM_KIND_SNAP_TABLE, 21);
+        // SNAP_TABLE took the next free value, 21 — retired by spec §5.6
+        // before it ever shipped, and pinned here so nothing re-uses it.
+        assert_eq!(DGRAM_KIND_SNAP_TABLE_RETIRED, 21);
     }
 
     #[test]
     fn snap_begin_body_070_roundtrips_and_pins_layout() {
-        assert_eq!(SNAP_BEGIN_FIXED_LEN, 122);
+        assert_eq!(SNAP_BEGIN_FIXED_LEN, 120);
         assert_eq!(SNAP_BEGIN_LAYOUT_V3, 2);
+        assert_eq!(SNAP_BEGIN_LAYOUT_V4, 3);
         let mut identity = [0u64; 8];
         identity[0] = 0x1111_2222_3333_4444;
         identity[1] = 0x5555_6666_7777_8888;
@@ -876,18 +837,17 @@ mod tests {
         version[1] = 0x0102_0003;
         let b = SnapBeginBody {
             session: 9,
-            layout: SNAP_BEGIN_LAYOUT_V3,
+            layout: SNAP_BEGIN_LAYOUT_V4,
             service_id: 1,
             snapshot_pos: 4096,
             total_len: 77,
             identity,
             version,
-            config: vec![],
         };
         let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(&mut buf, &b);
         assert_eq!(&buf[0..4], &9u32.to_le_bytes());
-        assert_eq!(buf[4], 2);
+        assert_eq!(buf[4], 3);
         assert_eq!(buf[5], 1);
         assert_eq!(
             &buf[6..8],
@@ -899,7 +859,6 @@ mod tests {
         assert_eq!(&buf[24..32], &identity[0].to_le_bytes());
         assert_eq!(&buf[32..40], &identity[1].to_le_bytes());
         assert_eq!(&buf[92..96], &version[1].to_le_bytes());
-        assert_eq!(&buf[120..122], &0u16.to_le_bytes());
         assert_eq!(read_snap_begin_body(&buf), Some(b.clone()));
         assert_eq!(b.declared_mask(), 0b11);
         assert_eq!(read_snap_begin_body(&buf[..SNAP_BEGIN_FIXED_LEN - 1]), None);
@@ -914,7 +873,7 @@ mod tests {
             None,
             "34 bytes is below the 0.7.0 fixed part"
         );
-        // A 122-byte body with layout 1 DOES decode — the receiving node
+        // A 120-byte body with layout 1 DOES decode — the receiving node
         // refuses it by name (`peer wire ≤ 0.6.0`), not the decoder.
         let b = SnapBeginBody {
             session: 1,
@@ -924,102 +883,41 @@ mod tests {
             total_len: 1,
             identity: [0; 8],
             version: [0; 8],
-            config: vec![],
         };
         let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(&mut buf, &b);
         assert_eq!(read_snap_begin_body(&buf).unwrap().layout, 1);
     }
 
-    /// `config` still rides at the end and its length is still re-checked
-    /// against the buffer actually received.
+    /// Spec §5.6: the body is FIXED-LENGTH now. A longer datagram — the
+    /// intermediate 0.7.0 shape, which appended `config_len ‖ config` — still
+    /// DECODES (its extra bytes are simply not read); what refuses it is its
+    /// `layout` discriminator at the node layer, by name. Refusing it here on
+    /// length would be indistinguishable from a truncated datagram.
     #[test]
-    fn snap_begin_config_rides_past_the_fixed_part() {
+    fn a_layout_v3_body_with_a_trailing_config_still_decodes_and_names_its_layout() {
         let b = SnapBeginBody {
             session: 1,
-            layout: SNAP_BEGIN_LAYOUT_V3,
+            layout: SNAP_BEGIN_LAYOUT_V4,
             service_id: 0,
             snapshot_pos: 0,
             total_len: 1,
             identity: [1; 8],
             version: [0; 8],
-            config: vec![1, 2, 3, 4],
         };
-        let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN + 4];
+        let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(&mut buf, &b);
-        assert_eq!(&buf[120..122], &4u16.to_le_bytes());
         assert_eq!(read_snap_begin_body(&buf), Some(b));
         assert_eq!(read_snap_begin_body(&buf[..buf.len() - 1]), None);
-    }
-
-    /// FROZEN: kind 21 and the SNAP_TABLE body layout. Never change these
-    /// bytes. (Kind is 21, not the brief's literal 18: `18` is already
-    /// `uc_protocol::v2::crypto::DGRAM_KIND_HS_INIT` in this same kind-byte
-    /// space — see `kind_codes_are_stable`'s note.)
-    #[test]
-    fn snap_table_body_pins_bytes_and_is_total() {
-        use crate::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
-        assert_eq!(DGRAM_KIND_SNAP_TABLE, 21);
-        assert_eq!(SNAP_TABLE_FIXED_LEN, 22);
-        let b = SnapTableBody {
-            session: 7,
-            position: 4096,
-            time_ns: 99,
-            table: vec![1, 2, 3],
-        };
-        let mut buf = vec![0u8; SNAP_TABLE_FIXED_LEN + 3];
-        write_snap_table_body(&mut buf, &b);
-        assert_eq!(&buf[0..4], &7u32.to_le_bytes());
-        assert_eq!(&buf[4..12], &4096u64.to_le_bytes());
-        assert_eq!(&buf[12..20], &99u64.to_le_bytes());
-        assert_eq!(&buf[20..22], &3u16.to_le_bytes());
-        assert_eq!(&buf[22..], &[1, 2, 3]);
-        assert_eq!(read_snap_table_body(&buf), Some(b.clone()));
-        // no table at all: position 0, len 0
-        let none = SnapTableBody {
-            session: 7,
-            position: 0,
-            time_ns: 0,
-            table: vec![],
-        };
-        let mut nb = vec![0u8; SNAP_TABLE_FIXED_LEN];
-        write_snap_table_body(&mut nb, &none);
-        assert_eq!(read_snap_table_body(&nb), Some(none));
-        // totality
-        assert_eq!(read_snap_table_body(&buf[..21]), None, "short");
-        assert_eq!(
-            read_snap_table_body(&buf[..buf.len() - 1]),
-            None,
-            "length mismatch"
-        );
-        let mut z = buf.clone();
-        z[4..12].copy_from_slice(&0u64.to_le_bytes());
-        assert_eq!(read_snap_table_body(&z), None, "position 0 with a table");
-        let mut p = nb.clone();
-        p[4..12].copy_from_slice(&1u64.to_le_bytes());
-        assert_eq!(read_snap_table_body(&p), None, "position without a table");
-        let max = SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN;
-        let mut big = vec![0u8; SNAP_TABLE_FIXED_LEN + max + 1];
-        big[4..12].copy_from_slice(&1u64.to_le_bytes());
-        big[20..22].copy_from_slice(&((max + 1) as u16).to_le_bytes());
-        assert_eq!(read_snap_table_body(&big), None, "over the table ceiling");
-        // The boundary itself (exactly 1064 B, the max entry count) is
-        // ACCEPTED — the ceiling check is `>`, not `>=`.
-        let mut at_max = vec![0u8; SNAP_TABLE_FIXED_LEN + max];
-        at_max[4..12].copy_from_slice(&1u64.to_le_bytes());
-        at_max[20..22].copy_from_slice(&(max as u16).to_le_bytes());
-        assert_eq!(
-            max, 1064,
-            "the boundary value asserted below must track this constant"
-        );
-        assert!(
-            read_snap_table_body(&at_max).is_some(),
-            "table_len exactly at the ceiling is accepted"
-        );
-        assert!(
-            SNAP_TABLE_FIXED_LEN + max <= MTU_DEFAULT - DATAGRAM_HEADER_LEN - 24,
-            "fits crypto-on"
-        );
+        // The V3 shape: same first 120 bytes, `layout` 2, then `config_len` +
+        // 4 config bytes. Decodes; the layout is what a node refuses on.
+        let mut v3 = buf.clone();
+        v3[4] = SNAP_BEGIN_LAYOUT_V3;
+        v3.extend_from_slice(&4u16.to_le_bytes());
+        v3.extend_from_slice(&[1, 2, 3, 4]);
+        let got = read_snap_begin_body(&v3).expect("a longer body still decodes");
+        assert_eq!(got.layout, SNAP_BEGIN_LAYOUT_V3);
+        assert_eq!(got.identity, [1u64; 8]);
     }
 
     #[test]

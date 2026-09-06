@@ -31,7 +31,7 @@ use uc_net::rebuild::NakConfig;
 use uc_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent, RefusalKind};
 use uc_net::sender::{CtrlMsg, Sender, SenderConfig, identity_mask};
 use uc_protocol::identity::FsmName;
-use uc_protocol::v2::datagram::{SNAP_BEGIN_LAYOUT_V2, SNAP_BEGIN_LAYOUT_V3};
+use uc_protocol::v2::datagram::{SNAP_BEGIN_LAYOUT_V2, SNAP_BEGIN_LAYOUT_V4};
 
 const TERM: u32 = 3;
 const CAP: u64 = 1 << 20; // 1 MiB ring
@@ -65,6 +65,18 @@ fn snapshot_bytes(id: u8) -> Vec<u8> {
 /// The artifact position FSM `id` publishes in these tests.
 fn snap_pos(id: u8) -> u64 {
     64 * 1024 + id as u64 * 4096
+}
+
+/// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT's position — above every row's,
+/// so the floor a joiner adopts is still the rows' minimum.
+const CLUSTER_POS: u64 = 64 * 1024 + 8 * 4096;
+
+/// The cluster artifact's bytes (an opaque image to `uc_net` — the node layer
+/// is what parses it), distinguishable from every row's.
+fn cluster_bytes() -> Vec<u8> {
+    (0..SNAP_LEN / 4)
+        .map(|i| (i.wrapping_mul(17).wrapping_add(200)) as u8)
+        .collect()
 }
 
 fn write_snapshot_file(dir: &Path, id: u8) -> PathBuf {
@@ -155,13 +167,22 @@ fn build_with_versions(faults: FaultConfig, names: &[&str], versions: [u32; 8]) 
             len,
         });
     }
+    // Spec §5.6: exactly one CLUSTER ARTIFACT, last, outside the declared mask.
+    let cluster_path = leader_dir
+        .path()
+        .join(format!("snap-{CLUSTER_POS}.ultcluster"));
+    std::fs::write(&cluster_path, cluster_bytes()).unwrap();
+    artifacts.push(uc_net::sender::SnapArtifact {
+        service_id: uc_net::sender::CLUSTER_ARTIFACT_ID,
+        snapshot_pos: CLUSTER_POS,
+        path: cluster_path,
+        len: cluster_bytes().len() as u64,
+    });
     let snapshot_source: uc_net::sender::SnapshotSource = Arc::new(move || {
         Some(uc_net::sender::SnapshotSet {
             services_declared: declared,
             identity,
             version: versions,
-            config: Vec::new(),
-            table: (0, 0, Vec::new()),
             artifacts: artifacts.clone(),
         })
     });
@@ -270,6 +291,15 @@ impl Harness {
             .join(format!("snap-{}.ultsnap", snap_pos(id)))
     }
 
+    /// Where the session's CLUSTER ARTIFACT lands: `snapshots/cluster/`, the
+    /// same path the node's own `uc2-cluster` agent writes and recovers from
+    /// (spec §5.6) — not a `255/` directory.
+    fn cluster_final_path(&self) -> PathBuf {
+        self.follower_snap_dir
+            .join("cluster")
+            .join(format!("snap-{CLUSTER_POS}.ultcluster"))
+    }
+
     /// Send a hand-built SNAP_BEGIN straight at the follower — the only way to
     /// exercise a refusal, since our own sender never emits one.
     fn forge_begin(&self, layout: u8, identity: [u64; 8], version: [u32; 8]) {
@@ -312,7 +342,6 @@ impl Harness {
                 total_len: 64,
                 identity,
                 version,
-                config: vec![],
             },
         );
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -320,7 +349,7 @@ impl Harness {
     }
 
     /// A genuine wire-≤0.6.0 `SNAP_BEGIN`: 34 bytes — the exact fixed part
-    /// wire 0.6.0 sent, below wire 0.7.0's `SNAP_BEGIN_FIXED_LEN` (122), so it
+    /// wire 0.6.0 sent, below wire 0.7.0's `SNAP_BEGIN_FIXED_LEN` (120), so it
     /// is too short to decode at all — the realistic flag-day shape, which
     /// must still name the `peer wire ≤ 0.6.0` refusal rather than vanishing
     /// as an anonymous malformed datagram.
@@ -363,6 +392,21 @@ fn below_floor_nak_upgrades_to_snapshot_session_and_file_transfers_exactly() {
         got,
         snapshot_bytes(0),
         "received file is byte-identical to the source"
+    );
+    // Spec §5.6: the session also carried the CLUSTER ARTIFACT — and it is
+    // what COMPLETES the set, so `final_path(0)` above cannot exist without
+    // it having been announced. It lands under `snapshots/cluster/`.
+    h.pump_until("the cluster artifact landed", |h| {
+        h.cluster_final_path().exists()
+    });
+    assert_eq!(
+        std::fs::read(h.cluster_final_path()).unwrap(),
+        cluster_bytes(),
+        "the cluster artifact is byte-identical to the source too"
+    );
+    assert!(
+        !h.follower_snap_dir.join("255").exists(),
+        "and it does NOT get a 255/ directory of its own"
     );
     assert_eq!(
         h.leader_send.stats().snap_sessions.load(Ordering::Relaxed),
@@ -528,7 +572,7 @@ fn a_mismatched_identity_refuses_the_session_and_names_the_row() {
     let st = h.follower.stats();
     let mut theirs = [0u64; 8];
     theirs[0] = uc_protocol::identity::FsmName::parse("b").unwrap().hash();
-    h.forge_begin(SNAP_BEGIN_LAYOUT_V3, theirs, [0; 8]);
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V4, theirs, [0; 8]);
     h.pump_until("the identity refusal is counted", |_| {
         st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
     });
@@ -556,7 +600,7 @@ fn same_names_in_a_different_row_order_are_refused_positionally() {
     let mut theirs = [0u64; 8];
     theirs[0] = hb;
     theirs[1] = ha;
-    h.forge_begin(SNAP_BEGIN_LAYOUT_V3, theirs, [0; 8]);
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V4, theirs, [0; 8]);
     h.pump_until("refused", |_| {
         st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
     });
@@ -574,12 +618,12 @@ fn a_version_mismatch_is_refused_only_when_both_sides_report_one() {
     let st = h.follower.stats();
     let ours = [name_hash("a"), 0, 0, 0, 0, 0, 0, 0];
     // Their row 0 is unversioned: not a mismatch.
-    h.forge_begin(SNAP_BEGIN_LAYOUT_V3, ours, [0; 8]);
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V4, ours, [0; 8]);
     h.pump_until("intake opened", |h| h.follower_snap_dir.join("0").exists());
     assert_eq!(st.snap_refused_version_mismatch.load(Ordering::Relaxed), 0);
     // Their row 0 is 2.0.0 against our 1.0.0: refused, by row, both versions.
     h.forge_begin(
-        SNAP_BEGIN_LAYOUT_V3,
+        SNAP_BEGIN_LAYOUT_V4,
         ours,
         [0x0200_0000, 0, 0, 0, 0, 0, 0, 0],
     );
@@ -607,7 +651,7 @@ fn an_out_of_range_service_id_is_refused_not_a_panic() {
     let mut h = build(FaultConfig::default(), &["fsm0"]);
     let st = h.follower.stats();
     let ours = identity_hashes_of(&["fsm0"]);
-    h.forge_begin_with_id(SNAP_BEGIN_LAYOUT_V3, 9, ours, [0; 8]);
+    h.forge_begin_with_id(SNAP_BEGIN_LAYOUT_V4, 9, ours, [0; 8]);
     h.pump_until("the out-of-range id is refused, not a panic", |_| {
         st.snap_refused_declared_mismatch.load(Ordering::Relaxed) > 0
     });
