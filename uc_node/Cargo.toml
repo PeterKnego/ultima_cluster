@@ -44,14 +44,11 @@ signal-hook = { workspace = true }
 clap = { workspace = true }
 
 [dev-dependencies]
-# Dev-only cycle (permitted: every edge is a dev-dependency) — the Task 11
-# barrier test drives the full read path with a real service + client.
-# uc_service is deliberately unversioned here (even though uc_node now depends
-# on it at runtime; see [dependencies] above). The runtime edge is versioned
-# because uc_service comes first in the crates.io publish order; the dev-only
-# edge has no version so `cargo package` strips it from the published manifest
-# and avoids a forward-reference to a future version (standard idiom for a
-# dev-only test cycle in a dual-edge scenario).
+# Asymmetric cycle: uc_node → uc_service is a runtime dependency (for the
+# cluster FSM's traits); uc_service → uc_node remains dev-only and unversioned
+# so `cargo package` strips it when uc_service publishes before uc_node is
+# available on crates.io. The Task 11 barrier test drives the full read path
+# with a real service + client.
 uc_service = { path = "../uc_service" }
 uc_client = { path = "../uc_client", version = "2.11.0" }
 # L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,
