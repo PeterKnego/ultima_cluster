@@ -34,13 +34,20 @@ pub const FRAME_TYPE_PADDING: u8 = 2;
 /// layer (M5) applies only MESSAGE frames and TIMER frames addressed to the
 /// row.
 pub const FRAME_TYPE_NEW_TERM: u8 = 3;
-/// Cluster-config entry (M7, spec 2026-07-13): payload =
-/// `v2::config::encode_config` bytes. Appended by a serving leader; adopted
-/// at append (leader) / at durable recording (follower, archive scan).
-/// Replicated/archived/replayed like any frame; the apply layer applies only
-/// MESSAGE frames and TIMER frames addressed to the row, so services never
-/// see it.
-pub const FRAME_TYPE_CONFIG: u8 = 4;
+/// Cluster-FSM command (spec §4.3). The body is `kind: u8 ‖ reserved [u8; 7]
+/// ‖ payload`; the kind selects the payload codec. Reuses `CONFIG`'s number
+/// inside the unreleased 2.11.0 flag day — no shipped node ever emitted a
+/// frame 4 that is not a `Membership` command. User apply loops yield it;
+/// the cluster FSM's loop acts on it; the archive walk reads the kind byte
+/// to feed `Membership` payloads to the consensus kernel at durability.
+pub const FRAME_TYPE_CLUSTER: u8 = 4;
+/// Deprecated name for [`FRAME_TYPE_CLUSTER`] (M7-era, spec 2026-07-13, when
+/// this frame type carried only `v2::config::encode_config` bytes). Same
+/// number, same wire meaning once every `CONFIG` body is reread as a
+/// `Membership`-kind `CLUSTER` body (task 2). Kept so the workspace stays
+/// green while callers migrate; removed in plan 1 task 5.
+#[deprecated(note = "renamed FRAME_TYPE_CLUSTER (spec §4.3); removed in plan 1 task 5")]
+pub const FRAME_TYPE_CONFIG: u8 = FRAME_TYPE_CLUSTER;
 /// Scheduled timer fired by the leader (time-and-timers spec §4.2): a 24-byte
 /// body ([`TimerBody`]); `client_id`/`seq` are 0; `time_ns` is the deadline
 /// unless the frame is late (`time_ns > deadline_ns`). Delivered to exactly the
@@ -49,11 +56,58 @@ pub const FRAME_TYPE_TIMER: u8 = 5;
 /// `flags` bit 0 on a TIMER frame: fired from the replicated schedule table
 /// (plan 2), not from a state machine's `schedule` call.
 pub const FLAG_TIMER_TABLE: u8 = 0x01;
-/// The replicated schedule table (time-and-timers spec §5, plan 2): payload =
-/// `v2::schedule::encode_schedule_table` bytes; appended by a serving leader
-/// on a verified `schedule_apply` admin request; adopted at append (leader) /
-/// at durable recording (follower, archive scan); the apply layer skips it.
+/// Retired before it shipped (was `SCHEDULE_TABLE`, plan 2). Reserved so the
+/// number is never reassigned to something a pre-release build might misread.
+pub const FRAME_TYPE_SCHEDULE_TABLE_RETIRED: u8 = 6;
+/// Deprecated name for the old standalone schedule-table frame type (now
+/// [`FRAME_TYPE_SCHEDULE_TABLE_RETIRED`]): the table now travels as a
+/// `CLUSTER kind=ScheduleTable` body (spec §4.3). Kept so the workspace
+/// stays green while callers migrate; removed in plan 1 task 5.
+#[deprecated(
+    note = "the table now travels as a CLUSTER kind=ScheduleTable body; removed in plan 1 task 5"
+)]
 pub const FRAME_TYPE_SCHEDULE_TABLE: u8 = 6;
+/// `kind ‖ reserved` — the fixed prefix of every `CLUSTER` body.
+pub const CLUSTER_BODY_PREFIX_LEN: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ClusterKind {
+    Membership = 1,
+    ScheduleTable = 2,
+    Settings = 3,
+}
+
+impl ClusterKind {
+    pub const fn from_u8(b: u8) -> Option<ClusterKind> {
+        match b {
+            1 => Some(ClusterKind::Membership),
+            2 => Some(ClusterKind::ScheduleTable),
+            3 => Some(ClusterKind::Settings),
+            _ => None,
+        }
+    }
+}
+
+/// Write the prefix; `buf.len() >= CLUSTER_BODY_PREFIX_LEN`. Reserved bytes
+/// are written as zero so a later reader may claim them.
+pub fn write_cluster_prefix(buf: &mut [u8], kind: ClusterKind) {
+    buf[0] = kind as u8;
+    buf[1..CLUSTER_BODY_PREFIX_LEN].fill(0);
+}
+
+/// Total: `None` on a short body, an unknown kind, or a non-zero reserved
+/// byte. Returns the kind and the payload that follows the prefix.
+pub fn read_cluster_prefix(buf: &[u8]) -> Option<(ClusterKind, &[u8])> {
+    if buf.len() < CLUSTER_BODY_PREFIX_LEN {
+        return None;
+    }
+    let kind = ClusterKind::from_u8(buf[0])?;
+    if buf[1..CLUSTER_BODY_PREFIX_LEN].iter().any(|b| *b != 0) {
+        return None;
+    }
+    Some((kind, &buf[CLUSTER_BODY_PREFIX_LEN..]))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -224,10 +278,10 @@ mod tests {
         assert_eq!(FRAME_TYPE_MESSAGE, 1);
         assert_eq!(FRAME_TYPE_PADDING, 2);
         assert_eq!(FRAME_TYPE_NEW_TERM, 3);
-        assert_eq!(FRAME_TYPE_CONFIG, 4);
+        assert_eq!(FRAME_TYPE_CLUSTER, 4);
         assert_eq!(FRAME_TYPE_TIMER, 5);
         assert_eq!(FLAG_TIMER_TABLE, 0x01);
-        assert_eq!(FRAME_TYPE_SCHEDULE_TABLE, 6);
+        assert_eq!(FRAME_TYPE_SCHEDULE_TABLE_RETIRED, 6);
     }
 
     /// FROZEN: the 24-byte TIMER body (spec §4.2).
@@ -253,5 +307,39 @@ mod tests {
             Some(b),
             "trailing bytes are ignored"
         );
+    }
+
+    #[test]
+    fn cluster_frame_type_reuses_config_number_and_prefix_is_frozen() {
+        // FROZEN once shipped (spec §7): the number, the prefix length, the kinds.
+        assert_eq!(FRAME_TYPE_CLUSTER, 4);
+        assert_eq!(CLUSTER_BODY_PREFIX_LEN, 8);
+        assert_eq!(ClusterKind::Membership as u8, 1);
+        assert_eq!(ClusterKind::ScheduleTable as u8, 2);
+        assert_eq!(ClusterKind::Settings as u8, 3);
+        assert_eq!(FRAME_TYPE_SCHEDULE_TABLE_RETIRED, 6);
+    }
+
+    #[test]
+    fn cluster_prefix_roundtrips_and_reserved_bytes_are_zero() {
+        let mut buf = vec![0xffu8; CLUSTER_BODY_PREFIX_LEN + 3];
+        write_cluster_prefix(&mut buf, ClusterKind::Settings);
+        assert_eq!(&buf[1..8], &[0u8; 7]);
+        let (kind, payload) = read_cluster_prefix(&buf).unwrap();
+        assert_eq!(kind, ClusterKind::Settings);
+        assert_eq!(payload, &[0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn cluster_prefix_is_total_on_short_and_unknown_input() {
+        assert!(read_cluster_prefix(&[]).is_none());
+        assert!(read_cluster_prefix(&[1u8; 7]).is_none());
+        let mut bad = [0u8; 8];
+        bad[0] = 9; // unknown kind
+        assert!(read_cluster_prefix(&bad).is_none());
+        let mut nz = [0u8; 8];
+        nz[0] = 1;
+        nz[3] = 1; // reserved byte set: refused, so the bytes can be claimed later
+        assert!(read_cluster_prefix(&nz).is_none());
     }
 }

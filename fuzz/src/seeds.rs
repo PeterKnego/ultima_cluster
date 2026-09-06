@@ -794,6 +794,7 @@ pub fn ring_mpsc_record() -> Vec<Seed> {
 }
 
 /// `uc_protocol_log_frame` — one header per frame type the log buffer carries.
+#[allow(deprecated)] // FRAME_TYPE_CONFIG: kept as a seed of the pre-rename number; see uc_protocol::v2::frame
 pub fn uc_protocol_log_frame() -> Vec<Seed> {
     use uc_protocol::v2::frame::*;
 
@@ -1343,4 +1344,106 @@ pub fn uc_node_http() -> Vec<Seed> {
     big.extend_from_slice(b" HTTP/1.1\r\n\r\n");
     seeds.push(Seed::fixed("13-oversized-request-line", big));
     seeds
+}
+
+// ===========================================================================
+// Cluster-FSM plan 1, task 1 targets
+// ===========================================================================
+
+/// `uc_protocol_cluster_frame` — the `CLUSTER` body every node decodes off
+/// the log (spec §4.3): a valid prefix + payload for each kind (a two-voter
+/// `WireConfig` for `Membership`, a one-entry table for `ScheduleTable`, the
+/// genesis default for `Settings`), plus the `read_cluster_prefix` refusals
+/// a short buffer, an unknown kind, and a non-zero reserved byte.
+pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
+    use uc_protocol::v2::config::{WireConfig, WireMember, encode_config};
+    use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, ClusterKind, write_cluster_prefix};
+    use uc_protocol::v2::schedule::{ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table};
+    use uc_protocol::v2::settings::{Settings, encode_settings};
+
+    fn prefixed(kind: ClusterKind, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
+        write_cluster_prefix(&mut v, kind);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    // A two-voter WireConfig — a real cluster-membership shape.
+    let cfg = WireConfig {
+        version: 1,
+        prev_position: 0,
+        voters: vec![
+            WireMember { id: 1, ip: 0x0A00_0001, port: 9000 },
+            WireMember { id: 2, ip: 0x0A00_0002, port: 9000 },
+        ],
+        learners: vec![],
+        tombstones: vec![],
+    };
+    let mut cfg_bytes = Vec::new();
+    encode_config(&cfg, &mut cfg_bytes);
+
+    let table = ScheduleTable {
+        entries: vec![ScheduleEntry {
+            identity_hash: uc_protocol::identity::fnv1a_64(b"clock"),
+            timer_id: 1,
+            rule: ScheduleRule::Once { at_ns: 1_700_000_000_000_000_000 },
+        }],
+    };
+    let mut table_bytes = Vec::new();
+    encode_schedule_table(&table, &mut table_bytes);
+
+    let mut settings_bytes = Vec::new();
+    encode_settings(&Settings::genesis_default(), &mut settings_bytes);
+
+    let mut unknown_kind = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
+    unknown_kind[0] = 9;
+
+    let mut reserved_nonzero = vec![0u8; CLUSTER_BODY_PREFIX_LEN];
+    reserved_nonzero[0] = ClusterKind::Settings as u8;
+    reserved_nonzero[3] = 1;
+
+    vec![
+        Seed::fixed("01-membership", prefixed(ClusterKind::Membership, &cfg_bytes)),
+        Seed::fixed("02-schedule-table", prefixed(ClusterKind::ScheduleTable, &table_bytes)),
+        Seed::fixed("03-settings", prefixed(ClusterKind::Settings, &settings_bytes)),
+        Seed::fixed("04-short", vec![0u8; 4]),
+        Seed::fixed("05-unknown-kind", unknown_kind),
+        Seed::fixed("06-reserved-nonzero", reserved_nonzero),
+    ]
+}
+
+/// `uc_protocol_settings` — the replicated settings record (cluster-FSM spec
+/// §6): the genesis default, a non-default encoding, and the three refusals
+/// the decoder owes: a wrong length, an unknown version, an unknown target.
+pub fn uc_protocol_settings() -> Vec<Seed> {
+    use uc_protocol::v2::settings::*;
+
+    fn encoded(s: &Settings) -> Vec<u8> {
+        let mut v = Vec::new();
+        encode_settings(s, &mut v);
+        v
+    }
+
+    let genesis = encoded(&Settings::genesis_default());
+    let non_default = encoded(&Settings {
+        fsm_lag_bytes: 16 << 20,
+        admission_bytes: 4 << 20,
+        snapshot_interval_bytes: 1 << 30,
+        snapshot_target: Target::Learners,
+    });
+    let mut bad_version = genesis.clone();
+    bad_version[0] = 2;
+    let mut bad_target = genesis.clone();
+    bad_target[28] = 9;
+    let mut trailing = genesis.clone();
+    trailing.push(0);
+
+    vec![
+        Seed::fixed("01-genesis-default", genesis),
+        Seed::fixed("02-non-default", non_default),
+        Seed::fixed("03-bad-version", bad_version),
+        Seed::fixed("04-bad-target", bad_target),
+        Seed::fixed("05-trailing-byte", trailing),
+        Seed::fixed("06-short", vec![0u8; 4]),
+    ]
 }

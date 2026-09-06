@@ -16,6 +16,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use uc_journal::{Durability, Journal, JournalConfig, JournalError};
+// TODO(plan 1 task 2/5): FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE are
+// deprecated aliases for FRAME_TYPE_CLUSTER (kind=Membership/ScheduleTable);
+// callers migrate in later tasks.
+#[allow(deprecated)]
 use uc_protocol::v2::frame::{
     self, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, FRAME_TYPE_SCHEDULE_TABLE, FrameHeader, HEADER_LEN,
 };
@@ -440,6 +444,7 @@ impl Archive {
     /// frame)`. PADDING frames are skipped (a wrap padding carries a stale term
     /// stamp and is not a real term boundary). Header-only, so it never reads
     /// payload bytes.
+    #[allow(deprecated)] // FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE: see the import above
     fn observe_terms(&mut self, block: &[u8], base: u64) {
         let mut off = 0usize;
         while off + HEADER_LEN <= block.len() {

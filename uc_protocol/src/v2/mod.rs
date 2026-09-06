@@ -11,3 +11,4 @@ pub mod datagram;
 pub mod frame;
 pub mod ipc;
 pub mod schedule;
+pub mod settings;

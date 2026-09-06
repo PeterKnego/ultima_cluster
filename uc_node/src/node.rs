@@ -42,6 +42,9 @@ use uc_protocol::v2::cnc::{
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
+// TODO(plan 1 task 2/5): FRAME_TYPE_CONFIG is a deprecated alias for
+// FRAME_TYPE_CLUSTER (kind=Membership); callers migrate in later tasks.
+#[allow(deprecated)]
 use uc_protocol::v2::frame::{FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, TimerBody, align_frame_len};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SCHED,
@@ -7439,6 +7442,7 @@ pub(crate) fn recover_config_record(
 /// prev/cur shape `Action::ConfigAdopted`'s exec arm persists, so even a
 /// multi-hop scan (more than one adoption crash-exposed in the same window)
 /// folds down to a valid one-level record.
+#[allow(deprecated)] // FRAME_TYPE_CONFIG: see the import above
 pub(crate) fn rederive_config(
     archive: &Archive,
     rec: ConfigRecord,

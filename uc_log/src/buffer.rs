@@ -18,6 +18,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// TODO(plan 1 task 2/5): FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE are
+// deprecated aliases for FRAME_TYPE_CLUSTER (kind=Membership/ScheduleTable);
+// callers migrate in later tasks.
+#[allow(deprecated)]
 use uc_protocol::v2::frame::{
     self, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
     FRAME_TYPE_SCHEDULE_TABLE, FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN, TIMER_BODY_LEN,
@@ -729,6 +733,7 @@ impl Appender {
     /// point (`ConfigRecord.position` semantics), UNLIKE `append`/
     /// `append_new_term` which return the frame START. Same wrap/overrun
     /// discipline as `append`.
+    #[allow(deprecated)] // FRAME_TYPE_CONFIG: see the import above
     pub fn append_config(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
         if payload.len() > self.buffer.max_payload {
             return Err(AppendError::PayloadTooLarge);
@@ -804,6 +809,7 @@ impl Appender {
     /// adoption effect point), NOT the frame start. Same wrap/overrun/commit
     /// discipline as `append_config` — this is that method's body with the
     /// frame type swapped.
+    #[allow(deprecated)] // FRAME_TYPE_SCHEDULE_TABLE: see the import above
     pub fn append_schedule_table(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
         if payload.len() > self.buffer.max_payload {
             return Err(AppendError::PayloadTooLarge);
@@ -957,6 +963,8 @@ mod tests {
     use crate::cnc::{CncMeta, CncPage};
     use crate::region::Region;
     use std::sync::Arc;
+    #[allow(deprecated)]
+    // FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE: see the module import above
     use uc_protocol::v2::frame::{
         FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM,
         FRAME_TYPE_PADDING, FRAME_TYPE_SCHEDULE_TABLE, FRAME_TYPE_TIMER, HEADER_LEN,
@@ -1027,6 +1035,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // FRAME_TYPE_CONFIG: see the module import above
     fn append_config_records_type_term_and_payload_returns_frame_end() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 7, 0);
@@ -1056,6 +1065,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // FRAME_TYPE_SCHEDULE_TABLE: see the module import above
     fn append_schedule_table_is_a_stamped_type_6_frame_returning_the_end() {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 4, 0);
