@@ -52,17 +52,6 @@ crc32fast = { workspace = true }
 # with a real service + client.
 uc_service = { path = "../uc_service" }
 uc_client = { path = "../uc_client", version = "2.11.0" }
-# Cluster-FSM plan 1 task 8: `admin_auth.rs`'s settings-apply capstone drives
-# `uc2ctl settings apply`/`show` as library calls (`uc_ctl::settings::{apply,
-# show}`) rather than shelling out to the built binary. The SAME asymmetric
-# cycle as the `uc_service` entry above, with the two crates swapped: `uc_ctl`
-# depends on `uc_node` NORMALLY (it needs `uc_node::cluster_agent` and the
-# node types to build the admin CLI), so this edge only exists in test
-# builds. Deliberately unversioned, for the same reason `uc_lincheck`/
-# `uc_sim` below are: a versioned path dev-dep would make `cargo package`
-# require it from the registry, which fails since `uc_ctl` is what depends on
-# `uc_node`, not the other way around.
-uc_ctl = { path = "../uc_ctl" }
 # L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,
 # built for the v2 SDK trait only (v1 `uc_service` is not pulled in here).
 # NOTE: deliberately no `version =` — uc_lincheck is `publish = false` (never

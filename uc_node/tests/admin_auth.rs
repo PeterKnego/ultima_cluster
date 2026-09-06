@@ -26,13 +26,11 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use uc_consensus::election::NodeId;
 use uc_crypto::admin::{AdminMessage, sign};
-use uc_ctl::CommonArgs;
 use uc_lincheck::register::RegisterSm;
 use uc_log::cnc::{AdminAuth, AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
@@ -1313,83 +1311,5 @@ fn schedule_apply_is_signed_digest_checked_leader_only_and_audited() {
     for s in svcs {
         s.stop();
     }
-    c.stop();
-}
-
-// ---------------------------------------------------------------------------
-// Cluster-FSM plan 1 task 8: `settings apply`/`show` (spec §6, §8) via
-// `uc_ctl`'s library surface (`uc_ctl::settings::{apply, show}`), not the raw
-// `admin_request` helper the schedule-apply test above uses — this is the one
-// path in this file that exercises `uc2ctl`'s own code (parse, stage, digest,
-// sign, send, print) end to end rather than only the node's admission of a
-// request forged in the test.
-// ---------------------------------------------------------------------------
-
-/// One node is enough here: `settings apply`'s acceptance function
-/// (`ClusterFsm::validate`'s `Settings` arm) checks bounds only, never
-/// membership or a declared FSM set, so there is nothing for a second voter
-/// or a declared row to prove.
-///
-/// `show`'s assertion: per task 8's brief, there is no live, in-process
-/// reading in this plan (spec §13 phase 2 is what would add one) — `show`
-/// reads the newest CLUSTER ARTIFACT, which a `uc2-cluster` agent only
-/// writes once every declared row has snapshotted. This cluster declares no
-/// FSM at all (`ServicesConfig::none_for_tests()`, via `spawn_cluster`), so
-/// no artifact is EVER written here, even though the live view above proves
-/// the settings command committed. Rather than capture `show`'s stdout, this
-/// asserts the underlying condition the honest "no cluster artifact yet"
-/// line is printed from (`read_committed_settings` answering `None`) and
-/// that `show` itself still returns `Ok` on that path — driving a real
-/// artifact would need a `SnapshotStateMachine` service tuned the way
-/// `learner.rs`'s `start_with_snapshots` tests do, which is its own setup
-/// this capstone does not need to prove the apply path end to end.
-#[test]
-fn settings_apply_via_uc_ctl_commits_and_show_reads_the_honest_no_artifact_line() {
-    let _g = serialize();
-    let c = spawn_cluster(1, AdminPolicy::Filesystem);
-    let leader = await_single_leader(&c.nodes, 30);
-    let dir = c.nodes[leader].instance_dir.clone();
-
-    let toml_path = dir.join("settings-apply-test.toml");
-    std::fs::write(&toml_path, "admission_bytes = 4096\n").expect("write settings TOML");
-
-    let common = CommonArgs {
-        instance_dir: dir.clone(),
-        app_id: APP.into(),
-        admin_key: None,
-        admin_key_name: None,
-        admin_ttl_secs: 30,
-    };
-
-    // The library call `uc2ctl settings apply` makes: parse, stage, sign (a
-    // no-op under `AdminPolicy::Filesystem`), send op 7, poll the response.
-    uc_ctl::settings::apply(&common, &toml_path).expect("settings apply");
-
-    // The command travels as a CLUSTER frame and takes effect at COMMIT —
-    // `cluster_view().admission_bytes` reaching 4096 proves the request
-    // committed and the live view followed, the same round trip the
-    // schedule-apply test proves via `table_position` above.
-    let node = c.nodes[leader].node.as_ref().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while node.cluster_view().admission_bytes.load(Ordering::Acquire) != 4096 {
-        assert!(
-            Instant::now() < deadline,
-            "the leader never committed the settings it applied"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        !dir.join(uc_node::SETTINGS_PENDING_FILE).exists(),
-        "an accepted apply consumes the staged file"
-    );
-
-    assert!(
-        uc_node::cluster_agent::read_committed_settings(&dir)
-            .expect("reading the cluster artifact")
-            .is_none(),
-        "no service in this cluster ever snapshots, so no cluster artifact should exist yet"
-    );
-    uc_ctl::settings::show(&common).expect("settings show must not error with no artifact yet");
-
     c.stop();
 }

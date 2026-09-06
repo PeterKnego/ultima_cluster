@@ -168,6 +168,21 @@ pub fn apply(common: &CommonArgs, file: &Path) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- show
 
+/// Render `Settings::fsm_lag_bytes` for `show`. Fully spelled units only for
+/// the common cases an operator actually sets ("lockstep", "default", a
+/// whole MiB count) — an arbitrary byte count (reachable in practice:
+/// `parse_fsm_lag` accepts bare digits and `KiB`/`GiB` too, not just `MiB`,
+/// e.g. `fsm_lag = "64KiB"` stores `65536`, which is not a whole MiB) falls
+/// back to raw bytes rather than lying about the unit.
+fn render_fsm_lag(bytes: u64) -> String {
+    match bytes {
+        0 => "default".to_string(),
+        FSM_LAG_LOCKSTEP => "lockstep".to_string(),
+        b if b.is_multiple_of(1 << 20) => format!("{}MiB", b >> 20),
+        b => format!("{b}B"),
+    }
+}
+
 /// `uc2ctl settings show`: the COMMITTED settings, read out of this instance
 /// directory's newest cluster artifact
 /// (`uc_node::cluster_agent::read_committed_settings`). `None` (no artifact
@@ -181,16 +196,7 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    // Fully spelled units only for the common cases an operator actually
-    // sets ("lockstep", "default", a whole MiB count) — an arbitrary byte
-    // count (accepted by `parse_fsm_lag` via bare digits or KiB/GiB) falls
-    // back to raw bytes rather than lying about the unit.
-    let fsm_lag = match settings.fsm_lag_bytes {
-        0 => "default".to_string(),
-        FSM_LAG_LOCKSTEP => "lockstep".to_string(),
-        b if b.is_multiple_of(1 << 20) => format!("{}MiB", b >> 20),
-        b => format!("{b}B"),
-    };
+    let fsm_lag = render_fsm_lag(settings.fsm_lag_bytes);
     let target = match settings.snapshot_target {
         Target::All => "all",
         Target::Learners => "learners",
@@ -257,5 +263,24 @@ mod tests {
         assert_eq!(s.admission_bytes, 0);
         assert_eq!(s.snapshot_interval_bytes, 0);
         assert_eq!(s.fsm_lag_bytes, 0);
+    }
+
+    /// Fix round 1, Minor 3: `parse_fsm_lag` accepts `KiB` (and bare byte
+    /// counts) as well as `MiB`, so a non-MiB-aligned `fsm_lag_bytes` is
+    /// reachable by ordinary operator input, not just a hypothetical value —
+    /// `render_fsm_lag`'s raw-byte fallback must actually fire for it rather
+    /// than silently rounding or mislabeling the unit.
+    #[test]
+    fn render_fsm_lag_falls_back_to_raw_bytes_for_a_non_mib_value() {
+        assert_eq!(render_fsm_lag(0), "default");
+        assert_eq!(render_fsm_lag(FSM_LAG_LOCKSTEP), "lockstep");
+        assert_eq!(render_fsm_lag(16 << 20), "16MiB");
+        assert_eq!(render_fsm_lag(64 << 10), "65536B");
+
+        // Round-trip through `parse_settings` too: `fsm_lag = "64KiB"` is a
+        // real TOML an operator would write.
+        let s = parse_settings("fsm_lag = \"64KiB\"\n").unwrap();
+        assert_eq!(s.fsm_lag_bytes, 65536);
+        assert_eq!(render_fsm_lag(s.fsm_lag_bytes), "65536B");
     }
 }

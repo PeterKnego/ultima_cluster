@@ -1437,7 +1437,6 @@ dependencies = [
  "uc_client",
  "uc_consensus",
  "uc_crypto",
- "uc_ctl",
  "uc_journal",
  "uc_lincheck",
  "uc_log",
