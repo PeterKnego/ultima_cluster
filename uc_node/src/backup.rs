@@ -41,9 +41,10 @@
 //! while purge is running concurrently:
 //!
 //! > first_base only advances (purge), the newest snapshot position only
-//! > advances (publish is atomic, retention keeps the newest 2, and purge
-//! > only runs below a durably persisted floor that some retained snapshot
-//! > covers) — so a snapshot copied AFTER the journal always covers any purge
+//! > advances (publish is atomic; the node's set retention deletes only
+//! > BELOW the complete set at its floor, so the set the floor names is
+//! > always retained; and purge only runs below that durably persisted
+//! > floor) — so a snapshot copied AFTER the journal always covers any purge
 //! > that happened BEFORE the journal copy. The reverse order can capture a
 //! > snapshot set from before a purge that the journal copy then reflects: a
 //! > hole.
@@ -371,8 +372,8 @@ fn cluster_snapshots_dir(root: &Path) -> PathBuf {
 ///
 /// # Retrying the WHOLE directory on a vanished source file
 ///
-/// `src` may be live under our feet: `journal/`'s purge and `snapshots/`'s
-/// keep-newest-2 retention both unlink files while the node keeps running,
+/// `src` may be live under our feet: `journal/`'s purge and the node's
+/// below-the-set snapshot retention both unlink files while the node runs,
 /// and a backup taken under load races both by design (this module's whole
 /// premise). If a file we already listed vanishes before its `fs::copy` runs
 /// (`io::ErrorKind::NotFound`), this does NOT skip just that name and
@@ -401,7 +402,8 @@ fn cluster_snapshots_dir(root: &Path) -> PathBuf {
 /// A retried copy is equivalent to having simply started that part of the
 /// backup a little LATER — which the ordering rule (module doc) already
 /// covers: `first_base` only ever advances (purge) and the newest retained
-/// snapshot position only ever advances (atomic publish, keep-newest-2), so
+/// snapshot position only ever advances (atomic publish; retention deletes
+/// only BELOW the complete set at the floor), so
 /// a later start can only make the coverage invariant easier to satisfy, not
 /// harder. Retries are bounded (not unbounded) because purge/retention
 /// cadence tracks SNAPSHOT cadence — orders of magnitude slower than copying

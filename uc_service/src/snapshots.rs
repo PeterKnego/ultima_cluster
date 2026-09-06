@@ -32,13 +32,15 @@
 //! the envelope on every install path, and the SM's check stays as
 //! belt-and-suspenders.
 //!
-//! **Retention.** `publish` does NOT prune (coordinated-snapshot spec §5.3,
-//! ruling P1): only the NODE can see which artifacts form a complete SET at an
-//! instant, so it owns retention — keeping the newest complete set plus
-//! anything newer. A per-writer keep-newest-N here would happily delete the
-//! artifact at the floor once two later instants were abandoned, and the ship
-//! gate would then decline `MISSING` forever. [`SnapshotStore::retain_newest`]
-//! remains for the node-side pruner.
+//! **Retention.** This module does NOT prune at all (coordinated-snapshot
+//! spec §5.3, ruling P1): only the NODE can see which artifacts form a
+//! complete SET at an instant, so it owns retention — keeping the set at its
+//! floor plus anything newer, and unlinking everything below. A per-writer
+//! keep-newest-N here would happily delete the artifact at the floor once two
+//! later instants were abandoned, and the ship gate ("the complete set at my
+//! floor") would then decline `MISSING` forever. The pruner is
+//! `uc_node`'s `prune_snapshots_below`, which matches `snap-<pos>.ultsnap`
+//! EXACTLY — never a `.tmp` this module may still be writing.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -130,9 +132,10 @@ pub fn verify_snapshot_envelope(src: &mut dyn Read, expected: u64) -> Result<(),
     Ok(())
 }
 
-/// Owns the `instance_dir/snapshots` directory: position-tagged file naming,
-/// atomic publish, and keep-newest-2 retention. Cheap to construct — no open
-/// file handles are held between calls.
+/// Owns the `instance_dir/snapshots` directory: position-tagged file naming
+/// and atomic publish. It does **not** retain or prune — the node owns set
+/// retention (module doc, ruling P1). Cheap to construct — no open file
+/// handles are held between calls.
 ///
 /// `Clone` is cheap (a `PathBuf`) and lets the builder thread and the apply
 /// thread's reconstruction path (M6 Task 5) each hold one over the same dir.
@@ -186,8 +189,8 @@ impl SnapshotStore {
 
     /// Write a new snapshot tagged at `pos`: `write` streams into a temp file,
     /// which is `fsync`'d then atomically renamed onto `snap-<pos>.ultsnap`
-    /// (module doc). Then retention drops every snapshot file except the
-    /// newest 2 (by position). Returns the final path on success.
+    /// (module doc). Nothing is pruned — the node's set retention decides what
+    /// is garbage. Returns the final path on success.
     ///
     /// On a `write` failure (or an I/O error at any step before the rename),
     /// the temp file is best-effort unlinked and the error is returned — the
@@ -220,45 +223,19 @@ impl SnapshotStore {
         let final_path = self.path_for(pos);
         std::fs::rename(&tmp_path, &final_path)?;
         // Coordinated-snapshot spec §5.3 (plan-2 ruling P1): retention is
-        // NODE-owned. The node keeps the newest COMPLETE set plus anything
-        // newer and deletes the rest; a per-writer "newest 2" pruner here
-        // cannot see sets, so two abandoned instants after a complete set at
-        // P would delete P — and the ship gate ("the complete set at my
-        // floor") would then decline MISSING forever. `retain_newest` stays
-        // for the node-side pruner (Task 5) to reuse.
+        // NODE-owned. The node keeps the set at its floor plus anything newer
+        // and deletes the rest; a per-writer "newest 2" pruner here cannot see
+        // sets, so two abandoned instants after a complete set at P would
+        // delete P — and the ship gate ("the complete set at my floor") would
+        // then decline MISSING forever.
         Ok(final_path)
-    }
-
-    /// Unlink every complete snapshot file except the `keep` newest (by
-    /// position). Best-effort per file: a removal race (the file already gone)
-    /// is not an error here — nothing else in this single-writer module
-    /// deletes snapshot files, but tolerating a `NotFound` keeps this robust
-    /// against, say, an operator manually clearing the directory.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn retain_newest(&self, keep: usize) -> io::Result<()> {
-        let mut all: Vec<(u64, PathBuf)> = std::fs::read_dir(&self.dir)?
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name();
-                let pos = name.to_str().and_then(parse_snap_pos)?;
-                Some((pos, e.path()))
-            })
-            .collect();
-        all.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
-        for (_, path) in all.into_iter().skip(keep) {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
     }
 }
 
 /// Parse `snap-<pos>.ultsnap` -> `pos`. Anything else (a `.tmp` in-progress
 /// file, a foreign file an operator dropped in, a malformed number) is `None`
-/// and silently ignored by both `newest` and `retain_newest`.
+/// and silently ignored by `newest` — and by the node's own pruner, which
+/// applies the identical rule to the same names.
 fn parse_snap_pos(file_name: &str) -> Option<u64> {
     file_name
         .strip_prefix(PREFIX)?
@@ -390,12 +367,12 @@ mod tests {
         assert!(store.newest(500).unwrap().is_none());
     }
 
-    /// Coordinated-snapshot ruling P1: `publish` no longer prunes — retention
-    /// is node-owned, because only the node can see which artifacts form a
-    /// COMPLETE set. `retain_newest` itself is unchanged and still keeps the
-    /// newest `keep`; the node-side pruner (Task 5) is its next caller.
+    /// Coordinated-snapshot ruling P1: `publish` never prunes — retention is
+    /// node-owned, because only the node can see which artifacts form a
+    /// COMPLETE set. This module keeps every artifact it writes; `uc_node`'s
+    /// `prune_snapshots_below` is what deletes them.
     #[test]
-    fn publish_never_prunes_and_retain_newest_still_keeps_the_newest_two() {
+    fn publish_never_prunes() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
         for pos in [100u64, 200, 300, 400] {
@@ -414,12 +391,6 @@ mod tests {
             on_disk(()),
             vec![100, 200, 300, 400],
             "publish keeps every artifact: the node decides what is garbage"
-        );
-        store.retain_newest(2).unwrap();
-        assert_eq!(
-            on_disk(()),
-            vec![300, 400],
-            "keep-newest-2, oldest two unlinked"
         );
     }
 

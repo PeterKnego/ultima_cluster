@@ -41,9 +41,10 @@ mod output;
 mod replay;
 mod session;
 /// Position-tagged on-disk snapshot files (M6 Task 3) — `SnapshotStore`'s
-/// atomic-publish + keep-newest-2 retention. Public: tests and operational
-/// tooling read the snapshot directory directly (e.g. the M6 Task 3 e2e test
-/// cross-checks the cnc marker against `SnapshotStore::newest`).
+/// atomic publish. Retention is NODE-owned (coordinated-snapshot spec §5.3,
+/// ruling P1): this module never deletes an artifact. Public: tests and
+/// operational tooling read the snapshot directory directly (e.g. the M6 Task
+/// 3 e2e test cross-checks the cnc marker against `SnapshotStore::newest`).
 pub mod snapshots;
 /// `Tagged<ROW, S>`: run one state-machine type at several rows (harnesses
 /// only, spec §3.3) — see the module doc.

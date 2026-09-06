@@ -40,23 +40,16 @@ use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 use crate::cluster_fsm::{ClusterFsm, ClusterState, ClusterView};
 
-/// How many cluster artifacts a retention sweep keeps — the newest N by
-/// position. **2, the same number every user row keeps**
-/// (`uc_service::snapshots`'s `retain_newest(2)`), and for the same reason: a
-/// joiner's snapshot session may still be streaming the previous artifact
-/// when the next one is written, and a corrupt newest artifact fail-stops
-/// `recover`, so the second is what an operator removes the first to fall
-/// back to (see the runbook's `cluster_artifact_corrupt` entry).
-///
-/// Coordinated-snapshot spec §5.3: retention is now **node-owned**, not this
-/// agent's own — task 5 prunes every artifact below a complete set's
-/// position, across every row and the cluster FSM together, so an
-/// unconditional "keep 2" run from inside [`ClusterAgent::take_snapshot`]
-/// could delete the very artifact a just-completed set needs (an abandoned
-/// instant plus one more here would let this sweep outrun a two-instant-old
-/// complete set before the ship gate at that floor is ever read). See
-/// [`ClusterAgent::retain_newest`].
-pub const CLUSTER_ARTIFACTS_KEPT: usize = 2;
+// Coordinated-snapshot spec §5.3 (ruling P1): this agent has NO retention of
+// its own. The node prunes every artifact — every row's and this family's —
+// below a COMPLETE set's position, on the completion branch only
+// (`Consensus::prune_snapshots_below`). A per-writer "keep the newest N" here
+// could not see sets, so an abandoned instant plus one more would let it
+// delete the artifact the newest complete set is made of, before the ship
+// gate at that floor was ever read. The runbook's `cluster_artifact_corrupt`
+// recovery — remove the named file and restart — still works: everything at
+// or above the floor is retained, which is at least the set the node is
+// serving from.
 
 pub fn artifact_path(dir: &Path, position: u64) -> PathBuf {
     dir.join(format!("snap-{position}.ultcluster"))
@@ -651,53 +644,6 @@ impl ClusterAgent {
         *snapshot_pos = pos;
         cluster_snapshot_pos.store(pos, Ordering::Release);
         Ok(pos)
-    }
-
-    /// Unlink every complete artifact except the `keep` newest by position —
-    /// the cluster family's copy of `uc_service::snapshots`'s
-    /// `retain_newest`, which every user row has run after every publish
-    /// since M6.
-    ///
-    /// Coordinated-snapshot spec §5.3: retention is now **node-owned**, not
-    /// per-writer — task 5 prunes every artifact below a *complete set's*
-    /// position, across every declared row and this agent together, so
-    /// [`Self::take_snapshot`] no longer calls this after every freeze (an
-    /// unconditional "keep 2" here could delete the artifact a complete set
-    /// two instants back still needs, before task 5's floor computation ever
-    /// reads it). Kept, unused for now, for task 5 to call from the node's
-    /// set-retention path — the file-naming and sweep logic are identical to
-    /// what that path needs for the cluster family.
-    #[allow(dead_code)]
-    fn retain_newest(&self, keep: usize) {
-        let Ok(rd) = fs::read_dir(&self.snapshot_dir) else {
-            return;
-        };
-        let mut all: Vec<(u64, PathBuf)> = rd
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name();
-                let pos = name
-                    .to_str()?
-                    .strip_prefix("snap-")?
-                    .strip_suffix(".ultcluster")?
-                    .parse::<u64>()
-                    .ok()?;
-                Some((pos, e.path()))
-            })
-            .collect();
-        all.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
-        for (_, path) in all.into_iter().skip(keep) {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => crate::obs_event!(
-                    Warn,
-                    "cluster_snapshot_prune_failed",
-                    path = path.display().to_string().as_str(),
-                    err = e.to_string().as_str()
-                ),
-            }
-        }
     }
 }
 

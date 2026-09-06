@@ -166,6 +166,23 @@ fn wait_until(mut f: impl FnMut() -> bool) {
     }
 }
 
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command an
+/// instant and return its position **P**, polling through the `retry` window a
+/// leader legitimately answers while it has the role but not yet an appender.
+/// Duplicated per test binary, like `admin_request_ok` elsewhere.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
+}
+
 /// Submit one `Cmd` through the real ingress ring, retrying while the ring is
 /// momentarily full (the node drains it into the log continuously). `retries`
 /// scales the attempt budget; a genuinely wedged ring fails the test loudly.
@@ -407,7 +424,7 @@ fn purged_node_after_snapshotting_service(dir: &Path, app: &str, n: u32) -> (Nod
     // one once every write is committed, so P sits at the live frontier and
     // the purge below it drops essentially the whole prefix — which is what
     // puts the next incarnation below the floor.
-    node.append_snapshot_for_test(0).unwrap();
+    command_instant(&node);
     // A snapshot was published AND the node purged below it.
     let cnc = open_cnc(dir, app);
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
@@ -536,7 +553,7 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
     }
     wait_commit_covers_all(&node);
     // Spec §5.2: command the instant (see `purged_node_after_snapshotting_service`).
-    node.append_snapshot_for_test(0).unwrap();
+    command_instant(&node);
     let cnc = open_cnc(dir.path(), app);
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
     wait_until(|| node.archive_first_base() > 0);

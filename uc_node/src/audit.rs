@@ -19,7 +19,7 @@
 //! *fresh* decision is recorded before that decision is published.
 //!
 //! ```json
-//! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7}
+//! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7,"detail":null}
 //! ```
 //!
 //! Key order is fixed and is a contract, exactly as for
@@ -119,17 +119,21 @@ impl AuditOrigin {
 
 /// The wire op codes: 1-5 as `wire_to_config_op` decodes them, plus
 /// `6 = schedule_apply` (time-and-timers plan 2 — the replicated schedule
-/// table) and `7 = settings_apply` (cluster-FSM spec §6 — the replicated
-/// settings record). Neither of the last two is a configuration change and
-/// neither reaches `wire_to_config_op`. An op outside 1..=7 is recorded as
-/// `"unknown"` rather than dropped — a malformed request is exactly the kind
-/// of thing an audit log exists to keep.
+/// table), `7 = settings_apply` (cluster-FSM spec §6 — the replicated
+/// settings record), `8 = snapshot` and `9 = snapshot_fetch`
+/// (coordinated-snapshot spec §5.5/§5.7). None of the last four is a
+/// configuration change and none reaches `wire_to_config_op`. An op outside
+/// 1..=9 is recorded as `"unknown"` rather than dropped — a malformed request
+/// is exactly the kind of thing an audit log exists to keep.
 ///
 /// For both STAGED-FILE ops the record's `id`/`addr` fields carry the staged
 /// file's DIGEST rather than a member address (that is what the operator
 /// signed), and `config_version` carries the position the op reports (the
 /// schedule table's, or the committed cluster position) rather than the
-/// config version.
+/// config version. For `snapshot` the `id` field carries the `--standby`
+/// flag and `config_version` the instant's position P (or the newest complete
+/// set's, on a refusal); for `snapshot_fetch`, `id` is the learner's id,
+/// `ip`/`port` pack the position, and `config_version` is that position.
 pub fn op_name(op: u32) -> &'static str {
     match op {
         1 => "add_learner",
@@ -139,6 +143,8 @@ pub fn op_name(op: u32) -> &'static str {
         5 => "remove_voter",
         6 => "schedule_apply",
         7 => "settings_apply",
+        8 => "snapshot",
+        9 => "snapshot_fetch",
         _ => "unknown",
     }
 }
@@ -181,6 +187,12 @@ pub struct AuditRecord<'a> {
     /// The config version published with the answer (the new one on
     /// `accepted`, the current one otherwise).
     pub config_version: u64,
+    /// Coordinated-snapshot spec §5.5: free text naming what the wire numbers
+    /// cannot — today only the row a `48 snapshot_unsupported` refusal names,
+    /// because op 8's `id` field already carries `--standby`. `None` (which
+    /// renders as `null`) on every other op, so the record's key SET is the
+    /// same on every line and only its values differ.
+    pub detail: Option<&'a str>,
 }
 
 /// The append-only admin audit file. Opened once at node start and owned by
@@ -251,7 +263,7 @@ impl AuditLog {
 
 /// The record's fields, in the one order both the file line and the obs
 /// mirror use. `addr` is `null` when the op carries no address.
-fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 11] {
+fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 12] {
     [
         Field {
             key: "actor",
@@ -300,6 +312,13 @@ fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 11] 
             key: "config_version",
             value: FieldValue::U64(r.config_version),
         },
+        Field {
+            key: "detail",
+            value: match r.detail {
+                Some(s) => FieldValue::Str(s),
+                None => FieldValue::Null,
+            },
+        },
     ]
 }
 
@@ -345,6 +364,7 @@ mod tests {
             outcome: AuditOutcome::Accepted,
             reason: 0,
             config_version: 7,
+            detail: None,
         }
     }
 
@@ -359,8 +379,28 @@ mod tests {
             "{\"ts_ns\":1755600000000000000,\"event\":\"admin_op\",\"actor\":\"ops-alice\",\
              \"origin\":\"local\",\"op\":1,\"op_name\":\"add_learner\",\"id\":4,\
              \"addr\":\"10.0.0.4:9100\",\"seq\":12,\"nonce\":880,\"outcome\":\"accepted\",\
-             \"reason\":0,\"config_version\":7}\n"
+             \"reason\":0,\"config_version\":7,\"detail\":null}\n"
         );
+    }
+
+    /// Coordinated-snapshot spec §5.5: `detail` is what a `48
+    /// snapshot_unsupported` refusal names the row in — op 8's `id` field
+    /// already carries `--standby`, so the number alone could not say which
+    /// row is not snapshot-capable.
+    #[test]
+    fn the_detail_field_carries_the_row_a_snapshot_refusal_names() {
+        let dir = tempdir();
+        let mut a = AuditLog::open(dir.path()).unwrap();
+        let mut r = rec(13);
+        r.op = 8;
+        r.op_name = op_name(8);
+        r.outcome = AuditOutcome::Refused(48);
+        r.reason = 48;
+        r.detail = Some("row 1 (kv)");
+        a.record(&r).unwrap();
+        let text = std::fs::read_to_string(a.path()).unwrap();
+        assert!(text.contains(r#""op_name":"snapshot""#), "{text}");
+        assert!(text.contains(r#""detail":"row 1 (kv)""#), "{text}");
     }
 
     #[test]
@@ -408,7 +448,9 @@ mod tests {
         assert_eq!(op_name(0), "unknown");
         assert_eq!(op_name(6), "schedule_apply");
         assert_eq!(op_name(7), "settings_apply");
-        assert_eq!(op_name(8), "unknown");
+        assert_eq!(op_name(8), "snapshot");
+        assert_eq!(op_name(9), "snapshot_fetch");
+        assert_eq!(op_name(10), "unknown");
         assert_eq!(op_name(2), "promote");
         assert_eq!(op_name(4), "remove_learner");
         assert_eq!(op_name(5), "remove_voter");

@@ -9,7 +9,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use uc_consensus::config::{Addr, ClusterConfig, ConfigOp};
 use uc_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
@@ -38,14 +38,15 @@ use uc_protocol::ring::{
     SpscProducer, SpscRing,
 };
 use uc_protocol::v2::cnc::{
-    ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES,
-    CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
+    ADMIN_OP_SCHEDULE_APPLY, ADMIN_OP_SETTINGS_APPLY, ADMIN_OP_SNAPSHOT, ADMIN_OP_SNAPSHOT_FETCH,
+    CNC_MAX_PEER_SLOTS, CNC_MAX_SERVICES, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER,
+    CNC_SVC_STATUS_SNAPSHOT_CAPABLE, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER, NODE_FLAG_LEARNER,
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 use uc_protocol::v2::frame::{
-    ClusterKind, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, TimerBody, align_frame_len,
-    read_cluster_prefix,
+    ClusterKind, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER, TimerBody,
+    align_frame_len, read_cluster_prefix,
 };
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SCHED,
@@ -76,7 +77,7 @@ use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
     decode_schedule_table,
 };
-use uc_protocol::v2::settings::{Settings, decode_settings};
+use uc_protocol::v2::settings::{Settings, Target, decode_settings};
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -455,6 +456,85 @@ pub const REASON_SETTINGS_DECODE: u32 = 46;
 /// the same number by construction.
 pub const REASON_SETTINGS_BOUNDS: u32 = 47;
 
+// ---- Plan 2: `uc2ctl snapshot` refusal reasons (coordinated-snapshot §5.5) --
+// Wire `reason` codes on a refused (`status = 1`) [`ADMIN_OP_SNAPSHOT`].
+/// A declared row's cnc slot does not carry `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`
+/// — the service attached there was started with `start()` rather than
+/// `start_with_snapshots()`, so it will never act on a `SNAPSHOT` frame and
+/// the set at P can never be complete. Such a cluster is legitimate (purge is
+/// off by default) and simply never snapshots; the operator is TOLD rather
+/// than left with a floor that never moves. The audit record's `detail` names
+/// the first such row.
+pub const REASON_SNAPSHOT_UNSUPPORTED: u32 = 48;
+/// A `--standby` instant was commanded on a cluster whose committed
+/// membership holds no learner. Only a learner freezes for a standby instant
+/// (spec §5.7), so nothing anywhere would build the set.
+pub const REASON_SNAPSHOT_NO_LEARNER: u32 = 49;
+
+/// Why [`Consensus::command_snapshot`] refused to append a `SNAPSHOT` frame.
+///
+/// Three shapes, and the numbers are the WIRE codes admin op 8 publishes, so
+/// the in-process API and `uc2ctl` can never disagree about what happened:
+///
+/// * [`SnapshotRefusal::Retry`] — code `2`, which is the admin band's
+///   `status` (not a `reason`): this node is not the serving leader, or a
+///   previous instant is still in flight and no further `interval_bytes` has
+///   accrued, or the log buffer was momentarily full. All three are
+///   side-effect-free and genuinely retryable.
+/// * [`SnapshotRefusal::Unsupported`] — [`REASON_SNAPSHOT_UNSUPPORTED`],
+///   naming the first incapable row.
+/// * [`SnapshotRefusal::NoLearner`] — [`REASON_SNAPSHOT_NO_LEARNER`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRefusal {
+    /// Not the serving leader, an instant already in flight, or the buffer
+    /// was full — poll again.
+    Retry,
+    /// Row `row` (named `name`) lacks the snapshot capability bit.
+    Unsupported { row: u8, name: String },
+    /// `--standby` with no learner in the committed membership.
+    NoLearner,
+}
+
+impl SnapshotRefusal {
+    /// The wire code: `2` for retry (an admin `status`), else the `reason`.
+    pub fn code(&self) -> u32 {
+        match self {
+            SnapshotRefusal::Retry => 2,
+            SnapshotRefusal::Unsupported { .. } => REASON_SNAPSHOT_UNSUPPORTED,
+            SnapshotRefusal::NoLearner => REASON_SNAPSHOT_NO_LEARNER,
+        }
+    }
+
+    /// The `(status, reason)` pair admin op 8 publishes for this refusal.
+    fn wire(&self) -> (u32, u32) {
+        match self {
+            SnapshotRefusal::Retry => (2, 0),
+            other => (1, other.code()),
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotRefusal::Retry => {
+                write!(
+                    f,
+                    "retry (not the serving leader, or an instant is in flight)"
+                )
+            }
+            SnapshotRefusal::Unsupported { row, name } => write!(
+                f,
+                "snapshot_unsupported: row {row} ({name}) is not snapshot-capable"
+            ),
+            SnapshotRefusal::NoLearner => write!(
+                f,
+                "snapshot_no_learner: --standby with no learner in the membership"
+            ),
+        }
+    }
+}
+
 /// Plan 1 (spec §6): the longest a staged settings file can be. `Settings` is
 /// fixed-width, so this is exact — anything else is refused unread.
 const MAX_SETTINGS_BYTES: u64 = uc_protocol::v2::settings::SETTINGS_LEN as u64;
@@ -596,14 +676,32 @@ struct Rings {
 /// The in-process ingress channel's item type. `Payload` is the harness/
 /// embedded submit path (`Node::submit`); `TimerForTest` (time-and-timers
 /// plan Task 5) lets a test append a TIMER frame as the leader would, ahead
-/// of the real node-side scheduler, and `SnapshotForTest`
-/// (coordinated-snapshot plan 2 Task 3) does the same for a `SNAPSHOT` frame,
-/// ahead of admin op 8 and the cadence (Task 5).
+/// of the real node-side scheduler.
+///
+/// Task 3's `SnapshotForTest` is GONE: a `SNAPSHOT` frame is never a bare
+/// append any more — [`Node::command_snapshot`] runs the real op-8 body, with
+/// the refusals, the single-in-flight gate and the completeness tracking. It
+/// also cannot ride this channel, which is drained only while SERVING: a
+/// command has to be ANSWERED on a follower (`retry`), not queued forever.
 enum Ingress {
     Payload(Vec<u8>),
     TimerForTest(TimerBody),
-    SnapshotForTest(u8),
 }
+
+/// Coordinated-snapshot spec §5.5: the in-process half of `uc2ctl snapshot`
+/// — [`Node::command_snapshot`]'s request, carrying the reply channel the
+/// consensus agent answers on. Its own channel rather than [`Ingress`]'s
+/// because it must be drained on EVERY pass, whatever this node's role.
+struct SnapshotCmd {
+    standby: bool,
+    reply: mpsc::SyncSender<Result<u64, SnapshotRefusal>>,
+}
+
+/// How long [`Node::command_snapshot`] waits for the consensus agent's
+/// answer before reporting `retry`. Generous by design: the agent answers
+/// within one duty cycle unless it is wedged, and the caller's alternative to
+/// a timeout is an unbounded block on a thread that may have fail-stopped.
+const SNAPSHOT_CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Node {
     /// M10 (Task 4): this node's id, captured from `cfg.id` at boot — nothing
@@ -615,6 +713,16 @@ pub struct Node {
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
     ingress_tx: mpsc::SyncSender<Ingress>,
+    /// Coordinated-snapshot spec §5.5: [`Node::command_snapshot`]'s request
+    /// channel to the consensus agent, which drains it once per pass whatever
+    /// its role — a command on a FOLLOWER has to be answered `retry`, not
+    /// queued behind a leadership that may never come.
+    snapshot_cmd_tx: mpsc::SyncSender<SnapshotCmd>,
+    /// Spec §5.3: the newest complete SET's position, published by the
+    /// consensus agent's `check_set_completeness`.
+    snapshot_set_position: Arc<AtomicU64>,
+    /// Spec §9: the last instant this node commanded (leader-local).
+    snapshot_instant_pub: Arc<AtomicU64>,
     /// Ingress admission budget (`append - commit`), mirrored from
     /// `NodeConfig` so `submit` (the in-process path) enforces the same
     /// door as the client ring drain.
@@ -1148,6 +1256,24 @@ impl Node {
         // artifact — the agent itself is built further down, once the cluster
         // FSM has been recovered.
         let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
+        // Coordinated-snapshot spec §5.3/§5.4: the newest COMPLETE set's
+        // position, seeded from the DURABLE floor. The floor is only ever set
+        // from a complete set, so the recovered value is exactly "the last
+        // complete set this node held" — which is why the ship gate needs no
+        // counter and has no boot window (§5.4). Starting it at 0 instead
+        // would let the first pass after a restart re-detect and re-prune a
+        // set the node already had.
+        let snapshot_set_position = Arc::new(AtomicU64::new(state_snapshot_floor));
+        // Spec §9: the last instant COMMANDED (leader-local; a fresh boot has
+        // commanded none) and the per-row missed-instant counters.
+        let snapshot_instant_pub = Arc::new(AtomicU64::new(0));
+        let snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES] =
+            std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
+        // Spec §5.5: `Node::command_snapshot`'s request channel. Depth 1 —
+        // one operator command at a time; a second concurrent caller is
+        // answered `retry`, which is what it would get from the single-in-
+        // flight gate anyway.
+        let (snapshot_cmd_tx, snapshot_cmd_rx) = mpsc::sync_channel::<SnapshotCmd>(1);
         // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
         // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
         // around a DATA datagram to detect a prime that straddled its processing and
@@ -1165,10 +1291,8 @@ impl Node {
         // reason instead of once per NAK (a below-floor peer re-NAKs on a timer).
         // `uc_net` has no logging dependency, so the naming lives here.
         let src_decline_reason = AtomicU8::new(SNAP_DECLINE_NONE);
-        // Spec §5.6: the CLUSTER ARTIFACT the set carries under id 255 —
-        // whichever one the `uc2-cluster` agent has most recently written,
-        // read at the moment a peer's NAK opens a session.
-        let src_cluster_pos = Arc::clone(&cluster_snapshot_pos);
+        // Spec §5.6: the CLUSTER ARTIFACT the set carries under id 255 — the
+        // one at this node's floor, like every other member of the set.
         let src_cluster_dir = instance.cluster_snapshot_dir();
         let src_id = cfg.id;
         sender.set_snapshot_source(Arc::new(move || {
@@ -1176,7 +1300,6 @@ impl Node {
                 &src_cnc,
                 &src_root,
                 &src_services,
-                &src_cluster_pos,
                 &src_cluster_dir,
                 src_id,
                 &src_decline_reason,
@@ -1674,6 +1797,19 @@ impl Node {
             crypto_last_log_ns: 0,
             cluster_view: Arc::clone(&cluster_view),
             cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
+            snapshot_last_commanded: 0,
+            snapshot_last_commanded_bytes: 0,
+            snapshot_set_position: Arc::clone(&snapshot_set_position),
+            snapshot_instant_pub: Arc::clone(&snapshot_instant_pub),
+            snapshot_row_incomplete: snapshot_row_incomplete.clone(),
+            snapshot_instants_abandoned: Arc::new(AtomicU64::new(0)),
+            snapshot_interval_bytes: 0,
+            snapshot_target_learners: false,
+            snap_root: snap_root.clone(),
+            cluster_snapshot_dir: instance.cluster_snapshot_dir(),
+            pending_fetch: None,
+            snapshot_cmd_rx,
+            snapshot_cadence_refused: 0,
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
         // consensus agent starts. The view already holds genesis or the
@@ -1697,6 +1833,9 @@ impl Node {
             leader_flag,
             can_serve_flag,
             ingress_tx,
+            snapshot_cmd_tx,
+            snapshot_set_position,
+            snapshot_instant_pub,
             admission_bytes: cfg.admission_bytes_default,
             fsm_door: fsm_lag_eff,
             buffer,
@@ -1916,17 +2055,48 @@ impl Node {
             .map_err(|e| e.to_string())
     }
 
-    /// Test-only (coordinated-snapshot plan 2 Task 3): append a `SNAPSHOT`
-    /// frame as the leader would, so a service test can drive a coordinated
-    /// instant before `uc2ctl snapshot` (admin op 8) and the cadence exist —
-    /// the same shape, and the same in-process ingress path, as
-    /// [`append_timer_for_test`](Self::append_timer_for_test). `flags` is the
-    /// header flags byte (`FLAG_SNAPSHOT_STANDBY` or 0).
-    #[doc(hidden)]
-    pub fn append_snapshot_for_test(&self, flags: u8) -> Result<(), String> {
-        self.ingress_tx
-            .send(Ingress::SnapshotForTest(flags))
-            .map_err(|e| e.to_string())
+    /// Command a coordinated snapshot instant (spec §5.5) — the in-process
+    /// twin of `uc2ctl snapshot [--standby]`, running admin op 8's exact
+    /// body. Returns the instant's position **P** (the `SNAPSHOT` frame's
+    /// END), the position every declared row and the cluster FSM will freeze
+    /// at.
+    ///
+    /// Like the operator's verb it **always supersedes** an instant still in
+    /// flight, and like it, it is answered on this node only: a follower
+    /// refuses [`SnapshotRefusal::Retry`], with the leader named in the cnc
+    /// page's `leader_hint` for the caller to redirect to.
+    ///
+    /// A [`SnapshotRefusal::Retry`] is also what a caller sees if the
+    /// consensus agent does not answer within [`SNAPSHOT_CMD_TIMEOUT`] —
+    /// side-effect-free either way, so polling is always safe.
+    pub fn command_snapshot(&self, standby: bool) -> Result<u64, SnapshotRefusal> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        if self
+            .snapshot_cmd_tx
+            .try_send(SnapshotCmd { standby, reply })
+            .is_err()
+        {
+            return Err(SnapshotRefusal::Retry);
+        }
+        answer
+            .recv_timeout(SNAPSHOT_CMD_TIMEOUT)
+            .unwrap_or(Err(SnapshotRefusal::Retry))
+    }
+
+    /// Spec §5.3/§9: the position of the newest COMPLETE snapshot set this
+    /// node holds (`uc2_snapshot_set_position`) — `0` until the first one.
+    /// This is the node's purge floor once it has been persisted, and it must
+    /// agree cluster-wide on a caught-up cluster.
+    pub fn snapshot_set_position(&self) -> u64 {
+        self.snapshot_set_position.load(Ordering::Acquire)
+    }
+
+    /// Spec §9: the last instant this node COMMANDED as leader
+    /// (`uc2_snapshot_instant_position`), `0` if it never has. Unlike
+    /// [`Node::snapshot_set_position`] this is leader-local — a follower's
+    /// reading is whatever it last commanded in some earlier term.
+    pub fn snapshot_instant_position(&self) -> u64 {
+        self.snapshot_instant_pub.load(Ordering::Relaxed)
     }
 
     /// Partition handles for every one of the node's outbound sockets (receiver,
@@ -2676,10 +2846,76 @@ struct Consensus {
     /// state, read once per pass by [`Consensus::refresh_from_view`].
     cluster_view: Arc<ClusterView>,
     /// Cluster-FSM spec §4.7 / Ruling R2: the `uc2-cluster` agent's newest
-    /// complete artifact position, mirrored by that agent. Folded into the
-    /// purge floor (`maybe_persist_snapshot_floor`) so a purge never drops
-    /// journal that agent still needs.
+    /// complete artifact position, mirrored by that agent. One of the members
+    /// of a SET (spec §5.3) — `check_set_completeness` reads it beside every
+    /// declared row's slot.
     cluster_snapshot_pos: Arc<AtomicU64>,
+
+    // ---- Coordinated snapshot instants (spec §5.3-§5.5) -------------------
+    /// The frame-END P of the newest `SNAPSHOT` frame THIS node appended as
+    /// leader, `0` when none is outstanding. Leader-only state: it gates
+    /// single-in-flight, and it is what `snapshot_instant_abandoned` reports
+    /// the rows against. Reset on every leader exit (`BecomeFollower`,
+    /// `halt`) and on a truncation that cuts it away, for
+    /// `last_cluster_append`'s reason — a frame appended under a term we no
+    /// longer lead may never commit at all, and a gate still holding its
+    /// position would refuse every later instant on this node, forever.
+    snapshot_last_commanded: u64,
+    /// The APPEND position at the moment [`Consensus::snapshot_last_commanded`]
+    /// was set — the cadence's baseline (spec §5.5: "a further
+    /// `interval_bytes` of log has accrued since it"). Seeded at every leader
+    /// open from that leader's first append, so election churn cannot make a
+    /// fresh leader snapshot immediately.
+    snapshot_last_commanded_bytes: u64,
+    /// Spec §5.3/§9: the position of the newest COMPLETE set this node holds
+    /// — every declared row's artifact plus the cluster FSM's, all at P. The
+    /// purge floor is set from it (`maybe_persist_snapshot_floor`) and
+    /// `uc2_snapshot_set_position` exports it. `Arc` because `/metrics` reads
+    /// it off the consensus thread.
+    snapshot_set_position: Arc<AtomicU64>,
+    /// Spec §9: `uc2_snapshot_instant_position` — the last P this node
+    /// COMMANDED. Unlike [`Consensus::snapshot_last_commanded`] it is never
+    /// reset: a gauge that fell back to 0 on a failover would read as "no
+    /// instant has ever been commanded".
+    snapshot_instant_pub: Arc<AtomicU64>,
+    /// Spec §9: `uc2_snapshot_row_incomplete_total{row}` — instants row `r`
+    /// failed to reach, counted when an incomplete instant is superseded.
+    snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES],
+    /// How many instants this node abandoned (one per supersession of an
+    /// incomplete instant, whatever the number of rows that missed it). The
+    /// deterministic companion to the `snapshot_instant_abandoned` log
+    /// record, so a test can adjudicate supersession without swapping the
+    /// process-global log sink.
+    snapshot_instants_abandoned: Arc<AtomicU64>,
+    /// `settings.snapshot.interval_bytes` as of this pass's
+    /// [`Consensus::refresh_from_view`] — the cadence reads the cached value,
+    /// never a second load of the view. `0` = **no cadence** (operator
+    /// commanded only), matching the retired `SnapshotPolicy::Disabled` and
+    /// purge-being-off-by-default; `u64::MAX` cannot occur (the cluster FSM's
+    /// `validate` refuses it as `47 settings_bounds`).
+    snapshot_interval_bytes: u64,
+    /// `settings.snapshot.target == Learners` as of this pass's
+    /// `refresh_from_view` — the flag a CADENCE-issued instant carries. An
+    /// explicit `uc2ctl snapshot [--standby]` overrides it per command.
+    snapshot_target_learners: bool,
+    /// `<instance_dir>/snapshots` — the parent of every declared row's
+    /// artifact directory. Read only by the node-owned retention sweep
+    /// (`prune_snapshots_below`); the node NEVER writes an artifact.
+    snap_root: PathBuf,
+    /// `<instance_dir>/snapshots/cluster` — the `uc2-cluster` agent's
+    /// artifact directory, the other half of the same sweep.
+    cluster_snapshot_dir: PathBuf,
+    /// Admin op 9's node-local bookkeeping (spec §5.7 item 5): the learner id
+    /// and position this voter has been pointed at, recorded here so Task 6's
+    /// `SNAP_REQUEST` send has one place to read it from.
+    pending_fetch: Option<(NodeId, u64)>,
+    /// Spec §5.5: the consumer half of [`Node::command_snapshot`]'s channel.
+    snapshot_cmd_rx: mpsc::Receiver<SnapshotCmd>,
+    /// The last NAMED refusal (48/49) the CADENCE hit, `0` for none — a
+    /// latch, so a cluster with one non-snapshotting row names it once
+    /// instead of every pass. Cleared by the next accepted cadence instant,
+    /// exactly like the snapshot source's decline latch.
+    snapshot_cadence_refused: u32,
 }
 
 /// Wall-clock nanoseconds since the Unix epoch — the leaf clock read behind
@@ -2731,6 +2967,11 @@ impl Consensus {
         // read what this publishes. One `Acquire` load unless a CLUSTER frame
         // committed since the last pass.
         self.refresh_from_view();
+        // Coordinated-snapshot spec §5.3: and the SET third — a read-only
+        // poll (one `Acquire` load on the steady path) that the purge floor
+        // in step 8 reads. Commit, apply and replication never wait on a
+        // snapshot, so this is a poll and never a barrier.
+        self.check_set_completeness();
         let mut did = false;
 
         // Time-and-timers spec §3.2/§4.3 — ONE wall-clock read per pass, so
@@ -2889,6 +3130,16 @@ impl Consensus {
         // The ring drain is skipped rather than called with `serving = false`:
         // holding is not a role change, and clients must not be redirected
         // with `MSG_V2_NOT_LEADER` by a node that is still the leader.
+        // 3a'. Coordinated snapshot instants (spec §5.5): the leader's byte
+        // cadence, evaluated from the REPLICATED settings this pass's
+        // `refresh_from_view` cached. Placed with the timers, ahead of the
+        // client drains and under the same `hold_clients` gate: a `SNAPSHOT`
+        // frame is a leader-issued frame like a `TIMER`, and appending one
+        // between two due timers would clamp the second one's stamp past its
+        // deadline exactly as a client frame would.
+        if serving && !hold_clients {
+            did |= self.maybe_issue_cadence_snapshot();
+        }
         if serving && !hold_clients {
             did |= self.drain_ingress();
         }
@@ -2957,6 +3208,20 @@ impl Consensus {
         if let Some(req) = self.cnc.read_admin_req(self.last_admin_seq) {
             self.last_admin_seq = req.seq;
             self.handle_admin(req);
+            did = true;
+        }
+
+        // 11b. Coordinated-snapshot spec §5.5: the IN-PROCESS half of the
+        // same verb (`Node::command_snapshot`), beside the cnc band and with
+        // the same body. Drained whatever the role — a command on a follower
+        // must be ANSWERED `retry` rather than held — and bounded at one per
+        // pass, like the admin slot, so a caller in a loop cannot starve the
+        // duty cycle. Not audited: there is no admin request line and no
+        // actor to attribute it to; the `snapshot_commanded` obs record is
+        // what an in-process instant leaves behind.
+        if let Ok(cmd) = self.snapshot_cmd_rx.try_recv() {
+            let answer = self.command_snapshot_operator(cmd.standby);
+            let _ = cmd.reply.try_send(answer);
             did = true;
         }
 
@@ -3396,8 +3661,17 @@ impl Consensus {
 
     /// M14a (spec §3.2/§5.1): publish `min` over the declared FSMs' slots into
     /// page 1's singular service fields, once per cycle, store-on-change.
-    /// Runs FIRST in `do_work`: `refresh_durable` (the report ceiling), the
-    /// ingress door and the two persisters all read this cycle's value.
+    /// Runs FIRST in `do_work`: `refresh_durable` (the report ceiling) and
+    /// the output-progress persister read this cycle's value.
+    ///
+    /// **`service_snapshot_pos` is OBSERVABILITY ONLY** since the
+    /// coordinated-snapshot work (spec §5.3): the purge floor is the newest
+    /// complete SET's position (`snapshot_set_position`), not this minimum.
+    /// The two agree whenever every row is at the same instant — which, since
+    /// a row only ever freezes at an instant, is the steady state — but the
+    /// min also names a position mid-instant, at which some row's artifact
+    /// does not exist, and a floor must never be one of those. Kept because
+    /// `uc2ctl status` and `uc2_service_snapshot_pos` read it.
     fn publish_service_mins(&mut self) {
         // ONE pass over the declared slots (M14c2 T10b): the mins AND the
         // per-id words the attach/detach edges key on, so `heartbeat_ns` is
@@ -3926,47 +4200,21 @@ impl Consensus {
     /// advance the floor (archive not yet caught up, or a prior best-effort
     /// purge that failed) simply retries on the next tick.
     fn maybe_persist_snapshot_floor(&mut self) -> bool {
-        // Cluster FSM (spec §4.7): the cluster artifact is a snapshot like any
-        // other, so the floor is the minimum over the USER rows AND it. A
-        // floor above the cluster artifact would let the purge drop journal
-        // the `uc2-cluster` agent still needs to replay from after a restart.
+        // Coordinated-snapshot spec §5.3: the floor is the newest COMPLETE
+        // SET's position — every declared row's artifact at P plus the
+        // cluster FSM's at P — published by `check_set_completeness` at the
+        // top of this pass. Not the page-1 minimum over the rows: that answer
+        // is a min over positions the rows chose INDEPENDENTLY, which since
+        // Task 3 no longer happens at all (a row freezes only at an instant),
+        // and which could name a P at which some row's artifact does not
+        // exist. `publish_service_mins` still writes that word, for
+        // observability only.
         //
-        // `> 0` GUARD: `0` means "no cluster artifact yet", which must not pin
-        // the floor at 0 forever. It converges — the agent's bridging trigger
-        // takes a snapshot as soon as every declared row has one, i.e. as soon
-        // as `service_snapshot_pos` itself is non-zero.
-        //
-        // M2: taken alone that guard left the rows' floor UNBOUNDED by the
-        // cluster artifact in one window — between the rows publishing their
-        // first `snapshot_pos` and the `uc2-cluster` agent's next duty cycle,
-        // where `rows > 0` and `cluster_pos == 0`. The window is short and
-        // further covered by `slack_bytes`, and its worst outcome is R18's
-        // IDLE path rather than a hole; the second disjunct closes it exactly
-        // anyway. "No cluster artifact yet" is only allowed to mean "no floor
-        // yet" while NO declared row has snapshotted either — after that, an
-        // absent artifact bounds the floor at 0 until the agent writes one.
-        //
-        // The row scan runs only while `cluster_pos == 0`, which after the
-        // first cluster snapshot never happens again (the agent seeds
-        // `cluster_snapshot_pos` from the recovered artifact at boot), so this
-        // costs nothing on the steady path.
-        let cluster_pos = self.cluster_snapshot_pos.load(Ordering::Acquire);
-        let service_pos = {
-            let rows = self.cnc.snapshots().service_snapshot_pos.load_acquire();
-            if cluster_pos > 0 {
-                rows.min(cluster_pos)
-            } else if self.services.ids().all(|id| {
-                self.cnc
-                    .service_slot(id as usize)
-                    .snapshot_pos
-                    .load_acquire()
-                    == 0
-            }) {
-                rows
-            } else {
-                0
-            }
-        };
+        // Plan-1's `cluster_pos > 0 OR no row snapshotted` guard is gone with
+        // it: "no complete set yet" is exactly `snapshot_set_position == 0`,
+        // one word, with no window in which a row's floor is unbounded by the
+        // cluster artifact.
+        let service_pos = self.snapshot_set_position.load(Ordering::Acquire);
         let durable = self.cnc.counters().durable.load_acquire();
         let have_new_floor = service_pos > self.snapshot_persisted_floor && service_pos <= durable;
         let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
@@ -4031,6 +4279,23 @@ impl Consensus {
             if self.sm.can_serve() {
                 flags |= NODE_FLAG_CAN_SERVE;
             }
+        }
+        // Coordinated-snapshot spec §5.7 item 2: the node's ROLE, published
+        // into the same word the service apply loop already reads
+        // `NODE_FLAG_LEADER` from once per cycle — a row acts on a
+        // standby-flagged instant only when this bit is set, and so does the
+        // cluster FSM. Taken from the KERNEL's durable-time membership shadow
+        // (`sm.config()`), the same reader the sender's targets and the vote
+        // path use, so "am I a learner" has one answer per node and not two.
+        //
+        // NOT masked off `halt_removed`, unlike the two above: LEADER and
+        // CAN_SERVE are claims an attacher acts on (submit here, read here)
+        // and a parked node must make neither, while LEARNER is a statement
+        // of fact about the membership that stays true while the node is
+        // parked. A halted node's rows are not going to freeze for anything
+        // in any case — nothing is applying.
+        if self.sm.config().is_learner(self.id) {
+            flags |= NODE_FLAG_LEARNER;
         }
         status.flags.store_release(flags);
         // M10: edge-detect the CAN_SERVE bit only — one branch, no allocation
@@ -4321,7 +4586,6 @@ impl Consensus {
         match item {
             Ingress::Payload(p) => self.try_append(p),
             Ingress::TimerForTest(body) => self.try_append_timer(body),
-            Ingress::SnapshotForTest(flags) => self.try_append_snapshot(*flags),
         }
     }
 
@@ -4358,20 +4622,312 @@ impl Consensus {
         }
     }
 
-    /// Test-only (coordinated-snapshot plan 2 Task 3): append one `SNAPSHOT`
-    /// frame at the current term. `false` = ring full (caller holds it).
-    /// Task 5 replaces this hook's callers with `command_snapshot` (admin op
-    /// 8 + the cadence), which adds the refusals, the single-in-flight gate
-    /// and the completeness tracking this bare append has none of.
-    fn try_append_snapshot(&mut self, flags: u8) -> bool {
+    // ---- Coordinated snapshot instants (spec §5.3-§5.5) -------------------
+
+    /// **The operator's instant** — admin op 8's body, and what
+    /// [`Node::command_snapshot`] drives. Identical to
+    /// [`Self::command_snapshot`] in every check EXCEPT single-in-flight:
+    /// `uc2ctl snapshot` **always supersedes** (spec §5.5), because an
+    /// operator asking for an instant by hand has already decided that
+    /// whatever is in flight is not going to complete.
+    fn command_snapshot_operator(&mut self, standby: bool) -> Result<u64, SnapshotRefusal> {
+        self.command_snapshot_inner(standby, true)
+    }
+
+    /// **The cadence's instant** (spec §5.5), and the entry point the unit
+    /// tests drive: single in flight, superseding only once a further
+    /// `interval_bytes` of log has accrued since the last commanded P.
+    fn command_snapshot(&mut self, standby: bool) -> Result<u64, SnapshotRefusal> {
+        self.command_snapshot_inner(standby, false)
+    }
+
+    /// Append one `SNAPSHOT` frame (spec §5.1) and take ownership of the
+    /// instant it opens. Returns its frame-END **P**.
+    ///
+    /// The gates, in this order and for these reasons:
+    ///
+    /// 1. **Leader.** `role == Leader && appender.is_some()` — the same pair
+    ///    `apply_schedule_table` uses, because a leader still waiting on its
+    ///    leader-open collapse ack HAS the role but no appender, and
+    ///    appending in that window would panic. `retry`, which is what
+    ///    `uc2ctl` polls through.
+    /// 2. **Single in flight** (skipped for `operator`), placed BEFORE the
+    ///    capability scan deliberately: on a healthy cluster with a cadence
+    ///    configured this is the arm that runs every time the accrual bar is
+    ///    met while the previous set is still filling, and it must not cost a
+    ///    pass over eight cnc slots to say "not yet".
+    /// 3. **Capability.** Every DECLARED row's slot must carry
+    ///    `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; the first that does not is named
+    ///    (`48`). A row started with plain `start()` ignores the frame, so
+    ///    the set at P could never complete and the floor would never move —
+    ///    the operator is told rather than left watching a stalled floor.
+    /// 4. **A standby instant needs a learner** (`49`): only a learner
+    ///    freezes for one (spec §5.7), so with none in the membership nothing
+    ///    anywhere would build the set.
+    ///
+    /// Nothing is mutated until the append SUCCEEDS, so every refusal — and a
+    /// momentarily full buffer — leaves this agent byte-for-byte unchanged
+    /// and the whole request retryable.
+    fn command_snapshot_inner(
+        &mut self,
+        standby: bool,
+        operator: bool,
+    ) -> Result<u64, SnapshotRefusal> {
+        if !matches!(self.sm.role(), Role::Leader) || self.appender.is_none() {
+            return Err(SnapshotRefusal::Retry);
+        }
+        // "In flight" = an instant this node commanded whose set it has not
+        // completed. `snapshot_set_position` only ever advances through
+        // `check_set_completeness`, and `snapshot_last_commanded` is cleared
+        // on every leader exit and on a truncation that cuts the frame away,
+        // so this cannot latch shut on a frame that will never commit.
+        let in_flight = self.snapshot_last_commanded
+            > self.snapshot_set_position.load(Ordering::Acquire)
+            && self.snapshot_last_commanded > 0;
+        if in_flight && !operator {
+            let interval = self.snapshot_interval_bytes;
+            let accrued = self
+                .cnc
+                .counters()
+                .append
+                .load_acquire()
+                .saturating_sub(self.snapshot_last_commanded_bytes);
+            if interval == 0 || accrued < interval {
+                return Err(SnapshotRefusal::Retry);
+            }
+        }
+        for row in self.services.ids() {
+            let status = self.cnc.service_slot(row as usize).status.load_acquire();
+            if status & CNC_SVC_STATUS_SNAPSHOT_CAPABLE == 0 {
+                return Err(SnapshotRefusal::Unsupported {
+                    row,
+                    name: self
+                        .services
+                        .name_of(row)
+                        .map(|n| n.as_str().to_string())
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        if standby && self.sm.config().learners.is_empty() {
+            return Err(SnapshotRefusal::NoLearner);
+        }
         let term = self.sm.current_term();
-        let Some(app) = self.appender.as_mut() else {
-            return false;
+        let flags = if standby { FLAG_SNAPSHOT_STANDBY } else { 0 };
+        let end = match self
+            .appender
+            .as_mut()
+            .expect("checked above")
+            .append_snapshot(term, flags)
+        {
+            Ok((end, _stamp)) => end,
+            // Nothing was appended: the whole request is retryable, and the
+            // in-flight instant (if any) is untouched — an abandonment must
+            // never be recorded for an instant that was not superseded.
+            // `PayloadTooLarge` is unreachable (the body is empty) and is
+            // answered the same way rather than being silently dropped.
+            Err(_) => return Err(SnapshotRefusal::Retry),
         };
-        match app.append_snapshot(term, flags) {
-            Ok(_) => true,
-            Err(AppendError::WouldOverrun) => false,
-            Err(AppendError::PayloadTooLarge) => true, // unreachable: empty body
+        if in_flight {
+            self.note_abandoned_instant(self.snapshot_last_commanded);
+        }
+        self.snapshot_last_commanded = end;
+        // The frame-END IS the append counter right after this append, so
+        // the cadence's baseline needs no second load.
+        self.snapshot_last_commanded_bytes = end;
+        self.snapshot_instant_pub.store(end, Ordering::Relaxed);
+        crate::obs_event!(
+            Info,
+            "snapshot_commanded",
+            node = self.id as u64,
+            position = end,
+            term = term as u64,
+            standby = standby,
+            operator = operator
+        );
+        Ok(end)
+    }
+
+    /// Spec §9/§10: name (and count) an instant that is being superseded
+    /// before its set completed. The rows reported are exactly those whose
+    /// cnc `snapshot_pos` never reached `p` — the freeze failed, the row is
+    /// slow, or its service process is gone — plus `cluster` when the
+    /// `uc2-cluster` agent did not reach it either.
+    ///
+    /// Off the hot path by construction: it runs only from the supersession
+    /// branch of [`Self::command_snapshot_inner`].
+    fn note_abandoned_instant(&self, p: u64) {
+        let mut rows = String::new();
+        for row in self.services.ids() {
+            if self
+                .cnc
+                .service_slot(row as usize)
+                .snapshot_pos
+                .load_acquire()
+                != p
+            {
+                self.snapshot_row_incomplete[row as usize].fetch_add(1, Ordering::Relaxed);
+                if !rows.is_empty() {
+                    rows.push(',');
+                }
+                rows.push_str(&row.to_string());
+            }
+        }
+        if self.cluster_snapshot_pos.load(Ordering::Acquire) != p {
+            if !rows.is_empty() {
+                rows.push(',');
+            }
+            rows.push_str("cluster");
+        }
+        self.snapshot_instants_abandoned
+            .fetch_add(1, Ordering::Relaxed);
+        crate::obs_event!(
+            Warn,
+            "snapshot_instant_abandoned",
+            node = self.id as u64,
+            position = p,
+            rows = rows.as_str()
+        );
+    }
+
+    /// Spec §5.3: is the set at some P complete on THIS node? One
+    /// `Acquire` load of the `uc2-cluster` agent's artifact position, and —
+    /// only when that has moved past the newest complete set — one load per
+    /// declared row's cnc slot. No acks cross the wire; each node completes
+    /// its own set independently, and sets are position-aligned because P is.
+    ///
+    /// **Why the cluster artifact's position is the candidate P.** Since Task
+    /// 4 the `uc2-cluster` agent writes an artifact only at a `SNAPSHOT`
+    /// frame's end, so its position IS an instant this node reached; every
+    /// declared row agreeing on that exact number is the whole of the set
+    /// definition. Deriving the candidate this way (rather than from
+    /// `snapshot_last_commanded`) is what makes a FOLLOWER complete its own
+    /// sets — a follower never appends the frame and has no commanded P.
+    ///
+    /// Commit, apply and replication never wait on any of this: it is a
+    /// read-only poll, run once per pass, and the only work it can trigger is
+    /// the retention sweep on the (rare) completion edge.
+    fn check_set_completeness(&mut self) {
+        let seen = self.snapshot_set_position.load(Ordering::Relaxed);
+        let p = self.cluster_snapshot_pos.load(Ordering::Acquire);
+        if p <= seen {
+            return;
+        }
+        for row in self.services.ids() {
+            if self
+                .cnc
+                .service_slot(row as usize)
+                .snapshot_pos
+                .load_acquire()
+                != p
+            {
+                return;
+            }
+        }
+        self.snapshot_set_position.store(p, Ordering::Release);
+        crate::obs_event!(
+            Info,
+            "snapshot_set_complete",
+            node = self.id as u64,
+            position = p
+        );
+        // Ruling P1: retention is NODE-owned and runs HERE, on the completion
+        // branch only — never after an individual freeze, where a per-writer
+        // "keep the newest N" sweep cannot see sets and two abandoned
+        // instants could delete the very artifact the newest complete set is
+        // made of.
+        self.prune_snapshots_below(p);
+    }
+
+    /// Spec §5.3 (Ruling P1): the node-owned, **delete-only** retention
+    /// sweep. Keeps the complete set at `p` and everything newer; unlinks
+    /// every older artifact under each row's `snapshots/<row>/` and under
+    /// `snapshots/cluster/`.
+    ///
+    /// **Exact names only.** A file counts only if it parses as
+    /// `snap-<pos>.ultsnap` (or `.ultcluster`) — a builder's `.tmp` or a
+    /// receiver's part file never matches, so a sweep can never race a write
+    /// it cannot see. Best-effort per file: a `NotFound` is a benign race,
+    /// anything else is counted and named once for the whole sweep rather
+    /// than per file.
+    ///
+    /// The node never WRITES an artifact (every row artifact carries the
+    /// 16-byte envelope only `uc_service::snapshots::SnapshotStore::publish`
+    /// writes); it only ever deletes one it can prove is superseded.
+    fn prune_snapshots_below(&self, p: u64) {
+        let mut removed = 0u64;
+        let mut errors = 0u64;
+        for row in self.services.ring_ids() {
+            let (r, e) = prune_snapshot_dir(&self.snap_root.join(row.to_string()), SNAP_SUFFIX, p);
+            removed += r;
+            errors += e;
+        }
+        let (r, e) = prune_snapshot_dir(&self.cluster_snapshot_dir, CLUSTER_SNAP_SUFFIX, p);
+        removed += r;
+        errors += e;
+        if removed > 0 || errors > 0 {
+            crate::obs_event!(
+                Info,
+                "snapshot_set_retained",
+                node = self.id as u64,
+                position = p,
+                removed = removed,
+                errors = errors
+            );
+        }
+    }
+
+    /// Spec §5.5's second trigger: the leader appends a `SNAPSHOT` frame once
+    /// `settings.snapshot.interval_bytes` of log has accrued since the last
+    /// instant it commanded, flagged per `settings.snapshot.target`.
+    ///
+    /// `interval_bytes == 0` means **no cadence** (Ruling P3) — operator
+    /// commanded only, matching the retired `SnapshotPolicy`'s "0 = never"
+    /// and purge being off by default. So the steady-state cost on a cluster
+    /// that has not configured one is a single compare against a cached
+    /// field, and with a cadence configured it is that plus one `Acquire`
+    /// load of the append counter.
+    ///
+    /// A NAMED refusal (48/49) is latched: a cluster with one non-snapshotting
+    /// row would otherwise emit a line every pass, forever.
+    fn maybe_issue_cadence_snapshot(&mut self) -> bool {
+        let interval = self.snapshot_interval_bytes;
+        if interval == 0 {
+            return false;
+        }
+        let accrued = self
+            .cnc
+            .counters()
+            .append
+            .load_acquire()
+            .saturating_sub(self.snapshot_last_commanded_bytes);
+        if accrued < interval {
+            return false;
+        }
+        let standby = self.snapshot_target_learners;
+        match self.command_snapshot(standby) {
+            Ok(_) => {
+                self.snapshot_cadence_refused = 0;
+                true
+            }
+            // An instant is still in flight and has not aged out, or the
+            // buffer was momentarily full. Nothing changed; the next pass
+            // re-evaluates. NOT a refusal an operator needs told about.
+            Err(SnapshotRefusal::Retry) => false,
+            Err(e) => {
+                if self.snapshot_cadence_refused != e.code() {
+                    self.snapshot_cadence_refused = e.code();
+                    let detail = e.to_string();
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_cadence_refused",
+                        node = self.id as u64,
+                        reason = e.code() as u64,
+                        detail = detail.as_str()
+                    );
+                }
+                false
+            }
         }
     }
 
@@ -4650,6 +5206,19 @@ impl Consensus {
             // confusion an operator debugs a stalled cluster with.
             self.cnc.store_admission_bytes(adm_eff);
         }
+        // Coordinated-snapshot spec §5.5/§6: the snapshot cadence and its
+        // target, cached HERE (once, on the pass a CLUSTER frame committed)
+        // rather than loaded again by `maybe_issue_cadence_snapshot` on every
+        // pass. Neither is clamped: `interval_bytes` is a byte count with no
+        // node-local meaning to bound it against, `0` means no cadence
+        // (Ruling P3), and `u64::MAX` cannot be adopted at all — the cluster
+        // FSM's `validate` refuses it as `47 settings_bounds`.
+        self.snapshot_interval_bytes = self
+            .cluster_view
+            .snapshot_interval_bytes
+            .load(Ordering::Acquire);
+        self.snapshot_target_learners =
+            self.cluster_view.snapshot_target.load(Ordering::Acquire) == Target::Learners as u8;
     }
 
     /// UNRECOVERABLE and fail-stop; everything else (`Full`, `Empty`, …) ends
@@ -5511,13 +6080,61 @@ impl Consensus {
                 (false, false) => (2, 0, self.schedule_position),
                 (false, true) => (2, 0, self.cluster_view.position.load(Ordering::Acquire)),
             };
-            let (status, reason) = self.audit_admin(
+            let (status, reason) = self.audit_admin_detailed(
                 actor.as_deref(),
                 AuditOrigin::Local,
                 audited,
                 status,
                 reason,
                 version,
+                None,
+            );
+            self.write_admin_reply(req.seq, status, reason, version);
+            return;
+        }
+        // Coordinated-snapshot spec §5.5/§5.7: the two SNAPSHOT ops. Placed
+        // beside the staged-file pair and before the leader/forward split for
+        // the same reason: neither is a configuration change, so neither
+        // reaches `propose_and_append` — and neither may be FORWARDED. Op 8
+        // appends on the leader (a follower answers retry, and `uc2ctl`
+        // re-sends to the node the leader hint names); op 9 is node-LOCAL by
+        // design (spec §5.7 item 5: it runs on the voter it is pointed at and
+        // changes nothing cluster-wide), so forwarding it would run the fetch
+        // on the wrong node entirely.
+        if req.op == ADMIN_OP_SNAPSHOT || req.op == ADMIN_OP_SNAPSHOT_FETCH {
+            let (status, reason, version, detail) = if req.op == ADMIN_OP_SNAPSHOT {
+                // `uc2ctl snapshot` carries `--standby` in the request's `id`
+                // field (this op has no digest to sign, so the three address
+                // fields are free); Task 7 pins the encoding.
+                match self.command_snapshot_operator(req.id != 0) {
+                    Ok(p) => (0, 0, p, None),
+                    Err(e) => {
+                        let (s, r) = e.wire();
+                        let detail = match &e {
+                            SnapshotRefusal::Unsupported { row, name } => {
+                                Some(format!("row {row} ({name})"))
+                            }
+                            _ => None,
+                        };
+                        (
+                            s,
+                            r,
+                            self.snapshot_set_position.load(Ordering::Acquire),
+                            detail,
+                        )
+                    }
+                }
+            } else {
+                self.request_fetch(req.id, fetch_position(req.ip, req.port))
+            };
+            let (status, reason) = self.audit_admin_detailed(
+                actor.as_deref(),
+                AuditOrigin::Local,
+                audited,
+                status,
+                reason,
+                version,
+                detail.as_deref(),
             );
             self.write_admin_reply(req.seq, status, reason, version);
             return;
@@ -5855,6 +6472,53 @@ impl Consensus {
         }
     }
 
+    /// Admin op 9's body (spec §5.7 item 5): point THIS voter at a learner
+    /// that holds a complete set, so it can pull that set store-only rather
+    /// than pay a freeze of its own. Node-LOCAL — it changes nothing
+    /// cluster-wide, which is why it runs on whichever node it is addressed
+    /// to and is never forwarded.
+    ///
+    /// Returns the `(status, reason, version, detail)` quadruple
+    /// `handle_admin` publishes. `version` carries the position the fetch
+    /// targets, which is this op's "version in effect" (one meaning per op,
+    /// as `schedule apply` and `settings apply` each have their own).
+    ///
+    /// What is implemented HERE is the bookkeeping: the named id must be a
+    /// learner in the committed membership and must not be this node, and the
+    /// request is recorded in [`Consensus::pending_fetch`] for the sender to
+    /// act on. The datagram itself is Task 6's, so an accepted request is
+    /// answered `retry` — side-effect-free and safe to poll, which is exactly
+    /// what `uc2ctl` does with a `2`.
+    fn request_fetch(&mut self, learner_id: u32, position: u64) -> (u32, u32, u64, Option<String>) {
+        let membership = self.cluster_view.membership();
+        if !membership.is_learner(learner_id) {
+            return (
+                1,
+                REASON_SNAPSHOT_NO_LEARNER,
+                position,
+                Some(format!("node {learner_id} is not a learner")),
+            );
+        }
+        if learner_id == self.id {
+            return (
+                1,
+                REASON_SNAPSHOT_NO_LEARNER,
+                position,
+                Some("a node cannot fetch a set from itself".to_string()),
+            );
+        }
+        self.pending_fetch = Some((learner_id, position));
+        crate::obs_event!(
+            Info,
+            "snapshot_fetch_requested",
+            node = self.id as u64,
+            from = learner_id as u64,
+            position = position
+        );
+        // Task 6: send SNAP_REQUEST here.
+        (2, 0, position, None)
+    }
+
     /// Count + name one refused `schedule apply` and build its reply triple.
     fn refuse_schedule(&self, reason: u32) -> (u32, u32, u64) {
         self.schedule_refused.fetch_add(1, Ordering::Relaxed);
@@ -6061,7 +6725,26 @@ impl Consensus {
         reason: u32,
         version: u64,
     ) -> (u32, u32) {
+        self.audit_admin_detailed(actor, origin, req, status, reason, version, None)
+    }
+
+    /// [`Self::audit_admin`] plus the record's `detail` — free text naming
+    /// what the numbers cannot. Only the snapshot ops use it today: `48
+    /// snapshot_unsupported` has to say WHICH row is not snapshot-capable,
+    /// and the `id` field is already spoken for by `--standby` (spec §8).
+    #[allow(clippy::too_many_arguments)]
+    fn audit_admin_detailed(
+        &mut self,
+        actor: Option<&str>,
+        origin: AuditOrigin,
+        req: AuditedReq,
+        status: u32,
+        reason: u32,
+        version: u64,
+        detail: Option<&str>,
+    ) -> (u32, u32) {
         let rec = AuditRecord {
+            detail,
             ts_ns: crate::obs::metrics::now_unix_ns(),
             // `None` is exactly `AdminPolicy::Filesystem`: nothing was
             // authenticated, the instance directory's permissions were the
@@ -6353,6 +7036,11 @@ impl Consensus {
                 // holding its position would refuse every later apply — on
                 // this node, forever.
                 self.last_cluster_append = 0;
+                // Coordinated-snapshot spec §5.5: the snapshot instant's
+                // single-in-flight gate opens for the identical reason. The
+                // metric (`snapshot_instant_pub`) is deliberately NOT reset —
+                // it answers "what was last commanded", which stays true.
+                self.snapshot_last_commanded = 0;
                 // Issue #6: abandon any leader open still awaiting its collapse
                 // ack. The cut itself is already commanded and remains correct
                 // (it drops only this node's own unreplicated tail), but the
@@ -6648,8 +7336,10 @@ impl Consensus {
         // Cluster-FSM spec §4.9: the other leader-exit path — this node will
         // never append again, so the heap is discarded here too.
         self.discard_timers();
-        // …and the same for the cluster-command gate (`BecomeFollower`).
+        // …and the same for the cluster-command gate (`BecomeFollower`) and
+        // the snapshot instant's.
         self.last_cluster_append = 0;
+        self.snapshot_last_commanded = 0;
         self.can_serve_flag.store(false, Ordering::Release);
         // Veil §5 discharge, observation 1 (the parked-reads liveness
         // blemish): `do_work` short-circuits every SUBSEQUENT cycle, so a
@@ -6807,6 +7497,16 @@ impl Consensus {
         // that comparison alone would never re-trigger the (now leader-only)
         // arm step.
         self.view_position_seen = u64::MAX;
+        // Coordinated-snapshot spec §5.5: re-base the CADENCE at this
+        // leader's own frontier. Without it a fresh leader's
+        // `snapshot_last_commanded_bytes` is whatever it held as a follower
+        // (0, on a node that has never led), so `append - 0 >= interval`
+        // holds instantly and every failover would command an instant —
+        // election churn would turn into a snapshot storm. The honest
+        // reading of "a further `interval_bytes` of log has accrued" on a
+        // node that has commanded no instant in this term is: since it took
+        // the term.
+        self.snapshot_last_commanded_bytes = end;
         // We ARE the leader of this term — published only now that we can act
         // like one (see the note in `Action::BecomeLeader`).
         self.cnc.status().leader_hint.store_release(self.id as u64);
@@ -6849,6 +7549,15 @@ impl Consensus {
         // Observations for frames ending above the cut describe bytes that are
         // gone; a re-received tail is re-scanned and re-emitted by the archive.
         self.pending_cfg_obs.retain(|(position, _)| *position <= to);
+        // Coordinated-snapshot spec §5.5/§10: a `SNAPSHOT` frame above the
+        // cut is gone, so the instant it opened can never complete. Open the
+        // single-in-flight gate rather than wait for the interval to age it
+        // out — the spec names truncation as one of the two ways an in-flight
+        // instant ends. Any artifact already built at that P is an orphan the
+        // next complete set's retention sweep drops.
+        if self.snapshot_last_commanded > to {
+            self.snapshot_last_commanded = 0;
+        }
         let matching = self.pending_truncation == Some(epoch);
         self.feed(Event::Truncated { epoch, to });
         if matching {
@@ -7732,7 +8441,38 @@ fn snapshot_set_for(
     cnc: &CncPage,
     root: &std::path::Path,
     services: &crate::services::ServicesConfig,
-    cluster_snapshot_pos: &AtomicU64,
+    cluster_dir: &std::path::Path,
+    node_id: NodeId,
+    decline_reason: &AtomicU8,
+) -> Option<SnapshotSet> {
+    // Spec §5.4, "the complete set at my floor". The floor is set from a
+    // COMPLETE set (`check_set_completeness` → `maybe_persist_snapshot_floor`)
+    // and is durable across restarts, so this needs no counter and has no
+    // boot window in which one reads zero — the residual this spec exists to
+    // remove.
+    let at = cnc.snapshots().node_snapshot_floor.load_acquire();
+    snapshot_set_at(
+        at,
+        cnc,
+        root,
+        services,
+        cluster_dir,
+        node_id,
+        decline_reason,
+    )
+}
+
+/// [`snapshot_set_for`]'s body, with the position given rather than read off
+/// the floor — the seam Task 6's `SNAP_REQUEST` serving needs (`at` is then
+/// the position the requesting voter asked for). Every artifact in the set it
+/// returns is tagged `at`; the whole set is at ONE position or there is no
+/// set (spec §5.6's one-position rule).
+#[allow(clippy::too_many_arguments)]
+fn snapshot_set_at(
+    at: u64,
+    cnc: &CncPage,
+    root: &std::path::Path,
+    services: &crate::services::ServicesConfig,
     cluster_dir: &std::path::Path,
     node_id: NodeId,
     decline_reason: &AtomicU8,
@@ -7748,8 +8488,7 @@ fn snapshot_set_for(
         }
         None
     };
-    let floor = cnc.snapshots().node_snapshot_floor.load_acquire();
-    if floor == 0 {
+    if at == 0 {
         // Nothing has snapshotted: the joiner is served by journal
         // replay from 0 (spec §14.3's "moot" case).
         return decline(SNAP_DECLINE_FLOOR_ZERO, "floor 0");
@@ -7771,20 +8510,21 @@ fn snapshot_set_for(
     let mut artifacts = Vec::new();
     let mut version = [0u32; uc_protocol::v2::cnc::CNC_MAX_SERVICES];
     for id in services.ring_ids() {
-        let pos = cnc.service_slot(id as usize).snapshot_pos.load_acquire();
-        if pos == 0 {
-            return decline(SNAP_DECLINE_MISSING, "missing artifact");
-        }
-        let path = root
-            .join(id.to_string())
-            .join(format!("snap-{pos}.ultsnap"));
-        // A declared id whose newest artifact is missing (a retention
-        // race, a hand-edited dir) makes the SET incomplete — and the
-        // receiver adopts the floor only on a complete set, so a partial
-        // ship would strand the joiner below a floor it can never adopt
-        // AND hold the leader's single session slot for 30 s. Refuse:
-        // the NAK stays an overrun, the peer re-NAKs, the next attempt
-        // sees the file.
+        // Spec §5.3/§5.4 (Ruling P6): the artifact AT `at`, by name — NOT
+        // whatever that row's cnc slot currently points at. The slot is a
+        // live word that runs ahead the moment a newer instant completes on
+        // this node, and a set assembled from live words could mix positions;
+        // the artifact's own file name is the frontier, and the 16-byte
+        // envelope inside it (`uc_service::snapshots`) is what the joiner
+        // verifies that name against.
+        let path = root.join(id.to_string()).join(format!("snap-{at}.ultsnap"));
+        // A declared id whose artifact at this position is missing (a
+        // retention race, a hand-edited dir, a row that never reached the
+        // instant) makes the SET incomplete — and the receiver adopts the
+        // floor only on a complete set, so a partial ship would strand the
+        // joiner below a floor it can never adopt AND hold the leader's
+        // single session slot for 30 s. Refuse: the NAK stays an overrun, the
+        // peer re-NAKs, the next attempt sees the file.
         let Ok(meta) = std::fs::metadata(&path) else {
             return decline(SNAP_DECLINE_MISSING, "missing artifact");
         };
@@ -7795,7 +8535,7 @@ fn snapshot_set_for(
         version[id as usize] = cnc.service_slot(id as usize).status.version();
         artifacts.push(SnapArtifact {
             service_id: id,
-            snapshot_pos: pos,
+            snapshot_pos: at,
             path,
             len,
         });
@@ -7818,22 +8558,13 @@ fn snapshot_set_for(
     // Cluster-FSM spec §5.6: the CLUSTER ARTIFACT, LAST — the cluster row's
     // own image (membership, the replicated schedule table, the settings),
     // which a below-floor joiner installs by fiat before the floor advances.
-    // Its position is the one the `uc2-cluster` agent published when it wrote
-    // the file, never a live counter: the artifact IS the content, which is
-    // the whole reason the retired `SNAP_TABLE` carry (which read live state
-    // at ship time) had to go.
-    //
-    // `0` = the agent has never snapshotted. On a settled leader the bridging
-    // trigger prevents that — it fires once every declared row has snapshotted,
-    // which is the same condition `floor != 0` above already checked — so this
-    // is the narrow window between a row publishing its artifact and the
-    // cluster agent's next duty cycle. Decline: the peer re-NAKs and the next
-    // attempt has it.
-    let cluster_pos = cluster_snapshot_pos.load(Ordering::Acquire);
-    if cluster_pos == 0 {
-        return decline(SNAP_DECLINE_MISSING, "missing cluster artifact");
-    }
-    let cluster_path = crate::cluster_agent::artifact_path(cluster_dir, cluster_pos);
+    // At `at` like every other member of the set, and by NAME for the same
+    // reason: since Task 4 the `uc2-cluster` agent writes an artifact only at
+    // an instant, so `snap-<at>.ultcluster` either exists or this node never
+    // completed the set at `at`. The artifact IS the content, which is the
+    // whole reason the retired `SNAP_TABLE` carry (which read live state at
+    // ship time) had to go.
+    let cluster_path = crate::cluster_agent::artifact_path(cluster_dir, at);
     let Ok(meta) = std::fs::metadata(&cluster_path) else {
         return decline(SNAP_DECLINE_MISSING, "missing cluster artifact");
     };
@@ -7842,7 +8573,7 @@ fn snapshot_set_for(
     }
     artifacts.push(SnapArtifact {
         service_id: CLUSTER_ARTIFACT_ID,
-        snapshot_pos: cluster_pos,
+        snapshot_pos: at,
         path: cluster_path,
         len: meta.len(),
     });
@@ -7859,6 +8590,67 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// `snapshot fetch`'s position, unpacked from the two free address fields of
+/// the 64-byte admin request line (spec §8; `uc2ctl` packs it the same way,
+/// pinned by Task 7): the low 32 bits in `ip`, the next 16 in `port`.
+///
+/// **48 bits**, which bounds an addressable fetch position at 256 TiB of
+/// appended log. Beyond that the operator's `--position` is unrepresentable
+/// and the request lands at a wrong (lower) position, which is refused as a
+/// missing set rather than served wrongly. `0` means "the learner's newest
+/// complete set" — the default, and the only value `uc2ctl` sends unless
+/// `--position` is given.
+fn fetch_position(ip: u32, port: u16) -> u64 {
+    (ip as u64) | ((port as u64) << 32)
+}
+
+/// The artifact-name shape [`Consensus::prune_snapshots_below`] matches: a
+/// user row's, and the `uc2-cluster` agent's. Both share the `snap-` prefix
+/// and differ only in the suffix.
+const SNAP_PREFIX: &str = "snap-";
+/// A user row's artifact suffix (`uc_service::snapshots`' `SUFFIX`).
+const SNAP_SUFFIX: &str = ".ultsnap";
+/// The cluster FSM's artifact suffix (`cluster_agent::artifact_path`).
+const CLUSTER_SNAP_SUFFIX: &str = ".ultcluster";
+
+/// Unlink every `snap-<pos><suffix>` in `dir` with `pos < below`. Returns
+/// `(removed, errors)`.
+///
+/// **Exact names only** (Ruling P1). A name counts only if it strips the
+/// prefix, strips the suffix and parses as a `u64` — so a builder's
+/// `snap-<pos>.ultsnap.tmp`, a receiver's part file, and anything an operator
+/// dropped in are all invisible here, and this sweep can never delete a file
+/// something else is still writing. A missing directory is not an error (a
+/// node whose rows have never snapshotted has none).
+fn prune_snapshot_dir(dir: &Path, suffix: &str, below: u64) -> (u64, u64) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    let (mut removed, mut errors) = (0u64, 0u64);
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(pos) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(SNAP_PREFIX))
+            .and_then(|n| n.strip_suffix(suffix))
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if pos >= below {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            // Already gone: a benign race with a concurrent sweep or an
+            // operator, not a failure to retain anything.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => errors += 1,
+        }
+    }
+    (removed, errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7872,13 +8664,20 @@ mod tests {
     /// Build a heap-backed cnc page for the bare-`Consensus` harness (no file,
     /// no flock — these tests drive `feed`/`exec` directly).
     fn test_cnc() -> Arc<CncPage> {
+        test_cnc_for(&ServicesConfig::none_for_tests())
+    }
+
+    /// [`test_cnc`] with a declared row map — the page a node built from
+    /// `[services] names` has (cnc 3.1 writes each row's name + hash into its
+    /// slot's line 7 at `init`).
+    fn test_cnc_for(services: &ServicesConfig) -> Arc<CncPage> {
         CncPage::heap(&CncMeta {
             node_id: 1,
             instance_id: 0,
             app_id: "test".into(),
             buffer_bytes: 1 << 16,
             max_payload: 4096,
-            services: [None; CNC_MAX_SERVICES],
+            services: services.service_names(),
         })
     }
 
@@ -7906,6 +8705,14 @@ mod tests {
         /// agent would own in a real node — lets a test inject a handshake
         /// datagram exactly as `crypto_admit` would deliver one.
         hs_tx: mpsc::SyncSender<HandshakeDatagram>,
+        /// Coordinated-snapshot spec §5.3: the `uc2-cluster` agent's artifact
+        /// position, shared with `cons`. A test drives it directly to stand in
+        /// for that agent freezing at an instant.
+        cluster_snapshot_pos: Arc<AtomicU64>,
+        /// Spec §5.5: the `Node` half of `Node::command_snapshot`'s channel.
+        /// Kept alive so `cons.snapshot_cmd_rx` never disconnects; a test may
+        /// also send on it to exercise the do_work drain.
+        _snapshot_cmd_tx: mpsc::SyncSender<SnapshotCmd>,
         // Kept alive: dropping these would disconnect the consensus's endpoints.
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
@@ -7978,6 +8785,83 @@ mod tests {
             self.cons.on_collapsed(e, t);
         }
 
+        /// Coordinated-snapshot spec §5.2/§5.7: stand in for a service that
+        /// was started with `start_with_snapshots()` — the capability bit is
+        /// SERVICE-written into its slot's status word at attach.
+        fn mark_capable(&self, row: u8) {
+            let slot = self.cons.cnc.service_slot(row as usize);
+            let st = slot.status.load_acquire();
+            slot.status
+                .store_release(st | CNC_SVC_STATUS_SNAPSHOT_CAPABLE);
+        }
+
+        /// Stand in for a row that FROZE at `p`: the builder agent publishes
+        /// the artifact's position into the row's cnc slot.
+        fn row_froze_at(&self, row: u8, p: u64) {
+            self.cons
+                .cnc
+                .service_slot(row as usize)
+                .snapshot_pos
+                .store_release(p);
+        }
+
+        /// Put a committed `Settings` with this cadence in force — the whole
+        /// loop, so the value the cadence reads is the REPLICATED one and not
+        /// a poked field.
+        fn set_settings_interval(&mut self, interval_bytes: u64) {
+            let s = Settings {
+                snapshot_interval_bytes: interval_bytes,
+                ..Settings::genesis_default()
+            };
+            let end = self
+                .cons
+                .append_cluster_frame(&ClusterCommand::Settings(s))
+                .expect("settings append");
+            self.commit_through(end);
+            self.cons.refresh_from_view();
+        }
+
+        /// Append `n` bytes' worth of client frames as the leader would, so
+        /// the cadence's accrual bar (`append - last_commanded_bytes`) can be
+        /// crossed by ordinary traffic. Returns the new append position.
+        ///
+        /// Each declared row's `applied` is carried forward with it: a real
+        /// service keeps up, and leaving `applied` at 0 would pin this
+        /// harness's report ceiling (`min_applied + fsm_lag`) inside the
+        /// bytes just appended.
+        fn append_client_bytes(&mut self, n: u64) -> u64 {
+            let payload = vec![0u8; 256];
+            let target = self.cons.cnc.counters().append.load_acquire() + n;
+            while self.cons.cnc.counters().append.load_acquire() < target {
+                assert!(
+                    self.cons.try_append(&payload),
+                    "the harness buffer must not overrun in this test"
+                );
+            }
+            let append = self.cons.cnc.counters().append.load_acquire();
+            for row in self.cons.services.ids() {
+                self.cons
+                    .cnc
+                    .service_slot(row as usize)
+                    .applied
+                    .store_release(append);
+            }
+            append
+        }
+
+        /// The node's durably-persisted purge floor, as the cnc page mirrors
+        /// it.
+        fn cnc_floor(&self) -> u64 {
+            self.cons.cnc.snapshots().node_snapshot_floor.load_acquire()
+        }
+
+        /// Let the snapshot-floor persister past its 100 ms fsync floor
+        /// without sleeping (`OUTPUT_PROGRESS_FLOOR_NS` is monotonic-ns based,
+        /// and this harness's `now_ns` is a real `Instant`).
+        fn advance_floor_timer(&mut self) {
+            self.cons.snapshot_floor_last_persist_ns = None;
+        }
+
         /// Simulate the archive completing the truncation and the consensus
         /// duty-cycle draining the infallible slot.
         fn post_ack_and_drain(&mut self, epoch: u64, to: u64) {
@@ -8020,6 +8904,34 @@ mod tests {
         peer_override: &[(NodeId, SocketAddr)],
         settings_genesis: Settings,
     ) -> Harness {
+        harness_full(
+            crypto,
+            peer_override,
+            settings_genesis,
+            ServicesConfig::none_for_tests(),
+        )
+    }
+
+    /// Coordinated-snapshot plan 2 Task 5: a harness with DECLARED rows, so a
+    /// test can drive the SET (capability bits, per-row `snapshot_pos`,
+    /// completeness) rather than the `none_for_tests` fiction. The page's row
+    /// map and the `ServicesConfig` are built from the same names, exactly as
+    /// `Node::start_with_socket` builds them from `[services] names`.
+    fn harness_with_rows(names: &[&str]) -> Harness {
+        harness_full(
+            None,
+            &[],
+            Settings::genesis_default(),
+            ServicesConfig::from_names(names, None).expect("valid row names"),
+        )
+    }
+
+    fn harness_full(
+        crypto: Option<SharedTransport>,
+        peer_override: &[(NodeId, SocketAddr)],
+        settings_genesis: Settings,
+        services: ServicesConfig,
+    ) -> Harness {
         // Reproduce the REAL gap between the two `Instant` origins (T12
         // review, M4). In `Node::start_with_socket` the `SharedTransport`'s
         // base is taken as the very first statement and `Consensus::base` only
@@ -8034,7 +8946,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_nanos(HARNESS_CRYPTO_CLOCK_GAP_NS));
         }
         let dir = tempfile::tempdir().unwrap();
-        let cnc = test_cnc();
+        let cnc = test_cnc_for(&services);
         let buffer = Arc::new(LogBuffer::new(
             Region::heap_zeroed(1 << 16),
             Arc::clone(&cnc),
@@ -8172,6 +9084,15 @@ mod tests {
         // artifact the way the `uc_net` receiver agent would.
         let (cluster_install_tx, cluster_install_rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
         let cluster_installed = Arc::new(AtomicU64::new(0));
+        // Coordinated-snapshot plan 2 Task 5: the set/instant cells and the
+        // in-process command channel, wired exactly as `start_with_socket`
+        // wires them (the `Node` half of each is kept on the `Harness`).
+        let snapshot_set_position = Arc::new(AtomicU64::new(0));
+        let snapshot_instant_pub = Arc::new(AtomicU64::new(0));
+        let snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES] =
+            std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
+        let snapshot_instants_abandoned = Arc::new(AtomicU64::new(0));
+        let (snapshot_cmd_tx, snapshot_cmd_rx) = mpsc::sync_channel::<SnapshotCmd>(1);
         let cluster = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -8214,7 +9135,7 @@ mod tests {
             svc_sched,
             timers: (0..CNC_MAX_SERVICES as u8)
                 .map(|row| {
-                    ServicesConfig::none_for_tests()
+                    services
                         .name_of(row)
                         .map(|n| crate::timers::RowTimers::new(n.hash()))
                 })
@@ -8223,7 +9144,8 @@ mod tests {
             pass_now_ns: 0,
             #[cfg(test)]
             test_now_ns: None,
-            services: ServicesConfig::none_for_tests(),
+            fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
+            services,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
             last_snap_refusals: (0, 0, 0),
             min_applied: u64::MAX,
@@ -8235,11 +9157,6 @@ mod tests {
             admission_bytes_default: 256 * 1024,
             buffer_bytes: 1 << 16,
             max_payload: 4096,
-            fsm_lag_eff: crate::services::fsm_lag_eff(
-                &ServicesConfig::none_for_tests(),
-                1 << 16,
-                4096,
-            ),
             pending_ring_ingress: None,
             last_holes_published: (0, 0),
             sock,
@@ -8327,7 +9244,23 @@ mod tests {
             crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
             cluster_view,
-            cluster_snapshot_pos,
+            cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
+            snapshot_last_commanded: 0,
+            snapshot_last_commanded_bytes: 0,
+            snapshot_set_position: Arc::clone(&snapshot_set_position),
+            snapshot_instant_pub: Arc::clone(&snapshot_instant_pub),
+            snapshot_row_incomplete: snapshot_row_incomplete.clone(),
+            snapshot_instants_abandoned: Arc::clone(&snapshot_instants_abandoned),
+            snapshot_interval_bytes: 0,
+            snapshot_target_learners: false,
+            // The same two directories `Node::start_with_socket` hands it —
+            // real paths under the harness tempdir, so the retention sweep
+            // runs for real rather than against a stub.
+            snap_root: dir.path().join("snapshots"),
+            cluster_snapshot_dir: dir.path().join("snapshots").join("cluster"),
+            pending_fetch: None,
+            snapshot_cmd_rx,
+            snapshot_cadence_refused: 0,
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
         // consensus agent, mirrored here so this harness exercises the same
@@ -8341,6 +9274,8 @@ mod tests {
             cluster_install_tx,
             svc_sched_producer_0: svc_sched_0_producer,
             hs_tx,
+            cluster_snapshot_pos,
+            _snapshot_cmd_tx: snapshot_cmd_tx,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
             _cfg_obs_tx: cfg_obs_tx,
@@ -8348,6 +9283,212 @@ mod tests {
             _trunc_rx: trunc_rx,
             _dir: dir,
         }
+    }
+
+    // ---- plan 2 task 5: commanded instants, the set, the floor, the flag ----
+
+    /// Spec §5.3/§5.4, end to end on one node: the leader commands an
+    /// instant, the set fills a member at a time, and only the LAST member
+    /// completes it — at which point the purge floor becomes P.
+    ///
+    /// The intermediate assertions are the load-bearing ones. A completeness
+    /// rule that fired on "some row reached P", or on the cluster artifact
+    /// alone, would pass the final assertion and fail these — and it would
+    /// move the floor to a position at which a joiner would be served an
+    /// artifact that does not exist.
+    #[test]
+    fn a_commanded_instant_completes_when_every_row_and_the_cluster_reach_it_and_moves_the_floor() {
+        let mut h = harness_with_rows(&["a", "b"]);
+        drive_to_serving_leader(&mut h);
+        h.mark_capable(0);
+        h.mark_capable(1);
+
+        let p = h
+            .cons
+            .command_snapshot(false)
+            .expect("both rows are capable");
+        assert_eq!(
+            h.cons.snapshot_instant_pub.load(Ordering::Relaxed),
+            p,
+            "the commanded instant is published for /metrics"
+        );
+
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            0,
+            "incomplete: nobody froze yet"
+        );
+
+        h.row_froze_at(0, p);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            0,
+            "row 1 and the cluster still missing"
+        );
+
+        h.row_froze_at(1, p);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            0,
+            "every row is at P but the CLUSTER artifact is not — that is not a set"
+        );
+
+        h.cluster_snapshot_pos.store(p, Ordering::Release);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            p,
+            "every declared row AND the cluster FSM at P: the set is complete"
+        );
+
+        // The floor follows on the next pass past the fsync floor, once the
+        // archive has made P durable — the `service_pos <= durable` belt
+        // (spec §5.4: a purge floor is only ever a position whose covering
+        // journal block is itself durable HERE).
+        h.cons.cnc.counters().durable.store_release(p);
+        h.advance_floor_timer();
+        h.cons.do_work();
+        assert_eq!(h.cnc_floor(), p, "floor := P on completion (spec §5.3)");
+    }
+
+    /// Spec §5.5's two named refusals. Both exist so an operator is TOLD
+    /// rather than left watching a floor that can never move: a row that
+    /// ignores the frame can never complete a set, and a standby instant with
+    /// no learner is a freeze nobody performs.
+    #[test]
+    fn an_incapable_row_refuses_the_command_by_name_and_a_standby_needs_a_learner() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+
+        let e = h
+            .cons
+            .command_snapshot(false)
+            .expect_err("row 0 was started with plain start()");
+        assert_eq!(e.code(), REASON_SNAPSHOT_UNSUPPORTED);
+        assert_eq!(
+            e,
+            SnapshotRefusal::Unsupported {
+                row: 0,
+                name: "a".to_string()
+            },
+            "the refusal NAMES the row — that is what reaches the audit detail"
+        );
+        assert_eq!(
+            h.cons.cnc.counters().append.load_acquire(),
+            6048,
+            "a refused command appends nothing"
+        );
+
+        h.mark_capable(0);
+        assert_eq!(
+            h.cons
+                .command_snapshot(true)
+                .expect_err("the genesis config has no learners")
+                .code(),
+            REASON_SNAPSHOT_NO_LEARNER,
+        );
+        // ...and the same command without `--standby` is fine, so the
+        // refusal is about the LEARNER and not about the row.
+        assert!(h.cons.command_snapshot(false).is_ok());
+    }
+
+    /// Spec §5.5's single-in-flight rule and its escape hatch. Without the
+    /// escape a row that never freezes would wedge every later instant on
+    /// this node forever ("more than two instants behind" would be a stall
+    /// the leader itself could never move past, not a reachable alert); with
+    /// no gate at all a slow row would be handed a fresh P every pass and
+    /// never complete any of them.
+    #[test]
+    fn single_in_flight_supersedes_after_an_interval_and_counts_the_abandoned_rows() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.mark_capable(0);
+        h.set_settings_interval(4096);
+
+        let p1 = h.cons.command_snapshot(false).expect("first instant");
+        assert_eq!(
+            h.cons
+                .command_snapshot(false)
+                .expect_err("the set at p1 is not complete")
+                .code(),
+            2,
+            "in flight"
+        );
+
+        h.append_client_bytes(4096);
+        let p2 = h.cons.command_snapshot(false).expect("superseded");
+        assert!(p2 > p1);
+        assert_eq!(
+            h.cons.snapshot_row_incomplete[0].load(Ordering::Relaxed),
+            1,
+            "row 0 never reached p1"
+        );
+        assert_eq!(
+            h.cons.snapshot_instants_abandoned.load(Ordering::Relaxed),
+            1,
+            "exactly one instant was abandoned (the `snapshot_instant_abandoned` record)"
+        );
+
+        // An OPERATOR's instant supersedes with no interval at all — that is
+        // the whole difference between `uc2ctl snapshot` and the cadence.
+        assert_eq!(
+            h.cons
+                .command_snapshot(false)
+                .expect_err("still in flight, no bytes accrued")
+                .code(),
+            2
+        );
+        let p3 = h
+            .cons
+            .command_snapshot_operator(false)
+            .expect("uc2ctl snapshot always supersedes");
+        assert!(p3 > p2);
+        assert_eq!(
+            h.cons.snapshot_instants_abandoned.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    /// Spec §5.7 item 2: `NODE_FLAG_LEARNER` is NODE-written, from the
+    /// KERNEL's durable-time membership shadow — the same word, and the same
+    /// reader, the leader flag comes from. A row acts on a standby-flagged
+    /// instant only when it is set, so a stale bit is a voter paying a freeze
+    /// (or a learner skipping one).
+    #[test]
+    fn the_learner_flag_follows_the_kernels_shadow() {
+        let mut h = harness();
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.cnc.status().flags.load_acquire() & NODE_FLAG_LEARNER,
+            0,
+            "id 1 is a voter in the genesis config"
+        );
+
+        // Demote id 1 (this node) to learner, exactly as a committed
+        // `CLUSTER kind=Membership` frame would: the kernel adopts at
+        // DURABLE time through `ConfigObserved`.
+        let mut demoted = h.cons.sm.config().clone();
+        demoted = demoted
+            .apply(uc_consensus::config::ConfigOp::DemoteVoter { id: 1 })
+            .expect("id 1 is a voter");
+        h.cons.feed(Event::ConfigObserved {
+            position: h.cons.cnc.counters().append.load_acquire(),
+            config: demoted,
+        });
+        h.cons.do_work();
+        assert_ne!(
+            h.cons.cnc.status().flags.load_acquire() & NODE_FLAG_LEARNER,
+            0,
+            "the node publishes the role its kernel adopted"
+        );
+        assert_eq!(
+            h.cons.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER,
+            0,
+            "and LEARNER does not collide with the other flag bits"
+        );
     }
 
     // ---- plan 1 task 5: the leader issues CLUSTER commands, the view answers ----
@@ -9238,37 +10379,62 @@ mod tests {
         );
     }
 
-    /// Spec §4.7 / the floor rule: the purge floor is the minimum over the
-    /// user rows AND the cluster artifact — but a `0` cluster artifact ("none
-    /// yet") must NOT pin the floor at 0 forever.
+    /// Spec §5.3/§5.4 (plan 2, replacing plan 1's M2 guard wholesale): the
+    /// purge floor is the newest COMPLETE SET's position and nothing else.
+    ///
+    /// The page-1 minimum over the rows — plan 1's floor input, still written
+    /// by `publish_service_mins` for observability — must not move it. It is
+    /// a min over positions the rows could once choose independently, so it
+    /// can name a P at which some row's artifact does not exist; a floor set
+    /// from it would then decline `MISSING` at the ship gate forever, which
+    /// is exactly the failure "the complete set at my floor" removes.
     #[test]
-    fn the_purge_floor_includes_the_cluster_artifact_but_only_once_it_exists() {
-        let mut h = harness();
+    fn the_purge_floor_is_the_complete_sets_position_not_the_page_one_minimum() {
+        let mut h = harness_with_rows(&["a"]);
         h.cons.purge_policy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
+
+        // The page-1 min says 4096, and NO set is complete. Under plan 1's
+        // rule that number was the floor; now it is a gauge.
         h.cons
             .cnc
             .snapshots()
             .service_snapshot_pos
             .store_release(4096);
+        assert!(!h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, 0,
+            "no complete set: no floor, whatever the rows' min says"
+        );
 
-        // No cluster artifact yet: the rows' floor stands on its own.
+        // A row at P with no cluster artifact at P is still not a set.
+        h.row_froze_at(0, 4096);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), 0);
+        assert!(!h.cons.maybe_persist_snapshot_floor());
+
+        // The cluster FSM reaches the same instant: NOW there is a set.
+        h.cluster_snapshot_pos.store(4096, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), 4096);
+        h.cons.snapshot_floor_last_persist_ns = None; // skip the 100 ms fsync floor
         assert!(h.cons.maybe_persist_snapshot_floor());
         assert_eq!(h.cons.snapshot_persisted_floor, 4096);
+        assert_eq!(h.cnc_floor(), 4096, "durable-then-mirror");
 
-        // The rows move on, but the cluster artifact lags: the floor follows
-        // the artifact, not the rows.
+        // And a row racing ahead to an instant the cluster FSM has not
+        // reached does not move the floor with it.
+        h.row_froze_at(0, 6016);
         h.cons
             .cnc
             .snapshots()
             .service_snapshot_pos
             .store_release(6016);
-        h.cons.cluster_snapshot_pos.store(5000, Ordering::Release);
-        h.cons.snapshot_floor_last_persist_ns = None; // skip the 100 ms fsync floor
-        assert!(h.cons.maybe_persist_snapshot_floor());
+        h.cons.check_set_completeness();
+        h.cons.snapshot_floor_last_persist_ns = None;
+        h.cons.maybe_persist_snapshot_floor();
         assert_eq!(
-            h.cons.snapshot_persisted_floor, 5000,
-            "the cluster artifact holds the floor down, so a purge cannot \
-             drop journal the uc2-cluster agent still replays from"
+            h.cons.snapshot_persisted_floor, 4096,
+            "half a set is not a set"
         );
     }
 
@@ -12767,28 +13933,23 @@ mod tests {
     /// (Counting captured lines instead would mean swapping the PROCESS-GLOBAL
     /// log sink, which `obs::log`'s own unit tests also swap, in the same test
     /// binary, in parallel — a racy oracle for a deterministic property.)
+    /// Coordinated-snapshot plan 2 Task 5 (Ruling P6) rewrote what a set IS:
+    /// the artifacts **at this node's floor**, every one of them, by name.
+    /// The old per-slot "each row's newest" read is gone, so a row whose slot
+    /// has run ahead to a newer instant no longer drags a mixed-position set
+    /// into a session.
     #[test]
     fn the_snapshot_decline_latch_names_each_distinct_reason_once() {
         let dir = decline_scratch();
         let root = dir.path().join("snapshots");
         let cnc = test_cnc();
         let services = crate::services::ServicesConfig::from_names(&["a", "b"], None).unwrap();
-        // Spec §5.6: the cluster artifact's position, as the `uc2-cluster`
-        // agent publishes it, and the directory it writes into.
-        let cluster_pos = AtomicU64::new(0);
         let cluster_dir = dir.path().join("snapshots").join("cluster");
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
-        let call = || {
-            snapshot_set_for(
-                &cnc,
-                &root,
-                &services,
-                &cluster_pos,
-                &cluster_dir,
-                7,
-                &latch,
-            )
-        };
+        let call = || snapshot_set_for(&cnc, &root, &services, &cluster_dir, 7, &latch);
+        // The instant every artifact below is built at — the floor names it,
+        // and the file names carry it.
+        const P: u64 = 4096;
 
         // 1. Nothing has snapshotted: decline "floor 0" — the first of its kind,
         //    so the latch TRANSITIONS (that is the log line).
@@ -12804,7 +13965,7 @@ mod tests {
         );
 
         // 3. A DIFFERENT reason: the floor is up but no artifact is published.
-        cnc.snapshots().node_snapshot_floor.store_release(4096);
+        cnc.snapshots().node_snapshot_floor.store_release(P);
         assert!(call().is_none());
         assert_eq!(
             latch.load(Ordering::Relaxed),
@@ -12818,40 +13979,39 @@ mod tests {
             "and only once"
         );
 
-        // 4. A published position whose FILE is absent is the same "missing"
-        //    reason — still no new line.
-        cnc.service_slot(0).snapshot_pos.store_release(1024);
-        cnc.service_slot(1).snapshot_pos.store_release(2048);
-        assert!(call().is_none());
+        // 4. Row artifacts at OTHER positions do not count, however new, and
+        //    however loudly the row's own cnc slot points at them: the set is
+        //    the artifacts at the FLOOR. Same "missing" reason, no new line.
+        cnc.service_slot(0).snapshot_pos.store_release(8192);
+        cnc.service_slot(1).snapshot_pos.store_release(8192);
+        write_artifact(&root, 0, 8192, b"a newer instant");
+        write_artifact(&root, 1, 8192, b"a newer instant");
+        assert!(
+            call().is_none(),
+            "artifacts above the floor are not the set at the floor"
+        );
         assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
         // A zero-length file is "missing" too (a rename that lost its content).
-        write_artifact(&root, 0, 1024, b"");
+        write_artifact(&root, 0, P, b"");
         assert!(call().is_none());
         assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
 
-        // 5. Every ROW artifact is present, but the CLUSTER ARTIFACT is not
-        //    (spec §5.6): still the same "missing" family, and still no
+        // 5. Every ROW artifact at P is present, but the CLUSTER ARTIFACT is
+        //    not (spec §5.6): still the same "missing" family, and still no
         //    session — a joiner that adopted this floor would have no
         //    membership, no schedule table and no settings.
-        write_artifact(&root, 0, 1024, b"fsm-0 artifact");
-        write_artifact(&root, 1, 2048, b"fsm-1 artifact bytes");
+        write_artifact(&root, 0, P, b"fsm-0 artifact");
+        write_artifact(&root, 1, P, b"fsm-1 artifact bytes");
         assert!(
             call().is_none(),
             "the rows cover the mask, but the cluster artifact does not exist yet"
-        );
-        assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
-        // A published position whose FILE is absent is the same reason.
-        cluster_pos.store(4096, Ordering::Release);
-        assert!(
-            call().is_none(),
-            "the position is published, the file is not"
         );
         assert_eq!(latch.load(Ordering::Relaxed), SNAP_DECLINE_MISSING);
 
         // 6. The complete set ships — and CLEARS the latch.
         std::fs::create_dir_all(&cluster_dir).unwrap();
         std::fs::write(
-            crate::cluster_agent::artifact_path(&cluster_dir, 4096),
+            crate::cluster_agent::artifact_path(&cluster_dir, P),
             b"cluster image",
         )
         .unwrap();
@@ -12865,12 +14025,8 @@ mod tests {
                 .iter()
                 .map(|a| (a.service_id, a.snapshot_pos, a.len))
                 .collect::<Vec<_>>(),
-            vec![
-                (0u8, 1024u64, 14u64),
-                (1, 2048, 20),
-                (CLUSTER_ARTIFACT_ID, 4096, 13)
-            ],
-            "the cluster artifact is one more artifact, LAST"
+            vec![(0u8, P, 14u64), (1, P, 20), (CLUSTER_ARTIFACT_ID, P, 13)],
+            "ONE position for the whole set (spec §5.6), cluster artifact LAST"
         );
         assert_eq!(
             latch.load(Ordering::Relaxed),
@@ -12879,7 +14035,7 @@ mod tests {
         );
 
         // 7. ... so the NEXT decline of the same kind is named again.
-        std::fs::remove_file(root.join("1").join("snap-2048.ultsnap")).unwrap();
+        std::fs::remove_file(root.join("1").join(format!("snap-{P}.ultsnap"))).unwrap();
         assert!(call().is_none());
         assert_eq!(
             latch.load(Ordering::Relaxed),
@@ -12901,7 +14057,6 @@ mod tests {
         let root = dir.path().join("snapshots");
         let cnc = test_cnc();
         let services = crate::services::ServicesConfig::none_for_tests();
-        let cluster_pos = AtomicU64::new(4096);
         let cluster_dir = dir.path().join("snapshots").join("cluster");
         std::fs::create_dir_all(&cluster_dir).unwrap();
         std::fs::write(
@@ -12911,17 +14066,9 @@ mod tests {
         .unwrap();
         let latch = AtomicU8::new(SNAP_DECLINE_NONE);
         cnc.snapshots().node_snapshot_floor.store_release(4096);
-        cnc.service_slot(0).snapshot_pos.store_release(1024);
-        write_artifact(&root, 0, 1024, b"fsm-0 artifact");
-        let set = snapshot_set_for(
-            &cnc,
-            &root,
-            &services,
-            &cluster_pos,
-            &cluster_dir,
-            7,
-            &latch,
-        );
+        cnc.service_slot(0).snapshot_pos.store_release(4096);
+        write_artifact(&root, 0, 4096, b"fsm-0 artifact");
+        let set = snapshot_set_for(&cnc, &root, &services, &cluster_dir, 7, &latch);
         assert!(
             set.is_none(),
             "a none_for_tests node must never ship a snapshot set"

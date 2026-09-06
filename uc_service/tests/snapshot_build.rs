@@ -67,6 +67,23 @@ fn wait_until(mut f: impl FnMut() -> bool) {
     }
 }
 
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command an
+/// instant and return its position **P**, polling through the `retry` window a
+/// leader legitimately answers while it has the role but not yet an appender.
+/// Duplicated per test binary, like `admin_request_ok` elsewhere.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
+}
+
 /// Count complete (`.ultsnap`) snapshot files on disk — a leftover `.tmp` from
 /// an in-progress build (there shouldn't be one in this test, since every
 /// publish either fully succeeds or is cleaned up) would NOT be counted.
@@ -107,12 +124,10 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
         0,
         "no instant commanded yet: no artifact"
     );
-    // Nothing else appends once the submits have returned, so the append
-    // counter right after the instant lands IS P, the SNAPSHOT frame's end.
-    let before_append = cnc.counters().append.load_acquire();
-    node.append_snapshot_for_test(0).unwrap();
-    wait_until(|| cnc.counters().append.load_acquire() > before_append);
-    let p = cnc.counters().append.load_acquire();
+    // `command_snapshot` RETURNS P — the `SNAPSHOT` frame's end — so the
+    // instant's identity comes from the command rather than from reading the
+    // append counter and hoping nothing else appended.
+    let p = command_instant(&node);
 
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
     let s = cnc.snapshots().service_snapshot_pos.load_acquire();
@@ -131,17 +146,25 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
     assert_eq!(pos, s);
     assert!(path.ends_with(format!("snap-{s}.ultsnap")));
 
-    // A second instant produces a newer artifact BESIDE the first: `publish`
-    // no longer prunes (ruling P1 — the node owns set retention, Task 5).
+    // A second instant tags a NEWER artifact, and `publish` still prunes
+    // nothing (ruling P1). What removes the older one is the NODE's set
+    // retention, on the pass the set at p2 completes — so the steady state
+    // here is exactly one artifact, at the newest complete set's position.
     for i in 0..400u64 {
         let _: CmdResp = client.submit(&Cmd::Write(i)).unwrap();
     }
-    node.append_snapshot_for_test(0).unwrap();
-    wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > s);
+    let p2 = command_instant(&node);
+    wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() == p2);
+    wait_until(|| count_snapshots(dir.path()) == 1);
     assert_eq!(
-        count_snapshots(dir.path()),
-        2,
-        "two instants, two artifacts: the service prunes nothing"
+        store.newest(u64::MAX).unwrap().expect("file exists").0,
+        p2,
+        "the artifact that survives is the one AT the complete set's position"
+    );
+    assert_eq!(
+        node.snapshot_set_position(),
+        p2,
+        "the node completed its own set at the second instant"
     );
 
     client.shutdown();
