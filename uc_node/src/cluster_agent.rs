@@ -484,7 +484,7 @@ mod tests {
     /// no swap on the dev box — CLAUDE.md). `CARGO_TARGET_TMPDIR` is set only
     /// for integration-test binaries and these are inline unit tests in the
     /// lib target, so this falls back to a package-relative `target/`
-    /// directory — the same helper shape `schedule_state.rs`'s tests use.
+    /// directory — the same helper shape `audit.rs`'s tests use.
     fn tempdir() -> tempfile::TempDir {
         let root = std::env::var("CARGO_TARGET_TMPDIR")
             .map(std::path::PathBuf::from)

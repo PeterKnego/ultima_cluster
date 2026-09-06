@@ -1612,7 +1612,7 @@ impl Node {
             net_rx,
             obs_rx,
             cfg_obs_rx,
-            view_position_seen: 0,
+            view_position_seen: u64::MAX, // see the field: the first refresh must always run
             last_cluster_append: 0,
             schedule_position: 0,
             schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
@@ -2336,14 +2336,33 @@ struct Consensus {
     /// Cluster FSM (spec §4.5): the view's position as of the last
     /// `refresh_from_view`. The shadow that makes the per-pass read a single
     /// `Acquire` load with no lock.
+    ///
+    /// **Seeded `u64::MAX`, never `0`.** A fresh cluster's view sits at
+    /// position 0, and a shadow that started there would make the
+    /// construction-time `refresh_from_view` a no-op — so `[settings]` in
+    /// `node.toml`, which seeds the view's genesis, would never reach the lag
+    /// and admission doors until some unrelated CLUSTER frame happened to
+    /// commit. `u64::MAX` cannot be a real position (positions are frame-END
+    /// byte offsets), so the first call always runs the clamps exactly once.
     view_position_seen: u64,
     /// Cluster FSM (spec §4.4): the frame-END of the newest CLUSTER command
-    /// THIS node appended as leader, or 0. The SINGLE-IN-FLIGHT gate for the
-    /// two staged-file ops: while it is above the view's position the previous
-    /// command has not committed, and a second apply is answered `retry`.
+    /// THIS node appended as leader, or 0. The single-in-flight gate **for
+    /// this leader term** on the two staged-file ops: while it is above the
+    /// view's position the previous command has not committed, and a second
+    /// apply is answered `retry`.
+    ///
     /// Reset on every leader exit (`BecomeFollower`, `halt`) — a command
     /// appended under a term this node no longer leads may never commit at
-    /// all, and holding the gate shut on it would wedge the next leader.
+    /// all, and holding the gate shut on it would wedge the next leader
+    /// (possibly this node again).
+    ///
+    /// Per TERM, then, and not airtight across one: a new leader starts at `0`
+    /// while the previous leader's uncommitted frame may still be in flight,
+    /// so two table commands can briefly be above the view at once. That is
+    /// harmless here — the durable `ScheduleRecord` with its one level of
+    /// `prev`, which is what plan 2's rule actually protected, is gone; the
+    /// cluster FSM applies whichever of the two commits, in log order, and a
+    /// truncated one simply never reaches the view.
     last_cluster_append: u64,
     /// Cluster FSM: MIRROR of the view's `table_position` — the table this
     /// node's rows are armed from. Written only by `refresh_from_view`, which
@@ -5694,14 +5713,25 @@ impl Consensus {
     /// Deleting it earlier would lose the request on an append failure;
     /// deleting it at all is what keeps a re-presented request from appending
     /// the same payload twice (it refuses with MISSING instead).
+    ///
+    /// Both staged-file ops share the event NAME (`schedule_staged_file_kept`,
+    /// which shipped in plan 2 and is documented in the runbook and the
+    /// monitoring guide) and tell themselves apart by the `file` field — an
+    /// operator's next action is "remove this file by hand", so the record has
+    /// to say which one.
     fn consume_staged(&self, path: &Path, position: u64) {
         if let Err(e) = std::fs::remove_file(path) {
             let err = e.to_string();
+            let file = path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
             crate::obs_event!(
                 Warn,
                 "schedule_staged_file_kept",
                 node = self.id as u64,
                 position = position,
+                file = file.as_str(),
                 err = err.as_str()
             );
         }
@@ -7825,6 +7855,14 @@ mod tests {
         harness_with_crypto(None, &[])
     }
 
+    /// As [`harness`], but with the cluster FSM's GENESIS settings seeded from
+    /// `[settings]` in `node.toml` — the thing `NodeConfig::settings_genesis`
+    /// carries. The default is `Settings::genesis_default()` (every field
+    /// zero), which is what a `node.toml` with no `[settings]` section gives.
+    fn harness_with_settings(settings: Settings) -> Harness {
+        harness_with_crypto_and_settings(None, &[], settings)
+    }
+
     /// As [`harness`], but with the crypto plane wired exactly as
     /// `Node::start_with_socket` wires it (M8 Task 12). `peer_override`
     /// replaces one member's address with a real, bound socket so a genuine
@@ -7832,6 +7870,14 @@ mod tests {
     fn harness_with_crypto(
         crypto: Option<SharedTransport>,
         peer_override: &[(NodeId, SocketAddr)],
+    ) -> Harness {
+        harness_with_crypto_and_settings(crypto, peer_override, Settings::genesis_default())
+    }
+
+    fn harness_with_crypto_and_settings(
+        crypto: Option<SharedTransport>,
+        peer_override: &[(NodeId, SocketAddr)],
+        settings_genesis: Settings,
     ) -> Harness {
         // Reproduce the REAL gap between the two `Instant` origins (T12
         // review, M4). In `Node::start_with_socket` the `SharedTransport`'s
@@ -7964,7 +8010,7 @@ mod tests {
             membership: config.clone(),
             table: ScheduleTable { entries: vec![] },
             table_position: 0,
-            settings: Settings::genesis_default(),
+            settings: settings_genesis,
             applied: 0,
         };
         let cluster_view = Arc::new(ClusterView::new(&cluster_genesis));
@@ -7990,7 +8036,7 @@ mod tests {
                 .journal_arc(),
         );
 
-        let cons = Consensus {
+        let mut cons = Consensus {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             validated_term: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -8053,7 +8099,7 @@ mod tests {
             net_rx,
             obs_rx,
             cfg_obs_rx,
-            view_position_seen: 0,
+            view_position_seen: u64::MAX,
             last_cluster_append: 0,
             schedule_position: 0,
             schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),
@@ -8128,6 +8174,11 @@ mod tests {
             cluster_view,
             cluster_snapshot_pos,
         };
+        // The LAST thing `Node::start_with_socket` does before spawning the
+        // consensus agent, mirrored here so this harness exercises the same
+        // boot ordering: the genesis settings reach the doors, and the
+        // recovered artifact's table arms, before the first pass.
+        cons.refresh_from_view();
 
         Harness {
             cons,
@@ -8198,6 +8249,100 @@ mod tests {
             h.cons.view_position_seen, end,
             "and the shadow tracks the view's position tag"
         );
+    }
+
+    /// Spec §6, the BOOT seeding: `[settings]` in `node.toml` becomes the
+    /// cluster FSM's genesis, and the construction-time `refresh_from_view`
+    /// must push it onto this node's doors BEFORE the first pass — on a fresh
+    /// cluster the view sits at position 0 and no CLUSTER frame may ever
+    /// commit, so "it will be picked up when the view moves" is not a
+    /// seeding at all. `[settings] fsm_lag` is the ONLY way to configure the
+    /// FSM door since `[services] fsm_lag` is refused by name, so a silent
+    /// miss here runs an operator's `lockstep` cluster at `buffer_bytes / 4`.
+    #[test]
+    fn the_genesis_settings_reach_the_doors_at_construction() {
+        let h = harness_with_settings(Settings {
+            fsm_lag_bytes: uc_protocol::v2::settings::FSM_LAG_LOCKSTEP,
+            admission_bytes: 4096,
+            ..Settings::genesis_default()
+        });
+        // The view has NOT moved — this is a fresh cluster, position 0.
+        assert_eq!(h.cons.cluster_view.position.load(Ordering::Acquire), 0);
+        assert_eq!(
+            h.cons.admission_bytes, 4096,
+            "[settings] admission_bytes must reach the door at boot"
+        );
+        assert_eq!(
+            h.cons.cnc.admission_bytes(),
+            4096,
+            "…and the cnc mirror with it"
+        );
+        // The harness node declares nothing (`none_for_tests`), where the FSM
+        // door is inert by design — declare a row and re-run the one call
+        // `Node::start_with_socket` makes, which is what a real node does.
+        let mut h = h;
+        h.cons.services = crate::services::ServicesConfig::from_names(&["kv"], None).unwrap();
+        h.cons.fsm_lag_eff = crate::services::fsm_lag_eff(&h.cons.services, 1 << 16, 4096);
+        h.cons.view_position_seen = u64::MAX;
+        h.cons.refresh_from_view();
+        assert_eq!(
+            h.cons.cnc.fsm_lag_bytes(),
+            0,
+            "[settings] fsm_lag = lockstep must reach the page's lockstep sentinel at boot"
+        );
+        assert_eq!(
+            h.cons.fsm_lag_eff,
+            Some(
+                crate::services::fsm_lag_from_setting(
+                    uc_protocol::v2::settings::FSM_LAG_LOCKSTEP,
+                    1 << 16,
+                    4096
+                )
+                .unwrap()
+            ),
+            "and the door itself is the lockstep one, not buffer_bytes / 4"
+        );
+        // And it did NOT fabricate a table adoption out of a position-0 view.
+        assert_eq!(h.cons.schedule_position, 0);
+        assert_eq!(h.cons.schedule_pos_pub.load(Ordering::Relaxed), 0);
+    }
+
+    /// Spec §4.4: the single-in-flight gate is PER LEADER TERM, so both leader
+    /// exits must clear it. Without this a leader whose CLUSTER command was
+    /// appended and then truncated away would refuse every later apply with
+    /// `retry`, forever — the view can never reach a position that frame no
+    /// longer occupies.
+    #[test]
+    fn the_cluster_command_gate_is_cleared_on_both_leader_exits() {
+        for halt in [false, true] {
+            let mut h = harness();
+            drive_to_serving_leader(&mut h);
+            h.cons
+                .append_cluster_frame(&ClusterCommand::Settings(Settings {
+                    snapshot_interval_bytes: 5,
+                    ..Settings::genesis_default()
+                }))
+                .unwrap();
+            assert!(
+                h.cons.last_cluster_append > h.cons.cluster_view.position.load(Ordering::Acquire),
+                "the gate is shut while the command is above the view"
+            );
+            if halt {
+                h.cons.halt();
+            } else {
+                // Adopt a strictly higher term as a follower.
+                h.cons.feed(Event::RequestVote {
+                    from: 0,
+                    new_term: 9,
+                    last_term: 9,
+                    last_durable: 1 << 20,
+                });
+            }
+            assert_eq!(
+                h.cons.last_cluster_append, 0,
+                "leader exit (halt = {halt}) must open the gate"
+            );
+        }
     }
 
     /// Spec §4.4/§6: the replicated `fsm_lag` moves the FSM door and the cnc

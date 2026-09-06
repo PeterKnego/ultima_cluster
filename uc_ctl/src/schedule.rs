@@ -15,13 +15,13 @@
 //! [`uc_node::schedule_digest`] in the request's `(id, ip, port)` fields —
 //! the node recomputes the identical digest over the file IT reads back, so
 //! the file an operator signed is the file the cluster adopts (see
-//! `uc_node::schedule_state`'s module doc).
+//! `uc_node::cluster_fsm::staged_digest`, which `schedule_digest` aliases).
 //!
-//! `show` reads back the newest ADOPTED table from durable node state
-//! (`uc_node::read_record`, NOT the staged file — that one is consumed by a
-//! successful apply) and renders it, resolving each entry's `identity_hash`
-//! back to a name through the SAME cnc name lines `apply` used to resolve
-//! forward.
+//! `show` reads back the COMMITTED table from this instance directory's
+//! newest cluster artifact (`uc_node::cluster_agent::read_committed_table`,
+//! NOT the staged file — that one is consumed by a successful apply) and
+//! renders it, resolving each entry's `identity_hash` back to a name through
+//! the SAME cnc name lines `apply` used to resolve forward.
 //!
 //! A refused or timed-out `apply` deliberately leaves the staged file in
 //! place: the node only deletes `schedules.pending` on a successful append

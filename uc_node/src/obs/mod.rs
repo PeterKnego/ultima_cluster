@@ -51,8 +51,11 @@ pub struct ObsSources {
     pub timer_stats: Arc<crate::timers::TimerStats>,
     /// Time-and-timers plan 2 (§6): the adopted schedule table's frame-END
     /// position (0 = none) and its entry count, published by the consensus
-    /// agent when a table is adopted (at append, from the archive, or at
-    /// boot from `state/schedules.state`).
+    /// agent whenever the COMMITTED table changes — the cluster FSM applies
+    /// the `CLUSTER kind=ScheduleTable` command at commit and publishes the
+    /// view, and `Consensus::refresh_from_view` re-arms the rows and these
+    /// two gauges off it (at boot from the recovered cluster artifact, and
+    /// per pass thereafter).
     pub schedule_table_position: Arc<AtomicU64>,
     pub schedule_entries: Arc<AtomicU64>,
     /// Plan 2: `schedule apply` requests this node refused, for any reason.
