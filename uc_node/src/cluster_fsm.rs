@@ -159,8 +159,14 @@ impl ClusterRefusal {
 pub struct ClusterFsm {
     state: ClusterState,
     /// The declared rows' identity hashes, from `[services] names` — the
-    /// only node-local input, fixed at boot, identical cluster-wide by the
-    /// bootstrap boundary (spec §3.3).
+    /// only node-local input, fixed at boot.
+    ///
+    /// Read by [`ClusterFsm::validate`] and NOT by
+    /// [`ClusterFsm::validate_replicated`], so it never decides what a
+    /// committed command does (Ruling R24). Nothing enforces that two hosts'
+    /// lists agree in steady state — the positional identity comparison on
+    /// `SNAP_BEGIN` fires on the joiner path only — which is precisely why
+    /// `apply` must not consult it.
     declared_hashes: Vec<u64>,
 }
 
@@ -186,9 +192,56 @@ impl ClusterFsm {
         &self.state
     }
 
-    /// Pure: the acceptance decision on THIS state, no mutation. The leader's
-    /// pre-append check calls exactly this on a clone (spec §4.4).
+    /// The LEADER's pre-append acceptance decision on THIS state, no
+    /// mutation — [`Self::validate_replicated`] plus the one check that reads
+    /// node-local input (the declared-hash set). The leader's pre-append
+    /// check calls exactly this on a clone (spec §4.4).
+    ///
+    /// It is deliberately NOT what `apply` runs: see
+    /// [`Self::validate_replicated`] for why the two differ, and by exactly
+    /// how much.
     pub fn validate(&self, cmd: &ClusterCommand) -> Result<(), ClusterRefusal> {
+        self.validate_replicated(cmd)?;
+        // NODE-LOCAL, leader-only (Ruling R24). `declared_hashes` is this
+        // host's `[services] names`; running it inside `apply` would let two
+        // nodes with different lists reach opposite verdicts on the same
+        // command at the same position. Here it decides only whether an
+        // operator's request is appended AT ALL, so every replica still sees
+        // one command with one outcome.
+        if let ClusterCommand::ScheduleTable(t) = cmd {
+            for (i, e) in t.entries.iter().enumerate() {
+                if !self.declared_hashes.contains(&e.identity_hash) {
+                    return Err(ClusterRefusal::ScheduleUnknownFsm { entry: i });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The REPLICATED half of the acceptance decision: FSM state and
+    /// compile-time constants only, never this host. This is what `apply`
+    /// runs, on every node, so its verdict is identical everywhere by
+    /// construction — spec §4.4's rule verbatim ("validation that decides
+    /// acceptance lives in `apply`, deterministically, on FSM state only").
+    ///
+    /// What it deliberately does NOT check is a table entry naming an FSM
+    /// this node has not declared. That set is `[services] names`, node-local
+    /// input: if two hosts' lists differed, one replica would ACCEPT a
+    /// committed `ScheduleTable` and another REFUSE it, both would advance
+    /// `applied` past it, and they would then hold different
+    /// `table`/`table_position` at the same position and write divergent
+    /// artifacts under the same tag — a joiner getting whichever shipper it
+    /// reached. Nothing fail-stops it: the refusal path is `out.push(43)` and
+    /// carry on. Adopting unconditionally instead costs nothing: a row this
+    /// node does not declare simply never arms a timer, which is node-local
+    /// and harmless.
+    ///
+    /// The check itself is not lost — it stays in the leader's pre-append
+    /// [`Self::validate`], which `Consensus::apply_schedule_table` runs
+    /// before appending, so an operator still gets `43 schedule_unknown_fsm`
+    /// immediately and no unvalidated table reaches the log in the first
+    /// place.
+    pub fn validate_replicated(&self, cmd: &ClusterCommand) -> Result<(), ClusterRefusal> {
         match cmd {
             ClusterCommand::Membership(next) => {
                 // Version chaining IS the one-in-flight rule: the next record
@@ -203,11 +256,6 @@ impl ClusterFsm {
             ClusterCommand::ScheduleTable(t) => {
                 if t.entries.len() > MAX_SCHEDULE_ENTRIES {
                     return Err(ClusterRefusal::ScheduleTooLarge);
-                }
-                for (i, e) in t.entries.iter().enumerate() {
-                    if !self.declared_hashes.contains(&e.identity_hash) {
-                        return Err(ClusterRefusal::ScheduleUnknownFsm { entry: i });
-                    }
                 }
                 Ok(())
             }
@@ -296,7 +344,10 @@ impl RawStateMachine for ClusterFsm {
             out.push(42);
             return;
         };
-        if let Err(r) = self.validate(&command) {
+        // The REPLICATED half only (Ruling R24): every node must reach this
+        // verdict identically, so nothing node-local may enter it. The
+        // leader's own pre-append check is the fuller `validate`.
+        if let Err(r) = self.validate_replicated(&command) {
             out.push(r.reason_code() as u8);
             return;
         }
@@ -656,9 +707,14 @@ mod tests {
         );
     }
 
+    /// The LEADER's door refuses the whole table when any entry names an FSM
+    /// this node has not declared — all-or-nothing, so an operator never gets
+    /// a partially applied table. Ruling R24 moved this out of `apply`; what
+    /// `apply` does with a table that reached the log anyway is pinned by
+    /// `a_committed_table_naming_an_undeclared_fsm_is_adopted_but_refused_at_the_door`.
     #[test]
-    fn schedule_table_naming_an_undeclared_fsm_refuses_the_whole_table() {
-        let mut f = fsm();
+    fn schedule_table_naming_an_undeclared_fsm_refuses_the_whole_table_at_the_door() {
+        let f = fsm();
         let t = ScheduleTable {
             entries: vec![
                 ScheduleEntry {
@@ -679,14 +735,66 @@ mod tests {
             Err(ClusterRefusal::ScheduleUnknownFsm { entry: 1 })
         ));
         assert_eq!(f.validate(&cmd).unwrap_err().reason_code(), 43);
+        // Refusing entry 1 rejects entry 0 with it: the table is one record.
+        assert!(f.state().table.entries.is_empty());
+    }
+
+    /// I3 (Ruling R24): `apply`'s acceptance must be a function of FSM STATE
+    /// and the frame, nothing else. `declared_hashes` is this host's
+    /// `[services] names` — node-local — so leaving the unknown-FSM check in
+    /// `apply` meant two nodes whose lists differ would reach opposite
+    /// verdicts on the SAME command at the SAME position, both advance
+    /// `applied` past it, hold different `table`/`table_position`, and write
+    /// divergent artifacts under the same tag. Nothing fail-stops: the
+    /// refusal path is `out.push(43)` and carry on.
+    ///
+    /// So a COMMITTED table is adopted unconditionally, and the declared-hash
+    /// check stays where it decides nothing replicated: the leader's
+    /// pre-append `validate`, which is what `apply_schedule_table` runs
+    /// before anything reaches the log. A row this node does not declare
+    /// simply never arms — node-local and harmless.
+    #[test]
+    fn a_committed_table_naming_an_undeclared_fsm_is_adopted_but_refused_at_the_door() {
+        let mut f = ClusterFsm::new(genesis(), vec![0xF5A0]);
+        let t = ScheduleTable {
+            entries: vec![ScheduleEntry {
+                identity_hash: 0xF5A1, // NOT declared here
+                timer_id: 7,
+                rule: ScheduleRule::Once { at_ns: 5 },
+            }],
+        };
+        let cmd = ClusterCommand::ScheduleTable(t.clone());
+
+        // The LEADER's door still refuses it, by name and by reason code.
+        assert!(matches!(
+            f.validate(&cmd),
+            Err(ClusterRefusal::ScheduleUnknownFsm { entry: 0 })
+        ));
+        assert_eq!(f.validate(&cmd).unwrap_err().reason_code(), 43);
+
+        // But `apply` — which every replica runs, including one whose
+        // `[services] names` the operator fat-fingered — ADOPTS it.
         let mut out = Vec::new();
         f.apply(
-            &mut ApplyCtx::for_sm::<ClusterFsm>(300),
+            &mut ApplyCtx::for_sm::<ClusterFsm>(320),
             &body(&cmd),
             &mut out,
         );
-        assert_eq!(out, [43]);
-        assert!(f.state().table.entries.is_empty());
+        assert_eq!(out, [0], "accepted");
+        assert_eq!(f.state().table, t);
+        assert_eq!(f.state().table_position, 320);
+
+        // The determinism that buys: a node with a DIFFERENT declared set
+        // reaches the identical state at the identical position.
+        let mut g = ClusterFsm::new(genesis(), vec![0xF5A1]);
+        let mut out2 = Vec::new();
+        g.apply(
+            &mut ApplyCtx::for_sm::<ClusterFsm>(320),
+            &body(&cmd),
+            &mut out2,
+        );
+        assert_eq!(out, out2);
+        assert_eq!(f.state(), g.state());
     }
 
     #[test]
