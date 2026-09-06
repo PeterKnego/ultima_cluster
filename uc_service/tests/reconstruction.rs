@@ -295,6 +295,133 @@ fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
     node.stop();
 }
 
+/// Ruling P10, the CATCH-UP path: a span replayed from the journal freezes at
+/// its last `SNAPSHOT` frame.
+///
+/// Before P10 `replay_into` ignored every instant, so a row whose ring lapped
+/// it silently skipped the instant the leader was waiting on — the set could
+/// never complete, at any timeout. Here the instant is commanded with NO
+/// service attached at all, so the live apply loop cannot possibly be what
+/// freezes: the artifact exists only if the journal walk produced it.
+///
+/// It also pins P6: the artifact is the state STRICTLY BELOW P. The 1 000
+/// `Add(1)`s below the instant must be in it and the 1 000 above must not,
+/// which is what makes one instant's artifacts position-aligned across rows.
+#[test]
+fn a_replayed_span_freezes_at_its_last_snapshot_frame_below_it_only() {
+    use uc_service::SnapshotStateMachine;
+
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let node = start_single_node_with_buffer(dir.path(), "recp10", RING_BYTES);
+    wait_until(|| node.can_serve());
+
+    let prod = open_ingress(dir.path());
+    for i in 1..=1_000u32 {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    // The instant, with nothing attached. `ServicesConfig::none_for_tests`
+    // declares no row, so the capability gate (spec §5.5) is vacuous here —
+    // which is exactly the fixture this needs.
+    let p = command_instant(&node);
+    for i in 1_001..=2_000u32 {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    assert!(
+        node.counters().append.load_acquire() > RING_BYTES as u64,
+        "precondition: the ring must have scrolled so the instant is inside a \
+         REPLAYED span and not a live one"
+    );
+
+    let svc = ServiceBuilder::new(cfg(dir.path(), "recp10"), CountSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    let cnc = open_cnc(dir.path(), "recp10");
+    wait_service_caught_up(&cnc);
+    wait_until(|| cnc.service_slot(0).snapshot_pos.load_acquire() == p);
+    assert_eq!(query_total(&svc), 2_000, "the whole span still applied");
+
+    let store = uc_service::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+    let (pos, path) = store.newest(u64::MAX).unwrap().expect("an artifact at P");
+    assert_eq!(pos, p, "tagged with the instant, not the SM's own cursor");
+    let mut f = std::fs::File::open(&path).unwrap();
+    uc_service::snapshots::verify_snapshot_envelope(&mut f, p).expect("envelope names P");
+    let mut restored = CountSm::default();
+    restored.install_snapshot(p, &mut f).unwrap();
+    assert_eq!(
+        restored.total, 1_000,
+        "P6: the artifact is the log STRICTLY BELOW P — the 1 000 adds above \
+         the instant must not have leaked into it"
+    );
+
+    svc.stop();
+    node.stop();
+}
+
+/// Ruling P10, the RECONSTRUCTION path: a restart whose journal tail carries a
+/// `SNAPSHOT` frame above the artifact it installs completes that instant.
+///
+/// `replay_into` is the single entry point for both — the live loop's
+/// `Batch::Overrun` arm and a fresh/restarted service's first cycle both call
+/// it — so this is the same code as the test above, reached the other way:
+/// here the SM starts from an installed artifact at P1 rather than from zero,
+/// and the tail above it holds P2.
+#[test]
+fn a_restart_completes_an_instant_sitting_in_its_journal_tail() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let node = start_single_node_with_buffer(dir.path(), "recp10r", RING_BYTES);
+    wait_until(|| node.can_serve());
+    let prod = open_ingress(dir.path());
+
+    // First incarnation: catches up, then takes a LIVE instant at P1.
+    for i in 1..=500u32 {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    let svc1 = ServiceBuilder::new(cfg(dir.path(), "recp10r"), CountSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    let cnc = open_cnc(dir.path(), "recp10r");
+    wait_service_caught_up(&cnc);
+    let p1 = command_instant(&node);
+    wait_until(|| cnc.service_slot(0).snapshot_pos.load_acquire() == p1);
+    svc1.crash();
+
+    // With the row DOWN: more traffic, a second instant at P2, more traffic —
+    // and enough of it that the ring has scrolled, so the restart genuinely
+    // replays rather than reading the tail live.
+    for i in 501..=1_500u32 {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    let p2 = command_instant(&node);
+    assert!(p2 > p1);
+    for i in 1_501..=2_500u32 {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+
+    // The restart installs the artifact at P1 (or replays to it) and then
+    // walks a tail containing P2: the builder must receive P2.
+    let svc2 = ServiceBuilder::new(cfg(dir.path(), "recp10r"), CountSm::default())
+        .start_with_snapshots()
+        .unwrap();
+    wait_service_caught_up(&cnc);
+    wait_until(|| cnc.service_slot(0).snapshot_pos.load_acquire() == p2);
+    assert_eq!(query_total(&svc2), 2_500, "the whole tail applied too");
+
+    let store = uc_service::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+    assert_eq!(
+        store.newest(u64::MAX).unwrap().expect("an artifact").0,
+        p2,
+        "the instant in the tail completed on the restarted row"
+    );
+
+    svc2.stop();
+    node.stop();
+}
+
 #[test]
 fn restarted_service_epoch_bumps_and_state_rebuilds() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();

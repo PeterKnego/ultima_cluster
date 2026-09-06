@@ -29,7 +29,7 @@ use uc_protocol::v2::ipc::{MSG_V2_SCHED, SchedOp, SchedRecord, write_sched_recor
 use crate::builder_agent::BuildJob;
 use crate::config::SnapshotError;
 use crate::egress::Egress;
-use crate::replay::{Replay, replay_into};
+use crate::replay::{Replay, ReplayInstant, replay_into};
 use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 
 /// Time-and-timers §4.8: how many spins `write_sched` has taken waiting on a
@@ -682,6 +682,14 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 &st.cnc,
                 &st.journal_dir,
                 st.snapshot_restore.as_ref(),
+                // Ruling P10: the span this replay walks may hold the very
+                // instant the leader is waiting on. Same trigger, same flags
+                // word as the live arm above — one decision, two paths.
+                ReplayInstant {
+                    trigger: &mut st.snapshot_trigger,
+                    node_flags,
+                    service_id: st.service_id,
+                },
             ) {
                 Ok(Replay::Rejoin(cursor)) => cursor,
                 // The covering artifact is above `min(commit, durable)`: the
@@ -773,7 +781,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
 /// with it — exactly the reason `write_sched_if_leader` above is shaped the
 /// same way.
 #[inline(never)]
-fn on_snapshot_frame<S: RawStateMachine>(
+pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
     trigger: &mut Option<SnapshotTrigger<S>>,
     sm: &S,
     pos: u64,

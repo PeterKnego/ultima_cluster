@@ -20,11 +20,13 @@ use std::sync::Mutex;
 
 use uc_journal::TailReader;
 use uc_log::cnc::CncPage;
+use uc_protocol::v2::cnc::NODE_FLAG_LEARNER;
 use uc_protocol::v2::frame::{
-    self, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
+    self, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_SNAPSHOT,
+    FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len,
 };
 
-use crate::apply::SnapshotRestore;
+use crate::apply::{SnapshotRestore, SnapshotTrigger, on_snapshot_frame};
 use crate::config::ServiceError;
 use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 
@@ -44,6 +46,97 @@ pub(crate) enum Replay {
     /// the floor until the tail catches up; nightly 33488022809). Nothing was
     /// applied; the caller retries next cycle.
     AwaitArtifact { artifact: u64, target: u64 },
+}
+
+/// Ruling P10's inputs: everything a replayed span needs in order to act on
+/// its last `SNAPSHOT` frame. Bundled rather than passed as three more
+/// parameters because they travel together and mean one thing.
+///
+/// `trigger` is `None` on a row started with plain `start()` — not
+/// snapshot-capable, so pass 1 is skipped outright and the walk is
+/// byte-for-byte what it was before P10.
+pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
+    pub trigger: &'a mut Option<SnapshotTrigger<S>>,
+    /// The node-written status flags word, read ONCE per apply cycle by the
+    /// caller — the same value the live arm uses, so a role change mid-cycle
+    /// cannot make the two paths disagree about whether this node is a
+    /// learner.
+    pub node_flags: u64,
+    /// This row's cnc slot, for the "already held" guard below.
+    pub service_id: u8,
+}
+
+/// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in the
+/// span this replay is about to walk that this row should freeze at, or
+/// `None`.
+///
+/// **Why a pre-pass and not an inline decision.** "Act on the last one" cannot
+/// be decided while walking: the freeze has to happen BEFORE any frame at or
+/// above P is applied (P6), and whether a given instant is the last is only
+/// known once the span has been read to its end. Freezing at each in turn and
+/// keeping the newest would pay `freeze()` — O(state), on the apply thread,
+/// under the SM lock — once per instant in the span. Deciding first costs one
+/// extra journal walk that reads HEADERS ONLY, applies nothing and decodes
+/// nothing; beside the apply pass it precedes that is noise, and this whole
+/// path is the overrun path, never the live walk.
+///
+/// Two declines beyond `on_snapshot_frame`'s own three:
+///
+/// * an instant at or below the artifact this row already holds (its cnc
+///   `snapshot_pos`) — a restart replaying the span that contains its own
+///   installed artifact's frame would otherwise rebuild the same file;
+/// * a standby instant on a node that is not a learner (spec §5.7), checked
+///   here as well as in `on_snapshot_frame` so a standby-flagged frame cannot
+///   mask a plain instant EARLIER in the same span by being picked as "last"
+///   and then declined.
+fn last_actionable_instant<S: RawStateMachine>(
+    reader: &TailReader,
+    start_pos: u64,
+    cnc: &CncPage,
+    instant: &ReplayInstant<'_, S>,
+) -> Result<Option<u64>, ServiceError> {
+    let held = crate::attach::slot(cnc, instant.service_id)
+        .snapshot_pos
+        .load_acquire();
+    let mut last = None;
+    reader
+        .scan_from(start_pos, |_seq, base, payload| {
+            let counters = cnc.counters();
+            let target = counters
+                .commit
+                .load_acquire()
+                .min(counters.durable.load_acquire());
+            let mut off = 0usize;
+            while off + HEADER_LEN <= payload.len() {
+                let hdr = frame::read_header(&payload[off..]);
+                let total = hdr.length as usize;
+                let aligned = align_frame_len(total);
+                if total < HEADER_LEN || off + aligned > payload.len() {
+                    break;
+                }
+                let pos = base + off as u64;
+                let end = pos + aligned as u64;
+                // The same target guard pass 2 applies, so the two agree on
+                // where the span ends. `target` can only GROW between the
+                // passes, so at worst pass 2 walks further than pass 1 looked
+                // and an instant in that extra tail waits for the next pass —
+                // spec §10's abandonment, one cycle long.
+                if end > target {
+                    return false;
+                }
+                if hdr.frame_type == FRAME_TYPE_SNAPSHOT
+                    && end > held
+                    && !(hdr.flags & FLAG_SNAPSHOT_STANDBY != 0
+                        && instant.node_flags & NODE_FLAG_LEARNER == 0)
+                {
+                    last = Some(pos);
+                }
+                off += aligned;
+            }
+            true
+        })
+        .map_err(|e| ServiceError::Replay(e.to_string()))?;
+    Ok(last)
 }
 
 /// Replay archived journal blocks into `sm` (see [`Replay`] for the two
@@ -72,6 +165,7 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     cnc: &CncPage,
     journal_dir: &std::path::Path,
     restore: Option<&SnapshotRestore<S>>,
+    instant: ReplayInstant<'_, S>,
 ) -> Result<Replay, ServiceError> {
     let reader = TailReader::open(journal_dir).map_err(|e| ServiceError::Replay(e.to_string()))?;
     let mut guard = sm.lock().unwrap();
@@ -193,6 +287,16 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // re-read of purged or already-applied leading segments (the
     // O(journal)-per-overrun M5 carry).
 
+    // Ruling P10, PASS 1 — headers only, no apply, no decode: which
+    // `SNAPSHOT` frame in the span this pass is about to walk should be frozen
+    // at (see [`last_actionable_instant`] for why there is a pre-pass at all).
+    // Skipped entirely for a row that is not snapshot-capable.
+    let freeze_at = if instant.trigger.is_some() {
+        last_actionable_instant(&reader, start_pos, cnc, &instant)?
+    } else {
+        None
+    };
+
     reader
         .scan_from(start_pos, |_seq, base, payload| {
             // Re-read the live apply frontier PER BLOCK: both commit and durable
@@ -227,13 +331,19 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // Dispatch MESSAGE frames, and TIMER frames addressed to THIS
                 // row, that are not already reflected in the SM. PADDING /
                 // NEW_TERM / CONFIG (and any future type that is neither) are
-                // not user data. SNAPSHOT (type 7, coordinated-snapshot spec
-                // §5.2) falls through here DELIBERATELY: this is the journal
-                // walk that rebuilds a restarted service's state, and freezing
-                // an artifact for an instant the cluster passed long ago is
-                // meaningless work — the row's artifact for a live instant is
-                // built by the live apply loop, which is the only place that
-                // instant's `busy`/builder handoff exists. Leader-publish suppressed: apply only (see the
+                // not user data.
+                //
+                // SNAPSHOT (type 7) is ACTED ON — at the ONE position pass 1
+                // picked (Ruling P10). It replaces the pre-P10 rule, which
+                // ignored every instant here on the argument that "freezing at
+                // an instant the cluster passed long ago is meaningless work".
+                // It is not: the leader is still waiting on the NEWEST one, and
+                // ignoring it made a ring small enough to lap this row silently
+                // cost instants — a set that could never complete, at any
+                // timeout. Only the EARLIER instants in a span are meaningless,
+                // and pass 1 is what drops those.
+                //
+                // Leader-publish suppressed: apply only (see the
                 // doc), so the response bytes land in the throwaway scratch. A
                 // typed SM decodes inside its blanket `RawStateMachine` impl and
                 // fail-stops there on a committed, archived frame that will not
@@ -276,6 +386,16 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         },
                     );
                     let _ = ctx.take_sched_records();
+                } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT && Some(pos) == freeze_at {
+                    // Ruling P10 + P6: here, and only here — after every frame
+                    // below P has applied and before any frame at or above P
+                    // does, so the artifact is a function of the log strictly
+                    // below P: the same function the live loop computes, which
+                    // is what makes one instant's artifacts position-aligned
+                    // across rows. The decision (capability, standby, one build
+                    // in flight) is `on_snapshot_frame`'s, unchanged — this
+                    // path must not grow a second opinion about any of it.
+                    on_snapshot_frame(instant.trigger, &guard, pos, &hdr, instant.node_flags);
                 }
                 cursor = end;
                 off += aligned;

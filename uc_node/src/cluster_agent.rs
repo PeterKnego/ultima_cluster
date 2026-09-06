@@ -3,9 +3,10 @@
 
 //! The `uc2-cluster` agent (cluster-FSM spec §4.1): the cluster FSM's own
 //! apply loop, in-node, no cnc slot, outside the lag policy. It walks the
-//! node's `LogBuffer` with a `LogFollower`, acts on `CLUSTER` frames only
-//! (yielding everything else, `FRAME_TYPE_SNAPSHOT` included), and publishes
-//! [`ClusterView`] after every batch that applied something.
+//! node's `LogBuffer` with a `LogFollower`, APPLIES `CLUSTER` frames only
+//! (yielding everything else) and acts on `FRAME_TYPE_SNAPSHOT` frames
+//! without applying them, and publishes [`ClusterView`] after every batch
+//! that applied something.
 //!
 //! Coordinated-snapshot spec §5.2/§5.7: a `FRAME_TYPE_SNAPSHOT` frame is the
 //! cluster FSM's own freeze instant — the mirror image of what
@@ -19,6 +20,15 @@
 //! set (every row's `snapshot_pos == P` and this agent's own artifact at P)
 //! directly, so nothing needs to synthesize a cluster artifact after the
 //! fact.
+//!
+//! **Ruling P10**: an instant inside a JOURNAL CATCH-UP span counts too. When
+//! the live ring laps this agent it fast-forwards through the journal
+//! ([`ClusterAgent::replay_from_journal`], Ruling R18), and that walk now
+//! freezes at the LAST `SNAPSHOT` frame in the span — earlier ones are
+//! skipped, because single-in-flight means only the newest commanded instant
+//! can be the one the leader is still waiting on. Before P10 the catch-up
+//! ignored instants entirely, which made a ring small enough to lap this
+//! agent silently cost them.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -330,7 +340,7 @@ impl ClusterAgent {
                     // cursor afterwards, the next `next_batch` overruns and
                     // replays again, because the journal is always ahead of
                     // the buffer's base.
-                    if self.replay_from_journal(head) {
+                    if self.replay_from_journal(head, node_flags) {
                         applied_any = true;
                     }
                     break;
@@ -494,8 +504,13 @@ impl ClusterAgent {
     /// from the live buffer on the next cycle). Returns whether anything
     /// was applied. Panics only if the journal replay itself errors (an
     /// `ArchiveError`) — a fail-stop in the archive's own class.
-    fn replay_from_journal(&mut self, head: u64) -> bool {
+    fn replay_from_journal(&mut self, head: u64, node_flags: u64) -> bool {
         let from = self.follower.cursor;
+        // Ruling P10, pass 1 — HEADERS ONLY, no apply, no decode: which
+        // `SNAPSHOT` frame in the span this pass is about to walk should be
+        // frozen at. See [`Self::last_actionable_instant`] for why there is a
+        // pre-pass at all rather than an inline decision.
+        let freeze_at = self.last_actionable_instant(from, head, node_flags);
         let mut replay = match replay_journal_from(&self.journal, from) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -544,20 +559,40 @@ impl ClusterAgent {
                         break; // never apply an uncommitted frame
                     }
                     cursor = end;
-                    // `FRAME_TYPE_SNAPSHOT` (type 7) is deliberately NOT acted
-                    // on here, unlike in the live-buffer walk above. Reaching
-                    // this replay means this node's own ring lapped its
-                    // cursor and it is now fast-forwarding through the
-                    // journal to catch up to `head`; freezing at some
-                    // SNAPSHOT frame buried inside that catch-up span is
-                    // meaningless — by the time the replay finishes this
-                    // agent is already past it, so the artifact would tag a
-                    // stale instant nothing is still asking for. If this
-                    // node's set for that instant is left incomplete because
-                    // of it, that is spec §10's documented outcome (an
-                    // incomplete instant is simply abandoned) and no worse
-                    // than any other overrun window; the next instant, live,
-                    // is what this node actually freezes at.
+                    // Ruling P10, pass 2: the ONE instant pass 1 picked, acted
+                    // on exactly where it sits in the span — after every frame
+                    // below P has applied and before any frame at or above P
+                    // does (P6: P is an EXCLUSIVE frontier, so the artifact is
+                    // a function of the log strictly below it, the same
+                    // function the live walk computes).
+                    //
+                    // This arm REPLACES the pre-P10 rule, which ignored every
+                    // `SNAPSHOT` frame here on the argument that "freezing at
+                    // an instant the replay is already past is meaningless".
+                    // It is not: the leader is still waiting on the newest
+                    // one, and ignoring it made a ring small enough to lap
+                    // this agent silently cost instants — a set that could
+                    // never complete, at any timeout, which is exactly the
+                    // stall `uc_node/tests/learner.rs` reproduced 1-in-20.
+                    // Only the EARLIER instants in a span are meaningless, and
+                    // pass 1 is what drops those.
+                    if Some(rf.position) == freeze_at {
+                        // Ruling P2's order, as on the live path.
+                        self.fsm.set_consumed(end);
+                        if let Err(e) = Self::freeze_and_write(
+                            &mut self.fsm,
+                            &self.snapshot_dir,
+                            &mut self.snapshot_pos,
+                            &self.cluster_snapshot_pos,
+                        ) {
+                            crate::obs_event!(
+                                Warn,
+                                "cluster_snapshot_failed",
+                                err = e.to_string().as_str()
+                            );
+                        }
+                        applied_any = true;
+                    }
                     if rf.header.frame_type == FRAME_TYPE_CLUSTER {
                         let mut ctx = ApplyCtx::new(end, ClusterFsm::IDENTITY)
                             .with_time(rf.header.time_ns)
@@ -583,6 +618,50 @@ impl ClusterAgent {
             frames = frames
         );
         applied_any
+    }
+
+    /// Ruling P10, pass 1: the START position of the LAST `SNAPSHOT` frame in
+    /// `[from, head]` that this agent should freeze at, or `None`.
+    ///
+    /// **Why a pre-pass and not an inline decision.** "Act on the last one"
+    /// cannot be decided while walking: the freeze has to happen BEFORE any
+    /// frame at or above P is applied (P6), and whether a given instant is the
+    /// last one is only known once the span has been read to its end. Freezing
+    /// at each in turn and keeping the newest would pay `freeze()` — O(state)
+    /// — once per instant and write an artifact per instant; deciding first
+    /// costs one extra journal walk that reads HEADERS ONLY, applies nothing
+    /// and decodes nothing, which is cheap beside the apply pass it precedes.
+    /// This whole path is the overrun path — already the slow one — and it is
+    /// never on the live walk.
+    ///
+    /// The same two declines the live arm makes, for the same reasons:
+    /// a standby instant on a node that is not a learner (spec §5.7), and an
+    /// instant at or below the artifact this agent already holds (re-freezing
+    /// it would rewrite the same file on every overrun). There is no
+    /// capability rule here — the cluster row is always snapshot-capable.
+    ///
+    /// A journal that has been purged below `from` yields `None`, and pass 2
+    /// then reports the gap by its own name.
+    fn last_actionable_instant(&self, from: u64, head: u64, node_flags: u64) -> Option<u64> {
+        let mut replay = replay_journal_from(&self.journal, from).ok()??;
+        let mut last = None;
+        // A decode error is pass 2's to fail-stop on, with the position it
+        // actually reached; this pass just stops looking (`while let Ok(Some)`
+        // covers both `Ok(None)` and `Err`).
+        while let Ok(Some(rf)) = replay.next() {
+            let end = rf.position + align_frame_len(rf.header.length as usize) as u64;
+            if end > head {
+                break;
+            }
+            if rf.header.frame_type == FRAME_TYPE_SNAPSHOT
+                && end > self.snapshot_pos
+                && !(rf.header.flags & FLAG_SNAPSHOT_STANDBY != 0
+                    && node_flags & NODE_FLAG_LEARNER == 0)
+            {
+                last = Some(rf.position);
+            }
+        }
+        last
     }
 
     /// Freeze at the current applied position and write
@@ -1159,6 +1238,154 @@ mod tests {
             agent.applied() < head,
             "and it is strictly below the head, which is the whole point"
         );
+    }
+
+    /// Ruling P10: a REPLAYED span acts on its last `SNAPSHOT` frame.
+    ///
+    /// Before P10 this agent ignored every instant inside a journal catch-up,
+    /// so a ring small enough to lap it silently cost instants: the frame was
+    /// consumed, the cursor moved past it, and no artifact was ever written at
+    /// that P — a set that could never complete, at any timeout. (Reproduced
+    /// 1-in-20 in `uc_node/tests/learner.rs` before this fix.)
+    ///
+    /// Exactly ONE artifact, at the LAST instant in the span. The earlier ones
+    /// are skipped deliberately: single-in-flight means only the newest
+    /// commanded instant can be the one the leader is still waiting on, and
+    /// writing an artifact per instant in a long catch-up would be O(span) I/O
+    /// for sets nobody can complete any more.
+    #[test]
+    fn a_replayed_span_freezes_at_its_last_snapshot_frame_and_only_that_one() {
+        let (buffer, cnc, dir) = world();
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        // A command, an instant, another command, a second instant, and a
+        // trailing command ABOVE it — so a freeze at P2 that leaked the
+        // trailing command would be visible in the artifact (P6: P is an
+        // EXCLUSIVE frontier).
+        let _ = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(7))
+            .unwrap();
+        let (p1, _) = app.append_snapshot(1, 0).unwrap();
+        let _ = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(9))
+            .unwrap();
+        let (p2, _) = app.append_snapshot(1, 0).unwrap();
+        let e_last = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(11))
+            .unwrap();
+        while archive.do_work(&buffer).unwrap() {}
+        let journal = archive.journal_arc();
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            Arc::clone(&view),
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            journal,
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let head = stage_overrun(&buffer, &cnc);
+        assert!(head > e_last);
+
+        assert!(agent.do_work(), "the span is replayed");
+        assert_eq!(
+            agent.snapshot_pos(),
+            p2,
+            "the LAST instant in the span is the one frozen at"
+        );
+        let dir_names = {
+            let mut v: Vec<String> = std::fs::read_dir(dir.path().join("snapshots/cluster"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            dir_names,
+            vec![format!("snap-{p2}.ultcluster")],
+            "exactly one artifact — not one per instant in the span"
+        );
+
+        // P6: the artifact holds the command BELOW P2 and not the one above.
+        let (fsm2, at) = recover(
+            &dir.path().join("snapshots/cluster"),
+            genesis_state(),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(at, p2);
+        assert_eq!(
+            fsm2.state().settings.snapshot_interval_bytes,
+            9,
+            "the frame below P2 applied; the one above it did NOT leak in"
+        );
+        // ...and the walk still finished the span.
+        assert_eq!(agent.applied(), e_last);
+        assert_eq!(
+            view.snapshot_interval_bytes.load(Ordering::Acquire),
+            11,
+            "the trailing command applied after the freeze"
+        );
+        assert!(p1 < p2);
+    }
+
+    /// Ruling P10's guard: a replayed span whose only instant is at or BELOW
+    /// the artifact this agent already holds writes nothing. Without it, a
+    /// node that installed a set at P and then replayed the span containing
+    /// P's own frame would rewrite the same artifact on every overrun.
+    #[test]
+    fn a_replayed_instant_at_or_below_the_held_artifact_is_not_refrozen() {
+        let (buffer, cnc, dir) = world();
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let _ = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(7))
+            .unwrap();
+        let (p1, _) = app.append_snapshot(1, 0).unwrap();
+        let e2 = app
+            .append_cluster(1, ClusterKind::Settings, &settings_cmd(9))
+            .unwrap();
+        while archive.do_work(&buffer).unwrap() {}
+        let journal = archive.journal_arc();
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            journal,
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        // Stand in for "this agent already holds the artifact at p1".
+        agent.snapshot_pos = p1;
+        let head = stage_overrun(&buffer, &cnc);
+        assert!(head > e2);
+
+        agent.do_work();
+        assert_eq!(agent.snapshot_pos(), p1, "unchanged");
+        assert!(
+            std::fs::read_dir(dir.path().join("snapshots/cluster"))
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(true),
+            "no artifact written for an instant already held"
+        );
+        assert_eq!(agent.applied(), e2, "the span still walked to its end");
     }
 
     /// Ruling R12: a live overrun — the ring simply outran this agent, with
