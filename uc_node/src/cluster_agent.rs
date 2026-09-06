@@ -24,6 +24,15 @@ use uc_service::{ApplyCtx, RawStateMachine, SnapshotStateMachine};
 
 use crate::cluster_fsm::{ClusterFsm, ClusterState, ClusterView};
 
+/// How many cluster artifacts survive a [`ClusterAgent::take_snapshot`] —
+/// the newest N by position. **2, the same number every user row keeps**
+/// (`uc_service::snapshots`'s `retain_newest(2)`), and for the same reason: a
+/// joiner's snapshot session may still be streaming the previous artifact
+/// when the next one is written, and a corrupt newest artifact fail-stops
+/// `recover`, so the second is what an operator removes the first to fall
+/// back to (see the runbook's `cluster_artifact_corrupt` entry).
+pub const CLUSTER_ARTIFACTS_KEPT: usize = 2;
+
 pub fn artifact_path(dir: &Path, position: u64) -> PathBuf {
     dir.join(format!("snap-{position}.ultcluster"))
 }
@@ -579,7 +588,64 @@ impl ClusterAgent {
         }
         self.snapshot_pos = pos;
         self.cluster_snapshot_pos.store(pos, Ordering::Release);
+        self.retain_newest(CLUSTER_ARTIFACTS_KEPT);
         Ok(pos)
+    }
+
+    /// Unlink every complete artifact except the `keep` newest by position —
+    /// the cluster family's copy of `uc_service::snapshots`'s
+    /// `retain_newest`, which every user row has run after every publish
+    /// since M6.
+    ///
+    /// It has to exist here too: the bridging trigger fires once per user-row
+    /// snapshot interval, for the life of the cluster, so without a sweep the
+    /// file count, the inodes, and every `read_dir` over the directory (boot
+    /// [`recover`], and `uc2ctl schedule show`/`settings show`/`status`,
+    /// which all recover to read the newest artifact) grow without bound on
+    /// exactly the snapshotting clusters this feature serves.
+    ///
+    /// BEST EFFORT, and deliberately never fails the snapshot: the artifact
+    /// is already renamed and fsynced by the time this runs, so a failed
+    /// sweep leaves a correct — merely untidy — directory, and turning that
+    /// into an `Err` would make the caller log `cluster_snapshot_failed` for
+    /// a snapshot that succeeded. A `NotFound` is not even worth a line (an
+    /// operator clearing the directory by hand races this); anything else is
+    /// latched-free but rare enough that one Warn per occurrence is right.
+    ///
+    /// The directory entry removals are not fsynced. A crash can leave a
+    /// deleted file back on the next boot, which [`recover`] handles the same
+    /// way it handles any older artifact: it picks the newest and ignores the
+    /// rest.
+    fn retain_newest(&self, keep: usize) {
+        let Ok(rd) = fs::read_dir(&self.snapshot_dir) else {
+            return;
+        };
+        let mut all: Vec<(u64, PathBuf)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name();
+                let pos = name
+                    .to_str()?
+                    .strip_prefix("snap-")?
+                    .strip_suffix(".ultcluster")?
+                    .parse::<u64>()
+                    .ok()?;
+                Some((pos, e.path()))
+            })
+            .collect();
+        all.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
+        for (_, path) in all.into_iter().skip(keep) {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => crate::obs_event!(
+                    Warn,
+                    "cluster_snapshot_prune_failed",
+                    path = path.display().to_string().as_str(),
+                    err = e.to_string().as_str()
+                ),
+            }
+        }
     }
 }
 
@@ -905,6 +971,68 @@ mod tests {
         .unwrap();
         assert_eq!(start2, e1, "recovery resumes at the artifact's position");
         assert_eq!(fsm2.state().settings.snapshot_interval_bytes, 7);
+    }
+
+    /// I2: the cluster family is PRUNED, mirroring `uc_service`'s rows
+    /// (`snapshots.rs`'s `retain_newest(2)` after every publish). The
+    /// bridging trigger fires once per user-row snapshot interval for the
+    /// life of the cluster, so without a sweep the directory, its inodes and
+    /// every `read_dir` over it (boot `recover`, and every `uc2ctl schedule
+    /// show` / `settings show` / `status`) grow without bound.
+    ///
+    /// Keep 2 rather than 1 for the rows' own reason: a joiner's session may
+    /// still be streaming the previous artifact.
+    #[test]
+    fn take_snapshot_keeps_only_the_newest_two_artifacts() {
+        let (buffer, cnc, dir) = world();
+        let snap_dir = dir.path().join("snapshots/cluster");
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            snap_dir.clone(),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let mut positions = Vec::new();
+        for i in 1..=3u64 {
+            let e = app
+                .append_cluster(1, ClusterKind::Settings, &settings_cmd(i))
+                .unwrap();
+            cnc.counters().durable.store_release(e);
+            cnc.counters().commit.store_release(e);
+            agent.do_work();
+            positions.push(agent.take_snapshot().unwrap());
+        }
+        let mut on_disk: Vec<u64> = std::fs::read_dir(&snap_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.strip_prefix("snap-")?
+                    .strip_suffix(".ultcluster")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .collect();
+        on_disk.sort_unstable();
+        assert_eq!(
+            on_disk,
+            positions[1..],
+            "three snapshots leave exactly the newest two"
+        );
+        // And the survivors are whole: recovery still resumes at the newest.
+        let (_, start2) = recover(&snap_dir, genesis_state(), vec![]).unwrap();
+        assert_eq!(start2, positions[2]);
     }
 
     #[test]
