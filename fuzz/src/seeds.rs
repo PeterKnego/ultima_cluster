@@ -202,6 +202,19 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("15-snap-begin-cluster", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
+    // Coordinated-snapshot plan 2 (spec §5.7): a voter's pull request to a
+    // learner, and the leader's redirect to one.
+    let mut b = [0u8; SNAP_REQUEST_BODY_LEN];
+    write_snap_request_body(&mut b, &SnapRequestBody { session: 7, position: 8192 });
+    seeds.push(Seed::fixed("19-snap-request", datagram(DGRAM_KIND_SNAP_REQUEST, 0, 3, &b)));
+
+    let mut b = [0u8; SNAP_REDIRECT_BODY_LEN];
+    write_snap_redirect_body(
+        &mut b,
+        &SnapRedirectBody { session: 7, learner_id: 3, position: 8192 },
+    );
+    seeds.push(Seed::fixed("20-snap-redirect", datagram(DGRAM_KIND_SNAP_REDIRECT, 0, 3, &b)));
+
     seeds
 }
 

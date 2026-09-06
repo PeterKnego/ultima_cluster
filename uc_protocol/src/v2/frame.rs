@@ -52,6 +52,18 @@ pub const FLAG_TIMER_TABLE: u8 = 0x01;
 /// Retired before it shipped (was `SCHEDULE_TABLE`, plan 2). Reserved so the
 /// number is never reassigned to something a pre-release build might misread.
 pub const FRAME_TYPE_SCHEDULE_TABLE_RETIRED: u8 = 6;
+/// Coordinated snapshot instant (cluster-FSM + coordinated-snapshot spec
+/// §5.1): an empty-body frame the leader appends through the same path as
+/// any leader frame. Its frame-end position is the instant **P**; every
+/// declared row and the cluster FSM freeze at P, subject to the standby flag
+/// (§5.7). `client_id`/`seq` are 0; `flags` carries [`FLAG_SNAPSHOT_STANDBY`].
+pub const FRAME_TYPE_SNAPSHOT: u8 = 7;
+/// `flags` bit 0 on a SNAPSHOT frame (spec §5.7): the same header byte
+/// [`FLAG_TIMER_TABLE`] rides in — the frame TYPE disambiguates, so the
+/// overlapping bit value is fine. Set: only rows with
+/// `NODE_FLAG_LEARNER` set act on the instant (voters skip it, paying no
+/// freeze). Clear: every declared row and the cluster FSM freeze.
+pub const FLAG_SNAPSHOT_STANDBY: u8 = 0x01;
 /// `kind ‖ reserved` — the fixed prefix of every `CLUSTER` body.
 pub const CLUSTER_BODY_PREFIX_LEN: usize = 8;
 
@@ -267,6 +279,19 @@ mod tests {
         assert_eq!(FRAME_TYPE_TIMER, 5);
         assert_eq!(FLAG_TIMER_TABLE, 0x01);
         assert_eq!(FRAME_TYPE_SCHEDULE_TABLE_RETIRED, 6);
+        assert_eq!(FRAME_TYPE_SNAPSHOT, 7);
+    }
+
+    /// FROZEN (spec §5.1, §5.7): the SNAPSHOT frame type and standby flag.
+    #[test]
+    fn snapshot_frame_type_and_standby_flag_are_frozen() {
+        assert_eq!(FRAME_TYPE_SNAPSHOT, 7);
+        assert_eq!(FLAG_SNAPSHOT_STANDBY, 0x01);
+        assert_ne!(
+            FLAG_SNAPSHOT_STANDBY & FLAG_TIMER_TABLE,
+            0,
+            "same header byte, and the same bit is fine: the frame TYPE disambiguates"
+        );
     }
 
     /// FROZEN: the 24-byte TIMER body (spec §4.2).
