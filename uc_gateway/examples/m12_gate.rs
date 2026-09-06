@@ -624,6 +624,12 @@ const DEFAULT_ADMISSION_BYTES: u64 = 256 * 1024;
 const FLEET_BUFFER_BYTES: usize = 256 << 20;
 const ELECTION_TIMEOUT_MIN_NS: u64 = 150_000_000;
 const ELECTION_TIMEOUT_MAX_NS: u64 = 300_000_000;
+/// M14d row f: the cluster's snapshot CADENCE (coordinated-snapshot spec
+/// §5.5/§6) when `--purge-below-snapshot` is set — 32 KiB, `m6_gate`'s and
+/// `m9_gate`'s number. Seeded into the replicated settings record at genesis,
+/// because the per-service byte cadence that used to drive this arm is
+/// deleted (spec §5.2) and without instants the purge floor never moves.
+const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
 
 /// A distinct, index-derived election seed per node so a clean boot elects
 /// exactly one leader (m5_gate / lincheck_v2 precedent).
@@ -643,6 +649,7 @@ fn node_config(
     services: ServicesConfig,
     purge: uc_node::PurgePolicy,
     journal_segment_bytes: u64,
+    snapshot_interval_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -653,7 +660,14 @@ fn node_config(
         buffer_bytes,
         max_payload: NODE_MAX_PAYLOAD,
         admission_bytes_default: admission_bytes,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Coordinated-snapshot spec §5.5/§6: the snapshot CADENCE is a
+        // replicated setting, seeded at genesis. Row f's purge arm needs
+        // instants to happen at all — the per-service byte cadence that used
+        // to produce them is deleted (spec §5.2).
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            snapshot_interval_bytes,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         election_timeout_min_ns: ELECTION_TIMEOUT_MIN_NS,
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),
@@ -730,6 +744,7 @@ where
             ServicesConfig::single(S::NAME),
             uc_node::PurgePolicy::Disabled,
             uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            0, // purge off in the local smoke: no cadence either
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id), make_sm())
@@ -788,6 +803,7 @@ fn boot_cluster2(
             services,
             uc_node::PurgePolicy::Disabled,
             uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            0, // purge off in the local smoke: no cadence either
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let a = ServiceBuilder::new(
@@ -1724,6 +1740,13 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         services,
         purge,
         a.journal_segment_bytes,
+        // The cadence pairs with purge: without instants the floor never
+        // moves and row f's late joiner is never below it.
+        if a.purge_below_snapshot {
+            SNAPSHOT_INTERVAL_BYTES
+        } else {
+            0
+        },
     );
     let node = Node::start(cfg)?;
     println!(
@@ -1828,10 +1851,12 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         !(matches!(kind, FsmKind::Raw) && a.snapshot_interval_bytes > 0),
         "--fsm raw and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
     );
-    // TODO(plan 2 task 5): command an instant. `--snapshot-interval-bytes` now
-    // only selects `start_with_snapshots()` below; the cadence it used to
-    // configure lives in the replicated settings record and reaches this arm
-    // as a `SNAPSHOT` frame, so row f ships no artifact until Task 5 lands.
+    // `--snapshot-interval-bytes` now only selects `start_with_snapshots()`
+    // below, i.e. snapshot-CAPABLE (coordinated-snapshot spec §5.2's cnc
+    // status bit). The cadence it used to configure lives in the replicated
+    // settings record — the node role seeds it from
+    // [`SNAPSHOT_INTERVAL_BYTES`] whenever `--purge-below-snapshot` is set —
+    // and reaches this row as a `SNAPSHOT` frame.
     let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
     let envelope = a.envelope == Envelope::On;
     let snapshots = a.snapshot_interval_bytes > 0;

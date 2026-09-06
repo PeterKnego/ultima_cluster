@@ -71,6 +71,23 @@ fn open_cnc(dir: &Path, app: &str) -> Arc<CncPage> {
     CncPage::open_file(&dir.join("cnc2.dat"), app).expect("open cnc2.dat")
 }
 
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command a
+/// coordinated instant and return its position **P**, polling through the
+/// `retry` window a leader legitimately answers while it has the role but not
+/// yet an appender. Duplicated per test binary, like `wait_until`.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
+}
+
 /// Submit `n` 64-byte payloads (retrying through admission backpressure), then
 /// wait until the log is quiescent (`append == commit == durable`, stable across
 /// two reads) so `durable` is a settled byte position we can slice.
@@ -137,30 +154,30 @@ fn marker_persists_and_purge_advances_only_below_it() {
 
     let cnc = open_cnc(dir, app);
 
-    // No service snapshot published yet -> the floor is 0 and purge never fires,
-    // no matter how much log exists (purge is gated on the marker).
+    // No instant commanded yet -> no complete SET, so the floor is 0 and purge
+    // never fires, no matter how much log exists (coordinated-snapshot spec
+    // §5.3: purge is gated on the set, and a cluster nobody asks to snapshot
+    // is legitimate — purge is off by default).
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         node.archive_first_base(),
         0,
-        "purge must stay gated on the marker"
+        "purge must stay gated on a complete set"
     );
     assert_eq!(
         cnc.snapshots().node_snapshot_floor.load_acquire(),
         0,
-        "no floor persisted without a marker"
+        "no floor persisted without a set"
     );
 
-    // The service publishes a snapshot at an applied position. Pick a byte
-    // position well into the journal (below the active segment) so purging below
-    // it drops whole segment files. `s <= durable` by construction.
-    let durable = cnc.counters().durable.load_acquire();
-    let s = durable / 2;
+    // Command one (spec §5.5). This node declares NO services, so the set at
+    // P is the `uc2-cluster` agent's artifact alone; P is well into the
+    // journal (6000 submits above), so purging below it drops whole segments.
+    let s = command_instant(&node);
     assert!(
         s > SEG_BYTES,
-        "test setup: need >1 segment below the marker"
+        "test setup: need >1 segment below the instant"
     );
-    cnc.snapshots().service_snapshot_pos.store_release(s);
 
     // The node validates (`<= durable`), durably persists the floor, mirrors it,
     // and commands the purge.
@@ -195,12 +212,19 @@ fn marker_persists_and_purge_advances_only_below_it() {
     node.stop();
 }
 
-/// A `service_snapshot_pos` ahead of this node's durable frontier is a torn/racy
-/// read (or a snapshot at a not-yet-durable position). It must NEVER become the
-/// floor — a purge floor is only ever a position whose covering block is durable
-/// here.
+/// Coordinated-snapshot spec §5.3: the page-1 `service_snapshot_pos` word is
+/// **observability only** — whatever it says, it never becomes the purge
+/// floor. Before this work it WAS the floor input, and a torn or racy value
+/// above the durable frontier was refused by a `<= durable` belt; now the only
+/// thing that moves the floor is a complete SET (every declared row's artifact
+/// at P plus the cluster FSM's), which is why this test writes an absurd value
+/// and asserts nothing at all happens.
+///
+/// The `<= durable` belt still guards the set's own position
+/// (`maybe_persist_snapshot_floor`) and is pinned in `node.rs`'s unit tests,
+/// where a set position can be constructed directly.
 #[test]
-fn snapshot_pos_above_durable_is_never_persisted() {
+fn a_poked_service_snapshot_pos_never_becomes_the_floor() {
     let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let dir = root.path();
     let app = "purge2";
@@ -226,7 +250,7 @@ fn snapshot_pos_above_durable_is_never_persisted() {
     assert_eq!(
         cnc.snapshots().node_snapshot_floor.load_acquire(),
         0,
-        "a value above durable is ignored — never persisted, never mirrored"
+        "the page-1 word is not a floor input — never persisted, never mirrored"
     );
     assert_eq!(node.archive_first_base(), 0, "and nothing is purged");
     node.stop();

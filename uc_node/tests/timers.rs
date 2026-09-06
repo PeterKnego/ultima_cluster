@@ -1330,14 +1330,32 @@ fn capstone_config(
 /// move on its own (a real service publishing real artifacts), because that is
 /// what puts the joiner below it.
 fn start_snapshot_service(dir: &Path) -> Service<Timed<ClockSm>> {
-    // TODO(plan 2 task 5): command an instant — the byte cadence is deleted
-    // (coordinated-snapshot spec §5.2), so this service is capable but builds
-    // nothing until the leader commands an instant, and the floor the capstone
-    // needs never moves.
+    // The byte cadence is deleted (coordinated-snapshot spec §5.2): this row
+    // is snapshot-CAPABLE (the bit `start_with_snapshots` sets) but builds
+    // nothing until the leader commands an instant. `command_instant` below
+    // is what moves the floor the capstone needs.
     let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, Timed::new(ClockSm::default()))
         .start_with_snapshots()
         .expect("service start")
+}
+
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command a
+/// coordinated instant and return its position **P**, polling through the
+/// `retry` window a leader legitimately answers while it has the role but not
+/// yet an appender, or while a previous instant is still in flight.
+/// Duplicated per test binary, like `admin_request_ok` below.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
 }
 
 /// `reconfig.rs::admin_request_ok`, duplicated because each integration test
@@ -1441,7 +1459,6 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// timing-sensitivity flake, not a schedule-table defect; re-run to confirm
 /// before suspecting the chain under test.
 #[test]
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     let _g = serialize();
     let dir = tempdir();
@@ -1537,6 +1554,16 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
             t.wait().expect("answered");
         }
         c.shutdown();
+    }
+    // ---- command the instant that moves the floor (spec §5.5). The byte
+    // ---- cadence is gone, so nothing snapshots until asked; both voters
+    // ---- freeze at the same P and each completes its own set.
+    let instant = command_instant(nodes[leader].node.as_ref().unwrap());
+    for h in &nodes {
+        let node = h.node.as_ref().unwrap();
+        wait_until("every voter completed the set at the instant", || {
+            node.snapshot_set_position() >= instant
+        });
     }
     wait_until(
         "the leader purged the prefix holding the table frame",

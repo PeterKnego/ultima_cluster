@@ -233,8 +233,12 @@ pub enum FsmSet {
 pub struct ClusterCfg {
     pub purge: uc_node::PurgePolicy,
     pub journal_segment_bytes: u64,
-    /// `> 0` → services start via `start_with_snapshots` with this cadence; `0` →
-    /// plain `start` (no snapshot builder), the M5 default.
+    /// `> 0` → services start via `start_with_snapshots`, i.e. snapshot-CAPABLE
+    /// (coordinated-snapshot spec §5.2's cnc status bit); `0` → plain `start`
+    /// (no snapshot builder), the M5 default. The number itself no longer
+    /// configures anything: the byte cadence is deleted, and artifacts appear
+    /// only at instants a capstone commands
+    /// ([`LinClusterV2::command_instant`]).
     pub snapshot_interval_bytes: u64,
     /// M7 Task 10: reserve an extra (not-yet-a-member) address for
     /// [`LinClusterV2::random_config_op`] to cycle a "spare" node through
@@ -387,11 +391,11 @@ fn spawn_service<SM: SnapshotStateMachine + Default>(
             .expect("service start")
     } else {
         // M6 Task 10: snapshot-capable service, so the node can advance its
-        // purge floor and below-floor reconstruction goes via install.
-        // TODO(plan 2 task 5): command an instant. The byte cadence is gone
-        // (coordinated-snapshot spec §5.2); `snapshot_interval_bytes > 0` now
-        // only means "capable", so no artifact is built until the leader
-        // commands one.
+        // purge floor and below-floor reconstruction goes via install. The
+        // byte cadence is gone (coordinated-snapshot spec §5.2), so
+        // `snapshot_interval_bytes > 0` now means CAPABLE and nothing more:
+        // artifacts appear at the instants a capstone's churn commands
+        // through [`LinClusterV2::command_instant`].
         ServiceBuilder::new(cfg, SM::default())
             .start_with_snapshots()
             .expect("snapshot service start")
@@ -438,7 +442,7 @@ fn spawn_service_timer(
             .start()
             .expect("timer service start")
     } else {
-        // TODO(plan 2 task 5): command an instant (as above).
+        // Capable, never self-triggering — see `spawn_service` above.
         ServiceBuilder::new(cfg, Timed::new(TimerSm::default()))
             .start_with_snapshots()
             .expect("timer snapshot service start")
@@ -705,6 +709,26 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
             .filter_map(|s| s.node.as_ref().map(|n| n.archive_first_base()))
             .max()
             .unwrap_or(0)
+    }
+
+    /// Coordinated-snapshot spec §5.5: command one instant on whichever node
+    /// is currently the serving leader — `uc2ctl snapshot`, in process.
+    /// Returns its position **P**, or `None` when there is no serving leader
+    /// right now or the leader answered `retry` (an instant is in flight, or
+    /// its appender is not open yet).
+    ///
+    /// **Best-effort on purpose.** Every caller is churn: a capstone drives
+    /// this from a fault loop that is also killing leaders, so "no leader this
+    /// instant" is the normal case and not a failure. A NAMED refusal (48/49)
+    /// still panics — that one means the cluster can never snapshot, which is
+    /// a test-setup bug, not churn.
+    pub fn command_instant(&self) -> Option<u64> {
+        let li = self.leader()?;
+        match self.nodes[li].node.as_ref()?.command_snapshot(false) {
+            Ok(p) => Some(p),
+            Err(uc_node::SnapshotRefusal::Retry) => None,
+            Err(e) => panic!("uc2ctl snapshot refused on node {li}: {e}"),
+        }
     }
 
     /// Index of the current serving leader, or `None` in a transient window

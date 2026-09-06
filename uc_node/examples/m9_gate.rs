@@ -42,6 +42,13 @@ const APP: &str = "m9-gate";
 const BUFFER_BYTES: usize = 1 << 22;
 const MAX_PAYLOAD: usize = 256;
 const SEGMENT_BYTES: u64 = 16 * 1024;
+/// The cluster's snapshot CADENCE (coordinated-snapshot spec §5.5/§6): the
+/// leader commands an instant every this many bytes of appended log. Written
+/// into each node's `[settings]` block (`write_config`), which SEEDS the
+/// replicated settings record at genesis. The per-service byte cadence M6
+/// used is deleted (spec §5.2); this is its cluster-wide replacement, and it
+/// is what makes row 2's anti-vacuity check ("some node actually built a
+/// snapshot") satisfiable.
 const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
 const PURGE_SLACK_BYTES: u64 = 0;
 
@@ -219,9 +226,11 @@ impl SnapshotStateMachine for RegSm {
 // --------------------------------------------------------- fleet roles
 
 fn spawn_service(dir: &Path, app_id: &str, _snapshot_interval_bytes: u64) -> Service<RegSm> {
-    // TODO(plan 2 task 5): command an instant — the byte cadence is gone
-    // (coordinated-snapshot spec §5.2); the row is capable and builds only
-    // when the leader commands.
+    // Snapshot-CAPABLE only (coordinated-snapshot spec §5.2's cnc status
+    // bit): the byte cadence is gone, and the row builds at the instants the
+    // leader commands from the replicated `[settings]` cadence this gate
+    // seeds in `write_config`. The parameter is kept so the CLI surface is
+    // unchanged for the fleet driver.
     let cfg = ServiceConfig::new(dir, app_id);
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
@@ -480,7 +489,8 @@ fn write_config(
         "id = {id}\nbind = \"{addr}\"\ninstance_dir = \"{}\"\napp_id = \"{APP}\"\n\
          buffer_bytes = {BUFFER_BYTES}\nmax_payload = {MAX_PAYLOAD}\n\
          journal_segment_bytes = {SEGMENT_BYTES}\n\n\
-         [purge]\nbelow_snapshot_slack_bytes = {PURGE_SLACK_BYTES}\n\n",
+         [purge]\nbelow_snapshot_slack_bytes = {PURGE_SLACK_BYTES}\n\n\
+         [settings]\nsnapshot_interval_bytes = {SNAPSHOT_INTERVAL_BYTES}\n\n",
         dir.display()
     );
     for (mid, maddr) in members {

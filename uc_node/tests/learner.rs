@@ -31,7 +31,10 @@ use uc_net::fault::FaultConfig;
 use uc_net::receiver::RefusalKind;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::identity::{FsmName, pack_version};
-use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
+use uc_protocol::v2::cnc::{
+    ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER,
+    CNC_SVC_STATUS_SNAPSHOT_CAPABLE,
+};
 use uc_protocol::v2::schedule::{
     ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
@@ -42,6 +45,70 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn serialize() -> MutexGuard<'static, ()> {
     TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command a
+/// coordinated instant and return its position **P**, polling through the
+/// `retry` window a leader legitimately answers while it has the role but not
+/// yet an appender. Duplicated per test binary, like `serialize`.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
+}
+
+/// Command an instant on a fixture whose rows have NO real service, and fake
+/// what the service would have done: the snapshot-capability bit before the
+/// command (spec §5.5 refuses `48` without it) and each row's artifact +
+/// `snapshot_pos` after it. Returns **P**.
+///
+/// `uc_node` never parses a row's artifact, so a blob of the right NAME at
+/// the right position is a complete row as far as the node and the snapshot
+/// session are concerned — the same stand-in `purge_safety.rs` uses. What
+/// cannot be faked is the CLUSTER artifact: the `uc2-cluster` agent writes it,
+/// at the instant, which is exactly why the floor now needs a real command
+/// rather than a poked cnc word.
+///
+/// Call it in the MIDDLE of the fixture's traffic, not after it: P is the
+/// frame end of the frame this appends, so everything submitted afterwards is
+/// the retained `[P, append)` tail a below-floor joiner must replay once it
+/// has installed the set. That tail is the property the old hand-picked
+/// `durable / 2` floor provided.
+fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]) -> u64 {
+    for &row in rows {
+        let slot = cnc.service_slot(row as usize);
+        slot.status
+            .store_release(slot.status.load_acquire() | CNC_SVC_STATUS_SNAPSHOT_CAPABLE);
+    }
+    let p = command_instant(node);
+    for &row in rows {
+        let snap_dir = v_dir.join("snapshots").join(row.to_string());
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(
+            snap_dir.join(format!("snap-{p}.ultsnap")),
+            vec![0x5Au8; 4096],
+        )
+        .unwrap();
+        cnc.service_slot(row as usize).snapshot_pos.store_release(p);
+    }
+    // Observability only since spec §5.3, but `uc2ctl status` and the backup
+    // report read it — keep it truthful.
+    cnc.snapshots().service_snapshot_pos.store_release(p);
+    // 60 s, not 30: the `uc2-cluster` agent has to WALK to P before it can
+    // freeze, and its walk is paced by `min(commit, durable)` behind whatever
+    // traffic this fixture is pushing. Measured flaking at 30 s on a loaded
+    // box while the rest of this file's cluster tests ran alongside.
+    await_until(60, "the set at the instant completed", || {
+        node.snapshot_set_position() >= p
+    });
+    p
 }
 
 /// Wire 0.7.0 (Ruling 1): `snapshot_set_for` now declines outright for a
@@ -418,7 +485,6 @@ fn learner_replicates_live_and_never_disturbs_quorum() {
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     let _g = serialize();
     let dir = tempfile::Builder::new()
@@ -533,16 +599,15 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     // from `durable` for the duration of the raw submit loop below.
     let (mirror_stop, mirror_handle) = spawn_applied_mirror(std::sync::Arc::clone(&cnc), 0);
 
-    for i in 0u64..24000 {
-        let mut p = vec![0u8; PAYLOAD];
-        p[..8].copy_from_slice(&i.to_le_bytes());
-        loop {
-            match voter.submit(p.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
-    }
+    // The instant goes in the MIDDLE of the traffic (coordinated-snapshot spec
+    // §5.5), inside the mirror's window: half the log below P becomes the
+    // purged prefix, half above it the tail the joiner replays after
+    // installing the set. That is exactly the shape the old hand-picked
+    // `durable / 2` floor had — the difference is that P is now a real
+    // `SNAPSHOT` frame's end, and the cluster artifact at it is real too.
+    submit_frames(&voter, 12000);
+    let floor = instant_with_faked_rows(&voter, &v_dir, &cnc, &[0]);
+    submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -551,31 +616,10 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mirror_handle.join().unwrap();
 
-    let durable = voter.counters().durable.load_acquire();
-    // Frame-aligned (a real service publishes a snapshot at an apply boundary —
-    // a 128 B frame end for these 96 B payloads); a mid-frame floor would land the
-    // journal-replay datagram below the adopted position and be dropped as a dup.
-    let floor = (durable / 2) / 128 * 128;
     assert!(
         floor > SEG,
-        "need >1 segment below the floor (durable={durable})"
+        "need >1 segment below the floor (floor={floor})"
     );
-    let snap_dir = v_dir.join("snapshots").join("0");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::write(
-        snap_dir.join(format!("snap-{floor}.ultsnap")),
-        vec![0x5Au8; 4096],
-    )
-    .unwrap();
-    // M14c: the source closure ships each declared id's own newest artifact, so
-    // the test must publish the SLOT the service owns as well as the page-1
-    // aggregate the node would normally derive from it — this voter now
-    // declares a real "fsm0" (wire 0.7.0 Ruling 1: a `none_for_tests` node
-    // can no longer ship a snapshot session at all, see
-    // `spawn_applied_mirror`'s doc), but still has no REAL service attached
-    // to publish the aggregate on its own, so the test publishes it by hand.
-    cnc.service_slot(0).snapshot_pos.store_release(floor);
-    cnc.snapshots().service_snapshot_pos.store_release(floor);
 
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
@@ -776,9 +820,9 @@ impl uc_service::SnapshotStateMachine for SumSm {
 }
 
 fn start_sum_service(dir: &Path, app: &str) -> uc_service::Service<SumSm> {
-    // TODO(plan 2 task 5): command an instant — the 256 KiB byte cadence is
-    // gone (coordinated-snapshot spec §5.2); the row is capable, and builds
-    // only when the leader commands.
+    // Snapshot-CAPABLE only (coordinated-snapshot spec §5.2's cnc status
+    // bit): the 256 KiB byte cadence is gone, and this row freezes at the
+    // instants the leader commands (`command_instant`).
     let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, SumSm::default())
         .start_with_snapshots()
@@ -825,7 +869,7 @@ impl uc_service::SnapshotStateMachine for TaggedSum {
 }
 
 fn start_sum_service_row1(dir: &Path, app: &str) -> uc_service::Service<TaggedSum> {
-    // TODO(plan 2 task 5): command an instant (as `start_sum_service`).
+    // Capable, never self-triggering (as `start_sum_service`).
     let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, TaggedSum::default())
         .start_with_snapshots()
@@ -839,7 +883,6 @@ fn start_sum_service_row1(dir: &Path, app: &str) -> uc_service::Service<TaggedSu
 /// artifact and tail-replays. The first test anywhere that combines two FSMs
 /// with a below-floor join.
 #[test]
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     let _g = serialize();
     let dir = tempfile::Builder::new()
@@ -888,19 +931,13 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     let _v1 = start_sum_service_row1(&v_dir, app);
     await_until(30, "voter serves", || voter.can_serve());
 
-    // Drive well past one snapshot interval per FSM so both slots publish a
-    // position and the node floor (their min) leaves the journal's first
-    // segment behind.
-    for i in 0u64..24000 {
-        let mut p = vec![0u8; PAYLOAD];
-        p[..8].copy_from_slice(&i.to_le_bytes());
-        loop {
-            match voter.submit(p.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
-    }
+    // Drive past a segment, command ONE coordinated instant (spec §5.5) — no
+    // faking here: both rows run REAL snapshot-capable services, so both
+    // freeze at the SAME P, which is the point — then drive the tail the
+    // joiner will have to replay after installing the set.
+    submit_frames(&voter, 12000);
+    let instant = command_instant(&voter);
+    submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -908,9 +945,16 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     });
 
     let v_cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
-    await_until(30, "both FSMs published a snapshot", || {
-        v_cnc.service_slot(0).snapshot_pos.load_acquire() > SEG
-            && v_cnc.service_slot(1).snapshot_pos.load_acquire() > SEG
+    await_until(30, "both FSMs froze at the instant", || {
+        v_cnc.service_slot(0).snapshot_pos.load_acquire() == instant
+            && v_cnc.service_slot(1).snapshot_pos.load_acquire() == instant
+    });
+    assert!(
+        instant > SEG,
+        "need >1 segment below the instant (instant={instant})"
+    );
+    await_until(30, "the set at the instant completed", || {
+        voter.snapshot_set_position() >= instant
     });
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
@@ -1065,7 +1109,6 @@ impl Drop for CaptureGuard {
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     let _g = serialize();
     let buf = uc_node::obs::log::capture_for_tests();
@@ -1126,16 +1169,12 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
         CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc for mirror");
     let (mirror_stop, mirror_handle) = spawn_applied_mirror(cnc_for_mirror, 0);
 
-    for i in 0u64..24000 {
-        let mut p = vec![0u8; PAYLOAD];
-        p[..8].copy_from_slice(&i.to_le_bytes());
-        loop {
-            match voter.submit(p.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
-    }
+    // The instant mid-traffic (coordinated-snapshot spec §5.5), inside the
+    // mirror's window — see `instant_with_faked_rows`.
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    submit_frames(&voter, 12000);
+    let floor = instant_with_faked_rows(&voter, &v_dir, &cnc, &[0]);
+    submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -1143,24 +1182,10 @@ fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     });
     mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mirror_handle.join().unwrap();
-
-    // Publish a floor + a real artifact for FSM 0.
-    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
-    let durable = voter.counters().durable.load_acquire();
-    let floor = (durable / 2) / 128 * 128;
     assert!(
         floor > SEG,
-        "need >1 segment below the floor (durable={durable})"
+        "need >1 segment below the floor (floor={floor})"
     );
-    let snap_dir = v_dir.join("snapshots").join("0");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::write(
-        snap_dir.join(format!("snap-{floor}.ultsnap")),
-        vec![0x5Au8; 4096],
-    )
-    .unwrap();
-    cnc.service_slot(0).snapshot_pos.store_release(floor);
-    cnc.snapshots().service_snapshot_pos.store_release(floor);
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
     });
@@ -1238,7 +1263,6 @@ fn last_obs_record(buf: &std::sync::Arc<Mutex<Vec<u8>>>, event: &str) -> String 
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stalls() {
     let _g = serialize();
     let buf = uc_node::obs::log::capture_for_tests();
@@ -1302,16 +1326,13 @@ fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stall
     let (mirror0_stop, mirror0_handle) = spawn_applied_mirror(cnc_for_mirror0, 0);
     let (mirror1_stop, mirror1_handle) = spawn_applied_mirror(cnc_for_mirror1, 1);
 
-    for i in 0u64..24000 {
-        let mut p = vec![0u8; PAYLOAD];
-        p[..8].copy_from_slice(&i.to_le_bytes());
-        loop {
-            match voter.submit(p.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
-    }
+    // The instant mid-traffic, faking BOTH declared rows' freeze at it — the
+    // sender's `snapshot_set_for` refuses (missing artifact) unless every
+    // declared id has an artifact AT the floor, so a two-row leader needs two.
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    submit_frames(&voter, 12000);
+    let floor = instant_with_faked_rows(&voter, &v_dir, &cnc, &[0, 1]);
+    submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -1321,30 +1342,10 @@ fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stall
     mirror0_handle.join().unwrap();
     mirror1_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mirror1_handle.join().unwrap();
-
-    // Publish a floor + a real (hand-staged) artifact for BOTH declared rows —
-    // the sender's `snapshot_set_for` refuses (missing artifact) unless every
-    // declared id has one, so a two-row leader needs two.
-    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
-    let durable = voter.counters().durable.load_acquire();
-    let floor = (durable / 2) / 128 * 128;
     assert!(
         floor > SEG,
-        "need >1 segment below the floor (durable={durable})"
+        "need >1 segment below the floor (floor={floor})"
     );
-    for id in [0u8, 1] {
-        let snap_dir = v_dir.join("snapshots").join(id.to_string());
-        std::fs::create_dir_all(&snap_dir).unwrap();
-        std::fs::write(
-            snap_dir.join(format!("snap-{floor}.ultsnap")),
-            vec![0x5Au8; 4096],
-        )
-        .unwrap();
-        cnc.service_slot(id as usize)
-            .snapshot_pos
-            .store_release(floor);
-    }
-    cnc.snapshots().service_snapshot_pos.store_release(floor);
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
     });
@@ -1435,7 +1436,6 @@ fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stall
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
     let _g = serialize();
     let dir = tempfile::Builder::new()
@@ -1487,16 +1487,11 @@ fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
         .store_version(pack_version(1, 0, 0));
     let (mirror_stop, mirror_handle) = spawn_applied_mirror(cnc_for_mirror, 0);
 
-    for i in 0u64..24000 {
-        let mut p = vec![0u8; PAYLOAD];
-        p[..8].copy_from_slice(&i.to_le_bytes());
-        loop {
-            match voter.submit(p.clone()) {
-                Ok(()) => break,
-                Err(_) => std::thread::yield_now(),
-            }
-        }
-    }
+    // The instant mid-traffic — see `instant_with_faked_rows`.
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    submit_frames(&voter, 12000);
+    let floor = instant_with_faked_rows(&voter, &v_dir, &cnc, &[0]);
+    submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -1504,23 +1499,10 @@ fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
     });
     mirror_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     mirror_handle.join().unwrap();
-
-    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
-    let durable = voter.counters().durable.load_acquire();
-    let floor = (durable / 2) / 128 * 128;
     assert!(
         floor > SEG,
-        "need >1 segment below the floor (durable={durable})"
+        "need >1 segment below the floor (floor={floor})"
     );
-    let snap_dir = v_dir.join("snapshots").join("0");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::write(
-        snap_dir.join(format!("snap-{floor}.ultsnap")),
-        vec![0x5Au8; 4096],
-    )
-    .unwrap();
-    cnc.service_slot(0).snapshot_pos.store_release(floor);
-    cnc.snapshots().service_snapshot_pos.store_release(floor);
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
     });
@@ -1927,7 +1909,13 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         table_position = position;
     }
 
-    submit_frames(&voter, 24000);
+    // The instant in the MIDDLE of the churn (coordinated-snapshot spec
+    // §5.5), so the table's frame stays inside the purged prefix and the
+    // joiner still has a retained tail to replay — see
+    // `instant_with_faked_rows`.
+    submit_frames(&voter, 12000);
+    let floor = instant_with_faked_rows(&voter, &v_dir, &cnc, &[0]);
+    submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
         let a = c.append.load_acquire();
@@ -1939,25 +1927,15 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap();
     }
-
-    // Publish a snapshot floor + a real snapshot file for the sender to ship
-    // (frame-aligned: a mid-frame floor lands the journal-replay datagram
-    // below the adopted position and is dropped as a dup).
-    let durable = voter.counters().durable.load_acquire();
-    let floor = (durable / 2) / 128 * 128;
     assert!(
         floor > SEG,
-        "need >1 segment below the floor (durable={durable})"
+        "need >1 segment below the floor (floor={floor})"
     );
-    let snap_dir = v_dir.join("snapshots").join("0");
-    std::fs::create_dir_all(&snap_dir).unwrap();
-    std::fs::write(
-        snap_dir.join(format!("snap-{floor}.ultsnap")),
-        vec![0x5Au8; 4096],
-    )
-    .unwrap();
-    cnc.service_slot(0).snapshot_pos.store_release(floor);
-    cnc.snapshots().service_snapshot_pos.store_release(floor);
+    assert!(
+        table_position == 0 || table_position < floor,
+        "the table's frame must be inside the purged prefix \
+         (table_position={table_position} floor={floor})"
+    );
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
     });
@@ -2078,7 +2056,6 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
     let _g = serialize();
     let table = two_far_future_entries();
@@ -2146,7 +2123,6 @@ fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
     let _g = serialize();
     let f = below_floor_join("learner-nosched", None);
@@ -2242,7 +2218,6 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
 #[test]
 // Ruling P8: below-floor join needs a cluster artifact at the floor; until
 // Task 5 commands instants none exists.
-#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table()
 {
     let _g = serialize();

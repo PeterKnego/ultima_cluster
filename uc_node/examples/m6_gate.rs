@@ -259,10 +259,11 @@ const BUFFER_BYTES: usize = 1 << 22;
 /// Small journal segments + snapshot cadence so purge actually drops prefixes
 /// under the modest smoke workload (mirrors the lin_v2 purge capstone).
 const SEGMENT_BYTES: u64 = 16 * 1024;
-/// TODO(plan 2 task 5): command an instant. Unused since the byte cadence was
-/// deleted (coordinated-snapshot spec §5.2); kept so Task 5 has the number it
-/// needs for `settings.snapshot.interval_bytes`.
-#[allow(dead_code)]
+/// The cluster's snapshot CADENCE (coordinated-snapshot spec §5.5/§6): the
+/// leader commands an instant every this many bytes of appended log. Seeded
+/// into the replicated settings record at genesis (`make_config`) — the
+/// per-service byte cadence M6 used is deleted (spec §5.2), and this is its
+/// replacement: one number, cluster-wide, whichever node leads.
 const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
 
 fn seed_for(id: NodeId) -> u64 {
@@ -306,7 +307,10 @@ fn make_config(
         buffer_bytes: BUFFER_BYTES,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            snapshot_interval_bytes: SNAPSHOT_INTERVAL_BYTES,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(id),
@@ -319,10 +323,9 @@ fn make_config(
 }
 
 fn spawn_service(dir: &std::path::Path) -> uc_service::Service<RegSm> {
-    // TODO(plan 2 task 5): command an instant — `SNAPSHOT_INTERVAL_BYTES` no
-    // longer configures anything (coordinated-snapshot spec §5.2 deleted the
-    // cadence); every gate row that expects an artifact needs the leader to
-    // command one.
+    // Snapshot-CAPABLE (spec §5.2's cnc status bit) and nothing more: the row
+    // builds an artifact only at an instant the leader commands, which here
+    // is the replicated cadence seeded in `make_config`.
     let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()

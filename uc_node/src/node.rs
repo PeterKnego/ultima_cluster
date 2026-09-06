@@ -4857,7 +4857,13 @@ impl Consensus {
     fn prune_snapshots_below(&self, p: u64) {
         let mut removed = 0u64;
         let mut errors = 0u64;
-        for row in self.services.ring_ids() {
+        // The DECLARED rows — the same set `check_set_completeness` reads, so
+        // the pruner only ever touches artifact families the set is made of.
+        // NOT `ring_ids()`, whose "row 0 stands in for clients" fallback would
+        // have a node with nothing declared deleting files under
+        // `snapshots/0/` that its own set definition never covered. On a real
+        // node (which always declares `[services] names`) the two are equal.
+        for row in self.services.ids() {
             let (r, e) = prune_snapshot_dir(&self.snap_root.join(row.to_string()), SNAP_SUFFIX, p);
             removed += r;
             errors += e;
@@ -10436,6 +10442,29 @@ mod tests {
             h.cons.snapshot_persisted_floor, 4096,
             "half a set is not a set"
         );
+
+        // The `<= durable` belt (spec §5.4) still guards the SET's position: a
+        // purge floor is only ever a position whose covering journal block is
+        // durable HERE. The harness's counters are primed at 6016, so a
+        // complete set at 8192 is one this node cannot yet stand behind.
+        h.row_froze_at(0, 8192);
+        h.cluster_snapshot_pos.store(8192, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            8192,
+            "the SET is complete — completeness is not gated on durability"
+        );
+        h.cons.snapshot_floor_last_persist_ns = None;
+        h.cons.maybe_persist_snapshot_floor();
+        assert_eq!(
+            h.cons.snapshot_persisted_floor, 4096,
+            "...but the FLOOR waits for the archive to make P durable"
+        );
+        h.cons.cnc.counters().durable.store_release(8192);
+        h.cons.snapshot_floor_last_persist_ns = None;
+        assert!(h.cons.maybe_persist_snapshot_floor());
+        assert_eq!(h.cons.snapshot_persisted_floor, 8192);
     }
 
     /// Regression: `apply_schedule_table` must never block the consensus
