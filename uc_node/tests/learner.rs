@@ -64,72 +64,46 @@ fn command_instant(node: &Node) -> u64 {
     }
 }
 
-/// Command an instant on a fixture whose rows have NO real service, and fake
-/// what the service would have done: the snapshot-capability bit before the
-/// command (spec §5.5 refuses `48` without it) and each row's artifact +
-/// `snapshot_pos` after it. Returns **P**.
-///
-/// `uc_node` never parses a row's artifact, so a blob of the right NAME at
-/// the right position is a complete row as far as the node and the snapshot
-/// session are concerned — the same stand-in `purge_safety.rs` uses. What
-/// cannot be faked is the CLUSTER artifact: the `uc2-cluster` agent writes it,
-/// at the instant, which is exactly why the floor now needs a real command
-/// rather than a poked cnc word.
-///
-/// Call it in the MIDDLE of the fixture's traffic, not after it: P is the
-/// frame end of the frame this appends, so everything submitted afterwards is
-/// the retained `[P, append)` tail a below-floor joiner must replay once it
-/// has installed the set. That tail is the property the old hand-picked
-/// `durable / 2` floor provided.
+/// Command instants on `node` until one **completes** — every declared row
+/// and the cluster FSM at the same P — and return that P. `on_command` runs
+/// once per attempt with the freshly commanded position; `rows` is what the
+/// diagnostic prints (and, for the faked fixtures, what `on_command` writes).
 ///
 /// # Why it RETRIES (fix round 1)
 ///
-/// An instant commanded while the `uc2-cluster` agent is LAPPING is abandoned
-/// — by design, and it never completes however long you wait. These fixtures
-/// run a 256 KiB ring and push megabytes through it, so that agent overruns
-/// and catches up through the journal (Ruling R18), and
+/// An instant commanded while a row's apply loop or the `uc2-cluster` agent is
+/// LAPPING is abandoned — by design, and it never completes however long you
+/// wait. These fixtures run a 256 KiB ring and push megabytes through it, so a
+/// walker overruns and catches up through the journal (Ruling R18), and
 /// `ClusterAgent::replay_from_journal` deliberately does **not** act on a
 /// `FRAME_TYPE_SNAPSHOT` frame buried in a catch-up span (see its comment:
-/// freezing at an instant the agent is already past would tag a stale
-/// artifact). The frame is consumed, the cursor moves past it, and no cluster
-/// artifact is ever written at that P.
+/// freezing at an instant the walker is already past would tag a stale
+/// artifact). The frame is consumed, the cursor moves past it, and nothing is
+/// ever written at that P.
 ///
 /// That is spec §10's documented outcome — "a row never reaches P: the set
-/// stays incomplete; the next instant supersedes it" — with the cluster row
-/// as the row that missed. In production the cadence supersedes on its own;
-/// here the fixture does what the operator would, and
+/// stays incomplete; the next instant supersedes it" — reachable for the
+/// CLUSTER row and for a user row alike. In production the cadence supersedes
+/// on its own; here the fixture does what the operator would, and
 /// `command_snapshot_operator` (which `Node::command_snapshot` runs) always
-/// supersedes. Each attempt leaves the agent's cursor further forward, so
+/// supersedes. Each attempt leaves the walker's cursor further forward, so
 /// once the ring stops lapping the next attempt is walked LIVE and freezes.
 ///
-/// Reproduced at 1 run in 20 of
-/// `a_joiner_whose_rows_are_named_in_the_other_order_…` before the retry:
-/// `P=695328 set=0 cluster_artifact=0 view=0 append=commit=durable=1536256`,
-/// i.e. the whole log durable and committed with the agent's artifact still
-/// at 0 — a stall, not slowness, which is why the wait stays at 30 s per
-/// attempt rather than being widened.
-fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]) -> u64 {
-    for &row in rows {
-        let slot = cnc.service_slot(row as usize);
-        slot.status
-            .store_release(slot.status.load_acquire() | CNC_SVC_STATUS_SNAPSHOT_CAPABLE);
-    }
+/// Reproduced at ~1 run in 20 with the wait instrumented:
+/// `P=695328 set=0 cluster_artifact=0 view=0 append=commit=durable=1536256`
+/// — the whole log durable and committed with the agent's artifact still at 0.
+/// A stall, not slowness, which is why the wait stays at 30 s per attempt
+/// rather than being widened.
+fn instant_until_complete(
+    node: &Node,
+    cnc: &CncPage,
+    rows: &[u8],
+    mut on_command: impl FnMut(u64),
+) -> u64 {
     const ATTEMPTS: usize = 5;
     for attempt in 1..=ATTEMPTS {
         let p = command_instant(node);
-        for &row in rows {
-            let snap_dir = v_dir.join("snapshots").join(row.to_string());
-            std::fs::create_dir_all(&snap_dir).unwrap();
-            std::fs::write(
-                snap_dir.join(format!("snap-{p}.ultsnap")),
-                vec![0x5Au8; 4096],
-            )
-            .unwrap();
-            cnc.service_slot(row as usize).snapshot_pos.store_release(p);
-        }
-        // Observability only since spec §5.3, but `uc2ctl status` and the
-        // backup report read it — keep it truthful.
-        cnc.snapshots().service_snapshot_pos.store_release(p);
+        on_command(p);
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if node.snapshot_set_position() >= p {
@@ -151,8 +125,8 @@ fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]
         eprintln!(
             "instant {p} abandoned (attempt {attempt}/{ATTEMPTS}): set={} cluster_artifact={} \
              append={} commit={} durable={} rows(row,snapshot_pos,applied)={state:?} \
-             — the uc2-cluster agent was catching up through the journal and skipped the \
-             SNAPSHOT frame (spec §10); superseding",
+             — a walker was catching up through the journal and skipped the SNAPSHOT frame \
+             (spec §10); superseding",
             node.snapshot_set_position(),
             node.cluster_snapshot_position(),
             c.append.load_acquire(),
@@ -161,9 +135,51 @@ fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]
         );
     }
     panic!(
-        "no instant completed in {ATTEMPTS} attempts — the uc2-cluster agent never caught up \
-         to the live ring, which is NOT the documented abandonment this retry covers"
+        "no instant completed in {ATTEMPTS} attempts — a walker never caught up to the live \
+         ring, which is NOT the documented abandonment this retry covers"
     );
+}
+
+/// Command an instant on a fixture whose rows have NO real service, and fake
+/// what the service would have done: the snapshot-capability bit before the
+/// command (spec §5.5 refuses `48` without it) and each row's artifact +
+/// `snapshot_pos` after it. Returns **P**.
+///
+/// `uc_node` never parses a row's artifact, so a blob of the right NAME at
+/// the right position is a complete row as far as the node and the snapshot
+/// session are concerned — the same stand-in `purge_safety.rs` uses. What
+/// cannot be faked is the CLUSTER artifact: the `uc2-cluster` agent writes it,
+/// at the instant, which is exactly why the floor now needs a real command
+/// rather than a poked cnc word.
+///
+/// Call it in the MIDDLE of the fixture's traffic, not after it: P is the
+/// frame end of the frame this appends, so everything submitted afterwards is
+/// the retained `[P, append)` tail a below-floor joiner must replay once it
+/// has installed the set. That tail is the property the old hand-picked
+/// `durable / 2` floor provided.
+///
+/// Retries through an abandoned instant — see [`instant_until_complete`].
+fn instant_with_faked_rows(node: &Node, v_dir: &Path, cnc: &CncPage, rows: &[u8]) -> u64 {
+    for &row in rows {
+        let slot = cnc.service_slot(row as usize);
+        slot.status
+            .store_release(slot.status.load_acquire() | CNC_SVC_STATUS_SNAPSHOT_CAPABLE);
+    }
+    instant_until_complete(node, cnc, rows, |p| {
+        for &row in rows {
+            let snap_dir = v_dir.join("snapshots").join(row.to_string());
+            std::fs::create_dir_all(&snap_dir).unwrap();
+            std::fs::write(
+                snap_dir.join(format!("snap-{p}.ultsnap")),
+                vec![0x5Au8; 4096],
+            )
+            .unwrap();
+            cnc.service_slot(row as usize).snapshot_pos.store_release(p);
+        }
+        // Observability only since spec §5.3, but `uc2ctl status` and the
+        // backup report read it — keep it truthful.
+        cnc.snapshots().service_snapshot_pos.store_release(p);
+    })
 }
 
 /// Wire 0.7.0 (Ruling 1): `snapshot_set_for` now declines outright for a
@@ -986,12 +1002,15 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     let _v1 = start_sum_service_row1(&v_dir, app);
     await_until(30, "voter serves", || voter.can_serve());
 
-    // Drive past a segment, command ONE coordinated instant (spec §5.5) — no
-    // faking here: both rows run REAL snapshot-capable services, so both
-    // freeze at the SAME P, which is the point — then drive the tail the
-    // joiner will have to replay after installing the set.
+    // Drive past a segment, then command a coordinated instant (spec §5.5) —
+    // no faking here: both rows run REAL snapshot-capable services, so both
+    // freeze at the SAME P, which is the point. `instant_until_complete`
+    // supersedes an instant a lapping walker skipped (spec §10, and see its
+    // doc); nothing is faked in the callback, so what completes the set here
+    // is genuinely two services and the cluster agent agreeing on one P.
+    let v_cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
     submit_frames(&voter, 12000);
-    let instant = command_instant(&voter);
+    let instant = instant_until_complete(&voter, &v_cnc, &[0, 1], |_| {});
     submit_frames(&voter, 12000);
     await_until(30, "voter quiesced", || {
         let c = voter.counters();
@@ -999,18 +1018,24 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
         a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
     });
 
-    let v_cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
-    await_until(30, "both FSMs froze at the instant", || {
-        v_cnc.service_slot(0).snapshot_pos.load_acquire() == instant
-            && v_cnc.service_slot(1).snapshot_pos.load_acquire() == instant
-    });
+    // The set completing IS "every declared row at P", but say it out loud:
+    // this is the first test anywhere that two independent FSMs freeze at one
+    // log position, and it would still read as green if the assertion below
+    // were the only thing checked and it were checking something weaker.
+    assert_eq!(
+        v_cnc.service_slot(0).snapshot_pos.load_acquire(),
+        instant,
+        "row 0 froze at the instant"
+    );
+    assert_eq!(
+        v_cnc.service_slot(1).snapshot_pos.load_acquire(),
+        instant,
+        "row 1 froze at the SAME instant"
+    );
     assert!(
         instant > SEG,
         "need >1 segment below the instant (instant={instant})"
     );
-    await_until(30, "the set at the instant completed", || {
-        voter.snapshot_set_position() >= instant
-    });
     await_until(30, "voter purged its prefix", || {
         voter.archive_first_base() > 0
     });
