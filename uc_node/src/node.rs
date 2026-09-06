@@ -9458,6 +9458,73 @@ mod tests {
         );
     }
 
+    /// Spec §5.5's second trigger, and Ruling P3's sentinel. `0` means **no
+    /// cadence at all** — the retired `SnapshotPolicy`'s "0 = never", and the
+    /// reason purge stays off by default — so a cluster that has configured
+    /// nothing must never snapshot on its own, however much log it appends.
+    /// `target = learners` selects the standby flag for the instants the
+    /// cadence issues, per spec §5.7.
+    #[test]
+    fn the_cadence_is_off_at_zero_and_issues_flagged_instants_once_configured() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.mark_capable(0);
+
+        // (a) genesis: no cadence. Appending several times the interval the
+        //     next step configures changes nothing.
+        h.append_client_bytes(12 * 1024);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_instant_pub.load(Ordering::Relaxed),
+            0,
+            "interval_bytes == 0 is 'never', not 'every pass'"
+        );
+
+        // (b) a committed cadence, and the accrual bar met: one instant.
+        h.set_settings_interval(4096);
+        assert_eq!(h.cons.snapshot_interval_bytes, 4096, "read from the view");
+        h.append_client_bytes(4096);
+        h.cons.do_work();
+        let p1 = h.cons.snapshot_instant_pub.load(Ordering::Relaxed);
+        assert!(p1 > 0, "the cadence commanded an instant");
+
+        // (c) ...and NOT again until a further interval has accrued, even
+        //     though the set at p1 is still incomplete (single in flight).
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_instant_pub.load(Ordering::Relaxed),
+            p1,
+            "the accrual bar has not been met again"
+        );
+
+        // (d) the target selects the flag. `Learners` with no learner in the
+        //     membership refuses `49` — and the refusal is LATCHED, so a
+        //     cluster in that state names it once instead of every pass.
+        let s = Settings {
+            snapshot_interval_bytes: 4096,
+            snapshot_target: Target::Learners,
+            ..Settings::genesis_default()
+        };
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(s))
+            .expect("settings append");
+        h.commit_through(end);
+        h.cons.refresh_from_view();
+        assert!(h.cons.snapshot_target_learners);
+        h.append_client_bytes(8192);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.snapshot_cadence_refused, REASON_SNAPSHOT_NO_LEARNER,
+            "a standby cadence on a cluster with no learner is refused, once"
+        );
+        assert_eq!(
+            h.cons.snapshot_instant_pub.load(Ordering::Relaxed),
+            p1,
+            "and nothing was appended"
+        );
+    }
+
     /// Spec §5.7 item 2: `NODE_FLAG_LEARNER` is NODE-written, from the
     /// KERNEL's durable-time membership shadow — the same word, and the same
     /// reader, the leader flag comes from. A row acts on a standby-flagged
