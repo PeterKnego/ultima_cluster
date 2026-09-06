@@ -1422,6 +1422,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "clap",
+ "crc32fast",
  "fs2",
  "hdrhistogram",
  "libc",

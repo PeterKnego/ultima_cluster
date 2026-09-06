@@ -42,6 +42,7 @@ toml = { workspace = true }
 libc = { workspace = true }
 signal-hook = { workspace = true }
 clap = { workspace = true }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 # Asymmetric cycle: uc_node → uc_service is a runtime dependency (for the

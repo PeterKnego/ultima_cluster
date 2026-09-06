@@ -7142,7 +7142,7 @@ fn wire_to_config_op(op: u32, id: NodeId, ip: u32, port: u16) -> Option<ConfigOp
 /// `WireConfig` (the decoded `FRAME_TYPE_CONFIG` payload) -> `ClusterConfig`
 /// (the SM's in-memory form). Purely numeric — `WireMember`'s `(ip, port)` IS
 /// the `Addr` shape already, no `SocketAddr` involved.
-fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig {
+pub(crate) fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig {
     ClusterConfig {
         version: w.version,
         voters: w.voters.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
@@ -7164,7 +7164,7 @@ pub(crate) fn config_content_diverges(current: &ClusterConfig, incoming: &Cluste
 /// payload. `prev_position` is an audit-trail field only (the durable
 /// `ConfigRecord` keeps the authoritative prev) — the caller passes the
 /// CURRENTLY-adopted config's position, the entry `c` supersedes.
-fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig {
+pub(crate) fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig {
     WireConfig {
         version: c.version,
         prev_position,

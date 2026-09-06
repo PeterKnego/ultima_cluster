@@ -36,6 +36,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod cluster_fsm;
 pub mod config_file;
 pub mod ipc;
 #[cfg(feature = "mutation-testing")]
@@ -54,6 +55,7 @@ mod schedule_state;
 pub mod services;
 pub(crate) mod timers;
 
+pub use cluster_fsm::{ClusterCommand, ClusterFsm, ClusterRefusal, ClusterState, ClusterView};
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{
