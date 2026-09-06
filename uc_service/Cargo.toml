@@ -36,7 +36,7 @@ fs2 = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 
 [dev-dependencies]
-uc_node = { path = "../uc_node", version = "2.11.0" }
+uc_node = { path = "../uc_node" }
 uc_net = { path = "../uc_net", version = "2.11.0" }
 uc_client = { path = "../uc_client", version = "2.11.0" }
 # Dev-only cycle (permitted: the cyclic edge is a dev-dependency, same pattern

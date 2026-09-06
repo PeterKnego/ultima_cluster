@@ -226,12 +226,14 @@ cargo publish -p uc_log
 cargo publish -p uc_consensus
 cargo publish -p uc_net
 cargo publish -p uc_client
-cargo publish -p uc_node
 cargo publish -p uc_service
+cargo publish -p uc_node
 cargo publish -p uc_remote
 cargo publish -p uc_gateway
 cargo publish -p uc_ctl
 ```
+
+`uc_node` depends on `uc_service` since the cluster FSM (2.11.0), so `uc_service` publishes first; `uc_service`'s dev-dependency on `uc_node` is unversioned and stripped by `cargo package`.
 
 Wait for each to appear on crates.io before starting the next — `cargo
 publish` returns before the index has caught up, and the next crate's

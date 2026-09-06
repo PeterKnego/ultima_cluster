@@ -28,6 +28,11 @@ uc_log = { path = "../uc_log", version = "2.11.0" }
 uc_net = { path = "../uc_net", version = "2.11.0" }
 uc_consensus = { path = "../uc_consensus", version = "2.11.0" }
 uc_crypto = { path = "../uc_crypto", version = "2.11.0" }
+# The cluster FSM (spec §4) implements uc_service's RawStateMachine +
+# SnapshotStateMachine so it is "treated like any FSM". This is a RUNTIME
+# edge; uc_service's dev-dependency on uc_node stays a dev-only cycle. The
+# crates.io publish order therefore flips: uc_service BEFORE uc_node.
+uc_service = { path = "../uc_service", version = "2.11.0" }
 uc_journal = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
@@ -41,11 +46,12 @@ clap = { workspace = true }
 [dev-dependencies]
 # Dev-only cycle (permitted: every edge is a dev-dependency) — the Task 11
 # barrier test drives the full read path with a real service + client.
-# uc_service is deliberately unversioned: it comes AFTER uc_node in the
-# publish DAG order (docs/how-to/cut-a-release.md), so a version here would
-# make `cargo package`/`cargo publish` require an unresolvable forward
-# reference. Cargo silently strips an unversioned path dev-dependency from
-# the published manifest instead (standard idiom for a dev-only test cycle).
+# uc_service is deliberately unversioned here (even though uc_node now depends
+# on it at runtime; see [dependencies] above). The runtime edge is versioned
+# because uc_service comes first in the crates.io publish order; the dev-only
+# edge has no version so `cargo package` strips it from the published manifest
+# and avoids a forward-reference to a future version (standard idiom for a
+# dev-only test cycle in a dual-edge scenario).
 uc_service = { path = "../uc_service" }
 uc_client = { path = "../uc_client", version = "2.11.0" }
 # L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,

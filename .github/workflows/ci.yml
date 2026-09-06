@@ -175,8 +175,8 @@ jobs:
         run: >
           cargo package --no-verify
           -p uc_journal -p uc_protocol -p uc_obs -p uc_crypto -p uc_log
-          -p uc_consensus -p uc_net -p uc_client -p uc_node
-          -p uc_service -p uc_remote -p uc_gateway -p uc_ctl
+          -p uc_consensus -p uc_net -p uc_client -p uc_service -p uc_node
+          -p uc_remote -p uc_gateway -p uc_ctl
       # The 5 leaves (no path dependencies of their own: uc_journal,
       # uc_protocol, uc_obs, uc_remote, uc_consensus) are the only crates that can
       # be `cargo publish --dry-run`'d before anything is actually on
