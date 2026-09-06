@@ -967,11 +967,13 @@ mod tests {
     /// in the gap is in the journal by construction (the appender never
     /// overwrites bytes the archive has not recorded).
     ///
-    /// Deliberately the same staging as the no-prime test below, plus the
-    /// generation bump the archive does right after `LogCounters::prime` —
-    /// which is exactly what used to select the losing branch.
+    /// Deliberately the same staging as the no-prime test below: the head is
+    /// moved by a `LogCounters::prime`, the way `AdoptFloor` moves it, which
+    /// is exactly what used to select the losing branch. The agent no longer
+    /// knows about primes at all — since R18 the WHY of an overrun selects
+    /// nothing — so the test's name says only what it asserts.
     #[test]
-    fn an_overrun_after_a_prime_replays_the_journal_rather_than_skipping() {
+    fn an_overrun_replays_the_journal_rather_than_skipping() {
         let (buffer, cnc, dir) = world();
         let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
         let mut app = buffer.appender_for_test(0);
@@ -988,7 +990,6 @@ mod tests {
 
         let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
         let view = Arc::new(ClusterView::new(fsm.state()));
-        let prime_gen = Arc::new(AtomicU64::new(0));
         let mut agent = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -1001,11 +1002,6 @@ mod tests {
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
         );
-        // The archive bumps the generation right after `LogCounters::prime` —
-        // do the same, THEN stage the overrun, matching how `AdoptFloor`
-        // orders the two writes in `node.rs`. Under the old arm this is what
-        // made the agent skip.
-        prime_gen.fetch_add(1, Ordering::Release);
         let head = stage_overrun(&buffer, &cnc);
         assert!(head > e3, "the prime moves the head well past the frames");
 
