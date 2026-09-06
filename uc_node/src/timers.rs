@@ -217,7 +217,12 @@ impl RowTimers {
     pub fn pending_len(&self) -> usize {
         self.pending.len() + self.table.values().filter(|e| e.next.is_some()).count()
     }
-    /// Every table entry, parked ones included.
+    /// Every table entry, parked ones included. Ruling R15 (spec §4.9):
+    /// only the tests read it now — `arm_table_from_view`'s caller
+    /// (`Consensus::refresh_from_view`) publishes `uc2_schedule_entries`
+    /// from the view's table directly (`declared_table_entries`), since this
+    /// count would read 0 on every follower once arming became leader-only.
+    #[allow(dead_code)]
     pub fn table_len(&self) -> usize {
         self.table.len()
     }

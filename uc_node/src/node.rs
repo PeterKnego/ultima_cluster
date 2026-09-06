@@ -4218,14 +4218,18 @@ impl Consensus {
     /// Spec §4.9: the heap is leader-only. On any leader exit it is
     /// discarded, not re-armed; the next promotion rebuilds it from the
     /// service's edge announce and the cluster FSM's table.
+    ///
+    /// Ruling R15: does NOT touch `schedule_position` (or
+    /// `view_position_seen`) — after the leader/follower metrics-vs-arming
+    /// split, `schedule_position` gates only the cluster-wide table METRICS
+    /// (`schedule_pos_pub`/`schedule_entries_pub`), which stay correct and
+    /// unconditional on every node regardless of role; re-arming this row's
+    /// heap on the NEXT promotion is `on_collapsed`'s job
+    /// (`view_position_seen = u64::MAX`), not this function's.
     fn discard_timers(&mut self) {
         for slot in self.timers.iter_mut().flatten() {
             slot.discard();
         }
-        // Force `arm_table_from_view` to run again on the next
-        // `refresh_from_view`, which mirrors `schedule_position` from the
-        // view's `table_position` and only re-arms when the two disagree.
-        self.schedule_position = 0;
         self.publish_timers_pending();
     }
 
@@ -4396,21 +4400,47 @@ impl Consensus {
             .map_err(|r| r.reason_code())
     }
 
-    /// Cluster FSM (spec §4.5): hand every DECLARED row the entries the
-    /// COMMITTED table names for it, and publish the `/metrics` mirrors. A row
-    /// with no entry in the table adopts an EMPTY set — that is how an
-    /// operator removes an entry: apply a table without it.
+    /// Cluster FSM (spec §4.5, §4.9 Ruling R15): entries in the COMMITTED
+    /// table that name a row THIS node has declared — independent of whether
+    /// `RowTimers` is actually armed for them. `uc2_schedule_entries` must
+    /// read identically on every node, leader or follower (the same
+    /// "identical on every node" property `uc2_schedule_table_position`
+    /// already has, both backing `Uc2ScheduleTableDiverged`), so it is
+    /// computed from the view's table directly rather than from
+    /// `RowTimers::table_len()`, which since Task 7 is leader-only. Equal to
+    /// `table.entries.len()` whenever every entry names a declared row —
+    /// which the FSM's `validate` enforces (an unknown hash is refused
+    /// whole) — and, on a node whose declared set has somehow diverged from
+    /// the cluster's, the more useful of the two truths.
+    fn declared_table_entries(&self, inner: &ClusterViewInner) -> u64 {
+        inner
+            .table
+            .entries
+            .iter()
+            .filter(|e| {
+                self.timers
+                    .iter()
+                    .flatten()
+                    .any(|t| t.hash() == e.identity_hash)
+            })
+            .count() as u64
+    }
+
+    /// Cluster FSM (spec §4.5). Task 7 / Ruling R15: LEADER-ONLY — hand every
+    /// DECLARED row the entries the COMMITTED table names for it. A row with
+    /// no entry in the table adopts an EMPTY set — that is how an operator
+    /// removes an entry: apply a table without it. A follower's `RowTimers`
+    /// is never armed (the heap is leader-only, spec §4.9), so its
+    /// `pending_len()`/`uc2_timers_pending` reads 0 naturally, with no metric
+    /// special-casing.
     ///
-    /// Called only from [`Self::refresh_from_view`], i.e. only when the view's
-    /// position moved. Arms against `cnc.log_time_ns()` — the LOG's clock,
-    /// seeded from the journal at boot — and never a wall clock or a frame
-    /// stamp: every replica agrees on that reading, so every replica arms
-    /// identically, and a node down for a week catches up by ONE tick per
-    /// entry instead of replaying a backlog (`ScheduleRule::arm`).
-    ///
-    /// Returns the number of ARMED entries — what `uc2_schedule_entries`
-    /// publishes.
-    fn arm_table_from_view(&mut self, inner: &ClusterViewInner) -> u64 {
+    /// Called only from [`Self::refresh_from_view`]'s `leader_flag` branch.
+    /// Arms against `cnc.log_time_ns()` — the LOG's clock, seeded from the
+    /// journal at boot — and never a wall clock or a frame stamp: every
+    /// replica agrees on that reading, so every replica arms identically,
+    /// and a node down for a week catches up by ONE tick per entry instead
+    /// of replaying a backlog (`ScheduleRule::arm`).
+    fn arm_table_from_view(&mut self, inner: &ClusterViewInner) {
         let log_time_ns = self.cnc.log_time_ns();
         for slot in self.timers.iter_mut() {
             let Some(t) = slot else { continue };
@@ -4424,29 +4454,15 @@ impl Consensus {
                 .collect();
             t.adopt_table(&entries, log_time_ns);
         }
-        // What is actually ARMED across the rows, parked `once` entries
-        // included. Equal to `table.entries.len()` whenever every entry names
-        // a declared row — which the FSM's `validate` enforces (an unknown
-        // hash is refused whole) — and, on a node whose declared set has
-        // somehow diverged from the cluster's, the more useful of the two
-        // truths.
-        let armed: u64 = self
-            .timers
-            .iter()
-            .flatten()
-            .map(|t| t.table_len() as u64)
-            .sum();
-        self.schedule_pos_pub
-            .store(inner.table_position, Ordering::Relaxed);
-        self.schedule_entries_pub.store(armed, Ordering::Relaxed);
-        armed
     }
 
     /// Cluster FSM (spec §4.5): the ONE place this agent reads the committed
     /// cluster state. Called once per `do_work` pass, right after
     /// `publish_service_mins`, and once more at the end of construction (so a
     /// node boots with the recovered artifact's table already armed, before
-    /// its first pass).
+    /// its first pass, if it is the leader — `Node::start_with_socket` never
+    /// starts already leading, so this is a no-op there, but a harness that
+    /// pre-seeds `leader_flag` relies on it).
     ///
     /// The steady-state cost is a SINGLE `Acquire` load of the view's position
     /// word compared against a shadow — the consensus duty cycle is a measured
@@ -4454,7 +4470,11 @@ impl Consensus {
     /// never run), so nothing else may be added here. The mutex behind
     /// `snapshot_inner` is taken only on the pass where the position actually
     /// moved, which is a committed CLUSTER frame — an operator action or a
-    /// reconfiguration, not traffic.
+    /// reconfiguration, not traffic — OR the pass right after THIS node was
+    /// promoted (`on_collapsed` forces `view_position_seen` stale so the new
+    /// leader's first pass re-reads the view and arms its row heaps, spec
+    /// §4.9 Ruling R15: a promotion with no intervening committed table must
+    /// still arm from whatever table is already committed).
     ///
     /// `position` is stored LAST with `Release` by `ClusterView::publish`, so
     /// a reader that sees the new position and then locks sees the new inner
@@ -4466,17 +4486,33 @@ impl Consensus {
         }
         self.view_position_seen = vp;
         let inner = self.cluster_view.snapshot_inner();
+        // The table METRICS are cluster-wide and unconditional (every node,
+        // leader or follower) — gated only on the position actually moving,
+        // so a repeat visit from the promotion-forced re-check above (where
+        // the position did NOT change) does not re-log a spurious adoption.
         if inner.table_position != self.schedule_position {
             self.schedule_position = inner.table_position;
-            let armed = self.arm_table_from_view(&inner);
+            let entries = self.declared_table_entries(&inner);
+            self.schedule_pos_pub
+                .store(inner.table_position, Ordering::Relaxed);
+            self.schedule_entries_pub.store(entries, Ordering::Relaxed);
             crate::obs_event!(
                 Info,
                 "schedule_table_adopted",
                 node = self.id as u64,
                 position = inner.table_position,
-                entries = armed,
+                entries = entries,
                 source = "cluster_fsm"
             );
+        }
+        // The row-heap ARMING is leader-only (spec §4.9) and runs on every
+        // visit this function makes while leading — not only when the
+        // position changed above — so the leader's first pass after a
+        // promotion (`on_collapsed`'s forced re-check) arms from the
+        // ALREADY-committed table even though `schedule_position` already
+        // agrees with it (a follower's own earlier visit set it).
+        if self.leader_flag.load(Ordering::Relaxed) {
+            self.arm_table_from_view(&inner);
         }
         // The two node-local clamps (spec §4.4): the record carries a
         // cluster-wide INTENT, and each node bounds it against its own ring at
@@ -6683,6 +6719,15 @@ impl Consensus {
         self.feed(Event::NewTermAppended { position: end });
         self.open_gate();
         self.leader_flag.store(true, Ordering::Release);
+        // Cluster-FSM spec §4.9 Ruling R15: force the next `refresh_from_view`
+        // to re-read the view even if its position has not moved since our
+        // last visit (as a follower) — this is the only way a promotion with
+        // no intervening committed CLUSTER frame still arms this node's row
+        // heaps from the table the cluster already agreed on; a follower's
+        // own earlier visit already left `schedule_position` matching, so
+        // that comparison alone would never re-trigger the (now leader-only)
+        // arm step.
+        self.view_position_seen = u64::MAX;
         // We ARE the leader of this term — published only now that we can act
         // like one (see the note in `Action::BecomeLeader`).
         self.cnc.status().leader_hint.store_release(self.id as u64);
@@ -8604,6 +8649,194 @@ mod tests {
         h.cons.do_work();
         assert_eq!(h.cons.timers[0].as_ref().unwrap().table_len(), 0);
         assert_eq!(h.cons.schedule_position, end2);
+    }
+
+    /// One declared row ("kv") wired on both sides, exactly as
+    /// `the_rows_arm_from_the_committed_table_not_from_the_append` sets up —
+    /// factored out so the two Ruling R15 tests below share it. Returns the
+    /// row's identity hash.
+    fn harness_with_one_declared_row() -> (Harness, u64) {
+        let mut h = harness();
+        let hash = crate::services::ServicesConfig::from_names(&["kv"], None)
+            .unwrap()
+            .name_of(0)
+            .unwrap()
+            .hash();
+        h.cons.timers[0] = Some(crate::timers::RowTimers::new(hash));
+        h.cluster = ClusterAgent::new(
+            Arc::clone(&h.cons.buffer),
+            Arc::clone(&h.cons.cnc),
+            ClusterFsm::new(
+                ClusterState {
+                    membership: h.cons.sm.config().clone(),
+                    table: ScheduleTable { entries: vec![] },
+                    table_position: 0,
+                    settings: Settings::genesis_default(),
+                    applied: 0,
+                },
+                vec![hash],
+            ),
+            Arc::clone(&h.cons.cluster_view),
+            h._dir.path().join("snapshots/cluster"),
+            6016,
+            Arc::clone(&h.cons.cluster_snapshot_pos),
+            Arc::new(AtomicU64::new(0)),
+            Archive::open(ArchiveConfig::new(h._dir.path().join("rows-journal")))
+                .unwrap()
+                .journal_arc(),
+        );
+        (h, hash)
+    }
+
+    /// Cluster-FSM spec §4.9 Ruling R15 tests below need a CLUSTER frame on
+    /// the log while `h.cons` is still a plain follower — `append_cluster_frame`
+    /// is leader-only (it panics without `self.appender`). A standalone
+    /// `Appender` over the SAME shared buffer, used once and dropped, writes
+    /// one without ever promoting this node — exactly what a real follower
+    /// would see arrive over the wire and get recorded.
+    fn append_cluster_command_as_follower(h: &mut Harness, cmd: &ClusterCommand) -> u64 {
+        let term = h.cons.sm.current_term();
+        let mut payload = Vec::new();
+        let kind = ClusterFsm::encode_command(cmd, &mut payload);
+        let mut appender =
+            Appender::new(Arc::clone(&h.cons.buffer), term, h.cons.cnc.log_time_ns());
+        appender.append_cluster(term, kind, &payload).unwrap()
+    }
+
+    /// Like [`drive_to_serving_leader`], but does not assume a pristine
+    /// buffer starting at 6016 (that helper hardcodes the resulting NewTerm
+    /// frame's end at 6048) — needed when a test already appended a CLUSTER
+    /// frame as a follower before promoting, which moves the append counter
+    /// forward by that frame's size first.
+    fn drive_to_serving_leader_after_prior_append(h: &mut Harness) -> u64 {
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote {
+            from: 0,
+            term: 3,
+            granted: true,
+        });
+        assert!(
+            !h.cons.leader_flag.load(Ordering::Acquire),
+            "leading before the collapse landed"
+        );
+        h.complete_leader_open();
+        assert!(
+            h.cons.leader_flag.load(Ordering::Acquire),
+            "election did not complete"
+        );
+        let append = h.cons.cnc.counters().append.load_acquire();
+        h.cons.feed(Event::DurableAdvanced { durable: append });
+        let addr0 = h.cons.id_to_addr[&0];
+        let dt = h.cons.sm.term_at(append);
+        h.cons.feed_net(NetEvent::Report {
+            from: addr0,
+            term: 3,
+            durable: append,
+            durable_term: dt,
+        });
+        assert!(
+            h.cons.sm.can_serve(),
+            "commit did not open the serving gate"
+        );
+        append
+    }
+
+    /// Finding 2 (Ruling R15): `arm_table_from_view` must run only under
+    /// `leader_flag` — the row heap's own `RowTimers::table` never gets
+    /// populated on a follower, so `pending_len()`/`uc2_timers_pending` read
+    /// 0 there with no metric special-casing, while the cluster-wide table
+    /// METRICS (`schedule_position`/`schedule_pos_pub`/`schedule_entries_pub`)
+    /// still update on every node, exactly like `uc2_schedule_table_position`
+    /// already promised ("identical on every node").
+    #[test]
+    fn a_follower_with_a_committed_table_exports_zero_pending_but_the_table_metrics() {
+        let (mut h, hash) = harness_with_one_declared_row();
+        let table = ScheduleTable {
+            entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                identity_hash: hash,
+                timer_id: 9,
+                rule: ScheduleRule::Every {
+                    period_ns: 100,
+                    anchor_ns: 0,
+                },
+            }],
+        };
+        let end = append_cluster_command_as_follower(&mut h, &ClusterCommand::ScheduleTable(table));
+        h.commit_through(end);
+        h.cons.do_work();
+
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_len(),
+            0,
+            "a follower's row heap is never armed"
+        );
+        assert_eq!(
+            h.cons.cnc.service_slot(0).identity.timers_pending(),
+            0,
+            "uc2_timers_pending reads 0 on a follower"
+        );
+        assert_eq!(
+            h.cons.schedule_position, end,
+            "schedule_position mirrors the view's table_position on every node"
+        );
+        assert_eq!(
+            h.cons.schedule_pos_pub.load(Ordering::Relaxed),
+            end,
+            "table metrics are cluster-wide, not leader-only"
+        );
+        assert_eq!(
+            h.cons.schedule_entries_pub.load(Ordering::Relaxed),
+            1,
+            "table metrics are cluster-wide, not leader-only"
+        );
+    }
+
+    /// Finding 1 (Ruling R15): a node promoted with NO intervening committed
+    /// CLUSTER frame must still arm its row heaps from whatever table the
+    /// cluster already agreed on — `on_collapsed` forces
+    /// `view_position_seen` stale specifically so the new leader's first
+    /// `refresh_from_view` re-reads the (unchanged) view and arms, even
+    /// though `schedule_position` already matches it from this node's own
+    /// earlier life as a follower.
+    #[test]
+    fn promotion_without_a_new_cluster_frame_arms_the_table_on_the_first_leader_pass() {
+        let (mut h, hash) = harness_with_one_declared_row();
+        let table = ScheduleTable {
+            entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                identity_hash: hash,
+                timer_id: 9,
+                rule: ScheduleRule::Every {
+                    period_ns: 100,
+                    anchor_ns: 0,
+                },
+            }],
+        };
+        let end = append_cluster_command_as_follower(&mut h, &ClusterCommand::ScheduleTable(table));
+        h.commit_through(end);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_len(),
+            0,
+            "still a follower — not armed yet"
+        );
+
+        // Promote — NO further cluster frame is appended.
+        drive_to_serving_leader_after_prior_append(&mut h);
+        h.cons.do_work();
+
+        assert!(
+            h.cons.timers[0].as_ref().unwrap().table_len() > 0,
+            "the table arms on the leader's first pass, from the already-committed view"
+        );
+        assert!(
+            h.cons.timers[0].as_ref().unwrap().pending_len() > 0,
+            "an armed (unparked) table entry counts as pending"
+        );
+        assert_ne!(
+            h.cons.cnc.service_slot(0).identity.timers_pending(),
+            0,
+            "uc2_timers_pending reflects the newly-armed leader heap"
+        );
     }
 
     /// Cluster-FSM spec §4.9 Task 7: the heap is leader-only. A follower must
