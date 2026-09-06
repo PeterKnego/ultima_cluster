@@ -349,24 +349,63 @@ that already serves restart. The only thing not reconstructible,
 `in_flight`, is leader bookkeeping a new leader never inherits anyway (the
 at-least-once trade, §4.5 of the time-and-timers spec).
 
-So:
+**The ring must not be written on a follower.** This is not a tidiness
+point: `write_sched` on a full ring **spins forever** — `try_write` →
+`Err(Full)` → count `SCHED_RING_FULL_SPINS`, `yield_now`, retry
+(`uc_service/src/apply.rs:293–302`). A ring nobody drains therefore does not
+"fill to a high-water mark"; it eventually blocks the follower's apply
+thread for good. So the design is:
 
-- **Followers do not drain `svc_sched`.** The ring becomes leader-consumed,
-  as the ingress ring is. A follower's service still writes its schedule
-  records (they are outputs of `apply`, emitted identically everywhere); the
-  ring simply fills to its high-water mark and is drained from the tail on
-  promotion — `uc2_sched_ring_full_total` counts the case where a follower
-  was one for longer than the ring holds, which the re-announce covers.
-- **`BecomeLeader` requests the pending set.** The consensus agent sends the
-  row's service the same re-announce request restart uses; the service
-  walks `Timed<S>`'s pending set and `table_last` into the ring; the leader
-  arms from that plus the view's table. `rearm_timers` and the
-  `BecomeLeader` path collapse into this one request.
-- **Cost, stated:** timers due inside the promotion window fire one ring
-  round trip later than they would have. Failover already makes them late
-  (time-and-timers §4.3's post-failover case, `ev.late(ctx)`), so the
-  semantics are unchanged and only the width of an existing window moves.
-  `uc2_timers_late_total` and the timer gate's row c (precision) measure it.
+- **The service gates every ring write on the leader flag.** The apply loop
+  already reads `NODE_FLAG_LEADER` from the cnc status word once per cycle
+  (`apply.rs:421`) to gate egress publishing (`:465`); `write_sched` — on
+  both the `apply` path and the `on_timer` path — takes the same gate. A
+  follower's service emits no records, the ring cannot fill, the spin loop
+  is never entered on a follower, and `SCHED_RING_FULL_SPINS` becomes a
+  genuine leader-side anomaly (the leader's consensus agent not keeping up)
+  rather than a follower artefact. A record emitted in the demotion window
+  — flag read true at the top of a cycle, node demoted mid-batch — sits in
+  the ring until the next promotion, when it is drained and is harmless
+  (`schedule` replaces by id; a `cancel` of an absent id is a no-op).
+- **The service announces on the rising edge — no node→service request.**
+  `ApplyState` gains `was_leader`; when the per-cycle read flips false→true
+  the loop sets `announce_pending = true`, and the flush that already exists
+  for attach and post-replay (`apply.rs:368`: `pending_timers()` as
+  `Schedule` records, `table_delivered()` as the table's delivered marks)
+  does the rest. Race-free by ordering: `publish_status` sets the flag before
+  the node could fire anything; every record applied *before* the service
+  sees the edge is in the pending set the edge flushes, and every record
+  applied *after* is written directly under a now-true gate. No new IPC.
+- **The apply loop tracks the pending set for every SM, not only
+  `Timed<S>`.** Today `pending_timers()` is a provided no-op on the raw trait
+  and only `Timed` overrides it (`traits.rs:249–253`), so a bare SM's
+  announce is empty — which was fine while the follower's heap preserved its
+  timers across promotion, and is a regression once it does not. So
+  `ApplyState` keeps an in-memory `pending: HashMap<id, deadline>` and
+  `table_last`, maintained from `take_sched_records()` and from delivered
+  `TIMER` frames, and the edge-announce flushes the SM's own set when it
+  overrides the hook (`Timed`) and the loop's map otherwise. Parity with
+  today for a bare SM: its timers survive a promotion, a service restart on
+  the leader (the leader's heap is kept and the announce is additive), and —
+  better than today — a *node* restart, since the service process is still
+  up with its map when the restarted node is next promoted. They are lost
+  only when the service process itself restarts, exactly as today.
+- **Node side.** `drain_sched_rings` runs only under the leader flag; on
+  demotion the heap is **discarded**, not re-armed, so `rearm_timers` is
+  deleted; on promotion the node drains whatever the demotion window left in
+  the ring and then takes the announce. `BecomeLeader` needs no timer code
+  at all.
+- **`uc2_timers_pending` changes meaning.** It becomes the leader's count;
+  followers export `0`. Monitor-a-cluster's "every node holds the same set;
+  the leader is the only one that fires it" becomes "the leader holds the
+  set"; `Uc2TimersPendingDiverged`, if it were ever written, would be wrong
+  — it is not in the rule set and must not be added.
+- **Cost, stated:** timers due inside the promotion window fire one service
+  cycle plus one ring round trip later than they would have. Failover
+  already makes them late (time-and-timers §4.3's post-failover case,
+  `ev.late(ctx)`), so the semantics are unchanged and only the width of an
+  existing window moves. `uc2_timers_late_total` and the timer gate's row c
+  (precision) measure it.
 
 ## 5. Coordinated snapshot instants
 
@@ -769,5 +808,10 @@ settled before the corresponding task is written:
    P — a no-op today?).
 5. Whether any timers test pins "fires on the very first pass after
    failover" as a bar rather than an observation — the leader-only heap
-   (§4.9) widens that window by one ring round trip, and a test written to
-   the old width must be re-baselined, not weakened silently.
+   (§4.9) widens that window by one service cycle plus one ring round trip,
+   and a test written to the old width must be re-baselined, not weakened
+   silently.
+6. That the edge-announce's `table_delivered()` flush (`apply.rs:368`)
+   carries the table's delivered marks as the same `SchedOp` the follower's
+   `TableConsumed` path uses today, so a promoted node arms table entries
+   from the right occurrence and does not re-fire a delivered `once`.
