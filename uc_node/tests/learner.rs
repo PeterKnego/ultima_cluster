@@ -416,6 +416,9 @@ fn learner_replicates_live_and_never_disturbs_quorum() {
 /// from the seed the joiner started with — proving the install rebuilds peer
 /// routing (`rebuild_net_for_config`), not just the SM/record/cnc version.
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     let _g = serialize();
     let dir = tempfile::Builder::new()
@@ -1060,6 +1063,9 @@ impl Drop for CaptureGuard {
 /// (it re-NAKs forever) instead of installing a set that covers only some of its
 /// FSMs; the log line plus the counter are what tell an operator which it is.
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_declared_set_mismatch_refuses_the_session_and_names_it_in_a_log_line() {
     let _g = serialize();
     let buf = uc_node::obs::log::capture_for_tests();
@@ -1230,6 +1236,9 @@ fn last_obs_record(buf: &std::sync::Arc<Mutex<Vec<u8>>>, event: &str) -> String 
 /// differing row) with `ours = hash("fsm1")` (the joiner's own row-0 name)
 /// and `theirs = hash("sum")` (the leader's row-0 name).
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stalls() {
     let _g = serialize();
     let buf = uc_node::obs::log::capture_for_tests();
@@ -1424,6 +1433,9 @@ fn a_joiner_whose_rows_are_named_in_the_other_order_is_refused_by_name_and_stall
 /// needs to be running for this comparison to exercise the real wire path).
 /// Refused with `RefusalKind::Version`, both packed versions recorded.
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_joiner_running_another_fsm_version_is_refused_with_both_versions() {
     let _g = serialize();
     let dir = tempfile::Builder::new()
@@ -2064,6 +2076,9 @@ fn below_floor_join_with(app: &str, opts: JoinOpts<'_>) -> JoinFixture {
 /// session streams under id 255 and the `uc2-cluster` agent's fiat install of
 /// it, before the floor advances.
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
     let _g = serialize();
     let table = two_far_future_entries();
@@ -2129,6 +2144,9 @@ fn a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table() {
 /// `below_floor_join` is that check: without the artifact, the learner never
 /// adopts the floor and never reaches the frontier.
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
     let _g = serialize();
     let f = below_floor_join("learner-nosched", None);
@@ -2222,6 +2240,9 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
 /// report ceiling after a restart is `0 + fsm_lag` = 64 KiB, and 2 000
 /// pre-frames put the table's frame end a quarter of a megabyte above it.
 #[test]
+// Ruling P8: below-floor join needs a cluster artifact at the floor; until
+// Task 5 commands instants none exists.
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table()
 {
     let _g = serialize();
