@@ -323,7 +323,7 @@ fn backup_of_a_stopped_node_verifies_and_reports_positions() {
 
     let manifest = std::fs::read_to_string(out.join("MANIFEST")).expect("read MANIFEST");
     assert!(
-        manifest.contains("format=uc2-backup-v2"),
+        manifest.contains("format=uc2-backup-v3"),
         "manifest: {manifest}"
     );
     assert!(
@@ -1263,7 +1263,7 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
         );
     }
     let manifest = std::fs::read_to_string(artifact.join("MANIFEST")).unwrap();
-    assert!(manifest.contains("format=uc2-backup-v2\n"), "{manifest}");
+    assert!(manifest.contains("format=uc2-backup-v3\n"), "{manifest}");
     assert!(manifest.contains("newest_snapshot.0="), "{manifest}");
     assert!(manifest.contains("newest_snapshot.7=none\n"), "{manifest}");
 
@@ -1324,4 +1324,98 @@ fn verify_reports_a_hole_for_the_id_whose_snapshot_is_missing() {
     }
     // A MANIFEST that still claims FSM 1's snapshot is a mismatch too — but
     // the Hole is reported first (coverage before cross-check, as today).
+}
+
+// --------------------------------------------------------------------- Test 16
+
+/// The genesis cluster state — the seed `cluster_agent::recover` is handed
+/// when it finds no artifact, and the base for the one this file writes by
+/// hand below.
+fn cluster_genesis() -> uc_node::ClusterState {
+    uc_node::ClusterState {
+        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
+        table: uc_protocol::v2::schedule::ScheduleTable {
+            entries: Vec::new(),
+        },
+        table_position: 0,
+        settings: uc_protocol::v2::settings::Settings::genesis_default(),
+        applied: 0,
+    }
+}
+
+/// Write a REAL cluster artifact (`ClusterFsm::freeze`'s image, magic +
+/// version + CRC and all) at `pos` into `<dir>/snapshots/cluster/`, the way
+/// the `uc2-cluster` agent's `take_snapshot` would.
+///
+/// This file's node is built `none_for_tests()` (nothing declared), and the
+/// agent's bridging trigger only fires once EVERY declared row has
+/// snapshotted — so a harness node never writes one of these on its own,
+/// exactly as `publish_snapshot_and_wait_for_purge` has to fake a row's
+/// `.ultsnap` for the same reason.
+fn write_cluster_artifact(dir: &Path, pos: u64) -> u64 {
+    use uc_service::SnapshotStateMachine;
+    let mut fsm = uc_node::ClusterFsm::new(cluster_genesis(), Vec::new());
+    fsm.set_consumed(pos);
+    let (img, p) = fsm.freeze().expect("freeze the cluster image");
+    assert_eq!(p, pos, "the image is tagged at the consumed position");
+    let cluster_dir = dir.join("snapshots").join("cluster");
+    std::fs::create_dir_all(&cluster_dir).expect("mkdir snapshots/cluster");
+    std::fs::write(cluster_dir.join(format!("snap-{pos}.ultcluster")), &img)
+        .expect("write the cluster artifact");
+    pos
+}
+
+/// Cluster FSM (spec §4.7, plan-1 pre-final fix A): `snapshots/cluster/` is
+/// an artifact family like `snapshots/<id>/`, so backup must copy it, verify
+/// must check it, and restore must lay it down. Without it a restored node
+/// rebuilds its cluster row (membership, the schedule table, settings) from
+/// genesis plus whatever `CLUSTER` frames the restored journal still holds —
+/// which is nothing at all once the journal has been purged below the
+/// artifact, since the artifact is exactly what bounds that purge floor
+/// (`maybe_persist_snapshot_floor`).
+#[test]
+fn backup_and_restore_carry_the_cluster_artifact() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "clusterart";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    let cluster_pos = write_cluster_artifact(&dir, 4096);
+
+    let out = root.path().join("clusterart-out");
+    let report = backup_instance(&dir, &out).expect("backup_instance");
+    assert_eq!(report.newest_cluster_snapshot, Some(cluster_pos));
+    let manifest = std::fs::read_to_string(out.join("MANIFEST")).expect("read MANIFEST");
+    assert!(
+        manifest.contains(&format!("newest_cluster_snapshot={cluster_pos}\n")),
+        "manifest: {manifest}"
+    );
+    assert!(
+        out.join("snapshots")
+            .join("cluster")
+            .join(format!("snap-{cluster_pos}.ultcluster"))
+            .is_file(),
+        "the backup artifact carries snapshots/cluster/"
+    );
+    verify_artifact(&out).expect("verify_artifact");
+
+    let fresh = root.path().join("n0-restored");
+    restore_artifact(&out, &fresh).expect("restore_artifact");
+    let (fsm, got) = uc_node::cluster_agent::recover(
+        &uc_node::cluster_agent::snapshot_dir_of(&fresh),
+        cluster_genesis(),
+        Vec::new(),
+    )
+    .expect("recover the restored cluster FSM");
+    assert_eq!(
+        got, cluster_pos,
+        "the restored instance dir rebuilds the cluster FSM from the artifact, not from genesis"
+    );
+    assert_eq!(fsm.state().applied, cluster_pos);
 }

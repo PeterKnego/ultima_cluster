@@ -829,6 +829,15 @@ fn print_backup_report(r: &uc_node::backup::BackupReport) {
             .map(|p| p.to_string())
             .unwrap_or_else(|| "none".to_string())
     );
+    // Cluster FSM (spec §4.7): the cluster row's artifact, on its own line —
+    // it is not a declared row, so it is neither one of the
+    // `newest_snapshot.<id>` lines nor part of the aggregate above.
+    println!(
+        "newest_cluster_snapshot={}",
+        r.newest_cluster_snapshot
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
     println!("snapshot_floor={}", r.snapshot_floor);
     println!("healed_torn_tail={}", r.healed_torn_tail);
     println!("files={}", r.files);

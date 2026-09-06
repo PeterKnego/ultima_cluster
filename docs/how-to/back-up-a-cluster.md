@@ -15,7 +15,9 @@ before you decide which one you need.
 `uc2ctl backup` copies exactly the node's **durable** subdirectories —
 `journal/`, `state/`, `snapshots/<id>/` for every FSM id present — one
 directory per declared service since M14 — filtered to complete
-`snap-<pos>.ultsnap` files — into a fresh artifact directory. It never
+`snap-<pos>.ultsnap` files — plus `snapshots/cluster/`, the **cluster FSM's**
+own family (`snap-<pos>.ultcluster`: membership, the schedule table and the
+settings record, since 2.11) — into a fresh artifact directory. It never
 touches `cnc2.dat`, `log.buf`, the ring files, or `instance.lock`: those are
 volatile, and a node's next boot recreates them unconditionally regardless of
 what a backup or restore did. **`audit.jsonl` is not part of the artifact
@@ -41,6 +43,7 @@ the source's current frontier):
 journal_first_base=0
 journal_last_pos=5242880
 newest_snapshot=none
+newest_cluster_snapshot=none
 snapshot_floor=0
 healed_torn_tail=true
 files=3
@@ -63,7 +66,7 @@ directory.
 ## The ordering rule, and why it matters
 
 The three directories copy in one fixed order, one fully before the next
-starts: **`journal/` → `state/` → `snapshots/<id>/`**. This is not incidental — it
+starts: **`journal/` → `state/` → `snapshots/<id>/` → `snapshots/cluster/`**. This is not incidental — it
 is the entire correctness argument for taking a backup while purge is running
 concurrently underneath it:
 
@@ -146,7 +149,18 @@ Verify:
    rebuilt, even if every other declared FSM's snapshot is fine. A purged
    journal with no `snapshots/` directory at all is FSM 0's hole (the one id
    every node declares).
-5. If a `MANIFEST` file is present (every `uc2ctl backup` artifact writes
+5. Decodes the newest `snapshots/cluster/snap-<pos>.ultcluster` through the
+   **same** image decoder a joiner installs it with — magic, image version,
+   CRC32, every bounds check — so a verified artifact is one whose cluster
+   row a restored node can actually boot from. A failure is a
+   `corrupt cluster artifact <path>` refusal. The cluster family is covered
+   too: if it is present and the journal is purged, its newest artifact must
+   cover `first_base` (a `hole: service 255` refusal, `255` being the id the
+   snapshot session already reserves for the cluster artifact). A purged
+   journal with **no** cluster family at all is not a hole — a node
+   legitimately purges under its rows' floor alone during the window before
+   the `uc2-cluster` agent writes its first artifact.
+6. If a `MANIFEST` file is present (every `uc2ctl backup` artifact writes
    one), cross-checks its recorded positions against what verify just
    recovered — catching tampering or bitrot at the metadata level. A
    mismatch fails with `ManifestMismatch`.
@@ -202,10 +216,11 @@ for it):
 
 | Key | Meaning |
 |---|---|
-| `format` | `uc2-backup-v2` |
+| `format` | `uc2-backup-v3` |
 | `journal_first_base` | lowest position still covered by the artifact's journal; `0` = unpurged/empty |
 | `journal_last_pos` | the artifact's recovered durable frontier |
 | `newest_snapshot.<id>` | one line for every id `0..8`: highest `snap-<pos>.ultsnap` position found in `snapshots/<id>/`, or `none` |
+| `newest_cluster_snapshot` | highest `snap-<pos>.ultcluster` position found in `snapshots/cluster/`, or `none` — the **cluster FSM's** artifact (membership, the schedule table, settings), which is not a declared row and so gets its own line rather than a ninth `newest_snapshot.<id>` |
 | `snapshot_floor` | the durably-persisted snapshot floor from `state/snapshot.state` |
 | `healed_torn_tail` | whether making this artifact healed a torn active-segment tail |
 | `created_unix_ns` | wall-clock creation time |

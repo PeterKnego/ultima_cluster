@@ -21,6 +21,18 @@
 //! case one generation stale, per `uc_journal::stable_value`'s
 //! `pick_slot`).
 //!
+//! `snapshots/` holds two artifact FAMILIES: the numbered per-FSM ones
+//! (`snapshots/<id>/snap-<pos>.ultsnap`, M14a) and, since the cluster FSM
+//! (spec §4.7), the cluster row's own `snapshots/cluster/snap-<pos>.ultcluster`
+//! — membership, the schedule table and the settings record. Both are copied,
+//! verified and restored; `cluster` is not a `u8`, so
+//! [`snapshot_ids_present`] never returns it and the two are handled
+//! separately throughout. The cluster family matters for the same reason the
+//! numbered ones do: `maybe_persist_snapshot_floor` bounds the purge floor by
+//! the cluster artifact's position, so on a purged node the `CLUSTER` frames
+//! that built the cluster row are gone from the journal and the artifact is
+//! the only thing a restored node can rebuild that row from.
+//!
 //! # The ordering rule
 //!
 //! [`backup_instance`] copies, in this exact order, one directory fully
@@ -105,7 +117,29 @@ const STATE_FILES: [&str; 5] = [
 const SNAP_PREFIX: &str = "snap-";
 const SNAP_SUFFIX: &str = ".ultsnap";
 
-const MANIFEST_FORMAT: &str = "uc2-backup-v2";
+/// Cluster FSM (spec §4.7): the cluster row's own artifact family lives
+/// beside the numbered per-FSM ones, under `snapshots/cluster/`, and its
+/// files are `snap-<pos>.ultcluster` rather than `.ultsnap`. `cluster` is
+/// not a `u8`, so [`snapshot_ids_present`] never returns it — the two
+/// families are scanned, copied and covered separately throughout this
+/// module.
+const CLUSTER_DIR: &str = "cluster";
+const CLUSTER_SNAP_SUFFIX: &str = ".ultcluster";
+
+/// The `service` a cluster-family [`BackupError::Hole`] names. `255` is the
+/// id the snapshot session already reserves for the cluster artifact
+/// (`uc_net::sender::CLUSTER_ARTIFACT_ID`), and it can never collide with a
+/// real row (`CNC_MAX_SERVICES` is 8). Pinned equal to that constant by
+/// `cluster_hole_id_matches_the_snapshot_sessions_reserved_id`.
+const CLUSTER_HOLE_ID: u8 = 255;
+
+/// `uc2-backup-v3` adds the `newest_cluster_snapshot` line (the cluster
+/// artifact family). `v2` was M14a's per-id `newest_snapshot.<id>` lines;
+/// `v1` the single-FSM original. A manifest naming an older format is
+/// refused by [`check_manifest`] rather than read leniently — an artifact
+/// from a node that predates the cluster FSM also predates the 2.11.0 frame
+/// relayout, so its journal cannot be restored into this build anyway.
+const MANIFEST_FORMAT: &str = "uc2-backup-v3";
 
 /// Bounded retry count for [`copy_dir_sorted`]'s whole-directory retry on a
 /// vanished source file. See that function's doc for why bounded and why a
@@ -128,6 +162,14 @@ pub struct BackupReport {
     /// is empty) for that id. Offline and config-blind: whatever
     /// `snapshots/<id>/` directories exist on disk are the ids present.
     pub newest_snapshots: [Option<u64>; CNC_MAX_SERVICES],
+    /// Cluster FSM (spec §4.7): the highest position of any complete
+    /// (`snap-<pos>.ultcluster`) artifact in `snapshots/cluster/`, or `None`
+    /// if that directory is absent or empty. Kept OUT of
+    /// [`Self::newest_snapshots`] — that array is indexed by declared row id
+    /// and the cluster row has none (it is `255` on the snapshot session,
+    /// not a slot) — and out of [`Self::newest_snapshot`], which answers
+    /// "how fresh is the slowest USER FSM".
+    pub newest_cluster_snapshot: Option<u64>,
     /// The durably-persisted snapshot floor from `state/snapshot.state`
     /// (`0` if never set).
     pub snapshot_floor: u64,
@@ -186,6 +228,15 @@ pub enum BackupError {
     /// recovered state — tampering or bitrot at the metadata level.
     #[error("manifest mismatch: {0}")]
     ManifestMismatch(String),
+    /// Cluster FSM (spec §4.7): `snapshots/cluster/`'s newest artifact does
+    /// not decode — bad magic, an unknown image version, a failed CRC32, or
+    /// a length a bounds check refused. Verify reads it through the SAME
+    /// decoder a joiner installs it with ([`crate::cluster_fsm::ClusterFsm`]'s
+    /// `install_snapshot`), so an artifact that verifies here is one a
+    /// restored node can actually boot from, not merely a file of the right
+    /// name.
+    #[error("corrupt cluster artifact {path}: {reason}")]
+    ClusterArtifactCorrupt { path: PathBuf, reason: String },
     /// `verify_artifact`'s target does not look like a backup artifact
     /// (missing `journal/`, `state/`, one of the five `state/*.state` files,
     /// or a `state/*.state` file that fails to decode on BOTH slots).
@@ -285,6 +336,22 @@ fn parse_snap_pos(name: &str) -> Option<u64> {
         .strip_suffix(SNAP_SUFFIX)?
         .parse()
         .ok()
+}
+
+/// [`parse_snap_pos`]'s twin for the cluster family — same `snap-<pos>`
+/// convention (so `cluster_agent::take_snapshot`'s `.ultcluster.part`
+/// in-progress write is ignored exactly as a row's `.tmp` is), different
+/// suffix.
+fn parse_cluster_snap_pos(name: &str) -> Option<u64> {
+    name.strip_prefix(SNAP_PREFIX)?
+        .strip_suffix(CLUSTER_SNAP_SUFFIX)?
+        .parse()
+        .ok()
+}
+
+/// `snapshots/cluster/` under `root`.
+fn cluster_snapshots_dir(root: &Path) -> PathBuf {
+    snapshots_dir(root).join(CLUSTER_DIR)
 }
 
 /// Copy every regular file directly under `src` matching `keep` into `dst`
@@ -421,6 +488,22 @@ fn copy_snapshot_tree(src_root: &Path, dst_root: &Path) -> Result<(), BackupErro
             |n| parse_snap_pos(n).is_some(),
         )?;
     }
+    // Cluster FSM (spec §4.7): the cluster row's family, LAST — the same
+    // ordering argument the module doc makes for `snapshots/` as a whole
+    // (copied after `journal/`, so it can only be fresher than the journal
+    // copy, never staler), applied to the one family whose absence a
+    // restored node cannot repair by replay: `maybe_persist_snapshot_floor`
+    // bounds the purge floor by this artifact's position, so once the
+    // journal is purged the `CLUSTER` frames that built the cluster row are
+    // gone and the artifact is the only remaining source of the cluster's
+    // membership, schedule table and settings.
+    if cluster_snapshots_dir(src_root).is_dir() {
+        copy_dir_sorted(
+            &cluster_snapshots_dir(src_root),
+            &cluster_snapshots_dir(dst_root),
+            |n| parse_cluster_snap_pos(n).is_some(),
+        )?;
+    }
     Ok(())
 }
 
@@ -550,6 +633,17 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     // 3. Snapshots: per id present, the newest complete `snap-<pos>.ultsnap`.
     let (newest_snapshots, snapshot_files) = scan_snapshot_tree(artifact)?;
 
+    // 3b. The CLUSTER family (spec §4.7): the newest complete
+    // `snap-<pos>.ultcluster`, decoded through the SAME `install_snapshot`
+    // a joiner (and a restarted node's `cluster_agent::recover`) uses — magic,
+    // image version, CRC32 and every bounds check — so "verified" means
+    // "restorable", not "a file of the right name exists".
+    let (newest_cluster_snapshot, cluster_files) =
+        scan_snapshots(&cluster_snapshots_dir(artifact), parse_cluster_snap_pos)?;
+    if let Some(pos) = newest_cluster_snapshot {
+        check_cluster_artifact(&cluster_snapshots_dir(artifact), pos)?;
+    }
+
     // 4. Coverage invariant, PER ID (M14a): every FSM whose directory exists
     // must be rebuildable from its own newest snapshot + the journal tail. A
     // purged journal with no snapshot directory at all is FSM 0's hole (the
@@ -573,15 +667,36 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
                 });
             }
         }
+        // The cluster row's own coverage, under `service: CLUSTER_HOLE_ID`
+        // (255 — the id the snapshot session already reserves for it, and not
+        // a slot). Checked ONLY when the family is present: a real node
+        // legitimately purges before the `uc2-cluster` agent's first artifact
+        // exists (`maybe_persist_snapshot_floor` bounds the floor by the
+        // cluster artifact only once it is non-zero), so demanding one on
+        // every purged artifact would make `backup_instance` refuse
+        // perfectly good backups during that window. Once the family exists,
+        // the same ordering rule that covers a row covers it: the copy is
+        // taken after the journal, and the agent's tag is its consumed
+        // cursor, which only advances.
+        if let Some(pos) = newest_cluster_snapshot
+            && pos < journal_first_base
+        {
+            return Err(BackupError::Hole {
+                service: CLUSTER_HOLE_ID,
+                first_base: journal_first_base,
+                newest_snapshot: newest_cluster_snapshot,
+            });
+        }
     }
 
     let report = BackupReport {
         journal_first_base,
         journal_last_pos,
         newest_snapshots,
+        newest_cluster_snapshot,
         snapshot_floor,
         healed_torn_tail,
-        files: journal_files + STATE_FILES.len() + snapshot_files,
+        files: journal_files + STATE_FILES.len() + snapshot_files + cluster_files,
     };
 
     // 5. Cross-check a shipped MANIFEST, if present.
@@ -726,10 +841,12 @@ where
 }
 
 /// `(newest position, count of complete snapshot files)`. `None`/`0` if the
-/// directory is absent (no snapshots ever published) or empty. Anything not
-/// matching `snap-<pos>.ultsnap` (in particular `.tmp` in-progress writes) is
+/// directory is absent (no snapshots ever published) or empty. Anything
+/// `parse` rejects (in particular `.tmp`/`.part` in-progress writes) is
 /// ignored, same convention as `uc_service::snapshots::SnapshotStore`.
-fn scan_snapshots(dir: &Path) -> io::Result<(Option<u64>, usize)> {
+/// `parse` is [`parse_snap_pos`] for a numbered row's `.ultsnap` family and
+/// [`parse_cluster_snap_pos`] for the cluster row's `.ultcluster` one.
+fn scan_snapshots(dir: &Path, parse: fn(&str) -> Option<u64>) -> io::Result<(Option<u64>, usize)> {
     if !dir.is_dir() {
         return Ok((None, 0));
     }
@@ -742,13 +859,44 @@ fn scan_snapshots(dir: &Path) -> io::Result<(Option<u64>, usize)> {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pos) = parse_snap_pos(name) else {
+        let Some(pos) = parse(name) else {
             continue;
         };
         count += 1;
         newest = Some(newest.map_or(pos, |n| n.max(pos)));
     }
     Ok((newest, count))
+}
+
+/// Cluster FSM (spec §4.7): decode `snapshots/cluster/snap-<pos>.ultcluster`
+/// through [`ClusterFsm::install_snapshot`] — the same decoder a joiner
+/// installs the shipped artifact with and a restarted node recovers from
+/// (`cluster_agent::recover`) — so a verify that passes means the cluster
+/// row is actually restorable. Nothing of the decoded state is kept: this is
+/// a checksum-and-bounds pass, and the `ClusterFsm` it builds is a scratch
+/// one seeded from an empty genesis (the declared hashes are irrelevant —
+/// `install_snapshot` never consults them, exactly as
+/// `cluster_agent::read_committed_table` relies on).
+fn check_cluster_artifact(dir: &Path, pos: u64) -> Result<(), BackupError> {
+    use uc_service::SnapshotStateMachine;
+    let path = crate::cluster_agent::artifact_path(dir, pos);
+    let mut f = fs::File::open(&path)?;
+    let genesis = crate::cluster_fsm::ClusterState {
+        membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
+        table: uc_protocol::v2::schedule::ScheduleTable {
+            entries: Vec::new(),
+        },
+        table_position: 0,
+        settings: uc_protocol::v2::settings::Settings::genesis_default(),
+        applied: 0,
+    };
+    crate::cluster_fsm::ClusterFsm::new(genesis, Vec::new())
+        .install_snapshot(pos, &mut f)
+        .map_err(|e| BackupError::ClusterArtifactCorrupt {
+            path: path.clone(),
+            reason: e.to_string(),
+        })?;
+    Ok(())
 }
 
 /// Per id present under `root`'s `snapshots/`: the newest complete artifact
@@ -758,7 +906,7 @@ fn scan_snapshot_tree(root: &Path) -> io::Result<([Option<u64>; CNC_MAX_SERVICES
     let mut newest = [None; CNC_MAX_SERVICES];
     let mut count = 0;
     for id in snapshot_ids_present(root)? {
-        let (n, c) = scan_snapshots(&snapshots_dir(root).join(id.to_string()))?;
+        let (n, c) = scan_snapshots(&snapshots_dir(root).join(id.to_string()), parse_snap_pos)?;
         newest[id as usize] = n;
         count += c;
     }
@@ -790,6 +938,14 @@ fn write_manifest(dir: &Path, report: &BackupReport) -> Result<(), BackupError> 
             manifest_value(report.newest_snapshots[id])
         ));
     }
+    // The cluster row's family (spec §4.7), one line, `none` when the node
+    // never wrote one — deliberately NOT `newest_snapshot.255`: it is not a
+    // slot, and a reader scanning `newest_snapshot.<id>` lines must not pick
+    // it up as a ninth row.
+    contents.push_str(&format!(
+        "newest_cluster_snapshot={}\n",
+        manifest_value(report.newest_cluster_snapshot)
+    ));
     contents.push_str(&format!(
         "snapshot_floor={}\nhealed_torn_tail={}\ncreated_unix_ns={}\n",
         report.snapshot_floor, report.healed_torn_tail, created_unix_ns,
@@ -866,6 +1022,20 @@ fn check_manifest(path: &Path, report: &BackupReport) -> Result<(), BackupError>
         }
     }
 
+    let raw = get("newest_cluster_snapshot")?;
+    let ncs: Option<u64> = if raw == "none" {
+        None
+    } else {
+        Some(parse_u64("newest_cluster_snapshot", raw)?)
+    };
+    if ncs != report.newest_cluster_snapshot {
+        return Err(mismatch(
+            "newest_cluster_snapshot",
+            manifest_value(ncs),
+            manifest_value(report.newest_cluster_snapshot),
+        ));
+    }
+
     let sf = parse_u64("snapshot_floor", get("snapshot_floor")?)?;
     if sf != report.snapshot_floor {
         return Err(mismatch(
@@ -916,6 +1086,71 @@ mod tests {
         assert_eq!(parse_snap_pos("garbage"), None);
     }
 
+    /// The cluster family's parser, same `snap-<pos>` convention as a row's
+    /// but a different suffix — and neither parser may accept the other's
+    /// name (a `.ultsnap` counted as a cluster artifact would tag the cluster
+    /// row at a user FSM's position, and vice versa).
+    #[test]
+    fn parse_cluster_snap_pos_matches_the_agents_convention() {
+        assert_eq!(parse_cluster_snap_pos("snap-4096.ultcluster"), Some(4096));
+        assert_eq!(parse_cluster_snap_pos("snap-0.ultcluster"), Some(0));
+        // `take_snapshot`'s in-progress write, and the other family's name.
+        assert_eq!(parse_cluster_snap_pos("snap-4096.ultcluster.part"), None);
+        assert_eq!(parse_cluster_snap_pos("snap-4096.ultsnap"), None);
+        assert_eq!(parse_snap_pos("snap-4096.ultcluster"), None);
+    }
+
+    /// `cluster` is not a `u8`, so the per-row scan skips it — the property
+    /// that made backup drop the whole family before this fix, kept as a
+    /// pinned expectation rather than an accident of `u8::from_str`.
+    #[test]
+    fn snapshot_ids_present_never_returns_the_cluster_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(snapshots_dir(dir.path()).join("0")).unwrap();
+        fs::create_dir_all(cluster_snapshots_dir(dir.path())).unwrap();
+        assert_eq!(snapshot_ids_present(dir.path()).unwrap(), vec![0]);
+    }
+
+    /// A cluster-family `Hole` names the id the snapshot session already
+    /// reserves for the artifact, so an operator reading either surface sees
+    /// the same number.
+    #[test]
+    fn cluster_hole_id_matches_the_snapshot_sessions_reserved_id() {
+        assert_eq!(CLUSTER_HOLE_ID, uc_net::sender::CLUSTER_ARTIFACT_ID);
+        assert!(CLUSTER_HOLE_ID as usize >= CNC_MAX_SERVICES);
+    }
+
+    /// Bit-flip the newest cluster artifact: verify must refuse it by name
+    /// rather than carry an image no restored node could install.
+    #[test]
+    fn a_corrupt_cluster_artifact_is_caught() {
+        use uc_service::SnapshotStateMachine;
+        let dir = tempfile::tempdir().unwrap();
+        let cdir = cluster_snapshots_dir(dir.path());
+        fs::create_dir_all(&cdir).unwrap();
+        let genesis = crate::cluster_fsm::ClusterState {
+            membership: uc_consensus::config::ClusterConfig::genesis(Vec::new(), Vec::new()),
+            table: uc_protocol::v2::schedule::ScheduleTable {
+                entries: Vec::new(),
+            },
+            table_position: 0,
+            settings: uc_protocol::v2::settings::Settings::genesis_default(),
+            applied: 0,
+        };
+        let mut fsm = crate::cluster_fsm::ClusterFsm::new(genesis, Vec::new());
+        fsm.set_consumed(4096);
+        let (mut img, pos) = fsm.freeze().unwrap();
+        fs::write(crate::cluster_agent::artifact_path(&cdir, pos), &img).unwrap();
+        check_cluster_artifact(&cdir, pos).expect("the artifact as written must verify");
+        let last = img.len() - 1;
+        img[last] ^= 0xFF; // the trailing CRC32
+        fs::write(crate::cluster_agent::artifact_path(&cdir, pos), &img).unwrap();
+        assert!(matches!(
+            check_cluster_artifact(&cdir, pos),
+            Err(BackupError::ClusterArtifactCorrupt { .. })
+        ));
+    }
+
     #[test]
     fn manifest_roundtrips() {
         let mut newest_snapshots = [None; CNC_MAX_SERVICES];
@@ -924,6 +1159,7 @@ mod tests {
             journal_first_base: 100,
             journal_last_pos: 5000,
             newest_snapshots,
+            newest_cluster_snapshot: Some(4096),
             snapshot_floor: 200,
             healed_torn_tail: true,
             files: 7,
@@ -940,6 +1176,7 @@ mod tests {
             journal_first_base: 0,
             journal_last_pos: 5000,
             newest_snapshots: [None; CNC_MAX_SERVICES],
+            newest_cluster_snapshot: None,
             snapshot_floor: 0,
             healed_torn_tail: false,
             files: 3,
@@ -957,6 +1194,7 @@ mod tests {
             journal_first_base: 100,
             journal_last_pos: 5000,
             newest_snapshots,
+            newest_cluster_snapshot: Some(4096),
             snapshot_floor: 200,
             healed_torn_tail: false,
             files: 7,
@@ -981,6 +1219,7 @@ mod tests {
             journal_first_base: 0,
             journal_last_pos: 5000,
             newest_snapshots: [None; CNC_MAX_SERVICES],
+            newest_cluster_snapshot: None,
             snapshot_floor: 0,
             healed_torn_tail: true,
             files: 3,
@@ -1007,6 +1246,7 @@ mod tests {
             journal_first_base: 0,
             journal_last_pos: 5000,
             newest_snapshots: [None; CNC_MAX_SERVICES],
+            newest_cluster_snapshot: None,
             snapshot_floor: 0,
             healed_torn_tail: false,
             files: 3,
