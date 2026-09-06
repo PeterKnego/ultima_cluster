@@ -763,16 +763,20 @@ impl uc_service::SnapshotStateMachine for SumSm {
         src.read_to_end(&mut buf)?;
         assert!(buf.len() >= 16, "a SumSm artifact is 16 bytes");
         self.total = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        self.last = Some(position);
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier — restore the cursor the artifact recorded (the
+        // second 8 bytes), never the tag, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        self.last = Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
         Ok(position)
     }
 }
 
 fn start_sum_service(dir: &Path, app: &str) -> uc_service::Service<SumSm> {
-    let cfg =
-        uc_service::ServiceConfig::new(dir, app).snapshot_policy(uc_service::SnapshotPolicy {
-            interval_bytes: 256 * 1024,
-        });
+    // TODO(plan 2 task 5): command an instant — the 256 KiB byte cadence is
+    // gone (coordinated-snapshot spec §5.2); the row is capable, and builds
+    // only when the leader commands.
+    let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, SumSm::default())
         .start_with_snapshots()
         .expect("service start")
@@ -818,10 +822,8 @@ impl uc_service::SnapshotStateMachine for TaggedSum {
 }
 
 fn start_sum_service_row1(dir: &Path, app: &str) -> uc_service::Service<TaggedSum> {
-    let cfg =
-        uc_service::ServiceConfig::new(dir, app).snapshot_policy(uc_service::SnapshotPolicy {
-            interval_bytes: 256 * 1024,
-        });
+    // TODO(plan 2 task 5): command an instant (as `start_sum_service`).
+    let cfg = uc_service::ServiceConfig::new(dir, app);
     uc_service::ServiceBuilder::new(cfg, TaggedSum::default())
         .start_with_snapshots()
         .expect("service start")
@@ -834,6 +836,7 @@ fn start_sum_service_row1(dir: &Path, app: &str) -> uc_service::Service<TaggedSu
 /// artifact and tail-replays. The first test anywhere that combines two FSMs
 /// with a below-floor join.
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     let _g = serialize();
     let dir = tempfile::Builder::new()

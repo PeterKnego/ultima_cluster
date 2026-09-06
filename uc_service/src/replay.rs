@@ -204,7 +204,13 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                 // Dispatch MESSAGE frames, and TIMER frames addressed to THIS
                 // row, that are not already reflected in the SM. PADDING /
                 // NEW_TERM / CONFIG (and any future type that is neither) are
-                // not user data. Leader-publish suppressed: apply only (see the
+                // not user data. SNAPSHOT (type 7, coordinated-snapshot spec
+                // §5.2) falls through here DELIBERATELY: this is the journal
+                // walk that rebuilds a restarted service's state, and freezing
+                // an artifact for an instant the cluster passed long ago is
+                // meaningless work — the row's artifact for a live instant is
+                // built by the live apply loop, which is the only place that
+                // instant's `busy`/builder handoff exists. Leader-publish suppressed: apply only (see the
                 // doc), so the response bytes land in the throwaway scratch. A
                 // typed SM decodes inside its blanket `RawStateMachine` impl and
                 // fail-stops there on a committed, archived frame that will not

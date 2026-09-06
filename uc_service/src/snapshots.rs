@@ -116,7 +116,13 @@ impl SnapshotStore {
         }
         let final_path = self.path_for(pos);
         std::fs::rename(&tmp_path, &final_path)?;
-        self.retain_newest(2)?;
+        // Coordinated-snapshot spec §5.3 (plan-2 ruling P1): retention is
+        // NODE-owned. The node keeps the newest COMPLETE set plus anything
+        // newer and deletes the rest; a per-writer "newest 2" pruner here
+        // cannot see sets, so two abandoned instants after a complete set at
+        // P would delete P — and the ship gate ("the complete set at my
+        // floor") would then decline MISSING forever. `retain_newest` stays
+        // for the node-side pruner (Task 5) to reuse.
         Ok(final_path)
     }
 
@@ -125,6 +131,7 @@ impl SnapshotStore {
     /// is not an error here — nothing else in this single-writer module
     /// deletes snapshot files, but tolerating a `NotFound` keeps this robust
     /// against, say, an operator manually clearing the directory.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn retain_newest(&self, keep: usize) -> io::Result<()> {
         let mut all: Vec<(u64, PathBuf)> = std::fs::read_dir(&self.dir)?
             .filter_map(|e| e.ok())
@@ -236,21 +243,34 @@ mod tests {
         assert!(store.newest(500).unwrap().is_none());
     }
 
+    /// Coordinated-snapshot ruling P1: `publish` no longer prunes — retention
+    /// is node-owned, because only the node can see which artifacts form a
+    /// COMPLETE set. `retain_newest` itself is unchanged and still keeps the
+    /// newest `keep`; the node-side pruner (Task 5) is its next caller.
     #[test]
-    fn retention_keeps_only_the_newest_two() {
+    fn publish_never_prunes_and_retain_newest_still_keeps_the_newest_two() {
         let dir = tempfile::tempdir().unwrap();
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
         for pos in [100u64, 200, 300, 400] {
             store.publish(pos, ok_write(b"x")).unwrap();
         }
-        let mut remaining: Vec<u64> = std::fs::read_dir(dir.path().join("snapshots").join("0"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter_map(|e| parse_snap_pos(&e.file_name().to_string_lossy()))
-            .collect();
-        remaining.sort_unstable();
+        let on_disk = |()| -> Vec<u64> {
+            let mut v: Vec<u64> = std::fs::read_dir(dir.path().join("snapshots").join("0"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| parse_snap_pos(&e.file_name().to_string_lossy()))
+                .collect();
+            v.sort_unstable();
+            v
+        };
         assert_eq!(
-            remaining,
+            on_disk(()),
+            vec![100, 200, 300, 400],
+            "publish keeps every artifact: the node decides what is garbage"
+        );
+        store.retain_newest(2).unwrap();
+        assert_eq!(
+            on_disk(()),
             vec![300, 400],
             "keep-newest-2, oldest two unlinked"
         );

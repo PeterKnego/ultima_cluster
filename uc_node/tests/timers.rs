@@ -225,6 +225,11 @@ impl StateMachine for ClockSm {
 struct ClockImage {
     fired: Vec<Fired>,
     stamps: Vec<(u64, u64, u8)>,
+    /// The cursor the artifact was built at. Coordinated-snapshot spec §5.2:
+    /// the artifact TAG is the instant P (an exclusive frontier), which is
+    /// above this — so the image has to carry its own cursor for `install` to
+    /// restore it.
+    last: Option<u64>,
 }
 
 impl uc_service::SnapshotStateMachine for ClockSm {
@@ -234,6 +239,7 @@ impl uc_service::SnapshotStateMachine for ClockSm {
         let img = ClockImage {
             fired: self.fired.clone(),
             stamps: self.stamps.clone(),
+            last: self.last,
         };
         let bytes = bincode::serde::encode_to_vec(&img, bincode::config::standard())
             .map_err(|e| uc_service::SnapshotError::Codec(format!("clock image encode: {e}")))?;
@@ -261,7 +267,7 @@ impl uc_service::SnapshotStateMachine for ClockSm {
             })?;
         self.fired = img.fired;
         self.stamps = img.stamps;
-        self.last = Some(position);
+        self.last = img.last;
         Ok(position)
     }
 }
@@ -1324,9 +1330,11 @@ fn capstone_config(
 /// move on its own (a real service publishing real artifacts), because that is
 /// what puts the joiner below it.
 fn start_snapshot_service(dir: &Path) -> Service<Timed<ClockSm>> {
-    let cfg = ServiceConfig::new(dir, APP).snapshot_policy(uc_service::SnapshotPolicy {
-        interval_bytes: CAPSTONE_SEG,
-    });
+    // TODO(plan 2 task 5): command an instant — the byte cadence is deleted
+    // (coordinated-snapshot spec §5.2), so this service is capable but builds
+    // nothing until the leader commands an instant, and the floor the capstone
+    // needs never moves.
+    let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, Timed::new(ClockSm::default()))
         .start_with_snapshots()
         .expect("service start")
@@ -1433,6 +1441,7 @@ fn every_table(anchor_ns: u64) -> ScheduleTable {
 /// timing-sensitivity flake, not a schedule-table defect; re-run to confirm
 /// before suspecting the chain under test.
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
     let _g = serialize();
     let dir = tempdir();

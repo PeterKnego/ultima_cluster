@@ -625,6 +625,11 @@ fn elle_partition() {
 #[test]
 #[ignore]
 fn elle_purge() {
+    // TODO(plan 2 task 5): command an instant — `snapshot_interval_bytes` no
+    // longer configures a cadence (coordinated-snapshot spec §5.2), so this
+    // pass's "purge advanced the archive floor" non-vacuity check cannot be
+    // satisfied until the leader commands instants. `scripts/elle_check.sh`
+    // runs this pass.
     let ccfg = ClusterCfg {
         purge: uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,

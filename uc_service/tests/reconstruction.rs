@@ -19,7 +19,7 @@ use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
-use uc_service::{ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
+use uc_service::{ApplyCtx, Service, ServiceBuilder, ServiceConfig, StateMachine};
 
 use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
 
@@ -98,11 +98,14 @@ impl uc_service::SnapshotStateMachine for CountSm {
     ) -> Result<u64, uc_service::SnapshotError> {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(src, &mut buf)?;
-        let ((total, _last), _): ((u64, Option<u64>), usize) =
+        let ((total, last), _): ((u64, Option<u64>), usize) =
             bincode::serde::decode_from_slice(&buf, bincode::config::standard())
                 .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
         self.total = total;
-        self.last_applied = Some(position);
+        // Spec §5.2: the tag is the instant P, an EXCLUSIVE frontier — restore
+        // the cursor the artifact recorded, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        self.last_applied = last;
         Ok(position)
     }
 }
@@ -391,20 +394,20 @@ fn purged_node_after_snapshotting_service(dir: &Path, app: &str, n: u32) -> (Nod
     let node = start_purge_node(dir, app, RegisterSm::NAME);
     wait_until(|| node.can_serve());
 
-    let svc1 = ServiceBuilder::new(
-        ServiceConfig::new(dir, app).snapshot_policy(SnapshotPolicy {
-            interval_bytes: 4 * 1024,
-        }),
-        RegisterSm::default(),
-    )
-    .start_with_snapshots()
-    .unwrap();
+    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir, app), RegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
 
     let prod = open_ingress(dir);
     for i in 1..=n {
         write_reg(&prod, i, i as u64);
     }
     wait_commit_covers_all(&node);
+    // Coordinated-snapshot spec §5.2: the instant comes from the LOG. Command
+    // one once every write is committed, so P sits at the live frontier and
+    // the purge below it drops essentially the whole prefix — which is what
+    // puts the next incarnation below the floor.
+    node.append_snapshot_for_test(0).unwrap();
     // A snapshot was published AND the node purged below it.
     let cnc = open_cnc(dir, app);
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
@@ -437,12 +440,9 @@ fn fresh_service_below_purge_floor_installs_snapshot_then_tail_replays() {
     // purge floor → the gap guard installs the covering snapshot, then tail
     // replay carries it to the live frontier — state == snapshot prefix + tail,
     // exactly once.
-    let svc2 = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy { interval_bytes: 0 }),
-        RegisterSm::default(),
-    )
-    .start_with_snapshots()
-    .unwrap();
+    let svc2 = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), RegisterSm::default())
+        .start_with_snapshots()
+        .unwrap();
     let cnc = open_cnc(dir.path(), app);
     wait_service_caught_up(&cnc);
     assert_eq!(
@@ -527,19 +527,16 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
 
     let node = start_purge_node(dir.path(), app, CountSm::NAME);
     wait_until(|| node.can_serve());
-    let svc1 = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy {
-            interval_bytes: 4 * 1024,
-        }),
-        CountSm::default(),
-    )
-    .start_with_snapshots()
-    .unwrap();
+    let svc1 = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), CountSm::default())
+        .start_with_snapshots()
+        .unwrap();
     let prod = open_ingress(dir.path());
     for i in 1..=n {
         write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
     }
     wait_commit_covers_all(&node);
+    // Spec §5.2: command the instant (see `purged_node_after_snapshotting_service`).
+    node.append_snapshot_for_test(0).unwrap();
     let cnc = open_cnc(dir.path(), app);
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
     wait_until(|| node.archive_first_base() > 0);
@@ -554,12 +551,9 @@ fn snapshotting_count_sm_below_floor_recovers_exact_total() {
 
     // Fresh snapshot-capable CountSm: install the covering snapshot (its prefix
     // total), then tail-replay the rest → the exact grand total, no prefix lost.
-    let svc2 = ServiceBuilder::new(
-        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy { interval_bytes: 0 }),
-        CountSm::default(),
-    )
-    .start_with_snapshots()
-    .unwrap();
+    let svc2 = ServiceBuilder::new(ServiceConfig::new(dir.path(), app), CountSm::default())
+        .start_with_snapshots()
+        .unwrap();
     wait_service_caught_up(&cnc);
     assert_eq!(
         query_total(&svc2),

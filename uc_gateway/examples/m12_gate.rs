@@ -86,8 +86,7 @@ use uc_remote::{
 };
 use uc_service::{
     ApplyCtx, RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig,
-    SessionConfig, Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine,
-    TAG_FRESH,
+    SessionConfig, Sessioned, SnapshotError, SnapshotStateMachine, StateMachine, TAG_FRESH,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -232,11 +231,16 @@ struct ServiceArgs {
     /// the deliberately slow FSM. Only valid with `--fsm spin`.
     #[arg(long, default_value_t = 0)]
     work_spin: u64,
-    /// M14d row f: `SnapshotPolicy { interval_bytes }` on the service so the
-    /// leader has artifacts to ship. `0` = no snapshots — `start()`, byte-for-
-    /// byte every prior arm. `> 0` runs `start_with_snapshots()` (typed tier
-    /// only: `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
+    /// M14d row f: make the service snapshot-CAPABLE so the leader has
+    /// artifacts to ship. `0` = no snapshots — `start()`, byte-for-byte every
+    /// prior arm. `> 0` runs `start_with_snapshots()` (typed tier only:
+    /// `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
     /// `SnapshotStateMachine`); paired with `--fsm raw` it is refused by name.
+    ///
+    /// The BYTE VALUE no longer sets a cadence: coordinated-snapshot spec §5.2
+    /// deleted the per-service byte interval, and instants are commanded by
+    /// the leader. The flag is kept as the capability switch until Task 5
+    /// wires the command.
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
 }
@@ -517,13 +521,18 @@ impl SnapshotStateMachine for CountSm {
         }
         let count = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.count = count;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
@@ -1742,10 +1751,9 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------- service role
 
-/// M14d T2 fix round 1: `ServiceBuilder::start()` never reads
-/// `cfg.snapshot_policy` — only `start_with_snapshots()` spawns the M6
-/// builder thread that trips it (`uc_service/src/lib.rs:199-291`, the same
-/// method `m6_gate.rs` uses). Shared by the four typed arms below (raw arms
+/// M14d T2 fix round 1: only `start_with_snapshots()` spawns the M6 builder
+/// thread and declares the row snapshot-capable (`uc_service/src/lib.rs`, the
+/// same method `m6_gate.rs` uses); plain `start()` can never snapshot. Shared by the four typed arms below (raw arms
 /// keep plain `start()`; `--fsm raw` + `--snapshot-interval-bytes` is refused
 /// by name before this is ever reached).
 fn start_typed_svc<S: SnapshotStateMachine>(
@@ -1820,12 +1828,11 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         !(matches!(kind, FsmKind::Raw) && a.snapshot_interval_bytes > 0),
         "--fsm raw and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
     );
-    let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
-    if a.snapshot_interval_bytes > 0 {
-        cfg = cfg.snapshot_policy(SnapshotPolicy {
-            interval_bytes: a.snapshot_interval_bytes,
-        });
-    }
+    // TODO(plan 2 task 5): command an instant. `--snapshot-interval-bytes` now
+    // only selects `start_with_snapshots()` below; the cadence it used to
+    // configure lives in the replicated settings record and reaches this arm
+    // as a `SNAPSHOT` frame, so row f ships no artifact until Task 5 lands.
+    let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
     let envelope = a.envelope == Envelope::On;
     let snapshots = a.snapshot_interval_bytes > 0;
     let tag = format!(

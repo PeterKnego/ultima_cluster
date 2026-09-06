@@ -34,8 +34,8 @@ use uc_consensus::election::NodeId;
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_service::{
-    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy,
-    SnapshotStateMachine, StateMachine,
+    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotStateMachine,
+    StateMachine,
 };
 
 const APP: &str = "m9-gate";
@@ -200,23 +200,29 @@ impl SnapshotStateMachine for RegSm {
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.value = v;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
 
 // --------------------------------------------------------- fleet roles
 
-fn spawn_service(dir: &Path, app_id: &str, snapshot_interval_bytes: u64) -> Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, app_id).snapshot_policy(SnapshotPolicy {
-        interval_bytes: snapshot_interval_bytes,
-    });
+fn spawn_service(dir: &Path, app_id: &str, _snapshot_interval_bytes: u64) -> Service<RegSm> {
+    // TODO(plan 2 task 5): command an instant — the byte cadence is gone
+    // (coordinated-snapshot spec §5.2); the row is capable and builds only
+    // when the leader commands.
+    let cfg = ServiceConfig::new(dir, app_id);
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
         .expect("snapshot service start")

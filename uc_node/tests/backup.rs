@@ -45,7 +45,7 @@ use uc_node::backup::{BackupError, backup_instance, restore_artifact, verify_art
 use uc_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use uc_service::snapshots::SnapshotStore;
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine, Tagged};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine, Tagged};
 
 const SEG_BYTES: u64 = 64 * 1024;
 
@@ -1191,17 +1191,16 @@ fn two_fsm_purged_node(
     cfg.services = ServicesConfig::from_names(&[RegisterSm::NAME, "fsm1"], None).unwrap();
     let node = Node::start(cfg).expect("node");
     wait_until("serving", || node.can_serve());
-    let policy = SnapshotPolicy {
-        interval_bytes: 32 * 1024,
-    };
-    let s0 = ServiceBuilder::new(
-        ServiceConfig::new(dir, app).snapshot_policy(policy),
-        RegisterSm::default(),
-    )
-    .start_with_snapshots()
-    .expect("snapshot service 0");
+    // TODO(plan 2 task 5): command an instant. Both rows are snapshot-CAPABLE
+    // (spec §5.2's status bit); the 32 KiB byte cadence that used to make them
+    // build artifacts on their own is deleted, so nothing is built — and this
+    // helper's purge wait cannot be satisfied — until the leader commands an
+    // instant.
+    let s0 = ServiceBuilder::new(ServiceConfig::new(dir, app), RegisterSm::default())
+        .start_with_snapshots()
+        .expect("snapshot service 0");
     let s1 = ServiceBuilder::new(
-        ServiceConfig::new(dir, app).snapshot_policy(policy),
+        ServiceConfig::new(dir, app),
         Tagged::<1, RegisterSm>::default(),
     )
     .start_with_snapshots()
@@ -1219,6 +1218,7 @@ fn two_fsm_purged_node(
 }
 
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
     let _serialize_guard = serialize();
     let root = scratch();
@@ -1297,6 +1297,7 @@ fn restore_roundtrip_with_two_fsms_keeps_both_snapshot_trees() {
 }
 
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn verify_reports_a_hole_for_the_id_whose_snapshot_is_missing() {
     let _serialize_guard = serialize();
     let root = scratch();

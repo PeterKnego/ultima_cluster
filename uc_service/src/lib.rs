@@ -66,7 +66,8 @@ use crate::builder_agent::{BuildJob, BuilderState, builder_cycle};
 use crate::output::{OutputState, output_cycle};
 use crate::snapshots::SnapshotStore;
 
-pub use crate::config::{ServiceConfig, ServiceError, SnapshotError, SnapshotPolicy};
+pub use crate::apply::{SNAPSHOT_FREEZE_FAILED, SNAPSHOT_SKIPPED_BUSY};
+pub use crate::config::{ServiceConfig, ServiceError, SnapshotError};
 pub use crate::ids::IdGen;
 pub use crate::session::{
     SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
@@ -139,7 +140,7 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     pub fn start(self) -> Result<Service<S>, ServiceError> {
         let ServiceBuilder { cfg, sm, output } = self;
 
-        let attached = attach::attach(&cfg, sm)?;
+        let attached = attach::attach(&cfg, sm, false)?;
         let buffer = attached.buffer;
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
@@ -217,18 +218,24 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
     /// happens to also implement `SnapshotStateMachine`". The resolution
     /// mirrors the existing `.output_handler(..)` opt-in pattern: a caller
     /// whose SM implements [`SnapshotStateMachine`] but does NOT want the
-    /// builder thread (e.g. it never intends to configure a non-default
-    /// [`SnapshotPolicy`](crate::SnapshotPolicy), or wants to defer opting in)
-    /// simply calls [`start`](Self::start) instead — the builder thread only
-    /// ever exists because THIS method was called, never as a side effect of
-    /// the SM's capability alone.
+    /// builder thread (e.g. it wants to defer opting in) simply calls
+    /// [`start`](Self::start) instead — the builder thread only ever exists
+    /// because THIS method was called, never as a side effect of the SM's
+    /// capability alone.
+    ///
+    /// Coordinated-snapshot spec §5.2: this is also where the row declares
+    /// itself snapshot-CAPABLE (`CNC_SVC_STATUS_SNAPSHOT_CAPABLE` in its slot
+    /// status, written by `attach` in the same store as the attached bit).
+    /// The leader refuses to command an instant while any declared row lacks
+    /// that bit, so a cluster holding a `start()`-ed row is told, rather than
+    /// left with a floor that never moves.
     pub fn start_with_snapshots(self) -> Result<Service<S>, ServiceError>
     where
         S: SnapshotStateMachine,
     {
         let ServiceBuilder { cfg, sm, output } = self;
 
-        let attached = attach::attach(&cfg, sm)?;
+        let attached = attach::attach(&cfg, sm, true)?;
         let buffer = attached.buffer;
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
@@ -262,20 +269,21 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
 
         // Snapshot builder wiring: a 1-slot channel handing a (position,
         // type-erased streaming job) job from the apply thread (freeze, SM
-        // lock held briefly — `crate::apply::maybe_build_snapshot`) to the
-        // builder thread (stream + publish, off-lock —
+        // lock held — `crate::apply::on_snapshot_frame`, at the instant the
+        // log names) to the builder thread (stream + publish, off-lock —
         // `crate::builder_agent::builder_cycle`). `busy` gates BOTH
         // directions of "one in-flight build max": the apply thread checks it
         // before even calling `freeze()`, and the builder thread holds it for
         // the full stream+publish duration, not just while a job sits in the
         // channel.
+        //
+        // Coordinated-snapshot spec §5.2: there is no cadence to seed here any
+        // more. The trigger is a `FRAME_TYPE_SNAPSHOT` frame in the log, so
+        // the position basis (`last_snapshot_pos`) and the M6 byte-interval
+        // policy that used to drive it are both gone.
         let store = SnapshotStore::open(&cfg.instance_dir, service_id)?;
         let busy = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel::<(u64, BuildJob)>(1);
-        // Seed the interval basis from whatever the cnc marker already holds
-        // (0 on a fresh page) — a service reattaching after a prior
-        // incarnation already built snapshots doesn't immediately re-trigger.
-        let last_snapshot_pos = attach::slot(&cnc, service_id).snapshot_pos.load_acquire();
         let freeze: FreezeFn<S> = Box::new(|sm: &S| {
             let (handle, pos) = sm.freeze()?;
             let job: BuildJob =
@@ -283,8 +291,6 @@ impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
             Ok((job, pos))
         });
         state.snapshot_trigger = Some(SnapshotTrigger {
-            policy: cfg.snapshot_policy,
-            last_snapshot_pos,
             busy: Arc::clone(&busy),
             tx,
             freeze,

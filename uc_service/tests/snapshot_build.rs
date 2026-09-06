@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! M6 Task 3 capstone: a single node + a snapshot-capable service
-//! (`uc_lincheck`'s `RegisterSm`, feature `v2`) started via
-//! `start_with_snapshots` builds position-tagged on-disk snapshot files on a
-//! real byte-interval policy, publishes the newest complete position onto the
-//! cnc marker only AFTER the atomic rename, and enforces keep-newest-2
-//! retention — end to end through the real ingress/cnc/client IPC (spec M6
-//! Task 3, brief step 1's verbatim test).
+//! M6 Task 3 capstone, as re-pointed by coordinated-snapshot plan 2 Task 3: a
+//! single node + a snapshot-capable service (`uc_lincheck`'s `RegisterSm`,
+//! feature `v2`) started via `start_with_snapshots` builds position-tagged
+//! on-disk snapshot files **at the instants the LOG names** — a
+//! `FRAME_TYPE_SNAPSHOT` frame, spec §5.2, in place of the deleted M6 byte
+//! interval — and publishes the artifact's position onto
+//! the cnc marker only AFTER the atomic rename, end to end through the real
+//! ingress/cnc/client IPC.
+//!
+//! Retention is NOT asserted here any more (ruling P1): `publish` no longer
+//! prunes, because only the node can see which artifacts form a complete set.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -19,7 +23,7 @@ use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 use uc_log::cnc::CncPage;
 use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig};
-use uc_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
+use uc_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 // --------------------------------------------------------------------- harness
 
@@ -49,10 +53,6 @@ fn node_config(dir: &Path, app_id: &str) -> NodeConfig {
 
 fn start_single_node(dir: &Path, app_id: &str) -> Node {
     Node::start(node_config(dir, app_id)).unwrap()
-}
-
-fn cfg_with_policy(dir: &Path, app_id: &str, interval_bytes: u64) -> ServiceConfig {
-    ServiceConfig::new(dir, app_id).snapshot_policy(SnapshotPolicy { interval_bytes })
 }
 
 fn open_cnc(dir: &Path, app_id: &str) -> Arc<CncPage> {
@@ -89,7 +89,7 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
     wait_until(|| node.can_serve());
 
     let svc = ServiceBuilder::new(
-        cfg_with_policy(dir.path(), "snapb", 4 * 1024),
+        ServiceConfig::new(dir.path(), "snapb"),
         RegisterSm::default(),
     )
     .start_with_snapshots()
@@ -97,9 +97,18 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
     let client = Client::connect(dir.path(), "snapb").unwrap();
     for i in 0..400u64 {
         let _: CmdResp = client.submit(&Cmd::Write(i)).unwrap();
-    } // >> 4 KiB of frames
+    }
 
     let cnc = open_cnc(dir.path(), "snapb");
+    // Nothing is built until the log says so — the trigger is the frame, not
+    // a byte count (spec §5.2).
+    assert_eq!(
+        cnc.snapshots().service_snapshot_pos.load_acquire(),
+        0,
+        "no instant commanded yet: no artifact"
+    );
+    node.append_snapshot_for_test(0).unwrap();
+
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
     let s = cnc.snapshots().service_snapshot_pos.load_acquire();
     assert!(
@@ -112,24 +121,32 @@ fn builder_publishes_position_tagged_snapshot_and_cnc_marker() {
     assert_eq!(pos, s);
     assert!(path.ends_with(format!("snap-{s}.ultsnap")));
 
-    // A second interval produces a newer one and retention holds (<= 2 files).
+    // A second instant produces a newer artifact BESIDE the first: `publish`
+    // no longer prunes (ruling P1 — the node owns set retention, Task 5).
     for i in 0..400u64 {
         let _: CmdResp = client.submit(&Cmd::Write(i)).unwrap();
     }
+    node.append_snapshot_for_test(0).unwrap();
     wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > s);
-    assert!(count_snapshots(dir.path()) <= 2);
+    assert_eq!(
+        count_snapshots(dir.path()),
+        2,
+        "two instants, two artifacts: the service prunes nothing"
+    );
 
     client.shutdown();
     svc.stop();
     node.stop();
 }
 
-/// Default policy ("never" — `interval_bytes: 0`) means `start_with_snapshots`
-/// spawns the builder thread machinery but it structurally never trips: no
-/// file is ever written and the cnc marker stays `0`, even under real commit
-/// traffic. Pins "no snapshots, no marker, no purge" as the observable default.
+/// An UNCOMMANDED cluster never snapshots: `start_with_snapshots` spawns the
+/// builder thread machinery, but with no `SNAPSHOT` frame on the log it never
+/// trips — no file is written and the cnc marker stays `0`, even under real
+/// commit traffic. Pins "no snapshots, no marker, no purge" as the observable
+/// default, which is what keeps purge-off-by-default true (spec §5.5: a
+/// cluster that is never asked to snapshot is legitimate).
 #[test]
-fn default_policy_never_builds_a_snapshot() {
+fn a_service_never_commanded_an_instant_never_builds_a_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let node = start_single_node(dir.path(), "snapdef");
     wait_until(|| node.can_serve());
@@ -152,9 +169,9 @@ fn default_policy_never_builds_a_snapshot() {
     assert_eq!(
         cnc.snapshots().service_snapshot_pos.load_acquire(),
         0,
-        "never policy: no marker"
+        "never commanded: no marker"
     );
-    assert_eq!(count_snapshots(dir.path()), 0, "never policy: no file");
+    assert_eq!(count_snapshots(dir.path()), 0, "never commanded: no file");
 
     client.shutdown();
     svc.stop();

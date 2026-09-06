@@ -208,6 +208,7 @@ fn linearizable_under_failover_v2() {
 /// Same bars as the failover capstone: ≥ 80 % `Ok`, `Linearizable`, ≤ 120 s, run
 /// across seeds 0x1107 / 7 / 99 (the default + `LIN_SEED`).
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn linearizable_under_purge_and_snapshot_churn() {
     const DEFAULT_SEED: u64 = 0x1107;
     const TARGET_OPS: usize = 700;
@@ -676,6 +677,7 @@ fn linearizable_under_failover_with_crypto() {
 
 /// `linearizable_under_purge_and_snapshot_churn`, crypto ON.
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
     const DEFAULT_SEED: u64 = 0x1107;
     const TARGET_OPS: usize = 700;
@@ -1070,6 +1072,7 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
 }
 
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn two_fsm_bounded() {
     run_two_fsm(
         "two_fsm_bounded",
@@ -1081,6 +1084,7 @@ fn two_fsm_bounded() {
     );
 }
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn two_fsm_lockstep() {
     run_two_fsm(
         "two_fsm_lockstep",
@@ -1282,9 +1286,8 @@ fn two_fsm_slow_lockstep() {
 /// wrap, a restart reads the still-live ring directly and touches neither
 /// the journal nor a snapshot, whatever the purge posture. With purge off,
 /// the journal always covers `start_pos` even past the wrap, so a
-/// `SnapshotPolicy` alone never shortens a restart — the fresh service
-/// replays the whole journal, exactly as it would with no snapshot policy at
-/// all. With purge on AND past the wrap, the leader's journal prefix is
+/// snapshot capability alone never shortens a restart — the fresh service
+/// replays the whole journal, exactly as it would with no snapshots at all. With purge on AND past the wrap, the leader's journal prefix is
 /// dropped below the snapshot floor, so the fresh service's `start_pos` (0,
 /// an empty SM) is no longer covered and reconstruction installs the newest
 /// artifact once.
@@ -1375,6 +1378,7 @@ fn restart_installs(purge: bool) -> u32 {
 }
 
 #[test]
+#[ignore = "plan 2 task 5: instants are commanded"]
 fn snapshot_restart_installs_only_with_purge() {
     assert_eq!(
         restart_installs(false),

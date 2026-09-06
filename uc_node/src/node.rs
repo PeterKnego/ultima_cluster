@@ -596,10 +596,13 @@ struct Rings {
 /// The in-process ingress channel's item type. `Payload` is the harness/
 /// embedded submit path (`Node::submit`); `TimerForTest` (time-and-timers
 /// plan Task 5) lets a test append a TIMER frame as the leader would, ahead
-/// of the real node-side scheduler.
+/// of the real node-side scheduler, and `SnapshotForTest`
+/// (coordinated-snapshot plan 2 Task 3) does the same for a `SNAPSHOT` frame,
+/// ahead of admin op 8 and the cadence (Task 5).
 enum Ingress {
     Payload(Vec<u8>),
     TimerForTest(TimerBody),
+    SnapshotForTest(u8),
 }
 
 pub struct Node {
@@ -1910,6 +1913,19 @@ impl Node {
     pub fn append_timer_for_test(&self, body: TimerBody) -> Result<(), String> {
         self.ingress_tx
             .send(Ingress::TimerForTest(body))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Test-only (coordinated-snapshot plan 2 Task 3): append a `SNAPSHOT`
+    /// frame as the leader would, so a service test can drive a coordinated
+    /// instant before `uc2ctl snapshot` (admin op 8) and the cadence exist —
+    /// the same shape, and the same in-process ingress path, as
+    /// [`append_timer_for_test`](Self::append_timer_for_test). `flags` is the
+    /// header flags byte (`FLAG_SNAPSHOT_STANDBY` or 0).
+    #[doc(hidden)]
+    pub fn append_snapshot_for_test(&self, flags: u8) -> Result<(), String> {
+        self.ingress_tx
+            .send(Ingress::SnapshotForTest(flags))
             .map_err(|e| e.to_string())
     }
 
@@ -4305,6 +4321,7 @@ impl Consensus {
         match item {
             Ingress::Payload(p) => self.try_append(p),
             Ingress::TimerForTest(body) => self.try_append_timer(body),
+            Ingress::SnapshotForTest(flags) => self.try_append_snapshot(*flags),
         }
     }
 
@@ -4338,6 +4355,23 @@ impl Consensus {
             Ok(_) => true,
             Err(AppendError::WouldOverrun) => false,
             Err(AppendError::PayloadTooLarge) => true, // unreachable: fixed-size body
+        }
+    }
+
+    /// Test-only (coordinated-snapshot plan 2 Task 3): append one `SNAPSHOT`
+    /// frame at the current term. `false` = ring full (caller holds it).
+    /// Task 5 replaces this hook's callers with `command_snapshot` (admin op
+    /// 8 + the cadence), which adds the refusals, the single-in-flight gate
+    /// and the completeness tracking this bare append has none of.
+    fn try_append_snapshot(&mut self, flags: u8) -> bool {
+        let term = self.sm.current_term();
+        let Some(app) = self.appender.as_mut() else {
+            return false;
+        };
+        match app.append_snapshot(term, flags) {
+            Ok(_) => true,
+            Err(AppendError::WouldOverrun) => false,
+            Err(AppendError::PayloadTooLarge) => true, // unreachable: empty body
         }
     }
 

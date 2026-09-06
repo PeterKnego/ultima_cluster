@@ -63,8 +63,7 @@ use uc_node::{CryptoConfig, Node, NodeConfig};
 use uc_protocol::v2::cnc::ADMIN_OP_SCHEDULE_APPLY;
 use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
 use uc_service::{
-    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine, StateMachine,
-    Tagged, Timed,
+    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotStateMachine, StateMachine, Tagged, Timed,
 };
 
 use uc_lincheck::history::{History, Outcome};
@@ -387,12 +386,12 @@ fn spawn_service<SM: SnapshotStateMachine + Default>(
             .start()
             .expect("service start")
     } else {
-        // M6 Task 10: snapshot-capable service — builds on-disk snapshots on the
-        // policy cadence so the node can advance its purge floor. Below-floor
-        // reconstruction after a service crash then goes via snapshot install.
-        let cfg = cfg.snapshot_policy(SnapshotPolicy {
-            interval_bytes: snapshot_interval_bytes,
-        });
+        // M6 Task 10: snapshot-capable service, so the node can advance its
+        // purge floor and below-floor reconstruction goes via install.
+        // TODO(plan 2 task 5): command an instant. The byte cadence is gone
+        // (coordinated-snapshot spec §5.2); `snapshot_interval_bytes > 0` now
+        // only means "capable", so no artifact is built until the leader
+        // commands one.
         ServiceBuilder::new(cfg, SM::default())
             .start_with_snapshots()
             .expect("snapshot service start")
@@ -439,9 +438,7 @@ fn spawn_service_timer(
             .start()
             .expect("timer service start")
     } else {
-        let cfg = cfg.snapshot_policy(SnapshotPolicy {
-            interval_bytes: snapshot_interval_bytes,
-        });
+        // TODO(plan 2 task 5): command an instant (as above).
         ServiceBuilder::new(cfg, Timed::new(TimerSm::default()))
             .start_with_snapshots()
             .expect("timer snapshot service start")

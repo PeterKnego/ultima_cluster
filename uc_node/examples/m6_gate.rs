@@ -55,8 +55,7 @@ use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_service::{
-    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine,
-    StateMachine,
+    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotStateMachine, StateMachine,
 };
 
 // ------------------------------------------------------------------ CLI
@@ -236,13 +235,18 @@ impl SnapshotStateMachine for RegSm {
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.value = v;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
@@ -255,6 +259,10 @@ const BUFFER_BYTES: usize = 1 << 22;
 /// Small journal segments + snapshot cadence so purge actually drops prefixes
 /// under the modest smoke workload (mirrors the lin_v2 purge capstone).
 const SEGMENT_BYTES: u64 = 16 * 1024;
+/// TODO(plan 2 task 5): command an instant. Unused since the byte cadence was
+/// deleted (coordinated-snapshot spec §5.2); kept so Task 5 has the number it
+/// needs for `settings.snapshot.interval_bytes`.
+#[allow(dead_code)]
 const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
 
 fn seed_for(id: NodeId) -> u64 {
@@ -311,9 +319,11 @@ fn make_config(
 }
 
 fn spawn_service(dir: &std::path::Path) -> uc_service::Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, APP).snapshot_policy(SnapshotPolicy {
-        interval_bytes: SNAPSHOT_INTERVAL_BYTES,
-    });
+    // TODO(plan 2 task 5): command an instant — `SNAPSHOT_INTERVAL_BYTES` no
+    // longer configures anything (coordinated-snapshot spec §5.2 deleted the
+    // cadence); every gate row that expects an artifact needs the leader to
+    // command one.
+    let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
         .expect("snapshot service start")
