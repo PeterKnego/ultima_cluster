@@ -279,6 +279,18 @@ impl ClusterAgent {
         let head = c.commit.load_acquire().min(c.durable.load_acquire());
         let mut applied_any = false;
         loop {
+            // Invariant: one duty cycle never loops on a target it cannot
+            // reach. `next_batch(head)` returns an empty `Batch::Frames`
+            // (rather than `CaughtUp`) whenever `head` lands strictly inside
+            // a frame -- `FrameIter`'s target guard refuses to yield a frame
+            // whose END exceeds `head` and leaves the cursor put. That is the
+            // normal state whenever this node's commit is paced by the
+            // FSM-lag report ceiling (`services::report_ceiling`'s raw byte
+            // cap need not land on a frame end), so without the no-progress
+            // check below this loop never returns, starving
+            // `AgentRunner`'s stop flag and hanging `Node::stop()` joining
+            // `uc2-cluster` (services-hang investigation, Ruling R21).
+            let before = self.follower.cursor;
             match self.follower.next_batch(head) {
                 Batch::CaughtUp => break,
                 Batch::Overrun => {
@@ -334,6 +346,14 @@ impl ClusterAgent {
                         applied_any = true;
                     }
                 }
+            }
+            // A `Frames` batch that consumed nothing is `CaughtUp` in all but
+            // name (see the invariant comment above the match): `head` is
+            // mid-frame and will not move until the leader advances commit
+            // past this frame's end. Ending the duty cycle here — rather than
+            // spinning until it does — is what keeps this loop bounded.
+            if self.follower.cursor == before {
+                break;
             }
         }
         // Task 4's brief: "the follower's cursor after a batch is also a
@@ -710,6 +730,84 @@ mod tests {
         assert_eq!(view.position.load(Ordering::Acquire), e3);
         assert_eq!(view.snapshot_interval_bytes.load(Ordering::Acquire), 9);
         assert!(!agent.do_work(), "caught up: no work");
+    }
+
+    /// Regression for the services-hang investigation
+    /// (`.superpowers/sdd/2026-09-06-uc2-cluster-fsm-plan1/services-hang-investigation.md`):
+    /// `head` (`min(commit, durable)`) landing STRICTLY INSIDE a frame is
+    /// exactly what the FSM-lag report ceiling produces in production
+    /// (`services::report_ceiling`'s raw byte cap need not land on a frame
+    /// end). `LogFollower::next_batch` then hands back an empty
+    /// `Batch::Frames` forever — `FrameIter`'s target guard refuses to yield
+    /// a frame whose END exceeds `target` and leaves the cursor put — so the
+    /// pre-fix drain loop (`loop { match next_batch(head) { .. } }`, breaking
+    /// only on `CaughtUp`/`Overrun`) never returns. That starves
+    /// `AgentRunner`'s stop flag and hangs `Node::stop()` joining
+    /// `uc2-cluster`.
+    ///
+    /// One 96-byte frame at `[0, 96)`; `commit`/`durable` at `48`, the
+    /// investigation's own example. Run off-thread with a bounded join: on
+    /// the unfixed code this deadline fires (`do_work` spins forever); after
+    /// Ruling R21 it returns promptly, having done no work.
+    #[test]
+    fn a_target_inside_a_frame_ends_the_duty_cycle_instead_of_spinning() {
+        let (buffer, cnc, dir) = world();
+        let mut app = buffer.appender_for_test(0);
+        app.set_now(1);
+        // 32 B header + 8 B cluster prefix + 56 B payload = 96, already
+        // aligned — one frame spanning [0, 96).
+        let end = app
+            .append_cluster(1, ClusterKind::Settings, &[0u8; 56])
+            .unwrap();
+        assert_eq!(end, 96, "sanity: one 96-byte frame at [0, 96)");
+
+        let (fsm, start) = recover(dir.path(), genesis_state(), vec![]).unwrap();
+        let view = Arc::new(ClusterView::new(fsm.state()));
+        let mut agent = ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            fsm,
+            view,
+            dir.path().join("snapshots/cluster"),
+            start,
+            Arc::new(AtomicU64::new(0)),
+            empty_journal(dir.path()),
+            no_install_route(),
+            Arc::new(AtomicU64::new(0)),
+        );
+        // Strictly inside the only frame: not 0 (genesis), not 96 (its end).
+        cnc.counters().durable.store_release(48);
+        cnc.counters().commit.store_release(48);
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let did_work = agent.do_work();
+            let applied = agent.applied();
+            let cursor = agent.follower.cursor;
+            // Ignore a closed receiver: the assertion below already failed
+            // by the time this send could fail.
+            let _ = tx.send((did_work, applied, cursor));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok((did_work, applied, cursor)) => {
+                handle.join().expect("agent thread panicked");
+                assert!(
+                    !did_work,
+                    "a target that lands mid-frame is no work this cycle"
+                );
+                assert_eq!(
+                    applied, 0,
+                    "the FSM must not consume a frame it cannot see the end of"
+                );
+                assert_eq!(cursor, 0, "the cursor must stay at the frame's start");
+            }
+            Err(_) => panic!(
+                "do_work() did not return within the 2s deadline: the drain loop is \
+                 spinning on a target (commit=durable=48) that lands inside the only \
+                 frame ([0, 96)) instead of yielding the duty cycle -- see \
+                 .superpowers/sdd/2026-09-06-uc2-cluster-fsm-plan1/services-hang-investigation.md"
+            ),
+        }
     }
 
     /// Ruling R17: the position the view and the artifact carry is the apply
