@@ -110,6 +110,12 @@ impl InstanceDir {
     pub fn service_lock_for(&self, id: u8) -> PathBuf {
         self.root.join(format!("service.{id}.lock"))
     }
+    /// Cluster-FSM spec §4.7: the `uc2-cluster` agent's own snapshot
+    /// directory, alongside the per-service `snapshots/<id>/` directories but
+    /// keyed by name (the cluster FSM has no cnc slot / row id).
+    pub fn cluster_snapshot_dir(&self) -> PathBuf {
+        self.root.join("snapshots").join("cluster")
+    }
 }
 
 #[cfg(test)]
@@ -154,5 +160,9 @@ mod tests {
             dir.path().join("snapshots").join("1")
         );
         assert_eq!(d.service_lock_for(2), dir.path().join("service.2.lock"));
+        assert_eq!(
+            d.cluster_snapshot_dir(),
+            dir.path().join("snapshots").join("cluster")
+        );
     }
 }

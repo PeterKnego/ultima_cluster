@@ -58,6 +58,7 @@ use uc_protocol::v2::ipc::{
 };
 
 use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
+use crate::cluster_fsm::{ClusterState, ClusterView};
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use crate::schedule_state::{SCHEDULE_PENDING_FILE, ScheduleRecord, schedule_digest};
@@ -592,6 +593,10 @@ pub struct Node {
     /// M10 (Task 4): mirrors `cfg.journal_segment_bytes`, not otherwise kept
     /// on `Node`. Exposed via [`Node::observability`].
     journal_segment_bytes: u64,
+    /// Cluster-FSM spec §4.1/§4.5: the SAME `Arc<ClusterView>` the
+    /// `uc2-cluster` agent publishes into. Exposed via
+    /// [`Node::cluster_view`].
+    cluster_view: Arc<ClusterView>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1449,6 +1454,41 @@ impl Node {
         let schedule_pos_pub = Arc::new(AtomicU64::new(0));
         let schedule_entries_pub = Arc::new(AtomicU64::new(0));
 
+        // Cluster-FSM spec §4.1/§4.7: genesis from node.toml on a fresh dir,
+        // else the newest cluster artifact; the agent replays CLUSTER frames
+        // above it.
+        let cluster_genesis = ClusterState {
+            membership: config.clone(),
+            table: ScheduleTable { entries: vec![] },
+            table_position: 0,
+            settings: cfg.settings_genesis,
+            applied: 0,
+        };
+        let (cluster_fsm, cluster_start) = crate::cluster_agent::recover(
+            &instance.cluster_snapshot_dir(),
+            cluster_genesis,
+            cfg.services
+                .identity_hashes()
+                .iter()
+                .copied()
+                .filter(|h| *h != 0)
+                .collect(),
+        )?;
+        let cluster_view = Arc::new(ClusterView::new(cluster_fsm.state()));
+        let cluster_snapshot_pos = Arc::new(AtomicU64::new(0));
+        let mut cluster_agent = crate::cluster_agent::ClusterAgent::new(
+            Arc::clone(&buffer),
+            Arc::clone(&cnc),
+            cluster_fsm,
+            Arc::clone(&cluster_view),
+            instance.cluster_snapshot_dir(),
+            cluster_start,
+            Arc::clone(&cluster_snapshot_pos),
+        );
+        let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
+            cluster_agent.do_work()
+        })?;
+
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
             reports_unattested: Arc::clone(&reports_unattested),
@@ -1585,6 +1625,8 @@ impl Node {
             crypto_handshake_failures: Arc::clone(&crypto_handshake_failures),
             crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
+            cluster_view: Arc::clone(&cluster_view),
+            cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
         };
         // Plan 2 (spec §5): re-arm the persisted schedule table BEFORE the
         // consensus agent starts. The log-time word is already seeded from the
@@ -1626,11 +1668,21 @@ impl Node {
             crypto_handshake_failures,
             purge_enabled: !matches!(cfg.purge, PurgePolicy::Disabled),
             journal_segment_bytes: cfg.journal_segment_bytes,
+            cluster_view,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
             // the data plane, then the archive last (so a final block can flush).
-            agents: vec![consensus_agent, sender_agent, receiver_agent, archive_agent],
+            // The cluster agent has no cnc slot and no consensus dependency, so
+            // it is appended last — it stops after everything that could still
+            // append a CLUSTER frame it might otherwise race.
+            agents: vec![
+                consensus_agent,
+                sender_agent,
+                receiver_agent,
+                archive_agent,
+                cluster_runner,
+            ],
         })
     }
 
@@ -1665,6 +1717,13 @@ impl Node {
     /// driver runs, this advances to at most the snapshot floor.
     pub fn archive_first_base(&self) -> u64 {
         self.archive_first_base.load(Ordering::Acquire)
+    }
+
+    /// Cluster-FSM spec §4.1/§4.5: the cluster FSM's own published view
+    /// (membership, schedule table, settings), kept current by the
+    /// `uc2-cluster` agent independently of the lag policy.
+    pub fn cluster_view(&self) -> &ClusterView {
+        &self.cluster_view
     }
 
     /// M8 (Task 12): the newest node-to-node group-key epoch this node has
@@ -2571,6 +2630,15 @@ struct Consensus {
     /// `now_ns` of the last printed crypto diagnostic (see
     /// [`CRYPTO_LOG_INTERVAL_NS`]).
     crypto_last_log_ns: u64,
+    /// Cluster-FSM spec §4.5: the SAME `Arc<ClusterView>` the `uc2-cluster`
+    /// agent publishes into. Not yet read here — read by plan 1 task 5.
+    #[allow(dead_code)]
+    cluster_view: Arc<ClusterView>,
+    /// Cluster-FSM spec §4.7 / Ruling R2: the `uc2-cluster` agent's newest
+    /// complete artifact position, mirrored by that agent. Not yet read here
+    /// — read by plan 1 task 5.
+    #[allow(dead_code)]
+    cluster_snapshot_pos: Arc<AtomicU64>,
 }
 
 /// Wall-clock nanoseconds since the Unix epoch — the leaf clock read behind
@@ -8062,7 +8130,7 @@ mod tests {
         let sm = ElectionSm::new(
             ElectionConfig {
                 id: 1,
-                config,
+                config: config.clone(),
                 config_position: 0,
                 election_timeout_min_ns: 150,
                 election_timeout_max_ns: 300,
@@ -8265,6 +8333,14 @@ mod tests {
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
+            cluster_view: Arc::new(ClusterView::new(&ClusterState {
+                membership: config.clone(),
+                table: ScheduleTable { entries: vec![] },
+                table_position: 0,
+                settings: Settings::genesis_default(),
+                applied: 0,
+            })),
+            cluster_snapshot_pos: Arc::new(AtomicU64::new(0)),
         };
 
         Harness {

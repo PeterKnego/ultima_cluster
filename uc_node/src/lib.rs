@@ -36,6 +36,7 @@
 
 pub mod audit;
 pub mod backup;
+mod cluster_agent;
 pub mod cluster_fsm;
 pub mod config_file;
 pub mod ipc;
