@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use uc_protocol::v2::frame::{
     self, CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
-    FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN,
-    TIMER_BODY_LEN, TimerBody, align_frame_len, write_cluster_prefix,
+    FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, FrameHeader,
+    HEADER_LEN, TIMER_BODY_LEN, TimerBody, align_frame_len, write_cluster_prefix,
 };
 
 use crate::cnc::CncPage;
@@ -880,6 +880,73 @@ impl Appender {
         Ok((frame_pos, time_ns))
     }
 
+    /// Append a `FRAME_TYPE_SNAPSHOT` frame (cluster-FSM + coordinated-snapshot
+    /// spec §5.1): the coordinated snapshot instant. Empty body — the position
+    /// is the identity, so nothing else needs to ride the frame — `flags`
+    /// written verbatim (the caller passes [`FLAG_SNAPSHOT_STANDBY`] or 0).
+    /// Unlike `append_timer`, this is stamped like any CLIENT frame
+    /// (`max(now, last_stamp)`), never a deadline: it is not a timer, it is
+    /// "now" at the moment the leader appends it. `term` is passed explicitly,
+    /// as `append_cluster` does. Returns `(frame_end, stamp)` — the frame-end
+    /// position is **P**, the instant every declared row and the cluster FSM
+    /// freeze at.
+    pub fn append_snapshot(&mut self, term: u32, flags: u8) -> Result<(u64, u64), AppendError> {
+        let total = HEADER_LEN; // empty body
+        let aligned = align_frame_len(total) as u64;
+        let b = &self.buffer;
+
+        let off = b.offset(self.pos);
+        let to_end = b.capacity - off as u64;
+        let pad = if aligned > to_end { to_end } else { 0 };
+        let end = self.pos + pad + aligned;
+
+        // The one hard gate: never claim past durable + capacity.
+        if end > self.cached_durable + b.capacity {
+            self.cached_durable = b.cnc.counters().durable.load_acquire();
+            if end > self.cached_durable + b.capacity {
+                return Err(AppendError::WouldOverrun);
+            }
+        }
+
+        // The clamp, inline (final-review I1) — see `append`. A SNAPSHOT
+        // frame takes the pass's `now`, the client-frame rule, never a
+        // deadline.
+        let time_ns = self.now_ns.max(self.last_stamp);
+        self.last_stamp = time_ns;
+
+        let frame_pos = if pad > 0 {
+            self.write_padding(off, pad as u32, time_ns);
+            self.pos + pad
+        } else {
+            self.pos
+        };
+        let foff = b.offset(frame_pos);
+
+        // SAFETY (all raw writes): within capacity; bytes in [append,
+        // durable+capacity) are writer-owned per the gate; ordering via the
+        // commit word + append counter release stores below.
+        unsafe {
+            let hdr = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), HEADER_LEN);
+            frame::write_header_except_length(
+                hdr,
+                &FrameHeader {
+                    length: 0,
+                    frame_type: FRAME_TYPE_SNAPSHOT,
+                    flags,
+                    leadership_term_id: term,
+                    client_id: 0,
+                    seq: 0,
+                    time_ns,
+                },
+            );
+        }
+        b.commit_word(foff).store(total as u32, Ordering::Release);
+
+        self.pos = end;
+        b.cnc.counters().append.store_release(self.pos);
+        Ok((end, time_ns))
+    }
+
     /// Padding frame: header only; `length` spans to the buffer end.
     fn write_padding(&self, off: usize, pad_len: u32, time_ns: u64) {
         let b = &self.buffer;
@@ -910,9 +977,10 @@ mod tests {
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::{
-        CLUSTER_BODY_PREFIX_LEN, ClusterKind, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER,
-        FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, HEADER_LEN,
-        TIMER_BODY_LEN, TimerBody, read_cluster_prefix, read_header, read_timer_body,
+        CLUSTER_BODY_PREFIX_LEN, ClusterKind, FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE,
+        FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
+        FRAME_TYPE_SNAPSHOT, FRAME_TYPE_TIMER, HEADER_LEN, TIMER_BODY_LEN, TimerBody,
+        read_cluster_prefix, read_header, read_timer_body,
     };
 
     const CAP: u64 = 4096;
@@ -1078,6 +1146,32 @@ mod tests {
         assert_eq!(kind, ClusterKind::ScheduleTable);
         assert_eq!(payload, b"table-bytes");
         assert_eq!(a.last_stamp(), 1_000);
+    }
+
+    /// Coordinated-snapshot plan 2 (spec §5.1): `append_snapshot` is an
+    /// empty-body frame stamped like a CLIENT frame (`max(now, last)`) — NOT
+    /// like TIMER's deadline clamp — with `flags` written verbatim.
+    #[test]
+    fn append_snapshot_is_an_empty_stamped_frame_with_flags() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 5, 0);
+        a.set_now(3_000);
+        let (frame_end, stamp) = a.append_snapshot(5, FLAG_SNAPSHOT_STANDBY).unwrap();
+        assert_eq!(stamp, 3_000);
+        assert_eq!(
+            frame_end, HEADER_LEN as u64,
+            "empty body -> one aligned header frame"
+        );
+        assert_eq!(a.position(), frame_end);
+
+        let s = b.recordable_slice(0, 1 << 20).unwrap();
+        let h = read_header(s);
+        assert_eq!(h.frame_type, FRAME_TYPE_SNAPSHOT);
+        assert_eq!(h.length, HEADER_LEN as u32, "empty body");
+        assert_eq!(h.flags, FLAG_SNAPSHOT_STANDBY);
+        assert_eq!(h.leadership_term_id, 5);
+        assert_eq!((h.client_id, h.seq), (0, 0));
+        assert_eq!(h.time_ns, 3_000);
     }
 
     #[test]
