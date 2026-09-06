@@ -217,6 +217,15 @@ impl RowTimers {
     pub fn pending_len(&self) -> usize {
         self.pending.len() + self.table.values().filter(|e| e.next.is_some()).count()
     }
+    /// Test-only: a table entry's raw armed `next` deadline (`None` = parked
+    /// or absent), independent of the clock-driven catch-up
+    /// `table_fire_deadline` applies at fire time — Ruling R15' needs to
+    /// observe exactly what `adopt_table`/`table_fired` left it at, to prove
+    /// an unrelated re-arm does not walk it backward.
+    #[cfg(test)]
+    pub fn table_next_for_test(&self, id: u64) -> Option<u64> {
+        self.table.get(&id).and_then(|e| e.next)
+    }
     /// Every table entry, parked ones included. Ruling R15 (spec §4.9):
     /// only the tests read it now — `arm_table_from_view`'s caller
     /// (`Consensus::refresh_from_view`) publishes `uc2_schedule_entries`

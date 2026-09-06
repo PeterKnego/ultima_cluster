@@ -1615,6 +1615,7 @@ impl Node {
             view_position_seen: u64::MAX, // see the field: the first refresh must always run
             last_cluster_append: 0,
             schedule_position: 0,
+            last_armed_table_position: 0,
             schedule_pending: instance.root.join(SCHEDULE_PENDING_FILE),
             settings_pending: instance.root.join(SETTINGS_PENDING_FILE),
             schedule_pos_pub: Arc::clone(&schedule_pos_pub),
@@ -2365,11 +2366,29 @@ struct Consensus {
     /// cluster FSM applies whichever of the two commits, in log order, and a
     /// truncated one simply never reaches the view.
     last_cluster_append: u64,
-    /// Cluster FSM: MIRROR of the view's `table_position` — the table this
-    /// node's rows are armed from. Written only by `refresh_from_view`, which
-    /// re-arms whenever it moves; also the "version in effect" word a
-    /// `schedule apply` reply carries.
+    /// Cluster FSM: MIRROR of the view's `table_position` — published as the
+    /// cluster-wide table metrics (`schedule_pos_pub`/`schedule_entries_pub`)
+    /// whenever it moves, on every node regardless of role; also the
+    /// "version in effect" word a `schedule apply` reply carries. Since
+    /// Ruling R15 this no longer gates row-heap arming — see
+    /// `last_armed_table_position`.
     schedule_position: u64,
+    /// Cluster FSM spec §4.9, Ruling R15': the table position THIS node's row
+    /// heaps were last armed from, while leading — separate from
+    /// `schedule_position` (the metrics mirror, unconditional on every
+    /// node) so an unrelated committed CLUSTER frame (membership, settings —
+    /// anything that moves the view's position without changing the table)
+    /// does not re-`adopt_table` and clobber a table entry's `next` that
+    /// `RowTimers::table_fired` already advanced past what `adopt_table`
+    /// would recompute from `last_delivered` (which only the service's
+    /// `TableConsumed` round-trip raises) — the reviewer's repro: fire a
+    /// tick, then an unrelated commit re-arms the SAME occurrence and
+    /// duplicates it. Reset to `0` by `discard_timers` on any leader exit,
+    /// so the NEXT promotion's forced re-check (`view_position_seen =
+    /// u64::MAX` in `on_collapsed`) always re-arms even when the table
+    /// position itself is unchanged — `0` is also a real "no table"
+    /// position, and arming from an empty/absent table is a harmless no-op.
+    last_armed_table_position: u64,
     /// Plan 2: `<instance_dir>/schedules.pending` — the file an admin client
     /// stages and this node reads back under `ADMIN_OP_SCHEDULE_APPLY`. Held
     /// as a path because `Consensus` never sees the `InstanceDir` itself
@@ -4219,17 +4238,25 @@ impl Consensus {
     /// discarded, not re-armed; the next promotion rebuilds it from the
     /// service's edge announce and the cluster FSM's table.
     ///
-    /// Ruling R15: does NOT touch `schedule_position` (or
-    /// `view_position_seen`) — after the leader/follower metrics-vs-arming
-    /// split, `schedule_position` gates only the cluster-wide table METRICS
-    /// (`schedule_pos_pub`/`schedule_entries_pub`), which stay correct and
-    /// unconditional on every node regardless of role; re-arming this row's
-    /// heap on the NEXT promotion is `on_collapsed`'s job
-    /// (`view_position_seen = u64::MAX`), not this function's.
+    /// Ruling R15: does NOT touch `schedule_position` — after the
+    /// leader/follower metrics-vs-arming split, `schedule_position` gates
+    /// only the cluster-wide table METRICS (`schedule_pos_pub`/
+    /// `schedule_entries_pub`), which stay correct and unconditional on
+    /// every node regardless of role.
+    ///
+    /// Ruling R15': DOES reset `last_armed_table_position` to `0` — that
+    /// field, not `schedule_position`, is what gates row-heap re-arming
+    /// (see `refresh_from_view`), so the NEXT promotion's forced re-check
+    /// (`view_position_seen = u64::MAX` in `on_collapsed`) must find it
+    /// disagreeing with the view's `table_position` even when the table
+    /// itself never changed across the demotion/promotion — `0` also
+    /// correctly means "not yet armed this tenure" and doubles as the
+    /// harmless "no table" position.
     fn discard_timers(&mut self) {
         for slot in self.timers.iter_mut().flatten() {
             slot.discard();
         }
+        self.last_armed_table_position = 0;
         self.publish_timers_pending();
     }
 
@@ -4505,14 +4532,28 @@ impl Consensus {
                 source = "cluster_fsm"
             );
         }
-        // The row-heap ARMING is leader-only (spec §4.9) and runs on every
-        // visit this function makes while leading — not only when the
-        // position changed above — so the leader's first pass after a
-        // promotion (`on_collapsed`'s forced re-check) arms from the
-        // ALREADY-committed table even though `schedule_position` already
-        // agrees with it (a follower's own earlier visit set it).
-        if self.leader_flag.load(Ordering::Relaxed) {
+        // The row-heap ARMING is leader-only (spec §4.9) and gated on its
+        // OWN shadow, `last_armed_table_position` — NOT on `schedule_position`
+        // (Ruling R15) and NOT unconditionally on every leading visit
+        // (Ruling R15', the fix here): re-arming on an unrelated committed
+        // CLUSTER frame (membership, settings — anything that moves the
+        // view's position without changing the table) would recompute a
+        // table entry's `next` from `last_delivered`, clobbering whatever
+        // `RowTimers::table_fired` already advanced it to since the last arm
+        // — `table_fired` never raises `last_delivered` (only the service's
+        // `TableConsumed` round-trip does), so that recompute can walk `next`
+        // BACKWARD to an occurrence already fired, and re-fire it. Arming
+        // exactly when the table position changed, or once per promotion
+        // (`last_armed_table_position` reset to `0` by `discard_timers`, so
+        // `on_collapsed`'s forced re-check always finds a mismatch here even
+        // when `schedule_position` itself did not move), is the narrowest
+        // condition that both covers Ruling R15's promotion case and
+        // excludes this one.
+        if self.leader_flag.load(Ordering::Relaxed)
+            && inner.table_position != self.last_armed_table_position
+        {
             self.arm_table_from_view(&inner);
+            self.last_armed_table_position = inner.table_position;
         }
         // The two node-local clamps (spec §4.4): the record carries a
         // cluster-wide INTENT, and each node bounds it against its own ring at
@@ -8156,6 +8197,7 @@ mod tests {
             view_position_seen: u64::MAX,
             last_cluster_append: 0,
             schedule_position: 0,
+            last_armed_table_position: 0,
             schedule_pending: dir.path().join(SCHEDULE_PENDING_FILE),
             settings_pending: dir.path().join(SETTINGS_PENDING_FILE),
             schedule_pos_pub: Arc::new(AtomicU64::new(0)),
@@ -8836,6 +8878,108 @@ mod tests {
             h.cons.cnc.service_slot(0).identity.timers_pending(),
             0,
             "uc2_timers_pending reflects the newly-armed leader heap"
+        );
+    }
+
+    /// Count `FRAME_TYPE_TIMER` frames naming `id` in `[6016, append)` — the
+    /// same raw-buffer scan the §4.3 differential test's `collect_frames`
+    /// uses below, narrowed to one id. `6016` is this harness's fixed prime
+    /// base (see `harness_with_crypto_and_settings`).
+    fn count_timer_frames_for_id(h: &Harness, id: u64) -> usize {
+        let append = h.cons.cnc.counters().append.load_acquire();
+        let mut cursor = 6016u64;
+        let mut buf = Vec::new();
+        let mut n = 0;
+        while cursor < append {
+            let hdr = match h.cons.buffer.read_frame_validated(cursor, &mut buf) {
+                FrameRead::Frame(hdr) => hdr,
+                other => panic!("frame at {cursor} unreadable: {other:?}"),
+            };
+            if hdr.frame_type == uc_protocol::v2::frame::FRAME_TYPE_TIMER
+                && let Some(body) = uc_protocol::v2::frame::read_timer_body(
+                    &buf[uc_protocol::v2::frame::HEADER_LEN..],
+                )
+                && body.timer_id == id
+            {
+                n += 1;
+            }
+            cursor += align_frame_len(hdr.length as usize) as u64;
+        }
+        n
+    }
+
+    /// Ruling R15' (spec §4.9): re-arming must be gated on the table itself
+    /// changing (or the first leader pass after a promotion), never on an
+    /// unrelated committed CLUSTER frame — `RowTimers::adopt_table` recomputes
+    /// `next` from `last_delivered` (which only the service's `TableConsumed`
+    /// round-trip raises) and the log clock, ignoring whatever
+    /// `RowTimers::table_fired` already advanced `next` to; re-arming on
+    /// every leading visit (Ruling R15's first cut) could walk a fired
+    /// entry's `next` BACKWARD to the very occurrence just fired, making it
+    /// immediately due again — a duplicate `TIMER` frame outside the
+    /// documented "one duplicate after a restart" limit.
+    #[test]
+    fn an_unrelated_cluster_commit_while_leading_does_not_rearm_a_fired_table_tick() {
+        let (mut h, hash) = harness_with_one_declared_row();
+        drive_to_serving_leader(&mut h);
+
+        let table = ScheduleTable {
+            entries: vec![uc_protocol::v2::schedule::ScheduleEntry {
+                identity_hash: hash,
+                timer_id: 9,
+                rule: ScheduleRule::Every {
+                    period_ns: 100,
+                    anchor_ns: 0,
+                },
+            }],
+        };
+        let end = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::ScheduleTable(table))
+            .unwrap();
+        h.commit_through(end);
+        // The fresh harness's log clock is 0, so `Every{100, anchor 0}` arms
+        // at deadline 0 — immediately due at any `now >= 0`. Pinning the pass
+        // clock past it means this ONE `do_work` both arms (`refresh_from_view`)
+        // and fires (`fire_due_timers`) the same entry, advancing it to 100.
+        h.cons.test_now_ns = Some(50);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_next_for_test(9),
+            Some(100),
+            "the entry advanced past the fired occurrence"
+        );
+        assert_eq!(
+            count_timer_frames_for_id(&h, 9),
+            1,
+            "exactly one TIMER frame for id 9 so far"
+        );
+
+        // An UNRELATED committed CLUSTER frame (Settings, not the table)
+        // while STILL LEADING, at the same pass clock — the regression this
+        // test guards: Ruling R15's first cut re-armed on every leading
+        // visit, which would recompute `next` from `last_delivered` (still
+        // `None`) back to 0 — due again at `now = 50` — and fire a SECOND
+        // TIMER frame for the same id right here.
+        let end2 = h
+            .cons
+            .append_cluster_frame(&ClusterCommand::Settings(Settings {
+                snapshot_interval_bytes: 5,
+                ..Settings::genesis_default()
+            }))
+            .unwrap();
+        h.commit_through(end2);
+        h.cons.do_work();
+
+        assert_eq!(
+            h.cons.timers[0].as_ref().unwrap().table_next_for_test(9),
+            Some(100),
+            "an unrelated commit must not re-arm the table entry backward"
+        );
+        assert_eq!(
+            count_timer_frames_for_id(&h, 9),
+            1,
+            "no duplicate TIMER frame for id 9 was appended"
         );
     }
 
