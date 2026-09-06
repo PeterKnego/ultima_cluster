@@ -118,6 +118,13 @@ impl FsmName {
         self.bytes
     }
 
+    /// The `uc_` prefix is reserved for internal state machines (the cluster
+    /// FSM, `uc_cluster` — spec §3.3, §6): a name starting with it is a
+    /// `services.names` config refusal, not a valid declared row.
+    pub const fn is_reserved(&self) -> bool {
+        self.len >= 3 && self.bytes[0] == b'u' && self.bytes[1] == b'c' && self.bytes[2] == b'_'
+    }
+
     /// Inverse of [`padded`](Self::padded). All-zero (an undeclared row) or a
     /// line that fails the rules is `None` — a shared-memory page never panics
     /// an attacher.
@@ -213,6 +220,20 @@ mod tests {
         assert_eq!(FsmName::parse("ord ers"), Err(NameError::BadByte(b' ')));
         assert_eq!(FsmName::parse("ordérs"), Err(NameError::BadByte(0xC3)));
         assert_eq!(FsmName::parse("kv").unwrap().as_str(), "kv");
+    }
+
+    /// FSM identity + cluster FSM (spec §3.3, §6): the `uc_` prefix is
+    /// reserved for internal state machines (`uc_cluster`), so a service
+    /// name starting with it must be refused at config load — this is the
+    /// predicate that refusal is built on.
+    #[test]
+    fn is_reserved_flags_the_uc_prefix() {
+        assert!(FsmName::parse("uc_x").unwrap().is_reserved());
+        assert!(FsmName::parse("uc_cluster").unwrap().is_reserved());
+        assert!(!FsmName::parse("ucx").unwrap().is_reserved());
+        assert!(!FsmName::parse("kv").unwrap().is_reserved());
+        assert!(!FsmName::parse("uc").unwrap().is_reserved());
+        assert!(!FsmName::parse("u").unwrap().is_reserved());
     }
 
     /// FROZEN: FNV-1a 64 published vectors. Never change these.

@@ -357,7 +357,8 @@ mod tests {
             // 512 B — the same budget the examples use; a frame must fit one
             // datagram. See `a_payload_that_cannot_fit_a_datagram_is_refused`.
             max_payload: 512,
-            admission_bytes: 256 * 1024,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
             election_timeout_min_ns: 150_000_000,
             election_timeout_max_ns: 300_000_000,
             seed: 7,

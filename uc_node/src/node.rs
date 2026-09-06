@@ -73,6 +73,7 @@ use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule, ScheduleTable,
     decode_schedule_table, encode_schedule_table,
 };
+use uc_protocol::v2::settings::Settings;
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
 /// latch serializes them), so a slot suffices and, unlike a bounded channel,
@@ -200,7 +201,14 @@ pub struct NodeConfig {
     pub max_payload: usize,
     /// Ingress admission budget in bytes (`append - commit` backpressure gate,
     /// wired in Task 7). Default `256 * 1024`.
-    pub admission_bytes: u64,
+    ///
+    /// The cluster FSM (spec §3.3, §6) moved the live value cluster-wide
+    /// (`Settings::admission_bytes`, seeded by `[settings]` in `node.toml`
+    /// — `NodeConfig::settings_genesis` — and changed thereafter by `uc2ctl
+    /// settings apply`); this field is now only the boot-time fallback used
+    /// while the replicated view still says `0` ("derive at use"). Renamed
+    /// from `admission_bytes` in the same change.
+    pub admission_bytes_default: u64,
     pub election_timeout_min_ns: u64,
     pub election_timeout_max_ns: u64,
     pub seed: u64,
@@ -230,6 +238,13 @@ pub struct NodeConfig {
     /// (`ServicesConfig::validate`) — a bad bound is a named startup refusal
     /// before any file is created.
     pub services: ServicesConfig,
+    /// The cluster FSM (spec §3.3, §6): the replicated `Settings` record's
+    /// genesis value, seeded from `[settings]` in `node.toml`
+    /// (`config_file::SettingsSection`) — absent means
+    /// [`Settings::genesis_default`]. Nothing reads this yet; later tasks
+    /// install it as the cluster FSM's genesis image and read the live
+    /// value it evolves into.
+    pub settings_genesis: Settings,
 }
 
 /// What a drain achieved before the node stopped.
@@ -820,7 +835,7 @@ impl Node {
         // every boot, so without this an attaching reader sees a stale `0` for
         // an entire duty cycle even when the recovered record is not genesis).
         cnc.store_config_version(config.version);
-        cnc.store_admission_bytes(cfg.admission_bytes);
+        cnc.store_admission_bytes(cfg.admission_bytes_default);
 
         // M7 Task 6: the snapshot-session config-carry cache — the encoded
         // CURRENT `ConfigRecord.config` (`v2::config::encode_config` bytes), read
@@ -1469,7 +1484,7 @@ impl Node {
             current_round: None,
             next_round_seq: 1,
             next_nonce: 0,
-            admission_bytes: cfg.admission_bytes,
+            admission_bytes: cfg.admission_bytes_default,
             fsm_lag_eff,
             pending_ring_ingress: None,
             last_holes_published: (0, 0),
@@ -1578,7 +1593,7 @@ impl Node {
             leader_flag,
             can_serve_flag,
             ingress_tx,
-            admission_bytes: cfg.admission_bytes,
+            admission_bytes: cfg.admission_bytes_default,
             fsm_door: fsm_lag_eff,
             buffer,
             truncations,
@@ -2171,8 +2186,8 @@ struct Consensus {
     /// Monotonic per-node nonce — scopes each probe ROUND (no longer each
     /// read) so acks attribute to the right round on the wire.
     next_nonce: u64,
-    /// Mirror of `NodeConfig::admission_bytes` (the `append - commit` door
-    /// budget for the ring drain).
+    /// Mirror of `NodeConfig::admission_bytes_default` (the `append - commit`
+    /// door budget for the ring drain).
     admission_bytes: u64,
     /// M14a (spec §5.2): the FSM term — `Some(fsm_lag)` when at least one
     /// service is declared, `None` (inert) for a `none_for_tests` node.
@@ -10865,7 +10880,8 @@ mod tests {
             app_id: "t12".into(),
             buffer_bytes: 1 << 20,
             max_payload: 256,
-            admission_bytes: 256 * 1024,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
             election_timeout_min_ns: 20_000_000,
             election_timeout_max_ns: 40_000_000,
             seed: 1,

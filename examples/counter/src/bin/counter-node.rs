@@ -77,7 +77,8 @@ fn main() -> anyhow::Result<()> {
         app_id: args.app_id,
         buffer_bytes: 1 << 22, // 4 MiB log ring
         max_payload: 256,
-        admission_bytes: 256 * 1024,
+        admission_bytes_default: 256 * 1024,
+        settings_genesis: uc_node::Settings::genesis_default(),
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(args.id),

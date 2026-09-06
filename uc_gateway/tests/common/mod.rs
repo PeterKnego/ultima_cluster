@@ -64,7 +64,8 @@ pub fn start_single_node_with_election(
         app_id: APP.into(),
         buffer_bytes: 1 << 22, // 4 MiB
         max_payload: 256,
-        admission_bytes: 256 * 1024,
+        admission_bytes_default: 256 * 1024,
+        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
         election_timeout_min_ns: election_min_ns,
         election_timeout_max_ns: election_max_ns,
         seed: 1,
@@ -165,7 +166,8 @@ pub fn start_cluster(root: &Path, n: usize) -> Vec<Slot> {
             app_id: APP.into(),
             buffer_bytes: 1 << 22, // 4 MiB
             max_payload: 256,
-            admission_bytes: 256 * 1024,
+            admission_bytes_default: 256 * 1024,
+            settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
             // The lincheck-v2 3-node shape: sub-second failover, and each node
             // a distinct seed so a clean boot elects exactly one leader.
             election_timeout_min_ns: 150_000_000,

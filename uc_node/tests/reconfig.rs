@@ -61,7 +61,8 @@ fn make_config(
         app_id: APP.into(),
         buffer_bytes: 1 << 22,
         max_payload: 256,
-        admission_bytes: 256 * 1024,
+        admission_bytes_default: 256 * 1024,
+        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,
@@ -1017,7 +1018,7 @@ fn spawn_cluster_admission(n: usize, admission_bytes: u64) -> Cluster {
             instance_dir.clone(),
             seed_for(i),
         );
-        cfg.admission_bytes = admission_bytes;
+        cfg.admission_bytes_default = admission_bytes;
         let node = Node::start_with_socket(cfg, sock).expect("start");
         nodes.push(NodeH {
             id: i as NodeId,

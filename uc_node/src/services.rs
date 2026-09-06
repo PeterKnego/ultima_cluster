@@ -11,6 +11,7 @@ use uc_log::cnc::CncPage;
 use uc_protocol::identity::FsmName;
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
+use uc_protocol::v2::settings::FSM_LAG_LOCKSTEP;
 
 /// The FSM pacing policy (spec §1, "FSM pacing"). There is deliberately no
 /// unbounded variant: an FSM slower than the log's sustained rate can never
@@ -54,6 +55,12 @@ impl ServicesConfig {
         let mut out = [None; CNC_MAX_SERVICES];
         for (i, raw) in names.iter().enumerate() {
             let n = FsmName::parse(raw).map_err(|e| format!("services.names: {raw:?}: {e}"))?;
+            if n.is_reserved() {
+                return Err(format!(
+                    "services.names: {raw:?}: the uc_ prefix is reserved for internal state \
+                     machines (uc_cluster)"
+                ));
+            }
             if out[..i].contains(&Some(n)) {
                 return Err(format!("services.names: duplicate FSM name {raw:?}"));
             }
@@ -332,6 +339,43 @@ pub fn fsm_lag_eff(
     })
 }
 
+/// Cluster-FSM settings (spec §6, task 6 scaffolding): [`fsm_lag_eff`]'s
+/// arithmetic over a raw `Settings::fsm_lag_bytes` word instead of a
+/// config-declared [`ServicesConfig`] bound, for the replicated-settings path
+/// later tasks wire up. `0` reads as "derive the default"
+/// (`buffer_bytes / 4`, the same default `fsm_lag_eff` falls back to for a
+/// `None` `ServicesConfig::fsm_lag`); an out-of-range word is clamped below
+/// half the ring rather than refused — this feeds a sync/deterministic apply
+/// path with no `Result`, unlike `ServicesConfig::validate`, which runs once
+/// at config load and can still error.
+///
+/// `Settings::fsm_lag_bytes`'s own doc names `FSM_LAG_LOCKSTEP` (`0`) as what
+/// an EXPLICIT `settings apply` to lockstep encodes — the same word genesis's
+/// "derive the default" uses, distinguishable only via `Settings::has_fsm_lag`
+/// (not yet built). This function sees only the raw word, so `0` currently
+/// always takes the derive-default reading; the `FSM_LAG_LOCKSTEP` branch
+/// below is where a future task threads `has_fsm_lag` through once it exists.
+pub fn fsm_lag_from_setting(setting: u64, buffer_bytes: u64, max_payload: usize) -> Option<u64> {
+    if setting == 0 {
+        Some(buffer_bytes / 4)
+    } else if setting == FSM_LAG_LOCKSTEP {
+        Some(align_frame_len(HEADER_LEN + max_payload) as u64)
+    } else {
+        Some(setting.min(buffer_bytes / 2 - 1))
+    }
+}
+
+/// The cnc 4040 encoding over the same raw setting — mirrors
+/// [`ServicesConfig::page_lag_value`]'s arithmetic (the byte bound the page
+/// carries, clamped the same way [`fsm_lag_from_setting`] is).
+pub fn page_lag_from_setting(setting: u64, buffer_bytes: u64) -> u64 {
+    if setting == 0 {
+        buffer_bytes / 4
+    } else {
+        setting.min(buffer_bytes / 2 - 1)
+    }
+}
+
 /// M14c (spec §9): how stale a declared FSM's heartbeat may get before the
 /// node calls it gone and emits `service_detached`. Deliberately the SAME
 /// 3 s bar `obs::http`'s `HEARTBEAT_STALE_NS` applies to `/readyz` — a
@@ -393,6 +437,18 @@ mod tests {
         let nine: Vec<String> = (0..9).map(|i| format!("f{i}")).collect();
         let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
         assert!(e(&nine).contains("at most 8 FSMs"));
+    }
+
+    /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved for
+    /// internal state machines (`uc_cluster`) — a declared row may not claim
+    /// it.
+    #[test]
+    fn from_names_refuses_the_uc_reserved_prefix() {
+        let e = ServicesConfig::from_names(&["uc_cluster"], None).unwrap_err();
+        assert!(e.contains("reserved"), "{e}");
+        let e = ServicesConfig::from_names(&["kv", "uc_x"], None).unwrap_err();
+        assert!(e.contains("reserved"), "{e}");
+        assert!(ServicesConfig::from_names(&["ucx"], None).is_ok());
     }
 
     #[test]
@@ -551,6 +607,41 @@ mod tests {
             ),
             Some(64)
         );
+    }
+
+    /// Cluster-FSM settings (spec §6, task 6 scaffolding): the effective-lag
+    /// arithmetic over a raw `Settings::fsm_lag_bytes` word rather than a
+    /// config-declared `ServicesConfig` bound. `0` reads as "derive the
+    /// default" (same `buffer_bytes / 4` `fsm_lag_eff` uses); an explicit
+    /// value is clamped below half the ring rather than refused, because the
+    /// apply path this feeds is sync/deterministic/no-`Result` (unlike
+    /// `ServicesConfig::validate`, which runs once at config load and can
+    /// still error).
+    #[test]
+    fn fsm_lag_from_setting_table() {
+        let b = 4u64 << 20;
+        assert_eq!(fsm_lag_from_setting(0, b, 256), Some(b / 4));
+        assert_eq!(fsm_lag_from_setting(4096, b, 256), Some(4096));
+        assert_eq!(
+            fsm_lag_from_setting(b, b, 256),
+            Some(b / 2 - 1),
+            "an out-of-range setting is clamped, never refused, at this layer"
+        );
+        assert_eq!(
+            fsm_lag_from_setting(u64::MAX, b, 256),
+            Some(b / 2 - 1),
+            "clamped even from an absurd word"
+        );
+    }
+
+    /// The cnc 4040 encoding over the same raw setting — mirrors
+    /// [`ServicesConfig::page_lag_value`]'s arithmetic.
+    #[test]
+    fn page_lag_from_setting_table() {
+        let b = 4u64 << 20;
+        assert_eq!(page_lag_from_setting(0, b), b / 4);
+        assert_eq!(page_lag_from_setting(4096, b), 4096);
+        assert_eq!(page_lag_from_setting(b, b), b / 2 - 1);
     }
 
     #[test]

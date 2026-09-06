@@ -87,3 +87,9 @@ pub use uc_crypto::CryptoConfig;
 /// exactly the pre-M12b posture: the instance directory's permissions are the
 /// admin boundary and the cnc auth line is ignored.
 pub use uc_crypto::admin::{AdminKey, AdminPolicy};
+/// The cluster FSM (spec §3.3, §6): the replicated settings record, re-exported
+/// so a deployment that only depends on `uc_node` can build a [`NodeConfig`]'s
+/// `settings_genesis` without naming `uc_protocol` directly.
+/// [`Settings::genesis_default`] (every field zero / `Target::All`) is exactly
+/// the pre-cluster-FSM behavior — nothing reads this yet.
+pub use uc_protocol::v2::settings::{Settings, Target};

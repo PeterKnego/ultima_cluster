@@ -33,11 +33,11 @@ use uc_consensus::election::NodeId;
 use uc_crypto::rotation::RotationPolicy;
 use uc_net::fault::FaultConfig;
 
+use uc_protocol::v2::settings::{FSM_LAG_LOCKSTEP, Settings, Target};
+
 use crate::obs::log::LogLevel;
 use crate::preflight::{ObsOptions, StartupOptions};
-#[cfg(test)]
-use crate::services::FsmLag;
-use crate::services::ServicesConfig;
+use crate::services::{FsmLag, ServicesConfig};
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -194,10 +194,11 @@ struct MetricsSectionFile {
 }
 
 /// FSM identity (spec §3.3, §4.1): `[services]` — the declared FSM set, by
-/// name in row order, and the lag policy. `fsm_lag` is a STRING (`"16MiB"`,
-/// `"lockstep"`), parsed by `services::parse_fsm_lag` so the refusal can name
-/// the field. `ids` is accepted by serde ONLY so the loader can refuse it by
-/// name and point at `names` — `services.ids` was the pre-identity field.
+/// name in row order. `ids` is accepted by serde ONLY so the loader can
+/// refuse it by name and point at `names` — `services.ids` was the
+/// pre-identity field. `fsm_lag` is likewise accepted ONLY to refuse it by
+/// name and point at `[settings]` — the cluster FSM (spec §6) made it a
+/// cluster-wide setting instead of a per-host one.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ServicesSection {
@@ -207,6 +208,25 @@ struct ServicesSection {
     ids: Option<Vec<u8>>,
     #[serde(default)]
     fsm_lag: Option<String>,
+}
+
+/// The cluster FSM (spec §3.3, §6): `[settings]` SEEDS the replicated
+/// `Settings` record's genesis value — it is not itself the live setting
+/// (that is `uc2ctl settings apply`'s job, task 5). Optional; absent means
+/// [`Settings::genesis_default`]. `fsm_lag` is a STRING (`"16MiB"`,
+/// `"lockstep"`), parsed the same way `services.fsm_lag` used to be, by
+/// `services::parse_fsm_lag`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SettingsSection {
+    #[serde(default)]
+    admission_bytes: Option<u64>,
+    #[serde(default)]
+    fsm_lag: Option<String>,
+    #[serde(default)]
+    snapshot_interval_bytes: Option<u64>,
+    #[serde(default)]
+    snapshot_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,8 +243,12 @@ struct NodeConfigFile {
     buffer_bytes: usize,
     #[serde(default = "default_max_payload")]
     max_payload: usize,
-    #[serde(default = "default_admission_bytes")]
-    admission_bytes: u64,
+    /// The cluster FSM (spec §3.3, §6) moved this cluster-wide: accepted by
+    /// serde ONLY so the loader can refuse it by name and point at
+    /// `[settings]`/`uc2ctl settings apply` — the real value never comes
+    /// from here (see [`default_admission_bytes`]).
+    #[serde(default)]
+    admission_bytes: Option<u64>,
     #[serde(default = "default_election_min_ns")]
     election_timeout_min_ns: u64,
     #[serde(default = "default_election_max_ns")]
@@ -257,6 +281,10 @@ struct NodeConfigFile {
     /// Absent means `[0]` with the default bound (`buffer_bytes / 4`).
     #[serde(default)]
     services: Option<ServicesSection>,
+    /// The cluster FSM (spec §3.3, §6): seeds `NodeConfig::settings_genesis`.
+    /// Absent means [`Settings::genesis_default`].
+    #[serde(default)]
+    settings: Option<SettingsSection>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -533,6 +561,19 @@ pub fn parse_str_with_env(
     })?;
     apply_env_overrides(&mut f, &env)?;
 
+    // The cluster FSM (spec §3.3, §6) moved this cluster-wide: refuse by
+    // name, pointing at the replacement rather than silently deriving a
+    // per-host value from a key that no longer means anything.
+    if f.admission_bytes.is_some() {
+        return Err(ConfigError::Invalid {
+            field: "admission_bytes",
+            detail: "admission_bytes is a cluster-wide setting since the cluster FSM (2.11.0): \
+                     put it under [settings] to seed genesis, and change it with `uc2ctl \
+                     settings apply`"
+                .into(),
+        });
+    }
+
     let purge = match f.purge {
         Some(p) => PurgePolicy::BelowSnapshot {
             slack_bytes: p.below_snapshot_slack_bytes,
@@ -674,28 +715,70 @@ pub fn parse_str_with_env(
                         .into(),
                 });
             }
-            let fsm_lag = match s.fsm_lag.as_deref() {
-                None => None,
-                Some(raw) => Some(crate::services::parse_fsm_lag(raw).map_err(|detail| {
-                    ConfigError::Invalid {
-                        field: "services.fsm_lag",
-                        detail,
-                    }
-                })?),
-            };
+            // The cluster FSM (spec §3.3, §6) moved this cluster-wide, same
+            // as top-level `admission_bytes` above.
+            if s.fsm_lag.is_some() {
+                return Err(ConfigError::Invalid {
+                    field: "services.fsm_lag",
+                    detail: "services.fsm_lag is a cluster-wide setting since the cluster FSM \
+                             (2.11.0): put `fsm_lag` under [settings] to seed genesis, and \
+                             change it with `uc2ctl settings apply`"
+                        .into(),
+                });
+            }
             let refs: Vec<&str> = s.names.iter().map(String::as_str).collect();
-            let cfg = ServicesConfig::from_names(&refs, fsm_lag).map_err(|detail| {
-                ConfigError::Invalid {
+            let cfg =
+                ServicesConfig::from_names(&refs, None).map_err(|detail| ConfigError::Invalid {
                     field: "services.names",
                     detail,
-                }
-            })?;
+                })?;
             cfg.validate(f.buffer_bytes as u64)
                 .map_err(|detail| ConfigError::Invalid {
                     field: "services.fsm_lag",
                     detail,
                 })?;
             cfg
+        }
+    };
+
+    // The cluster FSM (spec §3.3, §6): `[settings]` seeds the replicated
+    // `Settings` record's genesis value. Absent means
+    // `Settings::genesis_default()` (every field zero / `Target::All`).
+    let settings_genesis = match f.settings {
+        None => Settings::genesis_default(),
+        Some(s) => {
+            let fsm_lag_bytes = match s.fsm_lag.as_deref() {
+                None => 0,
+                Some(raw) => {
+                    match crate::services::parse_fsm_lag(raw).map_err(|detail| {
+                        ConfigError::Invalid {
+                            field: "settings.fsm_lag",
+                            detail,
+                        }
+                    })? {
+                        FsmLag::Lockstep => FSM_LAG_LOCKSTEP,
+                        FsmLag::Bounded(b) => b,
+                    }
+                }
+            };
+            let snapshot_target = match s.snapshot_target.as_deref() {
+                None | Some("all") => Target::All,
+                Some("learners") => Target::Learners,
+                Some(other) => {
+                    return Err(ConfigError::Invalid {
+                        field: "settings.snapshot_target",
+                        detail: format!(
+                            "settings.snapshot_target must be \"all\" or \"learners\", got {other:?}"
+                        ),
+                    });
+                }
+            };
+            Settings {
+                fsm_lag_bytes,
+                admission_bytes: s.admission_bytes.unwrap_or(0),
+                snapshot_interval_bytes: s.snapshot_interval_bytes.unwrap_or(0),
+                snapshot_target,
+            }
         }
     };
 
@@ -709,7 +792,11 @@ pub fn parse_str_with_env(
             app_id: f.app_id,
             buffer_bytes: f.buffer_bytes,
             max_payload: f.max_payload,
-            admission_bytes: f.admission_bytes,
+            // `f.admission_bytes` is refused above whenever present — the
+            // file no longer supplies this value, only the code default
+            // (task 5 reads the replicated `settings_genesis`/live setting
+            // instead).
+            admission_bytes_default: default_admission_bytes(),
             election_timeout_min_ns: f.election_timeout_min_ns,
             election_timeout_max_ns: f.election_timeout_max_ns,
             seed: f.seed.unwrap_or_else(|| default_seed_for(f.id)),
@@ -718,6 +805,7 @@ pub fn parse_str_with_env(
             journal_segment_bytes: f.journal_segment_bytes,
             crypto,
             services,
+            settings_genesis,
         },
         StartupOptions {
             allow_volatile_fs: f.allow_volatile_fs,
@@ -1383,16 +1471,20 @@ level = "info"
     }
 
     #[test]
-    fn services_section_parses_names_in_row_order_and_a_lag() {
-        let body = MINIMAL.replace(
-            "names = [\"sm\"]",
-            "names = [\"kv\", \"orders\"]\nfsm_lag = \"16MiB\"",
+    fn services_section_parses_names_in_row_order_and_settings_seeds_the_lag() {
+        // `fsm_lag` moved to `[settings]` (task 6, spec §6): `[services]`
+        // only names the rows now — the lag policy is a cluster-wide
+        // setting, seeded at genesis from here.
+        let body = format!(
+            "{}\n[settings]\nfsm_lag = \"16MiB\"\n",
+            MINIMAL.replace("names = [\"sm\"]", "names = [\"kv\", \"orders\"]")
         );
         let (cfg, _) = load_str(&body).unwrap();
         assert_eq!(
             cfg.services,
-            ServicesConfig::from_names(&["kv", "orders"], Some(FsmLag::Bounded(16 << 20))).unwrap()
+            ServicesConfig::from_names(&["kv", "orders"], None).unwrap()
         );
+        assert_eq!(cfg.settings_genesis.fsm_lag_bytes, 16 << 20);
     }
 
     #[test]
@@ -1434,8 +1526,8 @@ level = "info"
                 "services.names",
             ),
             (
-                "names = [\"sm\"]\nfsm_lag = \"16 MiB\"",
-                "services.fsm_lag must be",
+                "names = [\"sm\"]\nfsm_lag = \"16MiB\"",
+                "uc2ctl settings apply",
                 "services.fsm_lag",
             ),
         ] {
@@ -1459,6 +1551,87 @@ level = "info"
         );
         let err = load_str(&body).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
+    }
+
+    /// The cluster FSM (spec §3.3, §6) moves two keys out of per-host
+    /// `node.toml`: top-level `admission_bytes` and `[services] fsm_lag`.
+    /// Both are refused by name, pointing at `uc2ctl settings apply`
+    /// (task 5's admin surface) rather than at `[settings]`, which only
+    /// SEEDS genesis.
+    #[test]
+    fn admission_bytes_and_services_fsm_lag_are_refused_by_name_pointing_at_settings_apply() {
+        // A bare key must precede every `[table]` header in TOML, or it binds
+        // to whatever table came last (`MINIMAL` ends in `[services]`) —
+        // prepend it rather than append.
+        let toml = format!("admission_bytes = 4096\n{MINIMAL}");
+        let e = load_str(&toml).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConfigError::Invalid {
+                    field: "admission_bytes",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        assert!(e.to_string().contains("uc2ctl settings apply"), "{e}");
+
+        let toml = MINIMAL.replace("[services]", "[services]\nfsm_lag = \"16MiB\"");
+        let e = load_str(&toml).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConfigError::Invalid {
+                    field: "services.fsm_lag",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        assert!(e.to_string().contains("uc2ctl settings apply"), "{e}");
+    }
+
+    /// `[settings]` is optional; absent, `settings_genesis` is exactly
+    /// [`Settings::genesis_default`]. Present, it seeds the four fields
+    /// (spec §6) — `admission_bytes`, `fsm_lag` (parsed the same way
+    /// `services.fsm_lag` used to be), `snapshot_interval_bytes`, and
+    /// `snapshot_target`.
+    #[test]
+    fn settings_section_seeds_genesis_and_is_optional() {
+        let toml = format!(
+            "{MINIMAL}\n[settings]\nadmission_bytes = 4096\nfsm_lag = \"lockstep\"\n\
+             snapshot_interval_bytes = 1073741824\nsnapshot_target = \"learners\"\n"
+        );
+        let (c, _) = load_str(&toml).unwrap();
+        assert_eq!(c.settings_genesis.admission_bytes, 4096);
+        assert_eq!(c.settings_genesis.fsm_lag_bytes, FSM_LAG_LOCKSTEP);
+        assert_eq!(c.settings_genesis.snapshot_interval_bytes, 1 << 30);
+        assert_eq!(c.settings_genesis.snapshot_target, Target::Learners);
+        assert_eq!(
+            load_str(MINIMAL).unwrap().0.settings_genesis,
+            Settings::genesis_default()
+        );
+    }
+
+    /// FSM identity + cluster FSM (spec §3.3, §6): `uc_` is reserved
+    /// (`uc_cluster`) — a `node.toml` naming a service with that prefix
+    /// refuses to start.
+    #[test]
+    fn a_uc_prefixed_service_name_is_refused() {
+        let toml = MINIMAL.replace("names = [\"sm\"]", "names = [\"uc_cluster\"]");
+        let e = load_str(&toml).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConfigError::Invalid {
+                    field: "services.names",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        assert!(e.to_string().contains("reserved"), "{e}");
     }
 
     #[test]
