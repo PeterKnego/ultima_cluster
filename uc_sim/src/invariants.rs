@@ -643,9 +643,16 @@ impl InvariantChecker {
     ///
     /// * `unobserved` — held config frames at or below the node's applied
     ///   frontier (`min(commit, durable)`, the position the apply loop polls)
-    ///   whose end the node's archive scan has never emitted a
-    ///   `ConfigObserved` for. Must be empty: the FSM applied a frame the
-    ///   kernel never saw.
+    ///   that the kernel does not hold EITHER WAY: its archive scan never
+    ///   emitted a `ConfigObserved` for the frame's end, AND its durable
+    ///   config record does not already cover it (`f.end <= cfg_cur_pos` with
+    ///   an adopted version at least the frame's — the record a restart
+    ///   recovers). Must be empty: the FSM applied a frame the kernel never
+    ///   saw. The record disjunct is not an exemption but the kernel's second
+    ///   way of holding a frame, and it is required because the sim's boot
+    ///   re-scan is lazy — a restarted node clears `cfg_observed` and re-emits
+    ///   nothing until new bytes arrive, while its commit shadow keeps
+    ///   advancing. See `World::check_two_readers` for the full argument.
     /// * `fsm_version` vs `adopted_version` — the version the FSM's derived
     ///   membership carries at that frontier vs the version the kernel has
     ///   actually adopted. The FSM may lag (it reads at commit); it may never

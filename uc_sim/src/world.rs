@@ -852,8 +852,11 @@ pub struct World {
     stat_restarts: u32,
     stat_stale_vote_window: u64,
     /// inv12 non-vacuity: how many (node, config frame) pairs the two-readers
-    /// sweep has actually ASSERTED — a frame the node genuinely holds at or
-    /// below its committed frontier. A run whose count is 0 proved nothing.
+    /// sweep has RELATED — a frame the node genuinely holds at or below its
+    /// committed frontier, i.e. one its cluster FSM has applied. A run whose
+    /// count is 0 proved nothing. NOT a count of pairs that could have failed:
+    /// a pair the kernel's recovered config record already covers is related
+    /// and counted, and can only pass.
     stat_two_readers_checks: u64,
 
     // ---- T13: crypto plane ----
@@ -881,7 +884,7 @@ pub struct Stats {
     pub restarts: u32,
     pub steps: u64,
     /// inv12 non-vacuity: (node, config frame) pairs the two-readers sweep
-    /// actually asserted over the run (see `World::two_readers_checks`).
+    /// related over the run (see `World::two_readers_checks`).
     pub two_readers_checks: u64,
 }
 
@@ -1863,7 +1866,8 @@ impl World {
 
     /// inv12 — THE TWO READERS (cluster-FSM spec §4.6). Swept after every
     /// event beside inv2/inv6. Returns how many (node, frame) pairs it
-    /// actually asserted, so a scenario can prove the sweep was not vacuous.
+    /// RELATED — frames the node genuinely holds at or below its committed
+    /// frontier — so a scenario can prove the sweep was not vacuous.
     ///
     /// `uc_sim` has no cluster FSM (it has no frames at all — spec §8
     /// amendment), so the FSM's membership is the DERIVED quantity the spec
@@ -1875,14 +1879,31 @@ impl World {
     ///
     /// Two halves, per `InvariantChecker::check_two_readers`:
     ///
-    /// (a) every held frame at or below the frontier is in the node's
-    ///     `cfg_observed` — the kernel's archive scan emitted it. NO
-    ///     exemptions: `cfg_observed` is written at EMISSION, not at
-    ///     adoption, so the observation pipeline's in-flight window (which
-    ///     inv6 must exempt) cannot produce a transient here; and a node that
-    ///     is down, halted or mid-restart has `commit == 0`, which makes the
-    ///     half vacuous rather than exempt. Keeping it unexempted is what
-    ///     makes it able to fail at all.
+    /// (a) every held frame at or below the frontier is one the kernel HAS —
+    ///     either its archive scan emitted an observation for it
+    ///     (`cfg_observed`), OR its durable config record already covers it:
+    ///     `f.end <= cfg_cur_pos` AND the adopted version is at least the
+    ///     frame's. The disjunct is not an exemption, it is the kernel's
+    ///     second way of holding a frame — `recover_config_record` at boot,
+    ///     mirrored here by `cfg_cur`/`cfg_cur_pos` — and it is REQUIRED
+    ///     because the sim's boot re-scan is LAZY: `on_restart` clears
+    ///     `cfg_observed`, but `observe_config_frames` only ever runs from
+    ///     `on_archive` inside its `append > durable` guard, and
+    ///     `on_restart` sets `append == durable` — so a restarted node
+    ///     re-emits NOTHING until the leader ships new bytes, while its commit
+    ///     shadow keeps advancing from gossip. Without the disjunct this half
+    ///     fires on a node that recovered its config perfectly (it did:
+    ///     `add_promote_demote_remove_cycle_under_faults`, seed 17 step 5420).
+    ///     The version conjunct keeps the disjunct honest: a frame from a
+    ///     DIFFERENT lineage sitting below a stale `cfg_cur_pos` (reachable
+    ///     under `revert_on_truncate_disabled`) must not be excused by
+    ///     position alone.
+    ///     Half (a) takes no NODE-level exemptions, though: `cfg_observed` is
+    ///     written at EMISSION, not at adoption, so the observation pipeline's
+    ///     in-flight window (which inv6 must exempt) cannot produce a transient
+    ///     here; and a node that is down, halted or mid-restart has
+    ///     `commit == 0`, which makes the half vacuous rather than exempt.
+    ///     Keeping it unexempted is what makes it able to fail at all.
     ///
     /// (b) the FSM's derived version never EXCEEDS the kernel's adopted one.
     ///     This half does take inv6's transient exemptions — down/halted
@@ -1921,17 +1942,14 @@ impl World {
                     continue;
                 }
                 checks += 1;
-                // The kernel "has" a frame two ways: its archive scan emitted
-                // an observation for it (`cfg_observed`), or its DURABLE
-                // config record already sits at or past that position — which
-                // is what a restart recovers (`recover_config_record`, mirrored
-                // by `cfg_cur`/`cfg_cur_pos`) and what the boot re-derivation
-                // re-emits from. `cfg_observed` is cleared at every restart, so
-                // without the second disjunct this half would fire on a node
-                // that recovered its config perfectly and simply has no new
-                // bytes to re-scan yet (see the task-10 report's sim-modelling
-                // note on the lazy boot re-scan).
-                if !nd.cfg_observed.contains(&f.end) && f.end > nd.cfg_cur_pos {
+                // The kernel "has" a frame two ways (see the doc comment): the
+                // archive scan emitted an observation for it, or its durable
+                // config record already covers it — position AND version, so a
+                // different-lineage frame below a stale `cfg_cur_pos` is not
+                // excused by position alone.
+                let in_record =
+                    f.end <= nd.cfg_cur_pos && nd.sm.config().version >= f.config.version;
+                if !nd.cfg_observed.contains(&f.end) && !in_record {
                     unobserved.push((f.end, f.config.version));
                 }
             }
@@ -2972,9 +2990,11 @@ impl World {
     }
 
     /// inv12 non-vacuity: how many (node, config frame) pairs the two-readers
-    /// sweep has asserted so far. Zero means the scenario never put a config
-    /// frame below any node's committed frontier — the invariant proved
-    /// nothing.
+    /// sweep has related so far — frames a node genuinely holds at or below
+    /// its committed frontier. Zero means the scenario never put a config
+    /// frame below any node's committed frontier and the invariant proved
+    /// nothing; a non-zero count is a floor on coverage, not a count of pairs
+    /// that could have failed.
     pub fn two_readers_checks(&self) -> u64 {
         self.stat_two_readers_checks
     }
