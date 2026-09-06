@@ -73,7 +73,7 @@ use uc_protocol::v2::datagram::{
     write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
 };
 use uc_protocol::v2::schedule::{
-    MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule, ScheduleTable,
+    MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN, ScheduleRule,
     decode_schedule_table,
 };
 use uc_protocol::v2::settings::{Settings, decode_settings};
@@ -752,7 +752,7 @@ impl Node {
         // M14a: the lag bound is validated BEFORE any file is created — a
         // named startup refusal, like a bad crypto key.
         cfg.services
-            .validate(cfg.buffer_bytes as u64)
+            .validate("NodeConfig::services fsm_lag", cfg.buffer_bytes as u64)
             .map_err(|d| io::Error::new(io::ErrorKind::InvalidInput, d))?;
 
         let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
@@ -1500,17 +1500,10 @@ impl Node {
 
         // Cluster-FSM spec §4.1/§4.7: genesis from node.toml on a fresh dir,
         // else the newest cluster artifact; the agent replays CLUSTER frames
-        // above it.
-        let cluster_genesis = ClusterState {
-            membership: config.clone(),
-            table: ScheduleTable { entries: vec![] },
-            table_position: 0,
-            settings: cfg.settings_genesis,
-            // 0 = the genesis record, from `[settings]` in node.toml — it
-            // never crossed the log, so there is no frame-END to name.
-            settings_position: 0,
-            applied: 0,
-        };
+        // above it. Both positions are 0 and the table is empty — which is
+        // what `ClusterState::genesis` means, so build it through the
+        // constructor rather than restating the field list here (P1).
+        let cluster_genesis = ClusterState::genesis(config.clone(), cfg.settings_genesis);
         let (cluster_fsm, cluster_start) = crate::cluster_agent::recover(
             &instance.cluster_snapshot_dir(),
             cluster_genesis,
@@ -3925,15 +3918,37 @@ impl Consensus {
         // `> 0` GUARD: `0` means "no cluster artifact yet", which must not pin
         // the floor at 0 forever. It converges — the agent's bridging trigger
         // takes a snapshot as soon as every declared row has one, i.e. as soon
-        // as `service_snapshot_pos` itself is non-zero — and until then the
-        // node has no floor worth purging under anyway.
+        // as `service_snapshot_pos` itself is non-zero.
+        //
+        // M2: taken alone that guard left the rows' floor UNBOUNDED by the
+        // cluster artifact in one window — between the rows publishing their
+        // first `snapshot_pos` and the `uc2-cluster` agent's next duty cycle,
+        // where `rows > 0` and `cluster_pos == 0`. The window is short and
+        // further covered by `slack_bytes`, and its worst outcome is R18's
+        // IDLE path rather than a hole; the second disjunct closes it exactly
+        // anyway. "No cluster artifact yet" is only allowed to mean "no floor
+        // yet" while NO declared row has snapshotted either — after that, an
+        // absent artifact bounds the floor at 0 until the agent writes one.
+        //
+        // The row scan runs only while `cluster_pos == 0`, which after the
+        // first cluster snapshot never happens again (the agent seeds
+        // `cluster_snapshot_pos` from the recovered artifact at boot), so this
+        // costs nothing on the steady path.
         let cluster_pos = self.cluster_snapshot_pos.load(Ordering::Acquire);
         let service_pos = {
             let rows = self.cnc.snapshots().service_snapshot_pos.load_acquire();
             if cluster_pos > 0 {
                 rows.min(cluster_pos)
-            } else {
+            } else if self.services.ids().all(|id| {
+                self.cnc
+                    .service_slot(id as usize)
+                    .snapshot_pos
+                    .load_acquire()
+                    == 0
+            }) {
                 rows
+            } else {
+                0
             }
         };
         let durable = self.cnc.counters().durable.load_acquire();
@@ -7814,7 +7829,7 @@ mod tests {
     use uc_log::region::Region;
     use uc_protocol::ring::RingHeader;
     use uc_protocol::v2::ipc::MSG_V2_SUBMIT;
-    use uc_protocol::v2::schedule::encode_schedule_table;
+    use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
     use uc_protocol::v2::settings::encode_settings;
 
     /// Build a heap-backed cnc page for the bare-`Consensus` harness (no file,

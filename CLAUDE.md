@@ -287,7 +287,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     changes them (admin op **7**, refusals **44–47**, audited `settings_apply`),
     `uc2ctl settings show` reads the committed artifact; the old top-level
     `admission_bytes` and `[services] fsm_lag` are **refused by name**; every
-    replicated value is CLAMPED at the point of use, never refused in `apply`.
+    replicated value is CLAMPED at the point of use; only the reserved
+    `u64::MAX` sentinels (`admission_bytes`, `snapshot.interval_bytes`) and an
+    `fsm_lag` byte bound below one max-size frame are refused at the door,
+    with reason 47.
     Single-in-flight now spans all three kinds. The timer heap is
     **LEADER-ONLY** — a follower's service writes no `svc_sched` record and
     exports `timers_pending = 0`, a demotion discards the heap, and a new

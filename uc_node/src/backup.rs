@@ -669,12 +669,19 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
         }
         // The cluster row's own coverage, under `service: CLUSTER_HOLE_ID`
         // (255 — the id the snapshot session already reserves for it, and not
-        // a slot). Checked ONLY when the family is present: a real node
-        // legitimately purges before the `uc2-cluster` agent's first artifact
-        // exists (`maybe_persist_snapshot_floor` bounds the floor by the
-        // cluster artifact only once it is non-zero), so demanding one on
-        // every purged artifact would make `backup_instance` refuse
-        // perfectly good backups during that window. Once the family exists,
+        // a slot). Checked ONLY when the family is present. The window that
+        // motivated it — a node purging under its rows' floor before the
+        // `uc2-cluster` agent's first artifact exists — is closed in
+        // production since M2 tightened `maybe_persist_snapshot_floor`, but
+        // this tool runs over a directory it did not produce (a restored one,
+        // a hand-assembled one, one from an earlier in-branch build), so
+        // demanding a cluster family unconditionally would refuse backups
+        // that are in fact whole.
+        //
+        // TODO(plan 2): once the commanded instant makes the artifact
+        // unconditional, an absent cluster family becomes a hole.
+        //
+        // Once the family exists,
         // the same ordering rule that covers a row covers it: the copy is
         // taken after the journal, and the agent's tag is its consumed
         // cursor, which only advances.

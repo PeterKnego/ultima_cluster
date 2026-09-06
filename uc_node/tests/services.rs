@@ -159,9 +159,12 @@ fn a_bad_lag_bound_is_a_named_startup_refusal_before_any_file_exists() {
         names(&["count"], Some(FsmLag::Bounded(2 << 20))),
     ); // == buffer/2
     let err = Node::start(cfg).err().expect("must refuse");
+    // M4: the message names the field the CALLER read the value under — here
+    // a programmatically built `NodeConfig`, never `services.fsm_lag`, a
+    // `node.toml` key that is refused by name since the cluster FSM.
     assert!(
         err.to_string()
-            .contains("services.fsm_lag must be below buffer_bytes / 2"),
+            .contains("NodeConfig::services fsm_lag must be below buffer_bytes / 2"),
         "{err}"
     );
     assert!(

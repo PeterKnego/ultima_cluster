@@ -1199,6 +1199,20 @@ mod tests {
         }
     }
 
+    /// P5: `monitor-a-cluster.md` states the contract's SIZE — "89 families"
+    /// — and nothing made that number a build-time fact, so adding a series
+    /// silently made the doc wrong. This pins the count; a deliberate change
+    /// updates both together.
+    #[test]
+    fn the_contract_has_the_number_of_families_the_docs_state() {
+        assert_eq!(
+            CONTRACT_SERIES.len(),
+            89,
+            "if this is intentional, update the family count in \
+             docs/how-to/monitor-a-cluster.md in the same commit"
+        );
+    }
+
     #[test]
     fn every_contract_series_is_present() {
         let s = synthetic_sources();

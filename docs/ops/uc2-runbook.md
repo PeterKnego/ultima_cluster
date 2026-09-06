@@ -161,6 +161,20 @@ verify rather than a build:
 
 ## When something is wrong
 
+- **A node refuses to start with `cluster_artifact_corrupt`** (2.11 pending).
+  The `uc2-cluster` agent found its newest `snapshots/cluster/snap-<pos>.ultcluster`
+  and the image failed a check — magic, version, CRC32, or a bounds check
+  inside it. The node fail-stops rather than starting: silently rolling the
+  cluster row back to an older membership, schedule table and settings record
+  would be worse than not starting. **The record names the file.** Remove
+  exactly that file and restart. The node recovers from the artifact beneath
+  it — one is guaranteed to be there, because the agent keeps the newest two —
+  and replays the gap from the journal, so nothing is lost. If a second
+  restart names the next file down, stop: two corrupt artifacts is a storage
+  problem, not a UC one, and the answer is
+  [wipe-and-rejoin](../how-to/recover-from-quorum-loss.md), which rebuilds the
+  cluster row from a peer's snapshot session. Never edit an artifact in place;
+  the CRC is over the whole image.
 - [Diagnose a node that is not serving](../how-to/diagnose-a-node.md) — reading
   a live node's control page. *Was §3's procedural half.*
 - [Change cluster membership: read the audit log](../how-to/change-cluster-membership.md#read-the-audit-log)
@@ -187,8 +201,10 @@ verify rather than a build:
   service** and drained only while leading. The same release adds
   `snapshots/cluster/` (durable — `snap-<pos>.ultcluster`, the cluster FSM's
   own artifact holding membership, the schedule table and the settings record
-  as of `<pos>`; note that `uc2ctl backup` does **not** copy it, so a restore
-  rebuilds the cluster FSM from the restored journal) and two transient staged
+  as of `<pos>`; `uc2ctl backup` **does** copy it, as an artifact family of
+  its own, and `verify-backup` decodes the newest one through the same image
+  decoder a joiner installs it with; the newest 2 are kept on a live node)
+  and two transient staged
   payloads in the instance root, `schedules.pending` and `settings.pending`,
   each written by its `uc2ctl … apply` and deleted by the node after a
   successful append. There is no `state/schedules.state`. *Was §1.*

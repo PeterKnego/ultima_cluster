@@ -894,6 +894,38 @@ section it amends and the ruling that decided it.*
    **installed cluster image**, through the view, rather than from a tail on
    every `BEGIN`.
 
+7. **§4.4/§6 — `fsm_lag` is clamped from BELOW as well, and a sub-frame bound
+   is refused at the door.** `fsm_lag_from_setting` (and its cnc-page twin,
+   which now takes `max_payload` for it) clamps every finite byte bound up to
+   one max-size frame on this host, because a lag shorter than one frame pins
+   `report_ceiling = min_applied + lag` inside the next frame and wedges
+   commit cluster-wide and permanently — the one setting whose too-small side
+   has no in-band recovery, since undoing it needs a `CLUSTER` frame that has
+   to commit. Belt and braces, `ClusterFsm::validate` refuses a non-zero,
+   non-`FSM_LAG_LOCKSTEP` bound below `MIN_FSM_LAG_BYTES` (1376 B, a
+   compile-time constant, so the verdict stays deterministic) as reason
+   **47 `settings_bounds`**, so an operator is told rather than silently
+   clamped. Review item **I1**.
+
+8. **§4.7/§5.3 — the cluster family keeps the newest two artifacts.**
+   `take_snapshot` prunes after its rename and dir fsync, mirroring
+   `uc_service::snapshots`'s `retain_newest(2)`; without it the bridging
+   trigger grew the directory once per user-row snapshot interval for the
+   life of the cluster, and every boot `recover` and every `uc2ctl schedule
+   show`/`settings show`/`status` scanned all of it. Keeping two (not one) is
+   what makes the runbook's `cluster_artifact_corrupt` recovery — remove the
+   named file and restart — real. Review item **I2**.
+
+9. **§4.4 — `apply` adopts a committed `ScheduleTable` unconditionally.** The
+   declared-hash (`schedule_unknown_fsm`) check reads `[services] names`,
+   node-local input, so running it inside `apply` let two hosts with
+   different lists reach opposite verdicts on the same command at the same
+   position and write divergent artifacts under the same tag, with no
+   fail-stop. It now lives only in the leader's pre-append `validate`;
+   `apply` runs `validate_replicated`, which is FSM state and constants only.
+   A row this node does not declare simply never arms. Review item **I3**,
+   Ruling **R24**.
+
 ### Designed and not built in plan 1
 
 Recorded so they are not mistaken for shipped surface.

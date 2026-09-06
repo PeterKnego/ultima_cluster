@@ -732,11 +732,17 @@ pub fn parse_str_with_env(
                     field: "services.names",
                     detail,
                 })?;
-            cfg.validate(f.buffer_bytes as u64)
-                .map_err(|detail| ConfigError::Invalid {
-                    field: "services.fsm_lag",
-                    detail,
-                })?;
+            // No `cfg.validate(...)` here (P4). It was dead: `from_names(…,
+            // None)` is the only shape this loader builds — `[services]
+            // fsm_lag` is refused by name a dozen lines up — so `resolve_lag`
+            // always yields `buffer_bytes / 4`, which passes for every
+            // `buffer_bytes` a node can boot with. The one input it could
+            // still have refused, `buffer_bytes = 0`, is refused by name with
+            // the arithmetic shown in `preflight` (`max_payload >
+            // buffer_bytes / 4`), whereas this call would have printed a
+            // message naming `services.fsm_lag` — the retired key. The check
+            // itself still runs, once, for programmatically built configs, in
+            // `Node::start`.
             cfg
         }
     };

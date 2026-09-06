@@ -1,7 +1,7 @@
 # The cluster FSM, explained
 
 *Written 2026-09-06 for the cluster-FSM work (plan 1, implemented on branch
-`uc2/cluster-fsm-plan1`; release on hold). Spec:
+`worktree-uc2+cluster-fsm-plan1`; release on hold). Spec:
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
 — this note carries §2–§4's argument in plain language. Coordinated snapshot
 instants (§5) are plan 2 and are not in the tree yet.*

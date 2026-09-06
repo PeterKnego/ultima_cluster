@@ -26,6 +26,15 @@ use uc_service::{ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine}
 use crate::node::{cluster_to_wire, wire_to_cluster_config};
 
 pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
+/// The image layout's version, refused by `install_snapshot` when unknown.
+///
+/// Still `1` even though the layout changed twice during plan 1's
+/// development: nothing was released at any intermediate shape, so there is
+/// no artifact in the world to be compatible with. A pre-release image
+/// therefore fails the membership-length or CRC check rather than a version
+/// refusal — a fine outcome for an artifact that only exists on a developer's
+/// disk, and not a reason to burn a version number. Bump it for the first
+/// change made AFTER a release.
 pub const CLUSTER_IMAGE_VERSION: u32 = 1;
 
 /// The staged table file an admin client writes under the instance directory

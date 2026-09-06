@@ -4,7 +4,7 @@
 //! The replicated settings record (cluster-FSM spec §6): the three
 //! cluster-wide policies that used to live per host in `node.toml`. Carried
 //! as a `CLUSTER kind=Settings` payload and inside the cluster FSM's image.
-//! `core`-only, like every codec in `v2`.
+//! `core` + `alloc` (the encoder appends into a `Vec<u8>`), like `v2::schedule`.
 
 /// Encoding version, first word of the payload. Bumped when the layout
 /// changes; a reader refuses any version it does not know.

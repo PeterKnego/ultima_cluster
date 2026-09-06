@@ -85,9 +85,11 @@ a `u8`, so the two are walked separately. `verify-backup` decodes the newest
 with (magic, image version, CRC32, every bounds check) and refuses a corrupt
 one by name; where the family is present and the journal is purged, its newest
 artifact must cover `first_base`, reported as `hole: service 255`. A purged
-journal with **no** cluster family is deliberately not a hole: a node
-legitimately purges under its rows' floor alone in the window before the
-`uc2-cluster` agent writes its first artifact.
+journal with **no** cluster family is deliberately not a hole. A live node no
+longer produces that shape — the purge floor is bounded at `0` until the
+`uc2-cluster` agent has written an artifact — but `verify-backup` runs over
+directories it did not produce, so it refuses to call one a hole on that
+evidence alone.
 
 The durable paths all live under the instance directory, so the directory as a
 whole must sit on a real filesystem. An instance directory on `tmpfs` makes

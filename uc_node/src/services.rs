@@ -206,14 +206,23 @@ impl ServicesConfig {
     /// buffer (the other half is the appender's overrun margin plus the
     /// leader's admission window). `0` is refused because it is the page's
     /// lockstep sentinel — a config that means lockstep must say so.
-    pub fn validate(&self, buffer_bytes: u64) -> Result<(), String> {
+    ///
+    /// `field` is the name the CALLER read the value under, for the same
+    /// reason [`parse_fsm_lag`] takes one (M4): the ONE name this must never
+    /// print is `services.fsm_lag`, a `node.toml` key that is refused
+    /// outright since the cluster FSM, so naming it would send an operator to
+    /// the one place the value cannot be written. `node.toml` always builds a
+    /// `ServicesConfig` with no lag of its own, so every reachable failure
+    /// here comes from a programmatically built `NodeConfig` — a harness's
+    /// `--fsm-lag`, or an embedder's `with_lag`.
+    pub fn validate(&self, field: &str, buffer_bytes: u64) -> Result<(), String> {
         match self.resolve_lag(buffer_bytes) {
             FsmLag::Lockstep => Ok(()),
-            FsmLag::Bounded(0) => {
-                Err("services.fsm_lag = 0 is not a bound; write \"lockstep\" for lockstep".into())
-            }
+            FsmLag::Bounded(0) => Err(format!(
+                "{field} = 0 is not a bound; write \"lockstep\" for lockstep"
+            )),
             FsmLag::Bounded(b) if b >= buffer_bytes / 2 => Err(format!(
-                "services.fsm_lag must be below buffer_bytes / 2 ({} < {}); got {b}",
+                "{field} must be below buffer_bytes / 2 ({} < {}); got {b}",
                 b,
                 buffer_bytes / 2
             )),
@@ -538,27 +547,27 @@ mod tests {
         let buf = 4u64 << 20;
         ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded((buf / 2) - 1)))
             .unwrap()
-            .validate(buf)
+            .validate("--fsm-lag", buf)
             .unwrap();
         let e = ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded(buf / 2)))
             .unwrap()
-            .validate(buf)
+            .validate("--fsm-lag", buf)
             .unwrap_err();
         assert!(
-            e.contains("services.fsm_lag must be below buffer_bytes / 2"),
+            e.contains("--fsm-lag must be below buffer_bytes / 2"),
             "{e}"
         );
         let e = ServicesConfig::from_names(&["a"], Some(FsmLag::Bounded(0)))
             .unwrap()
-            .validate(buf)
+            .validate("--fsm-lag", buf)
             .unwrap_err();
         assert!(
-            e.contains("services.fsm_lag = 0 is not a bound; write \"lockstep\""),
+            e.contains("--fsm-lag = 0 is not a bound; write \"lockstep\""),
             "{e}"
         );
         ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep))
             .unwrap()
-            .validate(buf)
+            .validate("--fsm-lag", buf)
             .unwrap();
         assert_eq!(
             ServicesConfig::from_names(&["a"], Some(FsmLag::Lockstep))
@@ -574,7 +583,7 @@ mod tests {
         assert_eq!(s.declared(), 0);
         assert_eq!(s.ids().count(), 0);
         assert_eq!(s.ring_ids().collect::<Vec<_>>(), vec![0]);
-        s.validate(4 << 20).unwrap();
+        s.validate("--fsm-lag", 4 << 20).unwrap();
     }
 
     #[test]
