@@ -18,14 +18,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// TODO(plan 1 task 2/5): FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE are
-// deprecated aliases for FRAME_TYPE_CLUSTER (kind=Membership/ScheduleTable);
-// callers migrate in later tasks.
-#[allow(deprecated)]
 use uc_protocol::v2::frame::{
-    self, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
-    FRAME_TYPE_SCHEDULE_TABLE, FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN, TIMER_BODY_LEN,
-    TimerBody, align_frame_len,
+    self, CLUSTER_BODY_PREFIX_LEN, ClusterKind, FRAME_TYPE_CLUSTER, FRAME_TYPE_MESSAGE,
+    FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, FrameHeader, HEADER_LEN,
+    TIMER_BODY_LEN, TimerBody, align_frame_len, write_cluster_prefix,
 };
 
 use crate::cnc::CncPage;
@@ -544,6 +540,20 @@ impl LogBuffer {
             advance: walked,
         })
     }
+
+    /// Test-only (plan 1, Controller ruling R3): a leader appender over this
+    /// buffer primed at `base` — mirrors `uc_node`'s leader-open construction
+    /// (`Action::BecomeLeader` / `Consensus::on_collapsed`, `node.rs`): the
+    /// archive already durably covers `[0, base)`, so the counters are
+    /// primed there before a fresh appender opens at that frontier, seeded
+    /// from the buffer's own log-time word exactly as `on_collapsed` seeds
+    /// from `self.cnc.log_time_ns()`. Term is fixed at 1 — a caller needing a
+    /// specific term primes and constructs by hand, as the node does.
+    #[doc(hidden)]
+    pub fn appender_for_test(self: &Arc<Self>, base: u64) -> Appender {
+        self.counters().prime(base);
+        Appender::new(Arc::clone(self), 1, self.cnc().log_time_ns())
+    }
 }
 
 /// The single writer. On the leader this is driven by the consensus agent;
@@ -722,23 +732,34 @@ impl Appender {
         Ok(frame_pos)
     }
 
-    /// Append a `FRAME_TYPE_CONFIG` entry (M7, spec 2026-07-13): payload =
-    /// `v2::config::encode_config` bytes, stamped with `term` — the caller's
-    /// current leadership term, passed explicitly (rather than read off
-    /// `self.leadership_term_id`) so the signature matches the config-append
-    /// contract shared with the sim's model (`uc_sim::world`), which has no
-    /// live `Appender` to carry it. In practice the caller always passes its
-    /// own current term, so this is not observably different from the
-    /// internal field. Returns the frame-END position — the adoption effect
-    /// point (`ConfigRecord.position` semantics), UNLIKE `append`/
-    /// `append_new_term` which return the frame START. Same wrap/overrun
-    /// discipline as `append`.
-    #[allow(deprecated)] // FRAME_TYPE_CONFIG: see the import above
-    pub fn append_config(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
-        if payload.len() > self.buffer.max_payload {
+    /// Append a `FRAME_TYPE_CLUSTER` entry (spec §4.3): the body is `kind ‖
+    /// reserved ‖ payload` (`CLUSTER_BODY_PREFIX_LEN` = 8 prefix bytes
+    /// written by `write_cluster_prefix`, then `payload` verbatim), stamped
+    /// with `term` — the caller's current leadership term, passed explicitly
+    /// (rather than read off `self.leadership_term_id`) so the signature
+    /// matches the config-append contract shared with the sim's model
+    /// (`uc_sim::world`), which has no live `Appender` to carry it. In
+    /// practice the caller always passes its own current term, so this is
+    /// not observably different from the internal field. Returns the
+    /// frame-END position — the adoption effect point (`ConfigRecord.position`
+    /// semantics for `kind == Membership`), UNLIKE `append`/`append_new_term`
+    /// which return the frame START. Same wrap/overrun discipline as
+    /// `append`.
+    ///
+    /// Renamed from `append_config` (M7, spec 2026-07-13), which carried only
+    /// `Membership` bodies with no prefix; `kind` now selects
+    /// Membership/ScheduleTable/Settings over the same frame type.
+    pub fn append_cluster(
+        &mut self,
+        term: u32,
+        kind: ClusterKind,
+        payload: &[u8],
+    ) -> Result<u64, AppendError> {
+        let body_len = CLUSTER_BODY_PREFIX_LEN + payload.len();
+        if body_len > self.buffer.max_payload {
             return Err(AppendError::PayloadTooLarge);
         }
-        let total = HEADER_LEN + payload.len();
+        let total = HEADER_LEN + body_len;
         let aligned = align_frame_len(total) as u64;
         let b = &self.buffer;
 
@@ -774,17 +795,15 @@ impl Appender {
         // durable+capacity) are writer-owned per the gate; ordering via the
         // commit word + append counter release stores below.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                b.region.ptr_at(foff + HEADER_LEN),
-                payload.len(),
-            );
+            let body = std::slice::from_raw_parts_mut(b.region.ptr_at(foff + HEADER_LEN), body_len);
+            write_cluster_prefix(body, kind);
+            body[CLUSTER_BODY_PREFIX_LEN..].copy_from_slice(payload);
             let hdr = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), HEADER_LEN);
             frame::write_header_except_length(
                 hdr,
                 &FrameHeader {
                     length: 0,
-                    frame_type: FRAME_TYPE_CONFIG,
+                    frame_type: FRAME_TYPE_CLUSTER,
                     flags: 0,
                     leadership_term_id: term,
                     client_id: 0,
@@ -800,77 +819,16 @@ impl Appender {
         Ok(end)
     }
 
-    /// Append a `FRAME_TYPE_SCHEDULE_TABLE` entry (time-and-timers plan 2):
-    /// payload = the replicated schedule table's own encoding, stamped with
-    /// `term` — the caller's current leadership term, passed explicitly for
-    /// the same reason as `append_config`'s `term` parameter. `client_id =
-    /// seq = 0`, stamped like every frame (`max(now, last)`). Returns the
-    /// frame-END position, matching `append_config`'s convention (the
-    /// adoption effect point), NOT the frame start. Same wrap/overrun/commit
-    /// discipline as `append_config` — this is that method's body with the
-    /// frame type swapped.
-    #[allow(deprecated)] // FRAME_TYPE_SCHEDULE_TABLE: see the import above
+    /// Deprecated shim (plan 1 task 2, removed in task 5): the replicated
+    /// schedule table now travels as a `CLUSTER kind=ScheduleTable` body
+    /// (spec §4.3) rather than its own standalone frame type, so this just
+    /// forwards to [`Self::append_cluster`]. Kept so `uc_node`'s pre-task-5
+    /// schedule-table call sites and tests keep compiling and passing.
+    #[deprecated(
+        note = "the table now travels as a CLUSTER kind=ScheduleTable body; removed in plan 1 task 5"
+    )]
     pub fn append_schedule_table(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
-        if payload.len() > self.buffer.max_payload {
-            return Err(AppendError::PayloadTooLarge);
-        }
-        let total = HEADER_LEN + payload.len();
-        let aligned = align_frame_len(total) as u64;
-        let b = &self.buffer;
-
-        let off = b.offset(self.pos);
-        let to_end = b.capacity - off as u64;
-        let pad = if aligned > to_end { to_end } else { 0 };
-        let end = self.pos + pad + aligned;
-
-        // The one hard gate: never claim past durable + capacity.
-        if end > self.cached_durable + b.capacity {
-            self.cached_durable = b.cnc.counters().durable.load_acquire();
-            if end > self.cached_durable + b.capacity {
-                return Err(AppendError::WouldOverrun);
-            }
-        }
-
-        // The clamp, inline (final-review I1) — see `append_config`.
-        let time_ns = self.now_ns.max(self.last_stamp);
-        self.last_stamp = time_ns;
-
-        let frame_pos = if pad > 0 {
-            self.write_padding(off, pad as u32, time_ns);
-            self.pos + pad
-        } else {
-            self.pos
-        };
-        let foff = b.offset(frame_pos);
-
-        // SAFETY (all raw writes): within capacity; bytes in [append,
-        // durable+capacity) are writer-owned per the gate; ordering via the
-        // commit word + append counter release stores below.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                b.region.ptr_at(foff + HEADER_LEN),
-                payload.len(),
-            );
-            let hdr = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), HEADER_LEN);
-            frame::write_header_except_length(
-                hdr,
-                &FrameHeader {
-                    length: 0,
-                    frame_type: FRAME_TYPE_SCHEDULE_TABLE,
-                    flags: 0,
-                    leadership_term_id: term,
-                    client_id: 0,
-                    seq: 0,
-                    time_ns,
-                },
-            );
-        }
-        b.commit_word(foff).store(total as u32, Ordering::Release);
-
-        self.pos = end;
-        b.cnc.counters().append.store_release(self.pos);
-        Ok(end)
+        self.append_cluster(term, ClusterKind::ScheduleTable, payload)
     }
 
     /// Append a TIMER frame (time-and-timers spec §4.2/§4.3). Stamped with the
@@ -963,12 +921,10 @@ mod tests {
     use crate::cnc::{CncMeta, CncPage};
     use crate::region::Region;
     use std::sync::Arc;
-    #[allow(deprecated)]
-    // FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE: see the module import above
     use uc_protocol::v2::frame::{
-        FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM,
-        FRAME_TYPE_PADDING, FRAME_TYPE_SCHEDULE_TABLE, FRAME_TYPE_TIMER, HEADER_LEN,
-        TIMER_BODY_LEN, TimerBody, read_header, read_timer_body,
+        CLUSTER_BODY_PREFIX_LEN, ClusterKind, FLAG_TIMER_TABLE, FRAME_TYPE_CLUSTER,
+        FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, HEADER_LEN,
+        TIMER_BODY_LEN, TimerBody, read_cluster_prefix, read_header, read_timer_body,
     };
 
     const CAP: u64 = 4096;
@@ -992,6 +948,24 @@ mod tests {
             256, // max_payload for tests
         ));
         (b, cnc)
+    }
+
+    /// Controller ruling R3: `appender_for_test` primes the counters at
+    /// `base` and hands back an appender whose first write lands exactly
+    /// there (mirroring a leader-open collapse to a non-zero frontier).
+    #[test]
+    fn appender_for_test_is_primed_at_base() {
+        let (b, c) = buf();
+        let mut a = b.appender_for_test(128);
+        assert_eq!(a.position(), 128, "appender opens at the primed base");
+        assert_eq!(c.counters().append.load_acquire(), 128);
+        assert_eq!(c.counters().durable.load_acquire(), 128);
+        let pos = a.append(1, 0, b"hi").unwrap();
+        assert_eq!(
+            pos, 128,
+            "the first frame is written AT base, not before it"
+        );
+        assert_eq!(a.position(), 128 + align_frame_len(HEADER_LEN + 2) as u64);
     }
 
     #[test]
@@ -1035,15 +1009,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // FRAME_TYPE_CONFIG: see the module import above
-    fn append_config_records_type_term_and_payload_returns_frame_end() {
+    fn append_cluster_records_type_term_and_prefix_returns_frame_end() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 7, 0);
         let payload = b"cfg-bytes-v1";
         // Stamped with the PASSED term (9), not the appender's own (7) —
         // pins the explicit-term signature.
-        let end = a.append_config(9, payload).unwrap();
-        // 32 header + 12 payload = 44 -> aligned 64
+        let end = a
+            .append_cluster(9, ClusterKind::Membership, payload)
+            .unwrap();
+        // 32 header + 8 prefix + 12 payload = 52 -> aligned 64
         assert_eq!(
             end, 64,
             "returns the frame-END position, unlike append/append_new_term"
@@ -1054,10 +1029,15 @@ mod tests {
         let s = b.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), 64);
         let h = read_header(s);
-        assert_eq!(h.length, (HEADER_LEN + payload.len()) as u32);
-        assert_eq!(h.frame_type, FRAME_TYPE_CONFIG);
+        assert_eq!(
+            h.length,
+            (HEADER_LEN + CLUSTER_BODY_PREFIX_LEN + payload.len()) as u32
+        );
+        assert_eq!(h.frame_type, FRAME_TYPE_CLUSTER);
         assert_eq!(h.leadership_term_id, 9);
-        assert_eq!(&s[HEADER_LEN..HEADER_LEN + payload.len()], payload);
+        let (kind, out_payload) = read_cluster_prefix(&s[HEADER_LEN..h.length as usize]).unwrap();
+        assert_eq!(kind, ClusterKind::Membership);
+        assert_eq!(out_payload, payload);
 
         // a data frame after it opens exactly at the returned frame-end
         let dpos = a.append(1, 0, &[0u8; 64]).unwrap();
@@ -1065,22 +1045,48 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // FRAME_TYPE_SCHEDULE_TABLE: see the module import above
-    fn append_schedule_table_is_a_stamped_type_6_frame_returning_the_end() {
+    fn append_cluster_writes_the_prefix_then_the_payload_and_stamps_like_a_client_frame() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 3, 0);
+        a.set_now(5_000);
+        let end = a
+            .append_cluster(3, ClusterKind::Settings, &[9u8; 29])
+            .unwrap();
+        let mut out = Vec::new();
+        let FrameRead::Frame(hdr) = b.read_frame_validated(
+            end - align_frame_len(HEADER_LEN + CLUSTER_BODY_PREFIX_LEN + 29) as u64,
+            &mut out,
+        ) else {
+            panic!()
+        };
+        assert_eq!(hdr.frame_type, FRAME_TYPE_CLUSTER);
+        assert_eq!(hdr.time_ns, 5_000);
+        let (kind, payload) = read_cluster_prefix(&out[HEADER_LEN..hdr.length as usize]).unwrap();
+        assert_eq!(kind, ClusterKind::Settings);
+        assert_eq!(payload, &[9u8; 29]);
+    }
+
+    /// The deprecated shim emits a real `CLUSTER kind=ScheduleTable` frame —
+    /// keeps `uc_node`'s pre-task-5 schedule-table call sites/tests passing.
+    #[test]
+    #[allow(deprecated)]
+    fn append_schedule_table_shim_emits_a_cluster_schedule_table_frame() {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 4, 0);
         a.set_now(1_000);
         let end = a.append_schedule_table(4, b"table-bytes").unwrap();
         assert_eq!(
             end, 64,
-            "32 header + 11 payload -> aligned 64; END returned"
+            "32 header + 8 prefix + 11 payload -> aligned 64; END returned"
         );
         let s = b.recordable_slice(0, 64).unwrap();
         let h = read_header(s);
-        assert_eq!(h.frame_type, FRAME_TYPE_SCHEDULE_TABLE);
+        assert_eq!(h.frame_type, FRAME_TYPE_CLUSTER);
         assert_eq!((h.client_id, h.seq, h.flags), (0, 0, 0));
         assert_eq!(h.time_ns, 1_000);
-        assert_eq!(&s[HEADER_LEN..HEADER_LEN + 11], b"table-bytes");
+        let (kind, payload) = read_cluster_prefix(&s[HEADER_LEN..h.length as usize]).unwrap();
+        assert_eq!(kind, ClusterKind::ScheduleTable);
+        assert_eq!(payload, b"table-bytes");
         assert_eq!(a.last_stamp(), 1_000);
     }
 
@@ -1208,17 +1214,17 @@ mod tests {
     }
 
     /// M7 Task 7 (uc_node's admin path, mandatory review carry): a
-    /// `WouldOverrun` from `append_config` must leave EXACTLY the pre-call
+    /// `WouldOverrun` from `append_cluster` must leave EXACTLY the pre-call
     /// state behind — no partial write, no frontier advance, no stray padding
     /// frame — so `uc_node::Consensus::propose_and_append`'s retry-whole
     /// contract (reply `status=2` and let `uc2ctl`/the follower's forward try
     /// again) is sound: the SAME config bytes re-appended on retry must land
     /// as the FIRST thing after the gate reopens, not after some already-
     /// written-but-unlinked debris. Pins the exact code path this task's
-    /// review relies on: `append_config`'s overrun check (buffer.rs) runs
+    /// review relies on: `append_cluster`'s overrun check (buffer.rs) runs
     /// strictly before it touches `self.pos`/writes any header/commit word.
     #[test]
-    fn append_config_would_overrun_leaves_no_partial_state() {
+    fn append_cluster_would_overrun_leaves_no_partial_state() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1, 0);
         // Fill to exactly capacity (durable stays 0): 42 frames of 96 B = 4032,
@@ -1238,7 +1244,8 @@ mod tests {
         // would land the frame at 4096, well past durable(0) + capacity(4096).
         let big_payload = vec![0u8; 200];
         assert_eq!(
-            a.append_config(9, &big_payload).unwrap_err(),
+            a.append_cluster(9, ClusterKind::Membership, &big_payload)
+                .unwrap_err(),
             AppendError::WouldOverrun,
             "expected the config append to be gated by the overrun check"
         );
@@ -1265,10 +1272,15 @@ mod tests {
         // cleanly at exactly the pre-failure position — proving the failed
         // attempt left nothing behind for the retry to trip over.
         c.counters().durable.store_release(4032);
-        let end = a.append_config(9, &big_payload).unwrap();
+        let end = a
+            .append_cluster(9, ClusterKind::Membership, &big_payload)
+            .unwrap();
         assert_eq!(
             end,
-            pos_before + 64 /* pad */ + align_frame_len(HEADER_LEN + big_payload.len()) as u64
+            pos_before
+                + 64 /* pad */
+                + align_frame_len(HEADER_LEN + CLUSTER_BODY_PREFIX_LEN + big_payload.len())
+                    as u64
         );
     }
 
@@ -1476,7 +1488,8 @@ mod tests {
         a.append(1, 1, b"x").unwrap();
         a.set_now(4_000); // the clock stepped back: the stamp must hold at 5_000
         a.append(1, 2, b"y").unwrap();
-        a.append_config(3, b"cfg").unwrap();
+        a.append_cluster(3, ClusterKind::Membership, b"cfg")
+            .unwrap();
         a.set_now(6_000);
         a.append(1, 3, b"z").unwrap();
         let hs = headers(&b, a.position());

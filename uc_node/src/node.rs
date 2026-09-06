@@ -42,10 +42,15 @@ use uc_protocol::v2::cnc::{
 };
 use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
-// TODO(plan 1 task 2/5): FRAME_TYPE_CONFIG is a deprecated alias for
-// FRAME_TYPE_CLUSTER (kind=Membership); callers migrate in later tasks.
+// TODO(plan 1 task 5): FRAME_TYPE_CONFIG is a deprecated alias for
+// FRAME_TYPE_CLUSTER (kind=Membership); the frame-type DISPATCH callers
+// migrate in task 5 (the append-side callers already moved to
+// `append_cluster`/`ClusterKind::Membership` in task 2).
 #[allow(deprecated)]
-use uc_protocol::v2::frame::{FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, TimerBody, align_frame_len};
+use uc_protocol::v2::frame::{
+    ClusterKind, FLAG_TIMER_TABLE, FRAME_TYPE_CONFIG, TimerBody, align_frame_len,
+    read_cluster_prefix,
+};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_BAD_SERVICE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SCHED,
     MSG_V2_SVC_QUERY, SchedOp, client_from_extra, extra_client, read_sched_record,
@@ -1407,6 +1412,13 @@ impl Node {
             // recording pass, and a dropped observation would leave a FOLLOWER
             // holding no table at all until its next restart. Blocking send;
             // a send error means the receiver is gone (shutdown).
+            //
+            // TODO(plan 1 task 5): `take_table_observations` is a deprecated
+            // shim (plan 1 task 2) that always returns empty now — the table
+            // travels as a `CLUSTER kind=ScheduleTable` frame with no separate
+            // observation feed. This loop is a no-op until task 5 reroutes
+            // follower table adoption through the cluster FSM's own apply path.
+            #[allow(deprecated)]
             for obs in archive.take_table_observations() {
                 if tbl_obs_tx.send(obs).is_err() {
                     break;
@@ -4234,7 +4246,7 @@ impl Consensus {
             .appender
             .as_mut()
             .expect("append_config_frame is leader-only")
-            .append_config(term, &bytes)?;
+            .append_cluster(term, ClusterKind::Membership, &bytes)?;
         self.feed(Event::ConfigObserved {
             position,
             config: new_cfg.clone(),
@@ -4257,6 +4269,11 @@ impl Consensus {
     /// On `Err` nothing was appended and nothing adopted, so the caller may
     /// retry the whole request — the same argument `append_config_frame`'s
     /// caller relies on.
+    ///
+    /// TODO(plan 1 task 5): `Appender::append_schedule_table` is a deprecated
+    /// shim (plan 1 task 2) forwarding to `append_cluster(kind=ScheduleTable)`;
+    /// this call site reroutes to `append_cluster` directly in task 5.
+    #[allow(deprecated)]
     fn append_schedule_table_frame(&mut self, table: &ScheduleTable) -> Result<u64, AppendError> {
         let term = self.sm.current_term();
         let mut bytes = Vec::new();
@@ -7469,7 +7486,15 @@ pub(crate) fn rederive_config(
         if frame.header.frame_type != FRAME_TYPE_CONFIG {
             continue;
         }
-        let wire = decode_config(&frame.payload)
+        // Plan 1 task 2 (spec §4.3/§4.6): this walk reads the archived frame
+        // DIRECTLY (not through `Archive::take_config_observations`, which
+        // already strips the prefix and filters by kind), so it must do both
+        // itself — a `ScheduleTable`/`Settings` CLUSTER frame in the same
+        // scan window is the cluster FSM's business, not a config change.
+        let Some((ClusterKind::Membership, payload)) = read_cluster_prefix(&frame.payload) else {
+            continue;
+        };
+        let wire = decode_config(payload)
             .unwrap_or_else(|| panic!("corrupt CONFIG frame at {}", frame.position));
         if wire.version <= cur.config.version {
             continue; // idempotent / stale re-observation
@@ -10450,7 +10475,7 @@ mod tests {
         let mut bytes = Vec::new();
         encode_config(&cluster_to_wire(cfg, 0), &mut bytes);
         let end = appender
-            .append_config(term, &bytes)
+            .append_cluster(term, ClusterKind::Membership, &bytes)
             .expect("config frame append");
         while archive.do_work(&buffer).expect("archive do_work") {}
         end
@@ -10474,12 +10499,12 @@ mod tests {
         let mut bytes1 = Vec::new();
         encode_config(&cluster_to_wire(cfg1, 0), &mut bytes1);
         let end1 = appender
-            .append_config(term, &bytes1)
+            .append_cluster(term, ClusterKind::Membership, &bytes1)
             .expect("v1 config frame append");
         let mut bytes2 = Vec::new();
         encode_config(&cluster_to_wire(cfg2, 0), &mut bytes2);
         let end2 = appender
-            .append_config(term, &bytes2)
+            .append_cluster(term, ClusterKind::Membership, &bytes2)
             .expect("v2 config frame append");
         while archive.do_work(&buffer).expect("archive do_work") {}
         (end1, end2)

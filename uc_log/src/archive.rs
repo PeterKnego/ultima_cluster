@@ -16,12 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use uc_journal::{Durability, Journal, JournalConfig, JournalError};
-// TODO(plan 1 task 2/5): FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE are
-// deprecated aliases for FRAME_TYPE_CLUSTER (kind=Membership/ScheduleTable);
-// callers migrate in later tasks.
-#[allow(deprecated)]
 use uc_protocol::v2::frame::{
-    self, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, FRAME_TYPE_SCHEDULE_TABLE, FrameHeader, HEADER_LEN,
+    self, ClusterKind, FRAME_TYPE_CLUSTER, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN,
+    read_cluster_prefix,
 };
 
 use crate::buffer::LogBuffer;
@@ -130,24 +127,18 @@ pub struct Archive {
     /// (blocks record the contiguous prefix in order). Drained by
     /// `take_term_observations`.
     term_observations: Vec<(u32, u64)>,
-    /// M7 (spec 2026-07-13): `(frame-END position, payload bytes)` for every
-    /// `FRAME_TYPE_CONFIG` frame durably recorded since the last
+    /// M7 (spec 2026-07-13), spec §4.3/§4.6 (plan 1 task 2): `(frame-END
+    /// position, payload-after-prefix bytes)` for every `FRAME_TYPE_CLUSTER`
+    /// frame of kind `Membership` durably recorded since the last
     /// `take_config_observations` call — detected in the SAME header walk as
-    /// `term_observations` (one scan, two outputs). Position-ordered by
-    /// construction. `frame_end = base + off + align_frame_len(h.length)` is
-    /// the effect point matching `ConfigRecord.position` semantics. Reset by
+    /// `term_observations` (one scan, two outputs). Every other `CLUSTER`
+    /// kind (ScheduleTable, Settings) is the cluster FSM's own business at
+    /// commit and never reaches this feed. Position-ordered by construction.
+    /// `frame_end = base + off + align_frame_len(h.length)` is the effect
+    /// point matching `ConfigRecord.position` semantics. Reset by
     /// `truncate_to` exactly like `term_observations`: any observation from a
     /// dropped tail is stale and must not be re-fed as if still durable.
     config_observations: Vec<(u64, Vec<u8>)>,
-    /// Time-and-timers plan 2: `(frame-END position, time_ns, payload bytes)`
-    /// for every `FRAME_TYPE_SCHEDULE_TABLE` frame durably recorded since the
-    /// last `take_table_observations` call — detected in the SAME header walk
-    /// as `term_observations`/`config_observations` (one scan, three
-    /// outputs). Position-ordered by construction. `frame_end = base + off +
-    /// align_frame_len(h.length)`, matching the CONFIG convention. Reset by
-    /// `truncate_to` exactly like `config_observations`: an observation from
-    /// a dropped tail is stale and must not be re-fed as if still durable.
-    table_observations: Vec<(u64, u64, Vec<u8>)>,
     /// The highest `time_ns` stamp seen by `observe_terms`'s header walk
     /// (time-and-timers spec §3.2), published to the cnc `log_time_ns` word
     /// after every recorded block. Monotonic — `do_work` never lowers the
@@ -248,7 +239,6 @@ impl Archive {
             last_observed_term: 0,
             term_observations: Vec::new(),
             config_observations: Vec::new(),
-            table_observations: Vec::new(),
             last_time_ns,
         })
     }
@@ -364,7 +354,6 @@ impl Archive {
             self.last_observed_term = 0;
             self.term_observations.clear();
             self.config_observations.clear();
-            self.table_observations.clear();
         }
         self.durable_pos = pos;
         self.first_base = pos;
@@ -443,8 +432,8 @@ impl Archive {
     /// `term_observations` as `(term, base position of the transition's first
     /// frame)`. PADDING frames are skipped (a wrap padding carries a stale term
     /// stamp and is not a real term boundary). Header-only, so it never reads
-    /// payload bytes.
-    #[allow(deprecated)] // FRAME_TYPE_CONFIG/FRAME_TYPE_SCHEDULE_TABLE: see the import above
+    /// payload bytes (except a `CLUSTER` frame's own 8-byte kind prefix, which
+    /// is itself part of the block already brought into memory to record it).
     fn observe_terms(&mut self, block: &[u8], base: u64) {
         let mut off = 0usize;
         while off + HEADER_LEN <= block.len() {
@@ -465,26 +454,20 @@ impl Archive {
             if h.frame_type != FRAME_TYPE_PADDING && h.time_ns > self.last_time_ns {
                 self.last_time_ns = h.time_ns;
             }
-            // M7: CONFIG frames in the same header walk. `aligned` is already
-            // the frame's end offset within `block` — `base + off + aligned`
-            // is the frame-END stream position (the adoption effect point,
-            // matching `ConfigRecord.position`).
-            if h.frame_type == FRAME_TYPE_CONFIG {
-                let payload_start = off + HEADER_LEN;
-                let payload_end = off + h.length as usize;
-                self.config_observations.push((
-                    base + off as u64 + aligned as u64,
-                    block[payload_start..payload_end].to_vec(),
-                ));
-            }
-            if h.frame_type == FRAME_TYPE_SCHEDULE_TABLE {
-                let payload_start = off + HEADER_LEN;
-                let payload_end = off + h.length as usize;
-                self.table_observations.push((
-                    base + off as u64 + aligned as u64,
-                    h.time_ns,
-                    block[payload_start..payload_end].to_vec(),
-                ));
+            // Spec §4.3/§4.6 (plan 1 task 2): `CLUSTER` frames in the same
+            // header walk. `aligned` is already the frame's end offset within
+            // `block` — `base + off + aligned` is the frame-END stream
+            // position (the adoption effect point, matching
+            // `ConfigRecord.position`). The kernel's durable-time membership
+            // feed only wants `Membership` payloads, after the prefix; every
+            // other kind (ScheduleTable, Settings) is the cluster FSM's own
+            // business at commit and the walk does not look at it.
+            if h.frame_type == FRAME_TYPE_CLUSTER {
+                let body = &block[off + HEADER_LEN..off + h.length as usize];
+                if let Some((ClusterKind::Membership, payload)) = read_cluster_prefix(body) {
+                    self.config_observations
+                        .push((base + off as u64 + aligned as u64, payload.to_vec()));
+                }
             }
             off += aligned;
         }
@@ -500,11 +483,17 @@ impl Archive {
         std::mem::take(&mut self.config_observations)
     }
 
-    /// Drain the SCHEDULE_TABLE-frame observations detected since the last
-    /// call (time-and-timers plan 2): `(frame-END position, time_ns, payload
-    /// bytes)`, position-ordered. Modelled on `take_config_observations`.
+    /// Deprecated shim (plan 1 task 2, removed in task 5): the schedule
+    /// table no longer has its own observation feed — a table frame is a
+    /// `CLUSTER kind=ScheduleTable` frame now, which `observe_terms` does not
+    /// forward anywhere (it is the cluster FSM's own business at commit).
+    /// Always empty. Kept so `uc_node`'s pre-task-5 call site keeps
+    /// compiling; task 5 removes it along with that call site.
+    #[deprecated(
+        note = "the schedule table has no separate observation feed anymore; removed in plan 1 task 5"
+    )]
     pub fn take_table_observations(&mut self) -> Vec<(u64, u64, Vec<u8>)> {
-        std::mem::take(&mut self.table_observations)
+        Vec::new()
     }
 
     /// Drain the term transitions detected since the last call (M4). Each entry
@@ -623,7 +612,6 @@ impl Archive {
             self.last_observed_term = 0;
             self.term_observations.clear();
             self.config_observations.clear();
-            self.table_observations.clear();
             return Ok(());
         }
         if base == pos {
@@ -650,7 +638,6 @@ impl Archive {
         self.last_observed_term = 0;
         self.term_observations.clear();
         self.config_observations.clear();
-        self.table_observations.clear();
         Ok(())
     }
 }
@@ -913,7 +900,32 @@ mod tests {
     use crate::cnc::{CncMeta, CncPage};
     use crate::region::Region;
     use std::sync::Arc;
+    use uc_protocol::v2::config::{WireConfig, WireMember, encode_config};
     use uc_protocol::v2::frame::read_header;
+    use uc_protocol::v2::settings::{Settings, encode_settings};
+
+    /// A genesis-shaped two-voter `WireConfig`, for tests that only need
+    /// *some* well-formed Membership payload to append and re-decode.
+    fn two_voter_wire_config() -> WireConfig {
+        WireConfig {
+            version: 1,
+            prev_position: 0,
+            voters: vec![
+                WireMember {
+                    id: 0,
+                    ip: u32::from_be_bytes([127, 0, 0, 1]),
+                    port: 9200,
+                },
+                WireMember {
+                    id: 1,
+                    ip: u32::from_be_bytes([127, 0, 0, 1]),
+                    port: 9201,
+                },
+            ],
+            learners: vec![],
+            tombstones: vec![],
+        }
+    }
 
     /// A scratch dir on REAL DISK, never `/tmp` — `/tmp` on the dev box is
     /// RAM-backed tmpfs with no swap, and a journal segment parked there is
@@ -1795,7 +1807,9 @@ mod tests {
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // ordinary MESSAGE frame first (96 B)
-        let end = a.append_config(1, b"cfg-v1").unwrap(); // CONFIG frame next
+        let end = a
+            .append_cluster(1, ClusterKind::Membership, b"cfg-v1")
+            .unwrap(); // CLUSTER frame next
         a.append(1, 1, &[0u8; 64]).unwrap(); // MESSAGE frame after it
         assert!(arch.do_work(&b).unwrap());
         assert_eq!(
@@ -1831,42 +1845,48 @@ mod tests {
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1, 0);
         a.append(1, 0, &[0u8; 64]).unwrap(); // [0, 96)
-        a.append_config(1, b"cfg-v1").unwrap(); // [96, 160), same (only) block
+        a.append_cluster(1, ClusterKind::Membership, b"cfg-v1")
+            .unwrap(); // [96, 160), same (only) block
         assert!(arch.do_work(&b).unwrap());
         // Deliberately NOT drained here — the observation is still pending when
         // the truncation lands, so the reset below is the thing under test
         // rather than an already-empty buffer.
-        arch.truncate_to(96).unwrap(); // drops the CONFIG frame's bytes (first-block cut)
+        arch.truncate_to(96).unwrap(); // drops the CLUSTER frame's bytes (first-block cut)
         assert!(
             arch.take_config_observations().is_empty(),
             "stale observation must not survive truncation"
         );
     }
 
-    // ------------------------------------------------- schedule-table scan
+    // ------------------------------------------- cluster-kind filtering scan
 
-    /// A recorded SCHEDULE_TABLE frame yields `(frame-END position, time_ns,
-    /// payload)`, draining mirrors the CONFIG pair, and the two observation
-    /// kinds never cross-contaminate.
+    /// Spec §4.3/§4.6 (plan 1 task 2): the archive walk feeds ONLY
+    /// `Membership`-kind `CLUSTER` payloads to the kernel's config-observation
+    /// feed. A `Settings`-kind frame in the same block is durably recorded
+    /// (the cluster FSM sees it at apply) but must never reach
+    /// `take_config_observations` — it is not a membership change.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn archive_observes_schedule_table_frames_with_end_position_and_stamp() {
+    fn archive_walk_feeds_only_membership_payloads_to_config_observations() {
         let (b, _c, dir) = setup(1 << 16);
-        let mut archive = Archive::open(test_cfg(dir.path())).unwrap();
-        let mut a = Appender::new(Arc::clone(&b), 1, 0);
-        a.set_now(500);
-        a.append(1, 1, b"x").unwrap(); // [0, 64)
-        a.set_now(700);
-        let end = a.append_schedule_table(1, b"tbl").unwrap(); // [64, 128)
-        assert_eq!(end, 128);
-        archive.do_work(&b).unwrap();
-        let obs = archive.take_table_observations();
-        assert_eq!(obs, vec![(128, 700, b"tbl".to_vec())]);
-        assert!(archive.take_table_observations().is_empty(), "drained");
-        assert!(
-            archive.take_config_observations().is_empty(),
-            "not confused with CONFIG"
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut app = Appender::new(Arc::clone(&b), 1, 0);
+        let mut cfg = Vec::new();
+        encode_config(&two_voter_wire_config(), &mut cfg);
+        let end_m = app
+            .append_cluster(1, ClusterKind::Membership, &cfg)
+            .unwrap();
+        let mut s = Vec::new();
+        encode_settings(&Settings::genesis_default(), &mut s);
+        let _end_s = app.append_cluster(1, ClusterKind::Settings, &s).unwrap();
+        while arch.do_work(&b).unwrap() {}
+        let obs = arch.take_config_observations();
+        assert_eq!(obs.len(), 1, "the Settings frame must NOT reach the kernel");
+        assert_eq!(
+            obs[0].0, end_m,
+            "frame-END position, as CONFIG's convention"
         );
+        assert_eq!(obs[0].1, cfg, "the payload AFTER the 8-byte prefix");
     }
 
     /// Post-M7 Task 3 (review carry): `replay_journal_from` — the shared-
