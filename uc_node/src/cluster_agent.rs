@@ -526,9 +526,13 @@ impl ClusterAgent {
     /// `ArchiveError`) — a fail-stop in the archive's own class.
     fn replay_from_journal(&mut self, head: u64, node_flags: u64) -> bool {
         let from = self.follower.cursor;
-        // Ruling P10, pass 1 — HEADERS ONLY, no apply, no decode: which
+        // Ruling P10, pass 1 — no apply, no frame-BODY decode: which
         // `SNAPSHOT` frame in the span this pass is about to walk should be
-        // frozen at. See [`Self::last_actionable_instant`] for why there is a
+        // frozen at. (Final wave M6: the pre-pass reads and CRC-checks whole
+        // journal BLOCKS like any other walk — `replay_journal_from` has no
+        // header-only mode; what it skips is decoding each frame's body and
+        // applying it. The `uc_service` twin's comment was corrected in fix
+        // round 3; this one said "headers only" until now.) See [`Self::last_actionable_instant`] for why there is a
         // pre-pass at all rather than an inline decision.
         let freeze_at = self.last_actionable_instant(from, head, node_flags);
         let mut replay = match replay_journal_from(&self.journal, from) {
@@ -656,8 +660,10 @@ impl ClusterAgent {
     /// last one is only known once the span has been read to its end. Freezing
     /// at each in turn and keeping the newest would pay `freeze()` — O(state)
     /// — once per instant and write an artifact per instant; deciding first
-    /// costs one extra journal walk that reads HEADERS ONLY, applies nothing
-    /// and decodes nothing, which is cheap beside the apply pass it precedes.
+    /// costs one extra journal walk that reads each block's frame HEADERS,
+    /// applies nothing and decodes no frame BODY — cheap beside the apply pass
+    /// it precedes, though not free: the blocks themselves are read and
+    /// CRC-checked twice (`docs/reference/limits.md` records the ~2x).
     /// This whole path is the overrun path — already the slow one — and it is
     /// never on the live walk.
     ///

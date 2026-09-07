@@ -162,7 +162,11 @@ fn last_actionable_instant<S: RawStateMachine>(
 /// row's identity hash — whose position is `> sm.last_applied()`
 /// (idempotent-skip: re-walking an overlap already reflected in the SM applies
 /// nothing) AND whose frame END is `<= target`, where `target = min(commit,
-/// durable)` is RE-READ per block (both counters can advance while replay runs).
+/// durable)` is captured ONCE by [`replay_into`] and shared with pass 1 — fix
+/// round 3's whole point, so the pre-pass's choice of instant and the apply
+/// pass's bound cannot disagree about where the span ends. (It said "RE-READ
+/// per block" until the final wave's M6; re-reading is what made a replayed
+/// instant able to freeze state above P.)
 ///
 /// # Invariants
 /// * NEVER apply above the live `min(commit, durable)` — the per-frame target

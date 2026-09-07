@@ -1723,6 +1723,12 @@ mod tests {
             DGRAM_KIND_SNAP_CHUNK,
             DGRAM_KIND_SNAP_NAK,
             DGRAM_KIND_SNAP_DONE,
+            // Final wave M1: the pull path's two kinds (coordinated-snapshot
+            // spec §5.7). `scope_of` names them, so the crate that OWNS the
+            // classification pins them too, rather than leaving the only
+            // coverage at the receiver.
+            DGRAM_KIND_SNAP_REQUEST,
+            DGRAM_KIND_SNAP_REDIRECT,
             DGRAM_KIND_CONFIG_PROPOSAL,
             DGRAM_KIND_CONFIG_REPLY,
         ] {
@@ -1762,14 +1768,25 @@ mod tests {
             DGRAM_KIND_SNAP_CHUNK,
             DGRAM_KIND_SNAP_NAK,
             DGRAM_KIND_SNAP_DONE,
+            DGRAM_KIND_SNAP_REQUEST,
+            DGRAM_KIND_SNAP_REDIRECT,
             DGRAM_KIND_CONFIG_PROPOSAL,
             DGRAM_KIND_CONFIG_REPLY,
         ] {
             assert_eq!(Transport::scope_of(k), Scope::Pairwise, "kind {k}");
         }
-        // The full 1..=17 sweep still runs too, now checked against the same
-        // partition instead of merely not-panicking.
-        for k in 1..=DGRAM_KIND_CONFIG_REPLY {
+        // The full sweep still runs too, now checked against the same
+        // partition instead of merely not-panicking. Final wave M1: it runs
+        // to `DGRAM_KIND_SNAP_REDIRECT` (23), the highest kind this cluster
+        // sends, so kinds 18-23 — the handshake trio and the pull path — are
+        // inside it rather than past its top. 18/19 are the Unsealed
+        // bootstrap pair and are excluded by name; everything else at or
+        // below 23 that is not one of the four fan-out kinds is Pairwise.
+        for k in 1..=DGRAM_KIND_SNAP_REDIRECT {
+            if matches!(k, DGRAM_KIND_HS_INIT | DGRAM_KIND_HS_RESP) {
+                assert_eq!(Transport::scope_of(k), Scope::Unsealed, "kind {k}");
+                continue;
+            }
             let expect_group = matches!(
                 k,
                 DGRAM_KIND_DATA

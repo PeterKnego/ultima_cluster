@@ -107,19 +107,6 @@ fn instant_until_complete(
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if node.snapshot_set_position() >= p {
-                // Plan 2 T10, controller ruling: Ruling P10 (a replayed span
-                // ACTS on its last `SNAPSHOT` frame) removed the reason a
-                // first attempt could be abandoned here, so the retry above is
-                // belt-and-braces and reaching attempt 2 is a REGRESSION, not
-                // a tolerated outcome. The loop stays — production cadence
-                // supersedes the same way, and a fixture that silently gave up
-                // would be worse — but a second attempt fails the test loudly.
-                assert_eq!(
-                    attempt, 1,
-                    "instant {p} completed only on attempt {attempt}: an earlier instant was \
-                     abandoned (spec §10), which Ruling P10 should have made unreachable on \
-                     this fixture — see the diagnostic above"
-                );
                 return p;
             }
             std::thread::yield_now();
@@ -145,6 +132,23 @@ fn instant_until_complete(
             c.append.load_acquire(),
             c.commit.load_acquire(),
             c.durable.load_acquire(),
+        );
+        // Plan 2 T10, controller ruling: Ruling P10 (a replayed span ACTS on
+        // its last `SNAPSHOT` frame) removed the reason a first attempt could
+        // be abandoned here, so the retry loop is belt-and-braces and reaching
+        // attempt 2 is a REGRESSION, not a tolerated outcome.
+        //
+        // Final wave M8: the assert lives HERE, at the deadline, not in the
+        // success branch. There it fired one command too late — a failed first
+        // attempt was diagnosed by the `eprintln!` above, a SECOND instant was
+        // commanded, and the test only failed once that one succeeded (or
+        // passed silently if it did not, five attempts later, under a
+        // different panic). Now the failure and its diagnostic coincide, and
+        // the printed state vector describes the attempt that actually stalled.
+        assert_ne!(
+            attempt, 1,
+            "instant {p} was abandoned on the FIRST attempt (spec §10), which Ruling P10 \
+             should have made unreachable on this fixture — see the diagnostic above"
         );
     }
     panic!(

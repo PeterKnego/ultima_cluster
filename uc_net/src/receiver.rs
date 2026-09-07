@@ -635,6 +635,16 @@ pub struct FollowerStats {
     /// `uc_node::Node::snapshot_session_refusals`, rather than a re-used
     /// identity slot, so "the source mixed two instants" is never read as
     /// "the two nodes disagree about which FSMs exist".
+    ///
+    /// Final wave M14 (accepted, doc-only): THREE distinguishable shapes
+    /// share this counter — a second `SNAP_BEGIN` naming a different
+    /// `snapshot_pos`, a `SNAP_BEGIN` whose position is above this node's own
+    /// durable frontier, and a store-only intake whose set does not match the
+    /// position the fetch asked for. They are one refusal CLASS ("this
+    /// session's position is not the one this node will accept"), the operator
+    /// action is identical, and the `snapshot_session_refused` obs record
+    /// names the specific case as it happens — so splitting the counter would
+    /// add two series that no alert or runbook step would key on.
     pub snap_refused_position_mismatch: AtomicU64,
     /// Fix round 2 (Ruling P11): a `SNAP_BEGIN` arrived carrying the session
     /// id of a fetch whose arm had already EXPIRED — the named refusal

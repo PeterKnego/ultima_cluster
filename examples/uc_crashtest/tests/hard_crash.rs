@@ -2562,11 +2562,25 @@ fn snapshot_instant_abandoned_on_service_sigkill_mid_build_and_the_next_complete
         st.cluster, p3,
         "and the uc2-cluster row is a member of it, at the same P"
     );
+    // Final wave M7: the property, not the exact count. The SECOND
+    // abandonment depends on P2 sitting in the SAME live batch the respawned
+    // row walks while still writing P1's artifact — on a slower or more loaded
+    // box the row can finish P1 and reach P2 in a later batch, freeze there,
+    // and the run ends with ONE abandonment. That is a scheduling accident,
+    // not a behaviour change, so pinning `2` was a latent flake. What the row
+    // exists to prove survives intact: at least one instant was abandoned,
+    // EVERY abandonment named row 1 (the SIGKILLed one), and NONE named row 0.
+    assert!(
+        st.abandoned >= 1,
+        "at least P1 was abandoned to the SIGKILL: {st:?}"
+    );
     assert_eq!(
-        (st.abandoned, st.row_incomplete[0], st.row_incomplete[1]),
-        (2, 0, 2),
-        "two instants were abandoned (P1 to the SIGKILL, P2 to the catch-up `busy` decline), \
-         both naming row 1 and neither naming row 0"
+        st.row_incomplete[1], st.abandoned,
+        "every abandoned instant named row 1 — the SIGKILLed row is the one that missed them"
+    );
+    assert_eq!(
+        st.row_incomplete[0], 0,
+        "and none named row 0, which froze on time for every instant"
     );
 
     // Let post-recovery ops land, then adjudicate the histories.

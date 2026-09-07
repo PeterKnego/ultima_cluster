@@ -117,8 +117,14 @@ pub fn verify_snapshot_envelope(src: &mut dyn Read, expected: u64) -> Result<(),
         match src.read(&mut buf[n..]) {
             Ok(0) => break,
             Ok(k) => n += k,
-            // An I/O error mid-header is indistinguishable from a short file
-            // for this decision, and both are refusals.
+            // Final wave M9: `Interrupted` is not an error, it is a signal
+            // arriving mid-`read`. Treating it as one turned a benign EINTR
+            // into `Short`, then into a `MistaggedSnapshot` fail-stop on the
+            // reconstruction path — a node refusing to start over a signal.
+            // Retry it, as `read_exact` itself does.
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // Any OTHER I/O error mid-header is indistinguishable from a short
+            // file for this decision, and both are refusals.
             Err(_) => break,
         }
     }
@@ -349,6 +355,43 @@ mod tests {
             .expect("published file exists");
         assert_eq!(pos, 4096);
         assert_eq!(found, path);
+    }
+
+    /// Final wave M9: an `Interrupted` mid-header is a signal arriving during
+    /// a `read`, not a truncated file. Before the fix it became
+    /// `EnvelopeError::Short`, which the reconstruction path turns into a
+    /// `MistaggedSnapshot` fail-stop — a node refusing to start over an EINTR.
+    #[test]
+    fn an_interrupted_read_mid_envelope_is_retried_not_a_refusal() {
+        struct EintrOnce<'a> {
+            bytes: &'a [u8],
+            fired: bool,
+        }
+        impl Read for EintrOnce<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.fired {
+                    self.fired = true;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                // One byte at a time, so the loop is genuinely short-reading.
+                if buf.is_empty() || self.bytes.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.bytes[0];
+                self.bytes = &self.bytes[1..];
+                Ok(1)
+            }
+        }
+
+        let mut raw = Vec::new();
+        write_snapshot_envelope(&mut raw, 4096).unwrap();
+        raw.extend_from_slice(b"payload");
+        let mut src = EintrOnce {
+            bytes: &raw,
+            fired: false,
+        };
+        verify_snapshot_envelope(&mut src, 4096).expect("EINTR is retried, not a refusal");
+        assert!(src.fired);
     }
 
     /// I2 (final wave): the rename that publishes an artifact must itself be

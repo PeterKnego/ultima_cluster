@@ -487,9 +487,19 @@ fn a_replayed_instant_at_or_below_the_applied_frontier_is_not_frozen_at() {
         snapshot_files(dir.path())
     );
 
-    // ---- phase C (anti-vacuity): the same row, the same replay path, an
-    // ---- instant that IS above the applied frontier — one artifact, at it,
-    // ---- holding the state strictly below it.
+    // ---- phase C (anti-vacuity): the same row, an instant that IS above the
+    // ---- applied frontier — one artifact, at it, holding the state strictly
+    // ---- below it.
+    //
+    // Final wave M6: this said "the same replay path", which it does not
+    // assert. Nothing here forces an overrun, so on a healthy box the row
+    // almost certainly takes the LIVE freeze arm (`apply.rs`'s
+    // `on_snapshot_frame`), not the replayed one. That is fine — the claim
+    // being pinned is "an instant above the frontier IS acted on, exactly
+    // once, at P", which both arms must satisfy and which makes phase B's
+    // "no artifact at all" non-vacuous. The replay arm's own coverage is the
+    // P10 tests (`SlowCountSm` and the deterministic overrun repros), which
+    // do force the overrun.
     SLOW_NS.store(200_000, O::Relaxed);
     for _ in 0..600 {
         submitted += 1;

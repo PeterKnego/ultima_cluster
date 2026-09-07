@@ -1959,8 +1959,9 @@ fn instant_completes_first_try(node: &Node, cnc: &CncPage, rows: &[u8]) -> u64 {
 /// from the very clients-before-timers ordering rule 5 exists to check. So
 /// this uses the only SOUND bound available from the log alone, the PREVIOUS
 /// frame's stamp (the true pass-start stamp is never above it, because stamps
-/// never decrease), which makes rule 5's "legitimately late" escape hatch
-/// always fire and rule 5 itself unreachable. Rules 1-4 — non-decreasing
+/// never decrease) — and `u64::MAX`, "no bound at all", for the very first
+/// frame, which has no predecessor. Either way rule 5's "legitimately late"
+/// escape hatch always fires and rule 5 itself is unreachable. Rules 1-4 — non-decreasing
 /// stamps over the whole log, no timer stamped before its deadline, and the
 /// two ordering diagnostics — are what this row runs, over a log that contains
 /// SNAPSHOT frames.
@@ -1983,7 +1984,16 @@ fn collect_log_frames(node: &Node) -> Vec<SimFrame> {
             other => panic!("frame at {cursor} unreadable: {other:?}"),
         };
         let next = cursor + align_frame_len(hdr.length as usize) as u64;
-        let pass_start_stamp = out.last().map(|f: &SimFrame| f.stamp).unwrap_or(0);
+        // Final wave M10: `u64::MAX` for the FIRST frame, not `0`. There is
+        // no previous frame, so no bound on the pass-start stamp exists at
+        // all — and `u64::MAX` is how "no bound available" is spelled for a
+        // rule whose escape hatch is `stamp <= pass_start_stamp`. `0` said
+        // the opposite (a bound of zero, which every stamp exceeds) and would
+        // have made rule 5 trivially SATISFIED for that one frame instead of
+        // explicitly unconstrained — a difference that does not matter while
+        // rule 5 is vacuous here, and would have mattered silently if it ever
+        // stopped being.
+        let pass_start_stamp = out.last().map(|f: &SimFrame| f.stamp).unwrap_or(u64::MAX);
         match hdr.frame_type {
             FRAME_TYPE_TIMER => {
                 let body = read_timer_body(&buf[HEADER_LEN..])

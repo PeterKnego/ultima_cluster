@@ -782,6 +782,16 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
 /// 3. **A build already in flight.** One in flight max, the rule `busy` has
 ///    enforced since M6; this row is simply incomplete for THIS instant, which
 ///    [`SNAPSHOT_SKIPPED_BUSY`] counts.
+/// 4. **An instant at or below what the SM has already applied** (final wave
+///    M4). Unreachable on the live walk today — post-install the cursor is set
+///    to the artifact's tag and post-replay to the replay end, and in both
+///    cases `last_applied()` is strictly below the cursor — but the reason it
+///    is unreachable is a GLOBAL argument about every cursor-setting path,
+///    whereas the replay twin (`replay.rs`) makes the same invariant LOCAL
+///    with one comparison. Freezing at such a frame would tag state above P
+///    with P, a divergence the artifact envelope cannot catch (the tag IS P),
+///    and fix round 3 exists because that class of bug is invisible. One
+///    compare, on a rare arm.
 ///
 /// Takes the `ApplyState` fields it touches individually rather than
 /// `&mut ApplyState<S>`: the call site runs with the SM's `MutexGuard` alive,
@@ -808,6 +818,15 @@ pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
     if trig.busy.load(Ordering::Acquire) {
         SNAPSHOT_SKIPPED_BUSY.fetch_add(1, Ordering::Relaxed);
         return; // 3. one in-flight build max
+    }
+    // 4. belt and braces, the replay twin's guard made local here too. Note
+    //    the comparison is against the frame's START (`pos`), matching
+    //    `replay.rs`'s `Some(pos) > guard.last_applied()`: `last_applied()` is
+    //    the SM's own last applied MESSAGE, which is strictly below the
+    //    instant's frame, so an instant this row is legitimately at has
+    //    `pos > last_applied`. A trait call, but on the SNAPSHOT arm only.
+    if Some(pos) <= sm.last_applied() {
+        return;
     }
     // **P**, the instant: this frame's END position, not its start. Everything
     // below P has applied (this frame is the last one yielded before the

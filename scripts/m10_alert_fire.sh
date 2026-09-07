@@ -143,10 +143,24 @@ def multi_level_hold(row, total):
     timeline this builder lays down. Needs at least 2 raw values (at least
     one real change) to be useful; a scenario feeding this policy a
     single-value series is a builder bug, not a legitimate "no changes"
-    case (that's `hold_last`'s job)."""
+    case (that's `hold_last`'s job).
+
+    Final wave (parked as T8): a degenerate series raises `ScenarioMissing`,
+    not a bare `assert`. The check itself is load-bearing - without it a
+    scenario that scraped one value would silently replay a flat series and
+    the rule would FAIL for a reason no line explained - but a bare `assert`
+    aborted the WHOLE adjudication run, which is the failure mode Fix round
+    1's Finding 1 removed everywhere else. As a `ScenarioMissing` it becomes
+    that rule's own named FAIL line, with the count, while every other rule
+    is still adjudicated."""
     vals = row["values"]
     n = len(vals)
-    assert n >= 2, f"multi_level_hold needs >=2 raw samples to produce a change, got {n}"
+    if n < 2:
+        raise ScenarioMissing(
+            f"multi_level_hold needs >=2 raw samples to produce a change, got {n} for "
+            f'{row["name"]}{{{row["labels_str"]}}} - the scenario scraped a degenerate '
+            "series, so this rule cannot be adjudicated"
+        )
     base = total // n
     counts = [base] * (n - 1) + [total - base * (n - 1)]
     return " ".join(f"{v}x{c}" for v, c in zip(vals, counts))

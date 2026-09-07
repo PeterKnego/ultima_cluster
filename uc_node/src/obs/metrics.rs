@@ -111,6 +111,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_refused_legacy_peer_total",
     "uc2_snapshot_refused_declared_set_total",
     "uc2_snapshot_refused_version_total",
+    // Final wave M2: added with instants and rendered from the first commit,
+    // but left out of the contract — so `m10_fleet_gate.py`'s family-coverage
+    // check never saw them. Contracted now, with the three above them.
+    "uc2_snapshot_refused_position_total",
+    "uc2_snapshot_refused_fetch_expired_total",
     "uc2_snapshot_intake_io_failures_total",
     // M14c2 (T10a): the three counters that close M14c's snapshot-session
     // deferrals — the leader's `File::open` TOCTOU, the joiner's abandoned
@@ -164,6 +169,20 @@ pub const CONTRACT_SERIES: &[&str] = &[
 /// the word itself, so a row that freezes for the exact same duration twice
 /// in a row is a known blind spot of this word-change detection, not a
 /// double count. `#[derive(Default)]` zero-initializes every row.
+///
+/// Final wave M5/T8, spelled out because `_count`'s name invites the wrong
+/// reading: the error is always an **UNDER**-count, never an over-count.
+/// Two sources — identical consecutive durations (one sample), and N freezes
+/// landing between two scrapes (one sample, the last value). And because this
+/// struct is process-local derived state rather than a cnc word, every
+/// counter here **resets to 0 when the node restarts**, so a `rate()` across
+/// a restart reads as a drop to zero and back, the same as any other
+/// process-local counter on this endpoint. The FIRST scrape after a restart
+/// also folds whatever the cnc word happens to hold (`last_seen_ns` starts at
+/// 0, so any nonzero reading differs) — one sample for a freeze that may have
+/// happened before the restart. That is a deliberate trade: the alternative,
+/// seeding `last_seen_ns` from the word at construction, would miss a genuine
+/// freeze that lands during startup.
 #[derive(Default)]
 pub struct SnapshotFreezeStats {
     last_seen_ns: [AtomicU64; CNC_MAX_SERVICES],
@@ -307,7 +326,9 @@ struct ServiceRow {
     /// Cumulative freeze duration this row has reported, in seconds
     /// (`uc2_snapshot_freeze_seconds_sum`).
     freeze_sum_seconds: f64,
-    /// Freezes this row has reported (`uc2_snapshot_freeze_seconds_count`).
+    /// Distinct freeze durations sampled for this row
+    /// (`uc2_snapshot_freeze_seconds_count`) — a LOWER bound on freezes; see
+    /// [`SnapshotFreezeStats`].
     freeze_count: u64,
 }
 
@@ -580,7 +601,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_snapshot_row_incomplete_total",
-        "Instants this row failed to reach before being superseded (coordinated-snapshot spec §9): the row never froze in time, and the next instant supersedes it.",
+        "Instants this row OWED a freeze for and failed to reach before being superseded (coordinated-snapshot spec §9): the row never froze in time, and the next instant supersedes it. A superseded STANDBY instant on a node that is not a learner is NOT counted here (ruling P13): a voter's row is supposed not to freeze for one.",
         "counter",
         &rows,
         |r| r.snapshot_row_incomplete,
@@ -588,7 +609,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled_f64(
         out,
         "uc2_snapshot_freeze_seconds_max",
-        "The longest freeze() call this row has reported since uc2_snapshot_instant_position last advanced (coordinated-snapshot spec §5.7/§9); reset to 0 the scrape after the leader commands a new instant. No histogram type exists in this encoder, so this and _sum/_count stand in for one.",
+        "The longest freeze() call this row has reported since the instant its node's rows are working on last advanced (coordinated-snapshot spec §5.7/§9) — max(uc2_snapshot_instant_position, uc2_snapshot_standby_instant_position), so the FULL instant on a voter and the STANDBY one on a learner; reset to 0 on the scrape after that moves. No histogram type exists in this encoder, so this and _sum/_count stand in for one.",
         "gauge",
         &rows,
         |r| r.freeze_max_seconds,
@@ -604,7 +625,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_service_labeled(
         out,
         "uc2_snapshot_freeze_seconds_count",
-        "Freezes this row has reported (coordinated-snapshot spec §9); paired with _sum for a mean.",
+        "DISTINCT freeze durations sampled from this row's cnc word at scrape boundaries (coordinated-snapshot spec §9); paired with _sum for a mean. Read it as a LOWER BOUND on freezes, not a count of them: the word carries no sequence number, so two identical consecutive durations count once and N freezes between two scrapes count once. It also resets to 0 when the node process restarts (it is process-local, derived state, not a cnc word).",
         "counter",
         &rows,
         |r| r.freeze_count,
@@ -1409,6 +1430,62 @@ mod tests {
         }
     }
 
+    /// Final wave M5 (parked as T8): [`SnapshotFreezeStats`]'s edge detection
+    /// is subtle enough that a regression would only show up on a fleet run —
+    /// the reset-on-instant-advance, the no-double-count-on-equal-values
+    /// blind spot, and the ordering rule that a freeze landing in the SAME
+    /// scrape as an instant advance must fold into the FRESH max.
+    ///
+    /// Driven directly rather than through `render_prometheus` so each rule is
+    /// asserted on its own, in the order the exporter calls them.
+    #[test]
+    fn snapshot_freeze_stats_resets_per_instant_and_never_double_counts_a_value() {
+        let st = SnapshotFreezeStats::default();
+
+        // Scrape 1: first reading for row 0 — one observation.
+        st.observe_instant(4096);
+        assert_eq!(st.observe_row(0, 500), (500, 500, 1));
+        // ...and row 1 is independent.
+        assert_eq!(st.observe_row(1, 900), (900, 900, 1));
+
+        // Scrape 2, same instant, IDENTICAL word: the known blind spot —
+        // nothing folds, and the max is held (not reset: the instant has not
+        // moved).
+        st.observe_instant(4096);
+        assert_eq!(
+            st.observe_row(0, 500),
+            (500, 500, 1),
+            "an unchanged cnc word is not a new freeze"
+        );
+
+        // Scrape 3, same instant, a SHORTER freeze: counted, summed, and the
+        // running max is unchanged because it is a max.
+        st.observe_instant(4096);
+        assert_eq!(st.observe_row(0, 100), (500, 600, 2));
+
+        // Scrape 4: the instant advances. Every row's max resets — and,
+        // crucially, `observe_instant` runs BEFORE the rows, so a freeze read
+        // in this same scrape folds into the fresh max rather than a stale
+        // one. `_sum`/`_count` are counters and never reset.
+        st.observe_instant(8192);
+        assert_eq!(
+            st.observe_row(0, 300),
+            (300, 900, 3),
+            "the new max is this scrape's reading, not the old 500"
+        );
+        assert_eq!(
+            st.observe_row(1, 900),
+            (0, 900, 1),
+            "row 1's max reset too, and its unchanged word folded nothing"
+        );
+
+        // A gauge that goes BACKWARDS still resets (`changes`, not `>`): the
+        // standby gauge can be lower than a stale full-instant reading, and
+        // the exporter feeds the max of the two.
+        st.observe_instant(4096);
+        assert_eq!(st.observe_row(0, 300), (0, 900, 3), "max reset, word same");
+    }
+
     /// P5: `monitor-a-cluster.md` states the contract's SIZE — "89 families"
     /// — and nothing made that number a build-time fact, so adding a series
     /// silently made the doc wrong. This pins the count; a deliberate change
@@ -1417,7 +1494,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            97,
+            99,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );

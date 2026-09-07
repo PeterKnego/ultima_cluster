@@ -777,6 +777,16 @@ struct Node {
     /// `complete_sets` is cleared with `commit`. Because the truncation prune
     /// drops every entry ABOVE the cut and the cursor drops TO the cut, no
     /// surviving entry is ever re-examined — the sweep cannot double-list.
+    ///
+    /// Final wave M13 (accepted, doc-only): it does NOT revisit a STANDBY
+    /// instant this node skipped as a voter if the node later becomes a
+    /// learner — the cursor is already past that position, so the set is never
+    /// listed even though the learner would now build one. Unreachable in any
+    /// shipped path (the sim's role changes do not replay history at a node,
+    /// and a real node only acts on instants going forward), and the fix —
+    /// lowering the cursor on a role change — would put a live-state
+    /// dependency into an invariant checker for no reachable benefit. Recorded
+    /// rather than fixed.
     snap_cursor: u64,
     /// How many entries of `complete_sets` inv11 has already judged (see
     /// `World::check_set_alignment`'s "judged once" note). Clamped to the
@@ -3387,6 +3397,15 @@ impl World {
     /// complete a set at (abandoned or truncated), and including a position
     /// twice if two lineages both ended a frame there (so the length is the
     /// number of frames commanded, not of distinct positions).
+    ///
+    /// Final wave M12 (accepted, doc-only): "ASCENDING" is by POSITION, not by
+    /// the order the frames were appended — the ledger is keyed by lineage and
+    /// flattened. The two agree on every reachable history, since a leader's
+    /// instants ascend and a truncation drops the frames above the cut; they
+    /// could differ only if a leader commanded an instant BELOW an abandoned
+    /// one, which no path does. `command_and_wait`'s `.last()` would then name
+    /// the wrong frame, so if such a path is ever added, sort by append order
+    /// here rather than fixing the caller.
     pub fn instants(&self) -> Vec<u64> {
         self.snapshot_frames
             .values()

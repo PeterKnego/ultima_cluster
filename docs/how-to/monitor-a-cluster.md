@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 97 families — is the
+exposition. The full series contract — 99 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -287,10 +287,10 @@ Seven families:
 | `uc2_snapshot_standby_instant_position` | gauge | none | the last **standby** instant this node's `uc2-cluster` agent *acted on*, `0` if never. **Learner-only**: a voter skips every standby frame by design, so a voter always reads `0`. This is the gauge to watch on a `snapshot.target = learners` cluster — the leader is a voter, so its own instant gauge and set position tell you nothing about whether the standby work is happening |
 | `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. **Must agree cluster-wide once caught up** |
 | `uc2_snapshot_fetched_position` | gauge | none | the newest set this node pulled whole from a learner with `uc2ctl snapshot fetch`, `0` if it never has. The standby return path's progress reading |
-| `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging |
-| `uc2_snapshot_freeze_seconds_max` | gauge | `service`, `row` | the longest `freeze()` this row has reported since `uc2_snapshot_instant_position` last advanced; reset to `0` on the scrape after a new instant is commanded |
+| `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row **owed a freeze for** and failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging. A superseded standby instant on a voter is not counted — that row is *supposed* not to freeze for one |
+| `uc2_snapshot_freeze_seconds_max` | gauge | `service`, `row` | the longest `freeze()` this row has reported since the instant its node's rows are working on last advanced — the full one on a voter, the standby one on a learner; reset to `0` on the scrape after that moves |
 | `uc2_snapshot_freeze_seconds_sum` | counter | `service`, `row` | cumulative `freeze()` seconds for this row |
-| `uc2_snapshot_freeze_seconds_count` | counter | `service`, `row` | freezes this row has reported |
+| `uc2_snapshot_freeze_seconds_count` | counter | `service`, `row` | DISTINCT freeze durations sampled from this row's cnc word at scrape boundaries — a **lower bound** on freezes, not a count of them (see below) |
 
 The last three are a **stand-in for a histogram**: this exposition encoder has
 no histogram type, so a max gauge plus a sum/count pair carries the
@@ -300,10 +300,23 @@ once per pass — two artefacts follow from that. A freeze is counted when the
 word's value **differs from what the previous scrape saw**, and the word
 carries no sequence number, so a row that freezes for the *exact same*
 duration on two consecutive instants is counted once: a known blind spot, and
-an under-count rather than a double count. And the running totals live in the
+an under-count rather than a double count. The same mechanism means **N
+freezes between two scrapes count once**, at the last one's duration — so on a
+cluster whose cadence is faster than the scrape interval, `_count` is well
+below the number of instants, and `_sum / _count` is a mean over the freezes
+that happened to be *visible*, not over all of them. Both errors point the
+same way: `_count` is a floor. And the running totals live in the
 node process, so a **node restart resets `_sum`/`_count` to zero** — an
 ordinary counter reset, which `rate()`/`increase()` already handle, but not
-something to read as "the freezes were undone".
+something to read as "the freezes were undone". The first scrape after a
+restart also folds whatever the cnc word happens to hold, which may describe a
+freeze from before the restart; that is deliberate, because seeding from the
+word instead would miss a genuine freeze landing during startup.
+
+`_max` is the one of the three that resets on purpose: it goes back to `0` on
+the scrape after the instant this node's rows are working on advances — the
+FULL instant on a voter (`uc2_snapshot_instant_position`), the STANDBY one on
+a learner (`uc2_snapshot_standby_instant_position`), whichever is higher.
 
 **Three alert rules.**
 
@@ -354,9 +367,8 @@ leave the joiner NAKing rather than installing a wrong or half set —
 about the set's position, so it was mixing two instants) and
 `uc2_snapshot_refused_fetch_expired_total` (a straggling answer to a
 `snapshot fetch` this node had already given up on — nothing is stored or
-installed, and the verb is simply re-runnable). Those last two are rendered
-but are not yet listed in `CONTRACT_SERIES`, so the 97-family count above does
-not include them. Any of them non-zero means a joiner is stuck; the consensus
+installed, and the verb is simply re-runnable). All five are in
+`CONTRACT_SERIES` and counted in the 99 above. Any of them non-zero means a joiner is stuck; the consensus
 agent names each one in a `snapshot_session_refused` record as it happens.
 
 **Eleven record names** go with the families, six at info and five at warn

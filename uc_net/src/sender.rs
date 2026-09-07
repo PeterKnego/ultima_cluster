@@ -4661,6 +4661,15 @@ mod tests {
     /// with a redirect to the learner the node layer names — and ONLY when it
     /// names one. The overrun is counted either way: the redirect is a hint,
     /// not a substitute for the re-NAK.
+    ///
+    /// Final wave M11 (accepted, erratum 6): "cannot serve" here means EVERY
+    /// `open_snap_session` failure, not only a genuinely missing set — a
+    /// transient `snap_open_failed`, or a session already in flight, sends a
+    /// redirect too. That is deliberate and self-correcting: the redirect is
+    /// advisory, the joiner re-NAKs on its own timer, and the alternative
+    /// (distinguishing the causes) would put a classification on the NAK path
+    /// to save a datagram that costs nothing. This test does not separate the
+    /// cases and is not meant to.
     #[test]
     fn an_unservable_below_floor_nak_redirects_when_the_node_names_a_learner() {
         let f = Fake::new();

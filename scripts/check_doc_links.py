@@ -56,6 +56,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Historical records and vendored trees: true when written, not maintained.
 SKIP = (
     "docs/superpowers/",
+    # The SDD scratch tree (briefs, per-task reports, the ledger). Gitignored
+    # (`.gitignore`), so CI never checks it out and this entry changes no CI
+    # verdict — it is what makes the local run of this script, which the
+    # release checklist names, reproducible for anyone with a live ledger.
+    ".superpowers/",
     "docs/tasks/",
     "proofs/.lake/",
     "target/",
