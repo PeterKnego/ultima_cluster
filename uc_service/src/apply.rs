@@ -579,51 +579,34 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             pf_pub += t2 - t1;
                             pf_bytes += payload.len() as u64;
                         }
-                        let recs = ctx.take_sched_records();
-                        if !recs.is_empty() {
-                            write_sched_if_leader(
+                        // M14a: the common frame schedules nothing, so the
+                        // drain (a Vec build + three list walks) is behind one
+                        // cheap test and lives out of line. The timer core put
+                        // it inline on every frame: -13.7 % on the apply hop
+                        // (apply_ab.sh 17d5c6b → 4cbe926, 2026-09-07).
+                        if ctx.has_sched_records() {
+                            ship_sched_records(
+                                &mut ctx,
                                 &mut st.svc_sched,
                                 &mut st.pending,
                                 &mut st.table_last,
-                                &recs,
                                 is_leader,
                             );
                         }
-                    } else if hdr.frame_type == FRAME_TYPE_TIMER
-                        && Some(pos) > sm.last_applied()
-                        && let Some(body) = read_timer_body(payload)
-                        && body.identity_hash == S::IDENTITY.hash()
-                    {
-                        // Delivery bookkeeping BEFORE `on_timer`: this instance is
-                        // no longer pending regardless of what the SM does with
-                        // it, and a table tick's delivery raises `table_last` —
-                        // parity with `Timed<S>`'s own bookkeeping, for the bare
-                        // SM the loop's maps serve.
-                        st.pending.remove(&body.timer_id);
-                        if hdr.flags & FLAG_TIMER_TABLE != 0 {
-                            st.table_last.insert(body.timer_id, body.deadline_ns);
-                        }
-                        let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
-                            .with_time(hdr.time_ns)
-                            .with_term(hdr.leadership_term_id);
-                        sm.on_timer(
-                            &mut ctx,
-                            TimerEvent {
-                                id: body.timer_id,
-                                deadline_ns: body.deadline_ns,
-                                table: hdr.flags & FLAG_TIMER_TABLE != 0,
-                            },
+                    } else if hdr.frame_type == FRAME_TYPE_TIMER && Some(pos) > sm.last_applied() {
+                        // The arm is the type test, the frontier test and this
+                        // call (M14a); the body decode, identity match and
+                        // delivery live out of line.
+                        on_timer_frame(
+                            &mut *sm,
+                            pos,
+                            &hdr,
+                            payload,
+                            is_leader,
+                            &mut st.svc_sched,
+                            &mut st.pending,
+                            &mut st.table_last,
                         );
-                        let recs = ctx.take_sched_records();
-                        if !recs.is_empty() {
-                            write_sched_if_leader(
-                                &mut st.svc_sched,
-                                &mut st.pending,
-                                &mut st.table_last,
-                                &recs,
-                                is_leader,
-                            );
-                        }
                     } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT {
                         // M14a: the arm is the type test and this call, nothing
                         // else — plan 2's T8 resolved the cnc slot INLINE here
@@ -748,6 +731,69 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         .store_release(unix_ns());
     drain_queries(st);
     progressed
+}
+
+/// Out of line (M14a): drain a frame's schedule/consumed records and ship
+/// them. Only reached when [`ApplyCtx::has_sched_records`] said there is
+/// something to ship — the common frame never gets here.
+#[inline(never)]
+fn ship_sched_records(
+    ctx: &mut ApplyCtx,
+    svc_sched: &mut SpscProducer,
+    pending: &mut HashMap<u64, u64>,
+    table_last: &mut HashMap<u64, u64>,
+    is_leader: bool,
+) {
+    let recs = ctx.take_sched_records();
+    if !recs.is_empty() {
+        write_sched_if_leader(svc_sched, pending, table_last, &recs, is_leader);
+    }
+}
+
+/// Out of line (M14a): a `FRAME_TYPE_TIMER` frame above the SM's frontier.
+/// Decodes the body, delivers it only to the FSM whose identity it names
+/// (any other row yields the frame, as before), does the delivery bookkeeping
+/// BEFORE `on_timer` (this instance is no longer pending regardless of what
+/// the SM does with it; a table tick's delivery raises `table_last` — parity
+/// with `Timed<S>`'s own bookkeeping, for the bare SM the loop's maps serve),
+/// then ships whatever the SM scheduled.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn on_timer_frame<S: RawStateMachine>(
+    sm: &mut S,
+    pos: u64,
+    hdr: &FrameHeader,
+    payload: &[u8],
+    is_leader: bool,
+    svc_sched: &mut SpscProducer,
+    pending: &mut HashMap<u64, u64>,
+    table_last: &mut HashMap<u64, u64>,
+) {
+    let Some(body) = read_timer_body(payload) else {
+        return;
+    };
+    if body.identity_hash != S::IDENTITY.hash() {
+        return;
+    }
+    pending.remove(&body.timer_id);
+    let table = hdr.flags & FLAG_TIMER_TABLE != 0;
+    if table {
+        table_last.insert(body.timer_id, body.deadline_ns);
+    }
+    let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
+        .with_time(hdr.time_ns)
+        .with_term(hdr.leadership_term_id);
+    sm.on_timer(
+        &mut ctx,
+        TimerEvent {
+            id: body.timer_id,
+            deadline_ns: body.deadline_ns,
+            table,
+        },
+    );
+    if ctx.has_sched_records() {
+        ship_sched_records(&mut ctx, svc_sched, pending, table_last, is_leader);
+    }
 }
 
 /// Coordinated-snapshot spec §5.2/§5.7: act on a `FRAME_TYPE_SNAPSHOT` frame.

@@ -126,6 +126,16 @@ impl ApplyCtx {
     pub(crate) fn consumed_table(&mut self, id: u64, deadline_ns: u64) {
         self.consumed_table.push((id, deadline_ns));
     }
+    /// Apply loop only: did this frame's apply leave anything to ship to the
+    /// node? Three `is_empty` checks — the hot loop asks this on EVERY frame
+    /// and must not pay for the drain below unless the answer is yes (the
+    /// drain built a `Vec` and walked three lists per frame; apply_ab.sh
+    /// measured the timer core's per-frame additions at -13.7 % on the apply
+    /// hop, 2026-09-07).
+    #[inline]
+    pub(crate) fn has_sched_records(&self) -> bool {
+        !self.timers.is_empty() || !self.consumed.is_empty() || !self.consumed_table.is_empty()
+    }
     /// Apply loop only: drain both lists as wire records, requests first.
     pub(crate) fn take_sched_records(&mut self) -> Vec<SchedRecord> {
         let mut out =
