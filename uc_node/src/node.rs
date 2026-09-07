@@ -2805,8 +2805,8 @@ struct Consensus {
     /// Per TERM, then, and not airtight across one: a new leader starts at `0`
     /// while the previous leader's uncommitted frame may still be in flight,
     /// so two table commands can briefly be above the view at once. That is
-    /// harmless here — the durable `ScheduleRecord` with its one level of
-    /// `prev`, which is what plan 2's rule actually protected, is gone; the
+    /// harmless here — the durable, now-retired `ScheduleRecord` with its one
+    /// level of `prev`, which is what plan 2's rule actually protected, is gone; the
     /// cluster FSM applies whichever of the two commits, in log order, and a
     /// truncated one simply never reaches the view.
     last_cluster_append: u64,

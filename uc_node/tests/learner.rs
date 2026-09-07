@@ -2311,7 +2311,7 @@ fn a_leader_without_a_table_ships_none_and_the_joiner_installs_none() {
 ///
 /// **Why this used to be red.** The retired `SNAP_TABLE` carry read LIVE state
 /// at ship time and gated it on the sender's commit counter
-/// (`shippable_schedule(ship, cnc.counters().commit)` — a leader only offered
+/// (the retired `shippable_schedule(ship, cnc.counters().commit)` — a leader only offered
 /// a record at or below what it knew to be committed). `LogCounters` is
 /// deliberately not primed at boot (`uc_log/src/counters.rs:55`), so a
 /// restarted node re-derives commit from live quorum reports, and a node whose
