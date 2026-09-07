@@ -581,10 +581,15 @@ on developer machines; avoid it structurally rather than by assuming the
 current machine is big enough (do not encode a particular box's size,
 mounts, or free space here — this file is shared):
 
-- **Write test/scratch artifacts to real disk** (a path under `$HOME`), NOT
-  `/tmp`. For the elle harness, set `ELLE_DIR` under `$HOME` (e.g.
-  `$HOME/elle-out`), never the default `/tmp/uc2-elle`. Check with
-  `findmnt /tmp` if unsure what backs it.
+- **Write test/scratch artifacts to real disk, under `$HOME/scratch/`** — NOT
+  `/tmp`, and NOT the home directory itself. One sweepable root is the whole
+  point: an unnamed "somewhere under `$HOME`" is how a home dir accumulates a
+  hundred loose `fix*.py`/`*.log` files and multi-GB stray cargo target dirs,
+  with no way to tell scratch from work. A stray target dir belongs in
+  `~/.cache/cargo-target-<name>` (see "Benchmarking discipline"), never in
+  `$HOME`. For the elle harness set `ELLE_DIR=$HOME/scratch/elle-out`, never
+  the default `/tmp/uc2-elle`. Check with `findmnt /tmp` if unsure what backs
+  it.
 - Test **instance dirs / journals already go to the cargo target tree** via
   `env!("CARGO_TARGET_TMPDIR")` (the `tempdir()` helper in the test suites) —
   keep it that way; do not `tempdir()` under `/tmp`.
