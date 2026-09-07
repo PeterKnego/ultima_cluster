@@ -61,6 +61,17 @@ pub struct ApplyCtx {
     /// The frame's `leadership_term_id`.
     pub term: u32,
     identity: FsmIdentity,
+    /// Everything this apply asked the node to do, allocated only by a frame
+    /// that asks: the common frame carries ONE null pointer here, not three
+    /// `Vec`s built and dropped per frame (apply_ab.sh measured the third
+    /// list alone at -2.9 % on the apply hop, 2026-09-07; M14a).
+    sched: Option<Box<SchedLists>>,
+}
+
+/// The per-apply schedule bookkeeping, boxed so that [`ApplyCtx`] stays a
+/// few words on the common path.
+#[derive(Debug, Default)]
+struct SchedLists {
     timers: Vec<TimerReq>,
     consumed: Vec<(u64, u64)>,
     consumed_table: Vec<(u64, u64)>,
@@ -73,10 +84,12 @@ impl ApplyCtx {
             time_ns: 0,
             term: 0,
             identity,
-            timers: Vec::new(),
-            consumed: Vec::new(),
-            consumed_table: Vec::new(),
+            sched: None,
         }
+    }
+    #[inline]
+    fn sched_mut(&mut self) -> &mut SchedLists {
+        self.sched.get_or_insert_with(Default::default)
     }
     /// Convenience for a state machine's own unit tests: `ApplyCtx::for_sm::<MySm>(pos)`
     /// builds the context with `S::IDENTITY`, the same identity the real apply
@@ -106,25 +119,30 @@ impl ApplyCtx {
     /// replaces its deadline. Deterministic: an output of apply, replayed
     /// identically on every replica (time-and-timers §4.4).
     pub fn schedule(&mut self, id: u64, at_ns: u64) {
-        self.timers.push(TimerReq::Schedule { id, at_ns });
+        self.sched_mut()
+            .timers
+            .push(TimerReq::Schedule { id, at_ns });
     }
     pub fn cancel(&mut self, id: u64) {
-        self.timers.push(TimerReq::Cancel { id });
+        self.sched_mut().timers.push(TimerReq::Cancel { id });
     }
     /// What this apply has asked so far, in order (read by `Timed`).
     pub fn timers(&self) -> &[TimerReq] {
-        &self.timers
+        self.sched
+            .as_ref()
+            .map(|s| s.timers.as_slice())
+            .unwrap_or(&[])
     }
     /// `Timed` only: this instance was delivered or dropped; the node may clear it.
     pub(crate) fn consumed(&mut self, id: u64, deadline_ns: u64) {
-        self.consumed.push((id, deadline_ns));
+        self.sched_mut().consumed.push((id, deadline_ns));
     }
     /// `Timed` only: a **table** tick (plan 2's replicated schedule table)
     /// was delivered or dropped; the node advances that entry's
     /// `last_delivered` from this instead of `Consumed` (`RowTimers::
     /// table_delivered`, Task 4), so a re-fired tick never re-advances it.
     pub(crate) fn consumed_table(&mut self, id: u64, deadline_ns: u64) {
-        self.consumed_table.push((id, deadline_ns));
+        self.sched_mut().consumed_table.push((id, deadline_ns));
     }
     /// Apply loop only: did this frame's apply leave anything to ship to the
     /// node? Three `is_empty` checks — the hot loop asks this on EVERY frame
@@ -134,13 +152,17 @@ impl ApplyCtx {
     /// hop, 2026-09-07).
     #[inline]
     pub(crate) fn has_sched_records(&self) -> bool {
-        !self.timers.is_empty() || !self.consumed.is_empty() || !self.consumed_table.is_empty()
+        self.sched.is_some()
     }
     /// Apply loop only: drain both lists as wire records, requests first.
     pub(crate) fn take_sched_records(&mut self) -> Vec<SchedRecord> {
-        let mut out =
-            Vec::with_capacity(self.timers.len() + self.consumed.len() + self.consumed_table.len());
-        for r in self.timers.drain(..) {
+        let Some(mut lists) = self.sched.take() else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(
+            lists.timers.len() + lists.consumed.len() + lists.consumed_table.len(),
+        );
+        for r in lists.timers.drain(..) {
             out.push(match r {
                 TimerReq::Schedule { id, at_ns } => SchedRecord {
                     op: SchedOp::Schedule,
@@ -154,14 +176,14 @@ impl ApplyCtx {
                 },
             });
         }
-        for (id, dl) in self.consumed.drain(..) {
+        for (id, dl) in lists.consumed.drain(..) {
             out.push(SchedRecord {
                 op: SchedOp::Consumed,
                 timer_id: id,
                 deadline_ns: dl,
             });
         }
-        for (id, dl) in self.consumed_table.drain(..) {
+        for (id, dl) in lists.consumed_table.drain(..) {
             out.push(SchedRecord {
                 op: SchedOp::TableConsumed,
                 timer_id: id,
