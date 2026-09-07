@@ -279,7 +279,7 @@ Since coordinated snapshot instants, a snapshot is something the whole cluster
 takes at one log position **P** on the leader's command
 ([the explainer](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)),
 and the purge floor moves only when the **complete set** at P is on disk.
-Seven families:
+Eight families:
 
 | family | type | labels | meaning |
 |---|---|---|---|

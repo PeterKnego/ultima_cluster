@@ -34,7 +34,7 @@ name: nightly
 #                  tarball — this job keeps it honest between tags.
 #   * fuzz       — M12d: libFuzzer over every decoder that sees bytes it did
 #                  not write (fuzz/README.md's target table), 600 s per
-#                  target, five matrix legs gated by `fuzz-groups` so a new
+#                  target, six matrix legs gated by `fuzz-groups` so a new
 #                  target can never be silently left unfuzzed. Nightly
 #                  toolchain; the fuzz crate is outside the workspace.
 #   * miri       — M12d: UB detection over the PURE decoders only
@@ -356,7 +356,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-          # `shared-key`, not `key`: all five matrix legs build the SAME
+          # `shared-key`, not `key`: all six matrix legs build the SAME
           # sanitizer artifacts, so they share one ~500 MB cache entry instead
           # of writing five and LRU-evicting the other nightly jobs' caches.
           shared-key: fuzz
