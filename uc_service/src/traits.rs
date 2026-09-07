@@ -116,7 +116,10 @@ impl ApplyCtx {
     /// leaves `sched` empty — so a frame never sees a predecessor's requests.
     #[inline(always)]
     pub(crate) fn rebind(&mut self, position: u64, time_ns: u64, term: u32) {
-        debug_assert!(self.sched.is_none(), "rebind with unshipped schedule records");
+        debug_assert!(
+            self.sched.is_none(),
+            "rebind with unshipped schedule records"
+        );
         self.position = position;
         self.time_ns = time_ns;
         self.term = term;

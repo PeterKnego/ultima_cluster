@@ -40,9 +40,11 @@ both in the time-and-timers gate doc and both run under
 `scripts/apply_ab.sh`. Both have a dev-box SMOKE reading (2026-09-07, not a
 gate) and **both miss their bar**: row d −26.8 % against `17d5c6b`, row f
 −2.7 % — bisected to four inline hot-loop additions (the M14a codegen
-lesson, re-learned) and fixed on `perf/apply-arm-slot-out-of-loop` (+16 %
-vs main, still ≈ −15 % vs the baseline; the gate doc's row d entry has the
-ledger). Every bar is pre-committed and no row has a gate result. `docs/how-to/cut-a-release.md` §1's writeup
+lesson, re-learned) and fixed in two passes — four inline arms moved out of line, then the
+loop's four per-frame callees force-inlined after `apply_cycle` outgrew
+LLVM's inlining budget — to **+1.6 % vs `17d5c6b` at N=1** on the box (the
+gate doc's row d entry has the full ledger). Every bar is pre-committed and
+no row has a gate result. `docs/how-to/cut-a-release.md` §1's writeup
 de-scaffolding is deliberately left until those results are in, because the
 release-evidence table needs them. See "Next up" below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
@@ -724,6 +726,22 @@ Two more from M14a's apply-hop isolation (`docs/benchmarks/uc2-m14a-apply-hop-20
   code, measure the harness's build-to-build resolution with a same-source
   rebuild control, and only trust deltas outside it (`scripts/hop1_ab.sh`,
   `docs/benchmarks/uc2-m14c-client-hop-2026-08-28.md`).
+
+One more from the 2.11.0 apply-hop regression (2026-09-07, the time-and-timers
+gate doc's row d ledger):
+
+- **A hot loop's callees fall out of line when the CALLER grows.** Nothing in
+  the frame loop's own arms explained the last 12 % of a 27 % loss: LLVM had
+  stopped inlining the loop's per-frame callees (`FrameIter::next`,
+  `read_header`, `Egress::publish`, `BroadcastProducer::write`) once
+  `apply_cycle` outgrew its inlining budget — each became a GOT-indirect call
+  per frame with its result round-tripping the stack. The per-frame callees
+  are `#[inline(always)]` now, which pins them regardless of caller size. The
+  `apply-profile` rdtsc probes could NOT see this (they read per-frame parity
+  while the plain A/B read −12 %): when the profile and the rate disagree,
+  read the machine code — `objdump -d -C` on the runner's kept
+  `apply_bench.{a,b}` binaries, `readelf -rW` to resolve `call *slot(%rip)`
+  targets, and compare the per-frame path's call list arm against arm.
 
 Harness models: `uc_gateway/examples/hop_bench` (client/edge/node hops),
 `uc_node/examples/apply_bench` (the FSM hop alone), `scripts/hop1_ab.sh`
