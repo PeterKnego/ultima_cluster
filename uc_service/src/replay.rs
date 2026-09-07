@@ -447,14 +447,14 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         // frame it did not pick is either an earlier instant
                         // (superseded) or one it declined for a reason that
                         // has not changed.
-                        let slot = crate::attach::slot(cnc, instant.service_id);
                         on_snapshot_frame(
                             instant.trigger,
                             &guard,
                             pos,
                             &hdr,
                             instant.node_flags,
-                            slot,
+                            cnc,
+                            instant.service_id,
                         );
                     }
                 }

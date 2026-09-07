@@ -625,14 +625,18 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             );
                         }
                     } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT {
-                        let slot = crate::attach::slot(&st.cnc, st.service_id);
+                        // M14a: the arm is the type test and this call, nothing
+                        // else — plan 2's T8 resolved the cnc slot INLINE here
+                        // and the codegen alone cost 2.7 % at N=1 on the apply
+                        // hop (apply_ab.sh, 9b7bcc4 → a64a6ed, 2026-09-07).
                         on_snapshot_frame(
                             &mut st.snapshot_trigger,
                             &sm,
                             pos,
                             &hdr,
                             node_flags,
-                            slot,
+                            &st.cnc,
+                            st.service_id,
                         );
                     }
                     if one_frame {
@@ -807,11 +811,14 @@ pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
     pos: u64,
     hdr: &FrameHeader,
     node_flags: u64,
-    slot: &uc_log::cnc::ServiceSlot,
+    cnc: &uc_log::cnc::CncPage,
+    service_id: u8,
 ) {
     let Some(trig) = trigger.as_mut() else {
         return; // 1. not snapshot-capable
     };
+    // Resolved HERE, out of line, never in the frame loop's body (M14a).
+    let slot = crate::attach::slot(cnc, service_id);
     if hdr.flags & FLAG_SNAPSHOT_STANDBY != 0 && node_flags & NODE_FLAG_LEARNER == 0 {
         return; // 2. a voter on a standby instant
     }
