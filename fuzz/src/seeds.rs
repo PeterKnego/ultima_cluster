@@ -110,7 +110,7 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     seeds.push(Seed::fixed("09-read-probe", datagram(DGRAM_KIND_READ_PROBE, 0, 3, &b)));
 
     // A SNAP_BEGIN LONGER than the fixed part, carrying the retired
-    // `SNAP_BEGIN_LAYOUT_V3` discriminator (cluster-FSM spec §5.6 made the
+    // `SNAP_BEGIN_LAYOUT_V3_RETIRED` discriminator (cluster-FSM spec §5.6 made the
     // body fixed-length; the intermediate 0.7.0 shape appended
     // `config_len ‖ config`). The decoder must still be total on it — it
     // ignores the tail, and the NODE refuses it by its `layout`.
@@ -122,7 +122,7 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
         &mut b,
         &SnapBeginBody {
             session: 7,
-            layout: SNAP_BEGIN_LAYOUT_V3,
+            layout: SNAP_BEGIN_LAYOUT_V3_RETIRED,
             service_id: 0,
             snapshot_pos: 8192,
             total_len: 1 << 20,
