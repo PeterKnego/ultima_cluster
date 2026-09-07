@@ -44,7 +44,11 @@ lesson, re-learned) and fixed in two passes — four inline arms moved out of li
 loop's four per-frame callees force-inlined after `apply_cycle` outgrew
 LLVM's inlining budget — to **+1.6 % vs `17d5c6b` at N=1** on the box (the
 gate doc's row d entry has the full ledger). Every bar is pre-committed and
-no row has a gate result. `docs/how-to/cut-a-release.md` §1's writeup
+no row has a gate result; the harness arms the time-and-timers rows need
+(`m12_gate --timed/--timers-per-sec/--state-bytes/--metrics-listen`,
+`m14_fleet_gate.py --tt-rows`, and the `uc2_timer_lateness_ns` /
+`uc2_consensus_pass_ns` histograms) exist since 2026-09-07 and are
+fleet-untested. `docs/how-to/cut-a-release.md` §1's writeup
 de-scaffolding is deliberately left until those results are in, because the
 release-evidence table needs them. See "Next up" below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each

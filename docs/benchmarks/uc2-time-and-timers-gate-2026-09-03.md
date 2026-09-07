@@ -364,16 +364,45 @@ Numbers to record on the day, before any comparison:
    on the fleet host shape, before running anything else. Rows a, b and e
    compare against that number, not against a fixed percentage. (Rows d and f
    do **not**: they carry their own control arm — step 5.)
-2. Measure the consensus-pass length on the rig under load, and write it into
-   the table above. Row c's bar is `2 ×` it, and row h's standby arm is
-   judged against it.
-3. Run `bench-infra/scripts/m14_fleet_gate.py`'s rows a/b/e against this
-   branch's binaries with `Timed<..>` services and no timers (row a), then
-   again with the 1 000 timers/s arm (rows b and c).
-4. Run row e: apply the 32-entry, 100 ms table with `uc2ctl schedule apply`
-   against the leader, confirm every node's `uc2_schedule_table_position`
-   agrees (`Uc2ScheduleTableDiverged` must not fire) before the measure
-   window opens, then re-run row a's three rows with it live.
+2. The consensus-pass length comes off the leader's `/metrics` during row
+   b's arms — `uc2_consensus_pass_ns` (a histogram the leader fills from the
+   one clock reading it already takes per pass; `_sum / _count` is the mean,
+   `_max` the worst) — and the driver writes it into its `GATE-JSON` for row
+   c. Copy it into the table above.
+3. Rows a, b and c, one invocation (the harness arms exist since 2026-09-07:
+   `m12_gate service --timed --timers-per-sec N`, `m12_gate node
+   --metrics-listen`, and `m14_fleet_gate.py`'s `--tt-rows`; the driver
+   refuses at the door without `--base-tree` + `--resolution-pct`, because
+   the bar IS the A/B against the pre-time-and-timers tree):
+
+   ```bash
+   R=<step 1's resolution, in %>
+   python3 bench-infra/scripts/m14_fleet_gate.py --fleet --rows '' --tt-rows abc \
+       --timed --timers-per-sec 1000 --base-tree <checkout of 17d5c6b> \
+       --resolution-pct "$R" --ab-reps 3
+   ```
+
+   Row a is the head tree (every service `Timed<..>`, no timers) against
+   the base tree on the same four rate arms (`n1 n2eq slow1 pair`),
+   interleaved A/B on fresh clusters; row b re-runs them with FSM 0 as the
+   self-sustaining 1 000 timers/s state machine and sweeps every voter's
+   `uc2_timers_late_total`; row c reads the leader's `uc2_timer_lateness_ns`
+   p99 (the upper bound of the bucket holding it — the ladder is 100 ns …
+   100 ms in 1-2-5 steps, so the answer's resolution is one bucket) against
+   `2 ×` the pass mean, and needs `_count ≥ 10 000`.
+4. Row e (needs row a's head rates in the same process, so it repeats `a`):
+
+   ```bash
+   python3 bench-infra/scripts/m14_fleet_gate.py --fleet --rows '' --tt-rows ae \
+       --timed --schedule-table 32 --base-tree <checkout of 17d5c6b> \
+       --resolution-pct "$R" --ab-reps 3
+   ```
+
+   The driver writes the 32-entry, 100 ms `every` table naming row 0's FSM,
+   applies it on the leader with `uc2ctl schedule apply` before the client
+   starts, and waits for every voter's `uc2_schedule_table_position` to agree
+   (30 s) before the measure window opens; then the four rate arms run with
+   it live, under row b's late == 0 sweep.
 5. Run rows d and f's apply-hop A/Bs with
    [`scripts/apply_ab.sh`](/scripts/apply_ab.sh), which builds and measures
    the control arm itself — that arm IS the bar, so there is nothing to
@@ -416,16 +445,30 @@ Numbers to record on the day, before any comparison:
    arms share the `--harness` overlay and so differ only in the library code
    under it; quote row d only for the rebuild-resolution check itself, and
    note the harness asymmetry as a limitation whenever you do.
-6. Run rows g and h, which **do** need the fleet and are user-gated:
-   - **g**: purge the leader, restart it, and join a fresh learner before its
-     first commit advance, under the row a load; time the convergence and
-     confirm `snapshot_installed` on the joiner. Then check
-     `uc2_snapshot_set_position` agrees cluster-wide.
-   - **h**: deploy the 256 MiB-state `CountSm`, run the row a load, command
-     `uc2ctl snapshot` (all nodes) and record `uc2_snapshot_freeze_seconds_max`
-     plus the longest `commit` stall; then `uc2ctl snapshot --standby` and
-     record both again. `uc2ctl snapshot show` is the diagnostic if an
-     instant does not complete.
+6. Rows g and h, which **do** need the fleet and are user-gated:
+
+   ```bash
+   python3 bench-infra/scripts/m14_fleet_gate.py --fleet --rows '' --tt-rows gh \
+       --timed --k <K from step 3> --state-bytes 268435456 --pass-ns <row c's pass mean>
+   ```
+
+   - **g**: the M14 join arm (a fresh learner joins a purged leader under the
+     row a load) with the LEADER's node unit restarted ~2 s after
+     `add-learner`; the joiner must still converge (`snapshot_installed` in
+     its log) within 60 s, and `uc2_snapshot_set_position` must agree on all
+     four hosts at the end.
+   - **h**: every service carries the 256 MiB ballast; under the row a load
+     the driver commands `uc2ctl snapshot` on the leader, reads the instant
+     P off the leader's `uc2_snapshot_instant_position` (leader-local by
+     ruling P13), waits for every voter's `uc2_snapshot_set_position` to
+     reach P, and records each voter's `uc2_snapshot_freeze_seconds_max`
+     plus the longest commit stall from the client's per-second timeline;
+     then it joins the learner, commands `--standby`, waits on the learner's
+     `uc2_snapshot_standby_instant_position`, and records both again. The
+     timeline is 1 s buckets, so the standby bar (gap ≤ a pass length) reads
+     as "zero stalled buckets"; the all-nodes gap is reported with no bar.
+     `uc2ctl snapshot show` is the diagnostic if an instant does not
+     complete. This arm is ~6 minutes of continuous load; run it last.
 7. Fill in the results table above; do not edit the bar table to match
    whatever the run produced.
 8. Only after this gate, the FSM identity gate, and the maintainer's
