@@ -15,14 +15,16 @@
 //! `fetch` asks THIS voter to pull a learner's complete set store-only: op
 //! 9, `id = learner_id`, and the target position packed into the request's
 //! two free address fields **exactly** the way the node's own
-//! `fetch_position` (`uc_node::node`) unpacks them — pinned equal by this
-//! module's own test: the low 32 bits in `ip`, the next 16 in `port` (`ip =
-//! (p & 0xFFFF_FFFF) as u32`, `port = (p >> 32) as u16`). That is **48
-//! bits**: a `--position` at or above `1 << 48` is refused HERE, by name,
-//! before the request ever reaches the admin band — past that bound the
-//! value would silently truncate to a lower, wrong position rather than
-//! fail loudly. `--position` omitted sends `0`, the wire's own "the
-//! learner's newest complete set" sentinel.
+//! `fetch_position` (`uc_node::fetch_position`, `pub`/`#[doc(hidden)]` since
+//! fix round 1 for exactly this purpose) unpacks them — round-tripped
+//! against the REAL function by this module's own test, not a hand-copied
+//! formula: the low 32 bits in `ip`, the next 16 in `port` (`ip = (p &
+//! 0xFFFF_FFFF) as u32`, `port = (p >> 32) as u16`). That is **48 bits**: a
+//! `--position` at or above `1 << 48` is refused HERE, by name, before the
+//! request ever reaches the admin band — past that bound the value would
+//! silently truncate to a lower, wrong position rather than fail loudly.
+//! `--position` omitted sends `0`, the wire's own "the learner's newest
+//! complete set" sentinel.
 //!
 //! `show` is OFFLINE, like `schedule show`/`settings show` — but unlike
 //! them it does not read the cluster artifact's CONTENT: it opens the cnc
@@ -219,9 +221,11 @@ pub fn show(common: &CommonArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    /// Pinned equal to `uc_node::node::fetch_position`'s unpacking
-    /// (`(ip as u64) | ((port as u64) << 32)`) — the CLI and the node must
-    /// never disagree about which bits mean what.
+    /// Round-trips against the REAL node decoder (fix round 1: `uc_node::
+    /// fetch_position` is `pub`, `#[doc(hidden)]`, exposed for exactly this
+    /// test) rather than a hand-copied formula that could silently drift
+    /// from it — the CLI and the node must never disagree about which bits
+    /// mean what.
     #[test]
     fn encode_fetch_position_round_trips_through_the_nodes_unpacking() {
         for p in [
@@ -233,8 +237,7 @@ mod tests {
             MAX_FETCH_POSITION - 1,
         ] {
             let (ip, port) = encode_fetch_position(p).unwrap();
-            let decoded = (ip as u64) | ((port as u64) << 32);
-            assert_eq!(decoded, p, "round trip for {p}");
+            assert_eq!(uc_node::fetch_position(ip, port), p, "round trip for {p}");
         }
     }
 

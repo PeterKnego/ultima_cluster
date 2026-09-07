@@ -338,6 +338,25 @@ struct SettingsShowArgs {
 // under DIFFERENT Rust names (distinct arg ids) than `CommonArgs`'s, each
 // `#[arg(long = "...")]`-pinned back to the SAME flag text and built into a
 // real `CommonArgs` by `take_common` only when no subcommand was given.
+// `args_conflicts_with_subcommands` is the ONLY way to get clap to accept
+// both `uc2ctl snapshot --instance-dir D --app-id A [--standby]` (this
+// struct's OWN take-only fields below, no subcommand token) and `uc2ctl
+// snapshot show --instance-dir D --app-id A` (`--instance-dir`/`--app-id`
+// AFTER the subcommand word, scoped to `SnapshotShowArgs`'s own `common` — a
+// second, independent copy, two levels down). It has a sharp edge at this
+// nesting depth, confirmed by hand: if this struct flattens `CommonArgs`
+// directly (reusing its field names/ids), clap 4.6's required-arg check for
+// `snapshot show`/`snapshot fetch` mis-fires — it reports `instance_dir`
+// missing even when given AFTER `show`, and renders the ROOT command's
+// usage line, not `snapshot show`'s. The fix is these take-only fields
+// under DIFFERENT Rust names (distinct arg ids) than `CommonArgs`'s, each
+// `#[arg(long = "...")]`-pinned back to the SAME flag text and built into a
+// real `CommonArgs` by `take_common` only when no subcommand was given.
+// Fix round 1: the naive flatten was reintroduced by hand and confirmed to
+// fail `snapshot_fetch_parses_from_position_and_common_args` AND
+// `snapshot_show_parses_common_args` identically ("the following required
+// argument was not provided: instance_dir", `Usage: uc2ctl <COMMAND>`) —
+// see the task report for the recorded line.
 #[derive(clap::Args)]
 #[command(args_conflicts_with_subcommands = true)]
 struct SnapshotArgs {
@@ -1234,6 +1253,117 @@ mod tests {
         assert!(reason_str(48).contains("snapshot_unsupported"));
         assert!(reason_str(49).contains("snapshot_no_learner"));
         assert!(reason_str(50).contains("snapshot_above_durable"));
+    }
+
+    // Fix round 1 (Important): every `uc2ctl snapshot ...` invocation shape
+    // parses to the variant/fields the caller expects. This is exactly the
+    // regression class the `args_conflicts_with_subcommands` id-collision
+    // bug (see `SnapshotArgs`'s doc comment) produces — a shape that
+    // compiles but fails at PARSE time with a confusing "required argument
+    // not provided" error attributed to the wrong command. `fetch` is the
+    // one of the four with no other coverage (the bin test only drives
+    // `take`/`show`); these four cover the whole surface with `Cli::
+    // try_parse_from`, no process spawn needed.
+
+    /// `uc2ctl snapshot --instance-dir D --app-id A` (no subcommand token):
+    /// the default (take) action, `standby` defaults to `false`.
+    #[test]
+    fn snapshot_bare_parses_as_the_default_take_action() {
+        let cli =
+            Cli::try_parse_from(["uc2ctl", "snapshot", "--instance-dir", "d", "--app-id", "a"])
+                .expect("parses");
+        let Cmd::Snapshot(a) = cli.cmd else {
+            panic!("expected Cmd::Snapshot")
+        };
+        assert!(
+            a.cmd.is_none(),
+            "no subcommand token: the default take action"
+        );
+        assert!(!a.standby);
+        assert_eq!(a.take_instance_dir.as_deref(), Some(Path::new("d")));
+        assert_eq!(a.take_app_id.as_deref(), Some("a"));
+    }
+
+    /// `uc2ctl snapshot --standby --instance-dir D --app-id A`: the SAME
+    /// default (take) action, `standby` now `true` — the `--standby`
+    /// instant path spec §5.7 describes.
+    #[test]
+    fn snapshot_standby_parses_as_the_default_take_action_with_standby_true() {
+        let cli = Cli::try_parse_from([
+            "uc2ctl",
+            "snapshot",
+            "--standby",
+            "--instance-dir",
+            "d",
+            "--app-id",
+            "a",
+        ])
+        .expect("parses");
+        let Cmd::Snapshot(a) = cli.cmd else {
+            panic!("expected Cmd::Snapshot")
+        };
+        assert!(a.cmd.is_none());
+        assert!(a.standby);
+        assert_eq!(a.take_instance_dir.as_deref(), Some(Path::new("d")));
+        assert_eq!(a.take_app_id.as_deref(), Some("a"));
+    }
+
+    /// `uc2ctl snapshot fetch --from 3 --position 4096 --instance-dir D
+    /// --app-id A`: the shape the `args_conflicts_with_subcommands`
+    /// id-collision bug hit for `show` (two levels of nested flattened
+    /// `CommonArgs`) — untested until this fix round.
+    #[test]
+    fn snapshot_fetch_parses_from_position_and_common_args() {
+        let cli = Cli::try_parse_from([
+            "uc2ctl",
+            "snapshot",
+            "fetch",
+            "--from",
+            "3",
+            "--position",
+            "4096",
+            "--instance-dir",
+            "d",
+            "--app-id",
+            "a",
+        ])
+        .expect("parses");
+        let Cmd::Snapshot(a) = cli.cmd else {
+            panic!("expected Cmd::Snapshot")
+        };
+        let Some(SnapshotCmd::Fetch(f)) = a.cmd else {
+            panic!("expected SnapshotCmd::Fetch")
+        };
+        assert_eq!(f.from, 3);
+        assert_eq!(f.position, Some(4096));
+        assert_eq!(f.common.instance_dir, PathBuf::from("d"));
+        assert_eq!(f.common.app_id, "a");
+    }
+
+    /// `uc2ctl snapshot show --instance-dir D --app-id A`: the shape that
+    /// actually failed at runtime before the id-collision fix (see
+    /// `SnapshotArgs`'s doc comment) — now a fast parse-only regression
+    /// test alongside the bin test that drives it end to end.
+    #[test]
+    fn snapshot_show_parses_common_args() {
+        let cli = Cli::try_parse_from([
+            "uc2ctl",
+            "snapshot",
+            "show",
+            "--instance-dir",
+            "d",
+            "--app-id",
+            "a",
+        ])
+        .expect("parses");
+        let Cmd::Snapshot(a) = cli.cmd else {
+            panic!("expected Cmd::Snapshot")
+        };
+        let Some(SnapshotCmd::Show(s)) = a.cmd else {
+            panic!("expected SnapshotCmd::Show")
+        };
+        assert_eq!(s.common.instance_dir, PathBuf::from("d"));
+        assert_eq!(s.common.app_id, "a");
     }
 
     #[test]

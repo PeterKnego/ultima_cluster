@@ -77,7 +77,7 @@ pub use node::{
     REASON_SCHEDULE_MISSING, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
     REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING,
     REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED,
-    SnapshotRefusal, StartOpts, SubmitError,
+    SnapshotRefusal, StartOpts, SubmitError, fetch_position,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

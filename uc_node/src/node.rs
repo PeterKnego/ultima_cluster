@@ -9131,7 +9131,14 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 /// missing set rather than served wrongly. `0` means "the learner's newest
 /// complete set" — the default, and the only value `uc2ctl` sends unless
 /// `--position` is given.
-fn fetch_position(ip: u32, port: u16) -> u64 {
+///
+/// `pub`, `#[doc(hidden)]` (fix round 1): not part of this crate's promised
+/// API — exposed solely so `uc_ctl::snapshot`'s own encoder can round-trip
+/// against the REAL decoder in a test (`uc_ctl/src/snapshot.rs`), rather
+/// than pin its own hand-copied formula and risk the two silently drifting
+/// apart.
+#[doc(hidden)]
+pub fn fetch_position(ip: u32, port: u16) -> u64 {
     (ip as u64) | ((port as u64) << 32)
 }
 
