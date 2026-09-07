@@ -251,11 +251,20 @@ impl RowTimers {
 /// against the other ("p99 lateness <= 2 x the measured consensus-pass
 /// length"), which is only meaningful while the two share a scale.
 ///
-/// 10 us at the bottom is below any plausible pass length on the rig; 100 ms
-/// at the top is far above one, so a run whose passes reach the `+Inf`
-/// overflow bucket is telling the operator something (a stalled agent), not
-/// running out of resolution.
-pub const NS_BUCKETS: [u64; 13] = [
+/// 100 ns at the bottom is below any plausible pass length on the rig — an
+/// IDLE leader's pass measured 311 ns mean on a dev box (2026-09-07, the
+/// harness smoke), so a 10 us floor would have put every idle pass in one
+/// bucket and left the quantiles blind; 100 ms at the top is far above any
+/// loaded pass, so a run whose passes reach the `+Inf` overflow bucket is
+/// telling the operator something (a stalled agent), not running out of
+/// resolution.
+pub const NS_BUCKETS: [u64; 19] = [
+    100,
+    200,
+    500,
+    1_000,
+    2_000,
+    5_000,
     10_000,
     20_000,
     50_000,
