@@ -59,11 +59,19 @@ INSTANT_WAIT_SECS = 120.0
 METRICS_PORT_DEFAULT = 9310
 SCRAPE_TIMEOUT_SECS = 5
 
-# The `le` ladder both NEW histogram families are exported with (10 us .. 100 ms,
-# then +Inf). Recorded here so the driver can say, in its own report, which
-# ladder a quantile was read off — `hist_quantile` returns a bucket UPPER
-# BOUND, so the ladder IS the resolution of the answer.
+# The `le` ladder both NEW histogram families are exported with — a mirror of
+# `uc_node::timers::NS_BUCKETS` (100 ns .. 100 ms, then `+Inf`), whose floor
+# dropped from 10 us to 100 ns on 2026-09-07 because an idle leader's pass is
+# ~300 ns and row c's quantiles have to be able to see it.
+#
+# Nothing here READS this constant — `hist_series` takes the bounds off the
+# scrape's own `le` labels, so a further change on the Rust side cannot break
+# the parser. It is recorded so a report can say which ladder a quantile was
+# read off: `hist_quantile` returns a bucket UPPER BOUND, so the ladder IS the
+# resolution of the answer, and a p99 quoted against the old floor would have
+# read `<= 10 us` for every pass on an idle rig.
 LATENESS_BUCKETS = (
+    100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0,
     10_000.0, 20_000.0, 50_000.0, 100_000.0, 200_000.0, 500_000.0,
     1_000_000.0, 2_000_000.0, 5_000_000.0, 10_000_000.0, 20_000_000.0,
     50_000_000.0, 100_000_000.0, float("inf"),
