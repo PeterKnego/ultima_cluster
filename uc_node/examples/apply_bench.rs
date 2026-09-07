@@ -207,9 +207,15 @@ fn main() -> anyhow::Result<()> {
     let frame = align_frame_len(HEADER_LEN + a.payload) as u64;
 
     // ---- the fake node ----
+    // Take a real `InstanceDir` (it creates `journal/` and `state/` and takes
+    // `instance.lock`, which no service ever touches — a service locks only
+    // `service.<id>.lock`) so every IPC path below comes from the SAME
+    // accessors the real node uses. That is what keeps this harness from
+    // drifting off the layout again: `svc_sched.<row>.ring` was added to
+    // `uc_service::attach` and missed here, and the bench died on every start
+    // until 2026-09-07.
     let _ = std::fs::remove_dir_all(&a.root);
-    std::fs::create_dir_all(a.root.join("journal"))?;
-    std::fs::create_dir_all(a.root.join("state"))?;
+    let dir = uc_node::InstanceDir::acquire(&a.root)?;
     let meta = CncMeta {
         node_id: 0,
         instance_id: rand::random::<u128>(),
@@ -221,7 +227,7 @@ fn main() -> anyhow::Result<()> {
         // below finds its row by name.
         services: ServicesConfig::tagged(a.fsms).service_names(),
     };
-    let cnc = CncPage::create_file(&a.root.join("cnc2.dat"), &meta)?;
+    let cnc = CncPage::create_file(&dir.cnc_path(), &meta)?;
     let mask = (1u64 << a.fsms) - 1;
     cnc.store_services_declared(mask);
     cnc.store_fsm_lag_bytes(lag);
@@ -231,22 +237,18 @@ fn main() -> anyhow::Result<()> {
     cnc.status().leader_hint.store_release(0);
     cnc.status().node_heartbeat_ns.store_release(unix_ns());
     let buffer = Arc::new(LogBuffer::create_file(
-        &a.root.join("log.buf"),
+        &dir.log_path(),
         buffer_bytes,
         Arc::clone(&cnc),
         MAX_PAYLOAD as usize,
     )?);
     let mut rings = Vec::new();
     for id in 0..a.fsms {
-        std::fs::create_dir_all(a.root.join("snapshots").join(id.to_string()))?;
-        let q = SpscRing::create(&a.root.join(format!("svc_query.{id}.ring")), MIB, MAX_MSG)
+        std::fs::create_dir_all(dir.snapshot_dir_for(id))?;
+        let q = SpscRing::create(&dir.svc_query_ring_for(id), MIB, MAX_MSG)
             .map_err(|e| anyhow::anyhow!("svc_query ring: {e}"))?;
-        let e = BroadcastRing::create(
-            &a.root.join(format!("egress_service.{id}.broadcast")),
-            4 * MIB,
-            MAX_MSG,
-        )
-        .map_err(|e| anyhow::anyhow!("egress ring: {e}"))?;
+        let e = BroadcastRing::create(&dir.egress_service_for(id), 4 * MIB, MAX_MSG)
+            .map_err(|e| anyhow::anyhow!("egress ring: {e}"))?;
         // The per-row `svc_sched` SPSC (service → node) that log time and
         // timers added: `uc_service::attach` OPENS it, so a fake node that
         // does not create it fails every attach with
@@ -255,7 +257,7 @@ fn main() -> anyhow::Result<()> {
         // The raw counter never schedules a timer, so nothing is ever written
         // and no drain is needed — the consumer half is held only to keep the
         // mapping alive for the run.
-        let s = SpscRing::create(&a.root.join(format!("svc_sched.{id}.ring")), MIB, MAX_MSG)
+        let s = SpscRing::create(&dir.svc_sched_ring_for(id), MIB, MAX_MSG)
             .map_err(|e| anyhow::anyhow!("svc_sched ring: {e}"))?;
         rings.push((q, e, s));
     }
@@ -412,6 +414,7 @@ fn main() -> anyhow::Result<()> {
         s.stop();
     }
     drop(rings);
+    drop(dir); // releases `instance.lock` before the dir goes away
     let _ = std::fs::remove_dir_all(&a.root);
     Ok(())
 }

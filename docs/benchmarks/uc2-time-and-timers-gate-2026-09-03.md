@@ -77,12 +77,15 @@ Both rows run under **[`scripts/apply_ab.sh`](/scripts/apply_ab.sh)**, added
 own temporary `git worktree` with its own private `CARGO_TARGET_DIR`
 (`--locked`), builds the head sha a **third** time into a separate dir as the
 same-source control arm, copies all three binaries out and records their
-`sha256`, then runs them interleaved and reports `head vs base`, `head vs
-head′` (**the resolution**) and a verdict of the first against the second.
-Its `--selftest` pins that arithmetic on fixed inputs; the `APPLY-JSON` line
-it parses is pinned on the Rust side by `uc_node/examples/apply_bench.rs`'s
-`apply_json_line_shape_is_pinned`. The verdict rule is stated in the script's
-header and reproduced under "Reading the rules" below.
+`sha256`, then runs them interleaved and reports `head vs base` against `head
+vs head′` (**the resolution**, which is the only bar) — plus a per-arm
+standard error that decides whether the run can resolve that bar at all, and
+so whether the answer is `within`, `outside`, or `inconclusive (noisy run)`.
+Its `--selftest` pins that arithmetic and all three verdicts on fixed inputs;
+the `APPLY-JSON` line it parses is pinned on the Rust side by
+`uc_node/examples/apply_bench.rs`'s `apply_json_line_shape_is_pinned`. The
+verdict rule is stated in the script's header and reproduced under "Reading
+the rules" below.
 
 **Coverage statement.** This gate measures throughput cost and timer
 precision on a fleet. It is not a substitute for the correctness tier, which
@@ -142,9 +145,9 @@ same two commits read ±0.3 %, and two builds of the *same* commit differed by
 | a | `m14_fleet_gate.py` rows a/b/e with every service wrapped in `Timed<..>` and **no timers scheduled**, steady window, against the same rows on the pre-time-and-timers binary | within the same-source rebuild resolution measured by `scripts/hop1_ab.sh` on the day (record the number first) | not run — release on hold |
 | b | the same three rows with one declared FSM scheduling **1 000 timers/s** sustained through the measure window | throughput within the same resolution as row a; **`uc2_timers_late_total == 0`** on every node after the warm-up window | not run — release on hold |
 | c | timer precision: the distribution of `time_ns − deadline_ns` over **≥ 10 000 on-time fires** under row b's load | **p99 ≤ 2 × the measured consensus-pass length on the rig.** Measure the pass length first, on the day, and write it into the results table before comparing anything to it | not run — release on hold |
-| d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), at N=1 and N=2, bounded lag, under [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) — `scripts/apply_ab.sh 17d5c6b HEAD --fsms 1 --pairs 6`, then `--fsms 2`. This pair straddles the `Appender::new`/`append` arity change, so the `--harness` overlay is NOT available on it: each arm builds the harness its own commit carries, and the two differ in the fake DRIVER, not in the measured apply loop. Say so when quoting the number | within the measured same-source rebuild resolution — the run's own B′ arm (`abs(head_vs_base) ≤ resolution + noise_margin`, the script's rule, reproduced under "Reading the rules") | **not run** — the runner it was missing exists since 2026-09-07; the 2026-09-03 no-runner finding it closes is kept in the Results table below |
+| d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), at N=1 and N=2, bounded lag, under [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) — `scripts/apply_ab.sh 17d5c6b HEAD --fsms 1 --pairs 6`, then `--fsms 2`. This pair straddles the `Appender::new`/`append` arity change, so the `--harness` overlay is NOT available on it: each arm builds the harness its own commit carries, and the two differ in the fake DRIVER, not in the measured apply loop. Say so when quoting the number | within the measured same-source rebuild resolution — the run's own B′ arm (`abs(head_vs_base) ≤ resolution`, the script's rule, reproduced under "Reading the rules"). Before quoting the number, check `driver/min` on **both** arms: this pair's arms differ in the fake driver, so a run in which the driver is the limiter is measuring the driver. The bench paces the driver on the slowest FSM, so `driver/min` reads ≈ 1.000 by construction — what row d must therefore also check is that the two arms' `driver_mean`s agree to within the resolution; if they do not, the row is measuring the driver and the number is not quotable | **not run** — the runner it was missing exists since 2026-09-07; the 2026-09-03 no-runner finding it closes is kept in the Results table below |
 | e | a 32-entry schedule table (`MAX_SCHEDULE_ENTRIES`, the cap) with **100 ms** `every` rules, all on **one** declared FSM, applied with `uc2ctl schedule apply` and left running through row a's three rows | **`uc2_timers_late_total` == 0** on every node after the warm-up window, and throughput within row a's resolution (the same-source rebuild number recorded on the day) | not run — release on hold |
-| f | **commanded instants under the throughput load** (cluster-FSM spec §11): the cost of the one arm coordinated snapshots add to the apply hot loop — the `FRAME_TYPE_SNAPSHOT` type test plus an out-of-line call. `scripts/apply_ab.sh 627eb4e a64a6ed --harness uc_node/examples/apply_bench.rs --pairs 6 --fsms 1`, then `--fsms 2`, bounded lag. `627eb4e` is the last commit before that arm entered the loop; `a64a6ed` is the merge that carries it. `--harness` is **required** on this pair: both arms predate the `svc_sched`-ring harness fix, so each arm's own `apply_bench` cannot run at all — with the overlay every arm runs the identical harness and only the library under it differs | within the run's own rebuild resolution (the B′ arm), at both N | dev-box **SMOKE** run 2026-09-07 at N=1 — see the Results table. Not a gate: a dev box is not a bench, and the fleet arm of this row (N=2, `--pairs 6`) has not been run |
+| f | **commanded instants under the throughput load** (cluster-FSM spec §11): the cost of the one arm coordinated snapshots add to the apply hot loop — the `FRAME_TYPE_SNAPSHOT` type test plus an out-of-line call. `scripts/apply_ab.sh 627eb4e a64a6ed --harness uc_node/examples/apply_bench.rs --pairs 6 --fsms 1`, then `--fsms 2`, bounded lag. `627eb4e` is the last commit before that arm entered the loop; `a64a6ed` is the merge that carries it. `--harness` is **required** on this pair: both arms predate the `svc_sched`-ring harness fix, so each arm's own `apply_bench` cannot run at all — with the overlay every arm runs the identical harness and only the library under it differs | within the run's own rebuild resolution (the B′ arm), at both N | dev-box **SMOKE** run 2026-09-07 at N=1, verdict `inconclusive (noisy run)` — see the Results table. Not a gate, and not a pass: the run's arms were noisier than the resolution they would have been judged against, and the row's own procedure (`--pairs 6`, N=1 **and** N=2) has not been run |
 | g | **a below-floor join with the shipper restarted mid-window** (cluster-FSM spec §11): `uc_node/tests/learner.rs::a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table` scaled to the fleet — purge the leader, restart it, and have a fresh learner join it before its first commit advance, under `m14_fleet_gate.py`'s row a load. Measure time to converge | **≤ 60 s** to converge and `snapshot_installed` observed — matching the [FSM-identity gate's row j](uc2-fsm-identity-gate-2026-09-02.md) | not run — fleet, user-gated |
 | h | **freeze duration vs commit stall** (cluster-FSM spec §11): a `CountSm` with a deliberately large state — a `Vec<u8>` of 256 MiB the FSM carries — under `m14_fleet_gate.py`'s row a load. Command an all-nodes instant and record `uc2_snapshot_freeze_seconds_max` and the longest gap in `commit` advance during it; then a `--standby` instant and record both again | the **standby** instant's commit gap is **≤ the pass length measured on the day** — i.e. no stall attributable to the instant. The **all-nodes** instant's gap is **reported, no bar**: it is the number this row exists to produce | not run — fleet, user-gated |
 
@@ -221,21 +224,40 @@ runs each, and computes, on the per-arm means of `apply_bench`'s `min_rate`
 (the slowest FSM's applied frames/s):
 
 ```text
-spread(X)     = (max(X) - min(X)) / mean(X) * 100
-head_vs_base  = (mean(B)  - mean(A)) / mean(A) * 100      the candidate
-resolution    = |mean(B') - mean(B)| / mean(B) * 100      the control
-noise_margin  = max(spread(A), spread(B), spread(B')) / 2
-verdict       = within  iff |head_vs_base| <= resolution + noise_margin
+head_vs_base = (mean(B)  - mean(A)) / mean(A) * 100      the candidate
+resolution   = |mean(B') - mean(B)| / mean(B) * 100      the bar
+sem(X)       = stdev(X) / (mean(X) * sqrt(K)) * 100      run quality, per arm
+
+if K < 2 or max(sem(A), sem(B), sem(B')) > resolution:
+    verdict = inconclusive (noisy run)
+elif |head_vs_base| <= resolution:  verdict = within resolution
+else:                               verdict = outside resolution
 ```
 
+**The rebuild resolution is the only bar, and run noise never widens it.**
 `resolution` is build noise: B and B′ are the same source, so whatever
-separates them is not semantics. `noise_margin` is half the widest within-arm
-run-to-run spread — the part of a K-run mean the box's own noise leaves
-unresolved. The sum is deliberately conservative; it can only *under*-claim a
-regression, which is the right way for a smoke runner to be wrong.
+separates them is not semantics — that is M14b's rule exactly. Rows d and f
+are **null** bars ("the added code is free"), so anything added to the
+right-hand side would only make it easier to bless a real regression, which
+is the wrong direction to be wrong in.
+
+Noise is a **separate gate whose answer is "no answer"**. `sem` is the
+standard error of the arm's *mean* — the quantity the verdict actually
+compares — and unlike a min/max spread it shrinks as `1/√K`, so `--pairs` is
+a real remedy rather than a knob that cannot move the number. A run whose
+arms are noisier than the resolution they are being judged against is
+reported `inconclusive (noisy run)` and claims neither "within" nor
+"outside". `--selftest` pins the arithmetic and all **three** verdicts on
+fixed inputs, with no cargo and no git.
+
 "outside resolution" is an instruction to measure the hop on the fleet, never
-a claim that the code regressed by that percentage. `--selftest` pins this
-arithmetic and both verdicts on fixed inputs, with no cargo and no git.
+a claim that the code regressed by that percentage.
+
+The runner also prints `/proc/loadavg`'s 1-minute figure and a count of other
+`cargo`/`rustc` processes into both the run header and its `AB-JSON` line,
+and warns (it does not refuse) when the load exceeds 1.0 or another build is
+running. A busy box does not bias an arm — the interleave sees to that — but
+it inflates every arm's `sem`, which is what turns a run inconclusive.
 
 **Rows d and f differ in one thing worth stating: whether the harness is
 identical across arms.** Row f's pair is inside the window in which
@@ -302,7 +324,7 @@ arm is still unrun.
 | c | not run — release on hold |
 | d | not run — release on hold. **History, kept because it is what the bar was written against:** on 2026-09-03 this row read *"not run: no runner"* — `scripts/hop1_ab.sh` drives `hop_bench`'s `dummy-node`/`engine-load` subcommands, which `apply_bench` does not have, and both invocations were refused with `error: unexpected argument 'dummy-node' found` / `'engine-load' found` (checked on `f59a0b5`, release build). That finding is **closed** by [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) (2026-09-07). Closing it turned up a second, deeper reason the row could not have run: `apply_bench` itself died on every start with `ring error: io: No such file or directory`, because `uc_service::attach` opens a per-row `svc_sched.<row>.ring` that log-time-and-timers added and the fake node never created — fixed in the same commit as the `APPLY-JSON` pin. Neither was a hold decision and neither was a measurement. |
 | e | not run — release on hold |
-| f | **dev-box SMOKE, not a gate** — run `20260907T065532Z-627eb4e-a64a6ed`, N=1 bounded, `--pairs 3 --secs 3`, harness overlay on, box otherwise idle (load 0.11 at start). **head vs base −0.242 %**, against a **resolution of 0.048 %** (B vs B′) and a **noise margin of 0.361 %** (widest within-arm spread 0.72 %, arm B′) → **within resolution**. Arm means, `min_rate` applied frames/s: A 15 925 292, B 15 886 806, B′ 15 879 179. Provenance — binaries `sha256` A `3ec16b16c5f37c884c4e4b70508cdcc1deb9eed9bc134c1e86033f1424708315`, B `a7af9ad309489c28518f108d14493a546ba322b554217d1caa734c993f4661af`, B′ `eb0f6ee5cc8aad6b4c0261838a2ad51a0ff98362743cd2b4b7b1c360bbeda42d`; harness `f2f495874b491e306a747e3c59e9bbda0ec570c505c3fda8349724a890917f1c`. Read it for what it is: three runs per arm on a dev box, whose noise margin is 7 × the resolution it is meant to police. The row's own procedure (`--pairs 6`, N=1 **and** N=2) has not been run. |
+| f | **dev-box SMOKE, and under the Q8 rule it is INCONCLUSIVE** — run `20260907T065532Z-627eb4e-a64a6ed`, N=1 bounded, `--pairs 3 --secs 3`, harness overlay on, box otherwise idle (load 0.11 at start). Arm means, `min_rate` applied frames/s: A 15 925 292 (sem **0.028 %**), B 15 886 806 (sem **0.164 %**), B′ 15 879 179 (sem **0.209 %**). **head vs base −0.242 %**; **resolution 0.048 %**; **worst arm sem 0.209 %**. The worst arm is 4.3 × noisier than the resolution it would be judged against, so the run resolves neither “within” nor “outside”: **`inconclusive (noisy run)`**. (Under the pre-Q8 rule this read “within resolution” against a 0.361 % noise margin — that margin is exactly what Q8 removed, because widening a null bar with noise blesses regressions.) `driver/min` is **1.000** on every arm: the bench paces its driver on the slowest FSM, so the two rates are equal by construction and `driver_mean` must be compared arm-to-arm rather than against `min_rate`. Provenance — binaries `sha256` A `3ec16b16c5f37c884c4e4b70508cdcc1deb9eed9bc134c1e86033f1424708315`, B `a7af9ad309489c28518f108d14493a546ba322b554217d1caa734c993f4661af`, B′ `eb0f6ee5cc8aad6b4c0261838a2ad51a0ff98362743cd2b4b7b1c360bbeda42d`; harness `f2f495874b491e306a747e3c59e9bbda0ec570c505c3fda8349724a890917f1c`. What would make it conclusive is the row's committed procedure — `--pairs 6`, N=1 **and** N=2, on an idle box; at this box's observed arm-to-arm variance that is ~57 pairs, so the honest reading is that a 0.048 % resolution is below what this dev box can resolve at all and the row belongs on quieter hardware. |
 | g | not run — fleet, user-gated |
 | h | not run — fleet, user-gated |
 
@@ -313,7 +335,7 @@ Numbers to record on the day, before any comparison:
 | `scripts/hop1_ab.sh` same-source rebuild resolution, on the rig (rows a, b, e) | not measured |
 | consensus-pass length on the rig, under row b's load (rows c and h) | not measured |
 | `scripts/apply_ab.sh` B′ resolution, row d's run | not measured |
-| `scripts/apply_ab.sh` B′ resolution, row f's run | not measured on the rig; **0.048 %** on the dev box, run `20260907T065532Z-627eb4e-a64a6ed` (smoke) |
+| `scripts/apply_ab.sh` B′ resolution, row f's run | not measured on the rig; **0.048 %** on the dev box, run `20260907T065532Z-627eb4e-a64a6ed` (smoke) — but the worst arm's standard error on that run was **0.209 %**, so the run could not resolve its own bar and the verdict is `inconclusive (noisy run)` |
 
 ## When this gate is run
 
@@ -352,7 +374,15 @@ Numbers to record on the day, before any comparison:
    straddles the `Appender::new` arity change). Record the run id, the three
    binary `sha256`s and, for row f, the harness `sha256` beside every number.
    These two rows do not need fleet spend — `apply_bench` isolates the FSM
-   hop on one host — but they do need an idle host.
+   hop on one host — but they do need an idle host, and the runner will say
+   so: a verdict of `inconclusive (noisy run)` is **not** a pass and not a
+   fail, it means the host could not resolve the bar. Raise `--pairs` or move
+   to a quieter host and run it again; do not record an inconclusive run as
+   either outcome. For row d, also check that the two arms' `driver_mean`s
+   agree to within the resolution before quoting `min_rate` — its arms differ
+   in the fake driver, and the bench paces that driver on the slowest FSM
+   (`driver/min` reads ≈ 1.000 by construction), so a driver-side difference
+   would land straight in the number.
 6. Run rows g and h, which **do** need the fleet and are user-gated:
    - **g**: purge the leader, restart it, and join a fresh learner before its
      first commit advance, under the row a load; time the convergence and

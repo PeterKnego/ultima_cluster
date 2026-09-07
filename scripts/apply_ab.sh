@@ -27,22 +27,35 @@
 # So a candidate delta means nothing until you know what two builds of one
 # source measure apart. That is arm B′ here, and it is the bar.
 #
-# THE VERDICT RULE (pinned by --selftest; quote it whenever you quote a run):
+# THE VERDICT RULE (pinned by --selftest; quote it whenever you quote a run).
+# The rebuild resolution is the ONLY bar. Run noise is a SEPARATE gate on
+# whether the run is worth reading at all — it never widens the bar.
 #
-#   spread(X)      = (max(X) - min(X)) / mean(X) * 100        [per arm, %]
-#   head_vs_base   = (mean(B)  - mean(A)) / mean(A)  * 100    [the candidate]
-#   resolution     = |mean(B') - mean(B)| / mean(B)  * 100    [the control]
-#   noise_margin   = max(spread(A), spread(B), spread(B')) / 2
-#   verdict        = "within resolution"  if |head_vs_base| <= resolution + noise_margin
-#                    "outside resolution" otherwise
+#   head_vs_base = (mean(B)  - mean(A)) / mean(A) * 100   [the candidate]
+#   resolution   = |mean(B') - mean(B)| / mean(B) * 100   [the bar]
+#   sem(X)       = stdev(X) / (mean(X) * sqrt(K)) * 100   [per arm, %]
 #
-# `resolution` is build noise: B and B′ are the same source, so whatever
-# separates them is not semantics. `noise_margin` is half the widest
-# within-arm run-to-run spread — the part of a K-run mean the box's own noise
-# leaves unresolved. The sum is deliberately CONSERVATIVE: it can only
-# under-claim a regression, which is the right way for a smoke runner to be
-# wrong. "outside resolution" means "measure this on the fleet", never "this
-# is a X % regression".
+#   if K < 2 or max(sem(A), sem(B), sem(B')) > resolution:
+#       verdict = "inconclusive (noisy run)"
+#   elif |head_vs_base| <= resolution:  verdict = "within resolution"
+#   else:                               verdict = "outside resolution"
+#
+# WHY IT IS SHAPED THIS WAY. Rows d and f are NULL bars — the claim under
+# test is "the added code is free". Anything ADDED to the right-hand side
+# therefore makes it EASIER to bless a real regression, which is the wrong
+# direction to be wrong in for a null bar. So the bar is exactly the M14b
+# rule: a candidate delta counts only if it is bigger than what two builds of
+# ONE source measure apart.
+#
+# Noise is handled by refusing to answer instead. `sem` is the standard error
+# of the arm's MEAN, which is the quantity the verdict compares — and unlike a
+# min/max spread it SHRINKS as 1/sqrt(K), so `--pairs` is a real remedy: a run
+# whose arms are noisier than the resolution they are being judged against is
+# reported "inconclusive (noisy run)", with the remedy printed. Neither
+# "within" nor "outside" is claimed from a run that cannot resolve either.
+#
+# "outside resolution" means "measure this hop on the fleet", never "this is
+# a X % regression".
 #
 # BUILD DISCIPLINE (required, see CLAUDE.md "Benchmarking discipline"):
 # ~/.cache/cargo-target is shared by the main checkout and every worktree, so
@@ -206,30 +219,34 @@ print("selftest ok: %s -> %s" % (sys.argv[2], got["verdict"]))
 
 if [ "$SELFTEST" -eq 1 ]; then
     echo "== apply_ab.sh --selftest (no cargo, no git) =="
-    # Case 1 — a null candidate inside build noise.
-    #   A  1000000,1020000 -> mean 1010000  spread 1.980198…
-    #   B  1005000,1015000 -> mean 1010000  spread 0.990099…
-    #   B' 1000000,1010000 -> mean 1005000  spread 0.995025…
-    #   head_vs_base 0.0 ; resolution 0.495050 ; margin 0.990099 -> within
+    # Case 1 — a candidate inside the rebuild resolution, arms quiet.
+    #   A 1000000 x2 ; B 1002000 x2 ; B' 1005000 x2, every sem 0
+    #   head_vs_base +0.200 ; resolution 0.299401 -> within
     selftest_case within \
-        '{"a_mean":1010000.0,"b_mean":1010000.0,"bp_mean":1005000.0,
-          "a_spread_pct":1.9801980198019802,"b_spread_pct":0.9900990099009901,
-          "bp_spread_pct":0.9950248756218906,
-          "head_vs_base_pct":0.0,"resolution_pct":0.4950495049504951,
-          "noise_margin_pct":0.9900990099009901,"verdict":"within resolution",
-          "runs_per_arm":2}' \
-        1000000 1020000  1005000 1015000  1000000 1010000
+        '{"a_mean":1000000.0,"b_mean":1002000.0,"bp_mean":1005000.0,
+          "a_sem_pct":0.0,"b_sem_pct":0.0,"bp_sem_pct":0.0,
+          "head_vs_base_pct":0.2,"resolution_pct":0.2994011976047904,
+          "verdict":"within resolution","runs_per_arm":2}' \
+        1000000 1000000  1002000 1002000  1005000 1005000
     # Case 2 — a candidate an order of magnitude outside a tight control.
-    #   A 1000000 ; B 900000 ; B' 901000, all spreads 0
-    #   head_vs_base -10.0 ; resolution 0.111111 ; margin 0.0 -> outside
+    #   A 1000000 ; B 900000 ; B' 901000, every sem 0
+    #   head_vs_base -10.0 ; resolution 0.111111 -> outside
     selftest_case outside \
         '{"a_mean":1000000.0,"b_mean":900000.0,"bp_mean":901000.0,
-          "a_spread_pct":0.0,"b_spread_pct":0.0,"bp_spread_pct":0.0,
+          "a_sem_pct":0.0,"b_sem_pct":0.0,"bp_sem_pct":0.0,
           "head_vs_base_pct":-10.0,"resolution_pct":0.1111111111111111,
-          "noise_margin_pct":0.0,"verdict":"outside resolution",
-          "runs_per_arm":2}' \
+          "verdict":"outside resolution","runs_per_arm":2}' \
         1000000 1000000  900000 900000  901000 901000
-    echo "== selftest PASSED (both cases)"
+    # Case 3 — a null candidate the run cannot resolve: arm A's standard
+    #   error of the mean (1.960784 %) is twenty times the resolution
+    #   (0.098039 %), so neither "within" nor "outside" is claimed.
+    selftest_case inconclusive \
+        '{"a_mean":1020000.0,"b_mean":1020000.0,"bp_mean":1021000.0,
+          "a_sem_pct":1.9607843137254901,"b_sem_pct":0.0,"bp_sem_pct":0.0,
+          "head_vs_base_pct":0.0,"resolution_pct":0.09803921568627451,
+          "verdict":"inconclusive (noisy run)","runs_per_arm":2}' \
+        1000000 1040000  1020000 1020000  1021000 1021000
+    echo "== selftest PASSED (all three verdicts)"
     exit 0
 fi
 
@@ -284,7 +301,15 @@ build_arm() { # $1 = arm label (a|b|bp), $2 = sha, $3 = target-dir suffix
         cargo build --release --locked -p uc_node --example apply_bench >&2 )
     cp "$target/release/examples/apply_bench" "$RUN_DIR/apply_bench.$arm"
     git -C "$REPO" worktree remove --force "$wt"
-    WORKTREES=("${WORKTREES[@]/$wt}")
+    # Drop it from the cleanup list BY INDEX. `${WORKTREES[@]/$wt}` would
+    # substring-replace inside every element and leave an empty one behind,
+    # which the EXIT trap would then try to `worktree remove`.
+    local i
+    for i in "${!WORKTREES[@]}"; do
+        if [ "${WORKTREES[i]}" = "$wt" ]; then
+            unset 'WORKTREES[i]'
+        fi
+    done
 }
 
 if [ "$PREBUILT" -eq 0 ]; then
@@ -332,6 +357,28 @@ echo "   sha256 A  $(sha256sum "$BIN_A" | cut -d' ' -f1)"
 echo "   sha256 B  $(sha256sum "$BIN_B" | cut -d' ' -f1)"
 echo "   sha256 B' $(sha256sum "$BIN_BP" | cut -d' ' -f1)"
 
+# ---- idle-box guard (warn, never refuse) --------------------------------
+# A busy box does not bias one arm — the interleave sees to that — but it
+# inflates every arm's standard error, and an arm noisier than the resolution
+# makes the whole run "inconclusive". Cheaper to know before the run than
+# after it. `pgrep -c` prints 0 and exits 1 when nothing matches.
+LOAD1="$(cut -d' ' -f1 /proc/loadavg)"
+N_CARGO="$(pgrep -xc cargo 2>/dev/null)" || N_CARGO=0
+N_RUSTC="$(pgrep -xc rustc 2>/dev/null)" || N_RUSTC=0
+OTHER_BUILDS=$((N_CARGO + N_RUSTC))
+BOX_BUSY=0
+if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 1.0 else 1)' "$LOAD1"; then
+    BOX_BUSY=1
+fi
+[ "$OTHER_BUILDS" -eq 0 ] || BOX_BUSY=1
+echo "   box: /proc/loadavg 1-min $LOAD1, other cargo/rustc $OTHER_BUILDS"
+if [ "$BOX_BUSY" -eq 1 ]; then
+    echo "   *** WARNING: the box is not idle (load > 1.0 and/or another build is"
+    echo "   *** running). Measuring anyway — but expect a wide standard error and"
+    echo "   *** an 'inconclusive (noisy run)' verdict. CLAUDE.md: a dev box is"
+    echo "   *** noisy whatever its size."
+fi
+
 # ------------------------------------------------------------- the measures --
 run_one() { # $1 = arm label, $2 = binary, $3 = rep number
     local arm="$1" bin="$2" rep="$3" out line
@@ -365,45 +412,86 @@ for rep in $(seq 1 "$PAIRS"); do
 done
 
 # ---------------------------------------------------------------- the verdict --
-python3 - "$TSV" <<'PY'
-import json, sys
+python3 - "$TSV" "$LOAD1" "$OTHER_BUILDS" <<'PY'
+import json, math, sys
 
 rows = {"A": [], "B": [], "Bp": []}
 for line in open(sys.argv[1]):
-    arm, rate, _driver = line.split("\t")
-    rows[arm].append(float(rate))
+    arm, rate, driver = line.split("\t")
+    rows[arm].append((float(rate), float(driver)))
+load1, other_builds = float(sys.argv[2]), int(sys.argv[3])
+
 
 def stats(v):
-    s = sorted(v)
-    mean = sum(s) / len(s)
-    # p50: the middle element of the sorted list (the UPPER median for an
-    # even n) — hop1_ab.sh's convention, kept so the two runners read alike.
+    r = sorted(x[0] for x in v)
+    d = [x[1] for x in v]
+    n = len(r)
+    mean = sum(r) / n
+    # Standard error of the MEAN, in percent of the mean. This — not a
+    # min/max spread — is the run-quality number, because the mean is what
+    # the verdict compares and because it shrinks as 1/sqrt(n), so --pairs
+    # is a real remedy. n < 2 has no spread estimate at all.
+    if n < 2:
+        sem_pct = float("inf")
+    else:
+        var = sum((x - mean) ** 2 for x in r) / (n - 1)
+        sem_pct = math.sqrt(var) / (mean * math.sqrt(n)) * 100.0
     return {
-        "n": len(s), "mean": mean, "p50": s[len(s) // 2],
-        "min": s[0], "max": s[-1],
-        "spread_pct": (s[-1] - s[0]) / mean * 100.0,
+        "n": n, "mean": mean,
+        # p50: the middle element of the sorted list (the UPPER median for an
+        # even n) — hop1_ab.sh's convention, kept so the two runners read alike.
+        "p50": r[n // 2], "min": r[0], "max": r[-1],
+        "spread_pct": (r[-1] - r[0]) / mean * 100.0,
+        "sem_pct": sem_pct,
+        "driver_mean": sum(d) / n,
+        "driver_over_min": (sum(d) / n) / mean,
     }
+
 
 st = {k: stats(v) for k, v in rows.items()}
 head_vs_base = (st["B"]["mean"] - st["A"]["mean"]) / st["A"]["mean"] * 100.0
 resolution = abs(st["Bp"]["mean"] - st["B"]["mean"]) / st["B"]["mean"] * 100.0
-noise_margin = max(st[k]["spread_pct"] for k in ("A", "B", "Bp")) / 2.0
-verdict = ("within resolution"
-           if abs(head_vs_base) <= resolution + noise_margin
-           else "outside resolution")
+worst_sem = max(st[k]["sem_pct"] for k in ("A", "B", "Bp"))
+
+# The rebuild resolution is the ONLY bar (these are NULL bars: adding noise to
+# the right-hand side would only make it easier to bless a real regression).
+# Noise gets its own gate, and its answer is "no answer".
+if worst_sem > resolution:
+    verdict = "inconclusive (noisy run)"
+elif abs(head_vs_base) <= resolution:
+    verdict = "within resolution"
+else:
+    verdict = "outside resolution"
 
 print("\n== summary (SMOKE — a ratio against a control arm, not a gate)")
 for k, label in (("A", "A  base      "), ("B", "B  head      "),
                  ("Bp", "B' head-again")):
     s = st[k]
-    print("   %s  n=%d  mean %12.0f  p50 %12.0f  min %12.0f  max %12.0f  spread %5.2f %%"
-          % (label, s["n"], s["mean"], s["p50"], s["min"], s["max"], s["spread_pct"]))
+    print("   %s  n=%d  mean %12.0f  p50 %12.0f  min %12.0f  max %12.0f  "
+          "spread %5.2f %%  sem %6.3f %%"
+          % (label, s["n"], s["mean"], s["p50"], s["min"], s["max"],
+             s["spread_pct"], s["sem_pct"]))
+    print("                 driver mean %12.0f  driver/min %.3f"
+          % (s["driver_mean"], s["driver_over_min"]))
+print("   box: loadavg 1-min %.2f, other cargo/rustc %d" % (load1, other_builds))
 print("   head vs base     %+7.3f %%   (the candidate)" % head_vs_base)
-print("   head vs head'    %7.3f %%   (the RESOLUTION — build noise alone)" % resolution)
-print("   noise margin     %7.3f %%   (widest within-arm spread / 2)" % noise_margin)
-print("   verdict: %s  (|%.3f| %s %.3f + %.3f)"
-      % (verdict, head_vs_base,
-         "<=" if verdict == "within resolution" else ">", resolution, noise_margin))
+print("   head vs head'    %7.3f %%   (the RESOLUTION — the bar, build noise alone)"
+      % resolution)
+print("   worst arm sem    %7.3f %%   (run quality; must be <= the resolution)"
+      % worst_sem)
+if verdict == "inconclusive (noisy run)":
+    print("   verdict: %s" % verdict)
+    print("          the arms are noisier (%.3f %%) than the resolution they are"
+          % worst_sem)
+    print("          judged against (%.3f %%), so NEITHER 'within' nor 'outside'"
+          % resolution)
+    print("          is claimed. Remedy: a quieter box, or more --pairs (sem")
+    print("          shrinks as 1/sqrt(K); %d more pairs would roughly halve it)."
+          % (3 * st["A"]["n"]))
+else:
+    print("   verdict: %s  (|%.3f| %s %.3f)"
+          % (verdict, head_vs_base,
+             "<=" if verdict == "within resolution" else ">", resolution))
 print("   (dev-box smoke. 'outside resolution' means MEASURE IT ON THE FLEET,")
 print("    never 'this is a regression of that size'.)")
 print("AB-JSON " + json.dumps({
@@ -412,9 +500,17 @@ print("AB-JSON " + json.dumps({
     "a_p50": st["A"]["p50"], "b_p50": st["B"]["p50"], "bp_p50": st["Bp"]["p50"],
     "a_spread_pct": st["A"]["spread_pct"], "b_spread_pct": st["B"]["spread_pct"],
     "bp_spread_pct": st["Bp"]["spread_pct"],
+    "a_sem_pct": st["A"]["sem_pct"], "b_sem_pct": st["B"]["sem_pct"],
+    "bp_sem_pct": st["Bp"]["sem_pct"],
+    "a_driver_mean": st["A"]["driver_mean"], "b_driver_mean": st["B"]["driver_mean"],
+    "bp_driver_mean": st["Bp"]["driver_mean"],
+    "a_driver_over_min": st["A"]["driver_over_min"],
+    "b_driver_over_min": st["B"]["driver_over_min"],
+    "bp_driver_over_min": st["Bp"]["driver_over_min"],
+    "load1": load1, "other_builds": other_builds,
     "head_vs_base_pct": head_vs_base,
     "resolution_pct": resolution,
-    "noise_margin_pct": noise_margin,
+    "worst_sem_pct": worst_sem,
     "verdict": verdict,
 }))
 PY
