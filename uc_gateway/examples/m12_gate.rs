@@ -15,9 +15,11 @@
 //! # bench-infra/scripts/m12_fleet_gate.py (gate rows 2 and 3) and M14d's driver
 //! m12_gate node          --id N --bind A --instance-dir D --members id@addr,… [--admission-kib K] \
 //!                         [--services 0,1] [--fsm-lag lockstep|BYTES] [--purge-below-snapshot] \
-//!                         [--journal-segment-bytes N] [--snapshot-interval-bytes N]
+//!                         [--journal-segment-bytes N] [--snapshot-interval-bytes N] \
+//!                         [--metrics-listen ADDR]
 //! m12_gate service       --instance-dir D [--envelope on|off] \
-//!                         [--fsm count|spin|raw|fsm<N>] [--work-spin K] [--snapshot-interval-bytes N]
+//!                         [--fsm count|spin|raw|fsm<N>] [--work-spin K] [--snapshot-interval-bytes N] \
+//!                         [--timed] [--timers-per-sec N] [--state-bytes N]
 //! m12_gate edge          --instance-dir D --listen A --members id@gw_addr,… [--envelope on|off] [--inflight N]
 //! m12_gate client-direct --instance-dir D --secs S [--payload P] [--inflight N] [--envelope on|off] \
 //!                         [--fan-in] [--warmup-secs S] [--measure-secs S] [--timeline]
@@ -87,6 +89,7 @@ use uc_remote::{
 use uc_service::{
     ApplyCtx, RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig,
     SessionConfig, Sessioned, SnapshotError, SnapshotStateMachine, StateMachine, TAG_FRESH,
+    TimerEvent,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -215,6 +218,16 @@ struct NodeArgs {
     /// changes the experiment behind a published bar.
     #[arg(long, default_value_t = DEFAULT_SNAPSHOT_INTERVAL_BYTES)]
     snapshot_interval_bytes: u64,
+    /// Time-and-timers gate rows b/c/e/h: serve this node's `/metrics`,
+    /// `/healthz` and `/readyz` on `ADDR` for the duration of the run — the
+    /// same `ObsServer` the `uc2-node` daemon starts from `[metrics] bind`.
+    /// Absent = no endpoint at all (this example's pre-branch behaviour), so
+    /// no row that does not scrape pays for one.
+    ///
+    /// Port `0` is honoured: the printed line reports the address actually
+    /// bound, so a driver can read it back rather than guessing.
+    #[arg(long)]
+    metrics_listen: Option<SocketAddr>,
 }
 
 #[derive(clap::Args)]
@@ -255,6 +268,34 @@ struct ServiceArgs {
     /// wires the command.
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
+    /// Time-and-timers gate row a: wrap the state machine in
+    /// [`uc_service::Timed`], the exactly-once timer-delivery wrapper. With
+    /// `--envelope on` the stack is `Timed<Sessioned<X>>` (`Timed` OUTSIDE,
+    /// so it sees the timer requests the inner SM makes); with `off` it is
+    /// `Timed<X>`. Row a runs every service wrapped and NO timers scheduled,
+    /// which is what makes it a measurement of the wrapper alone.
+    ///
+    /// Refused with `--fsm raw`: `RawCountSm` is not a `SnapshotStateMachine`
+    /// and the raw arms deliberately keep the plain `start()` path.
+    #[arg(long, default_value_t = false)]
+    timed: bool,
+    /// Time-and-timers gate row b: run [`TimerLoadSm`] in place of
+    /// [`CountSm`] — same identity, same counting, plus `N` self-sustaining
+    /// timers per second. `0` (the default) keeps `CountSm`.
+    ///
+    /// Only valid with `--fsm count`, and REQUIRES `--timed`: the node layer
+    /// is at-least-once (an in-flight instance is re-delivered by the next
+    /// leader), so without `Timed`'s pending set a failover double-fires and
+    /// the row measures a different thing than it claims to.
+    #[arg(long, default_value_t = 0)]
+    timers_per_sec: u64,
+    /// Time-and-timers gate row h: give the state machine a ballast
+    /// `Vec<u8>` of this many bytes, so `freeze()` has something real to copy
+    /// (row h's whole point is how long a freeze takes and what it does to
+    /// commit). `0` (the default) leaves the snapshot format byte-identical
+    /// to every prior arm's. Row h uses 268435456 (256 MiB).
+    #[arg(long, default_value_t = 0)]
+    state_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -474,6 +515,42 @@ fn default_root() -> PathBuf {
 struct CountSm {
     count: u64,
     last_applied: Option<u64>,
+    /// Time-and-timers gate row h (`--state-bytes`): dead weight the FSM
+    /// carries so `freeze()` has something real to copy. EMPTY by default, in
+    /// which case every byte of the snapshot format below is what it was
+    /// before this flag existed.
+    ballast: Vec<u8>,
+}
+
+/// Fill pattern for the row-h ballast: a fixed, position-independent byte
+/// sequence, so the bytes are deterministic (an SM's state must be) and not
+/// trivially compressible by anything in the path.
+fn ballast_of(len: u64) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+impl CountSm {
+    fn with_state_bytes(state_bytes: u64) -> CountSm {
+        CountSm {
+            ballast: ballast_of(state_bytes),
+            ..CountSm::default()
+        }
+    }
+}
+
+/// Shared by [`CountSm`] and [`TimerLoadSm`]: split an installed artifact's
+/// trailing ballast off after `head` fixed bytes and check its LENGTH against
+/// what this SM was configured to carry. The bytes themselves are not
+/// re-derived — the check is that a 256 MiB row really shipped and received
+/// 256 MiB, which is what row h is measuring.
+fn take_ballast(buf: &[u8], head: usize, want: usize) -> Result<Vec<u8>, SnapshotError> {
+    let got = buf.len() - head;
+    if got != want {
+        return Err(SnapshotError::Codec(format!(
+            "snapshot carries {got} ballast bytes, this service was built for {want}              (--state-bytes must match cluster-wide)"
+        )));
+    }
+    Ok(buf[head..].to_vec())
 }
 
 impl StateMachine for CountSm {
@@ -507,9 +584,12 @@ impl SnapshotStateMachine for CountSm {
 
     fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
         let pos = self.last_applied.unwrap_or(0);
-        let mut buf = Vec::with_capacity(16);
+        let mut buf = Vec::with_capacity(16 + self.ballast.len());
         buf.extend_from_slice(&self.count.to_le_bytes());
         buf.extend_from_slice(&pos.to_le_bytes());
+        // Row h: the COPY is the cost this row exists to measure, so the
+        // handle really carries the bytes rather than borrowing them.
+        buf.extend_from_slice(&self.ballast);
         Ok((buf, pos))
     }
 
@@ -543,6 +623,7 @@ impl SnapshotStateMachine for CountSm {
                 "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
+        self.ballast = take_ballast(&buf, 16, self.ballast.len())?;
         self.count = count;
         self.last_applied = Some(pos);
         Ok(position)
@@ -561,8 +642,14 @@ struct SpinCountSm {
 
 impl SpinCountSm {
     fn with_spin(spin: u64) -> Self {
+        Self::with_spin_and_state(spin, 0)
+    }
+    /// Row h's variant: the same priced apply, plus the ballast
+    /// `--state-bytes` asks for (so a two-FSM row h can make BOTH rows
+    /// expensive to freeze, not just row 0).
+    fn with_spin_and_state(spin: u64, state_bytes: u64) -> Self {
         Self {
-            inner: CountSm::default(),
+            inner: CountSm::with_state_bytes(state_bytes),
             spin,
         }
     }
@@ -618,6 +705,138 @@ impl SnapshotStateMachine for SpinCountSm {
         src: &mut dyn std::io::Read,
     ) -> Result<u64, SnapshotError> {
         self.inner.install_snapshot(position, src)
+    }
+}
+
+/// Time-and-timers gate row b: [`CountSm`] plus a self-sustaining timer load.
+///
+/// **Same identity as [`CountSm`]** (`NAME = "count"`, the default
+/// `VERSION`), deliberately: the node's `--services count,…` declaration and
+/// the `check-fsms` role need no change to run this row, and the gate's row b
+/// is meant to be row a's cluster with timers switched on, not a different
+/// cluster. Same `Command`/`Response`/`Query`/`QueryResponse`, same counting
+/// `apply`, same answer to `query` — so `check-fsms` compares like with like.
+///
+/// The load: on its FIRST apply it schedules ids `1..=N` at
+/// `time_ns + id * (1s / N)`, spreading N deadlines evenly across the next
+/// second; each `on_timer` re-schedules the SAME id one second past the
+/// deadline it just fired at. The result is a steady N fires/s for as long as
+/// the log advances — no wall clock anywhere, only `ctx.time_ns` and the
+/// deadline the framework hands back, so every replica arms identically.
+///
+/// "First apply" is `count == 0` rather than a `bool`, on purpose: after an
+/// `install_snapshot` the count is nonzero, so a restarted or below-floor
+/// service does NOT re-arm from its own resume instant (which would differ
+/// from what its peers armed). The pending set it resumes with is
+/// `Timed<S>`'s, carried in the artifact — which is also why
+/// `--timers-per-sec` requires `--timed`.
+///
+/// Note the deliberate re-arm rule: `deadline + 1s`, not `now + 1s`. A late
+/// fire therefore keeps the original phase and can be immediately due again;
+/// that is the honest behaviour for a fixed-rate load, and a run where it
+/// compounds is exactly what `uc2_timers_late_total` is there to report.
+struct TimerLoadSm {
+    inner: CountSm,
+    timers_per_sec: u64,
+    /// Fires delivered, carried in the snapshot so a restarted service
+    /// resumes the count instead of double counting from zero.
+    fires: u64,
+}
+
+impl TimerLoadSm {
+    fn new(timers_per_sec: u64, state_bytes: u64) -> Self {
+        Self {
+            inner: CountSm::with_state_bytes(state_bytes),
+            timers_per_sec,
+            fires: 0,
+        }
+    }
+}
+
+impl StateMachine for TimerLoadSm {
+    const NAME: &'static str = <CountSm as StateMachine>::NAME;
+
+    type Command = Vec<u8>;
+    type Response = u64;
+    type Query = ();
+    type QueryResponse = u64;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Vec<u8>) -> u64 {
+        if self.inner.count == 0 && self.timers_per_sec > 0 {
+            // `max(1)` only matters above 1e9 timers/s, which no row asks
+            // for; without it the whole set would land on one instant.
+            let step = (1_000_000_000 / self.timers_per_sec).max(1);
+            for id in 1..=self.timers_per_sec {
+                ctx.schedule(id, ctx.time_ns + id * step);
+            }
+        }
+        StateMachine::apply(&mut self.inner, ctx, cmd)
+    }
+
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        self.fires += 1;
+        ctx.schedule(ev.id, ev.deadline_ns + 1_000_000_000);
+        // Same rule `apply` follows: a TIMER frame is a frame, and the row's
+        // applied frontier must move past it or the framework re-delivers it.
+        self.inner.last_applied = Some(ctx.position).max(self.inner.last_applied);
+    }
+
+    fn query(&self, q: ()) -> u64 {
+        StateMachine::query(&self.inner, q)
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        StateMachine::last_applied(&self.inner)
+    }
+}
+
+/// [`CountSm`]'s format with `fires` spliced in after `count`/`pos` and the
+/// ballast (if any) still last: `count ++ pos ++ fires ++ ballast`.
+impl SnapshotStateMachine for TimerLoadSm {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        let pos = self.inner.last_applied.unwrap_or(0);
+        let mut buf = Vec::with_capacity(24 + self.inner.ballast.len());
+        buf.extend_from_slice(&self.inner.count.to_le_bytes());
+        buf.extend_from_slice(&pos.to_le_bytes());
+        buf.extend_from_slice(&self.fires.to_le_bytes());
+        buf.extend_from_slice(&self.inner.ballast);
+        Ok((buf, pos))
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        if buf.len() < 24 {
+            return Err(SnapshotError::Codec(format!(
+                "short snapshot: {} bytes",
+                buf.len()
+            )));
+        }
+        let count = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let fires = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+        // Same exclusive-frontier rule as `CountSm::install_snapshot`.
+        if pos > position {
+            return Err(SnapshotError::Codec(format!(
+                "snapshot payload position {pos} is above the artifact tag {position}"
+            )));
+        }
+        self.inner.ballast = take_ballast(&buf, 24, self.inner.ballast.len())?;
+        self.inner.count = count;
+        self.inner.last_applied = Some(pos);
+        self.fires = fires;
+        Ok(position)
     }
 }
 
@@ -1785,6 +2004,21 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         },
     );
     let node = Node::start(cfg)?;
+    // Time-and-timers gate rows b/c/e/h scrape this node. Same wiring the
+    // `uc2-node` daemon uses (`uc_node/src/bin/uc2-node.rs`); held for the
+    // life of the loop below, which never returns — dropping it would join
+    // the accept thread and close the endpoint.
+    let _metrics = match a.metrics_listen {
+        Some(addr) => {
+            let srv = uc_node::obs::http::ObsServer::serve(node.observability(), addr)?;
+            println!(
+                "m12_gate node {id} metrics: http://{}/metrics",
+                srv.local_addr()
+            );
+            Some(srv)
+        }
+        None => None,
+    };
     println!(
         "m12_gate node {id} up (services={:#b}); parking (killed externally by the harness)",
         services.declared()
@@ -1868,6 +2102,50 @@ fn run_and_park<S: SnapshotStateMachine>(
     park_service(&what)
 }
 
+/// Wrap `sm` in the wrappers the flags ask for and park. One place where the
+/// `Sessioned` / `Timed` combinations are spelled, so every `--fsm` arm gets
+/// all four and the "up" line names the stack exactly as it was built.
+///
+/// `Timed` goes OUTSIDE `Sessioned`: it has to see the `ctx.schedule` calls
+/// the inner state machine makes, and `Sessioned` forwards `on_timer`
+/// straight through (`uc_service/src/session.rs`).
+fn run_wrapped<S: SnapshotStateMachine>(
+    cfg: ServiceConfig,
+    sm: S,
+    envelope: bool,
+    timed: bool,
+    snapshots: bool,
+    inner: &str,
+    tag: &str,
+) -> anyhow::Result<()> {
+    match (envelope, timed) {
+        (true, true) => run_and_park(
+            cfg,
+            uc_service::Timed::new(Sessioned::new(sm, SessionConfig::default())),
+            snapshots,
+            format!("Timed<Sessioned<{inner}>> (typed tier, envelope on, {tag})"),
+        ),
+        (true, false) => run_and_park(
+            cfg,
+            Sessioned::new(sm, SessionConfig::default()),
+            snapshots,
+            format!("Sessioned<{inner}> (typed tier, envelope on, {tag})"),
+        ),
+        (false, true) => run_and_park(
+            cfg,
+            uc_service::Timed::new(sm),
+            snapshots,
+            format!("Timed<{inner}> (typed tier, envelope off, {tag})"),
+        ),
+        (false, false) => run_and_park(
+            cfg,
+            sm,
+            snapshots,
+            format!("{inner} (typed tier, envelope off, {tag})"),
+        ),
+    }
+}
+
 fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     let cnc = a.instance_dir.join("cnc2.dat");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1887,6 +2165,27 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         !(matches!(kind, FsmKind::Raw) && a.snapshot_interval_bytes > 0),
         "--fsm raw and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
     );
+    // The raw tier keeps the plain `start()` path and has no snapshot
+    // capability, so it has nothing for `Timed` to sit on either.
+    anyhow::ensure!(
+        !(matches!(kind, FsmKind::Raw) && a.timed),
+        "--fsm raw and --timed are exclusive: RawCountSm is not a SnapshotStateMachine, and the \
+         raw arms deliberately keep the plain start() path"
+    );
+    anyhow::ensure!(
+        a.timers_per_sec == 0 || matches!(kind, FsmKind::Count),
+        "--timers-per-sec > 0 is only valid with --fsm count (TimerLoadSm keeps CountSm's identity)"
+    );
+    // Time-and-timers §4.8: the NODE layer is at-least-once — an in-flight
+    // instance is re-delivered by the next leader — and `Timed<S>` is what
+    // makes delivery exactly-once from the log-derived pending set. A timer
+    // load without it measures a different cluster than the one row b claims.
+    anyhow::ensure!(
+        a.timers_per_sec == 0 || a.timed,
+        "--timers-per-sec requires --timed: the node layer is at-least-once (an in-flight timer \
+         is re-delivered by the next leader), and uc_service::Timed is what makes delivery \
+         exactly-once from the log-derived pending set"
+    );
     // On the SERVICE role `--snapshot-interval-bytes` now only selects
     // `start_with_snapshots()` below, i.e. snapshot-CAPABLE
     // (coordinated-snapshot spec §5.2's cnc status bit) — any positive value
@@ -1897,40 +2196,47 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
     // readings of the flag consistent.
     let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
     let envelope = a.envelope == Envelope::On;
+    let timed = a.timed;
     let snapshots = a.snapshot_interval_bytes > 0;
-    let tag = format!(
+    let mut tag = format!(
         "fsm={} spin={} snap={}",
         a.fsm, a.work_spin, a.snapshot_interval_bytes
     );
-    match (envelope, kind) {
-        (true, FsmKind::Count) => run_and_park(
+    if a.timers_per_sec > 0 {
+        tag.push_str(&format!(" timers_per_sec={}", a.timers_per_sec));
+    }
+    if a.state_bytes > 0 {
+        tag.push_str(&format!(" state_bytes={}", a.state_bytes));
+    }
+    match kind {
+        FsmKind::Count if a.timers_per_sec > 0 => run_wrapped(
             cfg,
-            Sessioned::new(CountSm::default(), SessionConfig::default()),
+            TimerLoadSm::new(a.timers_per_sec, a.state_bytes),
+            envelope,
+            timed,
             snapshots,
-            format!("Sessioned<CountSm> (typed tier, envelope on, {tag})"),
+            &format!("TimerLoadSm({}/s)", a.timers_per_sec),
+            &tag,
         ),
-        (true, FsmKind::Spin) => run_and_park(
+        FsmKind::Count => run_wrapped(
             cfg,
-            Sessioned::new(
-                SpinCountSm::with_spin(a.work_spin),
-                SessionConfig::default(),
-            ),
+            CountSm::with_state_bytes(a.state_bytes),
+            envelope,
+            timed,
             snapshots,
-            format!("Sessioned<SpinCountSm> (typed tier, envelope on, {tag})"),
+            "CountSm",
+            &tag,
         ),
-        (false, FsmKind::Count) => run_and_park(
+        FsmKind::Spin => run_wrapped(
             cfg,
-            CountSm::default(),
+            SpinCountSm::with_spin_and_state(a.work_spin, a.state_bytes),
+            envelope,
+            timed,
             snapshots,
-            format!("CountSm (typed tier, envelope off, {tag})"),
+            "SpinCountSm",
+            &tag,
         ),
-        (false, FsmKind::Spin) => run_and_park(
-            cfg,
-            SpinCountSm::with_spin(a.work_spin),
-            snapshots,
-            format!("SpinCountSm (typed tier, envelope off, {tag})"),
-        ),
-        (true, FsmKind::Raw) => {
+        FsmKind::Raw if envelope => {
             let _svc = ServiceBuilder::new(
                 cfg,
                 Sessioned::new(RawCountSm::default(), SessionConfig::default()),
@@ -1940,58 +2246,21 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
                 "Sessioned<RawCountSm> (raw tier, envelope on, {tag})"
             ))
         }
-        (false, FsmKind::Raw) => {
+        FsmKind::Raw => {
             let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
             park_service(&format!("RawCountSm (raw tier, envelope off, {tag})"))
         }
-        (true, FsmKind::Tagged(n)) => {
+        FsmKind::Tagged(n) => {
             macro_rules! arm {
                 ($n:literal) => {
-                    run_and_park(
+                    run_wrapped(
                         cfg,
-                        Sessioned::new(
-                            uc_service::Tagged::<$n, CountSm>::default(),
-                            SessionConfig::default(),
-                        ),
+                        uc_service::Tagged::<$n, CountSm>(CountSm::with_state_bytes(a.state_bytes)),
+                        envelope,
+                        timed,
                         snapshots,
-                        format!(
-                            concat!(
-                                "Sessioned<Tagged<",
-                                stringify!($n),
-                                ", CountSm>> (typed tier, envelope on, {})"
-                            ),
-                            tag
-                        ),
-                    )
-                };
-            }
-            match n {
-                0 => arm!(0),
-                1 => arm!(1),
-                2 => arm!(2),
-                3 => arm!(3),
-                4 => arm!(4),
-                5 => arm!(5),
-                6 => arm!(6),
-                7 => arm!(7),
-                _ => unreachable!("parse_fsm bounds N to 0..8"),
-            }
-        }
-        (false, FsmKind::Tagged(n)) => {
-            macro_rules! arm {
-                ($n:literal) => {
-                    run_and_park(
-                        cfg,
-                        uc_service::Tagged::<$n, CountSm>::default(),
-                        snapshots,
-                        format!(
-                            concat!(
-                                "Tagged<",
-                                stringify!($n),
-                                ", CountSm> (typed tier, envelope off, {})"
-                            ),
-                            tag
-                        ),
+                        concat!("Tagged<", stringify!($n), ", CountSm>"),
+                        &tag,
                     )
                 };
             }
@@ -2278,6 +2547,7 @@ fn run_check_fsms_role(a: CheckFsmsArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use uc_node::FsmLag;
+    use uc_service::TimerReq;
 
     #[test]
     fn services_from_flags_absent_is_refused() {
@@ -2359,8 +2629,171 @@ mod tests {
         assert_eq!(got, pos);
         assert_eq!(StateMachine::query(&b, ()), 200);
         assert_eq!(StateMachine::last_applied(&b), Some(pos));
-        let err = SpinCountSm::with_spin(0).install_snapshot(pos + 64, &mut &blob[..]);
+        // The tag is an EXCLUSIVE frontier since coordinated snapshots
+        // (spec §5.2 / ruling P6), so "mis-tagged" means the PAYLOAD sits
+        // ABOVE the tag — a tag above the payload is the ordinary case (the
+        // instant is the frame-END of a `SNAPSHOT` frame the row applied
+        // nothing at). This assertion used to read `pos + 64` and had been
+        // failing since the frontier flipped; it is the test that was stale,
+        // not the guard.
+        let err = SpinCountSm::with_spin(0).install_snapshot(pos - 64, &mut &blob[..]);
         assert!(err.is_err(), "a mis-tagged artifact must be refused");
+        assert!(
+            SpinCountSm::with_spin(0)
+                .install_snapshot(pos + 64, &mut &blob[..])
+                .is_ok(),
+            "a tag above the payload position is the ordinary exclusive-frontier case"
+        );
+    }
+
+    /// Time-and-timers gate row b: the whole set is armed on the FIRST apply,
+    /// evenly spread across the next second from the frame's OWN stamp, and
+    /// never re-armed afterwards (which is what keeps every replica's pending
+    /// set identical and a restarted service from re-arming at its own
+    /// resume instant).
+    #[test]
+    fn timer_load_sm_arms_the_whole_set_once_spread_across_the_next_second() {
+        let mut sm = TimerLoadSm::new(4, 0);
+        let mut ctx = ApplyCtx::for_sm::<TimerLoadSm>(64).with_time(1_000);
+        assert_eq!(StateMachine::apply(&mut sm, &mut ctx, vec![7u8; 8]), 1);
+        let step = 1_000_000_000 / 4;
+        let want: Vec<TimerReq> = (1..=4u64)
+            .map(|id| TimerReq::Schedule {
+                id,
+                at_ns: 1_000 + id * step,
+            })
+            .collect();
+        assert_eq!(ctx.timers(), &want[..]);
+
+        let mut ctx2 = ApplyCtx::for_sm::<TimerLoadSm>(128).with_time(2_000);
+        StateMachine::apply(&mut sm, &mut ctx2, vec![7u8; 8]);
+        assert!(ctx2.timers().is_empty(), "armed twice");
+
+        // `--timers-per-sec 0` is CountSm's behaviour exactly: no timers.
+        let mut off = TimerLoadSm::new(0, 0);
+        let mut ctx3 = ApplyCtx::for_sm::<TimerLoadSm>(64).with_time(1_000);
+        StateMachine::apply(&mut off, &mut ctx3, vec![7u8; 8]);
+        assert!(ctx3.timers().is_empty());
+    }
+
+    /// Each fire re-arms the SAME id one second past the deadline it fired
+    /// at — `deadline + 1s`, never `now + 1s`, so the rate does not drift —
+    /// counts the fire, and advances the applied frontier past the TIMER
+    /// frame.
+    #[test]
+    fn timer_load_sm_reschedules_the_same_id_one_second_past_its_deadline() {
+        let mut sm = TimerLoadSm::new(2, 0);
+        let mut ctx = ApplyCtx::for_sm::<TimerLoadSm>(64).with_time(10);
+        StateMachine::apply(&mut sm, &mut ctx, vec![0u8; 8]);
+
+        let deadline = 500_000_010;
+        // A LATE fire (stamp past the deadline) still re-arms from the
+        // deadline, so the phase is preserved.
+        let mut ctx2 = ApplyCtx::for_sm::<TimerLoadSm>(128).with_time(deadline + 7_000);
+        let ev = TimerEvent {
+            id: 1,
+            deadline_ns: deadline,
+            table: false,
+        };
+        assert!(ev.late(&ctx2));
+        StateMachine::on_timer(&mut sm, &mut ctx2, ev);
+        assert_eq!(
+            ctx2.timers(),
+            &[TimerReq::Schedule {
+                id: 1,
+                at_ns: deadline + 1_000_000_000
+            }]
+        );
+        assert_eq!(sm.fires, 1);
+        assert_eq!(StateMachine::last_applied(&sm), Some(128));
+        // A fire is not a command: the counter `query` answers is untouched.
+        assert_eq!(StateMachine::query(&sm, ()), 1);
+    }
+
+    /// Row h's ballast: `--state-bytes 0` leaves the artifact byte-identical
+    /// to every prior arm's (16 bytes), a nonzero one round-trips whole, and
+    /// a service built for a different size refuses the artifact by name
+    /// rather than silently installing a short state.
+    #[test]
+    fn state_bytes_ballast_round_trips_and_zero_keeps_the_16_byte_format() {
+        let mut plain = CountSm::default();
+        drive(&mut plain);
+        assert_eq!(
+            plain.freeze().unwrap().0.len(),
+            16,
+            "unchanged with no ballast"
+        );
+
+        let mut big = CountSm::with_state_bytes(4096);
+        drive(&mut big);
+        let (blob, pos) = big.freeze().unwrap();
+        assert_eq!(blob.len(), 16 + 4096);
+        let mut restored = CountSm::with_state_bytes(4096);
+        assert_eq!(restored.install_snapshot(pos, &mut &blob[..]).unwrap(), pos);
+        assert_eq!(restored.ballast, ballast_of(4096));
+        assert_eq!(StateMachine::query(&restored, ()), 200);
+
+        let mut wrong = CountSm::with_state_bytes(8192);
+        let e = wrong
+            .install_snapshot(pos, &mut &blob[..])
+            .expect_err("a 4096-byte artifact must not install into an 8192-byte row");
+        assert!(format!("{e}").contains("--state-bytes"), "{e}");
+    }
+
+    /// `TimerLoadSm`'s artifact is `CountSm`'s with `fires` spliced in after
+    /// `count`/`pos` and the ballast still last — so a restarted service
+    /// resumes the fire count instead of double counting from zero.
+    #[test]
+    fn timer_load_sm_snapshot_carries_fires_after_count_and_pos() {
+        let mut sm = TimerLoadSm::new(2, 32);
+        let mut ctx = ApplyCtx::for_sm::<TimerLoadSm>(64).with_time(10);
+        StateMachine::apply(&mut sm, &mut ctx, vec![0u8; 8]);
+        for (i, dl) in [500_000_010u64, 1_000_000_010].into_iter().enumerate() {
+            let mut c = ApplyCtx::for_sm::<TimerLoadSm>(128 + 64 * i as u64).with_time(dl);
+            StateMachine::on_timer(
+                &mut sm,
+                &mut c,
+                TimerEvent {
+                    id: 1,
+                    deadline_ns: dl,
+                    table: false,
+                },
+            );
+        }
+        let (blob, pos) = sm.freeze().unwrap();
+        assert_eq!(blob.len(), 24 + 32);
+        assert_eq!(
+            u64::from_le_bytes(blob[16..24].try_into().unwrap()),
+            2,
+            "fires sits after count/pos"
+        );
+        let mut restored = TimerLoadSm::new(2, 32);
+        assert_eq!(restored.install_snapshot(pos, &mut &blob[..]).unwrap(), pos);
+        assert_eq!(restored.fires, 2);
+        assert_eq!(StateMachine::query(&restored, ()), 1);
+        assert_eq!(restored.inner.ballast, ballast_of(32));
+        // Mis-tagged artifacts are refused exactly as CountSm's are: the
+        // tag is an EXCLUSIVE frontier, so the refusal is a payload position
+        // ABOVE it.
+        assert!(
+            TimerLoadSm::new(2, 32)
+                .install_snapshot(pos - 64, &mut &blob[..])
+                .is_err()
+        );
+    }
+
+    /// `TimerLoadSm` presents `CountSm`'s identity, which is what lets row b
+    /// reuse row a's `--services count,…` declaration and `check-fsms`.
+    #[test]
+    fn timer_load_sm_keeps_count_sms_identity() {
+        assert_eq!(
+            <TimerLoadSm as StateMachine>::NAME,
+            <CountSm as StateMachine>::NAME
+        );
+        assert_eq!(
+            <TimerLoadSm as RawStateMachine>::IDENTITY.hash(),
+            <CountSm as RawStateMachine>::IDENTITY.hash()
+        );
     }
 
     #[test]
