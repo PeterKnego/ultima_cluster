@@ -69,7 +69,7 @@ impl ProtocolVersion {
 // (`SNAP_BEGIN_FIXED_LEN`). A receiver now compares declared FSMs
 // **positionally, by name** rather than by row-count alone, and refuses a
 // 0.6.0-or-earlier body by its `layout` discriminator
-// (`SNAP_BEGIN_LAYOUT_V2`). As with 0.6.0 this alters only the snapshot-
+// (`SNAP_BEGIN_LAYOUT_V2_RETIRED`). As with 0.6.0 this alters only the snapshot-
 // session body; the flag day rests on the standing operational rule, not a
 // version gate.
 pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 7, 0);

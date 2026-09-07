@@ -182,15 +182,15 @@ pub const SNAP_BEGIN_FIXED_LEN: usize = 120;
 /// receiver refuses a body carrying this discriminator by name
 /// ("peer wire ≤ 0.6.0") rather than misreading its `services_declared` word
 /// as an `identity` array.
-pub const SNAP_BEGIN_LAYOUT_V2: u8 = 1;
+pub const SNAP_BEGIN_LAYOUT_V2_RETIRED: u8 = 1;
 
 /// The value [`SnapBeginBody::layout`] carried by the intermediate 0.7.0
 /// shape — the FSM-identity arrays plus a trailing carried `config`. Never
 /// shipped in a release (0.7.0 is one unreleased flag day) and retired by
 /// spec §5.6; kept as a named constant so the discriminator value is never
 /// re-used and a body carrying it is refused by name, exactly as
-/// [`SNAP_BEGIN_LAYOUT_V2`] is.
-pub const SNAP_BEGIN_LAYOUT_V3: u8 = 2;
+/// [`SNAP_BEGIN_LAYOUT_V2_RETIRED`] is.
+pub const SNAP_BEGIN_LAYOUT_V3_RETIRED: u8 = 2;
 
 /// The value [`SnapBeginBody::layout`] carries on wire 0.7.0 as shipped:
 /// the fixed-length body, no carried config, cluster artifact under
@@ -310,7 +310,7 @@ impl SnapBeginBody {
 
 /// Encode a snap-begin body. `layout` is written verbatim — production callers
 /// pass [`SNAP_BEGIN_LAYOUT_V4`]; a test forging a legacy-discriminator body
-/// passes [`SNAP_BEGIN_LAYOUT_V3`], [`SNAP_BEGIN_LAYOUT_V2`] or 0.
+/// passes [`SNAP_BEGIN_LAYOUT_V3_RETIRED`], [`SNAP_BEGIN_LAYOUT_V2_RETIRED`] or 0.
 pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
     buf[0..4].copy_from_slice(&b.session.to_le_bytes());
     buf[4] = b.layout;
@@ -332,8 +332,8 @@ pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
 /// peer speaking an older 0.7.0 shape, refused by its `layout` at the node
 /// layer with a name, not silently by a length check here.
 ///
-/// **Total for every `layout` value** — 0, [`SNAP_BEGIN_LAYOUT_V2`],
-/// [`SNAP_BEGIN_LAYOUT_V3`] and the shipped [`SNAP_BEGIN_LAYOUT_V4`] alike. Deciding what an unrecognized discriminator
+/// **Total for every `layout` value** — 0, [`SNAP_BEGIN_LAYOUT_V2_RETIRED`],
+/// [`SNAP_BEGIN_LAYOUT_V3_RETIRED`] and the shipped [`SNAP_BEGIN_LAYOUT_V4`] alike. Deciding what an unrecognized discriminator
 /// means is the receiving node's job, not the decoder's: it counts a named
 /// refusal ("peer wire ≤ 0.6.0") and drops the session, which is
 /// diagnosable, where a silent `None` here would be indistinguishable from a
@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn snap_begin_body_070_roundtrips_and_pins_layout() {
         assert_eq!(SNAP_BEGIN_FIXED_LEN, 120);
-        assert_eq!(SNAP_BEGIN_LAYOUT_V3, 2);
+        assert_eq!(SNAP_BEGIN_LAYOUT_V3_RETIRED, 2);
         assert_eq!(SNAP_BEGIN_LAYOUT_V4, 3);
         let mut identity = [0u64; 8];
         identity[0] = 0x1111_2222_3333_4444;
@@ -953,7 +953,7 @@ mod tests {
         // refuses it by name (`peer wire ≤ 0.6.0`), not the decoder.
         let b = SnapBeginBody {
             session: 1,
-            layout: SNAP_BEGIN_LAYOUT_V2,
+            layout: SNAP_BEGIN_LAYOUT_V2_RETIRED,
             service_id: 0,
             snapshot_pos: 0,
             total_len: 1,
@@ -988,11 +988,11 @@ mod tests {
         // The V3 shape: same first 120 bytes, `layout` 2, then `config_len` +
         // 4 config bytes. Decodes; the layout is what a node refuses on.
         let mut v3 = buf.clone();
-        v3[4] = SNAP_BEGIN_LAYOUT_V3;
+        v3[4] = SNAP_BEGIN_LAYOUT_V3_RETIRED;
         v3.extend_from_slice(&4u16.to_le_bytes());
         v3.extend_from_slice(&[1, 2, 3, 4]);
         let got = read_snap_begin_body(&v3).expect("a longer body still decodes");
-        assert_eq!(got.layout, SNAP_BEGIN_LAYOUT_V3);
+        assert_eq!(got.layout, SNAP_BEGIN_LAYOUT_V3_RETIRED);
         assert_eq!(got.identity, [1u64; 8]);
     }
 
