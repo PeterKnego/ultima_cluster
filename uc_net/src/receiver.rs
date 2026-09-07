@@ -2643,12 +2643,12 @@ impl FollowerReceiver {
             // has since acted on) naming a set whose directory entries never
             // reached the disk.
             //
-            // This is the THIRD writer of these files, and of the other two
-            // only ONE does this today: `uc_node::cluster_agent::take_snapshot`
-            // (which logs a Warn on failure). `uc_service::snapshots::
-            // SnapshotStore::publish` fsyncs the file and renames with no
-            // directory fsync at all — the same gap, in the service SDK's own
-            // write path, scheduled for this plan's final wave.
+            // This is the THIRD writer of these files, and as of the final
+            // wave's I2 all three do it: `uc_node::cluster_agent::
+            // take_snapshot` (logs a Warn on failure) and
+            // `uc_service::snapshots::SnapshotStore::publish` (returns the
+            // failure NAMED, because its caller already treats a publish error
+            // as "this instant did not happen").
             //
             // Best-effort, exactly as there: the artifact IS renamed and the
             // session must not stall on a directory handle. A failure is

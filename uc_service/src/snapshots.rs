@@ -188,9 +188,15 @@ impl SnapshotStore {
     }
 
     /// Write a new snapshot tagged at `pos`: `write` streams into a temp file,
-    /// which is `fsync`'d then atomically renamed onto `snap-<pos>.ultsnap`
-    /// (module doc). Nothing is pruned — the node's set retention decides what
+    /// which is `fsync`'d, atomically renamed onto `snap-<pos>.ultsnap`
+    /// (module doc), and then the DIRECTORY is `fsync`'d so the rename itself
+    /// is durable. Nothing is pruned — the node's set retention decides what
     /// is garbage. Returns the final path on success.
+    ///
+    /// A directory-fsync failure is returned as a named `Io` error even though
+    /// the rename has already happened: the artifact exists but is not
+    /// provably durable, and the builder agent's "did not happen" handling
+    /// (below) is the conservative answer.
     ///
     /// On a `write` failure (or an I/O error at any step before the rename),
     /// the temp file is best-effort unlinked and the error is returned — the
@@ -222,6 +228,35 @@ impl SnapshotStore {
         }
         let final_path = self.path_for(pos);
         std::fs::rename(&tmp_path, &final_path)?;
+        // I2 (final wave): fsync the artifact's DIRECTORY, so the rename that
+        // published it is itself durable. The file's own bytes are fsync'd
+        // above; without this a crash between the rename and the next
+        // unrelated directory sync can leave a node whose DURABLE snapshot
+        // floor names P (`maybe_persist_snapshot_floor` stores the floor, then
+        // prunes below it, and under `PurgePolicy::BelowSnapshot` purges the
+        // journal below P − slack) and whose `snap-<P>.ultsnap` never reached
+        // the disk. `replay_into`'s gap guard then fail-stops
+        // `SnapshotRequired` and the recovery is wipe-and-rejoin.
+        //
+        // This is the THIRD writer of these files and the last one to close
+        // the gap; the other two are `uc_node::cluster_agent::take_snapshot`
+        // (cluster artifact) and `uc_net::receiver`'s snapshot intake, both of
+        // which fsync the directory best-effort and COUNT a failure because
+        // they must not stall an agent loop. Here the caller is the builder
+        // agent, which already treats a publish error as "this instant did not
+        // happen" (logs, does not advance the marker, retries next interval),
+        // so a failure is returned NAMED rather than swallowed: reporting an
+        // artifact whose directory entry is not durable is exactly what the
+        // fsync exists to prevent.
+        if let Err(e) = File::open(&self.dir).and_then(|d| d.sync_all()) {
+            return Err(SnapshotError::Io(io::Error::new(
+                e.kind(),
+                format!(
+                    "snapshot directory fsync failed after publishing {}: {e}",
+                    final_path.display()
+                ),
+            )));
+        }
         // Coordinated-snapshot spec §5.3 (plan-2 ruling P1): retention is
         // NODE-owned. The node keeps the set at its floor plus anything newer
         // and deletes the rest; a per-writer "newest 2" pruner here cannot see
@@ -314,6 +349,50 @@ mod tests {
             .expect("published file exists");
         assert_eq!(pos, 4096);
         assert_eq!(found, path);
+    }
+
+    /// I2 (final wave): the rename that publishes an artifact must itself be
+    /// durable, so a power loss between the build and the next unrelated
+    /// directory sync cannot leave a node whose persisted snapshot FLOOR names
+    /// P with no `snap-P.ultsnap` on disk (and, under
+    /// `PurgePolicy::BelowSnapshot`, the journal prefix below P already gone).
+    ///
+    /// Watching it fail is the point of the mode: `0o300` (write + execute, no
+    /// read) is exactly enough to create and rename inside the directory and
+    /// NOT enough to open it `O_RDONLY` for the fsync, so a store that skips
+    /// the directory fsync returns `Ok` here and one that performs it returns
+    /// the named error.
+    #[test]
+    #[cfg(unix)]
+    fn publish_fsyncs_the_artifact_directory_and_names_the_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotStore::open(dir.path(), 0).unwrap();
+        // Happy path first: with a readable directory the fsync succeeds and
+        // publish is unchanged.
+        store.publish(4096, ok_write(b"hello")).unwrap();
+
+        let perms_before = std::fs::metadata(&store.dir).unwrap().permissions();
+        std::fs::set_permissions(&store.dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let result = store.publish(8192, ok_write(b"world"));
+        // Restore before asserting so a failure doesn't leave an
+        // undeletable temp dir behind.
+        std::fs::set_permissions(&store.dir, perms_before).unwrap();
+
+        let err = result.expect_err("a directory fsync that cannot happen is a named failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("snapshot directory fsync"),
+            "the failure names the step, not just `io`: {msg}"
+        );
+        assert!(
+            msg.contains("snap-8192.ultsnap") || msg.contains(store.dir.to_str().unwrap()),
+            "the failure names the artifact or its directory: {msg}"
+        );
+        // The rename DID happen — the error reports "published but not
+        // provably durable", and the caller's retry rebuilds the same name.
+        assert!(store.path_for(8192).exists());
     }
 
     /// The atomicity pin: a `write` closure that fails partway through must
