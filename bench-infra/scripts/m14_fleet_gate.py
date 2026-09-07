@@ -23,9 +23,43 @@ Every row verdict is a PURE function of recorded numbers, so `--selftest`
 replays canned inputs through them with no fleet. Bars are the constants
 below; they are printed beside each verdict as a GATE-JSON line. The exit
 code is the verdict: a green terminal is not a PASS.
+
+TIME AND TIMERS (`--tt-rows`, 2026-09-07)
+-----------------------------------------
+This driver also carries the fleet rows of
+`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`. They are a SEPARATE
+namespace from the M14 rows above, on a separate flag: `--rows` keeps its
+`abcdef` meaning and `--tt-rows` takes the letters `a b c e g h`.
+
+  tt-a  the rate arms (n1/n2eq/slow1/pair) with every service wrapped in
+        `Timed<..>` and NO timers scheduled, A/B'd against the SAME arms on
+        the pre-time-and-timers binary (`--base-tree`), interleaved per arm on
+        fresh clusters. Bar: within `--resolution-pct` (the day's
+        `scripts/hop1_ab.sh` same-source rebuild number).
+  tt-b  the same A/B with FSM 0 sustaining `--timers-per-sec` (the gate's
+        number is 1000), plus `uc2_timers_late_total == 0` on every node for
+        every row after every timers-on arm.
+  tt-c  timer precision under row b's load: p99 of `uc2_timer_lateness_ns`
+        (row 0) against 2 x the mean of `uc2_consensus_pass_ns`, both scraped
+        off the LEADER. Needs >= 10 000 fires or the row is inconclusive.
+  tt-e  the same arms again with a live `--schedule-table N` (the gate's
+        number is 32) applied by `uc2ctl schedule apply` BEFORE each arm's
+        client starts; bar is row a's resolution plus the same late == 0.
+  tt-g  row f's below-floor join with the LEADER's node unit restarted ~2 s
+        after `add-learner`; bar <= 60 s to converge, `snapshot_installed`
+        seen, `uc2_snapshot_set_position` equal cluster-wide.
+  tt-h  freeze duration vs commit stall: a 256 MiB-state FSM under load, an
+        all-nodes instant then a `--standby` one. The standby arm's commit
+        gap must be <= the pass length; the all-nodes gap is reported bare.
+
+The leaf helpers those rows stand on (the Prometheus parser, the histogram
+quantile/mean, the stall measure, the table file, the A/B arithmetic) are in
+`tt_fleet_gate.py`, stdlib-only so they are selftestable in isolation.
 """
 
 import argparse
+import base64
+import contextlib
 import json
 import re
 import shlex
@@ -36,6 +70,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import m6_fleet_gate as m6  # noqa: E402
 import m12_fleet_gate as m12  # noqa: E402
+import tt_fleet_gate as tt  # noqa: E402
 from m12_fleet_gate import (  # noqa: E402
     ssh, start_unit, kill_unit, truncate_log, tail_log, run_foreground,
     parse_result, echo, Verdict, APP, PORT, REMOTE_ROOT, UNIT_PREFIX,
@@ -44,8 +79,17 @@ from m12_fleet_gate import (  # noqa: E402
     sibling_pairs, require_pin_layout,
 )
 from m13_hop_bench import sync_tree  # noqa: E402
+from m14_ab_27_vs_28 import sync_tree_to  # noqa: E402
 
 BUILT_CTL = "/opt/bench/uc/target/release/uc2ctl"
+
+# The time-and-timers A/B's SECOND tree: the pre-time-and-timers checkout
+# (`17d5c6b`), rsynced and built beside the head one exactly as
+# `m14_ab_27_vs_28.py` does. Each version is probed by ITS OWN `m6_gate`,
+# because the two trees' cnc page layouts need not agree.
+BASE_SRC = "/opt/bench/uc-base"
+BASE_GATE = f"{BASE_SRC}/target/release/examples/m12_gate"
+BASE_PROBE = f"{BASE_SRC}/target/release/examples/m6_gate"
 
 # ------------------------------------------------------------------ bars
 # Spec §15.4, verbatim. Committed before any run; never edited to fit one.
@@ -305,11 +349,84 @@ def fsm_name(i, spin):
     return "count" if i == 0 else f"fsm{i}"
 
 
+class TtOpts:
+    """The time-and-timers role flags that must reach `node_args`/
+    `service_args`, which every arm builds without seeing the parsed argparse
+    namespace.
+
+    A module-level singleton rather than four more parameters threaded through
+    `one_arm`/`arm_kill`/`arm_join`, because those signatures are pinned by the
+    existing selftest and by three other rows that have nothing to do with
+    this flag day. `main()` sets it once; individual arms narrow it with the
+    `tt_options`/`tt_disabled` context managers.
+
+    Every field defaults OFF, so an untouched import builds byte-identical
+    role arguments to the pre-2026-09-07 driver — which is what lets the
+    BASELINE tree's arms (whose `m12_gate` has none of these flags) run
+    through the very same `node_args`/`service_args`.
+    """
+
+    def __init__(self, metrics_port=0, timed=False, timers_per_sec=0, state_bytes=0):
+        self.metrics_port = int(metrics_port or 0)
+        self.timed = bool(timed)
+        self.timers_per_sec = int(timers_per_sec or 0)
+        self.state_bytes = int(state_bytes or 0)
+
+    def replace(self, **over):
+        d = {"metrics_port": self.metrics_port, "timed": self.timed,
+             "timers_per_sec": self.timers_per_sec, "state_bytes": self.state_bytes}
+        d.update(over)
+        return TtOpts(**d)
+
+    def __repr__(self):
+        return (f"TtOpts(metrics_port={self.metrics_port}, timed={self.timed}, "
+                f"timers_per_sec={self.timers_per_sec}, state_bytes={self.state_bytes})")
+
+
+TT = TtOpts()
+
+
+@contextlib.contextmanager
+def tt_options(**over):
+    """Narrow `TT` for the duration of one arm (e.g. timers on for row b's
+    head arms only), then restore it. Nested use is fine — each level restores
+    the value it found."""
+    global TT
+    saved = TT
+    TT = saved.replace(**over)
+    try:
+        yield TT
+    finally:
+        TT = saved
+
+
+def tt_disabled():
+    """Every T&T role flag off — what the BASELINE tree's arms run under, since
+    `--metrics-listen`/`--timed`/`--timers-per-sec`/`--state-bytes` are all
+    flags this flag day added and its `m12_gate` would refuse by name."""
+    return tt_options(metrics_port=0, timed=False, timers_per_sec=0, state_bytes=0)
+
+
+# Node unit args as last started, per host — row g restarts the LEADER's node
+# unit mid-window and must start it with the SAME arguments (a restart that
+# quietly changed the member list or the purge policy would be measuring a
+# different cluster).
+LAST_NODE_ARGS = {}
+
+
 def node_args(h, node_id, members, fsms, lag, purge, snap):
     args = ["node", "--id", str(node_id), "--bind", f"{h.private_ip}:{PORT}",
             "--instance-dir", h.dir, "--members", members, "--app-id", APP,
             "--admission-kib", str(ADMISSION_KIB),
             "--services", ",".join(fsm_name(sid, spin) for sid, spin in fsms)]
+    # Every node this driver starts serves Prometheus text on its PRIVATE NIC
+    # when a port is configured (`--metrics-port`, default 9310): the T&T rows
+    # read all of their evidence off `/metrics`, and there is no second way to
+    # get `uc2_timers_late_total` or the two new histograms out of a node.
+    # `0` = do not pass the flag at all, which is what the baseline tree's
+    # arms run under (`tt_disabled`).
+    if TT.metrics_port:
+        args += ["--metrics-listen", f"{h.private_ip}:{TT.metrics_port}"]
     if lag is not None:
         args += ["--fsm-lag", lag]
     if purge:
@@ -331,12 +448,30 @@ def node_args(h, node_id, members, fsms, lag, purge, snap):
 
 
 def service_args(h, sid, spin, snap):
+    name = fsm_name(sid, spin)
     args = ["service", "--instance-dir", h.dir, "--app-id", APP, "--envelope", "on",
-            "--fsm", fsm_name(sid, spin)]
+            "--fsm", name]
     if spin > 0:
         args += ["--work-spin", str(spin)]
     if snap:
         args += ["--snapshot-interval-bytes", str(snap)]
+    # Time and timers. `--timed` wraps the state machine in `uc_service::
+    # Timed<S>` (exactly-once delivery from the log-derived pending set) and is
+    # rows a/b/c/e's standing condition — the gate measures the shipped
+    # wrapper, not a bare SM.
+    if TT.timed:
+        args.append("--timed")
+    # The timer LOAD and the 256 MiB ballast both attach to FSM 0's `count`
+    # row only, per the Rust contract: `--timers-per-sec` is valid only with
+    # `--fsm count` and requires `--timed`. Row 0 is `spin` in the `slow1`
+    # arm, so that arm deliberately carries no timer load — the late == 0
+    # sweep still runs over it, and the arms that DO carry timers are the
+    # three the bar reads.
+    if name == "count":
+        if TT.timed and TT.timers_per_sec > 0:
+            args += ["--timers-per-sec", str(TT.timers_per_sec)]
+        if TT.state_bytes > 0:
+            args += ["--state-bytes", str(TT.state_bytes)]
     return args
 
 
@@ -373,8 +508,9 @@ def start_cluster_m14(voters, fsms, lag=None, purge=False, snap=0, pins=None):
         # attach/detach transitions, row f's snapshot installs) would also see
         # every earlier arm's records. Service units already did this.
         truncate_log(h, "node")
-        start_unit(h, "node", node_args(h, i, ms, fsms, lag, purge, snap), nofile=True,
-                  cpus=node_cpus)
+        args = node_args(h, i, ms, fsms, lag, purge, snap)
+        LAST_NODE_ARGS[h.public_ip] = list(args)
+        start_unit(h, "node", args, nofile=True, cpus=node_cpus)
     time.sleep(BOOT_SETTLE_SECS)
     for h in voters:
         for sid, spin in fsms:
@@ -453,18 +589,105 @@ def check_all(hosts, leader, arm, checks, expect=None, expect_min=None):
         checks.append((arm, h.public_ip, "snapshot", ok, c))
 
 
+# -------------------------------------------------- /metrics (time+timers)
+def scrape_prom(h, label="metrics"):
+    """This host's `/metrics`, parsed by `tt.parse_prom`.
+
+    `{}` when no metrics port is configured (`--metrics-port 0`, and every
+    baseline arm) or the endpoint does not answer — with a WARN, because every
+    clause that reads a metric treats an unreadable one as NOT satisfied
+    rather than as a pass."""
+    if not TT.metrics_port:
+        return {}
+    r = ssh(h, f"curl -s --max-time {tt.SCRAPE_TIMEOUT_SECS} "
+               f"http://{h.private_ip}:{TT.metrics_port}/metrics", label=label)
+    m = tt.parse_prom(r.stdout or "")
+    if not m:
+        print(f"WARN scrape {h.public_ip}: /metrics empty or unreachable "
+              f"(port {TT.metrics_port})", flush=True)
+    return m
+
+
+def late_sweep(hosts, arm, late):
+    """Rows b and e's second clause: `uc2_timers_late_total == 0` on EVERY node
+    for EVERY row. Appends `(arm, host, service, row, late)` per sample.
+
+    A host whose scrape carries no `uc2_timers_late_total` at all is recorded
+    as an offender with count `-1`: the clause was not readable, and an
+    unreadable clause is not a pass (the same posture `status_slots`' `bound
+    is None` takes in row d)."""
+    for h in hosts:
+        m = scrape_prom(h, label="late")
+        hits = tt.prom_find(m, "uc2_timers_late_total")
+        if not hits:
+            print(f"WARN {arm}: no uc2_timers_late_total on {h.public_ip} — recorded "
+                  f"as an offender (an unreadable clause is not a pass)", flush=True)
+            late.append((arm, h.public_ip, "?", "?", -1))
+            continue
+        fired = {d.get("row"): v for d, v in tt.prom_find(m, "uc2_timers_fired_total")}
+        for d, v in hits:
+            row = d.get("row", "?")
+            late.append((arm, h.public_ip, d.get("service", "?"), row, int(v)))
+            print(f"INFO {arm} timers {h.public_ip} row={row} service={d.get('service')}: "
+                  f"fired={fired.get(row)} late={int(v)}", flush=True)
+
+
+def fold_freeze(ip, metrics, acc):
+    """Fold one host's per-row `uc2_snapshot_freeze_seconds_max` samples into
+    `acc` (host -> the largest value seen). Pure over a parsed scrape, so the
+    selftest can pin it.
+
+    Sampled DURING the instant poll, never once at the end: the gauge is reset
+    to 0 on the scrape after the node's instant position advances
+    (`uc_node/src/obs/metrics.rs`), so a single read taken after the instant
+    completed can legitimately read 0 and would report "no freeze" for a
+    freeze that did happen."""
+    for _, v in tt.prom_find(metrics, "uc2_snapshot_freeze_seconds_max"):
+        acc[ip] = max(acc.get(ip, 0.0), float(v))
+    return acc
+
+
 # ------------------------------------------------------------- rate arms
 def rate_of(d):
     return float(d["window_rps"])
 
 
-def one_arm(voters, a, label, fsms, lag, rates, checks, fan_in, pins=None):
+def one_arm(voters, a, label, fsms, lag, rates, checks, fan_in, pins=None,
+            pre_client=None, late=None, scrapes=None, check=True):
+    """One rate arm on a fresh cluster generation.
+
+    The three keyword hooks are the time-and-timers rows' whole footprint on
+    this function; every one of them is a no-op when unset, so the M14 rows
+    call it unchanged.
+
+      `pre_client(voters, leader)` runs after the cluster is up and BEFORE the
+          client starts — row e applies its schedule table there, because a
+          table adopted mid-window would put an un-tabled prefix inside the
+          measured window.
+      `late`, when a list, collects this arm's `uc2_timers_late_total` sweep
+          over every voter (rows b and e's second clause), taken right after
+          the client's window closes and BEFORE the divergence checks, which
+          take tens of seconds.
+      `scrapes`, when a list, appends `(label, leader_metrics)` — row c's
+          histogram evidence, which only the leader has (it is the node that
+          fires timers and runs the passes).
+      `check=False` skips the row-c divergence checks, which is what the
+          BASELINE arms of the A/B do: they are a rate measurement on a
+          different binary, not a claim about this branch's correctness.
+    """
     leader = start_cluster_m14(voters, fsms, lag=lag, pins=pins)
     print(f"INFO arm {label}: leader n{leader} on {voters[leader].public_ip}", flush=True)
+    if pre_client is not None:
+        pre_client(voters, leader)
     d = run_rate_arm(voters, leader, a, label, fan_in, pins=pins)
     rates[label] = rate_of(d)
     print(f"INFO arm {label}: window_rps={rates[label]:.0f} responses={d['responses']} lost={d['lost']}", flush=True)
-    check_all(voters, leader, label, checks, expect=int(d["responses"]))
+    if late is not None:
+        late_sweep(voters, label, late)
+    if scrapes is not None:
+        scrapes.append((label, scrape_prom(voters[leader], label="row-c")))
+    if check:
+        check_all(voters, leader, label, checks, expect=int(d["responses"]))
     stop_cluster_m14(voters)
     return d
 
@@ -709,13 +932,45 @@ def arm_kill(voters, a, K, checks, pins=None):
             "client_lost": d["lost"] if d else None}
 
 
-def arm_join(voters, learner, a, K, checks, pins=None):
+def restart_node(h, pins=None):
+    """Kill and start THIS host's node unit with the args it was last started
+    with, leaving the instance dir and the SERVICE units in place — row g's
+    mid-window shipper restart.
+
+    The args come from `LAST_NODE_ARGS` rather than being rebuilt: a restart
+    that quietly changed the member list, the purge policy or the metrics port
+    would be measuring a different cluster from the one that was running. The
+    node log is deliberately NOT truncated — row g wants both lives of the
+    leader in one file."""
+    args = LAST_NODE_ARGS.get(h.public_ip)
+    if args is None:
+        raise RuntimeError(f"restart_node: no recorded node args for {h.public_ip}")
+    kill_unit(h, "node")
+    start_unit(h, "node", args, nofile=True, cpus=(pins or {}).get("node"))
+
+
+def arm_join(voters, learner, a, K, checks, pins=None, restart_leader_after=None):
     """Row f: voters run the bounded pair with purge ON and snapshots every
     `M14_SNAPSHOT_INTERVAL_BYTES`; fan-in load runs for the whole arm; 10 s in, a learner declared
     {0,1} is admitted (`uc2ctl add-learner` on the leader — M7's pattern:
     the learner boots as a plain node with the CURRENT voters as its seed
     members) and must reach both voters' `applied` within 60 s via a
-    two-artifact snapshot session (wire 0.6.0), with zero refusals."""
+    two-artifact snapshot session (wire 0.6.0), with zero refusals.
+
+    `restart_leader_after`, when set, makes this the time-and-timers gate's
+    ROW G instead: that many seconds after `add-learner` — i.e. before the
+    joiner's first commit advance — the LEADER's node unit is killed and
+    started again with the same args, the service units left alone. That is
+    the fleet form of `learner.rs::a_joiner_served_by_a_leader_restarted_
+    before_its_first_commit_advance_still_installs_the_table`; the residual
+    the coordinated-snapshot spec was written to close was a restarted shipper
+    serving `(0, 0, [])`, so the joiner installed nothing. The bar is
+    deliberately row f's 60 s: nothing about the join path's MECHANICS
+    changed, only what it carries.
+
+    Either way the result dict now also carries `set_positions` — every host's
+    `uc2_snapshot_set_position` at the end of the arm, which row g requires to
+    agree cluster-wide."""
     leader = start_cluster_m14(voters, [(0, 0), (1, K)], purge=True, snap=M14_SNAPSHOT_INTERVAL_BYTES,
                                pins=pins)
     h = voters[leader]
@@ -728,6 +983,7 @@ def arm_join(voters, learner, a, K, checks, pins=None):
     rc, out = h.ctl("add-learner", new_id, addr)
     if rc != 0:
         raise RuntimeError(f"add-learner refused: {out.strip()}")
+    t_add = time.time()
     # Capture the target at add-learner time (fix round 1): under continuous
     # fan-in load, `applied` keeps advancing, so reading it after the
     # learner's node+service units boot (several ssh round trips) would
@@ -743,6 +999,19 @@ def arm_join(voters, learner, a, K, checks, pins=None):
     start_unit(learner, "node", node_args(learner, new_id, m12.members_str(voters), [(0, 0), (1, K)], None,
                                           True, M14_SNAPSHOT_INTERVAL_BYTES), nofile=True,
               cpus=(pins or {}).get("node"))
+    leader_restarted = False
+    if restart_leader_after is not None:
+        # Row g: land the restart `restart_leader_after` seconds after
+        # add-learner, whatever the intervening ssh round trips cost, so the
+        # instant is a property of the row rather than of the driver's own
+        # latency on the day.
+        wait = restart_leader_after - (time.time() - t_add)
+        if wait > 0:
+            time.sleep(wait)
+        print(f"INFO row g: restarting the LEADER's node unit on {h.public_ip} "
+              f"{time.time() - t_add:.2f}s after add-learner (services stay up)", flush=True)
+        restart_node(h, pins=pins)
+        leader_restarted = True
     time.sleep(2.0)
     for sid, spin in [(0, 0), (1, K)]:
         truncate_log(learner, f"service{sid}")
