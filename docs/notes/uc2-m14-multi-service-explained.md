@@ -258,11 +258,28 @@ inserts one word, so `SNAP_BEGIN_FIXED_LEN` goes 26 → 34
 `0.5.0 → 0.6.0` wire bump; `DATA`, `NAK`, `APPEND_POSITION`, `TERM_MAP`, the
 16-byte header and every admin datagram are byte-identical.
 
-One thing the per-id install path does *not* do on its own: a
-`SnapshotPolicy` shortens a service restart only together with purge —
-reconstruction installs the newest artifact only when the journal no longer
-covers the start position (`uc_service/src/replay.rs:73-78`); with purge off it
-replays the whole journal.
+One thing the per-id install path does *not* do on its own: a snapshot
+shortens a service restart only together with purge — reconstruction installs
+an artifact only when the journal no longer covers the start position
+(`uc_service/src/replay.rs`); with purge off it replays the whole journal.
+
+**What 2.11 (pending) changed about the set.** Everything above still
+describes the session's shape, but the *set* it ships is no longer the
+lowest-common-floor of N independently-timed artifacts. `SnapshotPolicy` and
+its per-service `interval_bytes` are **removed**; a snapshot is taken at a
+**coordinated instant** — a `SNAPSHOT` frame the leader appends, at whose
+frame-end position P every declared row *and* UC's own cluster FSM freeze
+together. So a set is the artifacts at **one** position, plus the cluster
+artifact under the reserved `service_id = 255`, and a session whose
+`SNAP_BEGIN`s disagree about that position is refused
+(`uc2_snapshot_refused_position_total`) rather than installing a row image and
+a cluster image taken at different points of the log. Retention moved with it:
+the node keeps the set at its floor and deletes below, instead of each writer
+keeping its own newest two. And because a coordinated freeze on a quorum caps
+every durable report at `P + fsm_lag`, there is now a **standby** form
+(`uc2ctl snapshot --standby`) that freezes only learners, with
+`uc2ctl snapshot fetch` as the return path.
+See [The cluster FSM, explained § Instants](uc2-cluster-fsm-explained.md#instants-one-position-one-set).
 
 The receiver writes each artifact to its own pre-sized `.part`, fsyncs and
 renames it as the contiguous frontier passes its end, and **adopts the floor

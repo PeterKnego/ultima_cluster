@@ -139,6 +139,59 @@ Full semantics, the ordering guarantee, and the failure-mode table:
 (the table specifically:
 [The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table)).
 
+## Snapshots: the instant, the envelope, and the exclusive frontier
+
+Snapshotting is opt-in: implement `SnapshotStateMachine` alongside your tier
+and start the service with `start_with_snapshots()` rather than `start()`.
+That is what sets the row's **snapshot-capability bit** on the cnc page, and
+`uc2ctl snapshot` refuses `48 snapshot_unsupported` naming any declared row
+that lacks it — a row started with plain `start()` would ignore the frame, so
+the set could never complete and the purge floor would never move.
+
+**When `freeze()` is called is no longer your decision** (2.11 pending). The
+per-service `SnapshotPolicy { interval_bytes }` is **removed**: a snapshot is
+now taken at a **coordinated instant**, a `SNAPSHOT` frame the leader appends,
+at whose frame-end position **P** every declared row and the cluster FSM
+freeze together. Your apply thread runs `freeze()` there, having applied
+everything below P, and the existing builder thread streams the artifact off
+the handle exactly as before. Nothing about `freeze`/`stream_snapshot`'s
+contract changed — `freeze` is still an O(1) pin on the apply thread,
+`stream_snapshot` still runs off it with no lock. What changed is that the
+trigger is the log, so every replica's artifact at P is a function of the log
+below P and the whole cluster's set is at one position.
+
+**`freeze()` is on the critical path of the whole cluster.** A node's durable
+report is capped at `min_applied + fsm_lag`, so a freeze that runs long on a
+quorum stalls commit at `P + fsm_lag` until the slowest one ends — see
+[Limits § Standing constraints](limits.md#standing-constraints). Keep `freeze`
+O(1) (pin a persistent structure, clone an `Arc`, bump a copy-on-write
+generation) and do the O(state) work in `stream_snapshot`, which runs off the
+apply thread. `uc2_snapshot_freeze_seconds_max{row}` is the number to watch.
+
+**`position` is an EXCLUSIVE frontier.** `install_snapshot(position, src)`
+lands an image covering every frame strictly **below** `position`, and a user
+frame normally starts exactly at it. So:
+
+- **return `position`** — the framework resumes reading at the frame whose
+  start is `position`;
+- **do not report `position` from `last_applied()`** afterwards. The apply
+  loop's idempotency guard is `pos > last_applied()`, so claiming P would
+  silently swallow the first frame above the instant. Restore the cursor the
+  artifact itself recorded — put it in your image; every reference state
+  machine does.
+
+**The mis-tag check is the framework's, not yours.** Every artifact file
+begins with a 16-byte UC envelope (`ULTSNAP1` + P, LE) that `SnapshotStore::
+publish` writes and every install path verifies, because the exclusive tag
+makes a mis-tagged artifact invisible from the payload: an image built at some
+earlier `P0` and renamed to `snap-<P>.ultsnap` passes any payload-side check a
+state machine can write. `src` is positioned at your first payload byte, and
+UC still prescribes **no** payload encoding. A payload cursor *above*
+`position` is worth refusing as belt-and-suspenders; below it is normal.
+
+See [Instance directory § The artifact envelope](instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts)
+and [The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).
+
 ## The blanket adapter and the byte-identity promise
 
 ```rust

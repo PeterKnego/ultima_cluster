@@ -51,8 +51,8 @@ fails otherwise. This is a wrong-cluster guard, not a credential — it is
 checked, but it proves nothing about who is asking.
 
 Every **mutating** admin-band command (`add-learner`, `promote`, `demote`,
-`remove-learner`, `remove-voter`, and — since 2.11 pending — `schedule apply`
-and `settings apply`)
+`remove-learner`, `remove-voter`, and — since 2.11 pending — `schedule apply`,
+`settings apply`, `snapshot` and `snapshot fetch`)
 additionally takes (M12b, `v2.6.0`):
 
 **`--admin-key <PATH>`**
@@ -85,7 +85,7 @@ window.
 
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,
 `remove-voter`, `schedule apply`, `schedule show`, `settings apply`,
-`settings show`, `status`.
+`settings show`, `snapshot`, `snapshot fetch`, `snapshot show`, `status`.
 
 Every mutating one is a **cluster-FSM command** since 2.11 (pending): the
 reconfiguration ops append `CLUSTER kind = 1` (Membership), `schedule apply`
@@ -287,6 +287,116 @@ position=8192 admission_bytes=262144 fsm_lag=16MiB snapshot_interval_bytes=0 sna
 `fsm_lag` renders as `default` (the record's `0`), `lockstep`, a whole-MiB
 count, or a raw byte count when it is neither. A node with no cluster artifact
 yet prints `no cluster artifact yet`.
+
+### `snapshot`
+
+Command a **coordinated snapshot instant** (2.11 pending, coordinated-snapshot
+spec §5). Wire op `8`, leader-only. The leader appends a `SNAPSHOT` frame; its
+frame-end position **P** is the instant, and every declared row plus the
+cluster FSM freezes there, having applied everything below it. When they have
+all published `snap-<P>`, the node holds the **complete set at P** and its
+purge floor moves to P.
+
+```
+uc2ctl snapshot --instance-dir <DIR> --app-id <ID> [--standby] [--admin-key <PATH>]
+```
+
+- `--standby` — only **learners** freeze. A voter's rows yield the frame like
+  any other node-only frame, so no voter pays the freeze; the set comes back
+  to a voter later with [`snapshot fetch`](#snapshot-fetch). Refused
+  `49 snapshot_no_learner` when the committed membership holds no learner.
+
+This op stages nothing and signs no digest — the whole command is the
+`--standby` bit, which rides the request's `id` field — so the `ip`/`port`
+fields are unused. On success the printed `version` word is **P**:
+
+```
+instant=73792
+```
+
+Two refusals are specific to it. `48 snapshot_unsupported` names a declared
+row that lacks the snapshot capability bit — it was started with plain
+`start()` rather than `start_with_snapshots()`, so it would ignore the frame
+and the set could never complete; the audit record's `detail` field names the
+row. `49 snapshot_no_learner` is `--standby` with no learner. A **follower**
+answers `retry` (status `2`), exactly as `schedule apply` does — check
+`uc2ctl status`'s `leader_hint` for where to re-run it — and so does a leader
+still opening its term. A leader whose previous instant's set has not
+completed answers `retry` to the *cadence*, but never to this verb: an
+operator's command always supersedes.
+
+Audited as `snapshot`, with `id` carrying `--standby` and `config_version`
+carrying P (or the newest complete set's position, on a refusal).
+
+### `snapshot fetch`
+
+Pull a learner's complete set onto **this** node, store-only (2.11 pending,
+spec §5.7 item 5). Wire op `9`. **Node-local**: it is never forwarded, so it
+always acts on the node `--instance-dir` names, whoever leads. This is the
+return path for a standby instant — a voter that did not freeze still needs
+the set for its own purge floor and to serve joiners.
+
+```
+uc2ctl snapshot fetch --from <LEARNER-ID> [--position <P>] --instance-dir <DIR> --app-id <ID> [--admin-key <PATH>]
+```
+
+- `--from <U32>` — the learner id to pull from.
+- `--position <U64>` — the set to pull. Omitted: the learner's newest complete
+  set. The value is packed into the request's two free address words (`ip` =
+  the low 32 bits, `port` = the next 16), so it is a **48-bit** field:
+  `uc2ctl` refuses a `--position` at or above `1 << 48` by name, locally,
+  before anything reaches the admin band, rather than letting it truncate to a
+  lower and wrong position.
+
+"Store-only" is the point: the artifacts are written and the set is marked
+complete at P, and **nothing is installed** — no state machine is touched, no
+`applied` moves backwards, and the floor is adopted through the ordinary
+completeness path. A voter above P holding a set at P is not a joiner.
+
+Status `0` means the pull is **underway**, not that it arrived:
+
+```
+accepted: fetch of position 73792 from node 1 is underway — not yet a promise it arrived; …
+```
+
+Poll `uc2_snapshot_fetched_position` (or `snapshot show`) for the landing.
+`50 snapshot_above_durable` refuses a position above this node's own durable
+frontier — an operator typo, or a learner transiently ahead of this voter; it
+becomes legitimate again once this node's log catches up. `retry` means a
+fetch is already in flight here; one is pending until it lands or its 60 s
+intake deadline passes. Audited as `snapshot_fetch`.
+
+### `snapshot show`
+
+Print the newest **complete set**'s position and each artifact's presence —
+the diagnostic for a stalled instant. Read-only, and **offline** in the same
+sense as `schedule show`/`settings show`: it writes no admin request.
+
+```
+uc2ctl snapshot show --instance-dir <DIR> --app-id <ID>
+```
+
+```
+row=0 name=orders newest=73792
+row=1 name=kv newest=73792
+cluster newest=73792
+set=73792
+```
+
+It opens the cnc page only to learn which rows are declared and their names,
+then reads directory listings under `<instance_dir>/snapshots/` and parses
+**file names** only (`snap-<pos>.ultsnap`, `snap-<pos>.ultcluster`). It never
+opens an artifact: the 16-byte `ULTSNAP1` envelope inside each one is
+[`verify-backup`](#verify-backup)'s business, not this command's.
+
+`set=<P>` is the newest position present in **every** declared row's directory
+*and* in `snapshots/cluster/` — the **intersection** of what is on disk, not
+each side's own newest. That matters: a row that has already frozen the *next*
+instant lists a newer file than the last complete set, and taking each side's
+maximum would make an established set appear to vanish. `set=none` means no
+such position exists, including "nothing has ever snapshotted". A row whose
+`newest=` sits below the others is the row a `Uc2SnapshotStalled` alert is
+pointing at.
 
 ### `status`
 
@@ -498,6 +608,16 @@ because its `retry` has a second cause:
 | `1` | `refused: <reason> (cluster position <N>) — staged file kept at <PATH>` | exit 1 |
 | `2` | `retry: leader unknown or a previous cluster command is still uncommitted (cluster position <N>) — staged file kept at <PATH>, try again` | exit 1 |
 
+`snapshot` and `snapshot fetch` stage no file, so their status lines say
+nothing about one. `snapshot`'s `version` word is the instant's position;
+`snapshot fetch`'s is the position it bound:
+
+| Status | Printed as | Process outcome |
+|---|---|---|
+| `0` | `instant=<P>` / `accepted: fetch of position <P> from node <id> is underway …` | exit 0 |
+| `1` | `refused: <reason> (snapshot position <N>)` / `refused: <reason> (position <N>)` | exit 1 |
+| `2` | `retry: leader unknown, or an instant is already in flight …` / `retry: a fetch is already in flight here …` | exit 1 |
+
 ## Refusal reasons
 
 The `reason` field of a status-`1` response. Codes 1–10 and 12 are the
@@ -509,7 +629,9 @@ caller can tell "the cluster refused this change" from "the cluster refused
 to believe this was you" without consulting the policy. 40–43 (2.11 pending)
 are `schedule apply`'s own refusals (`uc_node::REASON_SCHEDULE_*`) and 44–47
 (2.11 pending) are `settings apply`'s (`uc_node::REASON_SETTINGS_*`), each in
-its own band for the same reason.
+its own band for the same reason. 48–50 (2.11 pending) are the coordinated-snapshot
+ops' own (`uc_node::REASON_SNAPSHOT_*`), split across `snapshot` (48, 49) and
+`snapshot fetch` (50).
 
 | Code | Reason |
 |---|---|
@@ -538,6 +660,9 @@ its own band for the same reason.
 | 45 | `settings_missing` — no staged settings file on this node. Either `settings apply` was run against a different instance directory, or a successful apply already consumed it |
 | 46 | `settings_decode` — the staged file is not a decodable settings record (wrong length, unknown encoding version, or an unknown `snapshot_target` byte) |
 | 47 | `settings_bounds` — a field is out of range; the node's refusal detail and the audit record name which. Three values are out of range: `admission_bytes` or `snapshot_interval_bytes` equal to `u64::MAX` (the reserved sentinel), and an `fsm_lag` byte bound **below 1376 B** — one max-size frame. A sub-frame lag pins the report ceiling (`min_applied + fsm_lag`) inside the next frame and stops commit cluster-wide **permanently**, since changing a replicated setting needs a command that commits; `"lockstep"` is how you ask for the tightest pacing. `fsm_lag = "0"` (derive) and `"lockstep"` are sentinels, not bounds, and are never refused here |
+| 48 | `snapshot_unsupported` — a declared row lacks the snapshot capability bit: it was started with plain `start()` rather than `start_with_snapshots()`, so it would ignore the `SNAPSHOT` frame and the set at P could never complete. The audit record's `detail` field names the row. The cluster is legitimate — purge is off by default and such a cluster simply never snapshots — so it is refused by name rather than left with a floor that never moves |
+| 49 | `snapshot_no_learner` — `uc2ctl snapshot --standby` with no learner in the committed membership. Only a learner freezes for a standby instant, so with none there nothing anywhere would build the set |
+| 50 | `snapshot_above_durable` — `uc2ctl snapshot fetch --position P` names a P above this node's own durable frontier. A voter must not adopt a floor above what it has made durable. Usually an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

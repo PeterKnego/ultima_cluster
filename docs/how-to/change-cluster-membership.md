@@ -145,6 +145,19 @@ service logs `replay waits for snapshot artifact` once per wait. Before
 this, the learner stayed at its first floor forever and one FSM row could
 die with `SnapshotRequired`.
 
+**Since coordinated snapshot instants** (2.11 pending) a session ships one
+**set** at one position: every row's artifact and the cluster FSM's, all
+tagged with the same P, because the leader commanded a single `SNAPSHOT`
+frame that every row froze at. A node that cannot assemble such a set
+declines the session by name rather than shipping artifacts from two
+different points of the log, and a session whose `SNAP_BEGIN`s disagree
+about the position is refused outright. So "the set's floor" is now literally
+one number rather than the lowest of the rows'. If the node the joiner asks
+cannot serve — a voter that has not fetched a `--standby` set, or one
+restored from a backup taken before its own floor — it **redirects** the
+joiner to a learner that can, and the joiner asks there:
+[Keep the journal from growing without bound](bound-journal-growth.md#what-happens-to-a-node-that-falls-below-the-floor).
+
 ## Add a voter
 
 Two independent changes, in order.

@@ -952,3 +952,164 @@ Still open:
 - The artifact is written by a **bridging trigger** — once every declared row
   has snapshotted and the agent's applied position has reached the lowest of
   theirs — standing in for §5's commanded instant, which is plan 2.
+
+---
+
+## Errata (plan 2, as built)
+
+*Appended 2026-09-07 after plan 2 (coordinated and standby snapshot instants,
+§5) landed on `worktree-uc2+coordinated-snapshot-plan2`. The body above is
+retained scaffolding and is deliberately **not** rewritten in place; where it
+and the shipped code disagree, this section is what shipped. Each entry names
+the section it amends and the ruling that decided it. Plan 1's errata above
+still stand.*
+
+1. **§5.2/§5.4 — the artifact tag P is an EXCLUSIVE frontier, and the
+   mis-tag guarantee moved into a framework-owned envelope.** The image at P
+   covers every frame strictly **below** P; a user frame normally starts
+   exactly at P, so `install_snapshot(P)` must restore the cursor the artifact
+   itself recorded and **return** `position` — reporting P from
+   `last_applied()` would swallow the first frame above the instant, because
+   the apply loop's idempotency guard is `pos > last_applied()`. The framework
+   resumes reading at the frame whose START is P. That also kills the
+   payload-side mis-tag check: an artifact built at some lower `P0` and
+   presented as `P` passes any check a state machine can write, because the
+   tag is exclusive and the payload cursor legitimately sits below it. So the
+   guarantee is now framework-owned: `SnapshotStore::publish` writes a
+   **16-byte envelope** — `ULTSNAP1` then P as `u64` LE
+   (`SNAPSHOT_ENVELOPE_MAGIC`, `SNAPSHOT_ENVELOPE_LEN = 16`) — ahead of the
+   state machine's bytes, and every install path verifies it: the service's
+   own reconstruction (`uc_service/src/replay.rs`), the joiner (the receiver
+   writes the shipped bytes verbatim, envelope included), and
+   `uc2ctl verify-backup`. UC still prescribes **no payload encoding**; it
+   owns the header only. Pre-envelope artifacts are refused **by name**
+   (`EnvelopeError::{Short, BadMagic, Mistagged}`), so a developer's
+   pre-existing instance directory needs its `snapshots/` cleared — an
+   unreleased flag day inside `2.11.0`. Ruling **P6**.
+
+2. **§5.3/§5.5 — retention is node-owned and delete-only.** The node prunes
+   below the **persisted** floor, not at set completion, matching
+   `snap-<pos>.ultsnap` / `snap-<pos>.ultcluster` by exact name, keeping P and
+   everything newer (`Node::prune_snapshots_below`). Both per-writer
+   `retain_newest(2)` pruners are **gone** — `uc_service::snapshots` no longer
+   prunes at all, and neither does the cluster agent — because a per-writer
+   pruner cannot see a set: two abandoned instants would make it delete the
+   artifact at the floor, and the ship gate ("the complete set at my floor")
+   would then decline `MISSING` forever. Only the node can prove an artifact
+   is superseded, and the node never *writes* an artifact. Ruling **P1**.
+
+3. **§5.5/§6 — `snapshot_interval_bytes == 0` is "no cadence", and the
+   cadence clock measures COMMANDED instants.** `0` means operator-commanded
+   only, exactly as the retired `SnapshotPolicy`'s "0 = never" did, and it is
+   the default (ruling **P3**). The accrual baseline is
+   `snapshot_last_commanded_bytes` — the last instant this leader
+   *commanded*, not the last one *completed* as §5.5's prose says — and it is
+   **re-based to the append frontier at every leader open**, so election
+   churn cannot become a snapshot storm. Both choices make the cadence err
+   **late** (a longer gap than asked for) and never early, which is the safe
+   side for a knob whose only cost is disk; a leader flapping faster than the
+   interval never snapshots.
+
+4. **§5.2/§10 — a replayed span acts on its LAST `SNAPSHOT` frame.** Both the
+   live catch-up path and reconstruction (`uc_service/src/replay.rs`) pick the
+   last `SNAPSHOT` frame in the span they walk and freeze there, iff its P is
+   above **both** the row's `snapshot_pos` and its `last_applied` — a replayed
+   instant at or below the applied frontier is history and is skipped. So a
+   small ring no longer costs a row its instants: the cost is ~2× journal read
+   over the span (a pre-pass to find the last frame, then the replay) plus one
+   freeze on a row that is already behind. This is what makes the "completes
+   on the first attempt" bar in the integration tests reachable. Ruling
+   **P10**.
+
+5. **§5.7 item 4 — store-only receive signals node-side, and a fetch binds
+   its position.** A store-only intake (`IntakeMode::StoreOnly`) **never**
+   writes the service-written slot words and never writes
+   `cluster_snapshot_pos`: it writes the artifacts and signals through the
+   node-side `stored_set_pos`, from which the consensus agent's ordinary
+   completeness path (§5.3) moves the floor. `Node::request_fetch` **binds**
+   the position it asked for, and a fetch above this node's own durable
+   frontier is refused by the new reason **50 `snapshot_above_durable`** — a
+   voter must not adopt a floor above what it has made durable. A straggling
+   answer to a fetch this node has already given up on is refused by its
+   `(peer, session)` pair and counted as `fetch_expired`; there is exactly one
+   deadline for the whole path, `SNAP_INTAKE_TIMEOUT_NS` (60 s). Rulings
+   **P4'**, **P11**.
+
+6. **§5.7 item 6 — `SNAP_REDIRECT` fires only on `SNAP_DECLINE_MISSING`.**
+   With node-owned retention (erratum 2) the leader's set *at its floor*
+   normally exists, so the only case a redirect answers is artifacts that are
+   genuinely absent — in practice a node restored from a backup taken before
+   its current floor. The hint can also fire on a stale `MISSING` latch when
+   the sender is merely busy; that is self-correcting, because the joiner
+   re-NAKs. The redirect is resolved by the **node**, which owns membership,
+   not by the sender.
+
+7. **§8 — `uc2ctl snapshot show`'s `set=`, and op 9's position encoding.**
+   `set=<P>` is the max of the **intersection** of the on-disk positions
+   across every declared row's directory *and* `snapshots/cluster/` — not each
+   side's own newest — so a row that has already frozen a later instant does
+   not make an established set disappear from the reading (ruling **P12**).
+   `show` is offline and parses file **names** only; it never opens an
+   artifact. Op **8** carries `--standby` in the request's `id` field (there
+   is no digest to sign, so `ip`/`port` are unused and the response's
+   `version` word is P). Op **9** packs the target position into the two free
+   address fields — `ip = position & 0xFFFF_FFFF`, `port = position >> 32` —
+   i.e. **48 bits**; `uc2ctl` refuses a `--position` at or above `1 << 48` by
+   name rather than letting it truncate, and the CLI's encoder is
+   round-tripped in test against the node's own `fetch_position` decoder
+   rather than a hand-copied formula.
+
+8. **§9 — the metric shapes.** `Uc2ScheduleTableDiverged` is unchanged (plan
+   1's erratum stands: it keys on `uc2_schedule_table_position`, not on the
+   cluster FSM's position). The snapshot families are **seven** series, not
+   the six §9 names: `uc2_snapshot_row_incomplete_total{row}`,
+   `uc2_snapshot_freeze_seconds_max{row}` / `_sum{row}` / `_count{row}`,
+   `uc2_snapshot_instant_position`, `uc2_snapshot_set_position` and
+   `uc2_snapshot_fetched_position`. The freeze "histogram" §9 asks for is
+   those three series: the exposition encoder here has no histogram type, so
+   a max gauge plus a sum/count pair stands in for one. And
+   `Node::snapshot_session_refusals()` is a **5-tuple** — the plan-1 triple
+   plus `position_mismatch` (§5.6's one-position rule) and `fetch_expired`
+   (erratum 5).
+
+9. **§11 — inv11 is not the prefix form, and the red twin is not inv11.**
+   inv11 is *set alignment*, indexed by **frame end**, and it is three
+   clauses, not a prefix rule: no node lists a complete set above its own
+   `commit`; every listed instant is a `SNAPSHOT` frame inside the
+   cluster-wide committed prefix (so a truncated instant is never a set); and
+   an instant two nodes both list names the **same frame**. The prefix form
+   §11 sketched is wrong for a fleet where nodes legitimately complete
+   different subsets of instants — abandonment (§5.5) and a declining row
+   (§5.2) make `[P1, P2]` and `[P2]` legal neighbours. Ruling **P9**. The
+   fuzz tiers command an instant every 500 steps
+   (`STORM_INSTANT_STEPS = 500`): 5 646 instants over the 150 default-tier
+   runs and ~38 000 more over the heavy tier, with inv11 judging 16 549
+   completed sets in the default tier alone and firing **zero** times. The
+   red twin for the wrong-model truncated instant is the directed scenario's
+   own per-step assertion, **not** inv11 — a listed P is by construction
+   ≤ `global_max_commit`, and inv4 already forbids truncating there, so
+   inv11 cannot be the thing that fires.
+
+10. **§5.7 (naming) — the capability bit is `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`.**
+    The spec's prose calls it `CNC_SVC_STATUS_SNAPSHOT`; the shipped constant
+    is `CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9` (`uc_protocol::v2::cnc`),
+    service-written by `start_with_snapshots`.
+
+### Designed and not built in plan 2
+
+Recorded so they are not mistaken for shipped surface.
+
+- **A leader-side `snapshot_redirected` log record.** The redirect is *sent*
+  from `uc_net`'s sender, which carries no logging dependency by design, so
+  the leader's only witness is the `SenderStats::snap_redirects` counter. The
+  receiving half does emit `snapshot_redirect_followed` (and
+  `snapshot_redirect_unknown`). Adding a leader-side record is a product
+  change, not a test-task one.
+- **Automatic standby replication** stays deferred exactly as §5.7 item 5 and
+  §13 say: a voter still pulls with `uc2ctl snapshot fetch`, because a
+  learner's "complete at P" has nowhere cluster-visible to be published
+  without a fourth `CLUSTER` kind.
+- **The §11 gate rows** (instants under the throughput load, a below-floor
+  join with the shipper restarted mid-window, and freeze duration vs. commit
+  stall for an all-nodes instant against the same instant `--standby`) are
+  still unrun; they belong to the time-and-timers gate doc when it is run.

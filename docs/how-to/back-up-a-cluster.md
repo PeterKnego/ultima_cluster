@@ -71,8 +71,9 @@ is the entire correctness argument for taking a backup while purge is running
 concurrently underneath it:
 
 > first_base only advances (purge), the newest snapshot position only
-> advances (publish is atomic, retention keeps the newest 2, and purge only
-> runs below a durably persisted floor that some retained snapshot covers) —
+> advances (publish is atomic, retention keeps the set at the persisted floor
+> and everything newer, and purge only runs below a durably persisted floor
+> that some retained snapshot covers) —
 > so a snapshot copied AFTER the journal always covers any purge that
 > happened BEFORE the journal copy. The reverse order can capture a snapshot
 > set from before a purge that the journal copy then reflects: a hole.
@@ -149,7 +150,18 @@ Verify:
    rebuilt, even if every other declared FSM's snapshot is fine. A purged
    journal with no `snapshots/` directory at all is FSM 0's hole (the one id
    every node declares).
-5. Decodes the newest `snapshots/cluster/snap-<pos>.ultcluster` through the
+5. Checks every `snapshots/<id>/snap-<pos>.ultsnap`'s **16-byte envelope**
+   (2.11 pending): the file must start with `ULTSNAP1` followed by the
+   position it was built at, and that position must equal the one in its
+   name. A file that is too short, has the wrong magic, or was built at a
+   different position than it claims is a `corrupt snapshot artifact`
+   refusal — that last case is a renamed or mis-copied artifact, which is
+   exactly the failure the envelope exists to catch, because the tag is an
+   exclusive frontier and no payload-side check can see it
+   ([Instance directory § The artifact envelope](../reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts)).
+   An artifact written by a pre-2.11 build has no envelope and is refused
+   here by the same rule.
+6. Decodes the newest `snapshots/cluster/snap-<pos>.ultcluster` through the
    **same** image decoder a joiner installs it with — magic, image version,
    CRC32, every bounds check — so a verified artifact is one whose cluster
    row a restored node can actually boot from. A failure is a
@@ -160,7 +172,7 @@ Verify:
    journal with **no** cluster family at all is not a hole — a node
    legitimately purges under its rows' floor alone during the window before
    the `uc2-cluster` agent writes its first artifact.
-6. If a `MANIFEST` file is present (every `uc2ctl backup` artifact writes
+7. If a `MANIFEST` file is present (every `uc2ctl backup` artifact writes
    one), cross-checks its recorded positions against what verify just
    recovered — catching tampering or bitrot at the metadata level. A
    mismatch fails with `ManifestMismatch`.
@@ -191,6 +203,17 @@ Once restored, start a node against `--instance-dir` as normal. First boot
 does everything else: a fresh `cnc2.dat` and `instance_id`, config/vote/term
 recovery from the copied `state/`, and — if this id is a minority of a still-
 healthy quorum — rejoin and repair over the ordinary replication path.
+
+**One thing a restore cannot bring back** (2.11 pending): if the backup was
+taken *before* the node's current snapshot floor, the restored node comes up
+believing in a floor whose artifacts are not on its disk. It replicates and
+serves normally — but it cannot **serve a joiner** at that floor, so it
+declines the session by name (`missing artifact`) and, if a learner in the
+membership holds a complete set, answers the joiner with a **redirect** to it
+instead. Nothing is wedged: the joiner converges from the learner. To put the
+node back in a position to serve joiners itself, command a fresh instant
+(`uc2ctl snapshot`) once it is caught up, or pull one with
+[`uc2ctl snapshot fetch`](../reference/uc2ctl.md#snapshot-fetch).
 
 ## The minority-restore rule
 

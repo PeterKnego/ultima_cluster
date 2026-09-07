@@ -273,6 +273,91 @@ its four siblings without the thread-name prefix).
 | `cluster_command_applied` | info | `position`, `kind`, `accepted`, `reason` | this node's cluster FSM applied a `CLUSTER` command at frame-end `position`. `kind` is `1` Membership / `2` ScheduleTable / `3` Settings; `accepted` is `1` or `0`, with `reason` naming the refusal code when it is `0`. A refusal here is **deterministic and identical on every node** — it is the FSM's own validation, not a node-local judgement |
 | `cluster_artifact_installed` | info | `position`, `path` | a snapshot session's cluster artifact was installed by fiat at `position`; this node now holds the cluster's membership, schedule table and settings as of that position, before its purge floor advances |
 
+### The snapshot families (2.11 pending)
+
+Since coordinated snapshot instants, a snapshot is something the whole cluster
+takes at one log position **P** on the leader's command
+([the explainer](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)),
+and the purge floor moves only when the **complete set** at P is on disk.
+Seven families:
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `uc2_snapshot_instant_position` | gauge | none | the last instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances |
+| `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. **Must agree cluster-wide once caught up** |
+| `uc2_snapshot_fetched_position` | gauge | none | the newest set this node pulled whole from a learner with `uc2ctl snapshot fetch`, `0` if it never has. The standby return path's progress reading |
+| `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging |
+| `uc2_snapshot_freeze_seconds_max` | gauge | `service`, `row` | the longest `freeze()` this row has reported since `uc2_snapshot_instant_position` last advanced; reset to `0` on the scrape after a new instant is commanded |
+| `uc2_snapshot_freeze_seconds_sum` | counter | `service`, `row` | cumulative `freeze()` seconds for this row |
+| `uc2_snapshot_freeze_seconds_count` | counter | `service`, `row` | freezes this row has reported |
+
+The last three are a **stand-in for a histogram**: this exposition encoder has
+no histogram type, so a max gauge plus a sum/count pair carries the
+distribution's shape (`_sum / _count` is the mean, `_max` the tail). All three
+are derived from the cnc slot's `freeze_ns` word once per **scrape**, never
+once per pass — two artefacts follow from that. A freeze is counted when the
+word's value **differs from what the previous scrape saw**, and the word
+carries no sequence number, so a row that freezes for the *exact same*
+duration on two consecutive instants is counted once: a known blind spot, and
+an under-count rather than a double count. And the running totals live in the
+node process, so a **node restart resets `_sum`/`_count` to zero** — an
+ordinary counter reset, which `rate()`/`increase()` already handle, but not
+something to read as "the freezes were undone".
+
+**Two alert rules.**
+
+`Uc2SnapshotStalled` (warning, `for: 0m`):
+`changes(uc2_snapshot_instant_position[30m]) >= 2 and changes(uc2_snapshot_set_position[30m]) == 0`.
+This is "one broken FSM silently stops all purging", made loud. It is a
+`changes()` count rather than a subtraction on purpose: the two gauges are
+**not** comparable positions — the instant position is leader-local and the
+set position is each node's own — so the only honest question is whether each
+series is *moving*, on its own instance. Remedy: run
+`uc2ctl snapshot show` on the leader and look for the row whose `newest=` is
+behind, then check `uc2_snapshot_row_incomplete_total{row}` for it. A row that
+is merely lagging catches up on its own — a replayed span acts on its last
+`SNAPSHOT` frame — so a *persistent* stall means a row that is not
+snapshot-capable, busy forever, or whose service process is dead.
+
+`Uc2SnapshotSetDiverged` (warning, `for: 60s`):
+`count(count_values("p", uc2_snapshot_set_position)) > 1` — the
+`Uc2ScheduleTableDiverged` idiom verbatim, over the set position. The newest
+complete set's position must agree cluster-wide once every node is caught up,
+because it *is* the node's purge floor: two nodes disagreeing means one has
+pruned (or will prune) a different prefix than the other. A node behind is
+either still catching up (transient) or stuck — and on a cluster taking
+`--standby` instants it is also the reading that tells you a voter has not run
+`uc2ctl snapshot fetch` yet.
+
+**Snapshot-session refusals.** Five named counters drop a session outright and
+leave the joiner NAKing rather than installing a wrong or half set —
+`uc2_snapshot_refused_legacy_peer_total`,
+`uc2_snapshot_refused_declared_set_total`,
+`uc2_snapshot_refused_version_total`, plus two added with instants:
+`uc2_snapshot_refused_position_total` (the sender's `SNAP_BEGIN`s disagreed
+about the set's position, so it was mixing two instants) and
+`uc2_snapshot_refused_fetch_expired_total` (a straggling answer to a
+`snapshot fetch` this node had already given up on — nothing is stored or
+installed, and the verb is simply re-runnable). Those last two are rendered
+but are not yet listed in `CONTRACT_SERIES`, so the 96-family count above does
+not include them. Any of them non-zero means a joiner is stuck; the consensus
+agent names each one in a `snapshot_session_refused` record as it happens.
+
+**Eleven record names** go with the families, six at info and five at warn
+(paired names share a row below):
+
+| Event | Level | Fields | Means, and what to do |
+|---|---|---|---|
+| `snapshot_commanded` | info | `node`, `position`, `term`, `standby`, `operator` | this leader appended a `SNAPSHOT` frame at `position`. `standby` says whether only learners freeze; `operator` distinguishes `uc2ctl snapshot` from the cadence. The healthy signal |
+| `snapshot_set_complete` | info | `node`, `position`, `source` | the set at `position` is complete on this node and the floor may move. `source` is `"local"` (this node built it) or `"fetch"` (it pulled it whole from a learner) |
+| `snapshot_instant_abandoned` | warn | `node`, `position`, `rows` | a new instant superseded one whose set never completed; `rows` names the rows that never arrived. One is ordinary (a row was catching up); a repeat for the same row is what `Uc2SnapshotStalled` pages on |
+| `snapshot_cadence_refused` | warn | `node`, `reason`, `detail` | the `snapshot_interval_bytes` cadence tried to issue an instant and was refused — `48`/`49`, with `detail` naming the row. **Latched**: a cluster with one non-snapshotting row would otherwise emit this every pass, forever |
+| `snapshot_set_retained` | info | `node`, `position`, `removed`, `errors` | the node's retention sweep unlinked `removed` artifacts below the persisted floor at `position`. `errors` non-zero means a file it meant to delete would not go — check permissions and free space |
+| `snapshot_set_held_above_durable` | warn | `node`, `position`, `durable` | a set is on disk at a position above what this node has made durable, so the floor is deliberately **not** moved yet. Transient while the node catches up |
+| `snapshot_fetch_requested` / `snapshot_fetch_stored` | info | `node`, `from`, `position` | a `uc2ctl snapshot fetch` was sent to learner `from`, and later landed. The pair brackets the pull |
+| `snapshot_fetch_timeout` | warn | `node`, `from`, `position` | the pull got no answer inside the 60 s intake deadline. Nothing was stored; re-run the verb |
+| `snapshot_redirect_followed` / `snapshot_redirect_unknown` | info / warn | `node`, `from`, `position` | this joiner was redirected to node `from` for the set at `position` and followed it — or was redirected to a node it does not know, which it dropped. The **sending** side has no record of its own (the redirect leaves `uc_net`, which carries no logging dependency); its witness is the leader's `snap_redirects` counter |
+
 ## Install the alert rules
 
 [`packaging/prometheus/uc2-alerts.yml`](../../packaging/prometheus/uc2-alerts.yml)
@@ -319,6 +404,8 @@ table:
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 | `Uc2ServiceIdentityDrift` (FSM identity, 2.11 pending) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
 | `Uc2ServiceVersionDrift` (FSM identity, 2.11 pending) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
+| `Uc2SnapshotStalled` (coordinated snapshots, 2.11 pending) | this node has commanded snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
+| `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11 pending) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 

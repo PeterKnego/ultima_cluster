@@ -18,13 +18,16 @@ code.
 byte-empty, `UC2_*` env overrides, `config_loaded` {path, sha256}, the
 `uc_obs` crate, the `ultima_db` removal, and the Broadcast-ring
 memory-ordering fix loom found; `2.9.0` was the `uc_*` crate rename).
-**(2.11.0 IN PREPARATION: FSM identity, log time and timers, and the cluster
-FSM — one flag day. The workspace version is **bumped in-tree to `2.11.0`**,
-but `v2.10.0` is still the newest TAG and the newest crates.io version, so
-"what is released" is 2.10.0 until the tag exists. The release was **STOPPED
-again on 2026-09-05** by the maintainer, for the cluster-FSM and
-coordinated-snapshot work: plan 1 (the cluster FSM) is done, plans 2–3 of that
-spec are not written. **Both 2.11.0 gate docs are still 0-of-9 rows run**, and
+**(2.11.0 IN PREPARATION: FSM identity, log time and timers, the cluster
+FSM, and coordinated snapshot instants — one flag day. The workspace version
+is **bumped in-tree to `2.11.0`**, but `v2.10.0` is still the newest TAG and
+the newest crates.io version, so "what is released" is 2.10.0 until the tag
+exists. The release was **STOPPED again on 2026-09-05** by the maintainer, for
+the cluster-FSM and coordinated-snapshot work: plan 1 (the cluster FSM) is
+merged to local `main`; plan 2 (coordinated and standby snapshot instants,
+spec §5) is DONE on the `uc2+coordinated-snapshot-plan2` worktree branch and
+NOT merged; plan 3 (retirement and proof) is not written. **Both 2.11.0 gate
+docs are still 0-of-9 rows run**, and
 `docs/how-to/cut-a-release.md` §1's writeup de-scaffolding is deliberately
 left until those results are in, because the release-evidence table needs
 them. See "Next up" below.)**
@@ -63,20 +66,27 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up: **the cluster FSM** — the release was **STOPPED on 2026-09-05** by
-the maintainer to take it, so `2.11.0` is not being cut until it lands. Spec
-`docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`;
-**plan 1** (`docs/superpowers/plans/2026-09-06-uc2-cluster-fsm-plan1.md`,
-T0–T12) is **DONE on the `uc2+cluster-fsm-plan1` worktree branch**, not merged:
-cluster data (membership, the schedule table, a new replicated settings record)
-moves into one internal state machine applied at commit by a fifth agent, with
-its own snapshot artifact on the session; `SNAP_TABLE`,
-`FRAME_TYPE_SCHEDULE_TABLE` and `SnapBeginBody.config` retire; the timer heap
-goes leader-only. **Plans 2–3 of that spec are not written**: §5's coordinated
-snapshot instants (a `SNAPSHOT` frame at whose position every row and the
-cluster FSM freeze together) and §5.7's standby instants. Details in the
-"Standing facts" entry below; explainer
-`docs/notes/uc2-cluster-fsm-explained.md`; no gate doc, deliberately (see the
+Next up: **the cluster FSM and coordinated snapshots** — the release was
+**STOPPED on 2026-09-05** by the maintainer to take them, so `2.11.0` is not
+being cut until they land. Spec
+`docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
+(read its two appended "Errata … as built" sections — one per plan — before
+trusting the body, which is retained scaffolding).
+**Plan 1** (`docs/superpowers/plans/2026-09-06-uc2-cluster-fsm-plan1.md`,
+T0–T12) is **DONE and merged to local `main`** (unpushed): cluster data
+(membership, the schedule table, a new replicated settings record) moves into
+one internal state machine applied at commit by a fifth agent, with its own
+snapshot artifact on the session; `SNAP_TABLE`, `FRAME_TYPE_SCHEDULE_TABLE`
+and `SnapBeginBody.config` retire; the timer heap goes leader-only.
+**Plan 2** (`docs/superpowers/plans/2026-09-06-uc2-coordinated-snapshot-plan2.md`,
+T0–T11) is **DONE on the `uc2+coordinated-snapshot-plan2` worktree branch**,
+NOT merged: §5's coordinated snapshot instants (a `SNAPSHOT` frame at whose
+frame-end position every row and the cluster FSM freeze together) and §5.7's
+standby instants plus the fetch/redirect return path. **Plan 3 (retirement
+and proof) is not written.** Details in the "Standing facts" entry below;
+explainer `docs/notes/uc2-cluster-fsm-explained.md` (§ Instants is plan 2);
+no gate doc for either, deliberately — but coordinated snapshots owe three
+rows to the time-and-timers gate's throughput arm when it runs (see the
 release-evidence table in `docs/releases.md`).
 
 Already on `main` and in the same flag day: **FSM identity**
@@ -175,10 +185,12 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   `docs/reference/semver-policy.md`.
 - **`2.11.0` is not yet released** — wire `0.6.0` and cnc `3.0` still
   describe what is actually shipped; the tree is already at `0.7.0` / `3.1`.
-  **Four features, one flag day** (FSM identity, log time and timers plan 1,
-  the replicated schedule table, and the cluster FSM): wire `0.6.0` → `0.7.0`
-  and cnc `3.0` → `3.1`. The first three are on `main` (pushed 2026-09-04);
-  the cluster FSM is on the `uc2+cluster-fsm-plan1` worktree branch.
+  **Five features, one flag day** (FSM identity, log time and timers plan 1,
+  the replicated schedule table, the cluster FSM, and coordinated snapshot
+  instants): wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`. The first three
+  are on `origin/main` (pushed 2026-09-04); the cluster FSM is on local
+  `main` (unpushed); coordinated snapshots are on the
+  `uc2+coordinated-snapshot-plan2` worktree branch.
   - **FSM identity.** `SNAP_BEGIN` carries per-row identity hashes +
     versions, compared positionally, refused by name (replaces the
     `services_declared` bitmask); cnc slot line 7 = row name + hash,
@@ -301,8 +313,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `ScheduleRecord`/`prev`/revert and no `ScheduleShip`. Explainer
     `docs/notes/uc2-cluster-fsm-explained.md`; spec
     `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
-    (§5, coordinated snapshot instants, is that spec's plan 2 and is NOT in
-    the tree). A pre-final pass closed four of the gaps plan 1 first left:
+    (§5, coordinated snapshot instants, is that spec's plan 2 — the next
+    sub-bullet). A pre-final pass closed four of the gaps plan 1 first left:
     the §9 gauges `uc2_cluster_fsm_position` (the FSM's consumed position, a
     per-node stall reading — NOT a fleet-wide constant, so no alert keys on
     it) and `uc2_settings_position`; the fifth `uc2_agent_alive` sample
@@ -311,7 +323,43 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `snapshots/cluster/` in `uc2ctl backup`/`verify-backup`/`restore`
     (`MANIFEST` is `uc2-backup-v3`). **The one recorded gap left**:
     `schedule show`/`settings show`/`status` read the artifact, so they say
-    "no cluster artifact yet" until every declared row has snapshotted.
+    "no cluster artifact yet" until the first instant completes.
+  - **Coordinated and standby snapshot instants (spec §5, plan 2).**
+    `FRAME_TYPE_SNAPSHOT = 7` is header-only — the frame's END position **P**
+    IS the instant — and broadcast: every declared row and the cluster FSM
+    freeze at P, and a node holds the **complete set at P** when every row's
+    `snap-<P>.ultsnap` plus `snapshots/cluster/snap-<P>.ultcluster` exist.
+    That set is **committed by construction** (a row freezes only after
+    applying to P, apply is gated on `min(commit, durable)`, committed bytes
+    are never truncated), which is what lets the ship gate become "the
+    complete set at my floor" with no counter. `SnapshotPolicy` /
+    `ServiceConfig::snapshot_policy` are **DELETED**; `start_with_snapshots`
+    is the whole opt-in and sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9`.
+    Header flag `FLAG_SNAPSHOT_STANDBY = 0x01` (the byte `FLAG_TIMER_TABLE`
+    rides in) makes an instant learners-only; a node reads its role from
+    `NODE_FLAG_LEARNER = 4` in the cnc node-flags word. Return path:
+    `DGRAM_KIND_SNAP_REQUEST = 22` / `SNAP_REDIRECT = 23`, driven by
+    `uc2ctl snapshot fetch` (admin op **9**, node-local, never forwarded),
+    taken **store-only** — nothing installed, the floor adopted through the
+    ordinary completeness path. Admin op **8** = `uc2ctl snapshot
+    [--standby]`; refusals **48 `snapshot_unsupported`** (naming the row),
+    **49 `snapshot_no_learner`**, **50 `snapshot_above_durable`**. New cnc
+    slot word `freeze_ns` at line 7 `+496` (**service**-written, unlike the
+    rest of that line). Every artifact now carries a framework-owned 16-byte
+    envelope, `ULTSNAP1 ‖ P` — the tag is an **EXCLUSIVE** frontier, so
+    `install_snapshot(P)` returns `position` and must NOT report P from
+    `last_applied()`, and no payload-side check can catch a mis-tag;
+    pre-envelope artifacts are refused by name (clear a dev box's
+    `snapshots/` once). **Retention is node-owned and delete-only** — both
+    per-writer `retain_newest(2)` pruners are gone, because only the node can
+    see a *set*. A replayed span acts on its LAST `SNAPSHOT` frame (ruling
+    P10). 7 metric series + `Uc2SnapshotStalled` /
+    `Uc2SnapshotSetDiverged`; `snapshot_session_refusals()` is a 5-tuple. The
+    freeze cost is real and documented, not hidden: a freeze on a quorum
+    stalls commit at `P + fsm_lag` until the slowest ends, which is the whole
+    reason `--standby` exists. Explainer
+    `docs/notes/uc2-cluster-fsm-explained.md` § Instants; spec errata
+    "(plan 2, as built)".
   - **The relayout is the sharper half of this flag day.** Every prior wire
     bump was caught by a length check, so a mixed cluster stalled. A relaid
     header is the *same length*: a `0.6.0` peer's frames parse and mean
@@ -360,7 +408,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   remove it, at the cost of a wire flag day. `bincode` is `NoLimit`; the
   typed tier's decode is bounded by the payload cap and serde's 1 MiB
   pre-allocation cap, not by the codec.
-- **Purge is OFF by default** (`PurgePolicy::Disabled`). The
+- **Purge is OFF by default** (`PurgePolicy::Disabled`), and since the
+  unreleased `2.11.0` a purge floor moves only on a **complete snapshot set**
+  at one commanded instant (`uc2ctl snapshot`, or the replicated
+  `snapshot_interval_bytes` cadence — `0`, the default, means no cadence). The
   `/metrics`/`/healthz`/`/readyz` endpoint exists only when `[metrics]` is
   configured; readiness keys on `can_serve`, never the leader flag; the
   peer-slot metric band is leader-authoritative (followers export zeros).
@@ -404,7 +455,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
-  15 fuzz targets (21 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
+  15 fuzz targets (22 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and
@@ -695,10 +746,14 @@ Storage primitives:
 - Durable state: `uc_journal::StableValue<T>` (rotating two-slot atomic value)
   for vote, term map, snapshot floor, output progress, cluster-config record (config.state).
 - App state + snapshots: the user's `StateMachine`. M6 snapshots use the
-  `SnapshotStateMachine` capability; the artifact's bytes are entirely the
-  service's own business — UC ships no store and prescribes no snapshot
-  encoding. `uc_lincheck`'s `RegisterSm`/`ListAppendSm` are the worked
-  examples.
+  `SnapshotStateMachine` capability; the artifact's PAYLOAD bytes are entirely
+  the service's own business — UC ships no store and prescribes no snapshot
+  encoding, but since `2.11.0` (unreleased) it does own a 16-byte
+  `ULTSNAP1 ‖ P` envelope ahead of them, and the artifact tag is an
+  **exclusive** frontier. `uc_lincheck`'s `RegisterSm`/`ListAppendSm` are the
+  worked examples. **When** a snapshot happens is no longer the service's
+  choice: it is a coordinated instant on the log (`SNAPSHOT` frame, type 7),
+  not a per-service byte counter.
 
 Replication is reliable-UDP: the log buffer doubles as the retransmit buffer, a
 receiver that falls behind sends NAKs repaired from the buffer (or, below the

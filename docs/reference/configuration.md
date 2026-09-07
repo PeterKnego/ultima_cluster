@@ -131,8 +131,8 @@ record cannot see the host it lands on.
 |---|---|---|
 | `admission_bytes` | `0` → derive (256 KiB, `NodeConfig::admission_bytes_default`) | The ingress admission budget: the `append - commit` backpressure gate at the leader's door. Clamped to this host's `buffer_bytes / 2` at use. Published on the cnc page at offset 3712 and as `uc2_admission_bytes`. |
 | `fsm_lag` | `0` → derive (`buffer_bytes / 4`) | How far `applied` may drift between any two declared FSMs before the admission door closes. A string: `"<n>[KiB\|MiB\|GiB]"` (e.g. `"16MiB"`, no spaces, no fractions, binary units only) or `"lockstep"` (no FSM starts frame k+1 until every FSM finished frame k). A byte bound is **clamped** at use into the range from one max-size frame up to this host's `buffer_bytes / 2`, rather than refused — but a byte bound **below 1376 B** (one max-size frame on the widest path the transport allows) is refused outright by `uc2ctl settings apply` with `47 settings_bounds`. A lag shorter than one frame is not a tighter policy: the report ceiling is `min_applied + fsm_lag`, so it can pin commit strictly inside the next frame **permanently**, and the only way to change a replicated setting is a command that has to commit. Write `"lockstep"` if you want the tightest possible pacing. Lockstep costs an N-way cross-core handshake per frame — ~1.6 µs at N=2 on the dev box, i.e. ~600 k frames/s per FSM against ~22 M bounded (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`) — and while a sibling is stalled or dead every other FSM burns ≈ a core yielding on it. Those are **dev-box numbers, measured with the FSMs alone on the box**; on a contended host the cost is far higher — the 2026-08-29 fleet run measured lockstep at **60×** its bounded twin on a `c6id.2xlarge` leader host also running the node and the client (`docs/benchmarks/uc2-m14-gate-2026-08-29.md`, row e). **Lockstep needs a free CPU per declared FSM on top of the node's own agents: the cost is a gradient, not a cliff at one point — 3 busy threads on 2 CPUs is ~4× down (624 k → ~150 k), the two hyperthreads of one core ~7× down (~87 k), and 3 busy threads on 1 CPU ~880× down (709 frames/s per FSM at N=2) — while bounded mode on that worst rung is unaffected at 7.4 M frames/s** (full ladder in the record) — an operating-envelope fact, not a defect: lengthening the barrier's yield ladder ×4/×16 and making it unbounded were both measured at exactly 1.00× (`docs/benchmarks/uc2-m14c2-lockstep-oversubscription-2026-08-30.md`). Size the host, or pin the FSM threads, accordingly. |
-| `snapshot_interval_bytes` | `0` → on demand only | Carried by this release and read by the coordinated-snapshot work; `0` means no cadence. |
-| `snapshot_target` | `"all"` | `"all"` or `"learners"`; any other value is refused by name. Carried, not yet acted on. |
+| `snapshot_interval_bytes` | `0` → on demand only | How much log the **leader** lets accrue before it appends another `SNAPSHOT` frame. `0` means **no cadence**: instants are operator-commanded only ([`uc2ctl snapshot`](uc2ctl.md#snapshot)), which is the default and matches purge being off by default. The clock measures from the last instant this leader *commanded*, and it is re-based to the append frontier at every leader open so election churn cannot become a snapshot storm — both make the cadence err late rather than early. A leader flapping faster than the interval therefore never snapshots on its own. |
+| `snapshot_target` | `"all"` | Who freezes for a **cadence-issued** instant: `"all"` (every node's rows) or `"learners"` (only a learner's — the standby form, so no voter pays the freeze and a voter picks the set up with [`uc2ctl snapshot fetch`](uc2ctl.md#snapshot-fetch)). Any other value is refused by name. `uc2ctl snapshot --standby` overrides it per command. |
 
 Both `0` sentinels keep their meanings under that refusal: `fsm_lag = 0`
 ("derive this node's boot value") and `"lockstep"` are not byte bounds, so
@@ -258,10 +258,13 @@ Seed for the randomised timeout.
 **`purge: PurgePolicy`**
 Journal purge policy. Default `PurgePolicy::Disabled`. The enabled form is
 `PurgePolicy::BelowSnapshot { slack_bytes }`.
-A `SnapshotPolicy` shortens a service restart only together with purge:
-reconstruction installs the newest artifact only when the journal no longer
-covers the start position (`uc_service/src/replay.rs:73-78`); with purge off it
-replays the whole journal.
+Snapshots shorten a service restart only together with purge: reconstruction
+installs an artifact only when the journal no longer covers the start
+position (`uc_service/src/replay.rs`); with purge off it replays the whole
+journal. There is no per-service snapshot policy since 2.11 (pending) —
+`SnapshotPolicy` is gone and a snapshot is taken at a **coordinated instant**,
+commanded with [`uc2ctl snapshot`](uc2ctl.md#snapshot) or by the replicated
+`snapshot_interval_bytes` cadence below.
 To turn it on, see [Keep the journal from growing without bound](../how-to/bound-journal-growth.md).
 
 **`crypto: CryptoConfig`**
