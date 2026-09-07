@@ -470,6 +470,13 @@ pub const REASON_SNAPSHOT_UNSUPPORTED: u32 = 48;
 /// membership holds no learner. Only a learner freezes for a standby instant
 /// (spec §5.7), so nothing anywhere would build the set.
 pub const REASON_SNAPSHOT_NO_LEARNER: u32 = 49;
+/// A `snapshot fetch` (admin op 9) named a position ABOVE this node's durable
+/// frontier — an operator typo, or a learner transiently ahead of this voter.
+/// Refused at the door: a stored set is adopted as this node's snapshot floor,
+/// and a floor above the log would have `recover` install an artifact ahead of
+/// the bytes it summarises. The pull is legitimate again as soon as this
+/// node's log has caught up to it.
+pub const REASON_SNAPSHOT_ABOVE_DURABLE: u32 = 50;
 
 /// Why [`Consensus::command_snapshot`] refused to append a `SNAPSHOT` frame.
 ///
@@ -722,8 +729,13 @@ pub enum FetchRefusal {
     /// This node has no address for that member (it is not in the peer map),
     /// so no request can be addressed to it.
     UnknownPeer,
-    /// The consensus agent did not answer in time, or the receiver's fetch
-    /// route was momentarily full. Side-effect-free: re-run the verb.
+    /// The position named is above this node's own durable frontier — see
+    /// [`REASON_SNAPSHOT_ABOVE_DURABLE`]. Legitimate again once the log has
+    /// caught up.
+    AboveDurable,
+    /// A fetch is already in flight here, the consensus agent did not answer
+    /// in time, or the receiver's fetch route was momentarily full.
+    /// Side-effect-free: re-run the verb.
     Retry,
 }
 
@@ -1922,6 +1934,7 @@ impl Node {
             pending_fetch: None,
             fetch_tx,
             stored_set_pos,
+            stored_above_durable: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
             snapshot_cmd_rx,
@@ -3109,6 +3122,11 @@ struct Consensus {
     /// [`Consensus::check_set_completeness`], which treats it exactly like a
     /// locally produced set.
     stored_set_pos: Arc<AtomicU64>,
+    /// The `stored_set_pos` value this node has already named as being ABOVE
+    /// its durable frontier (`0` = none outstanding). A latch, so a voter that
+    /// stays behind the learner it fetched from logs the condition once rather
+    /// than every pass; cleared the moment such a set is adopted.
+    stored_above_durable: u64,
     /// Spec §5.7 item 6: the learner the last standby instant this node
     /// commanded addressed, and that instant's position — the redirect hint
     /// the sender agent consults when it cannot serve a below-floor NAK.
@@ -4051,7 +4069,7 @@ impl Consensus {
                 .load(Ordering::Acquire),
         );
         if now.3 != self.last_snap_refusals.3 {
-            // Coordinated-snapshot spec §5.6 / Ruling P6: the SOURCE mixed two
+            // Coordinated-snapshot spec §5.6: the SOURCE mixed two
             // instants (or a forgery spliced one artifact of one set into
             // another). No per-row detail cell: the failure is a property of
             // the SET, not of a row, and the offending positions are already
@@ -5090,8 +5108,32 @@ impl Consensus {
         // own rows never froze at P, so there is no cnc slot to read it off.
         // One `Acquire` load per pass, and the same high-water-mark rule as
         // every other completion: the floor never moves backwards.
+        //
+        // Fix round 1, Important 3: and never ABOVE this node's own durable
+        // frontier. A locally built set cannot be — a row freezes only after
+        // applying to P, and apply is gated on `min(commit, durable)` (§5.4) —
+        // but a FETCHED one carries no such proof: it is the learner's
+        // instant, and a learner can be transiently ahead of this voter.
+        // Adopting it would make the purge floor, and after a restart
+        // `recover`, name a position this node's log has not reached. Held
+        // back (the artifacts stay on disk, untouched) and adopted by a later
+        // pass once the log catches up — named ONCE, on the edge, because a
+        // node that stays behind would otherwise log every pass.
         let stored = self.stored_set_pos.load(Ordering::Acquire);
-        if stored > seen {
+        let durable = self.cnc.counters().durable.load_acquire();
+        if stored > seen && stored > durable {
+            if self.stored_above_durable != stored {
+                self.stored_above_durable = stored;
+                crate::obs_event!(
+                    Warn,
+                    "snapshot_set_held_above_durable",
+                    node = self.id as u64,
+                    position = stored,
+                    durable = durable
+                );
+            }
+        } else if stored > seen {
+            self.stored_above_durable = 0;
             self.snapshot_set_position.store(stored, Ordering::Release);
             crate::obs_event!(
                 Info,
@@ -6820,8 +6862,17 @@ impl Consensus {
                 position,
                 Some(format!("node {learner_id} has no address on this node")),
             ),
-            // The receiver's route was momentarily full: side-effect-free, and
-            // `uc2ctl` polls a `2`.
+            Err(FetchRefusal::AboveDurable) => (
+                1,
+                REASON_SNAPSHOT_ABOVE_DURABLE,
+                position,
+                Some(format!(
+                    "position {position} is above this node's durable frontier {}",
+                    self.cnc.counters().durable.load_acquire()
+                )),
+            ),
+            // A fetch is already in flight here, or the receiver's route was
+            // momentarily full: side-effect-free, and `uc2ctl` polls a `2`.
             Err(FetchRefusal::Retry) => (2, 0, position, None),
         }
     }
@@ -6880,9 +6931,29 @@ impl Consensus {
     /// The membership check is against the COMMITTED cluster view — the
     /// authority on who is a learner — and the address comes from this node's
     /// own peer map, which is what a datagram can actually be addressed to.
+    ///
+    /// Fix round 1, Important 3: `position` is also bounded by this node's
+    /// DURABLE frontier. A stored set becomes this node's snapshot floor, and
+    /// the cluster agent's `recover` picks the newest artifact BY NAME at
+    /// boot — so a set fetched from above this node's log could be installed
+    /// ahead of the bytes it summarises. Refused at the door, by name, rather
+    /// than fetched and then silently held back. (`0` = "the learner's newest"
+    /// names no position and is not bounded here; the receiver refuses to
+    /// WRITE an answer above durable, and the completeness poll refuses to
+    /// adopt one — the two together close that case.)
     fn start_fetch(&mut self, learner_id: NodeId, position: u64) -> Result<(), FetchRefusal> {
         if learner_id == self.id || !self.cluster_view.membership().is_learner(learner_id) {
             return Err(FetchRefusal::NotALearner);
+        }
+        // Honour `PendingFetch`: one fetch at a time. A second request is
+        // answered `retry` rather than quietly replacing a transfer that is
+        // very likely still running (the receiver would drop the new one
+        // anyway — it holds a single intake).
+        if self.pending_fetch.is_some() {
+            return Err(FetchRefusal::Retry);
+        }
+        if position > self.cnc.counters().durable.load_acquire() {
+            return Err(FetchRefusal::AboveDurable);
         }
         let Some(&peer) = self.id_to_addr.get(&learner_id) else {
             return Err(FetchRefusal::UnknownPeer);
@@ -9703,6 +9774,7 @@ mod tests {
             pending_fetch: None,
             fetch_tx,
             stored_set_pos,
+            stored_above_durable: 0,
             snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
             snapshot_standby_position: Arc::new(AtomicU64::new(0)),
             snapshot_cmd_rx,
@@ -10020,11 +10092,28 @@ mod tests {
             "a stored set completes the set at its position"
         );
 
+        // Fix round 1, Important 3: a stored set ABOVE this node's durable
+        // frontier is NOT adopted. It stays on disk (nothing here deletes it)
+        // and the floor stays where it was — a floor above the log would have
+        // `recover` install an artifact ahead of the bytes it summarises.
+        let above = h.cons.cnc.counters().durable.load_acquire() + 4096;
+        h.cons.stored_set_pos.store(above, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            p,
+            "a stored set above durable is held back, not adopted"
+        );
+        // ...and adopted the moment the log catches up to it.
+        h.cons.cnc.counters().durable.store_release(above);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), above);
+
         // ...and it is a high-water mark like every other completion: a stale
         // (or repeated) stored value never moves it back.
         h.cons.stored_set_pos.store(2048, Ordering::Release);
         h.cons.check_set_completeness();
-        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), p);
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), above);
     }
 
     /// Spec §5.7 item 5: admin op 9 validates the target against the COMMITTED
@@ -10070,12 +10159,32 @@ mod tests {
         );
         assert!(h.cons.pending_fetch.is_some());
 
+        // Fix round 1, Minor: single in flight — a second request while one is
+        // pending is answered `retry`, which is what `PendingFetch` is for.
+        assert_eq!(h.cons.request_fetch(2, 4096).0, 2, "a fetch is in flight");
+        assert!(h.fetch_rx.try_recv().is_err(), "and nothing was re-asked");
+
         // It is retired once the receiver publishes a stored set — so the
         // operator's verb is re-runnable rather than the node looking busy
         // forever.
         h.cons.stored_set_pos.store(4096, Ordering::Release);
         h.cons.poll_pending_fetch();
         assert!(h.cons.pending_fetch.is_none());
+
+        // Fix round 1, Important 3: a position above this node's own durable
+        // frontier is refused BY NAME at the door. A stored set becomes this
+        // node's snapshot floor, and a floor above the log would have
+        // `recover` install an artifact ahead of the bytes it summarises.
+        let above = h.cons.cnc.counters().durable.load_acquire() + 4096;
+        let (status, reason, _, detail) = h.cons.request_fetch(2, above);
+        assert_eq!((status, reason), (1, REASON_SNAPSHOT_ABOVE_DURABLE));
+        assert!(detail.unwrap().contains("durable"));
+        assert!(h.fetch_rx.try_recv().is_err(), "nothing was asked for");
+        assert!(h.cons.pending_fetch.is_none());
+        // `0` — "the learner's newest" — is never above anything: it is
+        // whatever the learner has, and the completeness poll's own
+        // `<= durable` gate is what holds an over-reaching answer back.
+        assert_eq!(h.cons.request_fetch(2, 0).0, 0);
     }
 
     /// Spec §5.7 item 6: a leader's `SNAP_REDIRECT` is resolved through THIS

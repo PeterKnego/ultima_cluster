@@ -190,7 +190,7 @@ pub const CLUSTER_ARTIFACT_ID: u8 = 255;
 /// of staying an overrun the peer re-NAKs. Without the cluster half, the
 /// joiner's own completion rule (which requires the cluster artifact too)
 /// never closes for the mirror-image reason.
-/// Coordinated-snapshot spec §5.6, Ruling P6 — **the one-position rule**, the
+/// Coordinated-snapshot spec §5.6 — **the one-position rule**, the
 /// other half of the invariant: every artifact of a set carries the SAME
 /// `snapshot_pos`, because a set IS "the artifacts at one instant P". A source
 /// that mixes two instants would ship a joiner a cluster image (membership,
@@ -1842,7 +1842,7 @@ mod tests {
     use uc_log::cnc::{CncMeta, CncPage};
     use uc_log::region::Region;
     use uc_protocol::v2::crypto::{COUNTER_LEN, TAG_LEN, read_counter};
-    use uc_protocol::v2::datagram::read_datagram_header;
+    use uc_protocol::v2::datagram::{read_datagram_header, read_snap_redirect_body};
     use uc_protocol::v2::frame::{
         FRAME_TYPE_MESSAGE, FrameHeader, HEADER_LEN, OFF_TYPE, read_header,
         write_header_except_length,
@@ -3444,7 +3444,7 @@ mod tests {
     fn sender_with_two_artifacts() -> (Sender, Fake, tempfile::TempDir) {
         let f = Fake::new();
         let dir = tempfile::tempdir().unwrap();
-        // One SET is one instant (Ruling P6), so both rows' artifacts — and
+        // One SET is one instant (spec §5.6), so both rows' artifacts — and
         // the cluster one below — are tagged 2048; only the row id and the
         // length differ, which is what this fixture is actually about.
         let p0 = dir.path().join("0").join("snap-2048.ultsnap");
@@ -3761,7 +3761,7 @@ mod tests {
         );
 
         // A SECOND one at the same instant, so the count is the only thing
-        // wrong with it (Ruling P6's one-position rule would otherwise refuse
+        // wrong with it (spec §5.6's one-position rule would otherwise refuse
         // it first, and this test would stop saying anything about the count).
         set.artifacts.push(cluster_artifact(dir.path(), 2048));
         assert!(!set_is_valid(&set), "two cluster artifacts: refused");
@@ -4364,7 +4364,7 @@ mod tests {
 
     // ==== Coordinated-snapshot plan 2, Task 6 ===============================
 
-    /// Ruling P6, the ONE-POSITION rule on the ship side: a set is the
+    /// Spec §5.6, the ONE-POSITION rule on the ship side: a set is the
     /// artifacts at ONE instant P. A source that hands back a row artifact at
     /// one position and a cluster artifact at another is not a set — it is two
     /// halves of two different instants, and installing it would give the
@@ -4525,5 +4525,65 @@ mod tests {
         }
         assert!(s.snap.is_none(), "no session for a set we do not hold");
         assert!(f.recv_raw().is_none(), "not one datagram");
+    }
+
+    /// Spec §5.7 item 6: a below-floor NAK this node cannot serve is answered
+    /// with a redirect to the learner the node layer names — and ONLY when it
+    /// names one. The overrun is counted either way: the redirect is a hint,
+    /// not a substitute for the re-NAK.
+    #[test]
+    fn an_unservable_below_floor_nak_redirects_when_the_node_names_a_learner() {
+        let f = Fake::new();
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        // No snapshot source at all: every below-floor NAK is unservable.
+        let armed = Arc::new(AtomicBool::new(false));
+        let hint_armed = Arc::clone(&armed);
+        s.set_snap_redirect_hint(Arc::new(move || {
+            hint_armed
+                .load(Ordering::Relaxed)
+                .then_some((7u32, 12_288u64))
+        }));
+
+        // (a) the node names nobody: the NAK stays exactly what it was.
+        let before = s.stats().overruns.load(Ordering::Relaxed);
+        s.on_nak(f.addr(), 0, 96);
+        for _ in 0..2 {
+            s.do_work();
+        }
+        assert!(f.recv_raw().is_none(), "no redirect while none is armed");
+        assert!(s.stats().overruns.load(Ordering::Relaxed) > before);
+        assert_eq!(s.stats().snap_redirects.load(Ordering::Relaxed), 0);
+
+        // (b) armed: the same NAK now also gets a redirect naming the learner
+        //     and the instant.
+        armed.store(true, Ordering::Relaxed);
+        let before = s.stats().overruns.load(Ordering::Relaxed);
+        s.on_nak(f.addr(), 0, 96);
+        for _ in 0..2 {
+            s.do_work();
+        }
+        let (h, body) = f.recv().expect("a SNAP_REDIRECT reached the peer");
+        assert_eq!(h.kind, DGRAM_KIND_SNAP_REDIRECT);
+        let r = read_snap_redirect_body(&body).expect("a well-formed SNAP_REDIRECT body");
+        assert_eq!((r.learner_id, r.position), (7, 12_288));
+        assert_eq!(s.stats().snap_redirects.load(Ordering::Relaxed), 1);
+        assert!(
+            s.stats().overruns.load(Ordering::Relaxed) > before,
+            "still a counted overrun: the NAK went unserved here"
+        );
     }
 }

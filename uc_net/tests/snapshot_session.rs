@@ -63,7 +63,7 @@ fn snapshot_bytes(id: u8) -> Vec<u8> {
 }
 
 /// The artifact position FSM `id` publishes in these tests. Coordinated-
-/// snapshot spec §5.6 / Ruling P6 — the ONE-POSITION rule: a set is the
+/// snapshot spec §5.6 — the ONE-POSITION rule: a set is the
 /// artifacts at ONE instant, so this is the same P for every row (and for the
 /// cluster artifact below). It takes an `id` only so the call sites still read
 /// as "row `id`'s artifact's position".
@@ -72,7 +72,7 @@ fn snap_pos(_id: u8) -> u64 {
 }
 
 /// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT's position — the SET's, like
-/// every row's (Ruling P6). A session whose BEGINs disagree is refused.
+/// every row's (spec §5.6). A session whose BEGINs disagree is refused.
 const CLUSTER_POS: u64 = 64 * 1024;
 
 /// The cluster artifact's bytes (an opaque image to `uc_net` — the node layer
