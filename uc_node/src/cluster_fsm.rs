@@ -13,29 +13,29 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use uc_consensus::config::{ClusterConfig, ProposeError};
+use uc_protocol::v2::cluster_image::{
+    ClusterImageParts, decode_cluster_image, encode_cluster_image,
+};
 use uc_protocol::v2::config::{decode_config, encode_config};
 use uc_protocol::v2::frame::{ClusterKind, read_cluster_prefix};
 use uc_protocol::v2::schedule::{
     MAX_SCHEDULE_ENTRIES, ScheduleTable, decode_schedule_table, encode_schedule_table,
 };
 use uc_protocol::v2::settings::{
-    FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, SETTINGS_LEN, Settings, decode_settings, encode_settings,
+    FSM_LAG_LOCKSTEP, MIN_FSM_LAG_BYTES, Settings, decode_settings, encode_settings,
 };
 use uc_service::{ApplyCtx, RawStateMachine, SnapshotError, SnapshotStateMachine};
 
 use crate::node::{cluster_to_wire, wire_to_cluster_config};
 
-pub const CLUSTER_IMAGE_MAGIC: &[u8; 8] = b"UCCLUST1";
-/// The image layout's version, refused by `install_snapshot` when unknown.
-///
-/// Still `1` even though the layout changed twice during plan 1's
-/// development: nothing was released at any intermediate shape, so there is
-/// no artifact in the world to be compatible with. A pre-release image
-/// therefore fails the membership-length or CRC check rather than a version
-/// refusal — a fine outcome for an artifact that only exists on a developer's
-/// disk, and not a reason to burn a version number. Bump it for the first
-/// change made AFTER a release.
-pub const CLUSTER_IMAGE_VERSION: u32 = 1;
+/// Plan 3 (spec §4.8) moved the image codec itself to
+/// `uc_protocol::v2::cluster_image` — a `core`-friendly leaf a fuzz target
+/// can reach without `uc_node` — so a fuzz target can exercise the decoder
+/// directly; re-exported here under their original names since nothing in
+/// this crate's public surface should have to change to follow the move. See
+/// [`uc_protocol::v2::cluster_image::CLUSTER_IMAGE_VERSION`] for the "why
+/// still `1`" note.
+pub use uc_protocol::v2::cluster_image::{CLUSTER_IMAGE_MAGIC, CLUSTER_IMAGE_VERSION};
 
 /// The staged table file an admin client writes under the instance directory
 /// before sending `ADMIN_OP_SCHEDULE_APPLY`. Relative to `<instance_dir>`,
@@ -395,30 +395,35 @@ impl RawStateMachine for ClusterFsm {
 /// The frozen image: magic ‖ version u32 ‖ applied u64 ‖ table_position u64
 /// ‖ settings_position u64 ‖ membership (u32 len ‖ encode_config) ‖ table
 /// (u32 len ‖ encode_schedule_table) ‖ settings (SETTINGS_LEN) ‖ crc32 of
-/// everything before it.
+/// everything before it. The codec for this layout lives in
+/// `uc_protocol::v2::cluster_image` (plan 3, spec §4.8) — this impl owns only
+/// the state ⇄ `ClusterImageParts` conversion and the two membership/table
+/// records' own codecs (`config`/`schedule`), which the leaf does not know
+/// about.
 pub type ClusterImage = Vec<u8>;
 
 impl SnapshotStateMachine for ClusterFsm {
     type SnapshotHandle = ClusterImage;
 
     fn freeze(&self) -> Result<(ClusterImage, u64), SnapshotError> {
-        let mut img = Vec::new();
-        img.extend_from_slice(CLUSTER_IMAGE_MAGIC);
-        img.extend_from_slice(&CLUSTER_IMAGE_VERSION.to_le_bytes());
-        img.extend_from_slice(&self.state.applied.to_le_bytes());
-        img.extend_from_slice(&self.state.table_position.to_le_bytes());
-        img.extend_from_slice(&self.state.settings_position.to_le_bytes());
         let mut m = Vec::new();
         encode_config(&cluster_to_wire(&self.state.membership, 0), &mut m);
-        img.extend_from_slice(&(m.len() as u32).to_le_bytes());
-        img.extend_from_slice(&m);
         let mut t = Vec::new();
         encode_schedule_table(&self.state.table, &mut t);
-        img.extend_from_slice(&(t.len() as u32).to_le_bytes());
-        img.extend_from_slice(&t);
-        encode_settings(&self.state.settings, &mut img);
-        let crc = crc32fast::hash(&img);
-        img.extend_from_slice(&crc.to_le_bytes());
+        let mut s = Vec::new();
+        encode_settings(&self.state.settings, &mut s);
+        let mut img = Vec::new();
+        encode_cluster_image(
+            &ClusterImageParts {
+                applied: self.state.applied,
+                table_position: self.state.table_position,
+                settings_position: self.state.settings_position,
+                membership: &m,
+                table: &t,
+                settings: &s,
+            },
+            &mut img,
+        );
         Ok((img, self.state.applied))
     }
 
@@ -434,79 +439,32 @@ impl SnapshotStateMachine for ClusterFsm {
         let mut img = Vec::new();
         src.read_to_end(&mut img).map_err(SnapshotError::from)?;
         let bad = |what: &'static str| SnapshotError::Codec(what.into());
-        if img.len() < 8 + 4 + 8 + 8 + 8 + 4 + 4 + SETTINGS_LEN + 4
-            || &img[0..8] != CLUSTER_IMAGE_MAGIC
-        {
-            return Err(bad("cluster image magic"));
-        }
-        let (body, crc) = img.split_at(img.len() - 4);
-        if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().unwrap()) {
-            return Err(bad("cluster image crc"));
-        }
-        // CRC32 is a public checksum, not a MAC: a crafted-or-corrupt body can
-        // still match it, so every length-prefixed and fixed-width read below
-        // is bounds-checked with `.get(..)` before slicing — no declared
-        // length, however wrong, may panic (mirrors
-        // `uc_protocol::v2::config::decode_config`'s check-before-index
-        // posture).
-        let u32_at = |o: usize| -> Result<u32, SnapshotError> {
-            body.get(o..o + 4)
-                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                .ok_or_else(|| bad("cluster image truncated"))
-        };
-        let u64_at = |o: usize| -> Result<u64, SnapshotError> {
-            body.get(o..o + 8)
-                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-                .ok_or_else(|| bad("cluster image truncated"))
-        };
-        let mut o = 8;
-        if u32_at(o)? != CLUSTER_IMAGE_VERSION {
-            return Err(bad("cluster image version"));
-        }
-        o += 4;
-        let applied = u64_at(o)?;
-        o += 8;
-        if applied != position {
+        // Total, CRC-checked, exact-framing decode of the outer image — see
+        // `uc_protocol::v2::cluster_image::decode_cluster_image`'s doc for
+        // the bounds-checking posture. Its `None` covers every wire-level
+        // refusal at once (magic/version/crc/length-prefix/framing); the one
+        // refusal this caller can name that the leaf cannot is the position
+        // mismatch below, since the expected position is not part of the
+        // wire image.
+        let parts = decode_cluster_image(&img).ok_or_else(|| bad("cluster image"))?;
+        if parts.applied != position {
             return Err(bad("cluster image position"));
         }
-        let table_position = u64_at(o)?;
-        o += 8;
-        let settings_position = u64_at(o)?;
-        o += 8;
-        let ml = u32_at(o)? as usize;
-        o += 4;
-        let m_bytes = o
-            .checked_add(ml)
-            .and_then(|end| body.get(o..end))
-            .ok_or_else(|| bad("cluster image membership length"))?;
         let membership = wire_to_cluster_config(
-            &decode_config(m_bytes).ok_or_else(|| bad("cluster image membership"))?,
+            &decode_config(parts.membership).ok_or_else(|| bad("cluster image membership"))?,
         );
-        o += ml;
-        let tl = u32_at(o)? as usize;
-        o += 4;
-        let t_bytes = o
-            .checked_add(tl)
-            .and_then(|end| body.get(o..end))
-            .ok_or_else(|| bad("cluster image table length"))?;
-        let table = decode_schedule_table(t_bytes).ok_or_else(|| bad("cluster image table"))?;
-        o += tl;
-        // `decode_settings` is itself exact-length (no trailing bytes
-        // tolerated), so require the remainder to be exactly `SETTINGS_LEN`
-        // rather than handing it a slice that could run past `body`'s end.
-        if o.checked_add(SETTINGS_LEN) != Some(body.len()) {
-            return Err(bad("cluster image settings length"));
-        }
-        let settings = decode_settings(&body[o..]).ok_or_else(|| bad("cluster image settings"))?;
+        let table = decode_schedule_table(parts.table).ok_or_else(|| bad("cluster image table"))?;
+        let settings =
+            decode_settings(parts.settings).ok_or_else(|| bad("cluster image settings"))?;
         self.state = ClusterState {
             membership,
             table,
-            table_position,
+            table_position: parts.table_position,
             settings,
-            settings_position,
-            applied,
+            settings_position: parts.settings_position,
+            applied: parts.applied,
         };
-        Ok(applied)
+        Ok(parts.applied)
     }
 }
 
