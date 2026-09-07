@@ -602,8 +602,43 @@ fn no_common_prefix_reaches_wipe_and_fatal_when_disabled() {
     assert_eq!(w.wipes(), 0, "no wipe counted in the counterfactual");
 }
 
+/// One coordinated snapshot instant per this many steps in the fuzz tiers —
+/// 20 000 / 500 = up to 40 command attempts per run, which lands ~30-40
+/// instants (a leaderless window skips one). See [`run_storm_with_instants`].
+const STORM_INSTANT_STEPS: u64 = 500;
+
+/// Drive a fuzz-tier world to its step budget while COMMANDING coordinated
+/// snapshot instants (cluster-FSM spec §5.1) on whatever node currently leads,
+/// one every [`STORM_INSTANT_STEPS`] steps. Under the storm's drops, dups and
+/// crashes that is a stream of instants across leader changes: some commit and
+/// complete on every node, some are abandoned when their leader is deposed,
+/// some are truncated with the tail that carried them — the exact mix inv11
+/// exists to judge, run against the same seeds every other invariant is fuzzed
+/// on. Returns the number of instants the ledger ended up holding.
+///
+/// No standby-flagged instants here: the fuzz arms have no learner, and spec
+/// §5.7's flag is only meaningful when one exists (the directed
+/// `a_standby_instant_completes_only_on_the_learner` covers that half).
+fn run_storm_with_instants(w: &mut World, budget: u64) -> Result<usize, InvariantViolation> {
+    for _ in 0..(budget / STORM_INSTANT_STEPS) {
+        if let Some(l) = w.current_leader() {
+            w.command_snapshot(l, false);
+        }
+        w.run_steps(STORM_INSTANT_STEPS)?;
+    }
+    w.run()?;
+    Ok(w.instants().len())
+}
+
 #[test]
 fn fuzz_default_seeds() {
+    // Every arm below commands instants (`run_storm_with_instants`): inv11 is
+    // fuzzed on the same seeds as every other invariant, not only on the three
+    // directed scenarios. These two totals are the tier's non-vacuity floor —
+    // a change that silently stopped commanding, or stopped completing, would
+    // otherwise leave inv11 green because it judged nothing.
+    let mut instants = 0usize;
+    let mut sets = 0usize;
     for seed in 0..50u64 {
         let mut w = World::new(SimConfig {
             n_nodes: 3,
@@ -614,9 +649,11 @@ fn fuzz_default_seeds() {
             crash_per_million: 500,
             ..SimConfig::default()
         });
-        if let Err(v) = w.run() {
-            panic!("seed {seed}: {v}");
+        match run_storm_with_instants(&mut w, 20_000) {
+            Ok(n) => instants += n,
+            Err(v) => panic!("seed {seed}: {v}"),
         }
+        sets += (0..3).map(|i| w.complete_sets(i).len()).sum::<usize>();
     }
     // Same seeds, run against the REAL intake-gate mechanism (guarded, as the node
     // ships it). Mechanism is ADDED alongside the default Gated tier above — the
@@ -635,9 +672,11 @@ fn fuzz_default_seeds() {
             },
             ..SimConfig::default()
         });
-        if let Err(v) = w.run() {
-            panic!("seed {seed} (Mechanism): {v}");
+        match run_storm_with_instants(&mut w, 20_000) {
+            Ok(n) => instants += n,
+            Err(v) => panic!("seed {seed} (Mechanism): {v}"),
         }
+        sets += (0..3).map(|i| w.complete_sets(i).len()).sum::<usize>();
     }
     // M14b: the same seeds with one node's report capped from the first
     // leader on — a capped MINORITY under drops/dups/crashes. Every invariant
@@ -658,18 +697,35 @@ fn fuzz_default_seeds() {
         }
         let capped = (seed % 3) as usize;
         w.set_apply_ceiling(capped, Some(w.max_commit() + 96));
-        if let Err(v) = w.run() {
-            panic!("seed {seed} (capped node {capped}): {v}");
+        match run_storm_with_instants(&mut w, 20_000) {
+            Ok(n) => instants += n,
+            Err(v) => panic!("seed {seed} (capped node {capped}): {v}"),
         }
+        sets += (0..3).map(|i| w.complete_sets(i).len()).sum::<usize>();
     }
+    // A capped node's applied frontier is what the ceiling clamps, so the
+    // third arm is also the one where a node lags instants its peers complete
+    // — inv11's non-prefix shape, arrived at by the storm rather than by a
+    // scripted decline.
+    assert!(
+        instants > 1_000 && sets > 1_000,
+        "the fuzz tier must actually command and complete instants \
+         ({instants} instants, {sets} completed sets over 150 runs)"
+    );
 }
 
 #[cfg(feature = "sim-heavy")]
 #[test]
 fn fuzz_heavy_seeds() {
+    // This arm carries the only FIVE-node clusters in the fuzz tiers, so it is
+    // where instants (`run_storm_with_instants`) meet a quorum wider than
+    // three — one more node whose applied frontier can lag an instant its
+    // peers complete.
+    let mut instants = 0usize;
     for seed in 0..1000u64 {
+        let n = if seed % 4 == 0 { 5 } else { 3 };
         let mut w = World::new(SimConfig {
-            n_nodes: if seed % 4 == 0 { 5 } else { 3 },
+            n_nodes: n,
             seed,
             max_steps: 20_000,
             drop_per_million: 50_000,
@@ -677,10 +733,15 @@ fn fuzz_heavy_seeds() {
             crash_per_million: 1_000,
             ..SimConfig::default()
         });
-        if let Err(v) = w.run() {
-            panic!("seed {seed}: {v}");
+        match run_storm_with_instants(&mut w, 20_000) {
+            Ok(k) => instants += k,
+            Err(v) => panic!("seed {seed}: {v}"),
         }
     }
+    assert!(
+        instants > 20_000,
+        "the heavy tier must actually command instants ({instants} over 1000 runs)"
+    );
     // The 1000-seed storm against the REAL intake-gate mechanism (guarded, as the
     // node ships it). ADDED alongside the Gated tier above — Mechanism is the
     // discipline the node actually runs, so it gets its own heavy fuzz.

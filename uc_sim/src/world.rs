@@ -44,7 +44,8 @@
 //! See `stale_vote_credential_opens_a_term_below_a_committed_position`.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Included};
 
 use uc_consensus::config::{Addr, ClusterConfig, ConfigOp, ProposeError};
 use uc_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
@@ -744,7 +745,11 @@ struct Node {
     apply_ceiling: Option<u64>,
     // ---- Task 9: coordinated snapshot sets (cluster-FSM spec §5.3) ----
     /// The instants this node has a COMPLETE SET at, ascending, as
-    /// `(position, appending term)`. A set is complete once every declared row
+    /// `(position, appending term)`. Ascending because completion walks the
+    /// ledger index in position order over the span the frontier newly
+    /// crossed, AND because a truncation drops every entry above its cut
+    /// (`on_truncated_feedback`) before a lower-lineage instant can arrive —
+    /// without that prune a refilled position could append below the tail. A set is complete once every declared row
     /// and the cluster FSM have frozen at P; the sim has no rows, so the node
     /// completes P when its own applied frontier — `min(commit, durable)`, the
     /// position the real apply loop polls and the frontier inv12 reads — has
@@ -762,6 +767,21 @@ struct Node {
     /// IGNORES the frame; if one exists the set is simply incomplete". What
     /// makes inv11's non-prefix shape real rather than theoretical.
     snap_declined: Vec<u64>,
+    /// The applied frontier this node's set-completion sweep has already
+    /// examined: every instant at or below it has been judged once and will
+    /// not be looked at again, so an event costs only the instants the
+    /// frontier NEWLY crossed. Monotone within a lineage, and lowered exactly
+    /// where the lineage can change under it: to the cut at a settled
+    /// truncation (a refill re-crosses those positions, possibly holding a
+    /// frame it did not hold before), and to 0 at a crash/restart, where
+    /// `complete_sets` is cleared with `commit`. Because the truncation prune
+    /// drops every entry ABOVE the cut and the cursor drops TO the cut, no
+    /// surviving entry is ever re-examined — the sweep cannot double-list.
+    snap_cursor: u64,
+    /// How many entries of `complete_sets` inv11 has already judged (see
+    /// `World::check_set_alignment`'s "judged once" note). Clamped to the
+    /// list's length when a truncation prunes its tail, zeroed with the list.
+    sets_judged: usize,
 }
 
 /// T13: one node's crypto-plane state. `peers`/`group` are pure `(input,
@@ -871,11 +891,20 @@ pub struct World {
     /// frontier implication are both recomputed from it.
     config_frames: Vec<CfgFrame>,
     /// Task 9: the SNAPSHOT-frame ledger (cluster-FSM spec §5.1) — every
-    /// instant ever appended by any leader, any lineage, in append order
-    /// (NOT sorted by position: a new leader appends below a deposed one's
-    /// abandoned tail). Node-level completeness is recomputed from it, and
-    /// inv11 judges every listed set against it.
-    snapshot_frames: Vec<SnapFrame>,
+    /// instant ever appended by any leader, any lineage — INDEXED BY FRAME
+    /// END. Two lineages can end a frame at the same byte (a deposed leader's
+    /// abandoned instant and a new leader's), hence a `Vec` per position; a
+    /// node holds at most one of them, since `term_at` is a function of its
+    /// own map. The index is what keeps the per-event sweep off the ledger's
+    /// length: completion walks only the `range` a node's frontier newly
+    /// crossed, and inv11's "is this a frame" test is one lookup rather than a
+    /// scan (fix round 1 — the linear form was quadratic in instants).
+    snapshot_frames: BTreeMap<u64, Vec<SnapFrame>>,
+    /// inv11 (c): the first node to list each instant, and under which frame.
+    /// Kept across sweeps rather than rebuilt, so a node that lists a position
+    /// another node listed under a DIFFERENT frame is convicted even if the
+    /// first lister has since truncated or restarted.
+    snapshot_claims: BTreeMap<u64, (NodeId, u32)>,
     /// The genesis config (identical on every node) — the version-0 baseline of
     /// the frontier implication.
     genesis_config: ClusterConfig,
@@ -1008,6 +1037,8 @@ impl World {
                 apply_ceiling: None,
                 complete_sets: Vec::new(),
                 snap_declined: Vec::new(),
+                snap_cursor: 0,
+                sets_judged: 0,
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
@@ -1027,7 +1058,9 @@ impl World {
             vote_drop_until: 0,
             crash_on_truncate: false,
             config_frames: Vec::new(),
-            snapshot_frames: Vec::new(),
+            snapshot_frames: BTreeMap::new(),
+
+            snapshot_claims: BTreeMap::new(),
             genesis_config: genesis,
             admitted_ever,
             pending_violation: None,
@@ -1773,6 +1806,8 @@ impl World {
         // instant — `commit` is volatile and restarts at 0, so a carried-over
         // list would sit above it. Same shape as the `cfg_observed` re-scan.
         nd.complete_sets.clear();
+        nd.snap_cursor = 0;
+        nd.sets_judged = 0;
         // Issue #7: a fresh `ElectionSm` is seeded FROM `durable`, so the
         // consensus agent's shadow starts in step with it — no phantom "advance"
         // on the first post-restart poll.
@@ -1875,6 +1910,14 @@ impl World {
             // model staying honest afterwards, not the check.
             nd.complete_sets.retain(|(end, _)| *end <= to);
             nd.snap_declined.retain(|end| *end <= to);
+            // The completion cursor drops TO the cut: a refill re-crosses
+            // those positions and may hold a frame this node did not hold
+            // before. Every surviving entry is at or below the cut, so
+            // nothing already listed can be listed twice.
+            nd.snap_cursor = nd.snap_cursor.min(to);
+            // inv11 judged the pruned entries already; the survivors keep
+            // their verdict, so only the count needs clamping.
+            nd.sets_judged = nd.sets_judged.min(nd.complete_sets.len());
         }
         self.drain_cfg_obs(node, now, step)?;
         // inv8 — revert correctness, pinned at the exact point the truncation
@@ -1924,8 +1967,7 @@ impl World {
             .iter()
             .filter(|f| {
                 f.end <= durable
-                    && f.end > 0
-                    && term_at(&self.nodes[node].term_map, f.end - 1) == f.term
+                    && self.holds_frame(node, f.end, f.term)
                     && !self.nodes[node].cfg_observed.contains(&f.end)
             })
             .map(|f| (f.end, f.config.clone()))
@@ -2042,7 +2084,7 @@ impl World {
                 // Content identity: a frame from a lineage this node does not
                 // hold was never in ITS log, so its FSM never applied it (the
                 // ledger is cluster-wide, the log is per node).
-                if term_at(&nd.term_map, f.end - 1) != f.term {
+                if !self.holds_frame(i, f.end, f.term) {
                     continue;
                 }
                 checks += 1;
@@ -2098,7 +2140,21 @@ impl World {
         let nd = &mut self.nodes[node];
         nd.append += FRAME;
         let end = nd.append;
-        self.snapshot_frames.push(SnapFrame { term, end, standby });
+        self.snapshot_frames
+            .entry(end)
+            .or_default()
+            .push(SnapFrame { term, end, standby });
+    }
+
+    /// CONTENT IDENTITY, shared by both frame ledgers (M7 config frames and
+    /// Task 9 snapshot instants): node `node` holds the frame ending at `end`
+    /// under `term` iff its own lineage at the frame's LAST BYTE is that term
+    /// (spec §6 — within a term the bytes are identical cluster-wide, so the
+    /// term at a position IS its content identity). The ledgers are
+    /// cluster-wide; a log is per node, and this is the one test that relates
+    /// them. `end == 0` is not a frame.
+    fn holds_frame(&self, node: usize, end: u64, term: u32) -> bool {
+        end > 0 && term_at(&self.nodes[node].term_map, end - 1) == term
     }
 
     /// Task 9 — SET COMPLETION (cluster-FSM spec §5.3). Detected per node, on
@@ -2146,25 +2202,29 @@ impl World {
             };
             #[cfg(not(feature = "mutation-testing"))]
             let frontier = nd.commit.min(nd.durable);
+            if frontier <= nd.snap_cursor {
+                continue; // no instant newly crossed: nothing to look at
+            }
             let is_learner = nd.sm.config().learners.iter().any(|&(id, _)| id == nd.id);
-            let mut due: Vec<(u64, u32)> = self
+            // Only the span the frontier NEWLY crossed, walked in position
+            // order — so `due` is ascending without a sort, and an event's
+            // cost is the number of instants in that span, not the ledger's
+            // length. At most one frame per position can pass `holds_frame`
+            // (`term_at` is a function of this node's own map).
+            let due: Vec<(u64, u32)> = self
                 .snapshot_frames
-                .iter()
+                .range((Excluded(nd.snap_cursor), Included(frontier)))
+                .flat_map(|(_, frames)| frames.iter())
                 .filter(|f| {
-                    f.end > 0
-                        && f.end <= frontier
-                        && term_at(&nd.term_map, f.end - 1) == f.term
+                    self.holds_frame(i, f.end, f.term)
                         && (!f.standby || is_learner)
                         && !nd.snap_declined.contains(&f.end)
-                        && !nd.complete_sets.iter().any(|&(end, _)| end == f.end)
                 })
                 .map(|f| (f.end, f.term))
                 .collect();
-            if due.is_empty() {
-                continue;
-            }
-            due.sort_unstable(); // ascending: sets complete in stream order
-            self.nodes[i].complete_sets.extend(due);
+            let nd = &mut self.nodes[i];
+            nd.snap_cursor = frontier;
+            nd.complete_sets.extend(due);
         }
     }
 
@@ -2198,52 +2258,78 @@ impl World {
     ///     content unique), so this can only fire if that construction breaks;
     ///     it is asserted anyway, because "sets are position-aligned" is the
     ///     sentence §5.3 leans on when it says no acks are needed.
-    fn check_set_alignment(&self, step: u64) -> Result<u64, InvariantViolation> {
+    /// ## Judged once per set, not re-swept
+    ///
+    /// Each (node, set) pair is judged at the first sweep after it is listed
+    /// and never again — the same DOCUMENTED DEVIATION inv1/3/4/5 take (see
+    /// `step_once`), and equivalent-or-stricter for the same reason: all three
+    /// halves are MONOTONE, so a pair that passes once cannot start failing.
+    ///
+    /// * (a) `commit` never decreases within a run (inv3 is exactly that
+    ///   check) and is zeroed only at a crash / halt / restart, which clear
+    ///   `complete_sets` and the judged cursor with it.
+    /// * (b) the ledger only grows, and `global_max_commit` only rises.
+    /// * (c) the claim map is kept across sweeps, so a later node listing the
+    ///   same position under a different frame is still convicted — including
+    ///   against a claimer that has since been truncated or restarted, which
+    ///   is stricter than rebuilding the map each sweep.
+    ///
+    /// The counter it returns therefore counts each pair ONCE, which is the
+    /// honest non-vacuity number (the per-event re-sweep it replaces inflated
+    /// it by the number of events each set survived).
+    fn check_set_alignment(&mut self, step: u64) -> Result<u64, InvariantViolation> {
         // Fast exit for every scenario that never commands an instant.
         if self.snapshot_frames.is_empty() {
             return Ok(0);
         }
         let mut checks = 0u64;
-        // (c): the first lister of each position, walked in node order — a
-        // BTreeMap, never a hash container, so the reported pair is stable.
-        let mut claimed: std::collections::BTreeMap<u64, (NodeId, u32)> =
-            std::collections::BTreeMap::new();
         for i in 0..self.cfg.n_nodes {
+            let judged = self.nodes[i].sets_judged;
+            if judged == self.nodes[i].complete_sets.len() {
+                continue; // nothing newly listed
+            }
             let nd = &self.nodes[i];
             let mut above_commit: Vec<u64> = Vec::new();
             let mut uncommitted: Vec<(u64, u32)> = Vec::new();
             let mut disagreeing: Vec<(u64, u32, NodeId, u32)> = Vec::new();
-            for &(end, term) in &nd.complete_sets {
+            let mut fresh_claims: Vec<(u64, NodeId, u32)> = Vec::new();
+            for &(end, term) in &nd.complete_sets[judged..] {
                 checks += 1;
                 if end > nd.commit {
                     above_commit.push(end);
                 }
                 let in_ledger = self
                     .snapshot_frames
-                    .iter()
-                    .any(|f| f.end == end && f.term == term);
+                    .get(&end)
+                    .is_some_and(|frames| frames.iter().any(|f| f.term == term));
                 if !in_ledger || end > self.checker.global_max_commit {
                     uncommitted.push((end, term));
                 }
-                match claimed.get(&end) {
+                // (c): the first lister of each position wins the claim — the
+                // nodes are walked in index order and the map is a BTreeMap,
+                // never a hash container, so the reported pair is stable.
+                match self.snapshot_claims.get(&end) {
                     Some(&(other, other_term)) => {
                         if other_term != term {
                             disagreeing.push((end, term, other, other_term));
                         }
                     }
-                    None => {
-                        claimed.insert(end, (i as NodeId, term));
-                    }
+                    None => fresh_claims.push((end, i as NodeId, term)),
                 }
             }
+            let commit = nd.commit;
             self.checker.check_set_alignment(
                 i as NodeId,
-                nd.commit,
+                commit,
                 &above_commit,
                 &uncommitted,
                 &disagreeing,
                 step,
             )?;
+            for (end, who, term) in fresh_claims {
+                self.snapshot_claims.insert(end, (who, term));
+            }
+            self.nodes[i].sets_judged = self.nodes[i].complete_sets.len();
         }
         Ok(checks)
     }
@@ -2263,8 +2349,7 @@ impl World {
         };
         for f in &self.config_frames {
             if f.end <= upto
-                && f.end > 0
-                && term_at(&nd.term_map, f.end - 1) == f.term
+                && self.holds_frame(node, f.end, f.term)
                 && f.config.version > best.version
             {
                 best = &f.config;
@@ -3131,6 +3216,8 @@ impl World {
                 nd.append = nd.durable;
                 nd.commit = 0;
                 nd.complete_sets.clear(); // volatile with `commit` (Task 9)
+                nd.snap_cursor = 0;
+                nd.sets_judged = 0;
                 nd.truncating = false;
                 nd.new_term_pos = None;
                 nd.leader_hint = None;
@@ -3164,6 +3251,8 @@ impl World {
             nd.append = nd.durable;
             nd.commit = 0;
             nd.complete_sets.clear(); // volatile with `commit` (Task 9)
+            nd.snap_cursor = 0;
+            nd.sets_judged = 0;
             nd.truncating = false;
             nd.new_term_pos = None;
             nd.leader_hint = None;
@@ -3294,10 +3383,15 @@ impl World {
     }
 
     /// Task 9: every instant in the World's SNAPSHOT-frame ledger, as
-    /// frame-END positions, in append order — including ones no node will ever
-    /// complete a set at (abandoned or truncated).
+    /// frame-END positions, ASCENDING — including ones no node will ever
+    /// complete a set at (abandoned or truncated), and including a position
+    /// twice if two lineages both ended a frame there (so the length is the
+    /// number of frames commanded, not of distinct positions).
     pub fn instants(&self) -> Vec<u64> {
-        self.snapshot_frames.iter().map(|f| f.end).collect()
+        self.snapshot_frames
+            .values()
+            .flat_map(|frames| frames.iter().map(|f| f.end))
+            .collect()
     }
 
     /// Task 9: the instants `node` currently has a COMPLETE SET at, ascending
