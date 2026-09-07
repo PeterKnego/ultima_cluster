@@ -112,6 +112,13 @@
 #                     hundreds of MB; the default is to reclaim them once
 #                     their binary is copied out, so a series of runs does
 #                     not accumulate them). The run prints each kept path.
+#   --harness-a FILE  overlay FILE on the A (base) arm only; --harness-b FILE
+#                     on B and B' only. For a pair whose arms cannot share one
+#                     harness (e.g. base 17d5c6b, whose own harness works but
+#                     predates the current uc_node API, against a head inside
+#                     the svc_sched-ring window whose own harness cannot start):
+#                     give the head side a harness that builds AND creates the
+#                     ring. The two harnesses then differ — say so when quoting.
 #   --harness FILE    copy FILE over each arm's
 #                     `uc_node/examples/apply_bench.rs` before building, so
 #                     every arm runs the IDENTICAL harness and only the
@@ -152,6 +159,8 @@ ROOT="$HOME/scratch/apply_ab"
 REUSE_TARGETS=0
 KEEP_TARGETS=0
 HARNESS=""
+HARNESS_A=""   # overlay for the A (base) arm only — a pair whose arms need DIFFERENT harnesses
+HARNESS_B=""   # overlay for the B and B' (head) arms only
 BIN_A=""
 BIN_B=""
 BIN_BP=""
@@ -171,6 +180,8 @@ while [ $# -gt 0 ]; do
         --reuse-targets) REUSE_TARGETS=1; shift ;;
         --keep-targets) KEEP_TARGETS=1; shift ;;
         --harness) HARNESS="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
+        --harness-a) HARNESS_A="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
+        --harness-b) HARNESS_B="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
         --bin-a) BIN_A="$2"; shift 2 ;;
         --bin-b) BIN_B="$2"; shift 2 ;;
         --bin-bp) BIN_BP="$2"; shift 2 ;;
@@ -281,6 +292,14 @@ if [ "$SELFTEST" -eq 1 ]; then
           "head_vs_base_pct":0.0,"resolution_pct":0.09803921568627451,
           "verdict":"inconclusive (noisy run)","runs_per_arm":2}' \
         1000000 1040000  1020000 1020000  1021000 1021000
+    # Case 5 — Ruling Q8': a delta far above BOTH the resolution and twice the
+    #   worst sem is a signal even though the run is noisy (row d read -26.8 %
+    #   with 0.13 % sems against a 0.026 % resolution and the old gate called it
+    #   "noisy"): head -30 %, arm A sem ~2.8 %, resolution 0.14 % -> outside.
+    selftest_case outside_noisy \
+        '{"a_mean":1000000.0,"b_mean":700000.0,"bp_mean":701000.0,
+          "head_vs_base_pct":-30.0,"verdict":"outside resolution","runs_per_arm":2}' \
+        960000 1040000  700000 700000  701000 701000
     # Case 4 — Ruling Q9: arm B never stalls the pacing loop (pace_stalls=0
     #   on every rep), so B's `min_rate` is measuring the driver, not the
     #   apply hop, however the means and sems compare — the driver-bound
@@ -290,7 +309,7 @@ if [ "$SELFTEST" -eq 1 ]; then
           "verdict":"inconclusive (driver-bound)","runs_per_arm":2}' \
         1000000 1000000  1000000 1000000  1000000 1000000 \
         100 0 100
-    echo "== selftest PASSED (all four verdicts)"
+    echo "== selftest PASSED (all five cases)"
     exit 0
 fi
 
@@ -341,6 +360,10 @@ build_arm() { # $1 = arm label (a|b|bp), $2 = sha, $3 = target-dir suffix
     git -C "$REPO" worktree add --detach --quiet "$wt" "$sha"
     WORKTREES+=("$wt")
     [ -z "$HARNESS" ] || cp "$HARNESS" "$wt/uc_node/examples/apply_bench.rs"
+    case "$arm" in
+        a)    [ -z "$HARNESS_A" ] || cp "$HARNESS_A" "$wt/uc_node/examples/apply_bench.rs" ;;
+        b|bp) [ -z "$HARNESS_B" ] || cp "$HARNESS_B" "$wt/uc_node/examples/apply_bench.rs" ;;
+    esac
     ( cd "$wt" && CARGO_TARGET_DIR="$target" \
         cargo build --release --locked -p uc_node --example apply_bench >&2 )
     cp "$target/release/examples/apply_bench" "$RUN_DIR/apply_bench.$arm"
@@ -530,14 +553,21 @@ unknown_arms = [k for k in ("A", "B", "Bp") if not st[k]["pace_stalls_known"]]
 # never stalled the pacing loop, that arm's min_rate is the driver's own
 # ceiling, not the apply hop's, and nothing downstream of that number means
 # what the other verdicts claim it means.
+# Ruling Q8' (2026-09-07, after row d read -26.8 % with a 0.026 % resolution
+# and 0.13 % sems and the Q8 gate called it "noisy"): a delta that clears BOTH
+# the rebuild resolution AND twice the worst arm's standard error is a real
+# signal whatever the noise gate says; "within" still demands a quiet run
+# (sem <= resolution) because a null result is only worth claiming when the
+# run could have seen a regression; everything else is inconclusive.
+signal_bar = max(resolution, 2.0 * worst_sem)
 if driver_bound:
     verdict = "inconclusive (driver-bound)"
+elif abs(head_vs_base) > signal_bar:
+    verdict = "outside resolution"
 elif worst_sem > resolution:
     verdict = "inconclusive (noisy run)"
-elif abs(head_vs_base) <= resolution:
-    verdict = "within resolution"
 else:
-    verdict = "outside resolution"
+    verdict = "within resolution"
 
 print("\n== summary (SMOKE — a ratio against a control arm, not a gate)")
 for k, label in (("A", "A  base      "), ("B", "B  head      "),
@@ -547,14 +577,17 @@ for k, label in (("A", "A  base      "), ("B", "B  head      "),
           "spread %5.2f %%  sem %6.3f %%"
           % (label, s["n"], s["mean"], s["p50"], s["min"], s["max"],
              s["spread_pct"], s["sem_pct"]))
-    print("                 driver mean %12.0f  driver/min %.3f  pace_stalls(sum) %d"
-          % (s["driver_mean"], s["driver_over_min"], s["pace_stalls_sum"]))
+    print("                 driver mean %12.0f  driver/min %.3f  pace_stalls(sum) %s"
+          % (s["driver_mean"], s["driver_over_min"],
+             ("%d" % s["pace_stalls_sum"]) if s["pace_stalls_known"] else "n/a"))
 print("   box: loadavg 1-min %.2f, other cargo/rustc %d" % (load1, other_builds))
 print("   head vs base     %+7.3f %%   (the candidate)" % head_vs_base)
 print("   head vs head'    %7.3f %%   (the RESOLUTION — the bar, build noise alone)"
       % resolution)
 print("   worst arm sem    %7.3f %%   (run quality; must be <= the resolution)"
       % worst_sem)
+print("   signal bar       %7.3f %%   (max(resolution, 2 x worst sem): |delta| above it is a signal)"
+      % signal_bar)
 if unknown_arms:
     print("   NOTE: arm(s) %s run a harness that predates `pace_stalls` (pre-plan-3"
           % ",".join(unknown_arms))
