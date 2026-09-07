@@ -1003,18 +1003,28 @@ pub struct FollowerReceiver {
     /// A fetch whose `SNAP_REQUEST` has gone out and whose session has not
     /// opened yet — see [`ArmedFetch`].
     armed_fetch: Option<ArmedFetch>,
-    /// Fix round 2 (Ruling P11): the session id of the fetch whose arm most
-    /// recently EXPIRED. A `SNAP_BEGIN` carrying it is refused
+    /// Fix round 2 (Ruling P11): the `(peer, session)` of the fetch whose arm
+    /// most recently EXPIRED. A `SNAP_BEGIN` matching BOTH is refused
     /// (`snap_refused_fetch_expired`) rather than taken as an ordinary
     /// session: the answer to a fetch that timed out would otherwise fall to
     /// the default [`IntakeMode::Install`] and be installed by fiat.
     ///
-    /// One slot, overwritten by the next expiry — fetches are operator-driven
-    /// and one at a time. The signal is the id THIS node minted for a fetch,
-    /// never the position: an Install session whose artifacts sit far above
-    /// this node's durable frontier is exactly what a below-floor joiner is
-    /// supposed to receive.
-    last_expired_fetch: Option<u32>,
+    /// **Both halves, and cleared once used** (fix round 3). A session id is a
+    /// per-process counter minted by the SOURCE (`sender.rs`, from 0), so the
+    /// same small number is minted routinely by every fresh source — a new
+    /// leader, a restarted node, a redirect-designated learner. Keyed on the
+    /// id alone this slot would refuse those peers' perfectly ordinary
+    /// sessions, and `snap_drop_intake_from` would tear down whatever transfer
+    /// one of them had in flight. Clearing it when it fires bounds the damage
+    /// the other way: one refusal per straggler, after which that peer's next
+    /// session — including the source's own re-sent BEGIN — opens normally.
+    ///
+    /// One slot, overwritten by the next expiry and cleared when a new fetch
+    /// is armed: fetches are operator-driven and one at a time. The signal is
+    /// the id THIS node minted for a fetch, never the position — an Install
+    /// session whose artifacts sit far above this node's durable frontier is
+    /// exactly what a below-floor joiner is supposed to receive.
+    last_expired_fetch: Option<(SocketAddr, u32)>,
     /// The session id the next node-initiated fetch will use. Local to this
     /// receiver: a session is scoped to one `(peer, session)` pair, and the
     /// source adopts the id we send it (`SnapRequestBody::session`).
@@ -2310,15 +2320,23 @@ impl FollowerReceiver {
             self.snap_drop_intake_from(from);
             return;
         }
-        // Fix round 2 (Ruling P11): the session id of a fetch whose arm has
-        // EXPIRED. Refused outright — never taken as an ordinary session,
-        // which is what the default `IntakeMode::Install` would make of it:
-        // the answer to a store-only pull would have its cluster artifact
-        // routed to the `uc2-cluster` agent and its floor adopted BY FIAT.
-        // Keyed on the id THIS node minted, never on the position — an
-        // Install session above `durable` is legal by definition (a joiner is
-        // below its floor). Counted; the node layer names `fetch_expired`.
-        if self.last_expired_fetch == Some(b.session) {
+        // Fix round 2 (Ruling P11): a fetch whose arm has EXPIRED, answered
+        // late. Refused outright — never taken as an ordinary session, which
+        // is what the default `IntakeMode::Install` would make of it: the
+        // answer to a store-only pull would have its cluster artifact routed
+        // to the `uc2-cluster` agent and its floor adopted BY FIAT. Keyed on
+        // the `(peer, session)` THIS node minted the fetch for, never on the
+        // position — an Install session above `durable` is legal by definition
+        // (a joiner is below its floor). Counted; the node layer names
+        // `fetch_expired`.
+        //
+        // Fix round 3: BOTH halves must match, and the slot is CONSUMED here.
+        // Session ids are per-source counters from 0, so id-only matching
+        // would refuse a different peer's ordinary session (and tear down its
+        // in-flight intake), and never clearing would make that refusal
+        // permanent rather than one-per-straggler.
+        if self.last_expired_fetch == Some((from, b.session)) {
+            self.last_expired_fetch = None;
             self.stats
                 .snap_refused_fetch_expired
                 .fetch_add(1, Ordering::Release);
@@ -2841,6 +2859,11 @@ impl FollowerReceiver {
         position: u64,
         mode: IntakeMode,
     ) {
+        // Fix round 3: a NEW fetch retires the parked straggler. Whatever the
+        // previous fetch's late answer would have been, this node is no longer
+        // waiting for it — and holding the slot past the fetch it belongs to
+        // is what would let it refuse an unrelated session later.
+        self.last_expired_fetch = None;
         // Arm BEFORE the request goes out: the source may answer within the
         // same duty cycle, and an intake that opened before the arm was
         // recorded would install by fiat a set this node only meant to store.
@@ -2897,7 +2920,7 @@ impl FollowerReceiver {
         if let Some(a) = self.armed_fetch
             && now > a.expires_ns
         {
-            self.last_expired_fetch = Some(a.session);
+            self.last_expired_fetch = Some((a.peer, a.session));
             self.armed_fetch = None;
         }
         let Some(rx) = self.fetch_rx.as_ref() else {
@@ -7318,10 +7341,45 @@ mod tests {
         // One nanosecond short of the bar the arm is still live...
         r.drain_fetch_route(armed.expires_ns);
         assert!(r.armed_fetch.is_some(), "not expired before the deadline");
-        // ...and past it, it is gone — with the session id remembered.
+        // ...and past it, it is gone — with the PEER and session remembered.
         r.drain_fetch_route(armed.expires_ns + 1);
         assert!(r.armed_fetch.is_none(), "expired");
-        assert_eq!(r.last_expired_fetch, Some(55));
+        assert_eq!(r.last_expired_fetch, Some((learner.addr(), 55)));
+
+        // Fix round 3: the parked id belongs to that PEER. Session ids are
+        // per-process counters minted by the SOURCE, from 0 — so a fresh
+        // source (a new leader, a restarted node, a redirect-designated
+        // learner) routinely mints the same small number, and its ordinary
+        // session must open normally rather than being refused as somebody
+        // else's straggler.
+        let mut stranger = FakeLeader::new();
+        stranger.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "another peer's session 55 is not our straggler and must open"
+            );
+            r.do_work();
+        }
+        assert_eq!(
+            r.snap_intake.as_ref().unwrap().peer,
+            stranger.addr(),
+            "...as an ordinary session"
+        );
+        assert_eq!(
+            r.snap_intake.as_ref().unwrap().mode,
+            IntakeMode::Install,
+            "...in the default mode: it is nobody's fetch"
+        );
+        assert_eq!(st.snap_refused_fetch_expired.load(Relaxed), 0);
+        r.snap_discard_intake();
 
         // The learner answers late. It must NOT open an Install intake.
         learner.send(
@@ -7343,13 +7401,44 @@ mod tests {
             r.snap_intake.is_none(),
             "no intake, and certainly no Install"
         );
+        // Nothing of the straggler is on disk. (The row directory itself may
+        // exist — the stranger's accepted session above created and then
+        // discarded a `.part` in it — so this asserts it is EMPTY rather than
+        // absent.)
+        let row0 = dir.path().join("0");
         assert!(
-            !dir.path().join("0").exists(),
-            "nothing of the straggler was written"
+            !row0.exists() || std::fs::read_dir(&row0).unwrap().next().is_none(),
+            "nothing of the straggler was written: {:?}",
+            std::fs::read_dir(&row0).map(|d| d
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>())
         );
 
-        // A DIFFERENT session from the same peer is unaffected — this refusal
-        // keys on the id this node minted, not on the peer.
+        // Fix round 3: ONE refusal per straggler. The slot is cleared when it
+        // fires, so the source's retry — same peer, same session — is an
+        // ordinary session again. (It must be: the source re-sends its BEGIN
+        // on a 20 ms cadence until a DONE comes back, and a permanent refusal
+        // would make that peer's next legitimate session unopenable.)
+        assert_eq!(r.last_expired_fetch, None, "cleared when it fired");
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the straggler is refused ONCE, not forever"
+            );
+            r.do_work();
+        }
+        r.snap_discard_intake();
+
+        // A DIFFERENT session from the same peer was never in question.
         learner.send(
             to,
             DGRAM_KIND_SNAP_BEGIN,
