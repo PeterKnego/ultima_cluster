@@ -433,6 +433,22 @@ struct CfgFrame {
     config: ClusterConfig,
 }
 
+/// A coordinated snapshot INSTANT in the World's frame ledger (cluster-FSM
+/// spec §5.1): the empty `FRAME_TYPE_SNAPSHOT` frame a leader appends, whose
+/// frame-END position `end` **is** the instant P. `term` is the appending
+/// leader's term and, exactly as for [`CfgFrame`], doubles as the frame's
+/// content identity (spec §6): a node holds this frame iff its lineage at the
+/// frame's last byte is the appending term. `standby` mirrors
+/// `FLAG_SNAPSHOT_STANDBY` (spec §5.7): only a LEARNER acts on a
+/// standby-flagged instant; a voter yields the frame like any other node-only
+/// frame and never completes a set at it.
+#[derive(Clone, Debug)]
+struct SnapFrame {
+    term: u32,
+    end: u64,
+    standby: bool,
+}
+
 /// M7: promote-learner catch-up slack (max report gap) used by the sim's
 /// `propose_config`. Generous relative to the archive cadence so a broadcast-fed
 /// learner qualifies within a few retries; small enough to stay a real check.
@@ -575,6 +591,17 @@ enum SimEvent {
     Restart {
         node: usize,
     },
+    /// Cluster-FSM spec §5.1/§5.5: `uc2ctl snapshot [--standby]` reaching the
+    /// node it is pointed at. Queued by [`World::command_snapshot`] rather
+    /// than appended inside the scripted call (unlike `propose_config`, whose
+    /// return value forces the append to be synchronous), so the frame lands
+    /// at a well-defined point in the event order and a leader deposed in the
+    /// meantime simply appends nothing — the admin path's "leader-only, else
+    /// retry" in the shape this world can express.
+    CommandSnapshot {
+        node: usize,
+        standby: bool,
+    },
     /// Agent feedback for a completed truncation (`Event::Truncated`), scheduled
     /// as the next event to model the latch window. Carries the SM-allocated
     /// `epoch` so the feedback matches the in-flight truncation (M5).
@@ -715,6 +742,26 @@ struct Node {
     nak_sent: u32,
     /// M14b: the slowest local FSM's reach — outgoing reports are clamped to it.
     apply_ceiling: Option<u64>,
+    // ---- Task 9: coordinated snapshot sets (cluster-FSM spec §5.3) ----
+    /// The instants this node has a COMPLETE SET at, ascending, as
+    /// `(position, appending term)`. A set is complete once every declared row
+    /// and the cluster FSM have frozen at P; the sim has no rows, so the node
+    /// completes P when its own applied frontier — `min(commit, durable)`, the
+    /// position the real apply loop polls and the frontier inv12 reads — has
+    /// passed P over bytes it genuinely holds. The term is carried so inv11's
+    /// half (c) can assert that a P two nodes both list names the SAME frame.
+    ///
+    /// VOLATILE, like `commit`: torn down by a crash and cleared at restart,
+    /// then re-derived as the frontier re-crosses each instant — the sim's
+    /// stand-in for the consensus agent re-reading each row's slot
+    /// `snapshot_pos` after a boot. Entries above a settled truncation's cut
+    /// are dropped at the ack (the artifacts are orphans, spec §10).
+    complete_sets: Vec<(u64, u32)>,
+    /// Instants this node will never complete a set at — the sim's model of
+    /// spec §5.2's "a row started with plain `start()` has no capability and
+    /// IGNORES the frame; if one exists the set is simply incomplete". What
+    /// makes inv11's non-prefix shape real rather than theoretical.
+    snap_declined: Vec<u64>,
 }
 
 /// T13: one node's crypto-plane state. `peers`/`group` are pure `(input,
@@ -823,6 +870,12 @@ pub struct World {
     /// (any lineage). Follower observation (adopt-at-durable) and the inv6/inv8
     /// frontier implication are both recomputed from it.
     config_frames: Vec<CfgFrame>,
+    /// Task 9: the SNAPSHOT-frame ledger (cluster-FSM spec §5.1) — every
+    /// instant ever appended by any leader, any lineage, in append order
+    /// (NOT sorted by position: a new leader appends below a deposed one's
+    /// abandoned tail). Node-level completeness is recomputed from it, and
+    /// inv11 judges every listed set against it.
+    snapshot_frames: Vec<SnapFrame>,
     /// The genesis config (identical on every node) — the version-0 baseline of
     /// the frontier implication.
     genesis_config: ClusterConfig,
@@ -840,6 +893,12 @@ pub struct World {
     /// wrong reader. See [`World::set_kernel_reads_committed_view`].
     #[cfg(feature = "mutation-testing")]
     kernel_reads_committed_view: bool,
+    /// Sim red-twin tooth (cluster-FSM spec §5.3/§5.4, Task 9): a row freezes
+    /// at the node's DURABLE frontier instead of its APPLIED one — a set at a
+    /// position the node has not committed. See
+    /// [`World::set_mutate_freeze_at_durable`].
+    #[cfg(feature = "mutation-testing")]
+    mutate_freeze_at_durable: bool,
     /// When set, a serving leader stops appending NEW frames — modeling a client
     /// that has stopped submitting. The leader still heartbeats its existing tail
     /// and re-gossips commit + term map on the idle floor, so commit PLATEAUS.
@@ -858,6 +917,10 @@ pub struct World {
     /// a pair the kernel's recovered config record already covers is related
     /// and counted, and can only pass.
     stat_two_readers_checks: u64,
+    /// inv11 non-vacuity: how many (node, complete set) pairs the set-alignment
+    /// sweep has JUDGED over the run. A run whose count is 0 proved nothing —
+    /// no node ever completed a set.
+    stat_set_alignment_checks: u64,
 
     // ---- T13: crypto plane ----
     /// `HS_KEY` (kind 20) deliveries addressed to a given node index are
@@ -886,6 +949,9 @@ pub struct Stats {
     /// inv12 non-vacuity: (node, config frame) pairs the two-readers sweep
     /// related over the run (see `World::two_readers_checks`).
     pub two_readers_checks: u64,
+    /// inv11 non-vacuity: (node, complete set) pairs the set-alignment sweep
+    /// judged over the run (see `World::set_alignment_checks`).
+    pub set_alignment_checks: u64,
 }
 
 impl World {
@@ -940,6 +1006,8 @@ impl World {
                 crypto: None,
                 nak_sent: 0,
                 apply_ceiling: None,
+                complete_sets: Vec::new(),
+                snap_declined: Vec::new(),
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
@@ -959,6 +1027,7 @@ impl World {
             vote_drop_until: 0,
             crash_on_truncate: false,
             config_frames: Vec::new(),
+            snapshot_frames: Vec::new(),
             genesis_config: genesis,
             admitted_ever,
             pending_violation: None,
@@ -966,6 +1035,8 @@ impl World {
             mutate_index_aligned_reconcile: false,
             #[cfg(feature = "mutation-testing")]
             kernel_reads_committed_view: false,
+            #[cfg(feature = "mutation-testing")]
+            mutate_freeze_at_durable: false,
             quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
@@ -973,6 +1044,7 @@ impl World {
             stat_restarts: 0,
             stat_stale_vote_window: 0,
             stat_two_readers_checks: 0,
+            stat_set_alignment_checks: 0,
             key_delivery_blocked_until: HashMap::new(),
             nodes,
             cfg,
@@ -1270,6 +1342,19 @@ impl World {
         // everything the cluster FSM has applied at commit, the kernel has at
         // least observed at durable. See `check_two_readers`.
         self.stat_two_readers_checks += self.check_two_readers(step)?;
+        // Task 9 — coordinated snapshot instants (cluster-FSM spec §5.3):
+        // completeness is DETECTED, not signalled (the real consensus agent
+        // polls the slots it already polls), so the detection runs in the
+        // post-event sweep beside the invariants rather than inside any one
+        // handler — both the commit and the durable half of a node's applied
+        // frontier move on different events. Then inv11 judges every listed
+        // set. A world that never commanded an instant — every scenario but
+        // this task's, the whole fuzz tier included — pays ONE branch here and
+        // makes neither call (each also fast-exits on its own).
+        if !self.snapshot_frames.is_empty() {
+            self.complete_snapshot_sets();
+            self.stat_set_alignment_checks += self.check_set_alignment(step)?;
+        }
         Ok(true)
     }
 
@@ -1282,6 +1367,7 @@ impl World {
             restarts: self.stat_restarts,
             steps: self.steps,
             two_readers_checks: self.stat_two_readers_checks,
+            set_alignment_checks: self.stat_set_alignment_checks,
         }
     }
 
@@ -1413,6 +1499,10 @@ impl World {
                 Ok(())
             }
             SimEvent::Restart { node } => self.on_restart(node, now),
+            SimEvent::CommandSnapshot { node, standby } => {
+                self.on_command_snapshot(node, standby);
+                Ok(())
+            }
             SimEvent::TruncatedFeedback { node, epoch, to } => {
                 self.on_truncated_feedback(node, epoch, to, now, step)
             }
@@ -1677,6 +1767,12 @@ impl World {
         let nd = &mut self.nodes[node];
         nd.sm = sm;
         nd.up = true;
+        // Task 9: the node's knowledge of its complete sets is re-derived at
+        // boot (the consensus agent re-reads each row's slot `snapshot_pos`),
+        // and here that means re-completing as the frontier re-crosses each
+        // instant — `commit` is volatile and restarts at 0, so a carried-over
+        // list would sit above it. Same shape as the `cfg_observed` re-scan.
+        nd.complete_sets.clear();
         // Issue #7: a fresh `ElectionSm` is seeded FROM `durable`, so the
         // consensus agent's shadow starts in step with it — no phantom "advance"
         // on the first post-restart poll.
@@ -1771,6 +1867,14 @@ impl World {
             let nd = &mut self.nodes[node];
             nd.cfg_observed.retain(|end| *end <= to);
             nd.pending_cfg_obs.retain(|(end, _)| *end <= to);
+            // Task 9 (spec §10, "SNAPSHOT frame truncated by a leader
+            // change"): any artifact built at a cut-away instant is an ORPHAN,
+            // so the set it belonged to stops being a set. inv11 (b) has
+            // already judged every entry here against the cluster-wide
+            // committed prefix at the step it was listed — this drop is the
+            // model staying honest afterwards, not the check.
+            nd.complete_sets.retain(|(end, _)| *end <= to);
+            nd.snap_declined.retain(|end| *end <= to);
         }
         self.drain_cfg_obs(node, now, step)?;
         // inv8 — revert correctness, pinned at the exact point the truncation
@@ -1972,6 +2076,172 @@ impl World {
                 &unobserved,
                 fsm_version,
                 nd.sm.config().version,
+                step,
+            )?;
+        }
+        Ok(checks)
+    }
+
+    /// Task 9: the leader's half of `uc2ctl snapshot` (cluster-FSM spec §5.1,
+    /// §5.5) — append the empty `SNAPSHOT` frame and record it in the World's
+    /// ledger. Leader-only and pointedly NOT retried: a node that is down, or
+    /// no longer a leader by the time the command lands, appends nothing (the
+    /// real follower answers `retry` with a leader hint; the scenario's
+    /// `instants()` is the oracle for whether a frame exists). The frame is
+    /// ordinary leader-appended bytes — [`FRAME`] of them, replicated,
+    /// recorded and truncated exactly like a config frame or a data frame.
+    fn on_command_snapshot(&mut self, node: usize, standby: bool) {
+        if !self.nodes[node].up || !matches!(self.nodes[node].sm.role(), Role::Leader) {
+            return;
+        }
+        let term = self.nodes[node].sm.current_term();
+        let nd = &mut self.nodes[node];
+        nd.append += FRAME;
+        let end = nd.append;
+        self.snapshot_frames.push(SnapFrame { term, end, standby });
+    }
+
+    /// Task 9 — SET COMPLETION (cluster-FSM spec §5.3). Detected per node, on
+    /// state the node already has, exactly like the real consensus agent
+    /// polling every declared slot's `snapshot_pos`: no acks cross the wire
+    /// and each node completes its own set independently.
+    ///
+    /// A node completes the set at an instant P when, and only when:
+    ///
+    /// * its APPLIED frontier `min(commit, durable)` has passed P. `uc_sim`
+    ///   has no rows and no FSM, so this frontier stands in for "every row has
+    ///   applied everything below P and frozen there" — it is the position the
+    ///   real apply loop polls (`min(commit, durable)`) and the same frontier
+    ///   inv12 reads. A frontier that jumps PAST several instants at once
+    ///   still completes each of them, ascending: every frame at or below P is
+    ///   applied before anything above it.
+    /// * it genuinely HOLDS the frame's bytes (content identity: its lineage
+    ///   at the frame's last byte is the appending term — spec §6). This is
+    ///   what makes a truncated instant unlistable on a node that refilled the
+    ///   same positions from a new leader: the position came back, the frame
+    ///   did not.
+    /// * the instant is not standby-flagged, or this node is a LEARNER
+    ///   (spec §5.7: a voter yields a standby-flagged frame and never freezes
+    ///   at it, which is the whole point of the flag).
+    /// * it has not DECLINED the instant ([`World::decline_instant`], spec
+    ///   §5.2's capability-less row).
+    ///
+    /// Down and halted nodes complete nothing: their service is not applying.
+    fn complete_snapshot_sets(&mut self) {
+        if self.snapshot_frames.is_empty() {
+            return;
+        }
+        for i in 0..self.cfg.n_nodes {
+            let nd = &self.nodes[i];
+            if !nd.up {
+                continue;
+            }
+            // The red-twin tooth freezes at the node's DURABLE frontier — the
+            // wrong rule (a set at bytes the node has not committed).
+            #[cfg(feature = "mutation-testing")]
+            let frontier = if self.mutate_freeze_at_durable {
+                nd.durable
+            } else {
+                nd.commit.min(nd.durable)
+            };
+            #[cfg(not(feature = "mutation-testing"))]
+            let frontier = nd.commit.min(nd.durable);
+            let is_learner = nd.sm.config().learners.iter().any(|&(id, _)| id == nd.id);
+            let mut due: Vec<(u64, u32)> = self
+                .snapshot_frames
+                .iter()
+                .filter(|f| {
+                    f.end > 0
+                        && f.end <= frontier
+                        && term_at(&nd.term_map, f.end - 1) == f.term
+                        && (!f.standby || is_learner)
+                        && !nd.snap_declined.contains(&f.end)
+                        && !nd.complete_sets.iter().any(|&(end, _)| end == f.end)
+                })
+                .map(|f| (f.end, f.term))
+                .collect();
+            if due.is_empty() {
+                continue;
+            }
+            due.sort_unstable(); // ascending: sets complete in stream order
+            self.nodes[i].complete_sets.extend(due);
+        }
+    }
+
+    /// inv11 — SET ALIGNMENT (cluster-FSM spec §5.3, §5.4, §11). Swept after
+    /// every event beside inv6/inv12. Returns how many (node, set) pairs it
+    /// JUDGED, so a scenario can prove the sweep was not vacuous.
+    ///
+    /// Deliberately NOT the prefix rule an early draft reached for ("one
+    /// node's list is a prefix of the other's"): that is unsound under
+    /// ABANDONMENT (spec §5.5). A node whose frontier lags past a superseded
+    /// instant never completes it while a faster node does, and a row without
+    /// the capability declines one outright (§5.2) — so `[P1, P2]` on one node
+    /// and `[P2]` on another are both legitimate, and neither is a prefix of
+    /// the other. What must hold instead (controller ruling P9):
+    ///
+    /// (a) no node lists a set ABOVE ITS OWN COMMIT. This is spec §5.4's
+    ///     argument in the contrapositive: a row freezes at P only after
+    ///     APPLYING to P, and apply is gated on `min(commit, durable)`, so an
+    ///     artifact at P exists only if P was committed ON THAT NODE when it
+    ///     was built. A set above commit would be a floor with nothing
+    ///     committed under it.
+    /// (b) every listed P is the frame-end of a SNAPSHOT frame the ledger
+    ///     holds under that term, and lies inside the CLUSTER-WIDE committed
+    ///     prefix (the checker's genuine `global_max_commit`). Committed bytes
+    ///     are never truncated (inv4), so a set implies a P that is there to
+    ///     stay: a TRUNCATED instant is never a set. This is the half the
+    ///     directed scenario exists for.
+    /// (c) a P that two nodes both list names the SAME frame — the same
+    ///     appending term. Positions align by construction (P is a byte
+    ///     position, and (b) puts it in the committed prefix, where inv2 makes
+    ///     content unique), so this can only fire if that construction breaks;
+    ///     it is asserted anyway, because "sets are position-aligned" is the
+    ///     sentence §5.3 leans on when it says no acks are needed.
+    fn check_set_alignment(&self, step: u64) -> Result<u64, InvariantViolation> {
+        // Fast exit for every scenario that never commands an instant.
+        if self.snapshot_frames.is_empty() {
+            return Ok(0);
+        }
+        let mut checks = 0u64;
+        // (c): the first lister of each position, walked in node order — a
+        // BTreeMap, never a hash container, so the reported pair is stable.
+        let mut claimed: std::collections::BTreeMap<u64, (NodeId, u32)> =
+            std::collections::BTreeMap::new();
+        for i in 0..self.cfg.n_nodes {
+            let nd = &self.nodes[i];
+            let mut above_commit: Vec<u64> = Vec::new();
+            let mut uncommitted: Vec<(u64, u32)> = Vec::new();
+            let mut disagreeing: Vec<(u64, u32, NodeId, u32)> = Vec::new();
+            for &(end, term) in &nd.complete_sets {
+                checks += 1;
+                if end > nd.commit {
+                    above_commit.push(end);
+                }
+                let in_ledger = self
+                    .snapshot_frames
+                    .iter()
+                    .any(|f| f.end == end && f.term == term);
+                if !in_ledger || end > self.checker.global_max_commit {
+                    uncommitted.push((end, term));
+                }
+                match claimed.get(&end) {
+                    Some(&(other, other_term)) => {
+                        if other_term != term {
+                            disagreeing.push((end, term, other, other_term));
+                        }
+                    }
+                    None => {
+                        claimed.insert(end, (i as NodeId, term));
+                    }
+                }
+            }
+            self.checker.check_set_alignment(
+                i as NodeId,
+                nd.commit,
+                &above_commit,
+                &uncommitted,
+                &disagreeing,
                 step,
             )?;
         }
@@ -2860,6 +3130,7 @@ impl World {
                 nd.up = false;
                 nd.append = nd.durable;
                 nd.commit = 0;
+                nd.complete_sets.clear(); // volatile with `commit` (Task 9)
                 nd.truncating = false;
                 nd.new_term_pos = None;
                 nd.leader_hint = None;
@@ -2892,6 +3163,7 @@ impl World {
             // Volatile state is lost; durable / vote / term_map persist.
             nd.append = nd.durable;
             nd.commit = 0;
+            nd.complete_sets.clear(); // volatile with `commit` (Task 9)
             nd.truncating = false;
             nd.new_term_pos = None;
             nd.leader_hint = None;
@@ -2997,6 +3269,63 @@ impl World {
     /// that could have failed.
     pub fn two_readers_checks(&self) -> u64 {
         self.stat_two_readers_checks
+    }
+
+    /// Sim red-twin tooth (cluster-FSM spec §5.3/§5.4, Task 9): every node
+    /// freezes at its DURABLE frontier instead of its APPLIED one. That is the
+    /// rule §5.4's argument forbids — a set at a position the node has not
+    /// committed, so the floor it sets can be truncated out from under it —
+    /// and inv11's half (a) is what must see it. `mutation-testing` builds
+    /// only; the tooth is never on by default.
+    #[cfg(feature = "mutation-testing")]
+    pub fn set_mutate_freeze_at_durable(&mut self, on: bool) {
+        self.mutate_freeze_at_durable = on;
+    }
+
+    /// Task 9 (cluster-FSM spec §5.1, §5.5): command a coordinated snapshot
+    /// instant on `node` — `uc2ctl snapshot [--standby]`. Queued, not
+    /// appended in place: the frame lands when the event is handled, and only
+    /// if `node` is still an up leader then (see
+    /// [`SimEvent::CommandSnapshot`]). Read the resulting instant off
+    /// [`World::instants`].
+    pub fn command_snapshot(&mut self, node: usize, standby: bool) {
+        let now = self.now;
+        self.push(SimEvent::CommandSnapshot { node, standby }, now);
+    }
+
+    /// Task 9: every instant in the World's SNAPSHOT-frame ledger, as
+    /// frame-END positions, in append order — including ones no node will ever
+    /// complete a set at (abandoned or truncated).
+    pub fn instants(&self) -> Vec<u64> {
+        self.snapshot_frames.iter().map(|f| f.end).collect()
+    }
+
+    /// Task 9: the instants `node` currently has a COMPLETE SET at, ascending
+    /// (cluster-FSM spec §5.3). Not necessarily a prefix of another node's —
+    /// see [`World::check_set_alignment`]'s doc and
+    /// [`World::decline_instant`].
+    pub fn complete_sets(&self, node: usize) -> Vec<u64> {
+        self.nodes[node]
+            .complete_sets
+            .iter()
+            .map(|&(end, _)| end)
+            .collect()
+    }
+
+    /// Task 9: make `node` DECLINE the instant at `position` — it will never
+    /// complete a set there. The sim's model of spec §5.2's capability-less
+    /// row ("a row started with plain `start()` … ignores the frame; if one
+    /// exists the set is simply incomplete"), and the reason inv11 cannot be
+    /// a prefix rule. Call it before the node's frontier reaches `position`.
+    pub fn decline_instant(&mut self, node: usize, position: u64) {
+        self.nodes[node].snap_declined.push(position);
+    }
+
+    /// inv11 non-vacuity: how many (node, complete set) pairs the set-alignment
+    /// sweep has judged so far. Zero means no node ever completed a set and the
+    /// invariant proved nothing.
+    pub fn set_alignment_checks(&self) -> u64 {
+        self.stat_set_alignment_checks
     }
 
     pub fn set_apply_ceiling(&mut self, node: usize, ceiling: Option<u64>) {

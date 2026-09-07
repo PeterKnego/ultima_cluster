@@ -26,6 +26,12 @@
 //!   apply ceiling when one is set, and never decreases between reset events
 //!   (truncation, crash/restart, a role change, a changed ceiling).
 //!   `inject_report` — a forged wire value by construction — bypasses it.
+//! - **inv11 — set alignment (cluster-FSM spec §5.3):** no node lists a
+//!   complete snapshot set above its own commit; every listed instant is a
+//!   `SNAPSHOT` frame inside the cluster-wide committed prefix (a truncated
+//!   instant is never a set); and an instant two nodes both list names the
+//!   same frame. NOT a prefix rule between nodes — abandonment makes
+//!   divergent lists legitimate. See [`InvariantChecker::check_set_alignment`].
 //!
 //! The checker owns the sim's *ground truth* — the values a real cluster would
 //! only know from an oracle: which node opened which term, the **genuine**
@@ -690,6 +696,78 @@ impl InvariantChecker {
                     "node {node}'s cluster FSM holds membership v{fsm_version} at committed \
                      frontier {frontier} while the kernel has adopted only v{adopted_version} \
                      — the committed-time reader has run AHEAD of the durable-time one"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// inv11 — SET ALIGNMENT (cluster-FSM spec §5.3, §5.4, §11). The world
+    /// computes the arguments (`World::check_set_alignment`, which carries the
+    /// full argument for the shape); this judges one node's list of complete
+    /// snapshot-set positions:
+    ///
+    /// * `above_commit` — listed positions ABOVE the node's own `commit`. Must
+    ///   be empty: a row freezes at P only after applying to P, and apply is
+    ///   gated on `min(commit, durable)`, so an artifact at P exists only if P
+    ///   was committed on that node when it was built (§5.4). A set above
+    ///   commit is a snapshot floor with nothing committed under it.
+    /// * `uncommitted` — listed `(position, term)` pairs that are not a
+    ///   SNAPSHOT frame the ledger holds under that term, or that lie above
+    ///   the cluster-wide genuine committed frontier. Must be empty: committed
+    ///   bytes are never truncated (inv4), so a set implies a P that is there
+    ///   to stay — a TRUNCATED instant is never a set (§10).
+    /// * `disagreeing` — `(position, this node's term, the other node, its
+    ///   term)` where two nodes list the same P under different frames. Must
+    ///   be empty: §5.3's "sets are position-aligned because P is".
+    ///
+    /// Deliberately NOT a prefix rule between nodes: abandonment (§5.5) and a
+    /// declining row (§5.2) both make `[P1, P2]` and `[P2]` legitimate
+    /// neighbours.
+    pub fn check_set_alignment(
+        &self,
+        node: NodeId,
+        commit: u64,
+        above_commit: &[u64],
+        uncommitted: &[(u64, u32)],
+        disagreeing: &[(u64, u32, NodeId, u32)],
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if let Some(&p) = above_commit.first() {
+            return Err(self.viol(
+                "snapshot set alignment (inv11)",
+                step,
+                format!(
+                    "node {node} lists a complete snapshot set at {p}, above its own commit \
+                     {commit} ({} such in total): a row can only freeze at a position it has \
+                     APPLIED, and apply is gated on min(commit, durable) — the set claims a \
+                     floor with uncommitted bytes under it",
+                    above_commit.len()
+                ),
+            ));
+        }
+        if let Some(&(p, term)) = uncommitted.first() {
+            return Err(self.viol(
+                "snapshot set alignment (inv11)",
+                step,
+                format!(
+                    "node {node} lists a complete snapshot set at {p} (term {term}) which is \
+                     not a committed SNAPSHOT frame — the cluster-wide committed frontier is \
+                     {} ({} such in total): a truncated or never-committed instant became a \
+                     set, so the floor it moves can be truncated away under it",
+                    self.global_max_commit,
+                    uncommitted.len()
+                ),
+            ));
+        }
+        if let Some(&(p, term, other, other_term)) = disagreeing.first() {
+            return Err(self.viol(
+                "snapshot set alignment (inv11)",
+                step,
+                format!(
+                    "node {node} and node {other} both list a complete snapshot set at {p} but \
+                     under different frames (term {term} vs term {other_term}): the instants \
+                     are not position-aligned, so the two sets are not the same set"
                 ),
             ));
         }

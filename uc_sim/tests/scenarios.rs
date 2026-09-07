@@ -3120,3 +3120,286 @@ fn leader_pass_model_keeps_timers_in_order_across_leader_changes() {
         );
     }
 }
+
+// ============================================================================
+// Task 9: inv11 — SET ALIGNMENT (cluster-FSM spec §5.3, §11).
+//
+// A coordinated snapshot instant is an empty `FRAME_TYPE_SNAPSHOT` frame the
+// leader appends; its frame-END is **P**. Every row freezes at P after
+// applying everything below it, and a node's SET at P is complete once every
+// row (and the cluster FSM) has frozen there. `uc_sim` has no rows — a node's
+// applied frontier stands in for them (`min(commit, durable)`, exactly the
+// position the real apply loop polls, and the same frontier inv12 reads) — so
+// the world's model is: a node lists P once its applied frontier passes P over
+// bytes it genuinely holds.
+//
+// inv11 is NOT "one node's list is a prefix of the other's": under
+// abandonment (spec §5.5) a node whose frontier lags past a superseded
+// instant never completes it while a faster node does, so `[P1, P2]` and
+// `[P2]` are both legitimate. What must hold is (a) no node lists a set above
+// its own commit, (b) every listed P is a SNAPSHOT frame inside the
+// cluster-wide committed prefix — a truncated instant is never a set — and
+// (c) a P two nodes both list names the same frame.
+
+/// True iff NO node lists a complete set at `p` — the property the truncated
+/// instant must keep for the whole run, so it is asserted inside every phase
+/// predicate rather than only at the end.
+fn none_lists(w: &World, p: u64) -> bool {
+    (0..3).all(|i| !w.complete_sets(i).contains(&p))
+}
+
+/// Command an instant on `leader` and step until the frame is in the ledger;
+/// returns its frame-end P. Stops at the append, so the caller can still act
+/// (e.g. decline it) before any node's frontier can reach it.
+fn command_and_wait(w: &mut World, leader: usize, standby: bool) -> u64 {
+    let before = w.instants().len();
+    w.command_snapshot(leader, standby);
+    assert!(
+        w.run_until(|w| w.instants().len() > before)
+            .expect("invariants"),
+        "the leader must append its SNAPSHOT frame"
+    );
+    *w.instants().last().expect("a frame was appended")
+}
+
+/// Stage spec §10's "`SNAPSHOT` frame truncated by a leader change": a leader
+/// isolated from both followers commands an instant, so the frame it appends
+/// can never reach a quorum and the majority elects over it.
+fn stage_truncated_instant(seed: u64) -> (World, u64, usize) {
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        max_steps: 200_000,
+        ..base_cfg(seed)
+    });
+    w.run_until_leader().expect("invariants");
+    let leader = w.current_leader().expect("a leader");
+    w.run_steps(2_000).expect("invariants"); // a genuine committed prefix first
+    w.partition_node(leader);
+    let p = command_and_wait(&mut w, leader, false);
+    assert!(
+        p > w.max_commit(),
+        "the instant must be staged ABOVE the committed frontier (p {p}, commit {})",
+        w.max_commit()
+    );
+    (w, p, leader)
+}
+
+/// The directed scenario: an instant commanded by a leader that is then
+/// deposed is truncated with the rest of its uncommitted tail — no node ever
+/// lists it, on any node, at any step. The positive control in the same test
+/// (a fresh instant from the NEW leader, which every node does list) is what
+/// keeps the negative half from passing vacuously.
+#[test]
+fn a_snapshot_frame_truncated_by_a_leader_change_never_becomes_a_complete_set() {
+    let (mut w, p, old) = stage_truncated_instant(3);
+    // The majority elects over the isolated leader and commits PAST p — the
+    // position exists again, under a different lineage.
+    assert!(
+        w.run_until(|w| {
+            assert!(
+                none_lists(w, p),
+                "a node listed the uncommitted instant {p}"
+            );
+            w.max_commit() > p
+        })
+        .expect("invariants"),
+        "the majority must elect and commit past the abandoned position"
+    );
+    // Heal: the deposed leader truncates the tail that carried the frame.
+    w.heal();
+    assert!(
+        w.run_until(|w| {
+            assert!(none_lists(w, p), "a node listed the truncated instant {p}");
+            w.truncations() >= 1
+        })
+        .expect("invariants"),
+        "the deposed leader's tail (carrying the SNAPSHOT frame) must truncate"
+    );
+    assert!(
+        none_lists(&w, p),
+        "the truncated instant became a set at {p}"
+    );
+    // Positive control: the NEW leader's own instant DOES become a complete
+    // set on every node — the negative half above is not vacuous.
+    let new_leader = w.current_leader().expect("a new leader");
+    assert_ne!(
+        new_leader, old,
+        "the isolated leader must have been deposed"
+    );
+    let p2 = command_and_wait(&mut w, new_leader, false);
+    assert!(
+        w.run_until(|w| {
+            assert!(none_lists(w, p), "a node listed the truncated instant {p}");
+            (0..3).all(|i| w.complete_sets(i).contains(&p2))
+        })
+        .expect("invariants"),
+        "a committed instant must complete on every node (p2 {p2})"
+    );
+    assert!(
+        w.set_alignment_checks() > 0,
+        "inv11 never asserted anything: no node ever listed a set"
+    );
+}
+
+/// Set lists legitimately DIVERGE (the reason inv11 is not a prefix rule):
+/// one node declines an instant (spec §5.2 — a row without the snapshot
+/// capability ignores the frame, so that node's set at P is never complete),
+/// while a node whose frontier is stalled across two later instants completes
+/// BOTH when it catches up — every frame at or below P is applied before
+/// anything above it, so a frontier that jumps past an instant still
+/// completes it.
+#[test]
+fn complete_set_lists_diverge_when_a_node_declines_and_a_lagging_node_catches_up() {
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        max_steps: 200_000,
+        ..base_cfg(11)
+    });
+    w.run_until_leader().expect("invariants");
+    let l = w.current_leader().expect("a leader");
+    let f: Vec<usize> = (0..3).filter(|&i| i != l).collect();
+    w.run_steps(2_000).expect("invariants");
+
+    // Instant 1: declined by f[0] — it never lists it, the others do.
+    let p1 = command_and_wait(&mut w, l, false);
+    w.decline_instant(f[0], p1);
+    assert!(
+        w.run_until(|w| w.complete_sets(l).contains(&p1) && w.complete_sets(f[1]).contains(&p1))
+            .expect("invariants"),
+        "a committed instant must complete on the nodes that did not decline it"
+    );
+    assert!(
+        !w.complete_sets(f[0]).contains(&p1),
+        "the declining node must not list {p1}"
+    );
+
+    // Instants 2 and 3 with f[0]'s archive FROZEN: its applied frontier
+    // stalls below both, so it lists neither while the others list both.
+    w.set_archive_frozen(f[0], true);
+    let p2 = command_and_wait(&mut w, l, false);
+    let p3 = command_and_wait(&mut w, l, false);
+    assert!(
+        w.run_until(|w| w.complete_sets(l).contains(&p3) && w.complete_sets(f[1]).contains(&p3))
+            .expect("invariants"),
+        "the un-stalled nodes must complete both later instants"
+    );
+    assert!(
+        w.complete_sets(f[0]).is_empty(),
+        "the stalled node must have completed nothing: {:?}",
+        w.complete_sets(f[0])
+    );
+    // Catch-up: the frontier crosses both instants at once.
+    w.set_archive_frozen(f[0], false);
+    assert!(
+        w.run_until(|w| w.complete_sets(f[0]).contains(&p3))
+            .expect("invariants"),
+        "the stalled node must complete the instants it lagged past"
+    );
+
+    assert_eq!(
+        w.complete_sets(l),
+        vec![p1, p2, p3],
+        "the leader lists every instant, ascending"
+    );
+    assert_eq!(
+        w.complete_sets(f[0]),
+        vec![p2, p3],
+        "the declining node's list lacks p1 — legitimately NOT a prefix of \
+         the leader's, and the leader's is not a prefix of it"
+    );
+    assert!(
+        w.set_alignment_checks() > 0,
+        "inv11 never asserted anything: no node ever listed a set"
+    );
+    w.run_steps(2_000).expect("invariants");
+}
+
+/// Spec §5.7: a STANDBY-flagged instant is acted on only by a LEARNER — a
+/// voter yields the frame like any other node-only frame, so its set at P is
+/// never complete and its floor does not move (which is the whole point: the
+/// voters never pay the freeze). The un-flagged instant that follows is the
+/// control: every node, learner included, completes that one.
+#[test]
+fn a_standby_instant_completes_only_on_the_learner() {
+    let mut w = World::new(SimConfig {
+        n_nodes: 4,
+        initial_learners: vec![3],
+        drop_per_million: 0,
+        max_steps: 200_000,
+        ..base_cfg(5)
+    });
+    w.run_until_leader().expect("invariants");
+    let l = w.current_leader().expect("a leader");
+    assert_ne!(l, 3, "a learner is never a leader");
+    w.run_steps(2_000).expect("invariants");
+
+    let standby = command_and_wait(&mut w, l, true);
+    assert!(
+        w.run_until(|w| w.complete_sets(3).contains(&standby))
+            .expect("invariants"),
+        "the learner must complete the standby instant"
+    );
+    let voters: Vec<usize> = (0..4).filter(|&i| i != 3).collect();
+    for &v in &voters {
+        assert!(
+            !w.complete_sets(v).contains(&standby),
+            "voter {v} froze at a standby instant"
+        );
+    }
+    // Control: an ordinary instant completes everywhere, learner included —
+    // and the voters' lists are still missing the standby position, which is
+    // inv11's non-prefix shape arriving from spec §5.7 rather than from a
+    // declining row.
+    let all = command_and_wait(&mut w, l, false);
+    assert!(
+        w.run_until(|w| (0..4).all(|i| w.complete_sets(i).contains(&all)))
+            .expect("invariants"),
+        "an un-flagged instant must complete on every node"
+    );
+    for &v in &voters {
+        assert_eq!(
+            w.complete_sets(v),
+            vec![all],
+            "voter {v} must list only the un-flagged instant"
+        );
+    }
+    assert_eq!(
+        w.complete_sets(3),
+        vec![standby, all],
+        "the learner lists both"
+    );
+}
+
+/// RED TWIN of the two above: a node that freezes at its DURABLE frontier
+/// instead of its applied one (`set_mutate_freeze_at_durable`) — the wrong
+/// rule, and exactly what spec §5.4's argument forbids: a set at a position
+/// the node has not committed is not evidence the position is committed, so
+/// the floor it sets can be truncated away underneath it. inv11's half (a)
+/// must see it, at the first instant whose bytes reach a node's disk before
+/// its commit.
+#[cfg(feature = "mutation-testing")]
+#[test]
+fn counterfactual_freezing_at_durable_lists_a_set_above_the_nodes_commit() {
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        max_steps: 200_000,
+        ..base_cfg(3)
+    });
+    w.set_mutate_freeze_at_durable(true);
+    w.run_until_leader().expect("invariants");
+    let leader = w.current_leader().expect("a leader");
+    w.run_steps(2_000).expect("invariants");
+    w.partition_node(leader);
+    w.command_snapshot(leader, false);
+    let e = w
+        .run()
+        .expect_err("freezing at durable must break a safety invariant");
+    assert_eq!(
+        e.invariant, "snapshot set alignment (inv11)",
+        "expected inv11 to fire: {e:?}"
+    );
+    assert!(
+        e.detail.contains("above its own commit"),
+        "expected inv11's half (a) — the set above the node's commit: {e}"
+    );
+}
