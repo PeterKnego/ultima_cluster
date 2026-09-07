@@ -78,6 +78,7 @@ use clap::{Parser, Subcommand};
 
 mod schedule;
 mod settings;
+mod snapshot;
 
 use uc_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
 use uc_log::cnc::{AdminAuth, AdminReq, CncPage, unpack_service_status};
@@ -321,6 +322,105 @@ struct SettingsShowArgs {
     common: CommonArgs,
 }
 
+// ---------------------------------------------------------------- plan 2: coordinated snapshot
+
+// `args_conflicts_with_subcommands` is the ONLY way to get clap to accept
+// both `uc2ctl snapshot --instance-dir D --app-id A [--standby]` (this
+// struct's OWN take-only fields below, no subcommand token) and `uc2ctl
+// snapshot show --instance-dir D --app-id A` (`--instance-dir`/`--app-id`
+// AFTER the subcommand word, scoped to `SnapshotShowArgs`'s own `common` — a
+// second, independent copy, two levels down). It has a sharp edge at this
+// nesting depth, confirmed by hand: if this struct flattens `CommonArgs`
+// directly (reusing its field names/ids), clap 4.6's required-arg check for
+// `snapshot show`/`snapshot fetch` mis-fires — it reports `instance_dir`
+// missing even when given AFTER `show`, and renders the ROOT command's
+// usage line, not `snapshot show`'s. The fix is these take-only fields
+// under DIFFERENT Rust names (distinct arg ids) than `CommonArgs`'s, each
+// `#[arg(long = "...")]`-pinned back to the SAME flag text and built into a
+// real `CommonArgs` by `take_common` only when no subcommand was given.
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct SnapshotArgs {
+    /// Take-only; see `CommonArgs::instance_dir`.
+    #[arg(long = "instance-dir")]
+    take_instance_dir: Option<PathBuf>,
+    /// Take-only; see `CommonArgs::app_id`.
+    #[arg(long = "app-id")]
+    take_app_id: Option<String>,
+    /// Take-only; see `CommonArgs::admin_key`.
+    #[arg(long = "admin-key")]
+    take_admin_key: Option<PathBuf>,
+    /// Take-only; see `CommonArgs::admin_key_name`.
+    #[arg(long = "admin-key-name")]
+    take_admin_key_name: Option<String>,
+    /// Take-only; see `CommonArgs::admin_ttl_secs`.
+    #[arg(long = "admin-ttl-secs", default_value_t = 30)]
+    take_admin_ttl_secs: u64,
+    /// Freeze only if the committed membership holds a learner (spec §5.7) —
+    /// meaningful only for the default (`take`) action; refused `49
+    /// snapshot_no_learner` when there is none.
+    #[arg(long)]
+    standby: bool,
+    /// Omitted: command an instant (`ADMIN_OP_SNAPSHOT`, wire op 8, the
+    /// default `take` action). `fetch`/`show` name themselves.
+    #[command(subcommand)]
+    cmd: Option<SnapshotCmd>,
+}
+
+impl SnapshotArgs {
+    /// The `CommonArgs` the default (`take`) action needs, built from this
+    /// struct's own take-only fields. `Err` by name (clap cannot enforce
+    /// "required, but only absent a subcommand" itself here — see the
+    /// struct doc) when `--instance-dir`/`--app-id` were not given.
+    fn take_common(&self) -> anyhow::Result<CommonArgs> {
+        Ok(CommonArgs {
+            instance_dir: self
+                .take_instance_dir
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--instance-dir is required"))?,
+            app_id: self
+                .take_app_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--app-id is required"))?,
+            admin_key: self.take_admin_key.clone(),
+            admin_key_name: self.take_admin_key_name.clone(),
+            admin_ttl_secs: self.take_admin_ttl_secs,
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Point THIS voter at a learner holding a complete set and pull it
+    /// store-only (`ADMIN_OP_SNAPSHOT_FETCH`, wire op 9, spec §5.7 item 5).
+    /// Node-local: never forwarded, runs on whichever node `--instance-dir`
+    /// names regardless of who leads.
+    Fetch(SnapshotFetchArgs),
+    /// Print the newest COMPLETE set's position and each artifact's
+    /// presence — the diagnostic for a stalled instant. OFFLINE (a directory
+    /// listing), like `schedule show`/`settings show`.
+    Show(SnapshotShowArgs),
+}
+
+#[derive(clap::Args)]
+struct SnapshotFetchArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// The learner id to pull a complete set from.
+    #[arg(long)]
+    from: u32,
+    /// The absolute byte position to pull (must be one `--from` holds a
+    /// complete set at). Omitted: the learner's newest complete set.
+    #[arg(long)]
+    position: Option<u64>,
+}
+
+#[derive(clap::Args)]
+struct SnapshotShowArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Add a fresh learner (wire op 1).
@@ -374,6 +474,10 @@ enum Cmd {
     /// Cluster-FSM plan 1 (spec §6): apply or show the replicated settings
     /// record (`ADMIN_OP_SETTINGS_APPLY`, wire op 7).
     Settings(SettingsArgs),
+    /// Coordinated-snapshot plan 2 (spec §5, §8): command an instant
+    /// (`ADMIN_OP_SNAPSHOT`, wire op 8) — the default action — or run
+    /// `fetch`/`show`.
+    Snapshot(SnapshotArgs),
 }
 
 fn main() {
@@ -398,6 +502,15 @@ fn main() {
         Cmd::Settings(a) => match a.cmd {
             SettingsCmd::Apply(args) => settings::apply(&args.common, &args.file),
             SettingsCmd::Show(args) => settings::show(&args.common),
+        },
+        Cmd::Snapshot(a) => match &a.cmd {
+            None => a
+                .take_common()
+                .and_then(|common| snapshot::take(&common, a.standby)),
+            Some(SnapshotCmd::Fetch(args)) => {
+                snapshot::fetch(&args.common, args.from, args.position)
+            }
+            Some(SnapshotCmd::Show(args)) => snapshot::show(&args.common),
         },
     };
     if let Err(e) = r {
@@ -472,6 +585,18 @@ fn reason_str(reason: u32) -> &'static str {
         46 => "settings_decode (the staged file is not a decodable settings record)",
         47 => {
             "settings_bounds (a field is out of range — see the node's refusal detail / audit record for which one)"
+        }
+        // Coordinated-snapshot plan 2 (spec §5.5, §8): `ADMIN_OP_SNAPSHOT` /
+        // `ADMIN_OP_SNAPSHOT_FETCH` (wire ops 8/9) refusal reasons —
+        // `uc_node::REASON_SNAPSHOT_*` (`uc_node::node`).
+        48 => {
+            "snapshot_unsupported (a declared row lacks the snapshot capability bit — it was started with plain start() rather than start_with_snapshots(); the audit detail names the row)"
+        }
+        49 => {
+            "snapshot_no_learner (--standby with no learner in the committed membership — only a learner freezes for a standby instant)"
+        }
+        50 => {
+            "snapshot_above_durable (the fetch position named is above this node's durable frontier — an operator typo, or a learner transiently ahead of this voter; legitimate again once this node's log catches up)"
         }
         _ => "unknown/malformed",
     }
@@ -1100,6 +1225,16 @@ mod tests {
     // cannot make sense of must come back `None` (so the caller falls back
     // to printing the raw line with a `?` marker) rather than a silently
     // truncated value.
+
+    /// Coordinated-snapshot plan 2 Task 7: pin the 48-50 band's names — the
+    /// snapshot refusal reasons a `uc2ctl snapshot`/`snapshot fetch` caller
+    /// greps for.
+    #[test]
+    fn reason_str_names_the_snapshot_band() {
+        assert!(reason_str(48).contains("snapshot_unsupported"));
+        assert!(reason_str(49).contains("snapshot_no_learner"));
+        assert!(reason_str(50).contains("snapshot_above_durable"));
+    }
 
     #[test]
     fn json_field_reads_a_plain_string_value() {
