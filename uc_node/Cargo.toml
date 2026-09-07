@@ -42,9 +42,12 @@ toml = { workspace = true }
 libc = { workspace = true }
 signal-hook = { workspace = true }
 clap = { workspace = true }
-crc32fast = { workspace = true }
 
 [dev-dependencies]
+# Test-only: the tampered-image test in cluster_fsm.rs recomputes a CRC by
+# hand to corrupt it. No non-test code in this crate uses crc32fast — the
+# cluster FSM's own encode/decode moved to uc_protocol's cluster_image codec.
+crc32fast = { workspace = true }
 # Asymmetric cycle: uc_node → uc_service is a runtime dependency (for the
 # cluster FSM's traits); uc_service → uc_node remains dev-only and unversioned
 # so `cargo package` strips it when uc_service publishes before uc_node is
