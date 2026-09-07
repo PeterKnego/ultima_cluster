@@ -408,7 +408,8 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `scripts/m10_alert_fire.sh` since `e8e3a25`, backed by the
     `log_time_frozen` and `schedule_diverged` scenarios, so its completeness
     cross-check passes and the M10 gate's row 4 can be re-run as written —
-    it has not been run on a cluster yet.
+    run locally 2026-09-07: **23/23 rules fire** under promtool, the five
+    2.11.0 rules on synthetic sources; not yet on a fleet.
 - **Wire crypto is opt-in and OFF by default**, all-encrypted or
   all-cleartext per cluster (no mixed mode). Threat model: a network-path
   adversary; out of model: a compromised host or a malicious member — the
