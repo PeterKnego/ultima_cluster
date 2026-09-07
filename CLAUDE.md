@@ -26,20 +26,22 @@ exists. The release was **STOPPED again on 2026-09-05** by the maintainer, for
 the cluster-FSM and coordinated-snapshot work; all three plans of that spec are
 now implemented (plan 1 the cluster FSM, plan 2 coordinated and standby
 snapshot instants, plan 3 retirement and proof). **The code is done; the
-release is blocked on three bodies of fleet gate rows**, none of which has
-run: (1) the **time-and-timers rows** a/b/c/e
-(`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`); (2) the
-**apply-hop A/B row d** in the same doc, whose missing runner
-`scripts/apply_ab.sh` now exists; and (3) the **plan-2 rows f/g/h**, also in
-that doc — the three coordinated-snapshot rows (instants under load, a
-below-floor join with the shipper restarted mid-window, freeze duration vs.
-commit stall all-nodes then `--standby`), of which row f has a dev-box SMOKE
-reading only, which is not a gate. Plus the **FSM-identity gate**
-(`docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md`, rows a/b/e/j), also
-unrun. Every bar is pre-committed and every result row still reads "not run".
-`docs/how-to/cut-a-release.md` §1's writeup de-scaffolding is deliberately
-left until those results are in, because the release-evidence table needs
-them. See "Next up" below.)**
+release is blocked on two fleet bodies of gate rows plus two isolated
+apply-hop A/Bs**, none of which has run: (1) the **time-and-timers rows**
+a/b/c/e (`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`), fleet;
+(2) the **plan-2 rows g/h**, also in that doc — the two coordinated-snapshot
+fleet rows (a below-floor join with the shipper restarted mid-window; freeze
+duration vs. commit stall, all-nodes then `--standby`); plus the
+**FSM-identity gate** (`docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md`,
+rows a/b/e/j), also fleet. Separately, two **apply-hop A/Bs that need only an
+idle host, not the fleet** — `apply_bench` isolates the FSM hop on one box —
+row **d** (time-and-timers) and row **f** (plan-2's commanded-instants arm),
+both in the time-and-timers gate doc and both run under
+`scripts/apply_ab.sh`; row f has a dev-box SMOKE reading only (verdict
+`inconclusive (noisy run)`), which is not a gate. Every bar is pre-committed
+and no row has a gate result. `docs/how-to/cut-a-release.md` §1's writeup
+de-scaffolding is deliberately left until those results are in, because the
+release-evidence table needs them. See "Next up" below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
 closed by a fleet-proven gate doc under `docs/benchmarks/` (bars are
 pre-committed before any run; a miss is recorded as FAIL and keeps the bar —
