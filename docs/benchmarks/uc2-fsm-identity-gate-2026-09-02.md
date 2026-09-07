@@ -72,6 +72,17 @@ sit inside it.
 
 ### Reading the rules
 
+**Row j's join now installs the cluster artifact too** (added 2026-09-07, no
+new row and no change to row j's bar): since the coordinated-snapshot work,
+the set a below-floor joiner installs carries the cluster FSM's artifact —
+membership, the schedule table and the settings record — alongside the
+service artifacts row j already checks for. The ≤ 60 s budget and the
+`snapshot_session_refusals() == (0, 0, 0)` check stand as committed; what
+changed is that a joiner which converges is now also holding the cluster's
+table and membership before it can serve or lead, which is
+[the time-and-timers gate's row g](uc2-time-and-timers-gate-2026-09-03.md),
+not this one.
+
 Same conventions as the M14 gate: **rate** is the direct `Engine` client's
 completed operations per second over the middle `MEASURE_SECS` of the
 steady window, `--inflight 4096`, 64-byte payload, session envelope on,

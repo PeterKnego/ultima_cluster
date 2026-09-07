@@ -1,6 +1,9 @@
 # uc2 time-and-timers gate — SKELETON, no fleet run yet
 
-**Date:** 2026-09-03 (bars committed; row e added the same day with plan 2).
+**Date:** 2026-09-03 (bars committed; row e added the same day with plan 2;
+rows **f, g and h** added 2026-09-07 with the cluster-FSM and
+coordinated-snapshot work, their bars pre-committed the same way, and row d
+given the runner it was missing).
 **Fleet run: NOT RUN — release on hold.** Log time and timers (plan 1 **and**
 plan 2, the replicated schedule table) land on the same unreleased `2.11.0`
 flag day as FSM identity; the maintainer has not green-lit fleet spend for
@@ -30,6 +33,14 @@ that fire through the same heap and the same frame — row e is its bar.
 Plain-language explainer:
 [`docs/notes/uc2-log-time-and-timers-explained.md`](../notes/uc2-log-time-and-timers-explained.md).
 
+Rows **f, g and h** are the three gate rows the cluster-FSM /
+coordinated-snapshot spec
+([`2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`](../superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md)
+§11) asks this document to carry, because that work lands on the same
+unreleased flag day and shares this gate's fleet trip: the apply-loop arm
+commanded instants add (f), a below-floor join with the shipper restarted
+mid-window (g), and freeze duration measured against commit stall (h).
+
 Two claims need a fleet to test, and this gate exists for exactly those:
 
 1. **The stamp is free.** The spec's cost claim is "one vDSO clock read and
@@ -54,9 +65,24 @@ CLAUDE.md's standing M14a lesson is that **code in a hot loop's body costs
 even on paths that never run** (a wait ladder added inline to the apply loop
 cost 9 % at N=1, a path N=1 never executes, through codegen alone; out of
 line it cost 1.5 % — [`uc2-m14a-apply-hop-2026-08-27.md`](uc2-m14a-apply-hop-2026-08-27.md)).
-That lesson is why row d exists: an isolated apply-hop A/B, run under
-`scripts/hop1_ab.sh`'s same-source rebuild discipline, is the only honest way
-to say the added frame-loop body is free.
+That lesson is why row d exists: an isolated apply-hop A/B with a same-source
+rebuild control is the only honest way to say the added frame-loop body is
+free. Row **f** is the same construction applied to the one arm the
+coordinated-snapshot work adds to that same loop (the `FRAME_TYPE_SNAPSHOT`
+type test plus an out-of-line call — out of line precisely because of the
+M14a lesson).
+
+Both rows run under **[`scripts/apply_ab.sh`](/scripts/apply_ab.sh)**, added
+2026-09-07 for exactly this. It takes two commit-ishes, builds each in its
+own temporary `git worktree` with its own private `CARGO_TARGET_DIR`
+(`--locked`), builds the head sha a **third** time into a separate dir as the
+same-source control arm, copies all three binaries out and records their
+`sha256`, then runs them interleaved and reports `head vs base`, `head vs
+head′` (**the resolution**) and a verdict of the first against the second.
+Its `--selftest` pins that arithmetic on fixed inputs; the `APPLY-JSON` line
+it parses is pinned on the Rust side by `uc_node/examples/apply_bench.rs`'s
+`apply_json_line_shape_is_pinned`. The verdict rule is stated in the script's
+header and reproduced under "Reading the rules" below.
 
 **Coverage statement.** This gate measures throughput cost and timer
 precision on a fleet. It is not a substitute for the correctness tier, which
@@ -87,25 +113,40 @@ MEASURE_SECS = 2, 8`). Row e here runs the same three driver rows again with a
 schedule table live, so it needs no new driver either — only the one
 `uc2ctl schedule apply` before the window opens. (The driver's rows a/b/e and
 this document's rows a–e are different namespaces; where it matters below, the
-driver's are called "the driver's rows a/b/e".) Row c is new. Row d is a
-dev-box-legal isolated A/B, not a fleet rate.
+driver's are called "the driver's rows a/b/e".) Row c is new. Rows d and f
+are dev-box-legal isolated A/Bs, not fleet rates. Rows g and h are fleet
+rows and are **user-gated**: they cost a fleet trip and are not run until the
+maintainer green-lights this gate.
 
-Rows a, b and d are **null bars against measurement noise, not ratios
-against a target**: "within the same-source rebuild resolution measured by
-`scripts/hop1_ab.sh` on the day". `scripts/hop1_ab.sh` A/B's two builds of
-the *same* source against one fixed sink and reports the spread that comes
-from build noise alone. **Record that number first, before comparing
-anything to it** (CLAUDE.md: "M14b's client-hop A/B read −4.2 % on one binary
-pair; fresh builds of the same two commits read ±0.3 %, and two builds of the
-*same* commit differed by 1 %").
+Rows a, b, d, e and f are **null bars against measurement noise, not ratios
+against a target** — "within the same-source rebuild resolution measured on
+the day". There are two such resolutions and they are not interchangeable:
+
+- Rows a, b and e compare fleet throughput, so their resolution is
+  **`scripts/hop1_ab.sh`**'s: it A/Bs two builds of the *same* source against
+  one fixed sink and reports the spread that comes from build noise alone.
+- Rows d and f compare the apply hop, so their resolution is the **control
+  arm of their own run** — `scripts/apply_ab.sh`'s third arm (B′), a second
+  build of the head source, measured back to back with the other two on the
+  same box in the same minutes. That is strictly better than importing a
+  number from another harness, and it is why those two rows have no separate
+  "record first" step: the bar is produced by the run it judges.
+
+**Record the resolution first, before comparing anything to it** (CLAUDE.md:
+"M14b's client-hop A/B read −4.2 % on one binary pair; fresh builds of the
+same two commits read ±0.3 %, and two builds of the *same* commit differed by
+1 %").
 
 | row | measure | bar | result |
 |---|---|---|---|
 | a | `m14_fleet_gate.py` rows a/b/e with every service wrapped in `Timed<..>` and **no timers scheduled**, steady window, against the same rows on the pre-time-and-timers binary | within the same-source rebuild resolution measured by `scripts/hop1_ab.sh` on the day (record the number first) | not run — release on hold |
 | b | the same three rows with one declared FSM scheduling **1 000 timers/s** sustained through the measure window | throughput within the same resolution as row a; **`uc2_timers_late_total == 0`** on every node after the warm-up window | not run — release on hold |
 | c | timer precision: the distribution of `time_ns − deadline_ns` over **≥ 10 000 on-time fires** under row b's load | **p99 ≤ 2 × the measured consensus-pass length on the rig.** Measure the pass length first, on the day, and write it into the results table before comparing anything to it | not run — release on hold |
-| d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), run under `scripts/hop1_ab.sh`'s same-source rebuild control, at N=1 and N=2, bounded lag | within the measured same-source rebuild resolution (the control arm of the same run) | **not run: no runner.** `scripts/hop1_ab.sh` drives `hop_bench`, not `apply_bench` — it launches the sink as `"$SINK" dummy-node --instance-dir … --app-id …` and each driver as `"$bin" engine-load --instance-dir … --app-id … --secs … --payload … --inflight … --engines …`, and parses a `RESULT {json}` line carrying `responses_per_sec`/`p50_ms`/`p90_ms`/`p99_ms`/`lost`. `apply_bench` has no subcommands at all (`clap` `Args`: `--root --fsms --mode --lag --secs …`); both invocations are refused with `error: unexpected argument 'dummy-node' found` / `'engine-load' found` (checked on `f59a0b5`, release build). Row d needs an `apply_bench`-shaped A/B runner with the same rebuild-control arm before it can be adjudicated; no substitute measurement was improvised. |
+| d | apply-hop A/B: `uc_node/examples/apply_bench`, this branch vs. `17d5c6b` (the pre-time-and-timers baseline), at N=1 and N=2, bounded lag, under [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) — `scripts/apply_ab.sh 17d5c6b HEAD --fsms 1 --pairs 6`, then `--fsms 2`. This pair straddles the `Appender::new`/`append` arity change, so the `--harness` overlay is NOT available on it: each arm builds the harness its own commit carries, and the two differ in the fake DRIVER, not in the measured apply loop. Say so when quoting the number | within the measured same-source rebuild resolution — the run's own B′ arm (`abs(head_vs_base) ≤ resolution + noise_margin`, the script's rule, reproduced under "Reading the rules") | **not run** — the runner it was missing exists since 2026-09-07; the 2026-09-03 no-runner finding it closes is kept in the Results table below |
 | e | a 32-entry schedule table (`MAX_SCHEDULE_ENTRIES`, the cap) with **100 ms** `every` rules, all on **one** declared FSM, applied with `uc2ctl schedule apply` and left running through row a's three rows | **`uc2_timers_late_total` == 0** on every node after the warm-up window, and throughput within row a's resolution (the same-source rebuild number recorded on the day) | not run — release on hold |
+| f | **commanded instants under the throughput load** (cluster-FSM spec §11): the cost of the one arm coordinated snapshots add to the apply hot loop — the `FRAME_TYPE_SNAPSHOT` type test plus an out-of-line call. `scripts/apply_ab.sh 627eb4e a64a6ed --harness uc_node/examples/apply_bench.rs --pairs 6 --fsms 1`, then `--fsms 2`, bounded lag. `627eb4e` is the last commit before that arm entered the loop; `a64a6ed` is the merge that carries it. `--harness` is **required** on this pair: both arms predate the `svc_sched`-ring harness fix, so each arm's own `apply_bench` cannot run at all — with the overlay every arm runs the identical harness and only the library under it differs | within the run's own rebuild resolution (the B′ arm), at both N | dev-box **SMOKE** run 2026-09-07 at N=1 — see the Results table. Not a gate: a dev box is not a bench, and the fleet arm of this row (N=2, `--pairs 6`) has not been run |
+| g | **a below-floor join with the shipper restarted mid-window** (cluster-FSM spec §11): `uc_node/tests/learner.rs::a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table` scaled to the fleet — purge the leader, restart it, and have a fresh learner join it before its first commit advance, under `m14_fleet_gate.py`'s row a load. Measure time to converge | **≤ 60 s** to converge and `snapshot_installed` observed — matching the [FSM-identity gate's row j](uc2-fsm-identity-gate-2026-09-02.md) | not run — fleet, user-gated |
+| h | **freeze duration vs commit stall** (cluster-FSM spec §11): a `CountSm` with a deliberately large state — a `Vec<u8>` of 256 MiB the FSM carries — under `m14_fleet_gate.py`'s row a load. Command an all-nodes instant and record `uc2_snapshot_freeze_seconds_max` and the longest gap in `commit` advance during it; then a `--standby` instant and record both again | the **standby** instant's commit gap is **≤ the pass length measured on the day** — i.e. no stall attributable to the instant. The **all-nodes** instant's gap is **reported, no bar**: it is the number this row exists to produce | not run — fleet, user-gated |
 
 ### Reading the rules
 
@@ -173,6 +214,59 @@ install is a correctness claim, adjudicated by
 `a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads` and
 the two `learner.rs` scenarios beside it, not by a rate.
 
+**Rows d and f: the verdict rule, stated once.** `scripts/apply_ab.sh`
+measures three arms — A (base), B (head) and B′ (head, built a second time
+into its own target dir from its own worktree) — interleaved, `--pairs K`
+runs each, and computes, on the per-arm means of `apply_bench`'s `min_rate`
+(the slowest FSM's applied frames/s):
+
+```text
+spread(X)     = (max(X) - min(X)) / mean(X) * 100
+head_vs_base  = (mean(B)  - mean(A)) / mean(A) * 100      the candidate
+resolution    = |mean(B') - mean(B)| / mean(B) * 100      the control
+noise_margin  = max(spread(A), spread(B), spread(B')) / 2
+verdict       = within  iff |head_vs_base| <= resolution + noise_margin
+```
+
+`resolution` is build noise: B and B′ are the same source, so whatever
+separates them is not semantics. `noise_margin` is half the widest within-arm
+run-to-run spread — the part of a K-run mean the box's own noise leaves
+unresolved. The sum is deliberately conservative; it can only *under*-claim a
+regression, which is the right way for a smoke runner to be wrong.
+"outside resolution" is an instruction to measure the hop on the fleet, never
+a claim that the code regressed by that percentage. `--selftest` pins this
+arithmetic and both verdicts on fixed inputs, with no cargo and no git.
+
+**Rows d and f differ in one thing worth stating: whether the harness is
+identical across arms.** Row f's pair is inside the window in which
+`apply_bench` could not run at all — `uc_service::attach` opens a per-row
+`svc_sched.<row>.ring` that the fake node never created (fixed 2026-09-07,
+in the same commit as the `APPLY-JSON` pin) — so row f **must** use
+`--harness`, and gets the stronger construction for free: every arm runs
+byte-identical harness source and only the library under it differs, which is
+`hop1_ab.sh`'s one-fixed-sink discipline generalized. Row d's pair straddles
+the `Appender::new`/`append` arity change of the same flag day, so no single
+harness compiles on both sides; each arm builds its own, and the two differ
+in the fake **driver** that paces the run, not in the apply loop being
+measured. That is a real, unavoidable asymmetry between the two rows and it
+is recorded here rather than discovered later.
+
+**Rows g and h are the two coordinated-snapshot claims a fleet is needed
+for.** Row g is the residual the spec was written to close, moved from a
+single-box test to a real join: a leader that ships a set and is then
+restarted used to serve `(0, 0, [])`, so the joiner installed nothing. The
+bar is deliberately the FSM-identity gate's row j number (≤ 60 s) rather than
+a new one — nothing about the join path's *mechanics* changed, only what it
+now carries, so a slower join would be a regression in the mechanics and not
+a cost of the feature. Row h exists because §5.7's stall argument is
+currently an argument: a freeze on a quorum that outlasts `fsm_lag` of
+appended log stalls commit **by design**, and standby instants exist to avoid
+it. 256 MiB of FSM state is chosen to make the freeze long enough to see
+against a live commit stream; the standby arm is the one with a bar, because
+"a standby instant does not stall commit" is the claim, and the all-nodes
+arm's gap is reported bare because it is the cost the operator is choosing
+between, not a target to hit.
+
 **What would fail this gate, if it ran.** Row a failing would mean the
 per-pass clock read, the ring drain, or the stamp write costs measurable
 throughput, which would be a surprise worth investigating rather than a
@@ -183,36 +277,53 @@ again, and the fix would be moving the added frame-loop body out of line, as
 M14a's `lockstep_wait` was. Row e failing while rows a and b pass would
 isolate the cost to the table path specifically — most plausibly the
 `TableConsumed` round trip through `svc_sched`, since that is the one hop a
-programmatic timer does not have on the firing side.
+programmatic timer does not have on the firing side. Row f failing would say the
+same thing about the `FRAME_TYPE_SNAPSHOT` arm, whose fix is the same move
+(it is already out of line, so the next step would be the type-dispatch
+shape itself). Row g failing would mean the join path regressed, not that
+the shipped set is wrong — the set's contents are a correctness claim with
+its own tests. Row h has no way to "fail" on the all-nodes arm; only its
+standby arm can, and a standby instant that stalls commit would mean a voter
+froze when the spec says only the learner should.
 
 ## Results
 
 **Not run.** No fleet spend has been authorized for this gate — the `2.11.0`
 release is on hold pending further work on this branch. This table stays
-empty until the maintainer green-lights a run:
+empty until the maintainer green-lights a run. The one exception is row f's
+dev-box **smoke**, recorded below because the runner had to be exercised on a
+real pair to be trusted; it is explicitly not a gate result, and row f's fleet
+arm is still unrun.
 
 | row | result |
 |---|---|
 | a | not run — release on hold |
 | b | not run — release on hold |
 | c | not run — release on hold |
-| d | **not run: no runner** — `scripts/hop1_ab.sh` drives `hop_bench`'s `dummy-node`/`engine-load` subcommands, which `apply_bench` does not have (see the bar table's row d for the exact refusals, checked 2026-09-03 on `f59a0b5`). Not a hold decision and not a measurement: the procedure as written has no runner for this row. |
+| d | not run — release on hold. **History, kept because it is what the bar was written against:** on 2026-09-03 this row read *"not run: no runner"* — `scripts/hop1_ab.sh` drives `hop_bench`'s `dummy-node`/`engine-load` subcommands, which `apply_bench` does not have, and both invocations were refused with `error: unexpected argument 'dummy-node' found` / `'engine-load' found` (checked on `f59a0b5`, release build). That finding is **closed** by [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) (2026-09-07). Closing it turned up a second, deeper reason the row could not have run: `apply_bench` itself died on every start with `ring error: io: No such file or directory`, because `uc_service::attach` opens a per-row `svc_sched.<row>.ring` that log-time-and-timers added and the fake node never created — fixed in the same commit as the `APPLY-JSON` pin. Neither was a hold decision and neither was a measurement. |
 | e | not run — release on hold |
+| f | **dev-box SMOKE, not a gate** — run `20260907T065532Z-627eb4e-a64a6ed`, N=1 bounded, `--pairs 3 --secs 3`, harness overlay on, box otherwise idle (load 0.11 at start). **head vs base −0.242 %**, against a **resolution of 0.048 %** (B vs B′) and a **noise margin of 0.361 %** (widest within-arm spread 0.72 %, arm B′) → **within resolution**. Arm means, `min_rate` applied frames/s: A 15 925 292, B 15 886 806, B′ 15 879 179. Provenance — binaries `sha256` A `3ec16b16c5f37c884c4e4b70508cdcc1deb9eed9bc134c1e86033f1424708315`, B `a7af9ad309489c28518f108d14493a546ba322b554217d1caa734c993f4661af`, B′ `eb0f6ee5cc8aad6b4c0261838a2ad51a0ff98362743cd2b4b7b1c360bbeda42d`; harness `f2f495874b491e306a747e3c59e9bbda0ec570c505c3fda8349724a890917f1c`. Read it for what it is: three runs per arm on a dev box, whose noise margin is 7 × the resolution it is meant to police. The row's own procedure (`--pairs 6`, N=1 **and** N=2) has not been run. |
+| g | not run — fleet, user-gated |
+| h | not run — fleet, user-gated |
 
 Numbers to record on the day, before any comparison:
 
 | measurement | value |
 |---|---|
-| `scripts/hop1_ab.sh` same-source rebuild resolution, on the rig | not measured |
-| consensus-pass length on the rig, under row b's load | not measured |
+| `scripts/hop1_ab.sh` same-source rebuild resolution, on the rig (rows a, b, e) | not measured |
+| consensus-pass length on the rig, under row b's load (rows c and h) | not measured |
+| `scripts/apply_ab.sh` B′ resolution, row d's run | not measured |
+| `scripts/apply_ab.sh` B′ resolution, row f's run | not measured on the rig; **0.048 %** on the dev box, run `20260907T065532Z-627eb4e-a64a6ed` (smoke) |
 
 ## When this gate is run
 
 1. Record `scripts/hop1_ab.sh`'s same-source rebuild resolution on the day,
-   on the fleet host shape, before running anything else. Rows a, b and d
-   compare against that number, not against a fixed percentage.
+   on the fleet host shape, before running anything else. Rows a, b and e
+   compare against that number, not against a fixed percentage. (Rows d and f
+   do **not**: they carry their own control arm — step 5.)
 2. Measure the consensus-pass length on the rig under load, and write it into
-   the table above. Row c's bar is `2 ×` it.
+   the table above. Row c's bar is `2 ×` it, and row h's standby arm is
+   judged against it.
 3. Run `bench-infra/scripts/m14_fleet_gate.py`'s rows a/b/e against this
    branch's binaries with `Timed<..>` services and no timers (row a), then
    again with the 1 000 timers/s arm (rows b and c).
@@ -220,17 +331,41 @@ Numbers to record on the day, before any comparison:
    against the leader, confirm every node's `uc2_schedule_table_position`
    agrees (`Uc2ScheduleTableDiverged` must not fire) before the measure
    window opens, then re-run row a's three rows with it live.
-5. Run row d's apply-hop A/B, including its same-source control arm.
-   **`scripts/hop1_ab.sh` cannot do this as written** (2026-09-03): it is a
-   `hop_bench` runner — it starts the sink with the `dummy-node` subcommand
-   and each driver with `engine-load`, neither of which `apply_bench`
-   accepts. Either teach the script an `apply_bench` mode (its own
-   `--root`/`--fsms`/`--mode`/`--secs` invocation and its `RESULT` line) or
-   write a sibling runner; whichever it is, keep the same-source rebuild
-   control arm, because that arm IS row d's bar.
-6. Fill in the results table above; do not edit the bar table to match
+5. Run rows d and f's apply-hop A/Bs with
+   [`scripts/apply_ab.sh`](/scripts/apply_ab.sh), which builds and measures
+   the control arm itself — that arm IS the bar, so there is nothing to
+   record first. On an otherwise **idle** box (check `uptime` / `top`; a
+   busy box makes the noise margin swamp the resolution, as the dev-box
+   smoke shows):
+
+   ```bash
+   scripts/apply_ab.sh 17d5c6b HEAD --pairs 6 --fsms 1      # row d
+   scripts/apply_ab.sh 17d5c6b HEAD --pairs 6 --fsms 2
+   scripts/apply_ab.sh 627eb4e a64a6ed --pairs 6 --fsms 1 \
+       --harness uc_node/examples/apply_bench.rs            # row f
+   scripts/apply_ab.sh 627eb4e a64a6ed --pairs 6 --fsms 2 \
+       --harness uc_node/examples/apply_bench.rs
+   ```
+
+   Row f **needs** `--harness` (both its arms predate the `svc_sched`-ring
+   harness fix and cannot run otherwise); row d **cannot use it** (its pair
+   straddles the `Appender::new` arity change). Record the run id, the three
+   binary `sha256`s and, for row f, the harness `sha256` beside every number.
+   These two rows do not need fleet spend — `apply_bench` isolates the FSM
+   hop on one host — but they do need an idle host.
+6. Run rows g and h, which **do** need the fleet and are user-gated:
+   - **g**: purge the leader, restart it, and join a fresh learner before its
+     first commit advance, under the row a load; time the convergence and
+     confirm `snapshot_installed` on the joiner. Then check
+     `uc2_snapshot_set_position` agrees cluster-wide.
+   - **h**: deploy the 256 MiB-state `CountSm`, run the row a load, command
+     `uc2ctl snapshot` (all nodes) and record `uc2_snapshot_freeze_seconds_max`
+     plus the longest `commit` stall; then `uc2ctl snapshot --standby` and
+     record both again. `uc2ctl snapshot show` is the diagnostic if an
+     instant does not complete.
+7. Fill in the results table above; do not edit the bar table to match
    whatever the run produced.
-7. Only after this gate, the FSM identity gate, and the maintainer's
+8. Only after this gate, the FSM identity gate, and the maintainer's
    version-number decision
    ([the semver policy](../reference/semver-policy.md)) does
    [Cut a release](../how-to/cut-a-release.md) apply.
@@ -246,3 +381,7 @@ Numbers to record on the day, before any comparison:
   apply-hop harness row d uses, and the codegen lesson row d exists for.
 - [M14c client hop](uc2-m14c-client-hop-2026-08-28.md) — where
   `scripts/hop1_ab.sh`'s same-source rebuild control came from.
+- [Cluster FSM and coordinated snapshots
+  spec](../superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md)
+  §11 — where rows f, g and h come from, and the correctness rows they are
+  deliberately **not** a substitute for.
