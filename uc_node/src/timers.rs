@@ -320,16 +320,30 @@ impl NsHistogram {
     /// the leader's consensus pass, and CLAUDE.md's standing M14a lesson is
     /// that a hot loop's body costs through codegen even on paths that never
     /// run — so the ladder stays out of line, as `lockstep_wait` did.
+    ///
+    /// SINGLE WRITER: only the consensus agent observes (both call sites are
+    /// in its leading pass), and the scrape only reads. So every update is a
+    /// plain relaxed load + store, not a locked read-modify-write — an
+    /// `fetch_add` would put four `lock`-prefixed instructions on every
+    /// leading pass for a guarantee (no lost update between writers) that a
+    /// single writer never needs. A scrape may read a value one update stale,
+    /// which is the same tolerance the cnc counters already carry. The bucket
+    /// is found by binary search (`partition_point`), not a scan of the
+    /// ladder.
     #[inline(never)]
     pub fn observe(&self, value_ns: u64) {
-        let mut i = 0;
-        while i < NS_BUCKETS.len() && value_ns > NS_BUCKETS[i] {
-            i += 1;
+        let i = NS_BUCKETS.partition_point(|&b| b < value_ns);
+        let slot = &self.slots[i];
+        slot.store(slot.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        self.sum.store(
+            self.sum.load(Ordering::Relaxed) + value_ns,
+            Ordering::Relaxed,
+        );
+        self.count
+            .store(self.count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+        if value_ns > self.max.load(Ordering::Relaxed) {
+            self.max.store(value_ns, Ordering::Relaxed);
         }
-        self.slots[i].fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(value_ns, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.max.fetch_max(value_ns, Ordering::Relaxed);
     }
 
     /// Read the histogram for one scrape, accumulating the bucket counts.
