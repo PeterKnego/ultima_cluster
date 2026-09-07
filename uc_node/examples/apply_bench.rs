@@ -144,6 +144,36 @@ fn unix_ns() -> u64 {
         .as_nanos() as u64
 }
 
+/// The machine-readable result line `scripts/apply_ab.sh` parses.
+///
+/// Extracted from `main` so the runner's parser and this printer cannot
+/// drift: `apply_json_line_shape_is_pinned` below pins the exact bytes, and
+/// the script's `--selftest` stubs print that same shape. `min_rate` — the
+/// slowest FSM's applied frames/s — is the hop number the A/B compares; the
+/// rest is provenance for the run.
+#[allow(clippy::too_many_arguments)]
+fn render_apply_json(
+    fsms: u8,
+    mode: &str,
+    lag: u64,
+    payload: usize,
+    frame: u64,
+    secs: f64,
+    min_rate: f64,
+    driver_rate: f64,
+    per: &[(f64, u64)],
+) -> String {
+    let per_json: Vec<String> = per
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{{\"fsm\":{i},\"rate\":{:.0},\"lag_waits\":{}}}", p.0, p.1))
+        .collect();
+    format!(
+        "APPLY-JSON {{\"fsms\":{fsms},\"mode\":\"{mode}\",\"lag\":{lag},\"payload\":{payload},\"frame\":{frame},\"secs\":{secs:.2},\"min_rate\":{min_rate:.0},\"driver_rate\":{driver_rate:.0},\"per\":[{}]}}",
+        per_json.join(",")
+    )
+}
+
 fn min_applied(cnc: &CncPage, fsms: u8) -> u64 {
     (0..fsms)
         .map(|id| cnc.service_slot(id as usize).applied.load_acquire())
@@ -217,7 +247,17 @@ fn main() -> anyhow::Result<()> {
             MAX_MSG,
         )
         .map_err(|e| anyhow::anyhow!("egress ring: {e}"))?;
-        rings.push((q, e));
+        // The per-row `svc_sched` SPSC (service → node) that log time and
+        // timers added: `uc_service::attach` OPENS it, so a fake node that
+        // does not create it fails every attach with
+        // `ring error: io: No such file or directory`. Same geometry as the
+        // real node's (`uc_node::node`: `SpscRing::create(.., MIB, MAX_MSG)`).
+        // The raw counter never schedules a timer, so nothing is ever written
+        // and no drain is needed — the consumer half is held only to keep the
+        // mapping alive for the run.
+        let s = SpscRing::create(&a.root.join(format!("svc_sched.{id}.ring")), MIB, MAX_MSG)
+            .map_err(|e| anyhow::anyhow!("svc_sched ring: {e}"))?;
+        rings.push((q, e, s));
     }
 
     // ---- the FSMs ----
@@ -342,22 +382,19 @@ fn main() -> anyhow::Result<()> {
     let driver_rate = (appended1 - appended0) as f64 / elapsed;
     println!("driver appended_frames/s={driver_rate:.0} pace_stalls={stalls}");
     println!("hop: min applied_frames/s={min_rate:.0}");
-    let per_json: Vec<String> = per
-        .iter()
-        .enumerate()
-        .map(|(i, p)| format!("{{\"fsm\":{i},\"rate\":{:.0},\"lag_waits\":{}}}", p.0, p.1))
-        .collect();
     println!(
-        "APPLY-JSON {{\"fsms\":{},\"mode\":\"{}\",\"lag\":{},\"payload\":{},\"frame\":{},\"secs\":{:.2},\"min_rate\":{:.0},\"driver_rate\":{:.0},\"per\":[{}]}}",
-        a.fsms,
-        a.mode,
-        lag,
-        a.payload,
-        frame,
-        elapsed,
-        min_rate,
-        driver_rate,
-        per_json.join(",")
+        "{}",
+        render_apply_json(
+            a.fsms,
+            &a.mode,
+            lag,
+            a.payload,
+            frame,
+            elapsed,
+            min_rate,
+            driver_rate,
+            &per,
+        )
     );
 
     // The SM's own count: proves the cursor sweep applied every frame (not
@@ -377,4 +414,37 @@ fn main() -> anyhow::Result<()> {
     drop(rings);
     let _ = std::fs::remove_dir_all(&a.root);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_apply_json;
+
+    /// Pins the exact bytes of the line `scripts/apply_ab.sh` parses.
+    ///
+    /// The runner reads `min_rate` out of this line, and its `--selftest`
+    /// stubs print a hand-written copy of this shape. If this assertion is
+    /// ever edited, the script's parser AND its stubs must be edited in the
+    /// same commit — that coupling is the whole point of the pin.
+    #[test]
+    fn apply_json_line_shape_is_pinned() {
+        let line = render_apply_json(
+            2,
+            "bounded",
+            16_777_216,
+            64,
+            96,
+            8.0,
+            1_234_567.4,
+            2_345_678.6,
+            &[(1_234_567.4, 11), (2_345_678.6, 0)],
+        );
+        assert_eq!(
+            line,
+            "APPLY-JSON {\"fsms\":2,\"mode\":\"bounded\",\"lag\":16777216,\"payload\":64,\
+             \"frame\":96,\"secs\":8.00,\"min_rate\":1234567,\"driver_rate\":2345679,\
+             \"per\":[{\"fsm\":0,\"rate\":1234567,\"lag_waits\":11},\
+             {\"fsm\":1,\"rate\":2345679,\"lag_waits\":0}]}"
+        );
+    }
 }
