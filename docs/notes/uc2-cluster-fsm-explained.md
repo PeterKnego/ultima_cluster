@@ -294,6 +294,35 @@ completeness path, exactly as if it had frozen. A fetch binds the position it
 asked for and is refused if that position is above what this node has made
 durable — a node must not adopt a floor above its own durable frontier.
 
+Two consequences of that shape are worth stating, because both were nearly
+shipped as defects.
+
+The first is a **monitoring** one. On a standby cluster the leader is a voter,
+so it commands instants whose sets only the learners build, and its own set
+stays where it was until someone runs the fetch. Read through the obvious
+metrics, that healthy steady state is *indistinguishable* from the failure the
+snapshot alert exists to catch: instants keep being commanded, no set ever
+completes. So the two are kept apart by construction rather than by a
+threshold. A superseded standby instant is not an abandonment on a node that
+was never going to build its set — no counter moves — and the commanded-instant
+gauge counts **full** instants only. The standby half gets its own gauge,
+written at the one place that decides whether this node acts on a standby
+frame at all, which by the rule above is only ever a learner. So the standby
+alert watches the node doing the work, and cannot fire on a voter: not because
+a label excludes it, but because a voter never writes the series.
+
+The second is a **security** one. The pull request is the one snapshot path
+that is deliberately not leader-gated — the source is a learner, and a learner
+never leads. Which means, with wire crypto off, that a 28-byte datagram
+claiming to come from anywhere elicits a whole snapshot set sent to that
+address. UC's crypto-off posture already concedes the cluster to a
+network-path adversary, but this one hands a reflector to an attacker aimed at
+somebody else entirely, which is not the cluster's to concede. So the request
+is served only to an address in the current membership — voters and learners,
+which is who could legitimately ask — and anything else is a named, counted
+drop. The redirect is left ungated on purpose: the worst a forged one achieves
+is making a joiner ask a real member for a set it will verify anyway.
+
 Until a voter has fetched, its floor sits where it was, and a joiner that
 needs a lower set is **redirected**: the node that cannot serve answers with
 "ask learner *k* for the set at P", and the joiner asks there. In practice

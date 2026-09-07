@@ -38,9 +38,15 @@ along with it — a signature you cannot name is not usable API. Concretely,
 and covered by this policy on the same terms as the rows above:
 
 - `uc_service::{ServiceBuilder, Service, ServiceConfig, ServiceError,
-  SnapshotPolicy, SnapshotError, OutputError}` — `ServiceBuilder::new(cfg,
-  sm).start()` is how a state machine is attached at all, and it returns
-  `Result<Service<S>, ServiceError>`.
+  SnapshotError, OutputError}` — `ServiceBuilder::new(cfg, sm).start()` is
+  how a state machine is attached at all, and it returns
+  `Result<Service<S>, ServiceError>`. (`SnapshotPolicy` was here until
+  2.11.0, which deleted it: the snapshot cadence became a replicated cluster
+  setting, `[settings] snapshot.interval_bytes`, so a service no longer
+  chooses one. Removing a promised type is a MAJOR change under this policy —
+  it ships in 2.11.0 under the same maintainer-decided carve-out as the FSM
+  identity break below, and for the same reason: nothing outside this
+  repository depends on it yet.)
 - `uc_client::{PipelinedConfig, Ticket, ClientError, WaitStrategy}` — the
   configuration, the handle and the error type the `PipelinedClient`/`Client`
   tiers hand back.

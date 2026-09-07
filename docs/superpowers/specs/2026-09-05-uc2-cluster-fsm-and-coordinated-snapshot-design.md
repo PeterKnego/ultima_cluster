@@ -1095,6 +1095,68 @@ still stand.*
     is `CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9` (`uc_protocol::v2::cnc`),
     service-written by `start_with_snapshots`.
 
+11. **§5.5/§5.9 — a standby instant is the learners' set, and the instant
+    gauge is split in two.** §5.5 anticipated that a `target = learners`
+    cadence could outrun the pull and prescribed "complete means complete on
+    the leader **by fetch**"; as-built erratum 3 replaced the completed-instant
+    clock with a *commanded*-instant clock, which discards that mechanism. The
+    consequence — found by the whole-branch review, not by a failure — is that
+    on a standby cluster the **leader is a voter**: it commands instants its
+    own rows are supposed not to freeze for, and its own set never completes
+    until an operator runs `uc2ctl snapshot fetch`. Every cadence tick
+    therefore counted an abandonment and bumped every declared row's
+    `snapshot_row_incomplete`, and `Uc2SnapshotStalled`'s firing condition
+    (`changes(instant) >= 2 and changes(set) == 0`) held permanently — the
+    healthy standby steady state was observably identical to a dead FSM.
+
+    As built: (a) a superseded instant that was **standby-flagged**, on a node
+    that is **not a learner**, was never this node's set to complete — it is
+    not counted abandoned, bumps no row counter, and does not hold the
+    single-in-flight gate. The cadence gate itself is unchanged (the interval
+    clause, and op 8's operator override, already let a standby instant be
+    superseded). (b) `uc2_snapshot_instant_position` advances for **full**
+    instants only, and a new gauge `uc2_snapshot_standby_instant_position`
+    carries the standby half — written by the `uc2-cluster` agent at the
+    moment it *acts* on a standby `SNAPSHOT` frame, which by §5.7's own skip
+    rule happens only on a **learner**. A voter exports `0`, so the new
+    `Uc2StandbySnapshotStalled` (the same `changes()` shape over the standby
+    gauge) cannot fire on one and needs no role label. The freeze-max edge
+    detector keys on `max()` of the two gauges, so it still resets for both
+    roles. `CONTRACT_SERIES` moves 96 → 99 (this gauge plus the two
+    already-rendered refusal counters, erratum 8's omission). Ruling **P13**.
+
+12. **§5.7 item 4 — `SNAP_REQUEST` is served only to a member of the current
+    membership.** The pull path is deliberately not leader-gated (the intended
+    source is a learner, which never leads), unlike the below-floor NAK path,
+    which returns before `serve_nak` on a follower. Crypto **off**, that made
+    every node a UDP reflector: a 28-byte spoofed datagram elicited a whole
+    snapshot set to an address of the attacker's choosing. That is a harm to a
+    **third party**, which the standing crypto-off residual ("a network-path
+    adversary already owns the cluster") does not cover, so it is closed in
+    code rather than accepted. `Sender` now keeps a `members` list — voters
+    **and** learners, minus self — separately from its fan-out, because a
+    learner's fan-out is deliberately empty and a learner is exactly the node
+    a standby fetch asks; it is seeded at boot (`Sender::set_members`) and
+    replaced by `CtrlMsg::SetPeers`'s new `members` field. A non-member is a
+    named, counted drop (`SenderStats::snap_request_unknown_peer`).
+    `SNAP_REDIRECT` is **not** gated: the worst a forged one can do is make a
+    below-floor joiner ask a real member for a set, which
+    `follow_snap_redirect` already bounds by name. `docs/security/attack-
+    surface.md` gains rows for both kinds and for `decode_snapshot_envelope`.
+    Ruling **P14**.
+
+13. **Gate drivers state their own snapshot cadence.** Not a product change,
+    recorded because it changed a measured number's provenance:
+    `m12_gate`'s `node` role had hardcoded a 32 KiB cadence (`m6_gate`'s and
+    `m9_gate`'s smoke number) whenever `--purge-below-snapshot` was set, while
+    `m14_fleet_gate.py`'s 32 MiB reached only the `service` role — where,
+    since erratum 3 deleted the per-service byte cadence, the flag now only
+    selects `start_with_snapshots()`. The M14 gate's purge rows would have run
+    at ~1024× the cadence rows d and f were measured at. The node role now
+    takes `--snapshot-interval-bytes`, defaulting to `0` (the example's
+    pre-branch behaviour) and **required** with `--purge-below-snapshot`, and
+    the fleet driver passes its constant to both roles.
+
 ### Designed and not built in plan 2
 
 Recorded so they are not mistaken for shipped surface.

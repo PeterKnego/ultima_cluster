@@ -26,7 +26,7 @@ exists. The release was **STOPPED again on 2026-09-05** by the maintainer, for
 the cluster-FSM and coordinated-snapshot work: plan 1 (the cluster FSM) is
 merged to local `main`; plan 2 (coordinated and standby snapshot instants,
 spec §5) is DONE on the `uc2+coordinated-snapshot-plan2` worktree branch and
-NOT merged; plan 3 (retirement and proof) is not written. **Both 2.11.0 gate
+NOT merged; plan 3 (retirement and proof) is WRITTEN but not executed. **Both 2.11.0 gate
 docs are still 0-of-9 rows run**, and
 `docs/how-to/cut-a-release.md` §1's writeup de-scaffolding is deliberately
 left until those results are in, because the release-evidence table needs

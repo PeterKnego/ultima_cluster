@@ -80,9 +80,18 @@ pub fn take(common: &CommonArgs, standby: bool) -> anyhow::Result<()> {
             anyhow::bail!("refused: {}", crate::reason_str(resp.reason));
         }
         2 => {
+            // Final wave (docs review): this used to name "an instant is
+            // already in flight" as a cause. Admin op 8 SKIPS the
+            // single-in-flight gate on purpose — that is the whole difference
+            // between `uc2ctl snapshot` and the cadence — so it can never
+            // retry for that reason. What it CAN retry for: this node is not
+            // the leader (ask the leader), or it is the leader but its
+            // appender is not installed yet (a leader-open collapse ack still
+            // outstanding), or the log buffer was momentarily full.
             println!(
-                "retry: leader unknown, or an instant is already in flight (snapshot position \
-                 {}) — try again",
+                "retry: this node is not the leader, or its leader open has not completed, or \
+                 the log buffer was momentarily full (snapshot position {}) — try again, or \
+                 run this against the leader",
                 resp.version
             );
             anyhow::bail!("retry: try again");

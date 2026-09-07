@@ -11,7 +11,9 @@ load — see [Change cluster membership](change-cluster-membership.md).
 ## Confirm every declared FSM can snapshot
 
 Your `StateMachine` must also implement `SnapshotStateMachine`, giving it
-`build_snapshot` and `install_snapshot`, and the service must be started with
+`freeze` (pin the state cheaply and hand back a handle), `stream_snapshot`
+(write that handle's bytes, off the apply thread) and `install_snapshot`, and
+the service must be started with
 `start_with_snapshots()` rather than `start()` — that is what publishes the
 row's **snapshot-capability bit**. `uc_lincheck`'s `RegisterSm` and
 `ListAppendSm` are small worked examples of the pair.

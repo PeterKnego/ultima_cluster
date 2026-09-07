@@ -616,7 +616,7 @@ nothing about one. `snapshot`'s `version` word is the instant's position;
 |---|---|---|
 | `0` | `instant=<P>` / `accepted: fetch of position <P> from node <id> is underway …` | exit 0 |
 | `1` | `refused: <reason> (snapshot position <N>)` / `refused: <reason> (position <N>)` | exit 1 |
-| `2` | `retry: leader unknown, or an instant is already in flight …` / `retry: a fetch is already in flight here …` | exit 1 |
+| `2` | `retry: this node is not the leader, or its leader open has not completed, or the log buffer was momentarily full …` / `retry: a fetch is already in flight here …` | exit 1 |
 
 ## Refusal reasons
 
