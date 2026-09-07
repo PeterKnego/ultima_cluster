@@ -1234,6 +1234,12 @@ impl Node {
             .chain(learner_addrs.iter())
             .copied()
             .collect();
+        // Ruling P14 (final wave I5): the same list, kept for the sender's
+        // `SNAP_REQUEST` gate. It is NOT the fan-out — a learner's fan-out is
+        // deliberately empty (it never leads) and a learner is exactly the
+        // node a standby fetch asks — so it is captured here, before the
+        // `is_learner` branch below rewrites `followers`.
+        let sender_members = followers.clone();
 
         // Channels.
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(NET_EVENT_CAPACITY);
@@ -1326,6 +1332,11 @@ impl Node {
             }),
         );
         sender.set_replay_source(journal);
+        // Ruling P14: who may ask this node for a snapshot set. Seeded at
+        // boot rather than only from `CtrlMsg::SetPeers`, which arrives on
+        // config ADOPTION — a learner that never sees a reconfiguration would
+        // otherwise refuse every fetch it exists to serve.
+        sender.set_members(sender_members);
         // M6 Task 6 / M14c: snapshot session wiring. `snap_root` holds one
         // `snapshots/<id>/` per declared FSM (created in `create_rings`);
         // `incoming_snapshot` is the node-internal signal the receiver raises on
@@ -2302,12 +2313,31 @@ impl Node {
         self.snapshot_set_position.load(Ordering::Acquire)
     }
 
-    /// Spec §9: the last instant this node COMMANDED as leader
+    /// Spec §9: the last **full** instant this node COMMANDED as leader
     /// (`uc2_snapshot_instant_position`), `0` if it never has. Unlike
     /// [`Node::snapshot_set_position`] this is leader-local — a follower's
     /// reading is whatever it last commanded in some earlier term.
+    ///
+    /// A STANDBY instant does not advance it (Ruling P13(b)): a standby
+    /// instant is the learners' set to build, and pairing this gauge with
+    /// `uc2_snapshot_set_position` on a voter that commanded one would make
+    /// `Uc2SnapshotStalled` fire on a healthy `snapshot.target = learners`
+    /// cluster. See [`Node::snapshot_standby_instant_position`].
     pub fn snapshot_instant_position(&self) -> u64 {
         self.snapshot_instant_pub.load(Ordering::Relaxed)
+    }
+
+    /// Ruling P13(b): the last **standby** instant this node's `uc2-cluster`
+    /// agent ACTED on (`uc2_snapshot_standby_instant_position`), `0` if it
+    /// never has.
+    ///
+    /// LEARNER-ONLY by construction: a voter skips every standby-flagged
+    /// `SNAPSHOT` frame (spec §5.7), so it never reaches the store and always
+    /// reads `0`. That is what lets `Uc2StandbySnapshotStalled` use the same
+    /// `changes()` shape as `Uc2SnapshotStalled` with no role label — it
+    /// cannot fire on a voter.
+    pub fn snapshot_standby_instant_position(&self) -> u64 {
+        self.snapshot_standby_instant_pub.load(Ordering::Acquire)
     }
 
     /// Spec §9: `uc2_snapshot_row_incomplete_total{row}` — how many instants
@@ -4348,10 +4378,21 @@ impl Consensus {
         // sender thread on the spot (see the helper's doc). The fiat-install
         // caller's joiner is typically a learner (not yet a voter in its own
         // seed), exercising this same +1 branch.
+        // Ruling P14 (final wave I5): the membership the sender's
+        // `SNAP_REQUEST` gate answers — voters AND learners, minus self,
+        // independent of the fan-out above (which is empty on a learner).
+        let members: Vec<SocketAddr> = config
+            .voters
+            .iter()
+            .chain(config.learners.iter())
+            .filter(|(id, _)| *id != self.id)
+            .map(|(_, a)| addr_of(*a))
+            .collect();
         let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
             followers,
             learners,
             cluster_size: sender_cluster_size(config, self.id),
+            members,
         });
         // Refresh the node's own routing + observability.
         self.rebuild_peer_maps(config);

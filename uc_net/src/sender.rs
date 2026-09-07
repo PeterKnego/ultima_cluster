@@ -126,6 +126,14 @@ pub enum CtrlMsg {
         followers: Vec<SocketAddr>,
         learners: Vec<SocketAddr>,
         cluster_size: usize,
+        /// Ruling P14 (final wave I5): every member of the new membership
+        /// EXCEPT self — voters and learners together, whatever this node's
+        /// own role is. Distinct from `followers`/`learners` on purpose: a
+        /// LEARNER's sender is given an empty fan-out (it never leads, so it
+        /// streams to no one), and a learner is exactly the node a
+        /// `SNAP_REQUEST` is meant to reach. Only [`Sender::on_snap_request`]
+        /// reads it.
+        members: Vec<SocketAddr>,
     },
 }
 
@@ -424,6 +432,15 @@ pub struct SenderStats {
     /// artifacts removed), so a rising count is worth reading as "this
     /// cluster's voters are relying on the standby return path".
     pub snap_redirects: AtomicU64,
+    /// Ruling P14 (final wave I5): `SNAP_REQUEST`s dropped because `from` is
+    /// not in the CURRENT membership. `SNAP_REQUEST` is the one snapshot path
+    /// that is deliberately not leader-gated — the intended source is a
+    /// learner — so without an address gate a crypto-off node reflects a whole
+    /// snapshot set to any address a 28-byte spoofed datagram names. Non-zero
+    /// crypto-off means someone is probing this node (or a stale member is
+    /// still asking); non-zero crypto-ON should be impossible, since both new
+    /// kinds are `Scope::Pairwise` and an unsealed datagram never gets here.
+    pub snap_request_unknown_peer: AtomicU64,
     /// M8: an outgoing datagram this sender could not seal — dropped rather
     /// than sent. Covers both scopes (T17 widened it from T10's DATA/HEARTBEAT
     /// only):
@@ -445,6 +462,17 @@ pub struct Sender {
     buffer: Arc<LogBuffer>,
     sock: FaultSocket,
     followers: Vec<SocketAddr>,
+    /// Ruling P14 (final wave I5): the CURRENT membership minus self — the
+    /// only addresses [`Sender::on_snap_request`] will serve a snapshot set
+    /// to. Seeded from the constructor's fan-out (which IS
+    /// membership-minus-self for a voter) and replaced wholesale by
+    /// [`CtrlMsg::SetPeers`]'s `members` and [`Sender::set_members`]. A
+    /// LEARNER needs the setter: its fan-out is deliberately empty, and a
+    /// learner is the node a standby fetch actually asks.
+    ///
+    /// A `Vec`, not a set: it holds at most `MAX_MEMBERS` = 8 addresses and
+    /// is scanned only on the (rare) `SNAP_REQUEST` path.
+    members: Vec<SocketAddr>,
     flow: FlowControl,
     ctrl: mpsc::Receiver<CtrlMsg>,
     cfg: SenderConfig,
@@ -689,6 +717,7 @@ impl Sender {
         Sender {
             buffer,
             sock,
+            members: followers.clone(),
             followers,
             flow,
             ctrl,
@@ -889,6 +918,7 @@ impl Sender {
                     followers,
                     learners,
                     cluster_size,
+                    members,
                 } => {
                     // Rebuild flow control from the new voting/learner split,
                     // re-feeding every surviving address's last raw advert so
@@ -907,6 +937,10 @@ impl Sender {
                     // streamed identically (same shape `with_learners` builds at
                     // construction).
                     self.followers = followers.into_iter().chain(learners).collect();
+                    // Ruling P14: replaced wholesale, and independently of the
+                    // fan-out above — a demoted node's sender goes silent but
+                    // must still know who may ask it for a set.
+                    self.members = members;
                     // The peer-observability slot mapping doesn't change here (M6
                     // Task 9's cnc band is keyed by NodeId, which SetPeers doesn't
                     // carry) — refresh whatever it already tracks against the new
@@ -1369,18 +1403,50 @@ impl Sender {
         true
     }
 
+    /// Ruling P14 (final wave I5): replace the membership this sender will
+    /// answer a `SNAP_REQUEST` from — every member EXCEPT self, voters and
+    /// learners alike, whatever this node's own role is.
+    ///
+    /// Needed as a boot-time setter (rather than only [`CtrlMsg::SetPeers`],
+    /// which arrives on config ADOPTION) because a LEARNER's sender is
+    /// constructed with an empty fan-out — it never leads, so it streams to no
+    /// one — and a learner is precisely the node a standby fetch asks. Without
+    /// this it would refuse every request until the first reconfiguration.
+    pub fn set_members(&mut self, members: Vec<SocketAddr>) {
+        self.members = members;
+    }
+
     /// Coordinated-snapshot spec §5.7 item 4: a peer asked this node for its
     /// complete set at `body.position` (`0` = "your newest", i.e. the set at
     /// this node's own floor — the same answer a below-floor NAK gets). Opens
     /// an ORDINARY session, scoped by the requester's session id.
     ///
-    /// Any node serves: the intended source is a learner (which is never the
-    /// leader), so nothing here consults the leader role. A request this node
-    /// cannot answer — no set at that position, or a session already in flight
-    /// — is silently dropped; the requester retries, exactly as spec §5.7 item
-    /// 6 describes ("a learner that has not completed answers the request with
-    /// nothing").
+    /// Any node ROLE serves: the intended source is a learner (which is never
+    /// the leader), so nothing here consults the leader role. A request this
+    /// node cannot answer — no set at that position, or a session already in
+    /// flight — is silently dropped; the requester retries, exactly as spec
+    /// §5.7 item 6 describes ("a learner that has not completed answers the
+    /// request with nothing").
+    ///
+    /// **But only a MEMBER is served** (Ruling P14). Because this path is
+    /// deliberately not leader-gated — unlike the below-floor NAK path, which
+    /// returns before `serve_nak` on a follower — it would otherwise make
+    /// every node a UDP reflector when crypto is off: a 28-byte spoofed
+    /// datagram elicits a whole snapshot set to an address of the attacker's
+    /// choosing, which harms a THIRD party rather than only this cluster.
+    /// The intended requester is always a cluster member (a voter pulling, or
+    /// a redirected joiner already in the membership), so the gate costs one
+    /// scan of at most 8 addresses and removes the arbitrary-address case
+    /// entirely. Crypto ON it is redundant (both new kinds are
+    /// `Scope::Pairwise`, so an unsealed datagram never reaches here) and
+    /// harmless. Named and counted, never silent: `snap_request_unknown_peer`.
     pub fn on_snap_request(&mut self, from: SocketAddr, body: SnapRequestBody) {
+        if !self.members.contains(&from) {
+            self.stats
+                .snap_request_unknown_peer
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let at = if body.position == 0 {
             None
         } else {
@@ -2006,12 +2072,18 @@ mod tests {
             followers: vec![f1.addr(), f2.addr(), f3.addr()],
             learners: vec![],
             cluster_size: 4,
+            members: vec![f1.addr(), f2.addr(), f3.addr()],
         })
         .unwrap();
         s.do_work();
 
         assert_eq!(s.followers.len(), 3, "fan-out grew to the new voter set");
         assert!(s.followers.contains(&f3.addr()));
+        // Ruling P14: the SNAP_REQUEST membership follows the same rebuild.
+        assert!(
+            s.members.contains(&f3.addr()),
+            "a new member may ask this node for a snapshot set"
+        );
         // needed = 2 now: f1's and f2's re-fed adverts must have survived the
         // rebuild (f3 has no status yet, so it sits at the bootstrap window
         // and cannot be the 2nd-highest).
@@ -4525,6 +4597,64 @@ mod tests {
         }
         assert!(s.snap.is_none(), "no session for a set we do not hold");
         assert!(f.recv_raw().is_none(), "not one datagram");
+    }
+
+    /// **Ruling P14 (I5)**: a `SNAP_REQUEST` is served only to an address in
+    /// the CURRENT membership. `SNAP_REQUEST` is the one snapshot path that
+    /// is not leader-gated (the intended source is a learner), so without
+    /// this a crypto-off node is a UDP reflector: a 28-byte spoofed datagram
+    /// elicits a whole snapshot set to an address of the attacker's choosing.
+    /// The requester is always a cluster member — a voter pulling, or a
+    /// redirected joiner already in the membership — so the gate costs one
+    /// linear scan of at most 8 addresses on a rare path, and removes the
+    /// arbitrary-address case entirely.
+    ///
+    /// Crypto ON this is already closed (both kinds are `Scope::Pairwise`, so
+    /// an unsealed datagram never reaches here); the gate is what closes it
+    /// crypto OFF, where the rest of the residual is cluster-internal but
+    /// reflection harms a THIRD party.
+    #[test]
+    fn a_snap_request_from_an_address_outside_the_membership_opens_nothing() {
+        let (mut s, f, _dir) = sender_without_crypto_and_snapshot_source();
+        // The helper's membership is exactly `[f.addr()]`.
+        let stranger: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        s.on_snap_request(
+            stranger,
+            SnapRequestBody {
+                session: 5,
+                position: 4096,
+            },
+        );
+        for _ in 0..4 {
+            s.do_work();
+        }
+        assert!(s.snap.is_none(), "no session for a non-member");
+        assert!(f.recv_raw().is_none(), "not one datagram");
+        assert_eq!(
+            s.stats.snap_request_unknown_peer.load(Ordering::Relaxed),
+            1,
+            "the drop is NAMED and counted, not silent"
+        );
+
+        // Positive control on the same sender: the identical request from a
+        // MEMBER is served, so the gate is about the address and nothing else.
+        s.on_snap_request(
+            f.addr(),
+            SnapRequestBody {
+                session: 6,
+                position: 4096,
+            },
+        );
+        for _ in 0..4 {
+            s.do_work();
+        }
+        let (h, _) = f.recv().expect("a member's request opens a session");
+        assert_eq!(h.kind, DGRAM_KIND_SNAP_BEGIN);
+        assert_eq!(
+            s.stats.snap_request_unknown_peer.load(Ordering::Relaxed),
+            1,
+            "and a served request counts nothing"
+        );
     }
 
     /// Spec §5.7 item 6: a below-floor NAK this node cannot serve is answered

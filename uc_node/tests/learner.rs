@@ -2612,9 +2612,28 @@ fn a_standby_instant_freezes_only_the_learner_and_voters_applied_keep_moving() {
             "voter {v} abandoned an instant; only one was commanded and it was never superseded"
         );
     }
-    // And the leader's own view of it: it commanded the instant, but holds no
-    // set at it.
-    assert_eq!(f.node(f.leader).snapshot_instant_position(), p);
+    // And the leader's own view of it (Ruling P13(b)): it commanded the
+    // instant, holds no set at it, and — because the set was never its to
+    // complete — does not report it on the FULL-instant gauge either. That
+    // gauge is what `Uc2SnapshotStalled` pairs with `snapshot_set_position`,
+    // so advancing it here would make this exact healthy state page.
+    assert_eq!(
+        f.node(f.leader).snapshot_instant_position(),
+        0,
+        "a standby instant is not a FULL instant on the voter that commanded it"
+    );
+    assert_eq!(
+        f.node(f.leader).snapshot_standby_instant_position(),
+        0,
+        "and a voter never ACTS on one, so its standby gauge stays 0"
+    );
+    // The learner is where the standby instant is observable: its uc2-cluster
+    // agent acted on P, which is what `Uc2StandbySnapshotStalled` watches.
+    assert_eq!(
+        f.node(f.learner).snapshot_standby_instant_position(),
+        p,
+        "the learner published the standby instant its rows acted on"
+    );
 
     f.stop();
 }
