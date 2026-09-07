@@ -174,8 +174,9 @@ permanently on any multi-node cluster.
 Since log time and timers, every log frame carries a leader-written timestamp
 and a state machine can schedule callbacks on it
 ([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Eight new
-families — five for the clock and the timer set, three for the replicated
-schedule table:
+contract families — five for the clock and the timer set, three for the
+replicated schedule table — plus four **off-contract** timing families
+(the two histograms below and their `_max` gauges):
 
 | family | type | labels | meaning |
 |---|---|---|---|
@@ -184,6 +185,8 @@ schedule table:
 | `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row **on the leader**. The timer heap is leader-only since the cluster FSM (2.11 pending), so a follower always exports `0` — that is the healthy reading, not a gap, and there is deliberately no divergence alert over this family |
 | `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
 | `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
+| `uc2_timer_lateness_ns` | histogram | `service`, `row` | **off-contract** (see below): wall-clock lateness of every `TIMER` frame this node appended **as leader** for that row — the pass clock minus the fired deadline, i.e. how far past its deadline the pass that *placed* the frame ran. Not the on-the-wire `time_ns - deadline_ns`, which is `0` for every on-time fire by construction. Companion gauge `uc2_timer_lateness_ns_max` |
+| `uc2_consensus_pass_ns` | histogram | none | **off-contract**: the interval between consecutive consensus-pass clock readings while this node **leads**, derived from the reading the pass already takes (no clock read of its own). The first pass of a leadership term is skipped, so a promotion contributes no giant sample; a follower's histogram simply stops advancing. Companion gauge `uc2_consensus_pass_ns_max` |
 | `uc2_schedule_table_position` | gauge | none | frame-END position of the schedule table this node's **cluster FSM** has applied; `0` = none. The table is cluster-FSM state applied at commit, so this must be identical on every node once caught up |
 | `uc2_schedule_entries` | gauge | none | entries in that committed table naming a row **this node declares** — read from the cluster FSM's view, not from the timer heap, so it reads identically on leader and follower even though the heap is leader-only. A parked `once` — one that has already fired — still counts here, unlike `uc2_timers_pending` |
 | `uc2_schedule_apply_refused_total` | counter | none | `uc2ctl schedule apply` requests this node refused. **Retries are not counted**: neither a follower's (the staged file is node-local, so the request is never forwarded) nor the leader's while a previous table frame is still above commit |
@@ -209,6 +212,20 @@ from the service's re-announce plus the cluster FSM's table view.
 A rising `uc2_timers_late_total` on a cluster that is not changing leaders is
 worth a look: either more than `TIMERS_PER_PASS` (64) timers are coming due per
 consensus pass, or the leader's passes are being delayed.
+
+**Reading the two timing histograms.** `uc2_timer_lateness_ns` is bounded
+below by the pass length — a timer can only be noticed by a pass — so the
+useful reading is the pair: `histogram_quantile(0.99, ...uc2_timer_lateness_ns_bucket...)`
+against `histogram_quantile(0.5, ...uc2_consensus_pass_ns_bucket...)`. That
+ratio is exactly the
+[time-and-timers gate's row c](../benchmarks/uc2-time-and-timers-gate-2026-09-03.md)
+bar (p99 lateness ≤ 2 × the measured pass length): a p99 well above it means
+passes are being delayed, not that the timer heap is slow. Both families are
+deliberately **outside** `CONTRACT_SERIES` — that list drives the M10 fleet
+gate's coverage row, which queries each entry as an instant Prometheus
+expression, and a histogram's family name is not a queryable series (only its
+`_bucket`/`_sum`/`_count` are). Both are process-local: they reset when the
+node restarts.
 
 **A second alert rule**, `Uc2ScheduleTableDiverged` (warning, `for: 60s`):
 `count(count_values("p", uc2_schedule_table_position)) > 1`. The table is

@@ -13,7 +13,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 use uc_protocol::v2::schedule::ScheduleRule;
@@ -245,11 +245,121 @@ impl RowTimers {
     }
 }
 
+/// Bucket upper bounds (`le`, nanoseconds) shared by both histograms in
+/// [`TimerStats`] — `uc2_timer_lateness_ns` and `uc2_consensus_pass_ns`.
+/// Fixed, not configurable: the time-and-timers gate's row c compares one
+/// against the other ("p99 lateness <= 2 x the measured consensus-pass
+/// length"), which is only meaningful while the two share a scale.
+///
+/// 10 us at the bottom is below any plausible pass length on the rig; 100 ms
+/// at the top is far above one, so a run whose passes reach the `+Inf`
+/// overflow bucket is telling the operator something (a stalled agent), not
+/// running out of resolution.
+pub const NS_BUCKETS: [u64; 13] = [
+    10_000,
+    20_000,
+    50_000,
+    100_000,
+    200_000,
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    50_000_000,
+    100_000_000,
+];
+
+/// Bucket slots: one per [`NS_BUCKETS`] bound plus the `+Inf` overflow.
+pub const NS_BUCKET_SLOTS: usize = NS_BUCKETS.len() + 1;
+
+/// A fixed-bucket nanosecond histogram written by ONE hot-path agent and read
+/// by the exporter thread. Every operation is a `Relaxed` atomic add: the
+/// buckets are counters whose only consumer is a scrape, so no ordering
+/// between them is needed or claimed — a scrape that lands mid-`observe` can
+/// see the bucket incremented and `_count` not yet, exactly as any two
+/// independent counters on this endpoint can disagree by one.
+///
+/// Per-bucket counts are stored NON-cumulatively and made cumulative at
+/// render time ([`NsHistogram::snapshot`]), which keeps `observe` to a single
+/// bucket write.
+#[derive(Default)]
+pub struct NsHistogram {
+    /// `[i]` = values in `(NS_BUCKETS[i-1], NS_BUCKETS[i]]`; the last slot is
+    /// everything above the top bound (`+Inf`).
+    slots: [AtomicU64; NS_BUCKET_SLOTS],
+    sum: AtomicU64,
+    count: AtomicU64,
+    max: AtomicU64,
+}
+
+/// One consistent-enough reading of an [`NsHistogram`], with the bucket
+/// counts already made cumulative (Prometheus's `le` semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NsHistogramSnapshot {
+    /// Cumulative counts, one per [`NS_BUCKETS`] bound; the last slot is the
+    /// `+Inf` bucket and equals `count`.
+    pub cumulative: [u64; NS_BUCKET_SLOTS],
+    pub sum: u64,
+    pub count: u64,
+    pub max: u64,
+}
+
+impl NsHistogram {
+    /// Record one observation. `#[inline(never)]`: both call sites are inside
+    /// the leader's consensus pass, and CLAUDE.md's standing M14a lesson is
+    /// that a hot loop's body costs through codegen even on paths that never
+    /// run — so the ladder stays out of line, as `lockstep_wait` did.
+    #[inline(never)]
+    pub fn observe(&self, value_ns: u64) {
+        let mut i = 0;
+        while i < NS_BUCKETS.len() && value_ns > NS_BUCKETS[i] {
+            i += 1;
+        }
+        self.slots[i].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(value_ns, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.max.fetch_max(value_ns, Ordering::Relaxed);
+    }
+
+    /// Read the histogram for one scrape, accumulating the bucket counts.
+    pub fn snapshot(&self) -> NsHistogramSnapshot {
+        let mut cumulative = [0u64; NS_BUCKET_SLOTS];
+        let mut running = 0u64;
+        for (i, slot) in self.slots.iter().enumerate() {
+            running += slot.load(Ordering::Relaxed);
+            cumulative[i] = running;
+        }
+        NsHistogramSnapshot {
+            cumulative,
+            sum: self.sum.load(Ordering::Relaxed),
+            // `count` is read AFTER the buckets, so it can only be >= their
+            // total, never less: a scrape never renders a `+Inf` bucket below
+            // `_count`, which is the one shape a Prometheus parser rejects.
+            count: self.count.load(Ordering::Relaxed).max(running),
+            max: self.max.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Process-local counters `/metrics` renders per row (spec §6).
 #[derive(Default)]
 pub struct TimerStats {
     pub fired: [AtomicU64; CNC_MAX_SERVICES],
     pub late: [AtomicU64; CNC_MAX_SERVICES],
+    /// Time-and-timers gate row c: per-row wall-clock lateness —
+    /// `pass_now_ns - deadline_ns` for every TIMER frame this node appended
+    /// as leader, i.e. how far past its deadline the pass that PLACED it ran.
+    /// An on-time fire is stamped with its own deadline, so the on-the-wire
+    /// `time_ns - deadline_ns` is 0 by construction and measures nothing;
+    /// this is the distribution the gate's bar is written against.
+    pub lateness_ns: [NsHistogram; CNC_MAX_SERVICES],
+    /// Time-and-timers gate row c's DENOMINATOR: the interval between
+    /// consecutive pass clock readings while this node leads. Node-level (the
+    /// pass is not per-row), and recorded from the reading the pass already
+    /// takes — never from a clock read of its own.
+    pub pass_ns: NsHistogram,
 }
 
 #[cfg(test)]
@@ -551,5 +661,39 @@ mod tests {
             Some((3, 7_000, true)),
             "a newer deadline for the same id fires (late, once)"
         );
+    }
+
+    /// Time-and-timers gate row c: a recorded value lands in the bucket whose
+    /// `le` bound first covers it, the counts render CUMULATIVE, and the
+    /// boundary itself belongs to the bucket that names it (`le` is
+    /// inclusive) — the one off-by-one a hand-rolled histogram gets wrong.
+    #[test]
+    fn a_recorded_value_lands_in_the_first_bucket_whose_le_bound_covers_it() {
+        let h = NsHistogram::default();
+        h.observe(9_999); // < 10 us  -> slot 0
+        h.observe(10_000); // == 10 us -> slot 0 (le is inclusive)
+        h.observe(10_001); // -> slot 1 (20 us)
+        h.observe(100_000_001); // above the top bound -> +Inf only
+        let s = h.snapshot();
+        assert_eq!(s.cumulative[0], 2, "le=10000");
+        assert_eq!(s.cumulative[1], 3, "le=20000 is cumulative");
+        assert_eq!(
+            s.cumulative[NS_BUCKETS.len() - 1],
+            3,
+            "le=100000000 excludes the overflow"
+        );
+        assert_eq!(s.cumulative[NS_BUCKET_SLOTS - 1], 4, "+Inf == count");
+        assert_eq!(s.count, 4);
+        assert_eq!(s.sum, 9_999 + 10_000 + 10_001 + 100_000_001);
+        assert_eq!(s.max, 100_000_001);
+        // Cumulative counts never decrease, at any bound.
+        assert!(s.cumulative.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn an_untouched_histogram_renders_as_all_zeroes_not_as_an_absent_reading() {
+        let s = NsHistogram::default().snapshot();
+        assert_eq!(s.cumulative, [0u64; NS_BUCKET_SLOTS]);
+        assert_eq!((s.sum, s.count, s.max), (0, 0, 0));
     }
 }

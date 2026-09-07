@@ -22,6 +22,7 @@ use uc_protocol::v2::cnc::{
 };
 
 use super::ObsSources;
+use crate::timers::{NS_BUCKET_SLOTS, NS_BUCKETS, NsHistogramSnapshot};
 
 /// Unix nanoseconds "now" — shared with Task 6's `/healthz`/`/readyz` probes.
 pub fn now_unix_ns() -> u64 {
@@ -294,6 +295,9 @@ fn push_labeled(out: &mut String, name: &str, help: &str, ty: &str, samples: &[(
 /// for an unnamed line (only a harness page, `ServiceIdentityLine::name()`
 /// returning `None`).
 struct ServiceRow {
+    /// The declared row's id — the index into the per-row stat arrays
+    /// (`TimerStats::lateness_ns`) the histogram families read.
+    id: usize,
     /// Pre-formatted label body, no braces: `service="kv",row="0"`.
     labels: String,
     attached: u64,
@@ -369,6 +373,7 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             .snapshot_freeze
             .observe_row(id as usize, slot.identity.freeze_ns());
         rows.push(ServiceRow {
+            id: id as usize,
             labels: format!("service=\"{name}\",row=\"{id}\""),
             attached: attached as u64,
             applied,
@@ -487,6 +492,67 @@ fn push_service_labeled_f64(
     push_labeled_f64(out, name, help, ty, &samples);
 }
 
+/// Emit one Prometheus HISTOGRAM family: the `# HELP`/`# TYPE` pair, then per
+/// sample a `_bucket` line for every [`NS_BUCKETS`] bound plus `le="+Inf"`,
+/// then `_sum` and `_count`. `labels` is the pre-formatted label body without
+/// braces (empty for a node-level histogram, which then renders
+/// `name_bucket{le="…"}` and bare `name_sum` / `name_count`).
+///
+/// The bucket counts must already be CUMULATIVE — [`NsHistogram::snapshot`]
+/// makes them so — because `le` means "at or below", not "in this band".
+///
+/// These two families are deliberately NOT in [`CONTRACT_SERIES`]: that list
+/// drives `bench-infra/scripts/m10_fleet_gate.py`'s coverage row, which
+/// queries each entry as an instant Prometheus expression, and a histogram's
+/// FAMILY name is not a queryable series (only `_bucket`/`_sum`/`_count`
+/// are). Contracting the family name would fail that row for a series that is
+/// present and correct; contracting its three rendered names instead would
+/// break the list's one-entry-per-family rule. The `_max` gauges beside them
+/// are ordinary gauges and could be contracted, but are left out with them so
+/// the two histograms are documented as one unit.
+fn push_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    samples: &[(String, NsHistogramSnapshot)],
+) {
+    push_family_header(out, name, help, "histogram");
+    for (labels, h) in samples {
+        let sep = if labels.is_empty() { "" } else { "," };
+        for (i, bound) in NS_BUCKETS.iter().enumerate() {
+            out.push_str(name);
+            out.push_str("_bucket{");
+            out.push_str(labels);
+            out.push_str(sep);
+            out.push_str("le=\"");
+            out.push_str(&bound.to_string());
+            out.push_str("\"} ");
+            out.push_str(&h.cumulative[i].to_string());
+            out.push('\n');
+        }
+        out.push_str(name);
+        out.push_str("_bucket{");
+        out.push_str(labels);
+        out.push_str(sep);
+        out.push_str("le=\"+Inf\"} ");
+        out.push_str(&h.cumulative[NS_BUCKET_SLOTS - 1].to_string());
+        out.push('\n');
+        for (suffix, value) in [("_sum", h.sum), ("_count", h.count)] {
+            out.push_str(name);
+            out.push_str(suffix);
+            if labels.is_empty() {
+                out.push(' ');
+            } else {
+                out.push('{');
+                out.push_str(labels);
+                out.push_str("} ");
+            }
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }
+    }
+}
+
 /// M14c (spec §9): every per-FSM family, aggregates included, as one
 /// contiguous block. `commit` and `now` are this scrape's single samples,
 /// threaded in so the block is consistent with the rest of the render.
@@ -597,6 +663,45 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "counter",
         &rows,
         |r| r.late,
+    );
+    // Time-and-timers gate row c: the lateness distribution per row and the
+    // consensus-pass length that its bar is stated against ("p99 lateness <=
+    // 2 x the measured pass length on the rig"). Both are leader-side by
+    // construction — a follower fires no timers and takes no pass interval —
+    // and both are rendered here, beside the counters they explain, even
+    // though the pass histogram carries no row label.
+    let lateness: Vec<(String, NsHistogramSnapshot)> = rows
+        .iter()
+        .map(|r| (r.labels.clone(), s.timer_stats.lateness_ns[r.id].snapshot()))
+        .collect();
+    push_histogram(
+        out,
+        "uc2_timer_lateness_ns",
+        "WALL-CLOCK lateness of every TIMER frame this node appended as leader for the row: the pass clock minus the fired deadline, i.e. how far past its deadline the pass that PLACED the frame ran (time-and-timers gate row c). NOT the on-the-wire time_ns - deadline_ns, which is 0 for every on-time fire by construction. Bounded below by the consensus-pass length, so read it against uc2_consensus_pass_ns.",
+        &lateness,
+    );
+    push_labeled(
+        out,
+        "uc2_timer_lateness_ns_max",
+        "The largest uc2_timer_lateness_ns observation for this row since the node started (process-local, so it resets on restart and never decreases while it runs).",
+        "gauge",
+        &lateness
+            .iter()
+            .map(|(l, h)| (l.clone(), h.max))
+            .collect::<Vec<_>>(),
+    );
+    let pass = s.timer_stats.pass_ns.snapshot();
+    push_histogram(
+        out,
+        "uc2_consensus_pass_ns",
+        "Interval between consecutive consensus-pass clock readings while this node LEADS (time-and-timers gate row c's denominator). Derived from the one wall-clock reading the pass already takes, never from a clock read of its own; the first pass of a leadership term is skipped, so a demotion/promotion cycle contributes no giant sample. A follower's histogram stops advancing rather than reading 0.",
+        &[(String::new(), pass)],
+    );
+    push_gauge(
+        out,
+        "uc2_consensus_pass_ns_max",
+        "The longest uc2_consensus_pass_ns interval since the node started (process-local, so it resets on restart and never decreases while it runs).",
+        pass.max,
     );
     push_service_labeled(
         out,
@@ -1497,6 +1602,87 @@ mod tests {
             99,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
+        );
+    }
+
+    /// Time-and-timers gate row c: both histograms render the standard
+    /// Prometheus shape — one `_bucket` line per `le` bound plus `+Inf`,
+    /// CUMULATIVE counts, `_sum`, `_count`, and the companion `_max` gauge.
+    /// The per-row family carries the same labels the counters beside it do;
+    /// the node-level one carries only `le`.
+    #[test]
+    fn the_two_ns_histograms_render_cumulative_buckets_sum_count_and_max() {
+        let s = synthetic_sources();
+        // Row 0 is the declared row in `synthetic_sources`.
+        s.timer_stats.lateness_ns[0].observe(5_000); // le=10000
+        s.timer_stats.lateness_ns[0].observe(30_000); // le=50000
+        s.timer_stats.lateness_ns[0].observe(300_000_000); // +Inf only
+        s.timer_stats.pass_ns.observe(120_000); // le=200000
+        let text = render_prometheus(&s);
+
+        assert!(
+            text.contains("\n# TYPE uc2_timer_lateness_ns histogram\n"),
+            "{text}"
+        );
+        let l = "service=\"\",row=\"0\"";
+        for (bound, want) in [
+            ("10000", 1),
+            ("20000", 1),
+            ("50000", 2),
+            ("100000000", 2),
+            ("+Inf", 3),
+        ] {
+            let line = format!("uc2_timer_lateness_ns_bucket{{{l},le=\"{bound}\"}} {want}\n");
+            assert!(text.contains(&line), "missing {line:?} in\n{text}");
+        }
+        assert!(text.contains(&format!(
+            "uc2_timer_lateness_ns_sum{{{l}}} {}\n",
+            5_000 + 30_000 + 300_000_000u64
+        )));
+        assert!(text.contains(&format!("uc2_timer_lateness_ns_count{{{l}}} 3\n")));
+        assert!(text.contains(&format!("uc2_timer_lateness_ns_max{{{l}}} 300000000\n")));
+
+        assert!(
+            text.contains("\n# TYPE uc2_consensus_pass_ns histogram\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_consensus_pass_ns_bucket{le=\"100000\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_consensus_pass_ns_bucket{le=\"200000\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_consensus_pass_ns_bucket{le=\"+Inf\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_consensus_pass_ns_sum 120000\n"),
+            "{text}"
+        );
+        assert!(text.contains("uc2_consensus_pass_ns_count 1\n"), "{text}");
+        assert!(
+            text.contains("uc2_consensus_pass_ns_max 120000\n"),
+            "{text}"
+        );
+
+        // Every bucket line for a family sits under exactly ONE header pair.
+        assert_eq!(text.matches("# TYPE uc2_timer_lateness_ns ").count(), 1);
+        assert_eq!(text.matches("# TYPE uc2_consensus_pass_ns ").count(), 1);
+    }
+
+    /// A node that has never fired a timer (or never led) still renders both
+    /// families, all zeroes — an absent series cannot be graphed, and the
+    /// gate's row c reads `_count` to decide whether it has samples at all.
+    #[test]
+    fn the_two_ns_histograms_render_at_zero_before_any_observation() {
+        let text = render_prometheus(&synthetic_sources());
+        assert!(text.contains("uc2_consensus_pass_ns_count 0\n"), "{text}");
+        assert!(
+            text.contains("uc2_timer_lateness_ns_count{service=\"\",row=\"0\"} 0\n"),
+            "{text}"
         );
     }
 

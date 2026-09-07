@@ -1859,6 +1859,7 @@ impl Node {
                 .collect(),
             timer_stats: Arc::clone(&timer_stats),
             pass_now_ns: 0,
+            last_pass_ns: 0,
             #[cfg(test)]
             test_now_ns: None,
             services: cfg.services,
@@ -2683,6 +2684,14 @@ struct Consensus {
     /// deadline comparison and every `Appender::set_now` in the pass, so a
     /// pass's frames share one clock. `0` until the first pass.
     pass_now_ns: u64,
+    /// Time-and-timers gate row c: the PREVIOUS pass's `pass_now_ns`, kept
+    /// only to derive `uc2_consensus_pass_ns` (the interval between
+    /// consecutive pass clock readings) without a second clock read. `0`
+    /// means "no previous reading to difference against" — the state this is
+    /// reset to on every non-leading pass, so the first pass of a new
+    /// leadership term is skipped rather than observed as the gap since the
+    /// last term.
+    last_pass_ns: u64,
     /// Test-only clock override for the one `wall_now_ns()` reading per pass.
     /// `#[cfg(test)]`, so the shipped binary has neither the field nor the
     /// branch — M14a's rule is that code in a hot body costs even on paths
@@ -3430,9 +3439,15 @@ impl Consensus {
         let serving = self.leader_flag.load(Ordering::Relaxed) && self.sm.can_serve();
         let mut hold_clients = false;
         if serving {
+            self.record_pass_interval();
             let (d, hold) = self.fire_due_timers();
             did |= d;
             hold_clients = hold;
+        } else {
+            // Not leading: forget the previous reading, so the first pass of
+            // the next leadership term is skipped instead of being observed
+            // as the whole gap since this node last led.
+            self.last_pass_ns = 0;
         }
         // 3a. Drain the in-process ingress queue (leader && serving only, the
         // harness/embedded path), bounded.
@@ -4783,6 +4798,29 @@ impl Consensus {
     /// client frame may be appended this pass, because a client frame's
     /// stamp would clamp the log clock past a deadline still waiting to
     /// fire and make that timer late.
+    /// Fold this pass's clock reading into `uc2_consensus_pass_ns` (the
+    /// time-and-timers gate's row c denominator: "the measured consensus-pass
+    /// length on the rig").
+    ///
+    /// Reads NO clock of its own — `pass_now_ns` is the one reading step 0
+    /// already took, so the series costs one subtraction and four relaxed
+    /// atomics per LEADING pass and nothing at all on a follower. Called from
+    /// the `serving` arm only, so the histogram is a leader-side reading by
+    /// construction, like `uc2_timers_fired_total` beside it.
+    #[inline(never)]
+    fn record_pass_interval(&mut self) {
+        let now = self.pass_now_ns;
+        if self.last_pass_ns != 0 {
+            // `saturating_sub`: `wall_now_ns` is a wall clock and can step
+            // backwards, which reads as a 0-length pass rather than a
+            // gigantic one.
+            self.timer_stats
+                .pass_ns
+                .observe(now.saturating_sub(self.last_pass_ns));
+        }
+        self.last_pass_ns = now;
+    }
+
     fn fire_due_timers(&mut self) -> (bool, bool) {
         let now = self.pass_now_ns;
         // `self.timers` and `self.appender` are disjoint fields, but the
@@ -4866,6 +4904,13 @@ impl Consensus {
                     }
                     did = true;
                     self.timer_stats.fired[row].fetch_add(1, Ordering::Relaxed);
+                    // Gate row c: WALL-CLOCK lateness — how far past its
+                    // deadline the pass that placed this frame ran. Not
+                    // `stamp - fire_dl`, which is 0 for every on-time fire by
+                    // construction (an on-time TIMER frame is stamped with
+                    // its own deadline) and so measures nothing. `now` is the
+                    // pass's one reading; no clock is read here.
+                    self.timer_stats.lateness_ns[row].observe(now.saturating_sub(fire_dl));
                     // ONLY the late case gets a line. A per-fire record on the
                     // consensus single-writer is a stderr write per timer —
                     // up to TIMERS_PER_PASS of them per pass — on the agent
@@ -9826,6 +9871,7 @@ mod tests {
                 .collect(),
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
             pass_now_ns: 0,
+            last_pass_ns: 0,
             #[cfg(test)]
             test_now_ns: None,
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
