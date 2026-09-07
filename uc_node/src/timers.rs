@@ -679,13 +679,17 @@ mod tests {
     #[test]
     fn a_recorded_value_lands_in_the_first_bucket_whose_le_bound_covers_it() {
         let h = NsHistogram::default();
-        h.observe(9_999); // < 10 us  -> slot 0
-        h.observe(10_000); // == 10 us -> slot 0 (le is inclusive)
-        h.observe(10_001); // -> slot 1 (20 us)
+        // Index the ladder by bound, not by position: the floor moved from
+        // 10 us to 100 ns once an idle pass measured ~300 ns.
+        let i10 = NS_BUCKETS.iter().position(|&b| b == 10_000).unwrap();
+        h.observe(9_999); // (5 us, 10 us] -> the le=10000 slot
+        h.observe(10_000); // == 10 us -> the same slot (le is inclusive)
+        h.observe(10_001); // -> the next slot (20 us)
         h.observe(100_000_001); // above the top bound -> +Inf only
         let s = h.snapshot();
-        assert_eq!(s.cumulative[0], 2, "le=10000");
-        assert_eq!(s.cumulative[1], 3, "le=20000 is cumulative");
+        assert_eq!(s.cumulative[i10 - 1], 0, "le=5000");
+        assert_eq!(s.cumulative[i10], 2, "le=10000");
+        assert_eq!(s.cumulative[i10 + 1], 3, "le=20000 is cumulative");
         assert_eq!(
             s.cumulative[NS_BUCKETS.len() - 1],
             3,
