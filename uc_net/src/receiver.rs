@@ -36,15 +36,17 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
-    DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
-    MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody,
-    SnapNakBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_append_position_body,
-    read_config_proposal_body, read_config_reply_body, read_datagram_header, read_nak_body,
-    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
+    DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody,
+    REQUEST_VOTE_BODY_LEN, RequestVoteBody, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
+    SNAP_NAK_BODY_LEN, SNAP_REQUEST_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody,
+    SnapRequestBody, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody,
+    read_append_position_body, read_config_proposal_body, read_config_reply_body,
+    read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
+    read_snap_begin_body, read_snap_nak_body, read_snap_redirect_body, read_snap_request_body,
     read_status_body, read_term_map_body, read_vote_body, write_append_position_body,
     write_datagram_header, write_nak_body, write_snap_begin_body, write_snap_nak_body,
-    write_status_body,
+    write_snap_request_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -234,6 +236,18 @@ pub enum NetEvent {
     ConfigReply {
         body: ConfigReplyBody,
     },
+    /// Coordinated-snapshot spec §5.7 item 6 (kind 23): the leader could not
+    /// serve our below-floor NAK and named a learner that can. Routed to the
+    /// NODE layer rather than answered here, because answering it means
+    /// resolving `learner_id` to an address — membership, which `uc_net` does
+    /// not own. The node hands the fetch straight back through
+    /// [`FollowerReceiver::set_fetch_route`], so the `SNAP_REQUEST` still
+    /// leaves this agent's socket (the source address is what the learner's
+    /// session is addressed to).
+    SnapRedirect {
+        learner_id: u32,
+        position: u64,
+    },
 }
 
 impl NetEvent {
@@ -252,12 +266,13 @@ impl NetEvent {
             NetEvent::ReadProbeAck { .. } => 7,
             NetEvent::ConfigProposal { .. } => 8,
             NetEvent::ConfigReply { .. } => 9,
+            NetEvent::SnapRedirect { .. } => 10,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 10;
+pub const NET_EVENT_KINDS: usize = 11;
 
 /// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
@@ -609,6 +624,40 @@ pub struct FollowerStats {
     /// [`FollowerStats::version_refusal`] (written BEFORE this counter
     /// bumps, `Release`-ordered against it) for the offending row's detail.
     pub snap_refused_version_mismatch: AtomicU64,
+    /// Coordinated-snapshot spec §5.6: a `SNAP_BEGIN` arrived
+    /// naming a `snapshot_pos` other than the one this session's first BEGIN
+    /// named — the named refusal **`position_mismatch`**. A set is the
+    /// artifacts at ONE instant; a session that mixes two would install a
+    /// cluster image and a row image taken at different points of the log.
+    /// The session is dropped and the peer re-NAKs.
+    ///
+    /// Its own counter — and its own (fourth) slot of
+    /// `uc_node::Node::snapshot_session_refusals`, rather than a re-used
+    /// identity slot, so "the source mixed two instants" is never read as
+    /// "the two nodes disagree about which FSMs exist".
+    ///
+    /// Final wave M14 (accepted, doc-only): THREE distinguishable shapes
+    /// share this counter — a second `SNAP_BEGIN` naming a different
+    /// `snapshot_pos`, a `SNAP_BEGIN` whose position is above this node's own
+    /// durable frontier, and a store-only intake whose set does not match the
+    /// position the fetch asked for. They are one refusal CLASS ("this
+    /// session's position is not the one this node will accept"), the operator
+    /// action is identical, and the `snapshot_session_refused` obs record
+    /// names the specific case as it happens — so splitting the counter would
+    /// add two series that no alert or runbook step would key on.
+    pub snap_refused_position_mismatch: AtomicU64,
+    /// Fix round 2 (Ruling P11): a `SNAP_BEGIN` arrived carrying the session
+    /// id of a fetch whose arm had already EXPIRED — the named refusal
+    /// **`fetch_expired`**, the fifth slot of
+    /// `uc_node::Node::snapshot_session_refusals`.
+    ///
+    /// It is a safety refusal, not a diagnostic one: without it the answer to
+    /// a timed-out store-only pull matches no arm, falls to the default
+    /// [`IntakeMode::Install`], and is installed BY FIAT — the cluster
+    /// artifact routed to the `uc2-cluster` agent and the floor adopted —
+    /// which is exactly what a store-only pull exists to prevent. A count here
+    /// means a learner answered a fetch late; re-run the operator's verb.
+    pub snap_refused_fetch_expired: AtomicU64,
     /// Detail for the most recent IDENTITY refusal (`RefusalKind::Identity`)
     /// on this receiver — the row, both sides' hash, and which kind of
     /// mismatch it was (always `Identity` here). `None` until the first such
@@ -663,6 +712,11 @@ pub struct FollowerStats {
     /// carrying `layout != SNAP_BEGIN_LAYOUT_V4`), which
     /// `snap_refused_legacy_peer` deliberately folds together.
     pub snap_begin_undecodable: AtomicU64,
+    /// Coordinated-snapshot spec §5.7 item 5: a node-requested fetch dropped
+    /// because a snapshot transfer was already in flight here. Not an error —
+    /// the operator's verb is re-runnable — but it is why an accepted
+    /// `uc2ctl snapshot fetch` can quietly do nothing.
+    pub snap_fetch_busy: AtomicU64,
 }
 
 /// What `set_snapshot_intake` wires in for a COMPLETED inbound session
@@ -689,6 +743,23 @@ pub type IncomingSnapshotSignal = (
     Arc<AtomicU64>,
     mpsc::SyncSender<(u64, PathBuf)>,
 );
+
+/// Coordinated-snapshot spec §5.7 items 5–6: one fetch the NODE layer asks
+/// this receiver to start. The node resolves the learner's `NodeId` to an
+/// address (membership is its business, not `uc_net`'s) and says what a
+/// completed transfer will MEAN here; the receiver mints the session, sends
+/// the `SNAP_REQUEST` from its own socket — the address the source's session
+/// is then addressed to — and arms the intake.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapFetch {
+    /// The learner to ask.
+    pub peer: SocketAddr,
+    /// The set to ask for; `0` = "your newest complete set".
+    pub position: u64,
+    /// [`IntakeMode::StoreOnly`] for a voter's op-9 pull,
+    /// [`IntakeMode::Install`] for a below-floor joiner following a redirect.
+    pub mode: IntakeMode,
+}
 
 /// M14c: the identity of the last INBOUND session that completed here — what
 /// [`FollowerReceiver::snap_last_done`] re-acks a straggling `SNAP_BEGIN`
@@ -725,9 +796,57 @@ struct SnapPart {
 /// stream). Each artifact is fsync'd + atomically renamed the moment the
 /// contiguous frontier passes its end; the FLOOR is adopted only once EVERY
 /// declared id has landed, so no FSM is ever stranded below an adopted floor.
+/// Coordinated-snapshot spec §5.7 item 4: what a completed inbound session
+/// MEANS on this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntakeMode {
+    /// The joiner's case, and everything that shipped before plan 2: this node
+    /// is below the floor, so the set is installed BY FIAT — the cluster
+    /// artifact goes to the `uc2-cluster` agent and the floor is adopted from
+    /// the session.
+    Install,
+    /// The standby return path: a VOTER pulling a set a learner froze
+    /// (`SNAP_REQUEST`). The artifacts are written verbatim and acked, and
+    /// nothing else happens — no `incoming_snapshot_pos`, no cluster install,
+    /// no fiat floor adoption. A voter above P storing a set at P is not a
+    /// joiner; its floor moves through the consensus agent's ordinary
+    /// completeness path (spec §5.3), keyed on `stored_set_pos`.
+    StoreOnly,
+}
+
+/// Coordinated-snapshot spec §5.7: a fetch this node has REQUESTED and whose
+/// session has not opened yet. An intake opened by a `SNAP_BEGIN` matching
+/// `(peer, session)` takes `mode`; every other session is
+/// [`IntakeMode::Install`], exactly as before plan 2.
+///
+/// It expires — cleared when the session opens, when a later fetch replaces
+/// it, or at `expires_ns`. Without the last of those, a learner that never
+/// answered would leave a STORE-ONLY arm lying in wait for whatever session
+/// next happened to reuse the id, and that session would be written to disk
+/// and then never installed.
+#[derive(Debug, Clone, Copy)]
+struct ArmedFetch {
+    peer: SocketAddr,
+    session: u32,
+    /// The position asked for; `0` = "your newest complete set", which binds
+    /// nothing. A session answering a bound fetch at any OTHER instant is
+    /// refused (`snap_refused_position_mismatch`): what came back is not the
+    /// set that was asked for, and a store-only intake would otherwise publish
+    /// it as this node's own set.
+    position: u64,
+    mode: IntakeMode,
+    expires_ns: u64,
+}
+
 struct SnapIntake {
     peer: SocketAddr,
     session: u32,
+    /// Spec §5.6, the one-position rule: the instant this session's set is at,
+    /// taken from its FIRST `SNAP_BEGIN`. Every later BEGIN of the session
+    /// must name the same one or the session is refused.
+    snapshot_pos: u64,
+    /// Install by fiat, or write-and-ack only — see [`IntakeMode`].
+    mode: IntakeMode,
     /// From the session's first `SNAP_BEGIN`; equals this node's own
     /// `own_identity` positionally (a difference is refused before an
     /// intake ever opens). The declared-FSM bitmask this session covers is
@@ -874,6 +993,52 @@ pub struct FollowerReceiver {
     /// `incoming_snapshot_pos` is stored, for the same reason the cell above
     /// is written first.
     cluster_install: Option<mpsc::SyncSender<(u64, PathBuf)>>,
+    /// Coordinated-snapshot spec §5.7 item 4 (Ruling P4'): the position of the
+    /// newest complete set this node has STORED from a learner — written
+    /// (`Release`) only after every artifact of that set, rows and cluster
+    /// alike, has been fsync'd and renamed into place. The consensus agent's
+    /// completeness poll reads it and treats the set exactly like one this
+    /// node built itself (spec §5.3). Nothing else is published: this is the
+    /// whole of a store-only intake's effect on the node.
+    ///
+    /// Always present (unlike the `Option` cells above) so
+    /// [`FollowerReceiver::stored_set_pos`] can hand the node a handle
+    /// whether or not an intake is configured.
+    stored_set_pos: Arc<AtomicU64>,
+    /// Coordinated-snapshot spec §5.7 items 5–6: fetches the NODE layer asks
+    /// this agent to start — admin op 9 (`StoreOnly`) and a `SNAP_REDIRECT`
+    /// the node resolved to an address (`Install`). Drained once per duty
+    /// cycle; `None` = no node wired one (unit tests, non-node embeddings).
+    fetch_rx: Option<mpsc::Receiver<SnapFetch>>,
+    /// A fetch whose `SNAP_REQUEST` has gone out and whose session has not
+    /// opened yet — see [`ArmedFetch`].
+    armed_fetch: Option<ArmedFetch>,
+    /// Fix round 2 (Ruling P11): the `(peer, session)` of the fetch whose arm
+    /// most recently EXPIRED. A `SNAP_BEGIN` matching BOTH is refused
+    /// (`snap_refused_fetch_expired`) rather than taken as an ordinary
+    /// session: the answer to a fetch that timed out would otherwise fall to
+    /// the default [`IntakeMode::Install`] and be installed by fiat.
+    ///
+    /// **Both halves, and cleared once used** (fix round 3). A session id is a
+    /// per-process counter minted by the SOURCE (`sender.rs`, from 0), so the
+    /// same small number is minted routinely by every fresh source — a new
+    /// leader, a restarted node, a redirect-designated learner. Keyed on the
+    /// id alone this slot would refuse those peers' perfectly ordinary
+    /// sessions, and `snap_drop_intake_from` would tear down whatever transfer
+    /// one of them had in flight. Clearing it when it fires bounds the damage
+    /// the other way: one refusal per straggler, after which that peer's next
+    /// session — including the source's own re-sent BEGIN — opens normally.
+    ///
+    /// One slot, overwritten by the next expiry and cleared when a new fetch
+    /// is armed: fetches are operator-driven and one at a time. The signal is
+    /// the id THIS node minted for a fetch, never the position — an Install
+    /// session whose artifacts sit far above this node's durable frontier is
+    /// exactly what a below-floor joiner is supposed to receive.
+    last_expired_fetch: Option<(SocketAddr, u32)>,
+    /// The session id the next node-initiated fetch will use. Local to this
+    /// receiver: a session is scoped to one `(peer, session)` pair, and the
+    /// source adopts the id we send it (`SnapRequestBody::session`).
+    fetch_session_seq: u32,
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
@@ -1129,6 +1294,11 @@ impl FollowerReceiver {
             incoming_snapshot_pos: None,
             incoming_cluster_pos: None,
             cluster_install: None,
+            stored_set_pos: Arc::new(AtomicU64::new(0)),
+            fetch_rx: None,
+            armed_fetch: None,
+            last_expired_fetch: None,
+            fetch_session_seq: 0,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
             snap_adopt_pending: None,
@@ -1265,6 +1435,22 @@ impl FollowerReceiver {
             self.incoming_cluster_pos = Some(cluster_pos);
             self.cluster_install = Some(cluster_install);
         }
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 4: the cell a completed STORE-ONLY
+    /// intake publishes its set's position into. The node clones this handle
+    /// at construction and its consensus agent polls it — see
+    /// [`FollowerStats`]' sibling doc and `Consensus::check_set_completeness`.
+    pub fn stored_set_pos(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.stored_set_pos)
+    }
+
+    /// Coordinated-snapshot spec §5.7 items 5–6: wire the node's fetch route.
+    /// One [`SnapFetch`] is drained per duty cycle; without this call nothing
+    /// can start a pull and the receiver behaves exactly as it did before
+    /// plan 2.
+    pub fn set_fetch_route(&mut self, rx: mpsc::Receiver<SnapFetch>) {
+        self.fetch_rx = Some(rx);
     }
 
     #[inline]
@@ -1959,6 +2145,39 @@ impl FollowerReceiver {
                     });
                 }
             }
+            // Coordinated-snapshot spec §5.7 item 4: a peer asks US for a set.
+            // Demuxed to our sender beside `SNAP_NAK` — it opens the session.
+            // Not leader-gated anywhere on this path: the intended source is a
+            // LEARNER, which never leads.
+            DGRAM_KIND_SNAP_REQUEST if self.sender_route.is_some() => {
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if let Some(b) = read_snap_request_body(body)
+                    && let Some(route) = &self.sender_route
+                {
+                    let _ = route.try_send(CtrlMsg::SnapRequest { from, body: b });
+                }
+            }
+            // Coordinated-snapshot spec §5.7 item 6: the leader could not
+            // serve our below-floor NAK and named a learner that can. Ignored
+            // while a transfer is already under way — a redirect is a hint
+            // about a NAK, and tearing down live progress to chase it would
+            // make a lost artifact cost the whole set. Otherwise routed to the
+            // node, which owns membership and hands the fetch back.
+            DGRAM_KIND_SNAP_REDIRECT => {
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if self.snap_intake.is_none()
+                    && let Some(b) = read_snap_redirect_body(body)
+                {
+                    let ev = NetEvent::SnapRedirect {
+                        learner_id: b.learner_id,
+                        position: b.position,
+                    };
+                    let idx = ev.kind_idx();
+                    if self.route.try_send(ev).is_err() {
+                        self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
         }
     }
@@ -2090,6 +2309,87 @@ impl FollowerReceiver {
             self.snap_send_done(from, &b);
             return;
         }
+        // Spec §5.6, the one-position rule: every `SNAP_BEGIN` of a session
+        // names the SAME instant. Checked BEFORE the duplicate-BEGIN and
+        // placement arms below, because a mixed-instant session is not a
+        // session with a lost BEGIN — probing for the "missing" artifact would
+        // just re-fetch the wrong one. Named, counted, and the session is
+        // dropped; the peer re-NAKs and the next attempt sees a set its source
+        // has finished assembling.
+        if let Some(cur) = self.snap_intake.as_ref()
+            && cur.peer == from
+            && cur.session == b.session
+            && cur.snapshot_pos != b.snapshot_pos
+        {
+            // Counted only — the node layer NAMES it (`snapshot_session_refused`,
+            // `reason = "position_mismatch"`), like the three refusals above:
+            // `uc_net` carries no logging dependency.
+            self.stats
+                .snap_refused_position_mismatch
+                .fetch_add(1, Ordering::Release);
+            self.snap_drop_intake_from(from);
+            return;
+        }
+        // Fix round 2 (Ruling P11): a fetch whose arm has EXPIRED, answered
+        // late. Refused outright — never taken as an ordinary session, which
+        // is what the default `IntakeMode::Install` would make of it: the
+        // answer to a store-only pull would have its cluster artifact routed
+        // to the `uc2-cluster` agent and its floor adopted BY FIAT. Keyed on
+        // the `(peer, session)` THIS node minted the fetch for, never on the
+        // position — an Install session above `durable` is legal by definition
+        // (a joiner is below its floor). Counted; the node layer names
+        // `fetch_expired`.
+        //
+        // Fix round 3: BOTH halves must match, and the slot is CONSUMED here.
+        // Session ids are per-source counters from 0, so id-only matching
+        // would refuse a different peer's ordinary session (and tear down its
+        // in-flight intake), and never clearing would make that refusal
+        // permanent rather than one-per-straggler.
+        if self.last_expired_fetch == Some((from, b.session)) {
+            self.last_expired_fetch = None;
+            self.stats
+                .snap_refused_fetch_expired
+                .fetch_add(1, Ordering::Release);
+            self.snap_drop_intake_from(from);
+            return;
+        }
+        // Fix round 1, Important 1 + 3: a FETCH binds the position it asked
+        // for, and a store-only fetch may not take a set above this node's own
+        // log. Two ways the answer can be the wrong set:
+        //
+        // * it is at an instant we did not ask for — the learner superseded
+        //   the one we named between our request and its answer, or a forgery.
+        //   `position == 0` ("your newest") asks for no particular instant, so
+        //   any answer satisfies it;
+        // * it is above this node's DURABLE frontier. `start_fetch` already
+        //   refuses an explicit position above it, so this closes the
+        //   `position == 0` case, where the learner picks. It matters because
+        //   a stored set becomes this node's snapshot floor, and the cluster
+        //   agent's `recover` picks the newest artifact BY NAME at boot: an
+        //   artifact above the log, once WRITTEN, could be installed ahead of
+        //   the bytes it summarises. So the refusal is here, before
+        //   `open_snap_part` creates anything. It is store-only-specific: a
+        //   below-floor JOINER's artifact is legitimately far above its own
+        //   durable — that is the whole point of installing one.
+        //
+        // Both count as `snap_refused_position_mismatch`: all three shapes are
+        // "the position of this set is not one we may take".
+        if let Some(a) = self.armed_fetch
+            && a.peer == from
+            && a.session == b.session
+            && ((a.position != 0 && a.position != b.snapshot_pos)
+                || (a.mode == IntakeMode::StoreOnly
+                    && b.snapshot_pos > self.buffer.counters().durable.load_acquire()))
+        {
+            self.stats
+                .snap_refused_position_mismatch
+                .fetch_add(1, Ordering::Release);
+            // Disarm: this answer is not the set we asked for, and the arm
+            // must not survive to accept the source's next attempt silently.
+            self.armed_fetch = None;
+            self.snap_drop_intake_from(from);
+            return;
+        }
         if let Some(cur) = self.snap_intake.as_mut()
             && cur.peer == from
             && cur.session == b.session
@@ -2151,9 +2451,20 @@ impl FollowerReceiver {
             return;
         };
         let announced_len = part.len;
+        // Spec §5.7 item 4: a session this node ASKED for takes the mode the
+        // node asked with; every other one installs by fiat, as before.
+        let mode = match self.armed_fetch {
+            Some(a) if a.peer == from && a.session == b.session => {
+                self.armed_fetch = None;
+                a.mode
+            }
+            _ => IntakeMode::Install,
+        };
         self.snap_intake = Some(SnapIntake {
             peer: from,
             session: b.session,
+            snapshot_pos: b.snapshot_pos,
+            mode,
             identity: b.identity,
             version: b.version,
             received: 0,
@@ -2334,6 +2645,36 @@ impl FollowerReceiver {
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            // Fix round 1 (promoted observation): fsync the artifact's
+            // DIRECTORY, so the rename that published it is itself durable.
+            // The file's own bytes are already fsync'd above; without this a
+            // crash right after a completion could leave a persisted snapshot
+            // FLOOR (and, on the store-only path, a `stored_set_pos` the node
+            // has since acted on) naming a set whose directory entries never
+            // reached the disk.
+            //
+            // This is the THIRD writer of these files, and as of the final
+            // wave's I2 all three do it: `uc_node::cluster_agent::
+            // take_snapshot` (logs a Warn on failure) and
+            // `uc_service::snapshots::SnapshotStore::publish` (returns the
+            // failure NAMED, because its caller already treats a publish error
+            // as "this instant did not happen").
+            //
+            // Best-effort, exactly as there: the artifact IS renamed and the
+            // session must not stall on a directory handle. A failure is
+            // counted (`snap_intake_io_failures` is the "look at this node's
+            // snapshot directory" counter) and the walk continues, rather than
+            // returning — a retry would only re-fsync a directory whose rename
+            // has already happened.
+            if let Some(parent) = intake.parts[k].final_path.parent()
+                && std::fs::File::open(parent)
+                    .and_then(|d| d.sync_all())
+                    .is_err()
+            {
+                self.stats
+                    .snap_intake_io_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             intake.parts[k].done = true;
             if intake.parts[k].service_id == CLUSTER_ARTIFACT_ID {
                 // Not a row: it has no bit in `received` (cluster-FSM §5.6).
@@ -2402,6 +2743,21 @@ impl FollowerReceiver {
                 .collect(),
         });
         self.snap_send_done(intake.peer, &ack);
+        // Coordinated-snapshot spec §5.7 item 4 (Ruling P4'): a STORE-ONLY
+        // intake stops here. The artifacts are on disk under their final
+        // names — every one of them fsync'd and renamed by
+        // `snap_publish_complete_parts` before this function is reached, which
+        // is what makes the single store below a valid "the whole set is
+        // present" signal — and the peer has its ack. Nothing is published,
+        // routed or adopted: this node is a VOTER above P, not a joiner, and
+        // the words those paths write belong to other agents (the rows'
+        // `snapshot_pos` to the service builders, `cluster_snapshot_pos` to the
+        // `uc2-cluster` agent). Its floor moves through the consensus agent's
+        // ordinary completeness poll, from this one word.
+        if intake.mode == IntakeMode::StoreOnly {
+            self.stored_set_pos.store(floor, Ordering::Release);
+            return;
+        }
         // Cluster-FSM spec §5.6: hand the CLUSTER ARTIFACT to the
         // `uc2-cluster` agent, and publish its position, BEFORE the floor
         // signal — the consensus agent's install handler samples the floor
@@ -2491,6 +2847,106 @@ impl FollowerReceiver {
             },
         );
         self.seal_and_send(peer, DGRAM_KIND_SNAP_DONE, &mut d);
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 5: ask `peer` for its complete set
+    /// at `position` (`0` = its newest) and arm a STORE-ONLY intake for the
+    /// session — the voter's half of the standby return path, which admin op 9
+    /// drives through [`FollowerReceiver::set_fetch_route`]. Public so a test
+    /// (and Task 10's learner harness) can drive one directly.
+    pub fn open_store_only_intake(&mut self, peer: SocketAddr, session: u32, position: u64) {
+        self.open_fetch_intake(peer, session, position, IntakeMode::StoreOnly);
+    }
+
+    /// [`Self::open_store_only_intake`] with the mode given: a below-floor
+    /// joiner following a `SNAP_REDIRECT` asks the same way but INSTALLS what
+    /// comes back (it is below the floor — that is the ordinary joiner path,
+    /// only with a learner as the source).
+    fn open_fetch_intake(
+        &mut self,
+        peer: SocketAddr,
+        session: u32,
+        position: u64,
+        mode: IntakeMode,
+    ) {
+        // Fix round 3: a NEW fetch retires the parked straggler. Whatever the
+        // previous fetch's late answer would have been, this node is no longer
+        // waiting for it — and holding the slot past the fetch it belongs to
+        // is what would let it refuse an unrelated session later.
+        self.last_expired_fetch = None;
+        // Arm BEFORE the request goes out: the source may answer within the
+        // same duty cycle, and an intake that opened before the arm was
+        // recorded would install by fiat a set this node only meant to store.
+        // The arm EXPIRES (`drain_fetch_route`): a learner that never answers
+        // must not leave a store-only arm lying in wait for some later,
+        // unrelated session that happens to reuse the id.
+        self.armed_fetch = Some(ArmedFetch {
+            peer,
+            session,
+            position,
+            mode,
+            expires_ns: self.now_ns().saturating_add(SNAP_INTAKE_TIMEOUT_NS),
+        });
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_REQUEST_BODY_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
+                kind: DGRAM_KIND_SNAP_REQUEST,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        write_snap_request_body(
+            &mut d[DATAGRAM_HEADER_LEN..],
+            &SnapRequestBody { session, position },
+        );
+        // Sealed like every other SNAP kind, or dropped — never sent in the
+        // clear (T17). A dropped request simply never produces a session; the
+        // operator's `uc2ctl snapshot fetch` is re-runnable and the node's
+        // pending record times out.
+        self.seal_and_send(peer, DGRAM_KIND_SNAP_REQUEST, &mut d);
+    }
+
+    /// Coordinated-snapshot spec §5.7 items 5–6: expire a stale arm, then
+    /// start at most one node-requested fetch per duty cycle. A fetch is
+    /// DROPPED (not queued) while a transfer is already in flight: the
+    /// requester is told nothing, its pending record times out, and re-running
+    /// the operator's verb is the retry. Queuing would be worse — a fetch that
+    /// starts minutes later, on a set the learner may have pruned.
+    ///
+    /// `now` is passed in rather than read here, like `snap_upkeep`'s, so a
+    /// test can place the expiry at a chosen instant.
+    fn drain_fetch_route(&mut self, now: u64) -> bool {
+        // Fix round 2 (Ruling P11): an expiring arm leaves its SESSION ID
+        // behind. A learner answering after the deadline would otherwise match
+        // no arm, fall to the default `IntakeMode::Install`, and have its set
+        // installed BY FIAT — cluster artifact routed, floor adopted — which
+        // is precisely what a store-only pull must never do. One slot,
+        // overwritten by the next expiry: fetches are operator-driven and
+        // one-at-a-time, so a second expiry means the first straggler is no
+        // longer the one to worry about.
+        if let Some(a) = self.armed_fetch
+            && now > a.expires_ns
+        {
+            self.last_expired_fetch = Some((a.peer, a.session));
+            self.armed_fetch = None;
+        }
+        let Some(rx) = self.fetch_rx.as_ref() else {
+            return false;
+        };
+        let Ok(f) = rx.try_recv() else {
+            return false;
+        };
+        if self.snap_intake.is_some() {
+            self.stats.snap_fetch_busy.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        self.fetch_session_seq = self.fetch_session_seq.wrapping_add(1);
+        let session = self.fetch_session_seq;
+        self.open_fetch_intake(f.peer, session, f.position, f.mode);
+        true
     }
 
     /// Build, seal and send one `SNAP_NAK`. `false` = it could not be sealed and
@@ -2805,6 +3261,12 @@ impl FollowerReceiver {
         if self.snap_upkeep(now) || self.snap_upkeep(self.now_ns()) {
             did = true;
         }
+        // Coordinated-snapshot spec §5.7: and start at most one node-requested
+        // fetch. Last, and after the intake poll above, so a fetch never
+        // competes with a transfer that is finishing this very cycle.
+        if self.drain_fetch_route(now) {
+            did = true;
+        }
         did
     }
 }
@@ -2826,8 +3288,9 @@ mod tests {
     use uc_protocol::v2::datagram::{
         DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
         DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader,
-        NAK_BODY_LEN, STATUS_BODY_LEN, read_nak_body, read_status_body, write_datagram_header,
-        write_nak_body, write_status_body,
+        NAK_BODY_LEN, SNAP_REDIRECT_BODY_LEN, STATUS_BODY_LEN, SnapRedirectBody, read_nak_body,
+        read_status_body, write_datagram_header, write_nak_body, write_snap_redirect_body,
+        write_status_body,
     };
 
     const TERM: u32 = 9;
@@ -5294,13 +5757,13 @@ mod tests {
             to,
             DGRAM_KIND_SNAP_BEGIN,
             0,
-            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
+            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 4096, 16, 0b1),
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, TOTAL, &[0xCCu8; 16]);
         let (done_wire, done_body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
         let done = read_snap_begin_body(&done_body).expect("a well-formed SNAP_DONE body");
         assert_eq!(done.session, 7);
-        assert_eq!(done.snapshot_pos, 8192);
+        assert_eq!(done.snapshot_pos, 4096);
         assert_eq!(
             done.service_id, CLUSTER_ARTIFACT_ID,
             "the ack echoes the session's LAST artifact — always the cluster one"
@@ -5318,7 +5781,7 @@ mod tests {
         assert!(
             dir.path()
                 .join("cluster")
-                .join("snap-8192.ultcluster")
+                .join("snap-4096.ultcluster")
                 .exists(),
             "...and its cluster artifact landed where the uc2-cluster agent recovers from"
         );
@@ -5649,7 +6112,7 @@ mod tests {
             to,
             DGRAM_KIND_SNAP_BEGIN,
             0,
-            &snap_begin_wire(11, 2, 8192, 64, 0b111),
+            &snap_begin_wire(11, 2, 4096, 64, 0b111),
         );
         let (_, body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_NAK);
         let nak = read_snap_nak_body(&body).expect("a well-formed SNAP_NAK body");
@@ -5673,7 +6136,7 @@ mod tests {
             to,
             DGRAM_KIND_SNAP_BEGIN,
             0,
-            &snap_begin_wire(11, 1, 5120, 64, 0b111),
+            &snap_begin_wire(11, 1, 4096, 64, 0b111),
         );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().unwrap().parts.len() < 2 {
@@ -5683,14 +6146,14 @@ mod tests {
             );
             r.do_work();
         }
-        assert!(dir.path().join("1").join("incoming-5120.part").exists());
+        assert!(dir.path().join("1").join("incoming-4096.part").exists());
 
         // ...and the re-sent BEGIN(2) now places, at base 128.
         peer.send_sealed_pairwise(
             to,
             DGRAM_KIND_SNAP_BEGIN,
             0,
-            &snap_begin_wire(11, 2, 8192, 64, 0b111),
+            &snap_begin_wire(11, 2, 4096, 64, 0b111),
         );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().unwrap().parts.len() < 3 {
@@ -5711,7 +6174,7 @@ mod tests {
             "each artifact sits at the SUM of its predecessors' lengths"
         );
         assert_eq!(intake.announced_len, 192);
-        assert!(dir.path().join("2").join("incoming-8192.part").exists());
+        assert!(dir.path().join("2").join("incoming-4096.part").exists());
     }
 
     /// M14c: the leader re-sends a `SNAP_BEGIN` every 20 ms until our
@@ -5739,7 +6202,7 @@ mod tests {
             to,
             DGRAM_KIND_SNAP_BEGIN,
             0,
-            &snap_begin_wire(21, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
+            &snap_begin_wire(21, CLUSTER_ARTIFACT_ID, 4096, 16, 0b1),
         );
         peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 64, &[0xCDu8; 16]);
         let (_, first) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
@@ -5999,7 +6462,7 @@ mod tests {
             DGRAM_KIND_SNAP_BEGIN,
             0,
             TERM,
-            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
+            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 4096, 16, 0b1),
         );
         leader.send(to, DGRAM_KIND_SNAP_CHUNK, 64, TERM, &[0xCDu8; 16]);
         assert_eq!(
@@ -6007,7 +6470,7 @@ mod tests {
             1,
             "the cluster artifact completed the session"
         );
-        let landed = dir.path().join("cluster").join("snap-8192.ultcluster");
+        let landed = dir.path().join("cluster").join("snap-4096.ultcluster");
         assert!(
             landed.is_file(),
             "it lands under snapshots/cluster/ — the same path the node's own \
@@ -6015,12 +6478,12 @@ mod tests {
         );
         assert_eq!(
             rx.try_recv().expect("the artifact is routed to the agent"),
-            (8192, landed),
+            (4096, landed),
             "position and path, so the agent installs by fiat at that position"
         );
         assert_eq!(
             cluster_cell.load(Relaxed),
-            8192,
+            4096,
             "and its position is published for the install handler to wait on"
         );
         assert_eq!(
@@ -6041,7 +6504,7 @@ mod tests {
             DGRAM_KIND_SNAP_BEGIN,
             0,
             TERM,
-            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 8192, 16, 0b1),
+            &snap_begin_wire(7, CLUSTER_ARTIFACT_ID, 4096, 16, 0b1),
         );
         assert_eq!(
             pump_and_count_dones(&mut r, &leader),
@@ -6462,7 +6925,7 @@ mod tests {
             DGRAM_KIND_SNAP_BEGIN,
             0,
             TERM,
-            &snap_begin_wire(21, 1, 5120, 640, 0b11),
+            &snap_begin_wire(21, 1, 4096, 640, 0b11),
         );
         let deadline = Instant::now() + Duration::from_secs(3);
         while r.snap_intake.as_ref().is_none_or(|i| i.parts.len() < 2) {
@@ -6548,7 +7011,7 @@ mod tests {
         // blocked retry, it never strands a completed set.
         std::fs::remove_dir(dir.path().join("0").join("snap-4096.ultsnap")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !dir.path().join("1").join("snap-5120.ultsnap").is_file() {
+        while !dir.path().join("1").join("snap-4096.ultsnap").is_file() {
             assert!(
                 Instant::now() < deadline,
                 "the set never published once cleared"
@@ -6556,5 +7019,543 @@ mod tests {
             r.do_work();
         }
         assert!(dir.path().join("0").join("snap-4096.ultsnap").is_file());
+    }
+
+    // ==== Coordinated-snapshot plan 2, Task 6 ===============================
+
+    /// Spec §5.6, the ONE-POSITION rule on the intake side: every `SNAP_BEGIN`
+    /// of a session names the SAME instant. A second BEGIN carrying a
+    /// different `snapshot_pos` is a source that mixed two instants (or a
+    /// forgery splicing one artifact of set A into set B): the session is
+    /// dropped by NAME, with its own counter, rather than assembled into a set
+    /// whose rows never saw the same log.
+    #[test]
+    fn a_session_whose_begins_disagree_on_position_is_refused() {
+        use Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b11),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
+        let st = r.stats();
+        let to = r.local_addr();
+
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(3, 0, 4096, 64, 0b11),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the first BEGIN never opened one"
+            );
+            r.do_work();
+        }
+
+        // The next artifact of the SAME session, at a DIFFERENT instant.
+        leader.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(3, 1, 8192, 64, 0b11),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_position_mismatch.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a BEGIN disagreeing on the set's position was not refused"
+            );
+            r.do_work();
+        }
+        assert!(
+            r.snap_intake.is_none(),
+            "the refusal drops the session it refuses"
+        );
+        assert_eq!(
+            st.snap_refused_declared_mismatch.load(Relaxed),
+            0,
+            "a position mismatch is its own named refusal, not an identity one"
+        );
+    }
+
+    /// Spec §5.7 item 4 (Ruling P4'): a STORE-ONLY intake writes the set's
+    /// artifact files and acks, and does NOTHING else — it publishes no
+    /// `incoming_snapshot_pos`, hands nothing to the `uc2-cluster` agent, and
+    /// arms no fiat adoption. A voter above P storing a set at P is not a
+    /// joiner. What it does publish is `stored_set_pos`, which the consensus
+    /// agent's completeness poll treats exactly like a locally produced set.
+    #[test]
+    fn store_only_completion_writes_artifacts_and_publishes_no_position() {
+        const P: u64 = 4096;
+        let b = buffer();
+        // A store-only intake refuses a set above this node's own durable
+        // frontier (fix round 1, Important 3), so give this voter a log that
+        // has reached P.
+        b.counters().prime(P);
+        let mut learner = FakeLeader::new();
+        let mut r = follower(&b, learner.addr());
+        let dir = snap_scratch_dir();
+        let incoming = Arc::new(AtomicU64::new(0));
+        let incoming_cluster = Arc::new(AtomicU64::new(0));
+        let (cluster_tx, cluster_rx) = mpsc::sync_channel::<(u64, PathBuf)>(1);
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            Some((
+                Arc::clone(&incoming),
+                Arc::clone(&incoming_cluster),
+                cluster_tx,
+            )),
+        );
+        let stored = r.stored_set_pos();
+        let to = r.local_addr();
+
+        // The voter asks the learner for the set at P and arms a store-only
+        // intake for the session it just minted.
+        r.open_store_only_intake(learner.addr(), 55, P);
+        let (h, body) = learner.recv().expect("a SNAP_REQUEST reached the learner");
+        assert_eq!(h.kind, DGRAM_KIND_SNAP_REQUEST);
+        let req = read_snap_request_body(&body).expect("a well-formed SNAP_REQUEST body");
+        assert_eq!((req.session, req.position), (55, P));
+
+        // The learner ships the ordinary session for that set.
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        learner.send(to, DGRAM_KIND_SNAP_CHUNK, 0, TERM, &[0x7Eu8; 64]);
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, CLUSTER_ARTIFACT_ID, P, 16, 0b1),
+        );
+        learner.send(to, DGRAM_KIND_SNAP_CHUNK, 64, TERM, &[0x3Cu8; 16]);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stored.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the store-only set never completed"
+            );
+            r.do_work();
+        }
+        assert_eq!(stored.load(Ordering::Acquire), P);
+        assert!(
+            dir.path()
+                .join("0")
+                .join(format!("snap-{P}.ultsnap"))
+                .is_file(),
+            "the row artifact is written verbatim"
+        );
+        assert!(
+            dir.path()
+                .join("cluster")
+                .join(format!("snap-{P}.ultcluster"))
+                .is_file(),
+            "...and so is the cluster artifact"
+        );
+        assert_eq!(
+            incoming.load(Ordering::Acquire),
+            0,
+            "a store-only intake publishes NO floor signal"
+        );
+        assert_eq!(
+            incoming_cluster.load(Ordering::Acquire),
+            0,
+            "...and no cluster position"
+        );
+        assert!(
+            cluster_rx.try_recv().is_err(),
+            "...and hands nothing to the uc2-cluster agent: nothing is installed by fiat"
+        );
+        assert!(
+            r.snap_adopt_pending.is_none(),
+            "...and arms no floor adoption"
+        );
+        // It still ACKS: the learner's session slot must be freed.
+        let acked = std::iter::from_fn(|| {
+            r.do_work();
+            learner.recv()
+        })
+        .take(4)
+        .any(|(h, _)| h.kind == DGRAM_KIND_SNAP_DONE);
+        assert!(acked, "a store-only completion still acks SNAP_DONE");
+    }
+
+    /// Fix round 1, Important 1: a fetch BINDS the position it asked for. A
+    /// source that answers our session with a set at some OTHER instant —
+    /// a learner that superseded the instant between our request and its
+    /// answer, or a forgery — must not have that set stored and adopted as
+    /// this node's own. It is the same `position_mismatch` refusal a session
+    /// that mixes two instants gets, for the same reason: what came back is
+    /// not the set that was asked for.
+    #[test]
+    fn a_fetched_session_answering_at_another_position_is_refused() {
+        use Ordering::Relaxed;
+        const ASKED: u64 = 4096;
+        const ANSWERED: u64 = 8192;
+        let b = buffer();
+        // This voter's log has reached both positions, so the durable bound
+        // below is not what refuses anything here (its own leg is last).
+        b.counters().prime(ANSWERED);
+        let mut learner = FakeLeader::new();
+        let mut r = follower(&b, learner.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
+        let stored = r.stored_set_pos();
+        let st = r.stats();
+        let to = r.local_addr();
+
+        r.open_store_only_intake(learner.addr(), 55, ASKED);
+        learner.recv().expect("the SNAP_REQUEST went out");
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, ANSWERED, 64, 0b1),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_position_mismatch.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a set at a position we never asked for was not refused"
+            );
+            r.do_work();
+        }
+        assert!(r.snap_intake.is_none(), "no intake opened for it");
+        assert_eq!(
+            stored.load(Ordering::Acquire),
+            0,
+            "and nothing was stored, let alone adopted"
+        );
+        assert!(
+            !dir.path().join("0").join("snap-8192.ultsnap").exists(),
+            "no artifact of the wrong set is left behind"
+        );
+
+        // `position = 0` means "your newest complete set", so ANY position the
+        // source answers with is the one we asked for.
+        r.open_store_only_intake(learner.addr(), 56, 0);
+        learner.recv().expect("the second SNAP_REQUEST went out");
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(56, 0, ANSWERED, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "a `newest` fetch must accept whatever position comes back"
+            );
+            r.do_work();
+        }
+        assert_eq!(
+            st.snap_refused_position_mismatch.load(Relaxed),
+            1,
+            "...and refuses nothing further"
+        );
+        r.snap_discard_intake();
+
+        // Fix round 1, Important 3, the `position = 0` leg: what a "newest"
+        // fetch may NOT do is take a set from ABOVE this node's own log. The
+        // artifacts would be written under names the cluster agent's `recover`
+        // picks by name at boot, and installed ahead of the bytes they
+        // summarise. Refused before any `.part` exists.
+        let above = b.counters().durable.load_acquire() + 4096;
+        r.open_store_only_intake(learner.addr(), 57, 0);
+        learner.recv().expect("the third SNAP_REQUEST went out");
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(57, 0, above, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_position_mismatch.load(Relaxed) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "a store-only set above this node's durable frontier was not refused"
+            );
+            r.do_work();
+        }
+        assert!(r.snap_intake.is_none());
+        assert!(
+            !dir.path().join("0").exists()
+                || std::fs::read_dir(dir.path().join("0"))
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .all(|e| !e.file_name().to_string_lossy().contains(&above.to_string())),
+            "nothing of the above-durable set was written"
+        );
+    }
+
+    /// Fix round 2 (Ruling P11): a fetch's arm EXPIRES, and the answer that
+    /// arrives after it must not become an INSTALL. Before this, a learner
+    /// answering a store-only pull late matched no arm, fell to the default
+    /// `IntakeMode::Install`, and had its cluster artifact routed to the
+    /// `uc2-cluster` agent and its floor adopted by fiat — the exact thing
+    /// store-only exists to prevent. The distinguishing signal is the SESSION
+    /// ID this node minted for the fetch, never the position: an ordinary
+    /// Install session above `durable` is entirely legal (a joiner is below
+    /// its floor by definition).
+    #[test]
+    fn a_begin_for_an_expired_fetch_is_refused_and_never_installed() {
+        use Ordering::Relaxed;
+        const P: u64 = 4096;
+        let b = buffer();
+        b.counters().prime(P);
+        let mut learner = FakeLeader::new();
+        let mut r = follower(&b, learner.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
+        let st = r.stats();
+        let to = r.local_addr();
+
+        r.open_store_only_intake(learner.addr(), 55, P);
+        learner.recv().expect("the SNAP_REQUEST went out");
+        let armed = r.armed_fetch.expect("armed");
+        assert_eq!(armed.session, 55);
+
+        // One nanosecond short of the bar the arm is still live...
+        r.drain_fetch_route(armed.expires_ns);
+        assert!(r.armed_fetch.is_some(), "not expired before the deadline");
+        // ...and past it, it is gone — with the PEER and session remembered.
+        r.drain_fetch_route(armed.expires_ns + 1);
+        assert!(r.armed_fetch.is_none(), "expired");
+        assert_eq!(r.last_expired_fetch, Some((learner.addr(), 55)));
+
+        // Fix round 3: the parked id belongs to that PEER. Session ids are
+        // per-process counters minted by the SOURCE, from 0 — so a fresh
+        // source (a new leader, a restarted node, a redirect-designated
+        // learner) routinely mints the same small number, and its ordinary
+        // session must open normally rather than being refused as somebody
+        // else's straggler.
+        let mut stranger = FakeLeader::new();
+        stranger.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "another peer's session 55 is not our straggler and must open"
+            );
+            r.do_work();
+        }
+        assert_eq!(
+            r.snap_intake.as_ref().unwrap().peer,
+            stranger.addr(),
+            "...as an ordinary session"
+        );
+        assert_eq!(
+            r.snap_intake.as_ref().unwrap().mode,
+            IntakeMode::Install,
+            "...in the default mode: it is nobody's fetch"
+        );
+        assert_eq!(st.snap_refused_fetch_expired.load(Relaxed), 0);
+        r.snap_discard_intake();
+
+        // The learner answers late. It must NOT open an Install intake.
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_fetch_expired.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a straggling BEGIN for an expired fetch was not refused"
+            );
+            r.do_work();
+        }
+        assert!(
+            r.snap_intake.is_none(),
+            "no intake, and certainly no Install"
+        );
+        // Nothing of the straggler is on disk. (The row directory itself may
+        // exist — the stranger's accepted session above created and then
+        // discarded a `.part` in it — so this asserts it is EMPTY rather than
+        // absent.)
+        let row0 = dir.path().join("0");
+        assert!(
+            !row0.exists() || std::fs::read_dir(&row0).unwrap().next().is_none(),
+            "nothing of the straggler was written: {:?}",
+            std::fs::read_dir(&row0).map(|d| d
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>())
+        );
+
+        // Fix round 3: ONE refusal per straggler. The slot is cleared when it
+        // fires, so the source's retry — same peer, same session — is an
+        // ordinary session again. (It must be: the source re-sends its BEGIN
+        // on a 20 ms cadence until a DONE comes back, and a permanent refusal
+        // would make that peer's next legitimate session unopenable.)
+        assert_eq!(r.last_expired_fetch, None, "cleared when it fired");
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the straggler is refused ONCE, not forever"
+            );
+            r.do_work();
+        }
+        r.snap_discard_intake();
+
+        // A DIFFERENT session from the same peer was never in question.
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(56, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "an unrelated session must still open"
+            );
+            r.do_work();
+        }
+        assert_eq!(st.snap_refused_fetch_expired.load(Relaxed), 1);
+    }
+
+    /// The `SNAP_REQUEST` half of the T17 rule: a pull request is a pairwise
+    /// SNAP kind like every other, so an unsealed one must never reach the
+    /// sender's control channel — a forged request would otherwise make any
+    /// node ship its whole state to whoever can reach the UDP port.
+    #[test]
+    fn an_unsealed_snap_request_is_refused_now_that_t17_landed() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<crate::sender::CtrlMsg>(4);
+        r.set_sender_route(ctrl_tx);
+        let to = r.local_addr();
+        let st = r.stats();
+
+        let mut body = vec![0u8; SNAP_REQUEST_BODY_LEN];
+        write_snap_request_body(
+            &mut body,
+            &SnapRequestBody {
+                session: 3,
+                position: 4096,
+            },
+        );
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &CryptoPeer::header(0, DGRAM_KIND_SNAP_REQUEST, 0));
+        d.extend_from_slice(&body);
+        peer.send_raw(to, &d);
+
+        // A cleartext `SNAP_REQUEST` is 28 bytes — SHORTER than any sealed
+        // frame can be (header + counter + tag = 40), and the body is
+        // fixed-length, so a forgery cannot pad itself out of that. It is
+        // therefore always the mixed-mode diagnostic that names it rather than
+        // the AEAD's own failure. Either way it is DROPPED before
+        // `on_datagram`, which is the property that matters here.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.peer_appears_cleartext.load(Relaxed) + st.dropped_auth_failed.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "an unsealed SNAP_REQUEST was neither authenticated nor rejected"
+            );
+            r.do_work();
+        }
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "the forged SNAP_REQUEST must never reach the sender agent"
+        );
+    }
+
+    /// ...and the same for `SNAP_REDIRECT`: an unsealed one must never reach
+    /// the consensus route. A forged redirect would otherwise point a
+    /// below-floor joiner at an attacker-named member — and while the node
+    /// layer bounds the damage (the id must resolve to a real member, and that
+    /// member serves the session on its own terms), the datagram has no
+    /// business being admitted at all.
+    #[test]
+    fn an_unsealed_snap_redirect_is_refused_now_that_t17_landed() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let (route_tx, route_rx) = mpsc::sync_channel::<NetEvent>(4);
+        r.route = route_tx;
+        let to = r.local_addr();
+        let st = r.stats();
+
+        let mut body = vec![0u8; SNAP_REDIRECT_BODY_LEN];
+        write_snap_redirect_body(
+            &mut body,
+            &SnapRedirectBody {
+                session: 0,
+                learner_id: 9,
+                position: 4096,
+            },
+        );
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &CryptoPeer::header(0, DGRAM_KIND_SNAP_REDIRECT, 0));
+        d.extend_from_slice(&body);
+        peer.send_raw(to, &d);
+
+        // 32 bytes — again shorter than any sealed frame (40), so the
+        // mixed-mode diagnostic is what names it. Dropped before
+        // `on_datagram` either way, which is the property under test.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.peer_appears_cleartext.load(Relaxed) + st.dropped_auth_failed.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "an unsealed SNAP_REDIRECT was neither authenticated nor rejected"
+            );
+            r.do_work();
+        }
+        assert!(
+            route_rx.try_recv().is_err(),
+            "the forged SNAP_REDIRECT must never reach the consensus agent"
+        );
     }
 }

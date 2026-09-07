@@ -346,6 +346,28 @@ pub trait SnapshotStateMachine: RawStateMachine {
     /// not carry it). Returns the post-install position, which MUST equal
     /// `position`. Runs on the apply thread with the SM lock held.
     ///
+    /// **`position` is an EXCLUSIVE frontier** (coordinated-snapshot spec
+    /// §5.2): since instants are commanded, the tag is **P**, the frame-END of
+    /// the `SNAPSHOT` frame the whole cluster froze at, and the image covers
+    /// every frame strictly BELOW P. A user frame normally starts exactly at
+    /// P, so an implementation must NOT report `position` from
+    /// [`last_applied`](RawStateMachine::last_applied) afterwards — the apply
+    /// loop's idempotency guard is `pos > last_applied()`, and claiming P
+    /// would silently swallow the first frame above the instant. Restore the
+    /// cursor the artifact itself recorded (put it in your image; every
+    /// reference SM does) and return `position` for the framework to resume
+    /// reading from. A payload cursor ABOVE `position` is a genuinely
+    /// mis-tagged artifact and should be refused — belt-and-suspenders only:
+    /// the tag is exclusive, so an artifact built at some LOWER `P0` and
+    /// presented as `P` passes any payload-side check an SM can write. That
+    /// case is the framework's (ruling P6). UC prescribes no payload encoding
+    /// — the bytes between `stream_snapshot` and here are entirely the
+    /// service's — but the FILE does not start with them: every artifact
+    /// carries a 16-byte UC envelope
+    /// ([`uc_service::snapshots`](crate::snapshots)) naming the instant it was
+    /// built at, which every install path strips and verifies before this
+    /// method is called. `src` is positioned at the payload's first byte.
+    ///
     /// Deviation from the M6 brief's literal trait block: the brief sketched a
     /// no-argument `install_snapshot(&mut self, src)` that recovered `S` from a
     /// "stream trailer". No such trailer exists in the ULTSNAP wire format, so

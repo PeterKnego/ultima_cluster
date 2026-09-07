@@ -56,7 +56,7 @@ writer.
 | 1344 | `archive_first_base` | consensus agent; mirrors the archive agent's first-base atomic |
 | 3456 | `config_version` | |
 | 3520 | `config_pending` | |
-| 3584 | `admin_req` | admin request slot — `seq u64 @+0` (the commit word) ‖ `nonce u64 @+8` ‖ `op u32 @+16` ‖ `id u32 @+20` ‖ `ip u32 @+24` ‖ `port u32 @+28`. Ops: `1..=5` the reconfiguration ops, `6 ADMIN_OP_SCHEDULE_APPLY`, `7 ADMIN_OP_SETTINGS_APPLY` (the cluster FSM, 2.11 pending). The two apply ops carry no payload here — the line is 64 fixed bytes and the HMAC covers exactly those, so the payload is staged in the instance directory and `id ‖ ip ‖ port` carry the first 80 bits of its SHA-256 instead |
+| 3584 | `admin_req` | admin request slot — `seq u64 @+0` (the commit word) ‖ `nonce u64 @+8` ‖ `op u32 @+16` ‖ `id u32 @+20` ‖ `ip u32 @+24` ‖ `port u32 @+28`. Ops: `1..=5` the reconfiguration ops, `6 ADMIN_OP_SCHEDULE_APPLY`, `7 ADMIN_OP_SETTINGS_APPLY` (the cluster FSM, 2.11 pending), `8 ADMIN_OP_SNAPSHOT` and `9 ADMIN_OP_SNAPSHOT_FETCH` (coordinated snapshots, 2.11 pending). The two apply ops carry no payload here — the line is 64 fixed bytes and the HMAC covers exactly those, so the payload is staged in the instance directory and `id ‖ ip ‖ port` carry the first 80 bits of its SHA-256 instead. Op `8` needs no payload at all: `id` carries the `--standby` flag. Op `9` puts the learner id in `id` and packs the target position into the two free address words — `ip` = the low 32 bits, `port` = the next 16, i.e. **48 bits** ([`uc2ctl` § `snapshot fetch`](uc2ctl.md#snapshot-fetch)) |
 | 3648 | `admin_resp` | admin response slot |
 | 3712 | `admission_bytes` | the node's admission window **in effect**. Observability only — nothing else gates on it. Since the cluster FSM (2.11 pending) the value is the committed `Settings::admission_bytes` clamped to this host's `buffer_bytes / 2`, or `NodeConfig::admission_bytes_default` while the setting reads `0`, re-published whenever the committed value moves rather than written once at boot |
 | 3776 | `seal_failures` | crypto seal failures |
@@ -78,6 +78,7 @@ position.
 |---|---|---|
 | 0 | `NODE_FLAG_LEADER` | this node is leader |
 | 1 | `NODE_FLAG_CAN_SERVE` | this node passes the serving gate |
+| 2 | `NODE_FLAG_LEARNER` = `4` | this node is a **learner** (coordinated snapshots, 2.11 pending). Written by the consensus agent in `publish_status` from the kernel's durable-time membership shadow, on every adoption. It is read by the service apply loop out of the same word it already reads `NODE_FLAG_LEADER` from, once per cycle: a row acts on a `SNAPSHOT` frame carrying `FLAG_SNAPSHOT_STANDBY` **only** when this bit is set. Role is a node property, so it lives here and not in a per-row slot |
 
 ## Peer slots
 
@@ -117,7 +118,7 @@ Fields within a slot (each its own 64 B line, one writer):
 
 | Slot offset | Field | Writer |
 |---|---|---|
-| 0 | `status` (line 0, word 0) — `service_id` (bits 0..8) \| attached (bit 8) \| incarnation (bits 32..64) | service, at attach / clean detach |
+| 0 | `status` (line 0, word 0) — `service_id` (bits 0..8) \| attached (bit 8) \| **snapshot-capable (bit 9)** \| incarnation (bits 32..64) | service, at attach / clean detach |
 | 8 | `version` (line 0, word 1) — packed FSM version (low 32 bits); `0` = unversioned/absent | service, at attach (cnc 3.1, FSM identity) |
 | 64 | `applied` | service apply agent |
 | 128 | `epoch` | service, `fetch_add` at attach |
@@ -128,6 +129,7 @@ Fields within a slot (each its own 64 B line, one writer):
 | 448 | `name` (line 7) — `[u8; 32]`, NUL-padded FSM name | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 480 | `identity_hash` (line 7) — u64, FNV-1a 64 of `name` | **node**, at `CncPage::init` (boot, once) — cnc 3.1, FSM identity |
 | 488 | `timers_pending` (line 7) — u64 count of this row's pending scheduled timers | **node** (consensus agent), republished every pass — cnc 3.1, log time. Since the cluster FSM (2.11 pending) the timer heap is **leader-only**, so this is the leader's count and a follower always publishes `0` |
+| 496 | `freeze_ns` (line 7) — u64, the duration in nanoseconds of this row's **last** `freeze()` call | **service** (`on_snapshot_frame`), once per instant — coordinated snapshots, 2.11 pending |
 
 A slot whose `status` reads `0` has never been attached this page generation.
 The node re-creates the page at every boot, so incarnation and epoch restart
@@ -147,3 +149,20 @@ way: its writer is the node's **consensus agent**, and unlike `name`/
 boot. It is exported as `uc2_timers_pending{service="<name>",row="<r>"}` and
 printed by `uc2ctl status` as `timers_pending=` on each per-FSM row. See
 [Log time and timers, explained](../notes/uc2-log-time-and-timers-explained.md).
+
+Line 7's fourth word, `freeze_ns` (`+496`), breaks it a **third** way: it is
+**service**-written, not node-written, so line 7 no longer has a single
+writer — but each of its four words still does, which is the property that
+matters. The service's apply loop writes it once per instant, right after
+`freeze()` returns; `/metrics` reads it once per scrape (never per pass) and
+derives `uc2_snapshot_freeze_seconds_max/_sum/_count{service,row}` from it.
+It shares a line with node-written words exactly as
+`CNC_SVC_STATUS_SNAPSHOT_CAPABLE` (status bit **9**, also service-written, set
+by `start_with_snapshots`) shares the status word.
+
+The capability bit is what `uc2ctl snapshot` checks before it commands
+anything: a row started with plain `start()` never sets it, ignores a
+`SNAPSHOT` frame, and could therefore never complete a set — so the leader
+refuses the instant `48 snapshot_unsupported` **naming that row** rather than
+leaving an operator watching a floor that never moves. See
+[The cluster FSM, explained § Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).

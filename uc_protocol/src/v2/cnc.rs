@@ -142,6 +142,17 @@ pub const ADMIN_OP_SCHEDULE_APPLY: u32 = 6;
 /// is too large for the 64-byte request line, so what the operator signs is
 /// the first 80 bits of its SHA-256, carried in `id ‖ ip ‖ port`.
 pub const ADMIN_OP_SETTINGS_APPLY: u32 = 7;
+/// Coordinated-snapshot plan 2 (spec §5.5, §8): command a snapshot instant.
+/// Same admin-request line; the `--standby` flag rides in the request (the
+/// existing `id`/`ip`/`port` fields — this op has no digest to sign).
+/// Leader-only; a follower answers `retry` with the leader hint, as
+/// `schedule apply` does. Refused `48 snapshot_unsupported` (naming the row)
+/// or `49 snapshot_no_learner` (a `--standby` request with no learner).
+pub const ADMIN_OP_SNAPSHOT: u32 = 8;
+/// Coordinated-snapshot plan 2 (spec §5.7, §8): pull a learner's complete
+/// set into a voter, store-only. Runs on the voter it targets (leader-local,
+/// not a cluster command — it changes nothing cluster-wide).
+pub const ADMIN_OP_SNAPSHOT_FETCH: u32 = 9;
 /// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
 /// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
 /// version u64 @+16.
@@ -292,7 +303,7 @@ const _: () = assert!(
 //   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
 //   +480 identity_hash   u64 FNV-1a 64 of the name             writer: node (init, boot-once)
 //   +488 timers_pending  u64 pending-timer count for this row  writer: node (consensus agent)
-//   +496 reserved (zero)
+//   +496 freeze_ns       u64 nanos, last freeze() call duration  writer: service (on_snapshot_frame)
 pub const CNC_OFF_SERVICE_SLOTS: usize = 4096;
 pub const CNC_SERVICE_SLOT_STRIDE: usize = 512;
 pub const CNC_MAX_SERVICES: usize = 8;
@@ -307,6 +318,12 @@ pub const CNC_SVC_OFF_RESERVED: usize = 448;
 /// `status` bit 8: the owning service process is attached (cleared on a clean
 /// detach; a crashed service leaves it set and its heartbeat ages instead).
 pub const CNC_SVC_STATUS_ATTACHED: u64 = 1 << 8;
+/// Coordinated-snapshot plan 2 (spec §5.2): service-written, set by
+/// `start_with_snapshots`. A row without this bit is not capable of
+/// completing a set at any instant; `uc2ctl snapshot`/cadence refuse
+/// `48 snapshot_unsupported` naming any declared row that lacks it.
+/// Bits 9..31 of the status word are otherwise free.
+pub const CNC_SVC_STATUS_SNAPSHOT_CAPABLE: u64 = 1 << 9;
 /// `status` bits 32..64: the attach count of this id on this page (bumped
 /// per attach, so a restart is visible even before the epoch is read).
 pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
@@ -314,7 +331,8 @@ pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
 /// low 32 bits of the status line's second word. `0` = unversioned/absent.
 pub const CNC_SVC_OFF_VERSION: usize = 8;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
-/// then (time-and-timers) its pending-timer count.
+/// then (time-and-timers) its pending-timer count, then (coordinated-
+/// snapshot spec §9) its last freeze duration.
 pub const CNC_SVC_OFF_NAME: usize = 448;
 pub const CNC_SVC_NAME_LEN: usize = 32;
 pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
@@ -322,9 +340,19 @@ pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
 /// `identity_hash` on line 7 (node-written, like the rest of the line; the
 /// consensus agent refreshes it once per pass). Reader: `/metrics`, `uc2ctl`.
 pub const CNC_SVC_OFF_TIMERS_PENDING: usize = 488;
+/// Coordinated-snapshot spec §9: this row's last `freeze()` call duration in
+/// nanoseconds, the word after `timers_pending` on line 7. Unlike the rest
+/// of line 7 this word is SERVICE-written (`on_snapshot_frame`, once per
+/// instant), not node-written — it shares the line with node-written words
+/// the same way `CNC_SVC_STATUS_SNAPSHOT_CAPABLE` shares a status word the
+/// service itself owns; there is exactly one writer for this word.
+/// `/metrics` reads it once per scrape (never per pass) to derive
+/// `uc2_snapshot_freeze_seconds_max/_sum/_count{row}`.
+pub const CNC_SVC_OFF_FREEZE_NS: usize = 496;
 const _: () = assert!(CNC_SVC_OFF_TIMERS_PENDING == CNC_SVC_OFF_IDENTITY_HASH + 8);
+const _: () = assert!(CNC_SVC_OFF_FREEZE_NS == CNC_SVC_OFF_TIMERS_PENDING + 8);
 const _: () = assert!(CNC_SVC_OFF_NAME == CNC_SVC_OFF_RESERVED);
-const _: () = assert!(CNC_SVC_OFF_IDENTITY_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE);
+const _: () = assert!(CNC_SVC_OFF_FREEZE_NS + 8 <= CNC_SERVICE_SLOT_STRIDE);
 const _: () = assert!(
     CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE <= CNC_PAGE_LEN,
     "service-slot band overruns the cnc page"
@@ -332,6 +360,12 @@ const _: () = assert!(
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
+/// Coordinated-snapshot plan 2 (spec §5.7): this node is a learner, set from
+/// the kernel's durable-time membership shadow in `publish_status` on every
+/// adoption. A row acts on a standby-flagged SNAPSHOT frame only when this
+/// flag is set; a voter's rows yield the frame like any other node-only
+/// frame — the same rule the cluster FSM follows from the same word.
+pub const NODE_FLAG_LEARNER: u64 = 4;
 
 /// Decoded fixed header fields (crc-agnostic — see module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,6 +713,9 @@ mod tests {
         assert_eq!(ADMIN_OP_SCHEDULE_APPLY, 6);
         // FROZEN: cluster-FSM settings apply, the same request line again.
         assert_eq!(ADMIN_OP_SETTINGS_APPLY, 7);
+        // FROZEN: coordinated-snapshot plan 2's two ops, same request line.
+        assert_eq!(ADMIN_OP_SNAPSHOT, 8);
+        assert_eq!(ADMIN_OP_SNAPSHOT_FETCH, 9);
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
         // Post-M7 (0.3.0): admission_bytes.
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
@@ -718,6 +755,11 @@ mod tests {
         // per-row pending-timer count, the word after identity_hash on line 7.
         assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, 488);
         assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, CNC_SVC_OFF_IDENTITY_HASH + 8);
+        // coordinated-snapshot spec §9: per-row last freeze duration, the
+        // word after timers_pending on line 7 — service-written, unlike the
+        // rest of the line.
+        assert_eq!(CNC_SVC_OFF_FREEZE_NS, 496);
+        assert_eq!(CNC_SVC_OFF_FREEZE_NS, CNC_SVC_OFF_TIMERS_PENDING + 8);
         const { assert!(CNC_OFF_FSM_LAG_BYTES + 8 <= CNC_OFF_SERVICES_DECLARED + 64) };
         // Page 1 is now FULL: the pair's line ends exactly where page 2 starts.
         assert_eq!(CNC_OFF_SERVICES_DECLARED + 64, 4096);
@@ -754,5 +796,19 @@ mod tests {
             CNC_SVC_OFF_NAME, CNC_SVC_OFF_RESERVED,
             "line 7 is the identity line"
         );
+    }
+
+    /// FROZEN (spec §5.2, §5.7, §5.5/§8): the standby role bit, the
+    /// snapshot-capability bit, and the two new admin ops.
+    #[test]
+    fn learner_flag_and_capability_bit_and_snapshot_ops_are_frozen() {
+        assert_eq!(NODE_FLAG_LEARNER, 4);
+        assert_eq!(
+            NODE_FLAG_LEARNER & (NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE),
+            0
+        );
+        assert_eq!(CNC_SVC_STATUS_SNAPSHOT_CAPABLE, 1 << 9);
+        assert_eq!(ADMIN_OP_SNAPSHOT, 8);
+        assert_eq!(ADMIN_OP_SNAPSHOT_FETCH, 9);
     }
 }

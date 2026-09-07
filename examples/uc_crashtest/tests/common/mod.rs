@@ -271,6 +271,43 @@ pub fn spawn_service_id(instance_dir: &Path, id: u8) -> Reap {
     Reap(child)
 }
 
+/// Coordinated-snapshot plan 2 (T10): spawn the service-only binary
+/// snapshot-CAPABLE (`--snapshots`, i.e. `start_with_snapshots()`), so the
+/// leader will accept `uc2ctl snapshot` for the row.
+///
+/// `freeze_ms` arms the bin's `SlowFreeze` wrapper through
+/// `UC2_CRASHTEST_FREEZE_MS` — `None` (or `0`) leaves `freeze()` a straight
+/// forward to `RegisterSm`'s, which is nanoseconds wide. A test that has to
+/// SIGKILL a service *while it is building* passes a value here, waits for
+/// the `freeze_started` sentinel the wrapper writes under the instance dir,
+/// and kills inside that window.
+///
+/// Row 0 attaches as bare `RegisterSm`; row 1 as `Tagged<1, RegisterSm>` —
+/// the two rows the coordinated-instant crashtest declares.
+pub fn spawn_service_snapshots(instance_dir: &Path, id: u8, freeze_ms: Option<u64>) -> Reap {
+    let mut cmd = Command::new(SERVICE_BIN);
+    cmd.arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID)
+        .arg("--snapshots");
+    if id != 0 {
+        cmd.arg("--tagged").arg(id.to_string());
+    }
+    // Set on the CHILD only — never `std::env::set_var` in the test process,
+    // which every other test in the binary shares.
+    cmd.env(
+        "UC2_CRASHTEST_FREEZE_MS",
+        freeze_ms.unwrap_or(0).to_string(),
+    );
+    let child = cmd
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn {SERVICE_BIN}: {e}"));
+    Reap(child)
+}
+
 /// Time-and-timers T11: spawn the service-only binary running
 /// `Timed<TimerSm>` (`--timer`). Its FSM name is `"timer"`, so the node must
 /// have been spawned with that name in its `--services` list.

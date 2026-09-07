@@ -153,7 +153,17 @@ mod tests {
         let store = SnapshotStore::open(dir.path(), 0).unwrap();
         let (pos, path) = store.newest(u64::MAX).unwrap().unwrap();
         assert_eq!(pos, 4096);
-        assert_eq!(std::fs::read(path).unwrap(), b"snapshot-bytes");
+        // Ruling P6: `publish` puts UC's envelope ahead of the job's bytes.
+        let raw = std::fs::read(path).unwrap();
+        assert_eq!(
+            crate::snapshots::decode_snapshot_envelope(&raw),
+            Ok(4096),
+            "the artifact names the instant it was built at"
+        );
+        assert_eq!(
+            &raw[crate::snapshots::SNAPSHOT_ENVELOPE_LEN..],
+            b"snapshot-bytes"
+        );
     }
 
     /// A failing job must NOT advance the cnc marker, and must still clear

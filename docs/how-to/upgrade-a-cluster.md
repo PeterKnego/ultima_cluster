@@ -337,7 +337,7 @@ you the same measured downtime number.
 
 ## Wire + cnc change in 2.11 (pending): FSM identity, log time and the cluster FSM (`0.7.0`, cnc `3.1`)
 
-Four features share this flag day, because all four were implemented before
+Five features share this flag day, because all five were implemented before
 the release was cut:
 
 - **FSM identity** gives each state machine a name declared in code and binds
@@ -363,10 +363,17 @@ the release was cut:
   [`docs/notes/uc2-cluster-fsm-explained.md`](../notes/uc2-cluster-fsm-explained.md)).
   **This one does need a per-host edit** — two moved `node.toml` keys — see
   below.
+- **Coordinated snapshot instants** make a snapshot something the whole
+  cluster takes at one log position on command, adding frame type `7`
+  (`SNAPSHOT`) with a standby flag and datagram kinds `22`/`23` (same spec,
+  §5; explainer section:
+  [Instants](../notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)).
+  It needs no `node.toml` edit, but it **does** need `snapshots/` emptied on
+  a dev box — see below — and it removes an SDK type.
 
 It is **one combined flag day**, on both lines at once — the same-host cnc
 page (`3.0` → `3.1`) and the node-to-node wire (`0.6.0` → `0.7.0`) — because
-all four changes ship in the same release.
+all five changes ship in the same release.
 
 **The `[services] ids` → `names` edit, required on every host.** `[services]`
 is no longer optional (absent used to mean `ids = [0]`; it now refuses to
@@ -392,6 +399,24 @@ directly, nothing at all — it attaches by its own `S::NAME`).
 machines (the cluster FSM declares `uc_cluster`). A `[services] names` entry
 starting with it is a named startup refusal; rename the row before the flag
 day if you have one.
+
+**Existing snapshot artifacts are refused.** Every artifact now begins with a
+16-byte `ULTSNAP1` envelope naming the position it was built at, and a file
+written by an earlier build has none. On a real deployment this cannot bite —
+nothing released ever wrote one — but a development instance directory carried
+across the flag day must have its `snapshots/` emptied, or the first install
+path to touch an old file refuses it by name. The node rebuilds the set at the
+next instant.
+
+**`SnapshotPolicy` is gone from the SDK.** A service that configured
+`ServiceConfig::snapshot_policy(SnapshotPolicy { interval_bytes })` no longer
+compiles: delete the call. `start_with_snapshots()` is the whole opt-in now,
+and the trigger moved to the log — command an instant with `uc2ctl snapshot`,
+or set the replicated `snapshot_interval_bytes` with `uc2ctl settings apply`.
+Check your `install_snapshot` while you are there: the position it is handed
+is an **exclusive** frontier and it must return that position, not report it
+from `last_applied()`
+([State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)).
 
 **The `admission_bytes` and `fsm_lag` edit, required on every host that sets
 either.** Both are cluster-wide policies now, so both are **refused by name**

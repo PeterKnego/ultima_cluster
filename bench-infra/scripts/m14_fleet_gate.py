@@ -95,6 +95,11 @@ STATS_RE = re.compile(r"reports_unattested=(\d+) snap_refusals=\((\d+),(\d+),(\d
 # builds ~250 snapshots, so the learner is still far below the purge floor and
 # must still converge by a snapshot session.
 M14_SEGMENT_BYTES = 16 << 20
+# Passed to BOTH roles of `m12_gate`: the `node` role seeds it into the
+# cluster's `[settings] snapshot.interval_bytes` at genesis (the replicated
+# cadence, coordinated-snapshot spec §5.5/§6) and the `service` role reads any
+# positive value as "start snapshot-capable". Rows d and f of
+# docs/benchmarks/uc2-m14-gate-2026-08-29.md were measured at this cadence.
 M14_SNAPSHOT_INTERVAL_BYTES = 32 << 20
 
 
@@ -309,6 +314,19 @@ def node_args(h, node_id, members, fsms, lag, purge, snap):
         args += ["--fsm-lag", lag]
     if purge:
         args += ["--purge-below-snapshot", "--journal-segment-bytes", str(M14_SEGMENT_BYTES)]
+        # The CADENCE this gate measures, stated here and nowhere else.
+        # Since 2.11.0 the cadence is a replicated setting seeded into
+        # `[settings] snapshot.interval_bytes` at genesis (coordinated-
+        # snapshot spec §5.5/§6), not the per-service byte policy spec §5.2
+        # deleted — so it has to reach the NODE role, not just the service's.
+        # `snap` was already a parameter here and had never been used; that
+        # gap briefly let `m12_gate`'s own hardcoded 32 KiB (m6/m9's smoke
+        # number) stand in for M14_SNAPSHOT_INTERVAL_BYTES, ~1024x more
+        # often, which under this gate's load degenerates into continuous
+        # freeze-and-abandon on every row. `m12_gate node` now REFUSES
+        # `--purge-below-snapshot` without an explicit number.
+        assert snap, "purge rows must state a snapshot cadence (M14_SNAPSHOT_INTERVAL_BYTES)"
+        args += ["--snapshot-interval-bytes", str(snap)]
     return args
 
 
@@ -886,6 +904,13 @@ def selftest():
     _na = node_args(_fh, 0, "0@h", [(0, 0), (1, 300)], None, False, 0)
     expect("node_args joins names, not row numbers",
            _na[_na.index("--services") + 1] == "count,spin")
+    expect("node_args passes no cadence without purge", "--snapshot-interval-bytes" not in _na)
+    # The cadence a purge row measures must reach the NODE role: since
+    # 2.11.0 it is a replicated setting seeded at genesis, and `m12_gate`'s
+    # `service` flag no longer configures one.
+    _na_purge = node_args(_fh, 0, "0@h", [(0, 0)], None, True, M14_SNAPSHOT_INTERVAL_BYTES)
+    expect("node_args carries M14_SNAPSHOT_INTERVAL_BYTES to the node role on a purge row",
+           _na_purge[_na_purge.index("--snapshot-interval-bytes") + 1] == str(32 << 20))
     _sa_plain = service_args(_fh, 0, 0, 0)
     _sa_spin = service_args(_fh, 1, 300, 0)
     expect("service_args omits --work-spin at spin=0", "--work-spin" not in _sa_plain)

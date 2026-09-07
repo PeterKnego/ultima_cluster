@@ -84,7 +84,7 @@ is a long `cargo fuzz run` with a large `-max_total_time`.
 
 `nightly.yml` has two jobs (`.github/workflows/nightly.yml`):
 
-* **`fuzz-groups`** — the five matrix legs are declared once, in that job's
+* **`fuzz-groups`** — the six matrix legs are declared once, in that job's
   `FUZZ_GROUPS` env, and a ~10-second Python step asserts their union is
   **exactly** the set of `[[bin]]` targets in `fuzz/Cargo.toml` (minus the
   `seed-corpus` generator), with no target in two legs and no leg naming a
@@ -92,7 +92,7 @@ is a long `cargo fuzz run` with a large `-max_total_time`.
   to a group fails the workflow here, before any sanitizer build. This is the
   mechanism that keeps "every target is fuzzed nightly" a fact rather than an
   intention — so when you add a target (see below), add it to a group.
-* **`fuzz`** — five parallel legs, `600` seconds per target on the committed
+* **`fuzz`** — six parallel legs, `600` seconds per target on the committed
   corpus, `--min-runs 10000`, `fail-fast: false`. A crash fails the leg and
   uploads `fuzz/artifacts` as a workflow artifact. A second cheap step
   re-checks the declared list against what `cargo fuzz list` actually

@@ -382,6 +382,17 @@ const _: () = assert!(SNAP_BEGIN_FIXED_LEN + 1024 <= MTU_DEFAULT - DATAGRAM_HEAD
 /// kind took the next free value, 21.
 pub const DGRAM_KIND_SNAP_TABLE_RETIRED: u8 = 21;
 
+/// Coordinated-snapshot plan 2 (spec §5.7): a voter asks a learner for its
+/// complete set at a position. Body = [`SnapRequestBody`]. The learner's
+/// sender opens an ordinary session for the set at that position from its
+/// own artifacts; the voter's receiver takes it in a store-only mode.
+pub const DGRAM_KIND_SNAP_REQUEST: u8 = 22;
+/// Coordinated-snapshot plan 2 (spec §5.7): the leader answers a below-floor
+/// NAK it cannot itself serve (its own set is incomplete or it is a voter
+/// waiting on a fetch) with a redirect to a learner that can. Body =
+/// [`SnapRedirectBody`]; the joiner sends its `SNAP_REQUEST` there.
+pub const DGRAM_KIND_SNAP_REDIRECT: u8 = 23;
+
 pub const SNAP_NAK_BODY_LEN: usize = 16;
 
 /// Requests a missing chunk of the snapshot file: `[offset, offset+length)`.
@@ -409,6 +420,66 @@ pub fn read_snap_nak_body(buf: &[u8]) -> Option<SnapNakBody> {
         session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
         offset: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
         length: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+    })
+}
+
+pub const SNAP_REQUEST_BODY_LEN: usize = 12;
+
+/// A voter's pull request to a learner (spec §5.7): "send me your complete
+/// set at `position`". `session` scopes the resulting transfer the way it
+/// scopes any other snapshot session. LE: session 0..4, position 4..12.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapRequestBody {
+    pub session: u32,
+    pub position: u64,
+}
+
+pub fn write_snap_request_body(buf: &mut [u8], b: &SnapRequestBody) {
+    buf[0..4].copy_from_slice(&b.session.to_le_bytes());
+    buf[4..12].copy_from_slice(&b.position.to_le_bytes());
+}
+
+/// Decode a `SNAP_REQUEST` body, or `None` if `buf.len() != SNAP_REQUEST_BODY_LEN`.
+/// Unlike [`read_snap_nak_body`], this reader is EXACT-length, not just total.
+pub fn read_snap_request_body(buf: &[u8]) -> Option<SnapRequestBody> {
+    if buf.len() != SNAP_REQUEST_BODY_LEN {
+        return None;
+    }
+    Some(SnapRequestBody {
+        session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        position: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+    })
+}
+
+pub const SNAP_REDIRECT_BODY_LEN: usize = 16;
+
+/// The leader's (or a voter's) answer to a below-floor `SNAP_NAK` it cannot
+/// serve itself (spec §5.7): "ask learner `learner_id` for the set at
+/// `position`". `session` scopes it to the requester's original transfer.
+/// LE: session 0..4, learner_id 4..8, position 8..16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapRedirectBody {
+    pub session: u32,
+    pub learner_id: u32,
+    pub position: u64,
+}
+
+pub fn write_snap_redirect_body(buf: &mut [u8], b: &SnapRedirectBody) {
+    buf[0..4].copy_from_slice(&b.session.to_le_bytes());
+    buf[4..8].copy_from_slice(&b.learner_id.to_le_bytes());
+    buf[8..16].copy_from_slice(&b.position.to_le_bytes());
+}
+
+/// Decode a `SNAP_REDIRECT` body, or `None` if `buf.len() != SNAP_REDIRECT_BODY_LEN`.
+/// EXACT-length, like [`read_snap_request_body`].
+pub fn read_snap_redirect_body(buf: &[u8]) -> Option<SnapRedirectBody> {
+    if buf.len() != SNAP_REDIRECT_BODY_LEN {
+        return None;
+    }
+    Some(SnapRedirectBody {
+        session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        learner_id: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        position: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
     })
 }
 
@@ -825,6 +896,9 @@ mod tests {
         // SNAP_TABLE took the next free value, 21 — retired by spec §5.6
         // before it ever shipped, and pinned here so nothing re-uses it.
         assert_eq!(DGRAM_KIND_SNAP_TABLE_RETIRED, 21);
+        // Coordinated-snapshot plan 2 (spec §5.7, §7): the standby pull kinds.
+        assert_eq!(DGRAM_KIND_SNAP_REQUEST, 22);
+        assert_eq!(DGRAM_KIND_SNAP_REDIRECT, 23);
     }
 
     #[test]
@@ -941,6 +1015,55 @@ mod tests {
             ]
         );
         assert_eq!(read_snap_nak_body(&buf[..SNAP_NAK_BODY_LEN - 1]), None);
+    }
+
+    /// FROZEN (spec §5.7, §7): the standby pull kinds and their bodies.
+    /// Both readers are total and EXACT-length (unlike `SnapNakBody`, which
+    /// only rejects short input): a longer buffer is also rejected.
+    #[test]
+    fn snap_request_and_redirect_bodies_roundtrip_and_are_exact_length() {
+        assert_eq!(
+            (DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_SNAP_REDIRECT),
+            (22, 23)
+        );
+        let mut b = [0u8; SNAP_REQUEST_BODY_LEN];
+        write_snap_request_body(
+            &mut b,
+            &SnapRequestBody {
+                session: 7,
+                position: 8192,
+            },
+        );
+        assert_eq!(
+            read_snap_request_body(&b),
+            Some(SnapRequestBody {
+                session: 7,
+                position: 8192,
+            })
+        );
+        assert!(read_snap_request_body(&b[..11]).is_none());
+        assert!(read_snap_request_body(&[]).is_none());
+        let mut too_long = [0u8; SNAP_REQUEST_BODY_LEN + 1];
+        too_long[..SNAP_REQUEST_BODY_LEN].copy_from_slice(&b);
+        assert!(
+            read_snap_request_body(&too_long).is_none(),
+            "exact-length, not just total: a longer buffer is also rejected"
+        );
+
+        let mut r = [0u8; SNAP_REDIRECT_BODY_LEN];
+        write_snap_redirect_body(
+            &mut r,
+            &SnapRedirectBody {
+                session: 7,
+                learner_id: 3,
+                position: 8192,
+            },
+        );
+        assert_eq!(read_snap_redirect_body(&r).unwrap().learner_id, 3);
+        assert!(read_snap_redirect_body(&r[..SNAP_REDIRECT_BODY_LEN - 1]).is_none());
+        let mut too_long = [0u8; SNAP_REDIRECT_BODY_LEN + 1];
+        too_long[..SNAP_REDIRECT_BODY_LEN].copy_from_slice(&r);
+        assert!(read_snap_redirect_body(&too_long).is_none());
     }
 
     #[test]

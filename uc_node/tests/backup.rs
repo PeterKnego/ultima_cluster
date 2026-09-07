@@ -45,7 +45,7 @@ use uc_node::backup::{BackupError, backup_instance, restore_artifact, verify_art
 use uc_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use uc_service::snapshots::SnapshotStore;
-use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine, Tagged};
+use uc_service::{ApplyCtx, ServiceBuilder, ServiceConfig, StateMachine, Tagged};
 
 const SEG_BYTES: u64 = 64 * 1024;
 
@@ -125,6 +125,23 @@ fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
 
 fn open_cnc(dir: &Path, app: &str) -> Arc<CncPage> {
     CncPage::open_file(&dir.join("cnc2.dat"), app).expect("open cnc2.dat")
+}
+
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command a
+/// coordinated instant and return its position **P**, polling through the
+/// `retry` window a leader legitimately answers while it has the role but not
+/// yet an appender. Duplicated per test binary, like `wait_until`.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
 }
 
 fn start_node(dir: &Path, app: &str, purge: PurgePolicy) -> Node {
@@ -233,33 +250,51 @@ fn drive_until_durable_exceeds(node: &Node, target: u64, timeout: Duration) -> u
 /// driver reads (`cnc.snapshots().service_snapshot_pos`) straight, the way
 /// `purge_safety.rs` did before M14a Task 5 introduced the slot-mirroring
 /// indirection for a declared node.
-fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: u64) {
-    let store = SnapshotStore::open(dir, 0).expect("open snapshot store");
-    store
-        .publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
-        .expect("publish snapshot");
-    let cnc = open_cnc(dir, app);
+fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node) -> u64 {
     let before = node.archive_first_base();
+    // Coordinated-snapshot spec §5.5: the floor moves on a COMPLETE SET, not
+    // on a page-1 word a test poked, so the instant is what this helper
+    // drives. This file's node declares NO services
+    // (`ServicesConfig::none_for_tests`), so the set at P is the
+    // `uc2-cluster` agent's artifact alone and completes as soon as that
+    // agent freezes.
+    let p = command_instant(node);
     // Setup precondition, same shape as `purge_safety.rs`'s "need >1 segment
     // below the marker": `Archive::purge_below` is segment-granular and keeps
-    // the block covering `pos`, so the floor can only advance if `pos` lies
-    // beyond the first surviving segment. Assert it here so a too-small `pos`
-    // is a named setup failure, never a silent 120s hang.
+    // the block covering `p`, so the floor can only advance if `p` lies
+    // beyond the first surviving segment. Assert it here so a too-early
+    // instant is a named setup failure, never a silent 120s hang.
     assert!(
-        pos > before + SEG_BYTES,
-        "test setup: snapshot pos {pos} is within one segment of the floor {before} — \
+        p > before + SEG_BYTES,
+        "test setup: instant {p} is within one segment of the floor {before} — \
          nothing below it is purgeable"
     );
+    // The fake ROW-0 artifact, published AT P: `verify_artifact`'s per-id
+    // coverage rule reads the newest artifact in each present directory and
+    // calls anything below the journal floor a hole, so an artifact at a
+    // position below the instant would be exactly that hole. (A real row's
+    // own `freeze()` at P is what puts it here; this file has no service.)
+    let store = SnapshotStore::open(dir, 0).expect("open snapshot store");
+    store
+        .publish(p, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
+        .expect("publish snapshot");
+    let cnc = open_cnc(dir, app);
     debug_assert_eq!(
         cnc.services_declared(),
         0,
         "this fake-service helper writes page 1 directly; only a harness node \
          (nothing declared) leaves page 1 to the test"
     );
-    cnc.snapshots().service_snapshot_pos.store_release(pos);
-    wait_until("purge advanced the floor", || {
-        node.archive_first_base() > before || pos == 0
+    // Observability only since spec §5.3 — kept so `uc2ctl status` and the
+    // backup report read something truthful about this fake row.
+    cnc.snapshots().service_snapshot_pos.store_release(p);
+    wait_until("the set at the instant completed", || {
+        node.snapshot_set_position() >= p
     });
+    wait_until("purge advanced the floor", || {
+        node.archive_first_base() > before
+    });
+    p
 }
 
 fn scratch() -> tempfile::TempDir {
@@ -397,12 +432,11 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     // Deadline-bounded, not a fixed cycle count (see `drive_until_durable_exceeds`'s
     // doc — this is the fix for the flake this test used to hit under load).
     let durable1 = drive_until_durable_exceeds(&node, 3 * SEG_BYTES, Duration::from_secs(120));
-    let pos1 = durable1 / 3;
     assert!(
-        pos1 > SEG_BYTES,
-        "test setup: need >1 segment below the first floor (durable1={durable1} pos1={pos1})"
+        durable1 > SEG_BYTES,
+        "test setup: need >1 segment below the first floor (durable1={durable1})"
     );
-    publish_snapshot_and_wait_for_purge(&dir, app, &node, pos1);
+    publish_snapshot_and_wait_for_purge(&dir, app, &node);
     let first_base_1 = node.archive_first_base();
     assert!(first_base_1 > 0, "first purge must have landed");
 
@@ -438,15 +472,17 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     // copied snapshot's newest position, so the journal copy (taken after)
     // reflects a purge floor the early snapshots/ copy does not cover.
     // Same deadline-bounded-not-fixed-count fix as the pos1 setup above.
-    let durable2 =
-        drive_until_durable_exceeds(&node, newest_copied + SEG_BYTES, Duration::from_secs(120));
-    let pos2 = durable2 - SEG_BYTES; // deep into the log, well past pos1/newest_copied
+    let durable2 = drive_until_durable_exceeds(
+        &node,
+        newest_copied + 2 * SEG_BYTES,
+        Duration::from_secs(120),
+    );
+    let pos2 = publish_snapshot_and_wait_for_purge(&dir, app, &node);
     assert!(
         pos2 > newest_copied,
         "test setup: second floor must overtake the copied snapshot \
          (durable2={durable2} pos2={pos2} newest_copied={newest_copied})"
     );
-    publish_snapshot_and_wait_for_purge(&dir, app, &node, pos2);
     wait_until("first_base overtook the copied snapshot", || {
         node.archive_first_base() > newest_copied
     });
@@ -496,10 +532,7 @@ fn ordered_backup_never_produces_a_hole_under_purge_churn() {
 
     for cycle in 0..5u64 {
         drive_and_quiesce(&node, 3000);
-        let cnc = open_cnc(&dir, app);
-        let durable = cnc.counters().durable.load_acquire();
-        let pos = durable.saturating_sub(SEG_BYTES / 2).max(1);
-        publish_snapshot_and_wait_for_purge(&dir, app, &node, pos);
+        publish_snapshot_and_wait_for_purge(&dir, app, &node);
 
         let out = root.path().join(format!("backup4-out-{cycle}"));
         let report = backup_instance(&dir, &out)
@@ -1191,17 +1224,14 @@ fn two_fsm_purged_node(
     cfg.services = ServicesConfig::from_names(&[RegisterSm::NAME, "fsm1"], None).unwrap();
     let node = Node::start(cfg).expect("node");
     wait_until("serving", || node.can_serve());
-    let policy = SnapshotPolicy {
-        interval_bytes: 32 * 1024,
-    };
-    let s0 = ServiceBuilder::new(
-        ServiceConfig::new(dir, app).snapshot_policy(policy),
-        RegisterSm::default(),
-    )
-    .start_with_snapshots()
-    .expect("snapshot service 0");
+    // Both rows are snapshot-CAPABLE (spec §5.2's status bit) but build
+    // nothing on their own: the 32 KiB byte cadence is deleted, so the purge
+    // this helper waits for follows the instant commanded below.
+    let s0 = ServiceBuilder::new(ServiceConfig::new(dir, app), RegisterSm::default())
+        .start_with_snapshots()
+        .expect("snapshot service 0");
     let s1 = ServiceBuilder::new(
-        ServiceConfig::new(dir, app).snapshot_policy(policy),
+        ServiceConfig::new(dir, app),
         Tagged::<1, RegisterSm>::default(),
     )
     .start_with_snapshots()
@@ -1209,6 +1239,14 @@ fn two_fsm_purged_node(
     let client = Client::connect(dir, app).expect("client");
     let mut v = 0u64;
     let deadline = Instant::now() + Duration::from_secs(60);
+    // Enough traffic that a purge below the instant actually drops a segment,
+    // THEN the instant (spec §5.5): both rows and the cluster FSM freeze at
+    // the same P, the set completes, the floor becomes P, and purge follows.
+    while Instant::now() < deadline && v < 4_000 {
+        v += 1;
+        let _: uc_lincheck::register::CmdResp = client.submit(&RegCmd::Write(v)).expect("write");
+    }
+    command_instant(&node);
     while node.archive_first_base() == 0 {
         assert!(Instant::now() < deadline, "no purge after 60 s");
         v += 1;
@@ -1324,6 +1362,65 @@ fn verify_reports_a_hole_for_the_id_whose_snapshot_is_missing() {
     }
     // A MANIFEST that still claims FSM 1's snapshot is a mismatch too — but
     // the Hole is reported first (coverage before cross-check, as today).
+}
+
+/// Coordinated-snapshot ruling P6: `verify_artifact` checks every row
+/// artifact's 16-byte UC envelope against the position its NAME claims — the
+/// same bytes the service's reconstruction path verifies before it installs.
+/// A name is only a name: a mis-copied backup, or any rename, can present an
+/// artifact built at `P0` under a later `P`, and installing it would leave
+/// every frame in `(P0, P)` unapplied. Verify must catch that here, before an
+/// operator restores it and finds out on a live node.
+#[test]
+fn verify_refuses_a_row_artifact_whose_envelope_disagrees_with_its_name() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "mistag";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 500);
+    let store = SnapshotStore::open(&dir, 0).expect("open snapshot store");
+    let pos = node.counters().durable.load_acquire();
+    store
+        .publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?))
+        .expect("publish snapshot");
+    node.stop();
+
+    let out = root.path().join("mistag-out");
+    backup_instance(&dir, &out).expect("backup_instance");
+    verify_artifact(&out).expect("the untouched artifact verifies");
+
+    // Rename the row artifact so its name claims a later instant than the
+    // envelope inside it.
+    let from = out
+        .join("snapshots")
+        .join("0")
+        .join(format!("snap-{pos}.ultsnap"));
+    let to = out
+        .join("snapshots")
+        .join("0")
+        .join(format!("snap-{}.ultsnap", pos + 64));
+    std::fs::rename(&from, &to).expect("rename the artifact");
+
+    match verify_artifact(&out) {
+        Err(BackupError::SnapshotArtifactCorrupt { path, reason }) => {
+            assert_eq!(path, to);
+            assert!(
+                reason.contains(&format!("built at position {pos}")),
+                "the refusal names both positions: {reason}"
+            );
+        }
+        other => panic!("expected SnapshotArtifactCorrupt, got {other:?}"),
+    }
+
+    // And a truncated artifact is refused by the same check.
+    std::fs::rename(&to, &from).expect("rename back");
+    std::fs::write(&from, b"nope").expect("truncate the artifact");
+    match verify_artifact(&out) {
+        Err(BackupError::SnapshotArtifactCorrupt { .. }) => {}
+        other => panic!("expected SnapshotArtifactCorrupt for a stub file, got {other:?}"),
+    }
 }
 
 // --------------------------------------------------------------------- Test 16

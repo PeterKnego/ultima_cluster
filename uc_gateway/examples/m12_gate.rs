@@ -15,7 +15,7 @@
 //! # bench-infra/scripts/m12_fleet_gate.py (gate rows 2 and 3) and M14d's driver
 //! m12_gate node          --id N --bind A --instance-dir D --members id@addr,… [--admission-kib K] \
 //!                         [--services 0,1] [--fsm-lag lockstep|BYTES] [--purge-below-snapshot] \
-//!                         [--journal-segment-bytes N]
+//!                         [--journal-segment-bytes N] [--snapshot-interval-bytes N]
 //! m12_gate service       --instance-dir D [--envelope on|off] \
 //!                         [--fsm count|spin|raw|fsm<N>] [--work-spin K] [--snapshot-interval-bytes N]
 //! m12_gate edge          --instance-dir D --listen A --members id@gw_addr,… [--envelope on|off] [--inflight N]
@@ -86,8 +86,7 @@ use uc_remote::{
 };
 use uc_service::{
     ApplyCtx, RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig,
-    SessionConfig, Sessioned, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine,
-    TAG_FRESH,
+    SessionConfig, Sessioned, SnapshotError, SnapshotStateMachine, StateMachine, TAG_FRESH,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -204,6 +203,18 @@ struct NodeArgs {
     /// actually drops prefixes inside a 60 s arm.
     #[arg(long, default_value_t = uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES)]
     journal_segment_bytes: u64,
+    /// The cluster's snapshot CADENCE, seeded into `[settings]
+    /// snapshot.interval_bytes` at genesis (coordinated-snapshot spec
+    /// §5.5/§6) — the replicated setting that replaced the per-service byte
+    /// cadence spec §5.2 deleted. Required with `--purge-below-snapshot`;
+    /// ignored without it (purge off = the floor is not being driven).
+    ///
+    /// Defaults to [`DEFAULT_SNAPSHOT_INTERVAL_BYTES`] (`0`, this example's
+    /// pre-branch behaviour). Every gate row states its own number — the
+    /// M14 fleet gate's is 32 MiB — because a driver-picked cadence silently
+    /// changes the experiment behind a published bar.
+    #[arg(long, default_value_t = DEFAULT_SNAPSHOT_INTERVAL_BYTES)]
+    snapshot_interval_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -232,11 +243,16 @@ struct ServiceArgs {
     /// the deliberately slow FSM. Only valid with `--fsm spin`.
     #[arg(long, default_value_t = 0)]
     work_spin: u64,
-    /// M14d row f: `SnapshotPolicy { interval_bytes }` on the service so the
-    /// leader has artifacts to ship. `0` = no snapshots — `start()`, byte-for-
-    /// byte every prior arm. `> 0` runs `start_with_snapshots()` (typed tier
-    /// only: `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
+    /// M14d row f: make the service snapshot-CAPABLE so the leader has
+    /// artifacts to ship. `0` = no snapshots — `start()`, byte-for-byte every
+    /// prior arm. `> 0` runs `start_with_snapshots()` (typed tier only:
+    /// `CountSm`/`SpinCountSm` and their `Sessioned<_>` wrap are all
     /// `SnapshotStateMachine`); paired with `--fsm raw` it is refused by name.
+    ///
+    /// The BYTE VALUE no longer sets a cadence: coordinated-snapshot spec §5.2
+    /// deleted the per-service byte interval, and instants are commanded by
+    /// the leader. The flag is kept as the capability switch until Task 5
+    /// wires the command.
     #[arg(long, default_value_t = 0)]
     snapshot_interval_bytes: u64,
 }
@@ -517,13 +533,18 @@ impl SnapshotStateMachine for CountSm {
         }
         let count = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.count = count;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
@@ -615,6 +636,23 @@ const DEFAULT_ADMISSION_BYTES: u64 = 256 * 1024;
 const FLEET_BUFFER_BYTES: usize = 256 << 20;
 const ELECTION_TIMEOUT_MIN_NS: u64 = 150_000_000;
 const ELECTION_TIMEOUT_MAX_NS: u64 = 300_000_000;
+/// The `node` role's DEFAULT snapshot cadence (coordinated-snapshot spec
+/// §5.5/§6), seeded into the replicated settings record at genesis.
+///
+/// **`0` = no cadence, matching this example's pre-branch behaviour** (see
+/// `git show 627eb4e:uc_gateway/examples/m12_gate.rs` — the flag lived on the
+/// `service` role, defaulted to `0`, and configured the per-service byte
+/// cadence that spec §5.2 has since deleted). It is deliberately NOT a
+/// hardcoded number: this example is a GATE DRIVER, and a driver that picks
+/// a cadence its caller did not ask for silently changes the experiment
+/// behind a published bar. It briefly did — a hardcoded 32 KiB (`m6_gate`'s
+/// and `m9_gate`'s smoke number) applied whenever `--purge-below-snapshot`
+/// was set, which under the M14 gate's load is ~1024× more often than
+/// `m14_fleet_gate.py`'s 32 MiB and degenerates into continuous
+/// freeze-and-abandon. Every caller that wants a cadence now states the
+/// number: `--snapshot-interval-bytes`, which `node_role` requires whenever
+/// purge is on (see its `ensure!`).
+const DEFAULT_SNAPSHOT_INTERVAL_BYTES: u64 = 0;
 
 /// A distinct, index-derived election seed per node so a clean boot elects
 /// exactly one leader (m5_gate / lincheck_v2 precedent).
@@ -634,6 +672,7 @@ fn node_config(
     services: ServicesConfig,
     purge: uc_node::PurgePolicy,
     journal_segment_bytes: u64,
+    snapshot_interval_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -644,7 +683,14 @@ fn node_config(
         buffer_bytes,
         max_payload: NODE_MAX_PAYLOAD,
         admission_bytes_default: admission_bytes,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Coordinated-snapshot spec §5.5/§6: the snapshot CADENCE is a
+        // replicated setting, seeded at genesis. Row f's purge arm needs
+        // instants to happen at all — the per-service byte cadence that used
+        // to produce them is deleted (spec §5.2).
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            snapshot_interval_bytes,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         election_timeout_min_ns: ELECTION_TIMEOUT_MIN_NS,
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),
@@ -721,6 +767,7 @@ where
             ServicesConfig::single(S::NAME),
             uc_node::PurgePolicy::Disabled,
             uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            0, // purge off in the local smoke: no cadence either
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id), make_sm())
@@ -779,6 +826,7 @@ fn boot_cluster2(
             services,
             uc_node::PurgePolicy::Disabled,
             uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            0, // purge off in the local smoke: no cadence either
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let a = ServiceBuilder::new(
@@ -1698,6 +1746,17 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         })
         .collect();
     let id = a.id;
+    // A gate driver must never leave a bar's cadence implicit: with purge on
+    // and no cadence there are no instants at all, the purge floor never
+    // moves, and row f's late joiner is never below it — a silently different
+    // experiment, in the other direction from the hardcoded 32 KiB this
+    // replaced.
+    anyhow::ensure!(
+        !a.purge_below_snapshot || a.snapshot_interval_bytes > 0,
+        "--purge-below-snapshot needs --snapshot-interval-bytes N: without a cadence no \
+         SNAPSHOT instant is ever commanded, so the purge floor never moves (state the \
+         number the gate row is measuring — m14_fleet_gate.py's is 32 MiB)"
+    );
     let services = services_from_flags(a.services.as_deref(), a.fsm_lag.as_deref())?;
     let purge = if a.purge_below_snapshot {
         uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 }
@@ -1715,6 +1774,15 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
         services,
         purge,
         a.journal_segment_bytes,
+        // The cadence pairs with purge: without instants the floor never
+        // moves and row f's late joiner is never below it. The number comes
+        // from the CALLER (`--snapshot-interval-bytes`), never from this
+        // file — see [`DEFAULT_SNAPSHOT_INTERVAL_BYTES`].
+        if a.purge_below_snapshot {
+            a.snapshot_interval_bytes
+        } else {
+            0
+        },
     );
     let node = Node::start(cfg)?;
     println!(
@@ -1726,13 +1794,13 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
     // cnc page. On a healthy throughput run it must stay 0. M14d adds the
     // snapshot-session refusal counters (below-floor joins the node had to
     // turn away).
-    let mut last = (u64::MAX, (u64::MAX, u64::MAX, u64::MAX));
+    let mut last = (u64::MAX, (u64::MAX, u64::MAX, u64::MAX, u64::MAX, u64::MAX));
     loop {
         let now = (node.reports_unattested(), node.snapshot_session_refusals());
         if now != last {
             println!(
-                "m12_gate node {id} stats: reports_unattested={} snap_refusals=({},{},{})",
-                now.0, now.1.0, now.1.1, now.1.2
+                "m12_gate node {id} stats: reports_unattested={} snap_refusals=({},{},{},{},{})",
+                now.0, now.1.0, now.1.1, now.1.2, now.1.3, now.1.4
             );
             last = now;
         }
@@ -1742,10 +1810,9 @@ fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------- service role
 
-/// M14d T2 fix round 1: `ServiceBuilder::start()` never reads
-/// `cfg.snapshot_policy` — only `start_with_snapshots()` spawns the M6
-/// builder thread that trips it (`uc_service/src/lib.rs:199-291`, the same
-/// method `m6_gate.rs` uses). Shared by the four typed arms below (raw arms
+/// M14d T2 fix round 1: only `start_with_snapshots()` spawns the M6 builder
+/// thread and declares the row snapshot-capable (`uc_service/src/lib.rs`, the
+/// same method `m6_gate.rs` uses); plain `start()` can never snapshot. Shared by the four typed arms below (raw arms
 /// keep plain `start()`; `--fsm raw` + `--snapshot-interval-bytes` is refused
 /// by name before this is ever reached).
 fn start_typed_svc<S: SnapshotStateMachine>(
@@ -1820,12 +1887,15 @@ fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
         !(matches!(kind, FsmKind::Raw) && a.snapshot_interval_bytes > 0),
         "--fsm raw and --snapshot-interval-bytes are exclusive: RawCountSm is not a SnapshotStateMachine"
     );
-    let mut cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
-    if a.snapshot_interval_bytes > 0 {
-        cfg = cfg.snapshot_policy(SnapshotPolicy {
-            interval_bytes: a.snapshot_interval_bytes,
-        });
-    }
+    // On the SERVICE role `--snapshot-interval-bytes` now only selects
+    // `start_with_snapshots()` below, i.e. snapshot-CAPABLE
+    // (coordinated-snapshot spec §5.2's cnc status bit) — any positive value
+    // means the same thing. The cadence it used to configure lives in the
+    // replicated settings record and is seeded by the NODE role's flag of the
+    // same name, reaching this row as a `SNAPSHOT` frame. Passing the same
+    // number to both roles (as `m14_fleet_gate.py` does) keeps the two
+    // readings of the flag consistent.
+    let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
     let envelope = a.envelope == Envelope::On;
     let snapshots = a.snapshot_interval_bytes > 0;
     let tag = format!(

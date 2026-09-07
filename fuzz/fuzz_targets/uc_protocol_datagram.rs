@@ -21,6 +21,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = read_config_reply_body(body);
     let _ = read_snap_begin_body(body);
     let _ = read_snap_nak_body(body);
+    let _ = read_snap_request_body(body);
+    let _ = read_snap_redirect_body(body);
     let _ = read_request_vote_body(body);
     let _ = read_vote_body(body);
     let _ = read_nak_body(body);

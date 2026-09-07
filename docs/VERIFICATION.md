@@ -193,9 +193,8 @@ toolchain to ≥ v4.32.0.
 
 A virtual-time cluster driving the *real* `ElectionSm` — `world.rs` wires
 `uc_consensus` directly, so a fix in the consensus crate is automatically
-reflected rather than mirrored by hand. Seeded fault fuzz with eleven whole-cluster
-safety invariants swept after **every** event (inv11, *set alignment*, belongs
-to the coordinated-snapshot work and is not in the tree):
+reflected rather than mirrored by hand. Seeded fault fuzz with **twelve**
+whole-cluster safety invariants swept after **every** event:
 
 | | Invariant |
 |---|---|
@@ -209,6 +208,7 @@ to the coordinated-snapshot work and is not in the tree):
 | inv8 | Revert correctness after truncation settles |
 | inv9 | Tombstone permanence |
 | inv10 | Report ceiling — a clamped report never exceeds its unclamped value or its apply ceiling, and never decreases except across a truncation, restart, role change or ceiling change (M14b) |
+| inv11 | Set alignment — no node lists a complete snapshot set above its own `commit`; every listed instant is a `SNAPSHOT` frame inside the cluster-wide committed prefix; and an instant two nodes both list names the **same** frame (`2.11.0`, coordinated-snapshot spec §5.3/§5.4) |
 | inv12 | Two readers — the cluster FSM's membership is always a **committed prefix** of the consensus kernel's durable-time config (`2.11.0`, cluster-FSM spec §4.6) |
 
 Directed scenarios stage specific historical bugs as permanent regression pins —
@@ -262,6 +262,32 @@ adoption; its red twin
 `counterfactual_unheld_config_observation_breaks_inv8` deletes the hold
 (`config_obs_latch_buffer = false`, the pre-fix node) and pins that inv8
 fires at the ack.
+
+**Set alignment (`2.11.0`, inv11).** A coordinated snapshot instant is a
+`SNAPSHOT` frame whose frame-END position P every row freezes at, and the node
+that completes the whole set at P moves its purge floor there. inv11 is the
+oracle for that: it indexes sets **by frame end** and judges three things —
+nothing listed above the node's own commit (a row can only freeze at a
+position it has applied, and apply is gated on `min(commit, durable)`, so a
+set above commit would claim a floor with uncommitted bytes under it); every
+listed instant is a real `SNAPSHOT` frame inside the cluster-wide **genuine**
+committed frontier (so a truncated instant is never a set); and two nodes
+listing the same P must mean the same frame.
+
+It is deliberately **not** a prefix rule between nodes, which is what §11 of
+the spec first sketched: abandonment (a superseding instant) and a row that
+declines one both make `[P1, P2]` on one node and `[P2]` on another entirely
+legitimate. A prefix rule would have failed on correct behaviour.
+`check_set_alignment` carries the argument in full. All three fuzz arms of the
+default tier and the heavy tier's 5-node arm **command instants** — 5 646 of
+them over the 150 default-tier runs and ~38 000 more over the heavy tier, with
+16 549 completed sets judged in the default tier alone and inv11 firing zero
+times — because an invariant nothing exercises is green for the wrong reason.
+A directed scenario stages a `SNAPSHOT` frame truncated by a leader change;
+its red twin (a world model that lists a truncated instant as a set) is caught
+by the scenario's own per-step assertion rather than by inv11, since a listed
+P is by construction at or below `global_max_commit` and inv4 already forbids
+truncating there.
 
 **Two readers (`2.11.0`, inv12).** Membership is carried by one frame and read
 by two consumers at two different time bases: the consensus kernel at
@@ -407,15 +433,36 @@ volume, with the timer mechanics driven through the public SDK.
 | `a_scheduled_timer_fires_at_its_deadline_in_order_and_once`, `the_log_time_seed_survives_a_restart_of_the_same_instance_dir`, `the_timer_bound_holds_client_frames_for_a_pass`, `a_timer_in_flight_at_a_leader_change_fires_late_and_is_delivered_once`, `a_schedule_table_ticks_exactly_once_per_deadline_and_advances_from_the_tick`, `a_restarted_node_resumes_the_table_with_one_catch_up_tick`, `a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads` | `uc_node/tests/timers.rs` | one timer fires once at its deadline in pass order and a cancelled one never fires; the cnc log-time word survives a restart of the same instance dir; more than `TIMERS_PER_PASS` due at one instant holds every client frame for a pass and still fires on time; an instance in flight at a leader change is delivered exactly once — late or on time, never twice, never at diverging positions; an applied schedule table ticks once per occurrence and advances from the tick while its `once` entry parks; five periods of downtime are caught up by **one** tick with the already-delivered `once` not re-delivered; and a joiner that was below the purge floor, once promoted and leading, keeps the schedule ticking |
 | `timers_pending_on_the_old_leader_fire_exactly_once_on_the_new_one_after_its_announce` (cluster FSM) | `uc_node/tests/timers.rs` | the **leader-only heap** (cluster-FSM spec §4.9): three nodes, two instances armed on the leader, the leader crashed with both in flight. Every follower's per-row `timers_pending` cnc word reads `0` across a settle window while the leader's reads `2` — a live reading, republished every pass — and the new leader's rising-edge **announce** rebuilds the whole set and fires it exactly once, with every surviving service's fired record compared as a whole struct so positions, stamps and lateness must agree. Watched red by inverting the §4.9 half in place |
 | `a_fresh_learner_below_the_floor_installs_the_leaders_schedule_table`, `a_leader_without_a_table_ships_none_and_the_joiner_installs_none`, `a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_installs_the_table` | `uc_node/tests/learner.rs` | a real leader + joiner `Node` pair over loopback UDP, under purge: a joiner **below the purge floor** installs the cluster's schedule table off the snapshot session's cluster artifact; a leader holding no table ships none and the joiner installs none rather than keeping a stale one; and — the residual this work exists to close — a leader **restarted before its first commit advance** still ships the committed table, because the artifact is committed by construction rather than gated on a counter that is zeroed at boot |
+| `a_commanded_instant_freezes_every_row_at_one_position_under_load_and_ordering_holds` (coordinated snapshots) | `uc_node/tests/timers.rs` | one node, **two** declared rows (a `Timed<ClockSm>` and a raw byte-sink `SumSm`) under a real client load loop mixing commands and timers. Three commanded instants, each asserted on four axes: both rows' `snapshot_pos`, the cluster artifact's position and `snapshot_set_position` all equal **one** P; `snapshot_instants_abandoned()` is unchanged, so the set completed on the **first** attempt (the bar ruling P10 makes reachable); commit keeps moving past each P, so the freeze did not park the pipeline; and the whole log is re-walked through `uc_sim::timers::check_frames`, so the §4.3 timer ordering oracle runs over a log carrying `SNAPSHOT` frames. Documented limitation: rule 5 of that oracle is **vacuous** here — it keys on a pass-start stamp a reader outside the node cannot see, and any boundary inferred from the frame sequence would be inferred from the very ordering rule 5 exists to check; rules 1–4 are what this row genuinely runs, and rule 5 stays owned by the in-crate differential test |
+| `a_standby_instant_freezes_only_the_learner_and_voters_applied_keep_moving` (coordinated snapshots) | `uc_node/tests/learner.rs` | 3 voters + 1 learner, a **real** `SumSm` service on all four (a declared row with no service attached cannot freeze either way, so a faked fixture would assert nothing). The learner's set completes at P; every voter's `snapshot_pos`, `snapshot_set_position` and `freeze_ns` are still `0` — it never ran `freeze()` — and every voter's `applied` advances past P under fresh load, asserted **after** that load rather than before it |
+| `a_voter_fetches_a_learners_set_store_only_and_its_floor_moves` (coordinated snapshots) | `uc_node/tests/learner.rs` | the same fixture plus a standby instant, then `request_fetch` on a **follower** voter (the verb is node-local and never forwarded). Negative first: a position above durable is `Err(AboveDurable)` — wire reason 50. Then both artifacts land by name under the voter's own instance dir; its `applied` is sampled on every iteration of the completion wait with a running high-water mark, so an install-then-replay could not hide inside one sample; and its floor moves — `snapshot_set_position == snapshot_fetched_position == P`, and the persisted `node_snapshot_floor` follows, with `snapshot_session_refusals()` still `(0,0,0,0,0)` |
+| `a_joiner_below_the_voters_floor_is_redirected_to_the_learner` (coordinated snapshots) | `uc_node/tests/learner.rs` | a voter whose floor-set artifacts are **deleted** — the test names it for what it is, a node restored from a backup taken before its own floor — plus a learner holding a standby set, and a fresh joiner starting from 0 below the purged prefix. The leader's `snap_redirects` counter rises, the joiner records `snapshot_redirect_followed` naming the learner and P and then `snapshot_installed`, its `archive_first_base` shows it adopted the shipped floor rather than replaying from 0, and the **learner's** session counter is what moved. The load-bearing red is skipping the deletion: the joiner then converges off the leader's own intact set and the redirect assertion fires |
 | `a_uc_prefixed_fsm_name_is_reserved_and_refused_by_name` | `uc_node/tests/services.rs` | the `uc_` reservation, refused at the door with the name in the message |
 | `daemon_refuses_a_services_fsm_lag_pointing_at_settings_apply` and its siblings | `uc_node/tests/daemon_refusals.rs` | the **real `uc2-node` binary** refuses a top-level `admission_bytes`, a `[services] fsm_lag` and `names = ["uc_cluster"]` by name with exit 2, each pointing at `uc2ctl settings apply` or at the reservation — and **starts** with the same two keys under `[settings]`, observed as a bounded poll for its cnc page and its own `node_listening`/`stopped` records |
 
 One more pin, from the M14d row-d lesson —
-`snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a `SnapshotPolicy`
-shortens a service restart **only together with purge, and only once the live
-log buffer has wrapped past `start_pos`**; below the wrap a restart reads the
+`snapshot_restart_installs_only_with_purge` (`lin_v2.rs`): a snapshot shortens
+a service restart **only together with purge, and only once the live log
+buffer has wrapped past `start_pos`**; below the wrap a restart reads the
 still-live ring and touches neither the journal nor a snapshot, whatever the
-purge posture.
+purge posture. Since coordinated snapshot instants (`2.11.0`) it commands one
+instant in the middle of its writes rather than configuring a per-service byte
+interval, so P is a frame end and everything above it is the tail the restarted
+service must replay.
+
+**The churn capstones command instants (`2.11.0`).**
+`linearizable_under_purge_and_snapshot_churn`, its `_with_crypto` twin, and
+both two-FSM arms drove their purge with `SnapshotPolicy { interval_bytes }`
+before; they now call `cluster.command_instant()` once per fault tick, before
+the fault, so an instant is commanded while the cluster is still whole. It is
+best-effort by design — `command_instant` answers `None` on "no serving
+leader", which in a fault loop is the normal case — and the loops' existing
+`max_archive_first_base() > 0` gate is what adjudicates whether enough of them
+landed. A genesis `snapshot_interval_bytes` cadence was rejected for these:
+it re-bases to the leader's append frontier at every leader open, and these
+capstones kill the leader roughly every 1.2 s, so it would often never fire —
+and what it exercised would be the cadence, not the commanded instant the
+purge depends on.
 
 ```bash
 cargo test --workspace          # includes the capstones
@@ -528,6 +575,24 @@ rebuilt entirely by journal replay of `TIMER` frames — the reconstruction path
 the in-process capstones never cross a process boundary on — and is checked
 by the same `uc_lincheck::timer::assert_timer_report` oracle §3 uses.
 
+**Snapshot instants (`2.11.0`).**
+`snapshot_instant_abandoned_on_service_sigkill_mid_build_and_the_next_completes`
+runs a real two-row node process under three worker threads' load, commands an
+instant `P1` through the cnc admin band, waits for a sentinel the row-1 service
+writes as it **enters** `freeze()` — so the `kill -9` is inside the build by
+construction, not by timing luck — and kills it there. A causality gate then
+waits out the whole freeze window and asserts row 1 published nothing at `P1`
+and the set at `P1` is still incomplete; **that gate exists because the test
+passed once with the SIGKILL removed**, the artificial slow freeze alone having
+produced the abandonment. `P2` is commanded while the row is down and
+supersedes; the row is respawned and caught up; `P3` completes the set. Final
+counts are asserted exactly — `(abandoned, row0_incomplete, row1_incomplete) ==
+(2, 0, 2)`, two rather than one because a catching-up row reaches `P1` first
+and declines `P2` as busy, which is spec §10 behaviour — and both FSMs'
+histories are still `Linearizable` with `equiv == 0`. The slow-freeze wrapper
+lives in the crashtest crate only and is opt-in (`--snapshots`), so all six
+pre-existing hard-crash tests attach byte-for-byte as before.
+
 ```bash
 cargo test -p uc_crashtest --features hard-crash-tests
 ```
@@ -599,7 +664,7 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The twenty targets
+### The twenty-two targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
@@ -623,6 +688,7 @@ takes the process down. Availability is the thing being defended here.
 | `uc_node_toml` | `uc_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
 | `uc_gateway_toml` | `uc_gateway::config_file::parse_str` — the gateway's whole named-refusal path, including its own `EdgeConfig::validate`. |
 | `uc_node_http` | `uc_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
+| `uc_service_snapshot_envelope` | coordinated snapshots — `uc_service::snapshots::decode_snapshot_envelope`, the 16-byte `ULTSNAP1` header every artifact file now begins with. A pure decoder, total on any slice, and the one check standing between a renamed or mis-copied artifact and an install that would silently leave a span of frames unapplied. |
 | `uc_node_cluster_artifact` | `ClusterFsm::install_snapshot` — the cluster IMAGE a below-floor joiner installs **by fiat** off a snapshot session, and a restarting node reads off disk. CRC32 is a checksum, not a MAC, so every length-prefixed read behind it is attacker-chosen. |
 
 ### Method
@@ -630,7 +696,7 @@ takes the process down. Availability is the thing being defended here.
 Seeds are generated from fixed literals by the real encoders (`cargo +nightly
 run --bin seed-corpus`), so the committed corpus is deterministic and a corpus
 change is reviewable in a diff. Nightly CI runs every target for **600 seconds**
-on that corpus across five matrix legs; a crash fails the leg and uploads the
+on that corpus across six matrix legs; a crash fails the leg and uploads the
 artifact. The `fuzz-groups` job asserts the legs' union is exactly the set of
 declared targets, so a new target cannot be silently left unfuzzed.
 
@@ -826,7 +892,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (five legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (six legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---
@@ -877,6 +943,35 @@ The most important section, and the one most projects omit.
   the shape that would index out of bounds without the decoder's `.get(..)`
   checks. The `CLUSTER` frame body and the settings record it wraps have
   their own targets (`uc_protocol_cluster_frame`, `uc_protocol_settings`).
+- **The §4.3 timer oracle's rule 5 is vacuous over the new instants row.**
+  `a_commanded_instant_freezes_every_row_at_one_position_under_load_and_ordering_holds`
+  (§3) re-walks a whole log carrying `SNAPSHOT` frames through
+  `uc_sim::timers::check_frames`, but rule 5 keys on the appender's high-water
+  mark when the producing leader pass **began**, and a reader outside the node
+  cannot see a pass boundary. The row therefore uses the only sound bound the
+  log alone gives — the previous frame's stamp, never below the true
+  pass-start stamp — which makes rule 5's "legitimately late" escape hatch
+  always fire. Rules 1–4 are what it genuinely runs. This was chosen over
+  inferring boundaries from the frame sequence, because the natural heuristic
+  ("a `Timer` after a `Client` starts a new pass") re-authorises exactly the
+  bug rule 5 exists to catch. Rule 5 over a real leader pass stays owned by
+  the in-crate differential test.
+- **Coordinated snapshots have no fleet numbers.** The freeze-vs-commit-stall
+  argument — a quorum frozen at P caps every durable report at `P + fsm_lag`,
+  which is the reason standby instants exist — is reasoning plus in-process
+  assertions that commit keeps moving on a small state. It is not yet a
+  measurement. Three rows are owed to the time-and-timers gate's throughput
+  arm: instants under load (A/B'd per M14a), a below-floor join with the
+  shipper restarted mid-window, and freeze duration against observed commit
+  pause on a deliberately large state, all-nodes then `--standby`.
+- **"The instant completed on the first attempt" is not constructible as a
+  watched red.** `instant_completes_first_try`'s bar and `learner.rs`'s
+  `attempt == 1` fire only on a regression of ruling P10 (a replayed span
+  acting on its last `SNAPSHOT` frame), so they were shipped without a red
+  twin and stated as such. The corollary is that they are a flakiness surface
+  across seven pre-existing `learner.rs` tests: a §10 abandonment on a loaded
+  box now fails loudly instead of retrying, which is the intent, but the
+  failure mode should be recognised for what it is.
 - **The leader pass is checked for ORDERING, not for which occurrence fires.**
   The differential test in §2 puts `uc_sim`'s §4.3 oracle on the real pass, so
   the mirror can no longer drift on stamp ordering, monotonicity or lateness

@@ -55,8 +55,7 @@ use uc_net::fault::FaultConfig;
 use uc_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_service::{
-    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine,
-    StateMachine,
+    ApplyCtx, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotStateMachine, StateMachine,
 };
 
 // ------------------------------------------------------------------ CLI
@@ -236,13 +235,18 @@ impl SnapshotStateMachine for RegSm {
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.value = v;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
@@ -255,6 +259,11 @@ const BUFFER_BYTES: usize = 1 << 22;
 /// Small journal segments + snapshot cadence so purge actually drops prefixes
 /// under the modest smoke workload (mirrors the lin_v2 purge capstone).
 const SEGMENT_BYTES: u64 = 16 * 1024;
+/// The cluster's snapshot CADENCE (coordinated-snapshot spec §5.5/§6): the
+/// leader commands an instant every this many bytes of appended log. Seeded
+/// into the replicated settings record at genesis (`make_config`) — the
+/// per-service byte cadence M6 used is deleted (spec §5.2), and this is its
+/// replacement: one number, cluster-wide, whichever node leads.
 const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
 
 fn seed_for(id: NodeId) -> u64 {
@@ -298,7 +307,10 @@ fn make_config(
         buffer_bytes: BUFFER_BYTES,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            snapshot_interval_bytes: SNAPSHOT_INTERVAL_BYTES,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(id),
@@ -311,9 +323,10 @@ fn make_config(
 }
 
 fn spawn_service(dir: &std::path::Path) -> uc_service::Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, APP).snapshot_policy(SnapshotPolicy {
-        interval_bytes: SNAPSHOT_INTERVAL_BYTES,
-    });
+    // Snapshot-CAPABLE (spec §5.2's cnc status bit) and nothing more: the row
+    // builds an artifact only at an instant the leader commands, which here
+    // is the replicated cadence seeded in `make_config`.
+    let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
         .expect("snapshot service start")

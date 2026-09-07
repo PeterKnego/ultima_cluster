@@ -238,14 +238,21 @@ impl uc_service::SnapshotStateMachine for TimerSm {
         let (sm, _) =
             bincode::serde::decode_from_slice::<TimerSm, _>(&buf, bincode::config::standard())
                 .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
-        if sm.last.unwrap_or(0) != position {
+        // Coordinated-snapshot spec §5.2: the tag is the INSTANT **P** — the
+        // frame-END of the `SNAPSHOT` frame, an EXCLUSIVE frontier: the image
+        // covers every frame BELOW P, and a user frame usually starts exactly
+        // AT P. So the payload's own position may be below the tag (never
+        // above — that would be a genuinely mis-tagged artifact), and the
+        // restored `last_applied` must be the cursor the artifact RECORDED,
+        // not the tag: the framework's `pos > last_applied` idempotency guard
+        // would otherwise swallow the frame at P.
+        if sm.last.unwrap_or(0) > position {
             return Err(uc_service::SnapshotError::Codec(format!(
-                "snapshot payload position {} != requested {position}",
+                "snapshot payload position {} is above the artifact tag {position}",
                 sm.last.unwrap_or(0)
             )));
         }
-        *self = sm;
-        self.last = Some(position);
+        *self = sm; // including the cursor the artifact recorded
         Ok(position)
     }
 }

@@ -41,9 +41,10 @@
 //! while purge is running concurrently:
 //!
 //! > first_base only advances (purge), the newest snapshot position only
-//! > advances (publish is atomic, retention keeps the newest 2, and purge
-//! > only runs below a durably persisted floor that some retained snapshot
-//! > covers) — so a snapshot copied AFTER the journal always covers any purge
+//! > advances (publish is atomic; the node's set retention deletes only
+//! > BELOW the complete set at its floor, so the set the floor names is
+//! > always retained; and purge only runs below that durably persisted
+//! > floor) — so a snapshot copied AFTER the journal always covers any purge
 //! > that happened BEFORE the journal copy. The reverse order can capture a
 //! > snapshot set from before a purge that the journal copy then reflects: a
 //! > hole.
@@ -237,6 +238,15 @@ pub enum BackupError {
     /// name.
     #[error("corrupt cluster artifact {path}: {reason}")]
     ClusterArtifactCorrupt { path: PathBuf, reason: String },
+    /// Coordinated-snapshot ruling P6: a row's `snap-<pos>.ultsnap` does not
+    /// carry a valid UC envelope for the position its NAME claims — it is
+    /// truncated, is not a UC artifact, or was built at a DIFFERENT instant
+    /// (a mis-copied or renamed file). Verify reads the same 16 bytes the
+    /// service's reconstruction path checks before installing, so an artifact
+    /// that verifies here is one a restored node can actually install —
+    /// the same posture the cluster family has had through its own decoder.
+    #[error("corrupt snapshot artifact {path}: {reason}")]
+    SnapshotArtifactCorrupt { path: PathBuf, reason: String },
     /// `verify_artifact`'s target does not look like a backup artifact
     /// (missing `journal/`, `state/`, one of the five `state/*.state` files,
     /// or a `state/*.state` file that fails to decode on BOTH slots).
@@ -362,8 +372,8 @@ fn cluster_snapshots_dir(root: &Path) -> PathBuf {
 ///
 /// # Retrying the WHOLE directory on a vanished source file
 ///
-/// `src` may be live under our feet: `journal/`'s purge and `snapshots/`'s
-/// keep-newest-2 retention both unlink files while the node keeps running,
+/// `src` may be live under our feet: `journal/`'s purge and the node's
+/// below-the-set snapshot retention both unlink files while the node runs,
 /// and a backup taken under load races both by design (this module's whole
 /// premise). If a file we already listed vanishes before its `fs::copy` runs
 /// (`io::ErrorKind::NotFound`), this does NOT skip just that name and
@@ -392,7 +402,8 @@ fn cluster_snapshots_dir(root: &Path) -> PathBuf {
 /// A retried copy is equivalent to having simply started that part of the
 /// backup a little LATER — which the ordering rule (module doc) already
 /// covers: `first_base` only ever advances (purge) and the newest retained
-/// snapshot position only ever advances (atomic publish, keep-newest-2), so
+/// snapshot position only ever advances (atomic publish; retention deletes
+/// only BELOW the complete set at the floor), so
 /// a later start can only make the coverage invariant easier to satisfy, not
 /// harder. Retries are bounded (not unbounded) because purge/retention
 /// cadence tracks SNAPSHOT cadence — orders of magnitude slower than copying
@@ -631,7 +642,12 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     open_state_readonly::<ConfigRecord>(&state_dir(artifact).join("config.state"))?;
 
     // 3. Snapshots: per id present, the newest complete `snap-<pos>.ultsnap`.
+    // Every one of them also has its UC envelope checked against the position
+    // its name claims (ruling P6) — the same 16 bytes the service verifies
+    // before it installs, so "verified" means "installable", not "a file of
+    // the right name exists".
     let (newest_snapshots, snapshot_files) = scan_snapshot_tree(artifact)?;
+    check_row_artifacts(artifact)?;
 
     // 3b. The CLUSTER family (spec §4.7): the newest complete
     // `snap-<pos>.ultcluster`, decoded through the SAME `install_snapshot`
@@ -873,6 +889,63 @@ fn scan_snapshots(dir: &Path, parse: fn(&str) -> Option<u64>) -> io::Result<(Opt
         newest = Some(newest.map_or(pos, |n| n.max(pos)));
     }
     Ok((newest, count))
+}
+
+/// Coordinated-snapshot ruling P6: check EVERY row artifact's 16-byte UC
+/// envelope against the position its file name claims.
+///
+/// The name is the only thing `scan_snapshots` (and the service's `newest`)
+/// has to go on, and a name is only a name: a mis-copied backup or a rename
+/// can present an artifact built at `P0` under a later `P`, and installing it
+/// would leave every frame in `(P0, P)` unapplied — a silent state gap. The
+/// service refuses that at install time; verify refuses it here, before an
+/// operator restores the artifact and finds out on a live node.
+fn check_row_artifacts(root: &Path) -> Result<(), BackupError> {
+    use std::io::Read as _;
+    for id in snapshot_ids_present(root)? {
+        let dir = snapshots_dir(root).join(id.to_string());
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(pos) = parse_snap_pos(name) else {
+                continue; // `.tmp`/`.part` and anything else: not an artifact
+            };
+            let path = entry.path();
+            let mut head = [0u8; uc_service::snapshots::SNAPSHOT_ENVELOPE_LEN];
+            let mut f = fs::File::open(&path)?;
+            let mut n = 0usize;
+            while n < head.len() {
+                match f.read(&mut head[n..]) {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(e) => return Err(BackupError::Io(e)),
+                }
+            }
+            match uc_service::snapshots::decode_snapshot_envelope(&head[..n]) {
+                Ok(built) if built == pos => {}
+                Ok(built) => {
+                    return Err(BackupError::SnapshotArtifactCorrupt {
+                        path,
+                        reason: format!(
+                            "built at position {built} but named {pos} \
+                             (a renamed or mis-copied artifact)"
+                        ),
+                    });
+                }
+                Err(e) => {
+                    return Err(BackupError::SnapshotArtifactCorrupt {
+                        path,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Cluster FSM (spec §4.7): decode `snapshots/cluster/snap-<pos>.ultcluster`

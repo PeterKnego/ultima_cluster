@@ -69,8 +69,9 @@ impl uc_service::StateMachine for RegisterSm {
 // The optional snapshot capability (M6): what lets the L3 harness drive the
 // REAL purge path. `SnapshotHandle = Vec<u8>` (bincode of `(value,
 // last_applied)`). `install_snapshot` takes the target `position` (the artifact
-// tag) and asserts the payload's recorded position matches (belt-and-suspenders
-// against a mis-tagged artifact).
+// tag) and asserts the payload's recorded position does not EXCEED it
+// (belt-and-suspenders against a mis-tagged artifact; the tag is an exclusive
+// frontier since coordinated instants, so equality is no longer the rule).
 #[cfg(feature = "v2")]
 impl uc_service::SnapshotStateMachine for RegisterSm {
     type SnapshotHandle = Vec<u8>;
@@ -104,16 +105,22 @@ impl uc_service::SnapshotStateMachine for RegisterSm {
             bincode::config::standard(),
         )
         .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
-        // The payload's recorded position must match the artifact tag we were
-        // asked to land at.
-        if la.unwrap_or(0) != position {
+        // Coordinated-snapshot spec §5.2: the tag is the INSTANT **P** — the
+        // frame-END of the `SNAPSHOT` frame, an EXCLUSIVE frontier: the image
+        // covers every frame BELOW P, and a user frame usually starts exactly
+        // AT P. So the payload's own position may be below the tag (never
+        // above — that would be a genuinely mis-tagged artifact), and the
+        // restored `last_applied` must be the cursor the artifact RECORDED,
+        // not the tag: the framework's `pos > last_applied` idempotency guard
+        // would otherwise swallow the frame at P.
+        if la.unwrap_or(0) > position {
             return Err(uc_service::SnapshotError::Codec(format!(
-                "snapshot payload position {} != requested {position}",
+                "snapshot payload position {} is above the artifact tag {position}",
                 la.unwrap_or(0)
             )));
         }
         self.value = v;
-        self.last_applied = Some(position);
+        self.last_applied = la;
         Ok(position)
     }
 }

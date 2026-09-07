@@ -196,14 +196,33 @@ fn linearizable_under_failover_v2() {
 // -------------------------------------------------- capstone under purge (M6)
 
 /// The M6 milestone's heart: the SAME capstone workload + WGL oracle, but every
-/// node runs snapshot-backed **purge** (tiny journal segments + a 64 KiB snapshot
-/// cadence + `BelowSnapshot { slack_bytes: 0 }`), and the fault mix gains a third
-/// arm — crash a random **follower's service**. Under purge that follower's fresh
-/// empty service can no longer tail-replay from the journal (the leader purged the
-/// prefix it needs), so the node reconstructs it via a **snapshot install** +
-/// tail-replay (Task 5). "Purge is safe": committed history stays linearizable
-/// while the log underneath is continuously snapshotted, purged, and the state is
-/// rebuilt from snapshots across churn.
+/// node runs snapshot-backed **purge** (tiny journal segments + `BelowSnapshot
+/// { slack_bytes: 0 }` + a coordinated instant commanded once per fault tick),
+/// and the fault mix gains a third arm — crash a random **follower's service**.
+/// Under purge that follower's fresh empty service can no longer tail-replay
+/// from the journal (the leader purged the prefix it needs), so the node
+/// reconstructs it via a **snapshot install** + tail-replay (Task 5). "Purge is
+/// safe": committed history stays linearizable while the log underneath is
+/// continuously snapshotted, purged, and the state is rebuilt from snapshots
+/// across churn.
+///
+/// **Where the snapshots come from (plan 2 T10).** They used to come from a
+/// per-service byte cadence — "a snapshot every 32 KiB of applied progress" —
+/// which no longer exists: since coordinated instants, a row freezes only at a
+/// `SNAPSHOT` frame the leader appended (spec §5.2), and
+/// `ClusterCfg::snapshot_interval_bytes > 0` now means CAPABLE and nothing
+/// more. So the churn loop COMMANDS one instant per fault tick
+/// ([`LinClusterV2::command_instant`], best-effort: a tick with no serving
+/// leader is the normal case in a fault loop, and the `max_archive_first_base
+/// > 0` gate below is what adjudicates whether enough of them landed).
+///
+/// Commanding from the churn loop rather than seeding a replicated `[settings]
+/// snapshot_interval_bytes` cadence at genesis is deliberate, and the same
+/// choice `elle_v2`'s purge pass already made: the cadence is leader-local and
+/// re-bases to the leader's own append at promotion, so on a capstone that
+/// kills the leader every ~1.2 s it would frequently never fire at all — and
+/// what it would then be exercising is the cadence timer, not the
+/// operator-commanded instant this capstone's purge depends on.
 ///
 /// Same bars as the failover capstone: ≥ 80 % `Ok`, `Linearizable`, ≤ 120 s, run
 /// across seeds 0x1107 / 7 / 99 (the default + `LIN_SEED`).
@@ -229,11 +248,12 @@ fn linearizable_under_purge_and_snapshot_churn() {
             .unwrap_or(115),
     );
 
-    // Purge posture: 16 KiB journal segments (smaller than the snapshot interval,
-    // so whole segments fall below the snapshot floor and get dropped even in the
-    // low-volume test workload), a snapshot every 32 KiB of applied progress, and
-    // purge everything below the snapshot with zero slack — the most aggressive
-    // purge, so below-floor reconstruction fires reliably within a short run.
+    // Purge posture: 16 KiB journal segments (small enough that whole segments
+    // fall below the snapshot floor and get dropped even in this low-volume
+    // workload), snapshot-CAPABLE services (`snapshot_interval_bytes > 0` means
+    // exactly that and nothing more — see the doc above), and purge everything
+    // below the snapshot with zero slack — the most aggressive purge, so
+    // below-floor reconstruction fires reliably within a short run.
     let ccfg = ClusterCfg {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
@@ -281,6 +301,12 @@ fn linearizable_under_purge_and_snapshot_churn() {
         || cluster.max_archive_first_base() == 0
     {
         std::thread::sleep(FAULT_PERIOD);
+        // Plan 2 T10: the instant FIRST, while the cluster is still whole — a
+        // set completes only if every declared row and the `uc2-cluster` row
+        // reach P, so commanding one straight into a kill would mostly abandon
+        // it (spec §10). Best-effort; the `max_archive_first_base > 0` gate in
+        // this loop's own condition is what says enough of them landed.
+        cluster.command_instant();
         match frng.random_range(0..3u8) {
             0 => cluster.kill_and_restart_leader(),
             1 => cluster.crash_and_restart_leader_service(),
@@ -731,6 +757,12 @@ fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
         || cluster.max_archive_first_base() == 0
     {
         std::thread::sleep(FAULT_PERIOD);
+        // Plan 2 T10: the instant FIRST, while the cluster is still whole — a
+        // set completes only if every declared row and the `uc2-cluster` row
+        // reach P, so commanding one straight into a kill would mostly abandon
+        // it (spec §10). Best-effort; the `max_archive_first_base > 0` gate in
+        // this loop's own condition is what says enough of them landed.
+        cluster.command_instant();
         match frng.random_range(0..3u8) {
             0 => cluster.kill_and_restart_leader(),
             1 => cluster.crash_and_restart_leader_service(),
@@ -1023,6 +1055,12 @@ fn run_two_fsm(label: &str, lag: uc_node::FsmLag, seed: u64) {
     {
         std::thread::sleep(FAULT_PERIOD);
         cluster.supervise_services();
+        // Plan 2 T10: the instant FIRST, while the cluster is still whole — a
+        // set completes only if every declared row and the `uc2-cluster` row
+        // reach P, so commanding one straight into a kill would mostly abandon
+        // it (spec §10). Best-effort; the `max_archive_first_base > 0` gate in
+        // this loop's own condition is what says enough of them landed.
+        cluster.command_instant();
         match frng.random_range(0..3u8) {
             0 => cluster.kill_and_restart_leader(),
             1 => cluster.crash_and_restart_leader_service(),
@@ -1282,9 +1320,8 @@ fn two_fsm_slow_lockstep() {
 /// wrap, a restart reads the still-live ring directly and touches neither
 /// the journal nor a snapshot, whatever the purge posture. With purge off,
 /// the journal always covers `start_pos` even past the wrap, so a
-/// `SnapshotPolicy` alone never shortens a restart — the fresh service
-/// replays the whole journal, exactly as it would with no snapshot policy at
-/// all. With purge on AND past the wrap, the leader's journal prefix is
+/// snapshot capability alone never shortens a restart — the fresh service
+/// replays the whole journal, exactly as it would with no snapshots at all. With purge on AND past the wrap, the leader's journal prefix is
 /// dropped below the snapshot floor, so the fresh service's `start_pos` (0,
 /// an empty SM) is no longer covered and reconstruction installs the newest
 /// artifact once.
@@ -1338,7 +1375,19 @@ fn restart_installs(purge: bool) -> u32 {
     let leader = cluster.await_single_serving(30);
     eprintln!("[t11 purge={purge}] phase: leader elected ({leader})");
     let client = cluster.client(leader);
-    for i in 0..WRITE_COUNT {
+    // Plan 2 T10: the instant goes in the MIDDLE of the writes, not after
+    // them. P is a frame END, so everything submitted after it is the
+    // retained `[P, append)` tail the restarted service must tail-replay once
+    // it has installed — and the artifact has to exist before the purge below
+    // can drop anything at all. `instant_until_complete` waits for the whole
+    // SET (every declared row plus the `uc2-cluster` row at one P), which is
+    // what `snapshot_set_position` — and therefore the purge floor — reads.
+    for i in 0..WRITE_COUNT / 2 {
+        let _: CmdResp = client.submit(&Cmd::Write(i)).unwrap();
+    }
+    let instant = cluster.instant_until_complete(30);
+    eprintln!("[t11 purge={purge}] phase: instant complete at {instant}");
+    for i in WRITE_COUNT / 2..WRITE_COUNT {
         let _: CmdResp = client.submit(&Cmd::Write(i)).unwrap();
     }
     eprintln!("[t11 purge={purge}] phase: {WRITE_COUNT} submits done");

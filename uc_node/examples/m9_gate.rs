@@ -34,14 +34,21 @@ use uc_consensus::election::NodeId;
 use uc_log::cnc::CncPage;
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_service::{
-    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy,
-    SnapshotStateMachine, StateMachine,
+    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotStateMachine,
+    StateMachine,
 };
 
 const APP: &str = "m9-gate";
 const BUFFER_BYTES: usize = 1 << 22;
 const MAX_PAYLOAD: usize = 256;
 const SEGMENT_BYTES: u64 = 16 * 1024;
+/// The cluster's snapshot CADENCE (coordinated-snapshot spec §5.5/§6): the
+/// leader commands an instant every this many bytes of appended log. Written
+/// into each node's `[settings]` block (`write_config`), which SEEDS the
+/// replicated settings record at genesis. The per-service byte cadence M6
+/// used is deleted (spec §5.2); this is its cluster-wide replacement, and it
+/// is what makes row 2's anti-vacuity check ("some node actually built a
+/// snapshot") satisfiable.
 const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
 const PURGE_SLACK_BYTES: u64 = 0;
 
@@ -200,23 +207,31 @@ impl SnapshotStateMachine for RegSm {
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.value = v;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
 
 // --------------------------------------------------------- fleet roles
 
-fn spawn_service(dir: &Path, app_id: &str, snapshot_interval_bytes: u64) -> Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, app_id).snapshot_policy(SnapshotPolicy {
-        interval_bytes: snapshot_interval_bytes,
-    });
+fn spawn_service(dir: &Path, app_id: &str, _snapshot_interval_bytes: u64) -> Service<RegSm> {
+    // Snapshot-CAPABLE only (coordinated-snapshot spec §5.2's cnc status
+    // bit): the byte cadence is gone, and the row builds at the instants the
+    // leader commands from the replicated `[settings]` cadence this gate
+    // seeds in `write_config`. The parameter is kept so the CLI surface is
+    // unchanged for the fleet driver.
+    let cfg = ServiceConfig::new(dir, app_id);
     ServiceBuilder::new(cfg, RegSm::default())
         .start_with_snapshots()
         .expect("snapshot service start")
@@ -474,7 +489,8 @@ fn write_config(
         "id = {id}\nbind = \"{addr}\"\ninstance_dir = \"{}\"\napp_id = \"{APP}\"\n\
          buffer_bytes = {BUFFER_BYTES}\nmax_payload = {MAX_PAYLOAD}\n\
          journal_segment_bytes = {SEGMENT_BYTES}\n\n\
-         [purge]\nbelow_snapshot_slack_bytes = {PURGE_SLACK_BYTES}\n\n",
+         [purge]\nbelow_snapshot_slack_bytes = {PURGE_SLACK_BYTES}\n\n\
+         [settings]\nsnapshot_interval_bytes = {SNAPSHOT_INTERVAL_BYTES}\n\n",
         dir.display()
     );
     for (mid, maddr) in members {

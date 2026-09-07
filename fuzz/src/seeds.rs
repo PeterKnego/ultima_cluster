@@ -202,6 +202,19 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("15-snap-begin-cluster", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
 
+    // Coordinated-snapshot plan 2 (spec §5.7): a voter's pull request to a
+    // learner, and the leader's redirect to one.
+    let mut b = [0u8; SNAP_REQUEST_BODY_LEN];
+    write_snap_request_body(&mut b, &SnapRequestBody { session: 7, position: 8192 });
+    seeds.push(Seed::fixed("19-snap-request", datagram(DGRAM_KIND_SNAP_REQUEST, 0, 3, &b)));
+
+    let mut b = [0u8; SNAP_REDIRECT_BODY_LEN];
+    write_snap_redirect_body(
+        &mut b,
+        &SnapRedirectBody { session: 7, learner_id: 3, position: 8192 },
+    );
+    seeds.push(Seed::fixed("20-snap-redirect", datagram(DGRAM_KIND_SNAP_REDIRECT, 0, 3, &b)));
+
     seeds
 }
 
@@ -1463,6 +1476,36 @@ pub fn uc_node_cluster_artifact() -> Vec<Seed> {
         Seed::fixed("03-truncated", truncated),
         Seed::fixed("04-bad-magic", bad_magic),
         Seed::fixed("05-lying-membership-length", lying_length),
+    ]
+}
+
+/// `uc_service_snapshot_envelope` — the 16-byte artifact envelope every
+/// `snap-<pos>.ultsnap` starts with (coordinated-snapshot ruling P6): the
+/// well-formed header, and the three refusals the decoder owes — empty, one
+/// byte short, and wrong magic — plus a header with a payload behind it (the
+/// shape every real install path reads).
+pub fn uc_service_snapshot_envelope() -> Vec<Seed> {
+    use uc_service::snapshots::write_snapshot_envelope;
+
+    fn envelope(pos: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        write_snapshot_envelope(&mut v, pos).expect("a Vec never fails");
+        v
+    }
+
+    let ok = envelope(4096);
+    let short = ok[..ok.len() - 1].to_vec();
+    let mut bad_magic = ok.clone();
+    bad_magic[0] ^= 0xFF;
+    let mut with_payload = envelope(1 << 40);
+    with_payload.extend_from_slice(b"state machine bytes");
+
+    vec![
+        Seed::fixed("01-envelope", ok),
+        Seed::fixed("02-empty", Vec::new()),
+        Seed::fixed("03-one-byte-short", short),
+        Seed::fixed("04-bad-magic", bad_magic),
+        Seed::fixed("05-envelope-plus-payload", with_payload),
     ]
 }
 

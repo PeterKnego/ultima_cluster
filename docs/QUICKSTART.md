@@ -393,8 +393,12 @@ ways the runbook covers in full, but at minimum:
   turns into ingress backpressure — and the whole of it is *reserved* on disk at
   startup, so sizing it up is a disk decision too. See
   [Configuration](/docs/reference/configuration.md).
-- **Implement `SnapshotStateMachine`** if you want the log purged. Without it
-  the journal grows forever.
+- **Implement `SnapshotStateMachine`** if you want the log purged, and start
+  the service with `start_with_snapshots()`. Without it the journal grows
+  forever. *When* a snapshot happens is not your choice: it is a coordinated
+  instant on the log (`uc2ctl snapshot`, or a replicated cadence), at which
+  every declared FSM freezes together — see
+  [Keep the journal from growing without bound](/docs/how-to/bound-journal-growth.md).
 - **Enable wire crypto** if node-to-node traffic crosses anything you do not
   trust. It is off by default, and `[admin] auth = "hmac"` only authenticates
   cluster-wide when paired with it — see

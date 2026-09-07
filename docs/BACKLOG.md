@@ -109,19 +109,33 @@ to point at "§ 2a" for these residuals now point here.*
 - **New in the cluster-FSM shape, and worth a line each.**
   `uc2ctl schedule show` / `settings show` / `status`'s `schedule_position=`
   read the newest **cluster artifact**, a file beside the running node, so
-  they lag the live view and say "no cluster artifact yet" until every declared
-  row has snapshotted; a live reading needs the response-on-the-egress-broadcast
-  path the design left to a phase 2. (Three other residuals listed here were
-  closed by plan 1's pre-final pass: `uc2ctl backup` now carries
-  `snapshots/cluster/`; `uc2_cluster_fsm_position` and `uc2_settings_position`
-  are exported; and `uc2_agent_alive` carries the fifth agent.)
+  they lag the live view and say "no cluster artifact yet" until the first
+  snapshot instant completes; a live reading needs the
+  response-on-the-egress-broadcast path the design left to a phase 2. (Three
+  other residuals listed here were closed by plan 1's pre-final pass:
+  `uc2ctl backup` now carries `snapshots/cluster/`;
+  `uc2_cluster_fsm_position` and `uc2_settings_position` are exported; and
+  `uc2_agent_alive` carries the fifth agent.)
+- **New with coordinated snapshots (plan 2), and deliberate.**
+  A voter's purge floor waits for an operator after a `--standby` instant:
+  **automatic standby replication** — a voter pulling a learner's set without
+  `uc2ctl snapshot fetch` — needs the learner's "complete at P" to be visible
+  cluster-wide, which is a fourth cluster-FSM command and a design of its own.
+  Aeron's open-source half defers it the same way. Two smaller ones beside it:
+  the redirect's **sending** side emits no log record (it leaves `uc_net`,
+  which carries no logging dependency by design — its witness is the leader's
+  `snap_redirects` counter), and the two new session-refusal counters
+  (`uc2_snapshot_refused_position_total`,
+  `uc2_snapshot_refused_fetch_expired_total`) are rendered but not yet listed
+  in `CONTRACT_SERIES`.
 - **Why:** none of these blocks anyone today, which is exactly why the list is
   worth keeping — a residual nobody wrote down becomes a surprise. The three
   struck-through entries above are the ones a user actually met by accident,
   and they are closed; what is left is conveniences and observability.
-- **Cost:** low, and what remains is one item: a live reading for
+- **Cost:** low, and what remains is two items: a live reading for
   `schedule show` / `settings show` / `status`, which needs the
-  response-on-the-egress-broadcast path (spec §13 phase 2).
+  response-on-the-egress-broadcast path (spec §13 phase 2), and automatic
+  standby replication, which needs a fourth `CLUSTER` kind (spec §13).
 
 ### 3. Rolling upgrades and leadership transfer
 
@@ -242,6 +256,11 @@ reviewer wants a workload to attack.
   (`docs/releases.md`, release-evidence table).
 - **`uc2-gateway --version`** — fixed on `main` after the tag, lands in the
   next release (`docs/releases.md`).
+- **Snapshot-session probe counters are sender-local** — `snap_redirects`
+  and `snap_request_unknown_peer` (the member gate on `SNAP_REQUEST`, plan 2)
+  live in `SenderStats` with no `/metrics` family, `Node::` accessor or obs
+  record, so an operator cannot see a peer probing for sets. One gauge each,
+  read at scrape; found by plan 2's final re-review.
 - **Leader self-send `seal_failures` wart** — the encrypted leader's
   self-addressed position report fails to seal and counts; harmless,
   suppression deferred since M8 (`docs/releases.md`, v2.3.0).
@@ -312,6 +331,15 @@ replicated schedule table, `FRAME_TYPE_SCHEDULE_TABLE = 6` and
 `uc2ctl schedule apply/show` (plan 2); and that table on the snapshot session,
 `SNAP_TABLE` datagram kind 21, so a below-floor joiner installs it before it
 can serve or lead (plan 3).
+
+**And superseded again by coordinated snapshot instants** (the same spec's
+plan 2, done on the `uc2+coordinated-snapshot-plan2` branch): the cluster
+artifact plan 1 wrote on a bridging trigger is now written at a commanded
+instant, so a "set" is one log position rather than a lowest-common-floor, and
+`SnapshotPolicy`'s per-service byte interval is deleted with it. Standby
+instants (`uc2ctl snapshot --standby`) and the `uc2ctl snapshot fetch` return
+path come with it —
+[`docs/notes/uc2-cluster-fsm-explained.md` § Instants](notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).
 
 **Superseded before shipping, in the same unreleased `2.11.0`**: the cluster
 FSM took over both carries. `FRAME_TYPE_SCHEDULE_TABLE = 6` becomes

@@ -175,7 +175,23 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Timed<S> {
         let got = self.inner.install_snapshot(position, src)?;
         self.pending = img.pending;
         self.table_last = img.table_last;
-        self.max_pos_seen = Some(got);
+        // Coordinated-snapshot spec §5.2 / ruling P6: `position` is the INSTANT
+        // P — the frame-END of the `SNAPSHOT` frame, an exclusive frontier — so
+        // a user frame normally starts exactly AT it. `last_applied()` here is
+        // `max(inner, max_pos_seen)` and the apply loop's guard is
+        // `pos > last_applied()`, so seeding this with `got` (== P) would make
+        // every `Timed<S>` service silently SKIP the first frame above the
+        // instant. Take the inner SM's restored cursor instead; `got` is only
+        // the resume point, and it is still what this returns.
+        //
+        // Final wave, T3 (accepted, doc-only): this can LOWER `max_pos_seen` —
+        // the installed artifact's own cursor may be below whatever this
+        // wrapper had seen. That is correct and not a regression: the
+        // framework never installs mid-life (an install happens on
+        // reconstruction or on a below-floor join, where the SM is fresh or
+        // being replaced wholesale), and the reduced value is the artifact's
+        // own recorded cursor, which after an install IS this SM's state.
+        self.max_pos_seen = self.inner.last_applied();
         Ok(got)
     }
 }

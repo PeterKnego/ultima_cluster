@@ -105,7 +105,14 @@ verify rather than a build:
   `uc2ctl settings apply <file.toml>` (admin op 7, refusals 44–47, audited as
   `settings_apply`). `[settings]` in `node.toml` seeds genesis only. Both
   `show` commands read a **file**, so they lag the live view and say
-  `no cluster artifact yet` until every declared row has snapshotted.
+  `no cluster artifact yet` until the first snapshot instant completes.
+- **What snapshot set is this node holding?** `uc2ctl snapshot show` prints
+  each declared row's newest artifact position, the cluster row's, and
+  `set=<P>` — the newest position present in **all** of them, which is the
+  purge floor once persisted. It is offline (a directory listing) and never
+  opens an artifact. A row whose `newest=` sits below the others is the row
+  holding the floor back, and `uc2_snapshot_row_incomplete_total{row}` will be
+  climbing for it.
 
 ## Changing a running cluster
 
@@ -137,9 +144,34 @@ verify rather than a build:
   `uc2ctl schedule show`, which reads this node's newest cluster artifact under
   `<instance_dir>/snapshots/cluster/`, and see the position on `uc2ctl
   status`'s `config:` line as `schedule_position=`. Both lag the live view —
-  an artifact appears once every declared row has snapshotted — so on a cluster
-  that is not snapshotting yet they say `no cluster artifact yet` and
+  an artifact appears at a snapshot **instant** — so on a cluster that is not
+  snapshotting yet they say `no cluster artifact yet` and
   `uc2_schedule_table_position` from `/metrics` is the live reading.
+- **Take a snapshot** (2.11 pending): `uc2ctl snapshot --instance-dir D
+  --app-id A [--admin-key K] [--standby]` (admin op `8`, audited as
+  `snapshot`). **Run it against the leader** — a follower answers `retry` (status `2`);
+  `uc2ctl status`'s `leader_hint` says where — and it prints `instant=<P>`, the frame-end position every
+  declared row and the cluster FSM freeze at. When they have all published
+  `snap-<P>`, that node's purge floor moves to P. Refused
+  `48 snapshot_unsupported` naming any declared row started with plain
+  `start()` rather than `start_with_snapshots()` (it would ignore the frame,
+  so the set could never complete), and `49 snapshot_no_learner` for
+  `--standby` with no learner in the committed membership. A cadence is the
+  replicated `snapshot_interval_bytes` (`0`, the default, means
+  operator-commanded only).
+  **`--standby` freezes only the learners**, which is how you avoid the
+  commit stall a large state's freeze causes on a quorum (`P + fsm_lag` until
+  the slowest freeze ends). The set comes back to a voter with
+  `uc2ctl snapshot fetch --from <learner-id> [--position P]` (admin op `9`,
+  **node-local — never forwarded**, so run it against the voter you want it
+  on; audited as `snapshot_fetch`). That writes the artifacts **store-only**:
+  no state machine is touched, and the floor advances through the ordinary
+  completeness path. Status `0` means the pull is underway, not that it
+  arrived — poll `uc2_snapshot_fetched_position` or `snapshot show`. Refused
+  `50 snapshot_above_durable` for a position above this node's durable
+  frontier. Until a voter has fetched, a joiner below its floor is
+  **redirected** to a learner that holds the set, so nothing wedges.
+  → [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
 - [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md) — key
   material, the flag-day rollout, health counters, and rotation; pair with
   `[admin] auth = "hmac"` — see its "Known interaction with admin
@@ -168,10 +200,13 @@ verify rather than a build:
   cluster row back to an older membership, schedule table and settings record
   would be worse than not starting. **The record names the file.** Remove
   exactly that file and restart. The node recovers from the artifact beneath
-  it — one is guaranteed to be there, because the agent keeps the newest two —
-  and replays the gap from the journal, so nothing is lost. If a second
-  restart names the next file down, stop: two corrupt artifacts is a storage
-  problem, not a UC one, and the answer is
+  it and replays the gap from the journal, so nothing is lost — **when there
+  is one**: since coordinated snapshot instants (2.11 pending) retention is
+  the node's and keeps the set at the persisted floor plus everything newer,
+  so an older artifact exists whenever a newer instant has completed since the
+  floor was last persisted, and does not when the corrupt file *is* the floor
+  set. In that case, and if a second restart names the next file down, stop:
+  that is a storage problem, not a UC one, and the answer is
   [wipe-and-rejoin](../how-to/recover-from-quorum-loss.md), which rebuilds the
   cluster row from a peer's snapshot session. Never edit an artifact in place;
   the CRC is over the whole image.
@@ -203,8 +238,7 @@ verify rather than a build:
   own artifact holding membership, the schedule table and the settings record
   as of `<pos>`; `uc2ctl backup` **does** copy it, as an artifact family of
   its own, and `verify-backup` decodes the newest one through the same image
-  decoder a joiner installs it with; the newest 2 are kept on a live node)
-  and two transient staged
+  decoder a joiner installs it with) and two transient staged
   payloads in the instance root, `schedules.pending` and `settings.pending`,
   each written by its `uc2ctl … apply` and deleted by the node after a
   successful append. There is no `state/schedules.state`. *Was §1.*

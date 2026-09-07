@@ -1,15 +1,15 @@
 # ultima_cluster releases
 
-## Unreleased — FSM identity, log time, and the cluster FSM (next minor, 2.11.0 when cut)
+## Unreleased — FSM identity, log time, the cluster FSM, and coordinated snapshots (next minor, 2.11.0 when cut)
 
 **Implemented; not tagged. Release on hold** — the maintainer **stopped** the
 release on 2026-09-05 for the cluster-FSM and coordinated-snapshot work, which
-is why there is a fourth feature below. This entry is a draft written ahead of
-the tag, per the standing writeup rule (CLAUDE.md), so the record is ready when
-the maintainer green-lights it.
+is why there are a fourth and a fifth feature below. This entry is a draft
+written ahead of the tag, per the standing writeup rule (CLAUDE.md), so the
+record is ready when the maintainer green-lights it.
 
-**Four features, one flag day.** All four were implemented before the
-release was cut, and all four move the wire to `0.7.0` and the cnc page to
+**Five features, one flag day.** All five were implemented before the
+release was cut, and all five move the wire to `0.7.0` and the cnc page to
 `3.1`, so they ship together:
 
 | feature | spec | plan |
@@ -18,6 +18,7 @@ release was cut, and all four move the wire to `0.7.0` and the cnc page to
 | Log time and timers, plan 1 | `docs/superpowers/specs/2026-09-02-uc2-time-and-timers-design.md` | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md` (T0–T14, all done) |
 | Log time and timers, plan 2 (the replicated schedule table) | the same spec, §5 | `docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md` (T0–T8, all done) |
 | **The cluster FSM** | `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md` | `docs/superpowers/plans/2026-09-06-uc2-cluster-fsm-plan1.md` (T0–T12, all done) |
+| **Coordinated and standby snapshot instants** | the same spec, §5 (plus its "Errata (plan 2, as built)") | `docs/superpowers/plans/2026-09-06-uc2-coordinated-snapshot-plan2.md` (T0–T11, all done) |
 
 Plan 2 was written and executed on the same branch after plan 1 landed. A third
 plan against the time-and-timers spec —
@@ -32,7 +33,8 @@ are recorded below as reserved numbers rather than as features.
 
 The coordinated-snapshot half of the cluster-FSM spec (§5: a `SNAPSHOT` frame
 at whose frame-end position every row and the cluster FSM freeze together, plus
-standby instants) is **plan 2 of that spec and is not in this release**.
+standby instants) is **plan 2 of that spec, and it landed too** — the section
+below. Plan 3 of that spec (retirement and proof) is still to come.
 
 ### The problem this closes
 
@@ -628,6 +630,173 @@ mechanism works.
   cluster artifact yet" until every declared row has snapshotted (spec §13
   phase 2 is what would close that). `docs/BACKLOG.md` item 2 carries it.
 
+### Coordinated and standby snapshot instants
+
+**The problem it closes.** M6 gave every service a byte trigger
+(`SnapshotPolicy { interval_bytes }`) and let each row snapshot on its own
+clock. A node's "snapshot set" was therefore whatever lowest-common-floor those
+independent timers happened to produce: a position nobody chose, that no other
+node shared, and that the ship gate had to reconstruct by asking each row for
+its newest artifact. The cluster FSM's own artifact was bolted onto that with a
+**bridging trigger** — write one once every declared row has snapshotted and my
+own applied position has reached the lowest of theirs — which plan 1 recorded
+as a stand-in. Plain-language argument:
+`docs/notes/uc2-cluster-fsm-explained.md`, § Instants.
+
+**The instant.** `FRAME_TYPE_SNAPSHOT = 7`, header-only: the frame's own END
+position **P** is the whole payload. It is broadcast, so every declared row's
+apply loop and the cluster FSM act on it, each having applied everything
+strictly below P; each calls `freeze()` and hands the build to the builder
+thread that already existed. A node holds the **complete set at P** when every
+declared row's `snap-<P>.ultsnap` and the cluster's `snap-<P>.ultcluster` are
+published, detected by the consensus agent polling slot words it already polls.
+No acks cross the wire: each node completes its own set, and sets are
+position-aligned because P is.
+
+**Why that makes the ship gate sound with no counter.** A row freezes at P only
+after *applying* to P, and apply is gated on `min(commit, durable)` — so an
+artifact at P exists only if P was committed on that node when it was built,
+and committed bytes are never truncated (sim inv4). A complete set therefore
+implies a committed P. The gate becomes "the complete set at my floor", with
+nothing to consult and no boot window in which a counter reads zero — which is
+the last of the three live-read mechanisms the cluster FSM set out to remove.
+`SnapshotSet.config`, `SnapshotSet.table`, `shippable_schedule`,
+`ScheduleShip`, `known_committed` and the position-0 rules are all gone.
+
+**Retention moved to the node, and became delete-only** (ruling P1). Both
+per-writer `retain_newest(2)` pruners are removed — `uc_service::snapshots`
+does not prune at all now, and neither does the cluster agent. A per-writer
+pruner cannot see a *set*: two abandoned instants in a row would have it delete
+the artifact at the floor, after which the ship gate declines `MISSING`
+forever, looking for a file its own retention removed. The node prunes below
+its **persisted** floor, by exact name, keeping P and everything newer; it
+never writes an artifact, only deletes one it can prove is superseded.
+
+**The envelope** (ruling P6). The artifact tag is an **exclusive** frontier —
+the image covers every frame strictly below P, and a user frame normally starts
+exactly at P — so `install_snapshot(P)` must restore the cursor the artifact
+recorded and return `position`, not report P from `last_applied()`. That in
+turn kills any payload-side mis-tag check, because an image built at some lower
+`P0` and presented as P passes every one of them. So the framework took the
+guarantee: `SnapshotStore::publish` writes 16 bytes of its own ahead of the
+service's — `ULTSNAP1` then P, LE — and every install path verifies them
+(`uc_service/src/replay.rs`, the joiner's receive, `uc2ctl verify-backup`). UC
+still prescribes no payload encoding. Pre-envelope artifacts are refused by
+name; nothing released ever wrote one, so this only reaches a developer's
+existing instance directory.
+
+**Standby instants** (§5.7). A `freeze()` is O(state) on the row's apply
+thread, and a node's durable report is capped at `min_applied + fsm_lag`
+(M14a's report ceiling). M6's per-service triggers staggered by accident; a
+coordinated instant freezes every row on every node at the same P, so a
+quorum's reports all cap at `P + fsm_lag` and **commit stalls cluster-wide**
+until the slowest freeze ends. UC cannot bound a freeze — the state and the
+code are the service's — so the only lever that works at any state size is not
+freezing the voters. `FLAG_SNAPSHOT_STANDBY` in the frame's header flags byte
+marks an instant learners-only; a node reads its own role from
+`NODE_FLAG_LEARNER = 4` in the cnc node-flags word, the same word the apply
+loop already reads `NODE_FLAG_LEADER` from once per cycle. (An earlier draft
+put this in a per-row slot status bit, which was wrong twice: that word is
+service-written, and role is a node property.) This is Aeron's shape verbatim —
+there too the standby snapshot is the same action with a flag that a member's
+services skip.
+
+**The return path is a pull**, as Aeron's open-source half is:
+`DGRAM_KIND_SNAP_REQUEST = 22` (`session ‖ position`) from a voter to a
+learner, answered by an ordinary session off the learner's own artifacts, taken
+by the voter's receiver in a new **store-only** mode — artifacts written and
+acked, nothing installed by fiat, the floor adopted through §5.3's ordinary
+completeness path keyed on a node-side `stored_set_pos`. A voter above P
+storing a set at P is not a joiner. The verb is `uc2ctl snapshot fetch --from
+<id> [--position P]` (admin op 9, node-local, never forwarded); it binds its
+position, is refused **50 `snapshot_above_durable`** above this node's durable
+frontier, and a straggling answer to an expired fetch is refused by its
+`(peer, session)` and counted `fetch_expired`. One deadline governs the whole
+path, `SNAP_INTAKE_TIMEOUT_NS` (60 s). Until a voter has fetched, a joiner
+below its floor is sent `DGRAM_KIND_SNAP_REDIRECT = 23`
+(`session ‖ learner_id ‖ position`) — which, with node-owned retention, fires
+only when artifacts are genuinely **missing**, in practice a node restored from
+a backup taken before its own floor.
+
+**One session, one position** (§5.6). Every `SNAP_BEGIN` of a session must
+agree on `snapshot_pos`; a session that mixes two is refused and counted
+(`uc2_snapshot_refused_position_total`). The sender enforces it at assembly by
+looking each artifact up **by file name** at the target position rather than by
+a row's live `snapshot_pos` word, which runs ahead the moment a later instant
+completes.
+
+**Triggers and refusals** (§5.5). Leader-only, two of them: `uc2ctl snapshot
+[--standby]` (admin op 8; a follower answers `retry` with the leader hint, as
+`schedule apply` does; audited as `snapshot`) and the replicated
+`snapshot_interval_bytes` cadence, flagged per `snapshot_target`. Single in
+flight with supersession — an operator's command always supersedes, and the
+cadence supersedes once a further `interval_bytes` has accrued, recording the
+old instant as **abandoned**. Both are refused **48 `snapshot_unsupported`**,
+naming the row, if any declared row lacks the new capability bit
+(`CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9`, service-written by
+`start_with_snapshots`), and **49 `snapshot_no_learner`** for `--standby` with
+no learner. As built, the cadence's clock measures the last *commanded*
+instant rather than the last complete one and is re-based to the append
+frontier at each leader open, so it errs late and election churn cannot become
+a snapshot storm.
+
+**A replayed span acts on its last `SNAPSHOT` frame** (ruling P10), in both the
+live catch-up and reconstruction paths, iff P is above both the row's
+`snapshot_pos` and its `last_applied`. Without it a small ring cost a row its
+instants outright; with it the cost is ~2× journal read over the span plus one
+freeze on a row that is already behind — and "the instant completed on the
+first attempt" becomes a bar the integration tests can assert.
+
+**Observability** (§9). Eight series:
+`uc2_snapshot_row_incomplete_total{row}`, `uc2_snapshot_freeze_seconds_max{row}`
+/ `_sum{row}` / `_count{row}` (three standing in for a histogram this encoder
+has no type for, derived once per scrape from the new cnc slot word
+`freeze_ns` at `+496`), `uc2_snapshot_instant_position`,
+`uc2_snapshot_standby_instant_position`, `uc2_snapshot_set_position` and
+`uc2_snapshot_fetched_position`. Three alerts: `Uc2SnapshotStalled` (a
+`changes()` pair, because the instant gauge is leader-local and the set gauge
+is per node, so only "is each series moving" is an honest question),
+`Uc2StandbySnapshotStalled` (the same pair over the standby gauge) and
+`Uc2SnapshotSetDiverged` (`count_values` over the set position — nodes
+disagreeing about their purge floors). All three have `m10_alert_fire.sh`
+builders and `m10_alerts.rs` scenarios, so the M10 gate's completeness
+cross-check stays green.
+
+The instant gauge is split in two on purpose (ruling P13, final wave). With
+`snapshot.target = learners` the leader is a **voter**: it commands instants
+whose sets only the learners build, so its own set never completes until an
+operator runs `uc2ctl snapshot fetch`. Keying one rule on one gauge would have
+made that healthy steady state fire `Uc2SnapshotStalled` permanently — and
+would have counted an abandonment against every declared row on every cadence
+tick. So `uc2_snapshot_instant_position` counts FULL instants only; the
+standby half is published by the `uc2-cluster` agent when it *acts* on a
+standby frame, which happens only on a learner, so a voter exports `0` and
+`Uc2StandbySnapshotStalled` cannot fire on one without a role label. On the
+same rule, a superseded standby instant on a non-learner is not counted
+abandoned, does not bump `uc2_snapshot_row_incomplete_total`, and does not
+hold the single-in-flight gate. `Node::snapshot_session_refusals()` grew
+to a 5-tuple. Eleven log records, from `snapshot_commanded` through
+`snapshot_redirect_unknown` (six info, five warn); the redirect's **sending**
+side has none, because
+it leaves `uc_net`, which carries no logging dependency — its witness is
+`SenderStats::snap_redirects`.
+
+**Proof.** Sim: **inv11**, *set alignment*, indexed by frame end — no node
+lists a set above its own commit, every listed instant is a `SNAPSHOT` frame
+inside the cluster-wide committed prefix, and an instant two nodes both list
+names the same frame. Deliberately **not** a prefix rule between nodes
+(ruling P9): abandonment and a declining row make divergent lists legitimate.
+The fuzz tiers command instants every 500 steps — 5 646 in the default tier and
+~38 000 more in the heavy tier, 16 549 completed sets judged in the default
+tier alone, zero hits. Integration: instants under load with two rows and the
+§4.3 timer oracle re-run over the same log; a standby instant that freezes only
+the learner while every voter's `applied` keeps moving; a voter's store-only
+fetch and its floor advancing; a joiner below the voters' floor redirected to
+the learner. Hard crash: a row SIGKILLed mid-`freeze()`, the instant abandoned,
+the next one completing, the history still linearizable. `lin_v2`'s three churn
+capstones now drive their purge with commanded instants. New fuzz target
+`uc_service_snapshot_envelope`.
+
 ### Fixed on the way (2026-09-03)
 
 Three product defects found by the nightlies of 2026-09-01 and 2026-09-02,
@@ -694,6 +863,16 @@ whole `uc_service` surface is additive (`#[non_exhaustive]` fields, two provided
 trait methods with defaults, new types, a new wrapper), and `uc_protocol`'s
 `FrameHeader` change is on an item the policy does not promise.
 
+Coordinated snapshot instants add **one API break**:
+`uc_service::SnapshotPolicy` and `ServiceConfig::snapshot_policy` are removed,
+because the trigger is now the log. `start_with_snapshots()` is the whole
+opt-in and the `SnapshotStateMachine` trait is unchanged in shape — but
+`install_snapshot`'s **contract** is now explicit about the tag being an
+exclusive frontier (return `position`; do not report it from `last_applied`),
+which a state machine written against the looser M6 wording may need to
+follow. There is also an on-disk break inside the same flag day: an artifact
+without the 16-byte `ULTSNAP1` envelope is refused.
+
 The cluster FSM adds **two config breaks and no API break**: a top-level
 `admission_bytes` and a `[services] fsm_lag` in an existing `node.toml` are now
 startup refusals pointing at `uc2ctl settings apply`, and an FSM named with the
@@ -726,6 +905,7 @@ file uses ("What proves the release").
 | `cargo test --workspace --doc` | Task 10, this worktree | see below (run as part of this docs sweep, not a release gate on its own) |
 | FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
 | time-and-timers gate (rows a/b/c/d/e) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — bars committed, no run. Row d is an isolated `apply_bench` A/B under `scripts/hop1_ab.sh`'s same-source rebuild control, added because this work *does* touch two hot loops (M14a's codegen lesson); row e re-runs the throughput rows with a full 32-entry schedule table live |
+| coordinated snapshots | no gate doc of its own | **pending** — three rows belong in the time-and-timers gate's throughput arm when it runs: commanded instants under load (the extra apply-loop arm, A/B'd per M14a), a below-floor join with the shipper restarted mid-window, and freeze duration vs. commit stall on a large state for an all-nodes instant against the same instant `--standby` |
 | cluster FSM | no gate doc of its own | **n/a by design** — the fifth agent's frames are operator-rate, and its one hot-path addition is a single `Acquire` load of the view's position word per consensus duty cycle, compared against a shadow, with the view's mutex taken only on a pass where that position moved. A row belongs in the time-and-timers gate's throughput arm when that gate is run |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |

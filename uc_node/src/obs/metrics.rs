@@ -12,7 +12,7 @@
 //! `Arc`s and atomics [`ObsSources`] already holds. All positions are byte
 //! positions — this system has no indices.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::unpack_service_status;
@@ -70,6 +70,16 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_timers_pending",
     "uc2_timers_fired_total",
     "uc2_timers_late_total",
+    // Coordinated-snapshot spec §9: the per-row snapshot families, plus the
+    // three unlabeled positions below (fetched/instant/set).
+    "uc2_snapshot_row_incomplete_total",
+    "uc2_snapshot_freeze_seconds_max",
+    "uc2_snapshot_freeze_seconds_sum",
+    "uc2_snapshot_freeze_seconds_count",
+    "uc2_snapshot_instant_position",
+    "uc2_snapshot_standby_instant_position",
+    "uc2_snapshot_set_position",
+    "uc2_snapshot_fetched_position",
     // Plan 2 (spec §6): the replicated schedule table.
     "uc2_schedule_table_position",
     // Cluster FSM (spec §9): the cluster row's own two positions.
@@ -101,6 +111,11 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_refused_legacy_peer_total",
     "uc2_snapshot_refused_declared_set_total",
     "uc2_snapshot_refused_version_total",
+    // Final wave M2: added with instants and rendered from the first commit,
+    // but left out of the contract — so `m10_fleet_gate.py`'s family-coverage
+    // check never saw them. Contracted now, with the three above them.
+    "uc2_snapshot_refused_position_total",
+    "uc2_snapshot_refused_fetch_expired_total",
     "uc2_snapshot_intake_io_failures_total",
     // M14c2 (T10a): the three counters that close M14c's snapshot-session
     // deferrals — the leader's `File::open` TOCTOU, the joiner's abandoned
@@ -135,6 +150,79 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_counter_ahead_resyncs_total",
     "uc_net_event_drops_total",
 ];
+
+/// Coordinated-snapshot spec §9: process-local per-row freeze-duration
+/// bookkeeping, derived from the row's cnc slot word (`ServiceIdentityLine`'s
+/// `freeze_ns`, service-written) once per SCRAPE, never per consensus-agent
+/// pass. No histogram type exists in this encoder (`push_gauge`/
+/// `push_gauge_f64`/`push_counter` only), so three series stand in for one:
+///
+/// - `uc2_snapshot_freeze_seconds_max{row}` (gauge): the longest freeze this
+///   row has reported since [`Node::snapshot_instant_position`]'s reading
+///   last ADVANCED — reset to 0 the scrape after that happens, so a stuck
+///   row's stale worst-case does not linger forever once the leader moves on.
+/// - `uc2_snapshot_freeze_seconds_sum{row}` / `_count{row}` (counters):
+///   cumulative total and number of freezes observed, giving a mean.
+///
+/// A freeze is "observed" when the cnc word's value differs from what the
+/// PREVIOUS scrape saw for that row — there is no edge/sequence number on
+/// the word itself, so a row that freezes for the exact same duration twice
+/// in a row is a known blind spot of this word-change detection, not a
+/// double count. `#[derive(Default)]` zero-initializes every row.
+///
+/// Final wave M5/T8, spelled out because `_count`'s name invites the wrong
+/// reading: the error is always an **UNDER**-count, never an over-count.
+/// Two sources — identical consecutive durations (one sample), and N freezes
+/// landing between two scrapes (one sample, the last value). And because this
+/// struct is process-local derived state rather than a cnc word, every
+/// counter here **resets to 0 when the node restarts**, so a `rate()` across
+/// a restart reads as a drop to zero and back, the same as any other
+/// process-local counter on this endpoint. The FIRST scrape after a restart
+/// also folds whatever the cnc word happens to hold (`last_seen_ns` starts at
+/// 0, so any nonzero reading differs) — one sample for a freeze that may have
+/// happened before the restart. That is a deliberate trade: the alternative,
+/// seeding `last_seen_ns` from the word at construction, would miss a genuine
+/// freeze that lands during startup.
+#[derive(Default)]
+pub struct SnapshotFreezeStats {
+    last_seen_ns: [AtomicU64; CNC_MAX_SERVICES],
+    max_ns: [AtomicU64; CNC_MAX_SERVICES],
+    sum_ns: [AtomicU64; CNC_MAX_SERVICES],
+    count: [AtomicU64; CNC_MAX_SERVICES],
+    last_instant_pos: AtomicU64,
+}
+
+impl SnapshotFreezeStats {
+    /// Call once per scrape, before any [`SnapshotFreezeStats::observe_row`]
+    /// call for that scrape: if `instant_pos`
+    /// (`uc2_snapshot_instant_position`'s reading) has moved since the last
+    /// scrape, every row's running max resets to 0 — "reset per instant".
+    fn observe_instant(&self, instant_pos: u64) {
+        if self.last_instant_pos.swap(instant_pos, Ordering::AcqRel) != instant_pos {
+            for m in &self.max_ns {
+                m.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Fold this scrape's raw `freeze_ns` reading for `row` into the running
+    /// stats and return the up-to-date `(max_ns, sum_ns, count)` triple to
+    /// render. Must run after this scrape's [`SnapshotFreezeStats::observe_instant`]
+    /// call, so a freeze that lands in the SAME scrape as the instant
+    /// advancing folds into the fresh (just-reset) max.
+    fn observe_row(&self, row: usize, raw_ns: u64) -> (u64, u64, u64) {
+        if self.last_seen_ns[row].swap(raw_ns, Ordering::AcqRel) != raw_ns {
+            self.sum_ns[row].fetch_add(raw_ns, Ordering::Relaxed);
+            self.count[row].fetch_add(1, Ordering::Relaxed);
+            self.max_ns[row].fetch_max(raw_ns, Ordering::Relaxed);
+        }
+        (
+            self.max_ns[row].load(Ordering::Relaxed),
+            self.sum_ns[row].load(Ordering::Relaxed),
+            self.count[row].load(Ordering::Relaxed),
+        )
+    }
+}
 
 fn push_family_header(out: &mut String, name: &str, help: &str, ty: &str) {
     out.push_str("# HELP ");
@@ -229,10 +317,40 @@ struct ServiceRow {
     fired: u64,
     /// Fired timers whose stamp exceeded their deadline.
     late: u64,
+    /// Coordinated-snapshot spec §9: instants this row failed to reach
+    /// before being superseded.
+    snapshot_row_incomplete: u64,
+    /// The longest freeze this row has reported since the last instant
+    /// advance, in seconds (`uc2_snapshot_freeze_seconds_max`).
+    freeze_max_seconds: f64,
+    /// Cumulative freeze duration this row has reported, in seconds
+    /// (`uc2_snapshot_freeze_seconds_sum`).
+    freeze_sum_seconds: f64,
+    /// Distinct freeze durations sampled for this row
+    /// (`uc2_snapshot_freeze_seconds_count`) — a LOWER bound on freezes; see
+    /// [`SnapshotFreezeStats`].
+    freeze_count: u64,
 }
 
 fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
     let declared = s.cnc.services_declared();
+    // Coordinated-snapshot spec §9: reset every row's running freeze max if
+    // the leader's last-commanded instant has advanced since the last
+    // scrape — BEFORE any row's raw reading folds in below, so a freeze that
+    // lands in the same scrape as the advance counts toward the fresh max.
+    //
+    // Ruling P13(b) split that reading in two, so the edge is the max of
+    // both: a VOTER's rows freeze for the FULL instants it commands (the
+    // standby gauge is 0 there), and a LEARNER's rows freeze for the STANDBY
+    // instants its uc2-cluster agent acts on (it never leads, so the full
+    // gauge is 0 or a stale reading from an earlier term). Taking the max
+    // keeps one edge detector for both roles; positions only grow, so it
+    // moves exactly when the instant this node's rows are working on does.
+    s.snapshot_freeze.observe_instant(
+        s.snapshot_instant_position
+            .load(Ordering::Relaxed)
+            .max(s.snapshot_standby_instant_position.load(Ordering::Acquire)),
+    );
     let mut rows = Vec::new();
     for id in 0..CNC_MAX_SERVICES as u8 {
         if declared & (1u64 << id) == 0 {
@@ -247,6 +365,9 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             .name()
             .map(|n| n.as_str().to_string())
             .unwrap_or_default();
+        let (freeze_max_ns, freeze_sum_ns, freeze_count) = s
+            .snapshot_freeze
+            .observe_row(id as usize, slot.identity.freeze_ns());
         rows.push(ServiceRow {
             labels: format!("service=\"{name}\",row=\"{id}\""),
             attached: attached as u64,
@@ -261,6 +382,10 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
             timers_pending: slot.identity.timers_pending(),
             fired: s.timer_stats.fired[id as usize].load(Ordering::Relaxed),
             late: s.timer_stats.late[id as usize].load(Ordering::Relaxed),
+            snapshot_row_incomplete: s.snapshot_row_incomplete[id as usize].load(Ordering::Relaxed),
+            freeze_max_seconds: freeze_max_ns as f64 / 1e9,
+            freeze_sum_seconds: freeze_sum_ns as f64 / 1e9,
+            freeze_count,
         });
     }
     rows
@@ -332,6 +457,34 @@ fn push_service_labeled(
 ) {
     let samples: Vec<(String, u64)> = rows.iter().map(|r| (r.labels.clone(), pick(r))).collect();
     push_labeled(out, name, help, ty, &samples);
+}
+
+/// [`push_labeled`] for an `f64` sample value.
+fn push_labeled_f64(out: &mut String, name: &str, help: &str, ty: &str, samples: &[(String, f64)]) {
+    push_family_header(out, name, help, ty);
+    for (labels, value) in samples {
+        out.push_str(name);
+        out.push('{');
+        out.push_str(labels);
+        out.push_str("} ");
+        out.push_str(&value.to_string());
+        out.push('\n');
+    }
+}
+
+/// [`push_service_labeled`] for an `f64` family with no aggregate twin —
+/// `uc2_snapshot_freeze_seconds_max`/`_sum` (spec §9), which have no
+/// histogram type to render as.
+fn push_service_labeled_f64(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    ty: &str,
+    rows: &[ServiceRow],
+    pick: impl Fn(&ServiceRow) -> f64,
+) {
+    let samples: Vec<(String, f64)> = rows.iter().map(|r| (r.labels.clone(), pick(r))).collect();
+    push_labeled_f64(out, name, help, ty, &samples);
 }
 
 /// M14c (spec §9): every per-FSM family, aggregates included, as one
@@ -444,6 +597,62 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "counter",
         &rows,
         |r| r.late,
+    );
+    push_service_labeled(
+        out,
+        "uc2_snapshot_row_incomplete_total",
+        "Instants this row OWED a freeze for and failed to reach before being superseded (coordinated-snapshot spec §9): the row never froze in time, and the next instant supersedes it. A superseded STANDBY instant on a node that is not a learner is NOT counted here (ruling P13): a voter's row is supposed not to freeze for one.",
+        "counter",
+        &rows,
+        |r| r.snapshot_row_incomplete,
+    );
+    push_service_labeled_f64(
+        out,
+        "uc2_snapshot_freeze_seconds_max",
+        "The longest freeze() call this row has reported since the instant its node's rows are working on last advanced (coordinated-snapshot spec §5.7/§9) — max(uc2_snapshot_instant_position, uc2_snapshot_standby_instant_position), so the FULL instant on a voter and the STANDBY one on a learner; reset to 0 on the scrape after that moves. No histogram type exists in this encoder, so this and _sum/_count stand in for one.",
+        "gauge",
+        &rows,
+        |r| r.freeze_max_seconds,
+    );
+    push_service_labeled_f64(
+        out,
+        "uc2_snapshot_freeze_seconds_sum",
+        "Cumulative freeze() duration this row has reported, in seconds (coordinated-snapshot spec §9); paired with _count for a mean.",
+        "counter",
+        &rows,
+        |r| r.freeze_sum_seconds,
+    );
+    push_service_labeled(
+        out,
+        "uc2_snapshot_freeze_seconds_count",
+        "DISTINCT freeze durations sampled from this row's cnc word at scrape boundaries (coordinated-snapshot spec §9); paired with _sum for a mean. Read it as a LOWER BOUND on freezes, not a count of them: the word carries no sequence number, so two identical consecutive durations count once and N freezes between two scrapes count once. It also resets to 0 when the node process restarts (it is process-local, derived state, not a cnc word).",
+        "counter",
+        &rows,
+        |r| r.freeze_count,
+    );
+    push_gauge(
+        out,
+        "uc2_snapshot_instant_position",
+        "The last snapshot instant this node COMMANDED as leader, 0 if never (coordinated-snapshot spec §9); leader-local — a follower's reading is whatever it last commanded in some earlier term.",
+        s.snapshot_instant_position.load(Ordering::Relaxed),
+    );
+    push_gauge(
+        out,
+        "uc2_snapshot_standby_instant_position",
+        "The last STANDBY snapshot instant this node's uc2-cluster agent ACTED on, 0 if it never has (coordinated-snapshot spec §5.7/§9, ruling P13). LEARNER-ONLY: a voter skips every standby instant by design, so it exports 0 — which is what keeps Uc2StandbySnapshotStalled off voters. Alert: Uc2StandbySnapshotStalled.",
+        s.snapshot_standby_instant_position.load(Ordering::Acquire),
+    );
+    push_gauge(
+        out,
+        "uc2_snapshot_set_position",
+        "The position of the newest COMPLETE snapshot set this node holds, 0 until the first one; must agree cluster-wide once caught up (coordinated-snapshot spec §5.3/§9). Alerts: Uc2SnapshotStalled, Uc2SnapshotSetDiverged.",
+        s.snapshot_set_position.load(Ordering::Acquire),
+    );
+    push_gauge(
+        out,
+        "uc2_snapshot_fetched_position",
+        "The newest set this node FETCHED whole from a learner (coordinated-snapshot spec §5.7 item 4), 0 if it never has.",
+        s.snapshot_fetched_position.load(Ordering::Acquire),
     );
     push_gauge(
         out,
@@ -841,6 +1050,22 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_snapshot_refused_position_total",
+        "Snapshot sessions refused because the sender's SNAP_BEGINs disagreed about the set's position — a set is the artifacts at ONE instant, and a source that mixes two would install a cluster image and a row image taken at different points of the log (coordinated-snapshot spec §5.6).",
+        s.receiver
+            .snap_refused_position_mismatch
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
+        "uc2_snapshot_refused_fetch_expired_total",
+        "Snapshot sessions refused because they answered a `snapshot fetch` this node had already given up on: the set is neither stored nor installed, and the operator's verb is re-runnable (coordinated-snapshot spec §5.7, Ruling P11).",
+        s.receiver
+            .snap_refused_fetch_expired
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
         "uc2_snapshot_intake_io_failures_total",
         "Local I/O failures on the snapshot INTAKE path: a `.part` that could not be created/sized or written to, or a completed artifact whose fsync/rename failed. Retried, but a persistent count means this node's snapshot dir is full, read-only, or obstructed (spec §14.3). Since 2.8.1 a failed publish is retried at most once per 250 ms per transfer — on the duty cycle AND on the chunk path — so a standing obstacle makes this climb at about four per second, not at the poll or chunk rate.",
         s.receiver.snap_intake_io_failures.load(Ordering::Relaxed),
@@ -1150,6 +1375,12 @@ mod tests {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_set_position: Arc::new(AtomicU64::new(0)),
+            snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,
             journal_segment_bytes: 64 << 20,
@@ -1199,6 +1430,62 @@ mod tests {
         }
     }
 
+    /// Final wave M5 (parked as T8): [`SnapshotFreezeStats`]'s edge detection
+    /// is subtle enough that a regression would only show up on a fleet run —
+    /// the reset-on-instant-advance, the no-double-count-on-equal-values
+    /// blind spot, and the ordering rule that a freeze landing in the SAME
+    /// scrape as an instant advance must fold into the FRESH max.
+    ///
+    /// Driven directly rather than through `render_prometheus` so each rule is
+    /// asserted on its own, in the order the exporter calls them.
+    #[test]
+    fn snapshot_freeze_stats_resets_per_instant_and_never_double_counts_a_value() {
+        let st = SnapshotFreezeStats::default();
+
+        // Scrape 1: first reading for row 0 — one observation.
+        st.observe_instant(4096);
+        assert_eq!(st.observe_row(0, 500), (500, 500, 1));
+        // ...and row 1 is independent.
+        assert_eq!(st.observe_row(1, 900), (900, 900, 1));
+
+        // Scrape 2, same instant, IDENTICAL word: the known blind spot —
+        // nothing folds, and the max is held (not reset: the instant has not
+        // moved).
+        st.observe_instant(4096);
+        assert_eq!(
+            st.observe_row(0, 500),
+            (500, 500, 1),
+            "an unchanged cnc word is not a new freeze"
+        );
+
+        // Scrape 3, same instant, a SHORTER freeze: counted, summed, and the
+        // running max is unchanged because it is a max.
+        st.observe_instant(4096);
+        assert_eq!(st.observe_row(0, 100), (500, 600, 2));
+
+        // Scrape 4: the instant advances. Every row's max resets — and,
+        // crucially, `observe_instant` runs BEFORE the rows, so a freeze read
+        // in this same scrape folds into the fresh max rather than a stale
+        // one. `_sum`/`_count` are counters and never reset.
+        st.observe_instant(8192);
+        assert_eq!(
+            st.observe_row(0, 300),
+            (300, 900, 3),
+            "the new max is this scrape's reading, not the old 500"
+        );
+        assert_eq!(
+            st.observe_row(1, 900),
+            (0, 900, 1),
+            "row 1's max reset too, and its unchanged word folded nothing"
+        );
+
+        // A gauge that goes BACKWARDS still resets (`changes`, not `>`): the
+        // standby gauge can be lower than a stale full-instant reading, and
+        // the exporter feeds the max of the two.
+        st.observe_instant(4096);
+        assert_eq!(st.observe_row(0, 300), (0, 900, 3), "max reset, word same");
+    }
+
     /// P5: `monitor-a-cluster.md` states the contract's SIZE — "89 families"
     /// — and nothing made that number a build-time fact, so adding a series
     /// silently made the doc wrong. This pins the count; a deliberate change
@@ -1207,7 +1494,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            89,
+            99,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -1472,6 +1759,24 @@ mod tests {
             text.contains("uc2_snapshot_refused_version_total 1\n"),
             "{text}"
         );
+        // Coordinated-snapshot spec §5.6: and the fourth, the one-position
+        // rule's — a source that mixed two instants; plus the fifth (Ruling
+        // P11), a learner answering a fetch this node gave up on.
+        s.receiver
+            .snap_refused_position_mismatch
+            .fetch_add(2, Ordering::Relaxed);
+        s.receiver
+            .snap_refused_fetch_expired
+            .fetch_add(4, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("uc2_snapshot_refused_position_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_refused_fetch_expired_total 4\n"),
+            "{text}"
+        );
     }
 
     /// Task 7 (spec §4.5): a service is found by NAME, so per-FSM labels
@@ -1512,6 +1817,12 @@ mod tests {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_set_position: Arc::new(AtomicU64::new(0)),
+            snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,
             journal_segment_bytes: 64 << 20,

@@ -625,6 +625,11 @@ fn elle_partition() {
 #[test]
 #[ignore]
 fn elle_purge() {
+    // `snapshot_interval_bytes` no longer configures a cadence
+    // (coordinated-snapshot spec §5.2) — it only makes the rows CAPABLE. The
+    // fault loop below commands an instant on every cycle, which is what
+    // moves the floor this pass's non-vacuity check reads.
+    // `scripts/elle_check.sh` runs this pass.
     let ccfg = ClusterCfg {
         purge: uc_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
@@ -640,10 +645,19 @@ fn elle_purge() {
         4,
         70,
         Duration::from_millis(1200),
-        |cluster, rng, _faults| match rng.random_range(0..3u8) {
-            0 => cluster.kill_and_restart_leader(),
-            1 => cluster.crash_and_restart_leader_service(),
-            _ => cluster.crash_and_restart_random_follower_service(rng),
+        |cluster, rng, _faults| {
+            // Spec §5.5: the instant FIRST, while the cluster is still whole
+            // — a set completes only if every row and the cluster FSM reach
+            // P, so commanding one straight into a kill would mostly abandon
+            // it. Best-effort (`None` on no leader / in flight): the loop runs
+            // many cycles, and the pass's non-vacuity check is what
+            // adjudicates whether any of them landed.
+            cluster.command_instant();
+            match rng.random_range(0..3u8) {
+                0 => cluster.kill_and_restart_leader(),
+                1 => cluster.crash_and_restart_leader_service(),
+                _ => cluster.crash_and_restart_random_follower_service(rng),
+            }
         },
         |cluster, _faults| cluster.max_archive_first_base() > 0,
         "purge never advanced the archive floor",

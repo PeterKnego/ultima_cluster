@@ -94,8 +94,8 @@ use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
 use uc_service::{
-    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy,
-    SnapshotStateMachine, StateMachine,
+    ApplyCtx, Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotStateMachine,
+    StateMachine,
 };
 
 // ------------------------------------------------------------------ CLI
@@ -177,10 +177,10 @@ struct ServiceArgs {
     instance_dir: PathBuf,
     #[arg(long, default_value = "m7-gate")]
     app_id: String,
-    /// M6 pairing: snapshot cadence in bytes of applied command payload
-    /// (mirrors `m6_gate`'s `SnapshotPolicy::interval_bytes`). 0 (default) =
-    /// off — the service starts plain (`ServiceBuilder::start`), current
-    /// behavior unchanged. > 0 starts with `start_with_snapshots`, giving the
+    /// M6 pairing: snapshot capability (the byte value no longer configures a
+    /// cadence — coordinated-snapshot spec §5.2). 0 (default) = off — the
+    /// service starts plain (`ServiceBuilder::start`), current behavior
+    /// unchanged. > 0 starts with `start_with_snapshots`, giving the
     /// node a real snapshot floor to purge below and a snapshot session for
     /// distant joiners/reconstructions to install instead of replaying the
     /// full journal from genesis.
@@ -328,13 +328,18 @@ impl SnapshotStateMachine for RegSm {
         }
         let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if pos != position {
+        // Coordinated-snapshot spec §5.2: the tag is the instant P, an
+        // EXCLUSIVE frontier (the frame-end of the `SNAPSHOT` frame), so the
+        // payload's own position sits at or below it — and it, not the tag,
+        // is what `last_applied` must report, or the framework's
+        // `pos > last_applied` guard swallows the frame that starts at P.
+        if pos > position {
             return Err(SnapshotError::Codec(format!(
-                "snapshot payload position {pos} != requested {position}"
+                "snapshot payload position {pos} is above the artifact tag {position}"
             )));
         }
         self.value = v;
-        self.last_applied = Some(position);
+        self.last_applied = Some(pos);
         Ok(position)
     }
 }
@@ -386,6 +391,7 @@ fn make_config(
     app_id: String,
     purge: PurgePolicy,
     journal_segment_bytes: u64,
+    snapshot_interval_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -397,7 +403,14 @@ fn make_config(
         buffer_bytes: BUFFER_BYTES,
         max_payload: 256,
         admission_bytes_default: 256 * 1024,
-        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        // Coordinated-snapshot spec §5.5/§6: the snapshot CADENCE is a
+        // replicated setting now, seeded at genesis. The per-service byte
+        // cadence M6 used is deleted; `snapshot_interval_bytes` here is the
+        // same number, moved to where the cluster agrees on it.
+        settings_genesis: uc_protocol::v2::settings::Settings {
+            snapshot_interval_bytes,
+            ..uc_protocol::v2::settings::Settings::genesis_default()
+        },
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(id),
@@ -410,8 +423,10 @@ fn make_config(
 }
 
 /// `snapshot_interval_bytes == 0` starts the service plain (current
-/// behavior); `> 0` starts it with a snapshot policy (M6 pairing — see the
-/// module doc).
+/// behavior); `> 0` starts it snapshot-CAPABLE (M6 pairing — see the module
+/// doc). The same number is seeded into `make_config`'s replicated settings,
+/// where it is the cluster's snapshot CADENCE — so a capable row and a
+/// cadence that commands instants for it always arrive together.
 fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> Service<RegSm> {
     if snapshot_interval_bytes == 0 {
         let cfg = ServiceConfig::new(dir, APP);
@@ -419,9 +434,10 @@ fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> Service<RegSm> {
             .start()
             .expect("service start")
     } else {
-        let cfg = ServiceConfig::new(dir, APP).snapshot_policy(SnapshotPolicy {
-            interval_bytes: snapshot_interval_bytes,
-        });
+        // The byte cadence is gone (coordinated-snapshot spec §5.2): `> 0`
+        // only means "capable" here, and the leader's cadence is what
+        // commands the instants this row freezes at.
+        let cfg = ServiceConfig::new(dir, APP);
         ServiceBuilder::new(cfg, RegSm::default())
             .start_with_snapshots()
             .expect("snapshot service start")
@@ -456,6 +472,16 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
         a.app_id,
         purge,
         a.journal_segment_bytes,
+        // Coordinated-snapshot spec §5.5: the cadence PAIRS with purge, as
+        // this role's `--purge-below-snapshot` doc already says the service's
+        // `--snapshot-interval-bytes` does — without instants the floor never
+        // moves and there is nothing to purge below. No new flag: the fleet
+        // driver's node command line is unchanged.
+        if a.purge_below_snapshot {
+            SNAPSHOT_INTERVAL_BYTES
+        } else {
+            0
+        },
     );
     let node = Node::start(cfg)?;
     println!("m7_gate node {} up; parking (harness owns lifecycle)", a.id);
@@ -1010,6 +1036,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
             APP.into(),
             SMOKE_PURGE,
             SEGMENT_BYTES,
+            SNAPSHOT_INTERVAL_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
@@ -1128,6 +1155,7 @@ fn scenario_replace_a_box(
         APP.into(),
         SMOKE_PURGE,
         SEGMENT_BYTES,
+        SNAPSHOT_INTERVAL_BYTES,
     );
     let node = Node::start_with_socket(cfg, sock).expect("start spare");
     let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
@@ -1242,6 +1270,7 @@ fn scenario_resize_3_5_3(
             APP.into(),
             SMOKE_PURGE,
             SEGMENT_BYTES,
+            SNAPSHOT_INTERVAL_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("start spare");
         let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);

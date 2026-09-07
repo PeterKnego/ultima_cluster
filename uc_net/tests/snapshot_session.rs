@@ -62,14 +62,18 @@ fn snapshot_bytes(id: u8) -> Vec<u8> {
         .collect()
 }
 
-/// The artifact position FSM `id` publishes in these tests.
-fn snap_pos(id: u8) -> u64 {
-    64 * 1024 + id as u64 * 4096
+/// The artifact position FSM `id` publishes in these tests. Coordinated-
+/// snapshot spec §5.6 — the ONE-POSITION rule: a set is the
+/// artifacts at ONE instant, so this is the same P for every row (and for the
+/// cluster artifact below). It takes an `id` only so the call sites still read
+/// as "row `id`'s artifact's position".
+fn snap_pos(_id: u8) -> u64 {
+    64 * 1024
 }
 
-/// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT's position — above every row's,
-/// so the floor a joiner adopts is still the rows' minimum.
-const CLUSTER_POS: u64 = 64 * 1024 + 8 * 4096;
+/// Cluster-FSM spec §5.6: the CLUSTER ARTIFACT's position — the SET's, like
+/// every row's (spec §5.6). A session whose BEGINs disagree is refused.
+const CLUSTER_POS: u64 = 64 * 1024;
 
 /// The cluster artifact's bytes (an opaque image to `uc_net` — the node layer
 /// is what parses it), distinguishable from every row's.
@@ -178,7 +182,13 @@ fn build_with_versions(faults: FaultConfig, names: &[&str], versions: [u32; 8]) 
         path: cluster_path,
         len: cluster_bytes().len() as u64,
     });
-    let snapshot_source: uc_net::sender::SnapshotSource = Arc::new(move || {
+    // Spec §5.7: `at` selects the set. This leader holds exactly one, at
+    // `CLUSTER_POS`; `None` (its floor) and `Some(that)` are served, anything
+    // else is refused — the shape `uc_node::snapshot_set_at` has.
+    let snapshot_source: uc_net::sender::SnapshotSource = Arc::new(move |at: Option<u64>| {
+        if at.is_some_and(|p| p != CLUSTER_POS) {
+            return None;
+        }
         Some(uc_net::sender::SnapshotSet {
             services_declared: declared,
             identity,

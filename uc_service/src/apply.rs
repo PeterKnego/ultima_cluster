@@ -14,21 +14,22 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
 use uc_protocol::ring::{RingError, SpscConsumer, SpscProducer};
-use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
+use uc_protocol::v2::cnc::{NODE_FLAG_LEADER, NODE_FLAG_LEARNER};
 use uc_protocol::v2::frame::{
-    FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_TIMER, read_timer_body,
+    FLAG_SNAPSHOT_STANDBY, FLAG_TIMER_TABLE, FRAME_TYPE_MESSAGE, FRAME_TYPE_SNAPSHOT,
+    FRAME_TYPE_TIMER, FrameHeader, align_frame_len, read_timer_body,
 };
 use uc_protocol::v2::ipc::{MSG_V2_SCHED, SchedOp, SchedRecord, write_sched_record};
 
 use crate::builder_agent::BuildJob;
 use crate::config::SnapshotError;
 use crate::egress::Egress;
-use crate::replay::{Replay, replay_into};
+use crate::replay::{Replay, ReplayInstant, replay_into};
 use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 
 /// Time-and-timers §4.8: how many spins `write_sched` has taken waiting on a
@@ -36,6 +37,19 @@ use crate::traits::{ApplyCtx, RawStateMachine, TimerEvent};
 /// surface (uc_service has no `uc_obs` dependency) — a later task may wire
 /// it up; for now it exists so a spin storm leaves a countable trace.
 pub(crate) static SCHED_RING_FULL_SPINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Coordinated-snapshot spec §10: instants this row declined because a build
+/// was still in flight. Each one leaves this node's set at that instant
+/// incomplete — the honest outcome, not an error. Process-global and `pub`
+/// (re-exported at the crate root) so the observability task can read it.
+pub static SNAPSHOT_SKIPPED_BUSY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Coordinated-snapshot spec §10: instants whose `freeze()` returned an error.
+/// Same consequence as [`SNAPSHOT_SKIPPED_BUSY`] — an incomplete set — but a
+/// service-side defect rather than a timing one, so it is counted apart.
+pub static SNAPSHOT_FREEZE_FAILED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Spike-only apply-budget probes (feature `apply-profile`). Counters are
@@ -148,15 +162,15 @@ pub(crate) struct SnapshotRestore<S: RawStateMachine> {
 
 /// M6 Task 3: the apply thread's half of the snapshot-builder handoff. Present
 /// only when the service was started via `start_with_snapshots`; `None` for a
-/// plain `start()` (or an SM that never opted in) means [`maybe_build_snapshot`]
-/// is a no-op every cycle.
+/// plain `start()` (or an SM that never opted in) means the row is not
+/// snapshot-capable and [`on_snapshot_frame`] ignores every instant.
+///
+/// Coordinated-snapshot spec §5.2: the trigger is now the LOG — a
+/// `FRAME_TYPE_SNAPSHOT` frame — so this type carries no cadence of its own.
+/// The M6 byte-interval policy and the `last_snapshot_pos` basis it needed are
+/// deleted; the leader decides when every row freezes, and it decides once for
+/// the whole cluster.
 pub(crate) struct SnapshotTrigger<S: RawStateMachine> {
-    pub(crate) policy: crate::config::SnapshotPolicy,
-    /// The position basis for the next interval check: updated to the
-    /// attempted position whenever a freeze is attempted (success OR failure)
-    /// — see [`maybe_build_snapshot`]'s doc for why a failure still advances
-    /// this rather than hot-looping a retry every cycle.
-    pub(crate) last_snapshot_pos: u64,
     /// Shared with the builder thread's `BuilderState`. Gates BOTH directions
     /// of "one in-flight build max": checked here before even calling
     /// `freeze()`, held by the builder for the full stream+publish duration.
@@ -432,12 +446,15 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
             .store_release(unix_ns());
         return false;
     }
-    // Cluster-FSM spec §4.9: read the leader flag ONCE, at the top of the
-    // cycle — before the announce flush below, so the rising edge is
-    // detected before anything can gate on `is_leader`, and reused for the
-    // whole cycle's batch (a direct field access, not a `&self` method, so
+    // Cluster-FSM spec §4.9: read the node-written status flags word ONCE, at
+    // the top of the cycle — before the announce flush below, so the rising
+    // edge is detected before anything can gate on `is_leader`, and reused for
+    // the whole cycle's batch (a direct field access, not a `&self` method, so
     // it does not conflict with the `follower` borrow the batch holds).
-    let is_leader = st.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
+    // Coordinated-snapshot spec §5.7 rides the same single read:
+    // `NODE_FLAG_LEARNER` decides whether a standby-flagged instant is ours.
+    let node_flags = st.cnc.status().flags.load_acquire();
+    let is_leader = node_flags & NODE_FLAG_LEADER != 0;
     if is_leader && !st.was_leader {
         st.announce_pending = true; // spec §4.9: announce on the rising edge
     }
@@ -607,6 +624,16 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                                 is_leader,
                             );
                         }
+                    } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT {
+                        let slot = crate::attach::slot(&st.cnc, st.service_id);
+                        on_snapshot_frame(
+                            &mut st.snapshot_trigger,
+                            &sm,
+                            pos,
+                            &hdr,
+                            node_flags,
+                            slot,
+                        );
                     }
                     if one_frame {
                         break; // lockstep: exactly one frame past the floor
@@ -663,6 +690,14 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 &st.cnc,
                 &st.journal_dir,
                 st.snapshot_restore.as_ref(),
+                // Ruling P10: the span this replay walks may hold the very
+                // instant the leader is waiting on. Same trigger, same flags
+                // word as the live arm above — one decision, two paths.
+                ReplayInstant {
+                    trigger: &mut st.snapshot_trigger,
+                    node_flags,
+                    service_id: st.service_id,
+                },
             ) {
                 Ok(Replay::Rejoin(cursor)) => cursor,
                 // The covering artifact is above `min(commit, durable)`: the
@@ -708,75 +743,127 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
         .heartbeat_ns
         .store_release(unix_ns());
     drain_queries(st);
-    // M6 Task 3: the freeze hook, last in the cycle (module doc / brief) —
-    // strictly after the batch loop above has published this cycle's
-    // `service_applied`, so a freeze taken here always sees the freshest
-    // position this cycle produced.
-    maybe_build_snapshot(st);
     progressed
 }
 
-/// Check the snapshot policy's interval and, if tripped, `freeze()` the SM
-/// (taking its lock briefly — NOT the whole cycle's lock span) and hand the
-/// resulting streaming job to the builder thread over the 1-slot channel.
+/// Coordinated-snapshot spec §5.2/§5.7: act on a `FRAME_TYPE_SNAPSHOT` frame.
 ///
-/// No-op whenever: there is no trigger (plain `start()`, or an SM that never
-/// opted into `start_with_snapshots`); the policy is `interval_bytes: 0`
-/// ("never" — the default); a build is already in flight (`busy`); or the
-/// threshold hasn't tripped yet.
+/// **Out of line on purpose** (M14a's hot-loop rule): the arm in the frames
+/// loop is one frame-type test and one call to this. A wait ladder written
+/// inline into that loop body cost 9 % at N=1 through codegen alone — on a
+/// path N=1 never executes (`docs/benchmarks/uc2-m14a-apply-hop-2026-08-27.md`).
 ///
-/// **Both freeze failure and a full/disconnected handoff still advance
-/// `last_snapshot_pos`** to this cycle's `service_applied` — deliberately: the
-/// alternative (leaving the basis unchanged) would re-attempt `freeze()` every
-/// single apply cycle for as long as the failure persists, turning "next
-/// interval retries" into a hot loop of freeze calls + log lines. Advancing the
-/// basis means a genuinely broken `freeze()` is retried once per
-/// `interval_bytes` worth of progress, same cadence as the happy path — a
-/// failed build looks, from the trigger's point of view, just like a
-/// successful one that produced nothing durable.
-fn maybe_build_snapshot<S: RawStateMachine>(st: &mut ApplyState<S>) {
-    let Some(trigger) = st.snapshot_trigger.as_mut() else {
-        return;
+/// The freeze runs INSIDE the batch's SM lock span (this is called from the
+/// frames loop, which holds the guard), not in a short span of its own at the
+/// end of the cycle as the M6 byte-trigger did — so this cycle's `applied`
+/// publication is delayed by one freeze. That is the cost spec §5.7/§10 already
+/// state for a non-standby instant: on a quorum it is what stalls commit at
+/// `P + fsm_lag`, and standby instants exist to avoid paying it on voters. Only
+/// the STREAMING must stay off-lock, and it still does (`builder_agent`).
+///
+/// The frame is never *applied*: it carries no user bytes, publishes no
+/// response and does not move `last_applied`. It is still a YIELDED frame —
+/// the caller's `one_frame` break fires after it exactly as it does after a
+/// `TIMER` frame, and the cursor advances over it either way, so lockstep and
+/// the lag barrier count it like any other frame.
+///
+/// Three silent declines, in order (spec §10 — an incomplete set is the honest
+/// outcome of every one of them, never a fail-stop):
+///
+/// 1. **No trigger.** A row started with plain `start()` is not
+///    snapshot-capable and never sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`; the
+///    leader refuses to command an instant on a cluster holding one
+///    (`48 snapshot_unsupported`, spec §5.5), so reaching here means the frame
+///    predates the refusal or the row is a harness. Ignore it.
+/// 2. **A standby instant on a node that is not a learner** (spec §5.7). The
+///    whole point of the flag is that voters do not pay the freeze, whose cost
+///    is O(state) on the apply thread and would cap a quorum's durable reports
+///    at `P + fsm_lag` simultaneously.
+/// 3. **A build already in flight.** One in flight max, the rule `busy` has
+///    enforced since M6; this row is simply incomplete for THIS instant, which
+///    [`SNAPSHOT_SKIPPED_BUSY`] counts.
+/// 4. **An instant at or below what the SM has already applied** (final wave
+///    M4). Unreachable on the live walk today — post-install the cursor is set
+///    to the artifact's tag and post-replay to the replay end, and in both
+///    cases `last_applied()` is strictly below the cursor — but the reason it
+///    is unreachable is a GLOBAL argument about every cursor-setting path,
+///    whereas the replay twin (`replay.rs`) makes the same invariant LOCAL
+///    with one comparison. Freezing at such a frame would tag state above P
+///    with P, a divergence the artifact envelope cannot catch (the tag IS P),
+///    and fix round 3 exists because that class of bug is invisible. One
+///    compare, on a rare arm.
+///
+/// Takes the `ApplyState` fields it touches individually rather than
+/// `&mut ApplyState<S>`: the call site runs with the SM's `MutexGuard` alive,
+/// which borrows `st.sm`, so a helper taking the whole struct would conflict
+/// with it — exactly the reason `write_sched_if_leader` above is shaped the
+/// same way. `slot` is this row's cnc slot (`crate::attach::slot(&st.cnc,
+/// st.service_id)`), needed only to publish the freeze duration — spec §9's
+/// `uc2_snapshot_freeze_seconds_max/_sum/_count{row}`.
+#[inline(never)]
+pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
+    trigger: &mut Option<SnapshotTrigger<S>>,
+    sm: &S,
+    pos: u64,
+    hdr: &FrameHeader,
+    node_flags: u64,
+    slot: &uc_log::cnc::ServiceSlot,
+) {
+    let Some(trig) = trigger.as_mut() else {
+        return; // 1. not snapshot-capable
     };
-    if trigger.policy.interval_bytes == 0 {
-        return; // "never" (default policy)
+    if hdr.flags & FLAG_SNAPSHOT_STANDBY != 0 && node_flags & NODE_FLAG_LEARNER == 0 {
+        return; // 2. a voter on a standby instant
     }
-    if trigger.busy.load(Ordering::Acquire) {
-        return; // one in-flight build max
+    if trig.busy.load(Ordering::Acquire) {
+        SNAPSHOT_SKIPPED_BUSY.fetch_add(1, Ordering::Relaxed);
+        return; // 3. one in-flight build max
     }
-    let applied = crate::attach::slot(&st.cnc, st.service_id)
-        .applied
-        .load_acquire();
-    if applied.saturating_sub(trigger.last_snapshot_pos) < trigger.policy.interval_bytes {
+    // 4. belt and braces, the replay twin's guard made local here too. Note
+    //    the comparison is against the frame's START (`pos`), matching
+    //    `replay.rs`'s `Some(pos) > guard.last_applied()`: `last_applied()` is
+    //    the SM's own last applied MESSAGE, which is strictly below the
+    //    instant's frame, so an instant this row is legitimately at has
+    //    `pos > last_applied`. A trait call, but on the SNAPSHOT arm only.
+    if Some(pos) <= sm.last_applied() {
         return;
     }
-
-    let frozen = {
-        // The SM lock, taken briefly for `freeze()` ONLY — never held across
-        // the (off-thread) stream/publish work, per the brief's lock-rule
-        // split.
-        let sm = st.sm.lock().unwrap();
-        (trigger.freeze)(&sm)
-    };
-    match frozen {
-        Ok((job, pos)) => {
-            trigger.last_snapshot_pos = pos;
-            trigger.busy.store(true, Ordering::Release);
-            if trigger.tx.try_send((pos, job)).is_err() {
-                // Defensive only: under normal operation `busy` already
-                // prevents this (the builder can't be mid-cycle AND have an
-                // empty channel slot occupied by us at the same time). Revert
-                // `busy` so a torn/disconnected builder can't wedge future
-                // attempts forever.
-                trigger.busy.store(false, Ordering::Release);
+    // **P**, the instant: this frame's END position, not its start. Everything
+    // below P has applied (this frame is the last one yielded before the
+    // freeze), so the artifact is a function of the log below P — the same
+    // function on every node, which is what makes the set position-aligned.
+    // The tag is P and NOT the position `freeze()` reports (the SM's own last
+    // applied MESSAGE, strictly below P): every row's artifact for one instant
+    // must carry the SAME tag or the node can never detect a complete set.
+    let p = pos + align_frame_len(hdr.length as usize) as u64;
+    // The SM lock is already held by the frames loop; `freeze()` is expected to
+    // pin state cheaply and hand the streaming off — the builder thread does
+    // the writing, off-lock (`builder_agent`'s module doc). The `Instant` pair
+    // brackets exactly this call (spec §9): it is the synchronous cost that
+    // can stall the apply thread (§5.7's commit-stall argument), not the
+    // builder's async write, which never touches this thread.
+    let freeze_t0 = Instant::now();
+    let result = (trig.freeze)(sm);
+    let freeze_ns = freeze_t0.elapsed().as_nanos() as u64;
+    slot.identity.store_freeze_ns(freeze_ns);
+    match result {
+        Ok((job, _sm_pos)) => {
+            trig.busy.store(true, Ordering::Release);
+            if trig.tx.try_send((p, job)).is_err() {
+                // Defensive only: `busy` already prevents this (the builder
+                // cannot be idle AND be holding the one channel slot). Revert
+                // it so a torn/disconnected builder cannot wedge every later
+                // instant, and count the row incomplete for this one.
+                trig.busy.store(false, Ordering::Release);
+                SNAPSHOT_SKIPPED_BUSY.fetch_add(1, Ordering::Relaxed);
             }
         }
         Err(e) => {
+            SNAPSHOT_FREEZE_FAILED.fetch_add(1, Ordering::Relaxed);
             eprintln!(
-                "uc_service: snapshot freeze failed at applied={applied}: {e} \
-                 (dropped; the next policy interval retries)"
+                "uc_service: snapshot freeze at instant {p} failed: {e} \
+                 (this row is incomplete for that instant; the next one retries)"
             );
-            trigger.last_snapshot_pos = applied;
         }
     }
 }
@@ -985,7 +1072,10 @@ pub(crate) fn check_node_instance(cnc: &CncPage, attached: u128, streak: &mut u8
 
 #[cfg(test)]
 mod tests {
-    use super::{MSG_V2_SCHED, NODE_FLAG_LEADER, SchedOp, SchedRecord, check_node_instance};
+    use super::{
+        FLAG_SNAPSHOT_STANDBY, MSG_V2_SCHED, NODE_FLAG_LEADER, NODE_FLAG_LEARNER, SchedOp,
+        SchedRecord, check_node_instance,
+    };
     use crate::traits::ApplyCtx;
     use std::sync::Arc;
     use uc_log::cnc::{CncMeta, CncPage};
@@ -1486,5 +1576,123 @@ mod tests {
         // ... and that second episode, too, counts once however long it lasts.
         assert!(!super::apply_cycle(&mut st));
         assert_eq!(waits(&cnc), 2, "still one episode");
+    }
+
+    // ------------------- coordinated snapshot instants (spec §5.2, §5.7)
+
+    /// The `FreezeFn` shape `start_with_snapshots` builds, for `CountSm`: the
+    /// job writes the apply count as 8 LE bytes, so a test can read back
+    /// exactly how much of the log the frozen image covers.
+    fn count_freeze() -> super::FreezeFn<CountSm> {
+        Box::new(|sm: &CountSm| {
+            let n = sm.applies;
+            let job: crate::builder_agent::BuildJob =
+                Box::new(move |w: &mut dyn std::io::Write| {
+                    w.write_all(&n.to_le_bytes()).map_err(Into::into)
+                });
+            Ok((job, sm.last.unwrap_or(0)))
+        })
+    }
+
+    /// Install the snapshot trigger `start_with_snapshots` installs, minus the
+    /// builder thread: the receiver half comes back so a test inspects the
+    /// handoff directly, and `busy` so it can simulate a build in flight.
+    fn with_snapshot_trigger<S: crate::traits::RawStateMachine>(
+        st: &mut super::ApplyState<S>,
+        freeze: super::FreezeFn<S>,
+    ) -> (
+        std::sync::mpsc::Receiver<(u64, crate::builder_agent::BuildJob)>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        st.snapshot_trigger = Some(super::SnapshotTrigger {
+            busy: Arc::clone(&busy),
+            tx,
+            freeze,
+        });
+        (rx, busy)
+    }
+
+    /// Append a `SNAPSHOT` frame with `flags` and advance `durable`/`commit`
+    /// to the new head. Returns **P**, the frame-end position.
+    fn append_snapshot_and_commit(
+        appender: &mut uc_log::buffer::Appender,
+        cnc: &CncPage,
+        flags: u8,
+    ) -> u64 {
+        let (end, _stamp) = appender.append_snapshot(1, flags).unwrap();
+        cnc.counters().durable.store_release(end);
+        cnc.counters().commit.store_release(end);
+        end
+    }
+
+    /// Spec §5.2: the trigger is the log, not a byte counter. The row freezes
+    /// at the SNAPSHOT frame's frame-end P — after everything below P has
+    /// applied, and tagged P (not the SM's own last-applied position).
+    #[test]
+    fn a_snapshot_frame_freezes_at_its_frame_end_after_everything_below_it() {
+        let (mut st, cnc, _sched, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let (rx, _busy) = with_snapshot_trigger(&mut st, count_freeze());
+        cnc.status().flags.store_release(NODE_FLAG_LEADER);
+        append_and_commit(&mut appender, &cnc, &[b"inc", b"inc"]);
+        let end_c = appender.position();
+        let end_s = append_snapshot_and_commit(&mut appender, &cnc, 0);
+        super::apply_cycle(&mut st);
+        let (pos, job) = rx.try_recv().expect("a build job at P");
+        assert_eq!(pos, end_s, "the artifact is tagged with the frame-end P");
+        let mut img = Vec::new();
+        job(&mut img).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(img.as_slice().try_into().unwrap()),
+            2,
+            "frozen AFTER the two incs below P"
+        );
+        assert!(end_c < end_s);
+    }
+
+    /// Spec §5.7: a standby-flagged instant is a learner's work. A voter
+    /// yields the frame like any other node-only frame and pays no freeze.
+    #[test]
+    fn a_standby_instant_is_ignored_by_a_voter_and_taken_by_a_learner() {
+        let (mut st, cnc, _sched, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let (rx, _busy) = with_snapshot_trigger(&mut st, count_freeze());
+        cnc.status().flags.store_release(0); // voter (follower)
+        append_snapshot_and_commit(&mut appender, &cnc, FLAG_SNAPSHOT_STANDBY);
+        super::apply_cycle(&mut st);
+        assert!(rx.try_recv().is_err(), "a voter ignores a standby instant");
+        cnc.status().flags.store_release(NODE_FLAG_LEARNER);
+        let p = append_snapshot_and_commit(&mut appender, &cnc, FLAG_SNAPSHOT_STANDBY);
+        super::apply_cycle(&mut st);
+        assert_eq!(
+            rx.try_recv().map(|(pos, _)| pos).ok(),
+            Some(p),
+            "a learner takes it"
+        );
+    }
+
+    /// Spec §5.2 / §10: a row started with plain `start()` has no capability
+    /// and ignores the frame (the set is simply incomplete); a row whose
+    /// builder is still busy skips this instant and counts the skip.
+    #[test]
+    fn a_non_capable_service_ignores_the_frame_and_a_busy_one_counts_the_skip() {
+        let (mut st, cnc, _sched, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        cnc.status().flags.store_release(NODE_FLAG_LEADER);
+        append_snapshot_and_commit(&mut appender, &cnc, 0);
+        super::apply_cycle(&mut st); // must not panic, must not build
+        assert!(st.snapshot_trigger.is_none());
+
+        let (mut st, cnc, _sched, mut appender, _dir) = apply_state_for_test(CountSm::default());
+        let (rx, busy) = with_snapshot_trigger(&mut st, count_freeze());
+        cnc.status().flags.store_release(NODE_FLAG_LEADER);
+        busy.store(true, std::sync::atomic::Ordering::Release);
+        let before = super::SNAPSHOT_SKIPPED_BUSY.load(std::sync::atomic::Ordering::Relaxed);
+        append_snapshot_and_commit(&mut appender, &cnc, 0);
+        super::apply_cycle(&mut st);
+        assert!(rx.try_recv().is_err(), "a busy builder gets no new job");
+        assert_eq!(
+            super::SNAPSHOT_SKIPPED_BUSY.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1
+        );
     }
 }

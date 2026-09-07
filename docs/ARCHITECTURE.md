@@ -263,9 +263,13 @@ oneshots — the client matcher correlates off the ring.
   [the state-machine contract reference](reference/state-machine-contract.md)
   for the raw bytes-in/bytes-out tier underneath it and when to reach for it
   directly.
-- **`SnapshotStateMachine`** *(optional)* — enables journal purge. A node below the
-  purge floor (crashed service, fresh learner, cold start) converges by snapshot
-  install plus tail replay, never by reading a purged prefix.
+- **`SnapshotStateMachine`** *(optional)* — enables journal purge. Since
+  `2.11.0` (unreleased) a snapshot is taken at a **coordinated instant**: a
+  `SNAPSHOT` frame the leader appends, at whose frame-end position P every
+  declared FSM and UC's own cluster FSM freeze together, so a node's snapshot
+  "set" is one log position. A node below the purge floor (crashed service,
+  fresh learner, cold start) converges by installing that set plus tail
+  replay, never by reading a purged prefix.
 - **`OutputHandler`** *(optional)* — async, leader-only side effects, at-least-once,
   with the position as idempotency key. The service advances an `output_completed`
   counter, the node persists it periodically, and a leadership transition replays

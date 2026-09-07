@@ -97,11 +97,14 @@ nodes disagree. See
 
 `schedule show` reads the node's newest **cluster artifact**
 (`snapshots/cluster/`), not the staged file. That is a file beside the running
-node, so it lags: an artifact is written once every declared row has
-snapshotted, and until then the command prints `no cluster artifact yet` even
-though the table is committed and ticking. On a cluster that is not snapshotting
-yet, `uc2_schedule_table_position` from `/metrics` is the live reading — it is
-published straight off the cluster FSM's view.
+node, so it lags: an artifact is written at a **snapshot instant** — one the
+operator commanded with `uc2ctl snapshot`, or one the replicated
+`snapshot_interval_bytes` cadence issued — and until the first of those the
+command prints `no cluster artifact yet` even though the table is committed and
+ticking. On a cluster that is not snapshotting yet,
+`uc2_schedule_table_position` from `/metrics` is the live reading — it is
+published straight off the cluster FSM's view. See
+[Keep the journal from growing without bound](bound-journal-growth.md#take-a-snapshot-command-an-instant-or-set-a-cadence).
 
 ## When an apply is refused
 

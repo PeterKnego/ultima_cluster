@@ -14,8 +14,8 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `log.buf` | node | The log ring buffer, `buffer_bytes` long. Recreated on each boot. |
 | `journal/` | node | Segmented durable log (`uc_journal`). Survives restarts; the source for replay and purge. |
 | `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. These five are exactly `backup`'s `STATE_FILES` checklist. All five are **node data** under the cluster FSM's line (2.11 pending): local, never replicated, never snapshotted. `config.state` is the one that looks like an exception and is not — it is the consensus kernel's *durable-time* membership shadow, a different reader at a different time base from the cluster FSM's committed view ([the cluster FSM explainer](../notes/uc2-cluster-fsm-explained.md)). There is **no** `schedules.state`: the schedule table is cluster data and lives in the cluster FSM's artifact. |
-| `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships and installs them. `<pos>` is the absolute log byte position the snapshot represents. The newest 2 per row are kept; older ones are unlinked after every publish. |
-| `snapshots/cluster/` | node (`uc2-cluster` agent) | `snap-<pos>.ultcluster` — the **cluster FSM's** artifact (2.11 pending): membership, the schedule table and the settings record as of `<pos>`, with a `UCCLUST1` magic, an image version and a trailing CRC32. Written by the node itself, not by a service, and shipped on the snapshot session under the reserved `service_id = 255` so a below-floor joiner installs it before its floor advances. Also what `uc2ctl schedule show`, `uc2ctl settings show` and `uc2ctl status`'s `schedule_position=` read. **The newest 2 are kept** and older ones unlinked after every write — the same retention every `snapshots/<id>/` row has, and for the same reason (a joiner's session may still be streaming the previous artifact, and the second is what you fall back to if the newest is corrupt). |
+| `snapshots/<id>/` | service and node | `snap-<pos>.ultsnap` artifacts for FSM `id`, one directory per declared id since M14. The service builds them; the node ships, installs and **deletes** them. `<pos>` is the absolute log byte position the snapshot represents — an **exclusive** frontier since coordinated instants (2.11 pending): the image covers every frame strictly below it. Every file starts with a 16-byte UC envelope (below). A receiver's in-flight download sits beside them as `incoming-<pos>.part`, pre-sized and renamed into place as the contiguous frontier passes its end; an abandoned intake's part files are unlinked. |
+| `snapshots/cluster/` | node (`uc2-cluster` agent) | `snap-<pos>.ultcluster` — the **cluster FSM's** artifact (2.11 pending): membership, the schedule table and the settings record as of `<pos>`, with a `UCCLUST1` magic, an image version and a trailing CRC32. Written by the node itself, not by a service, and shipped on the snapshot session under the reserved `service_id = 255` so a below-floor joiner installs it before its floor advances. Also what `uc2ctl schedule show`, `uc2ctl settings show` and `uc2ctl status`'s `schedule_position=` read. Retention is the node's, as it is for every row (below); the second-newest is what you fall back to if the newest is corrupt. |
 | `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
 | `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Payload is `service_id: u8` — which FSM answers (M14) — followed by the query bytes; same record framing as `ingress.ring`. |
 | `svc_query.<id>.ring` | node → service | Forwarded queries for FSM `id`. One per declared id since M14. |
@@ -48,6 +48,40 @@ the service, the gateway and every shmem client on a host therefore restart
 together on this upgrade — see
 [Upgrade a cluster](../how-to/upgrade-a-cluster.md). The rings are volatile
 (recreated on boot), so there is nothing to migrate.
+
+### The artifact envelope, and who deletes artifacts
+
+Two things about `snapshots/` changed with coordinated snapshot instants
+(2.11 pending) and are worth knowing before you touch the directory by hand.
+
+**Every artifact starts with a 16-byte envelope.** `ULTSNAP1` then the
+position it was built at, `u64` LE — written by the framework
+(`uc_service::snapshots::SnapshotStore::publish`), ahead of whatever bytes the
+state machine itself streamed. UC still prescribes **no** payload encoding;
+it owns this header only. It exists because the tag is an exclusive frontier,
+which makes a mis-tagged artifact undetectable from the payload: an image
+built at some earlier `P0` and renamed to `snap-<P>.ultsnap` passes any check
+a state machine could write, and installing it would silently leave every
+frame in `(P0, P)` unapplied. So every install path strips and verifies the
+envelope first — the service's own reconstruction, a joiner's receive (the
+session ships the file's bytes verbatim, envelope included), and
+`uc2ctl verify-backup`. An artifact that fails is refused by name (too short,
+bad magic, or built-at ≠ presented-as), never installed. Artifacts written by
+a pre-2.11 build have no envelope and are refused: on a developer box that
+means clearing `snapshots/` once, which is part of the same unreleased flag
+day as the wire bump.
+
+**Retention is the node's, and it only ever deletes.** The node keeps the
+complete set at its **persisted** snapshot floor plus everything newer, and
+unlinks everything below, matching `snap-<pos>.ultsnap` /
+`snap-<pos>.ultcluster` by exact name — so a builder's `.tmp` or a receiver's
+`.part` is invisible to the sweep and can never be raced. The old per-writer
+"keep the newest 2" pruners are gone from both the service and the cluster
+agent, because neither can see a *set*: two abandoned instants in a row would
+have had a per-row pruner delete the artifact at the floor, and the ship gate
+— "the complete set at my floor" — would then decline every joiner
+`missing artifact` forever. The node never writes an artifact; it only ever
+deletes one it can prove is superseded.
 
 ## Durability classes
 

@@ -1,10 +1,10 @@
 # The cluster FSM, explained
 
-*Written 2026-09-06 for the cluster-FSM work (plan 1, implemented on branch
-`worktree-uc2+cluster-fsm-plan1`; release on hold). Spec:
+*Written 2026-09-06 for the cluster-FSM work (plan 1); extended 2026-09-07
+with the "Instants" section below when plan 2 (coordinated and standby
+snapshot instants, §5) landed. Release on hold. Spec:
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
-— this note carries §2–§4's argument in plain language. Coordinated snapshot
-instants (§5) are plan 2 and are not in the tree yet.*
+— this note carries §2–§5's argument in plain language.*
 
 ## The problem in one sentence
 
@@ -195,18 +195,163 @@ looks like it should have gone. It is the kernel's durable-time shadow, and
 §4.6 above is the reason: it answers a different question, at a different time
 base, for a reader Raft does not allow to wait for commit.
 
-## What plan 1 does not do
+## Instants: one position, one set
 
-The artifact is written by a **bridging trigger**: the cluster agent snapshots
-once every declared row has snapshotted and its own applied position has
-reached the lowest of theirs. That is a stand-in. Plan 2 replaces it with a
-**coordinated snapshot instant** — a `SNAPSHOT` frame the leader appends, at
-whose frame-end position every row and the cluster FSM freeze together, so a
-"set" is one position rather than a lowest-common-floor — plus standby
-instants that let only learners pay the freeze. Until then, `uc2ctl schedule
-show` and `uc2ctl settings show` read the artifact and therefore say "no
-cluster artifact yet" on a cluster whose rows have not snapshotted; they read
-a file beside a running node, not its live view.
+Plan 1 wrote the cluster artifact on a **bridging trigger** — snapshot once
+every declared row happens to have snapshotted, and my own applied position
+has reached the lowest of theirs. That works, but it makes a "set" a
+lowest-common-floor: a coincidence of independent per-service timers, whose
+position no one chose. Plan 2 replaces it with something the cluster does
+deliberately.
+
+**The command.** The leader appends a `SNAPSHOT` frame — frame type 7, an
+empty body, because the frame's own end position **P** is the whole payload.
+An operator asks for one with `uc2ctl snapshot`, or the replicated
+`snapshot_interval_bytes` cadence issues one when enough log has accrued.
+Either way only a leader appends one, because only a leader appends anything.
+
+**What every row does at P.** The frame is broadcast, like every frame: each
+declared row's apply loop reaches it, and so does the cluster FSM. Each,
+having applied everything strictly below P, calls `freeze()` and hands the
+build to the same builder thread that has always written artifacts. The file
+is `snapshots/<row>/snap-<P>.ultsnap`; the cluster FSM's is
+`snapshots/cluster/snap-<P>.ultcluster`. When every declared row and the
+cluster FSM have published at P, that node holds the **complete set at P**.
+The old per-service `SnapshotPolicy { interval_bytes }` is gone; nothing
+triggers a snapshot but the log.
+
+**Why the set is committed by construction.** This is the part worth
+following, because it is where a counter used to be. A row freezes at P only
+after *applying* up to P, and apply is gated on `min(commit, durable)`. So an
+artifact at P exists only if P was committed on that node when it was built —
+and committed bytes are never truncated. A complete set therefore *implies* a
+committed P, with no counter to consult, no boot window in which one reads
+zero, and no freshness gate to get wrong. That is the same argument the whole
+cluster-FSM change rests on, arriving one level down: the ship gate becomes
+"the complete set at my floor", and everything it needs is already true.
+
+Two consequences follow immediately. A `SNAPSHOT` frame truncated by a leader
+change needs no revert record: nothing was adopted, and any artifact built at
+that P is simply an orphan. And a row that was behind when the instant went
+past does not lose it — replaying a span, it acts on that span's **last**
+`SNAPSHOT` frame and freezes there, provided P is above both what it has
+already snapshotted and what it has already applied.
+
+**Retention is node-owned, and it only ever deletes.** The node keeps the set
+at its persisted floor plus everything newer and unlinks the rest, matching
+file names exactly. It used to be per-writer — the service kept its newest
+two, the cluster agent kept its newest two — and that cannot work once a set
+is the unit: two abandoned instants in a row would have a per-row pruner
+delete the artifact at the floor, and the ship gate would then decline every
+joiner forever, looking for a file its own retention had removed. Only the
+node can see a set. Symmetrically, the node never *writes* an artifact: it
+deletes what it can prove is superseded, and nothing else.
+
+**The ship gate, and the envelope.** A session ships the artifacts at one
+position or none. The sender looks each one up **by file name** at the target
+position rather than by whatever a row's live `snapshot_pos` word reads — that
+word runs ahead the moment a later instant completes — and a receiver refuses
+a session whose `SNAP_BEGIN`s disagree about the position. That closes the
+"set assembled from two different instants" case by name rather than by luck.
+
+The file name is only a name, though, and a rename or a mis-copied backup can
+make an artifact built at some earlier `P0` claim P. Nothing in the payload
+can catch that, because the tag is an **exclusive** frontier: the image covers
+everything strictly below P, so a state machine's own cursor legitimately sits
+*below* the tag and an image from `P0` looks entirely plausible. So the
+framework took the guarantee: every artifact file now begins with sixteen
+bytes it owns — `ULTSNAP1` and P — checked on every install path and by
+`verify-backup`. UC still prescribes nothing about the payload.
+
+**Standby instants, and the pull that follows.** A freeze runs on the row's
+apply thread and is as long as the service's state is big — UC cannot bound
+it, because both the state and the code are the service's. Meanwhile a node's
+durable report is capped at `min_applied + fsm_lag`. Put those together and a
+coordinated instant has a cost the old accidental staggering hid: with every
+row on a quorum frozen at the same P, every report caps at `P + fsm_lag` and
+**commit stalls cluster-wide** until the slowest freeze ends. For a small
+state that is invisible. For a large one it is Aeron's snapshot pause arriving
+through the back door.
+
+The only lever that works for any state size is not freezing the voters. So a
+`SNAPSHOT` frame carries a flag, `FLAG_SNAPSHOT_STANDBY`, and a node acts on a
+flagged instant only if it is a **learner** — which it learns from a new bit,
+`NODE_FLAG_LEARNER`, in the same cnc word its apply loop already reads the
+leader flag from once per cycle. A voter's rows yield the frame like any other
+node-only frame and pay nothing. This is Aeron's shape, and it is Aeron's
+shape for the same reason: the standby snapshot there is the same action with
+a flag, which a member's services skip.
+
+That leaves the set on the learner, and a voter still needs it — for its own
+purge floor, and to serve a joiner. The return path is a **pull**:
+`uc2ctl snapshot fetch --from <learner-id>` sends a `SNAP_REQUEST`, the
+learner's sender opens an ordinary session from its own artifacts, and the
+voter's receiver takes it **store-only** — the files are written and the set is
+marked complete, and nothing is installed. That distinction matters: a voter
+above P storing a set at P is not a joiner, and treating it as one would roll
+its state machines backwards. Its floor then moves through the ordinary
+completeness path, exactly as if it had frozen. A fetch binds the position it
+asked for and is refused if that position is above what this node has made
+durable — a node must not adopt a floor above its own durable frontier.
+
+Two consequences of that shape are worth stating, because both were nearly
+shipped as defects.
+
+The first is a **monitoring** one. On a standby cluster the leader is a voter,
+so it commands instants whose sets only the learners build, and its own set
+stays where it was until someone runs the fetch. Read through the obvious
+metrics, that healthy steady state is *indistinguishable* from the failure the
+snapshot alert exists to catch: instants keep being commanded, no set ever
+completes. So the two are kept apart by construction rather than by a
+threshold. A superseded standby instant is not an abandonment on a node that
+was never going to build its set — no counter moves — and the commanded-instant
+gauge counts **full** instants only. The standby half gets its own gauge,
+written at the one place that decides whether this node acts on a standby
+frame at all, which by the rule above is only ever a learner. So the standby
+alert watches the node doing the work, and cannot fire on a voter: not because
+a label excludes it, but because a voter never writes the series.
+
+The second is a **security** one. The pull request is the one snapshot path
+that is deliberately not leader-gated — the source is a learner, and a learner
+never leads. Which means, with wire crypto off, that a 28-byte datagram
+claiming to come from anywhere elicits a whole snapshot set sent to that
+address. UC's crypto-off posture already concedes the cluster to a
+network-path adversary, but this one hands a reflector to an attacker aimed at
+somebody else entirely, which is not the cluster's to concede. So the request
+is served only to an address in the current membership — voters and learners,
+which is who could legitimately ask — and anything else is a named, counted
+drop. The redirect is left ungated on purpose: the worst a forged one achieves
+is making a joiner ask a real member for a set it will verify anyway.
+
+Until a voter has fetched, its floor sits where it was, and a joiner that
+needs a lower set is **redirected**: the node that cannot serve answers with
+"ask learner *k* for the set at P", and the joiner asks there. In practice
+that also covers a case nothing to do with standby — a node restored from a
+backup taken before its own floor, whose cnc page names a floor whose files
+are not on disk.
+
+**Two things this deliberately does not do.**
+
+*Automatic replication after a standby instant.* A voter pulls when an
+operator tells it to, not when the learner finishes. Making it automatic needs
+the learner's "complete at P" to be visible cluster-wide, and the honest
+channel for that is a cluster-FSM command the leader appends on the learner's
+behalf — a fourth kind, and a design of its own. Aeron's open-source half
+defers it the same way: there, a member replicates a standby snapshot when an
+operator flips a toggle. The trade is stated rather than hidden: you do not
+pay the freeze on voters, and in exchange a voter's purge floor waits for you.
+
+*Timezones and cron.* Still out, and still the schedule table's business, not
+the snapshot instant's — an instant is a byte position, not a time.
+
+## What plan 1 did not do, and plan 2 did not either
+
+`uc2ctl schedule show`, `uc2ctl settings show` and `uc2ctl status`'s
+`schedule_position=` still read the newest cluster **artifact** — a file
+beside the running node, not its live view — so they lag, and say "no cluster
+artifact yet" until the first instant has completed. One process cannot read
+another's memory; a live reading needs the response-on-the-egress-broadcast
+path the spec left to a phase 2.
 
 ## Where to go next
 
@@ -220,3 +365,9 @@ a file beside a running node, not its live view.
   — what the table does once the cluster FSM holds it.
 - [Instance directory § Files](../reference/instance-directory.md#files) —
   `snapshots/cluster/` and `settings.pending`.
+- [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
+  — commanding an instant, setting a cadence, and turning purge on.
+- [`uc2ctl` § `snapshot`](../reference/uc2ctl.md#snapshot) — the three verbs
+  and their refusals.
+- [Monitor a cluster § The snapshot families](../how-to/monitor-a-cluster.md#the-snapshot-families-211-pending)
+  — the seven series, the two alerts, and the records.

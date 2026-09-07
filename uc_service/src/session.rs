@@ -268,7 +268,10 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
     /// answer, not a less safe one: "under-reporting is safe, over-reporting
     /// above the frontier is refused" (the trait's own contract), and
     /// `max_pos_seen` never exceeds the true applied frontier because it is
-    /// exactly the position of the last frame this method saw. The dedup
+    /// exactly the position of the last frame this method saw — and, after an
+    /// `install_snapshot`, the cursor the artifact recorded, NEVER the artifact
+    /// tag, which is an exclusive frontier a frame may start at (ruling P6).
+    /// The dedup
     /// table itself is always rebuildable by replay regardless of where
     /// resume starts, so nothing here weakens the exactly-once guarantee —
     /// it only changes how much redundant re-processing a restart does.
@@ -386,7 +389,12 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
         let got = self.inner.install_snapshot(position, src)?;
         self.total_bytes = img.clients.values().map(ClientState::window_bytes).sum();
         self.clients = img.clients;
-        self.max_pos_seen = Some(got);
+        // Ruling P6, exactly as `Timed::install_snapshot`: `position` is the
+        // instant P, an EXCLUSIVE frontier, and a frame normally starts at it.
+        // Seeding `max_pos_seen` with `got` (== P) would make `last_applied()`
+        // report P and the apply loop's `pos > last_applied()` guard skip that
+        // frame — a silent one-command loss in every `Sessioned<S>` service.
+        self.max_pos_seen = self.inner.last_applied();
         Ok(got)
     }
 }

@@ -7,7 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## Unreleased — FSM identity, log time, and the cluster FSM (next minor, 2.11.0 when cut)
+## Unreleased — FSM identity, log time, the cluster FSM, and coordinated snapshots (next minor, 2.11.0 when cut)
 
 **Implemented; release on hold pending further changes.** This section is a
 draft, written ahead of the tag so the writeup is ready when the maintainer
@@ -16,11 +16,13 @@ green-lights it — see
 verified so far and what still says "pending". **No version has been
 tagged, and no fleet gate has run.**
 
-Four features share this release, because all four landed before it was
-cut, and all four are on the same wire `0.7.0` / cnc `3.1` flag day: FSM
-identity, log time and timers, the replicated schedule table built on it, and
-the cluster FSM, which took over how all of the cluster's own state reaches a
-node that has fallen behind.
+Five features share this release, because all five landed before it was
+cut, and all five are on the same wire `0.7.0` / cnc `3.1` flag day: FSM
+identity, log time and timers, the replicated schedule table built on it, the
+cluster FSM, which took over how all of the cluster's own state reaches a
+node that has fallen behind, and **coordinated snapshot instants**, which
+make a snapshot something the whole cluster takes at one log position on
+command.
 
 An FSM's identity — the name a state machine declares in its own code — now
 travels everywhere the cluster used to check only a bare row number, closing
@@ -171,6 +173,64 @@ schedule table an operator applies with one command.
   same change.
   → [Configuration § `[settings]`](docs/reference/configuration.md#settings) ·
   [`uc2ctl` § `settings apply`](docs/reference/uc2ctl.md#settings-apply)
+- **A snapshot is now something the whole cluster takes at one position, on
+  command.** `uc2ctl snapshot` makes the leader append a `SNAPSHOT` frame;
+  its frame-end position **P** is the *instant*, and every declared FSM plus
+  the cluster FSM freezes there, having applied everything below it. When they
+  have all published `snap-<P>`, that node holds the **complete set at P** and
+  its purge floor moves to P. Before this, each service snapshotted on its own
+  byte counter (`SnapshotPolicy { interval_bytes }`, now **removed**) and a
+  "set" was whatever lowest-common-floor those independent timers happened to
+  produce. Two things fall out of the change. The set is **committed by
+  construction** — a row freezes at P only after applying to P, and apply is
+  gated on `min(commit, durable)` — so the ship gate becomes "the complete set
+  at my floor" with no counter to consult and no boot window to get wrong. And
+  because only the node can see a *set*, retention became node-owned and
+  delete-only: it keeps the set at the floor plus everything newer, where a
+  per-writer "keep the newest two" would happily delete the artifact the floor
+  names. `uc2ctl snapshot show` prints the set and each row's presence;
+  `snapshot_interval_bytes` in the replicated settings gives the leader a
+  cadence, and `0` (the default) means operator-commanded only.
+  → [Keep the journal from growing without bound](docs/how-to/bound-journal-growth.md) ·
+  [The cluster FSM, explained § Instants](docs/notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set) ·
+  [`uc2ctl` § `snapshot`](docs/reference/uc2ctl.md#snapshot)
+- **Standby instants: freeze the learners, not the voters.** A coordinated
+  freeze has a cost the old accidental staggering hid — a `freeze()` is
+  O(state) and runs on the row's apply thread, and a node's durable report is
+  capped at `min_applied + fsm_lag`, so every row on a quorum frozen at the
+  same P stalls commit cluster-wide at `P + fsm_lag` until the slowest one
+  ends. `uc2ctl snapshot --standby` (or `snapshot_target = "learners"`) flags
+  the frame so that only a **learner** acts on it; a voter's rows yield it like
+  any other node-only frame and pay nothing. The set comes back on a pull:
+  `uc2ctl snapshot fetch --from <learner-id>` writes the artifacts
+  **store-only** — no state machine is touched and no `applied` moves — and the
+  voter's floor advances through the ordinary completeness path. Until a voter
+  has fetched, a joiner that needs a lower set is **redirected** to a learner
+  that holds it. The trade is explicit and is Aeron's: you do not pay the
+  freeze on voters, and in exchange a voter's purge floor waits for an
+  operator.
+  → [Keep the journal from growing without bound](docs/how-to/bound-journal-growth.md) ·
+  [`uc2ctl` § `snapshot fetch`](docs/reference/uc2ctl.md#snapshot-fetch) ·
+  [The cluster FSM, explained § Instants](docs/notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set)
+- **Snapshot artifacts are self-describing, and stalled purging is loud.**
+  Every artifact file now starts with a 16-byte UC envelope — `ULTSNAP1` plus
+  the position it was built at — verified on every install path and by
+  `uc2ctl verify-backup`. It closes a real hole: the tag is an *exclusive*
+  frontier, so an image built at an earlier position and renamed passes any
+  check a state machine could write, and installing it would silently leave a
+  span of frames unapplied. UC still prescribes nothing about the payload.
+  Eight new metric families go with the feature —
+  `uc2_snapshot_{instant,standby_instant,set,fetched}_position`,
+  `uc2_snapshot_row_incomplete_total{row}` and a three-series stand-in for a
+  freeze-duration histogram — plus three alert rules: `Uc2SnapshotStalled`,
+  which makes "one broken FSM silently stops all purging" page;
+  `Uc2StandbySnapshotStalled`, its learner-only twin for a
+  `snapshot.target = learners` cluster (where the leader is a voter whose own
+  set is *supposed* not to complete); and `Uc2SnapshotSetDiverged`, which
+  fires when two nodes disagree about their purge floors.
+  → [Monitor a cluster § The snapshot families](docs/how-to/monitor-a-cluster.md#the-snapshot-families-211-pending) ·
+  [Instance directory § The artifact envelope](docs/reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts) ·
+  [Back up a cluster § Verify before you trust it](docs/how-to/back-up-a-cluster.md#verify-before-you-trust-it)
 
 **Fixed**
 
@@ -211,7 +271,10 @@ schedule table an operator applies with one command.
   replaced by `--fsm <name>` on harness binaries that host more than one
   FSM type (a production service that links one state machine needs no
   flag). `[services]` goes from optional to required, and its old `ids` key
-  is refused outright, pointing at `names`. This is a real breaking change
+  is refused outright, pointing at `names`. `uc_service::SnapshotPolicy` and
+  `ServiceConfig::snapshot_policy` are **removed** with coordinated snapshot
+  instants: `start_with_snapshots()` is now the whole opt-in, and the trigger
+  is the log rather than a per-service byte counter. This is a real breaking change
   under [the semver policy](docs/reference/semver-policy.md); the
   maintainer's decision (spec §10) is to ship it as the next minor rather
   than a major, on the project having no external users yet to break — see
@@ -224,10 +287,14 @@ schedule table an operator applies with one command.
   log frame header is relaid for `time_ns` and a `TIMER` frame type is added;
   two more cnc words appear (`log_time_ns`, per-row `timers_pending`); and the
   cluster FSM turns frame type `4` into a kind-dispatched `CLUSTER` command
-  while making `SNAP_BEGIN` fixed-length (layout V4, no carried config). Three
-  numbers are **retired before shipping** and reserved so they are never
-  reassigned: frame type `6` (`SCHEDULE_TABLE`), datagram kind `21`
-  (`SNAP_TABLE`) and `SNAP_BEGIN` layout `2`.
+  while making `SNAP_BEGIN` fixed-length (layout V4, no carried config);
+  coordinated snapshots add frame type `7` (`SNAPSHOT`, header-only) with the
+  header flag `FLAG_SNAPSHOT_STANDBY`, datagram kinds `22` (`SNAP_REQUEST`)
+  and `23` (`SNAP_REDIRECT`), `NODE_FLAG_LEARNER = 4` in the cnc node-flags
+  word, slot status bit `9` (snapshot-capable) and slot word `+496`
+  (`freeze_ns`). Three numbers are **retired before shipping** and reserved so
+  they are never reassigned: frame type `6` (`SCHEDULE_TABLE`), datagram kind
+  `21` (`SNAP_TABLE`) and `SNAP_BEGIN` layout `2`.
   **Read the upgrade note before this one.** Every prior wire bump was caught
   by a length check, so a mixed cluster stalled. A relaid header is the *same
   length*: a `0.6.0` peer's frames parse on a `0.7.0` node and mean something
@@ -242,6 +309,10 @@ schedule table an operator applies with one command.
   as an artifact family of its own (`MANIFEST` format `uc2-backup-v3`, with a
   `newest_cluster_snapshot=` line), so a restored node comes back with the
   cluster's membership, table and settings.
+  **Existing `snapshots/` contents are refused**: every artifact now carries a
+  16-byte `ULTSNAP1` envelope, and one written by an earlier build has none.
+  Nothing released ever wrote one, so this bites only a developer's existing
+  instance directory — clear `snapshots/` once, as part of the same flag day.
   → [Instance directory § Files](docs/reference/instance-directory.md#files)
 - **`uc_node` now depends on `uc_service`**, so the ordered crates.io publish
   flips: `uc_service` goes before `uc_node`. The cluster FSM implements the
@@ -277,6 +348,13 @@ schedule table an operator applies with one command.
   against a shadow, with the mutex behind the view taken only on a pass where
   that position actually moved. A row for it belongs in the time-and-timers
   gate's throughput arm when that gate is run.
+  Coordinated snapshots have no gate doc of its own either, and needs three
+  rows in that same arm when it runs: commanded instants under the throughput
+  load (the cost of the extra apply-loop arm, A/B'd per M14a), a below-floor
+  join with the shipper restarted mid-window, and — the one that turns §5.7's
+  argument into a number — **freeze duration vs. commit stall** on a
+  deliberately large state, for an all-nodes instant and then the same instant
+  `--standby`.
 
 ## v2.10.0 — 2026-08-31
 

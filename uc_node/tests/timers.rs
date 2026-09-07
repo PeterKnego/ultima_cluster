@@ -44,11 +44,17 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uc_client::{Client, PipelinedClient, PipelinedConfig};
 use uc_consensus::election::NodeId;
+use uc_log::buffer::FrameRead;
 use uc_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc_net::fault::FaultConfig;
 use uc_node::{CryptoConfig, FsmLag, Node, NodeConfig, PurgePolicy, ServicesConfig};
 use uc_protocol::identity::FsmName;
-use uc_protocol::v2::cnc::{ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS};
+use uc_protocol::v2::cnc::{
+    ADMIN_OP_SCHEDULE_APPLY, CNC_MAX_PEER_SLOTS, CNC_SVC_STATUS_SNAPSHOT_CAPABLE,
+};
+use uc_protocol::v2::frame::{
+    FRAME_TYPE_PADDING, FRAME_TYPE_TIMER, HEADER_LEN, align_frame_len, read_timer_body,
+};
 use uc_protocol::v2::schedule::{
     ScheduleEntry, ScheduleRule, ScheduleTable, encode_schedule_table,
 };
@@ -56,6 +62,10 @@ use uc_service::{
     ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, StateMachine, Timed,
     TimerEvent,
 };
+/// The §4.3 ordering oracle, over frames a REAL node appended (plan 2 T10).
+/// `uc_sim` is a dev-dependency of `uc_node` for exactly this — see the
+/// in-crate differential test in `uc_node/src/node.rs`, which owns rule 5.
+use uc_sim::timers::{Frame as SimFrame, Kind as SimKind, check_frames};
 
 pub const APP: &str = "uc2-timers";
 
@@ -225,6 +235,11 @@ impl StateMachine for ClockSm {
 struct ClockImage {
     fired: Vec<Fired>,
     stamps: Vec<(u64, u64, u8)>,
+    /// The cursor the artifact was built at. Coordinated-snapshot spec §5.2:
+    /// the artifact TAG is the instant P (an exclusive frontier), which is
+    /// above this — so the image has to carry its own cursor for `install` to
+    /// restore it.
+    last: Option<u64>,
 }
 
 impl uc_service::SnapshotStateMachine for ClockSm {
@@ -234,6 +249,7 @@ impl uc_service::SnapshotStateMachine for ClockSm {
         let img = ClockImage {
             fired: self.fired.clone(),
             stamps: self.stamps.clone(),
+            last: self.last,
         };
         let bytes = bincode::serde::encode_to_vec(&img, bincode::config::standard())
             .map_err(|e| uc_service::SnapshotError::Codec(format!("clock image encode: {e}")))?;
@@ -261,7 +277,7 @@ impl uc_service::SnapshotStateMachine for ClockSm {
             })?;
         self.fired = img.fired;
         self.stamps = img.stamps;
-        self.last = Some(position);
+        self.last = img.last;
         Ok(position)
     }
 }
@@ -1324,12 +1340,32 @@ fn capstone_config(
 /// move on its own (a real service publishing real artifacts), because that is
 /// what puts the joiner below it.
 fn start_snapshot_service(dir: &Path) -> Service<Timed<ClockSm>> {
-    let cfg = ServiceConfig::new(dir, APP).snapshot_policy(uc_service::SnapshotPolicy {
-        interval_bytes: CAPSTONE_SEG,
-    });
+    // The byte cadence is deleted (coordinated-snapshot spec §5.2): this row
+    // is snapshot-CAPABLE (the bit `start_with_snapshots` sets) but builds
+    // nothing until the leader commands an instant. `command_instant` below
+    // is what moves the floor the capstone needs.
+    let cfg = ServiceConfig::new(dir, APP);
     ServiceBuilder::new(cfg, Timed::new(ClockSm::default()))
         .start_with_snapshots()
         .expect("service start")
+}
+
+/// `uc2ctl snapshot`, in process (coordinated-snapshot spec §5.5): command a
+/// coordinated instant and return its position **P**, polling through the
+/// `retry` window a leader legitimately answers while it has the role but not
+/// yet an appender, or while a previous instant is still in flight.
+/// Duplicated per test binary, like `admin_request_ok` below.
+fn command_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match node.command_snapshot(false) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("uc2ctl snapshot refused: {e}"),
+        }
+    }
 }
 
 /// `reconfig.rs::admin_request_ok`, duplicated because each integration test
@@ -1528,6 +1564,16 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
             t.wait().expect("answered");
         }
         c.shutdown();
+    }
+    // ---- command the instant that moves the floor (spec §5.5). The byte
+    // ---- cadence is gone, so nothing snapshots until asked; both voters
+    // ---- freeze at the same P and each completes its own set.
+    let instant = command_instant(nodes[leader].node.as_ref().unwrap());
+    for h in &nodes {
+        let node = h.node.as_ref().unwrap();
+        wait_until("every voter completed the set at the instant", || {
+            node.snapshot_set_position() >= instant
+        });
     }
     wait_until(
         "the leader purged the prefix holding the table frame",
@@ -1788,4 +1834,307 @@ fn a_promoted_below_floor_joiner_keeps_the_schedule_ticking_when_it_leads() {
             n.stop();
         }
     }
+}
+
+// ------------------ 4. a commanded instant under load (plan 2, spec §5.5/§11)
+
+/// The row-1 state machine for the coordinated-instant test below: a
+/// snapshot-capable RAW byte sink.
+///
+/// RAW, not typed, for the reason `uc_lincheck::timer`'s module doc gives:
+/// UC's log is a broadcast, so row 1 is handed row 0's `Cmd` frames too. A
+/// typed second FSM would try to decode them as its own command type and
+/// fail-stop; a byte sink cannot. What it does have to be is genuinely
+/// snapshot-CAPABLE and genuinely independent of row 0, because the property
+/// under test is that two unrelated FSMs freeze at ONE position.
+#[derive(Default)]
+struct SumSm {
+    total: u64,
+    last: Option<u64>,
+}
+
+impl RawStateMachine for SumSm {
+    const NAME: &'static str = "sum";
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: &[u8], out: &mut Vec<u8>) {
+        self.total = self.total.wrapping_add(cmd.len() as u64);
+        self.last = Some(ctx.position);
+        out.extend_from_slice(&self.total.to_le_bytes());
+    }
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.total.to_le_bytes());
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.last
+    }
+}
+
+impl uc_service::SnapshotStateMachine for SumSm {
+    type SnapshotHandle = Vec<u8>;
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc_service::SnapshotError> {
+        let pos = self.last.unwrap_or(0);
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.total.to_le_bytes());
+        buf.extend_from_slice(&pos.to_le_bytes());
+        Ok((buf, pos))
+    }
+    fn stream_snapshot(
+        handle: Vec<u8>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        assert!(buf.len() >= 16, "a SumSm artifact is 16 bytes");
+        self.total = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        // The tag is an EXCLUSIVE frontier (spec §5.2): restore the cursor the
+        // artifact recorded, never the tag.
+        self.last = Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()));
+        Ok(position)
+    }
+}
+
+fn start_sum_service(dir: &Path) -> Service<SumSm> {
+    ServiceBuilder::new(ServiceConfig::new(dir, APP), SumSm::default())
+        .start_with_snapshots()
+        .expect("row 1 service start")
+}
+
+/// Command one instant and wait for the whole SET to complete, asserting it
+/// completed on the FIRST attempt.
+///
+/// Ruling P10 is what makes that bar honest: a row that catches up through
+/// the journal now ACTS on the last `SNAPSHOT` frame of the replayed span, so
+/// an instant commanded while a walker is lapping is no longer skipped. The
+/// retry `learner.rs::instant_until_complete` keeps is belt-and-braces for the
+/// fixtures that push megabytes through a 256 KiB ring; this fixture runs a
+/// 4 MiB ring and a few hundred small frames, so a second attempt here would
+/// mean a REGRESSION to §10 abandonment and is a failure, not a retry.
+fn instant_completes_first_try(node: &Node, cnc: &CncPage, rows: &[u8]) -> u64 {
+    let before = node.snapshot_instants_abandoned();
+    let p = command_instant(node);
+    wait_until("the commanded set to complete", || {
+        node.snapshot_set_position() >= p
+    });
+    assert_eq!(
+        node.snapshot_set_position(),
+        p,
+        "the completed set must be AT the instant, not past it"
+    );
+    for &row in rows {
+        assert_eq!(
+            cnc.service_slot(row as usize).snapshot_pos.load_acquire(),
+            p,
+            "row {row} did not freeze at the instant {p}"
+        );
+    }
+    assert_eq!(
+        node.cluster_snapshot_position(),
+        p,
+        "the uc2-cluster row did not freeze at the instant {p}"
+    );
+    assert_eq!(
+        node.snapshot_instants_abandoned(),
+        before,
+        "instant {p} did not complete on the first attempt — a row or the cluster agent \
+         missed the SNAPSHOT frame (spec §10 abandonment), which Ruling P10 removed"
+    );
+    p
+}
+
+/// Every frame in `[0, append)`, in the vocabulary
+/// [`uc_sim::timers::check_frames`] speaks.
+///
+/// **`pass_start_stamp` is reconstructed, and rule 5 is VACUOUS here.** The
+/// oracle's fifth rule keys on the pass boundary — `last_stamp` as it stood
+/// when the leader pass that appended this frame began — and a test reading
+/// the log from outside cannot see one: the boundary would have to be inferred
+/// from the very clients-before-timers ordering rule 5 exists to check. So
+/// this uses the only SOUND bound available from the log alone, the PREVIOUS
+/// frame's stamp (the true pass-start stamp is never above it, because stamps
+/// never decrease) — and `u64::MAX`, "no bound at all", for the very first
+/// frame, which has no predecessor. Either way rule 5's "legitimately late"
+/// escape hatch always fires and rule 5 itself is unreachable. Rules 1-4 — non-decreasing
+/// stamps over the whole log, no timer stamped before its deadline, and the
+/// two ordering diagnostics — are what this row runs, over a log that contains
+/// SNAPSHOT frames.
+///
+/// Rule 5 over a REAL leader pass is owned by `uc_node/src/node.rs`'s
+/// `the_real_leader_pass_satisfies_the_sim_oracle_across_seeds`, which drives
+/// `do_work()` itself and therefore knows its own pass boundaries.
+fn collect_log_frames(node: &Node) -> Vec<SimFrame> {
+    let append = node.counters().append.load_acquire();
+    let mut out: Vec<SimFrame> = Vec::new();
+    let mut buf = Vec::new();
+    let mut cursor = 0u64;
+    while cursor < append {
+        let hdr = match node.read_frame_validated(cursor, &mut buf) {
+            FrameRead::Frame(hdr) => hdr,
+            // The load below is a few hundred small frames against a 4 MiB
+            // ring, so neither is reachable — assert rather than skip, so a
+            // future change that DOES reach one fails instead of silently
+            // shortening the sequence the oracle sees.
+            other => panic!("frame at {cursor} unreadable: {other:?}"),
+        };
+        let next = cursor + align_frame_len(hdr.length as usize) as u64;
+        // Final wave M10: `u64::MAX` for the FIRST frame, not `0`. There is
+        // no previous frame, so no bound on the pass-start stamp exists at
+        // all — and `u64::MAX` is how "no bound available" is spelled for a
+        // rule whose escape hatch is `stamp <= pass_start_stamp`. `0` said
+        // the opposite (a bound of zero, which every stamp exceeds) and would
+        // have made rule 5 trivially SATISFIED for that one frame instead of
+        // explicitly unconstrained — a difference that does not matter while
+        // rule 5 is vacuous here, and would have mattered silently if it ever
+        // stopped being.
+        let pass_start_stamp = out.last().map(|f: &SimFrame| f.stamp).unwrap_or(u64::MAX);
+        match hdr.frame_type {
+            FRAME_TYPE_TIMER => {
+                let body = read_timer_body(&buf[HEADER_LEN..])
+                    .expect("a TIMER frame the node itself appended must decode");
+                out.push(SimFrame {
+                    kind: SimKind::Timer,
+                    stamp: hdr.time_ns,
+                    deadline: Some(body.deadline_ns),
+                    pass_start_stamp,
+                });
+            }
+            // A wrap artefact carrying no stamp of its own. Unreachable at
+            // this ring size; skipping is right if it ever is reached.
+            FRAME_TYPE_PADDING => {}
+            // Every other type — MESSAGE, NEW_TERM, CONFIG, SCHEDULE_TABLE
+            // and, the point of this test, SNAPSHOT — is stamped
+            // `max(now, last_stamp)` by the same clamp, which is exactly what
+            // the oracle's `Client` kind means. Classifying them rather than
+            // skipping them is what lets the ordering rules blame a SNAPSHOT
+            // frame that ran ahead of a due timer.
+            _ => out.push(SimFrame {
+                kind: SimKind::Client,
+                stamp: hdr.time_ns,
+                deadline: None,
+                pass_start_stamp,
+            }),
+        }
+        cursor = next;
+    }
+    out
+}
+
+/// Plan 2's headline (spec §5.5, §11): a coordinated instant commanded on a
+/// leader under LOAD freezes **every declared row and the cluster FSM at one
+/// position**, three times over, without stalling commit and without
+/// disturbing the §4.3 frame ordering.
+///
+/// Four claims, each with its own assertion:
+///
+/// 1. **One position.** After each instant, row 0 (`Timed<ClockSm>`), row 1
+///    (`SumSm` — an unrelated FSM with unrelated state) and the `uc2-cluster`
+///    row all report `snapshot_pos == P`, and the node's completed-set
+///    position is that same P. The three sequences are therefore equal, which
+///    is the "set alignment" property inv11 checks in the sim.
+/// 2. **First try.** Each instant completes without being superseded
+///    (`snapshot_instants_abandoned` unchanged) — the bar Ruling P10 makes
+///    reachable.
+/// 3. **Commit never parked.** Commit advances strictly between every pair of
+///    consecutive instants while the client load loop runs, and crosses each
+///    instant's own P. A freeze that stalled the pipeline (spec §5.7's
+///    report-ceiling argument) would show here as a commit that does not move.
+/// 4. **Ordering holds.** The whole log — TIMER frames, MESSAGE frames and the
+///    three SNAPSHOT frames — satisfies `uc_sim::timers::check_frames`. See
+///    [`collect_log_frames`] for which of the oracle's rules an external
+///    reader can and cannot run.
+#[test]
+fn a_commanded_instant_freezes_every_row_at_one_position_under_load_and_ordering_holds() {
+    let _g = serialize();
+    let dir = tempdir();
+    let node = Node::start(config(dir.path(), names(&["clock", "sum"], None))).unwrap();
+    wait_until("serving", || node.can_serve());
+    let svc0 = start_snapshot_service(dir.path());
+    let svc1 = start_sum_service(dir.path());
+    let cnc = open_cnc(dir.path());
+    let client = Client::connect(dir.path(), APP).unwrap();
+
+    // Both rows must publish the snapshot-capability bit before an instant can
+    // be commanded at all — without it the leader refuses `48
+    // snapshot_unsupported` (spec §5.5) and `command_instant` panics.
+    wait_until("both rows snapshot-capable", || {
+        [0usize, 1].iter().all(|&r| {
+            cnc.service_slot(r).status.load_acquire() & CNC_SVC_STATUS_SNAPSHOT_CAPABLE != 0
+        })
+    });
+
+    // The load: `Nop` frames plus timers armed a few ms out, so the log the
+    // oracle reads holds real TIMER frames interleaved with the client frames
+    // and the SNAPSHOT frames.
+    let mut next_timer_id = 1u64;
+    let load = |n: u64, timer_id: &mut u64| {
+        for i in 0..n {
+            if i % 4 == 0 {
+                let _: u64 = client
+                    .submit(&Cmd::At {
+                        id: *timer_id,
+                        in_ms: 3,
+                    })
+                    .expect("submit At");
+                *timer_id += 1;
+            } else {
+                let _: u64 = client.submit(&Cmd::Nop).expect("submit Nop");
+            }
+        }
+    };
+
+    let mut instants: Vec<u64> = Vec::new();
+    let mut commits: Vec<u64> = Vec::new();
+    for round in 0..3 {
+        load(60, &mut next_timer_id);
+        let p = instant_completes_first_try(&node, &cnc, &[0, 1]);
+        assert!(
+            instants.last().is_none_or(|&prev| p > prev),
+            "instant {round} at {p} did not advance past {instants:?}"
+        );
+        instants.push(p);
+
+        // Claim 3: the pipeline kept moving. Commit crosses this instant's own
+        // P (so the freeze did not park the leader at `P + fsm_lag`), and it is
+        // strictly above where it stood at the previous instant.
+        load(60, &mut next_timer_id);
+        wait_until("commit to cross the instant", || {
+            node.counters().commit.load_acquire() > p
+        });
+        let commit = node.counters().commit.load_acquire();
+        assert!(
+            commits.last().is_none_or(|&prev| commit > prev),
+            "commit did not advance between instants: {commits:?} then {commit}"
+        );
+        commits.push(commit);
+    }
+
+    assert_eq!(instants.len(), 3, "three instants were commanded");
+    let (fired, _stamps) = query(&svc0);
+    assert!(
+        !fired.is_empty(),
+        "no timer ever fired — the oracle below would run on a timer-free log"
+    );
+
+    // Claim 4: the §4.3 predicate over the real log.
+    let frames = collect_log_frames(&node);
+    let timers = frames.iter().filter(|f| f.kind == SimKind::Timer).count();
+    assert!(
+        timers >= 10,
+        "only {timers} TIMER frames in the log — the oracle would run on a near-vacuous sequence"
+    );
+    check_frames(&frames).unwrap_or_else(|e| {
+        panic!("§4.3 violated by a log carrying three coordinated instants: {e}")
+    });
+
+    client.shutdown();
+    svc1.stop();
+    svc0.stop();
+    node.stop();
 }

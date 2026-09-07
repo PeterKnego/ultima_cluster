@@ -11,6 +11,7 @@ use uc_log::buffer::LogBuffer;
 use uc_log::cnc::{CncPage, pack_service_status, unpack_service_status};
 use uc_log::reader::LogFollower;
 use uc_protocol::ring::{BroadcastRing, SpscRing};
+use uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
 
 use crate::apply::ApplyState;
 use crate::config::{ServiceConfig, ServiceError};
@@ -55,9 +56,18 @@ pub(crate) fn lag_mode_for(cnc: &CncPage) -> crate::lag::LagMode {
 
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
+///
+/// `snapshot_capable` is `true` only from
+/// [`ServiceBuilder::start_with_snapshots`](crate::ServiceBuilder::start_with_snapshots)
+/// — the one path that installs a `freeze()` — and rides the SAME status
+/// store as the attached bit (coordinated-snapshot spec §5.2). Folding it in
+/// there rather than OR-ing it afterwards leaves no window in which the node
+/// can see this row attached-but-not-capable and refuse an instant
+/// (`48 snapshot_unsupported`) on a row that is about to be capable.
 pub(crate) fn attach<S: RawStateMachine>(
     cfg: &ServiceConfig,
     sm: S,
+    snapshot_capable: bool,
 ) -> Result<Attached<S>, ServiceError> {
     let dir = &cfg.instance_dir;
 
@@ -188,8 +198,19 @@ pub(crate) fn attach<S: RawStateMachine>(
     // Status: attached, incarnation += 1 (the prior life's value survives a
     // crash on the same page; a node restart zeroes it with the page).
     let (_, _, incarnation) = unpack_service_status(s.status.load_acquire());
+    // Coordinated-snapshot spec §5.2: the capability bit lives in the free
+    // 9..31 band of the SAME word `pack_service_status` fills (row in 0..8,
+    // attached at bit 8, incarnation at 32..64), so OR-ing it in disturbs
+    // neither the incarnation band nor the attached bit. The service process
+    // is the word's only writer, and `Service::stop` re-packs it without the
+    // bit — a detached row is not capable, which is exactly right.
+    let capable = if snapshot_capable {
+        CNC_SVC_STATUS_SNAPSHOT_CAPABLE
+    } else {
+        0
+    };
     s.status
-        .store_release(pack_service_status(row, true, incarnation.wrapping_add(1)));
+        .store_release(pack_service_status(row, true, incarnation.wrapping_add(1)) | capable);
     // cnc 3.1: the attaching service's declared version, for observability
     // (`ServiceStatusLine::version`) — written once, here, alongside status.
     s.status.store_version(S::VERSION);
