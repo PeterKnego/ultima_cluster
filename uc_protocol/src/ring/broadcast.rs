@@ -65,6 +65,12 @@ pub struct BroadcastProducer {
 
 impl BroadcastProducer {
     /// Publish a record. Never blocks; slow consumers may miss records.
+    ///
+    /// Forced inline: the service's egress publish calls this once per
+    /// applied frame, and its `Result` otherwise round-trips memory through
+    /// a GOT-indirect call (see `FrameIter::next` in `uc_log::reader`,
+    /// 2026-09-07).
+    #[inline(always)]
     pub fn write(
         &mut self,
         msg_type: u16,

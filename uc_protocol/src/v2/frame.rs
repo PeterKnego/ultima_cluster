@@ -149,6 +149,12 @@ pub fn write_header_except_length(buf: &mut [u8], h: &FrameHeader) {
 /// [`HEADER_LEN`] is a caller bug, and panicking is the correct fail-stop.
 /// The `uc_protocol_log_frame` fuzz target reproduces the real caller's
 /// guard (`len >= HEADER_LEN`) rather than removing it.
+// Forced inline: the apply loop decodes one header per frame through this.
+// It was inlined into that loop at 17d5c6b and fell out of line (a GOT call
+// with the 32-byte result round-tripping the stack) once `uc_service`'s
+// `apply_cycle` outgrew LLVM's inlining budget — see `FrameIter::next` in
+// `uc_log::reader` for the measurement (2026-09-07).
+#[inline(always)]
 pub fn read_header(buf: &[u8]) -> FrameHeader {
     FrameHeader {
         length: u32::from_le_bytes(buf[OFF_LENGTH..OFF_LENGTH + 4].try_into().unwrap()),
