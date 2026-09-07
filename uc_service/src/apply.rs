@@ -540,6 +540,10 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                 #[cfg(feature = "apply-profile")]
                 let (mut pf_frames, mut pf_sm, mut pf_pub, mut pf_bytes) = (0u64, 0u64, 0u64, 0u64);
                 let mut sm = st.sm.lock().unwrap();
+                // One context per batch, rebound per frame (see
+                // `ApplyCtx::rebind`): the per-frame construction was ~10
+                // stores plus a drop on the hot path.
+                let mut ctx = ApplyCtx::new(0, S::IDENTITY);
                 for (pos, hdr, payload) in frames {
                     // PADDING, NEW_TERM, CONFIG (and any future type that is
                     // neither MESSAGE nor a TIMER for THIS row), and anything
@@ -562,9 +566,7 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                         // bytes are trusted; a decode failure there is
                         // unrecoverable corruption and fail-stops.
                         st.resp_buf.clear();
-                        let mut ctx = ApplyCtx::new(pos, S::IDENTITY)
-                            .with_time(hdr.time_ns)
-                            .with_term(hdr.leadership_term_id);
+                        ctx.rebind(pos, hdr.time_ns, hdr.leadership_term_id);
                         sm.apply(&mut ctx, payload, &mut st.resp_buf);
                         #[cfg(feature = "apply-profile")]
                         let t1 = profile::now();

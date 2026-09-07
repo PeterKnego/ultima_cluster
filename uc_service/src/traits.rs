@@ -108,6 +108,19 @@ impl ApplyCtx {
         self.term = term;
         self
     }
+    /// Re-point a batch-scoped context at the next frame. The apply loop
+    /// builds ONE context per batch and rebinds it per frame: a fresh
+    /// `ApplyCtx` per frame is ~10 stores (the 40-byte identity copy among
+    /// them) plus a drop, on the hottest path in the system (M14a). The
+    /// schedule lists must already have been shipped — `take_sched_records`
+    /// leaves `sched` empty — so a frame never sees a predecessor's requests.
+    #[inline(always)]
+    pub(crate) fn rebind(&mut self, position: u64, time_ns: u64, term: u32) {
+        debug_assert!(self.sched.is_none(), "rebind with unshipped schedule records");
+        self.position = position;
+        self.time_ns = time_ns;
+        self.term = term;
+    }
     pub fn identity(&self) -> FsmIdentity {
         self.identity
     }
