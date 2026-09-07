@@ -696,7 +696,7 @@ takes the process down. Availability is the thing being defended here.
 Seeds are generated from fixed literals by the real encoders (`cargo +nightly
 run --bin seed-corpus`), so the committed corpus is deterministic and a corpus
 change is reviewable in a diff. Nightly CI runs every target for **600 seconds**
-on that corpus across five matrix legs; a crash fails the leg and uploads the
+on that corpus across six matrix legs; a crash fails the leg and uploads the
 artifact. The `fuzz-groups` job asserts the legs' union is exactly the set of
 declared targets, so a new target cannot be silently left unfuzzed.
 
@@ -892,7 +892,7 @@ whose apply loop is slow enough that the node's own report ceiling pins
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (five legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
+| `nightly.yml` | Full proof suite — lincheck capstones (single- and two-FSM), `sim-heavy`, loom, crashtest (single- and two-FSM), the Elle clean tier's **six** passes, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (six legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders + `uc_remote` SPSC) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---
