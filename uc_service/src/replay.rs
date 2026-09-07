@@ -76,12 +76,31 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
 /// known once the span has been read to its end. Freezing at each in turn and
 /// keeping the newest would pay `freeze()` — O(state), on the apply thread,
 /// under the SM lock — once per instant in the span. Deciding first costs one
-/// extra journal walk that reads HEADERS ONLY, applies nothing and decodes
-/// nothing; beside the apply pass it precedes that is noise, and this whole
+/// extra walk that applies nothing and decodes no user bytes, and this whole
 /// path is the overrun path, never the live walk.
 ///
-/// Two declines beyond `on_snapshot_frame`'s own three:
+/// **Cost, measured honestly** (fix round 3): this is NOT a header-only scan.
+/// `TailReader::scan_from` hands each journal BLOCK to its visitor with the
+/// payload already read and CRC-checked, so pass 1 costs a second full read of
+/// the span — ~2x the journal I/O per overrun, bounded by the tail above the
+/// row's start position. Cheaper than the alternative it replaces (an O(state)
+/// `freeze()` per instant in the span, under the SM lock) and confined to the
+/// overrun path, but not free. Two bounded alternatives if it ever matters: a
+/// REVERSE segment scan that stops at the first `SNAPSHOT` frame it finds, or
+/// a cnc word carrying the newest commanded instant's position so pass 1
+/// becomes one load.
 ///
+/// Three declines beyond `on_snapshot_frame`'s own three:
+///
+/// * **an instant at or below the row's APPLIED frontier** — the guard fix
+///   round 3 added, and the one that matters for correctness. `scan_from`
+///   always yields the COVERING segment, so a span routinely contains frames
+///   the SM is already past; freezing at one of those would pin state ABOVE P
+///   and tag it P, which the envelope check cannot catch (the tag IS P) and
+///   which makes this node's artifact for that instant differ from every live
+///   replica's — a joiner installing it double-applies `(P, applied]`. A
+///   `SNAPSHOT` frame at or below the frontier is history, exactly as it is
+///   for the `MESSAGE` and `TIMER` arms.
 /// * an instant at or below the artifact this row already holds (its cnc
 ///   `snapshot_pos`) — a restart replaying the span that contains its own
 ///   installed artifact's frame would otherwise rebuild the same file;
@@ -92,6 +111,8 @@ pub(crate) struct ReplayInstant<'a, S: RawStateMachine> {
 fn last_actionable_instant<S: RawStateMachine>(
     reader: &TailReader,
     start_pos: u64,
+    applied: Option<u64>,
+    target: u64,
     cnc: &CncPage,
     instant: &ReplayInstant<'_, S>,
 ) -> Result<Option<u64>, ServiceError> {
@@ -101,11 +122,6 @@ fn last_actionable_instant<S: RawStateMachine>(
     let mut last = None;
     reader
         .scan_from(start_pos, |_seq, base, payload| {
-            let counters = cnc.counters();
-            let target = counters
-                .commit
-                .load_acquire()
-                .min(counters.durable.load_acquire());
             let mut off = 0usize;
             while off + HEADER_LEN <= payload.len() {
                 let hdr = frame::read_header(&payload[off..]);
@@ -116,15 +132,14 @@ fn last_actionable_instant<S: RawStateMachine>(
                 }
                 let pos = base + off as u64;
                 let end = pos + aligned as u64;
-                // The same target guard pass 2 applies, so the two agree on
-                // where the span ends. `target` can only GROW between the
-                // passes, so at worst pass 2 walks further than pass 1 looked
-                // and an instant in that extra tail waits for the next pass —
-                // spec §10's abandonment, one cycle long.
+                // The SAME `target` value pass 2 uses — captured once by the
+                // caller and shared, so the two passes provably walk the same
+                // span. See `replay_into`'s capture for why that matters.
                 if end > target {
                     return false;
                 }
                 if hdr.frame_type == FRAME_TYPE_SNAPSHOT
+                    && Some(pos) > applied
                     && end > held
                     && !(hdr.flags & FLAG_SNAPSHOT_STANDBY != 0
                         && instant.node_flags & NODE_FLAG_LEARNER == 0)
@@ -287,27 +302,40 @@ pub(crate) fn replay_into<S: RawStateMachine>(
     // re-read of purged or already-applied leading segments (the
     // O(journal)-per-overrun M5 carry).
 
-    // Ruling P10, PASS 1 — headers only, no apply, no decode: which
-    // `SNAPSHOT` frame in the span this pass is about to walk should be frozen
-    // at (see [`last_actionable_instant`] for why there is a pre-pass at all).
-    // Skipped entirely for a row that is not snapshot-capable.
+    // Ruling P10, PASS 1: which `SNAPSHOT` frame in the span this pass is
+    // about to walk should be frozen at (see [`last_actionable_instant`] for
+    // why there is a pre-pass at all, and what it costs). Skipped entirely for
+    // a row that is not snapshot-capable.
+    //
+    // The applied frontier is sampled HERE, after the install block above may
+    // have moved it, and handed to pass 1 so both passes apply the identical
+    // "at or below the frontier is history" bound.
+    let applied_frontier = guard.last_applied();
+    // ONE apply frontier for BOTH passes (fix round 3). It used to be re-read
+    // per block by pass 2 so a long replay could pick up bytes that committed
+    // while it ran; that made the two passes disagree about where the span
+    // ENDS, and an instant in the difference was walked past and lost. The
+    // per-block refresh bought at most a few extra frames per pass and cost a
+    // correctness argument, so it is gone: replay now stops at the frontier it
+    // started with, and the caller's `Re-loop` (which either reads live or
+    // degrades again from a strictly higher cursor) picks up whatever
+    // committed meanwhile. Forward progress is unchanged — the cursor still
+    // advances every pass — and pass 1 and pass 2 now provably walk the same
+    // frames.
+    let target = {
+        let c = cnc.counters();
+        c.commit.load_acquire().min(c.durable.load_acquire())
+    };
     let freeze_at = if instant.trigger.is_some() {
-        last_actionable_instant(&reader, start_pos, cnc, &instant)?
+        last_actionable_instant(&reader, start_pos, applied_frontier, target, cnc, &instant)?
     } else {
         None
     };
 
     reader
         .scan_from(start_pos, |_seq, base, payload| {
-            // Re-read the live apply frontier PER BLOCK: both commit and durable
-            // can advance while we replay, so a later block may legitimately be
-            // (partly) applicable that an earlier snapshot would have gated.
-            let counters = cnc.counters();
-            let target = counters
-                .commit
-                .load_acquire()
-                .min(counters.durable.load_acquire());
-
+            // `target` is the ONE frontier captured above, shared with pass 1
+            // (fix round 3) — not re-read per block any more.
             let mut off = 0usize;
             while off + HEADER_LEN <= payload.len() {
                 let hdr = frame::read_header(&payload[off..]);
@@ -386,16 +414,37 @@ pub(crate) fn replay_into<S: RawStateMachine>(
                         },
                     );
                     let _ = ctx.take_sched_records();
-                } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT && Some(pos) == freeze_at {
-                    // Ruling P10 + P6: here, and only here — after every frame
-                    // below P has applied and before any frame at or above P
-                    // does, so the artifact is a function of the log strictly
-                    // below P: the same function the live loop computes, which
-                    // is what makes one instant's artifacts position-aligned
-                    // across rows. The decision (capability, standby, one build
-                    // in flight) is `on_snapshot_frame`'s, unchanged — this
-                    // path must not grow a second opinion about any of it.
-                    on_snapshot_frame(instant.trigger, &guard, pos, &hdr, instant.node_flags);
+                } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT && Some(pos) > guard.last_applied()
+                {
+                    // Fix round 3: the SAME `> last_applied` bound the two arms
+                    // above carry, and for a sharper reason. `scan_from` always
+                    // yields the COVERING segment, so a span routinely holds
+                    // frames the SM is already past; freezing at one of those
+                    // would pin state ABOVE P and tag it P — undetectable (the
+                    // tag IS P, so the envelope verifies), different from every
+                    // live replica's artifact for that instant, and a joiner
+                    // installing it double-applies `(P, applied]`. A `SNAPSHOT`
+                    // frame at or below the frontier is history.
+                    if Some(pos) == freeze_at {
+                        // Ruling P10 + P6: here, and only here — after every
+                        // frame below P has applied and before any frame at or
+                        // above P does, so the artifact is a function of the
+                        // log strictly below P: the same function the live loop
+                        // computes, which is what makes one instant's artifacts
+                        // position-aligned across rows. The decision
+                        // (capability, standby, one build in flight) is
+                        // `on_snapshot_frame`'s, unchanged — this path must not
+                        // grow a second opinion about any of it.
+                        //
+                        // Every OTHER `SNAPSHOT` frame in the span is skipped
+                        // silently, which is P10's "act on the last one only":
+                        // pass 1 walked these same frames, under the same
+                        // `target` and the same `> last_applied` bound, so a
+                        // frame it did not pick is either an earlier instant
+                        // (superseded) or one it declined for a reason that
+                        // has not changed.
+                        on_snapshot_frame(instant.trigger, &guard, pos, &hdr, instant.node_flags);
+                    }
                 }
                 cursor = end;
                 off += aligned;

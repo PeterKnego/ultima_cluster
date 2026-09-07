@@ -640,6 +640,16 @@ impl ClusterAgent {
     /// it would rewrite the same file on every overrun). There is no
     /// capability rule here — the cluster row is always snapshot-capable.
     ///
+    /// **No `applied` guard is needed here, unlike `uc_service`'s twin.**
+    /// `replay_journal_from(journal, from)` carries `skip_below: from`, and
+    /// `from` is this agent's own cursor, which R17 makes its `applied` — so
+    /// the walk cannot yield a frame this agent is already past, and an
+    /// instant it has already gone by can never be selected. The service side
+    /// has no such filter: `TailReader::scan_from` always hands back the
+    /// COVERING segment, so its pass 1 and its freeze arm both carry an
+    /// explicit `> last_applied` bound (fix round 3, and the determinism bug
+    /// that motivated it).
+    ///
     /// A journal that has been purged below `from` yields `None`, and pass 2
     /// then reports the gap by its own name.
     fn last_actionable_instant(&self, from: u64, head: u64, node_flags: u64) -> Option<u64> {

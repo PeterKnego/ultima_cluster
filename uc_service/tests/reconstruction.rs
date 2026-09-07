@@ -295,6 +295,241 @@ fn fresh_service_reconstructs_from_journal_after_ring_scrolled() {
     node.stop();
 }
 
+// --- Ruling P10's `last_applied` guard: a stale instant is history ----------
+//
+// These two statics are touched by ONE test
+// (`a_replayed_instant_at_or_below_the_applied_frontier_is_not_frozen_at`)
+// and by nothing else in this binary, so the file's default test parallelism
+// cannot race them.
+
+/// Nanoseconds `SlowCountSm::apply` sleeps — the lever that makes the live
+/// ring lap a running row on purpose, so an OVERRUN replay is a certainty and
+/// not a scheduling coincidence.
+static SLOW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// While false, `freeze()` fails — which is how the test makes a row DECLINE
+/// a live instant (spec §10) and then apply on past it, the state the guard
+/// under test exists for.
+static FREEZE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[derive(Default)]
+struct SlowCountSm {
+    total: u64,
+    last_applied: Option<u64>,
+}
+
+impl StateMachine for SlowCountSm {
+    const NAME: &'static str = "slowcount";
+    type Command = Cmd;
+    type Response = u64;
+    type Query = ();
+    type QueryResponse = u64;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Cmd) -> u64 {
+        let ns = SLOW_NS.load(std::sync::atomic::Ordering::Relaxed);
+        if ns > 0 {
+            std::thread::sleep(Duration::from_nanos(ns));
+        }
+        let Cmd::Add(n) = cmd;
+        self.total += n;
+        self.last_applied = Some(ctx.position);
+        self.total
+    }
+
+    fn query(&self, _q: ()) -> u64 {
+        self.total
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        self.last_applied
+    }
+}
+
+impl uc_service::SnapshotStateMachine for SlowCountSm {
+    type SnapshotHandle = (u64, Option<u64>);
+
+    fn freeze(&self) -> Result<((u64, Option<u64>), u64), uc_service::SnapshotError> {
+        if !FREEZE_OK.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(uc_service::SnapshotError::Codec(
+                "declined by the test".into(),
+            ));
+        }
+        Ok((
+            (self.total, self.last_applied),
+            self.last_applied.unwrap_or(0),
+        ))
+    }
+
+    fn stream_snapshot(
+        handle: (u64, Option<u64>),
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc_service::SnapshotError> {
+        let bytes = bincode::serde::encode_to_vec(handle, bincode::config::standard())
+            .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        std::io::Write::write_all(dst, &bytes)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc_service::SnapshotError> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(src, &mut buf)?;
+        let ((total, last), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+                .map_err(|e| uc_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = last;
+        Ok(position)
+    }
+}
+
+fn snapshot_files(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("snapshots").join("0"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".ultsnap"))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// Ruling P10 + the `last_applied` guard (fix round 3): a `SNAPSHOT` frame at
+/// or below the row's applied frontier is HISTORY, and a replayed span must
+/// never freeze at one.
+///
+/// **The determinism bug this pins.** P10 shipped without the
+/// `Some(pos) > last_applied()` bound its MESSAGE and TIMER siblings carry,
+/// and pass 1 filtered only on the cnc `snapshot_pos`. `scan_from` always
+/// yields the COVERING segment, i.e. frames below `start_pos`. So: an instant
+/// P is declined live (a freeze failure leaves `snapshot_pos` below P), the
+/// row applies on past P, and a later overrun replays a span whose only
+/// actionable instant is that stale P — the row would freeze with state ABOVE
+/// P and tag the artifact P. The envelope check passes (the tag IS P), so
+/// nothing catches it: a live replica's artifact at P holds different bytes,
+/// and a joiner installing this one double-applies `(P, last_applied]`.
+///
+/// Phase B is the red one; phase C is its anti-vacuity (the same row, the same
+/// replay path, freezes correctly at an instant that IS above the frontier).
+#[test]
+fn a_replayed_instant_at_or_below_the_applied_frontier_is_not_frozen_at() {
+    use std::sync::atomic::Ordering as O;
+    use uc_service::SnapshotStateMachine;
+
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let node = start_single_node_with_buffer(dir.path(), "recp10g", RING_BYTES);
+    wait_until(|| node.can_serve());
+    let prod = open_ingress(dir.path());
+    let cnc = open_cnc(dir.path(), "recp10g");
+
+    SLOW_NS.store(0, O::Relaxed);
+    FREEZE_OK.store(false, O::Relaxed); // every freeze DECLINES
+    let svc = ServiceBuilder::new(cfg(dir.path(), "recp10g"), SlowCountSm::default())
+        .start_with_snapshots()
+        .unwrap();
+
+    // ---- phase A: an instant the row DECLINES, then applies past.
+    let mut submitted = 0u32;
+    for _ in 0..200 {
+        submitted += 1;
+        write_submit_retrying(&prod, 5, submitted, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    let p1 = command_instant(&node);
+    submitted += 1;
+    write_submit_retrying(&prod, 5, submitted, &Cmd::Add(1));
+    for _ in 0..200 {
+        submitted += 1;
+        write_submit_retrying(&prod, 5, submitted, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    wait_until(|| cnc.service_slot(0).applied.load_acquire() > p1);
+    assert_eq!(
+        cnc.service_slot(0).snapshot_pos.load_acquire(),
+        0,
+        "phase A: the freeze failed, so the row holds no artifact — and its \
+         applied frontier is now ABOVE p1, which is the state under test"
+    );
+    assert!(snapshot_files(dir.path()).is_empty());
+
+    // ---- phase B: make the ring lap the row, with NO new instant in the
+    // ---- span. Its only actionable-looking instant is the stale p1.
+    FREEZE_OK.store(true, O::Relaxed); // freezes would now SUCCEED...
+    SLOW_NS.store(200_000, O::Relaxed); // ...and the row falls far behind
+    for _ in 0..3_000 {
+        submitted += 1;
+        write_submit_retrying(&prod, 5, submitted, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    // The precondition is not "the log is big" but "the row is more than a
+    // ring behind", which is exactly what makes its next batch `Overrun`.
+    let behind = node.counters().append.load_acquire() - cnc.service_slot(0).applied.load_acquire();
+    assert!(
+        behind > RING_BYTES as u64,
+        "precondition: the slow row must be more than a ring behind so its \
+         next batch OVERRUNS ({behind} B behind a {RING_BYTES} B ring)"
+    );
+    // Let the replay run and the row catch up.
+    SLOW_NS.store(0, O::Relaxed);
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        cnc.service_slot(0).snapshot_pos.load_acquire(),
+        0,
+        "a replayed span must NOT freeze at an instant the row already passed"
+    );
+    assert!(
+        snapshot_files(dir.path()).is_empty(),
+        "no artifact at all: {:?}",
+        snapshot_files(dir.path())
+    );
+
+    // ---- phase C (anti-vacuity): the same row, the same replay path, an
+    // ---- instant that IS above the applied frontier — one artifact, at it,
+    // ---- holding the state strictly below it.
+    SLOW_NS.store(200_000, O::Relaxed);
+    for _ in 0..600 {
+        submitted += 1;
+        write_submit_retrying(&prod, 5, submitted, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    let below_p2 = submitted as u64;
+    let p2 = command_instant(&node);
+    assert!(p2 > p1);
+    for _ in 0..600 {
+        submitted += 1;
+        write_submit_retrying(&prod, 5, submitted, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    SLOW_NS.store(0, O::Relaxed);
+    wait_until(|| cnc.service_slot(0).snapshot_pos.load_acquire() == p2);
+    assert_eq!(
+        snapshot_files(dir.path()),
+        vec![format!("snap-{p2}.ultsnap")],
+        "exactly one artifact, at the instant above the frontier — the stale \
+         p1 was never frozen at"
+    );
+
+    let store = uc_service::snapshots::SnapshotStore::open(dir.path(), 0).unwrap();
+    let (pos, path) = store.newest(u64::MAX).unwrap().expect("an artifact at p2");
+    assert_eq!(pos, p2);
+    let mut f = std::fs::File::open(&path).unwrap();
+    uc_service::snapshots::verify_snapshot_envelope(&mut f, p2).expect("envelope names p2");
+    let mut restored = SlowCountSm::default();
+    restored.install_snapshot(p2, &mut f).unwrap();
+    assert_eq!(
+        restored.total, below_p2,
+        "P6: the artifact is the state strictly BELOW p2 — the 600 adds above \
+         it must not have leaked in"
+    );
+
+    svc.stop();
+    node.stop();
+}
+
 /// Ruling P10, the CATCH-UP path: a span replayed from the journal freezes at
 /// its last `SNAPSHOT` frame.
 ///
