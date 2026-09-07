@@ -75,6 +75,11 @@ fn main() -> std::io::Result<()> {
     write_target(root, "uc_protocol_settings", seeds::uc_protocol_settings())?;
     write_target(
         root,
+        "uc_protocol_cluster_image",
+        seeds::uc_protocol_cluster_image(),
+    )?;
+    write_target(
+        root,
         "uc_node_cluster_artifact",
         seeds::uc_node_cluster_artifact(),
     )?;

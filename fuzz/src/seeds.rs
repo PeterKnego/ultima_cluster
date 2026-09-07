@@ -215,6 +215,22 @@ pub fn uc_protocol_datagram() -> Vec<Seed> {
     );
     seeds.push(Seed::fixed("20-snap-redirect", datagram(DGRAM_KIND_SNAP_REDIRECT, 0, 3, &b)));
 
+    // Cluster-FSM plan 3 (spec §11): an otherwise well-formed, exactly
+    // `SNAP_BEGIN_FIXED_LEN` V4 body carrying a `layout` discriminator that
+    // is none of 0, `SNAP_BEGIN_LAYOUT_V2_RETIRED`,
+    // `SNAP_BEGIN_LAYOUT_V3_RETIRED` or `SNAP_BEGIN_LAYOUT_V4` — the shape a
+    // peer running a FUTURE wire version would send. `read_snap_begin_body`
+    // is total for every `layout` byte (deciding what an unrecognized one
+    // means is the receiving NODE's job, not the decoder's — see its doc),
+    // so this seed exercises that path; the 14- and 15- seeds above already
+    // cover a valid V4 body.
+    let mut b = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+    write_snap_begin_body(
+        &mut b,
+        &SnapBeginBody { session: 9, layout: 200, service_id: 2, snapshot_pos: 65536, total_len: 300 * 1024, identity, version },
+    );
+    seeds.push(Seed::fixed("21-snap-begin-v4-bad-layout", datagram(DGRAM_KIND_SNAP_BEGIN, 0, 3, &b)));
+
     seeds
 }
 
@@ -1399,6 +1415,53 @@ pub fn uc_protocol_cluster_frame() -> Vec<Seed> {
         Seed::fixed("04-short", vec![0u8; 4]),
         Seed::fixed("05-unknown-kind", unknown_kind),
         Seed::fixed("06-reserved-nonzero", reserved_nonzero),
+    ]
+}
+
+/// `uc_protocol_cluster_image` (plan 3, spec §4.8) — the cluster image
+/// CODEC LEAF (`uc_protocol::v2::cluster_image`), moved out of
+/// `uc_node::cluster_fsm::{freeze, install_snapshot}` so it can be fuzzed
+/// without pulling in `uc_node`: a valid encode of genesis-shaped parts
+/// (empty membership, empty table, default settings), and the same image
+/// with one flipped CRC byte. `uc_node_cluster_artifact` below still covers
+/// the same decoder through the real `ClusterFsm::install_snapshot` entry
+/// point, with a richer (non-genesis) state and the length-prefix-lying
+/// refusal — the two targets are complementary, not redundant: this one
+/// reaches the leaf directly, that one proves the `uc_node` call site still
+/// wires it up correctly end to end.
+pub fn uc_protocol_cluster_image() -> Vec<Seed> {
+    use uc_protocol::v2::cluster_image::{ClusterImageParts, encode_cluster_image};
+    use uc_protocol::v2::config::{WireConfig, encode_config};
+    use uc_protocol::v2::schedule::{ScheduleTable, encode_schedule_table};
+    use uc_protocol::v2::settings::{Settings, encode_settings};
+
+    let mut membership = Vec::new();
+    encode_config(
+        &WireConfig { version: 1, prev_position: 0, voters: vec![], learners: vec![], tombstones: vec![] },
+        &mut membership,
+    );
+    let mut table = Vec::new();
+    encode_schedule_table(&ScheduleTable { entries: vec![] }, &mut table);
+    let mut settings = Vec::new();
+    encode_settings(&Settings::genesis_default(), &mut settings);
+
+    let parts = ClusterImageParts {
+        applied: 500,
+        table_position: 0,
+        settings_position: 0,
+        membership: &membership,
+        table: &table,
+        settings: &settings,
+    };
+    let mut image = Vec::new();
+    encode_cluster_image(&parts, &mut image);
+
+    let mut bad_crc = image.clone();
+    *bad_crc.last_mut().expect("non-empty image") ^= 1;
+
+    vec![
+        Seed::fixed("21-cluster-image", image),
+        Seed::fixed("22-cluster-image-bad-crc", bad_crc),
     ]
 }
 

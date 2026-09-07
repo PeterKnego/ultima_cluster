@@ -139,6 +139,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "uc_protocol_cluster_image"
+path = "fuzz_targets/uc_protocol_cluster_image.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "uc_protocol_settings"
 path = "fuzz_targets/uc_protocol_settings.rs"
 test = false
