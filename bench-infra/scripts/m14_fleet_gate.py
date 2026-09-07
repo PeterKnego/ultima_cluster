@@ -1052,14 +1052,589 @@ def arm_join(voters, learner, a, K, checks, pins=None, restart_leader_after=None
         st = node_stats(hh)
         refusals[hh.public_ip] = (st[1], st[2], st[3]) if st else (-1, -1, -1)
     hosts_all = voters + [learner]
+    # Row g: the newest COMPLETE snapshot set every host holds. It must agree
+    # cluster-wide once caught up (coordinated-snapshot spec §5.3/§9) — which
+    # is the clause that says the joiner adopted the shipper's set rather than
+    # merely catching up beside it.
+    set_positions = {}
+    for hh in hosts_all:
+        v = tt.prom_get(scrape_prom(hh, label="set-pos"), "uc2_snapshot_set_position")
+        if v is not None:
+            set_positions[hh.public_ip] = int(v)
     before = len(checks)
     check_all(hosts_all, leader, "join", checks, expect_min=int(d["responses"]) if d else None)
     check_ok = all(c[3] for c in checks[before:]) and len({c[4] for c in checks[before:]}) == 1
     print(f"INFO row f: joined_at={joined_at}s artifacts={artifacts} bytes={artifact_bytes} "
-          f"snapshot_installs={installs} refusals={refusals} check_ok={check_ok}", flush=True)
+          f"snapshot_installs={installs} refusals={refusals} check_ok={check_ok} "
+          f"set_positions={set_positions} leader_restarted={leader_restarted}", flush=True)
     stop_cluster_m14(hosts_all)
     return {"joined_at": joined_at, "refusals": refusals, "artifacts": artifacts,
             "artifact_bytes": artifact_bytes, "installs": installs, "check_ok": check_ok,
+            "client_lost": d["lost"] if d else None, "set_positions": set_positions,
+            "leader_restarted": leader_restarted}
+
+
+# ============================================ time and timers (--tt-rows)
+# Rows a/b/c/e/g/h of docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md.
+# The bars are that document's, pre-committed; nothing below may be edited to
+# fit a run. Every verdict is pure over recorded numbers, exactly like the M14
+# rows above, and every one prints a single GATE-JSON line.
+
+# The four rate arms the T&T rows re-use from `arm_rates`. The two LOCKSTEP
+# arms are deliberately absent: they are the M14 gate's row e, "reported, no
+# bar", so A/B-ing them would invent a bar the gate doc does not carry.
+TT_RATE_ARMS = ("n1", "n2eq", "slow1", "pair")
+
+ROW_H_ARM_SECS = 360          # two 120 s instant budgets + a learner join + baseline
+ROW_H_BASELINE_SECS = 12      # 2 s ramp + [2,10) s baseline + slack (row d's shape)
+ROW_H_GAP_TAIL_MS = 2000      # a stall may outlive the instant by a bucket or two
+ROW_H_LEARNER_SERVE_SECS = 120.0
+
+
+def tt_arm_fsms(label, K):
+    return {"n1": [(0, 0)], "n2eq": [(0, 0), (1, 0)],
+            "slow1": [(0, K)], "pair": [(0, 0), (1, K)]}[label]
+
+
+def tt_fan_in(label):
+    """Fan-in whenever two FSMs are declared (the M14 rate conventions)."""
+    return label in ("n2eq", "pair")
+
+
+# ------------------------------------------------------- pure T&T verdicts
+def _ab_fields(stats):
+    """`tt.ab_stats` output flattened for a GATE-JSON line."""
+    out = {}
+    for label, row in sorted(stats.items()):
+        f = {}
+        for side in ("base", "head"):
+            if side in row:
+                f[side] = {k: row[side][k]
+                           for k in ("n", "mean", "min", "max", "spread_pct", "sem_pct")}
+        if "delta_pct" in row:
+            f["delta_pct"] = row["delta_pct"]
+        out[label] = f
+    return out
+
+
+def _ab_row(row, title, rates_base, rates_head, resolution_pct, late_counts=None, **extra):
+    """The shared body of rows a, b and e: an interleaved A/B read against a
+    recorded resolution, plus (rows b and e) the `uc2_timers_late_total == 0`
+    sweep.
+
+    `rates_base` / `rates_head` are `{arm: [rate per rep]}`. Only
+    `within resolution` passes — `inconclusive (noisy run)` is a third answer
+    and never a soft pass (gate doc, "Rows d and f: the verdict rule").
+    `late_counts=None` means the row has no late clause; an EMPTY sweep is a
+    failure, not a pass, because it is the absence of evidence."""
+    arms = {label: {"base": rates_base.get(label, []), "head": rates_head.get(label, [])}
+            for label in sorted(set(rates_base) | set(rates_head))}
+    stats = tt.ab_stats(arms)
+    reading, worst_delta, worst_sem = tt.ab_reading(stats, resolution_pct)
+    offenders = tt.late_offenders(late_counts) if late_counts is not None else []
+    late_ok = None if late_counts is None else (bool(late_counts) and not offenders)
+    ok = (reading == "within resolution") and (late_ok is not False)
+    detail = (f"{reading}"
+              + (f": worst arm delta {worst_delta:+.3f} % vs resolution "
+                 f"{resolution_pct} %" if worst_delta is not None else "")
+              + (f" (worst sem {worst_sem:.3f} %)" if worst_sem is not None else ""))
+    if late_ok is not None:
+        detail += (f"; timers_late == 0 on {len(late_counts)} samples" if late_ok
+                   else f"; TIMERS LATE: {offenders[:8]}")
+    for arm, host, service, srow, count in offenders:
+        print(f"FAIL {row}: uc2_timers_late_total={count} on {host} arm={arm} "
+              f"service={service} row={srow}", flush=True)
+    gate_json(row, ok, reading=reading, worst_delta_pct=worst_delta, worst_sem_pct=worst_sem,
+              resolution_pct=resolution_pct, arms=_ab_fields(stats),
+              late_samples=(len(late_counts) if late_counts is not None else None),
+              late_offenders=[list(o) for o in offenders], **extra)
+    return Verdict(title, ok, detail)
+
+
+def verdict_tt_a(rates_base, rates_head, resolution_pct):
+    """Row a: every service wrapped in `Timed<..>`, NO timers scheduled, against
+    the same arms on the pre-time-and-timers binary. Bar: within the day's
+    `scripts/hop1_ab.sh` same-source rebuild resolution — a NULL bar ("the
+    stamp is free"), not a ratio against a target."""
+    return _ab_row("tt-a", "tt-a Timed<..> services, no timers, vs the pre-T&T binary",
+                   rates_base, rates_head, resolution_pct)
+
+
+def verdict_tt_b(rates_base, rates_head, resolution_pct, late_counts):
+    """Row b: the same A/B with FSM 0 sustaining the timer load, AND
+    `uc2_timers_late_total == 0` on every node for every row after the warm-up
+    window. Both clauses must hold."""
+    return _ab_row("tt-b", "tt-b sustained timer load vs the pre-T&T binary",
+                   rates_base, rates_head, resolution_pct, late_counts=late_counts)
+
+
+def verdict_tt_e(rates_row_a, rates_row_e, resolution_pct, late_counts, table_ok=None):
+    """Row e: the 32-entry, 100 ms table live through the same arms.
+
+    The comparison is row a's OWN head rates against row e's — the same
+    binary with and without a live table — because the bar is "throughput
+    within row a's resolution" and what row e adds is the table, not a
+    version change. `table_ok` is the per-arm convergence flag from
+    `apply_schedule_table`; a row whose table never converged on every voter
+    is not a pass whatever its rate did."""
+    converged = bool(table_ok) and all(table_ok.values())
+    v = _ab_row("tt-e", "tt-e 32-entry 100 ms schedule table live through the rate arms",
+                rates_row_a, rates_row_e, resolution_pct, late_counts=late_counts,
+                table_converged=converged, table_ok=table_ok)
+    if not converged:
+        return Verdict(v.row, False, v.detail + f"; TABLE DID NOT CONVERGE: {table_ok}")
+    return v
+
+
+def verdict_tt_c(p99_ns, pass_ns, count):
+    """Row c: `p99 <= 2 x the measured consensus-pass length on the rig`.
+
+    An on-time fire is stamped with its deadline, so the histogram measures
+    WALL-CLOCK lateness — the delay between the deadline passing and the pass
+    that notices it. That is bounded below by the pass length, which is why
+    the bar is a multiple of the measured pass and not a fixed number, and why
+    a p99 above it points at pass scheduling rather than at the timer heap.
+
+    Fewer than `ROW_C_MIN_FIRES` fires is `inconclusive (too few fires)` —
+    reported as such and NOT as a pass."""
+    bar_ns = tt.ROW_C_BAR_MULTIPLE * pass_ns if pass_ns else None
+    enough = count is not None and count >= tt.ROW_C_MIN_FIRES
+    ok = bool(enough and p99_ns is not None and bar_ns is not None and p99_ns <= bar_ns)
+    if not enough:
+        detail = (f"inconclusive (too few fires): count={count}, "
+                  f"need >= {tt.ROW_C_MIN_FIRES}")
+    elif p99_ns is None or bar_ns is None:
+        detail = f"inconclusive (missing histogram): p99={p99_ns} ns, mean pass={pass_ns} ns"
+    else:
+        detail = (f"p99 {p99_ns:.0f} ns over {count:.0f} fires vs bar {bar_ns:.0f} ns "
+                  f"({tt.ROW_C_BAR_MULTIPLE:g} x mean pass {pass_ns:.0f} ns)")
+    gate_json("tt-c", ok, p99_ns=p99_ns, pass_ns=pass_ns, count=count, bar_ns=bar_ns,
+              min_fires=tt.ROW_C_MIN_FIRES, multiple=tt.ROW_C_BAR_MULTIPLE)
+    return Verdict("tt-c timer precision under row b's load", ok, detail)
+
+
+def verdict_tt_g(g):
+    """Row g: `g` = `{"joined_at": s|None, "installs": n, "set_positions":
+    {host: pos}, "leader_restarted": bool}`.
+
+    Four clauses, and the last two are the anti-vacuity ones. `installs` is
+    row f's: at least one `snapshot_installed` record is the positive evidence
+    that a snapshot SESSION ran, rather than a plain journal catch-up.
+    `leader_restarted` is row g's own: without the mid-window restart this is
+    row f again, and the residual the row exists to close was never exercised.
+    `set_positions` must AGREE across every host and be non-zero — a complete
+    set at one position, cluster-wide."""
+    j = g.get("joined_at")
+    positions = g.get("set_positions") or {}
+    values = set(positions.values())
+    agree = len(positions) >= 1 and len(values) == 1 and all(p > 0 for p in values)
+    installs = int(g.get("installs") or 0)
+    restarted = bool(g.get("leader_restarted"))
+    ok = (j is not None and j <= tt.BAR_TT_G_CONVERGE_SECS and installs >= 1
+          and agree and restarted)
+    gate_json("tt-g", ok, joined_at=j, installs=installs, set_positions=positions,
+              set_agree=agree, leader_restarted=restarted, bar=tt.BAR_TT_G_CONVERGE_SECS)
+    return Verdict("tt-g below-floor join with the shipper restarted mid-window", ok,
+                   f"joined at {j}s (bar <= {tt.BAR_TT_G_CONVERGE_SECS}s), "
+                   f"snapshot installs={installs} (need >= 1), leader restarted={restarted}, "
+                   f"snapshot set agrees cluster-wide={agree} {sorted(positions.items())}")
+
+
+def verdict_tt_h(all_arm, standby_arm, pass_ns):
+    """Row h: freeze duration vs commit stall.
+
+    ONE bar, and it is the standby arm's: its commit gap must be `<=` the pass
+    length measured on the day (row c's mean), i.e. no stall attributable to
+    the instant. The ALL-NODES arm's gap is reported bare — it is the cost the
+    operator is choosing between, not a target to hit, and a freeze on a
+    quorum that outlasts `fsm_lag` of appended log stalls commit BY DESIGN.
+
+    Both instants must have completed: an instant that never landed makes the
+    row unreadable rather than passed."""
+    bar_secs = (pass_ns / 1e9) if pass_ns else None
+    a_arm, s_arm = all_arm or {}, standby_arm or {}
+    gap = s_arm.get("gap_secs")
+    both_done = bool(a_arm.get("completed")) and bool(s_arm.get("completed"))
+    ok = bool(both_done and bar_secs is not None and gap is not None and gap <= bar_secs)
+    if not both_done:
+        detail = (f"inconclusive (an instant did not complete): all-nodes="
+                  f"{a_arm.get('completed')} standby={s_arm.get('completed')}")
+    elif bar_secs is None:
+        detail = "inconclusive (no pass length recorded — run tt-c, or pass --pass-ns)"
+    else:
+        detail = (f"standby commit gap {gap}s vs bar {bar_secs * 1e3:.3f} ms "
+                  f"(the measured pass length); all-nodes gap {a_arm.get('gap_secs')}s "
+                  f"(reported, no bar), freeze max all-nodes "
+                  f"{max(a_arm.get('freeze_max', {}).values(), default=None)}s / standby "
+                  f"{max(s_arm.get('freeze_max', {}).values(), default=None)}s")
+    gate_json("tt-h", ok, all_nodes=a_arm, standby=s_arm, pass_ns=pass_ns,
+              bar_secs=bar_secs, stall_fraction=tt.STALL_FRACTION)
+    return Verdict("tt-h freeze duration vs commit stall", ok, detail)
+
+
+def row_c_reading(scrapes):
+    """`scrapes` = `[(arm, leader_metrics)]` from the TIMERS-ON arms ->
+    `(arm, p99_ns, pass_ns, count, per_arm)`.
+
+    Adjudicated on the arm with the MOST fires rather than on a pool of all of
+    them: 1 000 timers/s over one 12 s arm only just clears the 10 000-fire
+    floor, and pooling arms whose pass lengths differ would mix distributions
+    into a histogram that describes none of them. Every arm's reading is
+    returned too, and printed, so a run can be read even when the chosen arm
+    is inconclusive."""
+    per_arm = []
+    for arm, m in scrapes:
+        buckets, _, count = tt.hist_series(m, "uc2_timer_lateness_ns", row="0")
+        pb, psum, pcount = tt.hist_series(m, "uc2_consensus_pass_ns")
+        per_arm.append({
+            "arm": arm,
+            "count": count,
+            "p99_ns": tt.hist_quantile(buckets, 0.99),
+            "p50_ns": tt.hist_quantile(buckets, 0.50),
+            "lateness_max_ns": tt.prom_get(m, "uc2_timer_lateness_ns_max", row="0"),
+            "pass_ns": tt.hist_mean(psum, pcount),
+            "pass_p99_ns": tt.hist_quantile(pb, 0.99),
+            "pass_max_ns": tt.prom_get(m, "uc2_consensus_pass_ns_max"),
+        })
+    if not per_arm:
+        return None, None, None, None, per_arm
+    best = max(per_arm, key=lambda r: (r["count"] or 0))
+    return best["arm"], best["p99_ns"], best["pass_ns"], best["count"], per_arm
+
+
+# ------------------------------------------------------------- T&T fleet
+def prepare_base_tree(hosts, base_tree):
+    """rsync the pre-time-and-timers checkout to `BASE_SRC` on every host and
+    build ITS `m6_gate` + `m12_gate` there — `m14_ab_27_vs_28.py`'s
+    second-tree pattern, whose `sync_tree_to` this reuses rather than
+    re-deriving. Each version is probed by its own `m6_gate` because the two
+    trees' cnc page layouts need not agree."""
+    sync_tree_to(hosts, base_tree, BASE_SRC)
+    env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
+    cargo = m6.SshHost.CARGO
+    for h in hosts:
+        cmd = (f"sudo mkdir -p {BASE_SRC} && "
+               f"{env} {cargo} build --release --manifest-path {BASE_SRC}/Cargo.toml "
+               f"-p uc_node --example m6_gate && "
+               f"{env} {cargo} build --release --manifest-path {BASE_SRC}/Cargo.toml "
+               f"-p uc_gateway --example m12_gate && "
+               f"test -x {BASE_GATE} && test -x {BASE_PROBE} && echo PREPARED-BASE")
+        r = ssh(h, cmd, label="build-base")
+        if "PREPARED-BASE" not in (r.stdout or ""):
+            raise RuntimeError(f"baseline build on {h.public_ip}: {(r.stderr or r.stdout)[-2000:]}")
+    # Provenance beside every number, the M14b rule: which binaries these were.
+    r = ssh(hosts[0], f"sha256sum {BUILT_GATE} {BASE_GATE}; "
+                      f"git -C {m6.SshHost.UC_SRC} rev-parse --short HEAD 2>/dev/null; "
+                      f"git -C {BASE_SRC} rev-parse --short HEAD 2>/dev/null; true",
+            label="provenance")
+    print("INFO A/B provenance (head, base):\n" + (r.stdout or ""), flush=True)
+
+
+def base_fleet_hosts(a):
+    """The same 4 machines, addressed through the BASELINE tree's binaries."""
+    return m6.build_fleet_hosts(BASE_GATE, a.ssh_user, a.ssh_key, a.hosts, count=4,
+                                ctl_bin=BUILT_CTL, unit_prefix=UNIT_PREFIX,
+                                remote_root=REMOTE_ROOT, probe_bin=BASE_PROBE)
+
+
+def ensure_k(voters, a, rates, checks, pins=None):
+    """The slow-FSM `K` the rate arms need. Free when the M14 rows already ran
+    (they leave `n1` in `rates` and return K); otherwise `--k`, else one `n1`
+    arm plus the calibration ladder — the same two steps `arm_rates` takes,
+    and the same `calib_ok` band refusal if the ladder never slowed FSM 0
+    down."""
+    if a.k:
+        return a.k
+    if "n1" not in rates:
+        one_arm(voters, a, "n1", [(0, 0)], None, rates, checks, fan_in=False, pins=pins)
+    return arm_calib(voters, a, rates, checks, pins=pins)
+
+
+def arm_tt_ab(voters, base_voters, a, K, checks, timers_per_sec, tag, pins=None):
+    """Rows a and b: the four rate arms A/B'd against the baseline tree,
+    INTERLEAVED per arm on fresh clusters (A base, B head, A, B …).
+
+    Interleaved so a drift in the rig across the run lands on both versions
+    equally rather than on whichever ran second; fresh clusters per arm so no
+    mixed-version cluster ever exists (the baseline predates this flag day's
+    header relayout, and a relaid header is the SAME LENGTH — a mixed cluster
+    would parse each other's frames and mean something different, which is the
+    one failure mode the wire's length checks cannot catch).
+
+    Every BASE arm runs under `tt_disabled()`: its `m12_gate` has none of
+    `--metrics-listen`/`--timed`/`--timers-per-sec`, and would refuse them by
+    name. That is also why the base arms carry no late sweep, no metrics
+    scrape and no divergence check — they are a rate on another binary, not a
+    claim about this branch."""
+    base_rates = {label: [] for label in TT_RATE_ARMS}
+    head_rates = {label: [] for label in TT_RATE_ARMS}
+    late, scrapes = [], []
+    for label in TT_RATE_ARMS:
+        fsms = tt_arm_fsms(label, K)
+        row0 = fsm_name(0, fsms[0][1])
+        timers_here = timers_per_sec > 0 and row0 == "count"
+        if timers_per_sec > 0 and not timers_here:
+            print(f"INFO {tag} {label}: row 0 declares '{row0}', not 'count' — no timer load on "
+                  f"this arm (the Rust contract allows --timers-per-sec only with --fsm count). "
+                  f"The late == 0 sweep still runs over it.", flush=True)
+        for rep in range(1, a.ab_reps + 1):
+            with tt_disabled():
+                db = one_arm(base_voters, a, f"{tag} base {label} rep{rep}", fsms, None, {},
+                             checks, fan_in=tt_fan_in(label), pins=pins, check=False)
+            base_rates[label].append(rate_of(db))
+            with tt_options(timers_per_sec=(timers_per_sec if timers_here else 0)):
+                dh = one_arm(voters, a, f"{tag} head {label} rep{rep}", fsms, None, {},
+                             checks, fan_in=tt_fan_in(label), pins=pins,
+                             late=(late if timers_per_sec > 0 else None),
+                             scrapes=(scrapes if timers_here else None))
+            head_rates[label].append(rate_of(dh))
+            print(f"INFO {tag} {label} rep{rep}: base {base_rates[label][-1]:.0f} ops/s, "
+                  f"head {head_rates[label][-1]:.0f} ops/s", flush=True)
+    return {"base": base_rates, "head": head_rates, "late": late, "scrapes": scrapes}
+
+
+def apply_schedule_table(voters, leader, count, row0_name, arm):
+    """Row e: stage a `count`-entry table naming `row0_name`, apply it against
+    the LEADER, and wait until every voter's `uc2_schedule_table_position`
+    agrees and is non-zero.
+
+    `uc2ctl schedule apply` is leader-only by construction — it stages the
+    encoded table as a node-local file and signs its digest into the admin
+    request, so a follower has nothing to forward — which is why this runs on
+    `voters[leader]` and never retries elsewhere. No admin key is passed: this
+    gate's clusters run `m12_gate`'s default admin policy, exactly as
+    `arm_join`'s `add-learner` and `status_slots` do.
+
+    The table names the row's DECLARED name rather than a fixed `count`: an
+    entry naming an undeclared FSM refuses the WHOLE table (refusal 43), and
+    the `slow1` arm declares row 0 as `spin`.
+
+    Returns the per-host positions, or `None` on refusal or on the 30 s
+    convergence timeout. The arm still runs either way and `verdict_tt_e`
+    fails the row on the flag — an arm that produced evidence is worth more to
+    the run than a traceback."""
+    h = voters[leader]
+    path = f"/opt/bench/{UNIT_PREFIX}-schedule.toml"
+    body = tt.schedule_toml(count, row0_name)
+    blob = base64.b64encode(body.encode()).decode()
+    ssh(h, f"echo {blob} | base64 -d | sudo tee {path} >/dev/null && sudo sha256sum {path}",
+        label="schedule-stage")
+    r = ssh(h, f"sudo {BUILT_CTL} schedule apply --instance-dir {h.dir} --app-id {APP} {path}",
+            label="uc2ctl schedule")
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    print(f"INFO {arm}: schedule apply ({count} entries on '{row0_name}') "
+          f"rc={r.returncode}: {out[:400]}", flush=True)
+    if r.returncode != 0:
+        print(f"FAIL {arm}: `uc2ctl schedule apply` was refused — row e cannot be "
+              f"adjudicated on this arm", flush=True)
+        return None
+    deadline = time.time() + tt.SCHEDULE_CONVERGE_SECS
+    positions = {}
+    while time.time() < deadline:
+        positions = {hh.public_ip: tt.prom_get(scrape_prom(hh, label="table-pos"),
+                                               "uc2_schedule_table_position")
+                     for hh in voters}
+        vals = [v for v in positions.values() if v is not None]
+        if len(vals) == len(voters) and len(set(vals)) == 1 and vals[0] > 0:
+            print(f"INFO {arm}: schedule table converged at position {vals[0]:.0f} on all "
+                  f"{len(vals)} voters", flush=True)
+            return positions
+        time.sleep(0.5)
+    print(f"FAIL {arm}: schedule table did not converge within "
+          f"{tt.SCHEDULE_CONVERGE_SECS}s — positions {positions}", flush=True)
+    return None
+
+
+def arm_tt_e(voters, a, K, checks, pins=None):
+    """Row e: the same four arms again with the table live from before the
+    client starts, `--ab-reps` reps each so the comparison against row a's
+    head rates has the same statistical shape as rows a and b."""
+    rates = {label: [] for label in TT_RATE_ARMS}
+    late, table_ok, positions = [], {}, {}
+    for label in TT_RATE_ARMS:
+        fsms = tt_arm_fsms(label, K)
+        row0 = fsm_name(0, fsms[0][1])
+        for rep in range(1, a.ab_reps + 1):
+            state = {}
+
+            def pre_client(vs, leader, _row0=row0, _label=label, _rep=rep, _state=state):
+                _state["positions"] = apply_schedule_table(
+                    vs, leader, a.schedule_table, _row0, f"tt-e {_label} rep{_rep}")
+
+            scratch = {}
+            with tt_options(timers_per_sec=0):
+                one_arm(voters, a, f"tt-e {label} rep{rep}", fsms, None, scratch, checks,
+                        fan_in=tt_fan_in(label), pins=pins, pre_client=pre_client, late=late)
+            rates[label].append(scratch[f"tt-e {label} rep{rep}"])
+            key = f"{label} rep{rep}"
+            table_ok[key] = state.get("positions") is not None
+            positions[key] = state.get("positions")
+    return {"rates": rates, "late": late, "table_ok": table_ok, "positions": positions}
+
+
+def take_instant(voters, leader, watchers, standby, tag):
+    """Command one coordinated snapshot instant and wait for it to land.
+
+    Two different completion signals, deliberately:
+
+      all-nodes  `uc2_snapshot_instant_position` carries P — but it is
+                 documented LEADER-LOCAL ("the last snapshot instant this node
+                 COMMANDED as leader"; a follower exports whatever it last
+                 commanded in some earlier term), so polling it on every voter
+                 would never agree. The cluster-wide signal is
+                 `uc2_snapshot_set_position` reaching P on every voter, which
+                 IS "every row plus the cluster FSM froze at P and the set is
+                 complete" — the thing row h wants to know.
+      standby    the LEARNER's `uc2_snapshot_standby_instant_position`, which
+                 is per-node "the instant this node's uc2-cluster agent ACTED
+                 on" and learner-only by design (a voter skips every standby
+                 instant, so it exports 0 forever).
+
+    One scrape per watcher per poll serves both the completion test and the
+    freeze fold, because `uc2_snapshot_freeze_seconds_max` is reset on the
+    scrape after the instant advances and must be sampled during the wait."""
+    h = voters[leader]
+    metric = ("uc2_snapshot_standby_instant_position" if standby
+              else "uc2_snapshot_instant_position")
+    pre = tt.prom_get(scrape_prom(h if not standby else watchers[0], label="instant"), metric) or 0.0
+    flag = " --standby" if standby else ""
+    r = ssh(h, f"date +%s%3N; sudo {BUILT_CTL} snapshot --instance-dir {h.dir} "
+               f"--app-id {APP}{flag}", label="uc2ctl snapshot")
+    lines = [ln.strip() for ln in ((r.stdout or "") + (r.stderr or "")).splitlines() if ln.strip()]
+    # The instant's t0 is taken on the HOST clock, the same clock that stamps
+    # every TL bucket's unix_ms, so no driver/host skew enters the commit-gap
+    # measurement (row d's single-clock discipline).
+    t0_ms = int(lines[0]) if lines and lines[0].isdigit() else None
+    t0 = time.time()
+    res = {"standby": standby, "commanded": r.returncode == 0, "t0_ms": t0_ms,
+           "position": None, "completed": False, "secs": None, "freeze_max": {},
+           "pre_position": pre}
+    print(f"INFO {tag}: uc2ctl snapshot{flag} rc={r.returncode} t0_ms={t0_ms} "
+          f":: {' | '.join(lines[1:])[:400]}", flush=True)
+    if r.returncode != 0:
+        print(f"FAIL {tag}: the instant was refused", flush=True)
+        return res
+    deadline = t0 + tt.INSTANT_WAIT_SECS
+    while time.time() < deadline:
+        snaps = {w.public_ip: scrape_prom(w, label="instant") for w in watchers}
+        for ip, m in snaps.items():
+            fold_freeze(ip, m, res["freeze_max"])
+        if standby:
+            vals = [tt.prom_get(snaps[w.public_ip], metric) for w in watchers]
+            if vals and all(v is not None and v > pre for v in vals):
+                res["position"], res["completed"] = int(max(vals)), True
+                break
+        else:
+            p = tt.prom_get(snaps.get(h.public_ip, {}), metric)
+            if p is not None and p > pre:
+                res["position"] = int(p)
+                sets = [tt.prom_get(snaps[w.public_ip], "uc2_snapshot_set_position")
+                        for w in watchers]
+                if sets and all(s is not None and s >= p for s in sets):
+                    res["completed"] = True
+                    break
+        time.sleep(1.0)
+    res["secs"] = round(time.time() - t0, 2)
+    if not res["completed"]:
+        print(f"FAIL {tag}: the instant did not complete within {tt.INSTANT_WAIT_SECS}s "
+              f"(position={res['position']}, freeze_max={res['freeze_max']})", flush=True)
+    else:
+        print(f"INFO {tag}: instant complete at position {res['position']} in {res['secs']}s, "
+              f"freeze_max={res['freeze_max']}", flush=True)
+    return res
+
+
+def wait_learner_serving(learner, budget=ROW_H_LEARNER_SERVE_SECS):
+    """Row h: the learner must be attached and applying before a standby
+    instant means anything (`49 snapshot_no_learner` is about MEMBERSHIP, not
+    about readiness, so a commanded standby instant would otherwise be
+    accepted against a learner that has not caught up)."""
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        slots, _ = status_slots(learner)
+        s = slots.get(0)
+        if s and s["attached"] and s["applied"] > 0:
+            print(f"INFO tt-h: learner serving after {budget - (deadline - time.time()):.1f}s "
+                  f"(applied={s['applied']})", flush=True)
+            return True
+        time.sleep(0.5)
+    print(f"WARN tt-h: the learner was not serving within {budget}s — the standby instant "
+          f"runs anyway and the row records what it finds", flush=True)
+    return False
+
+
+def arm_tt_h(voters, learner, a, checks, pins=None):
+    """Row h: freeze duration vs commit stall on a 256 MiB-state FSM.
+
+    One declared FSM (`--state-bytes` attaches to row 0's `count` only), purge
+    OFF and no replicated cadence — so the ONLY instants that happen are the
+    two this arm commands, which is what makes the commit gaps attributable.
+    `--snapshot-interval-bytes` still reaches the SERVICE role, where since
+    coordinated snapshots it is nothing but the capability switch
+    (`start_with_snapshots`, `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`)."""
+    with tt_options(state_bytes=a.state_bytes):
+        leader = start_cluster_m14(voters, [(0, 0)], purge=False,
+                                   snap=M14_SNAPSHOT_INTERVAL_BYTES, pins=pins)
+        h = voters[leader]
+        print(f"INFO tt-h: leader n{leader} on {h.public_ip}, "
+              f"state_bytes={a.state_bytes}", flush=True)
+        run_rate_arm(voters, leader, a, "tt-h", fan_in=False, secs=ROW_H_ARM_SECS,
+                     timeline=True, unit=True, measure=False, pins=pins)
+        t_client = time.time()
+        time.sleep(ROW_H_BASELINE_SECS)
+        all_arm = take_instant(voters, leader, voters, False, "tt-h all-nodes")
+        # The standby arm needs a learner in the COMMITTED membership; added
+        # here rather than at the top so the all-nodes arm measures a plain
+        # three-voter cluster, and without purge so the join is an ordinary
+        # catch-up rather than row g's below-floor one.
+        new_id, addr = 3, f"{learner.private_ip}:{PORT}"
+        m12.wipe_dirs([learner])
+        rc, out = h.ctl("add-learner", new_id, addr)
+        if rc != 0:
+            raise RuntimeError(f"tt-h add-learner refused: {out.strip()}")
+        truncate_log(learner, "node")
+        start_unit(learner, "node",
+                   node_args(learner, new_id, m12.members_str(voters), [(0, 0)], None, False, 0),
+                   nofile=True, cpus=(pins or {}).get("node"))
+        time.sleep(2.0)
+        truncate_log(learner, "service0")
+        start_unit(learner, "service0",
+                   service_args(learner, 0, 0, M14_SNAPSHOT_INTERVAL_BYTES),
+                   cpus=service_cpu(pins, 0))
+        served = wait_learner_serving(learner)
+        standby_arm = take_instant(voters, leader, [learner], True, "tt-h standby")
+        standby_arm["learner_serving"] = served
+        # The client ran across both instants; its per-second buckets are the
+        # visible end of the commit stream.
+        m12.wait_units_done([(h, ["client"])], t_client + ROW_H_ARM_SECS + CLIENT_SLACK_SECS)
+        out = tail_log(h, "client", lines=4000) or ""
+        kill_unit(h, "client")
+        d = parse_result(out, "direct")
+        tl = parse_timeline(out)
+        if d is None:
+            print("WARN tt-h: client RESULT missing — timeline NOT trimmed", flush=True)
+        if not tl:
+            print("WARN tt-h: empty timeline — no baseline, no commit gap", flush=True)
+        baseline = 0.0
+        if tl:
+            t_start_ms = tl[0][0]
+            if d is not None:
+                tl = bound_timeline(tl, t_start_ms + int(d["elapsed_secs"] * 1000) + 1000)
+            base = [r for ms, r in tl if t_start_ms + 2000 <= ms < t_start_ms + 10000]
+            baseline = (sum(base) / len(base)) if base else 0.0
+        for arm in (all_arm, standby_arm):
+            arm["baseline_rps"] = baseline
+            arm["gap_secs"] = None
+            if tl and arm["t0_ms"] is not None and arm["secs"] is not None:
+                hi = arm["t0_ms"] + int(arm["secs"] * 1000) + ROW_H_GAP_TAIL_MS
+                arm["gap_secs"] = tt.longest_stall(tl, baseline, lo_ms=arm["t0_ms"], hi_ms=hi)
+        print(f"INFO tt-h: baseline {baseline:.0f}/s; all-nodes gap {all_arm['gap_secs']}s "
+              f"freeze_max {all_arm['freeze_max']}; standby gap {standby_arm['gap_secs']}s "
+              f"freeze_max {standby_arm['freeze_max']}", flush=True)
+        check_all(voters + [learner], leader, "tt-h", checks,
+                  expect_min=int(d["responses"]) if d else None)
+        stop_cluster_m14(voters + [learner])
+    return {"all_nodes": all_arm, "standby": standby_arm, "baseline_rps": baseline,
             "client_lost": d["lost"] if d else None}
 
 
@@ -1226,6 +1801,161 @@ def selftest():
     if _tm:
         expect("STATS_RE unattested/legacy/identity/version",
                _tm.groups() == ("0", "1", "2", "3"))
+
+    # ================================= time and timers (--tt-rows) =========
+    print("  -- tt_fleet_gate leaf helpers --")
+    fails += tt.selftest()
+    print("  -- time-and-timers rows --")
+    # Role args: the four new flags, on and off, through the SAME node_args /
+    # service_args every arm builds — including the BASELINE arms, whose
+    # m12_gate has none of them and which therefore run under tt_disabled().
+    with tt_options(metrics_port=9310, timed=True, timers_per_sec=1000, state_bytes=1 << 20):
+        _na_tt = node_args(_fh, 0, "0@h", [(0, 0)], None, False, 0)
+        _sa_row0 = service_args(_fh, 0, 0, 0)
+        _sa_row1 = service_args(_fh, 1, 0, 0)
+        _sa_spin0 = service_args(_fh, 0, 300, 0)
+        with tt_disabled():
+            _na_base = node_args(_fh, 0, "0@h", [(0, 0)], None, False, 0)
+            _sa_base = service_args(_fh, 0, 0, 0)
+        _na_after = node_args(_fh, 0, "0@h", [(0, 0)], None, False, 0)
+    _na_off = node_args(_fh, 0, "0@h", [(0, 0)], None, False, 0)
+    expect("node_args carries --metrics-listen on the private NIC when a port is set",
+           _na_tt[_na_tt.index("--metrics-listen") + 1] == f"{_fh.private_ip}:9310")
+    expect("node_args passes no --metrics-listen at port 0 (the default TT)",
+           "--metrics-listen" not in _na_off)
+    expect("tt_disabled strips every T&T flag from the node role (the baseline arms)",
+           "--metrics-listen" not in _na_base)
+    expect("tt_options restores the outer options after a nested tt_disabled",
+           _na_after == _na_tt)
+    expect("service_args wraps row 0 in Timed<..> under --timed", "--timed" in _sa_row0)
+    expect("service_args gives the timer load to row 0's `count` only",
+           _sa_row0[_sa_row0.index("--timers-per-sec") + 1] == "1000"
+           and "--timers-per-sec" not in _sa_row1)
+    expect("service_args gives a spun row 0 (`spin`, not `count`) no timer load",
+           "--timers-per-sec" not in _sa_spin0 and "--timed" in _sa_spin0)
+    expect("service_args gives the row-h ballast to row 0 only",
+           _sa_row0[_sa_row0.index("--state-bytes") + 1] == str(1 << 20)
+           and "--state-bytes" not in _sa_row1)
+    expect("tt_disabled strips every T&T flag from the service role",
+           "--timed" not in _sa_base and "--timers-per-sec" not in _sa_base
+           and "--state-bytes" not in _sa_base)
+    _sa_plain_tt = service_args(_fh, 0, 0, 0)
+    expect("service_args with T&T off is byte-identical to the pre-2026-09-07 shape",
+           _sa_plain_tt == _sa_plain)
+    # The arm map rows a/b/e re-use, and the fan-in convention.
+    expect("tt_arm_fsms n1/n2eq/slow1/pair", (
+        tt_arm_fsms("n1", 700) == [(0, 0)] and tt_arm_fsms("n2eq", 700) == [(0, 0), (1, 0)]
+        and tt_arm_fsms("slow1", 700) == [(0, 700)]
+        and tt_arm_fsms("pair", 700) == [(0, 0), (1, 700)]))
+    expect("tt_fan_in only where two FSMs are declared",
+           [tt_fan_in(x) for x in TT_RATE_ARMS] == [False, True, False, True])
+    expect("the T&T A/B deliberately excludes the lockstep arms (M14 row e has no bar)",
+           "n2eq-ls" not in TT_RATE_ARMS and "pair-ls" not in TT_RATE_ARMS)
+    # Row a/b/e verdicts: the A/B reading plus (b/e) the late == 0 sweep.
+    _base = {"n1": [1000.0, 1000.0, 1000.0], "pair": [500.0, 500.0, 500.0]}
+    _head_ok = {"n1": [1002.0, 998.0, 1000.0], "pair": [501.0, 499.0, 500.0]}
+    _head_bad = {"n1": [900.0, 900.0, 900.0], "pair": [500.0, 500.0, 500.0]}
+    _clean = [("tt-b head n1 rep1", "h0", "count", "0", 0),
+              ("tt-b head n1 rep1", "h1", "count", "0", 0)]
+    expect("row a passes inside the recorded resolution",
+           verdict_tt_a(_base, _head_ok, 1.0).passed)
+    expect("row a fails a real regression outside the resolution",
+           not verdict_tt_a(_base, _head_bad, 1.0).passed)
+    expect("row a with no resolution recorded is not a pass",
+           not verdict_tt_a(_base, _head_ok, None).passed)
+    expect("row a is not a pass when the run is noisier than its own bar",
+           not verdict_tt_a(_base, _head_ok, 0.001).passed)
+    expect("row b passes with a clean late sweep",
+           verdict_tt_b(_base, _head_ok, 1.0, _clean).passed)
+    expect("row b fails on one late timer anywhere",
+           not verdict_tt_b(_base, _head_ok, 1.0,
+                            _clean + [("tt-b head pair rep2", "h2", "count", "0", 7)]).passed)
+    expect("row b fails on an unreadable late clause (count -1)",
+           not verdict_tt_b(_base, _head_ok, 1.0,
+                            _clean + [("tt-b head n1 rep2", "h2", "?", "?", -1)]).passed)
+    expect("row b fails on an EMPTY late sweep (absence of evidence is not evidence)",
+           not verdict_tt_b(_base, _head_ok, 1.0, []).passed)
+    expect("row b fails the throughput clause even with a clean sweep",
+           not verdict_tt_b(_base, _head_bad, 1.0, _clean).passed)
+    _tok = {"n1 rep1": True, "pair rep1": True}
+    expect("row e passes with a converged table and a clean sweep",
+           verdict_tt_e(_base, _head_ok, 1.0, _clean, table_ok=_tok).passed)
+    expect("row e fails when the table never converged on every voter",
+           not verdict_tt_e(_base, _head_ok, 1.0, _clean,
+                            table_ok={**_tok, "pair rep1": False}).passed)
+    expect("row e fails with no table result at all",
+           not verdict_tt_e(_base, _head_ok, 1.0, _clean, table_ok={}).passed)
+    # Row c: p99 <= 2 x the mean pass, over >= 10 000 fires.
+    expect("row c passes at p99 = 2 x the mean pass exactly",
+           verdict_tt_c(20000.0, 10000.0, 12000).passed)
+    expect("row c fails just past 2 x the mean pass",
+           not verdict_tt_c(20001.0, 10000.0, 12000).passed)
+    expect("row c is inconclusive (not a pass) under 10 000 fires",
+           not verdict_tt_c(1000.0, 10000.0, 9999).passed)
+    expect("row c is inconclusive with no pass-length reading",
+           not verdict_tt_c(1000.0, None, 12000).passed)
+    expect("row c fails a p99 that landed in the +Inf bucket",
+           not verdict_tt_c(float("inf"), 10000.0, 12000).passed)
+    # row_c_reading over LITERAL scrapes: the arm with the most fires wins.
+    _thin = tt.parse_prom(
+        'uc2_timer_lateness_ns_bucket{service="count",row="0",le="10000"} 10\n'
+        'uc2_timer_lateness_ns_bucket{service="count",row="0",le="+Inf"} 10\n'
+        'uc2_timer_lateness_ns_count{service="count",row="0"} 10\n'
+        'uc2_consensus_pass_ns_sum 1000\nuc2_consensus_pass_ns_count 100\n')
+    _fat = tt.parse_prom(
+        'uc2_timer_lateness_ns_bucket{service="count",row="0",le="10000"} 11000\n'
+        'uc2_timer_lateness_ns_bucket{service="count",row="0",le="20000"} 12000\n'
+        'uc2_timer_lateness_ns_bucket{service="count",row="0",le="+Inf"} 12000\n'
+        'uc2_timer_lateness_ns_count{service="count",row="0"} 12000\n'
+        'uc2_consensus_pass_ns_sum 2400000\nuc2_consensus_pass_ns_count 200000\n')
+    _arm, _p99, _pass, _cnt, _per = row_c_reading([("n1", _thin), ("pair", _fat)])
+    expect("row_c_reading adjudicates on the arm with the MOST fires",
+           _arm == "pair" and _cnt == 12000.0)
+    expect("row_c_reading reads the p99 off that arm's buckets", _p99 == 20000.0)
+    expect("row_c_reading reads the mean pass length off the node histogram", _pass == 12.0)
+    expect("row_c_reading keeps every arm's reading for the record", len(_per) == 2)
+    expect("row_c_reading on no scrapes is all-None", row_c_reading([])[1] is None)
+    # Row g: joined in time, a real snapshot install, the leader really
+    # restarted, and one agreed set position cluster-wide.
+    _g = {"joined_at": 30.0, "installs": 2, "leader_restarted": True,
+          "set_positions": {"h0": 4096, "h1": 4096, "h2": 4096, "h3": 4096}}
+    expect("row g passes", verdict_tt_g(_g).passed)
+    expect("row g fails past the 60 s bar", not verdict_tt_g({**_g, "joined_at": 61.0}).passed)
+    expect("row g fails when the join never completed",
+           not verdict_tt_g({**_g, "joined_at": None}).passed)
+    expect("row g fails a journal-replay join (no snapshot_installed)",
+           not verdict_tt_g({**_g, "installs": 0}).passed)
+    expect("row g fails when the snapshot sets disagree",
+           not verdict_tt_g({**_g, "set_positions": {**_g["set_positions"], "h3": 2048}}).passed)
+    expect("row g fails on an all-zero set position (nothing was ever complete)",
+           not verdict_tt_g({**_g, "set_positions": {h: 0 for h in _g["set_positions"]}}).passed)
+    expect("row g fails when the leader was NOT restarted (that is row f, not row g)",
+           not verdict_tt_g({**_g, "leader_restarted": False}).passed)
+    # Row h: only the STANDBY arm has a bar, and it is the measured pass length.
+    _all = {"completed": True, "gap_secs": 4.0, "freeze_max": {"h0": 3.2}}
+    _sb = {"completed": True, "gap_secs": 0.0, "freeze_max": {"h3": 3.4}}
+    expect("row h passes when the standby instant did not stall commit",
+           verdict_tt_h(_all, _sb, 8000.0).passed)
+    expect("row h fails when the standby instant DID stall commit",
+           not verdict_tt_h(_all, {**_sb, "gap_secs": 2.0}, 8000.0).passed)
+    expect("row h does not judge the all-nodes gap (reported, no bar)",
+           verdict_tt_h({**_all, "gap_secs": 30.0}, _sb, 8000.0).passed)
+    expect("row h is inconclusive when an instant never completed",
+           not verdict_tt_h({**_all, "completed": False}, _sb, 8000.0).passed)
+    expect("row h is inconclusive with no measured pass length",
+           not verdict_tt_h(_all, _sb, None).passed)
+    # fold_freeze: the gauge is per row and resets, so the fold keeps the max.
+    _acc = {}
+    fold_freeze("h0", tt.parse_prom(
+        'uc2_snapshot_freeze_seconds_max{service="count",row="0"} 1.5\n'
+        'uc2_snapshot_freeze_seconds_max{service="spin",row="1"} 3.25\n'), _acc)
+    expect("fold_freeze takes the largest row on a host", _acc == {"h0": 3.25})
+    fold_freeze("h0", tt.parse_prom(
+        'uc2_snapshot_freeze_seconds_max{service="count",row="0"} 0\n'), _acc)
+    expect("fold_freeze keeps the max across polls (the gauge resets to 0)",
+           _acc == {"h0": 3.25})
+    expect("fold_freeze on a scrape without the family leaves the accumulator alone",
+           fold_freeze("h1", {}, dict(_acc)) == _acc)
     print(f"selftest: {'PASS' if fails == 0 else f'FAIL ({fails})'}")
     return 0 if fails == 0 else 1
 
@@ -1244,7 +1974,52 @@ def main():
     ap.add_argument("--calib-ks", default="250,500,1000,2000,4000,8000",
                     help="SpinCountSm K ladder for the calibration arm")
     ap.add_argument("--k", type=int, default=0, help="skip calibration and use this K")
-    ap.add_argument("--rows", default="abcdef", help="subset of a b c d e f (c runs with every arm)")
+    ap.add_argument("--rows", default="abcdef",
+                    help="subset of a b c d e f — the M14 gate's own rows (c runs with every "
+                         "arm). The time-and-timers rows are a SEPARATE namespace on --tt-rows; "
+                         "pass --rows '' to run only those.")
+    # ------------------------------------------------ time and timers rows
+    ap.add_argument("--tt-rows", default="",
+                    help="subset of a b c e g h — the fleet rows of "
+                         "docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md, a separate "
+                         "namespace from --rows: a = Timed<..> services, no timers, A/B'd "
+                         "against --base-tree; b = the same with --timers-per-sec sustained, "
+                         "plus uc2_timers_late_total == 0 everywhere; c = timer precision "
+                         "(p99 lateness vs 2 x the mean consensus pass) off row b's arms; "
+                         "e = the same arms with a live --schedule-table; g = row f's join "
+                         "with the LEADER's node restarted mid-window; h = an all-nodes then "
+                         "a --standby snapshot instant on a --state-bytes FSM under load")
+    ap.add_argument("--metrics-port", type=int, default=tt.METRICS_PORT_DEFAULT,
+                    help="every node this driver starts gets --metrics-listen "
+                         "<private_ip>:PORT and the T&T rows scrape it (0 = do not pass the "
+                         "flag; the baseline tree's arms always run without it)")
+    ap.add_argument("--timed", action="store_true",
+                    help="wrap every service in uc_service::Timed<..> (--timed on the service "
+                         "role); rows a/b/c/e are defined on the wrapped service and require it")
+    ap.add_argument("--timers-per-sec", type=int, default=0,
+                    help="FSM 0 sustains this many timer fires/s through the window (the gate's "
+                         "number for rows b and c is 1000); applied to row 0's `count` service "
+                         "only, since the Rust contract allows it only with --fsm count")
+    ap.add_argument("--schedule-table", type=int, default=0,
+                    help=f"row e: apply this many [[schedule]] entries (the gate's number is "
+                         f"{tt.MAX_SCHEDULE_ENTRIES} = MAX_SCHEDULE_ENTRIES) on row 0 before "
+                         f"each arm's client starts; 0 = off")
+    ap.add_argument("--state-bytes", type=int, default=tt.ROW_H_STATE_BYTES,
+                    help="row h: the ballast row 0's FSM carries into its snapshot (the gate's "
+                         "number is 256 MiB); applied by row h's arm only")
+    ap.add_argument("--base-tree", default="",
+                    help="rows a and b: local checkout of the PRE-time-and-timers binary "
+                         "(17d5c6b), rsynced to /opt/bench/uc-base and built there; its arms "
+                         "are the A of the interleaved A/B")
+    ap.add_argument("--ab-reps", type=int, default=3,
+                    help="interleaved reps per A/B arm (rows a, b and e)")
+    ap.add_argument("--resolution-pct", type=float, default=None,
+                    help="the same-source rebuild resolution measured by scripts/hop1_ab.sh on "
+                         "the rig ON THE DAY — rows a/b/e's bar. Required with --base-tree; "
+                         "record it BEFORE comparing anything to it")
+    ap.add_argument("--pass-ns", type=float, default=0.0,
+                    help="row h: the consensus pass length in ns, when row c is not being run "
+                         "in the same invocation (0 = take it from row c)")
     ap.add_argument("--pin", action="store_true",
                     help="pin every node/service/client unit to PIN_MAP_C6ID_2XL's CPUs "
                          "(default off); verifies the assumed hyperthread-sibling layout "
@@ -1256,6 +2031,47 @@ def main():
         sys.exit(selftest())
     if not a.fleet:
         ap.error("one of --fleet or --selftest is required")
+    # ------------------------------------------------ T&T door checks
+    # Every one of these would otherwise surface AFTER a fleet trip had been
+    # spent, as an unadjudicable row. The gate doc's own "When this gate is
+    # run" order (record the resolution first, measure the pass length first)
+    # is what they enforce.
+    global TT
+    unknown = sorted(set(a.tt_rows) - set("abcegh"))
+    if unknown:
+        ap.error(f"--tt-rows: unknown row letter(s) {unknown} (the T&T rows are a b c e g h)")
+    if any(r in a.tt_rows for r in "ab") and not a.base_tree:
+        ap.error("--tt-rows a/b are an A/B against the pre-time-and-timers binary: "
+                 "--base-tree is required")
+    if a.base_tree and a.resolution_pct is None:
+        ap.error("--base-tree without --resolution-pct: rows a/b/e are judged against the "
+                 "same-source rebuild resolution scripts/hop1_ab.sh measures ON THE DAY, and "
+                 "the gate doc requires it recorded BEFORE anything is compared to it")
+    if any(r in a.tt_rows for r in "abce") and not a.timed:
+        ap.error("--tt-rows a/b/c/e are defined on Timed<..>-wrapped services: --timed is required")
+    if any(r in a.tt_rows for r in "bc") and a.timers_per_sec <= 0:
+        ap.error("--tt-rows b/c need a sustained timer load: pass --timers-per-sec "
+                 "(the gate's number is 1000)")
+    if "e" in a.tt_rows:
+        if a.schedule_table <= 0:
+            ap.error(f"--tt-rows e needs --schedule-table N (the gate's number is "
+                     f"{tt.MAX_SCHEDULE_ENTRIES} = MAX_SCHEDULE_ENTRIES)")
+        if a.schedule_table > tt.MAX_SCHEDULE_ENTRIES:
+            ap.error(f"--schedule-table {a.schedule_table} exceeds MAX_SCHEDULE_ENTRIES "
+                     f"({tt.MAX_SCHEDULE_ENTRIES})")
+        if "a" not in a.tt_rows:
+            ap.error("--tt-rows e compares against row a's OWN head rates (the same binary "
+                     "with and without a live table), so row a must run in the same invocation")
+    if "c" in a.tt_rows and "b" not in a.tt_rows:
+        ap.error("--tt-rows c reads its histograms off row b's arms: run b in the same invocation")
+    if "h" in a.tt_rows and "c" not in a.tt_rows and a.pass_ns <= 0:
+        ap.error("--tt-rows h is judged against the consensus pass length measured on the day: "
+                 "run row c in the same invocation, or pass --pass-ns")
+    # The role flags every HEAD arm carries. Timer load and the row-h ballast
+    # are narrowed per arm (`tt_options`), so the M14 rows never carry either.
+    TT = TtOpts(metrics_port=a.metrics_port, timed=a.timed)
+    print(f"INFO time-and-timers options: {TT}, tt_rows={a.tt_rows or '(none)'}, "
+          f"ab_reps={a.ab_reps}, resolution_pct={a.resolution_pct}", flush=True)
     hosts, voters, learner = setup_fleet(a)
     if a.pin:
         # `hosts` = voters + the learner (`setup_fleet` returns all 4); row f
@@ -1267,6 +2083,8 @@ def main():
     pins = PIN_MAP_C6ID_2XL if a.pin else None
     rates, checks, verdicts = {}, [], []
     kill = join = None
+    tt_a = tt_b = tt_e = tt_g = tt_h = None
+    base_voters = None
     try:
         if any(r in a.rows for r in "abe"):
             K = arm_rates(voters, a, rates, checks, pins=pins)
@@ -1276,6 +2094,25 @@ def main():
             kill = arm_kill(voters, a, K, checks, pins=pins)
         if "f" in a.rows:
             join = arm_join(voters, learner, a, K, checks, pins=pins)
+        if a.tt_rows:
+            if a.base_tree:
+                prepare_base_tree(hosts, a.base_tree)
+                base_voters = base_fleet_hosts(a)[:3]
+            if any(r in a.tt_rows for r in "abce"):
+                K = ensure_k(voters, a, rates, checks, pins=pins)
+                print(f"INFO T&T rows: slow FSM K = {K}", flush=True)
+            if "a" in a.tt_rows:
+                tt_a = arm_tt_ab(voters, base_voters, a, K, checks, 0, "tt-a", pins=pins)
+            if "b" in a.tt_rows:
+                tt_b = arm_tt_ab(voters, base_voters, a, K, checks, a.timers_per_sec,
+                                 "tt-b", pins=pins)
+            if "e" in a.tt_rows:
+                tt_e = arm_tt_e(voters, a, K, checks, pins=pins)
+            if "g" in a.tt_rows:
+                tt_g = arm_join(voters, learner, a, K, checks, pins=pins,
+                                restart_leader_after=2.0)
+            if "h" in a.tt_rows:
+                tt_h = arm_tt_h(voters, learner, a, checks, pins=pins)
     finally:
         stop_cluster_m14(hosts)
     print("\nM14 gate — FLEET (rates in ops/s over the 8 s window)")
@@ -1287,6 +2124,31 @@ def main():
     if kill is not None: verdicts.append(verdict_row_d(kill))
     if "e" in a.rows: verdicts.append(verdict_row_e(rates))
     if join is not None: verdicts.append(verdict_row_f(join))
+    # ------------------------------------------------ time and timers rows
+    pass_ns = a.pass_ns or None
+    if tt_a is not None:
+        verdicts.append(verdict_tt_a(tt_a["base"], tt_a["head"], a.resolution_pct))
+    if tt_b is not None:
+        verdicts.append(verdict_tt_b(tt_b["base"], tt_b["head"], a.resolution_pct, tt_b["late"]))
+        if "c" in a.tt_rows:
+            arm, p99_ns, mean_pass_ns, count, per_arm = row_c_reading(tt_b["scrapes"])
+            print("\ntt-c per-arm readings (adjudicated on the arm with the most fires)")
+            for r in per_arm:
+                print(f"  {r['arm']:28s} fires={r['count']} p99={r['p99_ns']} ns "
+                      f"p50={r['p50_ns']} ns max={r['lateness_max_ns']} ns | mean pass="
+                      f"{r['pass_ns']} ns p99 pass={r['pass_p99_ns']} ns max={r['pass_max_ns']} ns")
+            print(f"  adjudicated on: {arm}")
+            pass_ns = mean_pass_ns or pass_ns
+            verdicts.append(verdict_tt_c(p99_ns, mean_pass_ns, count))
+    if tt_e is not None:
+        # Row e's comparison is row a's OWN head rates against row e's — the
+        # same binary with and without a live table.
+        verdicts.append(verdict_tt_e((tt_a or {}).get("head", {}), tt_e["rates"],
+                                     a.resolution_pct, tt_e["late"], table_ok=tt_e["table_ok"]))
+    if tt_g is not None:
+        verdicts.append(verdict_tt_g(tt_g))
+    if tt_h is not None:
+        verdicts.append(verdict_tt_h(tt_h["all_nodes"], tt_h["standby"], pass_ns))
     for v in verdicts:
         print(f"  [{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}")
     failed = [v for v in verdicts if not v.passed]
