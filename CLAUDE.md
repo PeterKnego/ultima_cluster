@@ -37,9 +37,12 @@ rows a/b/e/j), also fleet. Separately, two **apply-hop A/Bs that need only an
 idle host, not the fleet** — `apply_bench` isolates the FSM hop on one box —
 row **d** (time-and-timers) and row **f** (plan-2's commanded-instants arm),
 both in the time-and-timers gate doc and both run under
-`scripts/apply_ab.sh`; row f has a dev-box SMOKE reading only (verdict
-`inconclusive (noisy run)`), which is not a gate. Every bar is pre-committed
-and no row has a gate result. `docs/how-to/cut-a-release.md` §1's writeup
+`scripts/apply_ab.sh`. Both have a dev-box SMOKE reading (2026-09-07, not a
+gate) and **both miss their bar**: row d −26.8 % against `17d5c6b`, row f
+−2.7 % — bisected to four inline hot-loop additions (the M14a codegen
+lesson, re-learned) and fixed on `perf/apply-arm-slot-out-of-loop` (+16 %
+vs main, still ≈ −15 % vs the baseline; the gate doc's row d entry has the
+ledger). Every bar is pre-committed and no row has a gate result. `docs/how-to/cut-a-release.md` §1's writeup
 de-scaffolding is deliberately left until those results are in, because the
 release-evidence table needs them. See "Next up" below.)**
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
