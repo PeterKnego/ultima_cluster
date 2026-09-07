@@ -561,7 +561,11 @@ fn a_layout_one_begin_is_refused_as_a_pre_070_peer() {
     let mut h = build(FaultConfig::default(), &["fsm0"]);
     let st = h.follower.stats();
     // layout 1 (SNAP_BEGIN_LAYOUT_V2_RETIRED) = a wire ≤0.6.0-shaped body.
-    h.forge_begin(SNAP_BEGIN_LAYOUT_V2_RETIRED, identity_hashes_of(&["fsm0"]), [0; 8]);
+    h.forge_begin(
+        SNAP_BEGIN_LAYOUT_V2_RETIRED,
+        identity_hashes_of(&["fsm0"]),
+        [0; 8],
+    );
     h.pump_until("the legacy-layout refusal is counted", |_| {
         st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
     });

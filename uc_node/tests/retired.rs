@@ -4,12 +4,29 @@
 use std::process::Command;
 
 const RETIRED: &[&str] = &[
-    "FRAME_TYPE_CONFIG\\b", "FRAME_TYPE_SCHEDULE_TABLE\\b", "append_schedule_table",
-    "DGRAM_KIND_SNAP_TABLE\\b", "SnapTableBody", "SNAP_TABLE_FIXED_LEN", "SNAP_BEGIN_LAYOUT_V3\\b",
-    "schedule_state::", "ScheduleRecord\\b", "SCHEDULE_STATE_FILE", "ScheduleShip", "shippable_schedule",
-    "known_committed", "install_snapshot_table", "incoming_snapshot_config", "incoming_snapshot_table",
-    "SnapshotPolicy\\b", "maybe_build_snapshot", "rearm_timers", "uc2_timers_rearmed_total", "timers_rearmed",
-    "retain_newest", "bridging_trigger",
+    "FRAME_TYPE_CONFIG\\b",
+    "FRAME_TYPE_SCHEDULE_TABLE\\b",
+    "append_schedule_table",
+    "DGRAM_KIND_SNAP_TABLE\\b",
+    "SnapTableBody",
+    "SNAP_TABLE_FIXED_LEN",
+    "SNAP_BEGIN_LAYOUT_V3\\b",
+    "schedule_state::",
+    "ScheduleRecord\\b",
+    "SCHEDULE_STATE_FILE",
+    "ScheduleShip",
+    "shippable_schedule",
+    "known_committed",
+    "install_snapshot_table",
+    "incoming_snapshot_config",
+    "incoming_snapshot_table",
+    "SnapshotPolicy\\b",
+    "maybe_build_snapshot",
+    "rearm_timers",
+    "uc2_timers_rearmed_total",
+    "timers_rearmed",
+    "retain_newest",
+    "bridging_trigger",
 ];
 
 /// Q2 (controller ruling): a hit whose line mentions it is retired/reserved
@@ -43,10 +60,7 @@ fn retired_symbols_are_gone_from_the_tree() {
             .unwrap();
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout);
-            let remaining: Vec<&str> = text
-                .lines()
-                .filter(|line| !line_is_excused(line))
-                .collect();
+            let remaining: Vec<&str> = text.lines().filter(|line| !line_is_excused(line)).collect();
             if !remaining.is_empty() {
                 hits.push(format!("{pat}:\n{}", remaining.join("\n")));
             }
