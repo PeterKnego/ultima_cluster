@@ -421,7 +421,12 @@ Numbers to record on the day, before any comparison:
 
    Row f **needs** `--harness` (both its arms predate the `svc_sched`-ring
    harness fix and cannot run otherwise); row d **cannot use it** (its pair
-   straddles the `Appender::new` arity change). Record the run id, the three
+   straddles the `Appender::new` arity change). On a fleet host the runner
+   needs the repo's `.git` beside the synced tree (it builds each arm from a
+   `git worktree`), which `sync_tree` deliberately excludes — ship it once
+   with `rsync -az --rsync-path 'sudo rsync' .git ubuntu@<host>:/opt/bench/uc/.git`
+   (≈ 90 MB), and run the rows on the LEARNER host while the voters' rows
+   are not running, so the box is idle. Record the run id, the three
    binary `sha256`s and, for row f, the harness `sha256` beside every number.
    These two rows do not need fleet spend — `apply_bench` isolates the FSM
    hop on one host — but they do need an idle host, and the runner will say
