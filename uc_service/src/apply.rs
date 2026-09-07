@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use uc_log::cnc::CncPage;
 use uc_log::reader::{Batch, LogFollower};
@@ -625,7 +625,15 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
                             );
                         }
                     } else if hdr.frame_type == FRAME_TYPE_SNAPSHOT {
-                        on_snapshot_frame(&mut st.snapshot_trigger, &sm, pos, &hdr, node_flags);
+                        let slot = crate::attach::slot(&st.cnc, st.service_id);
+                        on_snapshot_frame(
+                            &mut st.snapshot_trigger,
+                            &sm,
+                            pos,
+                            &hdr,
+                            node_flags,
+                            slot,
+                        );
                     }
                     if one_frame {
                         break; // lockstep: exactly one frame past the floor
@@ -775,11 +783,13 @@ pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
 ///    enforced since M6; this row is simply incomplete for THIS instant, which
 ///    [`SNAPSHOT_SKIPPED_BUSY`] counts.
 ///
-/// Takes the two `ApplyState` fields it touches individually rather than
+/// Takes the `ApplyState` fields it touches individually rather than
 /// `&mut ApplyState<S>`: the call site runs with the SM's `MutexGuard` alive,
 /// which borrows `st.sm`, so a helper taking the whole struct would conflict
 /// with it — exactly the reason `write_sched_if_leader` above is shaped the
-/// same way.
+/// same way. `slot` is this row's cnc slot (`crate::attach::slot(&st.cnc,
+/// st.service_id)`), needed only to publish the freeze duration — spec §9's
+/// `uc2_snapshot_freeze_seconds_max/_sum/_count{row}`.
 #[inline(never)]
 pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
     trigger: &mut Option<SnapshotTrigger<S>>,
@@ -787,6 +797,7 @@ pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
     pos: u64,
     hdr: &FrameHeader,
     node_flags: u64,
+    slot: &uc_log::cnc::ServiceSlot,
 ) {
     let Some(trig) = trigger.as_mut() else {
         return; // 1. not snapshot-capable
@@ -808,8 +819,15 @@ pub(crate) fn on_snapshot_frame<S: RawStateMachine>(
     let p = pos + align_frame_len(hdr.length as usize) as u64;
     // The SM lock is already held by the frames loop; `freeze()` is expected to
     // pin state cheaply and hand the streaming off — the builder thread does
-    // the writing, off-lock (`builder_agent`'s module doc).
-    match (trig.freeze)(sm) {
+    // the writing, off-lock (`builder_agent`'s module doc). The `Instant` pair
+    // brackets exactly this call (spec §9): it is the synchronous cost that
+    // can stall the apply thread (§5.7's commit-stall argument), not the
+    // builder's async write, which never touches this thread.
+    let freeze_t0 = Instant::now();
+    let result = (trig.freeze)(sm);
+    let freeze_ns = freeze_t0.elapsed().as_nanos() as u64;
+    slot.identity.store_freeze_ns(freeze_ns);
+    match result {
         Ok((job, _sm_pos)) => {
             trig.busy.store(true, Ordering::Release);
             if trig.tx.try_send((p, job)).is_err() {

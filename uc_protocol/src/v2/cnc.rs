@@ -303,7 +303,7 @@ const _: () = assert!(
 //   +448 name            [u8; 32] NUL-padded FSM name          writer: node (init, boot-once)
 //   +480 identity_hash   u64 FNV-1a 64 of the name             writer: node (init, boot-once)
 //   +488 timers_pending  u64 pending-timer count for this row  writer: node (consensus agent)
-//   +496 reserved (zero)
+//   +496 freeze_ns       u64 nanos, last freeze() call duration  writer: service (on_snapshot_frame)
 pub const CNC_OFF_SERVICE_SLOTS: usize = 4096;
 pub const CNC_SERVICE_SLOT_STRIDE: usize = 512;
 pub const CNC_MAX_SERVICES: usize = 8;
@@ -331,7 +331,8 @@ pub const CNC_SVC_STATUS_INCARNATION_SHIFT: u32 = 32;
 /// low 32 bits of the status line's second word. `0` = unversioned/absent.
 pub const CNC_SVC_OFF_VERSION: usize = 8;
 /// cnc 3.1: line 7 — the row's FSM name, NUL-padded to 32 B, then its hash,
-/// then (time-and-timers) its pending-timer count.
+/// then (time-and-timers) its pending-timer count, then (coordinated-
+/// snapshot spec §9) its last freeze duration.
 pub const CNC_SVC_OFF_NAME: usize = 448;
 pub const CNC_SVC_NAME_LEN: usize = 32;
 pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
@@ -339,9 +340,19 @@ pub const CNC_SVC_OFF_IDENTITY_HASH: usize = 480;
 /// `identity_hash` on line 7 (node-written, like the rest of the line; the
 /// consensus agent refreshes it once per pass). Reader: `/metrics`, `uc2ctl`.
 pub const CNC_SVC_OFF_TIMERS_PENDING: usize = 488;
+/// Coordinated-snapshot spec §9: this row's last `freeze()` call duration in
+/// nanoseconds, the word after `timers_pending` on line 7. Unlike the rest
+/// of line 7 this word is SERVICE-written (`on_snapshot_frame`, once per
+/// instant), not node-written — it shares the line with node-written words
+/// the same way `CNC_SVC_STATUS_SNAPSHOT_CAPABLE` shares a status word the
+/// service itself owns; there is exactly one writer for this word.
+/// `/metrics` reads it once per scrape (never per pass) to derive
+/// `uc2_snapshot_freeze_seconds_max/_sum/_count{row}`.
+pub const CNC_SVC_OFF_FREEZE_NS: usize = 496;
 const _: () = assert!(CNC_SVC_OFF_TIMERS_PENDING == CNC_SVC_OFF_IDENTITY_HASH + 8);
+const _: () = assert!(CNC_SVC_OFF_FREEZE_NS == CNC_SVC_OFF_TIMERS_PENDING + 8);
 const _: () = assert!(CNC_SVC_OFF_NAME == CNC_SVC_OFF_RESERVED);
-const _: () = assert!(CNC_SVC_OFF_IDENTITY_HASH + 8 <= CNC_SERVICE_SLOT_STRIDE);
+const _: () = assert!(CNC_SVC_OFF_FREEZE_NS + 8 <= CNC_SERVICE_SLOT_STRIDE);
 const _: () = assert!(
     CNC_OFF_SERVICE_SLOTS + CNC_MAX_SERVICES * CNC_SERVICE_SLOT_STRIDE <= CNC_PAGE_LEN,
     "service-slot band overruns the cnc page"
@@ -744,6 +755,11 @@ mod tests {
         // per-row pending-timer count, the word after identity_hash on line 7.
         assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, 488);
         assert_eq!(CNC_SVC_OFF_TIMERS_PENDING, CNC_SVC_OFF_IDENTITY_HASH + 8);
+        // coordinated-snapshot spec §9: per-row last freeze duration, the
+        // word after timers_pending on line 7 — service-written, unlike the
+        // rest of the line.
+        assert_eq!(CNC_SVC_OFF_FREEZE_NS, 496);
+        assert_eq!(CNC_SVC_OFF_FREEZE_NS, CNC_SVC_OFF_TIMERS_PENDING + 8);
         const { assert!(CNC_OFF_FSM_LAG_BYTES + 8 <= CNC_OFF_SERVICES_DECLARED + 64) };
         // Page 1 is now FULL: the pair's line ends exactly where page 2 starts.
         assert_eq!(CNC_OFF_SERVICES_DECLARED + 64, 4096);

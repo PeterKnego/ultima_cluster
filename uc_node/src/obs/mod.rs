@@ -11,9 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use uc_log::cnc::CncPage;
+use uc_protocol::v2::cnc::CNC_MAX_SERVICES;
 
 pub mod http;
 pub mod metrics;
+
+pub use metrics::SnapshotFreezeStats;
 
 /// The structured-log core, re-exported from [`uc_obs`] so that
 /// `uc_node::obs::log::…` keeps naming it. It moved out of this crate so
@@ -71,6 +74,26 @@ pub struct ObsSources {
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
+    /// Coordinated-snapshot spec §9: the last instant this node COMMANDED as
+    /// leader, `0` if it never has (`uc2_snapshot_instant_position`). Leader-
+    /// local — a follower's reading is stale, whatever it last commanded in
+    /// some earlier term.
+    pub snapshot_instant_position: Arc<AtomicU64>,
+    /// Coordinated-snapshot spec §5.3/§9: the position of the newest
+    /// COMPLETE snapshot set this node holds, `0` until the first one
+    /// (`uc2_snapshot_set_position`) — must agree cluster-wide once caught
+    /// up. Alerts: `Uc2SnapshotStalled`, `Uc2SnapshotSetDiverged`.
+    pub snapshot_set_position: Arc<AtomicU64>,
+    /// Spec §9: `uc2_snapshot_row_incomplete_total{row}` — instants row
+    /// `row` failed to reach before being superseded.
+    pub snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES],
+    /// Spec §5.7 item 4: the newest set this node FETCHED whole from a
+    /// learner (`uc2_snapshot_fetched_position`), `0` if it never has.
+    pub snapshot_fetched_position: Arc<AtomicU64>,
+    /// Spec §9: process-local per-row freeze-duration bookkeeping the
+    /// exporter derives from the row's cnc slot word each scrape — see
+    /// [`metrics::SnapshotFreezeStats`].
+    pub snapshot_freeze: Arc<SnapshotFreezeStats>,
     pub crypto_enabled: bool,
     pub purge_enabled: bool,
     pub journal_segment_bytes: u64,
@@ -123,6 +146,11 @@ impl ObsSources {
             reports_unattested: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_set_position: Arc::new(AtomicU64::new(0)),
+            snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+            snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+            snapshot_freeze: Arc::new(SnapshotFreezeStats::default()),
             crypto_enabled: false,
             purge_enabled: false,
             journal_segment_bytes: 64 << 20,

@@ -233,3 +233,49 @@ groups:
     for: 60s
     labels: { severity: warning }
     annotations: { summary: "nodes disagree on the committed schedule-table position — since 2.11.0 the table is cluster-FSM state applied at commit, so a node at an odd position is a node whose uc2-cluster agent is not applying (compare uc2_schedule_table_position against uc2_commit_bytes on that node); one at 0 has applied no table at all. Only the leader appends timer frames, so if that node wins an election EVERY scheduled recurrence in the cluster stops; re-run `uc2ctl schedule apply`" }
+  - alert: Uc2SnapshotStalled
+    # Coordinated-snapshot spec §9: `uc2_snapshot_instant_position` (the
+    # leader's last COMMANDED instant) and `uc2_snapshot_set_position` (the
+    # newest COMPLETE set this node holds) normally advance together, one
+    # commanded instant to one completed set. "One broken FSM silently stops
+    # all purging" is the failure this rule makes loud: a row that never
+    # reaches P (freeze error, too slow, or its service process is dead)
+    # leaves the set incomplete forever, and NOTHING downstream fails loudly
+    # on its own — the next instant just supersedes the stuck one and the
+    # cycle repeats.
+    #
+    # Expressed as "the instant position has advanced twice while the set
+    # position did not" (`changes(...) >= 2` / `== 0` over a 30m window)
+    # rather than a plain subtraction, because the two gauges are NOT
+    # comparable positions on their own: `uc2_snapshot_instant_position` is
+    # leader-local (a follower's reading is stale, whatever it last
+    # commanded in some earlier term) while `uc2_snapshot_set_position` is
+    # every node's own newest complete set. A `changes()` count sidesteps
+    # that — it only asks whether each series is MOVING, on its own
+    # instance, which is exactly the "stalled" question.
+    #
+    # Ruling P10 means a lagging row normally catches up through the
+    # journal on its own, so this firing means a row that is not capable,
+    # busy forever, or its service process is dead — not ordinary lag.
+    # `uc2ctl snapshot show` on the leader lists the newest complete set's
+    # position and each row's presence in it; the row missing (or reporting
+    # an old `snapshot_pos`) is the one to investigate, and
+    # `uc2_snapshot_row_incomplete_total{row}` for it will be climbing.
+    expr: changes(uc2_snapshot_instant_position[30m]) >= 2 and changes(uc2_snapshot_set_position[30m]) == 0
+    for: 0m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} has commanded snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging; run `uc2ctl snapshot show` on the leader and look for the row whose snapshot_pos is behind" }
+  - alert: Uc2SnapshotSetDiverged
+    # Coordinated-snapshot spec §5.3/§9: the newest COMPLETE set's position
+    # must agree cluster-wide once every node is caught up — it is the
+    # node's purge floor once persisted, so two nodes disagreeing means one
+    # has pruned (or will prune) a different prefix than the other. Same
+    # count_values idiom as Uc2ScheduleTableDiverged, verbatim, over
+    # uc2_snapshot_set_position instead of uc2_schedule_table_position:
+    # promote the sample's own value into a label, then count how many
+    # distinct ones exist across scraped instances. More than one is
+    # divergence.
+    expr: count(count_values("p", uc2_snapshot_set_position)) > 1
+    for: 60s
+    labels: { severity: warning }
+    annotations: { summary: "nodes disagree on the newest COMPLETE snapshot set's position — one node's purge floor is at a different point than another's; a node behind is either still catching up (transient) or stuck (check uc2_snapshot_row_incomplete_total and uc2ctl snapshot show on it)" }

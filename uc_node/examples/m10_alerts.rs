@@ -68,6 +68,8 @@ const ALL_SCENARIOS: &[&str] = &[
     "version_drift",
     "log_time_frozen",
     "schedule_diverged",
+    "snapshot_stalled",
+    "snapshot_set_diverged",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -195,6 +197,8 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "version_drift" => scenario_version_drift(),
         "log_time_frozen" => scenario_log_time_frozen(),
         "schedule_diverged" => scenario_schedule_diverged(),
+        "snapshot_stalled" => scenario_snapshot_stalled(),
+        "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -395,6 +399,11 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         reports_unattested: Arc::new(AtomicU64::new(0)),
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+        snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+        snapshot_set_position: Arc::new(AtomicU64::new(0)),
+        snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
+        snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
+        snapshot_freeze: Arc::new(uc_node::obs::SnapshotFreezeStats::default()),
         crypto_enabled: false,
         purge_enabled: false,
         journal_segment_bytes: 64 << 20,
@@ -1438,6 +1447,112 @@ fn scenario_schedule_diverged() -> (SeriesFile, Disclosure) {
                      count_values idiom detects. The entries gauge is captured alongside \
                      because it is what tells the wipe signature (position 0 WITH entries > 0) \
                      apart from this one, though the rule itself reads only the position."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 18
+
+/// Uc2SnapshotStalled — **synthetic, disclosed**: one synthetic `ObsSources`
+/// standing in for a leader that has commanded three snapshot instants while
+/// no new complete set has landed — "one broken FSM silently stops all
+/// purging" (coordinated-snapshot spec §9), the exact failure this rule
+/// exists to make loud. Producing it for real needs a row whose `freeze()`
+/// genuinely never returns (a service bug or a hung disk) sustained across
+/// three real commanded instants — a much bigger, flakier harness than this
+/// rule's share of the gate warrants; same synthetic-state/real-exporter
+/// budget as `schedule_diverged` above.
+///
+/// `uc2_snapshot_instant_position` is bumped between each of the three real
+/// scrapes (a leader committing a fresh instant each round);
+/// `uc2_snapshot_set_position` is written ONCE, before the first scrape, and
+/// never touched again — the set never catches up to the second or third
+/// instant. Both render through the real encoder; the three-value instant
+/// series and the one-value set series are exactly what
+/// `scripts/m10_alert_fire.sh` replays as a `changes([30m]) >= 2` /
+/// `changes([30m]) == 0` timeline.
+fn scenario_snapshot_stalled() -> (SeriesFile, Disclosure) {
+    let src = synthetic_sources(0);
+    src.snapshot_set_position.store(4096, Ordering::Release);
+
+    let srv = ObsServer::serve(src.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for instant in [4096u64, 8192, 12288] {
+        src.snapshot_instant_position
+            .store(instant, Ordering::Release);
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc2_snapshot_instant_position", "uc2_snapshot_set_position"],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "snapshot_stalled",
+            rules: &["Uc2SnapshotStalled"],
+            state: "synthetic",
+            method: "one synthetic ObsSources, one real exporter: uc2_snapshot_instant_position \
+                     is bumped (4096, 8192, 12288) across the three real scrapes — a leader \
+                     committing a fresh instant each round — while uc2_snapshot_set_position is \
+                     written once (4096) and never touched again: no new complete set lands for \
+                     the second or third instant. Both positions render through the real \
+                     encoder; the resulting three-value instant series and one-value set series \
+                     are what scripts/m10_alert_fire.sh replays as a \
+                     changes([30m]) >= 2 / changes([30m]) == 0 timeline."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 19
+
+/// Uc2SnapshotSetDiverged — **synthetic, disclosed**: the same two-instance
+/// `count_values` shape as `scenario_schedule_diverged` — two synthetic
+/// `ObsSources` ("n0" holding a complete set at a real position, "n1" still
+/// at 0, the fresh-node/never-completed reading), each its own real
+/// exporter. Producing it for real needs a multi-node cluster with one
+/// node's completeness poll genuinely stuck, an order of magnitude larger
+/// than this rule's share of the harness; same synthetic-state/real-
+/// transition budget as `schedule_diverged`.
+fn scenario_snapshot_set_diverged() -> (SeriesFile, Disclosure) {
+    let src_a = synthetic_sources(0);
+    let src_b = synthetic_sources(1);
+    // n0 holds a complete set at 8192; n1 has never completed one (0).
+    src_a.snapshot_set_position.store(8192, Ordering::Release);
+
+    let srv_a = ObsServer::serve(src_a.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_b = ObsServer::serve(src_b.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_a = srv_a.local_addr();
+    let addr_b = srv_b.local_addr();
+
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round("n0", &scrape(addr_a), &["uc2_snapshot_set_position"]);
+        sf.record_round("n1", &scrape(addr_b), &["uc2_snapshot_set_position"]);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_a.stop();
+    srv_b.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "snapshot_set_diverged",
+            rules: &["Uc2SnapshotSetDiverged"],
+            state: "synthetic",
+            method: "two synthetic ObsSources, each its own real exporter: \"n0\" holds a \
+                     complete set (uc2_snapshot_set_position 8192) and \"n1\" has never \
+                     completed one (0) — a node that has not caught up to the newest complete \
+                     set. Both positions render through the real encoder; two DISTINCT values \
+                     across instances is exactly what Uc2SnapshotSetDiverged's count_values \
+                     idiom detects."
                 .into(),
         },
     )

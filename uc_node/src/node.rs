@@ -798,6 +798,18 @@ pub struct Node {
     /// instants. Read-only here; the consensus agent owns the writes.
     snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES],
     snapshot_instants_abandoned: Arc<AtomicU64>,
+    /// Spec §5.7 item 4 (Ruling P4'): the position of the newest set this
+    /// node FETCHED whole from a learner — the SAME allocation the receiver
+    /// agent publishes into (`receiver.stored_set_pos()`) and `Consensus`
+    /// reads as `stored_set_pos`. Exposed via
+    /// [`Node::snapshot_fetched_position`] / [`Node::observability`].
+    snapshot_fetched_position: Arc<AtomicU64>,
+    /// Spec §9: process-local per-row freeze-duration bookkeeping the
+    /// `/metrics` exporter derives from each row's cnc slot word (service-
+    /// written) once per scrape — never per consensus-agent pass. Owned
+    /// here (not the consensus agent) because it is exporter-only
+    /// bookkeeping with no cluster-visible effect.
+    snapshot_freeze: Arc<crate::obs::SnapshotFreezeStats>,
     /// Spec §5.3: the `uc2-cluster` agent's newest artifact position — the
     /// candidate P of every completeness poll.
     cluster_snapshot_pos: Arc<AtomicU64>,
@@ -1348,6 +1360,9 @@ impl Node {
         let snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES] =
             std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
         let snapshot_instants_abandoned = Arc::new(AtomicU64::new(0));
+        // Spec §9: process-local per-row freeze-duration bookkeeping for the
+        // `/metrics` exporter (never read or written on any hot-path agent).
+        let snapshot_freeze = Arc::new(crate::obs::SnapshotFreezeStats::default());
         // Spec §5.5: `Node::command_snapshot`'s request channel. Depth 1 —
         // one operator command at a time; a second concurrent caller is
         // answered `retry`, which is what it would get from the single-in-
@@ -1939,7 +1954,7 @@ impl Node {
             cluster_snapshot_dir: instance.cluster_snapshot_dir(),
             pending_fetch: None,
             fetch_tx,
-            stored_set_pos,
+            stored_set_pos: Arc::clone(&stored_set_pos),
             stored_above_durable: 0,
             snapshot_standby_learner,
             snapshot_standby_position,
@@ -1975,6 +1990,8 @@ impl Node {
             snapshot_instant_pub,
             snapshot_row_incomplete,
             snapshot_instants_abandoned,
+            snapshot_fetched_position: stored_set_pos,
+            snapshot_freeze,
             cluster_snapshot_pos,
             admission_bytes: cfg.admission_bytes_default,
             fsm_door: fsm_lag_eff,
@@ -2298,6 +2315,15 @@ impl Node {
         self.snapshot_instants_abandoned.load(Ordering::Relaxed)
     }
 
+    /// Spec §5.7 item 4 (Ruling P4'): `uc2_snapshot_fetched_position` — the
+    /// position of the newest set this node FETCHED whole from a learner
+    /// (`uc2ctl snapshot fetch`), `0` if it never has. The same reading
+    /// `Consensus::check_set_completeness` treats exactly like a locally
+    /// produced set.
+    pub fn snapshot_fetched_position(&self) -> u64 {
+        self.snapshot_fetched_position.load(Ordering::Acquire)
+    }
+
     /// Spec §5.3: the position of the newest artifact the `uc2-cluster` agent
     /// has written — one member of every set, and the candidate P the
     /// completeness poll compares each declared row against. Diagnostic: a
@@ -2369,6 +2395,11 @@ impl Node {
             reports_unattested: Arc::clone(&self.reports_unattested),
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
+            snapshot_instant_position: Arc::clone(&self.snapshot_instant_pub),
+            snapshot_set_position: Arc::clone(&self.snapshot_set_position),
+            snapshot_row_incomplete: self.snapshot_row_incomplete.clone(),
+            snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
+            snapshot_freeze: Arc::clone(&self.snapshot_freeze),
             crypto_enabled: self.crypto.is_some(),
             purge_enabled: self.purge_enabled,
             journal_segment_bytes: self.journal_segment_bytes,

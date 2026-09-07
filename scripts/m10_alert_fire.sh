@@ -133,6 +133,25 @@ def hold_last(row, total):
     return f"{v}x{total}"
 
 
+def multi_level_hold(row, total):
+    """CHANGES policy, for a `changes(...[range]) >= N` rule
+    (Uc2SnapshotStalled) rather than a level/delta one: replay every raw
+    captured value as its own equal-length hold, summing to `total` samples,
+    so the resulting series carries `len(values) - 1` change points spread
+    across the whole synthetic window — landing inside whatever range the
+    rule's `changes([...])` evaluates, since the window IS the whole
+    timeline this builder lays down. Needs at least 2 raw values (at least
+    one real change) to be useful; a scenario feeding this policy a
+    single-value series is a builder bug, not a legitimate "no changes"
+    case (that's `hold_last`'s job)."""
+    vals = row["values"]
+    n = len(vals)
+    assert n >= 2, f"multi_level_hold needs >=2 raw samples to produce a change, got {n}"
+    base = total // n
+    counts = [base] * (n - 1) + [total - base * (n - 1)]
+    return " ".join(f"{v}x{c}" for v, c in zip(vals, counts))
+
+
 def literal(row):
     """DELTA-jump policy for `for: 0m` rules: the raw captured samples
     (a real 0->N transition) are already inside the range window at the
@@ -240,6 +259,8 @@ RULE_META = {
     "Uc2ServiceVersionDrift": {"severity": "warning", "real": False, "scenario": "version_drift"},
     "Uc2LogTimeFrozen": {"severity": "warning", "real": False, "scenario": "log_time_frozen"},
     "Uc2ScheduleTableDiverged": {"severity": "warning", "real": False, "scenario": "schedule_diverged"},
+    "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
+    "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
 }
 
 
@@ -516,6 +537,57 @@ def build_Uc2ScheduleTableDiverged():
     return r
 
 
+def build_Uc2SnapshotStalled():
+    # Coordinated-snapshot spec §9: `changes(uc2_snapshot_instant_position[30m])
+    # >= 2 and changes(uc2_snapshot_set_position[30m]) == 0` — a CHANGES-based
+    # range-vector rule, unlike every builder above (level/delta). The
+    # scenario captures the leader committing THREE distinct instant
+    # positions across its three real scrape rounds while its complete-set
+    # gauge sits fixed at one value throughout — multi_level_hold replays
+    # each captured instant value as an equal-length hold spanning the whole
+    # 30m+margin synthetic window, so both change points land inside the
+    # range window evaluated at eval_time; hold_last (zero changes) does the
+    # same for the set-position series. `for: 0m`, so the condition need
+    # only be true AT eval_time, no sustain — same posture as
+    # build_Uc2ScheduleTableDiverged's `count(...) > 1` bare instant.
+    rows = load_scenario("snapshot_stalled")
+    instant_row = select(rows, "uc2_snapshot_instant_position", {})
+    set_row = select(rows, "uc2_snapshot_set_position", {})
+    eval_time, total = total_for(0, range_secs=1800)
+    r = new_rule("warning", labels_from=instant_row)
+    r["series"].append(
+        (f'uc2_snapshot_instant_position{{{instant_row["labels_str"]}}}', multi_level_hold(instant_row, total))
+    )
+    r["dilation"].append(
+        f"series=uc2_snapshot_instant_position policy=multi_level_hold range=1800s samples={total} "
+        f"(raw captured values {instant_row['values']} replayed as {len(instant_row['values'])} "
+        f"equal-length holds, {len(instant_row['values']) - 1} change point(s) inside the range window)"
+    )
+    r["series"].append((f'uc2_snapshot_set_position{{{set_row["labels_str"]}}}', hold_last(set_row, total)))
+    r["dilation"].append(
+        f"series=uc2_snapshot_set_position policy=hold_last range=1800s samples={total} "
+        f"(last real scraped value \"{set_row['values'][-1]}\" held constant — zero changes)"
+    )
+    r["eval_time"] = eval_time
+    return r
+
+
+def build_Uc2SnapshotSetDiverged():
+    # Coordinated-snapshot spec §9: the same two-instance count_values shape
+    # as build_Uc2ScheduleTableDiverged, verbatim, over
+    # uc2_snapshot_set_position instead of uc2_schedule_table_position — the
+    # outer count(...) has no `by`, so it strips every label:
+    # labels_from=None, same as build_Uc2ScheduleTableDiverged's.
+    rows = load_scenario("snapshot_set_diverged")
+    row_a = select(rows, "uc2_snapshot_set_position", {"instance": "n0"})
+    row_b = select(rows, "uc2_snapshot_set_position", {"instance": "n1"})
+    r = new_rule("warning", labels_from=None)
+    add_hold_last(r, row_a, "uc2_snapshot_set_position", 60)
+    add_hold_last(r, row_b, "uc2_snapshot_set_position", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -537,6 +609,8 @@ RULE_BUILDERS = {
     "Uc2ServiceVersionDrift": build_Uc2ServiceVersionDrift,
     "Uc2LogTimeFrozen": build_Uc2LogTimeFrozen,
     "Uc2ScheduleTableDiverged": build_Uc2ScheduleTableDiverged,
+    "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
+    "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
 }
 
 # Task 5 completeness cross-check: parse every `alert:` name straight out of

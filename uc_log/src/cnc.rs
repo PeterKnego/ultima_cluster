@@ -200,15 +200,19 @@ const _: () = assert!(std::mem::offset_of!(ServiceStatusLine, version) == cnc::C
 /// there is no separate release store for this field, and that is sufficient
 /// because no attacher passes `validate` (which checks that CRC) before the
 /// CRC exists, so no reader can observe the name bytes ahead of the write
-/// that publishes them. `timers_pending` (time-and-timers spec §6) is the one
-/// live word on this otherwise-frozen line: node-written, refreshed once per
-/// consensus-agent pass.
+/// that publishes them. `timers_pending` (time-and-timers spec §6) and
+/// `freeze_ns` (coordinated-snapshot spec §9) are the two live words on this
+/// otherwise-frozen line: `timers_pending` is node-written, refreshed once
+/// per consensus-agent pass; `freeze_ns` is SERVICE-written, once per
+/// instant (`on_snapshot_frame`) — a second, distinct writer on the same
+/// line, each owning its own word.
 #[repr(C)]
 pub struct ServiceIdentityLine {
     name: [u8; cnc::CNC_SVC_NAME_LEN],
     hash: AtomicU64,
     timers_pending: AtomicU64,
-    _pad: [u64; 2],
+    freeze_ns: AtomicU64,
+    _pad: [u64; 1],
 }
 impl ServiceIdentityLine {
     pub fn name(&self) -> Option<FsmName> {
@@ -224,6 +228,15 @@ impl ServiceIdentityLine {
     pub fn store_timers_pending(&self, v: u64) {
         self.timers_pending.store(v, Ordering::Release)
     }
+    /// This row's last `freeze()` call duration in nanoseconds
+    /// (coordinated-snapshot spec §9); service-written, `0` before the first
+    /// instant this row has completed a freeze for.
+    pub fn freeze_ns(&self) -> u64 {
+        self.freeze_ns.load(Ordering::Acquire)
+    }
+    pub fn store_freeze_ns(&self, v: u64) {
+        self.freeze_ns.store(v, Ordering::Release)
+    }
 }
 const _: () = assert!(std::mem::size_of::<ServiceIdentityLine>() == 64);
 const _: () = assert!(
@@ -233,6 +246,10 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::offset_of!(ServiceIdentityLine, timers_pending)
         == cnc::CNC_SVC_OFF_TIMERS_PENDING - cnc::CNC_SVC_OFF_NAME
+);
+const _: () = assert!(
+    std::mem::offset_of!(ServiceIdentityLine, freeze_ns)
+        == cnc::CNC_SVC_OFF_FREEZE_NS - cnc::CNC_SVC_OFF_NAME
 );
 
 /// M14a: one per-service slot on page 2 — see `uc_protocol::v2::cnc`'s
@@ -1678,6 +1695,18 @@ mod tests {
             u64::from_le_bytes(raw[base..base + 8].try_into().unwrap()),
             17,
             "offset pin: timers_pending lives at slot +488"
+        );
+        assert_eq!(slot.identity.freeze_ns(), 0);
+        slot.identity.store_freeze_ns(4_200_000);
+        assert_eq!(slot.identity.freeze_ns(), 4_200_000);
+        let raw = page.page();
+        let base = cnc::CNC_OFF_SERVICE_SLOTS
+            + 2 * cnc::CNC_SERVICE_SLOT_STRIDE
+            + cnc::CNC_SVC_OFF_FREEZE_NS;
+        assert_eq!(
+            u64::from_le_bytes(raw[base..base + 8].try_into().unwrap()),
+            4_200_000,
+            "offset pin: freeze_ns lives at slot +496"
         );
     }
 
