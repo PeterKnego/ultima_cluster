@@ -192,7 +192,7 @@ groups:
     #
     # This is a NARROW alert since 2.11.0, because the mechanisms that used to
     # make it fire are gone:
-    #   * there is no state/schedules.state and no ScheduleRecord, so the
+    #   * there is no state/schedules.state and no retired ScheduleRecord, so the
     #     crash-between-recording-and-persisting window is closed — the
     #     uc2-cluster agent replays the journal above its artifact;
     #   * there is no revert-on-truncation and no wipe keep-alive, because an

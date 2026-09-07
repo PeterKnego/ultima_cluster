@@ -204,7 +204,7 @@ hot path; the on-time signal is `rate(uc2_timers_fired_total[..])`. There is no
 re-arm record either: the heap is leader-only since the cluster FSM, so a
 demotion **discards** it rather than re-arming, and a promotion rebuilds it
 from the service's re-announce plus the cluster FSM's table view.
-`uc2_timers_rearmed_total` and the `timers_rearmed` record are **gone**.
+`uc2_timers_rearmed_total` and the `timers_rearmed` record are **retired**.
 
 A rising `uc2_timers_late_total` on a cluster that is not changing leaders is
 worth a look: either more than `TIMERS_PER_PASS` (64) timers are coming due per
@@ -222,7 +222,7 @@ the cluster stops.
 Since the cluster FSM (2.11 pending) this is a **narrow** alert, because the
 mechanisms that used to make it fire are gone:
 
-- there is no `state/schedules.state` and no `ScheduleRecord`, so the
+- there is no `state/schedules.state` and no retired `ScheduleRecord`, so the
   crash-between-record-and-persist window is closed — the cluster agent
   replays the journal;
 - there is no revert-on-truncation and no wipe keep-alive, because an

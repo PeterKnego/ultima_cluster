@@ -408,9 +408,9 @@ across the flag day must have its `snapshots/` emptied, or the first install
 path to touch an old file refuses it by name. The node rebuilds the set at the
 next instant.
 
-**`SnapshotPolicy` is gone from the SDK.** A service that configured
-`ServiceConfig::snapshot_policy(SnapshotPolicy { interval_bytes })` no longer
-compiles: delete the call. `start_with_snapshots()` is the whole opt-in now,
+**`SnapshotPolicy` is retired from the SDK.** A service that configured
+`ServiceConfig::snapshot_policy(SnapshotPolicy { interval_bytes })` (retired)
+no longer compiles: delete the call. `start_with_snapshots()` is the whole opt-in now,
 and the trigger moved to the log — command an instant with `uc2ctl snapshot`,
 or set the replicated `snapshot_interval_bytes` with `uc2ctl settings apply`.
 Check your `install_snapshot` while you are there: the position it is handed

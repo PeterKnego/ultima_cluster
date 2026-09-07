@@ -149,7 +149,7 @@ that lacks it — a row started with plain `start()` would ignore the frame, so
 the set could never complete and the purge floor would never move.
 
 **When `freeze()` is called is no longer your decision** (2.11 pending). The
-per-service `SnapshotPolicy { interval_bytes }` is **removed**: a snapshot is
+per-service `SnapshotPolicy { interval_bytes }` is **retired**: a snapshot is
 now taken at a **coordinated instant**, a `SNAPSHOT` frame the leader appends,
 at whose frame-end position **P** every declared row and the cluster FSM
 freeze together. Your apply thread runs `freeze()` there, having applied

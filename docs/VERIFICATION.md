@@ -452,7 +452,7 @@ service must replay.
 
 **The churn capstones command instants (`2.11.0`).**
 `linearizable_under_purge_and_snapshot_churn`, its `_with_crypto` twin, and
-both two-FSM arms drove their purge with `SnapshotPolicy { interval_bytes }`
+both two-FSM arms drove their purge with the now-retired `SnapshotPolicy { interval_bytes }`
 before; they now call `cluster.command_instant()` once per fault tick, before
 the fault, so an instant is commanded while the cluster is still whole. It is
 best-effort by design — `command_instant` answers `None` on "no serving

@@ -107,7 +107,7 @@ same body as its ack, so it carries this layout too, with no separate change.
 | bytes | field | width | meaning |
 |---|---|---|---|
 | 0..4 | `session` | u32 | session id |
-| 4 | `layout` | u8 | body discriminator; `3` = `SNAP_BEGIN_LAYOUT_V4` (0.7.0 as shipped). `1` = `SNAP_BEGIN_LAYOUT_V2` (0.6.0) and `2` = `SNAP_BEGIN_LAYOUT_V3` (the intermediate 0.7.0 shape with a carried config, never released) are refused **by name** at the node layer |
+| 4 | `layout` | u8 | body discriminator; `3` = `SNAP_BEGIN_LAYOUT_V4` (0.7.0 as shipped). `1` and `2` are retired and reserved (`SNAP_BEGIN_LAYOUT_V2_RETIRED`, the 0.6.0 shape, and `SNAP_BEGIN_LAYOUT_V3_RETIRED`, the intermediate 0.7.0 shape with a carried config, never released) and are refused **by name** at the node layer |
 | 5 | `service_id` | u8 | the row this artifact belongs to, or `255` = the **cluster artifact** |
 | 6..8 | — | 2 B | zero (pads `snapshot_pos` to u64 alignment) |
 | 8..16 | `snapshot_pos` | u64 | this artifact's snapshot position |
@@ -404,7 +404,7 @@ The apply layer never sees this frame: every FSM's apply loop yields
 `CLUSTER`. **Every** node adopts the table the same way — the cluster FSM
 applies the command at commit and publishes it on the view; there is no
 leader-at-append / follower-at-walk split any more, and no durable
-`ScheduleRecord` with a predecessor to revert to, because a committed frame is
+retired `ScheduleRecord` with a predecessor to revert to, because a committed frame is
 never truncated. What the table then does is
 [Log time and timers, explained § The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table).
 

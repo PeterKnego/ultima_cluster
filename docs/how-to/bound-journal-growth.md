@@ -30,7 +30,7 @@ the O(state) work in `stream_snapshot`.
 
 ## Take a snapshot: command an instant, or set a cadence
 
-There is no per-service byte trigger any more (`SnapshotPolicy` is gone). Two
+There is no per-service byte trigger any more (`SnapshotPolicy` is retired). Two
 triggers, both leader-only:
 
 **On command.** One instant, now:

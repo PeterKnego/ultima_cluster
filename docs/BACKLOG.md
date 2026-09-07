@@ -72,8 +72,8 @@ to point at "§ 2a" for these residuals now point here.*
   → [The cluster FSM, explained](notes/uc2-cluster-fsm-explained.md)
 - ~~**A wiped node's kept table does not propagate by snapshot**~~ (plan 3
   residual b, post-R7) — **CLOSED by the same change.** There is no wipe
-  keep-alive to propagate: `ScheduleRecord`, `revert_schedule_below` and
-  `shippable_schedule` are all gone, and the position-0 encoding rule they
+  keep-alive to propagate: the retired `ScheduleRecord`, `revert_schedule_below` and
+  `shippable_schedule` are all retired, and the position-0 encoding rule they
   needed went with them. The table is FSM state applied at **commit**, so an
   uncommitted frame is never applied and a truncated one never existed as far
   as the FSM is concerned — there is nothing to revert and nothing to keep
@@ -94,7 +94,7 @@ to point at "§ 2a" for these residuals now point here.*
   is not expressible — a timezone database is replicated state that must agree
   on every node and across every upgrade. Cron-style rules are a possible
   fourth `kind` byte; the codec has room.
-- ~~**`append_schedule_table` duplicates `append_config`'s body**~~ (ruling
+- ~~**a retired `append_schedule_table` would have duplicated `append_config`'s body**~~ (ruling
   R8) — **moot**: the cluster FSM collapsed both into one `append_cluster`
   with a kind byte, because there is one frame type now. The underlying rule
   stands for any future append body: extract **with an A/B** against
@@ -327,7 +327,7 @@ Requested by the maintainer directly on 2026-09-02 — never a ranked item on
 the 2026-09-01 list — and specced beside FSM identity, which is why it sat
 under item 2. **All three plans are implemented** and merged to `main`:
 leader-stamped log time plus a deterministic scheduler (plan 1); the
-replicated schedule table, `FRAME_TYPE_SCHEDULE_TABLE = 6` and
+replicated schedule table, the since-retired `FRAME_TYPE_SCHEDULE_TABLE = 6` and
 `uc2ctl schedule apply/show` (plan 2); and that table on the snapshot session,
 `SNAP_TABLE` datagram kind 21, so a below-floor joiner installs it before it
 can serve or lead (plan 3).
@@ -336,14 +336,15 @@ can serve or lead (plan 3).
 plan 2, done on the `uc2+coordinated-snapshot-plan2` branch): the cluster
 artifact plan 1 wrote on a bridging trigger is now written at a commanded
 instant, so a "set" is one log position rather than a lowest-common-floor, and
-`SnapshotPolicy`'s per-service byte interval is deleted with it. Standby
+the now-retired `SnapshotPolicy`'s per-service byte interval is deleted with it. Standby
 instants (`uc2ctl snapshot --standby`) and the `uc2ctl snapshot fetch` return
 path come with it —
 [`docs/notes/uc2-cluster-fsm-explained.md` § Instants](notes/uc2-cluster-fsm-explained.md#instants-one-position-one-set).
 
 **Superseded before shipping, in the same unreleased `2.11.0`**: the cluster
-FSM took over both carries. `FRAME_TYPE_SCHEDULE_TABLE = 6` becomes
-`CLUSTER kind = 2` and `SNAP_TABLE` kind 21 is **retired** — the table rides
+FSM took over both carries; the retired `FRAME_TYPE_SCHEDULE_TABLE = 6` and
+`SNAP_TABLE` kind 21 are both **retired** here. The frame becomes
+`CLUSTER kind = 2` and the table rides
 the cluster FSM's own snapshot artifact under `service_id = 255` instead, which
 is what actually closed the limitation plan 2 shipped with (plan 3's own two
 ship-side residuals went with it; see the struck bullets under item 2 above).

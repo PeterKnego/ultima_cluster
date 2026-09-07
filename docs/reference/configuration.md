@@ -199,8 +199,9 @@ Every voting member including this node, if it is a voter. Learners are not
 listed here.
 Seed only: authoritative for a fresh instance directory that has no durable
 config record. After the first boot, the durable config record and the
-`FRAME_TYPE_CONFIG` stream own membership, and this field is ignored. A restart
-with an edited `members` list has no effect.
+cluster FSM's `FRAME_TYPE_CLUSTER` (kind = `Membership`) commands own
+membership — the retired `FRAME_TYPE_CONFIG` frame type is gone — and this
+field is ignored. A restart with an edited `members` list has no effect.
 
 **`learners: Vec<(NodeId, SocketAddr)>`**
 Learner peers. Default empty. A learner is replicated to but never counted: no
@@ -262,7 +263,7 @@ Snapshots shorten a service restart only together with purge: reconstruction
 installs an artifact only when the journal no longer covers the start
 position (`uc_service/src/replay.rs`); with purge off it replays the whole
 journal. There is no per-service snapshot policy since 2.11 (pending) —
-`SnapshotPolicy` is gone and a snapshot is taken at a **coordinated instant**,
+the retired `SnapshotPolicy` is gone and a snapshot is taken at a **coordinated instant**,
 commanded with [`uc2ctl snapshot`](uc2ctl.md#snapshot) or by the replicated
 `snapshot_interval_bytes` cadence below.
 To turn it on, see [Keep the journal from growing without bound](../how-to/bound-journal-growth.md).

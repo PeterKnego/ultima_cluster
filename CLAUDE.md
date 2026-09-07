@@ -76,8 +76,8 @@ trusting the body, which is retained scaffolding).
 T0–T12) is **DONE and merged to local `main`** (unpushed): cluster data
 (membership, the schedule table, a new replicated settings record) moves into
 one internal state machine applied at commit by a fifth agent, with its own
-snapshot artifact on the session; `SNAP_TABLE`, `FRAME_TYPE_SCHEDULE_TABLE`
-and `SnapBeginBody.config` retire; the timer heap goes leader-only.
+snapshot artifact on the session; `SNAP_TABLE` is retired,
+`FRAME_TYPE_SCHEDULE_TABLE` is retired, and `SnapBeginBody.config` is retired; the timer heap goes leader-only.
 **Plan 2** (`docs/superpowers/plans/2026-09-06-uc2-coordinated-snapshot-plan2.md`,
 T0–T11) is **DONE on the `uc2+coordinated-snapshot-plan2` worktree branch**,
 NOT merged: §5's coordinated snapshot instants (a `SNAPSHOT` frame at whose
@@ -113,7 +113,7 @@ Also on `main` and in the same `2.11.0` flag day: **time and timers**
 (`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan1.md`, T0–T14),
 leader-stamped log time and a deterministic scheduler; plan 2
 (`docs/superpowers/plans/2026-09-03-uc2-time-and-timers-plan2.md`, T0–T8), the
-**replicated schedule table** (spec §5): `FRAME_TYPE_SCHEDULE_TABLE = 6`,
+**replicated schedule table** (spec §5): the since-retired `FRAME_TYPE_SCHEDULE_TABLE = 6`,
 `uc2ctl schedule apply/show`, adoption through the archive walk, and table
 ticks that fire through the same heap and the same `TIMER` frame; and plan 3
 (`docs/superpowers/plans/2026-09-03-uc2-schedule-table-in-snapshot.md`, T0–T5,
@@ -230,11 +230,12 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     (consensus-agent-written each pass). One new per-row IPC ring,
     `svc_sched.<row>.ring` (SPSC, service → node, 1 MiB, `MSG_V2_SCHED`),
     the first per-row ring the **node consumes**; it takes the per-row
-    reservation from 5 to 6 MiB. Only `timer_late` and `timers_rearmed` are
-    logged (no per-fire record: `uc_obs` has no Debug level and a `stderr`
+    reservation from 5 to 6 MiB. Only `timer_late` and (retired) `timers_rearmed`
+    were logged
+    (no per-fire record: `uc_obs` has no Debug level and a `stderr`
     write per timer on the consensus agent was rejected).
-  - **The replicated schedule table (plan 2).**
-    `FRAME_TYPE_SCHEDULE_TABLE = 6` carries the whole table: an 8-byte header
+  - **The replicated schedule table (plan 2, since retired — see below).**
+    The retired `FRAME_TYPE_SCHEDULE_TABLE = 6` carried the whole table: an 8-byte header
     plus `count × 33` bytes, `MAX_SCHEDULE_ENTRIES = 32` → 1064 B, inside the
     1312 B crypto-on ceiling. Three rules — `every {period_ns, anchor_ns}`,
     `at {secs_of_day}` (daily, UTC) and `once {at_ns}`, which **parks** after
@@ -246,7 +247,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     1064-byte payload. **Leader-only** (the staged file is node-local: a
     follower answers retry, never forwards) and **single-in-flight** (the
     leader answers retry while the previous table frame is above commit, which
-    is what makes one level of `ScheduleRecord.prev` enough). Refusals
+    is what made one level of the (now retired) `ScheduleRecord.prev` enough). Refusals
     `40 schedule_digest` / `41 schedule_missing` / `42 schedule_decode` /
     `43 schedule_unknown_fsm`; audited as `schedule_apply`. Ticks fire as
     `TIMER` frames with `FLAG_TIMER_TABLE`; a truncated table tick is **not**
@@ -260,8 +261,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     for what actually ships. (a) `FRAME_TYPE_SCHEDULE_TABLE = 6` is retired and
     reserved; the table is a `CLUSTER kind = 2` payload. (b) The plan-2
     adoption path — leader-at-append / followers-from-the-archive-walk,
-    persisted in `state/schedules.state`, reverted to `ScheduleRecord.prev` on
-    truncation, and the follower's `TableConsumed` advance — is gone: **every**
+    persisted in `state/schedules.state`, reverted on truncation to
+    `ScheduleRecord.prev` (retired along with the rest of this record),
+    and the follower's `TableConsumed` advance — is gone: **every**
     node applies the table at COMMIT in the cluster FSM, there is no durable
     record and nothing to revert, and only the leader holds a heap to advance.
     Single-in-flight is still one command, but now spans all three `CLUSTER`
@@ -275,7 +277,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     (a restarted node under-shipping; a wiped node's position-0 record, ruling
     R7) are **CLOSED by the cluster FSM** — the next sub-bullet — which is why
     that feature exists; `SNAP_TABLE`, `state/schedules.state`,
-    `ScheduleRecord`/`prev`/revert and `shippable_schedule` are all gone.
+    `ScheduleRecord`/`prev`/revert and `shippable_schedule` are all retired.
   - **The cluster FSM.** Cluster data — membership, the schedule table and
     the new replicated settings record — lives in one **internal** state
     machine (`uc_node::cluster_fsm`, `const NAME = "uc_cluster"`), applied at
@@ -283,8 +285,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     own artifact `snapshots/cluster/snap-<pos>.ultcluster`. `FRAME_TYPE_CLUSTER
     = 4` (reusing `CONFIG`'s number) carries `kind: u8 ‖ reserved [u8; 7] ‖
     payload`, kinds `1 = Membership`, `2 = ScheduleTable`, `3 = Settings`;
-    `FRAME_TYPE_SCHEDULE_TABLE = 6` and `DGRAM_KIND_SNAP_TABLE = 21` are
-    **retired before shipping** and reserved. The snapshot session ships the
+    the retired `FRAME_TYPE_SCHEDULE_TABLE = 6` and the retired
+    `DGRAM_KIND_SNAP_TABLE = 21` (retired before shipping) are
+    reserved. The snapshot session ships the
     cluster artifact under `service_id = 255`, last and outside the declared
     mask, and a below-floor joiner installs it BEFORE its floor advances — so
     `SnapBeginBody.config` is gone and `SNAP_BEGIN` is fixed-length at 120 B,
@@ -307,10 +310,10 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     **LEADER-ONLY** — a follower's service writes no `svc_sched` record and
     exports `timers_pending = 0`, a demotion discards the heap, and a new
     leader re-announces on the leader flag's rising edge;
-    `uc2_timers_rearmed_total` is deleted. The `uc_` FSM-name prefix is
+    `uc2_timers_rearmed_total` is retired. The `uc_` FSM-name prefix is
     **reserved**. `uc_node` now depends on `uc_service`, which flips the
     crates.io publish order. There is no `state/schedules.state`, no
-    `ScheduleRecord`/`prev`/revert and no `ScheduleShip`. Explainer
+    `ScheduleRecord`/`prev`/revert and no `ScheduleShip` — both retired. Explainer
     `docs/notes/uc2-cluster-fsm-explained.md`; spec
     `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`
     (§5, coordinated snapshot instants, is that spec's plan 2 — the next
@@ -332,7 +335,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     That set is **committed by construction** (a row freezes only after
     applying to P, apply is gated on `min(commit, durable)`, committed bytes
     are never truncated), which is what lets the ship gate become "the
-    complete set at my floor" with no counter. `SnapshotPolicy` /
+    complete set at my floor" with no counter. The retired `SnapshotPolicy` /
     `ServiceConfig::snapshot_policy` are **DELETED**; `start_with_snapshots`
     is the whole opt-in and sets `CNC_SVC_STATUS_SNAPSHOT_CAPABLE = 1 << 9`.
     Header flag `FLAG_SNAPSHOT_STANDBY = 0x01` (the byte `FLAG_TIMER_TABLE`
@@ -351,7 +354,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `last_applied()`, and no payload-side check can catch a mis-tag;
     pre-envelope artifacts are refused by name (clear a dev box's
     `snapshots/` once). **Retention is node-owned and delete-only** — both
-    per-writer `retain_newest(2)` pruners are gone, because only the node can
+    per-writer `retain_newest(2)` pruners are retired, because only the node can
     see a *set*. A replayed span acts on its LAST `SNAPSHOT` frame (ruling
     P10). 8 metric series + `Uc2SnapshotStalled` /
     `Uc2StandbySnapshotStalled` / `Uc2SnapshotSetDiverged`;

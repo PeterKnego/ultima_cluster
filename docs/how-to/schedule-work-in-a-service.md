@@ -155,8 +155,8 @@ exported per row; see
 [Monitor a cluster](monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending).
 `uc2_timers_pending` is the **leader's** count and a follower exports `0`, so
 do not alert on the fleet disagreeing about it — that is the healthy reading.
-(`uc2_timers_rearmed_total` existed in an earlier draft of this feature and is
-gone: with a leader-only heap there is nothing to re-arm on demotion.)
+(the retired `uc2_timers_rearmed_total` existed in an earlier draft of this feature
+and is retired: with a leader-only heap there is nothing to re-arm on demotion.)
 
 A rising `uc2_timers_late_total` on a cluster that is **not** changing leaders
 is worth investigating; after a failover it is expected.
