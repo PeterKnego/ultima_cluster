@@ -304,6 +304,21 @@ The break, under the rule above, is real:
 - `[services]` goes from optional (absent ⇒ `ids = [0]`) to **required**,
   and its `ids` key is refused outright, pointing at `names`.
 
+Two later changes in the same release ride **this same carve-out**, because
+they are the same kind of break in the same unreleased flag day:
+
+- the retired `uc_service::SnapshotPolicy` and `ServiceConfig::snapshot_policy` are
+  **removed** — removing a promised type is a MAJOR change under the rule
+  above. The snapshot cadence became cluster data (the replicated
+  `snapshot.interval_bytes`), so a service no longer chooses one:
+  `start_with_snapshots()` is the whole opt-in, and the trigger is the log.
+- The `node.toml` keys **move**: a top-level `admission_bytes` and a
+  `[services] fsm_lag` are startup refusals by name, pointing at `[settings]`
+  and `uc2ctl settings apply`. A config-schema break is not covered by the
+  API rule above at all — `node.toml` is an operator interface, versioned by
+  the flag day (`docs/how-to/upgrade-a-cluster.md`) rather than by semver —
+  but it is recorded here so the whole break is in one place.
+
 The maintainer's decision (spec §10, applied 2026-09-02): ship this as the
 **next minor**, `2.11.0`, rather than `3.0.0` — the same reasoning as every
 other freely-made API change on this project while it has no external

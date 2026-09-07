@@ -34,7 +34,13 @@ are recorded below as reserved numbers rather than as features.
 The coordinated-snapshot half of the cluster-FSM spec (§5: a `SNAPSHOT` frame
 at whose frame-end position every row and the cluster FSM freeze together, plus
 standby instants) is **plan 2 of that spec, and it landed too** — the section
-below. Plan 3 of that spec (retirement and proof) is still to come.
+below. **Plan 3 (retirement and proof) has landed as well**: every symbol §7
+retired is deleted and pinned against re-introduction by
+`uc_node/tests/retired.rs` (a `git grep` test, so a comment or a script
+counts); the cluster image codec moved out of `uc_node` into the `core`-only
+leaf `uc_protocol::v2::cluster_image` so it can be fuzzed directly
+(`uc_protocol_cluster_image`, the 23rd target); and the apply-hop A/B runner
+`scripts/apply_ab.sh` exists, which is what gate rows d and f were missing.
 
 ### The problem this closes
 
@@ -891,10 +897,12 @@ for one release, not a standing exception — see
 
 ### Release evidence
 
-**Nothing below has run yet — every row is `pending`.** No fleet gate, no
-tag, no crates.io publish. Filled in when the maintainer green-lights the
-release, following the same table shape every prior release entry in this
-file uses ("What proves the release").
+**No fleet gate has run, and every gate row below is `pending`.** No tag, no
+crates.io publish. The one measurement that exists — gate row f — is a
+**dev-box smoke**, which under the standing rule (a dev box is not a bench) is
+not a gate result and does not adjudicate a bar. Filled in when the maintainer
+green-lights the release, following the same table shape every prior release
+entry in this file uses ("What proves the release").
 
 | what | evidence | result |
 |---|---|---|
@@ -902,10 +910,15 @@ file uses ("What proves the release").
 | `docs.yml` (rustdoc, link check) | — | pending |
 | `release.yml` (build, SBOM, cosign, image) | — | pending |
 | workspace correctness stack (`lin_v2`, `lin_partition_v2`, `learner`, `elle_check.sh`, hard-crash) | dev-box smoke only so far, see the branch's Task 9 report | pending (fleet-equivalent, not yet a gate) |
-| `cargo test --workspace --doc` | Task 10, this worktree | see below (run as part of this docs sweep, not a release gate on its own) |
+| `cargo test --workspace --doc` | run on each docs sweep, most recently plan 3's | **green** (15 doc-test targets, 1 test) — run as part of the docs sweep, not a release gate on its own |
+| the flag day's retirements | `cargo test -p uc_node --test retired` | **green** — a `git grep` pin over every symbol spec §7 retired, plus the unit test of its own excuse rule |
 | FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
-| time-and-timers gate (rows a/b/c/d/e) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — bars committed, no run. Row d is an isolated `apply_bench` A/B under `scripts/hop1_ab.sh`'s same-source rebuild control, added because this work *does* touch two hot loops (M14a's codegen lesson); row e re-runs the throughput rows with a full 32-entry schedule table live |
-| coordinated snapshots | no gate doc of its own | **pending** — three rows belong in the time-and-timers gate's throughput arm when it runs: commanded instants under load (the extra apply-loop arm, A/B'd per M14a), a below-floor join with the shipper restarted mid-window, and freeze duration vs. commit stall on a large state for an all-nodes instant against the same instant `--standby` |
+| time-and-timers gate, rows a/b/c/e (throughput, timer precision, the 32-entry table) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — fleet. Bars committed, no run |
+| time-and-timers gate, **row d** — the apply-hop A/B for log time and timers (`17d5c6b` → `HEAD`, N=1 and N=2, bounded) | the same gate doc + [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) | pending — fleet. Added because this work *does* touch two hot loops (M14a's codegen lesson). The 2026-09-03 "not run: no runner" finding is **closed** — `apply_ab.sh` exists since 2026-09-07, and closing it also fixed `apply_bench`'s missing `svc_sched` ring. This pair straddles the `Appender` arity change, so the `--harness` overlay is not available on it |
+| time-and-timers gate, **row f** — commanded instants under the throughput load (the one apply-loop arm coordinated snapshots add), `627eb4e` → `a64a6ed` with the harness overlay | the same gate doc + [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) | pending — fleet. A dev-box **SMOKE** run on 2026-09-07 read head vs base −0.242 % against a 0.048 % resolution and a 0.361 % noise margin, i.e. within resolution at N=1 — **not a gate** (a dev box is not a bench, and `--pairs 6` at N=1 *and* N=2 has not been run) |
+| time-and-timers gate, **row g** — a below-floor join with the shipper restarted mid-window, scaled to the fleet | the same gate doc | pending — fleet. Bar ≤ 60 s to converge with `snapshot_installed` observed, matching the FSM-identity gate's row j |
+| time-and-timers gate, **row h** — freeze duration vs. commit stall on a 256 MiB state, all-nodes instant then `--standby` | the same gate doc | pending — fleet. The row that turns §5.7's argument into a number: the standby instant's commit gap must be ≤ the pass length measured on the day; the all-nodes gap is reported with no bar |
+| coordinated snapshots | no gate doc of its own — rows f/g/h above | pending — fleet. The three rows the feature owed now exist in the time-and-timers gate, with pre-committed bars; none has run on a fleet |
 | cluster FSM | no gate doc of its own | **n/a by design** — the fifth agent's frames are operator-rate, and its one hot-path addition is a single `Acquire` load of the view's position word per consensus duty cycle, compared against a shadow, with the view's mutex taken only on a pass where that position moved. A row belongs in the time-and-timers gate's throughput arm when that gate is run |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |

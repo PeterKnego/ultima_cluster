@@ -943,7 +943,12 @@ The most important section, and the one most projects omit.
   seeds include a crc-CONSISTENT body whose membership length prefix lies,
   the shape that would index out of bounds without the decoder's `.get(..)`
   checks. The `CLUSTER` frame body and the settings record it wraps have
-  their own targets (`uc_protocol_cluster_frame`, `uc_protocol_settings`).
+  their own targets (`uc_protocol_cluster_frame`, `uc_protocol_settings`),
+  and since plan 3 the image **codec** itself is a `core`-only leaf
+  (`uc_protocol::v2::cluster_image`) with its own round-tripping target
+  (`uc_protocol_cluster_image`), so it is reachable without linking
+  `uc_node` at all. What is still uncovered there is the same thing every
+  target leaves uncovered: stateful sequences, not single decodes.
 - **The §4.3 timer oracle's rule 5 is vacuous over the new instants row.**
   `a_commanded_instant_freezes_every_row_at_one_position_under_load_and_ordering_holds`
   (§3) re-walks a whole log carrying `SNAPSHOT` frames through
@@ -982,7 +987,30 @@ The most important section, and the one most projects omit.
   `uc_protocol_schedule_table` property fuzz target (totality, §7) and by
   `a_restarted_node_resumes_the_table_with_one_catch_up_tick` (one scenario),
   and by nothing seeded. A wrong-but-total occurrence choice would pass both the
-  fuzzer and the ordering oracle.
+  fuzzer and the ordering oracle. What the cluster FSM narrowed is the *input*
+  rather than the arithmetic: the table that arithmetic reads is now the
+  cluster FSM's committed record — one source of truth, identical on every
+  node — and only the leader holds a heap to arm from it, so the uncovered
+  surface is the occurrence choice alone, on one node, and no longer includes
+  which table a given node happened to be holding.
+- **The flag day's retirements are pinned by a grep, not by the type system.**
+  `uc_node/tests/retired.rs` runs `git grep` for each of spec §7's retired
+  symbols and fails if any comes back, deliberately catching a
+  re-introduction in a comment, a script or a doc as well as in code — but it
+  is a name check, so a symbol reintroduced under a *different* name with the
+  same broken shape passes it. Its own excuse rule is unit-tested
+  (`the_retired_or_reserved_excuse_applies_only_outside_rs_files`): a
+  historical-record file may name a retired symbol on a line that says it is
+  retired or reserved; a `.rs` hit is always a hit, whatever its comment says.
+- **One seam survives the node/cluster line, on purpose.**
+  `state/config.state` is still node-local durable state, and it is the only
+  membership copy that is: it is the consensus kernel's **durable-time**
+  shadow (cluster-FSM spec §4.6 — Raft §4.1 requires the newest configuration
+  in the log, committed or not, and an FSM cannot answer at that time base).
+  Everything else on that list moved into the cluster FSM. What relates the
+  two readers is **inv12** (§2), and the honest note above applies to it: in
+  the sim inv12 is largely a corollary of inv6, so the pair pins the reader
+  and neither half does it alone.
 - **The IPC rings' interleavings and UB are covered by nothing — except MPSC
   and Broadcast** (§6, §7).
   `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` — the one place

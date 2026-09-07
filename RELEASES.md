@@ -274,7 +274,11 @@ schedule table an operator applies with one command.
   is refused outright, pointing at `names`. `uc_service::SnapshotPolicy` and
   `ServiceConfig::snapshot_policy` are **removed** with coordinated snapshot
   instants: `start_with_snapshots()` is now the whole opt-in, and the trigger
-  is the log rather than a per-service byte counter. This is a real breaking change
+  is the log rather than a per-service byte counter. On the operator side, two
+  `node.toml` keys **move** in the same change: a top-level `admission_bytes`
+  and a `[services] fsm_lag` are startup refusals by name, pointing at
+  `[settings]` (which seeds genesis only) and at `uc2ctl settings apply`.
+  This is a real breaking change
   under [the semver policy](docs/reference/semver-policy.md); the
   maintainer's decision (spec §10) is to ship it as the next minor rather
   than a major, on the project having no external users yet to break — see

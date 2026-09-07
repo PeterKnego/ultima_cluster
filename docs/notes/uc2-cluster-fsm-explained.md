@@ -107,6 +107,57 @@ installs it **before** its purge floor advances — before it can serve a read o
 win an election — so it holds the cluster's membership, table and settings
 before it can act on any of them.
 
+## What Aeron already does, and why UC did not have it
+
+This shape is not invented here. Aeron Cluster snapshots node state and
+service state **at one log position, as sibling recordings in one
+recording-log entry** — checked in the Java source
+(`aeron-cluster/src/main/java/io/aeron/cluster/`, the lines the spec's §2
+cites):
+
+- `ConsensusModuleAgent.takeSnapshot(timestamp, logPosition, serviceAcks)`
+  (`ConsensusModuleAgent.java:3153`) records the consensus module's **own**
+  snapshot and every service's, all at the same `logPosition`, each appended
+  to the recording log under a `serviceId` — the consensus module's own entry
+  uses `ConsensusModule.Configuration.SERVICE_ID = Aeron.NULL_VALUE`
+  (`ConsensusModule.java:450`). That is the same idea as UC's reserved
+  `service_id = 255`.
+- `snapshotState(publication, logPosition, leadershipTermId)`
+  (`ConsensusModuleAgent.java:3221`) brackets the module's state with
+  `markBegin`/`markEnd` **stamped with `logPosition`**, and writes the
+  sessions, `timerService.snapshot(snapshotTaker)` — the whole timer set —
+  and the pending service-message trackers between them.
+- The instant is a **log entry**, not a side channel: the leader calls
+  `appendAction(ClusterAction.SNAPSHOT, timestamp, flags)`
+  (`ConsensusModuleAgent.java:2566`), every node replays it at the same
+  position (`:1581`), and each service sees it through
+  `ClusteredServiceAgent.onServiceAction` (`:1063`).
+- A node that needs a snapshot **replicates the recording**
+  (`SnapshotReplication.java:67`, `MultipleRecordingReplication`) — an
+  archive-to-archive copy of an immutable artifact, never a live read.
+
+So there is no ship-time gate in Aeron because there is nothing live to gate.
+"What was in force at P" is answered by the artifact.
+
+UC took the other path for one structural reason: **its snapshot artifacts are
+entirely the service's bytes.** UC ships no store and prescribes no encoding,
+so there was never a node-owned artifact to put node state in. When the
+schedule table needed to reach a below-floor joiner there was nowhere
+structural to put it, so it got a side channel carrying live state, which
+needed a freshness gate, which reached for the one counter that is zeroed at
+boot. Membership had carried the same way since M6, with no gate at all.
+
+The answer is *not* a node artifact — that was this design's first draft, and
+it was wrong. Under the line above there is **no node data to snapshot**.
+Everything the draft wanted to put in one is cluster data, and cluster data
+already has a mechanism. So: one more FSM, internal, and one command that
+makes every FSM freeze together. What UC gets that Aeron had to build
+separately is every mechanism the user FSMs already have — journal replay
+after a restart, snapshot-plus-tail-replay for a below-floor joiner, the
+hard-crash reconstruction path, `Timed<S>` if the cluster FSM ever schedules,
+the lincheck oracle. Three hand-written `StableValue`-plus-`prev` chains
+became one `SnapshotStateMachine` impl.
+
 ## Membership: one frame, two readers, and why that is safe
 
 The one place this is genuinely subtle. Raft's single-server-change safety
@@ -189,11 +240,20 @@ Everything below is gone from the tree, not deprecated:
 | `ScheduleShip` / `shippable_schedule` / the commit gate | the artifact is committed by construction, through apply's own gate |
 | the follower's timer heap, `rearm_timers`, `uc2_timers_rearmed_total` | the leader-only heap and the rising-edge re-announce |
 | `uc2_snapshot_table_stray_total` | there is no side-channel datagram left to be stray |
+| `SnapshotPolicy` / `ServiceConfig::snapshot_policy` (the per-service byte cadence) | the commanded instant, and the replicated `snapshot.interval_bytes` for a cadence |
+| both per-writer `retain_newest(2)` pruners | node-owned, delete-only retention — only the node can see a *set* |
+| the artifact's **bridging trigger** (`maybe_build_snapshot`) | the `SNAPSHOT` frame: one position, commanded |
 
 `state/config.state` **stays**, and that is the one thing on this list that
 looks like it should have gone. It is the kernel's durable-time shadow, and
 §4.6 above is the reason: it answers a different question, at a different time
-base, for a reader Raft does not allow to wait for commit.
+base, for a reader Raft does not allow to wait for commit. `uc_sim`'s **inv12**
+is what relates the two.
+
+None of this is deprecation: the names are gone from the tree, and
+`uc_node/tests/retired.rs` fails the build if any of them comes back — a
+`git grep`, deliberately, so a re-introduction in a comment, a script or a doc
+is caught as well as one in code.
 
 ## Instants: one position, one set
 
@@ -370,4 +430,4 @@ path the spec left to a phase 2.
 - [`uc2ctl` § `snapshot`](../reference/uc2ctl.md#snapshot) — the three verbs
   and their refusals.
 - [Monitor a cluster § The snapshot families](../how-to/monitor-a-cluster.md#the-snapshot-families-211-pending)
-  — the seven series, the two alerts, and the records.
+  — the eight families, the three alerts, and the records.

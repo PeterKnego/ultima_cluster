@@ -23,11 +23,20 @@ FSM, and coordinated snapshot instants — one flag day. The workspace version
 is **bumped in-tree to `2.11.0`**, but `v2.10.0` is still the newest TAG and
 the newest crates.io version, so "what is released" is 2.10.0 until the tag
 exists. The release was **STOPPED again on 2026-09-05** by the maintainer, for
-the cluster-FSM and coordinated-snapshot work: plan 1 (the cluster FSM) is
-merged to local `main`; plan 2 (coordinated and standby snapshot instants,
-spec §5) is DONE on the `uc2+coordinated-snapshot-plan2` worktree branch and
-NOT merged; plan 3 (retirement and proof) is WRITTEN but not executed. **Both 2.11.0 gate
-docs are still 0-of-9 rows run**, and
+the cluster-FSM and coordinated-snapshot work; all three plans of that spec are
+now implemented (plan 1 the cluster FSM, plan 2 coordinated and standby
+snapshot instants, plan 3 retirement and proof). **The code is done; the
+release is blocked on three bodies of fleet gate rows**, none of which has
+run: (1) the **time-and-timers rows** a/b/c/e
+(`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md`); (2) the
+**apply-hop A/B row d** in the same doc, whose missing runner
+`scripts/apply_ab.sh` now exists; and (3) the **plan-2 rows f/g/h**, also in
+that doc — the three coordinated-snapshot rows (instants under load, a
+below-floor join with the shipper restarted mid-window, freeze duration vs.
+commit stall all-nodes then `--standby`), of which row f has a dev-box SMOKE
+reading only, which is not a gate. Plus the **FSM-identity gate**
+(`docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md`, rows a/b/e/j), also
+unrun. Every bar is pre-committed and every result row still reads "not run".
 `docs/how-to/cut-a-release.md` §1's writeup de-scaffolding is deliberately
 left until those results are in, because the release-evidence table needs
 them. See "Next up" below.)**
@@ -79,15 +88,19 @@ one internal state machine applied at commit by a fifth agent, with its own
 snapshot artifact on the session; `SNAP_TABLE` is retired,
 `FRAME_TYPE_SCHEDULE_TABLE` is retired, and `SnapBeginBody.config` is retired; the timer heap goes leader-only.
 **Plan 2** (`docs/superpowers/plans/2026-09-06-uc2-coordinated-snapshot-plan2.md`,
-T0–T11) is **DONE on the `uc2+coordinated-snapshot-plan2` worktree branch**,
-NOT merged: §5's coordinated snapshot instants (a `SNAPSHOT` frame at whose
+T0–T11) is **DONE**: §5's coordinated snapshot instants (a `SNAPSHOT` frame at whose
 frame-end position every row and the cluster FSM freeze together) and §5.7's
-standby instants plus the fetch/redirect return path. **Plan 3 (retirement
-and proof) is not written.** Details in the "Standing facts" entry below;
+standby instants plus the fetch/redirect return path.
+**Plan 3** (`.superpowers/sdd/2026-09-06-uc2-cluster-fsm-plan3-retirement-and-proof/`,
+retirement and proof) is **DONE** too: every §7 symbol deleted and pinned by
+`uc_node/tests/retired.rs`, the cluster image codec moved to a fuzzed
+`core`-only leaf (`uc_protocol::v2::cluster_image`), the apply-hop A/B runner
+`scripts/apply_ab.sh` with gate rows d/f/g/h, and this record.
+Details in the "Standing facts" entry below;
 explainer `docs/notes/uc2-cluster-fsm-explained.md` (§ Instants is plan 2);
-no gate doc for either, deliberately — but coordinated snapshots owe three
-rows to the time-and-timers gate's throughput arm when it runs (see the
-release-evidence table in `docs/releases.md`).
+no gate doc for either, deliberately — the three rows coordinated snapshots
+owed now exist as rows **f/g/h** of the time-and-timers gate, pre-committed
+and unrun (see the release-evidence table in `docs/releases.md`).
 
 Already on `main` and in the same flag day: **FSM identity**
 (`docs/BACKLOG.md` § Shipped, taken up 2026-09-01;
@@ -188,9 +201,9 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   **Five features, one flag day** (FSM identity, log time and timers plan 1,
   the replicated schedule table, the cluster FSM, and coordinated snapshot
   instants): wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`. The first three
-  are on `origin/main` (pushed 2026-09-04); the cluster FSM is on local
-  `main` (unpushed); coordinated snapshots are on the
-  `uc2+coordinated-snapshot-plan2` worktree branch.
+  are on `origin/main` (pushed 2026-09-04); the cluster FSM and coordinated
+  snapshots are on local `main` (unpushed); the plan-3 retirement-and-proof
+  pass is on the `uc2+cluster-fsm-plan3` worktree branch.
   - **FSM identity.** `SNAP_BEGIN` carries per-row identity hashes +
     versions, compared positionally, refused by name (replaces the
     `services_declared` bitmask); cnc slot line 7 = row name + hash,
@@ -463,7 +476,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   proofs + conformance, loom (log-buffer frame visibility, the MPSC ring's
   per-record commit, and the Broadcast ring's seqlock read barrier — the last
   found and fixed a real weak-memory defect when it was written, 2026-08-31),
-  15 fuzz targets (22 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
+  15 fuzz targets (23 on the `2.11.0` branch), Miri (pure decoders + `uc_remote`'s
   Vec-backed SPSC internals; the mmap'd IPC rings are out of Miri's reach).
 - **`cargo fmt` is ENFORCED** since 2026-08-31: `cargo fmt --all -- --check`
   is the first step of `ci.yml`'s `test` job, so workspace drift is zero and
