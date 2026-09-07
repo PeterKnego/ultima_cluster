@@ -107,6 +107,19 @@ fn instant_until_complete(
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
             if node.snapshot_set_position() >= p {
+                // Plan 2 T10, controller ruling: Ruling P10 (a replayed span
+                // ACTS on its last `SNAPSHOT` frame) removed the reason a
+                // first attempt could be abandoned here, so the retry above is
+                // belt-and-braces and reaching attempt 2 is a REGRESSION, not
+                // a tolerated outcome. The loop stays — production cadence
+                // supersedes the same way, and a fixture that silently gave up
+                // would be worse — but a second attempt fails the test loudly.
+                assert_eq!(
+                    attempt, 1,
+                    "instant {p} completed only on attempt {attempt}: an earlier instant was \
+                     abandoned (spec §10), which Ruling P10 should have made unreachable on \
+                     this fixture — see the diagnostic above"
+                );
                 return p;
             }
             std::thread::yield_now();
@@ -222,6 +235,11 @@ struct NodeH {
     instance_dir: PathBuf,
     seed: u64,
     is_learner: bool,
+    /// The declared FSM set this node booted with, kept so [`NodeH::restart`]
+    /// reproduces it. Plan 2 T10: the standby/fetch fixtures declare a REAL
+    /// row (and attach a real service to it), where every pre-plan-2 test in
+    /// this file declares nothing.
+    services: uc_node::ServicesConfig,
     node: Option<Node>,
 }
 
@@ -284,6 +302,7 @@ impl NodeH {
             self.instance_dir.clone(),
             self.seed,
             self.addr,
+            self.services,
         );
         self.node = Some(Node::start_with_socket(cfg, sock).expect("restart"));
     }
@@ -307,6 +326,7 @@ fn make_config(
     instance_dir: PathBuf,
     seed: u64,
     addr: SocketAddr,
+    services: uc_node::ServicesConfig,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -326,7 +346,7 @@ fn make_config(
         purge: uc_node::PurgePolicy::Disabled,
         journal_segment_bytes: uc_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
         crypto: uc_node::CryptoConfig::Disabled,
-        services: uc_node::ServicesConfig::none_for_tests(),
+        services,
     }
 }
 
@@ -341,9 +361,23 @@ struct Cluster {
     nodes: Vec<NodeH>,
 }
 
+/// [`spawn_cluster_with_learner_services`] with nothing declared — the
+/// pre-plan-2 posture every quorum-shape test in this file uses.
+fn spawn_cluster_with_learner(n_voters: usize, n_learners: usize) -> Cluster {
+    spawn_cluster_with_learner_services(
+        n_voters,
+        n_learners,
+        uc_node::ServicesConfig::none_for_tests(),
+    )
+}
+
 /// Bind `n_voters` voter sockets + `n_learners` learner sockets, then start each
 /// node with the full (members, learners) maps. Learner ids are `n_voters..`.
-fn spawn_cluster_with_learner(n_voters: usize, n_learners: usize) -> Cluster {
+fn spawn_cluster_with_learner_services(
+    n_voters: usize,
+    n_learners: usize,
+    services: uc_node::ServicesConfig,
+) -> Cluster {
     let dir = tempfile::Builder::new()
         .prefix("uc2-learner-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -374,6 +408,7 @@ fn spawn_cluster_with_learner(n_voters: usize, n_learners: usize) -> Cluster {
             instance_dir.clone(),
             seed,
             addr,
+            services,
         );
         let node = Node::start_with_socket(cfg, sock).expect("start");
         nodes.push(NodeH {
@@ -382,6 +417,7 @@ fn spawn_cluster_with_learner(n_voters: usize, n_learners: usize) -> Cluster {
             instance_dir,
             seed,
             is_learner,
+            services,
             node: Some(node),
         });
     }
@@ -2381,4 +2417,593 @@ fn a_joiner_served_by_a_leader_restarted_before_its_first_commit_advance_still_i
     }
 
     f.stop();
+}
+
+// ---------------------------------------- standby instants (plan 2, spec §5.7)
+
+/// `uc2ctl snapshot --standby`, in process: only LEARNERS freeze (spec §5.7
+/// item 1). Same `retry` polling as [`command_instant`].
+fn command_standby_instant(node: &Node) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match node.command_snapshot(true) {
+            Ok(p) => return p,
+            Err(uc_node::SnapshotRefusal::Retry) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("uc2ctl snapshot --standby refused: {e}"),
+        }
+    }
+}
+
+/// A 3-voter + 1-learner cluster with ONE declared row (`SumSm`, "sum") and a
+/// REAL snapshot-capable service attached on every node — voters included.
+///
+/// Real services, not `instant_with_faked_rows`' stand-ins: the property both
+/// standby tests turn on is that a voter's apply loop does NOT freeze while a
+/// learner's does, and a row with no service attached cannot freeze either way.
+struct StandbyCluster {
+    c: Cluster,
+    leader: usize,
+    learner: usize,
+    svcs: Vec<Option<uc_service::Service<SumSm>>>,
+    cncs: Vec<std::sync::Arc<CncPage>>,
+}
+
+impl StandbyCluster {
+    fn node(&self, i: usize) -> &Node {
+        self.c.nodes[i].n()
+    }
+    /// The voter indices, leader first.
+    fn voters(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..3).collect();
+        v.sort_by_key(|&i| i != self.leader);
+        v
+    }
+    fn stop(mut self) {
+        for s in self.svcs.iter_mut() {
+            if let Some(s) = s.take() {
+                s.stop();
+            }
+        }
+        for h in self.c.nodes.iter_mut() {
+            h.stop();
+        }
+    }
+}
+
+const STANDBY_APP: &str = "learner";
+
+fn standby_cluster() -> StandbyCluster {
+    let c = spawn_cluster_with_learner_services(
+        3,
+        1,
+        uc_node::ServicesConfig::single(<SumSm as uc_service::RawStateMachine>::NAME),
+    );
+    let svcs: Vec<Option<uc_service::Service<SumSm>>> = c
+        .nodes
+        .iter()
+        .map(|h| Some(start_sum_service(&h.instance_dir, STANDBY_APP)))
+        .collect();
+    let cncs: Vec<std::sync::Arc<CncPage>> = c
+        .nodes
+        .iter()
+        .map(|h| {
+            CncPage::open_file(&h.instance_dir.join("cnc2.dat"), STANDBY_APP).expect("open cnc")
+        })
+        .collect();
+    let leader = await_single_leader(&c.nodes, 30);
+    // The capability bit is what makes an instant commandable at all (spec
+    // §5.5 refuses `48` without it), and it is published by the service's
+    // attach — so wait for the ATTACH, not for a timer.
+    await_until(
+        30,
+        "every row published the snapshot-capability bit",
+        || {
+            cncs.iter().all(|p| {
+                p.service_slot(0).status.load_acquire() & CNC_SVC_STATUS_SNAPSHOT_CAPABLE != 0
+            })
+        },
+    );
+    StandbyCluster {
+        c,
+        leader,
+        learner: 3,
+        svcs,
+        cncs,
+    }
+}
+
+/// Spec §5.7 items 1-3: a `--standby` instant is a real instant that only the
+/// LEARNER pays for.
+///
+/// The three halves, in the order the spec states them:
+///
+/// * the learner's set at **P** completes — its row froze at P and the
+///   `uc2-cluster` row did too, so `snapshot_set_position == P`;
+/// * every VOTER's row `snapshot_pos` is still `0` and its own set position is
+///   still `0` (§5.7 item 3: "a voter has no set at P and its floor does not
+///   move — yet"), and no voter row ever published a freeze duration; and
+/// * every voter's `applied` keeps MOVING across the instant, past P, under
+///   continued load. This is the point of the flag: an all-nodes instant caps
+///   every voter's durable report at `P + fsm_lag` for the length of its
+///   freeze (§5.7's commit-stall argument), and a standby instant must not.
+///
+/// The cheap red twin for the middle half is to assert a voter's
+/// `snapshot_pos == p` instead of `0`: that is exactly what a build that
+/// ignored `FLAG_SNAPSHOT_STANDBY` (or read the learner bit from the wrong
+/// word) would produce, and it fails on all three voters.
+#[test]
+fn a_standby_instant_freezes_only_the_learner_and_voters_applied_keep_moving() {
+    let _g = serialize();
+    let f = standby_cluster();
+
+    submit_n(&f.c.nodes[f.leader], 0, 800);
+    await_until(30, "every node applied the pre-instant load", || {
+        let commit = f.c.nodes[f.leader].commit();
+        commit > 0
+            && f.cncs
+                .iter()
+                .all(|p| p.service_slot(0).applied.load_acquire() >= commit)
+    });
+    let applied_before: Vec<u64> = f
+        .cncs
+        .iter()
+        .map(|p| p.service_slot(0).applied.load_acquire())
+        .collect();
+
+    let p = command_standby_instant(f.node(f.leader));
+
+    // Half 1: the learner, and only the learner, builds the set.
+    await_until(60, "the learner completed the standby set", || {
+        f.node(f.learner).snapshot_set_position() >= p
+    });
+    assert_eq!(
+        f.node(f.learner).snapshot_set_position(),
+        p,
+        "the learner's completed set must be AT the standby instant"
+    );
+    assert_eq!(
+        f.cncs[f.learner]
+            .service_slot(0)
+            .snapshot_pos
+            .load_acquire(),
+        p,
+        "the learner's row froze at the standby instant"
+    );
+    assert_eq!(
+        f.node(f.learner).cluster_snapshot_position(),
+        p,
+        "the learner's uc2-cluster row froze at the standby instant"
+    );
+
+    // Half 3: the voters keep applying, past P, under fresh load.
+    submit_n(&f.c.nodes[f.leader], 800, 800);
+    for &v in &f.voters() {
+        await_until(
+            30,
+            "a voter's applied advanced past the standby instant",
+            || f.cncs[v].service_slot(0).applied.load_acquire() > p.max(applied_before[v]),
+        );
+    }
+
+    // Half 2: no voter froze — checked AFTER the load above, so this is not a
+    // race the voters simply had not lost yet.
+    for &v in &f.voters() {
+        assert_eq!(
+            f.cncs[v].service_slot(0).snapshot_pos.load_acquire(),
+            0,
+            "voter {v} froze for a STANDBY instant at {p} — the flag was ignored"
+        );
+        assert_eq!(
+            f.node(v).snapshot_set_position(),
+            0,
+            "voter {v} completed a set at a standby instant; §5.7 item 3 says its floor \
+             does not move until it FETCHES"
+        );
+        assert_eq!(
+            f.cncs[v].service_slot(0).identity.freeze_ns(),
+            0,
+            "voter {v} recorded a freeze duration — it ran freeze() for a standby instant"
+        );
+        assert_eq!(
+            f.node(v).snapshot_instants_abandoned(),
+            0,
+            "voter {v} abandoned an instant; only one was commanded and it was never superseded"
+        );
+    }
+    // And the leader's own view of it: it commanded the instant, but holds no
+    // set at it.
+    assert_eq!(f.node(f.leader).snapshot_instant_position(), p);
+
+    f.stop();
+}
+
+/// Spec §5.7 items 4-5: a voter pulls a learner's complete set **store-only**
+/// (`Node::request_fetch`, the in-process twin of `uc2ctl snapshot fetch
+/// --from <learner-id>`), and that pull — not the learner's freeze — is what
+/// moves the voter's floor.
+///
+/// Four claims:
+///
+/// 1. **Refused above the log.** `request_fetch(learner, Some(durable + 4096))`
+///    is `FetchRefusal::AboveDurable` (wire reason 50). Run FIRST, because
+///    `start_fetch` answers `Retry` while another fetch is pending and the
+///    positive case below leaves one.
+/// 2. **The artifacts land, whole.** Every declared row's artifact AND the
+///    cluster artifact appear under the voter's own instance dir, named at the
+///    learner's P.
+/// 3. **Store-only: nothing is installed.** The voter's FSM `applied` never
+///    rewinds — sampled on every iteration of the wait, not just before and
+///    after, so an install-then-replay would have to hide inside a single
+///    sample to escape.
+/// 4. **The floor moves.** `snapshot_set_position == P` (through the
+///    completeness poll, `source = "fetch"`), and after the 100 ms persist
+///    throttle the cnc `node_snapshot_floor` reads P too.
+///
+/// Not driven through `uc2ctl`: `uc_ctl` is a bin-only crate, so the CLI's own
+/// bin test owns the verb parse and this owns the behaviour.
+#[test]
+fn a_voter_fetches_a_learners_set_store_only_and_its_floor_moves() {
+    let _g = serialize();
+    let f = standby_cluster();
+    let learner_id = f.c.learners[0].0;
+
+    submit_n(&f.c.nodes[f.leader], 0, 800);
+    await_until(30, "every node applied the pre-instant load", || {
+        let commit = f.c.nodes[f.leader].commit();
+        commit > 0
+            && f.cncs
+                .iter()
+                .all(|p| p.service_slot(0).applied.load_acquire() >= commit)
+    });
+    let p = command_standby_instant(f.node(f.leader));
+    await_until(60, "the learner completed the standby set", || {
+        f.node(f.learner).snapshot_set_position() >= p
+    });
+    // …and PERSISTED it as its floor. `position: None` is "the learner's
+    // newest complete set", which the serving side reads off its own
+    // `node_snapshot_floor` — a word the consensus agent writes on the 100 ms
+    // persist throttle. Fetching before it moves is answered `floor 0`
+    // (observed: `snapshot_session_declined reason="floor 0"`), and since a
+    // pending fetch blocks the next request for the 60 s intake timeout, the
+    // wait belongs HERE rather than in a retry loop around the verb.
+    await_until(
+        30,
+        "the learner persisted the standby set as its floor",
+        || {
+            f.cncs[f.learner]
+                .snapshots()
+                .node_snapshot_floor
+                .load_acquire()
+                == p
+        },
+    );
+
+    // The fetching VOTER: a follower, not the leader — the verb is node-local
+    // and is never forwarded, so a follower answering it is the honest shape.
+    let v = *f
+        .voters()
+        .iter()
+        .find(|&&i| i != f.leader)
+        .expect("a follower voter");
+    let v_node = f.node(v);
+    let v_dir = f.c.nodes[v].instance_dir.clone();
+    await_until(30, "the fetching voter's log reached the instant", || {
+        v_node.counters().durable.load_acquire() >= p
+    });
+    assert_eq!(
+        v_node.snapshot_set_position(),
+        0,
+        "the fetching voter must hold no set before the fetch"
+    );
+
+    // Claim 1: the named refusal, before anything is pending.
+    let above = v_node.counters().durable.load_acquire() + 4096;
+    assert_eq!(
+        v_node.request_fetch(learner_id, Some(above)),
+        Err(uc_node::FetchRefusal::AboveDurable),
+        "a fetch above this node's own durable frontier is refused by name (reason 50)"
+    );
+
+    // Claim 3's baseline, and the pull itself. `None` = the learner's NEWEST
+    // complete set, which is the one at `p`.
+    let applied_before = f.cncs[v].service_slot(0).applied.load_acquire();
+    v_node
+        .request_fetch(learner_id, None)
+        .expect("the fetch was accepted");
+    let mut applied_high = applied_before;
+    await_until(60, "the fetched set completed on the voter", || {
+        let applied = f.cncs[v].service_slot(0).applied.load_acquire();
+        assert!(
+            applied >= applied_high,
+            "the voter's FSM REWOUND from {applied_high} to {applied} — a store-only fetch \
+             must never install anything"
+        );
+        applied_high = applied;
+        v_node.snapshot_set_position() >= p
+    });
+    assert_eq!(
+        v_node.snapshot_set_position(),
+        p,
+        "the fetched set is the learner's set at the standby instant"
+    );
+    assert_eq!(
+        v_node.snapshot_fetched_position(),
+        p,
+        "and the node records it as FETCHED, not locally built"
+    );
+
+    // Claim 2: the artifacts, by name, in the voter's own dirs.
+    let row = v_dir
+        .join("snapshots")
+        .join("0")
+        .join(format!("snap-{p}.ultsnap"));
+    assert!(
+        row.is_file(),
+        "the fetched row-0 artifact is missing at {}",
+        row.display()
+    );
+    let cluster =
+        uc_node::cluster_agent::snapshot_dir_of(&v_dir).join(format!("snap-{p}.ultcluster"));
+    assert!(
+        cluster.is_file(),
+        "the fetched CLUSTER artifact is missing at {} — a set without it is not a set",
+        cluster.display()
+    );
+
+    // Claim 4: the floor. Persisted on the consensus agent's 100 ms throttle,
+    // so poll rather than reading once.
+    await_until(30, "the voter persisted the fetched floor", || {
+        f.cncs[v].snapshots().node_snapshot_floor.load_acquire() == p
+    });
+    // Claim 3, stated as the outcome rather than the sample: the voter's FSM
+    // is still ahead of where it was, never behind.
+    assert!(
+        f.cncs[v].service_slot(0).applied.load_acquire() >= applied_before,
+        "store-only: the voter's FSM must not have been rewound by the fetch"
+    );
+    assert_eq!(
+        v_node.snapshot_session_refusals(),
+        (0, 0, 0, 0, 0),
+        "a fetch between matched nodes must trip no session refusal"
+    );
+
+    f.stop();
+}
+
+/// Spec §5.7 item 6: a joiner below the voters' floor is **redirected** to the
+/// learner that holds a set, and converges there.
+///
+/// **How the MISSING case is constructed honestly.** With node-owned retention
+/// (Ruling P1) the leader's own set AT ITS FLOOR always exists, so
+/// `SNAP_REDIRECT` fires only when those artifacts are ABSENT. The fixture
+/// stages exactly that, in the order an operator could reach it:
+///
+/// 1. a plain instant `P0` — every row on every node freezes, the voter's floor
+///    moves to `P0` and it purges below it;
+/// 2. a `--standby` instant `P1` — only the learner freezes, so the voter's
+///    floor stays at `P0` while the learner holds a newer set;
+/// 3. the voter's `snapshots/*/snap-<P0>.*` files are **deleted**. This is a
+///    node RESTORED FROM A BACKUP TAKEN BEFORE `P0` (`uc2ctl backup restore`
+///    lays down the journal and the artifacts it had at backup time): the cnc
+///    page and the persisted floor say `P0`, and the artifacts that floor names
+///    are not on disk;
+/// 4. a fresh learner joins from 0, below the purged prefix.
+///
+/// The leader then cannot serve the below-floor NAK from its own set
+/// (`SNAP_DECLINE_MISSING`), answers `SNAP_REDIRECT` naming the learner and
+/// `P1`, and the joiner's `SNAP_REQUEST` to the learner installs the set at
+/// `P1`.
+///
+/// **What is asserted, and why not `snapshot_redirected`.** The controller's
+/// brief names a leader-side `snapshot_redirected` obs record; the tree has
+/// none — the redirect is sent inside `uc_net`'s sender, which carries no
+/// logging dependency, and its only leader-side witness is
+/// `SenderStats::snap_redirects`. So this asserts that counter on the LEADER
+/// and the `snapshot_redirect_followed` record on the JOINER (the receiving
+/// half, which does live in `uc_node`), which together pin both ends of the
+/// same datagram.
+#[test]
+fn a_joiner_below_the_voters_floor_is_redirected_to_the_learner() {
+    let _g = serialize();
+    let buf = uc_node::obs::log::capture_for_tests();
+    let _cap = CaptureGuard;
+
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-redirect-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    let app = "learner-redirect";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let s_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let j_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let s_addr = s_sock.local_addr().unwrap();
+    let j_addr = j_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    // BOTH learners are in the genesis membership: `command_snapshot(standby)`
+    // addresses `config().learners.first()`, so the standby holder must be
+    // id 1 and the joiner id 2 for the redirect to name the node that has the
+    // set. The joiner's node is not started until step 4.
+    let learners = vec![(1u32, s_addr), (2u32, j_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        buffer_bytes: 1 << 18, // small ring: the joiner's NAK from 0 falls below it
+        max_payload: 256,
+        admission_bytes_default: 256 * 1024,
+        settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+        crypto: uc_node::CryptoConfig::Disabled,
+        services: uc_node::ServicesConfig::single(<SumSm as uc_service::RawStateMachine>::NAME),
+    };
+
+    let v_dir = dir.path().join("v0");
+    let s_dir = dir.path().join("l1");
+    let voter =
+        Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    let standby =
+        Node::start_with_socket(cfg(1, s_addr, s_dir.clone()), s_sock).expect("start standby");
+    let _v_svc = start_sum_service(&v_dir, app);
+    let _s_svc = start_sum_service(&s_dir, app);
+    await_until(30, "voter serves", || voter.can_serve());
+    let v_cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    let s_cnc = CncPage::open_file(&s_dir.join("cnc2.dat"), app).expect("open standby cnc");
+    await_until(30, "both rows snapshot-capable", || {
+        [&v_cnc, &s_cnc]
+            .iter()
+            .all(|p| p.service_slot(0).status.load_acquire() & CNC_SVC_STATUS_SNAPSHOT_CAPABLE != 0)
+    });
+
+    // 1. the plain instant, in the MIDDLE of the churn so a retained tail
+    //    survives the purge.
+    submit_frames(&voter, 12000);
+    let p0 = instant_until_complete(&voter, &v_cnc, &[0], |_| {});
+    submit_frames(&voter, 12000);
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+    assert!(p0 > SEG, "need >1 segment below the floor (p0={p0})");
+    await_until(30, "voter purged its prefix", || {
+        voter.archive_first_base() > 0
+    });
+    await_until(30, "the voter persisted the floor at p0", || {
+        v_cnc.snapshots().node_snapshot_floor.load_acquire() == p0
+    });
+
+    // 2. the standby instant: only the learner freezes.
+    await_until(30, "the standby learner caught up", || {
+        standby.counters().durable.load_acquire() >= voter.counters().append.load_acquire()
+    });
+    let p1 = command_standby_instant(&voter);
+    await_until(60, "the standby learner completed its set", || {
+        standby.snapshot_set_position() >= p1
+    });
+    assert_eq!(standby.snapshot_set_position(), p1);
+    assert_eq!(
+        voter.snapshot_set_position(),
+        p0,
+        "the voter must NOT have frozen for the standby instant"
+    );
+
+    // 3. the restore-from-an-older-backup shape: the artifacts the voter's own
+    //    floor names are gone. Deleted while the voter is live, so this also
+    //    says what happens if retention or an open sender fd raced the unlink
+    //    — nothing did, in every run: the files are unlinked on the first try
+    //    and no session is in flight (the only peer is caught up).
+    let mut removed = 0;
+    for f in [
+        v_dir
+            .join("snapshots")
+            .join("0")
+            .join(format!("snap-{p0}.ultsnap")),
+        uc_node::cluster_agent::snapshot_dir_of(&v_dir).join(format!("snap-{p0}.ultcluster")),
+    ] {
+        assert!(
+            f.is_file(),
+            "expected the voter's set at {p0}: {}",
+            f.display()
+        );
+        std::fs::remove_file(&f).unwrap_or_else(|e| panic!("remove {}: {e}", f.display()));
+        removed += 1;
+    }
+    assert_eq!(
+        removed, 2,
+        "both members of the voter's set at p0 were removed"
+    );
+    assert_eq!(
+        v_cnc.snapshots().node_snapshot_floor.load_acquire(),
+        p0,
+        "the voter's floor still NAMES p0 — that is what makes the ship gate decline MISSING"
+    );
+
+    // 4. the joiner, from nothing.
+    let redirects_before = voter
+        .observability()
+        .sender
+        .snap_redirects
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let j_dir = dir.path().join("l2");
+    let joiner =
+        Node::start_with_socket(cfg(2, j_addr, j_dir.clone()), j_sock).expect("start joiner");
+    let _j_svc = start_sum_service(&j_dir, app);
+    let frontier = voter.counters().append.load_acquire();
+    await_until(60, "the joiner converged through the redirect", || {
+        joiner.counters().durable.load_acquire() >= frontier
+    });
+
+    // The leader could not serve, and said so by redirecting.
+    assert!(
+        voter
+            .observability()
+            .sender
+            .snap_redirects
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > redirects_before,
+        "the leader never sent a SNAP_REDIRECT — its below-floor NAK was served from \
+         somewhere, so the MISSING case was not staged"
+    );
+    // The joiner followed it, to the learner, at p1 — and installed there.
+    await_until(
+        30,
+        "the joiner recorded the redirect and the install",
+        || {
+            let captured = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+            captured.contains("snapshot_redirect_followed")
+                && captured.contains("snapshot_installed")
+        },
+    );
+    let followed = last_obs_record(&buf, "snapshot_redirect_followed");
+    assert!(
+        followed.contains("\"node\":2") && followed.contains("\"from\":1"),
+        "the joiner must have been redirected to the STANDBY learner: {followed}"
+    );
+    assert!(
+        followed.contains(&format!("\"position\":{p1}")),
+        "the redirect must name the standby instant p1={p1}: {followed}"
+    );
+    let installed = last_obs_record(&buf, "snapshot_installed");
+    assert!(
+        installed.contains("\"node\":2") && installed.contains(&format!("\"pos\":{p1}")),
+        "the joiner must have installed the learner's set at p1={p1}: {installed}"
+    );
+    assert!(
+        joiner.archive_first_base() >= p1,
+        "the joiner must have adopted the shipped floor at {p1}, not replayed from 0 \
+         (first_base={})",
+        joiner.archive_first_base()
+    );
+    assert_eq!(
+        joiner.snapshot_session_refusals(),
+        (0, 0, 0, 0, 0),
+        "a redirected session between matched nodes must trip no refusal"
+    );
+    assert!(
+        standby
+            .observability()
+            .sender
+            .snap_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "the LEARNER must have opened the session that served the joiner"
+    );
+
+    joiner.stop();
+    standby.stop();
+    voter.stop();
 }

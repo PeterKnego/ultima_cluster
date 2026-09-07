@@ -731,6 +731,45 @@ impl<SM: SnapshotStateMachine + Default, SM1: SnapshotStateMachine + StateMachin
         }
     }
 
+    /// Coordinated-snapshot spec §5.5, the QUIESCENT twin of
+    /// [`command_instant`](Self::command_instant): command instants on the
+    /// serving leader until one COMPLETES on it — every declared row and the
+    /// `uc2-cluster` row frozen at the same P — and return that P.
+    ///
+    /// For the callers that need an artifact to EXIST before they go on (the
+    /// snapshot/purge preconditions), rather than the fault-loop callers that
+    /// only need instants to keep happening. Panics on the deadline: a cluster
+    /// nobody is faulting has no legitimate reason not to complete one.
+    pub fn instant_until_complete(&self, secs: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut commanded: Option<u64> = None;
+        loop {
+            match commanded {
+                None => commanded = self.command_instant(),
+                Some(p) => {
+                    if let Some(li) = self.leader()
+                        && let Some(n) = self.nodes[li].node.as_ref()
+                    {
+                        if n.snapshot_set_position() >= p {
+                            return p;
+                        }
+                        // A leader change would leave `p` an orphan on the new
+                        // leader, which never commanded it — drop it and ask
+                        // the node that is leading now.
+                        if n.snapshot_instant_position() < p {
+                            commanded = None;
+                        }
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no instant completed within {secs}s (commanded={commanded:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Index of the current serving leader, or `None` in a transient window
     /// (including while the M7 Task 10 spare — a real voting member once
     /// promoted — is the one serving; it has no `self.nodes` index, so
