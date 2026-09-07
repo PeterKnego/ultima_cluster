@@ -26,8 +26,8 @@ use uc_log::state::{
 use uc_net::TermHandle;
 use uc_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc_net::receiver::{
-    CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
-    RefusalKind,
+    CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, IntakeMode, NetEvent,
+    PeerIds, RefusalKind, SnapFetch,
 };
 use uc_net::sender::{
     CLUSTER_ARTIFACT_ID, CtrlMsg, Sender, SenderConfig, SenderCrypto, SnapArtifact, SnapshotSet,
@@ -703,6 +703,56 @@ struct SnapshotCmd {
 /// a timeout is an unbounded block on a thread that may have fail-stopped.
 const SNAPSHOT_CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Coordinated-snapshot spec §5.7 item 5: the in-process half of `uc2ctl
+/// snapshot fetch` — [`Node::request_fetch`]'s request. Same shape (and same
+/// reason for its own channel) as [`SnapshotCmd`].
+struct FetchCmd {
+    learner_id: NodeId,
+    /// `None` = the learner's newest complete set (wire: position 0).
+    position: Option<u64>,
+    reply: mpsc::SyncSender<Result<(), FetchRefusal>>,
+}
+
+/// Why a `snapshot fetch` was not started (spec §5.7 item 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchRefusal {
+    /// The named node is not a learner in the committed membership — or is
+    /// this node itself, which cannot fetch a set from itself.
+    NotALearner,
+    /// This node has no address for that member (it is not in the peer map),
+    /// so no request can be addressed to it.
+    UnknownPeer,
+    /// The consensus agent did not answer in time, or the receiver's fetch
+    /// route was momentarily full. Side-effect-free: re-run the verb.
+    Retry,
+}
+
+/// Coordinated-snapshot spec §5.7 item 5: one fetch this node has asked its
+/// receiver agent to run. Kept so a second request does not silently pile up
+/// behind the first, and so the operator's verb becomes re-runnable again
+/// once the fetch has either landed or plainly failed.
+#[derive(Debug, Clone, Copy)]
+struct PendingFetch {
+    learner: NodeId,
+    /// The position asked for; `0` = "the learner's newest", which is why the
+    /// completion test below is `stored_set_pos` MOVING rather than reaching
+    /// a particular value.
+    position: u64,
+    /// `stored_set_pos` as it was when the fetch was issued — a store-only
+    /// completion moves it, and that move is what "the fetch landed" means.
+    stored_before: u64,
+    /// Pass-clock nanoseconds after which this record is dropped.
+    deadline_ns: u64,
+}
+
+/// How long a `snapshot fetch` stays pending before this node forgets it.
+/// Comfortably past `uc_net`'s 60 s intake timeout, so a fetch that is simply
+/// slow is never forgotten while its transfer is still alive.
+const FETCH_TIMEOUT_NS: u64 = 120_000_000_000;
+
+/// How long [`Node::request_fetch`] waits for the consensus agent's answer.
+const FETCH_CMD_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Node {
     /// M10 (Task 4): this node's id, captured from `cfg.id` at boot — nothing
     /// else on `Node` retains it (the consensus SM has its own copy). Exposed
@@ -718,6 +768,9 @@ pub struct Node {
     /// its role — a command on a FOLLOWER has to be answered `retry`, not
     /// queued behind a leadership that may never come.
     snapshot_cmd_tx: mpsc::SyncSender<SnapshotCmd>,
+    /// Coordinated-snapshot spec §5.7 item 5: [`Node::request_fetch`]'s
+    /// request channel, the in-process twin of admin op 9.
+    fetch_cmd_tx: mpsc::SyncSender<FetchCmd>,
     /// Spec §5.3: the newest complete SET's position, published by the
     /// consensus agent's `check_set_completeness`.
     snapshot_set_position: Arc<AtomicU64>,
@@ -1282,6 +1335,8 @@ impl Node {
         // answered `retry`, which is what it would get from the single-in-
         // flight gate anyway.
         let (snapshot_cmd_tx, snapshot_cmd_rx) = mpsc::sync_channel::<SnapshotCmd>(1);
+        // Spec §5.7 item 5: `Node::request_fetch`'s, on the same terms.
+        let (fetch_cmd_tx, fetch_cmd_rx) = mpsc::sync_channel::<FetchCmd>(1);
         // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
         // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
         // around a DATA datagram to detect a prime that straddled its processing and
@@ -1298,20 +1353,61 @@ impl Node {
         // reported, so the node names a decline in a log line ONCE per distinct
         // reason instead of once per NAK (a below-floor peer re-NAKs on a timer).
         // `uc_net` has no logging dependency, so the naming lives here.
-        let src_decline_reason = AtomicU8::new(SNAP_DECLINE_NONE);
+        // An `Arc` since plan 2 Task 6: the redirect hint below reads the same
+        // word, so it can tell "my set at my floor is MISSING" (the case a
+        // redirect answers) from every other decline.
+        let src_decline_reason = Arc::new(AtomicU8::new(SNAP_DECLINE_NONE));
         // Spec §5.6: the CLUSTER ARTIFACT the set carries under id 255 — the
         // one at this node's floor, like every other member of the set.
         let src_cluster_dir = instance.cluster_snapshot_dir();
         let src_id = cfg.id;
-        sender.set_snapshot_source(Arc::new(move || {
-            snapshot_set_for(
-                &src_cnc,
-                &src_root,
-                &src_services,
-                &src_cluster_dir,
-                src_id,
-                &src_decline_reason,
-            )
+        let hint_reason = Arc::clone(&src_decline_reason);
+        sender.set_snapshot_source(Arc::new(move |at| {
+            // Spec §5.7: `None` = the set at my floor (the below-floor-NAK
+            // case); `Some(p)` = the set at p, a peer's `SNAP_REQUEST`.
+            match at {
+                None => snapshot_set_for(
+                    &src_cnc,
+                    &src_root,
+                    &src_services,
+                    &src_cluster_dir,
+                    src_id,
+                    &src_decline_reason,
+                ),
+                Some(p) => snapshot_set_at(
+                    p,
+                    &src_cnc,
+                    &src_root,
+                    &src_services,
+                    &src_cluster_dir,
+                    src_id,
+                    &src_decline_reason,
+                ),
+            }
+        }));
+        // Spec §5.7 item 6: the standby instant this node last COMMANDED as
+        // leader — the learner it addressed (the first in the membership at
+        // command time; a standby instant addresses every learner) and the
+        // position. `snapshot_standby_position == 0` means "no standby instant
+        // commanded here", which is what disarms the redirect entirely on a
+        // cluster that does not use standby instants at all.
+        let snapshot_standby_learner = Arc::new(AtomicU32::new(0));
+        let snapshot_standby_position = Arc::new(AtomicU64::new(0));
+        let hint_learner = Arc::clone(&snapshot_standby_learner);
+        let hint_position = Arc::clone(&snapshot_standby_position);
+        sender.set_snap_redirect_hint(Arc::new(move || {
+            // ONLY the "my set at my floor is missing" decline (spec §5.7 item
+            // 6). Every other reason is either "nothing to ship at all"
+            // (floor 0 — the peer is served by journal replay) or a
+            // misconfiguration a redirect would paper over.
+            if hint_reason.load(Ordering::Relaxed) != SNAP_DECLINE_MISSING {
+                return None;
+            }
+            let position = hint_position.load(Ordering::Acquire);
+            if position == 0 {
+                return None;
+            }
+            Some((hint_learner.load(Ordering::Relaxed), position))
         }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters
@@ -1385,6 +1481,14 @@ impl Node {
             )),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
+        // Coordinated-snapshot spec §5.7 items 5–6: the fetch route (node →
+        // receiver) and the store-only completion signal (receiver →
+        // consensus agent). Depth 1: one fetch at a time is the whole design —
+        // the receiver holds one intake, and a second request while one is in
+        // flight is dropped and re-run by the operator.
+        let (fetch_tx, fetch_rx) = mpsc::sync_channel::<SnapFetch>(1);
+        receiver.set_fetch_route(fetch_rx);
+        let stored_set_pos = receiver.stored_set_pos();
         // Validated frontier, published by the consensus agent and read by the
         // receiver so its AppendPosition reports attest validated bytes only.
         let validated_frontier = Arc::new(AtomicU64::new(durable));
@@ -1705,7 +1809,7 @@ impl Node {
             test_now_ns: None,
             services: cfg.services,
             snap_stats: Arc::clone(&route_drops),
-            last_snap_refusals: (0, 0, 0),
+            last_snap_refusals: (0, 0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
@@ -1816,7 +1920,12 @@ impl Node {
             snap_root: snap_root.clone(),
             cluster_snapshot_dir: instance.cluster_snapshot_dir(),
             pending_fetch: None,
+            fetch_tx,
+            stored_set_pos,
+            snapshot_standby_learner,
+            snapshot_standby_position,
             snapshot_cmd_rx,
+            fetch_cmd_rx,
             snapshot_cadence_refused: 0,
         };
         // Cluster FSM (spec §4.5): arm from the RECOVERED view BEFORE the
@@ -1842,6 +1951,7 @@ impl Node {
             can_serve_flag,
             ingress_tx,
             snapshot_cmd_tx,
+            fetch_cmd_tx,
             snapshot_set_position,
             snapshot_instant_pub,
             snapshot_row_incomplete,
@@ -1990,15 +2100,17 @@ impl Node {
         &self.route_drops
     }
 
-    /// Wire 0.7.0 (spec §5, §9): the three named snapshot-session refusals
-    /// this node counted — `(peer wire ≤ 0.6.0, identity mismatch, version
-    /// mismatch)`. All three drop the session; the follower keeps NAKing, so
-    /// a non-zero value means a joiner is stuck and the fleet is mixed-version
-    /// or mis-declared. The observability workstream exports these; this
-    /// accessor is the single source it reads. The consensus agent names each
-    /// one in a `snapshot_session_refused` log record as it happens (`uc_net`
-    /// carries no logging dependency).
-    pub fn snapshot_session_refusals(&self) -> (u64, u64, u64) {
+    /// Wire 0.7.0 (spec §5, §9) + coordinated-snapshot spec §5.6: the four
+    /// named snapshot-session refusals this node counted — `(peer wire ≤
+    /// 0.6.0, identity mismatch, version mismatch, position mismatch)`. All
+    /// four drop the session; the follower keeps NAKing, so a non-zero value
+    /// means a joiner is stuck and the fleet is mixed-version, mis-declared,
+    /// or (the fourth) shipping a set assembled from two different instants.
+    /// The observability workstream exports these; this accessor is the single
+    /// source it reads. The consensus agent names each one in a
+    /// `snapshot_session_refused` log record as it happens (`uc_net` carries
+    /// no logging dependency).
+    pub fn snapshot_session_refusals(&self) -> (u64, u64, u64, u64) {
         (
             self.route_drops
                 .snap_refused_legacy_peer
@@ -2008,6 +2120,9 @@ impl Node {
                 .load(Ordering::Relaxed),
             self.route_drops
                 .snap_refused_version_mismatch
+                .load(Ordering::Relaxed),
+            self.route_drops
+                .snap_refused_position_mismatch
                 .load(Ordering::Relaxed),
         )
     }
@@ -2092,6 +2207,39 @@ impl Node {
         answer
             .recv_timeout(SNAPSHOT_CMD_TIMEOUT)
             .unwrap_or(Err(SnapshotRefusal::Retry))
+    }
+
+    /// Pull a complete snapshot set from a learner (coordinated-snapshot spec
+    /// §5.7 item 5) — the in-process twin of `uc2ctl snapshot fetch --from
+    /// <learner-id> [--position P]`, running admin op 9's exact body.
+    /// `position: None` asks for the learner's newest complete set.
+    ///
+    /// **Node-local**: it changes nothing cluster-wide, so it is answered on
+    /// whichever node it is called on and is never forwarded. `Ok(())` means
+    /// the request was accepted and a `SNAP_REQUEST` is on its way — NOT that
+    /// the set has arrived; the set lands (or does not) asynchronously, and
+    /// [`Node::snapshot_set_position`] moving to the fetched position is what
+    /// "it landed" looks like. Every refusal is side-effect-free.
+    pub fn request_fetch(
+        &self,
+        learner_id: NodeId,
+        position: Option<u64>,
+    ) -> Result<(), FetchRefusal> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        if self
+            .fetch_cmd_tx
+            .try_send(FetchCmd {
+                learner_id,
+                position,
+                reply,
+            })
+            .is_err()
+        {
+            return Err(FetchRefusal::Retry);
+        }
+        answer
+            .recv_timeout(FETCH_CMD_TIMEOUT)
+            .unwrap_or(Err(FetchRefusal::Retry))
     }
 
     /// Spec §5.3/§9: the position of the newest COMPLETE snapshot set this
@@ -2458,7 +2606,7 @@ struct Consensus {
     /// The `(peer wire ≤ 0.6.0, identity mismatch, version mismatch)` triple
     /// as of the last cycle — the edge detector behind
     /// `snapshot_session_refused`.
-    last_snap_refusals: (u64, u64, u64),
+    last_snap_refusals: (u64, u64, u64, u64),
     /// M14a: this cycle's `min(applied)` over the declared FSMs, refreshed by
     /// `publish_service_mins()` at the top of every `do_work` cycle.
     /// `u64::MAX` for a `none_for_tests` node (nothing declared: no FSM
@@ -2943,11 +3091,35 @@ struct Consensus {
     /// artifact directory, the other half of the same sweep.
     cluster_snapshot_dir: PathBuf,
     /// Admin op 9's node-local bookkeeping (spec §5.7 item 5): the learner id
-    /// and position this voter has been pointed at, recorded here so Task 6's
-    /// `SNAP_REQUEST` send has one place to read it from.
-    pending_fetch: Option<(NodeId, u64)>,
+    /// and position this voter has been pointed at, plus the pass clock at
+    /// which the attempt is given up on. Cleared when the receiver publishes a
+    /// stored set at or above `position` (the fetch landed) or when that
+    /// deadline passes — so `uc2ctl snapshot fetch` can be re-run rather than
+    /// finding the node permanently "already fetching".
+    pending_fetch: Option<PendingFetch>,
+    /// Coordinated-snapshot spec §5.7 items 5–6: the producer half of the
+    /// receiver agent's fetch route. The receiver sends the `SNAP_REQUEST`
+    /// (from ITS socket — the address the learner's session is addressed to)
+    /// and owns the intake; this agent only decides who to ask and what a
+    /// completed transfer will mean.
+    fetch_tx: mpsc::SyncSender<SnapFetch>,
+    /// Coordinated-snapshot spec §5.7 item 4 (Ruling P4'): the receiver
+    /// agent's store-only completion signal — the position of the newest set
+    /// this node FETCHED whole from a learner. Read by
+    /// [`Consensus::check_set_completeness`], which treats it exactly like a
+    /// locally produced set.
+    stored_set_pos: Arc<AtomicU64>,
+    /// Spec §5.7 item 6: the learner the last standby instant this node
+    /// commanded addressed, and that instant's position — the redirect hint
+    /// the sender agent consults when it cannot serve a below-floor NAK.
+    /// Written here (leader-side, at command time), read there.
+    snapshot_standby_learner: Arc<AtomicU32>,
+    snapshot_standby_position: Arc<AtomicU64>,
     /// Spec §5.5: the consumer half of [`Node::command_snapshot`]'s channel.
     snapshot_cmd_rx: mpsc::Receiver<SnapshotCmd>,
+    /// Spec §5.7 item 5: the consumer half of [`Node::request_fetch`]'s
+    /// channel — the in-process twin of admin op 9.
+    fetch_cmd_rx: mpsc::Receiver<FetchCmd>,
     /// The last NAMED refusal (48/49) the CADENCE hit, `0` for none — a
     /// latch, so a cluster with one non-snapshotting row names it once
     /// instead of every pass. Cleared by the next accepted cadence instant,
@@ -3261,6 +3433,16 @@ impl Consensus {
             let _ = cmd.reply.try_send(answer);
             did = true;
         }
+
+        // 11c. Spec §5.7 item 5: the same for `Node::request_fetch`, admin op
+        // 9's in-process twin — and the retirement of a pending fetch that has
+        // landed or timed out, so the verb stays re-runnable.
+        if let Ok(cmd) = self.fetch_cmd_rx.try_recv() {
+            let answer = self.start_fetch(cmd.learner_id, cmd.position.unwrap_or(0));
+            let _ = cmd.reply.try_send(answer);
+            did = true;
+        }
+        self.poll_pending_fetch();
 
         // 12. M7: clear the cnc `config_pending` mirror once commit has crossed
         // the adopted config's position — the entry is no longer at risk of a
@@ -3864,7 +4046,24 @@ impl Consensus {
             self.snap_stats
                 .snap_refused_version_mismatch
                 .load(Ordering::Acquire),
+            self.snap_stats
+                .snap_refused_position_mismatch
+                .load(Ordering::Acquire),
         );
+        if now.3 != self.last_snap_refusals.3 {
+            // Coordinated-snapshot spec §5.6 / Ruling P6: the SOURCE mixed two
+            // instants (or a forgery spliced one artifact of one set into
+            // another). No per-row detail cell: the failure is a property of
+            // the SET, not of a row, and the offending positions are already
+            // in the refusing node's own artifact directory.
+            crate::obs_event!(
+                Warn,
+                "snapshot_session_refused",
+                node = self.id as u64,
+                reason = "position_mismatch",
+                total = now.3
+            );
+        }
         if now.0 != self.last_snap_refusals.0 {
             crate::obs_event!(
                 Warn,
@@ -4770,7 +4969,12 @@ impl Consensus {
                 });
             }
         }
-        if standby && self.sm.config().learners.is_empty() {
+        // Spec §5.7: a standby instant addresses EVERY learner, so "the
+        // learner this instant went to" is a choice among equals — the first
+        // in the membership, read from the SAME config the refusal below
+        // checks, so the two can never disagree about whether one exists.
+        let standby_learner = self.sm.config().learners.first().map(|(id, _)| *id);
+        if standby && standby_learner.is_none() {
             return Err(SnapshotRefusal::NoLearner);
         }
         let term = self.sm.current_term();
@@ -4797,6 +5001,17 @@ impl Consensus {
         // the cadence's baseline needs no second load.
         self.snapshot_last_commanded_bytes = end;
         self.snapshot_instant_pub.store(end, Ordering::Relaxed);
+        // Spec §5.7 item 6: the redirect hint the sender agent reads when it
+        // cannot serve a below-floor NAK. Only a STANDBY instant arms it — a
+        // plain instant freezes this node's own rows too, so its set is here
+        // and there is nothing to redirect to. Learner first, position last:
+        // the position is what arms the hint, so the pair a reader sees is
+        // never half-written.
+        if standby {
+            self.snapshot_standby_learner
+                .store(standby_learner.unwrap_or(0), Ordering::Relaxed);
+            self.snapshot_standby_position.store(end, Ordering::Release);
+        }
         crate::obs_event!(
             Info,
             "snapshot_commanded",
@@ -4869,7 +5084,24 @@ impl Consensus {
     /// read-only poll, run once per pass, and the only work it can trigger is
     /// the retention sweep on the (rare) completion edge.
     fn check_set_completeness(&mut self) {
-        let seen = self.snapshot_set_position.load(Ordering::Relaxed);
+        let mut seen = self.snapshot_set_position.load(Ordering::Relaxed);
+        // Spec §5.7 item 4 (Ruling P4'): a set FETCHED whole from a learner is
+        // complete here the moment its last artifact is on disk — this node's
+        // own rows never froze at P, so there is no cnc slot to read it off.
+        // One `Acquire` load per pass, and the same high-water-mark rule as
+        // every other completion: the floor never moves backwards.
+        let stored = self.stored_set_pos.load(Ordering::Acquire);
+        if stored > seen {
+            self.snapshot_set_position.store(stored, Ordering::Release);
+            crate::obs_event!(
+                Info,
+                "snapshot_set_complete",
+                node = self.id as u64,
+                position = stored,
+                source = "fetch"
+            );
+            seen = stored;
+        }
         let p = self.cluster_snapshot_pos.load(Ordering::Acquire);
         if p <= seen {
             return;
@@ -4890,7 +5122,11 @@ impl Consensus {
             Info,
             "snapshot_set_complete",
             node = self.id as u64,
-            position = p
+            position = p,
+            // ...as opposed to `fetch` above: this node BUILT the set (spec
+            // §5.7 gave the record a second way to happen, so it has to say
+            // which).
+            source = "local"
         );
     }
 
@@ -6058,6 +6294,21 @@ impl Consensus {
                 self.on_config_reply(body);
                 return;
             }
+            NetEvent::SnapRedirect {
+                learner_id,
+                position,
+            } => {
+                // Coordinated-snapshot spec §5.7 item 6: we NAKed below a
+                // floor the leader could not serve, and it named a learner
+                // that can. We are a JOINER here — below the floor — so what
+                // comes back is installed by fiat, exactly as a session the
+                // leader itself had opened would have been. The receiver
+                // guards the "an intake is already open" case; this side
+                // resolves the id, which is membership and therefore the
+                // node's business, not `uc_net`'s.
+                self.follow_snap_redirect(learner_id, position);
+                return;
+            }
         };
         self.feed(event);
     }
@@ -6544,31 +6795,117 @@ impl Consensus {
     /// targets, which is this op's "version in effect" (one meaning per op,
     /// as `schedule apply` and `settings apply` each have their own).
     ///
-    /// What is implemented HERE is the bookkeeping: the named id must be a
-    /// learner in the committed membership and must not be this node, and the
-    /// request is recorded in [`Consensus::pending_fetch`] for the sender to
-    /// act on. The datagram itself is Task 6's, so an accepted request is
-    /// answered `retry` — side-effect-free and safe to poll, which is exactly
-    /// what `uc2ctl` does with a `2`.
+    /// The named id must be a learner in the committed membership, must not be
+    /// this node, and must have an address here; the request is then handed to
+    /// the receiver agent, which sends the `SNAP_REQUEST` from its own socket
+    /// and opens a STORE-ONLY intake. An accepted request is answered `0`: the
+    /// datagram is on its way. It is NOT a promise the set arrived — that
+    /// happens asynchronously and shows up as `snapshot_set_position` moving.
     fn request_fetch(&mut self, learner_id: u32, position: u64) -> (u32, u32, u64, Option<String>) {
-        let membership = self.cluster_view.membership();
-        if !membership.is_learner(learner_id) {
-            return (
+        match self.start_fetch(learner_id, position) {
+            Ok(()) => (0, 0, position, None),
+            Err(FetchRefusal::NotALearner) => (
                 1,
                 REASON_SNAPSHOT_NO_LEARNER,
                 position,
-                Some(format!("node {learner_id} is not a learner")),
-            );
-        }
-        if learner_id == self.id {
-            return (
+                Some(if learner_id == self.id {
+                    "a node cannot fetch a set from itself".to_string()
+                } else {
+                    format!("node {learner_id} is not a learner")
+                }),
+            ),
+            Err(FetchRefusal::UnknownPeer) => (
                 1,
                 REASON_SNAPSHOT_NO_LEARNER,
                 position,
-                Some("a node cannot fetch a set from itself".to_string()),
-            );
+                Some(format!("node {learner_id} has no address on this node")),
+            ),
+            // The receiver's route was momentarily full: side-effect-free, and
+            // `uc2ctl` polls a `2`.
+            Err(FetchRefusal::Retry) => (2, 0, position, None),
         }
-        self.pending_fetch = Some((learner_id, position));
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 6: act on a leader's
+    /// `SNAP_REDIRECT`. Resolve the named learner to an address and ask it for
+    /// the set at `position`, INSTALLING what comes back — this node is below
+    /// the floor (that is what its NAK said), so it is a joiner and the
+    /// ordinary fiat install is exactly right; only the source is unusual.
+    ///
+    /// Unauthenticated only in the sense every datagram is when crypto is off,
+    /// and bounded either way: the id must be a member THIS node knows an
+    /// address for, and the worst a forged redirect can do is make a
+    /// below-floor node ask a real member for a snapshot set — which that
+    /// member serves, or does not, on its own terms. A redirect naming an
+    /// unknown id is dropped with a named record rather than silently.
+    fn follow_snap_redirect(&mut self, learner_id: NodeId, position: u64) {
+        let Some(&peer) = self.id_to_addr.get(&learner_id) else {
+            crate::obs_event!(
+                Warn,
+                "snapshot_redirect_unknown",
+                node = self.id as u64,
+                from = learner_id as u64,
+                position = position
+            );
+            return;
+        };
+        if self
+            .fetch_tx
+            .try_send(SnapFetch {
+                peer,
+                position,
+                mode: IntakeMode::Install,
+            })
+            .is_err()
+        {
+            // The route was full: our NAK timer re-fires and the leader
+            // re-redirects. Nothing is recorded — this is a hot-path drop with
+            // its own retry, like every other full-channel drop here.
+            return;
+        }
+        crate::obs_event!(
+            Info,
+            "snapshot_redirect_followed",
+            node = self.id as u64,
+            from = learner_id as u64,
+            position = position
+        );
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 5, shared by admin op 9 and
+    /// [`Node::request_fetch`]: validate the target and hand the pull to the
+    /// receiver agent. `position == 0` means "the learner's newest complete
+    /// set".
+    ///
+    /// The membership check is against the COMMITTED cluster view — the
+    /// authority on who is a learner — and the address comes from this node's
+    /// own peer map, which is what a datagram can actually be addressed to.
+    fn start_fetch(&mut self, learner_id: NodeId, position: u64) -> Result<(), FetchRefusal> {
+        if learner_id == self.id || !self.cluster_view.membership().is_learner(learner_id) {
+            return Err(FetchRefusal::NotALearner);
+        }
+        let Some(&peer) = self.id_to_addr.get(&learner_id) else {
+            return Err(FetchRefusal::UnknownPeer);
+        };
+        if self
+            .fetch_tx
+            .try_send(SnapFetch {
+                peer,
+                position,
+                // A VOTER pulling a learner's set is not a joiner: nothing is
+                // installed by fiat (Ruling P4').
+                mode: IntakeMode::StoreOnly,
+            })
+            .is_err()
+        {
+            return Err(FetchRefusal::Retry);
+        }
+        self.pending_fetch = Some(PendingFetch {
+            learner: learner_id,
+            position,
+            stored_before: self.stored_set_pos.load(Ordering::Acquire),
+            deadline_ns: self.pass_now_ns.saturating_add(FETCH_TIMEOUT_NS),
+        });
         crate::obs_event!(
             Info,
             "snapshot_fetch_requested",
@@ -6576,8 +6913,38 @@ impl Consensus {
             from = learner_id as u64,
             position = position
         );
-        // Task 6: send SNAP_REQUEST here.
-        (2, 0, position, None)
+        Ok(())
+    }
+
+    /// Retire a pending fetch once it has landed (the receiver published a
+    /// stored set) or plainly has not (the deadline passed) — so the operator's
+    /// verb becomes re-runnable rather than the node looking permanently busy.
+    /// Costs one predictable branch per pass; the clock is this pass's, never a
+    /// fresh reading.
+    fn poll_pending_fetch(&mut self) {
+        let Some(p) = self.pending_fetch else {
+            return;
+        };
+        let stored = self.stored_set_pos.load(Ordering::Acquire);
+        if stored > p.stored_before {
+            self.pending_fetch = None;
+            crate::obs_event!(
+                Info,
+                "snapshot_fetch_stored",
+                node = self.id as u64,
+                from = p.learner as u64,
+                position = stored
+            );
+        } else if self.pass_now_ns > p.deadline_ns {
+            self.pending_fetch = None;
+            crate::obs_event!(
+                Warn,
+                "snapshot_fetch_timeout",
+                node = self.id as u64,
+                from = p.learner as u64,
+                position = p.position
+            );
+        }
     }
 
     /// Count + name one refused `schedule apply` and build its reply triple.
@@ -8774,6 +9141,12 @@ mod tests {
         /// Kept alive so `cons.snapshot_cmd_rx` never disconnects; a test may
         /// also send on it to exercise the do_work drain.
         _snapshot_cmd_tx: mpsc::SyncSender<SnapshotCmd>,
+        /// Spec §5.7 item 5: the `Node` half of `Node::request_fetch`'s
+        /// channel, and the RECEIVER agent's half of the fetch route — a test
+        /// reads the latter to see exactly what the consensus agent asked its
+        /// receiver to pull.
+        _fetch_cmd_tx: mpsc::SyncSender<FetchCmd>,
+        fetch_rx: mpsc::Receiver<SnapFetch>,
         // Kept alive: dropping these would disconnect the consensus's endpoints.
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
@@ -9154,6 +9527,14 @@ mod tests {
             std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
         let snapshot_instants_abandoned = Arc::new(AtomicU64::new(0));
         let (snapshot_cmd_tx, snapshot_cmd_rx) = mpsc::sync_channel::<SnapshotCmd>(1);
+        // Coordinated-snapshot plan 2 Task 6: the fetch channels and the
+        // receiver agent's store-only signal, wired as `start_with_socket`
+        // wires them. The receiver end of `fetch_rx` is kept on the `Harness`
+        // so a test can read what this agent asked for (there is no real
+        // receiver agent here).
+        let (fetch_tx, fetch_rx) = mpsc::sync_channel::<SnapFetch>(1);
+        let (fetch_cmd_tx, fetch_cmd_rx) = mpsc::sync_channel::<FetchCmd>(1);
+        let stored_set_pos = Arc::new(AtomicU64::new(0));
         let cluster = ClusterAgent::new(
             Arc::clone(&buffer),
             Arc::clone(&cnc),
@@ -9208,7 +9589,7 @@ mod tests {
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
-            last_snap_refusals: (0, 0, 0),
+            last_snap_refusals: (0, 0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
@@ -9320,7 +9701,12 @@ mod tests {
             snap_root: dir.path().join("snapshots"),
             cluster_snapshot_dir: dir.path().join("snapshots").join("cluster"),
             pending_fetch: None,
+            fetch_tx,
+            stored_set_pos,
+            snapshot_standby_learner: Arc::new(AtomicU32::new(0)),
+            snapshot_standby_position: Arc::new(AtomicU64::new(0)),
             snapshot_cmd_rx,
+            fetch_cmd_rx,
             snapshot_cadence_refused: 0,
         };
         // The LAST thing `Node::start_with_socket` does before spawning the
@@ -9337,6 +9723,8 @@ mod tests {
             hs_tx,
             cluster_snapshot_pos,
             _snapshot_cmd_tx: snapshot_cmd_tx,
+            _fetch_cmd_tx: fetch_cmd_tx,
+            fetch_rx,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
             _cfg_obs_tx: cfg_obs_tx,
@@ -9600,6 +9988,122 @@ mod tests {
         assert_eq!(
             names(&h.cons.cluster_snapshot_dir),
             vec![format!("snap-{p2}.ultcluster")]
+        );
+    }
+
+    /// Spec §5.7 item 4 (Ruling P4'): a set this node FETCHED from a learner
+    /// store-only completes exactly like one it built itself. The receiver
+    /// writes the files and publishes `stored_set_pos`; the completeness poll
+    /// treats that as "the set at P is complete here", and everything
+    /// downstream — the floor, retention, the ship gate — follows unchanged.
+    /// A voter whose own rows never froze at P has no cnc slot saying so,
+    /// which is precisely why this branch exists.
+    #[test]
+    fn a_fetched_set_completes_this_nodes_set_without_any_row_freezing() {
+        let mut h = harness_with_rows(&["a"]);
+        let p = 4096u64;
+        // The voter's own rows are at 0 — nothing here froze at p.
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), 0);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            0,
+            "no set, fetched or local"
+        );
+
+        // The receiver agent finished a store-only intake at p.
+        h.cons.stored_set_pos.store(p, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(
+            h.cons.snapshot_set_position.load(Ordering::Relaxed),
+            p,
+            "a stored set completes the set at its position"
+        );
+
+        // ...and it is a high-water mark like every other completion: a stale
+        // (or repeated) stored value never moves it back.
+        h.cons.stored_set_pos.store(2048, Ordering::Release);
+        h.cons.check_set_completeness();
+        assert_eq!(h.cons.snapshot_set_position.load(Ordering::Relaxed), p);
+    }
+
+    /// Spec §5.7 item 5: admin op 9 validates the target against the COMMITTED
+    /// membership and hands the pull to the receiver agent as a STORE-ONLY
+    /// fetch, addressed to the learner. Accepted (`0`) means "the request is on
+    /// its way", not "the set is here".
+    #[test]
+    fn a_fetch_is_refused_for_a_non_learner_and_handed_to_the_receiver_for_a_learner() {
+        let mut h = harness_with_rows(&["a"]);
+        // The harness membership is voters 0,1,2 with no learners.
+        let (status, reason, _, detail) = h.cons.request_fetch(2, 4096);
+        assert_eq!((status, reason), (1, REASON_SNAPSHOT_NO_LEARNER));
+        assert!(detail.unwrap().contains("not a learner"));
+        let (status, _, _, detail) = h.cons.request_fetch(1, 4096);
+        assert_eq!(status, 1, "id 1 is this node");
+        assert!(detail.unwrap().contains("from itself"));
+        assert!(h.fetch_rx.try_recv().is_err(), "nothing was asked for");
+        assert!(h.cons.pending_fetch.is_none());
+
+        // Make node 2 a learner in the committed view, then ask it. Published
+        // straight onto the view the way the `uc2-cluster` agent would — this
+        // test is about op 9's body, not about how a membership commits.
+        let mut state = h.cons.cluster_view.to_state();
+        state.membership.voters.retain(|(id, _)| *id != 2);
+        state
+            .membership
+            .learners
+            .push((2, addr_to_pair(h.cons.id_to_addr[&2])));
+        h.cons.cluster_view.publish(&state);
+        let (status, reason, version, detail) = h.cons.request_fetch(2, 4096);
+        assert_eq!(
+            (status, reason, version, detail),
+            (0, 0, 4096, None),
+            "accepted: the SNAP_REQUEST is on its way"
+        );
+        let asked = h.fetch_rx.try_recv().expect("the receiver was asked");
+        assert_eq!(asked.peer, h.cons.id_to_addr[&2]);
+        assert_eq!(asked.position, 4096);
+        assert_eq!(
+            asked.mode,
+            IntakeMode::StoreOnly,
+            "a voter pulling a learner's set is not a joiner"
+        );
+        assert!(h.cons.pending_fetch.is_some());
+
+        // It is retired once the receiver publishes a stored set — so the
+        // operator's verb is re-runnable rather than the node looking busy
+        // forever.
+        h.cons.stored_set_pos.store(4096, Ordering::Release);
+        h.cons.poll_pending_fetch();
+        assert!(h.cons.pending_fetch.is_none());
+    }
+
+    /// Spec §5.7 item 6: a leader's `SNAP_REDIRECT` is resolved through THIS
+    /// node's peer map and followed as an INSTALL fetch — the joiner is below
+    /// the floor, so what comes back is installed by fiat exactly as a session
+    /// the leader itself had opened would have been. An id this node has no
+    /// address for is dropped, not guessed at.
+    #[test]
+    fn a_redirect_is_followed_as_an_install_fetch_and_an_unknown_id_is_dropped() {
+        let mut h = harness_with_rows(&["a"]);
+        h.cons.follow_snap_redirect(4242, 8192);
+        assert!(
+            h.fetch_rx.try_recv().is_err(),
+            "an id with no address here is dropped, never guessed at"
+        );
+
+        h.cons.follow_snap_redirect(2, 8192);
+        let asked = h.fetch_rx.try_recv().expect("the receiver was asked");
+        assert_eq!(asked.peer, h.cons.id_to_addr[&2]);
+        assert_eq!(asked.position, 8192);
+        assert_eq!(
+            asked.mode,
+            IntakeMode::Install,
+            "a below-floor joiner installs by fiat — only the SOURCE is unusual"
+        );
+        assert!(
+            h.cons.pending_fetch.is_none(),
+            "a redirect is not the operator's pending fetch"
         );
     }
 

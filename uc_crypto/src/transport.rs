@@ -152,8 +152,8 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
-    DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, OFF_DGRAM_KEY_EPOCH,
-    read_datagram_header,
+    DGRAM_KIND_SNAP_REDIRECT, DGRAM_KIND_SNAP_REQUEST, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP,
+    DGRAM_KIND_VOTE, OFF_DGRAM_KEY_EPOCH, read_datagram_header,
 };
 use zeroize::Zeroizing;
 
@@ -314,6 +314,13 @@ impl Transport {
             | DGRAM_KIND_SNAP_CHUNK
             | DGRAM_KIND_SNAP_NAK
             | DGRAM_KIND_SNAP_DONE
+            // Coordinated-snapshot spec §5.7: the pull request and the
+            // leader's redirect are one-to-one control like every other SNAP
+            // kind. Named here rather than left to the catch-all below —
+            // which already classifies them Pairwise — so `scope_of` stays a
+            // readable inventory of the kinds this cluster actually sends.
+            | DGRAM_KIND_SNAP_REQUEST
+            | DGRAM_KIND_SNAP_REDIRECT
             | DGRAM_KIND_CONFIG_PROPOSAL
             | DGRAM_KIND_CONFIG_REPLY => Scope::Pairwise,
 

@@ -29,8 +29,10 @@ use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
-    SnapBeginBody, write_datagram_header, write_snap_begin_body,
+    DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT, DatagramHeader, MTU_DEFAULT,
+    SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4, SNAP_REDIRECT_BODY_LEN, SnapBeginBody,
+    SnapRedirectBody, SnapRequestBody, write_datagram_header, write_snap_begin_body,
+    write_snap_redirect_body,
 };
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
@@ -105,6 +107,14 @@ pub enum CtrlMsg {
     },
     /// M6 Task 6: the snapshot-session peer signals the file is complete.
     SnapDone { from: SocketAddr, session: u32 },
+    /// Coordinated-snapshot spec §5.7 item 4: a peer asks THIS node for its
+    /// complete set at a position — the standby return path's trigger, and
+    /// the only one that is not a below-floor NAK. Served by every node, not
+    /// just the leader: the intended source is a learner, which never leads.
+    SnapRequest {
+        from: SocketAddr,
+        body: SnapRequestBody,
+    },
     /// M7 (spec 2026-07-13): the consensus agent adopted a new `ClusterConfig`
     /// (`Action::ConfigAdopted`) — rebuild the fan-out + flow control from it.
     /// `followers` and `learners` are DISJOINT sets (voters-minus-self,
@@ -180,13 +190,31 @@ pub const CLUSTER_ARTIFACT_ID: u8 = 255;
 /// of staying an overrun the peer re-NAKs. Without the cluster half, the
 /// joiner's own completion rule (which requires the cluster artifact too)
 /// never closes for the mirror-image reason.
+/// Coordinated-snapshot spec §5.6, Ruling P6 — **the one-position rule**, the
+/// other half of the invariant: every artifact of a set carries the SAME
+/// `snapshot_pos`, because a set IS "the artifacts at one instant P". A source
+/// that mixes two instants would ship a joiner a cluster image (membership,
+/// schedule table, settings) taken at a position its rows never applied to, or
+/// the reverse — an install that is silently wrong rather than a transfer that
+/// stalls. There is exactly one honest answer to that: refuse the set, the way
+/// every other broken invariant here is refused (the peer re-NAKs, and the
+/// next attempt sees a set the source has finished assembling).
 pub fn set_is_valid(set: &SnapshotSet) -> bool {
     if set.services_declared != identity_mask(&set.identity) {
         return false;
     }
     let mut rows = 0usize;
     let mut cluster = 0usize;
+    let mut at: Option<u64> = None;
     for a in &set.artifacts {
+        // The one-position rule, checked over ROWS AND the cluster artifact
+        // alike — the cluster artifact is the one most likely to drift, since
+        // it is written by a different agent than the rows are.
+        match at {
+            None => at = Some(a.snapshot_pos),
+            Some(p) if p != a.snapshot_pos => return false,
+            Some(_) => {}
+        }
         if a.service_id == CLUSTER_ARTIFACT_ID {
             cluster += 1;
             continue;
@@ -219,7 +247,24 @@ pub fn identity_mask(identity: &[u64; 8]) -> u64 {
 /// `config` carry). Over-delivery (shipping to a peer that is already current)
 /// is safe: the receiver installs by fiat only on a genuine completed session,
 /// and the install is idempotent by the artifact's position.
-pub type SnapshotSource = Arc<dyn Fn() -> Option<SnapshotSet> + Send + Sync>;
+/// Coordinated-snapshot spec §5.7: the argument is WHICH set to offer.
+/// `None` = "the set at my own floor", the below-floor-NAK case and everything
+/// that shipped before this plan. `Some(p)` = "the set at p", a peer's
+/// `SNAP_REQUEST` — answered `None` (refused, no session) if this node does not
+/// hold a complete set at exactly p. The node wires it to `snapshot_set_at`.
+pub type SnapshotSource = Arc<dyn Fn(Option<u64>) -> Option<SnapshotSet> + Send + Sync>;
+
+/// Coordinated-snapshot spec §5.7 item 6: "who should this peer ask instead?"
+/// Consulted only when a below-floor NAK could not be upgraded to a session
+/// from this node's own artifacts. `Some((learner_id, position))` sends the
+/// NAKing peer a [`DGRAM_KIND_SNAP_REDIRECT`]; `None` leaves the NAK the
+/// counted overrun it has always been.
+///
+/// The POLICY lives in the node layer (which learner, and whether the decline
+/// was "the set at my floor is missing" rather than some other reason), not
+/// here: `uc_net` owns the datagram, `uc_node` owns membership and the
+/// standby instants it commanded.
+pub type SnapRedirectHint = Arc<dyn Fn() -> Option<(u32, u64)> + Send + Sync>;
 
 /// One artifact inside an in-flight outbound session. `base` is its first
 /// byte's STREAM-GLOBAL offset (the session is one concatenated byte stream
@@ -258,6 +303,10 @@ struct SnapSession {
     /// Peer-requested missing STREAM ranges (repair), served before the cursor.
     naks: VecDeque<(u64, u32)>,
     last_activity_ns: u64,
+    /// Coordinated-snapshot spec §5.7 item 4: this session was opened by a
+    /// peer's `SNAP_REQUEST`, not by a below-floor NAK — so it is driven off
+    /// the leader-role gate (its source is a learner).
+    on_request: bool,
 }
 
 impl SnapSession {
@@ -368,6 +417,13 @@ pub struct SenderStats {
     /// joiner NAKed forever. A PERSISTENT count is "go and look at the
     /// LEADER's snapshot directory".
     pub snap_open_failed: AtomicU64,
+    /// Coordinated-snapshot spec §5.7 item 6: below-floor NAKs this node could
+    /// not serve and answered with a `SNAP_REDIRECT` to a learner. Rare by
+    /// construction (with node-owned retention the leader's own set at its
+    /// floor is present unless it was restored from an old backup or had its
+    /// artifacts removed), so a rising count is worth reading as "this
+    /// cluster's voters are relying on the standby return path".
+    pub snap_redirects: AtomicU64,
     /// M8: an outgoing datagram this sender could not seal — dropped rather
     /// than sent. Covers both scopes (T17 widened it from T10's DATA/HEARTBEAT
     /// only):
@@ -433,6 +489,11 @@ pub struct Sender {
     /// M6 Task 6: newest shippable snapshot resolver (node-wired). `None` = this
     /// node never ships snapshots (a below-floor NAK stays an overrun).
     snapshot_source: Option<SnapshotSource>,
+    /// Coordinated-snapshot spec §5.7 item 6: the node's answer to "who should
+    /// this peer ask instead?" when a below-floor NAK cannot be served from
+    /// here. `None` = never redirect (the pre-plan-2 behaviour, and what every
+    /// unit test that does not wire one gets).
+    redirect_hint: Option<SnapRedirectHint>,
     /// M6 Task 6: the single in-flight outbound snapshot session, if any.
     snap: Option<SnapSession>,
     /// M14c2 (T10a): `snap_open_failed`'s operator `eprintln!` has fired. The
@@ -645,6 +706,7 @@ impl Sender {
             role,
             was_leader: false,
             snapshot_source: None,
+            redirect_hint: None,
             snap: None,
             snap_open_failed_logged: false,
             snap_session_seq: 0,
@@ -693,6 +755,14 @@ impl Sender {
     /// durable floor marker, so a session only ever ships a fully-published file.
     pub fn set_snapshot_source(&mut self, src: SnapshotSource) {
         self.snapshot_source = Some(src);
+    }
+
+    /// Wire the redirect policy (coordinated-snapshot spec §5.7 item 6).
+    /// Without it a below-floor NAK this node cannot serve stays exactly what
+    /// it was: a counted overrun the peer re-NAKs. With it, the peer is also
+    /// told which learner to ask — see [`SnapRedirectHint`].
+    pub fn set_snap_redirect_hint(&mut self, hint: SnapRedirectHint) {
+        self.redirect_hint = Some(hint);
     }
 
     /// Wire the archive's journal in as the retransmit source for deep NAKs
@@ -814,6 +884,7 @@ impl Sender {
                         self.snap = None;
                     }
                 }
+                CtrlMsg::SnapRequest { from, body } => self.on_snap_request(from, body),
                 CtrlMsg::SetPeers {
                     followers,
                     learners,
@@ -857,6 +928,17 @@ impl Sender {
         }
         self.was_leader = leader_role;
         if !leader_role {
+            // Coordinated-snapshot spec §5.7 item 4: a session opened by a
+            // peer's `SNAP_REQUEST` is driven WHATEVER this node's role is —
+            // the intended source is a LEARNER, and a learner is never the
+            // leader. Everything else below (DATA, NAK service, heartbeats)
+            // stays leader-only exactly as before, and a session opened by
+            // the leader-side below-floor-NAK path is still driven from the
+            // leader-gated call further down, so a demoted leader's in-flight
+            // session goes quiet and times out as it always has.
+            if self.snap.as_ref().is_some_and(|s| s.on_request) && self.drive_snap_session() {
+                did = true;
+            }
             return did;
         }
 
@@ -1109,8 +1191,15 @@ impl Sender {
                         // an unrecoverable overrun. If none can be opened (no
                         // source, no file, or a session is already in flight) it
                         // stays an overrun and the peer re-NAKs.
-                        if !self.try_open_snap_session(to) {
+                        if !self.try_open_snap_session(to, None) {
                             self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                            // Coordinated-snapshot spec §5.7 item 6: we could
+                            // not serve it — tell the peer who can. Still an
+                            // overrun (the NAK went unserved here, and that is
+                            // what the counter means); the redirect is an
+                            // extra hint, not a substitute for the re-NAK it
+                            // will send if the learner cannot serve it either.
+                            self.try_send_redirect(to);
                         }
                     }
                     break;
@@ -1177,19 +1266,33 @@ impl Sender {
 
     // -- M6 Task 6: snapshot session -----------------------------------------
 
-    /// Try to open a snapshot session to `to` in response to a below-floor NAK.
-    /// Returns `false` (caller counts an overrun) when: a session is already in
-    /// flight (one at a time — the peer re-NAKs and waits), no source is wired,
-    /// no shippable snapshot set exists, the set breaks its invariants, or one
-    /// of the files cannot be opened.
-    fn try_open_snap_session(&mut self, to: SocketAddr) -> bool {
+    /// Try to open a snapshot session to `to`. `at` selects WHICH set (spec
+    /// §5.7): `None` = this node's own floor — the below-floor-NAK case, and
+    /// everything that shipped before plan 2; `Some(p)` = the set at `p`, a
+    /// peer's `SNAP_REQUEST`, refused if this node does not hold one there.
+    ///
+    /// Returns `false` (a below-floor-NAK caller counts an overrun) when: a
+    /// session is already in flight (one at a time — the peer re-NAKs and
+    /// waits), no source is wired, no shippable snapshot set exists at the
+    /// asked-for position, the set breaks its invariants, or one of the files
+    /// cannot be opened.
+    fn try_open_snap_session(&mut self, to: SocketAddr, at: Option<u64>) -> bool {
+        self.open_snap_session(to, at, None)
+    }
+
+    /// [`Self::try_open_snap_session`]'s body, with the session id given
+    /// rather than minted. A `SNAP_REQUEST` carries the REQUESTER's session id
+    /// and the transfer is scoped by it (`SnapRequestBody::session`), so the
+    /// requester can key its own waiting intake on `(peer, session)` instead of
+    /// having to accept whatever the source happens to mint.
+    fn open_snap_session(&mut self, to: SocketAddr, at: Option<u64>, session: Option<u32>) -> bool {
         if self.snap.is_some() {
             return false;
         }
         let Some(src) = self.snapshot_source.clone() else {
             return false;
         };
-        let Some(set) = src() else {
+        let Some(set) = src(at) else {
             return false;
         };
         if !set_is_valid(&set) {
@@ -1239,8 +1342,14 @@ impl Sender {
             });
             base += a.len;
         }
-        let sid = self.snap_session_seq.wrapping_add(1);
-        self.snap_session_seq = sid;
+        let sid = match session {
+            Some(s) => s,
+            None => {
+                let sid = self.snap_session_seq.wrapping_add(1);
+                self.snap_session_seq = sid;
+                sid
+            }
+        };
         self.snap = Some(SnapSession {
             peer: to,
             session: sid,
@@ -1251,12 +1360,63 @@ impl Sender {
             cursor: 0,
             naks: VecDeque::new(),
             last_activity_ns: self.base.elapsed().as_nanos() as u64,
+            on_request: session.is_some(),
         });
         self.stats.snap_sessions.fetch_add(1, Ordering::Relaxed);
         // A set that opened proves the snapshot dir is readable again: re-arm
         // the open-failure log so the NEXT bad set is named once more.
         self.snap_open_failed_logged = false;
         true
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 4: a peer asked this node for its
+    /// complete set at `body.position` (`0` = "your newest", i.e. the set at
+    /// this node's own floor — the same answer a below-floor NAK gets). Opens
+    /// an ORDINARY session, scoped by the requester's session id.
+    ///
+    /// Any node serves: the intended source is a learner (which is never the
+    /// leader), so nothing here consults the leader role. A request this node
+    /// cannot answer — no set at that position, or a session already in flight
+    /// — is silently dropped; the requester retries, exactly as spec §5.7 item
+    /// 6 describes ("a learner that has not completed answers the request with
+    /// nothing").
+    pub fn on_snap_request(&mut self, from: SocketAddr, body: SnapRequestBody) {
+        let at = if body.position == 0 {
+            None
+        } else {
+            Some(body.position)
+        };
+        self.open_snap_session(from, at, Some(body.session));
+    }
+
+    /// Coordinated-snapshot spec §5.7 item 6: this node could not serve a
+    /// below-floor NAK — ask the node layer whether a learner can, and if so
+    /// tell the peer to go there. Best-effort: a dropped/unsealed redirect
+    /// costs nothing (the peer re-NAKs on its own timer and gets another).
+    fn try_send_redirect(&mut self, to: SocketAddr) {
+        let Some(hint) = self.redirect_hint.as_ref() else {
+            return;
+        };
+        let Some((learner_id, position)) = hint() else {
+            return;
+        };
+        let mut body = [0u8; SNAP_REDIRECT_BODY_LEN];
+        write_snap_redirect_body(
+            &mut body,
+            &SnapRedirectBody {
+                // No session exists: the NAK we could not serve never opened
+                // one. The joiner mints its own for the `SNAP_REQUEST` it
+                // sends onward, so this field is only ever informational here
+                // — see `SnapRedirectBody`'s doc.
+                session: 0,
+                learner_id,
+                position,
+            },
+        );
+        if self.assemble_snap(to, 0, DGRAM_KIND_SNAP_REDIRECT, &body) {
+            let _ = self.sock.send_to(&self.scratch, to);
+            self.stats.snap_redirects.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Advance the in-flight snapshot session by at most [`SNAP_DGRAMS_PER_CYCLE`]
@@ -2448,6 +2608,18 @@ mod tests {
         fn on_nak(&mut self, from: SocketAddr, position: u64, length: u32) {
             self.naks.push_back((from, position, length));
         }
+
+        /// Test-only: close the in-flight session as a peer's `SNAP_DONE`
+        /// would (same key: `(peer, session)`), so a test can drive a second
+        /// session without waiting out the 30 s session timeout.
+        fn on_snap_done(&mut self, from: SocketAddr, session: u32) {
+            if let Some(s) = self.snap.as_ref()
+                && s.peer == from
+                && s.session == session
+            {
+                self.snap = None;
+            }
+        }
     }
 
     /// A well-formed `Enabled` `uc_crypto::SharedTransport` with a fresh key
@@ -3197,7 +3369,7 @@ mod tests {
             }),
         );
         let cluster = cluster_artifact(dir.path(), 4096);
-        s.set_snapshot_source(Arc::new(move || {
+        s.set_snapshot_source(Arc::new(move |_at| {
             Some(SnapshotSet {
                 services_declared: 0b1,
                 identity: ident(0b1),
@@ -3239,7 +3411,13 @@ mod tests {
             always_leader(),
         );
         let cluster = cluster_artifact(dir.path(), 4096);
-        s.set_snapshot_source(Arc::new(move || {
+        s.set_snapshot_source(Arc::new(move |at| {
+            // This node holds exactly ONE set, at 4096: `None` (my floor) and
+            // `Some(4096)` are served, any other requested position is not —
+            // the same shape `uc_node::snapshot_set_at` has.
+            if at.is_some_and(|p| p != 4096) {
+                return None;
+            }
             Some(SnapshotSet {
                 services_declared: 0b1,
                 identity: ident(0b1),
@@ -3266,8 +3444,13 @@ mod tests {
     fn sender_with_two_artifacts() -> (Sender, Fake, tempfile::TempDir) {
         let f = Fake::new();
         let dir = tempfile::tempdir().unwrap();
-        let p0 = dir.path().join("snap-2048.ultsnap");
-        let p2 = dir.path().join("snap-4096.ultsnap");
+        // One SET is one instant (Ruling P6), so both rows' artifacts — and
+        // the cluster one below — are tagged 2048; only the row id and the
+        // length differ, which is what this fixture is actually about.
+        let p0 = dir.path().join("0").join("snap-2048.ultsnap");
+        let p2 = dir.path().join("2").join("snap-2048.ultsnap");
+        std::fs::create_dir_all(p0.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(p2.parent().unwrap()).unwrap();
         std::fs::write(&p0, vec![0xA1u8; 2048]).unwrap();
         std::fs::write(&p2, vec![0xB2u8; 3000]).unwrap();
         let b = buffer();
@@ -3285,8 +3468,8 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        let cluster = cluster_artifact(dir.path(), 8192);
-        s.set_snapshot_source(Arc::new(move || {
+        let cluster = cluster_artifact(dir.path(), 2048);
+        s.set_snapshot_source(Arc::new(move |_at| {
             Some(SnapshotSet {
                 services_declared: 0b101,
                 identity: ident(0b101),
@@ -3300,7 +3483,7 @@ mod tests {
                     },
                     SnapArtifact {
                         service_id: 2,
-                        snapshot_pos: 4096,
+                        snapshot_pos: 2048,
                         path: p2.clone(),
                         len: 3000,
                     },
@@ -3373,7 +3556,7 @@ mod tests {
                 begins[1].snapshot_pos,
                 begins[1].total_len
             ),
-            (2, 4096, 3000)
+            (2, 2048, 3000)
         );
         assert_eq!(
             (
@@ -3381,7 +3564,7 @@ mod tests {
                 begins[2].snapshot_pos,
                 begins[2].total_len
             ),
-            (CLUSTER_ARTIFACT_ID, 8192, t17_cluster_bytes().len() as u64),
+            (CLUSTER_ARTIFACT_ID, 2048, t17_cluster_bytes().len() as u64),
             "spec §5.6: the CLUSTER ARTIFACT is one more artifact, announced LAST"
         );
         // Stream-global offsets, contiguous over [0, 5048), and no datagram
@@ -3432,7 +3615,7 @@ mod tests {
                 }
             })
             // Spec §5.6: every valid set carries the cluster artifact, last.
-            .chain(std::iter::once(cluster_artifact(dir.path(), 4096)))
+            .chain(std::iter::once(cluster_artifact(dir.path(), 2048)))
             .collect();
         let b = buffer();
         b.counters().prime(4 * b.capacity());
@@ -3449,7 +3632,7 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        s.set_snapshot_source(Arc::new(move || {
+        s.set_snapshot_source(Arc::new(move |_at| {
             Some(SnapshotSet {
                 services_declared,
                 identity: ident(services_declared),
@@ -3571,13 +3754,16 @@ mod tests {
             "no cluster artifact: refused, however well the rows cover the mask"
         );
 
-        set.artifacts.push(cluster_artifact(dir.path(), 4096));
+        set.artifacts.push(cluster_artifact(dir.path(), 2048));
         assert!(
             set_is_valid(&set),
             "the rows cover the mask and exactly one cluster artifact rides along"
         );
 
-        set.artifacts.push(cluster_artifact(dir.path(), 8192));
+        // A SECOND one at the same instant, so the count is the only thing
+        // wrong with it (Ruling P6's one-position rule would otherwise refuse
+        // it first, and this test would stop saying anything about the count).
+        set.artifacts.push(cluster_artifact(dir.path(), 2048));
         assert!(!set_is_valid(&set), "two cluster artifacts: refused");
         set.artifacts.pop();
 
@@ -3624,7 +3810,7 @@ mod tests {
                 // the mask/identity disagreement it exists to pin.
                 SnapArtifact {
                     service_id: CLUSTER_ARTIFACT_ID,
-                    snapshot_pos: 4096,
+                    snapshot_pos: 2048,
                     path: PathBuf::from("/nonexistent-never-opened-cluster"),
                     len: 16,
                 },
@@ -3688,7 +3874,7 @@ mod tests {
             term_handle(9),
             always_leader(),
         );
-        s.set_snapshot_source(Arc::new(move || Some(set.clone())));
+        s.set_snapshot_source(Arc::new(move |_at| Some(set.clone())));
         (s, f)
     }
 
@@ -3736,7 +3922,7 @@ mod tests {
             services_declared: 0b101,
             identity: ident(0b101),
             version: [0; 8],
-            artifacts: vec![make(0), cluster_artifact(dir.path(), 4096)],
+            artifacts: vec![make(0), cluster_artifact(dir.path(), 2048)],
         });
         assert_snap_session_refused(&mut s, &f, "a declared id with no artifact");
         assert_eq!(
@@ -3750,7 +3936,7 @@ mod tests {
             services_declared: 0b101,
             identity: ident(0b101),
             version: [0; 8],
-            artifacts: vec![make(0), make(1), cluster_artifact(dir.path(), 4096)],
+            artifacts: vec![make(0), make(1), cluster_artifact(dir.path(), 2048)],
         });
         assert_snap_session_refused(&mut s, &f, "an artifact for an undeclared id");
         assert_eq!(s.stats().snap_open_failed.load(Ordering::Relaxed), 0);
@@ -3778,7 +3964,7 @@ mod tests {
                     path: part,
                     len: 0,
                 },
-                cluster_artifact(dir.path(), 4096),
+                cluster_artifact(dir.path(), 2048),
             ],
         });
         assert_snap_session_refused(&mut s, &f, "a half-written .part offered with len 0");
@@ -3803,7 +3989,7 @@ mod tests {
             services_declared: 0b101,
             identity: ident(0b101),
             version: [0; 8],
-            artifacts: vec![make(2), make(0), cluster_artifact(dir.path(), 4096)],
+            artifacts: vec![make(2), make(0), cluster_artifact(dir.path(), 2048)],
         });
         assert_snap_session_refused(&mut s, &f, "a set whose ids do not strictly ascend");
     }
@@ -3831,7 +4017,7 @@ mod tests {
                     path: gone,
                     len: 2048,
                 },
-                cluster_artifact(dir.path(), 4096),
+                cluster_artifact(dir.path(), 2048),
             ],
         });
         assert_snap_session_refused(&mut s, &f, "an artifact whose file cannot be opened");
@@ -4145,7 +4331,7 @@ mod tests {
                 peer_ids,
             }),
         );
-        s.set_snapshot_source(Arc::new(move || {
+        s.set_snapshot_source(Arc::new(move |_at| {
             Some(SnapshotSet {
                 services_declared: 0b1,
                 identity: ident(0b1),
@@ -4174,5 +4360,170 @@ mod tests {
             s.stats().seal_failures.load(Ordering::Relaxed) > 0,
             "counted, not silent"
         );
+    }
+
+    // ==== Coordinated-snapshot plan 2, Task 6 ===============================
+
+    /// Ruling P6, the ONE-POSITION rule on the ship side: a set is the
+    /// artifacts at ONE instant P. A source that hands back a row artifact at
+    /// one position and a cluster artifact at another is not a set — it is two
+    /// halves of two different instants, and installing it would give the
+    /// joiner a cluster image that never saw the row's frames (or the reverse).
+    /// Refused by `set_is_valid`, before any file is opened.
+    #[test]
+    fn a_set_whose_artifacts_disagree_on_position_never_opens_a_session() {
+        let dir = snap_scratch_dir();
+        let row_path = dir.path().join("snap-2048.ultsnap");
+        std::fs::write(&row_path, vec![0xC3u8; 2048]).unwrap();
+        let (mut s, f) = sender_with_explicit_snapshot_set(SnapshotSet {
+            services_declared: 0b1,
+            identity: ident(0b1),
+            version: [0; 8],
+            artifacts: vec![
+                SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: 2048,
+                    path: row_path,
+                    len: 2048,
+                },
+                // ...at a DIFFERENT instant.
+                cluster_artifact(dir.path(), 4096),
+            ],
+        });
+        assert_snap_session_refused(&mut s, &f, "a set that mixes two positions");
+        assert_eq!(
+            s.stats().snap_open_failed.load(Ordering::Relaxed),
+            0,
+            "refused before any file is opened"
+        );
+    }
+
+    /// Spec §5.7 item 4: a peer's `SNAP_REQUEST` opens an ordinary session for
+    /// the set AT THAT POSITION — not the source's floor. The source here
+    /// holds two complete sets (4096 and 8192); `position = 4096` must ship
+    /// the older one, and `position = 0` ("newest") the one the source offers
+    /// at its floor.
+    #[test]
+    fn a_snap_request_opens_a_session_for_the_set_at_that_position() {
+        let dir = snap_scratch_dir();
+        for p in [4096u64, 8192] {
+            std::fs::write(
+                dir.path().join(format!("snap-{p}.ultsnap")),
+                vec![0x5Au8; 64],
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join(format!("snap-{p}.ultcluster")),
+                vec![0xA5u8; 32],
+            )
+            .unwrap();
+        }
+        let root = dir.path().to_path_buf();
+        // The node's own source shape: `None` = the set at my floor (8192 —
+        // the newest), `Some(p)` = the set at p, refused if absent.
+        let set_at = move |p: u64| SnapshotSet {
+            services_declared: 0b1,
+            identity: ident(0b1),
+            version: [0; 8],
+            artifacts: vec![
+                SnapArtifact {
+                    service_id: 0,
+                    snapshot_pos: p,
+                    path: root.join(format!("snap-{p}.ultsnap")),
+                    len: 64,
+                },
+                SnapArtifact {
+                    service_id: CLUSTER_ARTIFACT_ID,
+                    snapshot_pos: p,
+                    path: root.join(format!("snap-{p}.ultcluster")),
+                    len: 32,
+                },
+            ],
+        };
+
+        let f = Fake::new();
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            // A LEARNER serves this, and a learner is never the leader — the
+            // request path must not be gated on the leader role.
+            Arc::new(AtomicBool::new(false)),
+        );
+        s.set_snapshot_source(Arc::new(move |at: Option<u64>| {
+            let p = at.unwrap_or(8192);
+            if p != 4096 && p != 8192 {
+                return None;
+            }
+            Some(set_at(p))
+        }));
+
+        // The set at 4096, by request.
+        s.on_snap_request(
+            f.addr(),
+            SnapRequestBody {
+                session: 77,
+                position: 4096,
+            },
+        );
+        for _ in 0..4 {
+            s.do_work();
+        }
+        let (h, body) = f.recv().expect("a SNAP_BEGIN for the requested set");
+        assert_eq!(h.kind, DGRAM_KIND_SNAP_BEGIN);
+        let b0 = read_snap_begin_body(&body).expect("a well-formed SNAP_BEGIN body");
+        assert_eq!(b0.snapshot_pos, 4096, "the set AT the requested position");
+        assert_eq!(
+            b0.session, 77,
+            "the REQUESTER's session id scopes the transfer"
+        );
+        f.drain();
+
+        // `position = 0` = "your newest complete set".
+        s.on_snap_done(f.addr(), 77);
+        s.on_snap_request(
+            f.addr(),
+            SnapRequestBody {
+                session: 78,
+                position: 0,
+            },
+        );
+        for _ in 0..4 {
+            s.do_work();
+        }
+        let (h, body) = f.recv().expect("a SNAP_BEGIN for the newest set");
+        assert_eq!(h.kind, DGRAM_KIND_SNAP_BEGIN);
+        let b1 = read_snap_begin_body(&body).expect("a well-formed SNAP_BEGIN body");
+        assert_eq!(b1.snapshot_pos, 8192, "0 means the source's own floor");
+        assert_eq!(b1.session, 78);
+    }
+
+    /// The same request for a set the source does not hold is refused — no
+    /// session, no datagram. (A learner that has not completed the instant
+    /// answers nothing and the requester retries, spec §5.7 item 6.)
+    #[test]
+    fn a_snap_request_for_a_position_the_source_lacks_opens_nothing() {
+        let (mut s, f, _dir) = sender_without_crypto_and_snapshot_source();
+        s.on_snap_request(
+            f.addr(),
+            SnapRequestBody {
+                session: 5,
+                position: 999_999,
+            },
+        );
+        for _ in 0..4 {
+            s.do_work();
+        }
+        assert!(s.snap.is_none(), "no session for a set we do not hold");
+        assert!(f.recv_raw().is_none(), "not one datagram");
     }
 }

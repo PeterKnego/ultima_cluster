@@ -841,6 +841,14 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_snapshot_refused_position_total",
+        "Snapshot sessions refused because the sender's SNAP_BEGINs disagreed about the set's position — a set is the artifacts at ONE instant, and a source that mixes two would install a cluster image and a row image taken at different points of the log (coordinated-snapshot spec §5.6).",
+        s.receiver
+            .snap_refused_position_mismatch
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
         "uc2_snapshot_intake_io_failures_total",
         "Local I/O failures on the snapshot INTAKE path: a `.part` that could not be created/sized or written to, or a completed artifact whose fsync/rename failed. Retried, but a persistent count means this node's snapshot dir is full, read-only, or obstructed (spec §14.3). Since 2.8.1 a failed publish is retried at most once per 250 ms per transfer — on the duty cycle AND on the chunk path — so a standing obstacle makes this climb at about four per second, not at the poll or chunk rate.",
         s.receiver.snap_intake_io_failures.load(Ordering::Relaxed),
@@ -1470,6 +1478,16 @@ mod tests {
         );
         assert!(
             text.contains("uc2_snapshot_refused_version_total 1\n"),
+            "{text}"
+        );
+        // Coordinated-snapshot spec §5.6: and the fourth, the one-position
+        // rule's — a source that mixed two instants.
+        s.receiver
+            .snap_refused_position_mismatch
+            .fetch_add(2, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("uc2_snapshot_refused_position_total 2\n"),
             "{text}"
         );
     }
