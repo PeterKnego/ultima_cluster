@@ -41,7 +41,7 @@ and covered by this policy on the same terms as the rows above:
   SnapshotError, OutputError}` — `ServiceBuilder::new(cfg, sm).start()` is
   how a state machine is attached at all, and it returns
   `Result<Service<S>, ServiceError>`. (the now-retired `SnapshotPolicy` was here until
-  2.11.0, which retired it: the snapshot cadence became a replicated cluster
+  2.11.0, which deleted it: the snapshot cadence became a replicated cluster
   setting, `[settings] snapshot.interval_bytes`, so a service no longer
   chooses one. Removing a promised type is a MAJOR change under this policy —
   it ships in 2.11.0 under the same maintainer-decided carve-out as the FSM
@@ -100,8 +100,8 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   new wrapper alongside `Sessioned<S>`. Nothing was renamed or removed. New
   metric families (`uc2_timers_{pending,fired_total,late_total,rearmed_total}`,
   `uc2_log_time_ns`, `uc2_log_time_lag_seconds`), one new alert rule
-  (`Uc2LogTimeFrozen`), two new `[log]` records (`timer_late`,
-  and the now-retired `timers_rearmed`) and two new `uc2ctl status` fields
+  (`Uc2LogTimeFrozen`), one new `[log]` record (`timer_late`; the drafted
+  `timers_rearmed` was retired before shipping) and two new `uc2ctl status` fields
   (`log_time_ns=`,
   per-row `timers_pending=`) follow the same "added, not renamed" convention.
 

@@ -76,6 +76,16 @@
 # directory and its sha256 recorded. Record those three hashes with any
 # number you quote.
 #
+# DISK COST. Each arm's private CARGO_TARGET_DIR
+# (`~/.cache/cargo-target-ab-<sha12>[-ctl]`) is a full `--release` target
+# tree — hundreds of MB each, three per run. By DEFAULT this script removes
+# all three right after copying their binaries out, so a series of A/Bs does
+# not accumulate them; pass `--keep-targets` (or `--reuse-targets`, which
+# implies it) to keep them, and the run prints each kept path. The three
+# copied binaries plus `runs.tsv` under `--root` (default
+# `$HOME/scratch/apply_ab/<run-id>/`) are NOT cleaned up by this script —
+# `rm -rf` a run directory yourself once you are done with its numbers.
+#
 # Usage:
 #   scripts/apply_ab.sh <base-commit-ish> <head-commit-ish> [options]
 #   scripts/apply_ab.sh --bin-a A --bin-b B --bin-bp B' [options]
@@ -94,7 +104,14 @@
 #   --reuse-targets   keep the per-arm CARGO_TARGET_DIRs instead of wiping
 #                     them first. Faster re-runs of the SAME comparison, but
 #                     the three binaries (and so the resolution) are then the
-#                     ones built on some earlier day, not fresh today.
+#                     ones built on some earlier day, not fresh today. Implies
+#                     --keep-targets (there would be nothing to reuse next
+#                     time otherwise).
+#   --keep-targets    do not remove the three per-arm CARGO_TARGET_DIRs after
+#                     the build phase (each is a full release target tree,
+#                     hundreds of MB; the default is to reclaim them once
+#                     their binary is copied out, so a series of runs does
+#                     not accumulate them). The run prints each kept path.
 #   --harness FILE    copy FILE over each arm's
 #                     `uc_node/examples/apply_bench.rs` before building, so
 #                     every arm runs the IDENTICAL harness and only the
@@ -133,6 +150,7 @@ PAIRS=4
 SETTLE=1
 ROOT="$HOME/scratch/apply_ab"
 REUSE_TARGETS=0
+KEEP_TARGETS=0
 HARNESS=""
 BIN_A=""
 BIN_B=""
@@ -151,6 +169,7 @@ while [ $# -gt 0 ]; do
         --settle) SETTLE="$2"; shift 2 ;;
         --root) ROOT="$2"; shift 2 ;;
         --reuse-targets) REUSE_TARGETS=1; shift ;;
+        --keep-targets) KEEP_TARGETS=1; shift ;;
         --harness) HARNESS="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
         --bin-a) BIN_A="$2"; shift 2 ;;
         --bin-b) BIN_B="$2"; shift 2 ;;
@@ -325,6 +344,15 @@ build_arm() { # $1 = arm label (a|b|bp), $2 = sha, $3 = target-dir suffix
     ( cd "$wt" && CARGO_TARGET_DIR="$target" \
         cargo build --release --locked -p uc_node --example apply_bench >&2 )
     cp "$target/release/examples/apply_bench" "$RUN_DIR/apply_bench.$arm"
+    # Reclaim the target dir by default (M8): each is a full release build,
+    # hundreds of MB, and a series of A/Bs otherwise accumulates one per sha
+    # forever. --reuse-targets implies keeping it (there is nothing to reuse
+    # next time otherwise); --keep-targets keeps it without that implication.
+    if [ "$REUSE_TARGETS" -eq 1 ] || [ "$KEEP_TARGETS" -eq 1 ]; then
+        echo "   kept target dir for arm ${arm^^}: $target" >&2
+    else
+        rm -rf "$target"
+    fi
     git -C "$REPO" worktree remove --force "$wt"
     # Drop it from the cleanup list BY INDEX. `${WORKTREES[@]/$wt}` would
     # substring-replace inside every element and leave an empty one behind,

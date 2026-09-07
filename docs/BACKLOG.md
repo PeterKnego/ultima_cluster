@@ -72,9 +72,9 @@ to point at "§ 2a" for these residuals now point here.*
   → [The cluster FSM, explained](notes/uc2-cluster-fsm-explained.md)
 - ~~**A wiped node's kept table does not propagate by snapshot**~~ (plan 3
   residual b, post-R7) — **CLOSED by the same change.** There is no wipe
-  keep-alive to propagate: the retired `ScheduleRecord`, `revert_schedule_below` and
-  `shippable_schedule` are all retired, and the position-0 encoding rule they
-  needed went with them. The table is FSM state applied at **commit**, so an
+  keep-alive to propagate: `ScheduleRecord` (retired) and
+  `shippable_schedule` (retired) are gone — as is `revert_schedule_below` —
+  and the position-0 encoding rule they needed went with them. The table is FSM state applied at **commit**, so an
   uncommitted frame is never applied and a truncated one never existed as far
   as the FSM is concerned — there is nothing to revert and nothing to keep
   alive at an unanchored position.
@@ -94,7 +94,7 @@ to point at "§ 2a" for these residuals now point here.*
   is not expressible — a timezone database is replicated state that must agree
   on every node and across every upgrade. Cron-style rules are a possible
   fourth `kind` byte; the codec has room.
-- ~~**a retired `append_schedule_table` would have duplicated `append_config`'s body**~~ (ruling
+- ~~**`append_schedule_table` (retired) duplicated `append_config`'s body**~~ (ruling
   R8) — **moot**: the cluster FSM collapsed both into one `append_cluster`
   with a kind byte, because there is one frame type now. The underlying rule
   stands for any future append body: extract **with an A/B** against

@@ -423,7 +423,12 @@ impl SnapshotStateMachine for ClusterFsm {
                 settings: &s,
             },
             &mut img,
-        );
+        )
+        .ok_or_else(|| {
+            SnapshotError::Codec(
+                "cluster image: membership or schedule table exceeds u32::MAX bytes".into(),
+            )
+        })?;
         Ok((img, self.state.applied))
     }
 

@@ -74,20 +74,32 @@ pub struct ClusterImageParts<'a> {
 /// CRC covers exactly the bytes this call appends — not any bytes already in
 /// `out` before it — so a caller may compose this into a larger buffer
 /// without the checksum picking up unrelated prefix bytes.
-pub fn encode_cluster_image(p: &ClusterImageParts<'_>, out: &mut Vec<u8>) {
+///
+/// `None` if `p.membership` or `p.table` is longer than `u32::MAX` bytes —
+/// each rides a `u32` length prefix on the wire (the byte layout is
+/// unchanged), so a payload that long cannot be represented at all and must
+/// be refused rather than silently truncated by an `as u32` cast. Neither
+/// membership nor a 32-entry schedule table ever approaches this in
+/// practice; the check exists so the cast at the call site is provably safe
+/// rather than merely believed to be. `out` is left untouched on refusal —
+/// nothing is written until both lengths are known to fit.
+pub fn encode_cluster_image(p: &ClusterImageParts<'_>, out: &mut Vec<u8>) -> Option<()> {
+    let membership_len: u32 = p.membership.len().try_into().ok()?;
+    let table_len: u32 = p.table.len().try_into().ok()?;
     let start = out.len();
     out.extend_from_slice(CLUSTER_IMAGE_MAGIC);
     out.extend_from_slice(&CLUSTER_IMAGE_VERSION.to_le_bytes());
     out.extend_from_slice(&p.applied.to_le_bytes());
     out.extend_from_slice(&p.table_position.to_le_bytes());
     out.extend_from_slice(&p.settings_position.to_le_bytes());
-    out.extend_from_slice(&(p.membership.len() as u32).to_le_bytes());
+    out.extend_from_slice(&membership_len.to_le_bytes());
     out.extend_from_slice(p.membership);
-    out.extend_from_slice(&(p.table.len() as u32).to_le_bytes());
+    out.extend_from_slice(&table_len.to_le_bytes());
     out.extend_from_slice(p.table);
     out.extend_from_slice(p.settings);
     let crc = crc32fast::hash(&out[start..]);
     out.extend_from_slice(&crc.to_le_bytes());
+    Some(())
 }
 
 /// Total, CRC-checked, exact-framing decode. `None` covers every refusal
@@ -259,7 +271,7 @@ mod tests {
             settings: &settings,
         };
         let mut img = Vec::new();
-        encode_cluster_image(&parts, &mut img);
+        encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
 
         assert_eq!(&img[0..8], CLUSTER_IMAGE_MAGIC, "magic at 0");
         assert_eq!(
@@ -291,7 +303,7 @@ mod tests {
             settings: &settings,
         };
         let mut img = Vec::new();
-        encode_cluster_image(&parts, &mut img);
+        encode_cluster_image(&parts, &mut img).expect("well under u32::MAX");
         assert_eq!(decode_cluster_image(&img), Some(parts));
 
         for pos in 0..img.len() {
@@ -317,5 +329,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn encode_refuses_a_payload_longer_than_u32_max_rather_than_truncating() {
+        // A slice whose reported length is one past `u32::MAX`, without
+        // actually allocating that much memory: `encode_cluster_image`
+        // checks both length prefixes with `try_into` BEFORE writing or
+        // reading a single byte of either payload, so a dangling pointer
+        // paired with an oversized length is sound here — nothing ever
+        // dereferences it. This is exactly what an `as u32` cast at the call
+        // site would otherwise truncate silently (M10).
+        let over_len = u32::MAX as usize + 1;
+        let over: &[u8] =
+            unsafe { std::slice::from_raw_parts(std::ptr::NonNull::dangling().as_ptr(), over_len) };
+        let (membership, table, settings) = genesis_parts();
+
+        let mut out = Vec::new();
+        let parts = ClusterImageParts {
+            applied: 0,
+            table_position: 0,
+            settings_position: 0,
+            membership: over,
+            table: &table,
+            settings: &settings,
+        };
+        assert_eq!(
+            encode_cluster_image(&parts, &mut out),
+            None,
+            "an over-long membership payload must be refused"
+        );
+        assert!(out.is_empty(), "nothing is written to `out` on refusal");
+
+        let mut out = Vec::new();
+        let parts = ClusterImageParts {
+            applied: 0,
+            table_position: 0,
+            settings_position: 0,
+            membership: &membership,
+            table: over,
+            settings: &settings,
+        };
+        assert_eq!(
+            encode_cluster_image(&parts, &mut out),
+            None,
+            "an over-long table payload must be refused"
+        );
+        assert!(out.is_empty(), "nothing is written to `out` on refusal");
     }
 }

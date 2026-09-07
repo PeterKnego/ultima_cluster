@@ -10,6 +10,7 @@ const RETIRED: &[&str] = &[
     "DGRAM_KIND_SNAP_TABLE\\b",
     "SnapTableBody",
     "SNAP_TABLE_FIXED_LEN",
+    "SNAP_BEGIN_LAYOUT_V2\\b",
     "SNAP_BEGIN_LAYOUT_V3\\b",
     "schedule_state::",
     "ScheduleRecord\\b",
@@ -60,6 +61,7 @@ fn retired_symbols_are_gone_from_the_tree() {
             .args([
                 "grep",
                 "-nE",
+                "--untracked",
                 pat,
                 "--",
                 ":!docs/superpowers/",
@@ -72,7 +74,20 @@ fn retired_symbols_are_gone_from_the_tree() {
             .current_dir(root)
             .output()
             .unwrap();
-        if out.status.success() {
+        // `git grep` exits 0 on a match, 1 on no match, and anything else
+        // (128 typically: not a repository, bad pathspec, `git` missing) is
+        // an ERROR — not "clean". Treating a nonzero exit as "no hits" would
+        // pass this test vacuously (e.g. outside a git checkout, or in a
+        // `cargo package` tarball), which is exactly the state a real
+        // re-introduction could hide in. Only 0 and 1 are readable as "ran
+        // successfully"; everything else fails loudly.
+        let code = out.status.code();
+        assert!(
+            matches!(code, Some(0) | Some(1)),
+            "git grep failed for pattern {pat:?} (exit {code:?}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if code == Some(0) {
             let text = String::from_utf8_lossy(&out.stdout);
             let remaining: Vec<&str> = text.lines().filter(|line| !hit_is_excused(line)).collect();
             if !remaining.is_empty() {

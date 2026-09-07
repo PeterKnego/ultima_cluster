@@ -20,7 +20,11 @@ use uc_protocol::v2::cluster_image::{decode_cluster_image, encode_cluster_image}
 fuzz_target!(|data: &[u8]| {
     if let Some(parts) = decode_cluster_image(data) {
         let mut re = Vec::new();
-        encode_cluster_image(&parts, &mut re);
+        // `data` (and so every decoded part) is bounded by the fuzzer's own
+        // input size, always far under `u32::MAX` — re-encoding a decoded
+        // image can never hit the length refusal `encode_cluster_image`
+        // added for an out-of-range payload.
+        encode_cluster_image(&parts, &mut re).expect("a decoded image re-encodes");
         assert_eq!(decode_cluster_image(&re), Some(parts));
     }
 });

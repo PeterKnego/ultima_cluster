@@ -404,7 +404,7 @@ The apply layer never sees this frame: every FSM's apply loop yields
 `CLUSTER`. **Every** node adopts the table the same way — the cluster FSM
 applies the command at commit and publishes it on the view; there is no
 leader-at-append / follower-at-walk split any more, and no durable
-retired `ScheduleRecord` with a predecessor to revert to, because a committed frame is
+`ScheduleRecord` (retired) with a predecessor to revert to, because a committed frame is
 never truncated. What the table then does is
 [Log time and timers, explained § The schedule table](../notes/uc2-log-time-and-timers-explained.md#the-schedule-table).
 

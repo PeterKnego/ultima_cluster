@@ -205,7 +205,7 @@ one log stream (#11); the release-ledger line (#5) is process, not code
   instants): wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`. The first three
   are on `origin/main` (pushed 2026-09-04); the cluster FSM and coordinated
   snapshots are on local `main` (unpushed); the plan-3 retirement-and-proof
-  pass is on the `uc2+cluster-fsm-plan3` worktree branch.
+  pass is on the `worktree-uc2+cluster-fsm-plan3` worktree branch.
   - **FSM identity.** `SNAP_BEGIN` carries per-row identity hashes +
     versions, compared positionally, refused by name (replaces the
     `services_declared` bitmask); cnc slot line 7 = row name + hash,

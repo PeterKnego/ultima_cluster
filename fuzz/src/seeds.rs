@@ -1454,7 +1454,7 @@ pub fn uc_protocol_cluster_image() -> Vec<Seed> {
         settings: &settings,
     };
     let mut image = Vec::new();
-    encode_cluster_image(&parts, &mut image);
+    encode_cluster_image(&parts, &mut image).expect("genesis parts are well under u32::MAX");
 
     let mut bad_crc = image.clone();
     *bad_crc.last_mut().expect("non-empty image") ^= 1;

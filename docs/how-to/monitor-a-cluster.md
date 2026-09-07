@@ -222,8 +222,8 @@ the cluster stops.
 Since the cluster FSM (2.11 pending) this is a **narrow** alert, because the
 mechanisms that used to make it fire are gone:
 
-- there is no `state/schedules.state` and no retired `ScheduleRecord`, so the
-  crash-between-record-and-persist window is closed — the cluster agent
+- there is no `state/schedules.state` and no `ScheduleRecord` (retired), so
+  the crash-between-record-and-persist window is closed — the cluster agent
   replays the journal;
 - there is no revert-on-truncation and no wipe keep-alive, because an
   uncommitted frame is never applied in the first place; the
