@@ -256,6 +256,11 @@ reviewer wants a workload to attack.
   (`docs/releases.md`, release-evidence table).
 - **`uc2-gateway --version`** — fixed on `main` after the tag, lands in the
   next release (`docs/releases.md`).
+- **Snapshot-session probe counters are sender-local** — `snap_redirects`
+  and `snap_request_unknown_peer` (the member gate on `SNAP_REQUEST`, plan 2)
+  live in `SenderStats` with no `/metrics` family, `Node::` accessor or obs
+  record, so an operator cannot see a peer probing for sets. One gauge each,
+  read at scrape; found by plan 2's final re-review.
 - **Leader self-send `seal_failures` wart** — the encrypted leader's
   self-addressed position report fails to seal and counts; harmless,
   suppression deferred since M8 (`docs/releases.md`, v2.3.0).
