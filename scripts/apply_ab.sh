@@ -445,9 +445,13 @@ run_one() { # $1 = arm label, $2 = binary, $3 = rep number
 import json, sys
 rep, arm, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
 d = json.loads(sys.stdin.readline())
-print("  rep %2s  %-2s  %12.0f applied frames/s   driver %12.0f   pace_stalls %d"
-      % (rep, arm, d["min_rate"], d["driver_rate"], d["pace_stalls"]))
-open(tsv, "a").write("%s\t%f\t%f\t%d\n" % (arm, d["min_rate"], d["driver_rate"], d["pace_stalls"]))
+# A harness older than plan 3 (row d base arm 17d5c6b) prints no
+# pace_stalls; record -1 = unknown so the driver-bound guard is reported as
+# not evaluable for that arm rather than crashing the run.
+ps = d.get("pace_stalls", -1)
+print("  rep %2s  %-2s  %12.0f applied frames/s   driver %12.0f   pace_stalls %s"
+      % (rep, arm, d["min_rate"], d["driver_rate"], ("%d" % ps) if ps >= 0 else "n/a"))
+open(tsv, "a").write("%s\t%f\t%f\t%d\n" % (arm, d["min_rate"], d["driver_rate"], ps))
 ' "$rep" "$arm" "$TSV"
     [ "$SETTLE" = "0" ] || sleep "$SETTLE"
 }
@@ -505,7 +509,9 @@ def stats(v):
         # one setting min_rate — the guard the "driver_mean agrees" check
         # could never provide, because a paced driver's mean IS min_rate by
         # construction.
-        "pace_stalls_sum": sum(s),
+        "pace_stalls_sum": sum(x for x in s if x >= 0),
+        # -1 = this arm's harness predates the field (pre-plan-3 apply_bench)
+        "pace_stalls_known": all(x >= 0 for x in s),
     }
 
 
@@ -513,7 +519,9 @@ st = {k: stats(v) for k, v in rows.items()}
 head_vs_base = (st["B"]["mean"] - st["A"]["mean"]) / st["A"]["mean"] * 100.0
 resolution = abs(st["Bp"]["mean"] - st["B"]["mean"]) / st["B"]["mean"] * 100.0
 worst_sem = max(st[k]["sem_pct"] for k in ("A", "B", "Bp"))
-driver_bound = any(st[k]["pace_stalls_sum"] == 0 for k in ("A", "B", "Bp"))
+driver_bound = any(st[k]["pace_stalls_known"] and st[k]["pace_stalls_sum"] == 0
+                   for k in ("A", "B", "Bp"))
+unknown_arms = [k for k in ("A", "B", "Bp") if not st[k]["pace_stalls_known"]]
 
 # The rebuild resolution is the ONLY bar (these are NULL bars: adding noise to
 # the right-hand side would only make it easier to bless a real regression).
@@ -547,6 +555,11 @@ print("   head vs head'    %7.3f %%   (the RESOLUTION — the bar, build noise a
       % resolution)
 print("   worst arm sem    %7.3f %%   (run quality; must be <= the resolution)"
       % worst_sem)
+if unknown_arms:
+    print("   NOTE: arm(s) %s run a harness that predates `pace_stalls` (pre-plan-3"
+          % ",".join(unknown_arms))
+    print("         apply_bench), so the driver-bound guard could NOT be evaluated")
+    print("         for them; quote the number only with that caveat (row d).")
 if verdict == "inconclusive (driver-bound)":
     print("   verdict: %s" % verdict)
     print("          at least one arm's pace_stalls summed to 0 across its reps: the")
@@ -585,6 +598,7 @@ print("AB-JSON " + json.dumps({
     "a_pace_stalls_sum": st["A"]["pace_stalls_sum"],
     "b_pace_stalls_sum": st["B"]["pace_stalls_sum"],
     "bp_pace_stalls_sum": st["Bp"]["pace_stalls_sum"],
+    "pace_stalls_unknown_arms": unknown_arms,
     "driver_bound": driver_bound,
     "load1": load1, "other_builds": other_builds,
     "head_vs_base_pct": head_vs_base,
