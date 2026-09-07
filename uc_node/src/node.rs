@@ -794,6 +794,11 @@ pub struct Node {
     snapshot_set_position: Arc<AtomicU64>,
     /// Spec §9: the last instant this node commanded (leader-local).
     snapshot_instant_pub: Arc<AtomicU64>,
+    /// Ruling P13(b): the last STANDBY instant this node's `uc2-cluster`
+    /// agent ACTED on — LEARNER-ONLY by construction (a voter skips every
+    /// standby frame), which is what makes `Uc2StandbySnapshotStalled`
+    /// unable to fire on a voter. Written by that agent, read at scrape.
+    snapshot_standby_instant_pub: Arc<AtomicU64>,
     /// Spec §9: per-row missed-instant counters, and the count of abandoned
     /// instants. Read-only here; the consensus agent owns the writes.
     snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES],
@@ -1357,6 +1362,10 @@ impl Node {
         // Spec §9: the last instant COMMANDED (leader-local; a fresh boot has
         // commanded none) and the per-row missed-instant counters.
         let snapshot_instant_pub = Arc::new(AtomicU64::new(0));
+        // Ruling P13(b): its standby twin, written by the `uc2-cluster`
+        // agent (the one place that decides whether this node acts on a
+        // standby instant at all).
+        let snapshot_standby_instant_pub = Arc::new(AtomicU64::new(0));
         let snapshot_row_incomplete: [Arc<AtomicU64>; CNC_MAX_SERVICES] =
             std::array::from_fn(|_| Arc::new(AtomicU64::new(0)));
         let snapshot_instants_abandoned = Arc::new(AtomicU64::new(0));
@@ -1797,6 +1806,7 @@ impl Node {
             cluster_journal,
             cluster_install_rx,
             Arc::clone(&cluster_installed),
+            Arc::clone(&snapshot_standby_instant_pub),
         );
         let cluster_runner = AgentRunner::spawn("uc2-cluster", IdleStrategy::Yield, move || {
             cluster_agent.do_work()
@@ -1943,6 +1953,7 @@ impl Node {
             cluster_view: Arc::clone(&cluster_view),
             cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
             snapshot_last_commanded: 0,
+            snapshot_last_commanded_standby: false,
             snapshot_last_commanded_bytes: 0,
             snapshot_set_position: Arc::clone(&snapshot_set_position),
             snapshot_instant_pub: Arc::clone(&snapshot_instant_pub),
@@ -1988,6 +1999,7 @@ impl Node {
             fetch_cmd_tx,
             snapshot_set_position,
             snapshot_instant_pub,
+            snapshot_standby_instant_pub,
             snapshot_row_incomplete,
             snapshot_instants_abandoned,
             snapshot_fetched_position: stored_set_pos,
@@ -2396,6 +2408,7 @@ impl Node {
             reports_implausible: Arc::clone(&self.reports_implausible),
             crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
             snapshot_instant_position: Arc::clone(&self.snapshot_instant_pub),
+            snapshot_standby_instant_position: Arc::clone(&self.snapshot_standby_instant_pub),
             snapshot_set_position: Arc::clone(&self.snapshot_set_position),
             snapshot_row_incomplete: self.snapshot_row_incomplete.clone(),
             snapshot_fetched_position: Arc::clone(&self.snapshot_fetched_position),
@@ -3100,6 +3113,12 @@ struct Consensus {
     /// longer lead may never commit at all, and a gate still holding its
     /// position would refuse every later instant on this node, forever.
     snapshot_last_commanded: u64,
+    /// Whether [`Consensus::snapshot_last_commanded`] was STANDBY-flagged
+    /// (Ruling P13(a)). A standby instant is the LEARNERS' set to build, so on
+    /// a node that is not a learner it is not in flight here and superseding
+    /// it is not an abandonment. Reset with `snapshot_last_commanded`, and
+    /// meaningless while that is `0`.
+    snapshot_last_commanded_standby: bool,
     /// The APPEND position at the moment [`Consensus::snapshot_last_commanded`]
     /// was set — the cadence's baseline (spec §5.5: "a further
     /// `interval_bytes` of log has accrued since it"). Seeded at every leader
@@ -5010,13 +5029,29 @@ impl Consensus {
         if !matches!(self.sm.role(), Role::Leader) || self.appender.is_none() {
             return Err(SnapshotRefusal::Retry);
         }
+        // Ruling P13(a): a STANDBY instant addresses the LEARNERS' rows
+        // (spec §5.7) — on a node that is not a learner it was never this
+        // node's set to complete, so it is not in flight HERE, and
+        // superseding it is not an abandonment. Without this, a cluster
+        // running `snapshot.target = learners` with a cadence (the mode
+        // `--standby` shipped for) counts an abandonment against every
+        // declared row on every cadence tick, forever: the leader is a voter,
+        // its rows are SUPPOSED not to freeze, and `snapshot_set_position`
+        // does not move until an operator runs `uc2ctl snapshot fetch`.
+        //
+        // The learner arm is unreachable today — the leader gate above means
+        // this only ever runs on a voter — but the rule is about who owes the
+        // set, not about who happens to be able to lead, so it is written the
+        // way it is meant.
+        let mine_to_complete =
+            !self.snapshot_last_commanded_standby || self.sm.config().is_learner(self.id);
         // "In flight" = an instant this node commanded whose set it has not
         // completed. `snapshot_set_position` only ever advances through
         // `check_set_completeness`, and `snapshot_last_commanded` is cleared
         // on every leader exit and on a truncation that cuts the frame away,
         // so this cannot latch shut on a frame that will never commit.
-        let in_flight = self.snapshot_last_commanded
-            > self.snapshot_set_position.load(Ordering::Acquire)
+        let in_flight = mine_to_complete
+            && self.snapshot_last_commanded > self.snapshot_set_position.load(Ordering::Acquire)
             && self.snapshot_last_commanded > 0;
         if in_flight && !operator {
             let interval = self.snapshot_interval_bytes;
@@ -5071,10 +5106,23 @@ impl Consensus {
             self.note_abandoned_instant(self.snapshot_last_commanded);
         }
         self.snapshot_last_commanded = end;
+        self.snapshot_last_commanded_standby = standby;
         // The frame-END IS the append counter right after this append, so
         // the cadence's baseline needs no second load.
         self.snapshot_last_commanded_bytes = end;
-        self.snapshot_instant_pub.store(end, Ordering::Relaxed);
+        // Ruling P13(b): `uc2_snapshot_instant_position` is the FULL-instant
+        // gauge — the one `Uc2SnapshotStalled` pairs with
+        // `uc2_snapshot_set_position`, whose whole meaning is "instants are
+        // being commanded and this node's sets are not completing". A standby
+        // instant is BY DESIGN not this voter's set to complete, so counting
+        // it here would make the alert fire on a healthy standby cluster. The
+        // standby half is exported separately, by learners only
+        // (`uc2_snapshot_standby_instant_position`, published by the
+        // `uc2-cluster` agent when it ACTS on a standby frame) and watched by
+        // `Uc2StandbySnapshotStalled`.
+        if !standby {
+            self.snapshot_instant_pub.store(end, Ordering::Relaxed);
+        }
         // Spec §5.7 item 6: the redirect hint the sender agent reads when it
         // cannot serve a below-floor NAK. Only a STANDBY instant arms it — a
         // plain instant freezes this node's own rows too, so its set is here
@@ -5105,7 +5153,13 @@ impl Consensus {
     /// `uc2-cluster` agent did not reach it either.
     ///
     /// Off the hot path by construction: it runs only from the supersession
-    /// branch of [`Self::command_snapshot_inner`].
+    /// branch of [`Self::command_snapshot_inner`] — and, since Ruling P13(a),
+    /// only for an instant this node OWED a set for. A superseded STANDBY
+    /// instant on a node that is not a learner never reaches here: its rows
+    /// are supposed not to have frozen, so counting them would make a healthy
+    /// `snapshot.target = learners` cluster read exactly like one with a dead
+    /// FSM. The gate is in the caller, where `in_flight` is decided, because
+    /// that same fact also means the instant does not hold the next command.
     fn note_abandoned_instant(&self, p: u64) {
         let mut rows = String::new();
         for row in self.services.ids() {
@@ -7603,6 +7657,7 @@ impl Consensus {
                 // metric (`snapshot_instant_pub`) is deliberately NOT reset —
                 // it answers "what was last commanded", which stays true.
                 self.snapshot_last_commanded = 0;
+                self.snapshot_last_commanded_standby = false;
                 // Issue #6: abandon any leader open still awaiting its collapse
                 // ack. The cut itself is already commanded and remains correct
                 // (it drops only this node's own unreplicated tail), but the
@@ -7902,6 +7957,7 @@ impl Consensus {
         // the snapshot instant's.
         self.last_cluster_append = 0;
         self.snapshot_last_commanded = 0;
+        self.snapshot_last_commanded_standby = false;
         self.can_serve_flag.store(false, Ordering::Release);
         // Veil §5 discharge, observation 1 (the parked-reads liveness
         // blemish): `do_work` short-circuits every SUBSEQUENT cycle, so a
@@ -8119,6 +8175,7 @@ impl Consensus {
         // next complete set's retention sweep drops.
         if self.snapshot_last_commanded > to {
             self.snapshot_last_commanded = 0;
+            self.snapshot_last_commanded_standby = false;
         }
         let matching = self.pending_truncation == Some(epoch);
         self.feed(Event::Truncated { epoch, to });
@@ -9692,6 +9749,7 @@ mod tests {
                 .journal_arc(),
             cluster_install_rx,
             Arc::clone(&cluster_installed),
+            Arc::new(AtomicU64::new(0)),
         );
 
         let mut cons = Consensus {
@@ -9829,6 +9887,7 @@ mod tests {
             cluster_view,
             cluster_snapshot_pos: Arc::clone(&cluster_snapshot_pos),
             snapshot_last_commanded: 0,
+            snapshot_last_commanded_standby: false,
             snapshot_last_commanded_bytes: 0,
             snapshot_set_position: Arc::clone(&snapshot_set_position),
             snapshot_instant_pub: Arc::clone(&snapshot_instant_pub),
@@ -10041,6 +10100,94 @@ mod tests {
             h.cons.snapshot_instants_abandoned.load(Ordering::Relaxed),
             2
         );
+    }
+
+    /// **Ruling P13(a)**: a STANDBY instant is a learner's set to build. On a
+    /// node that is not a learner it was never this node's set to complete,
+    /// so superseding it is not an abandonment: no `snapshot_instants_
+    /// abandoned`, no `snapshot_row_incomplete` on any row (a voter's row is
+    /// SUPPOSED not to freeze for one), and no single-in-flight hold.
+    ///
+    /// Without this, `snapshot.target = learners` plus a cadence — exactly
+    /// the mode `--standby` shipped for — makes a healthy cluster's
+    /// monitoring indistinguishable from one with a dead FSM: the leader is a
+    /// voter, so it commands instants its own set can never complete, and
+    /// every cadence tick counts an abandonment against every declared row.
+    ///
+    /// P13(b) is the other half, pinned here too: a standby instant does not
+    /// advance `uc2_snapshot_instant_position`, which is what
+    /// `Uc2SnapshotStalled` keys on.
+    #[test]
+    fn a_superseded_standby_instant_is_not_this_voters_abandonment() {
+        let mut h = harness_with_rows(&["a"]);
+        drive_to_serving_leader(&mut h);
+        h.mark_capable(0);
+        h.set_settings_interval(4096);
+
+        // A learner in the committed membership, so `49 no_learner` does not
+        // pre-empt the case under test. This node (id 1) stays a voter.
+        let mut c = h.cons.sm.config().clone();
+        c.learners.push((9, (9, 1)));
+        c.version += 1;
+        h.cons.feed(Event::ConfigObserved {
+            position: h.cons.cnc.counters().append.load_acquire(),
+            config: c,
+        });
+        h.cons.do_work();
+        assert!(!h.cons.sm.config().is_learner(h.cons.id), "still a voter");
+
+        let p1 = h.cons.command_snapshot(true).expect("standby instant");
+        assert_eq!(
+            h.cons.snapshot_instant_pub.load(Ordering::Relaxed),
+            0,
+            "P13(b): a standby instant is not a FULL instant — the gauge \
+             Uc2SnapshotStalled keys on must not advance for one"
+        );
+
+        // No accrued bytes: a FULL instant still follows immediately, because
+        // there is nothing in flight that this node owes a set for.
+        let p2 = h
+            .cons
+            .command_snapshot(false)
+            .expect("a standby instant this voter will never complete blocks nothing");
+        assert!(p2 > p1);
+        assert_eq!(
+            h.cons.snapshot_instants_abandoned.load(Ordering::Relaxed),
+            0,
+            "superseding a standby instant on a voter is not an abandonment"
+        );
+        for row in 0..CNC_MAX_SERVICES {
+            assert_eq!(
+                h.cons.snapshot_row_incomplete[row].load(Ordering::Relaxed),
+                0,
+                "row {row} is supposed not to freeze for a standby instant"
+            );
+        }
+        assert_eq!(
+            h.cons.snapshot_instant_pub.load(Ordering::Relaxed),
+            p2,
+            "...and the FULL instant does advance the gauge"
+        );
+
+        // The gate is about STANDBY, not about supersession: a full instant
+        // still holds the next one until the interval accrues, and still
+        // counts the abandonment when one supersedes it.
+        assert_eq!(
+            h.cons
+                .command_snapshot(false)
+                .expect_err("the set at p2 is this node's to complete")
+                .code(),
+            2,
+            "in flight"
+        );
+        h.append_client_bytes(4096);
+        assert!(h.cons.command_snapshot(false).is_ok());
+        assert_eq!(
+            h.cons.snapshot_instants_abandoned.load(Ordering::Relaxed),
+            1,
+            "the FULL instant at p2 was abandoned"
+        );
+        assert_eq!(h.cons.snapshot_row_incomplete[0].load(Ordering::Relaxed), 1);
     }
 
     /// Ruling P1 as amended in fix round 1: retention prunes below the floor
@@ -10776,6 +10923,7 @@ mod tests {
                 rx
             },
             Arc::clone(&h.cons.cluster_installed),
+            Arc::new(AtomicU64::new(0)),
         );
         drive_to_serving_leader(&mut h);
 
@@ -10870,6 +11018,7 @@ mod tests {
                 rx
             },
             Arc::clone(&h.cons.cluster_installed),
+            Arc::new(AtomicU64::new(0)),
         );
         (h, hash)
     }

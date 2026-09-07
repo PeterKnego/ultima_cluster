@@ -260,6 +260,7 @@ RULE_META = {
     "Uc2LogTimeFrozen": {"severity": "warning", "real": False, "scenario": "log_time_frozen"},
     "Uc2ScheduleTableDiverged": {"severity": "warning", "real": False, "scenario": "schedule_diverged"},
     "Uc2SnapshotStalled": {"severity": "warning", "real": False, "scenario": "snapshot_stalled"},
+    "Uc2StandbySnapshotStalled": {"severity": "warning", "real": False, "scenario": "standby_snapshot_stalled"},
     "Uc2SnapshotSetDiverged": {"severity": "warning", "real": False, "scenario": "snapshot_set_diverged"},
 }
 
@@ -572,6 +573,66 @@ def build_Uc2SnapshotStalled():
     return r
 
 
+def build_Uc2StandbySnapshotStalled():
+    # Ruling P13(b): Uc2SnapshotStalled's shape, over the standby gauge, and
+    # the ONE builder here that also pins a rule NOT firing. The scenario
+    # captures TWO instances:
+    #   n0 (learner-shaped) - three distinct standby-instant positions across
+    #      the three real scrape rounds, complete-set gauge fixed: fires.
+    #   n1 (voter-shaped)   - standby gauge never written (0 throughout) and
+    #      its complete-set gauge equally fixed: must NOT fire.
+    # Both go into the same promtool test. `exp_samples` is written from
+    # `labels_from` (n0) alone, and promtool fails a test whose expression
+    # returns a sample the expectation does not list - so replaying n1's
+    # series here is what adjudicates "this rule cannot fire on a voter",
+    # rather than leaving it as prose in the rule's comment.
+    rows = load_scenario("standby_snapshot_stalled")
+    l_standby = select(rows, "uc2_snapshot_standby_instant_position", {"instance": "n0"})
+    l_set = select(rows, "uc2_snapshot_set_position", {"instance": "n0"})
+    v_standby = select(rows, "uc2_snapshot_standby_instant_position", {"instance": "n1"})
+    v_set = select(rows, "uc2_snapshot_set_position", {"instance": "n1"})
+    eval_time, total = total_for(0, range_secs=1800)
+    r = new_rule("warning", labels_from=l_standby)
+    r["series"].append(
+        (f'uc2_snapshot_standby_instant_position{{{l_standby["labels_str"]}}}', multi_level_hold(l_standby, total))
+    )
+    r["dilation"].append(
+        f"series=uc2_snapshot_standby_instant_position{{instance=n0}} policy=multi_level_hold "
+        f"range=1800s samples={total} (raw captured values {l_standby['values']} replayed as "
+        f"{len(l_standby['values'])} equal-length holds, {len(l_standby['values']) - 1} change "
+        f"point(s) inside the range window)"
+    )
+    r["series"].append((f'uc2_snapshot_set_position{{{l_set["labels_str"]}}}', hold_last(l_set, total)))
+    r["dilation"].append(
+        f"series=uc2_snapshot_set_position{{instance=n0}} policy=hold_last range=1800s "
+        f"samples={total} (last real scraped value \"{l_set['values'][-1]}\" held - zero changes)"
+    )
+    # The negative half: the voter's two series, replayed at the same length
+    # so promtool evaluates them at the same eval_time. multi_level_hold, NOT
+    # hold_last, deliberately: hold_last replays only the LAST captured value,
+    # which flattens ANY series to zero changes and would make this half
+    # vacuous — a regression that let a voter export an advancing standby
+    # gauge would still pass (measured: it did). multi_level_hold replays what
+    # was actually scraped, so "the voter does not fire" is a property of the
+    # EXPORTER adjudicated here, not of the dilation policy.
+    r["series"].append(
+        (f'uc2_snapshot_standby_instant_position{{{v_standby["labels_str"]}}}', multi_level_hold(v_standby, total))
+    )
+    r["dilation"].append(
+        f"series=uc2_snapshot_standby_instant_position{{instance=n1}} policy=multi_level_hold "
+        f"range=1800s samples={total} (voter-shaped: raw captured values {v_standby['values']} "
+        f"replayed faithfully; a voter skips every standby frame, so they are all 0, the series "
+        f"carries zero change points, and the rule must NOT fire on this instance)"
+    )
+    r["series"].append((f'uc2_snapshot_set_position{{{v_set["labels_str"]}}}', hold_last(v_set, total)))
+    r["dilation"].append(
+        f"series=uc2_snapshot_set_position{{instance=n1}} policy=hold_last range=1800s "
+        f"samples={total} (last real scraped value \"{v_set['values'][-1]}\" held - zero changes)"
+    )
+    r["eval_time"] = eval_time
+    return r
+
+
 def build_Uc2SnapshotSetDiverged():
     # Coordinated-snapshot spec §9: the same two-instance count_values shape
     # as build_Uc2ScheduleTableDiverged, verbatim, over
@@ -610,6 +671,7 @@ RULE_BUILDERS = {
     "Uc2LogTimeFrozen": build_Uc2LogTimeFrozen,
     "Uc2ScheduleTableDiverged": build_Uc2ScheduleTableDiverged,
     "Uc2SnapshotStalled": build_Uc2SnapshotStalled,
+    "Uc2StandbySnapshotStalled": build_Uc2StandbySnapshotStalled,
     "Uc2SnapshotSetDiverged": build_Uc2SnapshotSetDiverged,
 }
 

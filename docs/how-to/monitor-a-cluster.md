@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 96 families — is the
+exposition. The full series contract — 97 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -283,7 +283,8 @@ Seven families:
 
 | family | type | labels | meaning |
 |---|---|---|---|
-| `uc2_snapshot_instant_position` | gauge | none | the last instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances |
+| `uc2_snapshot_instant_position` | gauge | none | the last **full** instant this node **commanded as leader**, `0` if never. Leader-local: a follower's reading is whatever it last commanded in some earlier term, so never compare it across instances. A `--standby` instant does **not** advance it — see the next row |
+| `uc2_snapshot_standby_instant_position` | gauge | none | the last **standby** instant this node's `uc2-cluster` agent *acted on*, `0` if never. **Learner-only**: a voter skips every standby frame by design, so a voter always reads `0`. This is the gauge to watch on a `snapshot.target = learners` cluster — the leader is a voter, so its own instant gauge and set position tell you nothing about whether the standby work is happening |
 | `uc2_snapshot_set_position` | gauge | none | the newest **complete set** this node holds — its purge floor once persisted. `0` until the first one. **Must agree cluster-wide once caught up** |
 | `uc2_snapshot_fetched_position` | gauge | none | the newest set this node pulled whole from a learner with `uc2ctl snapshot fetch`, `0` if it never has. The standby return path's progress reading |
 | `uc2_snapshot_row_incomplete_total` | counter | `service`, `row` | instants this row failed to reach before the next one superseded it. The row whose counter climbs is the row stopping all purging |
@@ -304,7 +305,7 @@ node process, so a **node restart resets `_sum`/`_count` to zero** — an
 ordinary counter reset, which `rate()`/`increase()` already handle, but not
 something to read as "the freezes were undone".
 
-**Two alert rules.**
+**Three alert rules.**
 
 `Uc2SnapshotStalled` (warning, `for: 0m`):
 `changes(uc2_snapshot_instant_position[30m]) >= 2 and changes(uc2_snapshot_set_position[30m]) == 0`.
@@ -318,6 +319,21 @@ behind, then check `uc2_snapshot_row_incomplete_total{row}` for it. A row that
 is merely lagging catches up on its own — a replayed span acts on its last
 `SNAPSHOT` frame — so a *persistent* stall means a row that is not
 snapshot-capable, busy forever, or whose service process is dead.
+
+`Uc2StandbySnapshotStalled` (warning, `for: 0m`):
+`changes(uc2_snapshot_standby_instant_position[30m]) >= 2 and changes(uc2_snapshot_set_position[30m]) == 0`
+— the same shape, one gauge over. It exists because
+`snapshot.target = learners` makes the *healthy* steady state look like the
+failure above: the leader is a **voter**, so it commands instants its own rows
+are supposed not to freeze for, and its own set does not complete until
+someone runs `uc2ctl snapshot fetch`. So the full-instant rule deliberately
+ignores standby instants, and the standby work is watched on the node that
+actually does it. A voter exports `0` for the standby gauge and therefore
+cannot fire this rule — no role label needed. Firing means one of *that
+learner's* rows is not reaching P; the remedy is the same
+`uc2ctl snapshot show`, run on the learner. A learner whose standby gauge is
+**frozen** is a different fault (it is not receiving the frames at all) and
+shows up as `Uc2ReplicationStalled`/`Uc2PeerLagging` on that node.
 
 `Uc2SnapshotSetDiverged` (warning, `for: 60s`):
 `count(count_values("p", uc2_snapshot_set_position)) > 1` — the
@@ -339,7 +355,7 @@ about the set's position, so it was mixing two instants) and
 `uc2_snapshot_refused_fetch_expired_total` (a straggling answer to a
 `snapshot fetch` this node had already given up on — nothing is stored or
 installed, and the verb is simply re-runnable). Those last two are rendered
-but are not yet listed in `CONTRACT_SERIES`, so the 96-family count above does
+but are not yet listed in `CONTRACT_SERIES`, so the 97-family count above does
 not include them. Any of them non-zero means a joiner is stuck; the consensus
 agent names each one in a `snapshot_session_refused` record as it happens.
 
@@ -404,7 +420,8 @@ table:
 | `Uc2ServicePinnedAtLagBound` | a declared FSM that **is attached** has had its `uc_service_lag_bytes` at or above `uc2_fsm_lag_bytes` for 30s in bounded mode — that FSM is running, just slower than the log, and is pacing the whole cluster | warning |
 | `Uc2ServiceIdentityDrift` (FSM identity, 2.11 pending) | two nodes disagree on row `r`'s declared FSM name (its exported hash differs) — a config edit landed on some hosts and not others, or in a different order; the row's SNAP_BEGIN sessions will refuse each other the moment one runs | critical |
 | `Uc2ServiceVersionDrift` (FSM identity, 2.11 pending) | two nodes' attached services at row `r` report different non-zero packed versions — a rolling upgrade in progress, or a mis-deployed binary; refused on the snapshot path, **not** prevented on the live commit path (§7) | warning |
-| `Uc2SnapshotStalled` (coordinated snapshots, 2.11 pending) | this node has commanded snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
+| `Uc2SnapshotStalled` (coordinated snapshots, 2.11 pending) | this node has commanded **full** snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging | warning |
+| `Uc2StandbySnapshotStalled` (coordinated snapshots, 2.11 pending) | this **learner** has acted on standby snapshot instants at least twice in 30m with no complete set landing — one of its rows is silently stopping the standby set. Cannot fire on a voter (a voter exports `uc2_snapshot_standby_instant_position = 0`) | warning |
 | `Uc2SnapshotSetDiverged` (coordinated snapshots, 2.11 pending) | nodes disagree on the newest complete snapshot set's position, i.e. on their purge floors, for 60s | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.

@@ -74,15 +74,24 @@ pub struct ObsSources {
     pub reports_unattested: Arc<AtomicU64>,
     pub reports_implausible: Arc<AtomicU64>,
     pub crypto_handshake_failures: Arc<AtomicU64>,
-    /// Coordinated-snapshot spec §9: the last instant this node COMMANDED as
-    /// leader, `0` if it never has (`uc2_snapshot_instant_position`). Leader-
-    /// local — a follower's reading is stale, whatever it last commanded in
-    /// some earlier term.
+    /// Coordinated-snapshot spec §9: the last FULL instant this node
+    /// COMMANDED as leader, `0` if it never has
+    /// (`uc2_snapshot_instant_position`). Leader-local — a follower's reading
+    /// is stale, whatever it last commanded in some earlier term. A STANDBY
+    /// instant does NOT advance it (Ruling P13(b)); see the next field.
     pub snapshot_instant_position: Arc<AtomicU64>,
+    /// Ruling P13(b): the last STANDBY instant this node's `uc2-cluster`
+    /// agent ACTED on, `0` if it never has
+    /// (`uc2_snapshot_standby_instant_position`). LEARNER-ONLY by
+    /// construction — that agent skips every standby instant unless
+    /// `NODE_FLAG_LEARNER` is set, so a voter exports `0` and
+    /// `Uc2StandbySnapshotStalled` cannot fire on one.
+    pub snapshot_standby_instant_position: Arc<AtomicU64>,
     /// Coordinated-snapshot spec §5.3/§9: the position of the newest
     /// COMPLETE snapshot set this node holds, `0` until the first one
     /// (`uc2_snapshot_set_position`) — must agree cluster-wide once caught
-    /// up. Alerts: `Uc2SnapshotStalled`, `Uc2SnapshotSetDiverged`.
+    /// up. Alerts: `Uc2SnapshotStalled`, `Uc2StandbySnapshotStalled`,
+    /// `Uc2SnapshotSetDiverged`.
     pub snapshot_set_position: Arc<AtomicU64>,
     /// Spec §9: `uc2_snapshot_row_incomplete_total{row}` — instants row
     /// `row` failed to reach before being superseded.
@@ -147,6 +156,7 @@ impl ObsSources {
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),

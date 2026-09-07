@@ -353,8 +353,13 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     `snapshots/` once). **Retention is node-owned and delete-only** — both
     per-writer `retain_newest(2)` pruners are gone, because only the node can
     see a *set*. A replayed span acts on its LAST `SNAPSHOT` frame (ruling
-    P10). 7 metric series + `Uc2SnapshotStalled` /
-    `Uc2SnapshotSetDiverged`; `snapshot_session_refusals()` is a 5-tuple. The
+    P10). 8 metric series + `Uc2SnapshotStalled` /
+    `Uc2StandbySnapshotStalled` / `Uc2SnapshotSetDiverged`;
+    `snapshot_session_refusals()` is a 5-tuple. The instant gauge is split by
+    ruling P13: `uc2_snapshot_instant_position` counts FULL instants only and
+    `uc2_snapshot_standby_instant_position` is learner-only, so a healthy
+    `target = learners` cluster (whose voter leader's own set never completes
+    without `uc2ctl snapshot fetch`) does not read as a dead FSM. The
     freeze cost is real and documented, not hidden: a freeze on a quorum
     stalls commit at `P + fsm_lag` until the slowest ends, which is the whole
     reason `--standby` exists. Explainer

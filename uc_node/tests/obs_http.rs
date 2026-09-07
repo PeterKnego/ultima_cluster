@@ -94,6 +94,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
         snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+        snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
         snapshot_set_position: Arc::new(AtomicU64::new(0)),
         snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
         snapshot_fetched_position: Arc::new(AtomicU64::new(0)),

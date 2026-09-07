@@ -77,6 +77,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_snapshot_freeze_seconds_sum",
     "uc2_snapshot_freeze_seconds_count",
     "uc2_snapshot_instant_position",
+    "uc2_snapshot_standby_instant_position",
     "uc2_snapshot_set_position",
     "uc2_snapshot_fetched_position",
     // Plan 2 (spec §6): the replicated schedule table.
@@ -316,8 +317,19 @@ fn service_rows(s: &ObsSources, commit: u64, now: u64) -> Vec<ServiceRow> {
     // the leader's last-commanded instant has advanced since the last
     // scrape — BEFORE any row's raw reading folds in below, so a freeze that
     // lands in the same scrape as the advance counts toward the fresh max.
-    s.snapshot_freeze
-        .observe_instant(s.snapshot_instant_position.load(Ordering::Relaxed));
+    //
+    // Ruling P13(b) split that reading in two, so the edge is the max of
+    // both: a VOTER's rows freeze for the FULL instants it commands (the
+    // standby gauge is 0 there), and a LEARNER's rows freeze for the STANDBY
+    // instants its uc2-cluster agent acts on (it never leads, so the full
+    // gauge is 0 or a stale reading from an earlier term). Taking the max
+    // keeps one edge detector for both roles; positions only grow, so it
+    // moves exactly when the instant this node's rows are working on does.
+    s.snapshot_freeze.observe_instant(
+        s.snapshot_instant_position
+            .load(Ordering::Relaxed)
+            .max(s.snapshot_standby_instant_position.load(Ordering::Acquire)),
+    );
     let mut rows = Vec::new();
     for id in 0..CNC_MAX_SERVICES as u8 {
         if declared & (1u64 << id) == 0 {
@@ -602,6 +614,12 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
         "uc2_snapshot_instant_position",
         "The last snapshot instant this node COMMANDED as leader, 0 if never (coordinated-snapshot spec §9); leader-local — a follower's reading is whatever it last commanded in some earlier term.",
         s.snapshot_instant_position.load(Ordering::Relaxed),
+    );
+    push_gauge(
+        out,
+        "uc2_snapshot_standby_instant_position",
+        "The last STANDBY snapshot instant this node's uc2-cluster agent ACTED on, 0 if it never has (coordinated-snapshot spec §5.7/§9, ruling P13). LEARNER-ONLY: a voter skips every standby instant by design, so it exports 0 — which is what keeps Uc2StandbySnapshotStalled off voters. Alert: Uc2StandbySnapshotStalled.",
+        s.snapshot_standby_instant_position.load(Ordering::Acquire),
     );
     push_gauge(
         out,
@@ -1337,6 +1355,7 @@ mod tests {
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
@@ -1398,7 +1417,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            96,
+            97,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -1722,6 +1741,7 @@ mod tests {
             reports_implausible: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+            snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
             snapshot_set_position: Arc::new(AtomicU64::new(0)),
             snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
             snapshot_fetched_position: Arc::new(AtomicU64::new(0)),

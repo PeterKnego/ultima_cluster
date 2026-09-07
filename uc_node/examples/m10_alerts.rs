@@ -69,6 +69,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "log_time_frozen",
     "schedule_diverged",
     "snapshot_stalled",
+    "standby_snapshot_stalled",
     "snapshot_set_diverged",
 ];
 
@@ -198,6 +199,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "log_time_frozen" => scenario_log_time_frozen(),
         "schedule_diverged" => scenario_schedule_diverged(),
         "snapshot_stalled" => scenario_snapshot_stalled(),
+        "standby_snapshot_stalled" => scenario_standby_snapshot_stalled(),
         "snapshot_set_diverged" => scenario_snapshot_set_diverged(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
@@ -400,6 +402,7 @@ fn synthetic_sources_named(node_id: u32, name: Option<FsmName>) -> ObsSources {
         reports_implausible: Arc::new(AtomicU64::new(0)),
         crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
         snapshot_instant_position: Arc::new(AtomicU64::new(0)),
+        snapshot_standby_instant_position: Arc::new(AtomicU64::new(0)),
         snapshot_set_position: Arc::new(AtomicU64::new(0)),
         snapshot_row_incomplete: std::array::from_fn(|_| Arc::new(AtomicU64::new(0))),
         snapshot_fetched_position: Arc::new(AtomicU64::new(0)),
@@ -1512,6 +1515,83 @@ fn scenario_snapshot_stalled() -> (SeriesFile, Disclosure) {
 }
 
 // ----------------------------------------------------------- scenario 19
+
+/// Uc2StandbySnapshotStalled — **synthetic, disclosed**: Ruling P13(b)'s
+/// standby half of the scenario above, and the ONE scenario in this harness
+/// that also pins a rule NOT firing.
+///
+/// Two synthetic `ObsSources`, each its own real exporter:
+///
+/// - `"n0"` is **learner-shaped**: its `uc2-cluster` agent acts on a fresh
+///   standby instant each round (`uc2_snapshot_standby_instant_position`
+///   4096, 8192, 12288) while its own complete set stays at 4096 — one of the
+///   learner's rows never reaches P.
+/// - `"n1"` is **voter-shaped**: on a `snapshot.target = learners` cluster it
+///   is the node COMMANDING those instants, and it exports
+///   `uc2_snapshot_standby_instant_position = 0` throughout because a voter
+///   skips every standby frame by construction. Its own
+///   `uc2_snapshot_set_position` is equally frozen (a standby cluster's voter
+///   set only completes on `uc2ctl snapshot fetch`) — so the ONLY thing
+///   keeping it out of the alert is the standby gauge, which is exactly the
+///   property P13(b) added it for.
+///
+/// Both instances go into the same `promtool` test, whose `exp_samples` lists
+/// `n0` alone: promtool fails on an unexpected extra sample, so the voter
+/// instance NOT firing is adjudicated, not merely asserted in prose. Before
+/// P13(b) the "voter" series here is precisely what `Uc2SnapshotStalled`
+/// fired on, permanently, on a healthy standby cluster.
+fn scenario_standby_snapshot_stalled() -> (SeriesFile, Disclosure) {
+    let learner = synthetic_sources(0);
+    let voter = synthetic_sources(1);
+    // Both hold a complete set at 4096 and never complete another.
+    learner.snapshot_set_position.store(4096, Ordering::Release);
+    voter.snapshot_set_position.store(4096, Ordering::Release);
+
+    let srv_l = ObsServer::serve(learner.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let srv_v = ObsServer::serve(voter.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr_l = srv_l.local_addr();
+    let addr_v = srv_v.local_addr();
+
+    let families = [
+        "uc2_snapshot_standby_instant_position",
+        "uc2_snapshot_set_position",
+    ];
+    let mut sf = SeriesFile::new();
+    for instant in [4096u64, 8192, 12288] {
+        learner
+            .snapshot_standby_instant_position
+            .store(instant, Ordering::Release);
+        // The voter's cell is never written — that is the point.
+        sf.record_round("n0", &scrape(addr_l), &families);
+        sf.record_round("n1", &scrape(addr_v), &families);
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv_l.stop();
+    srv_v.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "standby_snapshot_stalled",
+            rules: &["Uc2StandbySnapshotStalled"],
+            state: "synthetic",
+            method: "two synthetic ObsSources, each its own real exporter. \"n0\" is \
+                     learner-shaped: uc2_snapshot_standby_instant_position is bumped (4096, \
+                     8192, 12288) across the three real scrapes — its uc2-cluster agent acting \
+                     on a fresh standby instant each round — while uc2_snapshot_set_position \
+                     stays at 4096. \"n1\" is voter-shaped: on a snapshot.target = learners \
+                     cluster it COMMANDS those instants but skips every standby frame, so its \
+                     standby gauge is never written (0 throughout) and its set position is \
+                     equally frozen at 4096. Both render through the real encoder, and both go \
+                     into the same promtool test: n0's series fires the changes([30m]) >= 2 / \
+                     == 0 rule and n1's must not, which promtool adjudicates because an \
+                     unexpected extra firing sample fails the test."
+                .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 20
 
 /// Uc2SnapshotSetDiverged — **synthetic, disclosed**: the same two-instance
 /// `count_values` shape as `scenario_schedule_diverged` — two synthetic

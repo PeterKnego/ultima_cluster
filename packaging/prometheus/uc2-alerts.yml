@@ -265,6 +265,32 @@ groups:
     for: 0m
     labels: { severity: warning }
     annotations: { summary: "{{ $labels.instance }} has commanded snapshot instants at least twice in 30m with no complete set landing — one FSM is silently stopping all purging; run `uc2ctl snapshot show` on the leader and look for the row whose snapshot_pos is behind" }
+  - alert: Uc2StandbySnapshotStalled
+    # Ruling P13(b): the standby half of Uc2SnapshotStalled, and the reason
+    # that rule keys on `uc2_snapshot_instant_position` (FULL instants) only.
+    # With `snapshot.target = learners` the leader is a VOTER: it commands
+    # instants its own rows are SUPPOSED not to freeze for, and its own set
+    # never completes until an operator runs `uc2ctl snapshot fetch`. Keying
+    # the stalled rule on the full gauge alone would make that healthy steady
+    # state fire permanently — the precise failure Uc2SnapshotStalled exists
+    # to make loud, reported on a working cluster.
+    #
+    # So the standby work is watched on the node that actually does it. The
+    # LEARNER's uc2-cluster agent publishes every standby instant it acts on
+    # into `uc2_snapshot_standby_instant_position`; a voter skips those frames
+    # by construction and exports 0, so this rule CANNOT fire on a voter and
+    # needs no role label to say so. The shape is Uc2SnapshotStalled's,
+    # verbatim, on the same instance: the standby instants keep arriving and
+    # this learner's own complete-set position never moves, so one of its rows
+    # is not reaching P.
+    #
+    # A learner exporting a FROZEN standby gauge is a different fault (it is
+    # not seeing the frames at all) and is covered by Uc2ReplicationStalled /
+    # Uc2PeerLagging on the same node, not here.
+    expr: changes(uc2_snapshot_standby_instant_position[30m]) >= 2 and changes(uc2_snapshot_set_position[30m]) == 0
+    for: 0m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} is a standby learner that has acted on snapshot instants at least twice in 30m with no complete set landing — one of ITS rows is silently stopping the standby set; run `uc2ctl snapshot show` on this learner and look for the row whose snapshot_pos is behind" }
   - alert: Uc2SnapshotSetDiverged
     # Coordinated-snapshot spec §5.3/§9: the newest COMPLETE set's position
     # must agree cluster-wide once every node is caught up — it is the

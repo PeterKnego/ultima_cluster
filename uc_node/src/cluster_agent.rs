@@ -179,6 +179,17 @@ pub struct ClusterAgent {
     /// Mirrors `snapshot_pos` for the consensus agent (task 5's floor
     /// computation) — Ruling R2.
     cluster_snapshot_pos: Arc<AtomicU64>,
+    /// Ruling P13(b): the last STANDBY instant this agent ACTED on, `0` if it
+    /// never has — `uc2_snapshot_standby_instant_position`, read at scrape.
+    ///
+    /// This agent sees every `SNAPSHOT` frame and applies spec §5.7's rule
+    /// itself (a standby instant is skipped unless `NODE_FLAG_LEARNER` is
+    /// set), so writing the cell exactly where it does NOT skip gives a
+    /// LEARNER-ONLY gauge for free: a voter never reaches the store, so it
+    /// exports 0, and `Uc2StandbySnapshotStalled` therefore cannot fire on
+    /// one. Written only at an instant this agent acts on — rare by
+    /// construction, and never on the commit path.
+    standby_instant_pos: Arc<AtomicU64>,
     out: Vec<u8>,
     /// Ruling R12: the SAME journal handle the archive agent records into
     /// (`Archive::journal_arc`). The appender never overwrites bytes the
@@ -230,6 +241,7 @@ impl ClusterAgent {
         journal: Arc<Journal>,
         install: mpsc::Receiver<(u64, PathBuf)>,
         installed: Arc<AtomicU64>,
+        standby_instant_pos: Arc<AtomicU64>,
     ) -> ClusterAgent {
         let snapshot_pos = fsm.last_applied().filter(|_| start > 0).unwrap_or(0);
         cluster_snapshot_pos.store(snapshot_pos, Ordering::Release);
@@ -241,6 +253,7 @@ impl ClusterAgent {
             snapshot_dir,
             snapshot_pos,
             cluster_snapshot_pos,
+            standby_instant_pos,
             out: Vec::new(),
             journal,
             replay_gap_logged: false,
@@ -354,10 +367,17 @@ impl ClusterAgent {
                             // yields it like any other node-only frame and
                             // pays no freeze (§5.7's whole point).
                             let end = pos + align_frame_len(hdr.length as usize) as u64;
-                            if hdr.flags & FLAG_SNAPSHOT_STANDBY != 0
-                                && node_flags & NODE_FLAG_LEARNER == 0
-                            {
+                            let standby = hdr.flags & FLAG_SNAPSHOT_STANDBY != 0;
+                            if standby && node_flags & NODE_FLAG_LEARNER == 0 {
                                 continue;
+                            }
+                            // Ruling P13(b): past the skip, so this node IS a
+                            // learner and this IS the standby P its rows act
+                            // on. Written before the freeze, which can take
+                            // O(state) — a scrape mid-freeze should already
+                            // read the instant the row is working on.
+                            if standby {
+                                self.standby_instant_pos.store(end, Ordering::Release);
                             }
                             // Controller Ruling P2: `set_consumed(end)` BEFORE
                             // `take_snapshot()` — `freeze()` tags the image at
@@ -577,6 +597,13 @@ impl ClusterAgent {
                     // Only the EARLIER instants in a span are meaningless, and
                     // pass 1 is what drops those.
                     if Some(rf.position) == freeze_at {
+                        // Ruling P13(b), as on the live path: `freeze_at` is
+                        // `last_actionable_instant`'s pick, which applies the
+                        // same §5.7 skip, so a standby instant reaching here
+                        // means this node is a learner acting on it.
+                        if rf.header.flags & FLAG_SNAPSHOT_STANDBY != 0 {
+                            self.standby_instant_pos.store(end, Ordering::Release);
+                        }
                         // Ruling P2's order, as on the live path.
                         self.fsm.set_consumed(end);
                         if let Err(e) = Self::freeze_and_write(
@@ -860,6 +887,7 @@ mod tests {
             empty_journal(dir.path()),
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e3);
         cnc.counters().commit.store_release(e1); // only the first command is committed
@@ -914,6 +942,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
             no_install_route(),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         // Strictly inside the only frame: not 0 (genesis), not 96 (its end).
@@ -987,6 +1016,7 @@ mod tests {
             empty_journal(dir.path()),
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e_msg);
         cnc.counters().commit.store_release(e_msg);
@@ -1043,6 +1073,7 @@ mod tests {
             empty_journal(dir.path()),
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         cnc.counters().durable.store_release(e1);
         cnc.counters().commit.store_release(e1);
@@ -1089,6 +1120,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
             no_install_route(),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         assert!(agent.do_work());
@@ -1137,6 +1169,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             empty_journal(dir.path()),
             no_install_route(),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
 
@@ -1225,6 +1258,7 @@ mod tests {
             journal,
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         let head = stage_overrun(&buffer, &cnc);
         assert!(head > e3, "the prime moves the head well past the frames");
@@ -1299,6 +1333,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             journal,
             no_install_route(),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         let head = stage_overrun(&buffer, &cnc);
@@ -1381,6 +1416,7 @@ mod tests {
             journal,
             no_install_route(),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
         );
         // Stand in for "this agent already holds the artifact at p1".
         agent.snapshot_pos = p1;
@@ -1437,6 +1473,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             journal,
             no_install_route(),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
 

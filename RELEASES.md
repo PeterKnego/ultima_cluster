@@ -219,13 +219,15 @@ schedule table an operator applies with one command.
   frontier, so an image built at an earlier position and renamed passes any
   check a state machine could write, and installing it would silently leave a
   span of frames unapplied. UC still prescribes nothing about the payload.
-  Seven new metric families go with the feature —
-  `uc2_snapshot_{instant,set,fetched}_position`,
+  Eight new metric families go with the feature —
+  `uc2_snapshot_{instant,standby_instant,set,fetched}_position`,
   `uc2_snapshot_row_incomplete_total{row}` and a three-series stand-in for a
-  freeze-duration histogram — plus two alert rules: `Uc2SnapshotStalled`, which
-  makes "one broken FSM silently stops all purging" page, and
-  `Uc2SnapshotSetDiverged`, which fires when two nodes disagree about their
-  purge floors.
+  freeze-duration histogram — plus three alert rules: `Uc2SnapshotStalled`,
+  which makes "one broken FSM silently stops all purging" page;
+  `Uc2StandbySnapshotStalled`, its learner-only twin for a
+  `snapshot.target = learners` cluster (where the leader is a voter whose own
+  set is *supposed* not to complete); and `Uc2SnapshotSetDiverged`, which
+  fires when two nodes disagree about their purge floors.
   → [Monitor a cluster § The snapshot families](docs/how-to/monitor-a-cluster.md#the-snapshot-families-211-pending) ·
   [Instance directory § The artifact envelope](docs/reference/instance-directory.md#the-artifact-envelope-and-who-deletes-artifacts) ·
   [Back up a cluster § Verify before you trust it](docs/how-to/back-up-a-cluster.md#verify-before-you-trust-it)

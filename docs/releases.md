@@ -747,18 +747,34 @@ instants outright; with it the cost is ~2× journal read over the span plus one
 freeze on a row that is already behind — and "the instant completed on the
 first attempt" becomes a bar the integration tests can assert.
 
-**Observability** (§9). Seven series:
+**Observability** (§9). Eight series:
 `uc2_snapshot_row_incomplete_total{row}`, `uc2_snapshot_freeze_seconds_max{row}`
 / `_sum{row}` / `_count{row}` (three standing in for a histogram this encoder
 has no type for, derived once per scrape from the new cnc slot word
 `freeze_ns` at `+496`), `uc2_snapshot_instant_position`,
-`uc2_snapshot_set_position` and `uc2_snapshot_fetched_position`. Two alerts:
-`Uc2SnapshotStalled` (a `changes()` pair, because the instant gauge is
-leader-local and the set gauge is per node, so only "is each series moving" is
-an honest question) and `Uc2SnapshotSetDiverged` (`count_values` over the set
-position — nodes disagreeing about their purge floors). Both have
-`m10_alert_fire.sh` builders and `m10_alerts.rs` scenarios, so the M10 gate's
-completeness cross-check stays green. `Node::snapshot_session_refusals()` grew
+`uc2_snapshot_standby_instant_position`, `uc2_snapshot_set_position` and
+`uc2_snapshot_fetched_position`. Three alerts: `Uc2SnapshotStalled` (a
+`changes()` pair, because the instant gauge is leader-local and the set gauge
+is per node, so only "is each series moving" is an honest question),
+`Uc2StandbySnapshotStalled` (the same pair over the standby gauge) and
+`Uc2SnapshotSetDiverged` (`count_values` over the set position — nodes
+disagreeing about their purge floors). All three have `m10_alert_fire.sh`
+builders and `m10_alerts.rs` scenarios, so the M10 gate's completeness
+cross-check stays green.
+
+The instant gauge is split in two on purpose (ruling P13, final wave). With
+`snapshot.target = learners` the leader is a **voter**: it commands instants
+whose sets only the learners build, so its own set never completes until an
+operator runs `uc2ctl snapshot fetch`. Keying one rule on one gauge would have
+made that healthy steady state fire `Uc2SnapshotStalled` permanently — and
+would have counted an abandonment against every declared row on every cadence
+tick. So `uc2_snapshot_instant_position` counts FULL instants only; the
+standby half is published by the `uc2-cluster` agent when it *acts* on a
+standby frame, which happens only on a learner, so a voter exports `0` and
+`Uc2StandbySnapshotStalled` cannot fire on one without a role label. On the
+same rule, a superseded standby instant on a non-learner is not counted
+abandoned, does not bump `uc2_snapshot_row_incomplete_total`, and does not
+hold the single-in-flight gate. `Node::snapshot_session_refusals()` grew
 to a 5-tuple. Eleven log records, from `snapshot_commanded` through
 `snapshot_redirect_unknown` (six info, five warn); the redirect's **sending**
 side has none, because

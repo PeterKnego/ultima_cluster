@@ -112,7 +112,10 @@ logged and retried, never fatal, so the symptom is silence rather than a crash.
 
 On a cluster with `/metrics` on, `Uc2SnapshotStalled` makes the "one broken FSM
 silently stops all purging" case loud, and
-`uc2_snapshot_row_incomplete_total{row}` names the row —
+`uc2_snapshot_row_incomplete_total{row}` names the row. On a
+`snapshot.target = learners` cluster watch `Uc2StandbySnapshotStalled` on the
+learners instead: the leader is a voter there, and its own set is *supposed*
+not to complete until `uc2ctl snapshot fetch` runs —
 see [Monitor a cluster § The snapshot families](monitor-a-cluster.md#the-snapshot-families-211-pending).
 
 ## What happens to a node that falls below the floor
