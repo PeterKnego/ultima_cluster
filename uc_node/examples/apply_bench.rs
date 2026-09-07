@@ -149,8 +149,12 @@ fn unix_ns() -> u64 {
 /// Extracted from `main` so the runner's parser and this printer cannot
 /// drift: `apply_json_line_shape_is_pinned` below pins the exact bytes, and
 /// the script's `--selftest` stubs print that same shape. `min_rate` — the
-/// slowest FSM's applied frames/s — is the hop number the A/B compares; the
-/// rest is provenance for the run.
+/// slowest FSM's applied frames/s — is the hop number the A/B compares;
+/// `pace_stalls` (Ruling Q9) is the driver-is-the-limiter guard: the driver
+/// spins on `min_applied` only when it is running ahead of the FSMs, so a
+/// driver that never stalls IS the limiter and the run's `min_rate` is
+/// measuring the driver, not the apply hop; the rest is provenance for the
+/// run.
 #[allow(clippy::too_many_arguments)]
 fn render_apply_json(
     fsms: u8,
@@ -161,6 +165,7 @@ fn render_apply_json(
     secs: f64,
     min_rate: f64,
     driver_rate: f64,
+    pace_stalls: u64,
     per: &[(f64, u64)],
 ) -> String {
     let per_json: Vec<String> = per
@@ -169,7 +174,7 @@ fn render_apply_json(
         .map(|(i, p)| format!("{{\"fsm\":{i},\"rate\":{:.0},\"lag_waits\":{}}}", p.0, p.1))
         .collect();
     format!(
-        "APPLY-JSON {{\"fsms\":{fsms},\"mode\":\"{mode}\",\"lag\":{lag},\"payload\":{payload},\"frame\":{frame},\"secs\":{secs:.2},\"min_rate\":{min_rate:.0},\"driver_rate\":{driver_rate:.0},\"per\":[{}]}}",
+        "APPLY-JSON {{\"fsms\":{fsms},\"mode\":\"{mode}\",\"lag\":{lag},\"payload\":{payload},\"frame\":{frame},\"secs\":{secs:.2},\"min_rate\":{min_rate:.0},\"driver_rate\":{driver_rate:.0},\"pace_stalls\":{pace_stalls},\"per\":[{}]}}",
         per_json.join(",")
     )
 }
@@ -395,6 +400,7 @@ fn main() -> anyhow::Result<()> {
             elapsed,
             min_rate,
             driver_rate,
+            stalls,
             &per,
         )
     );
@@ -440,12 +446,14 @@ mod tests {
             8.0,
             1_234_567.4,
             2_345_678.6,
+            42,
             &[(1_234_567.4, 11), (2_345_678.6, 0)],
         );
         assert_eq!(
             line,
             "APPLY-JSON {\"fsms\":2,\"mode\":\"bounded\",\"lag\":16777216,\"payload\":64,\
              \"frame\":96,\"secs\":8.00,\"min_rate\":1234567,\"driver_rate\":2345679,\
+             \"pace_stalls\":42,\
              \"per\":[{\"fsm\":0,\"rate\":1234567,\"lag_waits\":11},\
              {\"fsm\":1,\"rate\":2345679,\"lag_waits\":0}]}"
         );

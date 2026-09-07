@@ -28,14 +28,24 @@
 # source measure apart. That is arm B′ here, and it is the bar.
 #
 # THE VERDICT RULE (pinned by --selftest; quote it whenever you quote a run).
-# The rebuild resolution is the ONLY bar. Run noise is a SEPARATE gate on
-# whether the run is worth reading at all — it never widens the bar.
+# Ruling Q9's driver-bound guard runs FIRST: `apply_bench`'s driver thread
+# paces itself on the slowest FSM (spins while `append - min(applied) >
+# window`), so in steady state a driver that never stalls IS the limiter —
+# its arm's `min_rate` measures the driver, not the apply hop. The pin is
+# `pace_stalls`, exported per run in `APPLY-JSON` and summed per arm here; an
+# arm's `driver_mean` agreeing with another's proves nothing on its own
+# (they are paced to be equal by construction), which is why this guard,
+# not that comparison, is the gate row's precondition. Once that guard is
+# clear, the rebuild resolution is the ONLY bar. Run noise is a SEPARATE gate
+# on whether the run is worth reading at all — it never widens the bar.
 #
 #   head_vs_base = (mean(B)  - mean(A)) / mean(A) * 100   [the candidate]
 #   resolution   = |mean(B') - mean(B)| / mean(B) * 100   [the bar]
 #   sem(X)       = stdev(X) / (mean(X) * sqrt(K)) * 100   [per arm, %]
 #
-#   if K < 2 or max(sem(A), sem(B), sem(B')) > resolution:
+#   if any arm's summed pace_stalls == 0:
+#       verdict = "inconclusive (driver-bound)"
+#   elif K < 2 or max(sem(A), sem(B), sem(B')) > resolution:
 #       verdict = "inconclusive (noisy run)"
 #   elif |head_vs_base| <= resolution:  verdict = "within resolution"
 #   else:                               verdict = "outside resolution"
@@ -169,8 +179,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # arithmetic under test is the arithmetic that runs on a live A/B, not a copy
 # of it. The line's shape is pinned on the Rust side by
 # `uc_node/examples/apply_bench.rs`'s `apply_json_line_shape_is_pinned`.
-make_stub() { # $1 = path, rest = the min_rate values to cycle
-    local path="$1"; shift
+make_stub() { # $1 = path, $2 = pace_stalls (fixed per rep for this stub), rest = min_rate values to cycle
+    local path="$1" stalls="$2"; shift 2
     printf '%s\n' "$@" > "$path.rates"
     cat > "$path" <<'STUB'
 #!/usr/bin/env bash
@@ -182,18 +192,24 @@ mapfile -t rates < "$0.rates"
 r="${rates[$((n % ${#rates[@]}))]}"
 echo $((n + 1)) > "$0.n"
 echo "== fake apply_bench (selftest stub) =="
-echo "APPLY-JSON {\"fsms\":1,\"mode\":\"bounded\",\"lag\":16777216,\"payload\":64,\"frame\":96,\"secs\":1.00,\"min_rate\":$r,\"driver_rate\":$((r * 2)),\"per\":[{\"fsm\":0,\"rate\":$r,\"lag_waits\":0}]}"
+echo "APPLY-JSON {\"fsms\":1,\"mode\":\"bounded\",\"lag\":16777216,\"payload\":64,\"frame\":96,\"secs\":1.00,\"min_rate\":$r,\"driver_rate\":$((r * 2)),\"pace_stalls\":PACE_STALLS_PLACEHOLDER,\"per\":[{\"fsm\":0,\"rate\":$r,\"lag_waits\":0}]}"
 STUB
+    sed -i "s/PACE_STALLS_PLACEHOLDER/$stalls/" "$path"
     chmod +x "$path"
 }
 
-selftest_case() { # $1 = label, $2 = expected AB-JSON (python dict literal), rest = 6 rates
+selftest_case() { # $1 = label, $2 = expected AB-JSON (python dict literal), $3-$8 = 6 rates
+                   # (a1 a2 b1 b2 bp1 bp2), $9-$11 = optional per-arm pace_stalls
+                   # (a b bp; default 100 each — Ruling Q9's driver-bound guard
+                   # needs at least one arm's stalls to actually be zero, so
+                   # every OTHER case must pin a realistic nonzero value).
     local label="$1" expect="$2"; shift 2
     local dir="$ROOT/selftest/$label"
     rm -rf "$dir"; mkdir -p "$dir"
-    make_stub "$dir/a" "$1" "$2"
-    make_stub "$dir/b" "$3" "$4"
-    make_stub "$dir/bp" "$5" "$6"
+    local sa="${7:-100}" sb="${8:-100}" sbp="${9:-100}"
+    make_stub "$dir/a" "$sa" "$1" "$2"
+    make_stub "$dir/b" "$sb" "$3" "$4"
+    make_stub "$dir/bp" "$sbp" "$5" "$6"
     local out
     out="$("$0" --bin-a "$dir/a" --bin-b "$dir/b" --bin-bp "$dir/bp" \
         --pairs 2 --secs 1 --settle 0 --root "$dir/run")"
@@ -246,7 +262,16 @@ if [ "$SELFTEST" -eq 1 ]; then
           "head_vs_base_pct":0.0,"resolution_pct":0.09803921568627451,
           "verdict":"inconclusive (noisy run)","runs_per_arm":2}' \
         1000000 1040000  1020000 1020000  1021000 1021000
-    echo "== selftest PASSED (all three verdicts)"
+    # Case 4 — Ruling Q9: arm B never stalls the pacing loop (pace_stalls=0
+    #   on every rep), so B's `min_rate` is measuring the driver, not the
+    #   apply hop, however the means and sems compare — the driver-bound
+    #   verdict must win over "within"/"outside"/"noisy".
+    selftest_case driver_bound \
+        '{"a_mean":1000000.0,"b_mean":1000000.0,"bp_mean":1000000.0,
+          "verdict":"inconclusive (driver-bound)","runs_per_arm":2}' \
+        1000000 1000000  1000000 1000000  1000000 1000000 \
+        100 0 100
+    echo "== selftest PASSED (all four verdicts)"
     exit 0
 fi
 
@@ -392,9 +417,9 @@ run_one() { # $1 = arm label, $2 = binary, $3 = rep number
 import json, sys
 rep, arm, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
 d = json.loads(sys.stdin.readline())
-print("  rep %2s  %-2s  %12.0f applied frames/s   driver %12.0f"
-      % (rep, arm, d["min_rate"], d["driver_rate"]))
-open(tsv, "a").write("%s\t%f\t%f\n" % (arm, d["min_rate"], d["driver_rate"]))
+print("  rep %2s  %-2s  %12.0f applied frames/s   driver %12.0f   pace_stalls %d"
+      % (rep, arm, d["min_rate"], d["driver_rate"], d["pace_stalls"]))
+open(tsv, "a").write("%s\t%f\t%f\t%d\n" % (arm, d["min_rate"], d["driver_rate"], d["pace_stalls"]))
 ' "$rep" "$arm" "$TSV"
     [ "$SETTLE" = "0" ] || sleep "$SETTLE"
 }
@@ -417,14 +442,15 @@ import json, math, sys
 
 rows = {"A": [], "B": [], "Bp": []}
 for line in open(sys.argv[1]):
-    arm, rate, driver = line.split("\t")
-    rows[arm].append((float(rate), float(driver)))
+    arm, rate, driver, stalls = line.split("\t")
+    rows[arm].append((float(rate), float(driver), int(stalls)))
 load1, other_builds = float(sys.argv[2]), int(sys.argv[3])
 
 
 def stats(v):
     r = sorted(x[0] for x in v)
     d = [x[1] for x in v]
+    s = [x[2] for x in v]
     n = len(r)
     mean = sum(r) / n
     # Standard error of the MEAN, in percent of the mean. This — not a
@@ -445,6 +471,13 @@ def stats(v):
         "sem_pct": sem_pct,
         "driver_mean": sum(d) / n,
         "driver_over_min": (sum(d) / n) / mean,
+        # Ruling Q9 (I1): pace_stalls, summed across this arm's reps. The
+        # driver only spins here when it is running AHEAD of the slowest FSM
+        # (apply_bench.rs's pacing loop), so an arm that never stalls is the
+        # one setting min_rate — the guard the "driver_mean agrees" check
+        # could never provide, because a paced driver's mean IS min_rate by
+        # construction.
+        "pace_stalls_sum": sum(s),
     }
 
 
@@ -452,11 +485,18 @@ st = {k: stats(v) for k, v in rows.items()}
 head_vs_base = (st["B"]["mean"] - st["A"]["mean"]) / st["A"]["mean"] * 100.0
 resolution = abs(st["Bp"]["mean"] - st["B"]["mean"]) / st["B"]["mean"] * 100.0
 worst_sem = max(st[k]["sem_pct"] for k in ("A", "B", "Bp"))
+driver_bound = any(st[k]["pace_stalls_sum"] == 0 for k in ("A", "B", "Bp"))
 
 # The rebuild resolution is the ONLY bar (these are NULL bars: adding noise to
 # the right-hand side would only make it easier to bless a real regression).
-# Noise gets its own gate, and its answer is "no answer".
-if worst_sem > resolution:
+# Noise gets its own gate, and its answer is "no answer". Ruling Q9's
+# driver-bound guard runs FIRST and overrides every other verdict: if any arm
+# never stalled the pacing loop, that arm's min_rate is the driver's own
+# ceiling, not the apply hop's, and nothing downstream of that number means
+# what the other verdicts claim it means.
+if driver_bound:
+    verdict = "inconclusive (driver-bound)"
+elif worst_sem > resolution:
     verdict = "inconclusive (noisy run)"
 elif abs(head_vs_base) <= resolution:
     verdict = "within resolution"
@@ -471,15 +511,22 @@ for k, label in (("A", "A  base      "), ("B", "B  head      "),
           "spread %5.2f %%  sem %6.3f %%"
           % (label, s["n"], s["mean"], s["p50"], s["min"], s["max"],
              s["spread_pct"], s["sem_pct"]))
-    print("                 driver mean %12.0f  driver/min %.3f"
-          % (s["driver_mean"], s["driver_over_min"]))
+    print("                 driver mean %12.0f  driver/min %.3f  pace_stalls(sum) %d"
+          % (s["driver_mean"], s["driver_over_min"], s["pace_stalls_sum"]))
 print("   box: loadavg 1-min %.2f, other cargo/rustc %d" % (load1, other_builds))
 print("   head vs base     %+7.3f %%   (the candidate)" % head_vs_base)
 print("   head vs head'    %7.3f %%   (the RESOLUTION — the bar, build noise alone)"
       % resolution)
 print("   worst arm sem    %7.3f %%   (run quality; must be <= the resolution)"
       % worst_sem)
-if verdict == "inconclusive (noisy run)":
+if verdict == "inconclusive (driver-bound)":
+    print("   verdict: %s" % verdict)
+    print("          at least one arm's pace_stalls summed to 0 across its reps: the")
+    print("          driver never waited on the slowest FSM, so that arm's min_rate is")
+    print("          the driver's own ceiling, not the apply hop's (Ruling Q9). Neither")
+    print("          'within'/'outside' nor 'noisy' is claimed — see the gate doc's row")
+    print("          d procedure (the arm-cost verdict belongs to row f instead).")
+elif verdict == "inconclusive (noisy run)":
     print("   verdict: %s" % verdict)
     print("          the arms are noisier (%.3f %%) than the resolution they are"
           % worst_sem)
@@ -507,6 +554,10 @@ print("AB-JSON " + json.dumps({
     "a_driver_over_min": st["A"]["driver_over_min"],
     "b_driver_over_min": st["B"]["driver_over_min"],
     "bp_driver_over_min": st["Bp"]["driver_over_min"],
+    "a_pace_stalls_sum": st["A"]["pace_stalls_sum"],
+    "b_pace_stalls_sum": st["B"]["pace_stalls_sum"],
+    "bp_pace_stalls_sum": st["Bp"]["pace_stalls_sum"],
+    "driver_bound": driver_bound,
     "load1": load1, "other_builds": other_builds,
     "head_vs_base_pct": head_vs_base,
     "resolution_pct": resolution,
