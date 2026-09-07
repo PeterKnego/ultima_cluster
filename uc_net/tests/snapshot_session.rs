@@ -31,7 +31,7 @@ use uc_net::rebuild::NakConfig;
 use uc_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent, RefusalKind};
 use uc_net::sender::{CtrlMsg, Sender, SenderConfig, identity_mask};
 use uc_protocol::identity::FsmName;
-use uc_protocol::v2::datagram::{SNAP_BEGIN_LAYOUT_V2, SNAP_BEGIN_LAYOUT_V4};
+use uc_protocol::v2::datagram::{SNAP_BEGIN_LAYOUT_V2_RETIRED, SNAP_BEGIN_LAYOUT_V4};
 
 const TERM: u32 = 3;
 const CAP: u64 = 1 << 20; // 1 MiB ring
@@ -381,7 +381,7 @@ impl Harness {
         );
         let body = &mut d[DATAGRAM_HEADER_LEN..];
         body[0..4].copy_from_slice(&98u32.to_le_bytes()); // session
-        body[4] = SNAP_BEGIN_LAYOUT_V2;
+        body[4] = SNAP_BEGIN_LAYOUT_V2_RETIRED;
         body[8..16].copy_from_slice(&snap_pos(0).to_le_bytes()); // snapshot_pos
         body[16..24].copy_from_slice(&64u64.to_le_bytes()); // total_len
         body[24..32].copy_from_slice(&1u64.to_le_bytes()); // services_declared (0.6.0 shape)
@@ -560,8 +560,8 @@ fn a_failed_publish_is_counted_and_retried_not_stranded() {
 fn a_layout_one_begin_is_refused_as_a_pre_070_peer() {
     let mut h = build(FaultConfig::default(), &["fsm0"]);
     let st = h.follower.stats();
-    // layout 1 (SNAP_BEGIN_LAYOUT_V2) = a wire ≤0.6.0-shaped body.
-    h.forge_begin(SNAP_BEGIN_LAYOUT_V2, identity_hashes_of(&["fsm0"]), [0; 8]);
+    // layout 1 (SNAP_BEGIN_LAYOUT_V2_RETIRED) = a wire ≤0.6.0-shaped body.
+    h.forge_begin(SNAP_BEGIN_LAYOUT_V2_RETIRED, identity_hashes_of(&["fsm0"]), [0; 8]);
     h.pump_until("the legacy-layout refusal is counted", |_| {
         st.snap_refused_legacy_peer.load(Ordering::Relaxed) > 0
     });

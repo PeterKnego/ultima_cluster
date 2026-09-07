@@ -595,8 +595,8 @@ pub struct FollowerStats {
     /// A `SNAP_BEGIN` arrived whose `layout` byte is not
     /// [`SNAP_BEGIN_LAYOUT_V4`] — the named refusal **`peer speaks a
     /// SNAP_BEGIN shape we do not`**. The session is dropped. Two shapes reach
-    /// it: wire ≤ 0.6.0 (`SNAP_BEGIN_LAYOUT_V2`) and the retired intermediate
-    /// 0.7.0 body that carried a trailing config (`SNAP_BEGIN_LAYOUT_V3`,
+    /// it: wire ≤ 0.6.0 (`SNAP_BEGIN_LAYOUT_V2_RETIRED`) and the retired intermediate
+    /// 0.7.0 body that carried a trailing config (`SNAP_BEGIN_LAYOUT_V3_RETIRED`,
     /// cluster-FSM spec §5.6) — whose first 120 bytes decode identically to a
     /// V4 body, so this discriminator is the ONLY thing separating them.
     /// NOTE this is the *defensive* half for the 0.6.0 case: a genuine
@@ -2196,8 +2196,8 @@ impl FollowerReceiver {
         let now = self.now_ns();
         if b.layout != SNAP_BEGIN_LAYOUT_V4 {
             // "peer speaks a SNAP_BEGIN shape we do not" — wire ≤ 0.6.0
-            // (`SNAP_BEGIN_LAYOUT_V2`), or the intermediate 0.7.0 shape that
-            // carried a trailing config (`SNAP_BEGIN_LAYOUT_V3`, retired by
+            // (`SNAP_BEGIN_LAYOUT_V2_RETIRED`), or the intermediate 0.7.0 shape that
+            // carried a trailing config (`SNAP_BEGIN_LAYOUT_V3_RETIRED`, retired by
             // spec §5.6). Both are refused here by NAME rather than misread:
             // the V3 body's first 120 bytes decode identically, so nothing
             // but this discriminator separates them.
