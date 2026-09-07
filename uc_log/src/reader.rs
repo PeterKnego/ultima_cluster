@@ -114,6 +114,14 @@ impl<'a> Iterator for FrameIter<'a> {
     /// `(absolute position, frame header, payload bytes)`.
     type Item = (u64, FrameHeader, &'a [u8]);
 
+    // Forced inline: this is the apply loop's per-frame step. `uc_service`'s
+    // `apply_cycle` grew past LLVM's inlining budget over the 2.11.0 flag day
+    // and this 322-byte `next` fell out of line as a GOT-indirect call on
+    // every frame — with `Egress::publish`, the two calls were the whole
+    // ≈ 7 ns/frame gap left after the arm fixes (apply-profile + objdump,
+    // 17d5c6b vs d0f126a, 2026-09-07). The attribute pins it regardless of
+    // how big the caller gets.
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         // Detach the run slice from `&mut self` so the yielded payload borrows
         // the underlying `'a` allocation, not this iterator.

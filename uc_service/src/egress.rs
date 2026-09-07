@@ -44,6 +44,11 @@ impl Egress {
     /// a duplicate response for an already-committed op — harmless: committed is
     /// committed, and the client matcher takes the first answer for a
     /// `(client_id, local_seq)` pair.
+    // Forced inline: the apply loop calls this once per frame. It was inlined
+    // at 17d5c6b and fell out of line (a GOT-indirect call per frame) once
+    // `apply_cycle` outgrew the inliner's budget — see `FrameIter::next` in
+    // `uc_log::reader` for the measurement (2026-09-07).
+    #[inline(always)]
     pub(crate) fn publish(&mut self, client_id: u32, seq: u32, position: u64, resp: &[u8]) {
         self.scratch.clear();
         self.scratch.extend_from_slice(&position.to_le_bytes());
