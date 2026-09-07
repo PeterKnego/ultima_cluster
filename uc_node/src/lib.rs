@@ -71,13 +71,13 @@ pub use cluster_fsm::{
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{
-    DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy,
+    DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, FetchRefusal, Node, NodeConfig, PurgePolicy,
     REASON_AUDIT_FAILED, REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED, REASON_AUTH_MISSING,
     REASON_AUTH_UNKNOWN_KEY, REASON_SCHEDULE_DECODE, REASON_SCHEDULE_DIGEST,
     REASON_SCHEDULE_MISSING, REASON_SCHEDULE_UNKNOWN_FSM, REASON_SETTINGS_BOUNDS,
     REASON_SETTINGS_DECODE, REASON_SETTINGS_DIGEST, REASON_SETTINGS_MISSING,
-    REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED, SnapshotRefusal, StartOpts,
-    SubmitError,
+    REASON_SNAPSHOT_ABOVE_DURABLE, REASON_SNAPSHOT_NO_LEARNER, REASON_SNAPSHOT_UNSUPPORTED,
+    SnapshotRefusal, StartOpts, SubmitError,
 };
 pub use services::{FsmLag, ServicesConfig};
 /// Time-and-timers §6: the per-row timer counters carried by

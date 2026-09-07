@@ -849,6 +849,14 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     );
     push_counter(
         &mut out,
+        "uc2_snapshot_refused_fetch_expired_total",
+        "Snapshot sessions refused because they answered a `snapshot fetch` this node had already given up on: the set is neither stored nor installed, and the operator's verb is re-runnable (coordinated-snapshot spec §5.7, Ruling P11).",
+        s.receiver
+            .snap_refused_fetch_expired
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut out,
         "uc2_snapshot_intake_io_failures_total",
         "Local I/O failures on the snapshot INTAKE path: a `.part` that could not be created/sized or written to, or a completed artifact whose fsync/rename failed. Retried, but a persistent count means this node's snapshot dir is full, read-only, or obstructed (spec §14.3). Since 2.8.1 a failed publish is retried at most once per 250 ms per transfer — on the duty cycle AND on the chunk path — so a standing obstacle makes this climb at about four per second, not at the poll or chunk rate.",
         s.receiver.snap_intake_io_failures.load(Ordering::Relaxed),
@@ -1481,13 +1489,21 @@ mod tests {
             "{text}"
         );
         // Coordinated-snapshot spec §5.6: and the fourth, the one-position
-        // rule's — a source that mixed two instants.
+        // rule's — a source that mixed two instants; plus the fifth (Ruling
+        // P11), a learner answering a fetch this node gave up on.
         s.receiver
             .snap_refused_position_mismatch
             .fetch_add(2, Ordering::Relaxed);
+        s.receiver
+            .snap_refused_fetch_expired
+            .fetch_add(4, Ordering::Relaxed);
         let text = render_prometheus(&s);
         assert!(
             text.contains("uc2_snapshot_refused_position_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("uc2_snapshot_refused_fetch_expired_total 4\n"),
             "{text}"
         );
     }

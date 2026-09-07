@@ -636,6 +636,18 @@ pub struct FollowerStats {
     /// identity slot, so "the source mixed two instants" is never read as
     /// "the two nodes disagree about which FSMs exist".
     pub snap_refused_position_mismatch: AtomicU64,
+    /// Fix round 2 (Ruling P11): a `SNAP_BEGIN` arrived carrying the session
+    /// id of a fetch whose arm had already EXPIRED — the named refusal
+    /// **`fetch_expired`**, the fifth slot of
+    /// `uc_node::Node::snapshot_session_refusals`.
+    ///
+    /// It is a safety refusal, not a diagnostic one: without it the answer to
+    /// a timed-out store-only pull matches no arm, falls to the default
+    /// [`IntakeMode::Install`], and is installed BY FIAT — the cluster
+    /// artifact routed to the `uc2-cluster` agent and the floor adopted —
+    /// which is exactly what a store-only pull exists to prevent. A count here
+    /// means a learner answered a fetch late; re-run the operator's verb.
+    pub snap_refused_fetch_expired: AtomicU64,
     /// Detail for the most recent IDENTITY refusal (`RefusalKind::Identity`)
     /// on this receiver — the row, both sides' hash, and which kind of
     /// mismatch it was (always `Identity` here). `None` until the first such
@@ -991,6 +1003,18 @@ pub struct FollowerReceiver {
     /// A fetch whose `SNAP_REQUEST` has gone out and whose session has not
     /// opened yet — see [`ArmedFetch`].
     armed_fetch: Option<ArmedFetch>,
+    /// Fix round 2 (Ruling P11): the session id of the fetch whose arm most
+    /// recently EXPIRED. A `SNAP_BEGIN` carrying it is refused
+    /// (`snap_refused_fetch_expired`) rather than taken as an ordinary
+    /// session: the answer to a fetch that timed out would otherwise fall to
+    /// the default [`IntakeMode::Install`] and be installed by fiat.
+    ///
+    /// One slot, overwritten by the next expiry — fetches are operator-driven
+    /// and one at a time. The signal is the id THIS node minted for a fetch,
+    /// never the position: an Install session whose artifacts sit far above
+    /// this node's durable frontier is exactly what a below-floor joiner is
+    /// supposed to receive.
+    last_expired_fetch: Option<u32>,
     /// The session id the next node-initiated fetch will use. Local to this
     /// receiver: a session is scoped to one `(peer, session)` pair, and the
     /// source adopts the id we send it (`SnapRequestBody::session`).
@@ -1253,6 +1277,7 @@ impl FollowerReceiver {
             stored_set_pos: Arc::new(AtomicU64::new(0)),
             fetch_rx: None,
             armed_fetch: None,
+            last_expired_fetch: None,
             fetch_session_seq: 0,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
@@ -2285,6 +2310,21 @@ impl FollowerReceiver {
             self.snap_drop_intake_from(from);
             return;
         }
+        // Fix round 2 (Ruling P11): the session id of a fetch whose arm has
+        // EXPIRED. Refused outright — never taken as an ordinary session,
+        // which is what the default `IntakeMode::Install` would make of it:
+        // the answer to a store-only pull would have its cluster artifact
+        // routed to the `uc2-cluster` agent and its floor adopted BY FIAT.
+        // Keyed on the id THIS node minted, never on the position — an
+        // Install session above `durable` is legal by definition (a joiner is
+        // below its floor). Counted; the node layer names `fetch_expired`.
+        if self.last_expired_fetch == Some(b.session) {
+            self.stats
+                .snap_refused_fetch_expired
+                .fetch_add(1, Ordering::Release);
+            self.snap_drop_intake_from(from);
+            return;
+        }
         // Fix round 1, Important 1 + 3: a FETCH binds the position it asked
         // for, and a store-only fetch may not take a set above this node's own
         // log. Two ways the answer can be the wrong set:
@@ -2583,9 +2623,14 @@ impl FollowerReceiver {
             // crash right after a completion could leave a persisted snapshot
             // FLOOR (and, on the store-only path, a `stored_set_pos` the node
             // has since acted on) naming a set whose directory entries never
-            // reached the disk. Both sibling writers do this —
-            // `uc_node::cluster_agent::take_snapshot` (which logs a Warn on
-            // failure) — and this is the third writer of the same files.
+            // reached the disk.
+            //
+            // This is the THIRD writer of these files, and of the other two
+            // only ONE does this today: `uc_node::cluster_agent::take_snapshot`
+            // (which logs a Warn on failure). `uc_service::snapshots::
+            // SnapshotStore::publish` fsyncs the file and renames with no
+            // directory fsync at all — the same gap, in the service SDK's own
+            // write path, scheduled for this plan's final wave.
             //
             // Best-effort, exactly as there: the artifact IS renamed and the
             // session must not stall on a directory handle. A failure is
@@ -2831,16 +2876,28 @@ impl FollowerReceiver {
         self.seal_and_send(peer, DGRAM_KIND_SNAP_REQUEST, &mut d);
     }
 
-    /// Coordinated-snapshot spec §5.7 items 5–6: start at most one
-    /// node-requested fetch per duty cycle. A fetch is DROPPED (not queued)
-    /// while a transfer is already in flight: the requester is told nothing,
-    /// its pending record times out, and re-running the operator's verb is the
-    /// retry. Queuing would be worse — a fetch that starts minutes later, on a
-    /// set the learner may have pruned.
-    fn drain_fetch_route(&mut self) -> bool {
+    /// Coordinated-snapshot spec §5.7 items 5–6: expire a stale arm, then
+    /// start at most one node-requested fetch per duty cycle. A fetch is
+    /// DROPPED (not queued) while a transfer is already in flight: the
+    /// requester is told nothing, its pending record times out, and re-running
+    /// the operator's verb is the retry. Queuing would be worse — a fetch that
+    /// starts minutes later, on a set the learner may have pruned.
+    ///
+    /// `now` is passed in rather than read here, like `snap_upkeep`'s, so a
+    /// test can place the expiry at a chosen instant.
+    fn drain_fetch_route(&mut self, now: u64) -> bool {
+        // Fix round 2 (Ruling P11): an expiring arm leaves its SESSION ID
+        // behind. A learner answering after the deadline would otherwise match
+        // no arm, fall to the default `IntakeMode::Install`, and have its set
+        // installed BY FIAT — cluster artifact routed, floor adopted — which
+        // is precisely what a store-only pull must never do. One slot,
+        // overwritten by the next expiry: fetches are operator-driven and
+        // one-at-a-time, so a second expiry means the first straggler is no
+        // longer the one to worry about.
         if let Some(a) = self.armed_fetch
-            && self.now_ns() > a.expires_ns
+            && now > a.expires_ns
         {
+            self.last_expired_fetch = Some(a.session);
             self.armed_fetch = None;
         }
         let Some(rx) = self.fetch_rx.as_ref() else {
@@ -3174,7 +3231,7 @@ impl FollowerReceiver {
         // Coordinated-snapshot spec §5.7: and start at most one node-requested
         // fetch. Last, and after the intake poll above, so a fetch never
         // competes with a transfer that is finishing this very cycle.
-        if self.drain_fetch_route() {
+        if self.drain_fetch_route(now) {
             did = true;
         }
         did
@@ -7224,6 +7281,91 @@ mod tests {
                     .all(|e| !e.file_name().to_string_lossy().contains(&above.to_string())),
             "nothing of the above-durable set was written"
         );
+    }
+
+    /// Fix round 2 (Ruling P11): a fetch's arm EXPIRES, and the answer that
+    /// arrives after it must not become an INSTALL. Before this, a learner
+    /// answering a store-only pull late matched no arm, fell to the default
+    /// `IntakeMode::Install`, and had its cluster artifact routed to the
+    /// `uc2-cluster` agent and its floor adopted by fiat — the exact thing
+    /// store-only exists to prevent. The distinguishing signal is the SESSION
+    /// ID this node minted for the fetch, never the position: an ordinary
+    /// Install session above `durable` is entirely legal (a joiner is below
+    /// its floor by definition).
+    #[test]
+    fn a_begin_for_an_expired_fetch_is_refused_and_never_installed() {
+        use Ordering::Relaxed;
+        const P: u64 = 4096;
+        let b = buffer();
+        b.counters().prime(P);
+        let mut learner = FakeLeader::new();
+        let mut r = follower(&b, learner.addr());
+        let dir = snap_scratch_dir();
+        r.set_snapshot_intake(
+            dir.path().to_path_buf(),
+            ident(0b1),
+            Arc::new(|| [0u32; 8]),
+            None,
+        );
+        let st = r.stats();
+        let to = r.local_addr();
+
+        r.open_store_only_intake(learner.addr(), 55, P);
+        learner.recv().expect("the SNAP_REQUEST went out");
+        let armed = r.armed_fetch.expect("armed");
+        assert_eq!(armed.session, 55);
+
+        // One nanosecond short of the bar the arm is still live...
+        r.drain_fetch_route(armed.expires_ns);
+        assert!(r.armed_fetch.is_some(), "not expired before the deadline");
+        // ...and past it, it is gone — with the session id remembered.
+        r.drain_fetch_route(armed.expires_ns + 1);
+        assert!(r.armed_fetch.is_none(), "expired");
+        assert_eq!(r.last_expired_fetch, Some(55));
+
+        // The learner answers late. It must NOT open an Install intake.
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(55, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.snap_refused_fetch_expired.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a straggling BEGIN for an expired fetch was not refused"
+            );
+            r.do_work();
+        }
+        assert!(
+            r.snap_intake.is_none(),
+            "no intake, and certainly no Install"
+        );
+        assert!(
+            !dir.path().join("0").exists(),
+            "nothing of the straggler was written"
+        );
+
+        // A DIFFERENT session from the same peer is unaffected — this refusal
+        // keys on the id this node minted, not on the peer.
+        learner.send(
+            to,
+            DGRAM_KIND_SNAP_BEGIN,
+            0,
+            TERM,
+            &snap_begin_wire(56, 0, P, 64, 0b1),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "an unrelated session must still open"
+            );
+            r.do_work();
+        }
+        assert_eq!(st.snap_refused_fetch_expired.load(Relaxed), 1);
     }
 
     /// The `SNAP_REQUEST` half of the T17 rule: a pull request is a pairwise

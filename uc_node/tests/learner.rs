@@ -1117,7 +1117,7 @@ fn fresh_learner_joins_a_purged_two_fsm_leader_and_both_fsms_converge() {
     );
     assert_eq!(
         learner.snapshot_session_refusals(),
-        (0, 0, 0, 0),
+        (0, 0, 0, 0, 0),
         "matching declared identities/versions and a wire-0.7.0 peer: no refusal may fire"
     );
     // M14c2 T10b: the two artifacts landing is not by itself the M14c claim —

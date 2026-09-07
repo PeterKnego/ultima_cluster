@@ -758,9 +758,15 @@ struct PendingFetch {
 }
 
 /// How long a `snapshot fetch` stays pending before this node forgets it.
-/// Comfortably past `uc_net`'s 60 s intake timeout, so a fetch that is simply
-/// slow is never forgotten while its transfer is still alive.
-const FETCH_TIMEOUT_NS: u64 = 120_000_000_000;
+///
+/// Fix round 2 (Ruling P11): **the receiver agent's own arm deadline**, not a
+/// second constant. The two used to differ (120 s here, 60 s there), and a
+/// learner answering inside the gap matched no arm, fell to the default
+/// `IntakeMode::Install`, and had its set installed by fiat. One constant, no
+/// drift — and the receiver additionally refuses a straggler by session id, so
+/// even a clock skew between the node's wall clock and the receiver's
+/// process-elapsed one cannot reopen that window.
+const FETCH_TIMEOUT_NS: u64 = uc_net::receiver::SNAP_INTAKE_TIMEOUT_NS;
 
 /// How long [`Node::request_fetch`] waits for the consensus agent's answer.
 const FETCH_CMD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1821,7 +1827,7 @@ impl Node {
             test_now_ns: None,
             services: cfg.services,
             snap_stats: Arc::clone(&route_drops),
-            last_snap_refusals: (0, 0, 0, 0),
+            last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
@@ -2113,17 +2119,18 @@ impl Node {
         &self.route_drops
     }
 
-    /// Wire 0.7.0 (spec §5, §9) + coordinated-snapshot spec §5.6: the four
-    /// named snapshot-session refusals this node counted — `(peer wire ≤
-    /// 0.6.0, identity mismatch, version mismatch, position mismatch)`. All
-    /// four drop the session; the follower keeps NAKing, so a non-zero value
-    /// means a joiner is stuck and the fleet is mixed-version, mis-declared,
-    /// or (the fourth) shipping a set assembled from two different instants.
-    /// The observability workstream exports these; this accessor is the single
+    /// Wire 0.7.0 (spec §5, §9) + coordinated-snapshot spec §5.6/§5.7: the
+    /// five named snapshot-session refusals this node counted — `(peer wire ≤
+    /// 0.6.0, identity mismatch, version mismatch, position mismatch, fetch
+    /// expired)`. All five drop the session; the follower keeps NAKing, so a
+    /// non-zero value means a joiner is stuck and the fleet is mixed-version,
+    /// mis-declared, shipping a set assembled from two different instants, or
+    /// (the fifth) answering a fetch this node has already given up on. The
+    /// observability workstream exports these; this accessor is the single
     /// source it reads. The consensus agent names each one in a
     /// `snapshot_session_refused` log record as it happens (`uc_net` carries
     /// no logging dependency).
-    pub fn snapshot_session_refusals(&self) -> (u64, u64, u64, u64) {
+    pub fn snapshot_session_refusals(&self) -> (u64, u64, u64, u64, u64) {
         (
             self.route_drops
                 .snap_refused_legacy_peer
@@ -2136,6 +2143,9 @@ impl Node {
                 .load(Ordering::Relaxed),
             self.route_drops
                 .snap_refused_position_mismatch
+                .load(Ordering::Relaxed),
+            self.route_drops
+                .snap_refused_fetch_expired
                 .load(Ordering::Relaxed),
         )
     }
@@ -2619,7 +2629,7 @@ struct Consensus {
     /// The `(peer wire ≤ 0.6.0, identity mismatch, version mismatch)` triple
     /// as of the last cycle — the edge detector behind
     /// `snapshot_session_refused`.
-    last_snap_refusals: (u64, u64, u64, u64),
+    last_snap_refusals: (u64, u64, u64, u64, u64),
     /// M14a: this cycle's `min(applied)` over the declared FSMs, refreshed by
     /// `publish_service_mins()` at the top of every `do_work` cycle.
     /// `u64::MAX` for a `none_for_tests` node (nothing declared: no FSM
@@ -4067,7 +4077,22 @@ impl Consensus {
             self.snap_stats
                 .snap_refused_position_mismatch
                 .load(Ordering::Acquire),
+            self.snap_stats
+                .snap_refused_fetch_expired
+                .load(Ordering::Acquire),
         );
+        if now.4 != self.last_snap_refusals.4 {
+            // Fix round 2 (Ruling P11): a learner answered a fetch this node
+            // had already given up on. Nothing is installed and nothing is
+            // stored; the operator's `uc2ctl snapshot fetch` is re-runnable.
+            crate::obs_event!(
+                Warn,
+                "snapshot_session_refused",
+                node = self.id as u64,
+                reason = "fetch_expired",
+                total = now.4
+            );
+        }
         if now.3 != self.last_snap_refusals.3 {
             // Coordinated-snapshot spec §5.6: the SOURCE mixed two
             // instants (or a forgery spliced one artifact of one set into
@@ -5119,30 +5144,37 @@ impl Consensus {
         // back (the artifacts stay on disk, untouched) and adopted by a later
         // pass once the log catches up — named ONCE, on the edge, because a
         // node that stays behind would otherwise log every pass.
+        //
+        // The `durable` load sits UNDER the `stored > seen` guard: on the
+        // steady path (no fetch outstanding, or one already adopted) this
+        // whole branch is the one `Acquire` load of `stored_set_pos` and a
+        // compare.
         let stored = self.stored_set_pos.load(Ordering::Acquire);
-        let durable = self.cnc.counters().durable.load_acquire();
-        if stored > seen && stored > durable {
-            if self.stored_above_durable != stored {
-                self.stored_above_durable = stored;
+        if stored > seen {
+            let durable = self.cnc.counters().durable.load_acquire();
+            if stored > durable {
+                if self.stored_above_durable != stored {
+                    self.stored_above_durable = stored;
+                    crate::obs_event!(
+                        Warn,
+                        "snapshot_set_held_above_durable",
+                        node = self.id as u64,
+                        position = stored,
+                        durable = durable
+                    );
+                }
+            } else {
+                self.stored_above_durable = 0;
+                self.snapshot_set_position.store(stored, Ordering::Release);
                 crate::obs_event!(
-                    Warn,
-                    "snapshot_set_held_above_durable",
+                    Info,
+                    "snapshot_set_complete",
                     node = self.id as u64,
                     position = stored,
-                    durable = durable
+                    source = "fetch"
                 );
+                seen = stored;
             }
-        } else if stored > seen {
-            self.stored_above_durable = 0;
-            self.snapshot_set_position.store(stored, Ordering::Release);
-            crate::obs_event!(
-                Info,
-                "snapshot_set_complete",
-                node = self.id as u64,
-                position = stored,
-                source = "fetch"
-            );
-            seen = stored;
         }
         let p = self.cluster_snapshot_pos.load(Ordering::Acquire);
         if p <= seen {
@@ -9660,7 +9692,7 @@ mod tests {
             fsm_lag_eff: crate::services::fsm_lag_eff(&services, 1 << 16, 4096),
             services,
             snap_stats: Arc::new(uc_net::receiver::FollowerStats::default()),
-            last_snap_refusals: (0, 0, 0, 0),
+            last_snap_refusals: (0, 0, 0, 0, 0),
             min_applied: u64::MAX,
             pending_reads: Vec::new(),
             current_round: None,
