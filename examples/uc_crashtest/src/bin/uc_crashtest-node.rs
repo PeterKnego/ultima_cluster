@@ -78,6 +78,42 @@ fn seed_for(id: uc_consensus::election::NodeId) -> u64 {
     1 ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+/// The file name [`publish_snapshot_state`] writes under the instance dir.
+const SNAPSHOT_STATE_FILE: &str = "snapshot_state";
+
+/// Coordinated-snapshot plan 2 (T10): mirror this node's snapshot counters
+/// onto disk, once per poll, so a harness in ANOTHER process can read them.
+///
+/// `Node::snapshot_set_position` and friends are in-process accessors and the
+/// counters they read live nowhere else — not in the cnc page, and `/metrics`
+/// is only wired when `[metrics]` is configured, which these reference bins
+/// never are. So this uses the same filesystem-sentinel idiom as
+/// `crypto_epoch_active` above, written tmp-then-rename so a reader can never
+/// see a half-written line.
+fn publish_snapshot_state(node: &Node, instance_dir: &std::path::Path) {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(256);
+    let _ = write!(
+        s,
+        "set={}\ninstant={}\ncluster={}\nabandoned={}\n",
+        node.snapshot_set_position(),
+        node.snapshot_instant_position(),
+        node.cluster_snapshot_position(),
+        node.snapshot_instants_abandoned(),
+    );
+    for row in 0..8u8 {
+        let _ = writeln!(
+            s,
+            "row_incomplete_{row}={}",
+            node.snapshot_row_incomplete(row)
+        );
+    }
+    let tmp = instance_dir.join("snapshot_state.tmp");
+    if std::fs::write(&tmp, s.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, instance_dir.join(SNAPSHOT_STATE_FILE));
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let members = match &args.members {
@@ -143,8 +179,10 @@ fn main() -> anyhow::Result<()> {
             let _ = std::fs::write(instance_dir.join("crypto_epoch_active"), e.to_string());
             last_epoch = Some(e);
         }
+        publish_snapshot_state(&node, &instance_dir);
         // Not a park(): this process is torn down by a real SIGKILL from the
-        // test harness, but while alive it polls its own crypto epoch.
+        // test harness, but while alive it polls its own crypto epoch and
+        // mirrors its snapshot counters onto disk for the harness to read.
         std::thread::sleep(Duration::from_millis(100));
     }
 }

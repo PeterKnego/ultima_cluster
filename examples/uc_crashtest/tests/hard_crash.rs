@@ -2219,3 +2219,386 @@ fn two_fsm_timer_service_sigkill() {
     );
     // _node / svc0 / svc1 Reaps dropped here → killed + reaped.
 }
+
+// ------------------------- coordinated instants (plan 2 T10, spec §10/§11)
+
+/// How long the row-1 service's `freeze()` sleeps in the test below. Wide
+/// enough that the kill lands inside the build with room to spare on a loaded
+/// box, short enough that the surviving row's FSM door (`--fsm-lag 65536`)
+/// does not park the workers for long if anything goes wrong.
+const INSTANT_FREEZE_MS: u64 = 3_000;
+
+/// What the node bin mirrors onto `<instance_dir>/snapshot_state` once per
+/// poll — `Node`'s snapshot counters, which live nowhere a second process can
+/// read them (not the cnc page; `/metrics` is not wired on these bins).
+#[derive(Debug, Default, Clone, Copy)]
+struct SnapshotState {
+    set: u64,
+    cluster: u64,
+    abandoned: u64,
+    row_incomplete: [u64; 8],
+}
+
+/// Read `<instance_dir>/snapshot_state`. `None` while the node has not written
+/// one yet (or is mid-rename), which every caller treats as "poll again".
+fn read_snapshot_state(instance_dir: &Path) -> Option<SnapshotState> {
+    let text = std::fs::read_to_string(instance_dir.join("snapshot_state")).ok()?;
+    let mut st = SnapshotState::default();
+    for line in text.lines() {
+        let (k, v) = line.split_once('=')?;
+        let v: u64 = v.parse().ok()?;
+        match k {
+            "set" => st.set = v,
+            "cluster" => st.cluster = v,
+            "abandoned" => st.abandoned = v,
+            _ => {
+                if let Some(row) = k.strip_prefix("row_incomplete_")
+                    && let Ok(row) = row.parse::<usize>()
+                    && row < 8
+                {
+                    st.row_incomplete[row] = v;
+                }
+            }
+        }
+    }
+    Some(st)
+}
+
+/// Poll `snapshot_state` until `f` accepts it. Panics with the last reading on
+/// the deadline — a bounded wait with a named failure, never a bare sleep.
+fn await_snapshot_state(
+    instance_dir: &Path,
+    what: &str,
+    secs: u64,
+    mut f: impl FnMut(&SnapshotState) -> bool,
+) -> SnapshotState {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(st) = read_snapshot_state(instance_dir)
+            && f(&st)
+        {
+            return st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; last snapshot_state = {:?}",
+            read_snapshot_state(instance_dir)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `uc2ctl snapshot`, driven through the cnc admin band (op 8) from another
+/// process — the same path `uc2ctl` uses, minus the bin. Returns **P**, which
+/// op 8 publishes in the response's `version` field.
+///
+/// `status == 2` is the leader's legitimate retry (not serving yet, or an
+/// instant in flight and no cadence accrued); any other refusal panics,
+/// because every refusal op 8 can give here — `48 snapshot_unsupported`,
+/// `49 snapshot_no_learner` — would mean the fixture is mis-built.
+fn command_instant_via_admin(cnc: &CncPage, secs: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0) + 1;
+        cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce: rand::random::<u64>(),
+            op: 8, // ADMIN_OP_SNAPSHOT
+            id: 0, // id != 0 would mean --standby
+            ip: 0,
+            port: 0,
+        });
+        let resp = loop {
+            if let Some(resp) = cnc.read_admin_resp(seq) {
+                break resp;
+            }
+            assert!(Instant::now() < deadline, "snapshot admin op timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        match resp.status {
+            0 => {
+                assert!(resp.version > 0, "an accepted instant reports its P");
+                return resp.version;
+            }
+            2 => {}
+            _ => panic!(
+                "uc2ctl snapshot refused: status={} reason={}",
+                resp.status, resp.reason
+            ),
+        }
+        assert!(Instant::now() < deadline, "no instant was ever accepted");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Spec §10 ("service restarts mid-build") + §11's hard-crash row: an instant
+/// whose row is SIGKILLed **while its builder is running** is abandoned — by
+/// name, counted, on that row alone — the next instant completes, and the
+/// history stays linearizable across the whole thing.
+///
+/// **Landing inside the build window.** The reference `RegisterSm`'s entire
+/// state is two `Option<u64>`s, so its real `freeze()` is nanoseconds wide and
+/// no kill could be timed into it. The service bin therefore wraps row 1 in
+/// `SlowFreeze` (crashtest crate only — see its doc), which under
+/// `UC2_CRASHTEST_FREEZE_MS` writes a `freeze_started` sentinel and then
+/// sleeps. The harness waits for that FILE, not for a duration, so the SIGKILL
+/// is inside the build by construction rather than by luck.
+///
+/// **Why the supersession is commanded while row 1 is still DOWN.** Ruling P10
+/// makes a replayed span act on the last `SNAPSHOT` frame it contains, so a
+/// respawned row would replay straight back to `P1` and freeze there after
+/// all — which is P10 working, but leaves nothing abandoned to observe. The
+/// abandonment is what §10 documents and what this row exists to pin, so the
+/// order is: kill → command `P2` (superseding `P1` while row 1 cannot possibly
+/// reach it) → respawn → let the row catch up → command `P3`, which completes.
+/// The middle section says why `P2` itself cannot be the completing one (the
+/// catching-up row declines it `busy` while it is still writing `P1`'s
+/// artifact — §10 again, and the reason the brief's flow commands a third
+/// time).
+///
+/// Assertions, in order: exactly one abandonment after the supersession,
+/// naming row 1 and **not** row 0 (row 0 and the `uc2-cluster` row are waited
+/// to `P1` first, so a build that counted every row would fail here); the set
+/// at `P3` completes with the cluster row in it; the final counts are
+/// `(abandoned, row0, row1) == (2, 0, 2)`; and both FSMs' histories are
+/// `Linearizable` with every `submit_all` pair equal.
+#[test]
+fn snapshot_instant_abandoned_on_service_sigkill_mid_build_and_the_next_completes() {
+    shorten_client_timeout();
+    let seed: u64 = std::env::var("LIN_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let tmp = tempdir();
+    let inst = tmp.path().join("inst");
+    std::fs::create_dir_all(&inst).unwrap();
+
+    let _node = spawn_node_with_services(&inst, "register,fsm1", "65536");
+    wait_for_ready(&inst, Duration::from_secs(10));
+    let _svc0 = spawn_service_snapshots(&inst, 0, None);
+    let svc1 = Arc::new(Mutex::new(Some(spawn_service_snapshots(
+        &inst,
+        1,
+        Some(INSTANT_FREEZE_MS),
+    ))));
+
+    let dir = Arc::new(inst.clone());
+    let (h0, h1) = (Arc::new(History::default()), Arc::new(History::default()));
+    let equiv = Arc::new(AtomicU64::new(0));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    warmup_write2(&inst, &h0, &h1, &last_seen);
+    let handles = spawn_workers2(
+        &dir,
+        &h0,
+        &h1,
+        &equiv,
+        &last_seen,
+        &stop,
+        seed,
+        Duration::from_millis(7),
+        3,
+    );
+
+    let cnc = open_cnc(&inst).expect("the node's cnc page");
+    {
+        use uc_protocol::v2::cnc::CNC_SVC_STATUS_SNAPSHOT_CAPABLE;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(0..2).all(|r| {
+            cnc.service_slot(r).status.load_acquire() & CNC_SVC_STATUS_SNAPSHOT_CAPABLE != 0
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "both rows must publish the snapshot-capability bit (--snapshots)"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Enough committed history under the instant that the run is not vacuous.
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while History::ok_count(&h0.snapshot()) < 50 {
+            assert!(Instant::now() < deadline, "workers made no progress");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // ---- P1, and the kill inside its build.
+    let sentinel = inst.join("freeze_started");
+    let _ = std::fs::remove_file(&sentinel);
+    let p1 = command_instant_via_admin(&cnc, 30);
+    wait_for_path(&sentinel, Duration::from_secs(30));
+    let freeze_started = Instant::now();
+    {
+        let mut g = svc1.lock().unwrap();
+        g.take(); // SIGKILL + reap FSM 1, mid-freeze
+    }
+
+    // Row 0 and the cluster row DO reach P1 — so the abandonment below can
+    // only name row 1, and `row_incomplete_0 == 0` is a real discriminator.
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while cnc.service_slot(0).snapshot_pos.load_acquire() != p1 {
+            assert!(Instant::now() < deadline, "row 0 never froze at P1={p1}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    await_snapshot_state(&inst, "the cluster row to reach P1", 30, |st| {
+        st.cluster == p1
+    });
+
+    // **The kill has to be the CAUSE, not the coincidence.** A supersession
+    // commanded while row 1 is merely still inside its (artificially slow)
+    // freeze would abandon P1 whether or not anything was killed — that build
+    // would simply finish a moment later. So wait out the whole freeze window
+    // first: past it, a LIVE row 1 would have published its artifact and P1's
+    // set would be complete. It has not, because the process is gone.
+    //
+    // Cheap red twin, and the one that found this: remove the `g.take()` above
+    // and the two assertions below fail (row 1 reaches P1 and the set at P1
+    // completes), which is exactly what a test that credited the crash for a
+    // busy-decline would have hidden.
+    while freeze_started.elapsed() < Duration::from_millis(INSTANT_FREEZE_MS + 1_000) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_ne!(
+        cnc.service_slot(1).snapshot_pos.load_acquire(),
+        p1,
+        "row 1 published an artifact at P1={p1} after being SIGKILLed mid-build"
+    );
+    assert_eq!(
+        read_snapshot_state(&inst).unwrap_or_default().set,
+        0,
+        "the set at P1={p1} must be INCOMPLETE: row 1 died inside its build"
+    );
+
+    // ---- P2 supersedes P1 while row 1 is down, then row 1 comes back.
+    //
+    // The supersession is commanded BEFORE the respawn on purpose: it is what
+    // makes P1's abandonment observable (Ruling P10 would otherwise let a
+    // respawned row replay straight back to P1 and freeze there, leaving
+    // nothing abandoned — see the test's doc).
+    let p2 = command_instant_via_admin(&cnc, 30);
+    assert!(p2 > p1, "the second instant must be above the first");
+
+    // ---- the abandonment, named and counted on row 1 alone.
+    let st = await_snapshot_state(&inst, "the abandoned instant to be counted", 30, |st| {
+        st.abandoned >= 1
+    });
+    assert_eq!(
+        st.abandoned, 1,
+        "exactly one instant was superseded before its set completed"
+    );
+    assert_eq!(
+        st.row_incomplete[1], 1,
+        "row 1 was SIGKILLed mid-build, so it is the row that missed P1={p1}"
+    );
+    assert_eq!(
+        st.row_incomplete[0], 0,
+        "row 0 froze at P1 before the supersession — it must NOT be counted incomplete"
+    );
+
+    // ---- the respawned row catches up, then a THIRD instant completes.
+    //
+    // **Why P2 cannot be the completing one, and why that is not a defect.**
+    // The respawned row 1 catches up across a span holding BOTH P1 and P2, and
+    // acts on P1 first: `on_snapshot_frame`'s third decline is "one build in
+    // flight max" (`busy`), so P2 — 224 bytes further up the same batch —
+    // is skipped while P1's artifact is still being written. That is spec §10
+    // exactly ("a row never reaches P: the set stays incomplete; the next
+    // instant supersedes it"), and it is why the brief's flow COMMANDS AGAIN
+    // rather than waiting on P2. So the run ends with TWO abandonments, both
+    // naming row 1 and neither naming row 0 — asserted below rather than
+    // glossed over.
+    {
+        let mut g = svc1.lock().unwrap();
+        *g = Some(spawn_service_snapshots(&inst, 1, None));
+    }
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (snap, applied) = (
+                cnc.service_slot(1).snapshot_pos.load_acquire(),
+                cnc.service_slot(1).applied.load_acquire(),
+            );
+            // `applied > p2`: the reconstructed row is live again, past both
+            // instants. `snap >= p1`: it has COMPLETED a build, so its builder
+            // is idle and the next instant cannot be declined `busy`.
+            if applied > p2 && snap >= p1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the respawned row 1 never caught up idle (snapshot_pos={snap} applied={applied} \
+                 p1={p1} p2={p2})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let p3 = command_instant_via_admin(&cnc, 30);
+    assert!(p3 > p2, "the third instant must be above the second");
+    let st = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let st = read_snapshot_state(&inst).unwrap_or_default();
+            if st.set >= p3 {
+                break st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the set at P3={p3} never completed: {st:?} rows(snapshot_pos,applied)={:?}",
+                (0..2)
+                    .map(|r| (
+                        cnc.service_slot(r).snapshot_pos.load_acquire(),
+                        cnc.service_slot(r).applied.load_acquire()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(st.set, p3, "the completed set is the third instant");
+    assert_eq!(
+        st.cluster, p3,
+        "and the uc2-cluster row is a member of it, at the same P"
+    );
+    assert_eq!(
+        (st.abandoned, st.row_incomplete[0], st.row_incomplete[1]),
+        (2, 0, 2),
+        "two instants were abandoned (P1 to the SIGKILL, P2 to the catch-up `busy` decline), \
+         both naming row 1 and neither naming row 0"
+    );
+
+    // Let post-recovery ops land, then adjudicate the histories.
+    std::thread::sleep(Duration::from_secs(1));
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    assert_eq!(
+        equiv.load(Ordering::Relaxed),
+        0,
+        "replication-equivalence violated"
+    );
+    let (e0, e1) = (
+        Arc::try_unwrap(h0)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
+        Arc::try_unwrap(h1)
+            .map(History::into_entries)
+            .unwrap_or_else(|a| a.snapshot()),
+    );
+    let (ok0, ok1) = (History::ok_count(&e0), History::ok_count(&e1));
+    eprintln!(
+        "[instant_abandoned] seed={seed} p1={p1} p2={p2} p3={p3} ops0={} ok0={ok0} ops1={} ok1={ok1}",
+        e0.len(),
+        e1.len(),
+    );
+    // Liveness, so a run that wedged behind the FSM door cannot pass by having
+    // nothing to check.
+    assert!(
+        ok0 >= 100 && ok1 >= 100,
+        "liveness: only ok0={ok0} ok1={ok1} ops completed Ok (<100) across the instants"
+    );
+    assert_linearizable(&e0, "snapshot_instant_abandoned_fsm0", "fsm0");
+    assert_linearizable(&e1, "snapshot_instant_abandoned_fsm1", "fsm1");
+    // _node / svc0 / svc1 Reaps dropped here → killed + reaped.
+}

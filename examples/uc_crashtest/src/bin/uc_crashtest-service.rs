@@ -20,16 +20,111 @@
 //!
 //! Sync, like the node bin — no tokio.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use uc_lincheck::register::RegisterSm;
 use uc_lincheck::timer::{MixedRegisterSm, TimerSm};
 use uc_service::{
-    RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned,
-    StateMachine, Tagged, Timed,
+    ApplyCtx, RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned,
+    SnapshotError, SnapshotStateMachine, StateMachine, Tagged, Timed, TimerEvent,
 };
+
+/// Coordinated-snapshot plan 2 T10: how long this process's `freeze()` sleeps,
+/// in milliseconds. `0`/unset (every existing caller) makes [`SlowFreeze`]
+/// byte-for-byte a forward to the inner SM.
+///
+/// A slow freeze is the only way a test can SIGKILL a service *while it is
+/// building* an artifact and be sure of landing in that window: the reference
+/// `RegisterSm`'s whole state is two `Option<u64>`s, so its real freeze is
+/// nanoseconds wide. The knob lives HERE, in the crashtest crate, and never in
+/// `uc_lincheck` or the SDK — nothing that ships has a reason to sleep in
+/// `freeze`.
+const FREEZE_MS_ENV: &str = "UC2_CRASHTEST_FREEZE_MS";
+
+/// The sentinel [`SlowFreeze::freeze`] writes under the instance dir as it
+/// ENTERS the sleep, so a harness in another process can wait for the build to
+/// be genuinely in flight instead of sleeping and hoping. Only written when the
+/// sleep is armed.
+const FREEZE_SENTINEL: &str = "freeze_started";
+
+/// A `SnapshotStateMachine` whose `freeze()` announces itself and then sleeps
+/// for [`FREEZE_MS_ENV`] milliseconds before delegating.
+///
+/// Transparent in every other respect: `NAME`, `VERSION` and every method
+/// forward to `S`, so the wrapped row declares and behaves exactly as the
+/// unwrapped one. With the env var unset the wrapper does not even touch the
+/// filesystem — the branch is one `u64` compare on a path that runs once per
+/// instant.
+struct SlowFreeze<S> {
+    inner: S,
+    instance_dir: PathBuf,
+    sleep: Duration,
+}
+
+impl<S> SlowFreeze<S> {
+    fn new(inner: S, instance_dir: &Path) -> Self {
+        let ms: u64 = std::env::var(FREEZE_MS_ENV)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Self {
+            inner,
+            instance_dir: instance_dir.to_path_buf(),
+            sleep: Duration::from_millis(ms),
+        }
+    }
+}
+
+impl<S: StateMachine> StateMachine for SlowFreeze<S> {
+    const NAME: &'static str = S::NAME;
+    const VERSION: u32 = S::VERSION;
+    type Command = S::Command;
+    type Response = S::Response;
+    type Query = S::Query;
+    type QueryResponse = S::QueryResponse;
+
+    fn apply(&mut self, ctx: &mut ApplyCtx, cmd: Self::Command) -> Self::Response {
+        self.inner.apply(ctx, cmd)
+    }
+    fn query(&self, q: Self::Query) -> Self::QueryResponse {
+        self.inner.query(q)
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.inner.last_applied()
+    }
+    fn on_timer(&mut self, ctx: &mut ApplyCtx, ev: TimerEvent) {
+        self.inner.on_timer(ctx, ev)
+    }
+}
+
+impl<S: StateMachine + SnapshotStateMachine> SnapshotStateMachine for SlowFreeze<S> {
+    type SnapshotHandle = S::SnapshotHandle;
+
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), SnapshotError> {
+        if !self.sleep.is_zero() {
+            // Announce BEFORE sleeping: the harness's kill window is the sleep
+            // itself, so a sentinel written afterwards would be useless.
+            let _ = std::fs::write(self.instance_dir.join(FREEZE_SENTINEL), b"1");
+            std::thread::sleep(self.sleep);
+        }
+        self.inner.freeze()
+    }
+    fn stream_snapshot(
+        handle: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), SnapshotError> {
+        S::stream_snapshot(handle, dst)
+    }
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
+        self.inner.install_snapshot(position, src)
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -68,6 +163,19 @@ struct Args {
     /// (see the `uc_lincheck::timer` module doc).
     #[arg(long, default_value_t = false)]
     mixed_register: bool,
+    /// Coordinated-snapshot plan 2 (T10): attach through
+    /// `start_with_snapshots()` — i.e. publish
+    /// `CNC_SVC_STATUS_SNAPSHOT_CAPABLE`, without which the leader refuses
+    /// `uc2ctl snapshot` with `48 snapshot_unsupported` — and wrap the SM in
+    /// [`SlowFreeze`] so [`FREEZE_MS_ENV`] can widen the build window.
+    ///
+    /// Opt-in rather than the default so every pre-plan-2 hard-crash test
+    /// keeps attaching exactly as it did. Supports row 0 (bare `RegisterSm`)
+    /// and `--tagged 1` (`Tagged<1, RegisterSm>`) — the two rows the
+    /// coordinated-instant crashtest declares; it does not compose with
+    /// `--sessioned` / `--timer` / `--mixed-register`.
+    #[arg(long, default_value_t = false)]
+    snapshots: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,6 +220,42 @@ fn main() -> anyhow::Result<()> {
             instance_dir.display()
         );
         return supervise(svc);
+    }
+    // Coordinated-snapshot plan 2 (T10): the snapshot-CAPABLE arms, checked
+    // before the `(tagged, sessioned)` matrix below for the same reason the
+    // timer arms are — this one does not compose with it either.
+    if args.snapshots {
+        anyhow::ensure!(
+            !args.sessioned,
+            "--snapshots does not compose with --sessioned"
+        );
+        match args.tagged {
+            None => {
+                let svc =
+                    ServiceBuilder::new(cfg, SlowFreeze::new(RegisterSm::default(), &instance_dir))
+                        .start_with_snapshots()?;
+                println!(
+                    "service {:?} attached (snapshot-capable) at {}",
+                    <RegisterSm as StateMachine>::NAME,
+                    instance_dir.display()
+                );
+                return supervise(svc);
+            }
+            Some(1) => {
+                let svc = ServiceBuilder::new(
+                    cfg,
+                    SlowFreeze::new(Tagged::<1, RegisterSm>::default(), &instance_dir),
+                )
+                .start_with_snapshots()?;
+                println!(
+                    "service {:?} attached (snapshot-capable) at {}",
+                    <Tagged<1, RegisterSm> as StateMachine>::NAME,
+                    instance_dir.display()
+                );
+                return supervise(svc);
+            }
+            Some(row) => anyhow::bail!("--snapshots supports row 0 and --tagged 1, got {row}"),
+        }
     }
     // Every arm hands the service to `supervise`, which holds it alive until
     // it fail-stops; the branch has to happen here because the builder is
