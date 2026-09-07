@@ -2805,8 +2805,8 @@ struct Consensus {
     /// Per TERM, then, and not airtight across one: a new leader starts at `0`
     /// while the previous leader's uncommitted frame may still be in flight,
     /// so two table commands can briefly be above the view at once. That is
-    /// harmless here — the durable, now-retired `ScheduleRecord` with its one
-    /// level of `prev`, which is what plan 2's rule actually protected, is gone; the
+    /// harmless here — plan 2's durable schedule-record type (retired, with
+    /// its one level of `prev`), which is what plan 2's rule actually protected, is gone; the
     /// cluster FSM applies whichever of the two commits, in log order, and a
     /// truncated one simply never reaches the view.
     last_cluster_append: u64,
@@ -3178,7 +3178,8 @@ struct Consensus {
     /// `settings.snapshot.interval_bytes` as of this pass's
     /// [`Consensus::refresh_from_view`] — the cadence reads the cached value,
     /// never a second load of the view. `0` = **no cadence** (operator
-    /// commanded only), matching the retired `SnapshotPolicy::Disabled` and
+    /// commanded only), matching the retired per-service snapshot-policy
+    /// type's disabled variant and
     /// purge-being-off-by-default; `u64::MAX` cannot occur (the cluster FSM's
     /// `validate` refuses it as `47 settings_bounds`).
     snapshot_interval_bytes: u64,
@@ -5379,7 +5380,8 @@ impl Consensus {
     /// instant it commanded, flagged per `settings.snapshot.target`.
     ///
     /// `interval_bytes == 0` means **no cadence** (Ruling P3) — operator
-    /// commanded only, matching the retired `SnapshotPolicy`'s "0 = never"
+    /// commanded only, matching the retired per-service snapshot-policy
+    /// type's "0 = never"
     /// and purge being off by default. So the steady-state cost on a cluster
     /// that has not configured one is a single compare against a cached
     /// field, and with a cadence configured it is that plus one `Acquire`
@@ -10475,7 +10477,8 @@ mod tests {
     }
 
     /// Spec §5.5's second trigger, and Ruling P3's sentinel. `0` means **no
-    /// cadence at all** — the retired `SnapshotPolicy`'s "0 = never", and the
+    /// cadence at all** — the retired per-service snapshot-policy type's
+    /// "0 = never", and the
     /// reason purge stays off by default — so a cluster that has configured
     /// nothing must never snapshot on its own, however much log it appends.
     /// `target = learners` selects the standby flag for the instants the

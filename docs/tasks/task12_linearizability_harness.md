@@ -121,7 +121,7 @@ exercised yet; see Deferred.
 production).** The M5 startup invariant in `uc_node/src/runtime/recovery.rs`
 treated `output_progress > last_applied` as fatal "data dir corrupt". But the
 durable `last_applied` StableValue only advances at snapshot install
-(the long-retired v1 `SnapshotPolicy::LogsSinceLast`, default 5000), whereas `output_progress` is
+(the long-retired v1 `SnapshotPolicy::LogsSinceLast`, default 5000 — an openraft-era type unrelated to the retired v2 `uc_service::SnapshotPolicy`), whereas `output_progress` is
 fsynced per committed output. So **any** shmem node restart against a persisted
 `data_dir` before the first snapshot tripped a false-positive panic — the
 applied entries are in the log and openraft re-applies them on startup (the
