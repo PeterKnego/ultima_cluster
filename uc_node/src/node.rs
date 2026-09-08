@@ -9,7 +9,13 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
+// `Instant` is now used only by test-side deadlines (`mod tests`, below) —
+// every non-test reading goes through `LogClock`/`Consensus::clock` — so the
+// import is `#[cfg(test)]` to avoid an unused-import warning in the shipped
+// build.
+#[cfg(test)]
+use std::time::Instant;
 
 use uc_consensus::config::{Addr, ClusterConfig, ConfigOp};
 use uc_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
@@ -1877,6 +1883,7 @@ impl Node {
                 .collect(),
             timer_stats: Arc::clone(&timer_stats),
             pass_now_ns: 0,
+            pass_mono_ns: 0,
             last_pass_ns: 0,
             #[cfg(test)]
             test_now_ns: None,
@@ -1929,7 +1936,7 @@ impl Node {
             truncations: Arc::clone(&truncations),
             wipes: Arc::clone(&wipes),
             reports_implausible: Arc::clone(&reports_implausible),
-            base: Instant::now(),
+            clock: crate::log_clock::LogClock::new(),
             durable_seen: durable,
             adopted_term: boot_term,
             // Finding #5 (see the intake-gate boot init above): a recovered
@@ -2702,6 +2709,11 @@ struct Consensus {
     /// deadline comparison and every `Appender::set_now` in the pass, so a
     /// pass's frames share one clock. `0` until the first pass.
     pass_now_ns: u64,
+    /// The pass's one MONOTONIC reading (ns since `clock`'s origin) — the
+    /// value `Event::Tick` carries, and what `record_pass_interval`'s and the
+    /// lateness histogram's subtraction would be against if they moved off
+    /// wall time (they have not; see Task 3's note).
+    pass_mono_ns: u64,
     /// Time-and-timers gate row c: the PREVIOUS pass's `pass_now_ns`, kept
     /// only to derive `uc2_consensus_pass_ns` (the interval between
     /// consecutive pass clock readings) without a second clock read. `0`
@@ -2909,7 +2921,10 @@ struct Consensus {
     /// on `Action::CountWipe`. Shared with the `Node` handle for observability.
     wipes: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
-    base: Instant,
+    /// The pass's one clock (spec 2026-09-08 §5): `Instant` origin + sampled
+    /// epoch offset. `pass_now_ns` (the stamp) and `pass_mono_ns` (the Tick)
+    /// are both derived from ONE `mono_now()` at the top of `do_work`.
+    clock: crate::log_clock::LogClock,
     durable_seen: u64,
     adopted_term: u32,
     awaiting_reconcile: bool,
@@ -3263,36 +3278,25 @@ struct Consensus {
     snapshot_cadence_refused: u32,
 }
 
-/// Wall-clock nanoseconds since the Unix epoch — the leaf clock read behind
-/// [`Consensus::pass_now_ns`] (time-and-timers spec §3.2). `Consensus::now_ns`
-/// is monotonic-but-arbitrary-origin (`Instant`-based) and unsuitable as a log
-/// stamp; this is the real clock reading. Called EXACTLY ONCE per consensus
-/// pass, at the top of `do_work`: every stamp, deadline comparison and
-/// `Appender::set_now` in that pass shares the one reading.
-fn wall_now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 impl Consensus {
-    /// The pass's one clock reading. In a release build this IS
-    /// [`wall_now_ns`] — the `#[cfg(not(test))]` body is `#[inline(always)]`
-    /// and the override field does not exist — so `do_work`'s hot top is
-    /// byte-for-byte what it was before the seam went in.
+    /// The pass's one WALL value, derived from the pass's one monotonic
+    /// reading. In a release build this is `LogClock::wall_at` — one compare
+    /// and one add on the steady path — so `do_work`'s hot top gains no code.
     #[cfg(not(test))]
     #[inline(always)]
-    fn pass_clock(&self) -> u64 {
-        wall_now_ns()
+    fn pass_clock(&mut self, mono_ns: u64) -> u64 {
+        self.clock.wall_at(mono_ns)
     }
 
     /// Test build: honour `test_now_ns` when the test has placed the pass at a
-    /// chosen instant, else read the real clock so every pre-existing test
-    /// keeps its current behaviour.
+    /// chosen instant, else derive the real value. Only the WALL value is
+    /// overridden; `pass_mono_ns` is always the real reading.
     #[cfg(test)]
-    fn pass_clock(&self) -> u64 {
-        self.test_now_ns.unwrap_or_else(wall_now_ns)
+    fn pass_clock(&mut self, mono_ns: u64) -> u64 {
+        match self.test_now_ns {
+            Some(t) => t,
+            None => self.clock.wall_at(mono_ns),
+        }
     }
 
     /// One consensus duty cycle (binding order, plan §Task 8).
@@ -3319,12 +3323,17 @@ impl Consensus {
         self.check_set_completeness();
         let mut did = false;
 
-        // Time-and-timers spec §3.2/§4.3 — ONE wall-clock read per pass, so
-        // the pass's one reading bounds every stamp in it: TIMER frames stamp
-        // at max(deadline, last), and only DUE deadlines are ever appended
-        // (the debug_assert in `fire_due_timers`). Sched rings drain first so
-        // a timer scheduled by the service this pass can fire this pass.
-        let now_wall = self.pass_clock();
+        // Time-and-timers spec §3.2/§4.3, monotonic log clock spec §5 — ONE
+        // clock read per pass, literally one `Instant` read: `pass_mono_ns`
+        // (the Tick's value) and `pass_now_ns` (the wall stamp) are both
+        // derived from it, so the pass's one reading bounds every stamp in
+        // it: TIMER frames stamp at max(deadline, last), and only DUE
+        // deadlines are ever appended (the debug_assert in
+        // `fire_due_timers`). Sched rings drain first so a timer scheduled by
+        // the service this pass can fire this pass.
+        let mono = self.clock.mono_now();
+        self.pass_mono_ns = mono;
+        let now_wall = self.pass_clock(mono);
         self.pass_now_ns = now_wall;
         if let Some(app) = self.appender.as_mut() {
             app.set_now(now_wall);
@@ -3512,7 +3521,11 @@ impl Consensus {
         did |= self.advance_pending_reads();
 
         // 4. Feed the tick — the ONLY place real time enters the SM.
-        let now = self.now_ns();
+        //
+        // Spec 2026-09-08 §5.2: the Tick takes the pass's one monotonic
+        // reading — the second per-pass `Instant::now()` this replaced was
+        // the whole of approach A's measurable saving.
+        let now = self.pass_mono_ns;
         self.feed(Event::Tick { now_ns: now });
 
         // 5. Publish role/serving snapshots for the API (term is written on
@@ -4742,7 +4755,7 @@ impl Consensus {
     }
 
     fn now_ns(&self) -> u64 {
-        self.base.elapsed().as_nanos() as u64
+        self.clock.mono_now()
     }
 
     /// Leader only (spec §4.9): absorb the services' schedule/cancel/consumed
@@ -9894,6 +9907,7 @@ mod tests {
                 .collect(),
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
             pass_now_ns: 0,
+            pass_mono_ns: 0,
             last_pass_ns: 0,
             #[cfg(test)]
             test_now_ns: None,
@@ -9946,7 +9960,7 @@ mod tests {
             truncations: Arc::new(AtomicU64::new(0)),
             wipes: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
-            base: Instant::now(),
+            clock: crate::log_clock::LogClock::new(),
             durable_seen: 6016,
             adopted_term: boot_term,
             awaiting_reconcile: false,
@@ -11387,6 +11401,50 @@ mod tests {
             1,
             "no duplicate TIMER frame for id 9 was appended"
         );
+    }
+
+    /// Monotonic log clock (spec §5.2): a pass takes ONE clock read. The
+    /// stamp (`pass_now_ns`) and the Tick (`pass_mono_ns`) both come from it,
+    /// both advance across passes, and the wall value tracks `SystemTime`.
+    #[test]
+    fn a_pass_reads_the_clock_once_and_both_derived_values_advance() {
+        let mut h = harness();
+        h.cons.do_work();
+        let (w1, m1) = (h.cons.pass_now_ns, h.cons.pass_mono_ns);
+        assert!(m1 > 0, "pass_mono_ns is set by the pass");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        h.cons.do_work();
+        let (w2, m2) = (h.cons.pass_now_ns, h.cons.pass_mono_ns);
+        assert!(
+            m2 > m1 && w2 > w1,
+            "both derived values advance: {m1}->{m2}, {w1}->{w2}"
+        );
+        assert_eq!(
+            (w2 - w1) / 1_000_000,
+            (m2 - m1) / 1_000_000,
+            "wall and mono advanced by the same amount (to the ms)"
+        );
+        let sys = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        assert!(
+            sys.abs_diff(w2) < 50_000_000,
+            "stamp is wall-anchored: off by {}",
+            sys.abs_diff(w2)
+        );
+    }
+
+    /// The test seam overrides the WALL value only; the Tick still gets a
+    /// real monotonic reading, so pinning the pass clock cannot stall an
+    /// election timeout.
+    #[test]
+    fn test_now_ns_overrides_the_stamp_but_not_the_monotonic_reading() {
+        let mut h = harness();
+        h.cons.test_now_ns = Some(50);
+        h.cons.do_work();
+        assert_eq!(h.cons.pass_now_ns, 50);
+        assert!(h.cons.pass_mono_ns > 50, "mono is real, not the pinned 50");
     }
 
     /// Cluster-FSM spec §4.9 Task 7: the heap is leader-only. A follower must

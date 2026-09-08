@@ -13,9 +13,6 @@
 //! (§5.3). The appender's `max(now, last_stamp)` clamp stays; this module
 //! just never hands it a value that goes backwards.
 
-// Consumed by the consensus agent from Task 2 of the plan.
-#![allow(dead_code)]
-
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Slew rate at which a backward step is retired: the derived clock runs
