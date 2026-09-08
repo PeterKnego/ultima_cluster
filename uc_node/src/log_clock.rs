@@ -211,10 +211,17 @@ impl LogClock {
 
     #[inline(never)]
     fn resample_slow(&mut self, mono_ns: u64) {
-        let (m, w, width) = bracket_sample(self.base, RESAMPLE_RETRIES, RESAMPLE_THRESHOLD_NS);
+        let sample = bracket_sample(self.base, RESAMPLE_RETRIES, RESAMPLE_THRESHOLD_NS);
+        self.apply_sample(mono_ns, sample);
+    }
+
+    /// The resample DECISION, separated from the sampling so it can be
+    /// tested with a synthetic `(mono_mid, wall, width)`: a bracket wider
+    /// than `RESAMPLE_THRESHOLD_NS` is skipped (deferred one interval,
+    /// nothing adopted); otherwise the core compares it against the held
+    /// offset and any step it reports is parked for `take_step`.
+    fn apply_sample(&mut self, mono_ns: u64, (m, w, width): (u64, u64, u64)) {
         if width > RESAMPLE_THRESHOLD_NS {
-            // Every bracket was preempted or otherwise wide: do not adopt a
-            // reading whose error could itself look like a step.
             self.core.skip_resample(mono_ns);
             return;
         }
@@ -419,5 +426,54 @@ mod tests {
             "clock and SystemTime differ by {diff} ns"
         );
         assert_eq!(c.take_step(), None, "no step on an undisturbed box");
+    }
+
+    #[test]
+    fn a_wide_bracket_is_skipped_not_adopted() {
+        let mut c = LogClock::new();
+        let m = c.mono_now();
+        let before = c.wall_at(m);
+        // due now; the sample says "3 s ahead" but its bracket is too wide to trust
+        c.apply_sample(m, (m, before + 3 * S, RESAMPLE_THRESHOLD_NS + 1));
+        assert_eq!(c.take_step(), None, "a wide bracket must not be adopted");
+        assert_eq!(c.wall_at(m), before, "nothing changed");
+        assert!(
+            !c.core.due_for_resample(m + RESAMPLE_INTERVAL_NS - 1),
+            "deferred one interval"
+        );
+        assert!(c.core.due_for_resample(m + RESAMPLE_INTERVAL_NS));
+    }
+
+    #[test]
+    fn a_narrow_bracket_forward_step_is_adopted_and_reported_once() {
+        let mut c = LogClock::new();
+        let m = c.mono_now();
+        let before = c.wall_at(m);
+        c.apply_sample(m, (m, before + 3 * S, RESAMPLE_THRESHOLD_NS));
+        assert_eq!(c.take_step(), Some(Step::Forward(3 * S)));
+        assert_eq!(c.take_step(), None, "reported once");
+        assert_eq!(c.wall_at(m), before + 3 * S);
+    }
+
+    #[test]
+    fn a_narrow_bracket_backward_step_is_smeared_and_reported() {
+        let mut c = LogClock::new();
+        let m = c.mono_now();
+        let before = c.wall_at(m);
+        c.apply_sample(m, (m, before - S, 100));
+        assert_eq!(c.take_step(), Some(Step::Backward(S)));
+        assert_eq!(c.wall_at(m), before, "never backwards");
+        assert_eq!(c.remaining_smear_ns(m), S);
+    }
+
+    #[test]
+    fn resample_slow_on_a_real_clock_reports_no_step_when_undisturbed() {
+        let mut c = LogClock::new();
+        let m = c.mono_now();
+        let before = c.wall_at(m);
+        c.resample_slow(m); // real bracket against real SystemTime; no step expected
+        let after = c.wall_at(m);
+        assert!(after >= before);
+        assert_eq!(c.take_step(), None);
     }
 }
