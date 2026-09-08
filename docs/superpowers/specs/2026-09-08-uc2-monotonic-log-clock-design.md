@@ -2,17 +2,20 @@
 
 **Date:** 2026-09-08
 **Status:** design brainstormed in chat 2026-09-08, with a measurement probe
-run between the approaches section and this document (§3). Awaiting the
-maintainer's review of this written spec. Next: the implementation plan.
+run between the approaches section and this document (§3); **amended the same
+day** after the maintainer's challenge re-priced the saving against fleet
+numbers (§3, §4, §8 — the first draft called the perf case "null" from a local
+run three orders of magnitude below peak; it is a conditional 2.2 %). Approved
+by the maintainer 2026-09-08 ("sounds reasonable"). Next: the implementation
+plan.
 **Baseline:** local `main` / worktree `claude-2` at `0ef7ddc` — the `2.11.0`
 flag day merged but unreleased (wire `0.7.0`, cnc `3.1`); `2.10.0` is what
 is shipped.
 **Requested by:** the maintainer, 2026-09-08 ("a fast, monotonic,
 wall-clock-anchored ns counter, that works both on Arm in Intel"). Not a
 ranked `docs/BACKLOG.md` item.
-**Release:** **NOT `2.11.0`.** This touches the consensus agent's hot loop,
-and `2.11.0` is release-stopped with its gate rows still recorded as not
-run. It ships in the minor after — §8.
+**Release:** `2.12.0`. `2.11.0` is **tagged** on `main` (`4855f36`); this
+touches the consensus agent's hot loop and ships in the next minor — §8.
 
 ## 1. Goal and locked decisions
 
@@ -47,7 +50,8 @@ is; nothing about the frame, the wire, cnc, or the FSM surface changes.
 |---|---|---|
 | clock shape | monotonic source + a sampled epoch **offset**: `now = MONOTONIC + offset` | §2 |
 | monotonic source | the kernel's `CLOCK_MONOTONIC` (`std::time::Instant`), **not** a raw hardware counter | §3, §4 |
-| why not the raw counter | measured: saves 12.7 ns/pass on an agent that spins 8.4 passes per delivered response, and costs a PLL to avoid reintroducing the freeze | §3, §4 |
+| why not the raw counter first | A is the safe, portable half with a **2.2 % ceiling**; the raw counter ("B-lite", re-anchored every K passes) adds ~1.3 % on top for an `unsafe` per-arch surface, and is a **follow-on gated on A's fleet result** | §3, §4 |
+| what A actually removes | the consensus agent's **second** unconditional clock read per pass — `pass_now_ns` (wall) and `now_ns` (monotonic) are both derived from ONE `Instant` read | §3, §5.2 |
 | offset sampling | bracket a wall read between two monotonic reads; keep the narrowest bracket | §5.1 |
 | forward step | **adopt immediately** — monotonic-safe, and identical to today's behaviour | §5.3 |
 | backward step | **never adopt as a step**; smear — run the derived clock slow until it re-converges with UTC | §5.3 |
@@ -104,7 +108,7 @@ So the offset is piecewise constant: it moves only at step events and across
 suspend. There is no continuous drift to chase, which is why this design is
 a subtraction and not a control loop.
 
-## 3. The measurement that chose between the approaches
+## 3. The measurements, and what they bound
 
 Run on the dev box 2026-09-08 (AMD Ryzen AI MAX+ 395, clocksource `tsc`,
 CPU flags `constant_tsc nonstop_tsc rdtscp`), pinned to one core, N=20 M
@@ -126,6 +130,16 @@ Cost of one clock read:
 
 Measured counter rate 3.0001 GHz (0.333 ns/tick).
 
+**How many reads a pass takes today — corrected from the first draft, which
+counted one.** The consensus agent takes **two** unconditional clock reads
+per pass: `SystemTime::now()` for the log stamp (`pass_clock()`,
+`node.rs:3268`) and `Instant::now()` for `Event::Tick`'s `now_ns`
+(`node.rs:3497` → `now_ns()` at `:4726`); three more `now_ns()` calls at
+`:4549`, `:4612` and `:6306` are conditional. The sender takes one
+unconditional `Instant::now()` per pass (`uc_net/src/sender.rs:1043`, the
+heartbeat check); the receiver's reads are all conditional. So the
+consensus agent pays **≈ 38.7 ns per pass** today, not 20.
+
 Drift of B against the wall clock with no resampling: **−293 ns/s ≈ 0.29 ppm
 ≈ 1.05 ms/hour**.
 
@@ -137,23 +151,49 @@ all on the one box, leader read off `uc2_consensus_pass_ns`:
 | idle | 2.121 M/s | 471.5 ns | 4.3 % of a pass | 2.7 % |
 | under load (165 983 resp/s) | 1.401 M/s | 713.9 ns | 2.82 % of a pass | **1.78 %** |
 
-**The decisive reading:** under load the consensus agent ran 1.401 M passes
-to deliver 165 983 responses — **8.4 passes per response**. It is spinning
-with spare capacity, not saturated. Cutting 1.78 % from the cycles of an
-agent that is already idle 8 passes out of 9 converts to no end-to-end
-throughput, which is CLAUDE.md's own hop-isolation doctrine: the hop whose
-solo throughput ≈ the whole-chain throughput is the limiter, and optimizing
-a faster hop measures null.
+**What the local run does and does not say.** Under load the consensus
+agent ran 1.401 M passes to deliver 165 983 responses — 8.4 passes per
+response, i.e. not saturated. The first draft read that as "the clock
+converts to no throughput." That inference does **not** transfer: 166 k/s
+is three orders of magnitude below the fleet's peak, and at peak the agent
+is doing real work every pass. The local run bounds the *per-read cost*; it
+says nothing about whether the consensus agent is the limiter at peak.
 
-**Stated limits of this measurement.** Three nodes on one 16C/32T box is
-oversubscribed against a fleet, where the core-count sweep
-(`docs/benchmarks/uc2-node-core-count-sweep-2026-08-31.md`) found each
-polling agent wants its own core. A fleet leader's pass would be *shorter*,
-so the clock's fraction of it would rise toward the 4.3 % idle figure —
-higher, but still single-digit percent of an agent that is not the limiter.
-The probe did not measure ARM; see §4 for why that stopped mattering.
+**The fleet framing, from numbers already on `main`.** Under row b's load
+the leader's pass was **mean 881.59 ns** (the time-and-timers gate's row c
+results cell), on a rig doing **2 625 636 resp/s** the same day (its
+`hop1_ab.sh` resolution cell), i.e. ~1.13 M passes/s and **~2.3 commands
+per pass** — the leader batches (`INGRESS_PER_CYCLE = 256`,
+`node.rs:306`), so the clock is read once for all of them. The tree's peak
+is 3 437 529 resp/s (`uc2-arch-sweep-c8id-vs-c9gd-2026-08-31.md`, c8id
+unpinned). Amortized either way, today's two reads are
 
-## 4. A vs B — the two approaches, and why B was rejected
+```
+38.7 ns / 881.59 ns per pass  =  4.4 %
+```
+
+of the pass — the ceiling with *zero* reads, which is not achievable. Against
+the rig's measured same-source rebuild resolution of **1.12 %**:
+
+| | reads/pass | ns/pass | saving | ceiling, IF consensus-bound |
+|---|---|---|---|---|
+| today | 2 (`SystemTime` + `Instant`) | 38.7 | — | — |
+| **A**: one `Instant` read, derive both | 1 | ~19 | 19.7 ns | **2.2 %** |
+| **B-lite**: one `rdtsc`/`CNTVCT`, re-anchor every K passes | 1 + 1/K | ~7.6 | 31 ns | **3.5 %** |
+| zero reads | 0 | 0 | 38.7 | 4.4 % |
+
+**Whether the ceiling is realised is unknown and is the thing the fleet A/B
+in §8 exists to find out.** Nothing in the gate docs isolates the consensus
+hop; if it is the limiter at peak, pass length *is* throughput and the
+saving converts one-for-one; if it is not, the saving is null, per
+CLAUDE.md's hop-isolation doctrine. Both A and B-lite clear the 1.12 %
+resolution, so the A/B can tell.
+
+**Stated limits.** The per-read costs are one dev box, x86 only, pinned. The
+ARM read cost was not measured; it is irrelevant to A (`Instant` is
+portable) and is the first thing B-lite would need.
+
+## 4. A vs B — the two approaches, why A goes first, and B-lite
 
 Both approaches have the same shape: a monotonic counter plus a fixed offset
 that turns it into epoch nanoseconds. They differ in **one substitution** —
@@ -176,10 +216,10 @@ B is genuinely faster — 7.41 ns against 20.11 ns — because today's
 `tsc`); what B removes is the vDSO's seqlock read of the kernel timekeeping
 struct, the mult/shift, and `Duration` construction.
 
-**B was rejected on three grounds, in order of weight:**
+**B as first drafted — anchor once, resample on agrona's hourly cadence —
+is rejected on two grounds:**
 
-1. **The saving buys nothing.** §3: 1.78 % of a non-limiting agent.
-2. **B reintroduces the failure mode this spec exists to remove.** B's
+1. **B reintroduces the failure mode this spec exists to remove.** B's
    `mult` is a snapshot of the rate; the kernel's is continuously
    NTP-corrected. So B drifts against UTC — measured 0.29 ppm, ~1 ms/hour —
    and correcting that by resampling the *offset* produces a step. A
@@ -188,21 +228,36 @@ struct, the mult/shift, and `Duration` construction.
    noisy continuous measurement — a phase-locked loop. That is what `ntpd`
    is, and B would run a second one inside the node, in disagreement with
    the first.
-3. **Arch surface.** Intrinsics and ordering fences (`lfence`/`rdtscp` on
+2. **Arch surface.** Intrinsics and ordering fences (`lfence`/`rdtscp` on
    x86 — which halves the saving to 6.28 ns; `isb` on ARM), invariant-TSC
    detection with a fallback path, cross-socket synchronisation, and suspend
    handling. All `unsafe`, all per-arch, all needing their own tests.
 
-**A is a subtraction; B is a control system.** A takes the entire
+**A is a subtraction; B-as-drafted is a control system.** A takes the entire
 behavioural win — no freeze, UTC re-convergence, identical on ARM and Intel,
-no `unsafe`, no calibration, no fallback — at a measured cost of zero.
+no `unsafe`, no calibration, no fallback — and removes one of the two reads
+(§5.2), for a 2.2 % ceiling.
 
-**One consequence worth recording:** choosing A removed the need for the ARM
-fleet probe that was planned. The maintainer's report that Graviton's
+**B-lite — the variant the first draft missed, kept as a follow-on.** The
+PLL objection assumed agrona's hourly resample. Re-anchor the raw counter to
+the vDSO clock every **K passes** instead — K = 100 is ~90 µs at the fleet's
+pass length — and the resample step is bounded by
+`drift × interval ≈ 0.29 ppm × 90 µs ≈ 0.03 ns`: zero in integer
+nanoseconds, so the appender clamp never sees a backward step and there is
+no drift to chase. No PLL. What remains of B's cost is exactly ground 2, the
+`unsafe` per-arch surface, bought for **~1.3 % over A** — about one
+resolution unit. That is not worth doing blind, and it is not worth doing at
+all if A's fleet A/B reads null (which would show the consensus agent is not
+the limiter). So: **A ships first; B-lite is taken up only if A's A/B shows a
+gain**, and then as its own spec-and-plan with the ARM read cost measured
+first.
+
+**One consequence worth recording:** choosing A first removed the need for
+the ARM fleet probe that was planned. The maintainer's report that Graviton's
 `CNTFRQ_EL0` runs at 1 GHz (1 ns/tick, against the 24–100 MHz that the
 public surveys quote) could not be confirmed from public sources and remains
-**unverified**; it mattered only for pricing B, and `Instant::now()` is
-portable with no hardware-counter question left. If B is ever revisited,
+**unverified**; it matters only for B-lite, and `Instant::now()` is
+portable with no hardware-counter question in A. If B-lite is taken up,
 reading `CNTFRQ_EL0` on one Graviton host is the first step.
 
 ## 5. The design
@@ -234,11 +289,27 @@ priori.
 ### 5.2 Reading it
 
 `pass_clock()` (`uc_node/src/node.rs:3268`, with the `#[cfg(test)]`
-twin at `:3276`) becomes one monotonic read plus
-one add, in exactly the place `wall_now_ns()` is read today — once per pass,
-at the top of `do_work`. No caller changes; `pass_now_ns`, `set_now`, timer
-deadline comparisons and `record_pass_interval` all consume the same `u64`
-they consume now.
+twin at `:3276`) becomes one monotonic read plus one add, in exactly the
+place `wall_now_ns()` is read today — once per pass, at the top of
+`do_work`. No caller changes; `pass_now_ns`, `set_now`, timer deadline
+comparisons and `record_pass_interval` all consume the same `u64` they
+consume now.
+
+**And the pass's second read goes away.** `Event::Tick`'s `now_ns`
+(`node.rs:3497`, today a separate `Instant::now()` via `now_ns()` at
+`:4726`) is derived from the **same** monotonic reading the stamp was — the
+raw `Instant` delta before the offset is added. One read per pass yields
+both values; that single removed read is the whole of A's measurable
+saving (§3). The conditional `now_ns()` sites (`:4549`, `:4612`, `:6306`)
+may keep their own reads or take the pass value — the plan decides, with the
+constraint that a value used for an interval must stay monotonic (it is
+either way, since the source is `Instant`).
+
+A side effect worth naming: `uc2_consensus_pass_ns` and
+`uc2_timer_lateness_ns` are today *differences of `CLOCK_REALTIME`*
+(`record_pass_interval`, `node.rs:4811`; lateness at `:4913`). Under A they
+become differences of a monotonic-sourced value, which is what a duration
+should be; a forward wall-clock step no longer lands in either histogram.
 
 The `#[cfg(test)]` override on `pass_clock` stays as it is, so every
 existing test keeps its behaviour and the new step/smear paths get the same
@@ -331,32 +402,38 @@ Whether to add a counter for adopted/smeared steps is left open (§9); the
 argument against is that steps are rare and the lag series already shows
 them.
 
-## 8. Release
+## 8. Release and acceptance
 
-**Not `2.11.0`.** At this baseline (`0ef7ddc`) both of that flag day's gate
-docs record **every** row as not run — eight in
-`docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` (a/b/c/d/e/f/g/h,
-of which f carries a dev-box smoke whose own verdict is `inconclusive (noisy
-run)`) and four in `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md`
-(a/b/e/j). A fleet run has since happened — `0ef7ddc` is "fix(gate): four
-reader/runner defects the first real fleet run found" — but its results are
-**not** written into those Results tables, so what the tree records is
-twelve unrun rows. Either way the release is waiting on measurements, and
-this change touches the consensus agent's hot loop — the M14a lesson, re-learned in the 2026-09-07
-row-d regression, is that such changes must be A/B'd on exact binaries
-because codegen alone has cost 9 % for arms that never execute. Adding an
-unmeasured hot-loop change to a release already waiting on measurements is
-the wrong trade.
-
-It ships in the minor after. No wire, cnc, or API change, so it is an
+**`2.12.0`.** `2.11.0` is tagged on `main` (`4855f36`, "2.11.0 is tagged");
+this worktree's baseline `0ef7ddc` predates that, so the plan rebases onto
+the tagged `main` first. This change touches the consensus agent's hot loop
+— the M14a lesson, re-learned in the 2026-09-07 row-d regression, is that
+such changes must be A/B'd on exact binaries because codegen alone has cost
+9 % for arms that never execute. No wire, cnc, or API change, so it is an
 ordinary minor by `docs/reference/semver-policy.md`.
 
-**Acceptance is behavioural, not a rate bar.** The pre-commitment is a null
-throughput result against the current tree, measured the way
-`scripts/hop1_ab.sh` measures — exact binaries, back to back, with a
-same-source rebuild control to establish the harness's own resolution first
-(the M14b lesson). A regression outside that resolution is a FAIL and keeps
-the bar, per the honest-failure protocol.
+**Acceptance is a fleet A/B, and it is pre-committed here.** Under
+`m14_fleet_gate.py`'s row a load (steady window), this tree against its
+parent, measured the way `scripts/hop1_ab.sh` measures — exact binaries,
+back to back, with a same-source rebuild control run first to establish the
+day's resolution (the M14b lesson; 1.12 % on 2026-09-07). Three readings are
+possible and each is a result, not a failure of the method:
+
+- **Gain outside the resolution** (ceiling 2.2 %, §3) — A is a perf win, the
+  consensus agent is the limiter at peak, and **B-lite is worth its own
+  spec** (§4).
+- **Within the resolution** — A is null for throughput and ships on its
+  behavioural merits alone (no freeze, one read, monotonic durations);
+  **B-lite is closed**, since the agent is not the limiter.
+- **Regression outside the resolution** — a FAIL, recorded as such; the
+  change does not ship until the cause is found (the row-d playbook:
+  `objdump` the two binaries' `do_work`, since the probes could not see the
+  last regression and the machine code could).
+
+Behavioural acceptance is separate and deterministic: the step/smear paths
+under the `pass_clock()` test seam (§5.2), plus a synthetic
+`Uc2LogTimeFrozen` scenario in `m10_alerts.rs` showing the alert no longer
+fires on a stepped-but-healthy leader.
 
 ## 9. Open parameters and out of scope
 
@@ -383,9 +460,10 @@ Out of scope:
   the log clock is still the *leader's* clock, and `max(now, last_stamp)`
   plus the `log_time_ns` seed is still what carries it across a failover.
   Bounded cross-node skew would be a different feature.
-- **Approach B**, unless a future measurement shows the consensus agent has
-  become the limiter (§4). If it is revisited, the first step is reading
-  `CNTFRQ_EL0` on a Graviton host.
+- **B-lite** (§4). Taken up only if A's fleet A/B (§8) reads a gain outside
+  the resolution — that reading is what shows the consensus agent is the
+  limiter. Its own spec and plan; first step, reading `CNTFRQ_EL0` on a
+  Graviton host and measuring the ARM read cost.
 - **The clamp.** `max(now, last_stamp)` stays. It is the guarantee of
   record and this design deliberately does not replace it — it stops
   *depending* on it for step absorption.
