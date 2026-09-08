@@ -290,13 +290,36 @@ struct NodeConfigFile {
 fn default_buffer_bytes() -> usize {
     1 << 26 // 64 MiB — a production default, not the examples' 4 MiB
 }
-fn default_max_payload() -> usize {
-    // 512 B, matching the examples' NODE_MAX_PAYLOAD. A max-size frame plus its
-    // headers (and any crypto tag) must fit ONE datagram — `uc_net`'s Sender
-    // asserts it at construction. The previous 1 MiB default was ~700x over the
-    // 1408 B MTU budget and panicked the daemon on first boot.
-    512
+/// Test seam: the shipped default, so `preflight`'s regression guard can
+/// assert the default satisfies its own checks rather than hard-coding a copy
+/// of the number that would drift.
+#[cfg(test)]
+pub(crate) fn default_max_payload_for_test() -> usize {
+    default_max_payload()
 }
+
+fn default_max_payload() -> usize {
+    // DERIVED from the transport budget, never a literal — see
+    // `uc_protocol::v2::datagram::max_payload_for_mtu`. A max-size frame plus
+    // its headers (and the crypto tag) must fit ONE datagram; `uc_net`'s
+    // Sender asserts it at construction.
+    //
+    // History, because both directions have bitten: the original 1 MiB default
+    // was ~700x over the MTU budget and panicked the daemon on first boot
+    // (adf72ba). Its replacement, a flat 512 B, was safe but arbitrary — and
+    // too SMALL to carry a full `MAX_SCHEDULE_ENTRIES` schedule table (1072 B),
+    // so a DEFAULT node silently capped `uc2ctl schedule apply` at 15 of the
+    // advertised 32 entries and refused the rest as an undecodable file
+    // (found by the 2026-09-08 time-and-timers fleet gate).
+    //
+    // Deriving it fixes both and keeps fixing them: the value tracks the path
+    // budget, so a larger `MTU_DEFAULT` (AWS EC2 and GCP both support ~9000 B
+    // jumbo frames, where this yields 8928) widens the default instead of
+    // leaving a small constant to be rediscovered. `preflight` checks BOTH
+    // bounds against whatever the operator actually configured.
+    uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT
+}
+
 fn default_admission_bytes() -> u64 {
     256 * 1024
 }

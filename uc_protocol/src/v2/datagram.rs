@@ -17,6 +17,43 @@ pub const DATAGRAM_HEADER_LEN: usize = 16;
 /// Default datagram budget (spec §5); jumbo-frame deployments raise it.
 pub const MTU_DEFAULT: usize = 1408;
 
+/// The largest `max_payload` a node can carry on a given path MTU, with wire
+/// crypto ENABLED — the tighter of the two modes, so a node configured to this
+/// starts in either.
+///
+/// DERIVED, never a literal. The arithmetic is `docs/security/attack-surface.md`
+/// §3 and is pure transport geometry: the MTU, less the datagram header, less
+/// the crypto tag+counter, floored to `FRAME_ALIGNMENT`, less the frame header.
+/// At `MTU_DEFAULT` it yields 1312 (and 1344 with crypto off, the documented
+/// command ceiling).
+///
+/// It is a function of the MTU on purpose. The 1408 B default is sized for a
+/// 1500 B Ethernet path, but the main deploy targets (AWS EC2, GCP) support
+/// ~9000 B jumbo frames, where this yields 8928 — so anything defaulted from
+/// here follows the path budget instead of pinning a small number that a
+/// larger MTU would silently waste. Raising `MTU_DEFAULT` itself is a wire
+/// flag day (CLAUDE.md, "Command payload ceiling"), not a config change.
+pub const fn max_payload_for_mtu(mtu: usize) -> usize {
+    let budget = mtu - DATAGRAM_HEADER_LEN - crate::v2::crypto::CRYPTO_OVERHEAD;
+    let aligned = budget & !(crate::v2::frame::FRAME_ALIGNMENT - 1);
+    aligned - crate::v2::frame::HEADER_LEN
+}
+
+/// [`max_payload_for_mtu`] at [`MTU_DEFAULT`] — what a node uses when
+/// `node.toml` sets no `max_payload`.
+pub const MAX_PAYLOAD_DEFAULT: usize = max_payload_for_mtu(MTU_DEFAULT);
+
+const _: () = assert!(MAX_PAYLOAD_DEFAULT == 1312);
+// The floor the schedule table imposes: a full `MAX_SCHEDULE_ENTRIES` table
+// must fit the DEFAULT, or the shipped default would refuse its own preflight
+// and the daemon would not boot out of the box.
+const _: () = assert!(
+    crate::v2::frame::CLUSTER_BODY_PREFIX_LEN
+        + crate::v2::schedule::SCHEDULE_HEADER_LEN
+        + crate::v2::schedule::MAX_SCHEDULE_ENTRIES * crate::v2::schedule::SCHEDULE_ENTRY_LEN
+        <= MAX_PAYLOAD_DEFAULT
+);
+
 pub const OFF_DGRAM_POSITION: usize = 0; // u64 LE — meaning depends on kind
 pub const OFF_DGRAM_TERM_ID: usize = 8; // u32 LE — leadership_term_id
 pub const OFF_DGRAM_KIND: usize = 12; // u8

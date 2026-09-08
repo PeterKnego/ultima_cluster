@@ -18,7 +18,8 @@ use uc_consensus::election::NodeId;
 use uc_protocol::v2::config::MAX_MEMBERS;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{DATAGRAM_HEADER_LEN, MTU_DEFAULT};
-use uc_protocol::v2::frame::{FRAME_ALIGNMENT, HEADER_LEN, align_frame_len};
+use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, FRAME_ALIGNMENT, HEADER_LEN, align_frame_len};
+use uc_protocol::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
 
 use crate::config_file::AdminSection;
 use crate::obs::log::LogLevel;
@@ -58,6 +59,15 @@ pub enum PreflightError {
         max_payload: usize,
         need: usize,
         mtu: usize,
+    },
+    #[error(
+        "max_payload ({max_payload}) cannot carry a full schedule table:          MAX_SCHEDULE_ENTRIES ({entries}) encodes to a {need}-byte CLUSTER frame body.          `uc2ctl schedule apply` would refuse any table over {fits} entries on this node —          raise max_payload to at least {need}. (The cap is a cluster-wide constant;          max_payload is node-local, and nothing else ties the two together.)"
+    )]
+    PayloadTooSmallForScheduleTable {
+        max_payload: usize,
+        need: usize,
+        entries: usize,
+        fits: usize,
     },
     #[error("instance_dir {path} does not exist or cannot be probed: {detail}")]
     InstanceDirUnprobeable { path: String, detail: String },
@@ -120,6 +130,28 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
             max_payload: cfg.max_payload,
             need,
             mtu: MTU_DEFAULT,
+        });
+    }
+    // The LOWER bound on `max_payload`, and the mirror of the MTU check above.
+    // 2026-09-08: the time-and-timers gate's row e could not run because a
+    // full `MAX_SCHEDULE_ENTRIES` table needs a larger frame than the shipped
+    // default carried, and the append refused it as an undecodable file. The
+    // cap is a cluster-wide compile-time constant while `max_payload` is a
+    // node-local runtime knob; before this check nothing connected them, so
+    // the two could silently disagree and only a full table applied in anger
+    // would find out. `PayloadExceedsMtu` guards the too-BIG direction; this
+    // guards too-SMALL.
+    let table_need = CLUSTER_BODY_PREFIX_LEN + SCHEDULE_HEADER_LEN
+        + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN;
+    if cfg.max_payload < table_need {
+        return Err(PreflightError::PayloadTooSmallForScheduleTable {
+            max_payload: cfg.max_payload,
+            need: table_need,
+            entries: MAX_SCHEDULE_ENTRIES,
+            fits: cfg
+                .max_payload
+                .saturating_sub(CLUSTER_BODY_PREFIX_LEN + SCHEDULE_HEADER_LEN)
+                / SCHEDULE_ENTRY_LEN,
         });
     }
     if cfg.election_timeout_min_ns >= cfg.election_timeout_max_ns {
@@ -354,9 +386,13 @@ mod tests {
             instance_dir: std::path::PathBuf::from("/srv/uc2/n1"),
             app_id: "myapp".into(),
             buffer_bytes: 1 << 26,
-            // 512 B — the same budget the examples use; a frame must fit one
-            // datagram. See `a_payload_that_cannot_fit_a_datagram_is_refused`.
-            max_payload: 512,
+            // The shipped default. A frame must fit one datagram (see
+            // `a_payload_that_cannot_fit_a_datagram_is_refused`) AND be large
+            // enough for a full schedule table (see
+            // `a_payload_too_small_for_a_full_schedule_table_is_refused_by_name`),
+            // so `base()` uses the real default rather than a number of its
+            // own that could drift out from under either check.
+            max_payload: uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT,
             admission_bytes_default: 256 * 1024,
             settings_genesis: uc_protocol::v2::settings::Settings::genesis_default(),
             election_timeout_min_ns: 150_000_000,
@@ -401,6 +437,62 @@ mod tests {
         c.max_payload = usize::MAX / 2;
         let msg = check_semantics(&c).unwrap_err().to_string();
         assert!(msg.contains("max_payload"), "got: {msg}");
+    }
+
+    /// A `max_payload` too SMALL to carry a full schedule table is refused by
+    /// name, with the numbers.
+    ///
+    /// Found by the 2026-09-08 time-and-timers fleet gate: row e applies a
+    /// `MAX_SCHEDULE_ENTRIES` table, and every arm was refused because the
+    /// append did not fit — reported to the operator as `schedule_decode`,
+    /// "the staged file is not a decodable schedule table", about a file that
+    /// decoded perfectly. The cap is a cluster-wide compile-time constant and
+    /// `max_payload` is a node-local runtime knob; this is the check that ties
+    /// them together at the one moment an operator can still act on it.
+    #[test]
+    fn a_payload_too_small_for_a_full_schedule_table_is_refused_by_name() {
+        let mut c = base();
+        c.max_payload = 512;
+        let err = check_semantics(&c).unwrap_err();
+        match err {
+            PreflightError::PayloadTooSmallForScheduleTable {
+                max_payload,
+                need,
+                entries,
+                fits,
+            } => {
+                assert_eq!(max_payload, 512);
+                assert_eq!(entries, MAX_SCHEDULE_ENTRIES);
+                assert_eq!(
+                    need,
+                    CLUSTER_BODY_PREFIX_LEN
+                        + SCHEDULE_HEADER_LEN
+                        + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN
+                );
+                // 512 carried only 15 of the advertised 32.
+                assert_eq!(fits, 15);
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+    }
+
+    /// The SHIPPED DEFAULT must satisfy the check above.
+    ///
+    /// This is the regression guard that matters most here: a preflight
+    /// refusal whose own default trips it means the daemon refuses to boot out
+    /// of the box, which is precisely the failure `adf72ba` fixed when the
+    /// 1 MiB default panicked `uc_net::sender` on first boot. Adding the
+    /// refusal WITHOUT this test would have re-created that bug in the
+    /// opposite direction.
+    #[test]
+    fn the_shipped_default_max_payload_can_carry_a_full_schedule_table() {
+        let mut c = base();
+        c.max_payload = crate::config_file::default_max_payload_for_test();
+        assert!(
+            check_semantics(&c).is_ok(),
+            "the default max_payload must pass its own preflight: {:?}",
+            check_semantics(&c).unwrap_err()
+        );
     }
 
     /// The refusal must report the REAL byte requirement, not a sentinel.

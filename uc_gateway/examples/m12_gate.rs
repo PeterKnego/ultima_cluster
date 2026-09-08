@@ -845,17 +845,21 @@ impl SnapshotStateMachine for TimerLoadSm {
 const NODE_BUFFER_BYTES: usize = 64 << 20;
 /// See `m5_gate`'s identical constant doc: this door is enforced on
 /// `try_submit`'s bincode-ENCODED bytes, not on `--payload` itself.
-/// 2026-09-07 (time-and-timers gate row e): raised 512 -> 1344, the datagram
-/// ceiling (`docs/security/attack-surface.md` §3), because 512 CANNOT CARRY A
-/// FULL SCHEDULE TABLE. `append_cluster` checks
-/// `CLUSTER_BODY_PREFIX_LEN (8) + payload > max_payload`, and a
-/// `MAX_SCHEDULE_ENTRIES` table encodes to 1064 B, so the frame is 1072 B —
-/// over twice the old door. Every row-e arm was refused, and because
-/// `Node::apply_schedule_table` maps `AppendError::PayloadTooLarge` onto
-/// `REASON_SCHEDULE_DECODE` the refusal read as "the staged file is not a
-/// decodable schedule table" for a file that decodes perfectly. The old value
-/// capped the harness at 15 entries (8 + 8 + 15*33 = 511).
-const NODE_MAX_PAYLOAD: usize = 1344;
+/// The node's `max_payload`, taken from the SAME derived constant the daemon
+/// defaults to (`uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT`) rather than a
+/// literal of its own.
+///
+/// 2026-09-07 (time-and-timers gate row e): this was 512, which CANNOT CARRY A
+/// FULL SCHEDULE TABLE — `append_cluster` checks
+/// `CLUSTER_BODY_PREFIX_LEN (8) + payload > max_payload` and a
+/// `MAX_SCHEDULE_ENTRIES` table encodes to 1064 B, so the frame is 1072 B.
+/// Every row-e arm was refused, as a misleading `schedule_decode`. It was
+/// briefly raised to a flat 1344 (the crypto-OFF ceiling), which works only
+/// because this harness hardcodes `CryptoConfig::Disabled`: at 1344 the
+/// datagram need is 1416 B with crypto ON, over the 1408 B MTU, so enabling
+/// crypto here would have panicked `uc_net`'s sender at construction. The
+/// derived constant is crypto-SAFE in both modes and follows the MTU.
+const NODE_MAX_PAYLOAD: usize = uc_protocol::v2::datagram::MAX_PAYLOAD_DEFAULT;
 /// The in-process arms' admission window, unchanged (the fleet `node` role
 /// takes `--admission-kib` instead).
 const DEFAULT_ADMISSION_BYTES: u64 = 256 * 1024;

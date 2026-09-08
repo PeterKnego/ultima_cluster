@@ -592,6 +592,14 @@ fn reason_str(reason: u32) -> &'static str {
         43 => {
             "schedule_unknown_fsm (an entry names an fsm that is not one of this cluster's declared rows)"
         }
+        // 51 is out of the 40-43 band because it was added later (2026-09-08);
+        // it belongs to `schedule apply` all the same. It is deliberately NOT
+        // 42: the file is fine, the NODE's max_payload is too small, and
+        // reporting it as a decode error sent operators to inspect a valid
+        // TOML. See `uc_node::REASON_SCHEDULE_TOO_LARGE`.
+        51 => {
+            "schedule_too_large (the table decoded fine but does not fit this node's max_payload — raise max_payload in node.toml and restart; a full 32-entry table needs 1072 bytes)"
+        }
         // Cluster-FSM plan 1 (spec §6): `ADMIN_OP_SETTINGS_APPLY` (wire op
         // 7) refusal reasons — `uc_node::REASON_SETTINGS_*` (`uc_node::node`),
         // the exact twin of the 40-43 band above.

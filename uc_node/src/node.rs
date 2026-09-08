@@ -478,6 +478,24 @@ pub const REASON_SNAPSHOT_NO_LEARNER: u32 = 49;
 /// node's log has caught up to it.
 pub const REASON_SNAPSHOT_ABOVE_DURABLE: u32 = 50;
 
+/// The encoded table does not fit THIS node's `max_payload`, so the leader
+/// could not append it. Distinct from [`REASON_SCHEDULE_DECODE`] on purpose:
+/// until 2026-09-08 this case was reported as 42, telling the operator "the
+/// staged file is not a decodable schedule table" about a file that decodes
+/// perfectly — sending them to inspect their TOML when the actual fix is one
+/// node-local config value. Found by the time-and-timers fleet gate, whose
+/// row e applies a full `MAX_SCHEDULE_ENTRIES` table and was refused on every
+/// arm against the then-default `max_payload` of 512.
+///
+/// `preflight` now refuses such a `max_payload` at STARTUP
+/// (`PayloadTooSmallForScheduleTable`), so on a node that booted this reason
+/// is reachable only where the two can still disagree: a node started before
+/// that check existed, or one whose config was hand-edited below the floor.
+/// It is kept rather than assumed unreachable — the comment this replaces
+/// claimed exactly that, reasoning about the fixed 1344 B TRANSPORT ceiling
+/// while the code tested `max_payload`, a node-local RUNTIME knob.
+pub const REASON_SCHEDULE_TOO_LARGE: u32 = 51;
+
 /// Why [`Consensus::command_snapshot`] refused to append a `SNAPSHOT` frame.
 ///
 /// Three shapes, and the numbers are the WIRE codes admin op 8 publishes, so
@@ -6938,12 +6956,17 @@ impl Consensus {
             // Nothing appended, nothing adopted, staged file still present:
             // safe to retry whole (`append_cluster_frame`'s argument).
             Err(AppendError::WouldOverrun) => (2, 0, self.schedule_position),
-            // NOT retryable. `MAX_SCHEDULE_TABLE_BYTES` (1064 B, 32 entries)
-            // is under the payload ceiling, so this is unreachable today —
-            // but a permanent error must never be answered `2`, which tells
-            // `uc2ctl` to poll for a commit that can never happen. It is a
-            // refusal for the same reason an undecodable body is.
-            Err(AppendError::PayloadTooLarge) => self.refuse_schedule(REASON_SCHEDULE_DECODE),
+            // NOT retryable, and NOT `schedule_decode`. A permanent error must
+            // never be answered `2` (that tells `uc2ctl` to poll for a commit
+            // that can never happen), but it must also not blame the operator's
+            // file: the table decoded fine and simply does not fit this node's
+            // `max_payload`. The comment here used to call this unreachable
+            // because 1064 B is under the payload CEILING — true of the fixed
+            // 1344 B transport ceiling, but `max_payload` is a node-local
+            // RUNTIME knob whose default was 512 until 2026-09-08, so it was
+            // reachable on a DEFAULT node and the fleet gate hit it on every
+            // arm of row e.
+            Err(AppendError::PayloadTooLarge) => self.refuse_schedule(REASON_SCHEDULE_TOO_LARGE),
         }
     }
 
