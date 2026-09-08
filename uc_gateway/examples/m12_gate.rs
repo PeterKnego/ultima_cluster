@@ -845,7 +845,17 @@ impl SnapshotStateMachine for TimerLoadSm {
 const NODE_BUFFER_BYTES: usize = 64 << 20;
 /// See `m5_gate`'s identical constant doc: this door is enforced on
 /// `try_submit`'s bincode-ENCODED bytes, not on `--payload` itself.
-const NODE_MAX_PAYLOAD: usize = 512;
+/// 2026-09-07 (time-and-timers gate row e): raised 512 -> 1344, the datagram
+/// ceiling (`docs/security/attack-surface.md` §3), because 512 CANNOT CARRY A
+/// FULL SCHEDULE TABLE. `append_cluster` checks
+/// `CLUSTER_BODY_PREFIX_LEN (8) + payload > max_payload`, and a
+/// `MAX_SCHEDULE_ENTRIES` table encodes to 1064 B, so the frame is 1072 B —
+/// over twice the old door. Every row-e arm was refused, and because
+/// `Node::apply_schedule_table` maps `AppendError::PayloadTooLarge` onto
+/// `REASON_SCHEDULE_DECODE` the refusal read as "the staged file is not a
+/// decodable schedule table" for a file that decodes perfectly. The old value
+/// capped the harness at 15 entries (8 + 8 + 15*33 = 511).
+const NODE_MAX_PAYLOAD: usize = 1344;
 /// The in-process arms' admission window, unchanged (the fleet `node` role
 /// takes `--admission-kib` instead).
 const DEFAULT_ADMISSION_BYTES: u64 = 256 * 1024;

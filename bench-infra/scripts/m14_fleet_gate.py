@@ -124,11 +124,22 @@ STATUS_RE = re.compile(
     r"heartbeat_age=(\S+)")
 TL_RE = re.compile(r'^TL\s+(\{.*\})\s*$', re.M)
 FSMS_OK_RE = re.compile(r'^FSMS-OK\s+(\{.*\})\s*$', re.M)
-# `m12_gate.rs`'s node role prints three snapshot-refusal counters since FSM
-# identity: legacy (peer wire <= 0.6.0), identity (positional name mismatch),
-# version (both sides versioned, differ) — e.g.
-#   m12_gate node 0 stats: reports_unattested=0 snap_refusals=(0,0,0)
-STATS_RE = re.compile(r"reports_unattested=(\d+) snap_refusals=\((\d+),(\d+),(\d+)\)")
+# `m12_gate.rs`'s node role prints FIVE snapshot-refusal counters since the
+# coordinated-snapshot work (`Node::snapshot_session_refusals()` is a 5-tuple,
+# uc_node/src/node.rs): legacy (peer wire <= 0.6.0), identity (positional name
+# mismatch), version (both sides versioned, differ), position (the fetch/
+# redirect return path's instant mismatch) and fetch_expired — e.g.
+#   m12_gate node 0 stats: reports_unattested=0 snap_refusals=(0,0,0,0,0)
+# This regex matched only THREE until 2026-09-07, so it silently failed to
+# match the real line and every host read as (-1,-1,-1) = unknown, which
+# `verdict_row_f` then scored as "not zero". The selftest below missed it
+# because its literal was copied from the pre-5-tuple format string.
+STATS_RE = re.compile(
+    r"reports_unattested=(\d+) snap_refusals=\((\d+),(\d+),(\d+),(\d+),(\d+)\)")
+
+# How many refusal counters that line carries — pinned against the regex in
+# the selftest, so the two can never drift apart again.
+REFUSAL_SLOTS = 5
 
 # Journal/snapshot sizing for row f. The m6/m7-era values (16 KiB / 32 KiB)
 # were written for arms whose client wrote kilobytes per second; the M13-class
@@ -222,6 +233,15 @@ def verdict_row_c(checks):
     bad = [c for c in checks if not c[3]]
     by_arm = {}
     for arm, host, mode, ok, count in checks:
+        # A check that could not be READ contributes no count. It is already in
+        # `bad` (check_fsms returns ok=False with count=None), so the row fails
+        # either way — but letting None into the agreement set made `sorted()`
+        # raise TypeError against the ints beside it, which killed the whole
+        # run and DISCARDED rows g/h after their arms had already been measured
+        # (2026-09-07). check_all's contract is "never raises — the verdict
+        # function judges"; this is the verdict function keeping that bargain.
+        if count is None:
+            continue
         by_arm.setdefault(arm, set()).add(count)
     disagree = {arm: sorted(cs) for arm, cs in by_arm.items() if len(cs) > 1}
     ok = not bad and not disagree and bool(checks)
@@ -276,7 +296,7 @@ def verdict_row_e(rates):
 
 
 def verdict_row_f(join):
-    """`join` = {"joined_at": s|None, "refusals": {host: (legacy, identity, version)},
+    """`join` = {"joined_at": s|None, "refusals": {host: 5 counters, all zero},
     "artifacts": {0: n, 1: n}, "installs": n, "check_ok": bool}.
 
     `installs` is the anti-vacuity clause. Everything else row f checks is
@@ -287,7 +307,8 @@ def verdict_row_f(join):
     `snapshot_installed` record on the learner is the positive evidence that
     the wire-0.6.0 two-artifact session actually ran."""
     j = join.get("joined_at")
-    refusals_zero = all(tuple(v) == (0, 0, 0) for v in join.get("refusals", {}).values()) and bool(join.get("refusals"))
+    zero = (0,) * REFUSAL_SLOTS
+    refusals_zero = all(tuple(v) == zero for v in join.get("refusals", {}).values()) and bool(join.get("refusals"))
     both = all(join.get("artifacts", {}).get(i, 0) > 0 for i in (0, 1))
     installs = int(join.get("installs") or 0)
     ok = j is not None and j <= BAR_F_JOIN_SECS and refusals_zero and both \
@@ -775,13 +796,21 @@ def log_lines(h, unit, pattern, lines=200):
 
 
 def node_stats(h):
-    """Last `stats:` line of the node unit's log → (unattested, legacy, identity, version)."""
-    out = tail_log(h, "node", lines=400)
-    hits = STATS_RE.findall(out or "")
+    """Last `stats:` line of the node unit's log →
+    (unattested, legacy, identity, version, position, fetch_expired).
+
+    GREPS the whole log rather than tailing it. `m12_gate`'s node role prints
+    this line only when the tuple CHANGES (`if now != last`, m12_gate.rs:2033),
+    so on a healthy run — every counter zero, forever — it appears EXACTLY ONCE,
+    at line 2. A `tail -n 400` therefore stopped finding it as soon as the log
+    outgrew the window: on 2026-09-07 the leader's log was 742 lines and node2's
+    498, so both read "unknown" while the two quieter hosts read the real
+    zeros. The counters were (0,0,0,0,0) on all four the whole time. A log
+    scrolling past a fixed window must never be able to look like a refusal."""
+    hits = STATS_RE.findall("\n".join(log_lines(h, "node", "snap_refusals=", lines=50)))
     if not hits:
         return None
-    u, l, i, v = hits[-1]
-    return int(u), int(l), int(i), int(v)
+    return tuple(int(x) for x in hits[-1])
 
 
 def parse_timeline(out):
@@ -1050,7 +1079,7 @@ def arm_join(voters, learner, a, K, checks, pins=None, restart_leader_after=None
     refusals = {}
     for hh in voters + [learner]:
         st = node_stats(hh)
-        refusals[hh.public_ip] = (st[1], st[2], st[3]) if st else (-1, -1, -1)
+        refusals[hh.public_ip] = tuple(st[1:]) if st else (-1,) * REFUSAL_SLOTS
     hosts_all = voters + [learner]
     # Row g: the newest COMPLETE snapshot set every host holds. It must agree
     # cluster-wide once caught up (coordinated-snapshot spec §5.3/§9) — which
@@ -1700,14 +1729,28 @@ def selftest():
     expect("row d baseline window closed before the kill", baseline_clean(12000, 10000))
     expect("row d baseline window still open at the kill", not baseline_clean(9000, 10000))
     expect("row e always passes", verdict_row_e({"n2eq": 100.0, "n2eq-ls": 40.0}).passed)
+    # An UNREADABLE check (count None) must fail row c, never raise: letting it
+    # into the agreement set crashed the 2026-09-07 g/h run at verdict time.
+    _c_unread = [("tt-h", "h0", "snapshot", True, 100), ("tt-h", "h1", "snapshot", False, None)]
+    expect("row c fails on an unreadable check instead of raising",
+           not verdict_row_c(_c_unread).passed)
+    expect("row c does not treat a None count as cross-host disagreement",
+           verdict_row_c([("a", "h0", "snapshot", True, 7),
+                          ("a", "h1", "snapshot", True, 7)]).passed)
     tl_in = [(ms, 100) for ms in range(0, 5000, 1000)] + [(ms, 0) for ms in range(5000, 45000, 1000)]
     expect("bound_timeline drops trailing buckets past end_ms, keeps earlier",
            bound_timeline(tl_in, 5000) == [(ms, 100) for ms in range(0, 5000, 1000)])
-    good = {"joined_at": 30.0, "refusals": {"h0": (0, 0, 0), "h1": (0, 0, 0), "h2": (0, 0, 0), "h3": (0, 0, 0)},
+    _z = (0,) * REFUSAL_SLOTS
+    good = {"joined_at": 30.0, "refusals": {"h0": _z, "h1": _z, "h2": _z, "h3": _z},
             "artifacts": {0: 1, 1: 1}, "artifact_bytes": {0: [4096], 1: [4096]},
             "installs": 2, "check_ok": True}
     expect("row f pass", verdict_row_f(good).passed)
-    expect("row f fail on a refusal", not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (1, 0, 0)}}).passed)
+    expect("row f fail on a refusal",
+           not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (1,) + (0,) * (REFUSAL_SLOTS - 1)}}).passed)
+    expect("row f fail on a refusal in the LAST slot (the two the 5-tuple added)",
+           not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (0,) * (REFUSAL_SLOTS - 1) + (1,)}}).passed)
+    expect("row f fail on an UNREADABLE stats line (-1 = unknown, never a pass)",
+           not verdict_row_f({**good, "refusals": {**good["refusals"], "h3": (-1,) * REFUSAL_SLOTS}}).passed)
     expect("row f fail on one artifact", not verdict_row_f({**good, "artifacts": {0: 1, 1: 0}}).passed)
     expect("row f fail late", not verdict_row_f({**good, "joined_at": 61.0}).passed)
     expect("row f fail divergence", not verdict_row_f({**good, "check_ok": False}).passed)
@@ -1795,12 +1838,17 @@ def selftest():
         expect("STATUS_RE attached/epoch/incarnation/applied/lag/snapshot_pos/heartbeat_age",
                (_sm.group(5), _sm.group(6), _sm.group(7), _sm.group(8), _sm.group(9), _sm.group(10), _sm.group(11))
                == ("true", "5", "2", "1000", "50", "900", "0.123s"))
-    _stats_line = "m12_gate node 0 stats: reports_unattested=0 snap_refusals=(1,2,3)"
+    _stats_line = "m12_gate node 0 stats: reports_unattested=0 snap_refusals=(1,2,3,4,5)"
     _tm = STATS_RE.search(_stats_line)
     expect("STATS_RE matches a literal m12_gate node-role stats line", _tm is not None)
     if _tm:
-        expect("STATS_RE unattested/legacy/identity/version",
-               _tm.groups() == ("0", "1", "2", "3"))
+        expect("STATS_RE unattested + the five refusal counters",
+               _tm.groups() == ("0", "1", "2", "3", "4", "5"))
+    expect("STATS_RE refuses the pre-5-tuple 3-counter line (the 2026-09-07 miss)",
+           STATS_RE.search("m12_gate node 0 stats: reports_unattested=0 "
+                           "snap_refusals=(0,0,0)") is None)
+    expect("REFUSAL_SLOTS matches the regex's counter group count",
+           REFUSAL_SLOTS == STATS_RE.groups - 1)
 
     # ================================= time and timers (--tt-rows) =========
     print("  -- tt_fleet_gate leaf helpers --")
