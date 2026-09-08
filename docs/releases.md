@@ -1,12 +1,12 @@
 # ultima_cluster releases
 
-## Unreleased — FSM identity, log time, the cluster FSM, and coordinated snapshots (next minor, 2.11.0 when cut)
+## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
-**Implemented; not tagged. Release on hold** — the maintainer **stopped** the
-release on 2026-09-05 for the cluster-FSM and coordinated-snapshot work, which
-is why there are a fourth and a fifth feature below. This entry is a draft
-written ahead of the tag, per the standing writeup rule (CLAUDE.md), so the
-record is ready when the maintainer green-lights it.
+**Tagged 2026-09-08.** The release was stopped on 2026-09-05 for the cluster-FSM and
+coordinated-snapshot work — which is why there are a fourth and a fifth feature
+below — and resumed once both fleet gates had run (2026-09-07/08). This entry
+was written ahead of the tag, per the standing writeup rule (CLAUDE.md), and
+updated with the gate results before it.
 
 **Five features, one flag day.** All five were implemented before the
 release was cut, and all five move the wire to `0.7.0` and the cnc page to

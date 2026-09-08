@@ -7,7 +7,7 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## Unreleased — FSM identity, log time, the cluster FSM, and coordinated snapshots (next minor, 2.11.0 when cut)
+## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
 Five features on one flag day: a state machine now carries its own **name and
 version** in code; every log frame carries the **time** the leader accepted it,
@@ -19,7 +19,7 @@ Wire `0.6.0` → `0.7.0` and cnc `3.0` → `3.1`, together. Proof record, row by
 row: [FSM identity gate](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md) ·
 [time-and-timers gate](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md) ·
 [the release-evidence table](docs/releases.md#release-evidence). Both gates ran
-on a fleet 2026-09-07/08; no version has been tagged yet.
+on a fleet 2026-09-07/08.
 
 - **FSM identity: a state machine declares its own name and version in
   code** (`uc_service`, `uc_node`, `uc_protocol`): a required `const NAME`
