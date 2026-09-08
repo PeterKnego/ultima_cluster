@@ -2704,8 +2704,9 @@ struct Consensus {
     /// Time-and-timers §6: per-row `fired`/`late` counters — the SAME `Arc`
     /// `Node::observability` hands the metrics encoder.
     timer_stats: Arc<crate::timers::TimerStats>,
-    /// Time-and-timers §3.2/§4.3: the ONE wall-clock reading of this pass
-    /// (`wall_now_ns`), sampled at the top of `do_work` and used for every
+    /// Time-and-timers §3.2/§4.3: the pass's WALL value, derived by
+    /// `LogClock::wall_at` from the pass's one `Instant` reading
+    /// (`pass_mono_ns`), sampled at the top of `do_work` and used for every
     /// deadline comparison and every `Appender::set_now` in the pass, so a
     /// pass's frames share one clock. `0` until the first pass.
     pass_now_ns: u64,
@@ -2722,12 +2723,13 @@ struct Consensus {
     /// leadership term is skipped rather than observed as the gap since the
     /// last term.
     last_pass_ns: u64,
-    /// Test-only clock override for the one `wall_now_ns()` reading per pass.
-    /// `#[cfg(test)]`, so the shipped binary has neither the field nor the
-    /// branch — M14a's rule is that code in a hot body costs even on paths
-    /// that never run, and this one is genuinely ABSENT rather than merely
-    /// unreachable. Set by `tests::timers_differential`, which has to place
-    /// passes at chosen instants to drive the §4.3 ordering deterministically.
+    /// Test-only override for the pass's WALL value only (`pass_clock`);
+    /// `pass_mono_ns` is always real. `#[cfg(test)]`, so the shipped binary
+    /// has neither the field nor the branch — M14a's rule is that code in a
+    /// hot body costs even on paths that never run, and this one is
+    /// genuinely ABSENT rather than merely unreachable. Set by
+    /// `tests::timers_differential`, which has to place passes at chosen
+    /// instants to drive the §4.3 ordering deterministically.
     #[cfg(test)]
     test_now_ns: Option<u64>,
     /// M14a: a copy of `NodeConfig::services` — the declared set + lag policy.
@@ -3541,8 +3543,9 @@ impl Consensus {
 
         // 6. Publish the node's status onto the shared cnc page for cross-process
         // attachers (service, clients). `term` + `flags` reflect the SM every
-        // cycle; `node_heartbeat_ns` is wall-clock ns (SystemTime) so a service
-        // in another process can compare it against its own clock for liveness.
+        // cycle; `node_heartbeat_ns` is epoch ns from the log clock
+        // (`pass_now_ns`) so a service in another process can compare it
+        // against its own clock for liveness.
         self.publish_status();
         self.report_snapshot_refusals();
 
@@ -4743,10 +4746,10 @@ impl Consensus {
             );
         }
         self.last_flags = flags;
-        // Final-review M5: reuse THIS pass's one clock reading (`wall_now_ns` is
-        // documented as called exactly once per pass, at the top of `do_work`,
-        // and `publish_status` runs only from step 6 of that same pass) rather
-        // than taking a second `SystemTime::now()` for the heartbeat.
+        // Final-review M5: reuse THIS pass's one reading (`pass_now_ns`,
+        // derived at the top of `do_work` from the pass's one `Instant` read
+        // and `publish_status` runs only from step 6 of that same pass)
+        // rather than reading any clock here.
         let now_ns = self.pass_now_ns;
         status.node_heartbeat_ns.store_release(now_ns);
         self.last_wall_ns = now_ns;
@@ -4842,9 +4845,11 @@ impl Consensus {
     fn record_pass_interval(&mut self) {
         let now = self.pass_now_ns;
         if self.last_pass_ns != 0 {
-            // `saturating_sub`: `wall_now_ns` is a wall clock and can step
-            // backwards, which reads as a 0-length pass rather than a
-            // gigantic one.
+            // `saturating_sub`: the value is monotone by construction now
+            // (`LogClock` never goes backwards) — this is a belt-and-braces
+            // guard against the `#[cfg(test)]` `test_now_ns` override, which
+            // a test may set to any value, so a pinned-backwards test reads
+            // as a 0-length pass rather than a gigantic one.
             self.timer_stats
                 .pass_ns
                 .observe(now.saturating_sub(self.last_pass_ns));
@@ -8215,8 +8220,8 @@ impl Consensus {
         );
         let mut appender =
             Appender::new(Arc::clone(&self.buffer), open.term, self.cnc.log_time_ns());
-        // Time-and-timers §3.2: the pass's ONE clock reading, not a second
-        // `SystemTime::now()` — every frame of this pass shares one clock.
+        // Time-and-timers §3.2: the pass's one reading (`pass_now_ns`), not a
+        // second clock read — every frame of this pass shares one clock.
         appender.set_now(self.pass_now_ns);
         appender
             .append_new_term()
