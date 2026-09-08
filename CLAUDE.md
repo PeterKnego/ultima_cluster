@@ -198,7 +198,11 @@ one log stream (#11); the release-ledger line (#5) is process, not code
     reads its clock **once per pass** and stamps every frame
     `max(now, last)` inside `uc_log::Appender`, so the log's time never
     goes backwards; `ctx.time_ns` is the FSM's deterministic "now" and
-    `query` gets none. `FRAME_TYPE_TIMER = 5` (24-byte body
+    `query` gets none. Since the (unreleased) `2.12.0` that read is
+    `CLOCK_MONOTONIC` plus a sampled epoch offset (`uc_node::log_clock`): a
+    backward wall step is smeared at 500 ppm, never frozen — spec
+    `docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`.
+    `FRAME_TYPE_TIMER = 5` (24-byte body
     `identity_hash ‖ timer_id ‖ deadline_ns`) is the **first per-FSM frame
     in a broadcast log**: delivered only to the FSM whose hash it names,
     skipped by every other apply loop but still counted as a yielded frame

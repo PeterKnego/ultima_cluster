@@ -7,6 +7,20 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## 2.12.0 (unreleased)
+
+- **Monotonic log clock.** The leader's log-time stamp comes from
+  `CLOCK_MONOTONIC` plus a sampled epoch offset: a backward NTP step slows
+  the log clock (500 ppm) instead of freezing it, and the consensus pass
+  takes one clock read instead of two. New gauge `uc2_log_clock_smear_ns`,
+  new event `log_clock_step`; `Uc2LogTimeFrozen` now means only a stalled
+  appender.
+  [Explainer](docs/notes/uc2-log-time-and-timers-explained.md#the-log-clock),
+  [spec](docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md).
+- **Performance:** the fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree
+  vs its pre-change parent commit) is **pre-committed and not yet run** —
+  [the gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
+
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
 Five features on one flag day: a state machine now carries its own **name and

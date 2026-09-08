@@ -66,10 +66,15 @@ verify rather than a build:
   records).
 - **Is the log's clock moving?** `uc2_log_time_ns` on every node is the highest
   leader stamp the archive has recorded; `uc2_log_time_lag_seconds` on the
-  **leader only** (rendered `0` elsewhere) is wall clock minus that. A grown lag
-  means the leader's clock stepped backwards (stamps hold flat until wall time
-  catches up) or nothing is being appended; `Uc2LogTimeFrozen` fires above 5 s
-  for 30 s. Per-row timer counters are `uc2_timers_pending`,
+  **leader only** (rendered `0` elsewhere) is wall clock minus that. Since
+  `2.12.0` (unreleased) a backward wall-clock step no longer holds this lag
+  open: the log clock smears the step instead of freezing, so
+  `Uc2LogTimeFrozen`'s meaning has narrowed to "the appender is stalled" — a
+  grown lag now means nothing is being appended, not a clock step. The
+  per-node smear gauge (`uc2_log_clock_smear_ns`) and the `log_clock_step`
+  record are covered in
+  [Monitor a cluster § The log clock and the timer families](../how-to/monitor-a-cluster.md#the-log-clock-and-the-timer-families-211-pending),
+  not repeated here. Per-row timer counters are `uc2_timers_pending`,
   `uc2_timers_fired_total` and `uc2_timers_late_total`; `uc2_timers_pending` is
   the **leader's** count and a follower exports `0`, because the timer heap is
   leader-only since the cluster FSM. The one `[log]` record is `timer_late`

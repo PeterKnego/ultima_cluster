@@ -513,6 +513,119 @@ frame, every node keeps the heap, leader fires, id-only frames) and adds
 three things: the monotone clamp, the deadline-stamped in-order placement,
 and exactly-once delivery decided on the service side from log content alone.
 
+## The log clock
+
+`ctx.time_ns` comes from somewhere. Since the (unreleased) `2.12.0` it comes
+from a small clock built purely to solve one problem: a leader's wall clock
+can jump, and the log cannot afford to stop when it does. The design spec is
+[`docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`](../superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md);
+this section is the plain-language version, and where the spec's own
+sentences are the exact right ones, they are quoted rather than rephrased.
+
+### 1. Two clocks, and neither one is enough alone
+
+Linux offers two clocks and neither one is sufficient alone:
+
+- **`CLOCK_REALTIME`** (`SystemTime`) answers *what time is it* — epoch
+  nanoseconds — but can **jump** in either direction when NTP corrects it or
+  an operator sets the clock. Not monotonic.
+- **`CLOCK_MONOTONIC`** (`Instant`) never jumps, but carries no calendar
+  meaning. The schedule table's `at {secs_of_day}` rule is a time of day, so
+  an unanchored counter cannot serve it.
+
+The log stamp needs both properties: it needs to never go backwards, the way
+the clamp already requires, and it needs to mean a calendar time, the way
+the schedule table already requires.
+
+### 2. `now = MONOTONIC + offset`, and why the offset barely moves
+
+The log clock is built by composition, not by asking the OS for a single
+better clock:
+
+```
+offset = REALTIME − MONOTONIC        // sampled periodically
+now()  = MONOTONIC + offset          // read once per consensus pass
+```
+
+The result counts like `CLOCK_MONOTONIC` and reads like `CLOCK_REALTIME`.
+
+**The offset is nearly constant, and that is the load-bearing fact.** NTP
+corrects a clock two ways: by **slewing** (running it imperceptibly fast or
+slow, continuously) and by **stepping** (a discontinuous jump, rare). Linux
+applies **slew to both** clocks — `clock_gettime(2)` states that
+`CLOCK_MONOTONIC` "is not affected by discontinuous jumps in the system time
+but is affected by frequency adjustments" — and applies **steps only to
+`REALTIME`**. In the subtraction `REALTIME − MONOTONIC`, the slew cancels.
+So the offset moves only at step events and across suspend, which is why
+tracking it is a subtraction sampled on a slow cadence rather than a control
+loop running every pass.
+
+The offset itself is sampled by bracketing a wall-clock read between two
+monotonic reads, and keeping the narrowest bracket seen — the same method
+Aeron's Agrona library uses for its own epoch clock.
+
+### 3. Forward is adopted, backward is smeared — and the old design already smeared, by stopping
+
+Periodically — on a cadence, not on the hot path — the held offset is
+re-sampled and compared against the new one. The difference is the step
+(slew having cancelled out, per §2 above). Three cases:
+
+- **No meaningful change** (inside the sampling bracket's noise): keep the
+  held offset. This is the steady state.
+- **Forward step** (wall time jumped ahead): **adopt immediately.** The
+  derived clock jumps forward with it. This is monotonic-safe and is exactly
+  what happened before this design, including the documented consequence
+  that every timer due in the skipped interval fires at once.
+- **Backward step** (wall time jumped back): **do not adopt.** Adopting
+  would move the derived clock backwards, the clamp would absorb it, and the
+  log would freeze — the failure mode this design removes. Instead
+  **smear**: hold a correction term and retire it gradually by running the
+  derived clock slightly slow, until the derived clock and UTC agree again.
+
+Holding the old offset forever, instead of smearing it back down, was
+considered and rejected: it would leave the log clock permanently ahead of
+UTC by the step size, which the `at {secs_of_day}` daily rule cannot
+tolerate — a daily job would fire at the wrong time of day, forever.
+Smearing keeps the log clock monotonic *and* returns it to UTC.
+
+The framing worth keeping: **the old design already smeared, by stopping.**
+`max(now, last_stamp)` — the clamp described in part 1 above, which is
+unchanged by any of this — is the crudest possible smear: it halts the
+clock until UTC catches up. This design replaces "stop dead" with "run
+slightly slow," same destination, no stall. A backward step now shows up as
+the gauge `uc2_log_clock_smear_ns` counting down to zero and one
+`log_clock_step` record, instead of a frozen log and a growing
+`uc2_log_time_lag_seconds`.
+
+### 4. What it costs
+
+Before this design, the consensus agent's pass took two unconditional clock
+reads: `SystemTime::now()` for the log stamp, and a separate
+`Instant::now()` for its own tick bookkeeping. The log clock's one
+`Instant` read produces both values — the stamp and the monotonic tick —
+because the tick is derived from the same raw monotonic reading the stamp
+was, before the offset is added. One read per pass instead of two is the
+whole of the measurable saving; nothing else on the hot path changes shape.
+
+### 5. What it does not do
+
+The log clock does not make nodes agree with each other any faster or any
+more precisely than they already did. It is still, exactly as before, **the
+leader's clock and only the leader's clock** that reaches the log — a
+follower runs its own log clock so that it is ready to lead, but writes no
+stamp with it. `log_time_ns`, the cnc word a fresh leader seeds its clamp
+from, is untouched: a promotion still seeds from the archive's recovered
+value, never from whichever node's wall clock happens to be running.
+
+It also does not reach for a raw hardware counter (`rdtsc`/`CNTVCT`) instead
+of the kernel's `CLOCK_MONOTONIC`. A raw counter reads faster, but it is
+`unsafe`, per-architecture, needs its own calibration against the kernel
+clock, and buys a saving on top of `Instant`'s that only matters if the
+consensus pass turns out to be the bottleneck at fleet peak — which is
+exactly what is not yet known. The spec's §4 lays out the full trade and
+leaves the raw-counter path ("B-lite") as a possible follow-on, gated on
+this design's own fleet result.
+
 ## Failure modes
 
 Every one of these is a designed-for case, not a bug report.
@@ -521,7 +634,7 @@ Every one of these is a designed-for case, not a bug report.
 |---|---|
 | Leader dies after stamping past a deadline, before firing | The next leader fires it **late**: `time_ns` clamped to `last_stamp`, `deadline_ns` unchanged, `ev.late(ctx)` true |
 | A deadline is already in the past when it is scheduled | Fires next pass, marked late the same way |
-| The leader's clock steps **backward** | Stamps hold at `last_stamp`; the log's time freezes; `uc2_log_time_lag_seconds` grows and `Uc2LogTimeFrozen` fires; timers resume when wall time catches up |
+| The leader's clock steps **backward** | Since `2.12.0` (unreleased), the log clock does not freeze: it keeps advancing, 500 ppm slow, until it has retired the step (a 1 s step takes 2 000 s) — visible as `uc2_log_clock_smear_ns` counting down and one `log_clock_step` record. `uc2_log_time_lag_seconds` stays at 0 throughout (the log clock is ahead of wall time during a smear), so `Uc2LogTimeFrozen` does not fire for this case any more — see [The log clock](#the-log-clock) |
 | The leader's clock steps **forward** | Log time jumps; every timer between the old and new time fires over the next passes, all "on time". Clock discipline (NTP) is the operator's job, as it is in Aeron |
 | Leadership is lost with timers appended but not yet confirmed | The old leader **discards** its heap; the new leader rebuilds from its service's re-announce, which still holds the unconfirmed instance, and fires it again. `Timed` drops the duplicate |
 | A cancel races a fire that is already on the log | The frame arrives, the instance is no longer pending, the frame is dropped. Cancel wins, identically on every replica |
@@ -545,6 +658,11 @@ Every one of these is a designed-for case, not a bug report.
 - `uc2_log_time_lag_seconds` on the leader only (rendered `0` elsewhere):
   wall clock minus the log's clock. `Uc2LogTimeFrozen` fires when it exceeds
   5 s for 30 s on the leader.
+- `uc2_log_clock_smear_ns` on **every** node (per-node, not leader-gated — a
+  follower's value is the clock it would lead with after a failover): ns of
+  a backward wall-clock step that node's log clock is still retiring, at
+  500 ppm; `0` when none. One `log_clock_step` record marks each detected
+  step. See [The log clock](#the-log-clock).
 - `uc2_timers_pending{service,row}`, plus `uc2_timers_fired_total` and
   `uc2_timers_late_total` per row. `uc2_timers_pending` is the **leader's**
   count — the heap is leader-only — so a follower exports `0` and the fleet

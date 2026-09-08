@@ -1,5 +1,58 @@
 # ultima_cluster releases
 
+## 2.12.0 (unreleased) — the monotonic log clock
+
+Requested by the maintainer 2026-09-08 ("a fast, monotonic, wall-clock-anchored
+ns counter, that works both on Arm in Intel"); not a ranked `docs/BACKLOG.md`
+item. Spec
+[`docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`](superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md).
+Baseline: local `main` / worktree `claude-2` at the tagged `v2.11.0` (wire
+`0.7.0`, cnc `3.1`).
+
+### What changed
+
+`pass_clock()` (`uc_node/src/node.rs:3268`) no longer reads
+`SystemTime::now()`. It reads a private module, `uc_node::log_clock`, whose
+value is `CLOCK_MONOTONIC` (`std::time::Instant`) plus a sampled epoch
+offset (`REALTIME − MONOTONIC`, bracketed and re-sampled every 1 s;
+`RESAMPLE_INTERVAL_NS`), read once per consensus pass exactly where
+`wall_now_ns()` was read before. `Event::Tick`'s `now_ns` is derived from the
+same monotonic reading the stamp used, so **the consensus agent's two
+unconditional clock reads per pass become one** — the whole of this design's
+measurable saving (spec §3/§5.2).
+
+A detected step is handled by case: a change inside the sampling bracket's
+noise (`STEP_TOLERANCE_NS = 10 µs`) is not a step; a **forward** step is
+adopted immediately, identical to pre-2.12.0 behaviour, including every
+timer due in the skipped interval firing at once; a **backward** step is
+**never adopted** — instead the derived clock is **smeared**, running
+`SMEAR_PPM = 500` slow (a 1 s step takes 2 000 s to retire) until it
+re-converges with UTC. The `max(now, last_stamp)` clamp in `uc_log::Appender`
+is unchanged; this design only stops relying on it as the step-absorber, so
+a backward step no longer freezes the log. New gauge
+`uc2_log_clock_smear_ns` (remaining ns still to retire, `0` when none) and
+new event `log_clock_step` (`direction`, `step_ns`, `smear_ns`) are
+**per-node, not leader-gated** (Ruling R6): `LogClock` runs on every node and
+persists across promotion, so a follower's smear is the clock it would lead
+with after a failover. `Uc2LogTimeFrozen` narrows to its one remaining cause,
+"the appender is stalled" — a healthy smear reads `uc2_log_time_lag_seconds
+== 0` throughout, because the log clock is ahead of wall time while smearing.
+
+No frame, wire, cnc or `ApplyCtx` change. `LogClock` runs on every node, but
+only the leader's clock ever reaches the log — a follower still writes
+frames verbatim and stamps nothing; it runs its own clock only so it is
+ready to lead.
+
+### Acceptance
+
+**Fleet A/B, unrun.** The bars are pre-committed in
+[the gate doc](benchmarks/uc2-log-clock-gate-2026-09-08.md): `m14_fleet_gate.py`
+rows a/b/e, this tree vs. its pre-change parent commit, on the same rig, same
+day, after a same-source rebuild control run records that day's resolution
+(the M14b lesson — 1.12 % on 2026-09-07). No fleet run has happened yet; the
+dev-box `m12_gate --arm direct` smoke is recorded in the gate doc as smoke,
+never as a bar (CLAUDE.md's benchmarking discipline).
+
 ## v2.11.0 — 2026-09-08 — FSM identity, log time, the cluster FSM, and coordinated snapshots
 
 **Tagged 2026-09-08.** The release was stopped on 2026-09-05 for the cluster-FSM and
