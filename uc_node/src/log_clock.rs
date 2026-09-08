@@ -52,7 +52,9 @@ pub(crate) struct LogClockCore {
     /// Total ns still to be retired by running slow, measured from the anchor.
     smear_ns: u64,
     next_resample_mono_ns: u64,
-    /// The last emitted value — asserted against in debug builds only.
+    /// The last emitted value — asserted against in debug builds only, so
+    /// neither the field nor its store exist in a release build.
+    #[cfg(debug_assertions)]
     last_ns: u64,
 }
 
@@ -63,12 +65,16 @@ impl LogClockCore {
             anchor_wall_ns: wall_ns,
             smear_ns: 0,
             next_resample_mono_ns: mono_ns.saturating_add(RESAMPLE_INTERVAL_NS),
+            #[cfg(debug_assertions)]
             last_ns: wall_ns,
         }
     }
 
     #[inline(always)]
     fn retired(&self, d: u64) -> u64 {
+        if self.smear_ns == 0 {
+            return 0;
+        }
         ((d as u128 * SMEAR_PPM as u128 / 1_000_000) as u64).min(self.smear_ns)
     }
 
@@ -83,12 +89,15 @@ impl LogClockCore {
     #[inline(always)]
     pub(crate) fn wall_at(&mut self, mono_ns: u64) -> u64 {
         let v = self.derived(mono_ns);
-        debug_assert!(
-            v >= self.last_ns,
-            "log clock went backwards: {} -> {v}",
-            self.last_ns
-        );
-        self.last_ns = v;
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                v >= self.last_ns,
+                "log clock went backwards: {} -> {v}",
+                self.last_ns
+            );
+            self.last_ns = v;
+        }
         v
     }
 
@@ -111,27 +120,42 @@ impl LogClockCore {
     }
 
     /// Compare a fresh `(mono, wall)` sample against what the held offset
-    /// predicts. Forward step: adopt (re-anchor at the sample, drop any
-    /// smear). Backward step: re-anchor at the DERIVED value and add the
-    /// difference to the smear. Within tolerance: nothing.
+    /// predicts. During a smear our derived clock is deliberately AHEAD of
+    /// the wall by `remaining_smear_ns` — that is expected, not a step — so
+    /// the baseline for "did the wall move" is `derived − remaining`, not
+    /// `derived` (controller ruling R7). Forward step: adopt (re-anchor at
+    /// the sample, drop any smear). Backward step: re-anchor at the DERIVED
+    /// value and add the difference to the smear. Within tolerance: nothing.
     pub(crate) fn resample(&mut self, mono_ns: u64, wall_ns: u64) -> Option<Step> {
         self.next_resample_mono_ns = mono_ns.saturating_add(RESAMPLE_INTERVAL_NS);
+        let remaining = self.remaining_smear_ns(mono_ns);
         let derived = self.derived(mono_ns);
-        if wall_ns > derived.saturating_add(STEP_TOLERANCE_NS) {
-            let by = wall_ns - derived;
-            self.anchor_mono_ns = mono_ns;
+        // Signed gap between our clock and the wall; positive = we are ahead.
+        // A smear in flight is EXPECTED to leave us ahead by `remaining`, so
+        // the step is what changed beyond that — not the gap itself.
+        let gap = derived as i128 - wall_ns as i128;
+        let step = gap - remaining as i128;
+        if step.unsigned_abs() <= STEP_TOLERANCE_NS as u128 {
+            return None;
+        }
+        self.anchor_mono_ns = mono_ns;
+        if gap <= 0 {
+            // The wall is at or above us: adopt it, nothing left to retire.
             self.anchor_wall_ns = wall_ns;
             self.smear_ns = 0;
-            Some(Step::Forward(by))
-        } else if wall_ns.saturating_add(STEP_TOLERANCE_NS) < derived {
-            let by = derived - wall_ns;
-            let remaining = self.remaining_smear_ns(mono_ns);
-            self.anchor_mono_ns = mono_ns;
-            self.anchor_wall_ns = derived;
-            self.smear_ns = remaining + by;
-            Some(Step::Backward(by))
+            Some(Step::Forward((-step) as u64))
         } else {
-            None
+            // We are still ahead of the wall: re-anchor at our own value
+            // (never backwards) and retire the whole gap. A forward step
+            // smaller than the remaining smear lands here too — it shrinks
+            // the smear rather than being adopted.
+            self.anchor_wall_ns = derived;
+            self.smear_ns = gap as u64;
+            if step > 0 {
+                Some(Step::Backward(step as u64))
+            } else {
+                Some(Step::Forward((-step) as u64))
+            }
         }
     }
 }
@@ -152,15 +176,24 @@ fn wall_now_ns() -> u64 {
 /// times, and return `(mono_mid_ns, wall_ns, width_ns)` of the NARROWEST
 /// bracket seen — stopping early once a bracket is at or under
 /// `threshold_ns`. The caller decides whether `width_ns` is good enough.
+///
+/// `wall_now_ns() == 0` (a `SystemTime` before the epoch — the only way it
+/// can return 0) is treated as an INVALID bracket: its `width` is forced to
+/// `u64::MAX` so it can never be `best` and never satisfies `threshold_ns`,
+/// which keeps a bogus 0 sample from ever being adopted as a ~56-year step.
 pub(crate) fn bracket_sample(base: Instant, retries: u32, threshold_ns: u64) -> (u64, u64, u64) {
     let mut best: Option<(u64, u64, u64)> = None;
     for _ in 0..retries.max(1) {
         let m0 = mono_since(base);
         let w = wall_now_ns();
         let m1 = mono_since(base);
-        let width = m1.saturating_sub(m0);
+        let width = if w == 0 {
+            u64::MAX
+        } else {
+            m1.saturating_sub(m0)
+        };
         if best.is_none_or(|b| width < b.2) {
-            best = Some((m0 + width / 2, w, width));
+            best = Some((m0 + m1.saturating_sub(m0) / 2, w, width));
         }
         if width <= threshold_ns {
             break;
@@ -183,6 +216,11 @@ impl LogClock {
     pub(crate) fn new() -> Self {
         let base = Instant::now();
         let (m, w, _width) = bracket_sample(base, INIT_RETRIES, INIT_THRESHOLD_NS);
+        // `bracket_sample` picks the best (narrowest-width) try regardless of
+        // width here, so if every try saw `SystemTime` before the epoch this
+        // is the process's only usable clock reading — not a case we should
+        // silently accept in a debug build.
+        debug_assert!(w != 0, "SystemTime before the epoch");
         Self {
             base,
             core: LogClockCore::new(m, w),
@@ -234,6 +272,13 @@ impl LogClock {
 
     pub(crate) fn remaining_smear_ns(&self, mono_ns: u64) -> u64 {
         self.core.remaining_smear_ns(mono_ns)
+    }
+
+    /// Test seam: feed a synthetic `(mono_mid, wall, width)` bracket into the
+    /// resample decision, exactly as `resample_slow` would.
+    #[cfg(test)]
+    pub(crate) fn inject_sample(&mut self, mono_ns: u64, sample: (u64, u64, u64)) {
+        self.apply_sample(mono_ns, sample);
     }
 }
 
@@ -323,9 +368,13 @@ mod tests {
         let at = RESAMPLE_INTERVAL_NS;
         let before = c.wall_at(at);
         c.resample(at, before - S);
-        let at2 = 2 * RESAMPLE_INTERVAL_NS;
+        let at2 = at + 1000 * S; // 0.5 s retired, 0.5 s remaining
         let derived = c.wall_at(at2);
-        assert_eq!(c.resample(at2, derived + 5 * S), Some(Step::Forward(5 * S)));
+        assert_eq!(c.remaining_smear_ns(at2), S / 2);
+        assert_eq!(
+            c.resample(at2, derived + 5 * S),
+            Some(Step::Forward(5 * S + S / 2))
+        );
         assert_eq!(c.remaining_smear_ns(at2), 0);
         assert_eq!(c.wall_at(at2), derived + 5 * S);
     }
@@ -341,10 +390,65 @@ mod tests {
         assert_eq!(c.remaining_smear_ns(at2), S / 2);
         assert_eq!(
             c.resample(at2, derived - 2 * S),
-            Some(Step::Backward(2 * S))
+            Some(Step::Backward(S + S / 2))
         );
-        assert_eq!(c.remaining_smear_ns(at2), S / 2 + 2 * S);
+        assert_eq!(c.remaining_smear_ns(at2), 2 * S);
         assert_eq!(c.wall_at(at2), derived, "still never backwards");
+    }
+
+    #[test]
+    fn a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down() {
+        // An INDEPENDENT wall: true_wall(mono) = base + mono, stepped back by
+        // 1 s once at t = 1 s, then running 1:1. Every resample after the
+        // step must see NO new step, and the remaining smear must fall
+        // strictly toward 0 without undershoot.
+        let base = 1000 * S;
+        let true_wall = |mono: u64| base + mono - if mono >= S { S } else { 0 };
+        let mut c = LogClockCore::new(0, base);
+        let mut steps = Vec::new();
+        let mut last_remaining = u64::MAX;
+        let mut mono = 0;
+        for _ in 0..3000 {
+            mono += RESAMPLE_INTERVAL_NS;
+            if let Some(s) = c.resample(mono, true_wall(mono)) {
+                steps.push((mono, s));
+            }
+            let rem = c.remaining_smear_ns(mono);
+            assert!(
+                rem <= last_remaining,
+                "smear grew at mono {mono}: {last_remaining} -> {rem}"
+            );
+            last_remaining = rem;
+            let v = c.wall_at(mono);
+            assert!(v >= true_wall(mono), "undershoot at mono {mono}");
+        }
+        assert_eq!(
+            steps,
+            vec![(S, Step::Backward(S))],
+            "exactly one step reported: {steps:?}"
+        );
+        assert_eq!(c.remaining_smear_ns(mono), 0, "fully retired after 3000 s");
+        assert_eq!(
+            c.wall_at(mono),
+            true_wall(mono),
+            "converged to the wall, no residue"
+        );
+    }
+
+    #[test]
+    fn a_forward_step_smaller_than_the_remaining_smear_shrinks_it_without_going_backwards() {
+        let mut c = LogClockCore::new(0, 1000 * S);
+        let at = RESAMPLE_INTERVAL_NS;
+        let before = c.wall_at(at);
+        c.resample(at, before - S); // smear 1 s
+        let at2 = 2 * RESAMPLE_INTERVAL_NS;
+        let derived = c.wall_at(at2);
+        let remaining = c.remaining_smear_ns(at2);
+        // the wall jumps forward by a quarter second: still below us
+        let wall = derived - remaining + S / 4;
+        assert_eq!(c.resample(at2, wall), Some(Step::Forward(S / 4)));
+        assert_eq!(c.wall_at(at2), derived, "never backwards");
+        assert_eq!(c.remaining_smear_ns(at2), remaining - S / 4);
     }
 
     #[test]

@@ -11481,6 +11481,33 @@ mod tests {
         );
     }
 
+    /// Spec 2026-09-08 §7: a backward step publishes a nonzero
+    /// `uc2_log_clock_smear_ns` that then falls pass over pass, and the
+    /// step is drained exactly once (`take_step`), so `publish_status`
+    /// cannot emit `log_clock_step` again for the same step.
+    #[test]
+    fn a_backward_step_publishes_a_falling_smear_gauge_and_is_drained_once() {
+        let mut h = harness();
+        h.cons.do_work();
+        let m = h.cons.pass_mono_ns;
+        let before = h.cons.clock.wall_at(m);
+        h.cons
+            .clock
+            .inject_sample(m, (m, before - 1_000_000_000, 100));
+        h.cons.publish_status();
+        let g1 = h.cons.log_clock_smear_pub.load(Ordering::Relaxed);
+        assert!(g1 > 0 && g1 <= 1_000_000_000, "gauge published: {g1}");
+        assert_eq!(
+            h.cons.clock.take_step(),
+            None,
+            "publish_status drained the step"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.cons.do_work(); // step 6 of the pass republishes
+        let g2 = h.cons.log_clock_smear_pub.load(Ordering::Relaxed);
+        assert!(g2 < g1, "gauge counts down: {g1} -> {g2}");
+    }
+
     /// The test seam overrides the WALL value only; the Tick still gets a
     /// real monotonic reading, so pinning the pass clock cannot stall an
     /// election timeout.
