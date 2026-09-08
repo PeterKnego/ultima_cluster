@@ -82,6 +82,26 @@ documentation for what it changes, because the tag is what people read.
       three. `v2.9.0` is also the release that **renamed every crate** to the
       `uc_` prefix, so §6's publish list below is the post-rename one: it is
       the first crates.io publish, and the names it burns are permanent.
+      For **`v2.11.0`** the scaffolding is a different shape, because this
+      writeup was drafted while the release was STOPPED and then updated after
+      the fleet gates ran, rather than being written at tag time. Retire:
+      the two `## Unreleased — FSM identity, log time, the cluster FSM, and
+      coordinated snapshots (next minor, 2.11.0 when cut)` headings
+      (`RELEASES.md`, `docs/releases.md`) — date them and drop the
+      `when cut` qualifier; `RELEASES.md`'s "**No version has been tagged
+      yet.**" sentence; and `docs/releases.md`'s "**Implemented; not tagged.
+      Release on hold** — the maintainer **stopped** the release on
+      2026-09-05 …" paragraph, which describes a hold that ended.
+      `grep -rn "Unreleased\|not tagged\|has been tagged\|Release on hold" RELEASES.md docs/releases.md`
+      finds all four. **Do NOT touch the gate docs' Results tables or the
+      release-evidence table** — those carry measured outcomes, several of
+      them honest failures and inconclusives, and they are the record the tag
+      exists to freeze. Two things this release leaves deliberately open and
+      that the tagger should NOT quietly close: the time-and-timers gate's
+      rows a/b/e are `inconclusive` pending a fleet re-run with the paired
+      statistic, and row h's standby arm did not complete (an
+      operating-envelope question, with four passing deterministic tests
+      behind the mechanism).
 
 ## 2. Check the version the way the workflow will
 
