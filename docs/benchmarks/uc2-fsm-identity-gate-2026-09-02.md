@@ -104,22 +104,56 @@ matched (a real defect in the positional comparison, not a bar to relax).
 
 ## Results
 
-**Not run.** No fleet spend has been authorized for this gate — the release
-itself is on hold pending further changes to `uc2/fsm-identity`. This table
-stays empty until the maintainer green-lights a run:
+**RUN 2026-09-07 on the fleet.** 4 × `c6id.2xlarge`, us-east-1a (node0
+`54.208.131.240` leader/client, node1 `34.228.73.79`, node2 `34.230.85.94`,
+node3 `54.221.97.88` learner). Head tree `d9483c2`, working tree clean.
+Driver `m14_fleet_gate.py --fleet --rows abef --metrics-port 0` (the M14
+gate's own conditions: no `--metrics-listen`, since this gate's rows mirror
+M14's). Calibration picked `K = 500`, the same rung the M14 gate used.
+Log kept off-tree.
+
+**Rows a/b/e are judged against the same-source rebuild resolution measured
+on the day: `1.12 %`** — see the "numbers to record" note below.
 
 | row | result |
 |---|---|
-| a | not run — release on hold |
-| b | not run — release on hold |
-| e | not run — release on hold |
-| j | not run — release on hold |
+| a | **not a regression, and NOT adjudicable against this bar.** Measured `n2eq`/`n1` = **0.539** (1 007 609 / 1 869 148 ops/s), which also misses the M14 gate's own ≥ 0.90 ratio bar the driver checks. The same-day A/B in [the time-and-timers gate](uc2-time-and-timers-gate-2026-09-03.md) settles it: on this rig, on the same hosts in the same minutes, the **pre-identity, pre-time-and-timers baseline tree `17d5c6b` straddles the same bar** — per-rep `n2eq`/`n1` of 0.678 / 0.734 / 0.626 and 0.717 / 0.810 / 1.362, against the head tree's 0.815 / 0.842 / 0.613 and 0.822 / 0.683 / 0.524. Neither tree sits cleanly above 0.90 here, and this gate's own arms are SINGLE SAMPLES in a distribution that wide. The 0.539 is where one sample landed, not a cost of FSM identity. **The bar itself is unreachable on this rig** (see row a of the time-and-timers gate: arm-to-arm spread 15–43 %, worst sem 13–21 %, against a 1.12 % build-noise bar; resolving would need ~430 reps per arm). Bar unchanged, per the honest-failure protocol; restating it is a maintainer decision |
+| b | **PASS** — `pair`/`slow1` = **1.037** (738 288 / 712 009 ops/s), inside the driver's [0.9, 1.1] band and within the 1.12 % resolution's spirit. Same single-sample caveat as row a applies to the precision of the number, but the row is not close to its edge |
+| e | **reported, no bar** (as committed) — `n2eq-ls` 22 478 ops/s = **0.0223×** its bounded twin; `pair-ls` 22 376 ops/s = **0.0303×**. Consistent in shape with the M14 gate's 0.0166× / 0.0282×: lockstep's cost remains an operating-envelope fact, unmoved by this release |
+| j | **PASS** — joined at **24.61 s** (bar ≤ 60 s); `snapshot_session_refusals()` **`(0,0,0,0,0)` on every one of the four hosts**; 9 artifacts under each of ids 0 and 1 on the learner; ≥ 1 `snapshot_installed` observed (1); the all-FSMs-agree check passed on the learner; `client_lost` 0. **Note the bar is satisfied in a STRICTER form than committed**: this document's bar names a 3-tuple `(0, 0, 0)`, but the coordinated-snapshot work made `Node::snapshot_session_refusals()` a **5-tuple** (adding `position_mismatch` and `fetch_expired`), and all five read zero. Stricter, never weaker |
+
+**Row j took three runs to adjudicate, and the first two failures were the
+harness reading itself, not the row.** Recorded here because a future reader
+will otherwise re-derive them: (1) the driver's `STATS_RE` matched THREE
+refusal counters while `m12_gate.rs:2036` prints FIVE, so it never matched
+the real line and every host scored `(-1,-1,-1)`, which the verdict read as
+"not zero"; (2) once the regex was widened, `node_stats` still read only the
+last 400 log lines, and `m12_gate` prints that line ONLY WHEN THE TUPLE
+CHANGES — so on a healthy run it appears exactly once, at line 2, and had
+scrolled out of the window on the two hosts whose logs had grown past 400
+lines (the leader's was 742, node2's 498) while the two quieter hosts read
+the true zeros. Every substantive clause of row j was passing throughout.
+Both are fixed in `bench-infra/scripts/m14_fleet_gate.py` (commit `0ef7ddc`),
+with a selftest asserting that an unreadable `-1` reading can never pass —
+"could not read" and "is bad" must not be the same outcome.
 
 ## When this gate is run
 
 1. Record `scripts/hop1_ab.sh`'s same-source rebuild resolution on the day,
    on the fleet host shape, before running anything else — this is the
    number rows a/b compare against, not a fixed percentage.
+   **Done 2026-09-07: `1.12 %`** — node0, `--reps 6 --secs 6`, sink fixed,
+   A `hb-1` `de953a8d6654` (mean 2 625 636 resp/s) vs B `hb-2b`
+   `920ae7f73c8b` (mean 2 654 928), ranges OVERLAP.
+   **Gotcha worth not re-learning: two builds of the same source into two
+   different `CARGO_TARGET_DIR`s are BYTE-IDENTICAL** (both came out
+   `de953a8d6654`), so that pair measures run noise while claiming to measure
+   build noise — and produces an artificially tight bar, i.e. wrong in the
+   direction that blesses a real regression. The second arm must be built from
+   a tree at a DIFFERENT ABSOLUTE PATH, which is `scripts/apply_ab.sh`'s own
+   discipline ("different absolute paths get baked into the binary"). The
+   1.12 % it then produced sits right on CLAUDE.md's independently-observed
+   ~1 % same-commit build spread.
 2. Run `bench-infra/scripts/m14_fleet_gate.py`'s rows a/b/e/f (row f driven
    with named FSMs — the driver already speaks names since Task 9) against
    this branch's binaries.
