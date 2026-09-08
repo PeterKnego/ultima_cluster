@@ -231,14 +231,27 @@ head_vs_base = (mean(B)  - mean(A)) / mean(A) * 100      the candidate
 resolution   = |mean(B') - mean(B)| / mean(B) * 100      the bar
 sem(X)       = stdev(X) / (mean(X) * sqrt(K)) * 100      run quality, per arm
 pace_stalls(X) = sum of the per-rep pace_stalls counter, per arm   driver-bound guard (Ruling Q9)
+signal_bar   = max(resolution, 2 * max(sem(A), sem(B), sem(B')))   Ruling Q8'
 
-if pace_stalls(A) == 0 or pace_stalls(B) == 0 or pace_stalls(B') == 0:
+if pace_stalls(X) is 0 OR UNKNOWN for any arm X:
     verdict = inconclusive (driver-bound)
-elif K < 2 or max(sem(A), sem(B), sem(B')) > resolution:
+elif |head_vs_base| > signal_bar:
+    verdict = outside resolution
+elif max(sem(A), sem(B), sem(B')) > resolution:
     verdict = inconclusive (noisy run)
-elif |head_vs_base| <= resolution:  verdict = within resolution
-else:                               verdict = outside resolution
+else:
+    verdict = within resolution
 ```
+
+**Updated 2026-09-08 to match the runner, which this block had drifted from.**
+Two differences from the rule as written before: `signal_bar` (Ruling Q8',
+2026-09-07) lets a delta that clears both the resolution and twice the worst
+sem read as a signal even on a noisy run, while `within` still demands a quiet
+one — a null result is only worth claiming when the run could have seen a
+regression; and an **unknown** `pace_stalls` now fails the guard rather than
+skipping it, so a pair whose baseline predates the counter is `inconclusive
+(driver-bound)` instead of quietly reporting a verdict its guard never
+checked. Both are pinned by `scripts/apply_ab.sh --selftest`.
 
 **The driver-bound guard runs first, and it is the ONLY guard that can tell
 row d's arms apart (Ruling Q9).** `apply_bench`'s driver thread paces itself
@@ -362,7 +375,60 @@ they are the ledger of how the apply-hop regression was found and fixed.
 | g | **PASS** — joined at **23.07 s** (bar ≤ 60 s), leader restarted mid-window (`leader_restarted = True`, the anti-vacuity clause), **1** `snapshot_installed`, and `uc2_snapshot_set_position` **agrees cluster-wide at 1644261696 on all four hosts**; refusals `(0,0,0,0,0)` everywhere. This is the residual the coordinated-snapshot spec was written to close — a leader that shipped a set and was then restarted used to serve `(0, 0, [])`, so the joiner installed nothing |
 | h | **All-nodes arm REPORTED (its purpose); the barred STANDBY arm did NOT COMPLETE — row unresolved.** All-nodes: instant `2628230944`, completed in **5.76 s**, per-voter `uc2_snapshot_freeze_seconds_max` **0.1637 / 0.1358 / 0.1638 s**, and the **longest commit gap was 0.0 s** — zero stalled 1 s buckets against a 1 411 356 ops/s baseline. So a 256 MiB-state all-nodes instant froze each voter ~164 ms without a measurable commit stall; that is the number this row exists to produce, and it carries no bar. Standby: instant `5433371552` commanded (`rc=0`), learner serving after 1.5 s, but `uc2_snapshot_standby_instant_position` never advanced within **120.7 s** and the learner's `freeze_seconds_max` stayed **0.0** — it never froze. **Lead, not a conclusion:** the learner ran ~10× behind throughout (final FSM count **24 191 536** vs the voters' **250 575 341**) under sustained 1.4 M ops/s; a standby instant freezes at frame-end position P and the learner cannot freeze at P until it has APPLIED to P, so if it never catches up while the load runs the instant cannot complete. Consistent with EITHER a real design gap OR a harness sequencing problem, and deliberately NOT guessed at here — it needs its own debugging pass |
 
-### Open after the 2026-09-07/08 run — four bar questions, deliberately unanswered here
+### RULED 2026-09-08 — the four bar questions, and what changed
+
+The maintainer ruled on all four questions below. **None of it is retroactive**:
+the 2026-09-07/08 results in the table above stand exactly as measured, and the
+restatements apply to the NEXT run. A restated bar is a decision about what the
+gate should measure, never a way to convert a recorded result.
+
+1. **Rows a/b/e now judge a PAIRED delta.** The driver already runs base and
+   head interleaved *within each rep*, and the old statistic threw that away by
+   differencing two arm means — leaving every bit of common-mode noise
+   (thermal, neighbours, drift) inside the comparison. `tt_fleet_gate.ab_stats`
+   now computes the per-rep delta and its standard error in percentage points,
+   and `ab_reading` judges those. Selftests pin the property that motivates it:
+   on data drifting 100 → 200 → 150 with head a steady +1 % in each rep, the
+   paired delta reads +1.000 % with ~0 sem while the unpaired arm sem exceeds
+   15 % — and a consistent −10 % under the same drift still reads `outside`, so
+   it cannot bless a regression. The bar itself (the day's resolution) is
+   unchanged for now; deriving it from a fleet-measured null is the remaining
+   half of this ruling and needs a control arm on the rig.
+2. **Row c's bar is restated against a pass QUANTILE.** It was
+   `lateness p99 <= 2 x MEAN pass`, which mixed two statistics and was
+   unreachable by construction — the pass distribution's own p99 (2 000 ns)
+   already exceeded `2 x mean` (1 763 ns), and a timer cannot fire before the
+   pass that notices it. It is now
+
+       lateness_p99 - pass_p99 <= pass_p99      (i.e. lateness_p99 <= 2 x pass_p99)
+
+   which compares like with like and, by subtracting the pass p99, measures the
+   delay *this feature* is responsible for with the scheduler's contribution
+   removed. **The 2026-09-07 reading fails this bar too** — 200 µs of lateness
+   against a 2 µs pass p99 is ~100× the budget — and a selftest pins that, so
+   the restatement cannot be mistaken for a way to pass what the old bar
+   failed. What it buys is that a future failure can no longer be blamed on the
+   bar's shape: it says the delay is not explained by pass spacing.
+3. **Row d's baseline is now guardable.** `scripts/harness/apply_bench_17d5c6b_pace_stalls.rs`
+   is `17d5c6b`'s own harness with one change — its `APPLY-JSON` line carries
+   the `pace_stalls` field — applied to the base arm with `--harness-a`. The
+   backport is safe because the counter is not new logic: `17d5c6b` already
+   incremented `stalls` in a pacing loop **byte-identical** to HEAD's, and
+   already printed the value on its human-readable line; it simply never
+   reached the machine-readable one. Row d's harness ASYMMETRY is unchanged and
+   still has to be disclosed — but the guard can now say whether the driver was
+   the limiter, which is the difference between a reading and a verdict.
+4. **Ruling Q8' is adopted, with one correction.** Its `signal_bar =
+   max(resolution, 2 x worst sem)` stands: a delta that clears both is a real
+   signal whatever the noise gate says. The correction is that an **unknown**
+   `pace_stalls` now fails the driver-bound guard instead of skipping it — the
+   old code treated "cannot read" as "not driver-bound" and printed a NOTE,
+   which is how row d reported `outside resolution` on a run whose guard had
+   never been evaluated. `scripts/apply_ab.sh`'s header (which still described
+   the pre-Q8' rule) and its `--selftest` are now pinned against the
+   implementation, with a sixth case covering the unknown arm.
+
+### Superseded — the four bar questions as they stood after the run
 
 The honest-failure protocol says a miss keeps its bar, so nothing above was
 edited to fit a result. But the run surfaced four questions that only the

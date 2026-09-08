@@ -330,6 +330,31 @@ def ab_stats(arms):
             }
         if "base" in row and "head" in row and row["base"]["mean"]:
             row["delta_pct"] = 100.0 * (row["head"]["mean"] - row["base"]["mean"]) / row["base"]["mean"]
+        # PAIRED statistic (maintainer ruling, 2026-09-08). The driver already
+        # runs base and head interleaved WITHIN each rep, so rep i's two rates
+        # are adjacent in time and see the same thermal state, the same noisy
+        # neighbour, the same drift. Differencing the two arm MEANS throws that
+        # away and leaves every bit of common-mode noise in the comparison,
+        # which is why the 2026-09-07 run read arm sems of 13-21 % against a
+        # 1.12 % bar and could not resolve it at any affordable rep count.
+        # The per-rep delta cancels whatever both arms saw together; what
+        # survives is the difference between the binaries.
+        #
+        # `paired_sem_pp` is in PERCENTAGE POINTS of the delta itself, not a
+        # fraction of a rate, so it compares directly against the resolution.
+        b, h = sides.get("base", []), sides.get("head", [])
+        pairs = [(float(x), float(y)) for x, y in zip(b, h) if x and y]
+        if len(pairs) >= 1:
+            deltas = [100.0 * (y - x) / x for x, y in pairs]
+            pmean = statistics.mean(deltas)
+            psd = statistics.stdev(deltas) if len(deltas) > 1 else 0.0
+            row["paired"] = {
+                "n": len(deltas),
+                "deltas_pct": [round(d, 4) for d in deltas],
+                "delta_pct": pmean,
+                "sem_pp": (psd / math.sqrt(len(deltas))) if len(deltas) > 1 else None,
+                "spread_pp": (max(deltas) - min(deltas)) if len(deltas) > 1 else 0.0,
+            }
         out[label] = row
     return out
 
@@ -340,10 +365,18 @@ def ab_reading(stats, resolution_pct):
     The rule is `scripts/apply_ab.sh`'s, transplanted to fleet rates so the
     two harnesses cannot drift (gate doc, "Rows d and f: the verdict rule"):
 
-        missing arm / no resolution / n < 2   -> inconclusive (named)
-        worst sem > resolution                -> inconclusive (noisy run)
-        |worst delta| <= resolution           -> within resolution
-        otherwise                             -> outside resolution
+        missing arm / no resolution / n < 2      -> inconclusive (named)
+        worst PAIRED sem > resolution            -> inconclusive (noisy run)
+        |worst PAIRED delta| <= resolution       -> within resolution
+        otherwise                                -> outside resolution
+
+    **Paired since 2026-09-08** (maintainer ruling). Base and head already run
+    interleaved within each rep, so the per-rep delta cancels the noise both
+    arms saw together — thermal state, a noisy neighbour, drift. Judging the
+    difference of two arm MEANS discarded that and left the comparison at the
+    mercy of rig variance: the 2026-09-07 run read arm sems of 13-21 % against
+    a 1.12 % bar, which no affordable rep count could resolve (sem falls as
+    1/sqrt(n), so it would have taken ~430 reps per arm).
 
     Only `within resolution` is a PASS. "Inconclusive" is a third answer, not
     a soft pass: a run whose own arms are noisier than the bar cannot resolve
@@ -360,9 +393,16 @@ def ab_reading(stats, resolution_pct):
         for side in ("base", "head"):
             if row[side]["n"] < 2:
                 return f"inconclusive (too few reps: {label}/{side})", None, None
-            if row[side]["sem_pct"] is not None:
-                sems.append(row[side]["sem_pct"])
-        deltas.append(row["delta_pct"])
+        # PAIRED (2026-09-08 ruling): judge the per-rep paired delta and ITS
+        # standard error, not the difference of two arm means and the arms'
+        # own sems. The unpaired numbers stay in the GATE-JSON for continuity
+        # and for comparison against runs made before this change.
+        pr = row.get("paired")
+        if pr is None or pr["n"] < 2:
+            return f"inconclusive (too few paired reps: {label})", None, None
+        deltas.append(pr["delta_pct"])
+        if pr["sem_pp"] is not None:
+            sems.append(pr["sem_pp"])
     worst_delta = max(deltas, key=abs)
     worst_sem = max(sems) if sems else None
     if resolution_pct is None or resolution_pct <= 0:
@@ -506,6 +546,27 @@ def selftest():
            ab_reading(st_out, 1.0)[0] == "outside resolution")
     expect("ab_reading reports the delta it judged",
            abs(ab_reading(st_out, 1.0)[1] + 10.0) < 1e-9)
+    # THE PAIRED STATISTIC, and why it exists (2026-09-08 ruling). Common-mode
+    # noise: every rep drifts wildly (100 -> 200 -> 150), but head is a steady
+    # +1 % over base IN EACH REP. Judging the arm MEANS leaves all that drift
+    # in the arms' own sems and the run cannot resolve any tight bar; the
+    # per-rep paired delta cancels it and reads +1.000 % with zero spread.
+    _drift = ab_stats({"n1": {"base": [100.0, 200.0, 150.0],
+                              "head": [101.0, 202.0, 151.5]}})
+    expect("paired delta cancels common-mode drift",
+           abs(_drift["n1"]["paired"]["delta_pct"] - 1.0) < 1e-9)
+    expect("paired sem is ~0 when every rep moves together",
+           _drift["n1"]["paired"]["sem_pp"] < 1e-9)
+    expect("the UNPAIRED arm sem on that same data is enormous by comparison",
+           _drift["n1"]["base"]["sem_pct"] > 15.0)
+    expect("paired judging resolves a bar the unpaired statistic could not",
+           ab_reading(_drift, 1.5)[0] == "within resolution")
+    # ...and it is not a way to bless a regression: a real, consistent -10 %
+    # under the same drift still reads OUTSIDE.
+    _drift_reg = ab_stats({"n1": {"base": [100.0, 200.0, 150.0],
+                                  "head": [90.0, 180.0, 135.0]}})
+    expect("a consistent regression under drift still reads outside",
+           ab_reading(_drift_reg, 1.5)[0] == "outside resolution")
     expect("ab_reading with no resolution is inconclusive",
            ab_reading(st_out, None)[0] == "inconclusive (no resolution recorded)")
     expect("ab_reading with a single rep is inconclusive",

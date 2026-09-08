@@ -43,12 +43,28 @@
 #   resolution   = |mean(B') - mean(B)| / mean(B) * 100   [the bar]
 #   sem(X)       = stdev(X) / (mean(X) * sqrt(K)) * 100   [per arm, %]
 #
-#   if any arm's summed pace_stalls == 0:
+#   signal_bar = max(resolution, 2 * max(sem(A), sem(B), sem(B')))
+#
+#   if any arm's pace_stalls is 0 OR UNKNOWN:
 #       verdict = "inconclusive (driver-bound)"
-#   elif K < 2 or max(sem(A), sem(B), sem(B')) > resolution:
+#   elif |head_vs_base| > signal_bar:
+#       verdict = "outside resolution"
+#   elif max(sem(A), sem(B), sem(B')) > resolution:
 #       verdict = "inconclusive (noisy run)"
-#   elif |head_vs_base| <= resolution:  verdict = "within resolution"
-#   else:                               verdict = "outside resolution"
+#   else:
+#       verdict = "within resolution"
+#
+# RULING Q8' (2026-09-07) is why `signal_bar` exists rather than a bare
+# `|delta| <= resolution` test: a delta that clears BOTH the rebuild resolution
+# AND twice the worst arm's standard error is a real signal whatever the noise
+# gate says. "within" still demands a quiet run (sem <= resolution), because a
+# NULL result is only worth claiming when the run could have seen a regression.
+# The 2026-09-08 amendment is the UNKNOWN clause above: a guard that cannot be
+# read is a failed guard, never a skipped one.
+#
+# This block and the implementation are pinned against each other by
+# --selftest; they disagreed between 2026-09-07 and 2026-09-08, with this
+# header describing the pre-Q8' rule while the code applied Q8'.
 #
 # WHY IT IS SHAPED THIS WAY. Rows d and f are NULL bars — the claim under
 # test is "the added code is free". Anything ADDED to the right-hand side
@@ -224,7 +240,15 @@ echo $((n + 1)) > "$0.n"
 echo "== fake apply_bench (selftest stub) =="
 echo "APPLY-JSON {\"fsms\":1,\"mode\":\"bounded\",\"lag\":16777216,\"payload\":64,\"frame\":96,\"secs\":1.00,\"min_rate\":$r,\"driver_rate\":$((r * 2)),\"pace_stalls\":PACE_STALLS_PLACEHOLDER,\"per\":[{\"fsm\":0,\"rate\":$r,\"lag_waits\":0}]}"
 STUB
-    sed -i "s/PACE_STALLS_PLACEHOLDER/$stalls/" "$path"
+    if [ "$stalls" = "omit" ]; then
+        # An OLD apply_bench: its APPLY-JSON line carries no `pace_stalls`
+        # field at all, which is exactly what row d's baseline (17d5c6b,
+        # predating the counter) prints. The runner must read that as UNKNOWN
+        # and fail the guard, not skip it.
+        sed -i 's/,\\"pace_stalls\\":PACE_STALLS_PLACEHOLDER//' "$path"
+    else
+        sed -i "s/PACE_STALLS_PLACEHOLDER/$stalls/" "$path"
+    fi
     chmod +x "$path"
 }
 
@@ -309,7 +333,18 @@ if [ "$SELFTEST" -eq 1 ]; then
           "verdict":"inconclusive (driver-bound)","runs_per_arm":2}' \
         1000000 1000000  1000000 1000000  1000000 1000000 \
         100 0 100
-    echo "== selftest PASSED (all five cases)"
+    # Case 6 — the 2026-09-08 amendment: arm A's harness predates `pace_stalls`
+    #   and emits no such field, so the guard cannot be EVALUATED on it. That
+    #   must be `inconclusive (driver-bound)`, not a skipped guard: the rates
+    #   below would otherwise read a clean `outside resolution` (-30 %, quiet
+    #   arms), which is precisely how row d reported on 2026-09-07.
+    selftest_case driver_unknown \
+        '{"a_mean":1000000.0,"b_mean":700000.0,"bp_mean":701000.0,
+          "pace_stalls_unknown_arms":["A"],"driver_bound":true,
+          "verdict":"inconclusive (driver-bound)","runs_per_arm":2}' \
+        1000000 1000000  700000 700000  701000 701000 \
+        omit 100 100
+    echo "== selftest PASSED (all six cases)"
     exit 0
 fi
 
@@ -542,9 +577,18 @@ st = {k: stats(v) for k, v in rows.items()}
 head_vs_base = (st["B"]["mean"] - st["A"]["mean"]) / st["A"]["mean"] * 100.0
 resolution = abs(st["Bp"]["mean"] - st["B"]["mean"]) / st["B"]["mean"] * 100.0
 worst_sem = max(st[k]["sem_pct"] for k in ("A", "B", "Bp"))
-driver_bound = any(st[k]["pace_stalls_known"] and st[k]["pace_stalls_sum"] == 0
-                   for k in ("A", "B", "Bp"))
+# Ruling Q9, with the 2026-09-08 correction: an arm whose `pace_stalls` cannot
+# be READ fails the guard exactly as an arm that reports zero does. Until now
+# "unknown" was treated as "not driver-bound", which SKIPPED the guard on the
+# one pair that needs it most (row d's baseline predates the counter) and let a
+# reading through as `outside resolution` with only a printed NOTE. That is the
+# same "could not read" != "is bad" confusion the 2026-09-07 fleet run found
+# four times in the gate harness; unknown is now an explicit inconclusive.
 unknown_arms = [k for k in ("A", "B", "Bp") if not st[k]["pace_stalls_known"]]
+driver_bound = bool(unknown_arms) or any(
+    st[k]["pace_stalls_known"] and st[k]["pace_stalls_sum"] == 0
+    for k in ("A", "B", "Bp")
+)
 
 # The rebuild resolution is the ONLY bar (these are NULL bars: adding noise to
 # the right-hand side would only make it easier to bless a real regression).

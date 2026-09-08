@@ -1215,30 +1215,59 @@ def verdict_tt_e(rates_row_a, rates_row_e, resolution_pct, late_counts, table_ok
     return v
 
 
-def verdict_tt_c(p99_ns, pass_ns, count):
-    """Row c: `p99 <= 2 x the measured consensus-pass length on the rig`.
+def verdict_tt_c(p99_ns, pass_ns, count, pass_p99_ns=None):
+    """Row c: the timer machinery's own lateness, ISOLATED from pass spacing.
+
+    **Bar restated 2026-09-08** (maintainer ruling, after the 2026-09-07 run):
+
+        lateness_p99 - pass_p99 <= pass_p99      i.e. lateness_p99 <= 2 x pass_p99
+
+    The previous bar was `lateness_p99 <= 2 x MEAN pass`, which mixed two
+    statistics and was UNREACHABLE BY CONSTRUCTION: on the rig the pass
+    distribution's own p99 (2 000 ns) already exceeded `2 x mean` (1 763 ns),
+    and a timer cannot fire before the pass that notices it, so
+    `lateness_p99 >= pass_p99 > bar` for any healthy system. Comparing a p99
+    against a p99 compares like with like, and SUBTRACTING the pass p99 is what
+    makes the row diagnostic: what is left is the delay this feature is
+    responsible for, with the scheduler's contribution removed.
 
     An on-time fire is stamped with its deadline, so the histogram measures
     WALL-CLOCK lateness — the delay between the deadline passing and the pass
-    that notices it. That is bounded below by the pass length, which is why
-    the bar is a multiple of the measured pass and not a fixed number, and why
-    a p99 above it points at pass scheduling rather than at the timer heap.
+    that notices it — which is why the bar is derived from the measured pass
+    and never a fixed number.
+
+    The bar is NOT retroactive: the 2026-09-07 row c FAIL stands as recorded,
+    and would also have failed this restatement (lateness p99 200 us against a
+    pass p99 of 2 us — an excess ~100x the budget). That is the point of the
+    restatement rather than an argument against it: under the old bar a failure
+    could be blamed on the bar's shape, and under this one it cannot, so a
+    failure here says the delay is NOT explained by pass spacing and wants its
+    own investigation.
 
     Fewer than `ROW_C_MIN_FIRES` fires is `inconclusive (too few fires)` —
-    reported as such and NOT as a pass."""
-    bar_ns = tt.ROW_C_BAR_MULTIPLE * pass_ns if pass_ns else None
+    reported as such and NOT as a pass. A missing pass p99 is likewise
+    inconclusive, never a pass."""
+    budget_ns = pass_p99_ns
+    bar_ns = (pass_p99_ns + budget_ns) if pass_p99_ns else None
+    excess_ns = (p99_ns - pass_p99_ns) if (p99_ns is not None and pass_p99_ns) else None
     enough = count is not None and count >= tt.ROW_C_MIN_FIRES
-    ok = bool(enough and p99_ns is not None and bar_ns is not None and p99_ns <= bar_ns)
+    ok = bool(enough and excess_ns is not None and budget_ns is not None
+              and excess_ns <= budget_ns)
     if not enough:
         detail = (f"inconclusive (too few fires): count={count}, "
                   f"need >= {tt.ROW_C_MIN_FIRES}")
-    elif p99_ns is None or bar_ns is None:
-        detail = f"inconclusive (missing histogram): p99={p99_ns} ns, mean pass={pass_ns} ns"
+    elif p99_ns is None or pass_p99_ns is None:
+        detail = (f"inconclusive (missing histogram): lateness p99={p99_ns} ns, "
+                  f"pass p99={pass_p99_ns} ns")
     else:
-        detail = (f"p99 {p99_ns:.0f} ns over {count:.0f} fires vs bar {bar_ns:.0f} ns "
-                  f"({tt.ROW_C_BAR_MULTIPLE:g} x mean pass {pass_ns:.0f} ns)")
-    gate_json("tt-c", ok, p99_ns=p99_ns, pass_ns=pass_ns, count=count, bar_ns=bar_ns,
-              min_fires=tt.ROW_C_MIN_FIRES, multiple=tt.ROW_C_BAR_MULTIPLE)
+        detail = (f"lateness p99 {p99_ns:.0f} ns - pass p99 {pass_p99_ns:.0f} ns "
+                  f"= {excess_ns:.0f} ns of excess over {count:.0f} fires, "
+                  f"vs a budget of one pass p99 ({budget_ns:.0f} ns); "
+                  f"bar = lateness p99 <= {bar_ns:.0f} ns. Mean pass {pass_ns:.0f} ns "
+                  f"(reported, no longer the bar)")
+    gate_json("tt-c", ok, p99_ns=p99_ns, pass_ns=pass_ns, pass_p99_ns=pass_p99_ns,
+              count=count, bar_ns=bar_ns, excess_ns=excess_ns, budget_ns=budget_ns,
+              min_fires=tt.ROW_C_MIN_FIRES)
     return Verdict("tt-c timer precision under row b's load", ok, detail)
 
 
@@ -1326,9 +1355,10 @@ def row_c_reading(scrapes):
             "pass_max_ns": tt.prom_get(m, "uc2_consensus_pass_ns_max"),
         })
     if not per_arm:
-        return None, None, None, None, per_arm
+        return None, None, None, None, per_arm, None
     best = max(per_arm, key=lambda r: (r["count"] or 0))
-    return best["arm"], best["p99_ns"], best["pass_ns"], best["count"], per_arm
+    return (best["arm"], best["p99_ns"], best["pass_ns"], best["count"], per_arm,
+            best["pass_p99_ns"])
 
 
 # ------------------------------------------------------------- T&T fleet
@@ -1933,17 +1963,34 @@ def selftest():
                             table_ok={**_tok, "pair rep1": False}).passed)
     expect("row e fails with no table result at all",
            not verdict_tt_e(_base, _head_ok, 1.0, _clean, table_ok={}).passed)
-    # Row c: p99 <= 2 x the mean pass, over >= 10 000 fires.
-    expect("row c passes at p99 = 2 x the mean pass exactly",
-           verdict_tt_c(20000.0, 10000.0, 12000).passed)
-    expect("row c fails just past 2 x the mean pass",
-           not verdict_tt_c(20001.0, 10000.0, 12000).passed)
+    # Row c, bar RESTATED 2026-09-08: lateness p99 - pass p99 <= pass p99,
+    # i.e. lateness p99 <= 2 x the pass P99 (not 2 x the pass MEAN, which the
+    # pass distribution's own p99 already exceeded on the rig).
+    expect("row c passes at lateness p99 = 2 x the pass p99 exactly",
+           verdict_tt_c(20000.0, 900.0, 12000, 10000.0).passed)
+    expect("row c fails just past 2 x the pass p99",
+           not verdict_tt_c(20001.0, 900.0, 12000, 10000.0).passed)
+    expect("row c passes when the excess is inside one pass p99",
+           verdict_tt_c(15000.0, 900.0, 12000, 10000.0).passed)
     expect("row c is inconclusive (not a pass) under 10 000 fires",
-           not verdict_tt_c(1000.0, 10000.0, 9999).passed)
-    expect("row c is inconclusive with no pass-length reading",
-           not verdict_tt_c(1000.0, None, 12000).passed)
+           not verdict_tt_c(1000.0, 900.0, 9999, 10000.0).passed)
+    expect("row c is inconclusive with no pass P99 reading",
+           not verdict_tt_c(1000.0, 10000.0, 12000, None).passed)
     expect("row c fails a p99 that landed in the +Inf bucket",
-           not verdict_tt_c(float("inf"), 10000.0, 12000).passed)
+           not verdict_tt_c(float("inf"), 900.0, 12000, 10000.0).passed)
+    # The restated bar is NOT a way to pass what the old one failed: the
+    # 2026-09-07 reading (lateness p99 200 us against a pass p99 of 2 us) fails
+    # this one too, by ~100x the budget. Pinned so nobody "fixes" the bar into
+    # one the observed data would have passed.
+    expect("row c's restatement still fails the 2026-09-07 fleet reading",
+           not verdict_tt_c(200000.0, 881.59, 19198, 2000.0).passed)
+    # The OLD bar's pathology, pinned as a regression guard: a system whose
+    # lateness p99 EQUALS its pass p99 — the best any timer can do, since it
+    # cannot fire before the pass that notices it — must PASS. Under
+    # `2 x mean pass` it failed whenever the pass p99 exceeded twice the mean,
+    # which is what made the old bar unreachable by construction.
+    expect("row c passes a system whose lateness p99 equals its pass p99",
+           verdict_tt_c(2000.0, 881.59, 19198, 2000.0).passed)
     # row_c_reading over LITERAL scrapes: the arm with the most fires wins.
     _thin = tt.parse_prom(
         'uc2_timer_lateness_ns_bucket{service="count",row="0",le="10000"} 10\n'
@@ -1956,7 +2003,7 @@ def selftest():
         'uc2_timer_lateness_ns_bucket{service="count",row="0",le="+Inf"} 12000\n'
         'uc2_timer_lateness_ns_count{service="count",row="0"} 12000\n'
         'uc2_consensus_pass_ns_sum 2400000\nuc2_consensus_pass_ns_count 200000\n')
-    _arm, _p99, _pass, _cnt, _per = row_c_reading([("n1", _thin), ("pair", _fat)])
+    _arm, _p99, _pass, _cnt, _per, _pass_p99 = row_c_reading([("n1", _thin), ("pair", _fat)])
     expect("row_c_reading adjudicates on the arm with the MOST fires",
            _arm == "pair" and _cnt == 12000.0)
     expect("row_c_reading reads the p99 off that arm's buckets", _p99 == 20000.0)
@@ -2179,7 +2226,8 @@ def main():
     if tt_b is not None:
         verdicts.append(verdict_tt_b(tt_b["base"], tt_b["head"], a.resolution_pct, tt_b["late"]))
         if "c" in a.tt_rows:
-            arm, p99_ns, mean_pass_ns, count, per_arm = row_c_reading(tt_b["scrapes"])
+            arm, p99_ns, mean_pass_ns, count, per_arm, pass_p99_ns = row_c_reading(
+                tt_b["scrapes"])
             print("\ntt-c per-arm readings (adjudicated on the arm with the most fires)")
             for r in per_arm:
                 print(f"  {r['arm']:28s} fires={r['count']} p99={r['p99_ns']} ns "
@@ -2187,7 +2235,7 @@ def main():
                       f"{r['pass_ns']} ns p99 pass={r['pass_p99_ns']} ns max={r['pass_max_ns']} ns")
             print(f"  adjudicated on: {arm}")
             pass_ns = mean_pass_ns or pass_ns
-            verdicts.append(verdict_tt_c(p99_ns, mean_pass_ns, count))
+            verdicts.append(verdict_tt_c(p99_ns, mean_pass_ns, count, pass_p99_ns))
     if tt_e is not None:
         # Row e's comparison is row a's OWN head rates against row e's — the
         # same binary with and without a live table.
