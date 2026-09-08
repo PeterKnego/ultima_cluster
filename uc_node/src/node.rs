@@ -2893,8 +2893,8 @@ struct Consensus {
     /// / `uc2_schedule_entries`.
     schedule_pos_pub: Arc<AtomicU64>,
     schedule_entries_pub: Arc<AtomicU64>,
-    /// Spec 2026-09-08 §7: remaining smear ns, leader-written once per pass
-    /// from `publish_status`; `uc2_log_clock_smear_ns`.
+    /// Spec 2026-09-08 §7: remaining smear ns, written once per pass on
+    /// every node from `publish_status`; `uc2_log_clock_smear_ns`.
     log_clock_smear_pub: Arc<AtomicU64>,
     /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
     /// whatever the reason. Shared with `Node::observability`.
@@ -4875,10 +4875,11 @@ impl Consensus {
         self.last_pass_ns = now;
     }
 
-    /// Spec 2026-09-08 §5.3: one line per detected wall-clock step. A forward
-    /// step was adopted (every timer due in the skipped interval fires now —
-    /// `docs/reference/limits.md`'s unchanged half); a backward step is being
-    /// smeared, `smear_ns` remaining.
+    /// Spec 2026-09-08 §5.3: one line per detected wall-clock step, on every
+    /// node. A forward step was adopted (every timer due in the skipped
+    /// interval fires now — `docs/reference/limits.md`'s unchanged half — on
+    /// the leader; a follower holds no timer heap, so nothing fires there);
+    /// a backward step is being smeared, `smear_ns` remaining.
     #[inline(never)]
     fn on_log_clock_step(&mut self, step: crate::log_clock::Step, smear_ns: u64) {
         use crate::log_clock::Step;

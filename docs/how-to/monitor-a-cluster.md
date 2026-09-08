@@ -182,7 +182,7 @@ replicated schedule table — plus four **off-contract** timing families
 |---|---|---|---|
 | `uc2_log_time_ns` | gauge | none | the highest leader stamp the archive on **this** node has recorded: the log's clock, in ns since the Unix epoch. Identical on every node once caught up |
 | `uc2_log_time_lag_seconds` | gauge | none | **leader only** (rendered `0` on followers): wall clock minus `uc2_log_time_ns`, floored at 0. Since 2.12.0 a backward wall-clock step no longer parks this (the log clock smears instead — see `uc2_log_clock_smear_ns` below); it grows only when nothing is being appended |
-| `uc2_log_clock_smear_ns` | gauge | none | **leader only** (rendered `0` on followers): ns of a backward wall-clock step the log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). Nonzero here means the log clock is AHEAD of wall time, so `uc2_log_time_lag_seconds` reads `0` — this gauge is the only visible sign of a smear in progress |
+| `uc2_log_clock_smear_ns` | gauge | none | **per node** (a follower's value is the clock it would lead with): ns of a backward wall-clock step that node's log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). Every node's clock is a candidate leader clock, so this is reported everywhere, not gated on leadership. On the leader, nonzero means the log clock is AHEAD of wall time, so `uc2_log_time_lag_seconds` reads `0` — this gauge is the only visible sign of a smear in progress |
 | `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row **on the leader**. The timer heap is leader-only since the cluster FSM (2.11 pending), so a follower always exports `0` — that is the healthy reading, not a gap, and there is deliberately no divergence alert over this family |
 | `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
 | `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
@@ -203,9 +203,11 @@ has **one** cause left: nothing is being appended, and every pending timer is
 waiting on it. The rule and threshold are unchanged from before the log
 clock; only the meaning narrowed.
 
-Every `log_clock_step` (info level; `node`, `direction`, `step_ns`,
-`smear_ns`) marks a detected wall-clock step: `direction = "forward"` means
-every timer due in the skipped interval fires this pass, `direction =
+Every node emits `log_clock_step` (info level; `node`, `direction`,
+`step_ns`, `smear_ns`) marking a detected wall-clock step: `direction =
+"forward"` means every timer due in the skipped interval fires this pass on
+the leader — a follower holds no timer heap, so on a follower the line is
+just a record of that node's own clock stepping, nothing fires; `direction =
 "backward"` means the step is being smeared and `smear_ns` is what remains.
 It has no gauge of its own beyond `uc2_log_clock_smear_ns`, which only shows
 a backward smear in progress, not a forward step (there is nothing left to

@@ -498,3 +498,11 @@ Out of scope:
   cannot A/B this change. The dev-box smoke is `m12_gate --arm direct` (three
   in-process nodes, the real consensus agent), two binaries alternated; the
   acceptance A/B is `m14_fleet_gate.py` row a on the fleet, as written.
+- **§7 / the plan's errata bullet above, "leader-only".** Wrong as written:
+  `LogClock` runs on every node and persists across promotion, so a
+  follower's smear is the clock it would lead with after a failover.
+  `uc2_log_clock_smear_ns` and `log_clock_step` are therefore **per-node**,
+  deliberately not leader-gated (Ruling R6, Task 3 review): hiding a
+  follower's smear would discard the one reading an operator wants before a
+  failover. Nothing about stamps changes — only the leader's clock ever
+  reaches the log.

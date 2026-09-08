@@ -62,9 +62,11 @@ pub struct ObsSources {
     pub schedule_table_position: Arc<AtomicU64>,
     pub schedule_entries: Arc<AtomicU64>,
     /// Spec 2026-09-08 §7: ns of backward wall-clock step still being
-    /// retired by the log clock (0 = none). The lag series saturates at 0
-    /// while the log clock is AHEAD of wall time, so this is the only sign
-    /// of a smear.
+    /// retired by the log clock (0 = none). Per node (every node's clock is
+    /// a candidate leader clock), not leader-only — a follower's value is
+    /// the clock it would lead with after a failover. The lag series
+    /// saturates at 0 while the log clock is AHEAD of wall time, so this is
+    /// the only sign of a smear.
     pub log_clock_smear_ns: Arc<AtomicU64>,
     /// Plan 2: `schedule apply` requests this node refused, for any reason.
     pub schedule_apply_refused: Arc<AtomicU64>,

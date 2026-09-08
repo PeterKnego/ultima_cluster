@@ -825,7 +825,7 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_log_clock_smear_ns",
-        "Leader only (0 elsewhere): nanoseconds of a backward wall-clock step the log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). The log clock is AHEAD of wall time while this is nonzero, so uc2_log_time_lag_seconds reads 0 — this gauge is the only sign of a smear.",
+        "Per node: nanoseconds of a backward step of THIS node's wall clock that its log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). On the leader this is the log's clock; on a follower it is the clock that node would lead with after a failover — every node's clock is a candidate leader clock, so it is reported everywhere. The log clock is AHEAD of wall time while this is nonzero, so uc2_log_time_lag_seconds reads 0 — this gauge is the only sign of a smear.",
         s.log_clock_smear_ns.load(Ordering::Relaxed),
     );
 }
