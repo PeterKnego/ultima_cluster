@@ -467,3 +467,34 @@ Out of scope:
 - **The clamp.** `max(now, last_stamp)` stays. It is the guarantee of
   record and this design deliberately does not replace it — it stops
   *depending* on it for step absorption.
+
+## Errata (plan, as built)
+
+- **§5.2, which sites take the pass reading.** Only `Event::Tick`'s `now_ns`
+  (`node.rs:3497`) is derived from the pass's one `Instant` reading. The
+  three conditional `now_ns()` sites (`:4549`, `:4612`, `:6306`) keep their
+  own `Instant` read: they are rare, they are intervals against a deadline
+  set from the same source, and folding them in would mean threading the
+  pass value into three cold paths for no measurable gain.
+- **§7, what the lag series shows during a smear.** The first draft said
+  `uc2_log_time_lag_seconds` "shows the smear retiring". It cannot: the
+  exporter computes `wall.saturating_sub(log_time)`, and during a smear the
+  log clock is AHEAD of wall, so the series reads 0. That is the right
+  behaviour for the alert (a smeared-but-healthy leader must not fire
+  `Uc2LogTimeFrozen`) but leaves the smear invisible, so the plan adds one
+  gauge, `uc2_log_clock_smear_ns` (leader-only, remaining nanoseconds still
+  to retire; 0 when none), and one obs event, `log_clock_step`
+  (`direction`, `step_ns`, `smear_ns`), emitted once per detected step.
+  §9's "whether to count steps" is answered: no counter — the event carries
+  the count and the gauge carries the state.
+- **§9, parameters.** Fixed in the plan's Global Constraints:
+  `SMEAR_PPM = 500`, `RESAMPLE_INTERVAL_NS = 1 s`, `STEP_TOLERANCE_NS =
+  10 µs`, bracket retries/thresholds 100/250 ns at construction and
+  4/1 000 ns in-pass (skip, never adopt a wide bracket). Suspend reads as a
+  forward step and is adopted — asserted, covered by the core's forward-step
+  test, not by a real suspend.
+- **§8, the local smoke harness.** `scripts/hop1_ab.sh` measures the client
+  hop against `dummy-node` — the consensus agent is not in its path, so it
+  cannot A/B this change. The dev-box smoke is `m12_gate --arm direct` (three
+  in-process nodes, the real consensus agent), two binaries alternated; the
+  acceptance A/B is `m14_fleet_gate.py` row a on the fleet, as written.
