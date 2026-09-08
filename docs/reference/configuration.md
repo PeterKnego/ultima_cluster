@@ -154,6 +154,7 @@ replaces:
 | `bind` must equal this node's own `members` entry | A leader elects, but followers never advance `durable` or `commit` — datagrams arrive from a source address matching no member. |
 | `instance_dir` must not be on a RAM-backed filesystem | Every `fsync` is a silent no-op; the cluster appears to work and loses committed data on power loss. |
 | `max_payload` must fit one datagram | A max-size frame plus headers and any crypto tag must fit the MTU; the node does not fragment. Oversized values panic inside the sender at construction. |
+| `max_payload` must carry a full schedule table | **Since 2.11.0.** A `MAX_SCHEDULE_ENTRIES` (32) table encodes to a 1072-byte `CLUSTER` frame body, so a smaller `max_payload` silently caps `uc2ctl schedule apply` at fewer entries and refuses the rest. Refused by name at startup with the byte figures and the entry count this node would accept. The default satisfies it; a pinned value below it does not. |
 | `buffer_bytes` must be a power of two | Ring geometry. |
 | `max_payload` must be well under `buffer_bytes` | A payload approaching the ring size cannot be buffered for retransmit. |
 | this node's `id` must appear in `members` or `learners` | A node not in its own cluster. |
@@ -228,7 +229,17 @@ at startup (see [Instance directory](instance-directory.md#on-disk-footprint));
 a node that cannot reserve it refuses to start.
 
 **`max_payload: usize`**
-Maximum payload size.
+Maximum payload size. **Optional, and best left unset**: the default is
+DERIVED from the path budget rather than being a fixed number —
+`uc_protocol::v2::datagram::max_payload_for_mtu(MTU_DEFAULT)`, which is
+**1312 B** at the built-in 1408 B MTU and would be ~8928 B on a 9000 B
+jumbo-frame path. Deriving it means the value follows the MTU instead of
+pinning a small number a larger path would waste, and it is the crypto-SAFE
+figure: the crypto-off command ceiling (1344 B) needs 1416 B of datagram with
+wire crypto enabled, over the MTU, so a node defaulted to it would refuse to
+start on exactly the clusters that turn crypto on. Both bounds — too big for
+the datagram, too small for a schedule table — are checked at startup and
+refused by name.
 
 **`admission_bytes_default: u64`**
 The **fallback** ingress admission budget in bytes — the `append - commit`

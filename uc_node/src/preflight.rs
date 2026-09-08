@@ -18,7 +18,9 @@ use uc_consensus::election::NodeId;
 use uc_protocol::v2::config::MAX_MEMBERS;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{DATAGRAM_HEADER_LEN, MTU_DEFAULT};
-use uc_protocol::v2::frame::{CLUSTER_BODY_PREFIX_LEN, FRAME_ALIGNMENT, HEADER_LEN, align_frame_len};
+use uc_protocol::v2::frame::{
+    CLUSTER_BODY_PREFIX_LEN, FRAME_ALIGNMENT, HEADER_LEN, align_frame_len,
+};
 use uc_protocol::v2::schedule::{MAX_SCHEDULE_ENTRIES, SCHEDULE_ENTRY_LEN, SCHEDULE_HEADER_LEN};
 
 use crate::config_file::AdminSection;
@@ -141,8 +143,8 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
     // the two could silently disagree and only a full table applied in anger
     // would find out. `PayloadExceedsMtu` guards the too-BIG direction; this
     // guards too-SMALL.
-    let table_need = CLUSTER_BODY_PREFIX_LEN + SCHEDULE_HEADER_LEN
-        + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN;
+    let table_need =
+        CLUSTER_BODY_PREFIX_LEN + SCHEDULE_HEADER_LEN + MAX_SCHEDULE_ENTRIES * SCHEDULE_ENTRY_LEN;
     if cfg.max_payload < table_need {
         return Err(PreflightError::PayloadTooSmallForScheduleTable {
             max_payload: cfg.max_payload,

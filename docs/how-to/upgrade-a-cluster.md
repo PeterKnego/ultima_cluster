@@ -418,6 +418,28 @@ is an **exclusive** frontier and it must return that position, not report it
 from `last_applied()`
 ([State-machine contract § Snapshots](../reference/state-machine-contract.md#snapshots-the-instant-the-envelope-and-the-exclusive-frontier)).
 
+**The `max_payload` edit, required only on hosts that PIN it.** If a
+`node.toml` sets `max_payload` to a value below what a full schedule table
+needs, the node is **refused by name** at startup:
+
+```
+max_payload (512) cannot carry a full schedule table: MAX_SCHEDULE_ENTRIES
+(32) encodes to a 1072-byte CLUSTER frame body. `uc2ctl schedule apply` would
+refuse any table over 15 entries on this node — raise max_payload to at least
+1072.
+```
+
+**Delete the line.** The default is derived from the path budget (1312 B at
+the built-in MTU) and satisfies the check on its own; pinning a number only
+takes you back out of step with it the next time the MTU or a frame layout
+moves. If you must pin, use at least 1072 — and note the crypto ceiling: a
+value above 1312 refuses to start once `[crypto].enabled = true`, because a
+max-size frame plus the GCM tag no longer fits one datagram.
+
+The example config no longer suggests a value. This is the one 2.11.0 edit
+that only bites hosts that opted into pinning: a `node.toml` that never
+mentioned `max_payload` needs no change.
+
 **The `admission_bytes` and `fsm_lag` edit, required on every host that sets
 either.** Both are cluster-wide policies now, so both are **refused by name**
 where they used to live:

@@ -750,12 +750,7 @@ pub fn parse_str_with_env(
                 });
             }
             let refs: Vec<&str> = s.names.iter().map(String::as_str).collect();
-            let cfg =
-                ServicesConfig::from_names(&refs, None).map_err(|detail| ConfigError::Invalid {
-                    field: "services.names",
-                    detail,
-                })?;
-            // No `cfg.validate(...)` here (P4). It was dead: `from_names(…,
+            // No `.validate(...)` on the result (P4). It was dead: `from_names(…,
             // None)` is the only shape this loader builds — `[services]
             // fsm_lag` is refused by name a dozen lines up — so `resolve_lag`
             // always yields `buffer_bytes / 4`, which passes for every
@@ -766,7 +761,16 @@ pub fn parse_str_with_env(
             // message naming `services.fsm_lag` — the retired key. The check
             // itself still runs, once, for programmatically built configs, in
             // `Node::start`.
-            cfg
+            //
+            // Returned directly rather than through a `let cfg = …; cfg`
+            // binding: clippy's `let_and_return` fires on that shape at the
+            // MSRV floor (1.89) though not on the pinned stable, which is how
+            // it reached `main` — these commits had never been pushed, so the
+            // `msrv` job had never seen them.
+            ServicesConfig::from_names(&refs, None).map_err(|detail| ConfigError::Invalid {
+                field: "services.names",
+                detail,
+            })?
         }
     };
 
