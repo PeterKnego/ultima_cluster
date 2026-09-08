@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 99 families — is the
+exposition. The full series contract — 100 families — is the
 `CONTRACT_SERIES` array in
 [`uc_node/src/obs/metrics.rs`](../../uc_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -173,15 +173,16 @@ permanently on any multi-node cluster.
 
 Since log time and timers, every log frame carries a leader-written timestamp
 and a state machine can schedule callbacks on it
-([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Eight new
-contract families — five for the clock and the timer set, three for the
+([the explainer](../notes/uc2-log-time-and-timers-explained.md)). Nine new
+contract families — six for the clock and the timer set, three for the
 replicated schedule table — plus four **off-contract** timing families
 (the two histograms below and their `_max` gauges):
 
 | family | type | labels | meaning |
 |---|---|---|---|
 | `uc2_log_time_ns` | gauge | none | the highest leader stamp the archive on **this** node has recorded: the log's clock, in ns since the Unix epoch. Identical on every node once caught up |
-| `uc2_log_time_lag_seconds` | gauge | none | **leader only** (rendered `0` on followers): wall clock minus `uc2_log_time_ns` |
+| `uc2_log_time_lag_seconds` | gauge | none | **leader only** (rendered `0` on followers): wall clock minus `uc2_log_time_ns`, floored at 0. Since 2.12.0 a backward wall-clock step no longer parks this (the log clock smears instead — see `uc2_log_clock_smear_ns` below); it grows only when nothing is being appended |
+| `uc2_log_clock_smear_ns` | gauge | none | **leader only** (rendered `0` on followers): ns of a backward wall-clock step the log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). Nonzero here means the log clock is AHEAD of wall time, so `uc2_log_time_lag_seconds` reads `0` — this gauge is the only visible sign of a smear in progress |
 | `uc2_timers_pending` | gauge | `service`, `row` | pending scheduled timers for that row **on the leader**. The timer heap is leader-only since the cluster FSM (2.11 pending), so a follower always exports `0` — that is the healthy reading, not a gap, and there is deliberately no divergence alert over this family |
 | `uc2_timers_fired_total` | counter | `service`, `row` | `TIMER` frames this node appended **as leader** for that row |
 | `uc2_timers_late_total` | counter | `service`, `row` | fires whose stamp exceeded their deadline (post-failover, or a deadline already in the past when scheduled) |
@@ -195,11 +196,20 @@ replicated schedule table — plus four **off-contract** timing families
 `uc2_log_time_lag_seconds > 5 and on(instance) uc2_is_leader == 1`. The
 `uc2_is_leader` join is what makes it meaningful: the lag series is
 leader-only, so without the join a follower's constant `0` would be
-indistinguishable from a healthy leader. A firing rule means the leader's wall
-clock stepped **backwards** (stamps hold flat at their last value until wall
-time catches up, by the monotone clamp) or nothing is being appended at all.
-Either way the log's clock has frozen relative to wall time, and every pending
-timer is waiting on it.
+indistinguishable from a healthy leader. Since 2.12.0 a backward wall-clock
+step no longer parks the log clock — it smears instead, running 500 ppm slow
+until it retires the step (`uc2_log_clock_smear_ns`) — so a firing rule now
+has **one** cause left: nothing is being appended, and every pending timer is
+waiting on it. The rule and threshold are unchanged from before the log
+clock; only the meaning narrowed.
+
+Every `log_clock_step` (info level; `node`, `direction`, `step_ns`,
+`smear_ns`) marks a detected wall-clock step: `direction = "forward"` means
+every timer due in the skipped interval fires this pass, `direction =
+"backward"` means the step is being smeared and `smear_ns` is what remains.
+It has no gauge of its own beyond `uc2_log_clock_smear_ns`, which only shows
+a backward smear in progress, not a forward step (there is nothing left to
+show once one is adopted).
 
 There is **no per-fire log record**. `timer_late` is emitted only when a fire
 is late, because a `stderr` write per timer would sit on the consensus agent's
@@ -385,7 +395,7 @@ about the set's position, so it was mixing two instants) and
 `uc2_snapshot_refused_fetch_expired_total` (a straggling answer to a
 `snapshot fetch` this node had already given up on — nothing is stored or
 installed, and the verb is simply re-runnable). All five are in
-`CONTRACT_SERIES` and counted in the 99 above. Any of them non-zero means a joiner is stuck; the consensus
+`CONTRACT_SERIES` and counted in the 100 above. Any of them non-zero means a joiner is stuck; the consensus
 agent names each one in a `snapshot_session_refused` record as it happens.
 
 **Eleven record names** go with the families, six at info and five at warn

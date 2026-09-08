@@ -92,6 +92,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_fsm_lag_bytes",
     "uc2_log_time_ns",
     "uc2_log_time_lag_seconds",
+    "uc2_log_clock_smear_ns",
     "uc2_output_completed_bytes",
     "uc2_output_progress_bytes",
     "uc_node_snapshot_floor_bytes",
@@ -818,8 +819,14 @@ fn push_service_families(out: &mut String, s: &ObsSources, commit: u64, now: u64
     push_gauge(
         out,
         "uc2_log_time_lag_seconds",
-        "Leader only (0 elsewhere): wall clock minus the log's clock. Grows when the leader's clock stepped backwards (stamps hold until wall time catches up) or nothing is being appended. Alert: Uc2LogTimeFrozen.",
+        "Leader only (0 elsewhere): wall clock minus the log's clock, floored at 0. Grows only when nothing is being appended — since 2.12.0 a backward wall-clock step no longer parks it (the log clock smears instead; see uc2_log_clock_smear_ns). Alert: Uc2LogTimeFrozen.",
         lag_s,
+    );
+    push_gauge(
+        out,
+        "uc2_log_clock_smear_ns",
+        "Leader only (0 elsewhere): nanoseconds of a backward wall-clock step the log clock is still retiring by running 500 ppm slow (spec 2026-09-08 §5.3). The log clock is AHEAD of wall time while this is nonzero, so uc2_log_time_lag_seconds reads 0 — this gauge is the only sign of a smear.",
+        s.log_clock_smear_ns.load(Ordering::Relaxed),
     );
 }
 
@@ -1475,6 +1482,7 @@ mod tests {
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
             schedule_table_position: Arc::new(AtomicU64::new(0)),
             schedule_entries: Arc::new(AtomicU64::new(0)),
+            log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             reports_unattested: Arc::new(AtomicU64::new(0)),
@@ -1533,6 +1541,19 @@ mod tests {
                 "missing the {agent} agent sample: {text}"
             );
         }
+    }
+
+    #[test]
+    fn log_clock_smear_gauge_renders_the_published_value() {
+        let s = synthetic_sources();
+        s.log_clock_smear_ns.store(123_456, Ordering::Relaxed);
+        let text = render_prometheus(&s);
+        assert!(
+            text.contains("\n# TYPE uc2_log_clock_smear_ns gauge\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nuc2_log_clock_smear_ns 123456\n"), "{text}");
+        assert!(CONTRACT_SERIES.contains(&"uc2_log_clock_smear_ns"));
     }
 
     /// Final wave M5 (parked as T8): [`SnapshotFreezeStats`]'s edge detection
@@ -1599,7 +1620,7 @@ mod tests {
     fn the_contract_has_the_number_of_families_the_docs_state() {
         assert_eq!(
             CONTRACT_SERIES.len(),
-            99,
+            100,
             "if this is intentional, update the family count in \
              docs/how-to/monitor-a-cluster.md in the same commit"
         );
@@ -2001,6 +2022,7 @@ mod tests {
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
             schedule_table_position: Arc::new(AtomicU64::new(0)),
             schedule_entries: Arc::new(AtomicU64::new(0)),
+            log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             cluster_view: test_cluster_view(),
             reports_unattested: Arc::new(AtomicU64::new(0)),

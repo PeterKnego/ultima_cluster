@@ -865,6 +865,7 @@ pub struct Node {
     /// agent publishes into, handed on by `observability()`.
     schedule_pos_pub: Arc<AtomicU64>,
     schedule_entries_pub: Arc<AtomicU64>,
+    log_clock_smear_pub: Arc<AtomicU64>,
     schedule_refused: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     /// Protocol 0.5.0: reports DECLINED because their content attestation
@@ -1812,6 +1813,7 @@ impl Node {
         let schedule_refused = Arc::new(AtomicU64::new(0));
         let schedule_pos_pub = Arc::new(AtomicU64::new(0));
         let schedule_entries_pub = Arc::new(AtomicU64::new(0));
+        let log_clock_smear_pub = Arc::new(AtomicU64::new(0));
 
         // Cluster-FSM spec §4.1/§4.7: genesis from node.toml on a fresh dir,
         // else the newest cluster artifact; the agent replays CLUSTER frames
@@ -1921,6 +1923,7 @@ impl Node {
             settings_pending: instance.root.join(SETTINGS_PENDING_FILE),
             schedule_pos_pub: Arc::clone(&schedule_pos_pub),
             schedule_entries_pub: Arc::clone(&schedule_entries_pub),
+            log_clock_smear_pub: Arc::clone(&log_clock_smear_pub),
             schedule_refused: Arc::clone(&schedule_refused),
             ingress_rx,
             trunc_tx,
@@ -2050,6 +2053,7 @@ impl Node {
             timer_stats,
             schedule_pos_pub,
             schedule_entries_pub,
+            log_clock_smear_pub,
             schedule_refused,
             reports_implausible,
             reports_unattested,
@@ -2458,6 +2462,7 @@ impl Node {
             timer_stats: Arc::clone(&self.timer_stats),
             schedule_table_position: Arc::clone(&self.schedule_pos_pub),
             schedule_entries: Arc::clone(&self.schedule_entries_pub),
+            log_clock_smear_ns: Arc::clone(&self.log_clock_smear_pub),
             schedule_apply_refused: Arc::clone(&self.schedule_refused),
             cluster_view: Arc::clone(&self.cluster_view),
             reports_unattested: Arc::clone(&self.reports_unattested),
@@ -2888,6 +2893,9 @@ struct Consensus {
     /// / `uc2_schedule_entries`.
     schedule_pos_pub: Arc<AtomicU64>,
     schedule_entries_pub: Arc<AtomicU64>,
+    /// Spec 2026-09-08 §7: remaining smear ns, leader-written once per pass
+    /// from `publish_status`; `uc2_log_clock_smear_ns`.
+    log_clock_smear_pub: Arc<AtomicU64>,
     /// Plan 2: `uc2_schedule_apply_refused_total` — every refused apply,
     /// whatever the reason. Shared with `Node::observability`.
     schedule_refused: Arc<AtomicU64>,
@@ -4753,6 +4761,16 @@ impl Consensus {
         let now_ns = self.pass_now_ns;
         status.node_heartbeat_ns.store_release(now_ns);
         self.last_wall_ns = now_ns;
+        // Spec 2026-09-08 §7: the smear gauge and the step event. Both are
+        // off the hot top of the pass — this runs once per pass in step 6,
+        // beside the other status stores — and the event body is out of line.
+        let smear = self.clock.remaining_smear_ns(self.pass_mono_ns);
+        if smear != 0 || self.log_clock_smear_pub.load(Ordering::Relaxed) != 0 {
+            self.log_clock_smear_pub.store(smear, Ordering::Relaxed);
+        }
+        if let Some(step) = self.clock.take_step() {
+            self.on_log_clock_step(step, smear);
+        }
         self.publish_ring_holes();
         self.publish_timers_pending();
     }
@@ -4855,6 +4873,27 @@ impl Consensus {
                 .observe(now.saturating_sub(self.last_pass_ns));
         }
         self.last_pass_ns = now;
+    }
+
+    /// Spec 2026-09-08 §5.3: one line per detected wall-clock step. A forward
+    /// step was adopted (every timer due in the skipped interval fires now —
+    /// `docs/reference/limits.md`'s unchanged half); a backward step is being
+    /// smeared, `smear_ns` remaining.
+    #[inline(never)]
+    fn on_log_clock_step(&mut self, step: crate::log_clock::Step, smear_ns: u64) {
+        use crate::log_clock::Step;
+        let (direction, step_ns) = match step {
+            Step::Forward(n) => ("forward", n),
+            Step::Backward(n) => ("backward", n),
+        };
+        crate::obs_event!(
+            Info,
+            "log_clock_step",
+            node = self.id as u64,
+            direction = direction,
+            step_ns = step_ns,
+            smear_ns = smear_ns
+        );
     }
 
     fn fire_due_timers(&mut self) -> (bool, bool) {
@@ -9950,6 +9989,7 @@ mod tests {
             settings_pending: dir.path().join(SETTINGS_PENDING_FILE),
             schedule_pos_pub: Arc::new(AtomicU64::new(0)),
             schedule_entries_pub: Arc::new(AtomicU64::new(0)),
+            log_clock_smear_pub: Arc::new(AtomicU64::new(0)),
             schedule_refused: Arc::new(AtomicU64::new(0)),
             ingress_rx,
             trunc_tx,

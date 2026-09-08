@@ -61,6 +61,11 @@ pub struct ObsSources {
     /// per pass thereafter).
     pub schedule_table_position: Arc<AtomicU64>,
     pub schedule_entries: Arc<AtomicU64>,
+    /// Spec 2026-09-08 §7: ns of backward wall-clock step still being
+    /// retired by the log clock (0 = none). The lag series saturates at 0
+    /// while the log clock is AHEAD of wall time, so this is the only sign
+    /// of a smear.
+    pub log_clock_smear_ns: Arc<AtomicU64>,
     /// Plan 2: `schedule apply` requests this node refused, for any reason.
     pub schedule_apply_refused: Arc<AtomicU64>,
     /// Cluster FSM (spec §9): the cluster FSM's published view — the SAME
@@ -148,6 +153,7 @@ impl ObsSources {
             timer_stats: Arc::new(crate::timers::TimerStats::default()),
             schedule_table_position: Arc::new(AtomicU64::new(0)),
             schedule_entries: Arc::new(AtomicU64::new(0)),
+            log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
             schedule_apply_refused: Arc::new(AtomicU64::new(0)),
             cluster_view: Arc::new(crate::cluster_fsm::ClusterView::new(
                 &crate::cluster_fsm::ClusterState::genesis_empty(),

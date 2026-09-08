@@ -228,12 +228,10 @@ impl LogClock {
     }
 
     /// The step detected by the most recent resample, once.
-    #[allow(dead_code)] // wired by Task 3 (Consensus::publish_status)
     pub(crate) fn take_step(&mut self) -> Option<Step> {
         self.pending.take()
     }
 
-    #[allow(dead_code)] // wired by Task 3 (Consensus::publish_status)
     pub(crate) fn remaining_smear_ns(&self, mono_ns: u64) -> u64 {
         self.core.remaining_smear_ns(mono_ns)
     }

@@ -86,6 +86,7 @@ fn synthetic_server() -> (ObsServer, ObsSources) {
         timer_stats: Arc::new(uc_node::TimerStats::default()),
         schedule_table_position: Arc::new(AtomicU64::new(0)),
         schedule_entries: Arc::new(AtomicU64::new(0)),
+        log_clock_smear_ns: Arc::new(AtomicU64::new(0)),
         schedule_apply_refused: Arc::new(AtomicU64::new(0)),
         cluster_view: Arc::new(uc_node::ClusterView::new(
             &uc_node::ClusterState::genesis_empty(),
