@@ -100,11 +100,11 @@ has no timer/schedule-table arms) and the two commit SHAs named explicitly:
 
    ```bash
    R=<step 1's resolution, in %>
-   python3 bench-infra/scripts/m14_fleet_gate.py --fleet --rows abc \
+   python3 bench-infra/scripts/m14_fleet_gate.py --fleet --rows abe \
        --base-tree <checkout of 10c014d> --resolution-pct "$R" --ab-reps 3
    ```
 
-   (this tree, `589451b` or later, is the head tree; `--rows abc` reuses the
+   (this tree, `589451b` or later, is the head tree; `--rows abe` reuses the
    driver's own rows a/b/e under its steady window, `WARMUP_SECS,
    MEASURE_SECS = 2, 8` — the same convention the M14, FSM-identity, and
    time-and-timers gates all use, so a single fleet trip can adjudicate this
@@ -191,7 +191,7 @@ base/head/head/base/base/head:
 
 Means: base (runs 1/4/5) = (183 285 + 176 806 + 169 493) / 3 = **176 528**;
 head (runs 2/3/6) = (184 208 + 177 569 + 176 593) / 3 = **179 456.67**.
-**Ratio head/base = 1.01659 (+1.66 %).**
+**Ratio head/base = 1.01659 (+1.66 %) — dev-box smoke, not a gate.**
 
 **Dev-box smoke, not a gate.** Per CLAUDE.md's standing rule, this number is
 reported and carries no bar — a dev box's own dip has been measured 7× to
