@@ -11,7 +11,7 @@ Baseline: local `main` / worktree `claude-2` at the tagged `v2.11.0` (wire
 
 ### What changed
 
-`pass_clock()` (`uc_node/src/node.rs:3268`) no longer reads
+`pass_clock()` (`uc_node/src/node.rs:3297`) no longer reads
 `SystemTime::now()`. It reads a private module, `uc_node::log_clock`, whose
 value is `CLOCK_MONOTONIC` (`std::time::Instant`) plus a sampled epoch
 offset (`REALTIME − MONOTONIC`, bracketed and re-sampled every 1 s;
@@ -23,7 +23,7 @@ measurable saving (spec §3/§5.2).
 
 A detected step is handled by case: a change inside the sampling bracket's
 noise (`STEP_TOLERANCE_NS = 10 µs`) is not a step; a **forward** step is
-adopted immediately, identical to pre-2.12.0 behaviour, including every
+adopted at the next resample (≤ 1 s), identical to pre-2.12.0 behaviour, including every
 timer due in the skipped interval firing at once; a **backward** step is
 **never adopted** — instead the derived clock is **smeared**, running
 `SMEAR_PPM = 500` slow (a 1 s step takes 2 000 s to retire) until it

@@ -31,6 +31,7 @@ record it summarizes; where the two disagree, the dated record wins.
 | **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the twenty decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders and `uc_remote`'s Vec-backed SPSC internals (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
+| **`log_clock` unit suite** | Ordinary unit tests | The monotonic log clock's pure arithmetic (`uc_node::log_clock`): steady state, forward-step adoption, backward-step smear and full retirement, tolerance, multiple resamples against a smear in flight (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`: one step reported, the remaining-smear gauge strictly falling, no undershoot, over 3 000 resamples), a seeded-random step sequence, and `bracket_sample`/`resample_slow` against the real clock — 17 tests, `cargo test -p uc_node --lib log_clock` |
 
 ### The headline result
 

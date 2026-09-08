@@ -289,6 +289,9 @@ reviewer wants a workload to attack.
 - **Minter-local epoch collision** after leader change — transient DATA
   loss, NAK-repaired, "a nice-to-have, not a safety break"
   (`docs/notes/uc2-m8-formal-methods-followups.md`).
+- **Alert on `uc2_log_clock_smear_ns`** (a smear above N seconds for M
+  minutes), with its `scripts/m10_alert_fire.sh` builder and scenario —
+  recorded 2026-09-08 by the log-clock spec's errata bullet 9.
 
 ## Accepted residuals — listed so they are not re-proposed
 

@@ -506,3 +506,55 @@ Out of scope:
   follower's smear would discard the one reading an operator wants before a
   failover. Nothing about stamps changes — only the leader's clock ever
   reaches the log.
+- **§5.2, "no longer lands in either histogram".** False as built. The first
+  draft claimed a forward step "no longer lands in either histogram" once
+  the clock read moved to `LogClock`. It does: `record_pass_interval`
+  (`uc2_consensus_pass_ns`) and the timer-lateness histogram
+  (`timer_stats.lateness_ns`, `node.rs:4989`) both subtract `pass_now_ns`
+  from a prior or deadline value, and `pass_now_ns` is exactly the value a
+  forward step ADOPTS — so an adopted forward step still lands in both
+  series as one outsized sample, same as before this change. Separately,
+  the first errata bullet above undercounted the conditional `now_ns()`
+  call sites at **three**; the actual count in `node.rs` is **five**
+  (`:4591`, `:4654`, `:6190`, `:6316`, `:6382` — the read-barrier timeout,
+  the timer-heap arm path, and related cold callers), none of them folded
+  into the pass reading, for the same reason the original three were not.
+- **§8, the synthetic `m10_alerts.rs` scenario.** Not built, and none exists
+  in this release. §8 sketched a
+  `Uc2LogTimeFrozen`-no-longer-fires-on-a-stepped-but-healthy-leader
+  scenario for `scripts/m10_alert_fire.sh`'s harness; it was never written.
+  It would need a manipulated system clock to drive a real step through
+  `bracket_sample`, and the exporter's lag arithmetic
+  (`wall.saturating_sub(log_time)`) is unchanged by this feature — a
+  synthetic scenario built on the existing frozen-log-time fault injector
+  would prove only that the arithmetic it already proves still holds, not
+  anything new about the smear. The gate doc
+  (`docs/benchmarks/uc2-log-clock-gate-2026-09-08.md`) says so plainly in
+  its coverage statement, and an alert on `uc2_log_clock_smear_ns` itself is
+  a `docs/BACKLOG.md` item, not part of this release.
+- **§9, no smear ceiling in this release.** §9 raised, and left open, whether
+  a smear above some ceiling should page. Decided: none, for `2.12.0`. A
+  backward step of any size is smeared at the fixed `SMEAR_PPM = 500` rate —
+  a 1 h step takes roughly 83 days to fully retire (`3600 s / (500 / 1e6)`)
+  — during which the log's time runs increasingly off true UTC and any
+  `at {secs_of_day}` schedule-table rule fires late until the smear is
+  retired (§5's daily rule, unaffected in kind, only in how far off UTC the
+  log clock is meanwhile). `uc2_log_clock_smear_ns` is the only signal an
+  operator has for this, and nothing pages on it — the alert plus its
+  `scripts/m10_alert_fire.sh` builder and scenario is the same
+  `docs/BACKLOG.md` item named in the bullet above.
+- **C1, the resample baseline bug and its fix.** As first built,
+  `LogClockCore::resample` compared the fresh wall sample against `derived`
+  — the clock's own current value — rather than against `derived −
+  remaining_smear_ns`. During a smear the derived clock is DELIBERATELY
+  ahead of the wall by the remaining smear (that is the whole point of
+  smearing), so comparing against `derived` re-detected that same, expected
+  gap as a brand-new backward step on every 1 s resample: the smear grew
+  instead of counting down, `log_clock_step` fired every second instead of
+  once, and a forward step arriving mid-smear was never adopted (it was
+  read as an even bigger backward step). The fix subtracts the remaining
+  smear from the gap before deciding whether anything changed —
+  `step = (derived − wall) − remaining` — so a smear in flight is silent
+  unless the wall moves by more than what the smear already accounts for; see
+  `uc_node/src/log_clock.rs`'s `resample` for the corrected algorithm and
+  its doc comment for the reasoning.

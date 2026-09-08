@@ -104,6 +104,15 @@ Consistency, SubmitError}`) are in the same position and are covered too.
   `timers_rearmed` was retired before shipping) and two new `uc2ctl status` fields
   (`log_time_ns=`,
   per-row `timers_pending=`) follow the same "added, not renamed" convention.
+- **The monotonic log clock (2.12 pending) adds one metric family and one
+  `[log]` record, both additive**: the `uc2_log_clock_smear_ns` gauge
+  (per-node, not leader-gated — ns of a backward wall-clock step still being
+  retired, `0` when none) and the `log_clock_step` record (`direction`,
+  `step_ns`, `smear_ns`), emitted once per detected step. No Rust surface,
+  wire frame or cnc field changed — `pass_clock()` moved from
+  `SystemTime::now()` to the private `uc_node::log_clock` module, an
+  internal detail nothing outside `uc_node` depends on. Nothing was renamed
+  or removed.
 
 The normative descriptions live where the surface does:
 [the state-machine contract](state-machine-contract.md),

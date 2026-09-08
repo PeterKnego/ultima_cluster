@@ -69,8 +69,10 @@ Next up, now that `2.11.0` is tagged: (1) the crates.io publish
 reachable from `uc2ctl`, client and service attach) and bound the three
 unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs` that turned a
 flaky failure into a 58-minute nightly hang on 2026-09-08; (3) `2.12.0`, which
-carries a fast increment-only `wall_now_ns()` (in progress in another session)
-and is the natural home for **jumbo frames** — raising `MTU_DEFAULT` is a wire
+carries the monotonic log clock (`uc_node::log_clock`, spec
+`docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`; fleet
+A/B pre-committed, unrun) and is the natural home for **jumbo frames** —
+raising `MTU_DEFAULT` is a wire
 flag day, so it pairs with whatever else moves the wire; (4) a fleet re-run of
 the time-and-timers rows a/b/e under the paired statistic, and of row c under
 its restated bar. The cluster FSM / coordinated snapshots spec is

@@ -34,11 +34,25 @@ change, so this is an ordinary minor (`2.12.0`) by
 [the semver policy](../reference/semver-policy.md).
 
 **Coverage statement.** This gate measures throughput cost only. It is not a
-substitute for the behavioural tier — the step/smear paths under the
-`pass_clock()` test seam and the seeded-random monotonicity property — which
-is `uc_node`'s `log_clock` unit suite (row c below) plus the synthetic
-`Uc2LogTimeFrozen`-no-longer-fires-on-a-stepped-but-healthy-leader scenario
-in `m10_alerts.rs`. See
+substitute for the behavioural tier. Row c's coverage IS: `uc_node`'s
+`log_clock` unit suite (the pure `LogClockCore`/`LogClock` arithmetic —
+steady state, forward-step adoption, backward-step smear at 500 ppm,
+tolerance, a forward step during a smear, a second backward step during a
+smear, multi-resample convergence with no re-reported step and a
+monotonically falling gauge, a forward step smaller than the remaining
+smear, `bracket_sample`/`resample_slow` against the real clock) plus one
+node-level test,
+`a_backward_step_publishes_a_falling_smear_gauge_and_is_drained_once`, which
+drives the same decision through `Consensus::publish_status` via the
+`LogClock::inject_sample` test seam and checks the published
+`uc2_log_clock_smear_ns` gauge and the `take_step` drain. Two things this
+statement corrects from the original coverage claim: (1) `pass_clock()`'s
+`#[cfg(test)]` `test_now_ns` override bypasses `LogClock` entirely (it pins
+the WALL value directly), so it was never a seam onto the step/smear paths —
+the node-level test above uses `inject_sample` instead, which goes through
+the real `LogClock`; (2) no `m10_alerts.rs` scenario for the smear was ever
+built, and none exists in this release — see spec errata bullet 8. The
+alert-tier gap is tracked as a `docs/BACKLOG.md` item, not covered here. See
 [VERIFICATION §11](../VERIFICATION.md#11-what-is-not-verified) for what
 neither tier covers.
 
@@ -67,7 +81,7 @@ skeleton for those three).
 |---|---|---|---|
 | a | **fleet A/B**: `m14_fleet_gate.py` rows a/b/e (steady window, `WARMUP_SECS, MEASURE_SECS = 2, 8`), this tree vs its parent commit (`10c014d`, the last commit before Task 1's code), on the same rig, same day, after a same-source rebuild control run FIRST to record the day's resolution (the M14b lesson; 1.12 % on 2026-09-07) | three readings, each a result (spec §8, reproduced above): **gain outside the resolution** (ceiling 2.2 %) → A is a perf win, consensus is the limiter, B-lite gets its own spec; **within the resolution** → null for throughput, ships on behaviour alone, B-lite closed; **regression outside the resolution** → FAIL, does not ship until the cause is found (`objdump -d -C` both binaries' `do_work`) | **not run — fleet, user-gated** |
 | b | **codegen sanity**: count of `clock_gettime`/`__vdso_clock_gettime` call sites reachable from `m5_gate`, this tree vs parent, `objdump -d -C \| grep -c` (the time-and-timers row-d playbook) | strictly fewer in this tree | **filled in by Task 2, step 6 (controller rulings R1/R2): parent = 2, HEAD = 2 — not lower.** Both sites are libstd's shared `Timespec::now` (the one function every `Instant`/`SystemTime` read routes through) plus `m5_gate::await_single_leader` in the harness; a static call-site count cannot see per-pass frequency — diagnostic, not a bar (ruling R2); the acceptance bar is row a |
-| c | **behaviour**: `cargo test -p uc_node --lib log_clock` — steady state, forward adopted, backward smeared at 500 ppm and fully retired at 2 000 s/s, monotone under 20 000 seeded random steps | all green | **filled in by Task 1: 15 passed (11 planned + 4 added in review, covering the resample decision — wide bracket skipped, narrow forward adopted and reported once, narrow backward smeared, real-clock resample reports no step). Re-run 2026-09-08 to confirm (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-logclock`): the same test filter also incidentally matches one unrelated test whose name contains the substring `log_clock` (`obs::metrics::tests::log_clock_smear_gauge_renders_the_published_value`, Task 3's gauge test), so the raw summary line reads `test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 275 filtered out` — 15 in the `log_clock` module itself (all green) plus that one incidental match (also green). The module's own count is unchanged at 15/15** |
+| c | **behaviour**: `cargo test -p uc_node --lib log_clock` — steady state, forward adopted, backward smeared at 500 ppm and fully retired at 2 000 s/s, monotone under 20 000 seeded random steps, PLUS `a_backward_step_publishes_a_falling_smear_gauge_and_is_drained_once` (`node.rs`) | all green | **filled in by Task 1: 15 passed (11 planned + 4 added in review). Re-run 2026-09-08 to confirm (`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-logclock`): the same test filter also incidentally matches one unrelated test whose name contains the substring `log_clock` (`obs::metrics::tests::log_clock_smear_gauge_renders_the_published_value`, Task 3's gauge test). **Updated by the fix-wave (2026-09-08, C1/I2): the resample baseline bug (C1) added two tests to the module — a multi-resample convergence test (`a_smear_in_flight_is_not_re_reported_and_the_gauge_counts_down`, an independent-wall model asserting exactly one step over 3000 resamples and a strictly-falling remaining-smear gauge) and a small-forward-step-during-a-smear test — bringing the `log_clock` module's own unit count to 17/17 green. `cargo test -p uc_node --lib log_clock` (substring match, so it also still picks up the one incidental `obs` gauge test) now reads `test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 276 filtered out`. Separately, the node-level test named in this row's "what" column drives the same corrected decision through `Consensus::publish_status` via the new `LogClock::inject_sample` test seam (its name does not contain the substring `log_clock`, so it is not part of that 18 and must be run by name — see the fix-wave report). No alert-tier scenario exists for the smear in this release (spec errata bullet 8); that gap is a `docs/BACKLOG.md` item, not this row's job.** |
 | d | **dev-box SMOKE, not a gate**: `m12_gate --arm direct --secs 8` alternated A/B/B/A/A/B on an idle box, private target dirs, sha256 of each binary recorded | reported, **no bar** (CLAUDE.md: a local rate is smoke; the same dip measured 7× spanned 0–18 % on a dev box) | **filled in by step 2 below — see [Results](#results)** |
 
 ## Why `hop1_ab.sh` is not the harness
