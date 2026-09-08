@@ -278,6 +278,21 @@ schedule table an operator applies with one command.
   only when no covering artifact exists at all.
   → [Change cluster membership § pair with snapshots](docs/how-to/change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously)
 
+**Known issue at release**
+
+- **`uc2ctl` can panic if the node it is reading restarts at that instant.**
+  The control page is shared memory a node re-initialises when it restarts, and
+  one reader (`CncPage::meta()`) asserts the page is valid rather than
+  returning an error — so `uc2ctl status`, a client attach, or a service
+  attach that lands exactly on a node's restart can die with
+  `cnc page header must be valid after construction`. The window is the
+  restart itself, so it takes a coincidence to hit and sustained restart churn
+  to hit often. **Nothing is written and nothing is lost** — the reader is the
+  process that dies, and re-running the command works. Not a regression: the
+  code predates this release. Found while investigating a nightly hang, and
+  recorded rather than rushed into the release; the fix is a fallible read on
+  the five call sites. → [the engineering record](docs/releases.md)
+
 **Removed (breaking)**
 
 - **The apply trait signature changes**: `apply(&mut self, position: u64,

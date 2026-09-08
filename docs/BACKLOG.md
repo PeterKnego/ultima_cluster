@@ -1,5 +1,27 @@
 # Backlog — candidate directions after M14
 
+## `CncPage::meta()` must not panic on a page a live writer re-initialised
+
+**Added 2026-09-08**, from the fleet-gate follow-up (see `docs/releases.md`,
+"Known issue at release"). `meta()` `.expect()`s a valid header on an mmap
+another process owns and re-initialises on restart, so `uc2ctl status`, a
+client attach or a service attach can PANIC instead of erroring. `open_file`
+validates at open and documents the right posture ("a typed error, never a
+panic"), but a shared mapping can change under the reader afterwards, so
+open-time validation cannot close it.
+
+Fix: `try_meta() -> Option<CncMeta>`; handle a transient `None` at
+`uc_ctl/src/main.rs:716` and `:1048`, `uc_client/src/engine.rs:348` and `:352`,
+and `uc_service/src/attach.rs:77`; keep `meta()` for heap-backed pages, where
+the invariant is real. Reproduce with `cargo test -p uc_crashtest --features
+hard-crash-tests` — roughly 1 run in 6 on a 32-thread box.
+
+**Worth pairing with:** bounding the three unbounded waits in
+`examples/uc_crashtest/tests/remote_lin.rs` (worker `join()`, chaos `join()`,
+`Reap::drop`'s `kill(); wait()`). They are why the 2026-09-08 nightly spent its
+whole 60-minute budget and was cancelled instead of failing fast — that run
+took every other nightly job's evidence down with it.
+
 *Written 2026-09-01 against `v2.10.0`. Status: a ranked list of options, not
 a plan. Nothing here is scheduled; the maintainer picks. Every item cites the
 document that first recorded it, so the reasoning can be re-checked rather

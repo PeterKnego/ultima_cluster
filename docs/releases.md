@@ -951,6 +951,65 @@ relied on (crates.io publishing started at `2.9.0`). This is one decision
 for one release, not a standing exception — see
 [the semver policy § FSM identity carve-out](reference/semver-policy.md#fsm-identity-a-breaking-trait-and-config-change-riding-as-a-minor).
 
+### Known issue at release: `CncPage::meta()` panics on a page a live writer re-initialised
+
+**Found 2026-09-08 while investigating a nightly hang; recorded rather than
+fixed, by maintainer decision.** Not a regression — the code predates this
+release — and no gate row depends on it.
+
+`CncPage::meta()` ends in
+
+```rust
+let header = cnc::read_cnc_header(page)
+    .expect("cnc page header must be valid after construction (init/validate ran)");
+```
+
+That invariant holds for a page THIS process constructed. It does **not** hold
+for a file-backed page shared with a live writer: the cnc page is an mmap another
+process owns, and a node that restarts RE-INITIALISES it underneath every
+attached reader. `CncPage::open_file` validates at open — and its own comment
+states the right posture, "bad magic/len/crc → `BadHeader` (a typed error,
+never a panic)" — but validity at open says nothing about the next read of a
+shared mapping. The panic is a genuine TOCTOU, and open-time validation cannot
+close it.
+
+**Operator-visible consequence.** `meta()` is reached from `uc2ctl`
+(`main.rs:716`, `:1048`), the client engine (`engine.rs:348`, `:352`) and
+service attach (`attach.rs:77`). Running `uc2ctl status` against a node that
+restarts at that instant can PANIC instead of returning a clean error, and a
+client or service attaching at the same moment can too. The window is the
+node's re-init, so it is narrow and needs a restart to coincide with an
+attach — which is why it has gone unnoticed: it takes sustained kill/restart
+churn to hit. It is not a correctness or durability risk; nothing is written,
+and the panicking reader is the one that dies.
+
+**How it was found.** The 2026-09-08 nightly's `crashtest` job hung for its
+whole 60-minute budget and was cancelled, on the SAME commit that passed in
+1m25s the night before. Reproducing locally: the twins pass 3/3 alone (~20.5 s)
+and 3/3 as a pair (~41 s), but the full 15-test suite fails about **1 run in
+6**. With full output kept, the failing run showed three EXPECTED panics
+(`uc_service/src/apply.rs:1115`, the documented fail-stop when a node's
+`instance_id` changes — the chaos thread's own doing) and one that was not:
+`uc_log/src/cnc.rs:965`. A port-collision hypothesis was raised first and
+**refuted by measurement** — every one of the four crashtest binaries shares an
+identical bind-`:0`-then-drop probe, but instrumenting all four across six full
+runs found **0 duplicate ports in ~162 probes**.
+
+**The fix, when it is taken:** a fallible `try_meta() -> Option<CncMeta>` (or
+`Result`), with the five call sites handling a transient `None`, keeping
+`meta()` for heap-backed pages where the invariant is real. Tracked in
+`docs/BACKLOG.md`.
+
+**Still unexplained, and deliberately not claimed as fixed by the above:** the
+58-minute HANG. This panic explains the failure, not a stall — every wait in
+the test body is deadlined (30 s settle, 60 s final read). Three waits are NOT
+bounded and are the only places a 60-minute stall can live: the worker
+`join()`, the chaos `join()`, and `Reap::drop`'s `kill(); wait()`, which
+returns immediately for a SIGKILLed child unless it is in uninterruptible
+sleep. Bounding those would make the next occurrence fail fast WITH a location
+instead of consuming the nightly's whole budget and cancelling every other
+job's evidence with it — a diagnosability fix, not a cure.
+
 ### Release evidence
 
 **Both fleet gates RAN on 2026-09-07/08** — 4 × `c6id.2xlarge`, us-east-1a,
