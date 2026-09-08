@@ -197,6 +197,8 @@ Do this from a clean directory, downloading from the release page. You are
 checking the thing users will download, not the thing your runner produced.
 
 ```sh
+mkdir v2.11.0-verify && cd v2.11.0-verify
+gh release download v2.11.0 -R PeterKnego/ultima_cluster -D .   # -R: outside the repo, gh has no cwd to infer it from
 sha256sum -c SHA256SUMS --ignore-missing
 
 cosign verify-blob \
