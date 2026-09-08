@@ -858,6 +858,62 @@ regression from the features above; all three date to M6/M7.
   still applying, so the floor keeps moving during the join — a realistic
   path, deliberately left as is now that both defects are fixed.
 
+### A default `max_payload` could not carry a full schedule table (2026-09-08)
+
+**Found by the fleet gate, in the row written to look for exactly this class of
+thing.** Time-and-timers gate row e applies a `MAX_SCHEDULE_ENTRIES` table —
+the cap, deliberately, "not a plausible setting" — and every one of its 22 arms
+was refused with `schedule_decode`, *"the staged file is not a decodable
+schedule table"*, about a file that decodes perfectly.
+
+The refusal was a misnomer over a real limit. `Appender::append_cluster` checks
+`CLUSTER_BODY_PREFIX_LEN (8) + payload > max_payload`; a full table encodes to
+1064 B, so the frame body is 1072 B; and `default_max_payload` was **512**. A
+DEFAULT-configured node therefore accepted only **15** of the advertised 32
+entries and refused the rest — while `Node::apply_schedule_table` mapped
+`AppendError::PayloadTooLarge` onto `REASON_SCHEDULE_DECODE`, pointing the
+operator at their TOML when the fix was one node-local config value.
+
+The comment on that arm called the path "unreachable today" because 1064 B is
+under the payload ceiling. That reasoned about the fixed **1344 B transport
+ceiling** while the code tests `max_payload`, a **node-local runtime knob**
+whose default was less than half of it. `MAX_SCHEDULE_ENTRIES` is a cluster-wide
+compile-time constant; nothing tied the two together, so they could disagree
+silently and only a full table applied in anger would find out.
+
+Three fixes, because the default being wrong, the constants being unconnected,
+and the refusal being misnamed are separate faults:
+
+- **`max_payload`'s default is now DERIVED, never a literal.**
+  `uc_protocol::v2::datagram::max_payload_for_mtu(mtu)` is a `const fn` over the
+  transport geometry — MTU less the datagram header less `CRYPTO_OVERHEAD`,
+  floored to `FRAME_ALIGNMENT`, less `HEADER_LEN` — and `MAX_PAYLOAD_DEFAULT`
+  is that at `MTU_DEFAULT`: **1312 B** today, and **8928 B** at a 9000 B jumbo
+  MTU, which is what the main deploy targets support. The default follows the
+  path budget instead of pinning a small number a larger MTU would waste. It is
+  deliberately the crypto-SAFE figure: at 1344 (the crypto-off command ceiling)
+  a datagram needs 1416 B with crypto on, over the 1408 B MTU, so a 1344
+  default would refuse to start on exactly the clusters that enable wire
+  crypto.
+- **Startup refuses a `max_payload` that cannot carry the table, by name.**
+  `PayloadTooSmallForScheduleTable` reports the configured value, the bytes
+  needed, and how many entries this node would actually accept. It is the
+  mirror of `PayloadExceedsMtu`, which has guarded the too-BIG direction since
+  a 1 MiB default panicked `uc_net`'s sender on first boot in M9. Two
+  compile-time asserts pin the default against its own preflight, so the
+  daemon can never ship a default that refuses to boot.
+- **`REASON_SCHEDULE_TOO_LARGE` (51, `schedule_too_large`)** replaces 42 on
+  that arm, and `uc2ctl` names the real remedy: raise `max_payload` and
+  restart.
+
+**Operator impact.** A `node.toml` that pins `max_payload = 512` (as the old
+example suggested) now **refuses to start** with a named refusal telling it
+what to set. Leaving `max_payload` unset — the recommended posture — picks the
+derived default and needs no edit. `2.11.0` already requires config edits for
+`[services] names` and the `[settings]` migration, so this joins that list
+rather than adding a new class of upgrade work; the example config no longer
+pins a value.
+
 ### Breaking, and why it ships as a minor
 
 Under [the semver policy](reference/semver-policy.md) this is a real
@@ -897,14 +953,28 @@ for one release, not a standing exception — see
 
 ### Release evidence
 
-**No fleet gate has run, and every gate row below is `pending`.** No tag, no
-crates.io publish. The only measurements that exist — gate rows d and f — are
-**dev-box smoke** (2026-09-07), which under the standing rule (a dev box is not
-a bench) is not a gate result and does not adjudicate a bar; both rows
-nonetheless **miss** their bar on the box, and the gate doc's row d entry
-carries the bisect and the fix branch. Filled in when the maintainer
-green-lights the release, following the same table shape every prior release
-entry in this file uses ("What proves the release").
+**Both fleet gates RAN on 2026-09-07/08** — 4 × `c6id.2xlarge`, us-east-1a,
+head tree `d9483c2`, base tree `17d5c6b`, fleet destroyed afterwards (12
+resources, `state list` empty, an independent boto3 sweep confirming 0 live
+instances). No tag and no crates.io publish yet.
+
+**Three rows PASS, two are honest FAILs, and four could not be ADJUDICATED as
+written** — the last group for three independent *structural* reasons, not for
+want of running: a rate bar an order of magnitude below this rig's arm-to-arm
+variance, a precision bar below the pass distribution's own p99, and a
+driver-bound guard that cannot be evaluated on the commit pair its row names.
+Those are bar questions for the maintainer and are written up in the
+time-and-timers gate doc under "Open after the 2026-09-07/08 run"; **no bar was
+edited**, per the honest-failure protocol, and that was verified
+programmatically (every bar cell byte-identical to its pre-run text, 8 rows +
+4 rows).
+
+The run also found **five harness defects and one product defect**. Four of the
+harness five turned "could not read" into "is bad" and produced false failures
+or destroyed measured data; they are fixed in `bench-infra/scripts/m14_fleet_gate.py`
+and `scripts/apply_ab.sh` (commit `0ef7ddc`). The product defect is the one row
+e tripped over and is fixed in `e6c5cda` — see "A default `max_payload` could
+not carry a full schedule table" below.
 
 | what | evidence | result |
 |---|---|---|
@@ -915,13 +985,13 @@ entry in this file uses ("What proves the release").
 | the rest of the proof surface (`docs/VERIFICATION.md`): loom ×3, fuzz smoke, Lean proofs + conformance, the M10 alert-fire row | same day, same commit: loom `loom_mpsc` 4 / `loom_broadcast` 3 / `loom_frame` 2; `fuzz_smoke.sh 60 --min-runs 10000` all 23 targets clean; `lake build` 3 037 jobs; `conform` 100 000 vectors OK; `m10_alert_fire.sh` **23/23 rules PASS**, the five 2.11.0 rules (`Uc2LogTimeFrozen`, `Uc2ScheduleTableDiverged`, `Uc2SnapshotStalled`, `Uc2StandbySnapshotStalled`, `Uc2SnapshotSetDiverged`) on their synthetic scenarios | **green locally** |
 | `cargo test --workspace --doc` | run on each docs sweep, most recently plan 3's | **green** (15 doc-test targets, 1 test) — run as part of the docs sweep, not a release gate on its own |
 | the flag day's retirements | `cargo test -p uc_node --test retired` | **green** — a `git grep` pin over every symbol spec §7 retired, plus the unit test of its own excuse rule |
-| FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | pending — bars committed, no run |
-| time-and-timers gate, rows a/b/c/e (throughput, timer precision, the 32-entry table) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | pending — fleet. Bars committed, no run |
-| time-and-timers gate, **row d** — the apply-hop A/B for log time and timers (`17d5c6b` → `HEAD`, N=1 and N=2, bounded) | the same gate doc + [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) | pending — quiet host (not fleet): `apply_bench` isolates the FSM hop on one box, so this row needs only an idle host, not fleet spend. Added because this work *does* touch two hot loops (M14a's codegen lesson). The 2026-09-03 "not run: no runner" finding is **closed** — `apply_ab.sh` exists since 2026-09-07, and closing it also fixed `apply_bench`'s missing `svc_sched` ring. This pair straddles the `Appender` arity change, so the `--harness` overlay is not available on it, and its arm-cost verdict is not quotable on its own — that is row f's job (Ruling Q9; see the gate doc). **Dev-box SMOKE 2026-09-07, bar MISSED: −26.8 % at N=1 (21.15 M → 15.48 M applied frames/s, resolution 0.026 %), −26.1 % at N=2.** Not a gate — but a real regression, bisected to four inline hot-loop additions (timer core −13.7 %, a third `ApplyCtx` `Vec` −2.9 %, cluster-FSM T7 −9.8 %, T8 −2.1 %; the M14a lesson) and fixed in two passes: four arms out of line (+16.15 % vs the pre-fix main), then the loop's four per-frame callees force-inlined after `apply_cycle` outgrew LLVM's inlining budget (+3.1 % and +16.0 %) — **final smoke +1.61 % vs the baseline at N=1, +3.31 % at N=2**. Ledger in the gate doc's Results |
-| time-and-timers gate, **row f** — commanded instants under the throughput load (the one apply-loop arm coordinated snapshots add), `627eb4e` → `a64a6ed` with the harness overlay | the same gate doc + [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) | pending — quiet host (not fleet), same reason as row d. **Dev-box SMOKE 2026-09-07 (`--pairs 6`, harness overlay): N=1 −2.66 % against a 0.082 % resolution with every arm's sem below it, `outside resolution` — the bar (within resolution) is MISSED; N=2 −2.30 %, `inconclusive (noisy run)` (box not idle).** Not a gate. The `SNAPSHOT` arm itself measured free; the loss is plan-2 T8's inline cnc-slot lookup in that arm, fixed on `perf/apply-arm-slot-out-of-loop` (`34f339d`); the same day's residual pass took the whole hop back above the pre-timers baseline (row d) |
-| time-and-timers gate, **row g** — a below-floor join with the shipper restarted mid-window, scaled to the fleet | the same gate doc | pending — fleet. Bar ≤ 60 s to converge with `snapshot_installed` observed, matching the FSM-identity gate's row j |
-| time-and-timers gate, **row h** — freeze duration vs. commit stall on a 256 MiB state, all-nodes instant then `--standby` | the same gate doc | pending — fleet. The row that turns §5.7's argument into a number: the standby instant's commit gap must be ≤ the pass length measured on the day; the all-nodes gap is reported with no bar |
-| coordinated snapshots | no gate doc of its own — rows f/g/h above | pending. The three rows the feature owed now exist in the time-and-timers gate, with pre-committed bars; two (g/h) need the fleet and neither has run; row f needs only a quiet host and its dev-box smoke reading (2026-09-07) MISSES the bar at N=1 (−2.66 %, `outside resolution`; not a gate result — the fix is on `perf/apply-arm-slot-out-of-loop`) |
+| FSM identity fleet gate (rows a/b/e/j) | `docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md` | **RAN 2026-09-07.** Row b **PASS** (`pair`/`slow1` = 1.037). Row j **PASS** — joined 24.61 s against a ≤ 60 s bar, `snapshot_session_refusals()` zero on all four hosts, and satisfied in the STRICTER 5-tuple form the coordinated-snapshot work introduced (the committed bar names three counters; the code now has five, and all five read zero). Row e **reported, no bar** (lockstep 0.0223× / 0.0303× bounded). Row a is **not a regression and not adjudicable against its bar**: it read `n2eq`/`n1` = 0.539, but the same-day A/B shows the pre-flag-day baseline tree straddles the same bar on this rig (0.626–1.362 across reps), so a single-sample arm landed in a wide distribution rather than measuring a cost of identity |
+| time-and-timers gate, rows a/b/c/e (throughput, timer precision, the 32-entry table) | `docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md` | **RAN 2026-09-07/08.** Rows a, b and e: **inconclusive (noisy run)** — arm spreads 15–43 % and worst sems 12–21 % against a 1.12 % build-noise bar; `sem` falls as `1/√n`, so resolving would need ~430 reps per arm. Not a pass and not a fail. Row b's own added clause **PASSES**: `uc2_timers_late_total == 0` on every node across 54 samples under a sustained 1 000 timers/s. Row c: **FAIL (honest)** — p99 lateness 200 µs over 19 198 fires against a 1 763 ns bar, with the pre-specified diagnosis confirmed (lateness p50 ~1 µs = one pass, so the contract holds; the p99 tracks the pass-length tail, whose max reached 1.46 ms against an ~880 ns mean). Row e also missed `late == 0` with **exactly 32 late fires — one per table entry, leader-only, in all 12 arms** — which is `RowTimers::table_fire_deadline`'s documented one-catch-up-tick-per-entry, triggered by the driver anchoring entries ~8 months in the past; not a product defect |
+| time-and-timers gate, **row d** — the apply-hop A/B for log time and timers (`17d5c6b` → `HEAD`, N=1 and N=2, bounded) | the same gate doc + [`scripts/apply_ab.sh`](/scripts/apply_ab.sh) | **RAN 2026-09-07 on an idle fleet host, and INCONCLUSIVE: the row's own guard cannot be evaluated on its pair.** N=1 **+7.561 %** (head faster), N=2 **+6.554 %**, but both report `pace_stalls_unknown_arms = ["A"]` — `17d5c6b`'s `apply_bench` predates the `pace_stalls` counter, so Ruling Q9's driver-bound guard, which the gate doc calls the only guard that can tell row d's arms apart, is structurally unevaluable here. The numbers are reported bare |
+| time-and-timers gate, **row f** — commanded instants under the throughput load (the one apply-loop arm coordinated snapshots add), `627eb4e` → `a64a6ed` with the harness overlay | the same gate doc | **RAN 2026-09-07 on an idle fleet host: FAIL at both N, and the cleanest reading of the trip.** N=1 **−2.074 %** against a 0.150 % resolution (worst sem 0.078 %); N=2 **−3.294 %** against 1.571 % (worst sem 1.252 %). Both guards clear on all three arms, so unlike rows a/b/d/e this one actually resolves its bar. **Caveat that must travel with it:** the pair is pinned to commits that PREDATE the force-inlining recovery, so this is the arm's cost *as introduced*, not as it ships — a supplementary A/B from `627eb4e` to HEAD reads **+35.3 % / +40.9 %** (guards clear), i.e. the recovery more than absorbs it |
+| time-and-timers gate, **row g** — a below-floor join with the shipper restarted mid-window, scaled to the fleet | the same gate doc | **RAN 2026-09-07: PASS.** Joined at 23.07 s against a ≤ 60 s bar, with the leader restarted mid-window (the anti-vacuity clause), one `snapshot_installed`, and `uc2_snapshot_set_position` agreeing cluster-wide at 1644261696 on all four hosts. This is the residual the coordinated-snapshot spec was written to close |
+| time-and-timers gate, **row h** — freeze duration vs. commit stall on a 256 MiB state, all-nodes instant then `--standby` | the same gate doc | **RAN 2026-09-07: the all-nodes arm produced its number; the BARRED standby arm did not complete.** All-nodes: instant completed in 5.76 s, per-voter freeze max 0.164 / 0.136 / 0.164 s, and the longest commit gap was **0.0 s** — zero stalled 1 s buckets against a 1 411 356 ops/s baseline. That is the number the row exists to report, and it carries no bar. Standby: commanded, learner serving, but the instant never landed within 120.7 s and the learner never froze. Lead, not a conclusion: the learner ran ~10× behind under sustained load, and a standby instant cannot complete until the learner has APPLIED to the instant's position. The mechanism itself has four passing deterministic tests |
+| coordinated snapshots | no gate doc of its own — rows f/g/h above | **Row g PASS** (the residual the feature was written to close), **row f FAIL** (the apply-loop arm's introduction cost, since more than absorbed), **row h half-reported** (all-nodes freeze/stall measured; standby arm unresolved). The standby non-completion is an operating-envelope question rather than a broken mechanism: `a_standby_instant_freezes_only_the_learner_and_voters_applied_keep_moving`, the learner-only guard and the superseded-instant case all pass |
 | cluster FSM | no gate doc of its own | **n/a by design** — the fifth agent's frames are operator-rate, and its one hot-path addition is a single `Acquire` load of the view's position word per consensus duty cycle, compared against a shadow, with the view's mutex taken only on a pass where that position moved. A row belongs in the time-and-timers gate's throughput arm when that gate is run |
 | artifact integrity (`sha256sum -c`) | — | pending |
 | artifact provenance (`cosign verify-blob`) | — | pending |

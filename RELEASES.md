@@ -9,12 +9,14 @@ analyses, wire-version mechanics, upgrade remedies — is
 
 ## Unreleased — FSM identity, log time, the cluster FSM, and coordinated snapshots (next minor, 2.11.0 when cut)
 
-**Implemented; release on hold pending further changes.** This section is a
-draft, written ahead of the tag so the writeup is ready when the maintainer
+**Implemented, and both fleet gates have now RUN (2026-09-07/08).** This
+section is written ahead of the tag so the writeup is ready when the maintainer
 green-lights it — see
-[the release-evidence table](docs/releases.md#release-evidence) for what is
-verified so far and what still says "pending". **No version has been
-tagged, and no fleet gate has run.**
+[the release-evidence table](docs/releases.md#release-evidence) for every row's
+result. **No version has been tagged yet.** Three gate rows pass, two are
+recorded as honest failures, and four could not be adjudicated against bars
+that turned out to be unreachable as written; none of the four describes a
+defect in what ships, and no bar was edited to fit a result.
 
 Five features share this release, because all five landed before it was
 cut, and all five are on the same wire `0.7.0` / cnc `3.1` flag day: FSM
@@ -254,6 +256,20 @@ schedule table an operator applies with one command.
   adopts the new floor, the same wipe-and-rejoin posture `NoCommonPrefix`
   takes.
   → [Change cluster membership § pair with snapshots](docs/how-to/change-cluster-membership.md#before-you-start-pair-with-snapshots-if-you-write-continuously)
+- **A default node could not apply a full schedule table, and said the wrong
+  thing about it.** `max_payload`'s default (512 B) was smaller than a
+  32-entry table needs (1072 B), so a stock node accepted only 15 of the
+  advertised `MAX_SCHEDULE_ENTRIES` and refused the rest as
+  `schedule_decode` — "the staged file is not a decodable schedule table" —
+  about a file that was perfectly valid. `max_payload` is now **derived from
+  the path budget** rather than being a fixed number (1312 B at the built-in
+  MTU, and ~8928 B on a jumbo-frame path), the node **refuses at startup, by
+  name**, if a configured value cannot carry the table, and the refusal an
+  operator sees is now `schedule_too_large`, naming `max_payload` as the
+  remedy. If your `node.toml` pins `max_payload = 512`, remove the line or
+  raise it — the node will tell you exactly what to set. Full analysis in
+  [the engineering record](docs/releases.md).
+
 - **A second FSM row no longer fail-stops when its snapshot sits above the
   set's floor.** A two-row snapshot set is adopted at the lower of its rows'
   positions, so the other row's artifact is briefly above what the node has
@@ -333,32 +349,44 @@ schedule table an operator applies with one command.
 
 **Performance**
 
-- **Not measured yet.** Two gate skeletons carry pre-committed bars with
-  empty results, per the honest-failure protocol.
-  FSM identity's hot path is untouched — every change is at config load,
-  attach, and the snapshot-session boundary — so its expected delta is null:
-  → [FSM identity gate skeleton](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md).
-  Log time and timers **does** add to two hot loops (one clock read and one
-  heap peek per leader pass; a `time_ns`/`term` fill and a `TIMER` branch per
-  applied frame), so its gate carries an isolated apply-hop A/B alongside the
-  throughput rows, because M14a proved that code added to a hot loop's body
-  can cost even on paths that never run, plus a row that runs a full 32-entry
-  schedule table under the throughput load:
-  → [Time-and-timers gate skeleton](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md).
-  The cluster FSM has **no gate doc of its own**: it adds a fifth polling
-  agent whose frames are operator-rate (a reconfiguration, a table, a settings
-  change — not traffic), and its one hot-path addition is a single `Acquire`
-  load of the published view's position word per consensus duty cycle, compared
-  against a shadow, with the mutex behind the view taken only on a pass where
-  that position actually moved. A row for it belongs in the time-and-timers
-  gate's throughput arm when that gate is run.
-  Coordinated snapshots have no gate doc of its own either, and needs three
-  rows in that same arm when it runs: commanded instants under the throughput
-  load (the cost of the extra apply-loop arm, A/B'd per M14a), a below-floor
-  join with the shipper restarted mid-window, and — the one that turns §5.7's
-  argument into a number — **freeze duration vs. commit stall** on a
-  deliberately large state, for an all-nodes instant and then the same instant
-  `--standby`.
+- **Measured on a fleet, 2026-09-07/08, and the honest answer is mixed.** Both
+  gates ran on 4 × `c6id.2xlarge`. The results in one line each, with every
+  bar left exactly as it was pre-committed:
+  → [FSM identity gate](docs/benchmarks/uc2-fsm-identity-gate-2026-09-02.md),
+  → [time-and-timers gate](docs/benchmarks/uc2-time-and-timers-gate-2026-09-03.md).
+
+- **What passed.** The two-FSM learner join over the new wire converges in
+  **24.61 s** against a ≤ 60 s bar with zero snapshot-session refusals on any
+  host; the bounded pair still converges to its slow FSM (1.037); and a
+  below-floor join whose shipper is **restarted mid-window** converges in
+  **23.07 s** with the snapshot set agreeing cluster-wide — the residual
+  coordinated snapshots were designed to close.
+
+- **What a coordinated snapshot actually costs, measured.** An all-nodes
+  instant over a **256 MiB** state froze each voter for ~**164 ms** and
+  produced **zero stalled seconds** of commit against a 1.4 M ops/s baseline.
+  That is the number the row exists to report and it carries no bar. The
+  `--standby` arm of the same row did not complete on a learner running far
+  behind the write rate, which is an operating-envelope fact worth knowing: a
+  standby instant freezes at a log position, so it completes only once the
+  learner has applied to that position.
+
+- **Timer precision missed its bar, and the reason is scheduling, not timers.**
+  Median lateness was ~**1 µs** — about one consensus pass, which is the
+  contract working — while the p99 tracked the pass-length *tail*. The bar was
+  also unreachable as written (it compares a p99 against twice a mean, and the
+  pass distribution's own p99 already exceeds it), so it is recorded as a
+  failure and left standing for the maintainer to restate rather than quietly
+  adjusted.
+
+- **Throughput could not be adjudicated.** The rate rows are null bars against
+  build noise (1.12 % on the day), but this rig's arm-to-arm spread was
+  15–43 %; resolving that bar would need roughly 430 repetitions per arm, so
+  the rows are recorded `inconclusive` — not a pass and not a fail. The
+  apply-hop A/B did resolve cleanly and shows the one arm coordinated
+  snapshots add cost **−2.1 %** when introduced, against a supplementary
+  measurement of **+35 %** from that same commit to what ships — the
+  force-inlining work done since more than absorbs it.
 
 ## v2.10.0 — 2026-08-31
 
