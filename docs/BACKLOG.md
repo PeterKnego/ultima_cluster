@@ -1,26 +1,20 @@
 # Backlog — candidate directions after M14
 
-## `CncPage::meta()` must not panic on a page a live writer re-initialised
+## Bound the three unbounded waits in `remote_lin.rs`
 
 **Added 2026-09-08**, from the fleet-gate follow-up (see `docs/releases.md`,
-"Known issue at release"). `meta()` `.expect()`s a valid header on an mmap
-another process owns and re-initialises on restart, so `uc2ctl status`, a
-client attach or a service attach can PANIC instead of erroring. `open_file`
-validates at open and documents the right posture ("a typed error, never a
-panic"), but a shared mapping can change under the reader afterwards, so
-open-time validation cannot close it.
+"Known issue at release"). The worker `join()`, the chaos `join()` and
+`Reap::drop`'s `kill(); wait()` in `examples/uc_crashtest/tests/remote_lin.rs`
+are the only waits in that test body without a deadline, and so the only places
+a 60-minute stall can live. They are why the 2026-09-08 nightly spent its whole
+budget and was cancelled instead of failing fast — that run took every other
+nightly job's evidence down with it. Bounding them is a **diagnosability** fix:
+the next occurrence fails with a location instead of a cancellation.
 
-Fix: `try_meta() -> Option<CncMeta>`; handle a transient `None` at
-`uc_ctl/src/main.rs:716` and `:1048`, `uc_client/src/engine.rs:348` and `:352`,
-and `uc_service/src/attach.rs:77`; keep `meta()` for heap-backed pages, where
-the invariant is real. Reproduce with `cargo test -p uc_crashtest --features
-hard-crash-tests` — roughly 1 run in 6 on a 32-thread box.
-
-**Worth pairing with:** bounding the three unbounded waits in
-`examples/uc_crashtest/tests/remote_lin.rs` (worker `join()`, chaos `join()`,
-`Reap::drop`'s `kill(); wait()`). They are why the 2026-09-08 nightly spent its
-whole 60-minute budget and was cancelled instead of failing fast — that run
-took every other nightly job's evidence down with it.
+This was the second half of the `CncPage::meta()` item; the first half is
+fixed — see the [Shipped](#shipped-since-this-list-was-written) section's
+first entry. Fixing the panic does **not** explain the hang, and was never claimed
+to — that is exactly why this half stays open.
 
 *Written 2026-09-01 against `v2.10.0`. Status: a ranked list of options, not
 a plan. Nothing here is scheduled; the maintainer picks. Every item cites the
@@ -325,8 +319,33 @@ without a new argument:
 ## Shipped since this list was written
 
 Kept per this page's preamble — an item that is taken up gets its line updated
-rather than deleted, so the reasoning stays re-checkable. Both of these are in
-`2.11.0`; what remains open from them is item 2 above.
+rather than deleted, so the reasoning stays re-checkable. The last two are in
+`2.11.0` and the first in `2.12.0`; what remains open from them is item 2
+above, plus the `remote_lin.rs` waits at the top of this page.
+
+### `CncPage::meta()` must not panic on a page a live writer re-initialised — FIXED for `2.12.0`
+
+Taken up and fixed 2026-09-09, after `2.11.0` shipped it as a recorded known
+issue. `meta()` `.expect()`ed a valid header on an mmap another process owns
+and re-initialises on restart, so `uc2ctl`, a client attach, a service attach
+or the gateway could PANIC instead of erroring. `open_file` validates at open
+and documents the right posture ("a typed error, never a panic"), but a shared
+mapping changes under the reader afterwards, so open-time validation cannot
+close it.
+
+Fixed by **replacing** `meta()` with `try_meta() -> Option<CncMeta>` rather
+than adding a twin beside it — permitted in a minor because
+[the semver policy](reference/semver-policy.md) lists `uc_log`'s `cnc` module
+as not promised, and preferred because a surviving `meta()` is a loaded call
+the next production caller can reach for. Six call sites, not the five this
+list named: `uc_gateway/src/edge.rs` reads `max_payload` the same way and was
+missed. The three attach doors answer `None` with `CncError::BadHeader`;
+`uc2ctl` refuses admin signing by name and skips its leftover-page
+cross-check. Pinned by a test that forces the torn window deterministically
+instead of waiting on the ~1-in-6 crashtest race.
+
+Record: `docs/releases.md`, "Known issue at release" → its **FIXED after the
+tag** paragraph.
 
 ### FSM identity — name the state machine, not the slot (was item 2)
 

@@ -1053,6 +1053,27 @@ runs found **0 duplicate ports in ~162 probes**.
 `meta()` for heap-backed pages where the invariant is real. Tracked in
 `docs/BACKLOG.md`.
 
+**FIXED after the tag, on `main`, for `2.12.0`.** `meta()` is gone and
+`try_meta() -> Option<CncMeta>` replaces it — a signature change, not an
+additive twin, which `docs/reference/semver-policy.md` permits because
+`uc_log`'s `cnc` module is in the "not promised" table. Deleting the
+panicking method rather than parking it beside a safe one is the point: a
+`meta()` left in place is a loaded call the next production caller can reach
+for, and no type would stop them. Every call site now handles `None` — the
+three attach doors (`uc_client::Engine::attach`, `uc_service::attach`,
+`uc_gateway::Edge::start`) with the same `CncError::BadHeader` they would
+have raised had the page been torn at open time, `uc2ctl`'s admin signing
+with a named "the node is restarting — retry" refusal, and `uc2ctl`'s
+leftover-page cross-check by skipping the check, matching the posture its own
+`Err(e)` arm already had for an unreadable page. The record above counts five
+call sites; there were **six** — `uc_gateway/src/edge.rs:785` reads
+`max_payload` off the page the same way, and was missed. Pinned by
+`try_meta_reports_a_header_rewritten_under_the_reader` in `uc_log/src/cnc.rs`,
+which forces the window deterministically (zero the magic through a second fd
+on the shared mapping, after a successful `open_file`) rather than waiting on
+the ~1-in-6 race; against the old `meta()` that test panics at
+`uc_log/src/cnc.rs:965`, which was watched before the fix was written.
+
 **Still unexplained, and deliberately not claimed as fixed by the above:** the
 58-minute HANG. This panic explains the failure, not a stall — every wait in
 the test body is deadlined (30 s settle, 60 s final read). Three waits are NOT

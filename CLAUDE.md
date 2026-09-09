@@ -17,15 +17,16 @@ code.
 **Current version: `2.11.0`** — tagged 2026-09-08 at `ff0f5b6`: FSM identity,
 log time and timers, the replicated schedule table, the cluster FSM, and
 coordinated snapshot instants, one flag day (wire `0.6.0` → `0.7.0`, cnc
-`3.0` → `3.1`). **The crates.io publish is the remaining step** (`cut-a-release.md`
-§6, `uc_service` now before `uc_node`); until it runs the newest crates.io
-version is `2.10.0`. Both fleet gates ran 2026-09-07/08 and every row is
+`3.0` → `3.1`). All 13 crates published to crates.io the same
+day (`cut-a-release.md` §6, `uc_service` now before `uc_node`), so `2.11.0`
+is the newest crates.io version. Both fleet gates ran 2026-09-07/08 and every row is
 recorded in its gate doc with no bar moved: three PASS, two honest FAIL (timer
 precision — bar since restated; the coordinated-snapshot arm's introduction
 cost, since absorbed), four inconclusive (rate bars an order of magnitude below
 the rig's variance — the driver now judges paired deltas). The known issue
-shipped as recorded: `CncPage::meta()` can panic on a page a restarting node
-rewrites (`docs/BACKLOG.md`). `2.10.0` was one log stream, `UC2_*` env
+shipped as recorded — `CncPage::meta()` can panic on a page a restarting node
+rewrites — and is **fixed on `main` for `2.12.0`** (`meta()` replaced by a
+fallible `try_meta()`; `docs/BACKLOG.md` § Shipped). `2.10.0` was one log stream, `UC2_*` env
 overrides, `uc_obs`, the `ultima_db` removal and the Broadcast-ring
 memory-ordering fix; `2.9.0` the `uc_*` crate rename.
 **M14c2 is the last feature milestone; milestones M1–M14 are all complete**, each
@@ -63,17 +64,16 @@ rate-limit note is now measured on both runs: crates.io limits **new crate
 names** hard and new *versions* barely at all, so `2.9.0`'s twelve new
 names took 62 minutes and `2.10.0`'s one took 59 seconds.)
 
-Next up, now that `2.11.0` is tagged: (1) the crates.io publish
-(`cut-a-release.md` §6); (2) `docs/BACKLOG.md`'s newest item — make
-`CncPage::meta()` fallible (it panics on a page a restarting node rewrites;
-reachable from `uc2ctl`, client and service attach) and bound the three
+Next up, now that `2.11.0` is tagged and published: (1) bound the three
 unbounded waits in `examples/uc_crashtest/tests/remote_lin.rs` that turned a
-flaky failure into a 58-minute nightly hang on 2026-09-08; (3) `2.12.0`, which
+flaky failure into a 58-minute nightly hang on 2026-09-08 — the open half of
+`docs/BACKLOG.md`'s newest item, whose other half (`CncPage::meta()`) is
+fixed on `main`; (2) `2.12.0`, which
 carries the monotonic log clock (`uc_node::log_clock`, spec
 `docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md`; fleet
 A/B pre-committed, unrun) and is the natural home for **jumbo frames** —
 raising `MTU_DEFAULT` is a wire
-flag day, so it pairs with whatever else moves the wire; (4) a fleet re-run of
+flag day, so it pairs with whatever else moves the wire; (3) a fleet re-run of
 the time-and-timers rows a/b/e under the paired statistic, and of row c under
 its restated bar. The cluster FSM / coordinated snapshots spec is
 `docs/superpowers/specs/2026-09-05-uc2-cluster-fsm-and-coordinated-snapshot-design.md`

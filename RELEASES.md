@@ -17,6 +17,15 @@ analyses, wire-version mechanics, upgrade remedies — is
   appender.
   [Explainer](docs/notes/uc2-log-time-and-timers-explained.md#the-log-clock),
   [spec](docs/superpowers/specs/2026-09-08-uc2-monotonic-log-clock-design.md).
+- **Fixed: attaching to a restarting node could panic instead of refusing.**
+  `uc2ctl`, a client `Engine::attach`, a service attach and the gateway all
+  decoded the cnc page's header through a method that `expect`ed it to be
+  valid — but a restarting node re-initialises that page underneath every
+  attached reader, so the decode could land on a torn header and abort the
+  process. It is now fallible (`CncPage::try_meta`), and each caller answers
+  with the typed refusal it would have given had the page been bad at open
+  time. Recorded as a known issue at
+  [2.11.0](docs/releases.md#known-issue-at-release-cncpagemeta-panics-on-a-page-a-live-writer-re-initialised).
 - **Performance:** the fleet A/B (`m14_fleet_gate.py` rows a/b/e, this tree
   vs its pre-change parent commit) is **pre-committed and not yet run** —
   [the gate doc](docs/benchmarks/uc2-log-clock-gate-2026-09-08.md).
