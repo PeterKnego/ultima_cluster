@@ -207,6 +207,31 @@ Means: base (runs 1/4/5) = (183 285 + 176 806 + 169 493) / 3 = **176 528**;
 head (runs 2/3/6) = (184 208 + 177 569 + 176 593) / 3 = **179 456.67**.
 **Ratio head/base = 1.01659 (+1.66 %) — dev-box smoke, not a gate.**
 
+**Re-run on the final HEAD, 2026-09-09.** The six runs above measured
+`589451b`; the final-review fix wave (`9a55595`) landed after them and does
+touch the hot path (`retired()` gained a `smear == 0` early-out; `wall_at`
+lost a debug-only store), so the smoke was repeated against the SAME base
+binary (sha256 `6622f165…`, unchanged on disk) with `f5e0907` built into
+`$HOME/.cache/cargo-target-logclock-head` (sha256
+`7ed8c21a7b777f244120ae3bde8a457d0a76bb980102da13a423574f85f7410b`), same
+order base/head/head/base/base/head, `--secs 8`, idle box:
+
+| run | arm | responses/s |
+|---|---|---|
+| 1 | base | 183 310 |
+| 2 | head `f5e0907` | 169 389 |
+| 3 | head | 179 570 |
+| 4 | base | 154 197 |
+| 5 | base | 175 390 |
+| 6 | head | 175 076 |
+
+Means: base **170 966** (spread 154 197–183 310, a 17 % band); head
+**174 678** (spread 169 389–179 570).
+**Ratio head/base = 1.02172 (+2.17 %) — dev-box smoke, not a gate.** The
+delta sits inside the base arm's own spread; it is consistent with the
+2.2 % ceiling and equally consistent with zero, which is the reading the
+first run gave. Per-run logs: `$HOME/scratch/logclock-smoke2-logs/`.
+
 **Dev-box smoke, not a gate.** Per CLAUDE.md's standing rule, this number is
 reported and carries no bar — a dev box's own dip has been measured 7× to
 span 0–18 % against a real 10 % bar, and a +1.66 % reading here is well
