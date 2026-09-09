@@ -209,7 +209,7 @@ fn service_applies_committed_frames_and_publishes_responses() {
         1,
         "first incarnation bumps service_epoch 0 -> 1"
     );
-    assert_eq!(svc.instance_id(), cnc.meta().instance_id);
+    assert_eq!(svc.instance_id(), cnc.try_meta().unwrap().instance_id);
 
     svc.stop();
     node.stop();

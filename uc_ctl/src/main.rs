@@ -713,7 +713,15 @@ fn signed_admin_request(
         Some(key) => {
             let expiry_ns =
                 unix_ns().saturating_add(common.admin_ttl_secs.saturating_mul(1_000_000_000));
-            let meta = cnc.meta();
+            // The node rewrites this page in place on restart, so it can tear
+            // between `open`'s validation and here. Refuse by name rather than
+            // panicking — and rather than signing a request against a torn
+            // instance_id the node would reject anyway.
+            let meta = cnc.try_meta().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cnc2.dat header is being rewritten (the node is restarting) — retry"
+                )
+            })?;
             let msg = AdminMessage {
                 app_id: &meta.app_id,
                 instance_id: meta.instance_id,
@@ -1045,7 +1053,18 @@ fn check_leftover_cnc_matches(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
     }
     match CncPage::open_file(&cnc_path, &a.app_id) {
         Ok(cnc) => {
-            let leftover_id = cnc.meta().node_id;
+            // Same posture as the `Err(e)` arm below: a page we cannot decode
+            // (here, one torn by a live node rewriting it) skips the
+            // cross-check rather than panicking or refusing outright.
+            let Some(leftover) = cnc.try_meta() else {
+                println!(
+                    "note: leftover cnc2.dat in {:?} is being rewritten — skipping the \
+                     --node-id/--app-id cross-check",
+                    a.instance_dir
+                );
+                return Ok(());
+            };
+            let leftover_id = leftover.node_id;
             if leftover_id != a.node_id {
                 anyhow::bail!(
                     "refusing: leftover cnc2.dat in {:?} belongs to node_id {leftover_id}, not \

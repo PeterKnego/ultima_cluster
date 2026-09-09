@@ -395,7 +395,7 @@ fn admin_request(
             corrupt_tag,
             expiry_override,
         } => {
-            let meta = cnc.meta();
+            let meta = cnc.try_meta().unwrap();
             let expiry_ns = expiry_override.unwrap_or_else(|| unix_ns() + ttl.as_nanos() as u64);
             let m = AdminMessage {
                 app_id: &meta.app_id,
@@ -815,7 +815,7 @@ fn a_replayed_request_cannot_be_re_presented() {
 /// `pwrite`n straight into `cnc2.dat`. That is exactly the write an attacker
 /// with directory access can make, and it is coherent with the node's
 /// `MAP_SHARED` mapping of the same file; the assertion right after it
-/// (`cnc.meta().instance_id`) proves the forgery actually landed, so a test
+/// (`cnc.try_meta().unwrap().instance_id`) proves the forgery actually landed, so a test
 /// that quietly failed to forge anything cannot pass by accident. No crc is
 /// recomputed — deliberately: `read_cnc_header` (what `meta()` uses) checks
 /// only the magic, which is the whole reason this was reachable.
@@ -828,7 +828,7 @@ fn a_capture_replayed_after_a_restart_is_refused() {
     let key = test_key();
 
     let cnc = open_cnc(&dir);
-    let captured_instance_id = cnc.meta().instance_id;
+    let captured_instance_id = cnc.try_meta().unwrap().instance_id;
 
     // 1. A real, accepted, signed request — the bytes the attacker captures.
     //    The capture is signed with the rig's default TTL (`TTL`, 30 s), and
@@ -869,7 +869,7 @@ fn a_capture_replayed_after_a_restart_is_refused() {
     let leader = await_single_leader(&c.nodes, 20);
     let cnc = open_cnc(&dir);
     assert_ne!(
-        cnc.meta().instance_id,
+        cnc.try_meta().unwrap().instance_id,
         captured_instance_id,
         "setup: a restart must re-randomize instance_id"
     );
@@ -878,7 +878,7 @@ fn a_capture_replayed_after_a_restart_is_refused() {
     // 3. The forgery: put the CAPTURED instance_id back on the page.
     forge_instance_id(&dir, captured_instance_id);
     assert_eq!(
-        cnc.meta().instance_id,
+        cnc.try_meta().unwrap().instance_id,
         captured_instance_id,
         "the raw header write did not land — this test would prove nothing"
     );

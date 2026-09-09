@@ -74,7 +74,9 @@ pub(crate) fn attach<S: RawStateMachine>(
     // 1. Open + validate the cnc page (magic/crc/version/app_id). Capture the
     //    node's per-boot instance_id (a fresh id invalidates a stale attach).
     let cnc = CncPage::open_file(&dir.join("cnc2.dat"), &cfg.app_id)?;
-    let meta = cnc.meta();
+    // A restarting node rewrites this page in place, so it can tear between
+    // `open_file`'s validation and this decode — refuse, never panic.
+    let meta = cnc.try_meta().ok_or(uc_log::cnc::CncError::BadHeader)?;
     let instance_id = meta.instance_id;
 
     // 1b. Find our row BY NAME (spec §4.3). A harness page (`none_for_tests`:

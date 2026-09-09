@@ -782,7 +782,10 @@ impl Edge {
         // the ingress ring (spec §4.3).
         let cnc = CncPage::open_file(&cfg.instance_dir.join(CNC_FILE), &cfg.app_id)
             .map_err(|e| EdgeError::Attach(ClientError::from(e)))?;
-        let max_payload = cnc.meta().max_payload as usize;
+        let max_payload = cnc
+            .try_meta()
+            .ok_or_else(|| EdgeError::Attach(ClientError::from(uc_log::cnc::CncError::BadHeader)))?
+            .max_payload as usize;
         drop(cnc);
 
         let (send, poll) = Engine::attach(

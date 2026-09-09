@@ -958,12 +958,24 @@ impl CncPage {
         page_mut[48..64].fill(0);
     }
 
-    /// Decode the header + app_id back into an owned `CncMeta`.
-    pub fn meta(&self) -> CncMeta {
+    /// Decode the header + app_id back into an owned `CncMeta`, or `None` when
+    /// the header does not currently read as a valid v2 cnc page.
+    ///
+    /// **Fallible on purpose, and it must stay that way.** For a file-backed
+    /// page this maps memory ANOTHER process owns: a restarting node
+    /// re-initialises the page in place (see [`Self::create_file`]'s doc), so a
+    /// reader that passed `open_file`'s validation can still observe a zeroed or
+    /// half-written header microseconds later. Open-time validation cannot close
+    /// that — the bytes change after the check — so this returns `None` for the
+    /// torn window rather than panicking, exactly as [`Self::try_instance_id`]
+    /// has since M5. Callers treat `None` as "the node is restarting": a typed
+    /// refusal at an attach door, a re-probe on a polling path — never an
+    /// `unwrap` outside tests, where the page is heap-backed and the invariant
+    /// is real.
+    pub fn try_meta(&self) -> Option<CncMeta> {
         let page = self.page();
-        let header = cnc::read_cnc_header(page)
-            .expect("cnc page header must be valid after construction (init/validate ran)");
-        CncMeta {
+        let header = cnc::read_cnc_header(page)?;
+        Some(CncMeta {
             node_id: header.node_id,
             instance_id: header.instance_id,
             app_id: cnc::read_cnc_app_id(page).to_string(),
@@ -973,7 +985,7 @@ impl CncPage {
             // `None` — `init` already wrote real names before this page was
             // ever readable, so lying here would be actively wrong.
             services: self.service_names(),
-        }
+        })
     }
 
     /// Non-panicking `instance_id` read straight off the header bytes — a cheap
@@ -1053,7 +1065,7 @@ mod tests {
             ..test_meta()
         };
         let fresh = CncPage::create_file(tmp.path(), &meta2).unwrap();
-        assert_eq!(fresh.meta().instance_id, 0xA5A5_0000_1111_2222);
+        assert_eq!(fresh.try_meta().unwrap().instance_id, 0xA5A5_0000_1111_2222);
         assert_eq!(fresh.counters().append.load_acquire(), 0);
         assert_eq!(fresh.counters().commit.load_acquire(), 0);
         assert_eq!(fresh.status().flags.load_acquire(), 0);
@@ -1293,7 +1305,7 @@ mod tests {
         let page = CncPage::create_file(&p, &meta).unwrap();
         page.counters().append.store_release(4096);
         let re = CncPage::open_file(&p, "kv").unwrap();
-        assert_eq!(re.meta().instance_id, meta.instance_id);
+        assert_eq!(re.try_meta().unwrap().instance_id, meta.instance_id);
         assert_eq!(
             re.counters().append.load_acquire(),
             4096,
@@ -1380,9 +1392,41 @@ mod tests {
             services: [None; CNC_MAX_SERVICES],
         };
         let page = CncPage::heap(&meta);
-        let out = page.meta();
+        let out = page.try_meta().unwrap();
         assert_eq!(out, meta);
         assert_eq!(out.app_id.len(), 63);
+    }
+
+    /// A node RESTART re-initialises this page IN PLACE under every attached
+    /// reader (`create_file`'s documented torn-header window), so a reader can
+    /// observe a zeroed / half-written header at any moment AFTER a successful
+    /// `open_file`. Decoding it must report the header as absent, never panic —
+    /// the same posture `try_instance_id` has had since M5. Open-time
+    /// validation cannot close this: the bytes change after the check.
+    #[test]
+    #[cfg_attr(miri, ignore)] // real cnc file, mmap'd
+    fn try_meta_reports_a_header_rewritten_under_the_reader() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cnc2.dat");
+        let _writer = CncPage::create_file(&p, &test_meta()).unwrap();
+        let reader = CncPage::open_file(&p, "test-app").unwrap();
+        assert_eq!(
+            reader.try_meta().unwrap().instance_id,
+            test_meta().instance_id,
+            "a valid page still decodes"
+        );
+
+        // The restarting node zeroes the header in place; the mapping is
+        // shared, so this reader sees it mid-rewrite.
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.write_at(&[0u8; 8], cnc::CNC_OFF_MAGIC as u64).unwrap();
+
+        assert!(
+            reader.try_meta().is_none(),
+            "a torn header must decode as None, not panic"
+        );
     }
 
     #[test]

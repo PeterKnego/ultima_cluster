@@ -75,7 +75,7 @@ pub struct EngineConfig {
     /// Client-side payload cap, checked before the ring write so an oversized
     /// submit fails loud here instead of being silently dropped downstream.
     /// `None` (the default) INHERITS the attached node's own bound —
-    /// `cnc.meta().max_payload` — at `Engine::attach` time; `Some(n)` is an
+    /// `cnc.try_meta().max_payload` — at `Engine::attach` time; `Some(n)` is an
     /// explicit override. Inheriting matters because the node's bound is
     /// typically MTU-bounded (a few hundred bytes — well under the ring's own
     /// ~64 KiB `TooLarge` ceiling): without it, a submit that clears the
@@ -345,11 +345,16 @@ impl Engine {
     ) -> Result<(SendHalf, PollHalf), ClientError> {
         let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)?;
         let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
-        let instance_id = cnc.meta().instance_id;
+        // The page validated at `open_file`, but it is memory the node owns and
+        // re-initialises in place on restart — so it can go torn between that
+        // check and this decode. Refuse with the same typed error `open_file`
+        // would have raised rather than panicking the attaching process.
+        let meta = cnc.try_meta().ok_or(uc_log::cnc::CncError::BadHeader)?;
+        let instance_id = meta.instance_id;
         // Door default: explicit `Some` overrides; `None` inherits the
         // attached node's own bound from the cnc page (see EngineConfig::
         // max_payload's doc for why this matters).
-        let max_payload = cfg.max_payload.or(Some(cnc.meta().max_payload as usize));
+        let max_payload = cfg.max_payload.or(Some(meta.max_payload as usize));
         let (ingress, _ic) = MpscRing::open(&instance_dir.join(INGRESS_RING))?.into_split();
         let (query, _qc) = MpscRing::open(&instance_dir.join(QUERY_RING))?.into_split();
         // M14b: which FSMs exist here. A page reading 0 is a harness node
