@@ -15,7 +15,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -30,7 +30,7 @@ use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_PROBE,
     DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_REDIRECT, DatagramHeader,
-    MTU_DEFAULT, PROBE_RUNG_LEN, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
+    MTU_BOUND, MTU_DEFAULT, PROBE_RUNG_LEN, SNAP_BEGIN_FIXED_LEN, SNAP_BEGIN_LAYOUT_V4,
     SNAP_REDIRECT_BODY_LEN, SnapBeginBody, SnapRedirectBody, SnapRequestBody,
     write_datagram_header, write_probe_rung, write_snap_begin_body, write_snap_redirect_body,
 };
@@ -588,6 +588,12 @@ pub struct Sender {
     /// Jumbo spec §5.1: the discovery ledger shared with the receiver and
     /// the node. `None` = this sender does not probe (harness senders).
     probe: Option<Arc<ProbeTable>>,
+    /// Jumbo spec §7.1: the COMMITTED datagram rung, published by the node's
+    /// consensus agent (`Node`'s `live_mtu` cell) and read once per budget
+    /// computation. `None` in unit tests and in any embedding that never
+    /// wires one, where `cfg.mtu` stands in — the pre-jumbo behaviour,
+    /// byte-for-byte.
+    live_mtu: Option<Arc<AtomicUsize>>,
 }
 
 /// M8 (Task 17): everything the SEND path needs to run with crypto on, taken
@@ -710,9 +716,9 @@ impl Sender {
             align_frame_len(HEADER_LEN + buffer.max_payload())
                 + DATAGRAM_HEADER_LEN
                 + cfg.crypto_overhead()
-                <= cfg.mtu,
-            "a max-size frame (+ crypto overhead, if enabled) must fit one datagram \
-             (raise mtu — the jumbo-frame knob)"
+                <= MTU_BOUND,
+            "a max-size frame (+ crypto overhead, if enabled) must fit one datagram at the \
+             top rung (MTU_BOUND) — the buffer's max_payload is the bound, jumbo spec §7.2"
         );
         // Voting followers pace commit; learners are fanned-out to but never enter
         // `limit()`.
@@ -732,8 +738,11 @@ impl Sender {
             ctrl,
             cfg,
             sent,
-            run: Vec::with_capacity(cfg.mtu),
-            scratch: Vec::with_capacity(cfg.mtu),
+            // Sized for the TOP rung, not for `cfg.mtu`: the live rung can be
+            // raised under a running sender (jumbo spec §7.1) and a Vec that
+            // has to grow mid-pass is a reallocation on the hot path.
+            run: Vec::with_capacity(MTU_BOUND),
+            scratch: Vec::with_capacity(MTU_BOUND),
             naks: VecDeque::new(),
             last_status: HashMap::new(),
             base: Instant::now(),
@@ -757,6 +766,7 @@ impl Sender {
             peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
             peer_ids_src,
             probe: None,
+            live_mtu: None,
         }
     }
 
@@ -817,6 +827,27 @@ impl Sender {
     /// peer set is the node's to maintain (`ProbeTable::set_peers`).
     pub fn set_probe_table(&mut self, table: Arc<ProbeTable>) {
         self.probe = Some(table);
+    }
+
+    /// Jumbo spec §7.1: the cell the node's consensus agent publishes the
+    /// COMMITTED datagram rung into. Wired at boot, before the sender agent
+    /// spawns; unwired, every budget falls back to `cfg.mtu`.
+    pub fn set_live_mtu(&mut self, live_mtu: Arc<AtomicUsize>) {
+        self.live_mtu = Some(live_mtu);
+    }
+
+    /// The datagram body budget this pass: the LIVE rung (jumbo spec §7.1)
+    /// when the node wired one, else `cfg.mtu`, less the header and the
+    /// crypto tag. `read_run_validated` copies a first frame even when it is
+    /// larger than this, so a frame the committed ceiling admitted is sent
+    /// alone, never split and never withheld.
+    fn budget(&self) -> usize {
+        let mtu = self
+            .live_mtu
+            .as_ref()
+            .map(|m| m.load(Ordering::Relaxed))
+            .unwrap_or(self.cfg.mtu);
+        mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead()
     }
 
     fn now_ns(&self) -> u64 {
@@ -1079,7 +1110,7 @@ impl Sender {
         let limit = self.flow.limit();
         // M8: shrunk by crypto_overhead() when crypto is on, so a run's body
         // plus the counter+tag `assemble`/`seal_scratch` add never exceeds mtu.
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
+        let budget = self.budget();
         let mut dgrams = 0;
         while dgrams < self.cfg.dgrams_per_cycle && self.sent < append && self.sent < limit {
             // don't read more than the flow limit allows in one datagram
@@ -1284,7 +1315,7 @@ impl Sender {
     /// Retransmit [pos, pos+len) to ONE follower, MTU chunk by MTU chunk.
     /// `len` is capped by the follower (Task 8), so this is bounded work.
     fn serve_nak(&mut self, to: SocketAddr, pos: u64, len: u32) {
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
+        let budget = self.budget();
         let end = pos + len as u64;
         let mut p = pos;
         while p < end {
@@ -1354,7 +1385,7 @@ impl Sender {
         // and scope is decided by kind, never by destination or by which
         // source — ring or journal — served it), so this budget shrinks by
         // crypto_overhead() exactly like serve_nak's ring-path budget above.
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
+        let budget = self.budget();
         let mut p = pos;
         let mut emitted = 0usize;
         let mut served_any = false;
@@ -1725,7 +1756,7 @@ impl Sender {
         // datagram overruns `mtu` by exactly `CRYPTO_OVERHEAD` on every full
         // chunk (which, at the default 1408, is every chunk of a snapshot
         // bigger than one datagram — i.e. all of them).
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
+        let budget = self.budget();
         let part_end = sess.parts[i].base + sess.parts[i].len;
         let want = ((part_end - offset) as usize).min(budget);
         let in_file = offset - sess.parts[i].base;
@@ -2027,6 +2058,18 @@ mod tests {
         ))
     }
 
+    /// Jumbo spec §7.2: a buffer sized for the BOUND — `payload_ceiling` at
+    /// the top rung with crypto on, the largest `max_payload` any node can
+    /// boot with. 1 MiB of ring, so `LogBuffer::new`'s "4x the max claim"
+    /// assert is satisfied.
+    fn jumbo_buffer() -> Arc<LogBuffer> {
+        Arc::new(LogBuffer::new(
+            Region::heap_zeroed(1 << 20),
+            test_cnc(1 << 20),
+            8864,
+        ))
+    }
+
     fn term_handle(t: u32) -> TermHandle {
         Arc::new(std::sync::atomic::AtomicU32::new(t))
     }
@@ -2051,7 +2094,10 @@ mod tests {
             self.sock.local_addr().unwrap()
         }
         fn recv(&self) -> Option<(DatagramHeader, Vec<u8>)> {
-            let mut buf = [0u8; 2048];
+            // Big enough for the TOP rung: a short buffer truncates a UDP
+            // datagram silently, which is exactly what the live-rung test
+            // needs to be able to see whole.
+            let mut buf = [0u8; MTU_BOUND + 64];
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if let Some((n, _)) = self.sock.recv_from(&mut buf).unwrap() {
@@ -2063,7 +2109,7 @@ mod tests {
             None
         }
         fn drain(&self) {
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; MTU_BOUND + 64];
             while self.sock.recv_from(&mut buf).unwrap().is_some() {}
         }
         /// M8 (Task 10): the raw wire bytes (header ++ whatever crypto did to
@@ -2075,7 +2121,7 @@ mod tests {
         /// datagrams are already queued on this loopback socket by the time
         /// this polls.
         fn recv_raw(&self) -> Option<Vec<u8>> {
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; MTU_BOUND + 64];
             let deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < deadline {
                 if let Some((n, _)) = self.sock.recv_from(&mut buf).unwrap() {
@@ -3026,6 +3072,49 @@ mod tests {
             saw_any,
             "fixture must actually produce datagrams for this to mean anything"
         );
+    }
+
+    /// Jumbo spec §7.1: the packing budget follows the LIVE rung; a frame
+    /// larger than that budget still goes out alone (`read_run_validated`
+    /// always copies the first frame of a run), bounded by `MTU_BOUND`.
+    #[test]
+    fn the_budget_follows_the_live_rung_and_an_oversize_frame_goes_alone() {
+        let b = jumbo_buffer();
+        let f = Fake::new();
+        let (mut s, _tx) = sender_to(&[&f], &b);
+        let live = Arc::new(AtomicUsize::new(MTU_DEFAULT));
+        s.set_live_mtu(Arc::clone(&live));
+        assert_eq!(s.budget(), MTU_DEFAULT - DATAGRAM_HEADER_LEN);
+        live.store(MTU_BOUND, Ordering::Release);
+        assert_eq!(s.budget(), MTU_BOUND - DATAGRAM_HEADER_LEN);
+        // Back to the baseline: one 4 KB frame (over the baseline budget, well
+        // under the buffer's bound) followed by many 64 B frames.
+        live.store(MTU_DEFAULT, Ordering::Release);
+        let mut a = Appender::new(Arc::clone(&b), 9, 0);
+        a.append(4, 0, &[7u8; 4096]).unwrap();
+        for i in 1..40u32 {
+            a.append(4, i, &[1u8; 64]).unwrap();
+        }
+        for _ in 0..32 {
+            if !s.do_work() {
+                break;
+            }
+        }
+        let big = align_frame_len(HEADER_LEN + 4096);
+        let (mut oversize, mut total) = (0usize, 0usize);
+        while let Some(d) = f.recv_raw() {
+            total += 1;
+            if d.len() > MTU_DEFAULT {
+                oversize += 1;
+                assert_eq!(
+                    d.len() - DATAGRAM_HEADER_LEN,
+                    big,
+                    "an over-budget frame is sent ALONE, never split and never packed with"
+                );
+            }
+        }
+        assert_eq!(oversize, 1, "exactly the 4 KB frame exceeded the live rung");
+        assert!(total > 1, "the 64 B frames packed into their own datagrams");
     }
 
     #[test]

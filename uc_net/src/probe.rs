@@ -47,6 +47,16 @@ pub struct ProbeTable {
     cadence: ProbeCadence,
     peers: Mutex<HashMap<SocketAddr, PeerProbe>>,
     unsent: AtomicU64,
+    /// The soonest `next_due_ns` over the UNRESOLVED peers, or `u64::MAX`
+    /// when every peer is resolved (or there are none). Maintained under
+    /// `peers` by every method that can change a `next_due_ns` or a peer's
+    /// resolved-ness, and read WITHOUT the lock by [`ProbeTable::due`] —
+    /// which the sender's busy loop calls every pass, and which must
+    /// therefore cost one `Relaxed` load and nothing else on the overwhelming
+    /// majority of passes. A stale-high reading cannot happen (the store is
+    /// under the lock and only ever lowered by a writer that then holds it);
+    /// a stale-LOW reading costs one needless lock, never a missed probe.
+    earliest_due_ns: AtomicU64,
 }
 
 impl ProbeTable {
@@ -55,6 +65,7 @@ impl ProbeTable {
             cadence,
             peers: Mutex::new(HashMap::new()),
             unsent: AtomicU64::new(0),
+            earliest_due_ns: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -66,6 +77,33 @@ impl ProbeTable {
         for &p in peers {
             g.entry(p).or_default();
         }
+        self.publish_earliest(&g);
+    }
+
+    /// Recompute [`Self::earliest_due_ns`] from the map. Called under the
+    /// lock by every mutator; `Self::resolved` is the same predicate `due`
+    /// skips on, so a resolved peer never holds the fast path open.
+    fn publish_earliest(&self, g: &HashMap<SocketAddr, PeerProbe>) {
+        let e = g
+            .values()
+            .filter(|p| !Self::resolved(p))
+            .map(|p| p.next_due_ns)
+            .min()
+            .unwrap_or(u64::MAX);
+        self.earliest_due_ns.store(e, Ordering::Relaxed);
+    }
+
+    /// The soonest instant at which [`ProbeTable::due`] can return anything;
+    /// `u64::MAX` once every peer is resolved. Exposed for tests and for the
+    /// caller that wants to see the ladder has finished.
+    pub fn earliest_due_ns(&self) -> u64 {
+        self.earliest_due_ns.load(Ordering::Relaxed)
+    }
+
+    /// Nothing left for this pair to tell each other — see [`ProbeTable::due`]
+    /// for why BOTH halves are required.
+    fn resolved(p: &PeerProbe) -> bool {
+        p.verified as usize >= MTU_BOUND && p.advertised >= p.verified
     }
 
     pub fn peers(&self) -> Vec<SocketAddr> {
@@ -114,11 +152,16 @@ impl ProbeTable {
     /// own — pays that for as long as that stays true. It is also what
     /// re-discovers a path that later improves.
     pub fn due(&self, now_ns: u64) -> Vec<(SocketAddr, Vec<u32>)> {
+        // The sender polls this every pass and the answer is almost always
+        // "nothing": one Relaxed load, no mutex, no allocation. `Vec::new`
+        // does not allocate.
+        if now_ns < self.earliest_due_ns.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut g = self.peers.lock().unwrap();
         for (&addr, p) in g.iter_mut() {
-            let resolved = p.verified as usize >= MTU_BOUND && p.advertised >= p.verified;
-            if resolved || now_ns < p.next_due_ns {
+            if Self::resolved(p) || now_ns < p.next_due_ns {
                 continue;
             }
             let mut rungs: Vec<u32> = RUNGS.iter().copied().filter(|&r| r > p.verified).collect();
@@ -137,6 +180,7 @@ impl ProbeTable {
             p.next_due_ns = now_ns + step;
             out.push((addr, rungs));
         }
+        self.publish_earliest(&g);
         out
     }
 
@@ -151,6 +195,10 @@ impl ProbeTable {
         if let Some(p) = g.get_mut(&from) {
             p.verified = p.verified.max(rung);
             p.advertised = own_min_rung;
+            // An ack can RESOLVE this peer, which takes its deadline out of
+            // the fast path's minimum (and, when it was the last unresolved
+            // peer, closes the door for good).
+            self.publish_earliest(&g);
         }
     }
 
@@ -293,6 +341,38 @@ mod tests {
             "advertisement level: only the untried rung above is left"
         );
         assert_eq!(t.table_min(&[a(1)]), Some(8832));
+    }
+
+    /// The sender's busy loop calls `due` every pass, so an idle pass must
+    /// not take the peer mutex at all. Proved by HOLDING that mutex: a `due`
+    /// that locked would block until the guard drops, and the receive below
+    /// would time out instead of returning.
+    #[test]
+    fn due_before_the_earliest_deadline_takes_no_lock() {
+        let t = ProbeTable::new(fast());
+        t.set_peers(&[a(1), a(2)]);
+        assert_eq!(t.earliest_due_ns(), 0, "a new peer is due now");
+        assert_eq!(t.due(0).len(), 2);
+        assert_eq!(t.earliest_due_ns(), 10, "both rescheduled at fast_ns");
+
+        let guard = t.peers.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t2 = Arc::clone(&t);
+        std::thread::spawn(move || {
+            let _ = tx.send(t2.due(5));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("due(now < earliest) must not take the peer lock");
+        assert!(got.is_empty());
+        drop(guard);
+
+        // Resolving every peer closes the door: no lock, ever again.
+        t.on_ack(a(1), MTU_BOUND as u32, MTU_BOUND as u32);
+        assert_eq!(t.earliest_due_ns(), 10, "a(2) is still unresolved");
+        t.on_ack(a(2), MTU_BOUND as u32, MTU_BOUND as u32);
+        assert_eq!(t.earliest_due_ns(), u64::MAX);
+        assert!(t.due(u64::MAX - 1).is_empty());
     }
 
     #[test]
